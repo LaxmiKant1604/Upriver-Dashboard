@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, Menu, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -45,6 +45,45 @@ function shiftMonthRange(s, deltaYears, deltaMonths) {
   const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
   const day = Math.min(p.d, daysInMonth(y, m));
   return { start: `${y}-${pad2(m)}-01`, end: `${y}-${pad2(m)}-${pad2(day)}` };
+}
+
+/* ============================== DAILY REPORT HELPERS ============================== */
+// Full calendar month `n` months before the month containing `s` (n=0 -> that month).
+function monthBack(s, n) {
+  const p = parts(s);
+  const total = p.y * 12 + (p.m - 1) - n;
+  const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
+  return { y, m, from: `${y}-${pad2(m)}-01`, to: `${y}-${pad2(m)}-${pad2(daysInMonth(y, m))}` };
+}
+// Column set for the daily report: `monthsBack` completed months, the current
+// month (MTD, up to `latest`), then the last `days` days ending at `latest`.
+function dailyReportColumns(latest, monthsBack, days) {
+  const cols = [];
+  for (let i = monthsBack; i >= 1; i--) {
+    const mb = monthBack(latest, i);
+    cols.push({ key: `m${mb.y}-${mb.m}`, group: "month", label: `${MONTH_ABBR[mb.m - 1]} '${String(mb.y).slice(2)}`, from: mb.from, to: mb.to });
+  }
+  const cur = parts(latest);
+  cols.push({ key: "mtd", group: "mtd", label: `${MONTH_ABBR[cur.m - 1]} '${String(cur.y).slice(2)} MTD`, from: monthStart(latest), to: latest });
+  for (let d = days - 1; d >= 0; d--) {
+    const day = addDays(latest, -d);
+    const p = parts(day);
+    cols.push({ key: `d${day}`, group: "day", label: `${p.d}-${MONTH_ABBR[p.m - 1]}`, from: day, to: day });
+  }
+  return cols;
+}
+
+// Ad columns aren't wired into the DataDoe export yet (source/column names are
+// being confirmed via ?action=fields). Read them optimistically under a few
+// likely names so the table auto-fills once the export includes them.
+const AD_SALES_KEYS = ["ad_sales", "advertising_sales", "ppc_sales", "sponsored_products_sales", "attributed_sales"];
+const AD_SPEND_KEYS = ["ad_spend", "ad_spends", "advertising_spend", "ppc_spend", "spend", "cost"];
+const CLICKS_KEYS = ["clicks", "total_clicks", "ad_clicks"];
+function pickNum(row, keys) {
+  for (const k of keys) {
+    if (row[k] !== undefined && row[k] !== null && row[k] !== "") return Number(row[k]) || 0;
+  }
+  return null;
 }
 
 /* ============================== NUMBER / MONEY HELPERS ============================== */
@@ -176,6 +215,14 @@ export default function App() {
   // Sidebar shell state: `collapsed` = desktop icon-only mode; `mobileOpen` = drawer open on small screens.
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  // Which section is showing: the main dashboard or the Daily Reporting view.
+  const [view, setView] = useState("dashboard");
+
+  // Daily Reporting: single-account view, defaults to Aakriti Art Creations.
+  const [dailyAccountId, setDailyAccountId] = useState(null);
+  const [dailyRows, setDailyRows] = useState([]);
+  const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyError, setDailyError] = useState(null);
 
   const TODAY = todayStr();
 
@@ -194,6 +241,8 @@ export default function App() {
         if (withBrand.length > 0) {
           setSingleId(withBrand[0].id);
           setBrand(withBrand[0].brand);
+          const aakriti = withBrand.find((a) => /aakriti/i.test(a.name));
+          setDailyAccountId((aakriti || withBrand[0]).id);
         }
         setAccountsError(null);
       })
@@ -250,6 +299,43 @@ export default function App() {
   }, [activeIds.join(",")]);
 
   useEffect(() => { setExcluded(new Set()); }, [brand]);
+
+  // Daily Reporting fetch: pull ~5 months of single-account history so the
+  // report can show 3 completed months + current-month MTD + the last 5 days.
+  const fetchDaily = useCallback(() => {
+    if (!dailyAccountId) return;
+    setDailyLoading(true);
+    setDailyError(null);
+    const mb = monthBack(TODAY, 5);
+    apiGet({ action: "sales", ids: dailyAccountId, from: mb.from, to: TODAY })
+      .then((body) => setDailyRows(body.rows || []))
+      .catch((err) => setDailyError(err.message))
+      .finally(() => setDailyLoading(false));
+  }, [dailyAccountId, TODAY]);
+
+  useEffect(() => {
+    if (view === "daily") fetchDaily();
+  }, [view, fetchDaily]);
+
+  const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
+  const dailyReport = useMemo(() => {
+    const latest = dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null) || TODAY;
+    const columns = dailyReportColumns(latest, 3, 5);
+    const cells = columns.map((col) => {
+      let sales = 0, units = 0, adSales = 0, adSpend = 0, clicks = 0, hasAd = false;
+      dailyRows.forEach((r) => {
+        if (r.date < col.from || r.date > col.to) return;
+        sales += r.total_sales || 0;
+        units += r.total_units_sold || 0;
+        const as = pickNum(r, AD_SALES_KEYS), sp = pickNum(r, AD_SPEND_KEYS), ck = pickNum(r, CLICKS_KEYS);
+        if (as !== null || sp !== null || ck !== null) hasAd = true;
+        adSales += as || 0; adSpend += sp || 0; clicks += ck || 0;
+      });
+      return { sales, units, adSales, adSpend, clicks, hasAd };
+    });
+    return { latest, columns, cells };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dailyRows]);
 
   const scopeCurrency = useMemo(() => {
     const set = new Set(activeIds.map((id) => accountById[id]?.currency).filter(Boolean));
@@ -431,9 +517,13 @@ export default function App() {
           </div>
 
           <nav className="sb-nav">
-            <button className="sb-nav-item active" title="Dashboard" onClick={() => setMobileOpen(false)}>
+            <button className={"sb-nav-item" + (view === "dashboard" ? " active" : "")} title="Dashboard" onClick={() => { setView("dashboard"); setMobileOpen(false); }}>
               <LayoutDashboard size={18} />
               <span className="sb-nav-label">Dashboard</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "daily" ? " active" : "")} title="Daily Reporting" onClick={() => { setView("daily"); setMobileOpen(false); }}>
+              <CalendarRange size={18} />
+              <span className="sb-nav-label">Daily Reporting</span>
             </button>
           </nav>
 
@@ -456,11 +546,13 @@ export default function App() {
           <span className="mark">UPRIVER</span>
           <span className="sub">Amazon Seller Portfolio — Sales</span>
         </div>
-        <div className="tabs topbar-tabs">
-          <button className={"tab" + (mode === "all" ? " active" : "")} onClick={() => setMode("all")}>All Accounts</button>
-          <button className={"tab" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single Account</button>
-          <button className={"tab" + (mode === "brand" ? " active" : "")} onClick={() => setMode("brand")}>Brand View</button>
-        </div>
+        {view === "dashboard" && (
+          <div className="tabs topbar-tabs">
+            <button className={"tab" + (mode === "all" ? " active" : "")} onClick={() => setMode("all")}>All Accounts</button>
+            <button className={"tab" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single Account</button>
+            <button className={"tab" + (mode === "brand" ? " active" : "")} onClick={() => setMode("brand")}>Brand View</button>
+          </div>
+        )}
         <div className="live-wrap">
           <span className="live-dot" />
           {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()}` : "Loading…"} · {accounts.length} accounts
@@ -470,6 +562,7 @@ export default function App() {
         </div>
       </div>
 
+      {view === "dashboard" && (
       <div className="container">
         <div className="controls-bar">
           {mode === "all" && (
@@ -644,11 +737,94 @@ export default function App() {
           Brand grouping is inferred automatically from account names and may need manual correction for accounts with very similar names.
         </div>
       </div>
+      )}
+
+      {view === "daily" && (
+      <div className="container">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">Daily Reporting</div>
+            <div className="page-sub">Sales & advertising snapshot by month and by day</div>
+          </div>
+          <div className="select">
+            <select value={dailyAccountId || ""} onChange={(e) => setDailyAccountId(e.target.value)}>
+              {BRAND_LIST.map((b) => (
+                <optgroup label={BRAND_LABELS[b] || b} key={b}>
+                  {BRAND_MAP[b].map((id) => (
+                    <option value={id} key={id}>{FLAGS[accountById[id].country] || ""} {accountById[id].name} ({accountById[id].currency || "—"})</option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            <ChevronDown size={16} />
+          </div>
+        </div>
+
+        {dailyError && (
+          <div className="error-banner"><AlertTriangle size={15} /> {dailyError}</div>
+        )}
+
+        <div className="panel" style={{ marginTop: 14 }}>
+          <div className="panel-head">
+            <div>
+              <div className="panel-title">{accountById[dailyAccountId]?.name || "Account"}</div>
+              <div className="page-sub">Latest data: {fmtDateHuman(dailyReport.latest)} · shown in {dailyCurrency}</div>
+            </div>
+            <button className="refresh-btn" onClick={fetchDaily} title="Refresh data">
+              <RefreshCw size={13} className={dailyLoading ? "spin" : ""} />
+            </button>
+          </div>
+
+          <div className="daily-scroll">
+            <table className="daily-table">
+              <thead>
+                <tr>
+                  <th className="dt-metric">{accountById[dailyAccountId]?.name?.split(" ")[0] || "Metric"}</th>
+                  {dailyReport.columns.map((c) => (
+                    <th key={c.key} className={"dt-col dt-" + c.group}>{c.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {DAILY_METRICS.map((metric) => (
+                  <tr key={metric.key} className={metric.highlight ? "dt-row-highlight" : ""}>
+                    <td className="dt-metric">{metric.label}</td>
+                    {dailyReport.cells.map((cell, i) => (
+                      <td key={dailyReport.columns[i].key} className={"mono dt-" + dailyReport.columns[i].group}>
+                        {dailyLoading ? "…" : metric.fmt(cell, dailyCurrency)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="footer-note">
+          ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
+          Ad Sales, Ad Spend, and Clicks show "—" until the DataDoe advertising source is wired in — use <code>/api/datadoe?action=fields</code> on the live site to find its source id and column names, then add those columns to the export.
+        </div>
+      </div>
+      )}
         </div>
       </div>
     </div>
   );
 }
+
+// Rows of the Daily Reporting table, in display order. Ad-derived rows fall
+// back to "—" until advertising data is present on the fetched rows.
+const DAILY_METRICS = [
+  { key: "sales", label: "Total Sales", fmt: (c, cur) => fmtMoney(c.sales, cur) },
+  { key: "adSales", label: "Ad Sales", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSales, cur) : "—") },
+  { key: "adSpend", label: "Ad Spends", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
+  { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : "—") },
+  { key: "units", label: "Units", fmt: (c) => c.units.toLocaleString("en-US") },
+  { key: "roi", label: "ROI", highlight: true, fmt: (c) => (c.hasAd && c.adSpend > 0 ? (c.adSales / c.adSpend).toFixed(1) : "—") },
+  { key: "acos", label: "ACoS %", fmt: (c) => (c.hasAd && c.adSales > 0 ? (c.adSpend / c.adSales * 100).toFixed(1) + "%" : "—") },
+  { key: "tacos", label: "TACoS %", fmt: (c) => (c.hasAd && c.sales > 0 ? (c.adSpend / c.sales * 100).toFixed(1) + "%" : "—") },
+];
 
 const STYLE = `
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
@@ -752,6 +928,23 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .native-row{ display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--border); font-size:12.5px; }
 .native-row:last-child{ border-bottom:none; }
 .footer-note{ margin-top:18px; font-size:11.5px; color:var(--ink-soft); line-height:1.6; padding:14px 4px 6px; }
+.footer-note code{ font-family:'JetBrains Mono',monospace; font-size:11px; background:#F1F2F6; padding:1px 5px; border-radius:5px; }
+
+/* ---- Daily Reporting table ---- */
+.page-title{ font-size:19px; font-weight:800; letter-spacing:-0.01em; }
+.page-sub{ font-size:12px; color:var(--ink-soft); margin-top:2px; }
+.daily-scroll{ margin-top:12px; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.daily-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12.5px; min-width:760px; }
+.daily-table th, .daily-table td{ padding:9px 12px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
+.daily-table thead th{ font-size:11px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em; border-bottom:1px solid var(--border); background:var(--surface); }
+.daily-table th.dt-metric, .daily-table td.dt-metric{ text-align:left; font-weight:700; position:sticky; left:0; background:var(--surface); z-index:1; }
+.daily-table td.dt-metric{ color:var(--ink); }
+.daily-table th.dt-month, .daily-table td.dt-month{ background:#F3F6FC; }
+.daily-table th.dt-mtd, .daily-table td.dt-mtd{ background:#FEF3E2; color:var(--accent-deep); font-weight:700; border-left:1px solid var(--border); border-right:2px solid var(--border); }
+.daily-table tbody tr:hover td:not(.dt-mtd){ background:#FAFBFD; }
+.daily-table tr.dt-row-highlight td{ background:#FBEFD8; font-weight:700; }
+.daily-table tr.dt-row-highlight td.dt-mtd{ background:#F7E2BE; }
+.daily-table tr.dt-row-highlight td.dt-metric{ background:#FBEFD8; }
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
   /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */

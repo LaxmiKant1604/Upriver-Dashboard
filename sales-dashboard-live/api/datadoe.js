@@ -173,7 +173,43 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts or ?action=sales" });
+    // Temporary discovery route to find DataDoe's advertising data source and
+    // its column names. Hit this once on the live deployment, e.g.
+    //   /api/datadoe?action=fields
+    //   /api/datadoe?action=fields&sourceId=<id>
+    // then read the JSON to identify the ad source id + ad sales/spend/clicks
+    // column names, wire them into the "sales" export columns (or a new
+    // "ads" action), and remove this route afterwards.
+    if (action === "fields") {
+      const sourceId = req.query.sourceId || SALES_SOURCE_ID;
+      const candidates = [
+        `${BASE}/sources`,
+        `${BASE}/util/sources`,
+        `${BASE}/data-sources`,
+        `${BASE}/util/data-sources`,
+        `${BASE}/util/data-models`,
+        `${BASE}/sources/${sourceId}`,
+        `${BASE}/sources/${sourceId}/columns`,
+        `${BASE}/util/sources/${sourceId}`,
+        `${BASE}/util/sources/${sourceId}/columns`,
+      ];
+      const results = {};
+      for (const url of candidates) {
+        try {
+          const r = await fetch(url, { headers: authHeaders(apiKey) });
+          const text = await r.text().catch(() => "");
+          results[url] = { status: r.status, ok: r.ok, body: text.slice(0, 4000) };
+        } catch (e) {
+          results[url] = { error: e instanceof Error ? e.message : String(e) };
+        }
+        // Stay under DataDoe's ~2 req/sec org rate limit while probing.
+        await new Promise((resolve) => setTimeout(resolve, 550));
+      }
+      res.status(200).json({ sourceId, note: "Discovery route — identify the ad source id + column names, then remove this action.", results });
+      return;
+    }
+
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, or ?action=fields" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }
