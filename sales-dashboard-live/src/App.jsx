@@ -319,7 +319,11 @@ export default function App() {
 
   const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
   const dailyReport = useMemo(() => {
-    const latest = dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null) || TODAY;
+    // Anchor to yesterday at the latest — today is always excluded, since
+    // today's sales/ad numbers are still accumulating and not a full day.
+    const yesterday = addDays(TODAY, -1);
+    let latest = dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null) || yesterday;
+    if (latest > yesterday) latest = yesterday;
     const columns = dailyReportColumns(latest, 3, 5);
     const cells = columns.map((col) => {
       let sales = 0, units = 0, adSales = 0, adSpend = 0, clicks = 0, hasAd = false;
