@@ -26,7 +26,7 @@ Last updated: 2026-07-01
 - Added this project memory file so future work has a durable handoff location.
 - Fixed a DataDoe sales export failure caused by sending more than 5 `sellerOrVendorIds` in one export request. `sales-dashboard-live/api/datadoe.js` now chunks sales exports into batches of 5 and combines the returned rows.
 - Vercel deployment is intended to auto-deploy from the main branch.
-- Local commit `Batch DataDoe sales exports` was created on `main`, but push from this environment was blocked because GitHub credentials were authenticated as `aibylk16` and the remote `LaxmiKant1604/Upriver-Dashboard` returned HTTP 403.
+- Local commit `89c30f0 Batch DataDoe sales exports` was pushed to `origin/main` after clearing the stale cached GitHub credential.
 - `DATADOE_API_KEY` is expected to be configured for Production, Preview, and Development in Vercel.
 - DataDoe authentication is verified to use the custom `datadoe-api-key` header, not standard Bearer auth.
 - DataDoe endpoint paths are verified as `/util/sellers-and-vendors` for accounts and `/exports` for export creation/data retrieval.
@@ -84,5 +84,5 @@ Last updated: 2026-07-01
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
 4. Make code changes under `sales-dashboard-live/`, then commit and push.
 5. Vercel should auto-deploy from the main branch.
-6. If `git push origin main` returns 403, update the GitHub credentials or remote access for `LaxmiKant1604/Upriver-Dashboard`, then push again.
+6. If `git push origin main` returns 403 for `aibylk16`, reject the stale cached GitHub credential for `https://github.com` so Git Credential Manager can authenticate as `LaxmiKant1604`, then push again.
 7. Update this file whenever a task is completed, new context is learned, or an important decision is made.
