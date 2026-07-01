@@ -31,6 +31,7 @@ Last updated: 2026-07-01
 - DataDoe authentication is verified to use the custom `datadoe-api-key` header, not standard Bearer auth.
 - DataDoe endpoint paths are verified as `/util/sellers-and-vendors` for accounts and `/exports` for export creation/data retrieval.
 - Account list loading has worked with 15 accounts visible in dropdowns.
+- Header UI updated: the top badge now reads `UPRIVER` instead of `PULSE`, and the account scope selector (`All Accounts`, `Single Account`, `Brand View`) moved into the header before the refresh/account status.
 - Added a collapsible left sidebar shell around the existing dashboard in `src/App.jsx`. It has a brand/workspace header ("UR" logo, "Upriver Dashboard", `laxmikant@upriver.in`) and a single active "Dashboard" nav item. Desktop supports a collapse button (icon-only mode); mobile/tablet uses an off-canvas drawer with a menu button, backdrop click, and close button. All existing filters, KPI cards, comparisons, chart, and breakdowns render unchanged inside the new `.main-area`. Icons use `lucide-react`.
 
 ## In progress
@@ -58,6 +59,7 @@ Last updated: 2026-07-01
 - Static FX rates are hardcoded in `src/App.jsx` for now. This is simple and free, but rates need periodic updates or a live API later.
 - Brand grouping is heuristic: account names are grouped by stripping marketplace codes. This needs manual handling for spelling edge cases.
 - Project files should remain under `sales-dashboard-live/` unless Vercel's Root Directory setting is changed too.
+- The sidebar currently stays simple with only the Dashboard item; additional report/module options should be added later only when requested.
 
 ## Technical learnings
 

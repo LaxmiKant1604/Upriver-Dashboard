@@ -453,8 +453,13 @@ export default function App() {
           <Menu size={18} />
         </button>
         <div className="brandmark">
-          <span className="mark">PULSE</span>
+          <span className="mark">UPRIVER</span>
           <span className="sub">Amazon Seller Portfolio — Sales</span>
+        </div>
+        <div className="tabs topbar-tabs">
+          <button className={"tab" + (mode === "all" ? " active" : "")} onClick={() => setMode("all")}>All Accounts</button>
+          <button className={"tab" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single Account</button>
+          <button className={"tab" + (mode === "brand" ? " active" : "")} onClick={() => setMode("brand")}>Brand View</button>
         </div>
         <div className="live-wrap">
           <span className="live-dot" />
@@ -466,12 +471,6 @@ export default function App() {
       </div>
 
       <div className="container">
-        <div className="tabs">
-          <button className={"tab" + (mode === "all" ? " active" : "")} onClick={() => setMode("all")}>All Accounts</button>
-          <button className={"tab" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single Account</button>
-          <button className={"tab" + (mode === "brand" ? " active" : "")} onClick={() => setMode("brand")}>Brand View</button>
-        </div>
-
         <div className="controls-bar">
           {mode === "all" && (
             <div className="chip-row">
@@ -692,6 +691,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .brandmark{ display:flex; align-items:center; gap:10px; }
 .brandmark .mark{ font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:.06em; background:var(--ink); color:#fff; padding:5px 9px; border-radius:6px; font-size:13px; }
 .brandmark .sub{ font-size:12.5px; color:var(--ink-soft); }
+.topbar-tabs{ margin-left:auto; flex-shrink:0; }
 .live-wrap{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
 .live-dot{ width:8px; height:8px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
 .refresh-btn{ border:1px solid var(--border); background:var(--surface); border-radius:7px; padding:5px 7px; cursor:pointer; display:flex; align-items:center; color:var(--ink-soft); }
@@ -766,8 +766,11 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .sb-footer{ display:none; }
   .menu-btn{ display:inline-flex; }
   .sb-backdrop{ display:block; position:fixed; inset:0; background:rgba(10,12,20,.42); z-index:35; }
+  .topbar{ align-items:flex-start; }
+  .topbar-tabs{ order:3; width:100%; margin-left:0; justify-content:center; }
+  .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .container{ padding:16px 14px 0;} }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-tabs{ overflow-x:auto; justify-content:flex-start; } .tab{ white-space:nowrap; } .container{ padding:16px 14px 0;} }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;
