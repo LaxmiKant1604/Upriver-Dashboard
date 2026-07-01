@@ -31,6 +31,7 @@ Last updated: 2026-07-01
 - DataDoe authentication is verified to use the custom `datadoe-api-key` header, not standard Bearer auth.
 - DataDoe endpoint paths are verified as `/util/sellers-and-vendors` for accounts and `/exports` for export creation/data retrieval.
 - Account list loading has worked with 15 accounts visible in dropdowns.
+- Added a collapsible left sidebar shell around the existing dashboard in `src/App.jsx`. It has a brand/workspace header ("UR" logo, "Upriver Dashboard", `laxmikant@upriver.in`) and a single active "Dashboard" nav item. Desktop supports a collapse button (icon-only mode); mobile/tablet uses an off-canvas drawer with a menu button, backdrop click, and close button. All existing filters, KPI cards, comparisons, chart, and breakdowns render unchanged inside the new `.main-area`. Icons use `lucide-react`.
 
 ## In progress
 
@@ -40,6 +41,7 @@ Last updated: 2026-07-01
 
 - Verify sales numbers on the live dashboard match Seller Central expectations.
 - Consider switching sales source from `b24cd69c06` (Profit by Date, settlement-based, roughly 7-day lag) to `401ffcd7e5` (Sales & Traffic by ASIN & Date, roughly 4-day lag, closer to Seller Central) if accuracy is off.
+- Sidebar is intentionally a minimal foundation: only the "Dashboard" nav item exists for now. Add further report/module nav items (e.g. Profit, PPC, Inventory) into the `.sb-nav` block in `src/App.jsx` later, only when the user decides which modules are needed.
 - Add Profit module for net margin analysis.
 - Add PPC module for ad spend, ACoS, TACoS, and campaign performance.
 - Add Inventory module for FBA stock, days-of-cover, and restock alerts.

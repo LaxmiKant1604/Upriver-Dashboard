@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, Menu, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -172,6 +172,10 @@ export default function App() {
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [granularity, setGranularity] = useState("D");
+
+  // Sidebar shell state: `collapsed` = desktop icon-only mode; `mobileOpen` = drawer open on small screens.
+  const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
 
   const TODAY = todayStr();
 
@@ -413,7 +417,41 @@ export default function App() {
     <div className="dash-root">
       <style>{STYLE}</style>
 
+      <div className="app-shell">
+        <aside className={"sidebar" + (collapsed ? " collapsed" : "") + (mobileOpen ? " mobile-open" : "")}>
+          <div className="sb-brand">
+            <div className="sb-logo">UR</div>
+            <div className="sb-brand-text">
+              <div className="sb-ws-name">Upriver Dashboard</div>
+              <div className="sb-ws-sub">laxmikant@upriver.in</div>
+            </div>
+            <button className="sb-close" onClick={() => setMobileOpen(false)} aria-label="Close menu">
+              <X size={18} />
+            </button>
+          </div>
+
+          <nav className="sb-nav">
+            <button className="sb-nav-item active" title="Dashboard" onClick={() => setMobileOpen(false)}>
+              <LayoutDashboard size={18} />
+              <span className="sb-nav-label">Dashboard</span>
+            </button>
+          </nav>
+
+          <div className="sb-footer">
+            <button className="sb-collapse" onClick={() => setCollapsed((c) => !c)} title={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-label="Toggle sidebar">
+              {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+              <span className="sb-nav-label">Collapse</span>
+            </button>
+          </div>
+        </aside>
+
+        {mobileOpen && <div className="sb-backdrop" onClick={() => setMobileOpen(false)} />}
+
+        <div className="main-area">
       <div className="topbar">
+        <button className="menu-btn" onClick={() => setMobileOpen(true)} aria-label="Open menu">
+          <Menu size={18} />
+        </button>
         <div className="brandmark">
           <span className="mark">PULSE</span>
           <span className="sub">Amazon Seller Portfolio — Sales</span>
@@ -607,6 +645,8 @@ export default function App() {
           Brand grouping is inferred automatically from account names and may need manual correction for accounts with very similar names.
         </div>
       </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -619,6 +659,35 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .dash-root{ font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; background:var(--bg); color:var(--ink); min-height:100vh; padding-bottom:20px; }
 .mono{ font-family:'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 .loading-screen{ display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:'Manrope',sans-serif; color:var(--ink-soft); text-align:center; padding:24px; }
+
+/* ---- Sidebar shell ---- */
+.app-shell{ display:flex; align-items:stretch; min-height:100vh; }
+.sidebar{ width:250px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; position:sticky; top:0; height:100vh; z-index:40; transition:width .18s ease; }
+.sidebar.collapsed{ width:74px; }
+.sb-brand{ display:flex; align-items:center; gap:11px; padding:0 16px; min-height:65px; border-bottom:1px solid var(--border); }
+.sb-logo{ width:36px; height:36px; flex-shrink:0; border-radius:9px; background:var(--ink); color:#fff; font-family:'JetBrains Mono',monospace; font-weight:700; font-size:14px; letter-spacing:.02em; display:flex; align-items:center; justify-content:center; }
+.sb-brand-text{ display:flex; flex-direction:column; min-width:0; }
+.sb-ws-name{ font-size:13.5px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sb-ws-sub{ font-size:11px; color:var(--ink-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sidebar.collapsed .sb-brand{ justify-content:center; padding:0; }
+.sidebar.collapsed .sb-brand-text{ display:none; }
+.sb-close{ display:none; margin-left:auto; border:none; background:transparent; color:var(--ink-soft); cursor:pointer; padding:5px; border-radius:6px; }
+.sb-close:hover{ background:#F1F2F6; color:var(--ink); }
+.sb-nav{ display:flex; flex-direction:column; gap:3px; padding:12px 10px; flex:1; overflow-y:auto; }
+.sb-nav-item{ display:flex; align-items:center; gap:11px; width:100%; padding:9px 11px; border:none; background:transparent; border-radius:9px; font-size:13.5px; font-weight:700; color:var(--ink-soft); cursor:pointer; font-family:inherit; text-align:left; }
+.sb-nav-item svg{ flex-shrink:0; }
+.sb-nav-item:hover{ background:#F1F2F6; color:var(--ink); }
+.sb-nav-item.active{ background:#FEF3E2; color:var(--accent-deep); }
+.sidebar.collapsed .sb-nav-item{ justify-content:center; padding:9px; }
+.sidebar.collapsed .sb-nav-label{ display:none; }
+.sb-footer{ padding:10px; border-top:1px solid var(--border); }
+.sb-collapse{ display:flex; align-items:center; gap:11px; width:100%; padding:9px 11px; border:none; background:transparent; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--ink-soft); cursor:pointer; font-family:inherit; }
+.sb-collapse:hover{ background:#F1F2F6; color:var(--ink); }
+.sidebar.collapsed .sb-collapse{ justify-content:center; padding:9px; }
+.main-area{ flex:1; min-width:0; display:flex; flex-direction:column; }
+.menu-btn{ display:none; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:6px 8px; cursor:pointer; color:var(--ink); align-items:center; }
+.sb-backdrop{ display:none; }
+
 .topbar{ display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 28px; background:var(--surface); border-bottom:1px solid var(--border); flex-wrap:wrap; }
 .brandmark{ display:flex; align-items:center; gap:10px; }
 .brandmark .mark{ font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:.06em; background:var(--ink); color:#fff; padding:5px 9px; border-radius:6px; font-size:13px; }
@@ -683,7 +752,21 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .native-row{ display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--border); font-size:12.5px; }
 .native-row:last-child{ border-bottom:none; }
 .footer-note{ margin-top:18px; font-size:11.5px; color:var(--ink-soft); line-height:1.6; padding:14px 4px 6px; }
-@media (max-width:900px){ .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;} }
+@media (max-width:900px){
+  .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
+  /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
+  .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
+  .sidebar.collapsed{ width:270px; }
+  .sidebar.collapsed .sb-brand{ justify-content:flex-start; padding:0 16px; }
+  .sidebar.collapsed .sb-brand-text{ display:flex; }
+  .sidebar.collapsed .sb-nav-item{ justify-content:flex-start; padding:9px 11px; }
+  .sidebar.collapsed .sb-nav-label{ display:inline; }
+  .sidebar.mobile-open{ transform:translateX(0); }
+  .sb-close{ display:inline-flex; }
+  .sb-footer{ display:none; }
+  .menu-btn{ display:inline-flex; }
+  .sb-backdrop{ display:block; position:fixed; inset:0; background:rgba(10,12,20,.42); z-index:35; }
+}
 @media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .container{ padding:16px 14px 0;} }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
