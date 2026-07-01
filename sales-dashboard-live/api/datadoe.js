@@ -22,6 +22,10 @@
 
 const BASE = "https://api.datadoe.com/api/v1";
 
+// Verified DataDoe REST details:
+// - Accounts endpoint includes the /util prefix.
+// - Auth uses the custom datadoe-api-key header, not Authorization: Bearer.
+// - Sales exports accept no more than 5 seller/vendor IDs per request.
 const ENDPOINTS = {
   sellers: `${BASE}/util/sellers-and-vendors`,
   exportsCreate: `${BASE}/exports`,
@@ -33,6 +37,9 @@ const ENDPOINTS = {
 // This id is a stable data-model identifier, verified against DataDoe's
 // data during development — should not need to change.
 const SALES_SOURCE_ID = "b24cd69c06";
+// Alternative source 401ffcd7e5 may match Seller Central more closely if
+// settlement-lagged sales totals from b24cd69c06 are not accurate enough.
+const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 
 function authHeaders(apiKey) {
   return {
@@ -89,6 +96,31 @@ async function createExport(apiKey, sellerOrVendorIds, from, to) {
   return r.json();
 }
 
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+async function fetchSalesRows(apiKey, sellerOrVendorIds, from, to) {
+  const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
+  const allRows = [];
+
+  for (const chunk of chunks) {
+    const created = await createExport(apiKey, chunk, from, to);
+    const exportId = created.exportId || created.id;
+    if (created.status !== "COMPLETED") {
+      await pollExport(apiKey, exportId);
+    }
+    const rows = await downloadExport(apiKey, exportId);
+    allRows.push(...rows);
+  }
+
+  return allRows;
+}
+
 async function pollExport(apiKey, exportId) {
   const maxAttempts = 12;
   const delayMs = 1500;
@@ -136,12 +168,7 @@ export default async function handler(req, res) {
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
-      const created = await createExport(apiKey, sellerOrVendorIds, from, to);
-      const exportId = created.exportId || created.id;
-      if (created.status !== "COMPLETED") {
-        await pollExport(apiKey, exportId);
-      }
-      const rows = await downloadExport(apiKey, exportId);
+      const rows = await fetchSalesRows(apiKey, sellerOrVendorIds, from, to);
       res.status(200).json({ rows });
       return;
     }
