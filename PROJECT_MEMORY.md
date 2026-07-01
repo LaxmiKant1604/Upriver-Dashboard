@@ -40,7 +40,13 @@ Last updated: 2026-07-01
 
 ## In progress
 
-- Finding the DataDoe advertising data source. Next step: deploy, hit `/api/datadoe?action=fields` on the live URL, read the JSON to get the ad source id + the exact ad sales / ad spend / clicks column names, then either add those columns to the sales export or add a dedicated `ads` action, and update the `AD_*` key lists in `src/App.jsx` if the column names differ.
+- Migrating all reports to the user-confirmed sources:
+  - Sales/units: `401ffcd7e5` ("Sales & Traffic by ASIN & Date") — user says this is the correct sales report; should replace `b24cd69c06` app-wide.
+  - Advertising (ad sales, ad spend, clicks): `08cdc77d3d` — a separate source, must be fetched and merged with sales by date.
+- Next step: hit `/api/datadoe?action=sample&sourceId=401ffcd7e5` and `...&sourceId=08cdc77d3d` on the live URL to read each source's real column names + row granularity, then:
+  1. Swap `SALES_SOURCE_ID` to `401ffcd7e5`, mapping its actual sales/units columns and handling per-ASIN granularity (watch the `limit: 2500` export cap and avoid double-counting orders when summing ASIN rows).
+  2. Add an ads fetch (new action or combined) against `08cdc77d3d` and merge by date; update the `AD_*` key lists in `src/App.jsx` to the real ad column names so Ad Sales/Spend/Clicks/ROI/ACoS/TACoS populate.
+- Temporary discovery routes `?action=fields` and `?action=sample` exist in `api/datadoe.js`; remove them once sources/columns are confirmed.
 
 ## Pending tasks and known follow-ups
 
