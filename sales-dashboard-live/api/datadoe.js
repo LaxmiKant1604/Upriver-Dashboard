@@ -39,12 +39,13 @@ const ENDPOINTS = {
 // export by the non-metric columns selected, so requesting only date +
 // seller_or_vendor_id returns one row per account per day.
 const SALES_SOURCE_ID = "401ffcd7e5";
+// Keep to columns that exist in this source. It has no currency /
+// seller_or_vendor_name / marketplace_country_code columns (the export
+// validation rejects them), so we request only the id + metrics and let the
+// frontend resolve currency/name from the accounts list.
 const SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
-  "seller_or_vendor_name",
-  "marketplace_country_code",
-  "currency",
   "total_sales",
   "total_units",
 ];
