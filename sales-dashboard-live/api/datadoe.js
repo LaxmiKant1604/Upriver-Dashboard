@@ -290,15 +290,23 @@ export default async function handler(req, res) {
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean).slice(0, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
       const to = req.query.to || new Date().toISOString().slice(0, 10);
       const from = req.query.from || new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+      const limit = Number(req.query.limit) || 200;
+      // Columns must be specified (DataDoe rejects an empty/absent list). Pass
+      // ?columns=a,b,c to probe arbitrary columns, else default by source.
+      let columns;
+      if (req.query.columns) columns = String(req.query.columns).split(",").map((c) => c.trim()).filter(Boolean);
+      else if (sourceId === SALES_SOURCE_ID) columns = SALES_COLUMNS;
+      else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
+      else columns = ["date", "seller_or_vendor_id"];
 
       const createRes = await fetch(ENDPOINTS.exportsCreate, {
         method: "POST",
         headers: authHeaders(apiKey),
-        body: JSON.stringify({ sourceId, sellerOrVendorIds, from, to, limit: 5, outputType: "JSON" }),
+        body: JSON.stringify({ sourceId, sellerOrVendorIds, columns, from, to, limit, outputType: "JSON", orderByColumn: "date", orderByDirection: "ASC" }),
       });
       const createText = await createRes.text().catch(() => "");
       if (!createRes.ok) {
-        res.status(200).json({ sourceId, from, to, sellerOrVendorIds, ok: false, stage: "create", status: createRes.status, body: createText.slice(0, 2000) });
+        res.status(200).json({ sourceId, from, to, columns, sellerOrVendorIds, ok: false, stage: "create", status: createRes.status, body: createText.slice(0, 2000) });
         return;
       }
       let created = {};
@@ -308,16 +316,24 @@ export default async function handler(req, res) {
         try {
           await pollExport(apiKey, exportId);
         } catch (e) {
-          res.status(200).json({ sourceId, from, to, sellerOrVendorIds, ok: false, stage: "poll", error: e instanceof Error ? e.message : String(e) });
+          res.status(200).json({ sourceId, from, to, columns, sellerOrVendorIds, ok: false, stage: "poll", error: e instanceof Error ? e.message : String(e) });
           return;
         }
       }
       const rows = await downloadExport(apiKey, exportId);
+      // Summaries to diagnose granularity/magnitude without dumping everything.
+      const salesSum = rows.reduce((a, r) => a + (Number(r.total_sales) || 0), 0);
+      const unitsSum = rows.reduce((a, r) => a + (Number(r.total_units) || 0), 0);
+      const dates = rows.map((r) => r.date).filter(Boolean);
       res.status(200).json({
-        sourceId, from, to, sellerOrVendorIds, ok: true,
+        sourceId, from, to, columns, sellerOrVendorIds, ok: true,
         rowCount: rows.length,
-        columns: rows.length ? Object.keys(rows[0]) : [],
-        sample: rows.slice(0, 3),
+        rowKeys: rows.length ? Object.keys(rows[0]) : [],
+        distinctDates: new Set(dates).size,
+        minDate: dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : null,
+        maxDate: dates.length ? dates.reduce((a, b) => (a > b ? a : b)) : null,
+        salesSum, unitsSum,
+        sample: rows.slice(0, 8),
       });
       return;
     }
