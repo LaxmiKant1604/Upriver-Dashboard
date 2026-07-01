@@ -38,19 +38,36 @@ const ENDPOINTS = {
 // (Previously used b24cd69c06 "Profit by Date".) DataDoe aggregates each
 // export by the non-metric columns selected, so requesting only date +
 // seller_or_vendor_id returns one row per account per day.
-const SALES_SOURCE_ID = "401ffcd7e5";
-// Keep to columns that exist in this source. It has no currency /
-// seller_or_vendor_name / marketplace_country_code columns (the export
-// validation rejects them), so we request only the id + metrics and let the
-// frontend resolve currency/name from the accounts list.
-const SALES_COLUMNS = [
+// Dashboard source: fast daily per-account rollup ("Profit by Date",
+// ~1 row/account/day, includes order counts). Used by action=sales for the
+// multi-account dashboard, where per-ASIN volume would be millions of rows.
+const DASHBOARD_SOURCE_ID = "b24cd69c06";
+const DASHBOARD_COLUMNS = [
+  "date",
+  "seller_or_vendor_id",
+  "seller_or_vendor_name",
+  "marketplace_country_code",
+  "currency",
+  "total_sales",
+  "total_units_sold",
+  "total_orders",
+];
+
+// Daily Reporting sales source: "Sales & Traffic by ASIN & Date" (401ffcd7e5),
+// the user-confirmed accurate report. It is per-ASIN (~700 rows/account/day,
+// mostly zero-sales rows), so action=daily aggregates it to one row per account
+// per day server-side. It has no currency/name columns, so only id + metrics
+// are requested. Used only for the single-account Daily Reporting view.
+const DAILY_SALES_SOURCE_ID = "401ffcd7e5";
+const DAILY_SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
   "total_sales",
   "total_units",
 ];
-// Advertising source (ad sales / spend / clicks per account per day),
-// fetched separately and merged with sales by (account, date).
+
+// Advertising source (ad sales / spend / clicks), merged into the daily report
+// by (account, date).
 const ADS_SOURCE_ID = "08cdc77d3d";
 const ADS_COLUMNS = [
   "date",
@@ -60,7 +77,10 @@ const ADS_COLUMNS = [
   "ad_clicks",
 ];
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
-const EXPORT_ROW_LIMIT = 10000;
+const DASHBOARD_ROW_LIMIT = 5000;
+// The per-ASIN daily source produces ~20k rows/account/month; allow a large
+// window for one account across several months.
+const DAILY_ROW_LIMIT = 200000;
 
 function authHeaders(apiKey) {
   return {
@@ -85,7 +105,7 @@ async function fetchAccounts(apiKey) {
   }));
 }
 
-async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to) {
+async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit) {
   const r = await fetch(ENDPOINTS.exportsCreate, {
     method: "POST",
     headers: authHeaders(apiKey),
@@ -95,7 +115,7 @@ async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, 
       columns,
       from,
       to,
-      limit: EXPORT_ROW_LIMIT,
+      limit,
       outputType: "JSON",
       orderByColumn: "date",
       orderByDirection: "ASC",
@@ -118,12 +138,12 @@ function chunkArray(items, size) {
 
 // Run an export for any source, chunking by the 5-id-per-export cap and
 // combining the returned rows.
-async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to) {
+async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit) {
   const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
   const allRows = [];
 
   for (const chunk of chunks) {
-    const created = await createExport(apiKey, sourceId, columns, chunk, from, to);
+    const created = await createExport(apiKey, sourceId, columns, chunk, from, to, limit);
     const exportId = created.exportId || created.id;
     if (created.status !== "COMPLETED") {
       await pollExport(apiKey, exportId);
@@ -133,6 +153,23 @@ async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, fro
   }
 
   return allRows;
+}
+
+// Aggregate raw rows to one row per (seller_or_vendor_id, date), summing the
+// given numeric fields. Used to collapse the per-ASIN daily source.
+function aggregateByAccountDate(rawRows, fields) {
+  const byKey = new Map();
+  for (const r of rawRows) {
+    const key = `${r.seller_or_vendor_id}|${r.date}`;
+    let agg = byKey.get(key);
+    if (!agg) {
+      agg = { date: r.date, seller_or_vendor_id: r.seller_or_vendor_id };
+      for (const f of fields) agg[f] = 0;
+      byKey.set(key, agg);
+    }
+    for (const f of fields) agg[f] += num(r[f]);
+  }
+  return [...byKey.values()];
 }
 
 const num = (v) => Number(v) || 0;
@@ -220,21 +257,27 @@ export default async function handler(req, res) {
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
-      const rows = await fetchExportRows(apiKey, SALES_SOURCE_ID, SALES_COLUMNS, sellerOrVendorIds, from, to);
-      // Normalize the source's `total_units` to the `total_units_sold` name the
-      // frontend already reads, so nothing downstream needs to change.
-      for (const r of rows) {
-        if (r.total_units !== undefined && r.total_units_sold === undefined) {
-          r.total_units_sold = r.total_units;
-        }
+      const rows = await fetchExportRows(apiKey, DASHBOARD_SOURCE_ID, DASHBOARD_COLUMNS, sellerOrVendorIds, from, to, DASHBOARD_ROW_LIMIT);
+      res.status(200).json({ rows });
+      return;
+    }
+
+    // Daily Reporting data: single-account sales/units from the accurate but
+    // per-ASIN source 401ffcd7e5 (aggregated to one row per day), merged with
+    // advertising figures from 08cdc77d3d.
+    if (action === "daily") {
+      const { ids, from, to } = req.query;
+      if (!ids || !from || !to) {
+        res.status(400).json({ error: "Missing required params: ids, from, to" });
+        return;
       }
-      // Merge advertising figures only when asked (the Daily Reporting view),
-      // so the main dashboard stays a single fast export.
-      const wantAds = req.query.ads === "1" || req.query.ads === "true";
-      if (wantAds) {
-        const adRows = await fetchExportRows(apiKey, ADS_SOURCE_ID, ADS_COLUMNS, sellerOrVendorIds, from, to);
-        mergeSalesAndAds(rows, adRows);
-      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      const salesRaw = await fetchExportRows(apiKey, DAILY_SALES_SOURCE_ID, DAILY_SALES_COLUMNS, sellerOrVendorIds, from, to, DAILY_ROW_LIMIT);
+      const rows = aggregateByAccountDate(salesRaw, ["total_sales", "total_units"]);
+      for (const r of rows) r.total_units_sold = r.total_units;
+      const adRaw = await fetchExportRows(apiKey, ADS_SOURCE_ID, ADS_COLUMNS, sellerOrVendorIds, from, to, DAILY_ROW_LIMIT);
+      const ads = aggregateByAccountDate(adRaw, ["ad_sales", "ad_spend", "ad_clicks"]);
+      mergeSalesAndAds(rows, ads);
       res.status(200).json({ rows });
       return;
     }
@@ -247,7 +290,7 @@ export default async function handler(req, res) {
     // column names, wire them into the "sales" export columns (or a new
     // "ads" action), and remove this route afterwards.
     if (action === "fields") {
-      const sourceId = req.query.sourceId || SALES_SOURCE_ID;
+      const sourceId = req.query.sourceId || DAILY_SALES_SOURCE_ID;
       const candidates = [
         `${BASE}/sources`,
         `${BASE}/util/sources`,
@@ -280,7 +323,7 @@ export default async function handler(req, res) {
     //   /api/datadoe?action=sample&sourceId=401ffcd7e5
     // Remove this route once the source/columns are confirmed.
     if (action === "sample") {
-      const sourceId = req.query.sourceId || SALES_SOURCE_ID;
+      const sourceId = req.query.sourceId || DAILY_SALES_SOURCE_ID;
       let ids = req.query.ids;
       if (!ids) {
         const accts = await fetchAccounts(apiKey);
@@ -295,7 +338,8 @@ export default async function handler(req, res) {
       // ?columns=a,b,c to probe arbitrary columns, else default by source.
       let columns;
       if (req.query.columns) columns = String(req.query.columns).split(",").map((c) => c.trim()).filter(Boolean);
-      else if (sourceId === SALES_SOURCE_ID) columns = SALES_COLUMNS;
+      else if (sourceId === DAILY_SALES_SOURCE_ID) columns = DAILY_SALES_COLUMNS;
+      else if (sourceId === DASHBOARD_SOURCE_ID) columns = DASHBOARD_COLUMNS;
       else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
       else columns = ["date", "seller_or_vendor_id"];
 

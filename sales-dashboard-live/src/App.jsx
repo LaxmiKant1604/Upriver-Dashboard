@@ -307,7 +307,7 @@ export default function App() {
     setDailyLoading(true);
     setDailyError(null);
     const mb = monthBack(TODAY, 5);
-    apiGet({ action: "sales", ids: dailyAccountId, from: mb.from, to: TODAY, ads: 1 })
+    apiGet({ action: "daily", ids: dailyAccountId, from: mb.from, to: TODAY })
       .then((body) => setDailyRows(body.rows || []))
       .catch((err) => setDailyError(err.message))
       .finally(() => setDailyLoading(false));
