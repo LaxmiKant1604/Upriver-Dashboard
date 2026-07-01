@@ -37,16 +37,14 @@ Last updated: 2026-07-01
 - Daily Reporting renders a table matching the user's screenshot: columns are 3 completed months + current-month MTD + the last 5 days (relative to the latest data date); rows are Total Sales, Ad Sales, Ad Spends, Clicks, Units, ROI (Ad Sales÷Ad Spend), ACoS % (Ad Spend÷Ad Sales), TACoS % (Ad Spend÷Total Sales). Table helpers: `monthBack`, `dailyReportColumns`, `DAILY_METRICS`. Wide table scrolls horizontally with a sticky metric column.
 - Total Sales and Units populate from the existing sales source now. Ad Sales/Spend/Clicks (and the derived ROI/ACoS/TACoS) show "—" because no DataDoe advertising source is wired yet. The frontend reads ad fields optimistically via `pickNum` + candidate key lists (`AD_SALES_KEYS`, `AD_SPEND_KEYS`, `CLICKS_KEYS`), so the table auto-fills once the export includes real ad columns.
 - Added a temporary discovery route to `api/datadoe.js`: `?action=fields` (optional `&sourceId=`). It probes candidate DataDoe source/column endpoints and returns their JSON so we can identify the advertising source id + column names. Remove this route after the ad source is confirmed. It exposes source metadata (not the API key) on the live URL while present.
+- Migrated the sales source from `b24cd69c06` to the user-confirmed `401ffcd7e5` ("Sales & Traffic by ASIN & Date") app-wide. Columns used: `total_sales`, `total_units` (the export is aggregated per account per day because only date + seller_or_vendor_id dimensions are selected). `total_units` is normalized to `total_units_sold` server-side so the frontend is unchanged. This source has no order-count column, so the dashboard Orders and Avg. Order Value KPIs now show "—" (guarded by a `hasOrders` check) unless an orders column is added later.
+- Wired advertising data from source `08cdc77d3d` (columns `ad_sales`, `ad_spend`, `ad_clicks`). The `action=sales` route merges ad rows into sales rows by (account, date) via `mergeSalesAndAds`, but only when called with `&ads=1` (the Daily Reporting view sets this; the main dashboard skips it to stay a single fast export). The Daily Reporting table's Ad Sales / Ad Spends / Clicks now populate, and ROI / ACoS % / TACoS % derive from them.
+- Export helpers in `api/datadoe.js` were generalized: `createExport(apiKey, sourceId, columns, ids, from, to)` and `fetchExportRows(...)` work for any source; the per-export row limit was raised to `EXPORT_ROW_LIMIT = 10000`.
 
 ## In progress
 
-- Migrating all reports to the user-confirmed sources:
-  - Sales/units: `401ffcd7e5` ("Sales & Traffic by ASIN & Date") — user says this is the correct sales report; should replace `b24cd69c06` app-wide.
-  - Advertising (ad sales, ad spend, clicks): `08cdc77d3d` — a separate source, must be fetched and merged with sales by date.
-- Next step: hit `/api/datadoe?action=sample&sourceId=401ffcd7e5` and `...&sourceId=08cdc77d3d` on the live URL to read each source's real column names + row granularity, then:
-  1. Swap `SALES_SOURCE_ID` to `401ffcd7e5`, mapping its actual sales/units columns and handling per-ASIN granularity (watch the `limit: 2500` export cap and avoid double-counting orders when summing ASIN rows).
-  2. Add an ads fetch (new action or combined) against `08cdc77d3d` and merge by date; update the `AD_*` key lists in `src/App.jsx` to the real ad column names so Ad Sales/Spend/Clicks/ROI/ACoS/TACoS populate.
-- Temporary discovery routes `?action=fields` and `?action=sample` exist in `api/datadoe.js`; remove them once sources/columns are confirmed.
+- Verify the migrated numbers on the live site (both the main dashboard and the Daily Reporting ad rows) against Seller Central, since the sales source changed from `b24cd69c06` to `401ffcd7e5`.
+- Temporary discovery routes `?action=fields` and `?action=sample` still exist in `api/datadoe.js`; remove them now that sources/columns are confirmed.
 
 ## Pending tasks and known follow-ups
 

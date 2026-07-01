@@ -307,7 +307,7 @@ export default function App() {
     setDailyLoading(true);
     setDailyError(null);
     const mb = monthBack(TODAY, 5);
-    apiGet({ action: "sales", ids: dailyAccountId, from: mb.from, to: TODAY })
+    apiGet({ action: "sales", ids: dailyAccountId, from: mb.from, to: TODAY, ads: 1 })
       .then((body) => setDailyRows(body.rows || []))
       .catch((err) => setDailyError(err.message))
       .finally(() => setDailyLoading(false));
@@ -416,6 +416,9 @@ export default function App() {
   const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [rows, rangeFrom, rangeTo]);
   const kpi = useMemo(() => aggregate(scopedRows), [scopedRows, mixedScope]);
   const aov = kpi.orders > 0 ? kpi.sales / kpi.orders : 0;
+  // The sales source (401ffcd7e5) has no order-count column, so Orders / AOV
+  // show "—" unless an orders figure is actually present on the rows.
+  const hasOrders = useMemo(() => rows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [rows]);
 
   const trend = useMemo(() => {
     const buckets = {};
@@ -670,12 +673,12 @@ export default function App() {
           </div>
           <div className="kpi-card">
             <div className="kpi-label">Orders</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : kpi.orders.toLocaleString("en-US")}</div>
+            <div className="kpi-value mono">{rowsLoading ? "…" : hasOrders ? kpi.orders.toLocaleString("en-US") : "—"}</div>
             <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
           </div>
           <div className="kpi-card">
             <div className="kpi-label">Avg. Order Value</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : fmtMoney(aov, displayCurrency, 2)}</div>
+            <div className="kpi-value mono">{rowsLoading ? "…" : hasOrders ? fmtMoney(aov, displayCurrency, 2) : "—"}</div>
             <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
           </div>
         </div>

@@ -33,13 +33,33 @@ const ENDPOINTS = {
   exportRaw: (id) => `${BASE}/exports/${id}/raw`,
 };
 
-// Source table for daily sales/units/orders per account (Profit by Date).
-// This id is a stable data-model identifier, verified against DataDoe's
-// data during development — should not need to change.
-const SALES_SOURCE_ID = "b24cd69c06";
-// Alternative source 401ffcd7e5 may match Seller Central more closely if
-// settlement-lagged sales totals from b24cd69c06 are not accurate enough.
+// Source table for daily sales/units per account. 401ffcd7e5 ("Sales &
+// Traffic by ASIN & Date") is the user-confirmed correct sales report.
+// (Previously used b24cd69c06 "Profit by Date".) DataDoe aggregates each
+// export by the non-metric columns selected, so requesting only date +
+// seller_or_vendor_id returns one row per account per day.
+const SALES_SOURCE_ID = "401ffcd7e5";
+const SALES_COLUMNS = [
+  "date",
+  "seller_or_vendor_id",
+  "seller_or_vendor_name",
+  "marketplace_country_code",
+  "currency",
+  "total_sales",
+  "total_units",
+];
+// Advertising source (ad sales / spend / clicks per account per day),
+// fetched separately and merged with sales by (account, date).
+const ADS_SOURCE_ID = "08cdc77d3d";
+const ADS_COLUMNS = [
+  "date",
+  "seller_or_vendor_id",
+  "ad_sales",
+  "ad_spend",
+  "ad_clicks",
+];
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
+const EXPORT_ROW_LIMIT = 10000;
 
 function authHeaders(apiKey) {
   return {
@@ -64,26 +84,17 @@ async function fetchAccounts(apiKey) {
   }));
 }
 
-async function createExport(apiKey, sellerOrVendorIds, from, to) {
+async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to) {
   const r = await fetch(ENDPOINTS.exportsCreate, {
     method: "POST",
     headers: authHeaders(apiKey),
     body: JSON.stringify({
-      sourceId: SALES_SOURCE_ID,
+      sourceId,
       sellerOrVendorIds,
-      columns: [
-        "date",
-        "seller_or_vendor_id",
-        "seller_or_vendor_name",
-        "marketplace_country_code",
-        "currency",
-        "total_sales",
-        "total_units_sold",
-        "total_orders",
-      ],
+      columns,
       from,
       to,
-      limit: 2500,
+      limit: EXPORT_ROW_LIMIT,
       outputType: "JSON",
       orderByColumn: "date",
       orderByDirection: "ASC",
@@ -104,12 +115,14 @@ function chunkArray(items, size) {
   return chunks;
 }
 
-async function fetchSalesRows(apiKey, sellerOrVendorIds, from, to) {
+// Run an export for any source, chunking by the 5-id-per-export cap and
+// combining the returned rows.
+async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to) {
   const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
   const allRows = [];
 
   for (const chunk of chunks) {
-    const created = await createExport(apiKey, chunk, from, to);
+    const created = await createExport(apiKey, sourceId, columns, chunk, from, to);
     const exportId = created.exportId || created.id;
     if (created.status !== "COMPLETED") {
       await pollExport(apiKey, exportId);
@@ -119,6 +132,44 @@ async function fetchSalesRows(apiKey, sellerOrVendorIds, from, to) {
   }
 
   return allRows;
+}
+
+const num = (v) => Number(v) || 0;
+
+// Fold advertising rows (ad_sales/ad_spend/ad_clicks) into the sales rows by
+// (account, date). Ad totals attach to the first sales row for each key so
+// downstream range sums count them exactly once; days with ad activity but no
+// sales row get a synthetic zero-sales row.
+function mergeSalesAndAds(salesRows, adRows) {
+  const firstByKey = new Map();
+  for (const r of salesRows) {
+    const key = `${r.seller_or_vendor_id}|${r.date}`;
+    if (!firstByKey.has(key)) firstByKey.set(key, r);
+  }
+  for (const a of adRows) {
+    const key = `${a.seller_or_vendor_id}|${a.date}`;
+    const target = firstByKey.get(key);
+    if (target) {
+      target.ad_sales = num(target.ad_sales) + num(a.ad_sales);
+      target.ad_spend = num(target.ad_spend) + num(a.ad_spend);
+      target.ad_clicks = num(target.ad_clicks) + num(a.ad_clicks);
+    } else {
+      const row = {
+        date: a.date,
+        seller_or_vendor_id: a.seller_or_vendor_id,
+        currency: a.currency,
+        total_sales: 0,
+        total_units: 0,
+        total_units_sold: 0,
+        ad_sales: num(a.ad_sales),
+        ad_spend: num(a.ad_spend),
+        ad_clicks: num(a.ad_clicks),
+      };
+      salesRows.push(row);
+      firstByKey.set(key, row);
+    }
+  }
+  return salesRows;
 }
 
 async function pollExport(apiKey, exportId) {
@@ -168,7 +219,21 @@ export default async function handler(req, res) {
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
-      const rows = await fetchSalesRows(apiKey, sellerOrVendorIds, from, to);
+      const rows = await fetchExportRows(apiKey, SALES_SOURCE_ID, SALES_COLUMNS, sellerOrVendorIds, from, to);
+      // Normalize the source's `total_units` to the `total_units_sold` name the
+      // frontend already reads, so nothing downstream needs to change.
+      for (const r of rows) {
+        if (r.total_units !== undefined && r.total_units_sold === undefined) {
+          r.total_units_sold = r.total_units;
+        }
+      }
+      // Merge advertising figures only when asked (the Daily Reporting view),
+      // so the main dashboard stays a single fast export.
+      const wantAds = req.query.ads === "1" || req.query.ads === "true";
+      if (wantAds) {
+        const adRows = await fetchExportRows(apiKey, ADS_SOURCE_ID, ADS_COLUMNS, sellerOrVendorIds, from, to);
+        mergeSalesAndAds(rows, adRows);
+      }
       res.status(200).json({ rows });
       return;
     }
