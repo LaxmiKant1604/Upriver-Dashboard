@@ -209,7 +209,54 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, or ?action=fields" });
+    // Temporary discovery route: pull a small real sample from a source (no
+    // columns specified) to reveal its actual column names and row granularity.
+    //   /api/datadoe?action=sample&sourceId=401ffcd7e5
+    // Remove this route once the source/columns are confirmed.
+    if (action === "sample") {
+      const sourceId = req.query.sourceId || SALES_SOURCE_ID;
+      let ids = req.query.ids;
+      if (!ids) {
+        const accts = await fetchAccounts(apiKey);
+        const aak = accts.find((a) => /aakriti/i.test(a.name));
+        ids = accts.length ? (aak || accts[0]).id : "";
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean).slice(0, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
+      const to = req.query.to || new Date().toISOString().slice(0, 10);
+      const from = req.query.from || new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+
+      const createRes = await fetch(ENDPOINTS.exportsCreate, {
+        method: "POST",
+        headers: authHeaders(apiKey),
+        body: JSON.stringify({ sourceId, sellerOrVendorIds, from, to, limit: 5, outputType: "JSON" }),
+      });
+      const createText = await createRes.text().catch(() => "");
+      if (!createRes.ok) {
+        res.status(200).json({ sourceId, from, to, sellerOrVendorIds, ok: false, stage: "create", status: createRes.status, body: createText.slice(0, 2000) });
+        return;
+      }
+      let created = {};
+      try { created = JSON.parse(createText); } catch (e) { /* leave empty */ }
+      const exportId = created.exportId || created.id;
+      if (created.status !== "COMPLETED") {
+        try {
+          await pollExport(apiKey, exportId);
+        } catch (e) {
+          res.status(200).json({ sourceId, from, to, sellerOrVendorIds, ok: false, stage: "poll", error: e instanceof Error ? e.message : String(e) });
+          return;
+        }
+      }
+      const rows = await downloadExport(apiKey, exportId);
+      res.status(200).json({
+        sourceId, from, to, sellerOrVendorIds, ok: true,
+        rowCount: rows.length,
+        columns: rows.length ? Object.keys(rows[0]) : [],
+        sample: rows.slice(0, 3),
+      });
+      return;
+    }
+
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=fields, or ?action=sample" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }
