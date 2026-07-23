@@ -191,6 +191,42 @@ async function apiGet(params) {
   return body;
 }
 
+const API_CACHE_PREFIX = "upriver:datadoe:v1:";
+
+function apiCacheKey(params) {
+  const qs = new URLSearchParams();
+  Object.keys(params).sort().forEach((key) => qs.set(key, params[key]));
+  return API_CACHE_PREFIX + qs.toString();
+}
+
+function readApiCache(params) {
+  try {
+    const raw = window.localStorage.getItem(apiCacheKey(params));
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeApiCache(params, body) {
+  const cachedAt = Date.now();
+  try {
+    window.localStorage.setItem(apiCacheKey(params), JSON.stringify({ body, cachedAt }));
+  } catch (e) {
+    // Storage can be full or blocked; keep the dashboard usable even then.
+  }
+  return cachedAt;
+}
+
+async function cachedApiGet(params, { force = false } = {}) {
+  if (!force) {
+    const cached = readApiCache(params);
+    if (cached) return { ...cached, fromCache: true };
+  }
+  const body = await apiGet(params);
+  return { body, cachedAt: writeApiCache(params, body), fromCache: false };
+}
+
 /* ============================== MAIN APP ============================== */
 export default function App() {
   const [accounts, setAccounts] = useState([]);
@@ -226,29 +262,43 @@ export default function App() {
 
   const TODAY = todayStr();
 
-  useEffect(() => {
-    setAccountsLoading(true);
-    apiGet({ action: "accounts" })
-      .then((body) => {
-        // brand = a lowercase grouping key (case-insensitive matching, so
-        // "Indya Store" and "INDYA STORE" land in the same group).
-        // brandLabel = the nicely-cased label actually shown in the UI.
-        const withBrand = (body.accounts || []).map((a) => {
-          const rawBrand = inferBrand(a.name);
-          return { ...a, brand: rawBrand.toLowerCase(), brandLabel: rawBrand };
-        });
-        setAccounts(withBrand);
-        if (withBrand.length > 0) {
-          setSingleId(withBrand[0].id);
-          setBrand(withBrand[0].brand);
-          const aakriti = withBrand.find((a) => /aakriti/i.test(a.name));
-          setDailyAccountId((aakriti || withBrand[0]).id);
-        }
-        setAccountsError(null);
-      })
-      .catch((err) => setAccountsError(err.message))
-      .finally(() => setAccountsLoading(false));
+  const applyAccounts = useCallback((body) => {
+    // brand = a lowercase grouping key (case-insensitive matching, so
+    // "Indya Store" and "INDYA STORE" land in the same group).
+    // brandLabel = the nicely-cased label actually shown in the UI.
+    const withBrand = (body.accounts || []).map((a) => {
+      const rawBrand = inferBrand(a.name);
+      return { ...a, brand: rawBrand.toLowerCase(), brandLabel: rawBrand };
+    });
+    setAccounts(withBrand);
+    if (withBrand.length > 0) {
+      setSingleId((prev) => prev || withBrand[0].id);
+      setBrand((prev) => prev || withBrand[0].brand);
+      const aakriti = withBrand.find((a) => /aakriti/i.test(a.name));
+      setDailyAccountId((prev) => prev || (aakriti || withBrand[0]).id);
+    }
+    setAccountsError(null);
+    return withBrand;
   }, []);
+
+  const fetchAccounts = useCallback(() => {
+    setAccountsLoading(true);
+    setAccountsError(null);
+    return cachedApiGet({ action: "accounts" }, { force: true })
+      .then(({ body }) => applyAccounts(body))
+      .catch((err) => {
+        setAccountsError(err.message);
+        return [];
+      })
+      .finally(() => setAccountsLoading(false));
+  }, [applyAccounts]);
+
+  useEffect(() => {
+    const cached = readApiCache({ action: "accounts" });
+    if (cached) applyAccounts(cached.body);
+    else setAccountsError("No cached account list yet. Click refresh to fetch accounts from DataDoe.");
+    setAccountsLoading(false);
+  }, [applyAccounts]);
 
   const BRAND_MAP = useMemo(() => {
     const map = {};
@@ -276,46 +326,89 @@ export default function App() {
     return accounts.filter((a) => a.country === marketFilter).map((a) => a.id);
   }, [mode, singleId, brand, excluded, marketFilter, accounts, BRAND_MAP]);
 
-  const fetchRows = useCallback(() => {
+  const dashboardParams = useMemo(() => {
     if (activeIds.length === 0) {
+      return null;
+    }
+    return { action: "sales", ids: activeIds.join(","), from: addDays(monthStart(TODAY), -420), to: TODAY };
+  }, [activeIds, TODAY]);
+
+  const loadCachedRows = useCallback(() => {
+    if (!dashboardParams) {
       setRows([]);
+      return;
+    }
+    const cached = readApiCache(dashboardParams);
+    if (cached) {
+      setRows(cached.body.rows || []);
+      setLastFetchedAt(new Date(cached.cachedAt));
+      setRowsError(null);
+    } else {
+      setRows([]);
+      setLastFetchedAt(null);
+      setRowsError("No cached dashboard data for this selection. Click refresh to fetch from DataDoe.");
+    }
+  }, [dashboardParams]);
+
+  const fetchRows = useCallback(() => {
+    if (!dashboardParams) {
+      setRows([]);
+      setRowsError(accounts.length === 0 ? "No cached accounts yet. Click refresh to fetch accounts first." : null);
       return;
     }
     setRowsLoading(true);
     setRowsError(null);
-    const from = addDays(monthStart(TODAY), -420);
-    apiGet({ action: "sales", ids: activeIds.join(","), from, to: TODAY })
-      .then((body) => {
+    cachedApiGet(dashboardParams, { force: true })
+      .then(({ body, cachedAt }) => {
         setRows(body.rows || []);
-        setLastFetchedAt(new Date());
+        setLastFetchedAt(new Date(cachedAt));
       })
       .catch((err) => setRowsError(err.message))
       .finally(() => setRowsLoading(false));
-  }, [activeIds, TODAY]);
+  }, [accounts.length, dashboardParams]);
 
   useEffect(() => {
-    fetchRows();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeIds.join(",")]);
+    loadCachedRows();
+  }, [loadCachedRows]);
 
   useEffect(() => { setExcluded(new Set()); }, [brand]);
 
   // Daily Reporting fetch: pull ~5 months of single-account history so the
   // report can show 3 completed months + current-month MTD + the last 5 days.
-  const fetchDaily = useCallback(() => {
-    if (!dailyAccountId) return;
-    setDailyLoading(true);
-    setDailyError(null);
+  const dailyParams = useMemo(() => {
+    if (!dailyAccountId) return null;
     const mb = monthBack(TODAY, 5);
-    apiGet({ action: "daily", ids: dailyAccountId, from: mb.from, to: TODAY })
-      .then((body) => setDailyRows(body.rows || []))
-      .catch((err) => setDailyError(err.message))
-      .finally(() => setDailyLoading(false));
+    return { action: "daily", ids: dailyAccountId, from: mb.from, to: TODAY };
   }, [dailyAccountId, TODAY]);
 
+  const loadCachedDaily = useCallback(() => {
+    if (!dailyParams) {
+      setDailyRows([]);
+      return;
+    }
+    const cached = readApiCache(dailyParams);
+    if (cached) {
+      setDailyRows(cached.body.rows || []);
+      setDailyError(null);
+    } else {
+      setDailyRows([]);
+      setDailyError("No cached Daily Reporting data for this account. Click refresh to fetch from DataDoe.");
+    }
+  }, [dailyParams]);
+
+  const fetchDaily = useCallback(() => {
+    if (!dailyParams) return;
+    setDailyLoading(true);
+    setDailyError(null);
+    cachedApiGet(dailyParams, { force: true })
+      .then(({ body }) => setDailyRows(body.rows || []))
+      .catch((err) => setDailyError(err.message))
+      .finally(() => setDailyLoading(false));
+  }, [dailyParams]);
+
   useEffect(() => {
-    if (view === "daily") fetchDaily();
-  }, [view, fetchDaily]);
+    if (view === "daily") loadCachedDaily();
+  }, [view, loadCachedDaily]);
 
   const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
   const dailyReport = useMemo(() => {
@@ -497,10 +590,14 @@ export default function App() {
         <style>{STYLE}</style>
         <div className="loading-screen">
           <AlertTriangle size={20} style={{ marginBottom: 8 }} />
-          <div>Couldn't load accounts: {accountsError}</div>
+          <div>{accountsError}</div>
           <div style={{ fontSize: 12.5, color: "var(--ink-soft)", marginTop: 8 }}>
-            Check that DATADOE_API_KEY is set correctly in this deployment's environment variables.
+            The dashboard now uses cached data on open. Use refresh only when you want to call DataDoe.
           </div>
+          <button className="cache-refresh-btn" onClick={fetchAccounts} disabled={accountsLoading}>
+            <RefreshCw size={14} className={accountsLoading ? "spin" : ""} />
+            Refresh accounts
+          </button>
         </div>
       </div>
     );
@@ -841,6 +938,9 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .dash-root{ font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; background:var(--bg); color:var(--ink); min-height:100vh; padding-bottom:20px; }
 .mono{ font-family:'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 .loading-screen{ display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:'Manrope',sans-serif; color:var(--ink-soft); text-align:center; padding:24px; }
+.cache-refresh-btn{ margin-top:14px; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:8px 12px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; color:var(--ink); font-family:inherit; font-size:13px; font-weight:700; }
+.cache-refresh-btn:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
+.cache-refresh-btn:disabled{ cursor:not-allowed; opacity:.65; }
 
 /* ---- Sidebar shell ---- */
 .app-shell{ display:flex; align-items:stretch; min-height:100vh; }
