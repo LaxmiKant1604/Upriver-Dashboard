@@ -236,6 +236,14 @@ function normalizeBrandSalesRows(rows) {
   }));
 }
 
+function catalogBrandNames(rows) {
+  return [...new Set(
+    rows
+      .map((row) => String(row.product_brand || "").trim())
+      .filter(Boolean)
+  )].sort((a, b) => a.localeCompare(b));
+}
+
 // Aggregate raw rows to one row per (seller_or_vendor_id, date), summing the
 // given numeric fields. Used to collapse the per-ASIN daily source.
 function aggregateByAccountDate(rawRows, fields) {
@@ -373,7 +381,7 @@ export default async function handler(req, res) {
         CATALOG_ROW_LIMIT,
         { orderByColumn: "child_asin" }
       );
-      res.status(200).json({ rows: normalizeBrandSalesRows(rawRows), catalog });
+      res.status(200).json({ rows: normalizeBrandSalesRows(rawRows), catalogBrands: catalogBrandNames(catalog) });
       return;
     }
 

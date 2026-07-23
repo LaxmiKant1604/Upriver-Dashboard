@@ -225,7 +225,7 @@ export default function App() {
   const [rowsLoading, setRowsLoading] = useState(false);
   const [rowsError, setRowsError] = useState(null);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
-  const [catalog, setCatalog] = useState([]);
+  const [catalogBrands, setCatalogBrands] = useState([]);
 
   const [selectedAccountId, setSelectedAccountId] = useState(null);
   const [selectedBrand, setSelectedBrand] = useState("ALL");
@@ -300,12 +300,12 @@ export default function App() {
     const cached = readApiCache(dashboardParams);
     if (cached) {
       setRows(cached.body.rows || []);
-      setCatalog(cached.body.catalog || []);
+      setCatalogBrands(cached.body.catalogBrands || []);
       setLastFetchedAt(new Date(cached.cachedAt));
       setRowsError(null);
     } else {
       setRows([]);
-      setCatalog([]);
+      setCatalogBrands([]);
       setLastFetchedAt(null);
       setRowsError("No cached dashboard data for this selection. Click refresh to fetch from DataDoe.");
     }
@@ -322,7 +322,7 @@ export default function App() {
     cachedApiGet(dashboardParams, { force: true })
       .then(({ body, cachedAt }) => {
         setRows(body.rows || []);
-        setCatalog(body.catalog || []);
+        setCatalogBrands(body.catalogBrands || []);
         setLastFetchedAt(new Date(cachedAt));
       })
       .catch((err) => setRowsError(err.message))
@@ -433,10 +433,10 @@ export default function App() {
     return String(r.product_brand || "Unassigned").trim() || "Unassigned";
   }
   const brandList = useMemo(() => {
-    const names = new Set();
-    [...catalog, ...rows].forEach((r) => names.add(productBrand(r)));
+    const names = new Set(catalogBrands);
+    rows.forEach((r) => names.add(productBrand(r)));
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [catalog, rows]);
+  }, [catalogBrands, rows]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
