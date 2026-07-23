@@ -17,6 +17,7 @@ Last updated: 2026-07-01
 - Data source: DataDoe REST API, using a server-side `DATADOE_API_KEY`.
 - Deployment target: Vercel. Pushing code to GitHub should trigger Vercel rebuild/redeploy.
 - Critical Vercel setting: Settings -> General -> Root Directory must be `sales-dashboard-live`, because the project files are nested one folder deep.
+- Production URL: https://upriverdashboard.vercel.app
 - Local development command from the README: `npm install`, then `npm run dev`.
 
 ## Completed
@@ -26,6 +27,7 @@ Last updated: 2026-07-01
 - Added this project memory file so future work has a durable handoff location.
 - Fixed a DataDoe sales export failure caused by sending more than 5 `sellerOrVendorIds` in one export request. `sales-dashboard-live/api/datadoe.js` now chunks sales exports into batches of 5 and combines the returned rows.
 - Vercel deployment is intended to auto-deploy from the main branch.
+- Production deploy completed from the repo root with Vercel CLI on 2026-07-23. Deployment URL: https://upriver-dashboard-gchyci0gn-laxmikant1604s-projects.vercel.app. Production alias: https://upriverdashboard.vercel.app.
 - Local commit `89c30f0 Batch DataDoe sales exports` was pushed to `origin/main` after clearing the stale cached GitHub credential.
 - `DATADOE_API_KEY` is expected to be configured for Production, Preview, and Development in Vercel.
 - DataDoe authentication is verified to use the custom `datadoe-api-key` header, not standard Bearer auth.
@@ -72,6 +74,7 @@ Last updated: 2026-07-01
 - Brand grouping is heuristic: account names are grouped by stripping marketplace codes. This needs manual handling for spelling edge cases.
 - Project files should remain under `sales-dashboard-live/` unless Vercel's Root Directory setting is changed too.
 - The sidebar currently stays simple with only the Dashboard item; additional report/module options should be added later only when requested.
+- Vercel CLI should be run from the repo root, not from `sales-dashboard-live`, because the Vercel project already has Root Directory set to `sales-dashboard-live`. Running from the nested app folder makes Vercel look for `sales-dashboard-live/sales-dashboard-live`.
 
 ## Technical learnings
 
