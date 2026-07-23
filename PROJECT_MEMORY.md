@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-01
+Last updated: 2026-07-23
 
 ## Operating rule
 
@@ -35,6 +35,8 @@ Last updated: 2026-07-01
 - Account list loading has worked with 15 accounts visible in dropdowns.
 - Header UI updated: the top badge now reads `UPRIVER` instead of `PULSE`, and the account scope selector (`All Accounts`, `Single Account`, `Brand View`) moved into the header before the refresh/account status.
 - Added browser-side DataDoe response caching in `src/App.jsx`. The app now hydrates accounts, dashboard sales, and Daily Reporting from `localStorage` on open/selection changes and does not call DataDoe automatically. Network calls happen only through explicit refresh buttons, which update the matching cache entry.
+- Replaced the dashboard's `All Accounts` / `Single Account` / `Brand View` modes with a single Account Selection dropdown in the header and a Brand Selection dropdown below it. The brand dropdown includes `Select All Brands` and filters every dashboard KPI, comparison, trend, and breakdown locally from the cached response.
+- Replaced account-name heuristic brand grouping with DataDoe product-brand data. Dashboard refreshes now use the product-level sales source plus the Product Catalog by ASIN source, keeping all DataDoe calls manual and caching both the sales rollup and catalog response per account/date range.
 - Added a collapsible left sidebar shell around the existing dashboard in `src/App.jsx`. It has a brand/workspace header ("UR" logo, "Upriver Dashboard", `laxmikant@upriver.in`). Desktop supports a collapse button (icon-only mode); mobile/tablet uses an off-canvas drawer with a menu button, backdrop click, and close button. All existing filters, KPI cards, comparisons, chart, and breakdowns render unchanged inside the new `.main-area`. Icons use `lucide-react`.
 - Added a "Daily Reporting" section as a second sidebar nav item. A `view` state (`"dashboard"` | `"daily"`) switches the main content; the account-scope tabs only show in dashboard view. The Daily Reporting view is single-account (defaults to Aakriti Art Creations, matched by name) with its own account dropdown and independent fetch (`dailyRows`, ~5 months of history via `action=sales`).
 - Daily Reporting renders a table matching the user's screenshot: columns are 3 completed months + current-month MTD + the last 5 days (relative to the latest data date); rows are Total Sales, Ad Sales, Ad Spends, Clicks, Units, ROI (Ad Sales÷Ad Spend), ACoS % (Ad Spend÷Ad Sales), TACoS % (Ad Spend÷Total Sales). Table helpers: `monthBack`, `dailyReportColumns`, `DAILY_METRICS`. Wide table scrolls horizontally with a sticky metric column.
@@ -42,7 +44,7 @@ Last updated: 2026-07-01
 - Added a temporary discovery route to `api/datadoe.js`: `?action=fields` (optional `&sourceId=`). It probes candidate DataDoe source/column endpoints and returns their JSON so we can identify the advertising source id + column names. Remove this route after the ad source is confirmed. It exposes source metadata (not the API key) on the live URL while present.
 - IMPORTANT — source granularity finding: `401ffcd7e5` ("Sales & Traffic by ASIN & Date") is **per-ASIN**, ~700 rows/account/day (mostly zero-sales rows), and has no currency/name columns. It has data for AAKRITI only from ~2026-04-27 onward. Summing ALL rows per day gives correct totals (full June = ₹623,252 / 456 units, matching Seller Central expectations); a naive fetch with a low row limit truncates recent dates to ₹0. It cannot be used for the multi-account dashboard (would be millions of rows), so it is used ONLY for the single-account Daily Reporting view.
 - Architecture split in `api/datadoe.js`:
-  - `action=sales` (main dashboard): fast daily rollup source `b24cd69c06` ("Profit by Date"), columns incl. `total_orders`/`total_units_sold`, `DASHBOARD_ROW_LIMIT = 5000`. Dashboard Orders/AOV work again (guarded by a `hasOrders` check in `src/App.jsx`).
+  - `action=brand-sales` (main dashboard): Product-level **Profit by SKU & Date** data, grouped server-side by date/account/currency/product brand. It returns compact brand-aware rows plus Product Catalog by ASIN records for the selected account. The legacy `action=sales` fast daily rollup remains available for compatibility but is no longer used by the dashboard UI.
   - `action=daily` (Daily Reporting): fetches per-ASIN sales from `401ffcd7e5`, aggregates to one row per (account, date) via `aggregateByAccountDate`, then merges ads from `08cdc77d3d` (also aggregated) via `mergeSalesAndAds`. `DAILY_ROW_LIMIT = 200000`. The frontend Daily view calls `action=daily`.
 - Advertising source `08cdc77d3d`: columns `ad_sales`, `ad_spend`, `ad_clicks`. Ad rows populate the Daily Reporting Ad Sales/Ad Spends/Clicks, and ROI/ACoS/TACoS derive from them.
 - Export helpers generalized: `createExport`/`fetchExportRows(apiKey, sourceId, columns, ids, from, to, limit)` work for any source with a per-call limit.
@@ -62,8 +64,7 @@ Last updated: 2026-07-01
 - Add PPC module for ad spend, ACoS, TACoS, and campaign performance.
 - Add Inventory module for FBA stock, days-of-cover, and restock alerts.
 - Currency conversion currently uses static approximate FX rates in `src/App.jsx`; consider wiring in a live FX API or creating a maintenance process for updates.
-- Brand grouping is inferred from account names and may need manual validation after first real-data deploy.
-- Confirm whether MeridianMarKet / MeridianmarKet / MeridienMarket should merge as one brand; currently they may be treated separately because spelling differs.
+- Confirm product-brand labels in the catalog match the desired reporting taxonomy. They now come directly from Amazon/DataDoe catalog data rather than account-name heuristics.
 - YoY comparisons require roughly 13 months of account history.
 - The most recent 1-2 days of Amazon data may change as settlement data finalizes.
 - README text currently displays mojibake for some punctuation in this environment; consider normalizing the file encoding if editing it later.
@@ -72,11 +73,12 @@ Last updated: 2026-07-01
 
 - Source ID `b24cd69c06` was chosen initially for daily account-level rollup. Trade-off: it is settlement-based and can lag Seller Central by roughly 7 days. `401ffcd7e5` may match Seller Central more closely but has not been swapped in.
 - Static FX rates are hardcoded in `src/App.jsx` for now. This is simple and free, but rates need periodic updates or a live API later.
-- Brand grouping is heuristic: account names are grouped by stripping marketplace codes. This needs manual handling for spelling edge cases.
+- Brand filtering uses `product_brand` from DataDoe's catalog/product data, not account-name heuristics. Similar-looking product-brand labels will be treated as distinct until the underlying catalog data is corrected or an explicit mapping layer is added.
 - Project files should remain under `sales-dashboard-live/` unless Vercel's Root Directory setting is changed too.
 - The sidebar currently stays simple with only the Dashboard item; additional report/module options should be added later only when requested.
 - Vercel CLI should be run from the repo root, not from `sales-dashboard-live`, because the Vercel project already has Root Directory set to `sales-dashboard-live`. Running from the nested app folder makes Vercel look for `sales-dashboard-live/sales-dashboard-live`.
 - Data policy for reports: all current and future reports should use the shared cache-first pattern (`cachedApiGet` / `readApiCache`) and should call DataDoe only on manual refresh. Do not add mount/view-change auto-fetching unless the user explicitly asks for it.
+- Brand filtering is account-scoped. The selected account is the dashboard's primary scope; `Select All Brands` returns that account's overall figures, while a named product brand filters the same cached rows without another DataDoe request.
 
 ## Technical learnings
 
@@ -87,6 +89,11 @@ Last updated: 2026-07-01
 - `npm run build` currently succeeds, but Vite warns that the generated JS chunk is larger than 500 kB.
 - DataDoe REST API rate limit is understood to be 2 requests/second per organization; excess requests may return HTTP 429 with `Retry-After: 1`.
 - DataDoe exports are asynchronous: POST `/exports`, poll `/exports/{id}` until status is `COMPLETED`, then GET `/exports/{id}/raw`.
+- DataDoe public schema confirmed the source IDs and fields for product-brand filtering:
+  - `57a0cb319c10a395853afc0671579bf7ef0ff45d8a40c88ed9d2a5f61b4169a4` — **Profit by SKU & Date**. It is at child-ASIN/SKU/day grain and exposes `product_brand`, `total_sales`, `total_units_sold`, and `total_orders`.
+  - `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8` — **Product Catalog by ASIN**. It exposes `child_asin`, `parent_asin`, `product_name`, and `product_brand` and is used to populate the complete brand selector.
+  - The existing `401ffcd7e5` Sales & Traffic source has `child_asin` and `parent_asin`, but does **not** expose `asin`, `sku`, `brand`, or `brand_name` fields. Do not request those names from that source.
+  - SKU-level sales must use DataDoe `groupBy` plus `aggregations` (date/account/currency/product_brand grouped; sales/units/orders summed). Fetching selected columns alone returns repeated SKU-level rows and can truncate the dashboard result.
 - DataDoe API keys are shown only once at creation time. After that, only the prefix is visible in the UI.
 - Vercel serverless functions cannot have spaces in the filename. A file named `datadoe (1).js` under `api/` would fail deployment with `invalid_function_name`; the active API route must remain `api/datadoe.js`.
 - Changing Vercel environment variables does not auto-redeploy. Trigger a redeploy for new values to take effect.

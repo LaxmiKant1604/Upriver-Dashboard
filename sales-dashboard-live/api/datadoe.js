@@ -53,6 +53,44 @@ const DASHBOARD_COLUMNS = [
   "total_orders",
 ];
 
+// Product-level dashboard source. DataDoe's schema defines each row at the
+// child-ASIN/SKU/day grain and joins the catalog's `product_brand` field onto
+// it. Selecting date + product_brand causes DataDoe to return a compact daily
+// brand rollup instead of every individual SKU row.
+const BRAND_SALES_SOURCE_ID = "57a0cb319c10a395853afc0671579bf7ef0ff45d8a40c88ed9d2a5f61b4169a4";
+const BRAND_SALES_COLUMNS = [
+  "date",
+  "seller_or_vendor_id",
+  "seller_or_vendor_name",
+  "marketplace_country_code",
+  "currency",
+  "product_brand",
+];
+const BRAND_SALES_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "total_units_sold", aggregation: "sum", alias: "total_units_sold_sum" },
+  { column: "total_orders", aggregation: "sum", alias: "total_orders_sum" },
+];
+const BRAND_SALES_GROUP_BY = [
+  "date",
+  "seller_or_vendor_id",
+  "seller_or_vendor_name",
+  "marketplace_country_code",
+  "currency",
+  "product_brand",
+];
+
+// Product Catalog by ASIN. This is the authoritative ASIN-to-brand mapping
+// used to populate the brand selector, including brands with no sales in the
+// selected reporting window.
+const PRODUCT_CATALOG_SOURCE_ID = "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8";
+const PRODUCT_CATALOG_COLUMNS = [
+  "child_asin",
+  "parent_asin",
+  "product_name",
+  "product_brand",
+];
+
 // Daily Reporting sales source: "Sales & Traffic by ASIN & Date" (401ffcd7e5),
 // the user-confirmed accurate report. It is per-ASIN (~700 rows/account/day,
 // mostly zero-sales rows), so action=daily aggregates it to one row per account
@@ -78,6 +116,7 @@ const ADS_COLUMNS = [
 ];
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 const DASHBOARD_ROW_LIMIT = 5000;
+const CATALOG_ROW_LIMIT = 10000;
 // The per-ASIN daily source produces ~20k rows/account/month; allow a large
 // window for one account across several months.
 const DAILY_ROW_LIMIT = 200000;
@@ -135,7 +174,8 @@ async function fetchAccounts(apiKey) {
   }));
 }
 
-async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit) {
+async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
+  const { groupBy, aggregations, orderByColumn = "date" } = options;
   const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
     headers: authHeaders(apiKey),
@@ -147,8 +187,10 @@ async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, 
       to,
       limit,
       outputType: "JSON",
-      orderByColumn: "date",
+      orderByColumn,
       orderByDirection: "ASC",
+      ...(groupBy ? { groupBy } : {}),
+      ...(aggregations ? { aggregations } : {}),
     }),
   });
   if (!r.ok) {
@@ -168,12 +210,12 @@ function chunkArray(items, size) {
 
 // Run an export for any source, chunking by the 5-id-per-export cap and
 // combining the returned rows.
-async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit) {
+async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
   const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
   const allRows = [];
 
   for (const chunk of chunks) {
-    const created = await createExport(apiKey, sourceId, columns, chunk, from, to, limit);
+    const created = await createExport(apiKey, sourceId, columns, chunk, from, to, limit, options);
     const exportId = created.exportId || created.id;
     if (created.status !== "COMPLETED") {
       await pollExport(apiKey, exportId);
@@ -183,6 +225,15 @@ async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, fro
   }
 
   return allRows;
+}
+
+function normalizeBrandSalesRows(rows) {
+  return rows.map((row) => ({
+    ...row,
+    total_sales: num(row.total_sales_sum ?? row.total_sales),
+    total_units_sold: num(row.total_units_sold_sum ?? row.total_units_sold),
+    total_orders: num(row.total_orders_sum ?? row.total_orders),
+  }));
 }
 
 // Aggregate raw rows to one row per (seller_or_vendor_id, date), summing the
@@ -289,6 +340,40 @@ export default async function handler(req, res) {
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
       const rows = await fetchExportRows(apiKey, DASHBOARD_SOURCE_ID, DASHBOARD_COLUMNS, sellerOrVendorIds, from, to, DASHBOARD_ROW_LIMIT);
       res.status(200).json({ rows });
+      return;
+    }
+
+    // Brand-aware dashboard data for one selected account. The product sales
+    // source is rolled up by date + product_brand, while the catalog source
+    // supplies the account's complete ASIN/SKU-to-brand list for the filter.
+    if (action === "brand-sales") {
+      const { ids, from, to } = req.query;
+      if (!ids || !from || !to) {
+        res.status(400).json({ error: "Missing required params: ids, from, to" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      const rawRows = await fetchExportRows(
+        apiKey,
+        BRAND_SALES_SOURCE_ID,
+        BRAND_SALES_COLUMNS,
+        sellerOrVendorIds,
+        from,
+        to,
+        DASHBOARD_ROW_LIMIT,
+        { groupBy: BRAND_SALES_GROUP_BY, aggregations: BRAND_SALES_AGGREGATIONS }
+      );
+      const catalog = await fetchExportRows(
+        apiKey,
+        PRODUCT_CATALOG_SOURCE_ID,
+        PRODUCT_CATALOG_COLUMNS,
+        sellerOrVendorIds,
+        from,
+        to,
+        CATALOG_ROW_LIMIT,
+        { orderByColumn: "child_asin" }
+      );
+      res.status(200).json({ rows: normalizeBrandSalesRows(rawRows), catalog });
       return;
     }
 

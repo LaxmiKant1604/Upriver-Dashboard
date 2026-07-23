@@ -13,18 +13,6 @@ const FLAGS = { IN: "🇮🇳", US: "🇺🇸", AU: "🇦🇺", CA: "🇨🇦", 
 const SYMBOL = { INR: "₹", USD: "$", AUD: "A$", CAD: "C$", GBP: "£", EUR: "€" };
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-// Tokens stripped from the end of an account name to infer its brand.
-// e.g. "Indya Store IN" / "INDYA STORE US AU" / "Indya Store CA CA" -> "Indya Store"
-const MARKET_TOKENS = new Set(["IN", "US", "USA", "UK", "GB", "CA", "AU", "EU", "MX", "JP", "DE", "FR", "IT", "ES", "AE", "SG", "NL", "SE", "PL", "BR"]);
-
-function inferBrand(name) {
-  const tokens = name.trim().split(/\s+/);
-  while (tokens.length > 1 && MARKET_TOKENS.has(tokens[tokens.length - 1].toUpperCase())) {
-    tokens.pop();
-  }
-  return tokens.join(" ").trim() || name;
-}
-
 /* ============================== DATE HELPERS ============================== */
 function pad2(n) { return String(n).padStart(2, "0"); }
 function todayStr() { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
@@ -237,12 +225,10 @@ export default function App() {
   const [rowsLoading, setRowsLoading] = useState(false);
   const [rowsError, setRowsError] = useState(null);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
+  const [catalog, setCatalog] = useState([]);
 
-  const [mode, setMode] = useState("all");
-  const [marketFilter, setMarketFilter] = useState("ALL");
-  const [singleId, setSingleId] = useState(null);
-  const [brand, setBrand] = useState(null);
-  const [excluded, setExcluded] = useState(new Set());
+  const [selectedAccountId, setSelectedAccountId] = useState(null);
+  const [selectedBrand, setSelectedBrand] = useState("ALL");
   const [rangePreset, setRangePreset] = useState("30D");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -263,22 +249,15 @@ export default function App() {
   const TODAY = todayStr();
 
   const applyAccounts = useCallback((body) => {
-    // brand = a lowercase grouping key (case-insensitive matching, so
-    // "Indya Store" and "INDYA STORE" land in the same group).
-    // brandLabel = the nicely-cased label actually shown in the UI.
-    const withBrand = (body.accounts || []).map((a) => {
-      const rawBrand = inferBrand(a.name);
-      return { ...a, brand: rawBrand.toLowerCase(), brandLabel: rawBrand };
-    });
-    setAccounts(withBrand);
-    if (withBrand.length > 0) {
-      setSingleId((prev) => prev || withBrand[0].id);
-      setBrand((prev) => prev || withBrand[0].brand);
-      const aakriti = withBrand.find((a) => /aakriti/i.test(a.name));
-      setDailyAccountId((prev) => prev || (aakriti || withBrand[0]).id);
+    const nextAccounts = body.accounts || [];
+    setAccounts(nextAccounts);
+    if (nextAccounts.length > 0) {
+      setSelectedAccountId((prev) => prev || nextAccounts[0].id);
+      const aakriti = nextAccounts.find((a) => /aakriti/i.test(a.name));
+      setDailyAccountId((prev) => prev || (aakriti || nextAccounts[0]).id);
     }
     setAccountsError(null);
-    return withBrand;
+    return nextAccounts;
   }, []);
 
   const fetchAccounts = useCallback(() => {
@@ -300,38 +279,18 @@ export default function App() {
     setAccountsLoading(false);
   }, [applyAccounts]);
 
-  const BRAND_MAP = useMemo(() => {
-    const map = {};
-    accounts.forEach((a) => {
-      (map[a.brand] = map[a.brand] || []).push(a.id);
-    });
-    return map;
-  }, [accounts]);
-  const BRAND_LIST = useMemo(() => Object.keys(BRAND_MAP).sort(), [BRAND_MAP]);
-  const BRAND_LABELS = useMemo(() => {
-    const map = {};
-    accounts.forEach((a) => { if (!map[a.brand]) map[a.brand] = a.brandLabel || a.brand; });
-    return map;
-  }, [accounts]);
   const accountById = useMemo(() => {
     const m = {};
     accounts.forEach((a) => (m[a.id] = a));
     return m;
   }, [accounts]);
 
-  const activeIds = useMemo(() => {
-    if (mode === "single") return singleId ? [singleId] : [];
-    if (mode === "brand") return (BRAND_MAP[brand] || []).filter((id) => !excluded.has(id));
-    if (marketFilter === "ALL") return accounts.map((a) => a.id);
-    return accounts.filter((a) => a.country === marketFilter).map((a) => a.id);
-  }, [mode, singleId, brand, excluded, marketFilter, accounts, BRAND_MAP]);
-
   const dashboardParams = useMemo(() => {
-    if (activeIds.length === 0) {
+    if (!selectedAccountId) {
       return null;
     }
-    return { action: "sales", ids: activeIds.join(","), from: addDays(monthStart(TODAY), -420), to: TODAY };
-  }, [activeIds, TODAY]);
+    return { action: "brand-sales", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
+  }, [selectedAccountId, TODAY]);
 
   const loadCachedRows = useCallback(() => {
     if (!dashboardParams) {
@@ -341,10 +300,12 @@ export default function App() {
     const cached = readApiCache(dashboardParams);
     if (cached) {
       setRows(cached.body.rows || []);
+      setCatalog(cached.body.catalog || []);
       setLastFetchedAt(new Date(cached.cachedAt));
       setRowsError(null);
     } else {
       setRows([]);
+      setCatalog([]);
       setLastFetchedAt(null);
       setRowsError("No cached dashboard data for this selection. Click refresh to fetch from DataDoe.");
     }
@@ -361,6 +322,7 @@ export default function App() {
     cachedApiGet(dashboardParams, { force: true })
       .then(({ body, cachedAt }) => {
         setRows(body.rows || []);
+        setCatalog(body.catalog || []);
         setLastFetchedAt(new Date(cachedAt));
       })
       .catch((err) => setRowsError(err.message))
@@ -371,7 +333,7 @@ export default function App() {
     loadCachedRows();
   }, [loadCachedRows]);
 
-  useEffect(() => { setExcluded(new Set()); }, [brand]);
+  useEffect(() => { setSelectedBrand("ALL"); }, [selectedAccountId]);
 
   // Daily Reporting fetch: pull ~5 months of single-account history so the
   // report can show 3 completed months + current-month MTD + the last 5 days.
@@ -434,18 +396,13 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dailyRows]);
 
-  const scopeCurrency = useMemo(() => {
-    const set = new Set(activeIds.map((id) => accountById[id]?.currency).filter(Boolean));
-    return set.size === 1 ? [...set][0] : set.size === 0 ? null : "MIXED";
-  }, [activeIds, accountById]);
-  const mixedScope = scopeCurrency === "MIXED";
-  const displayCurrency = mixedScope ? "INR" : scopeCurrency || "INR";
+  const displayCurrency = accountById[selectedAccountId]?.currency || "INR";
 
   function rowCurrency(r) {
     return r.currency || accountById[r.seller_or_vendor_id]?.currency || "INR";
   }
   function salesInDisplay(r) {
-    return mixedScope ? r.total_sales * (FX[rowCurrency(r)] || 1) : r.total_sales;
+    return r.total_sales;
   }
 
   function aggregate(rowSet) {
@@ -458,18 +415,30 @@ export default function App() {
     return { sales, units, orders };
   }
 
+  const brandRows = useMemo(
+    () => rows.filter((r) => selectedBrand === "ALL" || productBrand(r) === selectedBrand),
+    [rows, selectedBrand]
+  );
   const [scopeMin, scopeMax] = useMemo(() => {
     let mn = null, mx = null;
-    rows.forEach((r) => {
+    brandRows.forEach((r) => {
       if (!mn || r.date < mn) mn = r.date;
       if (!mx || r.date > mx) mx = r.date;
     });
     return [mn, mx];
-  }, [rows]);
+  }, [brandRows]);
   const latest = scopeMax || TODAY;
 
+  function productBrand(r) {
+    return String(r.product_brand || "Unassigned").trim() || "Unassigned";
+  }
+  const brandList = useMemo(() => {
+    const names = new Set();
+    [...catalog, ...rows].forEach((r) => names.add(productBrand(r)));
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [catalog, rows]);
   function filterRows(from, to) {
-    return rows.filter((r) => r.date >= from && r.date <= to);
+    return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
   function compareValue(curFrom, curTo, prevFrom, prevTo, minDate) {
     if (!minDate || prevFrom < minDate) return { value: null, insufficient: true, curr: null };
@@ -489,7 +458,7 @@ export default function App() {
     const yoy = compareValue(monthStart(latest), latest, py.start, py.end, scopeMin);
     return { dod, wow, mtd, yoy };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, latest, scopeMin]);
+  }, [brandRows, latest, scopeMin]);
 
   const [rangeFrom, rangeTo] = useMemo(() => {
     let f, t;
@@ -506,12 +475,12 @@ export default function App() {
     return [f, t];
   }, [rangePreset, latest, scopeMin, customFrom, customTo]);
 
-  const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [rows, rangeFrom, rangeTo]);
-  const kpi = useMemo(() => aggregate(scopedRows), [scopedRows, mixedScope]);
+  const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [brandRows, rangeFrom, rangeTo]);
+  const kpi = useMemo(() => aggregate(scopedRows), [scopedRows]);
   const aov = kpi.orders > 0 ? kpi.sales / kpi.orders : 0;
   // The sales source (401ffcd7e5) has no order-count column, so Orders / AOV
   // show "—" unless an orders figure is actually present on the rows.
-  const hasOrders = useMemo(() => rows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [rows]);
+  const hasOrders = useMemo(() => brandRows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [brandRows]);
 
   const trend = useMemo(() => {
     const buckets = {};
@@ -530,12 +499,12 @@ export default function App() {
       return { key: k, label, value: buckets[k] };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopedRows, granularity, mixedScope]);
+  }, [scopedRows, granularity]);
 
   const byAccountBreakdown = useMemo(() => {
     const sums = {};
     scopedRows.forEach((r) => {
-      const v = r.total_sales * (FX[rowCurrency(r)] || 1);
+      const v = salesInDisplay(r);
       sums[r.seller_or_vendor_id] = (sums[r.seller_or_vendor_id] || 0) + v;
     });
     const total = Object.values(sums).reduce((a, b) => a + b, 0);
@@ -548,38 +517,18 @@ export default function App() {
   const byBrandBreakdown = useMemo(() => {
     const sums = {};
     scopedRows.forEach((r) => {
-      const a = accountById[r.seller_or_vendor_id];
-      const b = a?.brand || "Other";
-      const v = r.total_sales * (FX[rowCurrency(r)] || 1);
+      const b = productBrand(r);
+      const v = salesInDisplay(r);
       sums[b] = (sums[b] || 0) + v;
     });
     const total = Object.values(sums).reduce((a, b) => a + b, 0);
-    return Object.keys(sums).map((b) => ({ key: b, label: BRAND_LABELS[b] || b, flag: null, value: sums[b], share: total ? (sums[b] / total) * 100 : 0 })).sort((a, b) => b.value - a.value);
-  }, [scopedRows, accountById]);
+    return Object.keys(sums).map((b) => ({ key: b, label: b, flag: null, value: sums[b], share: total ? (sums[b] / total) * 100 : 0 })).sort((a, b) => b.value - a.value);
+  }, [scopedRows]);
 
-  const activeAccountKeys = useMemo(() => new Set(activeIds), [activeIds]);
+  const activeAccountKeys = useMemo(() => new Set(selectedAccountId ? [selectedAccountId] : []), [selectedAccountId]);
   const activeBrandKeys = useMemo(() => {
-    if (mode === "brand") return new Set([brand]);
-    if (mode === "single") return new Set([accountById[singleId]?.brand]);
-    return new Set();
-  }, [mode, brand, singleId, accountById]);
-
-  const nativeBreakdown = useMemo(() => {
-    if (!mixedScope) return [];
-    const sums = {};
-    scopedRows.forEach((r) => {
-      const a = accountById[r.seller_or_vendor_id];
-      const key = r.seller_or_vendor_id;
-      sums[key] = sums[key] || { name: a?.name || key, currency: rowCurrency(r), total: 0 };
-      sums[key].total += r.total_sales;
-    });
-    return Object.values(sums).sort((a, b) => b.total - a.total);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopedRows, mixedScope, accountById]);
-
-  const brandAccounts = BRAND_MAP[brand] || [];
-  const includedCount = brandAccounts.length - excluded.size;
-  const multiAccountBrands = useMemo(() => new Set(BRAND_LIST.filter((b) => (BRAND_MAP[b] || []).length > 1)), [BRAND_LIST, BRAND_MAP]);
+    return selectedBrand === "ALL" ? new Set() : new Set([selectedBrand]);
+  }, [selectedBrand]);
 
   if (accountsLoading) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen">Loading your Amazon accounts…</div></div>;
@@ -651,17 +600,26 @@ export default function App() {
           <span className="sub">Amazon Seller Portfolio — Sales</span>
         </div>
         {view === "dashboard" && (
-          <div className="tabs topbar-tabs">
-            <button className={"tab" + (mode === "all" ? " active" : "")} onClick={() => setMode("all")}>All Accounts</button>
-            <button className={"tab" + (mode === "single" ? " active" : "")} onClick={() => setMode("single")}>Single Account</button>
-            <button className={"tab" + (mode === "brand" ? " active" : "")} onClick={() => setMode("brand")}>Brand View</button>
+          <div className="select topbar-account-select">
+            <select
+              aria-label="Account selection"
+              value={selectedAccountId || ""}
+              onChange={(e) => setSelectedAccountId(e.target.value)}
+            >
+              {accounts.map((account) => (
+                <option value={account.id} key={account.id}>
+                  {FLAGS[account.country] || ""} {account.name} ({account.currency || "—"})
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={16} />
           </div>
         )}
         <div className="live-wrap">
           <span className="live-dot" />
           {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()}` : "Loading…"} · {accounts.length} accounts
-          <button className="refresh-btn" onClick={fetchRows} title="Refresh data">
-            <RefreshCw size={13} className={rowsLoading ? "spin" : ""} />
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh data">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
       </div>
@@ -669,41 +627,20 @@ export default function App() {
       {view === "dashboard" && (
       <div className="container">
         <div className="controls-bar">
-          {mode === "all" && (
-            <div className="chip-row">
-              {["ALL", ...Array.from(new Set(accounts.map((a) => a.country)))].map((c) => (
-                <button key={c} className={"chip" + (marketFilter === c ? " active" : "")} onClick={() => setMarketFilter(c)}>
-                  {c === "ALL" ? "All marketplaces" : `${FLAGS[c] || ""} ${c}`}
-                </button>
+          <div className="select">
+            <select
+              aria-label="Brand selection"
+              value={selectedBrand}
+              onChange={(e) => setSelectedBrand(e.target.value)}
+              disabled={brandList.length === 0}
+            >
+              <option value="ALL">Select All Brands</option>
+              {brandList.map((brandName) => (
+                <option value={brandName} key={brandName}>{brandName}</option>
               ))}
-            </div>
-          )}
-
-          {mode === "single" && (
-            <div className="select">
-              <select value={singleId || ""} onChange={(e) => setSingleId(e.target.value)}>
-                {BRAND_LIST.map((b) => (
-                  <optgroup label={BRAND_LABELS[b] || b} key={b}>
-                    {BRAND_MAP[b].map((id) => (
-                      <option value={id} key={id}>{FLAGS[accountById[id].country] || ""} {accountById[id].name} ({accountById[id].currency || "—"})</option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
-              <ChevronDown size={16} />
-            </div>
-          )}
-
-          {mode === "brand" && (
-            <div className="select">
-              <select value={brand || ""} onChange={(e) => setBrand(e.target.value)}>
-                {BRAND_LIST.map((b) => (
-                  <option value={b} key={b}>{BRAND_LABELS[b] || b}{multiAccountBrands.has(b) ? ` (${BRAND_MAP[b].length} accounts)` : ""}</option>
-                ))}
-              </select>
-              <ChevronDown size={16} />
-            </div>
-          )}
+            </select>
+            <ChevronDown size={16} />
+          </div>
 
           <div className="chip-row">
             {["7D", "30D", "90D", "MTD", "YTD", "CUSTOM"].map((p) => (
@@ -719,39 +656,6 @@ export default function App() {
             )}
           </div>
         </div>
-
-        {mode === "brand" && brand && (
-          <div className="brand-panel">
-            <div className="brand-panel-head">
-              <strong>{BRAND_LABELS[brand] || brand}</strong>
-              <span className="badge-count">{includedCount} of {brandAccounts.length} accounts combined</span>
-              {excluded.size > 0 && <button className="reset-link" onClick={() => setExcluded(new Set())}>Reset to all</button>}
-            </div>
-            <div className="check-grid">
-              {brandAccounts.map((id) => {
-                const a = accountById[id];
-                const checked = !excluded.has(id);
-                return (
-                  <label className="check-item" key={id}>
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => {
-                        setExcluded((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(id)) next.delete(id);
-                          else if (brandAccounts.length - next.size > 1) next.add(id);
-                          return next;
-                        });
-                      }}
-                    />
-                    {FLAGS[a.country] || ""} {a.name} <span style={{ color: "var(--ink-soft)" }}>({a.currency || "—"})</span>
-                  </label>
-                );
-              })}
-            </div>
-          </div>
-        )}
 
         {rowsError && (
           <div className="error-banner"><AlertTriangle size={15} /> {rowsError}</div>
@@ -822,23 +726,8 @@ export default function App() {
           <BreakdownPanel title="Sales by Brand" items={byBrandBreakdown} activeKeys={activeBrandKeys} currency="INR" />
         </div>
 
-        {mixedScope && nativeBreakdown.length > 0 && (
-          <details className="disclosure">
-            <summary>View native-currency figures for this selection (not combined)</summary>
-            <div style={{ marginTop: 10 }}>
-              {nativeBreakdown.map((n, i) => (
-                <div className="native-row" key={i}>
-                  <span>{n.name}</span>
-                  <span className="mono">{fmtMoney(n.total, n.currency)}</span>
-                </div>
-              ))}
-            </div>
-          </details>
-        )}
-
         <div className="footer-note">
-          Combined totals across currencies are converted to INR using approximate rates as of {fmtDateHuman(FX_AS_OF)}: $1 = ₹{FX.USD}, A$1 = ₹{FX.AUD}, C$1 = ₹{FX.CAD}. These rates are static in this build — update the FX constant periodically for accuracy.
-          Brand grouping is inferred automatically from account names and may need manual correction for accounts with very similar names.
+          Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export.
         </div>
       </div>
       )}
@@ -852,12 +741,8 @@ export default function App() {
           </div>
           <div className="select">
             <select value={dailyAccountId || ""} onChange={(e) => setDailyAccountId(e.target.value)}>
-              {BRAND_LIST.map((b) => (
-                <optgroup label={BRAND_LABELS[b] || b} key={b}>
-                  {BRAND_MAP[b].map((id) => (
-                    <option value={id} key={id}>{FLAGS[accountById[id].country] || ""} {accountById[id].name} ({accountById[id].currency || "—"})</option>
-                  ))}
-                </optgroup>
+              {accounts.map((account) => (
+                <option value={account.id} key={account.id}>{FLAGS[account.country] || ""} {account.name} ({account.currency || "—"})</option>
               ))}
             </select>
             <ChevronDown size={16} />
@@ -974,7 +859,8 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .brandmark{ display:flex; align-items:center; gap:10px; }
 .brandmark .mark{ font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:.06em; background:var(--ink); color:#fff; padding:5px 9px; border-radius:6px; font-size:13px; }
 .brandmark .sub{ font-size:12.5px; color:var(--ink-soft); }
-.topbar-tabs{ margin-left:auto; flex-shrink:0; }
+.topbar-account-select{ margin-left:auto; flex-shrink:1; min-width:0; }
+.topbar-account-select select{ min-width:280px; max-width:390px; }
 .live-wrap{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
 .live-dot{ width:8px; height:8px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
 .refresh-btn{ border:1px solid var(--border); background:var(--surface); border-radius:7px; padding:5px 7px; cursor:pointer; display:flex; align-items:center; color:var(--ink-soft); }
@@ -1067,10 +953,11 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .menu-btn{ display:inline-flex; }
   .sb-backdrop{ display:block; position:fixed; inset:0; background:rgba(10,12,20,.42); z-index:35; }
   .topbar{ align-items:flex-start; }
-  .topbar-tabs{ order:3; width:100%; margin-left:0; justify-content:center; }
+  .topbar-account-select{ order:3; width:100%; margin-left:0; }
+  .topbar-account-select select{ width:100%; max-width:none; }
   .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-tabs{ overflow-x:auto; justify-content:flex-start; } .tab{ white-space:nowrap; } .container{ padding:16px 14px 0;} }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .container{ padding:16px 14px 0;} }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;
