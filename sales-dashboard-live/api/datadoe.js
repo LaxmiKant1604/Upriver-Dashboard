@@ -89,8 +89,38 @@ function authHeaders(apiKey) {
   };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// DataDoe caps requests at 2/sec per organization. `ddFetch` spaces requests
+// out to stay under that cap and transparently retries on HTTP 429 using the
+// server's retry hint, so a burst of exports (e.g. the all-accounts load) or
+// concurrent tabs don't surface a rate-limit error to the user.
+let _lastDataDoeCall = 0;
+const MIN_REQUEST_INTERVAL_MS = 550;
+const MAX_RATE_LIMIT_RETRIES = 6;
+
+async function ddFetch(url, options, attempt = 0) {
+  const since = Date.now() - _lastDataDoeCall;
+  if (since < MIN_REQUEST_INTERVAL_MS) await sleep(MIN_REQUEST_INTERVAL_MS - since);
+  _lastDataDoeCall = Date.now();
+
+  const r = await fetch(url, options);
+  if (r.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+    let retrySec = Number(r.headers.get("retry-after")) || 0;
+    try {
+      const body = await r.clone().json();
+      retrySec = Number(body.retryAfterSeconds) || Number(body.config && body.config.retryAfterSeconds) || retrySec || 1;
+    } catch (e) {
+      retrySec = retrySec || 1;
+    }
+    await sleep(retrySec * 1000 + 250);
+    return ddFetch(url, options, attempt + 1);
+  }
+  return r;
+}
+
 async function fetchAccounts(apiKey) {
-  const r = await fetch(ENDPOINTS.sellers, { headers: authHeaders(apiKey) });
+  const r = await ddFetch(ENDPOINTS.sellers, { headers: authHeaders(apiKey) });
   if (!r.ok) {
     throw new Error(`DataDoe accounts request failed (${r.status}). Check the endpoint path in api/datadoe.js against https://api.datadoe.com/api/v1/docs`);
   }
@@ -106,7 +136,7 @@ async function fetchAccounts(apiKey) {
 }
 
 async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit) {
-  const r = await fetch(ENDPOINTS.exportsCreate, {
+  const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
     headers: authHeaders(apiKey),
     body: JSON.stringify({
@@ -214,7 +244,7 @@ async function pollExport(apiKey, exportId) {
   const maxAttempts = 12;
   const delayMs = 1500;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const r = await fetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
+    const r = await ddFetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
     if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
     const body = await r.json();
     if (body.status === "COMPLETED") return body;
@@ -225,7 +255,7 @@ async function pollExport(apiKey, exportId) {
 }
 
 async function downloadExport(apiKey, exportId) {
-  const r = await fetch(ENDPOINTS.exportRaw(exportId), { headers: authHeaders(apiKey) });
+  const r = await ddFetch(ENDPOINTS.exportRaw(exportId), { headers: authHeaders(apiKey) });
   if (!r.ok) throw new Error(`DataDoe export download failed (${r.status})`);
   const body = await r.json();
   if (typeof body.rawContent === "string") {
@@ -343,7 +373,7 @@ export default async function handler(req, res) {
       else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
       else columns = ["date", "seller_or_vendor_id"];
 
-      const createRes = await fetch(ENDPOINTS.exportsCreate, {
+      const createRes = await ddFetch(ENDPOINTS.exportsCreate, {
         method: "POST",
         headers: authHeaders(apiKey),
         body: JSON.stringify({ sourceId, sellerOrVendorIds, columns, from, to, limit, outputType: "JSON", orderByColumn: "date", orderByDirection: "ASC" }),

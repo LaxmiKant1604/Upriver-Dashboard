@@ -43,6 +43,7 @@ Last updated: 2026-07-01
   - `action=daily` (Daily Reporting): fetches per-ASIN sales from `401ffcd7e5`, aggregates to one row per (account, date) via `aggregateByAccountDate`, then merges ads from `08cdc77d3d` (also aggregated) via `mergeSalesAndAds`. `DAILY_ROW_LIMIT = 200000`. The frontend Daily view calls `action=daily`.
 - Advertising source `08cdc77d3d`: columns `ad_sales`, `ad_spend`, `ad_clicks`. Ad rows populate the Daily Reporting Ad Sales/Ad Spends/Clicks, and ROI/ACoS/TACoS derive from them.
 - Export helpers generalized: `createExport`/`fetchExportRows(apiKey, sourceId, columns, ids, from, to, limit)` work for any source with a per-call limit.
+- Rate limiting: DataDoe caps at 2 requests/sec per organization; the all-accounts dashboard load (chunked exports) plus any concurrent usage was surfacing HTTP 429 in the UI. Added `ddFetch` in `api/datadoe.js` — a wrapper that spaces DataDoe requests ~550ms apart (`MIN_REQUEST_INTERVAL_MS`) and auto-retries on 429 using `retryAfterSeconds`/`Retry-After` (up to 6 times). All accounts/export/poll/download calls route through it. The account-scope tabs are NOT the cause of the 429.
 
 ## In progress
 
@@ -84,6 +85,7 @@ Last updated: 2026-07-01
 - DataDoe API keys are shown only once at creation time. After that, only the prefix is visible in the UI.
 - Vercel serverless functions cannot have spaces in the filename. A file named `datadoe (1).js` under `api/` would fail deployment with `invalid_function_name`; the active API route must remain `api/datadoe.js`.
 - Changing Vercel environment variables does not auto-redeploy. Trigger a redeploy for new values to take effect.
+- DataDoe AI Skills reference for Claude/Codex handoff and future report ideas: https://github.com/Deltologic/datadoe-ai-skills. Also review DataDoe Hub's AI skills/docs pages when designing new modules, especially reconciliation dashboards, orders manager, ASIN/search audit, export discovery, REST fallback, polling, and rate-limit guidance.
 
 ## Amazon accounts inventory
 
