@@ -61,9 +61,8 @@ function dailyReportColumns(latest, monthsBack, days) {
   return cols;
 }
 
-// Ad columns aren't wired into the DataDoe export yet (source/column names are
-// being confirmed via ?action=fields). Read them optimistically under a few
-// likely names so the table auto-fills once the export includes them.
+// The daily API returns these advertising fields. Keep a few aliases so the
+// table stays resilient if DataDoe changes an export field name later.
 const AD_SALES_KEYS = ["ad_sales", "advertising_sales", "ppc_sales", "sponsored_products_sales", "attributed_sales"];
 const AD_SPEND_KEYS = ["ad_spend", "ad_spends", "advertising_spend", "ppc_spend", "spend", "cost"];
 const CLICKS_KEYS = ["clicks", "total_clicks", "ad_clicks"];
@@ -374,10 +373,13 @@ export default function App() {
 
   const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
   const dailyReport = useMemo(() => {
-    // Anchor to yesterday at the latest — today is always excluded, since
-    // today's sales/ad numbers are still accumulating and not a full day.
+    // The sales source can emit a newer zero-sales row before its daily data
+    // arrives. Anchor to the latest completed sales date, not that placeholder.
     const yesterday = addDays(TODAY, -1);
-    let latest = dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null) || yesterday;
+    const rowsWithSales = dailyRows.filter((r) => Number(r.total_sales) > 0 || Number(r.total_units_sold) > 0);
+    let latest = rowsWithSales.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null)
+      || dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null)
+      || yesterday;
     if (latest > yesterday) latest = yesterday;
     const columns = dailyReportColumns(latest, 3, 5);
     const cells = columns.map((col) => {
@@ -757,7 +759,7 @@ export default function App() {
           <div className="panel-head">
             <div>
               <div className="panel-title">{accountById[dailyAccountId]?.name || "Account"}</div>
-              <div className="page-sub">Latest data: {fmtDateHuman(dailyReport.latest)} · shown in {dailyCurrency}</div>
+              <div className="page-sub">Latest completed sales: {fmtDateHuman(dailyReport.latest)} · shown in {dailyCurrency}</div>
             </div>
             <button className="refresh-btn" onClick={fetchDaily} title="Refresh data">
               <RefreshCw size={13} className={dailyLoading ? "spin" : ""} />
@@ -792,7 +794,7 @@ export default function App() {
 
         <div className="footer-note">
           ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
-          Ad Sales, Ad Spend, and Clicks show "—" until the DataDoe advertising source is wired in — use <code>/api/datadoe?action=fields</code> on the live site to find its source id and column names, then add those columns to the export.
+          Sales and units are sourced from DataDoe Sales & Traffic by ASIN & Date. Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export. The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
       </div>
       )}

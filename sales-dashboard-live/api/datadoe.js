@@ -92,16 +92,17 @@ const PRODUCT_CATALOG_COLUMNS = [
 ];
 
 // Daily Reporting sales source: "Sales & Traffic by ASIN & Date" (401ffcd7e5),
-// the user-confirmed accurate report. It is per-ASIN (~700 rows/account/day,
-// mostly zero-sales rows), so action=daily aggregates it to one row per account
-// per day server-side. It has no currency/name columns, so only id + metrics
-// are requested. Used only for the single-account Daily Reporting view.
+// the user-confirmed accurate report. It is per-ASIN, so DataDoe aggregates it
+// by account/date before the server returns it to the dashboard.
 const DAILY_SALES_SOURCE_ID = "401ffcd7e5";
 const DAILY_SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
-  "total_sales",
-  "total_units",
+];
+const DAILY_SALES_GROUP_BY = ["date", "seller_or_vendor_id"];
+const DAILY_SALES_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "total_units", aggregation: "sum", alias: "total_units_sum" },
 ];
 
 // Advertising source (ad sales / spend / clicks), merged into the daily report
@@ -110,16 +111,19 @@ const ADS_SOURCE_ID = "08cdc77d3d";
 const ADS_COLUMNS = [
   "date",
   "seller_or_vendor_id",
-  "ad_sales",
-  "ad_spend",
-  "ad_clicks",
+];
+const ADS_GROUP_BY = ["date", "seller_or_vendor_id"];
+const ADS_AGGREGATIONS = [
+  { column: "ad_sales", aggregation: "sum", alias: "ad_sales_sum" },
+  { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
+  { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
 ];
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 const DASHBOARD_ROW_LIMIT = 5000;
 const CATALOG_ROW_LIMIT = 10000;
-// The per-ASIN daily source produces ~20k rows/account/month; allow a large
-// window for one account across several months.
-const DAILY_ROW_LIMIT = 200000;
+// Daily sources are aggregated by account/date before download, so a compact
+// limit safely covers years of history without raw ASIN row truncation.
+const DAILY_ROW_LIMIT = 5000;
 
 function authHeaders(apiKey) {
   return {
@@ -236,29 +240,29 @@ function normalizeBrandSalesRows(rows) {
   }));
 }
 
+function normalizeDailySalesRows(rows) {
+  return rows.map((row) => ({
+    ...row,
+    total_sales: num(row.total_sales_sum ?? row.total_sales),
+    total_units: num(row.total_units_sum ?? row.total_units),
+  }));
+}
+
+function normalizeAdRows(rows) {
+  return rows.map((row) => ({
+    ...row,
+    ad_sales: num(row.ad_sales_sum ?? row.ad_sales),
+    ad_spend: num(row.ad_spend_sum ?? row.ad_spend),
+    ad_clicks: num(row.ad_clicks_sum ?? row.ad_clicks),
+  }));
+}
+
 function catalogBrandNames(rows) {
   return [...new Set(
     rows
       .map((row) => String(row.product_brand || "").trim())
       .filter(Boolean)
   )].sort((a, b) => a.localeCompare(b));
-}
-
-// Aggregate raw rows to one row per (seller_or_vendor_id, date), summing the
-// given numeric fields. Used to collapse the per-ASIN daily source.
-function aggregateByAccountDate(rawRows, fields) {
-  const byKey = new Map();
-  for (const r of rawRows) {
-    const key = `${r.seller_or_vendor_id}|${r.date}`;
-    let agg = byKey.get(key);
-    if (!agg) {
-      agg = { date: r.date, seller_or_vendor_id: r.seller_or_vendor_id };
-      for (const f of fields) agg[f] = 0;
-      byKey.set(key, agg);
-    }
-    for (const f of fields) agg[f] += num(r[f]);
-  }
-  return [...byKey.values()];
 }
 
 const num = (v) => Number(v) || 0;
@@ -385,9 +389,8 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Daily Reporting data: single-account sales/units from the accurate but
-    // per-ASIN source 401ffcd7e5 (aggregated to one row per day), merged with
-    // advertising figures from 08cdc77d3d.
+    // Daily Reporting data: the sales and advertising sources are both
+    // aggregated by account/date in DataDoe, then merged server-side.
     if (action === "daily") {
       const { ids, from, to } = req.query;
       if (!ids || !from || !to) {
@@ -395,11 +398,29 @@ export default async function handler(req, res) {
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
-      const salesRaw = await fetchExportRows(apiKey, DAILY_SALES_SOURCE_ID, DAILY_SALES_COLUMNS, sellerOrVendorIds, from, to, DAILY_ROW_LIMIT);
-      const rows = aggregateByAccountDate(salesRaw, ["total_sales", "total_units"]);
+      const salesRaw = await fetchExportRows(
+        apiKey,
+        DAILY_SALES_SOURCE_ID,
+        DAILY_SALES_COLUMNS,
+        sellerOrVendorIds,
+        from,
+        to,
+        DAILY_ROW_LIMIT,
+        { groupBy: DAILY_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
+      );
+      const rows = normalizeDailySalesRows(salesRaw);
       for (const r of rows) r.total_units_sold = r.total_units;
-      const adRaw = await fetchExportRows(apiKey, ADS_SOURCE_ID, ADS_COLUMNS, sellerOrVendorIds, from, to, DAILY_ROW_LIMIT);
-      const ads = aggregateByAccountDate(adRaw, ["ad_sales", "ad_spend", "ad_clicks"]);
+      const adRaw = await fetchExportRows(
+        apiKey,
+        ADS_SOURCE_ID,
+        ADS_COLUMNS,
+        sellerOrVendorIds,
+        from,
+        to,
+        DAILY_ROW_LIMIT,
+        { groupBy: ADS_GROUP_BY, aggregations: ADS_AGGREGATIONS }
+      );
+      const ads = normalizeAdRows(adRaw);
       mergeSalesAndAds(rows, ads);
       res.status(200).json({ rows });
       return;

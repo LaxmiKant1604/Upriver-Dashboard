@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 ## Operating rule
 
@@ -48,14 +48,14 @@ Last updated: 2026-07-23
 - IMPORTANT — source granularity finding: `401ffcd7e5` ("Sales & Traffic by ASIN & Date") is **per-ASIN**, ~700 rows/account/day (mostly zero-sales rows), and has no currency/name columns. It has data for AAKRITI only from ~2026-04-27 onward. Summing ALL rows per day gives correct totals (full June = ₹623,252 / 456 units, matching Seller Central expectations); a naive fetch with a low row limit truncates recent dates to ₹0. It cannot be used for the multi-account dashboard (would be millions of rows), so it is used ONLY for the single-account Daily Reporting view.
 - Architecture split in `api/datadoe.js`:
   - `action=brand-sales` (main dashboard): Product-level **Profit by SKU & Date** data, grouped server-side by date/account/currency/product brand. It returns compact brand-aware rows plus Product Catalog by ASIN records for the selected account. The legacy `action=sales` fast daily rollup remains available for compatibility but is no longer used by the dashboard UI.
-  - `action=daily` (Daily Reporting): fetches per-ASIN sales from `401ffcd7e5`, aggregates to one row per (account, date) via `aggregateByAccountDate`, then merges ads from `08cdc77d3d` (also aggregated) via `mergeSalesAndAds`. `DAILY_ROW_LIMIT = 200000`. The frontend Daily view calls `action=daily`.
+  - `action=daily` (Daily Reporting): DataDoe now aggregates sales and ads server-side by `(seller_or_vendor_id, date)`, then the API merges the two compact results. This avoids raw ASIN/ad-row truncation and returns one row per day to the frontend.
 - Advertising source `08cdc77d3d`: columns `ad_sales`, `ad_spend`, `ad_clicks`. Ad rows populate the Daily Reporting Ad Sales/Ad Spends/Clicks, and ROI/ACoS/TACoS derive from them.
 - Export helpers generalized: `createExport`/`fetchExportRows(apiKey, sourceId, columns, ids, from, to, limit)` work for any source with a per-call limit.
 - Rate limiting: DataDoe caps at 2 requests/sec per organization; the all-accounts dashboard load (chunked exports) plus any concurrent usage was surfacing HTTP 429 in the UI. Added `ddFetch` in `api/datadoe.js` — a wrapper that spaces DataDoe requests ~550ms apart (`MIN_REQUEST_INTERVAL_MS`) and auto-retries on 429 using `retryAfterSeconds`/`Retry-After` (up to 6 times). All accounts/export/poll/download calls route through it. The account-scope tabs are NOT the cause of the 429.
 
 ## In progress
 
-- Verify the migrated numbers on the live site (both the main dashboard and the Daily Reporting ad rows) against Seller Central, since the sales source changed from `b24cd69c06` to `401ffcd7e5`.
+- Deploy and live-verify the Daily Reporting aggregation/freshness correction completed on 2026-07-24.
 - Temporary discovery routes `?action=fields` and `?action=sample` still exist in `api/datadoe.js`; remove them now that sources/columns are confirmed.
 
 ## Pending tasks and known follow-ups
@@ -98,6 +98,8 @@ Last updated: 2026-07-23
   - The existing `401ffcd7e5` Sales & Traffic source has `child_asin` and `parent_asin`, but does **not** expose `asin`, `sku`, `brand`, or `brand_name` fields. Do not request those names from that source.
   - SKU-level sales must use DataDoe `groupBy` plus `aggregations` (date/account/currency/product_brand grouped; sales/units/orders summed). Fetching selected columns alone returns repeated SKU-level rows and can truncate the dashboard result.
   - Product Catalog by ASIN can be large (many product descriptions and ASINs). Do not cache/send the raw catalog in the browser response when only brand filtering is required; collapse it server-side to unique `product_brand` labels.
+  - Daily Reporting validation on 2026-07-24 for AAKRITI ART CREATIONS IN: June 2026 totals from `action=daily` exactly reconciled to a direct `401ffcd7e5` Sales & Traffic export: `₹633,481.37` sales and `467` units across `20,779` ASIN-level rows. The API output contained `88` unique daily rows and no duplicate dates.
+  - The Sales & Traffic source may expose a current zero-sales row before its sales/units finish loading. For example, July 23 had zero sales/units but nonzero ads. The Daily Reporting table must anchor on the latest date with completed sales/units rather than the maximum raw date.
 - DataDoe API keys are shown only once at creation time. After that, only the prefix is visible in the UI.
 - Vercel serverless functions cannot have spaces in the filename. A file named `datadoe (1).js` under `api/` would fail deployment with `invalid_function_name`; the active API route must remain `api/datadoe.js`.
 - Changing Vercel environment variables does not auto-redeploy. Trigger a redeploy for new values to take effect.
