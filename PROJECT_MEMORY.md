@@ -58,12 +58,14 @@ Last updated: 2026-07-24
 
 ## In progress
 
-- No active implementation work.
+- No active implementation work. The next implementation decision is whether the dashboard's headline sales metric should be changed from profit/settlement sales to ordered item sales so it exactly follows the Seller Central Order Report.
 - Temporary discovery routes `?action=fields` and `?action=sample` still exist in `api/datadoe.js`; remove them now that sources/columns are confirmed.
 
 ## Pending tasks and known follow-ups
 
 - Verify sales numbers on the live dashboard match Seller Central expectations.
+- If the desired headline metric is Seller Central's Order Report total, change the main dashboard from `Profit by SKU & Date` to DataDoe's per-account **Order Line Items** source. Discover that source dynamically using `GET /api/v1/exports/sources?sellerOrVendorIds=<id>` and aggregate `sum_item_price` by order date. Preserve product-brand filtering by joining the existing catalog data to the order item's ASIN/SKU.
+- Repair or make optional the Daily Reporting advertising source `08cdc77d3d`: on 2026-07-24 it returned `404 Source not found`, which currently prevents a manual `action=daily` refresh even when the sales export succeeds.
 - Consider switching sales source from `b24cd69c06` (Profit by Date, settlement-based, roughly 7-day lag) to `401ffcd7e5` (Sales & Traffic by ASIN & Date, roughly 4-day lag, closer to Seller Central) if accuracy is off.
 - Sidebar is intentionally a minimal foundation: only the "Dashboard" nav item exists for now. Add further report/module nav items (e.g. Profit, PPC, Inventory) into the `.sb-nav` block in `src/App.jsx` later, only when the user decides which modules are needed.
 - Add Profit module for net margin analysis.
@@ -103,6 +105,9 @@ Last updated: 2026-07-24
   - Product Catalog by ASIN can be large (many product descriptions and ASINs). Do not cache/send the raw catalog in the browser response when only brand filtering is required; collapse it server-side to unique `product_brand` labels.
   - Daily Reporting validation on 2026-07-24 for AAKRITI ART CREATIONS IN: June 2026 totals from `action=daily` exactly reconciled to a direct `401ffcd7e5` Sales & Traffic export: `₹633,481.37` sales and `467` units across `20,779` ASIN-level rows. The API output contained `88` unique daily rows and no duplicate dates.
   - The Sales & Traffic source may expose a current zero-sales row before its sales/units finish loading. For example, July 23 had zero sales/units but nonzero ads. The Daily Reporting table must anchor on the latest date with completed sales/units rather than the maximum raw date.
+  - Seller Central reconciliation on 2026-07-24, using the attached `C:\\Users\\laxmi\\Downloads\\788561020658.txt` Order Report for 2026-07-23: the report is for **Indya Store IN** and totals `INR 159,954.00` item price across 345 lines. It consists of `INR 137,346.00` shipped and `INR 22,608.00` pending; 22 cancelled lines have zero value. The deployed main dashboard's `action=brand-sales` route (source `57a0...`, Profit by SKU & Date) returned `INR 135,220.00`, 281 units, and 259 orders for the same account/date. The `INR 24,734.00` gap is primarily the pending order value (`INR 22,608.00`); the remaining `INR 2,126.00` is consistent with the source's settlement/profit-oriented adjustments rather than raw ordered item price. Do not claim these two report types should reconcile exactly.
+  - The same live reconciliation found no 2026-07-23 rows in the `401ffcd7e5` Sales & Traffic by ASIN & Date source for any connected account, so it cannot currently provide yesterday's Seller Central total. This is source freshness/availability, not a frontend cache or aggregation defect.
+  - Daily Reporting's configured advertising source `08cdc77d3d` currently responds `404 Source not found` from DataDoe. Since `action=daily` fetches ads after sales, the 404 aborts the whole manual daily response. The code should degrade gracefully to sales-only data until a valid ads source ID is discovered.
 - DataDoe API keys are shown only once at creation time. After that, only the prefix is visible in the UI.
 - Vercel serverless functions cannot have spaces in the filename. A file named `datadoe (1).js` under `api/` would fail deployment with `invalid_function_name`; the active API route must remain `api/datadoe.js`.
 - Changing Vercel environment variables does not auto-redeploy. Trigger a redeploy for new values to take effect.
