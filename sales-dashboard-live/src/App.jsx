@@ -467,6 +467,15 @@ export default function App() {
   const [rangeFrom, rangeTo] = useMemo(() => {
     let f, t;
     switch (rangePreset) {
+      case "YESTERDAY": {
+        // Use the prior calendar day when it is available; a delayed source
+        // falls back to its latest completed date instead of creating an
+        // inverted range.
+        const yesterday = addDays(TODAY, -1);
+        f = yesterday <= latest ? yesterday : latest;
+        t = f;
+        break;
+      }
       case "7D": f = addDays(latest, -6); t = latest; break;
       case "90D": f = addDays(latest, -89); t = latest; break;
       case "MTD": f = monthStart(latest); t = latest; break;
@@ -604,11 +613,15 @@ export default function App() {
           <span className="sub">Amazon Seller Portfolio — Sales</span>
         </div>
         {view === "dashboard" && (
+          <div className="topbar-filters">
           <div className="select topbar-account-select">
             <select
               aria-label="Account selection"
               value={selectedAccountId || ""}
-              onChange={(e) => setSelectedAccountId(e.target.value)}
+              onChange={(e) => {
+                setSelectedAccountId(e.target.value);
+                setSelectedBrand("ALL");
+              }}
             >
               {accounts.map((account) => (
                 <option value={account.id} key={account.id}>
@@ -618,20 +631,7 @@ export default function App() {
             </select>
             <ChevronDown size={16} />
           </div>
-        )}
-        <div className="live-wrap">
-          <span className="live-dot" />
-          {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()}` : "Loading…"} · {accounts.length} accounts
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh data">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : rowsLoading) ? "spin" : ""} />
-          </button>
-        </div>
-      </div>
-
-      {view === "dashboard" && (
-      <div className="container">
-        <div className="controls-bar">
-          <div className="select">
+          <div className="select topbar-brand-select">
             <select
               aria-label="Brand selection"
               value={selectedBrand}
@@ -645,11 +645,24 @@ export default function App() {
             </select>
             <ChevronDown size={16} />
           </div>
+          </div>
+        )}
+        <div className="live-wrap">
+          <span className="live-dot" />
+          {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()}` : "Loading…"} · {accounts.length} accounts
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh data">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : rowsLoading) ? "spin" : ""} />
+          </button>
+        </div>
+      </div>
 
+      {view === "dashboard" && (
+      <div className="container">
+        <div className="controls-bar dashboard-controls">
           <div className="chip-row">
-            {["7D", "30D", "90D", "MTD", "YTD", "CUSTOM"].map((p) => (
+            {["YESTERDAY", "7D", "30D", "90D", "MTD", "YTD", "CUSTOM"].map((p) => (
               <button key={p} className={"chip" + (rangePreset === p ? " active" : "")} onClick={() => setRangePreset(p)}>
-                {p === "CUSTOM" ? "Custom" : p}
+                {p === "YESTERDAY" ? "Yesterday" : p === "CUSTOM" ? "Custom" : p}
               </button>
             ))}
             {rangePreset === "CUSTOM" && (
@@ -863,8 +876,11 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .brandmark{ display:flex; align-items:center; gap:10px; }
 .brandmark .mark{ font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:.06em; background:var(--ink); color:#fff; padding:5px 9px; border-radius:6px; font-size:13px; }
 .brandmark .sub{ font-size:12.5px; color:var(--ink-soft); }
-.topbar-account-select{ margin-left:auto; flex-shrink:1; min-width:0; }
+.topbar-filters{ display:flex; align-items:center; gap:8px; margin-left:auto; min-width:0; }
+.topbar-account-select{ flex-shrink:1; min-width:0; }
 .topbar-account-select select{ min-width:280px; max-width:390px; }
+.topbar-brand-select{ flex-shrink:1; min-width:0; }
+.topbar-brand-select select{ min-width:210px; max-width:280px; }
 .live-wrap{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
 .live-dot{ width:8px; height:8px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
 .refresh-btn{ border:1px solid var(--border); background:var(--surface); border-radius:7px; padding:5px 7px; cursor:pointer; display:flex; align-items:center; color:var(--ink-soft); }
@@ -876,6 +892,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .tab{ border:none; background:transparent; padding:8px 16px; font-size:13.5px; font-weight:700; color:var(--ink-soft); border-radius:9px; cursor:pointer; font-family:inherit; }
 .tab.active{ background:var(--ink); color:#fff; }
 .controls-bar{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:16px; flex-wrap:wrap; }
+.dashboard-controls{ justify-content:flex-end; }
 .chip-row{ display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
 .chip{ border:1px solid var(--border); background:var(--surface); padding:6px 12px; font-size:12.5px; font-weight:700; border-radius:8px; cursor:pointer; color:var(--ink-soft); font-family:inherit; }
 .chip.active{ border-color:var(--accent-deep); background:#FEF3E2; color:var(--accent-deep); }
@@ -957,11 +974,12 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .menu-btn{ display:inline-flex; }
   .sb-backdrop{ display:block; position:fixed; inset:0; background:rgba(10,12,20,.42); z-index:35; }
   .topbar{ align-items:flex-start; }
-  .topbar-account-select{ order:3; width:100%; margin-left:0; }
-  .topbar-account-select select{ width:100%; max-width:none; }
+  .topbar-filters{ order:3; width:100%; margin-left:0; display:grid; grid-template-columns:minmax(0,1.5fr) minmax(160px,1fr); }
+  .topbar-account-select,.topbar-brand-select{ width:100%; }
+  .topbar-account-select select,.topbar-brand-select select{ width:100%; max-width:none; }
   .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .container{ padding:16px 14px 0;} }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;
