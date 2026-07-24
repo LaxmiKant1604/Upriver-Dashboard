@@ -53,31 +53,31 @@ const DASHBOARD_COLUMNS = [
   "total_orders",
 ];
 
-// Product-level dashboard source. DataDoe's schema defines each row at the
-// child-ASIN/SKU/day grain and joins the catalog's `product_brand` field onto
-// it. Selecting date + product_brand causes DataDoe to return a compact daily
-// brand rollup instead of every individual SKU row.
-const BRAND_SALES_SOURCE_ID = "57a0cb319c10a395853afc0671579bf7ef0ff45d8a40c88ed9d2a5f61b4169a4";
-const BRAND_SALES_COLUMNS = [
+// Main dashboard sales source. Order Line Items is the Seller Central order
+// report equivalent: `item_price_value` is the source-of-truth ordered item
+// value, including pending orders. It intentionally replaces Profit by SKU &
+// Date, which includes shipped orders only and therefore cannot reconcile to
+// Seller Central's Order Report total.
+const ORDER_LINE_ITEMS_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
+const ORDER_SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
   "seller_or_vendor_name",
   "marketplace_country_code",
-  "currency",
-  "product_brand",
+  "item_price_currency",
+  "child_asin",
 ];
-const BRAND_SALES_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
-  { column: "total_units_sold", aggregation: "sum", alias: "total_units_sold_sum" },
-  { column: "total_orders", aggregation: "sum", alias: "total_orders_sum" },
+const ORDER_SALES_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sold_sum" },
 ];
-const BRAND_SALES_GROUP_BY = [
+const ORDER_SALES_GROUP_BY = [
   "date",
   "seller_or_vendor_id",
   "seller_or_vendor_name",
   "marketplace_country_code",
-  "currency",
-  "product_brand",
+  "item_price_currency",
+  "child_asin",
 ];
 
 // Product Catalog by ASIN. This is the authoritative ASIN-to-brand mapping
@@ -120,6 +120,9 @@ const ADS_AGGREGATIONS = [
 ];
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 const DASHBOARD_ROW_LIMIT = 5000;
+// Order rows are grouped by day and ASIN before download. A year of data can
+// still contain more than 5,000 ASIN/day groups, so use a higher export cap.
+const ORDER_SALES_ROW_LIMIT = 50000;
 const CATALOG_ROW_LIMIT = 10000;
 // Daily sources are aggregated by account/date before download, so a compact
 // limit safely covers years of history without raw ASIN row truncation.
@@ -231,13 +234,46 @@ async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, fro
   return allRows;
 }
 
-function normalizeBrandSalesRows(rows) {
-  return rows.map((row) => ({
-    ...row,
-    total_sales: num(row.total_sales_sum ?? row.total_sales),
-    total_units_sold: num(row.total_units_sold_sum ?? row.total_units_sold),
-    total_orders: num(row.total_orders_sum ?? row.total_orders),
-  }));
+function orderSalesByBrand(rows, catalogRows) {
+  const brandByAsin = new Map();
+  for (const catalogRow of catalogRows) {
+    const asin = String(catalogRow.child_asin || "").trim();
+    const brand = String(catalogRow.product_brand || "").trim();
+    if (asin && brand) brandByAsin.set(asin, brand);
+  }
+
+  // The export is compact at date/ASIN grain. Join the catalog brand and fold
+  // those ASIN rows again so the browser receives only date/brand totals.
+  const totals = new Map();
+  for (const row of rows) {
+    const productBrand = brandByAsin.get(String(row.child_asin || "").trim()) || "Unassigned";
+    const currency = row.item_price_currency || row.currency || null;
+    const key = [
+      row.date,
+      row.seller_or_vendor_id,
+      row.seller_or_vendor_name,
+      row.marketplace_country_code,
+      currency,
+      productBrand,
+    ].join("|");
+    const current = totals.get(key) || {
+      date: row.date,
+      seller_or_vendor_id: row.seller_or_vendor_id,
+      seller_or_vendor_name: row.seller_or_vendor_name,
+      marketplace_country_code: row.marketplace_country_code,
+      currency,
+      product_brand: productBrand,
+      total_sales: 0,
+      total_units_sold: 0,
+      // A compact ASIN-level export cannot deduplicate order IDs across ASINs.
+      // Leave Orders/AOV unavailable rather than showing a misleading value.
+      total_orders: null,
+    };
+    current.total_sales += num(row.total_sales_sum ?? row.item_price_value);
+    current.total_units_sold += num(row.total_units_sold_sum ?? row.quantity);
+    totals.set(key, current);
+  }
+  return [...totals.values()];
 }
 
 function normalizeDailySalesRows(rows) {
@@ -355,9 +391,10 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Brand-aware dashboard data for one selected account. The product sales
-    // source is rolled up by date + product_brand, while the catalog source
-    // supplies the account's complete ASIN/SKU-to-brand list for the filter.
+    // Brand-aware dashboard data for one selected account. Order Line Items
+    // is rolled up by date + ASIN, then joined to the catalog's product_brand
+    // field server-side. This keeps headline sales aligned to Seller Central's
+    // Order Report while retaining the existing brand filter.
     if (action === "brand-sales") {
       const { ids, from, to } = req.query;
       if (!ids || !from || !to) {
@@ -367,13 +404,13 @@ export default async function handler(req, res) {
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
       const rawRows = await fetchExportRows(
         apiKey,
-        BRAND_SALES_SOURCE_ID,
-        BRAND_SALES_COLUMNS,
+        ORDER_LINE_ITEMS_SOURCE_ID,
+        ORDER_SALES_COLUMNS,
         sellerOrVendorIds,
         from,
         to,
-        DASHBOARD_ROW_LIMIT,
-        { groupBy: BRAND_SALES_GROUP_BY, aggregations: BRAND_SALES_AGGREGATIONS }
+        ORDER_SALES_ROW_LIMIT,
+        { groupBy: ORDER_SALES_GROUP_BY, aggregations: ORDER_SALES_AGGREGATIONS }
       );
       const catalog = await fetchExportRows(
         apiKey,
@@ -385,7 +422,7 @@ export default async function handler(req, res) {
         CATALOG_ROW_LIMIT,
         { orderByColumn: "child_asin" }
       );
-      res.status(200).json({ rows: normalizeBrandSalesRows(rawRows), catalogBrands: catalogBrandNames(catalog) });
+      res.status(200).json({ rows: orderSalesByBrand(rawRows, catalog), catalogBrands: catalogBrandNames(catalog) });
       return;
     }
 

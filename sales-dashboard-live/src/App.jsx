@@ -288,7 +288,9 @@ export default function App() {
     if (!selectedAccountId) {
       return null;
     }
-    return { action: "brand-sales", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
+    // Bump this whenever the backend changes the metric definition so a
+    // previously cached report can never be presented as the new one.
+    return { action: "brand-sales", reportVersion: "order-items-v1", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
   const loadCachedRows = useCallback(() => {

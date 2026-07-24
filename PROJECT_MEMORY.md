@@ -58,7 +58,7 @@ Last updated: 2026-07-24
 
 ## In progress
 
-- No active implementation work. The next implementation decision is whether the dashboard's headline sales metric should be changed from profit/settlement sales to ordered item sales so it exactly follows the Seller Central Order Report.
+- Main dashboard source correction in progress: `action=brand-sales` now uses DataDoe Order Line Items (`89b275...`) rather than Profit by SKU & Date. It aggregates ordered `item_price_value` and quantity by date/ASIN, maps ASINs to catalog brands server-side, and folds the result to date/brand rows. Build passed; production reconciliation is pending deployment.
 - Temporary discovery routes `?action=fields` and `?action=sample` still exist in `api/datadoe.js`; remove them now that sources/columns are confirmed.
 
 ## Pending tasks and known follow-ups
