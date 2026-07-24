@@ -195,6 +195,27 @@ function readApiCache(params) {
   }
 }
 
+// Brand names are catalog metadata and remain valid across sales-report cache
+// versions. Reuse them only from cached responses for the selected account so
+// the header selector is usable before that account's next manual refresh.
+function readCachedCatalogBrands(accountId) {
+  if (!accountId) return [];
+  try {
+    const brands = new Set();
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(API_CACHE_PREFIX)) continue;
+      const params = new URLSearchParams(key.slice(API_CACHE_PREFIX.length));
+      if (params.get("action") !== "brand-sales" || params.get("ids") !== accountId) continue;
+      const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
+      (cached.body?.catalogBrands || []).forEach((brand) => brands.add(brand));
+    }
+    return [...brands].sort((a, b) => a.localeCompare(b));
+  } catch (e) {
+    return [];
+  }
+}
+
 function writeApiCache(params, body) {
   const cachedAt = Date.now();
   try {
@@ -436,11 +457,17 @@ export default function App() {
   function productBrand(r) {
     return String(r.product_brand || "Unassigned").trim() || "Unassigned";
   }
+  const cachedAccountBrands = useMemo(
+    () => readCachedCatalogBrands(selectedAccountId),
+    [selectedAccountId, catalogBrands]
+  );
   const brandList = useMemo(() => {
-    const names = new Set(catalogBrands);
-    rows.forEach((r) => names.add(productBrand(r)));
+    const names = new Set([...cachedAccountBrands, ...catalogBrands]);
+    rows
+      .filter((row) => row.seller_or_vendor_id === selectedAccountId)
+      .forEach((row) => names.add(productBrand(row)));
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [catalogBrands, rows]);
+  }, [cachedAccountBrands, catalogBrands, rows, selectedAccountId]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -636,7 +663,6 @@ export default function App() {
               aria-label="Brand selection"
               value={selectedBrand}
               onChange={(e) => setSelectedBrand(e.target.value)}
-              disabled={brandList.length === 0}
             >
               <option value="ALL">Select All Brands</option>
               {brandList.map((brandName) => (
