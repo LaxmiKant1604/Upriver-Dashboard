@@ -402,6 +402,10 @@ export default async function handler(req, res) {
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "Dashboard refresh requires exactly one selected account." });
+        return;
+      }
       const rawRows = await fetchExportRows(
         apiKey,
         ORDER_LINE_ITEMS_SOURCE_ID,

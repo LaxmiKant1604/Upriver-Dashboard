@@ -373,6 +373,7 @@ export default function App() {
     const cached = readApiCache(dailyParams);
     if (cached) {
       setDailyRows(cached.body.rows || []);
+      setLastFetchedAt(new Date(cached.cachedAt));
       setDailyError(null);
     } else {
       setDailyRows([]);
@@ -385,7 +386,10 @@ export default function App() {
     setDailyLoading(true);
     setDailyError(null);
     cachedApiGet(dailyParams, { force: true })
-      .then(({ body }) => setDailyRows(body.rows || []))
+      .then(({ body, cachedAt }) => {
+        setDailyRows(body.rows || []);
+        setLastFetchedAt(new Date(cachedAt));
+      })
       .catch((err) => setDailyError(err.message))
       .finally(() => setDailyLoading(false));
   }, [dailyParams]);
@@ -395,6 +399,9 @@ export default function App() {
   }, [view, loadCachedDaily]);
 
   const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
+  const refreshScopeAccount = view === "daily"
+    ? accountById[dailyAccountId]
+    : accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
     // The sales source can emit a newer zero-sales row before its daily data
     // arrives. Anchor to the latest completed sales date, not that placeholder.
@@ -675,8 +682,8 @@ export default function App() {
         )}
         <div className="live-wrap">
           <span className="live-dot" />
-          {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()}` : "Loading…"} · {accounts.length} accounts
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh data">
+          {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh"}
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh selected account">
             <RefreshCw size={13} className={(view === "daily" ? dailyLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
