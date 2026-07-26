@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download } from "lucide-react";
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -221,6 +221,128 @@ function downloadPlanSpreadsheet(rows, meta, targetDays) {
   URL.revokeObjectURL(url);
 }
 
+/* ============================== RECONCILIATION HELPERS ============================== */
+function sixFullCalendarMonths(today) {
+  const p = parts(today);
+  const months = [];
+  for (let i = 6; i >= 1; i--) {
+    const total = p.y * 12 + (p.m - 1) - i;
+    const y = Math.floor(total / 12);
+    const m = ((total % 12) + 12) % 12 + 1;
+    months.push(`${y}-${pad2(m)}`);
+  }
+  const first = months[0].split("-").map(Number);
+  const last = months[months.length - 1].split("-").map(Number);
+  return {
+    months,
+    from: `${first[0]}-${pad2(first[1])}-01`,
+    to: `${last[0]}-${pad2(last[1])}-${pad2(daysInMonth(last[0], last[1]))}`,
+  };
+}
+
+function reconMonthLabel(key) {
+  if (!key) return "";
+  const [y, m] = key.split("-").map(Number);
+  return `${MONTH_ABBR[m - 1]} ${y}`;
+}
+
+function reconMonthOf(date) {
+  return String(date || "").slice(0, 7);
+}
+
+function isCancelledOrder(status) {
+  return /cancel/i.test(String(status || ""));
+}
+
+function buildReconciliation(raw, selectedBrand) {
+  if (!raw) return { orders: [], settlements: [], allSettlementRows: [], brandScopeIsConservative: false };
+  const scopeOrders = (raw.orders || []).flatMap((order) => {
+    const brands = Object.keys(order.brandBreakdown || {});
+    if (selectedBrand !== "ALL") {
+      // Settlement entries are order-level. Only single-brand orders can be
+      // attributed faithfully to a product brand, so omit mixed-brand orders.
+      if (brands.length !== 1 || brands[0] !== selectedBrand) return [];
+      const brand = order.brandBreakdown[selectedBrand];
+      return [{ ...order, quantity: brand.quantity, orderRevenue: brand.orderRevenue, orderTax: brand.orderTax }];
+    }
+    return [order];
+  });
+  const scopedIds = new Set(scopeOrders.map((order) => order.orderId));
+  const allSettlementRows = selectedBrand === "ALL"
+    ? (raw.settlements || [])
+    : (raw.settlements || []).filter((settlement) => settlement.orderId && scopedIds.has(settlement.orderId));
+  const settlementsByOrder = new Map();
+  allSettlementRows.forEach((settlement) => {
+    if (!settlement.orderId || !scopedIds.has(settlement.orderId)) return;
+    const list = settlementsByOrder.get(settlement.orderId) || [];
+    list.push(settlement);
+    settlementsByOrder.set(settlement.orderId, list);
+  });
+  const orders = scopeOrders.map((order) => {
+    const settlements = settlementsByOrder.get(order.orderId) || [];
+    const orderSettlements = settlements.filter((s) => s.settlementType === "ORDER");
+    const refundSettlements = settlements.filter((s) => s.settlementType === "REFUND");
+    const hasOrderSettlement = orderSettlements.length > 0;
+    const hasRefund = refundSettlements.length > 0;
+    const reconciliationStatus = isCancelledOrder(order.status) ? "Cancelled"
+      : hasOrderSettlement && hasRefund ? "Settled + Refunded"
+      : hasRefund ? "Refunded"
+      : hasOrderSettlement ? "Settled" : "Pending";
+    const settledRevenue = orderSettlements.reduce((sum, s) => sum + Number(s.settledRevenue || 0), 0);
+    const settledTax = orderSettlements.reduce((sum, s) => sum + Number(s.settledTax || 0), 0);
+    const fees = settlements.reduce((sum, s) => sum + Number(s.referralFee || 0) + Number(s.fbaFee || 0), 0);
+    const refundAmount = refundSettlements.reduce((sum, s) => sum + Math.abs(Number(s.refundedAmount || 0)), 0);
+    const netPayout = settlements.reduce((sum, s) => sum + Number(s.netPayout || 0), 0);
+    const settlementDate = settlements.reduce((latest, s) => !latest || s.settlementDate > latest ? s.settlementDate : latest, null);
+    const crossMonth = Boolean(settlementDate && reconMonthOf(settlementDate) !== reconMonthOf(order.orderDate));
+    return {
+      ...order, settlements, reconciliationStatus, settledRevenue, settledTax, fees,
+      refundAmount, netPayout, settlementDate, crossMonth,
+      delta: Number(order.orderRevenue || 0) - settledRevenue,
+    };
+  });
+  return { orders, settlements: allSettlementRows.filter((s) => s.orderId && scopedIds.has(s.orderId)), allSettlementRows, brandScopeIsConservative: selectedBrand !== "ALL" };
+}
+
+function reconciliationStatusClass(status) {
+  return String(status || "").toLowerCase().replace(/[^a-z]+/g, "-");
+}
+
+function downloadReconciliationCsv(rows, currency, scopeLabel) {
+  const exportRows = rows.map((row) => ({
+    "Order ID": row.orderId,
+    "Order Date": row.orderDate,
+    "Order Month": reconMonthLabel(reconMonthOf(row.orderDate)),
+    Status: row.status,
+    Channel: row.fulfillmentChannel,
+    B2B: row.isBusiness ? "Yes" : "No",
+    Quantity: Math.round(row.quantity || 0),
+    "Order Revenue": Number(row.orderRevenue || 0).toFixed(2),
+    Tax: Number(row.orderTax || 0).toFixed(2),
+    "Recon Status": row.reconciliationStatus,
+    "Settlement Date": row.settlementDate || "",
+    "Settlement Month": row.settlementDate ? reconMonthLabel(reconMonthOf(row.settlementDate)) : "",
+    "Settled Revenue": Number(row.settledRevenue || 0).toFixed(2),
+    Fees: Number(row.fees || 0).toFixed(2),
+    "Refund Amount": Number(row.refundAmount || 0).toFixed(2),
+    "Net Payout": Number(row.netPayout || 0).toFixed(2),
+    Delta: Number(row.delta || 0).toFixed(2),
+    "Cross Month": row.crossMonth ? `Settled in ${reconMonthLabel(reconMonthOf(row.settlementDate))}` : "No",
+    Currency: currency || "",
+  }));
+  if (!exportRows.length) return;
+  const headers = Object.keys(exportRows[0]);
+  const csv = "\uFEFF" + [headers, ...exportRows.map((row) => headers.map((header) => row[header]))]
+    .map((line) => line.map(csvCell).join(","))
+    .join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `amazon-reconciliation-${String(scopeLabel || "account").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 /* ============================== NUMBER / MONEY HELPERS ============================== */
 function pct(curr, prev) {
   if (prev === 0) return curr === 0 ? 0 : null;
@@ -327,6 +449,8 @@ async function apiGet(params) {
 }
 
 const API_CACHE_PREFIX = "upriver:datadoe:v1:";
+const LARGE_CACHE_DB = "upriver-report-cache";
+const LARGE_CACHE_STORE = "responses";
 
 function apiCacheKey(params) {
   const qs = new URLSearchParams();
@@ -383,6 +507,59 @@ async function cachedApiGet(params, { force = false } = {}) {
   return { body, cachedAt: writeApiCache(params, body), fromCache: false };
 }
 
+// Order-level reconciliation data can be much larger than a browser's
+// localStorage quota. Store that report in IndexedDB so cache-first remains
+// reliable for large accounts; localStorage remains a fallback for browsers
+// where IndexedDB is unavailable or blocked.
+function openLargeCache() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error("IndexedDB is unavailable")); return; }
+    const request = window.indexedDB.open(LARGE_CACHE_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(LARGE_CACHE_STORE);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function readLargeApiCache(params) {
+  const key = apiCacheKey(params);
+  try {
+    const db = await openLargeCache();
+    const cached = await new Promise((resolve, reject) => {
+      const request = db.transaction(LARGE_CACHE_STORE, "readonly").objectStore(LARGE_CACHE_STORE).get(key);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return cached || readApiCache(params);
+  } catch (e) {
+    return readApiCache(params);
+  }
+}
+async function writeLargeApiCache(params, body) {
+  const cachedAt = Date.now();
+  const key = apiCacheKey(params);
+  try {
+    const db = await openLargeCache();
+    await new Promise((resolve, reject) => {
+      const request = db.transaction(LARGE_CACHE_STORE, "readwrite").objectStore(LARGE_CACHE_STORE).put({ body, cachedAt }, key);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return cachedAt;
+  } catch (e) {
+    return writeApiCache(params, body);
+  }
+}
+async function cachedLargeApiGet(params, { force = false } = {}) {
+  if (!force) {
+    const cached = await readLargeApiCache(params);
+    if (cached) return { ...cached, fromCache: true };
+  }
+  const body = await apiGet(params);
+  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+}
+
 /* ============================== MAIN APP ============================== */
 export default function App() {
   const [accounts, setAccounts] = useState([]);
@@ -422,6 +599,25 @@ export default function App() {
   const [targetDays, setTargetDays] = useState(30);
   const [planSearch, setPlanSearch] = useState("");
   const [planSort, setPlanSort] = useState({ key: "recommended", dir: "desc" });
+
+  // Reconciliation is a six-full-month, cache-first report. Once refreshed,
+  // its month selector and Order Explorer operate entirely in the browser.
+  const [reconciliationData, setReconciliationData] = useState(null);
+  const [reconciliationLoading, setReconciliationLoading] = useState(false);
+  const [reconciliationError, setReconciliationError] = useState(null);
+  const [reconciliationCachedAt, setReconciliationCachedAt] = useState(null);
+  const [reconciliationMonth, setReconciliationMonth] = useState("");
+  const [reconciliationMode, setReconciliationMode] = useState("counts");
+  const [reconciliationSearch, setReconciliationSearch] = useState("");
+  const [reconciliationStatusFilter, setReconciliationStatusFilter] = useState("ALL");
+  const [reconciliationReconFilter, setReconciliationReconFilter] = useState("ALL");
+  const [reconciliationB2BFilter, setReconciliationB2BFilter] = useState("ALL");
+  const [reconciliationCrossMonthFilter, setReconciliationCrossMonthFilter] = useState("ALL");
+  const [reconciliationFrom, setReconciliationFrom] = useState("");
+  const [reconciliationTo, setReconciliationTo] = useState("");
+  const [reconciliationSort, setReconciliationSort] = useState({ key: "orderDate", dir: "desc" });
+  const [reconciliationPage, setReconciliationPage] = useState(1);
+  const [copiedOrderId, setCopiedOrderId] = useState(null);
 
   const TODAY = todayStr();
 
@@ -600,6 +796,50 @@ export default function App() {
     if (view === "fbaplan") loadCachedPlan();
   }, [view, loadCachedPlan]);
 
+  const reconciliationWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
+  const reconciliationParams = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return {
+      action: "reconciliation", reportVersion: "reconciliation-v1", ids: selectedAccountId,
+      from: reconciliationWindow.from, to: reconciliationWindow.to,
+    };
+  }, [selectedAccountId, reconciliationWindow]);
+
+  const applyReconciliationData = useCallback((body, cachedAt) => {
+    setReconciliationData(body);
+    setReconciliationCachedAt(new Date(cachedAt));
+    setReconciliationMonth((previous) => body.months?.includes(previous) ? previous : body.months?.[body.months.length - 1] || "");
+    setReconciliationError(null);
+  }, []);
+
+  const loadCachedReconciliation = useCallback(async () => {
+    if (!reconciliationParams) {
+      setReconciliationData(null);
+      return;
+    }
+    const cached = await readLargeApiCache(reconciliationParams);
+    if (cached) applyReconciliationData(cached.body, cached.cachedAt);
+    else {
+      setReconciliationData(null);
+      setReconciliationCachedAt(null);
+      setReconciliationError("No cached reconciliation data for this account. Click refresh to fetch six completed months from DataDoe.");
+    }
+  }, [applyReconciliationData, reconciliationParams]);
+
+  const fetchReconciliation = useCallback(() => {
+    if (!reconciliationParams || reconciliationLoading) return;
+    setReconciliationLoading(true);
+    setReconciliationError(null);
+    cachedLargeApiGet(reconciliationParams, { force: true })
+      .then(({ body, cachedAt }) => applyReconciliationData(body, cachedAt))
+      .catch((err) => setReconciliationError(err.message))
+      .finally(() => setReconciliationLoading(false));
+  }, [applyReconciliationData, reconciliationLoading, reconciliationParams]);
+
+  useEffect(() => {
+    if (view === "reconciliation") loadCachedReconciliation();
+  }, [view, loadCachedReconciliation]);
+
   const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
@@ -662,6 +902,123 @@ export default function App() {
     t.anyInv = anyInv; t.anyAwd = anyAwd;
     return t;
   }, [planRows]);
+
+  const reconciliationScope = useMemo(
+    () => buildReconciliation(reconciliationData, selectedBrand),
+    [reconciliationData, selectedBrand]
+  );
+  const reconInSelectedMonth = useCallback((date) => (
+    reconciliationMonth === "ALL" || reconMonthOf(date) === reconciliationMonth
+  ), [reconciliationMonth]);
+  const reconciliationOrdersForMonth = useMemo(
+    () => reconciliationScope.orders.filter((order) => reconInSelectedMonth(order.orderDate)),
+    [reconciliationScope.orders, reconInSelectedMonth]
+  );
+  const reconciliationSettlementsForMonth = useMemo(
+    () => reconciliationScope.allSettlementRows.filter((settlement) => reconInSelectedMonth(settlement.settlementDate)),
+    [reconciliationScope.allSettlementRows, reconInSelectedMonth]
+  );
+  const reconciliationMetrics = useMemo(() => {
+    const shipped = reconciliationOrdersForMonth.filter((order) => /shipped/i.test(String(order.status)));
+    const settledOrders = reconciliationOrdersForMonth.filter((order) => /settled/i.test(order.reconciliationStatus));
+    const orderRevenue = reconciliationOrdersForMonth.reduce((sum, order) => sum + Number(order.orderRevenue || 0), 0);
+    const settledRevenue = reconciliationOrdersForMonth.reduce((sum, order) => sum + Number(order.settledRevenue || 0), 0);
+    const refunded = reconciliationOrdersForMonth.filter((order) => /refunded/i.test(order.reconciliationStatus));
+    const refundAmount = reconciliationOrdersForMonth.reduce((sum, order) => sum + Number(order.refundAmount || 0), 0);
+    const cancelled = reconciliationOrdersForMonth.filter((order) => isCancelledOrder(order.status));
+    const reconciliationRate = shipped.length ? (settledOrders.length / shipped.length) * 100 : null;
+    const netPayout = reconciliationSettlementsForMonth.reduce((sum, settlement) => sum + Number(settlement.netPayout || 0), 0);
+    return {
+      shippedOrders: shipped.length, settledOrders: settledOrders.length, orderGap: shipped.length - settledOrders.length,
+      orderRevenue, settledRevenue, revenueGap: orderRevenue - settledRevenue,
+      refunds: refunded.length, refundAmount, cancelled: cancelled.length, reconciliationRate, netPayout,
+    };
+  }, [reconciliationOrdersForMonth, reconciliationSettlementsForMonth]);
+  const reconciliationTrend = useMemo(() => (reconciliationData?.months || []).map((month) => {
+    const orders = reconciliationScope.orders.filter((order) => reconMonthOf(order.orderDate) === month);
+    const shipped = orders.filter((order) => /shipped/i.test(String(order.status))).length;
+    const settled = orders.filter((order) => /settled/i.test(order.reconciliationStatus)).length;
+    return { month, label: reconMonthLabel(month), shipped, settled };
+  }), [reconciliationData, reconciliationScope.orders]);
+  const reconciliationDonut = useMemo(() => {
+    const groups = [
+      ["Settled", "#149B67"], ["Pending", "#E69B28"], ["Cancelled", "#DF5960"], ["Refunded", "#3F84C5"],
+    ];
+    return groups.map(([label, fill]) => ({ label, fill, value: reconciliationOrdersForMonth.filter((order) => {
+      if (label === "Settled") return order.reconciliationStatus === "Settled";
+      if (label === "Refunded") return /Refunded/.test(order.reconciliationStatus);
+      return order.reconciliationStatus === label;
+    }).length }));
+  }, [reconciliationOrdersForMonth]);
+  const reconciliationWaterfall = useMemo(() => {
+    const settlements = reconciliationSettlementsForMonth;
+    const gross = settlements.reduce((sum, s) => sum + Number(s.settledRevenue || 0), 0);
+    const tax = settlements.reduce((sum, s) => sum + Number(s.settledTax || 0), 0);
+    const referral = settlements.reduce((sum, s) => sum + Number(s.referralFee || 0), 0);
+    const fba = settlements.reduce((sum, s) => sum + Number(s.fbaFee || 0), 0);
+    const refunds = settlements.reduce((sum, s) => sum + Number(s.refundedAmount || 0), 0);
+    const net = settlements.reduce((sum, s) => sum + Number(s.netPayout || 0), 0);
+    return [
+      { label: "Gross revenue", value: gross, kind: "positive" }, { label: "Tax", value: tax, kind: "positive" },
+      { label: "Referral fees", value: referral, kind: "negative" }, { label: "FBA fees", value: fba, kind: "negative" },
+      { label: "Refunds", value: refunds, kind: "negative" },
+      { label: "Other", value: net - gross - tax - referral - fba - refunds, kind: "negative" },
+      { label: "Net payout", value: net, kind: "net" },
+    ];
+  }, [reconciliationSettlementsForMonth]);
+  const reconciliationDaily = useMemo(() => {
+    const groups = new Map();
+    const keyFor = (date) => reconciliationMonth === "ALL" ? reconMonthOf(date) : date;
+    reconciliationScope.orders.forEach((order) => {
+      if (!reconInSelectedMonth(order.orderDate)) return;
+      const key = keyFor(order.orderDate);
+      const current = groups.get(key) || { key, label: reconciliationMonth === "ALL" ? reconMonthLabel(key) : key.slice(8), shipped: 0, settled: 0, refunds: 0, orderRevenue: 0, settledRevenue: 0 };
+      if (/shipped/i.test(String(order.status))) current.shipped += 1;
+      current.orderRevenue += Number(order.orderRevenue || 0);
+      groups.set(key, current);
+    });
+    reconciliationScope.allSettlementRows.forEach((settlement) => {
+      if (!reconInSelectedMonth(settlement.settlementDate)) return;
+      const key = keyFor(settlement.settlementDate);
+      const current = groups.get(key) || { key, label: reconciliationMonth === "ALL" ? reconMonthLabel(key) : key.slice(8), shipped: 0, settled: 0, refunds: 0, orderRevenue: 0, settledRevenue: 0 };
+      if (settlement.settlementType === "ORDER") { current.settled += 1; current.settledRevenue += Number(settlement.settledRevenue || 0); }
+      if (settlement.settlementType === "REFUND") current.refunds += 1;
+      groups.set(key, current);
+    });
+    return [...groups.values()].sort((a, b) => a.key.localeCompare(b.key));
+  }, [reconciliationMonth, reconciliationScope, reconInSelectedMonth]);
+  const reconciliationExplorerRows = useMemo(() => {
+    const search = reconciliationSearch.trim().toLowerCase();
+    return reconciliationOrdersForMonth.filter((order) => {
+      if (reconciliationStatusFilter !== "ALL" && String(order.status) !== reconciliationStatusFilter) return false;
+      if (reconciliationReconFilter !== "ALL" && order.reconciliationStatus !== reconciliationReconFilter) return false;
+      if (reconciliationB2BFilter !== "ALL" && (order.isBusiness ? "YES" : "NO") !== reconciliationB2BFilter) return false;
+      if (reconciliationCrossMonthFilter === "CROSS" && !order.crossMonth) return false;
+      if (reconciliationCrossMonthFilter === "SAME" && order.crossMonth) return false;
+      if (reconciliationFrom && order.orderDate < reconciliationFrom) return false;
+      if (reconciliationTo && order.orderDate > reconciliationTo) return false;
+      if (!search) return true;
+      return `${order.orderId} ${order.orderDate} ${order.status} ${order.fulfillmentChannel} ${order.reconciliationStatus} ${order.settlementDate || ""}`.toLowerCase().includes(search);
+    });
+  }, [reconciliationOrdersForMonth, reconciliationSearch, reconciliationStatusFilter, reconciliationReconFilter, reconciliationB2BFilter, reconciliationCrossMonthFilter, reconciliationFrom, reconciliationTo]);
+  const reconciliationSortedRows = useMemo(() => [...reconciliationExplorerRows].sort((a, b) => {
+    const av = a[reconciliationSort.key], bv = b[reconciliationSort.key];
+    const aEmpty = av === null || av === undefined || av === "";
+    const bEmpty = bv === null || bv === undefined || bv === "";
+    if (aEmpty && bEmpty) return 0;
+    if (aEmpty) return 1;
+    if (bEmpty) return -1;
+    const compare = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv));
+    return reconciliationSort.dir === "asc" ? compare : -compare;
+  }), [reconciliationExplorerRows, reconciliationSort]);
+  const reconciliationPageCount = Math.max(1, Math.ceil(reconciliationSortedRows.length / 50));
+  const reconciliationPageRows = reconciliationSortedRows.slice((reconciliationPage - 1) * 50, reconciliationPage * 50);
+  const reconciliationPages = useMemo(() => {
+    const pages = new Set([1, reconciliationPageCount, reconciliationPage - 1, reconciliationPage, reconciliationPage + 1]);
+    return [...pages].filter((page) => page >= 1 && page <= reconciliationPageCount).sort((a, b) => a - b);
+  }, [reconciliationPage, reconciliationPageCount]);
+
+  useEffect(() => { setReconciliationPage(1); }, [reconciliationMonth, reconciliationSearch, reconciliationStatusFilter, reconciliationReconFilter, reconciliationB2BFilter, reconciliationCrossMonthFilter, reconciliationFrom, reconciliationTo, selectedBrand]);
 
   const setPlanSortKey = useCallback((key) => {
     setPlanSort((prev) => {
@@ -869,6 +1226,10 @@ export default function App() {
               <CalendarRange size={18} />
               <span className="sb-nav-label">Daily Reporting</span>
             </button>
+            <button className={"sb-nav-item" + (view === "reconciliation" ? " active" : "")} title="Reconciliation Dashboard" onClick={() => { setView("reconciliation"); setMobileOpen(false); }}>
+              <ReceiptText size={18} />
+              <span className="sb-nav-label">Reconciliation</span>
+            </button>
             <button className={"sb-nav-item" + (view === "fbaplan" ? " active" : "")} title="FBA Shipment Plan" onClick={() => { setView("fbaplan"); setMobileOpen(false); }}>
               <Boxes size={18} />
               <span className="sb-nav-label">FBA Shipment Plan</span>
@@ -929,11 +1290,11 @@ export default function App() {
         <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
-            const stamp = view === "fbaplan" ? planCachedAt : lastFetchedAt;
+            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : lastFetchedAt;
             return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
           })()}
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : fetchRows} title="Refresh selected account">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : rowsLoading) ? "spin" : ""} />
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : fetchRows} disabled={view === "reconciliation" && reconciliationLoading} title="Refresh selected account">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
       </div>
@@ -1085,6 +1446,133 @@ export default function App() {
           ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
           Sales and units are sourced from DataDoe Sales & Traffic by ASIN & Date. {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export." : "Advertising metrics show — for a named brand because the connected advertising export is account-level and cannot be assigned accurately to a product brand."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
+      </div>
+      )}
+
+      {view === "reconciliation" && (
+      <div className="container reconciliation-page">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">Amazon Reconciliation</div>
+            <div className="page-sub">Orders versus settlements for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
+          </div>
+          {reconciliationData && (
+            <div className="recon-month-picker">
+              <label htmlFor="reconciliation-month">Report month</label>
+              <select id="reconciliation-month" value={reconciliationMonth || "ALL"} onChange={(e) => setReconciliationMonth(e.target.value)}>
+                <option value="ALL">All 6 Months</option>
+                {(reconciliationData.months || []).map((month) => <option key={month} value={month}>{reconMonthLabel(month)}</option>)}
+              </select>
+            </div>
+          )}
+        </div>
+
+        {reconciliationError && <div className="error-banner"><AlertTriangle size={15} /> {reconciliationError}</div>}
+
+        {!reconciliationData && !reconciliationError && (
+          <div className="panel recon-empty"><ReceiptText size={22} /><div>Reconciliation data is loading from cache...</div></div>
+        )}
+
+        {reconciliationData && <>
+          <div className="recon-freshness">
+            <span className="live-dot" style={{ position: "relative", top: 1 }} />
+            <span>Orders and settlement events from <strong>{fmtDateHuman(reconciliationData.from)}</strong> to <strong>{fmtDateHuman(reconciliationData.to)}</strong></span>
+            <span className="plan-fresh-sep">·</span>
+            <span>cached {reconciliationCachedAt?.toLocaleString()}</span>
+          </div>
+          {reconciliationScope.brandScopeIsConservative && (
+            <div className="recon-notice"><Info size={15} /> Brand scope includes only orders containing this one brand. Mixed-brand orders are excluded because settlement events are order-level and cannot be allocated accurately by product brand.</div>
+          )}
+
+          <div className="recon-kpis">
+            <ReconKpi label="Shipped Orders" value={reconciliationMetrics.shippedOrders.toLocaleString("en-US")} note="orders in selected order month" />
+            <ReconKpi label="Settled Orders" value={reconciliationMetrics.settledOrders.toLocaleString("en-US")} note={`gap ${reconciliationMetrics.orderGap.toLocaleString("en-US")}`} />
+            <ReconKpi label="Order Revenue" value={fmtMoney(reconciliationMetrics.orderRevenue, displayCurrency)} note="purchase-date basis" />
+            <ReconKpi label="Settled Revenue" value={fmtMoney(reconciliationMetrics.settledRevenue, displayCurrency)} note={`gap ${fmtMoney(reconciliationMetrics.revenueGap, displayCurrency)}`} />
+            <ReconKpi label="Refunds" value={`${reconciliationMetrics.refunds.toLocaleString("en-US")} · ${fmtMoney(reconciliationMetrics.refundAmount, displayCurrency)}`} note="orders with a refund event" />
+            <ReconKpi label="Cancelled" value={reconciliationMetrics.cancelled.toLocaleString("en-US")} note="not expected to settle" />
+            <ReconKpi label="Reconciliation Rate" value={reconciliationMetrics.reconciliationRate === null ? "-" : `${reconciliationMetrics.reconciliationRate.toFixed(1)}%`} note="shipped orders with ORDER settlement" />
+            <ReconKpi label="Net Payout" value={fmtMoney(reconciliationMetrics.netPayout, displayCurrency)} note="settlement posted-date basis" />
+          </div>
+
+          <div className="recon-chart-grid">
+            <div className="panel recon-chart-panel">
+              <div className="panel-head"><div><div className="panel-title">Monthly Settlement Trend</div><div className="page-sub">Selected month is highlighted in amber</div></div></div>
+              <div className="recon-chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={reconciliationTrend} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
+                    <CartesianGrid stroke="#EBEDF3" vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                    <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                    <Tooltip />
+                    <Bar dataKey="shipped" name="Shipped orders" radius={[4, 4, 0, 0]}>
+                      {reconciliationTrend.map((entry) => <Cell key={entry.month} fill={entry.month === reconciliationMonth ? "#E69B28" : "#D6DFEA"} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div className="panel recon-chart-panel">
+              <div className="panel-head"><div><div className="panel-title">Reconciliation Status</div><div className="page-sub">Order status after matching settlement events</div></div></div>
+              <div className="recon-donut-wrap">
+                <ResponsiveContainer width="58%" height="100%">
+                  <PieChart><Pie data={reconciliationDonut.filter((item) => item.value > 0)} dataKey="value" nameKey="label" innerRadius="56%" outerRadius="78%" paddingAngle={2}>{reconciliationDonut.filter((item) => item.value > 0).map((item) => <Cell key={item.label} fill={item.fill} />)}</Pie><Tooltip /></PieChart>
+                </ResponsiveContainer>
+                <div className="recon-donut-legend">{reconciliationDonut.map((item) => <div key={item.label}><span style={{ background: item.fill }} />{item.label}<strong>{item.value}</strong></div>)}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="panel recon-overlay-panel">
+            <div className="panel-head">
+              <div><div className="panel-title">Order and Settlement Overlay</div><div className="page-sub">Orders use purchase date; settlements use Amazon posting date.</div></div>
+              <div className="seg"><button className={reconciliationMode === "counts" ? "active" : ""} onClick={() => setReconciliationMode("counts")}>Order Counts</button><button className={reconciliationMode === "revenue" ? "active" : ""} onClick={() => setReconciliationMode("revenue")}>Revenue</button></div>
+            </div>
+            <div className="recon-overlay-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={reconciliationDaily} margin={{ top: 10, right: 15, left: -16, bottom: 0 }}>
+                  <CartesianGrid stroke="#EBEDF3" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                  <YAxis yAxisId="left" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} tickFormatter={(v) => reconciliationMode === "revenue" ? compactNumber(v, displayCurrency) : v} />
+                  <YAxis yAxisId="right" orientation="right" allowDecimals={false} tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                  <Tooltip formatter={(value, name) => [reconciliationMode === "revenue" && name !== "Refund events" ? fmtMoney(value, displayCurrency) : value, name]} />
+                  <Legend />
+                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "orderRevenue" : "shipped"} name={reconciliationMode === "revenue" ? "Order revenue" : "Shipped orders"} fill="#E6A12A" radius={[3, 3, 0, 0]} />
+                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "settledRevenue" : "settled"} name={reconciliationMode === "revenue" ? "Settled revenue" : "ORDER settlements"} fill="#D76168" radius={[3, 3, 0, 0]} />
+                  <Line yAxisId="right" type="monotone" dataKey="refunds" name="Refund events" stroke="#3F84C5" strokeWidth={2} dot={{ r: 3 }} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="panel recon-waterfall-panel">
+            <div className="panel-head"><div><div className="panel-title">Settlement Revenue Waterfall</div><div className="page-sub">All values preserve the signs supplied by Amazon settlement data.</div></div></div>
+            <div className="recon-waterfall">{reconciliationWaterfall.map((item) => <div className="recon-waterfall-row" key={item.label}><span>{item.label}</span><div className="recon-waterfall-track"><div className={`recon-waterfall-fill ${item.kind}`} style={{ width: `${Math.min(100, (Math.abs(item.value) / Math.max(1, ...reconciliationWaterfall.map((bar) => Math.abs(bar.value)))) * 100)}%` }} /></div><strong>{fmtMoney(item.value, displayCurrency, 2)}</strong></div>)}</div>
+          </div>
+
+          <div className="panel recon-daily-panel">
+            <div className="panel-head"><div><div className="panel-title">Daily Summary</div><div className="page-sub">Click a month above to switch this table together with every dashboard section.</div></div></div>
+            <div className="recon-table-scroll"><table className="recon-daily-table"><thead><tr><th>{reconciliationMonth === "ALL" ? "Month" : "Day"}</th><th>Shipped</th><th>ORDER settlements</th><th>Refund events</th><th>Order revenue</th><th>Settled revenue</th></tr></thead><tbody>{reconciliationDaily.map((row) => <tr key={row.key}><td>{row.label}</td><td>{row.shipped}</td><td>{row.settled}</td><td>{row.refunds}</td><td>{fmtMoney(row.orderRevenue, displayCurrency)}</td><td>{fmtMoney(row.settledRevenue, displayCurrency)}</td></tr>)}</tbody></table></div>
+          </div>
+
+          <div className="panel recon-explorer-panel">
+            <div className="panel-head"><div><div className="panel-title">Order Explorer</div><div className="page-sub">{reconciliationSortedRows.length.toLocaleString("en-US")} matching orders. Copy an order ID, inspect timing, or export the filtered result.</div></div><button className="plan-export-btn" onClick={() => downloadReconciliationCsv(reconciliationSortedRows, displayCurrency, refreshScopeAccount?.name)} disabled={!reconciliationSortedRows.length}><Download size={15} />Download Excel</button></div>
+            <div className="recon-filters">
+              <label className="plan-field recon-search"><span className="plan-field-label">Search</span><span className="plan-search-wrap"><Search size={14} /><input value={reconciliationSearch} onChange={(e) => setReconciliationSearch(e.target.value)} placeholder="Order ID, status, channel..." /></span></label>
+              <ReconSelect label="Order status" value={reconciliationStatusFilter} onChange={setReconciliationStatusFilter} options={["ALL", ...new Set(reconciliationScope.orders.map((order) => String(order.status)))]} />
+              <ReconSelect label="Recon status" value={reconciliationReconFilter} onChange={setReconciliationReconFilter} options={["ALL", "Settled", "Settled + Refunded", "Refunded", "Pending", "Cancelled"]} />
+              <ReconSelect label="B2B" value={reconciliationB2BFilter} onChange={setReconciliationB2BFilter} options={["ALL", "YES", "NO"]} />
+              <ReconSelect label="Cross-month" value={reconciliationCrossMonthFilter} onChange={setReconciliationCrossMonthFilter} options={["ALL", "SAME", "CROSS"]} />
+              <label className="plan-field"><span className="plan-field-label">From</span><input type="date" value={reconciliationFrom} min={reconciliationData.from} max={reconciliationData.to} onChange={(e) => setReconciliationFrom(e.target.value)} /></label>
+              <label className="plan-field"><span className="plan-field-label">To</span><input type="date" value={reconciliationTo} min={reconciliationData.from} max={reconciliationData.to} onChange={(e) => setReconciliationTo(e.target.value)} /></label>
+            </div>
+            <div className="recon-table-scroll"><table className="recon-table"><thead><tr><ReconTh label="Order ID" col="orderId" sort={reconciliationSort} setSort={setReconciliationSort} align="left" /><ReconTh label="Order Date" col="orderDate" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Status" col="status" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Channel" col="fulfillmentChannel" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="B2B" col="isBusiness" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Revenue" col="orderRevenue" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Tax" col="orderTax" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Recon Status" col="reconciliationStatus" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Sett. Date" col="settlementDate" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Settled" col="settledRevenue" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Fees" col="fees" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Refund" col="refundAmount" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Net Payout" col="netPayout" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Delta" col="delta" sort={reconciliationSort} setSort={setReconciliationSort} /><ReconTh label="Cross-Month" col="crossMonth" sort={reconciliationSort} setSort={setReconciliationSort} /></tr></thead><tbody>{reconciliationPageRows.map((row) => <tr key={row.orderId} className={`recon-row-${reconciliationStatusClass(row.reconciliationStatus)}`}><td className="recon-order-id"><button title="Copy order ID" onClick={async () => { try { await navigator.clipboard.writeText(row.orderId); setCopiedOrderId(row.orderId); window.setTimeout(() => setCopiedOrderId(null), 1200); } catch (e) {} }}>{row.orderId} {copiedOrderId === row.orderId ? <Check size={13} /> : <Copy size={13} />}</button></td><td>{row.orderDate}</td><td>{row.status}</td><td>{row.fulfillmentChannel}</td><td>{row.isBusiness ? "Yes" : "No"}</td><td>{fmtMoney(row.orderRevenue, displayCurrency, 2)}</td><td>{fmtMoney(row.orderTax, displayCurrency, 2)}</td><td><span className={`recon-badge ${reconciliationStatusClass(row.reconciliationStatus)}`}>{row.reconciliationStatus}</span></td><td>{row.settlementDate || "-"}</td><td>{fmtMoney(row.settledRevenue, displayCurrency, 2)}</td><td>{fmtMoney(row.fees, displayCurrency, 2)}</td><td>{fmtMoney(row.refundAmount, displayCurrency, 2)}</td><td>{fmtMoney(row.netPayout, displayCurrency, 2)}</td><td>{fmtMoney(row.delta, displayCurrency, 2)}</td><td>{row.crossMonth ? <span className="recon-cross-badge">Settled in {reconMonthLabel(reconMonthOf(row.settlementDate))}</span> : "-"}</td></tr>)}</tbody></table></div>
+            {!reconciliationPageRows.length && <div className="empty-note">No orders match these filters.</div>}
+            <div className="recon-pagination"><button disabled={reconciliationPage === 1} onClick={() => setReconciliationPage((page) => Math.max(1, page - 1))}>Prev</button>{reconciliationPages.map((page, index) => <React.Fragment key={page}>{index > 0 && page - reconciliationPages[index - 1] > 1 && <span>...</span>}<button className={page === reconciliationPage ? "active" : ""} onClick={() => setReconciliationPage(page)}>{page}</button></React.Fragment>)}<button disabled={reconciliationPage === reconciliationPageCount} onClick={() => setReconciliationPage((page) => Math.min(reconciliationPageCount, page + 1))}>Next</button></div>
+          </div>
+
+          <div className="footer-note">Data powered by DataDoe. Settlement dates are when Amazon posted a financial event, while order dates are purchase dates. A cross-month settlement, a pending recent order, a cancelled order, an MCF order, or a B2B deferral can all create an expected difference; this report makes that timing inspectable instead of hiding it.</div>
+        </>}
       </div>
       )}
 
@@ -1268,6 +1756,19 @@ function PlanTh({ label, col, sort, onSort, align = "right", className = "" }) {
       </span>
     </th>
   );
+}
+
+function ReconKpi({ label, value, note }) {
+  return <div className="recon-kpi"><div className="recon-kpi-label">{label}</div><div className="recon-kpi-value mono">{value}</div><div className="recon-kpi-note">{note}</div></div>;
+}
+
+function ReconSelect({ label, value, onChange, options }) {
+  return <label className="plan-field recon-select"><span className="plan-field-label">{label}</span><select value={value} onChange={(e) => onChange(e.target.value)}>{options.map((option) => <option key={option} value={option}>{option === "ALL" ? "All" : option === "YES" ? "Yes" : option === "NO" ? "No" : option === "SAME" ? "Same month" : option === "CROSS" ? "Cross-month only" : option}</option>)}</select></label>;
+}
+
+function ReconTh({ label, col, sort, setSort, align = "right" }) {
+  const active = sort.key === col;
+  return <th className={align === "left" ? "recon-left" : ""} onClick={() => setSort((previous) => ({ key: col, dir: previous.key === col && previous.dir === "asc" ? "desc" : "asc" }))} title="Click to sort"><span>{label}{active ? (sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} />}</span></th>;
 }
 
 // Rows of the Daily Reporting table, in display order. Ad-derived rows fall
@@ -1456,9 +1957,63 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .pt-badge-ok{ background:#E6F2EB; color:var(--pos); }
 .plan-table tfoot td{ position:sticky; bottom:0; background:#F1F2F6; font-weight:700; border-top:1px solid var(--border); border-bottom:none; z-index:1; }
 .plan-table tfoot td.pt-id{ background:#F1F2F6; z-index:2; }
+
+/* ---- Amazon Reconciliation ---- */
+.reconciliation-page{ padding-bottom:30px; }
+.recon-month-picker{ display:flex; align-items:center; gap:8px; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:7px 10px; }
+.recon-month-picker label{ font-size:11px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.04em; }
+.recon-month-picker select,.recon-select select{ border:0; outline:0; background:transparent; color:var(--ink); font:700 13px inherit; }
+.recon-freshness{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--ink-soft); }
+.recon-freshness strong{ color:var(--ink); }
+.recon-notice{ display:flex; align-items:flex-start; gap:8px; margin-top:12px; padding:10px 12px; border:1px solid #F3D9A8; border-radius:8px; background:#FEF3E2; color:#7B5413; font-size:12px; line-height:1.45; }
+.recon-notice svg{ flex:none; margin-top:1px; }
+.recon-empty{ min-height:200px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; color:var(--ink-soft); margin-top:14px; }
+.recon-kpis{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:14px; }
+.recon-kpi{ border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:var(--surface); min-height:92px; }
+.recon-kpi-label{ color:var(--ink-soft); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+.recon-kpi-value{ color:var(--ink); font-size:18px; font-weight:700; margin-top:7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.recon-kpi-note{ color:var(--ink-soft); font-size:11px; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.recon-chart-grid{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
+.recon-chart-panel{ min-height:270px; }
+.recon-chart-wrap{ height:205px; }
+.recon-donut-wrap{ height:205px; display:flex; align-items:center; }
+.recon-donut-legend{ display:flex; flex-direction:column; gap:9px; width:42%; font-size:12px; color:var(--ink-soft); }
+.recon-donut-legend div{ display:grid; grid-template-columns:9px 1fr auto; align-items:center; gap:7px; }
+.recon-donut-legend span{ width:8px; height:8px; border-radius:999px; }
+.recon-donut-legend strong{ color:var(--ink); font-family:'JetBrains Mono',monospace; }
+.recon-overlay-panel,.recon-waterfall-panel,.recon-daily-panel,.recon-explorer-panel{ margin-top:14px; }
+.recon-overlay-wrap{ height:290px; }
+.recon-waterfall{ display:flex; flex-direction:column; gap:9px; }
+.recon-waterfall-row{ display:grid; grid-template-columns:130px minmax(90px,1fr) 130px; gap:10px; align-items:center; font-size:12px; }
+.recon-waterfall-row > span{ color:var(--ink-soft); }
+.recon-waterfall-row > strong{ font-family:'JetBrains Mono',monospace; text-align:right; font-size:11.5px; }
+.recon-waterfall-track{ height:10px; border-radius:3px; overflow:hidden; background:#EEF1F6; }
+.recon-waterfall-fill{ height:100%; min-width:2px; border-radius:3px; }
+.recon-waterfall-fill.positive{ background:#149B67; }.recon-waterfall-fill.negative{ background:#DF5960; }.recon-waterfall-fill.net{ background:#3F84C5; }
+.recon-table-scroll{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.recon-daily-table,.recon-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12px; min-width:760px; }
+.recon-daily-table th,.recon-daily-table td,.recon-table th,.recon-table td{ padding:9px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
+.recon-daily-table th,.recon-table th{ color:var(--ink-soft); font-size:10.5px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; background:#FAFBFD; }
+.recon-daily-table th:first-child,.recon-daily-table td:first-child,.recon-table th.recon-left,.recon-table td:first-child{ text-align:left; }
+.recon-table{ min-width:1720px; }
+.recon-table th{ cursor:pointer; user-select:none; position:sticky; top:0; z-index:1; }
+.recon-table th span{ display:inline-flex; align-items:center; gap:4px; }
+.recon-table th:hover{ color:var(--ink); }
+.recon-table tbody tr:hover td{ background:#FAFBFD; }
+.recon-row-pending td:first-child{ box-shadow:inset 3px 0 #E69B28; }.recon-row-cancelled td:first-child{ box-shadow:inset 3px 0 #DF5960; }.recon-row-refunded td:first-child,.recon-row-settled-refunded td:first-child{ box-shadow:inset 3px 0 #3F84C5; }.recon-row-settled td:first-child{ box-shadow:inset 3px 0 #149B67; }
+.recon-order-id button{ display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:transparent; color:#244E8A; cursor:pointer; font:600 11px 'JetBrains Mono',monospace; }
+.recon-order-id button:hover{ text-decoration:underline; }
+.recon-badge,.recon-cross-badge{ display:inline-block; border-radius:999px; padding:3px 7px; font-size:10.5px; font-weight:700; }
+.recon-badge.settled{ background:#E6F2EB; color:#087D50; }.recon-badge.pending{ background:#FEF0D9; color:#95600B; }.recon-badge.cancelled{ background:#FCE6E7; color:#B43D44; }.recon-badge.refunded,.recon-badge.settled-refunded{ background:#E6F0FA; color:#2A639B; }.recon-cross-badge{ border:1px solid #EDA73C; color:#965A07; background:#FFF8E9; }
+.recon-filters{ display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px; margin:0 0 14px; }
+.recon-search{ flex:1; min-width:230px; }.recon-select{ min-width:118px; }.recon-select select{ border:1px solid var(--border); border-radius:8px; padding:8px 10px; background:var(--surface); }
+.recon-filters input[type=date]{ border:1px solid var(--border); border-radius:8px; padding:8px 9px; font:600 12px inherit; color:var(--ink); background:var(--surface); }
+.recon-pagination{ display:flex; justify-content:flex-end; align-items:center; gap:5px; flex-wrap:wrap; padding-top:12px; }
+.recon-pagination button{ min-width:31px; border:1px solid var(--border); border-radius:6px; padding:5px 8px; color:var(--ink-soft); background:var(--surface); font:600 12px inherit; cursor:pointer; }.recon-pagination button.active{ border-color:var(--accent-deep); background:#FEF3E2; color:var(--accent-deep); }.recon-pagination button:disabled{ opacity:.45; cursor:not-allowed; }
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
   .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
+  .recon-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }.recon-chart-grid{ grid-template-columns:1fr; }
   /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
   .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
   .sidebar.collapsed{ width:270px; }
@@ -1477,7 +2032,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .topbar-account-select select,.topbar-brand-select select{ width:100%; max-width:none; }
   .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } .recon-kpis{ grid-template-columns:1fr; }.recon-month-picker{ width:100%; justify-content:space-between; }.recon-waterfall-row{ grid-template-columns:100px minmax(70px,1fr) 100px; gap:7px; }.recon-waterfall-row > strong{ font-size:10.5px; }.recon-filters{ display:grid; grid-template-columns:1fr 1fr; }.recon-search{ grid-column:1/-1; min-width:0; } }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;

@@ -122,6 +122,31 @@ const ADS_AGGREGATIONS = [
   { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
   { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
 ];
+
+// Amazon Reconciliation Dashboard. These sources are intentionally kept at
+// order / settlement-event grain so the browser can make cross-month timing
+// visible instead of comparing incompatible daily aggregates.
+const RECONCILIATION_SETTLEMENTS_SOURCE_ID = "732dac689a6545697c2f2e36c61b2c9e93187053bcce2999914183c6f490df27";
+const RECONCILIATION_ORDER_COLUMNS = [
+  "date", "order_date", "amazon_order_id", "child_asin", "amazon_order_status",
+  "fulfillment_channel", "order_is_business", "item_price_currency",
+];
+const RECONCILIATION_ORDER_GROUP_BY = [...RECONCILIATION_ORDER_COLUMNS];
+const RECONCILIATION_ORDER_AGGREGATIONS = [
+  { column: "quantity", aggregation: "sum", alias: "quantity_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "item_price_sum" },
+  { column: "item_tax_value", aggregation: "sum", alias: "item_tax_sum" },
+];
+const RECONCILIATION_SETTLEMENT_COLUMNS = ["date", "amazon_order_id", "settlement_type", "currency"];
+const RECONCILIATION_SETTLEMENT_GROUP_BY = [...RECONCILIATION_SETTLEMENT_COLUMNS];
+const RECONCILIATION_SETTLEMENT_AGGREGATIONS = [
+  { column: "item_price", aggregation: "sum", alias: "item_price_sum" },
+  { column: "item_tax", aggregation: "sum", alias: "item_tax_sum" },
+  { column: "referral_fee", aggregation: "sum", alias: "referral_fee_sum" },
+  { column: "fba_per_unit_fulfillment_fee", aggregation: "sum", alias: "fba_fee_sum" },
+  { column: "refunded_amount", aggregation: "sum", alias: "refunded_amount_sum" },
+  { column: "total", aggregation: "sum", alias: "total_sum" },
+];
 // ===== FBA Shipment Plan sources (verified against api/v1/spec/data-scheme) =====
 // Per-ASIN unit sales. "Sales & Traffic by ASIN & Date" (401ffcd7e5) exposes
 // child_asin + total_units and is the report the Daily Reporting view already
@@ -176,6 +201,7 @@ const CATALOG_ROW_LIMIT = 10000;
 // limit safely covers years of history without raw ASIN row truncation.
 const DAILY_ROW_LIMIT = 5000;
 const DAILY_BRAND_ROW_LIMIT = 50000;
+const RECONCILIATION_ROW_LIMIT = 50000;
 
 function authHeaders(apiKey) {
   return {
@@ -402,6 +428,83 @@ function splitDateRangeByMonth(from, to) {
     cursor = addDaysStr(end, 1);
   }
   return windows;
+}
+
+function isFullCalendarMonthWindow(window) {
+  const [year, month] = window.from.slice(0, 7).split("-").map(Number);
+  return window.from === `${year}-${pad2s(month)}-01`
+    && window.to === `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
+}
+
+function reconciliationOrders(rows, catalogRows) {
+  const brandByAsin = new Map();
+  for (const row of catalogRows) {
+    const asin = String(row.child_asin || "").trim();
+    const brand = String(row.product_brand || "").trim() || "Unassigned";
+    if (asin && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
+  }
+  const byOrder = new Map();
+  for (const row of rows) {
+    const orderId = String(row.amazon_order_id || "").trim();
+    if (!orderId) continue;
+    const brand = brandByAsin.get(String(row.child_asin || "").trim()) || "Unassigned";
+    const current = byOrder.get(orderId) || {
+      orderId,
+      orderDate: row.order_date || row.date || null,
+      status: row.amazon_order_status || "Unknown",
+      fulfillmentChannel: row.fulfillment_channel || "Unknown",
+      isBusiness: row.order_is_business === true || String(row.order_is_business).toLowerCase() === "true",
+      currency: row.item_price_currency || null,
+      quantity: 0,
+      orderRevenue: 0,
+      orderTax: 0,
+      brandBreakdown: {},
+    };
+    const quantity = num(row.quantity_sum ?? row.quantity);
+    const revenue = num(row.item_price_sum ?? row.item_price_value);
+    const tax = num(row.item_tax_sum ?? row.item_tax_value);
+    current.quantity += quantity;
+    current.orderRevenue += revenue;
+    current.orderTax += tax;
+    const brandTotal = current.brandBreakdown[brand] || { quantity: 0, orderRevenue: 0, orderTax: 0 };
+    brandTotal.quantity += quantity;
+    brandTotal.orderRevenue += revenue;
+    brandTotal.orderTax += tax;
+    current.brandBreakdown[brand] = brandTotal;
+    byOrder.set(orderId, current);
+  }
+  return [...byOrder.values()];
+}
+
+function reconciliationSettlements(rows) {
+  return rows.map((row) => ({
+    settlementDate: row.date || null,
+    orderId: String(row.amazon_order_id || "").trim() || null,
+    settlementType: String(row.settlement_type || "OTHER").trim().toUpperCase(),
+    currency: row.currency || null,
+    settledRevenue: num(row.item_price_sum ?? row.item_price),
+    settledTax: num(row.item_tax_sum ?? row.item_tax),
+    referralFee: num(row.referral_fee_sum ?? row.referral_fee),
+    fbaFee: num(row.fba_fee_sum ?? row.fba_per_unit_fulfillment_fee),
+    refundedAmount: num(row.refunded_amount_sum ?? row.refunded_amount),
+    netPayout: num(row.total_sum ?? row.total),
+  }));
+}
+
+async function reconciliationRowsByMonth(apiKey, sourceId, columns, ids, from, to, aggregations, groupBy) {
+  const result = [];
+  for (const window of splitDateRangeByMonth(from, to)) {
+    const rows = await fetchExportRows(
+      apiKey, sourceId, columns, ids, window.from, window.to, RECONCILIATION_ROW_LIMIT,
+      { groupBy, aggregations, orderByColumn: "date", orderByDirection: "ASC" }
+    );
+    // Exact row-cap results are unsafe: the API may have truncated more data.
+    if (rows.length >= RECONCILIATION_ROW_LIMIT) {
+      throw new Error(`Reconciliation export reached the ${RECONCILIATION_ROW_LIMIT.toLocaleString("en-US")} row cap for ${window.from.slice(0, 7)}. The report was not saved because a partial reconciliation would be misleading.`);
+    }
+    result.push(...rows);
+  }
+  return result;
 }
 
 async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
@@ -645,6 +748,48 @@ export default async function handler(req, res) {
       const ads = normalizeAdRows(adRaw);
       mergeSalesAndAds(rows, ads);
       res.status(200).json({ rows, brandFiltered: false });
+      return;
+    }
+
+    // Reconciliation is deliberately fetched as six monthly, order-level
+    // batches. The UI joins the two sources locally by amazon_order_id and
+    // exposes settlement posting dates separately from purchase dates.
+    if (action === "reconciliation") {
+      const { ids, from, to } = req.query;
+      if (!ids || !from || !to) {
+        res.status(400).json({ error: "Missing required params: ids, from, to" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "Reconciliation requires exactly one selected account." });
+        return;
+      }
+      const start = String(from), end = String(to);
+      const windows = splitDateRangeByMonth(start, end);
+      if (windows.length !== 6 || windows.some((window) => !isFullCalendarMonthWindow(window))) {
+        res.status(400).json({ error: "Reconciliation requires exactly six complete calendar months." });
+        return;
+      }
+      const orderRows = await reconciliationRowsByMonth(
+        apiKey, ORDER_LINE_ITEMS_SOURCE_ID, RECONCILIATION_ORDER_COLUMNS, sellerOrVendorIds,
+        start, end, RECONCILIATION_ORDER_AGGREGATIONS, RECONCILIATION_ORDER_GROUP_BY
+      );
+      const settlementRows = await reconciliationRowsByMonth(
+        apiKey, RECONCILIATION_SETTLEMENTS_SOURCE_ID, RECONCILIATION_SETTLEMENT_COLUMNS, sellerOrVendorIds,
+        start, end, RECONCILIATION_SETTLEMENT_AGGREGATIONS, RECONCILIATION_SETTLEMENT_GROUP_BY
+      );
+      const catalog = await fetchExportRows(
+        apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds, start, end, CATALOG_ROW_LIMIT,
+        { orderByColumn: "child_asin" }
+      );
+      res.status(200).json({
+        from: start,
+        to: end,
+        months: windows.map((w) => w.from.slice(0, 7)),
+        orders: reconciliationOrders(orderRows, catalog),
+        settlements: reconciliationSettlements(settlementRows),
+      });
       return;
     }
 
