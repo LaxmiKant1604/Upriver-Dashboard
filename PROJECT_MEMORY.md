@@ -87,7 +87,7 @@ New sidebar report directly below Daily Reporting. Single selected account, cach
 - Planning Avg = max(3-month avg, MTD projected).
 - Daily Planning Rate = Planning Avg / days in current month.
 - Target Units = Daily Rate * Target Coverage Days (numeric input at top, default 30, any positive number; recomputes locally, no fetch).
-- Total Coverage Inventory = FBA Available + Reserved + In Transit (+ AWD for US).
+- Total FBA Inv. = FBA Available + Reserved + In Transit (+ AWD for US).
 - Recommended Shipment = max(0, ceil(Target Units - FBA - Reserved - In Transit [- AWD if US])).
 - Stock Remark = Restock if Recommended > 0 else OK.
 
@@ -99,7 +99,8 @@ New sidebar report directly below Daily Reporting. Single selected account, cach
 - `sales-dashboard-live/vercel.json` added with `maxDuration: 60` for `api/datadoe.js` (the plan makes ~7-8 sequential, rate-limited exports; observed 25-33s per refresh).
 - On 2026-07-26, the plan table was updated to round all visible unit values to whole units. The former displayed `Plan Avg` column was replaced with dynamic `Target Units (Nd)`: `Planning Avg / days in current month * Target Coverage Days`. This makes the entered days visibly change the required stock, while 3-month average and MTD projection remain demand inputs. Recommended Shipment still uses the exact calculation and rounds up with `ceil`.
 - The plan has a `Download Excel` action that exports the currently visible (searched and sorted) rows as a UTF-8 BOM CSV, which opens directly in Excel. It includes all displayed planning/inventory columns and the dynamic target-days column; CSV cells are protected from spreadsheet-formula injection. Do not add the npm `xlsx` package for this: its audit reported two unpatched high-severity advisories, so the dependency was removed.
-- `Coverage Units` means inventory already counted toward meeting demand: FBA Available + Reserved FC Transfer/Processing + In Transit; US accounts also add AWD Available. It is a quantity of units, not a number of days.
+- `Total FBA Inv.` means inventory already counted toward meeting demand: FBA Available + Reserved FC Transfer/Processing + In Transit; US accounts also add AWD Available. It is a quantity of units, not a number of days.
+- On 2026-07-26, the combined inventory label was renamed from `Coverage Units` to `Total FBA Inv.`. A new sortable `FBA Days (MTD DRR)` column was added to the table and Excel-compatible export. It is `FBA Available / (MTD Units / completed sales days)` and displays whole days; it intentionally excludes reserved, inbound, and AWD inventory because those units are not physically available in FBA. When MTD DRR is zero or unavailable, it displays `—`. The totals row uses total FBA Available divided by the summed MTD DRR, rather than summing individual ASIN cover days.
 - Latest production deployment for the rounded units, dynamic Target Units, and Excel-compatible export: `https://upriver-dashboard-5dema7vbr-laxmikant1604s-projects.vercel.app` (2026-07-26). It is aliased to `https://upriverdashboard.vercel.app`; the production bundle was checked for all three new UI strings.
 
 ### Verification (Haven&Hue US and AAKRITI IN)

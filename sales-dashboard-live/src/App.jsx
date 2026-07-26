@@ -100,6 +100,10 @@ function computePlanRow(r, meta, targetDays) {
   const inTransit = Number(r.inboundShipped || 0) + Number(r.inboundReceived || 0);
   const isUS = !!meta.isUS;
   const awd = isUS ? Number(r.awdAvailable || 0) : 0;
+  // FBA days cover intentionally uses only physically available FBA units.
+  // Reserved, inbound, and AWD stock remain part of the shipment-plan total.
+  const mtdDrr = elapsed > 0 ? mtdUnits / elapsed : null;
+  const fbaDaysCover = invKnown && mtdDrr && mtdDrr > 0 ? fba / mtdDrr : null;
 
   const coverage = invKnown ? fba + reserved + inTransit + awd : null;
   const recommended = invKnown ? Math.max(0, Math.ceil(targetUnits - fba - reserved - inTransit - awd)) : null;
@@ -113,6 +117,8 @@ function computePlanRow(r, meta, targetDays) {
     m1, m2, m3, mtdUnits,
     threeMoAvg, mtdProjected, planningAvg, targetUnits,
     fbaAvailable: invKnown ? fba : null,
+    mtdDrr,
+    fbaDaysCover,
     reserved: invKnown ? reserved : null,
     inTransit: invKnown ? inTransit : null,
     awd: isUS ? (invKnown || r.awdAvailable != null ? awd : null) : null,
@@ -139,6 +145,7 @@ const PLAN_SORT_ACCESSORS = {
   planningAvg: (r) => r.planningAvg,
   targetUnits: (r) => r.targetUnits,
   fbaAvailable: (r) => r.fbaAvailable,
+  fbaDaysCover: (r) => r.fbaDaysCover,
   reserved: (r) => r.reserved,
   inTransit: (r) => r.inTransit,
   awd: (r) => r.awd,
@@ -192,10 +199,11 @@ function downloadPlanSpreadsheet(rows, meta, targetDays) {
     "MTD Projected": Math.round(row.mtdProjected),
     [targetLabel]: Math.round(row.targetUnits),
     "FBA Available": row.fbaAvailable === null ? "" : Math.round(row.fbaAvailable),
+    "FBA Days Cover (MTD DRR)": row.fbaDaysCover === null ? "" : Math.round(row.fbaDaysCover),
     Reserved: row.reserved === null ? "" : Math.round(row.reserved),
     "In Transit": row.inTransit === null ? "" : Math.round(row.inTransit),
     ...(meta.isUS ? { "AWD Available": row.awd === null ? "" : Math.round(row.awd) } : {}),
-    "Coverage Units": row.coverage === null ? "" : Math.round(row.coverage),
+    "Total FBA Inv.": row.coverage === null ? "" : Math.round(row.coverage),
     "Recommended Shipment": row.recommended === null ? "" : Math.round(row.recommended),
     "Stock Remark": row.remark || "",
   }));
@@ -638,16 +646,22 @@ export default function App() {
   }, [planComputed, planSearch, planSort]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
     let anyInv = false, anyAwd = false;
     planRows.forEach((r) => {
       t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
       t.targetUnits += r.targetUnits;
-      if (r.fbaAvailable !== null) { anyInv = true; t.fbaAvailable += r.fbaAvailable; t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage; }
+      if (r.fbaAvailable !== null) {
+        anyInv = true;
+        t.fbaAvailable += r.fbaAvailable;
+        if (r.mtdDrr !== null) t.mtdDrr += r.mtdDrr;
+        t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage;
+      }
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
       if (r.recommended !== null) t.recommended += r.recommended;
       if (r.remark === "Restock") t.restockCount += 1;
     });
+    t.fbaDaysCover = t.mtdDrr > 0 ? t.fbaAvailable / t.mtdDrr : null;
     t.anyInv = anyInv; t.anyAwd = anyAwd;
     return t;
   }, [planRows]);
@@ -1158,7 +1172,7 @@ export default function App() {
               <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.restockCount.toLocaleString("en-US")}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Coverage Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Total FBA Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
             </div>
           </>
         )}
@@ -1178,10 +1192,11 @@ export default function App() {
                     <PlanTh label="MTD Proj." col="mtdProjected" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label={`Target Units (${targetDays || 0}d)`} col="targetUnits" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="FBA Avail" col="fbaAvailable" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="FBA Days (MTD DRR)" col="fbaDaysCover" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="Reserved" col="reserved" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="In Transit" col="inTransit" sort={planSort} onSort={setPlanSortKey} />
                     {planData.isUS && <PlanTh label="AWD Avail" col="awd" sort={planSort} onSort={setPlanSortKey} />}
-                    <PlanTh label="Coverage" col="coverage" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="Total FBA Inv." col="coverage" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="Recommend" col="recommended" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="Remark" col="remark" sort={planSort} onSort={setPlanSortKey} align="left" />
                   </tr>
@@ -1202,6 +1217,7 @@ export default function App() {
                       <td className="mono">{nInt(r.mtdProjected)}</td>
                       <td className="mono pt-strong">{nInt(r.targetUnits)}</td>
                       <td className="mono">{nInt(r.fbaAvailable)}</td>
+                      <td className="mono">{nInt(r.fbaDaysCover)}</td>
                       <td className="mono">{nInt(r.reserved)}</td>
                       <td className="mono">{nInt(r.inTransit)}</td>
                       {planData.isUS && <td className="mono">{nInt(r.awd)}</td>}
@@ -1222,6 +1238,7 @@ export default function App() {
                     <td className="mono">—</td>
                     <td className="mono pt-strong">{nInt(planTotals.targetUnits)}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</td>
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaDaysCover) : "—"}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.reserved) : "—"}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.inTransit) : "—"}</td>
                     {planData.isUS && <td className="mono">{planTotals.anyAwd ? nInt(planTotals.awd) : "—"}</td>}
@@ -1247,7 +1264,7 @@ export default function App() {
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
           Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
           {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> from <code>Listings</code> and is added to coverage for this US account.</> : <> AWD does not apply to non-US accounts and is hidden.</>}
-          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Coverage Units = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. Recommended Shipment = ceil(Target Units − Coverage Units), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Total FBA Inv. = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. FBA Days (MTD DRR) = FBA Available divided by MTD daily run rate; it excludes reserved, inbound, and AWD stock. Recommended Shipment = ceil(Target Units − Total FBA Inv.), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
       </div>
       )}
