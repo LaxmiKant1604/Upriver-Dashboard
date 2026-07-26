@@ -993,11 +993,21 @@ export default async function handler(req, res) {
       }
       const catalogTo = /^\d{4}-\d{2}-\d{2}$/.test(String(asOf || "")) ? String(asOf) : new Date().toISOString().slice(0, 10);
       const catalogFrom = addDaysStr(catalogTo, -365);
-      const notificationRows = await fetchExportRows(
-        apiKey, CONTENT_CHANGE_SOURCE_ID, CONTENT_CHANGE_COLUMNS, sellerOrVendorIds,
-        null, null, CONTENT_CHANGE_ROW_LIMIT,
-        { orderByColumn: "event_time", orderByDirection: "DESC" }
-      );
+      let notificationRows;
+      try {
+        notificationRows = await fetchExportRows(
+          apiKey, CONTENT_CHANGE_SOURCE_ID, CONTENT_CHANGE_COLUMNS, sellerOrVendorIds,
+          null, null, CONTENT_CHANGE_ROW_LIMIT,
+          { orderByColumn: "event_time", orderByDirection: "DESC" }
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/source is disabled for this organization/i.test(message)) {
+          res.status(424).json({ error: "Content Change Alerts is disabled in DataDoe. In DataDoe, open Settings > Data tables and enable Branded Item Content Change Notifications, then refresh this report again." });
+          return;
+        }
+        throw err;
+      }
       const catalogRows = await fetchExportRows(
         apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds,
         catalogFrom, catalogTo, CATALOG_ROW_LIMIT,
