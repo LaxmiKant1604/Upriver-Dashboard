@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -111,7 +111,7 @@ function computePlanRow(r, meta, targetDays) {
     brand: r.brand,
     sku: r.sku,
     m1, m2, m3, mtdUnits,
-    threeMoAvg, mtdProjected, planningAvg,
+    threeMoAvg, mtdProjected, planningAvg, targetUnits,
     fbaAvailable: invKnown ? fba : null,
     reserved: invKnown ? reserved : null,
     inTransit: invKnown ? inTransit : null,
@@ -137,6 +137,7 @@ const PLAN_SORT_ACCESSORS = {
   threeMoAvg: (r) => r.threeMoAvg,
   mtdProjected: (r) => r.mtdProjected,
   planningAvg: (r) => r.planningAvg,
+  targetUnits: (r) => r.targetUnits,
   fbaAvailable: (r) => r.fbaAvailable,
   reserved: (r) => r.reserved,
   inTransit: (r) => r.inTransit,
@@ -168,7 +169,49 @@ function monthKeyLabel(key) {
 }
 // Integer / 1-decimal unit formatters; unknown values render as an em dash.
 const nInt = (v) => (v === null || v === undefined || !isFinite(v) ? "—" : Math.round(Number(v)).toLocaleString("en-US"));
-const n1 = (v) => (v === null || v === undefined || !isFinite(v) ? "—" : Number(v).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }));
+function csvCell(value) {
+  let text = value === null || value === undefined ? "" : String(value);
+  // Prevent spreadsheet programs from evaluating a product value as a formula.
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function downloadPlanSpreadsheet(rows, meta, targetDays) {
+  const monthLabels = (meta.months || []).map((m) => monthKeyLabel(m.key));
+  const targetLabel = `Target Units (${targetDays} Days)`;
+  const exportRows = rows.map((row) => ({
+    "Product Name": row.productName || "",
+    ASIN: row.asin || "",
+    SKU: row.sku || "",
+    Brand: row.brand || "",
+    [monthLabels[0] || "Month 1"]: Math.round(row.m1),
+    [monthLabels[1] || "Month 2"]: Math.round(row.m2),
+    [monthLabels[2] || "Month 3"]: Math.round(row.m3),
+    "MTD Units": Math.round(row.mtdUnits),
+    "3M Avg": Math.round(row.threeMoAvg),
+    "MTD Projected": Math.round(row.mtdProjected),
+    [targetLabel]: Math.round(row.targetUnits),
+    "FBA Available": row.fbaAvailable === null ? "" : Math.round(row.fbaAvailable),
+    Reserved: row.reserved === null ? "" : Math.round(row.reserved),
+    "In Transit": row.inTransit === null ? "" : Math.round(row.inTransit),
+    ...(meta.isUS ? { "AWD Available": row.awd === null ? "" : Math.round(row.awd) } : {}),
+    "Coverage Units": row.coverage === null ? "" : Math.round(row.coverage),
+    "Recommended Shipment": row.recommended === null ? "" : Math.round(row.recommended),
+    "Stock Remark": row.remark || "",
+  }));
+  if (exportRows.length === 0) return;
+  const headers = Object.keys(exportRows[0]);
+  const csv = "\uFEFF" + [headers, ...exportRows.map((row) => headers.map((header) => row[header]))]
+    .map((line) => line.map(csvCell).join(","))
+    .join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  const account = String(meta.accountName || "account").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  link.href = url;
+  link.download = `fba-shipment-plan-${account || "account"}-${meta.asOf || "report"}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
 
 /* ============================== NUMBER / MONEY HELPERS ============================== */
 function pct(curr, prev) {
@@ -595,11 +638,11 @@ export default function App() {
   }, [planComputed, planSearch, planSort]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, planningAvg: 0, fbaAvailable: 0, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
     let anyInv = false, anyAwd = false;
     planRows.forEach((r) => {
       t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
-      t.planningAvg += r.planningAvg;
+      t.targetUnits += r.targetUnits;
       if (r.fbaAvailable !== null) { anyInv = true; t.fbaAvailable += r.fbaAvailable; t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage; }
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
       if (r.recommended !== null) t.recommended += r.recommended;
@@ -1077,6 +1120,15 @@ export default function App() {
               <input type="text" placeholder="ASIN, SKU, product, or brand" value={planSearch} onChange={(e) => setPlanSearch(e.target.value)} />
             </span>
           </label>
+          <button
+            className="plan-export-btn"
+            type="button"
+            disabled={!planData || planRows.length === 0}
+            onClick={() => downloadPlanSpreadsheet(planRows, planData, targetDays || 30)}
+          >
+            <Download size={15} />
+            Download Excel
+          </button>
         </div>
 
         {planError && (
@@ -1106,7 +1158,7 @@ export default function App() {
               <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.restockCount.toLocaleString("en-US")}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Coverage Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Coverage Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
             </div>
           </>
         )}
@@ -1124,7 +1176,7 @@ export default function App() {
                     <PlanTh label="MTD" col="mtdUnits" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="3M Avg" col="threeMoAvg" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="MTD Proj." col="mtdProjected" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="Plan Avg" col="planningAvg" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label={`Target Units (${targetDays || 0}d)`} col="targetUnits" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="FBA Avail" col="fbaAvailable" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="Reserved" col="reserved" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="In Transit" col="inTransit" sort={planSort} onSort={setPlanSortKey} />
@@ -1146,9 +1198,9 @@ export default function App() {
                       <td className="mono">{nInt(r.m2)}</td>
                       <td className="mono">{nInt(r.m3)}</td>
                       <td className="mono">{nInt(r.mtdUnits)}</td>
-                      <td className="mono">{n1(r.threeMoAvg)}</td>
-                      <td className="mono">{n1(r.mtdProjected)}</td>
-                      <td className="mono pt-strong">{n1(r.planningAvg)}</td>
+                      <td className="mono">{nInt(r.threeMoAvg)}</td>
+                      <td className="mono">{nInt(r.mtdProjected)}</td>
+                      <td className="mono pt-strong">{nInt(r.targetUnits)}</td>
                       <td className="mono">{nInt(r.fbaAvailable)}</td>
                       <td className="mono">{nInt(r.reserved)}</td>
                       <td className="mono">{nInt(r.inTransit)}</td>
@@ -1168,7 +1220,7 @@ export default function App() {
                     <td className="mono">{nInt(planTotals.mtdUnits)}</td>
                     <td className="mono">—</td>
                     <td className="mono">—</td>
-                    <td className="mono pt-strong">{n1(planTotals.planningAvg)}</td>
+                    <td className="mono pt-strong">{nInt(planTotals.targetUnits)}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.reserved) : "—"}</td>
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.inTransit) : "—"}</td>
@@ -1195,7 +1247,7 @@ export default function App() {
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
           Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
           {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> from <code>Listings</code> and is added to coverage for this US account.</> : <> AWD does not apply to non-US accounts and is hidden.</>}
-          {" "}Planning Avg = max(3-month avg, MTD projected). Recommended Shipment = ceil(Planning daily rate × target days − coverage inventory), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Coverage Units = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. Recommended Shipment = ceil(Target Units − Coverage Units), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
       </div>
       )}
@@ -1372,6 +1424,9 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .plan-search-wrap{ display:flex; align-items:center; gap:8px; border:1px solid var(--border); border-radius:9px; padding:0 12px; background:var(--surface); }
 .plan-search-wrap svg{ color:var(--ink-soft); flex-shrink:0; }
 .plan-search-wrap input{ border:none; outline:none; padding:9px 0; font-size:13px; font-family:inherit; color:var(--ink); width:100%; background:transparent; }
+.plan-export-btn{ display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:36px; padding:8px 12px; border:1px solid var(--accent-deep); border-radius:8px; background:var(--surface); color:var(--accent-deep); font:700 13px inherit; cursor:pointer; white-space:nowrap; }
+.plan-export-btn:hover:not(:disabled){ background:#FEF3E2; }
+.plan-export-btn:disabled{ opacity:.5; cursor:not-allowed; }
 .plan-freshness{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--ink-soft); }
 .plan-freshness strong{ color:var(--ink); font-weight:700; }
 .plan-fresh-sep{ color:var(--border); }
