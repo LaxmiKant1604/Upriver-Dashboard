@@ -984,6 +984,13 @@ export default function App() {
   const applySkuPlData = useCallback((body, cachedAt, accountCurrency) => {
     setSkuPlData(body);
     setSkuPlCachedAt(new Date(cachedAt));
+    // Populate the shared header selector even when this account has not had a
+    // dashboard refresh yet. These are only brands present in the P&L scope;
+    // any fuller catalog cache remains merged by `brandList`.
+    if (body.accountId && Array.isArray(body.catalogBrands)) {
+      setCatalogBrands(body.catalogBrands);
+      setCatalogBrandsAccountId(body.accountId);
+    }
     // Default to the latest completed month; keep the prior choice if still valid.
     setSkuPlMonth((prev) => (body.months?.includes(prev) || prev === "ALL") ? prev : body.months?.[body.months.length - 1] || "ALL");
     // Default currency: the account's own currency if present, else the first.

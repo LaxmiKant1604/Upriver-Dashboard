@@ -966,11 +966,14 @@ export default async function handler(req, res) {
       }
       const rows = await fetchSkuPlRows(apiKey, sellerOrVendorIds, windows);
       const currencies = [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort();
+      const catalogBrands = [...new Set(rows.map((r) => r.brand).filter(Boolean))].sort((a, b) => a.localeCompare(b));
       res.status(200).json({
+        accountId: sellerOrVendorIds[0],
         from: start,
         to: end,
         months: windows.map((w) => w.from.slice(0, 7)),
         currencies,
+        catalogBrands,
         rows,
       });
       return;
