@@ -127,6 +127,8 @@ New sidebar report directly below Daily Reporting. Single selected account, cach
 
 ## In progress
 
+- **Amazon Reconciliation Dashboard:** implementing a new cache-first report under the shared header Account/Brand scope, based on DataDoe's `create-amazon-reconciliation-dashboard` skill. It will reconcile six *full* calendar months of Order Line Items with Settlements & P&L Components, keep all filtering and exploration local after an explicit refresh, and make normal cross-month settlement timing visible rather than misclassifying it as a data defect. The confirmed settlement source is `732dac689a6545697c2f2e36c61b2c9e93187053bcce2999914183c6f490df27`; its financial fields are named `item_price`, `item_tax`, `referral_fee`, `fba_per_unit_fulfillment_fee`, `refunded_amount`, and `total` (not the `sum_*` aliases used by the generic skill).
+- **Delivery protocol:** for future Claude/Codex changes, the implementing agent must update this memory with completed work, in-progress/pending work, decisions, technical learnings, and verification. Codex must then perform a senior-engineer review, resolve material findings, verify the deployed behavior, and record a concise completion/deployment summary before declaring the task finished.
 - FBA Shipment Plan review follow-up is open: address month-rollover completeness and duplicate-refresh protection before treating shipment recommendations as production-accurate in all periods. The main dashboard now uses DataDoe Order Line Items (`89b275...`) rather than Profit by SKU & Date for its sales total.
 - Temporary discovery routes `?action=fields` and `?action=sample` still exist in `api/datadoe.js`; remove them now that sources/columns are confirmed.
 
@@ -182,6 +184,25 @@ New sidebar report directly below Daily Reporting. Single selected account, cach
 - Vercel serverless functions cannot have spaces in the filename. A file named `datadoe (1).js` under `api/` would fail deployment with `invalid_function_name`; the active API route must remain `api/datadoe.js`.
 - Changing Vercel environment variables does not auto-redeploy. Trigger a redeploy for new values to take effect.
 - DataDoe AI Skills reference for Claude/Codex handoff and future report ideas: https://github.com/Deltologic/datadoe-ai-skills. Also review DataDoe Hub's AI skills/docs pages when designing new modules, especially reconciliation dashboards, orders manager, ASIN/search audit, export discovery, REST fallback, polling, and rate-limit guidance.
+
+## DataDoe reference (Deltologic GitHub) — reviewed 2026-07-26, for future features
+
+Public org: https://github.com/Deltologic. Two repos are the most useful references for extending this dashboard:
+
+- **`datadoe-api-starter`** (branch `development`) — official Next.js reference app on the DataDoe API. Mirror its patterns:
+  - `src/lib/datadoe-client.ts` — canonical client. Confirms our conventions: `datadoe-api-key` header; on 429 read `retry-after` (our `ddFetch` already does this); responses/errors carry a `datadoe-api-request-id` header worth logging for support; error `message` can be an array (first = summary, full = details).
+  - `src/app/api/datadoe/[...path]/route.ts` — a generic catch-all proxy that forwards any `/api/v1/*` path server-side. If we add more sources/actions, consider this pattern instead of one hand-written branch per action.
+  - `src/types/api/exports.ts` — authoritative Exports request/response shape. **Capabilities we are NOT yet using but should:**
+    - `filters: { combinator: "and"|"or", rules: [{ field, operator, value, not }] }` — server-side row filtering. This unlocks using **Order Line Items** with `amazon_order_status != "Cancelled"` for cleaner sales, or filtering an export to specific ASINs.
+    - `dateInterval: "DAY"|"WEEK"|"MONTH"` — native period bucketing. The FBA Shipment Plan currently runs 3 separate month exports; one grouped export with `dateInterval:"MONTH"` + `groupBy:["child_asin"]` could replace them and cut refresh latency (the 25-40s risk).
+    - `skip` (+ `limit`) — real pagination for large sources instead of a single large `limit`.
+    - Real export statuses: `PENDING | IN_PROGRESS | COMPLETED | ERROR | BLOCKED_NO_TOKENS`. **Latent bug in our `api/datadoe.js` `pollExport`:** it checks `status === "FAILED"` (never emitted), so a failed export polls until timeout instead of erroring fast. Change to treat `ERROR` and `BLOCKED_NO_TOKENS` as terminal failures.
+  - `AGENTS.md` — build discipline for this API: read README first; run a `/util/sellers-and-vendors` health check before coding; keep features simple; feature-based folders under `src/features/<name>/`.
+
+- **`datadoe-ai-skills`** (branch `development`) — 18 skill blueprints (`skills/<name>/SKILL.md`), each a ready feature spec with the exact source, columns, and formulas. Direct candidates for new sidebar modules: `restock-priority-alert` (inventory, overlaps our FBA plan), `net-profit-pl-analyzer`, `ppc-wasted-spend-watchdog` / `ppc-bid-optimizer-apply` / `ppc-negative-keyword-applier`, `keyword-rank-sqp-tracker`, `sales-movers-scanner`, `return-refund-analyzer`, `buy-box-loss-root-cause`, `suppressed-inactive-listings-check`, `daily-account-health-check`, `weekly-business-review`, `create-orders-manager`, `create-amazon-reconciliation-dashboard`, `amazon-listing-optimizer`.
+  - `restock-priority-alert` validates our FBA plan design (same `amazon_fba_inventory_health` source, latest-snapshot/MAX(date), inbound-aware, skip dead stock). It surfaces extra fields we could add later: `days_of_supply`, `units_shipped_t7/t30`, `fba_inventory_level_health_status`, and Amazon's own `recommended_ship_in_quantity` / `recommended_ship_in_date` (worth showing next to our computed Recommended Shipment as a cross-check). Note quirks it flags: `days_of_supply` is often null for slow SKUs (fall back to t30 velocity); FBA Inventory Health is not available in MX.
+
+- There is also a hosted MCP server (`Deltologic/datadoe-mcp`, base `https://mcp.datadoe.com/mcp/v1`) exposing the same data as MCP tools — an alternative to the REST exports flow if we ever want tool-based access.
 
 ## Amazon accounts inventory
 
