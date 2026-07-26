@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -72,6 +72,103 @@ function pickNum(row, keys) {
   }
   return null;
 }
+
+/* ============================== FBA SHIPMENT PLAN HELPERS ============================== */
+// Turn one raw per-ASIN plan row + report metadata + the target-coverage input
+// into all derived planning metrics. Pure and local, so changing the target or
+// filters recomputes instantly without any DataDoe request.
+function computePlanRow(r, meta, targetDays) {
+  const keys = (meta.months || []).map((m) => m.key);
+  const m1 = Number(r.unitsByMonth?.[keys[0]] || 0);
+  const m2 = Number(r.unitsByMonth?.[keys[1]] || 0);
+  const m3 = Number(r.unitsByMonth?.[keys[2]] || 0);
+  const mtdUnits = Number(r.mtdUnits || 0);
+
+  const threeMoAvg = (m1 + m2 + m3) / 3;
+  const daysInMonth = Number(meta.currentMonth?.daysInMonth || 0);
+  const elapsed = Number(meta.elapsedDays || 0);
+  const mtdProjected = elapsed > 0 ? (mtdUnits / elapsed) * daysInMonth : 0;
+  const planningAvg = Math.max(threeMoAvg, mtdProjected);
+  const dailyRate = daysInMonth > 0 ? planningAvg / daysInMonth : 0;
+  const targetUnits = dailyRate * Number(targetDays || 0);
+
+  // Inventory may be unavailable (null) for the whole snapshot; keep planning
+  // fields null in that case rather than treating unknown stock as zero.
+  const invKnown = r.fbaAvailable !== null && r.fbaAvailable !== undefined;
+  const fba = Number(r.fbaAvailable || 0);
+  const reserved = Number(r.reservedFcTransfer || 0) + Number(r.reservedFcProcessing || 0);
+  const inTransit = Number(r.inboundShipped || 0) + Number(r.inboundReceived || 0);
+  const isUS = !!meta.isUS;
+  const awd = isUS ? Number(r.awdAvailable || 0) : 0;
+
+  const coverage = invKnown ? fba + reserved + inTransit + awd : null;
+  const recommended = invKnown ? Math.max(0, Math.ceil(targetUnits - fba - reserved - inTransit - awd)) : null;
+  const remark = recommended === null ? null : recommended > 0 ? "Restock" : "OK";
+
+  return {
+    asin: r.asin,
+    productName: r.productName,
+    brand: r.brand,
+    sku: r.sku,
+    m1, m2, m3, mtdUnits,
+    threeMoAvg, mtdProjected, planningAvg,
+    fbaAvailable: invKnown ? fba : null,
+    reserved: invKnown ? reserved : null,
+    inTransit: invKnown ? inTransit : null,
+    awd: isUS ? (invKnown || r.awdAvailable != null ? awd : null) : null,
+    coverage, recommended, remark, invKnown, isUS,
+  };
+}
+
+function planSearchMatch(row, q) {
+  if (!q) return true;
+  const hay = `${row.asin || ""} ${row.sku || ""} ${row.productName || ""} ${row.brand || ""}`.toLowerCase();
+  return hay.includes(q.toLowerCase());
+}
+
+// Sortable columns for the plan table. `get` returns a comparable value; null
+// values always sort last regardless of direction.
+const PLAN_SORT_ACCESSORS = {
+  asin: (r) => r.asin || "",
+  productName: (r) => (r.productName || "").toLowerCase(),
+  brand: (r) => (r.brand || "").toLowerCase(),
+  m1: (r) => r.m1, m2: (r) => r.m2, m3: (r) => r.m3,
+  mtdUnits: (r) => r.mtdUnits,
+  threeMoAvg: (r) => r.threeMoAvg,
+  mtdProjected: (r) => r.mtdProjected,
+  planningAvg: (r) => r.planningAvg,
+  fbaAvailable: (r) => r.fbaAvailable,
+  reserved: (r) => r.reserved,
+  inTransit: (r) => r.inTransit,
+  awd: (r) => r.awd,
+  coverage: (r) => r.coverage,
+  recommended: (r) => r.recommended,
+  remark: (r) => r.remark || "",
+};
+
+function comparePlanRows(a, b, key, dir) {
+  const acc = PLAN_SORT_ACCESSORS[key] || PLAN_SORT_ACCESSORS.recommended;
+  const av = acc(a), bv = acc(b);
+  const aNull = av === null || av === undefined;
+  const bNull = bv === null || bv === undefined;
+  if (aNull && bNull) return 0;
+  if (aNull) return 1;   // nulls always last
+  if (bNull) return -1;
+  let cmp;
+  if (typeof av === "string" || typeof bv === "string") cmp = String(av).localeCompare(String(bv));
+  else cmp = av - bv;
+  return dir === "asc" ? cmp : -cmp;
+}
+
+// "2026-04" -> "Apr '26"
+function monthKeyLabel(key) {
+  if (!key) return "";
+  const [y, m] = key.split("-").map(Number);
+  return `${MONTH_ABBR[m - 1]} '${String(y).slice(2)}`;
+}
+// Integer / 1-decimal unit formatters; unknown values render as an em dash.
+const nInt = (v) => (v === null || v === undefined || !isFinite(v) ? "—" : Math.round(Number(v)).toLocaleString("en-US"));
+const n1 = (v) => (v === null || v === undefined || !isFinite(v) ? "—" : Number(v).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }));
 
 /* ============================== NUMBER / MONEY HELPERS ============================== */
 function pct(curr, prev) {
@@ -266,6 +363,16 @@ export default function App() {
   const [dailyLoading, setDailyLoading] = useState(false);
   const [dailyError, setDailyError] = useState(null);
 
+  // FBA Shipment Plan: single selected account, cache-first like the others.
+  const [planAccountId, setPlanAccountId] = useState(null);
+  const [planData, setPlanData] = useState(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState(null);
+  const [planCachedAt, setPlanCachedAt] = useState(null);
+  const [targetDays, setTargetDays] = useState(30);
+  const [planSearch, setPlanSearch] = useState("");
+  const [planSort, setPlanSort] = useState({ key: "recommended", dir: "desc" });
+
   const TODAY = todayStr();
 
   const applyAccounts = useCallback((body) => {
@@ -275,6 +382,7 @@ export default function App() {
       setSelectedAccountId((prev) => prev || nextAccounts[0].id);
       const aakriti = nextAccounts.find((a) => /aakriti/i.test(a.name));
       setDailyAccountId((prev) => prev || (aakriti || nextAccounts[0]).id);
+      setPlanAccountId((prev) => prev || nextAccounts[0].id);
     }
     setAccountsError(null);
     return nextAccounts;
@@ -398,9 +506,55 @@ export default function App() {
     if (view === "daily") loadCachedDaily();
   }, [view, loadCachedDaily]);
 
+  // FBA Shipment Plan: cache-first, single selected account, manual refresh only.
+  const planParams = useMemo(() => {
+    if (!planAccountId) return null;
+    // Bump reportVersion if the backend metric definition changes so a stale
+    // cached report can never be presented as the current one. `to` (the as-of
+    // date) is part of the cache key; the target-coverage input is NOT, because
+    // it is applied locally and must never trigger a refetch.
+    return { action: "fba-plan", reportVersion: "fba-plan-v1", ids: planAccountId, to: TODAY };
+  }, [planAccountId, TODAY]);
+
+  const loadCachedPlan = useCallback(() => {
+    if (!planParams) {
+      setPlanData(null);
+      return;
+    }
+    const cached = readApiCache(planParams);
+    if (cached) {
+      setPlanData(cached.body);
+      setPlanCachedAt(new Date(cached.cachedAt));
+      setPlanError(null);
+    } else {
+      setPlanData(null);
+      setPlanCachedAt(null);
+      setPlanError("No cached FBA Shipment Plan for this account. Click refresh to fetch from DataDoe.");
+    }
+  }, [planParams]);
+
+  const fetchPlan = useCallback(() => {
+    if (!planParams) return;
+    setPlanLoading(true);
+    setPlanError(null);
+    cachedApiGet(planParams, { force: true })
+      .then(({ body, cachedAt }) => {
+        setPlanData(body);
+        setPlanCachedAt(new Date(cachedAt));
+      })
+      .catch((err) => setPlanError(err.message))
+      .finally(() => setPlanLoading(false));
+  }, [planParams]);
+
+  useEffect(() => {
+    if (view === "fbaplan") loadCachedPlan();
+  }, [view, loadCachedPlan]);
+
   const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
   const refreshScopeAccount = view === "daily"
     ? accountById[dailyAccountId]
+    : view === "fbaplan"
+    ? accountById[planAccountId]
     : accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
     // The sales source can emit a newer zero-sales row before its daily data
@@ -427,6 +581,42 @@ export default function App() {
     return { latest, columns, cells };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dailyRows]);
+
+  // Derived FBA Shipment Plan: raw rows -> computed metrics -> filter -> sort.
+  // Everything here is local, so search/sort/target changes never refetch.
+  const planComputed = useMemo(() => {
+    if (!planData || !Array.isArray(planData.rows)) return [];
+    return planData.rows.map((r) => computePlanRow(r, planData, targetDays));
+  }, [planData, targetDays]);
+
+  const planRows = useMemo(() => {
+    const filtered = planComputed.filter((r) => planSearchMatch(r, planSearch));
+    return [...filtered].sort((a, b) => comparePlanRows(a, b, planSort.key, planSort.dir));
+  }, [planComputed, planSearch, planSort]);
+
+  const planTotals = useMemo(() => {
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, planningAvg: 0, fbaAvailable: 0, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
+    let anyInv = false, anyAwd = false;
+    planRows.forEach((r) => {
+      t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
+      t.planningAvg += r.planningAvg;
+      if (r.fbaAvailable !== null) { anyInv = true; t.fbaAvailable += r.fbaAvailable; t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage; }
+      if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
+      if (r.recommended !== null) t.recommended += r.recommended;
+      if (r.remark === "Restock") t.restockCount += 1;
+    });
+    t.anyInv = anyInv; t.anyAwd = anyAwd;
+    return t;
+  }, [planRows]);
+
+  const setPlanSortKey = useCallback((key) => {
+    setPlanSort((prev) => {
+      if (prev.key === key) return { key, dir: prev.dir === "asc" ? "desc" : "asc" };
+      // Text columns default to ascending; numeric columns to descending.
+      const textCols = ["asin", "productName", "brand", "sku", "remark"];
+      return { key, dir: textCols.includes(key) ? "asc" : "desc" };
+    });
+  }, []);
 
   const displayCurrency = accountById[selectedAccountId]?.currency || "INR";
 
@@ -625,6 +815,10 @@ export default function App() {
               <CalendarRange size={18} />
               <span className="sb-nav-label">Daily Reporting</span>
             </button>
+            <button className={"sb-nav-item" + (view === "fbaplan" ? " active" : "")} title="FBA Shipment Plan" onClick={() => { setView("fbaplan"); setMobileOpen(false); }}>
+              <Boxes size={18} />
+              <span className="sb-nav-label">FBA Shipment Plan</span>
+            </button>
           </nav>
 
           <div className="sb-footer">
@@ -682,9 +876,12 @@ export default function App() {
         )}
         <div className="live-wrap">
           <span className="live-dot" />
-          {lastFetchedAt ? `Refreshed ${lastFetchedAt.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh"}
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : fetchRows} title="Refresh selected account">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : rowsLoading) ? "spin" : ""} />
+          {(() => {
+            const stamp = view === "fbaplan" ? planCachedAt : lastFetchedAt;
+            return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
+          })()}
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : fetchRows} title="Refresh selected account">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
       </div>
@@ -846,9 +1043,182 @@ export default function App() {
         </div>
       </div>
       )}
+
+      {view === "fbaplan" && (
+      <div className="container">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">FBA Shipment Plan</div>
+            <div className="page-sub">Per-ASIN restock recommendation from sales velocity and live FBA{planData?.isUS ? " + AWD" : ""} inventory</div>
+          </div>
+          <div className="select">
+            <select aria-label="FBA plan account" value={planAccountId || ""} onChange={(e) => setPlanAccountId(e.target.value)}>
+              {accounts.map((account) => (
+                <option value={account.id} key={account.id}>{FLAGS[account.country] || ""} {account.name} ({account.country || "—"})</option>
+              ))}
+            </select>
+            <ChevronDown size={16} />
+          </div>
+        </div>
+
+        <div className="plan-controls">
+          <label className="plan-field">
+            <span className="plan-field-label">Target Coverage Days</span>
+            <input
+              type="number" min="1" step="1" value={targetDays}
+              onChange={(e) => { const v = e.target.value; setTargetDays(v === "" ? "" : Math.max(1, Number(v))); }}
+              onBlur={(e) => { if (e.target.value === "" || Number(e.target.value) < 1) setTargetDays(30); }}
+            />
+          </label>
+          <label className="plan-field plan-search">
+            <span className="plan-field-label">Search</span>
+            <span className="plan-search-wrap">
+              <Search size={14} />
+              <input type="text" placeholder="ASIN, SKU, product, or brand" value={planSearch} onChange={(e) => setPlanSearch(e.target.value)} />
+            </span>
+          </label>
+        </div>
+
+        {planError && (
+          <div className="error-banner"><AlertTriangle size={15} /> {planError}</div>
+        )}
+
+        {planData && (
+          <>
+            <div className="plan-freshness">
+              <span className="live-dot" style={{ position: "relative", top: 1 }} />
+              <span>Sales through <strong>{planData.salesLatestDate ? fmtDateHuman(planData.salesLatestDate) : "—"}</strong></span>
+              <span className="plan-fresh-sep">·</span>
+              <span>FBA inventory snapshot <strong>{planData.inventoryDate ? fmtDateHuman(planData.inventoryDate) : "unavailable"}</strong></span>
+              {planData.isUS && <><span className="plan-fresh-sep">·</span><span>AWD {planData.awdAvailable ? "included" : "no live units"}</span></>}
+              <span className="plan-fresh-sep">·</span>
+              <span>{planCachedAt ? `cached ${planCachedAt.toLocaleString()}` : ""}</span>
+            </div>
+
+            {!planData.inventoryAvailable && (
+              <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+                <AlertTriangle size={15} /> Live FBA inventory is unavailable for this account right now, so coverage and recommendations show “—”. Sales velocity is still shown.
+              </div>
+            )}
+
+            <div className="plan-stat-row">
+              <div className="plan-stat"><div className="plan-stat-label">ASINs</div><div className="plan-stat-value mono">{planRows.length.toLocaleString("en-US")}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.restockCount.toLocaleString("en-US")}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Coverage Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
+            </div>
+          </>
+        )}
+
+        {planData && planRows.length > 0 ? (
+          <div className="panel" style={{ marginTop: 14, padding: 0, overflow: "hidden" }}>
+            <div className="plan-scroll">
+              <table className="plan-table">
+                <thead>
+                  <tr>
+                    <PlanTh className="pt-id" label="Product / ASIN" col="asin" sort={planSort} onSort={setPlanSortKey} align="left" />
+                    <PlanTh label={monthKeyLabel(planData.months?.[0]?.key)} col="m1" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label={monthKeyLabel(planData.months?.[1]?.key)} col="m2" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label={monthKeyLabel(planData.months?.[2]?.key)} col="m3" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="MTD" col="mtdUnits" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="3M Avg" col="threeMoAvg" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="MTD Proj." col="mtdProjected" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="Plan Avg" col="planningAvg" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="FBA Avail" col="fbaAvailable" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="Reserved" col="reserved" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="In Transit" col="inTransit" sort={planSort} onSort={setPlanSortKey} />
+                    {planData.isUS && <PlanTh label="AWD Avail" col="awd" sort={planSort} onSort={setPlanSortKey} />}
+                    <PlanTh label="Coverage" col="coverage" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="Recommend" col="recommended" sort={planSort} onSort={setPlanSortKey} />
+                    <PlanTh label="Remark" col="remark" sort={planSort} onSort={setPlanSortKey} align="left" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {planRows.map((r) => (
+                    <tr key={r.asin} className={r.remark === "Restock" ? "plan-restock" : ""}>
+                      <td className="pt-id">
+                        <div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div>
+                        <div className="pt-meta mono">{r.asin}{r.sku ? ` · ${r.sku}` : ""}</div>
+                        {r.brand && <div className="pt-brand">{r.brand}</div>}
+                      </td>
+                      <td className="mono">{nInt(r.m1)}</td>
+                      <td className="mono">{nInt(r.m2)}</td>
+                      <td className="mono">{nInt(r.m3)}</td>
+                      <td className="mono">{nInt(r.mtdUnits)}</td>
+                      <td className="mono">{n1(r.threeMoAvg)}</td>
+                      <td className="mono">{n1(r.mtdProjected)}</td>
+                      <td className="mono pt-strong">{n1(r.planningAvg)}</td>
+                      <td className="mono">{nInt(r.fbaAvailable)}</td>
+                      <td className="mono">{nInt(r.reserved)}</td>
+                      <td className="mono">{nInt(r.inTransit)}</td>
+                      {planData.isUS && <td className="mono">{nInt(r.awd)}</td>}
+                      <td className="mono">{nInt(r.coverage)}</td>
+                      <td className="mono pt-strong">{nInt(r.recommended)}</td>
+                      <td>{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="plan-totals-row">
+                    <td className="pt-id">Totals · {planRows.length} ASIN{planRows.length === 1 ? "" : "s"}</td>
+                    <td className="mono">{nInt(planTotals.m1)}</td>
+                    <td className="mono">{nInt(planTotals.m2)}</td>
+                    <td className="mono">{nInt(planTotals.m3)}</td>
+                    <td className="mono">{nInt(planTotals.mtdUnits)}</td>
+                    <td className="mono">—</td>
+                    <td className="mono">—</td>
+                    <td className="mono pt-strong">{n1(planTotals.planningAvg)}</td>
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</td>
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.reserved) : "—"}</td>
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.inTransit) : "—"}</td>
+                    {planData.isUS && <td className="mono">{planTotals.anyAwd ? nInt(planTotals.awd) : "—"}</td>}
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</td>
+                    <td className="mono pt-strong">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</td>
+                    <td>{planTotals.restockCount > 0 ? `${planTotals.restockCount} restock` : "OK"}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        ) : planData && planRows.length === 0 ? (
+          <div className="panel" style={{ marginTop: 14 }}>
+            <div className="empty-note">{planSearch ? "No ASINs match your search." : "No ASINs found for this account in the reporting window."}</div>
+          </div>
+        ) : !planError ? (
+          <div className="panel" style={{ marginTop: 14 }}>
+            <div className="empty-note">{planLoading ? "Loading FBA Shipment Plan from DataDoe…" : "No cached data yet. Click refresh to fetch this account's plan from DataDoe."}</div>
+          </div>
+        ) : null}
+
+        <div className="footer-note">
+          Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
+          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
+          {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> from <code>Listings</code> and is added to coverage for this US account.</> : <> AWD does not apply to non-US accounts and is hidden.</>}
+          {" "}Planning Avg = max(3-month avg, MTD projected). Recommended Shipment = ceil(Planning daily rate × target days − coverage inventory), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+        </div>
+      </div>
+      )}
         </div>
       </div>
     </div>
+  );
+}
+
+// Sortable header cell for the plan table.
+function PlanTh({ label, col, sort, onSort, align = "right", className = "" }) {
+  const active = sort.key === col;
+  return (
+    <th
+      className={`${className} ${align === "left" ? "pt-left" : ""} pt-sortable ${active ? "pt-sorted" : ""}`}
+      onClick={() => onSort(col)}
+      title="Click to sort"
+    >
+      <span className="pt-th-inner">
+        {label}
+        {active ? (sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />) : <ArrowUpDown size={12} className="pt-th-idle" />}
+      </span>
+    </th>
   );
 }
 
@@ -920,7 +1290,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .spin{ animation:spin 1s linear infinite; }
 @keyframes spin{ from{transform:rotate(0deg);} to{transform:rotate(360deg);} }
 @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(30,142,90,.45);} 70%{box-shadow:0 0 0 6px rgba(30,142,90,0);} 100%{box-shadow:0 0 0 0 rgba(30,142,90,0);} }
-.container{ max-width:1240px; margin:0 auto; padding:22px 24px 0; }
+.container{ width:100%; max-width:1240px; margin:0 auto; padding:22px 24px 0; min-width:0; }
 .tabs{ display:inline-flex; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:4px; gap:2px; }
 .tab{ border:none; background:transparent; padding:8px 16px; font-size:13.5px; font-weight:700; color:var(--ink-soft); border-radius:9px; cursor:pointer; font-family:inherit; }
 .tab.active{ background:var(--ink); color:#fff; }
@@ -992,8 +1362,52 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .daily-table tr.dt-row-highlight td{ background:#FBEFD8; font-weight:700; }
 .daily-table tr.dt-row-highlight td.dt-mtd{ background:#F7E2BE; }
 .daily-table tr.dt-row-highlight td.dt-metric{ background:#FBEFD8; }
+
+/* ---- FBA Shipment Plan ---- */
+.plan-controls{ display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; margin-top:14px; }
+.plan-field{ display:flex; flex-direction:column; gap:5px; }
+.plan-field-label{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
+.plan-field input[type=number]{ border:1px solid var(--border); border-radius:9px; padding:8px 12px; font-size:13px; font-weight:700; font-family:inherit; color:var(--ink); width:130px; }
+.plan-search{ flex:1; min-width:200px; }
+.plan-search-wrap{ display:flex; align-items:center; gap:8px; border:1px solid var(--border); border-radius:9px; padding:0 12px; background:var(--surface); }
+.plan-search-wrap svg{ color:var(--ink-soft); flex-shrink:0; }
+.plan-search-wrap input{ border:none; outline:none; padding:9px 0; font-size:13px; font-family:inherit; color:var(--ink); width:100%; background:transparent; }
+.plan-freshness{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--ink-soft); }
+.plan-freshness strong{ color:var(--ink); font-weight:700; }
+.plan-fresh-sep{ color:var(--border); }
+.plan-stat-row{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:14px; }
+.plan-stat{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px 14px; }
+.plan-stat-label{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
+.plan-stat-value{ font-size:20px; font-weight:700; margin-top:5px; }
+.plan-scroll{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.plan-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12.5px; min-width:1080px; }
+.plan-table th, .plan-table td{ padding:9px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
+.plan-table thead th{ font-size:10.5px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em; background:#FAFBFD; position:sticky; top:0; z-index:2; }
+.plan-table th.pt-left, .plan-table td.pt-left{ text-align:left; }
+.plan-table .pt-sortable{ cursor:pointer; user-select:none; }
+.plan-table .pt-sortable:hover{ color:var(--ink); }
+.plan-table th.pt-sorted{ color:var(--accent-deep); }
+.pt-th-inner{ display:inline-flex; align-items:center; gap:4px; }
+.pt-th-inner .pt-th-idle{ opacity:.4; }
+.plan-table th.pt-id, .plan-table td.pt-id{ text-align:left; position:sticky; left:0; background:var(--surface); z-index:1; min-width:230px; max-width:300px; border-right:1px solid var(--border); }
+.plan-table thead th.pt-id{ z-index:3; background:#FAFBFD; }
+.pt-name{ font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:280px; }
+.pt-meta{ font-size:11px; color:var(--ink-soft); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:280px; }
+.pt-brand{ font-size:11px; color:var(--accent-deep); font-weight:700; margin-top:2px; }
+.plan-table td.pt-strong{ font-weight:700; color:var(--ink); }
+.plan-table tbody tr:hover td{ background:#FAFBFD; }
+.plan-table tbody tr:hover td.pt-id{ background:#F4F6FA; }
+.plan-table tr.plan-restock td{ background:#FEF3E2; }
+.plan-table tr.plan-restock td.pt-id{ background:#FDEBCB; box-shadow:inset 3px 0 0 var(--accent); }
+.plan-table tr.plan-restock:hover td{ background:#FCEBCF; }
+.pt-badge{ display:inline-block; font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; }
+.pt-badge-restock{ background:#FCE4C4; color:#8A5A12; }
+.pt-badge-ok{ background:#E6F2EB; color:var(--pos); }
+.plan-table tfoot td{ position:sticky; bottom:0; background:#F1F2F6; font-weight:700; border-top:1px solid var(--border); border-bottom:none; z-index:1; }
+.plan-table tfoot td.pt-id{ background:#F1F2F6; z-index:2; }
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
+  .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
   /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
   .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
   .sidebar.collapsed{ width:270px; }
@@ -1012,7 +1426,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .topbar-account-select select,.topbar-brand-select select{ width:100%; max-width:none; }
   .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;

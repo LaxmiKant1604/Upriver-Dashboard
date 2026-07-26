@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-24
+Last updated: 2026-07-26
 
 ## Operating rule
 
@@ -63,6 +63,50 @@ Last updated: 2026-07-24
 - Advertising source `08cdc77d3d` was configured with columns `ad_sales`, `ad_spend`, `ad_clicks`, but it returned `404 Source not found` on 2026-07-24. Do not rely on its Daily Reporting metrics until it is replaced or the route is made sales-only.
 - Export helpers generalized: `createExport`/`fetchExportRows(apiKey, sourceId, columns, ids, from, to, limit)` work for any source with a per-call limit.
 - Rate limiting: DataDoe caps at 2 requests/sec per organization; the all-accounts dashboard load (chunked exports) plus any concurrent usage was surfacing HTTP 429 in the UI. Added `ddFetch` in `api/datadoe.js` — a wrapper that spaces DataDoe requests ~550ms apart (`MIN_REQUEST_INTERVAL_MS`) and auto-retries on 429 using `retryAfterSeconds`/`Retry-After` (up to 6 times). All accounts/export/poll/download calls route through it. The account-scope tabs are NOT the cause of the 429.
+
+## FBA Shipment Plan report (added 2026-07-26)
+
+New sidebar report directly below Daily Reporting. Single selected account, cache-first, manual-refresh-only, all planning math computed in the browser. Backend action `fba-plan` in `sales-dashboard-live/api/datadoe.js`; frontend view + helpers in `sales-dashboard-live/src/App.jsx` (`computePlanRow`, `comparePlanRows`, `planSearchMatch`, `PlanTh`).
+
+### DataDoe sources & field mappings (verified against https://api.datadoe.com/api/v1/spec/data-scheme — public, unauthenticated; there is NO REST "list sources" endpoint, use the spec URL)
+- Unit sales per ASIN: `401ffcd7e5` Sales & Traffic by ASIN & Date (`amazon_sales_and_traffic_with_cogs`), column `total_units`, grouped server-side by `child_asin` per month window. Same source Daily Reporting already reconciled to Seller Central.
+- Live FBA inventory: `44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823` FBA Inventory Health (`amazon_fba_inventory_health`). Per-SKU fields used: `available`, `reserved_fc_transfer`, `reserved_fc_processing`, `inbound_shipped`, `inbound_received`, `inbound_working`, `sku`, `child_asin`, `product_name`, `date`. Snapshot is per-SKU per-day; the server keeps only the latest snapshot date (fetch ordered by date DESC over a 10-day lookback, then filter to max date) and folds SKUs to ASIN by summing.
+- AWD available (US accounts only): `ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3` Listings (`amazon_listings_with_cogs`), column `awd_available_distributable_quantity`. Listings has NO date column, so its export sends no from/to and orders by `child_asin` (createExport now omits from/to when falsy).
+- Brand + product name: `68d2de23...` Product Catalog by ASIN (`product_brand`, `product_name`), fetched over the 3-month+MTD window.
+
+### Field-mapping decisions (per spec + confirmed on real rows)
+- FBA Available = `available`.
+- Reserved = `reserved_fc_transfer` + `reserved_fc_processing` ONLY. Customer-order reserve (`reserved_customer_order`) is intentionally excluded and never fetched. NOTE: `total_reserved_quantity` is unreliable in raw data (observed total=3 while fc_transfer=14, fc_processing=1) — do NOT use it.
+- In Transit to FBA = `inbound_shipped` + `inbound_received`. `inbound_working` (still being prepared, not yet shipped) is intentionally excluded per the "already shipped/inbound/receiving" definition.
+- AWD only applies to US-marketplace accounts (isUS derived from the authoritative DataDoe accounts-list country, not client input). Non-US accounts get AWD null/hidden; it never enters coverage or the recommendation.
+
+### Calculations (browser, `computePlanRow`)
+- 3 Month Avg = (m1+m2+m3)/3 over the 3 completed calendar months.
+- MTD Projected Monthly Units = (MTD units / elapsed days) * days in current month. elapsedDays = day-of-month of the latest COMPLETED sales date (not the raw calendar day), so a reporting lag does not understate velocity; 0 if no current-month sales.
+- Planning Avg = max(3-month avg, MTD projected).
+- Daily Planning Rate = Planning Avg / days in current month.
+- Target Units = Daily Rate * Target Coverage Days (numeric input at top, default 30, any positive number; recomputes locally, no fetch).
+- Total Coverage Inventory = FBA Available + Reserved + In Transit (+ AWD for US).
+- Recommended Shipment = max(0, ceil(Target Units - FBA - Reserved - In Transit [- AWD if US])).
+- Stock Remark = Restock if Recommended > 0 else OK.
+
+### Behaviors / assumptions
+- One row per ASIN. SKU->ASIN folding sums inventory across SKUs. Representative SKU = first non-empty SKU in ascending `localeCompare` order (stable across refreshes), gathered from FBA Inventory Health + Listings.
+- Rows are limited to ASINs with real activity: any unit sales in the window OR any live FBA/AWD stock. This drops the large zero-sales/zero-stock catalog tail that Sales & Traffic emits daily (e.g. AAKRITI 2226 -> 1225 rows; Haven&Hue 92 -> 79).
+- Live inventory freshness (snapshot date) is shown separately from sales-report freshness (latest completed sales date). When the whole FBA inventory snapshot is unavailable, coverage/recommendation render "—" with a banner; sales velocity still displays. No values are fabricated.
+- Cache key (`planParams`) = {action:"fba-plan", reportVersion:"fba-plan-v1", ids, to}. Target Coverage Days, search, and sort are NOT in the key — local recompute only. Refresh is single-account (server rejects != 1 id with HTTP 400).
+- `sales-dashboard-live/vercel.json` added with `maxDuration: 60` for `api/datadoe.js` (the plan makes ~7-8 sequential, rate-limited exports; observed 25-33s per refresh).
+
+### Verification (Haven&Hue US and AAKRITI IN)
+- Sales reconciliation EXACT: plan per-ASIN monthly sums equal `action=daily` (same source 401ffcd7e5, grouped by date). Haven&Hue: Apr 92 / May 646 / Jun 877 / Jul-MTD(<=07-22) 462 identical both ways. AAKRITI June = 467 units, matching the previously documented Seller Central reconciliation.
+- Inventory per-ASIN reconciliation MATCH vs raw 2026-07-23 FBA Inventory Health snapshot: B09F3RBP4K avail96/fct2/fcp1, B09F3SVQW3 avail0/fct(null->0)/fcp19, B0BVMQ49TC avail1/fct0/fcp3 — all exact, including null->0 coalescing.
+- AWD: Listings export with no date range works; Haven&Hue returned 24 ASINs with AWD>0. Non-US (AAKRITI) returns awdAvailable=null on every row and no AWD column.
+- UI (Playwright, desktop 1440 + mobile 390): sticky Product/ASIN column holds when scrolled; horizontal scroll is inside the table only. Fixed a bug where the min-width:1080 table forced the whole page to overflow to 1240px on mobile — root cause was `.container { margin:0 auto }` disabling flex stretch; fixed by adding `width:100%` (and `min-width:0`). Search 79->3 on "hella"; restock rows highlighted; math confirmed (B000CRZXPI 3M avg 66.3, MTD proj 100.0, plan avg 100.0). No console errors. Independent code review found no issues.
+
+### Known limitations / risks
+- Refresh latency 25-35s (many sequential rate-limited exports); could approach the 60s function limit on a slow DataDoe day — the UI then surfaces the error and the user retries.
+- Large catalogs (e.g. AAKRITI ~1225 rows) make a sizable localStorage entry; `writeApiCache` already swallows quota errors so the app stays usable.
+- Sales source (401ffcd7e5) can lag a few days; MTD projection is anchored to the latest completed sales date, which is shown in the UI.
 
 ## In progress
 

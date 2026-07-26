@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/datadoe.js": {
+      "maxDuration": 60
+    }
+  }
+}

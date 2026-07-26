@@ -118,6 +118,50 @@ const ADS_AGGREGATIONS = [
   { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
   { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
 ];
+// ===== FBA Shipment Plan sources (verified against api/v1/spec/data-scheme) =====
+// Per-ASIN unit sales. "Sales & Traffic by ASIN & Date" (401ffcd7e5) exposes
+// child_asin + total_units and is the report the Daily Reporting view already
+// reconciled to Seller Central. It is used here for the 3 completed months and
+// current-month MTD unit velocity.
+const PLAN_SALES_SOURCE_ID = "401ffcd7e5";
+// Live FBA inventory snapshot. "FBA Inventory Health" (44fc5ba0...) is the only
+// source that splits reserved into reserved_fc_transfer / reserved_fc_processing
+// / reserved_customer_order and splits inbound into working / shipped / received,
+// which is exactly what the shipment-plan definition requires. It is per SKU per
+// snapshot date; the latest snapshot date is kept and SKUs are folded to ASIN.
+const FBA_HEALTH_SOURCE_ID = "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823";
+const FBA_HEALTH_COLUMNS = [
+  "date",
+  "marketplace_country_code",
+  "child_asin",
+  "sku",
+  "fnsku",
+  "product_name",
+  "available",
+  "reserved_fc_transfer",
+  "reserved_fc_processing",
+  "inbound_working",
+  "inbound_shipped",
+  "inbound_received",
+];
+// AWD available inventory (US marketplace only). The "Listings" source
+// (ba689c05...) exposes awd_available_distributable_quantity per SKU. Listings
+// has no date column, so its exports must not send a date range or a date
+// orderBy.
+const LISTINGS_SOURCE_ID = "ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3";
+const LISTINGS_AWD_COLUMNS = [
+  "child_asin",
+  "sku",
+  "fnsku",
+  "awd_available_distributable_quantity",
+];
+// Inventory Health is a daily snapshot; look back a short window and keep the
+// latest snapshot date. DESC ordering guarantees the full latest snapshot is at
+// the front of the result, so the row limit only ever drops older snapshots.
+const PLAN_INVENTORY_LOOKBACK_DAYS = 10;
+const PLAN_INVENTORY_ROW_LIMIT = 15000;
+const PLAN_SALES_ROW_LIMIT = 30000;
+
 const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 const DASHBOARD_ROW_LIMIT = 5000;
 // Order rows are grouped by day and ASIN before download. A year of data can
@@ -182,7 +226,7 @@ async function fetchAccounts(apiKey) {
 }
 
 async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
-  const { groupBy, aggregations, orderByColumn = "date" } = options;
+  const { groupBy, aggregations, orderByColumn = "date", orderByDirection = "ASC" } = options;
   const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
     headers: authHeaders(apiKey),
@@ -190,12 +234,14 @@ async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, 
       sourceId,
       sellerOrVendorIds,
       columns,
-      from,
-      to,
+      // Sources without a date column (e.g. Listings) must not receive a date
+      // range; only include from/to when provided.
+      ...(from ? { from } : {}),
+      ...(to ? { to } : {}),
       limit,
       outputType: "JSON",
       orderByColumn,
-      orderByDirection: "ASC",
+      orderByDirection,
       ...(groupBy ? { groupBy } : {}),
       ...(aggregations ? { aggregations } : {}),
     }),
@@ -302,6 +348,53 @@ function catalogBrandNames(rows) {
 }
 
 const num = (v) => Number(v) || 0;
+
+/* ===== FBA Shipment Plan helpers ===== */
+const pad2s = (n) => String(n).padStart(2, "0");
+function daysInMonthUTC(y, m /* 1..12 */) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+function addDaysStr(s, n) {
+  const [y, m, d] = s.split("-").map(Number);
+  const t = Date.UTC(y, m - 1, d) + n * 86400000;
+  const dt = new Date(t);
+  return `${dt.getUTCFullYear()}-${pad2s(dt.getUTCMonth() + 1)}-${pad2s(dt.getUTCDate())}`;
+}
+// The 3 completed calendar months before the month containing `toStr`, plus the
+// current (MTD) month window ending at `toStr`.
+function planMonthWindows(toStr) {
+  const [ty, tm] = toStr.split("-").map(Number);
+  const completed = [];
+  for (let i = 3; i >= 1; i--) {
+    const total = ty * 12 + (tm - 1) - i;
+    const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
+    completed.push({
+      key: `${y}-${pad2s(m)}`,
+      from: `${y}-${pad2s(m)}-01`,
+      to: `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`,
+    });
+  }
+  const current = {
+    key: `${ty}-${pad2s(tm)}`,
+    from: `${ty}-${pad2s(tm)}-01`,
+    to: toStr,
+    daysInMonth: daysInMonthUTC(ty, tm),
+  };
+  return { completed, current };
+}
+
+// Sum per-ASIN units for one grouped Sales & Traffic export window.
+async function planAsinUnits(apiKey, ids, from, to) {
+  const rows = await fetchExportRows(
+    apiKey, PLAN_SALES_SOURCE_ID, ["child_asin"], ids, from, to, PLAN_SALES_ROW_LIMIT,
+    { groupBy: ["child_asin"], aggregations: [{ column: "total_units", aggregation: "sum", alias: "units_sum" }], orderByColumn: "child_asin", orderByDirection: "ASC" }
+  );
+  const byAsin = new Map();
+  for (const r of rows) {
+    const asin = String(r.child_asin || "").trim();
+    if (!asin) continue;
+    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.total_units));
+  }
+  return byAsin;
+}
 
 // Fold advertising rows (ad_sales/ad_spend/ad_clicks) into the sales rows by
 // (account, date). Ad totals attach to the first sales row for each key so
@@ -467,6 +560,193 @@ export default async function handler(req, res) {
       return;
     }
 
+    // FBA Shipment Plan: one selected account only. Combines per-ASIN unit
+    // velocity (3 completed months + current-month MTD) with the latest FBA
+    // inventory-health snapshot and (US only) AWD available inventory. All
+    // derived planning metrics are computed in the browser so filter/target
+    // changes never trigger a DataDoe request.
+    if (action === "fba-plan") {
+      const { ids, to } = req.query;
+      if (!ids || !to) {
+        res.status(400).json({ error: "Missing required params: ids, to" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "FBA Shipment Plan requires exactly one selected account." });
+        return;
+      }
+      const { completed, current } = planMonthWindows(String(to));
+
+      // Authoritative account country (drives US-only AWD logic).
+      const accounts = await fetchAccounts(apiKey);
+      const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
+      const isUS = String(account?.country || "").toUpperCase() === "US";
+
+      // 1) Per-ASIN units for each completed month.
+      const asinSet = new Set();
+      const unitsByAsinByMonth = {}; // asin -> { monthKey: units }
+      for (const mo of completed) {
+        const byAsin = await planAsinUnits(apiKey, sellerOrVendorIds, mo.from, mo.to);
+        for (const [asin, units] of byAsin) {
+          asinSet.add(asin);
+          (unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {}))[mo.key] = units;
+        }
+      }
+
+      // 2a) Current-month MTD units per ASIN (grouped by ASIN, so it stays small
+      // and cannot be truncated by an ASIN*day row explosion).
+      const mtdByAsin = await planAsinUnits(apiKey, sellerOrVendorIds, current.from, current.to);
+      for (const asin of mtdByAsin.keys()) asinSet.add(asin);
+      // 2b) Latest completed sales date in the current month (grouped by date
+      // only, ~1 row/day). Elapsed days are measured to this date so the MTD
+      // projection is not diluted by dates the source has not populated yet.
+      const dateRows = await fetchExportRows(
+        apiKey, PLAN_SALES_SOURCE_ID, ["date"], sellerOrVendorIds, current.from, current.to, 500,
+        { groupBy: ["date"], aggregations: [{ column: "total_units", aggregation: "sum", alias: "units_sum" }], orderByColumn: "date", orderByDirection: "ASC" }
+      );
+      let salesLatestDate = null;
+      for (const r of dateRows) {
+        if (num(r.units_sum) > 0 && r.date && (!salesLatestDate || r.date > salesLatestDate)) salesLatestDate = r.date;
+      }
+      // Elapsed days = day-of-month of the latest completed sales date, so the
+      // MTD projection uses the true covered days rather than the raw calendar
+      // day (the sales source can lag a few days).
+      const elapsedDays = (salesLatestDate && salesLatestDate >= current.from && salesLatestDate <= current.to)
+        ? Number(salesLatestDate.slice(8, 10))
+        : 0;
+
+      // 3) Catalog brand + product name. Use the full 3-month + MTD window so a
+      // product released before the current month is still resolved to a brand.
+      const catalog = await fetchExportRows(
+        apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds, completed[0].from, current.to, CATALOG_ROW_LIMIT,
+        { orderByColumn: "child_asin" }
+      );
+      const brandByAsin = new Map();
+      const nameByAsin = new Map();
+      for (const c of catalog) {
+        const asin = String(c.child_asin || "").trim();
+        if (!asin) continue;
+        const brand = String(c.product_brand || "").trim();
+        if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
+        const name = String(c.product_name || "").trim();
+        if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
+      }
+
+      // 4) Latest FBA inventory-health snapshot, folded from SKU to ASIN.
+      const invRows = await fetchExportRows(
+        apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
+        addDaysStr(String(to), -PLAN_INVENTORY_LOOKBACK_DAYS), String(to), PLAN_INVENTORY_ROW_LIMIT,
+        { orderByColumn: "date", orderByDirection: "DESC" }
+      );
+      let inventoryDate = null;
+      for (const r of invRows) {
+        if (r.date && (!inventoryDate || r.date > inventoryDate)) inventoryDate = r.date;
+      }
+      const invByAsin = {};
+      const skusByAsin = {};
+      const invProductName = new Map();
+      for (const r of invRows) {
+        if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
+        const asin = String(r.child_asin || "").trim();
+        if (!asin) continue;
+        asinSet.add(asin);
+        const cur = invByAsin[asin] || (invByAsin[asin] = {
+          available: 0, fcTransfer: 0, fcProcessing: 0,
+          inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
+        });
+        cur.available += num(r.available);
+        cur.fcTransfer += num(r.reserved_fc_transfer);
+        cur.fcProcessing += num(r.reserved_fc_processing);
+        cur.inboundShipped += num(r.inbound_shipped);
+        cur.inboundReceived += num(r.inbound_received);
+        cur.inboundWorking += num(r.inbound_working);
+        const sku = String(r.sku || "").trim();
+        if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+        const nm = String(r.product_name || "").trim();
+        if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
+      }
+      const inventoryAvailable = invRows.length > 0;
+
+      // 5) AWD available (US only), folded from SKU to ASIN.
+      const awdByAsin = {};
+      let awdAvailable = false;
+      if (isUS) {
+        const awdRows = await fetchExportRows(
+          apiKey, LISTINGS_SOURCE_ID, LISTINGS_AWD_COLUMNS, sellerOrVendorIds,
+          null, null, CATALOG_ROW_LIMIT,
+          { orderByColumn: "child_asin" }
+        );
+        awdAvailable = awdRows.length > 0;
+        for (const r of awdRows) {
+          const asin = String(r.child_asin || "").trim();
+          if (!asin) continue;
+          awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
+          const sku = String(r.sku || "").trim();
+          if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+        }
+      }
+
+      // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU
+      // in ascending (localeCompare) order, so it is stable across refreshes.
+      // Only ASINs with real activity are kept: any unit sales in the window, or
+      // any live FBA/AWD stock. This drops the large tail of zero-sales,
+      // zero-stock catalog ASINs that the Sales & Traffic source emits daily.
+      const rows = [];
+      for (const asin of asinSet) {
+        const inv = invByAsin[asin] || null;
+        const skus = skusByAsin[asin] ? [...skusByAsin[asin]].sort((a, b) => a.localeCompare(b)) : [];
+        const unitsByMonth = {};
+        let salesTotal = 0;
+        for (const mo of completed) {
+          const u = num(unitsByAsinByMonth[asin]?.[mo.key]);
+          unitsByMonth[mo.key] = u;
+          salesTotal += u;
+        }
+        const mtdUnits = num(mtdByAsin.get(asin));
+        salesTotal += mtdUnits;
+        const invTotal = inv
+          ? inv.available + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
+          : 0;
+        const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
+        if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0) continue;
+        rows.push({
+          asin,
+          productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
+          brand: brandByAsin.get(asin) || null,
+          sku: skus[0] || null,
+          unitsByMonth,
+          mtdUnits,
+          // Inventory numbers: when the snapshot exists but this ASIN is absent,
+          // it genuinely holds no FBA stock (0). When the whole snapshot is
+          // unavailable, inventory fields are null so the UI can flag it.
+          fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
+          reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
+          reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
+          inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
+          inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
+          inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
+          awdAvailable: isUS ? awdUnits : null,
+        });
+      }
+
+      res.status(200).json({
+        asOf: String(to),
+        accountName: account?.name || null,
+        marketCountry: account?.country || null,
+        isUS,
+        months: completed,
+        currentMonth: current,
+        salesLatestDate,
+        elapsedDays,
+        inventoryDate,
+        inventoryAvailable,
+        awdAvailable,
+        rows,
+      });
+      return;
+    }
+
     // Temporary discovery route to find DataDoe's advertising data source and
     // its column names. Hit this once on the live deployment, e.g.
     //   /api/datadoe?action=fields
@@ -528,10 +808,13 @@ export default async function handler(req, res) {
       else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
       else columns = ["date", "seller_or_vendor_id"];
 
+      // Sources without a date column need a different orderBy and no date
+      // range; pass ?orderBy=<col> and omit from/to for those.
+      const orderByColumn = req.query.orderBy || "date";
       const createRes = await ddFetch(ENDPOINTS.exportsCreate, {
         method: "POST",
         headers: authHeaders(apiKey),
-        body: JSON.stringify({ sourceId, sellerOrVendorIds, columns, from, to, limit, outputType: "JSON", orderByColumn: "date", orderByDirection: "ASC" }),
+        body: JSON.stringify({ sourceId, sellerOrVendorIds, columns, ...(from ? { from } : {}), ...(to ? { to } : {}), limit, outputType: "JSON", orderByColumn, orderByDirection: "ASC" }),
       });
       const createText = await createRes.text().catch(() => "");
       if (!createRes.ok) {
@@ -567,7 +850,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }
