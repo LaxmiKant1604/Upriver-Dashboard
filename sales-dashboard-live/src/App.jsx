@@ -257,13 +257,14 @@ function isCancelledOrder(status) {
 function buildReconciliation(raw, selectedBrand) {
   if (!raw) return { orders: [], settlements: [], allSettlementRows: [], brandScopeIsConservative: false };
   const scopeOrders = (raw.orders || []).flatMap((order) => {
-    const brands = Object.keys(order.brandBreakdown || {});
+    // `brands` is the compact response shape. Keep the breakdown fallback so
+    // a pre-existing cached response from the previous schema stays usable.
+    const brands = order.brands || Object.keys(order.brandBreakdown || {});
     if (selectedBrand !== "ALL") {
       // Settlement entries are order-level. Only single-brand orders can be
       // attributed faithfully to a product brand, so omit mixed-brand orders.
       if (brands.length !== 1 || brands[0] !== selectedBrand) return [];
-      const brand = order.brandBreakdown[selectedBrand];
-      return [{ ...order, quantity: brand.quantity, orderRevenue: brand.orderRevenue, orderTax: brand.orderTax }];
+      return [order];
     }
     return [order];
   });
@@ -800,7 +801,7 @@ export default function App() {
   const reconciliationParams = useMemo(() => {
     if (!selectedAccountId) return null;
     return {
-      action: "reconciliation", reportVersion: "reconciliation-v1", ids: selectedAccountId,
+      action: "reconciliation", reportVersion: "reconciliation-v2", ids: selectedAccountId,
       from: reconciliationWindow.from, to: reconciliationWindow.to,
     };
   }, [selectedAccountId, reconciliationWindow]);

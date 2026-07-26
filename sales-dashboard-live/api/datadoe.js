@@ -473,7 +473,15 @@ function reconciliationOrders(rows, catalogRows) {
     current.brandBreakdown[brand] = brandTotal;
     byOrder.set(orderId, current);
   }
-  return [...byOrder.values()];
+  // The browser only needs the list of brands: named-brand reconciliation
+  // accepts single-brand orders and intentionally excludes mixed-brand orders
+  // because settlement entries cannot be split reliably by item. Do not send
+  // duplicate per-brand monetary maps for every order in a large six-month
+  // payload.
+  return [...byOrder.values()].map(({ brandBreakdown, ...order }) => ({
+    ...order,
+    brands: Object.keys(brandBreakdown),
+  }));
 }
 
 function reconciliationSettlements(rows) {
