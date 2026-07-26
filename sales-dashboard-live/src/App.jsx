@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -344,6 +344,114 @@ function downloadReconciliationCsv(rows, currency, scopeLabel) {
   URL.revokeObjectURL(url);
 }
 
+/* ============================== SKU P&L ANALYZER HELPERS ============================== */
+// Sum a SKU's per-month buckets for the selected month ("ALL" = all six).
+function skuPlScopedTotals(byMonth, month) {
+  const zero = { sales: 0, profit: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0, units: 0 };
+  if (!byMonth) return zero;
+  const keys = month && month !== "ALL" ? [month] : Object.keys(byMonth);
+  return keys.reduce((acc, key) => {
+    const b = byMonth[key];
+    if (!b) return acc;
+    acc.sales += Number(b.sales || 0);
+    acc.profit += Number(b.profit || 0);
+    acc.cost += Number(b.cost || 0);
+    acc.adSpend += Number(b.adSpend || 0);
+    acc.fees += Number(b.fees || 0);
+    acc.cogs += Number(b.cogs || 0);
+    acc.units += Number(b.units || 0);
+    return acc;
+  }, { ...zero });
+}
+
+// Turn one raw SKU row + the selected month into displayable, recomputed metrics.
+// Every ratio is derived here from the summed amounts — ratios are never summed.
+function computeSkuPlRow(row, month) {
+  const t = skuPlScopedTotals(row.byMonth, month);
+  // Margin and the ad ratio are recomputed from sums; null when sales is 0 so an
+  // undefined ratio is shown as "—" rather than a misleading number.
+  const margin = t.sales > 0 ? (t.profit / t.sales) * 100 : null;
+  const adSalesRatio = t.sales > 0 ? (t.adSpend / t.sales) * 100 : null;
+  const cogsMissing = t.sales > 0 && t.cogs <= 0;
+  return {
+    sku: row.sku, asin: row.asin, productName: row.productName, brand: row.brand, currency: row.currency,
+    ...t, margin, adSalesRatio, cogsMissing,
+    hasActivity: t.sales !== 0 || t.profit !== 0 || t.units !== 0 || t.adSpend !== 0,
+  };
+}
+
+// Primary status/flag for a computed row, given the scope's blended margin.
+// Priority: real loss, then a data-quality COGS warning, then ad-heavy, then
+// thin margin, else OK. Each returns one concrete next action.
+function skuPlStatus(row, blendedMarginPct) {
+  if (row.profit < 0) return { key: "loss", label: "Loss", tone: "bad", action: "Raise price or reduce ad bids; review or discontinue." };
+  if (row.cogsMissing) return { key: "cogs", label: "Check COGS", tone: "warn", action: "Verify/fix COGS — profit and margin are overstated until COGS is uploaded." };
+  if (row.adSpend > row.profit && row.adSpend > 0) return { key: "ad", label: "Ad-heavy", tone: "warn", action: "Reduce ad bids — ad spend is eating the whole profit." };
+  if (row.margin !== null && blendedMarginPct !== null && row.margin < 0.5 * blendedMarginPct) return { key: "thin", label: "Thin margin", tone: "warn", action: "Raise price or cut cost — margin is under half the account average." };
+  return { key: "ok", label: "OK", tone: "ok", action: null };
+}
+
+function skuPlStatusOptionLabel(key) {
+  return { ALL: "All statuses", loss: "Loss", cogs: "Check COGS", ad: "Ad-heavy", thin: "Thin margin", ok: "OK" }[key] || key;
+}
+
+function downloadSkuPlCsv(rows, currency, monthLabel, accountName) {
+  const exportRows = rows.map((r) => ({
+    "Product Name": r.productName || "",
+    ASIN: r.asin || "",
+    SKU: r.sku || "",
+    Brand: r.brand || "",
+    Currency: r.currency || "",
+    Sales: Number(r.sales || 0).toFixed(2),
+    Profit: Number(r.profit || 0).toFixed(2),
+    "Margin %": r.margin === null ? "" : r.margin.toFixed(1),
+    Units: Math.round(r.units || 0),
+    "Total Cost": Number(r.cost || 0).toFixed(2),
+    "Amazon Fees": Number(r.fees || 0).toFixed(2),
+    "Ad Spend": Number(r.adSpend || 0).toFixed(2),
+    COGS: Number(r.cogs || 0).toFixed(2),
+    "Ad/Sales %": r.adSalesRatio === null ? "" : r.adSalesRatio.toFixed(1),
+    Status: r.status?.label || "",
+    "Suggested Action": r.status?.action || "",
+  }));
+  if (!exportRows.length) return;
+  const headers = Object.keys(exportRows[0]);
+  const csv = "﻿" + [headers, ...exportRows.map((row) => headers.map((h) => row[h]))]
+    .map((line) => line.map(csvCell).join(","))
+    .join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  const account = String(accountName || "account").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  link.href = url;
+  link.download = `sku-pl-${account || "account"}-${(monthLabel || "6-months").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${currency || "cur"}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadContentChangesCsv(events, accountName) {
+  const exportRows = events.map((event) => ({
+    "Event Time": event.eventTime || "",
+    "Notification Type": event.notificationType || "",
+    ASINs: (event.asins || []).join(" | "),
+    Brands: (event.brands || []).join(" | "),
+    "Notification ID": event.notificationId || "",
+    Metadata: event.metadataPreview || "",
+    "Payload Preview": event.payloadPreview || "",
+  }));
+  if (!exportRows.length) return;
+  const headers = Object.keys(exportRows[0]);
+  const csv = "\uFEFF" + [headers, ...exportRows.map((row) => headers.map((header) => row[header]))]
+    .map((line) => line.map(csvCell).join(","))
+    .join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  const account = String(accountName || "account").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  link.href = url;
+  link.download = `content-change-alerts-${account || "account"}-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 /* ============================== NUMBER / MONEY HELPERS ============================== */
 function pct(curr, prev) {
   if (prev === 0) return curr === 0 ? 0 : null;
@@ -468,8 +576,8 @@ function readApiCache(params) {
   }
 }
 
-// Brand names are catalog metadata and remain valid across sales-report cache
-// versions. Reuse them only from cached responses for the selected account so
+// Brand names are catalog metadata and remain valid across report-cache
+// versions. Reuse cached catalog-bearing responses for the selected account so
 // the header selector is usable before that account's next manual refresh.
 function readCachedCatalogBrands(accountId) {
   if (!accountId) return [];
@@ -479,7 +587,7 @@ function readCachedCatalogBrands(accountId) {
       const key = window.localStorage.key(i);
       if (!key || !key.startsWith(API_CACHE_PREFIX)) continue;
       const params = new URLSearchParams(key.slice(API_CACHE_PREFIX.length));
-      if (params.get("action") !== "brand-sales" || params.get("ids") !== accountId) continue;
+      if (params.get("ids") !== accountId) continue;
       const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
       (cached.body?.catalogBrands || []).forEach((brand) => brands.add(brand));
     }
@@ -619,6 +727,28 @@ export default function App() {
   const [reconciliationSort, setReconciliationSort] = useState({ key: "orderDate", dir: "desc" });
   const [reconciliationPage, setReconciliationPage] = useState(1);
   const [copiedOrderId, setCopiedOrderId] = useState(null);
+
+  // SKU P&L Analyzer: six-full-month, cache-first report on the shared header
+  // scope. Month/currency/search/sort/filter/pagination all run locally.
+  const [skuPlData, setSkuPlData] = useState(null);
+  const [skuPlLoading, setSkuPlLoading] = useState(false);
+  const [skuPlError, setSkuPlError] = useState(null);
+  const [skuPlCachedAt, setSkuPlCachedAt] = useState(null);
+  const [skuPlMonth, setSkuPlMonth] = useState("");
+  const [skuPlCurrency, setSkuPlCurrency] = useState("");
+  const [skuPlSearch, setSkuPlSearch] = useState("");
+  const [skuPlStatusFilter, setSkuPlStatusFilter] = useState("ALL");
+  const [skuPlSort, setSkuPlSort] = useState({ key: "profit", dir: "desc" });
+  const [skuPlPage, setSkuPlPage] = useState(1);
+
+  // Content Change Alerts: cache-first, selected-account-only monitoring of
+  // Amazon A+ / branded-item content change notifications.
+  const [contentChangesData, setContentChangesData] = useState(null);
+  const [contentChangesLoading, setContentChangesLoading] = useState(false);
+  const [contentChangesError, setContentChangesError] = useState(null);
+  const [contentChangesCachedAt, setContentChangesCachedAt] = useState(null);
+  const [contentChangesSearch, setContentChangesSearch] = useState("");
+  const [contentChangesType, setContentChangesType] = useState("ALL");
 
   const TODAY = todayStr();
 
@@ -841,6 +971,98 @@ export default function App() {
     if (view === "reconciliation") loadCachedReconciliation();
   }, [view, loadCachedReconciliation]);
 
+  // SKU P&L Analyzer: six full calendar months, cache-first, shared header scope.
+  const skuPlWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
+  const skuPlParams = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return {
+      action: "sku-pl", reportVersion: "sku-pl-v1", ids: selectedAccountId,
+      from: skuPlWindow.from, to: skuPlWindow.to,
+    };
+  }, [selectedAccountId, skuPlWindow]);
+
+  const applySkuPlData = useCallback((body, cachedAt, accountCurrency) => {
+    setSkuPlData(body);
+    setSkuPlCachedAt(new Date(cachedAt));
+    // Default to the latest completed month; keep the prior choice if still valid.
+    setSkuPlMonth((prev) => (body.months?.includes(prev) || prev === "ALL") ? prev : body.months?.[body.months.length - 1] || "ALL");
+    // Default currency: the account's own currency if present, else the first.
+    const currencies = body.currencies || [];
+    setSkuPlCurrency((prev) => currencies.includes(prev) ? prev : (currencies.includes(accountCurrency) ? accountCurrency : currencies[0] || ""));
+    setSkuPlPage(1);
+    setSkuPlError(null);
+  }, []);
+
+  const loadCachedSkuPl = useCallback(async () => {
+    if (!skuPlParams) { setSkuPlData(null); return; }
+    const cached = await readLargeApiCache(skuPlParams);
+    if (cached) applySkuPlData(cached.body, cached.cachedAt, accountById[selectedAccountId]?.currency);
+    else {
+      setSkuPlData(null);
+      setSkuPlCachedAt(null);
+      setSkuPlError("No cached SKU P&L for this account. Click refresh to fetch six completed months from DataDoe.");
+    }
+  }, [applySkuPlData, skuPlParams, accountById, selectedAccountId]);
+
+  const fetchSkuPl = useCallback(() => {
+    if (!skuPlParams || skuPlLoading) return;
+    setSkuPlLoading(true);
+    setSkuPlError(null);
+    cachedLargeApiGet(skuPlParams, { force: true })
+      .then(({ body, cachedAt }) => applySkuPlData(body, cachedAt, accountById[selectedAccountId]?.currency))
+      .catch((err) => setSkuPlError(err.message))
+      .finally(() => setSkuPlLoading(false));
+  }, [applySkuPlData, skuPlLoading, skuPlParams, accountById, selectedAccountId]);
+
+  useEffect(() => {
+    if (view === "skupl") loadCachedSkuPl();
+  }, [view, loadCachedSkuPl]);
+
+  // Reset paging when any SKU P&L filter/scope changes (all local, no refetch).
+  useEffect(() => { setSkuPlPage(1); }, [skuPlMonth, skuPlCurrency, skuPlSearch, skuPlStatusFilter, selectedBrand]);
+
+  const contentChangesParams = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return {
+      action: "content-changes", reportVersion: "content-changes-v1", ids: selectedAccountId, asOf: TODAY,
+    };
+  }, [selectedAccountId, TODAY]);
+
+  const applyContentChangesData = useCallback((body, cachedAt) => {
+    setContentChangesData(body);
+    setContentChangesCachedAt(new Date(cachedAt));
+    if (body.accountId && Array.isArray(body.catalogBrands)) {
+      setCatalogBrands(body.catalogBrands);
+      setCatalogBrandsAccountId(body.accountId);
+    }
+    setContentChangesError(null);
+  }, []);
+
+  const loadCachedContentChanges = useCallback(async () => {
+    if (!contentChangesParams) { setContentChangesData(null); return; }
+    const cached = await readLargeApiCache(contentChangesParams);
+    if (cached) applyContentChangesData(cached.body, cached.cachedAt);
+    else {
+      setContentChangesData(null);
+      setContentChangesCachedAt(null);
+      setContentChangesError("No cached Content Change Alerts for this account. Click refresh to fetch notifications from DataDoe.");
+    }
+  }, [applyContentChangesData, contentChangesParams]);
+
+  const fetchContentChanges = useCallback(() => {
+    if (!contentChangesParams || contentChangesLoading) return;
+    setContentChangesLoading(true);
+    setContentChangesError(null);
+    cachedLargeApiGet(contentChangesParams, { force: true })
+      .then(({ body, cachedAt }) => applyContentChangesData(body, cachedAt))
+      .catch((err) => setContentChangesError(err.message))
+      .finally(() => setContentChangesLoading(false));
+  }, [applyContentChangesData, contentChangesLoading, contentChangesParams]);
+
+  useEffect(() => {
+    if (view === "contentchanges") loadCachedContentChanges();
+  }, [view, loadCachedContentChanges]);
+
   const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
@@ -1031,6 +1253,127 @@ export default function App() {
   }, []);
 
   const displayCurrency = accountById[selectedAccountId]?.currency || "INR";
+
+  /* ===== SKU P&L Analyzer derived data (all local, no refetch) ===== */
+  // The effective currency is always a single currency; currencies are never mixed.
+  const skuPlCurrencies = skuPlData?.currencies || [];
+  const effectiveSkuCurrency = skuPlCurrencies.includes(skuPlCurrency)
+    ? skuPlCurrency
+    : (skuPlCurrencies.includes(displayCurrency) ? displayCurrency : skuPlCurrencies[0] || displayCurrency);
+
+  // Rows scoped to one currency + the header brand, computed for the selected
+  // month, keeping only rows with activity in scope.
+  const skuPlComputed = useMemo(() => {
+    if (!skuPlData?.rows) return [];
+    return skuPlData.rows
+      .filter((r) => r.currency === effectiveSkuCurrency)
+      .filter((r) => selectedBrand === "ALL" || (r.brand || "Unassigned") === selectedBrand)
+      .map((r) => computeSkuPlRow(r, skuPlMonth))
+      .filter((r) => r.hasActivity);
+  }, [skuPlData, effectiveSkuCurrency, selectedBrand, skuPlMonth]);
+
+  // Blended margin over the whole in-scope set drives the thin-margin leak test.
+  const skuPlBlendedMargin = useMemo(() => {
+    const sales = skuPlComputed.reduce((s, r) => s + r.sales, 0);
+    const profit = skuPlComputed.reduce((s, r) => s + r.profit, 0);
+    return sales > 0 ? (profit / sales) * 100 : null;
+  }, [skuPlComputed]);
+
+  const skuPlKpis = useMemo(() => {
+    const t = skuPlComputed.reduce((acc, r) => {
+      acc.sales += r.sales; acc.profit += r.profit; acc.units += r.units;
+      acc.cost += r.cost; acc.adSpend += r.adSpend; acc.fees += r.fees; acc.cogs += r.cogs;
+      return acc;
+    }, { sales: 0, profit: 0, units: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0 });
+    t.margin = t.sales > 0 ? (t.profit / t.sales) * 100 : null;
+    return t;
+  }, [skuPlComputed]);
+
+  // Attach a single status/flag to each row from the blended-margin scope.
+  const skuPlRows = useMemo(
+    () => skuPlComputed.map((r) => ({ ...r, status: skuPlStatus(r, skuPlBlendedMargin) })),
+    [skuPlComputed, skuPlBlendedMargin]
+  );
+
+  const skuPlTopProfit = useMemo(
+    () => [...skuPlRows].sort((a, b) => b.profit - a.profit).slice(0, 8),
+    [skuPlRows]
+  );
+  const skuPlLeaks = useMemo(
+    () => skuPlRows.filter((r) => r.status.key !== "ok")
+      .sort((a, b) => a.profit - b.profit)
+      .slice(0, 12),
+    [skuPlRows]
+  );
+  const skuPlStatusCounts = useMemo(() => {
+    const counts = { loss: 0, cogs: 0, ad: 0, thin: 0, ok: 0 };
+    skuPlRows.forEach((r) => { counts[r.status.key] = (counts[r.status.key] || 0) + 1; });
+    return counts;
+  }, [skuPlRows]);
+
+  const skuPlFiltered = useMemo(() => {
+    const q = skuPlSearch.trim().toLowerCase();
+    return skuPlRows.filter((r) => {
+      if (skuPlStatusFilter !== "ALL" && r.status.key !== skuPlStatusFilter) return false;
+      if (!q) return true;
+      return `${r.asin || ""} ${r.sku || ""} ${r.productName || ""} ${r.brand || ""}`.toLowerCase().includes(q);
+    });
+  }, [skuPlRows, skuPlSearch, skuPlStatusFilter]);
+
+  const skuPlSorted = useMemo(() => {
+    const acc = {
+      productName: (r) => (r.productName || "").toLowerCase(),
+      sku: (r) => (r.sku || "").toLowerCase(),
+      sales: (r) => r.sales, profit: (r) => r.profit, margin: (r) => (r.margin === null ? -Infinity : r.margin),
+      units: (r) => r.units, cost: (r) => r.cost, fees: (r) => r.fees, adSpend: (r) => r.adSpend,
+      cogs: (r) => r.cogs, adSalesRatio: (r) => (r.adSalesRatio === null ? Infinity : r.adSalesRatio),
+      status: (r) => r.status.label,
+    }[skuPlSort.key] || ((r) => r.profit);
+    return [...skuPlFiltered].sort((a, b) => {
+      const av = acc(a), bv = acc(b);
+      const cmp = typeof av === "string" || typeof bv === "string" ? String(av).localeCompare(String(bv)) : av - bv;
+      return skuPlSort.dir === "asc" ? cmp : -cmp;
+    });
+  }, [skuPlFiltered, skuPlSort]);
+
+  const skuPlPageCount = Math.max(1, Math.ceil(skuPlSorted.length / 50));
+  const skuPlSafePage = Math.min(skuPlPage, skuPlPageCount);
+  const skuPlPageRows = skuPlSorted.slice((skuPlSafePage - 1) * 50, skuPlSafePage * 50);
+  const skuPlPages = useMemo(() => {
+    const pages = new Set([1, skuPlPageCount, skuPlSafePage - 1, skuPlSafePage, skuPlSafePage + 1]);
+    return [...pages].filter((p) => p >= 1 && p <= skuPlPageCount).sort((a, b) => a - b);
+  }, [skuPlSafePage, skuPlPageCount]);
+  const skuPlMonthLabel = skuPlMonth === "ALL" ? "All 6 Months" : reconMonthLabel(skuPlMonth);
+  const setSkuPlSortKey = useCallback((key) => {
+    setSkuPlSort((prev) => prev.key === key
+      ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+      : { key, dir: ["productName", "sku", "status"].includes(key) ? "asc" : "desc" });
+  }, []);
+
+  const contentChangeEvents = useMemo(() => {
+    const search = contentChangesSearch.trim().toLowerCase();
+    return (contentChangesData?.events || []).filter((event) => {
+      if (selectedBrand !== "ALL" && !(event.brands || []).includes(selectedBrand)) return false;
+      if (contentChangesType !== "ALL" && event.notificationType !== contentChangesType) return false;
+      if (!search) return true;
+      return [event.eventTime, event.notificationType, event.notificationId, ...(event.asins || []), ...(event.brands || []), event.metadataPreview, event.payloadPreview]
+        .join(" ").toLowerCase().includes(search);
+    });
+  }, [contentChangesData, contentChangesSearch, contentChangesType, selectedBrand]);
+
+  const contentChangeTypes = useMemo(
+    () => [...new Set((contentChangesData?.events || []).map((event) => event.notificationType).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [contentChangesData]
+  );
+  const contentChangeStats = useMemo(() => {
+    const events = contentChangesData?.events || [];
+    return {
+      total: events.length,
+      asinLinked: events.filter((event) => event.asins?.length).length,
+      brandLinked: events.filter((event) => event.brands?.length).length,
+      latest: events[0]?.eventTime || null,
+    };
+  }, [contentChangesData]);
 
   function rowCurrency(r) {
     return r.currency || accountById[r.seller_or_vendor_id]?.currency || "INR";
@@ -1235,6 +1578,14 @@ export default function App() {
               <Boxes size={18} />
               <span className="sb-nav-label">FBA Shipment Plan</span>
             </button>
+            <button className={"sb-nav-item" + (view === "skupl" ? " active" : "")} title="SKU P&L Analyzer" onClick={() => { setView("skupl"); setMobileOpen(false); }}>
+              <Wallet size={18} />
+              <span className="sb-nav-label">SKU P&amp;L Analyzer</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "contentchanges" ? " active" : "")} title="Content Change Alerts" onClick={() => { setView("contentchanges"); setMobileOpen(false); }}>
+              <BellRing size={18} />
+              <span className="sb-nav-label">Content Alerts</span>
+            </button>
           </nav>
 
           <div className="sb-footer">
@@ -1291,11 +1642,11 @@ export default function App() {
         <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
-            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : lastFetchedAt;
+            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
             return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
           })()}
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : fetchRows} disabled={view === "reconciliation" && reconciliationLoading} title="Refresh selected account">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : rowsLoading) ? "spin" : ""} />
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "contentchanges" ? fetchContentChanges : fetchRows} disabled={(view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "contentchanges" && contentChangesLoading)} title="Refresh selected account">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
       </div>
@@ -1736,10 +2087,229 @@ export default function App() {
         </div>
       </div>
       )}
+
+      {view === "skupl" && (
+      <div className="container skupl-page">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">SKU P&amp;L Analyzer</div>
+            <div className="page-sub">Net profit by SKU for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} · {skuPlMonthLabel}{effectiveSkuCurrency ? ` · ${effectiveSkuCurrency}` : ""}</div>
+          </div>
+          {skuPlData && (
+            <div className="recon-month-picker">
+              <label htmlFor="skupl-month">Report month</label>
+              <select id="skupl-month" value={skuPlMonth || "ALL"} onChange={(e) => setSkuPlMonth(e.target.value)}>
+                <option value="ALL">All 6 Months</option>
+                {(skuPlData.months || []).map((month) => <option key={month} value={month}>{reconMonthLabel(month)}</option>)}
+              </select>
+              {skuPlCurrencies.length > 1 && (
+                <>
+                  <label htmlFor="skupl-currency">Currency</label>
+                  <select id="skupl-currency" value={effectiveSkuCurrency} onChange={(e) => setSkuPlCurrency(e.target.value)}>
+                    {skuPlCurrencies.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {skuPlError && <div className="error-banner"><AlertTriangle size={15} /> {skuPlError}</div>}
+
+        {!skuPlData && !skuPlError && (
+          <div className="panel recon-empty"><Wallet size={22} /><div>{skuPlLoading ? "Loading SKU P&L from DataDoe…" : "SKU P&L data is loading from cache…"}</div></div>
+        )}
+
+        {skuPlData && <>
+          <div className="recon-freshness">
+            <span className="live-dot" style={{ position: "relative", top: 1 }} />
+            <span>Profit by SKU &amp; Date from <strong>{fmtDateHuman(skuPlData.from)}</strong> to <strong>{fmtDateHuman(skuPlData.to)}</strong></span>
+            <span className="plan-fresh-sep">·</span>
+            <span>cached {skuPlCachedAt?.toLocaleString()}</span>
+            {skuPlCurrencies.length > 1 && <><span className="plan-fresh-sep">·</span><span>{skuPlCurrencies.length} currencies — showing {effectiveSkuCurrency}</span></>}
+          </div>
+
+          {skuPlComputed.length === 0 ? (
+            <div className="panel"><div className="empty-note">{selectedBrand === "ALL" ? "No SKU profit rows for this account in the selected month and currency." : "No SKUs match the selected brand in this month and currency."}</div></div>
+          ) : <>
+            <div className="skupl-kpis">
+              <SkuKpi label="Total Sales" value={fmtMoney(skuPlKpis.sales, effectiveSkuCurrency)} />
+              <SkuKpi label="Net Profit" value={fmtMoney(skuPlKpis.profit, effectiveSkuCurrency)} tone={skuPlKpis.profit < 0 ? "bad" : "good"} />
+              <SkuKpi label="Blended Margin" value={skuPlKpis.margin === null ? "—" : `${skuPlKpis.margin.toFixed(1)}%`} />
+              <SkuKpi label="Units" value={nInt(skuPlKpis.units)} />
+              <SkuKpi label="Total Cost" value={fmtMoney(skuPlKpis.cost, effectiveSkuCurrency)} />
+              <SkuKpi label="Ad Spend" value={fmtMoney(skuPlKpis.adSpend, effectiveSkuCurrency)} />
+              <SkuKpi label="Amazon Fees" value={fmtMoney(skuPlKpis.fees, effectiveSkuCurrency)} />
+            </div>
+
+            <div className="skupl-insights">
+              <div className="panel">
+                <div className="panel-head"><div><div className="panel-title">Top Profit SKUs</div><div className="page-sub">Ranked by net profit, not sales</div></div></div>
+                <div className="skupl-rank">
+                  {skuPlTopProfit.map((r, i) => (
+                    <div className="skupl-rank-row" key={(r.sku || r.asin || "") + i}>
+                      <span className="skupl-rank-num">{i + 1}</span>
+                      <span className="skupl-rank-name" title={r.productName || r.sku}>
+                        {r.productName || r.sku || r.asin}
+                        <span className="skupl-rank-sub mono">{r.sku || r.asin}</span>
+                      </span>
+                      <span className="skupl-rank-val mono">
+                        {fmtMoney(r.profit, effectiveSkuCurrency)}
+                        <span className="skupl-rank-margin">{r.margin === null ? "" : `${r.margin.toFixed(0)}%`}</span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="panel">
+                <div className="panel-head"><div><div className="panel-title">Profit Leaks</div><div className="page-sub">Fix first · {skuPlStatusCounts.loss + skuPlStatusCounts.cogs + skuPlStatusCounts.ad + skuPlStatusCounts.thin} flagged</div></div></div>
+                <div className="skupl-leaks">
+                  {skuPlLeaks.length === 0 ? <div className="empty-note">No profit leaks flagged in this scope.</div> :
+                    skuPlLeaks.map((r, i) => (
+                      <div className="skupl-leak-row" key={(r.sku || r.asin || "") + i}>
+                        <div className="skupl-leak-head">
+                          <span className={"pt-badge sku-badge-" + r.status.tone}>{r.status.label}</span>
+                          <span className="skupl-leak-name" title={r.productName || r.sku}>{r.productName || r.sku || r.asin}</span>
+                          <span className={"mono skupl-leak-profit" + (r.profit < 0 ? " sku-neg" : "")}>{fmtMoney(r.profit, effectiveSkuCurrency)}</span>
+                        </div>
+                        <div className="skupl-leak-action">{r.status.action}</div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="panel skupl-table-panel" style={{ padding: 0, overflow: "hidden" }}>
+              <div className="skupl-toolbar">
+                <label className="plan-field skupl-search">
+                  <span className="plan-field-label">Search</span>
+                  <span className="plan-search-wrap"><Search size={14} /><input value={skuPlSearch} onChange={(e) => setSkuPlSearch(e.target.value)} placeholder="SKU, ASIN, product, or brand" /></span>
+                </label>
+                <label className="plan-field">
+                  <span className="plan-field-label">Status</span>
+                  <select value={skuPlStatusFilter} onChange={(e) => setSkuPlStatusFilter(e.target.value)}>
+                    {["ALL", "loss", "cogs", "ad", "thin", "ok"].map((k) => <option key={k} value={k}>{skuPlStatusOptionLabel(k)}{k !== "ALL" ? ` (${skuPlStatusCounts[k] || 0})` : ""}</option>)}
+                  </select>
+                </label>
+                <div className="skupl-toolbar-spacer" />
+                <button className="plan-export-btn" onClick={() => downloadSkuPlCsv(skuPlSorted, effectiveSkuCurrency, skuPlMonthLabel, refreshScopeAccount?.name)} disabled={!skuPlSorted.length}><Download size={15} />Download CSV</button>
+              </div>
+              <div className="plan-scroll">
+                <table className="plan-table skupl-table">
+                  <thead>
+                    <tr>
+                      <PlanTh className="pt-id" label="Product / SKU" col="productName" sort={skuPlSort} onSort={setSkuPlSortKey} align="left" />
+                      <PlanTh label="Sales" col="sales" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Profit" col="profit" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Margin %" col="margin" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Units" col="units" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Total Cost" col="cost" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Amazon Fees" col="fees" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Ad Spend" col="adSpend" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="COGS" col="cogs" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Ad/Sales %" col="adSalesRatio" sort={skuPlSort} onSort={setSkuPlSortKey} />
+                      <PlanTh label="Status" col="status" sort={skuPlSort} onSort={setSkuPlSortKey} align="left" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {skuPlPageRows.map((r, i) => (
+                      <tr key={(r.sku || r.asin || "") + i} className={r.status.key === "loss" ? "skupl-row-loss" : ""}>
+                        <td className="pt-id">
+                          <div className="pt-name" title={r.productName || r.sku}>{r.productName || "(no product name)"}</div>
+                          <div className="pt-meta mono">{r.sku || "—"}{r.asin ? ` · ${r.asin}` : ""}</div>
+                          {r.brand && <div className="pt-brand">{r.brand}</div>}
+                        </td>
+                        <td className="mono">{fmtMoney(r.sales, effectiveSkuCurrency)}</td>
+                        <td className={"mono pt-strong" + (r.profit < 0 ? " sku-neg" : "")}>{fmtMoney(r.profit, effectiveSkuCurrency)}</td>
+                        <td className="mono">{r.margin === null ? "—" : `${r.margin.toFixed(1)}%`}</td>
+                        <td className="mono">{nInt(r.units)}</td>
+                        <td className="mono">{fmtMoney(r.cost, effectiveSkuCurrency)}</td>
+                        <td className="mono">{fmtMoney(r.fees, effectiveSkuCurrency)}</td>
+                        <td className="mono">{fmtMoney(r.adSpend, effectiveSkuCurrency)}</td>
+                        <td className={"mono" + (r.cogsMissing ? " sku-warn" : "")}>{r.cogsMissing ? "missing" : fmtMoney(r.cogs, effectiveSkuCurrency)}</td>
+                        <td className="mono">{r.adSalesRatio === null ? "—" : `${r.adSalesRatio.toFixed(1)}%`}</td>
+                        <td><span className={"pt-badge sku-badge-" + r.status.tone} title={r.status.action || ""}>{r.status.label}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {!skuPlPageRows.length && <div className="empty-note" style={{ padding: "14px 16px" }}>No SKUs match these filters.</div>}
+              <div className="recon-pagination">
+                <button disabled={skuPlSafePage === 1} onClick={() => setSkuPlPage((page) => Math.max(1, page - 1))}>Prev</button>
+                {skuPlPages.map((page, index) => <React.Fragment key={page}>{index > 0 && page - skuPlPages[index - 1] > 1 && <span>…</span>}<button className={page === skuPlSafePage ? "active" : ""} onClick={() => setSkuPlPage(page)}>{page}</button></React.Fragment>)}
+                <button disabled={skuPlSafePage === skuPlPageCount} onClick={() => setSkuPlPage((page) => Math.min(skuPlPageCount, page + 1))}>Next</button>
+              </div>
+            </div>
+          </>}
+
+          <div className="footer-note">
+            Profit comes straight from DataDoe <code>Profit by SKU &amp; Date</code> (the <code>profit</code> column), which already blends settlements, COGS, and ad spend — it is not rebuilt from raw orders. Sales, Profit, Total Cost, Ad Spend, Amazon Fees, COGS, and Units are summed per SKU; every ratio (Margin %, Ad/Sales %, Blended Margin) is recomputed from those sums, never averaged. <strong>Ad/Sales %</strong> = ad spend ÷ total sales (this report does not aggregate ad sales, so it is not classic ACoS). Currencies are never combined; when an account reports more than one, use the currency selector. This report always uses six <strong>full</strong> calendar months because Amazon fees settle in batches by settlement date, so a partial month can badly misstate profit. A “Check COGS” flag means COGS is zero/missing, so that SKU’s margin is overstated — verify COGS before trusting it. Month, currency, brand, search, sort, filter, and CSV export all run locally; only Refresh calls DataDoe.
+          </div>
+        </>}
+      </div>
+      )}
+
+      {view === "contentchanges" && (
+      <div className="container content-changes-page">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">Content Change Alerts</div>
+            <div className="page-sub">Amazon A+ and branded-item content changes for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` / ${selectedBrand}`}</div>
+          </div>
+          {contentChangesData && <button className="plan-export-btn" onClick={() => downloadContentChangesCsv(contentChangeEvents, refreshScopeAccount?.name)} disabled={!contentChangeEvents.length}><Download size={15} />Download CSV</button>}
+        </div>
+
+        {contentChangesError && <div className="error-banner"><AlertTriangle size={15} /> {contentChangesError}</div>}
+
+        {!contentChangesData && !contentChangesError && (
+          <div className="panel recon-empty"><BellRing size={22} /><div>{contentChangesLoading ? "Loading content alerts from DataDoe..." : "Content alerts are loading from cache..."}</div></div>
+        )}
+
+        {contentChangesData && <>
+          <div className="recon-freshness">
+            <span className="live-dot" style={{ position: "relative", top: 1 }} />
+            <span>Latest events delivered by DataDoe</span>
+            <span className="plan-fresh-sep">/</span>
+            <span>cached {contentChangesCachedAt?.toLocaleString()}</span>
+            <span className="plan-fresh-sep">/</span>
+            <span>Amazon may publish these notifications within about 2 hours of the content change</span>
+          </div>
+
+          <div className="recon-kpis">
+            <ReconKpi label="Events" value={contentChangeStats.total.toLocaleString("en-US")} note="Cached account total" />
+            <ReconKpi label="ASIN-linked" value={contentChangeStats.asinLinked.toLocaleString("en-US")} note="ASIN extracted from payload" />
+            <ReconKpi label="Brand-attributed" value={contentChangeStats.brandLinked.toLocaleString("en-US")} note="Matched to product catalog" />
+            <ReconKpi label="Latest event" value={contentChangeStats.latest ? new Date(contentChangeStats.latest).toLocaleDateString() : "-"} note={contentChangeStats.latest ? new Date(contentChangeStats.latest).toLocaleTimeString() : "No events returned"} />
+          </div>
+
+          {selectedBrand !== "ALL" && contentChangesData.unassignedEvents > 0 && (
+            <div className="recon-notice"><Info size={15} /> Events without an ASIN-to-brand catalog match are excluded while a specific brand is selected. Select All Brands to review those unassigned events.</div>
+          )}
+
+          <div className="panel content-alerts-panel">
+            <div className="panel-head"><div><div className="panel-title">Notification Feed</div><div className="page-sub">{contentChangeEvents.length.toLocaleString("en-US")} matching events. Search and filters work locally.</div></div></div>
+            <div className="recon-filters">
+              <label className="plan-field recon-search"><span className="plan-field-label">Search</span><span className="plan-search-wrap"><Search size={14} /><input value={contentChangesSearch} onChange={(e) => setContentChangesSearch(e.target.value)} placeholder="ASIN, brand, notification ID, or payload..." /></span></label>
+              <label className="plan-field recon-select"><span className="plan-field-label">Event type</span><select value={contentChangesType} onChange={(e) => setContentChangesType(e.target.value)}><option value="ALL">All types</option>{contentChangeTypes.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
+            </div>
+            <div className="recon-table-scroll"><table className="recon-table content-alerts-table"><thead><tr><th>Event time</th><th>Type</th><th>ASINs</th><th>Brands</th><th>Notification ID</th><th>Details</th></tr></thead><tbody>{contentChangeEvents.map((event, index) => <tr key={event.notificationId || `${event.eventTime}-${index}`}><td>{event.eventTime ? new Date(event.eventTime).toLocaleString() : "-"}</td><td>{event.notificationType || "-"}</td><td className="mono">{event.asins?.length ? event.asins.join(", ") : "-"}</td><td>{event.brands?.length ? event.brands.join(", ") : "Unassigned"}</td><td className="mono">{event.notificationId || "-"}</td><td><span className="content-preview" title={event.payloadPreview || event.metadataPreview || ""}>{event.metadataPreview || event.payloadPreview || "-"}</span></td></tr>)}</tbody></table></div>
+            {!contentChangeEvents.length && <div className="empty-note">{selectedBrand === "ALL" ? "No content change events were returned for this account." : "No content change events match the selected brand."}</div>}
+          </div>
+
+          <div className="footer-note">Data powered by DataDoe <code>Branded Item Content Change Notifications</code>. This is a monitoring feed for Amazon A+ / branded-item content changes, not a sales or catalog history report. Amazon's payload schema can vary; the dashboard extracts ASINs from the payload and joins them to the Product Catalog before applying the shared brand filter. Events without an identifiable or catalog-mapped ASIN remain visible only under Select All Brands. Opening this report reads the browser cache; only Refresh calls DataDoe.</div>
+        </>}
+      </div>
+      )}
         </div>
       </div>
     </div>
   );
+}
+
+// KPI card for the SKU P&L Analyzer.
+function SkuKpi({ label, value, tone }) {
+  return <div className="skupl-kpi"><div className="skupl-kpi-label">{label}</div><div className={"skupl-kpi-value mono" + (tone === "bad" ? " sku-neg" : tone === "good" ? " sku-pos" : "")}>{value}</div></div>;
 }
 
 // Sortable header cell for the plan table.
@@ -2002,6 +2572,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .recon-table th:hover{ color:var(--ink); }
 .recon-table tbody tr:hover td{ background:#FAFBFD; }
 .recon-row-pending td:first-child{ box-shadow:inset 3px 0 #E69B28; }.recon-row-cancelled td:first-child{ box-shadow:inset 3px 0 #DF5960; }.recon-row-refunded td:first-child,.recon-row-settled-refunded td:first-child{ box-shadow:inset 3px 0 #3F84C5; }.recon-row-settled td:first-child{ box-shadow:inset 3px 0 #149B67; }
+.content-alerts-table{ min-width:1180px; }.content-alerts-table th:first-child,.content-alerts-table td:first-child{ text-align:left; }.content-preview{ display:block; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-soft); }
 .recon-order-id button{ display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:transparent; color:#244E8A; cursor:pointer; font:600 11px 'JetBrains Mono',monospace; }
 .recon-order-id button:hover{ text-decoration:underline; }
 .recon-badge,.recon-cross-badge{ display:inline-block; border-radius:999px; padding:3px 7px; font-size:10.5px; font-weight:700; }
@@ -2011,10 +2582,43 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .recon-filters input[type=date]{ border:1px solid var(--border); border-radius:8px; padding:8px 9px; font:600 12px inherit; color:var(--ink); background:var(--surface); }
 .recon-pagination{ display:flex; justify-content:flex-end; align-items:center; gap:5px; flex-wrap:wrap; padding-top:12px; }
 .recon-pagination button{ min-width:31px; border:1px solid var(--border); border-radius:6px; padding:5px 8px; color:var(--ink-soft); background:var(--surface); font:600 12px inherit; cursor:pointer; }.recon-pagination button.active{ border-color:var(--accent-deep); background:#FEF3E2; color:var(--accent-deep); }.recon-pagination button:disabled{ opacity:.45; cursor:not-allowed; }
+
+/* ---- SKU P&L Analyzer ---- */
+.skupl-kpis{ display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin-top:14px; }
+.skupl-kpi{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px 13px; }
+.skupl-kpi-label{ font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
+.skupl-kpi-value{ font-size:17px; font-weight:700; margin-top:5px; white-space:nowrap; }
+.sku-neg{ color:var(--neg); } .sku-pos{ color:var(--pos); } .sku-warn{ color:var(--accent-deep); }
+.skupl-insights{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
+.skupl-rank{ display:flex; flex-direction:column; margin-top:6px; }
+.skupl-rank-row{ display:grid; grid-template-columns:24px 1fr auto; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--grid-line); }
+.skupl-rank-row:last-child{ border-bottom:none; }
+.skupl-rank-num{ font:700 12px 'JetBrains Mono',monospace; color:var(--ink-soft); }
+.skupl-rank-name{ min-width:0; font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; flex-direction:column; }
+.skupl-rank-sub{ font-size:10.5px; color:var(--ink-soft); font-weight:500; overflow:hidden; text-overflow:ellipsis; }
+.skupl-rank-val{ text-align:right; font-weight:700; font-size:12.5px; white-space:nowrap; display:flex; flex-direction:column; }
+.skupl-rank-margin{ font-size:10.5px; color:var(--ink-soft); font-weight:600; }
+.skupl-leaks{ display:flex; flex-direction:column; gap:9px; margin-top:8px; max-height:340px; overflow-y:auto; }
+.skupl-leak-row{ border:1px solid var(--border); border-radius:9px; padding:8px 10px; background:#FBFBFD; }
+.skupl-leak-head{ display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:8px; }
+.skupl-leak-name{ min-width:0; font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.skupl-leak-profit{ font-weight:700; font-size:12px; white-space:nowrap; }
+.skupl-leak-action{ font-size:11.5px; color:var(--ink-soft); margin-top:4px; line-height:1.45; }
+.skupl-toolbar{ display:flex; align-items:flex-end; gap:12px; flex-wrap:wrap; padding:14px 16px; border-bottom:1px solid var(--border); }
+.skupl-toolbar .plan-field select{ min-height:36px; border:1px solid var(--border); border-radius:8px; padding:7px 10px; font:600 13px inherit; color:var(--ink); background:var(--surface); }
+.skupl-search{ flex:1; min-width:200px; }
+.skupl-toolbar-spacer{ flex:1; }
+.pt-badge.sku-badge-bad{ background:#FCE4E4; color:var(--neg); }
+.pt-badge.sku-badge-warn{ background:#FCE4C4; color:#8A5A12; }
+.pt-badge.sku-badge-ok{ background:#E6F2EB; color:var(--pos); }
+.skupl-table tr.skupl-row-loss td{ background:#FDECEC; }
+.skupl-table tr.skupl-row-loss td.pt-id{ background:#FBE0E0; box-shadow:inset 3px 0 0 var(--neg); }
+.skupl-table tr.skupl-row-loss:hover td{ background:#FBE0E0; }
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
   .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
   .recon-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }.recon-chart-grid{ grid-template-columns:1fr; }
+  .skupl-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }.skupl-insights{ grid-template-columns:1fr; }
   /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
   .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
   .sidebar.collapsed{ width:270px; }
@@ -2033,7 +2637,7 @@ html,body,#root{ margin:0; padding:0; height:100%; }
   .topbar-account-select select,.topbar-brand-select select{ width:100%; max-width:none; }
   .live-wrap{ margin-left:auto; }
 }
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } .recon-kpis{ grid-template-columns:1fr; }.recon-month-picker{ width:100%; justify-content:space-between; }.recon-waterfall-row{ grid-template-columns:100px minmax(70px,1fr) 100px; gap:7px; }.recon-waterfall-row > strong{ font-size:10.5px; }.recon-filters{ display:grid; grid-template-columns:1fr 1fr; }.recon-search{ grid-column:1/-1; min-width:0; } }
+@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } .recon-kpis{ grid-template-columns:1fr; }.recon-month-picker{ width:100%; justify-content:space-between; }.recon-waterfall-row{ grid-template-columns:100px minmax(70px,1fr) 100px; gap:7px; }.recon-waterfall-row > strong{ font-size:10.5px; }.recon-filters{ display:grid; grid-template-columns:1fr 1fr; }.recon-search{ grid-column:1/-1; min-width:0; } .skupl-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;

@@ -91,6 +91,19 @@ const PRODUCT_CATALOG_COLUMNS = [
   "product_brand",
 ];
 
+// Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time
+// source reports changes to A+ / branded item content after Amazon publishes
+// them. Its payload is intentionally normalised before it reaches the browser:
+// notification payloads vary by Amazon event version and can be very large.
+const CONTENT_CHANGE_SOURCE_ID = "aec3d5976911a7a80110c08801a741e4f0a25dd997d639f5d918284d905a4758";
+const CONTENT_CHANGE_COLUMNS = [
+  "event_time",
+  "sp_api_notification_id",
+  "sp_api_notification_type",
+  "notification_metadata",
+  "payload",
+];
+
 // Daily Reporting sales source: "Sales & Traffic by ASIN & Date" (401ffcd7e5),
 // the user-confirmed accurate report. It is per-ASIN, so DataDoe aggregates it
 // by account/date before the server returns it to the dashboard.
@@ -147,6 +160,27 @@ const RECONCILIATION_SETTLEMENT_AGGREGATIONS = [
   { column: "refunded_amount", aggregation: "sum", alias: "refunded_amount_sum" },
   { column: "total", aggregation: "sum", alias: "total_sum" },
 ];
+// ===== SKU P&L Analyzer source =====
+// "Profit by SKU & Date" (57a0...) is DataDoe's canonical Premium P&L table: it
+// already pre-joins settlements, COGS, and advertising, so `profit` is trusted
+// directly and never rebuilt from raw orders/settlements. Aggregated per SKU with
+// enough grouping (child_asin/product_name/product_brand/currency) to support
+// local product, brand, and currency filtering. Ratio columns (acos/tacos/roi)
+// are deliberately NOT summed — the browser recomputes ratios from the sums.
+const SKU_PL_SOURCE_ID = "57a0cb319c10a395853afc0671579bf7ef0ff45d8a40c88ed9d2a5f61b4169a4";
+const SKU_PL_GROUP_BY = ["sku", "child_asin", "product_name", "product_brand", "currency"];
+const SKU_PL_COLUMNS = [...SKU_PL_GROUP_BY];
+const SKU_PL_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "profit", aggregation: "sum", alias: "profit_sum" },
+  { column: "total_cost", aggregation: "sum", alias: "total_cost_sum" },
+  { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
+  { column: "total_fees", aggregation: "sum", alias: "total_fees_sum" },
+  { column: "cogs_total", aggregation: "sum", alias: "cogs_total_sum" },
+  { column: "total_units_sold", aggregation: "sum", alias: "units_sum" },
+];
+const SKU_PL_ROW_LIMIT = 50000;
+
 // ===== FBA Shipment Plan sources (verified against api/v1/spec/data-scheme) =====
 // Per-ASIN unit sales. "Sales & Traffic by ASIN & Date" (401ffcd7e5) exposes
 // child_asin + total_units and is the report the Daily Reporting view already
@@ -202,6 +236,7 @@ const CATALOG_ROW_LIMIT = 10000;
 const DAILY_ROW_LIMIT = 5000;
 const DAILY_BRAND_ROW_LIMIT = 50000;
 const RECONCILIATION_ROW_LIMIT = 50000;
+const CONTENT_CHANGE_ROW_LIMIT = 1000;
 
 function authHeaders(apiKey) {
   return {
@@ -408,6 +443,60 @@ function catalogBrandNames(rows) {
 
 const num = (v) => Number(v) || 0;
 
+function parseJsonValue(value) {
+  if (!value || typeof value !== "string") return value;
+  try { return JSON.parse(value); } catch (e) { return value; }
+}
+
+function compactJsonPreview(value, maxLength = 420) {
+  const parsed = parseJsonValue(value);
+  const text = typeof parsed === "string" ? parsed : JSON.stringify(parsed || {});
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+// DataDoe passes through Amazon notification payloads whose nesting changes
+// over time. Find ASIN values by semantic key names as well as any exact ASIN
+// pattern in strings, so known payload variants remain brand-filterable.
+function notificationAsins(value) {
+  const found = new Set();
+  const visit = (node, key = "") => {
+    if (node === null || node === undefined) return;
+    if (typeof node === "string") {
+      const text = node.trim();
+      if (/asin/i.test(key) && /^[A-Z0-9]{10}$/i.test(text)) found.add(text.toUpperCase());
+      const matches = text.match(/\b[A-Z0-9]{10}\b/gi) || [];
+      matches.forEach((match) => found.add(match.toUpperCase()));
+      return;
+    }
+    if (Array.isArray(node)) { node.forEach((item) => visit(item, key)); return; }
+    if (typeof node === "object") Object.entries(node).forEach(([childKey, child]) => visit(child, childKey));
+  };
+  visit(parseJsonValue(value));
+  return [...found].sort();
+}
+
+function compactContentChangeEvents(rows, catalogRows) {
+  const brandByAsin = new Map();
+  for (const catalogRow of catalogRows) {
+    const asin = String(catalogRow.child_asin || "").trim().toUpperCase();
+    const brand = String(catalogRow.product_brand || "").trim();
+    if (asin && brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
+  }
+  return rows.map((row) => {
+    const asins = notificationAsins(row.payload);
+    const brands = [...new Set(asins.map((asin) => brandByAsin.get(asin)).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    return {
+      eventTime: row.event_time || null,
+      notificationId: String(row.sp_api_notification_id || "").trim() || null,
+      notificationType: String(row.sp_api_notification_type || "BRANDED_ITEM_CONTENT_CHANGE").trim(),
+      asins,
+      brands,
+      metadataPreview: compactJsonPreview(row.notification_metadata),
+      payloadPreview: compactJsonPreview(row.payload),
+    };
+  }).sort((a, b) => String(b.eventTime || "").localeCompare(String(a.eventTime || "")));
+}
+
 /* ===== FBA Shipment Plan helpers ===== */
 const pad2s = (n) => String(n).padStart(2, "0");
 function daysInMonthUTC(y, m /* 1..12 */) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
@@ -515,6 +604,56 @@ async function reconciliationRowsByMonth(apiKey, sourceId, columns, ids, from, t
   return result;
 }
 
+// Fetch Profit by SKU & Date in monthly batches and fold to one row per
+// (currency|sku|child_asin), with per-month numeric sums kept under `byMonth`.
+// Each month is aggregated server-side by DataDoe; hitting the row cap throws so
+// a truncated (misleading) P&L is never returned as complete.
+async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
+  const combined = new Map();
+  for (const window of windows) {
+    const monthKey = window.from.slice(0, 7);
+    const rows = await fetchExportRows(
+      apiKey, SKU_PL_SOURCE_ID, SKU_PL_COLUMNS, sellerOrVendorIds, window.from, window.to, SKU_PL_ROW_LIMIT,
+      { groupBy: SKU_PL_GROUP_BY, aggregations: SKU_PL_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" }
+    );
+    if (rows.length >= SKU_PL_ROW_LIMIT) {
+      throw new Error(`SKU P&L export reached the ${SKU_PL_ROW_LIMIT.toLocaleString("en-US")} row cap for ${monthKey}. The report was not saved because a partial P&L would be misleading.`);
+    }
+    for (const row of rows) {
+      const sku = String(row.sku || "").trim();
+      const childAsin = String(row.child_asin || "").trim();
+      const currency = String(row.currency || "").trim() || null;
+      // Never merge across currencies: currency is part of the identity key.
+      const key = `${currency || "?"}|${sku}|${childAsin}`;
+      let entry = combined.get(key);
+      if (!entry) {
+        entry = {
+          sku: sku || null,
+          asin: childAsin || null,
+          productName: String(row.product_name || "").trim() || null,
+          brand: String(row.product_brand || "").trim() || null,
+          currency,
+          byMonth: {},
+        };
+        combined.set(key, entry);
+      }
+      // Fill missing product name/brand from any month that has them.
+      if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
+      if (!entry.brand) entry.brand = String(row.product_brand || "").trim() || null;
+      const bucket = entry.byMonth[monthKey] || { sales: 0, profit: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0, units: 0 };
+      bucket.sales += num(row.total_sales_sum ?? row.total_sales);
+      bucket.profit += num(row.profit_sum ?? row.profit);
+      bucket.cost += num(row.total_cost_sum ?? row.total_cost);
+      bucket.adSpend += num(row.ad_spend_sum ?? row.ad_spend);
+      bucket.fees += num(row.total_fees_sum ?? row.total_fees);
+      bucket.cogs += num(row.cogs_total_sum ?? row.cogs_total);
+      bucket.units += num(row.units_sum ?? row.total_units_sold);
+      entry.byMonth[monthKey] = bucket;
+    }
+  }
+  return [...combined.values()];
+}
+
 async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
   const allRows = [];
   for (const window of splitDateRangeByMonth(from, to)) {
@@ -615,7 +754,9 @@ async function pollExport(apiKey, exportId) {
     if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
     const body = await r.json();
     if (body.status === "COMPLETED") return body;
-    if (body.status === "FAILED") throw new Error("DataDoe export failed to process.");
+    if (["FAILED", "ERROR", "BLOCKED_NO_TOKENS"].includes(body.status)) {
+      throw new Error(`DataDoe export failed to process (${body.status}).`);
+    }
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
   throw new Error("DataDoe export timed out while processing. Try a shorter date range.");
@@ -797,6 +938,78 @@ export default async function handler(req, res) {
         months: windows.map((w) => w.from.slice(0, 7)),
         orders: reconciliationOrders(orderRows, catalog),
         settlements: reconciliationSettlements(settlementRows),
+      });
+      return;
+    }
+
+    // SKU P&L Analyzer: one selected account only, exactly six complete
+    // calendar months. Uses the Premium "Profit by SKU & Date" source, fetched
+    // in monthly batches and folded to one row per (currency|sku|child_asin)
+    // with per-month sums. The browser localises to a single currency, applies
+    // the shared brand scope, switches month, and recomputes every ratio.
+    if (action === "sku-pl") {
+      const { ids, from, to } = req.query;
+      if (!ids || !from || !to) {
+        res.status(400).json({ error: "Missing required params: ids, from, to" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "SKU P&L Analyzer requires exactly one selected account." });
+        return;
+      }
+      const start = String(from), end = String(to);
+      const windows = splitDateRangeByMonth(start, end);
+      if (windows.length !== 6 || windows.some((window) => !isFullCalendarMonthWindow(window))) {
+        res.status(400).json({ error: "SKU P&L Analyzer requires exactly six complete calendar months." });
+        return;
+      }
+      const rows = await fetchSkuPlRows(apiKey, sellerOrVendorIds, windows);
+      const currencies = [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort();
+      res.status(200).json({
+        from: start,
+        to: end,
+        months: windows.map((w) => w.from.slice(0, 7)),
+        currencies,
+        rows,
+      });
+      return;
+    }
+
+    // Content Change Alerts: one selected account only. Amazon sends these
+    // near-real-time A+ / branded-item notifications without a stable payload
+    // schema, so the server extracts ASINs and resolves them through the
+    // existing Product Catalog before returning a compact event summary.
+    if (action === "content-changes") {
+      const { ids, asOf } = req.query;
+      if (!ids) {
+        res.status(400).json({ error: "Missing required param: ids" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "Content Change Alerts requires exactly one selected account." });
+        return;
+      }
+      const catalogTo = /^\d{4}-\d{2}-\d{2}$/.test(String(asOf || "")) ? String(asOf) : new Date().toISOString().slice(0, 10);
+      const catalogFrom = addDaysStr(catalogTo, -365);
+      const notificationRows = await fetchExportRows(
+        apiKey, CONTENT_CHANGE_SOURCE_ID, CONTENT_CHANGE_COLUMNS, sellerOrVendorIds,
+        null, null, CONTENT_CHANGE_ROW_LIMIT,
+        { orderByColumn: "event_time", orderByDirection: "DESC" }
+      );
+      const catalogRows = await fetchExportRows(
+        apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds,
+        catalogFrom, catalogTo, CATALOG_ROW_LIMIT,
+        { orderByColumn: "child_asin", orderByDirection: "ASC" }
+      );
+      const events = compactContentChangeEvents(notificationRows, catalogRows);
+      res.status(200).json({
+        accountId: sellerOrVendorIds[0],
+        events,
+        catalogBrands: catalogBrandNames(catalogRows),
+        retrievedAt: new Date().toISOString(),
+        unassignedEvents: events.filter((event) => !event.brands.length).length,
       });
       return;
     }
@@ -1091,7 +1304,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }
