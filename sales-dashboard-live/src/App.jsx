@@ -394,6 +394,7 @@ export default function App() {
   const [rowsError, setRowsError] = useState(null);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const [catalogBrands, setCatalogBrands] = useState([]);
+  const [catalogBrandsAccountId, setCatalogBrandsAccountId] = useState(null);
 
   const [selectedAccountId, setSelectedAccountId] = useState(null);
   const [selectedBrand, setSelectedBrand] = useState("ALL");
@@ -408,14 +409,12 @@ export default function App() {
   // Which section is showing: the main dashboard or the Daily Reporting view.
   const [view, setView] = useState("dashboard");
 
-  // Daily Reporting: single-account view, defaults to Aakriti Art Creations.
-  const [dailyAccountId, setDailyAccountId] = useState(null);
+  // Every report reads this single account/brand scope from the header.
   const [dailyRows, setDailyRows] = useState([]);
   const [dailyLoading, setDailyLoading] = useState(false);
   const [dailyError, setDailyError] = useState(null);
 
-  // FBA Shipment Plan: single selected account, cache-first like the others.
-  const [planAccountId, setPlanAccountId] = useState(null);
+  // FBA Shipment Plan is cache-first and uses the shared header scope.
   const [planData, setPlanData] = useState(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState(null);
@@ -431,9 +430,6 @@ export default function App() {
     setAccounts(nextAccounts);
     if (nextAccounts.length > 0) {
       setSelectedAccountId((prev) => prev || nextAccounts[0].id);
-      const aakriti = nextAccounts.find((a) => /aakriti/i.test(a.name));
-      setDailyAccountId((prev) => prev || (aakriti || nextAccounts[0]).id);
-      setPlanAccountId((prev) => prev || nextAccounts[0].id);
     }
     setAccountsError(null);
     return nextAccounts;
@@ -482,11 +478,13 @@ export default function App() {
     if (cached) {
       setRows(cached.body.rows || []);
       setCatalogBrands(cached.body.catalogBrands || []);
+      setCatalogBrandsAccountId(selectedAccountId);
       setLastFetchedAt(new Date(cached.cachedAt));
       setRowsError(null);
     } else {
       setRows([]);
       setCatalogBrands([]);
+      setCatalogBrandsAccountId(null);
       setLastFetchedAt(null);
       setRowsError("No cached dashboard data for this selection. Click refresh to fetch from DataDoe.");
     }
@@ -504,6 +502,7 @@ export default function App() {
       .then(({ body, cachedAt }) => {
         setRows(body.rows || []);
         setCatalogBrands(body.catalogBrands || []);
+        setCatalogBrandsAccountId(selectedAccountId);
         setLastFetchedAt(new Date(cachedAt));
       })
       .catch((err) => setRowsError(err.message))
@@ -519,10 +518,10 @@ export default function App() {
   // Daily Reporting fetch: pull ~5 months of single-account history so the
   // report can show 3 completed months + current-month MTD + the last 5 days.
   const dailyParams = useMemo(() => {
-    if (!dailyAccountId) return null;
+    if (!selectedAccountId) return null;
     const mb = monthBack(TODAY, 5);
-    return { action: "daily", ids: dailyAccountId, from: mb.from, to: TODAY };
-  }, [dailyAccountId, TODAY]);
+    return { action: "daily", reportVersion: "daily-brand-v1", ids: selectedAccountId, brand: selectedBrand, from: mb.from, to: TODAY };
+  }, [selectedAccountId, selectedBrand, TODAY]);
 
   const loadCachedDaily = useCallback(() => {
     if (!dailyParams) {
@@ -559,13 +558,13 @@ export default function App() {
 
   // FBA Shipment Plan: cache-first, single selected account, manual refresh only.
   const planParams = useMemo(() => {
-    if (!planAccountId) return null;
+    if (!selectedAccountId) return null;
     // Bump reportVersion if the backend metric definition changes so a stale
     // cached report can never be presented as the current one. `to` (the as-of
     // date) is part of the cache key; the target-coverage input is NOT, because
     // it is applied locally and must never trigger a refetch.
-    return { action: "fba-plan", reportVersion: "fba-plan-v1", ids: planAccountId, to: TODAY };
-  }, [planAccountId, TODAY]);
+    return { action: "fba-plan", reportVersion: "fba-plan-v1", ids: selectedAccountId, to: TODAY };
+  }, [selectedAccountId, TODAY]);
 
   const loadCachedPlan = useCallback(() => {
     if (!planParams) {
@@ -601,12 +600,8 @@ export default function App() {
     if (view === "fbaplan") loadCachedPlan();
   }, [view, loadCachedPlan]);
 
-  const dailyCurrency = accountById[dailyAccountId]?.currency || "INR";
-  const refreshScopeAccount = view === "daily"
-    ? accountById[dailyAccountId]
-    : view === "fbaplan"
-    ? accountById[planAccountId]
-    : accountById[selectedAccountId];
+  const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
+  const refreshScopeAccount = accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
     // The sales source can emit a newer zero-sales row before its daily data
     // arrives. Anchor to the latest completed sales date, not that placeholder.
@@ -641,9 +636,11 @@ export default function App() {
   }, [planData, targetDays]);
 
   const planRows = useMemo(() => {
-    const filtered = planComputed.filter((r) => planSearchMatch(r, planSearch));
+    const filtered = planComputed.filter((r) =>
+      (selectedBrand === "ALL" || r.brand === selectedBrand) && planSearchMatch(r, planSearch)
+    );
     return [...filtered].sort((a, b) => comparePlanRows(a, b, planSort.key, planSort.dir));
-  }, [planComputed, planSearch, planSort]);
+  }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
     const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
@@ -713,15 +710,15 @@ export default function App() {
   }
   const cachedAccountBrands = useMemo(
     () => readCachedCatalogBrands(selectedAccountId),
-    [selectedAccountId, catalogBrands]
+    [selectedAccountId, catalogBrands, catalogBrandsAccountId]
   );
   const brandList = useMemo(() => {
-    const names = new Set([...cachedAccountBrands, ...catalogBrands]);
-    rows
-      .filter((row) => row.seller_or_vendor_id === selectedAccountId)
-      .forEach((row) => names.add(productBrand(row)));
+    // Never carry a prior account's in-memory catalog into the newly selected
+    // account. Cached catalog keys are already account-scoped.
+    const currentCatalogBrands = catalogBrandsAccountId === selectedAccountId ? catalogBrands : [];
+    const names = new Set([...cachedAccountBrands, ...currentCatalogBrands]);
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [cachedAccountBrands, catalogBrands, rows, selectedAccountId]);
+  }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, selectedAccountId]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -897,8 +894,7 @@ export default function App() {
           <span className="mark">UPRIVER</span>
           <span className="sub">Amazon Seller Portfolio — Sales</span>
         </div>
-        {view === "dashboard" && (
-          <div className="topbar-filters">
+        <div className="topbar-filters">
           <div className="select topbar-account-select">
             <select
               aria-label="Account selection"
@@ -929,8 +925,7 @@ export default function App() {
             </select>
             <ChevronDown size={16} />
           </div>
-          </div>
-        )}
+        </div>
         <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
@@ -1041,15 +1036,7 @@ export default function App() {
         <div className="controls-bar">
           <div>
             <div className="page-title">Daily Reporting</div>
-            <div className="page-sub">Sales & advertising snapshot by month and by day</div>
-          </div>
-          <div className="select">
-            <select value={dailyAccountId || ""} onChange={(e) => setDailyAccountId(e.target.value)}>
-              {accounts.map((account) => (
-                <option value={account.id} key={account.id}>{FLAGS[account.country] || ""} {account.name} ({account.currency || "—"})</option>
-              ))}
-            </select>
-            <ChevronDown size={16} />
+            <div className="page-sub">Sales & advertising snapshot for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
           </div>
         </div>
 
@@ -1060,7 +1047,7 @@ export default function App() {
         <div className="panel" style={{ marginTop: 14 }}>
           <div className="panel-head">
             <div>
-              <div className="panel-title">{accountById[dailyAccountId]?.name || "Account"}</div>
+              <div className="panel-title">{refreshScopeAccount?.name || "Account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
               <div className="page-sub">Latest completed sales: {fmtDateHuman(dailyReport.latest)} · shown in {dailyCurrency}</div>
             </div>
             <button className="refresh-btn" onClick={fetchDaily} title="Refresh data">
@@ -1072,7 +1059,7 @@ export default function App() {
             <table className="daily-table">
               <thead>
                 <tr>
-                  <th className="dt-metric">{accountById[dailyAccountId]?.name?.split(" ")[0] || "Metric"}</th>
+                  <th className="dt-metric">{refreshScopeAccount?.name?.split(" ")[0] || "Metric"}</th>
                   {dailyReport.columns.map((c) => (
                     <th key={c.key} className={"dt-col dt-" + c.group}>{c.label}</th>
                   ))}
@@ -1096,7 +1083,7 @@ export default function App() {
 
         <div className="footer-note">
           ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
-          Sales and units are sourced from DataDoe Sales & Traffic by ASIN & Date. Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export. The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
+          Sales and units are sourced from DataDoe Sales & Traffic by ASIN & Date. {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export." : "Advertising metrics show — for a named brand because the connected advertising export is account-level and cannot be assigned accurately to a product brand."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
       </div>
       )}
@@ -1106,15 +1093,7 @@ export default function App() {
         <div className="controls-bar">
           <div>
             <div className="page-title">FBA Shipment Plan</div>
-            <div className="page-sub">Per-ASIN restock recommendation from sales velocity and live FBA{planData?.isUS ? " + AWD" : ""} inventory</div>
-          </div>
-          <div className="select">
-            <select aria-label="FBA plan account" value={planAccountId || ""} onChange={(e) => setPlanAccountId(e.target.value)}>
-              {accounts.map((account) => (
-                <option value={account.id} key={account.id}>{FLAGS[account.country] || ""} {account.name} ({account.country || "—"})</option>
-              ))}
-            </select>
-            <ChevronDown size={16} />
+            <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and live FBA{planData?.isUS ? " + AWD" : ""} inventory</div>
           </div>
         </div>
 
@@ -1252,7 +1231,7 @@ export default function App() {
           </div>
         ) : planData && planRows.length === 0 ? (
           <div className="panel" style={{ marginTop: 14 }}>
-            <div className="empty-note">{planSearch ? "No ASINs match your search." : "No ASINs found for this account in the reporting window."}</div>
+            <div className="empty-note">{planSearch ? "No ASINs match your search." : selectedBrand === "ALL" ? "No ASINs found for this account in the reporting window." : "No ASINs match the selected brand."}</div>
           </div>
         ) : !planError ? (
           <div className="panel" style={{ marginTop: 14 }}>

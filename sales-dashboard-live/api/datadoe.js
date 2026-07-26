@@ -104,6 +104,10 @@ const DAILY_SALES_AGGREGATIONS = [
   { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
   { column: "total_units", aggregation: "sum", alias: "total_units_sum" },
 ];
+// A named brand needs ASIN-level grouping before it can be joined to the
+// Product Catalog. The all-brand report keeps the more compact date grouping.
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "child_asin"];
 
 // Advertising source (ad sales / spend / clicks), merged into the daily report
 // by (account, date).
@@ -171,6 +175,7 @@ const CATALOG_ROW_LIMIT = 10000;
 // Daily sources are aggregated by account/date before download, so a compact
 // limit safely covers years of history without raw ASIN row truncation.
 const DAILY_ROW_LIMIT = 5000;
+const DAILY_BRAND_ROW_LIMIT = 50000;
 
 function authHeaders(apiKey) {
   return {
@@ -330,6 +335,34 @@ function normalizeDailySalesRows(rows) {
   }));
 }
 
+// Join the ASIN-level daily export to the account's catalog, then fold the
+// chosen brand back to one row per day for the existing Daily Reporting table.
+function dailyRowsForBrand(rows, catalogRows, brand) {
+  const brandByAsin = new Map();
+  for (const catalogRow of catalogRows) {
+    const asin = String(catalogRow.child_asin || "").trim();
+    const productBrand = String(catalogRow.product_brand || "").trim();
+    if (asin && productBrand && !brandByAsin.has(asin)) brandByAsin.set(asin, productBrand);
+  }
+  const totals = new Map();
+  for (const row of rows) {
+    if (brandByAsin.get(String(row.child_asin || "").trim()) !== brand) continue;
+    const key = `${row.seller_or_vendor_id}|${row.date}`;
+    const current = totals.get(key) || {
+      date: row.date,
+      seller_or_vendor_id: row.seller_or_vendor_id,
+      total_sales: 0,
+      total_units: 0,
+      total_units_sold: 0,
+    };
+    current.total_sales += num(row.total_sales_sum ?? row.total_sales);
+    current.total_units += num(row.total_units_sum ?? row.total_units);
+    current.total_units_sold = current.total_units;
+    totals.set(key, current);
+  }
+  return [...totals.values()];
+}
+
 function normalizeAdRows(rows) {
   return rows.map((row) => ({
     ...row,
@@ -358,6 +391,37 @@ function addDaysStr(s, n) {
   const dt = new Date(t);
   return `${dt.getUTCFullYear()}-${pad2s(dt.getUTCMonth() + 1)}-${pad2s(dt.getUTCDate())}`;
 }
+function splitDateRangeByMonth(from, to) {
+  const windows = [];
+  let cursor = from;
+  while (cursor <= to) {
+    const [y, m] = cursor.split("-").map(Number);
+    const monthEnd = `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`;
+    const end = monthEnd < to ? monthEnd : to;
+    windows.push({ from: cursor, to: end });
+    cursor = addDaysStr(end, 1);
+  }
+  return windows;
+}
+
+async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
+  const allRows = [];
+  for (const window of splitDateRangeByMonth(from, to)) {
+    const rows = await fetchExportRows(
+      apiKey,
+      DAILY_SALES_SOURCE_ID,
+      DAILY_BRAND_SALES_COLUMNS,
+      sellerOrVendorIds,
+      window.from,
+      window.to,
+      DAILY_BRAND_ROW_LIMIT,
+      { groupBy: DAILY_BRAND_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
+    );
+    allRows.push(...rows);
+  }
+  return allRows;
+}
+
 // The 3 completed calendar months before the month containing `toStr`, plus the
 // current (MTD) month window ending at `toStr`.
 function planMonthWindows(toStr) {
@@ -523,15 +587,39 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Daily Reporting data: the sales and advertising sources are both
-    // aggregated by account/date in DataDoe, then merged server-side.
+    // Daily Reporting data. All brands stay compact at account/date grain;
+    // a named brand is joined through the catalog at ASIN/day grain first.
     if (action === "daily") {
       const { ids, from, to } = req.query;
+      const brand = String(req.query.brand || "ALL");
       if (!ids || !from || !to) {
         res.status(400).json({ error: "Missing required params: ids, from, to" });
         return;
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "Daily Reporting requires exactly one selected account." });
+        return;
+      }
+
+      if (brand !== "ALL") {
+        const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
+        const catalog = await fetchExportRows(
+          apiKey,
+          PRODUCT_CATALOG_SOURCE_ID,
+          PRODUCT_CATALOG_COLUMNS,
+          sellerOrVendorIds,
+          from,
+          to,
+          CATALOG_ROW_LIMIT,
+          { orderByColumn: "child_asin" }
+        );
+        // Advertising data is account-level in the current source. Omitting it
+        // is safer than presenting the whole account's spend as one brand's.
+        res.status(200).json({ rows: dailyRowsForBrand(salesRaw, catalog, brand), brandFiltered: true });
+        return;
+      }
+
       const salesRaw = await fetchExportRows(
         apiKey,
         DAILY_SALES_SOURCE_ID,
@@ -556,7 +644,7 @@ export default async function handler(req, res) {
       );
       const ads = normalizeAdRows(adRaw);
       mergeSalesAndAds(rows, ads);
-      res.status(200).json({ rows });
+      res.status(200).json({ rows, brandFiltered: false });
       return;
     }
 
