@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw } from "lucide-react";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -345,6 +345,22 @@ function downloadReconciliationCsv(rows, currency, scopeLabel) {
 }
 
 /* ============================== SKU P&L ANALYZER HELPERS ============================== */
+const COGS_OVERRIDE_STORAGE_KEY = "upriver-cogs-overrides-v1";
+
+function readCogsOverrides() {
+  try {
+    const stored = localStorage.getItem(COGS_OVERRIDE_STORAGE_KEY);
+    const parsed = stored ? JSON.parse(stored) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function cogsOverrideKey(accountId, row) {
+  return [accountId || "", row.currency || "", row.sku || "", row.asin || ""].join("|");
+}
+
 // Sum a SKU's per-month buckets for the selected month ("ALL" = all six).
 function skuPlScopedTotals(byMonth, month) {
   const zero = { sales: 0, profit: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0, units: 0 };
@@ -365,18 +381,27 @@ function skuPlScopedTotals(byMonth, month) {
 }
 
 // Turn one raw SKU row + the selected month into displayable, recomputed metrics.
+// A manual COGS-per-unit override replaces only the COGS component; cost and
+// profit move by the same delta so all related P&L metrics stay internally sound.
 // Every ratio is derived here from the summed amounts — ratios are never summed.
-function computeSkuPlRow(row, month) {
+function computeSkuPlRow(row, month, cogsPerUnitOverride) {
   const t = skuPlScopedTotals(row.byMonth, month);
+  const rawCogs = t.cogs;
+  const hasCogsOverride = Number.isFinite(cogsPerUnitOverride) && cogsPerUnitOverride >= 0;
+  const cogs = hasCogsOverride ? t.units * cogsPerUnitOverride : rawCogs;
+  const cogsDelta = cogs - rawCogs;
+  const cost = t.cost + cogsDelta;
+  const profit = t.profit - cogsDelta;
   // Margin and the ad ratio are recomputed from sums; null when sales is 0 so an
-  // undefined ratio is shown as "—" rather than a misleading number.
-  const margin = t.sales > 0 ? (t.profit / t.sales) * 100 : null;
+  // undefined ratio is shown as “—” rather than a misleading number.
+  const margin = t.sales > 0 ? (profit / t.sales) * 100 : null;
   const adSalesRatio = t.sales > 0 ? (t.adSpend / t.sales) * 100 : null;
-  const cogsMissing = t.sales > 0 && t.cogs <= 0;
+  const cogsMissing = t.sales > 0 && cogs <= 0;
   return {
     sku: row.sku, asin: row.asin, productName: row.productName, brand: row.brand, currency: row.currency,
-    ...t, margin, adSalesRatio, cogsMissing,
-    hasActivity: t.sales !== 0 || t.profit !== 0 || t.units !== 0 || t.adSpend !== 0,
+    ...t, cogs, cost, profit, rawCogs, cogsPerUnitOverride: hasCogsOverride ? cogsPerUnitOverride : null,
+    hasCogsOverride, margin, adSalesRatio, cogsMissing,
+    hasActivity: t.sales !== 0 || profit !== 0 || t.units !== 0 || t.adSpend !== 0,
   };
 }
 
@@ -410,6 +435,8 @@ function downloadSkuPlCsv(rows, currency, monthLabel, accountName) {
     "Amazon Fees": Number(r.fees || 0).toFixed(2),
     "Ad Spend": Number(r.adSpend || 0).toFixed(2),
     COGS: Number(r.cogs || 0).toFixed(2),
+    "COGS per Unit": r.cogsPerUnitOverride === null ? "" : Number(r.cogsPerUnitOverride).toFixed(2),
+    "COGS Source": r.hasCogsOverride ? "Manual override" : "DataDoe",
     "Ad/Sales %": r.adSalesRatio === null ? "" : r.adSalesRatio.toFixed(1),
     Status: r.status?.label || "",
     "Suggested Action": r.status?.action || "",
@@ -740,6 +767,10 @@ export default function App() {
   const [skuPlStatusFilter, setSkuPlStatusFilter] = useState("ALL");
   const [skuPlSort, setSkuPlSort] = useState({ key: "profit", dir: "desc" });
   const [skuPlPage, setSkuPlPage] = useState(1);
+  const [cogsOverrides, setCogsOverrides] = useState(readCogsOverrides);
+  const [cogsEditRow, setCogsEditRow] = useState(null);
+  const [cogsEditValue, setCogsEditValue] = useState("");
+  const [cogsEditError, setCogsEditError] = useState("");
 
   // Content Change Alerts: cache-first, selected-account-only monitoring of
   // Amazon A+ / branded-item content change notifications.
@@ -1275,9 +1306,49 @@ export default function App() {
     return skuPlData.rows
       .filter((r) => r.currency === effectiveSkuCurrency)
       .filter((r) => selectedBrand === "ALL" || (r.brand || "Unassigned") === selectedBrand)
-      .map((r) => computeSkuPlRow(r, skuPlMonth))
+      .map((r) => computeSkuPlRow(r, skuPlMonth, cogsOverrides[cogsOverrideKey(selectedAccountId, r)]?.perUnit))
       .filter((r) => r.hasActivity);
-  }, [skuPlData, effectiveSkuCurrency, selectedBrand, skuPlMonth]);
+  }, [skuPlData, effectiveSkuCurrency, selectedBrand, skuPlMonth, cogsOverrides, selectedAccountId]);
+
+  const openCogsEditor = useCallback((row) => {
+    setCogsEditRow(row);
+    setCogsEditValue(row.cogsPerUnitOverride === null ? "" : String(row.cogsPerUnitOverride));
+    setCogsEditError("");
+  }, []);
+
+  const closeCogsEditor = useCallback(() => {
+    setCogsEditRow(null);
+    setCogsEditValue("");
+    setCogsEditError("");
+  }, []);
+
+  const saveCogsOverride = useCallback(() => {
+    if (!cogsEditRow || !selectedAccountId) return;
+    const valueText = cogsEditValue.trim();
+    const perUnit = Number(valueText);
+    if (!valueText || !Number.isFinite(perUnit) || perUnit < 0) {
+      setCogsEditError("Enter a valid zero or positive per-unit cost.");
+      return;
+    }
+    const key = cogsOverrideKey(selectedAccountId, cogsEditRow);
+    const next = {
+      ...cogsOverrides,
+      [key]: { perUnit, updatedAt: new Date().toISOString(), sku: cogsEditRow.sku || null, asin: cogsEditRow.asin || null, currency: cogsEditRow.currency || null },
+    };
+    try { localStorage.setItem(COGS_OVERRIDE_STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* state still keeps this session's correction */ }
+    setCogsOverrides(next);
+    closeCogsEditor();
+  }, [cogsEditRow, cogsEditValue, cogsOverrides, closeCogsEditor, selectedAccountId]);
+
+  const resetCogsOverride = useCallback(() => {
+    if (!cogsEditRow || !selectedAccountId) return;
+    const key = cogsOverrideKey(selectedAccountId, cogsEditRow);
+    const next = { ...cogsOverrides };
+    delete next[key];
+    try { localStorage.setItem(COGS_OVERRIDE_STORAGE_KEY, JSON.stringify(next)); } catch (e) { /* state still resets this session */ }
+    setCogsOverrides(next);
+    closeCogsEditor();
+  }, [cogsEditRow, cogsOverrides, closeCogsEditor, selectedAccountId]);
 
   // Blended margin over the whole in-scope set drives the thin-margin leak test.
   const skuPlBlendedMargin = useMemo(() => {
@@ -2239,7 +2310,10 @@ export default function App() {
                         <td className="mono">{fmtMoney(r.cost, effectiveSkuCurrency)}</td>
                         <td className="mono">{fmtMoney(r.fees, effectiveSkuCurrency)}</td>
                         <td className="mono">{fmtMoney(r.adSpend, effectiveSkuCurrency)}</td>
-                        <td className={"mono" + (r.cogsMissing ? " sku-warn" : "")}>{r.cogsMissing ? "missing" : fmtMoney(r.cogs, effectiveSkuCurrency)}</td>
+                        <td className={"mono skupl-cogs-cell" + (r.cogsMissing ? " sku-warn" : "")}>
+                          <span>{r.cogsMissing ? "missing" : fmtMoney(r.cogs, effectiveSkuCurrency)}</span>
+                          <button className="icon-action" type="button" onClick={() => openCogsEditor(r)} title="Update COGS per unit" aria-label={`Update COGS for ${r.sku || r.asin || "SKU"}`}><Pencil size={13} /></button>
+                        </td>
                         <td className="mono">{r.adSalesRatio === null ? "—" : `${r.adSalesRatio.toFixed(1)}%`}</td>
                         <td><span className={"pt-badge sku-badge-" + r.status.tone} title={r.status.action || ""}>{r.status.label}</span></td>
                       </tr>
@@ -2257,10 +2331,34 @@ export default function App() {
           </>}
 
           <div className="footer-note">
-            Profit comes straight from DataDoe <code>Profit by SKU &amp; Date</code> (the <code>profit</code> column), which already blends settlements, COGS, and ad spend — it is not rebuilt from raw orders. Sales, Profit, Total Cost, Ad Spend, Amazon Fees, COGS, and Units are summed per SKU; every ratio (Margin %, Ad/Sales %, Blended Margin) is recomputed from those sums, never averaged. <strong>Ad/Sales %</strong> = ad spend ÷ total sales (this report does not aggregate ad sales, so it is not classic ACoS). Currencies are never combined; when an account reports more than one, use the currency selector. This report always uses six <strong>full</strong> calendar months because Amazon fees settle in batches by settlement date, so a partial month can badly misstate profit. A “Check COGS” flag means COGS is zero/missing, so that SKU’s margin is overstated — verify COGS before trusting it. Month, currency, brand, search, sort, filter, and CSV export all run locally; only Refresh calls DataDoe.
+            Profit comes straight from DataDoe <code>Profit by SKU &amp; Date</code> (the <code>profit</code> column), which already blends settlements, COGS, and ad spend — it is not rebuilt from raw orders. Sales, Profit, Total Cost, Ad Spend, Amazon Fees, COGS, and Units are summed per SKU; every ratio (Margin %, Ad/Sales %, Blended Margin) is recomputed from those sums, never averaged. <strong>Ad/Sales %</strong> = ad spend ÷ total sales (this report does not aggregate ad sales, so it is not classic ACoS). Currencies are never combined; when an account reports more than one, use the currency selector. This report always uses six <strong>full</strong> calendar months because Amazon fees settle in batches by settlement date, so a partial month can badly misstate profit. A “Check COGS” flag means COGS is zero/missing, so that SKU’s margin is overstated — verify COGS before trusting it. A per-unit COGS override adjusts COGS, total cost, profit, and margins for that account/SKU locally; it is included in the CSV. Month, currency, brand, search, sort, filter, and CSV export all run locally; only Refresh calls DataDoe.
           </div>
         </>}
       </div>
+      )}
+
+      {cogsEditRow && (
+        <div className="cogs-modal-backdrop" role="presentation" onMouseDown={closeCogsEditor}>
+          <section className="cogs-modal" role="dialog" aria-modal="true" aria-labelledby="cogs-modal-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="cogs-modal-head">
+              <div>
+                <div id="cogs-modal-title" className="panel-title">Update COGS</div>
+                <div className="page-sub">{cogsEditRow.productName || cogsEditRow.sku || cogsEditRow.asin}</div>
+              </div>
+              <button className="icon-action" type="button" onClick={closeCogsEditor} title="Close" aria-label="Close COGS editor"><X size={16} /></button>
+            </div>
+            <div className="cogs-modal-meta mono">{cogsEditRow.sku || "—"}{cogsEditRow.asin ? ` · ${cogsEditRow.asin}` : ""}</div>
+            <label className="plan-field cogs-modal-input">
+              <span className="plan-field-label">COGS per unit ({cogsEditRow.currency || effectiveSkuCurrency})</span>
+              <input type="number" min="0" step="0.01" inputMode="decimal" autoFocus value={cogsEditValue} onChange={(event) => { setCogsEditValue(event.target.value); setCogsEditError(""); }} onKeyDown={(event) => { if (event.key === "Enter") saveCogsOverride(); }} />
+            </label>
+            {cogsEditError && <div className="cogs-modal-error">{cogsEditError}</div>}
+            <div className="cogs-modal-actions">
+              {cogsEditRow.hasCogsOverride && <button className="secondary-action" type="button" onClick={resetCogsOverride}><RotateCcw size={14} />Use DataDoe COGS</button>}
+              <button className="plan-export-btn" type="button" onClick={saveCogsOverride}>Save COGS</button>
+            </div>
+          </section>
+        </div>
       )}
 
       {view === "contentchanges" && (
@@ -2621,6 +2719,9 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .skupl-toolbar .plan-field select{ min-height:36px; border:1px solid var(--border); border-radius:8px; padding:7px 10px; font:600 13px inherit; color:var(--ink); background:var(--surface); }
 .skupl-search{ flex:1; min-width:200px; }
 .skupl-toolbar-spacer{ flex:1; }
+.skupl-cogs-cell{ white-space:nowrap; }.skupl-cogs-cell .icon-action{ margin-left:5px; vertical-align:middle; }
+.icon-action{ display:inline-grid; place-items:center; width:27px; height:27px; padding:0; border:1px solid var(--border); border-radius:6px; color:var(--ink-soft); background:var(--surface); cursor:pointer; }.icon-action:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
+.cogs-modal-backdrop{ position:fixed; inset:0; z-index:50; display:grid; place-items:center; padding:18px; background:rgba(12,18,32,.36); }.cogs-modal{ width:min(100%,420px); border:1px solid var(--border); border-radius:8px; background:var(--surface); box-shadow:0 20px 46px rgba(10,12,20,.26); padding:18px; }.cogs-modal-head{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }.cogs-modal-meta{ margin-top:8px; font-size:11px; color:var(--ink-soft); }.cogs-modal-input{ display:flex; flex-direction:column; gap:6px; margin-top:18px; }.cogs-modal-input input{ width:100%; min-height:38px; border:1px solid var(--border); border-radius:7px; padding:8px 10px; font:600 14px inherit; color:var(--ink); background:var(--surface); }.cogs-modal-error{ margin-top:8px; color:var(--neg); font-size:12px; font-weight:600; }.cogs-modal-actions{ display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin-top:18px; }.secondary-action{ display:inline-flex; align-items:center; gap:6px; min-height:34px; border:1px solid var(--border); border-radius:7px; padding:7px 10px; color:var(--ink-soft); background:var(--surface); font:600 12px inherit; cursor:pointer; }.secondary-action:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
 .pt-badge.sku-badge-bad{ background:#FCE4E4; color:var(--neg); }
 .pt-badge.sku-badge-warn{ background:#FCE4C4; color:#8A5A12; }
 .pt-badge.sku-badge-ok{ background:#E6F2EB; color:var(--pos); }
