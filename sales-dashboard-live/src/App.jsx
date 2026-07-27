@@ -890,7 +890,7 @@ export default function App() {
     // cached report can never be presented as the current one. `to` (the as-of
     // date) is part of the cache key; the target-coverage input is NOT, because
     // it is applied locally and must never trigger a refetch.
-    return { action: "fba-plan", reportVersion: "fba-plan-v1", ids: selectedAccountId, to: TODAY };
+    return { action: "fba-plan", reportVersion: "fba-plan-v2-transfer-dedupe", ids: selectedAccountId, to: TODAY };
   }, [selectedAccountId, TODAY]);
 
   const loadCachedPlan = useCallback(() => {
@@ -2094,7 +2094,7 @@ export default function App() {
 
         <div className="footer-note">
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
-          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
+          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = the non-overlapping remainder of <code>reserved_fc_transfer</code> after <code>inbound_shipped</code>, plus <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
           {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> from <code>Listings</code> and is added to coverage for this US account.</> : <> AWD does not apply to non-US accounts and is hidden.</>}
           {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Total FBA Inv. = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. FBA Days (MTD DRR) = FBA Available divided by MTD daily run rate; it excludes reserved, inbound, and AWD stock. Recommended Shipment = ceil(Target Units − Total FBA Inv.), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>

@@ -1187,6 +1187,12 @@ export default async function handler(req, res) {
           : 0;
         const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
         if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0) continue;
+        // DataDoe's FBA Inventory Health snapshot can include the same units in
+        // both `reserved_fc_transfer` and `inbound_shipped`. Amazon exposes
+        // that overlap only as Inbound, so subtract it from the FC-transfer
+        // reserve before returning the planning components. This preserves a
+        // genuine residual FC-transfer balance without double-counting stock.
+        const adjustedFcTransfer = inv ? Math.max(0, inv.fcTransfer - inv.inboundShipped) : 0;
         rows.push({
           asin,
           productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
@@ -1198,7 +1204,7 @@ export default async function handler(req, res) {
           // it genuinely holds no FBA stock (0). When the whole snapshot is
           // unavailable, inventory fields are null so the UI can flag it.
           fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-          reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
+          reservedFcTransfer: inventoryAvailable ? adjustedFcTransfer : null,
           reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
           inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
           inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
