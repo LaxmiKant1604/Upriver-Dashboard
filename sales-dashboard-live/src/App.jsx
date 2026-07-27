@@ -793,7 +793,7 @@ export default function App() {
     }
     // Bump this whenever the backend changes the metric definition so a
     // previously cached report can never be presented as the new one.
-    return { action: "brand-sales", reportVersion: "order-items-v1", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
+    return { action: "brand-sales", reportVersion: "order-items-v2-gross", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
   const loadCachedRows = useCallback(() => {
@@ -1746,7 +1746,7 @@ export default function App() {
         </div>
 
         <div className="footer-note">
-          Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export.
+          Total Sales is gross order value from DataDoe Order Line Items: product price plus item tax. This is the tax-inclusive value used when comparing the dashboard with Seller Central's Order Report. Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export.
         </div>
       </div>
       )}

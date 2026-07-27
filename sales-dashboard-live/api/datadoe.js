@@ -54,10 +54,10 @@ const DASHBOARD_COLUMNS = [
 ];
 
 // Main dashboard sales source. Order Line Items is the Seller Central order
-// report equivalent: `item_price_value` is the source-of-truth ordered item
-// value, including pending orders. It intentionally replaces Profit by SKU &
-// Date, which includes shipped orders only and therefore cannot reconcile to
-// Seller Central's Order Report total.
+// report equivalent. The dashboard presents gross ordered sales, so it adds
+// the product price and item tax while preserving each component in the API.
+// This includes pending orders and intentionally replaces Profit by SKU & Date,
+// which includes shipped orders only.
 const ORDER_LINE_ITEMS_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
 const ORDER_SALES_COLUMNS = [
   "date",
@@ -68,7 +68,8 @@ const ORDER_SALES_COLUMNS = [
   "child_asin",
 ];
 const ORDER_SALES_AGGREGATIONS = [
-  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "product_sales_sum" },
+  { column: "item_tax_value", aggregation: "sum", alias: "item_tax_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sold_sum" },
 ];
 const ORDER_SALES_GROUP_BY = [
@@ -376,12 +377,18 @@ function orderSalesByBrand(rows, catalogRows) {
       currency,
       product_brand: productBrand,
       total_sales: 0,
+      product_sales: 0,
+      item_tax: 0,
       total_units_sold: 0,
       // A compact ASIN-level export cannot deduplicate order IDs across ASINs.
       // Leave Orders/AOV unavailable rather than showing a misleading value.
       total_orders: null,
     };
-    current.total_sales += num(row.total_sales_sum ?? row.item_price_value);
+    const productSales = num(row.product_sales_sum ?? row.total_sales_sum ?? row.item_price_value);
+    const itemTax = num(row.item_tax_sum ?? row.item_tax_value);
+    current.product_sales += productSales;
+    current.item_tax += itemTax;
+    current.total_sales += productSales + itemTax;
     current.total_units_sold += num(row.total_units_sold_sum ?? row.quantity);
     totals.set(key, current);
   }
