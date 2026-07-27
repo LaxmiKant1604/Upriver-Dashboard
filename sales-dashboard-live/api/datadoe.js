@@ -754,8 +754,11 @@ function mergeSalesAndAds(salesRows, adRows) {
 }
 
 async function pollExport(apiKey, exportId) {
-  const maxAttempts = 12;
-  const delayMs = 1500;
+  // DataDoe recommends a five-second poll cadence and exports can take close
+  // to 30 seconds. The former 18-second window produced false timeouts for
+  // valid Sales & Traffic exports. Keep this below Vercel's 60-second limit.
+  const maxAttempts = 9;
+  const delayMs = 5000;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const r = await ddFetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
     if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
