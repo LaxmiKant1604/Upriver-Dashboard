@@ -793,7 +793,7 @@ export default function App() {
     }
     // Bump this whenever the backend changes the metric definition so a
     // previously cached report can never be presented as the new one.
-    return { action: "brand-sales", reportVersion: "order-items-v2-gross", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
+    return { action: "brand-sales", reportVersion: "order-items-v2-quality", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
   const loadCachedRows = useCallback(() => {
@@ -1390,13 +1390,14 @@ export default function App() {
   }
 
   function aggregate(rowSet) {
-    let sales = 0, units = 0, orders = 0;
+    let sales = 0, units = 0, orders = 0, unpricedUnits = 0;
     rowSet.forEach((r) => {
       units += r.total_units_sold || 0;
       orders += r.total_orders || 0;
       sales += salesInDisplay(r);
+      unpricedUnits += r.unpriced_units || 0;
     });
-    return { sales, units, orders };
+    return { sales, units, orders, unpricedUnits };
   }
 
   const brandRows = useMemo(
@@ -1679,6 +1680,11 @@ export default function App() {
         {rowsError && (
           <div className="error-banner"><AlertTriangle size={15} /> {rowsError}</div>
         )}
+        {!rowsLoading && selectedBrand === "ALL" && kpi.unpricedUnits > 0 && (
+          <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+            <AlertTriangle size={15} /> DataDoe returned {kpi.unpricedUnits.toLocaleString("en-US")} unit{kpi.unpricedUnits === 1 ? "" : "s"} with zero order value in this range. Total Sales may be understated until the upstream order data is completed.
+          </div>
+        )}
 
         <div className="kpi-grid">
           <div className="kpi-card">
@@ -1746,7 +1752,7 @@ export default function App() {
         </div>
 
         <div className="footer-note">
-          Total Sales is gross order value from DataDoe Order Line Items: product price plus item tax. This is the tax-inclusive value used when comparing the dashboard with Seller Central's Order Report. Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export.
+          Total Sales is DataDoe Order Line Items `item_price_value`, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export. If the warning above appears, DataDoe has returned units without an order value, so refresh again after its upstream order data is completed.
         </div>
       </div>
       )}
