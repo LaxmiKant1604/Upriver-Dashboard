@@ -181,6 +181,30 @@ const SKU_PL_AGGREGATIONS = [
 ];
 const SKU_PL_ROW_LIMIT = 50000;
 
+// ===== Keyword Rank & Share Tracker sources =====
+// Search Query Performance is Amazon Brand Analytics data at the exact
+// child-ASIN/query/period grain needed for organic-rank and share-of-query
+// monitoring. These tables are not default data sources, so the action below
+// turns an organisation-disabled response into an actionable setup message.
+const SQP_WEEKLY_SOURCE_ID = "81aa5b4cc248bb70de405b9ff9d51290b9232f84570d76ba2a1289b67b6595fb";
+const SQP_MONTHLY_SOURCE_ID = "df4160ff8e1add239172a69ebd6c8abfec7116ee4a17720983757b1b55599830";
+const SQP_COLUMNS = [
+  "date",
+  "child_asin",
+  "search_query",
+  "search_query_volume",
+  "search_query_total_impression_count",
+  "search_query_total_click_count",
+  "search_query_total_purchase_count",
+  "child_asin_impression_count",
+  "child_asin_click_count",
+  "child_asin_purchase_count",
+  "child_asin_organic_search_rank",
+];
+const SQP_ROW_LIMIT = 50000;
+const SQP_WEEKLY_LOOKBACK_DAYS = 84;
+const SQP_MONTHLY_LOOKBACK_DAYS = 365;
+
 // ===== FBA Shipment Plan sources (verified against api/v1/spec/data-scheme) =====
 // Per-ASIN unit sales. "Sales & Traffic by ASIN & Date" (401ffcd7e5) exposes
 // child_asin + total_units and is the report the Daily Reporting view already
@@ -344,6 +368,24 @@ async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, fro
   }
 
   return allRows;
+}
+
+function sqpDistinctPeriods(rows) {
+  return [...new Set(rows.map((row) => String(row.date || "")).filter(Boolean))].sort();
+}
+
+async function fetchSqpRows(apiKey, sourceId, sellerOrVendorIds, from, to) {
+  const rows = await fetchExportRows(
+    apiKey, sourceId, SQP_COLUMNS, sellerOrVendorIds, from, to, SQP_ROW_LIMIT,
+    { orderByColumn: "date", orderByDirection: "ASC" }
+  );
+  // A full result exactly at the cap is indistinguishable from a truncated one.
+  // Refuse to save a misleading keyword trend rather than silently dropping
+  // long-tail terms from the money-keyword watch list.
+  if (rows.length >= SQP_ROW_LIMIT) {
+    throw new Error(`Search Query Performance export reached the ${SQP_ROW_LIMIT.toLocaleString("en-US")} row cap. The Keyword Rank report was not saved because a partial keyword history would be misleading.`);
+  }
+  return rows;
 }
 
 function orderSalesByBrand(rows, catalogRows) {
@@ -989,6 +1031,108 @@ export default async function handler(req, res) {
       return;
     }
 
+    // Keyword Rank & Share Tracker: fetch the selected account's weekly SQP
+    // series. The client derives money keywords and every share/trend locally,
+    // so brand/ASIN/search/status filters never make another DataDoe request.
+    // New SQP connections commonly have only four weekly periods. When fewer
+    // than four arrive, use the longer monthly source; only report a baseline
+    // when neither cadence has two comparable periods.
+    if (action === "keyword-rank") {
+      const { ids, to } = req.query;
+      if (!ids || !to) {
+        res.status(400).json({ error: "Missing required params: ids, to" });
+        return;
+      }
+      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
+      if (sellerOrVendorIds.length !== 1) {
+        res.status(400).json({ error: "Keyword Rank requires exactly one selected account." });
+        return;
+      }
+      const end = String(to);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+        res.status(400).json({ error: "Invalid to date. Use YYYY-MM-DD." });
+        return;
+      }
+
+      let weeklyRows;
+      try {
+        weeklyRows = await fetchSqpRows(
+          apiKey, SQP_WEEKLY_SOURCE_ID, sellerOrVendorIds,
+          addDaysStr(end, -SQP_WEEKLY_LOOKBACK_DAYS), end
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/source is disabled for this organization/i.test(message)) {
+          res.status(424).json({ error: "Keyword Rank is disabled in DataDoe. In DataDoe, open Settings > Data tables and enable Search Query Performance (SQP) by ASIN (Weekly), then refresh this report again." });
+          return;
+        }
+        throw err;
+      }
+
+      const weeklyPeriods = sqpDistinctPeriods(weeklyRows);
+      let cadence = "weekly";
+      let rows = weeklyRows;
+      let periods = weeklyPeriods;
+      if (weeklyPeriods.length < 4) {
+        let monthlyRows;
+        try {
+          monthlyRows = await fetchSqpRows(
+            apiKey, SQP_MONTHLY_SOURCE_ID, sellerOrVendorIds,
+            addDaysStr(end, -SQP_MONTHLY_LOOKBACK_DAYS), end
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (/source is disabled for this organization/i.test(message)) {
+            res.status(424).json({ error: "Keyword Rank needs more SQP history, but the monthly SQP fallback is disabled in DataDoe. In DataDoe, open Settings > Data tables and enable Search Query Performance (SQP) by ASIN (Monthly), then refresh this report again." });
+            return;
+          }
+          throw err;
+        }
+        const monthlyPeriods = sqpDistinctPeriods(monthlyRows);
+        if (monthlyPeriods.length >= 2) {
+          cadence = "monthly";
+          rows = monthlyRows;
+          periods = monthlyPeriods;
+        } else {
+          cadence = "baseline";
+          // Prefer the fresher weekly observation; when it is empty use the
+          // monthly row so the user still gets an honest current baseline.
+          rows = weeklyRows.length ? weeklyRows : monthlyRows;
+          periods = sqpDistinctPeriods(rows);
+        }
+      }
+
+      const catalogRows = await fetchExportRows(
+        apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds,
+        addDaysStr(end, -365), end, CATALOG_ROW_LIMIT,
+        { orderByColumn: "child_asin", orderByDirection: "ASC" }
+      );
+      const products = [];
+      const seenAsins = new Set();
+      for (const row of catalogRows) {
+        const asin = String(row.child_asin || "").trim();
+        if (!asin || seenAsins.has(asin)) continue;
+        seenAsins.add(asin);
+        products.push({
+          asin,
+          name: String(row.product_name || "").trim() || null,
+          brand: String(row.product_brand || "").trim() || "Unassigned",
+        });
+      }
+
+      res.status(200).json({
+        accountId: sellerOrVendorIds[0],
+        cadence,
+        periods,
+        weeklyPeriodCount: weeklyPeriods.length,
+        rows,
+        products,
+        catalogBrands: catalogBrandNames(catalogRows),
+        retrievedAt: new Date().toISOString(),
+      });
+      return;
+    }
+
     // Content Change Alerts: one selected account only. Amazon sends these
     // near-real-time A+ / branded-item notifications without a stable payload
     // schema, so the server extracts ASINs and resolves them through the
@@ -1333,7 +1477,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }

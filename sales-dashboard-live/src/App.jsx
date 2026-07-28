@@ -73,6 +73,129 @@ function pickNum(row, keys) {
   return null;
 }
 
+/* ============================== KEYWORD RANK HELPERS ============================== */
+// SQP reports one child-ASIN/query/period row. These helpers retain the
+// source's query-total denominators while computing every share and trend in
+// the browser. This lets account/brand/ASIN/search/status changes stay local.
+function sqpNumber(value) { return Number(value) || 0; }
+function sqpRatio(numerator, denominator) { return denominator > 0 ? numerator / denominator : 0; }
+function sqpPercent(value) { return `${(Number(value || 0) * 100).toFixed(1)}%`; }
+function sqpSignedPoints(value) {
+  const points = Number(value || 0) * 100;
+  return `${points >= 0 ? "+" : ""}${points.toFixed(1)}pp`;
+}
+function sqpStatusMeta(key) {
+  return {
+    lost: { label: "Lost", tone: "bad", lever: "Check suppression, stock, and Buy Box" },
+    slipping: { label: "Slipping", tone: "bad", lever: "Confirm term in listing; add ad support" },
+    rising: { label: "Rising", tone: "good", lever: "Protect rank and scale ads" },
+    emerging: { label: "Emerging", tone: "warn", lever: "Index the term and test ads" },
+    stable: { label: "Stable", tone: "neutral", lever: "Monitor" },
+    baseline: { label: "Baseline", tone: "neutral", lever: "History is still building" },
+  }[key] || { label: "Stable", tone: "neutral", lever: "Monitor" };
+}
+function sqpStatusPriority(key) {
+  return ({ lost: 0, slipping: 1, emerging: 2, rising: 3, stable: 4, baseline: 5 })[key] ?? 6;
+}
+function sqpAverage(points, accessor) {
+  if (!points.length) return 0;
+  return points.reduce((sum, point) => sum + accessor(point), 0) / points.length;
+}
+function buildKeywordRows(data, selectedBrand) {
+  if (!data?.rows?.length) return [];
+  const productByAsin = new Map((data.products || []).map((product) => [product.asin, product]));
+  const grouped = new Map();
+  for (const row of data.rows) {
+    const asin = String(row.child_asin || "").trim();
+    const query = String(row.search_query || "").trim();
+    if (!asin || !query) continue;
+    const product = productByAsin.get(asin) || { asin, name: null, brand: "Unassigned" };
+    if (selectedBrand !== "ALL" && product.brand !== selectedBrand) continue;
+    const key = `${asin}|${query}`;
+    const current = grouped.get(key) || { asin, query, productName: product.name, brand: product.brand, byDate: new Map() };
+    const date = String(row.date || "");
+    if (!date) continue;
+    // A defensive merge protects share denominators if DataDoe ever emits a
+    // duplicate raw row for the same ASIN/query/period.
+    const point = current.byDate.get(date) || { date, volume: 0, totalImpressions: 0, totalClicks: 0, totalPurchases: 0, impressions: 0, clicks: 0, purchases: 0, rank: null };
+    point.volume = Math.max(point.volume, sqpNumber(row.search_query_volume));
+    point.totalImpressions = Math.max(point.totalImpressions, sqpNumber(row.search_query_total_impression_count));
+    point.totalClicks = Math.max(point.totalClicks, sqpNumber(row.search_query_total_click_count));
+    point.totalPurchases = Math.max(point.totalPurchases, sqpNumber(row.search_query_total_purchase_count));
+    point.impressions += sqpNumber(row.child_asin_impression_count);
+    point.clicks += sqpNumber(row.child_asin_click_count);
+    point.purchases += sqpNumber(row.child_asin_purchase_count);
+    const rank = sqpNumber(row.child_asin_organic_search_rank);
+    if (rank > 0) point.rank = point.rank === null ? rank : Math.min(point.rank, rank);
+    current.byDate.set(date, point);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].map((group) => {
+    const points = [...group.byDate.values()].sort((a, b) => a.date.localeCompare(b.date)).map((point) => ({
+      ...point,
+      impressionShare: sqpRatio(point.impressions, point.totalImpressions),
+      clickShare: sqpRatio(point.clicks, point.totalClicks),
+      purchaseShare: sqpRatio(point.purchases, point.totalPurchases),
+      conversionRate: sqpRatio(point.purchases, point.clicks),
+    }));
+    const totalPurchases = points.reduce((sum, point) => sum + point.purchases, 0);
+    const totalVolume = points.reduce((sum, point) => sum + point.volume, 0);
+    // Money keywords are terms that actually generated a purchase for this
+    // ASIN. This intentionally keeps the alert list short and actionable.
+    if (!totalPurchases || !totalVolume) return null;
+    const latest = points[points.length - 1];
+    const trendReady = data.cadence === "weekly" ? points.length >= 4 : data.cadence === "monthly" ? points.length >= 2 : false;
+    const windowSize = points.length >= 6 ? 3 : points.length >= 4 ? 2 : 1;
+    const recent = trendReady ? points.slice(-windowSize) : [];
+    const prior = trendReady ? points.slice(-windowSize * 2, -windowSize) : [];
+    const recentImpressionShare = sqpAverage(recent, (point) => point.impressionShare);
+    const priorImpressionShare = sqpAverage(prior, (point) => point.impressionShare);
+    const recentRank = sqpAverage(recent.filter((point) => point.rank !== null), (point) => point.rank);
+    const priorRank = sqpAverage(prior.filter((point) => point.rank !== null), (point) => point.rank);
+    const recentVolume = sqpAverage(recent, (point) => point.volume);
+    const priorVolume = sqpAverage(prior, (point) => point.volume);
+    const shareDelta = trendReady ? recentImpressionShare - priorImpressionShare : 0;
+    const rankDelta = trendReady && recentRank && priorRank ? recentRank - priorRank : 0;
+    const volumeGrowth = trendReady && priorVolume > 0 ? (recentVolume - priorVolume) / priorVolume : 0;
+    let status = "baseline";
+    if (trendReady) {
+      const shareCollapsed = latest.impressionShare <= 0.005 && priorImpressionShare >= 0.01;
+      const rankLost = latest.rank !== null && latest.rank >= 95 && priorRank > 0 && priorRank < 80;
+      const shareFalling = priorImpressionShare > 0 && recentImpressionShare < priorImpressionShare * 0.75;
+      const rankWorsening = rankDelta >= 5;
+      const shareRising = priorImpressionShare > 0 && recentImpressionShare > priorImpressionShare * 1.25;
+      const rankImproving = rankDelta <= -5;
+      const isEmerging = volumeGrowth >= 0.25 && latest.impressionShare < 0.03;
+      if (shareCollapsed || rankLost) status = "lost";
+      else if (shareFalling || rankWorsening) status = "slipping";
+      else if (isEmerging) status = "emerging";
+      else if (shareRising || rankImproving) status = "rising";
+      else status = "stable";
+    }
+    const averagePurchaseShare = sqpAverage(points, (point) => point.purchaseShare);
+    return {
+      asin: group.asin,
+      productName: group.productName,
+      brand: group.brand,
+      query: group.query,
+      points,
+      latest,
+      periods: points.length,
+      status,
+      statusMeta: sqpStatusMeta(status),
+      moneyScore: sqpAverage(points, (point) => point.volume) * averagePurchaseShare,
+      impressionShareDelta: shareDelta,
+      rankDelta,
+      volumeGrowth,
+      recentImpressionShare,
+      priorImpressionShare,
+      recentRank: recentRank || latest.rank,
+      priorRank: priorRank || null,
+      conversionRate: sqpRatio(totalPurchases, points.reduce((sum, point) => sum + point.clicks, 0)),
+    };
+  }).filter(Boolean);
+}
+
 /* ============================== FBA SHIPMENT PLAN HELPERS ============================== */
 // Turn one raw per-ASIN plan row + report metadata + the target-coverage input
 // into all derived planning metrics. Pure and local, so changing the target or
@@ -781,6 +904,17 @@ export default function App() {
   const [contentChangesSearch, setContentChangesSearch] = useState("");
   const [contentChangesType, setContentChangesType] = useState("ALL");
 
+  // Keyword Rank & Share Tracker: selected-account SQP snapshots are cached
+  // locally; the table's ASIN/search/status controls operate only on that data.
+  const [keywordRankData, setKeywordRankData] = useState(null);
+  const [keywordRankLoading, setKeywordRankLoading] = useState(false);
+  const [keywordRankError, setKeywordRankError] = useState(null);
+  const [keywordRankCachedAt, setKeywordRankCachedAt] = useState(null);
+  const [keywordRankSearch, setKeywordRankSearch] = useState("");
+  const [keywordRankAsin, setKeywordRankAsin] = useState("ALL");
+  const [keywordRankStatus, setKeywordRankStatus] = useState("ALL");
+  const [keywordRankSort, setKeywordRankSort] = useState({ key: "priority", dir: "asc" });
+
   const TODAY = todayStr();
 
   const applyAccounts = useCallback((body) => {
@@ -1100,6 +1234,52 @@ export default function App() {
   useEffect(() => {
     if (view === "contentchanges") loadCachedContentChanges();
   }, [view, loadCachedContentChanges]);
+
+  // Keyword Rank & Share Tracker: SQP data is large enough to use IndexedDB
+  // when available. Loading a cached account snapshot, changing brand, or
+  // filtering never calls DataDoe; only the shared header Refresh does.
+  const keywordRankParams = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return {
+      action: "keyword-rank", reportVersion: "keyword-rank-v1", ids: selectedAccountId, to: TODAY,
+    };
+  }, [selectedAccountId, TODAY]);
+
+  const applyKeywordRankData = useCallback((body, cachedAt) => {
+    setKeywordRankData(body);
+    setKeywordRankCachedAt(new Date(cachedAt));
+    if (body.accountId && Array.isArray(body.catalogBrands)) {
+      setCatalogBrands(body.catalogBrands);
+      setCatalogBrandsAccountId(body.accountId);
+    }
+    setKeywordRankAsin("ALL");
+    setKeywordRankError(null);
+  }, []);
+
+  const loadCachedKeywordRank = useCallback(async () => {
+    if (!keywordRankParams) { setKeywordRankData(null); return; }
+    const cached = await readLargeApiCache(keywordRankParams);
+    if (cached) applyKeywordRankData(cached.body, cached.cachedAt);
+    else {
+      setKeywordRankData(null);
+      setKeywordRankCachedAt(null);
+      setKeywordRankError("No cached Keyword Rank data for this account. Click refresh to fetch SQP data from DataDoe.");
+    }
+  }, [applyKeywordRankData, keywordRankParams]);
+
+  const fetchKeywordRank = useCallback(() => {
+    if (!keywordRankParams || keywordRankLoading) return;
+    setKeywordRankLoading(true);
+    setKeywordRankError(null);
+    cachedLargeApiGet(keywordRankParams, { force: true })
+      .then(({ body, cachedAt }) => applyKeywordRankData(body, cachedAt))
+      .catch((err) => setKeywordRankError(err.message))
+      .finally(() => setKeywordRankLoading(false));
+  }, [applyKeywordRankData, keywordRankLoading, keywordRankParams]);
+
+  useEffect(() => {
+    if (view === "keywordrank") loadCachedKeywordRank();
+  }, [view, loadCachedKeywordRank]);
 
   const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
@@ -1453,6 +1633,61 @@ export default function App() {
     };
   }, [contentChangesData]);
 
+  /* ===== Keyword Rank & Share Tracker derived data (all local, no refetch) ===== */
+  const keywordRankRows = useMemo(
+    () => buildKeywordRows(keywordRankData, selectedBrand),
+    [keywordRankData, selectedBrand]
+  );
+  const keywordRankAsins = useMemo(() => [...new Map(
+    keywordRankRows.map((row) => [row.asin, { asin: row.asin, name: row.productName }])
+  ).values()].sort((a, b) => String(a.name || a.asin).localeCompare(String(b.name || b.asin))), [keywordRankRows]);
+  const keywordRankStatusCounts = useMemo(() => {
+    const counts = { lost: 0, slipping: 0, rising: 0, emerging: 0, stable: 0, baseline: 0 };
+    keywordRankRows.forEach((row) => { counts[row.status] = (counts[row.status] || 0) + 1; });
+    return counts;
+  }, [keywordRankRows]);
+  const keywordRankFiltered = useMemo(() => {
+    const search = keywordRankSearch.trim().toLowerCase();
+    return keywordRankRows.filter((row) => {
+      if (keywordRankAsin !== "ALL" && row.asin !== keywordRankAsin) return false;
+      if (keywordRankStatus !== "ALL" && row.status !== keywordRankStatus) return false;
+      if (!search) return true;
+      return `${row.query} ${row.asin} ${row.productName || ""} ${row.brand || ""}`.toLowerCase().includes(search);
+    });
+  }, [keywordRankRows, keywordRankAsin, keywordRankStatus, keywordRankSearch]);
+  const keywordRankSorted = useMemo(() => {
+    const accessors = {
+      priority: (row) => sqpStatusPriority(row.status),
+      productName: (row) => String(row.productName || row.asin).toLowerCase(),
+      query: (row) => row.query.toLowerCase(),
+      volume: (row) => row.latest.volume,
+      impressionShare: (row) => row.latest.impressionShare,
+      shareDelta: (row) => row.impressionShareDelta,
+      rank: (row) => row.latest.rank ?? 101,
+      rankDelta: (row) => row.rankDelta,
+      conversion: (row) => row.conversionRate,
+      moneyScore: (row) => row.moneyScore,
+      status: (row) => row.statusMeta.label,
+    };
+    const accessor = accessors[keywordRankSort.key] || accessors.priority;
+    return [...keywordRankFiltered].sort((a, b) => {
+      const av = accessor(a), bv = accessor(b);
+      const compare = typeof av === "string" || typeof bv === "string" ? String(av).localeCompare(String(bv)) : av - bv;
+      return keywordRankSort.dir === "asc" ? compare : -compare;
+    });
+  }, [keywordRankFiltered, keywordRankSort]);
+  const keywordRankStats = useMemo(() => ({
+    moneyKeywords: keywordRankRows.length,
+    atRisk: keywordRankStatusCounts.lost + keywordRankStatusCounts.slipping,
+    emerging: keywordRankStatusCounts.emerging,
+    stable: keywordRankStatusCounts.stable + keywordRankStatusCounts.rising,
+  }), [keywordRankRows.length, keywordRankStatusCounts]);
+  const setKeywordRankSortKey = useCallback((key) => {
+    setKeywordRankSort((prev) => prev.key === key
+      ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+      : { key, dir: ["priority", "productName", "query", "status"].includes(key) ? "asc" : "desc" });
+  }, []);
+
   function rowCurrency(r) {
     return r.currency || accountById[r.seller_or_vendor_id]?.currency || "INR";
   }
@@ -1661,6 +1896,10 @@ export default function App() {
               <Wallet size={18} />
               <span className="sb-nav-label">SKU P&amp;L Analyzer</span>
             </button>
+            <button className={"sb-nav-item" + (view === "keywordrank" ? " active" : "")} title="Keyword Rank" onClick={() => { setView("keywordrank"); setMobileOpen(false); }}>
+              <TrendingUp size={18} />
+              <span className="sb-nav-label">Keyword Rank</span>
+            </button>
             <button className={"sb-nav-item" + (view === "contentchanges" ? " active" : "")} title="Content Change Alerts" onClick={() => { setView("contentchanges"); setMobileOpen(false); }}>
               <BellRing size={18} />
               <span className="sb-nav-label">Content Alerts</span>
@@ -1721,11 +1960,11 @@ export default function App() {
         <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
-            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
+            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "keywordrank" ? keywordRankCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
             return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
           })()}
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "contentchanges" ? fetchContentChanges : fetchRows} disabled={(view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "contentchanges" && contentChangesLoading)} title="Refresh selected account">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
+          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows} disabled={(view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading)} title="Refresh selected account">
+            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>
       </div>
@@ -2337,6 +2576,113 @@ export default function App() {
       </div>
       )}
 
+      {view === "keywordrank" && (
+      <div className="container skupl-page keyword-rank-page">
+        <div className="controls-bar">
+          <div>
+            <div className="page-title">Keyword Rank &amp; Share</div>
+            <div className="page-sub">Money keywords for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` / ${selectedBrand}`} · organic rank supports the share-of-query signal</div>
+          </div>
+        </div>
+
+        {keywordRankError && <div className="error-banner"><AlertTriangle size={15} /> {keywordRankError}</div>}
+
+        {!keywordRankData && !keywordRankError && (
+          <div className="panel recon-empty"><TrendingUp size={22} /><div>{keywordRankLoading ? "Loading Search Query Performance from DataDoe..." : "Keyword Rank data is loading from cache..."}</div></div>
+        )}
+
+        {keywordRankData && <>
+          <div className="recon-freshness">
+            <span className="live-dot" style={{ position: "relative", top: 1 }} />
+            <span>{keywordRankData.cadence === "weekly" ? "Weekly" : keywordRankData.cadence === "monthly" ? "Monthly fallback" : "Baseline"} SQP through <strong>{keywordRankData.periods?.length ? fmtDateHuman(keywordRankData.periods[keywordRankData.periods.length - 1]) : "unavailable"}</strong></span>
+            <span className="plan-fresh-sep">·</span>
+            <span>cached {keywordRankCachedAt?.toLocaleString()}</span>
+            <span className="plan-fresh-sep">·</span>
+            <span>{keywordRankData.periods?.length || 0} comparable period{keywordRankData.periods?.length === 1 ? "" : "s"}</span>
+          </div>
+
+          {keywordRankData.cadence === "baseline" && (
+            <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+              <AlertTriangle size={15} /> Not enough SQP history for a trend yet ({keywordRankData.periods?.length || 0} period{keywordRankData.periods?.length === 1 ? "" : "s"}; weekly trend needs 4). Current share and rank are shown as a baseline. Refresh again as SQP history builds.
+            </div>
+          )}
+
+          <div className="plan-stat-row">
+            <div className="plan-stat"><div className="plan-stat-label">Money Keywords</div><div className="plan-stat-value mono">{keywordRankStats.moneyKeywords.toLocaleString("en-US")}</div></div>
+            <div className="plan-stat"><div className="plan-stat-label">At Risk</div><div className="plan-stat-value mono">{keywordRankStats.atRisk.toLocaleString("en-US")}</div></div>
+            <div className="plan-stat"><div className="plan-stat-label">Emerging</div><div className="plan-stat-value mono">{keywordRankStats.emerging.toLocaleString("en-US")}</div></div>
+            <div className="plan-stat"><div className="plan-stat-label">Holding / Rising</div><div className="plan-stat-value mono">{keywordRankStats.stable.toLocaleString("en-US")}</div></div>
+          </div>
+
+          <div className="panel skupl-table-panel" style={{ marginTop: 14, padding: 0, overflow: "hidden" }}>
+            <div className="skupl-toolbar keyword-rank-toolbar">
+              <label className="plan-field skupl-search">
+                <span className="plan-field-label">Search</span>
+                <span className="plan-search-wrap"><Search size={14} /><input value={keywordRankSearch} onChange={(event) => setKeywordRankSearch(event.target.value)} placeholder="Keyword, ASIN, product, or brand" /></span>
+              </label>
+              <label className="plan-field">
+                <span className="plan-field-label">ASIN</span>
+                <select value={keywordRankAsin} onChange={(event) => setKeywordRankAsin(event.target.value)}>
+                  <option value="ALL">All ASINs</option>
+                  {keywordRankAsins.map((item) => <option key={item.asin} value={item.asin}>{item.name ? `${item.name} · ${item.asin}` : item.asin}</option>)}
+                </select>
+              </label>
+              <label className="plan-field">
+                <span className="plan-field-label">Signal</span>
+                <select value={keywordRankStatus} onChange={(event) => setKeywordRankStatus(event.target.value)}>
+                  <option value="ALL">All signals</option>
+                  {["lost", "slipping", "rising", "emerging", "stable", "baseline"].map((status) => <option key={status} value={status}>{sqpStatusMeta(status).label} ({keywordRankStatusCounts[status] || 0})</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="plan-scroll">
+              <table className="plan-table keyword-rank-table">
+                <thead>
+                  <tr>
+                    <PlanTh className="pt-id" label="Product / ASIN" col="productName" sort={keywordRankSort} onSort={setKeywordRankSortKey} align="left" />
+                    <PlanTh label="Keyword" col="query" sort={keywordRankSort} onSort={setKeywordRankSortKey} align="left" />
+                    <PlanTh label="Query Vol." col="volume" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Impr. Share" col="impressionShare" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Share Trend" col="shareDelta" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Organic Rank" col="rank" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Rank Trend" col="rankDelta" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Your CVR" col="conversion" sort={keywordRankSort} onSort={setKeywordRankSortKey} />
+                    <PlanTh label="Signal" col="status" sort={keywordRankSort} onSort={setKeywordRankSortKey} align="left" />
+                    <PlanTh label="Suggested Action" col="priority" sort={keywordRankSort} onSort={setKeywordRankSortKey} align="left" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {keywordRankSorted.map((row) => (
+                    <tr key={`${row.asin}|${row.query}`} className={row.status === "lost" || row.status === "slipping" ? "plan-restock" : ""}>
+                      <td className="pt-id">
+                        <div className="pt-name" title={row.productName || row.asin}>{row.productName || "(no product name)"}</div>
+                        <div className="pt-meta mono">{row.asin}</div>
+                        {row.brand && <div className="pt-brand">{row.brand}</div>}
+                      </td>
+                      <td className="keyword-query" title={row.query}>{row.query}</td>
+                      <td className="mono">{nInt(row.latest.volume)}</td>
+                      <td className="mono">{sqpPercent(row.latest.impressionShare)}</td>
+                      <td className={"mono " + (row.impressionShareDelta < 0 ? "keyword-bad" : row.impressionShareDelta > 0 ? "keyword-good" : "")}>{row.status === "baseline" ? "—" : sqpSignedPoints(row.impressionShareDelta)}</td>
+                      <td className="mono">{row.latest.rank === null ? "—" : Math.round(row.latest.rank)}</td>
+                      <td className={"mono " + (row.rankDelta > 0 ? "keyword-bad" : row.rankDelta < 0 ? "keyword-good" : "")}>{row.status === "baseline" || !row.rankDelta ? "—" : `${row.rankDelta > 0 ? "+" : ""}${row.rankDelta.toFixed(1)}`}</td>
+                      <td className="mono">{sqpPercent(row.conversionRate)}</td>
+                      <td><span className={"pt-badge sku-badge-" + row.statusMeta.tone}>{row.statusMeta.label}</span></td>
+                      <td className="keyword-lever">{row.statusMeta.lever}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {!keywordRankSorted.length && <div className="empty-note" style={{ padding: "14px 16px" }}>{keywordRankRows.length ? "No money keywords match these filters." : "No converting SQP keywords were found for this account and brand in the available history."}</div>}
+          </div>
+
+          <div className="footer-note">
+            Search Query Performance comes from DataDoe <code>Search Query Performance (SQP) by ASIN</code>. A money keyword is a query where the selected ASIN actually generated purchases; alerts are ranked by query volume and purchase share. Impression Share = child-ASIN impressions ÷ all-ASIN query impressions. Organic rank is supporting context only: query share is the primary visibility signal. Weekly mode compares the latest 2–3 periods with the prior 2–3 periods; when fewer than four weekly periods exist, the report uses monthly SQP if available, otherwise shows an honest baseline. Lost/Slipping: check listing term coverage, stock, Buy Box, suppression, and ad support. Rising: protect and scale. Emerging: test indexing and ads. All filters and sorting are local; only Refresh calls DataDoe.
+          </div>
+        </>}
+      </div>
+      )}
+
       {cogsEditRow && (
         <div className="cogs-modal-backdrop" role="presentation" onMouseDown={closeCogsEditor}>
           <section className="cogs-modal" role="dialog" aria-modal="true" aria-labelledby="cogs-modal-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -2639,6 +2985,11 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .pt-badge-ok{ background:#E6F2EB; color:var(--pos); }
 .plan-table tfoot td{ position:sticky; bottom:0; background:#F1F2F6; font-weight:700; border-top:1px solid var(--border); border-bottom:none; z-index:1; }
 .plan-table tfoot td.pt-id{ background:#F1F2F6; z-index:2; }
+.keyword-rank-table{ min-width:1280px; }
+.keyword-rank-table .keyword-query{ text-align:left; white-space:normal; min-width:190px; max-width:280px; line-height:1.35; }
+.keyword-rank-table .keyword-lever{ text-align:left; white-space:normal; min-width:210px; max-width:270px; color:var(--ink-soft); line-height:1.35; }
+.keyword-bad{ color:#D94141; font-weight:700; }
+.keyword-good{ color:#069669; font-weight:700; }
 
 /* ---- Amazon Reconciliation ---- */
 .reconciliation-page{ padding-bottom:30px; }
