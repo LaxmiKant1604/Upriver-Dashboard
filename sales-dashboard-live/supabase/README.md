@@ -14,14 +14,27 @@ and Development:
 & "C:\Users\laxmi\AppData\Roaming\npm\vercel.cmd" integration add supabase --name upriver-shared-data --metadata region=bom1 --metadata publicEnvVarPrefix=VITE_ --environment production --environment preview --environment development --format=json
 ```
 
-The Vercel Marketplace must first be accepted by an authorised team owner.
-Vercel injects `SUPABASE_URL`, `SUPABASE_SECRET_KEY`,
+The Vercel Marketplace terms must first be accepted by an authorised team
+owner. Vercel injects `SUPABASE_URL`, `SUPABASE_SECRET_KEY`,
 `SUPABASE_PUBLISHABLE_KEY`, and their `VITE_` public equivalents. Never put
 `SUPABASE_SECRET_KEY` in a Vite variable, committed file, or browser request.
 
 ## Apply the database schema
 
-After the resource exists, open its Supabase dashboard through Vercel and run
+After the resource exists, apply all versioned migrations from the app folder:
+
+```powershell
+& "C:\Program Files\nodejs\npm.cmd" run db:migrate
+```
+
+The runner reads the root `.env.local` created by `vercel integration add`,
+uses `POSTGRES_URL`, and records completed files in
+`public.app_schema_migrations`. It prints only migration/table names, never
+database credentials. The Vercel Marketplace pooler uses encrypted TLS; the
+runner selects its `no-verify` compatibility mode because the local Windows
+Node certificate store does not recognise the pooler's chain. This affects
+only this direct migration connection, not deployed dashboard requests. You
+can alternatively run
 `migrations/20260728_shared_dashboard.sql` in the Supabase SQL editor. Then
 verify the following tables exist:
 
@@ -42,6 +55,8 @@ too large for a practical JSON row, such as reconciliation exports.
 6. Move large reports to the private Storage bucket and add the controlled ads
    history sync.
 
-Until these steps are implemented, the dashboard intentionally continues to
-use the existing browser cache. No browser may call DataDoe or Supabase with a
-secret key.
+The `upriver-shared-data` resource was provisioned in Mumbai on 2026-07-28
+and the first migration was applied successfully. Until the report migration
+steps are implemented, the dashboard intentionally continues to use the
+existing browser cache. No browser may call DataDoe or Supabase with a secret
+key.
