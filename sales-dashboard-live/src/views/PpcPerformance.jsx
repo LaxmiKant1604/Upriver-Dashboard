@@ -249,7 +249,7 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
         ]} />
 
         {data.totalSalesUnavailable && (
-          <Notice tone="warn">TACoS is unavailable because the total-sales export failed: {data.totalSalesUnavailable}. Every advertising figure above is unaffected — it comes from the saved Ads history.</Notice>
+          <Notice tone="warn">TACoS is unavailable: {data.totalSalesUnavailable}. Every advertising figure above is unaffected — it comes from the saved Ads history.</Notice>
         )}
 
         <PriorityActions

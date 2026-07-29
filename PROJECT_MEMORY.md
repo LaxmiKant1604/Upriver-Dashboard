@@ -613,7 +613,8 @@ Review fixed the following correctness risks before merge:
 - PPC rollups now include currency in their identity, so a campaign/ASIN/target
   or search term reported in multiple currencies never has its money or ratios
   combined. Account-wide PPC KPIs and TACoS are intentionally unavailable for a
-  multi-currency scope rather than fabricated.
+  multi-currency scope rather than fabricated; the UI labels this distinction
+  accurately instead of describing it as an export failure.
 - Priority Feed uses campaign-level PPC insights only. Search-term, target and
   ASIN views overlap that campaign spend and remain drill-down views, so adding
   them to the feed would double-count waste.
