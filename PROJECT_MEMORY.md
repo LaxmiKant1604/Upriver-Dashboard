@@ -251,7 +251,7 @@ Public org: https://github.com/Deltologic. Two repos are the most useful referen
 
 - There is also a hosted MCP server (`Deltologic/datadoe-mcp`, base `https://mcp.datadoe.com/mcp/v1`) exposing the same data as MCP tools — an alternative to the REST exports flow if we ever want tool-based access.
 
-## Dashboard authentication and account access (implemented 2026-07-29; deployment pending)
+## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
 ### What is implemented
 
@@ -297,6 +297,13 @@ Vercel Production for invitation redirects. Supabase Auth settings showed
 email signup enabled and email confirmation enabled on 2026-07-29. The
 production dependency audit after adding `@supabase/supabase-js` found zero
 production vulnerabilities; do not run `npm audit fix --force` casually.
+
+**Deployment verification:** feature commit `de5327e` deployed as
+`https://upriver-dashboard-m6rs943xe-laxmikant1604s-projects.vercel.app` and
+is live at `https://upriverdashboard.vercel.app`. Production homepage returned
+HTTP 200; a request to `/api/datadoe?action=accounts` without a Supabase access
+token returned HTTP 401 `Please sign in to access the dashboard.` This confirms
+the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
