@@ -253,6 +253,71 @@ Public org: https://github.com/Deltologic. Two repos are the most useful referen
 
 ## Amazon accounts inventory
 
+## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)
+
+The three requested Amazon Ads reports now have a server-side, cache-first
+foundation. The code is ready to deploy and the Supabase migration has already
+been applied to the production `upriver-shared-data` database.
+
+- **Campaign performance**: `08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c`.
+  This is persisted at campaign/day grain and also upserts the compact
+  `ad_daily_metrics` table used by Daily Reporting, so saved campaign metrics
+  can be read without another DataDoe advertising export.
+- **ASIN performance**: `d0017e92fb089c2c8c3fe65f81d08666ecb4fe937ffbce9969ce2fc7d28c805c`.
+  This is persisted at its native ASIN/campaign/ad/day grain.
+- **Keyword Targeting performance**: `bbba3d213ac78ccbaf22cfa68eecb3f475641f49da26d51d1ac36446310051e3`.
+  This is persisted at its native targeting/keyword/campaign/ad-group/day
+  grain, retaining `ad_campaign_type` so SP/SB/SD are not mixed blindly.
+
+### Automation behavior
+
+- `sales-dashboard-live/api/ads-sync.js` discovers the authoritative DataDoe
+  account list every scheduled run. Existing accounts and accounts connected in
+  the future are included automatically; no account list is hard-coded.
+- Supabase tables `ads_daily_source_rows` and `ads_sync_state` were created by
+  migration `20260729_automated_ads_sync.sql`. Upserts use each report's
+  natural dimensions plus account/marketplace/date, so daily and monthly
+  re-fetches correct attribution instead of double-counting it.
+- Initial history is imported once per account/source: 56 days for campaign and
+  targeting, 60 days for ASIN. Later runs re-fetch the latest 21-day correction
+  window daily and the last 49 days about once every 25 days.
+- A hard 50,000-row export cap is never accepted as complete: the worker splits
+  a date range and retries smaller windows. DataDoe calls are spaced at least
+  ~550 ms and retry HTTP 429 responses to respect the organization limit.
+- A database lock prevents overlapping work for the same country/source scope.
+  `CRON_SECRET` is stored only in Vercel Production and protects every cron
+  endpoint; it must never be copied into source, docs, screenshots, or git.
+
+### Country schedules (all cron expressions are UTC)
+
+Each source gets its own bounded job so a large ASIN/targeting export cannot
+block the compact campaign export. Vercel Hobby can run up to 100 daily jobs,
+but has hourly (up to 59 minute) scheduling precision.
+
+| Marketplace scope | Campaign | ASIN | Targeting | Intended local morning |
+| --- | --- | --- | --- | --- |
+| India (`IN`) | 00:30 UTC | 01:30 UTC | 02:30 UTC | approximately 06:00 / 07:00 / 08:00 IST |
+| US + Canada (`US`, `CA`) | 10:00 UTC | 11:00 UTC | 12:00 UTC | approximately 06:00 / 07:00 / 08:00 US Eastern during daylight saving |
+| Australia (`AU`) | 20:00 UTC | 21:00 UTC | 22:00 UTC | approximately 06:00 / 07:00 / 08:00 AEST |
+| Other future countries | 06:00 UTC | 07:00 UTC | 08:00 UTC | fallback; not guaranteed 06:00 local |
+
+The application chooses country membership dynamically. The scheduled UTC
+times are intentionally documented as *approximate*: Vercel Hobby may invoke
+any time during the requested hour and does not provide DST-aware local-time
+scheduling. A Vercel Pro/external timezone-aware scheduler is required if
+exact 06:00 local time becomes a business requirement.
+
+### Current implementation status
+
+- Supabase migration applied successfully and verified: the new tables are
+  present alongside the existing dashboard tables.
+- Code, Vercel cron configuration, and protected secret are ready; deploy,
+  production cron registration, and a small live country-worker validation are
+  the remaining tasks for this change.
+- The existing browser report cache remains in place. New Ads data is shared
+  server-side now; other report families will be migrated to shared Supabase
+  snapshots incrementally, using the same no-automatic-DataDoe-fetch rule.
+
 - 15 total accounts were previously observed through DataDoe.
 - Marketplace count observed: IN (7), US (5), AU (1), CA (1), plus 1 US-marketplace account labelled "AU" in DataDoe data.
 - Accounts with Amazon Ads connected: Indya Store IN, Haven&Hue US, JustHuman IN, Sashaa World IN, AAKRITI ART CREATIONS IN.

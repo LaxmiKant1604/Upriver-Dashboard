@@ -20,6 +20,8 @@
 // https://api.datadoe.com/api/v1/docs for the correct path and let me know
 // what you find — it's a one-line fix here.
 
+import { getAdDailyMetrics, isSupabaseConfigured } from "./supabase.js";
+
 const BASE = "https://api.datadoe.com/api/v1";
 
 // Verified DataDoe REST details:
@@ -936,17 +938,34 @@ export default async function handler(req, res) {
       );
       const rows = normalizeDailySalesRows(salesRaw);
       for (const r of rows) r.total_units_sold = r.total_units;
-      const adRaw = await fetchExportRows(
-        apiKey,
-        ADS_SOURCE_ID,
-        ADS_COLUMNS,
-        sellerOrVendorIds,
-        from,
-        to,
-        DAILY_ROW_LIMIT,
-        { groupBy: ADS_GROUP_BY, aggregations: ADS_AGGREGATIONS }
-      );
-      const ads = normalizeAdRows(adRaw);
+      // The scheduled Ads worker owns campaign data. Reading its saved
+      // upserts avoids another DataDoe export whenever a user opens or
+      // refreshes Daily Reporting. Keep a REST fallback until the first
+      // scheduled seed has completed for an existing deployment.
+      let ads;
+      if (isSupabaseConfigured()) {
+        const savedAds = await getAdDailyMetrics(sellerOrVendorIds[0], from, to);
+        ads = normalizeAdRows(savedAds.map((row) => ({
+          date: row.metric_date,
+          seller_or_vendor_id: sellerOrVendorIds[0],
+          currency: row.currency,
+          ad_sales: row.ad_sales,
+          ad_spend: row.ad_spend,
+          ad_clicks: row.ad_clicks,
+        })));
+      } else {
+        const adRaw = await fetchExportRows(
+          apiKey,
+          ADS_SOURCE_ID,
+          ADS_COLUMNS,
+          sellerOrVendorIds,
+          from,
+          to,
+          DAILY_ROW_LIMIT,
+          { groupBy: ADS_GROUP_BY, aggregations: ADS_AGGREGATIONS }
+        );
+        ads = normalizeAdRows(adRaw);
+      }
       mergeSalesAndAds(rows, ads);
       res.status(200).json({ rows, brandFiltered: false });
       return;

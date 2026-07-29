@@ -111,10 +111,12 @@ For the planned Supabase ads history:
 The currently configured campaign source is
 `08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c`.
 
-## Planned shared sync behavior
+## Implemented shared sync behavior (2026-07-29)
 
-This is the required implementation behavior; it is not active in the
-dashboard yet.
+The scheduled worker is implemented in `api/ads-sync.js`; its migration is
+`supabase/migrations/20260729_automated_ads_sync.sql`. It persists Campaign,
+ASIN, and Keyword Targeting daily data server-side. The Vercel cron deployment
+and first production run are the remaining operational steps.
 
 1. **Initial seed:** a controlled server job exports the initial window for a
    selected account/source (for example, 56 days for Campaign or Ad Group
@@ -131,10 +133,11 @@ dashboard yet.
    campaign + campaign type + currency. The database executes `INSERT ... ON
    CONFLICT ... DO UPDATE`, replacing metrics and `source_refreshed_at` for the
    same key. It never double-counts spend, sales, clicks, or orders.
-5. **Dashboard reads Supabase:** users see the saved rows for their selected
-   account/date range. A manual refresh requests a single controlled account
-   sync and a database lock prevents another user from starting the same sync
-   concurrently. Browsing/filtering never calls DataDoe.
+5. **Daily Reporting ads reads Supabase:** campaign totals are also upserted to
+   `ad_daily_metrics`, which `action=daily` reads rather than making a new Ads
+   export. The browser's existing cache-first behavior remains unchanged.
+   Other report families continue to migrate to shared snapshots incrementally;
+   browsing/filtering must never create an uncontrolled DataDoe export.
 
 For a typical 21-day daily table, a day is refreshed every day while it stays
 inside that rolling window; it is also included in the next monthly 49-day
