@@ -35,6 +35,27 @@ when a new connection can initially backfill only 56 or 60 days.
 | Ad Group Performance | `amazon_ads_by_ad_group_by_date` | 56 days | 21 days | 49 days monthly |
 | Ad Purchased Products | `amazon_ads_purchased_products` | 60 days | 21 days | 49 days monthly |
 
+## Ad-product coverage warning
+
+Do not treat every Amazon Ads table as SP + SB + SD automatically. Verified
+from the DataDoe source dependencies on 2026-07-29:
+
+- **Keyword Targeting Performance**
+  (`amazon_ads_targeting_by_campaign_by_date`) includes **Sponsored Products
+  (SP), Sponsored Brands (SB), and Sponsored Display (SD)**. Its underlying
+  sources are `raw_ads_api_report_targeting_sp`,
+  `raw_ads_api_report_legacy_targeting_sb_all`, and
+  `raw_ads_api_report_targeting_sd`.
+- **Search Term Performance (Ads)**
+  (`amazon_ads_search_terms_by_campaign_by_date`) includes **SP and SB only**.
+  Its `ad_campaign_type` field explicitly documents `SPONSORED_BRANDS or
+  SPONSORED_PRODUCTS`; it has no SD source dependency. Do not describe a
+  Search-Term report as all-product Ads coverage or use it to assess SD search
+  queries.
+
+Always retain/filter `ad_campaign_type` in a combined PPC report so users can
+see which ad products contributed to the totals.
+
 ## Continuous configuration and Marketing Stream reports
 
 These have `CONTINUOUS` fetch metadata, not a stated number of historical days:
