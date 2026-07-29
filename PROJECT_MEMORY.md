@@ -318,10 +318,11 @@ exact 06:00 local time becomes a business requirement.
   in code: server-only helpers live under `lib/server/`, and one dynamic
   `api/cron/[scope].js` function serves all 12 scheduled country/source paths.
   Do not recreate one API file per schedule on this Hobby project.
-- **Production deployment is live:** commit `a8a3fb7` deployed as
-  `https://upriver-dashboard-avtu59toz-laxmikant1604s-projects.vercel.app`
-  and is aliased to `https://upriverdashboard.vercel.app`. Vercel API metadata
-  confirms `READY`, alias assigned, and exactly **12** registered cron jobs.
+- **Production deployment is live:** the scheduler code from commit `a8a3fb7`
+  is live through the stable alias `https://upriverdashboard.vercel.app`.
+  Vercel API metadata confirms `READY`, alias assigned, and exactly **12**
+  registered cron jobs. The latest deployment record is documentation commit
+  `6824110`; it carries the same scheduler code.
 - Production health check returned HTTP 200. A direct request without the
   secret correctly returned HTTP 401, proving the cron route is not public.
   Vercel supplies the stored `CRON_SECRET` authorization header to scheduled
