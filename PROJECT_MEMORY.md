@@ -295,6 +295,23 @@ window. Keep currency separate, use shared Account/Brand scope, read Supabase
 snapshots first, and make external DataDoe refreshes controlled rather than
 per-browser.
 
+**Approved next-report roadmap (2026-07-29, planning):** user selected six
+new read-only modules: PPC Performance & Wasted Spend, Returns & Refund
+Leakage, Sales Movers, Listing Health / Suppressed Listings, Buy Box Loss, and
+Listing & Search Optimizer. Build in phased, independently verified commits:
+first shared insight/alert primitives plus Sales Movers, Listing Health and
+Buy Box; then Returns; then PPC from persisted Ads data; then Listing/Search
+Optimizer; then an optional cross-report priority feed. Every module must use
+the existing global Account/Brand header scope, server-enforced permissions,
+shared Supabase snapshot/cache-first behavior, explicit refresh only, and
+mobile-safe tables. The requested "AI" experience means evidence-bound,
+deterministic insights: severity, money/revenue at risk, named contributing
+metrics, data freshness/confidence, and a recommended action. Do not generate
+unsupported claims or use any Amazon write action without a later explicit
+approval. Claude/Codex must read each referenced DataDoe `SKILL.md` and the
+data scheme before implementation, update this memory after every stage, run a
+senior code review, deploy only after source-level and browser-level checks.
+
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
 ### What is implemented
