@@ -1,0 +1,419 @@
+// Focused tests for the Insight Engine.
+//
+// These cover the parts that are easy to get subtly wrong and expensive to get
+// wrong in front of a user: the exactness of the sales decomposition, the
+// refusal to average ratios, the "never claim an unevidenced cause" rule, the
+// ranking, the dedupe, and the CSV formula-injection guard.
+//
+// Run with: npm run test:insights
+
+import assert from "node:assert/strict";
+
+import {
+  buildBuyBoxRows,
+  buildListingHealthRows,
+  buildSalesMoversRows,
+  buildSalesMoversInsights,
+  buildBuyBoxInsights,
+  decomposeSalesChange,
+  dedupeInsights,
+  insightExportRows,
+  makeInsight,
+  salesMoversCompletenessWarning,
+  sortInsights,
+} from "../src/lib/insights.js";
+import { csvCell, csvText } from "../src/lib/csv.js";
+import { fmtMoney, nInt, ratio } from "../src/lib/format.js";
+
+let passed = 0;
+function test(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    console.log(`  ok  ${name}`);
+  } catch (error) {
+    console.error(`FAIL  ${name}`);
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}
+
+console.log("Insight Engine");
+
+/* ---------- decomposition ---------- */
+
+test("sales decomposition sums exactly to the sales change", () => {
+  const cases = [
+    [{ sessions: 1200, units: 90, sales: 4500 }, { sessions: 1000, units: 100, sales: 5200 }],
+    [{ sessions: 10, units: 1, sales: 19.99 }, { sessions: 400, units: 40, sales: 812.4 }],
+    [{ sessions: 7777, units: 1234, sales: 98765.43 }, { sessions: 1, units: 1, sales: 1 }],
+  ];
+  for (const [recent, prior] of cases) {
+    const parts = decomposeSalesChange(recent, prior);
+    assert.ok(parts, "expected a decomposition");
+    const total = parts.traffic + parts.conversion + parts.price;
+    const actual = recent.sales - prior.sales;
+    // Floating point only, not a tolerance for a wrong formula.
+    assert.ok(Math.abs(total - actual) < 1e-6, `parts ${total} != change ${actual}`);
+  }
+});
+
+test("decomposition refuses to attribute when a denominator is missing", () => {
+  assert.equal(decomposeSalesChange({ sessions: 0, units: 0, sales: 0 }, { sessions: 100, units: 10, sales: 500 }), null);
+  assert.equal(decomposeSalesChange({ sessions: 100, units: 10, sales: 500 }, { sessions: 100, units: 0, sales: 0 }), null);
+});
+
+/* ---------- Sales Movers ---------- */
+
+const moversData = {
+  accountId: "acct-1",
+  salesLatestDate: "2026-07-25",
+  lagDays: 4,
+  sourceLabel: "Sales & Traffic by ASIN & Date",
+  dataUnavailable: false,
+  inventoryAvailable: true,
+  inventorySnapshotDate: "2026-07-29",
+  windows: { recent: { from: "2026-07-19", to: "2026-07-25" }, prior: { from: "2026-07-12", to: "2026-07-18" } },
+  currencies: ["INR"],
+  rows: [
+    {
+      asin: "B001", productName: "Falling ASIN", brand: "Alpha",
+      recent: { sales: 4000, units: 80, orders: 78, sessions: 1000, pageViews: 1200 },
+      prior: { sales: 8000, units: 160, orders: 155, sessions: 2000, pageViews: 2400 },
+      ads: { recentSpend: 100, recentSales: 300, priorSpend: 400, priorSales: 1200 },
+      inventory: { available: 50, inbound: 0, daysOfSupply: 12, unitsShippedT30: 300 },
+    },
+    {
+      asin: "B002", productName: "Stocked out ASIN", brand: "Alpha",
+      recent: { sales: 2000, units: 40, orders: 40, sessions: 500, pageViews: 600 },
+      prior: { sales: 2100, units: 42, orders: 42, sessions: 520, pageViews: 640 },
+      ads: { recentSpend: 0, recentSales: 0, priorSpend: 0, priorSales: 0 },
+      inventory: { available: 0, inbound: 0, daysOfSupply: 0, unitsShippedT30: 120 },
+    },
+    {
+      asin: "B003", productName: "Other brand", brand: "Beta",
+      recent: { sales: 900, units: 9, orders: 9, sessions: 300, pageViews: 320 },
+      prior: { sales: 300, units: 3, orders: 3, sessions: 100, pageViews: 110 },
+      ads: { recentSpend: 10, recentSales: 90, priorSpend: 5, priorSales: 20 },
+      inventory: { available: 80, inbound: 20, daysOfSupply: 40, unitsShippedT30: 30 },
+    },
+  ],
+};
+
+test("the shared header brand filter is applied locally", () => {
+  assert.equal(buildSalesMoversRows(moversData, "ALL").length, 3);
+  const alpha = buildSalesMoversRows(moversData, "Alpha");
+  assert.equal(alpha.length, 2);
+  assert.ok(alpha.every((row) => row.brand === "Alpha"));
+});
+
+test("conversion and price are recomputed from totals, never averaged", () => {
+  const [row] = buildSalesMoversRows(moversData, "ALL");
+  assert.equal(row.cvrRecent, 80 / 1000);
+  assert.equal(row.aspRecent, 4000 / 80);
+  // Traffic halved while conversion and price held, so traffic must dominate.
+  assert.equal(row.dominantDriver, "traffic");
+  assert.equal(row.salesDelta, -4000);
+});
+
+test("a zero-stock ASIN that sold produces a high-severity stockout insight", () => {
+  const rows = buildSalesMoversRows(moversData, "ALL");
+  const insights = buildSalesMoversInsights(moversData, rows, "INR");
+  const stockout = insights.find((insight) => insight.category === "stockout");
+  assert.ok(stockout, "expected a stockout insight");
+  assert.equal(stockout.asin, "B002");
+  assert.equal(stockout.moneyAtRisk, 2000);
+  assert.equal(stockout.currency, "INR");
+  assert.equal(stockout.confidence, "high");
+  assert.ok(stockout.action.length > 10);
+  assert.ok(stockout.evidence.length >= 3);
+});
+
+test("every insight carries severity, evidence, why, action and freshness", () => {
+  const rows = buildSalesMoversRows(moversData, "ALL");
+  for (const insight of buildSalesMoversInsights(moversData, rows, "INR")) {
+    assert.ok(["high", "medium", "low"].includes(insight.severity), "severity");
+    assert.ok(insight.evidence.length > 0, "evidence");
+    assert.ok(insight.why && insight.why.length > 10, "why");
+    assert.ok(insight.action && insight.action.length > 10, "action");
+    assert.ok(insight.freshness, "freshness");
+    assert.ok(["high", "medium", "low"].includes(insight.confidence), "confidence");
+  }
+});
+
+test("an unattributable decline says so and drops confidence", () => {
+  const data = {
+    ...moversData,
+    rows: [{
+      asin: "B009", productName: "No sessions last week", brand: "Alpha",
+      recent: { sales: 0, units: 0, orders: 0, sessions: 0, pageViews: 0 },
+      prior: { sales: 5000, units: 50, orders: 50, sessions: 900, pageViews: 1000 },
+      ads: { recentSpend: 0, recentSales: 0, priorSpend: 0, priorSales: 0 },
+      inventory: null,
+    }],
+  };
+  const rows = buildSalesMoversRows(data, "ALL");
+  assert.equal(rows[0].dominantDriver, null);
+  const insight = buildSalesMoversInsights(data, rows, "INR").find((item) => item.category === "decline-unattributed");
+  assert.ok(insight, "expected an unattributed decline insight");
+  assert.equal(insight.confidence, "low");
+  assert.ok(/cannot be attributed/i.test(insight.why));
+});
+
+test("a uniform traffic-shaped collapse is reported as possible incompleteness", () => {
+  const rows = Array.from({ length: 10 }, (_, index) => ({
+    asin: `Z${index}`, productName: `Z${index}`, brand: "Alpha",
+    recent: { sales: 100, units: 2, orders: 2, sessions: 20, pageViews: 25 },
+    prior: { sales: 1000, units: 20, orders: 20, sessions: 200, pageViews: 250 },
+    ads: { recentSpend: 0, recentSales: 0, priorSpend: 0, priorSales: 0 },
+    inventory: null,
+  }));
+  const built = buildSalesMoversRows({ ...moversData, rows }, "ALL");
+  const warning = salesMoversCompletenessWarning(built);
+  assert.ok(warning && /not finished loading/i.test(warning));
+  // A healthy mixed set must NOT trigger the guard.
+  assert.equal(salesMoversCompletenessWarning(buildSalesMoversRows(moversData, "ALL")), null);
+});
+
+/* ---------- Listing Health ---------- */
+
+const listingData = {
+  accountId: "acct-1",
+  asOf: "2026-07-29",
+  salesWindow: { from: "2026-06-30", to: "2026-07-29", days: 30 },
+  sourceLabel: "Listings",
+  salesSourceLabel: "Profit by SKU & Date",
+  issuesAvailable: true,
+  issuesSourceLabel: "Listings (Raw JSON)",
+  inventoryAvailable: true,
+  currencies: ["INR"],
+  rows: [
+    {
+      sku: "SKU-ERR", asin: "B100", productName: "Blocked by error", brand: "Alpha",
+      listingStatus: "Active", fulfillmentChannel: "FBA", price: 499, currency: "INR",
+      listingQuantity: 0, fbaAvailable: 10, snapshotAvailable: 10,
+      sales30d: 15000, units30d: 30, hasSalesData: true,
+      issues: [{ severity: "ERROR", code: "8541", message: "Missing required attribute" }],
+      summary: { buyable: true, discoverable: true }, hasLiveOffer: true,
+    },
+    {
+      sku: "SKU-STRAND", asin: "B101", productName: "Stranded stock", brand: "Alpha",
+      listingStatus: "Inactive", fulfillmentChannel: "FBA", price: 299, currency: "INR",
+      listingQuantity: 0, fbaAvailable: 40, snapshotAvailable: 40,
+      sales30d: 0, units30d: 0, hasSalesData: false,
+      issues: [], summary: { buyable: false, discoverable: true }, hasLiveOffer: false,
+    },
+    {
+      sku: "SKU-FBM", asin: "B102", productName: "FBM no price", brand: "Beta",
+      listingStatus: "Active", fulfillmentChannel: "FBM", price: 0, currency: "INR",
+      listingQuantity: 12, fbaAvailable: 0, snapshotAvailable: null,
+      sales30d: 500, units30d: 2, hasSalesData: true,
+      issues: [], summary: null, hasLiveOffer: null,
+    },
+    {
+      sku: "SKU-OK", asin: "B103", productName: "Healthy", brand: "Beta",
+      listingStatus: "Active", fulfillmentChannel: "FBA", price: 999, currency: "INR",
+      listingQuantity: 0, fbaAvailable: 5, snapshotAvailable: 5,
+      sales30d: 9000, units30d: 9, hasSalesData: true,
+      issues: [], summary: { buyable: true, discoverable: true }, hasLiveOffer: true,
+    },
+  ],
+};
+
+test("listing gates are applied in the documented order", () => {
+  const rows = buildListingHealthRows(listingData, "ALL");
+  const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
+  assert.equal(byS["SKU-ERR"].gate, "error");
+  assert.equal(byS["SKU-STRAND"].gate, "suppressed");
+  assert.equal(byS["SKU-FBM"].gate, "no_price");
+  assert.equal(byS["SKU-OK"].gate, "ok");
+});
+
+test("units on hand never adds two views of the same stock", () => {
+  const rows = buildListingHealthRows(listingData, "ALL");
+  const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
+  // FBA offer: snapshot value only, not snapshot + listing quantity.
+  assert.equal(byS["SKU-ERR"].unitsOnHand, 10);
+  // FBM offer: merchant quantity only.
+  assert.equal(byS["SKU-FBM"].unitsOnHand, 12);
+});
+
+test("a healthy listing has no sales at risk", () => {
+  const rows = buildListingHealthRows(listingData, "ALL");
+  const ok = rows.find((row) => row.sku === "SKU-OK");
+  assert.equal(ok.salesAtRisk, 0);
+});
+
+test("without the raw-issues table nothing is labelled suppressed", () => {
+  const withoutIssues = {
+    ...listingData,
+    issuesAvailable: false,
+    rows: listingData.rows.map((row) => ({ ...row, issues: [], summary: null, hasLiveOffer: null })),
+  };
+  const rows = buildListingHealthRows(withoutIssues, "ALL");
+  assert.ok(!rows.some((row) => row.gate === "suppressed"), "must not infer suppression");
+  assert.ok(!rows.some((row) => row.gate === "error"), "must not infer an error");
+  // The Inactive listing is still detected from listing_status alone.
+  assert.equal(rows.find((row) => row.sku === "SKU-STRAND").gate, "inactive");
+});
+
+/* ---------- Buy Box ---------- */
+
+const buyBoxData = {
+  accountId: "acct-1",
+  asOf: "2026-07-29",
+  window: { from: "2026-07-02", to: "2026-07-29", days: 28, sliceDays: 7 },
+  observedWindow: { from: "2026-07-02", to: "2026-07-28" },
+  sourceLabel: "Profit by SKU & Date",
+  inventoryAvailable: true,
+  inventorySnapshotDate: "2026-07-29",
+  currencies: ["INR"],
+  rows: [
+    {
+      sku: "BB-PRICE", asin: "B200", productName: "Priced out", brand: "Alpha", currency: "INR",
+      buyBoxPct: 40, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
+      sales: 10000, units: 50, pageViews: 4000,
+      price: { yourPrice: 550, salesPrice: 550, featuredOfferPrice: 499, lowestPriceNewPlusShipping: 495, currency: "INR" },
+      available: 100, unitsShippedT30: 60, inventoryKnown: true,
+    },
+    {
+      sku: "BB-STOCK", asin: "B201", productName: "Out of stock", brand: "Alpha", currency: "INR",
+      buyBoxPct: 20, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
+      sales: 5000, units: 25, pageViews: 2000,
+      price: { yourPrice: 300, salesPrice: 300, featuredOfferPrice: 320, lowestPriceNewPlusShipping: 320, currency: "INR" },
+      available: 0, unitsShippedT30: 30, inventoryKnown: true,
+    },
+    {
+      sku: "BB-UNKNOWN", asin: "B202", productName: "No evidence", brand: "Beta", currency: "INR",
+      buyBoxPct: 60, buyBoxBasis: "unweighted mean of observed days", buyBoxDays: 5, windowDays: 28,
+      sales: 2000, units: 10, pageViews: 0,
+      price: null, available: null, unitsShippedT30: null, inventoryKnown: true,
+    },
+    {
+      sku: "BB-FINE", asin: "B203", productName: "Winning", brand: "Beta", currency: "INR",
+      buyBoxPct: 99, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
+      sales: 20000, units: 100, pageViews: 9000,
+      price: { yourPrice: 100, salesPrice: 100, featuredOfferPrice: 100, lowestPriceNewPlusShipping: 100, currency: "INR" },
+      available: 500, unitsShippedT30: 120, inventoryKnown: true,
+    },
+  ],
+};
+
+test("sales at risk is sales x (1 - buy box share)", () => {
+  const rows = buildBuyBoxRows(buyBoxData, "ALL", 90);
+  const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
+  assert.equal(byS["BB-PRICE"].salesAtRisk, 10000 * 0.6);
+  assert.equal(byS["BB-STOCK"].salesAtRisk, 5000 * 0.8);
+});
+
+test("buy box causes are only claimed with evidence", () => {
+  const rows = buildBuyBoxRows(buyBoxData, "ALL", 90);
+  const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
+  assert.equal(byS["BB-PRICE"].cause, "price");
+  assert.equal(byS["BB-STOCK"].cause, "stock");
+  assert.equal(byS["BB-UNKNOWN"].cause, "unconfirmed");
+  const insights = buildBuyBoxInsights(buyBoxData, rows, 90);
+  const unknown = insights.find((insight) => insight.sku === "BB-UNKNOWN");
+  assert.equal(unknown.confidence, "low");
+  assert.ok(/not present/i.test(unknown.why));
+});
+
+test("the threshold is local and changes which rows are flagged", () => {
+  assert.equal(buildBuyBoxRows(buyBoxData, "ALL", 90).filter((row) => row.belowThreshold).length, 3);
+  assert.equal(buildBuyBoxRows(buyBoxData, "ALL", 50).filter((row) => row.belowThreshold).length, 2);
+  assert.equal(buildBuyBoxRows(buyBoxData, "ALL", 100).filter((row) => row.belowThreshold).length, 4);
+});
+
+test("a SKU holding the buy box produces no insight", () => {
+  const rows = buildBuyBoxRows(buyBoxData, "ALL", 90);
+  const insights = buildBuyBoxInsights(buyBoxData, rows, 90);
+  assert.ok(!insights.some((insight) => insight.sku === "BB-FINE"));
+});
+
+/* ---------- ranking, dedupe, export ---------- */
+
+function insight(overrides) {
+  return makeInsight({
+    id: overrides.id,
+    reportKey: overrides.reportKey || "r",
+    reportLabel: "R",
+    severity: overrides.severity,
+    category: overrides.category || "c",
+    title: overrides.id,
+    asin: overrides.asin || null,
+    moneyAtRisk: overrides.moneyAtRisk ?? null,
+    currency: overrides.currency || "INR",
+    kind: overrides.kind || "risk",
+    why: "because the numbers say so",
+    action: "do the thing",
+    evidence: [{ label: "Metric", value: 1 }],
+  });
+}
+
+test("ranking puts risks first, then severity, then money", () => {
+  const ordered = sortInsights([
+    insight({ id: "low-big", severity: "low", moneyAtRisk: 9999 }),
+    insight({ id: "high-small", severity: "high", moneyAtRisk: 5 }),
+    insight({ id: "high-big", severity: "high", moneyAtRisk: 500 }),
+    insight({ id: "opportunity", severity: "high", moneyAtRisk: 100000, kind: "opportunity" }),
+  ]).map((item) => item.id);
+  assert.deepEqual(ordered, ["high-big", "high-small", "low-big", "opportunity"]);
+});
+
+test("money is not compared across currencies", () => {
+  const ordered = sortInsights([
+    insight({ id: "inr", severity: "high", moneyAtRisk: 100, currency: "INR" }),
+    insight({ id: "usd", severity: "high", moneyAtRisk: 5, currency: "USD" }),
+  ]).map((item) => item.id);
+  // With mixed currencies the 100 INR must not outrank 5 USD on money alone;
+  // the tie falls through to confidence then label order.
+  assert.deepEqual(ordered, ["inr", "usd"]);
+});
+
+test("dedupe collapses repeats for the same report, category and entity", () => {
+  const deduped = dedupeInsights([
+    insight({ id: "a1", severity: "medium", asin: "B1", moneyAtRisk: 10 }),
+    insight({ id: "a2", severity: "high", asin: "B1", moneyAtRisk: 20 }),
+    insight({ id: "b1", severity: "low", asin: "B2", moneyAtRisk: 1 }),
+  ]);
+  assert.equal(deduped.length, 2);
+  const merged = deduped.find((item) => item.asin === "B1");
+  assert.equal(merged.severity, "high", "the most severe survives");
+  assert.equal(merged.mergedCount, 2);
+});
+
+test("insight export carries evidence, money basis, confidence and freshness", () => {
+  const [row] = insightExportRows([insight({ id: "x", severity: "high", moneyAtRisk: 12.5 })]);
+  for (const column of ["Report", "Priority", "Product", "Insight", "Money at Risk", "Currency", "Evidence", "Why Flagged", "Recommended Action", "Confidence"]) {
+    assert.ok(column in row, `missing column ${column}`);
+  }
+  assert.equal(row["Money at Risk"], "12.50");
+});
+
+/* ---------- CSV and formatting guards ---------- */
+
+test("CSV escapes spreadsheet formulas and quotes", () => {
+  assert.equal(csvCell("=1+1"), "\"'=1+1\"");
+  assert.equal(csvCell("+SUM(A1)"), "\"'+SUM(A1)\"");
+  assert.equal(csvCell("-2"), "\"'-2\"");
+  assert.equal(csvCell("@cmd"), "\"'@cmd\"");
+  assert.equal(csvCell('say "hi"'), '"say ""hi"""');
+  assert.equal(csvCell(null), '""');
+});
+
+test("CSV output starts with a UTF-8 BOM so Excel reads it correctly", () => {
+  const text = csvText([{ A: "1", B: "₹2" }]);
+  assert.equal(text.charCodeAt(0), 0xfeff);
+  assert.ok(text.includes("₹2"));
+});
+
+test("unknown numbers render as an em dash, never as zero", () => {
+  assert.equal(nInt(null), "—");
+  assert.equal(nInt(undefined), "—");
+  assert.equal(fmtMoney(null, "INR"), "—");
+  assert.equal(ratio(1, 0), null);
+  assert.equal(nInt(0), "0");
+  assert.equal(fmtMoney(0, "INR"), "₹0");
+});
+
+console.log(`\n${passed} assertions passed${process.exitCode ? " (with failures above)" : ""}`);

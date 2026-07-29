@@ -259,6 +259,20 @@ export async function claimRefreshLock({ reportKey, accountId, paramsHash, lockS
   });
 }
 
+// Releasing the lock as soon as a refresh finishes means a failed export does
+// not block the next attempt for the whole lock duration.
+export async function releaseRefreshLock({ reportKey, accountId, paramsHash }) {
+  const query = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+  });
+  await request(`/rest/v1/report_refresh_locks?${query}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+}
+
 export async function getCogsOverrides(accountId) {
   const query = new URLSearchParams({
     select: "currency,sku,asin,per_unit_cost,updated_at",

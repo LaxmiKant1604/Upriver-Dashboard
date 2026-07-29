@@ -1,50 +1,23 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, ShieldAlert, Trophy, Undo2, Megaphone, FileSearch, ListChecks } from "lucide-react";
 import { supabase } from "./lib/supabase.js";
+// Display and CSV helpers are shared with the insight report views so both
+// render money, dates and units identically. Nothing here converts currency.
+import {
+  FLAGS, FX, FX_AS_OF, MONTH_ABBR, SYMBOL,
+  addDays, compactNumber, daysInMonth, fmtDateHuman, fmtMoney, fmtMoneyCompact,
+  fmtPct, fmtRangeLabel, fromUTC, monthBack, monthKeyLabel, monthStart, nInt,
+  pad2, parts, pct, shiftMonthRange, todayStr, toUTC, weekStart, yearStart,
+} from "./lib/format.js";
+import { csvCell } from "./lib/csv.js";
+import SalesMovers from "./views/SalesMovers.jsx";
+import ListingHealth from "./views/ListingHealth.jsx";
+import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 
-/* ============================== CONFIG ============================== */
-// Approximate FX rates for combining accounts that use different currencies.
-// These are static and will drift over time — update periodically, or
-// replace with a live FX API call for better accuracy.
-const FX = { INR: 1, USD: 94.6, AUD: 65.2, CAD: 66.6, GBP: 118, EUR: 101 };
-const FX_AS_OF = "2026-07-01";
-
-const FLAGS = { IN: "🇮🇳", US: "🇺🇸", AU: "🇦🇺", CA: "🇨🇦", UK: "🇬🇧", GB: "🇬🇧", DE: "🇩🇪", FR: "🇫🇷", JP: "🇯🇵", MX: "🇲🇽" };
-const SYMBOL = { INR: "₹", USD: "$", AUD: "A$", CAD: "C$", GBP: "£", EUR: "€" };
-const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
-/* ============================== DATE HELPERS ============================== */
-function pad2(n) { return String(n).padStart(2, "0"); }
-function todayStr() { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
-function parts(s) { const [y, m, d] = s.split("-").map(Number); return { y, m, d }; }
-function toUTC(s) { const p = parts(s); return Date.UTC(p.y, p.m - 1, p.d); }
-function fromUTC(t) { const d = new Date(t); return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`; }
-function addDays(s, n) { return fromUTC(toUTC(s) + n * 86400000); }
-function daysInMonth(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
-function monthStart(s) { const p = parts(s); return `${p.y}-${pad2(p.m)}-01`; }
-function yearStart(s) { const p = parts(s); return `${p.y}-01-01`; }
-function weekStart(s) { const t = toUTC(s); const dow = new Date(t).getUTCDay(); const diff = dow === 0 ? 6 : dow - 1; return fromUTC(t - diff * 86400000); }
-function fmtDateHuman(s) { const p = parts(s); return `${MONTH_ABBR[p.m - 1]} ${p.d}, ${p.y}`; }
-function fmtRangeLabel(from, to) { return from === to ? fmtDateHuman(from) : `${fmtDateHuman(from)} – ${fmtDateHuman(to)}`; }
-
-function shiftMonthRange(s, deltaYears, deltaMonths) {
-  const p = parts(s);
-  const total = p.y * 12 + (p.m - 1) + deltaMonths + deltaYears * 12;
-  const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
-  const day = Math.min(p.d, daysInMonth(y, m));
-  return { start: `${y}-${pad2(m)}-01`, end: `${y}-${pad2(m)}-${pad2(day)}` };
-}
-
 /* ============================== DAILY REPORT HELPERS ============================== */
-// Full calendar month `n` months before the month containing `s` (n=0 -> that month).
-function monthBack(s, n) {
-  const p = parts(s);
-  const total = p.y * 12 + (p.m - 1) - n;
-  const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
-  return { y, m, from: `${y}-${pad2(m)}-01`, to: `${y}-${pad2(m)}-${pad2(daysInMonth(y, m))}` };
-}
 // Column set for the daily report: `monthsBack` completed months, the current
 // month (MTD, up to `latest`), then the last `days` days ending at `latest`.
 function dailyReportColumns(latest, monthsBack, days) {
@@ -291,21 +264,6 @@ function comparePlanRows(a, b, key, dir) {
   if (typeof av === "string" || typeof bv === "string") cmp = String(av).localeCompare(String(bv));
   else cmp = av - bv;
   return dir === "asc" ? cmp : -cmp;
-}
-
-// "2026-04" -> "Apr '26"
-function monthKeyLabel(key) {
-  if (!key) return "";
-  const [y, m] = key.split("-").map(Number);
-  return `${MONTH_ABBR[m - 1]} '${String(y).slice(2)}`;
-}
-// Integer / 1-decimal unit formatters; unknown values render as an em dash.
-const nInt = (v) => (v === null || v === undefined || !isFinite(v) ? "—" : Math.round(Number(v)).toLocaleString("en-US"));
-function csvCell(value) {
-  let text = value === null || value === undefined ? "" : String(value);
-  // Prevent spreadsheet programs from evaluating a product value as a formula.
-  if (/^[=+\-@]/.test(text)) text = `'${text}`;
-  return `"${text.replace(/"/g, '""')}"`;
 }
 
 function downloadPlanSpreadsheet(rows, meta, targetDays) {
@@ -602,41 +560,6 @@ function downloadContentChangesCsv(events, accountName) {
   link.download = `content-change-alerts-${account || "account"}-${new Date().toISOString().slice(0, 10)}.csv`;
   link.click();
   URL.revokeObjectURL(url);
-}
-
-/* ============================== NUMBER / MONEY HELPERS ============================== */
-function pct(curr, prev) {
-  if (prev === 0) return curr === 0 ? 0 : null;
-  return ((curr - prev) / prev) * 100;
-}
-function fmtPct(v) {
-  if (v === null || v === undefined || !isFinite(v)) return "—";
-  const s = v >= 0 ? "+" : "";
-  return `${s}${v.toFixed(1)}%`;
-}
-function fmtMoney(value, currency, decimals) {
-  const d = decimals === undefined ? 0 : decimals;
-  const symbol = SYMBOL[currency] || (currency ? currency + " " : "");
-  const locale = currency === "INR" ? "en-IN" : "en-US";
-  const n = Number(value || 0);
-  return symbol + n.toLocaleString(locale, { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-function compactNumber(v, currency) {
-  const sign = v < 0 ? "-" : "";
-  v = Math.abs(v);
-  if (currency === "INR") {
-    if (v >= 1e7) return sign + (v / 1e7).toFixed(1) + "Cr";
-    if (v >= 1e5) return sign + (v / 1e5).toFixed(1) + "L";
-    if (v >= 1e3) return sign + (v / 1e3).toFixed(1) + "k";
-    return sign + v.toFixed(0);
-  }
-  if (v >= 1e6) return sign + (v / 1e6).toFixed(1) + "M";
-  if (v >= 1e3) return sign + (v / 1e3).toFixed(1) + "k";
-  return sign + v.toFixed(0);
-}
-function fmtMoneyCompact(value, currency) {
-  const symbol = SYMBOL[currency] || (currency ? currency + " " : "");
-  return symbol + compactNumber(value, currency);
 }
 
 /* ============================== SMALL COMPONENTS ============================== */
@@ -1027,6 +950,94 @@ async function cachedLargeApiGet(params, { force = false } = {}) {
   }
   const body = await apiGet(params);
   return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+}
+
+/* ===== Shared report layer (the six insight reports) =====
+   These reports are stored server-side in Supabase rather than per browser, so
+   one person's refresh is visible to every user permitted on that account.
+   Two operations exist and only one of them can reach DataDoe:
+
+     loadSharedReport    — reads the saved snapshot. Used on navigation and on
+                           every account change. It never calls DataDoe.
+     refreshSharedReport — sends refresh=1. The server claims a lock, calls
+                           DataDoe once, saves the snapshot for everyone, and
+                           publishes a compact "updated" event.
+
+   The browser cache is still written, but only as an instant first paint and an
+   offline fallback: the shared snapshot is always the authority, which is why
+   `loadSharedReport` issues its request even when a cached copy exists. */
+async function loadSharedReport(params) {
+  const body = await apiGet(params);
+  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+}
+
+async function refreshSharedReport(params) {
+  // `refresh` is deliberately NOT part of the cache key, so a refreshed report
+  // and a read of the same scope share one cache entry.
+  const body = await apiGet({ ...params, refresh: "1" });
+  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+}
+
+function readSharedReportCache(params) {
+  return readLargeApiCache(params);
+}
+
+/**
+ * State for one shared insight report.
+ *
+ * On navigation and on any account change it reads the SHARED snapshot, so a
+ * refresh performed by a colleague is visible immediately. The browser copy is
+ * painted first purely so the screen is never blank, and it is also the fallback
+ * if the shared read fails. Only `refresh()` can reach DataDoe, and an in-flight
+ * guard means repeated clicks cannot launch duplicate exports.
+ */
+function useSharedReport({ params, active }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [cachedAt, setCachedAt] = useState(null);
+  const refreshing = React.useRef(false);
+
+  const load = useCallback(async () => {
+    if (!params) { setData(null); setCachedAt(null); setError(null); return; }
+    setError(null);
+    let cached = null;
+    try { cached = await readSharedReportCache(params); } catch (e) { cached = null; }
+    if (cached) { setData(cached.body); setCachedAt(new Date(cached.cachedAt)); }
+    setLoading(true);
+    try {
+      const result = await loadSharedReport(params);
+      setData(result.body);
+      setCachedAt(new Date(result.cachedAt));
+    } catch (loadError) {
+      setError(cached
+        ? `Showing the last copy saved in this browser. The shared snapshot could not be read: ${loadError.message}`
+        : loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [params]);
+
+  useEffect(() => { if (active) load(); }, [active, load]);
+
+  const refresh = useCallback(async () => {
+    if (!params || refreshing.current) return;
+    refreshing.current = true;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await refreshSharedReport(params);
+      setData(result.body);
+      setCachedAt(new Date(result.cachedAt));
+    } catch (refreshError) {
+      setError(refreshError.message);
+    } finally {
+      refreshing.current = false;
+      setLoading(false);
+    }
+  }, [params]);
+
+  return { data, loading, error, cachedAt, refresh, reload: load };
 }
 
 /* ============================== MAIN APP ============================== */
@@ -1500,6 +1511,51 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "keywordrank") loadCachedKeywordRank();
   }, [view, loadCachedKeywordRank]);
+
+  /* ===== The six insight reports =====
+     Each one is single-account, read from the shared Supabase snapshot on
+     navigation, and refreshed only by the header Refresh button. The as-of date
+     is part of the snapshot scope; every filter, threshold and sort inside the
+     report is local and deliberately NOT part of it. */
+  const insightScope = useMemo(
+    () => (selectedAccountId ? { ids: selectedAccountId, to: TODAY } : null),
+    [selectedAccountId, TODAY]
+  );
+  const salesMoversParams = useMemo(
+    () => (insightScope ? { action: "sales-movers", ...insightScope } : null),
+    [insightScope]
+  );
+  const listingHealthParams = useMemo(
+    () => (insightScope ? { action: "listing-health", ...insightScope } : null),
+    [insightScope]
+  );
+  const buyBoxParams = useMemo(
+    () => (insightScope ? { action: "buy-box-loss", ...insightScope } : null),
+    [insightScope]
+  );
+
+  const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" });
+  const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" });
+  const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" });
+
+  const INSIGHT_VIEWS = useMemo(() => ({
+    salesmovers: { report: salesMovers, label: "Sales Movers" },
+    listinghealth: { report: listingHealth, label: "Listing Health" },
+    buybox: { report: buyBox, label: "Buy Box Loss" },
+  }), [salesMovers, listingHealth, buyBox]);
+  const activeInsightReport = INSIGHT_VIEWS[view]?.report || null;
+
+  // Every insight report returns the brands present in its own scope so the
+  // shared header selector is usable from these reports alone, exactly like the
+  // SKU P&L and Keyword Rank reports already do. Brands stay account-scoped.
+  useEffect(() => {
+    const body = activeInsightReport?.data;
+    if (!body || body.snapshotMissing) return;
+    if (body.accountId && Array.isArray(body.catalogBrands) && body.catalogBrands.length) {
+      setCatalogBrands(body.catalogBrands);
+      setCatalogBrandsAccountId(body.accountId);
+    }
+  }, [activeInsightReport?.data]);
 
   const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
@@ -2128,6 +2184,18 @@ function DashboardApp({ session, access, onSignOut }) {
               <BellRing size={18} />
               <span className="sb-nav-label">Content Alerts</span>
             </button>
+            <button className={"sb-nav-item" + (view === "salesmovers" ? " active" : "")} title="Sales Movers — weekly ASIN gains and declines" onClick={() => { setView("salesmovers"); setMobileOpen(false); }}>
+              <TrendingUp size={18} />
+              <span className="sb-nav-label">Sales Movers</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "listinghealth" ? " active" : "")} title="Listing Health — suppressed, inactive and stranded listings" onClick={() => { setView("listinghealth"); setMobileOpen(false); }}>
+              <ShieldAlert size={18} />
+              <span className="sb-nav-label">Listing Health</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "buybox" ? " active" : "")} title="Buy Box Loss — featured-offer share and its causes" onClick={() => { setView("buybox"); setMobileOpen(false); }}>
+              <Trophy size={18} />
+              <span className="sb-nav-label">Buy Box Loss</span>
+            </button>
             {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
               <UsersRound size={18} />
               <span className="sb-nav-label">User Access</span>
@@ -2192,11 +2260,22 @@ function DashboardApp({ session, access, onSignOut }) {
         {view !== "access" && <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
+            if (activeInsightReport) {
+              const stamp = activeInsightReport.cachedAt;
+              return stamp
+                ? `Read ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}`
+                : "Select an account to refresh";
+            }
             const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "keywordrank" ? keywordRankCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
             return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
           })()}
-          <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows} disabled={(view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading)} title="Refresh selected account">
-            <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
+          <button
+            className="refresh-btn"
+            onClick={activeInsightReport ? activeInsightReport.refresh : view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows}
+            disabled={activeInsightReport ? activeInsightReport.loading : (view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading)}
+            title={activeInsightReport ? "Refresh this report from DataDoe for the selected account and save it for everyone with access" : "Refresh selected account"}
+          >
+            <RefreshCw size={13} className={(activeInsightReport ? activeInsightReport.loading : view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
           </button>
         </div>}
       </div>
@@ -2992,6 +3071,39 @@ function DashboardApp({ session, access, onSignOut }) {
         </>}
       </div>
       )}
+
+      {view === "salesmovers" && (
+        <SalesMovers
+          data={salesMovers.data}
+          loading={salesMovers.loading}
+          error={salesMovers.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
+        />
+      )}
+
+      {view === "listinghealth" && (
+        <ListingHealth
+          data={listingHealth.data}
+          loading={listingHealth.loading}
+          error={listingHealth.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
+        />
+      )}
+
+      {view === "buybox" && (
+        <BuyBoxLoss
+          data={buyBox.data}
+          loading={buyBox.loading}
+          error={buyBox.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
+        />
+      )}
         </div>
       </div>
     </div>
@@ -3316,8 +3428,51 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .auth-root{ min-height:100vh; display:grid; place-items:center; padding:24px; background:var(--bg); font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; color:var(--ink); }.auth-panel{ width:min(100%,400px); border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:28px; box-shadow:0 18px 46px rgba(18,23,43,.1); }.auth-logo{ display:grid; place-items:center; width:40px; height:40px; border-radius:8px; background:#10172E; color:#fff; font-weight:800; font-size:12px; }.auth-title{ margin-top:18px; font-size:22px; font-weight:800; }.auth-sub{ margin-top:7px; color:var(--ink-soft); font-size:13px; line-height:1.55; }.auth-field{ display:flex; flex-direction:column; gap:6px; margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.auth-field input,.auth-field select{ min-height:39px; width:100%; border:1px solid var(--border); border-radius:7px; padding:8px 10px; color:var(--ink); background:var(--surface); font:600 14px 'Manrope',sans-serif; text-transform:none; letter-spacing:0; }.auth-submit{ width:100%; min-height:40px; margin-top:20px; border:1px solid #10172E; border-radius:7px; background:#10172E; color:#fff; cursor:pointer; font:700 13px 'Manrope',sans-serif; }.auth-submit:disabled{ opacity:.6; cursor:not-allowed; }.auth-error,.auth-success{ display:flex; align-items:center; gap:7px; margin-top:14px; padding:9px 10px; border-radius:6px; font-size:12px; font-weight:700; }.auth-error{ color:var(--neg); background:#FDECEC; }.auth-success{ color:var(--pos); background:#E6F2EB; }.auth-note{ margin-top:13px; color:var(--ink-soft); font-size:11.5px; line-height:1.5; text-align:center; }
 .auth-link{ display:block; width:100%; margin-top:10px; border:0; background:transparent; color:var(--accent-deep); cursor:pointer; font:700 11.5px 'Manrope',sans-serif; }
 .access-heading{ align-items:center; }.access-grid{ display:grid; grid-template-columns:minmax(280px,.85fr) minmax(380px,1.5fr); gap:14px; margin-top:14px; }.access-invite,.access-users,.access-editor{ padding:16px; }.access-invite .panel-title,.access-users .panel-title{ display:flex; align-items:center; gap:8px; }.access-field-label{ margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.access-account-list{ max-height:240px; overflow:auto; margin-top:8px; border:1px solid var(--border); border-radius:7px; }.access-account-check{ display:flex; align-items:flex-start; gap:8px; padding:9px 10px; border-bottom:1px solid var(--border); color:var(--ink); font-size:12.5px; font-weight:600; cursor:pointer; }.access-account-check:last-child{ border-bottom:0; }.access-account-check input{ margin-top:2px; accent-color:var(--accent-deep); }.access-user-list{ margin-top:12px; border-top:1px solid var(--border); }.access-user-row{ width:100%; display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:12px; padding:11px 2px; border:0; border-bottom:1px solid var(--border); background:transparent; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }.access-user-row:hover,.access-user-row.selected{ background:#FBF2E4; }.access-user-row strong,.access-user-row small{ display:block; }.access-user-row strong{ font-size:12.5px; }.access-user-row small{ margin-top:3px; color:var(--ink-soft); font-size:11px; }.access-role{ display:inline-flex; justify-content:center; min-width:60px; padding:4px 7px; border-radius:999px; background:#EEF1F7; color:var(--ink-soft); font-size:10px; font-weight:800; text-transform:uppercase; }.access-role.role-admin{ background:#E7EDF9; color:#254D92; }.access-role.role-editor{ background:#FBEFD8; color:#8A5A12; }.access-editor{ margin-top:14px; max-width:720px; }.access-notice{ margin-top:14px; padding:10px 12px; border:1px solid #B8DFC8; border-radius:7px; background:#EEF8F1; color:var(--pos); font-size:12px; font-weight:700; }.access-empty{ margin-top:14px; color:var(--ink-soft); font-size:13px; }
+/* ---- Insight Engine (shared by the six insight reports) ---- */
+.priority-panel{ margin-top:16px; }
+.insight-list{ display:flex; flex-direction:column; gap:10px; margin-top:10px; }
+.insight-row{ border:1px solid var(--border); border-left:3px solid var(--border); border-radius:10px; padding:11px 13px; background:#FBFBFD; }
+.insight-row.insight-high{ border-left-color:var(--neg); background:#FEF7F7; }
+.insight-row.insight-medium{ border-left-color:var(--accent); background:#FFFCF5; }
+.insight-row.insight-low{ border-left-color:#C9CEDC; }
+.insight-head{ display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:9px; }
+.insight-title{ font-size:13px; font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.insight-money{ font-size:13px; font-weight:700; white-space:nowrap; color:var(--ink); }
+.insight-why{ margin-top:6px; font-size:12px; color:var(--ink-soft); line-height:1.5; }
+.insight-evidence{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.insight-chip{ display:inline-flex; align-items:baseline; gap:5px; border:1px solid var(--border); border-radius:999px; padding:2px 9px; background:var(--surface); font-size:11px; }
+.insight-chip em{ font-style:normal; color:var(--ink-soft); }
+.insight-chip b{ font-weight:700; color:var(--ink); font-size:11px; }
+.insight-action{ margin-top:8px; font-size:12px; color:var(--ink); line-height:1.5; }
+.insight-action strong{ color:var(--accent-deep); }
+.insight-foot{ margin-top:7px; font-size:10.5px; color:var(--ink-soft); line-height:1.45; }
+.movers-table{ min-width:1500px; }
+.movers-driver{ text-align:left; }
+.movers-unattributed{ color:var(--ink-soft); font-size:11.5px; }
+.pt-badge.driver-traffic{ background:#E6F0FA; color:#2A639B; }
+.pt-badge.driver-conversion{ background:#EDE7FA; color:#5B3E9B; }
+.pt-badge.driver-price{ background:#FCE4C4; color:#8A5A12; }
+.listing-health-table{ min-width:1320px; }
+.listing-health-table .listing-issue{ text-align:left; white-space:normal; min-width:220px; max-width:340px; line-height:1.4; color:var(--ink-soft); font-size:11.5px; }
+.buybox-table{ min-width:1340px; }
+.buybox-table .buybox-cause{ white-space:normal; min-width:230px; max-width:320px; }
+.buybox-cause-detail{ margin-top:4px; font-size:11px; color:var(--ink-soft); line-height:1.4; }
+.returns-table{ min-width:1460px; }
+.returns-reason{ text-align:left; white-space:normal; min-width:200px; max-width:300px; line-height:1.4; }
+.ppc-table{ min-width:1420px; }
+.ppc-term{ text-align:left; white-space:normal; min-width:200px; max-width:300px; line-height:1.35; }
+.optimizer-table{ min-width:1480px; }
+.optimizer-note{ text-align:left; white-space:normal; min-width:230px; max-width:330px; line-height:1.4; color:var(--ink-soft); font-size:11.5px; }
+.feed-source{ display:inline-block; font-size:10.5px; font-weight:700; color:var(--ink-soft); background:#F1F2F6; border-radius:999px; padding:2px 8px; }
+.report-tabs{ display:inline-flex; background:#F1F2F6; border-radius:9px; padding:3px; flex-wrap:wrap; gap:2px; }
+.report-tabs button{ border:none; background:transparent; padding:6px 13px; font-size:12px; font-weight:700; border-radius:7px; cursor:pointer; color:var(--ink-soft); font-family:inherit; }
+.report-tabs button.active{ background:#fff; color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.08); }
+
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
+  .insight-head{ grid-template-columns:1fr; gap:5px; }
+  .insight-title{ white-space:normal; }
+  .insight-money{ text-align:left; }
   .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
   .recon-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }.recon-chart-grid{ grid-template-columns:1fr; }
   .skupl-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }.skupl-insights{ grid-template-columns:1fr; }
