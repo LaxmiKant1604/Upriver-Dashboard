@@ -3354,20 +3354,35 @@ export default function App() {
 
   useEffect(() => {
     if (!supabase) { setAuthReady(true); return undefined; }
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session || null);
-      configureApiSession(data.session || null);
+    let active = true;
+    const restoreSession = async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (!active) return;
+      // A saved refresh token can recover an expired access token. Do not
+      // discard that session merely because the initial read hit an error.
+      const restored = error ? await supabase.auth.refreshSession() : { data };
+      if (!active) return;
+      const nextSession = restored.data?.session || null;
+      setSession(nextSession);
+      configureApiSession(nextSession);
       if (window.location.hash.includes("type=invite") || window.location.search.includes("type=invite")) setPasswordSetup(true);
+      setAuthReady(true);
+    };
+    restoreSession().catch(() => {
+      if (!active) return;
+      setSession(null);
+      configureApiSession(null);
       setAuthReady(true);
     });
     const { data: subscription } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      if (!active) return;
       setSession(nextSession || null);
       configureApiSession(nextSession || null);
       if (event === "PASSWORD_RECOVERY") setPasswordSetup(true);
       if (event === "USER_UPDATED") setPasswordSetup(false);
       if (event === "SIGNED_OUT") { setAccess(null); setAccessError(""); setPasswordSetup(false); }
     });
-    return () => subscription.subscription.unsubscribe();
+    return () => { active = false; subscription.subscription.unsubscribe(); };
   }, []);
 
   useEffect(() => {

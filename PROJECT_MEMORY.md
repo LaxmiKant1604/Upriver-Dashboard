@@ -318,6 +318,18 @@ screen. The bootstrap action remains hidden after initial setup; this is a
 presentation-only change and does not weaken the server-side administrator
 protection.
 
+**Session persistence fix (implemented 2026-07-29):** the browser Supabase
+client now uses explicit first-party
+`localStorage` using `upriver-dashboard-auth-v1`, with persistent refresh
+tokens enabled. App startup now attempts `refreshSession()` only when
+`getSession()` reports an error, so a recoverable expired access token is not
+treated as a logout. Existing users will need to sign in once after this
+storage-key migration; subsequent browser refreshes should keep them signed in
+unless they explicitly sign out, clear browser site data, or their Supabase
+session is revoked. `npm run build` passed; end-to-end refresh verification
+requires a signed-in browser session and must be performed by the dashboard
+owner after deployment.
+
 `DASHBOARD_APP_URL=https://upriverdashboard.vercel.app` is configured in
 Vercel Production for invitation redirects. Supabase Auth settings showed
 email signup enabled and email confirmation enabled on 2026-07-29. The
