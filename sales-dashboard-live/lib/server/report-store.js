@@ -50,6 +50,14 @@ export function wantsRefresh(req) {
   return value === "1" || value === "true" || value === "yes";
 }
 
+// A stale snapshot is only safe to serve across a date rollover when it was
+// produced by the current metric schema. A reportVersion bump means its
+// payload shape or definitions changed, so an older payload must not masquerade
+// as the new report.
+export function staleSnapshotMatchesReportVersion(snapshot, reportVersion) {
+  return snapshot?.params?.reportVersion === reportVersion;
+}
+
 function snapshotMeta(snapshot) {
   return {
     savedAt: snapshot.source_refreshed_at || snapshot.updated_at || null,
@@ -114,7 +122,7 @@ export async function serveSharedReport({
     // flag is what lets the UI say "this is yesterday's report" instead of
     // implying it is current.
     const latest = await getLatestReportSnapshot({ reportKey, accountId });
-    if (latest && latest.payload) {
+    if (latest && latest.payload && staleSnapshotMatchesReportVersion(latest, reportVersion)) {
       res.status(200).json({
         ...latest.payload,
         reportKey, reportVersion, paramsHash,

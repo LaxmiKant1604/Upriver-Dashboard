@@ -36,6 +36,8 @@ import {
 // The reason-bucket classifier runs server-side (the client receives rows that
 // are already bucketed), so it is imported from the report builder.
 import { classifyReturnReason } from "../lib/server/reports/returns.js";
+import { rollupPpcRows } from "../lib/server/reports/ppc.js";
+import { staleSnapshotMatchesReportVersion } from "../lib/server/report-store.js";
 import { csvCell, csvText } from "../src/lib/csv.js";
 import { fmtMoney, nInt, ratio } from "../src/lib/format.js";
 
@@ -520,6 +522,31 @@ test("PPC ratios are recomputed from summed numerators and denominators", () => 
 test("TACoS is withheld when total account sales is unavailable", () => {
   const metrics = ppcMetrics({ spend: 100, sales: 100, clicks: 1, impressions: 1, orders: 1, units: 1 }, { totalSales: null });
   assert.equal(metrics.tacos, null);
+});
+
+test("PPC rollups keep the same campaign separate by currency", () => {
+  const rows = [
+    { currency: "INR", campaign_id: "C1", campaign_type: "SPONSORED_PRODUCTS", metric_date: "2026-07-01", metrics: { ad_spend: 100, ad_sales: 400, ad_clicks: 20, ad_impressions: 1000, ad_orders: 4, ad_units_sold: 4 } },
+    { currency: "USD", campaign_id: "C1", campaign_type: "SPONSORED_PRODUCTS", metric_date: "2026-07-01", metrics: { ad_spend: 7, ad_sales: 28, ad_clicks: 2, ad_impressions: 100, ad_orders: 1, ad_units_sold: 1 } },
+  ];
+  const rolled = rollupPpcRows(
+    rows,
+    (row) => `${row.campaign_id}|${row.campaign_type}`,
+    (row) => ({ campaignId: row.campaign_id, campaignType: row.campaign_type }),
+    { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold" }
+  );
+  assert.equal(rolled.length, 2, "one campaign in two currencies must remain two rows");
+  const inr = rolled.find((row) => row.currencies[0] === "INR");
+  const usd = rolled.find((row) => row.currencies[0] === "USD");
+  assert.equal(inr.spend, 100);
+  assert.equal(usd.spend, 7);
+  assert.notEqual(inr.key, usd.key);
+});
+
+test("stale shared snapshots must match the current report version", () => {
+  assert.equal(staleSnapshotMatchesReportVersion({ params: { reportVersion: "ppc-v2" } }, "ppc-v2"), true);
+  assert.equal(staleSnapshotMatchesReportVersion({ params: { reportVersion: "ppc-v1" } }, "ppc-v2"), false);
+  assert.equal(staleSnapshotMatchesReportVersion({ params: {} }, "ppc-v2"), false);
 });
 
 test("dead spend needs the minimum click count", () => {

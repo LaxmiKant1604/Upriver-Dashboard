@@ -606,6 +606,29 @@ approval. Claude/Codex must read each referenced DataDoe `SKILL.md` and the
 data scheme before implementation, update this memory after every stage, run a
 senior code review, deploy only after source-level and browser-level checks.
 
+**Six-report senior review (2026-07-29, remediation completed locally):**
+`npm run verify` now passes 49 assertions and a full non-tree-shaken Vite build.
+Review fixed the following correctness risks before merge:
+
+- PPC rollups now include currency in their identity, so a campaign/ASIN/target
+  or search term reported in multiple currencies never has its money or ratios
+  combined. Account-wide PPC KPIs and TACoS are intentionally unavailable for a
+  multi-currency scope rather than fabricated.
+- Priority Feed uses campaign-level PPC insights only. Search-term, target and
+  ASIN views overlap that campaign spend and remain drill-down views, so adding
+  them to the feed would double-count waste.
+- Pagination of persisted Ads source rows is now ordered by metric date plus
+  its remaining primary-key fields (`source_key`, marketplace and
+  `dimension_key`). This makes PostgREST pages deterministic when an account has
+  more than 1,000 rows on a single date, preventing a partial or repeated PPC
+  rollup.
+- The cross-midnight fallback serves a saved snapshot only if its stored
+  `reportVersion` matches the currently requested metric schema. A future report
+  version change therefore cannot render an old payload under a new definition.
+
+Live DataDoe validation for one IN and one US account, plus signed-in browser
+and mobile validation, remain required before production deployment.
+
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
 ### What is implemented

@@ -93,17 +93,15 @@ export default function PriorityFeed({ reports, accountName, selectedBrand, curr
 
     const ppc = reports.ppc?.data;
     if (ppc && !ppc.snapshotMissing) {
-      // The feed uses the search-term level, where waste is most actionable, at
-      // the default 30% break-even. The PPC report itself lets you change that.
-      const rows = buildPpcRows(ppc, "searchTerms", { breakEvenAcos: 30, selectedBrand });
+      // Campaigns are the one non-overlapping PPC grain. Search terms, targets,
+      // and ASIN rows are useful drill-downs in the PPC report but each rolls
+      // up to campaign spend; adding them here would count the same exposure
+      // multiple times in the global priority total.
       const campaignRows = buildPpcRows(ppc, "campaigns", { breakEvenAcos: 30, selectedBrand });
       out.push({
         key: "ppc-performance",
         label: "PPC Performance",
-        insights: [
-          ...buildPpcInsights(ppc, rows, "searchTerms", 30),
-          ...buildPpcInsights(ppc, campaignRows, "campaigns", 30),
-        ],
+        insights: buildPpcInsights(ppc, campaignRows, "campaigns", 30),
       });
     } else {
       out.push({ key: "ppc-performance", label: "PPC Performance", insights: [], missing: true });

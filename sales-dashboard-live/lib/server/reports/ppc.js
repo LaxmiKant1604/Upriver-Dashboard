@@ -69,11 +69,16 @@ function accumulate(target, row, salesKey, ordersKey, unitsKey) {
  * Every bucket keeps `campaignTypes` so the UI can show which ad products a row
  * actually represents instead of implying full SP+SB+SD coverage.
  */
-function rollup(rows, keyFn, labelFn, { salesKey, ordersKey, unitsKey }) {
+export function rollupPpcRows(rows, keyFn, labelFn, { salesKey, ordersKey, unitsKey }) {
   const byKey = new Map();
   for (const row of rows) {
-    const key = keyFn(row);
-    if (key === null || key === undefined || key === "") continue;
+    const entityKey = keyFn(row);
+    if (entityKey === null || entityKey === undefined || entityKey === "") continue;
+    // A campaign, target, or search term can only be summed with rows in the
+    // same currency. Including currency in the storage key prevents a
+    // multi-marketplace account from displaying INR + USD as one amount.
+    const currency = String(row.currency || "").trim() || null;
+    const key = `${currency || "?"}|${entityKey}`;
     let entry = byKey.get(key);
     if (!entry) {
       entry = {
@@ -87,7 +92,7 @@ function rollup(rows, keyFn, labelFn, { salesKey, ordersKey, unitsKey }) {
       byKey.set(key, entry);
     }
     accumulate(entry, row, salesKey, ordersKey, unitsKey);
-    if (row.currency) entry.currencies.add(row.currency);
+    if (currency) entry.currencies.add(currency);
     if (row.campaign_type) entry.campaignTypes.add(row.campaign_type);
     if (row.metric_date) entry.days.add(row.metric_date);
   }
@@ -124,7 +129,7 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
   const searchTermRows = bySource.get(ADS_SEARCH_TERMS.syncKey) || [];
 
   // Campaign performance uses account-level ad_sales / ad_orders.
-  const campaigns = rollup(
+  const campaigns = rollupPpcRows(
     campaignRows,
     (row) => `${row.campaign_id}|${row.campaign_type}`,
     (row) => ({
@@ -141,7 +146,7 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
 
   // ASIN performance is same-SKU attributed in this source; the aliases make
   // that explicit rather than presenting it as total attributed sales.
-  const asins = rollup(
+  const asins = rollupPpcRows(
     asinRows,
     (row) => row.child_asin,
     (row) => ({
@@ -152,7 +157,7 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
     { salesKey: "ad_sales_same_sku", ordersKey: "ad_orders_same_sku", unitsKey: "ad_units_sold_same_sku" }
   );
 
-  const targets = rollup(
+  const targets = rollupPpcRows(
     targetingRows,
     (row) => `${row.targeting_id || row.dimensions?.ad_keyword_id || ""}|${row.campaign_id}|${row.dimensions?.ad_group_id || ""}`,
     (row) => ({
@@ -167,7 +172,7 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
     { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold_click" }
   );
 
-  const searchTerms = rollup(
+  const searchTerms = rollupPpcRows(
     searchTermRows,
     (row) => `${row.dimensions?.ad_search_term || ""}|${row.campaign_id}|${row.dimensions?.ad_group_id || ""}`,
     (row) => ({
@@ -187,32 +192,39 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
   for (const row of campaignRows) {
     const date = row.metric_date;
     if (!date) continue;
-    const entry = dailyMap.get(date) || { date, ...emptyTotals() };
+    const currency = String(row.currency || "").trim() || null;
+    const key = `${date}|${currency || "?"}`;
+    const entry = dailyMap.get(key) || { date, currency, ...emptyTotals() };
     accumulate(entry, row, "ad_sales", "ad_orders", "ad_units_sold");
-    dailyMap.set(date, entry);
+    dailyMap.set(key, entry);
   }
   const daily = [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date));
 
   // TACoS needs total account sales, which no Ads table carries. One small
   // grouped export, on explicit refresh only, saved into the shared snapshot.
+  const currencies = [...new Set(adsRows.map((row) => row.currency).filter(Boolean))].sort();
   let totalSales = null;
   let totalSalesUnavailable = null;
-  try {
-    const salesRows = await fetchExportRowsStrict(
-      apiKey, SALES_TRAFFIC.id, TOTAL_SALES_GROUP_BY, ids, from, to, ROW_LIMITS.dateRollup,
-      {
-        groupBy: TOTAL_SALES_GROUP_BY,
-        aggregations: TOTAL_SALES_AGGREGATIONS,
-        orderByColumn: "date",
-        orderByDirection: "ASC",
-      },
-      "PPC total-sales export"
-    );
-    totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "sales_sum", "total_sales"), 0);
-  } catch (error) {
-    // TACoS is the only metric that needs this. Losing it must not lose the
-    // whole report, so it degrades to "unavailable" rather than throwing.
-    totalSalesUnavailable = error instanceof Error ? error.message : String(error);
+  if (currencies.length > 1) {
+    totalSalesUnavailable = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
+  } else {
+    try {
+      const salesRows = await fetchExportRowsStrict(
+        apiKey, SALES_TRAFFIC.id, TOTAL_SALES_GROUP_BY, ids, from, to, ROW_LIMITS.dateRollup,
+        {
+          groupBy: TOTAL_SALES_GROUP_BY,
+          aggregations: TOTAL_SALES_AGGREGATIONS,
+          orderByColumn: "date",
+          orderByDirection: "ASC",
+        },
+        "PPC total-sales export"
+      );
+      totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "sales_sum", "total_sales"), 0);
+    } catch (error) {
+      // TACoS is the only metric that needs this. Losing it must not lose the
+      // whole report, so it degrades to "unavailable" rather than throwing.
+      totalSalesUnavailable = error instanceof Error ? error.message : String(error);
+    }
   }
 
   const catalog = await fetchCatalog(apiKey, ids);
@@ -222,7 +234,6 @@ export async function buildPpcPerformance({ apiKey, ids, to }) {
     row.brand = brandLabel(meta.brand);
   }
 
-  const currencies = [...new Set(adsRows.map((row) => row.currency).filter(Boolean))].sort();
   const latestMetricDate = adsRows.reduce(
     (latest, row) => (!latest || row.metric_date > latest ? row.metric_date : latest),
     null

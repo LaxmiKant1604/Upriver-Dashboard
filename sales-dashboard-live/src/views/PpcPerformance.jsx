@@ -85,6 +85,10 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
 
   const account = useMemo(() => {
     if (!data?.campaigns) return null;
+    // Account KPIs need one monetary unit. Individual table rows remain
+    // available per currency, but an account-wide ACoS/TACoS across currencies
+    // would be a fabricated ratio.
+    if ((data.currencies?.length || 0) > 1) return null;
     const totals = data.campaigns.reduce((acc, row) => ({
       spend: acc.spend + (Number(row.spend) || 0),
       sales: acc.sales + (Number(row.sales) || 0),

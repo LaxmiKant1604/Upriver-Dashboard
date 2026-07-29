@@ -363,7 +363,11 @@ export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, m
       account_id: `eq.${accountId}`,
       source_key: `in.(${sourceKeys.join(",")})`,
       and: `(metric_date.gte.${from},metric_date.lte.${to})`,
-      order: "metric_date.asc",
+      // A date alone is not deterministic when one day has more than one
+      // thousand rows. The remaining primary-key fields prevent PostgREST
+      // offset pages from skipping or repeating tied same-day rows while the
+      // PPC report aggregates multiple saved source types.
+      order: "metric_date.asc,source_key.asc,marketplace_country_code.asc,dimension_key.asc",
       limit: String(ADS_ROW_PAGE_SIZE),
       offset: String(offset),
     });
