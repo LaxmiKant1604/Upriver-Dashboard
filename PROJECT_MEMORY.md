@@ -630,6 +630,21 @@ Review fixed the following correctness risks before merge:
 Live DataDoe validation for one IN and one US account, plus signed-in browser
 and mobile validation, remain required before production deployment.
 
+**Marketplace-aware dashboard foundation (2026-07-29, ready to deploy):**
+`sales-dashboard-live/lib/marketplaces.js` is the single source of truth for
+marketplace country, default currency, numeric locale and IANA timezone. It
+covers the current IN/US/CA/AU accounts and the UK plus Amazon Europe
+marketplaces (DE, FR, IT, ES, NL, BE, IE, PL and SE), with safe profiles for
+other supported marketplaces. `fetchAccounts` now returns normalized country,
+currency, locale and timezone metadata. Every report window derives its
+date-only `to` value from the *selected account's marketplace day*, preventing
+an India-based user from requesting tomorrow's US/Canada data near midnight (or
+the reverse). Display money respects the currency locale, dashboard breakdowns
+no longer hard-code INR, and content-alert timestamps use the selected
+marketplace timezone. This is intentionally account-scoped: currencies are
+still never converted or combined. Validation: 50 insight assertions and the
+full Vite build pass. The deployment/production browser check is the next step.
+
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
 ### What is implemented

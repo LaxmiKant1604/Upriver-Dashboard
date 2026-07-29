@@ -38,6 +38,7 @@ import {
 import { classifyReturnReason } from "../lib/server/reports/returns.js";
 import { rollupPpcRows } from "../lib/server/reports/ppc.js";
 import { staleSnapshotMatchesReportVersion } from "../lib/server/report-store.js";
+import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell, csvText } from "../src/lib/csv.js";
 import { fmtMoney, nInt, ratio } from "../src/lib/format.js";
 
@@ -547,6 +548,17 @@ test("stale shared snapshots must match the current report version", () => {
   assert.equal(staleSnapshotMatchesReportVersion({ params: { reportVersion: "ppc-v2" } }, "ppc-v2"), true);
   assert.equal(staleSnapshotMatchesReportVersion({ params: { reportVersion: "ppc-v1" } }, "ppc-v2"), false);
   assert.equal(staleSnapshotMatchesReportVersion({ params: {} }, "ppc-v2"), false);
+});
+
+test("marketplace profiles cover Europe and use the marketplace business day", () => {
+  assert.deepEqual(
+    marketplaceProfile("DE"),
+    { country: "DE", countryName: "Germany", currency: "EUR", locale: "de-DE", timeZone: "Europe/Berlin" }
+  );
+  assert.equal(marketplaceProfile("CA").currency, "CAD");
+  assert.equal(marketplaceProfile("PL").currency, "PLN");
+  assert.equal(marketplaceToday("US", new Date("2026-07-30T01:30:00.000Z")), "2026-07-29");
+  assert.equal(marketplaceToday("IN", new Date("2026-07-30T01:30:00.000Z")), "2026-07-30");
 });
 
 test("dead spend needs the minimum click count", () => {

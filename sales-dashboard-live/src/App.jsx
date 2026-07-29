@@ -8,8 +8,9 @@ import {
   FLAGS, FX, FX_AS_OF, MONTH_ABBR, SYMBOL,
   addDays, compactNumber, daysInMonth, fmtDateHuman, fmtMoney, fmtMoneyCompact,
   fmtPct, fmtRangeLabel, fromUTC, monthBack, monthKeyLabel, monthStart, nInt,
-  pad2, parts, pct, shiftMonthRange, todayStr, toUTC, weekStart, yearStart,
+  pad2, parts, pct, shiftMonthRange, toUTC, weekStart, yearStart,
 } from "./lib/format.js";
+import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell } from "./lib/csv.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
@@ -1148,8 +1149,6 @@ function DashboardApp({ session, access, onSignOut }) {
   const [keywordRankStatus, setKeywordRankStatus] = useState("ALL");
   const [keywordRankSort, setKeywordRankSort] = useState({ key: "priority", dir: "asc" });
 
-  const TODAY = todayStr();
-
   const applyAccounts = useCallback((body) => {
     const nextAccounts = (body.accounts || []).filter((account) => isAdmin || allowedAccountIds.has(String(account.id)));
     setAccounts(nextAccounts);
@@ -1186,6 +1185,15 @@ function DashboardApp({ session, access, onSignOut }) {
     accounts.forEach((a) => (m[a.id] = a));
     return m;
   }, [accounts]);
+
+  const selectedMarketplace = marketplaceProfile(
+    accountById[selectedAccountId]?.country,
+    accountById[selectedAccountId]?.currency
+  );
+  // All report windows follow the selected marketplace's business day. This
+  // keeps a US, Canadian, Australian, Indian, or European account from being
+  // queried for the wrong calendar date when the viewer is elsewhere.
+  const TODAY = marketplaceToday(selectedMarketplace.country);
 
   const dashboardParams = useMemo(() => {
     if (!selectedAccountId) {
@@ -1583,7 +1591,7 @@ function DashboardApp({ session, access, onSignOut }) {
     }
   }, [activeInsightReport?.data]);
 
-  const dailyCurrency = accountById[selectedAccountId]?.currency || "INR";
+  const dailyCurrency = selectedMarketplace.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
     // The sales source can emit a newer zero-sales row before its daily data
@@ -1772,7 +1780,7 @@ function DashboardApp({ session, access, onSignOut }) {
     });
   }, []);
 
-  const displayCurrency = accountById[selectedAccountId]?.currency || "INR";
+  const displayCurrency = selectedMarketplace.currency || "INR";
 
   /* ===== SKU P&L Analyzer derived data (all local, no refetch) ===== */
   // The effective currency is always a single currency; currencies are never mixed.
@@ -2417,8 +2425,8 @@ function DashboardApp({ session, access, onSignOut }) {
         </div>
 
         <div className="breakdown-grid">
-          <BreakdownPanel title="Sales by Account" items={byAccountBreakdown} activeKeys={activeAccountKeys} currency="INR" />
-          <BreakdownPanel title="Sales by Brand" items={byBrandBreakdown} activeKeys={activeBrandKeys} currency="INR" />
+          <BreakdownPanel title="Sales by Account" items={byAccountBreakdown} activeKeys={activeAccountKeys} currency={displayCurrency} />
+          <BreakdownPanel title="Sales by Brand" items={byBrandBreakdown} activeKeys={activeBrandKeys} currency={displayCurrency} />
         </div>
 
         <div className="footer-note">
@@ -3110,7 +3118,7 @@ function DashboardApp({ session, access, onSignOut }) {
               <label className="plan-field recon-search"><span className="plan-field-label">Search</span><span className="plan-search-wrap"><Search size={14} /><input value={contentChangesSearch} onChange={(e) => setContentChangesSearch(e.target.value)} placeholder="ASIN, brand, notification ID, or payload..." /></span></label>
               <label className="plan-field recon-select"><span className="plan-field-label">Event type</span><select value={contentChangesType} onChange={(e) => setContentChangesType(e.target.value)}><option value="ALL">All types</option>{contentChangeTypes.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
             </div>
-            <div className="recon-table-scroll"><table className="recon-table content-alerts-table"><thead><tr><th>Event time</th><th>Type</th><th>ASINs</th><th>Brands</th><th>Notification ID</th><th>Details</th></tr></thead><tbody>{contentChangeEvents.map((event, index) => <tr key={event.notificationId || `${event.eventTime}-${index}`}><td>{event.eventTime ? new Date(event.eventTime).toLocaleString() : "-"}</td><td>{event.notificationType || "-"}</td><td className="mono">{event.asins?.length ? event.asins.join(", ") : "-"}</td><td>{event.brands?.length ? event.brands.join(", ") : "Unassigned"}</td><td className="mono">{event.notificationId || "-"}</td><td><span className="content-preview" title={event.payloadPreview || event.metadataPreview || ""}>{event.metadataPreview || event.payloadPreview || "-"}</span></td></tr>)}</tbody></table></div>
+            <div className="recon-table-scroll"><table className="recon-table content-alerts-table"><thead><tr><th>Event time</th><th>Type</th><th>ASINs</th><th>Brands</th><th>Notification ID</th><th>Details</th></tr></thead><tbody>{contentChangeEvents.map((event, index) => <tr key={event.notificationId || `${event.eventTime}-${index}`}><td>{event.eventTime ? new Date(event.eventTime).toLocaleString(selectedMarketplace.locale, { timeZone: selectedMarketplace.timeZone }) : "-"}</td><td>{event.notificationType || "-"}</td><td className="mono">{event.asins?.length ? event.asins.join(", ") : "-"}</td><td>{event.brands?.length ? event.brands.join(", ") : "Unassigned"}</td><td className="mono">{event.notificationId || "-"}</td><td><span className="content-preview" title={event.payloadPreview || event.metadataPreview || ""}>{event.metadataPreview || event.payloadPreview || "-"}</span></td></tr>)}</tbody></table></div>
             {!contentChangeEvents.length && <div className="empty-note">{selectedBrand === "ALL" ? "No content change events were returned for this account." : "No content change events match the selected brand."}</div>}
           </div>
 

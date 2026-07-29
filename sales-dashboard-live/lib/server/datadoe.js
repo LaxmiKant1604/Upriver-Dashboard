@@ -11,6 +11,8 @@
 // - Sources without a date column (Listings, Product Catalog) must not receive
 //   a from/to range, and must order by a column that actually exists.
 
+import { marketplaceProfile } from "../marketplaces.js";
+
 export const DATADOE_BASE = "https://api.datadoe.com/api/v1";
 
 export const ENDPOINTS = {
@@ -76,13 +78,18 @@ export async function fetchAccounts(apiKey) {
   }
   const body = await r.json();
   const list = body.data || body.results || (Array.isArray(body) ? body : []);
-  return list.map((a) => ({
-    id: a.id,
-    name: a.name,
-    country: a.marketplaceCountryCode,
-    countryName: a.marketplaceCountryName,
-    currency: a.currency || null,
-  }));
+  return list.map((a) => {
+    const profile = marketplaceProfile(a.marketplaceCountryCode, a.currency);
+    return {
+      id: a.id,
+      name: a.name,
+      country: profile.country,
+      countryName: a.marketplaceCountryName || profile.countryName,
+      currency: profile.currency,
+      locale: profile.locale,
+      timeZone: profile.timeZone,
+    };
+  });
 }
 
 export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {

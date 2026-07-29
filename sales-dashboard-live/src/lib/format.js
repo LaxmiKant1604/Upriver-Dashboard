@@ -5,6 +5,8 @@
 // is always passed in explicitly: nothing here ever converts between
 // currencies, because no report is allowed to combine them.
 
+import { marketplaceProfile } from "../../lib/marketplaces.js";
+
 /* ============================== CONSTANTS ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
 // These are static and will drift over time — update periodically, or
@@ -15,6 +17,16 @@ export const FX_AS_OF = "2026-07-01";
 export const FLAGS = { IN: "🇮🇳", US: "🇺🇸", AU: "🇦🇺", CA: "🇨🇦", UK: "🇬🇧", GB: "🇬🇧", DE: "🇩🇪", FR: "🇫🇷", JP: "🇯🇵", MX: "🇲🇽" };
 export const SYMBOL = { INR: "₹", USD: "$", AUD: "A$", CAD: "C$", GBP: "£", EUR: "€" };
 export const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+Object.assign(FLAGS, {
+  IT: "\u{1F1EE}\u{1F1F9}", ES: "\u{1F1EA}\u{1F1F8}", NL: "\u{1F1F3}\u{1F1F1}", BE: "\u{1F1E7}\u{1F1EA}",
+  IE: "\u{1F1EE}\u{1F1EA}", PL: "\u{1F1F5}\u{1F1F1}", SE: "\u{1F1F8}\u{1F1EA}", TR: "\u{1F1F9}\u{1F1F7}",
+  AE: "\u{1F1E6}\u{1F1EA}", SA: "\u{1F1F8}\u{1F1E6}", BR: "\u{1F1E7}\u{1F1F7}", SG: "\u{1F1F8}\u{1F1EC}", EG: "\u{1F1EA}\u{1F1EC}",
+});
+Object.assign(SYMBOL, {
+  PLN: "z\u0142", SEK: "kr", TRY: "\u20BA", AED: "AED ", SAR: "SAR ", JPY: "\u00A5",
+  MXN: "MX$", BRL: "R$", SGD: "S$", EGP: "EGP ",
+});
 
 /* ============================== DATE HELPERS ============================== */
 export function pad2(n) { return String(n).padStart(2, "0"); }
@@ -84,13 +96,13 @@ export function fmtPoints(v, decimals = 1) {
   return `${v >= 0 ? "+" : ""}${Number(v).toFixed(decimals)}pp`;
 }
 
-export function fmtMoney(value, currency, decimals) {
+export function fmtMoney(value, currency, decimals, country) {
   if (value === null || value === undefined || !isFinite(value)) return "—";
   const d = decimals === undefined ? 0 : decimals;
-  const symbol = SYMBOL[currency] || (currency ? currency + " " : "");
-  const locale = currency === "INR" ? "en-IN" : "en-US";
+  const profile = marketplaceProfile(country, currency);
+  const symbol = SYMBOL[profile.currency] || (profile.currency ? profile.currency + " " : "");
   const n = Number(value || 0);
-  return symbol + n.toLocaleString(locale, { minimumFractionDigits: d, maximumFractionDigits: d });
+  return symbol + n.toLocaleString(profile.locale, { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
 export function compactNumber(v, currency) {
