@@ -292,6 +292,14 @@ Public org: https://github.com/Deltologic. Two repos are the most useful referen
 5. Sign in, open **User Access**, load the account directory once, invite each
    user, and tick only the accounts that user should access.
 
+**Observed setup issue (2026-07-29):** the first administrator confirmation
+email redirected to `http://localhost:3000` and then showed
+`error_code=otp_expired`. This confirms Supabase Auth URL Configuration has not
+yet been changed from its local-development default and that specific email
+link is no longer usable. Set the Site/Redirect URLs above first, then request
+a fresh confirmation email from the production dashboard. Do not troubleshoot
+the old link or start a localhost server merely to complete it.
+
 `DASHBOARD_APP_URL=https://upriverdashboard.vercel.app` is configured in
 Vercel Production for invitation redirects. Supabase Auth settings showed
 email signup enabled and email confirmation enabled on 2026-07-29. The
