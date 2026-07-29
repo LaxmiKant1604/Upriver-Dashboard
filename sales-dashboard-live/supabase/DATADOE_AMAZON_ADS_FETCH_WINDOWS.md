@@ -56,6 +56,22 @@ from the DataDoe source dependencies on 2026-07-29:
 Always retain/filter `ad_campaign_type` in a combined PPC report so users can
 see which ad products contributed to the totals.
 
+## Date grain for the three core Ads reports
+
+All three sources include a `date` field and can power day-wise or month-wise
+reports, but they must be aggregated at their own grain before comparison:
+
+- **Keyword Targeting Performance:** one dated performance grain per targeting
+  entity/keyword and campaign (with campaign/ad-group context). Sum metrics by
+  date when presenting an account, campaign, or month total; keep
+  `ad_campaign_type` to split SP/SB/SD.
+- **Ad Performance by ASIN & Date:** one dated performance grain per advertised
+  child ASIN. It is for product-level attribution and should be summed by date
+  only when a product breakdown is not required.
+- **Ad Performance by Campaign & Date:** one dated performance grain per
+  campaign. It is the compact source for account/campaign daily totals and is
+  the preferred current source for the existing Daily Reporting ads metrics.
+
 ## Continuous configuration and Marketing Stream reports
 
 These have `CONTINUOUS` fetch metadata, not a stated number of historical days:
