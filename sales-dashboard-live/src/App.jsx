@@ -16,6 +16,7 @@ import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
+import ListingOptimizer from "./views/ListingOptimizer.jsx";
 
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
@@ -1543,12 +1544,17 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (insightScope ? { action: "ppc-performance", ...insightScope } : null),
     [insightScope]
   );
+  const optimizerParams = useMemo(
+    () => (insightScope ? { action: "listing-optimizer", ...insightScope } : null),
+    [insightScope]
+  );
 
   const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" });
   const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" });
   const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" });
   const returns = useSharedReport({ params: returnsParams, active: view === "returns" });
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" });
+  const optimizer = useSharedReport({ params: optimizerParams, active: view === "optimizer" });
 
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
@@ -1556,7 +1562,8 @@ function DashboardApp({ session, access, onSignOut }) {
     buybox: { report: buyBox, label: "Buy Box Loss" },
     returns: { report: returns, label: "Returns & Refund Leakage" },
     ppc: { report: ppc, label: "PPC Performance" },
-  }), [salesMovers, listingHealth, buyBox, returns, ppc]);
+    optimizer: { report: optimizer, label: "Listing & Search Optimizer" },
+  }), [salesMovers, listingHealth, buyBox, returns, ppc, optimizer]);
   const activeInsightReport = INSIGHT_VIEWS[view]?.report || null;
 
   // Every insight report returns the brands present in its own scope so the
@@ -2217,6 +2224,10 @@ function DashboardApp({ session, access, onSignOut }) {
             <button className={"sb-nav-item" + (view === "ppc" ? " active" : "")} title="PPC Performance &amp; Wasted Spend" onClick={() => { setView("ppc"); setMobileOpen(false); }}>
               <Megaphone size={18} />
               <span className="sb-nav-label">PPC Performance</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "optimizer" ? " active" : "")} title="Listing &amp; Search Optimizer — search-funnel and content gaps" onClick={() => { setView("optimizer"); setMobileOpen(false); }}>
+              <FileSearch size={18} />
+              <span className="sb-nav-label">Listing Optimizer</span>
             </button>
             {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
               <UsersRound size={18} />
@@ -3146,6 +3157,16 @@ function DashboardApp({ session, access, onSignOut }) {
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}
+        />
+      )}
+
+      {view === "optimizer" && (
+        <ListingOptimizer
+          data={optimizer.data}
+          loading={optimizer.loading}
+          error={optimizer.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
         />
       )}
         </div>

@@ -617,6 +617,365 @@ const BUY_BOX_ACTIONS = {
 };
 
 /* ==================================================================== */
+/* Listing & Search Optimizer                                            */
+/* ==================================================================== */
+
+const OPTIMIZER_LABEL = "Listing & Search Optimizer";
+
+// Amazon's 2026 title rule for non-media categories.
+export const TITLE_MAX_CHARS = 75;
+const PROMOTIONAL_WORDS = /\b(best|best[- ]seller|sale|cheap|free shipping|hot|new|#1|number one|top rated|guaranteed|discount|deal)\b/i;
+// Symbols Amazon disallows in titles unless part of a brand name.
+const BANNED_TITLE_SYMBOLS = /[!$?_{}^¬¦]/;
+
+const STOP_WORDS = new Set([
+  "the", "a", "an", "and", "or", "for", "with", "of", "to", "in", "on", "at", "by",
+  "from", "is", "it", "as", "be", "are", "this", "that", "your", "you", "my", "our",
+]);
+
+function tokenise(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+}
+
+/**
+ * Per-query funnel metrics, each derived from summed counts so nothing is an
+ * average of averages. Market rates are the whole query's rates and are what
+ * make "below market" a measurement rather than a guess.
+ */
+export function optimizerQueryMetrics(query) {
+  const impressionShare = ratio(query.asinImpressions, query.totalImpressions);
+  const yourCtr = ratio(query.asinClicks, query.asinImpressions);
+  const marketCtr = ratio(query.totalClicks, query.totalImpressions);
+  const yourCvr = ratio(query.asinPurchases, query.asinClicks);
+  const marketCvr = ratio(query.totalPurchases, query.totalClicks);
+  const cartRate = ratio(query.asinCartAdds, query.asinClicks);
+  const marketCartRate = ratio(query.totalCartAdds, query.totalClicks);
+  const purchaseShare = ratio(query.asinPurchases, query.totalPurchases);
+  return {
+    ...query,
+    impressionShare,
+    yourCtr, marketCtr,
+    ctrVsMarket: yourCtr !== null && marketCtr !== null && marketCtr > 0 ? yourCtr / marketCtr : null,
+    yourCvr, marketCvr,
+    cvrVsMarket: yourCvr !== null && marketCvr !== null && marketCvr > 0 ? yourCvr / marketCvr : null,
+    cartRate, marketCartRate,
+    purchaseShare,
+  };
+}
+
+export const OPTIMIZER_GATES = {
+  relevance: {
+    label: "Probably not your product",
+    tone: "ok",
+    why: "Low impression share with both click-through AND conversion below the market rate for this query. That pattern means shoppers on this term do not want this product.",
+    action: "Do not chase this term. Spending on it or adding it to the listing would import irrelevant traffic.",
+  },
+  discoverability: {
+    label: "Not indexed well",
+    tone: "warn",
+    why: "The query has real volume and this ASIN converts at or above the market rate, but its impression share is low and its best organic rank is weak. Amazon is not showing it for a term it wins when shown.",
+    action: "Add this term to the listing where it is genuinely accurate — title if it is the primary term, otherwise a bullet or a structured attribute.",
+  },
+  exposure: {
+    label: "Needs rank or ads",
+    tone: "warn",
+    why: "Click-through and conversion are at or above market, so the copy is not the problem — only exposure is.",
+    action: "Push exposure rather than rewriting copy: raise rank with ads on this term and protect stock and Buy Box.",
+  },
+  click_rate: {
+    label: "Click-through below market",
+    tone: "warn",
+    why: "This ASIN gets impressions on the query but is clicked less often than the query average, which is a main-image, title or price signal.",
+    action: "Test the main image and the front of the title for this term, and check the price against the featured offer.",
+  },
+  conversion: {
+    label: "Conversion below market",
+    tone: "bad",
+    why: "Shoppers click this ASIN at or above the market rate and then do not buy, which is an offer-page problem rather than a discovery problem.",
+    action: "Work the offer page: bullets, A+ content, images, reviews and price. Check the cart-add rate to see whether shoppers drop before or after the cart.",
+  },
+  strong: {
+    label: "Winning",
+    tone: "ok",
+    why: "Impression share, click-through and conversion are all at or above the market rate for this query.",
+    action: "Protect it: keep stock and Buy Box, and keep the term in the listing.",
+  },
+};
+
+/**
+ * Classify one query, in the blueprint's order. Each gate needs both sides of a
+ * comparison to exist; a query without market denominators is left unclassified
+ * rather than being forced into a bucket.
+ */
+export function classifyOptimizerQuery(metrics, { lowShare = 0.1, weakRank = 20 } = {}) {
+  const { impressionShare, ctrVsMarket, cvrVsMarket, bestRank } = metrics;
+  if (impressionShare === null || ctrVsMarket === null || cvrVsMarket === null) return null;
+  const lowExposure = impressionShare < lowShare;
+  const weakCtr = ctrVsMarket < 0.8;
+  const weakCvr = cvrVsMarket < 0.8;
+
+  if (lowExposure && weakCtr && weakCvr) return "relevance";
+  if (lowExposure && !weakCvr && (bestRank === null || bestRank > weakRank)) return "discoverability";
+  if (lowExposure && !weakCtr && !weakCvr) return "exposure";
+  if (weakCtr) return "click_rate";
+  if (weakCvr) return "conversion";
+  return "strong";
+}
+
+/** Deterministic title checks against Amazon's published 2026 title rules. */
+export function auditTitle(title) {
+  const text = String(title || "");
+  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const counts = new Map();
+  words.forEach((word) => {
+    if (STOP_WORDS.has(word)) return;
+    counts.set(word, (counts.get(word) || 0) + 1);
+  });
+  const repeated = [...counts.entries()].filter(([, count]) => count > 2).map(([word]) => word);
+  const promotional = text.match(PROMOTIONAL_WORDS);
+  const bannedSymbol = text.match(BANNED_TITLE_SYMBOLS);
+  return {
+    length: text.length,
+    overLength: text.length > TITLE_MAX_CHARS,
+    repeatedWords: repeated,
+    promotionalWord: promotional ? promotional[0] : null,
+    bannedSymbol: bannedSymbol ? bannedSymbol[0] : null,
+    missing: text.trim().length === 0,
+  };
+}
+
+/**
+ * Build one row per ASIN: the funnel gates its queries fall into, its content
+ * gaps, and the money keywords whose terms are missing from the listing.
+ */
+export function buildOptimizerRows(data, selectedBrand) {
+  if (!data || !data.sqpAvailable) return [];
+  const productByAsin = new Map((data.products || []).map((product) => [product.asin, product]));
+  const byAsin = new Map();
+
+  for (const rawQuery of data.queries || []) {
+    const product = productByAsin.get(rawQuery.asin) || { asin: rawQuery.asin, name: null, brand: "Unassigned", bullets: [], description: null, hasImage: false };
+    if (selectedBrand !== "ALL" && product.brand !== selectedBrand) continue;
+    const metrics = optimizerQueryMetrics(rawQuery);
+    const gate = classifyOptimizerQuery(metrics);
+
+    let entry = byAsin.get(rawQuery.asin);
+    if (!entry) {
+      const listingText = [product.name, ...(product.bullets || []), product.description].filter(Boolean).join(" ").toLowerCase();
+      entry = {
+        asin: rawQuery.asin,
+        productName: product.name,
+        brand: product.brand,
+        category: product.category || null,
+        bestSellerRank: product.bestSellerRank || null,
+        bulletCount: (product.bullets || []).length,
+        hasDescription: Boolean(product.description),
+        hasImage: Boolean(product.hasImage),
+        title: product.name,
+        titleAudit: auditTitle(product.name),
+        listingText,
+        queries: [],
+        gateCounts: {},
+        volume: 0,
+        purchases: 0,
+        clicks: 0,
+        impressions: 0,
+      };
+      byAsin.set(rawQuery.asin, entry);
+    }
+    entry.queries.push({ ...metrics, gate });
+    if (gate) entry.gateCounts[gate] = (entry.gateCounts[gate] || 0) + 1;
+    entry.volume += Number(rawQuery.volume) || 0;
+    entry.purchases += Number(rawQuery.asinPurchases) || 0;
+    entry.clicks += Number(rawQuery.asinClicks) || 0;
+    entry.impressions += Number(rawQuery.asinImpressions) || 0;
+  }
+
+  return [...byAsin.values()].map((entry) => {
+    // Money keywords: queries that actually converted for this ASIN, ranked by
+    // the purchases they produced.
+    const moneyQueries = entry.queries
+      .filter((query) => query.asinPurchases > 0)
+      .sort((a, b) => b.asinPurchases - a.asinPurchases);
+
+    // A keyword gap is a token from a converting query that appears nowhere in
+    // the title, bullets or description. This is a coverage fact, not a
+    // suggestion to stuff the listing.
+    const gaps = new Map();
+    for (const query of moneyQueries) {
+      for (const token of tokenise(query.query)) {
+        if (entry.listingText.includes(token)) continue;
+        const current = gaps.get(token) || { token, purchases: 0, volume: 0, queries: [] };
+        current.purchases += query.asinPurchases;
+        current.volume += query.volume;
+        if (current.queries.length < 3) current.queries.push(query.query);
+        gaps.set(token, current);
+      }
+    }
+    const keywordGaps = [...gaps.values()].sort((a, b) => b.purchases - a.purchases).slice(0, 12);
+
+    // The single most important query is the biggest converter; whether it is in
+    // the title is the highest-leverage yes/no in the whole report.
+    const topQuery = moneyQueries[0] || null;
+    const topQueryInTitle = topQuery && entry.title
+      ? tokenise(topQuery.query).every((token) => String(entry.title).toLowerCase().includes(token))
+      : null;
+
+    const contentIssues = [];
+    if (entry.titleAudit.missing) contentIssues.push("No title in the catalog record");
+    if (entry.titleAudit.overLength) contentIssues.push(`Title is ${entry.titleAudit.length} characters, over Amazon's ${TITLE_MAX_CHARS}-character limit`);
+    if (entry.titleAudit.promotionalWord) contentIssues.push(`Title contains the promotional word "${entry.titleAudit.promotionalWord}"`);
+    if (entry.titleAudit.bannedSymbol) contentIssues.push(`Title contains the disallowed symbol "${entry.titleAudit.bannedSymbol}"`);
+    if (entry.titleAudit.repeatedWords.length) contentIssues.push(`Title repeats ${entry.titleAudit.repeatedWords.join(", ")} more than twice`);
+    if (entry.bulletCount < 5) contentIssues.push(`Only ${entry.bulletCount} of 5 bullet points are filled`);
+    if (!entry.hasDescription) contentIssues.push("No product description");
+    if (!entry.hasImage) contentIssues.push("No main image URL in the catalog record");
+
+    const dominantGate = Object.entries(entry.gateCounts).sort((a, b) => b[1] - a[1])[0] || null;
+
+    return {
+      ...entry,
+      queryCount: entry.queries.length,
+      moneyQueryCount: moneyQueries.length,
+      topQuery,
+      topQueryInTitle,
+      keywordGaps,
+      contentIssues,
+      dominantGate: dominantGate ? dominantGate[0] : null,
+      dominantGateMeta: dominantGate ? OPTIMIZER_GATES[dominantGate[0]] : null,
+      // Scope-level funnel rates, recomputed from the summed counts.
+      ctr: ratio(entry.clicks, entry.impressions),
+      cvr: ratio(entry.purchases, entry.clicks),
+    };
+  });
+}
+
+export function buildOptimizerInsights(data, rows) {
+  if (!data || !data.sqpAvailable) return [];
+  const freshness = freshnessNote({
+    sourceLabel: data.sqpSourceLabel,
+    asOf: data.periods?.[data.periods.length - 1],
+    extra: `${data.periodCount} weekly period${data.periodCount === 1 ? "" : "s"} in a ${data.window?.days}-day window`,
+  });
+  const insights = [];
+
+  for (const row of rows) {
+    const label = row.productName || row.asin;
+
+    // The single highest-leverage finding in the blueprint: the best-converting
+    // query is not in the title.
+    if (row.topQuery && row.topQueryInTitle === false) {
+      insights.push(makeInsight({
+        id: `optimizer-title-${row.asin}`,
+        reportKey: "listing-optimizer",
+        reportLabel: OPTIMIZER_LABEL,
+        category: "optimizer-title-gap",
+        severity: row.topQuery.asinPurchases >= 10 ? "high" : "medium",
+        title: `${label}: its best-converting search term "${row.topQuery.query}" is not in the title`,
+        asin: row.asin, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Search term", value: row.topQuery.query },
+          { label: "Purchases from this term", value: Math.round(row.topQuery.asinPurchases) },
+          { label: "Query volume", value: Math.round(row.topQuery.volume) },
+          { label: "Your impression share", value: row.topQuery.impressionShare === null ? null : `${(row.topQuery.impressionShare * 100).toFixed(1)}%` },
+          { label: "Your CVR vs market", value: row.topQuery.cvrVsMarket === null ? null : `${row.topQuery.cvrVsMarket.toFixed(2)}x` },
+          { label: "Title length", value: `${row.titleAudit.length} / ${TITLE_MAX_CHARS} characters` },
+        ],
+        // No monetary basis: SQP reports purchase counts, not revenue, and
+        // inventing a price to multiply by would be fabrication.
+        moneyAtRisk: null,
+        moneyBasis: null,
+        confidence: "high",
+        freshness,
+        why: `This term already produced ${Math.round(row.topQuery.asinPurchases)} purchases for this ASIN, yet its words do not all appear in the title, which is the strongest relevance signal Amazon reads.`,
+        action: row.titleAudit.overLength
+          ? `Rework the title to include this term while cutting it to ${TITLE_MAX_CHARS} characters — it is currently ${row.titleAudit.length}. Review the wording yourself; this report does not rewrite listings.`
+          : "Add this term near the front of the title, after the brand. Review the wording yourself; this report does not rewrite listings.",
+      }));
+    }
+
+    if (row.contentIssues.length) {
+      const blocking = row.contentIssues.some((issue) => /over Amazon's|No title|No main image/.test(issue));
+      insights.push(makeInsight({
+        id: `optimizer-content-${row.asin}`,
+        reportKey: "listing-optimizer",
+        reportLabel: OPTIMIZER_LABEL,
+        category: "optimizer-content",
+        severity: blocking ? "medium" : "low",
+        title: `${label} has ${row.contentIssues.length} listing content gap${row.contentIssues.length === 1 ? "" : "s"}`,
+        asin: row.asin, brand: row.brand, entityLabel: label,
+        evidence: [
+          ...row.contentIssues.slice(0, 5).map((issue, index) => ({ label: `Issue ${index + 1}`, value: issue })),
+          { label: "Bullets filled", value: `${row.bulletCount} of 5` },
+          { label: "Queries seen", value: row.queryCount },
+        ],
+        moneyAtRisk: null,
+        moneyBasis: null,
+        confidence: "high",
+        freshness: freshnessNote({ sourceLabel: data.contentSourceLabel, asOf: data.asOf }),
+        why: "These are measured properties of the listing record itself: a character count, a missing field, or a rule Amazon publishes.",
+        action: "Fill the missing fields and bring the title inside Amazon's character limit. Every change is made by you in Seller Central; this report only measures.",
+      }));
+    }
+
+    if (row.keywordGaps.length >= 3 && row.moneyQueryCount >= 3) {
+      insights.push(makeInsight({
+        id: `optimizer-gaps-${row.asin}`,
+        reportKey: "listing-optimizer",
+        reportLabel: OPTIMIZER_LABEL,
+        category: "optimizer-keyword-gap",
+        severity: "low",
+        title: `${label} converts on ${row.keywordGaps.length} words that appear nowhere in its listing`,
+        asin: row.asin, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Missing words", value: row.keywordGaps.slice(0, 6).map((gap) => gap.token).join(", ") },
+          { label: "Purchases behind them", value: Math.round(row.keywordGaps.reduce((sum, gap) => sum + gap.purchases, 0)) },
+          { label: "Example queries", value: row.keywordGaps[0]?.queries?.join(" / ") || null },
+        ],
+        moneyAtRisk: null,
+        moneyBasis: null,
+        confidence: "medium",
+        freshness,
+        why: "These words appear in queries that produced purchases for this ASIN but appear in neither the title, the bullets nor the description.",
+        action: "Add the words that are genuinely accurate for this product to a bullet or a structured attribute. Do not add a word that does not describe it, and do not repeat words to stuff the listing.",
+      }));
+    }
+
+    const dominant = row.dominantGateMeta;
+    if (dominant && ["conversion", "click_rate"].includes(row.dominantGate)) {
+      insights.push(makeInsight({
+        id: `optimizer-funnel-${row.asin}`,
+        reportKey: "listing-optimizer",
+        reportLabel: OPTIMIZER_LABEL,
+        category: `optimizer-${row.dominantGate}`,
+        severity: row.dominantGate === "conversion" ? "medium" : "low",
+        title: `${label}: ${dominant.label.toLowerCase()} on ${row.gateCounts[row.dominantGate]} of ${row.queryCount} search queries`,
+        asin: row.asin, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Queries in this state", value: `${row.gateCounts[row.dominantGate]} of ${row.queryCount}` },
+          { label: "Your CTR (all queries)", value: row.ctr === null ? null : `${(row.ctr * 100).toFixed(2)}%` },
+          { label: "Your CVR (all queries)", value: row.cvr === null ? null : `${(row.cvr * 100).toFixed(1)}%` },
+          { label: "Cart-add rate on top query", value: row.topQuery?.cartRate === null || !row.topQuery ? null : `${(row.topQuery.cartRate * 100).toFixed(1)}%` },
+          { label: "Bullets filled", value: `${row.bulletCount} of 5` },
+        ],
+        moneyAtRisk: null,
+        moneyBasis: null,
+        confidence: "high",
+        freshness,
+        why: dominant.why,
+        action: dominant.action,
+      }));
+    }
+  }
+
+  return sortInsights(insights);
+}
+
+/* ==================================================================== */
 /* PPC Performance & Wasted Spend                                        */
 /* ==================================================================== */
 

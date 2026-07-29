@@ -19,8 +19,14 @@ import {
   dedupeInsights,
   insightExportRows,
   makeInsight,
+  TITLE_MAX_CHARS,
+  auditTitle,
+  buildOptimizerInsights,
+  buildOptimizerRows,
   buildPpcInsights,
   buildPpcRows,
+  classifyOptimizerQuery,
+  optimizerQueryMetrics,
   buildReturnsInsights,
   buildReturnsRows,
   ppcMetrics,
@@ -542,6 +548,137 @@ test("PPC actions stay read-only", () => {
   for (const item of buildPpcInsights(ppcData, rows, "searchTerms", 30)) {
     assert.ok(/read-only|Read-only/.test(item.action), `action must state it changes nothing: ${item.action}`);
   }
+});
+
+/* ---------- Listing & Search Optimizer ---------- */
+
+function sqpQuery(overrides) {
+  return {
+    asin: "O100", query: "cotton bath towel", volume: 10000,
+    totalImpressions: 100000, totalClicks: 5000, totalCartAdds: 900, totalPurchases: 500,
+    asinImpressions: 20000, asinClicks: 1000, asinCartAdds: 180, asinPurchases: 100,
+    bestRank: 8, periodCount: 8,
+    ...overrides,
+  };
+}
+
+const optimizerData = {
+  accountId: "acct-1",
+  asOf: "2026-07-29",
+  window: { from: "2026-05-06", to: "2026-07-29", days: 84 },
+  sqpAvailable: true,
+  sqpSourceLabel: "Search Query Performance (SQP) by ASIN (Weekly)",
+  contentSourceLabel: "Product Catalog by ASIN",
+  periods: ["2026-06-01", "2026-06-08", "2026-06-15", "2026-06-22", "2026-06-29", "2026-07-06", "2026-07-13", "2026-07-20"],
+  periodCount: 8,
+  queries: [
+    // Healthy on every dimension.
+    sqpQuery({ query: "cotton bath towel" }),
+    // Low share, at-market CVR, weak rank -> discoverability.
+    sqpQuery({ query: "quick dry towel set", asinImpressions: 2000, asinClicks: 100, asinPurchases: 10, bestRank: 60 }),
+    // Impressions but far fewer clicks than the market -> click-rate.
+    sqpQuery({ query: "luxury towel", asinImpressions: 40000, asinClicks: 400, asinPurchases: 40 }),
+    // Clicks at market but almost no purchases -> conversion.
+    sqpQuery({ query: "towel gift box", asinClicks: 1000, asinPurchases: 5 }),
+    // Missing market denominators -> must stay unclassified.
+    sqpQuery({ query: "mystery term", totalImpressions: 0, totalClicks: 0, totalPurchases: 0, asinPurchases: 1 }),
+    // The biggest converter for this ASIN. Its words "hotel", "spa" and "towel"
+    // are in the title but "bundle" is not, so the title-gap check must fire.
+    sqpQuery({ query: "hotel spa towel bundle", asinPurchases: 300 }),
+  ],
+  products: [
+    {
+      asin: "O100",
+      name: "BrandX Premium Cotton Bath Towel Set of 4 - Best Value!! Absorbent Quick Dry Towel for Bathroom Spa Hotel Use",
+      brand: "Alpha",
+      category: "Home",
+      bestSellerRank: 1200,
+      bullets: ["Soft cotton", "Absorbent"],
+      description: null,
+      hasImage: true,
+    },
+  ],
+  catalogBrands: ["Alpha"],
+};
+
+test("optimizer funnel rates come from summed counts and compare to the market", () => {
+  const metrics = optimizerQueryMetrics(sqpQuery({}));
+  assert.equal(metrics.impressionShare, 20000 / 100000);
+  assert.equal(metrics.yourCtr, 1000 / 20000);
+  assert.equal(metrics.marketCtr, 5000 / 100000);
+  assert.equal(metrics.yourCvr, 100 / 1000);
+  assert.equal(metrics.marketCvr, 500 / 5000);
+  assert.equal(metrics.ctrVsMarket, 1);
+  assert.equal(metrics.cvrVsMarket, 1);
+});
+
+test("optimizer gates follow the documented order", () => {
+  const gateOf = (overrides) => classifyOptimizerQuery(optimizerQueryMetrics(sqpQuery(overrides)));
+  assert.equal(gateOf({}), "strong");
+  assert.equal(gateOf({ asinImpressions: 2000, asinClicks: 100, asinPurchases: 10, bestRank: 60 }), "discoverability");
+  assert.equal(gateOf({ asinImpressions: 40000, asinClicks: 400, asinPurchases: 40 }), "click_rate");
+  assert.equal(gateOf({ asinClicks: 1000, asinPurchases: 5 }), "conversion");
+  // Low share with both CTR and CVR under market is someone else's query.
+  assert.equal(gateOf({ asinImpressions: 2000, asinClicks: 20, asinPurchases: 0 }), "relevance");
+});
+
+test("a query with no market denominators is never given a cause", () => {
+  const metrics = optimizerQueryMetrics(sqpQuery({ totalImpressions: 0, totalClicks: 0, totalPurchases: 0 }));
+  assert.equal(classifyOptimizerQuery(metrics), null);
+  const rows = buildOptimizerRows(optimizerData, "ALL");
+  const unclassified = rows[0].queries.filter((query) => !query.gate);
+  assert.equal(unclassified.length, 1);
+  assert.equal(unclassified[0].query, "mystery term");
+});
+
+test("title audit applies Amazon's published 2026 rules", () => {
+  const audit = auditTitle(optimizerData.products[0].name);
+  assert.equal(audit.overLength, true, "title is longer than the 75-character limit");
+  assert.ok(audit.length > TITLE_MAX_CHARS);
+  assert.equal(audit.promotionalWord.toLowerCase(), "best");
+  assert.equal(audit.bannedSymbol, "!");
+  const clean = auditTitle("BrandX Cotton Bath Towel Set of 4 for Bathroom");
+  assert.equal(clean.overLength, false);
+  assert.equal(clean.promotionalWord, null);
+  assert.equal(clean.bannedSymbol, null);
+});
+
+test("content gaps and keyword gaps are measured, not invented", () => {
+  const [row] = buildOptimizerRows(optimizerData, "ALL");
+  assert.ok(row.contentIssues.some((issue) => /over Amazon's 75-character limit/.test(issue)));
+  assert.ok(row.contentIssues.some((issue) => /Only 2 of 5 bullet points/.test(issue)));
+  assert.ok(row.contentIssues.some((issue) => /No product description/.test(issue)));
+  // "gift" and "box" convert but appear nowhere in the title, bullets or
+  // description; "cotton" does appear, so it must NOT be reported as a gap.
+  const gapTokens = row.keywordGaps.map((gap) => gap.token);
+  assert.ok(!gapTokens.includes("cotton"), "a word already in the listing is not a gap");
+  assert.ok(gapTokens.includes("gift") || gapTokens.includes("box"));
+});
+
+test("optimizer insights carry no fabricated money value", () => {
+  const rows = buildOptimizerRows(optimizerData, "ALL");
+  const insights = buildOptimizerInsights(optimizerData, rows);
+  assert.ok(insights.length > 0);
+  for (const item of insights) {
+    // SQP reports purchase counts, not revenue. Inventing a price to multiply
+    // by would be fabrication, so money must stay null.
+    assert.equal(item.moneyAtRisk, null);
+    assert.ok(item.action.length > 10);
+    assert.ok(item.evidence.length > 0);
+  }
+});
+
+test("optimizer never offers to modify a listing itself", () => {
+  const insights = buildOptimizerInsights(optimizerData, buildOptimizerRows(optimizerData, "ALL"));
+  const titleInsight = insights.find((item) => item.category === "optimizer-title-gap");
+  assert.ok(titleInsight, "the top converting term is missing from this title");
+  assert.ok(/does not rewrite listings/i.test(titleInsight.action));
+});
+
+test("a disabled SQP table yields no rows rather than an error", () => {
+  const disabled = { ...optimizerData, sqpAvailable: false, queries: [], products: [] };
+  assert.deepEqual(buildOptimizerRows(disabled, "ALL"), []);
+  assert.deepEqual(buildOptimizerInsights(disabled, []), []);
 });
 
 /* ---------- ranking, dedupe, export ---------- */

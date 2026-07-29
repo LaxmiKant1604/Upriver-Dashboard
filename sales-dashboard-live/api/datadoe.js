@@ -56,6 +56,7 @@ import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION }
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
+import { buildListingOptimizer, OPTIMIZER_REPORT_KEY, OPTIMIZER_VERSION } from "../lib/server/reports/listing-optimizer.js";
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
@@ -1394,6 +1395,25 @@ export default async function handler(req, res) {
         userId: access.userId,
         label: "PPC Performance",
         build: () => buildPpcPerformance({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "listing-optimizer") {
+      const ids = singleAccountId(req, res, "Listing & Search Optimizer");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: OPTIMIZER_REPORT_KEY,
+        reportVersion: OPTIMIZER_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Listing & Search Optimizer",
+        build: () => buildListingOptimizer({ apiKey, ids, to }),
       });
       return;
     }
