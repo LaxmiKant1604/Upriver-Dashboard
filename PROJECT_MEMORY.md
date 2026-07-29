@@ -300,13 +300,17 @@ link is no longer usable. Set the Site/Redirect URLs above first, then request
 a fresh confirmation email from the production dashboard. Do not troubleshoot
 the old link or start a localhost server merely to complete it.
 
-**Bootstrap hardening (2026-07-29, in progress):** the login screen is being
-changed to query a public, non-sensitive `bootstrap-status` response from the
-existing access API. The one-time administrator-create control is shown only
-when no Auth user exists for `laxmikant@upriver.in`; if the status request
-fails, the control stays hidden. The database trigger remains the authority:
-only that exact email is assigned the admin role, so no other email can
-self-register as administrator.
+**Bootstrap hardening (completed and deployed 2026-07-29):** the login screen
+queries a public, non-sensitive `bootstrap-status` response from the existing
+access API. The one-time administrator-create control is shown only when no
+Auth user exists for `laxmikant@upriver.in`; if the status request fails, the
+control stays hidden. The database trigger remains the authority: only that
+exact email is assigned the admin role, so no other email can self-register as
+administrator. Commit `75a3e9f Hide completed administrator bootstrap` is
+deployed. Production verification returned HTTP 200 with
+`{"initialAdminExists":true,"confirmationPending":false}`, proving the owner
+account exists and is confirmed; the live login page should therefore hide the
+bootstrap action after a hard refresh.
 
 `DASHBOARD_APP_URL=https://upriverdashboard.vercel.app` is configured in
 Vercel Production for invitation redirects. Supabase Auth settings showed
