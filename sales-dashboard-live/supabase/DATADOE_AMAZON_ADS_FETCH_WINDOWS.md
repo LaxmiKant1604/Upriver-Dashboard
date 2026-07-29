@@ -73,3 +73,34 @@ For the planned Supabase ads history:
 
 The currently configured campaign source is
 `08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c`.
+
+## Planned shared sync behavior
+
+This is the required implementation behavior; it is not active in the
+dashboard yet.
+
+1. **Initial seed:** a controlled server job exports the initial window for a
+   selected account/source (for example, 56 days for Campaign or Ad Group
+   Performance) and stores each reported daily grain in Supabase.
+2. **Every daily sync:** the server re-exports the latest rolling window, not
+   only yesterday. For most performance tables that is the latest 21 days;
+   Placement is 28 days. This means a day can be revised repeatedly while
+   Amazon attribution settles.
+3. **Monthly correction sync:** the server re-exports the table's monthly
+   correction period (normally 49 days, Placement 56 days). Brand Metrics uses
+   a 95-day weekly correction sync instead.
+4. **Upsert, never append:** each row is identified by its natural report
+   grain. Campaign data, for example, uses account + marketplace + date +
+   campaign + campaign type + currency. The database executes `INSERT ... ON
+   CONFLICT ... DO UPDATE`, replacing metrics and `source_refreshed_at` for the
+   same key. It never double-counts spend, sales, clicks, or orders.
+5. **Dashboard reads Supabase:** users see the saved rows for their selected
+   account/date range. A manual refresh requests a single controlled account
+   sync and a database lock prevents another user from starting the same sync
+   concurrently. Browsing/filtering never calls DataDoe.
+
+For a typical 21-day daily table, a day is refreshed every day while it stays
+inside that rolling window; it is also included in the next monthly 49-day
+correction window. Once outside those correction windows, its stored value is
+retained as the final known value. Supabase remains the long-term history even
+though DataDoe initially backfilled only a limited number of days.
