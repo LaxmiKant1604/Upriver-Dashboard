@@ -113,10 +113,12 @@ The currently configured campaign source is
 
 ## Implemented shared sync behavior (2026-07-29)
 
-The scheduled worker is implemented in `api/ads-sync.js`; its migration is
-`supabase/migrations/20260729_automated_ads_sync.sql`. It persists Campaign,
-ASIN, and Keyword Targeting daily data server-side. The Vercel cron deployment
-and first production run are the remaining operational steps.
+The scheduled worker is implemented in `lib/server/ads-sync.js`; its migration
+is `supabase/migrations/20260729_automated_ads_sync.sql`. It persists Campaign,
+ASIN, and Keyword Targeting daily data server-side. Production deployment
+`a8a3fb7` has registered the 12 country/source schedules; inspect the first
+scheduled result in `ads_sync_state` and Vercel Cron logs before treating the
+initial backfill as complete.
 
 1. **Initial seed:** a controlled server job exports the initial window for a
    selected account/source (for example, 56 days for Campaign or Ad Group

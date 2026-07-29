@@ -318,9 +318,20 @@ exact 06:00 local time becomes a business requirement.
   in code: server-only helpers live under `lib/server/`, and one dynamic
   `api/cron/[scope].js` function serves all 12 scheduled country/source paths.
   Do not recreate one API file per schedule on this Hobby project.
-- The corrected code, Vercel cron configuration, and protected secret are
-  ready; deploy, production cron registration, and a small live country-worker
-  validation are the remaining tasks for this change.
+- **Production deployment is live:** commit `a8a3fb7` deployed as
+  `https://upriver-dashboard-avtu59toz-laxmikant1604s-projects.vercel.app`
+  and is aliased to `https://upriverdashboard.vercel.app`. Vercel API metadata
+  confirms `READY`, alias assigned, and exactly **12** registered cron jobs.
+- Production health check returned HTTP 200. A direct request without the
+  secret correctly returned HTTP 401, proving the cron route is not public.
+  Vercel supplies the stored `CRON_SECRET` authorization header to scheduled
+  invocations. The secret is intentionally unavailable from `vercel env pull`,
+  so do not weaken the endpoint merely to test it manually.
+- The first real scheduled DataDoe worker result still needs observation in
+  Vercel Cron logs / `ads_sync_state` after its next country time. Until the
+  first campaign seed succeeds for an account, Daily Reporting will show no
+  saved Ads metrics for that account rather than launch an unplanned DataDoe
+  Ads export.
 - The existing browser report cache remains in place. New Ads data is shared
   server-side now; other report families will be migrated to shared Supabase
   snapshots incrementally, using the same no-automatic-DataDoe-fetch rule.
