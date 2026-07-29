@@ -723,6 +723,24 @@ function LoginScreen({ passwordSetup = false }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [createAdmin, setCreateAdmin] = useState(false);
+  const [bootstrapStatus, setBootstrapStatus] = useState(null);
+
+  useEffect(() => {
+    if (passwordSetup) return undefined;
+    let active = true;
+    fetch("/api/access?action=bootstrap-status")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Unable to check administrator setup.");
+        return response.json();
+      })
+      .then((status) => { if (active) setBootstrapStatus(status); })
+      // Fail closed: an unavailable setup check must never offer a second
+      // administrator bootstrap path.
+      .catch(() => { if (active) setBootstrapStatus({ initialAdminExists: true }); });
+    return () => { active = false; };
+  }, [passwordSetup]);
+
+  const canCreateInitialAdmin = bootstrapStatus?.initialAdminExists === false;
 
   const submit = async (event) => {
     event.preventDefault();
@@ -743,6 +761,8 @@ function LoginScreen({ passwordSetup = false }) {
           options: { emailRedirectTo: window.location.origin },
         });
         if (signUpError) throw signUpError;
+        setBootstrapStatus({ initialAdminExists: true, confirmationPending: !data.session });
+        setCreateAdmin(false);
         if (!data.session) setMessage("Check your email to confirm this administrator login, then sign in.");
       } else {
         const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
@@ -766,7 +786,7 @@ function LoginScreen({ passwordSetup = false }) {
         {error && <div className="auth-error"><AlertTriangle size={15} />{error}</div>}
         {message && <div className="auth-success">{message}</div>}
         <button className="auth-submit" disabled={busy}>{busy ? "Please wait…" : passwordSetup ? "Save password" : createAdmin ? "Create administrator" : "Sign in"}</button>
-        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div><button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button></>}
+        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div>{canCreateInitialAdmin && <button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button>}{bootstrapStatus?.initialAdminExists && !createAdmin && <div className="auth-note">Administrator setup is already in progress or complete. Sign in with the owner account.</div>}</>}
       </form>
     </div>
   );

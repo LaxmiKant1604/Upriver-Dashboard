@@ -9,6 +9,8 @@ export function isSupabaseConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
 }
 
+const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
+
 export class DashboardAccessError extends Error {
   constructor(message, status = 403) {
     super(message);
@@ -125,6 +127,20 @@ export async function listDashboardUsers() {
     createdAt: profile.created_at,
     updatedAt: profile.updated_at,
   }));
+}
+
+// This intentionally returns only bootstrap state, not any user information.
+// The login screen uses it to remove the one-time owner-creation action once
+// the owner has an Auth account.
+export async function getInitialAdminBootstrapStatus() {
+  const authUsers = await authRequest("/auth/v1/admin/users?page=1&per_page=1000");
+  const owner = (authUsers.users || []).find((user) =>
+    String(user.email || "").trim().toLowerCase() === INITIAL_ADMIN_EMAIL
+  );
+  return {
+    initialAdminExists: Boolean(owner),
+    confirmationPending: Boolean(owner && !owner.email_confirmed_at && !owner.confirmed_at),
+  };
 }
 
 function validManagedRole(role) {

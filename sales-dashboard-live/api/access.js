@@ -2,6 +2,7 @@ import {
   DashboardAccessError,
   assertAdmin,
   getDashboardAccess,
+  getInitialAdminBootstrapStatus,
   inviteDashboardUser,
   listDashboardUsers,
   updateDashboardUser,
@@ -18,8 +19,16 @@ function bodyFor(req) {
 
 export default async function handler(req, res) {
   try {
-    const access = await getDashboardAccess(req);
     const action = String(req.query.action || "me");
+
+    // A public, non-sensitive boolean used only to hide the one-time bootstrap
+    // form after the fixed owner identity has been created.
+    if (req.method === "GET" && action === "bootstrap-status") {
+      res.status(200).json(await getInitialAdminBootstrapStatus());
+      return;
+    }
+
+    const access = await getDashboardAccess(req);
 
     if (req.method === "GET" && action === "me") {
       res.status(200).json({ access });
