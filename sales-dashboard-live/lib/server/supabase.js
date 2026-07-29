@@ -216,6 +216,27 @@ export async function getReportSnapshot({ reportKey, accountId, paramsHash }) {
   return rows[0] || null;
 }
 
+/**
+ * The most recent saved snapshot for a report and account, whatever scope it was
+ * saved under.
+ *
+ * Every insight report's scope includes its as-of date, so at midnight the exact
+ * scope key stops matching and the report would otherwise appear to have no
+ * saved data at all. This lets the server serve yesterday's saved report,
+ * clearly labelled with the date it was saved for, instead of a blank screen.
+ */
+export async function getLatestReportSnapshot({ reportKey, accountId }) {
+  const query = new URLSearchParams({
+    select: "id,report_key,account_id,params_hash,params,payload,payload_bytes,source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  return rows[0] || null;
+}
+
 export async function saveReportSnapshot(snapshot) {
   const rows = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
     method: "POST",
@@ -256,6 +277,20 @@ export async function claimRefreshLock({ reportKey, accountId, paramsHash, lockS
       p_params_hash: paramsHash,
       p_lock_seconds: lockSeconds,
     },
+  });
+}
+
+// Releasing the lock as soon as a refresh finishes means a failed export does
+// not block the next attempt for the whole lock duration.
+export async function releaseRefreshLock({ reportKey, accountId, paramsHash }) {
+  const query = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+  });
+  await request(`/rest/v1/report_refresh_locks?${query}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
   });
 }
 
@@ -306,6 +341,44 @@ export async function getAdDailyMetrics(accountId, from, to) {
     order: "metric_date.asc",
   });
   return request(`/rest/v1/ad_daily_metrics?${query}`);
+}
+
+// Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
+// request, so this pages. If an account's window genuinely exceeds the budget
+// the caller throws rather than aggregating a partial window, because a
+// truncated spend total would understate waste.
+const ADS_ROW_PAGE_SIZE = 1000;
+
+/**
+ * Read persisted Amazon Ads rows for one account.
+ *
+ * This is the PPC report's only Ads source: the scheduled worker owns the
+ * DataDoe exports, so opening or refreshing PPC never spends an Ads export.
+ */
+export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, maxRows }) {
+  const rows = [];
+  for (let offset = 0; ; offset += ADS_ROW_PAGE_SIZE) {
+    const query = new URLSearchParams({
+      select: "source_key,metric_date,marketplace_country_code,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at",
+      account_id: `eq.${accountId}`,
+      source_key: `in.(${sourceKeys.join(",")})`,
+      and: `(metric_date.gte.${from},metric_date.lte.${to})`,
+      // A date alone is not deterministic when one day has more than one
+      // thousand rows. The remaining primary-key fields prevent PostgREST
+      // offset pages from skipping or repeating tied same-day rows while the
+      // PPC report aggregates multiple saved source types.
+      order: "metric_date.asc,source_key.asc,marketplace_country_code.asc,dimension_key.asc",
+      limit: String(ADS_ROW_PAGE_SIZE),
+      offset: String(offset),
+    });
+    const page = await request(`/rest/v1/ads_daily_source_rows?${query}`);
+    rows.push(...page);
+    if (page.length < ADS_ROW_PAGE_SIZE) break;
+    if (maxRows && rows.length >= maxRows) {
+      throw new Error(`This account has more than ${maxRows.toLocaleString("en-US")} saved Amazon Ads rows in the selected window. The PPC report was not built because aggregating a partial window would understate spend and wasted spend. Use a shorter window.`);
+    }
+  }
+  return rows;
 }
 
 export async function upsertAdsSyncStates(states) {

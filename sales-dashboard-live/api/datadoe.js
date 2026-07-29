@@ -28,24 +28,66 @@ import {
   getDashboardAccess,
   isSupabaseConfigured,
 } from "../lib/server/supabase.js";
-
-const BASE = "https://api.datadoe.com/api/v1";
-
-// Verified DataDoe REST details:
-// - Accounts endpoint includes the /util prefix.
-// - Auth uses the custom datadoe-api-key header, not Authorization: Bearer.
-// - Sales exports accept no more than 5 seller/vendor IDs per request.
-const ENDPOINTS = {
-  sellers: `${BASE}/util/sellers-and-vendors`,
-  exportsCreate: `${BASE}/exports`,
-  exportStatus: (id) => `${BASE}/exports/${id}`,
-  exportRaw: (id) => `${BASE}/exports/${id}/raw`,
-};
+// Shared DataDoe transport. Extracted so every report — the seven original ones
+// and the six insight reports — shares one 2-req/sec rate limiter, one export
+// poller, and one row-cap policy.
+import {
+  DATADOE_BASE as BASE,
+  ENDPOINTS,
+  MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT,
+  addDaysStr,
+  authHeaders,
+  createExport,
+  daysInMonthUTC,
+  ddFetch,
+  downloadExport,
+  fetchAccounts,
+  fetchExportRows,
+  isDateStr,
+  isFullCalendarMonthWindow,
+  num,
+  pad2s,
+  pollExport,
+  splitDateRangeByMonth,
+} from "../lib/server/datadoe.js";
+import { serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
+import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
+import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
+import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
+import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
+import { buildListingOptimizer, OPTIMIZER_REPORT_KEY, OPTIMIZER_VERSION } from "../lib/server/reports/listing-optimizer.js";
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
   "keyword-rank", "content-changes", "fba-plan",
+  // Insight reports. Each is single-account and served from the shared
+  // Supabase snapshot unless an explicit refresh is requested.
+  // The Priority Feed has no action of its own: it combines the six snapshots
+  // in the browser, so there is nothing extra to authorise here.
+  "sales-movers", "listing-health", "buy-box-loss",
+  "returns-leakage", "ppc-performance", "listing-optimizer",
 ]);
+
+// Every insight report is strictly one selected account: the shared snapshot,
+// the refresh lock, and the permission check are all keyed by a single account.
+function singleAccountId(req, res, label) {
+  const ids = String(req.query.ids || "").split(",").filter(Boolean);
+  if (ids.length !== 1) {
+    res.status(400).json({ error: `${label} requires exactly one selected account.` });
+    return null;
+  }
+  return ids;
+}
+
+function reportAsOf(req, res) {
+  const to = String(req.query.to || "");
+  if (!isDateStr(to)) {
+    res.status(400).json({ error: "Invalid or missing `to` date. Use YYYY-MM-DD." });
+    return null;
+  }
+  return to;
+}
 
 // Source table for daily sales/units per account. 401ffcd7e5 ("Sales &
 // Traffic by ASIN & Date") is the user-confirmed correct sales report.
@@ -263,7 +305,6 @@ const PLAN_INVENTORY_LOOKBACK_DAYS = 10;
 const PLAN_INVENTORY_ROW_LIMIT = 15000;
 const PLAN_SALES_ROW_LIMIT = 30000;
 
-const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 const DASHBOARD_ROW_LIMIT = 5000;
 // Order rows are grouped by day and ASIN before download. A year of data can
 // still contain more than 5,000 ASIN/day groups, so use a higher export cap.
@@ -275,114 +316,6 @@ const DAILY_ROW_LIMIT = 5000;
 const DAILY_BRAND_ROW_LIMIT = 50000;
 const RECONCILIATION_ROW_LIMIT = 50000;
 const CONTENT_CHANGE_ROW_LIMIT = 1000;
-
-function authHeaders(apiKey) {
-  return {
-    "datadoe-api-key": apiKey,
-    "Content-Type": "application/json",
-  };
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// DataDoe caps requests at 2/sec per organization. `ddFetch` spaces requests
-// out to stay under that cap and transparently retries on HTTP 429 using the
-// server's retry hint, so a burst of exports (e.g. the all-accounts load) or
-// concurrent tabs don't surface a rate-limit error to the user.
-let _lastDataDoeCall = 0;
-const MIN_REQUEST_INTERVAL_MS = 550;
-const MAX_RATE_LIMIT_RETRIES = 6;
-
-async function ddFetch(url, options, attempt = 0) {
-  const since = Date.now() - _lastDataDoeCall;
-  if (since < MIN_REQUEST_INTERVAL_MS) await sleep(MIN_REQUEST_INTERVAL_MS - since);
-  _lastDataDoeCall = Date.now();
-
-  const r = await fetch(url, options);
-  if (r.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-    let retrySec = Number(r.headers.get("retry-after")) || 0;
-    try {
-      const body = await r.clone().json();
-      retrySec = Number(body.retryAfterSeconds) || Number(body.config && body.config.retryAfterSeconds) || retrySec || 1;
-    } catch (e) {
-      retrySec = retrySec || 1;
-    }
-    await sleep(retrySec * 1000 + 250);
-    return ddFetch(url, options, attempt + 1);
-  }
-  return r;
-}
-
-async function fetchAccounts(apiKey) {
-  const r = await ddFetch(ENDPOINTS.sellers, { headers: authHeaders(apiKey) });
-  if (!r.ok) {
-    throw new Error(`DataDoe accounts request failed (${r.status}). Check the endpoint path in api/datadoe.js against https://api.datadoe.com/api/v1/docs`);
-  }
-  const body = await r.json();
-  const list = body.data || body.results || (Array.isArray(body) ? body : []);
-  return list.map((a) => ({
-    id: a.id,
-    name: a.name,
-    country: a.marketplaceCountryCode,
-    countryName: a.marketplaceCountryName,
-    currency: a.currency || null,
-  }));
-}
-
-async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
-  const { groupBy, aggregations, orderByColumn = "date", orderByDirection = "ASC" } = options;
-  const r = await ddFetch(ENDPOINTS.exportsCreate, {
-    method: "POST",
-    headers: authHeaders(apiKey),
-    body: JSON.stringify({
-      sourceId,
-      sellerOrVendorIds,
-      columns,
-      // Sources without a date column (e.g. Listings) must not receive a date
-      // range; only include from/to when provided.
-      ...(from ? { from } : {}),
-      ...(to ? { to } : {}),
-      limit,
-      outputType: "JSON",
-      orderByColumn,
-      orderByDirection,
-      ...(groupBy ? { groupBy } : {}),
-      ...(aggregations ? { aggregations } : {}),
-    }),
-  });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`DataDoe export creation failed (${r.status}): ${text}`);
-  }
-  return r.json();
-}
-
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
-
-// Run an export for any source, chunking by the 5-id-per-export cap and
-// combining the returned rows.
-async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
-  const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
-  const allRows = [];
-
-  for (const chunk of chunks) {
-    const created = await createExport(apiKey, sourceId, columns, chunk, from, to, limit, options);
-    const exportId = created.exportId || created.id;
-    if (created.status !== "COMPLETED") {
-      await pollExport(apiKey, exportId);
-    }
-    const rows = await downloadExport(apiKey, exportId);
-    allRows.push(...rows);
-  }
-
-  return allRows;
-}
 
 function sqpDistinctPeriods(rows) {
   return [...new Set(rows.map((row) => String(row.date || "")).filter(Boolean))].sort();
@@ -504,8 +437,6 @@ function catalogBrandNames(rows) {
   )].sort((a, b) => a.localeCompare(b));
 }
 
-const num = (v) => Number(v) || 0;
-
 function parseJsonValue(value) {
   if (!value || typeof value !== "string") return value;
   try { return JSON.parse(value); } catch (e) { return value; }
@@ -560,33 +491,9 @@ function compactContentChangeEvents(rows, catalogRows) {
   }).sort((a, b) => String(b.eventTime || "").localeCompare(String(a.eventTime || "")));
 }
 
-/* ===== FBA Shipment Plan helpers ===== */
-const pad2s = (n) => String(n).padStart(2, "0");
-function daysInMonthUTC(y, m /* 1..12 */) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
-function addDaysStr(s, n) {
-  const [y, m, d] = s.split("-").map(Number);
-  const t = Date.UTC(y, m - 1, d) + n * 86400000;
-  const dt = new Date(t);
-  return `${dt.getUTCFullYear()}-${pad2s(dt.getUTCMonth() + 1)}-${pad2s(dt.getUTCDate())}`;
-}
-function splitDateRangeByMonth(from, to) {
-  const windows = [];
-  let cursor = from;
-  while (cursor <= to) {
-    const [y, m] = cursor.split("-").map(Number);
-    const monthEnd = `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`;
-    const end = monthEnd < to ? monthEnd : to;
-    windows.push({ from: cursor, to: end });
-    cursor = addDaysStr(end, 1);
-  }
-  return windows;
-}
-
-function isFullCalendarMonthWindow(window) {
-  const [year, month] = window.from.slice(0, 7).split("-").map(Number);
-  return window.from === `${year}-${pad2s(month)}-01`
-    && window.to === `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
-}
+/* ===== FBA Shipment Plan helpers =====
+   Date and range helpers now live in lib/server/datadoe.js so the insight
+   reports share exactly the same UTC string arithmetic. */
 
 function reconciliationOrders(rows, catalogRows) {
   const brandByAsin = new Map();
@@ -807,35 +714,6 @@ function mergeSalesAndAds(salesRows, adRows) {
     }
   }
   return salesRows;
-}
-
-async function pollExport(apiKey, exportId) {
-  // DataDoe recommends a five-second poll cadence and exports can take close
-  // to 30 seconds. The former 18-second window produced false timeouts for
-  // valid Sales & Traffic exports. Keep this below Vercel's 60-second limit.
-  const maxAttempts = 9;
-  const delayMs = 5000;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const r = await ddFetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
-    if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
-    const body = await r.json();
-    if (body.status === "COMPLETED") return body;
-    if (["FAILED", "ERROR", "BLOCKED_NO_TOKENS"].includes(body.status)) {
-      throw new Error(`DataDoe export failed to process (${body.status}).`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-  throw new Error("DataDoe export timed out while processing. Try a shorter date range.");
-}
-
-async function downloadExport(apiKey, exportId) {
-  const r = await ddFetch(ENDPOINTS.exportRaw(exportId), { headers: authHeaders(apiKey) });
-  if (!r.ok) throw new Error(`DataDoe export download failed (${r.status})`);
-  const body = await r.json();
-  if (typeof body.rawContent === "string") {
-    return JSON.parse(body.rawContent);
-  }
-  return Array.isArray(body) ? body : [];
 }
 
 export default async function handler(req, res) {
@@ -1410,6 +1288,133 @@ export default async function handler(req, res) {
         inventoryAvailable,
         awdAvailable,
         rows,
+      });
+      return;
+    }
+
+    /* ============================================================
+       Insight reports.
+       All six share one contract: without `refresh=1` the request only reads
+       the shared Supabase snapshot and never touches DataDoe, so navigation,
+       brand changes, filters, search, sorting and paging cost nothing. With
+       `refresh=1` a database lock is claimed first, so two people clicking
+       Refresh cannot spend DataDoe tokens twice, and the validated result is
+       saved once for every user permitted on that account.
+       ============================================================ */
+
+    if (action === "sales-movers") {
+      const ids = singleAccountId(req, res, "Sales Movers");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: SALES_MOVERS_REPORT_KEY,
+        reportVersion: SALES_MOVERS_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Sales Movers",
+        build: () => buildSalesMovers({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "listing-health") {
+      const ids = singleAccountId(req, res, "Listing Health");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: LISTING_HEALTH_REPORT_KEY,
+        reportVersion: LISTING_HEALTH_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Listing Health",
+        build: () => buildListingHealth({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "buy-box-loss") {
+      const ids = singleAccountId(req, res, "Buy Box Loss");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: BUY_BOX_REPORT_KEY,
+        reportVersion: BUY_BOX_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Buy Box Loss",
+        build: () => buildBuyBoxLoss({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "returns-leakage") {
+      const ids = singleAccountId(req, res, "Returns & Refund Leakage");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: RETURNS_REPORT_KEY,
+        reportVersion: RETURNS_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Returns & Refund Leakage",
+        build: () => buildReturnsLeakage({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    // PPC reads the persisted Supabase Ads history, never a live Ads export.
+    // Only its small total-sales figure (needed for TACoS) touches DataDoe, and
+    // only on an explicit refresh.
+    if (action === "ppc-performance") {
+      const ids = singleAccountId(req, res, "PPC Performance");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: PPC_REPORT_KEY,
+        reportVersion: PPC_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "PPC Performance",
+        build: () => buildPpcPerformance({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "listing-optimizer") {
+      const ids = singleAccountId(req, res, "Listing & Search Optimizer");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: OPTIMIZER_REPORT_KEY,
+        reportVersion: OPTIMIZER_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Listing & Search Optimizer",
+        build: () => buildListingOptimizer({ apiKey, ids, to }),
       });
       return;
     }

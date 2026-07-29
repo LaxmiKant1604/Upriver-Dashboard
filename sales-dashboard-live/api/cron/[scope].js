@@ -6,15 +6,19 @@ const SCOPE_CONFIG = {
   "in-campaign": { countries: ["IN"], source: "campaign-performance-v1" },
   "in-asin": { countries: ["IN"], source: "asin-performance-v1" },
   "in-targeting": { countries: ["IN"], source: "keyword-targeting-performance-v1" },
+  "in-searchterms": { countries: ["IN"], source: "search-terms-performance-v1" },
   "americas-campaign": { countries: ["US", "CA"], source: "campaign-performance-v1" },
   "americas-asin": { countries: ["US", "CA"], source: "asin-performance-v1" },
   "americas-targeting": { countries: ["US", "CA"], source: "keyword-targeting-performance-v1" },
+  "americas-searchterms": { countries: ["US", "CA"], source: "search-terms-performance-v1" },
   "au-campaign": { countries: ["AU"], source: "campaign-performance-v1" },
   "au-asin": { countries: ["AU"], source: "asin-performance-v1" },
   "au-targeting": { countries: ["AU"], source: "keyword-targeting-performance-v1" },
+  "au-searchterms": { countries: ["AU"], source: "search-terms-performance-v1" },
   "other-campaign": { countries: "OTHER", source: "campaign-performance-v1" },
   "other-asin": { countries: "OTHER", source: "asin-performance-v1" },
   "other-targeting": { countries: "OTHER", source: "keyword-targeting-performance-v1" },
+  "other-searchterms": { countries: "OTHER", source: "search-terms-performance-v1" },
 };
 
 export default async function handler(req, res) {

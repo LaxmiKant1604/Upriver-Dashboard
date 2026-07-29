@@ -1,6 +1,300 @@
 # Project Memory
 
-Last updated: 2026-07-27
+Last updated: 2026-07-29
+
+## Six insight reports — built on branch `feature/six-insight-reports` (2026-07-29, NOT deployed, NOT merged)
+
+All six approved read-only modules are implemented on the branch
+`feature/six-insight-reports` (base `main` at `497c7cc`). **Nothing was merged to
+main and nothing was deployed**, as instructed. Codex review is the next step.
+
+### Commits, in phase order
+
+| Commit | Phase |
+| --- | --- |
+| `1c3eb22` | Insight engine + Sales Movers + Listing Health + Buy Box Loss |
+| `1278c05` | Returns & Refund Leakage |
+| `626280e` | PPC Performance & Wasted Spend |
+| `78658d1` | Listing & Search Optimizer |
+| `a4d6f7d` | Cross-report Priority Feed |
+| `ad39fc4` | Senior-review fixes (currency mixing, truncation, midnight-blank reports) |
+
+### New and changed files
+
+New server modules:
+- `lib/server/datadoe.js` — the DataDoe transport, extracted from
+  `api/datadoe.js` so all thirteen reports share one 2-req/sec rate limiter, one
+  export poller, one row-cap policy and one set of UTC date helpers. Adds
+  `fetchExportRowsStrict`, which refuses a result sitting on the row cap.
+- `lib/server/report-store.js` — the shared snapshot contract (below).
+- `lib/server/reports/sources.js` — every source id, column, grain, default-
+  enablement flag and fetch window, validated against the live data scheme.
+- `lib/server/reports/common.js` — catalog map, source freshness, FBA snapshot.
+- `lib/server/reports/{sales-movers,listing-health,buy-box,returns,ppc,listing-optimizer}.js`
+
+New client modules:
+- `src/lib/format.js`, `src/lib/csv.js` — display and CSV helpers moved out of
+  `App.jsx` so the report views format money, dates and units identically.
+- `src/lib/insights.js` — the Insight Engine and all six reports' rule sets.
+- `src/views/shared.jsx` — report shell, freshness strip, Priority Actions,
+  insight card, sortable header, pagination, currency-scope helpers.
+- `src/views/{SalesMovers,ListingHealth,BuyBoxLoss,ReturnsLeakage,PpcPerformance,ListingOptimizer,PriorityFeed}.jsx`
+
+Changed: `api/datadoe.js` (imports the shared transport; six new actions),
+`lib/server/supabase.js` (`releaseRefreshLock`, `getLatestReportSnapshot`,
+`getAdsDailySourceRows`), `lib/server/ads-sync.js` + `api/cron/[scope].js` +
+`vercel.json` (search-terms Ads source, 16 crons), `src/App.jsx` (seven sidebar
+items, shared-report data layer, insight CSS), `package.json` (scripts).
+
+### Non-negotiable architecture — how each rule is met
+
+- **Shared Account/Brand scope only.** No report has a page-level account or
+  brand selector. Brand filtering is applied client-side in every builder, and
+  each payload returns `catalogBrands` so the header selector works from these
+  reports alone.
+- **Server-enforced permissions.** `getDashboardAccess(req)` runs before any
+  branch in `api/datadoe.js`; all six actions are in `ACCOUNT_SCOPED_ACTIONS`, so
+  `assertAccountAccess` rejects an account the user is not assigned. Each action
+  additionally requires exactly one account id.
+- **Only Refresh calls DataDoe.** A request without `refresh=1` reads the saved
+  Supabase snapshot and never touches DataDoe. Navigation, brand changes,
+  filters, search, sorting, paging, level tabs, the Buy Box threshold and the PPC
+  break-even input are all local recomputation.
+- **Shared snapshot + refresh lock.** `serveSharedReport` claims
+  `claim_report_refresh_lock` before any export, so two people pressing Refresh
+  cannot spend DataDoe tokens twice; the validated payload is saved to
+  `report_snapshots` for every permitted user and a compact `dashboard_events`
+  row is published. The lock is released in a `finally`, so a failed refresh does
+  not block retries. There is also a client-side in-flight guard per report.
+- **PPC reads persisted Ads history.** Every advertising figure comes from
+  `ads_daily_source_rows`. No Ads export runs from the report path at all, even
+  on Refresh. The only DataDoe call PPC makes is one small total-sales export for
+  TACoS, and losing it degrades TACoS to unavailable without breaking the report.
+- **Currencies stay separate.** Nothing converts. Combined money totals render an
+  em dash when a scope holds more than one currency, per-row money keeps its own
+  currency, and the Priority Feed groups by currency and never adds across them.
+- **No summed percentages.** ACoS, TACoS, CTR, CVR, CPC, ROAS, conversion,
+  margin, return rate, impression share and Buy Box share are all recomputed from
+  summed numerators and denominators.
+- **No fake zeroes.** Unknown values render as an em dash. A missing snapshot, a
+  disabled source, a missing FBA snapshot, an unseeded Ads account and a lagging
+  sales source each have their own explicit state.
+- **Read-only.** No Amazon write action, bid change or negative keyword anywhere.
+
+### Sources used, all validated against the live data scheme on 2026-07-29
+
+Validated against `https://api.datadoe.com/api/v1/spec/data-scheme` (public,
+unauthenticated). `default:false` tables are not enabled for every organisation
+and every such export is wrapped to return an actionable Settings > Data tables
+message instead of a server error.
+
+| Table | Full id | default | Used by | Documented window |
+| --- | --- | --- | --- | --- |
+| `amazon_sales_and_traffic_with_cogs` | `401ffcd7e50c1ea9a18cacf221ddf99858db20a0f31eff65fc22a8e8140c7e1b` | yes | Movers, Returns rate, PPC TACoS | INITIAL 35 / DAILY 4 / MONTHLY 30 |
+| `amazon_profit_by_sku_and_date` | `57a0cb31...` | yes (premium) | Buy Box, Listing Health, Movers ads | CONTINUOUS, intraday |
+| `amazon_listings_with_cogs` | `ba689c05...` | yes (premium) | Listing Health | CONTINUOUS, no date column |
+| `amazon_listings_raw` | `6ea445cdc459f9fbb9517c5c009384da60ef31a1e70d4de9187ea3d4c28535c4` | **no** | Listing Health issue codes (optional) | CONTINUOUS, no date column |
+| `amazon_fba_inventory_health` | `44fc5ba0...` | yes (premium) | Buy Box prices, Movers stock, Listing Health | INITIAL 1 / DAILY 1 (snapshot only) |
+| `amazon_returns` | `27c6fc0ec69648b5fed4612dbd9ccdfdeaaca6787f8f985c01266e4dc11f9038` | yes | Returns reasons | INITIAL 60 / DAILY 60 |
+| `amazon_settlements_with_cogs` | `732dac68...` | yes | Returns money | INITIAL 730 / DAILY 21 |
+| `amazon_products_by_child_asin` | `68d2de23...` | yes | all (brand), Optimizer (content) | CONTINUOUS, no date column |
+| `amazon_ads_performance_by_campaign_by_date` | `08cdc77d...` | yes | PPC campaigns | 56 / 21 / 49 |
+| `amazon_ads_performance_by_child_asin_and_date` | `d0017e92...` | yes | PPC ASINs (same-SKU attributed) | 60 / 21 / 49 |
+| `amazon_ads_targeting_by_campaign_by_date` | `bbba3d21...` | **no** | PPC targets (**SP + SB + SD**) | 56 / 21 / 49 |
+| `amazon_ads_search_terms_by_campaign_by_date` | `e94e9671989ce4aa2814ac729807c7ddcc1cc47a71ebcd75d9fe661ed80335be` | **no** | PPC search terms (**SP + SB only**) | 60 / 21 / 49 |
+| `amazon_child_product_organic_search_ranks_per_week` | `81aa5b4c...` | **no** | Optimizer | INITIAL 21 / WEEKLY 7 |
+
+Newly discovered facts worth keeping:
+- `amazon_returns` has **no quantity column and no currency column**, and
+  `amazon_return_refunded_amount` / `amazon_return_label_cost` exist for **FBM
+  returns only**. One row is one returned item. All refund money therefore comes
+  from settlement REFUND rows, which cover FBA and FBM and carry a currency.
+- `amazon_sales_and_traffic_with_cogs` has **no currency column**; its money is
+  in the account's currency.
+- `amazon_products_by_child_asin` has **no `seller_or_vendor_id` column** — it is
+  marketplace-level and filtered by the export's account ids.
+- `amazon_listings_with_cogs.listing_status` is the enum `Active / Inactive /
+  Incomplete`, and `listing_fulfillment_channel` is `DEFAULT` (= FBM) /
+  `AMAZON_NA` / `AMAZON_EU` / null.
+- Buy Box share has **no dedicated table**. `buybox_percentage` lives on
+  `amazon_profit_by_sku_and_date` at SKU/day grain.
+
+### Formulas and rules per report
+
+**Sales Movers.** Two equal 7-day windows, both ending at the latest date Sales &
+Traffic actually reported units (never today, because that source's recurring
+window is 4 days). Because `sales = sessions x (units/sessions) x (sales/units)`,
+the change is split exactly into a traffic effect, a conversion effect and a price
+effect that sum to the total change; the dominant driver is the largest of the
+three. An ASIN with no sessions or no units in either week shows **Not
+attributable** instead of a guessed driver. Buy Box is deliberately not diagnosed
+here (it needs a page-view-weighted average of daily rows). A uniform,
+traffic-shaped collapse across most of the catalogue triggers a data-completeness
+warning instead of a page of false alarms.
+
+**Listing Health.** Gates in order: reported ERROR issue, missing
+buyable/discoverable flag, `Inactive`, `Incomplete`, stock on hand with no active
+or buyable offer (stranded), Active with no price, then WARNING/INFO. Ranked by
+trailing 30-day `total_sales` for that SKU — money that stops, not a forecast.
+Units on hand uses the FBA snapshot for FBA offers and the merchant quantity for
+FBM offers and **never adds them**, because they are two views of the same stock.
+Without the non-default raw-issues table nothing is labelled Suppressed.
+
+**Buy Box Loss.** 28 days of raw daily rows in 7-day slices (rejecting any slice
+that hits the cap), folded into a **page-view-weighted** Buy Box share so a
+2-page-view day cannot count as much as a 2,000-page-view day. Days where Amazon
+reported no featured-offer competition are **excluded**, not scored 0%, because a
+sole seller has lost nothing. Sales at risk = `sales x (1 - share)`. Cause is
+named only from present evidence: your price above `featuredoffer_price` is
+Price; zero or near-zero `available` against the 30-day run rate is Stock; a
+selling SKU with no FBA row at all is Fulfilment; otherwise **Unconfirmed** with
+confidence dropped.
+
+**Returns & Refund Leakage.** Ranked by money, not rate. Leakage = settled
+customer refunds + seller-borne return fees (return commission + FBA
+customer-return per-unit fee, less any restocking fee recovered, clamped at zero).
+`COGS on refunded units` is displayed but **excluded**, because the source does
+not say whether returned stock came back sellable. Rate is Amazon's own
+`units_refunded / units_shipped`; when refunds exceed shipments inside the window
+the returns belong to earlier sales, so the rate is withheld as **lag\*** rather
+than shown above 100%. A cause is named only when one reason bucket is at least
+half of that product's returns. Refunds are separated from pending and cancelled
+activity structurally: a refund exists only once a REFUND settlement posts, a
+cancelled order never settles, and a pending return shows as a pending request.
+
+**PPC Performance & Wasted Spend.** Ads figures come only from Supabase.
+**Dead spend** is the whole spend of a row with clicks and no attributed orders,
+and only above a 10-click minimum. A **break-even breach** counts only the spend
+*above* the break-even ACoS as wasted, because the sales up to that point are
+still worth buying. Scaling candidates are separate opportunities. Coverage is
+stated per level and Search Term results are never labelled as covering
+Sponsored Display.
+
+**Listing & Search Optimizer.** SQP reports both the ASIN's counts and the whole
+query's totals, so "below market" is a measurement: impression share = your
+impressions ÷ query impressions, and CTR/CVR vs market is your rate ÷ the same
+query's rate. Gates in order: relevance guard (low share + both below market),
+discoverability, exposure, click-rate, conversion. A query missing the market
+denominators is left **unclassified**. Organic rank uses the **best** rank
+observed, never an average. Title checks apply Amazon's published 2026 rules for
+non-media categories (75 characters, no promotional words, no disallowed symbols,
+no word more than twice). Insights carry **no money value**, because SQP reports
+purchase counts and inventing a price would be fabrication.
+
+**Priority Feed.** Re-derives the six reports' insights from the same snapshots,
+dedupes repeats per (report, category, product) keeping the most severe, and
+groups by currency. It deliberately does **not** merge across reports: a Buy Box
+loss and a returns problem on the same ASIN are different problems with different
+fixes.
+
+### Verification actually performed
+
+- `npm run test:insights` — **47 assertions pass** (`scripts/test-insights.mjs`),
+  covering decomposition exactness, the no-averaged-ratios rule, gate ordering,
+  evidence-gated causes, the click minimum, break-even partial waste, the
+  currency-withholding fix, ranking, dedupe, CSV formula-injection escaping and
+  em-dash-not-zero rendering.
+- `npm run build:check` — clean build, ~1,010 kB bundle with the expected
+  >500 kB chunk warning. New view strings confirmed present in the bundle.
+- `node --check` on every server module; `import()` of `api/datadoe.js` to prove
+  every import resolves; `vercel.json` parsed (16 crons).
+- Access control audited in code: the auth gate is the first statement in the
+  handler and all six actions are account-scoped.
+
+**IMPORTANT — a build-verification gap was found and fixed.** `src/lib/supabase.js`
+exports `supabase` as null when `VITE_SUPABASE_URL`/`VITE_SUPABASE_PUBLISHABLE_KEY`
+are absent, and `App.jsx` then returns an early "Login setup incomplete" screen.
+Vite inlines `import.meta.env` at build time, so in a workspace without those
+variables Rollup proves `supabase` is null and **dead-code-eliminates the entire
+dashboard** — LoginScreen, DashboardApp, every report view, recharts and
+lucide-react. A plain `npm run build` produced a ~180 kB bundle with no chunk
+warning while compiling almost none of the app. Any past "npm run build passed"
+claim made in a workspace without those variables verified very little. Use
+`npm run build:check` (or `npm run verify`), which injects placeholder public
+values; a bundle well under ~900 kB, or a missing chunk warning, means the app was
+tree-shaken away and the build did not verify it.
+
+### Senior self-review — defects found and fixed in `ad39fc4`
+
+- **Currency mixing (correctness).** The Movers advertising export is grouped by
+  `child_asin` AND `currency` but was folded on ASIN alone, adding two currencies
+  into one spend number. Now withheld per ASIN with a `mixedCurrency` flag.
+- **Currency mixing (presentation).** Combined money totals in Buy Box, Listing
+  Health, Returns and PPC summed across currencies. Now an em dash plus an
+  explanation via `moneyScope`/`totalMoney`.
+- **Silent truncation.** The shared catalog and FBA snapshot reads were not
+  strict. A truncated catalog silently drops brands and makes the header brand
+  filter hide real rows; a truncated inventory snapshot makes an absent SKU look
+  like zero stock and produces a **false stockout claim**. Both now reject.
+- **Understated leakage.** The returns fee component could go negative when a
+  restocking fee exceeded the return fees. Clamped at zero.
+- **Reports blank every midnight.** Snapshot scope includes the as-of date, so the
+  exact key stopped matching at midnight and all six reports looked unsaved. The
+  server now falls back to the latest saved snapshot and the UI labels it as an
+  earlier as-of date. This also resolves the long-standing FBA Shipment Plan
+  stale-cache follow-up.
+- **Wrong refresh target.** Refresh on the Priority Feed would have refreshed the
+  main dashboard. Now disabled there with a tooltip.
+
+### Open issues for Codex review
+
+1. **No live DataDoe validation was possible from this workspace.**
+   `DATADOE_API_KEY` is not present locally (`vercel env pull` at the repo root
+   provides only the Supabase and Postgres variables), and production must not be
+   deployed. So **no report has yet run against a real account**, and the
+   requested IN and US account validation is outstanding. Every source id, column
+   name, grain and window was validated against the public data scheme, and only
+   export shapes already proven in this repo are used (`groupBy` + `sum`
+   aggregations, plain column selects, `orderByColumn`, omitted from/to for
+   date-less sources), but the first real refresh of each report still needs
+   observing on a preview deployment.
+2. **`aggregation: "avg"` was deliberately never used**, because it is unproven
+   in this repo. That is why Buy Box fetches raw daily rows in slices. If a live
+   test confirms DataDoe supports `avg`, Buy Box could collapse to one grouped
+   export and lose most of its latency.
+3. **Latency risk.** Buy Box runs 4 sliced exports plus a snapshot; Returns runs 3
+   plus a catalog; Movers runs 6. `maxDuration` is 60 s. These need timing on real
+   accounts, especially large catalogues; the observed 25–46 s of existing
+   six-month reports suggests Movers and Buy Box are the ones to watch.
+4. **16 cron entries** now exist (four Ads sources × four country scopes).
+   Confirm this is within the Vercel plan's cron limit before deploying; the
+   project previously had 12 registered.
+5. **Search Term Ads history starts at first sync.** Adding
+   `search-terms-performance-v1` means its 60-day initial seed only happens on the
+   next scheduled run after deployment. Until then the PPC search-term level
+   correctly reports no saved rows rather than zero spend.
+6. **Browser-level verification is outstanding.** No Playwright runtime is
+   available in this workspace, so mobile overflow, sticky identifier columns and
+   the "zero DataDoe requests on navigation/filter/sort" behaviour were built to
+   the proven existing patterns and reasoned through, but not observed in a real
+   browser. This is the highest-value remaining check.
+7. **Any authorised viewer can trigger a Refresh** and therefore spend DataDoe
+   quota. This matches the existing reports' behaviour, but if refresh should be
+   restricted to editor/admin, that is a one-line change in each action.
+8. **Priority Feed is a seventh sidebar item.** Phase 5 asked for a global feed
+   and it needed a home; flagging it against the "only the six requested sidebar
+   items" instruction.
+9. **`report_snapshots` growth.** Each report keeps one row per
+   (report, account, params_hash) and the as-of date is part of the hash, so a new
+   row accumulates per account per day. An 8 MB per-snapshot guard exists, but a
+   retention job that deletes superseded snapshots is still needed to protect the
+   Supabase free-tier 500 MB.
+10. **Pre-existing cleanup, untouched:** the temporary `?action=fields` and
+    `?action=sample` diagnostic routes remain in `api/datadoe.js`, and the stray
+    `sales-dashboard-live/datadoe (1).js` file still exists.
+
+### How to review
+
+```
+git checkout feature/six-insight-reports
+cd sales-dashboard-live
+npm run verify          # 47 assertions + a real (non-tree-shaken) build
+```
+Then deploy a **preview** (not production), sign in, and for one IN and one US
+account press Refresh once per report, confirming: the shared snapshot is saved,
+a second browser sees it without its own refresh, a concurrent Refresh is
+rejected by the lock, and navigation/brand/filter/sort/paging produce zero
+`/api/datadoe` requests.
 
 ## Operating rule
 
@@ -311,6 +605,45 @@ unsupported claims or use any Amazon write action without a later explicit
 approval. Claude/Codex must read each referenced DataDoe `SKILL.md` and the
 data scheme before implementation, update this memory after every stage, run a
 senior code review, deploy only after source-level and browser-level checks.
+
+**Six-report senior review (2026-07-29, remediation completed locally):**
+`npm run verify` now passes 49 assertions and a full non-tree-shaken Vite build.
+Review fixed the following correctness risks before merge:
+
+- PPC rollups now include currency in their identity, so a campaign/ASIN/target
+  or search term reported in multiple currencies never has its money or ratios
+  combined. Account-wide PPC KPIs and TACoS are intentionally unavailable for a
+  multi-currency scope rather than fabricated; the UI labels this distinction
+  accurately instead of describing it as an export failure.
+- Priority Feed uses campaign-level PPC insights only. Search-term, target and
+  ASIN views overlap that campaign spend and remain drill-down views, so adding
+  them to the feed would double-count waste.
+- Pagination of persisted Ads source rows is now ordered by metric date plus
+  its remaining primary-key fields (`source_key`, marketplace and
+  `dimension_key`). This makes PostgREST pages deterministic when an account has
+  more than 1,000 rows on a single date, preventing a partial or repeated PPC
+  rollup.
+- The cross-midnight fallback serves a saved snapshot only if its stored
+  `reportVersion` matches the currently requested metric schema. A future report
+  version change therefore cannot render an old payload under a new definition.
+
+Live DataDoe validation for one IN and one US account, plus signed-in browser
+and mobile validation, remain required before production deployment.
+
+**Marketplace-aware dashboard foundation (2026-07-29, ready to deploy):**
+`sales-dashboard-live/lib/marketplaces.js` is the single source of truth for
+marketplace country, default currency, numeric locale and IANA timezone. It
+covers the current IN/US/CA/AU accounts and the UK plus Amazon Europe
+marketplaces (DE, FR, IT, ES, NL, BE, IE, PL and SE), with safe profiles for
+other supported marketplaces. `fetchAccounts` now returns normalized country,
+currency, locale and timezone metadata. Every report window derives its
+date-only `to` value from the *selected account's marketplace day*, preventing
+an India-based user from requesting tomorrow's US/Canada data near midnight (or
+the reverse). Display money respects the currency locale, dashboard breakdowns
+no longer hard-code INR, and content-alert timestamps use the selected
+marketplace timezone. This is intentionally account-scoped: currencies are
+still never converted or combined. Validation: 50 insight assertions and the
+full Vite build pass. The deployment/production browser check is the next step.
 
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
