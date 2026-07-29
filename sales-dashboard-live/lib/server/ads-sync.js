@@ -83,6 +83,38 @@ const ADS_SOURCES = [
     ],
     keyFields: ["ad_targeting_id", "ad_keyword_id", "ad_campaign_id", "ad_group_id", "ad_campaign_type"],
   },
+  {
+    // Search Term Performance (Ads). Added so the PPC report can read customer
+    // search terms from Supabase instead of making every browser export them.
+    // IMPORTANT: this source's documented ad_campaign_type values are
+    // SPONSORED_BRANDS or SPONSORED_PRODUCTS and its DataDoe dependencies are
+    // only the SB/SP search-term reports, so it is SP + SB and must never be
+    // presented as covering Sponsored Display. Keyword Targeting Performance is
+    // the SP + SB + SD source.
+    // Not a default DataDoe table: an organisation that has not enabled it will
+    // fail this source only, leaving the other three unaffected.
+    key: "search-terms-performance-v1",
+    sourceId: "e94e9671989ce4aa2814ac729807c7ddcc1cc47a71ebcd75d9fe661ed80335be",
+    initialDays: 60,
+    dailyDays: 21,
+    monthlyDays: 49,
+    batchSize: MAX_IDS_PER_EXPORT,
+    dimensions: [
+      "marketplace_id", "marketplace_country_code", "marketplace_country_name",
+      "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_seller_id",
+      "amazon_ads_profile_id", "date", "ad_search_term", "ad_targeting_text",
+      "ad_keyword_id", "ad_keyword", "ad_keyword_status", "ad_match_type",
+      "ad_campaign_id", "ad_campaign_name", "ad_campaign_type",
+      "ad_portfolio_id", "ad_portfolio_name", "ad_campaign_status",
+      "ad_campaign_budget_amount", "ad_campaign_budget_type", "ad_campaign_budget_currency",
+      "ad_group_id", "ad_group_name",
+    ],
+    metrics: [
+      "ad_spend", "ad_sales", "ad_clicks", "ad_impressions", "ad_orders",
+      "ad_orders_same_sku", "ad_units_sold_click",
+    ],
+    keyFields: ["ad_search_term", "ad_keyword_id", "ad_campaign_id", "ad_group_id", "ad_campaign_type"],
+  },
 ];
 
 function sleep(ms) {

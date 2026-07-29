@@ -617,6 +617,209 @@ const BUY_BOX_ACTIONS = {
 };
 
 /* ==================================================================== */
+/* PPC Performance & Wasted Spend                                        */
+/* ==================================================================== */
+
+const PPC_LABEL = "PPC Performance";
+
+/**
+ * Derive every advertising ratio from the summed numerators and denominators.
+ * ACoS, CTR, CVR and CPC are never summed or averaged from per-row ratios.
+ */
+export function ppcMetrics(row, { totalSales } = {}) {
+  const spend = Number(row.spend) || 0;
+  const sales = Number(row.sales) || 0;
+  const clicks = Number(row.clicks) || 0;
+  const impressions = Number(row.impressions) || 0;
+  const orders = Number(row.orders) || 0;
+  return {
+    ...row,
+    spend, sales, clicks, impressions, orders,
+    units: Number(row.units) || 0,
+    acos: sales > 0 ? (spend / sales) * 100 : null,
+    roas: spend > 0 ? sales / spend : null,
+    // TACoS needs account total sales, which no Ads table carries.
+    tacos: totalSales && totalSales > 0 ? (spend / totalSales) * 100 : null,
+    cpc: clicks > 0 ? spend / clicks : null,
+    ctr: impressions > 0 ? (clicks / impressions) * 100 : null,
+    cvr: clicks > 0 ? (orders / clicks) * 100 : null,
+    aov: orders > 0 ? sales / orders : null,
+  };
+}
+
+/**
+ * Wasted spend, split into the two kinds that need different actions.
+ *
+ *  * Dead spend — clicks with zero attributed orders, above a minimum click
+ *    count so a small sample is not called waste. All of the spend is waste.
+ *  * Break-even breach — the row converts, but its ACoS is above the
+ *    break-even target. Only the spend ABOVE break-even is waste, not the whole
+ *    spend, because the row is still producing profitable sales up to that point.
+ */
+export function ppcWaste(row, breakEvenAcos, minClicks) {
+  const spend = Number(row.spend) || 0;
+  const sales = Number(row.sales) || 0;
+  const clicks = Number(row.clicks) || 0;
+  const orders = Number(row.orders) || 0;
+
+  if (orders === 0 && clicks >= minClicks) {
+    return { kind: "dead", wasted: spend, note: `${clicks} clicks and no attributed orders` };
+  }
+  if (orders === 0) {
+    return { kind: "watch", wasted: 0, note: `only ${clicks} click${clicks === 1 ? "" : "s"} so far — too small a sample to call waste` };
+  }
+  const acos = sales > 0 ? (spend / sales) * 100 : null;
+  if (acos !== null && acos > breakEvenAcos) {
+    const breakEvenSpend = sales * (breakEvenAcos / 100);
+    return { kind: "breach", wasted: Math.max(0, spend - breakEvenSpend), note: `ACoS ${acos.toFixed(1)}% against a ${breakEvenAcos}% break-even` };
+  }
+  if (acos !== null && acos <= breakEvenAcos * 0.6 && orders >= 3) {
+    return { kind: "scale", wasted: 0, note: `ACoS ${acos.toFixed(1)}% is well inside the ${breakEvenAcos}% break-even` };
+  }
+  return { kind: "ok", wasted: 0, note: acos === null ? "no attributed sales" : `ACoS ${acos.toFixed(1)}%` };
+}
+
+export const PPC_WASTE_META = {
+  dead: { label: "Dead spend", tone: "bad" },
+  breach: { label: "Break-even breach", tone: "warn" },
+  scale: { label: "Scaling candidate", tone: "ok" },
+  watch: { label: "Small sample", tone: "ok" },
+  ok: { label: "Within target", tone: "ok" },
+};
+
+export function buildPpcRows(data, level, { breakEvenAcos, selectedBrand }) {
+  if (!data) return [];
+  const source = data[level] || [];
+  const minClicks = data.minClicksForWaste || 10;
+  return source
+    // Only the ASIN level carries a brand, so the shared header brand filter
+    // applies there. Campaign, target and search-term rows are not
+    // brand-attributable, and filtering them by brand would silently hide
+    // spend, so they are left unfiltered and the UI says so.
+    .filter((row) => level !== "asins" || selectedBrand === "ALL" || row.brand === selectedBrand)
+    .map((row) => {
+      const metrics = ppcMetrics(row, { totalSales: data.totalSales });
+      const waste = ppcWaste(metrics, breakEvenAcos, minClicks);
+      return { ...metrics, waste, wasteMeta: PPC_WASTE_META[waste.kind] };
+    });
+}
+
+export function buildPpcInsights(data, rows, level, breakEvenAcos) {
+  if (!data) return [];
+  const coverage = data.sourceAvailability?.find((entry) => entry.key?.startsWith(
+    level === "searchTerms" ? "search-terms" : level === "targets" ? "keyword-targeting" : level === "asins" ? "asin" : "campaign"
+  ));
+  const freshness = freshnessNote({
+    sourceLabel: coverage?.label || "Persisted Amazon Ads history",
+    asOf: data.latestMetricDate,
+    extra: `${data.window?.days}-day window · ${coverage?.coverage || ""}`.trim(),
+  });
+  const totalSpend = rows.reduce((sum, row) => sum + row.spend, 0);
+  const insights = [];
+
+  for (const row of rows) {
+    const label = row.searchTerm || row.targetText || row.campaignName || row.productName || row.asin || row.campaignId;
+    if (!label) continue;
+    const currency = row.currencies?.[0] || null;
+    const entityAsin = level === "asins" ? row.asin : null;
+
+    if (row.waste.kind === "dead") {
+      const share = totalSpend > 0 ? row.waste.wasted / totalSpend : 0;
+      insights.push(makeInsight({
+        id: `ppc-dead-${level}-${row.key}`,
+        reportKey: "ppc-performance",
+        reportLabel: PPC_LABEL,
+        category: "ppc-dead-spend",
+        severity: severityFromExposure({ share, moneyAtRisk: row.waste.wasted }),
+        title: `"${label}" spent ${row.waste.wasted.toFixed(0)} on ${row.clicks} clicks with no orders`,
+        asin: entityAsin, brand: row.brand || null, entityLabel: label,
+        evidence: [
+          { label: "Spend", value: row.spend.toFixed(2) },
+          { label: "Clicks", value: Math.round(row.clicks) },
+          { label: "Orders", value: 0 },
+          { label: "Impressions", value: Math.round(row.impressions) },
+          { label: "CTR", value: row.ctr === null ? null : `${row.ctr.toFixed(2)}%` },
+          { label: "CPC", value: row.cpc === null ? null : row.cpc.toFixed(2) },
+          { label: "Campaign", value: row.campaignName || null },
+          { label: "Ad product", value: (row.campaignTypes || []).join(", ") || null },
+          { label: "Active days", value: row.activeDays || null },
+        ],
+        moneyAtRisk: row.waste.wasted,
+        moneyBasis: `all spend on this row over ${data.window?.days} days, because it produced no attributed orders`,
+        currency,
+        confidence: "high",
+        freshness,
+        why: `${row.waste.note}, which is above the ${data.minClicksForWaste}-click minimum this report requires before calling spend wasted.`,
+        action: level === "searchTerms"
+          ? "Review this customer search term and consider adding it as a negative keyword in the campaign shown. This report is read-only and applies nothing itself."
+          : "Pause or reduce the bid on this target, or fix the landing offer if the clicks should be converting. This report is read-only and changes nothing itself.",
+      }));
+      continue;
+    }
+
+    if (row.waste.kind === "breach") {
+      const share = totalSpend > 0 ? row.waste.wasted / totalSpend : 0;
+      insights.push(makeInsight({
+        id: `ppc-breach-${level}-${row.key}`,
+        reportKey: "ppc-performance",
+        reportLabel: PPC_LABEL,
+        category: "ppc-break-even-breach",
+        severity: severityFromExposure({ share, moneyAtRisk: row.waste.wasted }),
+        title: `"${label}" is ${row.acos.toFixed(0)}% ACoS, ${row.waste.wasted.toFixed(0)} above break-even`,
+        asin: entityAsin, brand: row.brand || null, entityLabel: label,
+        evidence: [
+          { label: "Spend", value: row.spend.toFixed(2) },
+          { label: "Attributed sales", value: row.sales.toFixed(2) },
+          { label: "ACoS", value: `${row.acos.toFixed(1)}%` },
+          { label: "Break-even target", value: `${breakEvenAcos}%` },
+          { label: "Orders", value: Math.round(row.orders) },
+          { label: "CVR", value: row.cvr === null ? null : `${row.cvr.toFixed(1)}%` },
+          { label: "CPC", value: row.cpc === null ? null : row.cpc.toFixed(2) },
+          { label: "Ad product", value: (row.campaignTypes || []).join(", ") || null },
+        ],
+        moneyAtRisk: row.waste.wasted,
+        moneyBasis: `only the spend above the ${breakEvenAcos}% break-even target, not the whole spend, because the sales up to that point are still worth buying`,
+        currency,
+        confidence: "high",
+        freshness,
+        why: `This row converts but ${row.waste.note}, so the spend above break-even is buying unprofitable sales.`,
+        action: "Lower the bid until ACoS reaches the break-even target, or improve conversion on the offer before spending more. Read-only: no bid is changed here.",
+      }));
+      continue;
+    }
+
+    if (row.waste.kind === "scale" && row.sales > 0) {
+      insights.push(makeInsight({
+        id: `ppc-scale-${level}-${row.key}`,
+        reportKey: "ppc-performance",
+        reportLabel: PPC_LABEL,
+        kind: "opportunity",
+        category: "ppc-scaling",
+        severity: row.sales >= totalSpend * 0.1 ? "medium" : "low",
+        title: `"${label}" returns ${row.roas === null ? "" : `${row.roas.toFixed(1)}x`} at ${row.acos.toFixed(0)}% ACoS`,
+        asin: entityAsin, brand: row.brand || null, entityLabel: label,
+        evidence: [
+          { label: "Spend", value: row.spend.toFixed(2) },
+          { label: "Attributed sales", value: row.sales.toFixed(2) },
+          { label: "ACoS", value: `${row.acos.toFixed(1)}%` },
+          { label: "Break-even target", value: `${breakEvenAcos}%` },
+          { label: "Orders", value: Math.round(row.orders) },
+          { label: "CVR", value: row.cvr === null ? null : `${row.cvr.toFixed(1)}%` },
+        ],
+        moneyAtRisk: row.sales,
+        moneyBasis: "attributed sales this row already produces, which is the upside a budget or bid increase would build on",
+        currency,
+        confidence: "high",
+        freshness,
+        why: `${row.waste.note} with ${Math.round(row.orders)} attributed orders, so there is profitable headroom.`,
+        action: "Consider raising the bid or budget here, after confirming stock cover so extra traffic does not hit an out-of-stock offer. Read-only: nothing is changed here.",
+      }));
+    }
+  }
+  return sortInsights(insights);
+}
+
+/* ==================================================================== */
 /* Returns & Refund Leakage                                              */
 /* ==================================================================== */
 

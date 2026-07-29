@@ -19,8 +19,11 @@ import {
   dedupeInsights,
   insightExportRows,
   makeInsight,
+  buildPpcInsights,
+  buildPpcRows,
   buildReturnsInsights,
   buildReturnsRows,
+  ppcMetrics,
   salesMoversCompletenessWarning,
   sortInsights,
 } from "../src/lib/insights.js";
@@ -426,6 +429,119 @@ test("a systemic fixable reason produces an account-level insight", () => {
   assert.ok(account, "expected an account-level pattern insight");
   assert.equal(account.moneyAtRisk, null, "an account pattern has no single monetary basis");
   assert.ok(/product \/ quality/i.test(account.title));
+});
+
+/* ---------- PPC Performance & Wasted Spend ---------- */
+
+const ppcData = {
+  accountId: "acct-1",
+  asOf: "2026-07-29",
+  window: { from: "2026-06-30", to: "2026-07-29", days: 30 },
+  minClicksForWaste: 10,
+  adsRowCount: 400,
+  latestMetricDate: "2026-07-28",
+  totalSales: 200000,
+  totalSalesSourceLabel: "Sales & Traffic by ASIN & Date",
+  totalSalesLagDays: 4,
+  currencies: ["INR"],
+  sourceAvailability: [
+    { key: "campaign-performance-v1", label: "Ad Performance by Campaign & Date", coverage: "All campaign types", rows: 200, sync: null, defaultDataset: true },
+    { key: "search-terms-performance-v1", label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", rows: 200, sync: null, defaultDataset: false },
+  ],
+  searchTerms: [
+    {
+      key: "dead", searchTerm: "cheap knockoff thing", campaignName: "C1", campaignType: "SPONSORED_PRODUCTS",
+      spend: 4000, sales: 0, clicks: 120, impressions: 9000, orders: 0, units: 0,
+      currencies: ["INR"], campaignTypes: ["SPONSORED_PRODUCTS"], activeDays: 28,
+    },
+    {
+      key: "smallsample", searchTerm: "brand new term", campaignName: "C1", campaignType: "SPONSORED_PRODUCTS",
+      spend: 60, sales: 0, clicks: 4, impressions: 200, orders: 0, units: 0,
+      currencies: ["INR"], campaignTypes: ["SPONSORED_PRODUCTS"], activeDays: 3,
+    },
+    {
+      key: "breach", searchTerm: "expensive but converting", campaignName: "C2", campaignType: "SPONSORED_BRANDS",
+      spend: 1000, sales: 2000, clicks: 90, impressions: 5000, orders: 10, units: 11,
+      currencies: ["INR"], campaignTypes: ["SPONSORED_BRANDS"], activeDays: 30,
+    },
+    {
+      key: "scale", searchTerm: "great term", campaignName: "C2", campaignType: "SPONSORED_PRODUCTS",
+      spend: 500, sales: 5000, clicks: 80, impressions: 4000, orders: 25, units: 26,
+      currencies: ["INR"], campaignTypes: ["SPONSORED_PRODUCTS"], activeDays: 30,
+    },
+  ],
+};
+
+test("PPC ratios are recomputed from summed numerators and denominators", () => {
+  const metrics = ppcMetrics({ spend: 1000, sales: 4000, clicks: 200, impressions: 10000, orders: 20, units: 22 }, { totalSales: 50000 });
+  assert.equal(metrics.acos, 25);
+  assert.equal(metrics.roas, 4);
+  assert.equal(metrics.cpc, 5);
+  assert.equal(metrics.ctr, 2);
+  assert.equal(metrics.cvr, 10);
+  assert.equal(metrics.tacos, 2);
+});
+
+test("TACoS is withheld when total account sales is unavailable", () => {
+  const metrics = ppcMetrics({ spend: 100, sales: 100, clicks: 1, impressions: 1, orders: 1, units: 1 }, { totalSales: null });
+  assert.equal(metrics.tacos, null);
+});
+
+test("dead spend needs the minimum click count", () => {
+  const rows = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  const byKey = Object.fromEntries(rows.map((row) => [row.key, row]));
+  assert.equal(byKey.dead.waste.kind, "dead");
+  assert.equal(byKey.dead.waste.wasted, 4000, "all spend is waste when nothing converted");
+  // 4 clicks is a small sample, not proven waste.
+  assert.equal(byKey.smallsample.waste.kind, "watch");
+  assert.equal(byKey.smallsample.waste.wasted, 0);
+});
+
+test("a break-even breach only counts the spend above break-even", () => {
+  const rows = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  const breach = rows.find((row) => row.key === "breach");
+  assert.equal(breach.waste.kind, "breach");
+  // ACoS is 50%; break-even spend on 2000 sales at 30% is 600, so 400 is waste.
+  assert.equal(breach.waste.wasted, 400);
+  assert.ok(breach.waste.wasted < breach.spend, "must not treat all spend as waste");
+});
+
+test("profitable rows are surfaced as scaling opportunities, not waste", () => {
+  const rows = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  const scale = rows.find((row) => row.key === "scale");
+  assert.equal(scale.waste.kind, "scale");
+  assert.equal(scale.waste.wasted, 0);
+  const insights = buildPpcInsights(ppcData, rows, "searchTerms", 30);
+  const opportunity = insights.find((item) => item.category === "ppc-scaling");
+  assert.ok(opportunity);
+  assert.equal(opportunity.kind, "opportunity");
+  // Risks must still rank ahead of opportunities.
+  assert.equal(insights[0].kind, "risk");
+});
+
+test("the break-even input changes waste without any refetch", () => {
+  const at30 = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  const at60 = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 60, selectedBrand: "ALL" });
+  const breach30 = at30.find((row) => row.key === "breach").waste;
+  const breach60 = at60.find((row) => row.key === "breach").waste;
+  assert.equal(breach30.kind, "breach");
+  assert.notEqual(breach60.kind, "breach", "a 50% ACoS is inside a 60% break-even");
+});
+
+test("search-term insights never claim Sponsored Display coverage", () => {
+  const rows = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  const insights = buildPpcInsights(ppcData, rows, "searchTerms", 30);
+  for (const item of insights) {
+    assert.ok(/SP \+ SB only/.test(item.freshness), "freshness must state the SP+SB-only coverage");
+    assert.ok(!/SPONSORED_DISPLAY/i.test(item.freshness));
+  }
+});
+
+test("PPC actions stay read-only", () => {
+  const rows = buildPpcRows(ppcData, "searchTerms", { breakEvenAcos: 30, selectedBrand: "ALL" });
+  for (const item of buildPpcInsights(ppcData, rows, "searchTerms", 30)) {
+    assert.ok(/read-only|Read-only/.test(item.action), `action must state it changes nothing: ${item.action}`);
+  }
 });
 
 /* ---------- ranking, dedupe, export ---------- */

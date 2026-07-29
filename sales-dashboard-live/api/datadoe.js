@@ -55,6 +55,7 @@ import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from 
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
+import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
@@ -1371,6 +1372,28 @@ export default async function handler(req, res) {
         userId: access.userId,
         label: "Returns & Refund Leakage",
         build: () => buildReturnsLeakage({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    // PPC reads the persisted Supabase Ads history, never a live Ads export.
+    // Only its small total-sales figure (needed for TACoS) touches DataDoe, and
+    // only on an explicit refresh.
+    if (action === "ppc-performance") {
+      const ids = singleAccountId(req, res, "PPC Performance");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: PPC_REPORT_KEY,
+        reportVersion: PPC_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "PPC Performance",
+        build: () => buildPpcPerformance({ apiKey, ids, to }),
       });
       return;
     }

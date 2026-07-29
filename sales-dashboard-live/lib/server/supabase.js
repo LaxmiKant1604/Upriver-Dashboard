@@ -322,6 +322,40 @@ export async function getAdDailyMetrics(accountId, from, to) {
   return request(`/rest/v1/ad_daily_metrics?${query}`);
 }
 
+// Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
+// request, so this pages. If an account's window genuinely exceeds the budget
+// the caller throws rather than aggregating a partial window, because a
+// truncated spend total would understate waste.
+const ADS_ROW_PAGE_SIZE = 1000;
+
+/**
+ * Read persisted Amazon Ads rows for one account.
+ *
+ * This is the PPC report's only Ads source: the scheduled worker owns the
+ * DataDoe exports, so opening or refreshing PPC never spends an Ads export.
+ */
+export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, maxRows }) {
+  const rows = [];
+  for (let offset = 0; ; offset += ADS_ROW_PAGE_SIZE) {
+    const query = new URLSearchParams({
+      select: "source_key,metric_date,marketplace_country_code,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at",
+      account_id: `eq.${accountId}`,
+      source_key: `in.(${sourceKeys.join(",")})`,
+      and: `(metric_date.gte.${from},metric_date.lte.${to})`,
+      order: "metric_date.asc",
+      limit: String(ADS_ROW_PAGE_SIZE),
+      offset: String(offset),
+    });
+    const page = await request(`/rest/v1/ads_daily_source_rows?${query}`);
+    rows.push(...page);
+    if (page.length < ADS_ROW_PAGE_SIZE) break;
+    if (maxRows && rows.length >= maxRows) {
+      throw new Error(`This account has more than ${maxRows.toLocaleString("en-US")} saved Amazon Ads rows in the selected window. The PPC report was not built because aggregating a partial window would understate spend and wasted spend. Use a shorter window.`);
+    }
+  }
+  return rows;
+}
+
 export async function upsertAdsSyncStates(states) {
   if (!states.length) return;
   await request("/rest/v1/ads_sync_state?on_conflict=account_id,source_key", {
