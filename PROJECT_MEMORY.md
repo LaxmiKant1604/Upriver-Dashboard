@@ -251,6 +251,50 @@ Public org: https://github.com/Deltologic. Two repos are the most useful referen
 
 - There is also a hosted MCP server (`Deltologic/datadoe-mcp`, base `https://mcp.datadoe.com/mcp/v1`) exposing the same data as MCP tools — an alternative to the REST exports flow if we ever want tool-based access.
 
+### Report opportunity review (2026-07-29)
+
+DataDoe's published skill catalogue was rechecked at
+https://github.com/Deltologic/datadoe-ai-skills and its public data scheme at
+https://api.datadoe.com/api/v1/spec/data-scheme. The current Upriver modules
+already cover Dashboard, Daily Reporting, Reconciliation, FBA Shipment Plan,
+SKU P&L, Keyword Rank, and Content Alerts (pending the source being enabled).
+Do not build duplicates. Recommended next modules, in priority order, are:
+
+1. **PPC Performance & Wasted Spend:** campaign/ASIN/keyword/search-term
+   performance, spend, attributed sales, ACoS/TACoS, zero-sale click waste,
+   break-even breaches, and concrete bid/negative-keyword suggestions. This is
+   the highest-value next module because shared daily Ads history is already
+   persisted in Supabase. Preserve campaign type; Search Term data is SP+SB,
+   while Keyword Targeting is SP+SB+SD.
+2. **Returns & Refund Leakage:** SKU/ASIN returns, refund value, return rate,
+   reason buckets, COGS/profit impact, and money-ranked fixes. It identifies
+   whether the best action is product, sizing, listing, or delivery work.
+3. **Sales Movers & Weekly Business Review:** week-over-week SKU gains/losses
+   diagnosed by traffic, conversion, price, buy box, ads, margin, and stock;
+   paired with a compact owner/manager weekly summary and actions.
+4. **Listing Health / Suppressed Listings:** inactive, incomplete, suppressed,
+   stranded, or error-state SKUs ranked by sales at risk; prevents silent sales
+   loss. Add Buy Box root-cause as a drill-down for price, availability, and
+   fulfilment causes.
+5. **Account Health Monitor:** Account Health Rating, order-defect, late
+   shipment, valid tracking, cancellation, and policy violations against
+   Amazon targets. This is a risk-prevention report, not a sales report.
+6. **Orders Manager:** searchable order/line-item operations view with order
+   status, FBA/FBM, business order, geography, product/SKU, and local workflow
+   tags. It is best for customer-service and operations teams.
+7. **Listing / Search Optimizer:** combines SQP, catalog and listings to show
+   search-funnel gaps, title/content quality, and ASIN search visibility. Use
+   only after the team is ready to act on copy/content changes; it is less
+   urgent than PPC, returns, or listing health.
+
+Important data limits: Order Line Items are near-real-time but can be delayed
+up to about an hour; Sales & Traffic can lag up to four days; Profit/settlement
+metrics are better for settled profitability than same-day ordered sales; Ads
+attribution should continue to be re-upserted over its rolling correction
+window. Keep currency separate, use shared Account/Brand scope, read Supabase
+snapshots first, and make external DataDoe refreshes controlled rather than
+per-browser.
+
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
 ### What is implemented
