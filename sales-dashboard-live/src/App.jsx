@@ -786,7 +786,7 @@ function LoginScreen({ passwordSetup = false }) {
         {error && <div className="auth-error"><AlertTriangle size={15} />{error}</div>}
         {message && <div className="auth-success">{message}</div>}
         <button className="auth-submit" disabled={busy}>{busy ? "Please wait…" : passwordSetup ? "Save password" : createAdmin ? "Create administrator" : "Sign in"}</button>
-        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div>{canCreateInitialAdmin && <button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button>}{bootstrapStatus?.initialAdminExists && !createAdmin && <div className="auth-note">Administrator setup is already in progress or complete. Sign in with the owner account.</div>}</>}
+        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div>{canCreateInitialAdmin && <button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button>}</>}
       </form>
     </div>
   );

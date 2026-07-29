@@ -312,6 +312,12 @@ deployed. Production verification returned HTTP 200 with
 account exists and is confirmed; the live login page should therefore hide the
 bootstrap action after a hard refresh.
 
+**Login UI cleanup (completed 2026-07-29):** removed the explanatory
+"Administrator setup is already in progress or complete" text from the login
+screen. The bootstrap action remains hidden after initial setup; this is a
+presentation-only change and does not weaken the server-side administrator
+protection.
+
 `DASHBOARD_APP_URL=https://upriverdashboard.vercel.app` is configured in
 Vercel Production for invitation redirects. Supabase Auth settings showed
 email signup enabled and email confirmation enabled on 2026-07-29. The
