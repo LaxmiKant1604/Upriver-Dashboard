@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw } from "lucide-react";
+import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck } from "lucide-react";
+import { supabase } from "./lib/supabase.js";
 
 /* ============================== CONFIG ============================== */
 // Approximate FX rates for combining accounts that use different currencies.
@@ -12,6 +13,7 @@ const FX_AS_OF = "2026-07-01";
 const FLAGS = { IN: "🇮🇳", US: "🇺🇸", AU: "🇦🇺", CA: "🇨🇦", UK: "🇬🇧", GB: "🇬🇧", DE: "🇩🇪", FR: "🇫🇷", JP: "🇯🇵", MX: "🇲🇽" };
 const SYMBOL = { INR: "₹", USD: "$", AUD: "A$", CAD: "C$", GBP: "£", EUR: "€" };
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
 /* ============================== DATE HELPERS ============================== */
 function pad2(n) { return String(n).padStart(2, "0"); }
@@ -698,23 +700,192 @@ function BreakdownPanel({ title, items, activeKeys, currency }) {
   );
 }
 
+function authFetch(path, accessToken, options = {}) {
+  return fetch(path, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+  }).then(async (response) => {
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+    return body;
+  });
+}
+
+function LoginScreen({ passwordSetup = false }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [createAdmin, setCreateAdmin] = useState(false);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!supabase) return;
+    setBusy(true); setError(""); setMessage("");
+    try {
+      if (passwordSetup) {
+        if (password.length < 8) throw new Error("Use at least 8 characters for your password.");
+        if (password !== confirmPassword) throw new Error("Passwords do not match.");
+        const { error: updateError } = await supabase.auth.updateUser({ password });
+        if (updateError) throw updateError;
+        setMessage("Password saved. Opening your dashboard…");
+      } else if (createAdmin) {
+        if (email.trim().toLowerCase() !== INITIAL_ADMIN_EMAIL) throw new Error("Only the configured dashboard owner can create the initial administrator login.");
+        if (password.length < 8) throw new Error("Use at least 8 characters for your password.");
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(), password,
+          options: { emailRedirectTo: window.location.origin },
+        });
+        if (signUpError) throw signUpError;
+        if (!data.session) setMessage("Check your email to confirm this administrator login, then sign in.");
+      } else {
+        const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+        if (signInError) throw signInError;
+      }
+    } catch (submitError) {
+      setError(submitError.message || "Unable to continue.");
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="auth-root">
+      <style>{STYLE}</style>
+      <form className="auth-panel" onSubmit={submit}>
+        <div className="auth-logo">UR</div>
+        <div className="auth-title">{passwordSetup ? "Set your password" : createAdmin ? "Create administrator login" : "Upriver Dashboard"}</div>
+        <div className="auth-sub">{passwordSetup ? "Choose a password to activate your invited account." : createAdmin ? "Create the one initial administrator identity for this dashboard." : "Sign in to your Amazon reporting workspace."}</div>
+        {!passwordSetup && <label className="auth-field"><span>Email</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required /></label>}
+        <label className="auth-field"><span>{passwordSetup ? "New password" : "Password"}</span><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete={passwordSetup ? "new-password" : "current-password"} required minLength="8" /></label>
+        {passwordSetup && <label className="auth-field"><span>Confirm password</span><input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} autoComplete="new-password" required minLength="8" /></label>}
+        {error && <div className="auth-error"><AlertTriangle size={15} />{error}</div>}
+        {message && <div className="auth-success">{message}</div>}
+        <button className="auth-submit" disabled={busy}>{busy ? "Please wait…" : passwordSetup ? "Save password" : createAdmin ? "Create administrator" : "Sign in"}</button>
+        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div><button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button></>}
+      </form>
+    </div>
+  );
+}
+
+function AccessPanel({ accessToken, accounts, onLoadAccounts }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [inviteAccountIds, setInviteAccountIds] = useState([]);
+  const [editingUserId, setEditingUserId] = useState("");
+  const [editRole, setEditRole] = useState("viewer");
+  const [editAccountIds, setEditAccountIds] = useState([]);
+
+  const loadUsers = useCallback(async () => {
+    setLoading(true); setError("");
+    try { setUsers((await authFetch("/api/access?action=users", accessToken)).users || []); }
+    catch (loadError) { setError(loadError.message); }
+    finally { setLoading(false); }
+  }, [accessToken]);
+
+  useEffect(() => { loadUsers(); }, [loadUsers]);
+
+  const toggle = (accountId, setter) => setter((current) => current.includes(accountId)
+    ? current.filter((id) => id !== accountId)
+    : [...current, accountId]);
+
+  const invite = async (event) => {
+    event.preventDefault();
+    setLoading(true); setError(""); setNotice("");
+    try {
+      await authFetch("/api/access?action=invite", accessToken, {
+        method: "POST",
+        body: JSON.stringify({ email, displayName, accountIds: inviteAccountIds }),
+      });
+      setEmail(""); setDisplayName(""); setInviteAccountIds([]);
+      setNotice("Invitation sent and account access assigned.");
+      await loadUsers();
+    } catch (inviteError) { setError(inviteError.message); }
+    finally { setLoading(false); }
+  };
+
+  const beginEdit = (user) => {
+    setEditingUserId(user.id);
+    setEditRole(user.role === "editor" ? "editor" : "viewer");
+    setEditAccountIds(user.accountIds || []);
+    setNotice(""); setError("");
+  };
+
+  const saveEdit = async () => {
+    setLoading(true); setError(""); setNotice("");
+    try {
+      await authFetch("/api/access?action=user", accessToken, {
+        method: "PATCH",
+        body: JSON.stringify({ userId: editingUserId, role: editRole, accountIds: editAccountIds }),
+      });
+      setEditingUserId("");
+      setNotice("User access updated.");
+      await loadUsers();
+    } catch (saveError) { setError(saveError.message); }
+    finally { setLoading(false); }
+  };
+
+  return <div className="container access-page">
+    <div className="controls-bar access-heading"><div><div className="page-title">User Access</div><div className="page-sub">Invite users and assign only the Amazon accounts they may access.</div></div><button className="secondary-action" onClick={onLoadAccounts} disabled={loading}><RefreshCw size={14} className={loading ? "spin" : ""} />Load accounts</button></div>
+    {error && <div className="error-banner"><AlertTriangle size={15} />{error}</div>}
+    {notice && <div className="access-notice">{notice}</div>}
+    {!accounts.length && <div className="panel access-empty">Load the account directory before inviting a user, then choose their permitted accounts.</div>}
+    <div className="access-grid">
+      <form className="panel access-invite" onSubmit={invite}>
+        <div className="panel-title"><UserPlus size={17} />Invite user</div>
+        <label className="auth-field"><span>Email address</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="user@company.com" /></label>
+        <label className="auth-field"><span>Name (optional)</span><input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Team member" /></label>
+        <div className="access-field-label">Allowed Amazon accounts</div>
+        <div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={inviteAccountIds.includes(account.id)} onChange={() => toggle(account.id, setInviteAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div>
+        <button className="auth-submit" disabled={loading || !accounts.length}>Send invitation</button>
+      </form>
+      <div className="panel access-users">
+        <div className="panel-title"><UsersRound size={17} />Users</div>
+        <div className="access-user-list">{users.map((user) => <button className={"access-user-row" + (editingUserId === user.id ? " selected" : "")} type="button" key={user.id} onClick={() => beginEdit(user)}><span><strong>{user.displayName || user.email}</strong><small>{user.email}</small></span><span className={"access-role role-" + user.role}>{user.role}</span><span>{user.accountIds.length} accounts</span></button>)}</div>
+      </div>
+    </div>
+    {editingUserId && (() => {
+      const user = users.find((candidate) => candidate.id === editingUserId);
+      if (!user) return null;
+      return <div className="panel access-editor"><div className="panel-head"><div><div className="panel-title">Edit access</div><div className="page-sub">{user.email}</div></div><button className="icon-action" type="button" onClick={() => setEditingUserId("")} title="Close"><X size={15} /></button></div>{user.role === "admin" ? <div className="empty-note">The initial administrator remains protected in this panel.</div> : <><label className="auth-field"><span>Role</span><select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><div className="access-field-label">Allowed Amazon accounts</div><div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={editAccountIds.includes(account.id)} onChange={() => toggle(account.id, setEditAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div><button className="auth-submit" type="button" onClick={saveEdit} disabled={loading}>Save access</button></>}</div>;
+    })()}
+  </div>;
+}
+
 /* ============================== DATA LAYER ============================== */
+let apiAccessToken = "";
+let apiCacheOwner = "anonymous";
+
+function configureApiSession(session) {
+  apiAccessToken = session?.access_token || "";
+  apiCacheOwner = session?.user?.id || "anonymous";
+}
+
 async function apiGet(params) {
+  if (!apiAccessToken) throw new Error("Please sign in to access the dashboard.");
   const qs = new URLSearchParams(params).toString();
-  const r = await fetch(`/api/datadoe?${qs}`);
+  const r = await fetch(`/api/datadoe?${qs}`, { headers: { Authorization: `Bearer ${apiAccessToken}` } });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(body.error || `Request failed (${r.status})`);
   return body;
 }
 
-const API_CACHE_PREFIX = "upriver:datadoe:v1:";
+const API_CACHE_PREFIX = "upriver:datadoe:v2:";
 const LARGE_CACHE_DB = "upriver-report-cache";
 const LARGE_CACHE_STORE = "responses";
 
 function apiCacheKey(params) {
   const qs = new URLSearchParams();
   Object.keys(params).sort().forEach((key) => qs.set(key, params[key]));
-  return API_CACHE_PREFIX + qs.toString();
+  return API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":" + qs.toString();
 }
 
 function readApiCache(params) {
@@ -733,10 +904,11 @@ function readCachedCatalogBrands(accountId) {
   if (!accountId) return [];
   try {
     const brands = new Set();
+    const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
     for (let i = 0; i < window.localStorage.length; i++) {
       const key = window.localStorage.key(i);
-      if (!key || !key.startsWith(API_CACHE_PREFIX)) continue;
-      const params = new URLSearchParams(key.slice(API_CACHE_PREFIX.length));
+      if (!key || !key.startsWith(ownerPrefix)) continue;
+      const params = new URLSearchParams(key.slice(ownerPrefix.length));
       if (params.get("ids") !== accountId) continue;
       const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
       (cached.body?.catalogBrands || []).forEach((brand) => brands.add(brand));
@@ -744,6 +916,24 @@ function readCachedCatalogBrands(accountId) {
     return [...brands].sort((a, b) => a.localeCompare(b));
   } catch (e) {
     return [];
+  }
+}
+
+function removeUnauthorizedCachedData(allowedAccountIds, isAdmin) {
+  if (isAdmin) return;
+  const allowed = new Set(allowedAccountIds);
+  const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+  try {
+    const staleKeys = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(ownerPrefix)) continue;
+      const accountId = new URLSearchParams(key.slice(ownerPrefix.length)).get("ids");
+      if (accountId && !allowed.has(accountId)) staleKeys.push(key);
+    }
+    staleKeys.forEach((key) => window.localStorage.removeItem(key));
+  } catch (e) {
+    // Browser storage can be unavailable; server authorization remains final.
   }
 }
 
@@ -820,7 +1010,15 @@ async function cachedLargeApiGet(params, { force = false } = {}) {
 }
 
 /* ============================== MAIN APP ============================== */
-export default function App() {
+function DashboardApp({ session, access, onSignOut }) {
+  const isAdmin = access.role === "admin";
+  const allowedAccountIds = useMemo(() => new Set(access.accountIds || []), [access.accountIds]);
+  useEffect(() => {
+    configureApiSession(session);
+    removeUnauthorizedCachedData(access.accountIds || [], isAdmin);
+    void removeUnauthorizedLargeCachedData(access.accountIds || [], isAdmin);
+  }, [session, access.accountIds, isAdmin]);
+
   const [accounts, setAccounts] = useState([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
   const [accountsError, setAccountsError] = useState(null);
@@ -918,14 +1116,16 @@ export default function App() {
   const TODAY = todayStr();
 
   const applyAccounts = useCallback((body) => {
-    const nextAccounts = body.accounts || [];
+    const nextAccounts = (body.accounts || []).filter((account) => isAdmin || allowedAccountIds.has(String(account.id)));
     setAccounts(nextAccounts);
     if (nextAccounts.length > 0) {
-      setSelectedAccountId((prev) => prev || nextAccounts[0].id);
+      setSelectedAccountId((prev) => nextAccounts.some((account) => account.id === prev) ? prev : nextAccounts[0].id);
+    } else {
+      setSelectedAccountId(null);
     }
     setAccountsError(null);
     return nextAccounts;
-  }, []);
+  }, [allowedAccountIds, isAdmin]);
 
   const fetchAccounts = useCallback(() => {
     setAccountsLoading(true);
@@ -1836,6 +2036,10 @@ export default function App() {
     return selectedBrand === "ALL" ? new Set() : new Set([selectedBrand]);
   }, [selectedBrand]);
 
+  if (!isAdmin && access.accountIds.length === 0) {
+    return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen"><ShieldCheck size={24} style={{ marginBottom: 10 }} /><strong>No Amazon accounts assigned</strong><div style={{ marginTop: 8 }}>Your administrator must assign an account before you can view dashboard data.</div><button className="cache-refresh-btn" onClick={onSignOut}><LogOut size={14} />Sign out</button></div></div>;
+  }
+
   if (accountsLoading) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen">Loading your Amazon accounts…</div></div>;
   }
@@ -1868,7 +2072,7 @@ export default function App() {
             <div className="sb-logo">UR</div>
             <div className="sb-brand-text">
               <div className="sb-ws-name">Upriver Dashboard</div>
-              <div className="sb-ws-sub">laxmikant@upriver.in</div>
+              <div className="sb-ws-sub">{access.email}</div>
             </div>
             <button className="sb-close" onClick={() => setMobileOpen(false)} aria-label="Close menu">
               <X size={18} />
@@ -1904,12 +2108,20 @@ export default function App() {
               <BellRing size={18} />
               <span className="sb-nav-label">Content Alerts</span>
             </button>
+            {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
+              <UsersRound size={18} />
+              <span className="sb-nav-label">User Access</span>
+            </button>}
           </nav>
 
           <div className="sb-footer">
             <button className="sb-collapse" onClick={() => setCollapsed((c) => !c)} title={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-label="Toggle sidebar">
               {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
               <span className="sb-nav-label">Collapse</span>
+            </button>
+            <button className="sb-collapse" onClick={onSignOut} title="Sign out" aria-label="Sign out">
+              <LogOut size={18} />
+              <span className="sb-nav-label">Sign out</span>
             </button>
           </div>
         </aside>
@@ -1925,7 +2137,7 @@ export default function App() {
           <span className="mark">UPRIVER</span>
           <span className="sub">Amazon Seller Portfolio — Sales</span>
         </div>
-        <div className="topbar-filters">
+        {view !== "access" && <div className="topbar-filters">
           <div className="select topbar-account-select">
             <select
               aria-label="Account selection"
@@ -1956,8 +2168,8 @@ export default function App() {
             </select>
             <ChevronDown size={16} />
           </div>
-        </div>
-        <div className="live-wrap">
+        </div>}
+        {view !== "access" && <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
             const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "keywordrank" ? keywordRankCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
@@ -1966,8 +2178,10 @@ export default function App() {
           <button className="refresh-btn" onClick={view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows} disabled={(view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading)} title="Refresh selected account">
             <RefreshCw size={13} className={(view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
           </button>
-        </div>
+        </div>}
       </div>
+
+      {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
 
       {view === "dashboard" && (
       <div className="container">
@@ -3079,11 +3293,15 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 .skupl-table tr.skupl-row-loss td{ background:#FDECEC; }
 .skupl-table tr.skupl-row-loss td.pt-id{ background:#FBE0E0; box-shadow:inset 3px 0 0 var(--neg); }
 .skupl-table tr.skupl-row-loss:hover td{ background:#FBE0E0; }
+.auth-root{ min-height:100vh; display:grid; place-items:center; padding:24px; background:var(--bg); font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; color:var(--ink); }.auth-panel{ width:min(100%,400px); border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:28px; box-shadow:0 18px 46px rgba(18,23,43,.1); }.auth-logo{ display:grid; place-items:center; width:40px; height:40px; border-radius:8px; background:#10172E; color:#fff; font-weight:800; font-size:12px; }.auth-title{ margin-top:18px; font-size:22px; font-weight:800; }.auth-sub{ margin-top:7px; color:var(--ink-soft); font-size:13px; line-height:1.55; }.auth-field{ display:flex; flex-direction:column; gap:6px; margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.auth-field input,.auth-field select{ min-height:39px; width:100%; border:1px solid var(--border); border-radius:7px; padding:8px 10px; color:var(--ink); background:var(--surface); font:600 14px 'Manrope',sans-serif; text-transform:none; letter-spacing:0; }.auth-submit{ width:100%; min-height:40px; margin-top:20px; border:1px solid #10172E; border-radius:7px; background:#10172E; color:#fff; cursor:pointer; font:700 13px 'Manrope',sans-serif; }.auth-submit:disabled{ opacity:.6; cursor:not-allowed; }.auth-error,.auth-success{ display:flex; align-items:center; gap:7px; margin-top:14px; padding:9px 10px; border-radius:6px; font-size:12px; font-weight:700; }.auth-error{ color:var(--neg); background:#FDECEC; }.auth-success{ color:var(--pos); background:#E6F2EB; }.auth-note{ margin-top:13px; color:var(--ink-soft); font-size:11.5px; line-height:1.5; text-align:center; }
+.auth-link{ display:block; width:100%; margin-top:10px; border:0; background:transparent; color:var(--accent-deep); cursor:pointer; font:700 11.5px 'Manrope',sans-serif; }
+.access-heading{ align-items:center; }.access-grid{ display:grid; grid-template-columns:minmax(280px,.85fr) minmax(380px,1.5fr); gap:14px; margin-top:14px; }.access-invite,.access-users,.access-editor{ padding:16px; }.access-invite .panel-title,.access-users .panel-title{ display:flex; align-items:center; gap:8px; }.access-field-label{ margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.access-account-list{ max-height:240px; overflow:auto; margin-top:8px; border:1px solid var(--border); border-radius:7px; }.access-account-check{ display:flex; align-items:flex-start; gap:8px; padding:9px 10px; border-bottom:1px solid var(--border); color:var(--ink); font-size:12.5px; font-weight:600; cursor:pointer; }.access-account-check:last-child{ border-bottom:0; }.access-account-check input{ margin-top:2px; accent-color:var(--accent-deep); }.access-user-list{ margin-top:12px; border-top:1px solid var(--border); }.access-user-row{ width:100%; display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:12px; padding:11px 2px; border:0; border-bottom:1px solid var(--border); background:transparent; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }.access-user-row:hover,.access-user-row.selected{ background:#FBF2E4; }.access-user-row strong,.access-user-row small{ display:block; }.access-user-row strong{ font-size:12.5px; }.access-user-row small{ margin-top:3px; color:var(--ink-soft); font-size:11px; }.access-role{ display:inline-flex; justify-content:center; min-width:60px; padding:4px 7px; border-radius:999px; background:#EEF1F7; color:var(--ink-soft); font-size:10px; font-weight:800; text-transform:uppercase; }.access-role.role-admin{ background:#E7EDF9; color:#254D92; }.access-role.role-editor{ background:#FBEFD8; color:#8A5A12; }.access-editor{ margin-top:14px; max-width:720px; }.access-notice{ margin-top:14px; padding:10px 12px; border:1px solid #B8DFC8; border-radius:7px; background:#EEF8F1; color:var(--pos); font-size:12px; font-weight:700; }.access-empty{ margin-top:14px; color:var(--ink-soft); font-size:13px; }
 @media (max-width:900px){
   .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
   .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
   .recon-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }.recon-chart-grid{ grid-template-columns:1fr; }
   .skupl-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }.skupl-insights{ grid-template-columns:1fr; }
+  .access-grid{ grid-template-columns:1fr; }.access-user-row{ grid-template-columns:minmax(130px,1fr) auto; }.access-user-row > :last-child{ grid-column:2; }
   /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
   .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
   .sidebar.collapsed{ width:270px; }
@@ -3106,3 +3324,79 @@ html,body,#root{ margin:0; padding:0; height:100%; }
 @media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
 button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
 `;
+
+export default function App() {
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [passwordSetup, setPasswordSetup] = useState(false);
+  const [access, setAccess] = useState(null);
+  const [accessError, setAccessError] = useState("");
+
+  useEffect(() => {
+    if (!supabase) { setAuthReady(true); return undefined; }
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session || null);
+      configureApiSession(data.session || null);
+      if (window.location.hash.includes("type=invite") || window.location.search.includes("type=invite")) setPasswordSetup(true);
+      setAuthReady(true);
+    });
+    const { data: subscription } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      setSession(nextSession || null);
+      configureApiSession(nextSession || null);
+      if (event === "PASSWORD_RECOVERY") setPasswordSetup(true);
+      if (event === "USER_UPDATED") setPasswordSetup(false);
+      if (event === "SIGNED_OUT") { setAccess(null); setAccessError(""); setPasswordSetup(false); }
+    });
+    return () => subscription.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!session?.access_token) { setAccess(null); return; }
+    let active = true;
+    setAccess(null); setAccessError("");
+    authFetch("/api/access?action=me", session.access_token)
+      .then((body) => { if (active) setAccess(body.access); })
+      .catch((error) => { if (active) setAccessError(error.message || "Unable to load dashboard access."); });
+    return () => { active = false; };
+  }, [session?.access_token]);
+
+  const signOut = useCallback(async () => {
+    if (supabase) await supabase.auth.signOut();
+    setSession(null); setAccess(null); configureApiSession(null);
+  }, []);
+
+  if (!supabase) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Login setup incomplete</div><div className="auth-sub">The public Supabase browser configuration is missing from Vercel.</div></div></div>;
+  if (!authReady) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading secure session…</div></div>;
+  if (!session) return <LoginScreen passwordSetup={passwordSetup} />;
+  if (passwordSetup) return <LoginScreen passwordSetup />;
+  if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div><button className="auth-submit" onClick={signOut}>Sign out</button></div></div>;
+  if (!access) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading your dashboard access…</div></div>;
+  return <DashboardApp session={session} access={access} onSignOut={signOut} />;
+}
+
+async function removeUnauthorizedLargeCachedData(allowedAccountIds, isAdmin) {
+  if (isAdmin) return;
+  const allowed = new Set(allowedAccountIds);
+  const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+  try {
+    const db = await openLargeCache();
+    await new Promise((resolve, reject) => {
+      const store = db.transaction(LARGE_CACHE_STORE, "readwrite").objectStore(LARGE_CACHE_STORE);
+      const cursor = store.openCursor();
+      cursor.onsuccess = () => {
+        const current = cursor.result;
+        if (!current) { resolve(); return; }
+        const key = String(current.key || "");
+        if (key.startsWith(ownerPrefix)) {
+          const accountId = new URLSearchParams(key.slice(ownerPrefix.length)).get("ids");
+          if (accountId && !allowed.has(accountId)) current.delete();
+        }
+        current.continue();
+      };
+      cursor.onerror = () => reject(cursor.error);
+    });
+    db.close();
+  } catch (e) {
+    // Server authorization remains the final protection if IndexedDB is unavailable.
+  }
+}

@@ -251,6 +251,53 @@ Public org: https://github.com/Deltologic. Two repos are the most useful referen
 
 - There is also a hosted MCP server (`Deltologic/datadoe-mcp`, base `https://mcp.datadoe.com/mcp/v1`) exposing the same data as MCP tools — an alternative to the REST exports flow if we ever want tool-based access.
 
+## Dashboard authentication and account access (implemented 2026-07-29; deployment pending)
+
+### What is implemented
+
+- Supabase email/password authentication gates the entire browser app. The
+  Vite bundle uses only `VITE_SUPABASE_URL` and the public/anon key; it never
+  receives `SUPABASE_SECRET_KEY` or `DATADOE_API_KEY`.
+- The initial administrator is **`laxmikant@upriver.in`**. Migration
+  `20260729_dashboard_auth_and_access.sql` creates an Auth-user trigger that
+  makes this email `admin`; all invited users become `viewer` by default with
+  no Amazon account access. The migration is applied to production.
+- The sign-in screen permits only this initial owner email to create the first
+  administrator login. Every other person must be invited from the admin-only
+  **User Access** sidebar page.
+- The User Access page invites an email, lets the admin choose a Viewer or
+  Editor role, and assigns zero or more individual Amazon accounts. It lists
+  current users and lets the admin change a non-admin user's role/assignments.
+  The initial administrator is deliberately protected from alteration there.
+- `api/datadoe.js` now authenticates every request with the Supabase access
+  token. For every account-scoped action it validates `ids` on the server
+  against `account_permissions`; changing a browser URL/request cannot expose
+  an unassigned account. The `accounts` action filters the returned account
+  directory too. Diagnostic `fields`/`sample` actions require admin.
+- Browser report caches are now namespaced by Auth user ID (`v2` cache keys),
+  and both localStorage and IndexedDB report entries for revoked accounts are
+  removed when a user's access is loaded. Server authorization remains the
+  final control.
+- `api/access.js` is the admin-only invitation/access-management endpoint.
+  It uses the server-only Supabase secret to call the Auth Admin API; it does
+  not expose user-management capability to the browser.
+
+### One-time operational setup after deployment
+
+1. In Supabase Studio, open **Authentication > URL Configuration**.
+2. Set Site URL to `https://upriverdashboard.vercel.app`.
+3. Add `https://upriverdashboard.vercel.app/**` to Redirect URLs.
+4. On the dashboard login page, choose **Create initial administrator login**
+   and sign up using `laxmikant@upriver.in`. Confirm the email if Supabase asks.
+5. Sign in, open **User Access**, load the account directory once, invite each
+   user, and tick only the accounts that user should access.
+
+`DASHBOARD_APP_URL=https://upriverdashboard.vercel.app` is configured in
+Vercel Production for invitation redirects. Supabase Auth settings showed
+email signup enabled and email confirmation enabled on 2026-07-29. The
+production dependency audit after adding `@supabase/supabase-js` found zero
+production vulnerabilities; do not run `npm audit fix --force` casually.
+
 ## Amazon accounts inventory
 
 ## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)

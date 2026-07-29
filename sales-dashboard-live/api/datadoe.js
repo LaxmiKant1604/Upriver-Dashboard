@@ -20,7 +20,14 @@
 // https://api.datadoe.com/api/v1/docs for the correct path and let me know
 // what you find — it's a one-line fix here.
 
-import { getAdDailyMetrics, isSupabaseConfigured } from "../lib/server/supabase.js";
+import {
+  DashboardAccessError,
+  assertAccountAccess,
+  assertAdmin,
+  getAdDailyMetrics,
+  getDashboardAccess,
+  isSupabaseConfigured,
+} from "../lib/server/supabase.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
 
@@ -34,6 +41,11 @@ const ENDPOINTS = {
   exportStatus: (id) => `${BASE}/exports/${id}`,
   exportRaw: (id) => `${BASE}/exports/${id}/raw`,
 };
+
+const ACCOUNT_SCOPED_ACTIONS = new Set([
+  "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
+  "keyword-rank", "content-changes", "fba-plan",
+]);
 
 // Source table for daily sales/units per account. 401ffcd7e5 ("Sales &
 // Traffic by ASIN & Date") is the user-confirmed correct sales report.
@@ -827,18 +839,27 @@ async function downloadExport(apiKey, exportId) {
 }
 
 export default async function handler(req, res) {
-  const apiKey = process.env.DATADOE_API_KEY;
-  if (!apiKey) {
-    res.status(500).json({ error: "DATADOE_API_KEY is not set in this deployment's environment variables." });
-    return;
-  }
-
   try {
+    const access = await getDashboardAccess(req);
+    const apiKey = process.env.DATADOE_API_KEY;
+    if (!apiKey) {
+      res.status(500).json({ error: "DATADOE_API_KEY is not set in this deployment's environment variables." });
+      return;
+    }
     const action = req.query.action;
+
+    if (ACCOUNT_SCOPED_ACTIONS.has(action)) {
+      const ids = String(req.query.ids || "").split(",").filter(Boolean);
+      if (ids.length) assertAccountAccess(access, ids);
+    }
+    if (action === "fields" || action === "sample") assertAdmin(access);
 
     if (action === "accounts") {
       const accounts = await fetchAccounts(apiKey);
-      res.status(200).json({ accounts });
+      const allowedAccounts = access.role === "admin"
+        ? accounts
+        : accounts.filter((account) => access.accountIds.includes(String(account.id)));
+      res.status(200).json({ accounts: allowedAccounts });
       return;
     }
 
@@ -1498,6 +1519,7 @@ export default async function handler(req, res) {
 
     res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
+    const status = err instanceof DashboardAccessError ? err.status : 500;
+    res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   }
 }

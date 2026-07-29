@@ -9,6 +9,14 @@ export function isSupabaseConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
 }
 
+export class DashboardAccessError extends Error {
+  constructor(message, status = 403) {
+    super(message);
+    this.name = "DashboardAccessError";
+    this.status = status;
+  }
+}
+
 function requireConfiguration() {
   if (!isSupabaseConfigured()) {
     throw new Error("Supabase is not configured. Connect the Supabase Vercel integration and add SUPABASE_URL plus SUPABASE_SECRET_KEY.");
@@ -32,6 +40,152 @@ async function request(path, { method = "GET", body, headers = {} } = {}) {
     throw new Error(`Supabase request failed (${response.status}): ${result?.message || result?.hint || "Unknown error"}`);
   }
   return result;
+}
+
+async function authRequest(path, { method = "GET", body, accessToken } = {}) {
+  requireConfiguration();
+  const response = await fetch(`${SUPABASE_URL}${path}`, {
+    method,
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${accessToken || SUPABASE_SECRET_KEY}`,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new DashboardAccessError(result?.msg || result?.message || "Authentication request failed.", response.status === 401 ? 401 : 500);
+  }
+  return result;
+}
+
+function bearerToken(req) {
+  const header = String(req.headers?.authorization || "");
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+}
+
+export async function getDashboardAccess(req) {
+  const accessToken = bearerToken(req);
+  if (!accessToken) throw new DashboardAccessError("Please sign in to access the dashboard.", 401);
+  const user = await authRequest("/auth/v1/user", { accessToken });
+  const profileQuery = new URLSearchParams({
+    select: "role,display_name",
+    user_id: `eq.${user.id}`,
+    limit: "1",
+  });
+  const profiles = await request(`/rest/v1/user_profiles?${profileQuery}`);
+  const profile = profiles[0];
+  if (!profile) throw new DashboardAccessError("Your dashboard profile is still being created. Please try again in a moment.", 403);
+  const permissionsQuery = new URLSearchParams({
+    select: "account_id",
+    user_id: `eq.${user.id}`,
+  });
+  const permissions = await request(`/rest/v1/account_permissions?${permissionsQuery}`);
+  return {
+    userId: user.id,
+    email: user.email || "",
+    displayName: profile.display_name || user.user_metadata?.display_name || "",
+    role: profile.role,
+    accountIds: permissions.map((permission) => permission.account_id),
+  };
+}
+
+export function assertAccountAccess(access, accountIds) {
+  if (access.role === "admin") return;
+  const allowed = new Set(access.accountIds);
+  if (!accountIds.length || accountIds.some((accountId) => !allowed.has(accountId))) {
+    throw new DashboardAccessError("You do not have access to the selected Amazon account.", 403);
+  }
+}
+
+export function assertAdmin(access) {
+  if (access.role !== "admin") throw new DashboardAccessError("Administrator access is required.", 403);
+}
+
+export async function listDashboardUsers() {
+  const [profiles, permissions, authUsers] = await Promise.all([
+    request("/rest/v1/user_profiles?select=user_id,role,display_name,created_at,updated_at&order=created_at.asc"),
+    request("/rest/v1/account_permissions?select=user_id,account_id&order=account_id.asc"),
+    authRequest("/auth/v1/admin/users?page=1&per_page=1000"),
+  ]);
+  const emailById = new Map((authUsers.users || []).map((user) => [user.id, user.email || ""]));
+  const accountsByUser = new Map();
+  for (const permission of permissions) {
+    const current = accountsByUser.get(permission.user_id) || [];
+    current.push(permission.account_id);
+    accountsByUser.set(permission.user_id, current);
+  }
+  return profiles.map((profile) => ({
+    id: profile.user_id,
+    email: emailById.get(profile.user_id) || "Pending invitation",
+    displayName: profile.display_name || "",
+    role: profile.role,
+    accountIds: accountsByUser.get(profile.user_id) || [],
+    createdAt: profile.created_at,
+    updatedAt: profile.updated_at,
+  }));
+}
+
+function validManagedRole(role) {
+  return role === "viewer" || role === "editor";
+}
+
+function normalizeAccountIds(accountIds) {
+  if (!Array.isArray(accountIds)) throw new DashboardAccessError("Account assignments must be an array.", 400);
+  return [...new Set(accountIds.map((accountId) => String(accountId).trim()).filter(Boolean))];
+}
+
+export async function replaceAccountPermissions(userId, accountIds) {
+  const normalized = normalizeAccountIds(accountIds);
+  await request(`/rest/v1/account_permissions?user_id=eq.${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+  if (normalized.length) {
+    await request("/rest/v1/account_permissions", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: normalized.map((accountId) => ({ user_id: userId, account_id: accountId })),
+    });
+  }
+  return normalized;
+}
+
+export async function updateDashboardUser({ userId, role, accountIds }) {
+  if (!userId) throw new DashboardAccessError("User id is required.", 400);
+  if (!validManagedRole(role)) throw new DashboardAccessError("Only Viewer or Editor roles can be assigned here.", 400);
+  const existingQuery = new URLSearchParams({ select: "role", user_id: `eq.${userId}`, limit: "1" });
+  const existing = await request(`/rest/v1/user_profiles?${existingQuery}`);
+  if (existing[0]?.role === "admin") {
+    throw new DashboardAccessError("Administrator access is protected and cannot be changed from this panel.", 400);
+  }
+  const rows = await request(`/rest/v1/user_profiles?user_id=eq.${encodeURIComponent(userId)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: { role },
+  });
+  if (!rows.length) throw new DashboardAccessError("User was not found.", 404);
+  const assignedAccountIds = await replaceAccountPermissions(userId, accountIds);
+  return { userId, role, accountIds: assignedAccountIds };
+}
+
+export async function inviteDashboardUser({ email, displayName, accountIds }) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) throw new DashboardAccessError("Enter a valid email address.", 400);
+  const appUrl = String(process.env.DASHBOARD_APP_URL || "https://upriverdashboard.vercel.app").replace(/\/$/, "");
+  const invited = await authRequest("/auth/v1/invite", {
+    method: "POST",
+    body: {
+      email: normalizedEmail,
+      data: displayName ? { display_name: String(displayName).trim() } : {},
+      redirect_to: appUrl,
+    },
+  });
+  const userId = invited.id || invited.user?.id;
+  if (!userId) throw new DashboardAccessError("Supabase did not return an invited user id.", 500);
+  const assignedAccountIds = await replaceAccountPermissions(userId, accountIds);
+  return { userId, email: normalizedEmail, accountIds: assignedAccountIds };
 }
 
 export async function getReportSnapshot({ reportKey, accountId, paramsHash }) {
