@@ -311,9 +311,16 @@ exact 06:00 local time becomes a business requirement.
 
 - Supabase migration applied successfully and verified: the new tables are
   present alongside the existing dashboard tables.
-- Code, Vercel cron configuration, and protected secret are ready; deploy,
-  production cron registration, and a small live country-worker validation are
-  the remaining tasks for this change.
+- Vercel Hobby permits **at most 12 Serverless Functions per deployment**. The
+  first two scheduler deployment attempts failed only after a successful build
+  because 12 separate cron handlers plus existing API files exceeded that
+  limit (`exceeded_serverless_functions_per_deployment`). This is now resolved
+  in code: server-only helpers live under `lib/server/`, and one dynamic
+  `api/cron/[scope].js` function serves all 12 scheduled country/source paths.
+  Do not recreate one API file per schedule on this Hobby project.
+- The corrected code, Vercel cron configuration, and protected secret are
+  ready; deploy, production cron registration, and a small live country-worker
+  validation are the remaining tasks for this change.
 - The existing browser report cache remains in place. New Ads data is shared
   server-side now; other report families will be migrated to shared Supabase
   snapshots incrementally, using the same no-automatic-DataDoe-fetch rule.

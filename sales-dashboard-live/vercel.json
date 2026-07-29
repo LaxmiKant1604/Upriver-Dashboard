@@ -5,17 +5,17 @@
     }
   },
   "crons": [
-    { "path": "/api/cron/ads-india", "schedule": "30 0 * * *" },
-    { "path": "/api/cron/ads-india-asin", "schedule": "30 1 * * *" },
-    { "path": "/api/cron/ads-india-targeting", "schedule": "30 2 * * *" },
-    { "path": "/api/cron/ads-americas", "schedule": "0 10 * * *" },
-    { "path": "/api/cron/ads-americas-asin", "schedule": "0 11 * * *" },
-    { "path": "/api/cron/ads-americas-targeting", "schedule": "0 12 * * *" },
-    { "path": "/api/cron/ads-australia", "schedule": "0 20 * * *" },
-    { "path": "/api/cron/ads-australia-asin", "schedule": "0 21 * * *" },
-    { "path": "/api/cron/ads-australia-targeting", "schedule": "0 22 * * *" },
-    { "path": "/api/cron/ads-other", "schedule": "0 6 * * *" },
-    { "path": "/api/cron/ads-other-asin", "schedule": "0 7 * * *" },
-    { "path": "/api/cron/ads-other-targeting", "schedule": "0 8 * * *" }
+    { "path": "/api/cron/in-campaign", "schedule": "30 0 * * *" },
+    { "path": "/api/cron/in-asin", "schedule": "30 1 * * *" },
+    { "path": "/api/cron/in-targeting", "schedule": "30 2 * * *" },
+    { "path": "/api/cron/americas-campaign", "schedule": "0 10 * * *" },
+    { "path": "/api/cron/americas-asin", "schedule": "0 11 * * *" },
+    { "path": "/api/cron/americas-targeting", "schedule": "0 12 * * *" },
+    { "path": "/api/cron/au-campaign", "schedule": "0 20 * * *" },
+    { "path": "/api/cron/au-asin", "schedule": "0 21 * * *" },
+    { "path": "/api/cron/au-targeting", "schedule": "0 22 * * *" },
+    { "path": "/api/cron/other-campaign", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/other-asin", "schedule": "0 7 * * *" },
+    { "path": "/api/cron/other-targeting", "schedule": "0 8 * * *" }
   ]
 }

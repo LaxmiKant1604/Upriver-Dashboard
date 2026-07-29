@@ -20,7 +20,7 @@
 // https://api.datadoe.com/api/v1/docs for the correct path and let me know
 // what you find — it's a one-line fix here.
 
-import { getAdDailyMetrics, isSupabaseConfigured } from "./supabase.js";
+import { getAdDailyMetrics, isSupabaseConfigured } from "../lib/server/supabase.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
 
