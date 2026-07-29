@@ -17,6 +17,7 @@ import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
+import PriorityFeed from "./views/PriorityFeed.jsx";
 
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
@@ -1549,12 +1550,16 @@ function DashboardApp({ session, access, onSignOut }) {
     [insightScope]
   );
 
-  const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" });
-  const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" });
-  const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" });
-  const returns = useSharedReport({ params: returnsParams, active: view === "returns" });
-  const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" });
-  const optimizer = useSharedReport({ params: optimizerParams, active: view === "optimizer" });
+  // The Priority Feed combines all six, so each report also loads its shared
+  // snapshot while the feed is open. That is a snapshot read, never a DataDoe
+  // call, so opening the feed still costs no export.
+  const onFeed = view === "priority";
+  const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" || onFeed });
+  const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" || onFeed });
+  const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" || onFeed });
+  const returns = useSharedReport({ params: returnsParams, active: view === "returns" || onFeed });
+  const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
+  const optimizer = useSharedReport({ params: optimizerParams, active: view === "optimizer" || onFeed });
 
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
@@ -2229,6 +2234,10 @@ function DashboardApp({ session, access, onSignOut }) {
               <FileSearch size={18} />
               <span className="sb-nav-label">Listing Optimizer</span>
             </button>
+            <button className={"sb-nav-item" + (view === "priority" ? " active" : "")} title="Priority Feed — every evidenced signal from the six reports, ranked" onClick={() => { setView("priority"); setMobileOpen(false); }}>
+              <ListChecks size={18} />
+              <span className="sb-nav-label">Priority Feed</span>
+            </button>
             {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
               <UsersRound size={18} />
               <span className="sb-nav-label">User Access</span>
@@ -2293,6 +2302,11 @@ function DashboardApp({ session, access, onSignOut }) {
         {view !== "access" && <div className="live-wrap">
           <span className="live-dot" />
           {(() => {
+            // The Priority Feed has nothing of its own to refresh: it combines
+            // the six saved snapshots. Refreshing must happen in the report that
+            // owns the data, so the button is disabled here rather than silently
+            // refreshing the main dashboard instead.
+            if (onFeed) return `Combining saved reports · ${refreshScopeAccount?.name || "selected account"}`;
             if (activeInsightReport) {
               const stamp = activeInsightReport.cachedAt;
               return stamp
@@ -2304,9 +2318,9 @@ function DashboardApp({ session, access, onSignOut }) {
           })()}
           <button
             className="refresh-btn"
-            onClick={activeInsightReport ? activeInsightReport.refresh : view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows}
-            disabled={activeInsightReport ? activeInsightReport.loading : (view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading)}
-            title={activeInsightReport ? "Refresh this report from DataDoe for the selected account and save it for everyone with access" : "Refresh selected account"}
+            onClick={onFeed ? undefined : activeInsightReport ? activeInsightReport.refresh : view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows}
+            disabled={onFeed || (activeInsightReport ? activeInsightReport.loading : (view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading))}
+            title={onFeed ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data." : activeInsightReport ? "Refresh this report from DataDoe for the selected account and save it for everyone with access" : "Refresh selected account"}
           >
             <RefreshCw size={13} className={(activeInsightReport ? activeInsightReport.loading : view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
           </button>
@@ -3167,6 +3181,15 @@ function DashboardApp({ session, access, onSignOut }) {
           error={optimizer.error}
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
+        />
+      )}
+
+      {view === "priority" && (
+        <PriorityFeed
+          reports={{ salesMovers, listingHealth, buyBox, returns, ppc, optimizer }}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
         />
       )}
         </div>

@@ -733,6 +733,43 @@ test("dedupe collapses repeats for the same report, category and entity", () => 
   assert.equal(merged.mergedCount, 2);
 });
 
+test("dedupe keeps genuinely different problems on the same ASIN", () => {
+  // The feed must collapse a repeated alert, but a Buy Box loss and a returns
+  // problem on the same ASIN are two different problems with two different
+  // fixes. Merging them would hide real work.
+  const deduped = dedupeInsights([
+    insight({ id: "bb", reportKey: "buy-box-loss", category: "buybox-price", asin: "B1", severity: "high", moneyAtRisk: 100 }),
+    insight({ id: "ret", reportKey: "returns-leakage", category: "returns-sizing", asin: "B1", severity: "medium", moneyAtRisk: 50 }),
+    insight({ id: "bb-dup", reportKey: "buy-box-loss", category: "buybox-price", asin: "B1", severity: "low", moneyAtRisk: 10 }),
+  ]);
+  assert.equal(deduped.length, 2, "the repeated Buy Box alert merges, the returns alert stays");
+  const buyBox = deduped.find((item) => item.reportKey === "buy-box-loss");
+  assert.equal(buyBox.mergedCount, 2);
+  assert.equal(buyBox.severity, "high");
+  assert.ok(deduped.some((item) => item.reportKey === "returns-leakage"));
+});
+
+test("feed grouping never puts two currencies in one money total", () => {
+  // This mirrors what PriorityFeed does: bucket by currency, and send anything
+  // without a monetary basis to its own group.
+  const items = [
+    insight({ id: "inr1", severity: "high", moneyAtRisk: 100, currency: "INR" }),
+    insight({ id: "inr2", severity: "medium", moneyAtRisk: 40, currency: "INR" }),
+    insight({ id: "usd1", severity: "high", moneyAtRisk: 7, currency: "USD" }),
+    insight({ id: "none", severity: "medium", moneyAtRisk: null, currency: null }),
+  ];
+  const groups = new Map();
+  for (const item of items) {
+    const key = item.moneyAtRisk === null || !item.currency ? "__none__" : item.currency;
+    groups.set(key, [...(groups.get(key) || []), item]);
+  }
+  assert.equal(groups.size, 3);
+  assert.equal(groups.get("INR").reduce((sum, item) => sum + item.moneyAtRisk, 0), 140);
+  assert.equal(groups.get("USD").reduce((sum, item) => sum + item.moneyAtRisk, 0), 7);
+  assert.equal(groups.get("__none__").length, 1);
+  assert.equal(groups.get("__none__")[0].moneyAtRisk, null);
+});
+
 test("insight export carries evidence, money basis, confidence and freshness", () => {
   const [row] = insightExportRows([insight({ id: "x", severity: "high", moneyAtRisk: 12.5 })]);
   for (const column of ["Report", "Priority", "Product", "Insight", "Money at Risk", "Currency", "Evidence", "Why Flagged", "Recommended Action", "Confidence"]) {
