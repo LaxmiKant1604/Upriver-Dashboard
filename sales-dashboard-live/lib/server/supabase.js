@@ -216,6 +216,27 @@ export async function getReportSnapshot({ reportKey, accountId, paramsHash }) {
   return rows[0] || null;
 }
 
+/**
+ * The most recent saved snapshot for a report and account, whatever scope it was
+ * saved under.
+ *
+ * Every insight report's scope includes its as-of date, so at midnight the exact
+ * scope key stops matching and the report would otherwise appear to have no
+ * saved data at all. This lets the server serve yesterday's saved report,
+ * clearly labelled with the date it was saved for, instead of a blank screen.
+ */
+export async function getLatestReportSnapshot({ reportKey, accountId }) {
+  const query = new URLSearchParams({
+    select: "id,report_key,account_id,params_hash,params,payload,payload_bytes,source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  return rows[0] || null;
+}
+
 export async function saveReportSnapshot(snapshot) {
   const rows = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
     method: "POST",

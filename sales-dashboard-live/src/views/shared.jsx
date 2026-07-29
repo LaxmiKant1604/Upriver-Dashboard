@@ -171,7 +171,50 @@ export function SnapshotState({ data, loading, error, label, icon }) {
 export function snapshotFreshnessLabel(data) {
   if (!data?.snapshot) return data && data.shared === false ? "not shared — Supabase is not configured" : null;
   const saved = data.snapshot.savedAt ? new Date(data.snapshot.savedAt) : null;
-  return saved ? `shared snapshot saved ${saved.toLocaleString()}` : "shared snapshot saved";
+  const stamp = saved ? saved.toLocaleString() : "at an unknown time";
+  if (data.snapshot.staleScope) {
+    const savedFor = data.snapshot.savedForParams?.to;
+    return `shared snapshot saved ${stamp}${savedFor ? ` for as-of ${savedFor}` : ""} — refresh for today`;
+  }
+  return `shared snapshot saved ${stamp}`;
+}
+
+/**
+ * A banner for a snapshot that was saved under an earlier as-of date. The report
+ * is still real data, it is just not today's, and saying so plainly is better
+ * than either hiding it or implying it is current.
+ */
+export function StaleScopeNotice({ data }) {
+  if (!data?.snapshot?.staleScope) return null;
+  const savedFor = data.snapshot.savedForParams?.to;
+  const requested = data.snapshot.requestedParams?.to;
+  return (
+    <Notice tone="warn">
+      Showing the last saved version of this report{savedFor ? `, which covers data as of ${savedFor}` : ""}
+      {requested && savedFor && requested !== savedFor ? ` rather than ${requested}` : ""}. Every figure below is
+      real and was fetched then — it is simply not today's. Press Refresh to fetch the current window and save it
+      for everyone with access to this account.
+    </Notice>
+  );
+}
+
+/**
+ * Money can only be totalled inside one currency.
+ *
+ * When a report's scope contains more than one currency, any combined money
+ * figure is meaningless, so this returns `mixed: true` and callers render an em
+ * dash instead of a number that silently adds rupees to dollars.
+ */
+export function moneyScope(data, fallbackCurrency) {
+  const list = Array.isArray(data?.currencies) ? data.currencies.filter(Boolean) : [];
+  if (list.length > 1) return { currency: null, mixed: true, currencies: list };
+  return { currency: list[0] || fallbackCurrency || null, mixed: false, currencies: list };
+}
+
+/** Format a combined money total, or an em dash when currencies are mixed. */
+export function totalMoney(value, scope, formatter) {
+  if (scope.mixed) return "—";
+  return formatter(value, scope.currency);
 }
 
 function SeverityBadge({ severity }) {

@@ -63,9 +63,10 @@ const ACCOUNT_SCOPED_ACTIONS = new Set([
   "keyword-rank", "content-changes", "fba-plan",
   // Insight reports. Each is single-account and served from the shared
   // Supabase snapshot unless an explicit refresh is requested.
+  // The Priority Feed has no action of its own: it combines the six snapshots
+  // in the browser, so there is nothing extra to authorise here.
   "sales-movers", "listing-health", "buy-box-loss",
   "returns-leakage", "ppc-performance", "listing-optimizer",
-  "priority-feed",
 ]);
 
 // Every insight report is strictly one selected account: the shared snapshot,

@@ -29,9 +29,12 @@ export function brandLabel(value) {
  * export orders by child_asin.
  */
 export async function fetchCatalog(apiKey, ids) {
-  const rows = await fetchExportRows(
+  // Strict: a truncated catalog would silently drop product names and, worse,
+  // brands — which would make the shared header brand filter hide real rows.
+  const rows = await fetchExportRowsStrict(
     apiKey, PRODUCT_CATALOG.id, CATALOG_COLUMNS, ids, null, null, ROW_LIMITS.catalog,
-    { orderByColumn: "child_asin", orderByDirection: "ASC" }
+    { orderByColumn: "child_asin", orderByDirection: "ASC" },
+    "Product catalog export"
   );
   const byAsin = new Map();
   const brands = new Set();
@@ -109,10 +112,16 @@ export const INVENTORY_COLUMNS = [
  * which the UI must show as unavailable rather than as zero stock.
  */
 export async function fetchInventorySnapshot(apiKey, ids, asOf) {
-  const rows = await fetchExportRows(
+  // Strict on purpose. Ordering by date DESC puts the newest snapshot first, so
+  // hitting the cap only ever drops OLDER snapshots — unless the latest snapshot
+  // itself is bigger than the cap, in which case a SKU absent from the truncated
+  // result would look like zero stock and produce a false stockout claim. That
+  // is exactly the kind of confident-but-wrong output worth failing for.
+  const rows = await fetchExportRowsStrict(
     apiKey, FBA_INVENTORY_HEALTH.id, INVENTORY_COLUMNS, ids,
     addDaysStr(asOf, -FBA_INVENTORY_HEALTH.snapshotLookbackDays), asOf, ROW_LIMITS.inventory,
-    { orderByColumn: "date", orderByDirection: "DESC" }
+    { orderByColumn: "date", orderByDirection: "DESC" },
+    "FBA inventory snapshot export"
   );
 
   let snapshotDate = null;

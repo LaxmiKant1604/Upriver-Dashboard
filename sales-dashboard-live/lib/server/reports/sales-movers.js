@@ -103,13 +103,49 @@ async function fetchAdsWindow(apiKey, ids, window) {
     if (!asin) continue;
     const currency = String(row.currency || "").trim();
     if (currency) currencies.add(currency);
-    const current = byAsin.get(asin) || { spend: 0, sales: 0, clicks: 0 };
+    const current = byAsin.get(asin) || { spend: 0, sales: 0, clicks: 0, currencies: new Set() };
     current.spend += sumField(row, "ad_spend_sum", "ad_spend");
     current.sales += sumField(row, "ad_sales_sum", "ad_sales");
     current.clicks += sumField(row, "ad_clicks_sum", "ad_clicks");
+    if (currency) current.currencies.add(currency);
     byAsin.set(asin, current);
   }
+  // The export is grouped by child_asin AND currency. Folding to ASIN alone
+  // would add two currencies into one number, so an ASIN that reported more
+  // than one currency has its advertising figures withheld instead.
+  for (const entry of byAsin.values()) {
+    entry.mixedCurrency = entry.currencies.size > 1;
+    entry.currency = entry.currencies.size === 1 ? [...entry.currencies][0] : null;
+  }
   return { byAsin, currencies: [...currencies].sort() };
+}
+
+/**
+ * Advertising figures for one ASIN across the two windows.
+ *
+ * When either window reported more than one currency for this ASIN the figures
+ * are withheld (null) rather than summed, because adding two currencies would
+ * produce a number that means nothing. `mixedCurrency` tells the UI to say so.
+ */
+function adsFor(recent, prior) {
+  const mixed = Boolean(recent?.mixedCurrency || prior?.mixedCurrency);
+  if (mixed) {
+    return {
+      recentSpend: null, recentSales: null, recentClicks: null,
+      priorSpend: null, priorSales: null, priorClicks: null,
+      currency: null, mixedCurrency: true,
+    };
+  }
+  return {
+    recentSpend: num(recent?.spend),
+    recentSales: num(recent?.sales),
+    recentClicks: num(recent?.clicks),
+    priorSpend: num(prior?.spend),
+    priorSales: num(prior?.sales),
+    priorClicks: num(prior?.clicks),
+    currency: recent?.currency || prior?.currency || null,
+    mixedCurrency: false,
+  };
 }
 
 /**
@@ -168,14 +204,7 @@ export async function buildSalesMovers({ apiKey, ids, to }) {
       brand: brandLabel(meta.brand),
       recent: recentTotals,
       prior: priorTotals,
-      ads: {
-        recentSpend: num(recentAds.byAsin.get(asin)?.spend),
-        recentSales: num(recentAds.byAsin.get(asin)?.sales),
-        recentClicks: num(recentAds.byAsin.get(asin)?.clicks),
-        priorSpend: num(priorAds.byAsin.get(asin)?.spend),
-        priorSales: num(priorAds.byAsin.get(asin)?.sales),
-        priorClicks: num(priorAds.byAsin.get(asin)?.clicks),
-      },
+      ads: adsFor(recentAds.byAsin.get(asin), priorAds.byAsin.get(asin)),
       // null (not 0) when the whole snapshot is missing, so the UI can say so.
       inventory: inventory.available
         ? {

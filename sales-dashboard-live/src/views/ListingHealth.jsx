@@ -25,7 +25,10 @@ import {
   SnapshotState,
   SortTh,
   StatRow,
+  StaleScopeNotice,
+  moneyScope,
   snapshotFreshnessLabel,
+  totalMoney,
   sortRows,
   useSortState,
 } from "./shared.jsx";
@@ -97,6 +100,8 @@ export default function ListingHealth({ data, loading, error, accountName, selec
   const pageRows = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const state = <SnapshotState data={data} loading={loading} error={error} label="Listing Health report" icon={<ShieldAlert size={22} />} />;
+  // Money may only be totalled inside a single currency.
+  const money = moneyScope(data, currency);
   const scopeLabel = `${accountName || "the selected account"}${selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}`;
 
   const exportTable = () => downloadCsv(sorted.map((row) => ({
@@ -137,6 +142,8 @@ export default function ListingHealth({ data, loading, error, accountName, selec
 
       {state}
 
+      <StaleScopeNotice data={data} />
+
       {data && !data.snapshotMissing && <>
         <FreshnessBar items={[
           `${data.sourceLabel} as of ${fmtDateHuman(data.asOf)}`,
@@ -168,7 +175,7 @@ export default function ListingHealth({ data, loading, error, accountName, selec
           { label: "Listings scanned", value: nInt(rows.length) },
           { label: "Needs attention", value: nInt(totals.problems), tone: totals.problems ? "bad" : "good" },
           { label: "Blocked from selling", value: nInt(totals.blocked), tone: totals.blocked ? "bad" : "good" },
-          { label: "Sales at risk (30d)", value: fmtMoney(totals.salesAtRisk, currency), tone: totals.salesAtRisk > 0 ? "bad" : undefined },
+          { label: "Sales at risk (30d)", value: totalMoney(totals.salesAtRisk, money, fmtMoney), tone: totals.salesAtRisk > 0 && !money.mixed ? "bad" : undefined, hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Stranded units", value: nInt(totals.strandedUnits) },
         ]} />
 

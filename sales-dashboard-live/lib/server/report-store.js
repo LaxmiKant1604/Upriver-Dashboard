@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 
 import {
   claimRefreshLock,
+  getLatestReportSnapshot,
   getReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
@@ -105,6 +106,28 @@ export async function serveSharedReport({
       });
       return;
     }
+
+    // Every report's scope includes its as-of date, so the exact key stops
+    // matching the moment the date rolls over. Rather than show a blank report
+    // every morning, serve the most recent saved snapshot for this report and
+    // account and label it with the scope it was actually saved for. The stale
+    // flag is what lets the UI say "this is yesterday's report" instead of
+    // implying it is current.
+    const latest = await getLatestReportSnapshot({ reportKey, accountId });
+    if (latest && latest.payload) {
+      res.status(200).json({
+        ...latest.payload,
+        reportKey, reportVersion, paramsHash,
+        snapshot: {
+          ...snapshotMeta(latest),
+          staleScope: true,
+          savedForParams: latest.params || null,
+          requestedParams: { reportVersion, ...params },
+        },
+      });
+      return;
+    }
+
     res.status(200).json({
       snapshotMissing: true,
       reportKey, reportVersion, accountId, paramsHash,

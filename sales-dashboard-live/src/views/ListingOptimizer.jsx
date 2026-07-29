@@ -25,6 +25,7 @@ import {
   SearchField,
   SelectField,
   SnapshotState,
+  StaleScopeNotice,
   SortTh,
   StatRow,
   snapshotFreshnessLabel,
@@ -208,6 +209,8 @@ export default function ListingOptimizer({ data, loading, error, accountName, se
       </ReportHeader>
 
       {state}
+
+      <StaleScopeNotice data={data} />
 
       {data && !data.snapshotMissing && !data.sqpAvailable && (
         <Notice tone="warn">{data.sqpUnavailableReason}</Notice>

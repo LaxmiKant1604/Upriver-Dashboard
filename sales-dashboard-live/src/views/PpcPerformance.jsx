@@ -25,7 +25,10 @@ import {
   SnapshotState,
   SortTh,
   StatRow,
+  StaleScopeNotice,
+  moneyScope,
   snapshotFreshnessLabel,
+  totalMoney,
   sortRows,
   useSortState,
 } from "./shared.jsx";
@@ -126,6 +129,8 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
   const pageRows = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const state = <SnapshotState data={data} loading={loading} error={error} label="PPC Performance report" icon={<Megaphone size={22} />} />;
+  // Money may only be totalled inside a single currency.
+  const money = moneyScope(data, currency);
   const scopeLabel = `${accountName || "the selected account"}${level === "asins" && selectedBrand !== "ALL" ? ` · ${selectedBrand}` : ""}`;
   const activeLevel = LEVELS.find((item) => item.key === level);
   const levelCoverage = data?.sourceAvailability?.find((entry) => entry.key?.startsWith(
@@ -189,6 +194,8 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
 
       {state}
 
+      <StaleScopeNotice data={data} />
+
       {data && !data.snapshotMissing && <>
         <FreshnessBar items={[
           `${data.window.days}-day window ${fmtDateHuman(data.window.from)} – ${fmtDateHuman(data.window.to)}`,
@@ -224,8 +231,8 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
         )}
 
         <StatRow stats={[
-          { label: "Ad spend", value: fmtMoney(account?.spend, currency) },
-          { label: "Attributed sales", value: fmtMoney(account?.sales, currency) },
+          { label: "Ad spend", value: totalMoney(account?.spend, money, fmtMoney), hint: money.mixed ? "This account's saved Ads rows report more than one currency, so a combined total would be meaningless." : undefined },
+          { label: "Attributed sales", value: totalMoney(account?.sales, money, fmtMoney) },
           { label: "ACoS", value: account?.acos === null || account?.acos === undefined ? "—" : fmtRate(account.acos), hint: "Spend ÷ attributed sales, recomputed from the summed totals" },
           {
             label: "TACoS",
@@ -234,7 +241,7 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
               ? `Unavailable: ${data.totalSalesUnavailable}`
               : `Ad spend ÷ total account sales from ${data.totalSalesSourceLabel}, which can lag about ${data.totalSalesLagDays} days`,
           },
-          { label: `Wasted spend (${activeLevel.label.toLowerCase()})`, value: fmtMoney(wastedTotal, currency), tone: wastedTotal > 0 ? "bad" : "good" },
+          { label: `Wasted spend (${activeLevel.label.toLowerCase()})`, value: totalMoney(wastedTotal, money, fmtMoney), tone: wastedTotal > 0 && !money.mixed ? "bad" : "good" },
         ]} />
 
         {data.totalSalesUnavailable && (

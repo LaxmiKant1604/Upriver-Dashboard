@@ -189,6 +189,35 @@ test("a uniform traffic-shaped collapse is reported as possible incompleteness",
   assert.equal(salesMoversCompletenessWarning(buildSalesMoversRows(moversData, "ALL")), null);
 });
 
+test("advertising figures are withheld for an ASIN reporting two currencies", () => {
+  // The advertising export is grouped by child_asin AND currency, so folding to
+  // ASIN alone would add rupees to dollars. The server marks such an ASIN and
+  // the client must show no number rather than a meaningless one.
+  const data = {
+    ...moversData,
+    currencies: ["INR", "USD"],
+    rows: [{
+      asin: "B00MIX", productName: "Dual currency ASIN", brand: "Alpha",
+      recent: { sales: 1000, units: 20, orders: 20, sessions: 400, pageViews: 450 },
+      prior: { sales: 2000, units: 40, orders: 40, sessions: 800, pageViews: 900 },
+      ads: {
+        recentSpend: null, recentSales: null, recentClicks: null,
+        priorSpend: null, priorSales: null, priorClicks: null,
+        currency: null, mixedCurrency: true,
+      },
+      inventory: null,
+    }],
+  };
+  const [row] = buildSalesMoversRows(data, "ALL");
+  assert.equal(row.adsMixedCurrency, true);
+  assert.equal(row.adSpendDelta, null, "must not report a cross-currency spend delta");
+  assert.equal(row.adSalesDelta, null);
+  // The sales decomposition is unaffected: Sales & Traffic has no currency and
+  // is always in the account currency.
+  assert.equal(row.salesDelta, -1000);
+  assert.equal(row.dominantDriver, "traffic");
+});
+
 /* ---------- Listing Health ---------- */
 
 const listingData = {

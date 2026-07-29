@@ -24,7 +24,10 @@ import {
   SnapshotState,
   SortTh,
   StatRow,
+  StaleScopeNotice,
+  moneyScope,
   snapshotFreshnessLabel,
+  totalMoney,
   sortRows,
   useSortState,
 } from "./shared.jsx";
@@ -111,6 +114,8 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
   const pageRows = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const state = <SnapshotState data={data} loading={loading} error={error} label="Buy Box Loss report" icon={<Trophy size={22} />} />;
+  // Money may only be totalled inside a single currency.
+  const money = moneyScope(data, currency);
   const scopeLabel = `${accountName || "the selected account"}${selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}`;
 
   const exportTable = () => downloadCsv(sorted.map((row) => ({
@@ -146,6 +151,8 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
 
       {state}
 
+      <StaleScopeNotice data={data} />
+
       {data && !data.snapshotMissing && <>
         <FreshnessBar items={[
           `${data.sourceLabel}, ${data.window.days} days${data.observedWindow ? ` (${fmtDateHuman(data.observedWindow.from)} – ${fmtDateHuman(data.observedWindow.to)} observed)` : ""}`,
@@ -168,7 +175,7 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
         <StatRow stats={[
           { label: "SKUs with Buy Box data", value: nInt(totals.tracked) },
           { label: `Below ${safeThreshold}%`, value: nInt(totals.losing), tone: totals.losing ? "bad" : "good" },
-          { label: "Sales at risk", value: fmtMoney(totals.salesAtRisk, currency), tone: totals.salesAtRisk > 0 ? "bad" : undefined },
+          { label: "Sales at risk", value: totalMoney(totals.salesAtRisk, money, fmtMoney), tone: totals.salesAtRisk > 0 && !money.mixed ? "bad" : undefined, hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Sales-weighted Buy Box", value: totals.weightedBuyBox === null ? "—" : fmtRate(totals.weightedBuyBox) },
           { label: "Price / stock / unclear", value: `${totals.priceCaused} / ${totals.stockCaused} / ${totals.unconfirmed}` },
         ]} />

@@ -225,8 +225,12 @@ export function buildSalesMoversRows(data, selectedBrand) {
         if (Math.abs(entries[0][1]) > 0) dominantDriver = entries[0][0];
       }
 
-      const adSpendDelta = (Number(row.ads?.recentSpend) || 0) - (Number(row.ads?.priorSpend) || 0);
-      const adSalesDelta = (Number(row.ads?.recentSales) || 0) - (Number(row.ads?.priorSales) || 0);
+      // The server withholds advertising figures for an ASIN that reported more
+      // than one currency, so the delta stays null rather than becoming a
+      // meaningless zero.
+      const adsMixed = Boolean(row.ads?.mixedCurrency);
+      const adSpendDelta = adsMixed ? null : (Number(row.ads?.recentSpend) || 0) - (Number(row.ads?.priorSpend) || 0);
+      const adSalesDelta = adsMixed ? null : (Number(row.ads?.recentSales) || 0) - (Number(row.ads?.priorSales) || 0);
       const stockedOut = row.inventory ? Number(row.inventory.available) === 0 : null;
 
       return {
@@ -246,6 +250,7 @@ export function buildSalesMoversRows(data, selectedBrand) {
         dominantDriver,
         adSpendDelta,
         adSalesDelta,
+        adsMixedCurrency: adsMixed,
         stockedOut,
         direction: salesDelta > 0 ? "gain" : salesDelta < 0 ? "decline" : "flat",
       };

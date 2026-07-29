@@ -25,7 +25,10 @@ import {
   SnapshotState,
   SortTh,
   StatRow,
+  StaleScopeNotice,
+  moneyScope,
   snapshotFreshnessLabel,
+  totalMoney,
   sortRows,
   useSortState,
 } from "./shared.jsx";
@@ -100,6 +103,8 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
   const pageRows = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const state = <SnapshotState data={data} loading={loading} error={error} label="Returns & Refund Leakage report" icon={<Undo2 size={22} />} />;
+  // Money may only be totalled inside a single currency.
+  const money = moneyScope(data, currency);
   const scopeLabel = `${accountName || "the selected account"}${selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}`;
 
   const exportTable = () => downloadCsv(sorted.map((row) => ({
@@ -139,6 +144,8 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
 
       {state}
 
+      <StaleScopeNotice data={data} />
+
       {data && !data.snapshotMissing && <>
         <FreshnessBar items={[
           `${data.window.days}-day window ${fmtDateHuman(data.window.from)} – ${fmtDateHuman(data.window.to)}`,
@@ -165,11 +172,11 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
         )}
 
         <StatRow stats={[
-          { label: "Return leakage", value: fmtMoney(totals.leakage, currency), tone: totals.leakage > 0 ? "bad" : "good" },
+          { label: "Return leakage", value: totalMoney(totals.leakage, money, fmtMoney), tone: totals.leakage > 0 && !money.mixed ? "bad" : "good", hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Returned items", value: nInt(totals.returned) },
           { label: "Return rate", value: totals.rate === null ? "—" : fmtRate(totals.rate), hint: "Units refunded divided by units shipped, recomputed from the summed units" },
           { label: "Fixable share", value: totals.actionableShare === null ? "—" : fmtRate(totals.actionableShare, 0), hint: "Product, listing and sizing reasons as a share of all returns" },
-          { label: "COGS on refunded units", value: fmtMoney(totals.cogs, currency), hint: "Goods value tied to refunded units. Not counted as leakage: the source does not say whether the stock came back sellable." },
+          { label: "COGS on refunded units", value: totalMoney(totals.cogs, money, fmtMoney), hint: "Goods value tied to refunded units. Not counted as leakage: the source does not say whether the stock came back sellable." },
         ]} />
 
         <PriorityActions

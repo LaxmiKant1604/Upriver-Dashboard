@@ -24,6 +24,7 @@ import {
   SortTh,
   StatRow,
   IdentityCell,
+  StaleScopeNotice,
   snapshotFreshnessLabel,
   sortRows,
   useSortState,
@@ -147,6 +148,8 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
       />
 
       {state}
+
+      <StaleScopeNotice data={data} />
 
       {data && !data.snapshotMissing && data.dataUnavailable && (
         <Notice tone="warn">{data.unavailableReason}</Notice>

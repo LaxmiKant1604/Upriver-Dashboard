@@ -209,9 +209,14 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
       entry.refundedAmount += Math.abs(sumField(row, "refunded_amount_sum", "refunded_amount"));
       entry.refundTax += Math.abs(sumField(row, "refund_tax_sum", "refund_tax"));
       entry.refundedReferralFeeCredit += Math.abs(sumField(row, "refunded_referral_fee_sum", "refunded_referral_fee"));
-      entry.returnFees += Math.abs(sumField(row, "refund_commission_sum", "refund_commission"))
+      // Seller-borne return handling, less any restocking fee recovered from the
+      // customer. Clamped at zero so a large restocking recovery can never make
+      // the fee component negative and understate the leakage below the refund.
+      entry.returnFees += Math.max(0,
+        Math.abs(sumField(row, "refund_commission_sum", "refund_commission"))
         + Math.abs(sumField(row, "return_unit_fee_sum", "fba_customer_return_per_unit_fee"))
-        - Math.abs(sumField(row, "refund_restocking_fee_sum", "refund_restocking_fee"));
+        - Math.abs(sumField(row, "refund_restocking_fee_sum", "refund_restocking_fee"))
+      );
       entry.cogsOnRefundedUnits += Math.abs(sumField(row, "cogs_sum", "cogs_total_value"));
       entry.refundedUnitsSettled += Math.abs(sumField(row, "quantity_sum", "quantity"));
     }
