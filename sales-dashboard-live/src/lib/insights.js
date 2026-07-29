@@ -616,6 +616,194 @@ const BUY_BOX_ACTIONS = {
   unconfirmed: "Investigate manually in Seller Central: compare your offer against the current featured offer and confirm stock and fulfilment status.",
 };
 
+/* ==================================================================== */
+/* Returns & Refund Leakage                                              */
+/* ==================================================================== */
+
+const RETURNS_LABEL = "Returns & Refund Leakage";
+
+export const RETURN_BUCKET_META = {
+  product_quality: {
+    label: "Product / quality",
+    lever: "Supplier and QC",
+    action: "Raise the defect pattern with the supplier and add an incoming-QC check; re-inspect the current batch before shipping more.",
+    actionable: true,
+  },
+  listing_accuracy: {
+    label: "Listing accuracy",
+    lever: "Listing content",
+    action: "Correct the listing so it matches what ships: fix the wrong attribute, compatibility note, or image that is setting the wrong expectation.",
+    actionable: true,
+  },
+  sizing: {
+    label: "Sizing / fit",
+    lever: "Size chart and images",
+    action: "Add or correct the size chart and add a fit note plus an on-model image; sizing returns fall when expectation is set before purchase.",
+    actionable: true,
+  },
+  delivery: {
+    label: "Delivery / fulfilment",
+    lever: "Packaging and carrier",
+    action: "Review packaging and the carrier for this item; damage and undeliverable returns are a fulfilment fix, not a product fix.",
+    actionable: false,
+  },
+  low_actionability: {
+    label: "Low actionability",
+    lever: "Usually not fixable",
+    action: "Monitor only. These reasons (unwanted, no longer needed, no reason given) rarely respond to a product or listing change.",
+    actionable: false,
+  },
+  other: {
+    label: "Other / unclassified",
+    lever: "Needs review",
+    action: "Open the return reasons for this product in Seller Central; the reported reasons did not map to a known fixable pattern.",
+    actionable: false,
+  },
+};
+
+export function buildReturnsRows(data, selectedBrand) {
+  if (!data || !Array.isArray(data.rows)) return [];
+  return data.rows
+    .filter((row) => selectedBrand === "ALL" || row.brand === selectedBrand)
+    .map((row) => {
+      // Leakage is the money that actually left: the customer refund plus the
+      // seller-borne return fees. COGS on refunded units is reported separately
+      // because the source does not say whether that stock came back sellable,
+      // and calling it a loss would be an unsupported claim.
+      const totalLeakage = (Number(row.refundedAmount) || 0) + (Number(row.returnFees) || 0);
+
+      const unitsShipped = Number(row.unitsShipped) || 0;
+      const unitsRefunded = Number(row.unitsRefunded) || 0;
+      // A window that catches returns of earlier sales can report more refunded
+      // units than shipped units. That is a lag artefact, not a >100% rate, so
+      // the rate is withheld and the row is ranked by money instead.
+      const lagInflated = unitsShipped > 0 && unitsRefunded > unitsShipped;
+      const returnRate = unitsShipped > 0 && !lagInflated ? (unitsRefunded / unitsShipped) * 100 : null;
+
+      const buckets = row.reasonBuckets || {};
+      const bucketEntries = Object.entries(buckets).sort((a, b) => b[1] - a[1]);
+      const dominantBucket = bucketEntries.length ? bucketEntries[0][0] : null;
+      const dominantShare = row.returnCount > 0 && bucketEntries.length
+        ? (bucketEntries[0][1] / row.returnCount) * 100
+        : null;
+      const actionableCount = ["product_quality", "listing_accuracy", "sizing"]
+        .reduce((sum, key) => sum + (buckets[key] || 0), 0);
+
+      return {
+        ...row,
+        totalLeakage,
+        returnRate,
+        lagInflated,
+        dominantBucket,
+        dominantBucketMeta: dominantBucket ? RETURN_BUCKET_META[dominantBucket] : null,
+        dominantShare,
+        actionableCount,
+        actionableShare: row.returnCount > 0 ? (actionableCount / row.returnCount) * 100 : null,
+      };
+    });
+}
+
+export function buildReturnsInsights(data, rows) {
+  if (!data) return [];
+  const freshness = freshnessNote({
+    sourceLabel: `${data.returnsSourceLabel} + ${data.moneySourceLabel}`,
+    asOf: data.window?.to,
+    extra: `${data.window?.days}-day window; return history is limited to about ${data.returnHistoryDays} days`,
+  });
+  const totalLeakage = rows.reduce((sum, row) => sum + row.totalLeakage, 0);
+  const insights = [];
+
+  for (const row of rows) {
+    if (row.totalLeakage <= 0 && row.returnCount === 0) continue;
+    const label = row.productName || row.sku || row.asin;
+    const share = totalLeakage > 0 ? row.totalLeakage / totalLeakage : 0;
+    let severity = severityFromExposure({ share, moneyAtRisk: row.totalLeakage });
+    // A high return rate on a real volume is a product problem even when the
+    // absolute money is mid-sized.
+    if (row.returnRate !== null && row.returnRate >= 15 && (row.unitsShipped || 0) >= 20 && severity === "low") {
+      severity = "medium";
+    }
+
+    const meta = row.dominantBucketMeta;
+    // Naming a cause requires a dominant reason bucket that is actually
+    // dominant. Below half the returns, the mix is reported without a claim.
+    const causeIsClear = Boolean(meta) && row.dominantShare !== null && row.dominantShare >= 50;
+
+    insights.push(makeInsight({
+      id: `returns-${row.currency || "na"}-${row.asin}`,
+      reportKey: "returns-leakage",
+      reportLabel: RETURNS_LABEL,
+      category: causeIsClear ? `returns-${row.dominantBucket}` : "returns-mixed",
+      severity,
+      title: causeIsClear
+        ? `${label} lost ${row.totalLeakage.toFixed(0)} to returns, mostly ${meta.label.toLowerCase()}`
+        : `${label} lost ${row.totalLeakage.toFixed(0)} to returns across mixed reasons`,
+      asin: row.asin, sku: row.sku, brand: row.brand, entityLabel: label,
+      evidence: [
+        { label: "Refund paid to customers", value: Number(row.refundedAmount || 0).toFixed(2) },
+        { label: "Seller-borne return fees", value: Number(row.returnFees || 0).toFixed(2) },
+        { label: "Returned items", value: row.returnCount || 0 },
+        { label: "Refunded units (settled)", value: Math.round(Number(row.refundedUnitsSettled) || 0) },
+        { label: "Units shipped in window", value: row.unitsShipped === null ? null : Math.round(row.unitsShipped) },
+        { label: "Return rate", value: row.returnRate === null ? (row.lagInflated ? "withheld — lag artefact" : null) : `${row.returnRate.toFixed(1)}%` },
+        { label: "Top reason", value: row.topReasons?.[0] ? `${row.topReasons[0].reason} (${row.topReasons[0].count})` : null },
+        { label: "Fixable share of returns", value: row.actionableShare === null ? null : `${row.actionableShare.toFixed(0)}%` },
+        { label: "FBA / FBM returns", value: `${row.fbaReturns} / ${row.fbmReturns}` },
+        { label: "COGS on refunded units", value: row.cogsOnRefundedUnits ? Number(row.cogsOnRefundedUnits).toFixed(2) : null },
+      ],
+      moneyAtRisk: row.totalLeakage,
+      moneyBasis: `settled customer refunds plus seller-borne return fees over ${data.window?.days} days. COGS on refunded units is shown separately and is NOT included, because the source does not say whether that stock returned sellable`,
+      currency: row.currency,
+      confidence: !row.hasMoney ? "low" : causeIsClear ? "high" : "medium",
+      freshness,
+      why: causeIsClear
+        ? `${row.dominantShare.toFixed(0)}% of this product's returns give a ${meta.label.toLowerCase()} reason, which is a ${meta.lever.toLowerCase()} problem.`
+        : row.returnCount === 0
+          ? "Refund settlements exist for this product but the Returns source reported no matching return records in the window, so no reason mix is available."
+          : "No single reason accounts for half of this product's returns, so the report does not attribute one cause.",
+      action: causeIsClear
+        ? meta.action
+        : row.returnCount === 0
+          ? "Check Seller Central for the return reasons behind these refunds; they may predate this report's return history."
+          : "Review the individual return reasons for this product before choosing a fix — the mix is genuinely split.",
+    }));
+  }
+
+  // One account-level insight when returns are dominated by a fixable cause.
+  const bucketTotals = new Map();
+  for (const entry of data.reasonTotals || []) {
+    bucketTotals.set(entry.bucket, (bucketTotals.get(entry.bucket) || 0) + entry.count);
+  }
+  const totalReturns = [...bucketTotals.values()].reduce((sum, value) => sum + value, 0);
+  const topBucket = [...bucketTotals.entries()].sort((a, b) => b[1] - a[1])[0];
+  if (topBucket && totalReturns >= 20 && RETURN_BUCKET_META[topBucket[0]]?.actionable && topBucket[1] / totalReturns >= 0.4) {
+    const meta = RETURN_BUCKET_META[topBucket[0]];
+    insights.push(makeInsight({
+      id: `returns-account-${topBucket[0]}`,
+      reportKey: "returns-leakage",
+      reportLabel: RETURNS_LABEL,
+      category: "returns-account-pattern",
+      severity: "medium",
+      title: `${((topBucket[1] / totalReturns) * 100).toFixed(0)}% of all returns in this scope are ${meta.label.toLowerCase()}`,
+      entityLabel: "Account pattern",
+      evidence: [
+        { label: "Returned items in window", value: totalReturns },
+        { label: `${meta.label} returns`, value: topBucket[1] },
+        { label: "Pending return requests", value: data.pendingReturnRequests || 0 },
+      ],
+      moneyAtRisk: null,
+      moneyBasis: null,
+      currency: null,
+      confidence: "high",
+      freshness,
+      why: `A single fixable reason bucket accounts for ${((topBucket[1] / totalReturns) * 100).toFixed(0)}% of returns across the whole scope, which points to a systemic cause rather than one bad product.`,
+      action: meta.action,
+    }));
+  }
+
+  return sortInsights(insights);
+}
+
 export function buildBuyBoxInsights(data, rows, thresholdPct) {
   if (!data) return [];
   const freshness = freshnessNote({

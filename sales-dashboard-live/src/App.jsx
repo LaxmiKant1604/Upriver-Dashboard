@@ -14,6 +14,7 @@ import { csvCell } from "./lib/csv.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
+import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
@@ -1533,16 +1534,22 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (insightScope ? { action: "buy-box-loss", ...insightScope } : null),
     [insightScope]
   );
+  const returnsParams = useMemo(
+    () => (insightScope ? { action: "returns-leakage", ...insightScope } : null),
+    [insightScope]
+  );
 
   const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" });
   const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" });
   const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" });
+  const returns = useSharedReport({ params: returnsParams, active: view === "returns" });
 
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
     listinghealth: { report: listingHealth, label: "Listing Health" },
     buybox: { report: buyBox, label: "Buy Box Loss" },
-  }), [salesMovers, listingHealth, buyBox]);
+    returns: { report: returns, label: "Returns & Refund Leakage" },
+  }), [salesMovers, listingHealth, buyBox, returns]);
   const activeInsightReport = INSIGHT_VIEWS[view]?.report || null;
 
   // Every insight report returns the brands present in its own scope so the
@@ -2195,6 +2202,10 @@ function DashboardApp({ session, access, onSignOut }) {
             <button className={"sb-nav-item" + (view === "buybox" ? " active" : "")} title="Buy Box Loss — featured-offer share and its causes" onClick={() => { setView("buybox"); setMobileOpen(false); }}>
               <Trophy size={18} />
               <span className="sb-nav-label">Buy Box Loss</span>
+            </button>
+            <button className={"sb-nav-item" + (view === "returns" ? " active" : "")} title="Returns &amp; Refund Leakage — refund money and fixable causes" onClick={() => { setView("returns"); setMobileOpen(false); }}>
+              <Undo2 size={18} />
+              <span className="sb-nav-label">Returns &amp; Refunds</span>
             </button>
             {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
               <UsersRound size={18} />
@@ -3099,6 +3110,17 @@ function DashboardApp({ session, access, onSignOut }) {
           data={buyBox.data}
           loading={buyBox.loading}
           error={buyBox.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
+        />
+      )}
+
+      {view === "returns" && (
+        <ReturnsLeakage
+          data={returns.data}
+          loading={returns.loading}
+          error={returns.error}
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}

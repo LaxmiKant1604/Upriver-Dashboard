@@ -19,9 +19,14 @@ import {
   dedupeInsights,
   insightExportRows,
   makeInsight,
+  buildReturnsInsights,
+  buildReturnsRows,
   salesMoversCompletenessWarning,
   sortInsights,
 } from "../src/lib/insights.js";
+// The reason-bucket classifier runs server-side (the client receives rows that
+// are already bucketed), so it is imported from the report builder.
+import { classifyReturnReason } from "../lib/server/reports/returns.js";
 import { csvCell, csvText } from "../src/lib/csv.js";
 import { fmtMoney, nInt, ratio } from "../src/lib/format.js";
 
@@ -328,6 +333,99 @@ test("a SKU holding the buy box produces no insight", () => {
   const rows = buildBuyBoxRows(buyBoxData, "ALL", 90);
   const insights = buildBuyBoxInsights(buyBoxData, rows, 90);
   assert.ok(!insights.some((insight) => insight.sku === "BB-FINE"));
+});
+
+/* ---------- Returns & Refund Leakage ---------- */
+
+const returnsData = {
+  accountId: "acct-1",
+  asOf: "2026-07-29",
+  window: { from: "2026-05-31", to: "2026-07-29", days: 60 },
+  returnsSourceLabel: "Returns (FBA & FBM)",
+  moneySourceLabel: "Settlements & P&L Components",
+  rateSourceLabel: "Sales & Traffic by ASIN & Date",
+  rateSourceLagDays: 4,
+  returnHistoryDays: 60,
+  returnRecordCount: 46,
+  pendingReturnRequests: 3,
+  fbmOnly: { refundedAmount: 0, sellerBorneLabelCost: 0 },
+  reasonTotals: [
+    { reason: "DEFECTIVE", count: 22, bucket: "product_quality" },
+    { reason: "APPAREL_TOO_SMALL", count: 14, bucket: "sizing" },
+    { reason: "UNWANTED_ITEM", count: 10, bucket: "low_actionability" },
+  ],
+  currencies: ["INR"],
+  rows: [
+    {
+      asin: "R100", sku: "SKU-Q", skuCount: 1, productName: "Defect-prone item", brand: "Alpha", currency: "INR",
+      returnCount: 20, fbaReturns: 18, fbmReturns: 2, pendingReturnRequests: 1,
+      reasonBuckets: { product_quality: 15, low_actionability: 5 },
+      topReasons: [{ reason: "DEFECTIVE", count: 15 }, { reason: "UNWANTED_ITEM", count: 5 }],
+      refundedAmount: 12000, refundTax: 500, returnFees: 900, refundedReferralFeeCredit: 800,
+      cogsOnRefundedUnits: 4000, refundedUnitsSettled: 20, refundEvents: 20,
+      settledSales: 90000, settledUnits: 150, hasMoney: true,
+      unitsSold: 160, unitsShipped: 150, unitsRefunded: 20, sales: 96000, hasTraffic: true,
+    },
+    {
+      asin: "R200", sku: "SKU-LAG", skuCount: 1, productName: "Lag artefact item", brand: "Alpha", currency: "INR",
+      returnCount: 9, fbaReturns: 9, fbmReturns: 0, pendingReturnRequests: 0,
+      reasonBuckets: { sizing: 4, low_actionability: 3, delivery: 2 },
+      topReasons: [{ reason: "APPAREL_TOO_SMALL", count: 4 }],
+      refundedAmount: 3000, refundTax: 0, returnFees: 200, refundedReferralFeeCredit: 0,
+      cogsOnRefundedUnits: 900, refundedUnitsSettled: 9, refundEvents: 9,
+      settledSales: 2000, settledUnits: 5, hasMoney: true,
+      unitsSold: 6, unitsShipped: 5, unitsRefunded: 9, sales: 2400, hasTraffic: true,
+    },
+  ],
+};
+
+test("return leakage is refunds plus seller-borne fees and excludes COGS", () => {
+  const rows = buildReturnsRows(returnsData, "ALL");
+  const byAsin = Object.fromEntries(rows.map((row) => [row.asin, row]));
+  assert.equal(byAsin.R100.totalLeakage, 12000 + 900);
+  // COGS on refunded units must be reported but never folded into the money.
+  assert.equal(byAsin.R100.cogsOnRefundedUnits, 4000);
+  assert.ok(byAsin.R100.totalLeakage < 12000 + 900 + 4000);
+});
+
+test("a return rate above 100% is withheld as a lag artefact", () => {
+  const rows = buildReturnsRows(returnsData, "ALL");
+  const byAsin = Object.fromEntries(rows.map((row) => [row.asin, row]));
+  assert.equal(byAsin.R100.returnRate, (20 / 150) * 100);
+  assert.equal(byAsin.R200.lagInflated, true);
+  assert.equal(byAsin.R200.returnRate, null, "must not report a rate above 100%");
+});
+
+test("a return cause is only named when one bucket is at least half the returns", () => {
+  const rows = buildReturnsRows(returnsData, "ALL");
+  const insights = buildReturnsInsights(returnsData, rows);
+  const clear = insights.find((item) => item.asin === "R100");
+  assert.equal(clear.category, "returns-product_quality");
+  assert.equal(clear.confidence, "high");
+  // R200's largest bucket is 4 of 9 returns, i.e. under half.
+  const mixed = insights.find((item) => item.asin === "R200");
+  assert.equal(mixed.category, "returns-mixed");
+  assert.equal(mixed.confidence, "medium");
+  assert.ok(/does not attribute one cause/i.test(mixed.why));
+});
+
+test("return reason strings map to the documented buckets", () => {
+  assert.equal(classifyReturnReason("DEFECTIVE"), "product_quality");
+  assert.equal(classifyReturnReason("MISSING_PARTS"), "product_quality");
+  assert.equal(classifyReturnReason("NOT_AS_DESCRIBED"), "listing_accuracy");
+  assert.equal(classifyReturnReason("APPAREL_TOO_LARGE"), "sizing");
+  assert.equal(classifyReturnReason("UNDELIVERABLE_REFUSED"), "delivery");
+  assert.equal(classifyReturnReason("NO_REASON_GIVEN"), "low_actionability");
+  assert.equal(classifyReturnReason("SOMETHING_BRAND_NEW"), "other");
+  assert.equal(classifyReturnReason(""), "other");
+});
+
+test("a systemic fixable reason produces an account-level insight", () => {
+  const insights = buildReturnsInsights(returnsData, buildReturnsRows(returnsData, "ALL"));
+  const account = insights.find((item) => item.category === "returns-account-pattern");
+  assert.ok(account, "expected an account-level pattern insight");
+  assert.equal(account.moneyAtRisk, null, "an account pattern has no single monetary basis");
+  assert.ok(/product \/ quality/i.test(account.title));
 });
 
 /* ---------- ranking, dedupe, export ---------- */

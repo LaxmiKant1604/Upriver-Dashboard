@@ -54,6 +54,7 @@ import { serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
+import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
@@ -1351,6 +1352,25 @@ export default async function handler(req, res) {
         userId: access.userId,
         label: "Buy Box Loss",
         build: () => buildBuyBoxLoss({ apiKey, ids, to }),
+      });
+      return;
+    }
+
+    if (action === "returns-leakage") {
+      const ids = singleAccountId(req, res, "Returns & Refund Leakage");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: RETURNS_REPORT_KEY,
+        reportVersion: RETURNS_VERSION,
+        accountId: ids[0],
+        params: { to },
+        userId: access.userId,
+        label: "Returns & Refund Leakage",
+        build: () => buildReturnsLeakage({ apiKey, ids, to }),
       });
       return;
     }
