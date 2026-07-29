@@ -643,7 +643,13 @@ the reverse). Display money respects the currency locale, dashboard breakdowns
 no longer hard-code INR, and content-alert timestamps use the selected
 marketplace timezone. This is intentionally account-scoped: currencies are
 still never converted or combined. Validation: 50 insight assertions and the
-full Vite build pass. The deployment/production browser check is the next step.
+full Vite build pass. **Production deployment completed 2026-07-29:** commit
+`543f35f` deployed as `dpl_87uT8Qmjapc8MwmWbsZCW5QQcmZ8` in 18 seconds;
+Vercel reports it Ready and aliases it to `https://upriverdashboard.vercel.app`.
+The public URL returned HTTP 200 after deployment. Remaining operational QA is
+to sign in and refresh one account each for IN, US, CA, AU and an EU marketplace
+when those accounts are connected, confirming DataDoe's returned country/currency
+matches the normalized account profile.
 
 ## Dashboard authentication and account access (implemented and deployed 2026-07-29)
 
