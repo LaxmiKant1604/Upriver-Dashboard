@@ -54,7 +54,7 @@ export function Notice({ tone = "info", children }) {
   }
   if (tone === "warn") {
     return (
-      <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+      <div className="alert warning">
         <AlertTriangle size={15} /> {children}
       </div>
     );

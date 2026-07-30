@@ -1,6 +1,223 @@
 # Project Memory
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
+
+## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
+
+Every current and future report must be built from the shared visual system in
+`sales-dashboard-live/src/styles/theme.js` and the shared components in
+`sales-dashboard-live/src/components/`. This is not a style preference; it is the
+reason a single token change restyles all fourteen report views at once.
+
+- **Never** hard-code a colour, radius, shadow or spacing value in a view. Use
+  the tokens (`--bg-app`, `--bg-surface`, `--bg-elevated`, `--border-default`,
+  `--border-hover`, `--text-primary`, `--text-secondary`, `--text-muted`,
+  `--accent`, `--accent-soft`, `--positive`, `--negative`, `--warning`,
+  `--info`, `--radius-sm/md/lg`, `--shadow-sm/md`, `--space-1..6`). If the
+  system lacks something, add the token to `theme.js` — do not localise it.
+- Charts must take their colours from the exported `CHART` object in `theme.js`
+  (recharts needs literal values, so it cannot read CSS variables).
+- Compose from the shared patterns rather than new markup: `AppShell`/`Sidebar`/
+  `TopBar`/`AccountSelector`/`BrandSelector`/`DateRangeSelector`
+  (`src/components/shell.jsx`); `MetricCard`, `ComparisonMetric`,
+  `TrendIndicator`, `Sparkline`, `ChartCard`, `ChartTooltip`, `BreakdownCard`,
+  `ContributionBar`, `MetricTooltip`, `StatusBadge`, `DataQualityAlert`,
+  `SkeletonCard`/`SkeletonMetricGrid`/`SkeletonChart`/`SkeletonTable`,
+  `EmptyState`, `ErrorState`, `SegmentedControl` (`src/components/ui.jsx`); and
+  the report shell helpers in `src/views/shared.jsx`.
+- Tables use the shared table system: `plan-scroll` + `plan-table` (or
+  `recon-table-scroll` + `recon-table`), a sticky `thead`, a sticky `pt-id`
+  identity column, right-aligned tabular numerals, `min-width` on the table so
+  horizontal scrolling stays **inside** the container, and `recon-pagination`
+  for paging. A report must never make the page itself scroll sideways.
+- Light theme only. Do not add a dark mode or a theme toggle.
+- Data honesty rules are enforced by the components and must be preserved: an
+  unknown value renders as an em dash and never as zero; a trend or sparkline is
+  omitted entirely when the earlier period does not exist rather than drawn from
+  a guess; money always carries an explicit currency and is never converted or
+  combined across currencies.
+- Only an explicit manual Refresh may call DataDoe. Navigation, account/brand
+  changes, date filters, sorting, search and pagination stay local.
+
+## Frontend redesign — premium light-theme workspace (2026-07-30, deployed)
+
+The whole frontend was redesigned into a light-theme Amazon seller command
+centre. **No business logic, calculation, API, route, permission or caching
+behaviour was changed.** The work was presentation plus the two interaction
+defects noted below.
+
+### New files
+
+- `sales-dashboard-live/src/styles/theme.js` — the entire design system as one
+  token-based stylesheet, exported as `STYLE`, plus the `CHART` colour object.
+  It replaces the ~340-line inline `STYLE` template literal that used to live at
+  the bottom of `App.jsx`. Every screen still renders `<style>{STYLE}</style>`,
+  so the import is a drop-in and the login/loading screens are styled too.
+  Three surface levels only: `--bg-app` (canvas), `--bg-surface` (panels),
+  `--bg-elevated` (KPI cards, dropdowns, interactive controls). Depth is 1px
+  borders plus soft ambient shadows; transitions are 150–250 ms.
+- `sales-dashboard-live/src/components/ui.jsx` — the reusable primitives listed
+  in the rule above. They take pre-formatted values, so report calculations stay
+  in the report.
+- `sales-dashboard-live/src/components/shell.jsx` — `Sidebar`, `TopBar`,
+  `AccountSelector`, `BrandSelector`, `DateRangeSelector`, and the `NAV_GROUPS`
+  navigation model. Presentation only: every piece of state stays in
+  `DashboardApp`.
+
+### Changed files
+
+- `sales-dashboard-live/src/App.jsx` — inline stylesheet removed and imported;
+  sidebar and header markup replaced by the shell components; the dashboard view
+  rebuilt on the new primitives; hard-coded chart hex values replaced with
+  `CHART`; loading/empty/error states added.
+- `sales-dashboard-live/index.html` — title is now
+  `UPRIVER — Amazon Seller Analytics`; the Manrope + JetBrains Mono webfonts moved
+  from a CSS `@import` inside the injected `<style>` to `<link rel=preconnect>` +
+  `<link rel=stylesheet>` in `<head>`, so the browser starts fetching them during
+  HTML parse instead of after the stylesheet evaluates. Added
+  `color-scheme: light` and a `theme-color`.
+- `sales-dashboard-live/src/views/shared.jsx` — the one inline amber banner style
+  became the shared `alert warning` class. Nothing else changed; the six insight
+  reports inherit the redesign through the shared class names.
+
+### Palette (light only)
+
+Cool-neutral canvas `#F3F5F9`, white surfaces, near-navy text `#111A2E`. The
+interactive accent is a confident blue (`--accent #2C5FD6`) used for active nav,
+selected controls, focus rings and the primary chart series. **UPRIVER gold
+(`--brand #E0982A`) is now a controlled brand accent only** — the logo tile, the
+workspace crumb and the Daily Reporting MTD column — instead of colouring the
+whole UI. Green/red/amber/blue keep their semantic meanings. Text contrast was
+measured and tuned: primary ≈15.5:1, secondary `#4E5769` ≈6.9:1 and muted
+`#6B7488` ≈4.6:1 against white, so every text level clears WCAG AA.
+
+### App shell
+
+- **Sidebar**: 236 px expanded, 68 px collapsed, smooth width transition. All
+  fifteen destinations are preserved with unchanged `view` keys and route
+  behaviour, now grouped for scanning as Overview / Finance / Operations /
+  Growth / Monitoring / Admin. The active item uses a subtle accent background
+  plus a slim 3 px accent indicator, not an oversized pill. Collapse and Sign
+  out remain at the bottom. Collapsed items rely on native `title` tooltips
+  deliberately: a CSS popover would be clipped by the rail's own vertical scroll
+  container.
+- **Mobile**: off-canvas drawer with a backdrop, a close button, and Escape to
+  dismiss. The Collapse toggle is hidden on mobile because it has no meaning
+  there.
+- **Top command bar**: breadcrumb `UPRIVER · Amazon Seller Portfolio › <page>`
+  on the left; Account selector, Brand selector and the refresh status cluster
+  (label, live/idle dot, last-refreshed time, account name, Refresh button) on
+  the right. The selectors are still native `<select>` elements — keyboard and
+  mobile behaviour and the exact change semantics are unchanged — wrapped in a
+  labelled icon+label+value+chevron control that truncates instead of
+  overlapping.
+
+### Main dashboard
+
+Information architecture preserved exactly: header → global date filter →
+data-quality alert → primary KPIs → performance comparisons → Sales Trend →
+Sales by Account → Sales by Brand.
+
+- **Date filter**: a compact segmented radio group (Yesterday / 7D / 30D / 90D /
+  MTD / YTD / Custom) with the resolved range shown beside it. Preset maths,
+  custom inputs and min/max clamping are the existing logic.
+- **Data-quality alert**: the real unpriced-units warning is now a compact warm
+  amber alert with a short headline plus detail, sized so it cannot outweigh the
+  KPIs it qualifies.
+- **KPI cards**: small label, dominant tabular-numeral value, `translateY(-2px)`
+  hover with a slightly stronger border and shadow. **New, and computed only
+  from the same cached rows:** a period-over-period change against the
+  immediately preceding window of equal length, and a tiny SVG sparkline of the
+  real per-day series. Both are withheld — not zeroed — when the earlier period
+  starts before the first date this scope actually reported, and the sparkline
+  renders nothing below three real points. Orders and Average Order Value still
+  show an em dash when the source reports no order count.
+- **Comparisons**: DoD / WoW / MTD / YoY as compact cards with period label,
+  percentage, direction arrow and comparison basis. Direction is never colour
+  alone — every value carries an arrow and an explicit sign.
+- **Sales Trend**: the analytical centrepiece in a larger `ChartCard`. Same real
+  data and the same Daily/Weekly/Monthly tabs; subtle area gradient, dashed
+  hover crosshair, highlighted active point, and a custom tooltip that shows
+  Date, Sales and — only when the source actually supplied them — Units and
+  Orders. Trend buckets now also carry units/orders for that tooltip. Animation
+  runs on data change only and is disabled entirely under
+  `prefers-reduced-motion` (recharts animates in JS, so it is told separately
+  via a `matchMedia` hook).
+- **Sales by Account / Brand**: one visual language — name, sales value,
+  contribution percentage and a horizontal contribution bar, aligned rows,
+  `Unassigned` deliberately muted. Currency comes from the selected marketplace;
+  INR is not hard-coded anywhere.
+
+### States
+
+Skeletons whose geometry matches the real content (metric grid, chart bars,
+table rows), plus distinct honest states for: no account selected, nothing saved
+for this account yet, saved but no sales in this range, nothing to plot, and a
+real upstream failure showing the verbatim message with a retry action. A new
+shared `SnapshotGate` renders exactly one of error / skeleton / "nothing saved
+yet" for the five cache-first reports. **A cache miss is no longer a red error
+banner** — it is a first-run empty state with a Refresh action, tracked in
+`rowsCacheMissing` / `snapshotNotice` separately from real errors. Daily
+Reporting no longer renders its matrix when nothing is saved, because that
+printed a full grid of zeroes that looked like genuinely reported sales.
+
+### Two interaction defects fixed (both were open follow-ups in this file)
+
+1. **Duplicate manual refreshes.** The header Refresh button is now disabled for
+   every view while that view's own request is in flight, and `fetchRows`,
+   `fetchDaily` and `fetchPlan` gained in-flight guards. Repeated clicks could
+   previously launch concurrent 25–45 s DataDoe exports for the dashboard, Daily
+   Reporting and the FBA plan, spending quota twice.
+2. **Mobile page overflow.** The seven-preset date control forced the whole page
+   36 px wider than a 390 px viewport, because flex items default to
+   `min-width:auto`. The row and the control can now shrink, so the control
+   scrolls inside itself and the page never scrolls sideways.
+
+### Verification actually performed (2026-07-30)
+
+- `npm run verify` — **50 insight assertions pass**, and `build:check` produced a
+  1,057 kB bundle with the expected >500 kB chunk warning, proving the full app
+  compiled rather than being tree-shaken away.
+- **Browser verification, which this file previously listed as the highest-value
+  outstanding check, is now done.** A temporary local harness (`devpreview.html`
+  + `src/devpreview.jsx`, both deleted before commit, plus a temporary export of
+  `DashboardApp` that was reverted) seeded the browser cache the app already
+  reads on open and rendered the real `DashboardApp`, so the redesign could be
+  driven in Chrome via Playwright without production Supabase credentials. The
+  seeded numbers were synthetic and existed only in that throwaway harness; no
+  mock data exists in the application.
+  Swept at **1440, 1180, 860 and 390 px**, and at every viewport: every one of
+  the fifteen navigation destinations was opened, all seven date presets plus the
+  custom range exercised, all three granularities switched, the chart hovered,
+  and the brand filter applied and cleared. Result: **zero page-level horizontal
+  overflow at any viewport, zero console or page errors, and zero `refresh=1`
+  requests** from navigation, brand changes, date changes, granularity changes or
+  sorting. Confirmed rendering: 4 KPI cards, 4 comparison cards, 4 sparklines,
+  15 nav items, the chart and its hover tooltip, and the brand filter narrowing
+  the brand breakdown from 5 rows to 2 locally. The mobile drawer opens from the
+  menu button and closes with Escape; the collapsed desktop rail measures 68 px.
+  Report tables scroll inside their own container with the sticky identity column
+  intact.
+- Note on the shared-report requests seen during the sweep: opening one of the
+  six insight reports does issue a `/api/datadoe` request **without** `refresh=1`.
+  That is the documented shared-snapshot read, which never touches DataDoe, and
+  it is unchanged by this work.
+
+### Remaining limitations
+
+- The six insight reports, Reconciliation, SKU P&L, FBA plan, Keyword Rank and
+  Content Alerts inherit the redesign through the shared class names and were
+  verified for layout, overflow and their empty/error states, but **not with real
+  populated data in a browser**, because that needs a signed-in production
+  session. Their table markup and calculations were not touched.
+- No screenshot was attached to the redesign request in the session that
+  produced this work, so the layout follows the written specification (refined
+  sidebar, command-bar header, compact filters, strong KPI hierarchy, main chart,
+  two-column breakdown) rather than a pixel reference.
+- The bundle is still a single ~1,057 kB chunk. Code-splitting recharts and the
+  report views behind dynamic imports remains the obvious performance follow-up.
+- `sales-dashboard-live/datadoe (1).js` and the diagnostic `?action=fields` /
+  `?action=sample` routes are still present; unrelated to this work.
 
 ## Six insight reports — built on branch `feature/six-insight-reports` (2026-07-29, NOT deployed, NOT merged)
 

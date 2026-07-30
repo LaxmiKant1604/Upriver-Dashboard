@@ -1,7 +1,17 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, TrendingDown, ChevronDown, Info, RefreshCw, AlertTriangle, LayoutDashboard, CalendarRange, Menu, X, PanelLeftClose, PanelLeftOpen, Boxes, Search, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, ShieldAlert, Trophy, Undo2, Megaphone, FileSearch, ListChecks } from "lucide-react";
+import { TrendingUp, Info, RefreshCw, AlertTriangle, X, Search, Boxes, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, CalendarRange, BarChart3, Inbox, DatabaseZap } from "lucide-react";
 import { supabase } from "./lib/supabase.js";
+// The whole workspace is styled from one token-based stylesheet. Every current
+// and future report must build on these tokens and shared patterns rather than
+// introducing its own colours, spacing or radii.
+import { STYLE, CHART } from "./styles/theme.js";
+import {
+  BreakdownCard, ChartCard, ChartTooltip, ComparisonMetric, DataQualityAlert,
+  EmptyState, ErrorState, MetricCard, SegmentedControl, SkeletonChart,
+  SkeletonMetricGrid, SkeletonTable, Sparkline, TrendIndicator,
+} from "./components/ui.jsx";
+import { DateRangeSelector, Sidebar, TopBar, VIEW_TITLES } from "./components/shell.jsx";
 // Display and CSV helpers are shared with the insight report views so both
 // render money, dates and units identically. Nothing here converts currency.
 import {
@@ -568,62 +578,49 @@ function downloadContentChangesCsv(events, accountName) {
 }
 
 /* ============================== SMALL COMPONENTS ============================== */
-function DeltaIcon({ value }) {
-  if (value === null || value === undefined) return <span>—</span>;
-  if (value > 0) return <TrendingUp size={15} />;
-  if (value < 0) return <TrendingDown size={15} />;
-  return <span>•</span>;
-}
-function deltaClass(value) {
-  if (value === null || value === undefined) return "flat";
-  if (value > 0) return "up";
-  if (value < 0) return "down";
-  return "flat";
-}
+// A shared empty Set for breakdown cards that mute nothing. Module-level so it
+// keeps a stable identity across renders.
+const EMPTY_KEY_SET = new Set();
 
-function CompareChip({ label, note, data }) {
-  if (!data) return null;
-  if (data.insufficient) {
+/**
+ * SnapshotGate — the one state a cache-first report shows before it has data.
+ *
+ * Exactly one of three honest outcomes is rendered: the real upstream error,
+ * a skeleton while a request is in flight, or "nothing saved yet" with the
+ * Refresh action. It never renders a zeroed layout, because a zero here would
+ * be indistinguishable from a real measurement of nothing.
+ */
+function SnapshotGate({ icon, label, error, loading, notice, onRefresh, busy }) {
+  if (error) {
     return (
-      <div className="compare-chip">
-        <div className="clabel">{label}</div>
-        <div className="cval flat"><Info size={14} /> —</div>
-        <div className="cnote">Not enough history yet</div>
+      <div className="panel">
+        <ErrorState
+          title={`${label} could not be loaded`}
+          message={error}
+          onRetry={onRefresh}
+          busy={busy}
+          retryLabel="Refresh from DataDoe"
+        />
       </div>
     );
   }
-  const v = data.value;
-  const label2 = v === null ? (data.curr > 0 ? "New" : "—") : fmtPct(v);
-  return (
-    <div className="compare-chip">
-      <div className="clabel">{label}</div>
-      <div className={"cval " + deltaClass(v)}>
-        <DeltaIcon value={v} /> {label2}
-      </div>
-      <div className="cnote">{note}</div>
-    </div>
-  );
-}
-
-function BreakdownPanel({ title, items, activeKeys, currency }) {
-  const max = items.length ? items[0].value : 0;
+  if (loading) {
+    return <div className="panel panel-flush"><SkeletonTable rows={6} /></div>;
+  }
   return (
     <div className="panel">
-      <div className="panel-head">
-        <div className="panel-title">{title}</div>
-      </div>
-      <div className="bar-list">
-        {items.length === 0 && <div className="empty-note">No data for this period.</div>}
-        {items.map((it) => (
-          <div className={"bar-row" + (activeKeys.has(it.key) ? " active" : "")} key={it.key}>
-            <div className="rlabel" title={it.label}>{it.flag ? it.flag + " " : ""}{it.label}</div>
-            <div className="bar-track">
-              <div className={"bar-fill" + (activeKeys.has(it.key) ? " active" : "")} style={{ width: (max ? (it.value / max) * 100 : 0) + "%" }} />
-            </div>
-            <div className="rvalue mono">{fmtMoneyCompact(it.value, currency)} <span style={{ color: "var(--ink-soft)", fontWeight: 500 }}>· {it.share.toFixed(1)}%</span></div>
-          </div>
-        ))}
-      </div>
+      <EmptyState
+        icon={icon}
+        title={notice ? "Nothing saved for this account yet" : `Reading the saved ${label}…`}
+        actions={onRefresh ? (
+          <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={busy}>
+            <RefreshCw size={14} className={busy ? "spin" : ""} aria-hidden="true" />
+            Refresh from DataDoe
+          </button>
+        ) : null}
+      >
+        {notice || `Loading the saved ${label} for this account.`}
+      </EmptyState>
     </div>
   );
 }
@@ -1045,6 +1042,28 @@ function useSharedReport({ params, active }) {
   return { data, loading, error, cachedAt, refresh, reload: load };
 }
 
+/**
+ * Honours the operating system's reduced-motion setting.
+ *
+ * The CSS already neutralises transitions under `prefers-reduced-motion`, but
+ * recharts animates in JavaScript, so the chart has to be told separately.
+ */
+function usePrefersReducedMotion() {
+  const [reduced, setReduced] = useState(() => (
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      : false
+  ));
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return undefined;
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const onChange = (event) => setReduced(event.matches);
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+  }, []);
+  return reduced;
+}
+
 /* ============================== MAIN APP ============================== */
 function DashboardApp({ session, access, onSignOut }) {
   const isAdmin = access.role === "admin";
@@ -1059,9 +1078,19 @@ function DashboardApp({ session, access, onSignOut }) {
   const [accountsLoading, setAccountsLoading] = useState(true);
   const [accountsError, setAccountsError] = useState(null);
 
+  const prefersReducedMotion = usePrefersReducedMotion();
+
   const [rows, setRows] = useState([]);
   const [rowsLoading, setRowsLoading] = useState(false);
   const [rowsError, setRowsError] = useState(null);
+  // "Nothing saved for this scope yet" is a first-run state, not a failure, so
+  // it is tracked separately from a real upstream error and rendered as an
+  // empty state with a Refresh action instead of a red banner.
+  const [rowsCacheMissing, setRowsCacheMissing] = useState(false);
+  // The same distinction for the cache-first reports. Only one report is on
+  // screen at a time and each one's loader sets or clears this on navigation,
+  // so a single shared slot is enough.
+  const [snapshotNotice, setSnapshotNotice] = useState(null);
   const [lastFetchedAt, setLastFetchedAt] = useState(null);
   const [catalogBrands, setCatalogBrands] = useState([]);
   const [catalogBrandsAccountId, setCatalogBrandsAccountId] = useState(null);
@@ -1216,12 +1245,14 @@ function DashboardApp({ session, access, onSignOut }) {
       setCatalogBrandsAccountId(selectedAccountId);
       setLastFetchedAt(new Date(cached.cachedAt));
       setRowsError(null);
+      setRowsCacheMissing(false);
     } else {
       setRows([]);
       setCatalogBrands([]);
       setCatalogBrandsAccountId(null);
       setLastFetchedAt(null);
-      setRowsError("No cached dashboard data for this selection. Click refresh to fetch from DataDoe.");
+      setRowsError(null);
+      setRowsCacheMissing(true);
     }
   }, [dashboardParams]);
 
@@ -1231,6 +1262,9 @@ function DashboardApp({ session, access, onSignOut }) {
       setRowsError(accounts.length === 0 ? "No cached accounts yet. Click refresh to fetch accounts first." : null);
       return;
     }
+    // In-flight guard: a second click must never start a duplicate DataDoe
+    // export for the same scope.
+    if (rowsLoading) return;
     setRowsLoading(true);
     setRowsError(null);
     cachedApiGet(dashboardParams, { force: true })
@@ -1239,10 +1273,11 @@ function DashboardApp({ session, access, onSignOut }) {
         setCatalogBrands(body.catalogBrands || []);
         setCatalogBrandsAccountId(selectedAccountId);
         setLastFetchedAt(new Date(cachedAt));
+        setRowsCacheMissing(false);
       })
       .catch((err) => setRowsError(err.message))
       .finally(() => setRowsLoading(false));
-  }, [accounts.length, dashboardParams]);
+  }, [accounts.length, dashboardParams, rowsLoading]);
 
   useEffect(() => {
     loadCachedRows();
@@ -1270,12 +1305,12 @@ function DashboardApp({ session, access, onSignOut }) {
       setDailyError(null);
     } else {
       setDailyRows([]);
-      setDailyError("No cached Daily Reporting data for this account. Click refresh to fetch from DataDoe.");
+      setDailyError(null);
     }
   }, [dailyParams]);
 
   const fetchDaily = useCallback(() => {
-    if (!dailyParams) return;
+    if (!dailyParams || dailyLoading) return;
     setDailyLoading(true);
     setDailyError(null);
     cachedApiGet(dailyParams, { force: true })
@@ -1285,7 +1320,7 @@ function DashboardApp({ session, access, onSignOut }) {
       })
       .catch((err) => setDailyError(err.message))
       .finally(() => setDailyLoading(false));
-  }, [dailyParams]);
+  }, [dailyParams, dailyLoading]);
 
   useEffect(() => {
     if (view === "daily") loadCachedDaily();
@@ -1311,15 +1346,17 @@ function DashboardApp({ session, access, onSignOut }) {
       setPlanData(cached.body);
       setPlanCachedAt(new Date(cached.cachedAt));
       setPlanError(null);
+      setSnapshotNotice(null);
     } else {
       setPlanData(null);
       setPlanCachedAt(null);
-      setPlanError("No cached FBA Shipment Plan for this account. Click refresh to fetch from DataDoe.");
+      setPlanError(null);
+      setSnapshotNotice("No saved FBA Shipment Plan for this account yet. Refresh to fetch it from DataDoe.");
     }
   }, [planParams]);
 
   const fetchPlan = useCallback(() => {
-    if (!planParams) return;
+    if (!planParams || planLoading) return;
     setPlanLoading(true);
     setPlanError(null);
     cachedApiGet(planParams, { force: true })
@@ -1329,7 +1366,7 @@ function DashboardApp({ session, access, onSignOut }) {
       })
       .catch((err) => setPlanError(err.message))
       .finally(() => setPlanLoading(false));
-  }, [planParams]);
+  }, [planParams, planLoading]);
 
   useEffect(() => {
     if (view === "fbaplan") loadCachedPlan();
@@ -1357,11 +1394,12 @@ function DashboardApp({ session, access, onSignOut }) {
       return;
     }
     const cached = await readLargeApiCache(reconciliationParams);
-    if (cached) applyReconciliationData(cached.body, cached.cachedAt);
+    if (cached) { setSnapshotNotice(null); applyReconciliationData(cached.body, cached.cachedAt); }
     else {
       setReconciliationData(null);
       setReconciliationCachedAt(null);
-      setReconciliationError("No cached reconciliation data for this account. Click refresh to fetch six completed months from DataDoe.");
+      setReconciliationError(null);
+      setSnapshotNotice("No saved reconciliation for this account yet. Refresh to fetch six completed months from DataDoe.");
     }
   }, [applyReconciliationData, reconciliationParams]);
 
@@ -1411,11 +1449,12 @@ function DashboardApp({ session, access, onSignOut }) {
   const loadCachedSkuPl = useCallback(async () => {
     if (!skuPlParams) { setSkuPlData(null); return; }
     const cached = await readLargeApiCache(skuPlParams);
-    if (cached) applySkuPlData(cached.body, cached.cachedAt, accountById[selectedAccountId]?.currency);
+    if (cached) { setSnapshotNotice(null); applySkuPlData(cached.body, cached.cachedAt, accountById[selectedAccountId]?.currency); }
     else {
       setSkuPlData(null);
       setSkuPlCachedAt(null);
-      setSkuPlError("No cached SKU P&L for this account. Click refresh to fetch six completed months from DataDoe.");
+      setSkuPlError(null);
+      setSnapshotNotice("No saved SKU P&L for this account yet. Refresh to fetch six completed months from DataDoe.");
     }
   }, [applySkuPlData, skuPlParams, accountById, selectedAccountId]);
 
@@ -1456,11 +1495,12 @@ function DashboardApp({ session, access, onSignOut }) {
   const loadCachedContentChanges = useCallback(async () => {
     if (!contentChangesParams) { setContentChangesData(null); return; }
     const cached = await readLargeApiCache(contentChangesParams);
-    if (cached) applyContentChangesData(cached.body, cached.cachedAt);
+    if (cached) { setSnapshotNotice(null); applyContentChangesData(cached.body, cached.cachedAt); }
     else {
       setContentChangesData(null);
       setContentChangesCachedAt(null);
-      setContentChangesError("No cached Content Change Alerts for this account. Click refresh to fetch notifications from DataDoe.");
+      setContentChangesError(null);
+      setSnapshotNotice("No saved content alerts for this account yet. Refresh to fetch notifications from DataDoe.");
     }
   }, [applyContentChangesData, contentChangesParams]);
 
@@ -1502,11 +1542,12 @@ function DashboardApp({ session, access, onSignOut }) {
   const loadCachedKeywordRank = useCallback(async () => {
     if (!keywordRankParams) { setKeywordRankData(null); return; }
     const cached = await readLargeApiCache(keywordRankParams);
-    if (cached) applyKeywordRankData(cached.body, cached.cachedAt);
+    if (cached) { setSnapshotNotice(null); applyKeywordRankData(cached.body, cached.cachedAt); }
     else {
       setKeywordRankData(null);
       setKeywordRankCachedAt(null);
-      setKeywordRankError("No cached Keyword Rank data for this account. Click refresh to fetch SQP data from DataDoe.");
+      setKeywordRankError(null);
+      setSnapshotNotice("No saved Keyword Rank data for this account yet. Refresh to fetch Search Query Performance from DataDoe.");
     }
   }, [applyKeywordRankData, keywordRankParams]);
 
@@ -1693,7 +1734,7 @@ function DashboardApp({ session, access, onSignOut }) {
   }), [reconciliationData, reconciliationScope.orders]);
   const reconciliationDonut = useMemo(() => {
     const groups = [
-      ["Settled", "#149B67"], ["Pending", "#E69B28"], ["Cancelled", "#DF5960"], ["Refunded", "#3F84C5"],
+      ["Settled", CHART.positive], ["Pending", CHART.gold], ["Cancelled", CHART.negative], ["Refunded", CHART.info],
     ];
     return groups.map(([label, fill]) => ({ label, fill, value: reconciliationOrdersForMonth.filter((order) => {
       if (label === "Settled") return order.reconciliationStatus === "Settled";
@@ -2098,6 +2139,57 @@ function DashboardApp({ session, access, onSignOut }) {
   // show "—" unless an orders figure is actually present on the rows.
   const hasOrders = useMemo(() => brandRows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [brandRows]);
 
+  /* Period-over-period change for the selected range, measured against the
+     immediately preceding window of the same length.
+
+     It is deliberately withheld (null) when that earlier window starts before
+     the first date this scope actually has data for: comparing against a period
+     the source never reported would invent a change. Nothing here is a
+     forecast — every figure is summed from the same cached rows the KPIs use. */
+  const kpiDeltas = useMemo(() => {
+    if (!scopeMax || !scopeMin) return null;
+    const spanDays = Math.round((toUTC(rangeTo) - toUTC(rangeFrom)) / 86400000) + 1;
+    if (spanDays < 1) return null;
+    const prevTo = addDays(rangeFrom, -1);
+    const prevFrom = addDays(prevTo, -(spanDays - 1));
+    if (prevFrom < scopeMin) return null;
+    const prev = aggregate(filterRows(prevFrom, prevTo));
+    const prevAov = prev.orders > 0 ? prev.sales / prev.orders : null;
+    return {
+      from: prevFrom,
+      to: prevTo,
+      label: fmtRangeLabel(prevFrom, prevTo),
+      sales: pct(kpi.sales, prev.sales),
+      units: pct(kpi.units, prev.units),
+      orders: prev.orders > 0 ? pct(kpi.orders, prev.orders) : null,
+      aov: prevAov !== null ? pct(aov, prevAov) : null,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brandRows, rangeFrom, rangeTo, scopeMin, scopeMax, kpi, aov]);
+
+  /* Daily series behind the KPI sparklines. These are the real per-day sums for
+     the selected range; Sparkline itself renders nothing below three points, so
+     a short range simply has no sparkline rather than a fabricated one. */
+  const kpiSpark = useMemo(() => {
+    const byDate = new Map();
+    scopedRows.forEach((r) => {
+      const bucket = byDate.get(r.date) || { sales: 0, units: 0, orders: 0 };
+      bucket.sales += salesInDisplay(r);
+      bucket.units += r.total_units_sold || 0;
+      bucket.orders += r.total_orders || 0;
+      byDate.set(r.date, bucket);
+    });
+    const dates = [...byDate.keys()].sort();
+    const series = dates.map((date) => byDate.get(date));
+    return {
+      sales: series.map((bucket) => bucket.sales),
+      units: series.map((bucket) => bucket.units),
+      orders: series.map((bucket) => bucket.orders),
+      aov: series.map((bucket) => (bucket.orders > 0 ? bucket.sales / bucket.orders : null)).filter((value) => value !== null),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopedRows]);
+
   const trend = useMemo(() => {
     const buckets = {};
     scopedRows.forEach((r) => {
@@ -2106,13 +2198,19 @@ function DashboardApp({ session, access, onSignOut }) {
       if (granularity === "M") key = r.date.slice(0, 7);
       else if (granularity === "W") key = weekStart(r.date);
       else key = r.date;
-      buckets[key] = (buckets[key] || 0) + v;
+      // Units and orders ride along on the same bucket so the chart tooltip can
+      // show them when — and only when — the source actually supplied them.
+      const bucket = buckets[key] || { value: 0, units: 0, orders: 0 };
+      bucket.value += v;
+      bucket.units += r.total_units_sold || 0;
+      bucket.orders += r.total_orders || 0;
+      buckets[key] = bucket;
     });
     return Object.keys(buckets).sort().map((k) => {
       let label;
       if (granularity === "M") { const [y, m] = k.split("-"); label = `${MONTH_ABBR[+m - 1]} ${y}`; }
       else { const p = parts(k); label = `${MONTH_ABBR[p.m - 1]} ${p.d}`; }
-      return { key: k, label, value: buckets[k] };
+      return { key: k, label, ...buckets[k] };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scopedRows, granularity]);
@@ -2145,6 +2243,10 @@ function DashboardApp({ session, access, onSignOut }) {
   const activeBrandKeys = useMemo(() => {
     return selectedBrand === "ALL" ? new Set() : new Set([selectedBrand]);
   }, [selectedBrand]);
+  // Whether the selected scope actually has sales rows inside the selected
+  // range. This separates "nothing saved yet" from "saved, but no sales here",
+  // which are two different states and get two different screens.
+  const hasDashboardData = scopedRows.length > 0;
 
   if (!isAdmin && access.accountIds.length === 0) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen"><ShieldCheck size={24} style={{ marginBottom: 10 }} /><strong>No Amazon accounts assigned</strong><div style={{ marginTop: 8 }}>Your administrator must assign an account before you can view dashboard data.</div><button className="cache-refresh-btn" onClick={onSignOut}><LogOut size={14} />Sign out</button></div></div>;
@@ -2172,265 +2274,326 @@ function DashboardApp({ session, access, onSignOut }) {
     );
   }
 
+  /* ===== The header Refresh control =====
+     One button drives every view, and it is still the ONLY thing in the app
+     that may call DataDoe. This descriptor keeps that routing in one place:
+     which report the click refreshes, whether a request is already in flight,
+     and what the status line should say. The Priority Feed owns no data of its
+     own, so it is deliberately not refreshable from here. */
+  const activeStamp = onFeed ? null
+    : activeInsightReport ? activeInsightReport.cachedAt
+    : view === "fbaplan" ? planCachedAt
+    : view === "reconciliation" ? reconciliationCachedAt
+    : view === "skupl" ? skuPlCachedAt
+    : view === "keywordrank" ? keywordRankCachedAt
+    : view === "contentchanges" ? contentChangesCachedAt
+    : lastFetchedAt;
+  const activeBusy = activeInsightReport ? activeInsightReport.loading
+    : view === "daily" ? dailyLoading
+    : view === "fbaplan" ? planLoading
+    : view === "reconciliation" ? reconciliationLoading
+    : view === "skupl" ? skuPlLoading
+    : view === "keywordrank" ? keywordRankLoading
+    : view === "contentchanges" ? contentChangesLoading
+    : rowsLoading;
+  const accountLabel = refreshScopeAccount?.name || "selected account";
+  const refreshDescriptor = {
+    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : "Last refreshed",
+    value: onFeed
+      ? accountLabel
+      : activeBusy
+        ? "Fetching…"
+        : activeStamp
+          ? `${activeStamp.toLocaleTimeString()} · ${accountLabel}`
+          : selectedAccountId ? "Not yet refreshed" : "Select an account",
+    live: Boolean(activeStamp) || onFeed,
+    busy: activeBusy,
+    onRefresh: onFeed ? undefined
+      : activeInsightReport ? activeInsightReport.refresh
+      : view === "daily" ? fetchDaily
+      : view === "fbaplan" ? fetchPlan
+      : view === "reconciliation" ? fetchReconciliation
+      : view === "skupl" ? fetchSkuPl
+      : view === "keywordrank" ? fetchKeywordRank
+      : view === "contentchanges" ? fetchContentChanges
+      : fetchRows,
+    // Disabled for every report while its own request is in flight. This closes
+    // the documented duplicate-refresh gap: repeated clicks could previously
+    // launch concurrent 25-45 s DataDoe exports for the dashboard, Daily
+    // Reporting and the FBA plan.
+    disabled: onFeed || activeBusy,
+    hint: onFeed
+      ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
+      : activeInsightReport
+        ? "Refresh this report from DataDoe for the selected account and save it for everyone with access"
+        : `Refresh ${accountLabel} from DataDoe`,
+  };
+
   return (
     <div className="dash-root">
       <style>{STYLE}</style>
 
       <div className="app-shell">
-        <aside className={"sidebar" + (collapsed ? " collapsed" : "") + (mobileOpen ? " mobile-open" : "")}>
-          <div className="sb-brand">
-            <div className="sb-logo">UR</div>
-            <div className="sb-brand-text">
-              <div className="sb-ws-name">Upriver Dashboard</div>
-              <div className="sb-ws-sub">{access.email}</div>
-            </div>
-            <button className="sb-close" onClick={() => setMobileOpen(false)} aria-label="Close menu">
-              <X size={18} />
-            </button>
-          </div>
-
-          <nav className="sb-nav">
-            <button className={"sb-nav-item" + (view === "dashboard" ? " active" : "")} title="Dashboard" onClick={() => { setView("dashboard"); setMobileOpen(false); }}>
-              <LayoutDashboard size={18} />
-              <span className="sb-nav-label">Dashboard</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "daily" ? " active" : "")} title="Daily Reporting" onClick={() => { setView("daily"); setMobileOpen(false); }}>
-              <CalendarRange size={18} />
-              <span className="sb-nav-label">Daily Reporting</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "reconciliation" ? " active" : "")} title="Reconciliation Dashboard" onClick={() => { setView("reconciliation"); setMobileOpen(false); }}>
-              <ReceiptText size={18} />
-              <span className="sb-nav-label">Reconciliation</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "fbaplan" ? " active" : "")} title="FBA Shipment Plan" onClick={() => { setView("fbaplan"); setMobileOpen(false); }}>
-              <Boxes size={18} />
-              <span className="sb-nav-label">FBA Shipment Plan</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "skupl" ? " active" : "")} title="SKU P&L Analyzer" onClick={() => { setView("skupl"); setMobileOpen(false); }}>
-              <Wallet size={18} />
-              <span className="sb-nav-label">SKU P&amp;L Analyzer</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "keywordrank" ? " active" : "")} title="Keyword Rank" onClick={() => { setView("keywordrank"); setMobileOpen(false); }}>
-              <TrendingUp size={18} />
-              <span className="sb-nav-label">Keyword Rank</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "contentchanges" ? " active" : "")} title="Content Change Alerts" onClick={() => { setView("contentchanges"); setMobileOpen(false); }}>
-              <BellRing size={18} />
-              <span className="sb-nav-label">Content Alerts</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "salesmovers" ? " active" : "")} title="Sales Movers — weekly ASIN gains and declines" onClick={() => { setView("salesmovers"); setMobileOpen(false); }}>
-              <TrendingUp size={18} />
-              <span className="sb-nav-label">Sales Movers</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "listinghealth" ? " active" : "")} title="Listing Health — suppressed, inactive and stranded listings" onClick={() => { setView("listinghealth"); setMobileOpen(false); }}>
-              <ShieldAlert size={18} />
-              <span className="sb-nav-label">Listing Health</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "buybox" ? " active" : "")} title="Buy Box Loss — featured-offer share and its causes" onClick={() => { setView("buybox"); setMobileOpen(false); }}>
-              <Trophy size={18} />
-              <span className="sb-nav-label">Buy Box Loss</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "returns" ? " active" : "")} title="Returns &amp; Refund Leakage — refund money and fixable causes" onClick={() => { setView("returns"); setMobileOpen(false); }}>
-              <Undo2 size={18} />
-              <span className="sb-nav-label">Returns &amp; Refunds</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "ppc" ? " active" : "")} title="PPC Performance &amp; Wasted Spend" onClick={() => { setView("ppc"); setMobileOpen(false); }}>
-              <Megaphone size={18} />
-              <span className="sb-nav-label">PPC Performance</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "optimizer" ? " active" : "")} title="Listing &amp; Search Optimizer — search-funnel and content gaps" onClick={() => { setView("optimizer"); setMobileOpen(false); }}>
-              <FileSearch size={18} />
-              <span className="sb-nav-label">Listing Optimizer</span>
-            </button>
-            <button className={"sb-nav-item" + (view === "priority" ? " active" : "")} title="Priority Feed — every evidenced signal from the six reports, ranked" onClick={() => { setView("priority"); setMobileOpen(false); }}>
-              <ListChecks size={18} />
-              <span className="sb-nav-label">Priority Feed</span>
-            </button>
-            {isAdmin && <button className={"sb-nav-item" + (view === "access" ? " active" : "")} title="User access" onClick={() => { setView("access"); setMobileOpen(false); }}>
-              <UsersRound size={18} />
-              <span className="sb-nav-label">User Access</span>
-            </button>}
-          </nav>
-
-          <div className="sb-footer">
-            <button className="sb-collapse" onClick={() => setCollapsed((c) => !c)} title={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-label="Toggle sidebar">
-              {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-              <span className="sb-nav-label">Collapse</span>
-            </button>
-            <button className="sb-collapse" onClick={onSignOut} title="Sign out" aria-label="Sign out">
-              <LogOut size={18} />
-              <span className="sb-nav-label">Sign out</span>
-            </button>
-          </div>
-        </aside>
+        <Sidebar
+          view={view}
+          onNavigate={(next) => { setView(next); setMobileOpen(false); }}
+          isAdmin={isAdmin}
+          email={access.email}
+          collapsed={collapsed}
+          onToggleCollapse={() => setCollapsed((value) => !value)}
+          mobileOpen={mobileOpen}
+          onCloseMobile={() => setMobileOpen(false)}
+          onSignOut={onSignOut}
+        />
 
         {mobileOpen && <div className="sb-backdrop" onClick={() => setMobileOpen(false)} />}
 
         <div className="main-area">
-      <div className="topbar">
-        <button className="menu-btn" onClick={() => setMobileOpen(true)} aria-label="Open menu">
-          <Menu size={18} />
-        </button>
-        <div className="brandmark">
-          <span className="mark">UPRIVER</span>
-          <span className="sub">Amazon Seller Portfolio — Sales</span>
-        </div>
-        {view !== "access" && <div className="topbar-filters">
-          <div className="select topbar-account-select">
-            <select
-              aria-label="Account selection"
-              value={selectedAccountId || ""}
-              onChange={(e) => {
-                setSelectedAccountId(e.target.value);
-                setSelectedBrand("ALL");
-              }}
-            >
-              {accounts.map((account) => (
-                <option value={account.id} key={account.id}>
-                  {FLAGS[account.country] || ""} {account.name} ({account.currency || "—"})
-                </option>
-              ))}
-            </select>
-            <ChevronDown size={16} />
-          </div>
-          <div className="select topbar-brand-select">
-            <select
-              aria-label="Brand selection"
-              value={selectedBrand}
-              onChange={(e) => setSelectedBrand(e.target.value)}
-            >
-              <option value="ALL">Select All Brands</option>
-              {brandList.map((brandName) => (
-                <option value={brandName} key={brandName}>{brandName}</option>
-              ))}
-            </select>
-            <ChevronDown size={16} />
-          </div>
-        </div>}
-        {view !== "access" && <div className="live-wrap">
-          <span className="live-dot" />
-          {(() => {
-            // The Priority Feed has nothing of its own to refresh: it combines
-            // the six saved snapshots. Refreshing must happen in the report that
-            // owns the data, so the button is disabled here rather than silently
-            // refreshing the main dashboard instead.
-            if (onFeed) return `Combining saved reports · ${refreshScopeAccount?.name || "selected account"}`;
-            if (activeInsightReport) {
-              const stamp = activeInsightReport.cachedAt;
-              return stamp
-                ? `Read ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}`
-                : "Select an account to refresh";
-            }
-            const stamp = view === "fbaplan" ? planCachedAt : view === "reconciliation" ? reconciliationCachedAt : view === "skupl" ? skuPlCachedAt : view === "keywordrank" ? keywordRankCachedAt : view === "contentchanges" ? contentChangesCachedAt : lastFetchedAt;
-            return stamp ? `Refreshed ${stamp.toLocaleTimeString()} · ${refreshScopeAccount?.name || "selected account"}` : "Select an account to refresh";
-          })()}
-          <button
-            className="refresh-btn"
-            onClick={onFeed ? undefined : activeInsightReport ? activeInsightReport.refresh : view === "daily" ? fetchDaily : view === "fbaplan" ? fetchPlan : view === "reconciliation" ? fetchReconciliation : view === "skupl" ? fetchSkuPl : view === "keywordrank" ? fetchKeywordRank : view === "contentchanges" ? fetchContentChanges : fetchRows}
-            disabled={onFeed || (activeInsightReport ? activeInsightReport.loading : (view === "reconciliation" && reconciliationLoading) || (view === "skupl" && skuPlLoading) || (view === "keywordrank" && keywordRankLoading) || (view === "contentchanges" && contentChangesLoading))}
-            title={onFeed ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data." : activeInsightReport ? "Refresh this report from DataDoe for the selected account and save it for everyone with access" : "Refresh selected account"}
-          >
-            <RefreshCw size={13} className={(activeInsightReport ? activeInsightReport.loading : view === "daily" ? dailyLoading : view === "fbaplan" ? planLoading : view === "reconciliation" ? reconciliationLoading : view === "skupl" ? skuPlLoading : view === "keywordrank" ? keywordRankLoading : view === "contentchanges" ? contentChangesLoading : rowsLoading) ? "spin" : ""} />
-          </button>
-        </div>}
-      </div>
+          <TopBar
+            viewTitle={VIEW_TITLES[view] || "Dashboard"}
+            onOpenMenu={() => setMobileOpen(true)}
+            mobileOpen={mobileOpen}
+            showScope={view !== "access"}
+            accounts={accounts}
+            selectedAccountId={selectedAccountId}
+            onAccountChange={(id) => { setSelectedAccountId(id); setSelectedBrand("ALL"); }}
+            brands={brandList}
+            selectedBrand={selectedBrand}
+            onBrandChange={setSelectedBrand}
+            flags={FLAGS}
+            refresh={refreshDescriptor}
+          />
 
       {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
 
       {view === "dashboard" && (
       <div className="container">
-        <div className="controls-bar dashboard-controls">
-          <div className="chip-row">
-            {["YESTERDAY", "7D", "30D", "90D", "MTD", "YTD", "CUSTOM"].map((p) => (
-              <button key={p} className={"chip" + (rangePreset === p ? " active" : "")} onClick={() => setRangePreset(p)}>
-                {p === "YESTERDAY" ? "Yesterday" : p === "CUSTOM" ? "Custom" : p}
-              </button>
-            ))}
-            {rangePreset === "CUSTOM" && (
-              <span className="custom-range">
-                <input type="date" value={customFrom} min={scopeMin || undefined} max={latest} onChange={(e) => setCustomFrom(e.target.value)} />
-                <input type="date" value={customTo} min={scopeMin || undefined} max={latest} onChange={(e) => setCustomTo(e.target.value)} />
-              </span>
-            )}
-          </div>
-        </div>
-
-        {rowsError && (
-          <div className="error-banner"><AlertTriangle size={15} /> {rowsError}</div>
-        )}
-        {!rowsLoading && selectedBrand === "ALL" && kpi.unpricedUnits > 0 && (
-          <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
-            <AlertTriangle size={15} /> DataDoe returned {kpi.unpricedUnits.toLocaleString("en-US")} unit{kpi.unpricedUnits === 1 ? "" : "s"} with zero order value in this range. Total Sales may be understated until the upstream order data is completed.
-          </div>
-        )}
-
-        <div className="kpi-grid">
-          <div className="kpi-card">
-            <div className="kpi-label">Total Sales</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : fmtMoney(kpi.sales, displayCurrency)}</div>
-            <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
-          </div>
-          <div className="kpi-card">
-            <div className="kpi-label">Units Sold</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : kpi.units.toLocaleString("en-US")}</div>
-            <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
-          </div>
-          <div className="kpi-card">
-            <div className="kpi-label">Orders</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : hasOrders ? kpi.orders.toLocaleString("en-US") : "—"}</div>
-            <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
-          </div>
-          <div className="kpi-card">
-            <div className="kpi-label">Avg. Order Value</div>
-            <div className="kpi-value mono">{rowsLoading ? "…" : hasOrders ? fmtMoney(aov, displayCurrency, 2) : "—"}</div>
-            <div className="kpi-period">{fmtRangeLabel(rangeFrom, rangeTo)}</div>
-          </div>
-        </div>
-
-        <div className="compare-row">
-          <CompareChip label="Day over Day" note="vs previous day" data={comparisons?.dod} />
-          <CompareChip label="Week over Week" note="vs prior 7 days" data={comparisons?.wow} />
-          <CompareChip label="Month to Date" note="vs last month, same days" data={comparisons?.mtd} />
-          <CompareChip label="Year over Year" note="vs same period last year" data={comparisons?.yoy} />
-        </div>
-
-        <div className="panel">
-          <div className="panel-head">
-            <div className="panel-title">Sales Trend</div>
-            <div className="seg">
-              {["D", "W", "M"].map((g) => (
-                <button key={g} className={granularity === g ? "active" : ""} onClick={() => setGranularity(g)}>
-                  {g === "D" ? "Daily" : g === "W" ? "Weekly" : "Monthly"}
-                </button>
-              ))}
+        <div className="page-head">
+          <div>
+            <div className="page-title">Sales Dashboard</div>
+            <div className="page-sub">
+              {refreshScopeAccount?.name || "No account selected"}
+              {selectedBrand === "ALL" ? " · All brands" : ` · ${selectedBrand}`}
+              {selectedMarketplace.country ? ` · ${selectedMarketplace.country}` : ""}
+              {` · reported in ${displayCurrency}`}
             </div>
           </div>
-          <div className="chart-wrap">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={trend} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="fillAccent" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#F2A93B" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#F2A93B" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="#EBEDF3" vertical={false} />
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={{ stroke: "#E3E6EE" }} tickLine={false} />
-                <YAxis tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} tickFormatter={(v) => compactNumber(v, displayCurrency)} width={54} />
-                <Tooltip formatter={(v) => [fmtMoney(v, displayCurrency), "Sales"]} labelStyle={{ fontWeight: 700, color: "#12172B" }} contentStyle={{ borderRadius: 10, border: "1px solid #E3E6EE", fontSize: 12.5 }} />
-                <Area type="monotone" dataKey="value" stroke="#C97F1D" strokeWidth={2} fill="url(#fillAccent)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
         </div>
 
-        <div className="breakdown-grid">
-          <BreakdownPanel title="Sales by Account" items={byAccountBreakdown} activeKeys={activeAccountKeys} currency={displayCurrency} />
-          <BreakdownPanel title="Sales by Brand" items={byBrandBreakdown} activeKeys={activeBrandKeys} currency={displayCurrency} />
-        </div>
+        {/* Global date filter. Presets, the custom range and its clamping are
+            the app's existing logic; only the control's presentation changed. */}
+        <DateRangeSelector
+          preset={rangePreset}
+          onPresetChange={setRangePreset}
+          customFrom={customFrom}
+          customTo={customTo}
+          onCustomFrom={setCustomFrom}
+          onCustomTo={setCustomTo}
+          minDate={scopeMin}
+          maxDate={latest}
+          rangeLabel={hasDashboardData ? fmtRangeLabel(rangeFrom, rangeTo) : null}
+          icon={<CalendarRange size={13} aria-hidden="true" />}
+        />
+
+        {rowsError && (
+          <DataQualityAlert
+            tone="error"
+            title="The dashboard data could not be refreshed"
+            detail={rowsError}
+          />
+        )}
+        {/* Real data-quality warning: DataDoe returned units carrying no order
+            value, so the sales total is understated. Compact, and never allowed
+            to outweigh the KPIs it qualifies. */}
+        {!rowsLoading && selectedBrand === "ALL" && kpi.unpricedUnits > 0 && (
+          <DataQualityAlert
+            tone="warning"
+            title={`${kpi.unpricedUnits.toLocaleString("en-US")} unit${kpi.unpricedUnits === 1 ? "" : "s"} in this range have no order value`}
+            detail="Total Sales may be understated. Refresh again once DataDoe completes its upstream order data — no value is estimated or filled in here."
+          />
+        )}
+
+        {!selectedAccountId ? (
+          <div className="panel">
+            <EmptyState
+              icon={<Inbox size={19} aria-hidden="true" />}
+              title="No account selected"
+              actions={accounts.length ? null : (
+                <button className="plan-export-btn" type="button" onClick={fetchAccounts} disabled={accountsLoading}>
+                  <RefreshCw size={14} className={accountsLoading ? "spin" : ""} aria-hidden="true" />
+                  Load account directory
+                </button>
+              )}
+            >
+              Choose an Amazon account in the command bar above to load its saved sales data.
+            </EmptyState>
+          </div>
+        ) : rowsLoading && !hasDashboardData ? (
+          <>
+            <SkeletonMetricGrid count={4} />
+            <div className="chart-card"><SkeletonChart /></div>
+          </>
+        ) : rowsCacheMissing && !hasDashboardData ? (
+          <div className="panel">
+            <EmptyState
+              icon={<DatabaseZap size={19} aria-hidden="true" />}
+              title="Nothing saved for this account yet"
+              actions={(
+                <button className="plan-export-btn" type="button" onClick={fetchRows} disabled={rowsLoading}>
+                  <RefreshCw size={14} className={rowsLoading ? "spin" : ""} aria-hidden="true" />
+                  Refresh from DataDoe
+                </button>
+              )}
+            >
+              Opening a report, switching account or brand, and changing the date range all read saved data only.
+              Refresh is the one action that calls DataDoe.
+            </EmptyState>
+          </div>
+        ) : !hasDashboardData ? (
+          <div className="panel">
+            <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales in this range">
+              This account has saved data, but no sales were reported between {fmtRangeLabel(rangeFrom, rangeTo)}.
+              Widen the date range or clear the brand filter.
+            </EmptyState>
+          </div>
+        ) : (
+        <>
+          {/* Primary KPI section. Comparisons and sparklines appear only where
+              real history exists for this scope; nothing is back-filled. */}
+          <div className="metric-grid">
+            <MetricCard
+              label="Total Sales"
+              value={fmtMoney(kpi.sales, displayCurrency)}
+              hint={`Order value in ${displayCurrency}. Currencies are never converted or combined.`}
+              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.sales} text={fmtPct(kpiDeltas.sales)} title={`vs ${kpiDeltas.label}`} /> : null}
+              spark={<Sparkline values={kpiSpark.sales} color={CHART.primary} ariaLabel="Daily sales for the selected range" />}
+            />
+            <MetricCard
+              label="Units Sold"
+              value={kpi.units.toLocaleString("en-US")}
+              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
+              spark={<Sparkline values={kpiSpark.units} color={CHART.teal} ariaLabel="Daily units for the selected range" />}
+            />
+            <MetricCard
+              label="Orders"
+              value={hasOrders ? kpi.orders.toLocaleString("en-US") : "—"}
+              hint={hasOrders ? undefined : "This sales source reports no order count, so Orders and Average Order Value are unavailable rather than shown as zero."}
+              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              trend={hasOrders && kpiDeltas && kpiDeltas.orders !== null ? <TrendIndicator value={kpiDeltas.orders} text={fmtPct(kpiDeltas.orders)} title={`vs ${kpiDeltas.label}`} /> : null}
+              spark={hasOrders ? <Sparkline values={kpiSpark.orders} color={CHART.violet} ariaLabel="Daily orders for the selected range" /> : null}
+            />
+            <MetricCard
+              label="Avg. Order Value"
+              value={hasOrders ? fmtMoney(aov, displayCurrency, 2) : "—"}
+              hint={hasOrders ? "Total sales divided by orders for the selected range." : "Requires an order count, which this sales source does not report."}
+              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              trend={hasOrders && kpiDeltas && kpiDeltas.aov !== null ? <TrendIndicator value={kpiDeltas.aov} text={fmtPct(kpiDeltas.aov)} title={`vs ${kpiDeltas.label}`} /> : null}
+              spark={hasOrders ? <Sparkline values={kpiSpark.aov} color={CHART.gold} ariaLabel="Daily average order value for the selected range" /> : null}
+            />
+          </div>
+
+          {/* Performance comparisons. Each one states its own basis and shows an
+              em dash when this account has too little history to compare. */}
+          <div className="cmp-grid">
+            <ComparisonMetric label="Day over Day" basis="vs previous day" data={comparisons?.dod} format={fmtPct} />
+            <ComparisonMetric label="Week over Week" basis="vs prior 7 days" data={comparisons?.wow} format={fmtPct} />
+            <ComparisonMetric label="Month to Date" basis="vs last month, same days" data={comparisons?.mtd} format={fmtPct} />
+            <ComparisonMetric label="Year over Year" basis="vs same period last year" data={comparisons?.yoy} format={fmtPct} />
+          </div>
+
+          <ChartCard
+            title="Sales Trend"
+            subtitle={`${trend.length.toLocaleString("en-US")} ${granularity === "M" ? "month" : granularity === "W" ? "week" : "day"}${trend.length === 1 ? "" : "s"} · ${fmtRangeLabel(rangeFrom, rangeTo)} · ${displayCurrency}`}
+            actions={(
+              <SegmentedControl
+                ariaLabel="Trend granularity"
+                size="sm"
+                value={granularity}
+                onChange={setGranularity}
+                options={[
+                  { value: "D", label: "Daily" },
+                  { value: "W", label: "Weekly" },
+                  { value: "M", label: "Monthly" },
+                ]}
+              />
+            )}
+          >
+            {trend.length === 0 ? (
+              <EmptyState icon={<BarChart3 size={19} aria-hidden="true" />} title="Nothing to plot">
+                No sales were reported in this range, so the chart is intentionally left empty rather than drawn at zero.
+              </EmptyState>
+            ) : (
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={trend} margin={{ top: 8, right: 18, left: 6, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="fillSales" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={CHART.primary} stopOpacity={0.20} />
+                        <stop offset="100%" stopColor={CHART.primary} stopOpacity={0.01} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid stroke={CHART.grid} vertical={false} />
+                    <XAxis
+                      dataKey="label" tick={{ fontSize: 10.5, fill: CHART.axis }}
+                      axisLine={{ stroke: CHART.axisLine }} tickLine={false}
+                      minTickGap={18} tickMargin={8}
+                    />
+                    <YAxis
+                      tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false}
+                      tickFormatter={(value) => compactNumber(value, displayCurrency)} width={56}
+                    />
+                    <Tooltip
+                      cursor={{ stroke: CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }}
+                      content={(props) => (
+                        <ChartTooltip
+                          {...props}
+                          rows={(point) => [
+                            { key: "sales", label: "Sales", value: fmtMoney(point.value, displayCurrency), color: CHART.primary },
+                            point.units ? { key: "units", label: "Units", value: point.units.toLocaleString("en-US") } : null,
+                            hasOrders && point.orders ? { key: "orders", label: "Orders", value: point.orders.toLocaleString("en-US") } : null,
+                          ]}
+                        />
+                      )}
+                    />
+                    <Area
+                      type="monotone" dataKey="value" stroke={CHART.primary} strokeWidth={2}
+                      fill="url(#fillSales)" dot={false}
+                      activeDot={{ r: 4, fill: CHART.primary, stroke: "#fff", strokeWidth: 2 }}
+                      isAnimationActive={!prefersReducedMotion}
+                      animationDuration={420}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </ChartCard>
+
+          <div className="breakdown-grid">
+            <BreakdownCard
+              title="Sales by Account"
+              subtitle="The selected account is highlighted"
+              items={byAccountBreakdown}
+              activeKeys={activeAccountKeys}
+              mutedKeys={EMPTY_KEY_SET}
+              formatValue={(value) => fmtMoneyCompact(value, displayCurrency)}
+              emptyMessage="No account sales in this range."
+            />
+            <BreakdownCard
+              title="Sales by Brand"
+              subtitle="Contribution to the selected range"
+              items={byBrandBreakdown}
+              activeKeys={activeBrandKeys}
+              formatValue={(value) => fmtMoneyCompact(value, displayCurrency)}
+              emptyMessage="No brand sales in this range."
+            />
+          </div>
+        </>
+        )}
 
         <div className="footer-note">
-          Total Sales is DataDoe Order Line Items `item_price_value`, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (`product_brand`) for the selected account. Change an account or brand to use cached data; use refresh only when you want a new export. If the warning above appears, DataDoe has returned units without an order value, so refresh again after its upstream order data is completed.
+          Total Sales is DataDoe Order Line Items <code>item_price_value</code>, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (<code>product_brand</code>) for the selected account. Money is shown in the selected marketplace's currency and is never converted or combined with another currency. Changing account, brand, date range or granularity reads saved data only; <strong>Refresh is the only action that calls DataDoe</strong>. Comparisons and sparklines are computed from the same saved rows and are withheld — shown as an em dash or omitted — whenever this account lacks the earlier period they would need. If the warning above appears, DataDoe returned units without an order value, so refresh again after its upstream order data is completed.
         </div>
       </div>
       )}
@@ -2444,45 +2607,69 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
-        {dailyError && (
-          <div className="error-banner"><AlertTriangle size={15} /> {dailyError}</div>
-        )}
+        {dailyError && <DataQualityAlert tone="error" title="The last refresh failed" detail={dailyError} />}
 
-        <div className="panel" style={{ marginTop: 14 }}>
-          <div className="panel-head">
+        <div className="panel panel-flush">
+          <div className="panel-head" style={{ padding: "15px 18px 12px", marginBottom: 0, borderBottom: "1px solid var(--border-default)" }}>
             <div>
               <div className="panel-title">{refreshScopeAccount?.name || "Account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
-              <div className="page-sub">Latest completed sales: {fmtDateHuman(dailyReport.latest)} · shown in {dailyCurrency}</div>
+              <div className="page-sub">
+                {dailyRows.length
+                  ? `Latest completed sales: ${fmtDateHuman(dailyReport.latest)} · shown in ${dailyCurrency}`
+                  : `Reported in ${dailyCurrency}`}
+              </div>
             </div>
-            <button className="refresh-btn" onClick={fetchDaily} title="Refresh data">
-              <RefreshCw size={13} className={dailyLoading ? "spin" : ""} />
+            <button className="refresh-btn" onClick={fetchDaily} disabled={dailyLoading} title="Refresh this report from DataDoe" aria-label="Refresh Daily Reporting">
+              <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
             </button>
           </div>
 
-          <div className="daily-scroll">
-            <table className="daily-table">
-              <thead>
-                <tr>
-                  <th className="dt-metric">{refreshScopeAccount?.name?.split(" ")[0] || "Metric"}</th>
-                  {dailyReport.columns.map((c) => (
-                    <th key={c.key} className={"dt-col dt-" + c.group}>{c.label}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {DAILY_METRICS.map((metric) => (
-                  <tr key={metric.key} className={metric.highlight ? "dt-row-highlight" : ""}>
-                    <td className="dt-metric">{metric.label}</td>
-                    {dailyReport.cells.map((cell, i) => (
-                      <td key={dailyReport.columns[i].key} className={"mono dt-" + dailyReport.columns[i].group}>
-                        {dailyLoading ? "…" : metric.fmt(cell, dailyCurrency)}
-                      </td>
+          {/* No saved rows means no measured values. Rendering the matrix here
+              would print a full grid of zeroes that look like real reported
+              sales, so an explicit state is shown instead. */}
+          {dailyLoading && !dailyRows.length ? (
+            <SkeletonTable rows={8} />
+          ) : !dailyRows.length ? (
+            <EmptyState
+              icon={<DatabaseZap size={19} aria-hidden="true" />}
+              title={selectedAccountId ? "Nothing saved for this account yet" : "No account selected"}
+              actions={selectedAccountId ? (
+                <button className="plan-export-btn" type="button" onClick={fetchDaily} disabled={dailyLoading}>
+                  <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
+                  Refresh from DataDoe
+                </button>
+              ) : null}
+            >
+              {selectedAccountId
+                ? "Refresh to fetch this account's daily sales and advertising history. Navigating between reports and changing filters never calls DataDoe."
+                : "Choose an Amazon account in the command bar above."}
+            </EmptyState>
+          ) : (
+            <div className="daily-scroll">
+              <table className="daily-table">
+                <thead>
+                  <tr>
+                    <th className="dt-metric">{refreshScopeAccount?.name?.split(" ")[0] || "Metric"}</th>
+                    {dailyReport.columns.map((c) => (
+                      <th key={c.key} className={"dt-col dt-" + c.group}>{c.label}</th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {DAILY_METRICS.map((metric) => (
+                    <tr key={metric.key} className={metric.highlight ? "dt-row-highlight" : ""}>
+                      <td className="dt-metric">{metric.label}</td>
+                      {dailyReport.cells.map((cell, i) => (
+                        <td key={dailyReport.columns[i].key} className={"mono dt-" + dailyReport.columns[i].group}>
+                          {metric.fmt(cell, dailyCurrency)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         <div className="footer-note">
@@ -2510,10 +2697,18 @@ function DashboardApp({ session, access, onSignOut }) {
           )}
         </div>
 
-        {reconciliationError && <div className="error-banner"><AlertTriangle size={15} /> {reconciliationError}</div>}
+        {reconciliationData && reconciliationError && <DataQualityAlert tone="error" title="The last refresh failed" detail={reconciliationError} />}
 
-        {!reconciliationData && !reconciliationError && (
-          <div className="panel recon-empty"><ReceiptText size={22} /><div>Reconciliation data is loading from cache...</div></div>
+        {!reconciliationData && (
+          <SnapshotGate
+            icon={<ReceiptText size={19} aria-hidden="true" />}
+            label="reconciliation report"
+            error={reconciliationError}
+            loading={reconciliationLoading}
+            notice={snapshotNotice}
+            onRefresh={fetchReconciliation}
+            busy={reconciliationLoading}
+          />
         )}
 
         {reconciliationData && <>
@@ -2544,12 +2739,12 @@ function DashboardApp({ session, access, onSignOut }) {
               <div className="recon-chart-wrap">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={reconciliationTrend} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
-                    <CartesianGrid stroke="#EBEDF3" vertical={false} />
-                    <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
-                    <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                    <CartesianGrid stroke={CHART.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false} />
+                    <YAxis allowDecimals={false} tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false} />
                     <Tooltip />
                     <Bar dataKey="shipped" name="Shipped orders" radius={[4, 4, 0, 0]}>
-                      {reconciliationTrend.map((entry) => <Cell key={entry.month} fill={entry.month === reconciliationMonth ? "#E69B28" : "#D6DFEA"} />)}
+                      {reconciliationTrend.map((entry) => <Cell key={entry.month} fill={entry.month === reconciliationMonth ? CHART.gold : CHART.neutral} />)}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
@@ -2574,15 +2769,15 @@ function DashboardApp({ session, access, onSignOut }) {
             <div className="recon-overlay-wrap">
               <ResponsiveContainer width="100%" height="100%">
                 <ComposedChart data={reconciliationDaily} margin={{ top: 10, right: 15, left: -16, bottom: 0 }}>
-                  <CartesianGrid stroke="#EBEDF3" vertical={false} />
-                  <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
-                  <YAxis yAxisId="left" tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} tickFormatter={(v) => reconciliationMode === "revenue" ? compactNumber(v, displayCurrency) : v} />
-                  <YAxis yAxisId="right" orientation="right" allowDecimals={false} tick={{ fontSize: 11, fill: "#5B6178" }} axisLine={false} tickLine={false} />
+                  <CartesianGrid stroke={CHART.grid} vertical={false} />
+                  <XAxis dataKey="label" tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false} />
+                  <YAxis yAxisId="left" tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false} tickFormatter={(v) => reconciliationMode === "revenue" ? compactNumber(v, displayCurrency) : v} />
+                  <YAxis yAxisId="right" orientation="right" allowDecimals={false} tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false} />
                   <Tooltip formatter={(value, name) => [reconciliationMode === "revenue" && name !== "Refund events" ? fmtMoney(value, displayCurrency) : value, name]} />
                   <Legend />
-                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "orderRevenue" : "shipped"} name={reconciliationMode === "revenue" ? "Order revenue" : "Shipped orders"} fill="#E6A12A" radius={[3, 3, 0, 0]} />
-                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "settledRevenue" : "settled"} name={reconciliationMode === "revenue" ? "Settled revenue" : "ORDER settlements"} fill="#D76168" radius={[3, 3, 0, 0]} />
-                  <Line yAxisId="right" type="monotone" dataKey="refunds" name="Refund events" stroke="#3F84C5" strokeWidth={2} dot={{ r: 3 }} />
+                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "orderRevenue" : "shipped"} name={reconciliationMode === "revenue" ? "Order revenue" : "Shipped orders"} fill={CHART.gold} radius={[3, 3, 0, 0]} />
+                  <Bar yAxisId="left" dataKey={reconciliationMode === "revenue" ? "settledRevenue" : "settled"} name={reconciliationMode === "revenue" ? "Settled revenue" : "ORDER settlements"} fill={CHART.negative} radius={[3, 3, 0, 0]} />
+                  <Line yAxisId="right" type="monotone" dataKey="refunds" name="Refund events" stroke={CHART.info} strokeWidth={2} dot={{ r: 3 }} />
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -2655,9 +2850,7 @@ function DashboardApp({ session, access, onSignOut }) {
           </button>
         </div>
 
-        {planError && (
-          <div className="error-banner"><AlertTriangle size={15} /> {planError}</div>
-        )}
+        {planData && planError && <DataQualityAlert tone="error" title="The last refresh failed" detail={planError} />}
 
         {planData && (
           <>
@@ -2672,7 +2865,7 @@ function DashboardApp({ session, access, onSignOut }) {
             </div>
 
             {!planData.inventoryAvailable && (
-              <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+              <div className="alert warning">
                 <AlertTriangle size={15} /> Live FBA inventory is unavailable for this account right now, so coverage and recommendations show “—”. Sales velocity is still shown.
               </div>
             )}
@@ -2764,11 +2957,17 @@ function DashboardApp({ session, access, onSignOut }) {
           <div className="panel" style={{ marginTop: 14 }}>
             <div className="empty-note">{planSearch ? "No ASINs match your search." : selectedBrand === "ALL" ? "No ASINs found for this account in the reporting window." : "No ASINs match the selected brand."}</div>
           </div>
-        ) : !planError ? (
-          <div className="panel" style={{ marginTop: 14 }}>
-            <div className="empty-note">{planLoading ? "Loading FBA Shipment Plan from DataDoe…" : "No cached data yet. Click refresh to fetch this account's plan from DataDoe."}</div>
-          </div>
-        ) : null}
+        ) : (
+          <SnapshotGate
+            icon={<Boxes size={19} aria-hidden="true" />}
+            label="FBA Shipment Plan"
+            error={planError}
+            loading={planLoading}
+            notice={snapshotNotice}
+            onRefresh={fetchPlan}
+            busy={planLoading}
+          />
+        )}
 
         <div className="footer-note">
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
@@ -2805,10 +3004,18 @@ function DashboardApp({ session, access, onSignOut }) {
           )}
         </div>
 
-        {skuPlError && <div className="error-banner"><AlertTriangle size={15} /> {skuPlError}</div>}
+        {skuPlData && skuPlError && <DataQualityAlert tone="error" title="The last refresh failed" detail={skuPlError} />}
 
-        {!skuPlData && !skuPlError && (
-          <div className="panel recon-empty"><Wallet size={22} /><div>{skuPlLoading ? "Loading SKU P&L from DataDoe…" : "SKU P&L data is loading from cache…"}</div></div>
+        {!skuPlData && (
+          <SnapshotGate
+            icon={<Wallet size={19} aria-hidden="true" />}
+            label="SKU P&L report"
+            error={skuPlError}
+            loading={skuPlLoading}
+            notice={snapshotNotice}
+            onRefresh={fetchSkuPl}
+            busy={skuPlLoading}
+          />
         )}
 
         {skuPlData && <>
@@ -2953,10 +3160,18 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
-        {keywordRankError && <div className="error-banner"><AlertTriangle size={15} /> {keywordRankError}</div>}
+        {keywordRankData && keywordRankError && <DataQualityAlert tone="error" title="The last refresh failed" detail={keywordRankError} />}
 
-        {!keywordRankData && !keywordRankError && (
-          <div className="panel recon-empty"><TrendingUp size={22} /><div>{keywordRankLoading ? "Loading Search Query Performance from DataDoe..." : "Keyword Rank data is loading from cache..."}</div></div>
+        {!keywordRankData && (
+          <SnapshotGate
+            icon={<TrendingUp size={19} aria-hidden="true" />}
+            label="Keyword Rank report"
+            error={keywordRankError}
+            loading={keywordRankLoading}
+            notice={snapshotNotice}
+            onRefresh={fetchKeywordRank}
+            busy={keywordRankLoading}
+          />
         )}
 
         {keywordRankData && <>
@@ -2970,7 +3185,7 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
 
           {keywordRankData.cadence === "baseline" && (
-            <div className="error-banner" style={{ background: "#FEF3E2", borderColor: "#F3D9A8", color: "#8A5A12" }}>
+            <div className="alert warning">
               <AlertTriangle size={15} /> Not enough SQP history for a trend yet ({keywordRankData.periods?.length || 0} period{keywordRankData.periods?.length === 1 ? "" : "s"}; weekly trend needs 4). Current share and rank are shown as a baseline. Refresh again as SQP history builds.
             </div>
           )}
@@ -3085,10 +3300,18 @@ function DashboardApp({ session, access, onSignOut }) {
           {contentChangesData && <button className="plan-export-btn" onClick={() => downloadContentChangesCsv(contentChangeEvents, refreshScopeAccount?.name)} disabled={!contentChangeEvents.length}><Download size={15} />Download CSV</button>}
         </div>
 
-        {contentChangesError && <div className="error-banner"><AlertTriangle size={15} /> {contentChangesError}</div>}
+        {contentChangesData && contentChangesError && <DataQualityAlert tone="error" title="The last refresh failed" detail={contentChangesError} />}
 
-        {!contentChangesData && !contentChangesError && (
-          <div className="panel recon-empty"><BellRing size={22} /><div>{contentChangesLoading ? "Loading content alerts from DataDoe..." : "Content alerts are loading from cache..."}</div></div>
+        {!contentChangesData && (
+          <SnapshotGate
+            icon={<BellRing size={19} aria-hidden="true" />}
+            label="content alert feed"
+            error={contentChangesError}
+            loading={contentChangesLoading}
+            notice={snapshotNotice}
+            onRefresh={fetchContentChanges}
+            busy={contentChangesLoading}
+          />
         )}
 
         {contentChangesData && <>
@@ -3254,347 +3477,6 @@ const DAILY_METRICS = [
   { key: "tacos", label: "TACoS %", fmt: (c) => (c.hasAd && c.sales > 0 ? (c.adSpend / c.sales * 100).toFixed(1) + "%" : "—") },
 ];
 
-const STYLE = `
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-:root{ --bg:#F6F7FB; --surface:#FFFFFF; --ink:#12172B; --ink-soft:#5B6178; --border:#E3E6EE; --accent:#F2A93B; --accent-deep:#C97F1D; --pos:#1E8E5A; --neg:#D64545; --grid-line:#EBEDF3; }
-*{ box-sizing:border-box; }
-html,body,#root{ margin:0; padding:0; height:100%; }
-.dash-root{ font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; background:var(--bg); color:var(--ink); min-height:100vh; padding-bottom:20px; }
-.mono{ font-family:'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
-.loading-screen{ display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:'Manrope',sans-serif; color:var(--ink-soft); text-align:center; padding:24px; }
-.cache-refresh-btn{ margin-top:14px; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:8px 12px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; color:var(--ink); font-family:inherit; font-size:13px; font-weight:700; }
-.cache-refresh-btn:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
-.cache-refresh-btn:disabled{ cursor:not-allowed; opacity:.65; }
-
-/* ---- Sidebar shell ---- */
-.app-shell{ display:flex; align-items:stretch; min-height:100vh; }
-.sidebar{ width:250px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; position:sticky; top:0; height:100vh; z-index:40; transition:width .18s ease; }
-.sidebar.collapsed{ width:74px; }
-.sb-brand{ display:flex; align-items:center; gap:11px; padding:0 16px; min-height:65px; border-bottom:1px solid var(--border); }
-.sb-logo{ width:36px; height:36px; flex-shrink:0; border-radius:9px; background:var(--ink); color:#fff; font-family:'JetBrains Mono',monospace; font-weight:700; font-size:14px; letter-spacing:.02em; display:flex; align-items:center; justify-content:center; }
-.sb-brand-text{ display:flex; flex-direction:column; min-width:0; }
-.sb-ws-name{ font-size:13.5px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.sb-ws-sub{ font-size:11px; color:var(--ink-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.sidebar.collapsed .sb-brand{ justify-content:center; padding:0; }
-.sidebar.collapsed .sb-brand-text{ display:none; }
-.sb-close{ display:none; margin-left:auto; border:none; background:transparent; color:var(--ink-soft); cursor:pointer; padding:5px; border-radius:6px; }
-.sb-close:hover{ background:#F1F2F6; color:var(--ink); }
-.sb-nav{ display:flex; flex-direction:column; gap:3px; padding:12px 10px; flex:1; overflow-y:auto; }
-.sb-nav-item{ display:flex; align-items:center; gap:11px; width:100%; padding:9px 11px; border:none; background:transparent; border-radius:9px; font-size:13.5px; font-weight:700; color:var(--ink-soft); cursor:pointer; font-family:inherit; text-align:left; }
-.sb-nav-item svg{ flex-shrink:0; }
-.sb-nav-item:hover{ background:#F1F2F6; color:var(--ink); }
-.sb-nav-item.active{ background:#FEF3E2; color:var(--accent-deep); }
-.sidebar.collapsed .sb-nav-item{ justify-content:center; padding:9px; }
-.sidebar.collapsed .sb-nav-label{ display:none; }
-.sb-footer{ padding:10px; border-top:1px solid var(--border); }
-.sb-collapse{ display:flex; align-items:center; gap:11px; width:100%; padding:9px 11px; border:none; background:transparent; border-radius:9px; font-size:12.5px; font-weight:700; color:var(--ink-soft); cursor:pointer; font-family:inherit; }
-.sb-collapse:hover{ background:#F1F2F6; color:var(--ink); }
-.sidebar.collapsed .sb-collapse{ justify-content:center; padding:9px; }
-.main-area{ flex:1; min-width:0; display:flex; flex-direction:column; }
-.menu-btn{ display:none; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:6px 8px; cursor:pointer; color:var(--ink); align-items:center; }
-.sb-backdrop{ display:none; }
-
-.topbar{ display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 28px; background:var(--surface); border-bottom:1px solid var(--border); flex-wrap:wrap; }
-.brandmark{ display:flex; align-items:center; gap:10px; }
-.brandmark .mark{ font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:.06em; background:var(--ink); color:#fff; padding:5px 9px; border-radius:6px; font-size:13px; }
-.brandmark .sub{ font-size:12.5px; color:var(--ink-soft); }
-.topbar-filters{ display:flex; align-items:center; gap:8px; margin-left:auto; min-width:0; }
-.topbar-account-select{ flex-shrink:1; min-width:0; }
-.topbar-account-select select{ min-width:280px; max-width:390px; }
-.topbar-brand-select{ flex-shrink:1; min-width:0; }
-.topbar-brand-select select{ min-width:210px; max-width:280px; }
-.live-wrap{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--ink-soft); }
-.live-dot{ width:8px; height:8px; border-radius:50%; background:var(--pos); animation:pulse 2s infinite; }
-.refresh-btn{ border:1px solid var(--border); background:var(--surface); border-radius:7px; padding:5px 7px; cursor:pointer; display:flex; align-items:center; color:var(--ink-soft); }
-.spin{ animation:spin 1s linear infinite; }
-@keyframes spin{ from{transform:rotate(0deg);} to{transform:rotate(360deg);} }
-@keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(30,142,90,.45);} 70%{box-shadow:0 0 0 6px rgba(30,142,90,0);} 100%{box-shadow:0 0 0 0 rgba(30,142,90,0);} }
-.container{ width:100%; max-width:1240px; margin:0 auto; padding:22px 24px 0; min-width:0; }
-.tabs{ display:inline-flex; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:4px; gap:2px; }
-.tab{ border:none; background:transparent; padding:8px 16px; font-size:13.5px; font-weight:700; color:var(--ink-soft); border-radius:9px; cursor:pointer; font-family:inherit; }
-.tab.active{ background:var(--ink); color:#fff; }
-.controls-bar{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:16px; flex-wrap:wrap; }
-.dashboard-controls{ justify-content:flex-end; }
-.chip-row{ display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
-.chip{ border:1px solid var(--border); background:var(--surface); padding:6px 12px; font-size:12.5px; font-weight:700; border-radius:8px; cursor:pointer; color:var(--ink-soft); font-family:inherit; }
-.chip.active{ border-color:var(--accent-deep); background:#FEF3E2; color:var(--accent-deep); }
-.select{ position:relative; display:inline-flex; align-items:center; }
-.select select{ appearance:none; border:1px solid var(--border); background:var(--surface); padding:8px 34px 8px 12px; border-radius:9px; font-size:13px; font-weight:700; color:var(--ink); font-family:inherit; cursor:pointer; min-width:230px; }
-.select svg{ position:absolute; right:10px; pointer-events:none; color:var(--ink-soft); }
-.brand-panel{ margin-top:14px; background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:14px 16px; }
-.brand-panel-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px; }
-.badge-count{ font-size:11.5px; font-weight:700; color:var(--accent-deep); background:#FEF3E2; padding:3px 9px; border-radius:999px; }
-.check-grid{ display:flex; flex-wrap:wrap; gap:10px; }
-.check-item{ display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600; border:1px solid var(--border); padding:6px 10px; border-radius:9px; cursor:pointer; background:#FBFBFD; }
-.check-item input{ accent-color:var(--accent-deep); }
-.reset-link{ font-size:12px; color:var(--accent-deep); background:none; border:none; cursor:pointer; font-weight:700; font-family:inherit; }
-.custom-range{ display:flex; gap:8px; align-items:center; }
-.custom-range input[type=date]{ border:1px solid var(--border); border-radius:8px; padding:6px 8px; font-size:12.5px; font-family:inherit; }
-.error-banner{ margin-top:14px; background:#FDECEC; border:1px solid #F3C4C4; color:#9A2E2E; border-radius:10px; padding:10px 14px; font-size:13px; display:flex; align-items:center; gap:8px; }
-.kpi-grid{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:18px; }
-.kpi-card{ background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:16px 18px; }
-.kpi-label{ font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-soft); }
-.kpi-value{ font-size:25px; font-weight:700; margin-top:8px; letter-spacing:-0.01em; }
-.kpi-period{ font-size:11.5px; color:var(--ink-soft); margin-top:4px; }
-.compare-row{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:14px; }
-.compare-chip{ background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:13px 16px; }
-.compare-chip .clabel{ font-size:11.5px; color:var(--ink-soft); font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-.compare-chip .cval{ display:flex; align-items:center; gap:6px; font-size:18px; font-weight:700; margin-top:6px; font-family:'JetBrains Mono',monospace; }
-.compare-chip .cnote{ font-size:11px; color:var(--ink-soft); margin-top:3px; }
-.up{ color:var(--pos); } .down{ color:var(--neg); } .flat{ color:var(--ink-soft); }
-.panel{ background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:18px 20px; margin-top:18px; }
-.panel-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px; }
-.panel-title{ font-size:15px; font-weight:700; }
-.seg{ display:inline-flex; background:#F1F2F6; border-radius:8px; padding:3px; }
-.seg button{ border:none; background:transparent; padding:5px 12px; font-size:12px; font-weight:700; border-radius:6px; cursor:pointer; color:var(--ink-soft); font-family:inherit; }
-.seg button.active{ background:#fff; color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.08); }
-.chart-wrap{ height:280px; margin-top:10px; }
-.breakdown-grid{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
-.bar-list{ display:flex; flex-direction:column; gap:9px; margin-top:10px; max-height:360px; overflow-y:auto; padding-right:4px; }
-.bar-row{ display:grid; grid-template-columns:148px 1fr 118px; align-items:center; gap:10px; font-size:12.5px; }
-.bar-row .rlabel{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:700; }
-.bar-row.active .rlabel{ color:var(--accent-deep); }
-.bar-track{ height:8px; background:var(--grid-line); border-radius:5px; overflow:hidden; }
-.bar-fill{ height:100%; background:#C9CEDC; border-radius:5px; }
-.bar-fill.active{ background:var(--accent); }
-.rvalue{ text-align:right; font-weight:700; white-space:nowrap; }
-.empty-note{ font-size:12.5px; color:var(--ink-soft); padding:12px 0; }
-.disclosure{ margin-top:14px; font-size:12px; color:var(--ink-soft); background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px 16px; }
-.disclosure summary{ cursor:pointer; font-weight:700; color:var(--ink); }
-.native-row{ display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--border); font-size:12.5px; }
-.native-row:last-child{ border-bottom:none; }
-.footer-note{ margin-top:18px; font-size:11.5px; color:var(--ink-soft); line-height:1.6; padding:14px 4px 6px; }
-.footer-note code{ font-family:'JetBrains Mono',monospace; font-size:11px; background:#F1F2F6; padding:1px 5px; border-radius:5px; }
-
-/* ---- Daily Reporting table ---- */
-.page-title{ font-size:19px; font-weight:800; letter-spacing:-0.01em; }
-.page-sub{ font-size:12px; color:var(--ink-soft); margin-top:2px; }
-.daily-scroll{ margin-top:12px; overflow-x:auto; -webkit-overflow-scrolling:touch; }
-.daily-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12.5px; min-width:760px; }
-.daily-table th, .daily-table td{ padding:9px 12px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
-.daily-table thead th{ font-size:11px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em; border-bottom:1px solid var(--border); background:var(--surface); }
-.daily-table th.dt-metric, .daily-table td.dt-metric{ text-align:left; font-weight:700; position:sticky; left:0; background:var(--surface); z-index:1; }
-.daily-table td.dt-metric{ color:var(--ink); }
-.daily-table th.dt-month, .daily-table td.dt-month{ background:#F3F6FC; }
-.daily-table th.dt-mtd, .daily-table td.dt-mtd{ background:#FEF3E2; color:var(--accent-deep); font-weight:700; border-left:1px solid var(--border); border-right:2px solid var(--border); }
-.daily-table tbody tr:hover td:not(.dt-mtd){ background:#FAFBFD; }
-.daily-table tr.dt-row-highlight td{ background:#FBEFD8; font-weight:700; }
-.daily-table tr.dt-row-highlight td.dt-mtd{ background:#F7E2BE; }
-.daily-table tr.dt-row-highlight td.dt-metric{ background:#FBEFD8; }
-
-/* ---- FBA Shipment Plan ---- */
-.plan-controls{ display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; margin-top:14px; }
-.plan-field{ display:flex; flex-direction:column; gap:5px; }
-.plan-field-label{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
-.plan-field input[type=number]{ border:1px solid var(--border); border-radius:9px; padding:8px 12px; font-size:13px; font-weight:700; font-family:inherit; color:var(--ink); width:130px; }
-.plan-search{ flex:1; min-width:200px; }
-.plan-search-wrap{ display:flex; align-items:center; gap:8px; border:1px solid var(--border); border-radius:9px; padding:0 12px; background:var(--surface); }
-.plan-search-wrap svg{ color:var(--ink-soft); flex-shrink:0; }
-.plan-search-wrap input{ border:none; outline:none; padding:9px 0; font-size:13px; font-family:inherit; color:var(--ink); width:100%; background:transparent; }
-.plan-export-btn{ display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:36px; padding:8px 12px; border:1px solid var(--accent-deep); border-radius:8px; background:var(--surface); color:var(--accent-deep); font:700 13px inherit; cursor:pointer; white-space:nowrap; }
-.plan-export-btn:hover:not(:disabled){ background:#FEF3E2; }
-.plan-export-btn:disabled{ opacity:.5; cursor:not-allowed; }
-.plan-freshness{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--ink-soft); }
-.plan-freshness strong{ color:var(--ink); font-weight:700; }
-.plan-fresh-sep{ color:var(--border); }
-.plan-stat-row{ display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:14px; }
-.plan-stat{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px 14px; }
-.plan-stat-label{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
-.plan-stat-value{ font-size:20px; font-weight:700; margin-top:5px; }
-.plan-scroll{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
-.plan-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12.5px; min-width:1080px; }
-.plan-table th, .plan-table td{ padding:9px 11px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
-.plan-table thead th{ font-size:10.5px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em; background:#FAFBFD; position:sticky; top:0; z-index:2; }
-.plan-table th.pt-left, .plan-table td.pt-left{ text-align:left; }
-.plan-table .pt-sortable{ cursor:pointer; user-select:none; }
-.plan-table .pt-sortable:hover{ color:var(--ink); }
-.plan-table th.pt-sorted{ color:var(--accent-deep); }
-.pt-th-inner{ display:inline-flex; align-items:center; gap:4px; }
-.pt-th-inner .pt-th-idle{ opacity:.4; }
-.plan-table th.pt-id, .plan-table td.pt-id{ text-align:left; position:sticky; left:0; background:var(--surface); z-index:1; min-width:230px; max-width:300px; border-right:1px solid var(--border); }
-.plan-table thead th.pt-id{ z-index:3; background:#FAFBFD; }
-.pt-name{ font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:280px; }
-.pt-meta{ font-size:11px; color:var(--ink-soft); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:280px; }
-.pt-brand{ font-size:11px; color:var(--accent-deep); font-weight:700; margin-top:2px; }
-.plan-table td.pt-strong{ font-weight:700; color:var(--ink); }
-.plan-table tbody tr:hover td{ background:#FAFBFD; }
-.plan-table tbody tr:hover td.pt-id{ background:#F4F6FA; }
-.plan-table tr.plan-restock td{ background:#FEF3E2; }
-.plan-table tr.plan-restock td.pt-id{ background:#FDEBCB; box-shadow:inset 3px 0 0 var(--accent); }
-.plan-table tr.plan-restock:hover td{ background:#FCEBCF; }
-.pt-badge{ display:inline-block; font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; }
-.pt-badge-restock{ background:#FCE4C4; color:#8A5A12; }
-.pt-badge-ok{ background:#E6F2EB; color:var(--pos); }
-.plan-table tfoot td{ position:sticky; bottom:0; background:#F1F2F6; font-weight:700; border-top:1px solid var(--border); border-bottom:none; z-index:1; }
-.plan-table tfoot td.pt-id{ background:#F1F2F6; z-index:2; }
-.keyword-rank-table{ min-width:1280px; }
-.keyword-rank-table .keyword-query{ text-align:left; white-space:normal; min-width:190px; max-width:280px; line-height:1.35; }
-.keyword-rank-table .keyword-lever{ text-align:left; white-space:normal; min-width:210px; max-width:270px; color:var(--ink-soft); line-height:1.35; }
-.keyword-bad{ color:#D94141; font-weight:700; }
-.keyword-good{ color:#069669; font-weight:700; }
-
-/* ---- Amazon Reconciliation ---- */
-.reconciliation-page{ padding-bottom:30px; }
-.recon-month-picker{ display:flex; align-items:center; gap:8px; border:1px solid var(--border); background:var(--surface); border-radius:8px; padding:7px 10px; }
-.recon-month-picker label{ font-size:11px; font-weight:700; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.04em; }
-.recon-month-picker select,.recon-select select{ border:0; outline:0; background:transparent; color:var(--ink); font:700 13px inherit; }
-.recon-freshness{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:14px; font-size:12px; color:var(--ink-soft); }
-.recon-freshness strong{ color:var(--ink); }
-.recon-notice{ display:flex; align-items:flex-start; gap:8px; margin-top:12px; padding:10px 12px; border:1px solid #F3D9A8; border-radius:8px; background:#FEF3E2; color:#7B5413; font-size:12px; line-height:1.45; }
-.recon-notice svg{ flex:none; margin-top:1px; }
-.recon-empty{ min-height:200px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; color:var(--ink-soft); margin-top:14px; }
-.recon-kpis{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:14px; }
-.recon-kpi{ border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:var(--surface); min-height:92px; }
-.recon-kpi-label{ color:var(--ink-soft); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-.recon-kpi-value{ color:var(--ink); font-size:18px; font-weight:700; margin-top:7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.recon-kpi-note{ color:var(--ink-soft); font-size:11px; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.recon-chart-grid{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
-.recon-chart-panel{ min-height:270px; }
-.recon-chart-wrap{ height:205px; }
-.recon-donut-wrap{ height:205px; display:flex; align-items:center; }
-.recon-donut-legend{ display:flex; flex-direction:column; gap:9px; width:42%; font-size:12px; color:var(--ink-soft); }
-.recon-donut-legend div{ display:grid; grid-template-columns:9px 1fr auto; align-items:center; gap:7px; }
-.recon-donut-legend span{ width:8px; height:8px; border-radius:999px; }
-.recon-donut-legend strong{ color:var(--ink); font-family:'JetBrains Mono',monospace; }
-.recon-overlay-panel,.recon-waterfall-panel,.recon-daily-panel,.recon-explorer-panel{ margin-top:14px; }
-.recon-overlay-wrap{ height:290px; }
-.recon-waterfall{ display:flex; flex-direction:column; gap:9px; }
-.recon-waterfall-row{ display:grid; grid-template-columns:130px minmax(90px,1fr) 130px; gap:10px; align-items:center; font-size:12px; }
-.recon-waterfall-row > span{ color:var(--ink-soft); }
-.recon-waterfall-row > strong{ font-family:'JetBrains Mono',monospace; text-align:right; font-size:11.5px; }
-.recon-waterfall-track{ height:10px; border-radius:3px; overflow:hidden; background:#EEF1F6; }
-.recon-waterfall-fill{ height:100%; min-width:2px; border-radius:3px; }
-.recon-waterfall-fill.positive{ background:#149B67; }.recon-waterfall-fill.negative{ background:#DF5960; }.recon-waterfall-fill.net{ background:#3F84C5; }
-.recon-table-scroll{ overflow-x:auto; -webkit-overflow-scrolling:touch; }
-.recon-daily-table,.recon-table{ border-collapse:separate; border-spacing:0; width:100%; font-size:12px; min-width:760px; }
-.recon-daily-table th,.recon-daily-table td,.recon-table th,.recon-table td{ padding:9px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--border); }
-.recon-daily-table th,.recon-table th{ color:var(--ink-soft); font-size:10.5px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; background:#FAFBFD; }
-.recon-daily-table th:first-child,.recon-daily-table td:first-child,.recon-table th.recon-left,.recon-table td:first-child{ text-align:left; }
-.recon-table{ min-width:1720px; }
-.recon-table th{ cursor:pointer; user-select:none; position:sticky; top:0; z-index:1; }
-.recon-table th span{ display:inline-flex; align-items:center; gap:4px; }
-.recon-table th:hover{ color:var(--ink); }
-.recon-table tbody tr:hover td{ background:#FAFBFD; }
-.recon-row-pending td:first-child{ box-shadow:inset 3px 0 #E69B28; }.recon-row-cancelled td:first-child{ box-shadow:inset 3px 0 #DF5960; }.recon-row-refunded td:first-child,.recon-row-settled-refunded td:first-child{ box-shadow:inset 3px 0 #3F84C5; }.recon-row-settled td:first-child{ box-shadow:inset 3px 0 #149B67; }
-.content-alerts-table{ min-width:1180px; }.content-alerts-table th:first-child,.content-alerts-table td:first-child{ text-align:left; }.content-preview{ display:block; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-soft); }
-.recon-order-id button{ display:inline-flex; align-items:center; gap:5px; border:0; padding:0; background:transparent; color:#244E8A; cursor:pointer; font:600 11px 'JetBrains Mono',monospace; }
-.recon-order-id button:hover{ text-decoration:underline; }
-.recon-badge,.recon-cross-badge{ display:inline-block; border-radius:999px; padding:3px 7px; font-size:10.5px; font-weight:700; }
-.recon-badge.settled{ background:#E6F2EB; color:#087D50; }.recon-badge.pending{ background:#FEF0D9; color:#95600B; }.recon-badge.cancelled{ background:#FCE6E7; color:#B43D44; }.recon-badge.refunded,.recon-badge.settled-refunded{ background:#E6F0FA; color:#2A639B; }.recon-cross-badge{ border:1px solid #EDA73C; color:#965A07; background:#FFF8E9; }
-.recon-filters{ display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px; margin:0 0 14px; }
-.recon-search{ flex:1; min-width:230px; }.recon-select{ min-width:118px; }.recon-select select{ border:1px solid var(--border); border-radius:8px; padding:8px 10px; background:var(--surface); }
-.recon-filters input[type=date]{ border:1px solid var(--border); border-radius:8px; padding:8px 9px; font:600 12px inherit; color:var(--ink); background:var(--surface); }
-.recon-pagination{ display:flex; justify-content:flex-end; align-items:center; gap:5px; flex-wrap:wrap; padding-top:12px; }
-.recon-pagination button{ min-width:31px; border:1px solid var(--border); border-radius:6px; padding:5px 8px; color:var(--ink-soft); background:var(--surface); font:600 12px inherit; cursor:pointer; }.recon-pagination button.active{ border-color:var(--accent-deep); background:#FEF3E2; color:var(--accent-deep); }.recon-pagination button:disabled{ opacity:.45; cursor:not-allowed; }
-
-/* ---- SKU P&L Analyzer ---- */
-.skupl-kpis{ display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin-top:14px; }
-.skupl-kpi{ background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px 13px; }
-.skupl-kpi-label{ font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--ink-soft); }
-.skupl-kpi-value{ font-size:17px; font-weight:700; margin-top:5px; white-space:nowrap; }
-.sku-neg{ color:var(--neg); } .sku-pos{ color:var(--pos); } .sku-warn{ color:var(--accent-deep); }
-.skupl-insights{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
-.skupl-rank{ display:flex; flex-direction:column; margin-top:6px; }
-.skupl-rank-row{ display:grid; grid-template-columns:24px 1fr auto; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--grid-line); }
-.skupl-rank-row:last-child{ border-bottom:none; }
-.skupl-rank-num{ font:700 12px 'JetBrains Mono',monospace; color:var(--ink-soft); }
-.skupl-rank-name{ min-width:0; font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; flex-direction:column; }
-.skupl-rank-sub{ font-size:10.5px; color:var(--ink-soft); font-weight:500; overflow:hidden; text-overflow:ellipsis; }
-.skupl-rank-val{ text-align:right; font-weight:700; font-size:12.5px; white-space:nowrap; display:flex; flex-direction:column; }
-.skupl-rank-margin{ font-size:10.5px; color:var(--ink-soft); font-weight:600; }
-.skupl-leaks{ display:flex; flex-direction:column; gap:9px; margin-top:8px; max-height:340px; overflow-y:auto; }
-.skupl-leak-row{ border:1px solid var(--border); border-radius:9px; padding:8px 10px; background:#FBFBFD; }
-.skupl-leak-head{ display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:8px; }
-.skupl-leak-name{ min-width:0; font-size:12.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.skupl-leak-profit{ font-weight:700; font-size:12px; white-space:nowrap; }
-.skupl-leak-action{ font-size:11.5px; color:var(--ink-soft); margin-top:4px; line-height:1.45; }
-.skupl-toolbar{ display:flex; align-items:flex-end; gap:12px; flex-wrap:wrap; padding:14px 16px; border-bottom:1px solid var(--border); }
-.skupl-toolbar .plan-field select{ min-height:36px; border:1px solid var(--border); border-radius:8px; padding:7px 10px; font:600 13px inherit; color:var(--ink); background:var(--surface); }
-.skupl-search{ flex:1; min-width:200px; }
-.skupl-toolbar-spacer{ flex:1; }
-.skupl-cogs-cell{ white-space:nowrap; }.skupl-cogs-cell .icon-action{ margin-left:5px; vertical-align:middle; }
-.icon-action{ display:inline-grid; place-items:center; width:27px; height:27px; padding:0; border:1px solid var(--border); border-radius:6px; color:var(--ink-soft); background:var(--surface); cursor:pointer; }.icon-action:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
-.cogs-modal-backdrop{ position:fixed; inset:0; z-index:50; display:grid; place-items:center; padding:18px; background:rgba(12,18,32,.36); }.cogs-modal{ width:min(100%,420px); border:1px solid var(--border); border-radius:8px; background:var(--surface); box-shadow:0 20px 46px rgba(10,12,20,.26); padding:18px; }.cogs-modal-head{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }.cogs-modal-meta{ margin-top:8px; font-size:11px; color:var(--ink-soft); }.cogs-modal-input{ display:flex; flex-direction:column; gap:6px; margin-top:18px; }.cogs-modal-input input{ width:100%; min-height:38px; border:1px solid var(--border); border-radius:7px; padding:8px 10px; font:600 14px inherit; color:var(--ink); background:var(--surface); }.cogs-modal-error{ margin-top:8px; color:var(--neg); font-size:12px; font-weight:600; }.cogs-modal-actions{ display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin-top:18px; }.secondary-action{ display:inline-flex; align-items:center; gap:6px; min-height:34px; border:1px solid var(--border); border-radius:7px; padding:7px 10px; color:var(--ink-soft); background:var(--surface); font:600 12px inherit; cursor:pointer; }.secondary-action:hover{ border-color:var(--accent-deep); color:var(--accent-deep); }
-.pt-badge.sku-badge-bad{ background:#FCE4E4; color:var(--neg); }
-.pt-badge.sku-badge-warn{ background:#FCE4C4; color:#8A5A12; }
-.pt-badge.sku-badge-ok{ background:#E6F2EB; color:var(--pos); }
-.skupl-table tr.skupl-row-loss td{ background:#FDECEC; }
-.skupl-table tr.skupl-row-loss td.pt-id{ background:#FBE0E0; box-shadow:inset 3px 0 0 var(--neg); }
-.skupl-table tr.skupl-row-loss:hover td{ background:#FBE0E0; }
-.auth-root{ min-height:100vh; display:grid; place-items:center; padding:24px; background:var(--bg); font-family:'Manrope',-apple-system,'Segoe UI',sans-serif; color:var(--ink); }.auth-panel{ width:min(100%,400px); border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:28px; box-shadow:0 18px 46px rgba(18,23,43,.1); }.auth-logo{ display:grid; place-items:center; width:40px; height:40px; border-radius:8px; background:#10172E; color:#fff; font-weight:800; font-size:12px; }.auth-title{ margin-top:18px; font-size:22px; font-weight:800; }.auth-sub{ margin-top:7px; color:var(--ink-soft); font-size:13px; line-height:1.55; }.auth-field{ display:flex; flex-direction:column; gap:6px; margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.auth-field input,.auth-field select{ min-height:39px; width:100%; border:1px solid var(--border); border-radius:7px; padding:8px 10px; color:var(--ink); background:var(--surface); font:600 14px 'Manrope',sans-serif; text-transform:none; letter-spacing:0; }.auth-submit{ width:100%; min-height:40px; margin-top:20px; border:1px solid #10172E; border-radius:7px; background:#10172E; color:#fff; cursor:pointer; font:700 13px 'Manrope',sans-serif; }.auth-submit:disabled{ opacity:.6; cursor:not-allowed; }.auth-error,.auth-success{ display:flex; align-items:center; gap:7px; margin-top:14px; padding:9px 10px; border-radius:6px; font-size:12px; font-weight:700; }.auth-error{ color:var(--neg); background:#FDECEC; }.auth-success{ color:var(--pos); background:#E6F2EB; }.auth-note{ margin-top:13px; color:var(--ink-soft); font-size:11.5px; line-height:1.5; text-align:center; }
-.auth-link{ display:block; width:100%; margin-top:10px; border:0; background:transparent; color:var(--accent-deep); cursor:pointer; font:700 11.5px 'Manrope',sans-serif; }
-.access-heading{ align-items:center; }.access-grid{ display:grid; grid-template-columns:minmax(280px,.85fr) minmax(380px,1.5fr); gap:14px; margin-top:14px; }.access-invite,.access-users,.access-editor{ padding:16px; }.access-invite .panel-title,.access-users .panel-title{ display:flex; align-items:center; gap:8px; }.access-field-label{ margin-top:17px; color:var(--ink-soft); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; }.access-account-list{ max-height:240px; overflow:auto; margin-top:8px; border:1px solid var(--border); border-radius:7px; }.access-account-check{ display:flex; align-items:flex-start; gap:8px; padding:9px 10px; border-bottom:1px solid var(--border); color:var(--ink); font-size:12.5px; font-weight:600; cursor:pointer; }.access-account-check:last-child{ border-bottom:0; }.access-account-check input{ margin-top:2px; accent-color:var(--accent-deep); }.access-user-list{ margin-top:12px; border-top:1px solid var(--border); }.access-user-row{ width:100%; display:grid; grid-template-columns:minmax(160px,1fr) auto auto; align-items:center; gap:12px; padding:11px 2px; border:0; border-bottom:1px solid var(--border); background:transparent; color:var(--ink); font:inherit; text-align:left; cursor:pointer; }.access-user-row:hover,.access-user-row.selected{ background:#FBF2E4; }.access-user-row strong,.access-user-row small{ display:block; }.access-user-row strong{ font-size:12.5px; }.access-user-row small{ margin-top:3px; color:var(--ink-soft); font-size:11px; }.access-role{ display:inline-flex; justify-content:center; min-width:60px; padding:4px 7px; border-radius:999px; background:#EEF1F7; color:var(--ink-soft); font-size:10px; font-weight:800; text-transform:uppercase; }.access-role.role-admin{ background:#E7EDF9; color:#254D92; }.access-role.role-editor{ background:#FBEFD8; color:#8A5A12; }.access-editor{ margin-top:14px; max-width:720px; }.access-notice{ margin-top:14px; padding:10px 12px; border:1px solid #B8DFC8; border-radius:7px; background:#EEF8F1; color:var(--pos); font-size:12px; font-weight:700; }.access-empty{ margin-top:14px; color:var(--ink-soft); font-size:13px; }
-/* ---- Insight Engine (shared by the six insight reports) ---- */
-.priority-panel{ margin-top:16px; }
-.insight-list{ display:flex; flex-direction:column; gap:10px; margin-top:10px; }
-.insight-row{ border:1px solid var(--border); border-left:3px solid var(--border); border-radius:10px; padding:11px 13px; background:#FBFBFD; }
-.insight-row.insight-high{ border-left-color:var(--neg); background:#FEF7F7; }
-.insight-row.insight-medium{ border-left-color:var(--accent); background:#FFFCF5; }
-.insight-row.insight-low{ border-left-color:#C9CEDC; }
-.insight-head{ display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:9px; }
-.insight-title{ font-size:13px; font-weight:700; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.insight-money{ font-size:13px; font-weight:700; white-space:nowrap; color:var(--ink); }
-.insight-why{ margin-top:6px; font-size:12px; color:var(--ink-soft); line-height:1.5; }
-.insight-evidence{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-.insight-chip{ display:inline-flex; align-items:baseline; gap:5px; border:1px solid var(--border); border-radius:999px; padding:2px 9px; background:var(--surface); font-size:11px; }
-.insight-chip em{ font-style:normal; color:var(--ink-soft); }
-.insight-chip b{ font-weight:700; color:var(--ink); font-size:11px; }
-.insight-action{ margin-top:8px; font-size:12px; color:var(--ink); line-height:1.5; }
-.insight-action strong{ color:var(--accent-deep); }
-.insight-foot{ margin-top:7px; font-size:10.5px; color:var(--ink-soft); line-height:1.45; }
-.movers-table{ min-width:1500px; }
-.movers-driver{ text-align:left; }
-.movers-unattributed{ color:var(--ink-soft); font-size:11.5px; }
-.pt-badge.driver-traffic{ background:#E6F0FA; color:#2A639B; }
-.pt-badge.driver-conversion{ background:#EDE7FA; color:#5B3E9B; }
-.pt-badge.driver-price{ background:#FCE4C4; color:#8A5A12; }
-.listing-health-table{ min-width:1320px; }
-.listing-health-table .listing-issue{ text-align:left; white-space:normal; min-width:220px; max-width:340px; line-height:1.4; color:var(--ink-soft); font-size:11.5px; }
-.buybox-table{ min-width:1340px; }
-.buybox-table .buybox-cause{ white-space:normal; min-width:230px; max-width:320px; }
-.buybox-cause-detail{ margin-top:4px; font-size:11px; color:var(--ink-soft); line-height:1.4; }
-.returns-table{ min-width:1460px; }
-.returns-reason{ text-align:left; white-space:normal; min-width:200px; max-width:300px; line-height:1.4; }
-.ppc-table{ min-width:1420px; }
-.ppc-term{ text-align:left; white-space:normal; min-width:200px; max-width:300px; line-height:1.35; }
-.optimizer-table{ min-width:1480px; }
-.optimizer-note{ text-align:left; white-space:normal; min-width:230px; max-width:330px; line-height:1.4; color:var(--ink-soft); font-size:11.5px; }
-.feed-source{ display:inline-block; font-size:10.5px; font-weight:700; color:var(--ink-soft); background:#F1F2F6; border-radius:999px; padding:2px 8px; }
-.report-tabs{ display:inline-flex; background:#F1F2F6; border-radius:9px; padding:3px; flex-wrap:wrap; gap:2px; }
-.report-tabs button{ border:none; background:transparent; padding:6px 13px; font-size:12px; font-weight:700; border-radius:7px; cursor:pointer; color:var(--ink-soft); font-family:inherit; }
-.report-tabs button.active{ background:#fff; color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.08); }
-
-@media (max-width:900px){
-  .kpi-grid,.compare-row{ grid-template-columns:repeat(2,1fr);} .breakdown-grid{ grid-template-columns:1fr;}
-  .insight-head{ grid-template-columns:1fr; gap:5px; }
-  .insight-title{ white-space:normal; }
-  .insight-money{ text-align:left; }
-  .plan-stat-row{ grid-template-columns:repeat(3,1fr); }
-  .recon-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }.recon-chart-grid{ grid-template-columns:1fr; }
-  .skupl-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }.skupl-insights{ grid-template-columns:1fr; }
-  .access-grid{ grid-template-columns:1fr; }.access-user-row{ grid-template-columns:minmax(130px,1fr) auto; }.access-user-row > :last-child{ grid-column:2; }
-  /* Sidebar becomes an off-canvas drawer; collapse mode is ignored here. */
-  .sidebar{ position:fixed; left:0; top:0; height:100vh; width:270px; transform:translateX(-100%); transition:transform .2s ease; box-shadow:0 0 44px rgba(10,12,20,.22); }
-  .sidebar.collapsed{ width:270px; }
-  .sidebar.collapsed .sb-brand{ justify-content:flex-start; padding:0 16px; }
-  .sidebar.collapsed .sb-brand-text{ display:flex; }
-  .sidebar.collapsed .sb-nav-item{ justify-content:flex-start; padding:9px 11px; }
-  .sidebar.collapsed .sb-nav-label{ display:inline; }
-  .sidebar.mobile-open{ transform:translateX(0); }
-  .sb-close{ display:inline-flex; }
-  .sb-footer{ display:none; }
-  .menu-btn{ display:inline-flex; }
-  .sb-backdrop{ display:block; position:fixed; inset:0; background:rgba(10,12,20,.42); z-index:35; }
-  .topbar{ align-items:flex-start; }
-  .topbar-filters{ order:3; width:100%; margin-left:0; display:grid; grid-template-columns:minmax(0,1.5fr) minmax(160px,1fr); }
-  .topbar-account-select,.topbar-brand-select{ width:100%; }
-  .topbar-account-select select,.topbar-brand-select select{ width:100%; max-width:none; }
-  .live-wrap{ margin-left:auto; }
-}
-@media (max-width:560px){ .kpi-grid,.compare-row{ grid-template-columns:1fr;} .bar-row{ grid-template-columns:104px 1fr 80px;} .topbar{ padding:14px 16px;} .topbar-filters{ grid-template-columns:1fr; } .container{ padding:16px 14px 0;} .plan-stat-row{ grid-template-columns:repeat(2,1fr);} .plan-table th.pt-id, .plan-table td.pt-id{ min-width:160px; max-width:190px; } .pt-name,.pt-meta{ max-width:180px; } .recon-kpis{ grid-template-columns:1fr; }.recon-month-picker{ width:100%; justify-content:space-between; }.recon-waterfall-row{ grid-template-columns:100px minmax(70px,1fr) 100px; gap:7px; }.recon-waterfall-row > strong{ font-size:10.5px; }.recon-filters{ display:grid; grid-template-columns:1fr 1fr; }.recon-search{ grid-column:1/-1; min-width:0; } .skupl-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); } }
-@media (prefers-reduced-motion: reduce){ .live-dot{ animation:none;} .spin{ animation:none;} }
-button:focus-visible, select:focus-visible, input:focus-visible{ outline:2px solid var(--accent-deep); outline-offset:2px; }
-`;
 
 export default function App() {
   const [session, setSession] = useState(null);
