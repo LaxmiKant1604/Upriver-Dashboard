@@ -203,6 +203,26 @@ printed a full grid of zeroes that looked like genuinely reported sales.
   That is the documented shared-snapshot read, which never touches DataDoe, and
   it is unchanged by this work.
 
+### Deployment (2026-07-30)
+
+Commit `7bee6ac Redesign frontend as a light-theme analytics workspace` pushed to
+`origin/main` and deployed to production from the repo root with the Vercel CLI:
+deployment `dpl_7rYzRqwL6sFxxUgmUekP3ecU1EXr`
+(`https://upriver-dashboard-iy9uacrxr-laxmikant1604s-projects.vercel.app`),
+`readyState: READY`, aliased to `https://upriverdashboard.vercel.app`.
+
+Post-deployment verification: the production alias returned **HTTP 200**; the
+served HTML carries the new `UPRIVER — Amazon Seller Analytics` title, the
+`color-scheme: light` hint and the webfont `<link>` tags; the served bundle
+(`/assets/index-DPdRMajb.js`) contains the redesign markers `sb-group-label`,
+`crumb-current`, `refresh-cluster`, `metric-spark`, `chart-tip-swatch`,
+`--bg-elevated` and "Nothing saved for this account yet". Access control is
+unaffected: `/api/datadoe?action=accounts` without a Supabase token still returns
+**HTTP 401**, and `/api/access?action=bootstrap-status` still returns
+`{"initialAdminExists":true,"confirmationPending":false}`. The bare deployment
+URL returns 302 (Vercel deployment protection on the non-aliased host), which is
+the project's normal behaviour — verify through the alias.
+
 ### Remaining limitations
 
 - The six insight reports, Reconciliation, SKU P&L, FBA plan, Keyword Rank and
