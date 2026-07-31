@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-31 (Brand View first-use brand loading and focused reports implemented locally; deployment pending)
+Last updated: 2026-07-31 (Brand View first-use loading and focused reports deployed and verified)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-07-31; follow-up deployment pending)
+## Account-scoped brands and Brand View (2026-07-31; follow-up deployed)
 
 ### Completed locally
 
@@ -1170,6 +1170,31 @@ the previous anonymous data API is no longer accessible.
   production URL: the deployed JavaScript contains `brand-portfolio-v1`,
   `Brand View`, and `Portfolio brand` markers. Production URL:
   https://upriverdashboard.vercel.app
+- Follow-up commit **`9b32811`** (`Load portfolio brands on demand`) is pushed
+  and deployed. Vercel deployment **`dpl_8qvfndtCsGjZv4LQBakSGVcwNQ4p`** is
+  assigned to the stable production alias. A production JavaScript check found
+  both the `Load portfolio brands` and `Monthly Country Snapshot` feature
+  markers.
+
+### Vercel deployment learning (2026-07-31)
+
+- The Git-triggered deployment created for commit `9b32811` was `READY` but
+  built the repository root in `0ms` and served an older frontend bundle. This
+  indicates the Vercel project Root Directory setting is currently not being
+  applied correctly to the Git integration, despite the local nested project
+  link recording `rootDirectory: sales-dashboard-live`.
+- The successful corrective deployment was run from the **repository root**
+  with `npx vercel --prod --yes --scope laxmikant1604s-projects`; that command
+  correctly applied the configured `sales-dashboard-live` root once, built
+  Vite (2,384 modules), and updated the stable alias. Do not run that command
+  from inside `sales-dashboard-live` while the Vercel project still has this
+  Root Directory value, because it attempts the invalid nested path
+  `sales-dashboard-live/sales-dashboard-live`.
+- In Vercel Settings -> General, confirm the project Root Directory is exactly
+  `sales-dashboard-live` and save/reconnect the Git integration if future
+  auto-deploys again show a `0ms` root build. Verify every deployment by
+  checking the public bundle for a newly added UI marker before reporting it
+  live.
 
 ## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)
 
