@@ -38,6 +38,12 @@ import {
 import { classifyReturnReason } from "../lib/server/reports/returns.js";
 import { rollupPpcRows } from "../lib/server/reports/ppc.js";
 import { staleSnapshotMatchesReportVersion } from "../lib/server/report-store.js";
+import {
+  decorateDataDoeAccount,
+  publicAccountId,
+  resolveDataDoeAccountIds,
+  scopeDataDoeRows,
+} from "../lib/server/datadoe-connections.js";
 import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell, csvText } from "../src/lib/csv.js";
 import { fmtMoney, nInt, ratio } from "../src/lib/format.js";
@@ -56,6 +62,38 @@ function test(name, fn) {
 }
 
 console.log("Insight Engine");
+
+/* ---------- multi-DataDoe account routing ---------- */
+
+const TEST_CONNECTIONS = [
+  { id: "primary", label: "Primary DataDoe", apiKey: "primary-key", accountPrefix: "" },
+  { id: "secondary", label: "Secondary DataDoe", apiKey: "secondary-key", accountPrefix: "dd-secondary:" },
+];
+
+test("primary DataDoe accounts keep their existing public IDs", () => {
+  assert.equal(publicAccountId(TEST_CONNECTIONS[0], "seller-1"), "seller-1");
+  const account = decorateDataDoeAccount(TEST_CONNECTIONS[0], { id: "seller-1", name: "Primary Store" });
+  assert.equal(account.id, "seller-1");
+  assert.equal(account.name, "Primary Store");
+});
+
+test("secondary DataDoe rows and accounts are safely namespaced", () => {
+  const account = decorateDataDoeAccount(TEST_CONNECTIONS[1], { id: "seller-1", name: "Secondary Store" });
+  assert.equal(account.id, "dd-secondary:seller-1");
+  assert.match(account.name, /Secondary DataDoe/);
+  const rows = scopeDataDoeRows(TEST_CONNECTIONS[1], [{ seller_or_vendor_id: "seller-1", total_sales: 10 }]);
+  assert.equal(rows[0].seller_or_vendor_id, "dd-secondary:seller-1");
+});
+
+test("DataDoe exports reject mixed-organisation account IDs", () => {
+  const secondary = resolveDataDoeAccountIds(["dd-secondary:seller-2"], TEST_CONNECTIONS);
+  assert.equal(secondary.connection.id, "secondary");
+  assert.deepEqual(secondary.rawAccountIds, ["seller-2"]);
+  assert.throws(
+    () => resolveDataDoeAccountIds(["seller-1", "dd-secondary:seller-2"], TEST_CONNECTIONS),
+    /Cross-organisation exports/
+  );
+});
 
 /* ---------- decomposition ---------- */
 

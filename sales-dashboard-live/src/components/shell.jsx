@@ -314,13 +314,12 @@ export function DateRangeSelector({
   return (
     <div className="controls-bar dashboard-controls">
       <div className="chip-row">
-        <div className="segmented" role="radiogroup" aria-label="Date range">
+        <div className="segmented" role="group" aria-label="Date range">
           {RANGE_PRESETS.map((option) => (
             <button
               key={option.value}
               type="button"
-              role="radio"
-              aria-checked={preset === option.value}
+              aria-pressed={preset === option.value}
               className={preset === option.value ? "active" : ""}
               onClick={() => onPresetChange(option.value)}
             >

@@ -1,0 +1,101 @@
+// Server-only DataDoe connection registry.
+//
+// The original DataDoe organisation keeps its existing account IDs so current
+// account permissions, shared snapshots, and Ads history remain valid. A
+// secondary organisation gets a stable prefix, preventing a same-looking raw
+// seller/vendor ID from crossing an organisation boundary.
+
+const PRIMARY_ID = "primary";
+const SECONDARY_ID = "secondary";
+const SECONDARY_PREFIX = "dd-secondary:";
+
+function configured(value) {
+  return Boolean(String(value || "").trim());
+}
+
+export function getDataDoeConnections() {
+  const primaryKey = String(process.env.DATADOE_API_KEY || "").trim();
+  if (!configured(primaryKey)) {
+    throw new Error("DATADOE_API_KEY is not configured.");
+  }
+
+  const connections = [{
+    id: PRIMARY_ID,
+    label: "Primary DataDoe",
+    apiKey: primaryKey,
+    accountPrefix: "",
+  }];
+  const secondaryKey = String(process.env.DATADOE_API_KEY_SECONDARY || "").trim();
+  if (configured(secondaryKey)) {
+    if (secondaryKey === primaryKey) {
+      throw new Error("DATADOE_API_KEY_SECONDARY must be a different DataDoe API key from DATADOE_API_KEY.");
+    }
+    connections.push({
+      id: SECONDARY_ID,
+      label: "Secondary DataDoe",
+      apiKey: secondaryKey,
+      accountPrefix: SECONDARY_PREFIX,
+    });
+  }
+  return connections;
+}
+
+export function publicAccountId(connection, rawAccountId) {
+  const raw = String(rawAccountId || "").trim();
+  if (!raw) throw new Error("DataDoe returned an account without an ID.");
+  return connection.id === PRIMARY_ID ? raw : `${connection.accountPrefix}${raw}`;
+}
+
+export function resolveDataDoeAccountIds(accountIds, connections = getDataDoeConnections()) {
+  const requested = [...new Set((accountIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!requested.length) return null;
+
+  const secondary = connections.find((connection) => connection.id === SECONDARY_ID);
+  const primary = connections.find((connection) => connection.id === PRIMARY_ID);
+  const resolved = requested.map((accountId) => {
+    if (accountId.startsWith(SECONDARY_PREFIX)) {
+      const rawAccountId = accountId.slice(SECONDARY_PREFIX.length).trim();
+      if (!secondary || !rawAccountId) throw new Error("The selected secondary DataDoe account is unavailable.");
+      return { accountId, rawAccountId, connection: secondary };
+    }
+    if (accountId.includes(":")) throw new Error("The selected DataDoe account ID is invalid.");
+    if (!primary) throw new Error("The primary DataDoe connection is unavailable.");
+    return { accountId, rawAccountId: accountId, connection: primary };
+  });
+
+  const connection = resolved[0].connection;
+  if (resolved.some((entry) => entry.connection.id !== connection.id)) {
+    throw new Error("Select accounts from one DataDoe connection at a time. Cross-organisation exports are intentionally blocked.");
+  }
+  return {
+    connection,
+    accountIds: resolved.map((entry) => entry.accountId),
+    rawAccountIds: resolved.map((entry) => entry.rawAccountId),
+  };
+}
+
+export function connectionForApiKey(apiKey, connections = getDataDoeConnections()) {
+  const connection = connections.find((entry) => entry.apiKey === apiKey);
+  if (!connection) throw new Error("The requested DataDoe connection is not configured.");
+  return connection;
+}
+
+export function decorateDataDoeAccount(connection, account) {
+  const id = publicAccountId(connection, account.id);
+  return {
+    ...account,
+    id,
+    dataDoeConnectionId: connection.id,
+    dataDoeConnectionLabel: connection.label,
+    // Make duplicate account names distinguishable in the shared selector
+    // without exposing either API key.
+    name: connection.id === PRIMARY_ID ? account.name : `${account.name} (${connection.label})`,
+  };
+}
+
+export function scopeDataDoeRows(connection, rows) {
+  return (rows || []).map((row) => {
+    if (!row || row.seller_or_vendor_id === undefined || row.seller_or_vendor_id === null) return row;
+    return { ...row, seller_or_vendor_id: publicAccountId(connection, row.seller_or_vendor_id) };
+  });
+}

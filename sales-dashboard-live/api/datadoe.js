@@ -41,8 +41,8 @@ import {
   daysInMonthUTC,
   ddFetch,
   downloadExport,
-  fetchAccounts,
-  fetchExportRows,
+  fetchAccounts as fetchAccountsRaw,
+  fetchExportRows as fetchExportRowsRaw,
   isDateStr,
   isFullCalendarMonthWindow,
   num,
@@ -50,6 +50,13 @@ import {
   pollExport,
   splitDateRangeByMonth,
 } from "../lib/server/datadoe.js";
+import {
+  connectionForApiKey,
+  decorateDataDoeAccount,
+  getDataDoeConnections,
+  resolveDataDoeAccountIds,
+  scopeDataDoeRows,
+} from "../lib/server/datadoe-connections.js";
 import { serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
@@ -57,6 +64,20 @@ import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/ser
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
 import { buildListingOptimizer, OPTIMIZER_REPORT_KEY, OPTIMIZER_VERSION } from "../lib/server/reports/listing-optimizer.js";
+
+// Keep the rest of this legacy route's report builders connection-agnostic.
+// They still receive a normal API key and raw DataDoe seller IDs, while this
+// wrapper returns the stable public account ID for secondary-connection rows.
+async function fetchExportRows(apiKey, ...args) {
+  const rows = await fetchExportRowsRaw(apiKey, ...args);
+  return scopeDataDoeRows(connectionForApiKey(apiKey), rows);
+}
+
+async function fetchAccounts(apiKey) {
+  const connection = connectionForApiKey(apiKey);
+  const accounts = await fetchAccountsRaw(apiKey);
+  return accounts.map((account) => decorateDataDoeAccount(connection, account));
+}
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
@@ -719,21 +740,41 @@ function mergeSalesAndAds(salesRows, adRows) {
 export default async function handler(req, res) {
   try {
     const access = await getDashboardAccess(req);
-    const apiKey = process.env.DATADOE_API_KEY;
-    if (!apiKey) {
-      res.status(500).json({ error: "DATADOE_API_KEY is not set in this deployment's environment variables." });
-      return;
-    }
+    const connections = getDataDoeConnections();
     const action = req.query.action;
+    const publicAccountIds = String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
+    let accountScope = null;
 
-    if (ACCOUNT_SCOPED_ACTIONS.has(action)) {
-      const ids = String(req.query.ids || "").split(",").filter(Boolean);
-      if (ids.length) assertAccountAccess(access, ids);
+    const accountScopedAction = ACCOUNT_SCOPED_ACTIONS.has(action);
+    // `sample` is admin-only diagnostics, but it still needs the same routing
+    // when an administrator explicitly samples a secondary account.
+    const diagnosticAccountScope = action === "sample" && publicAccountIds.length > 0;
+    if (accountScopedAction || diagnosticAccountScope) {
+      if (accountScopedAction && publicAccountIds.length) assertAccountAccess(access, publicAccountIds);
+      accountScope = resolveDataDoeAccountIds(publicAccountIds, connections);
+      // Every existing action below can continue to send DataDoe its raw IDs.
+      // The public, connection-scoped ID remains available in accountScope for
+      // Supabase and response metadata.
+      if (accountScope) req.query.ids = accountScope.rawAccountIds.join(",");
     }
+    const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
 
     if (action === "accounts") {
-      const accounts = await fetchAccounts(apiKey);
+      const accounts = [];
+      const rawAccountOwners = new Map();
+      for (const connection of connections) {
+        const discovered = await fetchAccountsRaw(connection.apiKey);
+        for (const account of discovered) {
+          const rawAccountId = String(account.id || "");
+          const existingConnection = rawAccountOwners.get(rawAccountId);
+          if (existingConnection) {
+            throw new Error(`Amazon account ${rawAccountId} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate connection before syncing so data is never counted twice.`);
+          }
+          rawAccountOwners.set(rawAccountId, connection);
+          accounts.push(decorateDataDoeAccount(connection, account));
+        }
+      }
       const allowedAccounts = access.role === "admin"
         ? accounts
         : accounts.filter((account) => access.accountIds.includes(String(account.id)));
@@ -843,10 +884,10 @@ export default async function handler(req, res) {
       // scheduled seed has completed for an existing deployment.
       let ads;
       if (isSupabaseConfigured()) {
-        const savedAds = await getAdDailyMetrics(sellerOrVendorIds[0], from, to);
+        const savedAds = await getAdDailyMetrics(accountScope.accountIds[0], from, to);
         ads = normalizeAdRows(savedAds.map((row) => ({
           date: row.metric_date,
-          seller_or_vendor_id: sellerOrVendorIds[0],
+          seller_or_vendor_id: accountScope.accountIds[0],
           currency: row.currency,
           ad_sales: row.ad_sales,
           ad_spend: row.ad_spend,
@@ -938,7 +979,7 @@ export default async function handler(req, res) {
       const currencies = [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort();
       const catalogBrands = [...new Set(rows.map((r) => r.brand).filter(Boolean))].sort((a, b) => a.localeCompare(b));
       res.status(200).json({
-        accountId: sellerOrVendorIds[0],
+        accountId: accountScope.accountIds[0],
         from: start,
         to: end,
         months: windows.map((w) => w.from.slice(0, 7)),
@@ -1039,7 +1080,7 @@ export default async function handler(req, res) {
       }
 
       res.status(200).json({
-        accountId: sellerOrVendorIds[0],
+        accountId: accountScope.accountIds[0],
         cadence,
         periods,
         weeklyPeriodCount: weeklyPeriods.length,
@@ -1090,7 +1131,7 @@ export default async function handler(req, res) {
       );
       const events = compactContentChangeEvents(notificationRows, catalogRows);
       res.status(200).json({
-        accountId: sellerOrVendorIds[0],
+        accountId: accountScope.accountIds[0],
         events,
         catalogBrands: catalogBrandNames(catalogRows),
         retrievedAt: new Date().toISOString(),
@@ -1118,7 +1159,7 @@ export default async function handler(req, res) {
       const { completed, current } = planMonthWindows(String(to));
 
       // Authoritative account country (drives US-only AWD logic).
-      const accounts = await fetchAccounts(apiKey);
+      const accounts = await fetchAccountsRaw(apiKey);
       const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
       const isUS = String(account?.country || "").toUpperCase() === "US";
 
@@ -1312,7 +1353,7 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: SALES_MOVERS_REPORT_KEY,
         reportVersion: SALES_MOVERS_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "Sales Movers",
@@ -1331,7 +1372,7 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: LISTING_HEALTH_REPORT_KEY,
         reportVersion: LISTING_HEALTH_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "Listing Health",
@@ -1350,7 +1391,7 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: BUY_BOX_REPORT_KEY,
         reportVersion: BUY_BOX_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "Buy Box Loss",
@@ -1369,7 +1410,7 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: RETURNS_REPORT_KEY,
         reportVersion: RETURNS_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "Returns & Refund Leakage",
@@ -1391,11 +1432,11 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: PPC_REPORT_KEY,
         reportVersion: PPC_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "PPC Performance",
-        build: () => buildPpcPerformance({ apiKey, ids, to }),
+        build: () => buildPpcPerformance({ apiKey, ids, accountId: accountScope.accountIds[0], to }),
       });
       return;
     }
@@ -1410,7 +1451,7 @@ export default async function handler(req, res) {
         refresh: wantsRefresh(req),
         reportKey: OPTIMIZER_REPORT_KEY,
         reportVersion: OPTIMIZER_VERSION,
-        accountId: ids[0],
+        accountId: accountScope.accountIds[0],
         params: { to },
         userId: access.userId,
         label: "Listing & Search Optimizer",

@@ -2200,10 +2200,18 @@ function DashboardApp({ session, access, onSignOut }) {
       else key = r.date;
       // Units and orders ride along on the same bucket so the chart tooltip can
       // show them when — and only when — the source actually supplied them.
-      const bucket = buckets[key] || { value: 0, units: 0, orders: 0 };
+      const bucket = buckets[key] || {
+        value: 0, units: 0, orders: 0, hasUnits: false, hasOrders: false,
+      };
       bucket.value += v;
-      bucket.units += r.total_units_sold || 0;
-      bucket.orders += r.total_orders || 0;
+      if (r.total_units_sold !== undefined && r.total_units_sold !== null) {
+        bucket.units += r.total_units_sold || 0;
+        bucket.hasUnits = true;
+      }
+      if (r.total_orders !== undefined && r.total_orders !== null) {
+        bucket.orders += r.total_orders || 0;
+        bucket.hasOrders = true;
+      }
       buckets[key] = bucket;
     });
     return Object.keys(buckets).sort().map((k) => {
@@ -2551,8 +2559,8 @@ function DashboardApp({ session, access, onSignOut }) {
                           {...props}
                           rows={(point) => [
                             { key: "sales", label: "Sales", value: fmtMoney(point.value, displayCurrency), color: CHART.primary },
-                            point.units ? { key: "units", label: "Units", value: point.units.toLocaleString("en-US") } : null,
-                            hasOrders && point.orders ? { key: "orders", label: "Orders", value: point.orders.toLocaleString("en-US") } : null,
+                            point.hasUnits ? { key: "units", label: "Units", value: point.units.toLocaleString("en-US") } : null,
+                            point.hasOrders ? { key: "orders", label: "Orders", value: point.orders.toLocaleString("en-US") } : null,
                           ]}
                         />
                       )}

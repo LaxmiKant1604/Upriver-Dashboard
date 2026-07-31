@@ -62,7 +62,55 @@ temporarily hold the keys. For an admin-managed, scalable setup, use encrypted
 server-side connection records and an admin-only connection screen. Existing
 user-to-Amazon-account permissions continue to apply after connection mapping;
 they should never grant access merely because a second DataDoe organisation was
-added. No second connection has been configured yet.
+added. The dashboard owner later reported adding the secondary Vercel variable;
+its presence and the second organisation's live account list still require the
+production check recorded below.
+
+### Two-connection implementation (2026-07-31; deployment verification pending)
+
+The report API and automated Ads worker now support the existing primary
+DataDoe organisation plus an optional second one configured as the sensitive
+Vercel variable `DATADOE_API_KEY_SECONDARY`. The browser never receives either
+key.
+
+- Existing primary account IDs remain unchanged, preserving current user
+  permissions, browser caches, Supabase snapshots, COGS overrides and Ads
+  history. Secondary account IDs use the stable prefix `dd-secondary:`. The
+  shared account selector labels secondary entries `Secondary DataDoe` so two
+  similarly named stores can be distinguished.
+- `/api/datadoe?action=accounts` discovers and merges accounts from every
+  configured connection. Each account-scoped report resolves its selected
+  public account ID to one key plus its raw DataDoe seller/vendor ID before
+  exporting. It intentionally rejects a request containing accounts from more
+  than one organisation: DataDoe exports must not mix credentials or data.
+- Returned secondary rows are rewritten to their public prefixed account ID,
+  which keeps dashboard aggregation, local filters and cache keys consistent.
+  Insight-report snapshots use the public ID, while their live DataDoe exports
+  still use the raw ID. PPC's persisted Ads history also uses the public ID.
+- Scheduled Ads sync now discovers, partitions and exports accounts per
+  connection, then saves secondary records under their prefixed ID. The same
+  country cron jobs cover both organisations; no additional cron functions are
+  required. A repeated API key or the same raw Amazon account appearing in both
+  connections fails closed instead of duplicating sales or advertising data.
+- The outstanding redesign review findings are fixed: date presets now use a
+  truthful button group with `aria-pressed` rather than an incomplete ARIA
+  radio group, and the Sales Trend tooltip preserves valid zero unit/order
+  values while still omitting fields that a source did not provide.
+
+**Verification completed locally:** server modules pass `node --check`; `npm
+run verify` passes **53 assertions** (including primary ID preservation,
+secondary row namespacing and mixed-organisation rejection) and compiles the
+full application bundle. The secondary Vercel variable was reported added by
+the dashboard owner, but its value was intentionally not read or logged.
+
+**Required production check after deployment:** sign in as the administrator,
+hard-refresh once, confirm the Account selector includes the secondary
+organisation's accounts, select one of them and use manual Refresh on a report.
+The next existing country-specific Ads cron then seeds that organisation's Ads
+history; do not expose `CRON_SECRET` merely to force it manually. If an Amazon
+account appears in both DataDoe organisations, remove one copy in DataDoe
+before using the dashboard; the API will display a safe duplicate error rather
+than double count it.
 
 ## Frontend redesign — premium light-theme workspace (2026-07-30, deployed)
 

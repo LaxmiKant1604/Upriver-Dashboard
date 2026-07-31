@@ -104,8 +104,11 @@ export function rollupPpcRows(rows, keyFn, labelFn, { salesKey, ordersKey, units
   }));
 }
 
-export async function buildPpcPerformance({ apiKey, ids, to }) {
-  const accountId = ids[0];
+export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccountId = ids[0], to }) {
+  // `ids` stays raw for the live DataDoe sales export. Persisted Ads rows use
+  // the public account ID so a secondary DataDoe organisation cannot collide
+  // with the primary organisation's stored history.
+  const accountId = publicAccountId;
   const from = addDaysStr(to, -(WINDOW_DAYS - 1));
 
   // Sync state first: it is what lets the report say "the worker has not seeded

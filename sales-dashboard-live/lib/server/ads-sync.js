@@ -5,6 +5,7 @@ import {
   upsertAdsDailyRows,
   upsertAdsSyncStates,
 } from "./supabase.js";
+import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
 const EXPORT_LIMIT = 50000;
@@ -227,12 +228,13 @@ function windowFor(source, mode, to) {
   return { from: addDays(to, -(days - 1)), to };
 }
 
-function rowRecord(source, row, refreshedAt) {
-  const accountId = String(row.seller_or_vendor_id || "");
+function rowRecord(source, row, refreshedAt, connection) {
+  const rawAccountId = String(row.seller_or_vendor_id || "");
   const date = String(row.date || "");
-  if (!accountId || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+  if (!rawAccountId || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     throw new Error(`${source.key} returned a row without seller_or_vendor_id or a valid date.`);
   }
+  const accountId = publicAccountId(connection, rawAccountId);
   const dimensions = Object.fromEntries(source.dimensions.map((key) => [key, row[key] ?? null]));
   const metrics = Object.fromEntries(source.metrics.map((key) => [key, row[key] ?? null]));
   // JSON preserves empty fields and delimiters, so natural dimensions cannot
@@ -314,8 +316,7 @@ export function verifyCronRequest(req, res) {
 }
 
 export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source) => source.key)) {
-  const apiKey = process.env.DATADOE_API_KEY;
-  if (!apiKey) throw new Error("DATADOE_API_KEY is not configured.");
+  const connections = getDataDoeConnections();
   const now = new Date().toISOString();
   const to = now.slice(0, 10);
   const scope = countries === "OTHER" ? "OTHER" : [...countries].sort().join(",");
@@ -330,7 +331,25 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
   if (!locked) return { status: "skipped", reason: "A country Ads sync is already running.", scope };
 
   const startedAt = Date.now();
-  const accounts = (await fetchAccounts(apiKey)).filter((account) => countryMatches(account, countries));
+  const accounts = [];
+  const rawAccountOwners = new Map();
+  for (const connection of connections) {
+    const discovered = await fetchAccounts(connection.apiKey);
+    for (const account of discovered) {
+      if (!countryMatches(account, countries)) continue;
+      const existingConnection = rawAccountOwners.get(account.id);
+      if (existingConnection) {
+        throw new Error(`Amazon account ${account.id} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate DataDoe connection before syncing.`);
+      }
+      rawAccountOwners.set(account.id, connection);
+      accounts.push({
+        ...account,
+        rawAccountId: account.id,
+        id: publicAccountId(connection, account.id),
+        connection,
+      });
+    }
+  }
   const previousStates = await getAdsSyncStates(accounts.map((account) => account.id));
   const states = new Map(previousStates.map((state) => [`${state.account_id}|${state.source_key}`, state]));
   const summary = { status: "completed", scope, accounts: accounts.length, rows: 0, sources: {}, deferred: false };
@@ -340,13 +359,17 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
     for (const account of accounts) {
       const previous = states.get(`${account.id}|${source.key}`);
       const mode = pickMode(previous, source, now);
-      const group = work.get(mode) || [];
+      // DataDoe API keys are organisation-scoped; a single export must never
+      // carry account IDs belonging to two different organisations.
+      const workKey = `${account.connection.id}|${mode}`;
+      const group = work.get(workKey) || [];
       group.push({ account, previous });
-      work.set(mode, group);
+      work.set(workKey, group);
     }
     summary.sources[source.key] = { initial: 0, daily: 0, monthly: 0, rows: 0, failedAccounts: [] };
 
-    for (const [mode, entries] of work) {
+    for (const [workKey, entries] of work) {
+      const [, mode] = workKey.split("|");
       for (const batch of chunks(entries, source.batchSize)) {
         if (Date.now() - startedAt > WORK_BUDGET_MS) {
           summary.status = "partial";
@@ -354,10 +377,11 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
           return summary;
         }
         const range = windowFor(source, mode, to);
-        const ids = batch.map((entry) => entry.account.id);
+        const connection = batch[0].account.connection;
+        const ids = batch.map((entry) => entry.account.rawAccountId);
         try {
-          const rows = await fetchRange(apiKey, source, ids, range.from, range.to);
-          const normalized = rows.map((row) => rowRecord(source, row, now));
+          const rows = await fetchRange(connection.apiKey, source, ids, range.from, range.to);
+          const normalized = rows.map((row) => rowRecord(source, row, now, connection));
           await upsertAdsDailyRows(normalized);
           if (source.key === "campaign-performance-v1") {
             await upsertAdDailyMetrics(campaignMetricRecords(normalized));
@@ -379,7 +403,7 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
         } catch (error) {
           const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, error, now));
           await upsertAdsSyncStates(failed);
-          summary.sources[source.key].failedAccounts.push(...ids);
+          summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
         }
       }
     }
