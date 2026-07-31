@@ -119,6 +119,18 @@ account appears in both DataDoe organisations, remove one copy in DataDoe
 before using the dashboard; the API will display a safe duplicate error rather
 than double count it.
 
+### Account-directory refresh follow-up (2026-07-31; deployment pending)
+
+The dashboard intentionally opens from its cached account directory, so a new
+DataDoe organisation does not appear merely from a hard refresh. This protects
+the existing cache-first/no-automatic-DataDoe-fetch rule, but it made a newly
+added secondary connection hard to discover. The header Account control now has
+an adjacent icon-only **Refresh account list** button. It calls only the merged
+`accounts` endpoint when explicitly clicked; it does not refresh reports or
+fetch sales/Ads data. Administrators then see the new account(s) immediately;
+non-admin users still need the administrator to assign each new account in User
+Access.
+
 ## Frontend redesign — premium light-theme workspace (2026-07-30, deployed)
 
 The whole frontend was redesigned into a light-theme Amazon seller command

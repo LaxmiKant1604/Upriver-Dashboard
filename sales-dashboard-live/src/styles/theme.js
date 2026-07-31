@@ -265,6 +265,14 @@ body{ overflow-x:hidden; }
 .tb-select.account select{ min-width:190px; max-width:290px; }
 .tb-select.brand select{ min-width:130px; max-width:210px; }
 .tb-select select:disabled{ color:var(--text-muted); cursor:not-allowed; }
+.account-sync-btn{
+  width:28px; height:28px; flex:0 0 28px; border:1px solid var(--border-default);
+  border-radius:6px; background:var(--bg-surface); color:var(--text-secondary);
+  display:inline-flex; align-items:center; justify-content:center; cursor:pointer;
+  transition:border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), background var(--t-fast) var(--ease);
+}
+.account-sync-btn:hover:not(:disabled){ border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
+.account-sync-btn:disabled{ opacity:.5; cursor:not-allowed; }
 
 /* ---- Refresh status cluster ---- */
 .refresh-cluster{

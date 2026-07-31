@@ -189,7 +189,7 @@ export function Sidebar({
  * A native select is intentional: it stays keyboard accessible, works on
  * mobile, and keeps the exact change semantics the app already relies on.
  */
-export function AccountSelector({ accounts, value, onChange, flags }) {
+export function AccountSelector({ accounts, value, onChange, flags, onRefresh, refreshing = false }) {
   return (
     <div className="tb-select account">
       <Store size={15} aria-hidden="true" />
@@ -212,6 +212,18 @@ export function AccountSelector({ accounts, value, onChange, flags }) {
           <ChevronDown size={14} aria-hidden="true" />
         </div>
       </div>
+      {onRefresh && (
+        <button
+          className="account-sync-btn"
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing}
+          title="Refresh account list from DataDoe"
+          aria-label="Refresh account list from DataDoe"
+        >
+          <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
+        </button>
+      )}
     </div>
   );
 }
@@ -238,7 +250,7 @@ export function BrandSelector({ brands, value, onChange }) {
 
 export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
-  accounts, selectedAccountId, onAccountChange,
+  accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
   brands, selectedBrand, onBrandChange, flags,
   refresh,
 }) {
@@ -260,7 +272,14 @@ export function TopBar({
 
       {showScope && (
         <div className="tb-right">
-          <AccountSelector accounts={accounts} value={selectedAccountId} onChange={onAccountChange} flags={flags} />
+          <AccountSelector
+            accounts={accounts}
+            value={selectedAccountId}
+            onChange={onAccountChange}
+            flags={flags}
+            onRefresh={onRefreshAccounts}
+            refreshing={accountsRefreshing}
+          />
           <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} />
           <div className="refresh-cluster">
             <div className="refresh-status">

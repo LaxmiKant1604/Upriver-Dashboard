@@ -2365,6 +2365,8 @@ function DashboardApp({ session, access, onSignOut }) {
             accounts={accounts}
             selectedAccountId={selectedAccountId}
             onAccountChange={(id) => { setSelectedAccountId(id); setSelectedBrand("ALL"); }}
+            onRefreshAccounts={fetchAccounts}
+            accountsRefreshing={accountsLoading}
             brands={brandList}
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
