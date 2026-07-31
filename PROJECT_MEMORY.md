@@ -66,7 +66,7 @@ added. The dashboard owner later reported adding the secondary Vercel variable;
 its presence and the second organisation's live account list still require the
 production check recorded below.
 
-### Two-connection implementation (2026-07-31; deployment verification pending)
+### Two-connection implementation (2026-07-31; deployed)
 
 The report API and automated Ads worker now support the existing primary
 DataDoe organisation plus an optional second one configured as the sensitive
@@ -103,7 +103,14 @@ secondary row namespacing and mixed-organisation rejection) and compiles the
 full application bundle. The secondary Vercel variable was reported added by
 the dashboard owner, but its value was intentionally not read or logged.
 
-**Required production check after deployment:** sign in as the administrator,
+**Deployment verification:** feature commit `a553c27 Support secondary DataDoe
+account sync` is pushed to `origin/main` and deployed through the stable alias
+`https://upriverdashboard.vercel.app`. The production HTML now serves bundle
+`assets/index-D2gD8Dl7.js`; the protected `/api/datadoe?action=accounts` route
+returns HTTP 401 without a Supabase session, confirming the deployment remains
+protected and no API key is exposed.
+
+**Required signed-in production check:** sign in as the administrator,
 hard-refresh once, confirm the Account selector includes the secondary
 organisation's accounts, select one of them and use manual Refresh on a report.
 The next existing country-specific Ads cron then seeds that organisation's Ads
