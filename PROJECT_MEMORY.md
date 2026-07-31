@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-31
+Last updated: 2026-07-31 (account-scoped brand selector and Brand View implemented locally; verification passed, deployment pending)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1109,6 +1109,51 @@ token returned HTTP 401 `Please sign in to access the dashboard.` This confirms
 the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
+
+## Account-scoped brands and Brand View (2026-07-31; deployment pending)
+
+### Completed locally
+
+- **Account selector brand isolation:** the header Brand dropdown now derives
+  its values only from saved `brand-sales` rows whose `ids` cache parameter is
+  exactly the selected account. It no longer trusts broad Product Catalog
+  metadata, which could make brands from another account appear in the
+  selected account dropdown.
+- `action=brand-sales` now also returns `catalogBrands` derived from its
+  already-joined selected-account sales rows rather than the raw catalog
+  export. The browser and API therefore enforce the same scope boundary.
+- **Dashboard mode switcher:** the Dashboard header now has `Account view`
+  (the existing account/brand dashboard) and `Brand view`. Other report pages
+  remain account-scoped and their existing header behavior is unchanged.
+- **Brand View:** a separate portfolio view lets a user choose one brand and
+  shows a country/currency snapshot and a seven-day country-performance table
+  across all accounts that user is allowed to access. Country labels use the
+  existing marketplace flags and standard region names.
+- Brand View is cache-first and manual-refresh only. Its one refresh action
+  walks accessible accounts sequentially, reuses the existing
+  `action=brand-sales` API, saves each account response and saves the combined
+  portfolio response in the signed-in user's browser cache. It must not be
+  changed to background-fetch or parallel requests because that would spend
+  DataDoe tokens and can violate the organisation-wide rate limit.
+
+### Important decisions and limitations
+
+- Brand View **never combines or converts money across currencies**. It groups
+  sales by marketplace country and currency; percentage share is calculated
+  only within the same currency. The summary intentionally says "Sales
+  reporting: By country" rather than inventing a portfolio total.
+- It shows only sales and units because the current manual portfolio refresh
+  fetches only the proven Order Line Items + Product Catalog mapping. FBA
+  inventory, ad spend and TACoS remain withheld until a dedicated country-level
+  portfolio data source is fetched and reconciled; no account-level ad or FBA
+  value may be relabelled as a brand value.
+- A first Brand View refresh may take several minutes for many accounts because
+  it checks them one at a time. Progress is visible in the page. Subsequent
+  opens and date/filter changes use saved browser data and make no DataDoe API
+  call.
+- `npm run verify` passed after implementation: 53 deterministic assertions
+  and the full Vite build. Production deployment still needs to be triggered
+  by committing and pushing the pending changes.
 
 ## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)
 

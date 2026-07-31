@@ -842,26 +842,11 @@ function readApiCache(params) {
   }
 }
 
-// Brand names are catalog metadata and remain valid across report-cache
-// versions. Reuse cached catalog-bearing responses for the selected account so
-// the header selector is usable before that account's next manual refresh.
+// Kept as a compatibility name for the existing account selector. The list is
+// intentionally taken from that account's saved brand-sales rows, not from an
+// unscoped catalog response.
 function readCachedCatalogBrands(accountId) {
-  if (!accountId) return [];
-  try {
-    const brands = new Set();
-    const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
-    for (let i = 0; i < window.localStorage.length; i++) {
-      const key = window.localStorage.key(i);
-      if (!key || !key.startsWith(ownerPrefix)) continue;
-      const params = new URLSearchParams(key.slice(ownerPrefix.length));
-      if (params.get("ids") !== accountId) continue;
-      const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
-      (cached.body?.catalogBrands || []).forEach((brand) => brands.add(brand));
-    }
-    return [...brands].sort((a, b) => a.localeCompare(b));
-  } catch (e) {
-    return [];
-  }
+  return cachedBrandsForAccount(accountId);
 }
 
 function removeUnauthorizedCachedData(allowedAccountIds, isAdmin) {
@@ -1064,6 +1049,146 @@ function usePrefersReducedMotion() {
   return reduced;
 }
 
+function countryName(country) {
+  if (!country) return "Unknown marketplace";
+  try {
+    return new Intl.DisplayNames(["en"], { type: "region" }).of(country) || country;
+  } catch (e) {
+    return country;
+  }
+}
+
+// The account dashboard and Brand View both read this same cache shape.  It
+// intentionally considers only brand-sales rows, never broad catalog metadata,
+// so a brand cannot appear under an account where it has not been observed.
+function cachedBrandsForAccount(accountId) {
+  if (!accountId) return [];
+  try {
+    const brands = new Set();
+    const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(ownerPrefix)) continue;
+      const params = new URLSearchParams(key.slice(ownerPrefix.length));
+      if (params.get("action") !== "brand-sales" || params.get("ids") !== accountId) continue;
+      const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
+      (cached.body?.rows || []).forEach((row) => {
+        const brand = String(row.product_brand || "").trim();
+        if (brand && brand !== "Unassigned") brands.add(brand);
+      });
+    }
+    return [...brands].sort((a, b) => a.localeCompare(b));
+  } catch (e) {
+    return [];
+  }
+}
+
+function BrandPortfolioDashboard({
+  brand, data, loading, error, cacheMissing, progress, onRefresh,
+  rangePreset, onPresetChange, customFrom, customTo, onCustomFrom, onCustomTo,
+}) {
+  const rows = data?.rows || [];
+  const [scopeMin, scopeMax] = useMemo(() => {
+    let min = null, max = null;
+    rows.forEach((row) => {
+      if (!row.date) return;
+      if (!min || row.date < min) min = row.date;
+      if (!max || row.date > max) max = row.date;
+    });
+    return [min, max];
+  }, [rows]);
+  const latest = scopeMax || "";
+  const [rangeFrom, rangeTo] = useMemo(() => {
+    if (!latest) return ["", ""];
+    let from, to;
+    switch (rangePreset) {
+      case "YESTERDAY": from = addDays(latest, -1); to = from; break;
+      case "7D": from = addDays(latest, -6); to = latest; break;
+      case "90D": from = addDays(latest, -89); to = latest; break;
+      case "MTD": from = monthStart(latest); to = latest; break;
+      case "YTD": from = yearStart(latest); to = latest; break;
+      case "CUSTOM": from = customFrom || scopeMin || latest; to = customTo || latest; break;
+      default: from = addDays(latest, -29); to = latest;
+    }
+    if (scopeMin && from < scopeMin) from = scopeMin;
+    if (to > latest) to = latest;
+    return [from, to];
+  }, [rangePreset, latest, scopeMin, customFrom, customTo]);
+  const scoped = useMemo(() => rows.filter((row) => row.date >= rangeFrom && row.date <= rangeTo), [rows, rangeFrom, rangeTo]);
+  const markets = useMemo(() => {
+    const grouped = new Map();
+    scoped.forEach((row) => {
+      const country = row.marketplace_country_code || row.accountCountry || "";
+      const currency = row.currency || row.accountCurrency || "";
+      const key = `${country}|${currency}`;
+      const current = grouped.get(key) || { key, country, currency, sales: 0, units: 0, accounts: new Set(), byDate: new Map() };
+      current.sales += Number(row.total_sales) || 0;
+      current.units += Number(row.total_units_sold) || 0;
+      if (row.accountName) current.accounts.add(row.accountName);
+      const daily = current.byDate.get(row.date) || { sales: 0, units: 0 };
+      daily.sales += Number(row.total_sales) || 0;
+      daily.units += Number(row.total_units_sold) || 0;
+      current.byDate.set(row.date, daily);
+      grouped.set(key, current);
+    });
+    const currencyTotals = new Map();
+    grouped.forEach((market) => currencyTotals.set(market.currency, (currencyTotals.get(market.currency) || 0) + market.sales));
+    return [...grouped.values()]
+      .map((market) => ({ ...market, share: market.sales / Math.max(1, currencyTotals.get(market.currency) || 0) }))
+      .sort((a, b) => a.country.localeCompare(b.country) || a.currency.localeCompare(b.currency));
+  }, [scoped]);
+  const days = useMemo(() => {
+    if (!latest) return [];
+    return Array.from({ length: 7 }, (_, index) => addDays(latest, index - 6));
+  }, [latest]);
+  const totalUnits = markets.reduce((sum, market) => sum + market.units, 0);
+  const accountCount = new Set(scoped.map((row) => row.accountId)).size;
+
+  return (
+    <div className="container brand-portfolio-page">
+      <div className="page-head">
+        <div>
+          <div className="page-title">Brand View</div>
+          <div className="page-sub">{brand ? `${brand} across every accessible marketplace` : "Choose a brand to compare its marketplaces."}</div>
+        </div>
+      </div>
+      <DateRangeSelector
+        preset={rangePreset} onPresetChange={onPresetChange}
+        customFrom={customFrom} customTo={customTo} onCustomFrom={onCustomFrom} onCustomTo={onCustomTo}
+        minDate={scopeMin} maxDate={latest} rangeLabel={scoped.length ? fmtRangeLabel(rangeFrom, rangeTo) : null}
+        icon={<CalendarRange size={13} aria-hidden="true" />}
+      />
+      {error && <DataQualityAlert tone="error" title="Brand View could not be refreshed" detail={error} />}
+      {!brand ? (
+        <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Choose a portfolio brand">The brand picker in the command bar shows brands observed in your saved account data. Refresh any account once to add its brands here.</EmptyState></div>
+      ) : loading && !rows.length ? (
+        <><SkeletonMetricGrid count={4} /><div className="panel"><SkeletonTable rows={7} /></div></>
+      ) : cacheMissing && !rows.length ? (
+        <div className="panel"><EmptyState icon={<DatabaseZap size={19} aria-hidden="true" />} title="No saved Brand View yet" actions={<button className="plan-export-btn" type="button" onClick={onRefresh} disabled={loading}><RefreshCw size={14} className={loading ? "spin" : ""} />Refresh brand portfolio</button>}>Refresh scans only the accounts you are allowed to access, saves the result in this browser, and does not run automatically.</EmptyState></div>
+      ) : !scoped.length ? (
+        <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales for this brand in this range">The saved portfolio data contains no order value for {brand} between {rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : "the selected dates"}.</EmptyState></div>
+      ) : <>
+        <div className="metric-grid brand-portfolio-kpis">
+          <MetricCard label="Marketplaces" value={markets.length.toLocaleString("en-US")} period="country and currency scopes" />
+          <MetricCard label="Accounts selling" value={accountCount.toLocaleString("en-US")} period={fmtRangeLabel(rangeFrom, rangeTo)} />
+          <MetricCard label="Units sold" value={totalUnits.toLocaleString("en-US")} period={fmtRangeLabel(rangeFrom, rangeTo)} />
+          <MetricCard label="Sales reporting" value="By country" hint="Sales are intentionally kept in each marketplace currency; the dashboard does not convert or combine money across currencies." period="no FX conversion" />
+        </div>
+        <div className="panel brand-portfolio-table-panel">
+          <div className="panel-head"><div><div className="panel-title">Country Snapshot</div><div className="page-sub">Sales and units for the selected period, grouped without currency conversion.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th><th>Account</th><th>Sales</th><th>Units</th><th>Share in currency</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency || "Currency unavailable"}</small></td><td>{[...market.accounts].join(", ") || "-"}</td><td className="money">{fmtMoney(market.sales, market.currency, 0, market.country)}</td><td>{market.units.toLocaleString("en-US")}</td><td>{(market.share * 100).toFixed(1)}%</td></tr>)}</tbody></table></div>
+        </div>
+        <div className="panel brand-portfolio-table-panel">
+          <div className="panel-head"><div><div className="panel-title">7-Day Country Performance</div><div className="page-sub">Each row stays in its marketplace currency. Blank days mean no saved sale, not an estimated zero.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{days.map((day) => <th key={day}>{fmtDateHuman(day).replace(/, \d{4}$/, "")}</th>)}<th>7D Total</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{days.map((day) => <td key={day} className="money">{market.byDate.has(day) ? fmtMoney(market.byDate.get(day).sales, market.currency, 0, market.country) : "-"}</td>)}<td className="money">{fmtMoney(days.reduce((sum, day) => sum + (market.byDate.get(day)?.sales || 0), 0), market.currency, 0, market.country)}</td></tr>)}</tbody></table></div>
+        </div>
+        <div className="footer-note">Brand View uses the same DataDoe Order Line Items and Product Catalog mapping as Account View. It includes only accounts the signed-in user can access. Refresh is manual; it checks each accessible account sequentially to respect DataDoe limits. Advertising, FBA inventory, and TACoS are intentionally not shown here until country-level source data is fetched and reconciled for this brand.</div>
+      </>}
+      {loading && progress && <div className="brand-portfolio-progress" role="status">Refreshing {brand}: {progress.completed} of {progress.total} accounts checked{progress.account ? ` (${progress.account})` : ""}.</div>}
+    </div>
+  );
+}
+
 /* ============================== MAIN APP ============================== */
 function DashboardApp({ session, access, onSignOut }) {
   const isAdmin = access.role === "admin";
@@ -1097,6 +1222,17 @@ function DashboardApp({ session, access, onSignOut }) {
 
   const [selectedAccountId, setSelectedAccountId] = useState(null);
   const [selectedBrand, setSelectedBrand] = useState("ALL");
+  // Account View is the existing selected-account dashboard. Brand View is a
+  // deliberately separate portfolio scope: it never changes account-report
+  // state or causes background DataDoe requests.
+  const [dashboardMode, setDashboardMode] = useState("account");
+  const [selectedPortfolioBrand, setSelectedPortfolioBrand] = useState("");
+  const [brandPortfolioData, setBrandPortfolioData] = useState(null);
+  const [brandPortfolioLoading, setBrandPortfolioLoading] = useState(false);
+  const [brandPortfolioError, setBrandPortfolioError] = useState(null);
+  const [brandPortfolioCacheMissing, setBrandPortfolioCacheMissing] = useState(false);
+  const [brandPortfolioFetchedAt, setBrandPortfolioFetchedAt] = useState(null);
+  const [brandPortfolioProgress, setBrandPortfolioProgress] = useState(null);
   const [rangePreset, setRangePreset] = useState("30D");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -1232,6 +1368,92 @@ function DashboardApp({ session, access, onSignOut }) {
     // previously cached report can never be presented as the new one.
     return { action: "brand-sales", reportVersion: "order-items-v2-quality", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
+
+  const portfolioAccountSignature = useMemo(
+    () => accounts.map((account) => account.id).sort().join(","),
+    [accounts]
+  );
+  const portfolioCacheParams = useMemo(() => (
+    selectedPortfolioBrand && portfolioAccountSignature
+      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
+      : null
+  ), [selectedPortfolioBrand, portfolioAccountSignature]);
+
+  const loadCachedBrandPortfolio = useCallback(() => {
+    if (!portfolioCacheParams) {
+      setBrandPortfolioData(null);
+      setBrandPortfolioCacheMissing(false);
+      setBrandPortfolioFetchedAt(null);
+      return;
+    }
+    const cached = readApiCache(portfolioCacheParams);
+    if (cached) {
+      setBrandPortfolioData(cached.body);
+      setBrandPortfolioFetchedAt(new Date(cached.cachedAt));
+      setBrandPortfolioCacheMissing(false);
+      setBrandPortfolioError(null);
+    } else {
+      setBrandPortfolioData(null);
+      setBrandPortfolioFetchedAt(null);
+      setBrandPortfolioCacheMissing(true);
+      setBrandPortfolioError(null);
+    }
+  }, [portfolioCacheParams]);
+
+  const fetchBrandPortfolio = useCallback(async () => {
+    if (!selectedPortfolioBrand || !accounts.length || brandPortfolioLoading) return;
+    setBrandPortfolioLoading(true);
+    setBrandPortfolioError(null);
+    setBrandPortfolioProgress({ completed: 0, total: accounts.length, account: "" });
+    const rows = [];
+    const errors = [];
+    try {
+      // A portfolio refresh is intentionally sequential. Each account request
+      // itself creates two DataDoe exports, so parallelising this loop would
+      // waste tokens and breach the organisation-wide rate limit.
+      for (let index = 0; index < accounts.length; index++) {
+        const account = accounts[index];
+        setBrandPortfolioProgress({ completed: index, total: accounts.length, account: account.name });
+        const accountToday = marketplaceToday(account.country);
+        const params = {
+          action: "brand-sales", reportVersion: "order-items-v2-quality", ids: account.id,
+          from: addDays(monthStart(accountToday), -420), to: accountToday,
+        };
+        try {
+          const body = await apiGet(params);
+          writeApiCache(params, body);
+          (body.rows || []).forEach((row) => {
+            if (productBrand(row) !== selectedPortfolioBrand) return;
+            rows.push({
+              ...row,
+              accountId: account.id,
+              accountName: account.name,
+              accountCountry: account.country,
+              accountCurrency: account.currency,
+            });
+          });
+        } catch (accountError) {
+          errors.push({ accountId: account.id, accountName: account.name, message: accountError.message });
+        }
+        setBrandPortfolioProgress({ completed: index + 1, total: accounts.length, account: account.name });
+      }
+      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: accounts.map((account) => account.id) };
+      if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
+      setBrandPortfolioData(payload);
+      setBrandPortfolioFetchedAt(new Date());
+      setBrandPortfolioCacheMissing(false);
+      if (errors.length) setBrandPortfolioError(`${errors.length} account${errors.length === 1 ? "" : "s"} could not be refreshed. The results below include the accounts that completed: ${errors.map((error) => error.accountName).join(", ")}.`);
+    } catch (error) {
+      setBrandPortfolioError(error.message);
+    } finally {
+      setBrandPortfolioLoading(false);
+      setBrandPortfolioProgress(null);
+    }
+  }, [accounts, brandPortfolioLoading, portfolioCacheParams, selectedPortfolioBrand]);
+
+  useEffect(() => {
+    if (dashboardMode === "brand") loadCachedBrandPortfolio();
+  }, [dashboardMode, loadCachedBrandPortfolio]);
 
   const loadCachedRows = useCallback(() => {
     if (!dashboardParams) {
@@ -2080,11 +2302,17 @@ function DashboardApp({ session, access, onSignOut }) {
   );
   const brandList = useMemo(() => {
     // Never carry a prior account's in-memory catalog into the newly selected
-    // account. Cached catalog keys are already account-scoped.
-    const currentCatalogBrands = catalogBrandsAccountId === selectedAccountId ? catalogBrands : [];
-    const names = new Set([...cachedAccountBrands, ...currentCatalogBrands]);
+    // account. Only rows whose account was selected contribute a brand.
+    const currentRowBrands = rows.map(productBrand).filter((brand) => brand !== "Unassigned");
+    const names = new Set([...cachedAccountBrands, ...currentRowBrands]);
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, selectedAccountId]);
+  }, [cachedAccountBrands, rows]);
+  const portfolioBrandList = useMemo(() => {
+    const names = new Set();
+    accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));
+    if (selectedPortfolioBrand) names.add(selectedPortfolioBrand);
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [accounts, selectedPortfolioBrand, brandPortfolioFetchedAt, rows]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -2288,7 +2516,9 @@ function DashboardApp({ session, access, onSignOut }) {
      which report the click refreshes, whether a request is already in flight,
      and what the status line should say. The Priority Feed owns no data of its
      own, so it is deliberately not refreshable from here. */
+  const showingBrandPortfolio = view === "dashboard" && dashboardMode === "brand";
   const activeStamp = onFeed ? null
+    : showingBrandPortfolio ? brandPortfolioFetchedAt
     : activeInsightReport ? activeInsightReport.cachedAt
     : view === "fbaplan" ? planCachedAt
     : view === "reconciliation" ? reconciliationCachedAt
@@ -2296,7 +2526,8 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "keywordrank" ? keywordRankCachedAt
     : view === "contentchanges" ? contentChangesCachedAt
     : lastFetchedAt;
-  const activeBusy = activeInsightReport ? activeInsightReport.loading
+  const activeBusy = showingBrandPortfolio ? brandPortfolioLoading
+    : activeInsightReport ? activeInsightReport.loading
     : view === "daily" ? dailyLoading
     : view === "fbaplan" ? planLoading
     : view === "reconciliation" ? reconciliationLoading
@@ -2305,18 +2536,20 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "contentchanges" ? contentChangesLoading
     : rowsLoading;
   const accountLabel = refreshScopeAccount?.name || "selected account";
+  const refreshScopeLabel = showingBrandPortfolio ? (selectedPortfolioBrand || "portfolio brand") : accountLabel;
   const refreshDescriptor = {
-    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : "Last refreshed",
+    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? "Portfolio refresh" : "Last refreshed",
     value: onFeed
       ? accountLabel
       : activeBusy
         ? "Fetching…"
         : activeStamp
-          ? `${activeStamp.toLocaleTimeString()} · ${accountLabel}`
-          : selectedAccountId ? "Not yet refreshed" : "Select an account",
+          ? `${activeStamp.toLocaleTimeString()} · ${refreshScopeLabel}`
+          : showingBrandPortfolio ? (selectedPortfolioBrand ? "Not yet refreshed" : "Select a brand") : selectedAccountId ? "Not yet refreshed" : "Select an account",
     live: Boolean(activeStamp) || onFeed,
     busy: activeBusy,
     onRefresh: onFeed ? undefined
+      : showingBrandPortfolio ? fetchBrandPortfolio
       : activeInsightReport ? activeInsightReport.refresh
       : view === "daily" ? fetchDaily
       : view === "fbaplan" ? fetchPlan
@@ -2329,10 +2562,12 @@ function DashboardApp({ session, access, onSignOut }) {
     // the documented duplicate-refresh gap: repeated clicks could previously
     // launch concurrent 25-45 s DataDoe exports for the dashboard, Daily
     // Reporting and the FBA plan.
-    disabled: onFeed || activeBusy,
+    disabled: onFeed || activeBusy || (showingBrandPortfolio && !selectedPortfolioBrand),
     hint: onFeed
       ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
-      : activeInsightReport
+      : showingBrandPortfolio
+        ? "Refresh this brand across accessible accounts from DataDoe. This is the only Brand View action that calls DataDoe."
+        : activeInsightReport
         ? "Refresh this report from DataDoe for the selected account and save it for everyone with access"
         : `Refresh ${accountLabel} from DataDoe`,
   };
@@ -2370,13 +2605,34 @@ function DashboardApp({ session, access, onSignOut }) {
             brands={brandList}
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
+            dashboardMode={view === "dashboard" ? dashboardMode : "account"}
+            onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
+            portfolioBrands={portfolioBrandList}
+            selectedPortfolioBrand={selectedPortfolioBrand}
+            onPortfolioBrandChange={setSelectedPortfolioBrand}
             flags={FLAGS}
             refresh={refreshDescriptor}
           />
 
       {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
 
-      {view === "dashboard" && (
+      {view === "dashboard" && (dashboardMode === "brand" ? (
+        <BrandPortfolioDashboard
+          brand={selectedPortfolioBrand}
+          data={brandPortfolioData}
+          loading={brandPortfolioLoading}
+          error={brandPortfolioError}
+          cacheMissing={brandPortfolioCacheMissing}
+          progress={brandPortfolioProgress}
+          onRefresh={fetchBrandPortfolio}
+          rangePreset={rangePreset}
+          onPresetChange={setRangePreset}
+          customFrom={customFrom}
+          customTo={customTo}
+          onCustomFrom={setCustomFrom}
+          onCustomTo={setCustomTo}
+        />
+      ) : (
       <div className="container">
         <div className="page-head">
           <div>
@@ -2606,7 +2862,7 @@ function DashboardApp({ session, access, onSignOut }) {
           Total Sales is DataDoe Order Line Items <code>item_price_value</code>, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (<code>product_brand</code>) for the selected account. Money is shown in the selected marketplace's currency and is never converted or combined with another currency. Changing account, brand, date range or granularity reads saved data only; <strong>Refresh is the only action that calls DataDoe</strong>. Comparisons and sparklines are computed from the same saved rows and are withheld — shown as an em dash or omitted — whenever this account lacks the earlier period they would need. If the warning above appears, DataDoe returned units without an order value, so refresh again after its upstream order data is completed.
         </div>
       </div>
-      )}
+      ))}
 
       {view === "daily" && (
       <div className="container">

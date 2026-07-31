@@ -829,7 +829,13 @@ export default async function handler(req, res) {
         CATALOG_ROW_LIMIT,
         { orderByColumn: "child_asin" }
       );
-      res.status(200).json({ rows: orderSalesByBrand(rawRows, catalog), catalogBrands: catalogBrandNames(catalog) });
+      const rows = orderSalesByBrand(rawRows, catalog);
+      // Product Catalog metadata must never be allowed to widen the header's
+      // brand selector beyond this account's actual sales scope.  Some
+      // catalog exports can contain historical metadata that is not present
+      // in the requested sales range; derive the response list from the
+      // account's already-joined rows instead.
+      res.status(200).json({ rows, catalogBrands: catalogBrandNames(rows) });
       return;
     }
 

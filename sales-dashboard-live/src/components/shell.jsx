@@ -228,20 +228,29 @@ export function AccountSelector({ accounts, value, onChange, flags, onRefresh, r
   );
 }
 
-export function BrandSelector({ brands, value, onChange }) {
+export function BrandSelector({ brands, value, onChange, includeAll = true, label = "Brand" }) {
   return (
     <div className="tb-select brand">
       <Tag size={15} aria-hidden="true" />
       <div className="tb-select-body">
-        <div className="tb-select-label">Brand</div>
+        <div className="tb-select-label">{label}</div>
         <div className="tb-select-value">
           <select aria-label="Brand selection" value={value} onChange={(event) => onChange(event.target.value)}>
-            <option value="ALL">All brands</option>
+            {includeAll ? <option value="ALL">All brands</option> : <option value="">Select a brand</option>}
             {brands.map((brand) => <option value={brand} key={brand}>{brand}</option>)}
           </select>
           <ChevronDown size={14} aria-hidden="true" />
         </div>
       </div>
+    </div>
+  );
+}
+
+function DashboardModeSelector({ value, onChange }) {
+  return (
+    <div className="segmented dashboard-mode" role="group" aria-label="Dashboard scope">
+      <button type="button" className={value === "account" ? "active" : ""} aria-pressed={value === "account"} onClick={() => onChange("account")}>Account view</button>
+      <button type="button" className={value === "brand" ? "active" : ""} aria-pressed={value === "brand"} onClick={() => onChange("brand")}>Brand view</button>
     </div>
   );
 }
@@ -252,6 +261,7 @@ export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
   accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
   brands, selectedBrand, onBrandChange, flags,
+  dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
   refresh,
 }) {
   return (
@@ -272,15 +282,20 @@ export function TopBar({
 
       {showScope && (
         <div className="tb-right">
-          <AccountSelector
-            accounts={accounts}
-            value={selectedAccountId}
-            onChange={onAccountChange}
-            flags={flags}
-            onRefresh={onRefreshAccounts}
-            refreshing={accountsRefreshing}
-          />
-          <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} />
+          {onDashboardModeChange && <DashboardModeSelector value={dashboardMode} onChange={onDashboardModeChange} />}
+          {dashboardMode === "brand" ? (
+            <BrandSelector brands={portfolioBrands} value={selectedPortfolioBrand} onChange={onPortfolioBrandChange} includeAll={false} label="Portfolio brand" />
+          ) : <>
+            <AccountSelector
+              accounts={accounts}
+              value={selectedAccountId}
+              onChange={onAccountChange}
+              flags={flags}
+              onRefresh={onRefreshAccounts}
+              refreshing={accountsRefreshing}
+            />
+            <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} />
+          </>}
           <div className="refresh-cluster">
             <div className="refresh-status">
               <div className="refresh-status-label">{refresh.label}</div>
