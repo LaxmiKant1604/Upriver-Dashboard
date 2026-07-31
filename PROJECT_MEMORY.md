@@ -39,6 +39,31 @@ reason a single token change restyles all fourteen report views at once.
 - Only an explicit manual Refresh may call DataDoe. Navigation, account/brand
   changes, date filters, sorting, search and pagination stay local.
 
+## Multi-DataDoe connection readiness (2026-07-31)
+
+The current deployment has **one** server-side DataDoe connection:
+`DATADOE_API_KEY`. All DataDoe API routes and the Ads scheduler use that single
+key, so adding a second DataDoe organisation by changing the environment value
+would replace the first connection; it would not merge the two safely.
+
+Supporting another DataDoe account is feasible and should be implemented as a
+small connection layer before any second key is added:
+
+- store a server-only connection record for each DataDoe organisation;
+- associate every discovered `seller_or_vendor_id` with exactly one connection;
+- select the correct key server-side for every export, account discovery and
+  scheduled Ads sync;
+- namespace shared snapshots/cache keys by connection as well as account, and
+  reject duplicate/unassigned account IDs instead of guessing;
+- keep both keys out of the browser, source code, logs and `PROJECT_MEMORY.md`.
+
+For a fixed two-organisation setup, separate Vercel environment variables can
+temporarily hold the keys. For an admin-managed, scalable setup, use encrypted
+server-side connection records and an admin-only connection screen. Existing
+user-to-Amazon-account permissions continue to apply after connection mapping;
+they should never grant access merely because a second DataDoe organisation was
+added. No second connection has been configured yet.
+
 ## Frontend redesign — premium light-theme workspace (2026-07-30, deployed)
 
 The whole frontend was redesigned into a light-theme Amazon seller command
