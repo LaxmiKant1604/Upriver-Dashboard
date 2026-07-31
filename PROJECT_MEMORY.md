@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -222,6 +222,36 @@ unaffected: `/api/datadoe?action=accounts` without a Supabase token still return
 `{"initialAdminExists":true,"confirmationPending":false}`. The bare deployment
 URL returns 302 (Vercel deployment protection on the non-aliased host), which is
 the project's normal behaviour — verify through the alias.
+
+### Independent Codex review (2026-07-31; no production change)
+
+`npm run verify` was independently rerun after the deployment: all 50 insight
+assertions passed and the full 1,057 kB application bundle compiled. The public
+production alias was also checked: it returns the new light-theme sign-in page
+with the expected title and authentication controls. Authenticated report data
+was not inspected in this review because no production user session was used.
+
+Two polish fixes remain before describing the redesign as fully accessibility-
+and data-display-complete:
+
+1. **Date range keyboard semantics:** `DateRangeSelector` in
+   `src/components/shell.jsx` uses `role="radiogroup"` and `role="radio"`, but it
+   does not implement the required Arrow-key/roving-tabindex behaviour of an
+   ARIA radio group. Either implement that keyboard model or change the wrapper
+   to a neutral `role="group"` and retain ordinary buttons. Do not leave a
+   keyboard-incomplete radio pattern.
+2. **Chart tooltip zero values:** `DashboardApp` builds trend buckets with
+   `units: 0` and `orders: 0`, then only renders a tooltip row when each value is
+   truthy. A genuine zero-unit/zero-order bucket is therefore hidden, and the
+   bucket has no field-presence flag to distinguish an unavailable metric from
+   a real zero. Preserve `hasUnits`/`hasOrders` while aggregating rows and use
+   those flags when rendering the tooltip. This keeps the product rule that
+   unknown values are omitted without hiding real zero values.
+
+These are review findings only. No application code or deployment was changed
+on 2026-07-31; the live alias remains the deployment recorded above. Resolve
+the two items in a focused follow-up, rerun `npm run verify`, perform a
+signed-in browser check, then deploy and update this section with the commit.
 
 ### Remaining limitations
 
