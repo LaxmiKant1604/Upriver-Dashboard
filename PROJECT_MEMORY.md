@@ -119,7 +119,7 @@ account appears in both DataDoe organisations, remove one copy in DataDoe
 before using the dashboard; the API will display a safe duplicate error rather
 than double count it.
 
-### Account-directory refresh follow-up (2026-07-31; deployment pending)
+### Account-directory refresh follow-up (2026-07-31; deployed)
 
 The dashboard intentionally opens from its cached account directory, so a new
 DataDoe organisation does not appear merely from a hard refresh. This protects
@@ -130,6 +130,12 @@ an adjacent icon-only **Refresh account list** button. It calls only the merged
 fetch sales/Ads data. Administrators then see the new account(s) immediately;
 non-admin users still need the administrator to assign each new account in User
 Access.
+
+Commit `67f0d68 Add manual account directory refresh` is pushed to `main` and
+live at `https://upriverdashboard.vercel.app`; production serves
+`assets/index-BxxvG0Yk.js` and the protected account API still returns HTTP 401
+without a signed-in user. The administrator must now use the new header icon to
+perform the authenticated merged-account check.
 
 ## Frontend redesign — premium light-theme workspace (2026-07-30, deployed)
 
