@@ -1085,6 +1085,7 @@ function cachedBrandsForAccount(accountId) {
 
 function BrandPortfolioDashboard({
   brand, data, loading, error, cacheMissing, progress, onRefresh,
+  directoryLoading, directoryError, directoryProgress, onLoadBrandDirectory,
   rangePreset, onPresetChange, customFrom, customTo, onCustomFrom, onCustomTo,
 }) {
   const rows = data?.rows || [];
@@ -1141,6 +1142,29 @@ function BrandPortfolioDashboard({
     if (!latest) return [];
     return Array.from({ length: 7 }, (_, index) => addDays(latest, index - 6));
   }, [latest]);
+  const monthlyColumns = useMemo(() => {
+    if (!latest) return [];
+    return Array.from({ length: 6 }, (_, index) => {
+      const month = monthBack(latest, 5 - index);
+      return { key: `${month.y}-${pad2(month.m)}`, label: monthKeyLabel(`${month.y}-${pad2(month.m)}`), current: index === 5 };
+    });
+  }, [latest]);
+  const monthlyMarkets = useMemo(() => {
+    const grouped = new Map();
+    rows.forEach((row) => {
+      const country = row.marketplace_country_code || row.accountCountry || "";
+      const currency = row.currency || row.accountCurrency || "";
+      const key = `${country}|${currency}`;
+      const current = grouped.get(key) || { key, country, currency, byMonth: new Map() };
+      const monthKey = String(row.date || "").slice(0, 7);
+      if (!monthlyColumns.some((column) => column.key === monthKey)) return;
+      current.byMonth.set(monthKey, (current.byMonth.get(monthKey) || 0) + (Number(row.total_sales) || 0));
+      grouped.set(key, current);
+    });
+    return [...grouped.values()].sort((a, b) => a.country.localeCompare(b.country) || a.currency.localeCompare(b.currency));
+  }, [rows, monthlyColumns]);
+  const currentMonthDays = latest ? parts(latest).d : 0;
+  const currentMonthTotalDays = latest ? daysInMonth(parts(latest).y, parts(latest).m) : 0;
   const totalUnits = markets.reduce((sum, market) => sum + market.units, 0);
   const accountCount = new Set(scoped.map((row) => row.accountId)).size;
 
@@ -1159,8 +1183,9 @@ function BrandPortfolioDashboard({
         icon={<CalendarRange size={13} aria-hidden="true" />}
       />
       {error && <DataQualityAlert tone="error" title="Brand View could not be refreshed" detail={error} />}
+      {directoryError && <DataQualityAlert tone="warning" title="Some portfolio brands could not be loaded" detail={directoryError} />}
       {!brand ? (
-        <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Choose a portfolio brand">The brand picker in the command bar shows brands observed in your saved account data. Refresh any account once to add its brands here.</EmptyState></div>
+        <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Load portfolio brands" actions={<button className="plan-export-btn" type="button" onClick={onLoadBrandDirectory} disabled={directoryLoading}><RefreshCw size={14} className={directoryLoading ? "spin" : ""} />Load portfolio brands</button>}>The first use on this browser needs one manual brand-directory refresh. It checks only accounts you are allowed to access, then fills the Brand dropdown. It never runs automatically.</EmptyState></div>
       ) : loading && !rows.length ? (
         <><SkeletonMetricGrid count={4} /><div className="panel"><SkeletonTable rows={7} /></div></>
       ) : cacheMissing && !rows.length ? (
@@ -1179,12 +1204,17 @@ function BrandPortfolioDashboard({
           <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th><th>Account</th><th>Sales</th><th>Units</th><th>Share in currency</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency || "Currency unavailable"}</small></td><td>{[...market.accounts].join(", ") || "-"}</td><td className="money">{fmtMoney(market.sales, market.currency, 0, market.country)}</td><td>{market.units.toLocaleString("en-US")}</td><td>{(market.share * 100).toFixed(1)}%</td></tr>)}</tbody></table></div>
         </div>
         <div className="panel brand-portfolio-table-panel">
+          <div className="panel-head"><div><div className="panel-title">Monthly Country Snapshot</div><div className="page-sub">Six monthly sales columns plus the current-month run rate. Run rate = month-to-date sales / elapsed calendar days x days in month.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{monthlyColumns.map((column) => <th key={column.key}>{column.current ? `${column.label} actual` : column.label}</th>)}<th>Current month run rate</th></tr></thead><tbody>{monthlyMarkets.map((market) => { const actual = market.byMonth.get(monthlyColumns[monthlyColumns.length - 1]?.key) || 0; const runRate = currentMonthDays ? (actual / currentMonthDays) * currentMonthTotalDays : null; return <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{monthlyColumns.map((column) => <td key={column.key} className="money">{fmtMoney(market.byMonth.get(column.key) || 0, market.currency, 0, market.country)}</td>)}<td className="money">{fmtMoney(runRate, market.currency, 0, market.country)}</td></tr>; })}</tbody></table></div>
+        </div>
+        <div className="panel brand-portfolio-table-panel">
           <div className="panel-head"><div><div className="panel-title">7-Day Country Performance</div><div className="page-sub">Each row stays in its marketplace currency. Blank days mean no saved sale, not an estimated zero.</div></div></div>
           <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{days.map((day) => <th key={day}>{fmtDateHuman(day).replace(/, \d{4}$/, "")}</th>)}<th>7D Total</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{days.map((day) => <td key={day} className="money">{market.byDate.has(day) ? fmtMoney(market.byDate.get(day).sales, market.currency, 0, market.country) : "-"}</td>)}<td className="money">{fmtMoney(days.reduce((sum, day) => sum + (market.byDate.get(day)?.sales || 0), 0), market.currency, 0, market.country)}</td></tr>)}</tbody></table></div>
         </div>
         <div className="footer-note">Brand View uses the same DataDoe Order Line Items and Product Catalog mapping as Account View. It includes only accounts the signed-in user can access. Refresh is manual; it checks each accessible account sequentially to respect DataDoe limits. Advertising, FBA inventory, and TACoS are intentionally not shown here until country-level source data is fetched and reconciled for this brand.</div>
       </>}
       {loading && progress && <div className="brand-portfolio-progress" role="status">Refreshing {brand}: {progress.completed} of {progress.total} accounts checked{progress.account ? ` (${progress.account})` : ""}.</div>}
+      {directoryLoading && directoryProgress && <div className="brand-portfolio-progress" role="status">Loading portfolio brands: {directoryProgress.completed} of {directoryProgress.total} accounts checked{directoryProgress.account ? ` (${directoryProgress.account})` : ""}.</div>}
     </div>
   );
 }
@@ -1233,6 +1263,13 @@ function DashboardApp({ session, access, onSignOut }) {
   const [brandPortfolioCacheMissing, setBrandPortfolioCacheMissing] = useState(false);
   const [brandPortfolioFetchedAt, setBrandPortfolioFetchedAt] = useState(null);
   const [brandPortfolioProgress, setBrandPortfolioProgress] = useState(null);
+  // A fresh browser has no cached account catalog. This explicit, manual
+  // discovery pass fills the portfolio Brand dropdown before a brand is chosen.
+  const [brandDirectoryLoading, setBrandDirectoryLoading] = useState(false);
+  const [brandDirectoryError, setBrandDirectoryError] = useState(null);
+  const [brandDirectoryProgress, setBrandDirectoryProgress] = useState(null);
+  const [brandDirectoryFetchedAt, setBrandDirectoryFetchedAt] = useState(null);
+  const [brandDirectoryVersion, setBrandDirectoryVersion] = useState(0);
   const [rangePreset, setRangePreset] = useState("30D");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -1454,6 +1491,43 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (dashboardMode === "brand") loadCachedBrandPortfolio();
   }, [dashboardMode, loadCachedBrandPortfolio]);
+
+  const fetchBrandDirectory = useCallback(async () => {
+    if (!accounts.length || brandDirectoryLoading) return;
+    setBrandDirectoryLoading(true);
+    setBrandDirectoryError(null);
+    setBrandDirectoryProgress({ completed: 0, total: accounts.length, account: "" });
+    const errors = [];
+    try {
+      // This is an explicit setup action for a fresh browser. It asks each
+      // allowed account for the same proven 14-month account snapshot used by
+      // Account View, then saves it so selecting a brand costs nothing.
+      for (let index = 0; index < accounts.length; index++) {
+        const account = accounts[index];
+        setBrandDirectoryProgress({ completed: index, total: accounts.length, account: account.name });
+        const accountToday = marketplaceToday(account.country);
+        const params = {
+          action: "brand-sales", reportVersion: "order-items-v2-quality", ids: account.id,
+          from: addDays(monthStart(accountToday), -420), to: accountToday,
+        };
+        try {
+          const body = await apiGet(params);
+          writeApiCache(params, body);
+        } catch (accountError) {
+          errors.push({ accountName: account.name, message: accountError.message });
+        }
+        setBrandDirectoryProgress({ completed: index + 1, total: accounts.length, account: account.name });
+      }
+      setBrandDirectoryVersion((version) => version + 1);
+      setBrandDirectoryFetchedAt(new Date());
+      if (errors.length) setBrandDirectoryError(`${errors.length} account${errors.length === 1 ? "" : "s"} could not be read. Available brands were loaded from the accounts that completed: ${errors.map((error) => error.accountName).join(", ")}.`);
+    } catch (error) {
+      setBrandDirectoryError(error.message);
+    } finally {
+      setBrandDirectoryLoading(false);
+      setBrandDirectoryProgress(null);
+    }
+  }, [accounts, brandDirectoryLoading]);
 
   const loadCachedRows = useCallback(() => {
     if (!dashboardParams) {
@@ -2312,7 +2386,7 @@ function DashboardApp({ session, access, onSignOut }) {
     accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));
     if (selectedPortfolioBrand) names.add(selectedPortfolioBrand);
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [accounts, selectedPortfolioBrand, brandPortfolioFetchedAt, rows]);
+  }, [accounts, selectedPortfolioBrand, brandPortfolioFetchedAt, brandDirectoryVersion, rows]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -2518,7 +2592,7 @@ function DashboardApp({ session, access, onSignOut }) {
      own, so it is deliberately not refreshable from here. */
   const showingBrandPortfolio = view === "dashboard" && dashboardMode === "brand";
   const activeStamp = onFeed ? null
-    : showingBrandPortfolio ? brandPortfolioFetchedAt
+    : showingBrandPortfolio ? (selectedPortfolioBrand ? brandPortfolioFetchedAt : brandDirectoryFetchedAt)
     : activeInsightReport ? activeInsightReport.cachedAt
     : view === "fbaplan" ? planCachedAt
     : view === "reconciliation" ? reconciliationCachedAt
@@ -2526,7 +2600,7 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "keywordrank" ? keywordRankCachedAt
     : view === "contentchanges" ? contentChangesCachedAt
     : lastFetchedAt;
-  const activeBusy = showingBrandPortfolio ? brandPortfolioLoading
+  const activeBusy = showingBrandPortfolio ? (selectedPortfolioBrand ? brandPortfolioLoading : brandDirectoryLoading)
     : activeInsightReport ? activeInsightReport.loading
     : view === "daily" ? dailyLoading
     : view === "fbaplan" ? planLoading
@@ -2538,7 +2612,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const accountLabel = refreshScopeAccount?.name || "selected account";
   const refreshScopeLabel = showingBrandPortfolio ? (selectedPortfolioBrand || "portfolio brand") : accountLabel;
   const refreshDescriptor = {
-    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? "Portfolio refresh" : "Last refreshed",
+    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? (selectedPortfolioBrand ? "Portfolio refresh" : "Brand directory") : "Last refreshed",
     value: onFeed
       ? accountLabel
       : activeBusy
@@ -2549,7 +2623,7 @@ function DashboardApp({ session, access, onSignOut }) {
     live: Boolean(activeStamp) || onFeed,
     busy: activeBusy,
     onRefresh: onFeed ? undefined
-      : showingBrandPortfolio ? fetchBrandPortfolio
+      : showingBrandPortfolio ? (selectedPortfolioBrand ? fetchBrandPortfolio : fetchBrandDirectory)
       : activeInsightReport ? activeInsightReport.refresh
       : view === "daily" ? fetchDaily
       : view === "fbaplan" ? fetchPlan
@@ -2562,11 +2636,13 @@ function DashboardApp({ session, access, onSignOut }) {
     // the documented duplicate-refresh gap: repeated clicks could previously
     // launch concurrent 25-45 s DataDoe exports for the dashboard, Daily
     // Reporting and the FBA plan.
-    disabled: onFeed || activeBusy || (showingBrandPortfolio && !selectedPortfolioBrand),
+    disabled: onFeed || activeBusy || (showingBrandPortfolio && !accounts.length),
     hint: onFeed
       ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
       : showingBrandPortfolio
-        ? "Refresh this brand across accessible accounts from DataDoe. This is the only Brand View action that calls DataDoe."
+        ? selectedPortfolioBrand
+          ? "Refresh this brand across accessible accounts from DataDoe. This is the only Brand View action that calls DataDoe."
+          : "Load the portfolio brand list from accessible accounts. This is a manual DataDoe action and is required once on a fresh browser."
         : activeInsightReport
         ? "Refresh this report from DataDoe for the selected account and save it for everyone with access"
         : `Refresh ${accountLabel} from DataDoe`,
@@ -2587,6 +2663,7 @@ function DashboardApp({ session, access, onSignOut }) {
           mobileOpen={mobileOpen}
           onCloseMobile={() => setMobileOpen(false)}
           onSignOut={onSignOut}
+          brandMode={view === "dashboard" && dashboardMode === "brand"}
         />
 
         {mobileOpen && <div className="sb-backdrop" onClick={() => setMobileOpen(false)} />}
@@ -2625,6 +2702,10 @@ function DashboardApp({ session, access, onSignOut }) {
           cacheMissing={brandPortfolioCacheMissing}
           progress={brandPortfolioProgress}
           onRefresh={fetchBrandPortfolio}
+          directoryLoading={brandDirectoryLoading}
+          directoryError={brandDirectoryError}
+          directoryProgress={brandDirectoryProgress}
+          onLoadBrandDirectory={fetchBrandDirectory}
           rangePreset={rangePreset}
           onPresetChange={setRangePreset}
           customFrom={customFrom}

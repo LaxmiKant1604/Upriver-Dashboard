@@ -103,7 +103,7 @@ export const VIEW_TITLES = NAV_GROUPS.reduce((titles, group) => {
 export function Sidebar({
   view, onNavigate, isAdmin, email,
   collapsed, onToggleCollapse,
-  mobileOpen, onCloseMobile, onSignOut,
+  mobileOpen, onCloseMobile, onSignOut, brandMode = false,
 }) {
   // Escape closes the mobile drawer. Bound only while it is open.
   useEffect(() => {
@@ -130,7 +130,10 @@ export function Sidebar({
       </div>
 
       <nav className="sb-nav">
-        {NAV_GROUPS.map((group) => {
+        {(brandMode ? [{
+          label: "Brand View",
+          items: [{ view: "dashboard", label: "Brand Dashboard", title: "Daily, monthly and seven-day country performance", icon: LayoutDashboard }],
+        }] : NAV_GROUPS).map((group) => {
           const items = group.items.filter((item) => !item.adminOnly || isAdmin);
           if (!items.length) return null;
           return (

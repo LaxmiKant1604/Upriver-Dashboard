@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-31 (account-scoped brand selector and Brand View deployed and verified)
+Last updated: 2026-07-31 (Brand View first-use brand loading and focused reports implemented locally; deployment pending)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-07-31; deployed)
+## Account-scoped brands and Brand View (2026-07-31; follow-up deployment pending)
 
 ### Completed locally
 
@@ -1151,6 +1151,17 @@ the previous anonymous data API is no longer accessible.
   it checks them one at a time. Progress is visible in the page. Subsequent
   opens and date/filter changes use saved browser data and make no DataDoe API
   call.
+- **First-use brand dropdown follow-up:** a new browser could have no saved
+  brand-sales response, leaving the Brand View dropdown empty. Brand View now
+  presents an explicit `Load portfolio brands` action (and enables the header
+  refresh button with the same purpose when no brand is selected). It manually
+  reads each permitted account sequentially, stores the responses, then fills
+  the dropdown. It never runs on navigation or automatically.
+- While Brand View is active, the sidebar intentionally contains only `Brand
+  Dashboard`; switching back to Account View restores the full application
+  navigation. Brand View itself now contains only the three requested
+  country-level reports: `Country Snapshot`, `Monthly Country Snapshot` (six
+  months plus current-month run rate), and `7-Day Country Performance`.
 - `npm run verify` passed after implementation: 53 deterministic assertions
   and the full Vite build (1,071 kB main bundle; existing chunk-size warning
   remains only a performance follow-up).
