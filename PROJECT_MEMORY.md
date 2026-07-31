@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-31 (account-scoped brand selector and Brand View implemented locally; verification passed, deployment pending)
+Last updated: 2026-07-31 (account-scoped brand selector and Brand View deployed and verified)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-07-31; deployment pending)
+## Account-scoped brands and Brand View (2026-07-31; deployed)
 
 ### Completed locally
 
@@ -1152,8 +1152,13 @@ the previous anonymous data API is no longer accessible.
   opens and date/filter changes use saved browser data and make no DataDoe API
   call.
 - `npm run verify` passed after implementation: 53 deterministic assertions
-  and the full Vite build. Production deployment still needs to be triggered
-  by committing and pushing the pending changes.
+  and the full Vite build (1,071 kB main bundle; existing chunk-size warning
+  remains only a performance follow-up).
+- Feature commit **`7f23e9a`** (`Add account scoped brand portfolio view`) is
+  pushed to `origin/main`. Vercel auto-deployment was verified on the stable
+  production URL: the deployed JavaScript contains `brand-portfolio-v1`,
+  `Brand View`, and `Portfolio brand` markers. Production URL:
+  https://upriverdashboard.vercel.app
 
 ## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)
 
