@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-02 (Brand View HTTP 402 shared-snapshot fallback implemented locally; deployment pending)
+Last updated: 2026-08-02 (Brand View HTTP 402 shared-snapshot fallback deployed)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-08-02; HTTP 402 fallback deployment pending)
+## Account-scoped brands and Brand View (2026-08-02; HTTP 402 fallback deployed)
 
 ### Completed locally
 
@@ -1189,6 +1189,11 @@ the previous anonymous data API is no longer accessible.
   an upstream billing/source-access condition, not a browser dropdown bug;
   no code can truthfully generate catalog brands when neither DataDoe nor a
   prior saved catalog is available.
+- HTTP 402 fallback commit **`fd7a2e9`** (`Fallback brand directory to shared
+  snapshots`) is deployed as
+  `https://upriver-dashboard-3p5c9ibvn-laxmikant1604s-projects.vercel.app`
+  and assigned to the stable production alias. Vercel completed a full nested
+  app build and deployed the updated `api/datadoe` serverless function.
 - `npm run verify` passed after implementation: 53 deterministic assertions
   and the full Vite build (1,071 kB main bundle; existing chunk-size warning
   remains only a performance follow-up).
