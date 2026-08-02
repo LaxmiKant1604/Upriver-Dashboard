@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-07-31 (Brand View first-use loading and focused reports deployed and verified)
+Last updated: 2026-08-02 (Brand View catalog directory picker implemented locally; deployment pending)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-07-31; follow-up deployed)
+## Account-scoped brands and Brand View (2026-08-02; catalog picker deployment pending)
 
 ### Completed locally
 
@@ -1162,6 +1162,20 @@ the previous anonymous data API is no longer accessible.
   navigation. Brand View itself now contains only the three requested
   country-level reports: `Country Snapshot`, `Monthly Country Snapshot` (six
   months plus current-month run rate), and `7-Day Country Performance`.
+- **Catalog directory correction (2026-08-02):** the former first-use loader
+  scanned 14 months of `brand-sales` for every account. That was slow and
+  could leave the picker empty for a long time. The manual loader now calls
+  `GET /api/datadoe?action=brand-directory&ids=<allowed-account-ids>`, which
+  fetches only Product Catalog brand names. The server checks every requested
+  account against the signed-in user's permissions, partitions primary and
+  secondary DataDoe account IDs by connection, batches export IDs in groups of
+  five, and returns one sorted, deduplicated global brand list. Neither API
+  key reaches the browser.
+- The returned directory is cached per signed-in user and exact allowed-account
+  signature. On Brand View it is read from cache first; only `Load portfolio
+  brands` or the header refresh button with no selected brand calls DataDoe.
+  A changed account-access scope clears an unmatched directory cache so brands
+  from a previous user's scope cannot remain visible.
 - `npm run verify` passed after implementation: 53 deterministic assertions
   and the full Vite build (1,071 kB main bundle; existing chunk-size warning
   remains only a performance follow-up).

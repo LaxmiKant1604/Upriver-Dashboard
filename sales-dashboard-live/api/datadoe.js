@@ -782,6 +782,42 @@ export default async function handler(req, res) {
       return;
     }
 
+    // Brand View needs a global picker before a user has selected an account.
+    // This is deliberately a manual, catalog-only request: it avoids the old
+    // 14-month order-history scan merely to populate a dropdown. Requested
+    // public IDs are still authorized, then partitioned by DataDoe connection
+    // so the primary and secondary API keys can never be mixed in one export.
+    if (action === "brand-directory") {
+      if (!publicAccountIds.length) {
+        res.status(400).json({ error: "Brand directory requires at least one accessible account." });
+        return;
+      }
+      assertAccountAccess(access, publicAccountIds);
+      const idsByConnection = new Map();
+      for (const publicAccountId of publicAccountIds) {
+        const scope = resolveDataDoeAccountIds([publicAccountId], connections);
+        const entry = idsByConnection.get(scope.connection.id) || { connection: scope.connection, ids: [] };
+        entry.ids.push(scope.rawAccountIds[0]);
+        idsByConnection.set(scope.connection.id, entry);
+      }
+      const brands = new Set();
+      for (const { connection, ids } of idsByConnection.values()) {
+        const catalogRows = await fetchExportRows(
+          connection.apiKey,
+          PRODUCT_CATALOG_SOURCE_ID,
+          PRODUCT_CATALOG_COLUMNS,
+          ids,
+          null,
+          null,
+          CATALOG_ROW_LIMIT,
+          { orderByColumn: "child_asin" }
+        );
+        catalogBrandNames(catalogRows).forEach((brand) => brands.add(brand));
+      }
+      res.status(200).json({ brands: [...brands].sort((a, b) => a.localeCompare(b)) });
+      return;
+    }
+
     if (action === "sales") {
       const { ids, from, to } = req.query;
       if (!ids || !from || !to) {
@@ -1569,7 +1605,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });

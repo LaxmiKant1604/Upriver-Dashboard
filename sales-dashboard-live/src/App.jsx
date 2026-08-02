@@ -1269,6 +1269,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const [brandDirectoryError, setBrandDirectoryError] = useState(null);
   const [brandDirectoryProgress, setBrandDirectoryProgress] = useState(null);
   const [brandDirectoryFetchedAt, setBrandDirectoryFetchedAt] = useState(null);
+  const [brandDirectoryBrands, setBrandDirectoryBrands] = useState([]);
   const [brandDirectoryVersion, setBrandDirectoryVersion] = useState(0);
   const [rangePreset, setRangePreset] = useState("30D");
   const [customFrom, setCustomFrom] = useState("");
@@ -1415,6 +1416,11 @@ function DashboardApp({ session, access, onSignOut }) {
       ? { action: "brand-portfolio", reportVersion: "brand-portfolio-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
       : null
   ), [selectedPortfolioBrand, portfolioAccountSignature]);
+  const brandDirectoryCacheParams = useMemo(() => (
+    portfolioAccountSignature
+      ? { action: "brand-directory", reportVersion: "brand-directory-v1", ids: portfolioAccountSignature }
+      : null
+  ), [portfolioAccountSignature]);
 
   const loadCachedBrandPortfolio = useCallback(() => {
     if (!portfolioCacheParams) {
@@ -1492,42 +1498,42 @@ function DashboardApp({ session, access, onSignOut }) {
     if (dashboardMode === "brand") loadCachedBrandPortfolio();
   }, [dashboardMode, loadCachedBrandPortfolio]);
 
+  useEffect(() => {
+    if (dashboardMode !== "brand" || !brandDirectoryCacheParams) return;
+    const cached = readApiCache(brandDirectoryCacheParams);
+    if (!cached) {
+      setBrandDirectoryBrands([]);
+      setBrandDirectoryFetchedAt(null);
+      return;
+    }
+    setBrandDirectoryBrands(cached.body?.brands || []);
+    setBrandDirectoryFetchedAt(new Date(cached.cachedAt));
+    setBrandDirectoryError(null);
+  }, [dashboardMode, brandDirectoryCacheParams]);
+
   const fetchBrandDirectory = useCallback(async () => {
-    if (!accounts.length || brandDirectoryLoading) return;
+    if (!accounts.length || !brandDirectoryCacheParams || brandDirectoryLoading) return;
     setBrandDirectoryLoading(true);
     setBrandDirectoryError(null);
-    setBrandDirectoryProgress({ completed: 0, total: accounts.length, account: "" });
-    const errors = [];
+    setBrandDirectoryProgress({ completed: 0, total: 1, account: "Product Catalog" });
     try {
-      // This is an explicit setup action for a fresh browser. It asks each
-      // allowed account for the same proven 14-month account snapshot used by
-      // Account View, then saves it so selecting a brand costs nothing.
-      for (let index = 0; index < accounts.length; index++) {
-        const account = accounts[index];
-        setBrandDirectoryProgress({ completed: index, total: accounts.length, account: account.name });
-        const accountToday = marketplaceToday(account.country);
-        const params = {
-          action: "brand-sales", reportVersion: "order-items-v2-quality", ids: account.id,
-          from: addDays(monthStart(accountToday), -420), to: accountToday,
-        };
-        try {
-          const body = await apiGet(params);
-          writeApiCache(params, body);
-        } catch (accountError) {
-          errors.push({ accountName: account.name, message: accountError.message });
-        }
-        setBrandDirectoryProgress({ completed: index + 1, total: accounts.length, account: account.name });
-      }
+      // Catalog-only, connection-aware server action. This is substantially
+      // lighter than fetching 14 months of order lines for every account just
+      // to populate a picker.
+      const body = await apiGet(brandDirectoryCacheParams);
+      writeApiCache(brandDirectoryCacheParams, body);
+      setBrandDirectoryBrands(body.brands || []);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
-      if (errors.length) setBrandDirectoryError(`${errors.length} account${errors.length === 1 ? "" : "s"} could not be read. Available brands were loaded from the accounts that completed: ${errors.map((error) => error.accountName).join(", ")}.`);
+      setBrandDirectoryProgress({ completed: 1, total: 1, account: "Product Catalog" });
+      if (!(body.brands || []).length) setBrandDirectoryError("No named brands were returned from the accessible Product Catalog. Refresh the account directory and confirm that your DataDoe catalog source is enabled.");
     } catch (error) {
       setBrandDirectoryError(error.message);
     } finally {
       setBrandDirectoryLoading(false);
       setBrandDirectoryProgress(null);
     }
-  }, [accounts, brandDirectoryLoading]);
+  }, [accounts.length, brandDirectoryCacheParams, brandDirectoryLoading]);
 
   const loadCachedRows = useCallback(() => {
     if (!dashboardParams) {
@@ -2382,11 +2388,11 @@ function DashboardApp({ session, access, onSignOut }) {
     return [...names].sort((a, b) => a.localeCompare(b));
   }, [cachedAccountBrands, rows]);
   const portfolioBrandList = useMemo(() => {
-    const names = new Set();
+    const names = new Set(brandDirectoryBrands);
     accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));
     if (selectedPortfolioBrand) names.add(selectedPortfolioBrand);
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [accounts, selectedPortfolioBrand, brandPortfolioFetchedAt, brandDirectoryVersion, rows]);
+  }, [accounts, selectedPortfolioBrand, brandDirectoryBrands, brandPortfolioFetchedAt, brandDirectoryVersion, rows]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
