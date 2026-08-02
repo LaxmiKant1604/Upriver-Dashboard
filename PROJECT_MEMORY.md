@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-02 (Brand View catalog directory picker deployed and verified)
+Last updated: 2026-08-02 (Brand View HTTP 402 shared-snapshot fallback implemented locally; deployment pending)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-08-02; catalog picker deployed)
+## Account-scoped brands and Brand View (2026-08-02; HTTP 402 fallback deployment pending)
 
 ### Completed locally
 
@@ -1176,6 +1176,19 @@ the previous anonymous data API is no longer accessible.
   brands` or the header refresh button with no selected brand calls DataDoe.
   A changed account-access scope clears an unmatched directory cache so brands
   from a previous user's scope cannot remain visible.
+- **HTTP 402 fallback (2026-08-02):** production returned `DataDoe export
+  status check failed (402)` during the catalog directory request. The server
+  now checks the latest shared snapshot for the permitted account under the
+  Sales Movers, Listing Health, Buy Box Loss, Returns, PPC, and Listing
+  Optimizer report keys before creating any Product Catalog export. Those
+  snapshots already contain `catalogBrands`, so the picker can populate with
+  no DataDoe request when prior report data exists.
+- If no shared snapshot has a catalog brand list and DataDoe still returns
+  HTTP 402, the UI now surfaces a specific operational message: the Product
+  Catalog export needs available DataDoe credits or an enabled source. This is
+  an upstream billing/source-access condition, not a browser dropdown bug;
+  no code can truthfully generate catalog brands when neither DataDoe nor a
+  prior saved catalog is available.
 - `npm run verify` passed after implementation: 53 deterministic assertions
   and the full Vite build (1,071 kB main bundle; existing chunk-size warning
   remains only a performance follow-up).

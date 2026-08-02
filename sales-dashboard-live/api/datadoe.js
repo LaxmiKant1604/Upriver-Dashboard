@@ -26,6 +26,7 @@ import {
   assertAdmin,
   getAdDailyMetrics,
   getDashboardAccess,
+  getLatestReportSnapshot,
   isSupabaseConfigured,
 } from "../lib/server/supabase.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
@@ -167,6 +168,35 @@ const PRODUCT_CATALOG_COLUMNS = [
   "product_name",
   "product_brand",
 ];
+
+// These shared report payloads already carry the Product Catalog brand list.
+// Reading them first lets Brand View recover a picker without paying for a
+// new DataDoe export when the organisation is temporarily out of credits.
+const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
+  SALES_MOVERS_REPORT_KEY,
+  LISTING_HEALTH_REPORT_KEY,
+  BUY_BOX_REPORT_KEY,
+  RETURNS_REPORT_KEY,
+  PPC_REPORT_KEY,
+  OPTIMIZER_REPORT_KEY,
+];
+
+async function sharedSnapshotBrands(accountIds) {
+  if (!isSupabaseConfigured()) return [];
+  const brands = new Set();
+  for (const accountId of accountIds) {
+    const snapshots = await Promise.all(
+      BRAND_DIRECTORY_SNAPSHOT_KEYS.map((reportKey) => getLatestReportSnapshot({ reportKey, accountId }))
+    );
+    snapshots.forEach((snapshot) => {
+      (snapshot?.payload?.catalogBrands || []).forEach((brand) => {
+        const name = String(brand || "").trim();
+        if (name) brands.add(name);
+      });
+    });
+  }
+  return [...brands].sort((a, b) => a.localeCompare(b));
+}
 
 // Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time
 // source reports changes to A+ / branded item content after Amazon publishes
@@ -793,6 +823,11 @@ export default async function handler(req, res) {
         return;
       }
       assertAccountAccess(access, publicAccountIds);
+      const savedBrands = await sharedSnapshotBrands(publicAccountIds);
+      if (savedBrands.length) {
+        res.status(200).json({ brands: savedBrands, source: "shared-snapshot" });
+        return;
+      }
       const idsByConnection = new Map();
       for (const publicAccountId of publicAccountIds) {
         const scope = resolveDataDoeAccountIds([publicAccountId], connections);
@@ -801,20 +836,27 @@ export default async function handler(req, res) {
         idsByConnection.set(scope.connection.id, entry);
       }
       const brands = new Set();
-      for (const { connection, ids } of idsByConnection.values()) {
-        const catalogRows = await fetchExportRows(
-          connection.apiKey,
-          PRODUCT_CATALOG_SOURCE_ID,
-          PRODUCT_CATALOG_COLUMNS,
-          ids,
-          null,
-          null,
-          CATALOG_ROW_LIMIT,
-          { orderByColumn: "child_asin" }
-        );
-        catalogBrandNames(catalogRows).forEach((brand) => brands.add(brand));
+      try {
+        for (const { connection, ids } of idsByConnection.values()) {
+          const catalogRows = await fetchExportRows(
+            connection.apiKey,
+            PRODUCT_CATALOG_SOURCE_ID,
+            PRODUCT_CATALOG_COLUMNS,
+            ids,
+            null,
+            null,
+            CATALOG_ROW_LIMIT,
+            { orderByColumn: "child_asin" }
+          );
+          catalogBrandNames(catalogRows).forEach((brand) => brands.add(brand));
+        }
+      } catch (error) {
+        if (/\b402\b/.test(String(error?.message || error))) {
+          throw new Error("DataDoe could not load the Product Catalog because its export service returned HTTP 402. The shared report cache has no saved brand list for these accounts. Add DataDoe export credits or enable the Product Catalog source, then click Load portfolio brands again.");
+        }
+        throw error;
       }
-      res.status(200).json({ brands: [...brands].sort((a, b) => a.localeCompare(b)) });
+      res.status(200).json({ brands: [...brands].sort((a, b) => a.localeCompare(b)), source: "datadoe-catalog" });
       return;
     }
 
