@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-02 (Brand View catalog directory picker implemented locally; deployment pending)
+Last updated: 2026-08-02 (Brand View catalog directory picker deployed and verified)
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
@@ -1110,7 +1110,7 @@ the previous anonymous data API is no longer accessible.
 
 ## Amazon accounts inventory
 
-## Account-scoped brands and Brand View (2026-08-02; catalog picker deployment pending)
+## Account-scoped brands and Brand View (2026-08-02; catalog picker deployed)
 
 ### Completed locally
 
@@ -1189,6 +1189,12 @@ the previous anonymous data API is no longer accessible.
   assigned to the stable production alias. A production JavaScript check found
   both the `Load portfolio brands` and `Monthly Country Snapshot` feature
   markers.
+- Catalog-picker commit **`8bdb782`** (`Load brand picker from catalog
+  directory`) is deployed as Vercel deployment
+  **`upriver-dashboard-9ebf3pjlq-laxmikant1604s-projects.vercel.app`** and
+  assigned to `https://upriverdashboard.vercel.app`. The production bundle
+  contains the `brand-directory` marker, confirming the public site serves the
+  new picker route.
 
 ### Vercel deployment learning (2026-07-31)
 
