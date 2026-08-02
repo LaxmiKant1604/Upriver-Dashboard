@@ -1,6 +1,21 @@
 # Project Memory
 
-Last updated: 2026-08-02 (Brand View HTTP 402 shared-snapshot fallback deployed)
+Last updated: 2026-08-02 (Seller-dashboard topic reference reviewed)
+
+## External reference review (2026-08-02)
+
+- The GitHub [`seller-dashboard` topic](https://github.com/topics/seller-dashboard)
+  is a collection of unrelated repositories, not a repository, package, or
+  integration that can be added to UPRIVER.
+- Its current prominent entries are generic multi-vendor e-commerce products
+  (for example Noqta Marketplace, Django/MERN marketplace apps, and storefront
+  admin panels), rather than Amazon Seller Central/DataDoe analytics tools.
+- Do not copy or adopt the topic wholesale. Review an individual candidate for
+  licence, maintenance, framework fit, security, and its data model before
+  borrowing a specific pattern. UPRIVER's existing React/Vite, Vercel,
+  Supabase, authentication, access controls, caching, and DataDoe integration
+  remain the source of truth.
+- No application code changed as part of this reference review.
 
 ## MANDATORY RULE FOR ALL FUTURE REPORTS — use the shared design system
 
