@@ -32,6 +32,10 @@ Last updated: 2026-08-02 (shared snapshot persistence fixed for all reports)
   as User A; sign in as User B with access to that account; open the same report
   without pressing Refresh. It must show the saved timestamp/data and produce
   no DataDoe export.
+- **Production deployed:** 2026-08-02 to
+  https://upriverdashboard.vercel.app (Vercel deployment
+  `upriver-dashboard-4l1eglk3h-laxmikant1604s-projects.vercel.app`). The
+  stable URL returned HTTP 200 and served the new frontend bundle.
 
 ## External reference review (2026-08-02)
 
