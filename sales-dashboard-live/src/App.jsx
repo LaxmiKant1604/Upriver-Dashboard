@@ -1367,7 +1367,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const fetchAccounts = useCallback(() => {
     setAccountsLoading(true);
     setAccountsError(null);
-    return cachedApiGet({ action: "accounts" }, { force: true })
+    return refreshSharedReport({ action: "accounts" })
       .then(({ body }) => applyAccounts(body))
       .catch((err) => {
         setAccountsError(err.message);
@@ -1377,10 +1377,13 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [applyAccounts]);
 
   useEffect(() => {
-    const cached = readApiCache({ action: "accounts" });
-    if (cached) applyAccounts(cached.body);
-    else setAccountsError("No cached account list yet. Click refresh to fetch accounts from DataDoe.");
-    setAccountsLoading(false);
+    let active = true;
+    setAccountsLoading(true);
+    loadSharedReport({ action: "accounts" })
+      .then(({ body }) => { if (active) applyAccounts(body); })
+      .catch((error) => { if (active) setAccountsError(error.message); })
+      .finally(() => { if (active) setAccountsLoading(false); });
+    return () => { active = false; };
   }, [applyAccounts]);
 
   const accountById = useMemo(() => {
@@ -1404,7 +1407,7 @@ function DashboardApp({ session, access, onSignOut }) {
     }
     // Bump this whenever the backend changes the metric definition so a
     // previously cached report can never be presented as the new one.
-    return { action: "brand-sales", reportVersion: "order-items-v2-quality", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
+    return { action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
   const portfolioAccountSignature = useMemo(
@@ -1413,16 +1416,16 @@ function DashboardApp({ session, access, onSignOut }) {
   );
   const portfolioCacheParams = useMemo(() => (
     selectedPortfolioBrand && portfolioAccountSignature
-      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
+      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
       : null
   ), [selectedPortfolioBrand, portfolioAccountSignature]);
   const brandDirectoryCacheParams = useMemo(() => (
     portfolioAccountSignature
-      ? { action: "brand-directory", reportVersion: "brand-directory-v1", ids: portfolioAccountSignature }
+      ? { action: "brand-directory", reportVersion: "brand-directory-shared-v1", ids: portfolioAccountSignature }
       : null
   ), [portfolioAccountSignature]);
 
-  const loadCachedBrandPortfolio = useCallback(() => {
+  const loadCachedBrandPortfolio = useCallback(async () => {
     if (!portfolioCacheParams) {
       setBrandPortfolioData(null);
       setBrandPortfolioCacheMissing(false);
@@ -1441,7 +1444,40 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandPortfolioCacheMissing(true);
       setBrandPortfolioError(null);
     }
-  }, [portfolioCacheParams]);
+    if (!selectedPortfolioBrand || !accounts.length) return;
+    const rows = [];
+    const errors = [];
+    try {
+      await Promise.all(accounts.map(async (account) => {
+        const accountToday = marketplaceToday(account.country);
+        const params = {
+          action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
+          from: addDays(monthStart(accountToday), -420), to: accountToday,
+        };
+        try {
+          const { body } = await loadSharedReport(params);
+          if (body.snapshotMissing) {
+            errors.push({ accountId: account.id, accountName: account.name, message: body.message });
+            return;
+          }
+          (body.rows || []).forEach((row) => {
+            if (productBrand(row) !== selectedPortfolioBrand) return;
+            rows.push({ ...row, accountId: account.id, accountName: account.name, accountCountry: account.country, accountCurrency: account.currency });
+          });
+        } catch (error) {
+          errors.push({ accountId: account.id, accountName: account.name, message: error.message });
+        }
+      }));
+      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: accounts.map((account) => account.id) };
+      if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
+      setBrandPortfolioData(payload);
+      setBrandPortfolioFetchedAt(new Date());
+      setBrandPortfolioCacheMissing(Boolean(errors.length && !rows.length));
+      setBrandPortfolioError(errors.length ? `${errors.length} account${errors.length === 1 ? " has" : "s have"} no readable shared Dashboard snapshot yet.` : null);
+    } catch (error) {
+      if (!cached) setBrandPortfolioError(error.message);
+    }
+  }, [accounts, portfolioCacheParams, selectedPortfolioBrand]);
 
   const fetchBrandPortfolio = useCallback(async () => {
     if (!selectedPortfolioBrand || !accounts.length || brandPortfolioLoading) return;
@@ -1459,12 +1495,11 @@ function DashboardApp({ session, access, onSignOut }) {
         setBrandPortfolioProgress({ completed: index, total: accounts.length, account: account.name });
         const accountToday = marketplaceToday(account.country);
         const params = {
-          action: "brand-sales", reportVersion: "order-items-v2-quality", ids: account.id,
+          action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
           from: addDays(monthStart(accountToday), -420), to: accountToday,
         };
         try {
-          const body = await apiGet(params);
-          writeApiCache(params, body);
+          const { body } = await refreshSharedReport(params);
           (body.rows || []).forEach((row) => {
             if (productBrand(row) !== selectedPortfolioBrand) return;
             rows.push({
@@ -1500,15 +1535,21 @@ function DashboardApp({ session, access, onSignOut }) {
 
   useEffect(() => {
     if (dashboardMode !== "brand" || !brandDirectoryCacheParams) return;
-    const cached = readApiCache(brandDirectoryCacheParams);
-    if (!cached) {
-      setBrandDirectoryBrands([]);
-      setBrandDirectoryFetchedAt(null);
-      return;
-    }
-    setBrandDirectoryBrands(cached.body?.brands || []);
-    setBrandDirectoryFetchedAt(new Date(cached.cachedAt));
-    setBrandDirectoryError(null);
+    let active = true;
+    loadSharedReport(brandDirectoryCacheParams)
+      .then(({ body, cachedAt }) => {
+        if (!active) return;
+        if (body.snapshotMissing) {
+          setBrandDirectoryBrands([]);
+          setBrandDirectoryFetchedAt(null);
+          return;
+        }
+        setBrandDirectoryBrands(body.brands || []);
+        setBrandDirectoryFetchedAt(new Date(cachedAt));
+        setBrandDirectoryError(null);
+      })
+      .catch((error) => { if (active) setBrandDirectoryError(error.message); });
+    return () => { active = false; };
   }, [dashboardMode, brandDirectoryCacheParams]);
 
   const fetchBrandDirectory = useCallback(async () => {
@@ -1520,8 +1561,7 @@ function DashboardApp({ session, access, onSignOut }) {
       // Catalog-only, connection-aware server action. This is substantially
       // lighter than fetching 14 months of order lines for every account just
       // to populate a picker.
-      const body = await apiGet(brandDirectoryCacheParams);
-      writeApiCache(brandDirectoryCacheParams, body);
+      const { body } = await refreshSharedReport(brandDirectoryCacheParams);
       setBrandDirectoryBrands(body.brands || []);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
@@ -1535,12 +1575,12 @@ function DashboardApp({ session, access, onSignOut }) {
     }
   }, [accounts.length, brandDirectoryCacheParams, brandDirectoryLoading]);
 
-  const loadCachedRows = useCallback(() => {
+  const loadCachedRows = useCallback(async () => {
     if (!dashboardParams) {
       setRows([]);
       return;
     }
-    const cached = readApiCache(dashboardParams);
+    const cached = await readLargeApiCache(dashboardParams);
     if (cached) {
       setRows(cached.body.rows || []);
       setCatalogBrands(cached.body.catalogBrands || []);
@@ -1556,6 +1596,17 @@ function DashboardApp({ session, access, onSignOut }) {
       setRowsError(null);
       setRowsCacheMissing(true);
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(dashboardParams);
+      setRows(body.rows || []);
+      setCatalogBrands(body.catalogBrands || []);
+      setCatalogBrandsAccountId(selectedAccountId);
+      setLastFetchedAt(new Date(cachedAt));
+      setRowsError(null);
+      setRowsCacheMissing(Boolean(body.snapshotMissing));
+    } catch (error) {
+      if (!cached) setRowsError(error.message);
+    }
   }, [dashboardParams]);
 
   const fetchRows = useCallback(() => {
@@ -1569,7 +1620,7 @@ function DashboardApp({ session, access, onSignOut }) {
     if (rowsLoading) return;
     setRowsLoading(true);
     setRowsError(null);
-    cachedApiGet(dashboardParams, { force: true })
+    refreshSharedReport(dashboardParams)
       .then(({ body, cachedAt }) => {
         setRows(body.rows || []);
         setCatalogBrands(body.catalogBrands || []);
@@ -1592,15 +1643,15 @@ function DashboardApp({ session, access, onSignOut }) {
   const dailyParams = useMemo(() => {
     if (!selectedAccountId) return null;
     const mb = monthBack(TODAY, 5);
-    return { action: "daily", reportVersion: "daily-brand-v1", ids: selectedAccountId, brand: selectedBrand, from: mb.from, to: TODAY };
+    return { action: "daily", reportVersion: "daily-reporting-shared-v1", ids: selectedAccountId, brand: selectedBrand, from: mb.from, to: TODAY };
   }, [selectedAccountId, selectedBrand, TODAY]);
 
-  const loadCachedDaily = useCallback(() => {
+  const loadCachedDaily = useCallback(async () => {
     if (!dailyParams) {
       setDailyRows([]);
       return;
     }
-    const cached = readApiCache(dailyParams);
+    const cached = await readLargeApiCache(dailyParams);
     if (cached) {
       setDailyRows(cached.body.rows || []);
       setLastFetchedAt(new Date(cached.cachedAt));
@@ -1609,13 +1660,21 @@ function DashboardApp({ session, access, onSignOut }) {
       setDailyRows([]);
       setDailyError(null);
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(dailyParams);
+      setDailyRows(body.rows || []);
+      setLastFetchedAt(new Date(cachedAt));
+      setDailyError(body.snapshotMissing ? body.message : null);
+    } catch (error) {
+      if (!cached) setDailyError(error.message);
+    }
   }, [dailyParams]);
 
   const fetchDaily = useCallback(() => {
     if (!dailyParams || dailyLoading) return;
     setDailyLoading(true);
     setDailyError(null);
-    cachedApiGet(dailyParams, { force: true })
+    refreshSharedReport(dailyParams)
       .then(({ body, cachedAt }) => {
         setDailyRows(body.rows || []);
         setLastFetchedAt(new Date(cachedAt));
@@ -1635,15 +1694,15 @@ function DashboardApp({ session, access, onSignOut }) {
     // cached report can never be presented as the current one. `to` (the as-of
     // date) is part of the cache key; the target-coverage input is NOT, because
     // it is applied locally and must never trigger a refetch.
-    return { action: "fba-plan", reportVersion: "fba-plan-v2-transfer-dedupe", ids: selectedAccountId, to: TODAY };
+    return { action: "fba-plan", reportVersion: "fba-plan-shared-v1", ids: selectedAccountId, to: TODAY };
   }, [selectedAccountId, TODAY]);
 
-  const loadCachedPlan = useCallback(() => {
+  const loadCachedPlan = useCallback(async () => {
     if (!planParams) {
       setPlanData(null);
       return;
     }
-    const cached = readApiCache(planParams);
+    const cached = await readLargeApiCache(planParams);
     if (cached) {
       setPlanData(cached.body);
       setPlanCachedAt(new Date(cached.cachedAt));
@@ -1655,13 +1714,28 @@ function DashboardApp({ session, access, onSignOut }) {
       setPlanError(null);
       setSnapshotNotice("No saved FBA Shipment Plan for this account yet. Refresh to fetch it from DataDoe.");
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(planParams);
+      if (body.snapshotMissing) {
+        setPlanData(null);
+        setPlanCachedAt(null);
+        setSnapshotNotice(body.message);
+      } else {
+        setPlanData(body);
+        setPlanCachedAt(new Date(cachedAt));
+        setPlanError(null);
+        setSnapshotNotice(null);
+      }
+    } catch (error) {
+      if (!cached) setPlanError(error.message);
+    }
   }, [planParams]);
 
   const fetchPlan = useCallback(() => {
     if (!planParams || planLoading) return;
     setPlanLoading(true);
     setPlanError(null);
-    cachedApiGet(planParams, { force: true })
+    refreshSharedReport(planParams)
       .then(({ body, cachedAt }) => {
         setPlanData(body);
         setPlanCachedAt(new Date(cachedAt));
@@ -1678,7 +1752,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const reconciliationParams = useMemo(() => {
     if (!selectedAccountId) return null;
     return {
-      action: "reconciliation", reportVersion: "reconciliation-v2", ids: selectedAccountId,
+      action: "reconciliation", reportVersion: "reconciliation-shared-v1", ids: selectedAccountId,
       from: reconciliationWindow.from, to: reconciliationWindow.to,
     };
   }, [selectedAccountId, reconciliationWindow]);
@@ -1703,13 +1777,26 @@ function DashboardApp({ session, access, onSignOut }) {
       setReconciliationError(null);
       setSnapshotNotice("No saved reconciliation for this account yet. Refresh to fetch six completed months from DataDoe.");
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(reconciliationParams);
+      if (body.snapshotMissing) {
+        setReconciliationData(null);
+        setReconciliationCachedAt(null);
+        setSnapshotNotice(body.message);
+      } else {
+        setSnapshotNotice(null);
+        applyReconciliationData(body, cachedAt);
+      }
+    } catch (error) {
+      if (!cached) setReconciliationError(error.message);
+    }
   }, [applyReconciliationData, reconciliationParams]);
 
   const fetchReconciliation = useCallback(() => {
     if (!reconciliationParams || reconciliationLoading) return;
     setReconciliationLoading(true);
     setReconciliationError(null);
-    cachedLargeApiGet(reconciliationParams, { force: true })
+    refreshSharedReport(reconciliationParams)
       .then(({ body, cachedAt }) => applyReconciliationData(body, cachedAt))
       .catch((err) => setReconciliationError(err.message))
       .finally(() => setReconciliationLoading(false));
@@ -1724,7 +1811,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const skuPlParams = useMemo(() => {
     if (!selectedAccountId) return null;
     return {
-      action: "sku-pl", reportVersion: "sku-pl-v1", ids: selectedAccountId,
+      action: "sku-pl", reportVersion: "sku-pl-shared-v1", ids: selectedAccountId,
       from: skuPlWindow.from, to: skuPlWindow.to,
     };
   }, [selectedAccountId, skuPlWindow]);
@@ -1758,13 +1845,26 @@ function DashboardApp({ session, access, onSignOut }) {
       setSkuPlError(null);
       setSnapshotNotice("No saved SKU P&L for this account yet. Refresh to fetch six completed months from DataDoe.");
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(skuPlParams);
+      if (body.snapshotMissing) {
+        setSkuPlData(null);
+        setSkuPlCachedAt(null);
+        setSnapshotNotice(body.message);
+      } else {
+        setSnapshotNotice(null);
+        applySkuPlData(body, cachedAt, accountById[selectedAccountId]?.currency);
+      }
+    } catch (error) {
+      if (!cached) setSkuPlError(error.message);
+    }
   }, [applySkuPlData, skuPlParams, accountById, selectedAccountId]);
 
   const fetchSkuPl = useCallback(() => {
     if (!skuPlParams || skuPlLoading) return;
     setSkuPlLoading(true);
     setSkuPlError(null);
-    cachedLargeApiGet(skuPlParams, { force: true })
+    refreshSharedReport(skuPlParams)
       .then(({ body, cachedAt }) => applySkuPlData(body, cachedAt, accountById[selectedAccountId]?.currency))
       .catch((err) => setSkuPlError(err.message))
       .finally(() => setSkuPlLoading(false));
@@ -1780,7 +1880,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const contentChangesParams = useMemo(() => {
     if (!selectedAccountId) return null;
     return {
-      action: "content-changes", reportVersion: "content-changes-v1", ids: selectedAccountId, asOf: TODAY,
+      action: "content-changes", reportVersion: "content-changes-shared-v1", ids: selectedAccountId, asOf: TODAY,
     };
   }, [selectedAccountId, TODAY]);
 
@@ -1804,13 +1904,26 @@ function DashboardApp({ session, access, onSignOut }) {
       setContentChangesError(null);
       setSnapshotNotice("No saved content alerts for this account yet. Refresh to fetch notifications from DataDoe.");
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(contentChangesParams);
+      if (body.snapshotMissing) {
+        setContentChangesData(null);
+        setContentChangesCachedAt(null);
+        setSnapshotNotice(body.message);
+      } else {
+        setSnapshotNotice(null);
+        applyContentChangesData(body, cachedAt);
+      }
+    } catch (error) {
+      if (!cached) setContentChangesError(error.message);
+    }
   }, [applyContentChangesData, contentChangesParams]);
 
   const fetchContentChanges = useCallback(() => {
     if (!contentChangesParams || contentChangesLoading) return;
     setContentChangesLoading(true);
     setContentChangesError(null);
-    cachedLargeApiGet(contentChangesParams, { force: true })
+    refreshSharedReport(contentChangesParams)
       .then(({ body, cachedAt }) => applyContentChangesData(body, cachedAt))
       .catch((err) => setContentChangesError(err.message))
       .finally(() => setContentChangesLoading(false));
@@ -1826,7 +1939,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const keywordRankParams = useMemo(() => {
     if (!selectedAccountId) return null;
     return {
-      action: "keyword-rank", reportVersion: "keyword-rank-v1", ids: selectedAccountId, to: TODAY,
+      action: "keyword-rank", reportVersion: "keyword-rank-shared-v1", ids: selectedAccountId, to: TODAY,
     };
   }, [selectedAccountId, TODAY]);
 
@@ -1851,13 +1964,26 @@ function DashboardApp({ session, access, onSignOut }) {
       setKeywordRankError(null);
       setSnapshotNotice("No saved Keyword Rank data for this account yet. Refresh to fetch Search Query Performance from DataDoe.");
     }
+    try {
+      const { body, cachedAt } = await loadSharedReport(keywordRankParams);
+      if (body.snapshotMissing) {
+        setKeywordRankData(null);
+        setKeywordRankCachedAt(null);
+        setSnapshotNotice(body.message);
+      } else {
+        setSnapshotNotice(null);
+        applyKeywordRankData(body, cachedAt);
+      }
+    } catch (error) {
+      if (!cached) setKeywordRankError(error.message);
+    }
   }, [applyKeywordRankData, keywordRankParams]);
 
   const fetchKeywordRank = useCallback(() => {
     if (!keywordRankParams || keywordRankLoading) return;
     setKeywordRankLoading(true);
     setKeywordRankError(null);
-    cachedLargeApiGet(keywordRankParams, { force: true })
+    refreshSharedReport(keywordRankParams)
       .then(({ body, cachedAt }) => applyKeywordRankData(body, cachedAt))
       .catch((err) => setKeywordRankError(err.message))
       .finally(() => setKeywordRankLoading(false));
@@ -2384,9 +2510,10 @@ function DashboardApp({ session, access, onSignOut }) {
     // Never carry a prior account's in-memory catalog into the newly selected
     // account. Only rows whose account was selected contribute a brand.
     const currentRowBrands = rows.map(productBrand).filter((brand) => brand !== "Unassigned");
-    const names = new Set([...cachedAccountBrands, ...currentRowBrands]);
+    const currentSnapshotBrands = catalogBrandsAccountId === selectedAccountId ? catalogBrands : [];
+    const names = new Set([...cachedAccountBrands, ...currentSnapshotBrands, ...currentRowBrands]);
     return [...names].sort((a, b) => a.localeCompare(b));
-  }, [cachedAccountBrands, rows]);
+  }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, rows, selectedAccountId]);
   const portfolioBrandList = useMemo(() => {
     const names = new Set(brandDirectoryBrands);
     accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));

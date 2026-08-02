@@ -67,6 +67,69 @@ function snapshotMeta(snapshot) {
   };
 }
 
+// Legacy reports were originally written before the shared store existed.
+// They still build their payload in api/datadoe.js, so this small session API
+// lets those builders claim the same lock and persist through the same schema
+// without duplicating locking or Supabase writes in every route.
+export async function beginSharedRefresh({
+  res, reportKey, reportVersion, accountId, params, userId, label,
+  lockSeconds = DEFAULT_LOCK_SECONDS, present = (payload) => payload,
+}) {
+  const paramsHash = paramsHashFor(reportVersion, params);
+  if (!isSupabaseConfigured()) {
+    return {
+      finish(payload) {
+        res.status(200).json({ ...present(payload), reportKey, reportVersion, paramsHash, shared: false });
+      },
+      release: async () => {},
+    };
+  }
+
+  const locked = await claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds });
+  if (!locked) {
+    res.status(409).json({
+      error: `${label} is already being refreshed for this account. Wait for that refresh to finish, then read the saved data â€” it does not need a second DataDoe export.`,
+    });
+    return null;
+  }
+
+  return {
+    async finish(payload) {
+      const serialised = JSON.stringify(payload);
+      const payloadBytes = Buffer.byteLength(serialised, "utf8");
+      if (payloadBytes > MAX_SNAPSHOT_BYTES) {
+        throw new Error(`${label} produced ${(payloadBytes / (1024 * 1024)).toFixed(1)} MB, above the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB shared-snapshot limit. It was not saved. Narrow the scope (fewer days or a single brand) or aggregate this report further before relying on it.`);
+      }
+      const saved = await saveReportSnapshot({
+        reportKey,
+        accountId,
+        paramsHash,
+        params: { reportVersion, ...params },
+        payload,
+        payloadBytes,
+        sourceRefreshedAt: new Date().toISOString(),
+      });
+      if (saved?.id) {
+        await publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
+      }
+      res.status(200).json({
+        ...present(payload),
+        reportKey,
+        reportVersion,
+        paramsHash,
+        snapshot: {
+          savedAt: saved?.source_refreshed_at || new Date().toISOString(),
+          updatedAt: saved?.updated_at || null,
+          bytes: payloadBytes,
+          shared: true,
+          refreshedBy: userId || null,
+        },
+      });
+    },
+    release: () => releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {}),
+  };
+}
+
 /**
  * Serve one report through the shared snapshot layer.
  *
@@ -80,10 +143,12 @@ function snapshotMeta(snapshot) {
  * @param {string} options.userId         requesting user (audit only)
  * @param {string} options.label          human report name for messages
  * @param {() => Promise<object>} options.build  performs the DataDoe work
+ * @param {(payload: object) => object} [options.present]  removes data the
+ *        current user is not allowed to see after a shared payload is read
  */
 export async function serveSharedReport({
   res, refresh, reportKey, reportVersion, accountId, params, userId, label, build,
-  lockSeconds = DEFAULT_LOCK_SECONDS,
+  lockSeconds = DEFAULT_LOCK_SECONDS, present = (payload) => payload,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
 
@@ -100,7 +165,7 @@ export async function serveSharedReport({
       return;
     }
     const payload = await build();
-    res.status(200).json({ ...payload, reportKey, reportVersion, paramsHash, shared: false });
+    res.status(200).json({ ...present(payload), reportKey, reportVersion, paramsHash, shared: false });
     return;
   }
 
@@ -108,7 +173,7 @@ export async function serveSharedReport({
     const snapshot = await getReportSnapshot({ reportKey, accountId, paramsHash });
     if (snapshot && snapshot.payload) {
       res.status(200).json({
-        ...snapshot.payload,
+        ...present(snapshot.payload),
         reportKey, reportVersion, paramsHash,
         snapshot: snapshotMeta(snapshot),
       });
@@ -124,7 +189,7 @@ export async function serveSharedReport({
     const latest = await getLatestReportSnapshot({ reportKey, accountId });
     if (latest && latest.payload && staleSnapshotMatchesReportVersion(latest, reportVersion)) {
       res.status(200).json({
-        ...latest.payload,
+        ...present(latest.payload),
         reportKey, reportVersion, paramsHash,
         snapshot: {
           ...snapshotMeta(latest),
@@ -173,7 +238,7 @@ export async function serveSharedReport({
       await publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
     }
     res.status(200).json({
-      ...payload,
+      ...present(payload),
       reportKey, reportVersion, paramsHash,
       snapshot: {
         savedAt: saved?.source_refreshed_at || new Date().toISOString(),

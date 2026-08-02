@@ -58,7 +58,7 @@ import {
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
 } from "../lib/server/datadoe-connections.js";
-import { serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import { beginSharedRefresh, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
@@ -196,6 +196,73 @@ async function sharedSnapshotBrands(accountIds) {
     });
   }
   return [...brands].sort((a, b) => a.localeCompare(b));
+}
+
+function stableSelectionId(prefix, accountIds) {
+  return `${prefix}:${[...new Set(accountIds.map(String))].sort().join(",")}`;
+}
+
+// The first dashboard reports predate the shared snapshot layer. Keep their
+// existing builders intact, but give them the exact same saved-data contract as
+// the newer insight reports. Browser storage is now only a fast fallback.
+function legacySharedDescriptor({ action, req, access, publicAccountIds, accountScope }) {
+  const accountId = accountScope?.accountIds?.[0];
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || "");
+  switch (action) {
+    case "accounts":
+      return {
+        reportKey: "account-directory", reportVersion: "account-directory-shared-v1", accountId: "__account-directory__", params: {}, label: "account directory",
+        present: (payload) => ({
+          ...payload,
+          accounts: access.role === "admin"
+            ? (payload.accounts || [])
+            : (payload.accounts || []).filter((account) => access.accountIds.includes(String(account.id))),
+        }),
+      };
+    case "brand-directory":
+      if (!publicAccountIds.length) return null;
+      return {
+        reportKey: "brand-directory", reportVersion: "brand-directory-shared-v1",
+        accountId: stableSelectionId("brand-directory", publicAccountIds),
+        params: { accountIds: [...publicAccountIds].sort().join(",") }, label: "brand directory",
+      };
+    case "sales":
+      if (!publicAccountIds.length || !from || !to) return null;
+      return {
+        reportKey: "sales", reportVersion: "sales-shared-v1",
+        accountId: stableSelectionId("sales", publicAccountIds), params: { from, to }, label: "sales report",
+      };
+    case "brand-sales":
+      if (!accountId || !from || !to) return null;
+      return {
+        reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1", accountId,
+        params: { from, to }, label: "Dashboard",
+      };
+    case "daily":
+      if (!accountId || !from || !to) return null;
+      return {
+        reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v1", accountId,
+        params: { from, to, brand: String(req.query.brand || "ALL") }, label: "Daily Reporting",
+      };
+    case "reconciliation":
+      if (!accountId || !from || !to) return null;
+      return { reportKey: "reconciliation", reportVersion: "reconciliation-shared-v1", accountId, params: { from, to }, label: "Reconciliation" };
+    case "sku-pl":
+      if (!accountId || !from || !to) return null;
+      return { reportKey: "sku-pl", reportVersion: "sku-pl-shared-v1", accountId, params: { from, to }, label: "SKU P&L Analyzer" };
+    case "keyword-rank":
+      if (!accountId || !to) return null;
+      return { reportKey: "keyword-rank", reportVersion: "keyword-rank-shared-v1", accountId, params: { to }, label: "Keyword Rank" };
+    case "content-changes":
+      if (!accountId) return null;
+      return { reportKey: "content-changes", reportVersion: "content-changes-shared-v1", accountId, params: { asOf: String(req.query.asOf || "") }, label: "Content Change Alerts" };
+    case "fba-plan":
+      if (!accountId || !to) return null;
+      return { reportKey: "fba-plan", reportVersion: "fba-plan-shared-v1", accountId, params: { to }, label: "FBA Shipment Plan" };
+    default:
+      return null;
+  }
 }
 
 // Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time
@@ -768,6 +835,7 @@ function mergeSalesAndAds(salesRows, adRows) {
 }
 
 export default async function handler(req, res) {
+  let legacySharedRefresh = null;
   try {
     const access = await getDashboardAccess(req);
     const connections = getDataDoeConnections();
@@ -789,6 +857,35 @@ export default async function handler(req, res) {
     }
     const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
+    // Brand View is multi-account and therefore is not in ACCOUNT_SCOPED_ACTIONS.
+    // Authorise it before the shared-snapshot read as well as before a refresh.
+    if (action === "brand-directory" && publicAccountIds.length) {
+      assertAccountAccess(access, publicAccountIds);
+    }
+
+    const legacyShared = legacySharedDescriptor({ action, req, access, publicAccountIds, accountScope });
+    if (legacyShared) {
+      const sharedOptions = {
+        res,
+        ...legacyShared,
+        userId: access.userId,
+      };
+      if (!wantsRefresh(req)) {
+        // Reading a report is always server-side and shared. It never reaches
+        // DataDoe, even on a new browser or under a different user account.
+        await serveSharedReport({ ...sharedOptions, refresh: false });
+        return;
+      }
+      legacySharedRefresh = await beginSharedRefresh(sharedOptions);
+      if (!legacySharedRefresh) return;
+    }
+    const sendLegacyPayload = async (payload) => {
+      if (legacySharedRefresh) {
+        await legacySharedRefresh.finish(payload);
+        return;
+      }
+      res.status(200).json(payload);
+    };
 
     if (action === "accounts") {
       const accounts = [];
@@ -805,10 +902,7 @@ export default async function handler(req, res) {
           accounts.push(decorateDataDoeAccount(connection, account));
         }
       }
-      const allowedAccounts = access.role === "admin"
-        ? accounts
-        : accounts.filter((account) => access.accountIds.includes(String(account.id)));
-      res.status(200).json({ accounts: allowedAccounts });
+      await sendLegacyPayload({ accounts });
       return;
     }
 
@@ -825,7 +919,7 @@ export default async function handler(req, res) {
       assertAccountAccess(access, publicAccountIds);
       const savedBrands = await sharedSnapshotBrands(publicAccountIds);
       if (savedBrands.length) {
-        res.status(200).json({ brands: savedBrands, source: "shared-snapshot" });
+        await sendLegacyPayload({ brands: savedBrands, source: "shared-snapshot" });
         return;
       }
       const idsByConnection = new Map();
@@ -856,7 +950,7 @@ export default async function handler(req, res) {
         }
         throw error;
       }
-      res.status(200).json({ brands: [...brands].sort((a, b) => a.localeCompare(b)), source: "datadoe-catalog" });
+      await sendLegacyPayload({ brands: [...brands].sort((a, b) => a.localeCompare(b)), source: "datadoe-catalog" });
       return;
     }
 
@@ -868,7 +962,7 @@ export default async function handler(req, res) {
       }
       const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
       const rows = await fetchExportRows(apiKey, DASHBOARD_SOURCE_ID, DASHBOARD_COLUMNS, sellerOrVendorIds, from, to, DASHBOARD_ROW_LIMIT);
-      res.status(200).json({ rows });
+      await sendLegacyPayload({ rows });
       return;
     }
 
@@ -913,7 +1007,7 @@ export default async function handler(req, res) {
       // catalog exports can contain historical metadata that is not present
       // in the requested sales range; derive the response list from the
       // account's already-joined rows instead.
-      res.status(200).json({ rows, catalogBrands: catalogBrandNames(rows) });
+      await sendLegacyPayload({ rows, catalogBrands: catalogBrandNames(rows) });
       return;
     }
 
@@ -946,7 +1040,7 @@ export default async function handler(req, res) {
         );
         // Advertising data is account-level in the current source. Omitting it
         // is safer than presenting the whole account's spend as one brand's.
-        res.status(200).json({ rows: dailyRowsForBrand(salesRaw, catalog, brand), brandFiltered: true });
+        await sendLegacyPayload({ rows: dailyRowsForBrand(salesRaw, catalog, brand), brandFiltered: true });
         return;
       }
 
@@ -991,7 +1085,7 @@ export default async function handler(req, res) {
         ads = normalizeAdRows(adRaw);
       }
       mergeSalesAndAds(rows, ads);
-      res.status(200).json({ rows, brandFiltered: false });
+      await sendLegacyPayload({ rows, brandFiltered: false });
       return;
     }
 
@@ -1027,7 +1121,7 @@ export default async function handler(req, res) {
         apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds, start, end, CATALOG_ROW_LIMIT,
         { orderByColumn: "child_asin" }
       );
-      res.status(200).json({
+      await sendLegacyPayload({
         from: start,
         to: end,
         months: windows.map((w) => w.from.slice(0, 7)),
@@ -1062,7 +1156,7 @@ export default async function handler(req, res) {
       const rows = await fetchSkuPlRows(apiKey, sellerOrVendorIds, windows);
       const currencies = [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort();
       const catalogBrands = [...new Set(rows.map((r) => r.brand).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-      res.status(200).json({
+      await sendLegacyPayload({
         accountId: accountScope.accountIds[0],
         from: start,
         to: end,
@@ -1163,7 +1257,7 @@ export default async function handler(req, res) {
         });
       }
 
-      res.status(200).json({
+      await sendLegacyPayload({
         accountId: accountScope.accountIds[0],
         cadence,
         periods,
@@ -1214,7 +1308,7 @@ export default async function handler(req, res) {
         { orderByColumn: "child_asin", orderByDirection: "ASC" }
       );
       const events = compactContentChangeEvents(notificationRows, catalogRows);
-      res.status(200).json({
+      await sendLegacyPayload({
         accountId: accountScope.accountIds[0],
         events,
         catalogBrands: catalogBrandNames(catalogRows),
@@ -1400,7 +1494,7 @@ export default async function handler(req, res) {
         });
       }
 
-      res.status(200).json({
+      await sendLegacyPayload({
         asOf: String(to),
         accountName: account?.name || null,
         marketCountry: account?.country || null,
@@ -1651,5 +1745,7 @@ export default async function handler(req, res) {
   } catch (err) {
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
+  } finally {
+    await legacySharedRefresh?.release();
   }
 }

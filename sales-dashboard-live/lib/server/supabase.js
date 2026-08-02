@@ -3,7 +3,11 @@
 // integration without exposing the secret key in the Vite bundle.
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
-const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+// Vercel Marketplace projects can expose either the legacy service-role JWT or
+// Supabase's newer secret key. Prefer the service-role key when both exist:
+// it is accepted by every REST/Storage endpoint used by the server snapshot
+// layer, while keeping the newer key as a compatible fallback.
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
 export function isSupabaseConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);

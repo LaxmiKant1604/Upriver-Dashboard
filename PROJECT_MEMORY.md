@@ -1,6 +1,37 @@
 # Project Memory
 
-Last updated: 2026-08-02 (Seller-dashboard topic reference reviewed)
+Last updated: 2026-08-02 (shared snapshot persistence fixed for all reports)
+
+## Shared Data Persistence Fix (2026-08-02)
+
+- **Root cause confirmed:** Supabase contained saved snapshots only for the six
+  newer insight reports (`Sales Movers`, `Listing Health`, `Buy Box Loss`,
+  `Returns`, `PPC`, `Listing Optimizer`). The original Dashboard, Daily
+  Reporting, FBA Shipment Plan, Reconciliation, SKU P&L, Keyword Rank,
+  Content Alerts, account directory, and Brand View still used each browser's
+  `localStorage`/IndexedDB only. A second user therefore saw no saved data and
+  had to refresh DataDoe again.
+- **Fix implemented:** those legacy routes now use the same server-side
+  `report_snapshots` contract: ordinary opens read Supabase only; explicit
+  Refresh claims a cross-user database lock, calls DataDoe once, saves the
+  result, and releases the lock. Brand View refreshes each account sequentially
+  into that account's shared Dashboard snapshot; all users then build the same
+  portfolio view from those snapshots without another export.
+- The account directory and portfolio Brand Directory are also shared. Account
+  responses are filtered after the shared read, so a user only receives their
+  assigned Amazon accounts. Brand-directory access is authorised before every
+  shared read.
+- The API now prefers `SUPABASE_SERVICE_ROLE_KEY` when available and falls
+  back to `SUPABASE_SECRET_KEY`. A live read-only Supabase check succeeded and
+  confirmed the existing snapshot table/migration is healthy.
+- Browser storage remains a fast/offline fallback only; it is no longer the
+  authority. The selected-account Brand dropdown also includes brand names from
+  the current in-memory shared snapshot, avoiding a missing dropdown after a
+  fresh browser login.
+- Verification required after deployment: refresh one selected account/report
+  as User A; sign in as User B with access to that account; open the same report
+  without pressing Refresh. It must show the saved timestamp/data and produce
+  no DataDoe export.
 
 ## External reference review (2026-08-02)
 
