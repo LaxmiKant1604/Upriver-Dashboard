@@ -26,6 +26,7 @@ import {
   assertAdmin,
   getAdDailyMetrics,
   getDashboardAccess,
+  getLatestReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   saveReportSnapshot,
@@ -169,6 +170,60 @@ const PRODUCT_CATALOG_COLUMNS = [
   "product_name",
   "product_brand",
 ];
+
+// Each of these snapshots already preserves catalog brand names at an
+// account-level grain. They let Brand View rebuild its directory from
+// Supabase when DataDoe Product Catalog exports are unavailable or out of
+// credits, without guessing a brand's country from portfolio-wide data.
+const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
+  "brand-sales",
+  "fba-plan",
+  "sku-pl",
+  SALES_MOVERS_REPORT_KEY,
+  LISTING_HEALTH_REPORT_KEY,
+  BUY_BOX_REPORT_KEY,
+  RETURNS_REPORT_KEY,
+  PPC_REPORT_KEY,
+  OPTIMIZER_REPORT_KEY,
+  "content-changes",
+];
+
+function addBrandAccount(brandAccountIds, brand, accountId) {
+  const name = String(brand || "").trim();
+  if (!name) return;
+  const accountIds = brandAccountIds.get(name) || new Set();
+  accountIds.add(String(accountId));
+  brandAccountIds.set(name, accountIds);
+}
+
+function serialiseBrandAccountMap(brandAccountIds) {
+  const brands = [...brandAccountIds.keys()].sort((a, b) => a.localeCompare(b));
+  return {
+    brands,
+    brandAccounts: Object.fromEntries(brands.map((brand) => [brand, [...brandAccountIds.get(brand)].sort()])),
+  };
+}
+
+async function sharedSnapshotBrandAccounts(accountIds) {
+  const brandAccountIds = new Map();
+  const coveredAccountIds = new Set();
+  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds };
+
+  // Most accounts have a saved Dashboard snapshot, so this is typically one
+  // small Supabase read per account. Older report types are only consulted
+  // when the Dashboard did not yet save catalog metadata for that account.
+  await Promise.all(accountIds.map(async (accountId) => {
+    for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS) {
+      const snapshot = await getLatestReportSnapshot({ reportKey, accountId });
+      const brands = snapshot?.payload?.catalogBrands;
+      if (!Array.isArray(brands) || !brands.length) continue;
+      brands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+      coveredAccountIds.add(String(accountId));
+      break;
+    }
+  }));
+  return { brandAccountIds, coveredAccountIds };
+}
 
 function stableSelectionId(prefix, accountIds) {
   return `${prefix}:${[...new Set(accountIds.map(String))].sort().join(",")}`;
@@ -942,14 +997,15 @@ export default async function handler(req, res) {
         return;
       }
       assertAccountAccess(access, publicAccountIds);
-      const brandAccountIds = new Map();
+      const { brandAccountIds, coveredAccountIds } = await sharedSnapshotBrandAccounts(publicAccountIds);
+      const unresolvedAccountIds = publicAccountIds.filter((accountId) => !coveredAccountIds.has(String(accountId)));
       try {
         // Account-scoped catalog reads make the mapping unambiguous. The saved
         // map lets the selected brand refresh only its actual marketplaces;
         // we never infer a country from a similarly named brand in another
         // account. This is still manual and sequential, respecting DataDoe's
         // organisation-wide rate limit.
-        for (const publicAccountId of publicAccountIds) {
+        for (const publicAccountId of unresolvedAccountIds) {
           const scope = resolveDataDoeAccountIds([publicAccountId], connections);
           const catalogRows = await fetchExportRows(
             scope.connection.apiKey,
@@ -961,21 +1017,27 @@ export default async function handler(req, res) {
             CATALOG_ROW_LIMIT,
             { orderByColumn: "child_asin" }
           );
-          catalogBrandNames(catalogRows).forEach((brand) => {
-            const accountIds = brandAccountIds.get(brand) || new Set();
-            accountIds.add(publicAccountId);
-            brandAccountIds.set(brand, accountIds);
-          });
+          catalogBrandNames(catalogRows).forEach((brand) => addBrandAccount(brandAccountIds, brand, publicAccountId));
         }
       } catch (error) {
         if (/\b402\b/.test(String(error?.message || error))) {
-          throw new Error("DataDoe could not load the Product Catalog because its export service returned HTTP 402. The shared report cache has no saved brand list for these accounts. Add DataDoe export credits or enable the Product Catalog source, then click Load portfolio brands again.");
+          const saved = serialiseBrandAccountMap(brandAccountIds);
+          if (saved.brands.length) {
+            await sendLegacyPayload({
+              ...saved,
+              accounts: brandDirectoryAccounts || [],
+              source: "shared-snapshots-partial",
+              partial: true,
+              unresolvedAccountIds,
+            });
+            return;
+          }
+          throw new Error("DataDoe could not load the Product Catalog because its export service returned HTTP 402, and no saved report snapshot contains a brand list for these accounts. Add DataDoe export credits or enable the Product Catalog source, then click Load portfolio brands again.");
         }
         throw error;
       }
-      const brands = [...brandAccountIds.keys()].sort((a, b) => a.localeCompare(b));
-      const brandAccounts = Object.fromEntries(brands.map((brand) => [brand, [...brandAccountIds.get(brand)].sort()]));
-      await sendLegacyPayload({ brands, brandAccounts, accounts: brandDirectoryAccounts || [], source: "datadoe-catalog" });
+      const saved = serialiseBrandAccountMap(brandAccountIds);
+      await sendLegacyPayload({ ...saved, accounts: brandDirectoryAccounts || [], source: unresolvedAccountIds.length ? "datadoe-catalog" : "shared-snapshots" });
       return;
     }
 

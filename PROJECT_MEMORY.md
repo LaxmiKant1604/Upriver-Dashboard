@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View country-account routing deployed)
+Last updated: 2026-08-03 (Brand View cache-first catalog recovery in progress)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -45,6 +45,12 @@ Last updated: 2026-08-03 (Brand View country-account routing deployed)
 - **Deployment:** commit `15a3064` is live as Vercel deployment
   `dpl_4EqvE4JigbeLZyVyL35MT7jYEWwG`; the stable alias returned HTTP 200 and
   served the targeted-marketplace bundle.
+- **Catalog-credit recovery in progress:** DataDoe returned HTTP 402 for a
+  Product Catalog export while loading the Brand Directory. The directory is
+  being changed to derive its exact brand-to-account map first from saved
+  Supabase report snapshots, falling back to a Product Catalog export only for
+  accounts with no saved catalog metadata. A partial saved map remains usable
+  and is labelled rather than blocking the brand dropdown.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 

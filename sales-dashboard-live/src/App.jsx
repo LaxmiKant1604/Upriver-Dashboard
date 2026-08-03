@@ -1575,7 +1575,7 @@ function DashboardApp({ session, access, onSignOut }) {
         setBrandDirectoryAccounts(body.brandAccounts || {});
         if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
         setBrandDirectoryFetchedAt(new Date(cachedAt));
-        setBrandDirectoryError(null);
+        setBrandDirectoryError(body.partial ? "Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots." : null);
       })
       .catch((error) => { if (active) setBrandDirectoryError(error.message); });
     return () => { active = false; };
@@ -1596,6 +1596,7 @@ function DashboardApp({ session, access, onSignOut }) {
       if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
+      if (body.partial) setBrandDirectoryError("Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots.");
       setBrandDirectoryProgress({ completed: 1, total: 1, account: "Product Catalog" });
       if (!(body.brands || []).length) setBrandDirectoryError("No named brands were returned from the accessible Product Catalog. Refresh the account directory and confirm that your DataDoe catalog source is enabled.");
     } catch (error) {
