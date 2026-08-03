@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View v1-directory refresh scope repair in progress)
+Last updated: 2026-08-03 (Brand View v1-directory refresh scope repair deployed)
 
 ## Sellerboard Brand-By-Marketplace Research (2026-08-03)
 
@@ -27,13 +27,18 @@ Last updated: 2026-08-03 (Brand View v1-directory refresh scope repair in progre
   only India, but a red alert reported 26 unrelated accounts with no Dashboard
   snapshot. Cause: a prior v1 Brand Directory supplied brand names without a
   brand-to-account map, and the client fell back to checking every account.
-- **Fix in progress:** a v1 directory now performs a quiet Supabase-only
+- **Fix completed:** a v1 directory now performs a quiet Supabase-only
   discovery pass to identify the selected brand's saved accounts, records that
   map in the session, and refreshes only those accounts. The browser also
   upgrades the legacy directory to the shared v2 map in the background (still
   Supabase-only), so future users load the targeted map directly. Missing
   snapshots for other brands/accounts are not an error and must never trigger
   a DataDoe export or a red Brand View failure.
+- **Deployment:** commit `51fae31` is live as Vercel deployment
+  `dpl_4aTcG8T7hduwqhRY6X47WQgSjieC`; the stable alias returned HTTP 200 and
+  served the legacy-directory scope repair. For Beeline, the subsequent
+  refresh scope is only its discovered India account, and accounts without
+  Beeline are no longer reported as a Brand View failure.
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
