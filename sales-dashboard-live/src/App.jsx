@@ -1173,7 +1173,7 @@ function BrandPortfolioDashboard({
       <div className="page-head">
         <div>
           <div className="page-title">Brand View</div>
-          <div className="page-sub">{brand ? `${brand} across every accessible marketplace` : "Choose a brand to compare its marketplaces."}</div>
+          <div className="page-sub">{brand ? `${brand} across its mapped marketplaces` : "Choose a brand to compare its marketplaces."}</div>
         </div>
       </div>
       <DateRangeSelector
@@ -1189,7 +1189,7 @@ function BrandPortfolioDashboard({
       ) : loading && !rows.length ? (
         <><SkeletonMetricGrid count={4} /><div className="panel"><SkeletonTable rows={7} /></div></>
       ) : cacheMissing && !rows.length ? (
-        <div className="panel"><EmptyState icon={<DatabaseZap size={19} aria-hidden="true" />} title="No saved Brand View yet" actions={<button className="plan-export-btn" type="button" onClick={onRefresh} disabled={loading}><RefreshCw size={14} className={loading ? "spin" : ""} />Refresh brand portfolio</button>}>Refresh scans only the accounts you are allowed to access, saves the result in this browser, and does not run automatically.</EmptyState></div>
+        <div className="panel"><EmptyState icon={<DatabaseZap size={19} aria-hidden="true" />} title="No saved Brand View yet" actions={<button className="plan-export-btn" type="button" onClick={onRefresh} disabled={loading}><RefreshCw size={14} className={loading ? "spin" : ""} />Refresh brand portfolio</button>}>Refresh checks only marketplaces mapped to this brand, saves the result as shared data, and does not run automatically.</EmptyState></div>
       ) : !scoped.length ? (
         <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales for this brand in this range">The saved portfolio data contains no order value for {brand} between {rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : "the selected dates"}.</EmptyState></div>
       ) : <>
@@ -1211,7 +1211,7 @@ function BrandPortfolioDashboard({
           <div className="panel-head"><div><div className="panel-title">7-Day Country Performance</div><div className="page-sub">Each row stays in its marketplace currency. Blank days mean no saved sale, not an estimated zero.</div></div></div>
           <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{days.map((day) => <th key={day}>{fmtDateHuman(day).replace(/, \d{4}$/, "")}</th>)}<th>7D Total</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{days.map((day) => <td key={day} className="money">{market.byDate.has(day) ? fmtMoney(market.byDate.get(day).sales, market.currency, 0, market.country) : "-"}</td>)}<td className="money">{fmtMoney(days.reduce((sum, day) => sum + (market.byDate.get(day)?.sales || 0), 0), market.currency, 0, market.country)}</td></tr>)}</tbody></table></div>
         </div>
-        <div className="footer-note">Brand View uses the same DataDoe Order Line Items and Product Catalog mapping as Account View. It includes only accounts the signed-in user can access. Refresh is manual; it checks each accessible account sequentially to respect DataDoe limits. Advertising, FBA inventory, and TACoS are intentionally not shown here until country-level source data is fetched and reconciled for this brand.</div>
+        <div className="footer-note">Brand View uses the same DataDoe Order Line Items and Product Catalog mapping as Account View. It includes only accounts the signed-in user can access. Refresh is manual; it checks only marketplaces mapped to this brand, sequentially, to respect DataDoe limits. Advertising, FBA inventory, and TACoS are intentionally not shown here until country-level source data is fetched and reconciled for this brand.</div>
       </>}
       {loading && progress && <div className="brand-portfolio-progress" role="status">Refreshing {brand}: {progress.completed} of {progress.total} accounts checked{progress.account ? ` (${progress.account})` : ""}.</div>}
       {directoryLoading && directoryProgress && <div className="brand-portfolio-progress" role="status">Loading portfolio brands: {directoryProgress.completed} of {directoryProgress.total} accounts checked{directoryProgress.account ? ` (${directoryProgress.account})` : ""}.</div>}
@@ -1270,6 +1270,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const [brandDirectoryProgress, setBrandDirectoryProgress] = useState(null);
   const [brandDirectoryFetchedAt, setBrandDirectoryFetchedAt] = useState(null);
   const [brandDirectoryBrands, setBrandDirectoryBrands] = useState([]);
+  const [brandDirectoryAccounts, setBrandDirectoryAccounts] = useState({});
   const [brandDirectoryVersion, setBrandDirectoryVersion] = useState(0);
   const [rangePreset, setRangePreset] = useState("30D");
   const [customFrom, setCustomFrom] = useState("");
@@ -1422,19 +1423,32 @@ function DashboardApp({ session, access, onSignOut }) {
     const ids = discoveredIds.length ? discoveredIds : (isAdmin ? [] : [...allowedAccountIds]);
     return [...new Set(ids)].sort().join(",");
   }, [accounts, allowedAccountIds, isAdmin]);
+  const portfolioAccounts = useMemo(() => {
+    if (!selectedPortfolioBrand) return [];
+    const mappedIds = brandDirectoryAccounts[selectedPortfolioBrand];
+    // A v1 directory has no account map. Keep the old complete-portfolio
+    // behavior for that stale client record until the user refreshes once.
+    if (!Array.isArray(mappedIds)) return accounts;
+    const allowedIds = new Set(mappedIds);
+    return accounts.filter((account) => allowedIds.has(String(account.id)));
+  }, [accounts, brandDirectoryAccounts, selectedPortfolioBrand]);
+  const portfolioBrandAccountSignature = useMemo(
+    () => portfolioAccounts.map((account) => String(account.id)).sort().join(","),
+    [portfolioAccounts]
+  );
   const portfolioCacheParams = useMemo(() => (
-    selectedPortfolioBrand && portfolioAccountSignature
-      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
+    selectedPortfolioBrand && portfolioBrandAccountSignature
+      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v2", brand: selectedPortfolioBrand, ids: portfolioBrandAccountSignature, asOf: marketplaceToday("IN") }
       : null
-  ), [selectedPortfolioBrand, portfolioAccountSignature]);
+  ), [portfolioBrandAccountSignature, selectedPortfolioBrand]);
   const brandDirectoryCacheParams = useMemo(() => {
     if (portfolioAccountSignature) {
-      return { action: "brand-directory", reportVersion: "brand-directory-shared-v1", ids: portfolioAccountSignature };
+      return { action: "brand-directory", reportVersion: "brand-directory-shared-v2", ids: portfolioAccountSignature };
     }
     // Administrators may have no explicit account_permissions rows. Their
     // manual Brand View action lets the server discover connected accounts;
     // do not make this request automatically.
-    return isAdmin ? { action: "brand-directory", reportVersion: "brand-directory-shared-v1" } : null;
+    return isAdmin ? { action: "brand-directory", reportVersion: "brand-directory-shared-v2" } : null;
   }, [isAdmin, portfolioAccountSignature]);
 
   const loadCachedBrandPortfolio = useCallback(async () => {
@@ -1456,11 +1470,11 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandPortfolioCacheMissing(true);
       setBrandPortfolioError(null);
     }
-    if (!selectedPortfolioBrand || !accounts.length) return;
+    if (!selectedPortfolioBrand || !portfolioAccounts.length) return;
     const rows = [];
     const errors = [];
     try {
-      await Promise.all(accounts.map(async (account) => {
+      await Promise.all(portfolioAccounts.map(async (account) => {
         const accountToday = marketplaceToday(account.country);
         const params = {
           action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
@@ -1480,7 +1494,7 @@ function DashboardApp({ session, access, onSignOut }) {
           errors.push({ accountId: account.id, accountName: account.name, message: error.message });
         }
       }));
-      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: accounts.map((account) => account.id) };
+      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: portfolioAccounts.map((account) => account.id) };
       if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
       setBrandPortfolioData(payload);
       setBrandPortfolioFetchedAt(new Date());
@@ -1489,22 +1503,22 @@ function DashboardApp({ session, access, onSignOut }) {
     } catch (error) {
       if (!cached) setBrandPortfolioError(error.message);
     }
-  }, [accounts, portfolioCacheParams, selectedPortfolioBrand]);
+  }, [portfolioAccounts, portfolioCacheParams, selectedPortfolioBrand]);
 
   const fetchBrandPortfolio = useCallback(async () => {
-    if (!selectedPortfolioBrand || !accounts.length || brandPortfolioLoading) return;
+    if (!selectedPortfolioBrand || !portfolioAccounts.length || brandPortfolioLoading) return;
     setBrandPortfolioLoading(true);
     setBrandPortfolioError(null);
-    setBrandPortfolioProgress({ completed: 0, total: accounts.length, account: "" });
+    setBrandPortfolioProgress({ completed: 0, total: portfolioAccounts.length, account: "" });
     const rows = [];
     const errors = [];
     try {
       // A portfolio refresh is intentionally sequential. Each account request
       // itself creates two DataDoe exports, so parallelising this loop would
       // waste tokens and breach the organisation-wide rate limit.
-      for (let index = 0; index < accounts.length; index++) {
-        const account = accounts[index];
-        setBrandPortfolioProgress({ completed: index, total: accounts.length, account: account.name });
+      for (let index = 0; index < portfolioAccounts.length; index++) {
+        const account = portfolioAccounts[index];
+        setBrandPortfolioProgress({ completed: index, total: portfolioAccounts.length, account: account.name });
         const accountToday = marketplaceToday(account.country);
         const params = {
           action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
@@ -1525,9 +1539,9 @@ function DashboardApp({ session, access, onSignOut }) {
         } catch (accountError) {
           errors.push({ accountId: account.id, accountName: account.name, message: accountError.message });
         }
-        setBrandPortfolioProgress({ completed: index + 1, total: accounts.length, account: account.name });
+        setBrandPortfolioProgress({ completed: index + 1, total: portfolioAccounts.length, account: account.name });
       }
-      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: accounts.map((account) => account.id) };
+      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: portfolioAccounts.map((account) => account.id) };
       if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
       setBrandPortfolioData(payload);
       setBrandPortfolioFetchedAt(new Date());
@@ -1539,7 +1553,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandPortfolioLoading(false);
       setBrandPortfolioProgress(null);
     }
-  }, [accounts, brandPortfolioLoading, portfolioCacheParams, selectedPortfolioBrand]);
+  }, [brandPortfolioLoading, portfolioAccounts, portfolioCacheParams, selectedPortfolioBrand]);
 
   useEffect(() => {
     if (dashboardMode === "brand") loadCachedBrandPortfolio();
@@ -1553,10 +1567,12 @@ function DashboardApp({ session, access, onSignOut }) {
         if (!active) return;
         if (body.snapshotMissing) {
           setBrandDirectoryBrands([]);
+          setBrandDirectoryAccounts({});
           setBrandDirectoryFetchedAt(null);
           return;
         }
         setBrandDirectoryBrands(body.brands || []);
+        setBrandDirectoryAccounts(body.brandAccounts || {});
         if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
         setBrandDirectoryFetchedAt(new Date(cachedAt));
         setBrandDirectoryError(null);
@@ -1576,6 +1592,7 @@ function DashboardApp({ session, access, onSignOut }) {
       // to populate a picker.
       const { body } = await refreshSharedReport(brandDirectoryCacheParams);
       setBrandDirectoryBrands(body.brands || []);
+      setBrandDirectoryAccounts(body.brandAccounts || {});
       if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
@@ -2788,7 +2805,7 @@ function DashboardApp({ session, access, onSignOut }) {
       ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
       : showingBrandPortfolio
         ? selectedPortfolioBrand
-          ? "Refresh this brand across accessible accounts from DataDoe. This is the only Brand View action that calls DataDoe."
+          ? "Refresh this brand only across its mapped marketplaces from DataDoe. This is the only Brand View action that calls DataDoe."
           : "Load the portfolio brand list from accessible accounts. This is a manual DataDoe action and is required once on a fresh browser."
         : activeInsightReport
         ? "Refresh this report from DataDoe for the selected account and save it for everyone with access"

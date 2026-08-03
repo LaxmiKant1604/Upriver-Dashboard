@@ -26,7 +26,6 @@ import {
   assertAdmin,
   getAdDailyMetrics,
   getDashboardAccess,
-  getLatestReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   saveReportSnapshot,
@@ -171,35 +170,6 @@ const PRODUCT_CATALOG_COLUMNS = [
   "product_brand",
 ];
 
-// These shared report payloads already carry the Product Catalog brand list.
-// Reading them first lets Brand View recover a picker without paying for a
-// new DataDoe export when the organisation is temporarily out of credits.
-const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
-  SALES_MOVERS_REPORT_KEY,
-  LISTING_HEALTH_REPORT_KEY,
-  BUY_BOX_REPORT_KEY,
-  RETURNS_REPORT_KEY,
-  PPC_REPORT_KEY,
-  OPTIMIZER_REPORT_KEY,
-];
-
-async function sharedSnapshotBrands(accountIds) {
-  if (!isSupabaseConfigured()) return [];
-  const brands = new Set();
-  for (const accountId of accountIds) {
-    const snapshots = await Promise.all(
-      BRAND_DIRECTORY_SNAPSHOT_KEYS.map((reportKey) => getLatestReportSnapshot({ reportKey, accountId }))
-    );
-    snapshots.forEach((snapshot) => {
-      (snapshot?.payload?.catalogBrands || []).forEach((brand) => {
-        const name = String(brand || "").trim();
-        if (name) brands.add(name);
-      });
-    });
-  }
-  return [...brands].sort((a, b) => a.localeCompare(b));
-}
-
 function stableSelectionId(prefix, accountIds) {
   return `${prefix}:${[...new Set(accountIds.map(String))].sort().join(",")}`;
 }
@@ -251,7 +221,7 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
     case "brand-directory":
       if (!publicAccountIds.length) return null;
       return {
-        reportKey: "brand-directory", reportVersion: "brand-directory-shared-v1",
+        reportKey: "brand-directory", reportVersion: "brand-directory-shared-v2",
         accountId: stableSelectionId("brand-directory", publicAccountIds),
         params: { accountIds: [...publicAccountIds].sort().join(",") }, label: "brand directory",
       };
@@ -964,40 +934,38 @@ export default async function handler(req, res) {
     // Brand View needs a global picker before a user has selected an account.
     // This is deliberately a manual, catalog-only request: it avoids the old
     // 14-month order-history scan merely to populate a dropdown. Requested
-    // public IDs are still authorized, then partitioned by DataDoe connection
-    // so the primary and secondary API keys can never be mixed in one export.
+    // public IDs are authorized and resolved one at a time so the resulting
+    // brand-to-account map is exact across both DataDoe connections.
     if (action === "brand-directory") {
       if (!publicAccountIds.length) {
         res.status(400).json({ error: "Brand directory requires at least one accessible account." });
         return;
       }
       assertAccountAccess(access, publicAccountIds);
-      const savedBrands = await sharedSnapshotBrands(publicAccountIds);
-      if (savedBrands.length) {
-        await sendLegacyPayload({ brands: savedBrands, accounts: brandDirectoryAccounts || [], source: "shared-snapshot" });
-        return;
-      }
-      const idsByConnection = new Map();
-      for (const publicAccountId of publicAccountIds) {
-        const scope = resolveDataDoeAccountIds([publicAccountId], connections);
-        const entry = idsByConnection.get(scope.connection.id) || { connection: scope.connection, ids: [] };
-        entry.ids.push(scope.rawAccountIds[0]);
-        idsByConnection.set(scope.connection.id, entry);
-      }
-      const brands = new Set();
+      const brandAccountIds = new Map();
       try {
-        for (const { connection, ids } of idsByConnection.values()) {
+        // Account-scoped catalog reads make the mapping unambiguous. The saved
+        // map lets the selected brand refresh only its actual marketplaces;
+        // we never infer a country from a similarly named brand in another
+        // account. This is still manual and sequential, respecting DataDoe's
+        // organisation-wide rate limit.
+        for (const publicAccountId of publicAccountIds) {
+          const scope = resolveDataDoeAccountIds([publicAccountId], connections);
           const catalogRows = await fetchExportRows(
-            connection.apiKey,
+            scope.connection.apiKey,
             PRODUCT_CATALOG_SOURCE_ID,
             PRODUCT_CATALOG_COLUMNS,
-            ids,
+            scope.rawAccountIds,
             null,
             null,
             CATALOG_ROW_LIMIT,
             { orderByColumn: "child_asin" }
           );
-          catalogBrandNames(catalogRows).forEach((brand) => brands.add(brand));
+          catalogBrandNames(catalogRows).forEach((brand) => {
+            const accountIds = brandAccountIds.get(brand) || new Set();
+            accountIds.add(publicAccountId);
+            brandAccountIds.set(brand, accountIds);
+          });
         }
       } catch (error) {
         if (/\b402\b/.test(String(error?.message || error))) {
@@ -1005,7 +973,9 @@ export default async function handler(req, res) {
         }
         throw error;
       }
-      await sendLegacyPayload({ brands: [...brands].sort((a, b) => a.localeCompare(b)), accounts: brandDirectoryAccounts || [], source: "datadoe-catalog" });
+      const brands = [...brandAccountIds.keys()].sort((a, b) => a.localeCompare(b));
+      const brandAccounts = Object.fromEntries(brands.map((brand) => [brand, [...brandAccountIds.get(brand)].sort()]));
+      await sendLegacyPayload({ brands, brandAccounts, accounts: brandDirectoryAccounts || [], source: "datadoe-catalog" });
       return;
     }
 

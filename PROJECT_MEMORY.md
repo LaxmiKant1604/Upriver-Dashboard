@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View Supabase directory persistence deployed)
+Last updated: 2026-08-03 (Brand View country-account map in progress)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -34,6 +34,10 @@ Last updated: 2026-08-03 (Brand View Supabase directory persistence deployed)
   accounts.
 - **Deployment:** commit `927f77a` is live as Vercel deployment
   `dpl_4XQBxC6TnMMRHEUhuRivns182wJi`; the stable alias returned HTTP 200.
+- **Country-account routing in progress:** Brand View currently reads/refreshes
+  every accessible account after a brand is chosen. The directory is being
+  upgraded to store each catalog brand's exact permitted account IDs. Brand
+  reports will then only read and refresh the countries where that brand exists.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
