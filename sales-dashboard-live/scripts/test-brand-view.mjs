@@ -790,6 +790,156 @@ await asyncTest("a concurrent FX refresh serves the cache rather than a second p
   }
 });
 
+/* ============================ 7b. the cross-account portfolio merge ========= */
+//
+// The portfolio report is the same three tables over more than one account. It
+// must add the same marketplace together, refuse a partial ad sum, and still
+// never let one account's brand appear under another.
+
+const { buildBrandViewPortfolioSnapshot, brandViewPortfolioScopeId } = await import("../lib/server/reports/brand-view.js");
+const { buildBrandTables } = await import("../src/lib/brand-view-tables.js");
+
+// A second account selling the SAME brand in India, plus its own marketplace.
+const ACCOUNT_C = "in-seller-2";
+SNAPSHOTS[`brand-sales|${ACCOUNT_C}`] = {
+  source_refreshed_at: "2026-07-28T04:00:00.000Z",
+  params: { from: "2025-09-01", to: "2026-07-27" },
+  payload: {
+    catalogBrands: ["Bebi Born"],
+    rows: [
+      { date: "2026-07-27", marketplace_country_code: "IT", currency: "EUR", product_brand: "Bebi Born", total_sales: 90, total_units_sold: 9, seller_or_vendor_name: "Bebi Reseller" },
+      { date: "2026-07-27", marketplace_country_code: "DE", currency: "EUR", product_brand: "Bebi Born", total_sales: 20, total_units_sold: 2 },
+    ],
+  },
+};
+
+const PORTFOLIO = await buildBrandViewPortfolioSnapshot({
+  accountIds: [ACCOUNT_A, ACCOUNT_B, ACCOUNT_C],
+  brand: "Bebi Born",
+  asOf: "2026-07-28",
+  accountsById: {
+    [ACCOUNT_A]: { name: "Bebi EU", country: "IT" },
+    [ACCOUNT_C]: { name: "Bebi Reseller", country: "IT" },
+  },
+  getSnapshot: fakeGetSnapshot,
+  getAdsRows: fakeGetAdsRows,
+});
+
+test("the portfolio adds the same marketplace across accounts into one row", () => {
+  assert.equal(PORTFOLIO.scope, "portfolio");
+  const italy = PORTFOLIO.series.find((row) => row.c === "IT" && row.d === "2026-07-27");
+  // 210 from Bebi EU + 90 from Bebi Reseller. Neither account's other brands.
+  assert.equal(italy.s, 300);
+  assert.equal(italy.u, 30);
+  const italyMeta = PORTFOLIO.countries.find((entry) => entry.country === "IT");
+  assert.deepEqual(italyMeta.accounts, ["Bebi EU", "Bebi Reseller"]);
+  // The second account brings a marketplace of its own.
+  assert.ok(PORTFOLIO.countries.some((entry) => entry.country === "DE"));
+});
+
+test("an account that does not sell the brand contributes nothing and is not an error", () => {
+  // ACCOUNT_B sells only "Beeline" and was passed in scope on purpose.
+  assert.ok(!PORTFOLIO.series.some((row) => row.c === "IN"), "another account's unrelated marketplace leaked in");
+  assert.ok(!PORTFOLIO.accounts.some((entry) => entry.id === ACCOUNT_B));
+  assert.equal(PORTFOLIO.accounts.length, 2);
+  assert.ok(PORTFOLIO.notes.some((note) => /contributed nothing/i.test(note)));
+});
+
+test("no brand leakage: the portfolio never mixes in another brand's value", () => {
+  // Nordfell sells 900 in IT and Beeline 41,000 in IN within the same snapshots.
+  assert.ok(!PORTFOLIO.series.some((row) => row.s === 900 || row.s === 41000));
+  assert.equal(PORTFOLIO.brand, "Bebi Born");
+});
+
+test("portfolio ad spend is refused when only some contributing accounts have Ads coverage", () => {
+  // Italy is now sold by two accounts. Only Bebi EU has saved Ads rows there, so
+  // a summed figure would be partial and would understate TACoS.
+  const italy = PORTFOLIO.countries.find((entry) => entry.country === "IT");
+  assert.equal(italy.adsAvailable, false);
+  // The UK is sold by one account, which does have coverage, so it survives.
+  const uk = PORTFOLIO.countries.find((entry) => entry.country === "UK");
+  assert.equal(uk.adsAvailable, true);
+  assert.ok(PORTFOLIO.notes.some((note) => /partial sum/i.test(note)));
+});
+
+test("portfolio sales coverage is the intersection, so last year is only offered when every account can answer", () => {
+  // Bebi EU covers from 2025-05-01, Bebi Reseller only from 2025-09-01.
+  assert.equal(PORTFOLIO.coverage.salesFrom, "2025-09-01");
+  const model = brandViewModel(PORTFOLIO);
+  // 2026-07-27 would need 2025-07-27, which the reseller cannot answer for.
+  assert.equal(lastYearWindow(model, "2026-07-27", "2026-07-27"), null);
+  const rows = dailySnapshotRows(model, { from: "2026-07-27", to: "2026-07-27" }).rows;
+  assert.ok(rows.every((row) => row.lySales === null));
+});
+
+test("a lagging account is named rather than quietly dragging the latest day down", () => {
+  assert.equal(PORTFOLIO.coverage.salesLatestDate, "2026-07-27");
+  assert.equal(PORTFOLIO.coverage.accountCount, 2);
+});
+
+test("the portfolio snapshot key is the account set plus the brand", () => {
+  const key = brandViewPortfolioScopeId([ACCOUNT_C, ACCOUNT_A], "Bebi Born");
+  // Order-independent, so the same scope always hits the same saved row.
+  assert.equal(key, brandViewPortfolioScopeId([ACCOUNT_A, ACCOUNT_C], "Bebi Born"));
+  assert.notEqual(key, brandViewPortfolioScopeId([ACCOUNT_A], "Bebi Born"));
+  assert.notEqual(key, brandViewPortfolioScopeId([ACCOUNT_A, ACCOUNT_C], "Nordfell"));
+});
+
+/* ===================== 7c. the shared tables both pages render ============== */
+
+test("both reports build the same three tables from the same payload shape", () => {
+  for (const [label, payload] of [["account", SNAPSHOT], ["portfolio", PORTFOLIO]]) {
+    const model = brandViewModel(payload);
+    const tables = buildBrandTables(model, {
+      rangeFrom: model.latestDate,
+      rangeTo: model.latestDate,
+      displayCurrency: ORIGINAL_CURRENCY,
+      rates: null,
+    });
+    assert.ok(tables.dailyTable, `${label}: no daily table`);
+    assert.ok(tables.monthlyTable, `${label}: no monthly table`);
+    assert.ok(tables.weeklyTable, `${label}: no weekly table`);
+    assert.deepEqual(
+      tables.dailyTable.headers.map((header) => header.label),
+      ["Country", "Sales", "Last year sales", "Ad spend", "TACoS", "FBA inventory", "Inv. cover (days)", "Units"],
+      `${label}: unexpected Daily Snapshot columns`
+    );
+    // Every currency group leads with its own All Markets total row.
+    const totals = tables.dailyTable.rows.filter((row) => row.kind === "total");
+    assert.equal(totals.length, tables.dailyGroups.length, `${label}: one All Markets row per currency group`);
+    assert.ok(totals.every((row) => row.label === "All Markets"));
+    // The 7-Day report keeps its Units by country section.
+    assert.ok(tables.weeklyTable.rows.some((row) => row.kind === "section" && row.cells[0].t === "Units by country"));
+  }
+});
+
+test("the portfolio table names the accounts behind a shared marketplace", () => {
+  const model = brandViewModel(PORTFOLIO);
+  const tables = buildBrandTables(model, {
+    rangeFrom: "2026-07-27", rangeTo: "2026-07-27",
+    displayCurrency: ORIGINAL_CURRENCY, rates: null,
+  });
+  const italy = tables.dailyTable.rows.find((row) => row.label?.includes("Italy"));
+  assert.ok(italy.sublabel.includes("Bebi EU"), "the contributing accounts must be visible");
+  assert.ok(italy.sublabel.includes("Bebi Reseller"));
+  // Italy has no usable ad coverage across both accounts, so the cell is a dash.
+  assert.equal(italy.cells[3].t, "—");
+  assert.equal(italy.cells[4].t, "—");
+});
+
+test("an unavailable value reaches the table as an em dash, never a zero", () => {
+  const model = brandViewModel(PORTFOLIO);
+  const tables = buildBrandTables(model, {
+    rangeFrom: "2026-07-27", rangeTo: "2026-07-27",
+    displayCurrency: ORIGINAL_CURRENCY, rates: null,
+  });
+  const germany = tables.dailyTable.rows.find((row) => row.label?.includes("Germany"));
+  assert.equal(germany.cells[2].t, "—", "no complete last-year window");
+  assert.equal(germany.cells[3].t, "—", "no ads coverage");
+  // A real measured value is still a number.
+  assert.ok(germany.cells[7].t !== "—");
+});
+
 /* ========================================================== 8. exports */
 
 const EXPORT_MODEL = {

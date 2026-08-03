@@ -1,26 +1,116 @@
 # Project Memory
 
-Last updated: 2026-08-04 (Brand View header/sidebar boundary corrected)
+Last updated: 2026-08-04 (Portfolio Brand View upgraded to the new report format)
 
-## Brand View scope clarification (2026-08-03)
+## Portfolio Brand View upgraded to the shared format (2026-08-04)
 
+**This supersedes the 2026-08-03 "Brand View scope clarification" guardrail
+below.** The owner reviewed the header `Brand view` report on 2026-08-04, saw
+the old layout, and chose "upgrade the portfolio report to the new format" over
+"replace it with the single-account page". Both Brand Views now render the same
+three reports; only the account set differs.
+
+### What changed
+
+- **A defect was found first:** the account-scoped `brandview` route was
+  unreachable. Commit `99b001e` removed the sidebar entry that was the only
+  thing setting `view = "brandview"`, so the module shipped on 2026-08-03 was
+  dead code. The sidebar entry is restored.
+- The header `Brand view` switcher still opens the **cross-account** report —
+  one brand across every account that sells it. That behaviour is unchanged and
+  was explicitly kept.
+- `BrandPortfolioDashboard` in `App.jsx` was **deleted** and replaced by
+  `src/views/BrandPortfolio.jsx`, which renders the shared reports.
+
+### One report definition, two scopes
+
+| Layer | File |
+| --- | --- |
+| Per-account slice | `buildAccountBrandSlice` in `lib/server/reports/brand-view.js` |
+| Merger | `assembleBrandViewPayload` — same payload shape for 1 or N accounts |
+| Single account | `buildBrandViewSnapshot` → action `brand-view` |
+| Cross-account | `buildBrandViewPortfolioSnapshot` → action `brand-view-portfolio` |
+| Tables | `src/lib/brand-view-tables.js` (pure, unit-tested) |
+| Presentation | `src/views/BrandReports.jsx` |
+| Controls | `src/views/brand-controls.jsx`; pure range logic in `src/lib/brand-view.js` |
+
+The portfolio is literally the sum of the same per-account numbers, so the two
+reports cannot drift apart, and the exports consume the same table model as the
+screen.
+
+### Cross-account merge rules
+
+- Sales and units for the same marketplace are **summed** across accounts, and
+  the contributing accounts are named under the country (e.g. India = "Indya
+  Store IN, MeridienMarket IN").
+- **Ad spend is available for a marketplace only when EVERY account selling
+  there has saved Ads coverage.** One covered account out of two would give a
+  partial sum that understates TACoS, so the cell is unavailable instead. The
+  Ads window per marketplace is likewise the intersection.
+- Sales coverage is the intersection (latest start, earliest end), so a
+  last-year comparison is offered only when every contributing account can
+  answer for that window.
+- `salesLatestDate` is the newest date any account populated;
+  `salesCompleteThrough` is the newest date **all** of them have. When they
+  differ, the lagging accounts are named in a note and the freshness bar says
+  "all accounts complete through &lt;date&gt;".
+- Because accounts refresh at different times, the portfolio page opens on
+  **Last 30 days** rather than a single latest day that may be populated for
+  only some accounts. Single-account Brand View still opens on the latest day.
+- Account-level-only FBA inventory is excluded from country rows rather than
+  assigned to a marketplace, and is surfaced on All Markets only when the report
+  has a single currency group.
+
+### Two real bugs fixed while doing this
+
+1. `aggregateBrandSales` took the first currency it saw for a marketplace. Some
+   saved rows carry an empty currency, so if one came first the whole
+   marketplace rendered as "currency unavailable". It now takes the first
+   **non-null** currency.
+2. The FX effect read its own loading flag from the dependency list, so a failed
+   fetch re-ran it in an unbounded retry loop. The attempt is now tracked in a
+   ref, with the Refresh button as the explicit retry.
+
+### Verification (2026-08-04)
+
+- `npm run verify` green: 53 insight + **57** Brand View assertions + build.
+  New cases cover the merge, the conservative ads rule, coverage intersection,
+  the snapshot key, and that both scopes build identical table shapes.
+- **Real-data portfolio reconciliation**, "Caruso Italy" across its 6 mapped
+  accounts, through the real Supabase helpers:
+  - AU raw `50,507.61` vs built `50,507.61`; CA `10,655.65`; IN
+    `38,302,861.92`; US `348,236.05` — **worst delta 7.451e-9** (float noise on
+    a 38-million total).
+  - India and the United States are correctly single merged rows naming both
+    contributing accounts.
+  - Converted USD: group total = sum of visible rows = independent
+    recomputation, **exact**.
+  - Built in 5.6 s, 1,393 country/day rows, 81.7 kB saved snapshot.
+- The bundle **shrank** (1,126 kB → 1,118 kB) because the duplicate report
+  component was removed.
+
+### Finding for the owner
+
+`MeridienMarket IN` has not had its Dashboard refreshed since **2026-04-10**, so
+the combined India figure understates recent days. The report names it rather
+than hiding it. Refresh that account's Dashboard once to correct it.
+
+## Brand View scope clarification (2026-08-03, SUPERSEDED)
+
+- Retained for history. The guardrail below was reversed on 2026-08-04 by the
+  owner's explicit choice; see the section above.
 - The top-header `Brand view` switcher remains the separate portfolio-level
-  report (`BrandPortfolioDashboard` in `App.jsx`). It must not redirect into
-  Account View or the account-scoped `brandview` route.
-- The `Account view` / `Brand view` switcher remains in the header and keeps
-  the two workspaces separate. `Brand view` opens the existing portfolio Brand
-  Dashboard; `Account view` opens the account dashboard.
-- The standalone `Brand View` sidebar item was removed. It was the only sidebar
-  change requested and prevents a second, conflicting Brand View entry from
-  appearing while users work in Account view.
-- **Guardrail:** the 2026-08-04 request was navigation-only. Do not change the
-  portfolio Brand View's report layout, columns, formulas, source selection or
-  cache behavior while changing the Account/Brand header separation. The
-  account-scoped module added previously must not be routed from the header
-  switcher or used as a replacement for this established Brand View report.
-- **Legacy safety fix:** the older portfolio report now trims and uppercases
-  marketplace country and currency keys before grouping. This prevents duplicate
-  country rows when historical saved data differs only by letter case or spaces.
+  report. It must not redirect into Account View or the account-scoped
+  `brandview` route. *(Still true: the header opens the cross-account report,
+  which now uses the new format.)*
+- The standalone `Brand View` sidebar item was removed. *(Reversed — removing it
+  made the account-scoped page unreachable.)*
+- **Guardrail:** do not change the portfolio Brand View's report layout,
+  columns, formulas, source selection or cache behavior. *(Reversed for layout,
+  columns and currency; the sources and cache-only contract are unchanged.)*
+- **Legacy safety fix:** the older portfolio report trimmed and uppercased
+  marketplace country and currency keys before grouping, preventing duplicate
+  country rows. That normalisation is preserved in the new aggregation.
 
 ## Account-Scoped Brand View — NEW MODULE (2026-08-03)
 

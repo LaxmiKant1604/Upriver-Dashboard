@@ -75,10 +75,14 @@ import { buildListingOptimizer, OPTIMIZER_REPORT_KEY, OPTIMIZER_VERSION } from "
 import {
   BRAND_VIEW_BRANDS_REPORT_KEY,
   BRAND_VIEW_BRANDS_VERSION,
+  BRAND_VIEW_PORTFOLIO_REPORT_KEY,
+  BRAND_VIEW_PORTFOLIO_VERSION,
   BRAND_VIEW_REPORT_KEY,
   BRAND_VIEW_VERSION,
+  brandViewPortfolioScopeId,
   brandViewScopeId,
   buildBrandViewBrandDirectory,
+  buildBrandViewPortfolioSnapshot,
   buildBrandViewSnapshot,
 } from "../lib/server/reports/brand-view.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
@@ -1143,7 +1147,14 @@ export default async function handler(req, res) {
     // Brand View is multi-account and therefore is not in ACCOUNT_SCOPED_ACTIONS.
     // Authorise its directory and aggregate portfolio reads before the shared
     // snapshot is served as well as before a manual refresh.
-    if ((action === "brand-directory" || action === "brand-portfolio") && publicAccountIds.length) {
+    // `brand-view-portfolio` is multi-account and can legitimately span both
+    // DataDoe organisations, so it is deliberately not in ACCOUNT_SCOPED_ACTIONS
+    // (that path resolves a single connection). It is authorised here instead,
+    // before any read, exactly like the other portfolio actions.
+    if (
+      (action === "brand-directory" || action === "brand-portfolio" || action === "brand-view-portfolio")
+      && publicAccountIds.length
+    ) {
       assertAccountAccess(access, publicAccountIds);
     }
 
@@ -1261,6 +1272,56 @@ export default async function handler(req, res) {
           brand,
           asOf,
           account: accountMeta,
+          getSnapshot: getLatestReportSnapshot,
+          getAdsRows: getAdsDailySourceRows,
+        }),
+      });
+      return;
+    }
+
+    // The cross-account Brand View: one brand across every account it is mapped
+    // to. Same builder pieces, same payload shape and same client code as the
+    // single-account report above; only the account set differs. Still cache-only:
+    // it aggregates saved snapshots and never starts a DataDoe export.
+    if (action === "brand-view-portfolio") {
+      const brand = String(req.query.brand || "").trim();
+      const asOf = String(req.query.asOf || "");
+      const accountIds = [...new Set(publicAccountIds.map(String))].sort();
+      if (!brand || !accountIds.length || !isDateStr(asOf)) {
+        res.status(400).json({ error: "Brand View requires a brand, one or more allowed account ids, and an asOf date (YYYY-MM-DD)." });
+        return;
+      }
+      // Authorised above for this action, but assert again next to the read so
+      // the guarantee is visible at the point of use.
+      assertAccountAccess(access, accountIds);
+
+      const directory = await getLatestReportSnapshot({
+        reportKey: "account-directory",
+        accountId: "__account-directory__",
+      }).catch(() => null);
+      const accountsById = Object.fromEntries(
+        (directory?.payload?.accounts || [])
+          .filter((entry) => accountIds.includes(String(entry.id)))
+          .map((entry) => [String(entry.id), { name: entry.name || null, country: entry.country || null }])
+      );
+
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: BRAND_VIEW_PORTFOLIO_REPORT_KEY,
+        reportVersion: BRAND_VIEW_PORTFOLIO_VERSION,
+        accountId: brandViewPortfolioScopeId(accountIds, brand),
+        params: { accountIds: accountIds.join(","), brand, asOf },
+        userId: access.userId,
+        label: "Brand View",
+        // Reading a dozen saved Dashboard payloads sequentially takes longer
+        // than a single-account build, so the lock is held for longer.
+        lockSeconds: 300,
+        build: () => buildBrandViewPortfolioSnapshot({
+          accountIds,
+          brand,
+          asOf,
+          accountsById,
           getSnapshot: getLatestReportSnapshot,
           getAdsRows: getAdsDailySourceRows,
         }),
@@ -2173,7 +2234,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=brand-view-portfolio, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });

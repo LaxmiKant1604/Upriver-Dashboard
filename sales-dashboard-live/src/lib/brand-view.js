@@ -77,6 +77,48 @@ export function unconvertibleCurrencies(currencies, displayCurrency, rates) {
     .sort();
 }
 
+/* ============================== DATE RANGE ============================== */
+
+export const RANGE_PRESETS = [
+  { value: "LATEST", label: "Latest reported day" },
+  { value: "7D", label: "Last 7 days" },
+  { value: "30D", label: "Last 30 days" },
+  { value: "MTD", label: "Month to date" },
+  { value: "LASTMONTH", label: "Last full month" },
+  { value: "CUSTOM", label: "Custom range" },
+];
+
+/**
+ * Resolve a preset to a concrete window, clamped to what the saved data covers.
+ *
+ * Everything is measured from `latestDate` — the newest date the source actually
+ * populated — not from the wall clock, so "last 7 days" never silently includes
+ * days the source has not filled.
+ */
+export function resolveRange({ preset, latestDate, coverageFrom, customFrom, customTo }) {
+  if (!latestDate) return ["", ""];
+  let from;
+  let to = latestDate;
+  switch (preset) {
+    case "7D": from = addDays(latestDate, -6); break;
+    case "30D": from = addDays(latestDate, -29); break;
+    case "MTD": from = monthStart(latestDate); break;
+    case "LASTMONTH":
+      from = monthStart(addDays(monthStart(latestDate), -1));
+      to = addDays(monthStart(latestDate), -1);
+      break;
+    case "CUSTOM":
+      from = customFrom || coverageFrom || latestDate;
+      to = customTo || latestDate;
+      break;
+    default: from = latestDate;
+  }
+  if (coverageFrom && from < coverageFrom) from = coverageFrom;
+  if (to > latestDate) to = latestDate;
+  if (from > to) from = to;
+  return [from, to];
+}
+
 /* ============================== THE DATA MODEL ============================== */
 
 /** Safe addition that keeps `null` meaning "unavailable". */
@@ -108,6 +150,10 @@ export function brandViewModel(payload) {
       adsAvailable: false,
       fbaAvailable: null,
       currencyConflict: false,
+      // Which accounts sell this brand in this marketplace. Empty for the
+      // single-account report; populated for the cross-account one, where it is
+      // what tells the reader an India row is two accounts added together.
+      accounts: [],
       byDate: new Map(),
     };
     countries.set(key, created);
@@ -120,6 +166,7 @@ export function brandViewModel(payload) {
     entry.adsAvailable = Boolean(meta.adsAvailable);
     entry.fbaAvailable = meta.fbaAvailable === null || meta.fbaAvailable === undefined ? null : Number(meta.fbaAvailable);
     entry.currencyConflict = Boolean(meta.currencyConflict);
+    entry.accounts = Array.isArray(meta.accounts) ? meta.accounts : [];
   }
 
   for (const row of payload?.series || []) {
@@ -136,8 +183,13 @@ export function brandViewModel(payload) {
   const coverage = payload?.coverage || {};
   return {
     brand: payload?.brand || "",
+    // "account" for the single-account report, "portfolio" for the
+    // cross-account one. The two share every calculation below; only the label
+    // and the per-country account list differ.
+    scope: payload?.scope || "account",
     accountId: payload?.accountId || "",
     accountName: payload?.accountName || null,
+    accounts: payload?.accounts || [],
     asOf: payload?.asOf || null,
     countries: [...countries.values()].sort((a, b) => a.country.localeCompare(b.country)),
     coverage,
@@ -318,6 +370,7 @@ export function dailySnapshotRows(model, { from, to }) {
       key: country.country,
       country: country.country,
       currency: country.currency,
+      accounts: country.accounts,
       currencyConflict: country.currencyConflict,
       sales: current.sales,
       units: current.units,
@@ -394,6 +447,7 @@ export function monthlySnapshotRows(model, anchorDate) {
       key: country.country,
       country: country.country,
       currency: country.currency,
+      accounts: country.accounts,
       byMonth,
       currentActual,
       runRate,
@@ -443,6 +497,7 @@ export function sevenDayRows(model, anchorDate) {
       key: country.country,
       country: country.country,
       currency: country.currency,
+      accounts: country.accounts,
       byDate,
       sales: anySales,
       units: anyUnits,

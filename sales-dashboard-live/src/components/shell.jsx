@@ -31,6 +31,7 @@ import {
   ShieldAlert,
   Store,
   Tag,
+  Tags,
   TrendingUp,
   Trophy,
   Undo2,
@@ -49,6 +50,10 @@ export const NAV_GROUPS = [
     label: "Overview",
     items: [
       { view: "dashboard", label: "Dashboard", title: "Portfolio sales dashboard", icon: LayoutDashboard },
+      // The account-scoped Brand View: one account, one brand. The header's
+      // `Brand view` switcher opens the cross-account version of the same three
+      // reports; both render from src/views/BrandReports.jsx.
+      { view: "brandview", label: "Brand View", title: "Brand View — one account, one brand, every marketplace", icon: Tags },
       { view: "priority", label: "Priority Feed", title: "Priority Feed — every evidenced signal from the six reports, ranked", icon: ListChecks },
     ],
   },
