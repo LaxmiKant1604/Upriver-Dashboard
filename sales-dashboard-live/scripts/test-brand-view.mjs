@@ -901,12 +901,16 @@ test("both reports build the same three tables from the same payload shape", () 
     assert.ok(tables.weeklyTable, `${label}: no weekly table`);
     assert.deepEqual(
       tables.dailyTable.headers.map((header) => header.label),
-      ["Country", "Sales", "Last year sales", "Ad spend", "TACoS", "FBA inventory", "Inv. cover (days)", "Units"],
+      ["Country", "Total Sales", "LY Sales", "Ad Spend", "TACoS%", "FBA Inv.", "Inv Cover", "Units"],
       `${label}: unexpected Daily Snapshot columns`
     );
-    // Every currency group leads with its own All Markets total row.
+    // A group gets an All Markets row when it actually aggregates more than one
+    // marketplace, or when it is the only group and the report needs its top
+    // line. A lone marketplace in its own currency is not printed twice.
     const totals = tables.dailyTable.rows.filter((row) => row.kind === "total");
-    assert.equal(totals.length, tables.dailyGroups.length, `${label}: one All Markets row per currency group`);
+    const expectedTotals = tables.dailyGroups
+      .filter((group) => group.rows.length > 1 || tables.dailyGroups.length === 1).length;
+    assert.equal(totals.length, expectedTotals, `${label}: unexpected number of All Markets rows`);
     assert.ok(totals.every((row) => row.label === "All Markets"));
     // The 7-Day report keeps its Units by country section.
     assert.ok(tables.weeklyTable.rows.some((row) => row.kind === "section" && row.cells[0].t === "Units by country"));
@@ -920,11 +924,52 @@ test("the portfolio table names the accounts behind a shared marketplace", () =>
     displayCurrency: ORIGINAL_CURRENCY, rates: null,
   });
   const italy = tables.dailyTable.rows.find((row) => row.label?.includes("Italy"));
-  assert.ok(italy.sublabel.includes("Bebi EU"), "the contributing accounts must be visible");
-  assert.ok(italy.sublabel.includes("Bebi Reseller"));
+  assert.ok(italy.labelTitle.includes("Bebi EU"), "the contributing accounts must be discoverable");
+  assert.ok(italy.labelTitle.includes("Bebi Reseller"));
+  assert.match(italy.labelTitle, /Combined from 2 accounts/);
   // Italy has no usable ad coverage across both accounts, so the cell is a dash.
   assert.equal(italy.cells[3].t, "—");
   assert.equal(italy.cells[4].t, "—");
+  // More than one currency, so every group is introduced by a currency band.
+  const bands = tables.dailyTable.rows.filter((row) => row.kind === "band");
+  assert.equal(bands.length, tables.dailyGroups.length);
+  // The EUR group aggregates Italy and Germany, so it gets an All Markets row.
+  // The GBP group is the UK alone and is not printed twice.
+  const totals = tables.dailyTable.rows.filter((row) => row.kind === "total");
+  assert.equal(totals.length, 1);
+  const eur = tables.dailyGroups.find((group) => group.currency === "EUR");
+  assert.equal(eur.rows.length, 2, "Italy and Germany share the EUR group");
+});
+
+test("a single-currency report has no currency bands and exactly one All Markets row", () => {
+  // This is the shape the reference report has, and the shape every converted
+  // view has: one plain table, one total row at the top.
+  const model = brandViewModel(PORTFOLIO);
+  const tables = buildBrandTables(model, {
+    rangeFrom: "2026-07-27", rangeTo: "2026-07-27",
+    displayCurrency: "USD", rates: RATES,
+  });
+  assert.equal(tables.dailyGroups.length, 1);
+  assert.equal(tables.dailyTable.rows.filter((row) => row.kind === "band").length, 0, "a single currency needs no divider");
+  assert.equal(tables.dailyTable.rows.filter((row) => row.kind === "total").length, 1);
+  assert.equal(tables.dailyTable.rows[0].label, "All Markets");
+  // The 7-Day report likewise collapses to one block plus the units section.
+  assert.equal(tables.weeklyTable.rows.filter((row) => row.kind === "band").length, 0);
+  assert.equal(tables.weeklyTable.rows.filter((row) => row.kind === "total").length, 1);
+});
+
+test("inventory cover reads in months and a marketplace with no FBA record says n/a", () => {
+  const model = brandViewModel(SNAPSHOT);
+  const tables = buildBrandTables(model, {
+    rangeFrom: model.latestDate, rangeTo: model.latestDate,
+    displayCurrency: ORIGINAL_CURRENCY, rates: null,
+  });
+  const italy = tables.dailyTable.rows.find((row) => row.label?.includes("Italy"));
+  assert.match(italy.cells[6].t, /^\d+\.\d m?$|^\d+\.\dm$/, `expected months, got ${italy.cells[6].t}`);
+  assert.match(italy.hints[6], /days of cover/, "the exact day count stays available in the tooltip");
+  // Poland holds stock but never sold, so it carries the reference's "(FC only)".
+  const poland = tables.dailyTable.rows.find((row) => row.label?.includes("Poland"));
+  assert.match(poland.label, /\(FC only\)/);
 });
 
 test("an unavailable value reaches the table as an em dash, never a zero", () => {

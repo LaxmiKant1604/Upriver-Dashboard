@@ -26,10 +26,16 @@ import {
 } from "./brand-view.js";
 
 export const DASH = "—";
+// The reference report distinguishes "this metric has no value here" (an em
+// dash) from "this marketplace has no inventory record at all" (n/a). Keeping
+// both is more informative than collapsing them, and neither is ever a zero.
+export const NA = "n/a";
 // Ad spend is routinely a fraction of a currency unit, so it keeps two decimals
 // while sales figures stay whole units. This mirrors the reference report.
 export const SALES_DECIMALS = 0;
 export const SPEND_DECIMALS = 2;
+// Mean days per calendar month, used to express inventory cover in months.
+const DAYS_PER_MONTH = 30.44;
 
 /* ============================== FORMATTERS ============================== */
 
@@ -58,15 +64,26 @@ export function ratePct(value, decimals = 1) {
   return `${(Number(value) * 100).toFixed(decimals)}%`;
 }
 
-export function coverLabel(days) {
-  if (days === null || days === undefined || !Number.isFinite(Number(days))) return DASH;
-  return `${Math.round(Number(days)).toLocaleString("en-US")} d`;
+/**
+ * Inventory cover in months, e.g. "3.0m".
+ *
+ * Months rather than days because that is the unit restock decisions are made
+ * in, and it is what the report this screen replaces used. The exact day count
+ * is in the cell tooltip, so nothing is lost.
+ */
+export function coverLabel(days, fallback = DASH) {
+  if (days === null || days === undefined || !Number.isFinite(Number(days))) return fallback;
+  return `${(Number(days) / DAYS_PER_MONTH).toFixed(1)}m`;
+}
+
+export function coverMonths(days) {
+  if (days === null || days === undefined || !Number.isFinite(Number(days))) return null;
+  return Number(days) / DAYS_PER_MONTH;
 }
 
 export function coverHint(days) {
   if (days === null || days === undefined || !Number.isFinite(Number(days))) return undefined;
-  // 30.44 = mean days per calendar month, so the month equivalent is honest.
-  return `${(Number(days) / 30.44).toFixed(1)} months of cover at the current month-to-date daily run rate`;
+  return `${Math.round(Number(days)).toLocaleString("en-US")} days of cover at this brand's month-to-date daily unit run rate`;
 }
 
 /**
@@ -89,34 +106,78 @@ export function cell(text, number) {
     : { t: text, n: Number(number) };
 }
 
-/** The small grey line under a country name. */
-function countrySublabel(row, { converted, scope }) {
+/**
+ * The country cell.
+ *
+ * Deliberately spare: a flag, a name, and a short inline qualifier only when
+ * there is something real to say. Everything else that used to sit under the
+ * name (currency, account names) is either in the currency band above the group
+ * or in the row tooltip, because a sub-line on every row made the table hard to
+ * scan.
+ */
+function countryCellLabel(row) {
+  const parts = [countryTitle(row.country)];
+  // The reference report's "(FC only)": stock in a marketplace with no sales.
+  if (row.salesOnly) parts.push("(FC only)");
+  return parts.join(" ");
+}
+
+function countryCellTitle(row, { scope }) {
   const parts = [];
-  if (row.salesOnly) parts.push("Inventory only (no sales in range)");
-  if (scope === "portfolio" && row.accounts?.length) parts.push(row.accounts.join(", "));
-  parts.push(converted ? `from ${row.currency || "unknown currency"}` : row.currency);
-  if (row.currencyConflict) parts.push("multiple currencies reported");
-  return parts.filter(Boolean).join(" · ");
+  if (scope === "portfolio" && row.accounts?.length) {
+    parts.push(row.accounts.length > 1
+      ? `Combined from ${row.accounts.length} accounts: ${row.accounts.join(", ")}`
+      : row.accounts[0]);
+  }
+  if (row.salesOnly) parts.push("Holds FBA inventory for this brand but recorded no sales in the selected range.");
+  if (row.currencyConflict) parts.push("This marketplace reported more than one currency in the saved data.");
+  return parts.join(" · ") || undefined;
 }
 
-function groupSublabel(group, displayCurrency, suffix) {
+/**
+ * The band that introduces a currency group.
+ *
+ * Rendered only when the report has more than one currency. With a single
+ * currency — which is every converted view, and every single-marketplace-region
+ * account — the table reads exactly like one plain table with one All Markets
+ * row, which is the shape this report is meant to have.
+ */
+function currencyBand(group, displayCurrency, index) {
   const currency = group.converted ? displayCurrency : (group.currency || "currency unavailable");
-  return suffix ? `${suffix} · ${currency}` : currency;
+  const count = group.rows.length;
+  return {
+    key: `band-${group.key}-${index}`,
+    kind: "band",
+    cells: [{ t: `${currency} · ${count} marketplace${count === 1 ? "" : "s"}` }],
+  };
 }
 
+/**
+ * Should this group get an All Markets total row?
+ *
+ * A group with one marketplace would print the same figures twice, once as
+ * "All Markets" and once as the country. So the total is shown when the group
+ * actually aggregates something, or when it is the only group — in which case
+ * the report still needs its top line, exactly as the reference report has.
+ */
+function showsTotalRow(group, groupCount) {
+  return group.rows.length > 1 || groupCount === 1;
+}
 /* ============================== 1. DAILY ============================== */
 
 export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
   if (!daily) return null;
   const converted = isConvertedMode(displayCurrency);
+  const banded = groups.length > 1;
+  const suffix = converted ? ` (${displayCurrency})` : "";
   const headers = [
     { key: "country", label: "Country" },
-    { key: "sales", label: converted ? `Sales (${displayCurrency})` : "Sales" },
-    { key: "ly", label: converted ? `Last year sales (${displayCurrency})` : "Last year sales", hint: "Shown only when the saved snapshot fully covers the equivalent previous-year window." },
-    { key: "spend", label: converted ? `Ad spend (${displayCurrency})` : "Ad spend", hint: "Same-ASIN advertising spend for this brand only. Blank means the saved Ads history cannot answer for this marketplace and window — not zero spend." },
-    { key: "tacos", label: "TACoS", hint: "Brand ad spend divided by brand sales for the same marketplace and window." },
-    { key: "fba", label: "FBA inventory", hint: "Available FBA units for this brand's ASINs from the latest saved FBA snapshot. Never converted." },
-    { key: "cover", label: "Inv. cover (days)", hint: "Available FBA units divided by this brand's month-to-date daily unit run rate." },
+    { key: "sales", label: `Total Sales${suffix}` },
+    { key: "ly", label: `LY Sales${suffix}`, hint: "The equivalent period one year earlier. Shown only when the saved snapshot fully covers that window." },
+    { key: "spend", label: `Ad Spend${suffix}`, hint: "Same-ASIN advertising spend for this brand only. A dash means the saved Ads history cannot answer for this marketplace and window — not zero spend." },
+    { key: "tacos", label: "TACoS%", hint: "Brand ad spend divided by brand sales for the same marketplace and window." },
+    { key: "fba", label: "FBA Inv.", tone: "positive", hint: "Available FBA units for this brand's ASINs from the latest saved FBA snapshot. Never currency converted." },
+    { key: "cover", label: "Inv Cover", tone: "positive", hint: "Months of cover: available FBA units divided by this brand's month-to-date daily unit run rate." },
     { key: "units", label: "Units" },
   ];
 
@@ -129,16 +190,17 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     : null;
 
   const rows = [];
-  for (const group of groups) {
+  groups.forEach((group, index) => {
+    if (banded) rows.push(currencyBand(group, displayCurrency, index));
+
     const groupTacos = tacos(group.totals.adSpend, group.totals.sales);
     const groupFba = group.fbaAvailable === null ? unattributedFba : group.fbaAvailable;
     const groupMtdUnits = group.rows.reduce((sum, row) => sum + (Number(row.mtdUnits) || 0), 0);
     const groupCover = daily.mtd ? inventoryCoverDays(groupFba, groupMtdUnits, daily.mtd.elapsedDays) : null;
-    rows.push({
+    if (showsTotalRow(group, groups.length)) rows.push({
       key: `total-${group.key}`,
       kind: "total",
       label: "All Markets",
-      sublabel: groupSublabel(group, displayCurrency, `${group.rows.length} marketplace${group.rows.length === 1 ? "" : "s"}`),
       hints: [undefined, undefined, undefined, undefined, undefined, undefined, coverHint(groupCover), undefined],
       cells: [
         cell("All Markets"),
@@ -146,33 +208,34 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
         cell(money(group.totals.lySales, group.currency, SALES_DECIMALS), group.totals.lySales),
         cell(money(group.totals.adSpend, group.currency, SPEND_DECIMALS), group.totals.adSpend),
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
-        cell(groupFba === null ? DASH : nInt(groupFba), groupFba),
-        cell(coverLabel(groupCover), groupCover === null ? null : Math.round(groupCover)),
+        cell(groupFba === null ? NA : nInt(groupFba), groupFba),
+        cell(coverLabel(groupCover, NA), coverMonths(groupCover)),
         cell(nInt(group.units), group.units),
       ],
     });
+
     for (const row of group.rows) {
       const rowTacos = tacos(row.adSpend, row.sales);
       rows.push({
         key: `${group.key}-${row.country}`,
         kind: "row",
-        label: countryTitle(row.country),
-        sublabel: countrySublabel(row, { converted, scope }),
+        label: countryCellLabel(row),
+        labelTitle: countryCellTitle(row, { scope }),
         subcells: { 1: sharePct(row.sales, group.totals.sales, group.rows.length) },
         hints: [undefined, undefined, undefined, undefined, undefined, undefined, coverHint(row.coverDays), undefined],
         cells: [
-          cell(countryTitle(row.country)),
+          cell(countryCellLabel(row)),
           cell(money(row.sales, row.displayCurrency, SALES_DECIMALS, converted ? undefined : row.country), row.sales),
           cell(money(row.lySales, row.displayCurrency, SALES_DECIMALS, converted ? undefined : row.country), row.lySales),
           cell(money(row.adSpend, row.displayCurrency, SPEND_DECIMALS, converted ? undefined : row.country), row.adSpend),
           cell(ratePct(rowTacos), rowTacos === null ? null : rowTacos * 100),
-          cell(row.fbaAvailable === null ? DASH : nInt(row.fbaAvailable), row.fbaAvailable),
-          cell(coverLabel(row.coverDays), row.coverDays === null ? null : Math.round(row.coverDays)),
+          cell(row.fbaAvailable === null ? NA : nInt(row.fbaAvailable), row.fbaAvailable),
+          cell(coverLabel(row.coverDays, NA), coverMonths(row.coverDays)),
           cell(nInt(row.units), row.units),
         ],
       });
     }
-  }
+  });
   return { headers, rows };
 }
 
@@ -181,25 +244,28 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
 export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
   if (!monthly || !monthly.columns.current) return null;
   const converted = isConvertedMode(displayCurrency);
+  const banded = groups.length > 1;
   const current = monthly.columns.current;
   const completed = monthly.columns.completed;
+  const currentLabel = monthKeyLabel(current.key).replace(/ '\d\d$/, "");
   const headers = [
     { key: "country", label: "Country" },
     ...completed.map((month) => ({ key: month.key, label: monthKeyLabel(month.key) })),
-    { key: "actual", label: `${monthKeyLabel(current.key)} actual`, hint: `Month to date, ${current.from} to ${current.to}.` },
-    { key: "runrate", label: `${monthKeyLabel(current.key)} run rate`, hint: `Actual / ${current.elapsedDays} elapsed days x ${current.daysInMonth} days in month.` },
-    { key: "spend", label: "Ad spend (MTD)", hint: "Brand same-ASIN spend for the current month to date. Blank means unavailable, not zero." },
-    { key: "tacos", label: "TACoS (MTD)" },
+    { key: "actual", label: `${currentLabel} Act.`, tone: "positive", hint: `Month to date, ${current.from} to ${current.to}.` },
+    { key: "runrate", label: `${currentLabel} RR`, tone: "positive", hint: `Run rate = actual / ${current.elapsedDays} elapsed days x ${current.daysInMonth} days in the month.` },
+    { key: "spend", label: "Ad Spend", tone: "accent", hint: "Brand same-ASIN spend for the current month to date. A dash means unavailable, not zero." },
+    { key: "tacos", label: "TACoS%", tone: "accent" },
   ];
 
   const rows = [];
-  for (const group of groups) {
+  groups.forEach((group, index) => {
+    if (banded) rows.push(currencyBand(group, displayCurrency, index));
+
     const groupTacos = tacos(group.totals.adSpend, group.totals.currentActual);
-    rows.push({
+    if (showsTotalRow(group, groups.length)) rows.push({
       key: `total-${group.key}`,
       kind: "total",
       label: "All Markets",
-      sublabel: groupSublabel(group, displayCurrency, `${group.rows.length} marketplace${group.rows.length === 1 ? "" : "s"}`),
       cells: [
         cell("All Markets"),
         ...completed.map((month) => {
@@ -212,24 +278,26 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
       ],
     });
+
     for (const row of group.rows) {
       const rowTacos = tacos(row.adSpend, row.currentActual);
       // Share of the total this row may legitimately be compared against: its
       // own currency group in original mode, the single converted total
-      // otherwise.
+      // otherwise. A share across currencies would be meaningless.
       const subcells = {};
-      completed.forEach((month, index) => {
-        subcells[index + 1] = sharePct(row[`m_${month.key}`], group.totals[`m_${month.key}`], group.rows.length);
+      completed.forEach((month, monthIndex) => {
+        subcells[monthIndex + 1] = sharePct(row[`m_${month.key}`], group.totals[`m_${month.key}`], group.rows.length);
       });
       subcells[completed.length + 1] = sharePct(row.currentActual, group.totals.currentActual, group.rows.length);
+      subcells[completed.length + 2] = sharePct(row.runRate, group.totals.runRate, group.rows.length);
       rows.push({
         key: `${group.key}-${row.country}`,
         kind: "row",
-        label: countryTitle(row.country),
-        sublabel: countrySublabel(row, { converted, scope }),
+        label: countryCellLabel(row),
+        labelTitle: countryCellTitle(row, { scope }),
         subcells,
         cells: [
-          cell(countryTitle(row.country)),
+          cell(countryCellLabel(row)),
           ...completed.map((month) => {
             const value = row[`m_${month.key}`];
             return cell(money(value, row.displayCurrency, SALES_DECIMALS, converted ? undefined : row.country), value);
@@ -241,7 +309,7 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
         ],
       });
     }
-  }
+  });
   return { headers, rows };
 }
 
@@ -250,35 +318,35 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
 export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope }) {
   if (!weekly || !weekly.dates.length) return null;
   const converted = isConvertedMode(displayCurrency);
+  const banded = groups.length > 1;
   const dates = weekly.dates;
+  const latest = dates[dates.length - 1];
   const shortDate = (date) => fmtDateHuman(date).replace(/, \d{4}$/, "");
   const headers = [
     { key: "metric", label: "Metric" },
-    ...dates.map((date, index) => ({
-      key: date,
-      label: index === dates.length - 1 ? `${shortDate(date)} (latest)` : shortDate(date),
-    })),
-    { key: "total", label: "7-day total" },
+    ...dates.map((date) => ({ key: date, label: shortDate(date), tone: date === latest ? "latest" : undefined })),
+    { key: "total", label: "7D Total", tone: "total" },
   ];
 
   const rows = [];
-  for (const group of groups) {
+  groups.forEach((group, index) => {
+    if (banded) rows.push(currencyBand(group, displayCurrency, index));
+
     const totals = sevenDayColumnTotals(group, dates, displayCurrency, rates);
-    const label = group.converted ? displayCurrency : (group.currency || "currency unavailable");
     const weekSales = group.totals.sales;
     const weekSpend = group.totals.adSpend;
     const weekTacos = tacos(weekSpend, weekSales);
 
     rows.push({
-      key: `sales-${group.key}`, kind: "total", label: "Daily sales", sublabel: label,
+      key: `sales-${group.key}`, kind: "total", label: "Total Sales",
       cells: [
-        cell("Daily sales"),
+        cell("Total Sales"),
         ...dates.map((date) => cell(money(totals[date].sales, group.currency, SALES_DECIMALS), totals[date].sales)),
         cell(money(weekSales, group.currency, SALES_DECIMALS), weekSales),
       ],
     });
     rows.push({
-      key: `units-${group.key}`, kind: "row", label: "Units", sublabel: label,
+      key: `units-${group.key}`, kind: "row", label: "Units",
       cells: [
         cell("Units"),
         ...dates.map((date) => cell(nInt(totals[date].units), totals[date].units)),
@@ -286,17 +354,17 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
       ],
     });
     rows.push({
-      key: `spend-${group.key}`, kind: "row", label: "Ad spend", sublabel: label,
+      key: `spend-${group.key}`, kind: "row", label: "Ad Spend",
       cells: [
-        cell("Ad spend"),
+        cell("Ad Spend"),
         ...dates.map((date) => cell(money(totals[date].adSpend, group.currency, SPEND_DECIMALS), totals[date].adSpend)),
         cell(money(weekSpend, group.currency, SPEND_DECIMALS), weekSpend),
       ],
     });
     rows.push({
-      key: `tacos-${group.key}`, kind: "row", label: "TACoS", sublabel: label,
+      key: `tacos-${group.key}`, kind: "row", label: "TACoS%",
       cells: [
-        cell("TACoS"),
+        cell("TACoS%"),
         ...dates.map((date) => {
           const value = totals[date].tacos;
           return cell(ratePct(value), value === null ? null : value * 100);
@@ -304,7 +372,7 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
         cell(ratePct(weekTacos), weekTacos === null ? null : weekTacos * 100),
       ],
     });
-  }
+  });
 
   // Units are counts, not money, so this section is one list across every
   // marketplace rather than one block per currency.
@@ -313,10 +381,10 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
     rows.push({
       key: `country-${row.country}`,
       kind: "row",
-      label: countryTitle(row.country),
-      sublabel: countrySublabel(row, { converted, scope }),
+      label: countryCellLabel(row),
+      labelTitle: countryCellTitle(row, { scope }),
       cells: [
-        cell(countryTitle(row.country)),
+        cell(countryCellLabel(row)),
         ...dates.map((date) => {
           const units = row.byDate[date]?.units || 0;
           return cell(units ? nInt(units) : DASH, units || null);

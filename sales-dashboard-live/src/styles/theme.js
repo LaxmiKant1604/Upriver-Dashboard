@@ -978,33 +978,65 @@ body{ overflow-x:hidden; }
    .panel's own 16px 18px padding exactly. */
 .bv-scroll{ overflow-x:auto; overflow-y:visible; overscroll-behavior-inline:contain; -webkit-overflow-scrolling:touch; max-width:100%; margin:0 -18px -16px; padding:0 0 2px; }
 .bv-table{ width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+
+/* Headers are sentence case and generously sized. An all-caps micro-header is
+   fine for a dense operational grid; this is a report people read across, and
+   "Total Sales" is easier to scan than "TOTAL SALES" at 9px. */
 .bv-table th{
-  padding:9px 12px; background:var(--bg-subtle); border-bottom:1px solid var(--border-strong);
-  color:var(--text-muted); font-size:9.5px; font-weight:800; letter-spacing:.06em;
-  text-transform:uppercase; text-align:right; white-space:nowrap; position:sticky; top:0; z-index:2;
+  padding:11px 14px; background:var(--bg-surface); border-bottom:1px solid var(--border-strong);
+  color:var(--text-muted); font-size:11.5px; font-weight:650; letter-spacing:0;
+  text-align:right; white-space:nowrap; position:sticky; top:0; z-index:2;
 }
 .bv-table th.bv-first, .bv-table td.bv-first{
   text-align:left; position:sticky; left:0; z-index:3;
-  background:var(--bg-subtle); border-right:1px solid var(--border-default); min-width:172px;
+  background:var(--bg-surface); min-width:190px;
 }
-.bv-table td.bv-first{ background:var(--bg-surface); z-index:1; font-weight:750; color:var(--text-primary); }
+.bv-table th.bv-first{ color:var(--text-muted); }
+.bv-table td.bv-first{ z-index:1; font-weight:700; color:var(--text-primary); font-size:13px; }
 .bv-table td{
-  padding:9px 12px; border-bottom:1px solid var(--grid-line); color:var(--text-primary);
-  font-size:12px; font-weight:650; text-align:right; vertical-align:middle; white-space:nowrap;
+  padding:13px 14px; border-bottom:1px solid var(--grid-line); color:var(--text-primary);
+  font-size:13px; font-weight:650; text-align:right; vertical-align:middle; white-space:nowrap;
 }
-.bv-table td.bv-num{ font-family:'JetBrains Mono',ui-monospace,monospace; font-size:11.5px; }
-.bv-table td small{ display:block; margin-top:2px; color:var(--text-muted); font-size:9.5px; font-weight:650; }
+.bv-table td.bv-num{ font-variant-numeric:tabular-nums; }
+.bv-table td small{ display:block; margin-top:2px; color:var(--text-muted); font-size:10.5px; font-weight:600; }
 .bv-table tbody tr:last-child td{ border-bottom:0; }
 .bv-table tbody tr:hover td{ background:var(--bg-subtle); }
-.bv-table tbody tr:hover td.bv-first{ background:var(--bg-sunken); }
-.bv-table .bv-total td{ background:var(--accent-soft); border-bottom-color:var(--accent-border); color:var(--accent-strong); font-weight:800; }
-.bv-table .bv-total td.bv-first{ background:var(--accent-soft); color:var(--accent-strong); }
-.bv-table .bv-total td small{ color:var(--accent-strong); opacity:.75; }
+.bv-table tbody tr:hover td.bv-first{ background:var(--bg-subtle); }
+
+/* Toned columns. Inventory reads green because it is a stock position rather
+   than a money figure; the current-month projection and the advertising pair
+   get their own tints so the eye can find them in a wide month grid. */
+.bv-table .bv-col-positive{ color:var(--positive); }
+.bv-table th.bv-col-positive{ color:var(--positive); font-weight:750; }
+.bv-table .bv-col-accent{ color:var(--accent-strong); }
+.bv-table th.bv-col-accent{ color:var(--accent-strong); font-weight:750; }
+.bv-table .bv-col-latest, .bv-table .bv-col-total{ background:var(--accent-soft); color:var(--accent-strong); font-weight:750; }
+.bv-table th.bv-col-latest, .bv-table th.bv-col-total{ color:var(--accent-strong); font-weight:750; }
+.bv-table tbody tr:hover td.bv-col-latest, .bv-table tbody tr:hover td.bv-col-total{ background:var(--accent-soft); }
+
+/* The All Markets row. One per currency group — and with a single currency,
+   which is every converted view, there is exactly one, at the top. */
+.bv-table .bv-total td{
+  background:var(--accent-soft); border-bottom:1px solid var(--accent-border);
+  color:var(--accent-strong); font-weight:800;
+}
+.bv-table .bv-total td.bv-first{ background:var(--accent-soft); color:var(--accent-strong); font-weight:800; }
+.bv-table .bv-total td small{ color:var(--accent-strong); opacity:.8; }
 .bv-table tbody tr.bv-total:hover td{ background:var(--accent-soft); }
+
+/* The currency divider, rendered only when a report spans more than one
+   currency. It makes the stacked groups read as separate tables instead of as
+   one table with several confusing All Markets rows. */
+.bv-table .bv-band td{
+  padding:9px 14px; background:var(--bg-sunken); border-top:1px solid var(--border-strong);
+  border-bottom:1px solid var(--border-strong); color:var(--text-secondary);
+  font-size:10.5px; font-weight:800; letter-spacing:.07em; text-align:left; text-transform:uppercase;
+}
+.bv-table tbody tr:first-child.bv-band td{ border-top:0; }
 .bv-table .bv-section td{
-  padding:8px 12px; background:var(--bg-sunken); border-bottom:1px solid var(--border-strong);
-  color:var(--text-secondary); font-size:9.5px; font-weight:850; letter-spacing:.08em;
-  text-align:left; text-transform:uppercase; position:sticky; left:0;
+  padding:10px 14px; background:var(--bg-subtle); border-top:1px solid var(--border-strong);
+  border-bottom:1px solid var(--border-strong); color:var(--text-muted);
+  font-size:10.5px; font-weight:800; letter-spacing:.08em; text-align:left; text-transform:uppercase;
 }
 
 /* ======================= RESPONSIVE ======================= */

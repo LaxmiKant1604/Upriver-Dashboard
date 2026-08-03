@@ -15,13 +15,27 @@ import React, { useMemo } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
 import { DataQualityAlert, MetricCard } from "../components/ui.jsx";
-import { fmtDateHuman, fmtRangeLabel, nInt } from "../lib/format.js";
+import { fmtRangeLabel, monthLongLabel, nInt } from "../lib/format.js";
 import { isConvertedMode } from "../lib/brand-view.js";
 import { DASH, buildBrandTables } from "../lib/brand-view-tables.js";
 
 /* ------------------------------------------------------------------ table */
 
+/**
+ * One report table.
+ *
+ * A header may carry a `tone` (`positive`, `accent`, `latest`, `total`) which
+ * tints its whole column, and a row may be a `band` (a currency divider, shown
+ * only when the report has more than one currency) or a `section` (the "Units by
+ * country" divider). Everything else is a plain row or the All Markets total.
+ */
 export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
+  const columnClass = (index) => {
+    if (index === 0) return "bv-first";
+    const tone = headers[index]?.tone;
+    return tone ? `bv-num bv-col-${tone}` : "bv-num";
+  };
+
   return (
     <section className="panel bv-panel">
       <div className="panel-head">
@@ -37,7 +51,7 @@ export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
               {headers.map((header, index) => (
                 <th
                   key={header.key || index}
-                  className={index === 0 ? "bv-first" : "bv-num"}
+                  className={columnClass(index)}
                   scope="col"
                   title={header.hint || undefined}
                 >
@@ -48,9 +62,9 @@ export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
           </thead>
           <tbody>
             {rows.map((row) => {
-              if (row.kind === "section") {
+              if (row.kind === "section" || row.kind === "band") {
                 return (
-                  <tr className="bv-section" key={row.key}>
+                  <tr className={row.kind === "band" ? "bv-band" : "bv-section"} key={row.key}>
                     <td colSpan={headers.length}>{row.cells[0].t}</td>
                   </tr>
                 );
@@ -60,11 +74,10 @@ export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
                   {row.cells.map((value, index) => (
                     <td
                       key={index}
-                      className={index === 0 ? "bv-first" : "bv-num"}
-                      title={row.hints?.[index] || undefined}
+                      className={columnClass(index)}
+                      title={(index === 0 ? row.labelTitle : row.hints?.[index]) || undefined}
                     >
                       {index === 0 ? row.label || value.t : value.t}
-                      {index === 0 && row.sublabel ? <small>{row.sublabel}</small> : null}
                       {index > 0 && row.subcells?.[index] ? <small>{row.subcells[index]}</small> : null}
                     </td>
                   ))}
@@ -172,8 +185,23 @@ export default function BrandReports({
   React.useEffect(() => { if (onTables) onTables(tables); }, [onTables, tables]);
 
   if (!tables) return null;
+  const coverage = model.coverage || {};
   const rangeLabel = rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : "";
   const lastYear = tables.daily?.lastYearWindow;
+  const weekDates = tables.weekly?.dates || [];
+  const weekLabel = weekDates.length ? fmtRangeLabel(weekDates[0], weekDates[weekDates.length - 1]) : "";
+  // The subtitle states the run-rate formula with its real divisor, the way the
+  // reference report does, so nobody has to guess how the projection was made.
+  const monthly = tables.monthly?.columns?.current
+    ? {
+      completedLabel: tables.monthly.columns.completed.length
+        ? `${monthLongLabel(tables.monthly.columns.completed[0].key)} – ${monthLongLabel(tables.monthly.columns.current.key)}`
+        : monthLongLabel(tables.monthly.columns.current.key),
+      currentLabel: monthLongLabel(tables.monthly.columns.current.key),
+      elapsedDays: tables.monthly.columns.current.elapsedDays,
+      daysInMonth: tables.monthly.columns.current.daysInMonth,
+    }
+    : null;
 
   return (
     <>
@@ -219,29 +247,42 @@ export default function BrandReports({
 
       {tables.dailyTable && (
         <ReportPanel
-          title={`Daily Snapshot — ${model.brand}`}
-          subtitle={`${rangeLabel} · ${currencyLabel}${lastYear ? ` · last year compares ${fmtRangeLabel(lastYear.from, lastYear.to)}` : " · last year unavailable for this window"}`}
+          title={`${model.brand} — Daily Snapshot`}
+          subtitle={[
+            rangeLabel,
+            lastYear ? `LY compares ${fmtRangeLabel(lastYear.from, lastYear.to)}` : "LY unavailable for this window",
+            coverage.inventoryDate ? `FBA Inv. as of ${coverage.inventoryDate}` : "FBA Inv. unavailable",
+            currencyLabel,
+          ].filter(Boolean).join(" · ")}
           headers={tables.dailyTable.headers}
           rows={tables.dailyTable.rows}
-          minWidth={880}
+          minWidth={900}
         />
       )}
       {tables.monthlyTable && (
         <ReportPanel
-          title={`Monthly Snapshot — ${model.brand}`}
-          subtitle={`Five completed calendar months, the selected month to date and its run rate · ${currencyLabel} · share of the group total shown under each value`}
+          title={`${model.brand} — Monthly Snapshot`}
+          subtitle={[
+            monthly ? `${monthly.completedLabel} · ${monthly.currentLabel} MTD (${monthly.elapsedDays} days)` : null,
+            monthly ? `RR = (Act ÷ ${monthly.elapsedDays}) × ${monthly.daysInMonth}` : null,
+            currencyLabel,
+          ].filter(Boolean).join(" · ")}
           headers={tables.monthlyTable.headers}
           rows={tables.monthlyTable.rows}
-          minWidth={1020}
+          minWidth={1040}
         />
       )}
       {tables.weeklyTable && (
         <ReportPanel
-          title={`7-Day Performance — ${model.brand}`}
-          subtitle={`Seven days ending ${tables.anchor ? fmtDateHuman(tables.anchor) : ""} · ${currencyLabel} · units are never converted`}
+          title={`${model.brand} — 7-Day Performance`}
+          subtitle={[
+            weekLabel,
+            `${tables.marketplaceCount} marketplace${tables.marketplaceCount === 1 ? "" : "s"}`,
+            currencyLabel,
+          ].filter(Boolean).join(" · ")}
           headers={tables.weeklyTable.headers}
           rows={tables.weeklyTable.rows}
-          minWidth={980}
+          minWidth={1000}
         />
       )}
     </>

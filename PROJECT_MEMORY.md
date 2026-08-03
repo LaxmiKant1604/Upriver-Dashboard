@@ -89,6 +89,40 @@ screen.
 - The bundle **shrank** (1,126 kB → 1,118 kB) because the duplicate report
   component was removed.
 
+### Presentation matched to the reference report (2026-08-04, second pass)
+
+The owner compared the first build against the reference screenshots. The
+numbers were right but the layout was not. What changed, all in
+`src/lib/brand-view-tables.js`, `src/views/BrandReports.jsx` and the `.bv-*`
+CSS — no calculation was touched:
+
+- **One All Markets row, not one per currency.** A currency group now gets its
+  total only when it aggregates more than one marketplace, or when it is the
+  only group. Four singleton currencies used to print four All Markets rows that
+  each duplicated their single country row.
+- **Currency bands.** When a report spans more than one currency, each group is
+  introduced by a divider (`EUR · 9 marketplaces`) so the groups read as stacked
+  tables rather than one table with several confusing totals. With a single
+  currency — every converted view — there is no band and the table is exactly
+  the reference shape.
+- **No sub-label on every row.** Currency moved to the band; contributing
+  account names moved to the row tooltip; `(FC only)` is now an inline suffix on
+  an inventory-only marketplace, as in the reference.
+- **Reference column names**: Total Sales, LY Sales, Ad Spend, TACoS%, FBA Inv.,
+  Inv Cover, Units. Headers are sentence case at 11.5px instead of 9px all-caps,
+  and rows are 13px with 13px padding.
+- **Inventory cover is in months** (`3.0m`), with the exact day count in the
+  tooltip. A marketplace with no inventory record reads `n/a`, distinct from the
+  em dash used for a metric that simply has no value.
+- **Toned columns**: FBA Inv. and Inv Cover green, the current-month actual and
+  run rate green, Ad Spend/TACoS% accent, and the latest day plus 7D Total
+  tinted in the 7-day grid.
+- Subtitles now state the run-rate divisor explicitly, e.g.
+  `Mar 2026 – Aug 2026 · Aug 2026 MTD (3 days) · RR = (Act ÷ 3) × 31`.
+
+Tests grew to **59** and now cover the total-row rule, the single-currency
+shape, months-and-`n/a`, and the `(FC only)` suffix.
+
 ### Deployment (2026-08-04)
 
 - Commits `167c27b` (the upgrade) and `0b7dc59` (removing the retired report's
