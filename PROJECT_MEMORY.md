@@ -232,6 +232,11 @@ Shipment Plan once.
 
 ### Deployment
 
+- **Brand View entry-point repair:** commit `860522d` was verified with
+  `npm run verify` (53 insight assertions, 47 Brand View assertions and the
+  production build) and deployed on 2026-08-03 as
+  `https://upriver-dashboard-g94o18ssp-laxmikant1604s-projects.vercel.app`.
+  The stable alias is `https://upriverdashboard.vercel.app`.
 - **Review correction deployment:** commit `c3efc1d` (`Fix Brand View filter
   and ads coverage accuracy`) was verified with `npm run verify` and deployed
   on 2026-08-03 as `https://upriver-dashboard-5c8cayie1-laxmikant1604s-projects.vercel.app`.
