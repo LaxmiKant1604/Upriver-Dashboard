@@ -214,6 +214,11 @@ Shipment Plan once.
 
 ### Deployment
 
+- **Review correction deployment:** commit `c3efc1d` (`Fix Brand View filter
+  and ads coverage accuracy`) was verified with `npm run verify` and deployed
+  on 2026-08-03 as `https://upriver-dashboard-5c8cayie1-laxmikant1604s-projects.vercel.app`.
+  It is aliased to the stable production URL
+  `https://upriverdashboard.vercel.app`.
 - Commit `06df448` on `main`, deployed from the repository root as Vercel
   deployment `dpl_Eyj6jp6BEKmDwgD6EP3wJGCWYPyc` (target production, READY).
 - Stable alias **https://upriverdashboard.vercel.app** returned HTTP 200 and
