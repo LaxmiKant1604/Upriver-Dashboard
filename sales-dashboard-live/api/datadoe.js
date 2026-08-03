@@ -204,6 +204,18 @@ function serialiseBrandAccountMap(brandAccountIds) {
   };
 }
 
+function snapshotBrandNames(payload) {
+  const names = new Set((payload?.catalogBrands || []).map((brand) => String(brand || "").trim()).filter(Boolean));
+  // Older Dashboard and SKU P&L snapshots predate catalogBrands on every
+  // payload, but their row records still carry the joined brand. This keeps
+  // the directory recoverable after a schema upgrade without any DataDoe call.
+  (payload?.rows || []).forEach((row) => {
+    const brand = row?.product_brand || row?.brand;
+    if (String(brand || "").trim()) names.add(String(brand).trim());
+  });
+  return [...names];
+}
+
 async function sharedSnapshotBrandAccounts(accountIds) {
   const brandAccountIds = new Map();
   const coveredAccountIds = new Set();
@@ -215,8 +227,8 @@ async function sharedSnapshotBrandAccounts(accountIds) {
   await Promise.all(accountIds.map(async (accountId) => {
     for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS) {
       const snapshot = await getLatestReportSnapshot({ reportKey, accountId });
-      const brands = snapshot?.payload?.catalogBrands;
-      if (!Array.isArray(brands) || !brands.length) continue;
+      const brands = snapshotBrandNames(snapshot?.payload);
+      if (!brands.length) continue;
       brands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
       coveredAccountIds.add(String(accountId));
       break;
@@ -937,7 +949,7 @@ export default async function handler(req, res) {
     if (action === "brand-directory" && !publicAccountIds.length && access.role !== "admin") {
       publicAccountIds = [...new Set(access.accountIds || [])];
     }
-    if (action === "brand-directory" && wantsRefresh(req)) {
+    if (action === "brand-directory" && wantsRefresh(req) && !publicAccountIds.length) {
       const discovered = await discoverConnectedAccounts(connections);
       discoveredDirectoryAccounts = discovered;
       brandDirectoryAccounts = access.role === "admin"
@@ -961,6 +973,31 @@ export default async function handler(req, res) {
         userId: access.userId,
       };
       if (!wantsRefresh(req)) {
+        // Brand Directory v1 contained a usable brand list but not the newer
+        // brand-to-account map. Keep serving it instantly while a v2 map is
+        // being rebuilt from saved reports; the browser safely falls back to
+        // its permitted account set for that older payload.
+        if (action === "brand-directory") {
+          const previous = await getLatestReportSnapshot({
+            reportKey: legacyShared.reportKey,
+            accountId: legacyShared.accountId,
+          });
+          if (previous?.payload?.brands?.length) {
+            res.status(200).json({
+              ...previous.payload,
+              reportKey: legacyShared.reportKey,
+              reportVersion: legacyShared.reportVersion,
+              paramsHash: legacyShared.params ? paramsHashFor(legacyShared.reportVersion, legacyShared.params) : null,
+              snapshot: {
+                savedAt: previous.source_refreshed_at || previous.updated_at || null,
+                updatedAt: previous.updated_at || null,
+                shared: true,
+                legacyDirectory: previous.params?.reportVersion !== legacyShared.reportVersion,
+              },
+            });
+            return;
+          }
+        }
         // Reading a report is always server-side and shared. It never reaches
         // DataDoe, even on a new browser or under a different user account.
         await serveSharedReport({ ...sharedOptions, refresh: false });
@@ -999,45 +1036,17 @@ export default async function handler(req, res) {
       assertAccountAccess(access, publicAccountIds);
       const { brandAccountIds, coveredAccountIds } = await sharedSnapshotBrandAccounts(publicAccountIds);
       const unresolvedAccountIds = publicAccountIds.filter((accountId) => !coveredAccountIds.has(String(accountId)));
-      try {
-        // Account-scoped catalog reads make the mapping unambiguous. The saved
-        // map lets the selected brand refresh only its actual marketplaces;
-        // we never infer a country from a similarly named brand in another
-        // account. This is still manual and sequential, respecting DataDoe's
-        // organisation-wide rate limit.
-        for (const publicAccountId of unresolvedAccountIds) {
-          const scope = resolveDataDoeAccountIds([publicAccountId], connections);
-          const catalogRows = await fetchExportRows(
-            scope.connection.apiKey,
-            PRODUCT_CATALOG_SOURCE_ID,
-            PRODUCT_CATALOG_COLUMNS,
-            scope.rawAccountIds,
-            null,
-            null,
-            CATALOG_ROW_LIMIT,
-            { orderByColumn: "child_asin" }
-          );
-          catalogBrandNames(catalogRows).forEach((brand) => addBrandAccount(brandAccountIds, brand, publicAccountId));
-        }
-      } catch (error) {
-        if (/\b402\b/.test(String(error?.message || error))) {
-          const saved = serialiseBrandAccountMap(brandAccountIds);
-          if (saved.brands.length) {
-            await sendLegacyPayload({
-              ...saved,
-              accounts: brandDirectoryAccounts || [],
-              source: "shared-snapshots-partial",
-              partial: true,
-              unresolvedAccountIds,
-            });
-            return;
-          }
-          throw new Error("DataDoe could not load the Product Catalog because its export service returned HTTP 402, and no saved report snapshot contains a brand list for these accounts. Add DataDoe export credits or enable the Product Catalog source, then click Load portfolio brands again.");
-        }
-        throw error;
-      }
       const saved = serialiseBrandAccountMap(brandAccountIds);
-      await sendLegacyPayload({ ...saved, accounts: brandDirectoryAccounts || [], source: unresolvedAccountIds.length ? "datadoe-catalog" : "shared-snapshots" });
+      await sendLegacyPayload({
+        ...saved,
+        accounts: brandDirectoryAccounts || [],
+        source: "shared-snapshots",
+        partial: unresolvedAccountIds.length > 0,
+        unresolvedAccountIds,
+        message: saved.brands.length
+          ? null
+          : "No saved report snapshot has brand data yet. Refresh a Dashboard or SKU P&L report for an account once, then return here; Brand View will use that saved data without a Product Catalog export.",
+      });
       return;
     }
 

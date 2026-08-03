@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View cache-first catalog recovery deployed)
+Last updated: 2026-08-03 (Brand View 504 removal and fast directory recovery in progress)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -56,6 +56,12 @@ Last updated: 2026-08-03 (Brand View cache-first catalog recovery deployed)
 - **Deployment:** commit `82ac406` is live as Vercel deployment
   `dpl_4eDWyWXVMdqbjs3C5mgc72gdJmXo`; the production alias returned HTTP 200
   and served the cache-recovery bundle.
+- **504 diagnosis and repair in progress:** the 402 fallback could still make
+  many sequential Product Catalog exports for accounts whose snapshots did not
+  expose `catalogBrands`, causing a Vercel 504 before the dropdown populated.
+  Brand View is being made fully cache-first: it serves a prior v1/v2 directory
+  immediately, derives brands from saved `catalogBrands` or joined row brands,
+  and never launches Product Catalog exports merely to populate the dropdown.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
