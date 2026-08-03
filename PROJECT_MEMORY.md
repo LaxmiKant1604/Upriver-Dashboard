@@ -1,6 +1,25 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View cache-only fast directory deployed)
+Last updated: 2026-08-03 (Sellerboard brand-by-marketplace research recorded)
+
+## Sellerboard Brand-By-Marketplace Research (2026-08-03)
+
+- Reviewed Sellerboard's public Profit Dashboard and Sales/Stock Map guidance.
+  Its model is a durable product catalogue: the user filters products by brand
+  (or tags) and marketplaces in one dashboard, then the same active filters
+  drive its country/state table and map. Amazon US is shown by state; other
+  marketplaces are grouped by country. Sellerboard does not appear to rebuild
+  a catalog by calling an external product source whenever a brand is chosen.
+- **UPRIVER decision:** Brand View must follow the same shape. The selected
+  brand should resolve against a persistent Supabase brand-to-account/country
+  directory, and the same page should render its country rows, period trend,
+  and future inventory/PPC metrics from that already-scoped data. Do not make
+  catalog exports part of normal navigation or selection.
+- **Future hardening:** add a dedicated `brand_marketplace_directory` Supabase
+  table with brand, public account ID, marketplace country, source/freshness,
+  and optional admin override. The deployed cache-only snapshot approach is
+  the immediate recovery path; this table is the durable replacement when the
+  data model migration is scheduled.
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
