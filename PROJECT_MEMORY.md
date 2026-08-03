@@ -13,6 +13,11 @@ Last updated: 2026-08-04 (Brand View header/sidebar boundary corrected)
 - The standalone `Brand View` sidebar item was removed. It was the only sidebar
   change requested and prevents a second, conflicting Brand View entry from
   appearing while users work in Account view.
+- **Guardrail:** the 2026-08-04 request was navigation-only. Do not change the
+  portfolio Brand View's report layout, columns, formulas, source selection or
+  cache behavior while changing the Account/Brand header separation. The
+  account-scoped module added previously must not be routed from the header
+  switcher or used as a replacement for this established Brand View report.
 - **Legacy safety fix:** the older portfolio report now trims and uppercases
   marketplace country and currency keys before grouping. This prevents duplicate
   country rows when historical saved data differs only by letter case or spaces.
