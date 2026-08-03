@@ -1063,6 +1063,14 @@ function countryName(country) {
   }
 }
 
+function reportCountry(row) {
+  return String(row?.marketplace_country_code || row?.accountCountry || "").trim().toUpperCase();
+}
+
+function reportCurrency(row) {
+  return String(row?.currency || row?.accountCurrency || "").trim().toUpperCase();
+}
+
 // The account dashboard and Brand View both read this same cache shape.  It
 // intentionally considers only brand-sales rows, never broad catalog metadata,
 // so a brand cannot appear under an account where it has not been observed.
@@ -1124,8 +1132,8 @@ function BrandPortfolioDashboard({
   const markets = useMemo(() => {
     const grouped = new Map();
     scoped.forEach((row) => {
-      const country = row.marketplace_country_code || row.accountCountry || "";
-      const currency = row.currency || row.accountCurrency || "";
+      const country = reportCountry(row);
+      const currency = reportCurrency(row);
       const key = `${country}|${currency}`;
       const current = grouped.get(key) || { key, country, currency, sales: 0, units: 0, accounts: new Set(), byDate: new Map() };
       current.sales += Number(row.total_sales) || 0;
@@ -1157,8 +1165,8 @@ function BrandPortfolioDashboard({
   const monthlyMarkets = useMemo(() => {
     const grouped = new Map();
     rows.forEach((row) => {
-      const country = row.marketplace_country_code || row.accountCountry || "";
-      const currency = row.currency || row.accountCurrency || "";
+      const country = reportCountry(row);
+      const currency = reportCurrency(row);
       const key = `${country}|${currency}`;
       const current = grouped.get(key) || { key, country, currency, byMonth: new Map() };
       const monthKey = String(row.date || "").slice(0, 7);
@@ -1185,8 +1193,8 @@ function BrandPortfolioDashboard({
       return existing;
     };
     rows.forEach((row) => {
-      const country = row.marketplace_country_code || row.accountCountry || "";
-      const currency = row.currency || row.accountCurrency || "";
+      const country = reportCountry(row);
+      const currency = reportCurrency(row);
       const entry = ensure(country, currency);
       if (row.accountName) entry.accounts.add(row.accountName);
       if (row.date >= rangeFrom && row.date <= rangeTo) {
@@ -2959,6 +2967,7 @@ function DashboardApp({ session, access, onSignOut }) {
             onBrandChange={setSelectedBrand}
             dashboardMode={view === "dashboard" ? dashboardMode : "account"}
             onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
+            onOpenBrandView={() => { setDashboardMode("account"); setView("brandview"); setMobileOpen(false); }}
             portfolioBrands={portfolioBrandList}
             selectedPortfolioBrand={selectedPortfolioBrand}
             onPortfolioBrandChange={setSelectedPortfolioBrand}
