@@ -1,17 +1,18 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View portfolio separation restored)
+Last updated: 2026-08-04 (Brand View header/sidebar boundary corrected)
 
 ## Brand View scope clarification (2026-08-03)
 
 - The top-header `Brand view` switcher remains the separate portfolio-level
   report (`BrandPortfolioDashboard` in `App.jsx`). It must not redirect into
   Account View or the account-scoped `brandview` route.
-- The dedicated sidebar `brandview` route remains an additional account-scoped
-  report, but it is not a replacement for the portfolio Brand View screen.
-- **Sidebar boundary:** Brand View is opened from the sidebar only. The old
-  Account View / Brand View header mode toggle was removed so Account View
-  cannot look like it contains the separate Brand View workspace.
+- The `Account view` / `Brand view` switcher remains in the header and keeps
+  the two workspaces separate. `Brand view` opens the existing portfolio Brand
+  Dashboard; `Account view` opens the account dashboard.
+- The standalone `Brand View` sidebar item was removed. It was the only sidebar
+  change requested and prevents a second, conflicting Brand View entry from
+  appearing while users work in Account view.
 - **Legacy safety fix:** the older portfolio report now trims and uppercases
   marketplace country and currency keys before grouping. This prevents duplicate
   country rows when historical saved data differs only by letter case or spaces.

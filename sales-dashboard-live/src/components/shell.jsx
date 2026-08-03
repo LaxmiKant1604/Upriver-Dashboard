@@ -31,7 +31,6 @@ import {
   ShieldAlert,
   Store,
   Tag,
-  Tags,
   TrendingUp,
   Trophy,
   Undo2,
@@ -50,9 +49,6 @@ export const NAV_GROUPS = [
     label: "Overview",
     items: [
       { view: "dashboard", label: "Dashboard", title: "Portfolio sales dashboard", icon: LayoutDashboard },
-      // Account-scoped Brand View. A separate route key and a separate module:
-      // it does not share state or cache with the Dashboard's brand mode.
-      { view: "brandview", label: "Brand View", title: "Brand View — one account, one brand, every marketplace", icon: Tags },
       { view: "priority", label: "Priority Feed", title: "Priority Feed — every evidenced signal from the six reports, ranked", icon: ListChecks },
     ],
   },
@@ -253,13 +249,22 @@ export function BrandSelector({ brands, value, onChange, includeAll = true, labe
   );
 }
 
+function DashboardModeSelector({ value, onChange }) {
+  return (
+    <div className="segmented dashboard-mode" role="group" aria-label="Dashboard workspace">
+      <button type="button" className={value === "account" ? "active" : ""} aria-pressed={value === "account"} onClick={() => onChange("account")}>Account view</button>
+      <button type="button" className={value === "brand" ? "active" : ""} aria-pressed={value === "brand"} onClick={() => onChange("brand")}>Brand view</button>
+    </div>
+  );
+}
+
 /* ============================ TOP COMMAND BAR ============================ */
 
 export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
   accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
   brands, selectedBrand, onBrandChange, flags,
-  dashboardMode = "account", portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
+  dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
   refresh,
 }) {
   return (
@@ -280,6 +285,7 @@ export function TopBar({
 
       {showScope && (
         <div className="tb-right">
+          {onDashboardModeChange && <DashboardModeSelector value={dashboardMode} onChange={onDashboardModeChange} />}
           {dashboardMode === "brand" ? (
             <BrandSelector brands={portfolioBrands} value={selectedPortfolioBrand} onChange={onPortfolioBrandChange} includeAll={false} label="Portfolio brand" />
           ) : <>
