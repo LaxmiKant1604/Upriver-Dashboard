@@ -253,22 +253,13 @@ export function BrandSelector({ brands, value, onChange, includeAll = true, labe
   );
 }
 
-function DashboardModeSelector({ value, onChange }) {
-  return (
-    <div className="segmented dashboard-mode" role="group" aria-label="Dashboard scope">
-      <button type="button" className={value === "account" ? "active" : ""} aria-pressed={value === "account"} onClick={() => onChange("account")}>Account view</button>
-      <button type="button" className={value === "brand" ? "active" : ""} aria-pressed={value === "brand"} onClick={() => onChange("brand")}>Brand view</button>
-    </div>
-  );
-}
-
 /* ============================ TOP COMMAND BAR ============================ */
 
 export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
   accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
   brands, selectedBrand, onBrandChange, flags,
-  dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
+  dashboardMode = "account", portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
   refresh,
 }) {
   return (
@@ -289,7 +280,6 @@ export function TopBar({
 
       {showScope && (
         <div className="tb-right">
-          {onDashboardModeChange && <DashboardModeSelector value={dashboardMode} onChange={onDashboardModeChange} />}
           {dashboardMode === "brand" ? (
             <BrandSelector brands={portfolioBrands} value={selectedPortfolioBrand} onChange={onPortfolioBrandChange} includeAll={false} label="Portfolio brand" />
           ) : <>

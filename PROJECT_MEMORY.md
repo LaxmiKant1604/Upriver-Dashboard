@@ -9,6 +9,9 @@ Last updated: 2026-08-03 (Brand View portfolio separation restored)
   Account View or the account-scoped `brandview` route.
 - The dedicated sidebar `brandview` route remains an additional account-scoped
   report, but it is not a replacement for the portfolio Brand View screen.
+- **Sidebar boundary:** Brand View is opened from the sidebar only. The old
+  Account View / Brand View header mode toggle was removed so Account View
+  cannot look like it contains the separate Brand View workspace.
 - **Legacy safety fix:** the older portfolio report now trims and uppercases
   marketplace country and currency keys before grouping. This prevents duplicate
   country rows when historical saved data differs only by letter case or spaces.

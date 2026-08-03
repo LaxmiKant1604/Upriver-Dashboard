@@ -2938,7 +2938,7 @@ function DashboardApp({ session, access, onSignOut }) {
       <div className="app-shell">
         <Sidebar
           view={view}
-          onNavigate={(next) => { setView(next); setMobileOpen(false); }}
+          onNavigate={(next) => { setView(next); setDashboardMode("account"); setMobileOpen(false); }}
           isAdmin={isAdmin}
           email={access.email}
           collapsed={collapsed}
@@ -2966,7 +2966,6 @@ function DashboardApp({ session, access, onSignOut }) {
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
             dashboardMode={view === "dashboard" ? dashboardMode : "account"}
-            onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
             portfolioBrands={portfolioBrandList}
             selectedPortfolioBrand={selectedPortfolioBrand}
             onPortfolioBrandChange={setSelectedPortfolioBrand}
