@@ -1423,12 +1423,15 @@ function DashboardApp({ session, access, onSignOut }) {
     const ids = discoveredIds.length ? discoveredIds : (isAdmin ? [] : [...allowedAccountIds]);
     return [...new Set(ids)].sort().join(",");
   }, [accounts, allowedAccountIds, isAdmin]);
+  const portfolioMappingKnown = Boolean(
+    selectedPortfolioBrand && Array.isArray(brandDirectoryAccounts[selectedPortfolioBrand])
+  );
   const portfolioAccounts = useMemo(() => {
     if (!selectedPortfolioBrand) return [];
     const mappedIds = brandDirectoryAccounts[selectedPortfolioBrand];
-    // A v1 directory has no account map. Keep the old complete-portfolio
-    // behavior for that stale client record until the user refreshes once.
-    if (!Array.isArray(mappedIds)) return accounts;
+    // A v1 directory has no account map. Discover the saved scope first;
+    // never refresh every account merely because an older directory was read.
+    if (!Array.isArray(mappedIds)) return [];
     const allowedIds = new Set(mappedIds);
     return accounts.filter((account) => allowedIds.has(String(account.id)));
   }, [accounts, brandDirectoryAccounts, selectedPortfolioBrand]);
@@ -1451,14 +1454,45 @@ function DashboardApp({ session, access, onSignOut }) {
     return isAdmin ? { action: "brand-directory", reportVersion: "brand-directory-shared-v2" } : null;
   }, [isAdmin, portfolioAccountSignature]);
 
+  const discoverSavedBrandAccounts = useCallback(async () => {
+    const matchedIds = new Set();
+    const rows = [];
+    await Promise.all(accounts.map(async (account) => {
+      const accountToday = marketplaceToday(account.country);
+      const params = {
+        action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
+        from: addDays(monthStart(accountToday), -420), to: accountToday,
+      };
+      try {
+        const { body } = await loadSharedReport(params);
+        (body.rows || []).forEach((row) => {
+          if (productBrand(row) !== selectedPortfolioBrand) return;
+          matchedIds.add(String(account.id));
+          rows.push({ ...row, accountId: account.id, accountName: account.name, accountCountry: account.country, accountCurrency: account.currency });
+        });
+      } catch {
+        // An unrelated account without a saved Dashboard snapshot is not an
+        // error for this brand. It simply cannot prove this brand is present.
+      }
+    }));
+    const matchedAccounts = accounts.filter((account) => matchedIds.has(String(account.id)));
+    if (matchedAccounts.length) {
+      setBrandDirectoryAccounts((current) => ({
+        ...current,
+        [selectedPortfolioBrand]: matchedAccounts.map((account) => String(account.id)),
+      }));
+    }
+    return { accounts: matchedAccounts, rows };
+  }, [accounts, selectedPortfolioBrand]);
+
   const loadCachedBrandPortfolio = useCallback(async () => {
     if (!portfolioCacheParams) {
       setBrandPortfolioData(null);
       setBrandPortfolioCacheMissing(false);
       setBrandPortfolioFetchedAt(null);
-      return;
+      if (!selectedPortfolioBrand || portfolioMappingKnown) return;
     }
-    const cached = readApiCache(portfolioCacheParams);
+    const cached = portfolioCacheParams ? readApiCache(portfolioCacheParams) : null;
     if (cached) {
       setBrandPortfolioData(cached.body);
       setBrandPortfolioFetchedAt(new Date(cached.cachedAt));
@@ -1470,7 +1504,21 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandPortfolioCacheMissing(true);
       setBrandPortfolioError(null);
     }
-    if (!selectedPortfolioBrand || !portfolioAccounts.length) return;
+    if (!selectedPortfolioBrand) return;
+    if (!portfolioMappingKnown) {
+      try {
+        const discovered = await discoverSavedBrandAccounts();
+        const payload = { brand: selectedPortfolioBrand, rows: discovered.rows, errors: [], accountIds: discovered.accounts.map((account) => account.id) };
+        setBrandPortfolioData(payload);
+        setBrandPortfolioFetchedAt(new Date());
+        setBrandPortfolioCacheMissing(false);
+        setBrandPortfolioError(null);
+      } catch (error) {
+        if (!cached) setBrandPortfolioError(error.message);
+      }
+      return;
+    }
+    if (!portfolioAccounts.length) return;
     const rows = [];
     const errors = [];
     try {
@@ -1503,22 +1551,34 @@ function DashboardApp({ session, access, onSignOut }) {
     } catch (error) {
       if (!cached) setBrandPortfolioError(error.message);
     }
-  }, [portfolioAccounts, portfolioCacheParams, selectedPortfolioBrand]);
+  }, [discoverSavedBrandAccounts, portfolioAccounts, portfolioCacheParams, portfolioMappingKnown, selectedPortfolioBrand]);
 
   const fetchBrandPortfolio = useCallback(async () => {
-    if (!selectedPortfolioBrand || !portfolioAccounts.length || brandPortfolioLoading) return;
+    if (!selectedPortfolioBrand || brandPortfolioLoading) return;
     setBrandPortfolioLoading(true);
     setBrandPortfolioError(null);
-    setBrandPortfolioProgress({ completed: 0, total: portfolioAccounts.length, account: "" });
     const rows = [];
     const errors = [];
     try {
+      let targetAccounts = portfolioAccounts;
+      if (!portfolioMappingKnown) {
+        setBrandPortfolioProgress({ completed: 0, total: accounts.length, account: "Finding saved brand marketplaces" });
+        const discovered = await discoverSavedBrandAccounts();
+        targetAccounts = discovered.accounts;
+        if (!targetAccounts.length) {
+          setBrandPortfolioData({ brand: selectedPortfolioBrand, rows: discovered.rows, errors: [], accountIds: [] });
+          setBrandPortfolioCacheMissing(false);
+          setBrandPortfolioError("No saved Dashboard snapshot identifies this brand yet. Refresh the relevant account Dashboard once, then Brand View will use that saved data.");
+          return;
+        }
+      }
+      setBrandPortfolioProgress({ completed: 0, total: targetAccounts.length, account: "" });
       // A portfolio refresh is intentionally sequential. Each account request
       // itself creates two DataDoe exports, so parallelising this loop would
       // waste tokens and breach the organisation-wide rate limit.
-      for (let index = 0; index < portfolioAccounts.length; index++) {
-        const account = portfolioAccounts[index];
-        setBrandPortfolioProgress({ completed: index, total: portfolioAccounts.length, account: account.name });
+      for (let index = 0; index < targetAccounts.length; index++) {
+        const account = targetAccounts[index];
+        setBrandPortfolioProgress({ completed: index, total: targetAccounts.length, account: account.name });
         const accountToday = marketplaceToday(account.country);
         const params = {
           action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
@@ -1539,10 +1599,11 @@ function DashboardApp({ session, access, onSignOut }) {
         } catch (accountError) {
           errors.push({ accountId: account.id, accountName: account.name, message: accountError.message });
         }
-        setBrandPortfolioProgress({ completed: index + 1, total: portfolioAccounts.length, account: account.name });
+        setBrandPortfolioProgress({ completed: index + 1, total: targetAccounts.length, account: account.name });
       }
-      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: portfolioAccounts.map((account) => account.id) };
-      if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
+      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: targetAccounts.map((account) => account.id) };
+      const targetCacheParams = { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v2", brand: selectedPortfolioBrand, ids: targetAccounts.map((account) => String(account.id)).sort().join(","), asOf: marketplaceToday("IN") };
+      writeApiCache(targetCacheParams, payload);
       setBrandPortfolioData(payload);
       setBrandPortfolioFetchedAt(new Date());
       setBrandPortfolioCacheMissing(false);
@@ -1553,7 +1614,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandPortfolioLoading(false);
       setBrandPortfolioProgress(null);
     }
-  }, [brandPortfolioLoading, portfolioAccounts, portfolioCacheParams, selectedPortfolioBrand]);
+  }, [accounts.length, brandPortfolioLoading, discoverSavedBrandAccounts, portfolioAccounts, portfolioMappingKnown, selectedPortfolioBrand]);
 
   useEffect(() => {
     if (dashboardMode === "brand") loadCachedBrandPortfolio();
@@ -1576,6 +1637,20 @@ function DashboardApp({ session, access, onSignOut }) {
         if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
         setBrandDirectoryFetchedAt(new Date(cachedAt));
         setBrandDirectoryError(body.message || (body.partial ? "Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots." : null));
+        // Older shared directories only contain a brand list. Upgrade them
+        // once in the background to a shared brand-to-account map. This is
+        // Supabase-only and never creates a DataDoe Product Catalog export.
+        if (body.snapshot?.legacyDirectory) {
+          refreshSharedReport(brandDirectoryCacheParams)
+            .then(({ body: upgraded }) => {
+              if (!active || !upgraded.brands?.length) return;
+              setBrandDirectoryBrands(upgraded.brands);
+              setBrandDirectoryAccounts(upgraded.brandAccounts || {});
+              if (Array.isArray(upgraded.accounts) && upgraded.accounts.length) applyAccounts(upgraded);
+              setBrandDirectoryFetchedAt(new Date());
+            })
+            .catch(() => {});
+        }
       })
       .catch((error) => { if (active) setBrandDirectoryError(error.message); });
     return () => { active = false; };

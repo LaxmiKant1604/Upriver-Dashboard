@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Sellerboard brand-by-marketplace research recorded)
+Last updated: 2026-08-03 (Brand View v1-directory refresh scope repair in progress)
 
 ## Sellerboard Brand-By-Marketplace Research (2026-08-03)
 
@@ -20,6 +20,20 @@ Last updated: 2026-08-03 (Sellerboard brand-by-marketplace research recorded)
   and optional admin override. The deployed cache-only snapshot approach is
   the immediate recovery path; this table is the durable replacement when the
   data model migration is scheduled.
+
+## Brand View V1 Directory Scope Repair (2026-08-03)
+
+- Screenshot review found that Brand View data for `Beeline` correctly showed
+  only India, but a red alert reported 26 unrelated accounts with no Dashboard
+  snapshot. Cause: a prior v1 Brand Directory supplied brand names without a
+  brand-to-account map, and the client fell back to checking every account.
+- **Fix in progress:** a v1 directory now performs a quiet Supabase-only
+  discovery pass to identify the selected brand's saved accounts, records that
+  map in the session, and refreshes only those accounts. The browser also
+  upgrades the legacy directory to the shared v2 map in the background (still
+  Supabase-only), so future users load the targeted map directly. Missing
+  snapshots for other brands/accounts are not an error and must never trigger
+  a DataDoe export or a red Brand View failure.
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
