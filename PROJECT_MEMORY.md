@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View 504 removal and fast directory recovery in progress)
+Last updated: 2026-08-03 (Brand View cache-only fast directory deployed)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -56,12 +56,18 @@ Last updated: 2026-08-03 (Brand View 504 removal and fast directory recovery in 
 - **Deployment:** commit `82ac406` is live as Vercel deployment
   `dpl_4eDWyWXVMdqbjs3C5mgc72gdJmXo`; the production alias returned HTTP 200
   and served the cache-recovery bundle.
-- **504 diagnosis and repair in progress:** the 402 fallback could still make
-  many sequential Product Catalog exports for accounts whose snapshots did not
-  expose `catalogBrands`, causing a Vercel 504 before the dropdown populated.
-  Brand View is being made fully cache-first: it serves a prior v1/v2 directory
-  immediately, derives brands from saved `catalogBrands` or joined row brands,
-  and never launches Product Catalog exports merely to populate the dropdown.
+- **504 repair completed:** the 402 fallback could still make many sequential
+  Product Catalog exports for accounts whose snapshots did not expose
+  `catalogBrands`, causing a Vercel 504 before the dropdown populated. Brand
+  View is now fully cache-first: it serves a prior v1/v2 directory immediately,
+  derives brands from saved `catalogBrands` or joined row brands, and never
+  launches Product Catalog exports merely to populate the dropdown. This saves
+  DataDoe credits and prevents catalog-credit failures from blocking Brand View.
+  If no shared report has ever saved brand data for an account, the UI explains
+  that an account Dashboard or SKU P&L refresh must seed that data once.
+- **Deployment:** commit `03f4d12` is live as Vercel deployment
+  `dpl_Dz8wYTpnxcj1sbewiHt53Cf4qkFk`; the stable alias returned HTTP 200 and
+  served the cache-only directory bundle.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
