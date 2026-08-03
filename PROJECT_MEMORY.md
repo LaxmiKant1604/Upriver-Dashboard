@@ -228,6 +228,10 @@ Shipment Plan once.
 
 ### Deployment
 
+- **Sidebar-only Brand View navigation:** commit `d33349f` was verified with
+  `npm run verify` and deployed on 2026-08-03 as
+  `https://upriver-dashboard-9dque6c7p-laxmikant1604s-projects.vercel.app`.
+  The stable alias is `https://upriverdashboard.vercel.app`.
 - **Portfolio separation restore:** commit `32a716e` was verified with
   `npm run verify` and deployed on 2026-08-03 as
   `https://upriver-dashboard-pbyhnc3z5-laxmikant1604s-projects.vercel.app`.
