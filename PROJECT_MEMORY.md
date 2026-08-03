@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View country-account map in progress)
+Last updated: 2026-08-03 (Brand View country-account routing deployed)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -34,10 +34,17 @@ Last updated: 2026-08-03 (Brand View country-account map in progress)
   accounts.
 - **Deployment:** commit `927f77a` is live as Vercel deployment
   `dpl_4XQBxC6TnMMRHEUhuRivns182wJi`; the stable alias returned HTTP 200.
-- **Country-account routing in progress:** Brand View currently reads/refreshes
-  every accessible account after a brand is chosen. The directory is being
-  upgraded to store each catalog brand's exact permitted account IDs. Brand
-  reports will then only read and refresh the countries where that brand exists.
+- **Country-account routing completed:** Brand Directory v2 stores each
+  Product Catalog brand with the exact public account IDs where it exists.
+  Selecting a brand now reads and refreshes only those mapped country accounts,
+  not every account in the portfolio. The map is built from account-scoped
+  catalog exports, works across both DataDoe organisations, and stays inside
+  the permission-filtered shared snapshot scope. Old v1 browser data safely
+  falls back to the former all-accessible-account behavior until one directory
+  refresh seeds v2.
+- **Deployment:** commit `15a3064` is live as Vercel deployment
+  `dpl_4EqvE4JigbeLZyVyL35MT7jYEWwG`; the stable alias returned HTTP 200 and
+  served the targeted-marketplace bundle.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
