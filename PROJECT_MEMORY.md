@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Secondary DataDoe Brand View account-discovery repair in progress)
+Last updated: 2026-08-03 (Secondary DataDoe Brand View account-discovery repair deployed)
 
 ## Secondary DataDoe Brand View Check (2026-08-03)
 
@@ -13,11 +13,17 @@ Last updated: 2026-08-03 (Secondary DataDoe Brand View account-discovery repair 
   discovered connected accounts when the request had no cached IDs. A manual
   Brand Directory refresh with a stale primary-only browser list therefore
   never discovered newly added secondary accounts.
-- **Fix in progress:** an explicit Brand Directory refresh now always discovers
+- **Fix completed:** an explicit Brand Directory refresh now always discovers
   both configured DataDoe organisations, filters the result by the signed-in
   user's access, persists the merged account directory, and rebuilds the
   cache-only brand mapping. Normal navigation remains Supabase-only; no
   automatic DataDoe call was added.
+- **Deployment:** commit `c6f4e04` is live as Vercel deployment
+  `3aaQBTbhnZTrFLhkUcZ7DLj8ViPZ`; the stable alias returned HTTP 200. A signed-in
+  administrator must now use the explicit Brand Directory refresh once to
+  persist the secondary organisation's current account list. Then select a
+  secondary account in Account View and refresh its Dashboard/SKU P&L once to
+  seed that account's brand mapping for every user.
 
 ## Sellerboard Brand-By-Marketplace Research (2026-08-03)
 
