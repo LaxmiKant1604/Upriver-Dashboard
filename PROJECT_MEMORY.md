@@ -190,6 +190,23 @@ Shipment Plan once.
 - Cross-account scope check across five real accounts: every derived brand list
   was a subset of that account's own saved rows; zero invented brands.
 
+### Deployment
+
+- Commit `06df448` on `main`, deployed from the repository root as Vercel
+  deployment `dpl_Eyj6jp6BEKmDwgD6EP3wJGCWYPyc` (target production, READY).
+- Stable alias **https://upriverdashboard.vercel.app** returned HTTP 200 and
+  serves the new bundle `assets/index-BY4rqrhj.js`. Verified by string presence
+  in the served bundle, not by hash: `brandview`, `brand-view-brands`,
+  `Original marketplace currency`, `Inv. cover (days)` and the page lead copy
+  are all present. (A local `build:check` hash will never match Vercel's,
+  because build-check injects placeholder public env values.)
+- The lazy export chunk `assets/brand-view-export-mm_8LnGe.js` returns HTTP 200
+  at 11,781 bytes, confirming code-splitting works in production.
+- All three new actions (`brand-view-brands`, `brand-view`, `fx-rates`) return
+  **401 without a bearer token**, i.e. authorisation runs before anything else.
+  Existing actions (`accounts`, `brand-portfolio`, `fba-plan`) behave exactly as
+  before.
+
 ### Known limitations and next steps
 
 1. **No account currently has both a `brand-sales` snapshot and ASIN-level Ads
