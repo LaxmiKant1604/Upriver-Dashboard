@@ -89,6 +89,23 @@ screen.
 - The bundle **shrank** (1,126 kB → 1,118 kB) because the duplicate report
   component was removed.
 
+### Deployment (2026-08-04)
+
+- Commits `167c27b` (the upgrade) and `0b7dc59` (removing the retired report's
+  now-dead CSS), deployed from the repository root as
+  `dpl_9KZzfkyEj6K9jHU42i7VZieTHTPX`.
+- Stable alias **https://upriverdashboard.vercel.app** returned HTTP 200 and
+  serves `assets/index-BAUtbpQW.js`. Verified by string presence in the served
+  bundle: `brand-view-portfolio`, `Inv. cover (days)`, `bv-table`, `brandview`,
+  `all accounts complete through` and the new portfolio lead copy are all
+  present; `brand-portfolio-table` and the old subtitles are gone.
+- All API actions respond 401 unauthenticated, including the new
+  `brand-view-portfolio`.
+- **First use needs one click of Refresh inside the report.** The portfolio uses
+  a new report key, so no snapshot exists for it yet; the page shows its
+  "Build from saved data" action. That build reads only saved snapshots and does
+  not create a DataDoe export.
+
 ### Finding for the owner
 
 `MeridienMarket IN` has not had its Dashboard refreshed since **2026-04-10**, so
