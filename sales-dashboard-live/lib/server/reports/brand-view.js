@@ -261,6 +261,7 @@ export function aggregateBrandSales(rows, brand) {
 export function aggregateBrandAds(adRows, asinBrand, brand) {
   const spendByKey = new Map();
   const adCountries = new Set();
+  const coverageByCountry = new Map();
   let matchedRows = 0;
 
   for (const row of adRows || []) {
@@ -268,6 +269,10 @@ export function aggregateBrandAds(adRows, asinBrand, brand) {
     if (!parseDateStr(date)) continue;
     const country = trimmed(row?.marketplace_country_code).toUpperCase();
     adCountries.add(country);
+    const coverage = coverageByCountry.get(country) || { from: date, to: date };
+    if (date < coverage.from) coverage.from = date;
+    if (date > coverage.to) coverage.to = date;
+    coverageByCountry.set(country, coverage);
     const asin = trimmed(row?.child_asin).toUpperCase();
     if (!asin || asinBrand.get(asin) !== brand) continue;
     matchedRows += 1;
@@ -275,7 +280,7 @@ export function aggregateBrandAds(adRows, asinBrand, brand) {
     spendByKey.set(key, (spendByKey.get(key) || 0) + (Number(row?.metrics?.ad_spend) || 0));
   }
 
-  return { spendByKey, adCountries: [...adCountries], matchedRows };
+  return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows };
 }
 
 /**
@@ -415,7 +420,7 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
   // Six calendar months of ad history is exactly what the Monthly Snapshot
   // needs; the last-year column is sales only, so no ad history is read for it.
   const adsFrom = monthBack(asOf, 5)?.from || monthStart(asOf);
-  const adsTo = asOf > salesTo ? asOf : salesTo;
+  const adsTo = asOf;
   let adsError = null;
   let adRows = [];
   if (asinBrand.size) {
@@ -432,6 +437,11 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
     }
   }
   const ads = aggregateBrandAds(adRows, asinBrand, brand);
+  const adsCoverageByCountry = Object.fromEntries(ads.coverageByCountry);
+  const adCoverage = [...ads.coverageByCountry.values()].reduce((current, coverage) => ({
+    from: !current.from || coverage.from < current.from ? coverage.from : current.from,
+    to: !current.to || coverage.to > current.to ? coverage.to : current.to,
+  }), { from: null, to: null });
 
   const planSnapshot = await readOnce("fba-plan");
   const inventoryFallbackSnapshot = await readOnce(INVENTORY_FALLBACK_SNAPSHOT_KEY);
@@ -524,8 +534,11 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
       // Latest date the sales source actually populated. Used for MTD elapsed
       // days so a run rate is not diluted by dates the source has not filled.
       salesLatestDate: sales.maxDate,
-      adsFrom: asinBrand.size && !adsError ? adsFrom : null,
-      adsTo: asinBrand.size && !adsError ? adsTo : null,
+      // Observed saved-row bounds, never the requested query bounds. This
+      // prevents a partially seeded Ads history from becoming fake zero spend.
+      adsFrom: asinBrand.size && !adsError ? adCoverage.from : null,
+      adsTo: asinBrand.size && !adsError ? adCoverage.to : null,
+      adsCoverageByCountry,
       adsMatchedRows: ads.matchedRows,
       adsCountries: ads.adCountries,
       asinBrandSources,

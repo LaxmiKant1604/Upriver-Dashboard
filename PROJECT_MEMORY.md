@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Account-scoped Brand View module shipped)
+Last updated: 2026-08-03 (Brand View review corrections verified)
 
 ## Account-Scoped Brand View — NEW MODULE (2026-08-03)
 
@@ -77,6 +77,28 @@ additive (see "FBA per-marketplace inventory" below).
 - A requested range extending outside the saved Ads window → `—` (a partial sum
   would understate TACoS).
 - Missing FBA data → `—` for both inventory and cover.
+
+### Senior review corrections (2026-08-03)
+
+- **Date filters now drive all three reports.** The selected range's final date
+  is the shared reporting anchor: Daily Snapshot uses the complete selected
+  range; Monthly Snapshot pivots the five preceding completed months plus the
+  selected anchor month; and 7-Day Performance ends on that same anchor date.
+  Historical and custom selections therefore no longer leave the Monthly and
+  7-Day tables silently pinned to the newest saved day. Inventory cover uses
+  the selected anchor month's MTD unit rate.
+- **Ads completeness is now marketplace-specific.** Brand View records the
+  earliest and latest observed saved Ads row for every country. A selected
+  window outside that country's saved span displays Ad Spend and TACoS as
+  unavailable, rather than adding only available rows and treating missing
+  older days as zero spend. A country with complete Ads coverage but no
+  matching ASIN for the selected brand still correctly displays a real zero.
+- `adsFrom` / `adsTo` now describe observed saved data, not the wider window
+  requested from Supabase. This matters while an Ads account is seeded or
+  backfilled.
+- Regression coverage was added for partial country coverage and historical
+  Monthly/7-Day anchors. `npm run verify` passes **53 insight assertions + 47
+  Brand View assertions + production build**.
 
 ### Cache behaviour
 

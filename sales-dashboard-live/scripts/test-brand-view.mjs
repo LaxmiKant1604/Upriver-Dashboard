@@ -243,6 +243,7 @@ test("TACoS uses brand-scoped ad spend: another brand's spend is excluded", () =
   // Italy still counts as an ads-covered marketplace, which is what makes its
   // zero a real zero rather than an unavailable value.
   assert.deepEqual(ads.adCountries.sort(), ["IT", "UK"]);
+  assert.deepEqual(ads.coverageByCountry.get("UK"), { from: "2026-07-26", to: "2026-07-27" });
   assert.equal(ads.matchedRows, 2);
 });
 
@@ -364,10 +365,24 @@ test("missing Ads data is unavailable, never zero, but a covered marketplace can
 
 test("ad spend is unavailable for a range the saved Ads window does not fully cover", () => {
   const uk = MODEL.countries.find((entry) => entry.country === "UK");
-  assert.equal(typeof rangeAdSpend(MODEL, uk, "2026-07-21", "2026-07-27"), "number");
-  // The ads window starts at the first of five months back; anything earlier
-  // would be a partial sum and would understate TACoS.
+  assert.equal(typeof rangeAdSpend(MODEL, uk, "2026-07-26", "2026-07-27"), "number");
+  // The saved rows begin on 26 July. A seven-day total must not present the
+  // two saved days as a complete week of zero spend before that.
+  assert.equal(rangeAdSpend(MODEL, uk, "2026-07-21", "2026-07-27"), null);
   assert.equal(rangeAdSpend(MODEL, uk, "2025-06-01", "2026-07-27"), null);
+});
+
+test("country-specific Ads coverage refuses a partially seeded month", () => {
+  const uk = MODEL.countries.find((entry) => entry.country === "UK");
+  const partial = brandViewModel({
+    ...SNAPSHOT,
+    coverage: {
+      ...SNAPSHOT.coverage,
+      adsCoverageByCountry: { UK: { from: "2026-07-26", to: "2026-07-27" } },
+    },
+  });
+  assert.equal(rangeAdSpend(partial, uk, "2026-07-01", "2026-07-27"), null);
+  assert.equal(typeof rangeAdSpend(partial, uk, "2026-07-26", "2026-07-27"), "number");
 });
 
 test("missing FBA inventory renders unavailable rather than zero", () => {
@@ -401,7 +416,9 @@ test("the current-month run rate is actual / elapsed days x days in month", () =
   assert.equal(italy.runRate, (340 / 27) * 31);
 });
 
-test("the 7-day grid ends on the latest reported day", () => {
+test("monthly and 7-day tables honour their supplied report anchor", () => {
+  const monthly = monthlySnapshotRows(MODEL, "2026-06-30");
+  assert.equal(monthly.columns.current.key, "2026-06");
   const weekly = sevenDayRows(MODEL, "2026-07-27");
   assert.equal(weekly.dates.length, 7);
   assert.equal(weekly.dates[0], "2026-07-21");

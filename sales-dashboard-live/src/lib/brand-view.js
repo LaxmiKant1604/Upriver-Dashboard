@@ -173,7 +173,9 @@ export function rangeSales(country, from, to) {
  */
 export function rangeAdSpend(model, country, from, to) {
   if (!country.adsAvailable) return null;
-  const { adsFrom, adsTo } = model.coverage || {};
+  const countryCoverage = model.coverage?.adsCoverageByCountry?.[country.country];
+  const adsFrom = countryCoverage?.from || model.coverage?.adsFrom;
+  const adsTo = countryCoverage?.to || model.coverage?.adsTo;
   if (!adsFrom || !adsTo) return null;
   if (from < adsFrom || to > adsTo) return null;
   let spend = 0;
@@ -295,7 +297,7 @@ export function shareOf(value, total) {
  */
 export function dailySnapshotRows(model, { from, to }) {
   const ly = lastYearWindow(model, from, to);
-  const mtd = mtdWindow(model, model.latestDate);
+  const mtd = mtdWindow(model, to);
   const rows = [];
 
   for (const country of model.countries) {

@@ -482,8 +482,11 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
     () => (model && rangeFrom && rangeTo ? dailySnapshotRows(model, { from: rangeFrom, to: rangeTo }) : null),
     [model, rangeFrom, rangeTo]
   );
-  const monthly = useMemo(() => (model ? monthlySnapshotRows(model, latestDate) : null), [model, latestDate]);
-  const weekly = useMemo(() => (model ? sevenDayRows(model, latestDate) : null), [model, latestDate]);
+  // The selected range's final day is the common report anchor. That keeps a
+  // historical selection consistent across Daily, Monthly and 7-Day views.
+  const reportAnchor = rangeTo || latestDate;
+  const monthly = useMemo(() => (model ? monthlySnapshotRows(model, reportAnchor) : null), [model, reportAnchor]);
+  const weekly = useMemo(() => (model ? sevenDayRows(model, reportAnchor) : null), [model, reportAnchor]);
 
   const reportCurrencies = useMemo(
     () => [...new Set((model?.countries || []).map((entry) => entry.currency).filter(Boolean))],
@@ -784,7 +787,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         accountName: model.accountName || account?.name || model.accountId,
         brand: model.brand,
         rangeLabel: rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : DASH,
-        asOf: latestDate || model.asOf,
+        asOf: reportAnchor || model.asOf,
         currencyLabel,
         currencyCode: converted ? displayCurrency : "original",
         fxLine,
@@ -799,11 +802,11 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
       },
       reports: [
         toReport("daily", `Daily Snapshot — ${model.brand}`, `${rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : ""} · ${currencyLabel}`, "Daily Snapshot", dailyTable),
-        toReport("monthly", `Monthly Snapshot — ${model.brand}`, `Five completed months plus the current month and its run rate · ${currencyLabel}`, "Monthly Snapshot", monthlyTable),
-        toReport("weekly", `7-Day Performance — ${model.brand}`, `Seven days ending ${latestDate || ""} · ${currencyLabel}`, "7-Day Performance", weeklyTable),
+        toReport("monthly", `Monthly Snapshot — ${model.brand}`, `Five completed months plus the selected month and its run rate · ${currencyLabel}`, "Monthly Snapshot", monthlyTable),
+        toReport("weekly", `7-Day Performance — ${model.brand}`, `Seven days ending ${reportAnchor || ""} · ${currencyLabel}`, "7-Day Performance", weeklyTable),
       ],
     };
-  }, [account, converted, currencyLabel, dailyTable, displayCurrency, freshnessLine, fx, fxLine, latestDate, model, monthlyTable, rangeFrom, rangeTo, weeklyTable]);
+  }, [account, converted, currencyLabel, dailyTable, displayCurrency, freshnessLine, fx, fxLine, model, monthlyTable, rangeFrom, rangeTo, reportAnchor, weeklyTable]);
 
   const runExport = useCallback(async (format) => {
     if (!exportModel) return;
@@ -880,7 +883,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           onChange={setRangePreset}
           options={RANGE_PRESETS}
           disabled={!model}
-          hint="Applies to the Daily Snapshot. The Monthly and 7-Day reports are anchored to the latest reported day."
+          hint="Applies to all three reports. Monthly and 7-Day tables end on the selected range's final date."
         />
         {rangePreset === "CUSTOM" && (
           <div className="bv-field bv-custom">
@@ -1047,7 +1050,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           {monthlyTable && (
             <ReportPanel
               title={`Monthly Snapshot — ${model.brand}`}
-              subtitle={`Five completed calendar months, the current month to date and its run rate · ${currencyLabel} · share of the group total shown under each value`}
+              subtitle={`Five completed calendar months, the selected month to date and its run rate · ${currencyLabel} · share of the group total shown under each value`}
               headers={monthlyTable.headers}
               rows={monthlyTable.rows}
               minWidth={1020}
@@ -1056,7 +1059,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           {weeklyTable && (
             <ReportPanel
               title={`7-Day Performance — ${model.brand}`}
-              subtitle={`Seven days ending ${latestDate ? fmtDateHuman(latestDate) : ""} · ${currencyLabel} · units are never converted`}
+              subtitle={`Seven days ending ${reportAnchor ? fmtDateHuman(reportAnchor) : ""} · ${currencyLabel} · units are never converted`}
               headers={weeklyTable.headers}
               rows={weeklyTable.rows}
               minWidth={980}
