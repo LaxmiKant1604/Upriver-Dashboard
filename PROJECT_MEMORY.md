@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View bootstrap repair deployed)
+Last updated: 2026-08-03 (Brand View Supabase directory persistence in progress)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -25,6 +25,10 @@ Last updated: 2026-08-03 (Brand View bootstrap repair deployed)
   `index-D7eEO-BV.js` bundle. A signed-in user should open Brand View and click
   **Load portfolio brands** once; the resulting directory is shared for all
   authorised users and later opens read that snapshot without a DataDoe call.
+- **Follow-up in progress:** the brand-directory snapshot is shared, but its
+  account scope was not also persisted by that action. The refresh now writes
+  the already-discovered account directory to Supabase too, so a clean browser
+  can first recover account IDs and then load the matching saved brand list.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 

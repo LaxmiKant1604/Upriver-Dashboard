@@ -28,6 +28,8 @@ import {
   getDashboardAccess,
   getLatestReportSnapshot,
   isSupabaseConfigured,
+  publishSnapshotUpdate,
+  saveReportSnapshot,
 } from "../lib/server/supabase.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
 // and the six insight reports — shares one 2-req/sec rate limiter, one export
@@ -58,7 +60,7 @@ import {
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
 } from "../lib/server/datadoe-connections.js";
-import { beginSharedRefresh, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
@@ -200,6 +202,32 @@ async function sharedSnapshotBrands(accountIds) {
 
 function stableSelectionId(prefix, accountIds) {
   return `${prefix}:${[...new Set(accountIds.map(String))].sort().join(",")}`;
+}
+
+// A Brand View refresh already discovers the connected account catalogue in
+// order to find its permitted brands. Persist that same catalogue so a future
+// browser can establish its account scope from Supabase before it reads the
+// saved Brand View directory. The accounts response still filters this shared
+// record by the requesting user's permissions.
+async function persistAccountDirectory(accounts) {
+  if (!isSupabaseConfigured() || !accounts.length) return;
+  const reportKey = "account-directory";
+  const reportVersion = "account-directory-shared-v1";
+  const accountId = "__account-directory__";
+  const paramsHash = paramsHashFor(reportVersion, {});
+  const payload = { accounts };
+  const saved = await saveReportSnapshot({
+    reportKey,
+    accountId,
+    paramsHash,
+    params: { reportVersion },
+    payload,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    sourceRefreshedAt: new Date().toISOString(),
+  });
+  if (saved?.id) {
+    await publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
+  }
 }
 
 // The first dashboard reports predate the shared snapshot layer. Keep their
@@ -861,6 +889,7 @@ export default async function handler(req, res) {
     let publicAccountIds = String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
     let accountScope = null;
     let brandDirectoryAccounts = null;
+    let discoveredDirectoryAccounts = null;
 
     const accountScopedAction = ACCOUNT_SCOPED_ACTIONS.has(action);
     // `sample` is admin-only diagnostics, but it still needs the same routing
@@ -885,6 +914,7 @@ export default async function handler(req, res) {
     }
     if (action === "brand-directory" && wantsRefresh(req)) {
       const discovered = await discoverConnectedAccounts(connections);
+      discoveredDirectoryAccounts = discovered;
       brandDirectoryAccounts = access.role === "admin"
         ? discovered
         : discovered.filter((account) => access.accountIds.includes(String(account.id)));
@@ -913,6 +943,9 @@ export default async function handler(req, res) {
       }
       legacySharedRefresh = await beginSharedRefresh(sharedOptions);
       if (!legacySharedRefresh) return;
+      if (action === "brand-directory" && discoveredDirectoryAccounts) {
+        await persistAccountDirectory(discoveredDirectoryAccounts);
+      }
     }
     const sendLegacyPayload = async (payload) => {
       if (legacySharedRefresh) {
