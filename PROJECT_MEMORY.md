@@ -1,24 +1,17 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View review corrections verified)
+Last updated: 2026-08-03 (Brand View portfolio separation restored)
 
-## Brand View entry-point repair (2026-08-03)
+## Brand View scope clarification (2026-08-03)
 
-- **User-facing root cause:** the top-header `Brand view` switcher still opened
-  the older portfolio implementation (`BrandPortfolioDashboard` in `App.jsx`).
-  Its tables are the ones visible in the reported screenshots, so the newer
-  Account -> Brand module and its review corrections were not being shown.
-- **Fix:** the header switcher now opens the dedicated sidebar `brandview`
-  route. It preserves the normal Account View dashboard and provides the
-  required Account -> Brand -> reports flow without a competing hidden
-  implementation.
+- The top-header `Brand view` switcher remains the separate portfolio-level
+  report (`BrandPortfolioDashboard` in `App.jsx`). It must not redirect into
+  Account View or the account-scoped `brandview` route.
+- The dedicated sidebar `brandview` route remains an additional account-scoped
+  report, but it is not a replacement for the portfolio Brand View screen.
 - **Legacy safety fix:** the older portfolio report now trims and uppercases
   marketplace country and currency keys before grouping. This prevents duplicate
   country rows when historical saved data differs only by letter case or spaces.
-- The legacy portfolio builder remains in the codebase for now to avoid a
-  destructive removal of existing saved-report behavior. It is no longer the
-  header entry point and should be retired only after the dedicated Brand View
-  has been accepted against populated accounts.
 
 ## Account-Scoped Brand View — NEW MODULE (2026-08-03)
 

@@ -2967,7 +2967,6 @@ function DashboardApp({ session, access, onSignOut }) {
             onBrandChange={setSelectedBrand}
             dashboardMode={view === "dashboard" ? dashboardMode : "account"}
             onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
-            onOpenBrandView={() => { setDashboardMode("account"); setView("brandview"); setMobileOpen(false); }}
             portfolioBrands={portfolioBrandList}
             selectedPortfolioBrand={selectedPortfolioBrand}
             onPortfolioBrandChange={setSelectedPortfolioBrand}
