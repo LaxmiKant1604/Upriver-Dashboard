@@ -229,6 +229,10 @@ Shipment Plan once.
 
 ### Deployment
 
+- **Header/sidebar boundary correction:** commit `99b001e` was verified with
+  `npm run verify` and deployed on 2026-08-04 as
+  `https://upriver-dashboard-9rb73ggqq-laxmikant1604s-projects.vercel.app`.
+  The stable production URL is `https://upriverdashboard.vercel.app`.
 - **Sidebar-only Brand View navigation:** commit `d33349f` was verified with
   `npm run verify` and deployed on 2026-08-03 as
   `https://upriver-dashboard-9dque6c7p-laxmikant1604s-projects.vercel.app`.
