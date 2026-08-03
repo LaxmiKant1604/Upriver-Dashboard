@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View bootstrap repair ready for deployment)
+Last updated: 2026-08-03 (Brand View bootstrap repair deployed)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -19,6 +19,12 @@ Last updated: 2026-08-03 (Brand View bootstrap repair ready for deployment)
   than silently behaving like an account list. The Brand View refresh controls
   remain available when the user has permission even before account metadata is
   present.
+- **Deployment:** commit `03725a9` was pushed to `main` and deployed directly
+  to Vercel as `dpl_GHf8psnpS9b3BBLNr4rwQVyFPHrm`. The stable production alias
+  `https://upriverdashboard.vercel.app` returned HTTP 200 and served the new
+  `index-D7eEO-BV.js` bundle. A signed-in user should open Brand View and click
+  **Load portfolio brands** once; the resulting directory is shared for all
+  authorised users and later opens read that snapshot without a DataDoe call.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
