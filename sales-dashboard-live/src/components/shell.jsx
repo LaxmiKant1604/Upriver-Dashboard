@@ -31,6 +31,7 @@ import {
   ShieldAlert,
   Store,
   Tag,
+  Tags,
   TrendingUp,
   Trophy,
   Undo2,
@@ -49,6 +50,9 @@ export const NAV_GROUPS = [
     label: "Overview",
     items: [
       { view: "dashboard", label: "Dashboard", title: "Portfolio sales dashboard", icon: LayoutDashboard },
+      // Account-scoped Brand View. A separate route key and a separate module:
+      // it does not share state or cache with the Dashboard's brand mode.
+      { view: "brandview", label: "Brand View", title: "Brand View — one account, one brand, every marketplace", icon: Tags },
       { view: "priority", label: "Priority Feed", title: "Priority Feed — every evidenced signal from the six reports, ranked", icon: ListChecks },
     ],
   },

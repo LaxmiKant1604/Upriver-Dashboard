@@ -29,6 +29,11 @@ import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
 import PriorityFeed from "./views/PriorityFeed.jsx";
+// Account-scoped Brand View (Account -> Brand -> Brand Reports). Deliberately a
+// separate view key and a separate module: it owns all of its own state and
+// shares no cache key, report key or calculation with the Account View
+// dashboard or with the older portfolio brand mode below.
+import BrandView from "./views/BrandView.jsx";
 
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
@@ -2913,6 +2918,11 @@ function DashboardApp({ session, access, onSignOut }) {
         : `Refresh ${accountLabel} from DataDoe`,
   };
 
+  // Brand View owns its own account/brand/date/currency control bar, so the
+  // global scope cluster is hidden there rather than showing two account
+  // pickers that could disagree. Every other view keeps its existing header.
+  const showGlobalScope = view !== "access" && view !== "brandview";
+
   return (
     <div className="dash-root">
       <style>{STYLE}</style>
@@ -2938,7 +2948,7 @@ function DashboardApp({ session, access, onSignOut }) {
             viewTitle={VIEW_TITLES[view] || "Dashboard"}
             onOpenMenu={() => setMobileOpen(true)}
             mobileOpen={mobileOpen}
-            showScope={view !== "access"}
+            showScope={showGlobalScope}
             accounts={accounts}
             selectedAccountId={selectedAccountId}
             onAccountChange={(id) => { setSelectedAccountId(id); setSelectedBrand("ALL"); }}
@@ -2957,6 +2967,16 @@ function DashboardApp({ session, access, onSignOut }) {
           />
 
       {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
+
+      {view === "brandview" && (
+        <BrandView
+          accounts={accounts}
+          accountsLoading={accountsLoading}
+          accountsError={accountsError}
+          loadReport={loadSharedReport}
+          refreshReport={refreshSharedReport}
+        />
+      )}
 
       {view === "dashboard" && (dashboardMode === "brand" ? (
         <BrandPortfolioDashboard

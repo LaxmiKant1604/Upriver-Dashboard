@@ -928,6 +928,100 @@ body{ overflow-x:hidden; }
 .brand-portfolio-table .money{ color:var(--text-primary); font-family:'JetBrains Mono',monospace; font-size:11.5px; }
 .brand-portfolio-progress{ position:sticky; bottom:12px; z-index:3; width:max-content; max-width:100%; margin:var(--space-3) auto 0; padding:8px 11px; border:1px solid var(--accent-border); border-radius:var(--radius-sm); background:var(--bg-elevated); box-shadow:var(--shadow-md); color:var(--accent-strong); font-size:11.5px; font-weight:750; }
 
+/* ============ ACCOUNT-SCOPED BRAND VIEW (view key: brandview) ============
+   A separate module from the portfolio brand mode above. It reuses the same
+   tokens, panel, alert, state and button patterns; only the control bar and the
+   wide country grid are new. Light theme only, like the rest of the system. */
+.bv-page{ padding-bottom:var(--space-6); }
+
+.bv-controls{
+  display:flex; flex-wrap:wrap; align-items:flex-end; gap:var(--space-3);
+  margin-top:var(--space-4); padding:12px 14px;
+  border:1px solid var(--border-default); border-radius:var(--radius-md);
+  background:var(--bg-surface); box-shadow:var(--shadow-xs);
+}
+.bv-field{ display:flex; flex-direction:column; gap:5px; min-width:0; flex:1 1 190px; }
+.bv-field.disabled{ opacity:.6; }
+.bv-field-label{
+  display:flex; align-items:center; gap:6px; color:var(--text-muted);
+  font-size:10px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
+}
+.bv-field-label svg{ opacity:.75; flex:0 0 auto; }
+.bv-select{
+  width:100%; min-width:0; padding:8px 10px; appearance:auto;
+  border:1px solid var(--border-strong); border-radius:var(--radius-sm);
+  background:var(--bg-elevated); color:var(--text-primary);
+  font:inherit; font-size:12.5px; font-weight:650; cursor:pointer;
+  transition:border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
+}
+.bv-select:hover:not(:disabled){ border-color:var(--border-hover); }
+.bv-select:disabled{ cursor:not-allowed; background:var(--bg-sunken); color:var(--text-muted); }
+.bv-custom{ flex:1 1 260px; }
+.bv-custom-inputs{ display:flex; gap:6px; }
+.bv-custom-inputs input[type=date]{
+  flex:1; min-width:0; padding:7px 9px; border:1px solid var(--border-strong);
+  border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-primary);
+  font:inherit; font-size:12px;
+}
+.bv-actions{ display:flex; align-items:center; gap:var(--space-2); margin-left:auto; padding-bottom:1px; }
+
+.bv-export{ position:relative; }
+.bv-menu{
+  position:absolute; right:0; top:calc(100% + 6px); z-index:20; min-width:236px;
+  display:flex; flex-direction:column; padding:5px;
+  border:1px solid var(--border-strong); border-radius:var(--radius-md);
+  background:var(--bg-elevated); box-shadow:var(--shadow-lg);
+}
+.bv-menu button{
+  display:flex; align-items:flex-start; gap:9px; padding:8px 9px; border:0;
+  border-radius:var(--radius-sm); background:transparent; color:var(--text-primary);
+  font:inherit; font-size:12.5px; text-align:left; cursor:pointer;
+}
+.bv-menu button:hover{ background:var(--accent-soft); color:var(--accent-strong); }
+.bv-menu button svg{ margin-top:2px; flex:0 0 auto; opacity:.8; }
+.bv-menu button b{ display:block; font-weight:750; }
+.bv-menu button small{ display:block; margin-top:1px; color:var(--text-muted); font-size:10.5px; font-weight:600; }
+.bv-export-error{ position:absolute; right:0; top:calc(100% + 6px); z-index:20; width:250px; padding:8px 10px; border:1px solid var(--negative-border); border-radius:var(--radius-sm); background:var(--negative-soft); color:var(--negative); font-size:11px; font-weight:650; }
+
+.bv-freshness{ margin-top:var(--space-3); }
+.bv-kpis{ margin-top:var(--space-4); }
+.bv-panel{ margin-top:var(--space-4); overflow:hidden; }
+
+/* The table scrolls inside its own container so the page never scrolls
+   sideways on a tablet or a phone, and the country column stays pinned. */
+/* The negative margin bleeds the grid to the panel edges, so it must match
+   .panel's own 16px 18px padding exactly. */
+.bv-scroll{ overflow-x:auto; overflow-y:visible; overscroll-behavior-inline:contain; -webkit-overflow-scrolling:touch; max-width:100%; margin:0 -18px -16px; padding:0 0 2px; }
+.bv-table{ width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+.bv-table th{
+  padding:9px 12px; background:var(--bg-subtle); border-bottom:1px solid var(--border-strong);
+  color:var(--text-muted); font-size:9.5px; font-weight:800; letter-spacing:.06em;
+  text-transform:uppercase; text-align:right; white-space:nowrap; position:sticky; top:0; z-index:2;
+}
+.bv-table th.bv-first, .bv-table td.bv-first{
+  text-align:left; position:sticky; left:0; z-index:3;
+  background:var(--bg-subtle); border-right:1px solid var(--border-default); min-width:172px;
+}
+.bv-table td.bv-first{ background:var(--bg-surface); z-index:1; font-weight:750; color:var(--text-primary); }
+.bv-table td{
+  padding:9px 12px; border-bottom:1px solid var(--grid-line); color:var(--text-primary);
+  font-size:12px; font-weight:650; text-align:right; vertical-align:middle; white-space:nowrap;
+}
+.bv-table td.bv-num{ font-family:'JetBrains Mono',ui-monospace,monospace; font-size:11.5px; }
+.bv-table td small{ display:block; margin-top:2px; color:var(--text-muted); font-size:9.5px; font-weight:650; }
+.bv-table tbody tr:last-child td{ border-bottom:0; }
+.bv-table tbody tr:hover td{ background:var(--bg-subtle); }
+.bv-table tbody tr:hover td.bv-first{ background:var(--bg-sunken); }
+.bv-table .bv-total td{ background:var(--accent-soft); border-bottom-color:var(--accent-border); color:var(--accent-strong); font-weight:800; }
+.bv-table .bv-total td.bv-first{ background:var(--accent-soft); color:var(--accent-strong); }
+.bv-table .bv-total td small{ color:var(--accent-strong); opacity:.75; }
+.bv-table tbody tr.bv-total:hover td{ background:var(--accent-soft); }
+.bv-table .bv-section td{
+  padding:8px 12px; background:var(--bg-sunken); border-bottom:1px solid var(--border-strong);
+  color:var(--text-secondary); font-size:9.5px; font-weight:850; letter-spacing:.08em;
+  text-align:left; text-transform:uppercase; position:sticky; left:0;
+}
+
 /* ======================= RESPONSIVE ======================= */
 @media (max-width:1180px){
   .metric-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -976,8 +1070,21 @@ body{ overflow-x:hidden; }
   .tb-select.account select,.tb-select.brand select{ min-width:0; max-width:none; width:100%; }
   .refresh-cluster{ flex:1 1 160px; }
   .refresh-status-value{ max-width:none; }
+
+  .bv-controls{ gap:var(--space-2); }
+  .bv-field{ flex:1 1 46%; }
+  .bv-actions{ flex:1 1 100%; margin-left:0; }
+  .bv-actions > *{ flex:1 1 auto; }
+  .bv-actions .plan-export-btn{ width:100%; justify-content:center; }
+  .bv-menu{ right:auto; left:0; }
 }
 @media (max-width:640px){
+  .bv-field{ flex:1 1 100%; }
+  .bv-custom-inputs{ flex-direction:column; }
+  .bv-table th.bv-first, .bv-table td.bv-first{ min-width:140px; }
+  .bv-table th, .bv-table td{ padding:8px 9px; }
+  .bv-menu{ min-width:0; width:calc(100vw - 48px); max-width:280px; }
+  .bv-export-error{ width:calc(100vw - 48px); max-width:280px; }
   .metric-grid,.cmp-grid{ grid-template-columns:1fr; }
   .container{ padding:var(--space-4) var(--space-3) 0; }
   .plan-stat-row{ grid-template-columns:repeat(2,minmax(0,1fr)); }

@@ -28,6 +28,7 @@ import {
   getAdDailyMetrics,
   getDashboardAccess,
   getLatestReportSnapshot,
+  getReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   saveReportSnapshot,
@@ -68,6 +69,19 @@ import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/ser
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
 import { buildListingOptimizer, OPTIMIZER_REPORT_KEY, OPTIMIZER_VERSION } from "../lib/server/reports/listing-optimizer.js";
+// Account-scoped Brand View (Account -> Brand -> Brand Reports). Entirely
+// separate from the older portfolio `brand-portfolio` action above: different
+// report keys, different snapshot scope, different builders.
+import {
+  BRAND_VIEW_BRANDS_REPORT_KEY,
+  BRAND_VIEW_BRANDS_VERSION,
+  BRAND_VIEW_REPORT_KEY,
+  BRAND_VIEW_VERSION,
+  brandViewScopeId,
+  buildBrandViewBrandDirectory,
+  buildBrandViewSnapshot,
+} from "../lib/server/reports/brand-view.js";
+import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
 // Keep the rest of this legacy route's report builders connection-agnostic.
 // They still receive a normal API key and raw DataDoe seller IDs, while this
@@ -86,6 +100,9 @@ async function fetchAccounts(apiKey) {
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
   "keyword-rank", "content-changes", "fba-plan",
+  // Account-scoped Brand View. Both actions take exactly one account, are
+  // authorised against it, and read only that account's saved snapshots.
+  "brand-view-brands", "brand-view",
   // Insight reports. Each is single-account and served from the shared
   // Supabase snapshot unless an explicit refresh is requested.
   // The Priority Feed has no action of its own: it combines the six snapshots
@@ -370,6 +387,63 @@ async function persistAccountDirectory(accounts) {
   if (saved?.id) {
     await publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
   }
+}
+
+// Account name and marketplace country for one account, from the shared account
+// directory snapshot. Supabase only: Brand View must never call DataDoe's
+// account list merely to label a row. Returns null metadata rather than failing
+// when the directory has not been seeded, because the report itself does not
+// depend on it.
+async function sharedAccountMetadata(accountId) {
+  if (!isSupabaseConfigured()) return null;
+  const snapshot = await getLatestReportSnapshot({
+    reportKey: "account-directory",
+    accountId: "__account-directory__",
+  }).catch(() => null);
+  const account = (snapshot?.payload?.accounts || []).find((entry) => String(entry.id) === String(accountId));
+  return account ? { name: account.name || null, country: account.country || null, currency: account.currency || null } : null;
+}
+
+/**
+ * The account-scoped Brand View brand directory, cache-first.
+ *
+ * Deriving the list means reading this account's saved Dashboard payload, which
+ * for a large account is megabytes. Doing that on every page load — and again
+ * to validate the selected brand — would make the page slow for exactly the
+ * accounts that need it most. So the derived list is itself saved as a small
+ * shared snapshot and served from there; it is only rebuilt when nothing has
+ * been derived yet or the user explicitly refreshes.
+ *
+ * Rebuilding needs no refresh lock: it reads Supabase only, costs nothing
+ * upstream, and the write is an idempotent upsert of a deterministic result.
+ */
+async function brandViewDirectory(accountId, { rebuild = false } = {}) {
+  const paramsHash = paramsHashFor(BRAND_VIEW_BRANDS_VERSION, { accountId });
+  if (!rebuild) {
+    const saved = await getReportSnapshot({ reportKey: BRAND_VIEW_BRANDS_REPORT_KEY, accountId, paramsHash });
+    if (saved?.payload) {
+      return {
+        payload: saved.payload,
+        savedAt: saved.source_refreshed_at || saved.updated_at || null,
+        shared: true,
+      };
+    }
+  }
+  const payload = await buildBrandViewBrandDirectory({ accountId, getSnapshot: getLatestReportSnapshot });
+  const saved = await saveReportSnapshot({
+    reportKey: BRAND_VIEW_BRANDS_REPORT_KEY,
+    accountId,
+    paramsHash,
+    params: { reportVersion: BRAND_VIEW_BRANDS_VERSION, accountId },
+    payload,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    sourceRefreshedAt: new Date().toISOString(),
+  }).catch(() => null);
+  return {
+    payload,
+    savedAt: saved?.source_refreshed_at || new Date().toISOString(),
+    shared: Boolean(saved),
+  };
 }
 
 // The first dashboard reports predate the shared snapshot layer. Keep their
@@ -1099,6 +1173,110 @@ export default async function handler(req, res) {
       return;
     }
 
+    /* ============================================================
+       Account-scoped Brand View: Account -> Brand -> Brand Reports.
+
+       Both actions are single-account and cache-only. Neither ever starts a
+       DataDoe export, not even on an explicit Refresh: a Brand View refresh
+       re-aggregates this account's already-saved Dashboard, Ads and FBA
+       snapshots and saves one compact shared result. Getting *newer source*
+       data is still the job of the account's own reports, which keeps DataDoe
+       cost exactly where it already was.
+       ============================================================ */
+
+    if (action === "brand-view-brands") {
+      if (!accountScope || accountScope.accountIds.length !== 1) {
+        res.status(400).json({ error: "Brand View requires exactly one selected account." });
+        return;
+      }
+      const accountId = accountScope.accountIds[0];
+      if (!isSupabaseConfigured()) {
+        res.status(200).json({
+          accountId, brands: [], sources: [],
+          message: "Brand View needs the shared Supabase snapshot store. This deployment has no Supabase configuration.",
+        });
+        return;
+      }
+      const { payload, savedAt, shared } = await brandViewDirectory(accountId, { rebuild: wantsRefresh(req) });
+      res.status(200).json({
+        ...payload,
+        reportKey: BRAND_VIEW_BRANDS_REPORT_KEY,
+        reportVersion: BRAND_VIEW_BRANDS_VERSION,
+        snapshot: { savedAt, shared },
+      });
+      return;
+    }
+
+    if (action === "brand-view") {
+      if (!accountScope || accountScope.accountIds.length !== 1) {
+        res.status(400).json({ error: "Brand View requires exactly one selected account." });
+        return;
+      }
+      const accountId = accountScope.accountIds[0];
+      const brand = String(req.query.brand || "").trim();
+      const asOf = String(req.query.asOf || "");
+      if (!brand) {
+        res.status(400).json({ error: "Brand View requires a selected brand." });
+        return;
+      }
+      if (!isDateStr(asOf)) {
+        res.status(400).json({ error: "Brand View requires an asOf date (YYYY-MM-DD)." });
+        return;
+      }
+      // The brand must be one this account's own saved data records. This is the
+      // server-side guarantee behind "the Brand dropdown must never contain
+      // brands from another account": a crafted request naming another
+      // account's brand is refused rather than silently returning nothing.
+      // Cache-first, then one rebuild only if the brand is not in the saved
+      // list. That covers a brand added since the directory was last derived
+      // without paying for a rebuild on the common path.
+      let { payload: directory } = await brandViewDirectory(accountId);
+      if (!directory.brands.includes(brand)) {
+        ({ payload: directory } = await brandViewDirectory(accountId, { rebuild: true }));
+      }
+      if (!directory.brands.includes(brand)) {
+        res.status(400).json({
+          error: directory.brands.length
+            ? `"${brand}" is not a brand recorded in this account's saved data. Choose a brand from this account.`
+            : directory.message,
+        });
+        return;
+      }
+
+      const accountMeta = await sharedAccountMetadata(accountId);
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: BRAND_VIEW_REPORT_KEY,
+        reportVersion: BRAND_VIEW_VERSION,
+        // The brand is part of the snapshot's account key, not only its params
+        // hash, so the across-midnight stale-scope fallback can never serve one
+        // brand's saved report for another brand.
+        accountId: brandViewScopeId(accountId, brand),
+        params: { accountId, brand, asOf },
+        userId: access.userId,
+        label: "Brand View",
+        build: () => buildBrandViewSnapshot({
+          accountId,
+          brand,
+          asOf,
+          account: accountMeta,
+          getSnapshot: getLatestReportSnapshot,
+          getAdsRows: getAdsDailySourceRows,
+        }),
+      });
+      return;
+    }
+
+    // Exchange rates for the Brand View currency selector. Reading is always
+    // Supabase-first; the provider is contacted server-side at most once per
+    // provider cycle. A browser never calls the FX provider directly.
+    if (action === "fx-rates") {
+      const rates = await getFxRates();
+      res.status(200).json({ ...rates, displayCurrencies: FX_DISPLAY_CURRENCIES });
+      return;
+    }
+
     const legacyShared = legacySharedDescriptor({ action, req, access, publicAccountIds, accountScope });
     if (legacyShared) {
       const sharedOptions = {
@@ -1634,6 +1812,12 @@ export default async function handler(req, res) {
       const invByAsin = {};
       const skusByAsin = {};
       const invProductName = new Map();
+      // ADDITIVE ONLY. FBA Inventory Health is per marketplace, but the per-ASIN
+      // rows below intentionally fold that dimension away for the shipment plan.
+      // The account-scoped Brand View needs FBA inventory per country, so the
+      // same rows are also folded to (marketplace, brand) here. Nothing existing
+      // reads this key, so the FBA Shipment Plan report is unchanged.
+      const invByCountryBrand = new Map();
       for (const r of invRows) {
         if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
         const asin = String(r.child_asin || "").trim();
@@ -1653,6 +1837,17 @@ export default async function handler(req, res) {
         if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
         const nm = String(r.product_name || "").trim();
         if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
+        // Per-marketplace roll-up for Brand View. `brandByAsin` is the same
+        // catalog map the per-ASIN rows use, so a brand's country inventory can
+        // never disagree with its shipment-plan inventory.
+        const invCountry = String(r.marketplace_country_code || account?.country || "").trim().toUpperCase();
+        const invBrand = brandByAsin.get(asin) || null;
+        const countryBrandKey = `${invCountry}|${invBrand || ""}`;
+        const bucket = invByCountryBrand.get(countryBrandKey)
+          || { country: invCountry || null, brand: invBrand, fbaAvailable: 0, skus: new Set() };
+        bucket.fbaAvailable += num(r.available);
+        if (sku) bucket.skus.add(sku);
+        invByCountryBrand.set(countryBrandKey, bucket);
       }
       const inventoryAvailable = invRows.length > 0;
 
@@ -1737,6 +1932,13 @@ export default async function handler(req, res) {
         inventoryAvailable,
         awdAvailable,
         rows,
+        // Additive: consumed only by the account-scoped Brand View. Bounded by
+        // (marketplaces x brands), so it stays small for accounts with
+        // thousands of SKUs.
+        inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
+          ...entry,
+          skuCount: skus.size,
+        })),
       });
       return;
     }
@@ -1971,7 +2173,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });

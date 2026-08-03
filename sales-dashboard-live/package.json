@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "build:check": "node scripts/build-check.mjs",
     "test:insights": "node scripts/test-insights.mjs",
-    "verify": "npm run test:insights && npm run build:check",
+    "test:brand-view": "node scripts/test-brand-view.mjs",
+    "verify": "npm run test:insights && npm run test:brand-view && npm run build:check",
     "db:migrate": "node scripts/apply-supabase-migrations.mjs"
   },
   "dependencies": {

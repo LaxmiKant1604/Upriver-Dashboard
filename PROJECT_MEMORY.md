@@ -1,6 +1,223 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Secondary DataDoe Brand View account-discovery repair deployed)
+Last updated: 2026-08-03 (Account-scoped Brand View module shipped)
+
+## Account-Scoped Brand View — NEW MODULE (2026-08-03)
+
+A new page, route key `brandview`, with the flow **Account → Brand → Brand
+Reports**. It is a separate module from everything that existed before. The
+Account View dashboard, the older portfolio Brand View (`dashboard` + brand
+mode, action `brand-portfolio`), their calculations, cache keys, report keys and
+API actions were **not modified**. The only change to an existing route is
+additive (see "FBA per-marketplace inventory" below).
+
+### Architecture
+
+| Layer | File | Purpose |
+| --- | --- | --- |
+| Server report | `lib/server/reports/brand-view.js` | Account+brand aggregation and the brand directory. Every function takes exactly one `accountId`. |
+| Server FX | `lib/server/fx.js` | Exchange-rate service: Supabase-cached, provider-cycle aware, stale fallback. |
+| API actions | `api/datadoe.js` | `brand-view-brands`, `brand-view`, `fx-rates` (all new, purely additive). |
+| Client calc | `src/lib/brand-view.js` | Currency system and the three report computations. Dependency-free and unit-tested. |
+| Client page | `src/views/BrandView.jsx` | Control bar, three reports, alerts, empty/loading/error states. |
+| Exports | `src/lib/brand-view-export.js`, `src/lib/xlsx.js` | XLSX / CSV / PDF from one shared table model. Lazy-loaded. |
+| Styles | `src/styles/theme.js` (`.bv-*`) | Uses existing tokens only. Light theme, no new palette. |
+| Migration | `supabase/migrations/20260803_fx_rate_cache.sql` | `fx_rate_snapshots`. **Applied** on 2026-08-03. |
+| Tests | `scripts/test-brand-view.mjs` | 46 assertions, wired into `npm run verify`. |
+
+### Scoping guarantee (no cross-account brand leakage)
+
+- Every server function takes **one** `accountId` and reads only that account's
+  saved snapshots and that account's saved Ads rows. There is no code path that
+  iterates accounts, so leakage is structurally impossible rather than filtered.
+- `brand-view-brands` and `brand-view` are in `ACCOUNT_SCOPED_ACTIONS`, so
+  `assertAccountAccess` runs before either executes.
+- `brand-view` additionally refuses a brand that is not in that account's own
+  derived directory, so a crafted request naming another account's brand is
+  rejected rather than silently returning nothing.
+- The Brand dropdown is disabled until an account is chosen; changing account
+  clears brand, report, range and error state.
+- Snapshot key is `brand-view:<accountId>::<brand>`. The brand is in the
+  **account_id** column, not only the params hash, because the across-midnight
+  stale-scope fallback (`getLatestReportSnapshot`) looks up by report key +
+  account id alone. Without this, brand A could be served brand B's snapshot.
+
+### Sources
+
+| Metric | Source |
+| --- | --- |
+| Sales / units | saved `brand-sales` snapshot (Order Line Items joined to Product Catalog, already folded to date/country/currency/brand) |
+| Ad spend | `ads_daily_source_rows`, `source_key = asin-performance-v1`, joined to this account's ASIN→brand map |
+| ASIN→brand | `fba-plan`, `sku-pl`, `listing-health`, `sales-movers`, `returns-leakage`, `buy-box-loss`, `listing-optimizer` (first match wins). **Not** `brand-sales` — it is folded to brand grain and has no ASIN, which is why the older `brand-portfolio` builder always produced an empty ad join. |
+| FBA inventory | `fba-plan.inventoryByBrandCountry` (per marketplace) → `fba-plan.rows` → `listing-health.rows` (both account-level only) |
+
+### Formulas
+
+- **Last Year Sales** — the equivalent calendar window one year earlier
+  (`shiftYear`, 29 Feb clamped), shown **only** when the saved snapshot's
+  requested window fully covers it. Otherwise `—`, never a partial value.
+- **TACoS** — brand ad spend ÷ brand sales for the same marketplace and window.
+  Brand-scoped by ASIN, so whole-account spend is never attributed to a brand.
+  `null` unless both a real spend and a positive sales base exist.
+- **Inventory Cover** — available FBA units ÷ (brand MTD units ÷ elapsed days).
+  Displayed in **days**, with the month equivalent (÷30.44) in the cell tooltip.
+- **Current Month Run Rate** — current actual ÷ elapsed calendar days × days in
+  month. Elapsed days come from the latest **populated** source date, not the
+  wall clock, so an unfilled date cannot dilute the projection.
+- **Monthly Snapshot** — five completed calendar months + current month actual +
+  run rate + current-month ad spend and TACoS. Share of the group total is shown
+  under each month value.
+- **7-Day Performance** — seven days ending at the latest populated date. Daily
+  Sales / Units / Ad Spend / TACoS per currency group, then Units by Country.
+
+### "Unavailable is not zero"
+
+- A marketplace with **no** saved ad rows at all → ad spend `—`.
+- A marketplace **with** saved ad rows but none matching this brand → real `0`.
+- A requested range extending outside the saved Ads window → `—` (a partial sum
+  would understate TACoS).
+- Missing FBA data → `—` for both inventory and cover.
+
+### Cache behaviour
+
+- Normal page load, account switch, brand switch, date change, currency change,
+  sorting and export **never** call DataDoe. Reads are shared Supabase snapshots.
+- **A Brand View refresh never calls DataDoe either.** It re-aggregates this
+  account+brand from snapshots that already exist and saves one shared result
+  under a cross-user `claim_report_refresh_lock`. Getting *newer source* data
+  remains the job of the account's own reports, so DataDoe cost is unchanged.
+- The derived brand directory is itself saved as a small shared snapshot
+  (`brand-view-brands`). Measured on a real 5,302-row account: **2,109 ms** to
+  derive, **94 ms** cached. It is rebuilt only when absent or on explicit
+  Refresh, so a large account does not re-read a multi-megabyte payload per load.
+- Saved payload is bounded by (countries × days); the SKU/ASIN dimension is
+  aggregated away server-side, so thousands of SKUs cost nothing extra.
+  Measured: 423 country/day rows = **25.9 kB**. Hard design guard at 80,000 rows.
+
+### FX provider and cache policy
+
+- Provider: **ExchangeRate-API Open Access**, `https://open.er-api.com/v6/latest/USD`.
+  Docs `exchangerate-api.com/docs/free`, terms `exchangerate-api.com/terms`.
+  No API key required; caching is permitted, redistribution is not; attribution
+  is required and is shown in the page footer and in every export.
+- An optional paid key is supported with no code change: set
+  `EXCHANGERATE_API_KEY` server-side and the keyed v6 endpoint is used instead.
+  It is read from `process.env` only and never returned to a client.
+- Base currency USD; cross rates are derived from two numbers in the **same**
+  provider observation so totals cannot drift.
+- Cached in `fx_rate_snapshots` keyed by (base, rate_date, provider). RLS is
+  enabled with **no policy**, so only the server secret key can read it.
+- The provider is called at most once per `FX_MIN_REFRESH_HOURS` (12) **and**
+  only after the provider's own published `time_next_update_utc` has passed.
+  Refresh does not bypass that — the provider publishes daily. Guarded by
+  `claim_report_refresh_lock`.
+- Provider unreachable → newest cached table served with `fallback: true` and a
+  visible banner. No cached table at all → explicit `unavailable`, never a
+  static rate. A currency with no rate renders `—`, never a substituted value.
+- Browsers never call the provider; they call `?action=fx-rates`, which reads
+  Supabase. Rates are requested only when a conversion currency is selected.
+- "FX updated &lt;timestamp&gt;" is shown in the freshness bar and in exports.
+
+### Currency system
+
+- Selector: Original marketplace currency, USD, EUR, GBP, INR, CAD, AUD, JPY, AED.
+- **Original mode** groups money by currency with one All Markets row per
+  currency. There is deliberately no cross-currency total anywhere.
+- **Converted mode** converts each country value individually at full precision;
+  the group total is the **sum of those converted values**, so the visible rows
+  always add up to the visible total apart from display rounding. Verified
+  against live rates: group total === sum of rows === independent recomputation,
+  exact equality.
+- Unit counts and inventory unit counts are never converted.
+
+### Exports
+
+- Excel (.xlsx), CSV and PDF, all from one table model so an export can never
+  disagree with the screen. Lazy-loaded: an 11.76 kB chunk (4.56 kB gzip).
+- XLSX is written by `src/lib/xlsx.js`, a dependency-free store-mode ZIP +
+  SpreadsheetML writer. Chosen over exceljs/SheetJS because this export needs
+  only text and numbers and those libraries add hundreds of kB to the chunk
+  (and SheetJS no longer publishes current releases to npm). Verified: valid ZIP
+  read back by .NET `System.IO.Compression`, CRC-32 matches the reference value
+  `0xCBF43926`, output is byte-deterministic.
+- **PDF is the browser's print pipeline**, not a binary generator. A small PDF
+  library ships WinAnsi base-14 fonts that cannot render ₹ or a flag glyph, and
+  embedding a Unicode subset is a large dependency for one export. The menu says
+  "Opens a print view — save as PDF" rather than implying a direct download.
+- Every export carries account, brand, report range, as-of, currency mode, FX
+  timestamp / fallback status, source freshness, data limitations, All Markets
+  rows, country rows, currency symbols and totals. XLSX has one sheet per report
+  plus a provenance sheet; CSV has three labelled sections.
+- Formula injection is neutralised in both CSV (`csvCell`) and XLSX
+  (`sanitizeCell`): a leading `= + - @` is prefixed with an apostrophe.
+
+### FBA per-marketplace inventory (the one additive change to an existing route)
+
+`api/datadoe.js` `action=fba-plan` now also emits `inventoryByBrandCountry`,
+folding the same FBA Inventory Health rows to (marketplace, brand). The existing
+per-ASIN `rows` and every other field are untouched, `fba-plan-shared-v1` is
+unchanged, and the FBA Shipment Plan report does not read the new key — so no
+existing behaviour changes and no re-refresh is forced. Brand View falls back to
+account-level inventory (clearly labelled) until an account refreshes its FBA
+Shipment Plan once.
+
+### Verification evidence (2026-08-03)
+
+- `npm run verify` green: 53 insight assertions + 46 Brand View assertions +
+  production build (1,126 kB main chunk, 11.76 kB lazy export chunk).
+- `node --check` clean on all 11 changed/new server and shared modules.
+- Migration applied via `npm run db:migrate`; `fx_rate_snapshots` verified present.
+- **Real-data reconciliation**, account `12f3a683…` / brand `Caruso Italy`,
+  driven through the real Supabase REST helpers:
+  - sales raw `38,277,641.92` vs built `38,277,641.92`, delta **0.00**
+  - units raw `96,379` vs built `96,379`, delta **0**
+  - worst per-country money delta **0.000e+0**
+  - Daily Snapshot 2026-08-03: built ₹20,092 vs raw ₹20,092; LY ₹130,344
+  - Monthly run rate: built `3,209,895` = `310,635 / 3 × 31`
+  - Converted USD: group total = sum of rows = independent recomputation, exactly
+- **Route simulation** against production Supabase: read before save →
+  `snapshotMissing` with **zero** builds; refresh → 200 in 1,733 ms saving a
+  25.9 kB shared snapshot; second user's read → 200 in 80 ms from the shared
+  snapshot. Reading a sibling brand's key returned nothing (no cross-brand
+  fallback), confirming key isolation.
+- **FX end to end** against production: first call fetched from the provider and
+  saved (`rate_date 2026-08-03`, next update `2026-08-04T00:27:42Z`); second call
+  served from cache with no provider request; all eight display currencies
+  present. The production cache is now seeded.
+- Component smoke render: control bar renders all six controls, the Brand select
+  is `disabled` before an account is chosen, and a plain render issues **zero**
+  requests.
+- Cross-account scope check across five real accounts: every derived brand list
+  was a subset of that account's own saved rows; zero invented brands.
+
+### Known limitations and next steps
+
+1. **No account currently has both a `brand-sales` snapshot and ASIN-level Ads
+   history.** All `asin-performance-v1` rows belong to `dd-secondary:` accounts;
+   all 15 `brand-sales` snapshots belong to primary accounts. Overlap is zero, so
+   ad spend and TACoS render as unavailable today. Ad rows *do* carry
+   `marketplace_country_code` (US, IN, GB, IT, FR, ES, DE, NL), so the join will
+   work as soon as a secondary account's Dashboard is refreshed once from
+   Account View. **This is the single highest-value next action.**
+2. **No account has a saved `fba-plan` snapshot**, so per-marketplace FBA
+   inventory is not yet available anywhere. Brand View currently falls back to
+   Listing Health's account-level total (labelled). Refresh FBA Shipment Plan
+   once per account to enable per-country inventory and inventory cover.
+3. **Multi-currency behaviour is proven by tests, not yet by production data.**
+   Every saved `brand-sales` snapshot today is single-marketplace (IN or US). The
+   EU multi-marketplace accounts that motivated this report live in the secondary
+   organisation and have not had their Dashboard refreshed.
+4. **Responsive layout was verified by CSS/breakpoint audit, not by an automated
+   browser.** This repo has no browser automation and none was added. The
+   `.bv-*` rules define desktop, 900 px and 640 px behaviour, the grid scrolls
+   inside its own container with a sticky first column, and the page body never
+   scrolls sideways — but a human should confirm on a real tablet and phone.
+5. The three report table builders live inside `BrandView.jsx`. Every value they
+   render comes from tested pure functions, but the assembly itself is covered
+   only by the build. Extracting them into a testable module is a worthwhile
+   follow-up.
+6. Ads coverage starts 2026-06-02, so a range older than that yields `—` for ad
+   spend by design rather than a partial sum.
 
 ## Secondary DataDoe Brand View Check (2026-08-03)
 

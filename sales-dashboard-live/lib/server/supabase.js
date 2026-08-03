@@ -385,6 +385,38 @@ export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, m
   return rows;
 }
 
+/* ============================== EXCHANGE RATES ==============================
+   The Brand View currency selector reads these rows. They are written only by
+   the server-side FX service in lib/server/fx.js, never by a browser. */
+
+export async function getLatestFxSnapshot(baseCurrency) {
+  const query = new URLSearchParams({
+    select: "base_currency,rate_date,provider,rates,provider_updated_at,provider_next_update_at,fetched_at,updated_at",
+    base_currency: `eq.${baseCurrency}`,
+    order: "fetched_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/fx_rate_snapshots?${query}`);
+  return rows[0] || null;
+}
+
+export async function saveFxSnapshot(snapshot) {
+  const rows = await request("/rest/v1/fx_rate_snapshots?on_conflict=base_currency,rate_date,provider", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      base_currency: snapshot.baseCurrency,
+      rate_date: snapshot.rateDate,
+      provider: snapshot.provider,
+      rates: snapshot.rates,
+      provider_updated_at: snapshot.providerUpdatedAt || null,
+      provider_next_update_at: snapshot.providerNextUpdateAt || null,
+      fetched_at: snapshot.fetchedAt || new Date().toISOString(),
+    },
+  });
+  return rows[0] || null;
+}
+
 export async function upsertAdsSyncStates(states) {
   if (!states.length) return;
   await request("/rest/v1/ads_sync_state?on_conflict=account_id,source_key", {
