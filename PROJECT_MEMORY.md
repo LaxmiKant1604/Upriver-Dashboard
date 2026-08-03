@@ -1,6 +1,32 @@
 # Project Memory
 
-Last updated: 2026-08-02 (shared snapshot persistence fixed for all reports)
+Last updated: 2026-08-03 (Amazon PPC Dashboard skill reviewed)
+
+## Amazon PPC Dashboard Skill Review (2026-08-03)
+
+- Reviewed `Amazon PPC Dashboard.skill` from the project owner's Downloads.
+  It is a ZIP skill package, not a package to install into UPRIVER. It accepts
+  a manually exported Amazon Sponsored Products Search Term Report (`.xlsx`)
+  and produces a standalone HTML dashboard; no code was copied into UPRIVER.
+- **Useful future feature:** add a native, shared **Search-Term Intent Analyzer**
+  to the existing PPC Performance report. Its model classifies each term on
+  independent `tier`, `stage`, `theme`, and `polarity` axes; uses account
+  n-grams rather than a hard-coded taxonomy; compares exact intent with
+  broad/auto/phrase discovery; validates whether expected higher-intent tiers
+  really have higher CVR; flags no-order mismatch terms; and shows unclassified
+  spend plus overlapping-rule diagnostics.
+- **Important implementation decision:** intent rules must be account-specific,
+  user-reviewed and versioned in Supabase. Do not automatically label customer
+  terms or apply negatives/bids. Keep this feature read-only and offer evidence
+  only, consistent with UPRIVER's existing PPC rules.
+- **DataDoe scope is preserved:** UPRIVER's `Search Term Performance` source
+  contains Sponsored Products and Sponsored Brands only, never Sponsored
+  Display. Any intent view must label that coverage explicitly and must
+  recompute CTR/CVR/ACoS from summed values, never average ratios.
+- Existing PPC already supplies the prerequisite persisted search-term history,
+  campaign/ASIN/target views, multi-currency separation, and wasted-spend
+  safeguards. The skill is therefore a design and methodology reference, not a
+  replacement for the current shared multi-user dashboard.
 
 ## Shared Data Persistence Fix (2026-08-02)
 
