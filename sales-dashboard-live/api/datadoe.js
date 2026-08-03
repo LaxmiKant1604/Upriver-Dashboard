@@ -949,15 +949,17 @@ export default async function handler(req, res) {
     if (action === "brand-directory" && !publicAccountIds.length && access.role !== "admin") {
       publicAccountIds = [...new Set(access.accountIds || [])];
     }
-    if (action === "brand-directory" && wantsRefresh(req) && !publicAccountIds.length) {
+    if (action === "brand-directory" && wantsRefresh(req)) {
       const discovered = await discoverConnectedAccounts(connections);
       discoveredDirectoryAccounts = discovered;
       brandDirectoryAccounts = access.role === "admin"
         ? discovered
         : discovered.filter((account) => access.accountIds.includes(String(account.id)));
-      if (!publicAccountIds.length) publicAccountIds = brandDirectoryAccounts.map((account) => String(account.id));
-      const requested = new Set(publicAccountIds);
-      brandDirectoryAccounts = brandDirectoryAccounts.filter((account) => requested.has(String(account.id)));
+      // A manual directory refresh is the explicit account-discovery action.
+      // Replace a stale browser scope with every currently permitted account,
+      // including newly added secondary-organisation accounts. Ordinary reads
+      // remain cache-only and never call DataDoe.
+      publicAccountIds = brandDirectoryAccounts.map((account) => String(account.id));
     }
     // Brand View is multi-account and therefore is not in ACCOUNT_SCOPED_ACTIONS.
     // Authorise it before the shared-snapshot read as well as before a refresh.
