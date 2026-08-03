@@ -1167,6 +1167,87 @@ function BrandPortfolioDashboard({
   const currentMonthTotalDays = latest ? daysInMonth(parts(latest).y, parts(latest).m) : 0;
   const totalUnits = markets.reduce((sum, market) => sum + market.units, 0);
   const accountCount = new Set(scoped.map((row) => row.accountId)).size;
+  const detailedMarkets = useMemo(() => {
+    const hasCompleteLyWindow = Boolean(scopeMin && addDays(rangeFrom, -365) >= scopeMin);
+    const details = new Map();
+    const ensure = (country, currency) => {
+      const key = `${country || ""}|${currency || ""}`;
+      const existing = details.get(key) || {
+        key, country, currency, sales: 0, units: 0, lySales: hasCompleteLyWindow ? 0 : null,
+        adSpend: null, fbaAvailable: null, accounts: new Set(), byDate: new Map(),
+      };
+      details.set(key, existing);
+      return existing;
+    };
+    rows.forEach((row) => {
+      const country = row.marketplace_country_code || row.accountCountry || "";
+      const currency = row.currency || row.accountCurrency || "";
+      const entry = ensure(country, currency);
+      if (row.accountName) entry.accounts.add(row.accountName);
+      if (row.date >= rangeFrom && row.date <= rangeTo) {
+        entry.sales += Number(row.total_sales) || 0;
+        entry.units += Number(row.total_units_sold) || 0;
+        const daily = entry.byDate.get(row.date) || { sales: 0, units: 0, adSpend: null };
+        daily.sales += Number(row.total_sales) || 0;
+        daily.units += Number(row.total_units_sold) || 0;
+        entry.byDate.set(row.date, daily);
+      }
+      if (hasCompleteLyWindow && row.date >= addDays(rangeFrom, -365) && row.date <= addDays(rangeTo, -365)) {
+        entry.lySales += Number(row.total_sales) || 0;
+      }
+    });
+    (data?.ads || []).forEach((row) => {
+      if (!row.date || row.date < rangeFrom || row.date > rangeTo) return;
+      const entry = ensure(row.country, row.currency);
+      const spend = Number(row.adSpend) || 0;
+      entry.adSpend = (entry.adSpend || 0) + spend;
+      const daily = entry.byDate.get(row.date) || { sales: 0, units: 0, adSpend: null };
+      daily.adSpend = (daily.adSpend || 0) + spend;
+      entry.byDate.set(row.date, daily);
+    });
+    (data?.inventory || []).forEach((row) => {
+      const entry = ensure(row.country, row.currency);
+      entry.fbaAvailable = (entry.fbaAvailable || 0) + (Number(row.fbaAvailable) || 0);
+    });
+    return [...details.values()].filter((entry) => entry.sales || entry.units || entry.adSpend !== null || entry.fbaAvailable !== null)
+      .sort((a, b) => a.country.localeCompare(b.country) || a.currency.localeCompare(b.currency));
+  }, [data, rangeFrom, rangeTo, rows, scopeMin]);
+  const marketGroups = useMemo(() => {
+    const byCurrency = new Map();
+    detailedMarkets.forEach((market) => {
+      const group = byCurrency.get(market.currency) || { currency: market.currency, sales: 0, units: 0, lySales: 0, adSpend: null, fbaAvailable: null, markets: [] };
+      group.sales += market.sales;
+      group.units += market.units;
+      group.lySales = market.lySales === null ? null : (group.lySales === null ? null : group.lySales + market.lySales);
+      group.adSpend = market.adSpend === null ? group.adSpend : (group.adSpend || 0) + market.adSpend;
+      group.fbaAvailable = market.fbaAvailable === null ? group.fbaAvailable : (group.fbaAvailable || 0) + market.fbaAvailable;
+      group.markets.push(market);
+      byCurrency.set(market.currency, group);
+    });
+    return [...byCurrency.values()];
+  }, [detailedMarkets]);
+  const metricMoney = (value, currency, country) => value === null || value === undefined ? "-" : fmtMoney(value, currency, 0, country);
+  const inventoryCover = (market) => {
+    if (market.fbaAvailable === null || !latest) return null;
+    const mtdStart = monthStart(latest);
+    const mtdUnits = [...market.byDate.entries()]
+      .filter(([date]) => date >= mtdStart && date <= latest)
+      .reduce((sum, [, value]) => sum + value.units, 0);
+    if (!mtdUnits || !currentMonthDays) return null;
+    return (market.fbaAvailable / (mtdUnits / currentMonthDays)) / 30;
+  };
+  const coverLabel = (market) => {
+    const cover = inventoryCover(market);
+    return cover === null ? "-" : `${cover.toFixed(1)}m`;
+  };
+  const groupCoverLabel = (group) => {
+    if (group.fbaAvailable === null || !latest) return "-";
+    const mtdUnits = group.markets.reduce((sum, market) => sum + [...market.byDate.entries()]
+      .filter(([date]) => date >= monthStart(latest) && date <= latest)
+      .reduce((inner, [, value]) => inner + value.units, 0), 0);
+    if (!mtdUnits || !currentMonthDays) return "-";
+    return `${((group.fbaAvailable / (mtdUnits / currentMonthDays)) / 30).toFixed(1)}m`;
+  };
 
   return (
     <div className="container brand-portfolio-page">
@@ -1194,24 +1275,24 @@ function BrandPortfolioDashboard({
         <div className="panel"><EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales for this brand in this range">The saved portfolio data contains no order value for {brand} between {rangeFrom && rangeTo ? fmtRangeLabel(rangeFrom, rangeTo) : "the selected dates"}.</EmptyState></div>
       ) : <>
         <div className="metric-grid brand-portfolio-kpis">
-          <MetricCard label="Marketplaces" value={markets.length.toLocaleString("en-US")} period="country and currency scopes" />
+          <MetricCard label="Marketplaces" value={detailedMarkets.length.toLocaleString("en-US")} period="country and currency scopes" />
           <MetricCard label="Accounts selling" value={accountCount.toLocaleString("en-US")} period={fmtRangeLabel(rangeFrom, rangeTo)} />
           <MetricCard label="Units sold" value={totalUnits.toLocaleString("en-US")} period={fmtRangeLabel(rangeFrom, rangeTo)} />
-          <MetricCard label="Sales reporting" value="By country" hint="Sales are intentionally kept in each marketplace currency; the dashboard does not convert or combine money across currencies." period="no FX conversion" />
+          <MetricCard label="Sales reporting" value="By country" hint="Money is never converted or summed across currencies. Each country remains in its original marketplace currency." period="no FX conversion" />
         </div>
         <div className="panel brand-portfolio-table-panel">
-          <div className="panel-head"><div><div className="panel-title">Country Snapshot</div><div className="page-sub">Sales and units for the selected period, grouped without currency conversion.</div></div></div>
-          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th><th>Account</th><th>Sales</th><th>Units</th><th>Share in currency</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency || "Currency unavailable"}</small></td><td>{[...market.accounts].join(", ") || "-"}</td><td className="money">{fmtMoney(market.sales, market.currency, 0, market.country)}</td><td>{market.units.toLocaleString("en-US")}</td><td>{(market.share * 100).toFixed(1)}%</td></tr>)}</tbody></table></div>
+          <div className="panel-head"><div><div className="panel-title">{brand} - Daily Snapshot</div><div className="page-sub">{fmtRangeLabel(rangeFrom, rangeTo)}. FBA inventory is the latest saved FBA snapshot; TACoS uses saved same-ASIN advertising spend only.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th><th>Total sales</th><th>LY sales</th><th>Ad spend</th><th>TACoS</th><th>FBA inv.</th><th>Inv. cover</th><th>Units</th></tr></thead><tbody>{marketGroups.map((group) => <tr className="brand-portfolio-total" key={`all-${group.currency}`}><td><strong>All Markets</strong><small>{group.currency || "Currency unavailable"}</small></td><td className="money">{metricMoney(group.sales, group.currency)}</td><td className="money">{metricMoney(group.lySales, group.currency)}</td><td className="money">{metricMoney(group.adSpend, group.currency)}</td><td>{group.adSpend === null || !group.sales ? "-" : `${((group.adSpend / group.sales) * 100).toFixed(1)}%`}</td><td>{group.fbaAvailable === null ? "-" : Math.round(group.fbaAvailable).toLocaleString("en-US")}</td><td>{groupCoverLabel(group)}</td><td>{group.units.toLocaleString("en-US")}</td></tr>)}{detailedMarkets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{[...market.accounts].join(", ") || market.currency || "Marketplace unavailable"}</small></td><td className="money">{metricMoney(market.sales, market.currency, market.country)}</td><td className="money">{metricMoney(market.lySales, market.currency, market.country)}</td><td className="money">{metricMoney(market.adSpend, market.currency, market.country)}</td><td>{market.adSpend === null || !market.sales ? "-" : `${((market.adSpend / market.sales) * 100).toFixed(1)}%`}</td><td>{market.fbaAvailable === null ? "-" : Math.round(market.fbaAvailable).toLocaleString("en-US")}</td><td>{coverLabel(market)}</td><td>{market.units.toLocaleString("en-US")}</td></tr>)}</tbody></table></div>
         </div>
         <div className="panel brand-portfolio-table-panel">
-          <div className="panel-head"><div><div className="panel-title">Monthly Country Snapshot</div><div className="page-sub">Six monthly sales columns plus the current-month run rate. Run rate = month-to-date sales / elapsed calendar days x days in month.</div></div></div>
-          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{monthlyColumns.map((column) => <th key={column.key}>{column.current ? `${column.label} actual` : column.label}</th>)}<th>Current month run rate</th></tr></thead><tbody>{monthlyMarkets.map((market) => { const actual = market.byMonth.get(monthlyColumns[monthlyColumns.length - 1]?.key) || 0; const runRate = currentMonthDays ? (actual / currentMonthDays) * currentMonthTotalDays : null; return <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{monthlyColumns.map((column) => <td key={column.key} className="money">{fmtMoney(market.byMonth.get(column.key) || 0, market.currency, 0, market.country)}</td>)}<td className="money">{fmtMoney(runRate, market.currency, 0, market.country)}</td></tr>; })}</tbody></table></div>
+          <div className="panel-head"><div><div className="panel-title">{brand} - Monthly Snapshot</div><div className="page-sub">Six months by country. Current-month run rate = actual sales / elapsed calendar days x days in month.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{monthlyColumns.map((column) => <th key={column.key}>{column.current ? `${column.label} actual` : column.label}</th>)}<th>Current month run rate</th><th>Ad spend</th><th>TACoS</th></tr></thead><tbody>{monthlyMarkets.map((market) => { const actual = market.byMonth.get(monthlyColumns[monthlyColumns.length - 1]?.key) || 0; const runRate = currentMonthDays ? (actual / currentMonthDays) * currentMonthTotalDays : null; const live = detailedMarkets.find((entry) => entry.key === market.key); return <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{monthlyColumns.map((column) => <td key={column.key} className="money">{fmtMoney(market.byMonth.get(column.key) || 0, market.currency, 0, market.country)}</td>)}<td className="money">{fmtMoney(runRate, market.currency, 0, market.country)}</td><td className="money">{metricMoney(live?.adSpend, market.currency, market.country)}</td><td>{live?.adSpend === null || !actual ? "-" : `${((live.adSpend / actual) * 100).toFixed(1)}%`}</td></tr>; })}</tbody></table></div>
         </div>
         <div className="panel brand-portfolio-table-panel">
-          <div className="panel-head"><div><div className="panel-title">7-Day Country Performance</div><div className="page-sub">Each row stays in its marketplace currency. Blank days mean no saved sale, not an estimated zero.</div></div></div>
-          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Marketplace</th>{days.map((day) => <th key={day}>{fmtDateHuman(day).replace(/, \d{4}$/, "")}</th>)}<th>7D Total</th></tr></thead><tbody>{markets.map((market) => <tr key={market.key}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{days.map((day) => <td key={day} className="money">{market.byDate.has(day) ? fmtMoney(market.byDate.get(day).sales, market.currency, 0, market.country) : "-"}</td>)}<td className="money">{fmtMoney(days.reduce((sum, day) => sum + (market.byDate.get(day)?.sales || 0), 0), market.currency, 0, market.country)}</td></tr>)}</tbody></table></div>
+          <div className="panel-head"><div><div className="panel-title">{brand} - 7-Day Performance</div><div className="page-sub">Daily totals and units by marketplace. Blank Ads cells mean that saved ASIN-level Ads history is unavailable, not zero spend.</div></div></div>
+          <div className="brand-portfolio-scroll"><table className="brand-portfolio-table"><thead><tr><th>Metric</th>{days.map((day) => <th key={day}>{fmtDateHuman(day).replace(/, \d{4}$/, "")}</th>)}<th>7D total</th></tr></thead><tbody>{marketGroups.map((group) => <React.Fragment key={`daily-${group.currency}`}><tr className="brand-portfolio-total"><td><strong>Total sales</strong><small>{group.currency}</small></td>{days.map((day) => <td className="money" key={day}>{metricMoney(group.markets.reduce((sum, market) => sum + (market.byDate.get(day)?.sales || 0), 0), group.currency)}</td>)}<td className="money">{metricMoney(group.markets.reduce((sum, market) => sum + days.reduce((inner, day) => inner + (market.byDate.get(day)?.sales || 0), 0), 0), group.currency)}</td></tr><tr><td><strong>Units</strong><small>{group.currency}</small></td>{days.map((day) => <td key={day}>{group.markets.reduce((sum, market) => sum + (market.byDate.get(day)?.units || 0), 0).toLocaleString("en-US")}</td>)}<td>{group.markets.reduce((sum, market) => sum + days.reduce((inner, day) => inner + (market.byDate.get(day)?.units || 0), 0), 0).toLocaleString("en-US")}</td></tr><tr><td><strong>Ad spend</strong><small>{group.currency}</small></td>{days.map((day) => { const values = group.markets.map((market) => market.byDate.get(day)?.adSpend).filter((value) => value !== null && value !== undefined); return <td className="money" key={day}>{values.length ? metricMoney(values.reduce((sum, value) => sum + value, 0), group.currency) : "-"}</td>; })}<td className="money">{group.markets.some((market) => market.adSpend !== null) ? metricMoney(group.markets.reduce((sum, market) => sum + days.reduce((inner, day) => inner + (market.byDate.get(day)?.adSpend || 0), 0), 0), group.currency) : "-"}</td></tr><tr><td><strong>TACoS</strong><small>{group.currency}</small></td>{days.map((day) => { const sales = group.markets.reduce((sum, market) => sum + (market.byDate.get(day)?.sales || 0), 0); const spend = group.markets.reduce((sum, market) => sum + (market.byDate.get(day)?.adSpend || 0), 0); return <td key={day}>{spend && sales ? `${((spend / sales) * 100).toFixed(1)}%` : "-"}</td>; })}<td>-</td></tr></React.Fragment>)}<tr className="brand-portfolio-section"><td colSpan={days.length + 2}>Units by country</td></tr>{detailedMarkets.map((market) => <tr key={`units-${market.key}`}><td><strong>{FLAGS[market.country] || ""} {countryName(market.country)}</strong><small>{market.currency}</small></td>{days.map((day) => <td key={day}>{market.byDate.get(day)?.units ? market.byDate.get(day).units.toLocaleString("en-US") : "-"}</td>)}<td>{days.reduce((sum, day) => sum + (market.byDate.get(day)?.units || 0), 0).toLocaleString("en-US")}</td></tr>)}</tbody></table></div>
         </div>
-        <div className="footer-note">Brand View uses the same DataDoe Order Line Items and Product Catalog mapping as Account View. It includes only accounts the signed-in user can access. Refresh is manual; it checks only marketplaces mapped to this brand, sequentially, to respect DataDoe limits. Advertising, FBA inventory, and TACoS are intentionally not shown here until country-level source data is fetched and reconciled for this brand.</div>
+        <div className="footer-note">Brand View is a shared Supabase snapshot. Refresh rebuilds only this brand's mapped marketplaces from saved account sales, saved same-ASIN advertising history, and saved FBA-plan snapshots; it does not create a new DataDoe export. All money remains in the original marketplace currency.</div>
       </>}
       {loading && progress && <div className="brand-portfolio-progress" role="status">Refreshing {brand}: {progress.completed} of {progress.total} accounts checked{progress.account ? ` (${progress.account})` : ""}.</div>}
       {directoryLoading && directoryProgress && <div className="brand-portfolio-progress" role="status">Loading portfolio brands: {directoryProgress.completed} of {directoryProgress.total} accounts checked{directoryProgress.account ? ` (${directoryProgress.account})` : ""}.</div>}
@@ -1441,7 +1522,7 @@ function DashboardApp({ session, access, onSignOut }) {
   );
   const portfolioCacheParams = useMemo(() => (
     selectedPortfolioBrand && portfolioBrandAccountSignature
-      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v2", brand: selectedPortfolioBrand, ids: portfolioBrandAccountSignature, asOf: marketplaceToday("IN") }
+      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v3", brand: selectedPortfolioBrand, ids: portfolioBrandAccountSignature, asOf: marketplaceToday("IN") }
       : null
   ), [portfolioBrandAccountSignature, selectedPortfolioBrand]);
   const brandDirectoryCacheParams = useMemo(() => {
@@ -1486,70 +1567,45 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [accounts, selectedPortfolioBrand]);
 
   const loadCachedBrandPortfolio = useCallback(async () => {
-    if (!portfolioCacheParams) {
+    if (!selectedPortfolioBrand) {
       setBrandPortfolioData(null);
       setBrandPortfolioCacheMissing(false);
       setBrandPortfolioFetchedAt(null);
-      if (!selectedPortfolioBrand || portfolioMappingKnown) return;
-    }
-    const cached = portfolioCacheParams ? readApiCache(portfolioCacheParams) : null;
-    if (cached) {
-      setBrandPortfolioData(cached.body);
-      setBrandPortfolioFetchedAt(new Date(cached.cachedAt));
-      setBrandPortfolioCacheMissing(false);
       setBrandPortfolioError(null);
-    } else {
-      setBrandPortfolioData(null);
-      setBrandPortfolioFetchedAt(null);
-      setBrandPortfolioCacheMissing(true);
-      setBrandPortfolioError(null);
-    }
-    if (!selectedPortfolioBrand) return;
-    if (!portfolioMappingKnown) {
-      try {
-        const discovered = await discoverSavedBrandAccounts();
-        const payload = { brand: selectedPortfolioBrand, rows: discovered.rows, errors: [], accountIds: discovered.accounts.map((account) => account.id) };
-        setBrandPortfolioData(payload);
-        setBrandPortfolioFetchedAt(new Date());
-        setBrandPortfolioCacheMissing(false);
-        setBrandPortfolioError(null);
-      } catch (error) {
-        if (!cached) setBrandPortfolioError(error.message);
-      }
       return;
     }
-    if (!portfolioAccounts.length) return;
-    const rows = [];
-    const errors = [];
+    let targetAccounts = portfolioAccounts;
+    if (!portfolioMappingKnown) {
+      const discovered = await discoverSavedBrandAccounts();
+      targetAccounts = discovered.accounts;
+    }
+    const params = targetAccounts.length
+      ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v3", brand: selectedPortfolioBrand, ids: targetAccounts.map((account) => String(account.id)).sort().join(","), asOf: marketplaceToday("IN") }
+      : null;
+    if (!params) {
+      setBrandPortfolioData(null);
+      setBrandPortfolioCacheMissing(true);
+      setBrandPortfolioFetchedAt(null);
+      setBrandPortfolioError("No saved account snapshot identifies this brand yet. Refresh the relevant Account View once, then return here.");
+      return;
+    }
     try {
-      await Promise.all(portfolioAccounts.map(async (account) => {
-        const accountToday = marketplaceToday(account.country);
-        const params = {
-          action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
-          from: addDays(monthStart(accountToday), -420), to: accountToday,
-        };
-        try {
-          const { body } = await loadSharedReport(params);
-          if (body.snapshotMissing) {
-            errors.push({ accountId: account.id, accountName: account.name, message: body.message });
-            return;
-          }
-          (body.rows || []).forEach((row) => {
-            if (productBrand(row) !== selectedPortfolioBrand) return;
-            rows.push({ ...row, accountId: account.id, accountName: account.name, accountCountry: account.country, accountCurrency: account.currency });
-          });
-        } catch (error) {
-          errors.push({ accountId: account.id, accountName: account.name, message: error.message });
-        }
-      }));
-      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: portfolioAccounts.map((account) => account.id) };
-      if (portfolioCacheParams) writeApiCache(portfolioCacheParams, payload);
-      setBrandPortfolioData(payload);
-      setBrandPortfolioFetchedAt(new Date());
-      setBrandPortfolioCacheMissing(Boolean(errors.length && !rows.length));
-      setBrandPortfolioError(errors.length ? `${errors.length} account${errors.length === 1 ? " has" : "s have"} no readable shared Dashboard snapshot yet.` : null);
+      const { body, cachedAt } = await loadSharedReport(params);
+      if (body.snapshotMissing) {
+        setBrandPortfolioData(null);
+        setBrandPortfolioCacheMissing(true);
+        setBrandPortfolioFetchedAt(null);
+        setBrandPortfolioError(null);
+        return;
+      }
+      setBrandPortfolioData(body);
+      setBrandPortfolioFetchedAt(new Date(cachedAt));
+      setBrandPortfolioCacheMissing(false);
+      setBrandPortfolioError(body.unavailable?.length ? `${body.unavailable.length} marketplace source${body.unavailable.length === 1 ? " is" : "s are"} not seeded yet; unavailable metrics are shown as -.` : null);
     } catch (error) {
-      if (!cached) setBrandPortfolioError(error.message);
+      setBrandPortfolioData(null);
+      setBrandPortfolioCacheMissing(true);
+      setBrandPortfolioError(error.message);
     }
   }, [discoverSavedBrandAccounts, portfolioAccounts, portfolioCacheParams, portfolioMappingKnown, selectedPortfolioBrand]);
 
@@ -1557,8 +1613,6 @@ function DashboardApp({ session, access, onSignOut }) {
     if (!selectedPortfolioBrand || brandPortfolioLoading) return;
     setBrandPortfolioLoading(true);
     setBrandPortfolioError(null);
-    const rows = [];
-    const errors = [];
     try {
       let targetAccounts = portfolioAccounts;
       if (!portfolioMappingKnown) {
@@ -1566,48 +1620,19 @@ function DashboardApp({ session, access, onSignOut }) {
         const discovered = await discoverSavedBrandAccounts();
         targetAccounts = discovered.accounts;
         if (!targetAccounts.length) {
-          setBrandPortfolioData({ brand: selectedPortfolioBrand, rows: discovered.rows, errors: [], accountIds: [] });
-          setBrandPortfolioCacheMissing(false);
+          setBrandPortfolioData(null);
+          setBrandPortfolioCacheMissing(true);
           setBrandPortfolioError("No saved Dashboard snapshot identifies this brand yet. Refresh the relevant account Dashboard once, then Brand View will use that saved data.");
           return;
         }
       }
-      setBrandPortfolioProgress({ completed: 0, total: targetAccounts.length, account: "" });
-      // A portfolio refresh is intentionally sequential. Each account request
-      // itself creates two DataDoe exports, so parallelising this loop would
-      // waste tokens and breach the organisation-wide rate limit.
-      for (let index = 0; index < targetAccounts.length; index++) {
-        const account = targetAccounts[index];
-        setBrandPortfolioProgress({ completed: index, total: targetAccounts.length, account: account.name });
-        const accountToday = marketplaceToday(account.country);
-        const params = {
-          action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
-          from: addDays(monthStart(accountToday), -420), to: accountToday,
-        };
-        try {
-          const { body } = await refreshSharedReport(params);
-          (body.rows || []).forEach((row) => {
-            if (productBrand(row) !== selectedPortfolioBrand) return;
-            rows.push({
-              ...row,
-              accountId: account.id,
-              accountName: account.name,
-              accountCountry: account.country,
-              accountCurrency: account.currency,
-            });
-          });
-        } catch (accountError) {
-          errors.push({ accountId: account.id, accountName: account.name, message: accountError.message });
-        }
-        setBrandPortfolioProgress({ completed: index + 1, total: targetAccounts.length, account: account.name });
-      }
-      const payload = { brand: selectedPortfolioBrand, rows, errors, accountIds: targetAccounts.map((account) => account.id) };
-      const targetCacheParams = { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v2", brand: selectedPortfolioBrand, ids: targetAccounts.map((account) => String(account.id)).sort().join(","), asOf: marketplaceToday("IN") };
-      writeApiCache(targetCacheParams, payload);
-      setBrandPortfolioData(payload);
-      setBrandPortfolioFetchedAt(new Date());
+      setBrandPortfolioProgress({ completed: 0, total: targetAccounts.length, account: "Building shared portfolio snapshot" });
+      const params = { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v3", brand: selectedPortfolioBrand, ids: targetAccounts.map((account) => String(account.id)).sort().join(","), asOf: marketplaceToday("IN") };
+      const { body, cachedAt } = await refreshSharedReport(params);
+      setBrandPortfolioData(body);
+      setBrandPortfolioFetchedAt(new Date(cachedAt));
       setBrandPortfolioCacheMissing(false);
-      if (errors.length) setBrandPortfolioError(`${errors.length} account${errors.length === 1 ? "" : "s"} could not be refreshed. The results below include the accounts that completed: ${errors.map((error) => error.accountName).join(", ")}.`);
+      setBrandPortfolioError(body.unavailable?.length ? `${body.unavailable.length} marketplace source${body.unavailable.length === 1 ? " is" : "s are"} not seeded yet; unavailable metrics are shown as -.` : null);
     } catch (error) {
       setBrandPortfolioError(error.message);
     } finally {

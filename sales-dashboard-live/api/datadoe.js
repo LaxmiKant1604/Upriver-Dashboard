@@ -24,6 +24,7 @@ import {
   DashboardAccessError,
   assertAccountAccess,
   assertAdmin,
+  getAdsDailySourceRows,
   getAdDailyMetrics,
   getDashboardAccess,
   getLatestReportSnapshot,
@@ -201,6 +202,110 @@ function serialiseBrandAccountMap(brandAccountIds) {
   return {
     brands,
     brandAccounts: Object.fromEntries(brands.map((brand) => [brand, [...brandAccountIds.get(brand)].sort()])),
+  };
+}
+
+const BRAND_PORTFOLIO_REPORT_KEY = "brand-portfolio";
+const BRAND_PORTFOLIO_VERSION = "brand-portfolio-shared-v3";
+const BRAND_ADS_SOURCE_KEY = "asin-performance-v1";
+
+// Brand View is a portfolio report, but it must be as quick and cheap as any
+// account report once users have refreshed their source snapshots.  It reads
+// the shared account snapshots and the scheduled ASIN-level Ads history only;
+// it never starts a new DataDoe export itself.  This is what lets one saved
+// portfolio snapshot be reused by every authorised user.
+async function buildBrandPortfolioSnapshot({ brand, accountIds, asOf }) {
+  const rows = [];
+  const ads = [];
+  const inventory = [];
+  const unavailable = [];
+
+  for (const accountId of accountIds) {
+    const salesSnapshot = await getLatestReportSnapshot({ reportKey: "brand-sales", accountId });
+    const salesPayload = salesSnapshot?.payload;
+    const sourceRows = salesPayload?.rows || [];
+    if (!sourceRows.length) {
+      unavailable.push({ accountId, reason: "No saved account sales snapshot" });
+      continue;
+    }
+
+    const asinBrand = new Map();
+    for (const row of sourceRows) {
+      const rowBrand = String(row.product_brand || "").trim();
+      const asin = String(row.child_asin || "").trim();
+      if (asin && rowBrand) asinBrand.set(asin, rowBrand);
+      if (rowBrand !== brand) continue;
+      rows.push({
+        ...row,
+        accountId,
+        accountName: row.seller_or_vendor_name || null,
+        accountCountry: row.marketplace_country_code || null,
+        accountCurrency: row.currency || null,
+      });
+    }
+
+    // Inventory is read from the latest saved FBA-plan snapshot.  Its ASIN
+    // mapping is already joined to the product brand and its fields are live
+    // FBA Health values, so no client-side inference is needed.
+    const planSnapshot = await getLatestReportSnapshot({ reportKey: "fba-plan", accountId });
+    const planPayload = planSnapshot?.payload;
+    let fbaAvailable = 0;
+    let fbaKnown = false;
+    for (const row of planPayload?.rows || []) {
+      if (String(row.brand || "").trim() !== brand) continue;
+      if (row.fbaAvailable === null || row.fbaAvailable === undefined) continue;
+      fbaKnown = true;
+      fbaAvailable += num(row.fbaAvailable);
+    }
+    if (fbaKnown) {
+      const sample = sourceRows.find((row) => String(row.product_brand || "").trim() === brand) || sourceRows[0];
+      inventory.push({
+        accountId,
+        country: sample.marketplace_country_code || null,
+        currency: sample.currency || null,
+        fbaAvailable,
+        snapshotDate: planPayload?.inventoryDate || null,
+      });
+    }
+
+    // ASIN-level Ads history is maintained by the scheduled worker.  Joining
+    // it to this account's saved ASIN->brand map avoids the old bug where all
+    // account spend was displayed for one selected brand.
+    try {
+      const adRows = await getAdsDailySourceRows({
+        accountId,
+        sourceKeys: [BRAND_ADS_SOURCE_KEY],
+        from: addDaysStr(asOf, -60),
+        to: asOf,
+        maxRows: 60000,
+      });
+      for (const row of adRows) {
+        if (asinBrand.get(String(row.child_asin || "").trim()) !== brand) continue;
+        ads.push({
+          accountId,
+          date: row.metric_date,
+          country: row.marketplace_country_code || null,
+          currency: row.currency || null,
+          adSpend: num(row.metrics?.ad_spend),
+        });
+      }
+    } catch (error) {
+      unavailable.push({ accountId, reason: `Saved Ads history unavailable: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+
+  return {
+    brand,
+    asOf,
+    rows,
+    ads,
+    inventory,
+    unavailable,
+    sources: {
+      sales: "Saved Brand Sales snapshots (Order Line Items + Product Catalog)",
+      ads: "Saved Ad Performance by ASIN & Date history",
+      inventory: "Saved FBA Shipment Plan snapshots (FBA Inventory Health)",
+    },
   };
 }
 
@@ -962,9 +1067,36 @@ export default async function handler(req, res) {
       publicAccountIds = brandDirectoryAccounts.map((account) => String(account.id));
     }
     // Brand View is multi-account and therefore is not in ACCOUNT_SCOPED_ACTIONS.
-    // Authorise it before the shared-snapshot read as well as before a refresh.
-    if (action === "brand-directory" && publicAccountIds.length) {
+    // Authorise its directory and aggregate portfolio reads before the shared
+    // snapshot is served as well as before a manual refresh.
+    if ((action === "brand-directory" || action === "brand-portfolio") && publicAccountIds.length) {
       assertAccountAccess(access, publicAccountIds);
+    }
+
+    if (action === "brand-portfolio") {
+      const brand = String(req.query.brand || "").trim();
+      const asOf = String(req.query.asOf || "");
+      if (!brand || !publicAccountIds.length || !isDateStr(asOf)) {
+        res.status(400).json({ error: "Brand View requires brand, one or more allowed account ids, and an asOf date (YYYY-MM-DD)." });
+        return;
+      }
+      const accountIds = [...new Set(publicAccountIds.map(String))].sort();
+      await serveSharedReport({
+        res,
+        refresh: wantsRefresh(req),
+        reportKey: BRAND_PORTFOLIO_REPORT_KEY,
+        reportVersion: BRAND_PORTFOLIO_VERSION,
+        accountId: stableSelectionId("brand-portfolio", accountIds),
+        params: { brand, accountIds: accountIds.join(","), asOf },
+        userId: access.userId,
+        label: "Brand View",
+        // A portfolio build only aggregates shared snapshots plus persisted
+        // Ads rows, but a larger set of mapped marketplaces may still take a
+        // little longer than the default account report.
+        lockSeconds: 300,
+        build: () => buildBrandPortfolioSnapshot({ brand, accountIds, asOf }),
+      });
+      return;
     }
 
     const legacyShared = legacySharedDescriptor({ action, req, access, publicAccountIds, accountScope });
@@ -1839,7 +1971,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
+    res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });

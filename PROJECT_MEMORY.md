@@ -1529,6 +1529,45 @@ exact 06:00 local time becomes a business requirement.
 
 ## How to resume cold
 
+## Brand View Country Snapshots (implemented 2026-08-03)
+
+- Brand View now uses the shared `brand-portfolio-shared-v3` report rather
+  than rebuilding its tables independently in every browser. A manual Brand
+  View refresh aggregates only the selected brand's mapped accounts, stores
+  the compact portfolio payload in Supabase, and makes the same result
+  available to every user who is allowed to access those accounts.
+- Normal Brand View loads read this one shared Supabase snapshot and never
+  start a DataDoe export. The shared build itself reads only existing data:
+  `brand-sales` snapshots for real Order Line Items + Product Catalog sales,
+  saved `asin-performance-v1` Ads history for same-ASIN ad spend, and saved
+  `fba-plan` snapshots for FBA Inventory Health values. This is materially
+  faster than the earlier per-account browser loop and avoids repeated token
+  use.
+- The page now has the three country-level operating views requested from the
+  Sellerboard examples: **Daily Snapshot** (sales, last-year comparable
+  sales, ad spend, TACoS, FBA inventory, inventory cover, units), **Monthly
+  Snapshot** (six months, current-month actual and run rate), and **7-Day
+  Performance** (daily sales, units, ad spend, TACoS, plus units by country).
+  Sales are never summed across currencies: each marketplace/currency remains
+  a separate row and `All Markets` totals are per currency only.
+- **TACoS definition:** saved same-ASIN ad spend divided by the selected
+  brand's sales for the same date range. This is a brand-scoped ratio, unlike
+  the old account-wide Ads denominator. **Inventory cover:** latest saved FBA
+  available units divided by the selected month-to-date unit daily rate,
+  expressed in 30-day months.
+- Missing upstream history is deliberately shown as `-`, never as zero. Ads
+  need the scheduled `asin-performance-v1` history to have seeded for that
+  account; FBA inventory needs at least one saved FBA Shipment Plan snapshot.
+  A brand also must have a saved Account View (`brand-sales`) snapshot before
+  it can be mapped into the Brand directory. This applies particularly to a
+  newly connected secondary DataDoe account: refresh that specific Account
+  View once, then refresh its FBA Shipment Plan once if FBA metrics are needed.
+- The Brand View refresh is an aggregation of already-saved shared data, not a
+  live DataDoe refresh. This is intentional. Refresh the individual Account
+  View/FBA Plan or allow the existing Ads scheduler to update source snapshots
+  first; then use Brand View refresh to publish the fast shared brand-country
+  report to all permitted users.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

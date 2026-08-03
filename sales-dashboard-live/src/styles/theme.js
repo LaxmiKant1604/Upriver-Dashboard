@@ -920,6 +920,9 @@ body{ overflow-x:hidden; }
 .brand-portfolio-table td{ padding:11px 12px; border-bottom:1px solid var(--grid-line); color:var(--text-secondary); font-size:12px; font-weight:650; text-align:right; vertical-align:middle; white-space:nowrap; }
 .brand-portfolio-table tbody tr:last-child td{ border-bottom:0; }
 .brand-portfolio-table tbody tr:hover{ background:var(--bg-subtle); }
+.brand-portfolio-table .brand-portfolio-total td{ background:#f9edf1; border-bottom-color:#ebc5d1; color:#7c3349; font-weight:800; }
+.brand-portfolio-table .brand-portfolio-total .money{ color:#7c3349; }
+.brand-portfolio-table .brand-portfolio-section td{ padding:9px 12px; background:var(--bg-subtle); border-bottom:1px solid var(--border-strong); color:var(--text-muted); font-size:10px; font-weight:850; letter-spacing:.08em; text-align:left; text-transform:uppercase; }
 .brand-portfolio-table td strong{ display:block; color:var(--text-primary); font-size:12px; }
 .brand-portfolio-table td small{ display:block; margin-top:3px; color:var(--text-muted); font-size:10px; font-weight:650; }
 .brand-portfolio-table .money{ color:var(--text-primary); font-family:'JetBrains Mono',monospace; font-size:11.5px; }
