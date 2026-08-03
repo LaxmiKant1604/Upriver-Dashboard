@@ -910,23 +910,8 @@ body{ overflow-x:hidden; }
 /* ======================= BRAND PORTFOLIO ======================= */
 .dashboard-mode{ flex:0 0 auto; white-space:nowrap; }
 .dashboard-mode button{ min-width:82px; }
-.brand-portfolio-page{ padding-bottom:var(--space-6); }
-.brand-portfolio-kpis{ margin-top:var(--space-4); }
-.brand-portfolio-table-panel{ margin-top:var(--space-4); overflow:hidden; }
-.brand-portfolio-scroll{ overflow:auto; overscroll-behavior-inline:contain; }
-.brand-portfolio-table{ width:100%; min-width:760px; border-collapse:collapse; font-variant-numeric:tabular-nums; }
-.brand-portfolio-table th{ padding:10px 12px; border-bottom:1px solid var(--border-strong); background:var(--bg-subtle); color:var(--text-muted); font-size:10px; font-weight:800; letter-spacing:.05em; text-align:right; text-transform:uppercase; white-space:nowrap; }
-.brand-portfolio-table th:first-child,.brand-portfolio-table th:nth-child(2),.brand-portfolio-table td:first-child,.brand-portfolio-table td:nth-child(2){ text-align:left; }
-.brand-portfolio-table td{ padding:11px 12px; border-bottom:1px solid var(--grid-line); color:var(--text-secondary); font-size:12px; font-weight:650; text-align:right; vertical-align:middle; white-space:nowrap; }
-.brand-portfolio-table tbody tr:last-child td{ border-bottom:0; }
-.brand-portfolio-table tbody tr:hover{ background:var(--bg-subtle); }
-.brand-portfolio-table .brand-portfolio-total td{ background:#f9edf1; border-bottom-color:#ebc5d1; color:#7c3349; font-weight:800; }
-.brand-portfolio-table .brand-portfolio-total .money{ color:#7c3349; }
-.brand-portfolio-table .brand-portfolio-section td{ padding:9px 12px; background:var(--bg-subtle); border-bottom:1px solid var(--border-strong); color:var(--text-muted); font-size:10px; font-weight:850; letter-spacing:.08em; text-align:left; text-transform:uppercase; }
-.brand-portfolio-table td strong{ display:block; color:var(--text-primary); font-size:12px; }
-.brand-portfolio-table td small{ display:block; margin-top:3px; color:var(--text-muted); font-size:10px; font-weight:650; }
-.brand-portfolio-table .money{ color:var(--text-primary); font-family:'JetBrains Mono',monospace; font-size:11.5px; }
-.brand-portfolio-progress{ position:sticky; bottom:12px; z-index:3; width:max-content; max-width:100%; margin:var(--space-3) auto 0; padding:8px 11px; border:1px solid var(--accent-border); border-radius:var(--radius-sm); background:var(--bg-elevated); box-shadow:var(--shadow-md); color:var(--accent-strong); font-size:11.5px; font-weight:750; }
+/* The .brand-portfolio-* rules were removed with the component that used them.
+   The cross-account report now uses the shared .bv-* patterns below. */
 
 /* ============ ACCOUNT-SCOPED BRAND VIEW (view key: brandview) ============
    A separate module from the portfolio brand mode above. It reuses the same
