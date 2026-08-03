@@ -1567,6 +1567,14 @@ exact 06:00 local time becomes a business requirement.
   View/FBA Plan or allow the existing Ads scheduler to update source snapshots
   first; then use Brand View refresh to publish the fast shared brand-country
   report to all permitted users.
+- Code is committed as **`0de1494`** (`Upgrade shared brand country
+  snapshots`) and deployed from the repository root as Vercel deployment
+  **`upriver-dashboard-cft9coupo-laxmikant1604s-projects.vercel.app`**, which
+  is aliased to the stable production URL https://upriverdashboard.vercel.app.
+  Production HTML references bundle `index-JE4809lq.js`, the bundle generated
+  by that deployment. `npm run verify` passed (53 assertions) and the full
+  Vite build completed before release; Node syntax checking also passed for
+  `api/datadoe.js`.
 
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
