@@ -1,6 +1,6 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Brand View cache-first catalog recovery in progress)
+Last updated: 2026-08-03 (Brand View cache-first catalog recovery deployed)
 
 ## Brand View Bootstrap Repair (2026-08-03)
 
@@ -45,12 +45,17 @@ Last updated: 2026-08-03 (Brand View cache-first catalog recovery in progress)
 - **Deployment:** commit `15a3064` is live as Vercel deployment
   `dpl_4EqvE4JigbeLZyVyL35MT7jYEWwG`; the stable alias returned HTTP 200 and
   served the targeted-marketplace bundle.
-- **Catalog-credit recovery in progress:** DataDoe returned HTTP 402 for a
-  Product Catalog export while loading the Brand Directory. The directory is
-  being changed to derive its exact brand-to-account map first from saved
-  Supabase report snapshots, falling back to a Product Catalog export only for
-  accounts with no saved catalog metadata. A partial saved map remains usable
-  and is labelled rather than blocking the brand dropdown.
+- **Catalog-credit recovery completed:** DataDoe returned HTTP 402 for a
+  Product Catalog export while loading the Brand Directory. Brand Directory v2
+  now derives its exact brand-to-account map first from saved Supabase
+  Dashboard, FBA Plan, SKU P&L, and insight snapshots. It calls Product Catalog
+  only for accounts with no saved catalog metadata. If those remaining exports
+  still return 402, the usable saved portion is returned and visibly labelled
+  instead of blocking the brand dropdown. If no saved report has catalog data,
+  DataDoe credits/source access remains an unavoidable upstream requirement.
+- **Deployment:** commit `82ac406` is live as Vercel deployment
+  `dpl_4eDWyWXVMdqbjs3C5mgc72gdJmXo`; the production alias returned HTTP 200
+  and served the cache-recovery bundle.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 
