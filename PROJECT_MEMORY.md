@@ -1,6 +1,24 @@
 # Project Memory
 
-Last updated: 2026-08-03 (Amazon PPC Dashboard skill reviewed)
+Last updated: 2026-08-03 (Brand View bootstrap repair ready for deployment)
+
+## Brand View Bootstrap Repair (2026-08-03)
+
+- **Regression diagnosed:** after the shared-snapshot conversion, a fresh
+  browser with no saved `account-directory` snapshot had an empty `accounts`
+  array. Brand View then returned before its manual **Load portfolio brands**
+  action, leaving the Brand dropdown with only `Select a brand`.
+- **Fix:** a manual Brand View directory refresh is now permitted without an
+  in-memory account list. For an administrator without explicit account
+  permissions, the server discovers all connected accounts only on that manual
+  action; for another user it uses only the user's assigned account IDs. It
+  returns the permitted account metadata with the shared brand directory so the
+  client can bootstrap both selectors. Ordinary Brand View opens remain
+  read-only shared-snapshot reads and never call DataDoe.
+- The empty shared account directory now surfaces its saved-data message rather
+  than silently behaving like an account list. The Brand View refresh controls
+  remain available when the user has permission even before account metadata is
+  present.
 
 ## Amazon PPC Dashboard Skill Review (2026-08-03)
 

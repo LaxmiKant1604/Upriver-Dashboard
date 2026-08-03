@@ -1380,7 +1380,11 @@ function DashboardApp({ session, access, onSignOut }) {
     let active = true;
     setAccountsLoading(true);
     loadSharedReport({ action: "accounts" })
-      .then(({ body }) => { if (active) applyAccounts(body); })
+      .then(({ body }) => {
+        if (!active) return;
+        applyAccounts(body);
+        if (body.snapshotMissing) setAccountsError(body.message);
+      })
       .catch((error) => { if (active) setAccountsError(error.message); })
       .finally(() => { if (active) setAccountsLoading(false); });
     return () => { active = false; };
@@ -1410,20 +1414,28 @@ function DashboardApp({ session, access, onSignOut }) {
     return { action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
-  const portfolioAccountSignature = useMemo(
-    () => accounts.map((account) => account.id).sort().join(","),
-    [accounts]
-  );
+  const portfolioAccountSignature = useMemo(() => {
+    const discoveredIds = accounts.map((account) => String(account.id)).filter(Boolean);
+    // Account permissions are already enforced server-side. This fallback lets
+    // a permitted non-admin seed Brand View even when a fresh browser has not
+    // yet received the shared account-directory snapshot.
+    const ids = discoveredIds.length ? discoveredIds : (isAdmin ? [] : [...allowedAccountIds]);
+    return [...new Set(ids)].sort().join(",");
+  }, [accounts, allowedAccountIds, isAdmin]);
   const portfolioCacheParams = useMemo(() => (
     selectedPortfolioBrand && portfolioAccountSignature
       ? { action: "brand-portfolio", reportVersion: "brand-portfolio-shared-v1", brand: selectedPortfolioBrand, ids: portfolioAccountSignature, asOf: marketplaceToday("IN") }
       : null
   ), [selectedPortfolioBrand, portfolioAccountSignature]);
-  const brandDirectoryCacheParams = useMemo(() => (
-    portfolioAccountSignature
-      ? { action: "brand-directory", reportVersion: "brand-directory-shared-v1", ids: portfolioAccountSignature }
-      : null
-  ), [portfolioAccountSignature]);
+  const brandDirectoryCacheParams = useMemo(() => {
+    if (portfolioAccountSignature) {
+      return { action: "brand-directory", reportVersion: "brand-directory-shared-v1", ids: portfolioAccountSignature };
+    }
+    // Administrators may have no explicit account_permissions rows. Their
+    // manual Brand View action lets the server discover connected accounts;
+    // do not make this request automatically.
+    return isAdmin ? { action: "brand-directory", reportVersion: "brand-directory-shared-v1" } : null;
+  }, [isAdmin, portfolioAccountSignature]);
 
   const loadCachedBrandPortfolio = useCallback(async () => {
     if (!portfolioCacheParams) {
@@ -1534,7 +1546,7 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [dashboardMode, loadCachedBrandPortfolio]);
 
   useEffect(() => {
-    if (dashboardMode !== "brand" || !brandDirectoryCacheParams) return;
+    if (dashboardMode !== "brand" || !brandDirectoryCacheParams || !portfolioAccountSignature) return;
     let active = true;
     loadSharedReport(brandDirectoryCacheParams)
       .then(({ body, cachedAt }) => {
@@ -1545,24 +1557,26 @@ function DashboardApp({ session, access, onSignOut }) {
           return;
         }
         setBrandDirectoryBrands(body.brands || []);
+        if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
         setBrandDirectoryFetchedAt(new Date(cachedAt));
         setBrandDirectoryError(null);
       })
       .catch((error) => { if (active) setBrandDirectoryError(error.message); });
     return () => { active = false; };
-  }, [dashboardMode, brandDirectoryCacheParams]);
+  }, [applyAccounts, dashboardMode, brandDirectoryCacheParams, portfolioAccountSignature]);
 
   const fetchBrandDirectory = useCallback(async () => {
-    if (!accounts.length || !brandDirectoryCacheParams || brandDirectoryLoading) return;
+    if (!brandDirectoryCacheParams || brandDirectoryLoading) return;
     setBrandDirectoryLoading(true);
     setBrandDirectoryError(null);
-    setBrandDirectoryProgress({ completed: 0, total: 1, account: "Product Catalog" });
+    setBrandDirectoryProgress({ completed: 0, total: Math.max(1, accounts.length || allowedAccountIds.size), account: "Product Catalog" });
     try {
       // Catalog-only, connection-aware server action. This is substantially
       // lighter than fetching 14 months of order lines for every account just
       // to populate a picker.
       const { body } = await refreshSharedReport(brandDirectoryCacheParams);
       setBrandDirectoryBrands(body.brands || []);
+      if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
       setBrandDirectoryProgress({ completed: 1, total: 1, account: "Product Catalog" });
@@ -1573,7 +1587,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandDirectoryLoading(false);
       setBrandDirectoryProgress(null);
     }
-  }, [accounts.length, brandDirectoryCacheParams, brandDirectoryLoading]);
+  }, [accounts.length, allowedAccountIds.size, applyAccounts, brandDirectoryCacheParams, brandDirectoryLoading]);
 
   const loadCachedRows = useCallback(async () => {
     if (!dashboardParams) {
@@ -2769,7 +2783,7 @@ function DashboardApp({ session, access, onSignOut }) {
     // the documented duplicate-refresh gap: repeated clicks could previously
     // launch concurrent 25-45 s DataDoe exports for the dashboard, Daily
     // Reporting and the FBA plan.
-    disabled: onFeed || activeBusy || (showingBrandPortfolio && !accounts.length),
+    disabled: onFeed || activeBusy || (showingBrandPortfolio && !accounts.length && !isAdmin && !allowedAccountIds.size),
     hint: onFeed
       ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
       : showingBrandPortfolio

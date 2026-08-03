@@ -265,6 +265,24 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
   }
 }
 
+async function discoverConnectedAccounts(connections) {
+  const accounts = [];
+  const rawAccountOwners = new Map();
+  for (const connection of connections) {
+    const discovered = await fetchAccountsRaw(connection.apiKey);
+    for (const account of discovered) {
+      const rawAccountId = String(account.id || "");
+      const existingConnection = rawAccountOwners.get(rawAccountId);
+      if (existingConnection) {
+        throw new Error(`Amazon account ${rawAccountId} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate connection before syncing so data is never counted twice.`);
+      }
+      rawAccountOwners.set(rawAccountId, connection);
+      accounts.push(decorateDataDoeAccount(connection, account));
+    }
+  }
+  return accounts;
+}
+
 // Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time
 // source reports changes to A+ / branded item content after Amazon publishes
 // them. Its payload is intentionally normalised before it reaches the browser:
@@ -840,8 +858,9 @@ export default async function handler(req, res) {
     const access = await getDashboardAccess(req);
     const connections = getDataDoeConnections();
     const action = req.query.action;
-    const publicAccountIds = String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
+    let publicAccountIds = String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
     let accountScope = null;
+    let brandDirectoryAccounts = null;
 
     const accountScopedAction = ACCOUNT_SCOPED_ACTIONS.has(action);
     // `sample` is admin-only diagnostics, but it still needs the same routing
@@ -857,6 +876,22 @@ export default async function handler(req, res) {
     }
     const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
+    // A new browser may not yet have the shared account directory. Brand View
+    // remains usable: on its explicit manual refresh only, discover the
+    // accounts the user may access and use them to seed the brand directory.
+    // Ordinary reads still never call DataDoe.
+    if (action === "brand-directory" && !publicAccountIds.length && access.role !== "admin") {
+      publicAccountIds = [...new Set(access.accountIds || [])];
+    }
+    if (action === "brand-directory" && wantsRefresh(req)) {
+      const discovered = await discoverConnectedAccounts(connections);
+      brandDirectoryAccounts = access.role === "admin"
+        ? discovered
+        : discovered.filter((account) => access.accountIds.includes(String(account.id)));
+      if (!publicAccountIds.length) publicAccountIds = brandDirectoryAccounts.map((account) => String(account.id));
+      const requested = new Set(publicAccountIds);
+      brandDirectoryAccounts = brandDirectoryAccounts.filter((account) => requested.has(String(account.id)));
+    }
     // Brand View is multi-account and therefore is not in ACCOUNT_SCOPED_ACTIONS.
     // Authorise it before the shared-snapshot read as well as before a refresh.
     if (action === "brand-directory" && publicAccountIds.length) {
@@ -888,20 +923,7 @@ export default async function handler(req, res) {
     };
 
     if (action === "accounts") {
-      const accounts = [];
-      const rawAccountOwners = new Map();
-      for (const connection of connections) {
-        const discovered = await fetchAccountsRaw(connection.apiKey);
-        for (const account of discovered) {
-          const rawAccountId = String(account.id || "");
-          const existingConnection = rawAccountOwners.get(rawAccountId);
-          if (existingConnection) {
-            throw new Error(`Amazon account ${rawAccountId} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate connection before syncing so data is never counted twice.`);
-          }
-          rawAccountOwners.set(rawAccountId, connection);
-          accounts.push(decorateDataDoeAccount(connection, account));
-        }
-      }
+      const accounts = await discoverConnectedAccounts(connections);
       await sendLegacyPayload({ accounts });
       return;
     }
@@ -919,7 +941,7 @@ export default async function handler(req, res) {
       assertAccountAccess(access, publicAccountIds);
       const savedBrands = await sharedSnapshotBrands(publicAccountIds);
       if (savedBrands.length) {
-        await sendLegacyPayload({ brands: savedBrands, source: "shared-snapshot" });
+        await sendLegacyPayload({ brands: savedBrands, accounts: brandDirectoryAccounts || [], source: "shared-snapshot" });
         return;
       }
       const idsByConnection = new Map();
@@ -950,7 +972,7 @@ export default async function handler(req, res) {
         }
         throw error;
       }
-      await sendLegacyPayload({ brands: [...brands].sort((a, b) => a.localeCompare(b)), source: "datadoe-catalog" });
+      await sendLegacyPayload({ brands: [...brands].sort((a, b) => a.localeCompare(b)), accounts: brandDirectoryAccounts || [], source: "datadoe-catalog" });
       return;
     }
 
