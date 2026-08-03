@@ -225,6 +225,11 @@ Shipment Plan once.
 
 ### Deployment
 
+- **Portfolio separation restore:** commit `32a716e` was verified with
+  `npm run verify` and deployed on 2026-08-03 as
+  `https://upriver-dashboard-pbyhnc3z5-laxmikant1604s-projects.vercel.app`.
+  It restores the top-header Brand View switcher as the separate portfolio
+  report. Stable URL: `https://upriverdashboard.vercel.app`.
 - **Brand View entry-point repair:** commit `860522d` was verified with
   `npm run verify` (53 insight assertions, 47 Brand View assertions and the
   production build) and deployed on 2026-08-03 as
