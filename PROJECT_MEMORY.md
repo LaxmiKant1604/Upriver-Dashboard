@@ -2268,7 +2268,7 @@ the previous anonymous data API is no longer accessible.
   checking the public bundle for a newly added UI marker before reporting it
   live.
 
-## Shared DataDoe source reuse (implemented 2026-08-04; release in progress)
+## Shared DataDoe source reuse (implemented and deployed 2026-08-04)
 
 ### Completed
 
@@ -2301,6 +2301,13 @@ the previous anonymous data API is no longer accessible.
   through `source_export_cache`, then expired and pruned both test objects.
   This verified the REST metadata, private object upload/download and cleanup
   path end to end without using a DataDoe token.
+- Feature commit **`02ce7d9`** (`Reuse shared DataDoe source exports`) is
+  pushed to `origin/main`. Production deployment
+  **`dpl_Cp5VTqe2KHSi62LLC4woGrcG8dj9`** is READY at
+  `https://upriver-dashboard-h50cfeliu-laxmikant1604s-projects.vercel.app`
+  and aliased to https://upriverdashboard.vercel.app. Production verification
+  returned HTTP 200 with bundle `assets/index-CKwRf7FW.js`; the unauthenticated
+  DataDoe route still returns HTTP 401.
 
 ### Important decisions and technical learnings
 
