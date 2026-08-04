@@ -26,6 +26,7 @@ const { runReportAdapter } = await import("../lib/server/sync/adapters/report-ad
 const { expandSyncWork, targetDisposition, MAX_TARGET_ATTEMPTS } = await import("../lib/server/sync/planner.js");
 const { publicAccountId, resolveDataDoeAccountIds } = await import("../lib/server/datadoe-connections.js");
 const { ADS_SOURCES } = await import("../lib/server/ads-sync.js");
+const { isDataDoeDeadlineError, sleep, withDataDoeDeadline } = await import("../lib/server/datadoe.js");
 const { claimRefreshLock, releaseRefreshLock } = await import("../lib/server/supabase.js");
 
 let passed = 0;
@@ -85,6 +86,12 @@ test("vercel.json sync crons match the schedule constants", () => {
   assert.equal(byBucket["non-us"], "0 2 * * *");
   assert.equal(byBucket.us, "30 10 * * *");
   assert.equal(vercel.crons.length, 2, "legacy Ads crons must be disabled to prevent duplicate exports");
+});
+test("GitHub driver retries transient 429/5xx responses but keeps other non-200 responses fatal", () => {
+  const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduled-sync.yml", import.meta.url)), "utf8");
+  assert.match(workflow, /\[ "\$code" = "429" \]/);
+  assert.match(workflow, /\[ "\$code" -ge 500 \]/);
+  assert.match(workflow, /Non-retryable HTTP/);
 });
 
 /* 3. Registry coverage of every existing report key + ads sources. */
@@ -151,6 +158,12 @@ test("a completed target is skipped only for the same cycle and failures stop af
   assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "succeeded", attempts: 1 }, "2026-08-05").status, "due");
   assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "failed", attempts: MAX_TARGET_ATTEMPTS }, "2026-08-04").status, "terminal-failure");
   assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "deferred", attempts: 20 }, "2026-08-04").status, "due");
+});
+await asyncTest("scheduled DataDoe sleeps defer before the server deadline", async () => {
+  await assert.rejects(
+    () => withDataDoeDeadline(Date.now() + 25, () => sleep(100)),
+    (error) => isDataDoeDeadlineError(error),
+  );
 });
 
 /* 6. Lock acquire/release + concurrent-blocked (emulated claim RPC). */

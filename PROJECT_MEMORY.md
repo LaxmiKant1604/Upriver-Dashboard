@@ -37,15 +37,15 @@
 - Deployed the grouped catalog-error UX: `dpl_7J1FnZY4ycXLsTsuxuwKXuyUpGAA` (`https://upriverdashboard.vercel.app`). The next manual directory sync will reveal the precise DataDoe Product Catalog failure for the secondary connection, while keeping the successfully cached primary brands available.
 - Confirmed from the secondary DataDoe Settings screenshot: **Product Catalog by ASIN** and **Product Catalog by ASIN (Raw JSON)** are enabled, but both show **0 rows**. This is the direct reason secondary brands cannot appear in Brand View: DataDoe has not populated any catalog records for that organisation's connected Amazon accounts. Enabling the table alone is insufficient; the upstream Amazon connection/catalog ingestion must be backfilled or reconnected in DataDoe before any dashboard code can discover those brand names.
 
-Last updated: 2026-08-04 (Scheduled-sync foundation reviewed and repaired; migration applied; deployment blocked on GitHub secrets)
+Last updated: 2026-08-04 (Scheduled-sync foundation deployed; live non-US validation exposed and fixed transient timeout handling)
 
-## Scheduled-sync SaaS foundation — implemented, NOT deployed (2026-08-04)
+## Scheduled-sync SaaS foundation — deployed (2026-08-04)
 
 Phase 1 ("foundation first") of the website-wide scheduled DataDoe sync requested
-above. Built and senior-reviewed, `npm run verify` green (including **21 sync
+above. Built and senior-reviewed, `npm run verify` green (including **23 sync
 assertions**, 54 insight assertions, 60 Brand View assertions, and the full 1.12 MB
-application build). The production migration is applied, but the code is **not
-pushed or deployed yet** because the required GitHub Actions secrets are not set.
+application build). The production migration is applied, the GitHub Actions
+secrets are configured, and the foundation is pushed to `main` and deployed.
 Normal report reads are Supabase-only, but the old explicit per-page refresh
 buttons still trigger DataDoe until the declared UI-removal phase is completed.
 
@@ -137,6 +137,32 @@ production Supabase. Verified tables include `account_directory`, `sync_runs`,
 `sync_targets`, `sync_errors`, and `audit_log`; the scheduler prune RPC was created
 in the same transaction.
 
+### First production run + timeout hardening (2026-08-04)
+
+- Foundation commit `10114ff` was pushed to `main` and deployed as Vercel
+  deployment `dpl_77J5x6fRigNZrrZnr2o6ZYpKTn5b`, aliased to
+  `https://upriverdashboard.vercel.app`. Production returned HTTP 200 with CSP,
+  `nosniff`, and referrer-policy headers; an unauthenticated cron request returned
+  HTTP 401 as required.
+- GitHub Actions run `30926551090` proved the repository secrets are correct:
+  it authenticated to Vercel and began draining 84 targets across 38 non-US
+  accounts. Ads targets and multiple `brand-sales` snapshots succeeded and were
+  checkpointed in Supabase.
+- That run also exposed two honest upstream limitations: some `brand-sales`
+  exports returned DataDoe HTTP 402, and seven secondary-organisation targets
+  returned HTTP 404 because Order Line Items source
+  `89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778`
+  is unavailable in that DataDoe organisation. These remain visible terminal
+  target failures; the scheduler does not fabricate or erase data.
+- The run then encountered a Vercel `FUNCTION_INVOCATION_TIMEOUT` (HTTP 504) on
+  iteration 16. The driver previously treated every non-200 response as fatal.
+  Follow-up hardening now gives all shared DataDoe helpers an async-local server
+  deadline: fetches and poll sleeps defer before the 60-second cap, preserve the
+  previous snapshot, checkpoint the target as deferred without consuming a retry,
+  and release locks normally. The GitHub loop now retries transient HTTP 429/5xx
+  responses after backoff while keeping authentication/permanent 4xx errors fatal.
+  Rerun the production non-US workflow after deploying this follow-up commit.
+
 ### Why the 60s cap needs the GitHub driver
 
 One Vercel invocation is capped at 60s; a full bucket (≈15 accounts × multi-export
@@ -168,8 +194,12 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
 
 ### Known limitations / risks (for review)
 
-1. **Adapters unvalidated against live DataDoe** — no DataDoe key in this workspace.
-   Verify `brand-sales` + `sales-movers` sync on a preview.
+1. **Live DataDoe coverage is partial** — Ads and multiple primary `brand-sales`
+   targets succeeded in the first production run. Some primary exports returned
+   HTTP 402, and the secondary organisation lacks the configured Order Line Items
+   source ID (HTTP 404). `sales-movers` remains pending behind the incomplete
+   `brand-sales` queue. Resolve DataDoe credits/source enablement rather than
+   weakening scheduler validation.
 2. **`reportVersion` alignment** — enabled ones are verbatim from the browser
    (`brand-sales-shared-v1`, `sales-movers-v1`). If a scheduled window differs from
    a user's chosen range, the existing `getLatestReportSnapshot` stale fallback
@@ -193,11 +223,10 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
    unrelated customer organisations, add a tenant/workspace key to users,
    accounts, permissions, snapshots, sync targets, COGS, Ads rows, and audit logs,
    then enforce it in RLS and every server query.
-7. **Release blocker** — GitHub repository secrets `SYNC_ENDPOINT` and
-   `CRON_SECRET` are still missing. The browser session available to Codex was not
-   signed into GitHub, and the official CLI download was blocked by the local
-   network. Do not push/deploy the cron replacement until those secrets are set,
-   because one Vercel invocation cannot drain the bucket by itself.
+7. **Secrets configured** — GitHub repository secrets `SYNC_ENDPOINT` and
+   `CRON_SECRET` are present, and the first workflow authenticated successfully.
+   Never print, export, or commit their values. The remaining release validation
+   is a production rerun after timeout hardening, not secret setup.
 
 ### Follow-up phases (declared, not done)
 

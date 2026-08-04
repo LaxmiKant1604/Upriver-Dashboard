@@ -14,7 +14,7 @@
 //   - Unknown marketplace country is logged and skipped, never mis-bucketed.
 
 import { getDataDoeConnections, publicAccountId } from "../datadoe-connections.js";
-import { fetchAccounts } from "../datadoe.js";
+import { fetchAccounts, isDataDoeDeadlineError, withDataDoeDeadline } from "../datadoe.js";
 import { paramsHashFor } from "../report-store.js";
 import { marketplaceToday } from "../../marketplaces.js";
 import {
@@ -32,6 +32,7 @@ import { runAdsAdapter } from "./adapters/ads.js";
 const WORK_BUDGET_MS = 50_000;       // leave ~10s headroom under the 60s function cap
 const ADS_ITEM_RESERVE_MS = 46_000;  // never START an ads item with < 46s left (runAdsSync self-budgets 45s)
 const REPORT_RESERVE_MS = 8_000;     // heuristic floor to START a report adapter
+const DEADLINE_CHECKPOINT_MS = 2_500; // reserve time to persist status + release locks
 const BUCKET_LOCK_SECONDS = 90;      // > function cap; per-invocation, not held across the drain
 const REPORT_TARGET_LOCK_SECONDS = 240;
 
@@ -181,10 +182,28 @@ export async function runScheduledSync({ bucket, trigger = "cron", createdBy = n
       }
       await upsertSyncTarget({ reportKey: item.entry.reportKey, accountId: account.account_id, lastRunId: run.id, lastStatus: "running", lastAttemptAt: nowIso(), attempts, cycleDate });
       try {
-        const res = await runReportAdapter({ entry: item.entry, account, asOf, connections, build });
+        const res = await withDataDoeDeadline(
+          deadline - DEADLINE_CHECKPOINT_MS,
+          () => runReportAdapter({ entry: item.entry, account, asOf, connections, build }),
+        );
         counts.succeeded += 1;
         await upsertSyncTarget({ reportKey: item.entry.reportKey, accountId: account.account_id, lastRunId: run.id, lastStatus: "succeeded", lastAttemptAt: nowIso(), sourceRefreshedAt: res.sourceRefreshedAt, latestDataDate: res.latestDataDate, attempts, cycleDate });
       } catch (err) {
+        if (isDataDoeDeadlineError(err)) {
+          drained = false;
+          counts.deferred += 1;
+          await upsertSyncTarget({
+            reportKey: item.entry.reportKey,
+            accountId: account.account_id,
+            lastRunId: run.id,
+            lastStatus: "deferred",
+            lastAttemptAt: nowIso(),
+            lastError: err.message,
+            attempts: disposition.attempts,
+            cycleDate,
+          });
+          continue;
+        }
         drained = false;
         counts.failed += 1;
         await insertSyncError({ runId: run.id, reportKey: item.entry.reportKey, accountId: account.account_id, phase: "adapter", message: err.message });

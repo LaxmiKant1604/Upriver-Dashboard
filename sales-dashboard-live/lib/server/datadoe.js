@@ -11,6 +11,7 @@
 // - Sources without a date column (Listings, Product Catalog) must not receive
 //   a from/to range, and must order by a column that actually exists.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { marketplaceProfile } from "../marketplaces.js";
 
 export const DATADOE_BASE = "https://api.datadoe.com/api/v1";
@@ -31,7 +32,41 @@ export function authHeaders(apiKey) {
   };
 }
 
-export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const dataDoeDeadline = new AsyncLocalStorage();
+const DEADLINE_HEADROOM_MS = 750;
+
+export class DataDoeDeadlineError extends Error {
+  constructor() {
+    super("DataDoe work deferred before the server execution deadline.");
+    this.name = "DataDoeDeadlineError";
+    this.code = "DATADOE_DEADLINE";
+  }
+}
+
+export function isDataDoeDeadlineError(error) {
+  return error?.code === "DATADOE_DEADLINE" || error instanceof DataDoeDeadlineError;
+}
+
+// AsyncLocalStorage lets every existing report builder inherit the scheduled
+// invocation deadline without threading a new argument through every helper.
+// Browser-triggered/manual routes do not call this wrapper and keep their
+// existing behaviour.
+export function withDataDoeDeadline(deadlineAt, callback) {
+  return dataDoeDeadline.run(Number(deadlineAt), callback);
+}
+
+function remainingDeadlineMs() {
+  const deadlineAt = dataDoeDeadline.getStore();
+  return Number.isFinite(deadlineAt) ? deadlineAt - Date.now() : null;
+}
+
+export const sleep = (ms) => {
+  const remaining = remainingDeadlineMs();
+  if (remaining !== null && remaining <= ms + DEADLINE_HEADROOM_MS) {
+    return Promise.reject(new DataDoeDeadlineError());
+  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+};
 
 export const num = (v) => Number(v) || 0;
 
@@ -52,11 +87,36 @@ const MIN_REQUEST_INTERVAL_MS = 550;
 const MAX_RATE_LIMIT_RETRIES = 6;
 
 export async function ddFetch(url, options, attempt = 0) {
+  const remaining = remainingDeadlineMs();
+  if (remaining !== null && remaining <= DEADLINE_HEADROOM_MS) {
+    throw new DataDoeDeadlineError();
+  }
   const since = Date.now() - _lastDataDoeCall;
   if (since < MIN_REQUEST_INTERVAL_MS) await sleep(MIN_REQUEST_INTERVAL_MS - since);
   _lastDataDoeCall = Date.now();
 
-  const r = await fetch(url, options);
+  let deadlineTimer = null;
+  let deadlineController = null;
+  const requestOptions = { ...options };
+  const requestRemaining = remainingDeadlineMs();
+  if (requestRemaining !== null && !requestOptions.signal) {
+    deadlineController = new AbortController();
+    requestOptions.signal = deadlineController.signal;
+    deadlineTimer = setTimeout(
+      () => deadlineController.abort(),
+      Math.max(1, requestRemaining - DEADLINE_HEADROOM_MS),
+    );
+  }
+
+  let r;
+  try {
+    r = await fetch(url, requestOptions);
+  } catch (error) {
+    if (deadlineController?.signal.aborted) throw new DataDoeDeadlineError();
+    throw error;
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+  }
   if (r.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
     let retrySec = Number(r.headers.get("retry-after")) || 0;
     try {

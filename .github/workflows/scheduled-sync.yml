@@ -63,8 +63,13 @@ jobs:
             code=$(printf '%s' "$resp" | tail -n1)
             body=$(printf '%s' "$resp" | sed '$d')
             echo "iteration=$i http=$code body=$body"
+            if [ "$code" = "429" ] || { [ "$code" -ge 500 ] 2>/dev/null; }; then
+              echo "Transient HTTP ${code} from sync endpoint; retrying after backoff." >&2
+              sleep 20
+              continue
+            fi
             if [ "$code" != "200" ]; then
-              echo "Non-200 from sync endpoint; aborting." >&2
+              echo "Non-retryable HTTP ${code} from sync endpoint; aborting." >&2
               exit 1
             fi
             if [ "$(printf '%s' "$body" | jq -r '.drained // false')" = "true" ]; then
