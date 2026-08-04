@@ -24,12 +24,12 @@ import { CalendarRange, Coins, DatabaseZap, Inbox, RefreshCw, Tag } from "lucide
 import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { fmtRangeLabel } from "../lib/format.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, ORIGINAL_CURRENCY, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
+import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
 import { DASH } from "../lib/brand-view-tables.js";
 import BrandReports, { buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
 import {
   BvSelect, CustomRangeInputs, ExportMenu, RANGE_PRESETS,
-  useBrandExport, useBrandRange, useFxRates,
+  useBrandCurrency, useBrandExport, useBrandRange, useFxRates,
 } from "./brand-controls.jsx";
 
 const PORTFOLIO_VERSION = "brand-view-portfolio-v1";
@@ -44,12 +44,9 @@ export default function BrandPortfolio({
   const [notice, setNotice] = useState(null);
   const [savedAt, setSavedAt] = useState(null);
   const [staleScope, setStaleScope] = useState(null);
-  const [displayCurrency, setDisplayCurrency] = useState(ORIGINAL_CURRENCY);
   const [tables, setTables] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshGuard = useRef(false);
-
-  const { fx, fxError, reloadFx } = useFxRates(loadReport, displayCurrency);
 
   // A stable, sorted account signature keeps the snapshot key deterministic no
   // matter what order the directory returned the accounts in.
@@ -63,6 +60,11 @@ export default function BrandPortfolio({
   const asOf = useMemo(() => marketplaceToday("IN"), []);
 
   const model = useMemo(() => (data ? brandViewModel(data) : null), [data]);
+  // A brand sold across accounts and marketplaces usually spans several
+  // currencies, so it opens converted to one reporting currency and reads as a
+  // single clean table. A single-currency brand stays in its own currency.
+  const { displayCurrency, setDisplayCurrency } = useBrandCurrency(model, `${brand}::${idsKey}`);
+  const { fx, fxError, reloadFx } = useFxRates(loadReport, displayCurrency);
   const range = useBrandRange({
     latestDate: model?.latestDate || null,
     coverageFrom: model?.coverage?.salesFrom || null,

@@ -12,9 +12,15 @@ import { Download, FileSpreadsheet, FileText, Printer } from "lucide-react";
 // RANGE_PRESETS and resolveRange are pure and live in src/lib/brand-view.js with
 // the rest of the calculations, so Node can unit-test them. Re-exported here so
 // the components have one import.
-import { RANGE_PRESETS, isConvertedMode, resolveRange } from "../lib/brand-view.js";
+import { ORIGINAL_CURRENCY, RANGE_PRESETS, isConvertedMode, resolveRange } from "../lib/brand-view.js";
 
 export { RANGE_PRESETS, resolveRange };
+
+// The single currency a multi-currency brand is converted to by default, so the
+// report opens as one clean "All Markets" table rather than per-currency bands.
+// USD is the FX base, so no cross-rate is derived for it. Change this one line to
+// make INR (or any other) the default reporting currency.
+export const DEFAULT_REPORT_CURRENCY = "USD";
 
 /* ------------------------------------------------------------- controls */
 
@@ -159,6 +165,53 @@ export function useFxRates(loadReport, displayCurrency) {
   }, [displayCurrency, load]);
 
   return { fx, fxLoading, fxError, reloadFx: load };
+}
+
+/**
+ * The display-currency control with a data-driven default.
+ *
+ * WHY A DEFAULT THAT DEPENDS ON THE DATA
+ *   The clean single-table layout — one "All Markets" total, no dividers — is
+ *   only meaningful inside one currency. A brand that trades in a single currency
+ *   already renders that way in Original mode, so it is left in its own currency.
+ *   A brand that spans several currencies would otherwise open as stacked
+ *   per-currency bands; converting it to one reporting currency makes it read as
+ *   the same single clean table. Either way the report opens in the reference
+ *   shape without the user touching the control.
+ *
+ *   The choice only holds until the user picks a currency themselves: once they
+ *   do, `userChosen` latches and the data no longer overrides them. A new brand
+ *   or scope (`resetKey`) forgets that choice so the next brand gets its own
+ *   sensible default.
+ *
+ * @param {object|null} model     the brand view model (its `countries` carry the
+ *                                marketplace currencies)
+ * @param {string} resetKey       changes when the brand or scope changes
+ */
+export function useBrandCurrency(model, resetKey) {
+  const [displayCurrency, setDisplayCurrencyState] = useState(ORIGINAL_CURRENCY);
+  const userChosen = useRef(false);
+
+  const currencyCount = useMemo(
+    () => new Set((model?.countries || []).map((entry) => entry.currency).filter(Boolean)).size,
+    [model]
+  );
+
+  // A new brand or scope forgets any manual currency choice.
+  useEffect(() => { userChosen.current = false; }, [resetKey]);
+
+  // Follow the data until the user overrides it.
+  useEffect(() => {
+    if (userChosen.current) return;
+    setDisplayCurrencyState(currencyCount > 1 ? DEFAULT_REPORT_CURRENCY : ORIGINAL_CURRENCY);
+  }, [currencyCount]);
+
+  const setDisplayCurrency = useCallback((value) => {
+    userChosen.current = true;
+    setDisplayCurrencyState(value);
+  }, []);
+
+  return { displayCurrency, setDisplayCurrency };
 }
 
 /** Lazily load the export code and run one export. */
