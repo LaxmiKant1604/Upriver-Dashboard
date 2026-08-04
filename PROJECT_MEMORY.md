@@ -125,14 +125,15 @@ shape, months-and-`n/a`, and the `(FC only)` suffix.
 
 ### Deployment (2026-08-04)
 
-- Commits `167c27b` (the upgrade) and `0b7dc59` (removing the retired report's
-  now-dead CSS), deployed from the repository root as
-  `dpl_9KZzfkyEj6K9jHU42i7VZieTHTPX`.
+- Commits `167c27b` (the upgrade), `0b7dc59` (removing the retired report's
+  now-dead CSS) and `a261d89` (the reference layout pass), deployed from the
+  repository root. The final deployment is `dpl_75y6h5b8mKdC2CeYHwB1LDGGNHFC`.
 - Stable alias **https://upriverdashboard.vercel.app** returned HTTP 200 and
-  serves `assets/index-BAUtbpQW.js`. Verified by string presence in the served
-  bundle: `brand-view-portfolio`, `Inv. cover (days)`, `bv-table`, `brandview`,
-  `all accounts complete through` and the new portfolio lead copy are all
-  present; `brand-portfolio-table` and the old subtitles are gone.
+  serves `assets/index-Dd7fnBoO.js`. Verified by string presence in the served
+  bundle: `Total Sales`, `LY Sales`, `TACoS%`, `FBA Inv.`, `Inv Cover`,
+  `(FC only)`, `bv-band`, `bv-col-positive`, `bv-col-latest`,
+  `Units by country`, `All Markets` and `brand-view-portfolio` are all present;
+  `Inv. cover (days)`, `Last year sales` and `brand-portfolio-table` are gone.
 - All API actions respond 401 unauthenticated, including the new
   `brand-view-portfolio`.
 - **First use needs one click of Refresh inside the report.** The portfolio uses
