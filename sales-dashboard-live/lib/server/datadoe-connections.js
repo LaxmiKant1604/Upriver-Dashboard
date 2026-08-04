@@ -93,6 +93,26 @@ export function decorateDataDoeAccount(connection, account) {
   };
 }
 
+// Raw seller/vendor IDs belong to a DataDoe organisation, not to the whole
+// dashboard. Two organisations can therefore legitimately return the same
+// raw ID. Merge on the public, connection-scoped ID so both accounts remain
+// available to the shared account and Brand View directories.
+export function mergeDiscoveredDataDoeAccounts(connectionAccounts) {
+  const byPublicAccountId = new Map();
+  for (const { connection, accounts } of connectionAccounts || []) {
+    for (const account of accounts || []) {
+      const decorated = decorateDataDoeAccount(connection, account);
+      // A duplicate response from the same organisation should not create a
+      // duplicate selector option, while a secondary connection is already
+      // distinct because its public ID carries the secondary prefix.
+      if (!byPublicAccountId.has(decorated.id)) {
+        byPublicAccountId.set(decorated.id, decorated);
+      }
+    }
+  }
+  return [...byPublicAccountId.values()];
+}
+
 export function scopeDataDoeRows(connection, rows) {
   return (rows || []).map((row) => {
     if (!row || row.seller_or_vendor_id === undefined || row.seller_or_vendor_id === null) return row;

@@ -59,6 +59,7 @@ import {
   connectionForApiKey,
   decorateDataDoeAccount,
   getDataDoeConnections,
+  mergeDiscoveredDataDoeAccounts,
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
 } from "../lib/server/datadoe-connections.js";
@@ -514,21 +515,12 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
 }
 
 async function discoverConnectedAccounts(connections) {
-  const accounts = [];
-  const rawAccountOwners = new Map();
+  const accountsByConnection = [];
   for (const connection of connections) {
     const discovered = await fetchAccountsRaw(connection.apiKey);
-    for (const account of discovered) {
-      const rawAccountId = String(account.id || "");
-      const existingConnection = rawAccountOwners.get(rawAccountId);
-      if (existingConnection) {
-        throw new Error(`Amazon account ${rawAccountId} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate connection before syncing so data is never counted twice.`);
-      }
-      rawAccountOwners.set(rawAccountId, connection);
-      accounts.push(decorateDataDoeAccount(connection, account));
-    }
+    accountsByConnection.push({ connection, accounts: discovered });
   }
-  return accounts;
+  return mergeDiscoveredDataDoeAccounts(accountsByConnection);
 }
 
 // Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time

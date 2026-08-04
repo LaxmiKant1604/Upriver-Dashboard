@@ -40,6 +40,7 @@ import { rollupPpcRows } from "../lib/server/reports/ppc.js";
 import { staleSnapshotMatchesReportVersion } from "../lib/server/report-store.js";
 import {
   decorateDataDoeAccount,
+  mergeDiscoveredDataDoeAccounts,
   publicAccountId,
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
@@ -83,6 +84,15 @@ test("secondary DataDoe rows and accounts are safely namespaced", () => {
   assert.match(account.name, /Secondary DataDoe/);
   const rows = scopeDataDoeRows(TEST_CONNECTIONS[1], [{ seller_or_vendor_id: "seller-1", total_sales: 10 }]);
   assert.equal(rows[0].seller_or_vendor_id, "dd-secondary:seller-1");
+});
+
+test("account discovery retains matching raw IDs from both DataDoe organisations", () => {
+  const accounts = mergeDiscoveredDataDoeAccounts([
+    { connection: TEST_CONNECTIONS[0], accounts: [{ id: "seller-1", name: "Primary Store" }] },
+    { connection: TEST_CONNECTIONS[1], accounts: [{ id: "seller-1", name: "Secondary Store" }] },
+  ]);
+  assert.deepEqual(accounts.map((account) => account.id), ["seller-1", "dd-secondary:seller-1"]);
+  assert.equal(accounts[1].name, "Secondary Store (Secondary DataDoe)");
 });
 
 test("DataDoe exports reject mixed-organisation account IDs", () => {

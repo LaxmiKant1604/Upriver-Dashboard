@@ -1,5 +1,14 @@
 # Project Memory
 
+## In progress: complete Brand View directory across both DataDoe organisations (2026-08-04)
+
+- Investigated the report selector missing secondary-organisation accounts in Brand View.
+- Found and fixed a server-side merge bug: `discoverConnectedAccounts()` rejected a raw seller/vendor ID that appeared in both DataDoe organisations. Raw IDs are only unique within their organisation, so the refresh could fail before saving the combined account directory.
+- Account discovery now merges by the existing public, connection-scoped ID. Primary remains unchanged; the secondary account is retained as `dd-secondary:<raw-id>`. A regression test covers the same raw ID occurring in both connections.
+- Applied the same connection-scoped identity rule to the automated Ads sync so a matching raw ID cannot abort the scheduled cross-organisation job.
+- Verification complete: `npm run verify` passed (54 shared/report assertions, 59 Brand View assertions, and the full production build).
+- Pending: deploy, then run one Brand View directory refresh to seed the shared directory with all currently connected accounts.
+
 Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
 
 ## Brand View: multi-currency brands now open as one clean table (2026-08-04)

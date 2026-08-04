@@ -332,20 +332,20 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
 
   const startedAt = Date.now();
   const accounts = [];
-  const rawAccountOwners = new Map();
+  const publicAccountIds = new Set();
   for (const connection of connections) {
     const discovered = await fetchAccounts(connection.apiKey);
     for (const account of discovered) {
       if (!countryMatches(account, countries)) continue;
-      const existingConnection = rawAccountOwners.get(account.id);
-      if (existingConnection) {
-        throw new Error(`Amazon account ${account.id} appears in both ${existingConnection.label} and ${connection.label}. Remove the duplicate DataDoe connection before syncing.`);
-      }
-      rawAccountOwners.set(account.id, connection);
+      const id = publicAccountId(connection, account.id);
+      // A raw DataDoe ID is only unique inside its own organisation. Keep a
+      // matching secondary ID as a distinct, namespaced sync target.
+      if (publicAccountIds.has(id)) continue;
+      publicAccountIds.add(id);
       accounts.push({
         ...account,
         rawAccountId: account.id,
-        id: publicAccountId(connection, account.id),
+        id,
         connection,
       });
     }
