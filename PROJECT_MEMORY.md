@@ -14,6 +14,7 @@
 - Important design rule: recent sales brands are a helpful temporary fallback, never proof of a complete catalog. Every account without a completed `brand-catalog` snapshot stays queued so zero-sale brands are not silently omitted.
 - Verification after the catalog-sync implementation: `npm run verify` passed (54 shared/report assertions, 59 Brand View assertions, and the full production build).
 - Deployed catalog sync to production: `dpl_4YqKyG7rcAHYABkqndo1DujahnZT` (`https://upriverdashboard.vercel.app`). Pending: perform the first signed-in production **Load portfolio brands** run; it will seed both DataDoe organisations in small batches. If DataDoe rejects a particular catalog, the page now names the affected account and preserves all successful account catalogs.
+- Production seed feedback: the initial catalog sync reached the secondary organisation but every `dd-secondary:` account was returned as unavailable. This is a Product Catalog source/export-access condition in the secondary DataDoe organisation, not a cross-account merge failure. The UI is being changed to group failures by connection and show the exact server error rather than listing internal account IDs.
 
 Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
 

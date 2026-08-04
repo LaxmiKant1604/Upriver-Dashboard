@@ -1458,8 +1458,22 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandDirectoryFetchedAt(new Date());
       const unavailable = body.catalogUnavailableAccounts || [];
       if (unavailable.length) {
-        const names = unavailable.map((account) => account.name).join(", ");
-        setBrandDirectoryError(`Product Catalog is unavailable for: ${names}. Check the DataDoe source and export credits, then load the directory again.`);
+        const groups = new Map();
+        unavailable.forEach((account) => {
+          const connection = String(account.accountId || "").startsWith("dd-secondary:")
+            ? "Secondary DataDoe"
+            : "Primary DataDoe";
+          const error = String(account.error || "Product Catalog is unavailable.");
+          const key = `${connection}|${error}`;
+          groups.set(key, (groups.get(key) || 0) + 1);
+        });
+        const detail = [...groups.entries()]
+          .map(([key, count]) => {
+            const [connection, error] = key.split("|");
+            return `${connection}: ${count} account${count === 1 ? "" : "s"} (${error})`;
+          })
+          .join("; ");
+        setBrandDirectoryError(`Product Catalog could not be read. ${detail}`);
       } else if (body.message || body.partial) {
         setBrandDirectoryError(body.message || "Some account catalogs are still pending. Keep this page open while the directory sync completes.");
       }
