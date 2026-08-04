@@ -16,6 +16,10 @@ export const config = { maxDuration: 60 };
 
 export default async function handler(req, res) {
   if (!verifyCronRequest(req, res)) return; // sends 401/500 itself
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed." });
+    return;
+  }
   const bucket = String(req.query?.bucket || "");
   if (bucket !== "us" && bucket !== "non-us") {
     res.status(400).json({ error: "Query param 'bucket' must be 'us' or 'non-us'." });

@@ -37,16 +37,17 @@
 - Deployed the grouped catalog-error UX: `dpl_7J1FnZY4ycXLsTsuxuwKXuyUpGAA` (`https://upriverdashboard.vercel.app`). The next manual directory sync will reveal the precise DataDoe Product Catalog failure for the secondary connection, while keeping the successfully cached primary brands available.
 - Confirmed from the secondary DataDoe Settings screenshot: **Product Catalog by ASIN** and **Product Catalog by ASIN (Raw JSON)** are enabled, but both show **0 rows**. This is the direct reason secondary brands cannot appear in Brand View: DataDoe has not populated any catalog records for that organisation's connected Amazon accounts. Enabling the table alone is insufficient; the upstream Amazon connection/catalog ingestion must be backfilled or reconnected in DataDoe before any dashboard code can discover those brand names.
 
-Last updated: 2026-08-04 (Scheduled-sync FOUNDATION implemented — NOT deployed, awaiting Codex review)
+Last updated: 2026-08-04 (Scheduled-sync foundation reviewed and repaired; migration applied; deployment blocked on GitHub secrets)
 
 ## Scheduled-sync SaaS foundation — implemented, NOT deployed (2026-08-04)
 
 Phase 1 ("foundation first") of the website-wide scheduled DataDoe sync requested
-above. Built, `npm run verify` green (incl. **18 new sync assertions** + full
-build), **not committed-for-deploy / not deployed** — Codex reviews first. The app
-was already cache-first (reads are Supabase-only); this adds the server-side
-scheduled refresh so no user interaction ever triggers DataDoe, and removes the
-need for manual per-page refresh (UI removal is a declared follow-up phase).
+above. Built and senior-reviewed, `npm run verify` green (including **21 sync
+assertions**, 54 insight assertions, 60 Brand View assertions, and the full 1.12 MB
+application build). The production migration is applied, but the code is **not
+pushed or deployed yet** because the required GitHub Actions secrets are not set.
+Normal report reads are Supabase-only, but the old explicit per-page refresh
+buttons still trigger DataDoe until the declared UI-removal phase is completed.
 
 ### Schedule (exact)
 
@@ -97,11 +98,44 @@ need for manual per-page refresh (UI removal is a declared follow-up phase).
   two best-effort daily crons (`/api/cron/sync?bucket=non-us` @ `0 2 * * *`,
   `?bucket=us` @ `30 10 * * *`) + security headers (HSTS, CSP, nosniff,
   frame-options, referrer/permissions policy).
-- **Tests** `scripts/test-sync.mjs` (wired into `npm run verify`): 18 assertions —
+- **Tests** `scripts/test-sync.mjs` (wired into `npm run verify`): 21 assertions —
   bucket US/non-us/unknown, schedule constants ↔ vercel.json, registry coverage +
   enabled set + reportVersions, `dd-secondary:` namespacing + cross-org block,
-  batch ≤5, lock acquire/release/concurrent-blocked (emulated RPC), last-known-good
-  on build/validation failure, ads natural-key dedup, non-admin status isolation.
+  batch ≤5, lock acquire/release/concurrent-blocked (emulated RPC), resumable
+  per-cycle checkpoints, bounded Ads scopes, scheduler-only snapshot pruning,
+  last-known-good on build/validation failure, ads natural-key dedup, and
+  non-admin status isolation.
+
+### Codex production-gate review (2026-08-04)
+
+The initial handoff was not safe to deploy. Codex found and repaired these issues:
+
+1. The orchestrator wrote `sync_targets` but never read them to resume. Every
+   GitHub loop call restarted at the first report, so a bucket longer than 50
+   seconds could repeatedly rebuild early accounts and never reach later ones.
+   Targets now carry `cycle_date`; successful targets are skipped for that cycle,
+   failures receive at most three attempts, and a new day resets eligibility.
+2. One non-US Ads item ran both the managed-country and `OTHER` workers, each with
+   its own 45-second budget, inside one 60-second Vercel function. They are now
+   separate durable queue targets, so no invocation starts more than one Ads
+   worker.
+3. The 16 legacy Ads crons used different lock scopes from the new scheduler, so
+   they could duplicate exports despite the handoff claiming otherwise. They are
+   removed from `vercel.json`; only the two bucket kick-starter crons remain.
+4. Daily report windows created a new snapshot key every day and retained many
+   full payloads. Scheduler snapshots now carry `syncManaged=true`, and the new
+   service-role-only prune RPC removes older scheduler-owned snapshots after a
+   successful save without touching custom/manual snapshots.
+5. Sync status previously labelled the requested end date as the latest source
+   date. The adapter now records the actual latest payload/row date, so an
+   upstream-lagged report is not presented as current.
+6. The GitHub driver previously exited successfully after 40 incomplete calls.
+   It now fails visibly on iteration exhaustion or terminal target failures.
+
+The additive migration `20260805_scheduled_sync.sql` was applied successfully to
+production Supabase. Verified tables include `account_directory`, `sync_runs`,
+`sync_targets`, `sync_errors`, and `audit_log`; the scheduler prune RPC was created
+in the same transaction.
 
 ### Why the 60s cap needs the GitHub driver
 
@@ -130,7 +164,7 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
   `SUPABASE_SECRET_KEY`, `DASHBOARD_APP_URL`.
 - GitHub repo secrets (new): `SYNC_ENDPOINT` (e.g.
   `https://upriverdashboard.vercel.app/api/cron/sync`) and `CRON_SECRET` (same value).
-- Apply the migration: `npm run db:migrate` (adds the 5 tables; additive/idempotent).
+- Migration applied successfully on 2026-08-04 with `npm run db:migrate`.
 
 ### Known limitations / risks (for review)
 
@@ -147,17 +181,23 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
    `api/datadoe.js` (like brand-sales), add to `adapters/index.js`, flip
    `enabled:true`. One report adapter per account per call; keep 6-month reports
    (`reconciliation`,`sku-pl`) disabled until windowed checkpointing.
-4. **CA re-bucketing** — legacy ads crons group US+CA as "americas"; the new
-   bucketing puts CA in non-us. Legacy 16 ads crons are left running during
-   transition; the shared 600s ads lock prevents double-spend. Reconcile/remove
-   legacy crons in follow-up.
+4. **CA re-bucketing** — the new scheduler intentionally puts CA in the non-US
+   02:00 UTC bucket. The legacy Ads schedules were removed during review to avoid
+   different lock scopes creating duplicate exports.
 5. **CSP `script-src 'self'`** — verify no inline bootstrap in the built
    `dist/index.html` in a preview (watch console for CSP violations); the app uses
    inline styles so `style-src 'unsafe-inline'` is retained.
-6. **Vercel cron/function count** — now 18 crons + 5 functions
-   (`datadoe`, `access`, `cron/[scope]`, `cron/sync`, `sync`). If the plan rejects
-   the two new crons, remove them from `vercel.json`; the GitHub driver is
-   authoritative regardless.
+6. **SaaS tenancy boundary** — current authorization is one Upriver workspace:
+   global admin plus per-user `account_permissions`. That safely supports many
+   Upriver users, but it is not yet multi-company tenancy. Before onboarding
+   unrelated customer organisations, add a tenant/workspace key to users,
+   accounts, permissions, snapshots, sync targets, COGS, Ads rows, and audit logs,
+   then enforce it in RLS and every server query.
+7. **Release blocker** — GitHub repository secrets `SYNC_ENDPOINT` and
+   `CRON_SECRET` are still missing. The browser session available to Codex was not
+   signed into GitHub, and the official CLI download was blocked by the local
+   network. Do not push/deploy the cron replacement until those secrets are set,
+   because one Vercel invocation cannot drain the bucket by itself.
 
 ### Follow-up phases (declared, not done)
 
@@ -172,8 +212,8 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
 
 ### Review + preview validation steps (for Codex)
 
-1. `cd sales-dashboard-live && npm run verify` (insight + brand-view + 18 sync + build).
-2. Apply migration on a preview DB (`npm run db:migrate`), set GitHub secrets.
+1. `cd sales-dashboard-live && npm run verify` (insight + Brand View + 21 sync + build).
+2. Migration is applied. Set GitHub secrets before pushing/deploying.
 3. Preview deploy; confirm: unauthenticated `/api/cron/sync?bucket=us` → 401;
    non-admin `POST /api/sync` → 403; `GET /api/sync` returns only the caller's
    accounts; a `Bearer CRON_SECRET` call writes a `sync_runs` row and a

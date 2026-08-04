@@ -67,10 +67,16 @@ jobs:
               echo "Non-200 from sync endpoint; aborting." >&2
               exit 1
             fi
-            if printf '%s' "$body" | grep -q '"drained":true'; then
+            if [ "$(printf '%s' "$body" | jq -r '.drained // false')" = "true" ]; then
+              terminal_failed=$(printf '%s' "$body" | jq -r '.counts.terminalFailed // 0')
+              if [ "$terminal_failed" -gt 0 ]; then
+                echo "Bucket ${BUCKET} drained with ${terminal_failed} target(s) still failed after retry limit." >&2
+                exit 1
+              fi
               echo "Bucket ${BUCKET} drained after ${i} call(s)."
               exit 0
             fi
             sleep 5
           done
-          echo "Reached iteration cap without draining bucket ${BUCKET}; will complete on the next scheduled run."
+          echo "Reached iteration cap without draining bucket ${BUCKET}." >&2
+          exit 1

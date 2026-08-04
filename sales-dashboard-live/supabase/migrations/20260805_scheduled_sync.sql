@@ -60,6 +60,7 @@ create table if not exists public.sync_targets (
   last_success_at timestamptz,
   source_refreshed_at timestamptz,
   latest_data_date date,
+  cycle_date date,
   attempts integer not null default 0,
   next_eligible_at timestamptz not null default now(),
   last_error text,
@@ -69,6 +70,35 @@ create table if not exists public.sync_targets (
 );
 create index if not exists sync_targets_eligibility_idx
   on public.sync_targets (next_eligible_at);
+alter table public.sync_targets add column if not exists cycle_date date;
+
+-- Scheduler-owned snapshots use a browser-compatible params hash but carry
+-- params.syncManaged=true. Keep only the newest successful scheduled snapshot
+-- for each report/account; custom/manual snapshots are never touched.
+create or replace function public.prune_scheduled_report_snapshots(
+  p_report_key text,
+  p_account_id text,
+  p_keep_params_hash text
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  deleted_count integer;
+begin
+  delete from public.report_snapshots
+  where report_key = p_report_key
+    and account_id = p_account_id
+    and params_hash <> p_keep_params_hash
+    and coalesce(params ->> 'syncManaged', 'false') = 'true';
+  get diagnostics deleted_count = row_count;
+  return deleted_count;
+end;
+$$;
+revoke all on function public.prune_scheduled_report_snapshots(text, text, text) from public, anon, authenticated;
+grant execute on function public.prune_scheduled_report_snapshots(text, text, text) to service_role;
 
 -- 4. sync_errors -- append-only failure log, admin-read.
 create table if not exists public.sync_errors (

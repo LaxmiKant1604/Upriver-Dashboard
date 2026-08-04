@@ -12,13 +12,24 @@ import { paramsHashFor } from "../../report-store.js";
 import {
   saveReportSnapshot as defaultSave,
   publishSnapshotUpdate as defaultPublish,
+  pruneScheduledReportSnapshots as defaultPrune,
 } from "../../supabase.js";
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
+function latestPayloadDate(payload) {
+  const direct = [payload?.latestDataDate, payload?.salesLatestDate]
+    .map((value) => String(value || ""))
+    .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value));
+  const rowDates = (payload?.rows || [])
+    .map((row) => String(row?.date || row?.metric_date || ""))
+    .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value));
+  return [...direct, ...rowDates].sort().at(-1) || null;
+}
+
 export async function runReportAdapter({
   entry, account, asOf, connections, build,
-  save = defaultSave, publish = defaultPublish,
+  save = defaultSave, publish = defaultPublish, prune = defaultPrune,
 }) {
   if (typeof build !== "function") {
     throw new Error(`no adapter build wired for ${entry.reportKey}`);
@@ -45,16 +56,17 @@ export async function runReportAdapter({
     reportKey: entry.reportKey,
     accountId: account.account_id,
     paramsHash,
-    params: { reportVersion: entry.reportVersion, ...params },
+    params: { reportVersion: entry.reportVersion, syncManaged: true, ...params },
     payload,
     payloadBytes,
     sourceRefreshedAt: new Date().toISOString(),
   });
   if (saved?.id) {
+    await prune({ reportKey: entry.reportKey, accountId: account.account_id, keepParamsHash: paramsHash });
     await publish({ reportKey: entry.reportKey, accountId: account.account_id, paramsHash, snapshotId: saved.id }).catch(() => {});
   }
   return {
     sourceRefreshedAt: saved?.source_refreshed_at || new Date().toISOString(),
-    latestDataDate: params.to || asOf || null,
+    latestDataDate: latestPayloadDate(payload),
   };
 }

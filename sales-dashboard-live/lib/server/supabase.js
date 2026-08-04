@@ -399,7 +399,7 @@ export async function updateSyncRun(id, { status, finishedAt, counts }) {
 
 export async function getSyncTargets({ reportKeys, accountIds } = {}) {
   const params = new URLSearchParams({
-    select: "report_key,account_id,last_status,last_attempt_at,last_success_at,source_refreshed_at,latest_data_date,attempts,next_eligible_at,last_error",
+    select: "report_key,account_id,last_status,last_attempt_at,last_success_at,source_refreshed_at,latest_data_date,cycle_date,attempts,next_eligible_at,last_error",
   });
   if (reportKeys && reportKeys.length) params.set("report_key", `in.(${reportKeys.map((k) => `"${k}"`).join(",")})`);
   if (accountIds && accountIds.length) params.set("account_id", `in.(${accountIds.map((id) => `"${id}"`).join(",")})`);
@@ -410,12 +410,13 @@ export async function upsertSyncTarget(target) {
   const body = {
     report_key: target.reportKey,
     account_id: target.accountId,
-    last_run_id: target.lastRunId || null,
     last_status: target.lastStatus,
-    last_attempt_at: target.lastAttemptAt || null,
-    attempts: target.attempts != null ? target.attempts : 0,
-    next_eligible_at: target.nextEligibleAt || new Date().toISOString(),
   };
+  if (target.lastRunId !== undefined) body.last_run_id = target.lastRunId;
+  if (target.lastAttemptAt !== undefined) body.last_attempt_at = target.lastAttemptAt;
+  if (target.attempts !== undefined) body.attempts = target.attempts;
+  if (target.nextEligibleAt !== undefined) body.next_eligible_at = target.nextEligibleAt;
+  if (target.cycleDate !== undefined) body.cycle_date = target.cycleDate;
   // Only advance success markers on an actual success, so a later failure never
   // erases the last-known-good timestamps.
   if (target.lastStatus === "succeeded") {
@@ -430,6 +431,17 @@ export async function upsertSyncTarget(target) {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body,
+  });
+}
+
+export async function pruneScheduledReportSnapshots({ reportKey, accountId, keepParamsHash }) {
+  return request("/rest/v1/rpc/prune_scheduled_report_snapshots", {
+    method: "POST",
+    body: {
+      p_report_key: reportKey,
+      p_account_id: accountId,
+      p_keep_params_hash: keepParamsHash,
+    },
   });
 }
 

@@ -82,7 +82,11 @@ export default async function handler(req, res) {
       res.status(429).json({ error: "Too many sync requests. Wait a minute and try again." });
       return;
     }
-    const bucket = req.body?.bucket === "us" ? "us" : "non-us";
+    const bucket = String(req.body?.bucket || "");
+    if (bucket !== "us" && bucket !== "non-us") {
+      res.status(400).json({ error: "Body field 'bucket' must be 'us' or 'non-us'." });
+      return;
+    }
     await insertAuditLog({ actorUserId: access.userId, action: "sync.now", target: { bucket } });
     const result = await runScheduledSync({ bucket, trigger: "manual-admin", createdBy: access.userId });
     res.status(200).json(result);

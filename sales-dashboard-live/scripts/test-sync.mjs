@@ -23,6 +23,7 @@ const {
 } = await import("../lib/server/sync/registry.js");
 const { shapeSyncStatus } = await import("../lib/server/sync/status.js");
 const { runReportAdapter } = await import("../lib/server/sync/adapters/report-adapter.js");
+const { expandSyncWork, targetDisposition, MAX_TARGET_ATTEMPTS } = await import("../lib/server/sync/planner.js");
 const { publicAccountId, resolveDataDoeAccountIds } = await import("../lib/server/datadoe-connections.js");
 const { ADS_SOURCES } = await import("../lib/server/ads-sync.js");
 const { claimRefreshLock, releaseRefreshLock } = await import("../lib/server/supabase.js");
@@ -83,6 +84,7 @@ test("vercel.json sync crons match the schedule constants", () => {
   }
   assert.equal(byBucket["non-us"], "0 2 * * *");
   assert.equal(byBucket.us, "30 10 * * *");
+  assert.equal(vercel.crons.length, 2, "legacy Ads crons must be disabled to prevent duplicate exports");
 });
 
 /* 3. Registry coverage of every existing report key + ads sources. */
@@ -136,6 +138,19 @@ test("countriesForBucket maps us to ['US'] and non-us to the managed set + OTHER
 });
 test("every ads source batches seller/vendor ids in groups of <= 5", () => {
   for (const s of ADS_SOURCES) assert.ok(s.batchSize <= 5, `${s.key} batchSize ${s.batchSize} > 5`);
+});
+test("non-US Ads work is split into separately bounded managed and OTHER targets", () => {
+  const adsEntry = SYNC_REGISTRY.find((entry) => entry.reportKey === "ads:campaign-performance-v1");
+  const work = expandSyncWork([adsEntry], [], "non-us");
+  assert.equal(work.length, 2);
+  assert.deepEqual(work.map((item) => item.scope.countries), [["IN", "CA", "AU"], "OTHER"]);
+  assert.equal(new Set(work.map((item) => item.targetAccountId)).size, 2);
+});
+test("a completed target is skipped only for the same cycle and failures stop after three attempts", () => {
+  assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "succeeded", attempts: 1 }, "2026-08-04").status, "complete");
+  assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "succeeded", attempts: 1 }, "2026-08-05").status, "due");
+  assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "failed", attempts: MAX_TARGET_ATTEMPTS }, "2026-08-04").status, "terminal-failure");
+  assert.equal(targetDisposition({ cycle_date: "2026-08-04", last_status: "deferred", attempts: 20 }, "2026-08-04").status, "due");
 });
 
 /* 6. Lock acquire/release + concurrent-blocked (emulated claim RPC). */
@@ -210,6 +225,24 @@ await asyncTest("adapter blocks the save when validation fails", async () => {
     /validation failed/,
   );
   assert.equal(saveCalls, 0);
+});
+await asyncTest("successful scheduled snapshots are marked, pruned and report their actual latest row date", async () => {
+  const entry = {
+    reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+    windowFor: () => ({ from: "2025-06-01", to: "2026-08-04" }), validate: () => true,
+  };
+  let savedInput;
+  let prunedInput;
+  const result = await runReportAdapter({
+    entry, account: { account_id: "123", country: "US" }, asOf: "2026-08-04", connections: CONNS,
+    build: async () => ({ rows: [{ date: "2026-08-01" }, { date: "2026-08-03" }] }),
+    save: async (input) => { savedInput = input; return { id: "snapshot-1", source_refreshed_at: "2026-08-04T10:00:00Z" }; },
+    prune: async (input) => { prunedInput = input; },
+    publish: async () => {},
+  });
+  assert.equal(savedInput.params.syncManaged, true);
+  assert.deepEqual(prunedInput, { reportKey: "brand-sales", accountId: "123", keepParamsHash: savedInput.paramsHash });
+  assert.equal(result.latestDataDate, "2026-08-03");
 });
 
 /* 8. Ads rolling-correction upsert dedups by natural key (no double-count). */

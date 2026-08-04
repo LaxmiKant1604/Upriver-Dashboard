@@ -6,17 +6,11 @@
 // { status, deferred }. We just map the bucket to its country groups and let it run.
 
 import { runAdsSync } from "../../ads-sync.js";
-import { countriesForBucket } from "../registry.js";
-
-export async function runAdsAdapter({ entry, bucket }) {
+export async function runAdsAdapter({ entry, countries }) {
   const sourceKey = entry.sourceKey || String(entry.reportKey).replace(/^ads:/, "");
-  const { groups } = countriesForBucket(bucket);
-  let deferred = false;
-  let skipped = false;
-  for (const group of groups) {
-    const result = await runAdsSync(group, [sourceKey]);
-    if (result?.status === "partial" || result?.deferred) deferred = true;
-    if (result?.status === "skipped") skipped = true;
-  }
-  return { deferred, skipped };
+  const result = await runAdsSync(countries, [sourceKey]);
+  return {
+    deferred: result?.status === "partial" || Boolean(result?.deferred),
+    skipped: result?.status === "skipped",
+  };
 }
