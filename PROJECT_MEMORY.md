@@ -65,7 +65,7 @@ buttons still trigger DataDoe until the declared UI-removal phase is completed.
   `is_dashboard_admin()`, and `report_refresh_locks` + `claim_report_refresh_lock`
   (no new lock table, no heartbeat RPC).
 - **Registry** `lib/server/sync/registry.js` — the single declarative source of
-  truth. Enabled this pass: the 4 Ads sources + `brand-sales` + `sales-movers`.
+  truth. Enabled this pass: the 4 Ads sources + `brand-sales`.
   Declared but `enabled:false` (follow-up): `fba-plan`, `daily-reporting`,
   `reconciliation`, `sku-pl`, `keyword-rank`, `content-changes`, `listing-health`,
   `buy-box-loss`, `returns-leakage`, `ppc-performance`, `listing-optimizer`.
@@ -161,7 +161,14 @@ in the same transaction.
   previous snapshot, checkpoint the target as deferred without consuming a retry,
   and release locks normally. The GitHub loop now retries transient HTTP 429/5xx
   responses after backoff while keeping authentication/permanent 4xx errors fatal.
-  Rerun the production non-US workflow after deploying this follow-up commit.
+- A second live run resumed correctly from Supabase checkpoints and reached
+  `sales-movers`, but one account's multi-export build repeatedly exceeded the
+  safe deadline. Re-running the whole build would spend new DataDoe exports
+  without progress, so the validation run was cancelled and scheduled
+  `sales-movers` was disabled. Its normal dashboard/report behavior is untouched.
+  Re-enable it only after its adapter persists sub-export checkpoints across
+  serverless invocations. This leaves the proven four Ads sources + `brand-sales`
+  enabled in Phase 1.
 
 ### Why the 60s cap needs the GitHub driver
 
@@ -197,9 +204,9 @@ only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
 1. **Live DataDoe coverage is partial** — Ads and multiple primary `brand-sales`
    targets succeeded in the first production run. Some primary exports returned
    HTTP 402, and the secondary organisation lacks the configured Order Line Items
-   source ID (HTTP 404). `sales-movers` remains pending behind the incomplete
-   `brand-sales` queue. Resolve DataDoe credits/source enablement rather than
-   weakening scheduler validation.
+   source ID (HTTP 404). Resolve DataDoe credits/source enablement rather than
+   weakening scheduler validation. Scheduled `sales-movers` is separately disabled
+   until it can resume sub-exports without repeating token-consuming work.
 2. **`reportVersion` alignment** — enabled ones are verbatim from the browser
    (`brand-sales-shared-v1`, `sales-movers-v1`). If a scheduled window differs from
    a user's chosen range, the existing `getLatestReportSnapshot` stale fallback

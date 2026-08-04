@@ -129,7 +129,11 @@ export const SYNC_REGISTRY = [
     adapter: "sales-movers",
     validate: (v) => (v ? true : "sales-movers payload empty"),
     retentionDays: 14,
-    enabled: true,
+    // Live validation found some accounts need longer than one 60-second
+    // function for this multi-export build. Keep it declared but disabled until
+    // the adapter persists sub-export checkpoints; repeated whole-report retries
+    // would waste DataDoe exports.
+    enabled: false,
   }),
 
   // --- Declared, follow-up (enabled:false). Their adapters/builder extractions

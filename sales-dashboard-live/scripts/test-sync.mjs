@@ -105,13 +105,14 @@ test("registry covers every existing DataDoe report key + the 4 ads sources", ()
   ];
   for (const k of expected) assert.ok(keys.has(k), `registry missing ${k}`);
 });
-test("only ads + brand-sales + sales-movers are enabled this pass, with the browser reportVersions", () => {
+test("only ads + brand-sales are enabled until long report adapters are checkpointable", () => {
   const enabled = SYNC_REGISTRY.filter((e) => e.enabled).map((e) => e.reportKey).sort();
-  const expected = ["brand-sales", "sales-movers", ...ADS_SOURCE_KEYS.map((k) => `ads:${k}`)].sort();
+  const expected = ["brand-sales", ...ADS_SOURCE_KEYS.map((k) => `ads:${k}`)].sort();
   assert.deepEqual(enabled, expected);
   const byKey = new Map(SYNC_REGISTRY.map((e) => [e.reportKey, e]));
   assert.equal(byKey.get("brand-sales").reportVersion, "brand-sales-shared-v1");
   assert.equal(byKey.get("sales-movers").reportVersion, "sales-movers-v1");
+  assert.equal(byKey.get("sales-movers").enabled, false);
   assert.equal(byKey.get("fba-plan").enabled, false);
 });
 test("orderedWork runs ads sources before per-account reports", () => {
