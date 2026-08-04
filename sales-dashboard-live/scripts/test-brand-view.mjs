@@ -911,7 +911,8 @@ test("both reports build the same three tables from the same payload shape", () 
       ["Country", "Total Sales", "LY Sales", "FBA Inv.", "FBA Cover (days)", "Units"],
       `${label}: unexpected Daily Snapshot columns`
     );
-    assert.ok(!tables.monthlyTable.headers.some((header) => /ad spend|tacos/i.test(header.label)));
+    assert.ok(tables.monthlyTable.headers.some((header) => header.label === "Ad Spend"));
+    assert.ok(tables.monthlyTable.headers.some((header) => header.label === "TACoS%"));
     assert.ok(tables.weeklyTable.rows.some((row) => row.label === "Ad Spend"));
     assert.ok(tables.weeklyTable.rows.some((row) => row.label === "TACoS%"));
     // A group gets an All Markets row when it actually aggregates more than one

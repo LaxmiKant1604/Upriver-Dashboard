@@ -158,13 +158,12 @@ function showsTotalRow(group, groupCount) {
   return group.rows.length > 1 || groupCount === 1;
 }
 
-// Advertising coverage is still being completed. Daily and Monthly keep a
-// sales-and-inventory focus, while the 7-Day report exposes the available
-// day-by-day ad spend and TACoS rows for operational monitoring.
-function withoutAdvertisingColumns({ headers, rows }, { showWeeklyAdvertising = false } = {}) {
+// Daily keeps a sales-and-inventory focus. Monthly exposes current-month ad
+// spend and TACoS, while the 7-Day report exposes them day by day.
+function withoutAdvertisingColumns({ headers, rows }, { showAdvertising = false } = {}) {
   const visibleIndexes = headers
     .map((header, index) => ({ header, index }))
-    .filter(({ header }) => header.key !== "spend" && header.key !== "tacos")
+    .filter(({ header }) => showAdvertising || (header.key !== "spend" && header.key !== "tacos"))
     .map(({ index }) => index);
 
   return {
@@ -179,7 +178,7 @@ function withoutAdvertisingColumns({ headers, rows }, { showWeeklyAdvertising = 
         : header;
     }),
     rows: rows
-      .filter((row) => showWeeklyAdvertising || (row.label !== "Ad Spend" && row.label !== "TACoS%"))
+      .filter((row) => showAdvertising || (row.label !== "Ad Spend" && row.label !== "TACoS%"))
       .map((row) => {
         if (row.kind === "section" || row.kind === "band") return row;
         const subcells = row.subcells
@@ -345,7 +344,7 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
       });
     }
   });
-  return withoutAdvertisingColumns({ headers, rows });
+  return withoutAdvertisingColumns({ headers, rows }, { showAdvertising: true });
 }
 
 /* ============================== 3. 7-DAY ============================== */
@@ -429,7 +428,7 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
     });
   }
 
-  return withoutAdvertisingColumns({ headers, rows }, { showWeeklyAdvertising: true });
+  return withoutAdvertisingColumns({ headers, rows }, { showAdvertising: true });
 }
 
 /* ========================= THE ONE ENTRY POINT ========================= */
