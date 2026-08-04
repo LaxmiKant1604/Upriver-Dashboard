@@ -1,5 +1,13 @@
 # Project Memory
 
+## DataDoe support guidance reviewed (2026-08-04)
+
+- DataDoe confirmed that large report pulls should use its **REST API**, not MCP: MCP exports are capped at 3,500 rows each and a large result is split into multiple token-consuming exports, whereas one REST API export can return up to the requested large file size as a single export. Upriver already uses server-side REST API exports, so this architecture is the correct token-saving path; do not replace it with MCP report loops.
+- DataDoe corrected an MCP result-limit defect from 25 to 250. This does not change the dashboard's API integration.
+- Initial source loading/backfills can take 24-48 hours, and slower report families such as inventory may be queued after sales/orders. Treat missing or delayed upstream rows as incomplete DataDoe sync state, never as zero sales or zero inventory.
+- Support said Amazon Sales & Traffic reporting can be delayed/restricted. They suggested Order Line Items for sales/orders and Detail Page Traffic Event Notifications for traffic, but the same email thread contains a reported Order Line Items undercount while initial loading was incomplete. Do not change any current sales source solely from this recommendation; reconcile a fully synced account against Seller Central first.
+- PII shipment/address tables require a separate paid enablement and up to 24 hours before data appears. They are not required for the current Brand View/FBA availability calculations.
+
 ## In progress: complete Brand View directory across both DataDoe organisations (2026-08-04)
 
 - Brand View reporting refinement deployed as `dpl_DB5axa9shoGzGB1JxM71HfTgZczC` (`https://upriverdashboard.vercel.app`): Ad Spend and TACoS are hidden from every Daily Snapshot, Monthly Snapshot, 7-Day Performance table, and matching export. FBA Cover now displays whole **days**, calculated as available FBA units divided by average daily brand units sold in the currently selected date range. This replaces the prior opaque month display based on a cross-month MTD pace. FBA figures remain snapshot-backed; when a saved FBA snapshot has no country allocation, country rows stay `n/a` rather than inventing an allocation. `npm run verify` passed with 54 shared assertions, 60 Brand View assertions, and the complete Vite production build.
