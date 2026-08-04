@@ -2,6 +2,7 @@
 
 ## In progress: complete Brand View directory across both DataDoe organisations (2026-08-04)
 
+- Removed the obsolete **Brand View** item from the Account View sidebar. Brand View remains a separate mode selected only with the existing header **Account view / Brand view** switcher; no dashboard, filter, report, or Brand View logic changed.
 - Investigated the report selector missing secondary-organisation accounts in Brand View.
 - Found and fixed a server-side merge bug: `discoverConnectedAccounts()` rejected a raw seller/vendor ID that appeared in both DataDoe organisations. Raw IDs are only unique within their organisation, so the refresh could fail before saving the combined account directory.
 - Account discovery now merges by the existing public, connection-scoped ID. Primary remains unchanged; the secondary account is retained as `dd-secondary:<raw-id>`. A regression test covers the same raw ID occurring in both connections.

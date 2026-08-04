@@ -139,7 +139,7 @@ export function Sidebar({
           label: "Brand View",
           items: [{ view: "dashboard", label: "Brand Dashboard", title: "Daily, monthly and seven-day country performance", icon: LayoutDashboard }],
         }] : NAV_GROUPS).map((group) => {
-          const items = group.items.filter((item) => !item.adminOnly || isAdmin);
+          const items = group.items.filter((item) => item.view !== "brandview" && (!item.adminOnly || isAdmin));
           if (!items.length) return null;
           return (
             <div className="sb-group" key={group.label}>
