@@ -9,6 +9,7 @@
 - Verification complete: `npm run verify` passed (54 shared/report assertions, 59 Brand View assertions, and the full production build).
 - Deployed to production: `dpl_DVpnYRQwwpzGGhnpqvzm3uViyY4j` (`https://upriverdashboard.vercel.app`).
 - Next user action: open **Brand view** and use **Load portfolio brands** once. This explicitly refreshes the shared directory from both DataDoe organisations; after it completes, every authorised user reads the same saved list without another DataDoe request.
+- Production investigation after deployment: the Brand View directory requests return HTTP 200, including the manual load, so the remaining warning is a truthful partial-data state rather than an API-key, cross-organisation merge, or dropdown failure. The unresolved accounts have no saved `catalogBrands`/brand rows in Supabase. The current cache-first directory deliberately avoids Product Catalog exports because prior attempts returned DataDoe HTTP 402 or timed out; Supabase cannot infer brand names that neither its snapshots nor DataDoe supplies. To make these accounts complete, their DataDoe **Product Catalog by ASIN** source must be enabled/credit-available, or an account-scoped Dashboard/SKU P&L refresh must first save its brand data.
 
 Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
 
