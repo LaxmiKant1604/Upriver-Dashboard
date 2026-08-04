@@ -2268,6 +2268,76 @@ the previous anonymous data API is no longer accessible.
   checking the public bundle for a newly added UI marker before reporting it
   live.
 
+## Shared DataDoe source reuse (implemented 2026-08-04; release in progress)
+
+### Completed
+
+- Added `lib/server/source-contracts.js` as the canonical source/semantic
+  registry. It maps every existing report to its DataDoe sources and records
+  each source's native grain and valid fields. Future reports must declare
+  their dependencies here before scheduled activation.
+- Added exact source-export reuse to the shared `fetchExportRows()` transport.
+  This automatically covers every current/future report that uses the common
+  DataDoe helper. The cache identity includes the DataDoe organisation hash,
+  exact account scope, canonical source, columns, date range, grouping,
+  aggregations, ordering and row limit. Only identical exports can collide.
+- Concurrent requests for the same export now share one in-flight Promise, so
+  two users opening compatible reports together cannot create two exports.
+- Successful exports below their row cap are cached in the existing private
+  `dashboard-snapshots` Supabase Storage bucket. Postgres stores only compact
+  lookup metadata in `source_export_cache`; report rows do not increase the
+  already-constrained database size. Objects above 8 MiB are deliberately not
+  cached, and cache retention is capped at 512 MiB / 512 entries with expiry.
+- Source payloads are available only to server functions using the Supabase
+  service role. API keys, raw keys and raw account IDs are not stored in cache
+  metadata; organisation and account scope use SHA-256 fingerprints. Transport
+  remains HTTPS and Supabase provides encrypted storage at rest.
+- Added migration `20260806_shared_source_export_cache.sql` and deterministic
+  tests in `scripts/test-source-cache.mjs`. `npm run verify` now includes these
+  checks. Verification passed: 54 insight + 60 Brand View + 23 sync + 6 source
+  cache assertions and the full 1,121 kB production build.
+- The migration was applied to production Supabase on 2026-08-04. A live
+  service-role round trip uploaded a synthetic private Storage object, read it
+  through `source_export_cache`, then expired and pruned both test objects.
+  This verified the REST metadata, private object upload/download and cleanup
+  path end to end without using a DataDoe token.
+
+### Important decisions and technical learnings
+
+- Reuse is based on source semantics, not a report label. Order Line Items can
+  power ordered sales/units in Dashboard, Reconciliation and future compatible
+  views, but it cannot replace Sales & Traffic where sessions, page views or
+  conversion decomposition are required. Sales Movers therefore still needs
+  Sales & Traffic for its driver analysis.
+- FBA Inventory Health, Listings/AWD, Ads, Profit/COGS, Settlements, Returns,
+  Product Catalog and SQP remain distinct canonical sources. Their identical
+  export signatures are reused globally, but their metrics are never mixed.
+- Ads is already source-first: its four daily source datasets are persisted in
+  `ads_daily_source_rows` with correction-window upserts. The generic cache is
+  complementary; it does not replace Ads history or its late-attribution logic.
+- A response exactly on the DataDoe row cap is never persisted because it may
+  be truncated. Existing strict report guards still fail rather than present
+  partial totals.
+- Persisted cache expiry is honoured exactly in the in-process LRU. Scheduled
+  jobs also skip optional Storage persistence with less than three seconds of
+  execution budget, preserving the 60-second Vercel deadline.
+- This release removes duplicate *identical* exports immediately. Partially
+  overlapping requests (different columns, grain or windows) are intentionally
+  separate until a report is migrated to a shared canonical fact shape; merging
+  them automatically would risk incorrect metrics.
+
+### Pending after this release
+
+- Measure `source_export_cache` hit rate and Storage growth after several daily
+  cycles, then tune per-source TTLs from evidence.
+- Migrate the highest-value overlapping shapes incrementally: Product Catalog
+  superset, FBA Inventory snapshot, then a bounded ASIN/day sales fact. Reconcile
+  every derived report exactly before removing its old export signature.
+- FBA Plan and the remaining disabled scheduler adapters still need
+  checkpointable builders before scheduled activation. This cache reduces
+  duplicate work but does not make a multi-export report fit a single Vercel
+  function by itself.
+
 ## Automated Amazon Ads persistence (implemented 2026-07-29; deployment pending)
 
 The three requested Amazon Ads reports now have a server-side, cache-first

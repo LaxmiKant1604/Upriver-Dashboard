@@ -48,6 +48,54 @@ async function request(path, { method = "GET", body, headers = {} } = {}) {
   return result;
 }
 
+function storageObjectUrl(bucket, objectPath) {
+  const safeBucket = encodeURIComponent(bucket);
+  const safePath = String(objectPath || "")
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `${SUPABASE_URL}/storage/v1/object/${safeBucket}/${safePath}`;
+}
+
+async function putPrivateStorageObject(bucket, objectPath, contents, contentType = "application/json") {
+  requireConfiguration();
+  const response = await fetch(storageObjectUrl(bucket, objectPath), {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": contentType,
+      "x-upsert": "true",
+    },
+    body: contents,
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => null);
+    throw new Error(`Supabase Storage upload failed (${response.status}): ${result?.message || result?.error || "Unknown error"}`);
+  }
+}
+
+async function getPrivateStorageJson(bucket, objectPath) {
+  requireConfiguration();
+  const response = await fetch(storageObjectUrl(bucket, objectPath), {
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    },
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Supabase Storage download failed (${response.status}).`);
+  return response.json();
+}
+
+async function deletePrivateStorageObjects(bucket, objectPaths) {
+  if (!objectPaths.length) return;
+  await request(`/storage/v1/object/${encodeURIComponent(bucket)}`, {
+    method: "DELETE",
+    body: { prefixes: objectPaths },
+  });
+}
+
 async function authRequest(path, { method = "GET", body, accessToken } = {}) {
   requireConfiguration();
   const response = await fetch(`${SUPABASE_URL}${path}`, {
@@ -257,6 +305,65 @@ export async function saveReportSnapshot(snapshot) {
     },
   });
   return rows[0];
+}
+
+const SOURCE_CACHE_BUCKET = "dashboard-snapshots";
+
+export async function getSourceExportCache(requestHash) {
+  const query = new URLSearchParams({
+    select: "request_hash,source_id,object_path,row_count,payload_bytes,fetched_at,expires_at",
+    request_hash: `eq.${requestHash}`,
+    expires_at: `gt.${new Date().toISOString()}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/source_export_cache?${query}`);
+  const entry = rows[0];
+  if (!entry) return null;
+  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, entry.object_path);
+  if (!payload || !Array.isArray(payload.rows)) return null;
+  return { ...entry, rows: payload.rows };
+}
+
+export async function saveSourceExportCache({
+  requestHash,
+  sourceId,
+  organizationFingerprint,
+  accountScopeHash,
+  requestMeta,
+  rows,
+  payloadBytes,
+  expiresAt,
+}) {
+  const objectPath = `source-cache/v1/${requestHash.slice(0, 2)}/${requestHash}.json`;
+  const serialised = JSON.stringify({ rows });
+  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, serialised);
+  const saved = await request("/rest/v1/source_export_cache?on_conflict=request_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      request_hash: requestHash,
+      source_id: sourceId,
+      organization_fingerprint: organizationFingerprint,
+      account_scope_hash: accountScopeHash,
+      request_meta: requestMeta,
+      object_path: objectPath,
+      row_count: rows.length,
+      payload_bytes: payloadBytes,
+      fetched_at: new Date().toISOString(),
+      expires_at: expiresAt,
+    },
+  });
+  return saved[0] || null;
+}
+
+export async function pruneSourceExportCache() {
+  const deleted = await request("/rest/v1/rpc/prune_source_export_cache", {
+    method: "POST",
+    body: { p_max_bytes: 536870912, p_max_entries: 512 },
+  });
+  const objectPaths = (deleted || []).map((row) => row.object_path).filter(Boolean);
+  await deletePrivateStorageObjects(SOURCE_CACHE_BUCKET, objectPaths).catch(() => {});
+  return objectPaths.length;
 }
 
 export async function publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId }) {

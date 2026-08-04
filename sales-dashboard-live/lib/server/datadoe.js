@@ -12,7 +12,15 @@
 //   a from/to range, and must order by a column that actually exists.
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { marketplaceProfile } from "../marketplaces.js";
+import { cacheHoursForSource, sourceContractForId } from "./source-contracts.js";
+import {
+  getSourceExportCache,
+  isSupabaseConfigured,
+  pruneSourceExportCache,
+  saveSourceExportCache,
+} from "./supabase.js";
 
 export const DATADOE_BASE = "https://api.datadoe.com/api/v1";
 
@@ -216,19 +224,156 @@ export function chunkArray(items, size) {
   return chunks;
 }
 
+const SOURCE_CACHE_MAX_OBJECT_BYTES = 8 * 1024 * 1024;
+const SOURCE_MEMORY_CACHE_MAX = 24;
+const sourceExportInflight = new Map();
+const sourceMemoryCache = new Map();
+let sourceCacheUnavailableUntil = 0;
+let sourceCacheLastPrunedAt = 0;
+
+function sha256(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
+  );
+}
+
+function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
+  const contract = sourceContractForId(sourceId);
+  const organizationFingerprint = sha256(apiKey).slice(0, 24);
+  const accountScopeHash = sha256([...ids].map(String).sort().join("\u001f"));
+  const requestMeta = stableValue({
+    source: contract?.key || String(sourceId),
+    columns: [...columns].map(String).sort(),
+    from: from || null,
+    to: to || null,
+    limit,
+    groupBy: [...(options.groupBy || [])].map(String).sort(),
+    aggregations: [...(options.aggregations || [])].map(stableValue).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    orderByColumn: options.orderByColumn || "date",
+    orderByDirection: options.orderByDirection || "ASC",
+  });
+  const requestHash = sha256(JSON.stringify({ organizationFingerprint, accountScopeHash, requestMeta }));
+  return { requestHash, organizationFingerprint, accountScopeHash, requestMeta };
+}
+
+function rememberSourceRows(requestHash, rows, expiresAt) {
+  sourceMemoryCache.delete(requestHash);
+  sourceMemoryCache.set(requestHash, { rows, expiresAt });
+  while (sourceMemoryCache.size > SOURCE_MEMORY_CACHE_MAX) {
+    sourceMemoryCache.delete(sourceMemoryCache.keys().next().value);
+  }
+}
+
+function memorySourceRows(requestHash) {
+  const saved = sourceMemoryCache.get(requestHash);
+  if (!saved) return null;
+  if (saved.expiresAt <= Date.now()) {
+    sourceMemoryCache.delete(requestHash);
+    return null;
+  }
+  sourceMemoryCache.delete(requestHash);
+  sourceMemoryCache.set(requestHash, saved);
+  return saved.rows;
+}
+
+async function readPersistedSourceRows(requestHash) {
+  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return null;
+  try {
+    return await getSourceExportCache(requestHash);
+  } catch {
+    // A migration may be pending during a rolling deployment. Source caching
+    // is an optimisation and must never make a report unavailable.
+    sourceCacheUnavailableUntil = Date.now() + 60_000;
+    return null;
+  }
+}
+
+async function persistSourceRows({ identity, sourceId, rows, cacheHours }) {
+  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return;
+  const deadlineRemaining = remainingDeadlineMs();
+  if (deadlineRemaining !== null && deadlineRemaining < 3000) return;
+  const serialised = JSON.stringify({ rows });
+  const payloadBytes = Buffer.byteLength(serialised, "utf8");
+  if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return;
+  const expiresAt = new Date(Date.now() + cacheHours * 3600_000).toISOString();
+  try {
+    await saveSourceExportCache({
+      ...identity,
+      sourceId: String(sourceId),
+      rows,
+      payloadBytes,
+      expiresAt,
+    });
+    if (Date.now() - sourceCacheLastPrunedAt > 15 * 60_000) {
+      sourceCacheLastPrunedAt = Date.now();
+      await pruneSourceExportCache().catch(() => {});
+    }
+  } catch {
+    sourceCacheUnavailableUntil = Date.now() + 60_000;
+  }
+}
+
+async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit, options) {
+  const identity = sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options });
+  const cacheHours = cacheHoursForSource(sourceId);
+  if (options.bypassSourceCache !== true) {
+    const memoryRows = memorySourceRows(identity.requestHash);
+    if (memoryRows) return memoryRows;
+    const persisted = await readPersistedSourceRows(identity.requestHash);
+    if (persisted?.rows) {
+      const persistedExpiry = Date.parse(persisted.expires_at);
+      rememberSourceRows(
+        identity.requestHash,
+        persisted.rows,
+        Number.isFinite(persistedExpiry) ? persistedExpiry : Date.now() + cacheHours * 3600_000
+      );
+      return persisted.rows;
+    }
+  }
+
+  const existing = sourceExportInflight.get(identity.requestHash);
+  if (existing) return existing;
+
+  const work = (async () => {
+    const created = await createExport(apiKey, sourceId, columns, ids, from, to, limit, options);
+    const exportId = created.exportId || created.id;
+    if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
+    const rows = await downloadExport(apiKey, exportId);
+    const expiresAt = Date.now() + cacheHours * 3600_000;
+    rememberSourceRows(identity.requestHash, rows, expiresAt);
+    // A result on the cap may be truncated. Strict callers reject it; do not
+    // persist it where another report could mistake it for complete data.
+    if (rows.length < limit) {
+      await persistSourceRows({ identity, sourceId, rows, cacheHours });
+    }
+    return rows;
+  })();
+  sourceExportInflight.set(identity.requestHash, work);
+  try {
+    return await work;
+  } finally {
+    sourceExportInflight.delete(identity.requestHash);
+  }
+}
+
 // Run an export for any source, chunking by the 5-id-per-export cap and
-// combining the returned rows.
+// combining the returned rows. Every report reaches DataDoe through this
+// function, so identical source requests are shared across reports and users.
+// The cache key includes the organization, exact account scope, fields, grain,
+// aggregations, date window, row cap and ordering; incompatible requests can
+// never collide.
 export async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
   const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
   const allRows = [];
 
   for (const chunk of chunks) {
-    const created = await createExport(apiKey, sourceId, columns, chunk, from, to, limit, options);
-    const exportId = created.exportId || created.id;
-    if (created.status !== "COMPLETED") {
-      await pollExport(apiKey, exportId);
-    }
-    const rows = await downloadExport(apiKey, exportId);
+    const rows = await fetchSourceChunk(apiKey, sourceId, columns, chunk, from, to, limit, options);
     allRows.push(...rows);
   }
 
