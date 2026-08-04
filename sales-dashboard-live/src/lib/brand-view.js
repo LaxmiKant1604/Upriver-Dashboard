@@ -268,15 +268,26 @@ export function mtdWindow(model, anchorDate) {
 
 /**
  * Inventory cover in days: available FBA units divided by the brand's
- * month-to-date daily unit run rate for that marketplace.
+ * average daily unit sales for the measured report range in that marketplace.
  */
-export function inventoryCoverDays(fbaAvailable, mtdUnits, elapsedDays) {
+export function inventoryCoverDays(fbaAvailable, unitsSold, elapsedDays) {
   if (fbaAvailable === null || fbaAvailable === undefined) return null;
-  if (!Number.isFinite(Number(mtdUnits)) || Number(mtdUnits) <= 0) return null;
+  if (!Number.isFinite(Number(unitsSold)) || Number(unitsSold) <= 0) return null;
   if (!Number.isFinite(Number(elapsedDays)) || Number(elapsedDays) <= 0) return null;
-  const dailyRunRate = Number(mtdUnits) / Number(elapsedDays);
+  const dailyRunRate = Number(unitsSold) / Number(elapsedDays);
   if (dailyRunRate <= 0) return null;
   return Number(fbaAvailable) / dailyRunRate;
+}
+
+/** Inclusive calendar-day count for the report's selected sales window. */
+function daysInSelectedRange(from, to) {
+  const start = parseDateStr(from);
+  const end = parseDateStr(to);
+  if (!start || !end) return null;
+  const startUtc = Date.UTC(start.y, start.m - 1, start.d);
+  const endUtc = Date.UTC(end.y, end.m - 1, end.d);
+  const days = Math.floor((endUtc - startUtc) / 86400000) + 1;
+  return days > 0 ? days : null;
 }
 
 /** TACoS as a fraction. Null unless both a real spend and a real sales base exist. */
@@ -350,14 +361,16 @@ export function shareOf(value, total) {
 export function dailySnapshotRows(model, { from, to }) {
   const ly = lastYearWindow(model, from, to);
   const mtd = mtdWindow(model, to);
+  const selectedRangeDays = daysInSelectedRange(from, to);
   const rows = [];
 
   for (const country of model.countries) {
     const current = rangeSales(country, from, to);
     const adSpend = rangeAdSpend(model, country, from, to);
     const lySales = ly ? rangeSales(country, ly.from, ly.to).sales : null;
-    const mtdUnits = mtd ? rangeSales(country, mtd.from, mtd.to).units : 0;
-    const coverDays = mtd ? inventoryCoverDays(country.fbaAvailable, mtdUnits, mtd.elapsedDays) : null;
+    const coverDays = selectedRangeDays
+      ? inventoryCoverDays(country.fbaAvailable, current.units, selectedRangeDays)
+      : null;
 
     // A marketplace with no sales in the window is still shown when it holds
     // stock for the brand (the "FC only" case), and is hidden otherwise so no
@@ -378,7 +391,7 @@ export function dailySnapshotRows(model, { from, to }) {
       adSpend,
       lySales,
       fbaAvailable: country.fbaAvailable,
-      mtdUnits,
+      coverUnits: current.units,
       coverDays,
       salesOnly: !country.hasSales,
     });
@@ -388,6 +401,7 @@ export function dailySnapshotRows(model, { from, to }) {
     rows,
     lastYearWindow: ly,
     mtd,
+    selectedRangeDays,
     // Passed through so the All Markets row can show a real account-level FBA
     // total when the saved inventory source has no marketplace dimension.
     inventoryScope: model.coverage?.inventoryScope || "unavailable",

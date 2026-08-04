@@ -34,8 +34,6 @@ export const NA = "n/a";
 // while sales figures stay whole units. This mirrors the reference report.
 export const SALES_DECIMALS = 0;
 export const SPEND_DECIMALS = 2;
-// Mean days per calendar month, used to express inventory cover in months.
-const DAYS_PER_MONTH = 30.44;
 
 /* ============================== FORMATTERS ============================== */
 
@@ -73,17 +71,13 @@ export function ratePct(value, decimals = 1) {
  */
 export function coverLabel(days, fallback = DASH) {
   if (days === null || days === undefined || !Number.isFinite(Number(days))) return fallback;
-  return `${(Number(days) / DAYS_PER_MONTH).toFixed(1)}m`;
-}
-
-export function coverMonths(days) {
-  if (days === null || days === undefined || !Number.isFinite(Number(days))) return null;
-  return Number(days) / DAYS_PER_MONTH;
+  const rounded = Math.round(Number(days));
+  return `${rounded.toLocaleString("en-US")} day${rounded === 1 ? "" : "s"}`;
 }
 
 export function coverHint(days) {
   if (days === null || days === undefined || !Number.isFinite(Number(days))) return undefined;
-  return `${Math.round(Number(days)).toLocaleString("en-US")} days of cover at this brand's month-to-date daily unit run rate`;
+  return `${Math.round(Number(days)).toLocaleString("en-US")} days of cover at this brand's average daily unit sales for the selected report range`;
 }
 
 /**
@@ -163,6 +157,45 @@ function currencyBand(group, displayCurrency, index) {
 function showsTotalRow(group, groupCount) {
   return group.rows.length > 1 || groupCount === 1;
 }
+
+// Advertising coverage is still being completed. Keep the calculation data
+// intact for a future re-enable, but remove those columns and weekly metric rows
+// from every rendered table and export today.
+function withoutAdvertisingColumns({ headers, rows }) {
+  const visibleIndexes = headers
+    .map((header, index) => ({ header, index }))
+    .filter(({ header }) => header.key !== "spend" && header.key !== "tacos")
+    .map(({ index }) => index);
+
+  return {
+    headers: visibleIndexes.map((index) => {
+      const header = headers[index];
+      return header.key === "cover"
+        ? {
+          ...header,
+          label: "FBA Cover (days)",
+          hint: "Available FBA units divided by this brand's average daily unit sales in the selected report range.",
+        }
+        : header;
+    }),
+    rows: rows
+      .filter((row) => row.label !== "Ad Spend" && row.label !== "TACoS%")
+      .map((row) => {
+        if (row.kind === "section" || row.kind === "band") return row;
+        const subcells = row.subcells
+          ? Object.fromEntries(visibleIndexes
+            .map((oldIndex, newIndex) => [newIndex, row.subcells[oldIndex]])
+            .filter(([, value]) => value !== undefined))
+          : undefined;
+        return {
+          ...row,
+          cells: visibleIndexes.map((index) => row.cells[index]),
+          hints: row.hints ? visibleIndexes.map((index) => row.hints[index]) : undefined,
+          subcells,
+        };
+      }),
+  };
+}
 /* ============================== 1. DAILY ============================== */
 
 export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
@@ -195,8 +228,10 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
 
     const groupTacos = tacos(group.totals.adSpend, group.totals.sales);
     const groupFba = group.fbaAvailable === null ? unattributedFba : group.fbaAvailable;
-    const groupMtdUnits = group.rows.reduce((sum, row) => sum + (Number(row.mtdUnits) || 0), 0);
-    const groupCover = daily.mtd ? inventoryCoverDays(groupFba, groupMtdUnits, daily.mtd.elapsedDays) : null;
+    const groupRangeUnits = group.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0);
+    const groupCover = daily.selectedRangeDays
+      ? inventoryCoverDays(groupFba, groupRangeUnits, daily.selectedRangeDays)
+      : null;
     if (showsTotalRow(group, groups.length)) rows.push({
       key: `total-${group.key}`,
       kind: "total",
@@ -209,7 +244,7 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
         cell(money(group.totals.adSpend, group.currency, SPEND_DECIMALS), group.totals.adSpend),
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
         cell(groupFba === null ? NA : nInt(groupFba), groupFba),
-        cell(coverLabel(groupCover, NA), coverMonths(groupCover)),
+        cell(coverLabel(groupCover, NA), groupCover),
         cell(nInt(group.units), group.units),
       ],
     });
@@ -230,13 +265,13 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
           cell(money(row.adSpend, row.displayCurrency, SPEND_DECIMALS, converted ? undefined : row.country), row.adSpend),
           cell(ratePct(rowTacos), rowTacos === null ? null : rowTacos * 100),
           cell(row.fbaAvailable === null ? NA : nInt(row.fbaAvailable), row.fbaAvailable),
-          cell(coverLabel(row.coverDays, NA), coverMonths(row.coverDays)),
+          cell(coverLabel(row.coverDays, NA), row.coverDays),
           cell(nInt(row.units), row.units),
         ],
       });
     }
   });
-  return { headers, rows };
+  return withoutAdvertisingColumns({ headers, rows });
 }
 
 /* ============================== 2. MONTHLY ============================== */
@@ -310,7 +345,7 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
       });
     }
   });
-  return { headers, rows };
+  return withoutAdvertisingColumns({ headers, rows });
 }
 
 /* ============================== 3. 7-DAY ============================== */
@@ -394,7 +429,7 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
     });
   }
 
-  return { headers, rows };
+  return withoutAdvertisingColumns({ headers, rows });
 }
 
 /* ========================= THE ONE ENTRY POINT ========================= */

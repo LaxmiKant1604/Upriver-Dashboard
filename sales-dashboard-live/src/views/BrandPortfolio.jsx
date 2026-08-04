@@ -158,9 +158,9 @@ export default function BrandPortfolio({
         fxAttribution: converted ? (fx?.attribution || null) : null,
         freshnessLine: freshnessSummaryLine(model),
         generatedAt: new Date().toISOString(),
-        limitations: model.notes,
+        limitations: model.notes?.filter((note) => !/advertising|tacos/i.test(note)),
         footer: [
-          `Upriver Brand View (portfolio). ${model.brand} across ${accountNames.length} account${accountNames.length === 1 ? "" : "s"}, built from shared Supabase snapshots of their saved Dashboard, Ads and FBA reports.`,
+          `Upriver Brand View (portfolio). ${model.brand} across ${accountNames.length} account${accountNames.length === 1 ? "" : "s"}, built from shared Supabase snapshots of their saved Dashboard and FBA reports.`,
           converted
             ? `Money converted to ${displayCurrency}. ${fx?.attribution || ""}`
             : "Money is shown in each marketplace's original currency and is never summed across currencies.",
@@ -315,9 +315,8 @@ export default function BrandPortfolio({
           <div className="footer-note">
             Portfolio Brand View is a shared Supabase snapshot for this brand and its accounts. A marketplace sold by more
             than one account is one row: their sales and units are added together, and the contributing accounts are named
-            under the country. Ad spend is shown only where every account selling in that marketplace has saved Ads
-            coverage, because a partial sum would understate TACoS. A blank cell means the source cannot answer, never
-            zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
+            under the country. FBA cover is calculated from available FBA units and average daily unit sales in the selected
+            report range. A blank cell means the source cannot answer, never zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
           </div>
         </>
       ) : null}

@@ -118,7 +118,6 @@ export function freshnessSummaryLine(model) {
     coverage.salesCompleteThrough && coverage.salesCompleteThrough !== coverage.salesLatestDate
       ? `all accounts complete through ${coverage.salesCompleteThrough}`
       : null,
-    coverage.adsFrom ? `ads coverage ${coverage.adsFrom} to ${coverage.adsTo}` : "ads coverage unavailable",
     coverage.inventoryDate ? `FBA inventory as of ${coverage.inventoryDate}` : "FBA inventory unavailable",
   ].filter(Boolean).join(" · ");
 }
@@ -222,7 +221,7 @@ export default function BrandReports({
           detail={`Those marketplaces cannot be converted to ${displayCurrency} and are shown as unavailable rather than with a substituted rate. Switch to Original marketplace currency to see their real figures.`}
         />
       )}
-      {model.notes?.map((note) => (
+      {model.notes?.filter((note) => !/advertising|tacos/i.test(note)).map((note) => (
         <DataQualityAlert key={note} tone="info" title="Partial source coverage" detail={note} icon={Info} />
       ))}
 

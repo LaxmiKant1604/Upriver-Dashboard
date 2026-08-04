@@ -208,9 +208,9 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         fxAttribution: converted ? (fx?.attribution || null) : null,
         freshnessLine: freshnessSummaryLine(model),
         generatedAt: new Date().toISOString(),
-        limitations: model.notes,
+        limitations: model.notes?.filter((note) => !/advertising|tacos/i.test(note)),
         footer: [
-          "Upriver Brand View. Built from shared Supabase snapshots of this account's saved Dashboard, Ads and FBA reports.",
+          "Upriver Brand View. Built from shared Supabase snapshots of this account's saved Dashboard and FBA reports.",
           converted
             ? `Money converted to ${displayCurrency}. ${fx?.attribution || ""}`
             : "Money is shown in each marketplace's original currency and is never summed across currencies.",
@@ -390,8 +390,8 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           />
           <div className="footer-note">
             Brand View is a shared Supabase snapshot for this account and brand. Sales come from the saved Dashboard
-            snapshot (Order Line Items joined to Product Catalog), ad spend from saved same-ASIN Amazon Ads rows for this
-            brand only, and FBA inventory from the saved FBA Shipment Plan snapshot. A blank cell means the source cannot
+            snapshot (Order Line Items joined to Product Catalog) and FBA inventory from the saved FBA Shipment Plan snapshot.
+            FBA cover is calculated from available FBA units and average daily unit sales in the selected report range. A blank cell means the source cannot
             answer, never zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
           </div>
         </>

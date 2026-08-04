@@ -397,12 +397,19 @@ test("missing FBA inventory renders unavailable rather than zero", () => {
   assert.ok(bare.every((row) => row.coverDays === null));
 });
 
-test("inventory cover divides available units by the month-to-date daily run rate", () => {
+test("inventory cover divides available units by the selected-range daily run rate", () => {
   // 883 available, 34 MTD units over 27 elapsed days -> 883 / (34/27) days.
   assert.equal(inventoryCoverDays(883, 34, 27), 883 / (34 / 27));
   assert.equal(inventoryCoverDays(883, 0, 27), null, "a zero run rate has no cover, not infinite cover");
   assert.equal(inventoryCoverDays(null, 34, 27), null);
   assert.equal(inventoryCoverDays(883, 34, 0), null);
+});
+
+test("the Daily Snapshot cover uses the selected date range, not a cross-month MTD pace", () => {
+  const daily = dailySnapshotRows(MODEL, { from: "2026-07-26", to: "2026-07-27" });
+  const italy = daily.rows.find((row) => row.country === "IT");
+  assert.equal(daily.selectedRangeDays, 2);
+  assert.equal(italy.coverDays, 883 / (italy.coverUnits / 2));
 });
 
 test("the current-month run rate is actual / elapsed days x days in month", () => {
@@ -901,9 +908,11 @@ test("both reports build the same three tables from the same payload shape", () 
     assert.ok(tables.weeklyTable, `${label}: no weekly table`);
     assert.deepEqual(
       tables.dailyTable.headers.map((header) => header.label),
-      ["Country", "Total Sales", "LY Sales", "Ad Spend", "TACoS%", "FBA Inv.", "Inv Cover", "Units"],
+      ["Country", "Total Sales", "LY Sales", "FBA Inv.", "FBA Cover (days)", "Units"],
       `${label}: unexpected Daily Snapshot columns`
     );
+    assert.ok(!tables.monthlyTable.headers.some((header) => /ad spend|tacos/i.test(header.label)));
+    assert.ok(!tables.weeklyTable.rows.some((row) => /ad spend|tacos/i.test(row.label || "")));
     // A group gets an All Markets row when it actually aggregates more than one
     // marketplace, or when it is the only group and the report needs its top
     // line. A lone marketplace in its own currency is not printed twice.
@@ -927,9 +936,9 @@ test("the portfolio table names the accounts behind a shared marketplace", () =>
   assert.ok(italy.labelTitle.includes("Bebi EU"), "the contributing accounts must be discoverable");
   assert.ok(italy.labelTitle.includes("Bebi Reseller"));
   assert.match(italy.labelTitle, /Combined from 2 accounts/);
-  // Italy has no usable ad coverage across both accounts, so the cell is a dash.
-  assert.equal(italy.cells[3].t, "—");
-  assert.equal(italy.cells[4].t, "—");
+  // Advertising metrics are intentionally absent until coverage is complete.
+  assert.equal(italy.cells.length, 6);
+  assert.equal(italy.cells[3].t, "883");
   // More than one currency, so every group is introduced by a currency band.
   const bands = tables.dailyTable.rows.filter((row) => row.kind === "band");
   assert.equal(bands.length, tables.dailyGroups.length);
@@ -958,15 +967,15 @@ test("a single-currency report has no currency bands and exactly one All Markets
   assert.equal(tables.weeklyTable.rows.filter((row) => row.kind === "total").length, 1);
 });
 
-test("inventory cover reads in months and a marketplace with no FBA record says n/a", () => {
+test("inventory cover reads in selected-range days and a marketplace with no FBA record says n/a", () => {
   const model = brandViewModel(SNAPSHOT);
   const tables = buildBrandTables(model, {
     rangeFrom: model.latestDate, rangeTo: model.latestDate,
     displayCurrency: ORIGINAL_CURRENCY, rates: null,
   });
   const italy = tables.dailyTable.rows.find((row) => row.label?.includes("Italy"));
-  assert.match(italy.cells[6].t, /^\d+\.\d m?$|^\d+\.\dm$/, `expected months, got ${italy.cells[6].t}`);
-  assert.match(italy.hints[6], /days of cover/, "the exact day count stays available in the tooltip");
+  assert.match(italy.cells[4].t, /^\d+ days?$/, `expected days, got ${italy.cells[4].t}`);
+  assert.match(italy.hints[4], /days of cover/, "the exact day count stays available in the tooltip");
   // Poland holds stock but never sold, so it carries the reference's "(FC only)".
   const poland = tables.dailyTable.rows.find((row) => row.label?.includes("Poland"));
   assert.match(poland.label, /\(FC only\)/);
@@ -980,9 +989,8 @@ test("an unavailable value reaches the table as an em dash, never a zero", () =>
   });
   const germany = tables.dailyTable.rows.find((row) => row.label?.includes("Germany"));
   assert.equal(germany.cells[2].t, "—", "no complete last-year window");
-  assert.equal(germany.cells[3].t, "—", "no ads coverage");
   // A real measured value is still a number.
-  assert.ok(germany.cells[7].t !== "—");
+  assert.ok(germany.cells[5].t !== "—");
 });
 
 /* ========================================================== 8. exports */
