@@ -221,7 +221,7 @@ export default function BrandReports({
           detail={`Those marketplaces cannot be converted to ${displayCurrency} and are shown as unavailable rather than with a substituted rate. Switch to Original marketplace currency to see their real figures.`}
         />
       )}
-      {model.notes?.filter((note) => !/advertising|tacos/i.test(note)).map((note) => (
+      {model.notes?.map((note) => (
         <DataQualityAlert key={note} tone="info" title="Partial source coverage" detail={note} icon={Info} />
       ))}
 

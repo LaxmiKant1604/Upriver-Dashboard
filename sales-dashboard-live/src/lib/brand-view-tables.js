@@ -158,10 +158,10 @@ function showsTotalRow(group, groupCount) {
   return group.rows.length > 1 || groupCount === 1;
 }
 
-// Advertising coverage is still being completed. Keep the calculation data
-// intact for a future re-enable, but remove those columns and weekly metric rows
-// from every rendered table and export today.
-function withoutAdvertisingColumns({ headers, rows }) {
+// Advertising coverage is still being completed. Daily and Monthly keep a
+// sales-and-inventory focus, while the 7-Day report exposes the available
+// day-by-day ad spend and TACoS rows for operational monitoring.
+function withoutAdvertisingColumns({ headers, rows }, { showWeeklyAdvertising = false } = {}) {
   const visibleIndexes = headers
     .map((header, index) => ({ header, index }))
     .filter(({ header }) => header.key !== "spend" && header.key !== "tacos")
@@ -179,7 +179,7 @@ function withoutAdvertisingColumns({ headers, rows }) {
         : header;
     }),
     rows: rows
-      .filter((row) => row.label !== "Ad Spend" && row.label !== "TACoS%")
+      .filter((row) => showWeeklyAdvertising || (row.label !== "Ad Spend" && row.label !== "TACoS%"))
       .map((row) => {
         if (row.kind === "section" || row.kind === "band") return row;
         const subcells = row.subcells
@@ -429,7 +429,7 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
     });
   }
 
-  return withoutAdvertisingColumns({ headers, rows });
+  return withoutAdvertisingColumns({ headers, rows }, { showWeeklyAdvertising: true });
 }
 
 /* ========================= THE ONE ENTRY POINT ========================= */

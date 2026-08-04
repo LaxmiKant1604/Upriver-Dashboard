@@ -208,9 +208,9 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         fxAttribution: converted ? (fx?.attribution || null) : null,
         freshnessLine: freshnessSummaryLine(model),
         generatedAt: new Date().toISOString(),
-        limitations: model.notes?.filter((note) => !/advertising|tacos/i.test(note)),
+        limitations: model.notes,
         footer: [
-          "Upriver Brand View. Built from shared Supabase snapshots of this account's saved Dashboard and FBA reports.",
+          "Upriver Brand View. Built from shared Supabase snapshots of this account's saved Dashboard, Ads and FBA reports.",
           converted
             ? `Money converted to ${displayCurrency}. ${fx?.attribution || ""}`
             : "Money is shown in each marketplace's original currency and is never summed across currencies.",

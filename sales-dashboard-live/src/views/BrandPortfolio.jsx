@@ -158,9 +158,9 @@ export default function BrandPortfolio({
         fxAttribution: converted ? (fx?.attribution || null) : null,
         freshnessLine: freshnessSummaryLine(model),
         generatedAt: new Date().toISOString(),
-        limitations: model.notes?.filter((note) => !/advertising|tacos/i.test(note)),
+        limitations: model.notes,
         footer: [
-          `Upriver Brand View (portfolio). ${model.brand} across ${accountNames.length} account${accountNames.length === 1 ? "" : "s"}, built from shared Supabase snapshots of their saved Dashboard and FBA reports.`,
+          `Upriver Brand View (portfolio). ${model.brand} across ${accountNames.length} account${accountNames.length === 1 ? "" : "s"}, built from shared Supabase snapshots of their saved Dashboard, Ads and FBA reports.`,
           converted
             ? `Money converted to ${displayCurrency}. ${fx?.attribution || ""}`
             : "Money is shown in each marketplace's original currency and is never summed across currencies.",

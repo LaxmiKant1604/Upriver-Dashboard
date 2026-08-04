@@ -912,7 +912,8 @@ test("both reports build the same three tables from the same payload shape", () 
       `${label}: unexpected Daily Snapshot columns`
     );
     assert.ok(!tables.monthlyTable.headers.some((header) => /ad spend|tacos/i.test(header.label)));
-    assert.ok(!tables.weeklyTable.rows.some((row) => /ad spend|tacos/i.test(row.label || "")));
+    assert.ok(tables.weeklyTable.rows.some((row) => row.label === "Ad Spend"));
+    assert.ok(tables.weeklyTable.rows.some((row) => row.label === "TACoS%"));
     // A group gets an All Markets row when it actually aggregates more than one
     // marketplace, or when it is the only group and the report needs its top
     // line. A lone marketplace in its own currency is not printed twice.
