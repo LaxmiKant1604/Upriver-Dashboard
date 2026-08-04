@@ -1,0 +1,76 @@
+name: scheduled-sync
+
+# Authoritative driver for the website-wide scheduled DataDoe sync.
+#
+# Vercel's 60s function cap means one call to /api/cron/sync?bucket=<b> does only a
+# bounded slice and returns { drained }. This workflow fires at the exact bucket
+# times and calls the endpoint in a loop until it reports drained:true. It is
+# idempotent + lock-protected server-side, so repeated calls are always safe.
+#
+# Buckets:
+#   non-us -> 02:00 UTC (07:30 IST)   -- CA/AU/IN/EU/GB/...
+#   us     -> 10:30 UTC (16:00 IST)   -- Amazon US marketplace only
+#
+# Required GitHub repository secrets:
+#   SYNC_ENDPOINT  e.g. https://upriverdashboard.vercel.app/api/cron/sync
+#   CRON_SECRET    the same value set in Vercel (never printed by this workflow)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"    # non-us
+    - cron: "30 10 * * *"  # us
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Bucket to sync (us | non-us)"
+        required: true
+        default: "non-us"
+
+concurrency:
+  group: scheduled-sync-${{ github.event.schedule || github.event.inputs.bucket }}
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve bucket from trigger
+        id: b
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
+            echo "bucket=non-us" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "30 10 * * *" ]; then
+            echo "bucket=us" >> "$GITHUB_OUTPUT"
+          else
+            echo "bucket=${{ github.event.inputs.bucket }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Drain bucket until drained
+        env:
+          ENDPOINT: ${{ secrets.SYNC_ENDPOINT }}
+          SECRET: ${{ secrets.CRON_SECRET }}
+          BUCKET: ${{ steps.b.outputs.bucket }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENDPOINT:-}" ] || [ -z "${SECRET:-}" ]; then
+            echo "Missing SYNC_ENDPOINT or CRON_SECRET secret." >&2
+            exit 1
+          fi
+          for i in $(seq 1 40); do
+            resp=$(curl -sS -X POST "${ENDPOINT}?bucket=${BUCKET}&trigger=cron-github" \
+              -H "Authorization: Bearer ${SECRET}" -w $'\n%{http_code}')
+            code=$(printf '%s' "$resp" | tail -n1)
+            body=$(printf '%s' "$resp" | sed '$d')
+            echo "iteration=$i http=$code body=$body"
+            if [ "$code" != "200" ]; then
+              echo "Non-200 from sync endpoint; aborting." >&2
+              exit 1
+            fi
+            if printf '%s' "$body" | grep -q '"drained":true'; then
+              echo "Bucket ${BUCKET} drained after ${i} call(s)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Reached iteration cap without draining bucket ${BUCKET}; will complete on the next scheduled run."
