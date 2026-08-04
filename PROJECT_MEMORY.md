@@ -1,6 +1,125 @@
 # Project Memory
 
-Last updated: 2026-08-04 (Portfolio Brand View upgraded to the new report format)
+Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
+
+## Brand View: multi-currency brands now open as one clean table (2026-08-04)
+
+### The problem the owner reported
+
+The owner's reference layout (a single-currency brand, e.g. "Bebi Born" all in
+EUR) shows the clean shape: one coloured **All Markets** total row, flags, no
+dividers. But a genuinely multi-currency brand (e.g. "Caruso Italy" — AUD, CAD,
+INR, USD) opened in **Original marketplace currency** mode, which the table
+builder renders as stacked **currency bands** (`AUD · 1 MARKETPLACE`) with no
+single All Markets total. That is correct behaviour — you cannot sum
+A$ + C$ + ₹ + $ into one number — but it is not the layout the owner wanted.
+
+### Why it looked different (this was NOT two components)
+
+Both Brand View pages render through the same `src/views/BrandReports.jsx`, and
+`src/lib/brand-view-tables.js` chooses the layout purely from **how many
+currencies are in the data**: one currency → clean single table with an All
+Markets row; more than one → currency bands, no cross-currency total. Nothing was
+broken. The only reason Caruso showed bands is that the portfolio page **defaulted
+the currency selector to Original**, and Caruso trades in four currencies.
+
+### The fix — a data-driven default currency (no table-logic change)
+
+New shared hook **`useBrandCurrency(model, resetKey)`** in
+`src/views/brand-controls.jsx`. Until the user picks a currency, it follows the
+data:
+
+- **Multi-currency brand** (more than one distinct marketplace currency in
+  `model.countries`) → default to **`DEFAULT_REPORT_CURRENCY` = "USD"** (a named
+  export at the top of `brand-controls.jsx`; change that one line to make INR or
+  another currency the default). Converting to one currency collapses the bands
+  into the same single clean All Markets table as the reference.
+- **Single-currency brand** → stay in **Original** (its own currency), which
+  already renders as the reference single-table shape. So an all-EUR brand like
+  Bebi Born still shows €, unchanged.
+- The moment the user picks a currency themselves, `userChosen` latches and the
+  data no longer overrides them. A new brand/scope (`resetKey`) forgets that
+  choice so the next brand gets its own sensible default. `resetKey` is
+  `` `${accountId}::${brand}` `` on the account page and `` `${brand}::${idsKey}` ``
+  on the portfolio page.
+
+Wired into both `src/views/BrandView.jsx` and `src/views/BrandPortfolio.jsx`:
+the local `useState(ORIGINAL_CURRENCY)` was replaced by the hook, and `model` is
+now computed **before** `useFxRates` so the hook can read the data's currencies.
+USD is the FX base, so no cross-rate is derived for the default. Converting still
+needs the cached FX table; if a rate is missing the report shows the usual banner
+and a dash, never a substituted number, and Original is one dropdown click away.
+
+### Verification (2026-08-04)
+
+- `npm run verify` green: insight assertions + **59 Brand View assertions** +
+  production build (1,119.79 kB main chunk). No table-shape test changed; the
+  "single-currency report has no currency bands and exactly one All Markets row"
+  assertion still passes because the builder was untouched — only the default
+  currency selection changed.
+
+### Deployment (2026-08-04)
+
+- Commit `9d56efe` deployed from the repository root as Vercel deployment
+  `dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda` (target production, READY).
+- Stable alias **https://upriverdashboard.vercel.app** returned HTTP 200 and
+  serves the new bundle `assets/index-2PJr_5FU.js` (also HTTP 200). The default
+  reporting currency ("USD") is minified/inlined, so it is verified by the fresh
+  bundle hash rather than by a string search.
+- Local `main` holds commits `9d56efe` (code) and the follow-up memory commit.
+  Neither was pushed to `origin`
+  (github.com/LaxmiKant1604/Upriver-Dashboard) — push when you want GitHub in
+  sync; production is already live regardless.
+
+## Syncing all brands from BOTH DataDoe organisations (mechanism, 2026-08-04)
+
+The owner asked to "sync all brands from both DataDoe accounts". This is a
+**runtime admin action that already spans both orgs — there is no code change and
+no CLI script that can do it**, and it cannot be run from a developer workstation
+(DataDoe returns HTTP 403 to non-Vercel IPs, and the endpoint needs the admin's
+signed-in bearer token).
+
+### How the sync works (already implemented, both orgs covered)
+
+- Both keys are read only in `getDataDoeConnections()`
+  (`lib/server/datadoe-connections.js`): `DATADOE_API_KEY` (required) and
+  `DATADOE_API_KEY_SECONDARY` (optional; secondary accounts get a stable
+  `dd-secondary:` id prefix so raw ids can't cross an org boundary).
+- `discoverConnectedAccounts()` (`api/datadoe.js`) iterates **every** connection,
+  so both orgs are covered anywhere it runs.
+- **Trigger:** the **"Load portfolio brands"** button in
+  `src/views/BrandPortfolio.jsx` → `fetchBrandDirectory` in `src/App.jsx` →
+  `GET /api/datadoe?action=brand-directory&refresh=1`. Only on `refresh=1` does
+  the server run cross-org discovery, filter to the signed-in user's permitted
+  accounts, build the brand→account **v2** map (`brandAccounts`) from saved
+  Supabase snapshots, and persist both the `brand-directory`
+  (`brand-directory-shared-v2`) and `account-directory`
+  (`account-directory-shared-v1`) snapshots for every user.
+- The brand list itself spends **no** DataDoe export — it is read from each
+  account's saved snapshots (`catalogBrands` / row-level brand fields).
+
+### Steps for the owner to actually sync both orgs
+
+1. Sign in as an administrator and open the header **Brand view** (portfolio).
+2. Click **Load portfolio brands** once. This discovers accounts across both
+   DataDoe orgs and rebuilds the shared brand directory for all users.
+3. For any **secondary-org account that shows no brands**: a brand only appears
+   once that account has at least one saved snapshot. Open Account View for it and
+   refresh its Dashboard (or SKU P&L) once; its brands then appear for everyone.
+
+### Known gaps in the sync (candidates for a future hardening pass)
+
+- Discovery is **refresh-gated** by design (ordinary reads are Supabase-only to
+  avoid DataDoe cost), so newly added secondary accounts are invisible until a
+  manual "Load portfolio brands".
+- A non-admin only sees accounts explicitly granted to them.
+- An account with **no saved snapshot contributes zero brands** (returned as
+  `unresolvedAccountIds`, `partial: true`).
+- If the **same raw account id exists in both orgs**, `discoverConnectedAccounts`
+  (and the Ads cron's `runAdsSync`) **throw and abort the whole discovery**, not
+  just the duplicate. Making that non-fatal (skip/prefix and continue) would make
+  the cross-org sync robust to one collision — offered to the owner as an optional
+  follow-up, not yet done.
 
 ## Portfolio Brand View upgraded to the shared format (2026-08-04)
 
