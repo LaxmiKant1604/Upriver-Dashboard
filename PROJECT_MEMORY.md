@@ -7,7 +7,8 @@
 - Account discovery now merges by the existing public, connection-scoped ID. Primary remains unchanged; the secondary account is retained as `dd-secondary:<raw-id>`. A regression test covers the same raw ID occurring in both connections.
 - Applied the same connection-scoped identity rule to the automated Ads sync so a matching raw ID cannot abort the scheduled cross-organisation job.
 - Verification complete: `npm run verify` passed (54 shared/report assertions, 59 Brand View assertions, and the full production build).
-- Pending: deploy, then run one Brand View directory refresh to seed the shared directory with all currently connected accounts.
+- Deployed to production: `dpl_DVpnYRQwwpzGGhnpqvzm3uViyY4j` (`https://upriverdashboard.vercel.app`).
+- Next user action: open **Brand view** and use **Load portfolio brands** once. This explicitly refreshes the shared directory from both DataDoe organisations; after it completes, every authorised user reads the same saved list without another DataDoe request.
 
 Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
 
