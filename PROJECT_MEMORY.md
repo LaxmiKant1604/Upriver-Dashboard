@@ -37,7 +37,7 @@
 - Deployed the grouped catalog-error UX: `dpl_7J1FnZY4ycXLsTsuxuwKXuyUpGAA` (`https://upriverdashboard.vercel.app`). The next manual directory sync will reveal the precise DataDoe Product Catalog failure for the secondary connection, while keeping the successfully cached primary brands available.
 - Confirmed from the secondary DataDoe Settings screenshot: **Product Catalog by ASIN** and **Product Catalog by ASIN (Raw JSON)** are enabled, but both show **0 rows**. This is the direct reason secondary brands cannot appear in Brand View: DataDoe has not populated any catalog records for that organisation's connected Amazon accounts. Enabling the table alone is insufficient; the upstream Amazon connection/catalog ingestion must be backfilled or reconnected in DataDoe before any dashboard code can discover those brand names.
 
-Last updated: 2026-08-04 (Scheduled-sync foundation deployed; live non-US validation exposed and fixed transient timeout handling)
+Last updated: 2026-08-04 (Scheduled-sync foundation deployed and production-validated; upstream DataDoe coverage remains partial)
 
 ## Scheduled-sync SaaS foundation — deployed (2026-08-04)
 
@@ -169,6 +169,18 @@ in the same transaction.
   Re-enable it only after its adapter persists sub-export checkpoints across
   serverless invocations. This leaves the proven four Ads sources + `brand-sales`
   enabled in Phase 1.
+- Timeout hardening is commit `52a3234`; the long-adapter safety gate is commit
+  `390c927`. The final production deployment is
+  `dpl_Dwffk1isyiLuJYinbWKNkuGb9Lvs`
+  (`https://upriver-dashboard-jvp35ux0n-laxmikant1604s-projects.vercel.app`),
+  aliased to `https://upriverdashboard.vercel.app` and verified `READY`.
+- Final non-US validation run `30929409568` returned HTTP 200 and
+  `drained:true` on its first call: 46 enabled targets, 19 already-successful
+  targets skipped, 27 terminal `brand-sales` failures, zero deferred targets,
+  and no 504. GitHub correctly marked the run failed because terminal upstream
+  failures remain; that red status is intentional operational visibility, not a
+  scheduler/authentication failure. DataDoe source access/credits must be fixed
+  before all 38 non-US accounts can receive Dashboard snapshots.
 
 ### Why the 60s cap needs the GitHub driver
 
