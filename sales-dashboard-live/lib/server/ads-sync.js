@@ -17,7 +17,7 @@ const MANAGED_COUNTRIES = new Set(["IN", "US", "CA", "AU"]);
 const MIN_REQUEST_INTERVAL_MS = 550;
 let lastDataDoeRequestAt = 0;
 
-const ADS_SOURCES = [
+export const ADS_SOURCES = [
   {
     key: "campaign-performance-v1",
     sourceId: "08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c",

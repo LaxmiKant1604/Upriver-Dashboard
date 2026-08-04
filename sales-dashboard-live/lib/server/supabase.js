@@ -337,6 +337,149 @@ export async function upsertAdDailyMetrics(rows) {
   });
 }
 
+/* ===================== SCHEDULED SYNC (foundation) =====================
+ * Thin wrappers over the private service-role `request()`. All of these run
+ * server-side only; the browser never calls them. Tables are created by
+ * supabase/migrations/20260805_scheduled_sync.sql. sync_targets / sync internals
+ * are RLS-no-policy (service-role only); users see status via the account-scoped
+ * endpoint in api/sync.js. */
+
+/**
+ * Upsert the discovered account directory. `first_seen_at` is intentionally NOT
+ * in the payload, so a conflict update keeps the original discovery time (the DB
+ * default fills it only on first insert).
+ */
+export async function upsertAccountDirectory(rows) {
+  if (!rows.length) return;
+  const nowIso = new Date().toISOString();
+  const body = rows.map((r) => ({
+    account_id: r.accountId,
+    connection_id: r.connectionId || "primary",
+    marketplace_country_code: r.country || "",
+    currency: r.currency || "",
+    name: r.name || "",
+    sync_bucket: r.bucket || "unknown",
+    last_seen_at: nowIso,
+  }));
+  await request("/rest/v1/account_directory?on_conflict=account_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body,
+  });
+}
+
+export async function getAccountDirectoryRows(accountIds) {
+  const params = new URLSearchParams({
+    select: "account_id,connection_id,marketplace_country_code,currency,name,sync_bucket,last_seen_at",
+  });
+  if (accountIds && accountIds.length) params.set("account_id", `in.(${accountIds.map((id) => `"${id}"`).join(",")})`);
+  return request(`/rest/v1/account_directory?${params}`);
+}
+
+export async function insertSyncRun({ bucket, trigger, createdBy = null }) {
+  const rows = await request("/rest/v1/sync_runs", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: { bucket, trigger, status: "running", created_by: createdBy },
+  });
+  return rows[0];
+}
+
+export async function updateSyncRun(id, { status, finishedAt, counts }) {
+  const body = {};
+  if (status !== undefined) body.status = status;
+  if (finishedAt !== undefined) body.finished_at = finishedAt;
+  if (counts !== undefined) body.counts = counts;
+  await request(`/rest/v1/sync_runs?id=eq.${id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body,
+  });
+}
+
+export async function getSyncTargets({ reportKeys, accountIds } = {}) {
+  const params = new URLSearchParams({
+    select: "report_key,account_id,last_status,last_attempt_at,last_success_at,source_refreshed_at,latest_data_date,attempts,next_eligible_at,last_error",
+  });
+  if (reportKeys && reportKeys.length) params.set("report_key", `in.(${reportKeys.map((k) => `"${k}"`).join(",")})`);
+  if (accountIds && accountIds.length) params.set("account_id", `in.(${accountIds.map((id) => `"${id}"`).join(",")})`);
+  return request(`/rest/v1/sync_targets?${params}`);
+}
+
+export async function upsertSyncTarget(target) {
+  const body = {
+    report_key: target.reportKey,
+    account_id: target.accountId,
+    last_run_id: target.lastRunId || null,
+    last_status: target.lastStatus,
+    last_attempt_at: target.lastAttemptAt || null,
+    attempts: target.attempts != null ? target.attempts : 0,
+    next_eligible_at: target.nextEligibleAt || new Date().toISOString(),
+  };
+  // Only advance success markers on an actual success, so a later failure never
+  // erases the last-known-good timestamps.
+  if (target.lastStatus === "succeeded") {
+    body.last_success_at = target.lastSuccessAt || new Date().toISOString();
+    if (target.sourceRefreshedAt) body.source_refreshed_at = target.sourceRefreshedAt;
+    if (target.latestDataDate) body.latest_data_date = target.latestDataDate;
+    body.last_error = null;
+  } else if (target.lastError !== undefined) {
+    body.last_error = target.lastError ? String(target.lastError).slice(0, 1000) : null;
+  }
+  await request("/rest/v1/sync_targets?on_conflict=report_key,account_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body,
+  });
+}
+
+export async function insertSyncError({ runId, reportKey = "", accountId = "", phase, message }) {
+  await request("/rest/v1/sync_errors", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: {
+      run_id: runId || null,
+      report_key: reportKey,
+      account_id: accountId,
+      phase,
+      message: String(message || "").slice(0, 2000),
+    },
+  }).catch(() => {});
+}
+
+export async function insertAuditLog({ actorUserId = null, action, target = {} }) {
+  await request("/rest/v1/audit_log", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: { actor_user_id: actorUserId, action, target },
+  }).catch(() => {});
+}
+
+export async function getReportSnapshotsMeta({ reportKeys, accountIds } = {}) {
+  const params = new URLSearchParams({
+    select: "report_key,account_id,params,source_refreshed_at,updated_at,payload_bytes",
+    order: "updated_at.desc",
+  });
+  if (reportKeys && reportKeys.length) params.set("report_key", `in.(${reportKeys.map((k) => `"${k}"`).join(",")})`);
+  if (accountIds && accountIds.length) params.set("account_id", `in.(${accountIds.map((id) => `"${id}"`).join(",")})`);
+  return request(`/rest/v1/report_snapshots?${params}`);
+}
+
+/**
+ * Retention: delete snapshots for one report_key older than a cutoff. Keeps the
+ * newest rows (which are always more recent than the cutoff). Best-effort.
+ */
+export async function deleteReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
+  const params = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    updated_at: `lt.${cutoffIso}`,
+  });
+  await request(`/rest/v1/report_snapshots?${params}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  }).catch(() => {});
+}
+
 export async function getAdDailyMetrics(accountId, from, to) {
   const query = new URLSearchParams({
     select: "metric_date,currency,ad_sales,ad_spend,ad_clicks",

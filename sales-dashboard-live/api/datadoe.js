@@ -610,6 +610,43 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
   }
 }
 
+/**
+ * Build the Dashboard (brand-sales) payload for one account, headlessly.
+ *
+ * Co-located here so it reuses the module-scoped source ids, columns and the
+ * orderSalesByBrand/catalogBrandNames helpers in place (no risky cross-file move).
+ * Shared by the `action=brand-sales` refresh handler below AND the scheduled-sync
+ * report adapter (lib/server/sync/adapters/brand-sales.js), so the calculation has
+ * exactly one implementation. `ids` is the account's raw seller/vendor id(s).
+ */
+export async function buildBrandSalesPayload({ apiKey, ids, from, to }) {
+  const sellerOrVendorIds = (Array.isArray(ids) ? ids : String(ids).split(",")).filter(Boolean);
+  const rawRows = await fetchExportRows(
+    apiKey,
+    ORDER_LINE_ITEMS_SOURCE_ID,
+    ORDER_SALES_COLUMNS,
+    sellerOrVendorIds,
+    from,
+    to,
+    ORDER_SALES_ROW_LIMIT,
+    { groupBy: ORDER_SALES_GROUP_BY, aggregations: ORDER_SALES_AGGREGATIONS }
+  );
+  const catalog = await fetchExportRows(
+    apiKey,
+    PRODUCT_CATALOG_SOURCE_ID,
+    PRODUCT_CATALOG_COLUMNS,
+    sellerOrVendorIds,
+    from,
+    to,
+    CATALOG_ROW_LIMIT,
+    { orderByColumn: "child_asin" }
+  );
+  const rows = orderSalesByBrand(rawRows, catalog);
+  // Derive the brand list from the account's already-joined sales rows, never
+  // from wider catalog metadata, so the header brand filter cannot exceed scope.
+  return { rows, catalogBrands: catalogBrandNames(rows) };
+}
+
 async function discoverConnectedAccounts(connections) {
   const accountsByConnection = [];
   for (const connection of connections) {
@@ -1574,33 +1611,9 @@ export default async function handler(req, res) {
         res.status(400).json({ error: "Dashboard refresh requires exactly one selected account." });
         return;
       }
-      const rawRows = await fetchExportRows(
-        apiKey,
-        ORDER_LINE_ITEMS_SOURCE_ID,
-        ORDER_SALES_COLUMNS,
-        sellerOrVendorIds,
-        from,
-        to,
-        ORDER_SALES_ROW_LIMIT,
-        { groupBy: ORDER_SALES_GROUP_BY, aggregations: ORDER_SALES_AGGREGATIONS }
-      );
-      const catalog = await fetchExportRows(
-        apiKey,
-        PRODUCT_CATALOG_SOURCE_ID,
-        PRODUCT_CATALOG_COLUMNS,
-        sellerOrVendorIds,
-        from,
-        to,
-        CATALOG_ROW_LIMIT,
-        { orderByColumn: "child_asin" }
-      );
-      const rows = orderSalesByBrand(rawRows, catalog);
-      // Product Catalog metadata must never be allowed to widen the header's
-      // brand selector beyond this account's actual sales scope.  Some
-      // catalog exports can contain historical metadata that is not present
-      // in the requested sales range; derive the response list from the
-      // account's already-joined rows instead.
-      await sendLegacyPayload({ rows, catalogBrands: catalogBrandNames(rows) });
+      // Single implementation, shared with the scheduled-sync adapter.
+      const payload = await buildBrandSalesPayload({ apiKey, ids: sellerOrVendorIds, from, to });
+      await sendLegacyPayload(payload);
       return;
     }
 
