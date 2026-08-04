@@ -37,7 +37,152 @@
 - Deployed the grouped catalog-error UX: `dpl_7J1FnZY4ycXLsTsuxuwKXuyUpGAA` (`https://upriverdashboard.vercel.app`). The next manual directory sync will reveal the precise DataDoe Product Catalog failure for the secondary connection, while keeping the successfully cached primary brands available.
 - Confirmed from the secondary DataDoe Settings screenshot: **Product Catalog by ASIN** and **Product Catalog by ASIN (Raw JSON)** are enabled, but both show **0 rows**. This is the direct reason secondary brands cannot appear in Brand View: DataDoe has not populated any catalog records for that organisation's connected Amazon accounts. Enabling the table alone is insufficient; the upstream Amazon connection/catalog ingestion must be backfilled or reconnected in DataDoe before any dashboard code can discover those brand names.
 
-Last updated: 2026-08-04 (Brand View opens multi-currency brands as one clean table — deployed dpl_E3u3iMpdahpAuEwEUEMGw3zfVkda; brand-sync mechanism documented)
+Last updated: 2026-08-04 (Scheduled-sync FOUNDATION implemented — NOT deployed, awaiting Codex review)
+
+## Scheduled-sync SaaS foundation — implemented, NOT deployed (2026-08-04)
+
+Phase 1 ("foundation first") of the website-wide scheduled DataDoe sync requested
+above. Built, `npm run verify` green (incl. **18 new sync assertions** + full
+build), **not committed-for-deploy / not deployed** — Codex reviews first. The app
+was already cache-first (reads are Supabase-only); this adds the server-side
+scheduled refresh so no user interaction ever triggers DataDoe, and removes the
+need for manual per-page refresh (UI removal is a declared follow-up phase).
+
+### Schedule (exact)
+
+- **non-US** bucket → **02:00 UTC** (07:30 IST) — `account.country !== "US"` (CA/AU/IN/EU/GB/…).
+- **US** bucket → **10:30 UTC** (16:00 IST) — `account.country === "US"` only.
+- Classification is metadata-driven (`bucketForCountry`, from DataDoe
+  `marketplaceCountryCode`); **unknown/empty country is logged to `sync_errors` and
+  skipped, never mis-bucketed**.
+
+### What was built (files)
+
+- **Migration** `supabase/migrations/20260805_scheduled_sync.sql` (additive only):
+  `account_directory`, `sync_runs`, `sync_targets` (RLS-no-policy = service-role
+  only), `sync_errors`, `audit_log`. Reuses `touch_updated_at()`,
+  `is_dashboard_admin()`, and `report_refresh_locks` + `claim_report_refresh_lock`
+  (no new lock table, no heartbeat RPC).
+- **Registry** `lib/server/sync/registry.js` — the single declarative source of
+  truth. Enabled this pass: the 4 Ads sources + `brand-sales` + `sales-movers`.
+  Declared but `enabled:false` (follow-up): `fba-plan`, `daily-reporting`,
+  `reconciliation`, `sku-pl`, `keyword-rank`, `content-changes`, `listing-health`,
+  `buy-box-loss`, `returns-leakage`, `ppc-performance`, `listing-optimizer`.
+  **Honest limitation encoded in-file:** a new report joins only by adding an entry
+  + adapter; no arbitrary-code discovery.
+- **Orchestrator** `lib/server/sync/run-sync.js` (`runScheduledSync({bucket})`):
+  per-bucket lock (90s, reused RPC) → open `sync_runs` → discover both orgs +
+  upsert `account_directory` + classify → ordered work list → bounded ~50s loop
+  with per-target lock, idempotent build-then-save, checkpoint to `sync_targets`,
+  errors to `sync_errors`, **continue-on-failure** → retention (when drained) →
+  finalize + `audit_log`. Returns `{drained, remaining, counts}`.
+- **Adapters** `lib/server/sync/adapters/*`: `report-adapter.js` (generic, reuses
+  existing builders, keeps last-known-good — save only on success), `ads.js`
+  (pass-through to existing `runAdsSync`), `index.js` (build map; the only module
+  importing `api/datadoe.js`).
+- **Endpoints**: `api/cron/sync.js` (`?bucket=`, Bearer `CRON_SECRET` via
+  `verifyCronRequest`); `api/sync.js` (`POST` = admin-only "Sync now" via
+  `assertAdmin`, rate-limited + audited, runs the scheduled path — never per-page
+  DataDoe; `GET` = read-only account-scoped sync status). `lib/server/sync/status.js`
+  (pure shaper; non-admin sees strictly their own accounts).
+- **Supabase helpers** added to `lib/server/supabase.js` (service-role wrappers):
+  `upsertAccountDirectory`, `getAccountDirectoryRows`, `insert/updateSyncRun`,
+  `getSyncTargets`, `upsertSyncTarget`, `insertSyncError`, `insertAuditLog`,
+  `getReportSnapshotsMeta`, `deleteReportSnapshotsOlderThan`.
+- **Builder extraction (behavior-preserving):** `buildBrandSalesPayload({apiKey,ids,from,to})`
+  is now a co-located named export in `api/datadoe.js`; the `action=brand-sales`
+  handler calls it (single implementation). `ADS_SOURCES` is now exported.
+- **Driver**: `.github/workflows/scheduled-sync.yml` (repo root) — fires at exact
+  02:00 / 10:30 UTC, loops the endpoint until `"drained":true`. `vercel.json` gets
+  two best-effort daily crons (`/api/cron/sync?bucket=non-us` @ `0 2 * * *`,
+  `?bucket=us` @ `30 10 * * *`) + security headers (HSTS, CSP, nosniff,
+  frame-options, referrer/permissions policy).
+- **Tests** `scripts/test-sync.mjs` (wired into `npm run verify`): 18 assertions —
+  bucket US/non-us/unknown, schedule constants ↔ vercel.json, registry coverage +
+  enabled set + reportVersions, `dd-secondary:` namespacing + cross-org block,
+  batch ≤5, lock acquire/release/concurrent-blocked (emulated RPC), last-known-good
+  on build/validation failure, ads natural-key dedup, non-admin status isolation.
+
+### Why the 60s cap needs the GitHub driver
+
+One Vercel invocation is capped at 60s; a full bucket (≈15 accounts × multi-export
+reports, 20–46s each) cannot drain in one call. The endpoint does a bounded slice
+and returns `drained:false`; the GitHub Actions loop re-calls until drained.
+Idempotency lives in `sync_targets` + natural-key upserts, not the lock — a call
+killed at 60s wrote nothing partial (snapshots save only on success). Vercel Hobby
+crons are hour-imprecise and don't loop, so they are a best-effort kick-starter
+only; the 90s bucket lock de-dups a Vercel + GitHub double-fire.
+
+### Security decisions
+
+- No true E2EE (documented): the server must read data to ingest/compute. Secrets
+  stay server-only (`CRON_SECRET`, `DATADOE_API_KEY[_SECONDARY]`, Supabase
+  service-role); browsers use RLS via `account_permissions`. TLS + Supabase
+  encryption at rest. CSP allows self + Google Fonts (`fonts.googleapis.com` /
+  `fonts.gstatic.com`) + Supabase (`https://*.supabase.co`, `wss://*.supabase.co`);
+  **DataDoe origin deliberately absent** (browser never calls it).
+- `api/sync.js` POST is admin-only + per-user rate-limited (3/60s) + audited.
+
+### Env / setup for Codex before enabling
+
+- Vercel (already present): `CRON_SECRET`, `DATADOE_API_KEY`,
+  `DATADOE_API_KEY_SECONDARY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`/
+  `SUPABASE_SECRET_KEY`, `DASHBOARD_APP_URL`.
+- GitHub repo secrets (new): `SYNC_ENDPOINT` (e.g.
+  `https://upriverdashboard.vercel.app/api/cron/sync`) and `CRON_SECRET` (same value).
+- Apply the migration: `npm run db:migrate` (adds the 5 tables; additive/idempotent).
+
+### Known limitations / risks (for review)
+
+1. **Adapters unvalidated against live DataDoe** — no DataDoe key in this workspace.
+   Verify `brand-sales` + `sales-movers` sync on a preview.
+2. **`reportVersion` alignment** — enabled ones are verbatim from the browser
+   (`brand-sales-shared-v1`, `sales-movers-v1`). If a scheduled window differs from
+   a user's chosen range, the existing `getLatestReportSnapshot` stale fallback
+   still serves the newest scheduled snapshot. Insight reportVersions for the
+   `enabled:false` entries must be reconfirmed against the exported `*_VERSION`
+   constant when enabling.
+3. **fba-plan deferred** — its handler is larger/entangled (isUS discovery, many
+   helpers). Extract `buildFbaPlanPayload({apiKey,ids,to})` co-located in
+   `api/datadoe.js` (like brand-sales), add to `adapters/index.js`, flip
+   `enabled:true`. One report adapter per account per call; keep 6-month reports
+   (`reconciliation`,`sku-pl`) disabled until windowed checkpointing.
+4. **CA re-bucketing** — legacy ads crons group US+CA as "americas"; the new
+   bucketing puts CA in non-us. Legacy 16 ads crons are left running during
+   transition; the shared 600s ads lock prevents double-spend. Reconcile/remove
+   legacy crons in follow-up.
+5. **CSP `script-src 'self'`** — verify no inline bootstrap in the built
+   `dist/index.html` in a preview (watch console for CSP violations); the app uses
+   inline styles so `style-src 'unsafe-inline'` is retained.
+6. **Vercel cron/function count** — now 18 crons + 5 functions
+   (`datadoe`, `access`, `cron/[scope]`, `cron/sync`, `sync`). If the plan rejects
+   the two new crons, remove them from `vercel.json`; the GitHub driver is
+   authoritative regardless.
+
+### Follow-up phases (declared, not done)
+
+- Extract + enable the remaining ~11 report adapters (fba-plan first).
+- Remove/neutralise the manual-refresh UI: the `refresh=1` senders in `src/App.jsx`
+  (`fetchRows`/`fetchDaily`/`fetchPlan`/`fetchReconciliation`/`fetchSkuPl`/
+  `fetchKeywordRank`/`fetchContentChanges`/`fetchAccounts`/`fetchBrandDirectory`),
+  the `SnapshotGate` "Refresh from DataDoe" button, and **the auto
+  legacy-directory refresh at `App.jsx:1403-1413`**. Replace with the read-only
+  sync-status indicator (`GET /api/sync`) + admin "Sync now" (`POST /api/sync`),
+  and an optional `dashboard_events` realtime subscription.
+
+### Review + preview validation steps (for Codex)
+
+1. `cd sales-dashboard-live && npm run verify` (insight + brand-view + 18 sync + build).
+2. Apply migration on a preview DB (`npm run db:migrate`), set GitHub secrets.
+3. Preview deploy; confirm: unauthenticated `/api/cron/sync?bucket=us` → 401;
+   non-admin `POST /api/sync` → 403; `GET /api/sync` returns only the caller's
+   accounts; a `Bearer CRON_SECRET` call writes a `sync_runs` row and a
+   `brand-sales`/`sales-movers` snapshot; a second user reads it with **zero**
+   DataDoe calls; a concurrent bucket call returns `skipped:'locked'`.
+4. Confirm the app still loads (fonts/Supabase) under the new CSP — no console CSP
+   violations. Then deploy to production and record the deployment id here.
+
+
 
 ## Brand View: multi-currency brands now open as one clean table (2026-08-04)
 
