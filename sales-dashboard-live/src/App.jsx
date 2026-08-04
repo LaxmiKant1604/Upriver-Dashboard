@@ -1422,16 +1422,47 @@ function DashboardApp({ session, access, onSignOut }) {
     setBrandDirectoryError(null);
     setBrandDirectoryProgress({ completed: 0, total: Math.max(1, accounts.length || allowedAccountIds.size), account: "Product Catalog" });
     try {
-      // Catalog-only, connection-aware server action. This is substantially
-      // lighter than fetching 14 months of order lines for every account just
-      // to populate a picker.
-      const { body } = await refreshSharedReport(brandDirectoryCacheParams);
+      // The explicit directory action persists one Product Catalog result per
+      // DataDoe organisation at a time. Continue the user-requested sync in
+      // small serverless-safe batches; page load itself remains cache-only.
+      let body;
+      let batch = 0;
+      let requestParams = brandDirectoryCacheParams;
+      do {
+        ({ body } = await refreshSharedReport({
+          ...requestParams,
+          ...(batch === 0 ? { retryUnavailable: "1" } : {}),
+          ...(batch > 0 ? { catalogSyncContinue: "1" } : {}),
+        }));
+        batch += 1;
+        if (Array.isArray(body.accounts) && body.accounts.length) {
+          requestParams = {
+            ...brandDirectoryCacheParams,
+            ids: body.accounts.map((account) => String(account.id)).filter(Boolean).sort().join(","),
+          };
+        }
+        const pending = body.catalogSync?.pendingAccountIds || [];
+        setBrandDirectoryProgress({
+          completed: Math.max(0, (accounts.length || allowedAccountIds.size) - pending.length),
+          total: Math.max(1, accounts.length || allowedAccountIds.size),
+          account: pending.length ? `Loading ${pending.length} remaining account${pending.length === 1 ? "" : "s"}` : "Product Catalog",
+        });
+        // A catalog source can be blocked by DataDoe credits. Do not spin on
+        // an unavailable account; the API returns no pending IDs in that case.
+        if (!pending.length || batch >= 40) break;
+      } while (true);
       setBrandDirectoryBrands(body.brands || []);
       setBrandDirectoryAccounts(body.brandAccounts || {});
       if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
       setBrandDirectoryVersion((version) => version + 1);
       setBrandDirectoryFetchedAt(new Date());
-      if (body.message || body.partial) setBrandDirectoryError(body.message || "Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots.");
+      const unavailable = body.catalogUnavailableAccounts || [];
+      if (unavailable.length) {
+        const names = unavailable.map((account) => account.name).join(", ");
+        setBrandDirectoryError(`Product Catalog is unavailable for: ${names}. Check the DataDoe source and export credits, then load the directory again.`);
+      } else if (body.message || body.partial) {
+        setBrandDirectoryError(body.message || "Some account catalogs are still pending. Keep this page open while the directory sync completes.");
+      }
       setBrandDirectoryProgress({ completed: 1, total: 1, account: "Product Catalog" });
       if (!(body.brands || []).length) setBrandDirectoryError("No named brands were returned from the accessible Product Catalog. Refresh the account directory and confirm that your DataDoe catalog source is enabled.");
     } catch (error) {

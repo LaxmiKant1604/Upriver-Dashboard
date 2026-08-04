@@ -199,6 +199,10 @@ const PRODUCT_CATALOG_COLUMNS = [
 // Supabase when DataDoe Product Catalog exports are unavailable or out of
 // credits, without guessing a brand's country from portfolio-wide data.
 const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
+  // This compact per-account catalog snapshot is populated only by the
+  // explicit Brand View directory sync. It is first because it includes
+  // catalog brands even when an item has not sold in the report window.
+  "brand-catalog",
   "brand-sales",
   "fba-plan",
   "sku-pl",
@@ -210,6 +214,13 @@ const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
   OPTIMIZER_REPORT_KEY,
   "content-changes",
 ];
+
+const BRAND_CATALOG_REPORT_KEY = "brand-catalog";
+const BRAND_CATALOG_REPORT_VERSION = "brand-catalog-shared-v1";
+// One account per DataDoe organisation per request keeps each function under
+// Vercel's 60-second limit while allowing primary and secondary catalog work
+// to progress together. The browser continues the explicitly requested sync.
+const BRAND_CATALOG_ACCOUNTS_PER_CONNECTION = 1;
 
 function addBrandAccount(brandAccountIds, brand, accountId) {
   const name = String(brand || "").trim();
@@ -346,22 +357,107 @@ function snapshotBrandNames(payload) {
 async function sharedSnapshotBrandAccounts(accountIds) {
   const brandAccountIds = new Map();
   const coveredAccountIds = new Set();
-  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds };
+  const catalogPendingAccountIds = new Set();
+  const catalogUnavailable = new Map();
+  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable };
 
-  // Most accounts have a saved Dashboard snapshot, so this is typically one
-  // small Supabase read per account. Older report types are only consulted
-  // when the Dashboard did not yet save catalog metadata for that account.
+  // The explicit catalog snapshot is authoritative for a complete selector.
+  // Other reports are still useful fallback data while an account waits for its
+  // one-time catalog sync, but recent sales must never be mistaken for a full
+  // catalog because zero-sale brands would disappear.
   await Promise.all(accountIds.map(async (accountId) => {
-    for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS) {
+    const id = String(accountId);
+    const catalogSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
+    const catalogStatus = catalogSnapshot?.payload?.catalogSyncStatus;
+    const catalogBrands = snapshotBrandNames(catalogSnapshot?.payload);
+    if (catalogStatus === "complete") {
+      catalogBrands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+      coveredAccountIds.add(id);
+      return;
+    }
+    if (catalogStatus === "unavailable") {
+      catalogUnavailable.set(id, String(catalogSnapshot?.payload?.catalogSyncError || "Product Catalog is unavailable for this account."));
+    } else {
+      catalogPendingAccountIds.add(id);
+    }
+
+    for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS.slice(1)) {
       const snapshot = await getLatestReportSnapshot({ reportKey, accountId });
       const brands = snapshotBrandNames(snapshot?.payload);
-      if (!brands.length) continue;
-      brands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
-      coveredAccountIds.add(String(accountId));
-      break;
+      if (brands.length) {
+        brands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+        coveredAccountIds.add(id);
+        break;
+      }
     }
   }));
-  return { brandAccountIds, coveredAccountIds };
+  return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable };
+}
+
+async function saveBrandCatalogSnapshot(accountId, payload) {
+  const paramsHash = paramsHashFor(BRAND_CATALOG_REPORT_VERSION, { accountId });
+  const saved = await saveReportSnapshot({
+    reportKey: BRAND_CATALOG_REPORT_KEY,
+    accountId,
+    paramsHash,
+    params: { reportVersion: BRAND_CATALOG_REPORT_VERSION, accountId },
+    payload,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    sourceRefreshedAt: new Date().toISOString(),
+  });
+  if (saved?.id) {
+    await publishSnapshotUpdate({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
+  }
+}
+
+async function syncAccountBrandCatalog({ accountId, rawAccountId, connection }) {
+  try {
+    const rows = await fetchExportRowsRaw(
+      connection.apiKey,
+      PRODUCT_CATALOG_SOURCE_ID,
+      PRODUCT_CATALOG_COLUMNS,
+      [rawAccountId],
+      null,
+      null,
+      CATALOG_ROW_LIMIT,
+      { orderByColumn: "child_asin", orderByDirection: "ASC" }
+    );
+    if (rows.length >= CATALOG_ROW_LIMIT) {
+      throw new Error(`Product Catalog reached the ${CATALOG_ROW_LIMIT.toLocaleString("en-US")} row cap and was not used.`);
+    }
+    const payload = {
+      catalogBrands: catalogBrandNames(rows),
+      catalogSyncStatus: "complete",
+      catalogSyncedAt: new Date().toISOString(),
+    };
+    await saveBrandCatalogSnapshot(accountId, payload);
+    return { accountId, status: "complete", brandCount: payload.catalogBrands.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Persist the outcome so the automatic continuation can finish. A later
+    // explicit directory sync retries these accounts after access/credits are
+    // corrected; normal reads never spend DataDoe tokens.
+    await saveBrandCatalogSnapshot(accountId, {
+      catalogBrands: [],
+      catalogSyncStatus: "unavailable",
+      catalogSyncError: message,
+      catalogSyncedAt: new Date().toISOString(),
+    }).catch(() => {});
+    return { accountId, status: "unavailable", error: message };
+  }
+}
+
+async function syncBrandCatalogBatch(accountIds, connections) {
+  const byConnection = new Map();
+  for (const accountId of [...new Set(accountIds.map(String))].sort()) {
+    const scope = resolveDataDoeAccountIds([accountId], connections);
+    const group = byConnection.get(scope.connection.id) || { connection: scope.connection, accounts: [] };
+    group.accounts.push({ accountId, rawAccountId: scope.rawAccountIds[0], connection: scope.connection });
+    byConnection.set(scope.connection.id, group);
+  }
+  const work = [...byConnection.values()]
+    .flatMap((group) => group.accounts.slice(0, BRAND_CATALOG_ACCOUNTS_PER_CONNECTION));
+  return Promise.all(work.map(syncAccountBrandCatalog));
 }
 
 function stableSelectionId(prefix, accountIds) {
@@ -1124,7 +1220,11 @@ export default async function handler(req, res) {
     if (action === "brand-directory" && !publicAccountIds.length && access.role !== "admin") {
       publicAccountIds = [...new Set(access.accountIds || [])];
     }
-    if (action === "brand-directory" && wantsRefresh(req)) {
+    // The browser continues a catalog sync in several small requests. Account
+    // discovery belongs only to the first explicit click; repeating it for
+    // every batch would waste DataDoe calls and slow the directory down.
+    const continuingBrandDirectorySync = String(req.query.catalogSyncContinue || "") === "1";
+    if (action === "brand-directory" && wantsRefresh(req) && !continuingBrandDirectorySync) {
       const discovered = await discoverConnectedAccounts(connections);
       discoveredDirectoryAccounts = discovered;
       brandDirectoryAccounts = access.role === "admin"
@@ -1399,18 +1499,50 @@ export default async function handler(req, res) {
         return;
       }
       assertAccountAccess(access, publicAccountIds);
-      const { brandAccountIds, coveredAccountIds } = await sharedSnapshotBrandAccounts(publicAccountIds);
-      const unresolvedAccountIds = publicAccountIds.filter((accountId) => !coveredAccountIds.has(String(accountId)));
-      const saved = serialiseBrandAccountMap(brandAccountIds);
+      let directory = await sharedSnapshotBrandAccounts(publicAccountIds);
+      let unresolvedAccountIds = [...directory.catalogPendingAccountIds];
+      let catalogSync = [];
+
+      // Loading the picker is cache-only. On the explicit button action, seed
+      // one missing account per configured DataDoe organisation, then let the
+      // browser continue in small batches until the shared directory is done.
+      // Existing unavailable catalog snapshots are also retried explicitly,
+      // which lets an administrator recover after adding DataDoe credits.
+      if (wantsRefresh(req)) {
+        // A new explicit click retries prior catalog failures after credits or
+        // source access change. Continuation requests process only untouched
+        // accounts, so one blocked account cannot starve the rest of its
+        // DataDoe organisation.
+        const retryUnavailable = String(req.query.retryUnavailable || "") === "1";
+        const retryAccountIds = retryUnavailable ? [...directory.catalogUnavailable.keys()] : [];
+        const targets = [...new Set([...unresolvedAccountIds, ...retryAccountIds])];
+        if (targets.length) {
+          catalogSync = await syncBrandCatalogBatch(targets, connections);
+          directory = await sharedSnapshotBrandAccounts(publicAccountIds);
+          unresolvedAccountIds = [...directory.catalogPendingAccountIds];
+        }
+      }
+
+      const saved = serialiseBrandAccountMap(directory.brandAccountIds);
+      const catalogUnavailableAccounts = [...directory.catalogUnavailable.entries()].map(([accountId, error]) => {
+        const account = (brandDirectoryAccounts || []).find((entry) => String(entry.id) === String(accountId));
+        return { accountId, name: account?.name || accountId, error };
+      });
       await sendLegacyPayload({
         ...saved,
         accounts: brandDirectoryAccounts || [],
-        source: "shared-snapshots",
+        source: catalogSync.length ? "shared-snapshots-and-catalog-sync" : "shared-snapshots",
         partial: unresolvedAccountIds.length > 0,
         unresolvedAccountIds,
+        catalogUnavailableAccounts,
+        catalogSync: {
+          completed: catalogSync.filter((entry) => entry.status === "complete").length,
+          unavailable: catalogSync.filter((entry) => entry.status === "unavailable").length,
+          pendingAccountIds: unresolvedAccountIds,
+        },
         message: saved.brands.length
           ? null
-          : "No saved report snapshot has brand data yet. Refresh a Dashboard or SKU P&L report for an account once, then return here; Brand View will use that saved data without a Product Catalog export.",
+          : "No brand data is saved yet. The explicit directory sync is loading Product Catalog data account by account; keep this page open until it completes.",
       });
       return;
     }
