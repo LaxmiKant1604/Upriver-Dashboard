@@ -1,5 +1,48 @@
 # Project Memory
 
+## Scheduler v2 foundation — review corrections applied (2026-08-07)
+
+Addressed all four blocking items from "Scheduler v2 foundation review (Codex,
+2026-08-05)" on `feature/scheduler-v2` (still not pushed/merged/deployed;
+`feature/design-system` untouched at `e90c268`). Small local commits `549679e`
+(migration), `6352d90` (tests), + the docs commit.
+
+1. **DB one-attempt invariant (fixed, `549679e`).** The permissive CHECK is gone.
+   `20260807_scheduler_v2.sql` now enforces, at the database, the only two legal
+   states: `check ((create_export_count = 0 and attempted_at is null) or
+   (create_export_count = 1 and attempted_at is not null))` — a second create-export
+   cannot be recorded even by a direct service-role write. `claim_source_export_attempt`
+   remains a single atomic guarded UPDATE (`where attempted_at is null; return found`),
+   so concurrent/repeated calls never increment past one.
+2. **Cycle timing (fixed, `549679e`).** `open_sync_cycle` is enqueue-only: creates an
+   idempotent `pending` cycle with `started_at` NULL; repeated kickoff/watchdog calls
+   return it unchanged. New `claim_sync_cycle(cycle_id)` atomically moves
+   `pending -> running` and stamps `started_at` once (`where status='pending'; return
+   found`) — cannot be claimed twice or restarted. `scheduled_at` (target) and
+   `started_at` (actual) are separate for truthful Admin timings.
+3. **Source map (corrected from executable code, in `SCHEDULER_V2.md` §3).** From
+   `api/datadoe.js`: `brand-sales` (`buildBrandSalesPayload`, L622) uses
+   **Order Line Items `89b27535…` + Product Catalog `68d2de…`**, NOT Sales & Traffic;
+   FBA velocity + Daily use **Sales & Traffic `401ffcd7e5`** (`PLAN_SALES_SOURCE_ID`
+   L778 / `DAILY_SALES_SOURCE_ID` L675); `b24cd69c06` is a separate legacy path.
+   Added the rule that the same `source_id` does NOT imply a shared export — dedup
+   requires the *complete* request identity (org, scope, source, columns, grain,
+   aggregations, window, limit, ordering) to match, which per-report windows usually
+   do not; insight-report contracts remain unaudited (marked for Phase 1b + live).
+4. **Test blocker (fixed, `6352d90`).** Recreated `scripts/test-scheduler-v2.mjs` with
+   static imports / no top-level await / ASCII only (the top-level `await import(...)`
+   was the likely hang cause; could not reproduce the hang here, so removed the most
+   likely differentiator). Verified from the checked-out worktree: `node --check`
+   exits 0, `npm run test:scheduler-v2` = **22 assertions passed**, full `npm run
+   verify` green (54 insight + 60 Brand View + 23 sync + 6 source-cache + 22
+   scheduler-v2 + build), `git diff --check` clean.
+
+**Remaining live gaps (Codex):** real non-US & US cycles across both DataDoe orgs;
+the one-attempt/cycle-claim invariants under *actual* Postgres concurrency (modelled
++ structurally asserted here, not executed against a live DB); the non-Indian 402/404
+per-org source probe; and the Phase 1b+ implementation. Phase 1b stays blocked pending
+Codex approval of this corrected foundation.
+
 ## Scheduler v2 — source-first sync, foundation started (2026-08-07)
 
 Branch **`feature/scheduler-v2`** from `origin/main` @ `330ac91` (NOT pushed/merged/

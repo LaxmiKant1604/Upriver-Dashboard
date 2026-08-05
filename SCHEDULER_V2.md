@@ -50,44 +50,67 @@ tables + planner provide.
 
 ## 2. What this branch adds so far (committed, verify-green)
 
-- **`20260807_scheduler_v2.sql`** (additive; `0563d3e`): `sync_cycles`
-  (unique(bucket, cycle_date)), `sync_source_jobs` (unique(cycle_id, request_hash);
-  `attempted_at` + `create_export_count<=1` guard; fetch_status/error_stage/
-  error_code/error_message/row_count/payload_bytes/duration_ms/terminal;
-  cache_object_path + last_good_fetched_at), `sync_report_jobs` (separate
-  fetch/derive/save status + `validated`; latest_data_date; snapshot_params_hash;
-  last_good_snapshot_at). RPCs `open_sync_cycle` (idempotent kickoff) and
-  `claim_source_export_attempt` (durable one-POST guard). RLS service-role-write +
-  admin-read. **No secret in any migration.**
+- **`20260807_scheduler_v2.sql`** (additive; `0563d3e`, corrected by the review
+  pass): `sync_cycles` (unique(bucket, cycle_date)), `sync_source_jobs`
+  (unique(cycle_id, request_hash); DB-enforced one-attempt invariant — CHECK
+  `(count=0 AND attempted_at IS NULL) OR (count=1 AND attempted_at IS NOT NULL)`, so
+  the database caps create-export at one even against a direct write;
+  fetch_status/error_stage/error_code/error_message/row_count/payload_bytes/
+  duration_ms/terminal; cache_object_path + last_good_fetched_at), `sync_report_jobs`
+  (separate fetch/derive/save status + `validated`; latest_data_date;
+  snapshot_params_hash; last_good_snapshot_at). RPCs: `open_sync_cycle` (idempotent
+  ENQUEUE — creates a **pending** cycle with `started_at` NULL, never a duplicate),
+  `claim_sync_cycle` (atomic **pending → running**, stamps `started_at` once, cannot
+  be claimed twice), `claim_source_export_attempt` (durable one-POST guard). RLS
+  service-role-write + admin-read. **No secret in any migration.**
 - **planner v2** (`4469e70`): pure `buildDependencyPlan` (dedup),
   `sourceExportAttemptAllowed`, `reportFetchGate` + `scripts/test-scheduler-v2.mjs`
-  (10 assertions, in `npm run verify`).
+  (expanded to prove the DB invariants + transitions, in `npm run verify`).
 
 ---
 
-## 3. Source dependency map (draft — contracts to be extracted in Phase 1b)
+## 3. Source dependency map (corrected from executable `api/datadoe.js`)
 
-Each report DERIVES from one or more canonical sources. The **exact source IDs,
-columns, grain and aggregations must be lifted from the per-report builders in
-`api/datadoe.js`** (not guessed) and confirmed to exist **per organization** before
-enabling. Categories below are inferred from the registry + PROJECT_MEMORY and are
-the extraction checklist, not final contracts.
+Source IDs below are the **actual constants in `api/datadoe.js`** with line refs,
+not guesses. Earlier drafts of this file were WRONG (they said Dashboard uses
+Sales & Traffic); the code shows `buildBrandSalesPayload` uses Order Line Items +
+Product Catalog, and Sales & Traffic `401ffcd7e5` is used by Daily Reporting and
+FBA velocity instead. Corrected here.
 
-| Report | Canonical source(s) needed | Shared with | Notes |
-|---|---|---|---|
-| Dashboard / brand-sales | Sales & Traffic by ASIN & Date | Daily, SKU P&L, FBA, Movers, insights | already enabled |
-| Daily Reporting | Sales & Traffic (150-day window) + Ads | Dashboard (diff window ⇒ diff hash) | window differs ⇒ separate source job |
-| FBA Shipment Plan | Sales & Traffic (velocity) + FBA Inventory Health + (US only) Listings/AWD | Dashboard (sales) | AWD source US-only |
-| Reconciliation | **Order Line Items** + settlement/financial events | SKU P&L (financial) | ⚠ 402/404 source (see §5) |
-| SKU P&L Analyzer | Sales & Traffic + Order Line Items/financial + Ads + COGS (Supabase, user-entered) | Dashboard, Reconciliation, Ads | COGS is NOT a DataDoe source |
-| Keyword Rank | keyword-targeting-performance + search-query/rank source | Ads (keyword) | |
-| Content Alerts | Product Catalog / Listings snapshot | Brand directory | Product Catalog 0-rows in secondary org (known) |
-| Sales Movers | Sales & Traffic | Dashboard | multi-export ⇒ needs checkpointing |
-| Listing Health | Listings / catalog + Sales & Traffic | Content Alerts | |
-| Buy Box Loss | Buy-box / offer source + Sales & Traffic | | |
-| Returns & Refunds | Returns source + Sales & Traffic | Reconciliation | |
-| PPC Performance | campaign/asin/keyword/search-terms Ads (4) | Ads (all) | derives from ads_daily_source_rows |
-| Listing Optimizer | Ads + Listings + search-terms | PPC, Keyword Rank | |
+**Sharing rule (important):** two reports share a DataDoe export ONLY when their
+*complete* canonical identity is identical — organization, account scope, source
+id, columns, grain, aggregations, from/to window, row limit AND ordering — because
+that is exactly what `request_hash` covers. **The same `source_id` is NOT enough.**
+In practice per-report windows/columns differ, so cross-report dedup is the
+exception; each pairing below must be proven per `request_hash` before it is
+claimed as a saved export. The reliable token-saving is (a) within-cycle reuse of a
+request across accounts/reports that truly match, and (b) the persisted
+`source_export_cache`.
+
+| Report | Source constants used (api/datadoe.js) | Confidence |
+|---|---|---|
+| Dashboard / `brand-sales` | `ORDER_LINE_ITEMS_SOURCE_ID` = `89b27535…` (L164) **+** `PRODUCT_CATALOG_SOURCE_ID` = `68d2de…` (L189) — `buildBrandSalesPayload` L622-637 | confirmed from code |
+| Daily Reporting | `DAILY_SALES_SOURCE_ID` = `401ffcd7e5` (L675, Sales & Traffic) + `PRODUCT_CATALOG` `68d2de…` (L1639) + `ADS_SOURCE_ID` = `08cdc77d3d` (L1683) | confirmed |
+| FBA Shipment Plan | `PLAN_SALES_SOURCE_ID` = `401ffcd7e5` (L778, Sales & Traffic velocity, L1180/1969) + `PRODUCT_CATALOG` `68d2de…` (L1986) + `FBA_HEALTH_SOURCE_ID` = `44fc5b…` (L784, L2002) + **US only** `LISTINGS_SOURCE_ID` = `ba689c…` AWD (L803, L2057) | confirmed |
+| Reconciliation | `ORDER_LINE_ITEMS` `89b27535…` (L1719) + `RECONCILIATION_SETTLEMENTS_SOURCE_ID` = `732dac…` (L707, L1723) + `PRODUCT_CATALOG` `68d2de…` (L1727) | confirmed |
+| SKU P&L Analyzer | `SKU_PL_SOURCE_ID` = `57a0cb…` (L735, L1095) + COGS from **Supabase** (user-entered, not DataDoe) | confirmed |
+| Keyword Rank | `SQP_WEEKLY_SOURCE_ID` = `81aa5b…` (L754, L1803) + `SQP_MONTHLY_SOURCE_ID` = `df4160…` (L755, L1823) | confirmed |
+| Content Alerts | `CONTENT_CHANGE_SOURCE_ID` = `aec3d5…` (L663, L1899) + `PRODUCT_CATALOG` `68d2de…` (L1849/1912) | confirmed |
+| Sales Movers, Listing Health, Buy Box Loss, Returns & Refunds, PPC Performance, Listing Optimizer | **NOT audited yet** — extract per-report in Phase 1b and live-validate. Ads-derived reports read saved `ads_daily_source_rows` (`ADS_SOURCE_ID` `08cdc77d3d` + the 4 registry ads sources) | requires extraction + live validation |
+
+Notes from the corrected contracts:
+- **Order Line Items `89b27535…`** is used by BOTH Dashboard (`brand-sales`) and
+  Reconciliation — but with different columns/windows, so they are almost certainly
+  **different `request_hash`es** (not one shared export). This is the source that
+  returns 404 in some primary EU orgs and 402 on secondary (see §5), so it is a
+  first-class terminal-failure risk for Dashboard, not only Reconciliation.
+- **`401ffcd7e5` (Sales & Traffic)** is used by Daily Reporting and FBA velocity;
+  FBA reads it with `["child_asin"]` (L1180) and Daily with its own columns/window,
+  so again likely distinct `request_hash`es — verify before claiming a shared export.
+- **`b24cd69c06` (`DASHBOARD_SOURCE_ID`, L147, used at L1594)** is a separate legacy
+  dashboard path, NOT the `brand-sales` snapshot builder. Do not conflate the two.
+- **Derived-only (no own export):** Priority Feed, Brand View, brand directory,
+  `sales` rollup — read already-saved snapshots/history (`depends_on: []`).
 
 **Derived-only (must NOT create their own export):** Priority Feed, Brand View,
 brand directory, `sales` rollup — read already-saved snapshots/history. In the
