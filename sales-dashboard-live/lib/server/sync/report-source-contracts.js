@@ -125,6 +125,12 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
   const contracts = REPORT_SOURCE_CONTRACTS[reportKey];
   if (!contracts) return null;
 
+  // An empty account scope produces no source job, so return before validating the
+  // window map: a caller with nothing to sync should never be forced to supply
+  // windows just to receive an empty result.
+  const chunks = chunkAccountIds(ids);
+  if (chunks.length === 0) return [];
+
   const windowsMap = windowsByRequestKey || {};
   const declaredKeys = contracts.map((c) => c.requestKey);
 
@@ -139,9 +145,6 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
       throw new Error(`Unknown request key "${key}" for report "${reportKey}". Declared: ${declaredKeys.join(", ")}.`);
     }
   }
-
-  const chunks = chunkAccountIds(ids);
-  if (chunks.length === 0) return []; // empty account scope => no source job
 
   const out = [];
   for (const c of contracts) {

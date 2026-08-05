@@ -138,8 +138,11 @@ for (const n of [0, 1, 5, 6, 11]) {
   });
 }
 
-test("empty ID scope creates no source request", () => {
+test("empty ID scope returns [] BEFORE window validation (missing/empty window map is fine)", () => {
   assert.deepEqual(reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: [], windowsByRequestKey: bsWin }), []);
+  assert.deepEqual(reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: [], windowsByRequestKey: {} }), []);
+  assert.deepEqual(reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: [] }), []); // no window map at all
+  assert.deepEqual(reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: null, windowsByRequestKey: {} }), []);
 });
 
 test("six IDs create two chunks per source, not one (2 sources x 1 window x 2 chunks = 4)", () => {
