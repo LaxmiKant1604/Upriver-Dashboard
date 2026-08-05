@@ -64,8 +64,10 @@ tables + planner provide.
   be claimed twice), `claim_source_export_attempt` (durable one-POST guard). RLS
   service-role-write + admin-read. **No secret in any migration.**
 - **planner v2** (`4469e70`): pure `buildDependencyPlan` (dedup),
-  `sourceExportAttemptAllowed`, `reportFetchGate` + `scripts/test-scheduler-v2.mjs`
-  (expanded to prove the DB invariants + transitions, in `npm run verify`).
+  `sourceExportAttemptAllowed`, `reportFetchGate`. Tests live in
+  `scripts/scheduler-v2.test.mjs` (renamed from the old `test-scheduler-v2.mjs`,
+  which was an inaccessible entry in the Codex checkout) — 22 assertions proving the
+  DB invariants + transitions, run by `npm run verify`.
 
 ---
 

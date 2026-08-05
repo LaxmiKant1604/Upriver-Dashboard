@@ -12,7 +12,7 @@
     "test:brand-view": "node scripts/test-brand-view.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:source-cache": "node scripts/test-source-cache.mjs",
-    "test:scheduler-v2": "node scripts/test-scheduler-v2.mjs",
+    "test:scheduler-v2": "node scripts/scheduler-v2.test.mjs",
     "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:scheduler-v2 && npm run build:check",
     "db:migrate": "node scripts/apply-supabase-migrations.mjs"
   },

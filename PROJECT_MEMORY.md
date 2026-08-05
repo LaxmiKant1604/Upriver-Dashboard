@@ -1,5 +1,31 @@
 # Project Memory
 
+## Scheduler v2 test file renamed to a fresh path (2026-08-06)
+
+Codex approved the corrected SQL invariants + source dependency map, but
+`scripts/test-scheduler-v2.mjs` was still an inaccessible filesystem entry in the
+Codex checkout (`node --check`, direct read, and `git mv` all timed out on that
+path). Fixed the artifact only — no logic change, Phase 1b still not started.
+
+- The committed 22-assertion content was preserved verbatim under a NEW filename
+  **`sales-dashboard-live/scripts/scheduler-v2.test.mjs`**; the old
+  `scripts/test-scheduler-v2.mjs` was removed (`git rm`) and is not recreated.
+  `package.json` `test:scheduler-v2` now runs the new path. Git records it as a
+  clean rename (identical content).
+- Old path confirmed gone: `test -e …/test-scheduler-v2.mjs` → removed;
+  `git ls-files` shows no file of that name.
+- **Exact results from the checked-out worktree (this environment):**
+  - `node --check scripts/scheduler-v2.test.mjs` → exit 0
+  - `npm run test:scheduler-v2` → `22 assertions passed`, exit 0
+  - `npm run verify` → 54 insight + 60 Brand View + 23 sync + 6 source-cache + 22
+    scheduler-v2 + build, exit 0
+  - `git diff --check` → clean, exit 0
+- Note: the original hang was never reproducible in this workspace, so this is a
+  filesystem-entry workaround (fresh path + fresh bytes), not a proven root-cause
+  fix. Codex must re-run the four commands above against its own checkout.
+  Commit: see the rename commit below. Not pushed/merged/deployed;
+  `feature/design-system` untouched.
+
 ## Scheduler v2 foundation — review corrections applied (2026-08-07)
 
 Addressed all four blocking items from "Scheduler v2 foundation review (Codex,
