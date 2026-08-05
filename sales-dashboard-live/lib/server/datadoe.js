@@ -12,9 +12,12 @@
 //   a from/to range, and must order by a column that actually exists.
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
 import { marketplaceProfile } from "../marketplaces.js";
-import { cacheHoursForSource, sourceContractForId } from "./source-contracts.js";
+import { cacheHoursForSource } from "./source-contracts.js";
+// The canonical source request identity (request_hash) lives in a shared module so
+// the scheduler can compute the same hash without this DataDoe/report module graph.
+// Byte-identical to the previous in-file implementation: the source cache stays valid.
+import { sourceRequestIdentity } from "./source-identity.js";
 import {
   getSourceExportCache,
   isSupabaseConfigured,
@@ -231,36 +234,9 @@ const sourceMemoryCache = new Map();
 let sourceCacheUnavailableUntil = 0;
 let sourceCacheLastPrunedAt = 0;
 
-function sha256(value) {
-  return createHash("sha256").update(String(value)).digest("hex");
-}
-
-function stableValue(value) {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
-  );
-}
-
-function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
-  const contract = sourceContractForId(sourceId);
-  const organizationFingerprint = sha256(apiKey).slice(0, 24);
-  const accountScopeHash = sha256([...ids].map(String).sort().join("\u001f"));
-  const requestMeta = stableValue({
-    source: contract?.key || String(sourceId),
-    columns: [...columns].map(String).sort(),
-    from: from || null,
-    to: to || null,
-    limit,
-    groupBy: [...(options.groupBy || [])].map(String).sort(),
-    aggregations: [...(options.aggregations || [])].map(stableValue).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
-    orderByColumn: options.orderByColumn || "date",
-    orderByDirection: options.orderByDirection || "ASC",
-  });
-  const requestHash = sha256(JSON.stringify({ organizationFingerprint, accountScopeHash, requestMeta }));
-  return { requestHash, organizationFingerprint, accountScopeHash, requestMeta };
-}
+// sha256 / stableValue / sourceRequestIdentity were moved verbatim to
+// ./source-identity.js (imported above) so the scheduler shares one identity
+// implementation. No behaviour change; request_hash values are byte-identical.
 
 function rememberSourceRows(requestHash, rows, expiresAt) {
   sourceMemoryCache.delete(requestHash);
