@@ -128,14 +128,29 @@ sources feed PPC + Listing Optimizer + Keyword Rank + per-report ad metrics from
 
 ## 4. Phased plan (remaining) — ordered so the backend deploys/validates first
 
-**Phase 1b — registry source contracts.** For every report, add a declarative
-`sources: [{sourceId, columns, grain, aggregations, window, limit, ordering}]`
-extracted verbatim from the `api/datadoe.js` builder, so the planner can compute
-each report's `request_hash` set via the *existing* `sourceRequestIdentity` (extract
-it into `lib/server/sync/source-identity.js`, imported by both `datadoe.js` and the
-planner, **byte-identical hash** so `source_export_cache` stays valid). Tests: every
-sidebar report has a scheduler declaration; a source shared by ≥2 reports yields one
-`request_hash`.
+**Phase 1b — registry source contracts.** IN PROGRESS.
+- DONE (`420101b`): `sourceRequestIdentity` (+`sha256`/`stableValue`) extracted
+  **verbatim** into `lib/server/source-identity.js`, imported by `datadoe.js`.
+  Byte-identical hash proven by `scripts/source-identity.test.mjs` (parity vs an
+  independent reconstruction of the pre-extraction algorithm + a pinned golden hash),
+  so `source_export_cache` stays valid. Note: it landed at `lib/server/source-identity.js`
+  (a clean leaf importing only `source-contracts.js`), not under `sync/`.
+- DONE (`5026038`): `lib/server/sync/report-source-contracts.js` declares each
+  report's exact create-export inputs `{sourceKey, columns, limit, groupBy,
+  aggregations, orderByColumn, orderByDirection, windowKind}` + `reportSourceRequestHashes()`.
+  Declared so far, read line-by-line from the builders and **parity-tested against
+  the executable `api/datadoe.js` constants** (`scripts/report-source-contracts.test.mjs`,
+  10 assertions): **brand-sales** (Order Line Items + Product Catalog, one shared
+  window) and **sku-pl** (Profit by SKU & Date, per-month).
+- REMAINING: declare the multi-call / per-month / brand-variant reports
+  (`daily-reporting`, `fba-plan`, `reconciliation`, `keyword-rank`, `content-changes`)
+  and the insight reports with the SAME parity-tested method — each from its exact
+  builder calls, never assumed. Key realism found while auditing: several reports fire
+  multiple exports with per-month windows (e.g. sku-pl, fba-plan) and brand-variant
+  columns (daily all-brand vs named), and the same `source_id` used by two reports
+  usually has a different window ⇒ a different `request_hash` ⇒ NOT a shared export.
+  The request `source` field hashes on the contract KEY (not the raw id), so the
+  short/long id variants of a source collapse to one hash.
 
 **Phase 1c — worker v2 / run-sync v2.** Kickoff opens one cycle (`open_sync_cycle`),
 materializes `sync_source_jobs` (deduped) + `sync_report_jobs`. Bounded checkpointable

@@ -1,5 +1,44 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — identity extraction + first source contracts (2026-08-06)
+
+Codex approved the corrected foundation; started Phase 1b on `feature/scheduler-v2`
+(not pushed/merged/deployed; `feature/design-system` untouched; Phase 1c NOT started).
+Small commits `420101b`, `5026038`.
+
+- **Byte-identical extraction (`420101b`).** `sourceRequestIdentity` (+`sha256`,
+  `stableValue`) moved VERBATIM out of `lib/server/datadoe.js` into
+  `lib/server/source-identity.js` (a clean leaf importing only `source-contracts.js`);
+  `datadoe.js` now imports it, and its now-unused `createHash`/`sourceContractForId`
+  imports were dropped. The algorithm is unchanged — org fingerprint, account scope
+  joined with **U+001F** (a raw control char that slipped in was replaced with the
+  `\u001f` escape; runtime value identical), contract-key source, sorted columns,
+  from/to, limit, sorted groupBy, sorted aggregations, orderBy. `source_export_cache`
+  stays valid. Proven by `scripts/source-identity.test.mjs` (7 assertions): parity vs
+  an independent reconstruction of the pre-extraction code across a battery of inputs,
+  a pinned golden `request_hash` (`5601253219be13c7…`), canonical ordering,
+  contract-key resolution, org + account-scope isolation, and window/columns/limit/
+  ordering sensitivity.
+- **Per-report contracts (`5026038`).** `lib/server/sync/report-source-contracts.js`
+  declares each report's exact create-export inputs and `reportSourceRequestHashes()`
+  to resolve `request_hash`es via the shared identity. Declared + parity-tested
+  against the executable `api/datadoe.js` constants (`scripts/report-source-contracts.test.mjs`,
+  10 assertions — a mis-transcribed column/limit fails the suite): **brand-sales**
+  (Order Line Items + Product Catalog over one shared window) and **sku-pl** (Profit
+  by SKU & Date, per-month). Org isolation (primary vs dd-secondary apiKey => different
+  hash), deterministic dedup, and account/window sensitivity are all asserted.
+- **Deliberately NOT declared** (avoids assumptions): the multi-call/per-month/
+  brand-variant reports (`daily-reporting`, `fba-plan`, `reconciliation`,
+  `keyword-rank`, `content-changes`) and the insight reports. Auditing showed several
+  reports fire multiple exports with per-month windows and brand-variant columns, and
+  the same `source_id` across two reports usually differs by window ⇒ different
+  `request_hash` ⇒ not a shared export. These are the next Phase 1b increment, same
+  parity-tested method.
+- `npm run verify` green: 54 insight + 60 Brand View + 23 sync + 6 source-cache + 22
+  scheduler-v2 + 7 source-identity + 10 report-contracts + build. No live DataDoe
+  probe was run; live request_hash reconciliation against a real export remains Codex's
+  gate.
+
 ## Scheduler v2 test file renamed to a fresh path (2026-08-06)
 
 Codex approved the corrected SQL invariants + source dependency map, but
