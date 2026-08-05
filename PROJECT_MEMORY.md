@@ -2479,6 +2479,36 @@ exact 06:00 local time becomes a business requirement.
 
 ## How to resume cold
 
+## Scheduler v2 foundation review (Codex, 2026-08-05)
+
+- Branch `feature/scheduler-v2` contains the initial Scheduler v2 foundation in
+  commits `0563d3e`, `4469e70`, and `ede505f`. It has not been pushed, merged,
+  deployed, or approved for Phase 1b yet.
+- **Blocking migration defect:**
+  `sync_source_jobs_one_attempt check (create_export_count <= 1 or attempted_at
+  is not null)` does not cap attempts at one. Any count above one passes after
+  `attempted_at` is set. Enforce `create_export_count` in `0..1` and consistency
+  between the count and `attempted_at`; add a database-level test for it.
+- **Incorrect cycle timing semantics:** `open_sync_cycle` currently inserts a
+  `running` cycle with `started_at = now()`. Kickoff is only an enqueue action,
+  so it must create an idempotent `pending` cycle with no actual start time.
+  A separate atomic worker-claim transition must set `running` and
+  `started_at` when processing really begins.
+- **Incorrect dependency-map statement:** `SCHEDULER_V2.md` says Dashboard /
+  `brand-sales` uses Sales & Traffic by ASIN & Date. Current production code in
+  `buildBrandSalesPayload` actually uses Order Line Items source
+  `89b27535...` plus Product Catalog `68d2de...`. FBA Plan separately uses
+  Sales & Traffic source `401ffcd7e5`. Correct the map from the executable
+  contracts before extracting Phase 1b registry declarations.
+- **Verification blocker:** direct Windows access/execution of
+  `scripts/test-scheduler-v2.mjs` hangs (`node --check` times out), although its
+  committed Git blob is readable and its source can be inspected. Recreate or
+  otherwise normalize this file and prove `npm run test:scheduler-v2` plus the
+  full `npm run verify` run normally from the checked-out worktree. The current
+  handoff's verify-green claim is not independently reproducible yet.
+- Do not continue Phase 1b until these four items are fixed in small local
+  commits and re-reviewed. Keep `feature/design-system` untouched.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
