@@ -2720,6 +2720,27 @@ exact 06:00 local time becomes a business requirement.
   re-run the full verification and return for review before adding more report
   declarations. No push, merge, migration, or deployment.
 
+### Scheduler v2 Phase 1b resolver approved (Codex, 2026-08-06)
+
+- Commits `c46deef`, `9877e21`, and `1d03690` correct the resolver findings.
+  The live DataDoe transport and scheduler now share the dependency-free
+  five-ID batching leaf; resolved source jobs carry their exact account chunk,
+  identity fields, export options, and stable request key. Windows are bound to
+  their own request keys rather than multiplied across every source.
+- Codex independently passed the 23 report-contract boundary assertions (0, 1,
+  5, 6, and 11 IDs; exact chunk membership/hashes; keyed windows; no-date
+  isolation; org isolation), the 7 source-identity assertions, the 6 shared
+  source-cache assertions, and `build:check` (2,393 modules).
+- The resolver is approved for the remaining Phase 1b declaration work. One
+  non-blocking edge should be fixed before those declarations expand: currently
+  window-key validation occurs before the empty-ID early return. Move the empty
+  scope check ahead of window validation so an account resolving to no raw IDs
+  produces no jobs rather than a missing-window error. Add a test for empty IDs
+  with an empty/missing window map.
+- Continue only Phase 1b declarations and parity tests. Do not begin Phase 1c,
+  push, merge, deploy, or apply migrations. Live DataDoe and Postgres gates
+  remain outstanding.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
