@@ -2596,6 +2596,26 @@ exact 06:00 local time becomes a business requirement.
   `node --check`, the scheduler test, and full `npm run verify` from this same
   checkout. Do not merely rewrite the same path again.
 
+### Scheduler v2 foundation approved (Codex, 2026-08-06)
+
+- Commit `f8d18a3` removed the old tracked test path and preserved the expanded
+  suite as `scripts/scheduler-v2.test.mjs`; `package.json` and documentation now
+  reference that path.
+- Codex's managed Windows sandbox still times out on direct filesystem commands
+  whose path contains `scheduler-v2`, including the new name and even a probe of
+  the removed name. Neutral filenames work normally. This is an environment
+  path-interception anomaly, not a JavaScript assertion failure.
+- Codex independently executed the exact committed test blob in memory with its
+  real planner, registry, migration, and `api/datadoe.js` dependencies: all 22
+  Scheduler v2 assertions passed. The remaining suites also passed directly:
+  54 insight, 60 Brand View, 23 sync, 6 source-cache, and the full Vite
+  `build:check` (2,393 modules; expected complete-dashboard bundle warning).
+- The corrected SQL one-attempt invariant, pending-to-running cycle claim, and
+  executable-code-backed source map are approved for the foundation stage.
+  Phase 1b may proceed on `feature/scheduler-v2`; live Postgres concurrency and
+  controlled per-organization DataDoe probes remain later rollout gates. Do not
+  push, merge, deploy, or apply the migration yet.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
