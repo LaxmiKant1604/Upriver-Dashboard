@@ -1,5 +1,48 @@
 # Project Memory
 
+## Scheduler v2 — source-first sync, foundation started (2026-08-07)
+
+Branch **`feature/scheduler-v2`** from `origin/main` @ `330ac91` (NOT pushed/merged/
+deployed; `feature/design-system` left untouched at `e90c268`). Full working design,
+source dependency map, phased plan and rollout in **`SCHEDULER_V2.md`** (repo root) —
+read it first. No live DataDoe/Supabase/browser here, so every real-cycle / 402-404 /
+"page renders" claim is Codex's live gate, never asserted from this workspace.
+
+**Investigation (verified from code).** Scheduler **v1** already exists and is
+deployed: `registry.js` (only 4 Ads + `brand-sales` enabled; the legacy 7 + insights
+declared `enabled:false` — that is why pages still show "Refresh from DataDoe"),
+`run-sync.js`, `planner.js`, adapters, `20260805_scheduled_sync.sql`, and
+`20260806_shared_source_export_cache.sql`. **The canonical source identity already
+exists** in `datadoe.js` `sourceRequestIdentity` → `request_hash =
+sha256({organizationFingerprint, accountScopeHash, requestMeta{source, columns,
+from, to, limit, groupBy, aggregations, orderBy}})`, and `fetchSourceChunk` dedups
+(memory + in-flight + `source_export_cache`) and rejects truncated results. The v2
+gap: no durable *cross-invocation* one-create-export-per-request_hash-per-cycle
+guarantee, no source→report dependency graph, no separated fetch/derive/save state.
+
+**Landed this session (verify-green, small commits):**
+- `0563d3e` — additive migration `20260807_scheduler_v2.sql`: `sync_cycles`
+  (unique(bucket, cycle_date)), `sync_source_jobs` (unique(cycle_id, request_hash);
+  `attempted_at` + `create_export_count<=1` durable one-POST guard; safe error
+  code/stage/message; row_count/bytes/duration/terminal; last-known-good refs),
+  `sync_report_jobs` (separate fetch/derive/save + `validated`; latest_data_date;
+  snapshot ref). RPCs `open_sync_cycle` (idempotent) + `claim_source_export_attempt`.
+  RLS service-role-write / admin-read. **No secret in any migration.**
+- `4469e70` — planner v2 pure core (`buildDependencyPlan` dedup,
+  `sourceExportAttemptAllowed`, `reportFetchGate`) + `scripts/test-scheduler-v2.mjs`
+  (10 assertions in `npm run verify`: dedup=1 export, one-attempt, no-re-POST,
+  last-known-good derive gate, schedules 02:00/10:30, migration additive + no-secret).
+
+**Remaining (staged, see SCHEDULER_V2.md §4):** 1b registry per-report source
+contracts (+ extract `sourceRequestIdentity` into a shared module, byte-identical
+hash); 1c checkpointable worker/run-sync v2; 1d derivation adapters consuming saved
+source rows; 1e Admin Data Sync Center (view + `/api/admin/sync.js` + sidebar,
+admin-only, no manual-refresh button); 1f pg_cron/pg_net kickoff (separate migration,
+Vault secret, applied after load); **Phase 2 last** = remove manual refresh from
+App.jsx + new empty states + server rejects `refresh=1`. Non-Indian 402/404 needs one
+controlled per-org source probe. Deploy backend + validate real non-US & US cycles
+(both orgs) BEFORE the refresh-removal UI.
+
 ## DataDoe support guidance reviewed (2026-08-04)
 
 - DataDoe confirmed that large report pulls should use its **REST API**, not MCP: MCP exports are capped at 3,500 rows each and a large result is split into multiple token-consuming exports, whereas one REST API export can return up to the requested large file size as a single export. Upriver already uses server-side REST API exports, so this architecture is the correct token-saving path; do not replace it with MCP report loops.
