@@ -1,5 +1,43 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — resolver correction: 5-ID chunking + keyed windows (2026-08-06)
+
+Corrected the two resolver findings from Codex's Phase 1b review on
+`feature/scheduler-v2` (not pushed/merged/deployed; `feature/design-system`
+untouched; Phase 1c NOT started; no new report declarations added). Commits
+`c46deef` (batching leaf) + `9877e21` (resolver + tests) + the docs commit.
+
+- **Exact five-ID batching (`c46deef`, `9877e21`).** The live transport
+  (`fetchExportRows`) chunks the account scope into groups of
+  `MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5` in input order and computes one identity
+  per chunk. The resolver previously hashed ALL IDs together — wrong. Extracted the
+  batching into a dependency-free leaf `lib/server/id-batching.js` (`MAX…`,
+  `chunkArray`, `chunkAccountIds`); `datadoe.js` imports + re-exports it (so
+  `api/datadoe.js` is unaffected) and the resolver imports it, so both chunk
+  identically. `reportSourceRequestHashes` now emits **one request per 5-ID chunk**
+  with its own `request_hash`; empty scope ⇒ `[]`. Each result carries
+  `sellerOrVendorIds` (the exact chunk) plus requestHash / organizationFingerprint /
+  accountScopeHash / requestMeta / requestKey / sourceKey / sourceId / from / to /
+  limit / options.
+- **Contract-specific windows (`9877e21`).** Removed the global behaviour that applied
+  every window to every source (a Cartesian product). Each declared source now has a
+  stable **requestKey** (`brand-sales:order-lines`, `brand-sales:catalog`,
+  `sku-pl:monthly-profit`); windows come in as `windowsByRequestKey` and are applied
+  only to their own key. Missing or unknown request keys throw. This lets the future
+  FBA Plan sources independently take monthly sales windows, a catalog range, an
+  inventory snapshot range, and no-date Listings with no accidental cross-products.
+- **Tests (`9877e21`, 23 assertions).** ID counts 0/1/5/6/11 reproduce the transport's
+  chunks + hashes (independently chunked with the same leaf + shared identity); 6 IDs
+  ⇒ two chunks per source, 11 ⇒ three; each result carries its exact chunk; chunk
+  boundaries follow input order while within-chunk reordering keeps the hash; empty
+  IDs ⇒ none; per-key windows with no cross-product; a no-date request never gets
+  another source's dates; missing/unknown keys throw; primary vs dd-secondary stay
+  isolated; plus the executable-parity checks vs `api/datadoe.js`.
+- `npm run verify` green: 54 insight + 60 Brand View + 23 sync + 6 source-cache + 22
+  scheduler-v2 + 7 source-identity + 23 report-contracts + build. `node --check`,
+  `test:source-identity`, `test:report-contracts`, `git diff --check` all clean. No
+  live DataDoe probe; live reconciliation against a real export remains Codex's gate.
+
 ## Scheduler v2 Phase 1b — identity extraction + first source contracts (2026-08-06)
 
 Codex approved the corrected foundation; started Phase 1b on `feature/scheduler-v2`

@@ -142,6 +142,20 @@ sources feed PPC + Listing Optimizer + Keyword Rank + per-report ad metrics from
   the executable `api/datadoe.js` constants** (`scripts/report-source-contracts.test.mjs`,
   10 assertions): **brand-sales** (Order Line Items + Product Catalog, one shared
   window) and **sku-pl** (Profit by SKU & Date, per-month).
+- CORRECTED (`c46deef`, `9877e21`) after review: the resolver now reproduces the live
+  transport EXACTLY. Five-ID batching moved to a dependency-free leaf
+  `lib/server/id-batching.js` (shared by `datadoe.js` + the resolver); the resolver
+  chunks the account scope into groups of 5 in input order and emits **one request
+  per chunk** with its own `request_hash` (no longer one hash over all IDs); empty
+  scope ⇒ `[]`. Each declared source carries a stable **requestKey**
+  (`brand-sales:order-lines`, `brand-sales:catalog`, `sku-pl:monthly-profit`), and
+  windows are supplied as `windowsByRequestKey` and applied **only to their own key**
+  — no shared Cartesian product — so a monthly source and a no-date source can never
+  receive each other's dates (validated; missing/unknown keys throw). Result fields:
+  requestKey, sourceKey, sourceId, sellerOrVendorIds (the chunk), from/to, limit,
+  options, requestHash, organizationFingerprint, accountScopeHash, requestMeta. Tests
+  now cover ID counts 0/1/5/6/11 vs the transport, per-key windows, no-date, reorder
+  behaviour and org isolation (23 assertions).
 - REMAINING: declare the multi-call / per-month / brand-variant reports
   (`daily-reporting`, `fba-plan`, `reconciliation`, `keyword-rank`, `content-changes`)
   and the insight reports with the SAME parity-tested method — each from its exact
