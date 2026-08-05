@@ -18,6 +18,11 @@ import { cacheHoursForSource } from "./source-contracts.js";
 // the scheduler can compute the same hash without this DataDoe/report module graph.
 // Byte-identical to the previous in-file implementation: the source cache stays valid.
 import { sourceRequestIdentity } from "./source-identity.js";
+// Account-ID batching lives in a dependency-free leaf so the scheduler shares the
+// exact 5-ID chunking. Re-exported here so existing importers of these symbols from
+// this module (e.g. api/datadoe.js) keep working unchanged.
+import { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds } from "./id-batching.js";
+export { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds };
 import {
   getSourceExportCache,
   isSupabaseConfigured,
@@ -34,7 +39,8 @@ export const ENDPOINTS = {
   exportRaw: (id) => `${DATADOE_BASE}/exports/${id}/raw`,
 };
 
-export const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
+// MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT now lives in ./id-batching.js (imported +
+// re-exported above).
 
 export function authHeaders(apiKey) {
   return {
@@ -219,13 +225,7 @@ export async function downloadExport(apiKey, exportId) {
   return Array.isArray(body) ? body : [];
 }
 
-export function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
+// chunkArray now lives in ./id-batching.js (imported + re-exported above).
 
 const SOURCE_CACHE_MAX_OBJECT_BYTES = 8 * 1024 * 1024;
 const SOURCE_MEMORY_CACHE_MAX = 24;
