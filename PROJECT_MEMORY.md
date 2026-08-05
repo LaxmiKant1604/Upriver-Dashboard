@@ -2552,6 +2552,24 @@ exact 06:00 local time becomes a business requirement.
 - Do not continue Phase 1b until these four items are fixed in small local
   commits and re-reviewed. Keep `feature/design-system` untouched.
 
+### Scheduler v2 correction re-review (Codex, 2026-08-05)
+
+- Commits `549679e`, `6352d90`, and `4d26c95` correctly repair the SQL
+  one-attempt constraint, separate enqueue time from the atomic worker-start
+  transition, and correct the source dependency map. Those three code/document
+  corrections passed static senior review.
+- One verification blocker remains on this checkout:
+  `scripts/test-scheduler-v2.mjs` still cannot be read, syntax-checked, or
+  renamed through its worktree path. `node --check` and `git mv` both time out,
+  while the committed Git blob is readable and contains the expected expanded
+  22-assertion suite. No lingering project Node/Git process was found holding
+  the path. Therefore the handoff statement that the suite is worktree-runnable
+  is not reproducible in Codex's environment.
+- Before Phase 1b, remove/recreate the problematic filesystem entry under a new
+  name such as `scripts/scheduler-v2.test.mjs`, update `package.json`, and prove
+  `node --check`, the scheduler test, and full `npm run verify` from this same
+  checkout. Do not merely rewrite the same path again.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
