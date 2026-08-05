@@ -102,7 +102,14 @@ create table if not exists public.sync_source_jobs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint sync_source_jobs_cycle_hash_unique unique (cycle_id, request_hash),
-  constraint sync_source_jobs_one_attempt check (create_export_count <= 1 or attempted_at is not null)
+  -- The database itself caps create-export at ONE per source job and keeps the
+  -- counter and attempted_at consistent, so a direct service-role write or a
+  -- future worker bug cannot record a second create-export. The only legal states
+  -- are: not-yet-attempted (0 / NULL) and attempted-once (1 / NOT NULL).
+  constraint sync_source_jobs_one_attempt check (
+    (create_export_count = 0 and attempted_at is null)
+    or (create_export_count = 1 and attempted_at is not null)
+  )
 );
 create index if not exists sync_source_jobs_cycle_idx
   on public.sync_source_jobs (cycle_id, fetch_status);
@@ -168,9 +175,13 @@ create trigger sync_report_jobs_touch before update on public.sync_report_jobs
   for each row execute function public.touch_updated_at();
 
 -- ---------------------------------------------------------------------------
--- open_sync_cycle — idempotent kickoff primitive. Multiple triggers (pg_cron,
--- GitHub watchdog, Vercel watchdog) for the same (bucket, cycle_date) resolve to
--- ONE cycle row. Returns the cycle id. Never creates a duplicate cycle.
+-- open_sync_cycle — idempotent kickoff/ENQUEUE primitive. Multiple triggers
+-- (pg_cron, GitHub watchdog, Vercel watchdog) for the same (bucket, cycle_date)
+-- resolve to ONE cycle row. It creates the cycle as 'pending' with started_at
+-- LEFT NULL: kickoff does not pretend execution began. Repeated calls return the
+-- existing cycle unchanged (only updated_at is touched), never a duplicate and
+-- never a status/timing reset. scheduled_at (the 02:00/10:30 target) is recorded
+-- here; the real start time is stamped later by claim_sync_cycle.
 -- ---------------------------------------------------------------------------
 create or replace function public.open_sync_cycle(
   p_bucket text,
@@ -190,12 +201,41 @@ begin
     raise exception 'Invalid bucket %', p_bucket;
   end if;
 
-  insert into public.sync_cycles (bucket, cycle_date, scheduled_at, trigger, status, started_at)
-  values (p_bucket, p_cycle_date, p_scheduled_at, coalesce(p_trigger, 'pg_cron'), 'running', now())
+  insert into public.sync_cycles (bucket, cycle_date, scheduled_at, trigger, status)
+  values (p_bucket, p_cycle_date, p_scheduled_at, coalesce(p_trigger, 'pg_cron'), 'pending')
   on conflict (bucket, cycle_date) do update set updated_at = now()
   returning id into v_id;
 
   return v_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- claim_sync_cycle — the worker START transition. Atomically moves a PENDING
+-- cycle to RUNNING and stamps started_at exactly when worker processing begins.
+-- Returns TRUE only for the caller that won the transition; a cycle already
+-- running or finished matches nothing and returns FALSE, so it can never be
+-- claimed twice or restarted. Because scheduled_at is set at kickoff and
+-- started_at only here, the Admin Data Sync Center can report truthful timings.
+-- ---------------------------------------------------------------------------
+create or replace function public.claim_sync_cycle(p_cycle_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.sync_cycles
+     set status = 'running',
+         started_at = now(),
+         updated_at = now()
+   where id = p_cycle_id
+     and status = 'pending';
+
+  -- FOUND is true only if this caller performed the single pending -> running
+  -- transition. A concurrent/repeated caller finds status <> 'pending' and gets
+  -- FALSE; started_at is never overwritten.
+  return found;
 end;
 $$;
 
@@ -256,6 +296,8 @@ create policy "admins read sync report jobs" on public.sync_report_jobs
   for select to authenticated using (public.is_dashboard_admin());
 
 revoke all on function public.open_sync_cycle(text, date, timestamptz, text) from public, anon, authenticated;
+revoke all on function public.claim_sync_cycle(uuid) from public, anon, authenticated;
 revoke all on function public.claim_source_export_attempt(uuid, text) from public, anon, authenticated;
 grant execute on function public.open_sync_cycle(text, date, timestamptz, text) to service_role;
+grant execute on function public.claim_sync_cycle(uuid) to service_role;
 grant execute on function public.claim_source_export_attempt(uuid, text) to service_role;
