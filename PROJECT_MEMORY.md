@@ -2655,6 +2655,33 @@ exact 06:00 local time becomes a business requirement.
   controlled per-organization DataDoe probes remain later rollout gates. Do not
   push, merge, deploy, or apply the migration yet.
 
+### Scheduler v2 Phase 1b partial review (Codex, 2026-08-06)
+
+- Commits `420101b`, `5026038`, and `d72497a` were reviewed. The extraction of
+  `sourceRequestIdentity` is byte-compatible with the previous implementation;
+  its 7 parity/golden-hash assertions pass. The declared constant sets for
+  `brand-sales` and `sku-pl` match their current executable builders; their 10
+  declaration tests pass.
+- **Phase 1b is not yet approved to expand to the remaining reports.** The live
+  transport in `fetchExportRows` chunks seller/vendor IDs into groups of at most
+  five and computes one request hash per chunk. `reportSourceRequestHashes`
+  currently hashes the complete supplied ID array once per source/window. For
+  six or more IDs it therefore declares a source job that no real DataDoe export
+  creates, undermining exact cache parity and the one-attempt-per-export ledger.
+  Its tests cover only one or two IDs and do not exercise the API cap.
+- The resolver also applies every supplied window to every source contract. That
+  happens to work for the two first declarations (brand-sales shares one window;
+  sku-pl has one source), but it becomes an incorrect Cartesian product for
+  reports whose sources use different windows/no-date snapshots, including FBA
+  Plan. Each contract needs an explicit request/window key and only its own
+  concrete windows before the remaining reports are declared.
+- Required correction: share the five-ID batching primitive with the live
+  transport, emit one identity per real chunk, return no requests for an empty
+  scope, add 5/6/11-ID parity tests against `fetchExportRows` semantics, and
+  replace the global `windows` list with contract-keyed concrete windows. Then
+  re-run the full verification and return for review before adding more report
+  declarations. No push, merge, migration, or deployment.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
