@@ -31,10 +31,19 @@ export function versionedObjectPath(requestHash, version) {
 
 /**
  * Atomically publish a source payload as the new last-known-good.
- * Order: read old pointer -> upload NEW immutable object -> switch pointer -> prune OLD.
- * A pointer-write failure deletes the NEW orphan and leaves the OLD object + metadata
- * intact and readable. A successful save REQUIRES a non-empty object path.
- * Returns the committed object path.
+ *
+ * Order: read old pointer -> upload NEW immutable object -> switch pointer -> READ BACK to
+ * positively confirm -> prune OLD only after confirmation.
+ *
+ * Ambiguity safety (a metadata write can time out AFTER Postgres commits): the newly
+ * uploaded immutable object is NEVER deleted here, because the pointer may already point at
+ * it. A left-behind object is a harmless orphan that a later prune pass reclaims — losing a
+ * committed pointer's object is not. The OLD object is pruned ONLY after a read-back
+ * positively confirms the pointer now points at the new object. If the switch cannot be
+ * confirmed, the previous last-known-good object + pointer are left intact and readable and
+ * the caller sees a persist failure.
+ *
+ * A successful save REQUIRES a positively confirmed, non-empty object path.
  */
 export async function atomicSaveSourcePayload({
   storage, metadata, requestHash, sourceId, organizationFingerprint,
@@ -46,32 +55,43 @@ export async function atomicSaveSourcePayload({
 
   const newPath = versionedObjectPath(requestHash, version);
   // 1) The current pointer (previous good object), read BEFORE we change anything.
-  const previous = await metadata.read(requestHash);
+  const previous = await metadata.read(requestHash).catch(() => null);
   const previousPath = previous && previous.object_path ? previous.object_path : null;
 
   // 2) Upload the NEW immutable object. The old object is untouched.
   await storage.put(newPath, JSON.stringify({ rows }));
 
-  // 3) Switch the pointer to the new object ONLY after the upload succeeds. If this
-  //    fails, remove the new orphan and preserve the old object + metadata.
-  let saved;
+  // 3) Switch the pointer. The response may be AMBIGUOUS (commit + a dropped connection),
+  //    so we never treat a throw as "not committed" — we confirm by reading it back.
+  let saved = null;
   try {
     saved = await metadata.write({
       requestHash, sourceId, organizationFingerprint, accountScopeHash, requestMeta,
       objectPath: newPath, rowCount: rows.length, payloadBytes, expiresAt,
     });
-  } catch (error) {
-    await Promise.resolve(storage.delete(newPath)).catch(() => {});
-    throw error;
-  }
-  if (!saved || !saved.object_path) {
-    await Promise.resolve(storage.delete(newPath)).catch(() => {});
-    throw new Error("Source cache pointer did not persist an object path.");
+  } catch (_ambiguous) {
+    saved = null; // DB may or may not have committed; do NOT delete newPath.
   }
 
-  // 4) Prune the OLD object only after the new pointer is committed.
-  if (previousPath && previousPath !== newPath) {
-    await Promise.resolve(storage.delete(previousPath)).catch(() => {});
+  // 4) Positively confirm the committed pointer with a read-back.
+  const confirmed = await metadata.read(requestHash).catch(() => null);
+  const confirmedPath = confirmed && confirmed.object_path ? confirmed.object_path : null;
+
+  if (confirmedPath === newPath) {
+    // Our switch is confirmed: safe to prune the previous object.
+    if (previousPath && previousPath !== newPath) {
+      await Promise.resolve(storage.delete(previousPath)).catch(() => {});
+    }
+    return newPath;
   }
-  return saved.object_path;
+  if (confirmedPath && confirmedPath !== previousPath) {
+    // A CONCURRENT cycle committed a different new version for this request_hash. Its object
+    // is the live pointer; ours is a harmless orphan (left for later cleanup). Never delete
+    // the concurrent winner or our orphan here.
+    return confirmedPath;
+  }
+  // Unconfirmed: the pointer still shows the previous object (or is unreadable). Leave the
+  // new object as an orphan, keep the previous last-known-good intact, and fail closed so
+  // the worker records a persist failure without overwriting good data.
+  throw new Error("Source cache pointer switch was not positively confirmed; preserved previous last-known-good.");
 }

@@ -69,6 +69,8 @@ function fetchStatusOf(job) {
 
 // Rebuild the complete canonical job: plan supplies fetch params + policies; the DB row
 // is authoritative for lifecycle state (status / attempted_at / export_id / connection).
+// No 'primary' default — a missing connection id is left undefined so the adapter fails
+// closed rather than silently routing to the primary key.
 function mergeJob(meta, jobRow) {
   const hash = jobRow.request_hash ?? jobRow.requestHash;
   return {
@@ -79,7 +81,7 @@ function mergeJob(meta, jobRow) {
     fetch_status: fetchStatusOf(jobRow),
     attempted_at: jobRow.attempted_at ?? jobRow.attemptedAt ?? null,
     export_id: jobRow.export_id ?? jobRow.exportId ?? null,
-    connection_id: jobRow.connection_id ?? jobRow.connectionId ?? meta.connectionId ?? "primary",
+    connection_id: jobRow.connection_id ?? jobRow.connectionId ?? meta.connectionId,
   };
 }
 
@@ -99,6 +101,19 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     await store.recordSourceFailure({ cycleId, requestHash, exportId, stage, code, message, terminal, durationMs: clock() - started, rowCount });
     progress.failed += 1;
     return { requestKey, requestHash, status: terminal ? "terminal" : "failed", validated: false, code };
+  };
+
+  // An EXECUTION-deadline deferral (our withDataDoeDeadline, NOT a DataDoe processing
+  // timeout) after an export id is saved is RESUMABLE: leave the job 'attempted' with its
+  // export_id and record nothing, so the next bounded invocation resumes poll/download
+  // without a second create-export. Returns a deferral outcome only when export_id exists;
+  // otherwise the caller falls through to a normal failure.
+  const deferIfDeadline = (error, stage) => {
+    if (isDataDoeDeadlineError(error) && exportId) {
+      progress.deferred += 1;
+      return { requestKey, requestHash, status: "deferred", validated: false, resumable: true, stage };
+    }
+    return null;
   };
 
   // ---- STEPS 1-3: create-export (only for a pending job that wins the atomic claim) ----
@@ -134,6 +149,8 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   try {
     await runWithDeadline(() => dataDoe.poll(job, exportId));
   } catch (error) {
+    const deferral = deferIfDeadline(error, "poll");
+    if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "poll");
     return fail(cls.stage, cls.code, cls.message, cls.terminal);
   }
@@ -143,6 +160,8 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   try {
     rows = await runWithDeadline(() => dataDoe.download(job, exportId));
   } catch (error) {
+    const deferral = deferIfDeadline(error, "download");
+    if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "download");
     return fail(cls.stage, cls.code, cls.message, cls.terminal);
   }
@@ -191,7 +210,7 @@ export async function runSourceJobs({
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
     cycleId: null, claimedCycle: false, alreadyFinished: false,
-    planned: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, attemptsWon: 0,
+    planned: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, attemptsWon: 0, deferred: 0,
     deadlineReached: false, drained: false,
   };
   const outcomes = [];
@@ -214,7 +233,7 @@ export async function runSourceJobs({
       cycleId, bucket,
       requestHash: job.requestHash, requestKey: job.requestKey || "",
       sourceId: job.sourceId || "", sourceKey: job.sourceKey || "",
-      connectionId: job.connectionId || "primary",
+      connectionId: job.connectionId, // explicit; no 'primary' default in Scheduler v2
       organizationFingerprint: job.organizationFingerprint || "",
       accountScopeHash: job.accountScopeHash || "", requestMeta: job.requestMeta || {},
     });

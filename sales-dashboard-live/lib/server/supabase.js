@@ -626,8 +626,12 @@ export async function claimSourceExportAttempt(cycleId, requestHash) {
 }
 
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
-// in-progress or completed job (unique cycle_id, request_hash).
+// in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
+// explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.
 export async function upsertSyncSourceJob(job) {
+  if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
+    throw new Error(`upsertSyncSourceJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
+  }
   await request("/rest/v1/sync_source_jobs?on_conflict=cycle_id,request_hash", {
     method: "POST",
     headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
@@ -637,7 +641,7 @@ export async function upsertSyncSourceJob(job) {
       source_id: job.sourceId || "",
       source_key: job.sourceKey || "",
       organization_fingerprint: job.organizationFingerprint || "",
-      connection_id: job.connectionId || "primary",
+      connection_id: job.connectionId,
       account_scope_hash: job.accountScopeHash || "",
       request_meta: job.requestMeta || {},
       bucket: job.bucket,

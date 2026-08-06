@@ -67,7 +67,9 @@ export function buildDependencyPlan(reportRequests) {
           requestHash: src.requestHash,
           sourceId: src.sourceId || "",
           sourceKey: src.sourceKey || "",
-          connectionId: src.connectionId || "primary",
+          // No 'primary' default: the connection id is carried through as declared so a
+          // missing/invalid one fails closed downstream instead of routing to primary.
+          connectionId: src.connectionId,
           organizationFingerprint: src.organizationFingerprint || "",
           accountScopeHash: src.accountScopeHash || "",
           requestMeta: src.requestMeta || {},
@@ -84,7 +86,7 @@ export function buildDependencyPlan(reportRequests) {
       reportKey: req.reportKey,
       reportVersion: req.reportVersion || "",
       accountId: req.accountId,
-      connectionId: req.connectionId || "primary",
+      connectionId: req.connectionId,
       bucket: req.bucket || "",
       dependsOn: [...new Set(dependsOn)],
     });

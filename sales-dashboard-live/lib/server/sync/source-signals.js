@@ -95,7 +95,11 @@ export const SIGNAL_PRODUCERS = Object.freeze({
 export function deriveSignalsFromOutcomes(outcomes) {
   const signals = {};
   for (const outcome of Array.isArray(outcomes) ? outcomes : []) {
-    const deriver = outcome && SIGNAL_PRODUCERS[outcome.requestKey];
+    // A deferred (deadline-resumable) or skipped job is still in progress — it produces NO
+    // signal this round (not a failed one); the next invocation reconstructs it from the
+    // persisted success once it completes.
+    if (!outcome || outcome.status === "deferred" || outcome.status === "skipped") continue;
+    const deriver = SIGNAL_PRODUCERS[outcome.requestKey];
     if (deriver) signals[outcome.requestKey] = deriver(outcome);
   }
   return signals;

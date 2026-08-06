@@ -24,17 +24,29 @@ import { deriveSignalsFromOutcomes, SIGNAL_PRODUCERS, adsCurrencySignal } from "
 
 const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000;
 
+const VALID_CONNECTION_IDS = new Set(["primary", "dd-secondary"]);
+
 // Turn a resolved job (from reportSourceRequestHashes) into a planned source job that
 // carries BOTH the durable identity fields and the in-memory fetch params the live
 // adapter needs. fetchParams is NEVER persisted (the DB stores request_meta only).
-export function plannedSourceJob(reportKey, resolved, bucket) {
+//
+// FAIL CLOSED: connectionId is REQUIRED and explicit ('primary' or 'dd-secondary') — there
+// is no silent 'primary' default anywhere in Scheduler v2 — and the resolved job must carry
+// a non-empty organizationFingerprint. Both are what the adapter verifies before any call.
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId) {
+  if (!VALID_CONNECTION_IDS.has(connectionId)) {
+    throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
+  }
+  if (!resolved.organizationFingerprint) {
+    throw new Error("plannedSourceJob requires a non-empty organizationFingerprint on the resolved job.");
+  }
   const contract = (REPORT_SOURCE_CONTRACTS[reportKey] || []).find((c) => c.requestKey === resolved.requestKey);
   return {
     requestHash: resolved.requestHash,
     requestKey: resolved.requestKey,
     sourceId: resolved.sourceId,
     sourceKey: resolved.sourceKey,
-    connectionId: resolved.connectionId || "primary",
+    connectionId,
     organizationFingerprint: resolved.organizationFingerprint,
     accountScopeHash: resolved.accountScopeHash,
     requestMeta: resolved.requestMeta,
@@ -98,7 +110,12 @@ export function makeDataDoeAdapter(connections) {
     if (!conn || !conn.apiKey) throw new Error(`No configured DataDoe connection for "${id}".`);
     const expected = conn.organizationFingerprint || organizationFingerprint(conn.apiKey);
     const jobFingerprint = job.organizationFingerprint ?? job.organization_fingerprint;
-    if (jobFingerprint && jobFingerprint !== expected) {
+    // Unconditional: a missing fingerprint is a hard failure, and it must match the
+    // selected connection. A secondary job can never be routed to the primary key.
+    if (!jobFingerprint) {
+      throw new Error(`Source job for connection "${id}" is missing its organization fingerprint.`);
+    }
+    if (jobFingerprint !== expected) {
       throw new Error(`Source job organization does not match connection "${id}"; refusing to route it.`);
     }
     return conn;
@@ -132,14 +149,37 @@ export async function reconstructSignals({ store, cycleId, resolvePlan, adsRowsP
   for (const p of producers) {
     const jobRow = byHash.get(p.requestHash);
     const status = jobRow && (jobRow.fetch_status ?? jobRow.fetchStatus);
-    if (status !== "succeeded") continue; // only a validated saved success activates downstream
-    const payload = store.loadSourceRows ? await store.loadSourceRows(p.requestHash) : null;
-    const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
+    if (status !== "succeeded") continue; // only a validated saved success can activate downstream
+
+    // Distinguish a genuine empty success from missing/corrupt cached data. ONLY a payload
+    // that LOADS cleanly with an array `rows` (possibly []) is a validated success. A cache
+    // miss, a read error, or a payload whose `rows` is not an array is UNAVAILABLE — it must
+    // NOT be reconstructed as validated:true, or a missing SQP payload could wrongly activate
+    // catalog / monthly-fallback work.
+    let rows = null;
+    try {
+      const payload = store.loadSourceRows ? await store.loadSourceRows(p.requestHash) : null;
+      if (payload && Array.isArray(payload.rows)) rows = payload.rows;
+    } catch (_readError) {
+      rows = null;
+    }
+    if (rows === null) {
+      // Persisted job says succeeded, but its cached payload is missing/unreadable/malformed:
+      // a safe source-cache-unavailable state that activates NOTHING downstream.
+      signals[p.requestKey] = SIGNAL_PRODUCERS[p.requestKey]({ requestKey: p.requestKey, status: "failed", validated: false, unavailableReason: "source-cache-unavailable" });
+      continue;
+    }
     signals[p.requestKey] = SIGNAL_PRODUCERS[p.requestKey]({ requestKey: p.requestKey, status: "success", validated: true, rows });
   }
   if (adsRowsProvider) {
-    const adsRows = await adsRowsProvider();
-    signals["ppc-performance:ads-currency"] = adsCurrencySignal(adsRows);
+    // A validated currency read requires a real array of persisted ads rows. A missing/failed
+    // read must NOT present as currencyCount 0 (which would schedule total-sales); it is
+    // unavailable, so total-sales stays unscheduled (fail closed).
+    let adsRows = null;
+    try { adsRows = await adsRowsProvider(); } catch (_e) { adsRows = null; }
+    signals["ppc-performance:ads-currency"] = Array.isArray(adsRows)
+      ? adsCurrencySignal(adsRows)
+      : { status: "failed", validated: false, currencyCount: null };
   }
   return signals;
 }
