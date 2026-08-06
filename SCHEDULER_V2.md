@@ -633,3 +633,79 @@ Golden `request_hash` `5601253219be13c7…` unchanged; five-ID batching and
 primary/dd-secondary isolation unchanged; dedup groups unchanged.
 `report-source-contracts.test.mjs` = **155 assertions**; full `npm run verify` green
 (**327**); `git diff --check` clean.
+
+---
+
+## 13. Phase 1c — source-job worker (SHADOW MODE, 2026-08-06)
+
+The checkpointable, idempotent source half of a cycle. SHADOW MODE: not wired to any
+route/cron and it does not replace Scheduler v1 (`run-sync.js`); the pg_cron/Vercel
+kickoff and the production `resolvePlan` (registry → accounts → windows) are deliberately
+left for a later step. Commits `77c87d3` / `7c53045` / `68f1a9c`. Nothing pushed,
+merged, deployed, or migrated; Phase 1d (report derivation) not started.
+
+### 13.1 Modules (all I/O injected → deterministic, offline-testable)
+
+- `lib/server/sync/source-signals.js` — typed dependency signals from VALIDATED saved
+  results only (never the browser): probe `{status,validated,latestReportedDate}`,
+  keyword weekly `{…,distinctPeriods}`, optimizer SQP `{status,validated}`, PPC ads
+  currency `{…,currencyCount}` (from persisted `ads_daily_source_rows`).
+- `lib/server/sync/source-worker.js` — `runSourceJobs()`; the lifecycle below.
+- `lib/server/sync/source-sync-driver.js` — `makeSupabaseSourceStore` / `makeDataDoeFetcher`
+  / `runStagedSourceCycle`; the shadow composition + staged loop.
+- `lib/server/supabase.js` — service-role wrappers for the 3 tables + 3 RPCs.
+
+### 13.2 Worker / checkpoint flow (per invocation)
+
+1. `open_sync_cycle(bucket, cycle_date)` → the one cycle id (idempotent).
+2. `claim_sync_cycle(id)` → the first worker stamps `started_at`; a finished cycle is a
+   no-op. Later invocations proceed (per-job guards handle concurrency).
+3. Upsert each canonical job once (`unique(cycle_id, request_hash)`, ignore-duplicates).
+4. For each still-`pending` job, bounded by `maxJobs` and a wall-clock deadline:
+   a. `claim_source_export_attempt(id, request_hash)` — the durable one-attempt guard.
+      Lose it → create nothing (skip). Win it → exactly one create-export.
+   b. `fetchSource(job)` (create → poll → download via the injected DataDoe fetcher).
+   c. VALIDATE: a strict job at/above its row cap → `validate`/`TRUNCATED`, terminal,
+      NOT saved.
+   d. PERSIST: save rows to `source_export_cache`; a save error is a SEPARATE
+      `persist`/`SAVE_FAILED` stage.
+   e. On success → `succeeded` + `last_good_fetched_at`. On any failure → `failed` with a
+      SAFE `{stage,code,message}`; `cache_object_path`/`last_good_fetched_at` are never
+      cleared (last-known-good survives).
+5. Stop at the deadline (`deadlineReached`) or when the pending list drains; return
+   progress with NO secret.
+
+### 13.3 Database operations used
+
+`open_sync_cycle`, `claim_sync_cycle`, `claim_source_export_attempt` (RPCs);
+`sync_cycles` counts PATCH; `sync_source_jobs` insert-if-absent / list / success+failure
+PATCH; `source_export_cache` save. All service-role; RLS keeps reads admin-only.
+
+### 13.4 One-attempt & isolation evidence
+
+`claim_source_export_attempt` is a single guarded `UPDATE … WHERE attempted_at IS NULL`
+returning `FOUND` — one winner per (cycle, request_hash) across separate serverless
+invocations, backstopped by the `one_attempt` CHECK. Five-ID chunks and primary vs
+dd-secondary orgs have distinct `request_hash`es → distinct jobs → distinct exports; the
+worker never mixes them.
+
+### 13.5 Dependency-signal & failure/last-known-good evidence
+
+Signals are computed from the worker's own validated rows and fed back into the approved
+`reportSourceRequestHashes` (Sales Movers downstream uses the validated probe date;
+Optimizer catalog waits for a validated SQP success; Keyword monthly follows the
+distinct-period policy; PPC total-sales respects the ads-currency count). A
+failed/terminal/timed-out/save-failed job is not retried in the same cycle, saves no
+empty/partial/truncated data, and preserves the prior source rows and report snapshot.
+
+### 13.6 Tests / invariants
+
+`scheduler-v2.test.mjs` = **40 assertions** (in-memory store modelling the RPCs). Full
+`npm run verify` green (**345**); `git diff --check` clean. Golden `request_hash`,
+five-ID batching, and primary/dd-secondary isolation unchanged.
+
+### 13.7 Unresolved live gates (before enabling)
+
+pg_cron/Vercel kickoff + production `resolvePlan` wiring are not built; a live cycle
+against real DataDoe/Supabase (create/poll/download timing, disabled-source classification,
+Storage save) is Codex's separate gate. Report derivation is Phase 1d.

@@ -1,5 +1,41 @@
 # Project Memory
 
+## Scheduler v2 Phase 1c — source-job worker (SHADOW MODE, 2026-08-06)
+
+Implemented the checkpointable, idempotent source-job worker on `feature/scheduler-v2`
+(commits `77c87d3`, `7c53045`, `68f1a9c`; a docs commit follows). SHADOW MODE — not
+wired to any route/cron; Scheduler v1 untouched. Not pushed/merged/deployed/migrated;
+Phase 1d (report derivation) NOT started; browser refresh controls untouched. See
+SCHEDULER_V2.md §13.
+
+New files (all I/O injected -> fully offline-testable):
+- `lib/server/sync/source-signals.js` — typed signals derived ONLY from validated saved
+  results: Sales Movers probe `{status,validated,latestReportedDate}`, Keyword weekly
+  `{…,distinctPeriods}`, Optimizer SQP `{status,validated}`, PPC Ads currency
+  `{…,currencyCount}` from persisted `ads_daily_source_rows`. Never from the browser.
+- `lib/server/sync/source-worker.js` — `runSourceJobs()`: open/claim cycle, idempotent
+  upsert (one job per cycle_id+request_hash), `claim_source_export_attempt` BEFORE any
+  create-export (one export/hash/cycle across invocations; a lost claim creates nothing),
+  fetch/validate/persist recorded on SEPARATE stages with SAFE stage/code/message
+  (`classifyFetchError`, no raw error/secret), strict cap => validate/TRUNCATED (never
+  saved), resume (completed/attempted/failed skipped; no in-cycle retry), deadline
+  checkpoint, last-known-good preserved on every failure.
+- `lib/server/sync/source-sync-driver.js` — SHADOW composition: `makeSupabaseSourceStore`
+  + `makeDataDoeFetcher` (apiKey per connection, never stored) + `runStagedSourceCycle`
+  (plan primaries -> execute -> derive signals -> re-plan downstream via
+  `reportSourceRequestHashes` -> execute).
+
+`supabase.js` adds service-role wrappers for the three Phase 1c tables + three RPCs; a
+failure record never clears `cache_object_path`/`last_good_fetched_at`.
+
+Tests: `scheduler-v2.test.mjs` = **40 assertions** (in-memory store modelling the RPCs).
+Full `npm run verify` green (**345**); `git diff --check` clean. Golden `request_hash`,
+five-ID batching, and primary/dd-secondary isolation unchanged.
+
+Unresolved (Phase 1c live gates, before enabling): the pg_cron/Vercel kickoff wiring +
+the production `resolvePlan` (registry -> account directory -> windows) are deliberately
+NOT wired; a live cycle against real DataDoe/Supabase remains Codex's separate gate.
+
 ## Scheduler v2 Phase 1b — staged-policy re-review corrections applied (2026-08-06)
 
 Fixed the three fail-closed findings from the staged-policy re-review (below) on
