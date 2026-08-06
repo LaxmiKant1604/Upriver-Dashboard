@@ -1,5 +1,40 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b review - changes required (Codex, 2026-08-06)
+
+Reviewed commits `86cc805` and `7a8c8f4` on `feature/scheduler-v2`. Full
+`npm run verify` is green (54 insight + 60 Brand View + 23 sync + 6 source-cache
++ 22 Scheduler v2 + 7 source-identity + 60 report-contract assertions + build),
+but Phase 1b is **not approved yet**. Tests currently miss the following semantic
+and operational issues:
+
+1. **Keyword monthly fallback wastes a source export.** The executable handler only
+   fetches monthly SQP when weekly has fewer than four periods. The declaration makes
+   weekly and monthly unconditional, spending one unnecessary monthly export per
+   account/cycle once weekly history is sufficient. Encode a data-dependent fallback
+   condition that Phase 1c can enforce; do not solve this by browser input.
+2. **Daily superset truncation is not actually guarded.** The declaration and test
+   call the 50,000-row monthly cap "strict", but `fetchDailyBrandSalesRows` uses
+   `fetchExportRows` and never checks `rows.length >= DAILY_BRAND_ROW_LIMIT`. A capped
+   month could therefore derive understated all-brand and brand totals. Add an
+   executable strict guard or explicit scheduler validation metadata/output with a
+   test that fails if the guard disappears. Keep Daily behind its live superset-vs-
+   compact reconciliation gate.
+3. **Disabled-source status is described at the wrong layer.** HTTP 424 is generated
+   by the user-facing report API. A source-first worker sees DataDoe's raw disabled-
+   source error. Contracts must expose machine-readable terminal/degraded semantics;
+   Phase 1c must not branch on the report API's HTTP 424 string.
+4. **Insight dedup/classification documentation was inaccurate.** Five reports share
+   `common.fetchCatalog`, not all six; only three share the inventory helper. Listing
+   Optimizer uses a richer catalog identity, so it cannot share that common catalog.
+   Its disabled SQP path degrades to a valid `sqpAvailable:false` snapshot rather than
+   making the whole report terminal. `SCHEDULER_V2.md` was corrected during review.
+
+No implementation correction, Phase 1c work, push, merge, deployment, or Supabase
+migration was performed in this review. The next Claude pass must correct these four
+items, add focused tests, update both documents, and return for re-review before any
+insight declarations or worker implementation continue.
+
 ## Scheduler v2 Phase 1b — operational reports complete + insight audit (2026-08-06)
 
 `feature/scheduler-v2` (not pushed/merged/deployed; `feature/design-system` untouched;

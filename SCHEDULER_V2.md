@@ -255,7 +255,9 @@ validate. Do not claim accuracy without live reconciliation evidence.
 Audited from executable code in `lib/server/reports/` (`sources.js`, `common.js`,
 per-report builders). Dependency classes: **owned** = the report's own DataDoe export;
 **derived** = persisted `ads_daily_source_rows` / another snapshot; **org-cond** =
-`defaultDataset:false` source ⇒ HTTP 424 when disabled for an organization.
+`defaultDataset:false`. The report API may translate DataDoe's disabled-source error
+to HTTP 424, but a Scheduler v2 source worker sees the raw DataDoe error and must
+classify it with `isSourceDisabledError` (or an equivalent safe error code).
 
 | Report | Owned DataDoe exports (source · columns-const · limit · window · order) | Derived / org-cond |
 |---|---|---|
@@ -263,17 +265,19 @@ per-report builders). Dependency classes: **owned** = the report's own DataDoe e
 | Buy Box Loss | `profit-by-sku` DAILY_COLUMNS 50000 per-slice · `fba-inventory-health` · `product-catalog` | — |
 | Returns & Refunds | `returns` RETURN_COLUMNS 50000 · `settlements` SETTLEMENT_GROUP_BY 50000 · `sales-traffic` TRAFFIC_GROUP_BY 50000 · `product-catalog` | — |
 | Listing Health | `listings` LISTING_COLUMNS 20000 no-date · `profit-by-sku` SALES_COLUMNS 50000 · `fba-inventory-health` · `product-catalog` | **`listings-raw` org-cond, DEGRADES gracefully (optional)** |
-| Listing Optimizer | `sqp-weekly` SQP_COLUMNS 50000 · `product-catalog` | **`sqp-weekly` org-cond, terminal if disabled** |
+| Listing Optimizer | `sqp-weekly` SQP_COLUMNS 50000 · its own richer `product-catalog` request | **`sqp-weekly` org-cond; builder degrades to a valid `sqpAvailable:false` snapshot when disabled** |
 | PPC Performance | `sales-traffic` TOTAL_SALES_GROUP_BY 500 date-rollup (TACoS denominator) · `product-catalog` | **ads DERIVED from persisted `ads_daily_source_rows`** (never a live ads export) |
 
-**Shared insight fetchers (token saving via dedup):** every insight report calls
-`common.js fetchCatalog` (`product-catalog`, CATALOG_COLUMNS, **no-date**, limit **20000**,
-child_asin/ASC) and most call `fetchInventorySnapshot` (`fba-inventory-health`,
-INVENTORY_COLUMNS, {asOf-10..asOf}, 15000, date/DESC) with IDENTICAL shapes. For one
-account/org these resolve to the SAME `request_hash`, so the scheduler dedups them to ONE
-catalog export + ONE inventory export across all six insight reports. NOTE: the insight
-catalog (no-date, 20000) differs from the operational reports' catalog (windowed, 10000) ⇒
-a different `request_hash` ⇒ not shared with those.
+**Shared insight fetchers (token saving via dedup):** five reports call `common.js
+fetchCatalog` (Sales Movers, Buy Box Loss, Returns, Listing Health, PPC) with one
+identical `product-catalog` identity: CATALOG_COLUMNS, no-date, limit 20000,
+child_asin/ASC. Three reports call `fetchInventorySnapshot` (Sales Movers, Buy Box
+Loss, Listing Health) with one identical FBA Inventory Health identity. Those matching
+consumers can share one catalog and one inventory export per account/org. Listing
+Optimizer does **not** use `fetchCatalog`: it requests richer content columns, so its
+catalog has a different `request_hash` and cannot share under the exact-identity rule.
+The common insight catalog also differs from operational catalogs (window/limit), so
+it is not shared with those.
 
 **Not declared this session (stop condition, honest):** each insight report's column
 constants live in the builder files (not `api/datadoe.js`) and several use org-conditional
