@@ -1,5 +1,63 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b review blockers — fixed (2026-08-06)
+
+Fixed the three implementation blockers from "Phase 1b review - changes required"
+(further below) on `feature/scheduler-v2` (not pushed/merged/deployed;
+`feature/design-system` untouched; insight declarations + Phase 1c NOT started; no
+migration). Commits `625001f` (FIX 1) + `4d1dd64` (FIX 2+3) + a docs commit. Blocker
+4 (insight dedup/classification doc) was already corrected in `SCHEDULER_V2.md` §7
+during review.
+
+- **FIX 1 — Daily superset strict cap (blocker 2).** `fetchDailyBrandSalesRows`
+  (api/datadoe.js) now rejects any monthly ASIN/day window at `DAILY_BRAND_ROW_LIMIT`
+  (50000) **before appending** (window in the safe error), so a truncated month can't
+  derive/save an understated all-brand/named-brand total. `strict: true` added to
+  every contract whose builder truly enforces the cap (daily superset, sku-pl, keyword
+  weekly+monthly, reconciliation orders+settlements) and none that don't; pure
+  `rejectsAtCap(rowCount, limit)`. Tests: 49,999 accepted / exactly 50,000 rejected;
+  builder guard precedes append; no unbacked `strict` label. Daily stays behind its
+  live superset-vs-compact reconciliation gate.
+- **FIX 2 — Keyword monthly typed fallback (blocker 1).** `keyword-rank:sqp-monthly`
+  now has `dependencyMode:"fallback"`, `dependsOnRequestKey:"keyword-rank:sqp-weekly"`,
+  `condition:{type:"distinct_periods_lt",value:4}`. Pure `evaluateFallbackCondition`
+  + resolver `fallbackSignals`: monthly is active ONLY once weekly is evaluated (signal
+  present) AND has <4 distinct periods. **Token saving:** kickoff plans no monthly, so
+  sufficient weekly history spends no monthly export (one fewer/account/cycle). A
+  present-but-empty weekly signal (failed/last-known-good) still attempts monthly.
+  Deterministic; one-create-export-per-cycle stays `unique(cycle_id, request_hash)` +
+  `claim_source_export_attempt`. Tests: kickoff no-monthly, 4+ => none (+ rejects stray
+  monthly window), 0-3 => exactly one, no duplicate, last-known-good failure still
+  attempts monthly, org isolation, 0/1/5/6/11 transport parity.
+- **FIX 3 — machine-readable failure policy (blocker 3).** Replaced the misleading
+  `orgAvailability` strings (which described the report API's HTTP 424) with structured
+  `availabilityPolicy {disabledSource:"terminal"|"degraded", safeCode:"SOURCE_DISABLED",
+  reportOutcome:"blocked"|"save-unavailable-snapshot"}` on every conditional source
+  (keyword weekly+monthly, content events — all terminal). Pure `sourceDisabledOutcome`
+  branches on this, never on HTTP 424 (no contract field contains "424"). Tests: every
+  conditional source has structured policy; terminal vs degraded distinct; degraded
+  permits derivation; terminal blocks only its report.
+- `report-source-contracts.test.mjs` = **74 assertions**; full `npm run verify` green.
+  Remaining live gates: Daily all-brand reconciliation, per-org SQP/content/listings-raw
+  availability. Insight contracts + Phase 1c remain future work.
+
+## Supabase plan and storage status (2026-08-06)
+
+- The `upriver-shared-data` Supabase project is managed through the Vercel
+  Marketplace. Subscription changes, invoices, and payment must therefore be handled
+  in Vercel; the Supabase dashboard's direct plan controls are intentionally disabled.
+- Supabase usage showed database size `607 MB / 500 MB`, so the Free database quota
+  has been exceeded. The intended upgrade is Supabase Pro through the existing Vercel
+  Marketplace installation; the displayed Pro allowance is 8 GB disk per project.
+- This is separate from the Vercel hosting plan. Upgrade the Supabase Marketplace
+  resource, not merely the Vercel application hosting plan.
+- Architecture recommendation: direct Supabase management is preferable long-term for
+  the planned SaaS because billing, owners, project creation, and provider features are
+  controlled independently of Vercel. Do not transfer during Scheduler v2 development;
+  upgrade through Vercel now, stabilize/validate Scheduler v2, then plan and test a
+  Vercel-managed-to-Supabase-managed organization transfer separately. No transfer
+  decision or action has been made yet.
+
 ## Scheduler v2 Phase 1b review - changes required (Codex, 2026-08-06)
 
 Reviewed commits `86cc805` and `7a8c8f4` on `feature/scheduler-v2`. Full

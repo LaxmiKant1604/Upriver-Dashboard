@@ -286,3 +286,52 @@ focused Phase 1b increment, using the same method as the operational reports. Th
 classification above is complete; the formal `REPORT_SOURCE_CONTRACTS` entries + tests
 remain. No insight contract was guessed or half-declared. Priority Feed + Brand View stay
 derived-only (no DataDoe export).
+
+---
+
+## 8. Phase 1b review-blocker fixes (2026-08-06)
+
+Three review blockers corrected (commits `625001f`, `4d1dd64`). `npm run verify` green;
+insight declarations + Phase 1c NOT started.
+
+**FIX 1 — Daily superset row cap is now strictly enforced.** `fetchDailyBrandSalesRows`
+(api/datadoe.js) rejects any monthly ASIN/day window at the `DAILY_BRAND_ROW_LIMIT`
+(50,000) cap **before appending**, with the month in the safe error, so a truncated
+month can never derive/save an understated all-brand or named-brand total (the prior
+snapshot is preserved by the save-on-success adapter). The contract exposes this
+machine-readably: `strict: true` on every contract whose builder actually rejects at
+cap (`daily-reporting:asin-day-superset`, `sku-pl:monthly-profit`, `keyword-rank:sqp-weekly`,
+`keyword-rank:sqp-monthly`, `reconciliation:order-lines`, `reconciliation:settlements`)
+and none that do not. Pure `rejectsAtCap(rowCount, limit)` helper for Phase 1c. Daily
+stays behind its live superset-vs-compact reconciliation gate.
+
+**FIX 2 — Keyword monthly is a typed data-dependent fallback.** `keyword-rank:sqp-monthly`
+carries `dependencyMode:"fallback"`, `dependsOnRequestKey:"keyword-rank:sqp-weekly"`,
+`condition:{ type:"distinct_periods_lt", value:4 }`. Pure `evaluateFallbackCondition`
++ resolver `fallbackSignals` gate it: active ONLY once weekly is evaluated (signal
+present) AND weekly has < 4 distinct periods. **Token saving:** at kickoff (no signal)
+monthly is not planned, so an account with sufficient weekly history spends **no** monthly
+export — one fewer export/account/cycle than the previous unconditional declaration. A
+present-but-empty weekly signal (failed/empty last-known-good) still attempts monthly.
+Determinism + the one-create-export-per-cycle guarantee (`unique(cycle_id, request_hash)`
++ `claim_source_export_attempt`) mean repeated workers never duplicate it.
+
+**FIX 3 — machine-readable source-failure policy.** The misleading `orgAvailability`
+strings (which described the report API's HTTP 424) are replaced with structured
+`availabilityPolicy { disabledSource:"terminal"|"degraded", safeCode:"SOURCE_DISABLED",
+reportOutcome:"blocked"|"save-unavailable-snapshot" }` on every conditional source
+(keyword weekly+monthly, content-changes events — all **terminal**). Pure
+`sourceDisabledOutcome(policy)` returns `{ blocks, safeCode, reportOutcome }`; a
+source-first worker branches on this, **never** on an HTTP 424 string (no contract field
+contains "424"). Degraded (e.g. the future Listing Optimizer `sqp-weekly`, which the
+builder degrades to a valid `sqpAvailable:false` snapshot) does not block; terminal
+blocks only its own report while other reports/accounts in the cycle continue.
+
+**Tests:** `report-source-contracts.test.mjs` = **74 assertions** (adds the strict-cap,
+fallback, and structured-policy proofs). Full `npm run verify` green: 54 insight + 60
+Brand View + 23 sync + 6 source-cache + 22 scheduler-v2 + 7 source-identity + 74
+report-contracts + build.
+
+**Remaining live gates:** Daily superset-vs-compact all-brand reconciliation; real
+per-org SQP / content-changes / listings-raw availability (the raw disabled-source
+error). Insight contract declarations + Phase 1c remain future work.
