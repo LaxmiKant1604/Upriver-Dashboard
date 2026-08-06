@@ -3396,6 +3396,69 @@ exact 06:00 local time becomes a business requirement.
   day as final. Ads rolling re-fetch/upsert remains necessary for attribution
   corrections.
 
+### Scheduler v2 Phase 1c review (Codex, 2026-08-06)
+
+- Reviewed local commits `77c87d3`, `7c53045`, `68f1a9c`, and `aa6c6d1` on
+  `feature/scheduler-v2`. Phase 1c is **not approved** yet. The pure/offline
+  worker tests do not exercise several production Supabase/serverless
+  boundaries, and the current production adapter cannot complete a real job.
+- **Blocker: planned-job metadata is lost after the database round-trip.**
+  `plannedSourceJob` keeps `fetchParams` only in memory, `getSyncSourceJobs`
+  does not return `request_key`, organization/account/request metadata, and
+  `runSourceJobs` overlays only `strict` and `limit` onto the reloaded row. The
+  real fetcher therefore receives no `fetchParams` and fails every job; signal
+  outcomes also lose `requestKey`. Merge the complete regenerated planned job
+  by `request_hash` (with DB state authoritative for status/export id), or
+  persist/reconstruct every canonical fetch field, and add a test using the
+  exact production PostgREST row shape.
+- **Blocker: organization isolation fails open.** `plannedSourceJob` defaults a
+  missing connection to `primary`, and `makeDataDoeFetcher` silently falls back
+  to the primary connection when a requested connection id is absent or
+  unknown. A secondary job can therefore be sent with the primary API key.
+  Require an explicit valid connection id, fail closed on any mismatch, and
+  verify its organization fingerprint against the planned identity. Add tests
+  proving missing/unknown/secondary-without-key jobs make zero DataDoe calls.
+- **Blocker: create/poll/download is not checkpointable.** The worker claims the
+  only create-export attempt, but the production fetcher records `export_id`
+  only after polling and downloading finish. An invocation crash/deadline after
+  the POST leaves the row `attempted`; every resumed worker skips attempted
+  rows, so the paid export can never be polled/downloaded. Split the lifecycle:
+  persist `export_id` immediately after create, then let later invocations
+  resume poll/download without another POST. Propagate the worker deadline via
+  `withDataDoeDeadline`; checking time only before starting a potentially
+  45-second export is not a serverless deadline guarantee.
+- **Blocker: staged signals are memory-only across invocations.** Signals are
+  derived only from outcomes processed in the current `runStagedSourceCycle`.
+  After `maxJobs` or a deadline stops between the primary and downstream round,
+  the next invocation skips the already-succeeded primary and emits no signal,
+  so Sales Movers, Keyword fallback, and Listing Optimizer downstream jobs are
+  never planned. Persist validated signal facts, or reconstruct them from the
+  successful job plus saved source payload on resume. Test a brand-new driver
+  invocation after a one-job/deadline checkpoint, not only a second call using
+  the same in-memory state.
+- **Blocker: source-cache writes do not preserve last-known-good atomically.**
+  `saveSourceExportCache` uploads with `x-upsert:true` to a stable path based
+  only on `request_hash` before updating Postgres. If the metadata update then
+  fails, the old cache row still points to an object that has already been
+  overwritten, contradicting the worker's `previous data preserved` status.
+  Write to a versioned immutable object path, atomically switch the metadata
+  pointer only after upload succeeds, and retain the previous object until the
+  pointer commit is confirmed. Also reject a malformed/non-array fetch payload
+  instead of coercing it to a successful empty array.
+- Cycle counters are currently invocation-local: a resumed/staged round writes
+  only that call's success/failure counts and can reset previously accumulated
+  totals. Recompute counts from the persisted job rows (or update atomically)
+  before exposing them to the future Admin Data Sync Center.
+- The handoff's test evidence is not independently reproducible in this
+  checkout: both `node --check scripts/scheduler-v2.test.mjs` and
+  `npm run test:scheduler-v2` hung without output and were terminated after 15+
+  seconds. This is the same class of test-file checkout blocker seen earlier.
+  Resolve the artifact/read hang and rerun the focused suite plus full
+  `npm run verify` before re-review.
+- Nothing was pushed, merged, deployed, or migrated during this review;
+  `feature/design-system` remains untouched. Do not begin Phase 1d until these
+  Phase 1c production-boundary defects are corrected and reviewed.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
