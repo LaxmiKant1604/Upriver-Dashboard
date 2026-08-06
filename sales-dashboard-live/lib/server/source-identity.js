@@ -27,6 +27,15 @@ export function stableValue(value) {
   );
 }
 
+// The organization fingerprint of a DataDoe apiKey (first 24 hex of its sha256). The
+// scheduler uses this to VERIFY a source job is routed to the connection that owns it —
+// a primary job may only run on the primary key, a dd-secondary job only on the
+// secondary key — before any DataDoe call. Byte-identical to the value baked into
+// request_hash, so identities are unchanged.
+export function organizationFingerprint(apiKey) {
+  return sha256(apiKey).slice(0, 24);
+}
+
 export function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
   const contract = sourceContractForId(sourceId);
   const organizationFingerprint = sha256(apiKey).slice(0, 24);

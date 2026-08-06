@@ -679,6 +679,13 @@ export async function recordSyncSourceSuccess({ cycleId, requestHash, exportId =
   });
 }
 
+// Persist the DataDoe export id IMMEDIATELY after create-export, keeping fetch_status
+// 'attempted' (set by the claim RPC), so a crash after the POST resumes poll/download
+// WITHOUT a second create-export.
+export async function recordSyncSourceExportCreated({ cycleId, requestHash, exportId }) {
+  await patchSyncSourceJob(cycleId, requestHash, { export_id: exportId });
+}
+
 // Failure NEVER clears cache_object_path / last_good_fetched_at, so last-known-good
 // source data survives. error_message is the SAFE operator string only.
 export async function recordSyncSourceFailure({ cycleId, requestHash, stage, code, message, terminal = false, durationMs, rowCount = null, exportId = null }) {
@@ -693,6 +700,46 @@ export async function recordSyncSourceFailure({ cycleId, requestHash, stage, cod
     row_count: rowCount,
     export_id: exportId,
   });
+}
+
+// Injected adapters for the ATOMIC source-cache save (lib/server/sync/source-cache.js):
+// Storage put/get/delete on the private source-cache bucket, and the source_export_cache
+// pointer read/write. Kept as adapters so the atomic algorithm stays offline-testable.
+export function sourceCacheStorageAdapter() {
+  return {
+    put: (objectPath, contents) => putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, contents),
+    get: (objectPath) => getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath),
+    delete: (objectPath) => deletePrivateStorageObjects(SOURCE_CACHE_BUCKET, [objectPath]),
+  };
+}
+
+export function sourceCacheMetadataAdapter() {
+  return {
+    read: async (requestHash) => {
+      const query = new URLSearchParams({ select: "request_hash,object_path", request_hash: `eq.${requestHash}`, limit: "1" });
+      const rows = await request(`/rest/v1/source_export_cache?${query}`);
+      return rows[0] || null;
+    },
+    write: async (entry) => {
+      const saved = await request("/rest/v1/source_export_cache?on_conflict=request_hash", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+        body: {
+          request_hash: entry.requestHash,
+          source_id: entry.sourceId,
+          organization_fingerprint: entry.organizationFingerprint,
+          account_scope_hash: entry.accountScopeHash,
+          request_meta: entry.requestMeta,
+          object_path: entry.objectPath,
+          row_count: entry.rowCount,
+          payload_bytes: entry.payloadBytes,
+          fetched_at: new Date().toISOString(),
+          expires_at: entry.expiresAt,
+        },
+      });
+      return saved[0] || null;
+    },
+  };
 }
 
 export async function getReportSnapshotsMeta({ reportKeys, accountIds } = {}) {
