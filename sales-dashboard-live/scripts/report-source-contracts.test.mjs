@@ -752,6 +752,26 @@ test("normalizeAvailabilityPolicy: terminal vs degraded distinct; rejects bad en
   assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "nope" }), /reportOutcome/);
   assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "HTTP 424", reportOutcome: "blocked" }), /HTTP status/);
 });
+test("availabilityPolicy enforces the only two valid pairs (crossed combinations rejected)", () => {
+  // valid pairs accepted
+  assert.deepEqual(normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" }),
+    { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" });
+  assert.deepEqual(normalizeAvailabilityPolicy({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" }),
+    { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" });
+  // crossed pairs rejected (contradictory worker instructions)
+  assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" }), /Contradictory availabilityPolicy/);
+  assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" }), /Contradictory availabilityPolicy/);
+});
+test("sourceDisabledOutcome enforces the SAME invariant (rejects crossed pairs; null => blocked)", () => {
+  // shares normalizeAvailabilityPolicy, so contradictory pairs fail closed here too
+  assert.throws(() => sourceDisabledOutcome({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" }), /Contradictory availabilityPolicy/);
+  assert.throws(() => sourceDisabledOutcome({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" }), /Contradictory availabilityPolicy/);
+  // null/no-policy stays safe: a disabled default-dataset source is treated as blocked
+  assert.deepEqual(sourceDisabledOutcome(null), { blocks: true, safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" });
+  // consistent outcomes for the valid pairs
+  assert.equal(sourceDisabledOutcome({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" }).blocks, true);
+  assert.equal(sourceDisabledOutcome({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" }).blocks, false);
+});
 test("mutating a returned job's execution policy cannot mutate REPORT_SOURCE_CONTRACTS", () => {
   const before = JSON.stringify(REPORT_SOURCE_CONTRACTS["keyword-rank"]);
   const wk = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff })

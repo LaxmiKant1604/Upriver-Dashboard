@@ -485,22 +485,40 @@ export function evaluateFallbackCondition(condition, signal) {
 // produced (terminal); a degraded source does not block — the report saves a valid
 // snapshot with the source marked unavailable.
 export function sourceDisabledOutcome(policy) {
-  const degraded = policy && policy.disabledSource === "degraded";
+  // Consume the SAME normalized invariant as the resolved jobs, so both functions
+  // enforce identical valid pairs and can never disagree. A malformed or contradictory
+  // policy throws here too (fail closed).
+  const normalized = normalizeAvailabilityPolicy(policy);
+  if (normalized == null) {
+    // No disabled-source policy (a default-dataset source). This is only reached if a
+    // caller asks about a source with no policy; treat a disabled default source
+    // conservatively as terminal/blocked.
+    return { blocks: true, safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" };
+  }
   return {
-    blocks: !degraded,
-    safeCode: (policy && policy.safeCode) || "SOURCE_DISABLED",
-    reportOutcome: (policy && policy.reportOutcome) || (degraded ? "save-unavailable-snapshot" : "blocked"),
+    // The pair is guaranteed consistent by normalizeAvailabilityPolicy: terminal =>
+    // blocked, degraded => save-unavailable-snapshot.
+    blocks: normalized.disabledSource === "terminal",
+    safeCode: normalized.safeCode,
+    reportOutcome: normalized.reportOutcome,
   };
 }
 
 const VALID_DISABLED_SOURCE = new Set(["terminal", "degraded"]);
 const VALID_REPORT_OUTCOME = new Set(["blocked", "save-unavailable-snapshot"]);
+// The ONLY consistent pairs: a terminal source blocks its report; a degraded source
+// lets the report save an unavailable snapshot. Any crossed pair
+// (terminal + save-unavailable-snapshot, degraded + blocked) is contradictory.
+const REQUIRED_REPORT_OUTCOME = { terminal: "blocked", degraded: "save-unavailable-snapshot" };
 
 // Copy + validate a contract's availabilityPolicy into an IMMUTABLE value for a
-// concrete source job. Returns null when the source has no disabled-source policy.
-// Rejects unknown enums and any HTTP status string, so a resolved job never carries
-// the report API's HTTP 424 prose. The returned object is frozen and detached from
-// REPORT_SOURCE_CONTRACTS, so mutating a job cannot mutate the registry.
+// concrete source job. Returns null when the source has no disabled-source policy
+// (a default-dataset source that never reports disabled). Rejects unknown enums, any
+// HTTP status string, and — critically — any disabledSource/reportOutcome combination
+// that is not one of the two valid pairs, so a resolved job (and sourceDisabledOutcome,
+// which consumes this) can never carry contradictory worker instructions. The returned
+// object is frozen and detached from REPORT_SOURCE_CONTRACTS, so mutating a job cannot
+// mutate the registry.
 export function normalizeAvailabilityPolicy(policy) {
   if (policy == null) return null;
   if (typeof policy !== "object" || Array.isArray(policy)) {
@@ -518,6 +536,9 @@ export function normalizeAvailabilityPolicy(policy) {
   }
   if (/424/.test(safeCode) || /424/.test(String(reportOutcome)) || /424/.test(String(disabledSource))) {
     throw new Error("availabilityPolicy must not carry HTTP status strings.");
+  }
+  if (reportOutcome !== REQUIRED_REPORT_OUTCOME[disabledSource]) {
+    throw new Error(`Contradictory availabilityPolicy: disabledSource "${disabledSource}" requires reportOutcome "${REQUIRED_REPORT_OUTCOME[disabledSource]}", got "${reportOutcome}".`);
   }
   return Object.freeze({ disabledSource, safeCode, reportOutcome });
 }
