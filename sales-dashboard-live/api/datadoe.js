@@ -1146,6 +1146,12 @@ async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
       DAILY_BRAND_ROW_LIMIT,
       { groupBy: DAILY_BRAND_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
     );
+    // Strict: a month exactly at the row cap is indistinguishable from a truncated
+    // one. Reject it BEFORE appending, so an understated all-brand / named-brand
+    // total is never derived or saved; the previous good snapshot is preserved.
+    if (rows.length >= DAILY_BRAND_ROW_LIMIT) {
+      throw new Error(`Daily Reporting sales export reached the ${DAILY_BRAND_ROW_LIMIT.toLocaleString("en-US")} row cap for ${window.from.slice(0, 7)}. The report was not saved because a partial month would understate brand and all-brand totals.`);
+    }
     allRows.push(...rows);
   }
   return allRows;

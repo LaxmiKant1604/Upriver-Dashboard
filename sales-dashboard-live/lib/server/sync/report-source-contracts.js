@@ -135,6 +135,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "sku-pl": [
     {
       requestKey: "sku-pl:monthly-profit",
+      strict: true,
       sourceKey: "profit-by-sku-date",
       columns: SKU_PL_COLUMNS,
       limit: 50000, // SKU_PL_ROW_LIMIT
@@ -151,6 +152,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   reconciliation: [
     {
       requestKey: "reconciliation:order-lines",
+      strict: true,
       sourceKey: "order-line-items",
       columns: RECON_ORDER_COLUMNS,
       limit: 50000, // RECONCILIATION_ROW_LIMIT
@@ -162,6 +164,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "reconciliation:settlements",
+      strict: true,
       sourceKey: "settlements",
       columns: RECON_SETTLEMENT_COLUMNS,
       limit: 50000, // RECONCILIATION_ROW_LIMIT
@@ -190,6 +193,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "daily-reporting": [
     {
       requestKey: "daily-reporting:asin-day-superset",
+      strict: true,
       sourceKey: "sales-traffic-asin-date",
       columns: DAILY_BRAND_SALES_COLUMNS,
       limit: 50000, // DAILY_BRAND_ROW_LIMIT (strict: per-month cap => terminal, no partial save)
@@ -282,6 +286,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "keyword-rank": [
     {
       requestKey: "keyword-rank:sqp-weekly",
+      strict: true,
       sourceKey: "sqp-weekly",
       columns: SQP_COLUMNS,
       limit: 50000, // SQP_ROW_LIMIT (strict: cap => terminal, no partial save)
@@ -294,6 +299,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "keyword-rank:sqp-monthly",
+      strict: true,
       sourceKey: "sqp-monthly",
       columns: SQP_COLUMNS,
       limit: 50000, // SQP_ROW_LIMIT
@@ -396,6 +402,15 @@ export function declaredRequestKeys(reportKey) {
 
 export function reportSourceCoverage(reportKey) {
   return REPORT_SOURCE_COVERAGE[reportKey] || null;
+}
+
+// A source result at (or above) its row cap is indistinguishable from a truncated
+// one. Contracts marked `strict: true` MUST reject such a result rather than derive
+// or save an understated total; this mirrors the executable guard in the
+// api/datadoe.js builders (`rows.length >= LIMIT`). Phase 1c reads `strict` to know
+// which source jobs to fail (terminal) at the cap instead of persisting them.
+export function rejectsAtCap(rowCount, limit) {
+  return Number(rowCount) >= Number(limit);
 }
 
 /**

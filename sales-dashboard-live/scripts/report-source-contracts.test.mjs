@@ -17,6 +17,7 @@ import {
   declaredReportKeys,
   declaredRequestKeys,
   reportSourceCoverage,
+  rejectsAtCap,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -542,5 +543,49 @@ for (const n of [0, 1, 5, 6, 11]) {
     }
   });
 }
+
+/* ===================== FIX 1: Daily strict cap ===================== */
+
+test("rejectsAtCap accepts 49,999 and rejects exactly 50,000 (and above)", () => {
+  assert.equal(rejectsAtCap(49999, 50000), false);
+  assert.equal(rejectsAtCap(50000, 50000), true);
+  assert.equal(rejectsAtCap(50001, 50000), true);
+  assert.equal(rejectsAtCap(0, 50000), false);
+});
+
+test("Daily ASIN/day superset contract is marked strict:true", () => {
+  assert.equal(byKey(daily, "daily-reporting:asin-day-superset").strict, true);
+});
+
+test("fetchDailyBrandSalesRows enforces the row cap in executable code (rejects before append)", () => {
+  const start = DD.indexOf("async function fetchDailyBrandSalesRows");
+  assert.ok(start > 0, "fetchDailyBrandSalesRows must exist");
+  const body = DD.slice(start, DD.indexOf("\n}\n", start));
+  assert.ok(/rows\.length >= DAILY_BRAND_ROW_LIMIT/.test(body), "must guard rows.length >= DAILY_BRAND_ROW_LIMIT");
+  assert.ok(/throw new Error/.test(body), "a capped month must throw, not append");
+  // The throw is placed BEFORE the append so a rejected month contributes no rows.
+  assert.ok(body.indexOf("rows.length >= DAILY_BRAND_ROW_LIMIT") < body.indexOf("allRows.push"), "reject must precede append");
+});
+
+test("every strict:true contract is backed by an executable rows.length >= LIMIT guard", () => {
+  // machine-readable strict flag must never claim a safeguard the builder lacks.
+  const STRICT = {
+    "daily-reporting:asin-day-superset": "DAILY_BRAND_ROW_LIMIT",
+    "sku-pl:monthly-profit": "SKU_PL_ROW_LIMIT",
+    "keyword-rank:sqp-weekly": "SQP_ROW_LIMIT",
+    "keyword-rank:sqp-monthly": "SQP_ROW_LIMIT",
+    "reconciliation:order-lines": "RECONCILIATION_ROW_LIMIT",
+    "reconciliation:settlements": "RECONCILIATION_ROW_LIMIT",
+  };
+  const declaredStrict = [];
+  for (const key of declaredReportKeys()) {
+    for (const c of REPORT_SOURCE_CONTRACTS[key]) if (c.strict) declaredStrict.push(c.requestKey);
+  }
+  // exactly the intended set is marked strict — no unbacked strict labels.
+  assert.deepEqual(declaredStrict.sort(), Object.keys(STRICT).sort());
+  for (const [, constName] of Object.entries(STRICT)) {
+    assert.ok(new RegExp("rows\\.length >= " + constName).test(DD), "missing executable guard for " + constName);
+  }
+});
 
 console.log("\n" + passed + " assertions passed");
