@@ -3139,6 +3139,46 @@ exact 06:00 local time becomes a business requirement.
   Vite build completed before release; Node syntax checking also passed for
   `api/datadoe.js`.
 
+### Scheduler v2 Phase 1b insight-contract review (Codex, 2026-08-06)
+
+- Reviewed local commits `8750c20`, `056dcf0`, and `b14274b` on
+  `feature/scheduler-v2`. The six insight reports' DataDoe source IDs, columns,
+  groupings, aggregations, limits, orderings, strict row-cap flags, five-ID
+  batching, organization isolation, and the claimed common catalog/inventory
+  request-hash deduplication match the current executable builders.
+- `npm run verify` passes from the reviewed worktree: 301 assertions
+  (`54+60+23+6+22+7+129`) plus the complete 2,393-module Vite build. The branch
+  is clean; nothing has been pushed, merged, deployed, or migrated.
+- **Phase 1b is not approved yet.** Three execution-policy gaps would either
+  waste exports or change report behavior once Phase 1c consumes these jobs:
+  1. Sales Movers' traffic, ads, inventory, and catalog requests depend on a
+     validated `sales-movers:sales-latest-probe`. Their two comparison windows
+     cannot be known at kickoff, and the executable builder returns an
+     unavailable snapshot without fetching them when the probe has no reported
+     date. The registry currently marks every request active and requires all
+     windows up front. Add a typed staged dependency/signal and tests for probe
+     success, no-date, failed, terminal, and validated last-known-good states.
+  2. Listing Optimizer fetches its rich catalog only after SQP succeeds. When
+     SQP is disabled, the executable builder returns `sqpAvailable:false`
+     immediately. The registry currently schedules the catalog independently,
+     spending a token unnecessarily. Make the catalog depend on a validated SQP
+     result; disabled/failed SQP must not enqueue it.
+  3. PPC intentionally catches **any** total-sales export error (including a
+     strict row-cap failure) and saves the rest of the report with TACoS marked
+     unavailable. It also skips the total-sales export when persisted Ads rows
+     contain multiple currencies. The current job has no machine-readable
+     generic failure policy and is always active, so a Phase 1c worker would
+     likely block PPC or spend an unnecessary export. Add a typed any-failure
+     degradation policy plus a typed Ads-currency planning signal; do not fold
+     this into the existing disabled-source-only policy.
+- A smaller documentation issue remains at the top of
+  `report-source-contracts.js`: its scope comment still says Daily named-brand,
+  Keyword, Content, and insights are future/incomplete even though they are now
+  declared. Correct it with the policy fixes.
+- Re-review after these corrections. Do not start Phase 1c, push, merge,
+  deploy, or apply migrations before approval. Live DataDoe validation remains
+  a later gate.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
