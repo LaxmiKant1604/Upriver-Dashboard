@@ -25,6 +25,7 @@ import {
   validateStagedSignal,
   evaluateStagedActivation,
   salesMoversWindows,
+  isValidCalendarDate,
   validateAdsCurrencySignal,
   evaluateAdsCurrencyGate,
   normalizeFailurePolicy,
@@ -1139,8 +1140,8 @@ const ppcCatOnly = { "ppc-performance:catalog": [{ from: null, to: null }] };
 test("salesMoversWindows derives recent/prior 7-day weeks from the latest date (calendar-independent)", () => {
   assert.deepEqual(salesMoversWindows("2025-07-30"),
     { recent: { from: "2025-07-24", to: "2025-07-30" }, prior: { from: "2025-07-17", to: "2025-07-23" } });
-  assert.throws(() => salesMoversWindows("2025/07/30"), /valid YYYY-MM-DD/);
-  assert.throws(() => salesMoversWindows(null), /valid YYYY-MM-DD/);
+  assert.throws(() => salesMoversWindows("2025/07/30"), /calendar date/);
+  assert.throws(() => salesMoversWindows(null), /calendar date/);
 });
 
 test("staged signal + activation are typed and fail closed", () => {
@@ -1303,6 +1304,122 @@ test("PPC total-sales failurePolicy + dependency are execution metadata: request
     ids: ts.sellerOrVendorIds, from: ts.from, to: ts.to, limit: ts.limit, options: ts.options,
   }).requestHash;
   assert.equal(ts.requestHash, expected); // identity ignores failurePolicy + dependency
+});
+
+/* ============ staged-policy re-review: window binding + strict dates + safeCode ============ */
+
+// ---- FIX 2: strict UTC calendar-date validation ----
+test("isValidCalendarDate accepts real days (incl. leap 2024-02-29) and rejects impossible dates", () => {
+  for (const good of ["2024-02-29", "2025-07-30", "2000-02-29", "2025-12-31", "0099-06-15"]) {
+    assert.equal(isValidCalendarDate(good), true, good + " should be valid");
+  }
+  for (const bad of ["2025-99-99", "2025-02-30", "0000-00-00", "2023-02-29", "2100-02-29", "2025-13-01", "2025-00-10", "2025-06-31", "2025-1-1", "2025/07/30", "20250730", "", null, undefined, 20250730]) {
+    assert.equal(isValidCalendarDate(bad), false, JSON.stringify(bad) + " should be rejected");
+  }
+});
+
+test("staged signal rejects an impossible latestReportedDate but keeps a valid leap day / null", () => {
+  assert.equal(validateStagedSignal({ status: "success", validated: true, latestReportedDate: "2024-02-29" }).latestReportedDate, "2024-02-29");
+  assert.equal(validateStagedSignal({ status: "success", validated: true, latestReportedDate: null }).latestReportedDate, null);
+  for (const bad of ["2025-02-30", "2025-99-99", "0000-00-00", "2023-02-29"]) {
+    assert.throws(() => validateStagedSignal({ status: "success", validated: true, latestReportedDate: bad }), /calendar date/, bad);
+  }
+});
+
+test("salesMoversWindows rejects impossible dates and accepts a leap day", () => {
+  assert.deepEqual(salesMoversWindows("2024-02-29"), { recent: { from: "2024-02-23", to: "2024-02-29" }, prior: { from: "2024-02-16", to: "2024-02-22" } });
+  for (const bad of ["2025-02-30", "2025-99-99", "0000-00-00", "2023-02-29"]) {
+    assert.throws(() => salesMoversWindows(bad), /calendar date/, bad);
+  }
+});
+
+// ---- FIX 1: Sales Movers window binding to the validated probe date ----
+const smProbeOnly = { "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }] };
+const smDownstreamWin = (date) => {
+  const w = salesMoversWindows(date);
+  return {
+    "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
+    "sales-movers:traffic": [w.recent, w.prior],
+    "sales-movers:ads": [w.recent, w.prior],
+    "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+    "sales-movers:catalog": [{ from: null, to: null }],
+  };
+};
+const smSig = (date) => ({ "sales-movers:sales-latest-probe": { status: "success", validated: true, latestReportedDate: date } });
+const smResolve = (win, date) => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: smSig(date) });
+
+test("Sales Movers — the correct derived windows resolve, and request_hash is unchanged for them", () => {
+  const jobs = smResolve(smDownstreamWin("2025-07-30"), "2025-07-30");
+  const traffic = jobs.filter((j) => j.requestKey === "sales-movers:traffic");
+  assert.deepEqual(traffic.map((j) => [j.from, j.to]), [["2025-07-24", "2025-07-30"], ["2025-07-17", "2025-07-23"]]);
+  // identical to computing the identity directly => request_hash unchanged for valid requests
+  const c = byKey(REPORT_SOURCE_CONTRACTS["sales-movers"], "sales-movers:traffic");
+  const expected = sourceRequestIdentity({ apiKey: "k", sourceId: traffic[0].sourceId, columns: c.columns, ids: ["A1"], from: "2025-07-24", to: "2025-07-30", limit: c.limit, options: traffic[0].options }).requestHash;
+  assert.equal(traffic[0].requestHash, expected);
+});
+
+test("Sales Movers — arbitrary traffic/ads windows (e.g. 1999-01-01..07) are REJECTED for a 2025-07-30 probe", () => {
+  const w = salesMoversWindows("2025-07-30");
+  const bogus = { from: "1999-01-01", to: "1999-01-07" };
+  // arbitrary window
+  const badArbitrary = { ...smDownstreamWin("2025-07-30"), "sales-movers:traffic": [bogus, w.prior] };
+  assert.throws(() => smResolve(badArbitrary, "2025-07-30"), /must equal the recent/);
+  // ads too
+  const badAds = { ...smDownstreamWin("2025-07-30"), "sales-movers:ads": [w.recent, bogus] };
+  assert.throws(() => smResolve(badAds, "2025-07-30"), /must equal the recent/);
+});
+
+test("Sales Movers — mismatched / missing / duplicated / extra / reordered windows all fail closed", () => {
+  const w = salesMoversWindows("2025-07-30");
+  const base = smDownstreamWin("2025-07-30");
+  // duplicated (recent twice)
+  assert.throws(() => smResolve({ ...base, "sales-movers:traffic": [w.recent, w.recent] }, "2025-07-30"), /must equal the recent/);
+  // extra third window
+  assert.throws(() => smResolve({ ...base, "sales-movers:traffic": [w.recent, w.prior, { from: "2025-07-01", to: "2025-07-07" }] }, "2025-07-30"), /must equal the recent/);
+  // reordered (prior before recent) — order is bound, so rejected
+  assert.throws(() => smResolve({ ...base, "sales-movers:traffic": [w.prior, w.recent] }, "2025-07-30"), /must equal the recent/);
+  // only one window (missing prior)
+  assert.throws(() => smResolve({ ...base, "sales-movers:traffic": [w.recent] }, "2025-07-30"), /must equal the recent/);
+  // an off-by-one recent window
+  assert.throws(() => smResolve({ ...base, "sales-movers:traffic": [{ from: "2025-07-23", to: "2025-07-29" }, w.prior] }, "2025-07-30"), /must equal the recent/);
+});
+
+test("Sales Movers — latestReportedDate must fall inside the actual probe window (boundaries inclusive)", () => {
+  // probe window is 2025-07-12 .. 2025-08-06
+  // equal to boundaries => allowed
+  assert.equal(smResolve(smDownstreamWin("2025-07-12"), "2025-07-12").length, 7); // == from
+  assert.equal(smResolve(smDownstreamWin("2025-08-06"), "2025-08-06").length, 7); // == to
+  // before from / after to => rejected
+  assert.throws(() => smResolve(smDownstreamWin("2025-07-11"), "2025-07-11"), /outside the probe window/);
+  assert.throws(() => smResolve(smDownstreamWin("2025-08-07"), "2025-08-07"), /outside the probe window/);
+});
+
+test("Sales Movers — inventory as-of window and catalog no-date window are preserved (not bound)", () => {
+  const jobs = smResolve(smDownstreamWin("2025-07-30"), "2025-07-30");
+  const inv = jobs.find((j) => j.requestKey === "sales-movers:inventory");
+  const cat = jobs.find((j) => j.requestKey === "sales-movers:catalog");
+  assert.deepEqual([inv.from, inv.to], ["2025-07-27", "2025-08-06"]); // as-of preserved
+  assert.deepEqual([cat.from, cat.to], [null, null]);                  // no-date preserved
+});
+
+test("Sales Movers — kickoff (probe only) is untouched by the window binding", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smProbeOnly });
+  assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))], ["sales-movers:sales-latest-probe"]);
+});
+
+// ---- FIX 3: complete safeCode HTTP-status rejection ----
+test("normalizeFailurePolicy rejects EVERY standalone 4xx/5xx safeCode; allows symbolic codes", () => {
+  const make = (safeCode) => normalizeFailurePolicy({ onFailure: "degrade", degradedScope: "tacos-denominator", safeCode });
+  for (const code of [400, 401, 402, 403, 404, 409, 422, 424, 429, 451, 499, 500, 502, 503, 599]) {
+    assert.throws(() => make(`ERR_${code}`), /HTTP status/, String(code));
+    assert.throws(() => make(String(code)), /HTTP status/, String(code));
+  }
+  // symbolic codes with no 3-digit 4xx/5xx run remain allowed
+  for (const ok of ["TOTAL_SALES_UNAVAILABLE", "SOURCE_DISABLED", "TACOS_DENOMINATOR_MISSING", "CODE_200_OK_NOT_A_FAILURE", "BUCKET_12500"]) {
+    const p = make(ok);
+    assert.equal(p.safeCode, ok);
+    assert.equal(p.blocks, false);
+  }
 });
 
 console.log("\n" + passed + " assertions passed");

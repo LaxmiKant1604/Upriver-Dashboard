@@ -930,6 +930,17 @@ export function evaluateFallbackCondition(condition, signal) {
  */
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Strict UTC calendar-date check: the shape must be YYYY-MM-DD AND the value must be a
+// REAL day. A parse that would normalize an impossible date (2025-02-30 -> 2025-03-02,
+// 2025-99-99, 0000-00-00, a non-leap Feb 29) round-trips to a DIFFERENT string, so it is
+// rejected; a valid leap day (2024-02-29) round-trips unchanged and is accepted. No
+// silent normalization — the input is either a genuine calendar date or it is refused.
+export function isValidCalendarDate(value) {
+  if (typeof value !== "string" || !ISO_DATE.test(value)) return false;
+  const dt = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === value;
+}
+
 export function validateStagedSignal(signal) {
   if (signal == null || typeof signal !== "object" || Array.isArray(signal)) {
     throw new Error("Staged dependency signal must be an object with status/validated.");
@@ -941,10 +952,11 @@ export function validateStagedSignal(signal) {
     throw new Error("Staged signal.validated must be a boolean.");
   }
   // latestReportedDate is optional (SQP staging does not use it), but when present it
-  // must be a well-formed ISO date or an explicit null (probe succeeded, no reported day).
+  // must be a REAL UTC calendar date or an explicit null (probe succeeded, no reported
+  // day). Impossible dates are rejected, never normalized.
   if ("latestReportedDate" in signal
-    && !(signal.latestReportedDate === null || (typeof signal.latestReportedDate === "string" && ISO_DATE.test(signal.latestReportedDate)))) {
-    throw new Error("Staged signal.latestReportedDate must be a YYYY-MM-DD string or null.");
+    && !(signal.latestReportedDate === null || isValidCalendarDate(signal.latestReportedDate))) {
+    throw new Error("Staged signal.latestReportedDate must be a real YYYY-MM-DD calendar date or null.");
   }
   return signal;
 }
@@ -982,8 +994,8 @@ export function evaluateStagedActivation(activation, signal) {
  * Fails closed on a malformed date. Never guessed from the calendar.
  */
 export function salesMoversWindows(latestReportedDate) {
-  if (typeof latestReportedDate !== "string" || !ISO_DATE.test(latestReportedDate)) {
-    throw new Error("salesMoversWindows requires a valid YYYY-MM-DD latest reported date.");
+  if (!isValidCalendarDate(latestReportedDate)) {
+    throw new Error("salesMoversWindows requires a real YYYY-MM-DD calendar date.");
   }
   const recentFrom = addDaysStr(latestReportedDate, -(7 - 1));
   const recent = { from: recentFrom, to: latestReportedDate };
@@ -1051,8 +1063,12 @@ export function normalizeFailurePolicy(policy) {
   if (typeof safeCode !== "string" || !safeCode) {
     throw new Error("failurePolicy.safeCode must be a non-empty string.");
   }
-  // The admin-safe code must not smuggle a raw HTTP status string; causes are typed.
-  if (/\b(40[24]|429|5\d\d|424)\b/.test(safeCode)) {
+  // The admin-safe code must not smuggle an HTTP status; causes are typed, never parsed
+  // from text. Reject ANY standalone 4xx/5xx number (400-599) — not just a hand-picked
+  // few — regardless of surrounding letters/underscores, while allowing symbolic codes
+  // (no 3-digit 4xx/5xx run) such as TOTAL_SALES_UNAVAILABLE. The digit guards keep a
+  // longer number (e.g. 4021, 12500) from being read as a status.
+  if (/(?<!\d)[45]\d\d(?!\d)/.test(safeCode)) {
     throw new Error("failurePolicy.safeCode must not carry an HTTP status string.");
   }
   return Object.freeze({
@@ -1271,6 +1287,44 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
     }
     if (!activeKeys.has(key)) {
       throw new Error(`Request key "${key}" does not apply to marketplace country "${country}".`);
+    }
+  }
+
+  // Sales Movers: the recent/prior 7-day comparison windows are DERIVED FACTS of the
+  // validated probe date, not caller inputs. Bind them here so a Phase 1c caller cannot
+  // drift them — any supplied traffic/ads windows that are not EXACTLY the helper's
+  // [recent, prior] pair (mismatched, missing, duplicated, extra, reordered, or invalid)
+  // are rejected fail-closed, and request_hash stays identical for the correct windows.
+  // Inventory's as-of window and catalog's no-date window are left untouched.
+  if (reportKey === "sales-movers" && activeKeys.has("sales-movers:traffic")) {
+    const probeSig = signals["sales-movers:sales-latest-probe"];
+    const latest = probeSig && typeof probeSig === "object" ? probeSig.latestReportedDate : null;
+    if (!isValidCalendarDate(latest)) {
+      throw new Error("Sales Movers downstream requires a validated probe with a real latestReportedDate.");
+    }
+    // The reported date must fall INSIDE the actual probe request window (a single window).
+    const probeWins = windowsMap["sales-movers:sales-latest-probe"];
+    if (!Array.isArray(probeWins) || probeWins.length !== 1) {
+      throw new Error("Sales Movers probe must declare exactly one latest-date window.");
+    }
+    const pw = probeWins[0];
+    if (!pw || !isValidCalendarDate(pw.from) || !isValidCalendarDate(pw.to) || pw.from > pw.to) {
+      throw new Error("Sales Movers probe window must carry a valid from<=to calendar range.");
+    }
+    if (latest < pw.from || latest > pw.to) {
+      throw new Error(`Sales Movers latestReportedDate ${latest} is outside the probe window ${pw.from}..${pw.to}.`);
+    }
+    const { recent, prior } = salesMoversWindows(latest);
+    const expected = [recent, prior];
+    const sameWindow = (a, b) => a != null && b != null && (a.from ?? null) === b.from && (a.to ?? null) === b.to;
+    for (const key of ["sales-movers:traffic", "sales-movers:ads"]) {
+      const supplied = windowsMap[key];
+      const ok = Array.isArray(supplied) && supplied.length === expected.length
+        && expected.every((w, i) => sameWindow(supplied[i], w));
+      if (!ok) {
+        throw new Error(`Sales Movers "${key}" windows must equal the recent+prior weeks derived from ${latest} `
+          + `(${recent.from}..${recent.to} then ${prior.from}..${prior.to}).`);
+      }
     }
   }
 
