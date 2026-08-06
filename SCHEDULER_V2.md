@@ -586,3 +586,50 @@ outside `sourceRequestIdentity`, so the golden `request_hash`
 primary/dd-secondary isolation, one-create-export-per-cycle, last-known-good
 preservation, and no-auto-retry all hold. A staged/gated job that does not activate
 consumes no export and preserves the prior report snapshot.
+
+---
+
+## 12. Staged-policy re-review corrections (2026-08-06)
+
+Three fail-closed corrections from Codex's staged-policy re-review; on
+`feature/scheduler-v2` (commit `f398d12`). Nothing pushed/merged/deployed/migrated;
+Phase 1c NOT started; `request_hash` unchanged (metadata is still outside
+`sourceRequestIdentity`, and valid requests keep byte-identical hashes).
+
+### 12.1 Sales Movers windows are bound to the validated probe date (FIX 1)
+
+The recent/prior 7-day windows are DERIVED FACTS of the validated probe date, not caller
+inputs. The resolver now, when the probe has activated downstream, requires
+`sales-movers:traffic` and `sales-movers:ads` to equal EXACTLY the
+`salesMoversWindows(latestReportedDate)` pair `[recent, prior]` (same order). Any
+mismatched, missing, duplicated, extra, reordered, or invalid window is rejected — a
+Phase 1c caller cannot drift them, and it need not "remember" to call the helper because
+the resolver enforces the bind. A probe date of `2025-07-30` rejects arbitrary windows
+such as `1999-01-01..1999-01-07`. `sales-movers:inventory` (as-of `asOf-10d..asOf`) and
+`sales-movers:catalog` (no-date) are left untouched; correct windows keep their hashes.
+
+### 12.2 Strict UTC calendar-date validation (FIX 2)
+
+`isValidCalendarDate(value)` requires the `YYYY-MM-DD` shape AND round-trips the value
+through `Date.UTC` + `toISOString()`, so an impossible date that would silently normalize
+(`2025-02-30 → 2025-03-02`, `2025-99-99`, `0000-00-00`, a non-leap `2023-02-29`) is
+rejected, while a real leap day (`2024-02-29`) is accepted. It backs `validateStagedSignal`
+and `salesMoversWindows`. For Sales Movers the validated `latestReportedDate` must also
+fall INSIDE the actual `sales-movers:sales-latest-probe` window (boundaries inclusive)
+before any downstream job activates — a date before `probe.from` or after `probe.to`
+fails closed.
+
+### 12.3 Complete safeCode HTTP-status rejection (FIX 3)
+
+`normalizeFailurePolicy` now rejects EVERY standalone 4xx/5xx number (`400`–`599`) in
+`safeCode` via `/(?<!\d)[45]\d\d(?!\d)/` — the earlier regex missed `400/401/403/409/422`
+and others. Symbolic codes with no 3-digit 4xx/5xx run (e.g. `TOTAL_SALES_UNAVAILABLE`)
+remain allowed, and a longer number (`12500`) is not misread as a status. Operational
+behavior is still driven only by the typed `causes`, never parsed from message text.
+
+### 12.4 Invariants re-confirmed
+
+Golden `request_hash` `5601253219be13c7…` unchanged; five-ID batching and
+primary/dd-secondary isolation unchanged; dedup groups unchanged.
+`report-source-contracts.test.mjs` = **155 assertions**; full `npm run verify` green
+(**327**); `git diff --check` clean.

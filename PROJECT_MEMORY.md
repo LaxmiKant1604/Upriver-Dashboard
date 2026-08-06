@@ -1,5 +1,29 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — staged-policy re-review corrections applied (2026-08-06)
+
+Fixed the three fail-closed findings from the staged-policy re-review (below) on
+`feature/scheduler-v2` (HEAD `f398d12` code+tests; a docs commit follows). Not
+pushed/merged/deployed/migrated; Phase 1c NOT started; golden `request_hash`
+`5601253219be13c7…` unchanged. See SCHEDULER_V2.md §12.
+
+- **FIX 1 — Sales Movers window binding.** The resolver now binds `sales-movers:traffic`
+  / `sales-movers:ads` to `salesMoversWindows(latestReportedDate)`: supplied windows must
+  equal EXACTLY the derived `[recent, prior]` pair, else it rejects (mismatched/missing/
+  duplicated/extra/reordered/invalid). A `2025-07-30` probe rejects `1999-01-01..07`.
+  Inventory as-of + catalog no-date preserved; valid requests keep their hashes.
+- **FIX 2 — strict UTC calendar dates.** `isValidCalendarDate()` round-trips through
+  `Date.UTC`/`toISOString` (rejects `2025-99-99`, `2025-02-30`, `0000-00-00`, non-leap
+  `2023-02-29`; accepts `2024-02-29`), wired into `validateStagedSignal` +
+  `salesMoversWindows`. Sales Movers also requires `latestReportedDate` to fall inside the
+  probe window (boundaries inclusive) before activating downstream.
+- **FIX 3 — complete safeCode reject.** `normalizeFailurePolicy` rejects every standalone
+  4xx/5xx (`/(?<!\d)[45]\d\d(?!\d)/`, was only 402/404/424/429/5xx); symbolic codes like
+  `TOTAL_SALES_UNAVAILABLE` still allowed; typed `causes` remain authoritative.
+
+`report-source-contracts.test.mjs` = **155 assertions**; full verify green (**327**);
+`git diff --check` clean; five-ID batching + primary/dd-secondary isolation unchanged.
+
 ## Scheduler v2 Phase 1b staged-policy re-review (Codex, 2026-08-06)
 
 - Reviewed commits `476f62f` and `68d4050` on `feature/scheduler-v2`.
