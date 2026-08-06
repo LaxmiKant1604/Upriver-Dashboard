@@ -168,7 +168,7 @@ export const SOURCE_CONTRACTS = [
 // the upstream report/source they read instead of inventing another export.
 export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "brand-sales": ["order-line-items", "product-catalog"],
-  "daily-reporting": ["sales-traffic-asin-date", "ads-campaign-date"],
+  "daily-reporting": ["sales-traffic-asin-date", "product-catalog", "ads-campaign-date"],
   reconciliation: ["order-line-items", "settlements", "product-catalog"],
   "fba-plan": ["sales-traffic-asin-date", "product-catalog", "fba-inventory-health", "listings"],
   "sku-pl": ["profit-by-sku-date"],

@@ -71,17 +71,29 @@ const RECON_SETTLEMENT_AGGREGATIONS = [
   { column: "total", aggregation: "sum", alias: "total_sum" },
 ];
 
-// daily-reporting (all-brand path): the Sales & Traffic export. Ads are DERIVED from
-// the scheduled Ads sources (saved ads_daily_source_rows) — when Supabase is
-// configured (always, for the scheduler) Daily reads saved ads and issues NO ads
-// export; the REST ads export in api/datadoe.js is a no-Supabase fallback only, so it
-// is intentionally NOT declared as a Daily-owned export.
-const DAILY_SALES_COLUMNS = ["date", "seller_or_vendor_id"];
-const DAILY_SALES_GROUP_BY = [...DAILY_SALES_COLUMNS];
+// daily-reporting: the scheduler fetches the ASIN/day Sales & Traffic SUPERSET
+// (api/datadoe.js fetchDailyBrandSalesRows: monthly-segmented, child_asin grain) once
+// per account plus Product Catalog once, and DERIVES both the all-brand total (sum
+// sales/units per date over child_asin) and every named brand (join ASIN->brand via
+// catalog) from those saved rows. There is NO per-brand export and NO separate compact
+// all-brand export: the browser's compact all-brand export groups the SAME source
+// (401ffcd7e5) by [date, seller_or_vendor_id] with the SAME aggregations, so it is a
+// strict roll-up of this superset (grouped by [date, seller_or_vendor_id, child_asin]).
+// Ads are derived from the scheduled Ads sources (ads_daily_source_rows). See
+// REPORT_DERIVATION below. (LIVE GATE: reconcile superset-summed all-brand vs the
+// compact total once before permanently retiring the compact export.)
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin"];
+const DAILY_BRAND_SALES_GROUP_BY = [...DAILY_BRAND_SALES_COLUMNS];
 const DAILY_SALES_AGGREGATIONS = [
   { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
   { column: "total_units", aggregation: "sum", alias: "total_units_sum" },
 ];
+
+// keyword-rank: fetchSqpRows (raw SQP rows, strict truncation) + a 365-day catalog.
+const SQP_COLUMNS = ["date", "child_asin", "search_query", "search_query_volume", "search_query_total_impression_count", "search_query_total_click_count", "search_query_total_purchase_count", "child_asin_impression_count", "child_asin_click_count", "child_asin_purchase_count", "child_asin_organic_search_rank"];
+
+// content-changes: a no-date notification export (event_time DESC) + a 365-day catalog.
+const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_notification_type", "notification_metadata", "payload"];
 
 // fba-plan: planAsinUnits (monthly, child_asin) + a current-month daily-date probe +
 // catalog + FBA Inventory Health + US-only AWD listings.
@@ -171,17 +183,30 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "range:from..to (full 6-month span)",
     },
   ],
-  // Daily Reporting (all-brand): the Sales & Traffic export only. Ads are derived
-  // from the scheduled Ads sources (see the DAILY_SALES_* note above).
+  // Daily Reporting (single account). Scheduler-owned strategy: ONE monthly-segmented
+  // ASIN/day superset + ONE catalog; all-brand and every named brand DERIVE from the
+  // saved rows. No per-brand export, no compact all-brand export (see DAILY note above
+  // + REPORT_DERIVATION). Ads derived from the scheduled Ads sources.
   "daily-reporting": [
     {
-      requestKey: "daily-reporting:sales",
+      requestKey: "daily-reporting:asin-day-superset",
       sourceKey: "sales-traffic-asin-date",
-      columns: DAILY_SALES_COLUMNS,
-      limit: 5000, // DAILY_ROW_LIMIT
-      groupBy: DAILY_SALES_GROUP_BY,
+      columns: DAILY_BRAND_SALES_COLUMNS,
+      limit: 50000, // DAILY_BRAND_ROW_LIMIT (strict: per-month cap => terminal, no partial save)
+      groupBy: DAILY_BRAND_SALES_GROUP_BY,
       aggregations: DAILY_SALES_AGGREGATIONS,
       orderByColumn: "date",
+      orderByDirection: "ASC",
+      windowKind: "per-month:monthStart(asOf)-150..asOf",
+    },
+    {
+      requestKey: "daily-reporting:catalog",
+      sourceKey: "product-catalog",
+      columns: PRODUCT_CATALOG_COLUMNS,
+      limit: 10000, // CATALOG_ROW_LIMIT
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
       orderByDirection: "ASC",
       windowKind: "range:monthStart(asOf)-150..asOf",
     },
@@ -247,6 +272,78 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       marketplaceCountries: ["US"],
     },
   ],
+  // Keyword Rank (single account). SQP weekly + monthly + a 365-day catalog. The
+  // scheduler fetches BOTH SQP cadences unconditionally for a deterministic,
+  // cadence-agnostic derivation; the browser fetches monthly only as a data-fallback
+  // when weekly has < 4 distinct periods, so the scheduler accepts one extra monthly
+  // export per account/cycle (documented token cost). SQP is a non-default DataDoe
+  // table: a source disabled for an organization returns HTTP 424 and is a terminal
+  // source status, never substituted. Raw rows (no groupBy/agg); strict truncation.
+  "keyword-rank": [
+    {
+      requestKey: "keyword-rank:sqp-weekly",
+      sourceKey: "sqp-weekly",
+      columns: SQP_COLUMNS,
+      limit: 50000, // SQP_ROW_LIMIT (strict: cap => terminal, no partial save)
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-84d..asOf",
+      orgAvailability: "HTTP 424 when SQP weekly is disabled for the organization => terminal source status",
+    },
+    {
+      requestKey: "keyword-rank:sqp-monthly",
+      sourceKey: "sqp-monthly",
+      columns: SQP_COLUMNS,
+      limit: 50000, // SQP_ROW_LIMIT
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-365d..asOf",
+      orgAvailability: "HTTP 424 when SQP monthly is disabled for the organization => terminal source status",
+    },
+    {
+      requestKey: "keyword-rank:catalog",
+      sourceKey: "product-catalog",
+      columns: PRODUCT_CATALOG_COLUMNS,
+      limit: 10000, // CATALOG_ROW_LIMIT
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-365d..asOf",
+    },
+  ],
+  // Content Change Alerts (single account). A NO-DATE notification export (from/to
+  // null, event_time DESC) + a 365-day catalog. The notification source may be
+  // disabled per organization (HTTP 424) => terminal source status.
+  "content-changes": [
+    {
+      requestKey: "content-changes:events",
+      sourceKey: "content-changes",
+      columns: CONTENT_CHANGE_COLUMNS,
+      limit: 1000, // CONTENT_CHANGE_ROW_LIMIT
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "event_time",
+      orderByDirection: "DESC",
+      windowKind: "none (no-date source; from/to null)",
+      orgAvailability: "HTTP 424 when branded-item notifications are disabled for the organization => terminal source status",
+    },
+    {
+      requestKey: "content-changes:catalog",
+      sourceKey: "product-catalog",
+      columns: PRODUCT_CATALOG_COLUMNS,
+      limit: 10000, // CATALOG_ROW_LIMIT
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-365d..asOf",
+    },
+  ],
 });
 
 // Sources represented by already-scheduled/persisted data rather than a report-
@@ -256,6 +353,25 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   "daily-reporting": ["ads-campaign-date"],
 });
 
+// Deterministic, scheduler-owned derivation strategy for reports whose saved source
+// rows produce more than one UI output. Not controlled by browser input.
+export const REPORT_DERIVATION = Object.freeze({
+  "daily-reporting": {
+    outputs: ["all-brand", "named-brand (every brand for the account)"],
+    derivedFrom: ["daily-reporting:asin-day-superset", "daily-reporting:catalog"],
+    strategy:
+      "Fetch the ASIN/day Sales & Traffic superset once per account (monthly-segmented) "
+      + "and Product Catalog once; sum the superset over child_asin per (date, seller) for "
+      + "the all-brand total, and join ASIN->brand via the catalog for every named brand. "
+      + "No per-brand export; no compact all-brand export.",
+    adsFrom: "ads_daily_source_rows (scheduled Ads sources)",
+    liveGate:
+      "The compact all-brand export is a strict roll-up of the superset (same source + "
+      + "same aggregations, coarser grouping); reconcile superset-summed all-brand vs the "
+      + "compact total for one account before permanently retiring the compact export.",
+  },
+});
+
 // Phase 1c must not enable a partially declared report as though it covered every
 // current UI mode. Daily's named-brand path still needs its ASIN/month + catalog
 // contracts; the other reports below cover their current builder paths.
@@ -263,8 +379,10 @@ export const REPORT_SOURCE_COVERAGE = Object.freeze({
   "brand-sales": "complete",
   "sku-pl": "complete",
   reconciliation: "complete",
-  "daily-reporting": "all-brand-only",
+  "daily-reporting": "complete", // all-brand + every named brand derive from the ASIN/day superset
   "fba-plan": "complete",
+  "keyword-rank": "complete",
+  "content-changes": "complete",
 });
 
 export function declaredReportKeys() {

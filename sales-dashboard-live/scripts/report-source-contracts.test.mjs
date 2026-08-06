@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   REPORT_DERIVED_SOURCE_KEYS,
+  REPORT_DERIVATION,
   REPORT_SOURCE_CONTRACTS,
   reportSourceRequestHashes,
   declaredReportKeys,
@@ -123,8 +124,10 @@ test("owned plus explicitly derived source keys exactly cover each report's requ
   }
   assert.deepEqual(declaredRequestKeys("brand-sales"), ["brand-sales:order-lines", "brand-sales:catalog"]);
   assert.equal(declaredRequestKeys("listing-health"), null); // insight report intentionally not declared yet
-  assert.equal(reportSourceCoverage("daily-reporting"), "all-brand-only");
+  assert.equal(reportSourceCoverage("daily-reporting"), "complete");
   assert.equal(reportSourceCoverage("fba-plan"), "complete");
+  assert.equal(reportSourceCoverage("keyword-rank"), "complete");
+  assert.equal(reportSourceCoverage("content-changes"), "complete");
 });
 
 test("request keys are unique within a report and prefixed by the report key", () => {
@@ -307,14 +310,36 @@ test("reconciliation catalog uses PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT, n
   assert.equal(c.orderByColumn, "child_asin");
 });
 
-/* --- executable parity: daily-reporting --- */
-test("daily-reporting sales contract matches DAILY_SALES_* constants (ads are derived, not declared)", () => {
-  const c = daily[0];
-  assert.equal(daily.length, 1);
-  assert.deepEqual(c.columns, constArray("DAILY_SALES_COLUMNS"));
-  assert.deepEqual(c.groupBy, constArray("DAILY_SALES_GROUP_BY"));
+/* --- executable parity: daily-reporting (ASIN/day superset + catalog) --- */
+test("daily-reporting ASIN/day superset matches DAILY_BRAND_SALES_* constants (monthly-segmented)", () => {
+  const c = byKey(daily, "daily-reporting:asin-day-superset");
+  assert.deepEqual(c.columns, constArray("DAILY_BRAND_SALES_COLUMNS"));
+  assert.deepEqual(c.groupBy, constArray("DAILY_BRAND_SALES_GROUP_BY"));
   assert.deepEqual(c.aggregations, constAggregations("DAILY_SALES_AGGREGATIONS"));
-  assert.equal(c.limit, constNumber("DAILY_ROW_LIMIT"));
+  assert.equal(c.limit, constNumber("DAILY_BRAND_ROW_LIMIT")); // strict per-month cap
+  assert.ok(c.windowKind.startsWith("per-month"), "superset must be monthly-segmented");
+});
+test("daily-reporting catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT; no compact all-brand export", () => {
+  const c = byKey(daily, "daily-reporting:catalog");
+  assert.deepEqual(c.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
+  assert.equal(c.limit, constNumber("CATALOG_ROW_LIMIT"));
+  assert.equal(c.groupBy, null);
+  // No per-brand and no compact all-brand export: exactly two owned exports.
+  assert.equal(daily.length, 2);
+  assert.deepEqual(daily.map((x) => x.requestKey), ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
+  // Ads remain a derived dependency, not an owned export.
+  assert.ok((REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-campaign-date"));
+});
+test("daily-reporting derivation strategy derives all-brand + named-brand from the superset (no per-brand export)", () => {
+  const d = REPORT_DERIVATION["daily-reporting"];
+  assert.ok(d && Array.isArray(d.derivedFrom));
+  assert.deepEqual(d.derivedFrom, ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
+  assert.ok(d.outputs.includes("all-brand"));
+  assert.ok(/no per-brand export/i.test(d.strategy));
+  // Structural token-saving proof: the ASIN/day builder is monthly-segmented in code,
+  // so a named-brand report never triggers its own per-brand DataDoe export.
+  assert.ok(DD.includes("async function fetchDailyBrandSalesRows"));
+  assert.ok(/for \(const window of splitDateRangeByMonth\(from, to\)\)/.test(DD.slice(DD.indexOf("fetchDailyBrandSalesRows"))), "named-brand fetch must be monthly-segmented");
 });
 
 /* --- executable parity: fba-plan --- */
@@ -435,5 +460,87 @@ for (const n of [0, 1, 5, 6, 11]) {
 test("validation still applies to the new reports (missing required key throws)", () => {
   assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:monthly-units": fbaMonths }, marketplaceCountry: "IN" }), /Missing windows/);
 });
+
+/* ===================== keyword-rank + content-changes ===================== */
+
+const keyword = REPORT_SOURCE_CONTRACTS["keyword-rank"];
+const content = REPORT_SOURCE_CONTRACTS["content-changes"];
+const kwWin = {
+  "keyword-rank:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }],
+  "keyword-rank:sqp-monthly": [{ from: "2024-08-06", to: "2025-08-06" }],
+  "keyword-rank:catalog": [{ from: "2024-08-06", to: "2025-08-06" }],
+};
+const ccWin = {
+  "content-changes:events": [{ from: null, to: null }],
+  "content-changes:catalog": [{ from: "2024-08-06", to: "2025-08-06" }],
+};
+
+test("keyword-rank weekly + monthly SQP contracts match SQP_COLUMNS + SQP_ROW_LIMIT (raw rows)", () => {
+  for (const rk of ["keyword-rank:sqp-weekly", "keyword-rank:sqp-monthly"]) {
+    const c = byKey(keyword, rk);
+    assert.deepEqual(c.columns, constArray("SQP_COLUMNS"));
+    assert.equal(c.limit, constNumber("SQP_ROW_LIMIT"));
+    assert.equal(c.groupBy, null);
+    assert.equal(c.aggregations, null);
+    assert.equal(c.orderByColumn, "date");
+    assert.ok(/HTTP 424/.test(c.orgAvailability), rk + " must document the org-availability terminal status");
+  }
+  assert.equal(byKey(keyword, "keyword-rank:sqp-weekly").sourceKey, "sqp-weekly");
+  assert.equal(byKey(keyword, "keyword-rank:sqp-monthly").sourceKey, "sqp-monthly");
+});
+test("keyword-rank catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT", () => {
+  const c = byKey(keyword, "keyword-rank:catalog");
+  assert.deepEqual(c.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
+  assert.equal(c.limit, constNumber("CATALOG_ROW_LIMIT"));
+});
+test("keyword-rank SQP rejects a row-cap (truncation) result in the builder", () => {
+  assert.ok(/Search Query Performance export reached the/.test(DD), "fetchSqpRows must reject a row-cap result");
+});
+test("content-changes events is a NO-DATE source; catalog is a 365-day range", () => {
+  const ev = byKey(content, "content-changes:events");
+  assert.deepEqual(ev.columns, constArray("CONTENT_CHANGE_COLUMNS"));
+  assert.equal(ev.limit, constNumber("CONTENT_CHANGE_ROW_LIMIT"));
+  assert.equal(ev.orderByColumn, "event_time");
+  assert.equal(ev.orderByDirection, "DESC");
+  assert.ok(/no-date/i.test(ev.windowKind));
+  assert.ok(/HTTP 424/.test(ev.orgAvailability));
+  const cat = byKey(content, "content-changes:catalog");
+  assert.deepEqual(cat.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
+  assert.equal(cat.limit, constNumber("CATALOG_ROW_LIMIT"));
+});
+test("keyword-rank resolves weekly+monthly+catalog; the two SQP cadences are distinct sources/hashes", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwWin });
+  assert.equal(got.length, 3);
+  const wk = got.find((r) => r.requestKey === "keyword-rank:sqp-weekly");
+  const mo = got.find((r) => r.requestKey === "keyword-rank:sqp-monthly");
+  assert.notEqual(wk.sourceId, mo.sourceId);
+  assert.notEqual(wk.requestHash, mo.requestHash);
+});
+test("content-changes no-date events request carries null from/to and never inherits the catalog dates", () => {
+  const got = reportSourceRequestHashes({ reportKey: "content-changes", apiKey: "k", ids: ["A1"], windowsByRequestKey: ccWin });
+  const ev = got.find((r) => r.requestKey === "content-changes:events");
+  const cat = got.find((r) => r.requestKey === "content-changes:catalog");
+  assert.equal(ev.from, null);
+  assert.equal(ev.to, null);
+  assert.equal(ev.requestMeta.from, null);
+  assert.equal(ev.requestMeta.to, null);
+  assert.equal(cat.from, "2024-08-06");
+});
+test("keyword-rank primary vs dd-secondary org isolation", () => {
+  const p = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary-key", ids: ["A1"], windowsByRequestKey: kwWin });
+  const s = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "secondary-key", ids: ["A1"], windowsByRequestKey: kwWin });
+  for (let i = 0; i < p.length; i += 1) assert.notEqual(p[i].requestHash, s[i].requestHash);
+});
+for (const n of [0, 1, 5, 6, 11]) {
+  test(`keyword-rank reproduces the transport chunks + hashes for ${n} IDs`, () => {
+    const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary", ids: ids(n), windowsByRequestKey: kwWin });
+    const exp = transportExpected("keyword-rank", "primary", ids(n), kwWin);
+    assert.equal(got.length, exp.length);
+    for (let i = 0; i < exp.length; i += 1) {
+      assert.deepEqual(got[i].sellerOrVendorIds, exp[i].sellerOrVendorIds);
+      assert.equal(got[i].requestHash, exp[i].requestHash);
+    }
+  });
+}
 
 console.log("\n" + passed + " assertions passed");
