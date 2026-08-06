@@ -1,161 +1,190 @@
 // Scheduler v2 Phase 1c — checkpointable, idempotent source-job worker (SHADOW MODE).
 //
-// This does NOT replace Scheduler v1 (run-sync.js) and is not wired to any route or
-// cron in this commit. It executes the source half of one sync cycle: for each unique
-// canonical DataDoe request (identified by request_hash), it makes AT MOST ONE
-// create-export call — enforced by the durable claim_source_export_attempt DB guard —
-// fetches, validates, and persists the rows, and records fetch / validation / save
-// outcomes separately. Repeated invocations resume saved progress without repeating any
-// export; failed / timed-out / disabled / truncated / save-failed jobs are not retried
-// in the same cycle and never overwrite last-known-good source data.
+// Does NOT replace Scheduler v1 (run-sync.js) and is not wired to any route/cron. It
+// executes the source half of one sync cycle as a RESUMABLE state machine: for each
+// unique canonical request (request_hash) it makes at most ONE create-export
+// (claim_source_export_attempt), persists the export_id BEFORE polling so a crash after
+// the POST can resume without a second create, then poll -> download -> validate ->
+// save -> success. Fetch / poll / download / validate / persist failures are recorded on
+// DISTINCT safe stages and never overwrite last-known-good source data.
 //
-// All I/O is injected so the worker is deterministic and fully testable offline:
+// The complete canonical job (fetchParams, requestKey, org fingerprint, scope, request
+// meta, strict, limit, connection) comes from the PLAN, matched by request_hash; the
+// DATABASE remains authoritative for fetch_status, attempted_at, and export_id. The
+// production sync_source_jobs row has none of the plan-only fields, so the worker rebuilds
+// the full job by merging plan(by hash) with the DB row's authoritative lifecycle state.
 //
+// All I/O is injected so the worker is deterministic and fully offline-testable:
 //   store: {
-//     openCycle({bucket,cycleDate,scheduledAt,trigger}) -> cycleId          (idempotent)
-//     claimCycle(cycleId) -> boolean            (pending -> running; first worker only)
-//     getCycle(cycleId) -> { status, ... } | null
-//     upsertSourceJob({cycleId,bucket,...job}) -> void   (idempotent on cycle+hash)
-//     listSourceJobs(cycleId) -> [ { request_hash, request_key, fetch_status, ... } ]
-//     claimExportAttempt(cycleId, requestHash) -> boolean  (the one-attempt RPC)
-//     saveSourceRows({job,rows,payloadBytes,exportId}) -> cacheObjectPath
-//     recordSourceSuccess({...}) -> void
-//     recordSourceFailure({...}) -> void
-//     updateCycleCounts?(cycleId, counts) -> void
+//     openCycle, claimCycle, getCycle, upsertSourceJob, listSourceJobs,
+//     claimExportAttempt(cycleId, requestHash) -> boolean,
+//     recordExportCreated({cycleId, requestHash, exportId}) -> void,  // persist id, keep 'attempted'
+//     saveSourceRows({job, rows, payloadBytes, exportId, version}) -> objectPath (non-empty),
+//     recordSourceSuccess({...}) -> void,
+//     recordSourceFailure({...}) -> void,
+//     updateCycleCounts(cycleId, {sourceTotal, sourceSucceeded, sourceFailed}) -> void,
 //   }
-//   fetchSource(job) -> { rows, payloadBytes?, exportId? }   (throws typed DataDoe errors)
-//
-// The store methods correspond 1:1 to the SQL in 20260807_scheduler_v2.sql; the
-// production adapter (source-sync-driver.js) wires them to lib/server/supabase.js.
+//   dataDoe: {
+//     create(job) -> { exportId, completed? }   // exactly one create-export POST
+//     poll(job, exportId) -> void               // waits for COMPLETED (throws on fail/timeout)
+//     download(job, exportId) -> rows            // returns the rows array (or throws)
+//   }
 
-import { isDataDoeDeadlineError, isSourceDisabledError } from "../datadoe.js";
+import { isDataDoeDeadlineError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
-// Approximate serialized payload size WITHOUT retaining a big string; used only for
-// telemetry (payload_bytes), never for validation.
 function approxPayloadBytes(rows) {
   try { return Buffer.byteLength(JSON.stringify(rows ?? [])); } catch { return 0; }
 }
 
-// Map any fetch error to a SAFE {stage, code, message, terminal}. The stored message is
-// a fixed operator string — never the raw DataDoe error, a URL, an id, or a key — so no
-// secret can leak into status/error output. 4xx client errors are terminal (a retry
-// will not fix them); 5xx / timeouts are transient (a future cycle may succeed).
-export function classifyFetchError(error) {
+// Map any DataDoe error to a SAFE {code, message, terminal} for the given stage. The
+// stored message is a fixed operator string — never the raw error, a URL, an id, or a
+// key — so no secret can leak. 4xx client errors are terminal; 5xx / timeouts transient.
+export function classifyFetchError(error, stage = "create-export") {
   if (isDataDoeDeadlineError(error)) {
-    return { stage: "poll", code: "TIMEOUT", message: "DataDoe work deferred at the execution deadline.", terminal: false };
+    return { stage, code: "TIMEOUT", message: "DataDoe work deferred at the execution deadline.", terminal: false };
   }
   if (isSourceDisabledError(error)) {
-    return { stage: "create-export", code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true };
+    return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true };
   }
   const raw = error instanceof Error ? error.message : String(error);
-  const matched = raw.match(/\((\d{3})\)/); // e.g. "DataDoe export creation failed (403): ..."
+  const matched = raw.match(/\((\d{3})\)/);
   if (matched) {
     const status = Number(matched[1]);
     if (status >= 400 && status <= 599) {
-      const terminal = status >= 400 && status < 500; // client errors are permanent for this source
-      return { stage: "create-export", code: `HTTP_${status}`, message: `DataDoe returned HTTP ${status} for this source.`, terminal };
+      const terminal = status >= 400 && status < 500;
+      return { stage, code: `HTTP_${status}`, message: `DataDoe returned HTTP ${status} for this source.`, terminal };
     }
   }
   if (/timed out/i.test(raw)) {
-    return { stage: "poll", code: "TIMEOUT", message: "DataDoe export timed out while processing.", terminal: false };
+    return { stage, code: "TIMEOUT", message: "DataDoe export timed out while processing.", terminal: false };
   }
-  return { stage: "create-export", code: "EXPORT_ERROR", message: "DataDoe export failed for this source.", terminal: false };
+  return { stage, code: "EXPORT_ERROR", message: "DataDoe export failed for this source.", terminal: false };
 }
 
 function fetchStatusOf(job) {
   return job.fetch_status ?? job.fetchStatus ?? "pending";
 }
 
+// Rebuild the complete canonical job: plan supplies fetch params + policies; the DB row
+// is authoritative for lifecycle state (status / attempted_at / export_id / connection).
+function mergeJob(meta, jobRow) {
+  const hash = jobRow.request_hash ?? jobRow.requestHash;
+  return {
+    ...meta,
+    requestHash: hash,
+    request_hash: hash,
+    requestKey: meta.requestKey || jobRow.request_key || "",
+    fetch_status: fetchStatusOf(jobRow),
+    attempted_at: jobRow.attempted_at ?? jobRow.attemptedAt ?? null,
+    export_id: jobRow.export_id ?? jobRow.exportId ?? null,
+    connection_id: jobRow.connection_id ?? jobRow.connectionId ?? meta.connectionId ?? "primary",
+  };
+}
+
 /**
- * Process ONE source job through the full lifecycle. Returns an outcome object the
- * caller uses for signal derivation. Never throws for an expected source failure — it
- * records the failure and returns a non-success outcome so the cycle continues.
+ * Run ONE source job through the resumable lifecycle. Returns an outcome for signal
+ * derivation. Never throws for an expected source failure — it records a safe failure and
+ * returns a non-success outcome so the cycle continues.
  */
-async function processOneJob({ store, fetchSource, clock, cycleId, job, progress }) {
-  const requestHash = job.request_hash ?? job.requestHash;
-  const requestKey = job.request_key ?? job.requestKey ?? "";
+async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline }) {
+  const requestHash = job.requestHash;
+  const requestKey = job.requestKey || "";
   const started = clock();
+  const status = job.fetch_status;
+  let exportId = job.export_id || null;
 
-  // Durable one-attempt guard. Only the caller that flips attempted_at NULL -> now()
-  // may create an export; every concurrent/repeat caller gets false and MUST NOT
-  // create one. This holds across separate serverless invocations.
-  const won = await store.claimExportAttempt(cycleId, requestHash);
-  if (!won) {
-    progress.skipped += 1;
-    return { requestKey, requestHash, status: "skipped", validated: false, reason: "already-attempted" };
-  }
-  progress.attemptsWon += 1;
-
-  let rows; let payloadBytes; let exportId;
-  try {
-    const result = await fetchSource(job);
-    rows = Array.isArray(result?.rows) ? result.rows : [];
-    payloadBytes = Number.isFinite(result?.payloadBytes) ? result.payloadBytes : approxPayloadBytes(rows);
-    exportId = result?.exportId ?? null;
-  } catch (error) {
-    const cls = classifyFetchError(error);
-    await store.recordSourceFailure({
-      cycleId, requestHash, exportId: error?.exportId ?? null,
-      stage: cls.stage, code: cls.code, message: cls.message, terminal: cls.terminal,
-      durationMs: clock() - started,
-    });
+  const fail = async (stage, code, message, terminal, rowCount) => {
+    await store.recordSourceFailure({ cycleId, requestHash, exportId, stage, code, message, terminal, durationMs: clock() - started, rowCount });
     progress.failed += 1;
-    return { requestKey, requestHash, status: cls.terminal ? "terminal" : "failed", validated: false, code: cls.code };
+    return { requestKey, requestHash, status: terminal ? "terminal" : "failed", validated: false, code };
+  };
+
+  // ---- STEPS 1-3: create-export (only for a pending job that wins the atomic claim) ----
+  if (status === "pending") {
+    const won = await store.claimExportAttempt(cycleId, requestHash);
+    if (!won) { progress.skipped += 1; return { requestKey, requestHash, status: "skipped", validated: false, reason: "already-attempted" }; }
+    progress.attemptsWon += 1;
+    try {
+      const created = await runWithDeadline(() => dataDoe.create(job)); // exactly one POST
+      exportId = created && created.exportId ? created.exportId : null;
+    } catch (error) {
+      const cls = classifyFetchError(error, "create-export");
+      return fail(cls.stage, cls.code, cls.message, cls.terminal);
+    }
+    if (!exportId) {
+      // The POST returned no export id: an explicit safe failure, never silently skipped.
+      return fail("create-export", "CREATE_NO_EXPORT_ID", "DataDoe create-export returned no export id.", false);
+    }
+    // STEP 3: persist export_id IMMEDIATELY, before any poll/download, so a crash resumes.
+    await store.recordExportCreated({ cycleId, requestHash, exportId });
+  } else if (status === "attempted") {
+    // RESUME: create-export already ran. It must NOT run again.
+    if (!exportId) {
+      // Claimed but interrupted before an export id was saved: explicit safe failure.
+      return fail("create-export", "CREATE_INTERRUPTED", "Create-export was interrupted before an export id was saved.", false);
+    }
+    // else fall through to poll/download using the saved export_id
+  } else {
+    return null; // succeeded / failed / skipped: nothing to do
   }
 
-  // VALIDATE stage. A result sitting on the row cap is indistinguishable from a
-  // truncated one, so a strict job at/above its limit is a validation failure — never
-  // saved. (An honestly empty success, e.g. zero SQP rows, is a valid success.)
+  // ---- STEP 4: poll ----
+  try {
+    await runWithDeadline(() => dataDoe.poll(job, exportId));
+  } catch (error) {
+    const cls = classifyFetchError(error, "poll");
+    return fail(cls.stage, cls.code, cls.message, cls.terminal);
+  }
+
+  // ---- STEP 5: download ----
+  let rows;
+  try {
+    rows = await runWithDeadline(() => dataDoe.download(job, exportId));
+  } catch (error) {
+    const cls = classifyFetchError(error, "download");
+    return fail(cls.stage, cls.code, cls.message, cls.terminal);
+  }
+
+  // ---- STEP 6: validate. A non-array payload is a failure (never coerced to []); a
+  // strict job at/above its row cap is a truncation failure. Neither is saved. ----
+  if (!Array.isArray(rows)) {
+    return fail("validate", "MALFORMED_PAYLOAD", "DataDoe payload was not an array; result not saved.", true);
+  }
   if (job.strict === true && rows.length >= Number(job.limit)) {
-    await store.recordSourceFailure({
-      cycleId, requestHash, exportId,
-      stage: "validate", code: "TRUNCATED",
-      message: "Result reached the row cap; partial data was not saved.", terminal: true,
-      durationMs: clock() - started, rowCount: rows.length,
-    });
-    progress.failed += 1;
-    return { requestKey, requestHash, status: "terminal", validated: false, code: "TRUNCATED" };
+    return fail("validate", "TRUNCATED", "Result reached the row cap; partial data was not saved.", true, rows.length);
   }
 
-  // PERSIST stage, recorded SEPARATELY: a Supabase save failure is never reported as a
-  // DataDoe fetch failure, and it never overwrites last-known-good rows.
-  let cacheObjectPath = null;
+  // ---- STEP 7: persist (atomic last-known-good). A save error / empty object path is a
+  // SEPARATE persist-stage failure and never overwrites the previous good data. ----
+  const payloadBytes = approxPayloadBytes(rows);
+  let objectPath = null;
   try {
-    cacheObjectPath = await store.saveSourceRows({ job, rows, payloadBytes, exportId });
+    objectPath = await store.saveSourceRows({ job, rows, payloadBytes, exportId, version: `${cycleId}-${exportId}` });
   } catch (error) {
-    await store.recordSourceFailure({
-      cycleId, requestHash, exportId,
-      stage: "persist", code: "SAVE_FAILED",
-      message: "Saving the source result failed; previous data preserved.", terminal: true,
-      durationMs: clock() - started, rowCount: rows.length,
-    });
-    progress.failed += 1;
-    return { requestKey, requestHash, status: "failed", validated: false, code: "SAVE_FAILED" };
+    return fail("persist", "SAVE_FAILED", "Saving the source result failed; previous data preserved.", true, rows.length);
+  }
+  if (!objectPath) {
+    return fail("persist", "SAVE_NO_PATH", "Source save returned no object path; treated as a failure.", true, rows.length);
   }
 
-  await store.recordSourceSuccess({
-    cycleId, requestHash, exportId,
-    rowCount: rows.length, payloadBytes, durationMs: clock() - started, cacheObjectPath,
-  });
+  // ---- STEP 8: record success ----
+  await store.recordSourceSuccess({ cycleId, requestHash, exportId, rowCount: rows.length, payloadBytes, durationMs: clock() - started, cacheObjectPath: objectPath });
   progress.succeeded += 1;
-  // rows are returned in-memory ONLY to derive typed signals; they are not re-persisted.
   return { requestKey, requestHash, status: "success", validated: true, rowCount: rows.length, rows };
 }
 
 /**
  * Run (or resume) the source half of ONE cycle for a fixed set of planned source jobs.
- * Idempotent: upserts each planned job (unique cycle_id+request_hash), then processes
- * only the still-pending ones, bounded by maxJobs and a wall-clock deadline. Returns
- * progress + the per-job outcomes (with rows for signal derivation) and NEVER exposes a
- * secret. A cycle that has already finished is a no-op.
- *
- * plannedJobs: [{ requestHash, requestKey, sourceId, sourceKey, connectionId,
- *   organizationFingerprint, accountScopeHash, requestMeta, bucket, strict, limit }]
+ * Idempotent: upserts each planned job (unique cycle_id+request_hash), then processes the
+ * still-pending AND resumable-attempted ones, bounded by maxJobs and a wall-clock
+ * deadline. Cumulative cycle counts are recomputed from ALL persisted jobs (never reset).
+ * Returns progress + per-job outcomes (rows in-memory for signal derivation) and NEVER a
+ * secret. A finished cycle is a no-op.
  */
 export async function runSourceJobs({
-  store, fetchSource, plannedJobs,
+  store, dataDoe, plannedJobs,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = DEFAULT_RESERVE_MS, maxJobs = Infinity,
 }) {
@@ -166,65 +195,66 @@ export async function runSourceJobs({
     deadlineReached: false, drained: false,
   };
   const outcomes = [];
+  const runWithDeadline = (fn) => withDataDoeDeadline(deadlineMs === Infinity ? Infinity : deadlineMs - reserveMs, fn);
 
   const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
   progress.cycleId = cycleId;
-  progress.claimedCycle = await store.claimCycle(cycleId); // first worker stamps started_at
+  progress.claimedCycle = await store.claimCycle(cycleId);
 
   const cycle = await store.getCycle(cycleId);
-  const finished = cycle && ["succeeded", "partial", "failed"].includes(cycle.status);
-  if (finished && !progress.claimedCycle) {
+  if (cycle && ["succeeded", "partial", "failed"].includes(cycle.status) && !progress.claimedCycle) {
     progress.alreadyFinished = true;
     progress.drained = true;
     return { ...progress, outcomes };
   }
 
-  // Plan: upsert every canonical job once. Re-running is a no-op (unique cycle+hash),
-  // so a resumed invocation never duplicates a job or its export.
   for (const job of plannedJobs || []) {
     if (!job || !job.requestHash) continue;
     await store.upsertSourceJob({
       cycleId, bucket,
-      requestHash: job.requestHash,
-      requestKey: job.requestKey || "",
-      sourceId: job.sourceId || "",
-      sourceKey: job.sourceKey || "",
+      requestHash: job.requestHash, requestKey: job.requestKey || "",
+      sourceId: job.sourceId || "", sourceKey: job.sourceKey || "",
       connectionId: job.connectionId || "primary",
       organizationFingerprint: job.organizationFingerprint || "",
-      accountScopeHash: job.accountScopeHash || "",
-      requestMeta: job.requestMeta || {},
+      accountScopeHash: job.accountScopeHash || "", requestMeta: job.requestMeta || {},
     });
   }
-  progress.planned = (plannedJobs || []).filter((j) => j && j.requestHash).length;
-
-  // Metadata the worker needs per hash (strict/limit) that is NOT stored on the job row.
-  const metaByHash = new Map((plannedJobs || []).map((j) => [j.requestHash, j]));
+  const metaByHash = new Map((plannedJobs || []).filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
+  progress.planned = metaByHash.size;
 
   const jobRows = await store.listSourceJobs(cycleId);
   for (const jobRow of jobRows) {
-    if (progress.processed >= maxJobs) { progress.drained = false; break; }
-    if (clock() >= deadlineMs - reserveMs) { progress.deadlineReached = true; progress.drained = false; break; }
-    if (fetchStatusOf(jobRow) !== "pending") continue; // resume: skip completed/attempted/failed
+    const st = fetchStatusOf(jobRow);
+    if (st === "succeeded" || st === "failed" || st === "skipped") continue; // done
+    if (progress.processed >= maxJobs) { progress.deadlineReached = false; break; }
+    if (clock() >= deadlineMs - reserveMs) { progress.deadlineReached = true; break; }
 
-    const meta = metaByHash.get(jobRow.request_hash ?? jobRow.requestHash) || {};
-    const job = { ...jobRow, strict: meta.strict === true, limit: meta.limit };
+    const hash = jobRow.request_hash ?? jobRow.requestHash;
+    const meta = metaByHash.get(hash);
     progress.processed += 1;
-    outcomes.push(await processOneJob({ store, fetchSource, clock, cycleId, job, progress }));
+    if (!meta) {
+      // A pending/attempted job with no canonical plan entry: fail closed, never silent.
+      await store.recordSourceFailure({ cycleId, requestHash: hash, exportId: jobRow.export_id ?? null, stage: st === "attempted" ? "poll" : "create-export", code: "MISSING_PLAN", message: "No canonical plan entry for this source job.", terminal: false, durationMs: 0 });
+      progress.failed += 1;
+      outcomes.push({ requestKey: "", requestHash: hash, status: "failed", validated: false, code: "MISSING_PLAN" });
+      continue;
+    }
+    const job = mergeJob(meta, jobRow);
+    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline });
+    if (outcome) outcomes.push(outcome);
   }
 
-  progress.drained = !progress.deadlineReached && progress.processed < maxJobs
-    ? true
-    : progress.drained;
-  // Drained is true only if we reached the end of the pending list without a stop.
-  const pendingLeft = (await store.listSourceJobs(cycleId)).some((j) => fetchStatusOf(j) === "pending");
-  progress.drained = !pendingLeft && !progress.deadlineReached;
-
-  if (store.updateCycleCounts) {
-    await store.updateCycleCounts(cycleId, {
-      sourceTotal: jobRows.length,
-      sourceSucceeded: progress.succeeded,
-      sourceFailed: progress.failed,
-    });
-  }
+  // Cumulative counts + drained state: recomputed from ALL persisted jobs so resuming or
+  // adding staged jobs never reduces a previous count.
+  const allJobs = await store.listSourceJobs(cycleId);
+  const counts = {
+    sourceTotal: allJobs.length,
+    sourceSucceeded: allJobs.filter((j) => fetchStatusOf(j) === "succeeded").length,
+    sourceFailed: allJobs.filter((j) => fetchStatusOf(j) === "failed").length,
+  };
+  if (store.updateCycleCounts) await store.updateCycleCounts(cycleId, counts);
+  const unfinished = allJobs.some((j) => ["pending", "attempted"].includes(fetchStatusOf(j)));
+  progress.drained = !unfinished && !progress.deadlineReached;
+  progress.counts = counts;
   return { ...progress, outcomes };
 }

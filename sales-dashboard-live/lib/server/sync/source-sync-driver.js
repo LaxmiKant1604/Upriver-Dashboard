@@ -1,29 +1,32 @@
 // Scheduler v2 Phase 1c — SHADOW-MODE composition driver.
 //
 // Wires the pure source worker (source-worker.js) to real Supabase + DataDoe I/O and
-// runs the STAGED loop: plan primaries -> execute -> derive typed signals from the
-// validated results -> re-plan downstream/fallback through the approved Phase 1b
-// resolver -> execute, until nothing new is planned or the deadline is reached.
+// runs the STAGED loop. A brand-new invocation RECONSTRUCTS dependency signals from
+// PERSISTED successful source jobs + their saved payloads (and persisted ads rows) — it
+// never trusts in-memory-only or browser signals — then plans downstream/fallback jobs
+// through the approved Phase 1b resolver.
 //
-// SHADOW MODE: this module is NOT imported by any route, cron, or the Scheduler v1
-// worker (run-sync.js). It exists so Phase 1d and the pg_cron/Vercel kickoff can wire
-// it later. Nothing here runs a live DataDoe probe on import.
+// SHADOW MODE: not imported by any route, cron, or Scheduler v1 (run-sync.js). Nothing
+// here runs a live DataDoe probe on import.
 
 import { createExport, pollExport, downloadExport } from "../datadoe.js";
+import { organizationFingerprint } from "../source-identity.js";
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts,
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt,
-  recordSyncSourceSuccess, recordSyncSourceFailure, saveSourceExportCache,
+  recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
+  getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
 } from "../supabase.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import { runSourceJobs } from "./source-worker.js";
-import { deriveSignalsFromOutcomes } from "./source-signals.js";
+import { atomicSaveSourcePayload } from "./source-cache.js";
+import { deriveSignalsFromOutcomes, SIGNAL_PRODUCERS, adsCurrencySignal } from "./source-signals.js";
 
-const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000; // matches the shared source-cache horizon
+const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000;
 
 // Turn a resolved job (from reportSourceRequestHashes) into a planned source job that
 // carries BOTH the durable identity fields and the in-memory fetch params the live
-// fetcher needs. fetchParams is NEVER persisted (the DB stores request_meta only).
+// adapter needs. fetchParams is NEVER persisted (the DB stores request_meta only).
 export function plannedSourceJob(reportKey, resolved, bucket) {
   const contract = (REPORT_SOURCE_CONTRACTS[reportKey] || []).find((c) => c.requestKey === resolved.requestKey);
   return {
@@ -38,7 +41,6 @@ export function plannedSourceJob(reportKey, resolved, bucket) {
     bucket: resolved.bucket || bucket,
     strict: resolved.strict === true,
     limit: resolved.limit,
-    // in-memory only — the params required to re-issue the exact export:
     fetchParams: {
       columns: contract ? contract.columns : undefined,
       sellerOrVendorIds: resolved.sellerOrVendorIds,
@@ -52,6 +54,8 @@ export function plannedSourceJob(reportKey, resolved, bucket) {
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.
 export function makeSupabaseSourceStore() {
+  const storage = sourceCacheStorageAdapter();
+  const metadata = sourceCacheMetadataAdapter();
   return {
     openCycle: (args) => openSyncCycle(args),
     claimCycle: (cycleId) => claimSyncCycle(cycleId),
@@ -59,62 +63,103 @@ export function makeSupabaseSourceStore() {
     upsertSourceJob: (job) => upsertSyncSourceJob(job),
     listSourceJobs: (cycleId) => getSyncSourceJobs(cycleId),
     claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),
-    saveSourceRows: async ({ job, rows, payloadBytes, exportId }) => {
-      const saved = await saveSourceExportCache({
-        requestHash: job.request_hash ?? job.requestHash,
-        sourceId: job.source_id ?? job.sourceId,
-        organizationFingerprint: job.organization_fingerprint ?? job.organizationFingerprint ?? "",
-        accountScopeHash: job.account_scope_hash ?? job.accountScopeHash ?? "",
-        requestMeta: job.request_meta ?? job.requestMeta ?? {},
-        rows,
-        payloadBytes,
-        expiresAt: new Date(Date.now() + SOURCE_CACHE_TTL_MS).toISOString(),
-      });
-      // exportId is threaded only so the job row can resume a poll/download.
-      void exportId;
-      return saved?.object_path || null;
-    },
+    recordExportCreated: (args) => recordSyncSourceExportCreated(args),
+    loadSourceRows: (requestHash) => getSourceExportCache(requestHash),
+    saveSourceRows: ({ job, rows, payloadBytes, version }) => atomicSaveSourcePayload({
+      storage, metadata,
+      requestHash: job.request_hash ?? job.requestHash,
+      sourceId: job.source_id ?? job.sourceId,
+      organizationFingerprint: job.organization_fingerprint ?? job.organizationFingerprint ?? "",
+      accountScopeHash: job.account_scope_hash ?? job.accountScopeHash ?? "",
+      requestMeta: job.request_meta ?? job.requestMeta ?? {},
+      rows, payloadBytes,
+      expiresAt: new Date(Date.now() + SOURCE_CACHE_TTL_MS).toISOString(),
+      version,
+    }),
     recordSourceSuccess: (args) => recordSyncSourceSuccess(args),
     recordSourceFailure: (args) => recordSyncSourceFailure(args),
     updateCycleCounts: (cycleId, counts) => updateSyncCycleCounts(cycleId, counts),
   };
 }
 
-// Production fetcher: runs ONE DataDoe export for a planned job using the connection's
-// apiKey (looked up by connection_id => primary / dd-secondary isolation). The worker
-// calls this ONLY after winning claim_source_export_attempt, so it never creates a
-// second export. The apiKey is used here and never returned, logged, or stored.
-export function makeDataDoeFetcher(connections) {
+// Production DataDoe adapter with FAIL-CLOSED organization routing. A source job may run
+// ONLY on the connection that owns it: connection_id must be an explicit, valid id, and
+// the job's organizationFingerprint must match that connection's key. Missing / unknown /
+// mismatched routing throws BEFORE any DataDoe call — an unresolved secondary job is never
+// silently sent to the primary key. The apiKey is used here and never returned or stored.
+export function makeDataDoeAdapter(connections) {
   const byId = new Map((connections || []).map((c) => [c.id, c]));
-  return async function fetchSource(job) {
-    const conn = byId.get(job.connection_id ?? job.connectionId) || byId.get("primary");
-    if (!conn) throw new Error("No DataDoe connection is configured for this source job's organization.");
-    const p = job.fetchParams;
-    if (!p || !p.columns) throw new Error("Planned source job is missing its fetch parameters.");
-    const created = await createExport(conn.apiKey, job.source_id ?? job.sourceId, p.columns, p.sellerOrVendorIds, p.from, p.to, p.limit, p.options || {});
-    const exportId = created.exportId || created.id;
-    if (created.status !== "COMPLETED") await pollExport(conn.apiKey, exportId);
-    const rows = await downloadExport(conn.apiKey, exportId);
-    return { rows, exportId };
+  function resolveConnection(job) {
+    const id = job.connection_id ?? job.connectionId;
+    if (id !== "primary" && id !== "dd-secondary") {
+      throw new Error(`Source job has a missing/invalid connection id "${id}".`);
+    }
+    const conn = byId.get(id);
+    if (!conn || !conn.apiKey) throw new Error(`No configured DataDoe connection for "${id}".`);
+    const expected = conn.organizationFingerprint || organizationFingerprint(conn.apiKey);
+    const jobFingerprint = job.organizationFingerprint ?? job.organization_fingerprint;
+    if (jobFingerprint && jobFingerprint !== expected) {
+      throw new Error(`Source job organization does not match connection "${id}"; refusing to route it.`);
+    }
+    return conn;
+  }
+  return {
+    create: async (job) => {
+      const conn = resolveConnection(job); // throws before createExport
+      const p = job.fetchParams;
+      if (!p || !p.columns) throw new Error("Planned source job is missing its fetch parameters.");
+      const created = await createExport(conn.apiKey, job.sourceId ?? job.source_id, p.columns, p.sellerOrVendorIds, p.from, p.to, p.limit, p.options || {});
+      return { exportId: created.exportId || created.id, completed: created.status === "COMPLETED" };
+    },
+    poll: async (job, exportId) => { const conn = resolveConnection(job); await pollExport(conn.apiKey, exportId); },
+    download: async (job, exportId) => { const conn = resolveConnection(job); return downloadExport(conn.apiKey, exportId); },
   };
 }
 
 /**
- * Run (or resume) ONE cycle end to end in staged rounds. `resolvePlan(signals)` returns
- * the flattened planned source jobs for the current typed signals (production wires it
- * to reportSourceRequestHashes over the account set; tests inject a fixture). Downstream
- * jobs appear only once their primary's validated signal has been derived, so a probe
- * failure spends no downstream export and preserves the prior report. Bounded by
- * maxRounds, maxJobs, and the wall-clock deadline; never exposes a secret.
+ * Reconstruct the typed signals a brand-new worker process needs from PERSISTED state:
+ * the kickoff plan gives the signal-producing request keys -> hashes; for each whose DB
+ * job SUCCEEDED, the saved payload is loaded and the signal re-derived. A failed /
+ * terminal / not-yet-successful primary contributes no activating signal. PPC ads currency
+ * comes from persisted ads rows (never a live export). No browser/UI input is trusted.
+ */
+export async function reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider }) {
+  const signals = {};
+  const kickoff = await resolvePlan({});
+  const producers = (kickoff.sourceJobs || []).filter((j) => SIGNAL_PRODUCERS[j.requestKey]);
+  const jobs = await store.listSourceJobs(cycleId);
+  const byHash = new Map(jobs.map((j) => [j.request_hash ?? j.requestHash, j]));
+  for (const p of producers) {
+    const jobRow = byHash.get(p.requestHash);
+    const status = jobRow && (jobRow.fetch_status ?? jobRow.fetchStatus);
+    if (status !== "succeeded") continue; // only a validated saved success activates downstream
+    const payload = store.loadSourceRows ? await store.loadSourceRows(p.requestHash) : null;
+    const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
+    signals[p.requestKey] = SIGNAL_PRODUCERS[p.requestKey]({ requestKey: p.requestKey, status: "success", validated: true, rows });
+  }
+  if (adsRowsProvider) {
+    const adsRows = await adsRowsProvider();
+    signals["ppc-performance:ads-currency"] = adsCurrencySignal(adsRows);
+  }
+  return signals;
+}
+
+/**
+ * Run (or resume) ONE cycle end to end in staged rounds. Reconstructs signals from
+ * persisted state first (so a fresh invocation plans downstream without repeating a
+ * primary export), then: plan -> execute -> derive fresh signals -> re-plan -> execute,
+ * bounded by maxRounds, maxJobs, and the wall-clock deadline. Never exposes a secret.
  */
 export async function runStagedSourceCycle({
-  store, fetchSource, resolvePlan, extraSignals = {},
+  store, dataDoe, resolvePlan, adsRowsProvider, extraSignals = {},
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 5,
 }) {
-  let signals = { ...extraSignals };
+  const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+  let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
+
   const rollup = {
-    cycleId: null, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0,
+    cycleId, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0,
     deadlineReached: false, drained: false, signals,
   };
   const seenHashes = new Set();
@@ -126,7 +171,7 @@ export async function runStagedSourceCycle({
     if (remaining === 0) { rollup.drained = false; break; }
 
     const res = await runSourceJobs({
-      store, fetchSource, plannedJobs, bucket, cycleDate, scheduledAt, trigger,
+      store, dataDoe, plannedJobs, bucket, cycleDate, scheduledAt, trigger,
       clock, deadlineMs, reserveMs, maxJobs: remaining,
     });
     rollup.cycleId = res.cycleId;
@@ -135,6 +180,7 @@ export async function runStagedSourceCycle({
     rollup.succeeded += res.succeeded;
     rollup.failed += res.failed;
     rollup.skipped += res.skipped;
+    rollup.counts = res.counts;
 
     const before = JSON.stringify(signals);
     signals = { ...signals, ...deriveSignalsFromOutcomes(res.outcomes) };
