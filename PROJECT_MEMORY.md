@@ -3265,6 +3265,42 @@ exact 06:00 local time becomes a business requirement.
   deploy, or apply migrations before approval. Live DataDoe validation remains
   a later gate.
 
+### Scheduler v2 Phase 1b approval (Codex, 2026-08-06)
+
+- Re-reviewed Claude's fail-closed corrections in commits `f398d12` and
+  `463b727` on `feature/scheduler-v2`. No blocking findings remain in Phase 1b.
+- Sales Movers now accepts downstream traffic/ads jobs only when their windows
+  exactly equal the recent and prior seven-day windows derived from the fresh,
+  validated latest-date probe. Missing, extra, duplicate, reordered, invalid,
+  or caller-drifted windows fail closed. The reported date must also fall
+  inside the single real probe window, including either boundary.
+- Dependency dates now pass a strict UTC calendar round-trip check. Impossible
+  values such as `2025-02-30`, invalid leap days, and malformed dates cannot be
+  normalized silently into a different request window.
+- `failurePolicy.safeCode` rejects any standalone 4xx/5xx numeric status while
+  retaining symbolic operational codes. This metadata remains outside the
+  DataDoe request identity, so the pinned request hash
+  `5601253219be13c7a7431e10f58cfb05d26d963ef89a9a4cd678a994e04aac1e`
+  and existing deduplication behavior are unchanged.
+- Verification from the reviewed worktree passed: 155 focused report-contract
+  assertions and the complete `npm run verify` suite (327 assertions plus the
+  2,393-module production build). `feature/design-system` remains at
+  `e90c268`; no branch was pushed or merged and no deployment or migration was
+  performed.
+- **Next approved work is Phase 1c only:** implement the checkpointable,
+  idempotent source-job worker that consumes these resolved contracts and
+  writes `sync_cycles`, `sync_source_jobs`, and report-job state. It must claim
+  each `request_hash` atomically before the DataDoe create-export call, emit
+  the typed dependency signals from validated saved results, preserve
+  last-known-good data on every failure, and never retry a failed source in the
+  same cycle. Keep it in shadow mode; do not remove manual refresh or deploy
+  until live primary/secondary organization and non-US/US cycle validation is
+  complete.
+- Outstanding live gates remain: Daily superset-versus-compact reconciliation;
+  real per-organization handling for SQP, content-change, listings-raw, and
+  known DataDoe 402/404 responses; Ads history freshness for PPC; and one full
+  non-US plus one full US cycle across both DataDoe organizations.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
