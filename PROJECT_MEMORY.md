@@ -1,5 +1,35 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b staged-policy re-review (Codex, 2026-08-06)
+
+- Reviewed commits `476f62f` and `68d4050` on `feature/scheduler-v2`.
+  The reusable staged dependency, PPC currency gate, immutable dependency
+  metadata, and generic PPC degradation policy correctly address the earlier
+  orchestration findings. `npm run verify` passes all 317 assertions
+  (`54+60+23+6+22+7+145`) plus the complete 2,393-module build.
+- **Phase 1b is still not approved.** Three focused fail-closed corrections are
+  required before Phase 1c:
+  1. `salesMoversWindows()` is only called by the test/caller; the resolver does
+     not derive or validate `sales-movers:traffic` / `sales-movers:ads` windows
+     against the staged probe signal. A validated probe date of `2025-07-30`
+     currently accepts arbitrary supplied windows such as `1999-01-01..07` and
+     creates their request hashes. Bind these windows inside the resolver (or
+     reject any caller windows that do not exactly equal the helper's recent and
+     prior windows), and test mismatched/missing/extra/reordered windows.
+  2. The staged date validator checks only `YYYY-MM-DD` shape. Impossible dates
+     such as `2025-99-99`, `2025-02-30`, and `0000-00-00` pass; `addDaysStr`
+     normalizes them into unrelated dates. Add strict semantic UTC calendar-date
+     validation and, for Sales Movers, ensure the latest reported date falls
+     inside the actual probe window before activating downstream jobs.
+  3. `normalizeFailurePolicy()` claims to reject HTTP status text but its regex
+     only covers 402/404/424/429/5xx. Codes such as 400, 401, 403, 409, and 422
+     can still enter `safeCode`. Reject every numeric 4xx/5xx status and add
+     representative tests while continuing to allow symbolic safe codes such as
+     `TOTAL_SALES_UNAVAILABLE`.
+- Re-run focused tests and full verification, keep the golden request hash
+  unchanged, and return for re-review. Do not start Phase 1c, push, merge,
+  deploy, or apply migrations yet.
+
 ## Scheduler v2 Phase 1b — staged deps + failure policy (FIX 1/2/3, 2026-08-06)
 
 Fixed the three execution-policy gaps from Codex's insight-contract review on
