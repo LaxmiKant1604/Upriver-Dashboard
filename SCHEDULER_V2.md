@@ -279,13 +279,11 @@ catalog has a different `request_hash` and cannot share under the exact-identity
 The common insight catalog also differs from operational catalogs (window/limit), so
 it is not shared with those.
 
-**Not declared this session (stop condition, honest):** each insight report's column
-constants live in the builder files (not `api/datadoe.js`) and several use org-conditional
-sources; accurate per-call transcription + parity testing for six reports is the next
-focused Phase 1b increment, using the same method as the operational reports. The
-classification above is complete; the formal `REPORT_SOURCE_CONTRACTS` entries + tests
-remain. No insight contract was guessed or half-declared. Priority Feed + Brand View stay
-derived-only (no DataDoe export).
+**Now declared + parity-tested (see §10, 2026-08-06):** all six insight reports are formal
+`REPORT_SOURCE_CONTRACTS` entries, transcribed request-by-request from the builder files
+(where the column constants live) and parity-tested against those constants. Org-conditional
+`listings-raw` / `sqp-weekly` carry the degraded policy. Priority Feed + Brand View stay
+derived-only (`REPORT_DERIVED_ONLY`, no DataDoe export).
 
 ---
 
@@ -390,3 +388,111 @@ a zero-period success and wasted a monthly export; it no longer does. State tabl
 Determinism, one-create-export-per-cycle (`unique(cycle_id, request_hash)` +
 `claim_source_export_attempt`), five-ID batching and primary/dd-secondary isolation are
 unchanged and re-tested.
+
+---
+
+## 10. Insight source contracts declared + parity-tested (2026-08-06)
+
+The six insight reports classified in §7 are now formal `REPORT_SOURCE_CONTRACTS`
+entries, transcribed request-by-request from the executable builders and parity-tested
+against the builder constants (columns/groupBy/aggregations read out of
+`lib/server/reports/*.js`, not documentation). Commits `8750c20` (Sales Movers / Buy
+Box / Returns) and `056dcf0` (Listing Health / PPC / Listing Optimizer). `npm run
+verify` green (301 assertions); `request_hash` golden literal unchanged; Phase 1c NOT
+started; no push / deploy / migration.
+
+### 10.1 Full source dependency table (from executable code)
+
+Every request: source key · columns constant · limit (`ROW_LIMITS`) · groupBy/agg ·
+order · window · strict · policy. All fetch through `fetchExportRowsStrict` (generic
+`rows.length >= limit` guard, `lib/server/datadoe.js`) **except** the Sales Movers
+latest-date probe (a date rollup that never nears its 500 cap).
+
+| requestKey | source | columns · limit · order | grouped? | window | strict | policy |
+|---|---|---|---|---|---|---|
+| `sales-movers:sales-latest-probe` | sales-traffic-asin-date | `["date"]` · 500 · date/ASC | groupBy date, sum total_units | asOf−25d..asOf | no | — |
+| `sales-movers:traffic` | sales-traffic-asin-date | TRAFFIC_COLUMNS(2) · 50000 · child_asin/ASC | groupBy + 7 sums | recent + prior 7d | yes | — |
+| `sales-movers:ads` | profit-by-sku-date | ADS_COLUMNS(2) · 50000 · child_asin/ASC | groupBy + 3 sums | recent + prior 7d | yes | — |
+| `sales-movers:inventory` | fba-inventory-health | INVENTORY_COLUMNS(16) · 15000 · date/DESC | raw | asOf−10d..asOf | yes | — |
+| `sales-movers:catalog` | product-catalog | CATALOG_COLUMNS(4) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `buy-box-loss:daily` | profit-by-sku-date | DAILY_COLUMNS(10) · 50000 · date/ASC | raw | 4×7d slices (asOf−27d..asOf) | yes | — |
+| `buy-box-loss:inventory` | fba-inventory-health | INVENTORY_COLUMNS(16) · 15000 · date/DESC | raw | asOf−10d..asOf | yes | — |
+| `buy-box-loss:catalog` | product-catalog | CATALOG_COLUMNS(4) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `returns-leakage:returns` | returns | RETURN_COLUMNS(10) · 50000 · date/DESC | raw | asOf−59d..asOf | yes | — |
+| `returns-leakage:settlements` | settlements | SETTLEMENT_GROUP_BY(4) · 50000 · sku/ASC | groupBy + 9 sums | asOf−59d..asOf | yes | — |
+| `returns-leakage:traffic` | sales-traffic-asin-date | TRAFFIC_GROUP_BY(2) · 50000 · child_asin/ASC | groupBy + 4 sums | asOf−59d..asOf | yes | — |
+| `returns-leakage:catalog` | product-catalog | CATALOG_COLUMNS(4) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `listing-health:listings` | listings | LISTING_COLUMNS(13) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `listing-health:listings-raw` | listings-raw | LISTING_RAW_COLUMNS(6) · 20000 · child_asin/ASC | raw | no-date | yes | **degraded** |
+| `listing-health:sales` | profit-by-sku-date | SALES_COLUMNS(3) · 50000 · sku/ASC | groupBy + 3 sums | asOf−29d..asOf | yes | — |
+| `listing-health:inventory` | fba-inventory-health | INVENTORY_COLUMNS(16) · 15000 · date/DESC | raw | asOf−10d..asOf | yes | — |
+| `listing-health:catalog` | product-catalog | CATALOG_COLUMNS(4) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `ppc-performance:total-sales` | sales-traffic-asin-date | `["date"]` · 500 · date/ASC | groupBy date + 2 sums | asOf−29d..asOf | yes | — |
+| `ppc-performance:catalog` | product-catalog | CATALOG_COLUMNS(4) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+| `listing-optimizer:sqp-weekly` | sqp-weekly | OPT SQP_COLUMNS(15) · 50000 · date/ASC | raw | asOf−84d..asOf | yes | **degraded** |
+| `listing-optimizer:catalog` | product-catalog | OPT CATALOG_COLUMNS(13) · 20000 · child_asin/ASC | raw | no-date | yes | — |
+
+### 10.2 Shared identities (deduplicate) and identities that intentionally do NOT
+
+- **Common Product Catalog** — one `product-catalog` identity (CATALOG_COLUMNS(4),
+  no-date, 20000, child_asin/ASC) shared by **five** reports: Sales Movers, Buy Box,
+  Returns, Listing Health, PPC. One export per account, not five.
+- **Common FBA Inventory** — one `fba-inventory-health` identity (INVENTORY_COLUMNS(16),
+  asOf−10d..asOf, 15000, date/DESC) shared by **three**: Sales Movers, Buy Box, Listing
+  Health. One export per account, not three.
+- **Do NOT share (same source, different identity):**
+  - Sales Movers `traffic` (7 sums, 7-day) vs Returns `traffic` (4 sums, 60-day) — same
+    `sales-traffic-asin-date` source, different columns/aggregations/window.
+  - PPC `total-sales` (500 date rollup) vs Sales Movers `sales-latest-probe` (1 sum) vs
+    the traffic aggregates — all `sales-traffic-asin-date`, all distinct identities.
+  - **Listing Optimizer's catalog** (13 richer content columns) ≠ the common catalog;
+    **its SQP** (15 columns) ≠ Keyword Rank's SQP — proven by distinct `request_hash`
+    at an identical account scope + window.
+
+### 10.3 Derived Supabase dependencies (zero DataDoe exports)
+
+- **PPC advertising** — all campaign/ASIN/target/search-term figures come from persisted
+  `ads_daily_source_rows` (four scheduled Ads sources, `REPORT_DERIVED_SOURCE_KEYS`).
+  PPC's only owned exports are `total-sales` + `catalog`. Opening/refreshing PPC never
+  runs an Ads export.
+- **Priority Feed** and **Brand View** are `REPORT_DERIVED_ONLY`: they own zero source
+  contracts (Priority Feed reads the six insight outputs; Brand View reads brand-sales
+  rows + persisted Ads + fba-plan). A dependency-map test proves every sidebar report is
+  covered exactly one way — scheduler-declared **or** derived-only, never unaudited.
+
+### 10.4 Disabled-source behavior
+
+- **Terminal → blocked** (unchanged): Keyword Rank SQP, Content Changes events.
+- **Degraded → save-unavailable-snapshot** (new): `listing-health:listings-raw` (optional
+  listing-issues enrichment → `issuesAvailable:false`) and `listing-optimizer:sqp-weekly`
+  (→ a valid `sqpAvailable:false` snapshot). A degraded source never blocks the cycle;
+  `sourceDisabledOutcome(policy).blocks === false`. Both carry the structured policy
+  `{disabledSource:"degraded", safeCode:"SOURCE_DISABLED", reportOutcome:"save-unavailable-snapshot"}`
+  — no HTTP status strings — and it survives onto the resolved job frozen.
+
+### 10.5 Strict row-cap behavior
+
+Every insight request except the Sales Movers probe is `strict:true`, backed by
+`fetchExportRowsStrict` which throws on `rows.length >= limit` rather than returning a
+truncated page. The strict-backing test proves the exact strict set and that each strict
+insight request is issued through that guard (or through `common.js` for the shared
+catalog/inventory helpers).
+
+### 10.6 Estimated export savings (per account, per cycle)
+
+Naïve per-report fetching would issue **6 catalog** + **3 inventory** exports across the
+six insight reports; dedup collapses these to **1 catalog + 1 inventory**. PPC issues
+**0** Ads exports (four Ads sources fully derived) and **1** small date-rollup instead.
+Net: **7 redundant catalog/inventory exports removed per account per cycle**, plus the
+entire Ads-export path eliminated for PPC — before counting the five-ID batching that
+already collapses multi-account scopes.
+
+### 10.7 Unresolved live assumptions (must gate Phase 1c)
+
+- The `listings-raw` / `sqp-weekly` degraded paths are asserted from builder logic; a live
+  per-org probe must confirm a disabled table returns the documented `isSourceDisabledError`
+  (not a silent empty page) before enabling those sources in the scheduler.
+- PPC has **no export fallback** for stale Ads history — confirm the scheduled Ads worker
+  keeps `ads_daily_source_rows` fresh per account before PPC is enabled.
+- Window derivations (probe lookback, 7-day slices, 84-day SQP) are transcribed from the
+  builders but not yet reconciled against a live DataDoe response in this workspace.

@@ -1,5 +1,42 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — six insight source contracts declared (2026-08-06)
+
+Declared + parity-tested the exact DataDoe source contracts for all six insight
+reports on `feature/scheduler-v2` (HEAD `056dcf0`). Not pushed/merged/deployed;
+`feature/design-system` untouched; Phase 1c NOT started; no migration. Two code
+commits + a docs commit. See SCHEDULER_V2.md §10 for the full table.
+
+- Commit `8750c20` — Sales Movers, Buy Box, Returns. Commit `056dcf0` — Listing
+  Health, PPC, Listing Optimizer. Constants transcribed from the executable builders
+  (`lib/server/reports/*.js`) and parity-tested by reading those builder constants,
+  not documentation.
+- **Shared (dedup):** one common `product-catalog` export shared by 5 reports
+  (Sales Movers, Buy Box, Returns, Listing Health, PPC); one `fba-inventory-health`
+  export shared by 3 (Sales Movers, Buy Box, Listing Health). Proven by identical
+  `request_hash`. Savings: 7 redundant catalog/inventory exports removed per account
+  per cycle.
+- **Deliberately NOT shared:** Sales Movers vs Returns traffic (same source, diff
+  columns/aggs/window); Listing Optimizer's richer 13-col catalog ≠ common catalog;
+  its 15-col SQP ≠ Keyword Rank SQP — proven by distinct hashes at an identical scope.
+- **Derived, zero DataDoe exports:** PPC ads (persisted `ads_daily_source_rows`, 4
+  Ads sources — PPC owns only `total-sales` + `catalog`); Priority Feed + Brand View
+  are `REPORT_DERIVED_ONLY`. A dependency-map test proves every sidebar report is
+  covered exactly one way.
+- **Disabled-source:** `listing-health:listings-raw` and `listing-optimizer:sqp-weekly`
+  are **degraded → save-unavailable-snapshot** (never block the cycle); everything
+  else is a default dataset. Terminal blockers unchanged (Keyword Rank, Content
+  Changes).
+- **Strict:** every insight request except the Sales Movers latest-date probe is
+  `strict:true`, backed by the shared `fetchExportRowsStrict` (`rows.length >= limit`).
+- `report-source-contracts.test.mjs` = **129 assertions**; full `npm run verify` green
+  (301 total); `request_hash` golden `5601253219be13c7…` unchanged; `git diff --check`
+  clean.
+- **Live gates before Phase 1c:** confirm disabled `listings-raw`/`sqp-weekly` return
+  `isSourceDisabledError` (not silent empty); confirm the Ads worker keeps
+  `ads_daily_source_rows` fresh (PPC has no export fallback); reconcile window
+  derivations against a live DataDoe response.
+
 ## Scheduler v2 Phase 1b operational contracts approved (Codex, 2026-08-06)
 
 Final review of commits `5afd393` and `ab5d31a` on
