@@ -362,6 +362,13 @@ detached from `REPORT_SOURCE_CONTRACTS`, so mutating a job cannot mutate the reg
 carry no HTTP-status string, and are NOT part of the DataDoe request — **`request_hash`
 is unchanged** by their presence (asserted).
 
+`normalizeAvailabilityPolicy` enforces the ONLY two consistent pairs — **terminal →
+blocked**, **degraded → save-unavailable-snapshot** — and rejects a crossed pair
+(`terminal + save-unavailable-snapshot` or `degraded + blocked`) that would give the
+worker contradictory instructions. `sourceDisabledOutcome()` consumes the same
+normaliser, so both enforce an identical invariant (a contradictory policy fails closed
+in both; `null`/no-policy is treated conservatively as terminal/blocked).
+
 **Typed, validated fallback signal.** `fallbackSignals[dependsOnRequestKey]` is now
 `{ status: "success"|"last-known-good"|"failed"|"terminal", validated: boolean,
 distinctPeriods: number|null }`. The prior code conflated a failed weekly (`null`) with

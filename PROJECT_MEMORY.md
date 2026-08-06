@@ -1,5 +1,25 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — availabilityPolicy pair consistency fixed (2026-08-06)
+
+Fixed the final policy-consistency finding (below) on `feature/scheduler-v2` (not
+pushed/merged/deployed; `feature/design-system` untouched; no insight contracts; Phase
+1c NOT started; no migration). Commit `5afd393` (code + tests) + a docs commit.
+
+- `normalizeAvailabilityPolicy()` validated `disabledSource` and `reportOutcome`
+  independently, accepting contradictory pairs. It now enforces the ONLY two valid
+  pairs — **terminal → blocked**, **degraded → save-unavailable-snapshot** — after the
+  existing enum / non-empty-safeCode / no-HTTP-424 checks; a crossed pair
+  (terminal + save-unavailable-snapshot, degraded + blocked) throws. `null` → null.
+- `sourceDisabledOutcome()` now consumes `normalizeAvailabilityPolicy()`, so both
+  enforce exactly the same invariant (contradictory policy fails closed in both; null is
+  treated conservatively as terminal/blocked).
+- No `request_hash`/identity change (policy is outside the DataDoe request; golden hash
+  `5601253219be13c7…` unchanged). No fallback-behaviour change.
+- `report-source-contracts.test.mjs` = **85 assertions** (adds valid-pair accept +
+  crossed-pair reject in both functions, and the null=>blocked case). Full `npm run
+  verify` green; `git diff --check` clean.
+
 ## Scheduler v2 Phase 1b re-review - final policy consistency fix required (Codex, 2026-08-06)
 
 Reviewed commits `724f502` and `0f55f4b` on `feature/scheduler-v2`. The
