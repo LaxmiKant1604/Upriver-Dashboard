@@ -55,6 +55,30 @@ function constNumber(name) {
   return Number(m[1]);
 }
 
+/* ---- insight builders: read the real column/aggregation constants out of the
+   executable builder files (lib/server/reports/*.js). Same parity discipline as
+   the operational reports, but the constants live in the builders, not datadoe.js. ---- */
+const REPORTS_DIR = join(ROOT, "lib", "server", "reports");
+const builderCache = new Map();
+function builderText(file) {
+  if (!builderCache.has(file)) builderCache.set(file, readFileSync(join(REPORTS_DIR, file), "utf8"));
+  return builderCache.get(file);
+}
+function arrFrom(text, name) {
+  const start = text.indexOf("const " + name + " = [");
+  if (start < 0) throw new Error("const " + name + " not found");
+  const open = text.indexOf("[", start);
+  const close = text.indexOf("];", open);
+  return [...text.slice(open + 1, close).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+}
+function aggsFrom(text, name) {
+  const start = text.indexOf("const " + name + " = [");
+  if (start < 0) throw new Error("const " + name + " (aggregations) not found");
+  const close = text.indexOf("];", start);
+  return [...text.slice(start, close).matchAll(/\{\s*column:\s*"([^"]+)",\s*aggregation:\s*"([^"]+)",\s*alias:\s*"([^"]+)"\s*\}/g)]
+    .map((m) => ({ column: m[1], aggregation: m[2], alias: m[3] }));
+}
+
 // Independent "transport oracle": chunk with the same leaf the live transport uses
 // and compute the per-chunk identity with the same shared function. This is exactly
 // what fetchExportRows -> fetchSourceChunk -> sourceRequestIdentity does.
@@ -703,7 +727,8 @@ test("fetchDailyBrandSalesRows enforces the row cap in executable code (rejects 
 
 test("every strict:true contract is backed by an executable rows.length >= LIMIT guard", () => {
   // machine-readable strict flag must never claim a safeguard the builder lacks.
-  const STRICT = {
+  // Operational reports guard with a named per-report LIMIT constant in api/datadoe.js.
+  const OPERATIONAL_STRICT = {
     "daily-reporting:asin-day-superset": "DAILY_BRAND_ROW_LIMIT",
     "sku-pl:monthly-profit": "SKU_PL_ROW_LIMIT",
     "keyword-rank:sqp-weekly": "SQP_ROW_LIMIT",
@@ -711,14 +736,42 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "reconciliation:order-lines": "RECONCILIATION_ROW_LIMIT",
     "reconciliation:settlements": "RECONCILIATION_ROW_LIMIT",
   };
+  // Insight reports fetch through the shared fetchExportRowsStrict transport, whose
+  // generic guard rejects rows.length >= limit. Each strict insight request maps to
+  // the builder file that issues the strict fetch (common.js for the shared
+  // catalog/inventory helpers). The Sales Movers latest-date probe is deliberately
+  // NOT strict (a date rollup never nears its 500 cap), so it is absent here.
+  const INSIGHT_STRICT = {
+    "sales-movers:traffic": "sales-movers.js",
+    "sales-movers:ads": "sales-movers.js",
+    "sales-movers:inventory": "common.js",
+    "sales-movers:catalog": "common.js",
+    "buy-box-loss:daily": "buy-box.js",
+    "buy-box-loss:inventory": "common.js",
+    "buy-box-loss:catalog": "common.js",
+    "returns-leakage:returns": "returns.js",
+    "returns-leakage:settlements": "returns.js",
+    "returns-leakage:traffic": "returns.js",
+    "returns-leakage:catalog": "common.js",
+  };
   const declaredStrict = [];
   for (const key of declaredReportKeys()) {
     for (const c of REPORT_SOURCE_CONTRACTS[key]) if (c.strict) declaredStrict.push(c.requestKey);
   }
   // exactly the intended set is marked strict — no unbacked strict labels.
-  assert.deepEqual(declaredStrict.sort(), Object.keys(STRICT).sort());
-  for (const [, constName] of Object.entries(STRICT)) {
+  assert.deepEqual(declaredStrict.sort(), [...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)].sort());
+  for (const [, constName] of Object.entries(OPERATIONAL_STRICT)) {
     assert.ok(new RegExp("rows\\.length >= " + constName).test(DD), "missing executable guard for " + constName);
+  }
+  // The shared strict transport really enforces the cap, and every strict insight
+  // request is issued through it.
+  const transport = readFileSync(join(ROOT, "lib", "server", "datadoe.js"), "utf8");
+  const gi = transport.indexOf("function fetchExportRowsStrict");
+  assert.ok(gi > 0 && /rows\.length >= limit/.test(transport.slice(gi, gi + 500)),
+    "fetchExportRowsStrict must guard rows.length >= limit");
+  for (const [rk, file] of Object.entries(INSIGHT_STRICT)) {
+    assert.ok(/fetchExportRowsStrict\s*\(/.test(builderText(file)),
+      rk + " must fetch through fetchExportRowsStrict (" + file + ")");
   }
 });
 
@@ -790,6 +843,146 @@ test("execution metadata does NOT change request_hash (identity ignores strict/p
     ids: job.sellerOrVendorIds, from: job.from, to: job.to, limit: job.limit, options: job.options,
   }).requestHash;
   assert.equal(job.requestHash, expected);
+});
+
+/* =================== Insight reports: Sales Movers / Buy Box / Returns =================== */
+
+// requestKey -> expected executable source (builder file + constant names + fetch params).
+// Constants are read out of the builders so a drift in either place fails the test.
+const INSIGHT_SPEC = [
+  { rk: "sales-movers:traffic", file: "sales-movers.js", cols: "TRAFFIC_COLUMNS", group: "TRAFFIC_COLUMNS", aggs: "TRAFFIC_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "sales-movers:ads", file: "sales-movers.js", cols: "ADS_COLUMNS", group: "ADS_COLUMNS", aggs: "ADS_AGGREGATIONS", src: "profit-by-sku-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "sales-movers:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
+  { rk: "sales-movers:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "buy-box-loss:daily", file: "buy-box.js", cols: "DAILY_COLUMNS", group: null, aggs: null, src: "profit-by-sku-date", limit: 50000, oc: "date", od: "ASC", strict: true },
+  { rk: "buy-box-loss:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
+  { rk: "buy-box-loss:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "returns-leakage:returns", file: "returns.js", cols: "RETURN_COLUMNS", group: null, aggs: null, src: "returns", limit: 50000, oc: "date", od: "DESC", strict: true },
+  { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
+  { rk: "returns-leakage:traffic", file: "returns.js", cols: "TRAFFIC_GROUP_BY", group: "TRAFFIC_GROUP_BY", aggs: "TRAFFIC_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "returns-leakage:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+];
+
+test("insight contracts (Sales Movers / Buy Box / Returns) match their executable builder constants", () => {
+  for (const s of INSIGHT_SPEC) {
+    const c = byKey(REPORT_SOURCE_CONTRACTS[s.rk.split(":")[0]], s.rk);
+    assert.ok(c, s.rk + " must be declared");
+    const txt = builderText(s.file);
+    assert.deepEqual(c.columns, arrFrom(txt, s.cols), s.rk + " columns");                       // (1) exact columns
+    assert.deepEqual(c.groupBy, s.group ? arrFrom(txt, s.group) : null, s.rk + " groupBy");        // (2) exact groupBy
+    assert.deepEqual(c.aggregations, s.aggs ? aggsFrom(txt, s.aggs) : null, s.rk + " aggregations");// (2) exact aggregations
+    assert.equal(c.sourceKey, s.src, s.rk + " sourceKey");                                          // (3) exact source key
+    assert.ok(sourceContractForKey(s.src), s.src + " must be a known source contract");            // (3) resolves to a real source
+    assert.equal(c.limit, s.limit, s.rk + " limit");                                               // (4) exact limit
+    assert.equal(c.orderByColumn, s.oc, s.rk + " orderByColumn");                                   // (4) exact ordering
+    assert.equal(c.orderByDirection, s.od, s.rk + " orderByDirection");
+    assert.equal(Boolean(c.strict), Boolean(s.strict), s.rk + " strict flag");                      // (6) strict flag
+    assert.equal(c.availabilityPolicy, undefined, s.rk + " has no availabilityPolicy (default dataset)"); // (7/8)
+  }
+});
+
+test("sales-movers latest-date probe is a NON-strict date rollup (limit 500) matching fetchSalesTrafficLatestDate", () => {
+  const c = byKey(REPORT_SOURCE_CONTRACTS["sales-movers"], "sales-movers:sales-latest-probe");
+  assert.deepEqual(c.columns, ["date"]);
+  assert.deepEqual(c.groupBy, ["date"]);
+  assert.deepEqual(c.aggregations, [{ column: "total_units", aggregation: "sum", alias: "units_sum" }]);
+  assert.equal(c.limit, 500);
+  assert.equal(c.sourceKey, "sales-traffic-asin-date");
+  assert.notEqual(c.strict, true); // the one insight request that is intentionally not strict
+  const common = builderText("common.js");
+  const probe = common.slice(common.indexOf("function fetchSalesTrafficLatestDate"));
+  assert.ok(/fetchExportRows\(/.test(probe) && !/fetchExportRowsStrict\(/.test(probe.slice(0, probe.indexOf("}"))), "probe uses non-strict fetchExportRows");
+  assert.ok(/ROW_LIMITS\.dateRollup/.test(probe));
+});
+
+// Concrete per-requestKey windows (no Cartesian products): traffic/ads carry TWO
+// weekly windows; buy-box daily carries FOUR 7-day slices; catalog is no-date.
+const smWin = {
+  "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
+  "sales-movers:traffic": [{ from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-17", to: "2025-07-23" }],
+  "sales-movers:ads": [{ from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-17", to: "2025-07-23" }],
+  "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+  "sales-movers:catalog": [{ from: null, to: null }],
+};
+const bbWin = {
+  "buy-box-loss:daily": [
+    { from: "2025-07-10", to: "2025-07-16" }, { from: "2025-07-17", to: "2025-07-23" },
+    { from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-31", to: "2025-08-06" },
+  ],
+  "buy-box-loss:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+  "buy-box-loss:catalog": [{ from: null, to: null }],
+};
+const retWin = {
+  "returns-leakage:returns": [{ from: "2025-06-08", to: "2025-08-06" }],
+  "returns-leakage:settlements": [{ from: "2025-06-08", to: "2025-08-06" }],
+  "returns-leakage:traffic": [{ from: "2025-06-08", to: "2025-08-06" }],
+  "returns-leakage:catalog": [{ from: null, to: null }],
+};
+
+for (const [rep, win] of [["sales-movers", smWin], ["buy-box-loss", bbWin], ["returns-leakage", retWin]]) {
+  for (const n of [0, 1, 5, 6, 11]) {
+    test(`${rep} resolver reproduces the transport chunks + hashes for ${n} IDs`, () => {
+      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win });
+      if (n === 0) { assert.deepEqual(got, []); return; } // (17) empty scope returns []
+      const exp = transportExpected(rep, "k", ids(n), win);
+      assert.equal(got.length, exp.length, "same request count");
+      const key = (r) => [r.requestKey, r.from, r.to, r.sellerOrVendorIds.join(",")].join("|");
+      const gm = new Map(got.map((r) => [key(r), r.requestHash]));
+      for (const e of exp) assert.equal(gm.get(key(e)), e.requestHash, e.requestKey + " hash mismatch"); // (10)
+    });
+  }
+}
+
+test("sales-movers traffic + ads each resolve to exactly their 2 windows; probe/inventory/catalog do not inherit them", () => {
+  const got = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin });
+  assert.equal(got.filter((r) => r.requestKey === "sales-movers:traffic").length, 2);
+  assert.equal(got.filter((r) => r.requestKey === "sales-movers:ads").length, 2);
+  const traffic = got.filter((r) => r.requestKey === "sales-movers:traffic");
+  assert.notEqual(traffic[0].requestHash, traffic[1].requestHash); // recent != prior
+  const cat = got.find((r) => r.requestKey === "sales-movers:catalog");
+  assert.equal(cat.from, null); assert.equal(cat.to, null); // (5) no-date request keeps null dates
+  assert.equal(got.filter((r) => r.requestKey === "sales-movers:catalog").length, 1);
+});
+
+test("buy-box-loss daily resolves to one request per 7-day slice (4 slices; additive, not multiplied)", () => {
+  const got = reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin });
+  const daily = got.filter((r) => r.requestKey === "buy-box-loss:daily");
+  assert.equal(daily.length, 4);
+  assert.equal(new Set(daily.map((r) => r.requestHash)).size, 4); // four distinct slice identities
+  assert.equal(got.filter((r) => r.requestKey === "buy-box-loss:inventory").length, 1);
+});
+
+test("(12) the common insight catalog is ONE request identity shared across Sales Movers / Buy Box / Returns", () => {
+  const cat = (rep, win) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win })
+    .find((r) => r.requestKey.endsWith(":catalog")).requestHash;
+  const h1 = cat("sales-movers", smWin), h2 = cat("buy-box-loss", bbWin), h3 = cat("returns-leakage", retWin);
+  assert.equal(h1, h2); assert.equal(h2, h3); // identical columns/limit/window/order => fetched once
+});
+
+test("(12) the FBA inventory snapshot is ONE request identity shared by Sales Movers + Buy Box", () => {
+  const inv = (rep, win) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win })
+    .find((r) => r.requestKey.endsWith(":inventory")).requestHash;
+  assert.equal(inv("sales-movers", smWin), inv("buy-box-loss", bbWin));
+});
+
+test("same source, different identity: Sales Movers traffic vs Returns traffic do NOT deduplicate", () => {
+  const sm = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin }).find((r) => r.requestKey === "sales-movers:traffic");
+  const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:traffic");
+  assert.equal(sm.sourceId, ret.sourceId); // same DataDoe source id...
+  assert.notEqual(sm.requestHash, ret.requestHash); // ...but different columns/aggregations/window => distinct request
+});
+
+test("(11) sales-movers primary vs dd-secondary organizations remain isolated (different hashes)", () => {
+  const primary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "PRIMARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin });
+  const secondary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "DD_SECONDARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin });
+  assert.equal(primary.length, secondary.length);
+  for (let i = 0; i < primary.length; i++) assert.notEqual(primary[i].requestHash, secondary[i].requestHash);
+});
+
+test("(16/17) insight resolver fails closed: empty scope => [], missing declared window => throws", () => {
+  assert.deepEqual(reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: [], windowsByRequestKey: {} }), []);
+  const partial = { ...smWin }; delete partial["sales-movers:traffic"];
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: partial }));
 });
 
 console.log("\n" + passed + " assertions passed");

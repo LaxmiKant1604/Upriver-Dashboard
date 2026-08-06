@@ -106,6 +106,62 @@ const PLAN_DAILY_AGGREGATIONS = [{ column: "total_units", aggregation: "sum", al
 const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
 const LISTINGS_AWD_COLUMNS = ["child_asin", "sku", "fnsku", "awd_available_distributable_quantity"];
 
+/* ---- insight-report constants (transcribed verbatim from lib/server/reports/*.js;
+   parity-tested against the builder files). All insight DataDoe fetches use
+   fetchExportRowsStrict (rejects rows.length >= limit) EXCEPT the Sales Movers
+   latest-date probe. ROW_LIMITS (sources.js): aggregated/rawGrain 50000, catalog/
+   listings 20000, inventory 15000, dateRollup 500. ---- */
+
+// common.js — identical across the reports that call fetchCatalog / fetchInventorySnapshot,
+// so those requests dedupe to one export per account (see REPORT_DERIVATION dedup groups).
+const INSIGHT_CATALOG_COLUMNS = ["child_asin", "parent_asin", "product_name", "product_brand"];
+const INSIGHT_INVENTORY_COLUMNS = ["date", "sku", "child_asin", "product_name", "currency", "available", "unfulfillable_quantity", "inbound_shipped", "inbound_received", "days_of_supply", "units_shipped_t30", "your_price", "sales_price", "featuredoffer_price", "lowest_price_new_plus_shipping", "alert"];
+
+// sales-movers.js
+const SM_LATEST_COLUMNS = ["date"];
+const SM_LATEST_AGGREGATIONS = [{ column: "total_units", aggregation: "sum", alias: "units_sum" }];
+const SM_TRAFFIC_COLUMNS = ["child_asin", "product_name"];
+const SM_TRAFFIC_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
+  { column: "total_units", aggregation: "sum", alias: "units_sum" },
+  { column: "total_orders", aggregation: "sum", alias: "orders_sum" },
+  { column: "session", aggregation: "sum", alias: "sessions_sum" },
+  { column: "page_views", aggregation: "sum", alias: "page_views_sum" },
+  { column: "units_shipped", aggregation: "sum", alias: "units_shipped_sum" },
+  { column: "units_refunded", aggregation: "sum", alias: "units_refunded_sum" },
+];
+const SM_ADS_COLUMNS = ["child_asin", "currency"];
+const SM_ADS_AGGREGATIONS = [
+  { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
+  { column: "ad_sales", aggregation: "sum", alias: "ad_sales_sum" },
+  { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
+];
+
+// buy-box.js
+const BB_DAILY_COLUMNS = ["date", "sku", "child_asin", "product_name", "product_brand", "currency", "buybox_percentage", "total_sales", "total_units_sold", "page_views"];
+
+// returns.js
+const RET_RETURN_COLUMNS = ["date", "sku", "child_asin", "amazon_order_id", "amazon_return_reason", "amazon_fulfillment_channel", "amazon_return_request_status", "amazon_return_refunded_amount", "amazon_return_label_cost", "amazon_return_label_to_be_paid_by"];
+const RET_SETTLEMENT_COLUMNS = ["sku", "child_asin", "settlement_type", "currency"];
+const RET_SETTLEMENT_AGGREGATIONS = [
+  { column: "quantity", aggregation: "sum", alias: "quantity_sum" },
+  { column: "item_price", aggregation: "sum", alias: "item_price_sum" },
+  { column: "refunded_amount", aggregation: "sum", alias: "refunded_amount_sum" },
+  { column: "refund_tax", aggregation: "sum", alias: "refund_tax_sum" },
+  { column: "refunded_referral_fee", aggregation: "sum", alias: "refunded_referral_fee_sum" },
+  { column: "refund_commission", aggregation: "sum", alias: "refund_commission_sum" },
+  { column: "refund_restocking_fee", aggregation: "sum", alias: "refund_restocking_fee_sum" },
+  { column: "fba_customer_return_per_unit_fee", aggregation: "sum", alias: "return_unit_fee_sum" },
+  { column: "cogs_total_value", aggregation: "sum", alias: "cogs_sum" },
+];
+const RET_TRAFFIC_COLUMNS = ["child_asin", "product_name"];
+const RET_TRAFFIC_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
+  { column: "total_units", aggregation: "sum", alias: "units_sum" },
+  { column: "units_shipped", aggregation: "sum", alias: "units_shipped_sum" },
+  { column: "units_refunded", aggregation: "sum", alias: "units_refunded_sum" },
+];
+
 export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "brand-sales": [
     {
@@ -365,6 +421,168 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "range:asOf-365d..asOf",
     },
   ],
+
+  // ===== Insight reports (Phase 1b). Ads for PPC are DERIVED from persisted
+  // ads_daily_source_rows (see REPORT_DERIVED_SOURCE_KEYS); no report creates a
+  // per-brand export. Five reports share one Product Catalog export and three share
+  // one FBA Inventory export per account (identical request identity). =====
+  "sales-movers": [
+    {
+      requestKey: "sales-movers:sales-latest-probe",
+      sourceKey: "sales-traffic-asin-date",
+      columns: SM_LATEST_COLUMNS,
+      limit: 500, // ROW_LIMITS.dateRollup
+      groupBy: SM_LATEST_COLUMNS,
+      aggregations: SM_LATEST_AGGREGATIONS,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      // fetchSalesTrafficLatestDate uses fetchExportRows (NOT strict): a date rollup
+      // never approaches 500 rows, and it only needs the max reported date.
+      windowKind: "range:asOf-(lagDays+21)d..asOf (latest-completed-date probe)",
+    },
+    {
+      requestKey: "sales-movers:traffic",
+      sourceKey: "sales-traffic-asin-date",
+      columns: SM_TRAFFIC_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: SM_TRAFFIC_COLUMNS,
+      aggregations: SM_TRAFFIC_AGGREGATIONS,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "per-7day: recent week + prior week (2 windows ending at latest reported date)",
+      strict: true,
+    },
+    {
+      requestKey: "sales-movers:ads",
+      sourceKey: "profit-by-sku-date",
+      columns: SM_ADS_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: SM_ADS_COLUMNS,
+      aggregations: SM_ADS_AGGREGATIONS,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "per-7day: recent week + prior week (same 2 windows as traffic)",
+      strict: true,
+    },
+    {
+      requestKey: "sales-movers:inventory",
+      sourceKey: "fba-inventory-health",
+      columns: INSIGHT_INVENTORY_COLUMNS,
+      limit: 15000, // ROW_LIMITS.inventory
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "DESC",
+      windowKind: "range:asOf-10d..asOf (latest snapshot; shared FBA inventory export)",
+      strict: true,
+    },
+    {
+      requestKey: "sales-movers:catalog",
+      sourceKey: "product-catalog",
+      columns: INSIGHT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; shared common insight catalog)",
+      strict: true,
+    },
+  ],
+  "buy-box-loss": [
+    {
+      requestKey: "buy-box-loss:daily",
+      sourceKey: "profit-by-sku-date",
+      columns: BB_DAILY_COLUMNS,
+      limit: 50000, // ROW_LIMITS.rawGrain
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      // Raw daily rows (buybox_percentage is a ratio; a page-view-weighted share is
+      // computed downstream), fetched in 7-day slices; any slice at the cap aborts.
+      windowKind: "per-7day-slice:asOf-27d..asOf (4 slices)",
+      strict: true,
+    },
+    {
+      requestKey: "buy-box-loss:inventory",
+      sourceKey: "fba-inventory-health",
+      columns: INSIGHT_INVENTORY_COLUMNS,
+      limit: 15000, // ROW_LIMITS.inventory
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "DESC",
+      windowKind: "range:asOf-10d..asOf (shared FBA inventory export)",
+      strict: true,
+    },
+    {
+      requestKey: "buy-box-loss:catalog",
+      sourceKey: "product-catalog",
+      columns: INSIGHT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; shared common insight catalog)",
+      strict: true,
+    },
+  ],
+  "returns-leakage": [
+    {
+      requestKey: "returns-leakage:returns",
+      sourceKey: "returns",
+      columns: RET_RETURN_COLUMNS,
+      limit: 50000, // ROW_LIMITS.rawGrain
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "DESC",
+      // Raw grain: the Returns source has no quantity column, so one row IS one
+      // returned item and counting rows is the only correct count.
+      windowKind: "range:asOf-59d..asOf (RETURNS.historyDays)",
+      strict: true,
+    },
+    {
+      requestKey: "returns-leakage:settlements",
+      sourceKey: "settlements",
+      columns: RET_SETTLEMENT_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: RET_SETTLEMENT_COLUMNS,
+      aggregations: RET_SETTLEMENT_AGGREGATIONS,
+      orderByColumn: "sku",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-59d..asOf",
+      strict: true,
+    },
+    {
+      requestKey: "returns-leakage:traffic",
+      sourceKey: "sales-traffic-asin-date",
+      columns: RET_TRAFFIC_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: RET_TRAFFIC_COLUMNS,
+      aggregations: RET_TRAFFIC_AGGREGATIONS,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      // Same source as Sales Movers traffic but a different column/aggregation set
+      // and window => a distinct request identity; deliberately NOT shared.
+      windowKind: "range:asOf-59d..asOf",
+      strict: true,
+    },
+    {
+      requestKey: "returns-leakage:catalog",
+      sourceKey: "product-catalog",
+      columns: INSIGHT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; shared common insight catalog)",
+      strict: true,
+    },
+  ],
 });
 
 // Sources represented by already-scheduled/persisted data rather than a report-
@@ -404,6 +622,9 @@ export const REPORT_SOURCE_COVERAGE = Object.freeze({
   "fba-plan": "complete",
   "keyword-rank": "complete",
   "content-changes": "complete",
+  "sales-movers": "complete", // traffic+ads (2 windows each), inventory, catalog, latest-date probe
+  "buy-box-loss": "complete", // raw daily (4x7-day slices), inventory, catalog
+  "returns-leakage": "complete", // returns raw, settlements, traffic, catalog
 });
 
 export function declaredReportKeys() {
