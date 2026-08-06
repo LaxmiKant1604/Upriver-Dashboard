@@ -276,13 +276,13 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       marketplaceCountries: ["US"],
     },
   ],
-  // Keyword Rank (single account). SQP weekly + monthly + a 365-day catalog. The
-  // scheduler fetches BOTH SQP cadences unconditionally for a deterministic,
-  // cadence-agnostic derivation; the browser fetches monthly only as a data-fallback
-  // when weekly has < 4 distinct periods, so the scheduler accepts one extra monthly
-  // export per account/cycle (documented token cost). SQP is a non-default DataDoe
-  // table: a source disabled for an organization returns HTTP 424 and is a terminal
-  // source status, never substituted. Raw rows (no groupBy/agg); strict truncation.
+  // Keyword Rank (single account). SQP weekly (primary) + SQP monthly (data-dependent
+  // FALLBACK, attempted only when weekly has < 4 distinct periods) + a 365-day catalog.
+  // Matching the executable handler saves one monthly export per account/cycle whenever
+  // weekly history is sufficient. SQP is a non-default DataDoe table; when a source is
+  // disabled for an organisation the worker sees DataDoe's raw disabled-source error
+  // (NOT the report API's HTTP 424) — see each contract's structured availabilityPolicy.
+  // Raw rows (no groupBy/agg); strict truncation.
   "keyword-rank": [
     {
       requestKey: "keyword-rank:sqp-weekly",
@@ -295,7 +295,10 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByColumn: "date",
       orderByDirection: "ASC",
       windowKind: "range:asOf-84d..asOf",
-      orgAvailability: "HTTP 424 when SQP weekly is disabled for the organization => terminal source status",
+      // Weekly is the primary/required source. Disabled for the org => the report is
+      // blocked (matches the executable handler, which cannot produce Keyword Rank
+      // without SQP). Machine-readable so Phase 1c never parses an HTTP status string.
+      availabilityPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" },
     },
     {
       requestKey: "keyword-rank:sqp-monthly",
@@ -308,7 +311,16 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByColumn: "date",
       orderByDirection: "ASC",
       windowKind: "range:asOf-365d..asOf",
-      orgAvailability: "HTTP 424 when SQP monthly is disabled for the organization => terminal source status",
+      // Data-dependent fallback: attempted ONLY when the weekly SQP payload (freshly
+      // fetched OR last-known-good) has fewer than 4 distinct periods. Structured so
+      // Phase 1c can enforce it deterministically — it is NOT planned at kickoff when
+      // weekly history is sufficient, so repeated workers create no monthly job then;
+      // when required it is one source job obeying the one-create-export-per-cycle DB
+      // guard. Disabled while required => the fallback cannot be provided => blocked.
+      dependencyMode: "fallback",
+      dependsOnRequestKey: "keyword-rank:sqp-weekly",
+      condition: { type: "distinct_periods_lt", value: 4 },
+      availabilityPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" },
     },
     {
       requestKey: "keyword-rank:catalog",
@@ -323,8 +335,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
   ],
   // Content Change Alerts (single account). A NO-DATE notification export (from/to
-  // null, event_time DESC) + a 365-day catalog. The notification source may be
-  // disabled per organization (HTTP 424) => terminal source status.
+  // null, event_time DESC) + a 365-day catalog. The notification source may be disabled
+  // for an organisation; the worker sees DataDoe's raw disabled-source error (not HTTP
+  // 424) and applies the events contract's structured availabilityPolicy (terminal).
   "content-changes": [
     {
       requestKey: "content-changes:events",
@@ -336,7 +349,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByColumn: "event_time",
       orderByDirection: "DESC",
       windowKind: "none (no-date source; from/to null)",
-      orgAvailability: "HTTP 424 when branded-item notifications are disabled for the organization => terminal source status",
+      // The notification stream is the report's only substantive source; disabled for
+      // the org => the report is blocked. Structured, not an HTTP status string.
+      availabilityPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" },
     },
     {
       requestKey: "content-changes:catalog",
@@ -413,6 +428,36 @@ export function rejectsAtCap(rowCount, limit) {
   return Number(rowCount) >= Number(limit);
 }
 
+// Evaluate a typed data-dependent fallback condition against the signal from its
+// `dependsOnRequestKey` source (fetched this cycle OR last-known-good). Typed, not a
+// parsed description. Returns true when the fallback source SHOULD be attempted.
+export function evaluateFallbackCondition(condition, signal) {
+  if (!condition || typeof condition !== "object") return false;
+  switch (condition.type) {
+    case "distinct_periods_lt":
+      // Attempt the fallback only when the primary produced fewer than N periods.
+      // A missing/failed primary signal (null) counts as 0 distinct periods, so the
+      // fallback is attempted (weekly failing is exactly when monthly is needed).
+      return Number(signal && signal.distinctPeriods != null ? signal.distinctPeriods : 0) < Number(condition.value);
+    default:
+      return false;
+  }
+}
+
+// Map a source's structured availabilityPolicy to the outcome when DataDoe reports
+// that source as disabled for the organisation. Phase 1c branches on THIS, never on
+// the report API's HTTP 424 string. `blocks` = the dependent report cannot be
+// produced (terminal); a degraded source does not block — the report saves a valid
+// snapshot with the source marked unavailable.
+export function sourceDisabledOutcome(policy) {
+  const degraded = policy && policy.disabledSource === "degraded";
+  return {
+    blocks: !degraded,
+    safeCode: (policy && policy.safeCode) || "SOURCE_DISABLED",
+    reportOutcome: (policy && policy.reportOutcome) || (degraded ? "save-unavailable-snapshot" : "blocked"),
+  };
+}
+
 /**
  * Resolve the concrete canonical source requests for a declared report.
  *
@@ -435,7 +480,7 @@ export function rejectsAtCap(rowCount, limit) {
  *
  * Returns null for an undeclared report (callers must not assume a contract).
  */
-export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByRequestKey, marketplaceCountry }) {
+export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByRequestKey, marketplaceCountry, fallbackSignals }) {
   const contracts = REPORT_SOURCE_CONTRACTS[reportKey];
   if (!contracts) return null;
 
@@ -457,8 +502,25 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
       throw new Error(`Marketplace country is required to resolve conditional request key "${c.requestKey}".`);
     }
   }
-  const applies = (c) => !Array.isArray(c.marketplaceCountries)
-    || c.marketplaceCountries.map((value) => String(value).toUpperCase()).includes(country);
+  const signals = fallbackSignals || {};
+  const applies = (c) => {
+    // Country-conditional gate: authoritative account metadata, never window presence.
+    if (Array.isArray(c.marketplaceCountries) && c.marketplaceCountries.length
+      && !c.marketplaceCountries.map((value) => String(value).toUpperCase()).includes(country)) {
+      return false;
+    }
+    // Data-dependent fallback gate: a fallback source is active ONLY once its primary
+    // has been evaluated (a signal for dependsOnRequestKey is PRESENT) AND its typed
+    // condition holds. At kickoff the signal is absent, so the fallback is neither
+    // required nor planned — repeated workers create no monthly job while weekly
+    // history is sufficient. A present-but-empty signal (weekly failed / empty
+    // last-known-good) counts as 0 periods, so the fallback is still attempted.
+    if (c.dependencyMode === "fallback") {
+      if (!(c.dependsOnRequestKey in signals)) return false;
+      return evaluateFallbackCondition(c.condition, signals[c.dependsOnRequestKey]);
+    }
+    return true;
+  };
   const activeContracts = contracts.filter(applies);
   const activeKeys = new Set(activeContracts.map((c) => c.requestKey));
 

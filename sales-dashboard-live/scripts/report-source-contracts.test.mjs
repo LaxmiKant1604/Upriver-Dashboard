@@ -18,6 +18,8 @@ import {
   declaredRequestKeys,
   reportSourceCoverage,
   rejectsAtCap,
+  evaluateFallbackCondition,
+  sourceDisabledOutcome,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -466,11 +468,15 @@ test("validation still applies to the new reports (missing required key throws)"
 
 const keyword = REPORT_SOURCE_CONTRACTS["keyword-rank"];
 const content = REPORT_SOURCE_CONTRACTS["content-changes"];
-const kwWin = {
+// Kickoff windows: weekly primary + catalog only (monthly fallback not planned).
+const kwKickoff = {
   "keyword-rank:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }],
-  "keyword-rank:sqp-monthly": [{ from: "2024-08-06", to: "2025-08-06" }],
   "keyword-rank:catalog": [{ from: "2024-08-06", to: "2025-08-06" }],
 };
+// Fallback windows: all three keys (weekly + monthly + catalog).
+const kwFallbackWin = { ...kwKickoff, "keyword-rank:sqp-monthly": [{ from: "2024-08-06", to: "2025-08-06" }] };
+const SIG_LOW = { "keyword-rank:sqp-weekly": { distinctPeriods: 2 } };  // < 4 => monthly active
+const SIG_HIGH = { "keyword-rank:sqp-weekly": { distinctPeriods: 4 } }; // >= 4 => monthly inactive
 const ccWin = {
   "content-changes:events": [{ from: null, to: null }],
   "content-changes:catalog": [{ from: "2024-08-06", to: "2025-08-06" }],
@@ -484,7 +490,6 @@ test("keyword-rank weekly + monthly SQP contracts match SQP_COLUMNS + SQP_ROW_LI
     assert.equal(c.groupBy, null);
     assert.equal(c.aggregations, null);
     assert.equal(c.orderByColumn, "date");
-    assert.ok(/HTTP 424/.test(c.orgAvailability), rk + " must document the org-availability terminal status");
   }
   assert.equal(byKey(keyword, "keyword-rank:sqp-weekly").sourceKey, "sqp-weekly");
   assert.equal(byKey(keyword, "keyword-rank:sqp-monthly").sourceKey, "sqp-monthly");
@@ -504,18 +509,9 @@ test("content-changes events is a NO-DATE source; catalog is a 365-day range", (
   assert.equal(ev.orderByColumn, "event_time");
   assert.equal(ev.orderByDirection, "DESC");
   assert.ok(/no-date/i.test(ev.windowKind));
-  assert.ok(/HTTP 424/.test(ev.orgAvailability));
   const cat = byKey(content, "content-changes:catalog");
   assert.deepEqual(cat.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
   assert.equal(cat.limit, constNumber("CATALOG_ROW_LIMIT"));
-});
-test("keyword-rank resolves weekly+monthly+catalog; the two SQP cadences are distinct sources/hashes", () => {
-  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwWin });
-  assert.equal(got.length, 3);
-  const wk = got.find((r) => r.requestKey === "keyword-rank:sqp-weekly");
-  const mo = got.find((r) => r.requestKey === "keyword-rank:sqp-monthly");
-  assert.notEqual(wk.sourceId, mo.sourceId);
-  assert.notEqual(wk.requestHash, mo.requestHash);
 });
 test("content-changes no-date events request carries null from/to and never inherits the catalog dates", () => {
   const got = reportSourceRequestHashes({ reportKey: "content-changes", apiKey: "k", ids: ["A1"], windowsByRequestKey: ccWin });
@@ -527,15 +523,77 @@ test("content-changes no-date events request carries null from/to and never inhe
   assert.equal(ev.requestMeta.to, null);
   assert.equal(cat.from, "2024-08-06");
 });
-test("keyword-rank primary vs dd-secondary org isolation", () => {
-  const p = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary-key", ids: ["A1"], windowsByRequestKey: kwWin });
-  const s = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "secondary-key", ids: ["A1"], windowsByRequestKey: kwWin });
-  for (let i = 0; i < p.length; i += 1) assert.notEqual(p[i].requestHash, s[i].requestHash);
+
+/* ===================== FIX 2: keyword monthly data-dependent fallback ===================== */
+
+test("sqp-monthly contract carries typed fallback metadata (not a parsed string)", () => {
+  const mo = byKey(keyword, "keyword-rank:sqp-monthly");
+  assert.equal(mo.dependencyMode, "fallback");
+  assert.equal(mo.dependsOnRequestKey, "keyword-rank:sqp-weekly");
+  assert.deepEqual(mo.condition, { type: "distinct_periods_lt", value: 4 });
+});
+test("evaluateFallbackCondition: <4 (or missing/failed weekly) attempts monthly; >=4 does not", () => {
+  const cond = { type: "distinct_periods_lt", value: 4 };
+  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 3 }), true);
+  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 0 }), true);
+  assert.equal(evaluateFallbackCondition(cond, null), true);   // weekly failed / last-known-good empty
+  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 4 }), false);
+  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 9 }), false);
+});
+test("kickoff (no signals) plans weekly + catalog only — NO monthly source job", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff });
+  assert.deepEqual(got.map((r) => r.requestKey).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-weekly"]);
+  assert.ok(!got.some((r) => r.requestKey === "keyword-rank:sqp-monthly"));
+});
+test("weekly with 4+ periods creates no monthly source job (and rejects a stray monthly window)", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff, fallbackSignals: SIG_HIGH });
+  assert.ok(!got.some((r) => r.requestKey === "keyword-rank:sqp-monthly"));
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_HIGH }),
+    /does not apply/,
+  );
+});
+test("weekly with 0-3 periods creates EXACTLY ONE monthly source job", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+  const monthly = got.filter((r) => r.requestKey === "keyword-rank:sqp-monthly");
+  assert.equal(monthly.length, 1);
+  assert.equal(got.length, 3); // weekly + monthly + catalog, single chunk
+});
+test("repeated planning does not duplicate the monthly job (deterministic)", () => {
+  const a = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+  const b = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+  assert.deepEqual(a.map((r) => r.requestHash), b.map((r) => r.requestHash));
+  assert.equal(a.filter((r) => r.requestKey === "keyword-rank:sqp-monthly").length, 1);
+  // The one-create-export-per-cycle guard is unique(cycle_id, request_hash) +
+  // claim_source_export_attempt (proven in scheduler-v2.test.mjs): identical monthly
+  // request_hash across repeated worker calls collapses to one DataDoe export.
+});
+test("last-known-good survives weekly failure: an empty/failed weekly signal still activates monthly", () => {
+  // Weekly failed this cycle and last-known-good weekly is empty => signal PRESENT but
+  // null (0 periods) => monthly fallback is attempted; the failure does not erase the
+  // report (Phase 1c keeps the prior snapshot; the planner just adds the monthly job).
+  const sig = { "keyword-rank:sqp-weekly": null };
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: sig });
+  assert.equal(got.filter((r) => r.requestKey === "keyword-rank:sqp-monthly").length, 1);
+});
+test("keyword weekly + monthly cadences are distinct sources/hashes when monthly is active", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+  const wk = got.find((r) => r.requestKey === "keyword-rank:sqp-weekly");
+  const mo = got.find((r) => r.requestKey === "keyword-rank:sqp-monthly");
+  assert.notEqual(wk.sourceId, mo.sourceId);
+  assert.notEqual(wk.requestHash, mo.requestHash);
+});
+test("keyword-rank primary vs dd-secondary org isolation (kickoff + fallback)", () => {
+  for (const [win, sig] of [[kwKickoff, undefined], [kwFallbackWin, SIG_LOW]]) {
+    const p = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary-key", ids: ["A1"], windowsByRequestKey: win, fallbackSignals: sig });
+    const s = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "secondary-key", ids: ["A1"], windowsByRequestKey: win, fallbackSignals: sig });
+    for (let i = 0; i < p.length; i += 1) assert.notEqual(p[i].requestHash, s[i].requestHash);
+  }
 });
 for (const n of [0, 1, 5, 6, 11]) {
-  test(`keyword-rank reproduces the transport chunks + hashes for ${n} IDs`, () => {
-    const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary", ids: ids(n), windowsByRequestKey: kwWin });
-    const exp = transportExpected("keyword-rank", "primary", ids(n), kwWin);
+  test(`keyword-rank reproduces the transport chunks + hashes for ${n} IDs (fallback active)`, () => {
+    const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "primary", ids: ids(n), windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+    const exp = transportExpected("keyword-rank", "primary", ids(n), kwFallbackWin);
     assert.equal(got.length, exp.length);
     for (let i = 0; i < exp.length; i += 1) {
       assert.deepEqual(got[i].sellerOrVendorIds, exp[i].sellerOrVendorIds);
@@ -543,6 +601,43 @@ for (const n of [0, 1, 5, 6, 11]) {
     }
   });
 }
+
+/* ===================== FIX 3: structured source-failure policy ===================== */
+
+test("every conditional (org-availability) source has a structured availabilityPolicy; none parses HTTP 424", () => {
+  const conditional = [
+    ["keyword-rank", "keyword-rank:sqp-weekly"],
+    ["keyword-rank", "keyword-rank:sqp-monthly"],
+    ["content-changes", "content-changes:events"],
+  ];
+  for (const [rk, key] of conditional) {
+    const c = byKey(REPORT_SOURCE_CONTRACTS[rk], key);
+    assert.ok(c.availabilityPolicy && typeof c.availabilityPolicy === "object", key + " needs availabilityPolicy");
+    assert.equal(c.availabilityPolicy.safeCode, "SOURCE_DISABLED");
+    assert.ok(["terminal", "degraded"].includes(c.availabilityPolicy.disabledSource));
+    assert.ok(["blocked", "save-unavailable-snapshot"].includes(c.availabilityPolicy.reportOutcome));
+    assert.equal(c.orgAvailability, undefined, key + " must not keep the old descriptive string");
+  }
+  // No scheduler contract may depend on parsing an HTTP status string.
+  const dump = JSON.stringify(REPORT_SOURCE_CONTRACTS);
+  assert.ok(!/424/.test(dump), "no contract field may contain 424");
+  assert.ok(!/orgAvailability/.test(dump), "no contract may keep orgAvailability");
+});
+test("sourceDisabledOutcome: terminal blocks the report; degraded saves an unavailable snapshot", () => {
+  const terminal = sourceDisabledOutcome({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" });
+  const degraded = sourceDisabledOutcome({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" });
+  assert.equal(terminal.blocks, true);
+  assert.equal(terminal.reportOutcome, "blocked");
+  assert.equal(degraded.blocks, false); // degraded permits valid report derivation
+  assert.equal(degraded.reportOutcome, "save-unavailable-snapshot");
+  assert.notEqual(terminal.blocks, degraded.blocks); // terminal and degraded are distinct
+});
+test("keyword-rank's declared conditional sources are all terminal (report blocked when disabled)", () => {
+  for (const key of ["keyword-rank:sqp-weekly", "keyword-rank:sqp-monthly"]) {
+    assert.equal(sourceDisabledOutcome(byKey(keyword, key).availabilityPolicy).blocks, true);
+  }
+  assert.equal(sourceDisabledOutcome(byKey(content, "content-changes:events").availabilityPolicy).blocks, true);
+});
 
 /* ===================== FIX 1: Daily strict cap ===================== */
 
