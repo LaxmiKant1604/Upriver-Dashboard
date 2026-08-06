@@ -92,7 +92,7 @@ request across accounts/reports that truly match, and (b) the persisted
 | Report | Source constants used (api/datadoe.js) | Confidence |
 |---|---|---|
 | Dashboard / `brand-sales` | `ORDER_LINE_ITEMS_SOURCE_ID` = `89b27535…` (L164) **+** `PRODUCT_CATALOG_SOURCE_ID` = `68d2de…` (L189) — `buildBrandSalesPayload` L622-637 | confirmed from code |
-| Daily Reporting | `DAILY_SALES_SOURCE_ID` = `401ffcd7e5` (L675, Sales & Traffic) + `PRODUCT_CATALOG` `68d2de…` (L1639) + `ADS_SOURCE_ID` = `08cdc77d3d` (L1683) | confirmed |
+| Daily Reporting | All-brand path: `DAILY_SALES_SOURCE_ID` = `401ffcd7e5` (Sales & Traffic); Ads derive from persisted `ads_daily_source_rows`. Named-brand path additionally uses ASIN/month sales + `PRODUCT_CATALOG` and is not declared yet. | confirmed; named-brand pending |
 | FBA Shipment Plan | `PLAN_SALES_SOURCE_ID` = `401ffcd7e5` (L778, Sales & Traffic velocity, L1180/1969) + `PRODUCT_CATALOG` `68d2de…` (L1986) + `FBA_HEALTH_SOURCE_ID` = `44fc5b…` (L784, L2002) + **US only** `LISTINGS_SOURCE_ID` = `ba689c…` AWD (L803, L2057) | confirmed |
 | Reconciliation | `ORDER_LINE_ITEMS` `89b27535…` (L1719) + `RECONCILIATION_SETTLEMENTS_SOURCE_ID` = `732dac…` (L707, L1723) + `PRODUCT_CATALOG` `68d2de…` (L1727) | confirmed |
 | SKU P&L Analyzer | `SKU_PL_SOURCE_ID` = `57a0cb…` (L735, L1095) + COGS from **Supabase** (user-entered, not DataDoe) | confirmed |
@@ -119,10 +119,12 @@ brand directory, `sales` rollup — read already-saved snapshots/history. In the
 planner these are report jobs with `depends_on: []` (or depending only on other
 reports' saved output).
 
-Token-saving payoff: e.g. Sales & Traffic for one account, one window feeds
-Dashboard + Movers + Listing Health + FBA velocity from **one** export; the 4 Ads
-sources feed PPC + Listing Optimizer + Keyword Rank + per-report ad metrics from
-**4** exports total, not per-report.
+Token-saving payoff is request-identity based, not source-name based. One canonical
+request can feed every matching report dependency, but requests with different
+columns/windows remain separate. The four persisted Ads sources can feed compatible
+PPC and brand/report metrics without each report exporting Ads again. Dashboard
+continues to use Order Line Items + Product Catalog; it does not reuse the FBA/Daily
+Sales & Traffic requests.
 
 ---
 
@@ -156,15 +158,24 @@ sources feed PPC + Listing Optimizer + Keyword Rank + per-report ad metrics from
   options, requestHash, organizationFingerprint, accountScopeHash, requestMeta. Tests
   now cover ID counts 0/1/5/6/11 vs the transport, per-key windows, no-date, reorder
   behaviour and org isolation (23 assertions).
-- REMAINING: declare the multi-call / per-month / brand-variant reports
-  (`daily-reporting`, `fba-plan`, `reconciliation`, `keyword-rank`, `content-changes`)
-  and the insight reports with the SAME parity-tested method — each from its exact
-  builder calls, never assumed. Key realism found while auditing: several reports fire
-  multiple exports with per-month windows (e.g. sku-pl, fba-plan) and brand-variant
-  columns (daily all-brand vs named), and the same `source_id` used by two reports
-  usually has a different window ⇒ a different `request_hash` ⇒ NOT a shared export.
-  The request `source` field hashes on the contract KEY (not the raw id), so the
-  short/long id variants of a source collapse to one hash.
+- DONE (`a53b3e2`): empty account scopes return `[]` before validating windows or
+  conditional marketplace metadata.
+- DONE (`f2eb3e5`): exact declarations for **Reconciliation**, **FBA Shipment Plan**,
+  and the **all-brand Daily Reporting path**, parity-tested against their executable
+  builder calls. Reconciliation declares monthly Order Line Items + monthly
+  Settlements + one full-range Product Catalog request. FBA declares four monthly
+  ASIN-unit windows, current-month date coverage, catalog, inventory health, and a
+  no-date Listings/AWD request that is mandatory only when authoritative account
+  country is `US`. Daily all-brand declares Sales & Traffic; its Ads dependency is
+  explicitly derived from persisted Ads history rather than another DataDoe export.
+  Coverage metadata marks Daily `all-brand-only`, preventing Phase 1c from enabling
+  its still-undeclared named-brand path as complete. Tests now cover exact source
+  parity, monthly segmentation, no cross-products, 0/1/5/6/11-ID chunking,
+  source-requirement coverage, and US/non-US AWD applicability (46 assertions).
+- REMAINING: declare Daily Reporting's named-brand ASIN/month + Product Catalog path,
+  then `keyword-rank`, `content-changes`, and the insight reports with the SAME
+  parity-tested method. The same `source_id` used by two reports usually has a
+  different request identity and must not be claimed as a shared export.
 
 **Phase 1c — worker v2 / run-sync v2.** Kickoff opens one cycle (`open_sync_cycle`),
 materializes `sync_source_jobs` (deduped) + `sync_report_jobs`. Bounded checkpointable

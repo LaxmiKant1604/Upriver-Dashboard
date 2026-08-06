@@ -1,5 +1,44 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b - Daily/FBA/Reconciliation contracts (2026-08-06)
+
+Continued `feature/scheduler-v2` only. Nothing was pushed, merged, deployed, or
+applied to Supabase; `feature/design-system` was not touched; Phase 1c was not
+started. Commits: `a53b3e2` (empty-scope ordering), `f2eb3e5` (contracts/tests),
+plus the documentation commit that records this section.
+
+- `reportSourceRequestHashes` now returns `[]` for an empty account scope before
+  window or conditional-marketplace validation. An account resolving to no raw
+  DataDoe IDs therefore creates no source job and cannot fail on irrelevant input.
+- Declared **Reconciliation** from the executable builder: monthly Order Line Items
+  and monthly Settlements (six separate windows, 50,000-row limit, date ASC), plus
+  one full-range Product Catalog request. Windows stay bound to their request keys;
+  there is no Cartesian multiplication.
+- Declared **FBA Shipment Plan** from the executable builder: Sales & Traffic units
+  by ASIN for 3 completed months + current MTD, a separate current-month date probe,
+  Product Catalog, FBA Inventory Health, and US-only no-date Listings/AWD. The two
+  Sales & Traffic calls have different columns and therefore different request
+  hashes even when their dates match.
+- AWD applicability is driven by authoritative account marketplace metadata. A US
+  plan must include the AWD request; a non-US plan cannot include it; missing country
+  metadata fails contract resolution rather than silently losing AWD. Empty scopes
+  still return before this validation.
+- Declared only the **all-brand Daily Reporting** path: Sales & Traffic by account/day.
+  Ads are an explicit derived dependency on persisted `ads_daily_source_rows`, so
+  Daily does not own another Ads export in scheduled mode. The named-brand path uses
+  ASIN/month Sales & Traffic plus Product Catalog and remains undeclared. Coverage is
+  marked `all-brand-only`, so Phase 1c must not enable Daily as fully migrated yet.
+- Source coverage tests now require report-owned plus explicitly derived source keys
+  to exactly cover `REPORT_SOURCE_REQUIREMENTS`; this distinguishes intentional reuse
+  from an omitted source. FBA's country-conditional source and every report request
+  key are also validated.
+- Verification from this worktree: `npm run verify` passed 54 insight + 60 Brand View
+  + 23 sync + 6 source-cache + 22 Scheduler v2 + 7 source-identity + 46 report-contract
+  assertions and the complete production build. `git diff --check` was clean.
+- Remaining Phase 1b: named-brand Daily, Keyword Rank, Content Changes, and all
+  insight report contracts. Live DataDoe source availability, 402/404 behavior, real
+  request-hash reconciliation, and live Postgres concurrency remain rollout gates.
+
 ## Scheduler v2 Phase 1b — resolver correction: 5-ID chunking + keyed windows (2026-08-06)
 
 Corrected the two resolver findings from Codex's Phase 1b review on
