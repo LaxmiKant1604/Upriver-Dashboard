@@ -1,5 +1,37 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — staged deps + failure policy (FIX 1/2/3, 2026-08-06)
+
+Fixed the three execution-policy gaps from Codex's insight-contract review on
+`feature/scheduler-v2` (HEAD `476f62f` code+tests; a docs commit follows). Not
+pushed/merged/deployed/migrated; Phase 1c NOT started; `request_hash` unchanged
+(golden `5601253219be13c7…` green). See SCHEDULER_V2.md §11 for the state tables.
+
+Added ONE reusable typed layer in `report-source-contracts.js` (all fail closed on
+malformed input; all frozen + detached from the registry; all execution metadata that
+never enters `sourceRequestIdentity`):
+- **staged dependency** (`validateStagedSignal`/`evaluateStagedActivation`, +
+  `salesMoversWindows`) — a downstream job activates only on a FRESH validated success;
+  windows derived from the validated date, not the calendar.
+- **ads-currency gate** (`validateAdsCurrencySignal`/`evaluateAdsCurrencyGate`).
+- **generic failurePolicy** (`normalizeFailurePolicy`) — distinct from availabilityPolicy;
+  typed causes (export-error/timeout/http-4xx/http-5xx/strict-row-cap/source-save-error),
+  `blocks:false`, `neverPartial:true`, no HTTP-code text.
+
+- **FIX 1 Sales Movers:** traffic/ads/inventory/catalog staged on the latest-date probe.
+  Kickoff = probe only; no-date/failed/terminal/unvalidated/last-known-good ⇒ no
+  downstream (prior report preserved); malformed ⇒ throws.
+- **FIX 2 Listing Optimizer:** catalog staged on SQP. Disabled/failed/unvalidated SQP
+  spends no catalog export; zero-row SQP success still activates catalog.
+- **FIX 3 PPC:** total-sales gated by the ads-currency signal (≤1 currency runs, >1 skips
+  by design, absent/unvalidated skips, malformed throws) + degrade failurePolicy; catalog
+  stays independently required.
+
+Resolver now takes `dependencySignals` (`fallbackSignals` = legacy alias) and attaches
+immutable `failurePolicy` + `dependency` descriptor to jobs. Stale top-of-file scope
+comment corrected. `report-source-contracts.test.mjs` = **145 assertions**; full verify
+green (**317**); `git diff --check` clean.
+
 ## Scheduler v2 Phase 1b — six insight source contracts declared (2026-08-06)
 
 Declared + parity-tested the exact DataDoe source contracts for all six insight

@@ -496,3 +496,93 @@ already collapses multi-account scopes.
   keeps `ads_daily_source_rows` fresh per account before PPC is enabled.
 - Window derivations (probe lookback, 7-day slices, 84-day SQP) are transcribed from the
   builders but not yet reconciled against a live DataDoe response in this workspace.
+
+---
+
+## 11. Staged dependencies + generic failure policy (2026-08-06)
+
+Codex's insight-contract review approved the request shapes/batching/isolation/dedup but
+withheld Phase 1b for three execution-policy gaps. Fixed on `feature/scheduler-v2`
+(commit `476f62f`); nothing pushed/merged/deployed/migrated; Phase 1c NOT started;
+`request_hash` unchanged (all new metadata is outside `sourceRequestIdentity`).
+
+One reusable typed layer, added to `report-source-contracts.js` (all helpers fail closed
+on malformed input and return frozen objects detached from the registry):
+
+- **Staged dependency** — `validateStagedSignal` + `evaluateStagedActivation`. A staged
+  downstream job activates only when its primary's typed signal
+  `{status, validated, latestReportedDate?}` proves a **fresh** `validated` `success`
+  (and, where `requireReportedDate`, a real ISO date). `salesMoversWindows(date)` derives
+  the recent/prior 7-day weeks from the validated date — never the calendar.
+- **Ads-currency gate** — `validateAdsCurrencySignal` + `evaluateAdsCurrencyGate`. Reads a
+  typed `{status, validated, currencyCount}` signal derived from persisted
+  `ads_daily_source_rows`.
+- **Generic failure policy** — `normalizeFailurePolicy`, DISTINCT from `availabilityPolicy`
+  (which stays disabled-source-only). Governs any export/save failure — DataDoe error,
+  timeout, HTTP 4xx/5xx, a strict row-cap/truncation, or a Supabase source-save error —
+  as typed `causes`; a `degrade` policy sets `blocks:false` and `neverPartial:true` and
+  carries an admin-safe `safeCode` (never a parsed HTTP string).
+
+The resolver takes `dependencySignals` (`fallbackSignals` kept as the legacy alias),
+gates staged/currency contracts in `applies()`, and attaches immutable `failurePolicy`
+and a `dependency` descriptor `{mode, dependsOn, requiredSignalStatus, signalStatus,
+validated, latestReportedDate}` to each resolved job.
+
+### 11.1 Sales Movers — probe → downstream (FIX 1)
+
+`traffic`, `ads`, `inventory`, `catalog` are `dependencyMode:"staged"` on
+`sales-movers:sales-latest-probe` (`activation: validated_success, requireReportedDate`).
+
+| Probe signal this cycle | Downstream planned? | Outcome |
+|---|---|---|
+| absent (kickoff) | no | plan the probe only |
+| `success, validated, date` | **yes** | derive recent/prior weeks from the date; plan traffic/ads/inventory/catalog |
+| `success, validated, date=null` | no | honest "data unavailable" Sales Movers snapshot |
+| `failed` / `terminal` | no | preserve previous successful report |
+| `success, validated:false` (unvalidated) | no | preserve previous report |
+| `last-known-good` | no | conservative — no new exports, does not pretend the probe succeeded |
+| malformed status / bad date / missing required date | **throws** | fail closed |
+
+### 11.2 Listing Optimizer — SQP → catalog (FIX 2)
+
+`listing-optimizer:catalog` is `dependencyMode:"staged"` on `listing-optimizer:sqp-weekly`
+(`activation: validated_success`, no `requireReportedDate`).
+
+| SQP signal | Catalog planned? | Outcome |
+|---|---|---|
+| absent (kickoff) | no | plan SQP only |
+| `success, validated` (incl. **zero rows**) | **yes** | activate the rich catalog |
+| disabled SQP (`terminal`) | no | save `sqpAvailable:false`; **no catalog export spent** |
+| `failed` / unvalidated / `last-known-good` | no | no catalog export |
+| malformed | **throws** | fail closed |
+
+### 11.3 PPC — currency gate + failure policy (FIX 3)
+
+`ppc-performance:total-sales` is `dependencyMode:"ads-currency-gate"` on the
+`ppc-performance:ads-currency` signal and carries
+`failurePolicy {onFailure:"degrade", degradedScope:"tacos-denominator", safeCode:"TOTAL_SALES_UNAVAILABLE"}`.
+`ppc-performance:catalog` stays independently required and ungated (it enriches ASIN
+rows even when TACoS is unavailable).
+
+| Ads-currency signal | total-sales planned? | catalog | Notes |
+|---|---|---|---|
+| `validated, currencyCount 0` | **yes** | yes | matches the builder |
+| `validated, currencyCount 1` | **yes** | yes | |
+| `validated, currencyCount > 1` | no | yes | TACoS unavailable BY DESIGN, not an error |
+| absent | no | yes | safe: not scheduled |
+| `validated:false` | no | yes | fail closed |
+| malformed (`currencyCount -1`, bad status) | **throws** | — | fail closed |
+
+**total-sales failure handling:** any failure (incl. a strict row-cap) degrades ONLY the
+TACoS denominator — the rest of PPC is derived and saved; a capped/partial result is a
+failure, never saved as data (`neverPartial:true`). The policy is frozen on the resolved
+job and never blocks the report (`blocks:false`).
+
+### 11.4 Invariants preserved
+
+Execution metadata (`failurePolicy`, `dependency`, `strict`, `availabilityPolicy`) is
+outside `sourceRequestIdentity`, so the golden `request_hash`
+`5601253219be13c7…` and all dedup groups are unchanged. Five-ID batching,
+primary/dd-secondary isolation, one-create-export-per-cycle, last-known-good
+preservation, and no-auto-retry all hold. A staged/gated job that does not activate
+consumes no export and preserves the prior report snapshot.
