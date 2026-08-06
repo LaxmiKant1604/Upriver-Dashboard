@@ -96,8 +96,8 @@ request across accounts/reports that truly match, and (b) the persisted
 | FBA Shipment Plan | `PLAN_SALES_SOURCE_ID` = `401ffcd7e5` (L778, Sales & Traffic velocity, L1180/1969) + `PRODUCT_CATALOG` `68d2de…` (L1986) + `FBA_HEALTH_SOURCE_ID` = `44fc5b…` (L784, L2002) + **US only** `LISTINGS_SOURCE_ID` = `ba689c…` AWD (L803, L2057) | confirmed |
 | Reconciliation | `ORDER_LINE_ITEMS` `89b27535…` (L1719) + `RECONCILIATION_SETTLEMENTS_SOURCE_ID` = `732dac…` (L707, L1723) + `PRODUCT_CATALOG` `68d2de…` (L1727) | confirmed |
 | SKU P&L Analyzer | `SKU_PL_SOURCE_ID` = `57a0cb…` (L735, L1095) + COGS from **Supabase** (user-entered, not DataDoe) | confirmed |
-| Keyword Rank | **COMPLETE.** `sqp-weekly` (81aa5b, 84d) + `sqp-monthly` (df4160, 365d, both fetched unconditionally) + `product-catalog` (365d). SQP raw rows, strict, HTTP 424 terminal per org. | confirmed |
-| Content Alerts | **COMPLETE.** `content-changes` (aec3d5, **no-date**, 1000, event_time/DESC) + `product-catalog` (365d). HTTP 424 terminal per org. | confirmed |
+| Keyword Rank | **COMPLETE.** `sqp-weekly` (81aa5b, 84d) + `sqp-monthly` (df4160, 365d, **data-dependent fallback** — see §9) + `product-catalog` (365d). SQP raw rows, `strict`, structured `availabilityPolicy` (terminal). | confirmed |
+| Content Alerts | **COMPLETE.** `content-changes` (aec3d5, **no-date**, 1000, event_time/DESC) + `product-catalog` (365d). Structured `availabilityPolicy` (terminal). | confirmed |
 | Insight reports (Sales Movers, Buy Box Loss, Returns & Refunds, Listing Health, Listing Optimizer, PPC Performance) | **AUDITED + classified (contracts not yet declared).** Builders in `lib/server/reports/*.js` (`sources.js`/`common.js`). See §7. Owned: Movers (sales-traffic, profit-by-sku, fba-inventory-health, catalog), Buy Box (profit-by-sku, inventory, catalog), Returns (returns, settlements, sales-traffic, catalog). Owned+org-cond: Listing Health (+`listings-raw`, degrades), Listing Optimizer (`sqp-weekly`). PPC: owned small sales-traffic + catalog, **ads DERIVED from persisted `ads_daily_source_rows`**. | audited; declaration pending |
 
 Notes from the corrected contracts:
@@ -311,10 +311,11 @@ carries `dependencyMode:"fallback"`, `dependsOnRequestKey:"keyword-rank:sqp-week
 + resolver `fallbackSignals` gate it: active ONLY once weekly is evaluated (signal
 present) AND weekly has < 4 distinct periods. **Token saving:** at kickoff (no signal)
 monthly is not planned, so an account with sufficient weekly history spends **no** monthly
-export — one fewer export/account/cycle than the previous unconditional declaration. A
-present-but-empty weekly signal (failed/empty last-known-good) still attempts monthly.
-Determinism + the one-create-export-per-cycle guarantee (`unique(cycle_id, request_hash)`
-+ `claim_source_export_attempt`) mean repeated workers never duplicate it.
+export — one fewer export/account/cycle than the previous unconditional declaration.
+(Superseded by §9: a failed/terminal weekly no longer attempts monthly; only a
+validated fresh/last-known-good weekly does.) Determinism + the
+one-create-export-per-cycle guarantee (`unique(cycle_id, request_hash)` +
+`claim_source_export_attempt`) mean repeated workers never duplicate it.
 
 **FIX 3 — machine-readable source-failure policy.** The misleading `orgAvailability`
 strings (which described the report API's HTTP 424) are replaced with structured
@@ -335,3 +336,50 @@ report-contracts + build.
 **Remaining live gates:** Daily superset-vs-compact all-brand reconciliation; real
 per-org SQP / content-changes / listings-raw availability (the raw disabled-source
 error). Insight contract declarations + Phase 1c remain future work.
+
+---
+
+## 9. Phase 1b re-review corrections (2026-08-06)
+
+Two corrections (commit `724f502`). `npm run verify` green (report-contracts now **83**
+assertions); insight declarations + Phase 1c NOT started.
+
+**Concrete resolved-job shape (`reportSourceRequestHashes` output).** Each job now
+also carries immutable execution policy for Phase 1c:
+
+```
+{
+  requestKey, sourceKey, sourceId, sellerOrVendorIds,   // the exact ≤5-ID chunk
+  from, to, limit, options,                              // the DataDoe request
+  requestHash, organizationFingerprint, accountScopeHash, requestMeta,
+  strict: boolean,                                       // reject at row cap
+  availabilityPolicy: null | Object.freeze({ disabledSource, safeCode, reportOutcome })
+}
+```
+
+`strict` and `availabilityPolicy` are normalised copies (the policy is frozen and
+detached from `REPORT_SOURCE_CONTRACTS`, so mutating a job cannot mutate the registry),
+carry no HTTP-status string, and are NOT part of the DataDoe request — **`request_hash`
+is unchanged** by their presence (asserted).
+
+**Typed, validated fallback signal.** `fallbackSignals[dependsOnRequestKey]` is now
+`{ status: "success"|"last-known-good"|"failed"|"terminal", validated: boolean,
+distinctPeriods: number|null }`. The prior code conflated a failed weekly (`null`) with
+a zero-period success and wasted a monthly export; it no longer does. State table (for
+`condition { type:"distinct_periods_lt", value:4 }`):
+
+| Weekly signal | Monthly fallback |
+|---|---|
+| missing (kickoff) | not planned (weekly + catalog only) |
+| validated success, 0–3 periods | **active** (one monthly job) |
+| validated success, 4+ periods | not planned |
+| validated last-known-good, 0–3 | **active** |
+| validated last-known-good, 4+ | not planned |
+| failed, no validated last-known-good | not planned (prior report preserved) |
+| terminal / disabled | not planned; weekly `availabilityPolicy` blocks Keyword Rank |
+| unvalidated (validated:false) | not planned |
+| malformed signal / unsupported condition / invalid threshold or periods | **throws** a safe configuration error (fails closed) |
+
+Determinism, one-create-export-per-cycle (`unique(cycle_id, request_hash)` +
+`claim_source_export_attempt`), five-ID batching and primary/dd-secondary isolation are
+unchanged and re-tested.

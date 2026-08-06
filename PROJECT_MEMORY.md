@@ -1,5 +1,31 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b re-review corrections — applied (2026-08-06)
+
+Fixed the two re-review findings (below) on `feature/scheduler-v2` (not
+pushed/merged/deployed; `feature/design-system` untouched; insight declarations +
+Phase 1c NOT started; no migration). Commits `724f502` (code + tests) + a docs commit.
+
+- **FIX 1 — execution policy on concrete jobs.** `reportSourceRequestHashes()` jobs now
+  carry `strict` (explicit boolean) and `availabilityPolicy` (null, or a frozen
+  `{ disabledSource, safeCode, reportOutcome }` from the new `normalizeAvailabilityPolicy`,
+  which copies + validates enums, rejects HTTP-status strings, and detaches from
+  `REPORT_SOURCE_CONTRACTS`). Docstring updated. request_hash is unchanged (metadata is
+  not part of the DataDoe request). Concrete job shape recorded in SCHEDULER_V2.md §9.
+- **FIX 2 — typed validated fallback signal.** Ended the `null == 0 periods` conflation.
+  `evaluateFallbackCondition` requires a typed signal `{ status:
+  "success"|"last-known-good"|"failed"|"terminal", validated: boolean,
+  distinctPeriods: number|null }`. Only a VALIDATED fresh/last-known-good weekly under
+  the threshold schedules monthly; failed/terminal/unvalidated does NOT (prior report
+  preserved, no wasted export). Fails closed: malformed signal / unsupported condition /
+  invalid threshold or period count throw. Full state table in SCHEDULER_V2.md §9;
+  earlier §8's "failed weekly still attempts monthly" line is corrected.
+- `report-source-contracts.test.mjs` = **83 assertions** (adds execution-policy fields,
+  registry-immutability, request_hash-unchanged, the full typed-signal table, and
+  fail-closed cases). Full `npm run verify` green; `git diff --check` clean.
+- Remaining live gates unchanged: Daily all-brand reconciliation, per-org SQP/content/
+  listings-raw availability. Insight contracts + Phase 1c remain future work.
+
 ## Scheduler v2 Phase 1b re-review - two corrections still required (Codex, 2026-08-06)
 
 Reviewed commits `625001f`, `4d1dd64`, and `7afb323` on
