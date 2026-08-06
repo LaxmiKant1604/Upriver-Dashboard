@@ -428,20 +428,55 @@ export function rejectsAtCap(rowCount, limit) {
   return Number(rowCount) >= Number(limit);
 }
 
-// Evaluate a typed data-dependent fallback condition against the signal from its
-// `dependsOnRequestKey` source (fetched this cycle OR last-known-good). Typed, not a
-// parsed description. Returns true when the fallback source SHOULD be attempted.
-export function evaluateFallbackCondition(condition, signal) {
-  if (!condition || typeof condition !== "object") return false;
-  switch (condition.type) {
-    case "distinct_periods_lt":
-      // Attempt the fallback only when the primary produced fewer than N periods.
-      // A missing/failed primary signal (null) counts as 0 distinct periods, so the
-      // fallback is attempted (weekly failing is exactly when monthly is needed).
-      return Number(signal && signal.distinctPeriods != null ? signal.distinctPeriods : 0) < Number(condition.value);
-    default:
-      return false;
+// A typed fallback signal describes the primary source's result THIS cycle:
+//   { status: "success" | "last-known-good" | "failed" | "terminal",
+//     validated: boolean,
+//     distinctPeriods: number | null }
+// Only a VALIDATED fresh or last-known-good payload is a legitimate basis for a
+// data-dependent fallback decision. A failed/terminal primary (or an unvalidated
+// one) is NOT — it must preserve the prior report rather than spend a fallback
+// export. A malformed signal fails closed (throws), never a silent false.
+const FALLBACK_SIGNAL_STATUSES = new Set(["success", "last-known-good", "failed", "terminal"]);
+
+export function validateFallbackSignal(signal) {
+  if (signal == null || typeof signal !== "object" || Array.isArray(signal)) {
+    throw new Error("Fallback signal must be an object with status/validated/distinctPeriods.");
   }
+  if (!FALLBACK_SIGNAL_STATUSES.has(signal.status)) {
+    throw new Error(`Invalid fallback signal status "${signal.status}".`);
+  }
+  if (typeof signal.validated !== "boolean") {
+    throw new Error("Fallback signal.validated must be a boolean.");
+  }
+  if (!(signal.distinctPeriods === null || (Number.isInteger(signal.distinctPeriods) && signal.distinctPeriods >= 0))) {
+    throw new Error("Fallback signal.distinctPeriods must be a non-negative integer or null.");
+  }
+  return signal;
+}
+
+// Evaluate a typed data-dependent fallback condition against a typed signal from its
+// `dependsOnRequestKey` source. Returns true when the fallback source SHOULD be
+// attempted. Fails closed: an unsupported condition type, an invalid threshold, or a
+// malformed signal throws a safe configuration error rather than returning false.
+export function evaluateFallbackCondition(condition, signal) {
+  if (!condition || typeof condition !== "object" || condition.type == null) {
+    throw new Error("Fallback condition must be a typed object with a `type`.");
+  }
+  if (condition.type !== "distinct_periods_lt") {
+    throw new Error(`Unsupported fallback condition type "${condition.type}".`);
+  }
+  if (!Number.isInteger(condition.value) || condition.value < 0) {
+    throw new Error("Fallback condition.value (threshold) must be a non-negative integer.");
+  }
+  const sig = validateFallbackSignal(signal);
+  // A failed/terminal weekly (or one with no validated payload) is not a valid basis:
+  // do NOT schedule the fallback; the previous report snapshot is preserved.
+  if (sig.status === "failed" || sig.status === "terminal") return false;
+  if (!sig.validated) return false;
+  if (sig.distinctPeriods === null) {
+    throw new Error("A validated weekly signal must carry a numeric distinctPeriods.");
+  }
+  return sig.distinctPeriods < condition.value;
 }
 
 // Map a source's structured availabilityPolicy to the outcome when DataDoe reports
@@ -456,6 +491,35 @@ export function sourceDisabledOutcome(policy) {
     safeCode: (policy && policy.safeCode) || "SOURCE_DISABLED",
     reportOutcome: (policy && policy.reportOutcome) || (degraded ? "save-unavailable-snapshot" : "blocked"),
   };
+}
+
+const VALID_DISABLED_SOURCE = new Set(["terminal", "degraded"]);
+const VALID_REPORT_OUTCOME = new Set(["blocked", "save-unavailable-snapshot"]);
+
+// Copy + validate a contract's availabilityPolicy into an IMMUTABLE value for a
+// concrete source job. Returns null when the source has no disabled-source policy.
+// Rejects unknown enums and any HTTP status string, so a resolved job never carries
+// the report API's HTTP 424 prose. The returned object is frozen and detached from
+// REPORT_SOURCE_CONTRACTS, so mutating a job cannot mutate the registry.
+export function normalizeAvailabilityPolicy(policy) {
+  if (policy == null) return null;
+  if (typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("availabilityPolicy must be an object or null.");
+  }
+  const { disabledSource, safeCode, reportOutcome } = policy;
+  if (!VALID_DISABLED_SOURCE.has(disabledSource)) {
+    throw new Error(`Invalid availabilityPolicy.disabledSource "${disabledSource}".`);
+  }
+  if (!VALID_REPORT_OUTCOME.has(reportOutcome)) {
+    throw new Error(`Invalid availabilityPolicy.reportOutcome "${reportOutcome}".`);
+  }
+  if (typeof safeCode !== "string" || !safeCode) {
+    throw new Error("availabilityPolicy.safeCode must be a non-empty string.");
+  }
+  if (/424/.test(safeCode) || /424/.test(String(reportOutcome)) || /424/.test(String(disabledSource))) {
+    throw new Error("availabilityPolicy must not carry HTTP status strings.");
+  }
+  return Object.freeze({ disabledSource, safeCode, reportOutcome });
 }
 
 /**
@@ -473,10 +537,19 @@ export function sourceDisabledOutcome(policy) {
  * - `marketplaceCountry` is required when a report has country-conditional source
  *   contracts. It must come from authoritative account metadata, not UI input.
  *
- * Each returned request carries everything the worker needs to create the export
- * and record the job: requestKey, sourceKey, sourceId, sellerOrVendorIds (the exact
- * chunk), from, to, limit, options, requestHash, organizationFingerprint,
- * accountScopeHash, requestMeta.
+ * Each returned request carries everything the worker needs to create the export,
+ * record the job, and enforce its execution policy: requestKey, sourceKey, sourceId,
+ * sellerOrVendorIds (the exact chunk), from, to, limit, options, requestHash,
+ * organizationFingerprint, accountScopeHash, requestMeta, plus immutable execution
+ * metadata `strict` (explicit boolean) and `availabilityPolicy` (null, or a frozen
+ * { disabledSource, safeCode, reportOutcome }). The execution metadata is normalised
+ * copies — detached from REPORT_SOURCE_CONTRACTS — and is NOT part of the DataDoe
+ * request, so it never affects request_hash deduplication.
+ *
+ * `fallbackSignals` maps a primary requestKey to a typed signal
+ * ({ status, validated, distinctPeriods }); a `dependencyMode:"fallback"` contract is
+ * planned only when its primary's signal is present and its typed condition holds. A
+ * malformed signal or unsupported condition throws a safe configuration error.
  *
  * Returns null for an undeclared report (callers must not assume a contract).
  */
@@ -510,11 +583,12 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
       return false;
     }
     // Data-dependent fallback gate: a fallback source is active ONLY once its primary
-    // has been evaluated (a signal for dependsOnRequestKey is PRESENT) AND its typed
-    // condition holds. At kickoff the signal is absent, so the fallback is neither
-    // required nor planned — repeated workers create no monthly job while weekly
-    // history is sufficient. A present-but-empty signal (weekly failed / empty
-    // last-known-good) counts as 0 periods, so the fallback is still attempted.
+    // has been evaluated (a typed signal for dependsOnRequestKey is PRESENT) AND its
+    // typed condition holds. At kickoff the signal is absent, so the fallback is
+    // neither required nor planned. A failed/terminal/unvalidated primary does NOT
+    // activate the fallback (evaluateFallbackCondition returns false); a malformed
+    // signal throws. Only a validated fresh/last-known-good weekly with < N periods
+    // schedules the monthly export.
     if (c.dependencyMode === "fallback") {
       if (!(c.dependsOnRequestKey in signals)) return false;
       return evaluateFallbackCondition(c.condition, signals[c.dependsOnRequestKey]);
@@ -570,6 +644,11 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
           organizationFingerprint: identity.organizationFingerprint,
           accountScopeHash: identity.accountScopeHash,
           requestMeta: identity.requestMeta,
+          // Immutable execution policy Phase 1c enforces. Normalised (not the shared
+          // contract object) so a worker mutating a job cannot mutate the registry,
+          // and NOT part of the DataDoe request — request_hash is unaffected.
+          strict: c.strict === true,
+          availabilityPolicy: normalizeAvailabilityPolicy(c.availabilityPolicy),
         });
       }
     }

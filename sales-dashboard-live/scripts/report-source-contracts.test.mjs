@@ -20,6 +20,7 @@ import {
   rejectsAtCap,
   evaluateFallbackCondition,
   sourceDisabledOutcome,
+  normalizeAvailabilityPolicy,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -475,8 +476,9 @@ const kwKickoff = {
 };
 // Fallback windows: all three keys (weekly + monthly + catalog).
 const kwFallbackWin = { ...kwKickoff, "keyword-rank:sqp-monthly": [{ from: "2024-08-06", to: "2025-08-06" }] };
-const SIG_LOW = { "keyword-rank:sqp-weekly": { distinctPeriods: 2 } };  // < 4 => monthly active
-const SIG_HIGH = { "keyword-rank:sqp-weekly": { distinctPeriods: 4 } }; // >= 4 => monthly inactive
+// Typed, validated fallback signals (status/validated/distinctPeriods).
+const SIG_LOW = { "keyword-rank:sqp-weekly": { status: "success", validated: true, distinctPeriods: 2 } };  // < 4 => monthly active
+const SIG_HIGH = { "keyword-rank:sqp-weekly": { status: "success", validated: true, distinctPeriods: 4 } }; // >= 4 => monthly inactive
 const ccWin = {
   "content-changes:events": [{ from: null, to: null }],
   "content-changes:catalog": [{ from: "2024-08-06", to: "2025-08-06" }],
@@ -532,13 +534,34 @@ test("sqp-monthly contract carries typed fallback metadata (not a parsed string)
   assert.equal(mo.dependsOnRequestKey, "keyword-rank:sqp-weekly");
   assert.deepEqual(mo.condition, { type: "distinct_periods_lt", value: 4 });
 });
-test("evaluateFallbackCondition: <4 (or missing/failed weekly) attempts monthly; >=4 does not", () => {
+test("evaluateFallbackCondition: only a VALIDATED fresh/last-known-good weekly under threshold activates monthly", () => {
   const cond = { type: "distinct_periods_lt", value: 4 };
-  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 3 }), true);
-  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 0 }), true);
-  assert.equal(evaluateFallbackCondition(cond, null), true);   // weekly failed / last-known-good empty
-  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 4 }), false);
-  assert.equal(evaluateFallbackCondition(cond, { distinctPeriods: 9 }), false);
+  const sig = (o) => ({ status: "success", validated: true, distinctPeriods: 0, ...o });
+  // validated fresh success by period count
+  assert.equal(evaluateFallbackCondition(cond, sig({ distinctPeriods: 0 })), true);
+  assert.equal(evaluateFallbackCondition(cond, sig({ distinctPeriods: 3 })), true);
+  assert.equal(evaluateFallbackCondition(cond, sig({ distinctPeriods: 4 })), false);
+  assert.equal(evaluateFallbackCondition(cond, sig({ distinctPeriods: 9 })), false);
+  // validated last-known-good
+  assert.equal(evaluateFallbackCondition(cond, sig({ status: "last-known-good", distinctPeriods: 2 })), true);
+  assert.equal(evaluateFallbackCondition(cond, sig({ status: "last-known-good", distinctPeriods: 5 })), false);
+  // failed / terminal / unvalidated => never schedule (preserve prior report)
+  assert.equal(evaluateFallbackCondition(cond, { status: "failed", validated: false, distinctPeriods: null }), false);
+  assert.equal(evaluateFallbackCondition(cond, { status: "terminal", validated: false, distinctPeriods: null }), false);
+  assert.equal(evaluateFallbackCondition(cond, { status: "success", validated: false, distinctPeriods: 2 }), false);
+});
+test("evaluateFallbackCondition FAILS CLOSED on malformed signal / condition / threshold / periods", () => {
+  const cond = { type: "distinct_periods_lt", value: 4 };
+  const good = { status: "success", validated: true, distinctPeriods: 2 };
+  assert.throws(() => evaluateFallbackCondition(cond, null), /Fallback signal must be an object/);
+  assert.throws(() => evaluateFallbackCondition(cond, { validated: true, distinctPeriods: 2 }), /status/);
+  assert.throws(() => evaluateFallbackCondition(cond, { status: "success", distinctPeriods: 2 }), /validated must be a boolean/);
+  assert.throws(() => evaluateFallbackCondition(cond, { status: "success", validated: true, distinctPeriods: -1 }), /distinctPeriods/);
+  assert.throws(() => evaluateFallbackCondition(cond, { status: "success", validated: true, distinctPeriods: 1.5 }), /distinctPeriods/);
+  assert.throws(() => evaluateFallbackCondition(cond, { status: "success", validated: true, distinctPeriods: null }), /numeric distinctPeriods/);
+  assert.throws(() => evaluateFallbackCondition({ type: "wat", value: 4 }, good), /Unsupported fallback condition type/);
+  assert.throws(() => evaluateFallbackCondition({ type: "distinct_periods_lt", value: -1 }, good), /threshold/);
+  assert.throws(() => evaluateFallbackCondition({}, good), /typed object/);
 });
 test("kickoff (no signals) plans weekly + catalog only — NO monthly source job", () => {
   const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff });
@@ -568,13 +591,29 @@ test("repeated planning does not duplicate the monthly job (deterministic)", () 
   // claim_source_export_attempt (proven in scheduler-v2.test.mjs): identical monthly
   // request_hash across repeated worker calls collapses to one DataDoe export.
 });
-test("last-known-good survives weekly failure: an empty/failed weekly signal still activates monthly", () => {
-  // Weekly failed this cycle and last-known-good weekly is empty => signal PRESENT but
-  // null (0 periods) => monthly fallback is attempted; the failure does not erase the
-  // report (Phase 1c keeps the prior snapshot; the planner just adds the monthly job).
-  const sig = { "keyword-rank:sqp-weekly": null };
-  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: sig });
+test("failed weekly WITHOUT a validated last-known-good does NOT schedule monthly (prior report preserved)", () => {
+  const failedNoLkg = { "keyword-rank:sqp-weekly": { status: "failed", validated: false, distinctPeriods: null } };
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff, fallbackSignals: failedNoLkg });
+  assert.ok(!got.some((r) => r.requestKey === "keyword-rank:sqp-monthly"));
+});
+test("validated last-known-good weekly with 0-3 periods DOES schedule monthly", () => {
+  const lkg = { "keyword-rank:sqp-weekly": { status: "last-known-good", validated: true, distinctPeriods: 1 } };
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: lkg });
   assert.equal(got.filter((r) => r.requestKey === "keyword-rank:sqp-monthly").length, 1);
+});
+test("terminal/disabled weekly does NOT schedule monthly; weekly policy blocks Keyword Rank", () => {
+  const terminal = { "keyword-rank:sqp-weekly": { status: "terminal", validated: false, distinctPeriods: null } };
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff, fallbackSignals: terminal });
+  assert.ok(!got.some((r) => r.requestKey === "keyword-rank:sqp-monthly"));
+  const wk = got.find((r) => r.requestKey === "keyword-rank:sqp-weekly");
+  assert.equal(sourceDisabledOutcome(wk.availabilityPolicy).blocks, true);
+});
+test("a malformed fallback signal makes the resolver throw a safe configuration error", () => {
+  const bad = { "keyword-rank:sqp-weekly": { distinctPeriods: 2 } }; // missing status/validated
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: bad }),
+    /status/,
+  );
 });
 test("keyword weekly + monthly cadences are distinct sources/hashes when monthly is active", () => {
   const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
@@ -681,6 +720,56 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   for (const [, constName] of Object.entries(STRICT)) {
     assert.ok(new RegExp("rows\\.length >= " + constName).test(DD), "missing executable guard for " + constName);
   }
+});
+
+/* ============ re-review FIX 1: execution policy on concrete resolved jobs ============ */
+
+test("resolved jobs carry an explicit strict boolean + availabilityPolicy (null when N/A)", () => {
+  const got = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff });
+  const wk = got.find((r) => r.requestKey === "keyword-rank:sqp-weekly");   // strict + terminal policy
+  const cat = got.find((r) => r.requestKey === "keyword-rank:catalog");     // neither
+  assert.equal(wk.strict, true);
+  assert.deepEqual(wk.availabilityPolicy, { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" });
+  assert.equal(cat.strict, false); // explicit boolean, never undefined
+  assert.equal(cat.availabilityPolicy, null);
+});
+test("every resolved job has strict:boolean, availabilityPolicy:(object|null), and no HTTP 424", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: kwFallbackWin, fallbackSignals: SIG_LOW });
+  for (const j of jobs) {
+    assert.equal(typeof j.strict, "boolean");
+    assert.ok(j.availabilityPolicy === null || typeof j.availabilityPolicy === "object");
+    assert.ok(!/424/.test(JSON.stringify(j.availabilityPolicy)));
+  }
+});
+test("normalizeAvailabilityPolicy: terminal vs degraded distinct; rejects bad enum / HTTP strings", () => {
+  const deg = normalizeAvailabilityPolicy({ disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" });
+  const term = normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" });
+  assert.equal(normalizeAvailabilityPolicy(null), null);
+  assert.equal(sourceDisabledOutcome(deg).blocks, false); // degraded permits derivation
+  assert.equal(sourceDisabledOutcome(term).blocks, true);
+  assert.notEqual(deg.disabledSource, term.disabledSource);
+  assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "wat", safeCode: "x", reportOutcome: "blocked" }), /disabledSource/);
+  assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "nope" }), /reportOutcome/);
+  assert.throws(() => normalizeAvailabilityPolicy({ disabledSource: "terminal", safeCode: "HTTP 424", reportOutcome: "blocked" }), /HTTP status/);
+});
+test("mutating a returned job's execution policy cannot mutate REPORT_SOURCE_CONTRACTS", () => {
+  const before = JSON.stringify(REPORT_SOURCE_CONTRACTS["keyword-rank"]);
+  const wk = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff })
+    .find((r) => r.requestKey === "keyword-rank:sqp-weekly");
+  try { wk.availabilityPolicy.disabledSource = "degraded"; } catch (e) { /* frozen */ }
+  try { wk.strict = false; } catch (e) { /* primitive copy */ }
+  assert.equal(REPORT_SOURCE_CONTRACTS["keyword-rank"][0].availabilityPolicy.disabledSource, "terminal");
+  assert.equal(REPORT_SOURCE_CONTRACTS["keyword-rank"][0].strict, true);
+  assert.equal(JSON.stringify(REPORT_SOURCE_CONTRACTS["keyword-rank"]), before);
+});
+test("execution metadata does NOT change request_hash (identity ignores strict/policy)", () => {
+  const job = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "k", ids: ["A1"], windowsByRequestKey: kwKickoff })
+    .find((r) => r.requestKey === "keyword-rank:sqp-weekly");
+  const expected = sourceRequestIdentity({
+    apiKey: "k", sourceId: job.sourceId, columns: byKey(keyword, "keyword-rank:sqp-weekly").columns,
+    ids: job.sellerOrVendorIds, from: job.from, to: job.to, limit: job.limit, options: job.options,
+  }).requestHash;
+  assert.equal(job.requestHash, expected);
 });
 
 console.log("\n" + passed + " assertions passed");
