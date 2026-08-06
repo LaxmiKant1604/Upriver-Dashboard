@@ -574,6 +574,127 @@ export async function insertAuditLog({ actorUserId = null, action, target = {} }
   }).catch(() => {});
 }
 
+/* ===================== Scheduler v2 (Phase 1c) — source-first cycle =====================
+   Thin wrappers over the three additive tables + three RPCs in
+   20260807_scheduler_v2.sql. Service-role only (RLS bypassed for writes). These power
+   the SHADOW-MODE source worker; they never store an API key or a raw DataDoe error. */
+
+// open_sync_cycle: idempotent kickoff. Returns the single cycle id for (bucket, date).
+export async function openSyncCycle({ bucket, cycleDate, scheduledAt = null, trigger = "manual" }) {
+  return request("/rest/v1/rpc/open_sync_cycle", {
+    method: "POST",
+    body: { p_bucket: bucket, p_cycle_date: cycleDate, p_scheduled_at: scheduledAt, p_trigger: trigger },
+  });
+}
+
+// claim_sync_cycle: pending -> running; true only for the worker that won the start.
+export async function claimSyncCycle(cycleId) {
+  return request("/rest/v1/rpc/claim_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
+}
+
+export async function getSyncCycle(cycleId) {
+  const query = new URLSearchParams({
+    select: "id,bucket,cycle_date,status,started_at,finished_at,source_total,source_succeeded,source_failed",
+    id: `eq.${cycleId}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/sync_cycles?${query}`);
+  return rows[0] || null;
+}
+
+export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, status } = {}) {
+  const body = {};
+  if (sourceTotal != null) body.source_total = sourceTotal;
+  if (sourceSucceeded != null) body.source_succeeded = sourceSucceeded;
+  if (sourceFailed != null) body.source_failed = sourceFailed;
+  if (status) body.status = status;
+  if (!Object.keys(body).length) return;
+  await request(`/rest/v1/sync_cycles?id=eq.${cycleId}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body,
+  });
+}
+
+// claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller
+// that made the first (and only) create-export POST for this (cycle, request_hash).
+export async function claimSourceExportAttempt(cycleId, requestHash) {
+  return request("/rest/v1/rpc/claim_source_export_attempt", {
+    method: "POST",
+    body: { p_cycle_id: cycleId, p_request_hash: requestHash },
+  });
+}
+
+// Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
+// in-progress or completed job (unique cycle_id, request_hash).
+export async function upsertSyncSourceJob(job) {
+  await request("/rest/v1/sync_source_jobs?on_conflict=cycle_id,request_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: {
+      cycle_id: job.cycleId,
+      request_hash: job.requestHash,
+      source_id: job.sourceId || "",
+      source_key: job.sourceKey || "",
+      organization_fingerprint: job.organizationFingerprint || "",
+      connection_id: job.connectionId || "primary",
+      account_scope_hash: job.accountScopeHash || "",
+      request_meta: job.requestMeta || {},
+      bucket: job.bucket,
+    },
+  });
+}
+
+export async function getSyncSourceJobs(cycleId) {
+  const query = new URLSearchParams({
+    select: "id,request_hash,source_id,source_key,connection_id,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count",
+    cycle_id: `eq.${cycleId}`,
+    order: "created_at.asc",
+  });
+  return request(`/rest/v1/sync_source_jobs?${query}`);
+}
+
+async function patchSyncSourceJob(cycleId, requestHash, body) {
+  const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, request_hash: `eq.${requestHash}` });
+  await request(`/rest/v1/sync_source_jobs?${query}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body,
+  });
+}
+
+export async function recordSyncSourceSuccess({ cycleId, requestHash, exportId = null, rowCount, payloadBytes, durationMs, cacheObjectPath }) {
+  await patchSyncSourceJob(cycleId, requestHash, {
+    fetch_status: "succeeded",
+    succeeded_at: new Date().toISOString(),
+    export_id: exportId,
+    row_count: rowCount,
+    payload_bytes: payloadBytes,
+    duration_ms: durationMs,
+    cache_object_path: cacheObjectPath,
+    last_good_fetched_at: new Date().toISOString(),
+    error_stage: null,
+    error_code: null,
+    error_message: null,
+  });
+}
+
+// Failure NEVER clears cache_object_path / last_good_fetched_at, so last-known-good
+// source data survives. error_message is the SAFE operator string only.
+export async function recordSyncSourceFailure({ cycleId, requestHash, stage, code, message, terminal = false, durationMs, rowCount = null, exportId = null }) {
+  await patchSyncSourceJob(cycleId, requestHash, {
+    fetch_status: "failed",
+    failed_at: new Date().toISOString(),
+    error_stage: stage,
+    error_code: code,
+    error_message: message,
+    terminal,
+    duration_ms: durationMs,
+    row_count: rowCount,
+    export_id: exportId,
+  });
+}
+
 export async function getReportSnapshotsMeta({ reportKeys, accountIds } = {}) {
   const params = new URLSearchParams({
     select: "report_key,account_id,params,source_refreshed_at,updated_at,payload_bytes",
