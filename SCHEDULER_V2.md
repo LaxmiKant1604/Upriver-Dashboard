@@ -92,13 +92,13 @@ request across accounts/reports that truly match, and (b) the persisted
 | Report | Source constants used (api/datadoe.js) | Confidence |
 |---|---|---|
 | Dashboard / `brand-sales` | `ORDER_LINE_ITEMS_SOURCE_ID` = `89b27535…` (L164) **+** `PRODUCT_CATALOG_SOURCE_ID` = `68d2de…` (L189) — `buildBrandSalesPayload` L622-637 | confirmed from code |
-| Daily Reporting | All-brand path: `DAILY_SALES_SOURCE_ID` = `401ffcd7e5` (Sales & Traffic); Ads derive from persisted `ads_daily_source_rows`. Named-brand path additionally uses ASIN/month sales + `PRODUCT_CATALOG` and is not declared yet. | confirmed; named-brand pending |
+| Daily Reporting | **COMPLETE (superset strategy).** ONE ASIN/day Sales & Traffic superset (`fetchDailyBrandSalesRows`, monthly-segmented, `child_asin` grain, `DAILY_BRAND_ROW_LIMIT` 50000, L1136) + ONE `PRODUCT_CATALOG` — all-brand + every named brand derive from these; no per-brand and no compact export. Ads derive from `ads_daily_source_rows`. Keys: `daily-reporting:asin-day-superset`, `:catalog`. | confirmed |
 | FBA Shipment Plan | `PLAN_SALES_SOURCE_ID` = `401ffcd7e5` (L778, Sales & Traffic velocity, L1180/1969) + `PRODUCT_CATALOG` `68d2de…` (L1986) + `FBA_HEALTH_SOURCE_ID` = `44fc5b…` (L784, L2002) + **US only** `LISTINGS_SOURCE_ID` = `ba689c…` AWD (L803, L2057) | confirmed |
 | Reconciliation | `ORDER_LINE_ITEMS` `89b27535…` (L1719) + `RECONCILIATION_SETTLEMENTS_SOURCE_ID` = `732dac…` (L707, L1723) + `PRODUCT_CATALOG` `68d2de…` (L1727) | confirmed |
 | SKU P&L Analyzer | `SKU_PL_SOURCE_ID` = `57a0cb…` (L735, L1095) + COGS from **Supabase** (user-entered, not DataDoe) | confirmed |
-| Keyword Rank | `SQP_WEEKLY_SOURCE_ID` = `81aa5b…` (L754, L1803) + `SQP_MONTHLY_SOURCE_ID` = `df4160…` (L755, L1823) | confirmed |
-| Content Alerts | `CONTENT_CHANGE_SOURCE_ID` = `aec3d5…` (L663, L1899) + `PRODUCT_CATALOG` `68d2de…` (L1849/1912) | confirmed |
-| Sales Movers, Listing Health, Buy Box Loss, Returns & Refunds, PPC Performance, Listing Optimizer | **NOT audited yet** — extract per-report in Phase 1b and live-validate. Ads-derived reports read saved `ads_daily_source_rows` (`ADS_SOURCE_ID` `08cdc77d3d` + the 4 registry ads sources) | requires extraction + live validation |
+| Keyword Rank | **COMPLETE.** `sqp-weekly` (81aa5b, 84d) + `sqp-monthly` (df4160, 365d, both fetched unconditionally) + `product-catalog` (365d). SQP raw rows, strict, HTTP 424 terminal per org. | confirmed |
+| Content Alerts | **COMPLETE.** `content-changes` (aec3d5, **no-date**, 1000, event_time/DESC) + `product-catalog` (365d). HTTP 424 terminal per org. | confirmed |
+| Insight reports (Sales Movers, Buy Box Loss, Returns & Refunds, Listing Health, Listing Optimizer, PPC Performance) | **AUDITED + classified (contracts not yet declared).** Builders in `lib/server/reports/*.js` (`sources.js`/`common.js`). See §7. Owned: Movers (sales-traffic, profit-by-sku, fba-inventory-health, catalog), Buy Box (profit-by-sku, inventory, catalog), Returns (returns, settlements, sales-traffic, catalog). Owned+org-cond: Listing Health (+`listings-raw`, degrades), Listing Optimizer (`sqp-weekly`). PPC: owned small sales-traffic + catalog, **ads DERIVED from persisted `ads_daily_source_rows`**. | audited; declaration pending |
 
 Notes from the corrected contracts:
 - **Order Line Items `89b27535…`** is used by BOTH Dashboard (`brand-sales`) and
@@ -247,3 +247,38 @@ vs 402` in the recorded `error_code`.
 
 Do not count a cycle successful on HTTP 200; success = fetch + save + derive +
 validate. Do not claim accuracy without live reconciliation evidence.
+
+---
+
+## 7. Insight-report source audit + classification (2026-08-06)
+
+Audited from executable code in `lib/server/reports/` (`sources.js`, `common.js`,
+per-report builders). Dependency classes: **owned** = the report's own DataDoe export;
+**derived** = persisted `ads_daily_source_rows` / another snapshot; **org-cond** =
+`defaultDataset:false` source ⇒ HTTP 424 when disabled for an organization.
+
+| Report | Owned DataDoe exports (source · columns-const · limit · window · order) | Derived / org-cond |
+|---|---|---|
+| Sales Movers | `sales-traffic` TRAFFIC_COLUMNS 50000 per-window child_asin/ASC · `profit-by-sku` ADS_COLUMNS 50000 per-window · `fba-inventory-health` (shared) · `product-catalog` (shared) | ads come from Profit-by-SKU (owned), not persisted ads |
+| Buy Box Loss | `profit-by-sku` DAILY_COLUMNS 50000 per-slice · `fba-inventory-health` · `product-catalog` | — |
+| Returns & Refunds | `returns` RETURN_COLUMNS 50000 · `settlements` SETTLEMENT_GROUP_BY 50000 · `sales-traffic` TRAFFIC_GROUP_BY 50000 · `product-catalog` | — |
+| Listing Health | `listings` LISTING_COLUMNS 20000 no-date · `profit-by-sku` SALES_COLUMNS 50000 · `fba-inventory-health` · `product-catalog` | **`listings-raw` org-cond, DEGRADES gracefully (optional)** |
+| Listing Optimizer | `sqp-weekly` SQP_COLUMNS 50000 · `product-catalog` | **`sqp-weekly` org-cond, terminal if disabled** |
+| PPC Performance | `sales-traffic` TOTAL_SALES_GROUP_BY 500 date-rollup (TACoS denominator) · `product-catalog` | **ads DERIVED from persisted `ads_daily_source_rows`** (never a live ads export) |
+
+**Shared insight fetchers (token saving via dedup):** every insight report calls
+`common.js fetchCatalog` (`product-catalog`, CATALOG_COLUMNS, **no-date**, limit **20000**,
+child_asin/ASC) and most call `fetchInventorySnapshot` (`fba-inventory-health`,
+INVENTORY_COLUMNS, {asOf-10..asOf}, 15000, date/DESC) with IDENTICAL shapes. For one
+account/org these resolve to the SAME `request_hash`, so the scheduler dedups them to ONE
+catalog export + ONE inventory export across all six insight reports. NOTE: the insight
+catalog (no-date, 20000) differs from the operational reports' catalog (windowed, 10000) ⇒
+a different `request_hash` ⇒ not shared with those.
+
+**Not declared this session (stop condition, honest):** each insight report's column
+constants live in the builder files (not `api/datadoe.js`) and several use org-conditional
+sources; accurate per-call transcription + parity testing for six reports is the next
+focused Phase 1b increment, using the same method as the operational reports. The
+classification above is complete; the formal `REPORT_SOURCE_CONTRACTS` entries + tests
+remain. No insight contract was guessed or half-declared. Priority Feed + Brand View stay
+derived-only (no DataDoe export).

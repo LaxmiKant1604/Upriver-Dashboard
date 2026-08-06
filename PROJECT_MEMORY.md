@@ -1,5 +1,68 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b — operational reports complete + insight audit (2026-08-06)
+
+`feature/scheduler-v2` (not pushed/merged/deployed; `feature/design-system` untouched;
+Phase 1c NOT started; no migration applied). Commit `86cc805` + a docs commit.
+
+**Completed contracts this session (`86cc805`, parity-tested vs executable `api/datadoe.js`):**
+- **Daily Reporting — now COMPLETE** via a scheduler-owned superset strategy. Fetch the
+  ASIN/day Sales & Traffic SUPERSET once per account (`fetchDailyBrandSalesRows`: already
+  monthly-segmented, `child_asin` grain, `DAILY_BRAND_ROW_LIMIT` 50000) +
+  `daily-reporting:catalog` once, and DERIVE the all-brand total (sum over child_asin per
+  date) AND every named brand (ASIN→brand via catalog). **No per-brand export, no compact
+  all-brand export** — the compact date-grain export is a strict roll-up of the superset
+  (same source 401ffcd7e5 + same aggregations, coarser grouping). Request keys:
+  `daily-reporting:asin-day-superset`, `daily-reporting:catalog`. Ads derived from
+  `ads_daily_source_rows`. `REPORT_DERIVATION` records the strategy; LIVE GATE = reconcile
+  superset-summed all-brand vs the compact total once. Corrected
+  `REPORT_SOURCE_REQUIREMENTS["daily-reporting"]` to include `product-catalog`.
+- **Keyword Rank — COMPLETE.** `keyword-rank:sqp-weekly` (84d) + `:sqp-monthly` (365d) +
+  `:catalog` (365d). SQP = raw rows, date/ASC, 50000, strict truncation. Scheduler fetches
+  BOTH cadences unconditionally (deterministic; documented +1 monthly export/account vs the
+  browser's weekly<4 fallback). `orgAvailability` records HTTP 424 terminal status.
+- **Content Changes — COMPLETE.** `content-changes:events` = NO-DATE export (from/to null,
+  event_time/DESC, 1000) + `:catalog` (365d). `orgAvailability` = HTTP 424 terminal.
+- `REPORT_SOURCE_COVERAGE` now: brand-sales, sku-pl, reconciliation, fba-plan,
+  daily-reporting, keyword-rank, content-changes = **complete**. Tests: `test:report-contracts`
+  = 60 assertions; `npm run verify` green.
+
+**Insight reports — audited + classified (contracts NOT declared this session).** Every
+source call was read from `lib/server/reports/*.js` (`sources.js` + `common.js` +
+per-report builders). Classification (owned = report's own DataDoe export; derived =
+persisted/other snapshot; org-cond = defaultDataset:false ⇒ HTTP 424):
+- **Sales Movers** — all OWNED: `sales-traffic` (TRAFFIC_COLUMNS, per current+prior window),
+  `profit-by-sku` (ad metrics: ADS_COLUMNS), `fba-inventory-health`, `product-catalog`.
+  (Ads come from Profit-by-SKU, NOT the persisted ads sources.)
+- **Buy Box Loss** — all OWNED: `profit-by-sku` (DAILY_COLUMNS, per slice), `fba-inventory-health`,
+  `product-catalog`.
+- **Returns & Refunds** — all OWNED: `returns`, `settlements`, `sales-traffic`, `product-catalog`.
+- **Listing Health** — OWNED + org-cond: `listings` (no-date), `profit-by-sku`,
+  `fba-inventory-health`, `product-catalog`, and **`listings-raw` (org-conditional, DEGRADES
+  gracefully when disabled — optional)**.
+- **Listing Optimizer** — OWNED + org-cond: `sqp-weekly` (org-conditional, terminal if
+  disabled) + `product-catalog`.
+- **PPC Performance** — OWNED small `sales-traffic` (["date"] rollup, 500, TACoS denominator)
+  + `product-catalog`; **ads are DERIVED from persisted `ads_daily_source_rows`** (never a
+  live ads export).
+- Priority Feed + Brand View remain derived-only (no DataDoe export).
+- **Token-saving finding:** the insight reports share `fetchCatalog` (product-catalog, no-date,
+  limit **20000**, child_asin/ASC) and `fetchInventorySnapshot` with IDENTICAL request
+  identities, so the scheduler dedups them to ONE catalog + ONE inventory export per account
+  across all insight reports. NOTE the insight catalog (no-date, 20000) has a DIFFERENT
+  request_hash than the operational reports' catalog (windowed, 10000) ⇒ not shared with them.
+
+**Why insight contracts were NOT declared this session (stop condition):** each insight report
+composes 3–5 report-specific column sets (in the builder files, not `api/datadoe.js`) plus
+shared fetchers and org-conditional sources; accurate per-call transcription + parity testing
+for 6 reports is the next focused increment. The classification above is complete; formal
+`REPORT_SOURCE_CONTRACTS` entries + parity tests remain. No guessing was committed.
+
+**Remaining:** declare the 6 insight contracts (owned calls, with the same parity-tested method,
+reading each builder's column constants); then Phase 1c. Live DataDoe reconciliation
+(incl. the Daily all-brand superset equality + org 402/404/424) remains Codex's gate.
+
+
 ## Scheduler v2 Phase 1b - Daily/FBA/Reconciliation contracts (2026-08-06)
 
 Continued `feature/scheduler-v2` only. Nothing was pushed, merged, deployed, or
