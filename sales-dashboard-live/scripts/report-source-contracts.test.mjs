@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   REPORT_DERIVED_SOURCE_KEYS,
+  REPORT_DERIVED_ONLY,
   REPORT_DERIVATION,
   REPORT_SOURCE_CONTRACTS,
   reportSourceRequestHashes,
@@ -147,11 +148,15 @@ test("owned plus explicitly derived source keys exactly cover each report's requ
     assert.ok(required, key + " missing from REPORT_SOURCE_REQUIREMENTS");
     const owned = REPORT_SOURCE_CONTRACTS[key].map((c) => c.sourceKey);
     const represented = [...new Set([...owned, ...(REPORT_DERIVED_SOURCE_KEYS[key] || [])])];
-    assert.deepEqual(represented, required, key + " must represent every required source exactly");
+    // "exactly cover" is a SET relationship (a requirements list may order derived
+    // sources before owned ones, e.g. PPC lists its Ads sources first), so compare
+    // as sets and assert no source is over- or under-represented.
+    assert.deepEqual([...represented].sort(), [...required].sort(), key + " must represent every required source exactly");
+    assert.equal(represented.length, required.length, key + " must not duplicate or omit a source");
     assert.ok(reportSourceCoverage(key), key + " must declare its coverage status");
   }
   assert.deepEqual(declaredRequestKeys("brand-sales"), ["brand-sales:order-lines", "brand-sales:catalog"]);
-  assert.equal(declaredRequestKeys("listing-health"), null); // insight report intentionally not declared yet
+  assert.equal(declaredRequestKeys("brand-view"), null); // derived-only report: no owned source jobs
   assert.equal(reportSourceCoverage("daily-reporting"), "complete");
   assert.equal(reportSourceCoverage("fba-plan"), "complete");
   assert.equal(reportSourceCoverage("keyword-rank"), "complete");
@@ -166,8 +171,9 @@ test("request keys are unique within a report and prefixed by the report key", (
   }
 });
 
-test("an undeclared (insight) report resolves to null", () => {
-  assert.equal(reportSourceRequestHashes({ reportKey: "listing-health", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
+test("a derived-only report (no owned source jobs) resolves to null", () => {
+  assert.equal(reportSourceRequestHashes({ reportKey: "brand-view", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
+  assert.equal(reportSourceRequestHashes({ reportKey: "priority-feed", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
 });
 
 /* ----------------- exact 5-ID chunking vs the live transport ----------------- */
@@ -672,6 +678,8 @@ test("every conditional (org-availability) source has a structured availabilityP
     ["keyword-rank", "keyword-rank:sqp-weekly"],
     ["keyword-rank", "keyword-rank:sqp-monthly"],
     ["content-changes", "content-changes:events"],
+    ["listing-health", "listing-health:listings-raw"], // degraded (optional enrichment)
+    ["listing-optimizer", "listing-optimizer:sqp-weekly"], // degraded (valid sqpAvailable:false snapshot)
   ];
   for (const [rk, key] of conditional) {
     const c = byKey(REPORT_SOURCE_CONTRACTS[rk], key);
@@ -753,6 +761,15 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "returns-leakage:settlements": "returns.js",
     "returns-leakage:traffic": "returns.js",
     "returns-leakage:catalog": "common.js",
+    "listing-health:listings": "listing-health.js",
+    "listing-health:listings-raw": "listing-health.js",
+    "listing-health:sales": "listing-health.js",
+    "listing-health:inventory": "common.js",
+    "listing-health:catalog": "common.js",
+    "ppc-performance:total-sales": "ppc.js",
+    "ppc-performance:catalog": "common.js",
+    "listing-optimizer:sqp-weekly": "listing-optimizer.js",
+    "listing-optimizer:catalog": "listing-optimizer.js",
   };
   const declaredStrict = [];
   for (const key of declaredReportKeys()) {
@@ -861,9 +878,23 @@ const INSIGHT_SPEC = [
   { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
   { rk: "returns-leakage:traffic", file: "returns.js", cols: "TRAFFIC_GROUP_BY", group: "TRAFFIC_GROUP_BY", aggs: "TRAFFIC_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  // Listing Health
+  { rk: "listing-health:listings", file: "listing-health.js", cols: "LISTING_COLUMNS", group: null, aggs: null, src: "listings", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "listing-health:listings-raw", file: "listing-health.js", cols: "LISTING_RAW_COLUMNS", group: null, aggs: null, src: "listings-raw", limit: 20000, oc: "child_asin", od: "ASC", strict: true, policy: "degraded" },
+  { rk: "listing-health:sales", file: "listing-health.js", cols: "SALES_COLUMNS", group: "SALES_COLUMNS", aggs: "SALES_AGGREGATIONS", src: "profit-by-sku-date", limit: 50000, oc: "sku", od: "ASC", strict: true },
+  { rk: "listing-health:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
+  { rk: "listing-health:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  // PPC Performance (ads are derived; this is the only owned export besides catalog)
+  { rk: "ppc-performance:total-sales", file: "ppc.js", cols: "TOTAL_SALES_GROUP_BY", group: "TOTAL_SALES_GROUP_BY", aggs: "TOTAL_SALES_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 500, oc: "date", od: "ASC", strict: true },
+  { rk: "ppc-performance:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
+  // Listing Optimizer (richer SQP + richer content catalog; both intentionally unshared)
+  { rk: "listing-optimizer:sqp-weekly", file: "listing-optimizer.js", cols: "SQP_COLUMNS", group: null, aggs: null, src: "sqp-weekly", limit: 50000, oc: "date", od: "ASC", strict: true, policy: "degraded" },
+  { rk: "listing-optimizer:catalog", file: "listing-optimizer.js", cols: "CATALOG_CONTENT_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
 ];
 
-test("insight contracts (Sales Movers / Buy Box / Returns) match their executable builder constants", () => {
+const DEGRADED_POLICY = { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" };
+
+test("insight contracts (all six reports) match their executable builder constants", () => {
   for (const s of INSIGHT_SPEC) {
     const c = byKey(REPORT_SOURCE_CONTRACTS[s.rk.split(":")[0]], s.rk);
     assert.ok(c, s.rk + " must be declared");
@@ -877,7 +908,12 @@ test("insight contracts (Sales Movers / Buy Box / Returns) match their executabl
     assert.equal(c.orderByColumn, s.oc, s.rk + " orderByColumn");                                   // (4) exact ordering
     assert.equal(c.orderByDirection, s.od, s.rk + " orderByDirection");
     assert.equal(Boolean(c.strict), Boolean(s.strict), s.rk + " strict flag");                      // (6) strict flag
-    assert.equal(c.availabilityPolicy, undefined, s.rk + " has no availabilityPolicy (default dataset)"); // (7/8)
+    if (s.policy === "degraded") {                                                                  // (7) optional source degrades
+      assert.deepEqual(c.availabilityPolicy, DEGRADED_POLICY, s.rk + " must carry the degraded policy");
+      assert.equal(sourceDisabledOutcome(c.availabilityPolicy).blocks, false, s.rk + " must NOT block the cycle");
+    } else {                                                                                        // (8) required/default source: no policy
+      assert.equal(c.availabilityPolicy, undefined, s.rk + " must have no availabilityPolicy");
+    }
   }
 });
 
@@ -983,6 +1019,98 @@ test("(16/17) insight resolver fails closed: empty scope => [], missing declared
   assert.deepEqual(reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: [], windowsByRequestKey: {} }), []);
   const partial = { ...smWin }; delete partial["sales-movers:traffic"];
   assert.throws(() => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: partial }));
+});
+
+/* =============== Insight reports: Listing Health / PPC / Listing Optimizer =============== */
+
+const lhWin = {
+  "listing-health:listings": [{ from: null, to: null }],
+  "listing-health:listings-raw": [{ from: null, to: null }],
+  "listing-health:sales": [{ from: "2025-07-08", to: "2025-08-06" }],
+  "listing-health:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+  "listing-health:catalog": [{ from: null, to: null }],
+};
+const ppcWin = {
+  "ppc-performance:total-sales": [{ from: "2025-07-08", to: "2025-08-06" }],
+  "ppc-performance:catalog": [{ from: null, to: null }],
+};
+const optWin = {
+  "listing-optimizer:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }],
+  "listing-optimizer:catalog": [{ from: null, to: null }],
+};
+
+for (const [rep, win] of [["listing-health", lhWin], ["ppc-performance", ppcWin], ["listing-optimizer", optWin]]) {
+  for (const n of [0, 1, 5, 6, 11]) {
+    test(`${rep} resolver reproduces the transport chunks + hashes for ${n} IDs`, () => {
+      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win });
+      if (n === 0) { assert.deepEqual(got, []); return; } // (17) empty scope
+      const exp = transportExpected(rep, "k", ids(n), win);
+      assert.equal(got.length, exp.length, "same request count");
+      const key = (r) => [r.requestKey, r.from, r.to, r.sellerOrVendorIds.join(",")].join("|");
+      const gm = new Map(got.map((r) => [key(r), r.requestHash]));
+      for (const e of exp) assert.equal(gm.get(key(e)), e.requestHash, e.requestKey + " hash mismatch"); // (10)
+    });
+  }
+}
+
+test("(9) resolved insight jobs carry a strict boolean + normalized availabilityPolicy (degraded => blocks:false)", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "listing-health", apiKey: "k", ids: ["A1", "A2", "A3", "A4", "A5", "A6"], windowsByRequestKey: lhWin });
+  const raw = jobs.find((r) => r.requestKey === "listing-health:listings-raw");
+  const cat = jobs.find((r) => r.requestKey === "listing-health:catalog");
+  assert.equal(raw.strict, true);
+  assert.deepEqual(raw.availabilityPolicy, DEGRADED_POLICY);           // (9) frozen degraded policy on the job
+  assert.equal(sourceDisabledOutcome(raw.availabilityPolicy).blocks, false); // degraded never blocks the cycle
+  assert.equal(cat.strict, true);
+  assert.equal(cat.availabilityPolicy, null);                          // required source: explicit null, not undefined
+  const opt = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optWin })
+    .find((r) => r.requestKey === "listing-optimizer:sqp-weekly");
+  assert.deepEqual(opt.availabilityPolicy, DEGRADED_POLICY);
+});
+
+test("(13) Listing Optimizer's catalog and SQP do NOT deduplicate with the common catalog / Keyword Rank SQP", () => {
+  const hashAt = (c, from, to) => sourceRequestIdentity({
+    apiKey: "k", sourceId: sourceContractForKey(c.sourceKey).ids[0], columns: c.columns, ids: ["A1"],
+    from, to, limit: c.limit, options: { orderByColumn: c.orderByColumn, orderByDirection: c.orderByDirection },
+  }).requestHash;
+  const optCat = byKey(REPORT_SOURCE_CONTRACTS["listing-optimizer"], "listing-optimizer:catalog");
+  const commonCat = byKey(REPORT_SOURCE_CONTRACTS["sales-movers"], "sales-movers:catalog");
+  assert.equal(optCat.sourceKey, commonCat.sourceKey);         // same product-catalog source...
+  assert.notDeepEqual(optCat.columns, commonCat.columns);      // ...richer content columns...
+  assert.notEqual(hashAt(optCat, null, null), hashAt(commonCat, null, null)); // ...so a distinct identity at the SAME no-date window
+  const optSqp = byKey(REPORT_SOURCE_CONTRACTS["listing-optimizer"], "listing-optimizer:sqp-weekly");
+  const kwSqp = byKey(REPORT_SOURCE_CONTRACTS["keyword-rank"], "keyword-rank:sqp-weekly");
+  assert.equal(optSqp.sourceKey, kwSqp.sourceKey);             // same sqp-weekly source...
+  assert.notDeepEqual(optSqp.columns, kwSqp.columns);          // ...different column set...
+  assert.notEqual(hashAt(optSqp, "2025-05-14", "2025-08-06"), hashAt(kwSqp, "2025-05-14", "2025-08-06")); // ...distinct even at one window
+});
+
+test("(14) PPC creates NO Ads DataDoe source jobs; ads are declared derived from persisted rows", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin });
+  assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))].sort(), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
+  for (const c of REPORT_SOURCE_CONTRACTS["ppc-performance"]) assert.ok(!/^ads-/.test(c.sourceKey), "PPC owns no Ads source");
+  assert.deepEqual(REPORT_DERIVED_SOURCE_KEYS["ppc-performance"], ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"]);
+  assert.ok(/getAdsDailySourceRows/.test(builderText("ppc.js")), "PPC builder must read persisted ads rows, not fetch an export");
+});
+
+test("(15) Priority Feed and Brand View are derived-only: no owned contracts, resolver returns null", () => {
+  for (const k of ["priority-feed", "brand-view"]) {
+    assert.equal(REPORT_SOURCE_CONTRACTS[k], undefined, k + " must own no source contracts");
+    assert.equal(reportSourceRequestHashes({ reportKey: k, apiKey: "k", ids: ["A1"], windowsByRequestKey: {} }), null);
+    assert.ok(REPORT_DERIVED_ONLY.includes(k), k + " must be registered derived-only");
+  }
+});
+
+test("(dependency map) every report is scheduler-source-declared OR explicitly derived-only (none unaudited)", () => {
+  const declared = new Set(declaredReportKeys());
+  const derivedOnly = new Set(REPORT_DERIVED_ONLY);
+  for (const k of derivedOnly) assert.ok(!declared.has(k), k + " cannot be both declared and derived-only");
+  for (const key of Object.keys(REPORT_SOURCE_REQUIREMENTS)) {
+    assert.ok(declared.has(key) || derivedOnly.has(key), key + " is neither scheduler-declared nor derived-only");
+  }
+  for (const k of derivedOnly) {
+    assert.equal(REPORT_SOURCE_CONTRACTS[k], undefined, k + " must own no source contracts");
+    assert.equal(reportSourceRequestHashes({ reportKey: k, apiKey: "k", ids: ["A1"], windowsByRequestKey: {} }), null);
+  }
 });
 
 console.log("\n" + passed + " assertions passed");

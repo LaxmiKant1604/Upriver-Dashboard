@@ -162,6 +162,28 @@ const RET_TRAFFIC_AGGREGATIONS = [
   { column: "units_refunded", aggregation: "sum", alias: "units_refunded_sum" },
 ];
 
+// listing-health.js
+const LH_LISTING_COLUMNS = ["sku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "listing_pending_quantity", "fba_quantity_available", "fba_quantity_inbound", "fba_quantity_reserved", "listing_fulfillment_channel", "listing_open_date"];
+const LH_LISTING_RAW_COLUMNS = ["child_asin", "sku", "summaries", "issues", "offers", "fulfillment_availability"];
+const LH_SALES_COLUMNS = ["sku", "child_asin", "currency"];
+const LH_SALES_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
+  { column: "total_units_sold", aggregation: "sum", alias: "units_sum" },
+  { column: "profit", aggregation: "sum", alias: "profit_sum" },
+];
+
+// ppc.js — the ONE DataDoe export PPC makes (TACoS denominator); ads are derived.
+const PPC_TOTAL_SALES_COLUMNS = ["date"];
+const PPC_TOTAL_SALES_AGGREGATIONS = [
+  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
+  { column: "total_units", aggregation: "sum", alias: "units_sum" },
+];
+
+// listing-optimizer.js — richer SQP + a richer content catalog; deliberately NOT
+// deduplicated with Keyword Rank's SQP or the common insight catalog (columns differ).
+const OPT_SQP_COLUMNS = ["date", "child_asin", "search_query", "search_query_volume", "search_query_total_impression_count", "search_query_total_click_count", "search_query_total_cart_add_count", "search_query_total_purchase_count", "child_asin_impression_count", "child_asin_click_count", "child_asin_add_to_cart_count", "child_asin_purchase_count", "child_asin_organic_search_rank", "child_asin_median_click_price_value", "child_asin_median_click_price_currency"];
+const OPT_CATALOG_COLUMNS = ["child_asin", "parent_asin", "product_name", "product_brand", "product_root_category_name", "product_root_best_selling_rank", "product_bullet_point_1", "product_bullet_point_2", "product_bullet_point_3", "product_bullet_point_4", "product_bullet_point_5", "product_description", "product_image_url"];
+
 export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "brand-sales": [
     {
@@ -583,6 +605,132 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
   ],
+  "listing-health": [
+    {
+      requestKey: "listing-health:listings",
+      sourceKey: "listings",
+      columns: LH_LISTING_COLUMNS,
+      limit: 20000, // ROW_LIMITS.listings
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date listings snapshot)",
+      strict: true,
+    },
+    {
+      requestKey: "listing-health:listings-raw",
+      sourceKey: "listings-raw",
+      columns: LH_LISTING_RAW_COLUMNS,
+      limit: 20000, // ROW_LIMITS.listings
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; optional listing-issues enrichment)",
+      strict: true,
+      // Optional enrichment: a disabled Listings Raw table is a setup state, not a
+      // failure. The report is still saved with issuesAvailable:false, so this source
+      // degrades (does NOT block the cycle).
+      availabilityPolicy: { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" },
+    },
+    {
+      requestKey: "listing-health:sales",
+      sourceKey: "profit-by-sku-date",
+      columns: LH_SALES_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: LH_SALES_COLUMNS,
+      aggregations: LH_SALES_AGGREGATIONS,
+      orderByColumn: "sku",
+      orderByDirection: "ASC",
+      windowKind: "range:asOf-29d..asOf",
+      strict: true,
+    },
+    {
+      requestKey: "listing-health:inventory",
+      sourceKey: "fba-inventory-health",
+      columns: INSIGHT_INVENTORY_COLUMNS,
+      limit: 15000, // ROW_LIMITS.inventory
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "DESC",
+      windowKind: "range:asOf-10d..asOf (shared FBA inventory export)",
+      strict: true,
+    },
+    {
+      requestKey: "listing-health:catalog",
+      sourceKey: "product-catalog",
+      columns: INSIGHT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; shared common insight catalog)",
+      strict: true,
+    },
+  ],
+  "ppc-performance": [
+    {
+      requestKey: "ppc-performance:total-sales",
+      sourceKey: "sales-traffic-asin-date",
+      columns: PPC_TOTAL_SALES_COLUMNS,
+      limit: 500, // ROW_LIMITS.dateRollup
+      groupBy: PPC_TOTAL_SALES_COLUMNS,
+      aggregations: PPC_TOTAL_SALES_AGGREGATIONS,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      // The only DataDoe export PPC makes: total account sales for the TACoS
+      // denominator (no Ads table carries it). All advertising figures are DERIVED
+      // from persisted ads_daily_source_rows — PPC creates NO Ads export.
+      windowKind: "range:asOf-29d..asOf",
+      strict: true,
+    },
+    {
+      requestKey: "ppc-performance:catalog",
+      sourceKey: "product-catalog",
+      columns: INSIGHT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; shared common insight catalog)",
+      strict: true,
+    },
+  ],
+  "listing-optimizer": [
+    {
+      requestKey: "listing-optimizer:sqp-weekly",
+      sourceKey: "sqp-weekly",
+      columns: OPT_SQP_COLUMNS,
+      limit: 50000, // ROW_LIMITS.aggregated
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "ASC",
+      // SQP is not a default DataDoe table. A disabled organisation gets a valid
+      // sqpAvailable:false snapshot, so this source DEGRADES (does not block).
+      windowKind: "range:asOf-84d..asOf (>= 8 weeks of SQP)",
+      strict: true,
+      availabilityPolicy: { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" },
+    },
+    {
+      requestKey: "listing-optimizer:catalog",
+      sourceKey: "product-catalog",
+      columns: OPT_CATALOG_COLUMNS,
+      limit: 20000, // ROW_LIMITS.catalog
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      // Richer content columns (bullets, description, image, BSR) than the common
+      // insight catalog => a DISTINCT request identity; intentionally NOT shared.
+      windowKind: "none (no-date; richer content catalog, NOT the common one)",
+      strict: true,
+    },
+  ],
 });
 
 // Sources represented by already-scheduled/persisted data rather than a report-
@@ -590,7 +738,19 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
 // intentional derived dependency from an accidentally omitted source.
 export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   "daily-reporting": ["ads-campaign-date"],
+  // PPC Performance reads ALL advertising figures from the persisted Ads history the
+  // scheduled worker maintains (ads_daily_source_rows). Opening/refreshing PPC never
+  // runs an Amazon Ads export, so these four Ads sources are derived, not owned.
+  "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
 });
+
+// Reports that create ZERO owned DataDoe exports: every figure comes from other
+// reports' persisted rows. Declaring them explicitly lets the dependency-map test
+// prove every sidebar report is covered exactly one way (owned OR derived-only),
+// never silently unaudited.
+//   * brand-view    — composed from brand-sales rows + persisted Ads + fba-plan.
+//   * priority-feed — a command centre over the six insight reports' outputs.
+export const REPORT_DERIVED_ONLY = Object.freeze(["brand-view", "priority-feed"]);
 
 // Deterministic, scheduler-owned derivation strategy for reports whose saved source
 // rows produce more than one UI output. Not controlled by browser input.
@@ -609,6 +769,20 @@ export const REPORT_DERIVATION = Object.freeze({
       + "same aggregations, coarser grouping); reconcile superset-summed all-brand vs the "
       + "compact total for one account before permanently retiring the compact export.",
   },
+  "ppc-performance": {
+    outputs: ["account/campaign/ASIN/target/search-term PPC metrics + TACoS"],
+    derivedFrom: ["ads_daily_source_rows", "ppc-performance:total-sales", "ppc-performance:catalog"],
+    strategy:
+      "All advertising figures come from persisted ads_daily_source_rows (four scheduled "
+      + "Ads sources), joined to product names via the common catalog. The scheduler makes "
+      + "exactly one small grouped total-sales export for the TACoS denominator; if it fails "
+      + "or the account mixes currencies, TACoS degrades to unavailable and the rest of the "
+      + "report is still saved. No Ads DataDoe export is ever created by this report.",
+    adsFrom: "ads_daily_source_rows (scheduled Ads sources: campaign/asin/targeting/search-terms)",
+    liveGate:
+      "Confirm the scheduled Ads worker keeps ads_daily_source_rows fresh per account before "
+      + "PPC is enabled in Phase 1c; the report has no export fallback for stale Ads history.",
+  },
 });
 
 // Phase 1c must not enable a partially declared report as though it covered every
@@ -625,6 +799,9 @@ export const REPORT_SOURCE_COVERAGE = Object.freeze({
   "sales-movers": "complete", // traffic+ads (2 windows each), inventory, catalog, latest-date probe
   "buy-box-loss": "complete", // raw daily (4x7-day slices), inventory, catalog
   "returns-leakage": "complete", // returns raw, settlements, traffic, catalog
+  "listing-health": "complete", // listings, listings-raw (degraded), sales, inventory, catalog
+  "ppc-performance": "complete", // total-sales export + catalog; ads DERIVED from persisted rows
+  "listing-optimizer": "complete", // SQP weekly (degraded) + richer content catalog
 });
 
 export function declaredReportKeys() {
