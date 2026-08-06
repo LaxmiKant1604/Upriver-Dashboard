@@ -1,5 +1,25 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b operational contracts approved (Codex, 2026-08-06)
+
+Final review of commits `5afd393` and `ab5d31a` on
+`feature/scheduler-v2` found no remaining contract-layer issue. Availability policies
+now enforce exactly `terminal -> blocked` and
+`degraded -> save-unavailable-snapshot`; crossed pairs fail closed through both
+normalization and `sourceDisabledOutcome()`. The earlier strict-cap, immutable concrete
+job policy, typed SQP fallback, five-ID batching, keyed windows, and primary/secondary
+organization isolation corrections remain intact. The pinned request hash is unchanged.
+
+`npm run verify` passed: 54 insight + 60 Brand View + 23 sync + 6 source-cache +
+22 Scheduler v2 + 7 source-identity + 85 report-contract assertions + production
+build. Phase 1b's currently declared operational-report contract foundation is
+**approved**. Next work is the separately reviewable declaration/parity-test pass for
+the remaining six insight reports; Phase 1c must still wait until those declarations
+are reviewed. Live gates remain Daily superset-vs-compact reconciliation and controlled
+per-organization probes for SQP/content/listings availability. No push, merge,
+deployment, migration, insight declaration, or Phase 1c work was performed in this
+approval review.
+
 ## Scheduler v2 Phase 1b — availabilityPolicy pair consistency fixed (2026-08-06)
 
 Fixed the final policy-consistency finding (below) on `feature/scheduler-v2` (not
