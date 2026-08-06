@@ -10,7 +10,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
-  REPORT_SOURCE_CONTRACTS, reportSourceRequestHashes, declaredReportKeys, declaredRequestKeys,
+  REPORT_DERIVED_SOURCE_KEYS,
+  REPORT_SOURCE_CONTRACTS,
+  reportSourceRequestHashes,
+  declaredReportKeys,
+  declaredRequestKeys,
+  reportSourceCoverage,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -107,16 +112,31 @@ test("sku-pl contract matches SKU_PL_* constants + has stable requestKey", () =>
 
 /* --------------------------------- coverage --------------------------------- */
 
-test("declared reports are known and their source keys match the requirements", () => {
+test("owned plus explicitly derived source keys exactly cover each report's requirements", () => {
   for (const key of declaredReportKeys()) {
-    assert.deepEqual(REPORT_SOURCE_CONTRACTS[key].map((c) => c.sourceKey), REPORT_SOURCE_REQUIREMENTS[key]);
+    const required = REPORT_SOURCE_REQUIREMENTS[key];
+    assert.ok(required, key + " missing from REPORT_SOURCE_REQUIREMENTS");
+    const owned = REPORT_SOURCE_CONTRACTS[key].map((c) => c.sourceKey);
+    const represented = [...new Set([...owned, ...(REPORT_DERIVED_SOURCE_KEYS[key] || [])])];
+    assert.deepEqual(represented, required, key + " must represent every required source exactly");
+    assert.ok(reportSourceCoverage(key), key + " must declare its coverage status");
   }
   assert.deepEqual(declaredRequestKeys("brand-sales"), ["brand-sales:order-lines", "brand-sales:catalog"]);
-  assert.equal(declaredRequestKeys("fba-plan"), null);
+  assert.equal(declaredRequestKeys("listing-health"), null); // insight report intentionally not declared yet
+  assert.equal(reportSourceCoverage("daily-reporting"), "all-brand-only");
+  assert.equal(reportSourceCoverage("fba-plan"), "complete");
 });
 
-test("an undeclared report resolves to null", () => {
-  assert.equal(reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
+test("request keys are unique within a report and prefixed by the report key", () => {
+  for (const key of declaredReportKeys()) {
+    const keys = REPORT_SOURCE_CONTRACTS[key].map((c) => c.requestKey);
+    assert.equal(new Set(keys).size, keys.length, key + " has duplicate request keys");
+    for (const rk of keys) assert.ok(rk.startsWith(key + ":"), rk + " must start with '" + key + ":'");
+  }
+});
+
+test("an undeclared (insight) report resolves to null", () => {
+  assert.equal(reportSourceRequestHashes({ reportKey: "listing-health", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
 });
 
 /* ----------------- exact 5-ID chunking vs the live transport ----------------- */
@@ -237,6 +257,183 @@ test("primary and dd-secondary organizations remain isolated (different hashes)"
     assert.notEqual(p[i].requestHash, s[i].requestHash);
     assert.notEqual(p[i].organizationFingerprint, s[i].organizationFingerprint);
   }
+});
+
+/* ===================== next operational batch: recon / daily / fba ===================== */
+
+const recon = REPORT_SOURCE_CONTRACTS.reconciliation;
+const daily = REPORT_SOURCE_CONTRACTS["daily-reporting"];
+const fba = REPORT_SOURCE_CONTRACTS["fba-plan"];
+const byKey = (list, rk) => list.find((c) => c.requestKey === rk);
+
+// window fixtures
+const reconMonths = ["2025-03", "2025-04", "2025-05", "2025-06", "2025-07", "2025-08"]
+  .map((m) => ({ from: m + "-01", to: m + "-28" }));
+const reconRange = [{ from: "2025-03-01", to: "2025-08-28" }];
+const reconWin = { "reconciliation:order-lines": reconMonths, "reconciliation:settlements": reconMonths, "reconciliation:catalog": reconRange };
+
+const fbaMonths = [{ from: "2025-05-01", to: "2025-05-31" }, { from: "2025-06-01", to: "2025-06-30" }, { from: "2025-07-01", to: "2025-07-31" }, { from: "2025-08-01", to: "2025-08-06" }];
+const fbaBase = {
+  "fba-plan:monthly-units": fbaMonths,
+  "fba-plan:current-daily-dates": [{ from: "2025-08-01", to: "2025-08-06" }],
+  "fba-plan:catalog": [{ from: "2025-05-01", to: "2025-08-06" }],
+  "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
+};
+const fbaWithAwd = { ...fbaBase, "fba-plan:awd": [{ from: null, to: null }] };
+
+/* --- executable parity: reconciliation --- */
+test("reconciliation order-lines contract matches RECONCILIATION_ORDER_* constants", () => {
+  const c = byKey(recon, "reconciliation:order-lines");
+  assert.deepEqual(c.columns, constArray("RECONCILIATION_ORDER_COLUMNS"));
+  assert.deepEqual(c.groupBy, constArray("RECONCILIATION_ORDER_COLUMNS")); // GROUP_BY = [...COLUMNS]
+  assert.deepEqual(c.aggregations, constAggregations("RECONCILIATION_ORDER_AGGREGATIONS"));
+  assert.equal(c.limit, constNumber("RECONCILIATION_ROW_LIMIT"));
+  assert.equal(c.orderByColumn, "date");
+  assert.equal(c.orderByDirection, "ASC");
+});
+test("reconciliation settlements contract matches RECONCILIATION_SETTLEMENT_* constants", () => {
+  const c = byKey(recon, "reconciliation:settlements");
+  assert.deepEqual(c.columns, constArray("RECONCILIATION_SETTLEMENT_COLUMNS"));
+  assert.deepEqual(c.groupBy, constArray("RECONCILIATION_SETTLEMENT_COLUMNS"));
+  assert.deepEqual(c.aggregations, constAggregations("RECONCILIATION_SETTLEMENT_AGGREGATIONS"));
+  assert.equal(c.limit, constNumber("RECONCILIATION_ROW_LIMIT"));
+});
+test("reconciliation catalog uses PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT, no groupBy/agg", () => {
+  const c = byKey(recon, "reconciliation:catalog");
+  assert.deepEqual(c.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
+  assert.equal(c.limit, constNumber("CATALOG_ROW_LIMIT"));
+  assert.equal(c.groupBy, null);
+  assert.equal(c.aggregations, null);
+  assert.equal(c.orderByColumn, "child_asin");
+});
+
+/* --- executable parity: daily-reporting --- */
+test("daily-reporting sales contract matches DAILY_SALES_* constants (ads are derived, not declared)", () => {
+  const c = daily[0];
+  assert.equal(daily.length, 1);
+  assert.deepEqual(c.columns, constArray("DAILY_SALES_COLUMNS"));
+  assert.deepEqual(c.groupBy, constArray("DAILY_SALES_GROUP_BY"));
+  assert.deepEqual(c.aggregations, constAggregations("DAILY_SALES_AGGREGATIONS"));
+  assert.equal(c.limit, constNumber("DAILY_ROW_LIMIT"));
+});
+
+/* --- executable parity: fba-plan --- */
+test("fba-plan monthly-units matches the inline child_asin units export (planAsinUnits)", () => {
+  const c = byKey(fba, "fba-plan:monthly-units");
+  assert.deepEqual(c.columns, ["child_asin"]);
+  assert.deepEqual(c.groupBy, ["child_asin"]);
+  assert.deepEqual(c.aggregations, [{ column: "total_units", aggregation: "sum", alias: "units_sum" }]);
+  assert.equal(c.limit, constNumber("PLAN_SALES_ROW_LIMIT"));
+  assert.equal(c.orderByColumn, "child_asin");
+  assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["child_asin"]'), "planAsinUnits child_asin export must exist");
+});
+test("fba-plan current-daily-dates matches the inline date units export (limit 500)", () => {
+  const c = byKey(fba, "fba-plan:current-daily-dates");
+  assert.deepEqual(c.columns, ["date"]);
+  assert.deepEqual(c.groupBy, ["date"]);
+  assert.deepEqual(c.aggregations, [{ column: "total_units", aggregation: "sum", alias: "units_sum" }]);
+  assert.equal(c.limit, 500);
+  assert.equal(c.orderByColumn, "date");
+  assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["date"]'), "current-daily date export must exist");
+  assert.ok(DD.includes("current.from, current.to, 500,"), "date export limit 500 must exist");
+});
+test("fba-plan catalog / inventory-health / awd match their constants", () => {
+  const cat = byKey(fba, "fba-plan:catalog");
+  assert.deepEqual(cat.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
+  assert.equal(cat.limit, constNumber("CATALOG_ROW_LIMIT"));
+  const inv = byKey(fba, "fba-plan:inventory-health");
+  assert.deepEqual(inv.columns, constArray("FBA_HEALTH_COLUMNS"));
+  assert.equal(inv.limit, constNumber("PLAN_INVENTORY_ROW_LIMIT"));
+  assert.equal(inv.orderByColumn, "date");
+  assert.equal(inv.orderByDirection, "DESC");
+  const awd = byKey(fba, "fba-plan:awd");
+  assert.deepEqual(awd.columns, constArray("LISTINGS_AWD_COLUMNS"));
+  assert.equal(awd.limit, constNumber("CATALOG_ROW_LIMIT"));
+  assert.deepEqual(awd.marketplaceCountries, ["US"]);
+  assert.equal(awd.orderByColumn, "child_asin");
+});
+
+/* --- monthly segmentation, no cross-product --- */
+test("reconciliation segments orders + settlements per month; catalog stays a single range", () => {
+  const got = reportSourceRequestHashes({ reportKey: "reconciliation", apiKey: "k", ids: ["A1"], windowsByRequestKey: reconWin });
+  assert.equal(got.filter((r) => r.requestKey === "reconciliation:order-lines").length, 6);
+  assert.equal(got.filter((r) => r.requestKey === "reconciliation:settlements").length, 6);
+  assert.equal(got.filter((r) => r.requestKey === "reconciliation:catalog").length, 1);
+  assert.equal(got.length, 13); // 6 + 6 + 1, single chunk (no cross-product)
+  assert.equal(new Set(got.filter((r) => r.requestKey === "reconciliation:order-lines").map((r) => r.requestHash)).size, 6);
+});
+test("fba-plan monthly-units has one request per month; total is additive, not multiplied", () => {
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:monthly-units").length, 4);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:current-daily-dates").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:catalog").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:inventory-health").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
+  assert.equal(got.length, 8); // 4+1+1+1+1
+});
+
+/* --- same source id, different identity, never shared --- */
+test("fba-plan's two Sales & Traffic exports have distinct identities even at the same window", () => {
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
+  const mu = got.find((r) => r.requestKey === "fba-plan:monthly-units" && r.from === "2025-08-01");
+  const dd = got.find((r) => r.requestKey === "fba-plan:current-daily-dates");
+  assert.equal(mu.sourceId, dd.sourceId); // same Sales & Traffic source id
+  assert.equal(mu.from, dd.from);
+  assert.equal(mu.to, dd.to); // same window
+  assert.notEqual(mu.requestHash, dd.requestHash); // different columns => not a shared export
+});
+
+/* --- country-driven US-only AWD --- */
+test("fba-plan resolves without AWD for a non-US account", () => {
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "IN" });
+  assert.ok(got.length === 7);
+  assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"));
+});
+test("fba-plan resolves AWD as a no-date request for a US account", () => {
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
+  const awd = got.filter((r) => r.requestKey === "fba-plan:awd");
+  assert.equal(awd.length, 1);
+  assert.equal(awd[0].from, null);
+  assert.equal(awd[0].to, null);
+  assert.equal(awd[0].requestMeta.from, null);
+});
+test("fba-plan requires marketplace metadata for its conditional AWD contract", () => {
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase }),
+    /Marketplace country is required/,
+  );
+});
+test("US fba-plan cannot silently omit its AWD request", () => {
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "US" }),
+    /Missing windows.*fba-plan:awd/,
+  );
+});
+test("non-US fba-plan rejects an accidental AWD request", () => {
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "IN" }),
+    /does not apply.*IN/,
+  );
+});
+test("empty fba-plan scope returns before country and window validation", () => {
+  assert.deepEqual(reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: [] }), []);
+});
+
+/* --- 0/1/5/6/11-ID chunking for the new batch (reconciliation) --- */
+for (const n of [0, 1, 5, 6, 11]) {
+  test(`reconciliation reproduces the transport chunks + hashes for ${n} IDs`, () => {
+    const got = reportSourceRequestHashes({ reportKey: "reconciliation", apiKey: "primary", ids: ids(n), windowsByRequestKey: reconWin });
+    const exp = transportExpected("reconciliation", "primary", ids(n), reconWin);
+    assert.equal(got.length, exp.length);
+    for (let i = 0; i < exp.length; i += 1) {
+      assert.deepEqual(got[i].sellerOrVendorIds, exp[i].sellerOrVendorIds);
+      assert.equal(got[i].requestHash, exp[i].requestHash);
+    }
+  });
+}
+
+test("validation still applies to the new reports (missing required key throws)", () => {
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:monthly-units": fbaMonths }, marketplaceCountry: "IN" }), /Missing windows/);
 });
 
 console.log("\n" + passed + " assertions passed");
