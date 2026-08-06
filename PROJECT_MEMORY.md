@@ -3505,6 +3505,68 @@ exact 06:00 local time becomes a business requirement.
   `feature/design-system` remains untouched. Do not begin Phase 1d until these
   Phase 1c production-boundary defects are corrected and reviewed.
 
+### Scheduler v2 Phase 1c correction re-review (Codex, 2026-08-06)
+
+- Re-reviewed Claude's correction commits `3de9f7a`, `8a8f9a7`, and `33eceec`
+  on `feature/scheduler-v2` (HEAD `33eceec`). The prior metadata merge,
+  persisted export-id, malformed-payload, cumulative-count, and basic
+  connection-mismatch corrections are present, and the changed server modules
+  pass `node --check`. Phase 1c is nevertheless **not approved** because four
+  production-boundary issues remain.
+- **Blocker: organization routing still has fail-open defaults.**
+  `plannedSourceJob`, `mergeJob`, the planner, and the Supabase upsert still
+  replace a missing `connectionId` with `primary`; `makeDataDoeAdapter` also
+  accepts a missing organization fingerprint because it compares only when the
+  fingerprint is truthy. This contradicts the adapter's fail-closed contract.
+  Require both an explicit allowed connection id and a non-empty fingerprint;
+  verify the fingerprint unconditionally before every create/poll/download;
+  remove primary defaults from Scheduler v2; and test missing connection,
+  missing fingerprint, unknown connection, mismatched fingerprint, and missing
+  secondary key all produce zero DataDoe calls.
+- **Blocker: missing/corrupt persisted source data is reconstructed as a valid
+  empty success.** `reconstructSignals` converts a null cache read or a payload
+  without an array to `[]`, then sends `validated:true` to the signal producer.
+  A missing SQP payload can therefore activate Listing Optimizer catalog work
+  or Keyword monthly fallback as though DataDoe genuinely returned zero rows.
+  Only `{ rows: [] }` from a successfully loaded, validated cache object may be
+  treated as a real empty result. A cache miss/read error/malformed payload must
+  produce no activating signal and must be recorded as a safe source-cache
+  failure/unavailable state.
+- **Blocker: a normal serverless deadline during poll/download destroys the
+  resumable checkpoint.** `withDataDoeDeadline` raises
+  `DataDoeDeadlineError`, but `runJobLifecycle` records it as `fetch_status =
+  failed`. The saved `export_id` is then never polled again in that cycle even
+  though polling/downloading an existing export spends no second create-export
+  token and the migration explicitly permits continuation. Treat execution
+  deadline deferral after an export id is saved as resumable `attempted`, not a
+  terminal/failed source; preserve the export id and resume it on the next
+  bounded invocation. Keep genuine DataDoe processing timeouts/failures as
+  failed. Add a fresh-invocation test that hits the deadline during poll and
+  later succeeds with exactly one create-export.
+- **Blocker: the new source-cache publish is not safe under an ambiguous
+  metadata response.** After uploading the immutable object,
+  `atomicSaveSourcePayload` deletes that object whenever `metadata.write`
+  throws or returns no row. A network timeout can occur after Postgres has
+  committed the new pointer; deleting the object then leaves the committed
+  pointer broken and loses last-known-good readability. Never delete a newly
+  uploaded immutable object on an ambiguous pointer-write result. Leave it as
+  a harmless orphan and clean unreferenced versions later; only prune the
+  previous object after a positively confirmed pointer read/compare. Add a test
+  for "database commit succeeded but client response threw" and concurrency
+  between two cycles for the same request hash.
+- The Windows test artifact blocker is still reproducible in this Codex
+  checkout. Plain reads of both `scripts/scheduler-v2.test.mjs` and
+  `scripts/scheduler-v2-worker.test.mjs` hang; `node --check
+  scripts/scheduler-v2.test.mjs` and `npm run test:scheduler-v2` were each
+  terminated after 20-30 seconds without output. Therefore the claimed 350-test
+  run cannot be independently reproduced here, and full `npm run verify` was
+  not run because it invokes the same blocked suite. Resolve the checkout/read
+  hang using genuinely fresh accessible test artifacts and rerun focused plus
+  full verification in the Codex worktree.
+- No production migration, push, merge, deployment, live DataDoe call, or
+  Phase 1d work was performed. Keep Scheduler v2 in shadow mode and stop before
+  Phase 1d until these findings pass re-review.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
