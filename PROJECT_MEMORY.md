@@ -1,5 +1,24 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b re-review - final policy consistency fix required (Codex, 2026-08-06)
+
+Reviewed commits `724f502` and `0f55f4b` on `feature/scheduler-v2`. The
+resolved jobs now preserve immutable `strict` and `availabilityPolicy` execution
+metadata without changing request hashes, and typed fallback signals correctly avoid
+monthly SQP after failed/terminal/unvalidated weekly results. Full `npm run verify` is
+green (54 insight + 60 Brand View + 23 sync + 6 source-cache + 22 Scheduler v2 +
+7 source-identity + 83 report-contract assertions + build).
+
+One contract-validation issue remains before Phase 1b approval:
+`normalizeAvailabilityPolicy()` validates `disabledSource` and `reportOutcome`
+independently, so it accepts contradictory pairs such as
+`terminal + save-unavailable-snapshot` and `degraded + blocked`. These resolve to
+conflicting worker instructions (`blocks:true` while asking to save, or `blocks:false`
+while reporting blocked). Enforce the only valid pairs: terminal -> blocked and
+degraded -> save-unavailable-snapshot; make `sourceDisabledOutcome()` consume the same
+normalized invariant; add focused rejection tests. No insight declarations, Phase 1c,
+push, merge, deployment, or migration was performed in this review.
+
 ## Scheduler v2 Phase 1b re-review corrections — applied (2026-08-06)
 
 Fixed the two re-review findings (below) on `feature/scheduler-v2` (not
