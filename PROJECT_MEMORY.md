@@ -1,5 +1,34 @@
 # Project Memory
 
+## Scheduler v2 Phase 1b re-review - two corrections still required (Codex, 2026-08-06)
+
+Reviewed commits `625001f`, `4d1dd64`, and `7afb323` on
+`feature/scheduler-v2`. The Daily monthly row-cap guard is correctly placed before
+append/derivation, the Keyword monthly declaration is no longer unconditional, and
+HTTP 424 prose was replaced with structured source-disabled policies. Full
+`npm run verify` is green (54 insight + 60 Brand View + 23 sync + 6 source-cache +
+22 Scheduler v2 + 7 source-identity + 74 report-contract assertions + build).
+
+Phase 1b is nevertheless **not approved yet** because:
+
+1. `reportSourceRequestHashes()` drops execution semantics from its returned concrete
+   jobs. It does not return `strict` or `availabilityPolicy`, although Phase 1c is
+   expected to enforce those fields and the function documentation/tests claim each
+   result carries everything the worker needs. Return immutable execution metadata
+   (at least strict + availability policy), test it on strict/terminal/degraded jobs,
+   and make the worker contract explicit before Phase 1c.
+2. The fallback signal conflates a failed weekly source (`null`) with a successful
+   zero-period weekly result. A data-dependent fallback must run only from a validated
+   fresh or last-known-good weekly payload. A failed weekly fetch with no validated
+   payload must preserve the prior report and must not spend a monthly export merely
+   because `null` is interpreted as zero. Use a typed signal carrying validation/status
+   and period count; test success-empty, validated last-known-good, terminal-disabled,
+   and failed-without-last-known-good separately. Unsupported fallback condition types
+   should fail closed rather than silently return false.
+
+No insight declarations, Phase 1c work, push, merge, deployment, or Supabase migration
+was performed during this re-review.
+
 ## Scheduler v2 Phase 1b review blockers — fixed (2026-08-06)
 
 Fixed the three implementation blockers from "Phase 1b review - changes required"
@@ -49,6 +78,11 @@ during review.
 - Supabase usage showed database size `607 MB / 500 MB`, so the Free database quota
   has been exceeded. The intended upgrade is Supabase Pro through the existing Vercel
   Marketplace installation; the displayed Pro allowance is 8 GB disk per project.
+- On Pro, general-purpose database disk beyond the included 8 GB is billed at the
+  current Supabase rate of `$0.125/GB/month` (prorated by GB-hour). Paid-project disks
+  auto-expand near 90% utilization when overage/spend settings permit it; file-object
+  storage is a separate quota and charge. Current 607 MB database usage needs no
+  additional database-disk purchase after the Pro upgrade.
 - This is separate from the Vercel hosting plan. Upgrade the Supabase Marketplace
   resource, not merely the Vercel application hosting plan.
 - Architecture recommendation: direct Supabase management is preferable long-term for
