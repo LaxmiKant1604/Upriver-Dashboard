@@ -3301,6 +3301,65 @@ exact 06:00 local time becomes a business requirement.
   known DataDoe 402/404 responses; Ads history freshness for PPC; and one full
   non-US plus one full US cycle across both DataDoe organizations.
 
+### Official DataDoe documentation review (Codex, 2026-08-06)
+
+- Read the official DataDoe introduction, REST/API instructions, data-fetch
+  periods, marketplace timezone rules, exports overview, table-management, and
+  current subscription/pricing documentation. Primary references:
+  `https://www.datadoe.com/hub/docs/basics/introduction-to-datadoe`,
+  `https://www.datadoe.com/hub/docs/datadoe-data/data-fetch-periods`,
+  `https://www.datadoe.com/hub/docs/datadoe-data/orders-purchase-date-timezones`,
+  `https://api.datadoe.com/api/v1/spec/datadoe_api.md`, and
+  `https://www.datadoe.com/hub/docs/basics/subscription-pricing`.
+- **Scheduler freshness correction:** DataDoe's daily upstream fetch starts at
+  02:00 in each Seller/Vendor's local marketplace timezone. First data is
+  typically available by 03:00 local and 95% by 05:00 local. Therefore the
+  requested 02:00 UTC (07:30 IST) non-US kickoff and 10:30 UTC (16:00 IST) US
+  kickoff are enqueue times, not proof that every account is ready. The US and
+  Canada marketplace timezone is `America/Los_Angeles`; 10:30 UTC is only
+  02:30/03:30 there, so it is materially too early for the documented 95%
+  readiness point. Europe can also be only 03:00-04:00 local at the non-US
+  kickoff.
+- Phase 1c must calculate an authoritative marketplace business date and a
+  per-account `not_before`/freshness gate from marketplace timezone metadata.
+  It may enqueue one logical bucket cycle at the requested time, but workers
+  should fetch each account only after its local readiness threshold. A target
+  deferred because its local readiness time has not arrived is not a failed
+  DataDoe attempt and must not call create-export. The admin UI must distinguish
+  `waiting-for-upstream-window` from an actual failure.
+- DataDoe `DATE` columns are marketplace-local; `DATETIME` columns are UTC.
+  Report windows, latest completed day, MTD, and comparison periods must use
+  each account's documented marketplace timezone, not a global UTC/IST date.
+  US and Canada both use `America/Los_Angeles` in DataDoe.
+- REST API integration is rate-limited to 2 requests/second per organization;
+  HTTP 429 includes `Retry-After: 1`. Export creation is asynchronous, normally
+  under 30 seconds, with a recommended 5-second polling interval. The
+  one-create-export attempt invariant applies to the POST; status/download
+  polling should use bounded increasing backoff and honor `Retry-After` without
+  creating a second export.
+- Each export uses one source and one or more Seller/Vendor IDs. Completed
+  export files remain downloadable for only 24 hours, so validated source
+  payloads must be persisted to Supabase promptly rather than relying on the
+  DataDoe file URL as long-term storage.
+- **Current documented token pricing:** a standard-table export costs 2 AI
+  Tokens and a premium-table export costs 5 AI Tokens. Token cost is per
+  export, not one token per 50,000 rows. The 50,000-row value used by several
+  report builders is a truncation/safety cap, not the billing unit. DataDoe's
+  current Base plan documents 2,000 included monthly AI Tokens. Scheduler token
+  estimates and the future Admin Data Sync Center must use source-specific
+  standard/premium costs and five-ID batching to forecast real consumption.
+- Required DataDoe tables must be enabled separately in both organizations.
+  Enabled tables feed exports/API/MCP; disabled tables stop collection. Their
+  retention and row counts are managed in DataDoe Settings > Data. A source
+  toggle being enabled does not prove it has populated rows, so Phase 1c/live
+  validation still needs an explicit source-availability/readiness result.
+- Order Line Items has additional intraday refreshes at 10:00, 13:00, 16:00,
+  and 19:00 local, while Listings/FBA Inventory and selected Ads tables also
+  have documented intraday updates. Morning snapshots should identify their
+  actual latest completed data date and must not present an incomplete current
+  day as final. Ads rolling re-fetch/upsert remains necessary for attribution
+  corrections.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
