@@ -22,6 +22,12 @@ import {
   evaluateFallbackCondition,
   sourceDisabledOutcome,
   normalizeAvailabilityPolicy,
+  validateStagedSignal,
+  evaluateStagedActivation,
+  salesMoversWindows,
+  validateAdsCurrencySignal,
+  evaluateAdsCurrencyGate,
+  normalizeFailurePolicy,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -955,10 +961,16 @@ const retWin = {
   "returns-leakage:catalog": [{ from: null, to: null }],
 };
 
-for (const [rep, win] of [["sales-movers", smWin], ["buy-box-loss", bbWin], ["returns-leakage", retWin]]) {
+// Typed signals that activate the staged / gated downstream jobs. `smWin` traffic/ads
+// windows are exactly salesMoversWindows("2025-07-30").
+const SM_PROBE_OK = { "sales-movers:sales-latest-probe": { status: "success", validated: true, latestReportedDate: "2025-07-30" } };
+const OPT_SQP_OK = { "listing-optimizer:sqp-weekly": { status: "success", validated: true } };
+const PPC_CUR_OK = { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1 } };
+
+for (const [rep, win, sig] of [["sales-movers", smWin, SM_PROBE_OK], ["buy-box-loss", bbWin, undefined], ["returns-leakage", retWin, undefined]]) {
   for (const n of [0, 1, 5, 6, 11]) {
     test(`${rep} resolver reproduces the transport chunks + hashes for ${n} IDs`, () => {
-      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win });
+      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win, dependencySignals: sig });
       if (n === 0) { assert.deepEqual(got, []); return; } // (17) empty scope returns []
       const exp = transportExpected(rep, "k", ids(n), win);
       assert.equal(got.length, exp.length, "same request count");
@@ -970,7 +982,7 @@ for (const [rep, win] of [["sales-movers", smWin], ["buy-box-loss", bbWin], ["re
 }
 
 test("sales-movers traffic + ads each resolve to exactly their 2 windows; probe/inventory/catalog do not inherit them", () => {
-  const got = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin });
+  const got = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK });
   assert.equal(got.filter((r) => r.requestKey === "sales-movers:traffic").length, 2);
   assert.equal(got.filter((r) => r.requestKey === "sales-movers:ads").length, 2);
   const traffic = got.filter((r) => r.requestKey === "sales-movers:traffic");
@@ -989,36 +1001,38 @@ test("buy-box-loss daily resolves to one request per 7-day slice (4 slices; addi
 });
 
 test("(12) the common insight catalog is ONE request identity shared across Sales Movers / Buy Box / Returns", () => {
-  const cat = (rep, win) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win })
+  const cat = (rep, win, sig) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: sig })
     .find((r) => r.requestKey.endsWith(":catalog")).requestHash;
-  const h1 = cat("sales-movers", smWin), h2 = cat("buy-box-loss", bbWin), h3 = cat("returns-leakage", retWin);
+  const h1 = cat("sales-movers", smWin, SM_PROBE_OK), h2 = cat("buy-box-loss", bbWin), h3 = cat("returns-leakage", retWin);
   assert.equal(h1, h2); assert.equal(h2, h3); // identical columns/limit/window/order => fetched once
 });
 
 test("(12) the FBA inventory snapshot is ONE request identity shared by Sales Movers + Buy Box", () => {
-  const inv = (rep, win) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win })
+  const inv = (rep, win, sig) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: sig })
     .find((r) => r.requestKey.endsWith(":inventory")).requestHash;
-  assert.equal(inv("sales-movers", smWin), inv("buy-box-loss", bbWin));
+  assert.equal(inv("sales-movers", smWin, SM_PROBE_OK), inv("buy-box-loss", bbWin));
 });
 
 test("same source, different identity: Sales Movers traffic vs Returns traffic do NOT deduplicate", () => {
-  const sm = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin }).find((r) => r.requestKey === "sales-movers:traffic");
+  const sm = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK }).find((r) => r.requestKey === "sales-movers:traffic");
   const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:traffic");
   assert.equal(sm.sourceId, ret.sourceId); // same DataDoe source id...
   assert.notEqual(sm.requestHash, ret.requestHash); // ...but different columns/aggregations/window => distinct request
 });
 
 test("(11) sales-movers primary vs dd-secondary organizations remain isolated (different hashes)", () => {
-  const primary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "PRIMARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin });
-  const secondary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "DD_SECONDARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin });
+  const primary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "PRIMARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK });
+  const secondary = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "DD_SECONDARY_ORG_KEY", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK });
   assert.equal(primary.length, secondary.length);
   for (let i = 0; i < primary.length; i++) assert.notEqual(primary[i].requestHash, secondary[i].requestHash);
 });
 
 test("(16/17) insight resolver fails closed: empty scope => [], missing declared window => throws", () => {
   assert.deepEqual(reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: [], windowsByRequestKey: {} }), []);
+  // With the probe validated (all downstream active), a missing window for an active
+  // request throws for the right reason.
   const partial = { ...smWin }; delete partial["sales-movers:traffic"];
-  assert.throws(() => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: partial }));
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: partial, dependencySignals: SM_PROBE_OK }), /Missing windows/);
 });
 
 /* =============== Insight reports: Listing Health / PPC / Listing Optimizer =============== */
@@ -1039,10 +1053,10 @@ const optWin = {
   "listing-optimizer:catalog": [{ from: null, to: null }],
 };
 
-for (const [rep, win] of [["listing-health", lhWin], ["ppc-performance", ppcWin], ["listing-optimizer", optWin]]) {
+for (const [rep, win, sig] of [["listing-health", lhWin, undefined], ["ppc-performance", ppcWin, PPC_CUR_OK], ["listing-optimizer", optWin, OPT_SQP_OK]]) {
   for (const n of [0, 1, 5, 6, 11]) {
     test(`${rep} resolver reproduces the transport chunks + hashes for ${n} IDs`, () => {
-      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win });
+      const got = reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ids(n), windowsByRequestKey: win, dependencySignals: sig });
       if (n === 0) { assert.deepEqual(got, []); return; } // (17) empty scope
       const exp = transportExpected(rep, "k", ids(n), win);
       assert.equal(got.length, exp.length, "same request count");
@@ -1062,7 +1076,7 @@ test("(9) resolved insight jobs carry a strict boolean + normalized availability
   assert.equal(sourceDisabledOutcome(raw.availabilityPolicy).blocks, false); // degraded never blocks the cycle
   assert.equal(cat.strict, true);
   assert.equal(cat.availabilityPolicy, null);                          // required source: explicit null, not undefined
-  const opt = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optWin })
+  const opt = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optWin, dependencySignals: OPT_SQP_OK })
     .find((r) => r.requestKey === "listing-optimizer:sqp-weekly");
   assert.deepEqual(opt.availabilityPolicy, DEGRADED_POLICY);
 });
@@ -1085,7 +1099,7 @@ test("(13) Listing Optimizer's catalog and SQP do NOT deduplicate with the commo
 });
 
 test("(14) PPC creates NO Ads DataDoe source jobs; ads are declared derived from persisted rows", () => {
-  const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin });
+  const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK });
   assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))].sort(), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
   for (const c of REPORT_SOURCE_CONTRACTS["ppc-performance"]) assert.ok(!/^ads-/.test(c.sourceKey), "PPC owns no Ads source");
   assert.deepEqual(REPORT_DERIVED_SOURCE_KEYS["ppc-performance"], ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"]);
@@ -1111,6 +1125,184 @@ test("(dependency map) every report is scheduler-source-declared OR explicitly d
     assert.equal(REPORT_SOURCE_CONTRACTS[k], undefined, k + " must own no source contracts");
     assert.equal(reportSourceRequestHashes({ reportKey: k, apiKey: "k", ids: ["A1"], windowsByRequestKey: {} }), null);
   }
+});
+
+/* ================= FIX 1/2/3: staged dependencies + failure policy ================= */
+
+const keysOf = (jobs) => [...new Set(jobs.map((j) => j.requestKey))].sort();
+const smProbeWin = { "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }] };
+const optSqpWin = { "listing-optimizer:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }] };
+const ppcCatOnly = { "ppc-performance:catalog": [{ from: null, to: null }] };
+
+/* ---- typed models ---- */
+
+test("salesMoversWindows derives recent/prior 7-day weeks from the latest date (calendar-independent)", () => {
+  assert.deepEqual(salesMoversWindows("2025-07-30"),
+    { recent: { from: "2025-07-24", to: "2025-07-30" }, prior: { from: "2025-07-17", to: "2025-07-23" } });
+  assert.throws(() => salesMoversWindows("2025/07/30"), /valid YYYY-MM-DD/);
+  assert.throws(() => salesMoversWindows(null), /valid YYYY-MM-DD/);
+});
+
+test("staged signal + activation are typed and fail closed", () => {
+  assert.throws(() => validateStagedSignal({ status: "nope", validated: true }), /status/);
+  assert.throws(() => validateStagedSignal({ status: "success", validated: "yes" }), /validated/);
+  assert.throws(() => validateStagedSignal({ status: "success", validated: true, latestReportedDate: "bad" }), /YYYY-MM-DD/);
+  const act = { type: "validated_success", requireReportedDate: true };
+  assert.equal(evaluateStagedActivation(act, { status: "success", validated: true, latestReportedDate: "2025-07-30" }), true);
+  assert.equal(evaluateStagedActivation(act, { status: "success", validated: true, latestReportedDate: null }), false); // no data
+  assert.equal(evaluateStagedActivation(act, { status: "last-known-good", validated: true, latestReportedDate: "2025-07-30" }), false); // conservative
+  assert.equal(evaluateStagedActivation({ type: "validated_success" }, { status: "success", validated: false }), false); // unvalidated
+  assert.throws(() => evaluateStagedActivation(act, { status: "success", validated: true }), /requires latestReportedDate/); // fail closed
+  assert.throws(() => evaluateStagedActivation({ type: "bogus" }, { status: "success", validated: true }), /Unsupported staged activation/);
+});
+
+test("ads-currency signal + gate are typed and fail closed", () => {
+  assert.throws(() => validateAdsCurrencySignal({ status: "success", validated: true, currencyCount: 1.5 }), /currencyCount/);
+  assert.throws(() => validateAdsCurrencySignal({ status: "bogus", validated: true, currencyCount: 1 }), /status/);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 0 }), true);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 1 }), true);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 2 }), false); // by design
+  assert.equal(evaluateAdsCurrencyGate({ status: "failed", validated: true, currencyCount: 1 }), false);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: false, currencyCount: 1 }), false); // fail closed
+});
+
+test("normalizeFailurePolicy validates enums, rejects HTTP-code text, freezes the result", () => {
+  assert.equal(normalizeFailurePolicy(null), null);
+  assert.throws(() => normalizeFailurePolicy({ onFailure: "block", degradedScope: "x", safeCode: "Y" }), /onFailure/);
+  assert.throws(() => normalizeFailurePolicy({ onFailure: "degrade", degradedScope: "", safeCode: "Y" }), /degradedScope/);
+  assert.throws(() => normalizeFailurePolicy({ onFailure: "degrade", degradedScope: "x", safeCode: "HTTP 429" }), /HTTP status/);
+  const p = normalizeFailurePolicy({ onFailure: "degrade", degradedScope: "tacos-denominator", safeCode: "TOTAL_SALES_UNAVAILABLE" });
+  assert.ok(Object.isFrozen(p));
+  assert.equal(p.blocks, false); assert.equal(p.neverPartial, true);
+  assert.ok(p.causes.includes("strict-row-cap") && p.causes.includes("http-4xx") && p.causes.includes("source-save-error"));
+});
+
+/* ---- FIX 1: Sales Movers staged dependency state table ---- */
+
+test("Sales Movers — kickoff plans ONLY the latest-date probe (no downstream exports)", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smProbeWin });
+  assert.deepEqual(keysOf(jobs), ["sales-movers:sales-latest-probe"]);
+  assert.equal(jobs[0].dependency, null); // the probe itself is unconditional
+});
+
+test("Sales Movers — fresh validated probe with a date activates downstream with DERIVED windows + dependency metadata", () => {
+  const w = salesMoversWindows("2025-07-30");
+  const win = {
+    "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
+    "sales-movers:traffic": [w.recent, w.prior],
+    "sales-movers:ads": [w.recent, w.prior],
+    "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+    "sales-movers:catalog": [{ from: null, to: null }],
+  };
+  const jobs = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: SM_PROBE_OK });
+  assert.deepEqual(keysOf(jobs), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:inventory", "sales-movers:sales-latest-probe", "sales-movers:traffic"]);
+  const traffic = jobs.filter((j) => j.requestKey === "sales-movers:traffic");
+  assert.deepEqual(traffic.map((j) => [j.from, j.to]).sort(), [["2025-07-17", "2025-07-23"], ["2025-07-24", "2025-07-30"]]); // derived, not calendar-guessed
+  const dep = traffic[0].dependency;
+  assert.equal(dep.mode, "staged");
+  assert.equal(dep.dependsOn, "sales-movers:sales-latest-probe");
+  assert.equal(dep.signalStatus, "success");
+  assert.equal(dep.validated, true);
+  assert.equal(dep.latestReportedDate, "2025-07-30");
+  assert.ok(Object.isFrozen(dep));
+});
+
+test("Sales Movers — success-with-no-date / failed / terminal / unvalidated / last-known-good plan NO downstream", () => {
+  const nonActivating = [
+    { status: "success", validated: true, latestReportedDate: null },       // succeeded, no reported day => honest unavailable snapshot
+    { status: "failed", validated: false, latestReportedDate: null },        // failed
+    { status: "terminal", validated: false, latestReportedDate: null },      // terminal
+    { status: "success", validated: false, latestReportedDate: "2025-07-30" }, // unvalidated
+    { status: "last-known-good", validated: true, latestReportedDate: "2025-07-30" }, // conservative: no new exports
+  ];
+  for (const sig of nonActivating) {
+    const jobs = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smProbeWin, dependencySignals: { "sales-movers:sales-latest-probe": sig } });
+    assert.deepEqual(keysOf(jobs), ["sales-movers:sales-latest-probe"], JSON.stringify(sig) + " must not activate downstream");
+  }
+});
+
+test("Sales Movers — malformed probe signal / missing required date fail closed (throw)", () => {
+  const call = (sig) => reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smProbeWin, dependencySignals: { "sales-movers:sales-latest-probe": sig } });
+  assert.throws(() => call({ status: "bogus", validated: true }), /Invalid staged signal status/);
+  assert.throws(() => call({ status: "success", validated: true, latestReportedDate: "2025/07/30" }), /YYYY-MM-DD/);
+  assert.throws(() => call({ status: "success", validated: true }), /requires latestReportedDate/); // date field absent while required
+});
+
+/* ---- FIX 2: Listing Optimizer staged catalog state table ---- */
+
+test("Listing Optimizer — kickoff plans ONLY SQP (catalog gated on it)", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optSqpWin });
+  assert.deepEqual(keysOf(jobs), ["listing-optimizer:sqp-weekly"]);
+});
+
+test("Listing Optimizer — validated SQP success (including a ZERO-row success) activates the catalog", () => {
+  for (const sig of [{ status: "success", validated: true }, { status: "success", validated: true, latestReportedDate: null }]) {
+    const jobs = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optWin, dependencySignals: { "listing-optimizer:sqp-weekly": sig } });
+    assert.deepEqual(keysOf(jobs), ["listing-optimizer:catalog", "listing-optimizer:sqp-weekly"]);
+  }
+});
+
+test("Listing Optimizer — disabled/failed/unvalidated/last-known-good SQP does NOT consume a catalog export", () => {
+  for (const sig of [
+    { status: "terminal", validated: false }, // disabled SQP => sqpAvailable:false snapshot, catalog NOT scheduled
+    { status: "failed", validated: false },
+    { status: "success", validated: false },  // unvalidated
+    { status: "last-known-good", validated: true }, // conservative
+  ]) {
+    const jobs = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optSqpWin, dependencySignals: { "listing-optimizer:sqp-weekly": sig } });
+    assert.deepEqual(keysOf(jobs), ["listing-optimizer:sqp-weekly"], JSON.stringify(sig) + " must not schedule catalog");
+    assert.ok(!jobs.some((j) => j.requestKey === "listing-optimizer:catalog"), "no wasted catalog export");
+  }
+});
+
+test("Listing Optimizer — a malformed SQP signal fails closed", () => {
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "k", ids: ["A1"], windowsByRequestKey: optSqpWin, dependencySignals: { "listing-optimizer:sqp-weekly": { status: "success" } } }), /validated must be a boolean/);
+});
+
+/* ---- FIX 3: PPC currency gate + failure policy state table ---- */
+
+test("PPC — 0 or 1 Ads currency activates total-sales; >1 skips it; catalog stays active regardless", () => {
+  const plan = (currencyCount) => keysOf(reportSourceRequestHashes({
+    reportKey: "ppc-performance", apiKey: "k", ids: ["A1"],
+    windowsByRequestKey: currencyCount <= 1 ? ppcWin : ppcCatOnly,
+    dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount } },
+  }));
+  assert.deepEqual(plan(0), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
+  assert.deepEqual(plan(1), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
+  assert.deepEqual(plan(2), ["ppc-performance:catalog"]); // multi-currency: TACoS unavailable by design; catalog still enriches ASINs
+});
+
+test("PPC — missing/unvalidated currency signal skips total-sales (fail closed); malformed throws; catalog always stays", () => {
+  assert.deepEqual(keysOf(reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly })), ["ppc-performance:catalog"]); // missing
+  assert.deepEqual(keysOf(reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: false, currencyCount: 1 } } })), ["ppc-performance:catalog"]); // unvalidated
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: -1 } } }), /currencyCount/); // malformed
+});
+
+test("PPC total-sales carries an immutable failurePolicy (degrade, blocks:false, never partial); catalog has none", () => {
+  const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK });
+  const ts = jobs.find((j) => j.requestKey === "ppc-performance:total-sales");
+  const cat = jobs.find((j) => j.requestKey === "ppc-performance:catalog");
+  assert.equal(ts.strict, true); // strict row cap...
+  assert.equal(ts.failurePolicy.onFailure, "degrade");
+  assert.equal(ts.failurePolicy.blocks, false);      // ...yet a cap failure degrades TACoS, never blocks PPC
+  assert.equal(ts.failurePolicy.neverPartial, true); // capped/partial sales are a failure, never saved
+  assert.equal(ts.failurePolicy.degradedScope, "tacos-denominator");
+  assert.equal(cat.failurePolicy, null);             // catalog is independently required
+  assert.equal(cat.dependency, null);                // and ungated
+  const before = JSON.stringify(REPORT_SOURCE_CONTRACTS["ppc-performance"]);
+  try { ts.failurePolicy.blocks = true; } catch (e) { /* frozen */ }
+  assert.equal(ts.failurePolicy.blocks, false);
+  assert.equal(JSON.stringify(REPORT_SOURCE_CONTRACTS["ppc-performance"]), before); // registry unchanged
+});
+
+test("PPC total-sales failurePolicy + dependency are execution metadata: request_hash is unchanged", () => {
+  const ts = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK })
+    .find((j) => j.requestKey === "ppc-performance:total-sales");
+  const expected = sourceRequestIdentity({
+    apiKey: "k", sourceId: ts.sourceId, columns: byKey(REPORT_SOURCE_CONTRACTS["ppc-performance"], "ppc-performance:total-sales").columns,
+    ids: ts.sellerOrVendorIds, from: ts.from, to: ts.to, limit: ts.limit, options: ts.options,
+  }).requestHash;
+  assert.equal(ts.requestHash, expected); // identity ignores failurePolicy + dependency
 });
 
 console.log("\n" + passed + " assertions passed");

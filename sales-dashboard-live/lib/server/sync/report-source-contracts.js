@@ -17,14 +17,20 @@
 // requestKey — never as one shared list applied to every source — so a monthly
 // source and a no-date source can never receive each other's dates.
 //
-// SCOPE: only reports whose builder calls have been read line-by-line are declared
-// here. Daily Reporting currently covers its all-brand path only; its ASIN-grain
-// named-brand path remains explicitly incomplete. Keyword, Content and the insight
-// reports are later Phase 1b increments using the same parity-tested method.
+// SCOPE (2026-08-06): every current sidebar report is declared here or is registered
+// derived-only (REPORT_DERIVED_ONLY). Daily Reporting covers its all-brand path plus
+// every named brand via the ASIN/day superset derivation (REPORT_DERIVATION); Keyword
+// Rank, Content Changes, and all six insight reports (Sales Movers, Buy Box, Returns,
+// Listing Health, PPC, Listing Optimizer) are declared and parity-tested. A
+// dependency-map test proves no sidebar report is left unaudited. Staged/gated jobs
+// (Sales Movers probe → downstream, Listing Optimizer SQP → catalog, PPC total-sales
+// currency gate) and per-source failure policies are typed execution metadata that
+// never enters sourceRequestIdentity, so request_hash is unaffected.
 
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
 import { chunkAccountIds } from "../id-batching.js";
+import { addDaysStr } from "../datadoe.js";
 
 /* ---- constants transcribed verbatim from api/datadoe.js (parity-tested) ---- */
 
@@ -473,6 +479,11 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "ASC",
       windowKind: "per-7day: recent week + prior week (2 windows ending at latest reported date)",
       strict: true,
+      // Staged: planned only after the latest-date probe returns a validated reported
+      // date; the two 7-day windows are derived from it (salesMoversWindows).
+      dependencyMode: "staged",
+      dependsOnRequestKey: "sales-movers:sales-latest-probe",
+      activation: { type: "validated_success", requireReportedDate: true },
     },
     {
       requestKey: "sales-movers:ads",
@@ -485,6 +496,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "ASC",
       windowKind: "per-7day: recent week + prior week (same 2 windows as traffic)",
       strict: true,
+      dependencyMode: "staged",
+      dependsOnRequestKey: "sales-movers:sales-latest-probe",
+      activation: { type: "validated_success", requireReportedDate: true },
     },
     {
       requestKey: "sales-movers:inventory",
@@ -497,6 +511,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "DESC",
       windowKind: "range:asOf-10d..asOf (latest snapshot; shared FBA inventory export)",
       strict: true,
+      dependencyMode: "staged",
+      dependsOnRequestKey: "sales-movers:sales-latest-probe",
+      activation: { type: "validated_success", requireReportedDate: true },
     },
     {
       requestKey: "sales-movers:catalog",
@@ -509,6 +526,11 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "ASC",
       windowKind: "none (no-date; shared common insight catalog)",
       strict: true,
+      // The builder fetches catalog only after the probe yields a date (it returns the
+      // unavailable snapshot otherwise), so the shared-catalog job is staged too.
+      dependencyMode: "staged",
+      dependsOnRequestKey: "sales-movers:sales-latest-probe",
+      activation: { type: "validated_success", requireReportedDate: true },
     },
   ],
   "buy-box-loss": [
@@ -686,6 +708,15 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       // from persisted ads_daily_source_rows — PPC creates NO Ads export.
       windowKind: "range:asOf-29d..asOf",
       strict: true,
+      // Planned only when a validated Ads-currency signal proves <= 1 currency. The
+      // builder skips this export when persisted Ads rows mix currencies (a combined
+      // denominator would be meaningless) — TACoS unavailable by design, not an error.
+      dependencyMode: "ads-currency-gate",
+      dependsOnSignal: "ppc-performance:ads-currency",
+      // Any total-sales failure (DataDoe error, timeout, HTTP 4xx/5xx, a strict row-cap,
+      // or a source-save error) degrades ONLY the TACoS denominator: the rest of PPC is
+      // still derived and saved. A capped/partial result is a failure, never saved.
+      failurePolicy: { onFailure: "degrade", degradedScope: "tacos-denominator", safeCode: "TOTAL_SALES_UNAVAILABLE" },
     },
     {
       requestKey: "ppc-performance:catalog",
@@ -729,6 +760,13 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       // insight catalog => a DISTINCT request identity; intentionally NOT shared.
       windowKind: "none (no-date; richer content catalog, NOT the common one)",
       strict: true,
+      // Staged: the builder fetches the rich catalog only after SQP succeeds. Disabled/
+      // failed SQP returns sqpAvailable:false immediately and spends no catalog export.
+      // A validated SQP success with ZERO rows still activates the catalog (the builder
+      // continues to catalog after a successful empty export), so no requireReportedDate.
+      dependencyMode: "staged",
+      dependsOnRequestKey: "listing-optimizer:sqp-weekly",
+      activation: { type: "validated_success" },
     },
   ],
 });
@@ -877,6 +915,178 @@ export function evaluateFallbackCondition(condition, signal) {
   return sig.distinctPeriods < condition.value;
 }
 
+/* ============================ staged dependencies ============================
+ * A STAGED dependency gates a set of downstream source jobs behind the VALIDATED
+ * result of an already-run primary job (a probe or a first-source export). At
+ * kickoff the primary's signal is absent, so only the primary is planned; the
+ * downstream jobs are planned in a later pass once the worker supplies the typed
+ * signal. This is the ONE reusable mechanism for Sales Movers (probe → traffic/
+ * ads/inventory/catalog) and Listing Optimizer (SQP → catalog) — no report keeps
+ * ad-hoc branching. A staged signal describes the primary's result THIS cycle:
+ *   { status, validated, latestReportedDate?: "YYYY-MM-DD" | null }
+ * Conservative + token-safe: only a FRESH validated success activates downstream.
+ * A last-known-good/failed/terminal/unvalidated primary does NOT (it preserves the
+ * prior report and spends no new export). A malformed signal fails closed (throws).
+ */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+export function validateStagedSignal(signal) {
+  if (signal == null || typeof signal !== "object" || Array.isArray(signal)) {
+    throw new Error("Staged dependency signal must be an object with status/validated.");
+  }
+  if (!FALLBACK_SIGNAL_STATUSES.has(signal.status)) {
+    throw new Error(`Invalid staged signal status "${signal.status}".`);
+  }
+  if (typeof signal.validated !== "boolean") {
+    throw new Error("Staged signal.validated must be a boolean.");
+  }
+  // latestReportedDate is optional (SQP staging does not use it), but when present it
+  // must be a well-formed ISO date or an explicit null (probe succeeded, no reported day).
+  if ("latestReportedDate" in signal
+    && !(signal.latestReportedDate === null || (typeof signal.latestReportedDate === "string" && ISO_DATE.test(signal.latestReportedDate)))) {
+    throw new Error("Staged signal.latestReportedDate must be a YYYY-MM-DD string or null.");
+  }
+  return signal;
+}
+
+// Decide whether a staged contract's downstream job activates. Fails closed on a
+// malformed activation or signal. Returns false (not an error) for the legitimate
+// no-data / not-yet-successful states so the worker preserves the prior report.
+export function evaluateStagedActivation(activation, signal) {
+  if (!activation || typeof activation !== "object" || activation.type == null) {
+    throw new Error("Staged activation must be a typed object with a `type`.");
+  }
+  if (activation.type !== "validated_success") {
+    throw new Error(`Unsupported staged activation type "${activation.type}".`);
+  }
+  const sig = validateStagedSignal(signal);
+  // FRESH success only. last-known-good must NOT re-activate downstream (it would spend
+  // new exports on a stale anchor or pretend the current primary succeeded); failed/
+  // terminal/unvalidated preserve the prior report.
+  if (sig.status !== "success") return false;
+  if (!sig.validated) return false;
+  if (activation.requireReportedDate) {
+    if (!("latestReportedDate" in sig) || sig.latestReportedDate === undefined) {
+      throw new Error("Staged activation requires latestReportedDate on the signal (null when there is none).");
+    }
+    // Success but no reported date => honest "data unavailable" snapshot, no downstream.
+    if (sig.latestReportedDate === null) return false;
+  }
+  return true;
+}
+
+/**
+ * Pure Sales Movers comparison windows, derived from the VALIDATED latest reported
+ * date exactly as buildSalesMovers does:
+ *   recent = [latest-6, latest]; prior = [recent.from-7, recent.from-1]  (two 7-day weeks)
+ * Fails closed on a malformed date. Never guessed from the calendar.
+ */
+export function salesMoversWindows(latestReportedDate) {
+  if (typeof latestReportedDate !== "string" || !ISO_DATE.test(latestReportedDate)) {
+    throw new Error("salesMoversWindows requires a valid YYYY-MM-DD latest reported date.");
+  }
+  const recentFrom = addDaysStr(latestReportedDate, -(7 - 1));
+  const recent = { from: recentFrom, to: latestReportedDate };
+  const prior = { from: addDaysStr(recentFrom, -7), to: addDaysStr(recentFrom, -1) };
+  return { recent, prior };
+}
+
+/* ===================== PPC total-sales: typed Ads-currency gate =====================
+ * The TACoS denominator export is planned from a typed, validated currency signal
+ * derived from persisted ads_daily_source_rows — never from live Ads exports. Zero or
+ * one currency: schedule. More than one currency: do NOT schedule (a combined
+ * denominator would be meaningless; TACoS is unavailable BY DESIGN, not an error).
+ * Unvalidated: do not schedule (fail closed). Malformed: throw.
+ */
+const ADS_CURRENCY_STATUSES = new Set(["success", "failed", "terminal"]);
+
+export function validateAdsCurrencySignal(signal) {
+  if (signal == null || typeof signal !== "object" || Array.isArray(signal)) {
+    throw new Error("Ads-currency signal must be an object with status/validated/currencyCount.");
+  }
+  if (!ADS_CURRENCY_STATUSES.has(signal.status)) {
+    throw new Error(`Invalid ads-currency signal status "${signal.status}".`);
+  }
+  if (typeof signal.validated !== "boolean") {
+    throw new Error("Ads-currency signal.validated must be a boolean.");
+  }
+  if (!(Number.isInteger(signal.currencyCount) && signal.currencyCount >= 0)) {
+    throw new Error("Ads-currency signal.currencyCount must be a non-negative integer.");
+  }
+  return signal;
+}
+
+export function evaluateAdsCurrencyGate(signal) {
+  const sig = validateAdsCurrencySignal(signal);
+  // A non-success or unvalidated currency read is not a trustworthy basis: do not
+  // schedule total-sales (TACoS stays unavailable; the rest of PPC still derives).
+  if (sig.status !== "success" || !sig.validated) return false;
+  return sig.currencyCount <= 1;
+}
+
+/* ===================== generic source FAILURE policy =====================
+ * Distinct from availabilityPolicy (which is ONLY for org-disabled sources). A
+ * failurePolicy says what happens when a source's export/save FAILS for any reason —
+ * DataDoe/export error, timeout, HTTP 4xx/5xx, a strict row-cap/truncation, or a
+ * Supabase source-save error. For a degrade policy the report is NOT blocked: the
+ * degraded scope (e.g. the TACoS denominator) is marked unavailable, the rest of the
+ * report is derived and saved, and a capped/partial result is treated as a failure —
+ * never saved as data. HTTP codes are enumerated as typed causes, never parsed from text.
+ */
+const VALID_FAILURE_OUTCOME = new Set(["degrade"]);
+const FAILURE_CAUSES = Object.freeze(["export-error", "timeout", "http-4xx", "http-5xx", "strict-row-cap", "source-save-error"]);
+
+export function normalizeFailurePolicy(policy) {
+  if (policy == null) return null;
+  if (typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("failurePolicy must be an object or null.");
+  }
+  const { onFailure, degradedScope, safeCode } = policy;
+  if (!VALID_FAILURE_OUTCOME.has(onFailure)) {
+    throw new Error(`Invalid failurePolicy.onFailure "${onFailure}".`);
+  }
+  if (typeof degradedScope !== "string" || !degradedScope) {
+    throw new Error("failurePolicy.degradedScope must be a non-empty string.");
+  }
+  if (typeof safeCode !== "string" || !safeCode) {
+    throw new Error("failurePolicy.safeCode must be a non-empty string.");
+  }
+  // The admin-safe code must not smuggle a raw HTTP status string; causes are typed.
+  if (/\b(40[24]|429|5\d\d|424)\b/.test(safeCode)) {
+    throw new Error("failurePolicy.safeCode must not carry an HTTP status string.");
+  }
+  return Object.freeze({
+    onFailure,          // "degrade"
+    degradedScope,      // what becomes unavailable, e.g. "tacos-denominator"
+    safeCode,           // admin-safe reason code, never a raw DataDoe error/secret
+    blocks: false,      // a degrade failure never blocks the whole report
+    neverPartial: true, // a capped/truncated/partial result is a failure, never saved as data
+    causes: FAILURE_CAUSES, // the failure modes this policy governs (typed, not parsed)
+  });
+}
+
+// Typed, immutable dependency descriptor for a resolved staged/gated/fallback job.
+// Carries the mode, what it depends on, the required signal status, and the OBSERVED
+// signal state that gated it (status/validated/latestReportedDate). Not part of the
+// DataDoe request, so it never affects request_hash. null for an unconditional job.
+function resolveDependencyMeta(contract, signals) {
+  if (!contract.dependencyMode) return null;
+  const dependsOn = contract.dependsOnRequestKey || contract.dependsOnSignal || null;
+  const sig = dependsOn != null && dependsOn in signals ? signals[dependsOn] : null;
+  const required = contract.dependencyMode === "staged" ? "validated success (fresh)"
+    : contract.dependencyMode === "ads-currency-gate" ? "validated, <= 1 currency"
+    : contract.dependencyMode === "fallback" ? "validated success/last-known-good under threshold"
+    : "unknown";
+  return Object.freeze({
+    mode: contract.dependencyMode,
+    dependsOn,
+    requiredSignalStatus: required,
+    signalStatus: sig && typeof sig === "object" ? (sig.status ?? null) : null,
+    validated: sig && typeof sig === "object" && typeof sig.validated === "boolean" ? sig.validated : null,
+    latestReportedDate: sig && typeof sig === "object" && "latestReportedDate" in sig ? sig.latestReportedDate : null,
+  });
+}
+
 // Map a source's structured availabilityPolicy to the outcome when DataDoe reports
 // that source as disabled for the organisation. Phase 1c branches on THIS, never on
 // the report API's HTTP 424 string. `blocks` = the dependent report cannot be
@@ -965,14 +1175,27 @@ export function normalizeAvailabilityPolicy(policy) {
  * copies — detached from REPORT_SOURCE_CONTRACTS — and is NOT part of the DataDoe
  * request, so it never affects request_hash deduplication.
  *
- * `fallbackSignals` maps a primary requestKey to a typed signal
- * ({ status, validated, distinctPeriods }); a `dependencyMode:"fallback"` contract is
- * planned only when its primary's signal is present and its typed condition holds. A
- * malformed signal or unsupported condition throws a safe configuration error.
+ * `fallbackSignals` / `dependencySignals` map a primary requestKey (or a well-known
+ * signal key) to a typed signal from an already-run source THIS cycle. Both are merged
+ * into one gate map:
+ *   - `dependencyMode:"fallback"` (Keyword Rank monthly) plans only when its primary's
+ *     `{status,validated,distinctPeriods}` condition holds.
+ *   - `dependencyMode:"staged"` (Sales Movers downstream, Listing Optimizer catalog)
+ *     plans only when the primary's `{status,validated,latestReportedDate?}` proves a
+ *     fresh validated success (with a real reported date where required).
+ *   - `dependencyMode:"ads-currency-gate"` (PPC total-sales) plans only when a validated
+ *     `{status,validated,currencyCount}` Ads-currency signal proves <= 1 currency.
+ * At kickoff (no signals) only the unconditional primaries are planned. A malformed
+ * signal or unsupported condition throws a safe configuration error (fail closed).
+ *
+ * Resolved jobs additionally carry (immutable, outside request identity):
+ *   - `failurePolicy`: null, or a frozen generic any-failure degrade policy.
+ *   - `dependency`: null, or a frozen descriptor { mode, dependsOn, requiredSignalStatus,
+ *     signalStatus, validated, latestReportedDate } of the gate that activated the job.
  *
  * Returns null for an undeclared report (callers must not assume a contract).
  */
-export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByRequestKey, marketplaceCountry, fallbackSignals }) {
+export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByRequestKey, marketplaceCountry, fallbackSignals, dependencySignals }) {
   const contracts = REPORT_SOURCE_CONTRACTS[reportKey];
   if (!contracts) return null;
 
@@ -994,7 +1217,10 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
       throw new Error(`Marketplace country is required to resolve conditional request key "${c.requestKey}".`);
     }
   }
-  const signals = fallbackSignals || {};
+  // Typed signals from already-run primaries this cycle, keyed by requestKey (or a
+  // well-known signal key). `fallbackSignals` is the legacy name; `dependencySignals`
+  // is the general one. Both feed the same gate map.
+  const signals = { ...(fallbackSignals || {}), ...(dependencySignals || {}) };
   const applies = (c) => {
     // Country-conditional gate: authoritative account metadata, never window presence.
     if (Array.isArray(c.marketplaceCountries) && c.marketplaceCountries.length
@@ -1011,6 +1237,22 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
     if (c.dependencyMode === "fallback") {
       if (!(c.dependsOnRequestKey in signals)) return false;
       return evaluateFallbackCondition(c.condition, signals[c.dependsOnRequestKey]);
+    }
+    // Staged gate: a downstream job is active ONLY once its primary's typed signal is
+    // present AND a fresh validated success (and, where required, a real reported date)
+    // is proven. At kickoff the primary's signal is absent, so only the primary is
+    // planned. last-known-good/failed/terminal/unvalidated/no-date => not activated
+    // (prior report preserved, no wasted export). A malformed signal throws.
+    if (c.dependencyMode === "staged") {
+      if (!(c.dependsOnRequestKey in signals)) return false;
+      return evaluateStagedActivation(c.activation, signals[c.dependsOnRequestKey]);
+    }
+    // Ads-currency gate (PPC total-sales): scheduled only when a validated Ads-currency
+    // signal proves <= 1 currency. Absent signal => not scheduled (safe). >1 currency or
+    // unvalidated => not scheduled (TACoS unavailable by design). Malformed => throws.
+    if (c.dependencyMode === "ads-currency-gate") {
+      if (!(c.dependsOnSignal in signals)) return false;
+      return evaluateAdsCurrencyGate(signals[c.dependsOnSignal]);
     }
     return true;
   };
@@ -1068,6 +1310,12 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
           // and NOT part of the DataDoe request — request_hash is unaffected.
           strict: c.strict === true,
           availabilityPolicy: normalizeAvailabilityPolicy(c.availabilityPolicy),
+          // Generic any-failure degradation policy (distinct from availabilityPolicy);
+          // null unless declared. Frozen + detached from the registry.
+          failurePolicy: normalizeFailurePolicy(c.failurePolicy),
+          // Typed staged/gated/fallback dependency descriptor + the observed signal
+          // state that activated this job; null for an unconditional job.
+          dependency: resolveDependencyMeta(c, signals),
         });
       }
     }
