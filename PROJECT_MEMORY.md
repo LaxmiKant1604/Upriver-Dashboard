@@ -1,5 +1,51 @@
 # Project Memory
 
+## Scheduler v2 Phase 1c — review corrections (FIX 1-7, 2026-08-06)
+
+Corrected the seven Phase 1c review findings on `feature/scheduler-v2` (commits
+`3de9f7a`, `8a8f9a7`; a docs commit follows). SHADOW MODE unchanged; Scheduler v1,
+frontend, and manual refresh untouched. Not pushed/merged/deployed/migrated; Phase 1d
+not started. See SCHEDULER_V2.md §14.
+
+- **FIX 1 — complete job metadata.** The production `sync_source_jobs` row has no
+  requestKey/fetchParams. The worker now REBUILDS the full canonical job from the plan by
+  request_hash (fetchParams/requestKey/strict/limit/policies), with the DB row
+  authoritative only for fetch_status/attempted_at/export_id/connection. A pending/
+  attempted job with no plan entry fails closed (`MISSING_PLAN`). Proven with a
+  production-shape `listSourceJobs` returning only `getSyncSourceJobs` columns.
+- **FIX 2 — fail-closed org routing.** `makeDataDoeAdapter` requires an explicit valid
+  `connection_id`, the connection to exist, and the job's `organizationFingerprint` to
+  match it; missing/unknown/mismatched throws BEFORE any DataDoe call. No primary
+  fallback for a secondary job.
+- **FIX 3 — create/poll/download checkpoint.** Resumable state machine: claim ->
+  createExport once -> **persist export_id immediately** -> poll -> download -> validate
+  -> save -> success. Resume with `attempted`+export_id continues without re-create;
+  `attempted` with no export_id => explicit `CREATE_INTERRUPTED`. Distinct safe stages;
+  `withDataDoeDeadline` wraps DataDoe work.
+- **FIX 4 — signal reconstruction.** `reconstructSignals` rebuilds typed signals from
+  persisted successful jobs + saved payloads (+ persisted ads rows) at every invocation.
+  A brand-new process plans downstream without repeating a primary export; failed/
+  terminal/unvalidated primaries activate nothing.
+- **FIX 5 — atomic last-known-good storage.** `atomicSaveSourcePayload` writes an
+  immutable versioned object, switches the pointer only after upload, prunes the old only
+  after commit, and on a pointer failure deletes the new orphan and preserves the old.
+  Non-array payload rejected (never `[]`); success requires a non-empty object path.
+- **FIX 6 — cumulative counts.** source_total/succeeded/failed are recomputed from ALL
+  persisted jobs; resuming/adding staged jobs never reduces a count.
+- **FIX 7 — test hang.** Root cause: the Phase 1c tests used TOP-LEVEL AWAIT, making the
+  module an async module that hangs `node --check`/piped runs in some environments. Split
+  the Phase 1c async tests into `scheduler-v2-worker.test.mjs` (async `main()`,
+  deterministic exit, no TLA); restored `scheduler-v2.test.mjs` to pure sync;
+  `test:scheduler-v2` runs both. No timer/pending-promise/ALS/socket keeps Node alive.
+
+Tests: sync 22 + worker 23. Full `npm run verify` green (**350**); `node --check` on
+every changed file exits 0; `git diff --check` clean. Golden `request_hash`
+(source-identity 7 assertions) and five-ID batching unchanged; the shared v1
+`saveSourceExportCache` untouched.
+
+Remaining risks: pg_cron/Vercel kickoff + production `resolvePlan` still not wired; a
+live cycle against real DataDoe/Supabase Storage remains Codex's separate gate.
+
 ## Scheduler v2 Phase 1c — source-job worker (SHADOW MODE, 2026-08-06)
 
 Implemented the checkpointable, idempotent source-job worker on `feature/scheduler-v2`

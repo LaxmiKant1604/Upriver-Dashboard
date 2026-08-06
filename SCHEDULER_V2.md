@@ -709,3 +709,38 @@ five-ID batching, and primary/dd-secondary isolation unchanged.
 pg_cron/Vercel kickoff + production `resolvePlan` wiring are not built; a live cycle
 against real DataDoe/Supabase (create/poll/download timing, disabled-source classification,
 Storage save) is Codex's separate gate. Report derivation is Phase 1d.
+
+---
+
+## 14. Phase 1c review corrections (FIX 1-7, 2026-08-06)
+
+Commits `3de9f7a` (atomic cache + org fingerprint + sync helpers) and `8a8f9a7`
+(resumable worker + driver + test split). SHADOW MODE, Scheduler v1 / frontend / manual
+refresh untouched; not pushed/merged/deployed/migrated.
+
+- **FIX 1** — the worker rebuilds the full canonical job from the plan by request_hash
+  (fetchParams/requestKey/policies); the production `sync_source_jobs` row is authoritative
+  only for fetch_status/attempted_at/export_id/connection. No-plan job fails closed.
+- **FIX 2** — `makeDataDoeAdapter` fail-closed routing: explicit valid `connection_id`, the
+  connection must exist, `organizationFingerprint` must match; missing/unknown/mismatched
+  throws before any DataDoe call; a secondary job never uses the primary key.
+- **FIX 3** — resumable state machine: claim → createExport once → **persist export_id
+  immediately** → poll → download → validate → save → success. `attempted`+export_id
+  resumes without re-create; `attempted` with no id → `CREATE_INTERRUPTED`. Distinct safe
+  stages (create-export/poll/download/validate/persist); `withDataDoeDeadline` wraps work.
+- **FIX 4** — `reconstructSignals` rebuilds typed signals from persisted successful jobs +
+  saved payloads (+ persisted ads rows) each invocation; a fresh process plans downstream
+  without repeating a primary export; failed/terminal/unvalidated primaries activate nothing.
+- **FIX 5** — `atomicSaveSourcePayload`: immutable versioned object, pointer switched only
+  after upload, old pruned only after commit; a pointer failure deletes the new orphan and
+  preserves the old readable payload. Non-array payload rejected; success requires a
+  non-empty object path.
+- **FIX 6** — source counts recomputed from ALL persisted jobs (never decrease).
+- **FIX 7** — root cause: TOP-LEVEL AWAIT made the test an async module that hangs
+  `node --check`/piped runs. Phase 1c async tests moved to `scheduler-v2-worker.test.mjs`
+  (async `main()`, deterministic exit, no TLA); `scheduler-v2.test.mjs` restored to pure
+  sync; `test:scheduler-v2` runs both. No handle keeps Node alive.
+
+Tests: sync 22 + worker 23; full `npm run verify` green (**350**); `node --check` on every
+changed file exits 0; `git diff --check` clean; golden `request_hash` and five-ID batching
+unchanged; shared v1 `saveSourceExportCache` untouched.
