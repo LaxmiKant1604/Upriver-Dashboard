@@ -3895,6 +3895,30 @@ production, Scheduler v1, frontend, or scheduler-logic change. From HEAD
   assertions: 54+60+23+6+**56**+7+155) + `build:check`; `git diff --check` clean.
   Fix commit `ede5b12`; this docs update follows.
 
+### Scheduler v2 Phase 1c AV-literal correction re-review (Codex, 2026-08-07)
+
+- Re-reviewed commits `ede5b12` and `79bc35d`. The diff is limited to the
+  consolidated Scheduler v2 test artifact and documentation; production
+  scheduler code, Scheduler v1, and the frontend are unchanged. Constructing
+  credential-like fixtures from harmless runtime fragments is an appropriate
+  content-level correction and preserves the security assertions.
+- In this Codex worktree, the historical path
+  `scripts/scheduler-v2.test.mjs` remains blocked before JavaScript evaluation:
+  both direct Node execution and an attempted Git-blob export hang before
+  producing output. This is consistent with filename-specific Defender
+  quarantine history rather than a remaining production-code defect.
+- Final artifact correction required: move the already-clean consolidated
+  56-assertion suite to a never-used path such as
+  `scripts/scheduler-v2-verification.test.mjs`, remove the old quarantined path
+  from Git and the worktree, and update `package.json`. Do not recreate the old
+  filename and do not change production code or test coverage.
+- Phase 1c production logic remains accepted. Final approval is pending only
+  fresh-path verification: ordinary file read/copy, `node --check`, direct test
+  execution with all 56 assertions and natural exit, focused npm test, full
+  `npm run verify`, and `git diff --check`.
+- Phase 1d must not start yet. Nothing should be pushed, merged, deployed, or
+  migrated, and the untracked `HANDOFF.md` must remain uncommitted.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
