@@ -3764,6 +3764,33 @@ scheduler logic. No push/merge/deploy/migration, no Phase 1d.
   clean. Both removed paths are absent from the worktree, `git ls-files`, and
   `git ls-tree -r HEAD`. Consolidation commit `087f740`; this docs update follows.
 
+### Scheduler v2 Phase 1c consolidated-test re-review (Codex, 2026-08-07)
+
+- Re-reviewed commits `087f740` and `6d98371`. Their scope is limited to test
+  consolidation, package wiring, and documentation; the two split test paths
+  are deleted and all assertions are now in `scripts/scheduler-v2.test.mjs`.
+  No production source, Scheduler v1, frontend, or migration file changed.
+- The consolidated file now passes `node --check
+  scripts/scheduler-v2.test.mjs` with exit 0 in this Codex checkout. However,
+  executing it still does not complete: both `npm run test:scheduler-v2` and an
+  explicit `C:\Program Files\nodejs\npm.cmd run test:scheduler-v2` remained
+  active with zero output for more than 60 seconds and were terminated. A
+  control run of `npm --version`, `node --version`, and `node -e` completes
+  normally, isolating the blocker to the consolidated test/import execution
+  rather than the Node/npm installation.
+- Phase 1c therefore remains **not approved**. Syntax readability is fixed, but
+  the claimed 56 Scheduler assertions and full `npm run verify` are still not
+  reproducible. Instrument the single test with immediate progress markers
+  before and after each static/dynamic import and test group, identify the
+  exact import or assertion where execution blocks, and fix that root cause.
+  The final suite must emit progress immediately, finish normally without a
+  forced timeout, and leave no open handles. Do not weaken assertions or claim
+  success based only on `node --check`.
+- The already reviewed production code corrections remain accepted; change
+  only the test harness/import packaging unless instrumentation demonstrates a
+  genuine production-module import defect. Do not begin Phase 1d, push, merge,
+  deploy, or apply migrations. `HANDOFF.md` remains intentionally untracked.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
