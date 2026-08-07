@@ -861,3 +861,37 @@ Proof from the exact worktree: `node --check scripts/scheduler-v2.test.mjs` exit
 `npm run test:scheduler-v2` = **56** assertions, exit 0; `npm run verify` green (**361**
 assertions across all suites) plus `build:check`; `git diff --check` clean. Both removed test
 paths are absent from the worktree, `git ls-files`, and `git ls-tree -r HEAD`.
+
+---
+
+## 18. Phase 1c: test harness silent-hang diagnosis + fix (2026-08-07)
+
+The consolidated file passed `node --check` but executed with zero output and appeared to
+hang in the reviewer's worktree. Instrumentation (this correction) diagnoses and fixes the
+harness only — NO production, Scheduler v1, frontend, or scheduler-logic change (the active-
+handle dump below proved there was no real module-import defect to fix).
+
+- **Instrumentation added.** A synchronous `mark()` (stderr) / `out()` (stdout) pair built on
+  `fs.writeSync` replaces `console.log`/`console.error`. Markers bracket: module-body eval,
+  `before main()`, the start/finish of every one of the 7 dynamic imports, each of the 6
+  major test-group boundaries, the end of the test loop, and — right before the NATURAL exit
+  — a dump of `process.getActiveResourcesInfo()`.
+- **Diagnosis from the exact worktree.** Every dynamic import resolves in <=~55ms with no
+  block; all 56 tests run; the loop completes; and the active-resource dump prints `[]` — the
+  event loop is empty and the process exits naturally with code 0 (no `process.exit()`, no
+  forced timeout). So there is no unresolved promise, timer, socket, AsyncLocalStorage, or
+  server handle. `withDataDoeDeadline` is pure `AsyncLocalStorage.run` (no timer), and with
+  the default `Infinity` deadline `remainingDeadlineMs()` returns `null`, so no deadline
+  timer is ever created; `ddFetch`'s abort timer is cleared in a `finally` and is never
+  exercised by the in-memory fakes.
+- **Root cause of the silent hang.** The old runner did all imports first, then wrote results
+  with async `console.log`. When stdout is an npm pipe, Node's asynchronous stdout buffer can
+  be dropped if the process is killed before it flushes — so a run that was actually
+  progressing (or a fast exit) surfaced as ZERO output. Switching every marker/result to
+  synchronous `fs.writeSync` makes output land the instant it executes, so progress is always
+  visible and a true block would be pinpointed to the exact import/group.
+
+Proof from the exact worktree (all emit output promptly, exit 0, terminate naturally):
+`node --check scripts/scheduler-v2.test.mjs` exits 0; `node scripts/scheduler-v2.test.mjs`
+streams markers + **56** assertions, `active resources: []`, exit 0; `npm run test:scheduler-v2`
+exit 0; `npm run verify` green (**361** assertions) + `build:check`; `git diff --check` clean.

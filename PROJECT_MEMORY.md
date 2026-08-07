@@ -3791,6 +3791,39 @@ scheduler logic. No push/merge/deploy/migration, no Phase 1d.
   genuine production-module import defect. Do not begin Phase 1d, push, merge,
   deploy, or apply migrations. `HANDOFF.md` remains intentionally untracked.
 
+### Scheduler v2 Phase 1c: test-harness silent-hang diagnosed + fixed (Claude, 2026-08-07)
+
+Fixed ONLY the test harness (scripts/scheduler-v2.test.mjs). No production,
+Scheduler v1, frontend, or scheduler-logic change -- instrumentation proved
+there is NO real module-import defect, so production stays untouched. On
+`feature/scheduler-v2` from HEAD `297e3ca`. No push/merge/deploy/migration, no
+Phase 1d. `HANDOFF.md` left untracked.
+
+- **Instrumented** with a synchronous `mark()` (stderr) / `out()` (stdout) pair
+  built on `fs.writeSync`, replacing `console.log`/`console.error`. Markers
+  bracket module-body eval, `before main()`, the start/finish of all 7 dynamic
+  imports, each of the 6 major test-group boundaries, loop end, and a dump of
+  `process.getActiveResourcesInfo()` right before the natural exit.
+- **Diagnosis (exact worktree):** every dynamic import resolves in <=~55ms with
+  no block; all 56 tests run; active resources dump = `[]` (empty event loop);
+  the process exits NATURALLY with code 0 -- no `process.exit()`, no forced
+  timeout, no lingering timer/socket/handle/promise. `withDataDoeDeadline` is
+  pure `AsyncLocalStorage.run` (no timer; default Infinity deadline ->
+  `remainingDeadlineMs()` null), and `ddFetch`'s abort timer is cleared in a
+  `finally` and never hit by the in-memory fakes.
+- **Root cause:** the old runner did all imports first, then wrote results with
+  ASYNC `console.log`. To an npm pipe, Node's async stdout buffer can be dropped
+  if the process is killed before it flushes -> the run surfaced as ZERO output
+  (a "silent hang"). Synchronous `fs.writeSync` makes every marker/result land
+  immediately, so progress is always visible and a genuine block would pinpoint
+  the exact import/group. Did NOT hide anything with process.exit/timeout/skips.
+- **Proof (all prompt, exit 0, natural):** `node --check` exit 0;
+  `node scripts/scheduler-v2.test.mjs` streams markers + 56 assertions, active
+  resources `[]`, exit 0; `npm run test:scheduler-v2` exit 0; `npm run verify`
+  green (**361** assertions: 54+60+23+6+**56**+7+155) + `build:check` (built in
+  ~34s); `git diff --check` clean. 56 assertions preserved. Harness fix commit
+  `82c78d6`; this docs update follows.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
