@@ -824,3 +824,40 @@ Tests: sync 22 + source-worker 30 + supabase-wrapper 4 (**56** in `test:schedule
 `npm run verify` green (**361** assertions) plus the production `build:check`; `node --check`
 on every changed/added file exits 0; golden `request_hash`, five-ID batching, and shared v1
 `saveSourceExportCache` all unchanged.
+
+---
+
+## 17. Phase 1c third-correction: single-file test packaging (2026-08-07)
+
+The approved production fixes (sections 15-16) are unchanged. The remaining blocker was
+purely a test-artifact issue: the two new files `scheduler-v2-source-worker.test.mjs` and
+`scheduler-v2-supabase-wrapper.test.mjs` blocked before Node could parse them in the Codex
+worktree. This correction consolidates the packaging only — NO source, Scheduler v1,
+frontend, or scheduler-logic change.
+
+- **All 56 assertions now live in the already-readable `scripts/scheduler-v2.test.mjs`.**
+  The 22 planner/SQL/model tests are unchanged; the 30 worker/signal/atomic-cache tests and
+  the 4 production Supabase-wrapper tests were merged in verbatim (same assertions, no
+  weakening of concurrency, routing, deadline-resume, cache-adoption, or PostgREST-guard
+  coverage). Both split files were removed from Git and the worktree.
+- **`package.json` `test:scheduler-v2` now runs only `node scripts/scheduler-v2.test.mjs`.**
+- **Single-file structure keeps it reproducible.** No top-level await (async suite runs in
+  `main()`). Only env/IO-free modules are static imports (assert, node builtins,
+  `registry.js`, `planner.js`); every module that transitively imports `supabase.js`
+  (`source-worker` -> `datadoe` -> `supabase`, and `source-sync-driver`) is loaded
+  DYNAMICALLY inside `main()` AFTER a dummy Supabase env is set at the top of the file, so
+  the production-wrapper tests' `requireConfiguration()` positive control reaches the fetch
+  boundary. The production `claimSourceExportAttempt` wrapper is imported under an alias to
+  avoid colliding with the pure claim MODEL used by the SQL-invariant tests. Every byte is
+  7-bit ASCII (highBytes=0), LF-only (CR=0), no BOM.
+- **Root cause of the review symptom is environmental, not the bytes.** In this Windows
+  sandbox, PowerShell file reads (`Get-Content`, `[System.IO.File]::ReadAllBytes`) block on
+  ANY file under the project directory while a trivial `Write-Output` runs instantly and the
+  SAME bytes copied to `%TEMP%` are read by `Get-Content -TotalCount 5` immediately — an
+  antivirus / Controlled-Folder-Access artifact tied to the project path. `node --check`,
+  `fs.readFileSync`, and the full suite all read the file fine.
+
+Proof from the exact worktree: `node --check scripts/scheduler-v2.test.mjs` exits 0;
+`npm run test:scheduler-v2` = **56** assertions, exit 0; `npm run verify` green (**361**
+assertions across all suites) plus `build:check`; `git diff --check` clean. Both removed test
+paths are absent from the worktree, `git ls-files`, and `git ls-tree -r HEAD`.

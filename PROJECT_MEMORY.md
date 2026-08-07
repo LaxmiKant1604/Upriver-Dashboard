@@ -3726,6 +3726,44 @@ refresh, and `feature/design-system` (`e90c268`) untouched. Shadow mode intact.
   push, merge, deployment, migration, live DataDoe call, or Phase 1d work was
   performed. `feature/design-system` remains at `e90c268`.
 
+### Scheduler v2 Phase 1c third-correction: single-file test packaging (Claude, 2026-08-07)
+
+Fixed ONLY the inaccessible test packaging (production fixes are approved and
+untouched). On `feature/scheduler-v2` from HEAD `29cbe8f`. No change to
+source-cache.js, source-worker.js, supabase.js, Scheduler v1, frontend, or any
+scheduler logic. No push/merge/deploy/migration, no Phase 1d.
+
+- **Consolidated all 56 assertions into the already-readable
+  `scripts/scheduler-v2.test.mjs`.** Merged the 30 worker/signal/atomic-cache
+  tests and the 4 production Supabase-wrapper tests into it verbatim (same
+  assertions; concurrency, routing, deadline-resume, cache-adoption, and
+  PostgREST-guard coverage all intact), on top of the existing 22
+  planner/SQL/model tests.
+- **Removed both split files from Git and the worktree:**
+  `scripts/scheduler-v2-source-worker.test.mjs` and
+  `scripts/scheduler-v2-supabase-wrapper.test.mjs`.
+- **`package.json test:scheduler-v2` now runs only
+  `node scripts/scheduler-v2.test.mjs`.**
+- **Single-file design.** No top-level await; async suite runs in `main()`.
+  Only env/IO-free modules are static imports; every module transitively
+  importing `supabase.js` is dynamically imported inside `main()` AFTER a dummy
+  Supabase env is set at the top, so the wrapper's positive-control reaches the
+  fetch boundary. Production `claimSourceExportAttempt` imported under an alias
+  (`prodClaimSourceExportAttempt`) to avoid colliding with the pure claim MODEL.
+  File is 7-bit ASCII, LF-only, no BOM.
+- **Root cause of the "unreadable" symptom is environmental.** In this Windows
+  sandbox, PowerShell `Get-Content` / `[System.IO.File]::ReadAllBytes` block on
+  ANY file under the project dir, yet a trivial `Write-Output` runs instantly
+  and the SAME bytes copied to `%TEMP%` are read by `Get-Content -TotalCount 5`
+  immediately -- an AV / Controlled-Folder-Access artifact of the project path,
+  not the file. `node --check`, `fs.readFileSync`, and the full suite read it
+  fine. Verify readability with `node --check` / a normal read.
+- **Proof from this worktree.** `node --check scripts/scheduler-v2.test.mjs`
+  exits 0; `npm run test:scheduler-v2` = **56** assertions, exit 0;
+  `npm run verify` green (**361** assertions) + `build:check`; `git diff --check`
+  clean. Both removed paths are absent from the worktree, `git ls-files`, and
+  `git ls-tree -r HEAD`. Consolidation commit `087f740`; this docs update follows.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
