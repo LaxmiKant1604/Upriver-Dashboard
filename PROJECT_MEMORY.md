@@ -3979,6 +3979,48 @@ untracked.
   deploy, or apply migrations until the Phase 1d review and live gates pass.
 - `HANDOFF.md` remains untracked and must remain uncommitted.
 
+### Scheduler v2 Phase 1d -- report-derivation foundation started (Claude, 2026-08-07)
+
+From HEAD `852c865` (Phase 1c approved). SHADOW MODE; Scheduler v1 / frontend /
+manual refresh / `feature/design-system` untouched; nothing pushed/merged/
+deployed and NO migration applied; Phase 1e/1f (Admin Sync Center, pg_cron,
+refresh removal) NOT started. `HANDOFF.md` stays untracked. See SCHEDULER_V2.md
+section 21 for the full derivation dependency map.
+
+- **Delivered this session (foundation + first faithful tranche).** A pure,
+  transport-free report-derivation layer that derives report snapshots ONLY from
+  already-saved canonical source rows (`source_export_cache`), with ZERO DataDoe
+  exports (structural: the derivation modules import no datadoe/supabase, proven
+  by a test). New modules: `reports/derivation-core.js` (pure calc cores extracted
+  verbatim; route unchanged), `sync/report-derivation.js` (registry + dependency
+  map + `deriveReportSnapshot` orchestrator + `compareReportPayloads` parity),
+  `sync/report-worker.js` (checkpointable idempotent `runReportJobs`; separate
+  fetch/derive/validate/save accounting; last-known-good; failure isolation),
+  `sync/report-snapshot-store.js` (Supabase report store + cache-only loader +
+  shadow snapshot saver + no-refetch parity). `supabase.js` gained
+  `sync_report_jobs` wrappers (atomic one-derive via a conditional PATCH -- no new
+  RPC/migration) + `report_*` cycle counters.
+- **derive() WIRED + parity-safe:** brand-sales, content-changes (reuse the pure
+  leaf; route byte-identical). **Dependency map DECLARED for all 13** + derived-only
+  (brand-view, priority-feed, brand-directory); the other 11 derive cores are
+  PENDING extraction (next tranche, each with a golden parity test).
+- **Shadow snapshots** are namespaced `scheduler-v2/<reportKey>` so v2 never
+  overwrites production `report_snapshots`.
+- **Decisions (from the user this session):** reuse strategy = "safest per report"
+  (copy-into-pure-leaf + golden parity where verify does not exercise the fold, as
+  used for brand-sales/content-changes; extract-and-move only where verify already
+  covers it -- documented per report); scope = "foundation + first faithful
+  tranche," remaining adapters handed to the next session.
+- **Verification (this worktree):** `node --check` on every changed file exit 0;
+  `node scripts/scheduler-v2-report-derivation.test.mjs` = **20** assertions,
+  natural exit 0, zero fetch calls; `npm run test:scheduler-v2` = 56;
+  `npm run test:report-contracts` = 155; full `npm run verify` green = **381**
+  (54+60+23+6+56+**20**+7+155) + `build:check`; `git diff --check` clean.
+- **request_hash golden unchanged** (identity code untouched; a pinned brand-sales
+  golden is asserted in the Phase 1d suite).
+- Commits: `0541976` (impl), `bbaed0c` (tests+verify wiring), `54955fd` (fba map
+  fix); docs in the commit that follows.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

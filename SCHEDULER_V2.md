@@ -961,3 +961,104 @@ freshly-written project-dir file hang under Defender's on-access scan (trivial P
 node, and git all succeed; the same bytes read fine once the scan settles). This is an
 environmental scan artifact, not a file defect; a fresh Codex checkout has no such state, so
 the PowerShell proofs will pass there.
+
+---
+
+## 21. Phase 1d -- report-derivation foundation (SHADOW MODE, 2026-08-07)
+
+The report half of a cycle: derive report snapshots PURELY from already-saved canonical
+source rows (`source_export_cache`) with **zero DataDoe exports**. Commits `0541976` (impl),
+`bbaed0c` (tests), `54955fd` (fba map fix). SHADOW MODE -- not wired to any route/cron, does
+not change what pages read; Scheduler v1 / frontend / manual refresh / `feature/design-system`
+untouched; nothing pushed/merged/deployed and **no migration applied** (`sync_report_jobs`
+already exists in `20260807_scheduler_v2.sql`; the atomic one-derive guard is a conditional
+PATCH, so no new RPC/migration is needed).
+
+### 21.1 Modules
+
+- **`lib/server/reports/derivation-core.js`** -- PURE, dependency-free leaf. Report calc cores
+  extracted VERBATIM from `api/datadoe.js` (brand-sales `orderSalesByBrand`/`catalogBrandNames`;
+  content-changes `compactContentChangeEvents` + `notificationAsins`/`compactJsonPreview`/
+  `parseJsonValue`). The route is unchanged (its "one implementation / no risky cross-file
+  move" annotation is respected); a golden parity test pins byte-identical output. Because
+  this leaf imports nothing, a derivation adapter cannot reach a DataDoe export.
+- **`lib/server/sync/report-derivation.js`** -- the derivation registry (dependency map) + the
+  PURE `deriveReportSnapshot` orchestrator + `compareReportPayloads` (no-refetch parity) +
+  shadow-key namespacing. Imports only pure leaves (derivation-core, report-source-contracts,
+  planner); NEVER datadoe/supabase.
+- **`lib/server/sync/report-worker.js`** -- checkpointable, idempotent `runReportJobs` worker
+  (transport-free; all I/O injected). Gates required deps via `reportFetchGate`, claims derive
+  once, derives + validates + saves a versioned SHADOW snapshot, with SEPARATE fetch/derive/
+  validate/save accounting and per-report failure isolation.
+- **`lib/server/sync/report-snapshot-store.js`** -- production wiring: `makeSupabaseReportStore`,
+  `makeSourceRowLoader` (cache-only `getSourceExportCache`), `makeShadowSnapshotSaver`, and
+  `compareShadowToProduction`.
+- **`supabase.js`** -- `sync_report_jobs` wrappers: `getSyncReportJobs`, `upsertSyncReportJob`
+  (fail-closed connection id), `claimReportDeriveAttempt` (conditional PATCH pending->running),
+  `recordSyncReportBlocked/Failure/Success` (save vs derive are distinct stages; failure never
+  clears `snapshot_params_hash`/`last_good_snapshot_at`); `updateSyncCycleCounts` extended with
+  the existing `report_*` counters.
+
+### 21.2 Shadow snapshots
+
+v2 snapshots are written through the existing `saveReportSnapshot` under a namespaced report
+key `scheduler-v2/<reportKey>` (so a v2 snapshot can NEVER overwrite a production
+`report_snapshots` row). Each report job records its `snapshot_params_hash`.
+`compareShadowToProduction({productionReportKey, accountId, params})` loads the saved shadow
+snapshot and the saved production snapshot and structurally diffs them -- **no re-fetch, no
+export** -- for pre-cutover parity review.
+
+### 21.3 Derivation dependency map (from the executable registry)
+
+`derive` = WIRED (faithful pure core, parity-tested) or PENDING (dependency map declared; the
+pure-core extraction from the impure builder is the next tranche). Snapshot version tags are
+Phase-1d shadow tags. Required keys are computed from `REPORT_SOURCE_CONTRACTS` (never drift).
+
+| Report | derive | required request keys | optional | derived (persisted, non-DataDoe) |
+|---|---|---|---|---|
+| brand-sales | WIRED | order-lines, catalog | -- | -- |
+| content-changes | WIRED | events, catalog | -- | -- |
+| daily-reporting | pending | asin-day-superset, catalog | -- | ads-campaign-date |
+| fba-plan | pending | monthly-units, current-daily-dates, catalog, inventory-health | awd (US-only) | -- |
+| reconciliation | pending | order-lines, settlements, catalog | -- | -- |
+| sku-pl | pending | monthly-profit | -- | (COGS from Supabase) |
+| keyword-rank | pending | sqp-weekly, catalog | sqp-monthly (fallback) | -- |
+| sales-movers | pending | sales-latest-probe, traffic, ads, inventory, catalog | -- | -- |
+| buy-box-loss | pending | daily, inventory, catalog | -- | -- |
+| returns-leakage | pending | returns, settlements, traffic, catalog | -- | -- |
+| listing-health | pending | listings, sales, inventory, catalog | listings-raw (degraded) | -- |
+| listing-optimizer | pending | catalog | sqp-weekly (degraded/staged) | -- |
+| ppc-performance | pending | catalog | total-sales (currency-gated) | ads-campaign/asin/targeting/search-terms-date |
+
+**Derived-only** (own zero source contracts, create no source job): `brand-view`,
+`priority-feed`, `brand-directory`. `reportDerivationCoverage()` proves every scheduler-declared
+report is mapped exactly once (declared derivation OR derived-only; `missing`/`both` empty).
+
+### 21.4 Safety rules enforced (tested)
+
+Derive only from validated saved arrays (`[]` is valid); a cache miss / malformed / failed /
+truncated source is NEVER an empty success; a required source unavailable => not derived
+(last-known-good snapshot preserved); terminal-disabled required => blocked (that report only);
+optional/degraded never blocks; save failure is a distinct stage from derive; one report's
+failure never blocks another; repeated workers never re-derive a finished report;
+primary/dd-secondary never mix (no brand leakage); PPC owns no Ads export; derived-only reports
+own no source contracts; golden `request_hash` unchanged.
+
+### 21.5 Tests / status
+
+`scripts/scheduler-v2-report-derivation.test.mjs` = **20 assertions** (`test:report-derivation`,
+added to `npm run verify`). Full `npm run verify` green: **381** (54 insights + 60 brand-view +
+23 sync + 6 source-cache + 56 scheduler-v2 + **20 report-derivation** + 7 source-identity + 155
+report-contracts) + `build:check`; `node --check` on every changed file exits 0;
+`git diff --check` clean.
+
+### 21.6 Remaining (next tranche + live gates)
+
+- Wire the 11 PENDING `derive` cores (extract-and-parity per the safest per-report choice):
+  daily-reporting (superset all-brand + named-brand + ads merge), fba-plan (inline handler
+  extraction + AWD conditional), reconciliation + sku-pl (monthly segmentation), keyword-rank,
+  and the five insight reports + PPC (persisted-ads rollup). Each lands with a golden parity
+  test against its current builder output.
+- Derived-only derive (brand-view/priority-feed/brand-directory) reads other saved snapshots.
+- Live gates (Codex): a real cycle deriving from real saved rows; superset-vs-compact Daily
+  reconciliation; per-org disabled-source classification; Ads-history freshness before PPC.
