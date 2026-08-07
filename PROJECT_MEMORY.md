@@ -3952,6 +3952,33 @@ untracked.
   so the PowerShell `Test-Path`/`Get-Content`/copy proofs will pass there.
 - Commits: rename `93aa426`; docs in the commit that follows.
 
+### Scheduler v2 Phase 1c final approval (Codex, 2026-08-07)
+
+- Re-reviewed commits `93aa426` and `723e811`. No code findings remain. The
+  diff from review base `142c43d` contains only the test-file rename,
+  `package.json` command update, and documentation; production scheduler code,
+  Scheduler v1, frontend code, migrations, request hashing, and report logic are
+  unchanged.
+- Verified from this Codex checkout that the historical path
+  `scripts/scheduler-v2.test.mjs` is absent from the worktree, Git index, and
+  HEAD tree. The only tracked Scheduler v2 suite is
+  `scripts/scheduler-v2-verification.test.mjs`.
+- Direct verification passed: `node --check` exit 0; direct Node execution ran
+  all 56 assertions and exited naturally; `npm run test:scheduler-v2` passed all
+  56 assertions. This command runner reports its own stdout `PipeWrap` before
+  exit, which is expected and did not keep the process alive.
+- Full `npm run verify` passed after granting Vite/esbuild permission to spawn
+  its build helper: **361 assertions** (54+60+23+6+56+7+155), 2,393 modules
+  transformed, and the production bundle built successfully. The first
+  sandboxed build attempt failed only with `spawn EPERM`; the approved rerun
+  completed normally. `git diff --check` is clean.
+- **Phase 1c is approved.** Phase 1d is now the next implementation phase:
+  derive validated report snapshots solely from saved canonical source payloads,
+  preserve last-known-good snapshots on every failure, and perform no additional
+  DataDoe exports during derivation. Continue in shadow mode; do not push, merge,
+  deploy, or apply migrations until the Phase 1d review and live gates pass.
+- `HANDOFF.md` remains untracked and must remain uncommitted.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
