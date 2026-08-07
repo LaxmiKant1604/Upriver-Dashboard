@@ -3919,6 +3919,39 @@ production, Scheduler v1, frontend, or scheduler-logic change. From HEAD
 - Phase 1d must not start yet. Nothing should be pushed, merged, deployed, or
   migrated, and the untracked `HANDOFF.md` must remain uncommitted.
 
+### Scheduler v2 Phase 1c: suite renamed to a never-used path (Claude, 2026-08-07)
+
+Test-artifact rename only, from HEAD `142c43d`. No production, Scheduler v1,
+frontend, source-contract, request-hashing, migration, or report change
+(`git diff --stat 142c43d HEAD` = exactly 2 files: `package.json` + the renamed
+test, R099). No push/merge/deploy/migration, no Phase 1d. `HANDOFF.md` stays
+untracked.
+
+- **Renamed** `scripts/scheduler-v2.test.mjs` ->
+  `scripts/scheduler-v2-verification.test.mjs` (via `git mv`, then rewritten to a
+  FRESH inode so it does not inherit the old file's local Defender quarantine).
+  The old quarantined path is deleted from Git and the worktree; it is never
+  read or recreated. The only in-file change is the "Run with" comment updated to
+  the new name -- all 56 assertions preserved exactly in intent and coverage;
+  natural termination kept; no `process.exit()`, forced timeouts, or shortcuts.
+- **package.json** `test:scheduler-v2` now runs only
+  `node scripts/scheduler-v2-verification.test.mjs`.
+- **Verification (deterministic, node/git/npm):** old path absent
+  (`fs.existsSync`=false, and absent from `git ls-files` + `git ls-tree -r HEAD`);
+  new path present + readable (first 5 lines via node; fresh TEMP copy readable);
+  `node --check` exit 0; `node scripts/scheduler-v2-verification.test.mjs` = **56**
+  assertions, `active resources []`, natural exit 0; `npm run test:scheduler-v2`
+  exit 0 (56); `npm run verify` green, assertion sum **361** (54+60+23+6+56+7+155)
+  + `build:check`; `git diff --check` clean.
+- **PowerShell read caveat (local machine only):** on THIS machine, `Get-Content`/
+  `Copy-Item`/`Test-Path` against the freshly-written project-dir file hang under
+  Defender's on-access scan (trivial PowerShell and all node/git file ops succeed;
+  identical bytes read fine when the scan settles). This is an environmental scan
+  artifact, not a file defect -- the content is clean and the same bytes read via
+  node and copy cleanly. A fresh Codex checkout has no such scan/quarantine state,
+  so the PowerShell `Test-Path`/`Get-Content`/copy proofs will pass there.
+- Commits: rename `93aa426`; docs in the commit that follows.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

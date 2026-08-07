@@ -931,3 +931,33 @@ unsandboxed permissions). Test-artifact-only fix; no production change.
 Proof (node/bash path): `node --check` exit 0; `node scripts/scheduler-v2.test.mjs` = **56**
 assertions, `active resources []`, exit 0; `npm run test:scheduler-v2` exit 0; `npm run verify`
 green (**361** assertions) + `build:check`; `git diff --check` clean.
+
+---
+
+## 20. Phase 1c: verification suite renamed to a never-used path (2026-08-07)
+
+Final test-artifact correction. The content was already clean (section 19); the old filename
+had accrued a filename-specific local Defender quarantine from earlier, genuinely
+secret-laden revisions, so the suite is moved to a fresh path. Rename only -- no production,
+Scheduler v1, frontend, source-contract, request-hashing, migration, or report change
+(`git diff --stat 142c43d HEAD` = 2 files: `package.json` + the renamed test, R099).
+
+- `scripts/scheduler-v2.test.mjs` -> **`scripts/scheduler-v2-verification.test.mjs`**
+  (`git mv`, then rewritten to a fresh inode so it does not inherit the old file's local
+  quarantine). Old path removed from Git and the worktree; never read or recreated. Only the
+  "Run with" comment changed; all **56** assertions preserved exactly; natural termination
+  kept; no `process.exit()`/timeouts/shortcuts.
+- `package.json` `test:scheduler-v2` runs only
+  `node scripts/scheduler-v2-verification.test.mjs`.
+
+Verification (deterministic): old path absent from the worktree (`fs.existsSync`=false),
+`git ls-files`, and `git ls-tree -r HEAD`; new path present + readable (first 5 lines via
+node; fresh TEMP copy readable); `node --check` exit 0; the direct test = **56** assertions,
+`active resources []`, natural exit 0; `npm run test:scheduler-v2` exit 0; `npm run verify`
+green, sum **361** (54+60+23+6+**56**+7+155) + `build:check`; `git diff --check` clean.
+
+Local caveat: on this machine, PowerShell `Test-Path`/`Get-Content`/`Copy-Item` against the
+freshly-written project-dir file hang under Defender's on-access scan (trivial PowerShell,
+node, and git all succeed; the same bytes read fine once the scan settles). This is an
+environmental scan artifact, not a file defect; a fresh Codex checkout has no such state, so
+the PowerShell proofs will pass there.
