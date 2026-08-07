@@ -4021,6 +4021,50 @@ section 21 for the full derivation dependency map.
 - Commits: `0541976` (impl), `bbaed0c` (tests+verify wiring), `54955fd` (fba map
   fix); docs in the commit that follows.
 
+### Scheduler v2 Phase 1d foundation review (Codex, 2026-08-07)
+
+- Reviewed commits `0541976`, `bbaed0c`, `54955fd`, and `deac9ba`. The submitted
+  gates are green: focused derivation (20), Scheduler v2 (56), report contracts
+  (155), and full `npm run verify` (**381 assertions** plus a successful 2,393-module
+  production build). This does not yet approve Phase 1d because the new tests do
+  not exercise four production-state defects below.
+- **Blocker 1 -- blocked report jobs never finish.** `reportFinished()` does not
+  consider `fetch_status='blocked'`, while `recordSyncReportBlocked()` changes only
+  `fetch_status`. A blocked job remains `derive_status='pending'` (or `running`),
+  is reprocessed on every invocation, and keeps the cycle `drained=false`. Record
+  blocked reports as terminal for this cycle (`derive_status`/`save_status` skipped,
+  or make the finish predicate consistently recognize blocked) and prove a second
+  invocation performs no additional write/work.
+- **Blocker 2 -- segmented/chunked source payloads are overwritten.** The worker
+  assigns `sources[s.requestKey]` once per planned source; multiple request hashes
+  for the same request key overwrite earlier five-ID chunks/month windows. The
+  next adapters (Daily, SKU P&L, FBA, Reconciliation, Buy Box) therefore cannot
+  derive complete reports. Preserve every fragment with its request metadata
+  (`requestHash`, `from`, `to`, account chunk, rows), and expose deterministic
+  ordered fragments or a report-specific safe fold. FBA monthly rows need their
+  window metadata because their grouped rows do not contain the month.
+- **Blocker 3 -- Content Changes is not production-payload compatible.** The
+  production route returns `accountId`, `events`, `catalogBrands`, `retrievedAt`,
+  and `unassignedEvents`; the shadow adapter returns only `events` and
+  `catalogBrands`. The frontend reads `unassignedEvents`. Also, the adapter's
+  `latestDataDate` returns an event timestamp, but `sync_report_jobs.latest_data_date`
+  is a Postgres `date`; a real success write can fail after the snapshot save.
+  Produce the complete payload from deterministic context/source metadata and
+  normalize the job date to `YYYY-MM-DD` before the database write.
+- **Blocker 4 -- parity proof is self-referential.** `api/datadoe.js` remains
+  unchanged and still owns duplicate local folds, while the new test compares the
+  new adapter output with the same newly copied pure function. This cannot detect
+  drift from the production route, despite comments claiming one implementation.
+  For the two clean folds, either import the shared pure leaf from the route and
+  remove the duplicate functions, or add an independent golden/parity fixture
+  that executes both implementations and compares the complete payload shape.
+- Add the missing regression tests for blocked-job drain/idempotency, two fragments
+  sharing one request key (including month metadata), complete Content Changes
+  parity/date persistence, and actual route-vs-derivation parity. Do not begin the
+  remaining 11 adapters until these foundation defects are corrected.
+- Phase 1d is **not approved yet**. Continue in shadow mode; do not push, merge,
+  deploy, apply migrations, or commit the untracked `HANDOFF.md`.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
