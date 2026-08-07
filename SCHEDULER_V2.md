@@ -779,3 +779,48 @@ MODE; Scheduler v1 / frontend / manual refresh untouched; not pushed/merged/depl
 Tests: sync 22 + worker 27; full `npm run verify` green (**354**); `node --check` on every
 changed file exits 0; `git diff --check` clean; golden `request_hash` and five-ID batching
 unchanged; shared v1 `saveSourceExportCache` untouched.
+
+---
+
+## 16. Phase 1c second-correction re-review fixes (2026-08-07)
+
+SHADOW MODE; Scheduler v1 / frontend / manual refresh / `feature/design-system` untouched;
+not pushed/merged/deployed and no migration applied.
+
+- **Fix 1 — worker test readability blocker, resolved by a genuinely fresh artifact.** The
+  earlier `scheduler-v2-worker.test.mjs` remained unreadable on the review machine even with
+  the LF `.gitattributes` policy. Root cause of the review symptom: PowerShell
+  `[System.IO.File]::ReadAllBytes()` blocks on files in that sandbox (it hangs on the
+  known-good `scheduler-v2.test.mjs` too), i.e. an environment/AV artifact of the .NET file
+  API, not the bytes. Rather than argue the environment, the file was **replaced with a new
+  filename and fresh bytes**: `scripts/scheduler-v2-source-worker.test.mjs`, written 7-bit
+  ASCII (highBytes=0), LF-only (CR=0), no BOM, no top-level await. The old artifact was
+  `git rm`-removed. `package.json` `test:scheduler-v2` now runs
+  `scheduler-v2.test.mjs && scheduler-v2-source-worker.test.mjs && scheduler-v2-supabase-wrapper.test.mjs`.
+  A normal file read (Read tool / `fs.readFileSync`), both `node --check` commands, the
+  focused suite, and full `npm run verify` all complete from this checkout.
+- **Fix 2 — concurrent source-cache publication is now self-consistent.**
+  `atomicSaveSourcePayload` previously returned a concurrent writer's object path as this
+  attempt's success while the worker kept recording its OWN rows/row-count — pairing one
+  payload's rows/count with another payload's path. It now returns a self-consistent result
+  `{ objectPath, rows, rowCount, payloadBytes, winner }`. When read-back shows a DIFFERENT
+  winner it **adopts** that winner: loads and validates the winner's object and returns the
+  WINNER's rows, row count, bytes and path. If the winner cannot be read/validated it throws
+  a typed `SourceCachePointerConflictError` (`code: "CACHE_CONFLICT"`), preserving BOTH
+  immutable objects. The worker records the winner's rows/count/path on adoption, or a
+  benign NON-terminal `persist`/`CACHE_CONFLICT` non-success on an un-adoptable conflict
+  (no path recorded, previous last-known-good preserved). Concurrency tests use visibly
+  different row sets and row counts (winner 3 rows vs this attempt's 1).
+- **Fix 3 — durable job upsert enforces the fingerprint handoff invariant.**
+  `upsertSyncSourceJob` now REQUIRES a non-empty `organizationFingerprint` and rejects
+  BEFORE any PostgREST request — so a fingerprint-less job is never written (and never as an
+  empty string) and never reaches the one-attempt claim (`claim_source_export_attempt`) or
+  the DataDoe adapter that key routing off that row. A production-wrapper test drives the
+  REAL `lib/server/supabase.js` with a fetch spy: an empty/missing fingerprint rejects with
+  ZERO PostgREST calls; a well-formed job is the positive control that reaches exactly one
+  `sync_source_jobs` insert; the claim RPC is proven reachable only when invoked directly.
+
+Tests: sync 22 + source-worker 30 + supabase-wrapper 4 (**56** in `test:scheduler-v2`); full
+`npm run verify` green (**361** assertions) plus the production `build:check`; `node --check`
+on every changed/added file exits 0; golden `request_hash`, five-ID batching, and shared v1
+`saveSourceExportCache` all unchanged.

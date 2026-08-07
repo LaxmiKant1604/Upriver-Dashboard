@@ -3654,6 +3654,50 @@ exact 06:00 local time becomes a business requirement.
   remains at `e90c268`. Keep Scheduler v2 in shadow mode until these findings
   pass re-review.
 
+### Scheduler v2 Phase 1c second-correction fixes applied (Claude, 2026-08-07)
+
+Fixed ONLY the three remaining blockers from the review above, on
+`feature/scheduler-v2` from HEAD `0379210`. Small local commits, no push/merge/
+deploy, no migration applied, no Phase 1d work. Scheduler v1, frontend, manual
+refresh, and `feature/design-system` (`e90c268`) untouched. Shadow mode intact.
+
+- **Fix 1 (worker-test blocker) -- `efe4473`.** Diagnosed the review symptom:
+  PowerShell `[System.IO.File]::ReadAllBytes()` blocks on files in the sandbox
+  (it hangs on the known-good `scheduler-v2.test.mjs` too, producing empty
+  output) -- an environment/AV artifact of the .NET file API, NOT the bytes.
+  `node --check`, `fs.readFileSync`, and the normal Read tool all succeed.
+  Per instruction, replaced the artifact with a genuinely new filename + fresh
+  bytes: removed `scripts/scheduler-v2-worker.test.mjs`; added
+  `scripts/scheduler-v2-source-worker.test.mjs` (7-bit ASCII, highBytes=0,
+  LF-only CR=0, no BOM, no top-level await) preserving all prior coverage;
+  added `scripts/scheduler-v2-supabase-wrapper.test.mjs`; updated
+  `package.json test:scheduler-v2` to run all three.
+- **Fix 2 (concurrent cache publication) -- `8c57448`.**
+  `atomicSaveSourcePayload` returns a self-consistent
+  `{ objectPath, rows, rowCount, payloadBytes, winner }`. A different read-back
+  winner is ADOPTED (winner's object loaded + validated; winner's rows/count/
+  bytes/path returned); an un-adoptable winner throws typed
+  `SourceCachePointerConflictError` (`CACHE_CONFLICT`) preserving both objects.
+  The worker records the winner's rows/count/path on adoption, else a benign
+  non-terminal persist `CACHE_CONFLICT` non-success. It never combines one
+  payload's rows/count with another payload's object path. Concurrency tests
+  use visibly different rows and row counts (winner 3 vs this attempt's 1).
+- **Fix 3 (fingerprint invariant) -- `2ac60e9`.** `upsertSyncSourceJob`
+  requires a non-empty `organizationFingerprint` and rejects BEFORE any
+  PostgREST request (no empty-string write), so a fingerprint-less job never
+  reaches the durable insert or the one-attempt claim. Production-wrapper test
+  drives the REAL `supabase.js` with a fetch spy: empty/missing fingerprint
+  rejects with zero PostgREST calls; a well-formed job reaches exactly one
+  `sync_source_jobs` insert; the claim RPC is reachable only when invoked.
+- **Verification from this checkout.** Normal file read of the new worker test
+  succeeds. `node --check scripts/scheduler-v2.test.mjs`,
+  `node --check scripts/scheduler-v2-source-worker.test.mjs`, and
+  `node --check scripts/scheduler-v2-supabase-wrapper.test.mjs` all exit 0.
+  `npm run test:scheduler-v2` = 22 + 30 + 4 = **56** assertions, exit 0.
+  `npm run verify` green (**361** assertions across all suites) plus the
+  production `build:check` (bundle built, >500 kB chunk present). Docs updated
+  in the follow-up docs commit.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
