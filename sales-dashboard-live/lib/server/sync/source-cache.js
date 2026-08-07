@@ -29,6 +29,26 @@ export function versionedObjectPath(requestHash, version) {
   return `source-cache/v2/${safeHash.slice(0, 2)}/${safeHash}/${safeVersion}.json`;
 }
 
+// Raised when a CONCURRENT cycle already holds this request_hash's cache pointer and its
+// object cannot be adopted here. Both immutable objects are preserved; the caller records a
+// benign, non-terminal persist conflict rather than combining this attempt's rows with the
+// other object's path.
+export class SourceCachePointerConflictError extends Error {
+  constructor(winnerPath, ownPath) {
+    super("A concurrent cycle holds this request's cache pointer; both objects were preserved and this attempt was NOT recorded as the winner.");
+    this.name = "SourceCachePointerConflictError";
+    this.code = "CACHE_CONFLICT";
+    this.winnerPath = winnerPath;
+    this.ownPath = ownPath;
+  }
+}
+
+// Approximate the stored payload size the same way the worker does (bytes of the rows
+// array). Used for the adopted-winner branch, where we recompute from the winner's rows.
+function approxPayloadBytes(rows) {
+  try { return Buffer.byteLength(JSON.stringify(rows ?? [])); } catch { return 0; }
+}
+
 /**
  * Atomically publish a source payload as the new last-known-good.
  *
@@ -44,6 +64,14 @@ export function versionedObjectPath(requestHash, version) {
  * the caller sees a persist failure.
  *
  * A successful save REQUIRES a positively confirmed, non-empty object path.
+ *
+ * Returns a self-consistent result object: { objectPath, rows, rowCount, payloadBytes,
+ * winner }. `winner` is "self" when our own object won the pointer, or "concurrent" when a
+ * DIFFERENT cycle won and we ADOPTED its object — in which case rows/rowCount/payloadBytes
+ * are the WINNER's, never this attempt's, so a caller can never combine one payload's
+ * rows/count with another payload's path. If a concurrent winner exists but its object
+ * cannot be read/validated here, it throws a SourceCachePointerConflictError (code
+ * "CACHE_CONFLICT") and preserves BOTH objects.
  */
 export async function atomicSaveSourcePayload({
   storage, metadata, requestHash, sourceId, organizationFingerprint,
@@ -82,13 +110,40 @@ export async function atomicSaveSourcePayload({
     if (previousPath && previousPath !== newPath) {
       await Promise.resolve(storage.delete(previousPath)).catch(() => {});
     }
-    return newPath;
+    return {
+      objectPath: newPath,
+      rows,
+      rowCount: rows.length,
+      payloadBytes: typeof payloadBytes === "number" ? payloadBytes : approxPayloadBytes(rows),
+      winner: "self",
+    };
   }
   if (confirmedPath && confirmedPath !== previousPath) {
-    // A CONCURRENT cycle committed a different new version for this request_hash. Its object
-    // is the live pointer; ours is a harmless orphan (left for later cleanup). Never delete
-    // the concurrent winner or our orphan here.
-    return confirmedPath;
+    // A CONCURRENT cycle committed a DIFFERENT object for this request_hash and won the
+    // pointer. We must NEVER report success with OUR rows/row-count under the winner's path.
+    // ADOPT the winner: load and validate its object, then return the winner's rows, row
+    // count, bytes and path as one self-consistent result. Our own uploaded object is a
+    // harmless orphan (never deleted here); the concurrent winner is never deleted either.
+    let winnerRows = null;
+    try {
+      const winnerPayload = await Promise.resolve(storage.get(confirmedPath));
+      if (winnerPayload && Array.isArray(winnerPayload.rows)) winnerRows = winnerPayload.rows;
+    } catch (_readError) {
+      winnerRows = null;
+    }
+    if (winnerRows === null) {
+      // The winner holds the live pointer but is not readable/valid from here. Fail closed
+      // with a typed conflict, preserving BOTH immutable objects, so the caller records a
+      // non-success instead of pairing mismatched rows and path.
+      throw new SourceCachePointerConflictError(confirmedPath, newPath);
+    }
+    return {
+      objectPath: confirmedPath,
+      rows: winnerRows,
+      rowCount: winnerRows.length,
+      payloadBytes: approxPayloadBytes(winnerRows),
+      winner: "concurrent",
+    };
   }
   // Unconfirmed: the pointer still shows the previous object (or is unreadable). Leave the
   // new object as an orphan, keep the previous last-known-good intact, and fail closed so

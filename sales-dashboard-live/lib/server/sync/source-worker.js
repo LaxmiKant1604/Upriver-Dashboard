@@ -19,7 +19,10 @@
 //     openCycle, claimCycle, getCycle, upsertSourceJob, listSourceJobs,
 //     claimExportAttempt(cycleId, requestHash) -> boolean,
 //     recordExportCreated({cycleId, requestHash, exportId}) -> void,  // persist id, keep 'attempted'
-//     saveSourceRows({job, rows, payloadBytes, exportId, version}) -> objectPath (non-empty),
+//     saveSourceRows({job, rows, payloadBytes, exportId, version})
+//        -> objectPath string, OR { objectPath, rows, rowCount, payloadBytes } when a
+//           concurrent winner was adopted; throws code "CACHE_CONFLICT" on an un-adoptable
+//           concurrent pointer,
 //     recordSourceSuccess({...}) -> void,
 //     recordSourceFailure({...}) -> void,
 //     updateCycleCounts(cycleId, {sourceTotal, sourceSucceeded, sourceFailed}) -> void,
@@ -178,20 +181,35 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   // ---- STEP 7: persist (atomic last-known-good). A save error / empty object path is a
   // SEPARATE persist-stage failure and never overwrites the previous good data. ----
   const payloadBytes = approxPayloadBytes(rows);
-  let objectPath = null;
+  let saveResult;
   try {
-    objectPath = await store.saveSourceRows({ job, rows, payloadBytes, exportId, version: `${cycleId}-${exportId}` });
+    saveResult = await store.saveSourceRows({ job, rows, payloadBytes, exportId, version: `${cycleId}-${exportId}` });
   } catch (error) {
+    // A concurrent cycle that ALREADY holds this request's cache pointer is a benign,
+    // non-terminal persist conflict, not data loss: we record NO success rather than pair
+    // our rows/count with the other cycle's object path. Any other save error is a terminal
+    // persist failure. Both preserve the previous last-known-good.
+    if (error && error.code === "CACHE_CONFLICT") {
+      return fail("persist", "CACHE_CONFLICT", "A concurrent cycle already published this source's cache; this attempt was not recorded as the winner.", false, rows.length);
+    }
     return fail("persist", "SAVE_FAILED", "Saving the source result failed; previous data preserved.", true, rows.length);
   }
+  // A store returns EITHER a plain object-path string (its own confirmed object) OR a
+  // structured { objectPath, rows, rowCount, payloadBytes } when a concurrent winner was
+  // ADOPTED. In the adopted case we MUST record the WINNER's rows/count/bytes under the
+  // WINNER's path — never this attempt's rows under another object's path.
+  const objectPath = typeof saveResult === "string" ? saveResult : (saveResult && saveResult.objectPath) || null;
+  const savedRows = saveResult && Array.isArray(saveResult.rows) ? saveResult.rows : rows;
+  const savedRowCount = saveResult && typeof saveResult.rowCount === "number" ? saveResult.rowCount : rows.length;
+  const savedBytes = saveResult && typeof saveResult.payloadBytes === "number" ? saveResult.payloadBytes : payloadBytes;
   if (!objectPath) {
     return fail("persist", "SAVE_NO_PATH", "Source save returned no object path; treated as a failure.", true, rows.length);
   }
 
   // ---- STEP 8: record success ----
-  await store.recordSourceSuccess({ cycleId, requestHash, exportId, rowCount: rows.length, payloadBytes, durationMs: clock() - started, cacheObjectPath: objectPath });
+  await store.recordSourceSuccess({ cycleId, requestHash, exportId, rowCount: savedRowCount, payloadBytes: savedBytes, durationMs: clock() - started, cacheObjectPath: objectPath });
   progress.succeeded += 1;
-  return { requestKey, requestHash, status: "success", validated: true, rowCount: rows.length, rows };
+  return { requestKey, requestHash, status: "success", validated: true, rowCount: savedRowCount, rows: savedRows };
 }
 
 /**
