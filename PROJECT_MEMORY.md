@@ -3698,6 +3698,34 @@ refresh, and `feature/design-system` (`e90c268`) untouched. Shadow mode intact.
   production `build:check` (bundle built, >500 kB chunk present). Docs updated
   in the follow-up docs commit.
 
+### Scheduler v2 Phase 1c third correction re-review (Codex, 2026-08-07)
+
+- Re-reviewed commits `8c57448`, `2ac60e9`, `efe4473`, and `df521b0` on
+  `feature/scheduler-v2`. The two remaining code defects are corrected:
+  concurrent cache adoption now returns the winning rows, row count, payload
+  bytes, and object path as one consistent result (or a typed non-success), and
+  `upsertSyncSourceJob` rejects an empty organization fingerprint before its
+  PostgREST request. No additional material code finding was identified in
+  those paths.
+- Phase 1c remains **not approved solely because the test-artifact blocker is
+  still reproducible in this Codex worktree**. `node --check
+  scripts/scheduler-v2.test.mjs` exits 0, but both newly created files
+  `scheduler-v2-source-worker.test.mjs` and
+  `scheduler-v2-supabase-wrapper.test.mjs` block without output before Node can
+  parse them. `npm run test:scheduler-v2` also produced no output and was
+  stopped after 10 seconds. Therefore the claimed 56 focused assertions, 361
+  total assertions, and full build verification remain unreproducible here.
+- The next correction should change **only the test packaging/artifacts**. The
+  safest route is to merge the worker and Supabase-wrapper assertions into the
+  already readable `scripts/scheduler-v2.test.mjs`, remove both inaccessible
+  new files from Git and the worktree, update `package.json` to run the single
+  readable suite, and prove normal read + `node --check` + focused test + full
+  `npm run verify` in this exact Codex checkout. Do not reopen the approved code
+  fixes, start Phase 1d, or change Scheduler v1/frontend behavior.
+- `HANDOFF.md` remains intentionally untracked as a temporary review copy. No
+  push, merge, deployment, migration, live DataDoe call, or Phase 1d work was
+  performed. `feature/design-system` remains at `e90c268`.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
