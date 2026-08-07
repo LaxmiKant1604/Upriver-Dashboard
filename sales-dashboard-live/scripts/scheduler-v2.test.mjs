@@ -10,6 +10,11 @@
 // Structure notes that keep this reproducible on every platform:
 //   - No top-level await. The async suite runs inside main(); the module body has no TLA,
 //     no timer, and no open handle. All I/O is in-memory or synchronous file reads.
+//   - Progress is emitted via SYNCHRONOUS writes (fs.writeSync) so every marker + result
+//     line lands immediately even when stdout is an npm pipe -- a silent hang is impossible
+//     to mistake for progress. Markers (stderr) bracket main(), every dynamic import, and
+//     each major test group; the runner also dumps process.getActiveResourcesInfo() before
+//     the NATURAL exit (we never call process.exit()) so any lingering handle is visible.
 //   - Only env/IO-free modules are STATIC imports (assert, node builtins, registry.js,
 //     planner.js). Every module that transitively imports lib/server/supabase.js
 //     (source-worker -> datadoe -> supabase, source-sync-driver -> supabase) is loaded
@@ -27,7 +32,7 @@
 // upsertSyncSourceJob fingerprint guard (rejected before any PostgREST request).
 
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { SCHEDULE_UTC } from "../lib/server/sync/registry.js";
@@ -65,6 +70,18 @@ const datadoeSrc = readFileSync(join(ROOT, "api", "datadoe.js"), "utf8");
 let passed = 0;
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+// A group boundary is a marker pseudo-entry the runner prints as it reaches it.
+const group = (label) => tests.push({ marker: label });
+
+// Synchronous, UNBUFFERED writes (fd 1/2) so every progress marker and test result
+// appears the instant it executes -- even when stdout is a pipe (npm) and even if a
+// later stage were to block. Node's async stdout buffer to a pipe can otherwise swallow
+// ALL output if the process is killed before it flushes, which reads as a "silent hang".
+const START = Date.now();
+const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
+const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
+
+mark("module body evaluated (static imports resolved); registering tests");
 
 /* ================================================================ pure models
    Each mirrors the corresponding SQL exactly, so we can prove the invariant in
@@ -113,6 +130,8 @@ function claimSyncCycle(cycle) {
 }
 
 /* -------------------------------------------------- source-first dedup (full identity) */
+
+group("planner / SQL / model (22 sync tests)");
 
 test("same canonical source (same request_hash) needed by 2 reports -> ONE source job", () => {
   const shared = { requestHash: "H-oli-A", sourceId: "89b27535", sourceKey: "order-line-items", connectionId: "primary", bucket: "non-us" };
@@ -484,6 +503,8 @@ const runOpts = (over) => ({ bucket: "us", cycleDate: "2026-08-07", ...over });
 
 /* ----------------------------- one-attempt / resume / checkpoint ----------------------------- */
 
+group("source worker lifecycle + routing + deadline");
+
 test("single-winner attempt claim; a worker that LOSES it creates no export", async () => {
   const guard = makeMemoryStore();
   const cid = guard.openCycle({ bucket: "us", cycleDate: "2026-08-07" });
@@ -747,6 +768,8 @@ test("a genuine DataDoe processing timeout/failure during poll stays FAILED (not
 
 /* ----------------------------- BLOCKER 4/2: atomic cache under ambiguity + concurrency ----------------------------- */
 
+group("atomic cache + concurrency");
+
 function makeCacheAdapters() {
   const objects = new Map();
   const pointer = new Map();
@@ -880,6 +903,8 @@ test("worker CONCURRENCY: an un-adoptable CACHE_CONFLICT is a benign non-termina
 
 /* ----------------------------- BLOCKER 2 (signals): reconstruction distinguishes empty vs missing ----------------------------- */
 
+group("dependency signals + reconstruction");
+
 const optResolvePlan = (signals) => {
   const win = { "listing-optimizer:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }] };
   if (signals["listing-optimizer:sqp-weekly"] && signals["listing-optimizer:sqp-weekly"].status === "success") {
@@ -953,6 +978,8 @@ test("dependency signals are derived ONLY from validated saved results", async (
 });
 
 /* ----------------------------- staged flow through the real resolver ----------------------------- */
+
+group("staged flow through the real resolver");
 
 const smFullWin = (date) => {
   const w = salesMoversWindows(date);
@@ -1063,6 +1090,8 @@ test("classifyFetchError maps to SAFE codes/terminality and never echoes the raw
    control actually reaches the network boundary.
    ============================================================================================ */
 
+group("production Supabase durable-write guards");
+
 // Install a fetch spy that records each request URL and throws a recognizable sentinel, so
 // ANY PostgREST/network call is both observable and prevented from doing real I/O.
 function withFetchSpy(run) {
@@ -1126,37 +1155,64 @@ test("the fingerprint guard runs before the one-attempt claim: a rejected upsert
   });
 });
 
-/* ---- load env-dependent modules AFTER env is set, then run the async suite (no TLA) ---- */
+/* ---- load env-dependent modules AFTER env is set, then run the async suite (no TLA) ----
+   Each dynamic import is bracketed by a synchronous progress marker so a blocking import is
+   pinpointed immediately (see the `mark`/`out` note above). The modules below transitively
+   import lib/server/datadoe.js -> lib/server/supabase.js; both only declare constants /
+   functions / one AsyncLocalStorage at module top level (no network, timer, or handle at
+   import time), so these awaits resolve promptly and open no handle. */
 async function main() {
-  ({ runSourceJobs, classifyFetchError } = await import("../lib/server/sync/source-worker.js"));
-  ({ salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes } = await import("../lib/server/sync/source-signals.js"));
-  ({ runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter } = await import("../lib/server/sync/source-sync-driver.js"));
-  ({ atomicSaveSourcePayload, validateSourcePayload, versionedObjectPath } = await import("../lib/server/sync/source-cache.js"));
-  ({ reportSourceRequestHashes, salesMoversWindows } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ organizationFingerprint } = await import("../lib/server/source-identity.js"));
-  const sb = await import("../lib/server/supabase.js");
+  mark("main(): entered");
+
+  const step = async (label, thunk) => {
+    mark("import " + label + ": start");
+    const mod = await import(thunk);
+    mark("import " + label + ": done");
+    return mod;
+  };
+
+  ({ runSourceJobs, classifyFetchError } = await step("source-worker.js", "../lib/server/sync/source-worker.js"));
+  ({ salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes } = await step("source-signals.js", "../lib/server/sync/source-signals.js"));
+  ({ runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter } = await step("source-sync-driver.js (-> datadoe -> supabase)", "../lib/server/sync/source-sync-driver.js"));
+  ({ atomicSaveSourcePayload, validateSourcePayload, versionedObjectPath } = await step("source-cache.js", "../lib/server/sync/source-cache.js"));
+  ({ reportSourceRequestHashes, salesMoversWindows } = await step("report-source-contracts.js", "../lib/server/sync/report-source-contracts.js"));
+  ({ organizationFingerprint } = await step("source-identity.js", "../lib/server/source-identity.js"));
+  const sb = await step("supabase.js", "../lib/server/supabase.js");
   upsertSyncSourceJob = sb.upsertSyncSourceJob;
   prodClaimSourceExportAttempt = sb.claimSourceExportAttempt;
 
+  const total = tests.filter((t) => !t.marker).length;
+  mark("all imports resolved; running " + total + " tests");
   let failures = 0;
+  let ran = 0;
   for (const t of tests) {
+    if (t.marker) { mark("group -> " + t.marker); continue; }
     try {
       await t.fn();
       passed += 1;
-      console.log("  ok  " + t.name);
+      out("  ok  " + t.name);
     } catch (err) {
       failures += 1;
-      console.error("FAIL  " + t.name);
-      console.error(err && err.message ? err.message : err);
+      out("FAIL  " + t.name);
+      out(String(err && err.stack ? err.stack : err));
     }
+    ran += 1;
   }
-  console.log("\n" + passed + " assertions passed");
+  out("\n" + passed + " assertions passed");
+  mark("test loop complete: ran " + ran + "/" + total + ", " + passed + " passed, " + failures + " failed");
   return failures;
 }
 
+mark("before main()");
 main().then((failures) => {
+  // Expose anything still keeping the event loop alive. A clean run shows no timer/socket/
+  // handle here and the process then exits NATURALLY (we never call process.exit()).
+  const handles = typeof process.getActiveResourcesInfo === "function" ? process.getActiveResourcesInfo() : ["<getActiveResourcesInfo unavailable>"];
+  mark("main() resolved; active resources before natural exit: " + JSON.stringify(handles));
+  mark("setting process.exitCode=" + (failures ? 1 : 0) + " and returning to the event loop");
   if (failures) process.exitCode = 1;
 }).catch((err) => {
-  console.error(err);
+  out("FATAL " + String(err && err.stack ? err.stack : err));
+  mark("main() rejected; exitCode=1");
   process.exitCode = 1;
 });
