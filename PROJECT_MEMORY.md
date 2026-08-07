@@ -3610,6 +3610,50 @@ exact 06:00 local time becomes a business requirement.
   Phase 1d work was performed. Keep Scheduler v2 in shadow mode and stop before
   Phase 1d until these findings pass re-review.
 
+### Scheduler v2 Phase 1c second correction re-review (Codex, 2026-08-07)
+
+- Re-reviewed Claude commits `1d273d2`, `887136d`, and `eb6e78b` on
+  `feature/scheduler-v2`. The four original code paths are materially improved:
+  the adapter rejects missing/mismatched routing metadata; persisted cache
+  misses no longer become validated empty signals; execution-deadline
+  interruptions with a saved export id remain resumable; and immutable cache
+  objects are no longer deleted solely because a metadata response is
+  ambiguous. Phase 1c is still **not approved** because the verification
+  blocker remains and two consistency defects need correction.
+- **Verification blocker remains reproducible.** `node --check
+  scripts/scheduler-v2.test.mjs` now exits 0, but `node --check
+  scripts/scheduler-v2-worker.test.mjs` still does not return. A direct
+  `[System.IO.File]::ReadAllBytes()` of the rewritten worker test also blocks,
+  and `npm run test:scheduler-v2` consequently hangs without output. Both
+  processes were stopped after 30 seconds. The new `.gitattributes` policy did
+  not make the current Codex worktree artifact readable, so the claimed worker
+  tests and full `npm run verify` remain independently unreproducible. Replace
+  the artifact through a genuinely fresh path/bytes and confirm plain read,
+  both `node --check` commands, the focused suite, and full verify from this
+  exact checkout.
+- **Cache concurrency can report the wrong payload as this job's success.** In
+  `atomicSaveSourcePayload`, when read-back points to a concurrent writer's
+  different object path, the function returns that competing path as success.
+  The worker then records this job's row count/bytes and derives in-memory
+  signals from its own rows while `cache_object_path` points to the other
+  cycle's rows. Treat a competing confirmed pointer as a conflict/non-success,
+  or load and validate the winning object and consistently use its rows and
+  metadata. Never mark one payload successful with another payload's path.
+  Add a concurrency test using different row sets and row counts, not merely
+  checking that both immutable objects survive.
+- **The Supabase job upsert does not enforce the handoff's fingerprint
+  invariant.** `plannedSourceJob` and the DataDoe adapter reject an empty
+  fingerprint, but `upsertSyncSourceJob` validates only `connectionId` and still
+  writes `organization_fingerprint: job.organizationFingerprint || ""`.
+  Require a non-empty fingerprint before inserting the durable job row. Add a
+  direct production-wrapper test proving malformed jobs are rejected before
+  PostgREST and before the one-attempt claim, rather than relying solely on the
+  normal planner call path.
+- No production code, migration, push, merge, deployment, live DataDoe call,
+  or Phase 1d work was performed during this review. `feature/design-system`
+  remains at `e90c268`. Keep Scheduler v2 in shadow mode until these findings
+  pass re-review.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
