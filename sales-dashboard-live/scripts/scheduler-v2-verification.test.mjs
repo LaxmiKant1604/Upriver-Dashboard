@@ -22,7 +22,7 @@
 //     captures its configuration at module load, and the production-wrapper tests need
 //     requireConfiguration() to pass.
 //
-// Run with: npm run test:scheduler-v2   (node scripts/scheduler-v2.test.mjs)
+// Run with: npm run test:scheduler-v2   (node scripts/scheduler-v2-verification.test.mjs)
 //
 // Coverage: source-first dedup on FULL request identity; the DB one-attempt invariant;
 // cycle kickoff/claim transitions; last-known-good derive gate; schedules; SQL structure;
