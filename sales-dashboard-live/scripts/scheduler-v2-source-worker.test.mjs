@@ -1,10 +1,12 @@
-// Scheduler v2 Phase 1c — source-worker / signals / atomic-cache tests.
+// Scheduler v2 Phase 1c -- source-worker / signals / atomic-cache tests.
 //
-// Kept separate from scheduler-v2.test.mjs so NEITHER file uses top-level await (an async
-// module hangs `node --check` / piped runs on some setups). The async suite runs inside
-// main(); the module body has no top-level await, no timer, no open handle. All I/O is
-// in-memory. Lines are kept short and ASCII/LF (see .gitattributes) so the file reads
-// cleanly on every platform.
+// Fresh file (replaces the earlier scheduler-v2-worker.test.mjs, which became an
+// unreadable checkout artifact on the review machine). Kept separate from
+// scheduler-v2.test.mjs so NEITHER file uses top-level await (an async module body can
+// hang `node --check` / piped runs on some setups). The async suite runs inside main();
+// the module body has no top-level await, no timer, and no open handle. All I/O is
+// in-memory. Every byte is 7-bit ASCII with LF line endings (see the repo .gitattributes)
+// so the file reads cleanly with a plain file read on every platform.
 //
 // Run with: npm run test:scheduler-v2
 
@@ -457,7 +459,7 @@ atest("a genuine DataDoe processing timeout/failure during poll stays FAILED (no
   assert.equal(store._rawJob(res.cycleId, "h1").fetch_status, "failed");
 });
 
-/* ============================= BLOCKER 4: atomic cache under ambiguous metadata ============================= */
+/* ============================= BLOCKER 4/2: atomic cache under ambiguity + concurrency ============================= */
 
 function makeCacheAdapters() {
   const objects = new Map();
@@ -487,13 +489,16 @@ atest("atomic cache: DB commit succeeded but client response threw -> new object
   const a = makeCacheAdapters();
   const common = { requestHash: "h1", sourceId: "s", organizationFingerprint: "o", accountScopeHash: "x", requestMeta: {}, payloadBytes: 1, expiresAt: "2027-01-01" };
   const p1 = await atomicSaveSourcePayload({ ...common, storage: a.storage, metadata: a.metadata, rows: [{ v: 1 }], version: "v1" });
+  assert.equal(p1.winner, "self");
   // Now a save whose write COMMITS but the response THROWS.
   a.writeMode = "commit-then-throw";
   const p2 = await atomicSaveSourcePayload({ ...common, storage: a.storage, metadata: a.metadata, rows: [{ v: 2 }], version: "v2" });
-  assert.equal(p2, a.pointer.get("h1").object_path, "read-back confirms the committed new pointer");
-  assert.ok(a.objects.has(p2), "the newly uploaded object is NOT deleted");
-  assert.equal(a.objects.has(p1), false, "the confirmed old object is pruned after the switch");
-  assert.deepEqual((await a.storage.get(p2)).rows, [{ v: 2 }]);
+  assert.equal(p2.winner, "self");
+  assert.equal(p2.rowCount, 1);
+  assert.equal(p2.objectPath, a.pointer.get("h1").object_path, "read-back confirms the committed new pointer");
+  assert.ok(a.objects.has(p2.objectPath), "the newly uploaded object is NOT deleted");
+  assert.equal(a.objects.has(p1.objectPath), false, "the confirmed old object is pruned after the switch");
+  assert.deepEqual((await a.storage.get(p2.objectPath)).rows, [{ v: 2 }]);
 });
 
 atest("atomic cache: an unconfirmed pointer write preserves the old readable payload and keeps the orphan", async () => {
@@ -502,30 +507,92 @@ atest("atomic cache: an unconfirmed pointer write preserves the old readable pay
   const p1 = await atomicSaveSourcePayload({ ...common, storage: a.storage, metadata: a.metadata, rows: [{ v: 1 }], version: "v1" });
   a.writeMode = "throw-no-commit"; // pointer never moves
   await assert.rejects(atomicSaveSourcePayload({ ...common, storage: a.storage, metadata: a.metadata, rows: [{ v: 2 }], version: "v2" }), /not positively confirmed/);
-  assert.equal(a.pointer.get("h1").object_path, p1, "pointer still at the old good object");
-  assert.deepEqual((await a.storage.get(p1)).rows, [{ v: 1 }], "old payload still readable");
+  assert.equal(a.pointer.get("h1").object_path, p1.objectPath, "pointer still at the old good object");
+  assert.deepEqual((await a.storage.get(p1.objectPath)).rows, [{ v: 1 }], "old payload still readable");
   assert.ok(a.objects.has(versionedObjectPath("h1", "v2")), "the new object is left as a harmless orphan, not deleted");
 });
 
-atest("atomic cache: two concurrent cycles for the same request_hash never delete the committed object", async () => {
+atest("atomic cache CONCURRENCY: a different winner is ADOPTED with the winner's rows AND row count, never this attempt's", async () => {
   const a = makeCacheAdapters();
-  const common = { requestHash: "h1", sourceId: "s", organizationFingerprint: "o", accountScopeHash: "x", requestMeta: {}, payloadBytes: 1, expiresAt: "2027-01-01" };
-  // Cycle A writes vA, but cycle B commits vB concurrently and wins the pointer.
+  const common = { requestHash: "h1", sourceId: "s", organizationFingerprint: "o", accountScopeHash: "x", requestMeta: {}, payloadBytes: 999, expiresAt: "2027-01-01" };
+  // Cycle B has ALREADY committed a DIFFERENT object for h1 with a visibly different row set
+  // and row count (THREE rows). Cycle A is about to save ONE row.
   const pathB = versionedObjectPath("h1", "vB");
+  const winnerRows = [{ b: 1 }, { b: 2 }, { b: 3 }];
   const bWins = {
     storage: a.storage,
     metadata: {
       read: async (h) => a.pointer.get(h) || null,
-      write: async () => { a.pointer.set("h1", { object_path: pathB }); a.objects.set(pathB, JSON.stringify({ rows: [{ b: 1 }] })); return { object_path: pathB }; },
+      write: async () => {
+        a.pointer.set("h1", { object_path: pathB });
+        a.objects.set(pathB, JSON.stringify({ rows: winnerRows }));
+        return { object_path: pathB };
+      },
     },
   };
-  const pA = await atomicSaveSourcePayload({ ...common, storage: bWins.storage, metadata: bWins.metadata, rows: [{ a: 1 }], version: "vA" });
-  assert.equal(pA, pathB, "A observes the concurrently committed winner");
+  const resA = await atomicSaveSourcePayload({ ...common, storage: bWins.storage, metadata: bWins.metadata, rows: [{ a: 1 }], version: "vA" });
+  assert.equal(resA.winner, "concurrent");
+  assert.equal(resA.objectPath, pathB, "A adopts the concurrently committed winner's path");
+  assert.equal(resA.rowCount, 3, "A reports the WINNER's row count (3), NOT its own (1)");
+  assert.notEqual(resA.rowCount, 1, "A never pairs its own 1-row count with the winner's object");
+  assert.deepEqual(resA.rows, winnerRows, "A returns the WINNER's rows, not its own");
   assert.ok(a.objects.has(pathB), "the concurrent winner object is preserved");
   assert.ok(a.objects.has(versionedObjectPath("h1", "vA")), "A's own uploaded object is left as an orphan, not deleted");
 });
 
-/* ============================= BLOCKER 2: signal reconstruction distinguishes empty vs missing ============================= */
+atest("atomic cache CONCURRENCY: an un-adoptable winner fails closed with CACHE_CONFLICT and preserves both objects", async () => {
+  const a = makeCacheAdapters();
+  const common = { requestHash: "h1", sourceId: "s", organizationFingerprint: "o", accountScopeHash: "x", requestMeta: {}, payloadBytes: 1, expiresAt: "2027-01-01" };
+  const pathB = versionedObjectPath("h1", "vB");
+  // B wins the POINTER but its object is not readable from here (get -> null).
+  const bWins = {
+    storage: a.storage,
+    metadata: {
+      read: async (h) => a.pointer.get(h) || null,
+      write: async () => { a.pointer.set("h1", { object_path: pathB }); return { object_path: pathB }; },
+    },
+  };
+  await assert.rejects(
+    atomicSaveSourcePayload({ ...common, storage: bWins.storage, metadata: bWins.metadata, rows: [{ a: 1 }], version: "vA" }),
+    (e) => e && e.code === "CACHE_CONFLICT" && e.winnerPath === pathB,
+  );
+  assert.equal(a.pointer.get("h1").object_path, pathB, "the concurrent winner keeps the live pointer");
+  assert.ok(a.objects.has(versionedObjectPath("h1", "vA")), "A's own object is preserved as an orphan, never deleted");
+});
+
+atest("worker CONCURRENCY: an adopted-winner save records the winner's row count + path, never the download's", async () => {
+  const store = makeMemoryStore();
+  const winnerPath = "source-cache/v2/h1/winner.json";
+  const winnerRows = [{ w: 1 }, { w: 2 }];
+  // The persist step reports that a concurrent cycle already won; the worker must record the
+  // WINNER's rows/count/path, not the single row it just downloaded.
+  store.saveSourceRows = async () => ({ objectPath: winnerPath, rows: winnerRows, rowCount: winnerRows.length, payloadBytes: 77, winner: "concurrent" });
+  const dd = makeDataDoe(() => ({ rows: [{ a: 1 }] })); // downloads exactly ONE row
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [synthJob("h1")] }));
+  assert.equal(res.succeeded, 1);
+  const j = store._rawJob(res.cycleId, "h1");
+  assert.equal(j.row_count, 2, "recorded the winner's row count (2), not the downloaded 1");
+  assert.equal(j.cache_object_path, winnerPath, "recorded the winner's object path");
+  const outcome = res.outcomes.find((o) => o.requestHash === "h1");
+  assert.equal(outcome.rowCount, 2, "signal-derivation outcome uses the winner's row count");
+  assert.deepEqual(outcome.rows, winnerRows, "signal-derivation outcome uses the winner's rows");
+});
+
+atest("worker CONCURRENCY: an un-adoptable CACHE_CONFLICT is a benign non-terminal persist non-success", async () => {
+  const store = makeMemoryStore();
+  store.saveSourceRows = async () => { const e = new Error("concurrent pointer, both preserved"); e.code = "CACHE_CONFLICT"; throw e; };
+  const dd = makeDataDoe(() => ({ rows: [{ a: 1 }] }));
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [synthJob("h1")] }));
+  assert.equal(res.succeeded, 0);
+  assert.equal(res.failed, 1);
+  const j = store._rawJob(res.cycleId, "h1");
+  assert.equal(j.error_stage, "persist");
+  assert.equal(j.error_code, "CACHE_CONFLICT");
+  assert.equal(j.terminal, false, "a concurrent-winner conflict is retryable, not terminal");
+  assert.equal(j.cache_object_path, null, "no object path recorded for this attempt");
+});
+
+/* ============================= BLOCKER 2 (signals): reconstruction distinguishes empty vs missing ============================= */
 
 const optResolvePlan = (signals) => {
   const win = { "listing-optimizer:sqp-weekly": [{ from: "2025-05-14", to: "2025-08-06" }] };
@@ -596,6 +663,7 @@ atest("dependency signals are derived ONLY from validated saved results", async 
   assert.deepEqual(keywordWeeklySignal({ status: "success", validated: true, rows: [{ date: "2025-07-01" }, { date: "2025-07-08" }, { date: "2025-07-01" }] }), { status: "success", validated: true, distinctPeriods: 2 });
   assert.deepEqual(optimizerSqpSignal({ status: "success", validated: true, rows: [] }), { status: "success", validated: true });
   assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }, { currency: "CAD" }, { currency: "" }]), { status: "success", validated: true, currencyCount: 2 });
+  assert.deepEqual(salesMoversProbeSignal({ status: "success", validated: true, rows: [{ date: "2025-07-30", units_sum: 2 }, { date: "2025-07-28", units_sum: 9 }] }), { status: "success", validated: true, latestReportedDate: "2025-07-30" });
 });
 
 /* ============================= staged flow through the real resolver ============================= */
