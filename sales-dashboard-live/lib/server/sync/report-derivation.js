@@ -106,7 +106,7 @@ const REGISTRY = {
   // calc extraction (from an impure builder) is pending and the worker records the report
   // as derive-pending rather than fabricating an unfaithful payload.
   "daily-reporting": { snapshotVersion: "daily-reporting/v2d-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"], derive: null },
-  "fba-plan": { snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:listings-awd"], derivedSourceKeys: [], derive: null },
+  "fba-plan": { snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [], derive: null }, // awd is US-only (marketplace-conditional), so not a blanket required dep
   "reconciliation": { snapshotVersion: "reconciliation/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "sku-pl": { snapshotVersion: "sku-pl/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "keyword-rank": { snapshotVersion: "keyword-rank/v2d-1", optionalRequestKeys: ["keyword-rank:sqp-monthly"], derivedSourceKeys: [], derive: null },
