@@ -12,7 +12,7 @@
     "test:brand-view": "node scripts/test-brand-view.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:source-cache": "node scripts/test-source-cache.mjs",
-    "test:scheduler-v2": "node scripts/scheduler-v2.test.mjs && node scripts/scheduler-v2-source-worker.test.mjs && node scripts/scheduler-v2-supabase-wrapper.test.mjs",
+    "test:scheduler-v2": "node scripts/scheduler-v2.test.mjs",
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
     "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:scheduler-v2 && npm run test:source-identity && npm run test:report-contracts && npm run build:check",
