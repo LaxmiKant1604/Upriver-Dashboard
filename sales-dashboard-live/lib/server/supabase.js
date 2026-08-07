@@ -628,9 +628,18 @@ export async function claimSourceExportAttempt(cycleId, requestHash) {
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.
+//
+// The organization fingerprint is a hard handoff invariant: the durable job row is the
+// record the one-attempt claim (claim_source_export_attempt) and the DataDoe adapter later
+// key organization routing off. We REQUIRE a non-empty organizationFingerprint and reject
+// BEFORE any PostgREST request, so a fingerprint-less job is never written (never as an
+// empty string) and never reaches the one-attempt claim.
 export async function upsertSyncSourceJob(job) {
   if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
     throw new Error(`upsertSyncSourceJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
+  }
+  if (!job.organizationFingerprint) {
+    throw new Error("upsertSyncSourceJob requires a non-empty organizationFingerprint; refusing to write a source job with an empty organization fingerprint.");
   }
   await request("/rest/v1/sync_source_jobs?on_conflict=cycle_id,request_hash", {
     method: "POST",
@@ -640,7 +649,7 @@ export async function upsertSyncSourceJob(job) {
       request_hash: job.requestHash,
       source_id: job.sourceId || "",
       source_key: job.sourceKey || "",
-      organization_fingerprint: job.organizationFingerprint || "",
+      organization_fingerprint: job.organizationFingerprint,
       connection_id: job.connectionId,
       account_scope_hash: job.accountScopeHash || "",
       request_meta: job.requestMeta || {},
