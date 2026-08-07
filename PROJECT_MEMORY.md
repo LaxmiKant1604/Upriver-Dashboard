@@ -1,5 +1,48 @@
 # Project Memory
 
+## Scheduler v2 Phase 1c — correction re-review blockers fixed (2026-08-07)
+
+Fixed the five re-review blockers on `feature/scheduler-v2` (commits `1d273d2`,
+`887136d`; a docs commit follows). SHADOW MODE unchanged; Scheduler v1, frontend, and
+manual refresh untouched. Not pushed/merged/deployed/migrated; Phase 1d not started. See
+SCHEDULER_V2.md §15.
+
+- **Blocker 1 — fail-open org routing removed.** Every `|| "primary"` default is gone
+  from Scheduler v2 (`plannedSourceJob`, `mergeJob`, worker upsert, `buildDependencyPlan`,
+  `upsertSyncSourceJob`). `plannedSourceJob`/`upsertSyncSourceJob` now REQUIRE an explicit
+  `primary`/`dd-secondary` and a non-empty `organizationFingerprint`. `makeDataDoeAdapter`
+  verifies a non-empty fingerprint UNCONDITIONALLY (was: only when truthy) against the
+  selected connection before create/poll/download; missing/unknown/mismatched routing and
+  a missing secondary key throw before any DataDoe call.
+- **Blocker 2 — missing/corrupt cache no longer reconstructs as empty success.**
+  `reconstructSignals` treats only a cleanly loaded array (incl. `[]`) as `validated:true`;
+  a cache miss / read error / non-array payload is a non-activating
+  `source-cache-unavailable` signal, and a failed ads read gives `currencyCount:null`
+  (not 0). A missing SQP/ads payload can no longer activate catalog / monthly fallback /
+  total-sales.
+- **Blocker 3 — deadline during poll/download is resumable.** An execution-deadline
+  `DataDoeDeadlineError` after `export_id` is saved DEFERS (job stays `attempted` +
+  `export_id`, nothing recorded); the next bounded invocation resumes without a second
+  create-export. Genuine DataDoe processing timeouts/failures stay failed. Proven with a
+  fresh second invocation succeeding with exactly one create.
+- **Blocker 4 — atomic cache safe under ambiguous metadata.** `atomicSaveSourcePayload`
+  never deletes the newly uploaded immutable object on an ambiguous/throwing metadata
+  write; it reads the pointer back and prunes the OLD object only after a positively
+  confirmed switch. Unconfirmed → throw (persist failure) leaving the new orphan + old
+  readable. Tests cover DB-committed-but-response-threw and two concurrent cycles.
+- **Blocker 5 — Windows test-artifact hang.** Added `.gitattributes` forcing LF on
+  checkout for source/test files, and rewrote `scheduler-v2-worker.test.mjs` with short
+  ASCII/LF lines (no top-level await). `node --check` on both test files exits 0; both
+  runs and `npm run verify` complete.
+
+Tests: sync 22 + worker 27. Full `npm run verify` green (**354**); `node --check` on every
+changed file exits 0; `git diff --check` clean. Golden `request_hash` (source-identity 7)
+and five-ID batching unchanged; shared v1 `saveSourceExportCache` untouched.
+
+Unresolved live risks: pg_cron/Vercel kickoff + production `resolvePlan` still unwired; a
+live cycle against real DataDoe/Supabase Storage (create/poll/download, ambiguous
+PostgREST/Storage responses, disabled-source classification) remains Codex's separate gate.
+
 ## Scheduler v2 Phase 1c — review corrections (FIX 1-7, 2026-08-06)
 
 Corrected the seven Phase 1c review findings on `feature/scheduler-v2` (commits

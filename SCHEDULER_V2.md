@@ -744,3 +744,38 @@ refresh untouched; not pushed/merged/deployed/migrated.
 Tests: sync 22 + worker 23; full `npm run verify` green (**350**); `node --check` on every
 changed file exits 0; `git diff --check` clean; golden `request_hash` and five-ID batching
 unchanged; shared v1 `saveSourceExportCache` untouched.
+
+---
+
+## 15. Phase 1c correction re-review blockers (2026-08-07)
+
+Commits `1d273d2` (LF `.gitattributes`) + `887136d` (blockers 1-4 code + tests). SHADOW
+MODE; Scheduler v1 / frontend / manual refresh untouched; not pushed/merged/deployed/migrated.
+
+- **Blocker 1 — fail-closed org routing.** Removed every `|| "primary"` default in
+  Scheduler v2. `plannedSourceJob` and `upsertSyncSourceJob` REQUIRE an explicit
+  `primary`/`dd-secondary` id and a non-empty `organizationFingerprint`. The adapter's
+  `resolveConnection` requires a non-empty fingerprint and compares it UNCONDITIONALLY to
+  the selected connection before create/poll/download; missing/unknown/mismatched and a
+  missing secondary key throw with zero DataDoe calls.
+- **Blocker 2 — cache-aware signal reconstruction.** `reconstructSignals` only treats a
+  cleanly loaded array (including `[]`) as a validated success; a miss/read-error/non-array
+  payload is a non-activating `source-cache-unavailable` signal; a failed ads read yields
+  `currencyCount:null`.
+- **Blocker 3 — resumable deadline.** An execution-deadline `DataDoeDeadlineError` after
+  `export_id` is saved defers (job stays `attempted` + `export_id`, nothing recorded) so
+  the next bounded invocation resumes poll/download with no second create. Genuine DataDoe
+  processing timeouts/failures remain failed. `deriveSignalsFromOutcomes` skips deferred.
+- **Blocker 4 — ambiguity-safe atomic cache.** `atomicSaveSourcePayload` never deletes the
+  newly uploaded object on a throwing/ambiguous pointer write (Postgres may have committed).
+  It reads the pointer back; prunes the OLD object ONLY after a positively confirmed switch;
+  an unconfirmed write throws (persist failure) leaving the new orphan + old readable; a
+  concurrent winner is observed and preserved.
+- **Blocker 5 — Windows read/`node --check` hang.** `.gitattributes` forces LF on checkout
+  for source/test files; `scheduler-v2-worker.test.mjs` rewritten with short ASCII/LF lines
+  and no top-level await. `node --check` on both test files exits 0; both runs +
+  `npm run verify` complete.
+
+Tests: sync 22 + worker 27; full `npm run verify` green (**354**); `node --check` on every
+changed file exits 0; `git diff --check` clean; golden `request_hash` and five-ID batching
+unchanged; shared v1 `saveSourceExportCache` untouched.
