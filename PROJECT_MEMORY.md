@@ -4058,10 +4058,17 @@ section 21 for the full derivation dependency map.
   For the two clean folds, either import the shared pure leaf from the route and
   remove the duplicate functions, or add an independent golden/parity fixture
   that executes both implementations and compares the complete payload shape.
+- **Blocker 5 -- shadow saves bypass the established payload-size guard.**
+  `makeShadowSnapshotSaver()` calls `saveReportSnapshot()` directly, bypassing the
+  8 MB limit enforced by the existing shared-report path. The remaining adapters
+  can produce large payloads, so export/reuse the canonical size guard and reject
+  an oversized shadow payload before any Supabase write; preserve the previous
+  snapshot and record the failure at the save stage.
 - Add the missing regression tests for blocked-job drain/idempotency, two fragments
   sharing one request key (including month metadata), complete Content Changes
-  parity/date persistence, and actual route-vs-derivation parity. Do not begin the
-  remaining 11 adapters until these foundation defects are corrected.
+  parity/date persistence, actual route-vs-derivation parity, and payloads at/over
+  the snapshot-size limit. Do not begin the remaining 11 adapters until these
+  foundation defects are corrected.
 - Phase 1d is **not approved yet**. Continue in shadow mode; do not push, merge,
   deploy, apply migrations, or commit the untracked `HANDOFF.md`.
 
