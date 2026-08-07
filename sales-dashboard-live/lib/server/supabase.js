@@ -602,11 +602,15 @@ export async function getSyncCycle(cycleId) {
   return rows[0] || null;
 }
 
-export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, status } = {}) {
+export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, reportTotal, reportSucceeded, reportFailed, status } = {}) {
   const body = {};
   if (sourceTotal != null) body.source_total = sourceTotal;
   if (sourceSucceeded != null) body.source_succeeded = sourceSucceeded;
   if (sourceFailed != null) body.source_failed = sourceFailed;
+  // Phase 1d report counters (columns already exist in 20260807_scheduler_v2.sql).
+  if (reportTotal != null) body.report_total = reportTotal;
+  if (reportSucceeded != null) body.report_succeeded = reportSucceeded;
+  if (reportFailed != null) body.report_failed = reportFailed;
   if (status) body.status = status;
   if (!Object.keys(body).length) return;
   await request(`/rest/v1/sync_cycles?id=eq.${cycleId}`, {
@@ -712,6 +716,97 @@ export async function recordSyncSourceFailure({ cycleId, requestHash, stage, cod
     duration_ms: durationMs,
     row_count: rowCount,
     export_id: exportId,
+  });
+}
+
+/* ===== Scheduler v2 Phase 1d: sync_report_jobs (report-derivation) wrappers =====
+   The report worker (lib/server/sync/report-worker.js) drives these. fetch/derive/save
+   statuses are tracked separately (a Supabase save failure is never a DataDoe fetch
+   failure), and a failure NEVER clears snapshot_params_hash / last_good_snapshot_at so the
+   previous good shadow snapshot survives. There is no report-derive RPC; the atomic
+   one-derive guard is a conditional PATCH (UPDATE ... WHERE derive_status='pending'), which
+   PostgreSQL serializes so only one worker transitions the row. */
+
+const REPORT_JOB_COLUMNS = "id,report_key,report_version,account_id,connection_id,bucket,depends_on,fetch_status,derive_status,save_status,validated,error_stage,error_code,error_message,row_count,payload_bytes,duration_ms,latest_data_date,snapshot_params_hash,last_good_snapshot_at";
+
+export async function getSyncReportJobs(cycleId) {
+  const query = new URLSearchParams({ select: REPORT_JOB_COLUMNS, cycle_id: `eq.${cycleId}`, order: "created_at.asc" });
+  return request(`/rest/v1/sync_report_jobs?${query}`);
+}
+
+// Insert-if-absent so a resumed invocation never resets an in-progress/completed report job.
+// connection_id must be explicit (fail-closed, like the source jobs); no silent 'primary'.
+export async function upsertSyncReportJob(job) {
+  if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
+    throw new Error(`upsertSyncReportJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
+  }
+  await request("/rest/v1/sync_report_jobs?on_conflict=cycle_id,report_key,account_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: {
+      cycle_id: job.cycleId,
+      report_key: job.reportKey,
+      report_version: job.reportVersion || "",
+      account_id: job.accountId,
+      connection_id: job.connectionId,
+      bucket: job.bucket,
+      depends_on: job.dependsOn || [],
+    },
+  });
+}
+
+// Atomic single-derive guard: transition pending -> running for exactly this (cycle, report,
+// account). return=representation returns the row(s) actually updated; a concurrent worker
+// that already moved it off 'pending' updates zero rows and loses the claim.
+export async function claimReportDeriveAttempt(cycleId, reportKey, accountId) {
+  const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, report_key: `eq.${reportKey}`, account_id: `eq.${accountId}`, derive_status: "eq.pending" });
+  const rows = await request(`/rest/v1/sync_report_jobs?${query}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: { derive_status: "running" },
+  });
+  return Array.isArray(rows) && rows.length === 1;
+}
+
+async function patchSyncReportJob(cycleId, reportKey, accountId, body) {
+  const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, report_key: `eq.${reportKey}`, account_id: `eq.${accountId}` });
+  await request(`/rest/v1/sync_report_jobs?${query}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body });
+}
+
+// A required source failed/was skipped: block THIS report's fetch rollup only; the snapshot
+// and last_good_snapshot_at are untouched (last-known-good survives).
+export async function recordSyncReportBlocked({ cycleId, reportKey, accountId, reason }) {
+  await patchSyncReportJob(cycleId, reportKey, accountId, {
+    fetch_status: "blocked", error_stage: "fetch", error_code: "SOURCE_BLOCKED", error_message: reason || "required source unavailable",
+  });
+}
+
+// Records a fetch/derive/validate/save failure on its own stage; NEVER clears
+// snapshot_params_hash / last_good_snapshot_at. A non-terminal derive-pending (deps not yet
+// derivable) keeps derive_status re-runnable in a later cycle.
+export async function recordSyncReportFailure({ cycleId, reportKey, accountId, stage, code, message, terminal = false, durationMs = null }) {
+  const body = {
+    error_stage: stage, error_code: code, error_message: message, duration_ms: durationMs, failed_at: new Date().toISOString(),
+  };
+  if (stage === "save") {
+    // Derive succeeded; only the snapshot save failed -> mark the stages distinctly so a
+    // save failure is never read as a derivation failure. last_good_snapshot_at untouched.
+    body.derive_status = "succeeded";
+    body.save_status = "failed";
+  } else {
+    body.derive_status = "failed";
+  }
+  await patchSyncReportJob(cycleId, reportKey, accountId, body);
+}
+
+// SUCCESS requires fetch + derive + validate + save all passing. Sets validated=true, records
+// the snapshot key + latest data date, and stamps last_good_snapshot_at.
+export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, latestDataDate = null, rowCount = null, payloadBytes = null, snapshotParamsHash = null, durationMs = null }) {
+  await patchSyncReportJob(cycleId, reportKey, accountId, {
+    fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true,
+    latest_data_date: latestDataDate, row_count: rowCount, payload_bytes: payloadBytes,
+    snapshot_params_hash: snapshotParamsHash, last_good_snapshot_at: new Date().toISOString(),
+    succeeded_at: new Date().toISOString(), error_stage: null, error_code: null, error_message: null,
   });
 }
 
