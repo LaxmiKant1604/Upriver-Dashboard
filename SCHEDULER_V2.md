@@ -895,3 +895,39 @@ Proof from the exact worktree (all emit output promptly, exit 0, terminate natur
 `node --check scripts/scheduler-v2.test.mjs` exits 0; `node scripts/scheduler-v2.test.mjs`
 streams markers + **56** assertions, `active resources: []`, exit 0; `npm run test:scheduler-v2`
 exit 0; `npm run verify` green (**361** assertions) + `build:check`; `git diff --check` clean.
+
+---
+
+## 19. Phase 1c: the REAL block was a secret-shaped literal, not stdout buffering (2026-08-07)
+
+Section 18's stdout-buffer root cause is **superseded**. The synchronous markers were still
+worth keeping (a true block now pinpoints itself), but they did not fix the reviewer's
+failure. The actual cause is an **antivirus / endpoint-security content signature**: the
+consolidated test contained a leaked-credentials query string literal
+(`apikey=<value> token=<value>`) in the "no secret value appears" test, which Windows
+Defender flags — quarantining/scanning the file and blocking it from being **read or copied
+before Node can evaluate it** (hence zero output, even outside the sandbox and with
+unsandboxed permissions). Test-artifact-only fix; no production change.
+
+- **Reproduced + bisected.** `Copy-Item` of the source hung with empty output (blocked on the
+  source read). On TEMP copies: neutralizing ONLY the `apikey=/token=` string made the file
+  read reliably; the all-neutralized copy read; the untouched original was blocked/flaky. The
+  minimal trigger is that leaked-key fixture; `test-service-role-key` and the `*_ORG_KEY`
+  api-key values are on the same secret-shaped list.
+- **Fix (per the reviewer):** assemble every sensitive-looking value at RUNTIME from harmless
+  fragments (`frag()`/`dash()` join helpers) so no complete secret-shaped literal exists in
+  the bytes — the leaked query string (fragments + a runtime-built `RegExp`), the Supabase
+  placeholder key, and the two API-key placeholders. Comments reworded to avoid
+  credential-shaped text. The security assertions are unchanged in intent; all 56 kept.
+- **Content proven clean.** Exhaustive scan: no hex/JWT/Bearer/Authorization/`key=value`/
+  PRIVATE-KEY sequences. Identical fixed bytes copy+read via PowerShell in ~42ms from `%TEMP%`
+  and ~123ms at a fresh project-dir filename; `package.json` in the same dir reads fine.
+- **Local caveat:** this machine's Defender keeps quarantine state on the specific filename
+  `scheduler-v2.test.mjs` from the earlier secret-laden versions, so the in-place `Copy-Item`
+  still hangs here (a same-bytes copy under any other name reads fine). A fresh Codex checkout
+  has no such history and reads the clean file normally. Clearing local state needs Defender
+  admin and is deliberately out of scope.
+
+Proof (node/bash path): `node --check` exit 0; `node scripts/scheduler-v2.test.mjs` = **56**
+assertions, `active resources []`, exit 0; `npm run test:scheduler-v2` exit 0; `npm run verify`
+green (**361** assertions) + `build:check`; `git diff --check` clean.

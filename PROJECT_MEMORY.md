@@ -3849,6 +3849,52 @@ Phase 1d. `HANDOFF.md` left untracked.
   assertions, natural exit with no active resources, and full `npm run verify`
   in this Codex worktree. Do not begin Phase 1d, push, merge, deploy, or migrate.
 
+### Scheduler v2 Phase 1c: secret-shaped literal AV block fixed (Claude, 2026-08-07)
+
+The reviewer's content/AV diagnosis was correct (my prior stdout-buffer theory
+is retracted). Fixed ONLY the test artifact `scripts/scheduler-v2.test.mjs`; no
+production, Scheduler v1, frontend, or scheduler-logic change. From HEAD
+`9a44858`. No push/merge/deploy/migration, no Phase 1d. `HANDOFF.md` untracked.
+
+- **Reproduced + bisected.** `Copy-Item` of the source hung with EMPTY output
+  (blocked reading the source), confirming a pre-evaluation file-access block.
+  Bisection on TEMP copies generated via node: variant that neutralizes ONLY the
+  leaked-credentials query string `apikey=<v> token=<v>` in the "no secret value
+  appears" test READ RELIABLY; the all-neutralized variant also read; the
+  unmodified original was flaky/blocked. So the minimal trigger is that
+  leaked-key-shaped fixture; `test-service-role-key` and the `*_ORG_KEY`
+  api-key values are on the same secret-shaped list.
+- **Fix (instruction #3): build every sensitive value at RUNTIME from harmless
+  fragments** via `frag()`/`dash()` join helpers, so no complete secret-shaped
+  literal exists in the bytes. Neutralized: the `apikey=`/`token=` leaked query
+  string (assembled from `"api"+"key"`, `"to"+"ken"`, stand-in values, matched
+  by a runtime-built RegExp), the Supabase placeholder key (`dash("test","svc",
+  "role","key")`), and the two API-key placeholders (`PRIMARY_API_KEY`/
+  `SECONDARY_API_KEY`). Comments reworded to avoid credential-shaped text.
+  Security tests unchanged in intent; all 56 assertions kept. Did NOT use
+  process.exit/timeouts/skips/weakened assertions.
+- **Content is provably clean.** An exhaustive scan finds no hex/JWT/Bearer/
+  Authorization/`key=value`/PRIVATE-KEY sequences (only long camelCase
+  identifiers as false positives). The identical fixed bytes copy+read via
+  PowerShell in ~42ms from `%TEMP%` and ~123ms at a fresh project-dir path
+  (`scripts/_probe_clean.mjs`); unmodified `package.json` in the same dir reads
+  fine. So neither the directory nor the content blocks.
+- **Local caveat (not a code issue).** This machine's Defender retains quarantine
+  state on the specific filename `scheduler-v2.test.mjs` from the earlier,
+  genuinely secret-laden versions, so an in-place `Copy-Item scheduler-v2.test.mjs`
+  still hangs here even after a fresh delete+recreate with identical clean bytes
+  (a different filename with the same bytes reads fine). Clearing it needs
+  Defender admin (quarantine history / exclusion), which is out of scope and I
+  will not change the user's security config. A FRESH Codex checkout has no such
+  path history, so the reviewer's `Copy-Item`/`Get-Content` proof will pass there
+  because the content is clean.
+- **Proof (node/bash path, unaffected by the local filename quarantine):**
+  `node --check` exit 0; `node scripts/scheduler-v2.test.mjs` prints the first
+  marker immediately, runs 56 assertions, `active resources []`, natural exit 0;
+  `npm run test:scheduler-v2` exit 0 (56); `npm run verify` green (**361**
+  assertions: 54+60+23+6+**56**+7+155) + `build:check`; `git diff --check` clean.
+  Fix commit `ede5b12`; this docs update follows.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
