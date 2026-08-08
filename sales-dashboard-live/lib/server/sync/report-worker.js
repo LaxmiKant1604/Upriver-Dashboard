@@ -55,7 +55,7 @@ function toDateOnly(value) {
   return isValidCalendarDate(s) ? s : null;
 }
 
-async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes }) {
+async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes, loadDerivedContext }) {
   const { reportKey, accountId } = planned;
   const started = clock();
   const entry = REPORT_DERIVATIONS[reportKey];
@@ -96,9 +96,24 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
   }
   const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash);
 
+  // Load DERIVE-ONLY injected inputs (persisted non-DataDoe rows, e.g. the scheduled Ads rows for
+  // Daily Reporting) through an injected callback. These reach the pure adapter via the derive
+  // context but are DELIBERATELY excluded from the snapshot `params` below, so they never enter the
+  // snapshot identity/paramsHash. A throwing/absent loader leaves derivedContext empty; a required
+  // derived input the adapter needs but does not receive fails inside derive (last-known-good kept).
+  let derivedContext = {};
+  if (typeof loadDerivedContext === "function") {
+    try {
+      derivedContext = (await loadDerivedContext({ reportKey, accountId, planned, sources, statusByHash })) || {};
+    } catch (_e) {
+      derivedContext = {};
+    }
+  }
+
   // Deterministic derivation context: retrievedAt comes from the saved source metadata (the
-  // latest fragment fetch time), NEVER Date.now() inside the pure adapter.
-  const context = { ...(planned.context || {}), accountId, retrievedAt: (planned.context && planned.context.retrievedAt) || latestFetchedAt || null };
+  // latest fragment fetch time), NEVER Date.now() inside the pure adapter. derivedContext is
+  // derive-only (never a snapshot param).
+  const context = { ...(planned.context || {}), ...derivedContext, accountId, retrievedAt: (planned.context && planned.context.retrievedAt) || latestFetchedAt || null };
 
   // 4) Derive (pure). Never fabricate on unavailable/blocked/invalid/not-implemented.
   const result = deriveReportSnapshot({ reportKey, sources, context });
@@ -241,6 +256,10 @@ export async function runReportJobs({
   // Canonical shared-snapshot ceiling from the dependency-free limits leaf (no literal that
   // could drift from report-store.js). The worker recomputes actual bytes and checks this.
   maxSnapshotBytes = MAX_SNAPSHOT_BYTES,
+  // Optional injected loader for DERIVE-ONLY inputs (persisted non-DataDoe rows, e.g. the
+  // scheduled Ads rows Daily Reporting merges). Reaches the pure adapter via the derive context,
+  // never the snapshot params. null => reports that need no derived input (brand-sales, sku-pl...).
+  loadDerivedContext = null,
 }) {
   const progress = { cycleId, planned: 0, processed: 0, succeeded: 0, failed: 0, blocked: 0, skipped: 0, pending: 0, deadlineReached: false, drained: false };
   const outcomes = [];
@@ -275,7 +294,7 @@ export async function runReportJobs({
 
     let outcome;
     try {
-      outcome = await runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes });
+      outcome = await runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes, loadDerivedContext });
     } catch (error) {
       // Failure isolation: one report throwing never blocks the others.
       await store.recordReportFailure({ cycleId, reportKey: planned.reportKey, accountId: planned.accountId, stage: "derive", code: "DERIVE_CRASH", message: "Report derivation crashed.", terminal: true, durationMs: 0 });

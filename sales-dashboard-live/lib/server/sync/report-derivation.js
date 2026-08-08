@@ -21,6 +21,8 @@ import {
   orderSalesByBrand,
   catalogBrandNames,
   contentChangesPayload,
+  dailyReportingPayload,
+  skuPlPayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -108,10 +110,46 @@ const REGISTRY = {
   // claims, and preserves last-known-good correctly today; `derive: null` means the pure
   // calc extraction (from an impure builder) is pending and the worker records the report
   // as derive-pending rather than fabricating an unfaithful payload.
-  "daily-reporting": { snapshotVersion: "daily-reporting/v2d-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"], derive: null },
+  // Daily Reporting: derive BOTH all-brand and every named brand from the ONE saved ASIN/day
+  // superset + catalog. `context.brand` selects the mode (default "ALL"); the worker stores the
+  // ALL-brand snapshot this tranche (per-brand snapshot planning is deferred to orchestration).
+  // Ads are injected via `context.adRows` (planner-loaded from the scheduled Ads rows); the pure
+  // core imports no Supabase. All-brand rows/units re-aggregate additively; there are no ratio
+  // fields to sum (daily ratios are recomputed in the browser from these base sums).
+  "daily-reporting": {
+    snapshotVersion: "daily-reporting/v2d-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
+    derive: ({ sources, context }) => dailyReportingPayload({
+      supersetRows: sources["daily-reporting:asin-day-superset"].rows,
+      catalogRows: sources["daily-reporting:catalog"].rows,
+      adRows: context.adRows, // injected; array required for ALL (a missing load throws, never [] silently)
+      brand: context.brand ?? "ALL",
+    }),
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && typeof p.brandFiltered === "boolean",
+    latestDataDate: (p) => maxIsoDate((p.rows || []).map((r) => r.date)),
+  },
   "fba-plan": { snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [], derive: null }, // awd is US-only (marketplace-conditional), so not a blanket required dep
   "reconciliation": { snapshotVersion: "reconciliation/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
-  "sku-pl": { snapshotVersion: "sku-pl/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
+  // SKU P&L: fold the six monthly-profit fragments into the exact route payload (RAW byMonth per
+  // currency|sku|child_asin). Each fragment carries its window, so monthKey = fragment.from's
+  // month; two five-ID chunks in the same month sum into one bucket; currencies never merge (part
+  // of the identity key). COGS overrides are NOT baked in (the browser applies them at display via
+  // computeSkuPlRow), so the snapshot equals the route payload byte-for-byte.
+  "sku-pl": {
+    snapshotVersion: "sku-pl/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    derive: ({ sources, context }) => skuPlPayload({
+      accountId: context.accountId ?? null,
+      from: context.from ?? null,
+      to: context.to ?? null,
+      monthlyBatches: (sources["sku-pl:monthly-profit"].fragments || []).map((f) => ({
+        monthKey: String(f.from || "").slice(0, 7),
+        rows: f.rows,
+      })),
+    }),
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.months)
+      && Array.isArray(p.currencies) && Array.isArray(p.catalogBrands),
+    // Monthly report: the latest data date is the end of the last covered month (the window `to`).
+    latestDataDate: (p, context) => { const d = context && context.to != null ? String(context.to).slice(0, 10) : null; return d || null; },
+  },
   "keyword-rank": { snapshotVersion: "keyword-rank/v2d-1", optionalRequestKeys: ["keyword-rank:sqp-monthly"], derivedSourceKeys: [], derive: null },
   "sales-movers": { snapshotVersion: "sales-movers/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "buy-box-loss": { snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
