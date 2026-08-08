@@ -4276,6 +4276,43 @@ unchanged; `HANDOFF.md` stays untracked. See SCHEDULER_V2.md section 24.
   `cab8d1c` (pure cores), `b8d9cab` (registry adapters + worker channel), `baa8ad6`
   (parity/regression tests); docs follow.
 
+### Scheduler v2 Phase 1d tranche 2 review blocked (Codex, 2026-08-08)
+
+- Re-reviewed `5a3a197`, `cab8d1c`, `b8d9cab`, `baa8ad6`, and `b500a99`.
+  Verification is green: focused report derivation **44/44**, full `npm run verify`
+  **405 assertions** plus the successful 2,393-module production build, and
+  `git diff --check` clean. `HANDOFF.md` remains untracked and untouched.
+- **P1 - derived context can override authoritative report scope.**
+  `report-worker.js` currently merges `derivedContext` after `planned.context`, so an
+  injected loader can replace `from`, `to`, `brand`, or another planned field while
+  the snapshot params/hash still describe the original plan. Restrict derived input
+  to an explicit per-report allowlist and make planned scope authoritative. Add a
+  regression test proving injected scope overrides cannot change the payload or key.
+- **P1 - Daily Ads completeness is not typed or validated.** The adapter accepts any
+  `adRows` array, including `[]`, but an empty array can mean genuine zero activity,
+  an unseeded account, failed Ads sync, or incomplete date coverage. Require a typed,
+  validated Ads coverage signal for the exact planned account/date window. Only a
+  validated covered empty result may mean zero; missing/failed/stale/partial coverage
+  must block the report and preserve last-known-good data.
+- **P1 - SKU P&L does not enforce its production route contract before save.** The
+  live route requires one selected account and exactly six complete calendar months,
+  while the v2 validator only checks array shapes. Require six unique consecutive
+  full-month windows, exact context bounds, no gaps/duplicates/extras, and one-account
+  scope before derivation/save. Invalid plans must perform zero snapshot writes and
+  preserve last-known-good data.
+- **P1 - account-scoped reports need an explicit source-scope policy.** The generic
+  resolver supports 5-ID chunks, but SKU P&L's grouped output has no seller/vendor ID
+  and therefore cannot be split back into account snapshots. Daily source rows do
+  carry seller ID, but the current adapter does not filter them to the planned account,
+  and catalog rows carry no seller ID. Declare these two adapters single-account at
+  the source-job boundary (or implement a proven account-partitioning contract where
+  attribution exists). Add cross-account contamination tests.
+- **Decision:** tranche 2 is **not approved** yet. Do not start the remaining adapters,
+  push, merge, deploy, apply migrations, or leave shadow mode until these four blockers
+  are fixed and independently re-reviewed. Existing parity folds may remain; the
+  correction should be narrowly scoped to worker context validation, dependency
+  coverage, report contracts, and regression tests.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
