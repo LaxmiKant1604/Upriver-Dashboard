@@ -897,7 +897,9 @@ export function orderSalesByBrand(rows, catalogRows) {
   return [...totals.values()];
 }
 
-function normalizeDailySalesRows(rows) {
+// Exported so the Scheduler v2 Daily Reporting derivation can run the SAME normalization
+// independently for its route-vs-shadow parity harness (runtime unchanged).
+export function normalizeDailySalesRows(rows) {
   return rows.map((row) => ({
     ...row,
     total_sales: num(row.total_sales_sum ?? row.total_sales),
@@ -907,7 +909,8 @@ function normalizeDailySalesRows(rows) {
 
 // Join the ASIN-level daily export to the account's catalog, then fold the
 // chosen brand back to one row per day for the existing Daily Reporting table.
-function dailyRowsForBrand(rows, catalogRows, brand) {
+// Exported for the Scheduler v2 named-brand derivation parity harness.
+export function dailyRowsForBrand(rows, catalogRows, brand) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim();
@@ -933,7 +936,8 @@ function dailyRowsForBrand(rows, catalogRows, brand) {
   return [...totals.values()];
 }
 
-function normalizeAdRows(rows) {
+// Exported for the Scheduler v2 Daily Reporting derivation parity harness (runtime unchanged).
+export function normalizeAdRows(rows) {
   return rows.map((row) => ({
     ...row,
     ad_sales: num(row.ad_sales_sum ?? row.ad_sales),
@@ -1091,17 +1095,14 @@ async function reconciliationRowsByMonth(apiKey, sourceId, columns, ids, from, t
 // (currency|sku|child_asin), with per-month numeric sums kept under `byMonth`.
 // Each month is aggregated server-side by DataDoe; hitting the row cap throws so
 // a truncated (misleading) P&L is never returned as complete.
-async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
+// PURE fold: combine per-month SKU P&L batches into one row per (currency|sku|child_asin) with
+// per-month numeric sums under `byMonth`. Extracted verbatim from the fetch loop below and
+// exported so the Scheduler v2 SKU P&L derivation runs the IDENTICAL fold independently for its
+// route-vs-shadow parity harness. `monthlyBatches`: [{ monthKey, rows }] in canonical (window)
+// order; the fold is additive per bucket, and entry insertion/order matches the batch+row order.
+export function foldSkuPlMonthlyRows(monthlyBatches) {
   const combined = new Map();
-  for (const window of windows) {
-    const monthKey = window.from.slice(0, 7);
-    const rows = await fetchExportRows(
-      apiKey, SKU_PL_SOURCE_ID, SKU_PL_COLUMNS, sellerOrVendorIds, window.from, window.to, SKU_PL_ROW_LIMIT,
-      { groupBy: SKU_PL_GROUP_BY, aggregations: SKU_PL_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" }
-    );
-    if (rows.length >= SKU_PL_ROW_LIMIT) {
-      throw new Error(`SKU P&L export reached the ${SKU_PL_ROW_LIMIT.toLocaleString("en-US")} row cap for ${monthKey}. The report was not saved because a partial P&L would be misleading.`);
-    }
+  for (const { monthKey, rows } of monthlyBatches) {
     for (const row of rows) {
       const sku = String(row.sku || "").trim();
       const childAsin = String(row.child_asin || "").trim();
@@ -1135,6 +1136,22 @@ async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
     }
   }
   return [...combined.values()];
+}
+
+async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
+  const monthlyBatches = [];
+  for (const window of windows) {
+    const monthKey = window.from.slice(0, 7);
+    const rows = await fetchExportRows(
+      apiKey, SKU_PL_SOURCE_ID, SKU_PL_COLUMNS, sellerOrVendorIds, window.from, window.to, SKU_PL_ROW_LIMIT,
+      { groupBy: SKU_PL_GROUP_BY, aggregations: SKU_PL_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" }
+    );
+    if (rows.length >= SKU_PL_ROW_LIMIT) {
+      throw new Error(`SKU P&L export reached the ${SKU_PL_ROW_LIMIT.toLocaleString("en-US")} row cap for ${monthKey}. The report was not saved because a partial P&L would be misleading.`);
+    }
+    monthlyBatches.push({ monthKey, rows });
+  }
+  return foldSkuPlMonthlyRows(monthlyBatches);
 }
 
 async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
@@ -1203,7 +1220,8 @@ async function planAsinUnits(apiKey, ids, from, to) {
 // (account, date). Ad totals attach to the first sales row for each key so
 // downstream range sums count them exactly once; days with ad activity but no
 // sales row get a synthetic zero-sales row.
-function mergeSalesAndAds(salesRows, adRows) {
+// Exported for the Scheduler v2 Daily Reporting derivation parity harness (runtime unchanged).
+export function mergeSalesAndAds(salesRows, adRows) {
   const firstByKey = new Map();
   for (const r of salesRows) {
     const key = `${r.seller_or_vendor_id}|${r.date}`;
