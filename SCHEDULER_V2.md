@@ -1104,3 +1104,49 @@ Tests: `scheduler-v2-report-derivation.test.mjs` = **29** (20 + 9 blocker regres
 `npm run verify` green: **390** (54+60+23+6+56+**29**+7+155) + `build:check`; `node --check` on
 every changed file exits 0; `git diff --check` clean. Remaining: wire the 11 pending derive
 cores (each with a golden parity test) + the derived-only reads; then Codex's live gates.
+
+## 23. Phase 1d blocker-fix re-review -- P1/P2 corrections (SHADOW MODE, 2026-08-08)
+
+Corrects the three re-review blockers (one P1 parity, two P2 boundary) raised after the
+blocker 1-5 fixes. Commits `6e73571` (production), `e08b835` (regression tests). SHADOW MODE;
+Scheduler v1 / frontend / manual refresh / `feature/design-system` untouched; nothing pushed/
+merged/deployed/migrated; request_hash unchanged; zero DataDoe calls during derivation; the 11
+pending adapters still NOT started.
+
+1. **P1 -- fragment order now matches the live transport (never a hash).** `assembleSources`
+   carries an immutable `fragmentIndex` (the resolver/plan emission order, which is exactly the
+   live transport's account/chunk then window fetch order -- see report-source-contracts
+   `for contract -> for window -> for chunk`) and sorts fragments by it. The previous
+   `(from, to, requestHash)` sort is gone: a SHA is not a sequence key, and even the `from/to`
+   tiebreak re-derived order from data instead of preserving the plan. Concatenated `rows` are
+   now byte-identical to sequential `fetchExportRows` concatenation, so `orderSalesByBrand`
+   (last catalog label wins for a duplicate ASIN) and `compactContentChangeEvents` (first label
+   wins) resolve to the SAME value the live route produces. The pre-existing monthly-windows
+   regression was updated to the corrected contract (plan order preserved, not date-re-sorted).
+2. **P2 -- the size guard can no longer be bypassed by a supplied byte count.** New
+   dependency-free `lib/server/report-limits.js` leaf owns the single canonical
+   `MAX_SNAPSHOT_BYTES` plus `snapshotByteSize` / `assertSnapshotWithinLimit`. `report-store.js`
+   re-exports it; `report-worker.js` and `report-snapshot-store.js` import it (no literal that
+   can drift from report-store; a pure worker never imports Supabase to learn the limit).
+   `makeShadowSnapshotSaver` ALWAYS recomputes the actual UTF-8 JSON byte size and validates
+   against THAT before any write (throws `SNAPSHOT_TOO_LARGE`); a caller-supplied `payloadBytes`
+   is telemetry only and cannot understate/forge past the guard. The worker likewise recomputes
+   actual bytes (never a trusted value) and defaults `maxSnapshotBytes` to the leaf constant.
+3. **P2 -- `latest_data_date` is a strict calendar date, validated before save.** `toDateOnly`
+   now validates the sliced `YYYY-MM-DD` via the strict UTC round-trip `isValidCalendarDate`
+   (shared from report-source-contracts): `2026-02-30`, `2026-99-99`, and non-leap `2023-02-29`
+   are rejected; `2024-02-29` is accepted. The worker validates the derived latest date at a
+   dedicated VALIDATE stage BEFORE saving; a present-but-impossible date fails
+   (`INVALID_LATEST_DATE`) so the shadow snapshot is never saved ahead of a Postgres `date`
+   write that would then fail -- previous snapshot preserved, zero writes. A legitimately absent
+   (null) date still succeeds.
+
+Tests: `scheduler-v2-report-derivation.test.mjs` = **34** (20 + 9 foundation + 5 re-review
+regressions; one pre-existing monthly-windows test rewritten to the plan-order contract). New
+coverage: route-vs-shadow parity with >5 IDs + reverse-sorted hashes + conflicting catalog
+labels for both brand-sales and content-changes; the forged-small-`payloadBytes` oversized
+rejection with zero writes; the strict calendar rule (leap/impossible/malformed); and the
+end-to-end impossible-date VALIDATE failure with last-known-good preserved. Full `npm run verify`
+green: **395** (54+60+23+6+56+**34**+7+155) + `build:check`; `node --check` on every changed
+file exits 0; `git diff --check` clean. Remaining unchanged: wire the 11 pending derive cores
+(each with a golden parity test) + the derived-only reads; then Codex's live gates.

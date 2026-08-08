@@ -4154,6 +4154,53 @@ unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 22.
   pending derive cores. Continue in shadow mode; do not push, merge, deploy, apply
   migrations, touch Scheduler v1/frontend/manual refresh, or commit `HANDOFF.md`.
 
+### Scheduler v2 Phase 1d P1/P2 re-review blockers fixed (Claude, 2026-08-08)
+
+From HEAD `acd06ef`. SHADOW MODE; Scheduler v1 / frontend / manual refresh /
+`feature/design-system` untouched; nothing pushed/merged/deployed/migrated; the
+remaining 11 adapters NOT started; `HANDOFF.md` stays untracked. request_hash
+unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 23.
+
+- **P1 (fragment order == live transport, never a hash).** `assembleSources` now
+  carries an IMMUTABLE `fragmentIndex` (the resolver/plan emission order, which is
+  exactly the live transport's `for contract -> for window -> for chunk` fetch
+  order) and sorts by it. The old `(from, to, requestHash)` sort is removed -- a
+  SHA is not a sequence key, and even the from/to tiebreak re-derived order from
+  data instead of preserving the plan. Concatenated `rows` now equal sequential
+  `fetchExportRows` concatenation, so orderSalesByBrand (last catalog label wins
+  for a duplicate ASIN) and compactContentChangeEvents (first label wins) match
+  the live route. Tested: route-vs-shadow parity for brand-sales AND
+  content-changes with >5 account IDs (two chunks), DELIBERATELY reverse-sorted
+  request hashes, and a duplicate ASIN with conflicting catalog labels -- shadow
+  == sequential concat and != hash order (proving order is load-bearing). The
+  pre-existing monthly-windows regression was rewritten to the plan-order
+  contract (no longer expects a date re-sort).
+- **P2 (size guard cannot be bypassed by a supplied byte count).** New
+  dependency-free `lib/server/report-limits.js` leaf owns the single canonical
+  `MAX_SNAPSHOT_BYTES` + `snapshotByteSize` / `assertSnapshotWithinLimit`.
+  report-store.js re-exports it; report-worker.js and report-snapshot-store.js
+  import it (no drifting literal; a pure worker never imports Supabase to know the
+  limit). `makeShadowSnapshotSaver` ALWAYS recomputes actual UTF-8 bytes and
+  validates against THAT before any write (throws `SNAPSHOT_TOO_LARGE`); a
+  caller-supplied `payloadBytes` is telemetry only. Tested: an oversized payload
+  with a FORGED small `payloadBytes` is rejected with zero writes; a within-limit
+  payload persists the RECOMPUTED byte count, not the supplied one.
+- **P2 (strict calendar date, validated before save).** `toDateOnly` validates
+  the sliced date via the strict UTC round-trip `isValidCalendarDate` (rejects
+  2026-02-30 / 2026-99-99 / non-leap 2023-02-29; accepts 2024-02-29). The worker
+  validates the derived latest date at a dedicated VALIDATE stage BEFORE saving;
+  an impossible date fails (`INVALID_LATEST_DATE`) so the shadow snapshot is never
+  saved ahead of a Postgres `date` write that would then fail -- previous snapshot
+  preserved, zero writes; a null date still succeeds. Tested: the strict rule
+  (leap/impossible/malformed/timestamp) and the end-to-end validate-stage failure
+  with last-known-good preserved.
+- **Verification (this worktree):** `node --check` on every changed file exit 0;
+  `npm run test:report-derivation` = **34**; `npm run test:scheduler-v2` = 56;
+  `npm run test:report-contracts` = 155; full `npm run verify` green = **395**
+  (54+60+23+6+56+**34**+7+155) + `build:check` (2,393 modules); `git diff --check`
+  clean.
+- Commits: `6e73571` (production fixes), `e08b835` (regression tests); docs follow.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
