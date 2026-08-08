@@ -34,7 +34,8 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads,
     shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS;
 let runReportJobs, assembleSources;
-let reportSourceRequestHashes;
+let reportSourceRequestHashes, isValidCalendarDate;
+let makeShadowSnapshotSaver;
 // Leaf (Scheduler v2) pure cores.
 let orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload;
 // PRODUCTION route copies (api/datadoe.js) -- for the INDEPENDENT parity harness.
@@ -504,16 +505,19 @@ test("blocker2: two five-ID chunks under one request key are both preserved (no 
   assert.equal(latestFetchedAt, "2025-07-01T00:00:00Z");
 });
 
-test("blocker2: two monthly windows under one request key retain their date windows (deterministic order)", async () => {
+test("blocker2: two monthly windows under one request key retain their date windows in canonical plan order", async () => {
+  // The resolver emits windows in canonical (chronological) order; assembleSources PRESERVES that
+  // plan order via fragmentIndex -- it never re-sorts by date or request_hash (P1). The live
+  // transport concatenates the same plan sequentially, so shadow order matches it.
   const planned = [
-    src("fba-plan:monthly-units", "h_m2", { from: "2025-02-01", to: "2025-02-28" }),
     src("fba-plan:monthly-units", "h_m1", { from: "2025-01-01", to: "2025-01-31" }),
+    src("fba-plan:monthly-units", "h_m2", { from: "2025-02-01", to: "2025-02-28" }),
   ];
   const { sources } = assembleSources(planned, { h_m1: "succeeded", h_m2: "succeeded" }, { h_m1: { rows: [{ u: 1 }] }, h_m2: { rows: [{ u: 2 }] } });
   const frs = sources["fba-plan:monthly-units"].fragments;
   assert.equal(frs.length, 2);
   assert.deepEqual(frs.map((f) => [f.from, f.to, f.requestHash]), [["2025-01-01", "2025-01-31", "h_m1"], ["2025-02-01", "2025-02-28", "h_m2"]]);
-  assert.deepEqual(sources["fba-plan:monthly-units"].rows, [{ u: 1 }, { u: 2 }], "each window's rows retained (grouped rows lack the month)");
+  assert.deepEqual(sources["fba-plan:monthly-units"].rows, [{ u: 1 }, { u: 2 }], "each window's rows retained in plan order (grouped rows lack the month)");
 });
 
 test("blocker2: a missing/malformed fragment makes the key unavailable (blocks derivation safely)", async () => {
@@ -614,14 +618,152 @@ test("blocker5: shadow payload below/at limit saved; above limit rejected with z
   }
 });
 
+/* ============================= re-review blocker regressions (P1/P2) ============================= */
+
+group("re-review blockers (fragment order, size boundary, date boundary)");
+
+// P1: fragments concatenate in the CANONICAL plan/chunk sequence (fragmentIndex), identical to
+// sequential fetchExportRows() concatenation -- NEVER sorted by request_hash (a SHA is not a
+// sequence key). >5 account IDs (two chunks), hashes deliberately reverse-sorted, and a duplicate
+// ASIN with conflicting catalog labels prove the order is load-bearing.
+test("P1: brand-sales fragments follow plan order, not request_hash order (>5 IDs, conflicting catalog labels)", async () => {
+  const DUP = "ASINDUP0001";
+  // Two order-line chunks for 6 account IDs, fetched/concatenated in account/chunk order.
+  const orderChunk0 = [{ date: "2025-06-01", child_asin: DUP, seller_or_vendor_id: "S1", seller_or_vendor_name: "Store", marketplace_country_code: "US", item_price_currency: "USD", total_sales_sum: 100, total_units_sold_sum: 4 }];
+  const orderChunk1 = [{ date: "2025-06-02", child_asin: DUP, seller_or_vendor_id: "S1", seller_or_vendor_name: "Store", marketplace_country_code: "US", item_price_currency: "USD", total_sales_sum: 50, total_units_sold_sum: 2 }];
+  // SAME ASIN, CONFLICTING brand across the two catalog chunks. orderSalesByBrand keeps the LAST
+  // catalog label observed, so whichever chunk is last decides the derived product_brand.
+  const catChunk0 = [{ child_asin: DUP, product_brand: "AlphaBrand" }];
+  const catChunk1 = [{ child_asin: DUP, product_brand: "OmegaBrand" }];
+
+  // request_hashes are DELIBERATELY reverse-sorted: chunk0 ("zzz") > chunk1 ("aaa").
+  const planned = [
+    src("brand-sales:order-lines", "h_ol_zzz", { sellerOrVendorIds: ["A1", "A2", "A3", "A4", "A5"], from: "2025-01-01", to: "2025-06-30" }),
+    src("brand-sales:order-lines", "h_ol_aaa", { sellerOrVendorIds: ["A6"], from: "2025-01-01", to: "2025-06-30" }),
+    src("brand-sales:catalog", "h_cat_zzz", { sellerOrVendorIds: ["A1", "A2", "A3", "A4", "A5"], from: "2025-01-01", to: "2025-06-30" }),
+    src("brand-sales:catalog", "h_cat_aaa", { sellerOrVendorIds: ["A6"], from: "2025-01-01", to: "2025-06-30" }),
+  ];
+  const status = { h_ol_zzz: "succeeded", h_ol_aaa: "succeeded", h_cat_zzz: "succeeded", h_cat_aaa: "succeeded" };
+  const loaded = new Map([
+    ["h_ol_zzz", { rows: orderChunk0 }], ["h_ol_aaa", { rows: orderChunk1 }],
+    ["h_cat_zzz", { rows: catChunk0 }], ["h_cat_aaa", { rows: catChunk1 }],
+  ]);
+
+  const { sources } = assembleSources(planned, status, loaded);
+  // Fragments and rows are in plan order, though the hashes reverse-sort.
+  assert.deepEqual(sources["brand-sales:order-lines"].fragments.map((f) => f.requestHash), ["h_ol_zzz", "h_ol_aaa"]);
+  assert.deepEqual(sources["brand-sales:catalog"].fragments.map((f) => f.requestHash), ["h_cat_zzz", "h_cat_aaa"]);
+  assert.deepEqual(sources["brand-sales:order-lines"].rows, [...orderChunk0, ...orderChunk1], "rows == sequential concatenation");
+  assert.deepEqual(sources["brand-sales:catalog"].rows, [...catChunk0, ...catChunk1]);
+
+  // Shadow payload derived from the assembled (plan-ordered) rows.
+  const shadow = deriveReportSnapshot({ reportKey: "brand-sales", sources });
+  assert.equal(shadow.status, "derived");
+  // Oracle: the live transport concatenates chunks sequentially in account/chunk order.
+  const oracle = orderSalesByBrand([...orderChunk0, ...orderChunk1], [...catChunk0, ...catChunk1]);
+  assert.deepEqual(shadow.payload.rows, oracle, "shadow == sequential fetchExportRows concatenation");
+  assert.ok(shadow.payload.rows.every((r) => r.product_brand === "OmegaBrand"), "the LAST catalog chunk's label wins (plan order)");
+  // Proof the ordering is load-bearing: a request_hash sort would have flipped the chunks and
+  // produced AlphaBrand -- a genuinely different payload.
+  const hashSorted = orderSalesByBrand([...orderChunk1, ...orderChunk0], [...catChunk1, ...catChunk0]);
+  assert.notDeepEqual(shadow.payload.rows, hashSorted, "request_hash ordering would change the derived payload");
+});
+
+test("P1: content-changes catalog fragments follow plan order (first label wins), not request_hash", async () => {
+  const DUP = "ASINDUP002"; // exactly 10 chars so notificationAsins recognizes it
+  // SAME ASIN, conflicting brand; compactContentChangeEvents keeps the FIRST catalog label seen.
+  const catChunk0 = [{ child_asin: DUP, product_brand: "FirstBrand" }];
+  const catChunk1 = [{ child_asin: DUP, product_brand: "SecondBrand" }];
+  const events = [{ event_time: "2025-06-03T10:00:00Z", sp_api_notification_id: "n1", sp_api_notification_type: "BRANDED_ITEM_CONTENT_CHANGE", payload: JSON.stringify({ asin: DUP }), notification_metadata: "{}" }];
+  const planned = [
+    src("content-changes:events", "h_ev"),
+    src("content-changes:catalog", "h_cat_zzz", { sellerOrVendorIds: ["A1", "A2", "A3", "A4", "A5"] }),
+    src("content-changes:catalog", "h_cat_aaa", { sellerOrVendorIds: ["A6"] }),
+  ];
+  const status = { h_ev: "succeeded", h_cat_zzz: "succeeded", h_cat_aaa: "succeeded" };
+  const loaded = new Map([["h_ev", { rows: events }], ["h_cat_zzz", { rows: catChunk0 }], ["h_cat_aaa", { rows: catChunk1 }]]);
+
+  const { sources } = assembleSources(planned, status, loaded);
+  assert.deepEqual(sources["content-changes:catalog"].rows, [...catChunk0, ...catChunk1], "catalog concatenated in plan order");
+  const shadow = deriveReportSnapshot({ reportKey: "content-changes", sources, context: { accountId: "A1", retrievedAt: "2025-06-03T12:00:00Z" } });
+  assert.equal(shadow.status, "derived");
+  const oracle = compactContentChangeEvents(events, [...catChunk0, ...catChunk1]);
+  assert.deepEqual(shadow.payload.events, oracle, "shadow == sequential concatenation");
+  assert.deepEqual(shadow.payload.events[0].brands, ["FirstBrand"], "the FIRST catalog chunk's label wins (plan order)");
+  const hashOrder = compactContentChangeEvents(events, [...catChunk1, ...catChunk0]);
+  assert.notDeepEqual(shadow.payload.events, hashOrder, "request_hash ordering would change the derived brand");
+});
+
+// P2 (size boundary): the shadow saver ALWAYS recomputes the actual UTF-8 byte size and never
+// trusts a caller-supplied payloadBytes (which may be stale/understated/forged).
+test("P2-size: shadow saver recomputes bytes; a forged small payloadBytes cannot bypass the guard (zero writes)", async () => {
+  const writes = [];
+  // Inject a fake persistence layer so NO real Supabase write happens; it records any call.
+  const saver = makeShadowSnapshotSaver({ save: async (a) => { writes.push(a); } });
+  // A genuinely oversized (>8 MB) payload, with the caller LYING that it is 10 bytes.
+  const big = { rows: [{ blob: "x".repeat(9 * 1024 * 1024) }] };
+  await assert.rejects(
+    () => saver({ reportKey: "scheduler-v2/brand-sales", accountId: "A1", params: { reportVersion: "v", accountId: "A1" }, payload: big, payloadBytes: 10 }),
+    (err) => !!err && err.code === "SNAPSHOT_TOO_LARGE",
+    "oversized payload rejected despite a forged small payloadBytes",
+  );
+  assert.equal(writes.length, 0, "no Supabase write for a rejected oversized payload");
+
+  // A within-limit payload saves, and the RECOMPUTED byte count is persisted (not the forged one).
+  const small = { rows: [{ ok: true }] };
+  const res = await saver({ reportKey: "scheduler-v2/brand-sales", accountId: "A1", params: { reportVersion: "v", accountId: "A1" }, payload: small, payloadBytes: 999999999 });
+  assert.equal(writes.length, 1, "within-limit payload saved once");
+  assert.equal(writes[0].payloadBytes, Buffer.byteLength(JSON.stringify(small)), "the RECOMPUTED byte count is persisted, not the forged value");
+  assert.ok(res && typeof res.paramsHash === "string");
+});
+
+// P2 (date boundary): the strict UTC calendar-date rule accepts a real leap day and rejects
+// impossible/malformed values -- a shape-only regex is not enough.
+test("P2-date: strict calendar rule accepts a real leap day; rejects impossible/malformed dates", async () => {
+  assert.equal(isValidCalendarDate("2024-02-29"), true, "real leap day accepted");
+  assert.equal(isValidCalendarDate("2023-02-29"), false, "non-leap Feb 29 rejected");
+  assert.equal(isValidCalendarDate("2026-02-30"), false, "impossible day rejected");
+  assert.equal(isValidCalendarDate("2026-99-99"), false, "impossible month/day rejected");
+  assert.equal(isValidCalendarDate("2026-13-01"), false, "impossible month rejected");
+  assert.equal(isValidCalendarDate("2026-06-04T10:00:00Z"), false, "a full timestamp is not a date-only value");
+  assert.equal(isValidCalendarDate(""), false);
+  assert.equal(isValidCalendarDate(null), false);
+});
+
+// P2 (date boundary): an impossible derived latest date fails at the VALIDATE stage -- the shadow
+// snapshot is never saved ahead of a Postgres `date` write that would then fail.
+test("P2-date: impossible derived latest date fails at VALIDATE; previous snapshot preserved, zero writes", async () => {
+  const store = makeMemoryReportStore();
+  store.seedSource("h_ol", "succeeded");
+  store.seedSource("h_cat", "succeeded");
+  // A source row carrying an IMPOSSIBLE calendar date (bad upstream data). The payload is
+  // otherwise valid; only latest_data_date is not a real calendar date.
+  const badOrders = [{ date: "2026-02-30", child_asin: "ASIN000001", seller_or_vendor_id: "S1", seller_or_vendor_name: "Store", marketplace_country_code: "US", item_price_currency: "USD", total_sales_sum: 10, total_units_sold_sum: 1 }];
+  const loader = makeCacheLoader(new Map([["h_ol", badOrders], ["h_cat", CATALOG_ROWS]]));
+  const saver = makeSnapshotSaver(store);
+  // Seed a prior good shadow snapshot that MUST survive.
+  store._snapshots.set("scheduler-v2/brand-sales|A1|ph_prev", { payload: { rows: [{ prior: true }] } });
+  const plannedReports = [plan("brand-sales", "A1", [src("brand-sales:order-lines", "h_ol"), src("brand-sales:catalog", "h_cat")])];
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(res.failed, 1);
+  const bs = store._report("brand-sales", "A1");
+  assert.equal(bs.error_stage, "validate", "failed at the validate stage, not save");
+  assert.equal(bs.error_code, "INVALID_LATEST_DATE");
+  assert.equal(bs.validated, false);
+  assert.equal(store._saveCalls, 0, "no snapshot save when the date fails validation");
+  assert.ok(store._snapshots.has("scheduler-v2/brand-sales|A1|ph_prev"), "prior snapshot preserved");
+  assert.equal([...store._snapshots.keys()].filter((k) => k.startsWith("scheduler-v2/brand-sales")).length, 1, "no new snapshot written");
+});
+
 /* ---- run the async suite with NO top-level await; deterministic natural exit ---- */
 async function main() {
   mark("main(): loading Phase 1d modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS } = await import("../lib/server/sync/report-derivation.js"));
   ({ runReportJobs, assembleSources } = await import("../lib/server/sync/report-worker.js"));
-  ({ reportSourceRequestHashes } = await import("../lib/server/sync/report-source-contracts.js"));
+  ({ reportSourceRequestHashes, isValidCalendarDate } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = await import("../lib/server/reports/derivation-core.js"));
   ({ MAX_SNAPSHOT_BYTES } = await import("../lib/server/report-store.js"));
+  ({ makeShadowSnapshotSaver } = await import("../lib/server/sync/report-snapshot-store.js"));
   // The PRODUCTION route's own copies (now exported) -- executed independently for parity.
   const route = await import("../api/datadoe.js");
   routeOrderSalesByBrand = route.orderSalesByBrand;
