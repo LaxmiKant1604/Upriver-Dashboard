@@ -4113,6 +4113,47 @@ unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 22.
   (54+60+23+6+56+**29**+7+155) + `build:check`; `git diff --check` clean.
 - Commits: `875d9c9` (production fixes), `14208d1` (regression tests); docs follow.
 
+### Scheduler v2 Phase 1d blocker-fix re-review (Codex, 2026-08-08)
+
+- Re-reviewed `875d9c9`, `14208d1`, and `45fe182`. The five originally
+  reported defects are materially addressed, and the checked-out worktree passes
+  `npm run test:report-derivation` (**29 assertions**), full `npm run verify`
+  (**390 assertions** plus the successful 2,393-module production build), and
+  `git diff --check`. `HANDOFF.md` remains the only untracked file.
+- **P1 parity blocker -- fragment ordering no longer matches the live transport.**
+  `assembleSources()` sorts fragments with equal `from`/`to` by `requestHash`.
+  The live transport concatenates five-ID chunks in the original account/chunk
+  order. A SHA hash is not a sequence key. This can change complete payloads:
+  `orderSalesByBrand()` keeps the first catalog brand observed for a duplicate
+  ASIN, and Content Changes preserves source event order. Preserve the canonical
+  resolver/plan sequence (or carry an explicit immutable `fragmentIndex`/
+  `windowIndex` + `chunkIndex`) and sort by that sequence, never by hash. Add a
+  route-vs-shadow parity test with more than five account IDs, deliberately
+  reverse-sorting hashes, a duplicate ASIN with conflicting catalog labels, and
+  ordered events. The shadow payload must remain identical to sequential
+  `fetchExportRows()` concatenation.
+- **P2 size-boundary blocker -- the I/O saver trusts caller-supplied byte counts.**
+  `makeShadowSnapshotSaver()` recomputes bytes only when `payloadBytes` is absent;
+  a stale or understated numeric value bypasses the advertised defense-in-depth
+  guard. Also, `report-worker.js` repeats the 8 MB value as a literal default, so
+  it can drift from `report-store.js`. Put `MAX_SNAPSHOT_BYTES` in a dependency-free
+  shared limits leaf (so pure workers do not import Supabase), import it at the
+  interactive worker and saver boundaries, and always recompute actual UTF-8 JSON
+  bytes before writing. Treat a supplied count only as telemetry/a consistency
+  assertion. Test an oversized payload with a forged small `payloadBytes` value;
+  it must perform zero Supabase writes.
+- **P2 date-boundary blocker -- `toDateOnly()` is shape-only, not a strict date.**
+  Values such as `2026-99-99` and `2026-02-30` pass the regex, allowing a shadow
+  snapshot to be saved before the Postgres `date` success write fails. Validate
+  the sliced date by UTC round-trip (reuse the existing strict calendar-date
+  rule or a dependency-free shared date helper) before any snapshot save. An
+  invalid derived latest date must fail at validation and preserve the previous
+  snapshot with zero snapshot writes. Add leap-day, impossible-date, and malformed
+  timestamp tests.
+- Phase 1d remains **not approved**. Fix these three items before wiring the 11
+  pending derive cores. Continue in shadow mode; do not push, merge, deploy, apply
+  migrations, touch Scheduler v1/frontend/manual refresh, or commit `HANDOFF.md`.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
