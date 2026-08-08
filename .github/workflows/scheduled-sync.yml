@@ -1,6 +1,8 @@
 name: scheduled-sync
 
-# Authoritative driver for the website-wide scheduled DataDoe sync.
+# TEMPORARILY PAUSED: automatic DataDoe sync schedules are disabled while
+# Scheduler v2 is completed and validated. Keep workflow_dispatch only so an
+# administrator can run a deliberate emergency sync; it never runs by itself.
 #
 # Vercel's 60s function cap means one call to /api/cron/sync?bucket=<b> does only a
 # bounded slice and returns { drained }. This workflow fires at the exact bucket
@@ -16,9 +18,6 @@ name: scheduled-sync
 #   CRON_SECRET    the same value set in Vercel (never printed by this workflow)
 
 on:
-  schedule:
-    - cron: "0 2 * * *"    # non-us
-    - cron: "30 10 * * *"  # us
   workflow_dispatch:
     inputs:
       bucket:
@@ -27,7 +26,7 @@ on:
         default: "non-us"
 
 concurrency:
-  group: scheduled-sync-${{ github.event.schedule || github.event.inputs.bucket }}
+  group: scheduled-sync-manual-${{ github.event.inputs.bucket }}
   cancel-in-progress: false
 
 jobs:
@@ -38,13 +37,7 @@ jobs:
       - name: Resolve bucket from trigger
         id: b
         run: |
-          if [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
-            echo "bucket=non-us" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "30 10 * * *" ]; then
-            echo "bucket=us" >> "$GITHUB_OUTPUT"
-          else
-            echo "bucket=${{ github.event.inputs.bucket }}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "bucket=${{ github.event.inputs.bucket }}" >> "$GITHUB_OUTPUT"
 
       - name: Drain bucket until drained
         env:

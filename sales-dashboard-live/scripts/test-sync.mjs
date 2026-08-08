@@ -69,23 +69,19 @@ test("empty/unknown country is 'unknown' (flagged + skipped, never us/non-us)", 
   assert.equal(bucketForCountry(null), "unknown");
 });
 
-/* 2. Schedule constants + vercel.json alignment. */
+/* 2. Desired schedule constants + temporary production pause. */
 test("schedule constants are 02:00 (non-us) and 10:30 (us) UTC", () => {
   assert.equal(SCHEDULE_UTC["non-us"], "02:00");
   assert.equal(SCHEDULE_UTC.us, "10:30");
   assert.equal(SCHEDULE_CRON["non-us"], "0 2 * * *");
   assert.equal(SCHEDULE_CRON.us, "30 10 * * *");
 });
-test("vercel.json sync crons match the schedule constants", () => {
+test("automatic GitHub and Vercel sync schedules stay paused", () => {
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
-  const byBucket = {};
-  for (const c of vercel.crons || []) {
-    if (String(c.path).includes("bucket=non-us")) byBucket["non-us"] = c.schedule;
-    if (String(c.path).includes("bucket=us")) byBucket.us = c.schedule;
-  }
-  assert.equal(byBucket["non-us"], "0 2 * * *");
-  assert.equal(byBucket.us, "30 10 * * *");
-  assert.equal(vercel.crons.length, 2, "legacy Ads crons must be disabled to prevent duplicate exports");
+  const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduled-sync.yml", import.meta.url)), "utf8");
+  assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically while Scheduler v2 is unfinished");
+  assert.doesNotMatch(workflow, /^\s*schedule\s*:/m, "GitHub Actions must not invoke DataDoe automatically while paused");
+  assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "an explicit administrator-only emergency trigger should remain available");
 });
 test("GitHub driver retries transient 429/5xx responses but keeps other non-200 responses fatal", () => {
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduled-sync.yml", import.meta.url)), "utf8");

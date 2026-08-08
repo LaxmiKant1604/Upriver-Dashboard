@@ -24,8 +24,10 @@
 
 export const SCHEDULE_BUCKETS = { US: "us", NON_US: "non-us" };
 
-// Requested schedule, asserted in scripts/test-sync.mjs against vercel.json:
+// Desired Scheduler v2 schedule after production approval:
 //   non-us -> 02:00 UTC (07:30 IST); us -> 10:30 UTC (16:00 IST).
+// Automatic production triggers are temporarily removed while Scheduler v2 is
+// unfinished; scripts/test-sync.mjs asserts that pause remains in force.
 export const SCHEDULE_UTC = { "non-us": "02:00", us: "10:30" };
 export const SCHEDULE_CRON = { "non-us": "0 2 * * *", us: "30 10 * * *" };
 

@@ -2483,6 +2483,24 @@ exact 06:00 local time becomes a business requirement.
   Vite build completed before release; Node syntax checking also passed for
   `api/datadoe.js`.
 
+### Production scheduled sync temporarily paused (Codex, 2026-08-08)
+
+- The existing Scheduler v1 was still running automatically from two independent
+  drivers and consuming DataDoe export tokens while Scheduler v2 remained in
+  shadow-mode development: GitHub Actions `scheduled-sync` at 02:00/10:30 UTC and
+  matching Vercel crons for `/api/cron/sync`.
+- Automatic schedules were removed from both `.github/workflows/scheduled-sync.yml`
+  and `sales-dashboard-live/vercel.json`. The GitHub workflow retains only an
+  explicit administrator-triggered `workflow_dispatch`; it cannot run by itself.
+- Dashboard/API behavior and saved Supabase data are unchanged. Users continue to
+  see the last successfully saved snapshots, but those snapshots will become stale
+  until a deliberate manual sync or the validated Scheduler v2 rollout resumes
+  automatic refreshes.
+- Re-enable automatic scheduling only after Scheduler v2 completes its four current
+  Daily/SKU P&L integrity corrections, live shadow-cycle reconciliation, migration,
+  and Codex production approval. Restore one authoritative scheduler only; do not
+  restore both GitHub and Vercel as competing automatic drivers.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
