@@ -20,7 +20,7 @@
 import {
   orderSalesByBrand,
   catalogBrandNames,
-  compactContentChangeEvents,
+  contentChangesPayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -89,15 +89,18 @@ const REGISTRY = {
     snapshotVersion: "content-changes/v2d-1",
     optionalRequestKeys: [],
     derivedSourceKeys: [],
-    derive: ({ sources }) => {
-      const events = compactContentChangeEvents(
-        sources["content-changes:events"].rows,
-        sources["content-changes:catalog"].rows,
-      );
-      return { events, catalogBrands: catalogBrandNames(sources["content-changes:catalog"].rows) };
-    },
-    validatePayload: (p) => !!p && Array.isArray(p.events) && Array.isArray(p.catalogBrands),
-    latestDataDate: (p) => maxIsoDate((p.events || []).map((e) => e.eventTime)),
+    // Full production-parity payload via the shared assembler. retrievedAt/accountId come from
+    // the deterministic derivation context (source fetch time / plan), never Date.now().
+    derive: ({ sources, context }) => contentChangesPayload({
+      accountId: context.accountId ?? null,
+      notificationRows: sources["content-changes:events"].rows,
+      catalogRows: sources["content-changes:catalog"].rows,
+      retrievedAt: context.retrievedAt ?? null,
+    }),
+    validatePayload: (p) => !!p && Array.isArray(p.events) && Array.isArray(p.catalogBrands)
+      && typeof p.unassignedEvents === "number" && ("accountId" in p) && ("retrievedAt" in p),
+    // Event times are timestamps; latest_data_date must be date-only (Postgres date).
+    latestDataDate: (p) => { const d = maxIsoDate((p.events || []).map((e) => e.eventTime)); return d ? String(d).slice(0, 10) : null; },
   },
 
   // ---- Declared dependency map; derive wiring lands in the next faithful tranche. ----

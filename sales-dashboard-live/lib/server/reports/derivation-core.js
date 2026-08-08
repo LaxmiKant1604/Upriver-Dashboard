@@ -104,6 +104,22 @@ export function notificationAsins(value) {
   return [...found].sort();
 }
 
+// Assemble the COMPLETE Content Changes payload exactly as the api/datadoe.js route does
+// ({ accountId, events, catalogBrands, retrievedAt, unassignedEvents }). `retrievedAt` is a
+// caller-supplied value (the route passes a request timestamp; the scheduler passes the saved
+// source fetch time) so this stays PURE -- no Date.now() here. `unassignedEvents` is the COUNT
+// of events whose ASINs did not map to a catalog brand (the frontend reads this number).
+export function contentChangesPayload({ accountId, notificationRows, catalogRows, retrievedAt }) {
+  const events = compactContentChangeEvents(notificationRows, catalogRows);
+  return {
+    accountId,
+    events,
+    catalogBrands: catalogBrandNames(catalogRows),
+    retrievedAt,
+    unassignedEvents: events.filter((event) => !event.brands.length).length,
+  };
+}
+
 export function compactContentChangeEvents(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {

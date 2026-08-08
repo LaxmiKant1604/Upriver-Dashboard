@@ -23,8 +23,12 @@ import {
   getReportSnapshot,
   getLatestReportSnapshot,
 } from "../supabase.js";
-import { paramsHashFor } from "../report-store.js";
+import { paramsHashFor, MAX_SNAPSHOT_BYTES } from "../report-store.js";
 import { shadowSnapshotKey, productionKeyFromShadow, compareReportPayloads } from "./report-derivation.js";
+
+// Re-export the canonical shared-snapshot ceiling so callers (the report worker) enforce the
+// SAME 8 MB limit as the interactive report path -- one source of truth.
+export { MAX_SNAPSHOT_BYTES };
 
 // The report-worker `store` interface, backed by Supabase.
 export function makeSupabaseReportStore() {
@@ -50,8 +54,14 @@ export function makeSourceRowLoader() {
 // existing report_snapshots path; returns { paramsHash } so the job can record it.
 export function makeShadowSnapshotSaver() {
   return async ({ reportKey, accountId, params, payload, payloadBytes, sourceRefreshedAt }) => {
+    // Defense-in-depth: reject an oversized payload BEFORE any Supabase write, through the
+    // canonical limit (the worker also guards, but this protects any other caller too).
+    const bytes = typeof payloadBytes === "number" ? payloadBytes : Buffer.byteLength(JSON.stringify(payload ?? null));
+    if (bytes > MAX_SNAPSHOT_BYTES) {
+      throw new Error(`Shadow snapshot ${(bytes / (1024 * 1024)).toFixed(1)} MB exceeds the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB limit; not saved.`);
+    }
     const paramsHash = paramsHashFor(params.reportVersion, params);
-    await saveReportSnapshot({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt });
+    await saveReportSnapshot({ reportKey, accountId, paramsHash, params, payload, payloadBytes: bytes, sourceRefreshedAt });
     return { paramsHash };
   };
 }

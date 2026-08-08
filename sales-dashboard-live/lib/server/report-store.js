@@ -29,7 +29,10 @@ import {
 // A refresh that produces more than this is a design problem, not something to
 // silently truncate or silently keep out of the shared store. Every new report
 // aggregates server-side specifically to stay far below it.
-const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+// Canonical shared-snapshot payload ceiling. Exported so Scheduler v2 shadow snapshots
+// (lib/server/sync/report-snapshot-store.js + report-worker.js) reject oversized payloads
+// through the SAME limit as the interactive report path -- one source of truth.
+export const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
 const DEFAULT_LOCK_SECONDS = 240;
 

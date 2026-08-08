@@ -844,7 +844,11 @@ async function fetchSqpRows(apiKey, sourceId, sellerOrVendorIds, from, to) {
   return rows;
 }
 
-function orderSalesByBrand(rows, catalogRows) {
+// Exported so an INDEPENDENT parity harness (scripts/scheduler-v2-report-derivation.test.mjs)
+// can execute this production fold and the extracted pure copy in
+// lib/server/reports/derivation-core.js side by side and assert they never drift. Runtime
+// behavior is unchanged (adding `export` only).
+export function orderSalesByBrand(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim();
@@ -938,7 +942,7 @@ function normalizeAdRows(rows) {
   }));
 }
 
-function catalogBrandNames(rows) {
+export function catalogBrandNames(rows) {
   return [...new Set(
     rows
       .map((row) => String(row.product_brand || "").trim())
@@ -978,7 +982,7 @@ function notificationAsins(value) {
   return [...found].sort();
 }
 
-function compactContentChangeEvents(rows, catalogRows) {
+export function compactContentChangeEvents(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim().toUpperCase();

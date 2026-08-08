@@ -773,11 +773,14 @@ async function patchSyncReportJob(cycleId, reportKey, accountId, body) {
   await request(`/rest/v1/sync_report_jobs?${query}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body });
 }
 
-// A required source failed/was skipped: block THIS report's fetch rollup only; the snapshot
-// and last_good_snapshot_at are untouched (last-known-good survives).
+// A required source failed/was skipped: block THIS report TERMINALLY for the cycle so it is
+// not reprocessed on later invocations. fetch=blocked + derive/save=skipped + validated=false
+// is a consistent finished state; the snapshot and last_good_snapshot_at are untouched
+// (last-known-good survives), and a NEW cycle re-derives.
 export async function recordSyncReportBlocked({ cycleId, reportKey, accountId, reason }) {
   await patchSyncReportJob(cycleId, reportKey, accountId, {
-    fetch_status: "blocked", error_stage: "fetch", error_code: "SOURCE_BLOCKED", error_message: reason || "required source unavailable",
+    fetch_status: "blocked", derive_status: "skipped", save_status: "skipped", validated: false,
+    error_stage: "fetch", error_code: "SOURCE_BLOCKED", error_message: reason || "required source unavailable",
   });
 }
 
