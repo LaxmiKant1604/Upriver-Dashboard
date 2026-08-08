@@ -1150,3 +1150,105 @@ end-to-end impossible-date VALIDATE failure with last-known-good preserved. Full
 green: **395** (54+60+23+6+56+**34**+7+155) + `build:check`; `node --check` on every changed
 file exits 0; `git diff --check` clean. Remaining unchanged: wire the 11 pending derive cores
 (each with a golden parity test) + the derived-only reads; then Codex's live gates.
+
+## 24. Phase 1d tranche 2 -- Daily Reporting + SKU P&L adapters (SHADOW MODE, 2026-08-08)
+
+Wires the first two faithful derive adapters after the approved foundation (`ff9d350`). ONLY
+these two; the other nine adapters are NOT started. Commits `5a3a197` (route folds exported/
+extracted), `cab8d1c` (pure cores), `b8d9cab` (registry adapters + worker derived-input channel),
+`baa8ad6` (parity/regression tests). SHADOW MODE; Scheduler v1 / frontend / manual refresh /
+`feature/design-system` untouched; nothing pushed/merged/deployed/migrated; zero DataDoe calls
+during derivation; `request_hash`, five-ID batching, and organization isolation unchanged;
+`HANDOFF.md` stays untracked. (Commits are layered substrate -> cores -> adapters -> tests
+because both reports share the same files; each committed snapshot keeps the suite green.)
+
+### 24.1 Reuse strategy (safest-per-report)
+
+`npm run verify` does not execute the fetch-bound `api/datadoe.js` handlers, so -- exactly as the
+approved blocker-4 pattern -- the production folds are **exported** (runtime unchanged) and
+**copied verbatim** into the dependency-free `reports/derivation-core.js` leaf, with an INDEPENDENT
+route-vs-shadow parity harness executing both copies (separate function objects) on shared fixtures.
+The SKU P&L fold was extracted from `fetchSkuPlRows` into an exported pure `foldSkuPlMonthlyRows`
+that the route now calls (output-identical), removing the only inline duplication.
+
+Production functions reused/copied: `normalizeDailySalesRows`, `dailyRowsForBrand` (first catalog
+label per ASIN wins), `normalizeAdRows`, `mergeSalesAndAds`, `foldSkuPlMonthlyRows`, and the
+`src/App.jsx` COGS applier `computeSkuPlRow`/`skuPlScopedTotals`/`cogsOverrideKey` (a React module
+that cannot be imported offline, so transcribed verbatim and unit-tested against hand-computed
+expectations). The ONLY new fold is `rollupSupersetToDaily` (no production equivalent -- the route
+uses the server-side grouped compact export), proven equal to that compact calc in the harness.
+
+### 24.2 Daily Reporting
+
+- **Strategy.** Derive BOTH outputs from the ONE saved ASIN/day Sales & Traffic superset
+  (`daily-reporting:asin-day-superset`, monthly-segmented, strict) + saved Product Catalog. No
+  compact all-brand export, no per-brand export. ALL-brand = sum the superset over `child_asin`
+  per `(date, seller_or_vendor_id)` -> normalize -> `total_units_sold = total_units` -> merge the
+  injected Ads rows. Named brand = catalog ASIN->brand join folded to one row/day (NO ads, exactly
+  like the route). Additive values re-aggregate after fragment concatenation; there are no stored
+  ratio fields (daily ratios are recomputed in the browser from these base sums).
+- **Snapshot stored this tranche:** the ALL-brand payload `{ rows, brandFiltered:false }`. `brand`
+  is a legitimate snapshot param (the cache key includes it); per-brand snapshot PLANNING is
+  deferred to the orchestration phase (the core already derives any brand, fully parity-tested).
+- **Ads** are a DERIVE-ONLY injected input (`context.adRows`, planner-loaded from the scheduled
+  Ads rows) delivered via the worker's new `loadDerivedContext` callback -- reaching the pure
+  adapter but NEVER the snapshot params/identity. A missing/non-array `adRows` for the ALL mode
+  THROWS (-> derive-invalid, last-known-good preserved) rather than silently understating.
+- **Payload shape (ALL):** `{ rows: [{date, seller_or_vendor_id, total_sales_sum, total_units_sum,
+  total_sales, total_units, total_units_sold, ad_sales?, ad_spend?, ad_clicks?}], brandFiltered:false }`
+  (ad fields present only where Ads exist; ad-only days get a synthetic zero-sales row with
+  `currency`). **Named:** `{ rows: [{date, seller_or_vendor_id, total_sales, total_units,
+  total_units_sold}], brandFiltered:true }`. `latest_data_date` = max row date.
+
+### 24.3 SKU P&L
+
+- **Strategy.** Fold the six saved monthly-profit fragments (`sku-pl:monthly-profit`, strict) into
+  one row per `currency|sku|child_asin` with per-month sums under `byMonth`. `monthKey` comes from
+  each fragment's `from`, so two five-ID chunks in the same month sum into one bucket and the full
+  six-month `byMonth` map is preserved (including empty months). Currencies never merge (part of
+  the identity key). No ratios are summed.
+- **Snapshot = the RAW route payload** `{ accountId, from, to, months, currencies, catalogBrands,
+  rows }` byte-for-byte. `latest_data_date` = the window `to` (end of the last covered month).
+- **COGS dependency (approved: "raw fold + tested applier").** The live route does NOT apply COGS
+  overrides -- `src/App.jsx` applies them at display from browser `localStorage`, and the Supabase
+  `getCogsOverrides()`/`cogs_overrides` table is currently unused. Baking overrides in would
+  diverge from the route payload AND double-apply against the browser, so the snapshot stays raw.
+  The injected-COGS applier (`computeSkuPlRow` + `latestCogsOverridePerUnit`) is implemented and
+  parity-tested but NOT wired into the stored snapshot: it picks the latest valid per-unit override
+  (max `updated_at`; negative/non-finite ignored), replaces ONLY the COGS component, moves cost/
+  profit by the same delta, recomputes every ratio from sums, and keeps missing COGS explicitly
+  unavailable -- NEVER assumed zero. It is ready for future server-side use / the live-gate
+  reconciliation without touching the frontend.
+
+### 24.4 Job status / safety (both)
+
+`latest_data_date` (max row date / window `to`), truthful `row_count` (real payload rows) and
+`payload_bytes` (recomputed) are recorded; the payload is validated before save; invalid/missing/
+malformed inputs fail at derive/validate (never an empty snapshot); save failure is a distinct
+stage; a repeated worker invocation does not re-derive a finished report; one report's failure does
+not block the other; the adapters read only `sources`/`context` and create NO source request.
+
+### 24.5 Verification
+
+`node --check` on every changed file exits 0; `npm run test:report-derivation` = **44** (34 + 10
+new, natural exit 0, zero fetch); `npm run test:scheduler-v2` = 56; `npm run test:report-contracts`
+= 155; `npm run test:source-identity` = 7; full `npm run verify` green = **405**
+(54+60+23+6+56+**44**+7+155) + `build:check` (2,393 modules); `git diff --check` clean. The golden
+`request_hash`, five-ID batching, and primary/dd-secondary isolation assertions remain green.
+
+### 24.6 Live-data assumptions / risks
+
+- **Superset vs compact reconciliation (existing live gate).** The ALL-brand roll-up equals the
+  compact export only if DataDoe's `[date,seller]` group-by is a strict roll-up of the
+  `[date,seller,child_asin]` superset (same source, same aggregations). Proven offline against a
+  deterministic oracle; reconcile once against a live compact total before retiring the compact export.
+- **Ads freshness/injection.** ALL-brand fidelity depends on the planner loading the scheduled Ads
+  rows into `context.adRows`; an absent/failed Ads load must gate upstream (like a required source),
+  which the adapter enforces by throwing on a missing array.
+- **Fragment order = resolver plan order.** Faithful concatenation assumes production planning
+  passes the resolver's `contract -> window -> chunk` output through unchanged (the approved P1
+  guarantee); it must never rebuild fragments from unordered DB rows.
+- **COGS overrides are browser-local today.** The Supabase `cogs_overrides` reader is unused; wiring
+  the tested applier server-side is deferred and must not double-apply with the browser.
+- Remaining unchanged: the nine other adapters, per-brand daily snapshot planning, and Codex's live
+  gates (no push/merge/deploy/migration/pg_cron until then).

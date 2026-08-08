@@ -4225,6 +4225,57 @@ unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 23.
   migration application, Scheduler v1/frontend/manual-refresh changes, and live
   DataDoe calls until the complete shadow pipeline passes Codex's live gates.
 
+### Scheduler v2 Phase 1d tranche 2 -- Daily Reporting + SKU P&L adapters (Claude, 2026-08-08)
+
+From HEAD `ff9d350` (foundation approved). SHADOW MODE; ONLY these two adapters
+(the other nine NOT started); Scheduler v1 / frontend / manual refresh /
+`feature/design-system` untouched; nothing pushed/merged/deployed/migrated; zero
+DataDoe calls during derivation; request_hash, five-ID batching, and org isolation
+unchanged; `HANDOFF.md` stays untracked. See SCHEDULER_V2.md section 24.
+
+- **Two user decisions this session (task vs code mismatch surfaced first):**
+  (1) SKU P&L COGS = "raw fold + tested applier" -- the live route never applies
+  COGS overrides (App.jsx applies them at display from browser localStorage; the
+  Supabase getCogsOverrides/cogs_overrides table is unused), so the snapshot stays
+  the raw route payload and the injected-COGS applier is implemented + parity-tested
+  but NOT baked in (no double-apply, no frontend change). (2) Daily = store the
+  ALL-brand snapshot; the core derives any brand (both parity-tested); per-brand
+  snapshot planning deferred to orchestration; Ads injected via derive context.
+- **Reuse = safest-per-report (blocker-4 pattern).** verify does not run the
+  fetch-bound api/datadoe.js handlers, so production folds are EXPORTED (runtime
+  unchanged) + COPIED verbatim into the pure `reports/derivation-core.js` leaf with
+  an INDEPENDENT route-vs-shadow parity harness (separate function objects). SKU P&L
+  fold extracted from fetchSkuPlRows into exported `foldSkuPlMonthlyRows` (the route
+  now calls it; output-identical). Only new fold: `rollupSupersetToDaily` (proven ==
+  the compact calc).
+- **Daily Reporting.** Derive BOTH all-brand and every named brand from the ONE saved
+  ASIN/day superset + catalog. ALL = sum superset over child_asin per (date,seller)
+  -> normalize -> total_units_sold -> merge injected Ads -> `{rows, brandFiltered:false}`.
+  Named = catalog ASIN->brand join, no ads -> `{rows, brandFiltered:true}`. Ads reach
+  the pure adapter via the worker's NEW `loadDerivedContext` channel (derive context
+  only, NEVER snapshot params); a missing ALL adRows throws (last-known-good kept).
+  latest_data_date = max row date.
+- **SKU P&L.** Fold the six monthly-profit FRAGMENTS into one row per
+  currency|sku|child_asin with per-month byMonth sums (monthKey from fragment.from,
+  so two five-ID chunks/month sum into one bucket; full six-month map preserved incl.
+  empty months; currencies never merged; no ratios summed). Snapshot = the RAW route
+  payload `{accountId, from, to, months, currencies, catalogBrands, rows}` byte-for-byte.
+  latest_data_date = window `to`. COGS applier (computeSkuPlRow + latestCogsOverridePerUnit)
+  implemented + tested (latest by updated_at, negative/non-finite ignored, missing COGS
+  explicitly unavailable never zero) but NOT wired into the snapshot.
+- **Worker change:** added an injected `loadDerivedContext` callback -- DERIVE-ONLY
+  inputs (e.g. Ads) merged into the derive context, deliberately excluded from the
+  snapshot params/paramsHash. Backward-compatible (null for reports needing none).
+- **Verification (this worktree):** `node --check` on every changed file exit 0;
+  `npm run test:report-derivation` = **44** (34 + 10 new, natural exit 0, zero fetch);
+  `npm run test:scheduler-v2` = 56; `npm run test:report-contracts` = 155;
+  `npm run test:source-identity` = 7; full `npm run verify` green = **405**
+  (54+60+23+6+56+**44**+7+155) + `build:check` (2,393 modules); `git diff --check` clean.
+- Commits (layered substrate -> cores -> adapters -> tests because both reports share
+  the same files; each snapshot stays green): `5a3a197` (export/extract route folds),
+  `cab8d1c` (pure cores), `b8d9cab` (registry adapters + worker channel), `baa8ad6`
+  (parity/regression tests); docs follow.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
