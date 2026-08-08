@@ -27,10 +27,10 @@
 
 import { reportFetchGate } from "./planner.js";
 import { REPORT_DERIVATIONS, deriveReportSnapshot, shadowSnapshotKey } from "./report-derivation.js";
-
-function approxBytes(payload) {
-  try { return Buffer.byteLength(JSON.stringify(payload ?? null)); } catch { return 0; }
-}
+import { MAX_SNAPSHOT_BYTES, snapshotByteSize } from "../report-limits.js";
+// Strict UTC calendar-date rule (rejects 2026-02-30 / 2026-99-99 / 2023-02-29; accepts
+// 2024-02-29), reused from the contracts leaf so there is one implementation.
+import { isValidCalendarDate } from "./report-source-contracts.js";
 
 // A report job is finished when it derived AND saved (or was terminally blocked). Finished
 // jobs are never re-derived (idempotent across repeated worker invocations).
@@ -45,12 +45,14 @@ function reportFinished(jobRow) {
   return false;
 }
 
-// Normalize any date/timestamp to a strict YYYY-MM-DD (or null). sync_report_jobs.latest_data_date
-// is a Postgres `date`, so a full timestamp must never be written there.
+// Normalize any date/timestamp to a STRICT YYYY-MM-DD (or null). Beyond the shape, the sliced
+// date must be a real calendar date (UTC round-trip via isValidCalendarDate), so an impossible
+// date (2026-02-30, 2026-99-99, non-leap 2023-02-29) is rejected rather than written to the
+// Postgres `date` column. A valid ISO timestamp's date portion is accepted.
 function toDateOnly(value) {
   if (!value) return null;
   const s = String(value).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+  return isValidCalendarDate(s) ? s : null;
 }
 
 async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes }) {
@@ -114,16 +116,28 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     return fail(result.errorStage || "derive", "DERIVE_INVALID", result.reason || "derivation failed", true);
   }
 
-  // 5) SIZE GUARD: reject an oversized shadow payload BEFORE any Supabase write, through the
-  //    SAME canonical limit as the interactive path. Recorded as a save-stage failure; the
-  //    previous snapshot is preserved and saveSnapshot is never called (zero writes).
-  const payloadBytes = approxBytes(result.payload);
+  // 5) VALIDATE the derived latest data date BEFORE saving. sync_report_jobs.latest_data_date
+  //    is a Postgres `date`; a present-but-impossible value (e.g. 2026-02-30 from bad source
+  //    data) must fail at the VALIDATE stage so the shadow snapshot is never saved ahead of a
+  //    date write that would then fail. A legitimately absent date (null) is fine. The error is
+  //    a safe operator string -- no payload/secret.
+  const latestDataDate = toDateOnly(result.latestDataDate);
+  if (result.latestDataDate != null && String(result.latestDataDate) !== "" && latestDataDate === null) {
+    return fail("validate", "INVALID_LATEST_DATE", "Derived latest data date is not a valid calendar date; snapshot not saved (previous data preserved).", true);
+  }
+
+  // 6) SIZE GUARD: reject an oversized shadow payload BEFORE any Supabase write, recomputing the
+  //    ACTUAL UTF-8 byte size (never a trusted caller value) against the canonical limit.
+  //    Recorded as a save-stage failure; the previous snapshot is preserved and saveSnapshot is
+  //    never called (zero writes).
+  const payloadBytes = snapshotByteSize(result.payload);
   if (payloadBytes > maxSnapshotBytes) {
     return fail("save", "SNAPSHOT_SAVE_FAILED", `Shadow snapshot ${(payloadBytes / (1024 * 1024)).toFixed(1)} MB exceeds the ${(maxSnapshotBytes / (1024 * 1024))} MB limit; not saved (previous snapshot preserved).`, false);
   }
 
-  // 6) SAVE the shadow snapshot. A save failure is a SEPARATE stage from derive/validate and
-  //    never overwrites the previous good snapshot (save throws before any pointer moves).
+  // 7) SAVE the shadow snapshot. A save failure is a SEPARATE stage from derive/validate and
+  //    never overwrites the previous good snapshot (save throws before any pointer moves). The
+  //    saver recomputes bytes again as an impossible-to-bypass final-boundary guard.
   const params = { reportVersion: entry.snapshotVersion, accountId, ...(planned.context || {}) };
   let saved;
   try {
@@ -141,16 +155,16 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
   const rowCount = Array.isArray(result.payload && result.payload.rows) ? result.payload.rows.length
     : Array.isArray(result.payload && result.payload.events) ? result.payload.events.length : null;
 
-  // 7) SUCCESS: fetch + derive + validate + save all passed. latest_data_date is normalized
-  //    to a strict YYYY-MM-DD (the column is a Postgres date) so the success write cannot fail.
+  // 8) SUCCESS: fetch + derive + validate + save all passed. latest_data_date is the strict
+  //    YYYY-MM-DD validated above.
   await store.recordReportSuccess({
     cycleId, reportKey, accountId,
-    latestDataDate: toDateOnly(result.latestDataDate),
+    latestDataDate,
     rowCount, payloadBytes,
     snapshotParamsHash: saved && saved.paramsHash ? saved.paramsHash : null,
     durationMs: clock() - started,
   });
-  return { reportKey, accountId, status: "succeeded", latestDataDate: toDateOnly(result.latestDataDate), rowCount };
+  return { reportKey, accountId, status: "succeeded", latestDataDate, rowCount };
 }
 
 /**
@@ -165,18 +179,21 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
  * Returns `{ sources, latestFetchedAt }`. For each requestKey:
  *   available   -- true only if >=1 fragment AND every fragment loaded a validated array
  *                  (a miss/malformed fragment => false; NEVER coerced to []).
- *   fragments   -- deterministically ordered [{requestHash, requestKey, from, to,
- *                  sellerOrVendorIds, rows, fetchedAt, jobStatus, disabled, disabledPolicy}]
- *                  (order: from, then to, then requestHash). FBA monthly fragments keep their
- *                  window because grouped rows do not carry the month.
- *   rows        -- safe concatenation of all fragment rows when available (folds re-aggregate
- *                  by key, so concatenating chunks/windows is valid), else null.
+ *   fragments   -- ordered [{requestHash, requestKey, from, to, sellerOrVendorIds, rows,
+ *                  fetchedAt, fragmentIndex, jobStatus, disabled, disabledPolicy}] in the
+ *                  CANONICAL RESOLVER/PLAN sequence (fragmentIndex = position in
+ *                  plannedSources), which matches the live transport's five-ID chunk /
+ *                  window order -- NEVER sorted by request_hash (a SHA is not a sequence
+ *                  key). FBA monthly fragments keep their window because grouped rows do not
+ *                  carry the month.
+ *   rows        -- safe concatenation of all fragment rows in that sequence when available
+ *                  (identical to sequential fetchExportRows concatenation), else null.
  */
 export function assembleSources(plannedSources, statusByHash, loadedByHash) {
   const get = (h) => (loadedByHash instanceof Map ? loadedByHash.get(h) : loadedByHash[h]);
   const byKey = new Map();
   let latestFetchedAt = null;
-  for (const s of plannedSources || []) {
+  (plannedSources || []).forEach((s, fragmentIndex) => {
     if (!byKey.has(s.requestKey)) byKey.set(s.requestKey, []);
     const jobStatus = statusByHash[s.requestHash];
     let rows = null, fetchedAt = null;
@@ -186,16 +203,20 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash) {
     }
     if (fetchedAt && (!latestFetchedAt || String(fetchedAt) > String(latestFetchedAt))) latestFetchedAt = fetchedAt;
     byKey.get(s.requestKey).push({
+      // fragmentIndex is the IMMUTABLE canonical sequence key (the resolver/plan emission
+      // order == the account/chunk/window fetch order); the request_hash is NEVER a sort key.
+      fragmentIndex,
       requestHash: s.requestHash, requestKey: s.requestKey, from: s.from ?? null, to: s.to ?? null,
       sellerOrVendorIds: s.sellerOrVendorIds || null, rows, fetchedAt,
       jobStatus: jobStatus || "missing",
       disabled: jobStatus === "failed" && !!s.disabledPolicy, disabledPolicy: s.disabledPolicy || null,
       optional: !!s.optional,
     });
-  }
+  });
   const sources = {};
   for (const [requestKey, frags] of byKey) {
-    frags.sort((a, b) => String(a.from || "").localeCompare(String(b.from || "")) || String(a.to || "").localeCompare(String(b.to || "")) || a.requestHash.localeCompare(b.requestHash));
+    // Preserve canonical plan order (matches sequential fetchExportRows concatenation).
+    frags.sort((a, b) => a.fragmentIndex - b.fragmentIndex);
     const allArrays = frags.length > 0 && frags.every((f) => Array.isArray(f.rows));
     sources[requestKey] = {
       available: allArrays,
@@ -217,9 +238,9 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash) {
 export async function runReportJobs({
   store, cycleId, sourceRows, saveSnapshot, plannedReports = [],
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3000, maxJobs = Infinity,
-  // Canonical 8 MB shared-snapshot ceiling (report-store.js MAX_SNAPSHOT_BYTES). Production
-  // passes report-store's export explicitly; kept as a default so a caller cannot forget it.
-  maxSnapshotBytes = 8 * 1024 * 1024,
+  // Canonical shared-snapshot ceiling from the dependency-free limits leaf (no literal that
+  // could drift from report-store.js). The worker recomputes actual bytes and checks this.
+  maxSnapshotBytes = MAX_SNAPSHOT_BYTES,
 }) {
   const progress = { cycleId, planned: 0, processed: 0, succeeded: 0, failed: 0, blocked: 0, skipped: 0, pending: 0, deadlineReached: false, drained: false };
   const outcomes = [];

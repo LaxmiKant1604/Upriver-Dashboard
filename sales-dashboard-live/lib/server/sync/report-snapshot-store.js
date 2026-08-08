@@ -23,11 +23,11 @@ import {
   getReportSnapshot,
   getLatestReportSnapshot,
 } from "../supabase.js";
-import { paramsHashFor, MAX_SNAPSHOT_BYTES } from "../report-store.js";
+import { paramsHashFor } from "../report-store.js";
+import { MAX_SNAPSHOT_BYTES, assertSnapshotWithinLimit } from "../report-limits.js";
 import { shadowSnapshotKey, productionKeyFromShadow, compareReportPayloads } from "./report-derivation.js";
 
-// Re-export the canonical shared-snapshot ceiling so callers (the report worker) enforce the
-// SAME 8 MB limit as the interactive report path -- one source of truth.
+// Re-export the canonical shared-snapshot ceiling (from the dependency-free limits leaf).
 export { MAX_SNAPSHOT_BYTES };
 
 // The report-worker `store` interface, backed by Supabase.
@@ -52,16 +52,15 @@ export function makeSourceRowLoader() {
 // Shadow snapshot saver injected into the worker. `reportKey` is ALREADY the shadow key
 // (the worker calls shadowSnapshotKey). Computes the params hash and upserts through the
 // existing report_snapshots path; returns { paramsHash } so the job can record it.
-export function makeShadowSnapshotSaver() {
+export function makeShadowSnapshotSaver({ save = saveReportSnapshot } = {}) {
   return async ({ reportKey, accountId, params, payload, payloadBytes, sourceRefreshedAt }) => {
-    // Defense-in-depth: reject an oversized payload BEFORE any Supabase write, through the
-    // canonical limit (the worker also guards, but this protects any other caller too).
-    const bytes = typeof payloadBytes === "number" ? payloadBytes : Buffer.byteLength(JSON.stringify(payload ?? null));
-    if (bytes > MAX_SNAPSHOT_BYTES) {
-      throw new Error(`Shadow snapshot ${(bytes / (1024 * 1024)).toFixed(1)} MB exceeds the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB limit; not saved.`);
-    }
+    // Impossible-to-bypass guard at the final storage boundary: ALWAYS recompute the actual
+    // UTF-8 byte size from JSON.stringify(payload) and validate against THAT. A caller-supplied
+    // payloadBytes is NEVER trusted for the check (it may be stale/forged); it is telemetry
+    // only. An oversized payload throws (SNAPSHOT_TOO_LARGE) BEFORE any Supabase write.
+    const actualBytes = assertSnapshotWithinLimit(payload);
     const paramsHash = paramsHashFor(params.reportVersion, params);
-    await saveReportSnapshot({ reportKey, accountId, paramsHash, params, payload, payloadBytes: bytes, sourceRefreshedAt });
+    await save({ reportKey, accountId, paramsHash, params, payload, payloadBytes: actualBytes, sourceRefreshedAt });
     return { paramsHash };
   };
 }
