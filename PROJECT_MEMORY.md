@@ -4072,6 +4072,47 @@ section 21 for the full derivation dependency map.
 - Phase 1d is **not approved yet**. Continue in shadow mode; do not push, merge,
   deploy, apply migrations, or commit the untracked `HANDOFF.md`.
 
+### Scheduler v2 Phase 1d foundation blockers 1-5 fixed (Claude, 2026-08-08)
+
+From HEAD `8d1fe1c`. SHADOW MODE; Scheduler v1 / frontend / manual refresh /
+`feature/design-system` untouched; nothing pushed/merged/deployed/migrated; the
+remaining 11 adapters NOT started; `HANDOFF.md` stays untracked. request_hash
+unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 22.
+
+- **Blocker 1 (blocked terminal).** `recordSyncReportBlocked` now writes a
+  consistent terminal state (fetch=blocked, derive=skipped, save=skipped,
+  validated=false) and `reportFinished()` recognizes fetch=blocked, so a blocked
+  report is not reprocessed and the cycle drains. Tested: recorded once, second
+  invocation does zero processing/writes, drained=true, unrelated report finishes.
+- **Blocker 2 (fragment preservation).** New exported pure `assembleSources()`
+  groups planned sources into deterministically-ordered FRAGMENTS
+  (requestHash/requestKey/from/to/sellerOrVendorIds/rows/fetchedAt); one fragment
+  never overwrites another. A key is available only if every fragment loaded a
+  validated array (missing/malformed => unavailable, blocks safely). Adapters get
+  ordered `fragments` + a safe concatenated `rows`; FBA monthly fragments retain
+  from/to. Tested: 2 five-ID chunks, 2 monthly windows, no overwrite, bad fragment.
+- **Blocker 3 (content-changes parity + date).** Shared pure `contentChangesPayload`
+  yields the full { accountId, events, catalogBrands, retrievedAt, unassignedEvents }
+  payload; retrievedAt is deterministic (source fetch time from the context, never
+  Date.now() in the pure adapter); latest_data_date normalized to YYYY-MM-DD before
+  the DB write. Tested: complete payload keys, unassignedEvents count, date-only.
+- **Blocker 4 (independent parity).** Route folds orderSalesByBrand /
+  catalogBrandNames / compactContentChangeEvents are now `export`ed (runtime
+  unchanged) and an INDEPENDENT harness runs the route copy AND the derivation-core
+  copy side by side asserting identical output (two separate function objects) --
+  no longer self-referential. Route copies kept (no offline suite exercises those
+  handlers, so removal is unverifiable; the harness is the sanctioned alternative).
+- **Blocker 5 (size guard).** Canonical 8 MB `MAX_SNAPSHOT_BYTES` exported from
+  report-store.js and reused: the worker rejects an oversized shadow payload BEFORE
+  any Supabase write (SNAPSHOT_SAVE_FAILED at save stage, previous snapshot
+  preserved, zero writes); the saver enforces the same limit at the I/O boundary.
+  Tested below/at/above with zero writes on rejection.
+- **Verification (this worktree):** `node --check` on every changed file exit 0;
+  `npm run test:report-derivation` = **29**; `npm run test:scheduler-v2` = 56;
+  `npm run test:report-contracts` = 155; full `npm run verify` green = **390**
+  (54+60+23+6+56+**29**+7+155) + `build:check`; `git diff --check` clean.
+- Commits: `875d9c9` (production fixes), `14208d1` (regression tests); docs follow.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

@@ -1062,3 +1062,45 @@ report-contracts) + `build:check`; `node --check` on every changed file exits 0;
 - Derived-only derive (brand-view/priority-feed/brand-directory) reads other saved snapshots.
 - Live gates (Codex): a real cycle deriving from real saved rows; superset-vs-compact Daily
   reconciliation; per-org disabled-source classification; Ads-history freshness before PPC.
+
+---
+
+## 22. Phase 1d foundation review -- blockers 1-5 corrected (SHADOW MODE, 2026-08-08)
+
+Corrects the five review blockers on the Phase 1d foundation; the 11 pending adapters were
+NOT started. Commits `875d9c9` (production fixes), `14208d1` (regression tests). SHADOW MODE;
+Scheduler v1 / frontend / manual refresh / `feature/design-system` untouched; nothing pushed/
+merged/deployed/migrated; request_hash unchanged; zero DataDoe calls during derivation.
+
+1. **Blocked report completion.** `recordSyncReportBlocked` writes a consistent terminal state
+   (`fetch_status=blocked`, `derive_status=skipped`, `save_status=skipped`, `validated=false`);
+   `reportFinished()` treats `fetch_status=blocked` as finished. A blocked report is recorded
+   once, not reprocessed, and the cycle drains; `last_good_snapshot_at` is untouched.
+2. **Fragment preservation.** New exported pure `assembleSources(plannedSources, statusByHash,
+   loadedByHash)` groups sources into deterministically-ordered fragments (order: from, to,
+   requestHash), each carrying `requestHash/requestKey/from/to/sellerOrVendorIds/rows/fetchedAt`.
+   One fragment never overwrites another; a key is `available` only if every fragment loaded a
+   validated array (missing/malformed => unavailable, blocks safely, never coerced to `[]`).
+   Adapters receive ordered `fragments` plus a safe concatenated `rows`. FBA monthly fragments
+   retain their window because grouped rows do not carry the month.
+3. **Content Changes exact payload.** Shared pure `contentChangesPayload({accountId,
+   notificationRows, catalogRows, retrievedAt})` (derivation-core.js) returns the full
+   `{ accountId, events, catalogBrands, retrievedAt, unassignedEvents }` shape the route/
+   frontend use. `retrievedAt` comes from deterministic source metadata (the saved fetch time
+   in the derivation context), never `Date.now()` inside the pure adapter. `latest_data_date`
+   is normalized to `YYYY-MM-DD` (`toDateOnly`) before the `sync_report_jobs` write.
+4. **Independent calculation parity.** `api/datadoe.js` now `export`s `orderSalesByBrand`,
+   `catalogBrandNames`, `compactContentChangeEvents` (runtime unchanged). The Phase 1d suite
+   runs the PRODUCTION route copy and the extracted `derivation-core.js` copy side by side and
+   asserts identical output (two separate function objects) -- genuinely independent, catching
+   drift. The route copies are retained (no offline suite exercises those fetch-bound handlers,
+   so their removal cannot be verified here); this is the reviewer's sanctioned alternative.
+5. **Snapshot payload-size guard.** The canonical 8 MB `MAX_SNAPSHOT_BYTES` is exported from
+   `report-store.js` and reused. The worker rejects an oversized shadow payload BEFORE any
+   Supabase write (`SNAPSHOT_SAVE_FAILED` at the save stage, previous snapshot preserved, zero
+   writes); `makeShadowSnapshotSaver` enforces the same limit at the I/O boundary.
+
+Tests: `scheduler-v2-report-derivation.test.mjs` = **29** (20 + 9 blocker regressions). Full
+`npm run verify` green: **390** (54+60+23+6+56+**29**+7+155) + `build:check`; `node --check` on
+every changed file exits 0; `git diff --check` clean. Remaining: wire the 11 pending derive
+cores (each with a golden parity test) + the derived-only reads; then Codex's live gates.
