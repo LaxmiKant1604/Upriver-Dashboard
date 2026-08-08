@@ -38,8 +38,14 @@ let reportSourceRequestHashes, isValidCalendarDate;
 let makeShadowSnapshotSaver;
 // Leaf (Scheduler v2) pure cores.
 let orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload;
+// Daily Reporting + SKU P&L cores (derivation-core.js).
+let dailyReportingPayload, rollupSupersetToDaily, coreDailyRowsForBrand, coreNormalizeDailySalesRows,
+    coreNormalizeAdRows, coreMergeSalesAndAds;
+let skuPlFold, skuPlPayload, computeSkuPlRow, skuPlScopedTotals, latestCogsOverridePerUnit;
 // PRODUCTION route copies (api/datadoe.js) -- for the INDEPENDENT parity harness.
 let routeOrderSalesByBrand, routeCatalogBrandNames, routeCompactContentChangeEvents;
+let routeNormalizeDailySalesRows, routeDailyRowsForBrand, routeNormalizeAdRows, routeMergeSalesAndAds,
+    routeFoldSkuPlMonthlyRows;
 let MAX_SNAPSHOT_BYTES;
 
 /* ------------------------------- fixtures ------------------------------- */
@@ -755,13 +761,310 @@ test("P2-date: impossible derived latest date fails at VALIDATE; previous snapsh
   assert.equal([...store._snapshots.keys()].filter((k) => k.startsWith("scheduler-v2/brand-sales")).length, 1, "no new snapshot written");
 });
 
+/* ============================= Daily Reporting tranche ============================= */
+
+group("daily-reporting derivation (all-brand + named-brand)");
+
+// ASIN/day Sales & Traffic superset: {date, seller_or_vendor_id, child_asin, total_sales_sum,
+// total_units_sum}. Multiple sellers (>5-ID scenario), a duplicate ASIN across sellers, a
+// zero-priced/units row, and a second month.
+const DR_SUPERSET = [
+  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000001", total_sales_sum: 100, total_units_sum: 4 },
+  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000002", total_sales_sum: 50, total_units_sum: 2 },
+  { date: "2025-05-01", seller_or_vendor_id: "S2", child_asin: "ASIN000001", total_sales_sum: 30, total_units_sum: 1 },
+  { date: "2025-05-02", seller_or_vendor_id: "S1", child_asin: "ASIN000001", total_sales_sum: 0, total_units_sum: 3 },
+  { date: "2025-06-01", seller_or_vendor_id: "S1", child_asin: "ASIN000003", total_sales_sum: 20, total_units_sum: 1 },
+];
+const DR_CATALOG = [
+  { child_asin: "ASIN000001", product_brand: "Acme" },
+  { child_asin: "ASIN000001", product_brand: "AcmeDuplicate" }, // duplicate mapping: FIRST wins
+  { child_asin: "ASIN000002", product_brand: "Beta" },
+  // ASIN000003 has NO catalog brand => excluded from any named-brand fold
+];
+const DR_ADS = [
+  { date: "2025-05-01", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 10, ad_spend: 5, ad_clicks: 3 },
+  { date: "2025-05-03", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 7, ad_spend: 2, ad_clicks: 1 }, // ad-only day => synthetic row
+];
+
+// Independent oracle for the compact all-brand export: sum the superset per (date, seller),
+// first-seen order (this is what DataDoe's server-side group-by-date produces from the same source).
+function compactOracleFromSuperset(rows) {
+  const out = [];
+  const seen = new Map();
+  for (const r of rows) {
+    const k = `${r.date}|${r.seller_or_vendor_id}`;
+    let c = seen.get(k);
+    if (!c) { c = { date: r.date, seller_or_vendor_id: r.seller_or_vendor_id, total_sales_sum: 0, total_units_sum: 0 }; seen.set(k, c); out.push(c); }
+    c.total_sales_sum += r.total_sales_sum;
+    c.total_units_sum += r.total_units_sum;
+  }
+  return out;
+}
+
+test("daily ALL-brand: superset roll-up EQUALS the production compact calculation (with Ads merged)", async () => {
+  const sched = dailyReportingPayload({ supersetRows: DR_SUPERSET, catalogRows: DR_CATALOG, adRows: DR_ADS, brand: "ALL" });
+  // PRODUCTION oracle: run the route folds on an independently-summed compact export.
+  const compact = compactOracleFromSuperset(DR_SUPERSET);
+  const oracleRows = routeNormalizeDailySalesRows(compact);
+  for (const r of oracleRows) r.total_units_sold = r.total_units;
+  const oracle = { rows: routeMergeSalesAndAds(oracleRows, routeNormalizeAdRows(DR_ADS)), brandFiltered: false };
+  assert.deepEqual(sched, oracle, "shadow all-brand == production compact calc");
+  assert.equal(sched.brandFiltered, false);
+  // Explicit spot checks (additive re-aggregation over child_asin per date/seller).
+  const may1S1 = sched.rows.find((r) => r.date === "2025-05-01" && r.seller_or_vendor_id === "S1");
+  assert.equal(may1S1.total_sales, 150); assert.equal(may1S1.total_units, 6); assert.equal(may1S1.total_units_sold, 6);
+  assert.equal(may1S1.ad_sales, 10); assert.equal(may1S1.ad_spend, 5); assert.equal(may1S1.ad_clicks, 3);
+  const may1S2 = sched.rows.find((r) => r.date === "2025-05-01" && r.seller_or_vendor_id === "S2");
+  assert.equal(may1S2.total_sales, 30); assert.equal(may1S2.total_units, 1);
+  assert.ok(!("ad_sales" in may1S2), "a seller with no ad rows gets no ad fields");
+  const synthetic = sched.rows.find((r) => r.date === "2025-05-03");
+  assert.equal(synthetic.total_sales, 0); assert.equal(synthetic.ad_sales, 7); assert.equal(synthetic.currency, "USD");
+  // core folds are genuinely separate function objects from the route copies.
+  assert.notEqual(coreNormalizeDailySalesRows, routeNormalizeDailySalesRows);
+  assert.notEqual(coreMergeSalesAndAds, routeMergeSalesAndAds);
+});
+
+test("daily ALL-brand: zero superset + zero ads is an empty (not fabricated) payload", async () => {
+  const sched = dailyReportingPayload({ supersetRows: [], catalogRows: DR_CATALOG, adRows: [], brand: "ALL" });
+  assert.deepEqual(sched, { rows: [], brandFiltered: false });
+});
+
+test("daily named-brand: catalog join EQUALS the production dailyRowsForBrand (first mapping wins; unmapped excluded)", async () => {
+  const sched = dailyReportingPayload({ supersetRows: DR_SUPERSET, catalogRows: DR_CATALOG, brand: "Acme" });
+  const oracle = { rows: routeDailyRowsForBrand(DR_SUPERSET, DR_CATALOG, "Acme"), brandFiltered: true };
+  assert.deepEqual(sched, oracle, "shadow named-brand == production named-brand");
+  assert.equal(sched.brandFiltered, true);
+  // Acme == ASIN000001 (first catalog label wins over AcmeDuplicate). Rows folded to (seller,date):
+  assert.equal(sched.rows.length, 3);
+  assert.deepEqual(sched.rows.map((r) => [r.seller_or_vendor_id, r.date, r.total_sales, r.total_units]),
+    [["S1", "2025-05-01", 100, 4], ["S2", "2025-05-01", 30, 1], ["S1", "2025-05-02", 0, 3]]);
+  // Beta (ASIN000002) and the unmapped ASIN000003 never appear under Acme.
+  assert.ok(sched.rows.every((r) => r.total_units_sold === r.total_units));
+  // A brand with no ASINs => an empty (never fabricated) result.
+  assert.deepEqual(dailyReportingPayload({ supersetRows: DR_SUPERSET, catalogRows: DR_CATALOG, brand: "Nope" }), { rows: [], brandFiltered: true });
+  assert.notEqual(coreDailyRowsForBrand, routeDailyRowsForBrand);
+});
+
+// Split the superset into monthly + five-ID-chunk FRAGMENTS for the worker path.
+function seedDailyCycle() {
+  const store = makeMemoryReportStore();
+  store.seedSource("h_may_c0", "succeeded");
+  store.seedSource("h_may_c1", "succeeded");
+  store.seedSource("h_jun_c0", "succeeded");
+  store.seedSource("h_cat", "succeeded");
+  const loader = makeCacheLoader(new Map([
+    ["h_may_c0", DR_SUPERSET.filter((r) => r.date.startsWith("2025-05") && r.seller_or_vendor_id === "S1")],
+    ["h_may_c1", DR_SUPERSET.filter((r) => r.date.startsWith("2025-05") && r.seller_or_vendor_id === "S2")],
+    ["h_jun_c0", DR_SUPERSET.filter((r) => r.date.startsWith("2025-06"))],
+    ["h_cat", DR_CATALOG],
+  ]));
+  const plannedReports = [plan("daily-reporting", "A1", [
+    src("daily-reporting:asin-day-superset", "h_may_c0", { sellerOrVendorIds: ["S1", "b", "c", "d", "e"], from: "2025-05-01", to: "2025-05-31" }),
+    src("daily-reporting:asin-day-superset", "h_may_c1", { sellerOrVendorIds: ["S2"], from: "2025-05-01", to: "2025-05-31" }),
+    src("daily-reporting:asin-day-superset", "h_jun_c0", { from: "2025-06-01", to: "2025-06-30" }),
+    src("daily-reporting:catalog", "h_cat"),
+  ], { context: { brand: "ALL" } })];
+  const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adRows: DR_ADS } : {});
+  return { store, loader, plannedReports, loadDerivedContext };
+}
+
+test("daily worker: derives the ALL-brand shadow snapshot from saved fragments with ZERO fetch; correct date/rowCount; idempotent", async () => {
+  const { store, loader, plannedReports, loadDerivedContext } = seedDailyCycle();
+  await withFetchSpy(async (calls) => {
+    const saver = makeSnapshotSaver(store);
+    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext });
+    assert.equal(res.succeeded, 1);
+    assert.equal(calls.length, 0, "no DataDoe/network call during derivation");
+    const j = store._report("daily-reporting", "A1");
+    assert.equal(j.validated, true);
+    assert.equal(j.latest_data_date, "2025-06-01", "latest data date = max row date");
+    // Exactly one shadow-namespaced snapshot; params carry brand but NEVER the injected adRows.
+    const key = [...store._snapshots.keys()].find((k) => k.startsWith("scheduler-v2/daily-reporting|A1|"));
+    assert.ok(key, "shadow snapshot stored under the scheduler-v2 namespace");
+    const snap = store._snapshots.get(key);
+    assert.equal(snap.payload.brandFiltered, false);
+    assert.equal(j.row_count, snap.payload.rows.length, "row_count is the real payload row count");
+    assert.equal(snap.params.brand, "ALL", "brand IS a snapshot param (cache key)");
+    assert.ok(!("adRows" in snap.params), "injected adRows never leak into the snapshot params");
+    // idempotent second invocation.
+    const r2 = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext });
+    assert.equal(r2.processed, 0, "finished report not re-derived");
+  });
+});
+
+test("daily worker: ALL derivation without injected Ads fails at derive; previous snapshot preserved, zero writes", async () => {
+  const { store, loader, plannedReports } = seedDailyCycle();
+  store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
+  const saver = makeSnapshotSaver(store);
+  // No loadDerivedContext => the ALL adapter has no adRows and must NOT silently understate.
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(res.failed, 1);
+  const j = store._report("daily-reporting", "A1");
+  assert.equal(j.error_code, "DERIVE_INVALID");
+  assert.notEqual(j.derive_status, "succeeded");
+  assert.equal(store._saveCalls, 0, "no snapshot write when required Ads input is absent");
+  assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "previous snapshot preserved");
+});
+
+/* ============================= SKU P&L tranche ============================= */
+
+group("sku-pl derivation (monthly fold + injected COGS applier)");
+
+const skuRow = (o) => ({
+  sku: o.sku, child_asin: o.asin, product_name: o.name ?? null, product_brand: o.brand ?? null, currency: o.cur,
+  total_sales_sum: o.sales ?? 0, profit_sum: o.profit ?? 0, total_cost_sum: o.cost ?? 0,
+  ad_spend_sum: o.adSpend ?? 0, total_fees_sum: o.fees ?? 0, cogs_total_sum: o.cogs ?? 0, units_sum: o.units ?? 0,
+});
+
+// Six monthly windows: repeated SKU/ASIN across months + chunks, multiple currencies, a zero
+// row, a missing-COGS row, and two empty months (the source ran and returned []).
+const SKU_BATCHES = [
+  { monthKey: "2025-01", rows: [
+    skuRow({ sku: "SKU1", asin: "ASIN1", name: "Widget", brand: "Acme", cur: "USD", sales: 100, profit: 40, cost: 60, adSpend: 5, fees: 10, cogs: 20, units: 10 }),
+    skuRow({ sku: "SKU1", asin: "ASIN1", cur: "USD", sales: 50, profit: 20, cost: 30, adSpend: 2, fees: 5, cogs: 10, units: 5 }), // 2nd five-ID chunk, same key+month => sums
+    skuRow({ sku: "SKU1", asin: "ASIN1", cur: "CAD", sales: 200, profit: 80, cost: 120, adSpend: 0, fees: 20, cogs: 40, units: 20 }), // different currency => separate entry
+  ] },
+  { monthKey: "2025-02", rows: [
+    skuRow({ sku: "SKU1", asin: "ASIN1", cur: "USD", sales: 70, profit: 30, cost: 40, adSpend: 3, fees: 7, cogs: 15, units: 7 }), // repeated across months
+    skuRow({ sku: "SKU2", asin: "ASIN2", name: "Gadget", brand: "Beta", cur: "USD", sales: 0, profit: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0, units: 0 }), // zero sales/units
+  ] },
+  { monthKey: "2025-03", rows: [] },
+  { monthKey: "2025-04", rows: [
+    skuRow({ sku: "SKU3", asin: "ASIN3", name: "Doohickey", brand: "Acme", cur: "USD", sales: 80, profit: 10, cost: 70, adSpend: 1, fees: 8, cogs: 0, units: 8 }), // missing COGS
+  ] },
+  { monthKey: "2025-05", rows: [] },
+  { monthKey: "2025-06", rows: [
+    skuRow({ sku: "SKU1", asin: "ASIN1", cur: "USD", sales: 60, profit: 25, cost: 35, adSpend: 2, fees: 6, cogs: 12, units: 6 }),
+  ] },
+];
+
+test("sku-pl fold: core skuPlFold EQUALS the route foldSkuPlMonthlyRows; currencies never merged; chunks sum", async () => {
+  const routeFold = routeFoldSkuPlMonthlyRows(SKU_BATCHES);
+  const coreFold = skuPlFold(SKU_BATCHES);
+  assert.deepEqual(coreFold, routeFold, "core fold == route fold");
+  assert.notEqual(skuPlFold, routeFoldSkuPlMonthlyRows);
+  const byKey = new Map(coreFold.map((e) => [`${e.currency}|${e.sku}|${e.asin}`, e]));
+  assert.equal(coreFold.length, 4, "one entry per currency|sku|child_asin (currencies never merged)");
+  // 2025-01 USD: the two five-ID chunk rows sum into ONE bucket.
+  assert.deepEqual(byKey.get("USD|SKU1|ASIN1").byMonth["2025-01"], { sales: 150, profit: 60, cost: 90, adSpend: 7, fees: 15, cogs: 30, units: 15 });
+  assert.deepEqual(Object.keys(byKey.get("USD|SKU1|ASIN1").byMonth).sort(), ["2025-01", "2025-02", "2025-06"]);
+  assert.deepEqual(byKey.get("CAD|SKU1|ASIN1").byMonth["2025-01"], { sales: 200, profit: 80, cost: 120, adSpend: 0, fees: 20, cogs: 40, units: 20 });
+  assert.deepEqual(byKey.get("USD|SKU2|ASIN2").byMonth["2025-02"], { sales: 0, profit: 0, cost: 0, adSpend: 0, fees: 0, cogs: 0, units: 0 });
+  assert.equal(byKey.get("USD|SKU3|ASIN3").byMonth["2025-04"].cogs, 0, "missing COGS stays raw (0 here), never fabricated");
+});
+
+test("sku-pl payload: assembler EQUALS the route payload assembly (months/currencies/catalogBrands/rows)", async () => {
+  const sched = skuPlPayload({ accountId: "A1", from: "2025-01-01", to: "2025-06-30", monthlyBatches: SKU_BATCHES });
+  const rows = routeFoldSkuPlMonthlyRows(SKU_BATCHES);
+  const oracle = {
+    accountId: "A1", from: "2025-01-01", to: "2025-06-30",
+    months: [...new Set(SKU_BATCHES.map((b) => b.monthKey))],
+    currencies: [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort(),
+    catalogBrands: [...new Set(rows.map((r) => r.brand).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    rows,
+  };
+  assert.deepEqual(sched, oracle, "shadow payload == route payload");
+  assert.deepEqual(sched.months, ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"], "the full six-month map is preserved (even empty months)");
+  assert.deepEqual(sched.currencies, ["CAD", "USD"]);
+  assert.deepEqual(sched.catalogBrands, ["Acme", "Beta"]);
+});
+
+test("sku-pl worker: folds monthly fragments into the shadow snapshot with ZERO fetch; date=to; no extra source job; idempotent", async () => {
+  const store = makeMemoryReportStore();
+  const months = [["h_m1", "2025-01"], ["h_m2", "2025-02"], ["h_m3", "2025-03"], ["h_m4", "2025-04"], ["h_m5", "2025-05"], ["h_m6", "2025-06"]];
+  const loaderMap = new Map();
+  months.forEach(([h], i) => { store.seedSource(h, "succeeded"); loaderMap.set(h, SKU_BATCHES[i].rows); });
+  const loader = makeCacheLoader(loaderMap);
+  const sourceJobsBefore = store._sourceJobs.length;
+  const plannedReports = [plan("sku-pl", "A1",
+    months.map(([h, mk]) => src("sku-pl:monthly-profit", h, { from: `${mk}-01`, to: `${mk}-28` })),
+    { context: { from: "2025-01-01", to: "2025-06-30" } })];
+  await withFetchSpy(async (calls) => {
+    const saver = makeSnapshotSaver(store);
+    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+    assert.equal(res.succeeded, 1);
+    assert.equal(calls.length, 0, "zero DataDoe/network calls");
+    const j = store._report("sku-pl", "A1");
+    assert.equal(j.validated, true);
+    assert.equal(j.latest_data_date, "2025-06-30", "latest data date = window `to` (date-only)");
+    const key = [...store._snapshots.keys()].find((k) => k.startsWith("scheduler-v2/sku-pl|A1|"));
+    const snap = store._snapshots.get(key);
+    assert.equal(snap.payload.months.length, 6, "six-month map preserved end-to-end");
+    assert.equal(snap.payload.accountId, "A1");
+    assert.equal(j.row_count, snap.payload.rows.length);
+    assert.equal(store._sourceJobs.length, sourceJobsBefore, "the adapter creates NO new source request/job");
+    const r2 = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+    assert.equal(r2.processed, 0, "idempotent: finished report not re-derived");
+  });
+});
+
+test("sku-pl COGS applier: injected latest override applied; missing COGS stays unavailable (never zero)", async () => {
+  const plRow = { sku: "SKU1", asin: "ASIN1", productName: "Widget", brand: "Acme", currency: "USD", byMonth: {
+    "2025-01": { sales: 100, profit: 40, cost: 60, adSpend: 5, fees: 10, cogs: 0, units: 10 },
+    "2025-02": { sales: 50, profit: 20, cost: 30, adSpend: 2, fees: 5, cogs: 0, units: 5 },
+  } };
+  // No override + no COGS: flagged missing, ratios recomputed from sums, COGS never assumed zero-cost.
+  const none = computeSkuPlRow(plRow, "ALL", null);
+  assert.equal(none.units, 15); assert.equal(none.cogs, 0); assert.equal(none.rawCogs, 0);
+  assert.equal(none.cogsMissing, true); assert.equal(none.hasCogsOverride, false);
+  assert.equal(none.margin, 40); // (60 / 150) * 100 -- recomputed, never summed
+  // Latest override wins by updated_at; a negative/non-finite per-unit cost is ignored.
+  const overrides = [
+    { currency: "USD", sku: "SKU1", asin: "ASIN1", per_unit_cost: 2, updated_at: "2025-01-01T00:00:00Z" },
+    { currency: "USD", sku: "SKU1", asin: "ASIN1", per_unit_cost: 3, updated_at: "2025-02-01T00:00:00Z" },
+    { currency: "USD", sku: "SKU1", asin: "ASIN1", per_unit_cost: -1, updated_at: "2025-03-01T00:00:00Z" },
+    { currency: "USD", sku: "OTHER", asin: "ASIN9", per_unit_cost: 9, updated_at: "2025-04-01T00:00:00Z" },
+  ];
+  const perUnit = latestCogsOverridePerUnit(overrides, "A1", plRow);
+  assert.equal(perUnit, 3, "latest valid per-unit COGS by updated_at");
+  const applied = computeSkuPlRow(plRow, "ALL", perUnit);
+  assert.equal(applied.cogs, 45); // 15 units * 3
+  assert.equal(applied.cost, 135); // 90 + 45 delta
+  assert.equal(applied.profit, 15); // 60 - 45 delta
+  assert.equal(applied.margin, 10); // (15 / 150) * 100
+  assert.equal(applied.hasCogsOverride, true); assert.equal(applied.cogsPerUnitOverride, 3); assert.equal(applied.cogsMissing, false);
+  // No override for a different identity => null (explicitly unavailable, NEVER coerced to zero).
+  assert.equal(latestCogsOverridePerUnit(overrides, "A1", { currency: "CAD", sku: "SKU1", asin: "ASIN1" }), null);
+  assert.equal(latestCogsOverridePerUnit([], "A1", plRow), null);
+});
+
+test("sku-pl worker: a malformed monthly fragment blocks derivation and preserves last-known-good (zero writes)", async () => {
+  const store = makeMemoryReportStore();
+  store.seedSource("h_m1", "succeeded");
+  store.seedSource("h_m2", "succeeded");
+  const loader = makeCacheLoader(new Map([["h_m1", [skuRow({ sku: "SKU1", asin: "ASIN1", cur: "USD", sales: 10, units: 1 })]], ["h_m2", "oops"]]));
+  store._snapshots.set("scheduler-v2/sku-pl|A1|ph_prev", { payload: { rows: [{ prior: true }], months: [], currencies: [], catalogBrands: [] } });
+  const saver = makeSnapshotSaver(store);
+  const plannedReports = [plan("sku-pl", "A1", [
+    src("sku-pl:monthly-profit", "h_m1", { from: "2025-01-01", to: "2025-01-31" }),
+    src("sku-pl:monthly-profit", "h_m2", { from: "2025-02-01", to: "2025-02-28" }),
+  ], { context: { from: "2025-01-01", to: "2025-02-28" } })];
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.notEqual(store._report("sku-pl", "A1").derive_status, "succeeded");
+  assert.equal(res.succeeded, 0);
+  assert.equal(store._saveCalls, 0, "no snapshot write from a malformed fragment");
+  assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
+});
+
 /* ---- run the async suite with NO top-level await; deterministic natural exit ---- */
 async function main() {
   mark("main(): loading Phase 1d modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS } = await import("../lib/server/sync/report-derivation.js"));
   ({ runReportJobs, assembleSources } = await import("../lib/server/sync/report-worker.js"));
   ({ reportSourceRequestHashes, isValidCalendarDate } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = await import("../lib/server/reports/derivation-core.js"));
+  const core = await import("../lib/server/reports/derivation-core.js");
+  ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = core);
+  dailyReportingPayload = core.dailyReportingPayload;
+  rollupSupersetToDaily = core.rollupSupersetToDaily;
+  coreDailyRowsForBrand = core.dailyRowsForBrand;
+  coreNormalizeDailySalesRows = core.normalizeDailySalesRows;
+  coreNormalizeAdRows = core.normalizeAdRows;
+  coreMergeSalesAndAds = core.mergeSalesAndAds;
+  skuPlFold = core.skuPlFold;
+  skuPlPayload = core.skuPlPayload;
+  computeSkuPlRow = core.computeSkuPlRow;
+  skuPlScopedTotals = core.skuPlScopedTotals;
+  latestCogsOverridePerUnit = core.latestCogsOverridePerUnit;
   ({ MAX_SNAPSHOT_BYTES } = await import("../lib/server/report-store.js"));
   ({ makeShadowSnapshotSaver } = await import("../lib/server/sync/report-snapshot-store.js"));
   // The PRODUCTION route's own copies (now exported) -- executed independently for parity.
@@ -769,6 +1072,11 @@ async function main() {
   routeOrderSalesByBrand = route.orderSalesByBrand;
   routeCatalogBrandNames = route.catalogBrandNames;
   routeCompactContentChangeEvents = route.compactContentChangeEvents;
+  routeNormalizeDailySalesRows = route.normalizeDailySalesRows;
+  routeDailyRowsForBrand = route.dailyRowsForBrand;
+  routeNormalizeAdRows = route.normalizeAdRows;
+  routeMergeSalesAndAds = route.mergeSalesAndAds;
+  routeFoldSkuPlMonthlyRows = route.foldSkuPlMonthlyRows;
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;
