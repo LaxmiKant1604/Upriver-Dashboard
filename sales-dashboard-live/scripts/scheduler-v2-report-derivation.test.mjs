@@ -33,9 +33,13 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 // Bindings assigned in main() after the dummy env is set.
 let REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads,
     shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS;
-let runReportJobs;
+let runReportJobs, assembleSources;
 let reportSourceRequestHashes;
-let orderSalesByBrand;
+// Leaf (Scheduler v2) pure cores.
+let orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload;
+// PRODUCTION route copies (api/datadoe.js) -- for the INDEPENDENT parity harness.
+let routeOrderSalesByBrand, routeCatalogBrandNames, routeCompactContentChangeEvents;
+let MAX_SNAPSHOT_BYTES;
 
 /* ------------------------------- fixtures ------------------------------- */
 
@@ -93,18 +97,26 @@ function makeMemoryReportStore() {
       if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; }
       return false;
     },
+    writes: { blocked: 0, failure: 0, success: 0 }, // count DB write calls (idempotency proof)
+    lastSuccess: null, // captures args of the most recent recordReportSuccess (date check)
     recordReportBlocked({ reportKey, accountId, reason }) {
+      this.writes.blocked += 1;
       const j = reportJobs.get(key(reportKey, accountId));
-      Object.assign(j, { fetch_status: "blocked", error_stage: "fetch", error_code: "SOURCE_BLOCKED", error_message: reason });
+      // Mirror supabase.js: blocked is TERMINAL for the cycle (derive/save skipped).
+      Object.assign(j, { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped", validated: false, error_stage: "fetch", error_code: "SOURCE_BLOCKED", error_message: reason });
     },
     recordReportFailure({ reportKey, accountId, stage, code, message, terminal }) {
+      this.writes.failure += 1;
       const j = reportJobs.get(key(reportKey, accountId));
       const body = { error_stage: stage, error_code: code, error_message: message, terminal: !!terminal };
       if (stage === "save") { body.derive_status = "succeeded"; body.save_status = "failed"; }
       else body.derive_status = "failed";
       Object.assign(j, body);
     },
-    recordReportSuccess({ reportKey, accountId, latestDataDate, rowCount, snapshotParamsHash }) {
+    recordReportSuccess(args) {
+      this.writes.success += 1;
+      this.lastSuccess = args;
+      const { reportKey, accountId, latestDataDate, rowCount, snapshotParamsHash } = args;
       const j = reportJobs.get(key(reportKey, accountId));
       Object.assign(j, {
         fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true,
@@ -122,7 +134,9 @@ function makeCacheLoader(byHash) {
 
 // Shadow snapshot saver double: stores by (reportKey|account|paramsHash); can be made to throw.
 function makeSnapshotSaver(store) {
+  store._saveCalls = 0;
   return async ({ reportKey, accountId, params, payload }) => {
+    store._saveCalls += 1; // counts ACTUAL saver invocations (0 when the worker rejects first)
     const productionKey = reportKey.split("/").slice(1).join("/") || reportKey;
     if (store.failSaveFor.has(productionKey)) throw new Error("snapshot save failed (503)");
     const paramsHash = `ph_${JSON.stringify(params).length}`;
@@ -432,13 +446,187 @@ test("a report whose staged dependency source is absent stays pending (not deriv
   assert.equal(store._snapshots.size, 0);
 });
 
+/* ============================= review blocker regressions ============================= */
+
+group("blocker regressions");
+
+// Blocker 1: a blocked report is terminal for the cycle.
+test("blocker1: blocked report is terminal -- recorded once, second run zero work, cycle drains, unrelated finishes", async () => {
+  const store = makeMemoryReportStore();
+  store.seedSource("h_ol", "failed"); // brand-sales required dep failed
+  store.seedSource("h_cat", "succeeded");
+  store.seedSource("h_cc_ev", "succeeded");
+  store.seedSource("h_cc_cat", "succeeded");
+  const loader = makeCacheLoader(new Map([["h_cat", CATALOG_ROWS], ["h_cc_ev", CONTENT_ROWS], ["h_cc_cat", CATALOG_ROWS]]));
+  const saver = makeSnapshotSaver(store);
+  const plannedReports = [
+    plan("brand-sales", "A1", [src("brand-sales:order-lines", "h_ol"), src("brand-sales:catalog", "h_cat")]),
+    plan("content-changes", "A1", [src("content-changes:events", "h_cc_ev"), src("content-changes:catalog", "h_cc_cat")]),
+  ];
+  const r1 = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(store.writes.blocked, 1, "blocked recorded exactly once");
+  const bs = store._report("brand-sales", "A1");
+  assert.equal(bs.fetch_status, "blocked");
+  assert.equal(bs.derive_status, "skipped");
+  assert.equal(bs.save_status, "skipped");
+  assert.equal(bs.validated, false);
+  assert.equal(store._report("content-changes", "A1").validated, true, "unrelated report still finishes");
+  assert.equal(r1.drained, true, "cycle drains once every report is terminal");
+  // Second invocation: zero additional processing/writes.
+  const writesBefore = { ...store.writes };
+  const savesBefore = store._saveCalls;
+  const r2 = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(r2.processed, 0, "no report reprocessed on the second invocation");
+  assert.deepEqual(store.writes, writesBefore, "no additional DB writes");
+  assert.equal(store._saveCalls, savesBefore, "no additional snapshot saves");
+  assert.equal(r2.drained, true);
+});
+
+// Blocker 2: preserve every fragment.
+test("blocker2: two five-ID chunks under one request key are both preserved (no overwrite)", async () => {
+  const planned = [
+    src("brand-sales:order-lines", "h_ol_a", { sellerOrVendorIds: ["A1", "A2", "A3", "A4", "A5"], from: "2025-01-01", to: "2025-06-30" }),
+    src("brand-sales:order-lines", "h_ol_b", { sellerOrVendorIds: ["A6"], from: "2025-01-01", to: "2025-06-30" }),
+    src("brand-sales:catalog", "h_cat", { from: "2025-01-01", to: "2025-06-30" }),
+  ];
+  const status = { h_ol_a: "succeeded", h_ol_b: "succeeded", h_cat: "succeeded" };
+  const loaded = new Map([
+    ["h_ol_a", { rows: [{ chunk: "a" }], fetched_at: "2025-06-30T00:00:00Z" }],
+    ["h_ol_b", { rows: [{ chunk: "b" }], fetched_at: "2025-07-01T00:00:00Z" }],
+    ["h_cat", { rows: CATALOG_ROWS }],
+  ]);
+  const { sources, latestFetchedAt } = assembleSources(planned, status, loaded);
+  const ol = sources["brand-sales:order-lines"];
+  assert.equal(ol.fragments.length, 2, "both chunks preserved");
+  assert.deepEqual(ol.fragments.map((f) => f.requestHash), ["h_ol_a", "h_ol_b"], "deterministic order");
+  assert.deepEqual(ol.rows, [{ chunk: "a" }, { chunk: "b" }], "rows concatenated, none overwritten");
+  assert.equal(ol.available, true);
+  assert.equal(latestFetchedAt, "2025-07-01T00:00:00Z");
+});
+
+test("blocker2: two monthly windows under one request key retain their date windows (deterministic order)", async () => {
+  const planned = [
+    src("fba-plan:monthly-units", "h_m2", { from: "2025-02-01", to: "2025-02-28" }),
+    src("fba-plan:monthly-units", "h_m1", { from: "2025-01-01", to: "2025-01-31" }),
+  ];
+  const { sources } = assembleSources(planned, { h_m1: "succeeded", h_m2: "succeeded" }, { h_m1: { rows: [{ u: 1 }] }, h_m2: { rows: [{ u: 2 }] } });
+  const frs = sources["fba-plan:monthly-units"].fragments;
+  assert.equal(frs.length, 2);
+  assert.deepEqual(frs.map((f) => [f.from, f.to, f.requestHash]), [["2025-01-01", "2025-01-31", "h_m1"], ["2025-02-01", "2025-02-28", "h_m2"]]);
+  assert.deepEqual(sources["fba-plan:monthly-units"].rows, [{ u: 1 }, { u: 2 }], "each window's rows retained (grouped rows lack the month)");
+});
+
+test("blocker2: a missing/malformed fragment makes the key unavailable (blocks derivation safely)", async () => {
+  const planned = [src("brand-sales:order-lines", "h_a"), src("brand-sales:order-lines", "h_b")];
+  const { sources } = assembleSources(planned, { h_a: "succeeded", h_b: "succeeded" }, { h_a: { rows: [{ x: 1 }] }, h_b: { rows: "oops" } });
+  assert.equal(sources["brand-sales:order-lines"].available, false, "one malformed fragment => key unavailable");
+  assert.equal(sources["brand-sales:order-lines"].rows, null, "never a partial concatenation");
+  const { sources: s2 } = assembleSources(planned, { h_a: "succeeded", h_b: "pending" }, { h_a: { rows: [{ x: 1 }] } });
+  assert.equal(s2["brand-sales:order-lines"].available, false, "a missing fragment also blocks");
+});
+
+// Blocker 3: content-changes exact payload + date-only.
+test("blocker3: content-changes complete payload + date-only latest_data_date persisted", async () => {
+  const store = makeMemoryReportStore();
+  store.seedSource("h_ev", "succeeded");
+  store.seedSource("h_cat", "succeeded");
+  const eventsRows = [
+    { event_time: "2025-06-03T10:00:00Z", sp_api_notification_id: "n1", sp_api_notification_type: "BRANDED_ITEM_CONTENT_CHANGE", payload: JSON.stringify({ asin: "ASIN000001" }), notification_metadata: "{}" },
+    { event_time: "2025-06-04T09:00:00Z", sp_api_notification_id: "n2", sp_api_notification_type: "BRANDED_ITEM_CONTENT_CHANGE", payload: JSON.stringify({ asin: "ZZZZZZZZZZ" }), notification_metadata: "{}" }, // unmapped ASIN
+  ];
+  const richLoader = (h) => (h === "h_ev" ? { rows: eventsRows, fetched_at: "2025-06-04T12:00:00Z" } : (h === "h_cat" ? { rows: CATALOG_ROWS, fetched_at: "2025-06-04T11:00:00Z" } : null));
+  const saver = makeSnapshotSaver(store);
+  const plannedReports = [plan("content-changes", "ACC9", [src("content-changes:events", "h_ev"), src("content-changes:catalog", "h_cat")])];
+  await runReportJobs({ store, cycleId: "c", sourceRows: richLoader, saveSnapshot: saver, plannedReports });
+  const snap = [...store._snapshots.values()][0].payload;
+  assert.deepEqual(Object.keys(snap).sort(), ["accountId", "catalogBrands", "events", "retrievedAt", "unassignedEvents"], "exact production payload keys");
+  assert.equal(snap.accountId, "ACC9");
+  assert.equal(snap.retrievedAt, "2025-06-04T12:00:00Z", "retrievedAt from source fetch time, not Date.now()");
+  assert.equal(snap.unassignedEvents, 1, "the unmapped-ASIN event is counted as unassigned");
+  assert.equal(snap.events.length, 2);
+  const d = store.lastSuccess.latestDataDate;
+  assert.match(String(d), /^\d{4}-\d{2}-\d{2}$/, "the DB wrapper receives a date-only value");
+  assert.equal(d, "2025-06-04");
+});
+
+// Blocker 4: independent route-vs-leaf parity.
+test("blocker4: production route folds and Scheduler v2 leaf folds produce identical output (independent)", async () => {
+  assert.deepEqual(orderSalesByBrand(ORDER_ROWS, CATALOG_ROWS), routeOrderSalesByBrand(ORDER_ROWS, CATALOG_ROWS));
+  assert.deepEqual(catalogBrandNames(CATALOG_ROWS), routeCatalogBrandNames(CATALOG_ROWS));
+  assert.deepEqual(compactContentChangeEvents(CONTENT_ROWS, CATALOG_ROWS), routeCompactContentChangeEvents(CONTENT_ROWS, CATALOG_ROWS));
+  // Genuinely two separate function objects (not the adapter compared to its own helper).
+  assert.notEqual(orderSalesByBrand, routeOrderSalesByBrand);
+  assert.notEqual(compactContentChangeEvents, routeCompactContentChangeEvents);
+});
+
+test("blocker4: contentChangesPayload reproduces the route's inline payload formula", async () => {
+  const retrievedAt = "2025-06-04T12:00:00Z";
+  const accountId = "ACC1";
+  const got = contentChangesPayload({ accountId, notificationRows: CONTENT_ROWS, catalogRows: CATALOG_ROWS, retrievedAt });
+  // Independent oracle = the api/datadoe.js content-changes handler's inline assembly.
+  const events = routeCompactContentChangeEvents(CONTENT_ROWS, CATALOG_ROWS);
+  const oracle = { accountId, events, catalogBrands: routeCatalogBrandNames(CATALOG_ROWS), retrievedAt, unassignedEvents: events.filter((e) => !e.brands.length).length };
+  assert.deepEqual(got, oracle);
+});
+
+// Blocker 5: snapshot payload-size guard.
+test("blocker5: canonical 8 MB snapshot limit is exported and reused", async () => {
+  assert.equal(MAX_SNAPSHOT_BYTES, 8 * 1024 * 1024);
+});
+
+test("blocker5: shadow payload below/at limit saved; above limit rejected with zero Supabase writes", async () => {
+  // Learn the actual payload size for a brand-sales snapshot.
+  const learn = seedTwoReportCycle();
+  const learnSaver = makeSnapshotSaver(learn.store);
+  await runReportJobs({ store: learn.store, cycleId: "c", sourceRows: learn.loader, saveSnapshot: learnSaver, plannedReports: [learn.plannedReports[0]] });
+  const bytes = learn.store.lastSuccess.payloadBytes;
+  assert.ok(bytes > 0, "payload size captured");
+
+  // below the limit -> saved.
+  {
+    const { store, loader, plannedReports } = seedTwoReportCycle();
+    const saver = makeSnapshotSaver(store);
+    const r = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports: [plannedReports[0]], maxSnapshotBytes: bytes + 10 });
+    assert.equal(r.succeeded, 1);
+    assert.equal(store._saveCalls, 1);
+  }
+  // exactly at the limit -> saved (guard rejects only strictly greater).
+  {
+    const { store, loader, plannedReports } = seedTwoReportCycle();
+    const saver = makeSnapshotSaver(store);
+    const r = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports: [plannedReports[0]], maxSnapshotBytes: bytes });
+    assert.equal(r.succeeded, 1);
+    assert.equal(store._saveCalls, 1);
+  }
+  // above the limit -> rejected, ZERO Supabase writes, previous snapshot preserved.
+  {
+    const { store, loader, plannedReports } = seedTwoReportCycle();
+    store._snapshots.set("scheduler-v2/brand-sales|A1|ph_prev", { payload: { rows: [{ prior: true }] } });
+    const saver = makeSnapshotSaver(store);
+    const r = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports: [plannedReports[0]], maxSnapshotBytes: bytes - 1 });
+    assert.equal(r.failed, 1);
+    assert.equal(store._saveCalls, 0, "no Supabase write for a rejected oversized payload");
+    const bs = store._report("brand-sales", "A1");
+    assert.equal(bs.save_status, "failed");
+    assert.equal(bs.error_stage, "save");
+    assert.equal(bs.error_code, "SNAPSHOT_SAVE_FAILED");
+    assert.ok(store._snapshots.has("scheduler-v2/brand-sales|A1|ph_prev"), "prior snapshot preserved");
+  }
+});
+
 /* ---- run the async suite with NO top-level await; deterministic natural exit ---- */
 async function main() {
   mark("main(): loading Phase 1d modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS } = await import("../lib/server/sync/report-derivation.js"));
-  ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
+  ({ runReportJobs, assembleSources } = await import("../lib/server/sync/report-worker.js"));
   ({ reportSourceRequestHashes } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ orderSalesByBrand } = await import("../lib/server/reports/derivation-core.js"));
+  ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = await import("../lib/server/reports/derivation-core.js"));
+  ({ MAX_SNAPSHOT_BYTES } = await import("../lib/server/report-store.js"));
+  // The PRODUCTION route's own copies (now exported) -- executed independently for parity.
+  const route = await import("../api/datadoe.js");
+  routeOrderSalesByBrand = route.orderSalesByBrand;
+  routeCatalogBrandNames = route.catalogBrandNames;
+  routeCompactContentChangeEvents = route.compactContentChangeEvents;
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;
