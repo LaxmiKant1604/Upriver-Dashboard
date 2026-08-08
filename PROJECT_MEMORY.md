@@ -4167,7 +4167,7 @@ unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 23.
   order) and sorts by it. The old `(from, to, requestHash)` sort is removed -- a
   SHA is not a sequence key, and even the from/to tiebreak re-derived order from
   data instead of preserving the plan. Concatenated `rows` now equal sequential
-  `fetchExportRows` concatenation, so orderSalesByBrand (last catalog label wins
+  `fetchExportRows` concatenation, so orderSalesByBrand (first catalog label wins
   for a duplicate ASIN) and compactContentChangeEvents (first label wins) match
   the live route. Tested: route-vs-shadow parity for brand-sales AND
   content-changes with >5 account IDs (two chunks), DELIBERATELY reverse-sorted
@@ -4200,6 +4200,30 @@ unchanged; zero DataDoe calls during derivation. See SCHEDULER_V2.md section 23.
   (54+60+23+6+56+**34**+7+155) + `build:check` (2,393 modules); `git diff --check`
   clean.
 - Commits: `6e73571` (production fixes), `e08b835` (regression tests); docs follow.
+
+### Scheduler v2 Phase 1d foundation approved (Codex, 2026-08-08)
+
+- Re-reviewed `6e73571`, `e08b835`, and `c67828d` against the production
+  worker/storage paths and resolver emission order. No material findings remain
+  in the Phase 1d foundation correction set.
+- Canonical fragment ordering now follows the resolver's deterministic
+  contract/window/chunk output and is proven with multi-chunk, reverse-hash,
+  conflicting-catalog parity cases. Next-tranche production planning must pass
+  that resolver output through unchanged; it must not reconstruct fragments from
+  unordered database query results.
+- The snapshot limit now has one dependency-free source of truth, and the final
+  saver independently recomputes actual serialized UTF-8 bytes. Strict calendar
+  validation runs before snapshot persistence, so invalid dates and oversized
+  payloads preserve the previous snapshot and perform zero snapshot writes.
+- Independent verification in the Codex worktree: focused derivation suite
+  **34/34**, full `npm run verify` **395 assertions** plus the successful
+  2,393-module production build, and `git diff --check` clean. `HANDOFF.md`
+  remains untracked and should not be refreshed or committed.
+- **Phase 1d foundation is approved.** The next work may begin the remaining 11
+  faithful derivation adapters in small shadow-mode tranches, each with independent
+  production-route parity tests. Continue to prohibit push, merge, deployment,
+  migration application, Scheduler v1/frontend/manual-refresh changes, and live
+  DataDoe calls until the complete shadow pipeline passes Codex's live gates.
 
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
