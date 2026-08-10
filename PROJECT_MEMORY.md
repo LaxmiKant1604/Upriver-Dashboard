@@ -4478,3 +4478,34 @@ all-paused gate precedes `fetchAccounts`.
    07:30 IST non-US / 16:00 IST US automatic kickoffs.
 4. Browser-test the Data Sync Center at desktop/tablet/mobile with a real admin
    session. No production deployment was performed in this change.
+
+## Codex senior re-review: Scheduler v2 Phase 1d tranche 2 (2026-08-10)
+
+**Reviewed commits:** `539bfc7`, `6197cc6`, and `74e34d4` on
+`feature/scheduler-v2`.
+
+**Result:** approved with no code findings. The duplicate SKU P&L month guard now
+fails closed before folding, Daily Ads rows are checked against the authoritative
+raw seller id and planned date window, and the derivation import graph reaches the
+new dependency-free `date-windows.js` leaf rather than DataDoe/Supabase transport.
+The request-hash algorithm, five-ID batching, organization isolation, Scheduler v1,
+frontend behavior, and production schedules were not changed.
+
+**Independent verification:** focused suites passed with 65 report-derivation,
+159 report-contract, and 7 source-identity assertions. Full `npm run verify` passed
+with **439 assertions** (including 9 admin report-sync-control assertions) plus the
+2,394-module production build. The pinned request hash remains unchanged. The worktree
+is clean except the pre-existing untracked `HANDOFF.md`, which was not touched.
+
+**Mandatory next-tranche/live gate:** `ads_daily_source_rows` stores account scope in
+`account_id` and native metrics under the `metrics` JSON field; its read API does not
+directly return `seller_or_vendor_id` or flattened ad metrics. Before Daily Scheduling
+can be enabled, the production planner/derived-context loader must query rows by the
+authorized public account id, map the account through `resolveDataDoeAccountIds`, inject
+that authoritative raw seller id into every canonical Ads row, flatten only the expected
+metrics, and produce the typed `adsCoverage` envelope. Add a production-row-shape test
+for both primary and `dd-secondary` accounts. Missing, malformed, stale, partial, or
+cross-account data must continue to block the new snapshot and preserve last-known-good.
+
+**Deployment status:** still shadow mode. Nothing from this review was pushed, merged,
+deployed, migrated, or scheduled.
