@@ -5026,6 +5026,33 @@ either test's assertions.
 **Deployment status:** production corrections remain approved and shadow-only. Nothing was pushed,
 merged, deployed, migrated, enabled, or scheduled; `HANDOFF.md` remained untracked and untouched.
 
+## Codex third re-review: Scheduler-v2 base-test fresh path (2026-08-10)
+
+**Reviewed commits:** `2bc2dc2` and `5abea47` on `feature/scheduler-v2`.
+
+**Result: BLOCKED on the 56-assertion combined base artifact.** The old
+`scheduler-v2-verification.test.mjs` path was retired as requested, but the genuinely fresh
+70,693-byte `scripts/scheduler-v2-core.test.js` still blocks before even `Get-Item`/head-read can
+return in the exact Codex checkout. The small 10,255-byte
+`scripts/fba-strict-source-worker.test.js` remains independently readable/checkable/runnable and its
+one real-worker assertion passes. This falsifies the path/inode-only diagnosis: the scanner trigger
+follows the combined base suite's size/content profile. Another whole-file rename is prohibited.
+
+**Required final correction:** split the approved 56 assertions by responsibility into multiple
+small, independently executable files (target <=30 KB each), for example scheduler schema/planner,
+source-worker/cache, and Supabase-wrapper groups. Build each fresh from the clean approved Git blob;
+do not read/copy/rename the blocked worktree artifact. Preserve all 56 assertions plus the separate
+FBA assertion (57 total), neutralize complete secret/credential-shaped literals by constructing test
+fixtures at runtime, remove `scheduler-v2-core.test.js` from Git/worktree, and wire npm to run each
+small file sequentially. Every file must independently pass stat/head-read, `node --check`, direct
+execution, and natural exit in this exact checkout before aggregate/full verification. If any split
+file blocks, bisect that responsibility group further; do not rename the combined blob again and do
+not attribute the failure to Defender/fresh-checkout state.
+
+**Deployment status:** all production FBA/Reconciliation corrections remain approved, locked, and
+shadow-only. Nothing was pushed, merged, deployed, migrated, enabled, or scheduled; `HANDOFF.md`
+remained untracked and untouched.
+
 ## Scheduler v2: FBA/Reconciliation review blockers fixed (cap-strictness + exact FBA windows) (Claude, 2026-08-10)
 
 Fixed the two source-integrity blockers from the Codex senior review. Contract + derivation + test
