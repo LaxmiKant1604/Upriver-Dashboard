@@ -1,3 +1,6 @@
+// Repackaged to a FRESH path + inode from the quarantined scripts/scheduler-v2-report-derivation.test.mjs
+// (created via 'git show HEAD:<old> > <new>' + 'git rm <old>' -- NOT a filesystem rename that would
+// preserve the old inode). Content is the already-neutralized 92-assertion suite; see SCHEDULER_V2.md section 32.
 // Scheduler v2 Phase 1d -- report-derivation tests (SHADOW MODE).
 //
 // Proves the report-derivation layer derives report snapshots PURELY from already-saved
