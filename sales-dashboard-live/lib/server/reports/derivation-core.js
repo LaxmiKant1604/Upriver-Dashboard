@@ -670,3 +670,47 @@ export function fbaPlanPayload({
     })),
   };
 }
+
+// ---- Keyword Rank cores. Verbatim copies of the api/datadoe.js `keyword-rank` handler's PURE
+//      helpers (the DataDoe fetches + the non-deterministic retrievedAt are supplied by the caller).
+//      Kept dependency-free here; proven equal to the route formula by the Keyword Rank parity
+//      harness. ----
+
+// Verbatim copy of api/datadoe.js sqpDistinctPeriods: the sorted set of distinct non-empty `date`
+// values in a SQP row set. Drives the weekly-vs-monthly-vs-baseline cadence decision.
+export function sqpDistinctPeriods(rows) {
+  return [...new Set((rows || []).map((row) => String(row.date || "")).filter(Boolean))].sort();
+}
+
+/**
+ * Full Keyword Rank payload, byte-identical to the api/datadoe.js `keyword-rank` handler (except
+ * `retrievedAt`, which the route stamps with Date.now() but the scheduler supplies DETERMINISTICALLY
+ * from validated saved source metadata). The caller has already resolved `cadence`/`periods`/`rows`
+ * (weekly / monthly / baseline) and `weeklyPeriodCount` per the route's cadence logic; this assembler
+ * builds `products` (unique child_asin in catalog source order; blank name -> null, blank brand ->
+ * "Unassigned") and `catalogBrands`, exactly like the route. Pure.
+ */
+export function keywordRankPayload({ accountId, cadence, periods, weeklyPeriodCount, rows, catalogRows, retrievedAt }) {
+  const products = [];
+  const seenAsins = new Set();
+  for (const row of catalogRows || []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin || seenAsins.has(asin)) continue;
+    seenAsins.add(asin);
+    products.push({
+      asin,
+      name: String(row.product_name || "").trim() || null,
+      brand: String(row.product_brand || "").trim() || "Unassigned",
+    });
+  }
+  return {
+    accountId,
+    cadence,
+    periods,
+    weeklyPeriodCount,
+    rows,
+    products,
+    catalogBrands: catalogBrandNames(catalogRows || []),
+    retrievedAt,
+  };
+}
