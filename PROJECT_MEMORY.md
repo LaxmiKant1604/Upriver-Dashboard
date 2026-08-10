@@ -4962,6 +4962,40 @@ contract metadata and source-worker guard.
 **Deployment status:** still shadow mode. Nothing was pushed, merged, deployed, migrated, enabled,
 or scheduled.
 
+## Codex re-review: FBA/Reconciliation blocker fixes (2026-08-10)
+
+**Reviewed commits:** `5a3dd17`, `fb43775`, `1d170af`, `e9a74ff`, and `64d945d` on
+`feature/scheduler-v2`.
+
+**Result: production fixes approved; tranche remains BLOCKED on one test-artifact issue.** The six
+new Scheduler-v2 strict flags are outside source identity and correctly reach the existing source
+worker `rows.length >= limit` / `TRUNCATED` guard. FBA derivation now pins inventory to exactly
+`addDaysStr(asOf,-10)..asOf` and AWD to the exact no-date `{from:null,to:null}` contract. The
+accessible suites pass: report contracts **161**, report derivation **145**, and source identity
+**7**. No new production-code finding remains in this correction.
+
+**P1 verification blocker - modified Scheduler-v2 test artifact is unreadable/non-terminating in
+the review worktree.** `node --check scripts/scheduler-v2-verification.test.mjs` blocks before module
+evaluation, and `npm run test:scheduler-v2` emits no marker/output and remains running until manually
+interrupted (independently observed for more than 40 seconds). Therefore the claimed 57th source-
+worker assertion and the full `npm run verify` result are not reproducible here. This is the same
+class of content-scanner/test-packaging failure previously treated as a blocker; do not dismiss it as
+a fresh-checkout or Defender caveat.
+
+**Required correction:** restore `scripts/scheduler-v2-verification.test.mjs` byte-for-byte to its
+approved `602feea` parent content and move the one new FBA strict-cap source-worker test into a small,
+independently readable artifact (prefer `scripts/fba-strict-source-worker.test.js`) or into the
+already-readable FBA derivation suite if the import boundary stays honest. Wire it into npm without
+weakening or dropping the assertion. Each artifact must independently pass stat/head-read,
+`node --check`, direct execution, and natural process exit in the exact checked-out worktree; then
+the complete `npm run verify` must pass. If restoring the old path does not clear its local scan
+state, replace it with a genuinely fresh clean path containing only the approved 56-assertion base,
+remove the blocked path from Git/worktree, and prove both files separately readable. Do not alter the
+approved strict contracts or FBA window validation while fixing packaging.
+
+**Deployment status:** still shadow mode. Nothing was pushed, merged, deployed, migrated, enabled,
+or scheduled; `HANDOFF.md` remained untracked and untouched.
+
 ## Scheduler v2: FBA/Reconciliation review blockers fixed (cap-strictness + exact FBA windows) (Claude, 2026-08-10)
 
 Fixed the two source-integrity blockers from the Codex senior review. Contract + derivation + test
