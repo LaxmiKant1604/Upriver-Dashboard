@@ -2183,3 +2183,57 @@ handles. Aggregate: `npm run test:scheduler-v2` = 22+16+6+8+4+1 = **57**; `npm r
 = **522** (54+60+23+6+**57**+145+7+161+9) + `build:check` (2,394 modules, built ~6s); `git diff --check`
 clean; `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains
 SHADOW MODE with both reports locked.
+
+## 40. Keyword Rank derivation + shadow planner wired (SHADOW MODE, 2026-08-11)
+
+First functional tranche after the test-packaging approval: wires the `keyword-rank` `derive:null`
+registry entry to a pure adapter and adds the Keyword Rank shadow planner, reproducing the live
+api/datadoe.js `keyword-rank` payload PURELY from saved SQP + catalog fragments (ZERO DataDoe calls).
+No production route change (`api/datadoe.js` untouched); the keyword-rank source CONTRACT already existed
+(unchanged). No migration / schedule / control-unlock / push / merge / deploy. Keyword Rank report control
+stays LOCKED; no insight adapter started. `HANDOFF.md` untracked.
+
+### 40.1 Where the code lives (additive)
+
+- `lib/server/reports/derivation-core.js` (dependency-free leaf): + `sqpDistinctPeriods` (sorted distinct
+  non-empty `date`s) and `keywordRankPayload` -- verbatim transcriptions of the route's pure helpers
+  (`products` = unique child_asin in catalog source order, blank name -> null, blank brand ->
+  "Unassigned"; `catalogBrands` = `catalogBrandNames`). `retrievedAt` is a caller-supplied deterministic
+  value (never `Date.now()`).
+- `lib/server/sync/report-derivation.js`: the `keyword-rank` entry now carries real
+  `derive`/`validatePayload`/`latestDataDate` + `SQP_WEEKLY_LOOKBACK_DAYS=84` / `SQP_LONG_LOOKBACK_DAYS=365`
+  (byte-identical to the route). Windows are recomputed from asOf and BOTH endpoints pinned via the shared
+  `singleAccountFragmentRows`; SQP-weekly + catalog are required, SQP-monthly is the conditional fallback.
+- `lib/server/sync/report-planner.js`: + `planKeywordRank` (kickoff = weekly probe + 365-day catalog;
+  monthly SQP activated via the resolver's fallback gate only when a typed weekly signal satisfies
+  `distinct_periods < 4`, using the shared `evaluateFallbackCondition`); `SHADOW_PLANNED_REPORT_KEYS` now
+  includes `keyword-rank`.
+- `scripts/report-keyword-rank.test.js` (24) added to `test:report-derivation`
+  (now 66+26+33+20+24 = **169**).
+
+### 40.2 Cadence + safety (route parity)
+
+- **weekly** (>= 4 weekly distinct periods): use weekly rows/periods; monthly is neither read nor
+  required. **monthly** (weekly < 4 AND monthly >= 2 periods): use monthly rows/periods. **baseline**
+  (weekly < 4 AND monthly < 2): prefer non-empty weekly rows, else monthly rows; `periods` recomputed
+  from the chosen rows. `weeklyPeriodCount` always reflects the weekly source.
+- **Conditional monthly fallback:** when weekly < 4 periods, a missing/failed monthly => derive-invalid
+  (last-known-good preserved); a disabled monthly (terminal policy) => blocked. Never a silent baseline.
+- **Weekly disabled** (terminal) => blocked (via the required-source gate). **Weekly EMPTY** (validated
+  []) is a real state that proceeds to the monthly fallback; **weekly MISSING** (cache-miss/failed) =>
+  unavailable -- distinct states.
+- Exactly one account; primary/dd-secondary organization isolation preserved; request_hash + source
+  identity unchanged (the contract is untouched; strict 50,000-row caps on SQP are enforced upstream by
+  the source worker). Wrong-window / cross-account / malformed / partial / reordered fragments throw ->
+  derive-invalid -> last-known-good preserved. Derivation makes ZERO DataDoe/network calls (structural
+  import boundary + a fetch-spy test).
+
+### 40.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0); `report-keyword-rank.test.js` runs **24 passed, 0
+failed**. `npm run test:report-derivation` = **169** (66+26+33+20+24); `npm run test:sync-engine` (**57**);
+`npm run test:report-contracts` (**161**); `npm run test:source-identity` (7); `npm run verify` = **546**
+(54+60+23+6+**57**+**169**+7+161+9) + `build:check` (2,394 modules, built ~5s); `git diff --check` clean;
+`git status --short` shows only the intended files (+ untracked `HANDOFF.md`). `api/datadoe.js`,
+`report-source-contracts.js`, `source-worker.js`, and the approved `sync-*` / FBA test artifacts are
+untouched. Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.

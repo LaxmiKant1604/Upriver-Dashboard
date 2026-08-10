@@ -5236,3 +5236,32 @@ production module, migration, or scheduler behavior changed.
 - Review result: **test packaging approved**. The approved FBA Shipment Plan and Reconciliation
   derivation code remains byte-unchanged, Scheduler v2 remains shadow-only, and report controls stay
   locked. The next functional tranche is Keyword Rank derivation from saved SQP/catalog sources.
+
+## Scheduler v2: Keyword Rank derivation + shadow planner wired (Claude, 2026-08-11)
+
+First functional tranche after the test-packaging approval. Wired the `keyword-rank` `derive:null`
+registry entry to a pure adapter + added the Keyword Rank shadow planner, reproducing the live
+api/datadoe.js `keyword-rank` payload ({ accountId, cadence, periods, weeklyPeriodCount, rows, products,
+catalogBrands, retrievedAt }) PURELY from saved SQP + catalog fragments (ZERO DataDoe calls).
+**`api/datadoe.js` (the route) is UNCHANGED**; the keyword-rank source CONTRACT already existed and is
+untouched. SHADOW MODE; nothing pushed/merged/deployed/migrated; Keyword Rank + all report controls stay
+locked; no insight adapter started; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 40.
+
+- **Code (additive).** `derivation-core.js` += `sqpDistinctPeriods` + `keywordRankPayload` (verbatim route
+  helpers; products = unique child_asin in catalog order, blank name->null, blank brand->"Unassigned";
+  catalogBrands = catalogBrandNames; retrievedAt caller-supplied deterministic). `report-derivation.js`:
+  keyword-rank derive with cadence weekly/monthly/baseline exactly like the route, `SQP_WEEKLY_LOOKBACK_DAYS
+  =84`/`SQP_LONG_LOOKBACK_DAYS=365`, both window endpoints pinned; SQP-weekly+catalog required, SQP-monthly
+  conditional fallback (weekly<4 => monthly required: missing/failed=>invalid, disabled=>blocked, never a
+  silent baseline). `report-planner.js`: += `planKeywordRank` (kickoff weekly+catalog; monthly activated
+  via the fallback gate + shared evaluateFallbackCondition only when weekly<4); SHADOW_PLANNED_REPORT_KEYS
+  += keyword-rank. Test: `scripts/report-keyword-rank.test.js` (24) added to test:report-derivation (169).
+- **Route parity + safety.** cadence branches, weekly>=4 skips monthly, planner activates monthly exactly
+  once (not when weekly sufficient), weekly-empty vs missing-cache distinct, disabled weekly/monthly block,
+  strict-cap/wrong-window/cross-account/malformed reject preserving LKG, primary/dd-secondary hash
+  isolation, deterministic/idempotent, zero-fetch, and a worker-level no-snapshot/LKG proof -- all tested.
+- **Verification (all natural, exit 0).** node --check every changed file; report-keyword-rank **24**;
+  test:report-derivation **169** (66+26+33+20+24); test:sync-engine 57; test:report-contracts 161;
+  test:source-identity 7; `npm run verify` = **546** + build (2,394 modules); `git diff --check` clean;
+  only intended files changed (+ untracked HANDOFF.md); api/datadoe.js, report-source-contracts.js,
+  source-worker.js, sync-*/FBA test artifacts untouched.
