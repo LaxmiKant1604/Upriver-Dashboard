@@ -4781,3 +4781,33 @@ untouched. Detail in `SCHEDULER_V2.md` section 31.
   test:scheduler-v2 56; test:report-contracts 159; `npm run verify` = **466** + build (2,394 modules);
   `git diff --check` + `git status --short` clean. All 92 assertions preserved; only the test file
   changed.
+
+## Scheduler v2: report-derivation test moved to a fresh path/inode (Claude, 2026-08-10)
+
+Cleared the §31 re-review's final finding: the byte-neutralization was correct, but the tracked path
+`scripts/scheduler-v2-report-derivation.test.mjs` was quarantined at the PATH/INODE level in the
+shared worktree (`fs.statSync(path)`, a Node head read, `node --check`, and a `git diff` touching the
+path all hung before output, while `git status`/`git log` completed). Editing the same path in place
+could never clear an inode-level quarantine. Test-artifact only; blocker 1 stays approved and
+`supabase.js` is untouched. SHADOW MODE; nothing pushed/merged/deployed/migrated/enabled; controls
+locked; `HANDOFF.md` untouched. Commit `21e7f95`. Detail in `SCHEDULER_V2.md` section 32.
+
+- **Fix (one genuinely fresh file; old path fully removed).** Added `scripts/report-derivation.test.js`
+  -- a `.js` file with a genuinely fresh inode, created from the clean object-store blob
+  (`git show HEAD:<old.mjs> > scripts/report-derivation.test.js`), NOT a filesystem rename / `git mv`
+  (those preserve the quarantined inode). Content is the identical 92-assertion suite (66 report-
+  derivation + 26 planner/Ads-loader); risky-byte profile still matches the readable baseline (`JWT` 0,
+  64-hex 2 = the single golden pin once, no key-shaped literals, LF-only, no non-ASCII). `git rm`
+  removed the old path from index + worktree; the commit removes it from the HEAD tree. `package.json`
+  `test:report-derivation` now runs `node scripts/report-derivation.test.js`; the `.js` stays ESM via
+  `"type":"module"`; the `verify` chain needs no edit (it references the script name).
+- **Not a rename.** `git status` shows `R <old> -> <new>` only because the content is ~identical --
+  that is git's diff-time similarity detection, not a filesystem rename and not inode preservation. On
+  a fresh checkout git deletes the old path and writes a brand-new file at the new path, so the
+  quarantined inode does not survive.
+- **Verification (all natural, exit 0):** new path `fs.existsSync` true + `fs.statSync` (135,474 B) +
+  head read return immediately; node --check (0); `node scripts/report-derivation.test.js` **92**;
+  test:scheduler-v2 56; test:report-contracts 159; `npm run verify` = **466** + build (2,394 modules);
+  `git diff --check` + `git status --short` clean. Old path proven gone: `fs.existsSync` false,
+  `git ls-files` absent, `git ls-tree -r HEAD` absent. Golden `request_hash`, five-ID batching, and
+  organization isolation remain green.
