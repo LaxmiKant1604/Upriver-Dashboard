@@ -830,15 +830,35 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "listing-optimizer:sqp-weekly": "listing-optimizer.js",
     "listing-optimizer:catalog": "listing-optimizer.js",
   };
+  // Scheduler-v2 INTEGRITY strictness (separate from the legacy route-backed sets above). These
+  // contracts are strict at the SCHEDULER boundary even though the legacy api/datadoe.js route fetches
+  // them non-strict: a cap-sized page for any of them (understated FBA sales/stock, a missing
+  // AWD/inventory ASIN, or a catalog that turns known products into "Unassigned") is indistinguishable
+  // from truncation. They are deliberately NOT backed by a route rows.length>=LIMIT guard -- the
+  // source worker enforces the cap (asserted below), so they must NOT be added to OPERATIONAL_STRICT.
+  const SCHEDULER_V2_STRICT = [
+    "reconciliation:catalog",
+    "fba-plan:monthly-units", "fba-plan:current-daily-dates", "fba-plan:catalog",
+    "fba-plan:inventory-health", "fba-plan:awd",
+  ];
+  const routeBacked = new Set([...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)]);
+  // The categories are disjoint: a strict key is EITHER route-backed OR scheduler-only, never both.
+  for (const k of SCHEDULER_V2_STRICT) assert.ok(!routeBacked.has(k), k + " is scheduler-only strict, not route-backed");
   const declaredStrict = [];
   for (const key of declaredReportKeys()) {
     for (const c of REPORT_SOURCE_CONTRACTS[key]) if (c.strict) declaredStrict.push(c.requestKey);
   }
   // exactly the intended set is marked strict — no unbacked strict labels.
-  assert.deepEqual(declaredStrict.sort(), [...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)].sort());
+  assert.deepEqual(declaredStrict.sort(), [...routeBacked, ...SCHEDULER_V2_STRICT].sort());
+  // Legacy route guards (unchanged): operational reports guard with a named per-report LIMIT constant.
   for (const [, constName] of Object.entries(OPERATIONAL_STRICT)) {
     assert.ok(new RegExp("rows\\.length >= " + constName).test(DD), "missing executable guard for " + constName);
   }
+  // Scheduler-v2-only strict contracts are backed by the SOURCE WORKER's cap guard (NOT a route
+  // guard): a strict job whose result reaches the row cap fails as TRUNCATED before any save.
+  const worker = readFileSync(join(ROOT, "lib", "server", "sync", "source-worker.js"), "utf8");
+  assert.ok(/job\.strict === true && rows\.length >= Number\(job\.limit\)/.test(worker), "source worker must enforce the strict row cap");
+  assert.ok(/"TRUNCATED"/.test(worker), "the strict cap failure is recorded as TRUNCATED");
   // The shared strict transport really enforces the cap, and every strict insight
   // request is issued through it.
   const transport = readFileSync(join(ROOT, "lib", "server", "datadoe.js"), "utf8");
@@ -919,6 +939,38 @@ test("execution metadata does NOT change request_hash (identity ignores strict/p
     ids: job.sellerOrVendorIds, from: job.from, to: job.to, limit: job.limit, options: job.options,
   }).requestHash;
   assert.equal(job.requestHash, expected);
+});
+
+/* ---- Scheduler-v2 integrity strictness: FBA + reconciliation:catalog resolved jobs ---- */
+
+test("Scheduler-v2 integrity: every fba-plan resolved job + reconciliation:catalog is strict:true", () => {
+  const fbaJobs = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
+  for (const rk of ["fba-plan:monthly-units", "fba-plan:current-daily-dates", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:awd"]) {
+    const jobs = fbaJobs.filter((j) => j.requestKey === rk);
+    assert.ok(jobs.length >= 1, rk + " must resolve at least one job");
+    for (const j of jobs) assert.equal(j.strict, true, rk + " resolved job must be strict:true");
+  }
+  const recJobs = reportSourceRequestHashes({ reportKey: "reconciliation", apiKey: "k", ids: ["A1"], windowsByRequestKey: reconWin });
+  assert.equal(recJobs.find((j) => j.requestKey === "reconciliation:catalog").strict, true);
+  // The reconciliation order/settlement contracts were already strict (route-backed); still true.
+  assert.equal(recJobs.find((j) => j.requestKey === "reconciliation:order-lines").strict, true);
+});
+
+test("Scheduler-v2 strict metadata does NOT change fba-plan / reconciliation request_hash", () => {
+  const fbaJobs = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
+  for (const j of fbaJobs) {
+    const expected = sourceRequestIdentity({
+      apiKey: "k", sourceId: j.sourceId, columns: byKey(fba, j.requestKey).columns,
+      ids: j.sellerOrVendorIds, from: j.from, to: j.to, limit: j.limit, options: j.options,
+    }).requestHash;
+    assert.equal(j.requestHash, expected, j.requestKey + " request_hash must ignore the strict flag");
+  }
+  const recCat = reportSourceRequestHashes({ reportKey: "reconciliation", apiKey: "k", ids: ["A1"], windowsByRequestKey: reconWin }).find((j) => j.requestKey === "reconciliation:catalog");
+  const recExpected = sourceRequestIdentity({
+    apiKey: "k", sourceId: recCat.sourceId, columns: byKey(recon, "reconciliation:catalog").columns,
+    ids: recCat.sellerOrVendorIds, from: recCat.from, to: recCat.to, limit: recCat.limit, options: recCat.options,
+  }).requestHash;
+  assert.equal(recCat.requestHash, recExpected);
 });
 
 /* =================== Insight reports: Sales Movers / Buy Box / Returns =================== */
