@@ -225,20 +225,130 @@ test("keyword-rank: a disabled weekly SQP source is terminal => blocked", () => 
   assert.equal(deriveReportSnapshot({ reportKey: "keyword-rank", sources, context: ctx() }).status, "blocked");
 });
 
-test("keyword-rank: weekly < 4 with a DISABLED monthly fallback blocks (never a silent baseline)", () => {
+// Blocker 3: required-now monthly fallback preserves TYPED outcomes (not everything -> invalid).
+test("keyword-rank: weekly < 4 with a TERMINAL-DISABLED monthly fallback => BLOCKED (not invalid)", () => {
   const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-07-01" }], catalogRows: CATALOG }); // no monthly fragment
   const s = buildSources(planned, rows);
   s["keyword-rank:sqp-monthly"] = { available: false, rows: null, disabled: true, disabledPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" }, fragments: [] };
   const res = deriveReportSnapshot({ reportKey: "keyword-rank", sources: s, context: ctx() });
-  assert.equal(res.status, "invalid");
+  assert.equal(res.status, "blocked");
   assert.equal(res.payload, null);
 });
 
-test("keyword-rank: weekly < 4 with a MISSING monthly fallback blocks (LKG preserved)", () => {
+test("keyword-rank: weekly < 4 with a MISSING/failed monthly fallback => UNAVAILABLE (not invalid)", () => {
   const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-07-01" }], catalogRows: CATALOG }); // monthly absent
   const res = deriveKw(planned, rows);
-  assert.equal(res.status, "invalid");
+  assert.equal(res.status, "unavailable");
   assert.equal(res.payload, null);
+});
+
+test("keyword-rank: weekly < 4 with a VALIDATED EMPTY monthly is a real baseline input (derives)", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: [], monthlyRows: [], catalogRows: CATALOG }); // both validated empty
+  const res = deriveKw(planned, rows);
+  assert.equal(res.status, "derived", "an empty (but validated) monthly array is honored, not treated as missing");
+  assert.equal(res.payload.cadence, "baseline");
+  assert.deepEqual(res.payload.periods, []);
+  assert.deepEqual(res.payload.rows, []);
+});
+
+/* ============================= Blocker 4: SQP row-date validation ============================= */
+
+group("keyword-rank: SQP row date validation (plain object, real date, in-window)");
+
+test("keyword-rank: a non-object weekly SQP row => invalid (not silently filtered)", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-06-01" }, "2025-06-08"], catalogRows: CATALOG });
+  assert.equal(deriveKw(planned, rows).status, "invalid");
+});
+
+test("keyword-rank: an impossible weekly SQP date (2025-02-30 / 99-99) => invalid", () => {
+  for (const bad of ["2025-02-30", "2025-99-99", "not-a-date", ""]) {
+    const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-06-01" }, { date: bad }], catalogRows: CATALOG });
+    assert.equal(deriveKw(planned, rows).status, "invalid", "bad date " + JSON.stringify(bad));
+  }
+});
+
+test("keyword-rank: an OUT-OF-WINDOW weekly SQP date (before asOf-84) => invalid", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-06-01" }, { date: addDaysStr(ASOF, -85) }], catalogRows: CATALOG });
+  assert.equal(deriveKw(planned, rows).status, "invalid");
+});
+
+test("keyword-rank: an OUT-OF-WINDOW monthly SQP date (before asOf-365) => invalid", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-07-01" }], monthlyRows: [{ date: "2025-05-01" }, { date: addDaysStr(ASOF, -366) }], catalogRows: CATALOG });
+  assert.equal(deriveKw(planned, rows).status, "invalid");
+});
+
+test("keyword-rank: a future weekly SQP date (after asOf) => invalid", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: [{ date: "2025-06-01" }, { date: addDaysStr(ASOF, 1) }], catalogRows: CATALOG });
+  assert.equal(deriveKw(planned, rows).status, "invalid");
+});
+
+test("keyword-rank: clean in-window SQP dates derive normally (validation does not reject good data)", () => {
+  const { planned, rows } = kwPlanned({ weeklyRows: WEEKLY_ROWS, catalogRows: CATALOG });
+  assert.equal(deriveKw(planned, rows).status, "derived");
+});
+
+/* ============================= worker-level typed-state persistence + LKG ============================= */
+
+group("keyword-rank worker: blocked terminal / unavailable+invalid preserve LKG; unrelated continues");
+
+// The keyword-rank report's three planned sources (weekly + monthly[optional] + catalog); `monthlyExtra`
+// can add a disabledPolicy so the worker marks a failed monthly as terminal-disabled.
+const KW_REPORT_SOURCES = (monthlyExtra = {}) => [
+  { requestKey: "keyword-rank:sqp-weekly", requestHash: "kw-w", from: WEEKLY_FROM, to: ASOF, sellerOrVendorIds: [ID], optional: false },
+  { requestKey: "keyword-rank:sqp-monthly", requestHash: "kw-m", from: LONG_FROM, to: ASOF, sellerOrVendorIds: [ID], optional: true, ...monthlyExtra },
+  { requestKey: "keyword-rank:catalog", requestHash: "kw-c", from: LONG_FROM, to: ASOF, sellerOrVendorIds: [ID], optional: false },
+];
+const LKG = { cadence: "weekly", periods: ["prior"], rows: [] };
+
+// Run runReportJobs for a keyword-rank plan (+ an unrelated content-changes report). Seeds the source
+// job statuses + cache rows + a prior LKG snapshot; returns { store, savedKeys }.
+async function runKwWorker({ kwSources, statusByHash, rowsByHash }) {
+  const store = makeReportStore();
+  for (const [h, st] of Object.entries(statusByHash)) store.seedSource(h, st);
+  store.seedSource("other-src", "succeeded");
+  store.seedSnapshot("scheduler-v2/keyword-rank", ID, LKG);
+  const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rowsByHash, hash) ? { rows: rowsByHash[hash] } : { rows: [] });
+  const kwReport = { reportKey: "keyword-rank", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "keyword-rank/v2d-1", sources: kwSources, context: ctx() };
+  const other = { reportKey: "content-changes", accountId: "OTHER", connectionId: "primary", bucket: "us", reportVersion: "content-changes/v2d-1", sources: [{ requestKey: "content-changes:events", requestHash: "other-src", from: null, to: null, sellerOrVendorIds: ["OTHER"], optional: false }, { requestKey: "content-changes:catalog", requestHash: "other-src", from: null, to: null, sellerOrVendorIds: ["OTHER"], optional: false }], context: { accountId: "OTHER" } };
+  const savedKeys = [];
+  const saveSnapshot = async ({ reportKey }) => { savedKeys.push(reportKey); return { paramsHash: "ph" }; };
+  await runReportJobs({ store, cycleId: "cyc1", sourceRows, saveSnapshot, plannedReports: [kwReport, other] });
+  return { store, savedKeys };
+}
+
+test("keyword-rank worker: BLOCKED (terminal-disabled monthly) is terminal, writes zero snapshots, keeps LKG, unrelated continues", async () => {
+  const { store, savedKeys } = await runKwWorker({
+    kwSources: KW_REPORT_SOURCES({ disabledPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" } }),
+    statusByHash: { "kw-w": "succeeded", "kw-m": "failed", "kw-c": "succeeded" },
+    rowsByHash: { "kw-w": [{ date: "2025-07-01" }], "kw-c": CATALOG },
+  });
+  assert.ok(!savedKeys.includes("scheduler-v2/keyword-rank"), "no keyword-rank snapshot saved");
+  assert.equal(store.report("keyword-rank", ID).fetch_status, "blocked", "blocked is TERMINAL for the cycle");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/keyword-rank|" + ID).payload, LKG, "last-known-good preserved");
+  assert.ok(savedKeys.includes("scheduler-v2/content-changes"), "an unrelated report continues + saves");
+});
+
+test("keyword-rank worker: UNAVAILABLE (failed/missing monthly) writes zero snapshots, keeps LKG, unrelated continues", async () => {
+  const { store, savedKeys } = await runKwWorker({
+    kwSources: KW_REPORT_SOURCES(), // monthly optional, NO disabledPolicy
+    statusByHash: { "kw-w": "succeeded", "kw-m": "failed", "kw-c": "succeeded" },
+    rowsByHash: { "kw-w": [{ date: "2025-07-01" }], "kw-c": CATALOG },
+  });
+  assert.ok(!savedKeys.includes("scheduler-v2/keyword-rank"), "no keyword-rank snapshot saved");
+  assert.equal(store.report("keyword-rank", ID).derive_status, "failed", "unavailable recorded (non-terminal derive failure)");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/keyword-rank|" + ID).payload, LKG, "last-known-good preserved");
+  assert.ok(savedKeys.includes("scheduler-v2/content-changes"), "an unrelated report continues + saves");
+});
+
+test("keyword-rank worker: INVALID (out-of-window weekly date) writes zero snapshots, keeps LKG, unrelated continues", async () => {
+  const { store, savedKeys } = await runKwWorker({
+    kwSources: KW_REPORT_SOURCES(),
+    statusByHash: { "kw-w": "succeeded", "kw-c": "succeeded" }, // monthly not needed; weekly date is bad
+    rowsByHash: { "kw-w": [{ date: "2025-06-01" }, { date: addDaysStr(ASOF, -85) }], "kw-c": CATALOG },
+  });
+  assert.ok(!savedKeys.includes("scheduler-v2/keyword-rank"), "no keyword-rank snapshot saved");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/keyword-rank|" + ID).payload, LKG, "last-known-good preserved");
+  assert.ok(savedKeys.includes("scheduler-v2/content-changes"), "an unrelated report continues + saves");
 });
 
 /* ============================= window / account / integrity ============================= */
