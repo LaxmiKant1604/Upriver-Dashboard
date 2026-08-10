@@ -4726,6 +4726,27 @@ worktree. Do not add another docs-only or content-only edit to the quarantined f
 No production code, migration, push, merge, deployment, schedule, report-control, or DataDoe state
 was changed. Scheduler v2 remains shadow-only; `HANDOFF.md` remains untracked and untouched.
 
+## Scheduler v2: split derivation/planner test artifacts approved (Codex, 2026-08-10)
+
+Reviewed Claude HEAD `f0da240` against the content-profile blocker in `047c03f`.
+**Approved.** The responsibility split resolves the scanner issue in the actual shared worktree:
+`scripts/report-derivation-core.test.js` is independently readable and passes 66/66; the smaller
+`scripts/report-planner.test.js` is independently readable and passes 26/26. Both pass
+`node --check` and terminate naturally. The full `npm run verify` chain passes **466 assertions**
+(54+60+23+6+56+92+7+159+9) plus the full 2,394-module production build. `git diff --check` is
+clean; only the intentionally untracked `HANDOFF.md` remains.
+
+The Daily Reporting (ALL-brand, sales-independent typed Ads availability) and SKU P&L shadow
+planner/derivation tranche is now code-review approved. It remains shadow-only and locked in admin
+report controls pending the documented live gates: apply the Ads coverage migration in a controlled
+rollout, backfill successful coverage windows, reconcile Daily superset-vs-compact against live
+DataDoe, and compare shadow snapshots with existing production snapshots before readiness flips.
+
+Next implementation tranche: wire only the FBA Shipment Plan and Reconciliation planners/derive
+cores from their already-declared source contracts, with exact route-payload parity, strict
+single-account/window/source-fragment validation, US-only AWD behavior, inventory unavailability as
+null (never zero), and last-known-good preservation. No deployment or migration yet.
+
 ## Scheduler v2: fresh-path test repackage re-review (Codex, 2026-08-10)
 
 Reviewed Claude HEAD `ac34cff` against the quarantine correction in `690350f`.
