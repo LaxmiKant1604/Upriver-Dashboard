@@ -35,10 +35,16 @@ import {
   validateSkuPlMonthlyWindows,
   isValidCalendarDate,
 } from "./report-source-contracts.js";
-// planMonthWindows is the shared dependency-free window helper (byte-identical to the api/datadoe.js
-// fba-plan route copy; proven equal in the FBA parity harness). Reaching it here keeps the pure
-// derivation graph free of any DataDoe transport / Supabase import.
-import { planMonthWindows } from "../date-windows.js";
+// planMonthWindows/addDaysStr are shared dependency-free window helpers (byte-identical to the
+// api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
+// keeps the pure derivation graph free of any DataDoe transport / Supabase import.
+import { planMonthWindows, addDaysStr } from "../date-windows.js";
+
+// FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
+// constant. The derivation RECOMPUTES the expected inventory start as addDaysStr(asOf, -10) and pins
+// BOTH endpoints, so a planner/caller that shifts the snapshot window (a shortened or extended lookback)
+// is rejected -- the derivation never implicitly trusts the fragment's window.
+const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -237,8 +243,11 @@ const REGISTRY = {
       // 2) single-account single-fragment required ranges.
       const dailyDateRows = singleAccountFragmentRows(sources["fba-plan:current-daily-dates"], "fba-plan:current-daily-dates", rawSellerId, current.from, current.to);
       const catalogRows = singleAccountFragmentRows(sources["fba-plan:catalog"], "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
-      // Inventory ends at asOf (from = asOf - lookback, a planner constant); pin only the `to`.
-      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, null, asOf);
+      // Inventory window is EXACTLY [asOf - 10d .. asOf]. Recompute the expected start here and pin
+      // BOTH endpoints (a shortened or extended lookback fragment is rejected -> derive-invalid ->
+      // last-known-good preserved), never implicitly trusting the planner/caller.
+      const expectedInventoryFrom = addDaysStr(asOf, -FBA_INVENTORY_LOOKBACK_DAYS);
+      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, asOf);
 
       // 3) AWD -- US only. Missing/failed for a US account BLOCKS (never a silent zero); a validated
       //    (possibly empty) AWD source is honored. Non-US never reads AWD.
@@ -248,11 +257,15 @@ const REGISTRY = {
         if (!awd || awd.available !== true || !Array.isArray(awd.rows)) {
           throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
         }
+        // AWD is a NO-DATE source: require EXACTLY one single-account fragment whose window is the
+        // canonical {from:null, to:null}. A dated AWD fragment (a wrong/narrowed listings window) is
+        // rejected -> derive-invalid -> last-known-good preserved.
         const frags = awd.fragments || [];
         const f = frags.length === 1 ? frags[0] : null;
         const ids = f && f.sellerOrVendorIds;
-        const ok = !!f && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
-        if (!ok) throw new Error("fba-plan AWD must be exactly one single-account fragment; snapshot blocked.");
+        const ok = !!f && f.from === null && f.to === null
+          && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
+        if (!ok) throw new Error("fba-plan AWD must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.");
         awdRows = awd.rows;
       }
 
