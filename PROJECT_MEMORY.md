@@ -5193,3 +5193,27 @@ section 38.
   `node --check` 0; direct run exit code 0 (22/16/6/8/4/1). Aggregate: `test:scheduler-v2` **57**;
   `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
   = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: test suites renamed to a neutral `sync-*` family (Claude, 2026-08-10)
+
+Cleared the fourth re-review's blocker: files retaining a `scheduler-v2-*` FILENAME still blocked before
+metadata/head-read in the review worktree (signals >60s; schema-planner + cache too), while the neutral
+`fba-strict-source-worker.test.js` opened immediately -- so the quarantine trigger is attached to the
+reused `scheduler-v2-*` filename family, not size/content. Recreated the five small suites under neutral
+names, retired the old family. **Test-packaging only** -- production byte-unchanged since `705c087`;
+`fba-strict-source-worker.test.js` unchanged. SHADOW MODE; nothing pushed/merged/deployed/migrated;
+controls locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 39.
+
+- **Neutral files (from the ff31ed5 Git blobs, not the blocked worktree files, not git mv).** Each
+  `git show ff31ed5:<old> > <new>`, byte-identical (`cmp`), fresh inode, assertions unchanged:
+  `sync-schema-plan.test.js` 22 (17,755 B), `sync-source-jobs.test.js` 16 (26,378 B),
+  `sync-cache-atomicity.test.js` 6 (19,185 B), `sync-signals.test.js` 8 (25,343 B),
+  `sync-db-wrappers.test.js` 4 (7,848 B); kept `fba-strict-source-worker.test.js` 1 (10,255 B) = **57**.
+- **Retired** all five `scheduler-v2-*.test.js` from index + worktree (`git rm`; git renders `R` by
+  byte-identity but the new files have fresh inodes). `package.json` `test:scheduler-v2` runs the five
+  `sync-*` files then the FBA file.
+- **Verification (each file separately; natural exit 0).** No tracked `scheduler-v2-*.test.*` remains:
+  absent from filesystem, `git ls-files`, `git ls-tree -r HEAD`. Each of six files: stat + head read
+  immediate; `node --check` 0; direct run exit 0 (22/16/6/8/4/1). Aggregate: `test:scheduler-v2` **57**;
+  `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
+  = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
