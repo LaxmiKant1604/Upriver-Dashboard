@@ -4,6 +4,7 @@ import {
   upsertAdDailyMetrics,
   upsertAdsDailyRows,
   upsertAdsSyncStates,
+  recordAdsCoverageWindows,
 } from "./supabase.js";
 import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js";
 
@@ -396,6 +397,13 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
             account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now
           ));
           await upsertAdsSyncStates(savedStates);
+          // Record the exact SUCCESSFULLY-covered window per account so the Daily Reporting
+          // scheduler can prove coverage (a zero-ad day has no metric row, so first/last metric
+          // dates cannot). Best-effort: additive table, never changes the export cadence, and a
+          // missing (unmigrated) table is a silent no-op that never breaks this sync.
+          await recordAdsCoverageWindows(batch.map(({ account }) => ({
+            accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
+          })));
           savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
           summary.rows += normalized.length;
           summary.sources[source.key][mode] += batch.length;

@@ -1103,8 +1103,13 @@ export function evaluateDailyAdsCoverage(coverage, planned) {
     const blocked = adRowBlockStatus(row, { from: planned.from, to: planned.to, rawSellerId: plannedRawSellerId });
     if (blocked) return { ok: false, status: blocked, adRows: [] };
   }
-  // Validated, right account, required source succeeded, window fully covered, every row in scope:
-  // an empty adRows here is GENUINE zero advertising and may be merged as real zero.
+  // ---- Mixed/unusable currency: Daily merges ad totals per (seller, day) WITHOUT converting
+  // currency, so more than one distinct currency across the rows would sum incomparable amounts.
+  // A single-account/single-marketplace Daily report must be one currency; mixed => block. ----
+  const currencies = new Set(adRows.map((row) => row.currency).filter((c) => c != null && String(c).trim() !== ""));
+  if (currencies.size > 1) return { ok: false, status: "ads-mixed-currency", adRows: [] };
+  // Validated, right account, required source succeeded, window fully covered, every row in scope,
+  // single currency: an empty adRows here is GENUINE zero advertising and may be merged as real zero.
   return { ok: true, status: "validated", adRows };
 }
 

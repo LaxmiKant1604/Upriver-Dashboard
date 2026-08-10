@@ -906,6 +906,64 @@ export async function getAdDailyMetrics(accountId, from, to) {
   return request(`/rest/v1/ad_daily_metrics?${query}`);
 }
 
+/* Durable successful Ads coverage windows (ads_sync_coverage), created by the additive migration
+ * supabase/migrations/20260810_ads_sync_coverage.sql. Both helpers are BEST-EFFORT: until that
+ * migration is applied the table is absent, so the read returns no windows (Daily Reporting then
+ * fails closed and blocks) and the write is a no-op (the Ads sync is never broken). Service-role
+ * only; the browser never calls these. Coverage is proven from SUCCESSFUL sync windows, not from the
+ * first/last returned metric row (a successfully-covered day can have zero ads and thus no row). */
+export async function getDailyAdsCoverage(accountId, sourceKey) {
+  let windows = [];
+  try {
+    const query = new URLSearchParams({
+      select: "covered_from,covered_to",
+      account_id: `eq.${accountId}`,
+      source_key: `eq.${sourceKey}`,
+      status: "eq.succeeded",
+      order: "covered_from.asc",
+    });
+    const rows = await request(`/rest/v1/ads_sync_coverage?${query}`);
+    windows = (rows || []).map((row) => ({ from: row.covered_from, to: row.covered_to }));
+  } catch { windows = []; }
+  let status = "missing";
+  let latestMetricDate = null;
+  try {
+    const query = new URLSearchParams({
+      select: "last_status,latest_metric_date",
+      account_id: `eq.${accountId}`,
+      source_key: `eq.${sourceKey}`,
+      limit: "1",
+    });
+    const state = await request(`/rest/v1/ads_sync_state?${query}`);
+    if (state && state[0]) {
+      status = state[0].last_status || "missing";
+      latestMetricDate = state[0].latest_metric_date || null;
+    }
+  } catch { /* leave defaults => Daily blocks fail-closed */ }
+  return { windows, status, latestMetricDate };
+}
+
+export async function recordAdsCoverageWindows(rows) {
+  const payload = (rows || [])
+    .filter((row) => row && row.accountId && row.sourceKey && row.coveredFrom && row.coveredTo)
+    .map((row) => ({
+      account_id: row.accountId,
+      source_key: row.sourceKey,
+      covered_from: row.coveredFrom,
+      covered_to: row.coveredTo,
+      status: "succeeded",
+      source_refreshed_at: row.sourceRefreshedAt || new Date().toISOString(),
+    }));
+  if (!payload.length) return;
+  try {
+    await request("/rest/v1/ads_sync_coverage?on_conflict=account_id,source_key,covered_from,covered_to", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: payload,
+    });
+  } catch { /* additive table may be unmigrated; never break the Ads sync */ }
+}
+
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
 // request, so this pages. If an account's window genuinely exceeds the budget
 // the caller throws rather than aggregating a partial window, because a
