@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ["test", "svc", "role", "key"].join("-");
@@ -791,6 +791,7 @@ const DR_ADS = [
 const DR_FROM = "2025-05-01", DR_TO = "2025-06-30";
 const adsCoverage = (over = {}) => ({
   accountId: "A1",
+  rawSellerId: "S1", // authoritative raw seller/vendor id (DR_ADS rows are all seller S1)
   requested: { from: DR_FROM, to: DR_TO },
   coverage: { from: DR_FROM, to: DR_TO },
   validated: true,
@@ -877,7 +878,7 @@ function seedDailyCycle() {
     src("daily-reporting:asin-day-superset", "h_may_c1", { sellerOrVendorIds: ["S2"], from: "2025-05-01", to: "2025-05-31" }),
     src("daily-reporting:asin-day-superset", "h_jun_c0", { from: "2025-06-01", to: "2025-06-30" }),
     src("daily-reporting:catalog", "h_cat"),
-  ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO } })];
+  ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO, rawSellerId: "S1" } })];
   // Ads are injected as a typed, validated coverage contract (Blocker 2), never a bare array.
   const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage() } : {});
   return { store, loader, plannedReports, loadDerivedContext };
@@ -1119,7 +1120,7 @@ test("B1 e2e: a loader injecting scope overrides cannot move the snapshot identi
 
 group("tranche-2 blocker 2: typed Ads coverage contract (missing != zero)");
 
-const planCov = { accountId: "A1", from: DR_FROM, to: DR_TO };
+const planCov = { accountId: "A1", rawSellerId: "S1", from: DR_FROM, to: DR_TO };
 
 test("B2 unit: validated + fully covered + right account = usable (genuine zero when adRows empty)", async () => {
   const full = evaluateDailyAdsCoverage(adsCoverage(), planCov);
@@ -1173,42 +1174,35 @@ test("B2 e2e: a failed/stale Ads coverage BLOCKS the Daily snapshot and preserve
 
 group("tranche-2 blocker 3: SKU P&L six-complete-calendar-month contract");
 
+// One monthly fragment: a full-month window + its single-account raw seller scope.
+const mw = (from, to, sid = "A1") => ({ from, to, sellerOrVendorIds: [sid] });
 const sixWindows = [
-  { from: "2025-01-01", to: "2025-01-31" }, { from: "2025-02-01", to: "2025-02-28" },
-  { from: "2025-03-01", to: "2025-03-31" }, { from: "2025-04-01", to: "2025-04-30" },
-  { from: "2025-05-01", to: "2025-05-31" }, { from: "2025-06-01", to: "2025-06-30" },
+  mw("2025-01-01", "2025-01-31"), mw("2025-02-01", "2025-02-28"),
+  mw("2025-03-01", "2025-03-31"), mw("2025-04-01", "2025-04-30"),
+  mw("2025-05-01", "2025-05-31"), mw("2025-06-01", "2025-06-30"),
 ];
 
-test("B3 unit: exactly six complete consecutive months matching context.from/to is accepted", async () => {
+test("B3 unit: exactly six complete consecutive single-account months matching context.from/to is accepted", async () => {
   const ok = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: sixWindows });
   assert.equal(ok.ok, true);
   assert.deepEqual(ok.months, ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]);
-  // Repeated chunks of the SAME month (identical window) are allowed (they sum in the fold).
-  const withChunks = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: [sixWindows[0], ...sixWindows] });
-  assert.equal(withChunks.ok, true);
+  assert.equal(ok.accountId, "A1");
 });
 
-test("B3 unit: missing / extra / duplicate-as-different-window / reordered / partial-month / gap all FAIL closed", async () => {
+test("B3 unit: missing / extra / reordered / partial-month / gap all FAIL closed", async () => {
   const bad = (windows, from = "2025-01-01", to = "2025-06-30") => validateSkuPlMonthlyWindows({ from, to, windows });
   assert.equal(bad(sixWindows.slice(0, 5)).ok, false, "five months (one missing) rejected");
-  assert.equal(bad([...sixWindows, { from: "2025-07-01", to: "2025-07-31" }]).ok, false, "seven months (extra) rejected");
-  // Same month with a DIFFERENT (overlapping) window.
-  assert.equal(bad([{ from: "2025-01-01", to: "2025-01-15" }, ...sixWindows.slice(1)]).ok, false, "partial first month rejected");
-  assert.equal(bad([{ from: "2025-01-05", to: "2025-01-31" }, ...sixWindows.slice(1)]).ok, false, "month not starting on the 1st rejected");
-  // Reordered months.
+  assert.equal(bad([...sixWindows, mw("2025-07-01", "2025-07-31")]).ok, false, "seven months (extra) rejected");
+  assert.equal(bad([mw("2025-01-01", "2025-01-15"), ...sixWindows.slice(1)]).ok, false, "partial first month rejected");
+  assert.equal(bad([mw("2025-01-05", "2025-01-31"), ...sixWindows.slice(1)]).ok, false, "month not starting on the 1st rejected");
   const reordered = [sixWindows[1], sixWindows[0], ...sixWindows.slice(2)];
   assert.equal(bad(reordered).ok, false, "reordered months rejected");
-  // A gap (skip Feb, include Jul) still six windows but not the context span.
-  const gap = [sixWindows[0], sixWindows[2], sixWindows[3], sixWindows[4], sixWindows[5], { from: "2025-07-01", to: "2025-07-31" }];
+  const gap = [sixWindows[0], sixWindows[2], sixWindows[3], sixWindows[4], sixWindows[5], mw("2025-07-01", "2025-07-31")];
   assert.equal(bad(gap).ok, false, "a gap (missing Feb) rejected");
-  // context.from/to not a six-month span, or not month boundaries.
   assert.equal(bad(sixWindows, "2025-01-01", "2025-05-31").ok, false, "context to is a 5-month span");
   assert.equal(bad(sixWindows, "2025-01-05", "2025-06-30").ok, false, "context from is not a month start");
-  // Malformed dates fail closed (never throw).
   assert.equal(validateSkuPlMonthlyWindows({ from: "2025-02-30", to: "2025-06-30", windows: sixWindows }).ok, false, "impossible context date");
-  assert.equal(bad([{ from: "2025-01-01", to: "2025-99-99" }, ...sixWindows.slice(1)]).ok, false, "impossible fragment date");
-  // Multiple accounts in the fragments (defense-in-depth).
-  assert.equal(validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: sixWindows, accountIds: ["A1", "A2"] }).ok, false, "multi-account fragments rejected");
+  assert.equal(bad([mw("2025-01-01", "2025-99-99"), ...sixWindows.slice(1)]).ok, false, "impossible fragment date");
 });
 
 // Build a valid six-month sku-pl cycle from SKU_BATCHES; overridable windows for the failure path.
@@ -1276,6 +1270,174 @@ test("B4 e2e: sku-pl fragments that span two accounts BLOCK derivation (defense-
   assert.equal(res.succeeded, 0, "multi-account fragments never fold into a snapshot");
   assert.equal(store._saveCalls, 0, "zero writes");
   assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
+});
+
+/* ===================== tranche-2 re-review findings (2026-08-10) ===================== */
+
+group("re-review F1: duplicate SKU month cannot double-count");
+
+test("F1 unit: a duplicated month fragment is REJECTED, never deduped; and folding it WOULD double-count", async () => {
+  // Seven fragments = six months + a duplicate January -> too many fragments.
+  const dup7 = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: [mw("2025-01-01", "2025-01-31"), ...sixWindows] });
+  assert.equal(dup7.ok, false); assert.equal(dup7.reason, "expected-exactly-six-single-account-fragments");
+  // Six fragments but January appears twice (identical window), March missing -> duplicate rejected.
+  const twoJan = [mw("2025-01-01", "2025-01-31"), mw("2025-01-01", "2025-01-31"), ...sixWindows.slice(1, 5)];
+  const dup6 = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: twoJan });
+  assert.equal(dup6.ok, false); assert.equal(dup6.reason, "duplicate-month-fragment");
+  // Proof the rejection MATTERS: skuPlFold sums every fragment, so a duplicate January doubles it.
+  const janRows = SKU_BATCHES[0].rows;
+  const once = skuPlFold([{ monthKey: "2025-01", rows: janRows }]).find((e) => e.currency === "USD" && e.sku === "SKU1");
+  const twice = skuPlFold([{ monthKey: "2025-01", rows: janRows }, { monthKey: "2025-01", rows: janRows }]).find((e) => e.currency === "USD" && e.sku === "SKU1");
+  assert.equal(twice.byMonth["2025-01"].sales, once.byMonth["2025-01"].sales * 2, "a folded duplicate January WOULD double sales");
+  assert.equal(twice.byMonth["2025-01"].profit, once.byMonth["2025-01"].profit * 2, "...and profit");
+  assert.equal(twice.byMonth["2025-01"].units, once.byMonth["2025-01"].units * 2, "...and units");
+});
+
+test("F1 unit: a fragment must carry exactly one seller id; empty / missing / multiple / cross-account rejected", async () => {
+  const swap = (i, ids) => sixWindows.map((w, j) => (j === i ? { from: w.from, to: w.to, sellerOrVendorIds: ids } : w));
+  const v = (windows) => validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows });
+  assert.equal(v(swap(2, [])).reason, "fragment-must-carry-exactly-one-seller-id", "empty seller array rejected (no accountIds:[] tolerance)");
+  assert.equal(v(swap(2, undefined)).reason, "fragment-must-carry-exactly-one-seller-id", "missing seller ids rejected");
+  assert.equal(v(swap(2, ["A1", "A2"])).reason, "fragment-must-carry-exactly-one-seller-id", "multiple seller ids in one fragment rejected");
+  assert.equal(v(swap(2, [""])).reason, "fragment-seller-id-missing", "blank seller id rejected");
+  assert.equal(v(swap(2, ["   "])).reason, "fragment-seller-id-missing", "whitespace seller id rejected");
+  // Each fragment valid singly, but two distinct accounts across fragments -> single-account violation.
+  assert.equal(v(sixWindows.map((w, j) => (j === 3 ? { ...w, sellerOrVendorIds: ["B2"] } : w))).reason, "multiple-or-missing-accounts");
+});
+
+test("F1 e2e: a duplicated-January source set BLOCKS the sku-pl snapshot (zero writes, last-known-good preserved)", async () => {
+  const store = makeMemoryReportStore();
+  const wins = [mw("2025-01-01", "2025-01-31"), ...sixWindows]; // 7 fragments (dup Jan)
+  const loaderMap = new Map();
+  const planned = wins.map((w, i) => { const h = "h_dup_" + i; store.seedSource(h, "succeeded"); loaderMap.set(h, []); return src("sku-pl:monthly-profit", h, { from: w.from, to: w.to, sellerOrVendorIds: ["A1"] }); });
+  const loader = makeCacheLoader(loaderMap);
+  store._snapshots.set("scheduler-v2/sku-pl|A1|ph_prev", { payload: { rows: [{ prior: true }], months: [], currencies: [], catalogBrands: [] } });
+  const saver = makeSnapshotSaver(store);
+  const plannedReports = [plan("sku-pl", "A1", planned, { context: { from: "2025-01-01", to: "2025-06-30" } })];
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(res.succeeded, 0);
+  assert.equal(store._saveCalls, 0, "zero Supabase writes for a duplicated-month set");
+  assert.notEqual(store._report("sku-pl", "A1").derive_status, "succeeded");
+  assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
+});
+
+group("re-review F2: Daily Ads rows validated against account + window");
+
+test("F2 unit: cross-account / out-of-window / bad-date / missing-seller / non-finite rows BLOCK (never filtered)", async () => {
+  const row = (over) => ({ date: "2025-05-10", seller_or_vendor_id: "S1", ad_sales: 1, ad_spend: 1, ad_clicks: 1, ...over });
+  const withRows = (rows) => evaluateDailyAdsCoverage(adsCoverage({ adRows: rows }), planCov);
+  assert.deepEqual(withRows([row({ seller_or_vendor_id: "S2" })]), { ok: false, status: "ads-row-cross-account", adRows: [] }, "account B row inside A envelope blocks");
+  assert.equal(withRows([row({ date: "2025-04-30" })]).status, "ads-row-out-of-window", "row before planned.from blocks");
+  assert.equal(withRows([row({ date: "2025-07-01" })]).status, "ads-row-out-of-window", "row after planned.to blocks");
+  assert.equal(withRows([row({ date: "2025-02-30" })]).status, "ads-row-bad-date", "impossible date blocks");
+  assert.equal(withRows([row({ date: "not-a-date" })]).status, "ads-row-bad-date", "malformed date blocks");
+  assert.equal(withRows([row({ seller_or_vendor_id: undefined })]).status, "ads-row-cross-account", "missing seller id blocks (not this account)");
+  assert.equal(withRows([row({ ad_spend: NaN })]).status, "ads-row-non-finite-metric", "NaN metric blocks");
+  assert.equal(withRows([row({ ad_sales: Infinity })]).status, "ads-row-non-finite-metric", "Infinity metric blocks");
+  assert.equal(withRows([row({ ad_clicks: "3" })]).status, "ads-row-non-finite-metric", "non-number metric blocks");
+  // One bad row among good rows blocks the WHOLE set (never silently filtered).
+  assert.equal(withRows([row(), row({ seller_or_vendor_id: "S2" })]).status, "ads-row-cross-account", "a single bad row blocks all");
+});
+
+test("F2 unit: correct primary rows, correct dd-secondary rows, and validated-covered empty are usable", async () => {
+  const primary = evaluateDailyAdsCoverage(adsCoverage(), planCov);
+  assert.equal(primary.ok, true); assert.deepEqual(primary.adRows, DR_ADS);
+  // dd-secondary: PUBLIC accountId "dd-secondary:XYZ" is DISTINCT from the RAW seller id "XYZ"; rows
+  // carry the RAW id. Organization isolation + public/raw separation preserved.
+  const secRows = [{ date: "2025-05-02", seller_or_vendor_id: "XYZ", ad_sales: 4, ad_spend: 2, ad_clicks: 1 }];
+  const secPlan = { accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", from: DR_FROM, to: DR_TO };
+  const sec = evaluateDailyAdsCoverage(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: secRows, latestMetricDate: "2025-05-02" }), secPlan);
+  assert.equal(sec.ok, true); assert.deepEqual(sec.adRows, secRows);
+  // A dd-secondary row tagged with the PUBLIC id (not the raw id) is cross-account -> block.
+  const wrongTag = evaluateDailyAdsCoverage(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: [{ ...secRows[0], seller_or_vendor_id: "dd-secondary:XYZ" }] }), secPlan);
+  assert.equal(wrongTag.ok, false); assert.equal(wrongTag.status, "ads-row-cross-account");
+  // Genuine zero: validated, covered, right account, no rows.
+  const zero = evaluateDailyAdsCoverage(adsCoverage({ adRows: [], latestMetricDate: null }), planCov);
+  assert.equal(zero.ok, true); assert.deepEqual(zero.adRows, []);
+});
+
+test("F2 unit: a missing planned rawSellerId, a rawSellerId mismatch, or a missing coverage.rawSellerId THROWS", async () => {
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage(), { accountId: "A1", from: DR_FROM, to: DR_TO }), /planned\.rawSellerId/);
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ rawSellerId: "OTHER" }), planCov), /rawSellerId does not match/);
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ rawSellerId: "" }), planCov), /rawSellerId must be a non-empty/);
+});
+
+test("F2 e2e: a cross-account or out-of-window Ads row BLOCKS the Daily snapshot (zero writes, last-known-good preserved)", async () => {
+  const badSets = [
+    [{ date: "2025-05-01", seller_or_vendor_id: "S2", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // account B leaked into A
+    [{ date: "2025-04-01", seller_or_vendor_id: "S1", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // before the planned window
+  ];
+  for (const badRows of badSets) {
+    const { store, loader, plannedReports } = seedDailyCycle();
+    store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
+    const saver = makeSnapshotSaver(store);
+    const badLoader = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage({ adRows: badRows }) } : {});
+    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext: badLoader });
+    assert.equal(res.succeeded, 0, "a bad Ads row never yields a snapshot: " + JSON.stringify(badRows[0]));
+    assert.equal(store._saveCalls, 0, "zero Supabase writes");
+    assert.equal(store._report("daily-reporting", "A1").error_code, "DERIVE_INVALID");
+    assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "previous snapshot preserved");
+  }
+});
+
+group("re-review F3: pure derivation import boundary is real (transitive)");
+
+test("F3 unit: date-window leaf matches the datadoe re-exports (same functions; pinned/leap/month-end/invalid cases)", async () => {
+  const dw = await import("../lib/server/date-windows.js");
+  const dd = await import("../lib/server/datadoe.js");
+  // Same function objects -> no duplicated algorithm; route behavior is byte-for-byte unchanged.
+  assert.equal(dw.addDaysStr, dd.addDaysStr);
+  assert.equal(dw.splitDateRangeByMonth, dd.splitDateRangeByMonth);
+  assert.equal(dw.isFullCalendarMonthWindow, dd.isFullCalendarMonthWindow);
+  assert.deepEqual(dw.splitDateRangeByMonth("2025-01-15", "2025-03-10"), [
+    { from: "2025-01-15", to: "2025-01-31" }, { from: "2025-02-01", to: "2025-02-28" }, { from: "2025-03-01", to: "2025-03-10" },
+  ]);
+  assert.deepEqual(dw.splitDateRangeByMonth("2024-02-01", "2024-02-29"), [{ from: "2024-02-01", to: "2024-02-29" }]);
+  assert.equal(dw.isFullCalendarMonthWindow({ from: "2024-02-01", to: "2024-02-29" }), true, "leap Feb full month");
+  assert.equal(dw.isFullCalendarMonthWindow({ from: "2023-02-01", to: "2023-02-28" }), true, "non-leap Feb full month");
+  assert.equal(dw.isFullCalendarMonthWindow({ from: "2024-02-01", to: "2024-02-28" }), false, "leap Feb ending on the 28th is NOT full");
+  assert.equal(dw.isFullCalendarMonthWindow({ from: "2025-04-01", to: "2025-04-30" }), true);
+  assert.equal(dw.isFullCalendarMonthWindow({ from: "2025-04-01", to: "2025-04-31" }), false, "April has no 31st");
+  assert.equal(dw.addDaysStr("2024-02-28", 1), "2024-02-29");
+  assert.equal(dw.addDaysStr("2023-02-28", 1), "2023-03-01");
+  assert.equal(dw.addDaysStr("2025-12-31", 1), "2026-01-01");
+});
+
+test("F3 unit: derivation graph has NO transitive transport/storage import (fails if one is ever added)", async () => {
+  const LIBROOT = join(HERE, "..", "lib");
+  const entryFiles = [
+    "server/sync/report-worker.js", "server/sync/report-derivation.js",
+    "server/reports/derivation-core.js", "server/sync/report-source-contracts.js",
+  ].map((r) => join(LIBROOT, r));
+  const forbiddenFile = /[\\/](datadoe|supabase)\.js$/;
+  const forbiddenCall = /\b(createExport|pollExport|downloadExport|fetchExportRows|fetchExportRowsStrict)\s*\(/;
+  // Strip block + line comments so a doc-comment MENTION of a transport function is not mistaken
+  // for a real call (the `://` guard keeps URLs intact). Import/export scanning runs on the raw
+  // text (line-anchored), so stripping does not affect the import graph.
+  const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/([^:])\/\/.*$/gm, "$1").replace(/^\/\/.*$/gm, "");
+  // Match relative .js specifiers on import/export STATEMENTS (line-anchored so a "from" inside a
+  // string literal cannot be mistaken for an import). Covers multi-line imports ([^;] spans newlines).
+  const specRe = /^\s*(?:import|export)\b[^;]*?\bfrom\s*["'](\.[^"']+\.js)["']/gm;
+  const bareRe = /^\s*import\s*["'](\.[^"']+\.js)["']/gm;
+  const visited = new Set();
+  const walk = (file) => {
+    if (visited.has(file)) return;
+    visited.add(file);
+    const text = readFileSync(file, "utf8");
+    assert.ok(!forbiddenCall.test(stripComments(text)), file + " must not call a DataDoe transport function");
+    const specs = [...text.matchAll(specRe)].map((m) => m[1]).concat([...text.matchAll(bareRe)].map((m) => m[1]));
+    for (const spec of specs) {
+      const resolved = resolve(dirname(file), spec);
+      assert.ok(!forbiddenFile.test(resolved), file + " transitively imports forbidden transport/storage: " + spec);
+      walk(resolved);
+    }
+  };
+  for (const f of entryFiles) walk(f);
+  // Guard against a regex that silently matches nothing: the walk MUST reach the real leaves.
+  const reached = (name) => [...visited].some((f) => f.endsWith(name));
+  assert.ok(reached("date-windows.js"), "walk reached the date-window leaf");
+  assert.ok(reached("report-source-contracts.js") && reached("derivation-core.js") && reached("planner.js"), "walk reached the derivation deps");
+  assert.ok(reached("source-identity.js") && reached("id-batching.js"), "walk reached contracts' own deps");
 });
 
 /* ---- run the async suite with NO top-level await; deterministic natural exit ---- */

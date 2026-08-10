@@ -60,8 +60,8 @@ function toDateOnly(value) {
 // and the snapshot key is computed from it, so a derived override here would let injected data
 // diverge from what the snapshot claims. Enforced in buildDeriveContext (defense-in-depth).
 const RESERVED_CONTEXT_KEYS = new Set([
-  "accountId", "account", "brand", "from", "to", "params", "version", "reportVersion", "retrievedAt",
-  "context", "sources",
+  "accountId", "account", "rawSellerId", "brand", "from", "to", "params", "version", "reportVersion",
+  "retrievedAt", "context", "sources",
 ]);
 
 /**

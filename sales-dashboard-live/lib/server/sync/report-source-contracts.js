@@ -32,9 +32,11 @@ import { sourceContractForKey } from "../source-contracts.js";
 import { chunkAccountIds } from "../id-batching.js";
 // addDaysStr for the derived Sales Movers windows; the strict calendar-month helpers
 // (splitDateRangeByMonth / isFullCalendarMonthWindow) are the SAME helpers the production
-// SKU P&L route uses (api/datadoe.js), reused here so the scheduler enforces an identical
-// six-complete-calendar-month contract with no weaker duplicate validation.
-import { addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "../datadoe.js";
+// SKU P&L route uses, reused here so the scheduler enforces an identical
+// six-complete-calendar-month contract with no weaker duplicate validation. These come from the
+// dependency-free ../date-windows.js leaf (NOT ../datadoe.js) so this module -- and therefore the
+// pure report-derivation graph -- never transitively imports DataDoe transport or Supabase.
+import { addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "../date-windows.js";
 
 /* ---- constants transcribed verbatim from api/datadoe.js (parity-tested) ---- */
 
@@ -984,7 +986,9 @@ export function isValidCalendarDate(value) {
  * from a live Ads export) and this function decides whether it is a trustworthy basis:
  *
  *   coverage = {
- *     accountId,                 // the account the persisted Ads state is for
+ *     accountId,                 // the PUBLIC account id the persisted Ads state is for
+ *     rawSellerId,               // the authoritative RAW seller/vendor id (partition key for rows);
+ *                                //   distinct from accountId (dd-secondary public id = "dd-secondary:<raw>")
  *     requested: { from, to },   // the window the loader was asked to cover (echoed; cross-checked)
  *     coverage:  { from, to },   // the window the persisted state actually validated (null = none)
  *     validated,                 // was the persisted Ads state validated this cycle?
@@ -993,12 +997,19 @@ export function isValidCalendarDate(value) {
  *     adRows,                    // the persisted Ads rows for the window (array; [] is legal)
  *   }
  *
+ * `planned` is the AUTHORITATIVE scope from the plan: { accountId, rawSellerId, from, to }. The
+ * envelope being valid is NOT enough (re-review finding 2): before returning ok:true, EVERY row is
+ * validated against the planned account/window -- each row must be a plain object with a real date
+ * INSIDE [from,to], `seller_or_vendor_id` EQUAL to the authoritative rawSellerId, and finite ad
+ * metrics. A single cross-account / out-of-window / malformed / non-finite row BLOCKS the entire
+ * snapshot (never silently filtered into a partial save).
+ *
  * Returns { ok, status, adRows }. `ok:true` (status "validated") ONLY when the state is validated,
- * for the RIGHT account, its required source succeeded, and the validated coverage window fully
- * spans the PLANNED (authoritative) requested window -- then an empty adRows is genuine zero. Any
- * other case returns ok:false with a typed status the caller turns into a block (last-known-good
- * preserved, snapshot not overwritten). A structurally malformed contract, or one built for a
- * DIFFERENT window than the planned one, THROWS (fail closed) -- it is a wiring error, not data.
+ * for the RIGHT account, its required source succeeded, the coverage window fully spans the PLANNED
+ * requested window, AND every row passes -- then an empty adRows is genuine zero. Any other case
+ * returns ok:false with a typed status the caller turns into a block (last-known-good preserved).
+ * A structurally malformed contract, a window mismatch, or a rawSellerId mismatch THROWS (fail
+ * closed) -- it is a wiring error, not data.
  */
 const ADS_REQUIRED_SOURCE_STATUSES = new Set(["succeeded", "failed", "skipped", "pending", "missing"]);
 
@@ -1008,17 +1019,46 @@ function assertCoverageDateOrNull(value, label) {
   }
 }
 
+// A present ad metric must be a finite number. Absent (null/undefined) is allowed -- the merge
+// coerces it to 0 exactly like the production route -- but a present non-finite / non-number value
+// (NaN, Infinity, a string, an object) is corrupt data and must block, never be coerced to 0.
+function adMetricOk(value) {
+  return value == null || (typeof value === "number" && Number.isFinite(value));
+}
+
+// Per-row scope validation (finding 2). Returns a typed block status, or null when the row is safe.
+// A row must be a plain object, dated with a REAL calendar date INSIDE the planned window, tagged
+// with the AUTHORITATIVE raw seller/vendor id, and carry only finite ad metrics.
+function adRowBlockStatus(row, { from, to, rawSellerId }) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return "ads-row-malformed";
+  if (!isValidCalendarDate(row.date)) return "ads-row-bad-date";
+  if (row.date < from || row.date > to) return "ads-row-out-of-window";
+  if (String(row.seller_or_vendor_id) !== rawSellerId) return "ads-row-cross-account";
+  if (!adMetricOk(row.ad_sales_sum ?? row.ad_sales)) return "ads-row-non-finite-metric";
+  if (!adMetricOk(row.ad_spend_sum ?? row.ad_spend)) return "ads-row-non-finite-metric";
+  if (!adMetricOk(row.ad_clicks_sum ?? row.ad_clicks)) return "ads-row-non-finite-metric";
+  return null;
+}
+
 export function evaluateDailyAdsCoverage(coverage, planned) {
   if (!planned || typeof planned !== "object"
     || !isValidCalendarDate(planned.from) || !isValidCalendarDate(planned.to) || planned.from > planned.to) {
-    throw new Error("evaluateDailyAdsCoverage requires a planned { accountId, from<=to } window (real calendar dates).");
+    throw new Error("evaluateDailyAdsCoverage requires a planned { accountId, rawSellerId, from<=to } window (real calendar dates).");
   }
+  // The authoritative RAW seller/vendor id must come from the plan (resolveDataDoeAccountIds), not
+  // the coverage envelope -- it is the partition key every row is checked against. A missing one is
+  // a planner wiring error, not data: fail closed.
+  if (typeof planned.rawSellerId !== "string" || !planned.rawSellerId.trim()) {
+    throw new Error("evaluateDailyAdsCoverage requires an authoritative planned.rawSellerId (raw seller/vendor id).");
+  }
+  const plannedRawSellerId = planned.rawSellerId.trim();
   if (coverage == null || typeof coverage !== "object" || Array.isArray(coverage)) {
     throw new Error("Ads coverage must be a typed object (never a bare array/null); a missing load is not zero ads.");
   }
-  const { accountId, requested, coverage: cov, validated, latestMetricDate, requiredSourceStatus, adRows } = coverage;
+  const { accountId, rawSellerId, requested, coverage: cov, validated, latestMetricDate, requiredSourceStatus, adRows } = coverage;
   // ---- structural validation (fail closed on anything malformed) ----
   if (typeof accountId !== "string" || !accountId) throw new Error("Ads coverage.accountId must be a non-empty string.");
+  if (typeof rawSellerId !== "string" || !rawSellerId.trim()) throw new Error("Ads coverage.rawSellerId must be a non-empty string.");
   if (!requested || typeof requested !== "object") throw new Error("Ads coverage.requested must be a { from, to } object.");
   assertCoverageDateOrNull(requested.from, "requested.from");
   assertCoverageDateOrNull(requested.to, "requested.to");
@@ -1036,6 +1076,12 @@ export function evaluateDailyAdsCoverage(coverage, planned) {
   if (requested.from !== planned.from || requested.to !== planned.to) {
     throw new Error("Ads coverage.requested window does not match the planned Daily window (planned scope is authoritative).");
   }
+  // The contract's raw seller id must equal the AUTHORITATIVE planned raw seller id; a mismatch is a
+  // wiring bug (the plan resolves the account -> raw id, not the envelope). This ties row validation
+  // below to the plan, so a loader cannot self-declare another account's raw id to admit its rows.
+  if (rawSellerId.trim() !== plannedRawSellerId) {
+    throw new Error("Ads coverage.rawSellerId does not match the authoritative planned raw seller/vendor id.");
+  }
   // ---- typed classification (each non-ok status BLOCKS; genuine zero is the only empty pass) ----
   if (accountId !== planned.accountId) return { ok: false, status: "wrong-account", adRows: [] };
   if (requiredSourceStatus === "failed" || requiredSourceStatus === "skipped") return { ok: false, status: "failed", adRows: [] };
@@ -1050,29 +1096,40 @@ export function evaluateDailyAdsCoverage(coverage, planned) {
       return { ok: false, status: "stale", adRows: [] };
     }
   }
-  // Validated, right account, required source succeeded, window fully covered: an empty adRows here
-  // is GENUINE zero advertising and may be merged as real zero.
+  // ---- ROW-LEVEL validation (finding 2): a valid envelope is not enough. EVERY row must belong to
+  // this account's raw seller id and fall inside the planned window, with finite metrics. One bad
+  // row BLOCKS the whole snapshot -- rows are NEVER silently filtered into a partial save. ----
+  for (const row of adRows) {
+    const blocked = adRowBlockStatus(row, { from: planned.from, to: planned.to, rawSellerId: plannedRawSellerId });
+    if (blocked) return { ok: false, status: blocked, adRows: [] };
+  }
+  // Validated, right account, required source succeeded, window fully covered, every row in scope:
+  // an empty adRows here is GENUINE zero advertising and may be merged as real zero.
   return { ok: true, status: "validated", adRows };
 }
 
 /* ===================== SKU P&L: strict six-complete-calendar-month contract =====================
- * The production sku-pl route (api/datadoe.js) requires exactly ONE account and exactly SIX
- * complete calendar months (`windows.length !== 6 || windows.some(w => !isFullCalendarMonthWindow(w))`).
- * The scheduler adapter must enforce the SAME contract before saving a snapshot, reusing the SAME
- * strict calendar helpers (splitDateRangeByMonth / isFullCalendarMonthWindow) rather than a weaker
- * duplicate. Given the planned window (context.from/to) and the actual monthly fragment windows,
- * this returns { ok, reason } and NEVER throws on data (malformed dates fail closed to ok:false):
- *   - context.from/to must be real calendar dates spanning exactly six complete consecutive months
- *     (splitDateRangeByMonth is consecutive by construction; requiring all six to be full calendar
- *     months forces from=first-month-start and to=last-month-end);
- *   - every fragment window must itself be a full calendar month with a valid from<=to;
- *   - the DISTINCT fragment months (first-appearance order) must equal the six expected months in
- *     order -- rejecting a missing, extra, duplicated-as-different-window, overlapping, or reordered
- *     month. Repeated chunks of the SAME month (identical window) are allowed (they sum in the fold);
- *   - optionally, the fragments must not span more than one account (defense-in-depth; the resolver
- *     already forbids multi-account source jobs for sku-pl).
+ * The production sku-pl route requires exactly ONE account and exactly SIX complete calendar
+ * months. sku-pl is now a SINGLE-ACCOUNT scheduler contract (REPORT_SOURCE_SCOPE), so there is no
+ * legitimate second five-ID chunk for the same month: there must be EXACTLY six monthly fragments,
+ * one per expected month, each carrying exactly one seller/vendor id, all for the same account.
+ *
+ * Re-review finding 1: the previous version DEDUPED repeated identical month windows and tolerated
+ * an empty account scope. `skuPlFold` then summed EVERY fragment, so a duplicated January doubled
+ * January's sales/profit/units. This version does NOT dedupe -- it REJECTS a duplicate month and
+ * requires a validated single-account seller scope before folding.
+ *
+ * `windows`: one entry per monthly fragment, each `{ from, to, sellerOrVendorIds }`. Returns
+ * `{ ok, reason }` and NEVER throws on data (malformed fails closed to ok:false). Enforces:
+ *   - context.from/to real calendar dates spanning exactly six complete consecutive months
+ *     (from = first month start, to = sixth month end);
+ *   - EXACTLY six fragments (no extra, no missing, no duplicate chunk);
+ *   - each fragment carries EXACTLY one seller/vendor id (missing/empty/multiple => reject);
+ *   - all fragments share ONE distinct account id (no cross-account fold);
+ *   - each fragment window is a full calendar month; the six windows are the six expected months
+ *     in order with NO duplicate/overlapping/reordered/partial month.
  */
-export function validateSkuPlMonthlyWindows({ from, to, windows, accountIds } = {}) {
+export function validateSkuPlMonthlyWindows({ from, to, windows } = {}) {
   if (!isValidCalendarDate(from) || !isValidCalendarDate(to) || from > to) {
     return { ok: false, reason: "invalid-context-window" };
   }
@@ -1083,37 +1140,41 @@ export function validateSkuPlMonthlyWindows({ from, to, windows, accountIds } = 
   if (!Array.isArray(windows) || windows.length === 0) {
     return { ok: false, reason: "no-monthly-fragments" };
   }
-  // Defense-in-depth single-account check: reject fragments that provably span >1 account.
-  if (Array.isArray(accountIds)) {
-    const distinct = new Set(accountIds.map((id) => String(id)).filter(Boolean));
-    if (distinct.size > 1) return { ok: false, reason: "multiple-accounts" };
-  }
+  // Single-account sku-pl: exactly one fragment per expected month => exactly six fragments. More
+  // (a duplicate chunk) or fewer (a missing month) is rejected -- never deduped -- so the fold can
+  // never double-count.
+  if (windows.length !== 6) return { ok: false, reason: "expected-exactly-six-single-account-fragments" };
+
+  const accounts = new Set();
   const byMonth = new Map(); // monthKey -> { from, to }
   const orderedKeys = [];
   for (const w of windows) {
-    if (!w || !isValidCalendarDate(w.from) || !isValidCalendarDate(w.to)) {
-      return { ok: false, reason: "malformed-fragment-window" };
-    }
+    if (!w || typeof w !== "object" || Array.isArray(w)) return { ok: false, reason: "malformed-fragment" };
+    // Each fragment must carry EXACTLY one non-empty seller/vendor id (missing/empty/multiple =>
+    // reject). This is the raw account partition key; sku-pl grouped rows do not carry it, so a
+    // multi-id fragment could not be attributed and must never fold.
+    const ids = w.sellerOrVendorIds;
+    if (!Array.isArray(ids) || ids.length !== 1) return { ok: false, reason: "fragment-must-carry-exactly-one-seller-id" };
+    const sellerId = typeof ids[0] === "string" ? ids[0].trim() : "";
+    if (!sellerId) return { ok: false, reason: "fragment-seller-id-missing" };
+    accounts.add(sellerId);
+    if (!isValidCalendarDate(w.from) || !isValidCalendarDate(w.to)) return { ok: false, reason: "malformed-fragment-window" };
     if (!isFullCalendarMonthWindow(w)) return { ok: false, reason: "fragment-not-full-calendar-month" };
     const monthKey = w.from.slice(0, 7);
-    if (byMonth.has(monthKey)) {
-      const prev = byMonth.get(monthKey);
-      // A repeated chunk of the same month must carry the IDENTICAL window; a different window for
-      // the same month is an overlapping/inconsistent fragment.
-      if (prev.from !== w.from || prev.to !== w.to) return { ok: false, reason: "inconsistent-month-window" };
-    } else {
-      byMonth.set(monthKey, { from: w.from, to: w.to });
-      orderedKeys.push(monthKey);
-    }
+    if (byMonth.has(monthKey)) return { ok: false, reason: "duplicate-month-fragment" }; // NEVER dedupe
+    byMonth.set(monthKey, { from: w.from, to: w.to });
+    orderedKeys.push(monthKey);
   }
+  // One account across all fragments (empty/missing scope is already rejected per-fragment above).
+  if (accounts.size !== 1) return { ok: false, reason: "multiple-or-missing-accounts" };
+
   const expectedKeys = expected.map((w) => w.from.slice(0, 7));
-  if (orderedKeys.length !== expectedKeys.length) return { ok: false, reason: "month-count-mismatch" };
   for (let i = 0; i < expectedKeys.length; i += 1) {
     if (orderedKeys[i] !== expectedKeys[i]) return { ok: false, reason: "month-set-or-order-mismatch" };
     const got = byMonth.get(orderedKeys[i]);
     if (got.from !== expected[i].from || got.to !== expected[i].to) return { ok: false, reason: "window-boundary-mismatch" };
   }
-  return { ok: true, reason: null, months: expectedKeys };
+  return { ok: true, reason: null, months: expectedKeys, accountId: [...accounts][0] };
 }
 
 export function validateStagedSignal(signal) {

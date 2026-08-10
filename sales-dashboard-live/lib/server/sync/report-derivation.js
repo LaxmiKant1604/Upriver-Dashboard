@@ -139,6 +139,7 @@ const REGISTRY = {
       // with an empty adRows) is treated as GENUINE zero advertising.
       const verdict = evaluateDailyAdsCoverage(context.adsCoverage, {
         accountId: context.accountId ?? null,
+        rawSellerId: context.rawSellerId ?? null,
         from: context.from ?? null,
         to: context.to ?? null,
       });
@@ -166,11 +167,12 @@ const REGISTRY = {
       // last month end), one account, no missing/duplicate/overlapping/reordered/extra month --
       // reusing the SAME strict calendar helpers the route uses (no weaker duplicate). A violation
       // BLOCKS the snapshot (throws -> derive-invalid -> last-known-good preserved, zero writes).
+      // Each fragment carries its own single-account seller scope so the validator can reject a
+      // duplicate month, a multi-seller fragment, or a missing seller id BEFORE the fold (finding 1).
       const check = validateSkuPlMonthlyWindows({
         from: context.from ?? null,
         to: context.to ?? null,
-        windows: fragments.map((f) => ({ from: f.from, to: f.to })),
-        accountIds: fragments.flatMap((f) => f.sellerOrVendorIds || []),
+        windows: fragments.map((f) => ({ from: f.from, to: f.to, sellerOrVendorIds: f.sellerOrVendorIds })),
       });
       if (!check.ok) {
         throw new Error(`sku-pl six-complete-calendar-month contract violated (${check.reason}); snapshot blocked.`);
