@@ -30,9 +30,9 @@ const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + 
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 // Assigned in main() after the dummy env is set.
-let assembleSources, deriveReportSnapshot;
+let assembleSources, deriveReportSnapshot, runReportJobs;
 let fbaPlanPayload, foldPlanAsinUnits;
-let planMonthWindows, planFbaPlan;
+let planMonthWindows, addDaysStr, planFbaPlan;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -80,6 +80,44 @@ function fbaPlanned({ unitRowsByIdx = [[], [], [], []], dailyRows = [], catalogR
 const usContext = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true, ...over });
 const deriveFba = (planned, rows, context = usContext(), statusOverride) =>
   deriveReportSnapshot({ reportKey: "fba-plan", sources: buildSources(planned, rows, statusOverride), context });
+
+// A compact report-store double for the report worker (runReportJobs): all source deps are seeded
+// succeeded, so the FETCH gate passes and the DERIVE stage is exercised. Tracks snapshot save calls
+// so a test can prove a bad derive writes ZERO snapshots and never overwrites a seeded last-known-good.
+function makeReportStore() {
+  const reportJobs = new Map();
+  const snapshots = new Map();
+  const sourceJobs = [];
+  const key = (rk, a) => rk + "|" + a;
+  return {
+    _snapshots: snapshots,
+    saveCalls: 0,
+    seedSourceSucceeded(hash) { sourceJobs.push({ request_hash: hash, fetch_status: "succeeded" }); },
+    seedSnapshot(reportKey, accountId, payload) { snapshots.set(key(reportKey, accountId), { payload }); },
+    report(rk, a) { return reportJobs.get(key(rk, a)); },
+    listSourceJobs() { return sourceJobs.map((j) => ({ ...j })); },
+    upsertReportJob({ reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) {
+      const k = key(reportKey, accountId);
+      if (reportJobs.has(k)) return;
+      reportJobs.set(k, { report_key: reportKey, account_id: accountId, connection_id: connectionId, bucket, report_version: reportVersion, depends_on: dependsOn || [], fetch_status: "pending", derive_status: "pending", save_status: "pending", validated: false });
+    },
+    listReportJobs() { return [...reportJobs.values()].map((j) => ({ ...j })); },
+    claimReportDerive(_c, rk, a) { const j = reportJobs.get(key(rk, a)); if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; } return false; },
+    recordReportBlocked({ reportKey, accountId }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); },
+    recordReportFailure({ reportKey, accountId, stage, code }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); },
+    recordReportSuccess({ reportKey, accountId }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true }); },
+  };
+}
+
+// Build a planned report + a seeded store for the worker, from fbaPlanned() fragments.
+function fbaReportPlan(planned, rows) {
+  const store = makeReportStore();
+  for (const p of planned) store.seedSourceSucceeded(p.requestHash);
+  const sources = planned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-1", sources, context: usContext() };
+  const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
+  return { store, plannedReport, sourceRows };
+}
 
 // ---- shared parity fixture (a US account with sales, inventory + AWD) ----
 const UNITS = [
@@ -346,14 +384,84 @@ test("foldPlanAsinUnits: sums grouped child_asin units in first-seen order", () 
   assert.deepEqual([...m.entries()], [["B", 7], ["A", 3]]);
 });
 
+/* ============================= exact inventory + AWD window pinning (Blocker 2) ============================= */
+
+group("fba-plan: exact inventory + AWD window pinning");
+
+test("fba-plan: the canonical inventory window IS addDaysStr(asOf,-10)..asOf and AWD is null/null", () => {
+  assert.equal(INV_WINDOW.from, addDaysStr(ASOF, -10));
+  assert.equal(INV_WINDOW.to, ASOF);
+});
+
+test("fba-plan: a SHORTENED inventory lookback (from > asOf-10) blocks; payload null", () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) };
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "invalid");
+  assert.equal(res.payload, null);
+});
+
+test("fba-plan: an EXTENDED inventory lookback (from < asOf-10) blocks", () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -11) };
+  assert.equal(deriveFba(planned, rows).status, "invalid");
+});
+
+test("fba-plan: a wrong inventory `to` (!= asOf) blocks", () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
+  planned[idx] = { ...planned[idx], to: addDaysStr(ASOF, -1) };
+  assert.equal(deriveFba(planned, rows).status, "invalid");
+});
+
+test("fba-plan: a DATED AWD fragment (from/to not null) blocks; payload null", () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:awd");
+  planned[idx] = { ...planned[idx], from: "2025-08-01", to: ASOF };
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "invalid");
+  assert.equal(res.payload, null);
+});
+
+test("fba-plan: EXACT canonical windows still derive the identical payload", () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  assert.deepEqual(deriveFba(planned, rows).payload, EXPECTED);
+});
+
+test("planFbaPlan emits the canonical inventory (asOf-10..asOf) + no-date AWD windows the derivation requires", () => {
+  const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
+  const inv = req.sources.find((s) => s.requestKey === "fba-plan:inventory-health");
+  assert.equal(inv.from, addDaysStr(ASOF, -10));
+  assert.equal(inv.to, ASOF);
+  const awd = req.sources.find((s) => s.requestKey === "fba-plan:awd");
+  assert.equal(awd.from, null);
+  assert.equal(awd.to, null);
+});
+
+test("fba-plan worker: a shortened-inventory derive writes ZERO snapshots and preserves last-known-good", async () => {
+  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // shortened -> derive invalid before save
+  const { store, plannedReport, sourceRows } = fbaReportPlan(planned, rows);
+  const LKG = { asOf: "2025-07-01", rows: [{ asin: "PRIOR" }] };
+  store.seedSnapshot("scheduler-v2/fba-plan", ID, LKG); // prior good (shadow-namespaced) snapshot
+  const saveSnapshot = async () => { store.saveCalls += 1; return { paramsHash: "ph" }; };
+  await runReportJobs({ store, cycleId: "cyc1", sourceRows, saveSnapshot, plannedReports: [plannedReport] });
+  assert.equal(store.saveCalls, 0, "no snapshot saved for the blocked derive");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/fba-plan|" + ID).payload, LKG, "last-known-good snapshot unchanged/readable");
+  assert.equal(store.report("fba-plan", ID).derive_status, "failed", "report recorded a derive failure (terminal this cycle)");
+});
+
 /* ============================= run ============================= */
 
 async function main() {
   mark("main(): loading fba-plan modules");
-  ({ assembleSources } = await import("../lib/server/sync/report-worker.js"));
+  ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
-  ({ planMonthWindows } = await import("../lib/server/date-windows.js"));
+  ({ planMonthWindows, addDaysStr } = await import("../lib/server/date-windows.js"));
   ({ planFbaPlan } = await import("../lib/server/sync/report-planner.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
