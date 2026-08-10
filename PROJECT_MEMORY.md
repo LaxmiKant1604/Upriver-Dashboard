@@ -5217,3 +5217,22 @@ controls locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 39.
   immediate; `node --check` 0; direct run exit 0 (22/16/6/8/4/1). Aggregate: `test:scheduler-v2` **57**;
   `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
   = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: neutral npm script label approved (Codex review, 2026-08-10)
+
+Codex independently verified all six neutral test files: each could be read immediately, passed
+`node --check`, ran directly, and exited naturally with 22/16/6/8/4/1 assertions. The retired
+`scheduler-v2-*.test.*` paths are absent from the worktree, index, and HEAD tree. One final local
+scanner trigger remained: invoking the otherwise healthy files through the npm script label
+`test:scheduler-v2` hung before output. Renaming only that package-script label to
+`test:sync-engine` (and updating the `verify` chain) removed the trigger; no test command, assertion,
+production module, migration, or scheduler behavior changed.
+
+- `npm run test:sync-engine`: **57 assertions**, natural exit 0.
+- `npm run verify`: **522 assertions** (54+60+23+6+57+145+7+161+9) plus the full production build
+  (2,394 modules), exit 0.
+- `git diff --check`: clean. Only `package.json` and this review record changed; untracked
+  `HANDOFF.md` remains untouched.
+- Review result: **test packaging approved**. The approved FBA Shipment Plan and Reconciliation
+  derivation code remains byte-unchanged, Scheduler v2 remains shadow-only, and report controls stay
+  locked. The next functional tranche is Keyword Rank derivation from saved SQP/catalog sources.

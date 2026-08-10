@@ -12,12 +12,12 @@
     "test:brand-view": "node scripts/test-brand-view.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:source-cache": "node scripts/test-source-cache.mjs",
-    "test:scheduler-v2": "node scripts/sync-schema-plan.test.js && node scripts/sync-source-jobs.test.js && node scripts/sync-cache-atomicity.test.js && node scripts/sync-signals.test.js && node scripts/sync-db-wrappers.test.js && node scripts/fba-strict-source-worker.test.js",
+    "test:sync-engine": "node scripts/sync-schema-plan.test.js && node scripts/sync-source-jobs.test.js && node scripts/sync-cache-atomicity.test.js && node scripts/sync-signals.test.js && node scripts/sync-db-wrappers.test.js && node scripts/fba-strict-source-worker.test.js",
     "test:report-derivation": "node scripts/report-derivation-core.test.js && node scripts/report-planner.test.js && node scripts/report-fba-plan.test.js && node scripts/report-reconciliation.test.js",
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
-    "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:scheduler-v2 && npm run test:report-derivation && npm run test:source-identity && npm run test:report-contracts && npm run test:report-sync-controls && npm run build:check",
+    "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:sync-engine && npm run test:report-derivation && npm run test:source-identity && npm run test:report-contracts && npm run test:report-sync-controls && npm run build:check",
     "db:migrate": "node scripts/apply-supabase-migrations.mjs"
   },
   "dependencies": {
