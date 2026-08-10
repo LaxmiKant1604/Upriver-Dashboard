@@ -43,3 +43,42 @@ export function isFullCalendarMonthWindow(window) {
   return window.from === `${year}-${pad2s(month)}-01`
     && window.to === `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
 }
+
+// First day of the month a date falls in ("2026-08-10" -> "2026-08-01").
+export function monthStartStr(dateStr) {
+  return `${String(dateStr).slice(0, 7)}-01`;
+}
+
+// Local strict UTC calendar-date check (kept private so this leaf exports no helper that could
+// drift from report-source-contracts.isValidCalendarDate). An impossible/malformed date is rejected.
+function isRealDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const dt = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === value;
+}
+
+/**
+ * The six most recent COMPLETE calendar months as of `asOf` (a real YYYY-MM-DD), for the SKU P&L
+ * scheduler window. "Complete" means the month's final day is on or before `asOf` (an in-progress
+ * current month is excluded). Returns { from, to, months: [{from,to}] } where months are six
+ * consecutive full calendar months, `from` = first day of month one, `to` = last day of month six.
+ * Returns null for a malformed `asOf`. Pure/UTC; no I/O. The result satisfies
+ * validateSkuPlMonthlyWindows by construction.
+ */
+export function sixCompleteCalendarMonths(asOf) {
+  if (!isRealDate(asOf)) return null;
+  const [year, month] = asOf.slice(0, 7).split("-").map(Number);
+  const monthEnd = `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
+  // Last complete month = asOf's month when its end has passed, else the previous month.
+  let ly = year, lm = month;
+  if (monthEnd > asOf) { lm -= 1; if (lm === 0) { lm = 12; ly -= 1; } }
+  // Walk back five months for the start, then emit six consecutive full months.
+  let cy = ly, cm = lm - 5;
+  while (cm <= 0) { cm += 12; cy -= 1; }
+  const months = [];
+  for (let i = 0; i < 6; i += 1) {
+    months.push({ from: `${cy}-${pad2s(cm)}-01`, to: `${cy}-${pad2s(cm)}-${pad2s(daysInMonthUTC(cy, cm))}` });
+    cm += 1; if (cm === 13) { cm = 1; cy += 1; }
+  }
+  return { from: months[0].from, to: months[5].to, months };
+}
