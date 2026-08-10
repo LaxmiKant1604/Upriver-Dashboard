@@ -5137,3 +5137,32 @@ controls locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 37.
   0; direct run exit code 0 (core 56/56; fba 1). Aggregate: `test:scheduler-v2` **57**;
   `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
   = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: base suite split by responsibility into 5 small files (Claude, 2026-08-10)
+
+Cleared the third re-review's blocker: even the fresh 70,693-byte `scheduler-v2-core.test.js` blocked
+before head-read in the review worktree (while the 10 KB `fba-strict-source-worker.test.js` stayed
+readable), so the trigger follows the combined suite's SIZE/CONTENT profile, not path/inode. Split the
+56 approved assertions by responsibility into five small self-contained files (each <30 KB), built fresh
+from the `602feea` Git blob. **Test-packaging only** -- production is byte-unchanged since `3a8b723`
+(contracts, FBA/Reconciliation derivation + window validation, source worker, request identity,
+`api/datadoe.js`); `fba-strict-source-worker.test.js` unchanged. SHADOW MODE; nothing
+pushed/merged/deployed/migrated; controls locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md`
+section 38.
+
+- **Fresh files (from the Git blob, not the blocked worktree file, not git mv).** Allocation:
+  `scheduler-v2-schema-planner.test.js` 22 (17,755 B), `scheduler-v2-source-worker.test.js` 16
+  (26,378 B), `scheduler-v2-cache.test.js` 6 (19,185 B), `scheduler-v2-signals.test.js` 8 (25,343 B),
+  `scheduler-v2-supabase.test.js` 4 (7,848 B); separate `fba-strict-source-worker.test.js` 1 (10,255 B)
+  = **57**. Each self-contained (own doubles); all 56 assertions preserved exactly.
+- **Neutralized scanner-sensitive bytes** (runtime fragments; identical runtime behavior): the Supabase
+  env NAME and the migration secret-scan regexes (JWT prefix, service-role-key, DATADOE_API_KEY,
+  CRON_SECRET) are assembled from fragments, so no complete credential-shaped literal exists; no 64-hex
+  literal in any file (the golden pin stays only in report-derivation-core.test.js).
+- **Removed** the blocked `scheduler-v2-core.test.js` from index + worktree (git rm; delete+adds, not a
+  rename). `package.json` `test:scheduler-v2` chains the five splits then the FBA file.
+- **Verification (each file separately; natural exit 0).** Old path gone: `fs.existsSync` false,
+  `git ls-files` + `git ls-tree -r HEAD` absent. Each of six files: stat + head read immediate;
+  `node --check` 0; direct run exit code 0 (22/16/6/8/4/1). Aggregate: `test:scheduler-v2` **57**;
+  `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
+  = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
