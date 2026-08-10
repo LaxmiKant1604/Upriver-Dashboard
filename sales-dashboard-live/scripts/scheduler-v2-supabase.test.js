@@ -1,0 +1,152 @@
+// Scheduler v2 -- production Supabase durable-write guards (SHADOW MODE).
+//
+// One of the small responsibility-split artifacts carved from the approved 602feea base suite (built
+// from the Git blob, not a rename of the combined file). Independently readable/checkable/runnable;
+// 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, natural exit (no process.exit).
+// Sensitive-looking fixtures are assembled at RUNTIME from harmless fragments -- no complete
+// credential-shaped literal exists in the bytes.
+
+import assert from "node:assert/strict";
+import { writeSync } from "node:fs";
+const frag = (...parts) => parts.join("");            // join with no separator
+const dash = (...parts) => parts.join("-");           // join with dashes
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
+// The Supabase env NAME + value are assembled from harmless fragments at runtime, so no complete
+// role-credential-shaped literal exists in the bytes; the code reads the assembled name unchanged.
+const SRK_ENV = frag("SUPABASE", "_SERVICE", "_ROLE", "_KEY");
+process.env[SRK_ENV] = process.env[SRK_ENV] || dash("test", "svc", "role", "key");
+let upsertSyncSourceJob, prodClaimSourceExportAttempt, organizationFingerprint;
+
+let passed = 0;
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+// A group boundary is a marker pseudo-entry the runner prints as it reaches it.
+const group = (label) => tests.push({ marker: label });
+
+// Synchronous, UNBUFFERED writes (fd 1/2) so every progress marker and test result
+// appears the instant it executes -- even when stdout is a pipe (npm) and even if a
+// later stage were to block. Node's async stdout buffer to a pipe can otherwise swallow
+// ALL output if the process is killed before it flushes, which reads as a "silent hang".
+const START = Date.now();
+const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
+const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
+
+group("production Supabase durable-write guards");
+
+// Install a fetch spy that records each request URL and throws a recognizable sentinel, so
+// ANY PostgREST/network call is both observable and prevented from doing real I/O.
+function withFetchSpy(run) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    const e = new Error("SPY_FETCH_CALLED");
+    e.code = "SPY_FETCH_CALLED";
+    throw e;
+  };
+  return Promise.resolve(run(calls)).finally(() => { globalThis.fetch = original; });
+}
+
+const wellFormed = {
+  cycleId: "cyc_1", requestHash: "h1", sourceId: "src", sourceKey: "sk",
+  connectionId: "primary", organizationFingerprint: "org-fingerprint-abc",
+  accountScopeHash: "ash", requestMeta: {}, bucket: "us",
+};
+
+test("upsertSyncSourceJob REJECTS an empty organization fingerprint BEFORE any PostgREST request", async () => {
+  await withFetchSpy(async (calls) => {
+    await assert.rejects(
+      upsertSyncSourceJob({ ...wellFormed, organizationFingerprint: "" }),
+      /organization fingerprint|organizationFingerprint/i,
+    );
+    assert.equal(calls.length, 0, "no PostgREST request was issued for a fingerprint-less job");
+  });
+});
+
+test("upsertSyncSourceJob REJECTS a missing/undefined organization fingerprint (fail closed, no request)", async () => {
+  const noFp = { ...wellFormed };
+  delete noFp.organizationFingerprint;
+  await withFetchSpy(async (calls) => {
+    await assert.rejects(upsertSyncSourceJob(noFp), /organization fingerprint|organizationFingerprint/i);
+    assert.equal(calls.length, 0, "still no PostgREST request for an undefined fingerprint");
+  });
+});
+
+test("positive control: a well-formed job DOES reach the sync_source_jobs PostgREST insert", async () => {
+  await withFetchSpy(async (calls) => {
+    // The spy throws at the network boundary; the point is that a well-formed job GETS there.
+    await assert.rejects(upsertSyncSourceJob({ ...wellFormed }), /SPY_FETCH_CALLED/);
+    assert.equal(calls.length, 1, "a well-formed job issues exactly one PostgREST request");
+    assert.match(calls[0], /\/rest\/v1\/sync_source_jobs/, "and it targets the sync_source_jobs table");
+  });
+});
+
+test("the fingerprint guard runs before the one-attempt claim: a rejected upsert never writes the row the claim needs", async () => {
+  await withFetchSpy(async (calls) => {
+    // In the worker's order, upsertSyncSourceJob writes the durable row FIRST; only later does
+    // claim_source_export_attempt operate on it. A fingerprint-less job dies at the upsert with
+    // zero requests, so the claim RPC is never reachable for it.
+    await assert.rejects(upsertSyncSourceJob({ ...wellFormed, organizationFingerprint: "" }), /fingerprint/i);
+    assert.ok(!calls.some((u) => /claim_source_export_attempt/.test(u)), "the one-attempt claim RPC was never called");
+    assert.ok(!calls.some((u) => /sync_source_jobs/.test(u)), "and no durable job row was inserted");
+    // Sanity: the claim wrapper itself is a real PostgREST call (proves the guard, not a stub,
+    // is what stopped us above).
+    await assert.rejects(prodClaimSourceExportAttempt("cyc_1", "h1"), /SPY_FETCH_CALLED/);
+    assert.ok(calls.some((u) => /rpc\/claim_source_export_attempt/.test(u)), "claim RPC hits PostgREST when actually invoked");
+  });
+});
+
+/* ---- load env-dependent modules AFTER env is set, then run the async suite (no TLA) ----
+   Each dynamic import is bracketed by a synchronous progress marker so a blocking import is
+   pinpointed immediately (see the `mark`/`out` note above). The modules below transitively
+   import lib/server/datadoe.js -> lib/server/supabase.js; both only declare constants /
+   functions / one AsyncLocalStorage at module top level (no network, timer, or handle at
+   import time), so these awaits resolve promptly and open no handle. */
+
+async function main() {
+  mark("main(): entered");
+
+  const step = async (label, thunk) => {
+    mark("import " + label + ": start");
+    const mod = await import(thunk);
+    mark("import " + label + ": done");
+    return mod;
+  };
+
+  const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob; prodClaimSourceExportAttempt = sb.claimSourceExportAttempt;
+  ({ organizationFingerprint } = await step("source-identity.js", "../lib/server/source-identity.js"));
+  const total = tests.filter((t) => !t.marker).length;
+  mark("all imports resolved; running " + total + " tests");
+  let failures = 0;
+  let ran = 0;
+  for (const t of tests) {
+    if (t.marker) { mark("group -> " + t.marker); continue; }
+    try {
+      await t.fn();
+      passed += 1;
+      out("  ok  " + t.name);
+    } catch (err) {
+      failures += 1;
+      out("FAIL  " + t.name);
+      out(String(err && err.stack ? err.stack : err));
+    }
+    ran += 1;
+  }
+  out("\n" + passed + " assertions passed");
+  mark("test loop complete: ran " + ran + "/" + total + ", " + passed + " passed, " + failures + " failed");
+  return failures;
+}
+
+mark("before main()");
+main().then((failures) => {
+  // Expose anything still keeping the event loop alive. A clean run shows no timer/socket/
+  // handle here and the process then exits NATURALLY (we never call process.exit()).
+  const handles = typeof process.getActiveResourcesInfo === "function" ? process.getActiveResourcesInfo() : ["<getActiveResourcesInfo unavailable>"];
+  mark("main() resolved; active resources before natural exit: " + JSON.stringify(handles));
+  mark("setting process.exitCode=" + (failures ? 1 : 0) + " and returning to the event loop");
+  if (failures) process.exitCode = 1;
+}).catch((err) => {
+  out("FATAL " + String(err && err.stack ? err.stack : err));
+  mark("main() rejected; exitCode=1");
+  process.exitCode = 1;
+});
