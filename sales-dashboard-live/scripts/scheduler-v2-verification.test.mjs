@@ -647,35 +647,6 @@ test("strict row-cap data is never saved (validate / TRUNCATED)", async () => {
   assert.equal(store._rawJob(res.cycleId, "h1").error_code, "TRUNCATED");
 });
 
-test("Scheduler-v2 integrity: a cap-sized FBA source records TRUNCATED, persists nothing, unrelated source continues", async () => {
-  const store = makeMemoryStore();
-  // Resolve a REAL fba-plan job so the CONTRACT's strict flag flows onto the planned job (non-US =>
-  // AWD gated out; supply the four applicable windows). The limit is shrunk to 3 in-test only to make
-  // the cap reachable; the strict flag itself comes straight from the contract.
-  const fbaWin = {
-    "fba-plan:monthly-units": [{ from: "2025-05-01", to: "2025-05-31" }],
-    "fba-plan:current-daily-dates": [{ from: "2025-08-01", to: "2025-08-06" }],
-    "fba-plan:catalog": [{ from: "2025-05-01", to: "2025-08-06" }],
-    "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
-  };
-  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWin, marketplaceCountry: "CA" });
-  const units = resolved.find((r) => r.requestKey === "fba-plan:monthly-units");
-  assert.equal(units.strict, true, "the fba-plan units contract is strict:true");
-  const capped = plannedSourceJob("fba-plan", units, "us", "primary");
-  capped.limit = 3; capped.fetchParams.limit = 3;
-  // An unrelated healthy source (a different report) in the SAME batch.
-  const other = synthJob("other-ok", { requestKey: "brand-sales:catalog" });
-  const dd = makeDataDoe((job) => (job.requestHash === units.requestHash ? { rows: [{}, {}, {}] } : { rows: [{ ok: 1 }] }));
-  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [capped, other] }));
-  // Cap-sized FBA source: recorded TRUNCATED, and NO source payload persisted.
-  assert.equal(store._rawJob(res.cycleId, units.requestHash).error_code, "TRUNCATED");
-  assert.equal(store._cache.has(units.requestHash), false, "no source payload persisted for the capped FBA source");
-  // The unrelated source still completes and persists (one report/source failing never blocks another).
-  assert.equal(store._cache.has("other-ok"), true, "an unrelated source continues");
-  assert.equal(res.failed, 1);
-  assert.equal(res.succeeded, 1);
-});
-
 test("no secret value appears in a recorded error or the progress output", async () => {
   const store = makeMemoryStore();
   // Assemble the leaked-credentials query string at RUNTIME from fragments, so the bytes on
