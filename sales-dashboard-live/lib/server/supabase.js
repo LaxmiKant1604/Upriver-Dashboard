@@ -896,24 +896,96 @@ export async function deleteReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
   }).catch(() => {});
 }
 
+// Documented safety bounds for one Daily Ads window read.
+export const AD_DAILY_METRICS_PAGE_SIZE = 1000;      // PostgREST returns at most 1,000 rows per page
+export const AD_DAILY_METRICS_MAX_ROWS = 200000;     // hard ceiling; exceeding it BLOCKS Ads derivation
+
+// PostgREST/Postgres markers for a not-yet-migrated (missing) table -- distinguished from a genuine
+// read/write failure so shadow-only schema degrades to a typed "unavailable" while real operational
+// failures stay visible. Never inspects secrets; matches only structural error text.
+export function isSchemaMissingError(error) {
+  const message = error && error.message ? String(error.message) : String(error || "");
+  return /\(404\)/.test(message) || /PGRST205/.test(message) || /42P01/.test(message)
+    || /does not exist/i.test(message) || /Could not find the table/i.test(message) || /schema cache/i.test(message);
+}
+
+// Quote a text value for a PostgREST filter (dates need no quoting; text with reserved chars does).
+function pgrstQuote(value) {
+  return `"${String(value ?? "").replace(/"/g, '""')}"`;
+}
+
+/**
+ * Deterministic KEYSET pagination over ad_daily_metrics' full primary key
+ * (metric_date, campaign_id, campaign_type, currency), which is a strict TOTAL order, so no row is
+ * skipped or duplicated across pages. `fetchPage(cursor|null)` returns one ordered page. A per-key
+ * dedup set guards page-boundary re-reads (the PK is unique, so a dedup is never data loss). A
+ * non-array page is an ambiguous read (throws). Exceeding `maxRows` throws ADS_ROW_LIMIT_EXCEEDED so
+ * the caller blocks Ads derivation rather than aggregating a partial (understated) total. Pure given
+ * `fetchPage`, so it is unit-testable without Supabase.
+ */
+export async function paginateAdDailyMetrics({ fetchPage, pageSize = AD_DAILY_METRICS_PAGE_SIZE, maxRows = AD_DAILY_METRICS_MAX_ROWS }) {
+  const rows = [];
+  const seen = new Set();
+  let cursor = null;
+  for (;;) {
+    const page = await fetchPage(cursor);
+    if (!Array.isArray(page)) {
+      const err = new Error("ad_daily_metrics returned a non-array page; refusing an ambiguous read.");
+      err.code = "ADS_READ_AMBIGUOUS";
+      throw err;
+    }
+    for (const row of page) {
+      const key = `${row.metric_date}|${row.campaign_id}|${row.campaign_type}|${row.currency}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(row);
+      if (rows.length > maxRows) {
+        const err = new Error(`ad_daily_metrics window exceeds the ${maxRows}-row safety limit; refusing a partial Ads total.`);
+        err.code = "ADS_ROW_LIMIT_EXCEEDED";
+        throw err;
+      }
+    }
+    if (page.length < pageSize) break; // a short page is the last page
+    const last = page[page.length - 1];
+    cursor = { metric_date: last.metric_date, campaign_id: last.campaign_id, campaign_type: last.campaign_type, currency: last.currency };
+  }
+  return rows;
+}
+
 export async function getAdDailyMetrics(accountId, from, to) {
-  const query = new URLSearchParams({
-    select: "metric_date,currency,ad_sales,ad_spend,ad_clicks",
-    account_id: `eq.${accountId}`,
-    and: `(metric_date.gte.${from},metric_date.lte.${to})`,
-    order: "metric_date.asc",
-  });
-  return request(`/rest/v1/ad_daily_metrics?${query}`);
+  const fetchPage = (cursor) => {
+    const query = new URLSearchParams({
+      select: "metric_date,campaign_id,campaign_type,currency,ad_sales,ad_spend,ad_clicks",
+      account_id: `eq.${accountId}`,
+      and: `(metric_date.gte.${from},metric_date.lte.${to})`,
+      order: "metric_date.asc,campaign_id.asc,campaign_type.asc,currency.asc",
+      limit: String(AD_DAILY_METRICS_PAGE_SIZE),
+    });
+    if (cursor) {
+      const d = cursor.metric_date;
+      const ci = pgrstQuote(cursor.campaign_id);
+      const ct = pgrstQuote(cursor.campaign_type);
+      const cu = pgrstQuote(cursor.currency);
+      // Strictly-after (d,ci,ct,cu) in the composite order, ANDed with the account/window filters.
+      query.set("or", `(metric_date.gt.${d},and(metric_date.eq.${d},campaign_id.gt.${ci}),and(metric_date.eq.${d},campaign_id.eq.${ci},campaign_type.gt.${ct}),and(metric_date.eq.${d},campaign_id.eq.${ci},campaign_type.eq.${ct},currency.gt.${cu}))`);
+    }
+    return request(`/rest/v1/ad_daily_metrics?${query}`);
+  };
+  return paginateAdDailyMetrics({ fetchPage });
 }
 
 /* Durable successful Ads coverage windows (ads_sync_coverage), created by the additive migration
- * supabase/migrations/20260810_ads_sync_coverage.sql. Both helpers are BEST-EFFORT: until that
- * migration is applied the table is absent, so the read returns no windows (Daily Reporting then
- * fails closed and blocks) and the write is a no-op (the Ads sync is never broken). Service-role
- * only; the browser never calls these. Coverage is proven from SUCCESSFUL sync windows, not from the
- * first/last returned metric row (a successfully-covered day can have zero ads and thus no row). */
+ * supabase/migrations/20260810_ads_sync_coverage.sql. Both helpers return a TYPED outcome so an
+ * unmigrated shadow schema (`schema-missing`) is distinguished from a genuine PostgREST read/write
+ * failure (`read-failed` / `write-failed`) -- the loader degrades schema-missing to a typed
+ * "unavailable" (Daily still saves sales), while a real failure surfaces as an operational failure in
+ * the payload metadata (future Data Sync Center). Only SAFE codes are returned -- never a raw DB
+ * response or secret. Coverage is proven from SUCCESSFUL sync windows, not from the first/last
+ * returned metric row (a successfully-covered day can have zero ads and thus no row). */
 export async function getDailyAdsCoverage(accountId, sourceKey) {
   let windows = [];
+  let read = "ok";
+  let error = null;
   try {
     const query = new URLSearchParams({
       select: "covered_from,covered_to",
@@ -924,7 +996,11 @@ export async function getDailyAdsCoverage(accountId, sourceKey) {
     });
     const rows = await request(`/rest/v1/ads_sync_coverage?${query}`);
     windows = (rows || []).map((row) => ({ from: row.covered_from, to: row.covered_to }));
-  } catch { windows = []; }
+  } catch (readError) {
+    read = isSchemaMissingError(readError) ? "schema-missing" : "read-failed";
+    error = read === "schema-missing" ? "COVERAGE_SCHEMA_MISSING" : "COVERAGE_READ_FAILED";
+    windows = [];
+  }
   let status = "missing";
   let latestMetricDate = null;
   try {
@@ -939,8 +1015,11 @@ export async function getDailyAdsCoverage(accountId, sourceKey) {
       status = state[0].last_status || "missing";
       latestMetricDate = state[0].latest_metric_date || null;
     }
-  } catch { /* leave defaults => Daily blocks fail-closed */ }
-  return { windows, status, latestMetricDate };
+  } catch (stateError) {
+    // ads_sync_state is migrated (20260729); a failure here is operational, not shadow-missing.
+    if (read === "ok") { read = "read-failed"; error = "COVERAGE_READ_FAILED"; }
+  }
+  return { windows, status, latestMetricDate, read, error };
 }
 
 export async function recordAdsCoverageWindows(rows) {
@@ -954,14 +1033,20 @@ export async function recordAdsCoverageWindows(rows) {
       status: "succeeded",
       source_refreshed_at: row.sourceRefreshedAt || new Date().toISOString(),
     }));
-  if (!payload.length) return;
+  if (!payload.length) return { write: "ok", recorded: 0, error: null };
   try {
     await request("/rest/v1/ads_sync_coverage?on_conflict=account_id,source_key,covered_from,covered_to", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: payload,
     });
-  } catch { /* additive table may be unmigrated; never break the Ads sync */ }
+    return { write: "ok", recorded: payload.length, error: null };
+  } catch (writeError) {
+    // Schema-missing pre-rollout is a safe no-op; a real write failure is a typed operational failure
+    // (never throws here, so the Ads sync batch is not broken; the caller may surface the outcome).
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", recorded: 0, error: "COVERAGE_SCHEMA_MISSING" };
+    return { write: "write-failed", recorded: 0, error: "COVERAGE_WRITE_FAILED" };
+  }
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
