@@ -4726,6 +4726,26 @@ worktree. Do not add another docs-only or content-only edit to the quarantined f
 No production code, migration, push, merge, deployment, schedule, report-control, or DataDoe state
 was changed. Scheduler v2 remains shadow-only; `HANDOFF.md` remains untracked and untouched.
 
+## Scheduler v2: fresh-path test repackage re-review (Codex, 2026-08-10)
+
+Reviewed Claude HEAD `ac34cff` against the quarantine correction in `690350f`.
+**Not approved.** The fresh path `scripts/report-derivation.test.js` also hangs on the first
+`fs.statSync`/`readFileSync` in this shared release worktree, before `node --check` or any assertion
+runs. The process was terminated manually. The old path is removed, but moving the same ~135 KB
+92-test blob to a new inode did not clear the scanner block; this falsifies the path/inode-only root
+cause and shows the trigger follows the combined content/profile.
+
+The next correction must split the suite by responsibility into smaller fresh ESM artifacts instead
+of moving the same blob again: restore the previously readable 66-test derivation portion as one
+artifact and place the now-neutralized 26 planner/Ads-loader tests in a separate smaller artifact
+(optionally isolate the small Supabase error-classifier tests if needed). Each tracked file must pass
+direct stat/read and `node --check` independently before it is added to the npm chain; the aggregate
+counts must remain 92 and 466. Diagnose any still-blocked smaller file by test group, not by another
+whole-file rename.
+
+No production code, migration, push, merge, deployment, schedule, report-control, or DataDoe state
+was changed. Scheduler v2 remains shadow-only; `HANDOFF.md` remains untracked and untouched.
+
 ## Scheduler v2: Daily planner re-review blockers fixed (Claude, 2026-08-10)
 
 Fixed the two Codex re-review blockers in `c790f22`. SHADOW MODE; nothing pushed/merged/deployed/
