@@ -4923,3 +4923,41 @@ tests. Detail in `SCHEDULER_V2.md` section 34.
   test:report-contracts 159; `npm run verify` = **511** + build (2,394 modules); `git diff --check` +
   `git status --short` clean (only intended files + untracked HANDOFF.md); `api/datadoe.js` untouched.
   request_hash, five-ID batching, primary/dd-secondary isolation preserved.
+
+## Codex senior review: FBA Shipment Plan + Reconciliation derivations (2026-08-10)
+
+**Reviewed commits:** `df7e90a`, `19d2030`, `52ff761`, and `00eb50b` on
+`feature/scheduler-v2`.
+
+**Result: BLOCKED.** The pure payload folds closely match the live routes, the FBA null-vs-zero and
+US-AWD behavior are represented honestly, the Reconciliation six-month/account constraints are
+sound, and the focused `test:report-derivation` suite passes **137 assertions**. Two source-integrity
+issues must be corrected before these adapters can be approved:
+
+1. **P1 - cap-sized FBA/Reconciliation catalog exports are accepted as complete.** Scheduler v2's
+   source worker rejects `rows.length >= limit` only when the resolved contract carries
+   `strict:true`. All five `fba-plan` source contracts and `reconciliation:catalog` currently omit
+   that flag. A capped FBA sales, catalog, inventory, or AWD result can therefore be persisted and
+   used to derive understated sales/stock, while a capped reconciliation catalog can silently turn
+   known products into `Unassigned`. This contradicts the canonical rule already documented beside
+   `rejectsAtCap`: a result at its row limit is indistinguishable from truncation. Mark these newly
+   enabled contracts strict at the Scheduler-v2 boundary and prove the source worker records
+   `TRUNCATED`, writes no source payload/snapshot, and preserves last-known-good. The legacy browser
+   route may remain unchanged; scheduler strictness is a stronger integrity guard and must not be
+   limited to routes that historically implemented their own cap check.
+2. **P2 - two FBA fragment windows are not fully pinned by derivation.** Inventory validates only
+   `to === asOf` and accepts any `from`; AWD validates account shape but not its required no-date
+   `{from:null,to:null}` contract. Recompute the inventory start as `addDaysStr(asOf, -10)` in the
+   pure derivation and require both exact endpoints; require both AWD endpoints to be null. Add
+   negative tests for a shortened/extended inventory lookback and a dated AWD fragment. Each must
+   fail before snapshot save and preserve last-known-good. Request hashes and the production route
+   must remain unchanged.
+
+**Independent verification:** `node --check` passed for both new test files and
+`npm run test:report-derivation` passed **137/137**. `git diff --check` was clean before this review;
+the worktree contained only the pre-existing untracked `HANDOFF.md`, which was not touched. Full
+`npm run verify` was not repeated because the P1 integrity blocker is deterministic from the
+contract metadata and source-worker guard.
+
+**Deployment status:** still shadow mode. Nothing was pushed, merged, deployed, migrated, enabled,
+or scheduled.
