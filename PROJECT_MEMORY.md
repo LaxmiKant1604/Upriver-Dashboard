@@ -5272,6 +5272,41 @@ Re-review gate: keep request hashes unchanged; preserve strict caps and primary/
 run the full staged source loop with two accounts; keep Keyword Rank locked; do not start another adapter,
 cron/frontend cutover, migration, push, merge, or deployment. `HANDOFF.md` remains untracked/untouched.
 
+## Scheduler v2: Keyword Rank staged-cycle re-review blockers (Codex, 2026-08-11)
+
+Reviewed correction commits `38cfdb3`, `7ab2908`, `96c7eed`, and `650c656`. The requested four
+behavioral fixes are present: typed blocked/unavailable/invalid outcomes, strict SQP row-date/window
+validation, per-account request-hash signal reconstruction, and catalog execution staged after the
+cadence source. Tests are green (`test:report-derivation` 186; full `npm run verify` 563 plus the
+2,394-module build, exit 0), but integration is **not approved** yet because four production-shaped
+boundaries remain unsafe/unproven:
+
+1. **Two competing Keyword Rank entry points.** `SHADOW_PLANNED_REPORT_KEYS` still contains
+   `keyword-rank`, so the existing `buildShadowReportPlan` default path emits weekly + eager catalog
+   and never performs the specialized account-scoped fallback cycle. There must be one canonical
+   source-planning path: either delegate Keyword Rank to `runKeywordRankShadowCycle` or exclude it
+   from the generic builder with a fail-closed error. Prove generic callers cannot bypass staging.
+2. **Real secondary connection routing is broken.** `getDataDoeConnections()` returns id
+   `secondary`, durable jobs use `dd-secondary`, and `makeDataDoeAdapter()` indexes raw connection ids.
+   An independent production-shape probe returns `No configured DataDoe connection for
+   "dd-secondary"`. Normalize at one explicit boundary and test using the actual registry-shaped
+   `primary`/`secondary` connections; never allow secondary-to-primary fallback.
+3. **Per-invocation bounds are reset per round.** `runKeywordRankShadowCycle` passes the original
+   `maxJobs` to each of three `runSourceJobs` rounds and ignores `res.deadlineReached`, so `maxJobs:1`
+   can execute weekly, monthly, and catalog (three jobs) in one invocation. Track remaining budget
+   cumulatively, stop immediately on deadline/defer, and surface `deadlineReached`/`deferred`/`drained`.
+   Also reject or partition accounts whose planner bucket differs from the cycle bucket; one cycle
+   must never mix US and non-US schedules.
+4. **No final report plan / source-to-snapshot proof.** The specialized cycle returns hashes/signals
+   but not the final per-account `plannedReports` containing the actually staged dependencies. Return
+   the final canonical report requests and drive `runReportJobs` in an end-to-end offline test for
+   both weekly and monthly accounts. Prove final `depends_on`, saved payload cadence, zero derivation
+   network calls, idempotency, and LKG behavior.
+
+Re-review gate: retain the approved typed outcomes/date validation/catalog token state table; keep
+request hashes and source contracts unchanged; add small neutral tests; remain shadow-only/locked;
+do not start another adapter, push, merge, deploy, migrate, enable schedules, or touch `HANDOFF.md`.
+
 ## Scheduler v2: Keyword Rank derivation + shadow planner wired (Claude, 2026-08-11)
 
 First functional tranche after the test-packaging approval. Wired the `keyword-rank` `derive:null`
