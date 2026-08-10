@@ -266,6 +266,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "reconciliation:catalog",
+      strict: true, // Scheduler v2 integrity: a cap-sized catalog is indistinguishable from truncation and would silently turn known products into "Unassigned"; reject it. The legacy browser route uses a non-strict fetch here -- scheduler strictness is a stronger guard.
       sourceKey: "product-catalog",
       columns: PRODUCT_CATALOG_COLUMNS,
       limit: 10000, // CATALOG_ROW_LIMIT
@@ -308,9 +309,14 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   // FBA Shipment Plan (single account). Two Sales & Traffic exports with DIFFERENT
   // columns (child_asin units vs date units) => distinct request identities, never
   // shared. Catalog + Inventory Health ranges, and a US-only no-date AWD listing.
+  // Every fba-plan source is Scheduler-v2 strict: a result at (or above) its row cap is
+  // indistinguishable from a truncated one and would derive UNDERSTATED sales/stock (or a missing
+  // AWD/inventory ASIN). The legacy api/datadoe.js FBA route fetches these non-strict; the scheduler
+  // is intentionally stricter and rejects a cap-sized page (TRUNCATED) rather than persist/derive it.
   "fba-plan": [
     {
       requestKey: "fba-plan:monthly-units",
+      strict: true,
       sourceKey: "sales-traffic-asin-date",
       columns: PLAN_UNITS_COLUMNS,
       limit: 30000, // PLAN_SALES_ROW_LIMIT
@@ -322,6 +328,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "fba-plan:current-daily-dates",
+      strict: true,
       sourceKey: "sales-traffic-asin-date",
       columns: PLAN_DAILY_COLUMNS,
       limit: 500,
@@ -333,6 +340,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "fba-plan:catalog",
+      strict: true,
       sourceKey: "product-catalog",
       columns: PRODUCT_CATALOG_COLUMNS,
       limit: 10000, // CATALOG_ROW_LIMIT
@@ -344,6 +352,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "fba-plan:inventory-health",
+      strict: true,
       sourceKey: "fba-inventory-health",
       columns: FBA_HEALTH_COLUMNS,
       limit: 15000, // PLAN_INVENTORY_ROW_LIMIT
@@ -355,6 +364,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "fba-plan:awd",
+      strict: true,
       sourceKey: "listings",
       columns: LISTINGS_AWD_COLUMNS,
       limit: 10000, // CATALOG_ROW_LIMIT
