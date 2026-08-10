@@ -12,7 +12,7 @@
     "test:brand-view": "node scripts/test-brand-view.mjs",
     "test:sync": "node scripts/test-sync.mjs",
     "test:source-cache": "node scripts/test-source-cache.mjs",
-    "test:scheduler-v2": "node scripts/scheduler-v2-verification.test.mjs && node scripts/fba-strict-source-worker.test.js",
+    "test:scheduler-v2": "node scripts/scheduler-v2-core.test.js && node scripts/fba-strict-source-worker.test.js",
     "test:report-derivation": "node scripts/report-derivation-core.test.js && node scripts/report-planner.test.js && node scripts/report-fba-plan.test.js && node scripts/report-reconciliation.test.js",
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
