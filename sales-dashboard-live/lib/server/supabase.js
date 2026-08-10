@@ -43,7 +43,13 @@ async function request(path, { method = "GET", body, headers = {} } = {}) {
   });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(`Supabase request failed (${response.status}): ${result?.message || result?.hint || "Unknown error"}`);
+    // Attach SAFE structured error info: the HTTP status and the PostgREST/Postgres error code only
+    // (e.g. PGRST205, 42P01). Never the apikey/Authorization headers (which are request-side), a
+    // token, or the raw response payload -- only PostgREST's own { code, message, hint } descriptors.
+    const error = new Error(`Supabase request failed (${response.status}): ${result?.message || result?.hint || "Unknown error"}`);
+    error.status = response.status;
+    error.code = result && typeof result.code === "string" ? result.code : null;
+    throw error;
   }
   return result;
 }
@@ -900,13 +906,21 @@ export async function deleteReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
 export const AD_DAILY_METRICS_PAGE_SIZE = 1000;      // PostgREST returns at most 1,000 rows per page
 export const AD_DAILY_METRICS_MAX_ROWS = 200000;     // hard ceiling; exceeding it BLOCKS Ads derivation
 
-// PostgREST/Postgres markers for a not-yet-migrated (missing) table -- distinguished from a genuine
-// read/write failure so shadow-only schema degrades to a typed "unavailable" while real operational
-// failures stay visible. Never inspects secrets; matches only structural error text.
+// True ONLY for EXPLICIT evidence that a relation/table is not present (an unapplied shadow
+// migration) -- so a shadow-only table degrades to a typed "unavailable" while every other failure
+// stays a visible read/write failure. Recognizes: the PostgREST missing-table code (PGRST205), the
+// Postgres undefined-table code (42P01), the exact "Could not find the table ... in the schema
+// cache" message, or the Postgres 'relation "..." does not exist' message. A bare HTTP status
+// (including a generic/proxy/path 404), 401/403/5xx, and network failures are NOT schema-missing.
+// Inspects only the request helper's SAFE structured code + error text; never a secret.
 export function isSchemaMissingError(error) {
+  const code = error && typeof error.code === "string" ? error.code : "";
+  if (code === "PGRST205" || code === "42P01") return true;
   const message = error && error.message ? String(error.message) : String(error || "");
-  return /\(404\)/.test(message) || /PGRST205/.test(message) || /42P01/.test(message)
-    || /does not exist/i.test(message) || /Could not find the table/i.test(message) || /schema cache/i.test(message);
+  return /\bPGRST205\b/.test(message)
+    || /\b42P01\b/.test(message)
+    || /Could not find the table\b[\s\S]*\bschema cache\b/i.test(message)
+    || /relation "[^"]+" does not exist/i.test(message);
 }
 
 // Quote a text value for a PostgREST filter (dates need no quoting; text with reserved chars does).
