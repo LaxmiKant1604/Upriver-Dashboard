@@ -4527,6 +4527,59 @@ Claude must continue using small local commits on `feature/scheduler-v2`, update
 merging, deploying, applying migrations, or enabling schedules unless Codex explicitly
 approves that rollout step.
 
+## Codex review: Daily/SKU shadow planner + Daily Ads loader (2026-08-10)
+
+**Reviewed commits:** `db9edb4`, `27b2c18`, `c8215d7`, and `7d68657` on
+`feature/scheduler-v2`.
+
+**Result: BLOCKED.** The SKU six-complete-month plan and organization isolation are
+directionally sound, but Daily cannot be approved until the following findings are fixed:
+
+1. **P1 - Daily source window differs from the live route.** The planner uses
+   `addDaysStr(monthStartStr(asOf), -150)`. For `2026-08-10` this is `2026-03-04`,
+   while the live UI uses `monthBack(TODAY, 5).from` = `2026-03-01`. This silently
+   removes the first days of the oldest displayed month. Replace the 150-day
+   approximation with a shared exact calendar-month helper and parity-test several
+   month lengths, leap years, and year boundaries.
+2. **P1 - Daily Ads read can silently truncate.** `getAdDailyMetrics` performs one
+   unpaged PostgREST request. Campaign-level rows over a multi-month window can exceed
+   the server row limit, while the independent coverage table still marks the window
+   complete. Use a deterministic paged read with a hard no-partial guard, or a reviewed
+   server-side aggregate/RPC by date+currency. Never accept a capped/ambiguous result.
+3. **P1 - onboarding coverage deadlock.** Campaign Ads initially seeds only 56 days,
+   but Daily currently requires roughly five months of contiguous Ads coverage before
+   saving any snapshot. A newly connected account would therefore lose the whole Daily
+   sales report for months. Separate sales validity from Ads availability: save validated
+   sales while representing uncovered Ads periods explicitly as unavailable; never turn
+   missing Ads into zero. Preserve prior validated Ads where appropriate and make the
+   payload's coverage state machine explicit before frontend cutover.
+4. **P2 - missing currency is accepted despite the claimed unusable-currency guard.**
+   The validator filters out null/blank currency and only blocks when more than one
+   non-empty currency remains. A nonzero Ads row with `currency:null` currently returns
+   `ok:true`. Require one authoritative account currency (or reject missing/mismatched
+   row currency) and test null, blank, mixed, and valid currency states.
+5. **P1 - the new planner test artifact is unreadable in the Codex checkout.** Both
+   `node --check scripts/scheduler-v2-planner.test.mjs` and the npm planner test hang
+   before output, so the claimed 21 assertions and full 460-assertion verify run cannot
+   be reproduced here. Repackage the test under a fresh path with no credential-shaped
+   literals, preserve all assertions, remove the blocked path, and prove direct read,
+   `node --check`, focused test, and full verify complete naturally.
+6. **P2 - coverage persistence hides every database failure.** Read/write helpers catch
+   all errors as missing/no-op. That is safe for data values but operationally invisible
+   after migration, contrary to the Admin Data Sync Center requirement. Distinguish an
+   explicitly unmigrated/disabled shadow state from a real Supabase read/write failure;
+   record a safe failure stage without exposing secrets.
+
+**Independent verification:** existing report-derivation (65), report-contract (159),
+and report-sync-control (9) suites pass. The planner suite and therefore full
+`npm run verify` could not be reproduced because the new test file blocks before Node
+evaluation. A direct calculation reproduced the date mismatch (`2026-03-04` vs
+`2026-03-01`), and a direct validator call proved a nonzero null-currency row is accepted.
+
+**Deployment status:** shadow mode remains mandatory. Nothing was pushed, merged,
+deployed, migrated, enabled, or scheduled during this review. `HANDOFF.md` remains
+untouched and untracked.
+
 ## Scheduler v2 next tranche: Daily + SKU shadow planner + Daily Ads loader (Claude, 2026-08-10)
 
 Built the production-shape SHADOW planner + derived-context loader for ONLY Daily Reporting and
