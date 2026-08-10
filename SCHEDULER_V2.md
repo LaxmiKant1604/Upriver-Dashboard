@@ -1661,3 +1661,64 @@ Apply `20260810_ads_sync_coverage.sql` + let the Ads sync backfill successful co
 new accounts derive Ads for their proven covered window while older accounts validate fully.
 Reconcile superset-summed all-brand vs the compact total once. Codex then reviews the shadow plan
 against real saved rows before any report-controls readiness flip / cron wiring / deployment.
+
+## 30. Daily planner re-review blockers fixed (SHADOW MODE, 2026-08-10)
+
+Fixes the two Codex re-review blockers recorded in `c790f22`. SHADOW MODE; nothing
+pushed/merged/deployed/migrated/enabled; report-controls stay locked; `request_hash`, five-ID
+batching, and organization isolation unchanged; `HANDOFF.md` untracked. Commits `d5a6bad`
+(classifier + retire the blocked artifact), `445c3dc` (consolidate the 26 assertions).
+
+### 30.1 Blocker 1 -- a generic 404 is no longer "schema missing"
+
+`isSchemaMissingError` previously returned true for any error containing `(404)`, so an
+upstream/proxy/path failure was downgraded to `schema-missing`/`unavailable` instead of
+`read-failed`/`write-failed`. It now returns true ONLY on EXPLICIT missing-relation evidence:
+
+| Evidence | schema-missing? |
+|---|---|
+| PostgREST code `PGRST205` (structured or in the message) | yes |
+| Postgres code `42P01` (structured or in the message) | yes |
+| exact `Could not find the table ... in the schema cache` message | yes |
+| `relation "..." does not exist` message | yes |
+| a bare/generic/proxy 404 | NO -> read/write-failed |
+| 401 / 403 / 5xx / network failure | NO -> read/write-failed |
+
+The Supabase `request()` helper now attaches SAFE structured error info to the thrown error -- the
+HTTP `status` and the PostgREST/Postgres `code` only (never the apikey/Authorization headers, a
+token, or the raw response payload) -- so the classifier keys off the structured code first.
+`getDailyAdsCoverage` / `recordAdsCoverageWindows` still return the safe typed outcomes
+(`COVERAGE_SCHEMA_MISSING` / `COVERAGE_READ_FAILED` / `COVERAGE_WRITE_FAILED`); a generic 404 now
+correctly surfaces as `read-failed` / `write-failed`.
+
+### 30.2 Blocker 2 -- the standalone shadow-planner test artifact is retired
+
+`scripts/scheduler-v2-shadow-planner.test.mjs` did not terminate under `node --check` in the shared
+reviewer worktree, so the full `npm run verify` gate could not be reproduced. Rather than mint
+another standalone filename, all 26 planner / Daily-Ads-loader / orchestration assertions are moved
+INTO the already-readable `scripts/scheduler-v2-report-derivation.test.mjs` (the suite Codex
+confirmed runs), using that file's runtime-safe fixture patterns and `pl*`-namespaced helpers so
+nothing collides and no credential-looking fixture is byte-copied. The blocked file is removed from
+Git and the worktree, and its npm script + verify entry are deleted. Every behavior is preserved:
+exact Daily calendar window (+ live `monthBack` parity), SKU six-month planning, primary/dd-secondary
+isolation, >1,000-row Ads pagination, Ads row-limit rejection, availability states, new-account
+partial coverage, currency validation, zero DataDoe calls during derivation, golden `request_hash`
++ five-ID batching, and locked report controls. The isSchemaMissingError / coverage read-write tests
+are upgraded to the stricter blocker-1 classification.
+
+### 30.3 Verification (all natural, exit 0, from the checked-out worktree)
+
+`node --check scripts/scheduler-v2-report-derivation.test.mjs` (0); `npm run test:report-derivation`
+= **92** (66 + 26 moved); `npm run test:scheduler-v2` (56); `npm run test:report-contracts` (159);
+`npm run verify` completes naturally = **466** (54 + 60 + 23 + 6 + 56 + **92** + 7 + 159 + 9) +
+`build:check` (2,394 modules); `git diff --check` clean; `git status --short` clean (only untracked
+`HANDOFF.md`). The overall total is preserved at 466 (the 26 assertions moved, not lost). Removing
+the blocked file is what lets the chained verify terminate; no `process.exit`/timeout/skip/weakened
+assertion was used, and no failure was dismissed. Golden `request_hash` and primary/dd-secondary
+isolation remain green.
+
+### 30.4 Unresolved live gates (unchanged)
+
+Apply `20260810_ads_sync_coverage.sql`, let the Ads sync backfill successful coverage windows,
+reconcile superset-vs-compact once; then Codex reviews the shadow plan against real saved rows before
+any report-controls readiness flip / cron wiring / deployment.

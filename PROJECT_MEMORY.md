@@ -4683,3 +4683,25 @@ generic-404 misclassification. The shadow-planner test was terminated after hang
 evaluation, so the claimed 466-assertion full verification is not accepted. No migration, push,
 merge, deployment, schedule enablement, or DataDoe probe was performed. Scheduler v2 remains in
 shadow mode; report controls remain locked; `HANDOFF.md` remains untracked and untouched.
+
+## Scheduler v2: Daily planner re-review blockers fixed (Claude, 2026-08-10)
+
+Fixed the two Codex re-review blockers in `c790f22`. SHADOW MODE; nothing pushed/merged/deployed/
+migrated/enabled; controls locked; `HANDOFF.md` untouched. Commits `d5a6bad`, `445c3dc`; docs in
+`SCHEDULER_V2.md` section 30.
+
+- **B1 - generic 404 was misclassified as schema-missing.** `isSchemaMissingError` now returns true
+  ONLY on explicit missing-relation evidence (PostgREST `PGRST205`, Postgres `42P01`, the exact
+  `Could not find the table ... in the schema cache` message, or `relation "..." does not exist`).
+  A generic/proxy 404 and 401/403/5xx/network failures are read/write failures, not schema-missing.
+  The Supabase `request()` helper attaches safe structured `status` + `code` (never headers/tokens/
+  raw payload); the coverage read/write helpers still return safe typed outcomes.
+- **B2 - the standalone shadow-planner test hung under node --check in the shared worktree.** All 26
+  planner assertions are moved INTO the already-readable `scheduler-v2-report-derivation.test.mjs`
+  (pl*-namespaced helpers, runtime-safe fixtures, nothing byte-copied); the blocked file is deleted
+  from Git + the worktree and its npm/verify entry removed. Every behavior preserved; the coverage
+  classifier tests upgraded to the stricter blocker-1 rules.
+- **Verification (all natural, exit 0):** node --check (0); test:report-derivation 66 -> **92**;
+  test:scheduler-v2 56; test:report-contracts 159; `npm run verify` terminates = **466** + build
+  (2,394 modules); `git diff --check` + `git status --short` clean. Total preserved at 466 (26 moved,
+  not lost). Removing the blocked file is what lets the chained verify complete.
