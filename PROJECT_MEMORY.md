@@ -4509,3 +4509,15 @@ cross-account data must continue to block the new snapshot and preserve last-kno
 
 **Deployment status:** still shadow mode. Nothing from this review was pushed, merged,
 deployed, migrated, or scheduled.
+
+## Review-to-next-tranche workflow (2026-08-10)
+
+Until Scheduler v2 is fully production-ready, every Codex senior review must end with:
+
+1. a clear approved/blocked result with verified findings and test evidence; and
+2. one ready-to-paste Claude prompt for the next smallest safe tranche.
+
+Claude must continue using small local commits on `feature/scheduler-v2`, update
+`PROJECT_MEMORY.md` and `SCHEDULER_V2.md`, and stop for Codex review without pushing,
+merging, deploying, applying migrations, or enabling schedules unless Codex explicitly
+approves that rollout step.
