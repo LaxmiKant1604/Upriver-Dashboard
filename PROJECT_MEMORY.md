@@ -4313,6 +4313,44 @@ unchanged; `HANDOFF.md` stays untracked. See SCHEDULER_V2.md section 24.
   correction should be narrowly scoped to worker context validation, dependency
   coverage, report contracts, and regression tests.
 
+### Scheduler v2 Phase 1d tranche 2 -- four blockers fixed (2026-08-10)
+
+All four Codex data-integrity blockers on the Daily Reporting + SKU P&L tranche are
+fixed on local branch `feature/scheduler-v2`. SHADOW MODE; nothing pushed, merged,
+deployed, or migrated; `HANDOFF.md` untouched/untracked. Commits `e5f6ec4` (contracts
+leaf) and `d2ad810` (registry + worker wiring + tests); both independently green on
+checkout (verified in a detached worktree). Full detail + state tables in
+`SCHEDULER_V2.md` section 25.
+
+- **Blocker 1 (derived context override).** New fail-closed `buildDeriveContext` in
+  `report-worker.js`: planned account/brand/from/to scope is authoritative, derived
+  inputs are restricted to a frozen per-report `derivedContextKeys` allowlist and can
+  never set a reserved scope key, and a non-object payload is treated as no input. The
+  snapshot identity stays in the planned scope; an injected `accountId`/`brand`/`from`/
+  `to`/`reportVersion` override is ignored.
+- **Blocker 2 (typed Ads coverage).** Daily's ALL path consumes a typed
+  `adsCoverage` contract (accountId, requested/coverage windows, validated,
+  latestMetricDate, requiredSourceStatus, adRows) validated by `evaluateDailyAdsCoverage`.
+  Only validated + right-account + fully-covered is usable (empty rows = genuine zero);
+  missing/failed/unvalidated/stale/partial/wrong-account block and preserve last-known-good;
+  malformed throws. Missing Ads is never silently zero.
+- **Blocker 3 (SKU P&L six-month contract).** `sku-pl` derive enforces
+  `validateSkuPlMonthlyWindows` before folding -- exactly six complete consecutive
+  calendar months matching `context.from/to`, one account, no missing/extra/duplicate/
+  overlapping/reordered month -- reusing the SAME strict route helpers
+  (`splitDateRangeByMonth`/`isFullCalendarMonthWindow`). A violation preserves
+  last-known-good with zero writes.
+- **Blocker 4 (cross-account contamination).** New `REPORT_SOURCE_SCOPE` policy marks
+  `daily-reporting` + `sku-pl` single-account; the resolver rejects a multi-account
+  scope for them (one account == one raw id, so >1 id => fail closed). Five-ID batching
+  is unchanged for every other report. Account A can never receive account B's
+  rows/catalog/brands.
+- **Verification.** `npm run verify` green = **421** (54+60+23+6+56+**56**+7+**159**) +
+  build (2,393 modules); `node --check` on every changed file exits 0; `git diff --check`
+  clean. report-derivation 44->56, report-contracts 155->159. Zero DataDoe calls during
+  derivation; golden `request_hash` and primary/dd-secondary isolation unchanged. STOP
+  point respected: no other adapters, cron wiring, or rollout started.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

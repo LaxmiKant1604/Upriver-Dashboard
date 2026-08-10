@@ -1252,3 +1252,128 @@ new, natural exit 0, zero fetch); `npm run test:scheduler-v2` = 56; `npm run tes
   the tested applier server-side is deferred and must not double-apply with the browser.
 - Remaining unchanged: the nine other adapters, per-brand daily snapshot planning, and Codex's live
   gates (no push/merge/deploy/migration/pg_cron until then).
+
+## 25. Phase 1d tranche 2 review -- four data-integrity blockers fixed (SHADOW MODE, 2026-08-10)
+
+Corrects the four data-integrity blockers Codex raised on the Daily Reporting + SKU P&L tranche
+(review commit `8a991d5`). SHADOW MODE; Scheduler v1 / frontend / manual refresh / design files
+untouched; nothing pushed/merged/deployed/migrated; `request_hash`, five-ID batching for other
+reports, and primary/dd-secondary isolation unchanged; `HANDOFF.md` stays untracked. Commits
+`e5f6ec4` (contracts leaf), `d2ad810` (registry + worker wiring + tests); docs follow. Both code
+commits are independently green on checkout (verified in a detached worktree).
+
+### 25.1 Blocker 1 -- derived context can never override the planned scope
+
+`report-worker.js` previously spread `derivedContext` AFTER `planned.context`, so an injected
+loader could replace `account`/`brand`/`from`/`to` while the snapshot params/hash still described
+the original plan. New exported pure `buildDeriveContext({entry, plannedContext, derivedContext,
+accountId, latestFetchedAt})`:
+
+- the PLANNED scope is authoritative (spread last; it always wins);
+- a derived input contributes ONLY the field names the report allowlists in a new frozen
+  `entry.derivedContextKeys` AND that are not reserved scope keys
+  (`RESERVED_CONTEXT_KEYS` = accountId/account/brand/from/to/params/version/reportVersion/
+  retrievedAt/context/sources) -- every other field (unexpected, or a scope-override attempt) is
+  dropped deterministically;
+- a non-object / array `derivedContext` is treated as no derived input (never spread field-wise);
+- `accountId`/`retrievedAt` are pinned from authoritative sources, never `Date.now()`.
+
+Only `daily-reporting` allowlists a derived key (`["adsCoverage"]`); every other report is `[]`.
+The snapshot `params` still come from `planned.context` only, so the snapshot identity stays in
+the planned scope. Proven end-to-end: a loader injecting `accountId:"OTHER"`/`brand:"Nike"`/bogus
+`from`/`to`/`reportVersion` still yields a snapshot keyed by the planned `A1`/`ALL`/window and the
+registry version.
+
+### 25.2 Blocker 2 -- typed Ads coverage contract (missing Ads != zero)
+
+`daily-reporting`'s ALL path no longer accepts a bare `adRows` array. It consumes a typed
+`context.adsCoverage` contract, validated by the new pure `evaluateDailyAdsCoverage(coverage,
+{accountId, from, to})` (built by the planner from persisted `ads_daily_source_rows`, never a live
+Ads export). Contract fields: `accountId`, `requested{from,to}`, `coverage{from,to}`, `validated`,
+`latestMetricDate` (freshness), `requiredSourceStatus`, `adRows`.
+
+| Coverage state | Trigger | Outcome |
+|---|---|---|
+| validated (zero) | validated, right account, source succeeded, window fully covered, `adRows=[]` | usable -- genuine zero advertising, merged as real zero |
+| validated (data) | as above with rows + a freshness marker inside coverage | usable |
+| wrong-account | `coverage.accountId !== planned.accountId` | block |
+| failed | `requiredSourceStatus` in {failed, skipped} | block |
+| missing | `requiredSourceStatus` in {missing, pending} OR `coverage.from/to` null | block |
+| unvalidated | `validated !== true` | block |
+| partial | `coverage.from > requested.from` (early days missing) | block |
+| stale | `coverage.to < requested.to` (sync behind) OR rows present with no freshness marker | block |
+| malformed | non-object, bad dates/enum, or `requested` != planned window | throw (fail closed) |
+
+The planned window is authoritative: the contract's `requested` must equal `context.from/to`
+(a mismatch throws). Any block throws inside derive -> `DERIVE_INVALID` -> last-known-good
+preserved, zero snapshot writes. Never silently turns missing Ads into zero.
+
+### 25.3 Blocker 3 -- SKU P&L six-complete-calendar-month contract enforced before save
+
+`sku-pl` derive now runs `validateSkuPlMonthlyWindows({from, to, windows, accountIds})` before
+folding, reusing the SAME strict route helpers (`splitDateRangeByMonth` / `isFullCalendarMonthWindow`
+from `api/datadoe.js` via the contracts leaf) -- no weaker duplicate. Requires:
+
+- `context.from`/`to` real calendar dates spanning EXACTLY six complete consecutive calendar
+  months (so `from` = first month start, `to` = last month end);
+- every monthly fragment window is a full calendar month with a valid `from<=to`;
+- the DISTINCT fragment months (first-appearance order) equal the six expected months in order --
+  rejecting a missing, extra, duplicated-as-different-window, overlapping, or reordered month
+  (repeated chunks of the SAME month with an identical window are allowed and sum in the fold);
+- defense-in-depth: fragments must not span more than one account.
+
+Malformed dates fail closed (return `ok:false`, never throw). A violation throws inside derive
+-> `DERIVE_INVALID` -> last-known-good preserved, zero writes. A missing month usually blocks even
+earlier at the source gate (a not-succeeded fragment makes the source key unavailable).
+
+### 25.4 Blocker 4 -- explicit report source-scope policy (no cross-account contamination)
+
+New `REPORT_SOURCE_SCOPE` policy + `reportAccountScope()` / `requiresSingleAccountSource()`:
+
+| Report | scope | why |
+|---|---|---|
+| daily-reporting | single-account | Product Catalog rows (+ derived brand map) carry no seller/vendor id |
+| sku-pl | single-account | Profit-by-SKU fold groups by (currency/sku/child_asin), no seller id |
+| every other report | multi-account | safe five-ID batching (grouped rows carry a partition key) |
+
+`reportSourceRequestHashes` rejects a multi-account scope for a single-account report (each account
+is exactly one raw seller/vendor id via `resolveDataDoeAccountIds`, so >1 id => >1 account =>
+throw, fail closed). Five-ID batching is untouched for every other report (6 ids still -> two
+chunks for brand-sales). Proven: account A and account B each derive from their OWN single-account
+request hashes, so A can never receive B's rows/catalog/brands; a sku-pl plan whose fragments span
+two accounts is blocked before the fold.
+
+### 25.5 Adapter state after the tranche-2 blocker fixes
+
+| Report | derive | approved | source scope | derived input contract |
+|---|---|---|---|---|
+| brand-sales | WIRED | yes | multi-account | -- |
+| content-changes | WIRED | yes | multi-account | -- |
+| daily-reporting | WIRED (ALL) | implemented, NOT approved | single-account | typed `adsCoverage` (validated/covered/right-account or block) |
+| sku-pl | WIRED | implemented, NOT approved | single-account | none baked (COGS applier stays separate/tested) |
+| other 9 | pending | -- | (per policy) | -- |
+
+User decisions preserved: SKU P&L snapshot is the RAW route-equivalent fold (no COGS baked in;
+the tested applier stays separate, browser applies overrides); Daily stores the ALL-brand
+snapshot only (no per-brand scheduled jobs); frontend / Scheduler v1 / manual refresh / design
+files unchanged; `request_hash` identity and five-ID behavior for unrelated reports unchanged.
+
+### 25.6 Verification
+
+`node --check` on every changed JS/MJS file exits 0; full `npm run verify` green = **421**
+(54 insights + 60 brand-view + 23 sync + 6 source-cache + 56 scheduler-v2 + **56** report-derivation
++ 7 source-identity + **159** report-contracts) + `build:check` (2,393 modules); `git diff --check`
+clean. report-derivation 44 -> 56 (+12 blocker regressions), report-contracts 155 -> 159 (+4). Zero
+DataDoe/fetch calls during derivation (fetch-spy + import-boundary tests still green); zero snapshot
+writes for invalid/partial inputs; last-known-good survives every failure; golden `request_hash`
+(`e498a480...` / `936e6d1b...`) unchanged; primary/dd-secondary isolation unchanged.
+
+### 25.7 Remaining / unresolved live assumptions (unchanged -- still gates Codex re-review)
+
+- The nine other adapters, per-brand daily snapshot planning, cron/route wiring, frontend refresh
+  removal, and all of Codex's prior live gates remain out of scope (no push/merge/deploy/migration).
+- The Ads coverage contract and single-account source jobs are enforced in shadow logic + tests; the
+  planner that actually BUILDS `adsCoverage` from `ads_daily_source_rows` and emits single-account
+  source jobs is the next (orchestration) tranche and must construct the typed contract faithfully.
+- Superset-vs-compact Daily reconciliation and Ads-history freshness remain live gates before any
+  cutover.
