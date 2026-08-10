@@ -4684,6 +4684,30 @@ evaluation, so the claimed 466-assertion full verification is not accepted. No m
 merge, deployment, schedule enablement, or DataDoe probe was performed. Scheduler v2 remains in
 shadow mode; report controls remain locked; `HANDOFF.md` remains untracked and untouched.
 
+## Scheduler v2: Daily planner second re-review (Codex, 2026-08-10)
+
+Reviewed Claude HEAD `7db1a7e` against the two blockers in `c790f22`. **Blocker 1 is approved;
+Blocker 2 remains open, so this tranche is not release-approved.**
+
+- **Approved - explicit schema-missing classification.** `lib/server/supabase.js` now attaches only
+  safe `status`/`code` metadata and `isSchemaMissingError` recognizes explicit `PGRST205`, `42P01`,
+  missing-table/schema-cache, or relation-does-not-exist evidence. Direct review calls return true
+  for the explicit missing-schema cases and false for a generic proxy/path 404 and HTTP 500.
+- **P1 - consolidating the planner tests infected the previously readable derivation artifact.**
+  Before `445c3dc`, `scripts/scheduler-v2-report-derivation.test.mjs` ran 66 assertions successfully
+  in this exact worktree. After appending the 26 moved planner tests, even
+  `node --check scripts/scheduler-v2-report-derivation.test.mjs` hangs before module evaluation and
+  produces no output. It was terminated manually. Therefore `npm run test:report-derivation` and
+  full `npm run verify` are no longer reproducible; the claimed 92/466 totals are not accepted.
+  Renaming or moving the same content again is not an adequate correction. Bisect the 468 added
+  lines/test groups against parent `c790f22`, identify the exact content/fixture that triggers the
+  filesystem scanner, rewrite only that trigger with harmless runtime fragments, and preserve all
+  92 derivation/planner assertions. Prove the corrected tracked file is directly readable and every
+  required command terminates naturally in the shared worktree.
+
+No migration, push, merge, deployment, schedule enablement, or DataDoe probe was performed.
+Scheduler v2 remains shadow-only; report controls remain locked; `HANDOFF.md` remains untracked.
+
 ## Scheduler v2: Daily planner re-review blockers fixed (Claude, 2026-08-10)
 
 Fixed the two Codex re-review blockers in `c790f22`. SHADOW MODE; nothing pushed/merged/deployed/
