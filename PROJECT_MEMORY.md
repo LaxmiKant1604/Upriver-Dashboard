@@ -5237,6 +5237,41 @@ production module, migration, or scheduler behavior changed.
   derivation code remains byte-unchanged, Scheduler v2 remains shadow-only, and report controls stay
   locked. The next functional tranche is Keyword Rank derivation from saved SQP/catalog sources.
 
+## Scheduler v2: Keyword Rank derivation review blockers (Codex, 2026-08-11)
+
+Reviewed Claude commits `36444d2`, `bdd8c10`, `458beea`, and `2019136`. The pure payload fold and
+direct cadence tests are useful, and the committed suite is green (`test:report-derivation` 169;
+full `npm run verify` 546 + 2,394-module build, exit 0), but this tranche is **not approved** yet.
+No production code was changed by this review; Scheduler v2 remains shadow-only and controls locked.
+
+1. **Account-scoped staged orchestration is missing.** `planKeywordRank` can accept one manually
+   supplied `weeklySignal`, but `buildShadowReportPlan` never accepts or forwards signals. The generic
+   source driver currently keys staged signals only by `requestKey`, which is unsafe for a cycle with
+   multiple accounts because one account's weekly period count can overwrite/gate another account.
+   Add an end-to-end shadow orchestration path keyed by canonical source identity/request hash (and
+   account/organization), proving account A with >=4 weekly periods creates no monthly request while
+   account B with <4 creates exactly one, including after a fresh invocation reconstructs persisted
+   signals. Never use a global request-key-only signal for per-account fallback decisions.
+2. **The source graph spends a catalog export too early.** Kickoff currently plans weekly SQP plus
+   catalog, although the live route fetches catalog only after the weekly/monthly cadence path
+   succeeds. Stage catalog after usable weekly (>=4) or successful required monthly fallback. A
+   failed/disabled weekly source, or failed/disabled required monthly fallback, must spend no catalog
+   token. This needs typed dependency metadata and staged-cycle tests, not UI input.
+3. **Terminal monthly disable is misclassified.** The adapter throws for a disabled optional monthly
+   source, so `deriveReportSnapshot` catches it as `status:"invalid"`; the test named "blocks" actually
+   asserts `invalid`. Preserve typed semantics: required-now + terminal-disabled monthly => `blocked`;
+   required-now + failed/missing cache => `unavailable`; malformed/wrong-window data => `invalid`.
+   Prove worker persistence/status and last-known-good behavior for each state.
+4. **SQP row dates are not validated against their source window.** Fragment metadata is pinned, but
+   `sqpDistinctPeriods` accepts any non-empty date string, so stale/out-of-window valid dates can select
+   the wrong cadence and enter a saved payload. Before cadence selection, require each SQP row to be a
+   plain object with a real calendar `date` inside its weekly/monthly fragment window. Any malformed or
+   out-of-window row must produce `invalid`, zero snapshot writes, and preserve last-known-good.
+
+Re-review gate: keep request hashes unchanged; preserve strict caps and primary/dd-secondary isolation;
+run the full staged source loop with two accounts; keep Keyword Rank locked; do not start another adapter,
+cron/frontend cutover, migration, push, merge, or deployment. `HANDOFF.md` remains untracked/untouched.
+
 ## Scheduler v2: Keyword Rank derivation + shadow planner wired (Claude, 2026-08-11)
 
 First functional tranche after the test-packaging approval. Wired the `keyword-rank` `derive:null`
