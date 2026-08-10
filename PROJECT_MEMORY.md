@@ -4621,3 +4621,33 @@ storage), `c8215d7` (tests + verify wiring); docs follow. Full detail in `SCHEDU
 - **Unresolved live gates:** apply `20260810_ads_sync_coverage.sql` + let the Ads sync backfill
   coverage windows before Daily can pass live; reconcile the superset-summed all-brand vs the
   compact total once; then Codex reviews the shadow plan against real saved rows.
+
+## Scheduler v2: Daily planner review blockers fixed (Claude, 2026-08-10)
+
+Fixed the six Codex blockers on the Daily/SKU shadow planner (recorded in `ee87a36`). SHADOW MODE;
+nothing pushed/merged/deployed/migrated/enabled; controls stay locked; `HANDOFF.md` untouched.
+Commits `bb7be24` (Ads read pagination + typed coverage errors), `adb8cf6` (window + availability +
+currency + test repackage); docs follow. Full detail in `SCHEDULER_V2.md` section 29.
+
+- **B1 exact Daily window.** Planner spans `monthBackStr(asOf, 5) .. asOf` (byte-identical to the
+  live `monthBack(TODAY,5).from`), not the 150-day approximation (2026-03-01, not 2026-03-04). New
+  pure `monthBackStr`, parity-tested against the live UI helper.
+- **B3 sales independent of Ads.** New `resolveDailyAdsAvailability`: the derive always saves the
+  validated sales snapshot and layers Ads on ONLY for proven-covered dates, with an explicit
+  `adsAvailability` state (validated / partial / stale / unavailable / failed) + covered window in
+  the payload. Uncovered periods are unavailable (never fabricated zero); a covered date with no
+  activity is genuine zero; Ads never blocks sales. Sales parity preserved independently.
+- **B4 currency.** Authoritative account currency in the planned context; every Ads row validated
+  against it (null/blank-on-nonzero, mismatched, mixed all fail -> Ads failed, sales save).
+- **B2 no Ads truncation.** `getAdDailyMetrics` keyset-paginates over the full primary key (no
+  skip/dup), with a documented hard limit that BLOCKS (throws) rather than returning a partial total.
+- **B6 typed coverage errors.** `getDailyAdsCoverage`/`recordAdsCoverageWindows` distinguish
+  schema-missing (unmigrated) from read/write failures, returning only safe codes (no secrets).
+- **B5 test artifact.** Repackaged as `scheduler-v2-shadow-planner.test.mjs` with runtime-built fake
+  keys (no credential-shaped literal in bytes); old path removed from git + worktree; 26 assertions.
+- **Verification.** `node --check` clean on every changed file; the repackaged suite runs naturally
+  (26 passed, exit 0); all ten verify suites pass individually = **466** + build (2,394 modules);
+  `git diff --check` clean. The chained `npm run verify` hangs on THIS machine only (sections 19/20
+  Defender on-access-scan artifact on freshly-written .mjs); a fresh Codex checkout completes.
+- **Live gates unchanged:** apply `20260810_ads_sync_coverage.sql`, let the Ads sync backfill
+  coverage windows, reconcile superset-vs-compact once; then Codex reviews before any readiness flip.
