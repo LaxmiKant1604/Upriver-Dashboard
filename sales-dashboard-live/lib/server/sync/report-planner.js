@@ -215,12 +215,13 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
 }
 
 /**
- * Plan Keyword Rank for ONE account. At kickoff (no `weeklySignal`) it emits the SQP-weekly probe
- * (asOf-84d..asOf) + the 365-day catalog; the monthly SQP source is a data-dependent FALLBACK and is
- * NOT planned at kickoff. When a typed `weeklySignal` (from the already-run weekly source this cycle)
- * satisfies the contract's `distinct_periods < 4` condition, the monthly SQP request (asOf-365d..asOf)
- * is activated -- exactly one -- via the resolver's fallback gate. All for the one raw seller id;
- * request_hash + organization isolation come from the shared resolver.
+ * Plan Keyword Rank for ONE account from that account's OWN typed weekly signal (Blocker 1: never a
+ * global request-key signal). Emits the SQP-weekly probe (asOf-84d..asOf) + the 365-day catalog, and --
+ * ONLY when the typed weekly signal makes the contract's `distinct_periods < 4` fallback apply -- the
+ * monthly SQP request (asOf-365d..asOf). The catalog window is always resolved here (the catalog
+ * contract is unconditional); the STAGED-cycle driver decides WHEN the catalog export is actually
+ * spent (never before the cadence is resolved -- Blocker 2). request_hash + primary/dd-secondary
+ * isolation come from the shared resolver (unchanged by staging).
  */
 export function planKeywordRank({ accountId, country, currency, connections, asOf, weeklySignal = null }) {
   const scope = resolveAccountScope({ accountId, country, currency, connections });
@@ -236,8 +237,8 @@ export function planKeywordRank({ accountId, country, currency, connections, asO
     dependencySignals["keyword-rank:sqp-weekly"] = weeklySignal;
     // Supply the monthly window ONLY when the typed weekly signal makes the fallback apply (fail
     // closed via the shared evaluateFallbackCondition); the resolver rejects an inapplicable window.
-    const monthly = (REPORT_SOURCE_CONTRACTS["keyword-rank"] || []).find((c) => c.requestKey === "keyword-rank:sqp-monthly");
-    if (monthly && evaluateFallbackCondition(monthly.condition, weeklySignal)) {
+    const monthlyContract = (REPORT_SOURCE_CONTRACTS["keyword-rank"] || []).find((c) => c.requestKey === "keyword-rank:sqp-monthly");
+    if (monthlyContract && evaluateFallbackCondition(monthlyContract.condition, weeklySignal)) {
       windowsByRequestKey["keyword-rank:sqp-monthly"] = [{ from: longFrom, to: end }];
     }
   }
