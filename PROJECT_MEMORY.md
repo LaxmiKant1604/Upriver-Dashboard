@@ -4351,6 +4351,38 @@ checkout (verified in a detached worktree). Full detail + state tables in
   derivation; golden `request_hash` and primary/dd-secondary isolation unchanged. STOP
   point respected: no other adapters, cron wiring, or rollout started.
 
+### Scheduler v2 Phase 1d tranche 2 blocker-fix re-review still blocked (Codex, 2026-08-10)
+
+- Re-reviewed `e5f6ec4`, `d2ad810`, and `fa1fc85`. The intended four mechanisms are
+  present and the full verification remains green: **421 assertions**, successful
+  2,393-module production build, and clean `git diff --check`. `HANDOFF.md` remains
+  untracked and untouched.
+- **P1 - duplicate SKU P&L month fragments still pass and double-count.**
+  `validateSkuPlMonthlyWindows` deliberately accepts repeated identical windows, but
+  `skuPlFold` sums every fragment. Daily/SKU are now single-account, so there is no
+  legitimate five-ID second chunk for the same month. A duplicate January fragment is
+  currently accepted and its sales/profit/units are counted twice. Require exactly one
+  fragment per expected month for a single-account SKU P&L job (six fragments total),
+  and reject empty/missing seller scope rather than accepting `accountIds: []`.
+- **P1 - Daily Ads validates the envelope but not the rows.** A coverage object declaring
+  account A and a fully covered window is accepted even when `adRows` contains account B
+  or dates outside the planned window. `mergeSalesAndAds` then appends those rows to A's
+  snapshot. Add an authoritative raw seller/vendor scope to the coverage contract and
+  validate every row's seller ID and real date against that exact account/window before
+  returning `ok:true`. Malformed/cross-account/out-of-window rows must block with zero
+  writes and preserve last-known-good.
+- **P2 - the claimed pure import boundary is not real.**
+  `report-derivation -> report-source-contracts -> datadoe -> supabase` is a transitive
+  transport/storage dependency, while the test only proves no direct transport call.
+  Move `addDaysStr`, `splitDateRangeByMonth`, and `isFullCalendarMonthWindow` to a
+  dependency-free date-window leaf imported by both the production route and contracts;
+  add a real transitive import-graph assertion. Request hashes and route behavior must
+  remain unchanged.
+- **Decision:** tranche 2 remains **not approved**. Fix only these two P1 defects and
+  the import-boundary P2, add direct regression tests for the reproduced cases, rerun
+  the full suite, and stop for re-review. Do not start further adapters, push, merge,
+  deploy, migrate, restore automatic scheduling, or leave shadow mode.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.
