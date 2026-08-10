@@ -29,6 +29,9 @@ import {
   validateAdsCurrencySignal,
   evaluateAdsCurrencyGate,
   normalizeFailurePolicy,
+  REPORT_SOURCE_SCOPE,
+  reportAccountScope,
+  requiresSingleAccountSource,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
@@ -254,10 +257,59 @@ test("sku-pl monthly windows resolve to one request per month (no cross-product)
     { from: "2025-07-01", to: "2025-07-31" },
     { from: "2025-08-01", to: "2025-08-06" },
   ];
-  const got = reportSourceRequestHashes({ reportKey: "sku-pl", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: { "sku-pl:monthly-profit": months } });
-  assert.equal(got.length, 3); // 1 source x 3 windows x 1 chunk (2 ids <= 5)
+  // sku-pl is account-scoped (Blocker 4): a single account, so one request per window.
+  const got = reportSourceRequestHashes({ reportKey: "sku-pl", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "sku-pl:monthly-profit": months } });
+  assert.equal(got.length, 3); // 1 source x 3 windows x 1 chunk (one account)
   assert.equal(new Set(got.map((r) => r.requestHash)).size, 3);
   assert.deepEqual(got.map((r) => ({ from: r.from, to: r.to })), months);
+});
+
+/* ---- Blocker 4: report source-scope policy (single-account contracts) ---- */
+
+test("source-scope policy: daily-reporting and sku-pl are single-account; others multi-account", () => {
+  assert.equal(REPORT_SOURCE_SCOPE["daily-reporting"], "single-account");
+  assert.equal(REPORT_SOURCE_SCOPE["sku-pl"], "single-account");
+  assert.equal(reportAccountScope("daily-reporting"), "single-account");
+  assert.equal(reportAccountScope("sku-pl"), "single-account");
+  assert.equal(requiresSingleAccountSource("sku-pl"), true);
+  assert.equal(requiresSingleAccountSource("daily-reporting"), true);
+  // Every other report keeps safe five-ID batching.
+  assert.equal(reportAccountScope("brand-sales"), "multi-account");
+  assert.equal(requiresSingleAccountSource("brand-sales"), false);
+  assert.equal(requiresSingleAccountSource("keyword-rank"), false);
+});
+
+test("sku-pl rejects a multi-account scope (grouped rows carry no seller/vendor partition key)", () => {
+  const months = [{ from: "2025-06-01", to: "2025-06-30" }];
+  // One account resolves normally.
+  const one = reportSourceRequestHashes({ reportKey: "sku-pl", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "sku-pl:monthly-profit": months } });
+  assert.equal(one.length, 1);
+  assert.deepEqual(one[0].sellerOrVendorIds, ["A1"]);
+  // Two accounts (two raw ids) are rejected fail-closed.
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "sku-pl", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: { "sku-pl:monthly-profit": months } }),
+    /account-scoped and must resolve a single account/,
+  );
+});
+
+test("daily-reporting rejects a multi-account scope; single account resolves", () => {
+  const dailyWin = {
+    "daily-reporting:asin-day-superset": [{ from: "2025-05-01", to: "2025-05-31" }],
+    "daily-reporting:catalog": [{ from: "2025-05-01", to: "2025-05-31" }],
+  };
+  const one = reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1"], windowsByRequestKey: dailyWin });
+  assert.ok(one.length >= 1 && one.every((r) => r.sellerOrVendorIds.length === 1));
+  assert.throws(
+    () => reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: dailyWin }),
+    /account-scoped and must resolve a single account/,
+  );
+});
+
+test("single-account rejection does NOT disable five-ID batching for other reports", () => {
+  // brand-sales still batches 6 ids into two chunks (unchanged).
+  const got = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ids(6), windowsByRequestKey: bsWin });
+  const ol = got.filter((r) => r.requestKey === "brand-sales:order-lines");
+  assert.equal(ol.length, 2, "6 ids -> two five-ID chunks preserved for multi-account reports");
 });
 
 test("different request keys receive ONLY their own windows", () => {

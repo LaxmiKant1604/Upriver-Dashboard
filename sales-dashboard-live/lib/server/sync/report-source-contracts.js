@@ -30,7 +30,11 @@
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
 import { chunkAccountIds } from "../id-batching.js";
-import { addDaysStr } from "../datadoe.js";
+// addDaysStr for the derived Sales Movers windows; the strict calendar-month helpers
+// (splitDateRangeByMonth / isFullCalendarMonthWindow) are the SAME helpers the production
+// SKU P&L route uses (api/datadoe.js), reused here so the scheduler enforces an identical
+// six-complete-calendar-month contract with no weaker duplicate validation.
+import { addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "../datadoe.js";
 
 /* ---- constants transcribed verbatim from api/datadoe.js (parity-tested) ---- */
 
@@ -790,6 +794,36 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
 //   * priority-feed — a command centre over the six insight reports' outputs.
 export const REPORT_DERIVED_ONLY = Object.freeze(["brand-view", "priority-feed"]);
 
+/* ===================== report source-scope policy (cross-account safety) =====================
+ * The generic resolver chunks the account scope into groups of five and creates one export per
+ * chunk, which is safe ONLY when the grouped rows carry a per-account partition key
+ * (seller_or_vendor_id) so a multi-account export can be split back to each account. Two report
+ * families do NOT satisfy that:
+ *   - sku-pl: the Profit-by-SKU fold groups by (currency|sku|child_asin) with NO
+ *     seller_or_vendor_id, so rows from accounts A and B in one five-ID export are unattributable.
+ *   - daily-reporting: the Product Catalog rows (and the derived brand map) carry no seller/vendor
+ *     identity, so a multi-account catalog export cannot be partitioned either.
+ * These are therefore "single-account" contracts: a source job for them MUST cover exactly one
+ * account (one raw seller/vendor id -- resolveDataDoeAccountIds maps one account to exactly one
+ * raw id). Every other report keeps safe five-ID batching. `reportAccountScope()` returns the
+ * policy; the resolver rejects a multi-account scope for a single-account report (fail closed).
+ */
+export const REPORT_SOURCE_SCOPE = Object.freeze({
+  "daily-reporting": "single-account",
+  "sku-pl": "single-account",
+});
+
+// The declared account-scope policy for a report ("single-account" | "multi-account"). Unlisted
+// reports default to "multi-account" (safe five-ID batching preserved).
+export function reportAccountScope(reportKey) {
+  return REPORT_SOURCE_SCOPE[reportKey] || "multi-account";
+}
+
+// True when a report requires single-account source jobs (no cross-account batching).
+export function requiresSingleAccountSource(reportKey) {
+  return reportAccountScope(reportKey) === "single-account";
+}
+
 // Deterministic, scheduler-owned derivation strategy for reports whose saved source
 // rows produce more than one UI output. Not controlled by browser input.
 export const REPORT_DERIVATION = Object.freeze({
@@ -939,6 +973,147 @@ export function isValidCalendarDate(value) {
   if (typeof value !== "string" || !ISO_DATE.test(value)) return false;
   const dt = new Date(`${value}T00:00:00Z`);
   return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === value;
+}
+
+/* ===================== Daily Reporting: typed Ads coverage contract =====================
+ * An empty `adRows` array is ambiguous: it can mean GENUINE zero advertising, or it can mean the
+ * Ads state is missing / the Ads sync failed / the data is stale / the window is only partially
+ * covered / the rows belong to another account. Daily Reporting's ALL-brand snapshot must NEVER
+ * silently turn any of those into "zero ads". So the derive receives a TYPED coverage contract
+ * (built by the planner from authoritative persisted Ads state -- ads_daily_source_rows -- NEVER
+ * from a live Ads export) and this function decides whether it is a trustworthy basis:
+ *
+ *   coverage = {
+ *     accountId,                 // the account the persisted Ads state is for
+ *     requested: { from, to },   // the window the loader was asked to cover (echoed; cross-checked)
+ *     coverage:  { from, to },   // the window the persisted state actually validated (null = none)
+ *     validated,                 // was the persisted Ads state validated this cycle?
+ *     latestMetricDate,          // freshness: newest day with real ad activity (null = none)
+ *     requiredSourceStatus,      // the required Ads source job status this cycle
+ *     adRows,                    // the persisted Ads rows for the window (array; [] is legal)
+ *   }
+ *
+ * Returns { ok, status, adRows }. `ok:true` (status "validated") ONLY when the state is validated,
+ * for the RIGHT account, its required source succeeded, and the validated coverage window fully
+ * spans the PLANNED (authoritative) requested window -- then an empty adRows is genuine zero. Any
+ * other case returns ok:false with a typed status the caller turns into a block (last-known-good
+ * preserved, snapshot not overwritten). A structurally malformed contract, or one built for a
+ * DIFFERENT window than the planned one, THROWS (fail closed) -- it is a wiring error, not data.
+ */
+const ADS_REQUIRED_SOURCE_STATUSES = new Set(["succeeded", "failed", "skipped", "pending", "missing"]);
+
+function assertCoverageDateOrNull(value, label) {
+  if (!(value === null || isValidCalendarDate(value))) {
+    throw new Error(`Ads coverage ${label} must be a real YYYY-MM-DD calendar date or null.`);
+  }
+}
+
+export function evaluateDailyAdsCoverage(coverage, planned) {
+  if (!planned || typeof planned !== "object"
+    || !isValidCalendarDate(planned.from) || !isValidCalendarDate(planned.to) || planned.from > planned.to) {
+    throw new Error("evaluateDailyAdsCoverage requires a planned { accountId, from<=to } window (real calendar dates).");
+  }
+  if (coverage == null || typeof coverage !== "object" || Array.isArray(coverage)) {
+    throw new Error("Ads coverage must be a typed object (never a bare array/null); a missing load is not zero ads.");
+  }
+  const { accountId, requested, coverage: cov, validated, latestMetricDate, requiredSourceStatus, adRows } = coverage;
+  // ---- structural validation (fail closed on anything malformed) ----
+  if (typeof accountId !== "string" || !accountId) throw new Error("Ads coverage.accountId must be a non-empty string.");
+  if (!requested || typeof requested !== "object") throw new Error("Ads coverage.requested must be a { from, to } object.");
+  assertCoverageDateOrNull(requested.from, "requested.from");
+  assertCoverageDateOrNull(requested.to, "requested.to");
+  if (!cov || typeof cov !== "object") throw new Error("Ads coverage.coverage must be a { from, to } object.");
+  assertCoverageDateOrNull(cov.from, "coverage.from");
+  assertCoverageDateOrNull(cov.to, "coverage.to");
+  if (typeof validated !== "boolean") throw new Error("Ads coverage.validated must be a boolean.");
+  assertCoverageDateOrNull(latestMetricDate == null ? null : latestMetricDate, "latestMetricDate");
+  if (!ADS_REQUIRED_SOURCE_STATUSES.has(requiredSourceStatus)) {
+    throw new Error(`Ads coverage.requiredSourceStatus "${requiredSourceStatus}" is not a recognised status.`);
+  }
+  if (!Array.isArray(adRows)) throw new Error("Ads coverage.adRows must be an array ([] when there is no ad activity).");
+  // The contract must be for the SAME window the plan authoritatively requested; a loader claiming
+  // a different requested window is a wiring bug, and the planned window is the ONLY authority.
+  if (requested.from !== planned.from || requested.to !== planned.to) {
+    throw new Error("Ads coverage.requested window does not match the planned Daily window (planned scope is authoritative).");
+  }
+  // ---- typed classification (each non-ok status BLOCKS; genuine zero is the only empty pass) ----
+  if (accountId !== planned.accountId) return { ok: false, status: "wrong-account", adRows: [] };
+  if (requiredSourceStatus === "failed" || requiredSourceStatus === "skipped") return { ok: false, status: "failed", adRows: [] };
+  if (requiredSourceStatus !== "succeeded") return { ok: false, status: "missing", adRows: [] };
+  if (!validated) return { ok: false, status: "unvalidated", adRows: [] };
+  if (cov.from === null || cov.to === null) return { ok: false, status: "missing", adRows: [] };
+  if (cov.from > planned.from) return { ok: false, status: "partial", adRows: [] };
+  if (cov.to < planned.to) return { ok: false, status: "stale", adRows: [] };
+  // Freshness consistency: real ad rows must carry a freshness marker inside the coverage window.
+  if (adRows.length > 0) {
+    if (latestMetricDate == null || latestMetricDate < cov.from || latestMetricDate > cov.to) {
+      return { ok: false, status: "stale", adRows: [] };
+    }
+  }
+  // Validated, right account, required source succeeded, window fully covered: an empty adRows here
+  // is GENUINE zero advertising and may be merged as real zero.
+  return { ok: true, status: "validated", adRows };
+}
+
+/* ===================== SKU P&L: strict six-complete-calendar-month contract =====================
+ * The production sku-pl route (api/datadoe.js) requires exactly ONE account and exactly SIX
+ * complete calendar months (`windows.length !== 6 || windows.some(w => !isFullCalendarMonthWindow(w))`).
+ * The scheduler adapter must enforce the SAME contract before saving a snapshot, reusing the SAME
+ * strict calendar helpers (splitDateRangeByMonth / isFullCalendarMonthWindow) rather than a weaker
+ * duplicate. Given the planned window (context.from/to) and the actual monthly fragment windows,
+ * this returns { ok, reason } and NEVER throws on data (malformed dates fail closed to ok:false):
+ *   - context.from/to must be real calendar dates spanning exactly six complete consecutive months
+ *     (splitDateRangeByMonth is consecutive by construction; requiring all six to be full calendar
+ *     months forces from=first-month-start and to=last-month-end);
+ *   - every fragment window must itself be a full calendar month with a valid from<=to;
+ *   - the DISTINCT fragment months (first-appearance order) must equal the six expected months in
+ *     order -- rejecting a missing, extra, duplicated-as-different-window, overlapping, or reordered
+ *     month. Repeated chunks of the SAME month (identical window) are allowed (they sum in the fold);
+ *   - optionally, the fragments must not span more than one account (defense-in-depth; the resolver
+ *     already forbids multi-account source jobs for sku-pl).
+ */
+export function validateSkuPlMonthlyWindows({ from, to, windows, accountIds } = {}) {
+  if (!isValidCalendarDate(from) || !isValidCalendarDate(to) || from > to) {
+    return { ok: false, reason: "invalid-context-window" };
+  }
+  const expected = splitDateRangeByMonth(from, to);
+  if (expected.length !== 6 || expected.some((w) => !isFullCalendarMonthWindow(w))) {
+    return { ok: false, reason: "not-six-complete-calendar-months" };
+  }
+  if (!Array.isArray(windows) || windows.length === 0) {
+    return { ok: false, reason: "no-monthly-fragments" };
+  }
+  // Defense-in-depth single-account check: reject fragments that provably span >1 account.
+  if (Array.isArray(accountIds)) {
+    const distinct = new Set(accountIds.map((id) => String(id)).filter(Boolean));
+    if (distinct.size > 1) return { ok: false, reason: "multiple-accounts" };
+  }
+  const byMonth = new Map(); // monthKey -> { from, to }
+  const orderedKeys = [];
+  for (const w of windows) {
+    if (!w || !isValidCalendarDate(w.from) || !isValidCalendarDate(w.to)) {
+      return { ok: false, reason: "malformed-fragment-window" };
+    }
+    if (!isFullCalendarMonthWindow(w)) return { ok: false, reason: "fragment-not-full-calendar-month" };
+    const monthKey = w.from.slice(0, 7);
+    if (byMonth.has(monthKey)) {
+      const prev = byMonth.get(monthKey);
+      // A repeated chunk of the same month must carry the IDENTICAL window; a different window for
+      // the same month is an overlapping/inconsistent fragment.
+      if (prev.from !== w.from || prev.to !== w.to) return { ok: false, reason: "inconsistent-month-window" };
+    } else {
+      byMonth.set(monthKey, { from: w.from, to: w.to });
+      orderedKeys.push(monthKey);
+    }
+  }
+  const expectedKeys = expected.map((w) => w.from.slice(0, 7));
+  if (orderedKeys.length !== expectedKeys.length) return { ok: false, reason: "month-count-mismatch" };
+  for (let i = 0; i < expectedKeys.length; i += 1) {
+    if (orderedKeys[i] !== expectedKeys[i]) return { ok: false, reason: "month-set-or-order-mismatch" };
+    const got = byMonth.get(orderedKeys[i]);
+    if (got.from !== expected[i].from || got.to !== expected[i].to) return { ok: false, reason: "window-boundary-mismatch" };
+  }
+  return { ok: true, reason: null, months: expectedKeys };
 }
 
 export function validateStagedSignal(signal) {
@@ -1220,6 +1395,23 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
   // windows just to receive an empty result.
   const chunks = chunkAccountIds(ids);
   if (chunks.length === 0) return [];
+
+  // Cross-account safety (report source-scope policy): a single-account contract MUST resolve
+  // exactly one account per source job, because its grouped rows carry no per-account partition
+  // key and a multi-account export could not be split back (see REPORT_SOURCE_SCOPE). Each account
+  // is exactly one raw seller/vendor id (resolveDataDoeAccountIds), so a scope with more than one
+  // id means more than one account: reject it fail-closed. Five-ID batching is unaffected for
+  // every other (multi-account) report.
+  if (requiresSingleAccountSource(reportKey)) {
+    const scopeSize = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    if (scopeSize > 1) {
+      throw new Error(
+        `Report "${reportKey}" is account-scoped and must resolve a single account per source job; `
+        + `got ${scopeSize} accounts. Multi-account resolution is rejected because its grouped rows `
+        + `carry no seller/vendor partition key.`,
+      );
+    }
+  }
 
   const windowsMap = windowsByRequestKey || {};
   const declaredKeys = contracts.map((c) => c.requestKey);
