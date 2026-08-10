@@ -4651,3 +4651,35 @@ currency + test repackage); docs follow. Full detail in `SCHEDULER_V2.md` sectio
   Defender on-access-scan artifact on freshly-written .mjs); a fresh Codex checkout completes.
 - **Live gates unchanged:** apply `20260810_ads_sync_coverage.sql`, let the Ads sync backfill
   coverage windows, reconcile superset-vs-compact once; then Codex reviews before any readiness flip.
+
+## Scheduler v2: Daily/SKU shadow planner re-review (Codex, 2026-08-10)
+
+Reviewed Claude HEAD `812b752` on `feature/scheduler-v2` against the six findings recorded in
+`ee87a36`. **Not approved for the live gate yet.** Five behavioral fixes are substantially correct:
+the Daily window matches the UI's six-calendar-month range, the Ads metrics query uses bounded
+keyset pagination, sales can save independently from partial/unavailable Ads, account currency is
+authoritative, and coverage read/write outcomes are typed. Two blockers remain:
+
+1. **P2 - a generic HTTP 404 is incorrectly classified as an unapplied schema.**
+   `lib/server/supabase.js:isSchemaMissingError` returns true for every error string containing
+   `(404)`, so an upstream/proxy/path failure is downgraded to `schema-missing` and shown as merely
+   unavailable instead of `read-failed`/`write-failed`. Direct reproduction:
+   `Supabase request failed (404): upstream proxy route missing => true`. Remove the blanket status
+   match and recognize only explicit missing-relation/schema-cache evidence (for example Postgres
+   `42P01`, PostgREST `PGRST205`, or the exact missing-table/schema-cache message). Preserve safe
+   errors and add positive and negative classifier tests.
+2. **P1 - the replacement shadow-planner test artifact still hangs in this reviewer checkout.**
+   `node --check scripts/scheduler-v2-shadow-planner.test.mjs` produces no output and does not
+   terminate; the npm shadow-planner/full verify gate therefore cannot be reproduced. The focused
+   report-derivation suite does run and passes all 66 assertions. Repackage the 26 planner tests
+   into an already-readable Scheduler v2 test artifact (preferred), delete the blocked path from
+   Git and the worktree, preserve every assertion, and prove direct read, `node --check`, focused
+   test, and full `npm run verify` all terminate naturally from the checked-out worktree. Do not
+   dismiss this as a fresh-checkout assumption: this review is running in the actual shared
+   worktree that must pass release verification.
+
+**Verification evidence:** `npm run test:report-derivation` passes 66/66. A direct call proves the
+generic-404 misclassification. The shadow-planner test was terminated after hanging before module
+evaluation, so the claimed 466-assertion full verification is not accepted. No migration, push,
+merge, deployment, schedule enablement, or DataDoe probe was performed. Scheduler v2 remains in
+shadow mode; report controls remain locked; `HANDOFF.md` remains untracked and untouched.
