@@ -2048,3 +2048,44 @@ Aggregate: `npm run test:scheduler-v2` = 56 + 1 = **57**; `npm run test:report-d
 clean; `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). The approved
 strict contracts, FBA window validation, source worker, and `api/datadoe.js` are untouched. Scheduler v2
 remains SHADOW MODE with both reports locked.
+
+## 37. Scheduler-v2 base test moved to a fresh path/inode (scheduler-v2-core.test.js) (SHADOW MODE, 2026-08-10)
+
+Clears the second re-review's remaining blocker: restoring approved bytes to
+`scripts/scheduler-v2-verification.test.mjs` did NOT clear that path/inode's scan state in the review
+worktree (its metadata/head-read did not return after 25+ s; `test:scheduler-v2` emitted no output and
+had to be interrupted), while the small `fba-strict-source-worker.test.js` reads/checks/runs/exits
+cleanly. Test-packaging only. The APPROVED production code is byte-unchanged since `6a11d97`
+(strict FBA/reconciliation contracts, exact inventory + AWD window validation, report derivation,
+request identity, source worker, `api/datadoe.js`), and `fba-strict-source-worker.test.js` is unchanged.
+
+### 37.1 Fix (genuinely fresh path/inode; old path removed)
+
+- Created `scripts/scheduler-v2-core.test.js` from the CLEAN approved `602feea` Git BLOB
+  (`git show 602feea:sales-dashboard-live/scripts/scheduler-v2-verification.test.mjs > scripts/scheduler-v2-core.test.js`)
+  -- content obtained from the object store, NOT by reading the blocked worktree path, NOT a `git mv` /
+  filesystem rename. `cmp` against the blob confirms byte-identical; the new file has a fresh inode
+  (distinct from the old path's). All 56 base assertions are preserved exactly; the FBA assertion is NOT
+  added here. The `.js` file stays ESM via the package's `"type":"module"`.
+- Removed the blocked `scripts/scheduler-v2-verification.test.mjs` from the index + worktree (`git rm`);
+  the commit removes it from the HEAD tree.
+- `package.json`: `test:scheduler-v2 = node scripts/scheduler-v2-core.test.js && node
+  scripts/fba-strict-source-worker.test.js` (56 + 1 = **57**).
+
+Note on `git status`: it renders the change as `R <old.mjs> -> scheduler-v2-core.test.js` because the
+content is identical -- that is git's diff-time similarity DETECTION, not a filesystem rename and not
+inode preservation. On any fresh checkout git deletes the old path and writes a brand-new file (fresh
+inode) at the new path, so the quarantined inode does not survive.
+
+### 37.2 Verification (each file separately; natural exit 0)
+
+Old path proven gone: `fs.existsSync` false, `git ls-files` absent, `git ls-tree -r HEAD` absent
+(post-commit). Each new file: `fs.statSync` + a five-line head read return immediately; `node --check`
+exit 0; a direct `node <file>` run terminates naturally with process exit **0**
+(`scheduler-v2-core.test.js` = `ran 56/56, 56 passed`; `fba-strict-source-worker.test.js` = `1 passed`);
+both are pure in-memory with no lingering handles. Aggregate: `npm run test:scheduler-v2` = 56 + 1 =
+**57**; `npm run test:report-derivation` (**145**); `npm run test:report-contracts` (**161**);
+`npm run test:source-identity` (7); `npm run verify` = **522**
+(54+60+23+6+**57**+145+7+161+9) + `build:check` (2,394 modules, built ~7s); `git diff --check` clean;
+`git status --short` shows only the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains
+SHADOW MODE with both reports locked.

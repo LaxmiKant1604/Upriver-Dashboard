@@ -5084,3 +5084,29 @@ locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 36.
   direct run exit code 0 (base 56/56; new 1). Aggregate: `test:scheduler-v2` **57**;
   `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
   = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: base test moved to a fresh path/inode (scheduler-v2-core.test.js) (Claude, 2026-08-10)
+
+Cleared the second re-review's remaining blocker: restoring approved bytes to the same path did NOT
+clear `scripts/scheduler-v2-verification.test.mjs`'s path/inode scan state in the review worktree
+(metadata/head-read hung >25s; `test:scheduler-v2` produced no output and had to be interrupted). The
+proven fresh-inode approach (from the report-derivation-test saga) was applied. **Test-packaging only** --
+production code is byte-unchanged since `6a11d97` (strict contracts, exact inventory + AWD window
+validation, report derivation, request identity, source worker, `api/datadoe.js`), and
+`fba-strict-source-worker.test.js` is unchanged. SHADOW MODE; nothing pushed/merged/deployed/migrated;
+controls locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 37.
+
+- **Fresh file.** `scripts/scheduler-v2-core.test.js` created from the clean `602feea` Git BLOB
+  (`git show 602feea:<old.mjs> > scripts/scheduler-v2-core.test.js`) -- from the object store, NOT the
+  blocked worktree path, NOT `git mv`/rename. `cmp` byte-identical to the blob; fresh inode; all 56 base
+  assertions preserved exactly; FBA assertion NOT added here; stays ESM via `"type":"module"`.
+- **Old path removed.** `git rm scripts/scheduler-v2-verification.test.mjs` (index + worktree); the
+  commit removes it from the HEAD tree. `git status` shows `R` (content-similarity detection only, not a
+  filesystem rename -- a fresh checkout writes a brand-new inode at the new path).
+- **Wiring.** `test:scheduler-v2 = node scripts/scheduler-v2-core.test.js && node
+  scripts/fba-strict-source-worker.test.js` (56 + 1 = **57**).
+- **Verification (each file separately; natural exit 0).** Old path gone: `fs.existsSync` false,
+  `git ls-files` + `git ls-tree -r HEAD` absent. Each new file: stat + head read immediate; `node --check`
+  0; direct run exit code 0 (core 56/56; fba 1). Aggregate: `test:scheduler-v2` **57**;
+  `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
+  = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
