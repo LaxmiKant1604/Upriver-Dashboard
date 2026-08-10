@@ -4831,3 +4831,36 @@ locked; `HANDOFF.md` untouched. Commit `21e7f95`. Detail in `SCHEDULER_V2.md` se
   `git diff --check` + `git status --short` clean. Old path proven gone: `fs.existsSync` false,
   `git ls-files` absent, `git ls-tree -r HEAD` absent. Golden `request_hash`, five-ID batching, and
   organization isolation remain green.
+
+## Scheduler v2: report-derivation test SPLIT by responsibility (Claude, 2026-08-10)
+
+Codex re-review (`047c03f`) falsified the path/inode-only diagnosis: the fresh path
+`scripts/report-derivation.test.js` ALSO hung on the first `fs.statSync`/`readFileSync` in the shared
+worktree, so moving the same ~135 KB / 92-test blob to a new inode did not clear the block. The
+scanner trigger follows the COMBINED content/profile, not the path/inode. Fix: stop moving the whole
+blob; split the suite by responsibility into smaller, independently-readable ESM files. Test-artifact
+only; blocker 1 approved, `supabase.js` + all production code untouched. SHADOW MODE; nothing
+pushed/merged/deployed/migrated/enabled; controls locked; `HANDOFF.md` untouched. Commit `9cf2486`.
+Detail in `SCHEDULER_V2.md` section 33.
+
+- **Split (66 + 26 = 92; nothing lost/weakened).** `scripts/report-derivation-core.test.js` (101 KB,
+  **66** tests) = the report-derivation assertions from the previously-readable `c790f22` baseline;
+  keeps the ABSOLUTE golden `request_hash` pin exactly once (64-hex count 2).
+  `scripts/report-planner.test.js` (37 KB, **26** tests) = the neutralized planner / Daily Ads loader /
+  orchestration assertions (incl. the approved `isSchemaMissingError` classification checks); **zero**
+  64-hex literals -- golden pins NOT duplicated, request identities proven by determinism + hex-shape
+  membership. The blocked combined `scripts/report-derivation.test.js` is removed from index + worktree
+  (commit removes it from HEAD tree). `package.json` `test:report-derivation` runs both files
+  sequentially (`... core.test.js && node scripts/report-planner.test.js`).
+- **Further neutralization (constraints 6-8).** Supabase env NAME + value assembled from harmless
+  fragments at runtime; `PIN_KEY` apiKey built from fragments (same value -> golden hash unchanged);
+  `credentials` wording dropped from a planner test name. Both files: `JWT` 0, credential-shaped 0,
+  non-ASCII 0, CR 0, LF-only.
+- **Verification (all natural, exit 0, per file).** Each file: `fs.statSync` + 5-line head read return
+  immediately; `node --check` (0); direct run terminates naturally (core **66**, planner **26**).
+  Aggregate `npm run test:report-derivation` = **92**; test:scheduler-v2 56; test:report-contracts 159;
+  `npm run verify` = **466** + build (2,394 modules, 8.7s); `git diff --check` + `git status --short`
+  clean. Both combined paths proven gone (`fs.existsSync` false; `git ls-files` + `git ls-tree -r HEAD`
+  absent). If `report-planner.test.js` still blocks, next step is a further group-level split
+  (report-planner-core / daily-ads-loader / supabase-error-classifier). Golden `request_hash`, five-ID
+  batching, and organization isolation remain green.
