@@ -33,8 +33,8 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 // Bindings assigned in main() after the dummy env is set.
 let REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads,
     shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS;
-let runReportJobs, assembleSources;
-let reportSourceRequestHashes, isValidCalendarDate;
+let runReportJobs, assembleSources, buildDeriveContext;
+let reportSourceRequestHashes, isValidCalendarDate, evaluateDailyAdsCoverage, validateSkuPlMonthlyWindows;
 let makeShadowSnapshotSaver;
 // Leaf (Scheduler v2) pure cores.
 let orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload;
@@ -786,6 +786,20 @@ const DR_ADS = [
   { date: "2025-05-03", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 7, ad_spend: 2, ad_clicks: 1 }, // ad-only day => synthetic row
 ];
 
+// The Daily reporting window and a VALID typed Ads coverage contract for it (Blocker 2). Tests
+// override individual fields to exercise the missing/failed/stale/partial/wrong-account states.
+const DR_FROM = "2025-05-01", DR_TO = "2025-06-30";
+const adsCoverage = (over = {}) => ({
+  accountId: "A1",
+  requested: { from: DR_FROM, to: DR_TO },
+  coverage: { from: DR_FROM, to: DR_TO },
+  validated: true,
+  latestMetricDate: "2025-05-03",
+  requiredSourceStatus: "succeeded",
+  adRows: DR_ADS,
+  ...over,
+});
+
 // Independent oracle for the compact all-brand export: sum the superset per (date, seller),
 // first-seen order (this is what DataDoe's server-side group-by-date produces from the same source).
 function compactOracleFromSuperset(rows) {
@@ -859,12 +873,13 @@ function seedDailyCycle() {
     ["h_cat", DR_CATALOG],
   ]));
   const plannedReports = [plan("daily-reporting", "A1", [
-    src("daily-reporting:asin-day-superset", "h_may_c0", { sellerOrVendorIds: ["S1", "b", "c", "d", "e"], from: "2025-05-01", to: "2025-05-31" }),
+    src("daily-reporting:asin-day-superset", "h_may_c0", { sellerOrVendorIds: ["S1"], from: "2025-05-01", to: "2025-05-31" }),
     src("daily-reporting:asin-day-superset", "h_may_c1", { sellerOrVendorIds: ["S2"], from: "2025-05-01", to: "2025-05-31" }),
     src("daily-reporting:asin-day-superset", "h_jun_c0", { from: "2025-06-01", to: "2025-06-30" }),
     src("daily-reporting:catalog", "h_cat"),
-  ], { context: { brand: "ALL" } })];
-  const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adRows: DR_ADS } : {});
+  ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO } })];
+  // Ads are injected as a typed, validated coverage contract (Blocker 2), never a bare array.
+  const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage() } : {});
   return { store, loader, plannedReports, loadDerivedContext };
 }
 
@@ -885,7 +900,7 @@ test("daily worker: derives the ALL-brand shadow snapshot from saved fragments w
     assert.equal(snap.payload.brandFiltered, false);
     assert.equal(j.row_count, snap.payload.rows.length, "row_count is the real payload row count");
     assert.equal(snap.params.brand, "ALL", "brand IS a snapshot param (cache key)");
-    assert.ok(!("adRows" in snap.params), "injected adRows never leak into the snapshot params");
+    assert.ok(!("adRows" in snap.params) && !("adsCoverage" in snap.params), "injected Ads inputs never leak into the snapshot params");
     // idempotent second invocation.
     const r2 = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext });
     assert.equal(r2.processed, 0, "finished report not re-derived");
@@ -971,13 +986,14 @@ test("sku-pl payload: assembler EQUALS the route payload assembly (months/curren
 
 test("sku-pl worker: folds monthly fragments into the shadow snapshot with ZERO fetch; date=to; no extra source job; idempotent", async () => {
   const store = makeMemoryReportStore();
-  const months = [["h_m1", "2025-01"], ["h_m2", "2025-02"], ["h_m3", "2025-03"], ["h_m4", "2025-04"], ["h_m5", "2025-05"], ["h_m6", "2025-06"]];
+  // Six COMPLETE calendar months (Blocker 3): full month-end days, not a lax -28.
+  const months = [["h_m1", "2025-01", "2025-01-31"], ["h_m2", "2025-02", "2025-02-28"], ["h_m3", "2025-03", "2025-03-31"], ["h_m4", "2025-04", "2025-04-30"], ["h_m5", "2025-05", "2025-05-31"], ["h_m6", "2025-06", "2025-06-30"]];
   const loaderMap = new Map();
   months.forEach(([h], i) => { store.seedSource(h, "succeeded"); loaderMap.set(h, SKU_BATCHES[i].rows); });
   const loader = makeCacheLoader(loaderMap);
   const sourceJobsBefore = store._sourceJobs.length;
   const plannedReports = [plan("sku-pl", "A1",
-    months.map(([h, mk]) => src("sku-pl:monthly-profit", h, { from: `${mk}-01`, to: `${mk}-28` })),
+    months.map(([h, mk, end]) => src("sku-pl:monthly-profit", h, { from: `${mk}-01`, to: end, sellerOrVendorIds: ["A1"] })),
     { context: { from: "2025-01-01", to: "2025-06-30" } })];
   await withFetchSpy(async (calls) => {
     const saver = makeSnapshotSaver(store);
@@ -1046,12 +1062,228 @@ test("sku-pl worker: a malformed monthly fragment blocks derivation and preserve
   assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
 });
 
+/* ===================== tranche-2 review blockers (data integrity) ===================== */
+
+group("tranche-2 blocker 1: derived context never overrides planned scope");
+
+test("B1 unit: planned scope is authoritative; only allowlisted derived keys pass; reserved/unexpected dropped", async () => {
+  const entry = REPORT_DERIVATIONS["daily-reporting"]; // allowlist = ["adsCoverage"]
+  assert.deepEqual([...entry.derivedContextKeys], ["adsCoverage"], "daily-reporting allowlists only adsCoverage");
+  const ctx = buildDeriveContext({
+    entry,
+    plannedContext: { brand: "ALL", from: "2025-05-01", to: "2025-06-30" },
+    // A hostile loader tries to (a) override planned scope and (b) inject an unexpected field.
+    derivedContext: { adsCoverage: { tag: "ok" }, accountId: "EVIL", brand: "EVIL", from: "1999-01-01", to: "1999-12-31", reportVersion: "x", evilRows: [1, 2] },
+    accountId: "A1",
+    latestFetchedAt: "2025-06-30T00:00:00Z",
+  });
+  assert.equal(ctx.accountId, "A1", "accountId pinned to the planned account, not the injected one");
+  assert.equal(ctx.brand, "ALL", "planned brand wins");
+  assert.equal(ctx.from, "2025-05-01", "planned from wins");
+  assert.equal(ctx.to, "2025-06-30", "planned to wins");
+  assert.ok(!("reportVersion" in ctx) || ctx.reportVersion !== "x", "reserved reportVersion not overridden");
+  assert.ok(!("evilRows" in ctx), "unexpected (unallowlisted) derived field dropped");
+  assert.deepEqual(ctx.adsCoverage, { tag: "ok" }, "the ONE allowlisted derived key passes through");
+});
+
+test("B1 unit: a non-object derived payload is treated as no derived input (never spread field-wise)", async () => {
+  const entry = REPORT_DERIVATIONS["daily-reporting"];
+  for (const bad of [null, undefined, ["adsCoverage"], "adsCoverage", 42]) {
+    const ctx = buildDeriveContext({ entry, plannedContext: { brand: "ALL" }, derivedContext: bad, accountId: "A1", latestFetchedAt: null });
+    assert.ok(!("adsCoverage" in ctx), "no derived field leaks from a malformed derived payload");
+    assert.equal(ctx.accountId, "A1");
+    assert.equal(ctx.brand, "ALL");
+  }
+});
+
+test("B1 e2e: a loader injecting scope overrides cannot move the snapshot identity out of planned scope", async () => {
+  const { store, loader, plannedReports } = seedDailyCycle();
+  // Loader returns valid coverage PLUS an attempt to override account/brand/from/to.
+  const evilLoader = ({ reportKey }) => (reportKey === "daily-reporting"
+    ? { adsCoverage: adsCoverage(), accountId: "OTHER", brand: "Nike", from: "1999-01-01", to: "1999-02-01", reportVersion: "evil" }
+    : {});
+  const saver = makeSnapshotSaver(store);
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext: evilLoader });
+  assert.equal(res.succeeded, 1, "derivation still succeeds using the PLANNED scope + approved coverage");
+  const key = [...store._snapshots.keys()].find((k) => k.startsWith("scheduler-v2/daily-reporting|A1|"));
+  assert.ok(key, "snapshot stored under the PLANNED account A1, never the injected OTHER");
+  assert.ok(![...store._snapshots.keys()].some((k) => k.includes("|OTHER|")), "no snapshot under the injected account");
+  const snap = store._snapshots.get(key);
+  assert.equal(snap.params.brand, "ALL", "planned brand ALL is the snapshot identity, not the injected Nike");
+  assert.equal(snap.params.accountId, "A1");
+  assert.equal(snap.params.from, DR_FROM);
+  assert.equal(snap.params.to, DR_TO);
+  assert.equal(snap.params.reportVersion, REPORT_DERIVATIONS["daily-reporting"].snapshotVersion, "version is the registry version, not injected");
+  assert.equal(snap.payload.brandFiltered, false, "still the ALL-brand fold (injected brand ignored)");
+});
+
+group("tranche-2 blocker 2: typed Ads coverage contract (missing != zero)");
+
+const planCov = { accountId: "A1", from: DR_FROM, to: DR_TO };
+
+test("B2 unit: validated + fully covered + right account = usable (genuine zero when adRows empty)", async () => {
+  const full = evaluateDailyAdsCoverage(adsCoverage(), planCov);
+  assert.equal(full.ok, true); assert.equal(full.status, "validated");
+  assert.deepEqual(full.adRows, DR_ADS);
+  // Genuine zero: validated, fully covered, empty rows, no freshness marker.
+  const zero = evaluateDailyAdsCoverage(adsCoverage({ adRows: [], latestMetricDate: null }), planCov);
+  assert.equal(zero.ok, true); assert.equal(zero.status, "validated");
+  assert.deepEqual(zero.adRows, []);
+});
+
+test("B2 unit: missing / failed / unvalidated / stale / partial / wrong-account all BLOCK (never zero)", async () => {
+  const block = (over) => evaluateDailyAdsCoverage(adsCoverage(over), planCov);
+  assert.deepEqual(block({ requiredSourceStatus: "missing" }), { ok: false, status: "missing", adRows: [] });
+  assert.deepEqual(block({ requiredSourceStatus: "pending" }), { ok: false, status: "missing", adRows: [] });
+  assert.deepEqual(block({ requiredSourceStatus: "failed" }), { ok: false, status: "failed", adRows: [] });
+  assert.deepEqual(block({ requiredSourceStatus: "skipped" }), { ok: false, status: "failed", adRows: [] });
+  assert.deepEqual(block({ validated: false }), { ok: false, status: "unvalidated", adRows: [] });
+  assert.deepEqual(block({ coverage: { from: null, to: null } }), { ok: false, status: "missing", adRows: [] });
+  assert.deepEqual(block({ coverage: { from: "2025-05-05", to: DR_TO } }), { ok: false, status: "partial", adRows: [] }); // missing early days
+  assert.deepEqual(block({ coverage: { from: DR_FROM, to: "2025-06-15" } }), { ok: false, status: "stale", adRows: [] }); // sync behind the requested end
+  assert.deepEqual(block({ accountId: "B9" }), { ok: false, status: "wrong-account", adRows: [] });
+  // rows present but no freshness marker => stale/inconsistent.
+  assert.deepEqual(block({ latestMetricDate: null }), { ok: false, status: "stale", adRows: [] });
+});
+
+test("B2 unit: a structurally malformed contract, or a window mismatch, THROWS (fail closed)", async () => {
+  assert.throws(() => evaluateDailyAdsCoverage(null, planCov), /typed object/);
+  assert.throws(() => evaluateDailyAdsCoverage([], planCov), /typed object/);
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ adRows: "nope" }), planCov), /adRows must be an array/);
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ requiredSourceStatus: "weird" }), planCov), /requiredSourceStatus/);
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ coverage: { from: "2025-13-40", to: DR_TO } }), planCov), /calendar date/);
+  // requested window must equal the planned window (planned scope is authoritative).
+  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ requested: { from: "2020-01-01", to: "2020-06-30" } }), planCov), /does not match the planned/);
+});
+
+test("B2 e2e: a failed/stale Ads coverage BLOCKS the Daily snapshot and preserves last-known-good (zero writes)", async () => {
+  for (const bad of [{ requiredSourceStatus: "failed" }, { coverage: { from: DR_FROM, to: "2025-06-15" } }, { accountId: "B9" }]) {
+    const { store, loader, plannedReports } = seedDailyCycle();
+    store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
+    const saver = makeSnapshotSaver(store);
+    const badLoader = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage(bad) } : {});
+    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext: badLoader });
+    assert.equal(res.succeeded, 0, "blocked Ads coverage never produces a snapshot: " + JSON.stringify(bad));
+    assert.equal(store._saveCalls, 0, "zero Supabase writes");
+    assert.equal(store._report("daily-reporting", "A1").error_code, "DERIVE_INVALID");
+    assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "prior snapshot preserved");
+    assert.equal([...store._snapshots.keys()].filter((k) => k.startsWith("scheduler-v2/daily-reporting")).length, 1, "no new snapshot written");
+  }
+});
+
+group("tranche-2 blocker 3: SKU P&L six-complete-calendar-month contract");
+
+const sixWindows = [
+  { from: "2025-01-01", to: "2025-01-31" }, { from: "2025-02-01", to: "2025-02-28" },
+  { from: "2025-03-01", to: "2025-03-31" }, { from: "2025-04-01", to: "2025-04-30" },
+  { from: "2025-05-01", to: "2025-05-31" }, { from: "2025-06-01", to: "2025-06-30" },
+];
+
+test("B3 unit: exactly six complete consecutive months matching context.from/to is accepted", async () => {
+  const ok = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: sixWindows });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.months, ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06"]);
+  // Repeated chunks of the SAME month (identical window) are allowed (they sum in the fold).
+  const withChunks = validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: [sixWindows[0], ...sixWindows] });
+  assert.equal(withChunks.ok, true);
+});
+
+test("B3 unit: missing / extra / duplicate-as-different-window / reordered / partial-month / gap all FAIL closed", async () => {
+  const bad = (windows, from = "2025-01-01", to = "2025-06-30") => validateSkuPlMonthlyWindows({ from, to, windows });
+  assert.equal(bad(sixWindows.slice(0, 5)).ok, false, "five months (one missing) rejected");
+  assert.equal(bad([...sixWindows, { from: "2025-07-01", to: "2025-07-31" }]).ok, false, "seven months (extra) rejected");
+  // Same month with a DIFFERENT (overlapping) window.
+  assert.equal(bad([{ from: "2025-01-01", to: "2025-01-15" }, ...sixWindows.slice(1)]).ok, false, "partial first month rejected");
+  assert.equal(bad([{ from: "2025-01-05", to: "2025-01-31" }, ...sixWindows.slice(1)]).ok, false, "month not starting on the 1st rejected");
+  // Reordered months.
+  const reordered = [sixWindows[1], sixWindows[0], ...sixWindows.slice(2)];
+  assert.equal(bad(reordered).ok, false, "reordered months rejected");
+  // A gap (skip Feb, include Jul) still six windows but not the context span.
+  const gap = [sixWindows[0], sixWindows[2], sixWindows[3], sixWindows[4], sixWindows[5], { from: "2025-07-01", to: "2025-07-31" }];
+  assert.equal(bad(gap).ok, false, "a gap (missing Feb) rejected");
+  // context.from/to not a six-month span, or not month boundaries.
+  assert.equal(bad(sixWindows, "2025-01-01", "2025-05-31").ok, false, "context to is a 5-month span");
+  assert.equal(bad(sixWindows, "2025-01-05", "2025-06-30").ok, false, "context from is not a month start");
+  // Malformed dates fail closed (never throw).
+  assert.equal(validateSkuPlMonthlyWindows({ from: "2025-02-30", to: "2025-06-30", windows: sixWindows }).ok, false, "impossible context date");
+  assert.equal(bad([{ from: "2025-01-01", to: "2025-99-99" }, ...sixWindows.slice(1)]).ok, false, "impossible fragment date");
+  // Multiple accounts in the fragments (defense-in-depth).
+  assert.equal(validateSkuPlMonthlyWindows({ from: "2025-01-01", to: "2025-06-30", windows: sixWindows, accountIds: ["A1", "A2"] }).ok, false, "multi-account fragments rejected");
+});
+
+// Build a valid six-month sku-pl cycle from SKU_BATCHES; overridable windows for the failure path.
+function seedSkuCycle(windowOverride) {
+  const store = makeMemoryReportStore();
+  const wins = windowOverride || sixWindows;
+  const loaderMap = new Map();
+  const planned = wins.map((w, i) => {
+    const h = "h_sku_" + i;
+    store.seedSource(h, "succeeded");
+    loaderMap.set(h, (SKU_BATCHES[i] || { rows: [] }).rows);
+    return src("sku-pl:monthly-profit", h, { from: w.from, to: w.to, sellerOrVendorIds: ["A1"] });
+  });
+  const loader = makeCacheLoader(loaderMap);
+  const plannedReports = [plan("sku-pl", "A1", planned, { context: { from: "2025-01-01", to: "2025-06-30" } })];
+  return { store, loader, plannedReports };
+}
+
+test("B3 e2e: a five-month (missing) source set BLOCKS the sku-pl snapshot and preserves last-known-good (zero writes)", async () => {
+  const { store, loader, plannedReports } = seedSkuCycle(sixWindows.slice(0, 5)); // only five months planned/available
+  store._snapshots.set("scheduler-v2/sku-pl|A1|ph_prev", { payload: { rows: [{ prior: true }], months: [], currencies: [], catalogBrands: [] } });
+  const saver = makeSnapshotSaver(store);
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(res.succeeded, 0, "an incomplete six-month set never saves");
+  assert.equal(store._saveCalls, 0, "zero Supabase writes");
+  assert.notEqual(store._report("sku-pl", "A1").derive_status, "succeeded");
+  assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
+});
+
+group("tranche-2 blocker 4: cross-account contamination is impossible");
+
+test("B4 e2e: account A and account B each derive from their OWN single-account source jobs (no leakage)", async () => {
+  // Distinct request hashes per account (single-account source jobs, Blocker 4). A's rows/catalog
+  // are Acme/Beta; B's are Zeta. Neither can receive the other's rows.
+  const store = makeMemoryReportStore();
+  store.seedSource("h_ol_A", "succeeded"); store.seedSource("h_cat_A", "succeeded");
+  store.seedSource("h_ol_B", "succeeded"); store.seedSource("h_cat_B", "succeeded");
+  const loader = makeCacheLoader(new Map([
+    ["h_ol_A", ORDER_ROWS], ["h_cat_A", CATALOG_ROWS],
+    ["h_ol_B", ORDER_ROWS_SECONDARY], ["h_cat_B", CATALOG_ROWS_SECONDARY],
+  ]));
+  const saver = makeSnapshotSaver(store);
+  const plannedReports = [
+    plan("brand-sales", "ACCT_A", [src("brand-sales:order-lines", "h_ol_A", { sellerOrVendorIds: ["A"] }), src("brand-sales:catalog", "h_cat_A", { sellerOrVendorIds: ["A"] })]),
+    plan("brand-sales", "ACCT_B", [src("brand-sales:order-lines", "h_ol_B", { sellerOrVendorIds: ["B"] }), src("brand-sales:catalog", "h_cat_B", { sellerOrVendorIds: ["B"] })], { bucket: "non-us" }),
+  ];
+  await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  const snapA = store._snapshots.get([...store._snapshots.keys()].find((k) => k.includes("|ACCT_A|")));
+  const snapB = store._snapshots.get([...store._snapshots.keys()].find((k) => k.includes("|ACCT_B|")));
+  assert.deepEqual(snapA.payload.catalogBrands, ["Acme", "Beta"], "A uses only A's catalog");
+  assert.deepEqual(snapB.payload.catalogBrands, ["Zeta"], "B uses only B's catalog");
+  assert.ok(!snapA.payload.catalogBrands.includes("Zeta"), "A never receives B's brand");
+  assert.ok(!snapB.payload.catalogBrands.some((b) => b === "Acme" || b === "Beta"), "B never receives A's brands");
+  assert.ok(snapA.payload.rows.every((r) => r.seller_or_vendor_id === "S1"), "A rows are A's seller only");
+  assert.ok(snapB.payload.rows.every((r) => r.seller_or_vendor_id === "S9"), "B rows are B's seller only");
+});
+
+test("B4 e2e: sku-pl fragments that span two accounts BLOCK derivation (defense-in-depth)", async () => {
+  const { store, loader } = seedSkuCycle();
+  // Re-plan with a second account's id leaking into the fragments' sellerOrVendorIds.
+  const plannedReports = [plan("sku-pl", "A1", sixWindows.map((w, i) => src("sku-pl:monthly-profit", "h_sku_" + i, { from: w.from, to: w.to, sellerOrVendorIds: i === 3 ? ["A1", "B2"] : ["A1"] })), { context: { from: "2025-01-01", to: "2025-06-30" } })];
+  store._snapshots.set("scheduler-v2/sku-pl|A1|ph_prev", { payload: { rows: [{ prior: true }], months: [], currencies: [], catalogBrands: [] } });
+  const saver = makeSnapshotSaver(store);
+  const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
+  assert.equal(res.succeeded, 0, "multi-account fragments never fold into a snapshot");
+  assert.equal(store._saveCalls, 0, "zero writes");
+  assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
+});
+
 /* ---- run the async suite with NO top-level await; deterministic natural exit ---- */
 async function main() {
   mark("main(): loading Phase 1d modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS } = await import("../lib/server/sync/report-derivation.js"));
-  ({ runReportJobs, assembleSources } = await import("../lib/server/sync/report-worker.js"));
-  ({ reportSourceRequestHashes, isValidCalendarDate } = await import("../lib/server/sync/report-source-contracts.js"));
+  ({ runReportJobs, assembleSources, buildDeriveContext } = await import("../lib/server/sync/report-worker.js"));
+  ({ reportSourceRequestHashes, isValidCalendarDate, evaluateDailyAdsCoverage, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   const core = await import("../lib/server/reports/derivation-core.js");
   ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = core);
   dailyReportingPayload = core.dailyReportingPayload;

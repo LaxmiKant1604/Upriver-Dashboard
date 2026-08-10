@@ -55,6 +55,48 @@ function toDateOnly(value) {
   return isValidCalendarDate(s) ? s : null;
 }
 
+// Scope keys that define the PLANNED report identity/scope. A derive-only injected input may NEVER
+// set any of these, even if a report allowlists them by mistake: the planned scope is authoritative
+// and the snapshot key is computed from it, so a derived override here would let injected data
+// diverge from what the snapshot claims. Enforced in buildDeriveContext (defense-in-depth).
+const RESERVED_CONTEXT_KEYS = new Set([
+  "accountId", "account", "brand", "from", "to", "params", "version", "reportVersion", "retrievedAt",
+  "context", "sources",
+]);
+
+/**
+ * Build the pure derivation context FAIL-CLOSED (Blocker 1):
+ *  - the PLANNED context (account/brand/from/to/...) is authoritative and always wins;
+ *  - a derive-only injected input contributes ONLY the field names this report explicitly
+ *    allowlists (`entry.derivedContextKeys`) AND that are not reserved scope keys -- every other
+ *    field (unexpected, malformed, or a scope-override attempt) is dropped deterministically;
+ *  - a non-object / array derivedContext is treated as no derived input (never spread field-wise);
+ *  - accountId and retrievedAt are pinned last from authoritative sources (plan/source metadata),
+ *    never Date.now().
+ * So injected data can add approved derive-only inputs (e.g. Daily's typed Ads coverage) but can
+ * never replace the planned account, brand, or date scope that the snapshot identity is built from.
+ */
+export function buildDeriveContext({ entry, plannedContext, derivedContext, accountId, latestFetchedAt }) {
+  const planned = (plannedContext && typeof plannedContext === "object" && !Array.isArray(plannedContext)) ? plannedContext : {};
+  const allow = new Set((entry && entry.derivedContextKeys) || []);
+  const safeDerived = {};
+  if (derivedContext && typeof derivedContext === "object" && !Array.isArray(derivedContext)) {
+    for (const k of Object.keys(derivedContext)) {
+      if (!allow.has(k)) continue;               // unexpected/unapproved derived field: ignore
+      if (RESERVED_CONTEXT_KEYS.has(k)) continue; // never allow a scope override, even if allowlisted
+      safeDerived[k] = derivedContext[k];
+    }
+  }
+  // Spread the approved derived inputs FIRST, then the planned scope so the plan always wins, then
+  // pin accountId + retrievedAt from authoritative sources.
+  return {
+    ...safeDerived,
+    ...planned,
+    accountId,
+    retrievedAt: (planned.retrievedAt) || latestFetchedAt || null,
+  };
+}
+
 async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes, loadDerivedContext }) {
   const { reportKey, accountId } = planned;
   const started = clock();
@@ -110,10 +152,12 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     }
   }
 
-  // Deterministic derivation context: retrievedAt comes from the saved source metadata (the
-  // latest fragment fetch time), NEVER Date.now() inside the pure adapter. derivedContext is
-  // derive-only (never a snapshot param).
-  const context = { ...(planned.context || {}), ...derivedContext, accountId, retrievedAt: (planned.context && planned.context.retrievedAt) || latestFetchedAt || null };
+  // Deterministic derivation context, built FAIL-CLOSED (Blocker 1): the planned account/brand/
+  // date scope is authoritative, derived inputs are restricted to this report's explicit
+  // allowlist and can never override the planned scope, and retrievedAt comes from the saved
+  // source metadata (the latest fragment fetch time), NEVER Date.now(). derivedContext is
+  // derive-only (never a snapshot param -- the snapshot `params` below use planned.context only).
+  const context = buildDeriveContext({ entry, plannedContext: planned.context, derivedContext, accountId, latestFetchedAt });
 
   // 4) Derive (pure). Never fabricate on unavailable/blocked/invalid/not-implemented.
   const result = deriveReportSnapshot({ reportKey, sources, context });

@@ -29,6 +29,8 @@ import {
   declaredRequestKeys,
   REPORT_DERIVED_ONLY,
   sourceDisabledOutcome,
+  evaluateDailyAdsCoverage,
+  validateSkuPlMonthlyWindows,
 } from "./report-source-contracts.js";
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
@@ -118,12 +120,33 @@ const REGISTRY = {
   // fields to sum (daily ratios are recomputed in the browser from these base sums).
   "daily-reporting": {
     snapshotVersion: "daily-reporting/v2d-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
-    derive: ({ sources, context }) => dailyReportingPayload({
-      supersetRows: sources["daily-reporting:asin-day-superset"].rows,
-      catalogRows: sources["daily-reporting:catalog"].rows,
-      adRows: context.adRows, // injected; array required for ALL (a missing load throws, never [] silently)
-      brand: context.brand ?? "ALL",
-    }),
+    // Blocker 1: ONLY `adsCoverage` may be injected through the derive context. The worker's
+    // per-report allowlist drops any other derived field and never lets a derived input override
+    // the planned account/brand/from/to scope (the snapshot identity stays in the planned scope).
+    derivedContextKeys: ["adsCoverage"],
+    derive: ({ sources, context }) => {
+      const supersetRows = sources["daily-reporting:asin-day-superset"].rows;
+      const catalogRows = sources["daily-reporting:catalog"].rows;
+      const brand = context.brand ?? "ALL";
+      // Named-brand path: catalog ASIN->brand join, folded to one row/day, NO ads (like the route).
+      if (brand && brand !== "ALL") {
+        return dailyReportingPayload({ supersetRows, catalogRows, brand });
+      }
+      // ALL path: Ads are REQUIRED and must arrive as a typed, validated coverage contract
+      // (Blocker 2), NOT a bare adRows array. A missing/failed/stale/partial/wrong-account/
+      // unvalidated contract BLOCKS the snapshot (throws -> derive-invalid -> last-known-good
+      // preserved, zero writes); only a validated, fully-covered, right-account result (possibly
+      // with an empty adRows) is treated as GENUINE zero advertising.
+      const verdict = evaluateDailyAdsCoverage(context.adsCoverage, {
+        accountId: context.accountId ?? null,
+        from: context.from ?? null,
+        to: context.to ?? null,
+      });
+      if (!verdict.ok) {
+        throw new Error(`daily-reporting ALL Ads coverage not usable (status: ${verdict.status}); snapshot blocked.`);
+      }
+      return dailyReportingPayload({ supersetRows, catalogRows, adRows: verdict.adRows, brand: "ALL" });
+    },
     validatePayload: (p) => !!p && Array.isArray(p.rows) && typeof p.brandFiltered === "boolean",
     latestDataDate: (p) => maxIsoDate((p.rows || []).map((r) => r.date)),
   },
@@ -136,15 +159,29 @@ const REGISTRY = {
   // computeSkuPlRow), so the snapshot equals the route payload byte-for-byte.
   "sku-pl": {
     snapshotVersion: "sku-pl/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
-    derive: ({ sources, context }) => skuPlPayload({
-      accountId: context.accountId ?? null,
-      from: context.from ?? null,
-      to: context.to ?? null,
-      monthlyBatches: (sources["sku-pl:monthly-profit"].fragments || []).map((f) => ({
-        monthKey: String(f.from || "").slice(0, 7),
-        rows: f.rows,
-      })),
-    }),
+    derive: ({ sources, context }) => {
+      const fragments = sources["sku-pl:monthly-profit"].fragments || [];
+      // Blocker 3: enforce the production contract before folding -- exactly six complete,
+      // consecutive calendar months whose span equals context.from/to (first month start ..
+      // last month end), one account, no missing/duplicate/overlapping/reordered/extra month --
+      // reusing the SAME strict calendar helpers the route uses (no weaker duplicate). A violation
+      // BLOCKS the snapshot (throws -> derive-invalid -> last-known-good preserved, zero writes).
+      const check = validateSkuPlMonthlyWindows({
+        from: context.from ?? null,
+        to: context.to ?? null,
+        windows: fragments.map((f) => ({ from: f.from, to: f.to })),
+        accountIds: fragments.flatMap((f) => f.sellerOrVendorIds || []),
+      });
+      if (!check.ok) {
+        throw new Error(`sku-pl six-complete-calendar-month contract violated (${check.reason}); snapshot blocked.`);
+      }
+      return skuPlPayload({
+        accountId: context.accountId ?? null,
+        from: context.from ?? null,
+        to: context.to ?? null,
+        monthlyBatches: fragments.map((f) => ({ monthKey: String(f.from || "").slice(0, 7), rows: f.rows })),
+      });
+    },
     validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.months)
       && Array.isArray(p.currencies) && Array.isArray(p.catalogBrands),
     // Monthly report: the latest data date is the end of the last covered month (the window `to`).
@@ -171,6 +208,9 @@ export const REPORT_DERIVATIONS = Object.freeze(
       requiredRequestKeys: Object.freeze(requiredRequestKeys),
       optionalRequestKeys: Object.freeze([...optional]),
       derivedSourceKeys: Object.freeze([...(entry.derivedSourceKeys || [])]),
+      // Blocker 1 allowlist: the ONLY derive-context field names a loader may inject for this
+      // report (empty for every report that needs no derived input). Frozen so it can't drift.
+      derivedContextKeys: Object.freeze([...(entry.derivedContextKeys || [])]),
       derive: entry.derive || null,
       validatePayload: entry.validatePayload || ((p) => p != null),
       latestDataDate: entry.latestDataDate || (() => null),
