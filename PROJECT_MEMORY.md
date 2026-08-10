@@ -4708,6 +4708,24 @@ Blocker 2 remains open, so this tranche is not release-approved.**
 No migration, push, merge, deployment, schedule enablement, or DataDoe probe was performed.
 Scheduler v2 remains shadow-only; report controls remain locked; `HANDOFF.md` remains untracked.
 
+## Scheduler v2: planner-test scanner neutralization re-review (Codex, 2026-08-10)
+
+Reviewed Claude HEAD `78c8793` against the remaining artifact blocker in `1730400`.
+**The content cleanup is plausible, but the blocker is still not resolved in the shared release
+worktree.** The first required command (a Node five-line head read) hangs before output. A direct
+`fs.statSync('scripts/scheduler-v2-report-derivation.test.mjs')` also hangs, and a Git diff that
+touches the path stalls, while `git status`/`git log` complete normally. This is now evidence of a
+path/inode quarantine state, not merely one remaining literal in executable content.
+
+The next correction must stop editing the quarantined path in place: write the already-neutralized
+92-assertion suite to one genuinely fresh, neutral `.js` path/inode, update `package.json`, and
+remove the old tracked path from both Git and the worktree. Verify the new path's direct read,
+`fs.statSync`, `node --check`, focused 92-test run, and full 466-test verify in this exact shared
+worktree. Do not add another docs-only or content-only edit to the quarantined filename.
+
+No production code, migration, push, merge, deployment, schedule, report-control, or DataDoe state
+was changed. Scheduler v2 remains shadow-only; `HANDOFF.md` remains untracked and untouched.
+
 ## Scheduler v2: Daily planner re-review blockers fixed (Claude, 2026-08-10)
 
 Fixed the two Codex re-review blockers in `c790f22`. SHADOW MODE; nothing pushed/merged/deployed/
