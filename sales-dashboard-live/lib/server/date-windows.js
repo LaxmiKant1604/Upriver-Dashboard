@@ -49,6 +49,18 @@ export function monthStartStr(dateStr) {
   return `${String(dateStr).slice(0, 7)}-01`;
 }
 
+// First day of the calendar month `months` before the month containing `dateStr` (UTC, string).
+// Byte-identical to the live UI's monthBack(s, n).from (src/lib/format.js): monthBackStr(s,0) is
+// this month's first day. Handles any month length and year boundaries.
+// monthBackStr("2026-08-10", 5) === "2026-03-01"; monthBackStr("2026-02-10", 5) === "2025-09-01".
+export function monthBackStr(dateStr, months) {
+  const [y, m] = String(dateStr).slice(0, 7).split("-").map(Number);
+  let ty = y, tm = m - months;
+  while (tm <= 0) { tm += 12; ty -= 1; }
+  while (tm > 12) { tm -= 12; ty += 1; }
+  return `${ty}-${pad2s(tm)}-01`;
+}
+
 // Local strict UTC calendar-date check (kept private so this leaf exports no helper that could
 // drift from report-source-contracts.isValidCalendarDate). An impossible/malformed date is rejected.
 function isRealDate(value) {

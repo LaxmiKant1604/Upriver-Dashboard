@@ -977,140 +977,128 @@ export function isValidCalendarDate(value) {
   return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === value;
 }
 
-/* ===================== Daily Reporting: typed Ads coverage contract =====================
- * An empty `adRows` array is ambiguous: it can mean GENUINE zero advertising, or it can mean the
- * Ads state is missing / the Ads sync failed / the data is stale / the window is only partially
- * covered / the rows belong to another account. Daily Reporting's ALL-brand snapshot must NEVER
- * silently turn any of those into "zero ads". So the derive receives a TYPED coverage contract
- * (built by the planner from authoritative persisted Ads state -- ads_daily_source_rows -- NEVER
- * from a live Ads export) and this function decides whether it is a trustworthy basis:
+/* ===================== Daily Reporting: Ads availability model =====================
+ * SALES validity is INDEPENDENT of Ads availability (re-review blocker 3): Daily always saves its
+ * validated sales snapshot, and Ads are layered on ONLY for proven-covered dates. A newly-connected
+ * account whose Ads have seeded just 56 days must still get its full ~5-month sales report; the
+ * uncovered older Ads period is marked UNAVAILABLE (never fabricated as zero), and a covered date
+ * with no ad activity is a genuine zero.
  *
- *   coverage = {
- *     accountId,                 // the PUBLIC account id the persisted Ads state is for
- *     rawSellerId,               // the authoritative RAW seller/vendor id (partition key for rows);
- *                                //   distinct from accountId (dd-secondary public id = "dd-secondary:<raw>")
- *     requested: { from, to },   // the window the loader was asked to cover (echoed; cross-checked)
- *     coverage:  { from, to },   // the window the persisted state actually validated (null = none)
- *     validated,                 // was the persisted Ads state validated this cycle?
- *     latestMetricDate,          // freshness: newest day with real ad activity (null = none)
- *     requiredSourceStatus,      // the required Ads source job status this cycle
- *     adRows,                    // the persisted Ads rows for the window (array; [] is legal)
- *   }
- *
- * `planned` is the AUTHORITATIVE scope from the plan: { accountId, rawSellerId, from, to }. The
- * envelope being valid is NOT enough (re-review finding 2): before returning ok:true, EVERY row is
- * validated against the planned account/window -- each row must be a plain object with a real date
- * INSIDE [from,to], `seller_or_vendor_id` EQUAL to the authoritative rawSellerId, and finite ad
- * metrics. A single cross-account / out-of-window / malformed / non-finite row BLOCKS the entire
- * snapshot (never silently filtered into a partial save).
- *
- * Returns { ok, status, adRows }. `ok:true` (status "validated") ONLY when the state is validated,
- * for the RIGHT account, its required source succeeded, the coverage window fully spans the PLANNED
- * requested window, AND every row passes -- then an empty adRows is genuine zero. Any other case
- * returns ok:false with a typed status the caller turns into a block (last-known-good preserved).
- * A structurally malformed contract, a window mismatch, or a rawSellerId mismatch THROWS (fail
- * closed) -- it is a wiring error, not data.
+ * `resolveDailyAdsAvailability(coverage, planned)` NEVER throws on data/coverage/currency problems --
+ * it degrades Ads to a typed availability state so sales survive. It returns
+ *   { availability: { status, coveredFrom, coveredTo, requestedFrom, requestedTo, currency,
+ *                     latestMetricDate, reason }, adRows: <covered rows to merge> }.
+ * status:
+ *   validated   -- the whole requested window is proven-covered; merge all rows (empty = genuine 0)
+ *   partial     -- only a recent sub-window is covered (e.g. a new account); merge covered rows
+ *   stale       -- coverage does not reach the requested end (a recent gap); merge covered rows
+ *   unavailable -- no proven coverage yet, unmigrated shadow coverage schema, or the sync has not
+ *                  succeeded; merge NO rows (Ads not shown, never zero)
+ *   failed      -- an operational failure (read/limit/scope/currency/row corruption); merge NO rows
+ * The coverage contract (from daily-ads-loader.js) carries { accountId, rawSellerId, currency,
+ * requested:{from,to}, windows:[{from,to}], coverageRead, metricsRead, syncStatus, latestMetricDate,
+ * adRows }. `planned` is the authoritative scope { accountId, rawSellerId, currency, from, to }.
  */
-const ADS_REQUIRED_SOURCE_STATUSES = new Set(["succeeded", "failed", "skipped", "pending", "missing"]);
-
-function assertCoverageDateOrNull(value, label) {
-  if (!(value === null || isValidCalendarDate(value))) {
-    throw new Error(`Ads coverage ${label} must be a real YYYY-MM-DD calendar date or null.`);
-  }
-}
 
 // A present ad metric must be a finite number. Absent (null/undefined) is allowed -- the merge
-// coerces it to 0 exactly like the production route -- but a present non-finite / non-number value
-// (NaN, Infinity, a string, an object) is corrupt data and must block, never be coerced to 0.
+// coerces it to 0 like the production route -- but a present non-finite/non-number value (NaN,
+// Infinity, a string, an object) is corrupt data and must block, never be coerced to 0.
 function adMetricOk(value) {
   return value == null || (typeof value === "number" && Number.isFinite(value));
 }
 
-// Per-row scope validation (finding 2). Returns a typed block status, or null when the row is safe.
-// A row must be a plain object, dated with a REAL calendar date INSIDE the planned window, tagged
-// with the AUTHORITATIVE raw seller/vendor id, and carry only finite ad metrics.
-function adRowBlockStatus(row, { from, to, rawSellerId }) {
+// Per-row scope + currency validation. Returns a typed block status, or null when the row is safe.
+// A row must be a plain object, dated with a REAL calendar date INSIDE the requested window, tagged
+// with the AUTHORITATIVE raw seller/vendor id, carry only finite metrics, and carry the single
+// authoritative account currency (blocker 4): a null/blank currency on a nonzero row is rejected,
+// and any other-than-account currency (mismatched OR mixed) is rejected.
+function adRowBlockStatus(row, { from, to, rawSellerId, currency }) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return "ads-row-malformed";
   if (!isValidCalendarDate(row.date)) return "ads-row-bad-date";
   if (row.date < from || row.date > to) return "ads-row-out-of-window";
   if (String(row.seller_or_vendor_id) !== rawSellerId) return "ads-row-cross-account";
-  if (!adMetricOk(row.ad_sales_sum ?? row.ad_sales)) return "ads-row-non-finite-metric";
-  if (!adMetricOk(row.ad_spend_sum ?? row.ad_spend)) return "ads-row-non-finite-metric";
-  if (!adMetricOk(row.ad_clicks_sum ?? row.ad_clicks)) return "ads-row-non-finite-metric";
+  const sales = row.ad_sales_sum ?? row.ad_sales;
+  const spend = row.ad_spend_sum ?? row.ad_spend;
+  const clicks = row.ad_clicks_sum ?? row.ad_clicks;
+  if (!adMetricOk(sales) || !adMetricOk(spend) || !adMetricOk(clicks)) return "ads-row-non-finite-metric";
+  const rowCurrency = row.currency == null ? "" : String(row.currency).trim().toUpperCase();
+  const nonzero = (Number(sales) || 0) !== 0 || (Number(spend) || 0) !== 0 || (Number(clicks) || 0) !== 0;
+  if (!rowCurrency) { if (nonzero) return "ads-currency-missing"; }
+  else if (rowCurrency !== currency) return "ads-currency-mismatch";
   return null;
 }
 
-export function evaluateDailyAdsCoverage(coverage, planned) {
-  if (!planned || typeof planned !== "object"
-    || !isValidCalendarDate(planned.from) || !isValidCalendarDate(planned.to) || planned.from > planned.to) {
-    throw new Error("evaluateDailyAdsCoverage requires a planned { accountId, rawSellerId, from<=to } window (real calendar dates).");
+// The MOST RECENT contiguous covered window within [from, to], or null. Overlapping/adjacent
+// successful windows merge; the interval with the latest `to` is returned, clamped to [from, to].
+// (A new account's coverage is a recent suffix, so the covered window is anchored at the end.)
+function mostRecentCoveredWindow(windows, from, to) {
+  const clamped = (windows || [])
+    .filter((w) => w && isValidCalendarDate(w.from) && isValidCalendarDate(w.to) && w.from <= w.to && w.to >= from && w.from <= to)
+    .map((w) => ({ from: w.from < from ? from : w.from, to: w.to > to ? to : w.to }))
+    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  if (!clamped.length) return null;
+  const merged = [{ ...clamped[0] }];
+  for (let i = 1; i < clamped.length; i += 1) {
+    const last = merged[merged.length - 1];
+    if (clamped[i].from <= addDaysStr(last.to, 1)) { if (clamped[i].to > last.to) last.to = clamped[i].to; }
+    else merged.push({ ...clamped[i] });
   }
-  // The authoritative RAW seller/vendor id must come from the plan (resolveDataDoeAccountIds), not
-  // the coverage envelope -- it is the partition key every row is checked against. A missing one is
-  // a planner wiring error, not data: fail closed.
-  if (typeof planned.rawSellerId !== "string" || !planned.rawSellerId.trim()) {
-    throw new Error("evaluateDailyAdsCoverage requires an authoritative planned.rawSellerId (raw seller/vendor id).");
-  }
+  return merged.reduce((best, iv) => (best && best.to >= iv.to ? best : iv), null);
+}
+
+export function resolveDailyAdsAvailability(coverage, planned) {
+  const from = planned && planned.from;
+  const to = planned && planned.to;
+  const requestedFrom = isValidCalendarDate(from) ? from : null;
+  const requestedTo = isValidCalendarDate(to) ? to : null;
+  const accountCurrency = planned && planned.currency != null ? String(planned.currency).trim().toUpperCase() : "";
+  const latestMetricDate = coverage && coverage.latestMetricDate != null ? coverage.latestMetricDate : null;
+  const fail = (status, reason) => ({
+    availability: { status, coveredFrom: null, coveredTo: null, requestedFrom, requestedTo, currency: accountCurrency || null, latestMetricDate, reason },
+    adRows: [],
+  });
+  // Authoritative planned scope must be well formed. A planner bug degrades Ads (sales still save).
+  if (!requestedFrom || !requestedTo || requestedFrom > requestedTo) return fail("failed", "planned-window-invalid");
+  if (typeof planned.rawSellerId !== "string" || !planned.rawSellerId.trim()) return fail("failed", "planned-raw-seller-missing");
+  if (!accountCurrency) return fail("failed", "planned-currency-missing");
   const plannedRawSellerId = planned.rawSellerId.trim();
-  if (coverage == null || typeof coverage !== "object" || Array.isArray(coverage)) {
-    throw new Error("Ads coverage must be a typed object (never a bare array/null); a missing load is not zero ads.");
-  }
-  const { accountId, rawSellerId, requested, coverage: cov, validated, latestMetricDate, requiredSourceStatus, adRows } = coverage;
-  // ---- structural validation (fail closed on anything malformed) ----
-  if (typeof accountId !== "string" || !accountId) throw new Error("Ads coverage.accountId must be a non-empty string.");
-  if (typeof rawSellerId !== "string" || !rawSellerId.trim()) throw new Error("Ads coverage.rawSellerId must be a non-empty string.");
-  if (!requested || typeof requested !== "object") throw new Error("Ads coverage.requested must be a { from, to } object.");
-  assertCoverageDateOrNull(requested.from, "requested.from");
-  assertCoverageDateOrNull(requested.to, "requested.to");
-  if (!cov || typeof cov !== "object") throw new Error("Ads coverage.coverage must be a { from, to } object.");
-  assertCoverageDateOrNull(cov.from, "coverage.from");
-  assertCoverageDateOrNull(cov.to, "coverage.to");
-  if (typeof validated !== "boolean") throw new Error("Ads coverage.validated must be a boolean.");
-  assertCoverageDateOrNull(latestMetricDate == null ? null : latestMetricDate, "latestMetricDate");
-  if (!ADS_REQUIRED_SOURCE_STATUSES.has(requiredSourceStatus)) {
-    throw new Error(`Ads coverage.requiredSourceStatus "${requiredSourceStatus}" is not a recognised status.`);
-  }
-  if (!Array.isArray(adRows)) throw new Error("Ads coverage.adRows must be an array ([] when there is no ad activity).");
-  // The contract must be for the SAME window the plan authoritatively requested; a loader claiming
-  // a different requested window is a wiring bug, and the planned window is the ONLY authority.
-  if (requested.from !== planned.from || requested.to !== planned.to) {
-    throw new Error("Ads coverage.requested window does not match the planned Daily window (planned scope is authoritative).");
-  }
-  // The contract's raw seller id must equal the AUTHORITATIVE planned raw seller id; a mismatch is a
-  // wiring bug (the plan resolves the account -> raw id, not the envelope). This ties row validation
-  // below to the plan, so a loader cannot self-declare another account's raw id to admit its rows.
-  if (rawSellerId.trim() !== plannedRawSellerId) {
-    throw new Error("Ads coverage.rawSellerId does not match the authoritative planned raw seller/vendor id.");
-  }
-  // ---- typed classification (each non-ok status BLOCKS; genuine zero is the only empty pass) ----
-  if (accountId !== planned.accountId) return { ok: false, status: "wrong-account", adRows: [] };
-  if (requiredSourceStatus === "failed" || requiredSourceStatus === "skipped") return { ok: false, status: "failed", adRows: [] };
-  if (requiredSourceStatus !== "succeeded") return { ok: false, status: "missing", adRows: [] };
-  if (!validated) return { ok: false, status: "unvalidated", adRows: [] };
-  if (cov.from === null || cov.to === null) return { ok: false, status: "missing", adRows: [] };
-  if (cov.from > planned.from) return { ok: false, status: "partial", adRows: [] };
-  if (cov.to < planned.to) return { ok: false, status: "stale", adRows: [] };
-  // Freshness consistency: real ad rows must carry a freshness marker inside the coverage window.
-  if (adRows.length > 0) {
-    if (latestMetricDate == null || latestMetricDate < cov.from || latestMetricDate > cov.to) {
-      return { ok: false, status: "stale", adRows: [] };
-    }
-  }
-  // ---- ROW-LEVEL validation (finding 2): a valid envelope is not enough. EVERY row must belong to
-  // this account's raw seller id and fall inside the planned window, with finite metrics. One bad
-  // row BLOCKS the whole snapshot -- rows are NEVER silently filtered into a partial save. ----
+
+  if (coverage == null || typeof coverage !== "object" || Array.isArray(coverage)) return fail("unavailable", "no-ads-coverage");
+  const { accountId, rawSellerId, requested, windows, coverageRead, metricsRead, syncStatus, adRows } = coverage;
+  if (accountId !== planned.accountId) return fail("failed", "ads-account-mismatch");
+  if (typeof rawSellerId !== "string" || rawSellerId.trim() !== plannedRawSellerId) return fail("failed", "ads-raw-seller-mismatch");
+  if (!requested || requested.from !== requestedFrom || requested.to !== requestedTo) return fail("failed", "ads-window-mismatch");
+  if (!Array.isArray(adRows)) return fail("failed", "ads-rows-malformed");
+
+  // Read outcomes (blocker 6): a metrics truncation is a FAILURE, never a partial total. A
+  // schema-missing coverage table is a pre-rollout "unavailable"; a real read failure is "failed".
+  if (metricsRead === "limit-exceeded") return fail("failed", "ads-read-limit-exceeded");
+  if (metricsRead === "read-failed") return fail("failed", "ads-read-failed");
+  if (coverageRead === "schema-missing") return fail("unavailable", "coverage-schema-unmigrated");
+  if (coverageRead === "read-failed") return fail("failed", "coverage-read-failed");
+
+  // Required Ads source sync status.
+  if (syncStatus === "failed") return fail("failed", "ads-sync-failed");
+  if (syncStatus !== "succeeded") return fail("unavailable", "ads-not-synced");
+
+  // Every returned row must be in scope + one authoritative currency. One bad row means the Ads DATA
+  // is untrustworthy => Ads failed (not merged), but sales still save.
   for (const row of adRows) {
-    const blocked = adRowBlockStatus(row, { from: planned.from, to: planned.to, rawSellerId: plannedRawSellerId });
-    if (blocked) return { ok: false, status: blocked, adRows: [] };
+    const blocked = adRowBlockStatus(row, { from: requestedFrom, to: requestedTo, rawSellerId: plannedRawSellerId, currency: accountCurrency });
+    if (blocked) return fail("failed", blocked);
   }
-  // ---- Mixed/unusable currency: Daily merges ad totals per (seller, day) WITHOUT converting
-  // currency, so more than one distinct currency across the rows would sum incomparable amounts.
-  // A single-account/single-marketplace Daily report must be one currency; mixed => block. ----
-  const currencies = new Set(adRows.map((row) => row.currency).filter((c) => c != null && String(c).trim() !== ""));
-  if (currencies.size > 1) return { ok: false, status: "ads-mixed-currency", adRows: [] };
-  // Validated, right account, required source succeeded, window fully covered, every row in scope,
-  // single currency: an empty adRows here is GENUINE zero advertising and may be merged as real zero.
-  return { ok: true, status: "validated", adRows };
+
+  // Proven covered window (most-recent contiguous run). No coverage yet => unavailable (not zero).
+  const covered = mostRecentCoveredWindow(windows, requestedFrom, requestedTo);
+  if (!covered) return fail("unavailable", "no-covered-window");
+  const status = (covered.from === requestedFrom && covered.to === requestedTo) ? "validated"
+    : (covered.to < requestedTo ? "stale" : "partial");
+  // Merge ONLY rows inside the proven covered window; uncovered dates stay unavailable (never zero).
+  const coveredRows = adRows.filter((row) => row.date >= covered.from && row.date <= covered.to);
+  return {
+    availability: { status, coveredFrom: covered.from, coveredTo: covered.to, requestedFrom, requestedTo, currency: accountCurrency, latestMetricDate, reason: null },
+    adRows: coveredRows,
+  };
 }
 
 /* ===================== SKU P&L: strict six-complete-calendar-month contract =====================

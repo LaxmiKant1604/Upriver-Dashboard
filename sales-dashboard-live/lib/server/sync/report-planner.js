@@ -14,23 +14,25 @@
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { reportSourceRequestHashes } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
-import { addDaysStr, monthStartStr, splitDateRangeByMonth, sixCompleteCalendarMonths } from "../date-windows.js";
+import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 
-// Daily Reporting's ASIN/day superset + catalog both span monthStart(asOf) - 150d .. asOf, exactly
-// as the approved daily-reporting source contracts declare (windowKind per-month / range).
-const DAILY_LOOKBACK_DAYS = 150;
+// Daily Reporting spans the last SIX calendar months exactly as the live UI does:
+// [monthBack(asOf, 5).from .. asOf] (first day of the month five months back .. today). The prior
+// 150-day approximation (monthStart(asOf)-150d) silently trimmed the first days of the oldest month.
+const DAILY_MONTHS_BACK = 5;
 
 export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl"]);
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
- * Returns { accountId(public), rawSellerId, connectionId(orgId), apiKey, country, bucket }.
- * Throws (fail closed) on a missing/ambiguous account or a missing marketplace country. The raw
- * seller/vendor id is taken from resolveDataDoeAccountIds -- never inferred from report rows.
+ * Returns { accountId(public), rawSellerId, connectionId(orgId), apiKey, country, currency, bucket }.
+ * Throws (fail closed) on a missing/ambiguous account, a missing marketplace country, or a missing
+ * account currency. The raw seller/vendor id + currency come from account metadata -- never inferred
+ * from report rows. `currency` is the authoritative account currency the Daily Ads validator uses.
  */
-export function resolveAccountScope({ accountId, country, connections }) {
+export function resolveAccountScope({ accountId, country, currency, connections }) {
   const publicId = String(accountId || "").trim();
   if (!publicId) throw new Error("planner requires a public accountId.");
   const resolved = resolveDataDoeAccountIds([publicId], connections);
@@ -41,12 +43,15 @@ export function resolveAccountScope({ accountId, country, connections }) {
   }
   const marketplace = String(country || "").trim().toUpperCase();
   if (!marketplace) throw new Error(`planner requires an authoritative marketplace country for account "${publicId}".`);
+  const accountCurrency = String(currency || "").trim().toUpperCase();
+  if (!accountCurrency) throw new Error(`planner requires an authoritative account currency for account "${publicId}".`);
   return {
     accountId: publicId,
     rawSellerId: resolved.rawAccountIds[0],
     connectionId: resolved.connection.id, // organization id (primary | secondary)
     apiKey: resolved.connection.apiKey,   // organization-scoped credential (drives the org fingerprint)
     country: marketplace,
+    currency: accountCurrency,
     bucket: bucketForCountry(marketplace),
   };
 }
@@ -70,9 +75,9 @@ function decorateSources(sources, { reportKey, connectionId, bucket }) {
  * seller id. No extra Daily sales or Ads DataDoe export is added (Ads are a derive-only input read
  * from ad_daily_metrics; see daily-ads-loader.js). rawSellerId is stored in the planned context.
  */
-export function planDailyReporting({ accountId, country, connections, asOf }) {
-  const scope = resolveAccountScope({ accountId, country, connections });
-  const from = addDaysStr(monthStartStr(asOf), -DAILY_LOOKBACK_DAYS);
+export function planDailyReporting({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const from = monthBackStr(asOf, DAILY_MONTHS_BACK);
   const to = String(asOf);
   const windowsByRequestKey = {
     "daily-reporting:asin-day-superset": splitDateRangeByMonth(from, to),
@@ -89,9 +94,10 @@ export function planDailyReporting({ accountId, country, connections, asOf }) {
     connectionId: scope.connectionId,
     bucket: scope.bucket,
     sources: decorateSources(sources, { reportKey: "daily-reporting", connectionId: scope.connectionId, bucket: scope.bucket }),
-    // Planned scope is authoritative: brand ALL, the reporting window, and the raw seller id (used
-    // to validate every Ads row). The worker's fail-closed context builder pins these.
-    context: { brand: "ALL", from, to, rawSellerId: scope.rawSellerId },
+    // Planned scope is authoritative: brand ALL, the reporting window, the raw seller id (used to
+    // validate every Ads row), and the account currency (used to reject mismatched/null Ads
+    // currency). The worker's fail-closed context builder pins these.
+    context: { brand: "ALL", from, to, rawSellerId: scope.rawSellerId, currency: scope.currency },
   };
 }
 
@@ -102,8 +108,8 @@ export function planDailyReporting({ accountId, country, connections, asOf }) {
  * construction. No COGS override is baked into the snapshot (the browser applies overrides at
  * display; that is unchanged).
  */
-export function planSkuPl({ accountId, country, connections, asOf }) {
-  const scope = resolveAccountScope({ accountId, country, connections });
+export function planSkuPl({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
   const span = sixCompleteCalendarMonths(asOf);
   if (!span) throw new Error(`sku-pl planner could not compute six complete calendar months from asOf "${asOf}".`);
   const windowsByRequestKey = { "sku-pl:monthly-profit": span.months };
@@ -130,9 +136,9 @@ const PLANNERS = { "daily-reporting": planDailyReporting, "sku-pl": planSkuPl };
  *   - sourceJobs: the DEDUPLICATED canonical source jobs (fed to runSourceJobs) -- one job per
  *     unique request_hash, so identical source contracts across reports/accounts fetch once;
  *   - reportJobs: buildDependencyPlan's report->sources dependency map (telemetry).
- * `accounts`: [{ accountId, country }]. `asOfFor(country)` supplies the marketplace-local as-of date
- * (the caller passes marketplaceToday). Only daily-reporting + sku-pl are planned; other keys are
- * ignored. Pure given its inputs; performs no I/O.
+ * `accounts`: [{ accountId, country, currency }] (from the authoritative account directory).
+ * `asOfFor(country)` supplies the marketplace-local as-of date (the caller passes marketplaceToday).
+ * Only daily-reporting + sku-pl are planned; other keys are ignored. Pure given its inputs; no I/O.
  */
 export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor }) {
   const keys = (reportKeys || []).filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
@@ -140,7 +146,7 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
   for (const account of accounts) {
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
     for (const reportKey of keys) {
-      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, country: account.country, connections, asOf }));
+      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, country: account.country, currency: account.currency, connections, asOf }));
     }
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);

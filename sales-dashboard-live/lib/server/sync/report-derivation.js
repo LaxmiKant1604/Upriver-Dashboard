@@ -29,7 +29,7 @@ import {
   declaredRequestKeys,
   REPORT_DERIVED_ONLY,
   sourceDisabledOutcome,
-  evaluateDailyAdsCoverage,
+  resolveDailyAdsAvailability,
   validateSkuPlMonthlyWindows,
 } from "./report-source-contracts.js";
 
@@ -132,23 +132,31 @@ const REGISTRY = {
       if (brand && brand !== "ALL") {
         return dailyReportingPayload({ supersetRows, catalogRows, brand });
       }
-      // ALL path: Ads are REQUIRED and must arrive as a typed, validated coverage contract
-      // (Blocker 2), NOT a bare adRows array. A missing/failed/stale/partial/wrong-account/
-      // unvalidated contract BLOCKS the snapshot (throws -> derive-invalid -> last-known-good
-      // preserved, zero writes); only a validated, fully-covered, right-account result (possibly
-      // with an empty adRows) is treated as GENUINE zero advertising.
-      const verdict = evaluateDailyAdsCoverage(context.adsCoverage, {
-        accountId: context.accountId ?? null,
-        rawSellerId: context.rawSellerId ?? null,
-        from: context.from ?? null,
-        to: context.to ?? null,
-      });
-      if (!verdict.ok) {
-        throw new Error(`daily-reporting ALL Ads coverage not usable (status: ${verdict.status}); snapshot blocked.`);
+      // ALL path (blocker 3): SALES validity is INDEPENDENT of Ads. Always derive + save the sales
+      // snapshot; layer Ads on ONLY for proven-covered dates, and record an explicit availability
+      // state so uncovered periods are UNAVAILABLE (never fabricated zero). Ads never blocks the
+      // sales snapshot: an availability failure degrades Ads, it does not throw.
+      let availability;
+      let coveredAdRows;
+      try {
+        const resolved = resolveDailyAdsAvailability(context.adsCoverage, {
+          accountId: context.accountId ?? null,
+          rawSellerId: context.rawSellerId ?? null,
+          currency: context.currency ?? null,
+          from: context.from ?? null,
+          to: context.to ?? null,
+        });
+        availability = resolved.availability;
+        coveredAdRows = resolved.adRows;
+      } catch (_e) {
+        // Defensive: any unexpected error marks Ads failed but NEVER blocks the sales snapshot.
+        availability = { status: "failed", coveredFrom: null, coveredTo: null, requestedFrom: context.from ?? null, requestedTo: context.to ?? null, currency: context.currency ?? null, latestMetricDate: null, reason: "ads-availability-error" };
+        coveredAdRows = [];
       }
-      return dailyReportingPayload({ supersetRows, catalogRows, adRows: verdict.adRows, brand: "ALL" });
+      return dailyReportingPayload({ supersetRows, catalogRows, adRows: coveredAdRows, brand: "ALL", adsAvailability: availability });
     },
-    validatePayload: (p) => !!p && Array.isArray(p.rows) && typeof p.brandFiltered === "boolean",
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && typeof p.brandFiltered === "boolean"
+      && (p.brandFiltered === true || (p.adsAvailability && typeof p.adsAvailability.status === "string")),
     latestDataDate: (p) => maxIsoDate((p.rows || []).map((r) => r.date)),
   },
   "fba-plan": { snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [], derive: null }, // awd is US-only (marketplace-conditional), so not a blanket required dep

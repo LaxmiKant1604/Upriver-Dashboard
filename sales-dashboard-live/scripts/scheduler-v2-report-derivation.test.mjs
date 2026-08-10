@@ -34,7 +34,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads,
     shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS;
 let runReportJobs, assembleSources, buildDeriveContext;
-let reportSourceRequestHashes, isValidCalendarDate, evaluateDailyAdsCoverage, validateSkuPlMonthlyWindows;
+let reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows;
 let makeShadowSnapshotSaver;
 // Leaf (Scheduler v2) pure cores.
 let orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload;
@@ -786,17 +786,19 @@ const DR_ADS = [
   { date: "2025-05-03", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 7, ad_spend: 2, ad_clicks: 1 }, // ad-only day => synthetic row
 ];
 
-// The Daily reporting window and a VALID typed Ads coverage contract for it (Blocker 2). Tests
-// override individual fields to exercise the missing/failed/stale/partial/wrong-account states.
+// The Daily reporting window and a VALID typed Ads coverage contract for it. Tests override fields
+// to exercise the unavailable/partial/stale/failed availability states (re-review blocker 3/4).
 const DR_FROM = "2025-05-01", DR_TO = "2025-06-30";
 const adsCoverage = (over = {}) => ({
   accountId: "A1",
   rawSellerId: "S1", // authoritative raw seller/vendor id (DR_ADS rows are all seller S1)
+  currency: "USD",   // authoritative account currency
   requested: { from: DR_FROM, to: DR_TO },
-  coverage: { from: DR_FROM, to: DR_TO },
-  validated: true,
+  windows: [{ from: DR_FROM, to: DR_TO }], // fully-covered successful window
+  coverageRead: "ok",
+  metricsRead: "ok",
+  syncStatus: "succeeded",
   latestMetricDate: "2025-05-03",
-  requiredSourceStatus: "succeeded",
   adRows: DR_ADS,
   ...over,
 });
@@ -878,8 +880,8 @@ function seedDailyCycle() {
     src("daily-reporting:asin-day-superset", "h_may_c1", { sellerOrVendorIds: ["S2"], from: "2025-05-01", to: "2025-05-31" }),
     src("daily-reporting:asin-day-superset", "h_jun_c0", { from: "2025-06-01", to: "2025-06-30" }),
     src("daily-reporting:catalog", "h_cat"),
-  ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO, rawSellerId: "S1" } })];
-  // Ads are injected as a typed, validated coverage contract (Blocker 2), never a bare array.
+  ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO, rawSellerId: "S1", currency: "USD" } })];
+  // Ads are injected as a typed coverage contract; the derive layers Ads on the sales snapshot.
   const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage() } : {});
   return { store, loader, plannedReports, loadDerivedContext };
 }
@@ -899,6 +901,9 @@ test("daily worker: derives the ALL-brand shadow snapshot from saved fragments w
     assert.ok(key, "shadow snapshot stored under the scheduler-v2 namespace");
     const snap = store._snapshots.get(key);
     assert.equal(snap.payload.brandFiltered, false);
+    assert.equal(snap.payload.adsAvailability.status, "validated", "fully-covered Ads => validated availability");
+    assert.equal(snap.payload.adsAvailability.coveredFrom, DR_FROM);
+    assert.equal(snap.payload.adsAvailability.coveredTo, DR_TO);
     assert.equal(j.row_count, snap.payload.rows.length, "row_count is the real payload row count");
     assert.equal(snap.params.brand, "ALL", "brand IS a snapshot param (cache key)");
     assert.ok(!("adRows" in snap.params) && !("adsCoverage" in snap.params), "injected Ads inputs never leak into the snapshot params");
@@ -908,18 +913,20 @@ test("daily worker: derives the ALL-brand shadow snapshot from saved fragments w
   });
 });
 
-test("daily worker: ALL derivation without injected Ads fails at derive; previous snapshot preserved, zero writes", async () => {
+test("daily worker: without injected Ads, validated SALES still save with Ads marked UNAVAILABLE (never zero)", async () => {
+  // Blocker 3: sales validity is independent of Ads. No loadDerivedContext => no Ads coverage, but
+  // the sales snapshot must still save with an explicit unavailable Ads state (not a blocked report).
   const { store, loader, plannedReports } = seedDailyCycle();
-  store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
   const saver = makeSnapshotSaver(store);
-  // No loadDerivedContext => the ALL adapter has no adRows and must NOT silently understate.
   const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports });
-  assert.equal(res.failed, 1);
+  assert.equal(res.succeeded, 1, "sales snapshot saves even with no Ads coverage");
   const j = store._report("daily-reporting", "A1");
-  assert.equal(j.error_code, "DERIVE_INVALID");
-  assert.notEqual(j.derive_status, "succeeded");
-  assert.equal(store._saveCalls, 0, "no snapshot write when required Ads input is absent");
-  assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "previous snapshot preserved");
+  assert.equal(j.validated, true);
+  const snap = [...store._snapshots.values()].find((s) => s.payload.brandFiltered === false);
+  assert.equal(snap.payload.adsAvailability.status, "unavailable", "no coverage => Ads unavailable");
+  assert.equal(snap.payload.adsAvailability.reason, "no-ads-coverage");
+  assert.ok(snap.payload.rows.length > 0, "sales rows are present");
+  assert.ok(snap.payload.rows.every((r) => !("ad_sales" in r)), "no fabricated ad fields when Ads unavailable");
 });
 
 /* ============================= SKU P&L tranche ============================= */
@@ -1118,57 +1125,70 @@ test("B1 e2e: a loader injecting scope overrides cannot move the snapshot identi
   assert.equal(snap.payload.brandFiltered, false, "still the ALL-brand fold (injected brand ignored)");
 });
 
-group("tranche-2 blocker 2: typed Ads coverage contract (missing != zero)");
+group("blocker 3/4: Daily Ads availability model (sales independent of Ads)");
 
-const planCov = { accountId: "A1", rawSellerId: "S1", from: DR_FROM, to: DR_TO };
+const planCov = { accountId: "A1", rawSellerId: "S1", currency: "USD", from: DR_FROM, to: DR_TO };
+const avail = (over) => resolveDailyAdsAvailability(adsCoverage(over), planCov);
 
-test("B2 unit: validated + fully covered + right account = usable (genuine zero when adRows empty)", async () => {
-  const full = evaluateDailyAdsCoverage(adsCoverage(), planCov);
-  assert.equal(full.ok, true); assert.equal(full.status, "validated");
+test("B2 unit: validated fully-covered = usable Ads (genuine zero when adRows empty)", async () => {
+  const full = resolveDailyAdsAvailability(adsCoverage(), planCov);
+  assert.equal(full.availability.status, "validated");
+  assert.equal(full.availability.coveredFrom, DR_FROM); assert.equal(full.availability.coveredTo, DR_TO);
   assert.deepEqual(full.adRows, DR_ADS);
-  // Genuine zero: validated, fully covered, empty rows, no freshness marker.
-  const zero = evaluateDailyAdsCoverage(adsCoverage({ adRows: [], latestMetricDate: null }), planCov);
-  assert.equal(zero.ok, true); assert.equal(zero.status, "validated");
+  // Genuine zero: validated, fully covered, empty rows.
+  const zero = resolveDailyAdsAvailability(adsCoverage({ adRows: [] }), planCov);
+  assert.equal(zero.availability.status, "validated");
   assert.deepEqual(zero.adRows, []);
 });
 
-test("B2 unit: missing / failed / unvalidated / stale / partial / wrong-account all BLOCK (never zero)", async () => {
-  const block = (over) => evaluateDailyAdsCoverage(adsCoverage(over), planCov);
-  assert.deepEqual(block({ requiredSourceStatus: "missing" }), { ok: false, status: "missing", adRows: [] });
-  assert.deepEqual(block({ requiredSourceStatus: "pending" }), { ok: false, status: "missing", adRows: [] });
-  assert.deepEqual(block({ requiredSourceStatus: "failed" }), { ok: false, status: "failed", adRows: [] });
-  assert.deepEqual(block({ requiredSourceStatus: "skipped" }), { ok: false, status: "failed", adRows: [] });
-  assert.deepEqual(block({ validated: false }), { ok: false, status: "unvalidated", adRows: [] });
-  assert.deepEqual(block({ coverage: { from: null, to: null } }), { ok: false, status: "missing", adRows: [] });
-  assert.deepEqual(block({ coverage: { from: "2025-05-05", to: DR_TO } }), { ok: false, status: "partial", adRows: [] }); // missing early days
-  assert.deepEqual(block({ coverage: { from: DR_FROM, to: "2025-06-15" } }), { ok: false, status: "stale", adRows: [] }); // sync behind the requested end
-  assert.deepEqual(block({ accountId: "B9" }), { ok: false, status: "wrong-account", adRows: [] });
-  // rows present but no freshness marker => stale/inconsistent.
-  assert.deepEqual(block({ latestMetricDate: null }), { ok: false, status: "stale", adRows: [] });
+test("B2 unit: new-account partial + stale coverage still merge their covered rows (never zero the rest)", async () => {
+  // A new account with only a recent covered window => partial; rows inside are merged.
+  const partial = resolveDailyAdsAvailability(adsCoverage({ windows: [{ from: "2025-06-01", to: DR_TO }], adRows: [{ date: "2025-06-10", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 3, ad_spend: 1, ad_clicks: 1 }] }), planCov);
+  assert.equal(partial.availability.status, "partial");
+  assert.equal(partial.availability.coveredFrom, "2025-06-01"); assert.equal(partial.availability.coveredTo, DR_TO);
+  assert.equal(partial.adRows.length, 1, "covered rows are merged");
+  // A recent gap => stale; only the covered prefix is merged.
+  const stale = resolveDailyAdsAvailability(adsCoverage({ windows: [{ from: DR_FROM, to: "2025-06-15" }] }), planCov);
+  assert.equal(stale.availability.status, "stale");
+  assert.equal(stale.availability.coveredTo, "2025-06-15");
 });
 
-test("B2 unit: a structurally malformed contract, or a window mismatch, THROWS (fail closed)", async () => {
-  assert.throws(() => evaluateDailyAdsCoverage(null, planCov), /typed object/);
-  assert.throws(() => evaluateDailyAdsCoverage([], planCov), /typed object/);
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ adRows: "nope" }), planCov), /adRows must be an array/);
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ requiredSourceStatus: "weird" }), planCov), /requiredSourceStatus/);
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ coverage: { from: "2025-13-40", to: DR_TO } }), planCov), /calendar date/);
-  // requested window must equal the planned window (planned scope is authoritative).
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ requested: { from: "2020-01-01", to: "2020-06-30" } }), planCov), /does not match the planned/);
+test("B2 unit: unavailable (not-synced / schema-missing / no coverage) merges NO rows, never zero", async () => {
+  assert.equal(avail({ syncStatus: "missing" }).availability.status, "unavailable");
+  assert.equal(avail({ syncStatus: "pending" }).availability.status, "unavailable");
+  assert.equal(avail({ coverageRead: "schema-missing" }).availability.status, "unavailable");
+  assert.equal(avail({ windows: [] }).availability.status, "unavailable");
+  const u = avail({ syncStatus: "missing" });
+  assert.deepEqual(u.adRows, [], "no rows merged when Ads unavailable");
+  assert.equal(resolveDailyAdsAvailability(null, planCov).availability.status, "unavailable"); // missing contract
 });
 
-test("B2 e2e: a failed/stale Ads coverage BLOCKS the Daily snapshot and preserves last-known-good (zero writes)", async () => {
-  for (const bad of [{ requiredSourceStatus: "failed" }, { coverage: { from: DR_FROM, to: "2025-06-15" } }, { accountId: "B9" }]) {
+test("B2 unit: operational failures (sync-failed / read-failed / limit / scope / window mismatch) => failed", async () => {
+  assert.equal(avail({ syncStatus: "failed" }).availability.reason, "ads-sync-failed");
+  assert.equal(avail({ coverageRead: "read-failed" }).availability.reason, "coverage-read-failed");
+  assert.equal(avail({ metricsRead: "limit-exceeded" }).availability.reason, "ads-read-limit-exceeded");
+  assert.equal(avail({ metricsRead: "read-failed" }).availability.reason, "ads-read-failed");
+  assert.equal(avail({ accountId: "B9" }).availability.reason, "ads-account-mismatch");
+  assert.equal(avail({ rawSellerId: "OTHER" }).availability.reason, "ads-raw-seller-mismatch");
+  assert.equal(avail({ requested: { from: "2020-01-01", to: "2020-06-30" } }).availability.reason, "ads-window-mismatch");
+  assert.equal(avail({ syncStatus: "failed" }).availability.status, "failed");
+  assert.deepEqual(avail({ syncStatus: "failed" }).adRows, [], "failed Ads merges no rows");
+});
+
+test("B2 e2e: an unavailable/stale Ads state still SAVES the sales snapshot with explicit availability", async () => {
+  for (const c of [
+    { over: { syncStatus: "missing" }, status: "unavailable" },
+    { over: { syncStatus: "failed" }, status: "failed" },
+    { over: { windows: [{ from: DR_FROM, to: "2025-06-15" }] }, status: "stale" },
+  ]) {
     const { store, loader, plannedReports } = seedDailyCycle();
-    store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
     const saver = makeSnapshotSaver(store);
-    const badLoader = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage(bad) } : {});
-    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext: badLoader });
-    assert.equal(res.succeeded, 0, "blocked Ads coverage never produces a snapshot: " + JSON.stringify(bad));
-    assert.equal(store._saveCalls, 0, "zero Supabase writes");
-    assert.equal(store._report("daily-reporting", "A1").error_code, "DERIVE_INVALID");
-    assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "prior snapshot preserved");
-    assert.equal([...store._snapshots.keys()].filter((k) => k.startsWith("scheduler-v2/daily-reporting")).length, 1, "no new snapshot written");
+    const loadDerivedContext = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage(c.over) } : {});
+    const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext });
+    assert.equal(res.succeeded, 1, "sales snapshot saves regardless of Ads state: " + c.status);
+    const snap = [...store._snapshots.values()].find((s) => s.payload.brandFiltered === false);
+    assert.equal(snap.payload.adsAvailability.status, c.status, "explicit Ads availability recorded");
+    assert.ok(snap.payload.rows.length > 0, "sales rows present");
   }
 });
 
@@ -1321,62 +1341,63 @@ test("F1 e2e: a duplicated-January source set BLOCKS the sku-pl snapshot (zero w
   assert.ok(store._snapshots.has("scheduler-v2/sku-pl|A1|ph_prev"), "previous snapshot preserved");
 });
 
-group("re-review F2: Daily Ads rows validated against account + window");
+group("blocker 3/4: Daily Ads rows validated against account + window + currency");
 
-test("F2 unit: cross-account / out-of-window / bad-date / missing-seller / non-finite rows BLOCK (never filtered)", async () => {
-  const row = (over) => ({ date: "2025-05-10", seller_or_vendor_id: "S1", ad_sales: 1, ad_spend: 1, ad_clicks: 1, ...over });
-  const withRows = (rows) => evaluateDailyAdsCoverage(adsCoverage({ adRows: rows }), planCov);
-  assert.deepEqual(withRows([row({ seller_or_vendor_id: "S2" })]), { ok: false, status: "ads-row-cross-account", adRows: [] }, "account B row inside A envelope blocks");
-  assert.equal(withRows([row({ date: "2025-04-30" })]).status, "ads-row-out-of-window", "row before planned.from blocks");
-  assert.equal(withRows([row({ date: "2025-07-01" })]).status, "ads-row-out-of-window", "row after planned.to blocks");
-  assert.equal(withRows([row({ date: "2025-02-30" })]).status, "ads-row-bad-date", "impossible date blocks");
-  assert.equal(withRows([row({ date: "not-a-date" })]).status, "ads-row-bad-date", "malformed date blocks");
-  assert.equal(withRows([row({ seller_or_vendor_id: undefined })]).status, "ads-row-cross-account", "missing seller id blocks (not this account)");
-  assert.equal(withRows([row({ ad_spend: NaN })]).status, "ads-row-non-finite-metric", "NaN metric blocks");
-  assert.equal(withRows([row({ ad_sales: Infinity })]).status, "ads-row-non-finite-metric", "Infinity metric blocks");
-  assert.equal(withRows([row({ ad_clicks: "3" })]).status, "ads-row-non-finite-metric", "non-number metric blocks");
-  // One bad row among good rows blocks the WHOLE set (never silently filtered).
-  assert.equal(withRows([row(), row({ seller_or_vendor_id: "S2" })]).status, "ads-row-cross-account", "a single bad row blocks all");
+test("F2 unit: cross-account / out-of-window / bad-date / missing-seller / non-finite / bad-currency rows => failed", async () => {
+  const row = (over) => ({ date: "2025-05-10", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 1, ad_spend: 1, ad_clicks: 1, ...over });
+  const status = (rows) => resolveDailyAdsAvailability(adsCoverage({ adRows: rows }), planCov).availability;
+  assert.equal(status([row({ seller_or_vendor_id: "S2" })]).reason, "ads-row-cross-account", "account B row inside A blocks");
+  assert.equal(status([row({ date: "2025-04-30" })]).reason, "ads-row-out-of-window", "row before planned.from blocks");
+  assert.equal(status([row({ date: "2025-07-01" })]).reason, "ads-row-out-of-window", "row after planned.to blocks");
+  assert.equal(status([row({ date: "2025-02-30" })]).reason, "ads-row-bad-date", "impossible date blocks");
+  assert.equal(status([row({ seller_or_vendor_id: undefined })]).reason, "ads-row-cross-account", "missing seller id blocks");
+  assert.equal(status([row({ ad_spend: NaN })]).reason, "ads-row-non-finite-metric", "NaN metric blocks");
+  assert.equal(status([row({ ad_clicks: "3" })]).reason, "ads-row-non-finite-metric", "non-number metric blocks");
+  // Currency (blocker 4): null/blank currency on a NONZERO row must not pass; mismatched currency blocks.
+  assert.equal(status([row({ currency: null })]).reason, "ads-currency-missing", "null currency on nonzero row blocks");
+  assert.equal(status([row({ currency: "  " })]).reason, "ads-currency-missing", "blank currency on nonzero row blocks");
+  assert.equal(status([row({ currency: "CAD" })]).reason, "ads-currency-mismatch", "a currency != account currency blocks");
+  assert.equal(status([row({ currency: "USD" }), row({ currency: "CAD" })]).reason, "ads-currency-mismatch", "mixed currency blocks");
+  // A single bad row fails the WHOLE Ads set (never silently filtered).
+  assert.equal(status([row(), row({ seller_or_vendor_id: "S2" })]).status, "failed", "one bad row fails all Ads");
+  // All the above are "failed" (Ads unusable) -- sales still save (see the e2e test).
+  assert.equal(status([row({ currency: "CAD" })]).status, "failed");
 });
 
-test("F2 unit: correct primary rows, correct dd-secondary rows, and validated-covered empty are usable", async () => {
-  const primary = evaluateDailyAdsCoverage(adsCoverage(), planCov);
-  assert.equal(primary.ok, true); assert.deepEqual(primary.adRows, DR_ADS);
-  // dd-secondary: PUBLIC accountId "dd-secondary:XYZ" is DISTINCT from the RAW seller id "XYZ"; rows
-  // carry the RAW id. Organization isolation + public/raw separation preserved.
-  const secRows = [{ date: "2025-05-02", seller_or_vendor_id: "XYZ", ad_sales: 4, ad_spend: 2, ad_clicks: 1 }];
-  const secPlan = { accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", from: DR_FROM, to: DR_TO };
-  const sec = evaluateDailyAdsCoverage(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: secRows, latestMetricDate: "2025-05-02" }), secPlan);
-  assert.equal(sec.ok, true); assert.deepEqual(sec.adRows, secRows);
-  // A dd-secondary row tagged with the PUBLIC id (not the raw id) is cross-account -> block.
-  const wrongTag = evaluateDailyAdsCoverage(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: [{ ...secRows[0], seller_or_vendor_id: "dd-secondary:XYZ" }] }), secPlan);
-  assert.equal(wrongTag.ok, false); assert.equal(wrongTag.status, "ads-row-cross-account");
-  // Genuine zero: validated, covered, right account, no rows.
-  const zero = evaluateDailyAdsCoverage(adsCoverage({ adRows: [], latestMetricDate: null }), planCov);
-  assert.equal(zero.ok, true); assert.deepEqual(zero.adRows, []);
+test("F2 unit: correct primary + dd-secondary rows are usable; public/raw separation preserved", async () => {
+  const primary = resolveDailyAdsAvailability(adsCoverage(), planCov);
+  assert.equal(primary.availability.status, "validated"); assert.deepEqual(primary.adRows, DR_ADS);
+  // dd-secondary: PUBLIC id "dd-secondary:XYZ" is DISTINCT from the RAW seller id "XYZ"; rows carry
+  // the RAW id. Organization isolation + public/raw separation preserved.
+  const secRows = [{ date: "2025-05-02", seller_or_vendor_id: "XYZ", currency: "USD", ad_sales: 4, ad_spend: 2, ad_clicks: 1 }];
+  const secPlan = { accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", currency: "USD", from: DR_FROM, to: DR_TO };
+  const sec = resolveDailyAdsAvailability(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: secRows }), secPlan);
+  assert.equal(sec.availability.status, "validated"); assert.deepEqual(sec.adRows, secRows);
+  // A dd-secondary row tagged with the PUBLIC id (not the raw id) is cross-account -> failed.
+  const wrongTag = resolveDailyAdsAvailability(adsCoverage({ accountId: "dd-secondary:XYZ", rawSellerId: "XYZ", adRows: [{ ...secRows[0], seller_or_vendor_id: "dd-secondary:XYZ" }] }), secPlan);
+  assert.equal(wrongTag.availability.reason, "ads-row-cross-account");
 });
 
-test("F2 unit: a missing planned rawSellerId, a rawSellerId mismatch, or a missing coverage.rawSellerId THROWS", async () => {
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage(), { accountId: "A1", from: DR_FROM, to: DR_TO }), /planned\.rawSellerId/);
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ rawSellerId: "OTHER" }), planCov), /rawSellerId does not match/);
-  assert.throws(() => evaluateDailyAdsCoverage(adsCoverage({ rawSellerId: "" }), planCov), /rawSellerId must be a non-empty/);
+test("F2 unit: a missing planned rawSellerId or account currency degrades to failed (sales still save), never throws", async () => {
+  assert.equal(resolveDailyAdsAvailability(adsCoverage(), { accountId: "A1", currency: "USD", from: DR_FROM, to: DR_TO }).availability.reason, "planned-raw-seller-missing");
+  assert.equal(resolveDailyAdsAvailability(adsCoverage(), { accountId: "A1", rawSellerId: "S1", from: DR_FROM, to: DR_TO }).availability.reason, "planned-currency-missing");
+  assert.equal(resolveDailyAdsAvailability(adsCoverage({ rawSellerId: "OTHER" }), planCov).availability.reason, "ads-raw-seller-mismatch");
 });
 
-test("F2 e2e: a cross-account or out-of-window Ads row BLOCKS the Daily snapshot (zero writes, last-known-good preserved)", async () => {
+test("F2 e2e: a cross-account / out-of-window Ads row => Ads FAILED but sales still save (never zero)", async () => {
   const badSets = [
-    [{ date: "2025-05-01", seller_or_vendor_id: "S2", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // account B leaked into A
-    [{ date: "2025-04-01", seller_or_vendor_id: "S1", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // before the planned window
+    [{ date: "2025-05-01", seller_or_vendor_id: "S2", currency: "USD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // account B leaked into A
+    [{ date: "2025-04-01", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // before the planned window
   ];
   for (const badRows of badSets) {
     const { store, loader, plannedReports } = seedDailyCycle();
-    store._snapshots.set("scheduler-v2/daily-reporting|A1|ph_prev", { payload: { rows: [{ prior: true }], brandFiltered: false } });
     const saver = makeSnapshotSaver(store);
     const badLoader = ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: adsCoverage({ adRows: badRows }) } : {});
     const res = await runReportJobs({ store, cycleId: "c", sourceRows: loader, saveSnapshot: saver, plannedReports, loadDerivedContext: badLoader });
-    assert.equal(res.succeeded, 0, "a bad Ads row never yields a snapshot: " + JSON.stringify(badRows[0]));
-    assert.equal(store._saveCalls, 0, "zero Supabase writes");
-    assert.equal(store._report("daily-reporting", "A1").error_code, "DERIVE_INVALID");
-    assert.ok(store._snapshots.has("scheduler-v2/daily-reporting|A1|ph_prev"), "previous snapshot preserved");
+    assert.equal(res.succeeded, 1, "sales still save: " + JSON.stringify(badRows[0]));
+    const snap = [...store._snapshots.values()].find((s) => s.payload.brandFiltered === false);
+    assert.equal(snap.payload.adsAvailability.status, "failed", "corrupt Ads => failed availability");
+    assert.ok(snap.payload.rows.every((r) => !("ad_sales" in r)), "no ad fields merged when Ads failed");
   }
 });
 
@@ -1445,7 +1466,7 @@ async function main() {
   mark("main(): loading Phase 1d modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS } = await import("../lib/server/sync/report-derivation.js"));
   ({ runReportJobs, assembleSources, buildDeriveContext } = await import("../lib/server/sync/report-worker.js"));
-  ({ reportSourceRequestHashes, isValidCalendarDate, evaluateDailyAdsCoverage, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
+  ({ reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   const core = await import("../lib/server/reports/derivation-core.js");
   ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = core);
   dailyReportingPayload = core.dailyReportingPayload;

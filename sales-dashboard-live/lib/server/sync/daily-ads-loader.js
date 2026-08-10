@@ -17,8 +17,6 @@
 // All I/O is injected (getAdMetrics, getCoverageState, connections), so this is offline-testable and
 // makes ZERO DataDoe calls.
 
-import { addDaysStr } from "../date-windows.js";
-import { isValidCalendarDate } from "./report-source-contracts.js";
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
 
 // The ONE Ads source that feeds ad_daily_metrics (campaign-level daily); ads-sync.js only upserts
@@ -50,70 +48,58 @@ export function canonicalizeAdRows(metricRows, rawSellerId) {
 }
 
 /**
- * The last date D such that [from, D] is CONTIGUOUSLY covered by the successful windows, or null
- * when `from` itself is not covered. Pure; `windows` = [{from,to}] successful calendar windows. A
- * gap before/at `from` yields null (missing); a gap after yields a D < to (stale). Clamped to `to`.
+ * Build the typed adsCoverage contract that resolveDailyAdsAvailability consumes. `coverageState` =
+ * { windows:[{from,to}], status, latestMetricDate, read } from the durable ads coverage store, and
+ * `metricsRead` reports the ad_daily_metrics read outcome ("ok" | "limit-exceeded" | "read-failed").
+ * Pure. Carries the AUTHORITATIVE account currency + raw seller scope + raw successful windows so the
+ * availability resolver can compute the covered sub-window and validate every row.
  */
-export function adsCoveredThrough(windows, from, to) {
-  if (!isValidCalendarDate(from) || !isValidCalendarDate(to) || from > to) return null;
-  const valid = (windows || [])
-    .filter((w) => w && isValidCalendarDate(w.from) && isValidCalendarDate(w.to) && w.from <= w.to && w.to >= from && w.from <= to)
-    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
-  let cursor = from; // the next day that still needs coverage
-  let covered = false;
-  for (const w of valid) {
-    if (w.from > cursor) break;            // a gap before this window: contiguous coverage ends
-    if (w.to >= cursor) { cursor = addDaysStr(w.to, 1); covered = true; }
-  }
-  if (!covered) return null;
-  const through = addDaysStr(cursor, -1);
-  return through > to ? to : through;
-}
-
-/**
- * Build the typed adsCoverage contract for evaluateDailyAdsCoverage. `coverageState` =
- * { windows:[{from,to}], status, latestMetricDate } from the durable ads coverage store. Pure.
- * Coverage.from/to is the contiguous covered span anchored at `from` (so a start gap => coverage
- * null => missing; an end shortfall => coverage.to < to => stale). validated tracks the sync status.
- */
-export function buildDailyAdsCoverage({ accountId, rawSellerId, from, to, metricRows, coverageState }) {
+export function buildDailyAdsCoverage({ accountId, rawSellerId, currency, from, to, metricRows, metricsRead = "ok", coverageState }) {
   const state = coverageState || {};
-  const through = adsCoveredThrough(state.windows || [], from, to);
   return {
     accountId,
     rawSellerId,
+    currency: currency == null ? null : currency,
     requested: { from, to },
-    coverage: through ? { from, to: through } : { from: null, to: null },
-    validated: state.status === "succeeded",
+    windows: Array.isArray(state.windows) ? state.windows : [],
+    coverageRead: state.read || "ok",
+    metricsRead,
+    syncStatus: state.status || "missing",
     latestMetricDate: state.latestMetricDate ?? null,
-    requiredSourceStatus: state.status || "missing",
     adRows: canonicalizeAdRows(metricRows, rawSellerId),
   };
 }
 
 /**
  * Make the report-worker `loadDerivedContext` callback for Daily Reporting. For daily-reporting ALL,
- * it resolves the authoritative raw seller id, reads ad_daily_metrics + durable coverage, and returns
- * { adsCoverage }. For the named-brand path (no ads) and every other report it returns {}. Injected:
+ * it resolves the authoritative raw seller id, reads ad_daily_metrics (paginated, truncation-guarded)
+ * + durable coverage, and returns { adsCoverage }. A metrics read that throws (e.g. the row-limit
+ * guard) or an unresolvable account is captured as a typed read/scope state so the derive marks Ads
+ * failed/unavailable WITHOUT blocking the sales snapshot. For the named-brand path and every other
+ * report it returns {}. Injected:
  *   connections     -- DataDoe connections (for resolveDataDoeAccountIds); default is production.
- *   getAdMetrics    -- (accountId, from, to) -> ad_daily_metrics rows (getAdDailyMetrics).
- *   getCoverageState-- (accountId, sourceKey) -> { windows, status, latestMetricDate }.
+ *   getAdMetrics    -- (accountId, from, to) -> ad_daily_metrics rows (getAdDailyMetrics; may throw).
+ *   getCoverageState-- (accountId, sourceKey) -> { windows, status, latestMetricDate, read }.
  */
 export function makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState }) {
   return async ({ reportKey, accountId, planned }) => {
     if (reportKey !== "daily-reporting") return {};
     const context = (planned && planned.context) || {};
     if ((context.brand ?? "ALL") !== "ALL") return {}; // named-brand Daily uses no ads
-    const { from, to } = context;
-    // Authoritative raw seller/vendor id from account metadata -- never from rows. A missing or
-    // ambiguous resolution fails closed (the derive then blocks and preserves last-known-good).
+    const { from, to, currency } = context;
+    // Authoritative raw seller/vendor id from account metadata -- never from rows. An unresolvable
+    // account yields a null raw id; the availability resolver then marks Ads failed (sales survive).
     const resolved = resolveDataDoeAccountIds([accountId], connections);
-    if (!resolved || resolved.rawAccountIds.length !== 1) {
-      throw new Error(`daily ads loader could not resolve a single raw seller/vendor id for "${accountId}".`);
+    const rawSellerId = resolved && resolved.rawAccountIds.length === 1 ? resolved.rawAccountIds[0] : null;
+    let metricRows = [];
+    let metricsRead = "ok";
+    try {
+      metricRows = await getAdMetrics(accountId, from, to);
+    } catch (error) {
+      metricsRead = error && error.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed";
+      metricRows = [];
     }
-    const rawSellerId = resolved.rawAccountIds[0];
-    const metricRows = await getAdMetrics(accountId, from, to);
     const coverageState = await getCoverageState(accountId, DAILY_ADS_SOURCE_KEY);
-    return { adsCoverage: buildDailyAdsCoverage({ accountId, rawSellerId, from, to, metricRows, coverageState }) };
+    return { adsCoverage: buildDailyAdsCoverage({ accountId, rawSellerId, currency, from, to, metricRows, metricsRead, coverageState }) };
   };
 }

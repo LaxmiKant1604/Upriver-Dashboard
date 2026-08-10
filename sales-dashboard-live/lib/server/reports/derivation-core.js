@@ -260,16 +260,23 @@ export function rollupSupersetToDaily(supersetRows) {
 //                    like the route) -> { rows, brandFiltered:true }.
 // Ads are REQUIRED for the ALL payload and injected by the caller (planner-loaded from the
 // scheduled Ads rows); a missing/non-array adRows throws rather than silently understating.
-export function dailyReportingPayload({ supersetRows, catalogRows, adRows, brand = "ALL" }) {
+export function dailyReportingPayload({ supersetRows, catalogRows, adRows, brand = "ALL", adsAvailability = null }) {
   if (brand && brand !== "ALL") {
     return { rows: dailyRowsForBrand(supersetRows, catalogRows, brand), brandFiltered: true };
   }
   if (!Array.isArray(adRows)) {
     throw new Error("daily-reporting ALL derivation requires injected adRows (an array; [] when there is no ad activity).");
   }
+  // SALES are computed identically regardless of Ads (parity preserved). `adRows` are ONLY the
+  // proven-covered Ads rows; the merge adds ad fields to their (seller, day) sales rows, so an
+  // uncovered date's sales row simply carries no ad fields. `adsAvailability` (when provided) is the
+  // explicit coverage state the future frontend consumer reads to distinguish covered-genuine-zero
+  // from uncovered-unavailable. It is payload metadata only -- never part of the snapshot identity.
   const rows = normalizeDailySalesRows(rollupSupersetToDaily(supersetRows));
   for (const r of rows) r.total_units_sold = r.total_units;
-  return { rows: mergeSalesAndAds(rows, normalizeAdRows(adRows)), brandFiltered: false };
+  const payload = { rows: mergeSalesAndAds(rows, normalizeAdRows(adRows)), brandFiltered: false };
+  if (adsAvailability) payload.adsAvailability = adsAvailability;
+  return payload;
 }
 
 // ---- SKU P&L cores. `skuPlFold` is the verbatim copy of api/datadoe.js foldSkuPlMonthlyRows;
