@@ -2010,3 +2010,41 @@ writes ZERO snapshots and leaves a seeded last-known-good snapshot readable/unch
 `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). `api/datadoe.js` untouched
 since the review commit. request_hash, five-ID batching and primary/dd-secondary organization isolation
 preserved; Scheduler v2 remains SHADOW MODE with both reports locked.
+
+## 36. Scheduler-v2 verification test-artifact blocker fixed (restore base + fresh FBA strict test) (SHADOW MODE, 2026-08-10)
+
+Fixes the one remaining re-review blocker: after `fb43775` appended the FBA strict-cap source-worker
+test to `scripts/scheduler-v2-verification.test.mjs`, that file became unreadable/non-terminating in the
+review worktree (`node --check` blocked; `npm run test:scheduler-v2` emitted no markers and ran >40s
+until interrupted), so the 57th assertion + full `verify` were not reproducible. Test-packaging fix
+only. The APPROVED production fixes are untouched: `report-source-contracts.js` (strict flags),
+`report-derivation.js` (exact inventory + AWD window validation), `source-worker.js`, and
+`api/datadoe.js` are all byte-unchanged since the review commit `fdd84a0`.
+
+### 36.1 Fix
+
+- Restored `scripts/scheduler-v2-verification.test.mjs` **byte-for-byte** to its approved `602feea`
+  content (the 56-assertion base) via `git show 602feea:<path> > <path>` -- `git diff 602feea` is empty.
+- Moved the one new FBA strict-cap source-worker assertion into a small, independent, freshly-named
+  artifact: `scripts/fba-strict-source-worker.test.js` (10 KB). Self-contained -- a lean in-memory
+  source store + DataDoe double drive the REAL `runSourceJobs`; no DataDoe/Supabase/network, no
+  `process.exit`, no timers, no secret-shaped fixtures. Its scope is stronger than the removed inline
+  test: it resolves a REAL fba-plan job (contract `strict:true` + real row limit), returns EXACTLY
+  `job.limit` rows (`rows.length === limit`), and proves the worker records `TRUNCATED` (validate stage,
+  terminal), persists NO source payload, lets an unrelated `brand-sales` source in the same batch
+  succeed + persist, and does NOT attempt the truncated export again on a repeated run (one create-export
+  ever; `processed === 0` on the repeat).
+- `package.json`: `test:scheduler-v2 = node scripts/scheduler-v2-verification.test.mjs && node
+  scripts/fba-strict-source-worker.test.js`. Combined total stays **57** (56 base + 1 new).
+
+### 36.2 Verification (each file separately, then aggregate; all natural exit 0)
+
+Per file: `fs.statSync` + a five-line head read return immediately; `node --check` exit 0; a direct
+`node <file>` run terminates naturally with process exit code **0** (base = `ran 56/56, 56 passed`;
+new = `1 passed`). No lingering handles (both are pure in-memory; the process exits on its own).
+Aggregate: `npm run test:scheduler-v2` = 56 + 1 = **57**; `npm run test:report-derivation` (**145**);
+`npm run test:report-contracts` (**161**); `npm run test:source-identity` (7); `npm run verify` =
+**522** (54+60+23+6+**57**+145+7+161+9) + `build:check` (2,394 modules, built ~7s); `git diff --check`
+clean; `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). The approved
+strict contracts, FBA window validation, source worker, and `api/datadoe.js` are untouched. Scheduler v2
+remains SHADOW MODE with both reports locked.

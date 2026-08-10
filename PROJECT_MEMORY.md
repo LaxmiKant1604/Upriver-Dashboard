@@ -5028,3 +5028,29 @@ insight reports / cron / frontend cutover NOT started; `HANDOFF.md` untouched. D
   `npm run verify` = **522** + build (2,394 modules); `git diff --check` clean; only intended files
   changed (+ untracked HANDOFF.md); `api/datadoe.js` untouched. request_hash, five-ID batching,
   primary/dd-secondary isolation preserved.
+
+## Scheduler v2: verification test-artifact blocker fixed (restore base + fresh FBA strict test) (Claude, 2026-08-10)
+
+Fixed the re-review's one remaining blocker: `fb43775` had appended the FBA strict-cap test to
+`scripts/scheduler-v2-verification.test.mjs`, and the modified file became unreadable/non-terminating
+in the review worktree (`node --check` blocked; `test:scheduler-v2` hung >40s), so the 57th assertion +
+`verify` were not reproducible. **Test-packaging fix only** -- the APPROVED production code is byte-
+unchanged since `fdd84a0`: strict FBA/reconciliation contracts, exact inventory + AWD window validation,
+report derivation formulas, request identity, and source-worker code are all untouched (verified via
+`git diff fdd84a0 HEAD` on each file). SHADOW MODE; nothing pushed/merged/deployed/migrated; controls
+locked; `HANDOFF.md` untouched. Detail in `SCHEDULER_V2.md` section 36.
+
+- **Restore.** `scripts/scheduler-v2-verification.test.mjs` restored byte-for-byte to its approved
+  `602feea` content (56-assertion base) via `git show 602feea:<path> > <path>`; `git diff 602feea` empty.
+- **Fresh file.** The one new assertion moved to `scripts/fba-strict-source-worker.test.js` (10 KB,
+  self-contained: lean in-memory store + DataDoe double drive the REAL `runSourceJobs`; no network/DB,
+  no `process.exit`, no timers, no secret-shaped fixtures). Stronger scope than the removed inline test:
+  a REAL fba-plan job (contract strict + real limit) returns EXACTLY `job.limit` rows -> worker records
+  `TRUNCATED` (validate, terminal), persists nothing, an unrelated brand-sales source succeeds, and the
+  truncated export is not re-attempted on a repeat run (one create-export; `processed===0`).
+- **Wiring.** `test:scheduler-v2 = node scripts/scheduler-v2-verification.test.mjs && node
+  scripts/fba-strict-source-worker.test.js`; combined stays **57** (56 + 1).
+- **Verification (each file separately; natural exit 0).** stat + head read immediate; `node --check` 0;
+  direct run exit code 0 (base 56/56; new 1). Aggregate: `test:scheduler-v2` **57**;
+  `test:report-derivation` 145; `test:report-contracts` 161; `test:source-identity` 7; `npm run verify`
+  = **522** + build; `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
