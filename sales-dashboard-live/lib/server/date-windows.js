@@ -77,6 +77,32 @@ function isRealDate(value) {
  * Returns null for a malformed `asOf`. Pure/UTC; no I/O. The result satisfies
  * validateSkuPlMonthlyWindows by construction.
  */
+// The 3 completed calendar months before the month containing `toStr`, plus the current (MTD)
+// month window ending at `toStr`. Byte-identical to the api/datadoe.js `fba-plan` route helper of
+// the same name (kept here as the shared dependency-free copy the Scheduler v2 FBA planner +
+// derivation use; proven equal to the route copy by the FBA parity harness). Returns
+// { completed: [{key,from,to}] x3, current: {key,from,to,daysInMonth} }.
+export function planMonthWindows(toStr) {
+  const [ty, tm] = toStr.split("-").map(Number);
+  const completed = [];
+  for (let i = 3; i >= 1; i--) {
+    const total = ty * 12 + (tm - 1) - i;
+    const y = Math.floor(total / 12), m = (((total % 12) + 12) % 12) + 1;
+    completed.push({
+      key: `${y}-${pad2s(m)}`,
+      from: `${y}-${pad2s(m)}-01`,
+      to: `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`,
+    });
+  }
+  const current = {
+    key: `${ty}-${pad2s(tm)}`,
+    from: `${ty}-${pad2s(tm)}-01`,
+    to: toStr,
+    daysInMonth: daysInMonthUTC(ty, tm),
+  };
+  return { completed, current };
+}
+
 export function sixCompleteCalendarMonths(asOf) {
   if (!isRealDate(asOf)) return null;
   const [year, month] = asOf.slice(0, 7).split("-").map(Number);

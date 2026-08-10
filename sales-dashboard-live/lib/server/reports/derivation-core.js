@@ -401,3 +401,272 @@ export function computeSkuPlRow(row, month, cogsPerUnitOverride) {
     hasActivity: t.sales !== 0 || profit !== 0 || t.units !== 0 || t.adSpend !== 0,
   };
 }
+
+// ---- Reconciliation cores. Verbatim copies of api/datadoe.js reconciliationOrders /
+//      reconciliationSettlements (single formula, kept dependency-free here so both the route and
+//      the Scheduler v2 reconciliation derivation compute IDENTICAL orders/settlements). Proven
+//      equal to the route formula by the reconciliation parity harness. ----
+
+// Verbatim copy of api/datadoe.js reconciliationOrders: fold order-line rows to one entry per
+// amazon_order_id (purchase-side), keeping the distinct brand list per order. Currency is taken
+// from the order's first row and NEVER merged across currencies (each order keeps its own).
+export function reconciliationOrders(rows, catalogRows) {
+  const brandByAsin = new Map();
+  for (const row of catalogRows) {
+    const asin = String(row.child_asin || "").trim();
+    const brand = String(row.product_brand || "").trim() || "Unassigned";
+    if (asin && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
+  }
+  const byOrder = new Map();
+  for (const row of rows) {
+    const orderId = String(row.amazon_order_id || "").trim();
+    if (!orderId) continue;
+    const brand = brandByAsin.get(String(row.child_asin || "").trim()) || "Unassigned";
+    const current = byOrder.get(orderId) || {
+      orderId,
+      orderDate: row.order_date || row.date || null,
+      status: row.amazon_order_status || "Unknown",
+      fulfillmentChannel: row.fulfillment_channel || "Unknown",
+      isBusiness: row.order_is_business === true || String(row.order_is_business).toLowerCase() === "true",
+      currency: row.item_price_currency || null,
+      quantity: 0,
+      orderRevenue: 0,
+      orderTax: 0,
+      brandBreakdown: {},
+    };
+    const quantity = num(row.quantity_sum ?? row.quantity);
+    const revenue = num(row.item_price_sum ?? row.item_price_value);
+    const tax = num(row.item_tax_sum ?? row.item_tax_value);
+    current.quantity += quantity;
+    current.orderRevenue += revenue;
+    current.orderTax += tax;
+    const brandTotal = current.brandBreakdown[brand] || { quantity: 0, orderRevenue: 0, orderTax: 0 };
+    brandTotal.quantity += quantity;
+    brandTotal.orderRevenue += revenue;
+    brandTotal.orderTax += tax;
+    current.brandBreakdown[brand] = brandTotal;
+    byOrder.set(orderId, current);
+  }
+  return [...byOrder.values()].map(({ brandBreakdown, ...order }) => ({
+    ...order,
+    brands: Object.keys(brandBreakdown),
+  }));
+}
+
+// Verbatim copy of api/datadoe.js reconciliationSettlements: one canonical settlement row per source
+// row (posting-side), currency preserved per row (never converted).
+export function reconciliationSettlements(rows) {
+  return rows.map((row) => ({
+    settlementDate: row.date || null,
+    orderId: String(row.amazon_order_id || "").trim() || null,
+    settlementType: String(row.settlement_type || "OTHER").trim().toUpperCase(),
+    currency: row.currency || null,
+    settledRevenue: num(row.item_price_sum ?? row.item_price),
+    settledTax: num(row.item_tax_sum ?? row.item_tax),
+    referralFee: num(row.referral_fee_sum ?? row.referral_fee),
+    fbaFee: num(row.fba_fee_sum ?? row.fba_per_unit_fulfillment_fee),
+    refundedAmount: num(row.refunded_amount_sum ?? row.refunded_amount),
+    netPayout: num(row.total_sum ?? row.total),
+  }));
+}
+
+// Assemble the COMPLETE Reconciliation payload exactly as the api/datadoe.js `reconciliation` handler
+// does: { from, to, months, orders, settlements }. `months` is the six "YYYY-MM" keys the caller
+// derives from the validated six-month window; `orderRows`/`settlementRows` are the concatenated
+// per-month saved fragments (identical to the route's reconciliationRowsByMonth concatenation), and
+// `catalogRows` is the single full-range catalog fragment. Pure.
+export function reconciliationPayload({ from, to, months, orderRows, settlementRows, catalogRows }) {
+  return {
+    from,
+    to,
+    months,
+    orders: reconciliationOrders(orderRows, catalogRows),
+    settlements: reconciliationSettlements(settlementRows),
+  };
+}
+
+// ---- FBA Shipment Plan cores. A verbatim transcription of the PURE assembly in the api/datadoe.js
+//      `fba-plan` handler (the DataDoe fetches are replaced by injected saved source rows). Kept
+//      dependency-free here; proven equal to the route formula by the FBA parity harness. ----
+
+// Sum per-ASIN units for one grouped Sales & Traffic window (verbatim of planAsinUnits's fold).
+// Returns a Map(asin -> units) in first-seen row order (child_asin ASC as saved), so downstream
+// ASIN ordering matches the route exactly.
+export function foldPlanAsinUnits(rows) {
+  const byAsin = new Map();
+  for (const r of rows || []) {
+    const asin = String(r.child_asin || "").trim();
+    if (!asin) continue;
+    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.total_units));
+  }
+  return byAsin;
+}
+
+/**
+ * Full FBA Shipment Plan payload, byte-identical to the api/datadoe.js `fba-plan` handler, derived
+ * PURELY from saved source rows. Inputs (all already validated + scoped by the caller):
+ *   asOf, accountName, marketCountry, isUS  -- authoritative account metadata (String(to)/name/country).
+ *   completed  -- [{key,from,to}] x3 completed months (from planMonthWindows).
+ *   current    -- {key,from,to,daysInMonth} current MTD month (from planMonthWindows).
+ *   completedUnitRows -- [rows,rows,rows] grouped child_asin units, aligned to `completed`.
+ *   mtdUnitRows       -- grouped child_asin units for the current MTD window.
+ *   dailyDateRows     -- grouped date units for the current month (salesLatestDate + elapsedDays).
+ *   catalogRows       -- product catalog rows (brand + product name).
+ *   invRows           -- FBA inventory-health rows (DESC by date; latest snapshot folded).
+ *   awdRows           -- US-only AWD listing rows (ignored when !isUS; [] = validated empty).
+ * ASIN row order follows the route: completed-month ASINs, then MTD ASINs, then inventory ASINs.
+ */
+export function fbaPlanPayload({
+  asOf, accountName, marketCountry, isUS,
+  completed, current,
+  completedUnitRows = [], mtdUnitRows = [], dailyDateRows = [],
+  catalogRows = [], invRows = [], awdRows = [],
+}) {
+  // 1) Per-ASIN units for each completed month.
+  const asinSet = new Set();
+  const unitsByAsinByMonth = {};
+  completed.forEach((mo, i) => {
+    const byAsin = foldPlanAsinUnits(completedUnitRows[i] || []);
+    for (const [asin, units] of byAsin) {
+      asinSet.add(asin);
+      (unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {}))[mo.key] = units;
+    }
+  });
+
+  // 2a) Current-month MTD units per ASIN.
+  const mtdByAsin = foldPlanAsinUnits(mtdUnitRows);
+  for (const asin of mtdByAsin.keys()) asinSet.add(asin);
+  // 2b) Latest completed sales date in the current month + elapsed days (day-of-month of that date).
+  let salesLatestDate = null;
+  for (const r of dailyDateRows || []) {
+    if (num(r.units_sum) > 0 && r.date && (!salesLatestDate || r.date > salesLatestDate)) salesLatestDate = r.date;
+  }
+  const elapsedDays = (salesLatestDate && salesLatestDate >= current.from && salesLatestDate <= current.to)
+    ? Number(String(salesLatestDate).slice(8, 10))
+    : 0;
+
+  // 3) Catalog brand + product name (first non-empty per ASIN).
+  const brandByAsin = new Map();
+  const nameByAsin = new Map();
+  for (const c of catalogRows || []) {
+    const asin = String(c.child_asin || "").trim();
+    if (!asin) continue;
+    const brand = String(c.product_brand || "").trim();
+    if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
+    const name = String(c.product_name || "").trim();
+    if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
+  }
+
+  // 4) Latest FBA inventory-health snapshot, folded SKU->ASIN + a (marketplace, brand) roll-up.
+  let inventoryDate = null;
+  for (const r of invRows || []) {
+    if (r.date && (!inventoryDate || r.date > inventoryDate)) inventoryDate = r.date;
+  }
+  const invByAsin = {};
+  const skusByAsin = {};
+  const invProductName = new Map();
+  const invByCountryBrand = new Map();
+  for (const r of invRows || []) {
+    if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
+    const asin = String(r.child_asin || "").trim();
+    if (!asin) continue;
+    asinSet.add(asin);
+    const cur = invByAsin[asin] || (invByAsin[asin] = {
+      available: 0, fcTransfer: 0, fcProcessing: 0,
+      inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
+    });
+    cur.available += num(r.available);
+    cur.fcTransfer += num(r.reserved_fc_transfer);
+    cur.fcProcessing += num(r.reserved_fc_processing);
+    cur.inboundShipped += num(r.inbound_shipped);
+    cur.inboundReceived += num(r.inbound_received);
+    cur.inboundWorking += num(r.inbound_working);
+    const sku = String(r.sku || "").trim();
+    if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+    const nm = String(r.product_name || "").trim();
+    if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
+    const invCountry = String(r.marketplace_country_code || marketCountry || "").trim().toUpperCase();
+    const invBrand = brandByAsin.get(asin) || null;
+    const countryBrandKey = `${invCountry}|${invBrand || ""}`;
+    const bucket = invByCountryBrand.get(countryBrandKey)
+      || { country: invCountry || null, brand: invBrand, fbaAvailable: 0, skus: new Set() };
+    bucket.fbaAvailable += num(r.available);
+    if (sku) bucket.skus.add(sku);
+    invByCountryBrand.set(countryBrandKey, bucket);
+  }
+  const inventoryAvailable = (invRows || []).length > 0;
+
+  // 5) AWD available (US only), folded SKU->ASIN.
+  const awdByAsin = {};
+  let awdAvailable = false;
+  if (isUS) {
+    const rows = awdRows || [];
+    awdAvailable = rows.length > 0;
+    for (const r of rows) {
+      const asin = String(r.child_asin || "").trim();
+      if (!asin) continue;
+      awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
+      const sku = String(r.sku || "").trim();
+      if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+    }
+  }
+
+  // 6) Assemble one row per ASIN (representative SKU = first localeCompare SKU; drop zero-activity).
+  const rows = [];
+  for (const asin of asinSet) {
+    const inv = invByAsin[asin] || null;
+    const skus = skusByAsin[asin] ? [...skusByAsin[asin]].sort((a, b) => a.localeCompare(b)) : [];
+    const unitsByMonth = {};
+    let salesTotal = 0;
+    for (const mo of completed) {
+      const u = num(unitsByAsinByMonth[asin]?.[mo.key]);
+      unitsByMonth[mo.key] = u;
+      salesTotal += u;
+    }
+    const mtdUnits = num(mtdByAsin.get(asin));
+    salesTotal += mtdUnits;
+    const invTotal = inv
+      ? inv.available + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
+      : 0;
+    const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
+    if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0) continue;
+    // Subtract the FC-transfer/inbound-shipped overlap Amazon exposes only as Inbound.
+    const adjustedFcTransfer = inv ? Math.max(0, inv.fcTransfer - inv.inboundShipped) : 0;
+    rows.push({
+      asin,
+      productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
+      brand: brandByAsin.get(asin) || null,
+      sku: skus[0] || null,
+      unitsByMonth,
+      mtdUnits,
+      // FBA fields are null ONLY when the whole snapshot is unavailable; when the snapshot exists
+      // but this ASIN is absent, it genuinely holds no FBA stock (0).
+      fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
+      reservedFcTransfer: inventoryAvailable ? adjustedFcTransfer : null,
+      reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
+      inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
+      inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
+      inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
+      awdAvailable: isUS ? awdUnits : null,
+    });
+  }
+
+  return {
+    asOf: String(asOf),
+    accountName: accountName || null,
+    marketCountry: marketCountry || null,
+    isUS,
+    months: completed,
+    currentMonth: current,
+    salesLatestDate,
+    elapsedDays,
+    inventoryDate,
+    inventoryAvailable,
+    awdAvailable,
+    rows,
+    inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
+      ...entry,
+      skuCount: skus.size,
+    })),
+  };
+}
