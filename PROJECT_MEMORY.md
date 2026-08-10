@@ -4961,3 +4961,36 @@ contract metadata and source-worker guard.
 
 **Deployment status:** still shadow mode. Nothing was pushed, merged, deployed, migrated, enabled,
 or scheduled.
+
+## Scheduler v2: FBA/Reconciliation review blockers fixed (cap-strictness + exact FBA windows) (Claude, 2026-08-10)
+
+Fixed the two source-integrity blockers from the Codex senior review. Contract + derivation + test
+changes only; **`api/datadoe.js` (the live route) is UNCHANGED**. SHADOW MODE; nothing
+pushed/merged/deployed/migrated; no schedule/control enabled; both reports stay locked; Keyword Rank /
+insight reports / cron / frontend cutover NOT started; `HANDOFF.md` untouched. Detail in
+`SCHEDULER_V2.md` section 35.
+
+- **Blocker 1 -- reject cap-sized exports.** Added `strict:true` to six Scheduler-v2 contracts in
+  `report-source-contracts.js`: `reconciliation:catalog`, `fba-plan:monthly-units`,
+  `fba-plan:current-daily-dates`, `fba-plan:catalog`, `fba-plan:inventory-health`, `fba-plan:awd`. A
+  cap-sized page (`rows.length >= limit`) is indistinguishable from truncation; the source worker
+  (`source-worker.js`) now fails these as `TRUNCATED` and saves nothing. The legacy route stays
+  non-strict (scheduler strictness is a stronger guard). `strict` is outside `sourceRequestIdentity`, so
+  request_hash is unchanged. Tests: `report-source-contracts.test.mjs` gained a `SCHEDULER_V2_STRICT`
+  category (disjoint from the route-backed sets; backed by the source-worker guard, NOT a route guard)
+  + proofs that every resolved fba-plan/`reconciliation:catalog` job is strict and request_hash is
+  unchanged (161, +2); `scheduler-v2-verification.test.mjs` proves a cap-sized REAL fba-plan source
+  records TRUNCATED, persists nothing, and an unrelated source continues (57, +1).
+- **Blocker 2 -- pin exact FBA windows.** `report-derivation.js` now recomputes the inventory start as
+  `addDaysStr(asOf, -10)` and pins BOTH inventory endpoints, and requires the AWD fragment
+  `from === null && to === null`. Shortened/extended lookback or a dated AWD fragment -> derive-invalid
+  -> last-known-good preserved. Null-vs-zero, US-AWD-blocking, empty-AWD-zero, non-US-no-AWD unchanged;
+  request hashes unchanged (validation only). `report-fba-plan.test.js` (+8, now 33) adds the four
+  negative window tests (each -> invalid/null), a canonical-windows-still-derive-identical-payload test,
+  a planner<->derivation window-agreement test, and a worker-level test proving a bad-window derive
+  writes ZERO snapshots and preserves a seeded last-known-good.
+- **Verification (all natural, exit 0):** node --check every changed file; `test:report-derivation`
+  **145**; `test:report-contracts` **161**; `test:scheduler-v2` **57**; `test:source-identity` 7;
+  `npm run verify` = **522** + build (2,394 modules); `git diff --check` clean; only intended files
+  changed (+ untracked HANDOFF.md); `api/datadoe.js` untouched. request_hash, five-ID batching,
+  primary/dd-secondary isolation preserved.

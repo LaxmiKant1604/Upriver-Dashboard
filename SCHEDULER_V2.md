@@ -1951,3 +1951,62 @@ head read, `node --check` (0), direct run (`report-fba-plan` **25 passed**, `rep
 `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). `api/datadoe.js`
 untouched. request_hash, five-ID batching and primary/dd-secondary organization isolation preserved;
 Scheduler v2 remains SHADOW MODE with both reports locked.
+
+## 35. FBA + Reconciliation review blockers fixed: cap-strictness + exact FBA windows (SHADOW MODE, 2026-08-10)
+
+Fixes the two source-integrity blockers from the Codex senior review of the FBA/Reconciliation
+tranche. Test-and-contract changes only; `api/datadoe.js` (the live route) stays UNCHANGED; no
+migration, schedule, report-control, push, merge, or deploy. Keyword Rank / insight reports / cron /
+frontend cutover NOT started; both reports stay locked. `HANDOFF.md` untracked.
+
+### 35.1 Blocker 1 -- reject cap-sized Scheduler-v2 exports
+
+Scheduler v2's source worker rejects `rows.length >= limit` only when the resolved contract carries
+`strict:true`. Six newly-enabled contracts omitted it, so a capped (possibly truncated) result could be
+persisted and derived into understated FBA sales/stock or a reconciliation catalog that silently turns
+known products into `Unassigned`. Added `strict:true` to `reconciliation:catalog`,
+`fba-plan:monthly-units`, `fba-plan:current-daily-dates`, `fba-plan:catalog`, `fba-plan:inventory-health`,
+and `fba-plan:awd` (in `report-source-contracts.js`). The legacy browser route is unchanged -- these
+sources are fetched non-strict there; scheduler strictness is a stronger integrity guard enforced by
+the source worker (`source-worker.js`: `job.strict === true && rows.length >= Number(job.limit)` ->
+`TRUNCATED`, no save). `strict` is execution metadata OUTSIDE `sourceRequestIdentity`, so request_hash
+is unchanged.
+
+Tests separate the two kinds of strictness so the old executable-parity checks are not weakened:
+- `report-source-contracts.test.mjs`: the "every strict contract is backed by an executable
+  rows.length>=LIMIT guard" test now has a third **`SCHEDULER_V2_STRICT`** category (the six keys),
+  asserted DISJOINT from the route-backed `OPERATIONAL_STRICT`/`INSIGHT_STRICT` sets and backed instead
+  by the source-worker cap guard (a file-level assertion). Two new tests prove every resolved fba-plan +
+  `reconciliation:catalog` job is `strict:true` and that strict metadata does NOT change request_hash
+  (161 assertions, +2).
+- `scheduler-v2-verification.test.mjs`: a new test resolves a REAL fba-plan job (contract strict flag
+  intact), runs the source worker with a cap-sized result, and proves it records `TRUNCATED`, persists
+  NO source payload, and does not block an unrelated source in the same batch (57 tests, +1). The
+  report-side no-snapshot/last-known-good behavior is proven in `report-fba-plan.test.js` (below).
+
+### 35.2 Blocker 2 -- pin the exact FBA inventory + AWD windows in derivation
+
+`report-derivation.js` FBA derive previously validated inventory only by `to === asOf` (any `from`) and
+validated AWD account shape but not its required no-date `{from:null,to:null}` contract. Now it
+RECOMPUTES the inventory start as `addDaysStr(asOf, -10)` (shared `FBA_INVENTORY_LOOKBACK_DAYS = 10`,
+byte-identical to the route constant) and pins BOTH inventory endpoints, and requires the AWD fragment's
+`from === null` AND `to === null`. A shortened/extended lookback or a dated AWD fragment throws ->
+derive-invalid -> last-known-good preserved. FBA null-vs-zero, US-AWD blocking, validated-empty-AWD zero,
+and non-US-never-AWD behavior are unchanged; request hashes are unchanged (validation only, the planner
+already emits the canonical windows).
+
+`report-fba-plan.test.js` (+8, now 33) adds: shortened lookback blocks, extended lookback blocks, wrong
+inventory `to` blocks, dated AWD fragment blocks (each -> invalid, payload null); the exact canonical
+windows still derive the identical payload; `planFbaPlan` emits `inventory = asOf-10..asOf` + AWD
+null/null (planner<->derivation agree); and a worker-level test proving a shortened-inventory derive
+writes ZERO snapshots and leaves a seeded last-known-good snapshot readable/unchanged.
+
+### 35.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `npm run test:report-derivation` = **145**
+(66+26+33+20); `npm run test:report-contracts` (**161**); `npm run test:scheduler-v2` (**57**);
+`npm run test:source-identity` (7); `npm run verify` = **522**
+(54+60+23+6+**57**+**145**+7+**161**+9) + `build:check` (2,394 modules); `git diff --check` clean;
+`git status --short` shows only the intended files (+ untracked `HANDOFF.md`). `api/datadoe.js` untouched
+since the review commit. request_hash, five-ID batching and primary/dd-secondary organization isolation
+preserved; Scheduler v2 remains SHADOW MODE with both reports locked.
