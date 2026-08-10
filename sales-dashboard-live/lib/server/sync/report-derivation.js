@@ -25,6 +25,8 @@ import {
   skuPlPayload,
   reconciliationPayload,
   fbaPlanPayload,
+  keywordRankPayload,
+  sqpDistinctPeriods,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -45,6 +47,12 @@ import { planMonthWindows, addDaysStr } from "../date-windows.js";
 // BOTH endpoints, so a planner/caller that shifts the snapshot window (a shortened or extended lookback)
 // is rejected -- the derivation never implicitly trusts the fragment's window.
 const FBA_INVENTORY_LOOKBACK_DAYS = 10;
+
+// Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
+// SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP and the 365-day catalog share
+// the long window). The derivation RECOMPUTES both window starts from asOf and pins both endpoints.
+const SQP_WEEKLY_LOOKBACK_DAYS = 84;
+const SQP_LONG_LOOKBACK_DAYS = 365;
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -365,7 +373,71 @@ const REGISTRY = {
     // Monthly report: the latest data date is the end of the last covered month (the window `to`).
     latestDataDate: (p, context) => { const d = context && context.to != null ? String(context.to).slice(0, 10) : null; return d || null; },
   },
-  "keyword-rank": { snapshotVersion: "keyword-rank/v2d-1", optionalRequestKeys: ["keyword-rank:sqp-monthly"], derivedSourceKeys: [], derive: null },
+  // Keyword Rank: reproduce the api/datadoe.js `keyword-rank` payload from the saved SQP-weekly +
+  // catalog fragments (both required), plus the SQP-monthly fallback fragment when weekly has < 4
+  // distinct periods. Cadence mirrors the route exactly: weekly (>= 4 weekly periods), monthly (weekly
+  // < 4 AND monthly >= 2 periods), else baseline (prefer non-empty weekly rows, else monthly). Monthly
+  // is OPTIONAL in the gate (it is a data-dependent fallback), so the derive enforces it CONDITIONALLY:
+  // when weekly < 4 periods a missing/failed/disabled monthly BLOCKS (never a silent baseline). Windows
+  // are recomputed from asOf and both endpoints pinned; a missing/malformed/partial/wrong-window/
+  // reordered/cross-account fragment throws -> derive-invalid -> last-known-good preserved.
+  "keyword-rank": {
+    snapshotVersion: "keyword-rank/v2d-1", optionalRequestKeys: ["keyword-rank:sqp-monthly"], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("keyword-rank derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const weeklyFrom = addDaysStr(asOf, -SQP_WEEKLY_LOOKBACK_DAYS);
+      const longFrom = addDaysStr(asOf, -SQP_LONG_LOOKBACK_DAYS);
+      // Required, exact-window, single-account fragments (recompute windows from asOf; never trust caller).
+      const weeklyRows = singleAccountFragmentRows(sources["keyword-rank:sqp-weekly"], "keyword-rank:sqp-weekly", rawSellerId, weeklyFrom, asOf);
+      const catalogRows = singleAccountFragmentRows(sources["keyword-rank:catalog"], "keyword-rank:catalog", rawSellerId, longFrom, asOf);
+
+      const weeklyPeriods = sqpDistinctPeriods(weeklyRows);
+      let cadence = "weekly";
+      let rows = weeklyRows;
+      let periods = weeklyPeriods;
+      if (weeklyPeriods.length < 4) {
+        // Monthly SQP fallback is REQUIRED here. A missing/failed monthly => not derivable now (preserve
+        // last-known-good). A disabled monthly with a terminal policy => blocked. Never a silent baseline.
+        const monthly = sources["keyword-rank:sqp-monthly"];
+        if (!monthly || monthly.available !== true || !Array.isArray(monthly.rows)) {
+          if (monthly && monthly.disabled && sourceDisabledOutcome(monthly.disabledPolicy || null).blocks) {
+            throw new Error("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but the monthly source is disabled; snapshot blocked.");
+          }
+          throw new Error("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but is missing/failed; snapshot blocked (previous data preserved).");
+        }
+        const monthlyRows = singleAccountFragmentRows(monthly, "keyword-rank:sqp-monthly", rawSellerId, longFrom, asOf);
+        const monthlyPeriods = sqpDistinctPeriods(monthlyRows);
+        if (monthlyPeriods.length >= 2) {
+          cadence = "monthly"; rows = monthlyRows; periods = monthlyPeriods;
+        } else {
+          // Prefer the fresher weekly observation; when it is empty use the monthly rows so the user
+          // still gets an honest current baseline (verbatim route logic).
+          cadence = "baseline";
+          rows = weeklyRows.length ? weeklyRows : monthlyRows;
+          periods = sqpDistinctPeriods(rows);
+        }
+      }
+
+      return keywordRankPayload({
+        accountId: context.accountId ?? null,
+        cadence, periods,
+        weeklyPeriodCount: weeklyPeriods.length,
+        rows, catalogRows,
+        // Deterministic from the saved source fetch metadata (the worker pins context.retrievedAt to
+        // the latest fragment fetch time), NEVER Date.now().
+        retrievedAt: context.retrievedAt ?? null,
+      });
+    },
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.products)
+      && Array.isArray(p.catalogBrands) && Array.isArray(p.periods) && typeof p.cadence === "string"
+      && typeof p.weeklyPeriodCount === "number" && ("accountId" in p) && ("retrievedAt" in p),
+    // The latest data date is the most recent SQP period in the chosen cadence (date-only already).
+    latestDataDate: (p) => maxIsoDate((p.periods || []).map(String)),
+  },
   "sales-movers": { snapshotVersion: "sales-movers/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "buy-box-loss": { snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "returns-leakage": { snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },

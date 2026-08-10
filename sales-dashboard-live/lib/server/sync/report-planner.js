@@ -14,7 +14,7 @@
 // No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
-import { reportSourceRequestHashes } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
@@ -29,7 +29,13 @@ const DAILY_MONTHS_BACK = 5;
 // constant, so the scheduled inventory window (asOf-10d..asOf) matches the live route exactly.
 const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation"]);
+// Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
+// SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP + 365-day catalog share the
+// long window), so the scheduled SQP/catalog windows match the live route exactly.
+const SQP_WEEKLY_LOOKBACK_DAYS = 84;
+const SQP_LONG_LOOKBACK_DAYS = 365;
+
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "keyword-rank"]);
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
@@ -208,11 +214,54 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   };
 }
 
+/**
+ * Plan Keyword Rank for ONE account. At kickoff (no `weeklySignal`) it emits the SQP-weekly probe
+ * (asOf-84d..asOf) + the 365-day catalog; the monthly SQP source is a data-dependent FALLBACK and is
+ * NOT planned at kickoff. When a typed `weeklySignal` (from the already-run weekly source this cycle)
+ * satisfies the contract's `distinct_periods < 4` condition, the monthly SQP request (asOf-365d..asOf)
+ * is activated -- exactly one -- via the resolver's fallback gate. All for the one raw seller id;
+ * request_hash + organization isolation come from the shared resolver.
+ */
+export function planKeywordRank({ accountId, country, currency, connections, asOf, weeklySignal = null }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const weeklyFrom = addDaysStr(end, -SQP_WEEKLY_LOOKBACK_DAYS);
+  const longFrom = addDaysStr(end, -SQP_LONG_LOOKBACK_DAYS);
+  const windowsByRequestKey = {
+    "keyword-rank:sqp-weekly": [{ from: weeklyFrom, to: end }],
+    "keyword-rank:catalog": [{ from: longFrom, to: end }],
+  };
+  const dependencySignals = {};
+  if (weeklySignal != null) {
+    dependencySignals["keyword-rank:sqp-weekly"] = weeklySignal;
+    // Supply the monthly window ONLY when the typed weekly signal makes the fallback apply (fail
+    // closed via the shared evaluateFallbackCondition); the resolver rejects an inapplicable window.
+    const monthly = (REPORT_SOURCE_CONTRACTS["keyword-rank"] || []).find((c) => c.requestKey === "keyword-rank:sqp-monthly");
+    if (monthly && evaluateFallbackCondition(monthly.condition, weeklySignal)) {
+      windowsByRequestKey["keyword-rank:sqp-monthly"] = [{ from: longFrom, to: end }];
+    }
+  }
+  const sources = reportSourceRequestHashes({
+    reportKey: "keyword-rank", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country, dependencySignals,
+  });
+  return {
+    reportKey: "keyword-rank",
+    reportVersion: REPORT_DERIVATIONS["keyword-rank"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "keyword-rank", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+}
+
 const PLANNERS = {
   "daily-reporting": planDailyReporting,
   "sku-pl": planSkuPl,
   "fba-plan": planFbaPlan,
   reconciliation: planReconciliation,
+  "keyword-rank": planKeywordRank,
 };
 
 /**
