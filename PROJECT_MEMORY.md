@@ -4383,6 +4383,43 @@ checkout (verified in a detached worktree). Full detail + state tables in
   the full suite, and stop for re-review. Do not start further adapters, push, merge,
   deploy, migrate, restore automatic scheduling, or leave shadow mode.
 
+### Scheduler v2 Phase 1d tranche 2 -- three re-review findings fixed (Claude, 2026-08-10)
+
+All three Codex re-review findings on the Daily + SKU tranche are fixed on local branch
+`feature/scheduler-v2`. SHADOW MODE; nothing pushed/merged/deployed/migrated (the
+`20260810_report_sync_controls.sql` migration belongs to the separate admin-sync-controls
+commit `95263b3`, not this work); `HANDOFF.md` untouched. Commits `539bfc7` (date-window leaf
+refactor) and `6197cc6` (the three findings + tests). Detail + tables in `SCHEDULER_V2.md` §27.
+
+- **Finding 1 (duplicate SKU month double-count).** `validateSkuPlMonthlyWindows` no longer
+  dedupes repeated windows: single-account sku-pl now requires EXACTLY six fragments, one per
+  expected month, each carrying exactly one non-empty seller/vendor id, all one account. A
+  duplicate month (`duplicate-month-fragment` / `expected-exactly-six-single-account-fragments`),
+  a multi-seller fragment, or an empty/missing seller scope is rejected before the fold, so
+  `skuPlFold` can never double a month. Blocks with zero writes; last-known-good preserved. A
+  direct test proves a duplicated January is rejected AND that folding it would have doubled
+  sales/profit/units.
+- **Finding 2 (Daily Ads row-level account/date leakage).** The typed Ads coverage contract gains
+  an authoritative `rawSellerId` (raw seller/vendor id, distinct from the public accountId /
+  `dd-secondary:` prefix), and `evaluateDailyAdsCoverage` now validates EVERY row before ok:true --
+  plain object, real date inside the planned window, `seller_or_vendor_id` equal to the
+  authoritative raw id, finite metrics. One cross-account / out-of-window / malformed / non-finite
+  row blocks the whole snapshot (never silently filtered). `planned.rawSellerId` is required and
+  cross-checked against `coverage.rawSellerId`. Tests cover account-B-in-A, before/after window,
+  bad date, missing seller, non-finite metric, correct primary + dd-secondary rows, genuine zero,
+  and the e2e block-with-LKG.
+- **Finding 3 (false pure import boundary).** The pure calendar helpers (`addDaysStr`,
+  `splitDateRangeByMonth`, `isFullCalendarMonthWindow`, `pad2s`, `daysInMonthUTC`) moved to a new
+  dependency-free `lib/server/date-windows.js` leaf; `datadoe.js` re-exports them (route byte-for-
+  byte unchanged) and `report-source-contracts.js` imports from the leaf. A new recursive
+  import-graph test proves report-worker/report-derivation/derivation-core/report-source-contracts
+  reach neither `datadoe.js`/`supabase.js` nor any transport call, and it FAILS if a transitive
+  transport import is added (verified by injecting one).
+- **Verification.** `npm run verify` green = **439** (54+60+23+6+56+**65**+7+159+9 admin controls)
+  + build (2,394 modules); `node --check` on every changed file exits 0; `git diff --check` clean.
+  report-derivation 56->65 (+9). Golden `request_hash` and primary/dd-secondary isolation unchanged.
+  STOP point respected.
+
 1. Read this file end to end.
 2. Verify the live site works by hard-refreshing the Vercel deployment.
 3. If it errors, read the on-screen error message; the app surfaces DataDoe errors verbatim.

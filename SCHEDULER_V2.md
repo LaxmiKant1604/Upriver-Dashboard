@@ -1398,3 +1398,80 @@ source-backed report is shown locked. Unlocking is a code-reviewed readiness cha
 not an admin override. The final cutover must route these controls into the v2
 source-first planner so canonical request hashes remain deduplicated across all enabled
 reports.
+
+## 27. Phase 1d tranche 2 re-review -- three data-integrity findings fixed (SHADOW MODE, 2026-08-10)
+
+Corrects the three findings Codex raised re-reviewing the tranche-2 blocker fixes (§25).
+SHADOW MODE; Scheduler v1 / frontend / manual refresh / design files / schedules untouched;
+nothing pushed/merged/deployed/migrated (the admin `20260810_report_sync_controls.sql` migration
+is the separate `95263b3` admin-controls commit, not this work); `request_hash`, five-ID batching
+for other reports, and primary/dd-secondary isolation unchanged; `HANDOFF.md` untracked. Commits
+`539bfc7` (date-window leaf refactor), `6197cc6` (findings + tests).
+
+### 27.1 Finding 1 -- a duplicated SKU P&L month can no longer double-count
+
+sku-pl is single-account, so there is no legitimate second five-ID chunk for a month. The prior
+`validateSkuPlMonthlyWindows` DEDUPED identical repeated windows and tolerated an empty account
+scope; `skuPlFold` then summed every fragment, so a duplicated January doubled its totals. Now:
+
+- EXACTLY six fragments (`expected-exactly-six-single-account-fragments` otherwise);
+- a duplicate month is REJECTED, never deduped (`duplicate-month-fragment`);
+- each fragment carries EXACTLY one non-empty seller/vendor id (`fragment-must-carry-exactly-one-seller-id`
+  / `fragment-seller-id-missing`); all fragments share ONE account (`multiple-or-missing-accounts`);
+- the six full-month windows must equal the six expected months in order (missing/extra/reordered/
+  partial rejected; malformed dates fail closed).
+
+The derive passes each fragment's `sellerOrVendorIds`; a violation throws -> `DERIVE_INVALID` ->
+last-known-good preserved, zero writes. Proven: a duplicated January is rejected, AND `skuPlFold`
+on the duplicate would have doubled sales/profit/units (so the rejection is load-bearing).
+
+### 27.2 Finding 2 -- Daily Ads rows validated against the account + window
+
+The coverage envelope being valid was not enough: a contract for account A with a fully-covered
+window was accepted even if `adRows` held account B's rows or out-of-window dates, which
+`mergeSalesAndAds` then appended to A. The typed contract now carries an authoritative `rawSellerId`
+(the raw seller/vendor id -- DISTINCT from the public `accountId`; for dd-secondary the public id is
+`dd-secondary:<raw>`). `evaluateDailyAdsCoverage` receives `planned.rawSellerId` (from the plan's
+`resolveDataDoeAccountIds`, cross-checked against `coverage.rawSellerId`) and validates EVERY row
+before ok:true:
+
+| Row check | Block status |
+|---|---|
+| not a plain object | ads-row-malformed |
+| `date` not a real calendar date | ads-row-bad-date |
+| `date` outside planned [from,to] | ads-row-out-of-window |
+| `seller_or_vendor_id` != authoritative rawSellerId | ads-row-cross-account |
+| a present ad metric is non-finite / non-number | ads-row-non-finite-metric |
+
+One bad row BLOCKS the whole snapshot (never silently filtered into a partial save) -> throw ->
+`DERIVE_INVALID` -> last-known-good preserved, zero writes. A validated, fully-covered, right-account
+result with empty `adRows` remains genuine zero. Public/raw separation + organization isolation are
+preserved (a dd-secondary row tagged with the PUBLIC id is cross-account and blocks). A missing
+`planned.rawSellerId` or a rawSellerId mismatch THROWS (planner wiring error, fail closed).
+`rawSellerId` is a reserved (never-derived) scope key in the worker context builder.
+
+### 27.3 Finding 3 -- the pure derivation import boundary is now real (transitive)
+
+The pure calendar helpers moved from `lib/server/datadoe.js` (which imports `supabase.js`) into a
+new dependency-free `lib/server/date-windows.js` leaf: `pad2s`, `daysInMonthUTC`, `addDaysStr`,
+`splitDateRangeByMonth`, `isFullCalendarMonthWindow`. `datadoe.js` imports them from the leaf and
+RE-EXPORTS them (every existing importer unchanged, byte-for-byte; `splitDateRangeByDays` still uses
+the locally-imported `addDaysStr`). `report-source-contracts.js` imports the helpers from the leaf,
+so the report-derivation graph no longer transitively reaches DataDoe transport or Supabase. A new
+recursive import-graph test walks the transitive imports of report-worker / report-derivation /
+derivation-core / report-source-contracts and asserts none reach `datadoe.js` / `supabase.js` or a
+`createExport`/`pollExport`/`downloadExport`/`fetchExportRows(Strict)` call; it was proven to FAIL
+when a transport import is injected, so a future regression is caught. A date-window parity test
+pins split/leap/month-end/invalid cases and asserts the leaf and datadoe re-exports are the SAME
+function objects (no duplicated algorithm; request_hash unaffected).
+
+### 27.4 Verification
+
+`node --check` on every changed JS/MJS file exits 0; full `npm run verify` green = **439**
+(54 insights + 60 brand-view + 23 sync + 6 source-cache + 56 scheduler-v2 + **65** report-derivation
++ 7 source-identity + 159 report-contracts + 9 admin report-sync-controls) + `build:check`
+(2,394 modules -- +1 is the date-windows leaf); `git diff --check` clean. report-derivation 56 -> 65
+(+9: F1 dup-month + seller-scope + e2e, F2 row-level blocks + primary/dd-secondary + e2e, F3 leaf
+parity + transitive import-graph). Golden `request_hash` (`e498a480...` / `936e6d1b...`) and
+primary/dd-secondary isolation assertions remain green. STOP point respected: no further adapters,
+orchestration, cron wiring, frontend cutover, or deployment.
