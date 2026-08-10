@@ -4526,3 +4526,45 @@ Claude must continue using small local commits on `feature/scheduler-v2`, update
 `PROJECT_MEMORY.md` and `SCHEDULER_V2.md`, and stop for Codex review without pushing,
 merging, deploying, applying migrations, or enabling schedules unless Codex explicitly
 approves that rollout step.
+
+## Scheduler v2 next tranche: Daily + SKU shadow planner + Daily Ads loader (Claude, 2026-08-10)
+
+Built the production-shape SHADOW planner + derived-context loader for ONLY Daily Reporting and
+SKU P&L, wired into the existing shadow source/report workers. No other adapter started. SHADOW
+MODE; nothing pushed/merged/deployed/migrated/enabled; controls stay locked; `HANDOFF.md`
+untouched. Commits `db9edb4` (planner + date helpers), `27b2c18` (Daily Ads loader + coverage
+storage), `c8215d7` (tests + verify wiring); docs follow. Full detail in `SCHEDULER_V2.md` §28.
+
+- **Daily + SKU planner (`lib/server/sync/report-planner.js`).** `resolveAccountScope` resolves the
+  authoritative public account id -> raw seller/vendor id (`resolveDataDoeAccountIds`, never from
+  rows), org id, org-scoped api key (drives the request fingerprint), country, and bucket, keeping
+  primary vs `dd-secondary` isolated. `planDailyReporting` emits the exact approved Daily contract
+  windows (monthly ASIN/day superset + one catalog range over monthStart(asOf)-150d..asOf) for the
+  one raw seller id, stores `rawSellerId` in the planned context, derives ALL-brand only, and adds
+  no extra sales/Ads export. `planSkuPl` emits exactly six complete consecutive calendar months
+  (one fragment/month) via the new `date-windows.sixCompleteCalendarMonths`, satisfying
+  `validateSkuPlMonthlyWindows` by construction, with no COGS baked in. `buildShadowReportPlan`
+  composes the planners + `buildDependencyPlan` so identical source contracts deduplicate to one
+  canonical request hash (fetch once, reuse across reports).
+- **Daily Ads loader (`lib/server/sync/daily-ads-loader.js`).** The report-worker
+  `loadDerivedContext` for Daily. Preserves route parity: reads the aggregated `ad_daily_metrics`
+  via `getAdDailyMetrics(accountId, from, to)` -- NOT the overlapping raw campaign/ASIN/targeting/
+  search-term tables. Canonicalizes each metric row to a merge-ready Ads row stamped with the
+  AUTHORITATIVE raw seller id + finite metrics, and builds the typed `adsCoverage` envelope.
+  Coverage is proven from DURABLE successful-sync windows (`adsCoveredThrough`), not the first/last
+  metric row (a zero-ad day has no row). Missing/failed/stale/partial/cross-account/out-of-window/
+  non-finite/mixed-currency all block and preserve last-known-good; a validated fully-covered empty
+  result is genuine zero.
+- **Ads coverage storage.** New additive migration `20260810_ads_sync_coverage.sql` (NOT APPLIED):
+  one row per successfully completed Ads sync window. `supabase.js getDailyAdsCoverage /
+  recordAdsCoverageWindows` are best-effort (a missing/unmigrated table => Daily blocks fail-closed
+  / the write is a no-op), so the Ads sync + its DataDoe export cadence are unchanged. `ads-sync.js`
+  records the exact successfully-covered window after each successful campaign upsert (guarded).
+  `evaluateDailyAdsCoverage` gained a mixed/unusable-currency guard.
+- **Verification.** `npm run verify` green = **460** (54+60+23+6+56+65+7+159+9+**21** new planner
+  suite) + build (2,394 modules); `node --check` on every changed file exits 0; `git diff --check`
+  clean. Golden `request_hash` and primary/dd-secondary isolation unchanged. STOP point respected:
+  no cron/route wiring, no other adapters, controls still locked.
+- **Unresolved live gates:** apply `20260810_ads_sync_coverage.sql` + let the Ads sync backfill
+  coverage windows before Daily can pass live; reconcile the superset-summed all-brand vs the
+  compact total once; then Codex reviews the shadow plan against real saved rows.
