@@ -1377,3 +1377,24 @@ writes for invalid/partial inputs; last-known-good survives every failure; golde
   source jobs is the next (orchestration) tranche and must construct the typed contract faithfully.
 - Superset-vs-compact Daily reconciliation and Ads-history freshness remain live gates before any
   cutover.
+
+## 26. Admin report controls (local foundation, 2026-08-10)
+
+`report_sync_settings` is the server-authoritative allowlist for scheduled reports.
+All rows default to paused. `reportControlCatalog()` combines these settings with
+runtime readiness, so an unfinished adapter cannot be enabled even if a stale or
+malicious database row says `schedule_enabled=true`.
+
+`/api/admin/sync.js` provides admin-only GET/PATCH/POST operations. PATCH changes one
+report setting. POST runs one runtime-ready report for one bucket and optionally one
+account through the existing bounded scheduler path. Both actions are audited; manual
+work is rate-limited. Normal scheduled calls consult settings before account discovery;
+an empty enabled set returns `all-reports-paused` and contacts neither DataDoe
+organization.
+
+This is intentionally a control-plane foundation while Scheduler v2 remains shadowed.
+Only `brand-sales` is production-runner-ready on the current registry. Every other
+source-backed report is shown locked. Unlocking is a code-reviewed readiness change,
+not an admin override. The final cutover must route these controls into the v2
+source-first planner so canonical request hashes remain deduplicated across all enabled
+reports.

@@ -4390,3 +4390,54 @@ checkout (verified in a detached worktree). Full detail + state tables in
 5. Vercel should auto-deploy from the main branch.
 6. If `git push origin main` returns 403 for `aibylk16`, reject the stale cached GitHub credential for `https://github.com` so Git Credential Manager can authenticate as `LaxmiKant1604`, then push again.
 7. Update this file whenever a task is completed, new context is learned, or an important decision is made.
+
+## Admin report-level sync controls (2026-08-10)
+
+**Requested:** an admin-only page where each report can be enabled/paused for the
+schedule and manually synced by itself, instead of refreshing an entire account or
+website and spending unnecessary DataDoe exports.
+
+**Implemented locally on `feature/scheduler-v2` (not deployed/migrated):**
+
+- New admin-only **Data Sync Center** sidebar page (`src/views/DataSyncCenter.jsx`).
+  It lists all 13 source-backed reports, latest target status/success/error, a
+  per-report Enable/Pause control, and a report-scoped `Sync now` action. Manual
+  scope can be one account or all accounts in the selected US/non-US bucket.
+- New additive migration `20260810_report_sync_controls.sql` creates
+  `report_sync_settings`. Every report starts **paused**. Browser writes are not
+  allowed; the authenticated admin API performs validated service-role writes.
+- New `/api/admin/sync.js`: all methods require `assertAdmin`; settings changes and
+  manual runs are audit-logged; manual runs are rate-limited; unknown/unfinished
+  reports fail closed; no secret is returned.
+- `runScheduledSync` now accepts explicit `reportKeys`/`accountIds`. Normal schedule
+  calls read enabled report settings. If all reports are paused, it exits before
+  DataDoe account discovery, so that cycle makes **zero DataDoe calls**. A manual
+  call executes only the selected report and optional account.
+- Readiness is fail-closed in `report-controls.js`. All reports appear, but only a
+  production-wired registry report can be enabled or manually synced. On the
+  current branch that means **Dashboard (`brand-sales`) only**. The other 12 remain
+  visibly locked until Scheduler v2 derivation/orchestration is approved. This is
+  deliberate: a button must never spend exports if no validated production snapshot
+  can be saved.
+- Derived-only views (`Brand View`, `Priority Feed`, brand directory) are not
+  independently scheduled; they reuse saved upstream reports and create no DataDoe
+  export.
+
+**Verification:** focused suite `test:report-sync-controls` has 9 assertions; full
+`npm run verify` is green with **430 assertions** (421 existing + 9 controls) and a
+2,394-module production build. The focused tests prove admin-only routing, safe
+defaults, readiness locking, report/account filtering, no `refresh=1`, and that the
+all-paused gate precedes `fetchAccounts`.
+
+**Still pending before production:**
+
+1. Resolve the existing Scheduler v2 Daily/SKU P&L integrity review findings and
+   approve their adapters; finish/approve the remaining report derivations.
+2. Replace the temporary Scheduler v1 execution bridge with the final Scheduler v2
+   source-first planner/worker so multiple enabled reports reuse identical source
+   exports across reports.
+3. Apply both Scheduler v2 and report-control migrations in a reviewed rollout,
+   run live primary + secondary organization validation, and only then restore the
+   07:30 IST non-US / 16:00 IST US automatic kickoffs.
+4. Browser-test the Data Sync Center at desktop/tablet/mobile with a real admin
+   session. No production deployment was performed in this change.

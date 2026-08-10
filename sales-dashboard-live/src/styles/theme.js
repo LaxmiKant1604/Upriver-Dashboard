@@ -1137,6 +1137,33 @@ body{ overflow-x:hidden; }
 :focus-visible{ outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
 button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible, [tabindex]:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
 ::selection{ background:var(--accent-soft); color:var(--accent-strong); }
+
+/* ======================= ADMIN DATA SYNC CENTER ======================= */
+.sync-center{ padding-bottom:40px; }
+.sync-center-head{ align-items:center; }
+.sync-center-note{ margin:14px 0; display:flex; gap:10px; align-items:flex-start; }
+.sync-center-note div div{ margin-top:3px; color:var(--ink-soft); }
+.sync-scope-panel{ display:grid; grid-template-columns:minmax(190px,.7fr) minmax(260px,1fr) minmax(280px,1.4fr); gap:14px; align-items:end; padding:16px; margin-bottom:16px; }
+.sync-scope-panel label{ display:grid; gap:6px; }
+.sync-scope-panel label span{ color:var(--ink-muted); font-size:11px; font-weight:700; text-transform:uppercase; }
+.sync-scope-panel select{ width:100%; min-height:38px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--ink); padding:0 10px; }
+.sync-token-note{ color:var(--ink-soft); font-size:12px; line-height:1.45; }
+.sync-report-grid{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.sync-report-card{ padding:16px; min-width:0; }
+.sync-report-card.locked{ background:var(--bg-subtle); }
+.sync-report-title{ display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.sync-report-title>div{ display:grid; gap:3px; min-width:0; }
+.sync-report-title strong{ font-size:14px; }
+.sync-report-title span{ color:var(--ink-muted); font-size:11px; text-transform:capitalize; }
+.sync-report-meta{ display:grid; grid-template-columns:auto minmax(0,1fr); gap:6px 12px; margin:14px 0; font-size:12px; }
+.sync-report-meta span{ color:var(--ink-muted); }
+.sync-report-meta strong{ overflow-wrap:anywhere; }
+.sync-report-actions{ display:flex; gap:8px; justify-content:flex-end; }
+.sync-readiness,.sync-last-error{ min-height:34px; margin-bottom:12px; color:var(--ink-soft); font-size:12px; line-height:1.4; }
+.sync-last-error{ color:var(--negative); }
+.sync-loading{ padding:32px; text-align:center; color:var(--ink-soft); }
+@media(max-width:900px){ .sync-scope-panel{ grid-template-columns:1fr 1fr; }.sync-token-note{ grid-column:1/-1; } }
+@media(max-width:640px){ .sync-report-grid,.sync-scope-panel{ grid-template-columns:1fr; }.sync-token-note{ grid-column:auto; }.sync-report-actions{ justify-content:stretch; }.sync-report-actions button{ flex:1; } }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

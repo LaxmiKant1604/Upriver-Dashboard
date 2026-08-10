@@ -16,6 +16,7 @@ import {
   BellRing,
   Boxes,
   CalendarRange,
+  DatabaseZap,
   ChevronDown,
   ChevronRight,
   FileSearch,
@@ -92,6 +93,7 @@ export const NAV_GROUPS = [
   {
     label: "Admin",
     items: [
+      { view: "sync-center", label: "Data Sync Center", title: "Control report schedules and manual sync", icon: DatabaseZap, adminOnly: true },
       { view: "access", label: "User Access", title: "Invite users and assign account access", icon: UsersRound, adminOnly: true },
     ],
   },

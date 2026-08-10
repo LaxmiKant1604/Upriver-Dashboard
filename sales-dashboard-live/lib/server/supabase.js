@@ -574,6 +574,24 @@ export async function insertAuditLog({ actorUserId = null, action, target = {} }
   }).catch(() => {});
 }
 
+export async function getReportSyncSettings() {
+  return request("/rest/v1/report_sync_settings?select=report_key,schedule_enabled,updated_at&order=report_key.asc");
+}
+
+export async function setReportSyncSetting({ reportKey, scheduleEnabled, updatedBy }) {
+  const rows = await request("/rest/v1/report_sync_settings?on_conflict=report_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      report_key: reportKey,
+      schedule_enabled: scheduleEnabled === true,
+      updated_by: updatedBy || null,
+      updated_at: new Date().toISOString(),
+    },
+  });
+  return rows[0] || null;
+}
+
 /* ===================== Scheduler v2 (Phase 1c) — source-first cycle =====================
    Thin wrappers over the three additive tables + three RPCs in
    20260807_scheduler_v2.sql. Service-role only (RLS bypassed for writes). These power

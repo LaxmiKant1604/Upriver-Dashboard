@@ -16,7 +16,8 @@
     "test:report-derivation": "node scripts/scheduler-v2-report-derivation.test.mjs",
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
-    "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:scheduler-v2 && npm run test:report-derivation && npm run test:source-identity && npm run test:report-contracts && npm run build:check",
+    "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
+    "verify": "npm run test:insights && npm run test:brand-view && npm run test:sync && npm run test:source-cache && npm run test:scheduler-v2 && npm run test:report-derivation && npm run test:source-identity && npm run test:report-contracts && npm run test:report-sync-controls && npm run build:check",
     "db:migrate": "node scripts/apply-supabase-migrations.mjs"
   },
   "dependencies": {

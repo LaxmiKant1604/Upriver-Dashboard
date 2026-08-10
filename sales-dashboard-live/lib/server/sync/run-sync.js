@@ -22,8 +22,10 @@ import {
   upsertAccountDirectory, insertSyncRun, updateSyncRun, upsertSyncTarget,
   insertSyncError, insertAuditLog, deleteReportSnapshotsOlderThan,
   getAccountDirectoryRows, getSyncTargets,
+  getReportSyncSettings,
 } from "../supabase.js";
 import { bucketForCountry, entriesForBucket, orderedWork } from "./registry.js";
+import { enabledReportKeys } from "./report-controls.js";
 import { expandSyncWork, targetDisposition } from "./planner.js";
 import { getReportBuild } from "./adapters/index.js";
 import { runReportAdapter } from "./adapters/report-adapter.js";
@@ -47,12 +49,27 @@ async function runRetention(entries) {
   }
 }
 
-export async function runScheduledSync({ bucket, trigger = "cron", createdBy = null, budgetMs = WORK_BUDGET_MS }) {
+export async function runScheduledSync({
+  bucket, trigger = "cron", createdBy = null, budgetMs = WORK_BUDGET_MS,
+  reportKeys = null, accountIds = null,
+}) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
+  const requestedReportKeys = reportKeys ? new Set(reportKeys.map(String)) : null;
+  const requestedAccountIds = accountIds ? new Set(accountIds.map(String)) : null;
   const counts = { accounts: 0, targets: 0, succeeded: 0, failed: 0, terminalFailed: 0, deferred: 0, skipped: 0, discoveryFailed: 0 };
 
   if (!isSupabaseConfigured()) {
     return { bucket, drained: false, skipped: "supabase-not-configured", counts };
+  }
+
+  // Gate the cycle before account discovery. When all reports are paused, the
+  // scheduler performs zero DataDoe calls (including no account-directory call).
+  // A report-scoped manual action supplies its explicit key and bypasses only
+  // the schedule setting, never the registry's runtime-readiness flag.
+  const selectedKeys = requestedReportKeys || enabledReportKeys(await getReportSyncSettings());
+  const selectedEntries = entriesForBucket(bucket).filter((entry) => selectedKeys.has(entry.reportKey));
+  if (!selectedEntries.length) {
+    return { bucket, drained: true, skipped: "all-reports-paused", counts };
   }
 
   const deadline = Date.now() + budgetMs;
@@ -114,14 +131,17 @@ export async function runScheduledSync({ bucket, trigger = "cron", createdBy = n
       const accountId = row.accountId || row.account_id;
       const country = row.country || row.marketplace_country_code;
       const accBucket = row.bucket || row.sync_bucket || bucketForCountry(country);
-      if (accBucket === bucket) {
+      if (accBucket === bucket && (!requestedAccountIds || requestedAccountIds.has(String(accountId)))) {
         bucketAccounts.push({ account_id: accountId, marketplace_country_code: country, country });
       }
     }
     counts.accounts = bucketAccounts.length;
 
     // --- Build the ordered work list from the registry. ---
-    const entries = orderedWork(entriesForBucket(bucket));
+    // Explicit reportKeys are used only by the admin report-scoped manual action.
+    // Ordinary scheduled/watchdog runs read the database settings and do no work
+    // when every report is paused. This check happens before any report export.
+    const entries = orderedWork(selectedEntries);
     const work = expandSyncWork(entries, bucketAccounts, bucket);
     counts.targets = work.length;
 
