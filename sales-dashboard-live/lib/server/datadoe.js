@@ -23,6 +23,10 @@ import { sourceRequestIdentity } from "./source-identity.js";
 // this module (e.g. api/datadoe.js) keep working unchanged.
 import { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds } from "./id-batching.js";
 export { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds };
+// Pure calendar/window helpers live in a dependency-free leaf (so the "pure" report-derivation
+// graph never transitively reaches this transport/storage module). Imported for local use
+// (splitDateRangeByDays needs addDaysStr) and re-exported so existing importers keep working.
+import { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "./date-windows.js";
 import {
   getSourceExportCache,
   isSupabaseConfigured,
@@ -367,35 +371,15 @@ export async function fetchExportRowsStrict(apiKey, sourceId, columns, ids, from
   return rows;
 }
 
-/* ===== Date helpers (UTC, string based) ===== */
-export const pad2s = (n) => String(n).padStart(2, "0");
-
-export function daysInMonthUTC(y, m /* 1..12 */) {
-  return new Date(Date.UTC(y, m, 0)).getUTCDate();
-}
-
-export function addDaysStr(s, n) {
-  const [y, m, d] = s.split("-").map(Number);
-  const t = Date.UTC(y, m - 1, d) + n * 86400000;
-  const dt = new Date(t);
-  return `${dt.getUTCFullYear()}-${pad2s(dt.getUTCMonth() + 1)}-${pad2s(dt.getUTCDate())}`;
-}
+/* ===== Date helpers (UTC, string based) =====
+ * The pure calendar-date/window helpers live in the dependency-free ../date-windows.js leaf so
+ * modules that need them (e.g. the report-derivation boundary) do NOT transitively depend on this
+ * transport/storage module (which imports supabase.js). They are RE-EXPORTED here unchanged so
+ * every existing `import { ... } from "../datadoe.js"` caller keeps working byte-for-byte. */
+export { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow };
 
 export function isDateStr(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
-}
-
-export function splitDateRangeByMonth(from, to) {
-  const windows = [];
-  let cursor = from;
-  while (cursor <= to) {
-    const [y, m] = cursor.split("-").map(Number);
-    const monthEnd = `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`;
-    const end = monthEnd < to ? monthEnd : to;
-    windows.push({ from: cursor, to: end });
-    cursor = addDaysStr(end, 1);
-  }
-  return windows;
 }
 
 // Fixed-length day windows, used where a source is at raw row grain and a whole
@@ -409,12 +393,6 @@ export function splitDateRangeByDays(from, to, days) {
     cursor = addDaysStr(end, 1);
   }
   return windows;
-}
-
-export function isFullCalendarMonthWindow(window) {
-  const [year, month] = window.from.slice(0, 7).split("-").map(Number);
-  return window.from === `${year}-${pad2s(month)}-01`
-    && window.to === `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
 }
 
 // DataDoe returns HTTP 400 with this wording when a non-default table has not
