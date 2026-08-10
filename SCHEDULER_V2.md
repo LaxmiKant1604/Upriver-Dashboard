@@ -2237,3 +2237,57 @@ failed**. `npm run test:report-derivation` = **169** (66+26+33+20+24); `npm run 
 `git status --short` shows only the intended files (+ untracked `HANDOFF.md`). `api/datadoe.js`,
 `report-source-contracts.js`, `source-worker.js`, and the approved `sync-*` / FBA test artifacts are
 untouched. Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 41. Keyword Rank review blockers fixed: account-scoped staging + typed states + SQP date validation (SHADOW MODE, 2026-08-11)
+
+Fixes the four Keyword Rank review blockers. Additive scheduler-v2 code only; `api/datadoe.js` (route),
+`report-source-contracts.js` (the keyword-rank CONTRACT), `source-worker.js`, `source-sync-driver.js`,
+`source-signals.js`, and every approved `sync-*` / FBA test artifact are byte-UNCHANGED. No
+migration/schedule/control-unlock/push/merge/deploy; Keyword Rank stays locked; no other adapter started.
+`HANDOFF.md` untracked. request_hash + source identity unchanged; strict 50,000-row SQP caps preserved.
+
+### 41.1 Blocker 1 -- account-scoped staged orchestration (`lib/server/sync/keyword-rank-cycle.js`, new)
+
+The generic `runStagedSourceCycle` keys signals by requestKey, which collides across accounts. The new
+`runKeywordRankShadowCycle` replans EACH account from ITS OWN persisted weekly/monthly outcome, keyed by
+that account's canonical request HASH -- never a global request-key signal. It reuses the approved pure
+`runSourceJobs` (one-create-export-per-request-hash-per-cycle) + `plannedSourceJob`, and reconstructs
+signals from persisted jobs + saved cache, so a fresh invocation creates ZERO duplicate exports. Primary
+and dd-secondary accounts with the same raw id resolve DIFFERENT hashes (different org fingerprints) and
+can never consume each other's signal. `SHADOW_PLANNED_REPORT_KEYS` already includes keyword-rank.
+
+### 41.2 Blocker 2 -- staged catalog (no early token)
+
+Gating the catalog CONTRACT would break the approved `sync-signals.test.js` (it supplies a catalog window
+at kickoff), so instead the account-scoped DRIVER stages the catalog EXECUTION: R1 runs weekly only; R2
+runs monthly (weekly<4) OR catalog (weekly>=4); R3 runs catalog (weekly<4 + validated monthly, incl.
+baseline). A failed/disabled weekly OR required monthly spends NO catalog token. `planKeywordRank` is a
+per-account replanner from that account's own typed weekly signal (monthly gated by the shared
+`evaluateFallbackCondition`); the driver's per-round submit-set does the staging.
+
+### 41.3 Blocker 3 -- typed derive outcomes (`report-derivation.js`)
+
+`deriveReportSnapshot` now maps `error.deriveStatus` so the derive can raise typed outcomes instead of
+throwing everything to `invalid`: required-now monthly that is terminal-disabled => `blocked`;
+failed/missing/unreadable cache => `unavailable`; malformed/cross-account/wrong-window data => `invalid`;
+a VALIDATED empty monthly array is honored as real baseline input. The misleading "blocks"-but-asserts-
+`invalid` tests are corrected. Worker-level tests prove `blocked` is terminal for the cycle, and
+`unavailable`/`invalid` both write ZERO snapshots + preserve last-known-good, while an unrelated report in
+the same batch still completes + saves.
+
+### 41.4 Blocker 4 -- SQP row-date validation (`report-derivation.js`)
+
+Before counting periods / selecting cadence, every weekly/monthly SQP row must be a plain object whose
+`date` is a REAL YYYY-MM-DD calendar date INSIDE its exact fragment window (weekly 84d / monthly 365d).
+Invalid rows are NOT silently filtered -- one malformed / impossible / out-of-window / future row makes
+the report `invalid` (zero snapshots, last-known-good preserved). Clean in-window data derives normally.
+
+### 41.5 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-keyword-rank.test.js` **34**;
+`report-keyword-rank-cycle.test.js` **7** (two-account staged execution, catalog token-saving table,
+fresh-invocation zero-duplicate exports, primary/dd-secondary isolation). `npm run test:report-derivation`
+= **186** (66+26+33+20+34+7); `npm run test:sync-engine` (**57**, unchanged); `npm run test:report-contracts`
+(**161**, unchanged); `npm run test:source-identity` (7); `npm run verify` = **563** + `build:check`
+(2,394 modules); `git diff --check` clean; `git status --short` shows only the intended files (+ untracked
+`HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.

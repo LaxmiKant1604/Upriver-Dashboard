@@ -5300,3 +5300,34 @@ locked; no insight adapter started; `HANDOFF.md` untouched. Detail in `SCHEDULER
   test:source-identity 7; `npm run verify` = **546** + build (2,394 modules); `git diff --check` clean;
   only intended files changed (+ untracked HANDOFF.md); api/datadoe.js, report-source-contracts.js,
   source-worker.js, sync-*/FBA test artifacts untouched.
+
+## Scheduler v2: Keyword Rank review blockers fixed (account-scoped staging + typed states + SQP date validation) (Claude, 2026-08-11)
+
+Fixed the four Keyword Rank review blockers. **Additive scheduler-v2 code only** -- `api/datadoe.js`,
+`report-source-contracts.js` (the keyword-rank contract), `source-worker.js`, `source-sync-driver.js`,
+`source-signals.js`, and every approved `sync-*` / FBA test artifact are byte-UNCHANGED. SHADOW MODE;
+nothing pushed/merged/deployed/migrated; Keyword Rank + all controls locked; no other adapter started;
+`HANDOFF.md` untouched. request_hash + strict caps + primary/dd-secondary isolation preserved. Detail in
+`SCHEDULER_V2.md` section 41.
+
+- **Blocker 1 (new `lib/server/sync/keyword-rank-cycle.js`).** `runKeywordRankShadowCycle` replans each
+  account from its OWN persisted weekly/monthly outcome keyed by request HASH (never a global request-key
+  signal); reuses the approved `runSourceJobs` + `plannedSourceJob`; a fresh invocation reconstructs from
+  persisted jobs/cache with ZERO duplicate exports; primary vs dd-secondary (same raw id) resolve disjoint
+  hashes -> no cross-account signal. Two-account test: A(weekly>=4)=weekly+catalog no monthly; B(weekly<4)=
+  weekly+monthly+catalog.
+- **Blocker 2 (driver-staged catalog; NO contract change).** Gating the catalog contract would break the
+  approved sync-signals.test.js, so the DRIVER stages catalog EXECUTION: R1 weekly; R2 monthly(<4)/catalog
+  (>=4); R3 catalog(<4 + validated monthly). Failed/disabled weekly or required monthly spends NO catalog
+  token (state-table test).
+- **Blocker 3 (`report-derivation.js`).** deriveReportSnapshot maps `error.deriveStatus`: terminal-disabled
+  monthly=>blocked; failed/missing cache=>unavailable; malformed/wrong-window=>invalid; validated-empty
+  monthly=>baseline. Corrected the "blocks"-asserting-invalid tests; worker-level proofs: blocked terminal,
+  unavailable/invalid write zero snapshots + keep LKG, unrelated report continues.
+- **Blocker 4 (`report-derivation.js`).** Every weekly/monthly SQP row must be a plain object with a real
+  YYYY-MM-DD date inside its exact 84d/365d window BEFORE cadence; one malformed/impossible/out-of-window/
+  future row => invalid, zero snapshots, LKG preserved (not silently filtered).
+- **Verification (all natural, exit 0).** report-keyword-rank **34**; report-keyword-rank-cycle **7**;
+  test:report-derivation **186** (66+26+33+20+34+7); test:sync-engine 57 (unchanged); test:report-contracts
+  161 (unchanged); test:source-identity 7; `npm run verify` = **563** + build; `git diff --check` clean;
+  only intended files changed (+ untracked HANDOFF.md).
