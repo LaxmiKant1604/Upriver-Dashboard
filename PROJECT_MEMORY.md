@@ -4497,15 +4497,20 @@ with **439 assertions** (including 9 admin report-sync-control assertions) plus 
 2,394-module production build. The pinned request hash remains unchanged. The worktree
 is clean except the pre-existing untracked `HANDOFF.md`, which was not touched.
 
-**Mandatory next-tranche/live gate:** `ads_daily_source_rows` stores account scope in
-`account_id` and native metrics under the `metrics` JSON field; its read API does not
-directly return `seller_or_vendor_id` or flattened ad metrics. Before Daily Scheduling
-can be enabled, the production planner/derived-context loader must query rows by the
-authorized public account id, map the account through `resolveDataDoeAccountIds`, inject
-that authoritative raw seller id into every canonical Ads row, flatten only the expected
-metrics, and produce the typed `adsCoverage` envelope. Add a production-row-shape test
-for both primary and `dd-secondary` accounts. Missing, malformed, stale, partial, or
-cross-account data must continue to block the new snapshot and preserve last-known-good.
+**Mandatory next-tranche/live gate (corrected after tracing the production route):**
+Daily Reporting uses the already-aggregated `ad_daily_metrics` table through
+`getAdDailyMetrics`, not raw `ads_daily_source_rows`. The next production planner/
+derived-context loader must preserve that route parity: query `ad_daily_metrics` by the
+authorized public account id and exact window, map the account through
+`resolveDataDoeAccountIds`, inject that authoritative raw seller id into each canonical
+row, and produce the typed `adsCoverage` envelope. Do not sum campaign/ASIN/targeting/
+search-term raw Ads tables together because those grains overlap and would double-count.
+Coverage must come from authoritative successful-sync window metadata, not merely the
+first/last returned metric row: an account can have a successfully covered day with zero
+ads and therefore no row. Add production-shape tests for primary, `dd-secondary`, genuine
+zero, stale/partial/failed coverage, and mixed currency. Missing, malformed, stale,
+partial, or cross-account data must continue to block the new snapshot and preserve
+last-known-good.
 
 **Deployment status:** still shadow mode. Nothing from this review was pushed, merged,
 deployed, migrated, or scheduled.
