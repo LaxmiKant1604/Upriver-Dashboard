@@ -4885,3 +4885,41 @@ Detail in `SCHEDULER_V2.md` section 33.
   absent). If `report-planner.test.js` still blocks, next step is a further group-level split
   (report-planner-core / daily-ads-loader / supabase-error-classifier). Golden `request_hash`, five-ID
   batching, and organization isolation remain green.
+
+## Scheduler v2: FBA Shipment Plan + Reconciliation derivations wired (Claude, 2026-08-10)
+
+Phase 1d tranche after the Daily/SKU approval: wired the two remaining `derive: null` registry
+entries so each reproduces its live api/datadoe.js route payload PURELY from validated saved source
+fragments (ZERO DataDoe calls), last-known-good preserved on every failure. SHADOW MODE; nothing
+pushed/merged/deployed/migrated; no schedule/report-control enabled; both reports stay locked; Keyword
+Rank / insight reports / cron / frontend cutover NOT started; `HANDOFF.md` untouched. **`api/datadoe.js`
+(the live route) is UNCHANGED** -- pure copies live in the dependency-free leaves with strong parity
+tests. Detail in `SCHEDULER_V2.md` section 34.
+
+- **Code (additive, leaf-only).** `lib/server/reports/derivation-core.js` += `reconciliationOrders`,
+  `reconciliationSettlements`, `reconciliationPayload`, `foldPlanAsinUnits`, `fbaPlanPayload` (verbatim
+  transcriptions of the route folds/assembly). `lib/server/date-windows.js` += `planMonthWindows`
+  (3 completed months + current MTD; byte-identical to the route helper). `report-derivation.js`: the
+  `fba-plan` + `reconciliation` entries now carry real derive/validate/latestDataDate + two fragment
+  validators; reconciliation reuses `validateSkuPlMonthlyWindows`. `report-planner.js`: += `planFbaPlan`,
+  `planReconciliation`; `SHADOW_PLANNED_REPORT_KEYS = [daily-reporting, sku-pl, fba-plan, reconciliation]`;
+  `buildShadowReportPlan` threads the authoritative account `name`. Tests:
+  `scripts/report-fba-plan.test.js` (25) + `scripts/report-reconciliation.test.js` (20), both added to
+  `test:report-derivation` (now 137 = 66+26+25+20).
+- **FBA.** Recomputes route windows from `context.to` via `planMonthWindows`; validates monthly-units ==
+  [3 completed + MTD] in order, single-account (rejects missing/dup/reordered/extra/cross-account);
+  reproduces every route field incl. representative SKU (first localeCompare), completed+MTD units,
+  latest-snapshot-only inventory, FC-transfer/inbound overlap `max(0, fcTransfer-inboundShipped)`, FBA
+  fields **null** when the whole snapshot is unavailable vs **0** when a validated snapshot proves no
+  stock, `inventoryByBrandCountry`, zero-activity ASIN removal. **US AWD:** missing/failed AWD BLOCKS
+  (never silent zero); a validated empty AWD is honored; AWD stays optional (US-conditional) so non-US
+  never waits on it.
+- **Reconciliation.** Enforces exactly six complete consecutive months for orders AND settlements
+  (reuses the strict sku-pl helper), one account across both, one full-range single-account catalog;
+  rejects dup/missing/extra/reordered/partial/cross-account fragments; reproduces
+  `{ from, to, months, orders, settlements }`; currencies never merge, organizations never mix.
+- **Verification (all natural, exit 0).** node --check every changed file; each new test reads/checks/
+  runs independently (fba **25**, recon **20**); `test:report-derivation` **137**; test:scheduler-v2 56;
+  test:report-contracts 159; `npm run verify` = **511** + build (2,394 modules); `git diff --check` +
+  `git status --short` clean (only intended files + untracked HANDOFF.md); `api/datadoe.js` untouched.
+  request_hash, five-ID batching, primary/dd-secondary isolation preserved.
