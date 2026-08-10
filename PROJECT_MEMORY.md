@@ -4996,6 +4996,36 @@ approved strict contracts or FBA window validation while fixing packaging.
 **Deployment status:** still shadow mode. Nothing was pushed, merged, deployed, migrated, enabled,
 or scheduled; `HANDOFF.md` remained untracked and untouched.
 
+## Codex second re-review: Scheduler-v2 FBA strict test packaging (2026-08-10)
+
+**Reviewed commits:** `73be9d6`, `153b905`, and `2e8b865` on
+`feature/scheduler-v2`.
+
+**Result: BLOCKED only on the restored base test path.** The new small
+`scripts/fba-strict-source-worker.test.js` is independently readable: stat/head-read return
+immediately, `node --check` succeeds, direct execution terminates naturally, and its real-worker
+integration assertion passes. It proves a cap-sized FBA source is `TRUNCATED`, persists no payload,
+an unrelated source succeeds, and the truncated source is not re-attempted.
+
+The restored `scripts/scheduler-v2-verification.test.mjs` path remains inaccessible in this exact
+review worktree. A command containing its metadata/head-read did not return after 25+ seconds;
+`npm run test:scheduler-v2` likewise emitted no marker/output and remained running until interrupted.
+Restoring approved bytes therefore did not clear the path/inode scan state. The handoff's claimed
+base-file and aggregate proofs are not reproducible here, and full `npm run verify` still cannot run.
+
+**Required final packaging correction:** create a genuinely fresh
+`scripts/scheduler-v2-core.test.js` from the clean approved `602feea` Git blob (not a filesystem
+rename/move and not by reading/copying the blocked worktree path), remove
+`scripts/scheduler-v2-verification.test.mjs` from Git and the worktree, and point
+`test:scheduler-v2` at the new 56-assertion core followed by the already-approved one-assertion FBA
+file. Prove old-path absence from the worktree, `git ls-files`, and the HEAD tree. Prove each new file
+independently with stat, head-read, `node --check`, direct execution, and natural exit in the exact
+checkout before running the aggregate and full verification suites. Do not alter production code or
+either test's assertions.
+
+**Deployment status:** production corrections remain approved and shadow-only. Nothing was pushed,
+merged, deployed, migrated, enabled, or scheduled; `HANDOFF.md` remained untracked and untouched.
+
 ## Scheduler v2: FBA/Reconciliation review blockers fixed (cap-strictness + exact FBA windows) (Claude, 2026-08-10)
 
 Fixed the two source-integrity blockers from the Codex senior review. Contract + derivation + test
