@@ -1,20 +1,22 @@
-// Scheduler v2 -- production-shape SHADOW planner for Daily Reporting + SKU P&L only.
+// Scheduler v2 -- production-shape SHADOW planner for Daily Reporting, SKU P&L, FBA Shipment Plan
+// and Reconciliation.
 //
 // Turns an authorized account (from the account directory) into a single-account report request
 // carrying the exact source-contract windows the approved contracts declare, plus a planned context
-// whose scope (accountId / rawSellerId / from / to / brand) is AUTHORITATIVE. It resolves the raw
-// seller/vendor id from account metadata (resolveDataDoeAccountIds), NEVER from untrusted rows, and
-// keeps primary vs dd-secondary organizations isolated (one connection per account; the raw id and
-// the org fingerprint come from that connection). The request feeds buildDependencyPlan() ->
+// whose scope (accountId / rawSellerId / from / to / brand / asOf) is AUTHORITATIVE. It resolves the
+// raw seller/vendor id from account metadata (resolveDataDoeAccountIds), NEVER from untrusted rows,
+// and keeps primary vs dd-secondary organizations isolated (one connection per account; the raw id
+// and the org fingerprint come from that connection). The request feeds buildDependencyPlan() ->
 // runSourceJobs (source half) and runReportJobs (derive half). SHADOW MODE: not wired to any
-// cron/route; report-controls keeps daily-reporting + sku-pl locked until live approval.
+// cron/route; report-controls keeps every planned report locked until live approval.
 //
-// Only Daily Reporting (ALL-brand) and SKU P&L are planned here. No other adapter is started.
+// Only Daily Reporting (ALL-brand), SKU P&L, FBA Shipment Plan and Reconciliation are planned here.
+// No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { reportSourceRequestHashes } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
-import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths } from "../date-windows.js";
+import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 
@@ -23,7 +25,11 @@ import { buildDependencyPlan } from "./planner.js";
 // 150-day approximation (monthStart(asOf)-150d) silently trimmed the first days of the oldest month.
 const DAILY_MONTHS_BACK = 5;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl"]);
+// FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
+// constant, so the scheduled inventory window (asOf-10d..asOf) matches the live route exactly.
+const FBA_INVENTORY_LOOKBACK_DAYS = 10;
+
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation"]);
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
@@ -128,7 +134,86 @@ export function planSkuPl({ accountId, country, currency, connections, asOf }) {
   };
 }
 
-const PLANNERS = { "daily-reporting": planDailyReporting, "sku-pl": planSkuPl };
+/**
+ * Plan Reconciliation for ONE account over exactly SIX complete consecutive calendar months. Emits
+ * the per-month order-line + settlement fragments plus a single full-range catalog, all for the one
+ * raw seller id. Reuses the strict six-month helper so the plan satisfies the derivation's
+ * six-complete-calendar-month contract by construction. Never mixes currencies or organizations (one
+ * account, one connection). The browser localises to a single currency at display; unchanged here.
+ */
+export function planReconciliation({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const span = sixCompleteCalendarMonths(asOf);
+  if (!span) throw new Error(`reconciliation planner could not compute six complete calendar months from asOf "${asOf}".`);
+  const windowsByRequestKey = {
+    "reconciliation:order-lines": span.months,
+    "reconciliation:settlements": span.months,
+    "reconciliation:catalog": [{ from: span.from, to: span.to }],
+  };
+  const sources = reportSourceRequestHashes({
+    reportKey: "reconciliation", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "reconciliation",
+    reportVersion: REPORT_DERIVATIONS.reconciliation.snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "reconciliation", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { from: span.from, to: span.to, rawSellerId: scope.rawSellerId },
+  };
+}
+
+/**
+ * Plan FBA Shipment Plan for ONE account. Emits the exact route windows from planMonthWindows(asOf):
+ * monthly-units = 3 completed months + current MTD (one fragment each), a current-month daily-date
+ * probe, a catalog over completed[0].from .. asOf, an inventory-health snapshot over asOf-10d..asOf,
+ * and -- for US accounts only -- the no-date AWD listing source. All for the one raw seller id.
+ * `name` is the AUTHORITATIVE account name; `marketCountry` (raw) + `isUS` drive the US-only AWD +
+ * per-row AWD payload fields. The AWD source is planned ONLY for US (the contract is US-conditional).
+ */
+export function planFbaPlan({ accountId, name, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const asOfStr = String(asOf);
+  const { completed, current } = planMonthWindows(asOfStr);
+  const isUS = scope.country === "US";
+  const windowsByRequestKey = {
+    "fba-plan:monthly-units": [
+      ...completed.map((m) => ({ from: m.from, to: m.to })),
+      { from: current.from, to: current.to },
+    ],
+    "fba-plan:current-daily-dates": [{ from: current.from, to: current.to }],
+    "fba-plan:catalog": [{ from: completed[0].from, to: current.to }],
+    "fba-plan:inventory-health": [{ from: addDaysStr(asOfStr, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOfStr }],
+  };
+  // AWD is a US-only no-date source; supply its window ONLY for US (the contract's country gate would
+  // otherwise reject an inapplicable request key).
+  if (isUS) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+  const sources = reportSourceRequestHashes({
+    reportKey: "fba-plan", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "fba-plan",
+    reportVersion: REPORT_DERIVATIONS["fba-plan"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "fba-plan", connectionId: scope.connectionId, bucket: scope.bucket }),
+    // asOf/name/country/isUS are authoritative account metadata the derivation reproduces in the
+    // payload; rawSellerId scopes every fragment. marketCountry is the RAW account country (the
+    // payload preserves it verbatim), isUS is derived from the uppercased scope country.
+    context: { to: asOfStr, rawSellerId: scope.rawSellerId, accountName: name || null, marketCountry: country || null, isUS },
+  };
+}
+
+const PLANNERS = {
+  "daily-reporting": planDailyReporting,
+  "sku-pl": planSkuPl,
+  "fba-plan": planFbaPlan,
+  reconciliation: planReconciliation,
+};
 
 /**
  * Build the full SHADOW plan for a set of authorized accounts. Returns:
@@ -146,7 +231,9 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
   for (const account of accounts) {
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
     for (const reportKey of keys) {
-      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, country: account.country, currency: account.currency, connections, asOf }));
+      // `name` is threaded for FBA Shipment Plan (its payload carries the authoritative account
+      // name); the other planners ignore it.
+      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, name: account.name, country: account.country, currency: account.currency, connections, asOf }));
     }
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);

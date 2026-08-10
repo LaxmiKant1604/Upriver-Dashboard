@@ -23,6 +23,8 @@ import {
   contentChangesPayload,
   dailyReportingPayload,
   skuPlPayload,
+  reconciliationPayload,
+  fbaPlanPayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -31,7 +33,12 @@ import {
   sourceDisabledOutcome,
   resolveDailyAdsAvailability,
   validateSkuPlMonthlyWindows,
+  isValidCalendarDate,
 } from "./report-source-contracts.js";
+// planMonthWindows is the shared dependency-free window helper (byte-identical to the api/datadoe.js
+// fba-plan route copy; proven equal in the FBA parity harness). Reaching it here keeps the pure
+// derivation graph free of any DataDoe transport / Supabase import.
+import { planMonthWindows } from "../date-windows.js";
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -61,6 +68,44 @@ const maxIsoDate = (values) => {
   }
   return latest;
 };
+
+// FBA monthly-units contract: the saved fragments must be EXACTLY the expected windows
+// [3 completed months + current MTD], IN ORDER, one single-account fragment each. A positional
+// window match rejects a reordered/duplicate/partial month; the length check rejects a missing/extra
+// fragment; the seller-id check rejects a cross-account or multi-id fragment. Returns { ok, reason };
+// never throws on data (malformed => ok:false). `expected`: [{from,to}] x4 from planMonthWindows.
+function validateFbaMonthlyUnitsWindows(fragments, expected, rawSellerId) {
+  if (!Array.isArray(fragments)) return { ok: false, reason: "monthly-units-fragments-missing" };
+  if (fragments.length !== expected.length) return { ok: false, reason: "expected-exactly-four-monthly-units-fragments" };
+  for (let i = 0; i < expected.length; i += 1) {
+    const f = fragments[i];
+    if (!f || typeof f !== "object" || Array.isArray(f)) return { ok: false, reason: "malformed-monthly-units-fragment" };
+    const ids = f.sellerOrVendorIds;
+    if (!Array.isArray(ids) || ids.length !== 1) return { ok: false, reason: "monthly-units-fragment-must-carry-exactly-one-seller-id" };
+    const sellerId = typeof ids[0] === "string" ? ids[0].trim() : "";
+    if (!sellerId) return { ok: false, reason: "monthly-units-fragment-seller-id-missing" };
+    if (rawSellerId != null && sellerId !== String(rawSellerId)) return { ok: false, reason: "monthly-units-fragment-cross-account" };
+    if (f.from !== expected[i].from || f.to !== expected[i].to) return { ok: false, reason: "monthly-units-window-mismatch" };
+  }
+  return { ok: true, reason: null };
+}
+
+// A required single-range source must be EXACTLY one single-account fragment. `wantFrom/wantTo`
+// (when provided) pin the window; a null skips that side of the pin (e.g. inventory's lookback
+// `from` is a planner constant, so only its `to` is pinned). Returns the fragment rows or throws
+// (a throw becomes a derive-invalid => last-known-good preserved).
+function singleAccountFragmentRows(source, key, rawSellerId, wantFrom, wantTo) {
+  const frags = (source && source.fragments) || [];
+  const f = frags.length === 1 ? frags[0] : null;
+  const ids = f && f.sellerOrVendorIds;
+  const ok = !!f
+    && (wantFrom == null || f.from === wantFrom)
+    && (wantTo == null || f.to === wantTo)
+    && Array.isArray(ids) && ids.length === 1
+    && (rawSellerId == null || String(ids[0]).trim() === String(rawSellerId));
+  if (!ok) throw new Error(`${key} must be exactly one single-account fragment for its window; snapshot blocked.`);
+  return source.rows;
+}
 
 // ---- The derivation registry (dependency map) ------------------------------------------
 //
@@ -159,8 +204,118 @@ const REGISTRY = {
       && (p.brandFiltered === true || (p.adsAvailability && typeof p.adsAvailability.status === "string")),
     latestDataDate: (p) => maxIsoDate((p.rows || []).map((r) => r.date)),
   },
-  "fba-plan": { snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [], derive: null }, // awd is US-only (marketplace-conditional), so not a blanket required dep
-  "reconciliation": { snapshotVersion: "reconciliation/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
+  // FBA Shipment Plan: reproduce the api/datadoe.js `fba-plan` payload byte-for-byte from the saved
+  // fragments. AWD is US-only (marketplace-conditional), so it is NOT a blanket required dep; instead
+  // the derive enforces it per-account: a US account with a missing/failed AWD source BLOCKS (throws
+  // -> derive-invalid -> last-known-good preserved) so it can never silently become zero, while a
+  // VALIDATED empty AWD source is honored as "no AWD rows". Non-US never plans or reads AWD.
+  "fba-plan": {
+    snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("fba-plan derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const isUS = context.isUS === true;
+      // Recompute the exact route windows from asOf (never trust caller-supplied month boundaries).
+      const { completed, current } = planMonthWindows(asOf);
+
+      // 1) monthly-units == [completed0, completed1, completed2, currentMTD], in order, single-account.
+      const expectedUnitWindows = [
+        ...completed.map((m) => ({ from: m.from, to: m.to })),
+        { from: current.from, to: current.to },
+      ];
+      const unitFrags = sources["fba-plan:monthly-units"].fragments || [];
+      const unitCheck = validateFbaMonthlyUnitsWindows(unitFrags, expectedUnitWindows, rawSellerId);
+      if (!unitCheck.ok) {
+        throw new Error(`fba-plan monthly-units contract violated (${unitCheck.reason}); snapshot blocked.`);
+      }
+      const completedUnitRows = completed.map((_m, i) => unitFrags[i].rows);
+      const mtdUnitRows = unitFrags[completed.length].rows;
+
+      // 2) single-account single-fragment required ranges.
+      const dailyDateRows = singleAccountFragmentRows(sources["fba-plan:current-daily-dates"], "fba-plan:current-daily-dates", rawSellerId, current.from, current.to);
+      const catalogRows = singleAccountFragmentRows(sources["fba-plan:catalog"], "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
+      // Inventory ends at asOf (from = asOf - lookback, a planner constant); pin only the `to`.
+      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, null, asOf);
+
+      // 3) AWD -- US only. Missing/failed for a US account BLOCKS (never a silent zero); a validated
+      //    (possibly empty) AWD source is honored. Non-US never reads AWD.
+      let awdRows = [];
+      if (isUS) {
+        const awd = sources["fba-plan:awd"];
+        if (!awd || awd.available !== true || !Array.isArray(awd.rows)) {
+          throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
+        }
+        const frags = awd.fragments || [];
+        const f = frags.length === 1 ? frags[0] : null;
+        const ids = f && f.sellerOrVendorIds;
+        const ok = !!f && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
+        if (!ok) throw new Error("fba-plan AWD must be exactly one single-account fragment; snapshot blocked.");
+        awdRows = awd.rows;
+      }
+
+      return fbaPlanPayload({
+        asOf,
+        accountName: context.accountName ?? null,
+        marketCountry: context.marketCountry ?? null,
+        isUS,
+        completed, current,
+        completedUnitRows, mtdUnitRows,
+        dailyDateRows, catalogRows, invRows, awdRows,
+      });
+    },
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.months)
+      && Array.isArray(p.inventoryByBrandCountry) && typeof p.isUS === "boolean"
+      && ("asOf" in p) && ("inventoryAvailable" in p) && ("awdAvailable" in p),
+    // Latest real data date = the most recent of the sales/inventory dates (already date-only).
+    latestDataDate: (p) => maxIsoDate([p.salesLatestDate, p.inventoryDate]),
+  },
+  // Reconciliation: reproduce the api/datadoe.js `reconciliation` payload from the six monthly
+  // order + settlement fragments and the single full-range catalog fragment. Enforce EXACTLY six
+  // complete consecutive calendar months for orders AND settlements (reuse the strict sku-pl helper),
+  // one account across both sources, and a single full-range single-account catalog -- rejecting any
+  // duplicate/missing/extra/reordered/partial-month/cross-account fragment (a violation throws ->
+  // derive-invalid -> last-known-good preserved, zero writes). Currencies are never merged (the pure
+  // folds key each order/settlement by its own currency).
+  "reconciliation": {
+    snapshotVersion: "reconciliation/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const from = context.from ?? null;
+      const to = context.to ?? null;
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const orderFrags = sources["reconciliation:order-lines"].fragments || [];
+      const settleFrags = sources["reconciliation:settlements"].fragments || [];
+      const catalogFrags = sources["reconciliation:catalog"].fragments || [];
+      const orderCheck = validateSkuPlMonthlyWindows({ from, to, windows: orderFrags.map((f) => ({ from: f.from, to: f.to, sellerOrVendorIds: f.sellerOrVendorIds })) });
+      if (!orderCheck.ok) throw new Error(`reconciliation order-lines six-complete-calendar-month contract violated (${orderCheck.reason}); snapshot blocked.`);
+      const settleCheck = validateSkuPlMonthlyWindows({ from, to, windows: settleFrags.map((f) => ({ from: f.from, to: f.to, sellerOrVendorIds: f.sellerOrVendorIds })) });
+      if (!settleCheck.ok) throw new Error(`reconciliation settlements six-complete-calendar-month contract violated (${settleCheck.reason}); snapshot blocked.`);
+      // One account across BOTH sources; never cross-account/organization. When a rawSellerId is
+      // planned it is authoritative and both sources must match it.
+      if (orderCheck.accountId !== settleCheck.accountId) throw new Error("reconciliation orders and settlements resolve different accounts; snapshot blocked.");
+      if (rawSellerId != null && orderCheck.accountId !== rawSellerId) throw new Error("reconciliation fragments do not match the planned account; snapshot blocked.");
+      // Catalog: exactly ONE single-account fragment spanning the full six-month window.
+      const catFrag = catalogFrags.length === 1 ? catalogFrags[0] : null;
+      const catIds = catFrag && catFrag.sellerOrVendorIds;
+      const catOk = !!catFrag && catFrag.from === from && catFrag.to === to
+        && Array.isArray(catIds) && catIds.length === 1
+        && (rawSellerId == null || String(catIds[0]).trim() === rawSellerId);
+      if (!catOk) throw new Error("reconciliation catalog must be exactly one single-account full-range fragment; snapshot blocked.");
+      return reconciliationPayload({
+        from, to,
+        months: orderCheck.months,
+        orderRows: sources["reconciliation:order-lines"].rows,
+        settlementRows: sources["reconciliation:settlements"].rows,
+        catalogRows: sources["reconciliation:catalog"].rows,
+      });
+    },
+    validatePayload: (p) => !!p && Array.isArray(p.orders) && Array.isArray(p.settlements)
+      && Array.isArray(p.months) && ("from" in p) && ("to" in p),
+    // Monthly report: the latest data date is the end of the last covered month (the window `to`).
+    latestDataDate: (p, context) => { const d = context && context.to != null ? String(context.to).slice(0, 10) : null; return d || null; },
+  },
   // SKU P&L: fold the six monthly-profit fragments into the exact route payload (RAW byMonth per
   // currency|sku|child_asin). Each fragment carries its window, so monthKey = fragment.from's
   // month; two five-ID chunks in the same month sum into one bucket; currencies never merge (part
