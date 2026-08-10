@@ -121,6 +121,34 @@ function singleAccountFragmentRows(source, key, rawSellerId, wantFrom, wantTo) {
   return source.rows;
 }
 
+// Typed-throw helpers so the derive can raise blocked / unavailable (not just invalid). A
+// terminally-disabled conditionally-required source => blocked; a failed/missing/unreadable one =>
+// unavailable. deriveReportSnapshot reads `error.deriveStatus`.
+function deriveError(message, deriveStatus) {
+  const e = new Error(message);
+  if (deriveStatus) e.deriveStatus = deriveStatus;
+  return e;
+}
+
+// Blocker 4: before counting SQP periods or selecting cadence, EVERY row must be a plain object whose
+// `date` is a REAL YYYY-MM-DD calendar date INSIDE the exact fragment window [from..to]. Invalid rows are
+// NOT silently filtered -- one malformed / non-calendar / out-of-window row makes the report `invalid`
+// (throws -> derive-invalid -> zero snapshot writes -> last-known-good preserved). Pure.
+function assertSqpRowsInWindow(rows, from, to, label) {
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`${label} contains a non-object row; snapshot blocked (invalid).`);
+    }
+    const d = row.date;
+    if (!isValidCalendarDate(d)) {
+      throw new Error(`${label} contains a row whose date is not a real YYYY-MM-DD calendar date; snapshot blocked (invalid).`);
+    }
+    if (d < from || d > to) {
+      throw new Error(`${label} contains a row date ${d} outside its ${from}..${to} fragment window; snapshot blocked (invalid).`);
+    }
+  }
+}
+
 // ---- The derivation registry (dependency map) ------------------------------------------
 //
 // Each entry:
@@ -395,21 +423,27 @@ const REGISTRY = {
       const weeklyRows = singleAccountFragmentRows(sources["keyword-rank:sqp-weekly"], "keyword-rank:sqp-weekly", rawSellerId, weeklyFrom, asOf);
       const catalogRows = singleAccountFragmentRows(sources["keyword-rank:catalog"], "keyword-rank:catalog", rawSellerId, longFrom, asOf);
 
+      // Blocker 4: validate every weekly SQP row (plain object + real calendar date inside the 84-day
+      // window) BEFORE counting periods, so a stale/out-of-window/malformed row can never select the
+      // wrong cadence or enter a saved payload -- it makes the report invalid instead.
+      assertSqpRowsInWindow(weeklyRows, weeklyFrom, asOf, "keyword-rank weekly SQP");
       const weeklyPeriods = sqpDistinctPeriods(weeklyRows);
       let cadence = "weekly";
       let rows = weeklyRows;
       let periods = weeklyPeriods;
       if (weeklyPeriods.length < 4) {
-        // Monthly SQP fallback is REQUIRED here. A missing/failed monthly => not derivable now (preserve
-        // last-known-good). A disabled monthly with a terminal policy => blocked. Never a silent baseline.
+        // Monthly SQP fallback is REQUIRED here. Preserve TYPED outcomes (Blocker 3): a terminal-disabled
+        // monthly => blocked; a failed/missing/unreadable monthly cache => unavailable (never a silent
+        // baseline). A VALIDATED (possibly empty) monthly array is honored as real baseline input.
         const monthly = sources["keyword-rank:sqp-monthly"];
         if (!monthly || monthly.available !== true || !Array.isArray(monthly.rows)) {
           if (monthly && monthly.disabled && sourceDisabledOutcome(monthly.disabledPolicy || null).blocks) {
-            throw new Error("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but the monthly source is disabled; snapshot blocked.");
+            throw deriveError("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but the monthly source is disabled; snapshot blocked.", "blocked");
           }
-          throw new Error("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but is missing/failed; snapshot blocked (previous data preserved).");
+          throw deriveError("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
         }
         const monthlyRows = singleAccountFragmentRows(monthly, "keyword-rank:sqp-monthly", rawSellerId, longFrom, asOf);
+        assertSqpRowsInWindow(monthlyRows, longFrom, asOf, "keyword-rank monthly SQP");
         const monthlyPeriods = sqpDistinctPeriods(monthlyRows);
         if (monthlyPeriods.length >= 2) {
           cadence = "monthly"; rows = monthlyRows; periods = monthlyPeriods;
@@ -528,7 +562,18 @@ export function deriveReportSnapshot({ reportKey, sources = {}, context = {} }) 
   try {
     payload = entry.derive({ sources, context });
   } catch (error) {
-    return { status: "invalid", validated: false, payload: null, latestDataDate: null, errorStage: "derive", reason: "derivation threw", detail: error && error.message ? error.message : String(error) };
+    // A derive may raise a TYPED outcome for a CONDITIONALLY-required source (one the static required
+    // gate cannot see): a terminal-disabled such source => `blocked`; a failed/missing/unreadable one
+    // => `unavailable`. Any other throw is genuine data-invalidity => `invalid`. All three preserve
+    // last-known-good (no snapshot is written).
+    const typed = error && (error.deriveStatus === "blocked" || error.deriveStatus === "unavailable")
+      ? error.deriveStatus : "invalid";
+    return {
+      status: typed, validated: false, payload: null, latestDataDate: null,
+      errorStage: typed === "blocked" ? "fetch" : "derive",
+      reason: typed === "invalid" ? "derivation threw" : (error && error.message ? error.message : String(error)),
+      detail: error && error.message ? error.message : String(error),
+    };
   }
   if (!entry.validatePayload(payload)) {
     return { status: "invalid", validated: false, payload: null, latestDataDate: null, errorStage: "validate", reason: `derived payload for "${reportKey}" failed validation` };
