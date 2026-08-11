@@ -36,6 +36,7 @@ let runReportJobs;
 let reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows;
 let resolveAccountScope, planDailyReporting, planSkuPl, buildShadowReportPlan;
 let SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS;
+let classifyDirectoryAccounts, CONNECTION_UNAVAILABLE;
 let makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY;
 let runSourceJobs, reportControlCatalog, enabledReportKeys;
 let monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths;
@@ -264,6 +265,36 @@ test("planner: buildShadowReportPlan REJECTS an explicitly requested keyword-ran
     () => buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], reportKeys: ["daily-reporting", "keyword-rank"], connections: PL_CONN, asOfFor: plAsOfFor }),
     /cannot plan staged-cycle report/,
   );
+});
+
+group("planner: primary-only DataDoe (secondary org retired) skips stale dd-secondary accounts");
+
+const PL_PRIMARY_ONLY = [{ id: "primary", apiKey: plDash("org", "primary"), accountPrefix: "" }];
+
+test("classifyDirectoryAccounts: primary active, stale dd-secondary => CONNECTION_UNAVAILABLE (prefix intact, no primary routing)", async () => {
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: plDash("dd", "secondary") + ":B9", country: "US", currency: "USD" }];
+  const { active, unavailable } = classifyDirectoryAccounts(accounts, PL_PRIMARY_ONLY);
+  assert.deepEqual(active.map((a) => a.accountId), ["A1"], "only the primary account is active");
+  assert.equal(unavailable.length, 1);
+  assert.equal(unavailable[0].accountId, plDash("dd", "secondary") + ":B9", "prefix is retained (never stripped)");
+  assert.equal(unavailable[0].status, CONNECTION_UNAVAILABLE);
+  assert.equal(unavailable[0].connectionId, "secondary", "never re-routed to primary");
+  assert.equal(unavailable[0].active, false);
+  assert.equal(unavailable[0].readOnly, true);
+  // When the secondary IS configured, the same dd-secondary account is active again.
+  assert.equal(classifyDirectoryAccounts(accounts, PL_CONN).active.length, 2, "secondary configured => both active");
+});
+
+test("buildShadowReportPlan (primary-only): a primary account plans normally; a stale dd-secondary spends ZERO source jobs and is returned read-only", async () => {
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: plDash("dd", "secondary") + ":B9", country: "US", currency: "USD" }];
+  const plan = buildShadowReportPlan({ accounts, reportKeys: ["daily-reporting"], connections: PL_PRIMARY_ONLY, asOfFor: plAsOfFor });
+  assert.ok(plan.reportRequests.length > 0 && plan.reportRequests.every((r) => r.accountId === "A1"), "only the primary account is planned");
+  assert.ok(plan.sourceJobs.every((j) => j.connectionId === "primary"), "no source job routes to a non-primary connection");
+  assert.equal(plan.unavailableAccounts.length, 1);
+  assert.equal(plan.unavailableAccounts[0].accountId, plDash("dd", "secondary") + ":B9");
+  assert.equal(plan.unavailableAccounts[0].status, CONNECTION_UNAVAILABLE);
+  // The stale account contributes NO source job at all.
+  assert.ok(!plan.sourceJobs.some((j) => String(j.requestMeta && j.requestMeta.ids || "").includes("B9")), "stale account spends no source job");
 });
 
 group("planner: exact Daily calendar window == live monthBack(asOf, 5).from .. asOf");
@@ -539,6 +570,7 @@ async function main() {
   ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ resolveAccountScope, planDailyReporting, planSkuPl, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
+  ({ classifyDirectoryAccounts, CONNECTION_UNAVAILABLE } = await import("../lib/server/datadoe-connections.js"));
   ({ makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } = await import("../lib/server/sync/daily-ads-loader.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ reportControlCatalog, enabledReportKeys } = await import("../lib/server/sync/report-controls.js"));

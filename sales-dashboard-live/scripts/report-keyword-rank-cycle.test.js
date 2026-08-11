@@ -340,6 +340,31 @@ test("a GENUINE keyword orphan (keyword request_key, stale hash absent from the 
   assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job still untouched");
 });
 
+/* ============================= primary-only DataDoe (secondary org retired) ============================= */
+
+group("keyword-rank cycle: primary-only config skips stale dd-secondary accounts (zero secondary requests)");
+
+test("a primary account syncs normally while a stale dd-secondary directory row is skipped read-only (zero jobs, zero DataDoe calls, prefix intact)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const PRIMARY_ONLY = [{ id: "primary", apiKey: dash("prim", "key"), accountPrefix: "" }];
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r = await runKeywordRankShadowCycle({ accounts, connections: PRIMARY_ONLY, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  // The primary account synced (weekly >= 4 => weekly + catalog); the stale secondary spent nothing.
+  assert.equal(dd.totalCreates(), 2, "only the primary account's exports were created");
+  const byAcct = jobsByAccount(store, r.cycleId);
+  assert.deepEqual(Object.keys(byAcct), ["primary"], "only primary-connection source jobs exist");
+  assert.ok(!store.listSourceJobs(r.cycleId).some((j) => String(j.request_hash).includes("B1")), "no source job for the stale account");
+  // The stale account is returned read-only with its prefix intact and never routed to primary.
+  assert.equal(r.perAccount.length, 1, "only the active (primary) account is tracked");
+  assert.equal(r.unavailableAccounts.length, 1);
+  assert.equal(r.unavailableAccounts[0].accountId, dash("dd", "secondary") + ":B1", "prefix retained");
+  assert.equal(r.unavailableAccounts[0].status, "CONNECTION_UNAVAILABLE");
+  assert.equal(r.unavailableAccounts[0].readOnly, true);
+  // The primary report plan is complete and drives normally; the stale account contributes no report.
+  assert.deepEqual(r.plannedReports.map((p) => p.accountId), ["A1"], "only the primary account yields a report plan");
+});
+
 async function main() {
   mark("main(): loading keyword-rank cycle module");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));

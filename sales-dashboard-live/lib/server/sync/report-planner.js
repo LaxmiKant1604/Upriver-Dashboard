@@ -13,7 +13,7 @@
 // Only Daily Reporting (ALL-brand), SKU P&L, FBA Shipment Plan and Reconciliation are planned here.
 // No other adapter (Keyword Rank, insight reports) is started.
 
-import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
+import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
@@ -295,8 +295,13 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     throw new Error(`buildShadowReportPlan cannot plan staged-cycle report(s) [${stagedRequested.join(", ")}]; use runKeywordRankShadowCycle (account-scoped staged weekly/monthly/catalog cycle).`);
   }
   const keys = requested.filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
+  // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE planning. A
+  // stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary
+  // key, and its prefix/snapshots are untouched -- it is returned read-only so its unavailability cannot
+  // fail the primary cycle or spend a token.
+  const { active, unavailable } = classifyDirectoryAccounts(accounts, connections);
   const reportRequests = [];
-  for (const account of accounts) {
+  for (const account of active) {
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
     for (const reportKey of keys) {
       // `name` is threaded for FBA Shipment Plan (its payload carries the authoritative account
@@ -305,5 +310,5 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     }
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);
-  return { reportRequests, sourceJobs, reportJobs };
+  return { reportRequests, sourceJobs, reportJobs, unavailableAccounts: unavailable };
 }

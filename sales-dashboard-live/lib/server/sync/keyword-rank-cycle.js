@@ -19,6 +19,7 @@ import { plannedSourceJob } from "./source-sync-driver.js";
 import { keywordWeeklySignal } from "./source-signals.js";
 import { planKeywordRank } from "./report-planner.js";
 import { bucketForCountry } from "./registry.js";
+import { classifyDirectoryAccounts } from "../datadoe-connections.js";
 
 // The planner/organization-registry connection id ("primary" | "secondary") -> the source driver's
 // fail-closed connection id ("primary" | "dd-secondary") that plannedSourceJob validates.
@@ -45,14 +46,20 @@ export async function runKeywordRankShadowCycle({
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 3,
 }) {
-  // Schedule-bucket isolation (Blocker 3): every account's planner bucket MUST equal the supplied
+  // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE any planning.
+  // A stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary
+  // key, and its prefix/snapshots are untouched -- it is skipped read-only so it spends ZERO source jobs /
+  // DataDoe calls and never fails the primary cycle.
+  const { active, unavailable } = classifyDirectoryAccounts(accounts, connections);
+
+  // Schedule-bucket isolation (Blocker 3): every active account's planner bucket MUST equal the supplied
   // cycle bucket, so one cycle can never mix US and non-US schedules or record an account in the
   // wrong bucket. Reject BEFORE opening a cycle or touching DataDoe -- a mixed-bucket input therefore
   // causes ZERO DataDoe calls (a caller must partition US/non-US into separate cycles).
   if (bucket !== "us" && bucket !== "non-us") {
     throw new Error(`runKeywordRankShadowCycle requires an explicit cycle bucket of 'us' or 'non-us' (got "${bucket}").`);
   }
-  for (const a of accounts) {
+  for (const a of active) {
     const accountBucket = bucketForCountry(a.country);
     if (accountBucket !== bucket) {
       throw new Error(`Keyword Rank cycle bucket "${bucket}" does not match account "${a.accountId}" (country "${a.country}" resolves to bucket "${accountBucket}"); refuse to mix schedule buckets in one cycle.`);
@@ -61,7 +68,7 @@ export async function runKeywordRankShadowCycle({
 
   const asOfOf = (a) => (typeof asOfFor === "function" ? asOfFor(a.country) : (a.asOf || asOf));
   // Per-account tracked state; each account owns its weekly/monthly canonical hashes (account-scoped).
-  const state = accounts.map((a) => ({ account: a, asOf: asOfOf(a), weeklyHash: null, monthlyHash: null, weeklySignal: null, monthlySignal: null }));
+  const state = active.map((a) => ({ account: a, asOf: asOfOf(a), weeklyHash: null, monthlyHash: null, weeklySignal: null, monthlySignal: null }));
 
   const loadRows = async (hash) => {
     if (!hash || !store.loadSourceRows) return null;
@@ -192,6 +199,8 @@ export async function runKeywordRankShadowCycle({
     weeklySignal: st.weeklySignal,
     monthlySignal: st.monthlySignal,
   }));
+  // Stale accounts whose owning connection is not configured: skipped read-only, zero jobs/calls spent.
+  rollup.unavailableAccounts = unavailable;
 
   // Blocker 2 -- return the COMPLETE canonical report request per account (never filtered to
   // already-staged hashes). buildFinalReports lists EVERY source required for the account's currently
