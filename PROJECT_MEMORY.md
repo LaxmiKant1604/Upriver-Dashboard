@@ -6023,3 +6023,44 @@ Secondary DataDoe API NOT enabled. Buy Box stays SHADOW ONLY + locked.
 `test:source-identity` **7**; full `npm run verify` **672 assertions** (was 645) + 2,394-module production
 build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/scheduled.
+
+## Scheduler v2: Buy Box Loss review blockers fixed (2026-08-11)
+
+Resolves the two Codex blockers above (see SCHEDULER_V2.md §49.5), on `feature/scheduler-v2` from review base
+`5ef6f87`. Two small commits, two files (`report-derivation.js` + `report-buy-box.test.js`).
+
+**Blocker 1 -- bind every source ROW date to its validated window.** The adapter validated fragment metadata
+but only `assertPlainObjectRows` for daily/inventory rows, so canonical fragment metadata carrying a daily row
+dated `2099-01-01` + an inventory row dated `2099-01-02` still derived (writing those into `observedWindow` /
+`inventorySnapshotDate`). Fix: generalized the SQP-named row guard -> report-neutral `assertRowsInWindow`
+(plain object + real YYYY-MM-DD date + inside `[from,to]`; pure, behavior-identical, Keyword Rank + Sales
+Movers call sites renamed only). The Buy Box derive now binds each daily row to ITS OWN 7-day slice (a
+wrong-slice date inside the 28-day range is rejected) and each inventory row to `[asOf-10d,asOf]`; catalog
+stays no-date. One malformed/impossible/future/out-of-window/wrong-slice row => typed `invalid`, zero writes,
+LKG preserved; never silently filtered.
+
+**Blocker 2 -- test through the REAL generic planner/driver.** The prior "generic-cycle"/E2E cases built jobs
+directly + called `runSourceJobs`. Added Part C through `buildShadowReportPlan` -> `runStagedSourceCycle`
+(resolvePlan builds owner-scoped `plannedSourceJob`s from the plan's report requests) -> `runReportJobs`:
+default+explicit planning include `buy-box-loss`; exactly six canonical jobs (4 ordered daily slices +
+inventory + no-date catalog) with exact windows/report-deps/owner/context; report PENDING until all sources
+succeed then snapshot saved once + zero-network derive + idempotent; maxJobs + poll-deferral resume with one
+create-export per hash + memberships active; owner-scoped reconciliation leaves a second owner sharing
+inventory/catalog active; primary-only skips a stale dd-secondary read-only with zero DataDoe calls, never
+routed to primary.
+
+**Tests** (`report-buy-box.test.js` now **40 cases**, +13): Blocker 1 -- impossible date (2025-02-30),
+before/after slice window, wrong-slice, future daily date, inventory before asOf-10d / after asOf, the exact
+`2099-01-01`/`2099-01-02` repro, canonical-parity preserved, worker-level zero-write LKG; Blocker 2 -- the
+five real-driver cases above.
+
+**Scope guarantees.** Only `report-derivation.js` + `report-buy-box.test.js` changed. `request_hash`/source
+identity untouched (`test:source-identity` **7**, golden hash unchanged). Live route, `buy-box.js` builder,
+source contracts, Scheduler v1, frontend, migrations, report controls, schedules untouched. Secondary DataDoe
+API not enabled. Buy Box stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on both files (0); `test:report-derivation` **286**
+(66+30+33+20+34+24+12+27+40, was 273); `test:sync-engine` **79**; `test:report-contracts` **161**;
+`test:source-identity` **7**; full `npm run verify` **685 assertions** (was 672) + 2,394-module production
+build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
