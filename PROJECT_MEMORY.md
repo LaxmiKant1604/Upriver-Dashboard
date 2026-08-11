@@ -6405,3 +6405,56 @@ touched.
 Listing Health is approved as a SHADOW ONLY, locked derivation/planning tranche. The
 next focused tranche is PPC Performance only; do not unlock, schedule, deploy, or start
 Listing Optimizer in the same tranche.
+
+## Scheduler v2: PPC Performance derivation + gated shadow cycle (SHADOW MODE, 2026-08-12)
+
+Sixth functional report family on Scheduler v2 (see SCHEDULER_V2.md §52), on `feature/scheduler-v2` from
+approval base `393f3fc`. PPC's advertising data comes ENTIRELY from persisted Supabase Ads history -- **PPC
+creates ZERO DataDoe Ads exports**. Its only owned DataDoe requests are the shared no-date catalog + the
+OPTIONAL total-sales TACoS denominator, both gated on a validated Ads-currency signal. Four small commits.
+
+**Dependency map.** Persisted `ads_daily_source_rows` (campaign/asin/targeting/search-terms, `[asOf-29d,asOf]`,
+public account scope) -> derived via `context.ppcAds`; `ppc-performance:total-sales` (Sales & Traffic, grouped
+by date, 500 strict, OPTIONAL, ads-currency-gated); `ppc-performance:catalog` (no-date, 20k strict, REQUIRED,
+SAME hash as the other insight catalogs).
+
+1. **Pure derivation + loader** -- `derivation-core.js` gained `rollupPpcRows`, `ppcCampaigns/ppcAsins/
+   ppcTargets/ppcSearchTerms`, `ppcDailySeries`, `ppcPerformancePayload` (verbatim from ppc.js; currency-keyed
+   -- money never merges; campaignTypes + activeDays coverage; catalog name/brand enrichment; TACoS state),
+   zero transport imports. NEW `ppc-ads-loader.js` (server-only, no transport -- Supabase readers injected):
+   `validatePpcAdsRows` (pure fail-closed: allowed source_key, real metric_date in window, finite metrics --
+   one bad row => unavailable, never filtered), `loadPersistedPpcAds` (typed ok/unavailable; read error or
+   120k cap => unavailable; validated empty distinct), `ppcAdsCurrencySignalOf`, `makePpcAdsContextLoader`.
+   `report-derivation.js` wired the `ppc-performance` adapter (derivedContextKeys:["ppcAds"]; catalog required;
+   total-sales optional): pure derive (zero network); Ads unavailable/unseeded/cap => unavailable (LKG);
+   validated empty => valid report; catalog missing/failed => unavailable; cross-account/dated catalog =>
+   invalid; TACoS: >1 currency => exact multi-currency reason, <=1 + succeeded => sum, <=1 + failed/missing/
+   malformed/wrong-window => safe degraded reason (degrades ONLY TACoS). Payload accountId = public id;
+   rawSellerId scopes DataDoe catalog/total-sales. latestDataDate = max Ads metric_date (null empty).
+2. **Planner + cycle** -- `planPpcPerformance` plans nothing when Ads unvalidated (zero tokens); else the
+   resolver's ads-currency gate emits total-sales only for currencyCount<=1 (the window itself is gated),
+   catalog unconditional. `ppc-performance` added to `STAGED_CYCLE_REPORT_KEYS` (generic planner never plans
+   it). NEW `ppc-cycle.js` `runPpcShadowCycle`: loads+validates persisted Ads once (public scope, Supabase
+   read only), derives the ads-currency signal, plans/runs via owner-model runSourceJobs (one export per
+   request_hash; bounded/deferral resume; owner-scoped reconcile; primary-only stale-secondary skip).
+3. **Tests** -- new `scripts/report-ppc-performance.test.js` **31 cases** (wired into test:report-derivation):
+   fixture deep-equal, folds + coverage labels (search terms never claim SD), currency isolation, all TACoS
+   states, Ads unavailable vs validated-empty, required catalog + cross-account/dated fail-closed, identity,
+   zero-network, idempotency, typed loader validation + 120k cap + empty-vs-missing, staged-not-generic,
+   zero-Ads-export, gate (multi-currency catalog-only, unvalidated zero-tokens+LKG), catalog dedup across
+   owners, E2E saved-once, total-sales strict-cap degrades only TACoS, maxJobs/deferral resume, primary-only.
+
+**Report control unchanged.** Only `derivation-core.js`, `report-derivation.js`, `report-planner.js`,
+`ppc-ads-loader.js` (new), `ppc-cycle.js` (new), `report-ppc-performance.test.js` (new),
+`report-planner.test.js` (staged-key assertion), `package.json` changed. `api/datadoe.js` live route +
+`ppc.js` builder byte-unchanged; source CONTRACTS, `request_hash`/source identity, Scheduler v1, frontend,
+migrations, report controls, schedules untouched (`test:source-identity` **7**, golden hash unchanged). PPC
+stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on every changed file (0); `test:report-derivation`
+**388** (66+30+33+20+34+24+12+27+40+35+37+31, was 358); `test:sync-engine` **79**; `test:report-contracts`
+**161**; `test:source-identity` **7**; full `npm run verify` **787 assertions** (was 757) + 2,394-module
+production build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked
+`HANDOFF.md`). Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled. Unresolved live
+assumption: persisted-Ads FRESHNESS (worker sync cadence vs the 30-day window) is surfaced via
+sourceAvailability.sync but the derive does not gate on staleness -- confirm at live unlock.
