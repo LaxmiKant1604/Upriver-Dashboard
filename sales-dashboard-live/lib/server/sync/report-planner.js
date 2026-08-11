@@ -51,7 +51,12 @@ const BB_WINDOW_DAYS = 28;
 const BB_SLICE_DAYS = 7;
 const BB_INVENTORY_LOOKBACK_DAYS = 10;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss"]);
+// Returns & Refund Leakage lookback (days) -- byte-identical to the live builder/sources: returns.js
+// WINDOW_DAYS = RETURNS.historyDays (60). Returns, settlements and traffic all span [asOf-59d, asOf]; the
+// catalog is the shared no-date insight catalog. So the scheduled windows match the live route exactly.
+const RET_WINDOW_DAYS = 60;
+
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss", "returns-leakage"]);
 
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
 // are staged per account by runKeywordRankShadowCycle (keyword-rank-cycle.js). It therefore has ONE
@@ -362,6 +367,40 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   };
 }
 
+/**
+ * Plan Returns & Refund Leakage for ONE account. Emits the exact route windows: the raw Returns rows, the
+ * grouped Settlements money, and the grouped Sales & Traffic pair -- all over [asOf-59d, asOf] -- plus the
+ * shared no-date insight catalog, for the one raw seller id. All four sources are INDEPENDENTLY required
+ * (no probe / staged activation), so Returns uses the generic owner-scoped source cycle, never a dedicated
+ * staged-cycle driver. The catalog canonical hash dedupes with Sales Movers + Buy Box + other insight
+ * catalogs; returns/settlements/traffic carry their own distinct identities (the traffic column/aggregation
+ * set + 60-day window differ from Sales Movers traffic, so it is deliberately NOT shared).
+ */
+export function planReturnsLeakage({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const from = addDaysStr(end, -(RET_WINDOW_DAYS - 1));
+  const windowsByRequestKey = {
+    "returns-leakage:returns": [{ from, to: end }],
+    "returns-leakage:settlements": [{ from, to: end }],
+    "returns-leakage:traffic": [{ from, to: end }],
+    "returns-leakage:catalog": [{ from: null, to: null }],
+  };
+  const sources = reportSourceRequestHashes({
+    reportKey: "returns-leakage", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "returns-leakage",
+    reportVersion: REPORT_DERIVATIONS["returns-leakage"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "returns-leakage", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+}
+
 // Generic single-shot planners ONLY. keyword-rank + sales-movers are deliberately absent: they are staged
 // by their own account-scoped shadow cycles (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
 const PLANNERS = {
@@ -370,6 +409,7 @@ const PLANNERS = {
   "fba-plan": planFbaPlan,
   reconciliation: planReconciliation,
   "buy-box-loss": planBuyBoxLoss,
+  "returns-leakage": planReturnsLeakage,
 };
 
 /**
