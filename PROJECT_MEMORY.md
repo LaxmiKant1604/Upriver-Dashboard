@@ -5467,3 +5467,42 @@ in admin status without failing the primary cycle. Never strip the prefix, never
 primary key, never delete their saved snapshots, and never spend a DataDoe token for them. Add a
 primary-only test (no secondary env/connection) proving primary accounts sync normally while a stale
 secondary directory row produces zero source jobs, zero DataDoe calls, and one safe admin status.
+
+## Scheduler v2: Keyword Rank shared-cycle blockers fixed + primary-only DataDoe (Claude, 2026-08-11)
+
+Fixed the two shared-cycle/checkpoint integration blockers from the Codex re-review (`9041fc5`) and added
+the owner's primary-only DataDoe safety filter (`db7c347`). **Additive scheduler-v2 code only** --
+`api/datadoe.js`, the keyword-rank source CONTRACT, `report-source-contracts.js`, `report-derivation.js`,
+`source-signals.js`, and every approved FBA/`sync-*` artifact are byte-UNCHANGED. SHADOW MODE; nothing
+pushed/merged/deployed/migrated; Keyword Rank + all controls locked; `dd-secondary:` namespacing +
+historical snapshots retained (dormant, not deleted); `HANDOFF.md` untracked/untouched. request_hash +
+strict 50,000 caps + five-ID batching + catalog token-saving table + typed outcomes + SQP date validation +
+account/org/bucket isolation preserved. Detail in `SCHEDULER_V2.md` section 43. Three small green commits.
+
+- **Blocker 1 -- typed source-job ownership (`source-worker.js`, `keyword-rank-cycle.js`).** One
+  `sync_cycles` row exists per `(bucket, cycle_date)`, but `runSourceJobs` MISSING_PLAN'd any pending row
+  absent from the current round's plan -- so a Keyword round could fail a generic report's queued source.
+  `runSourceJobs` now takes optional `ownedJobs` (the full owned set for the cycle) defining a TYPED
+  scope by `request_key`: unrelated-family rows are left untouched (never MISSING_PLAN'd); a job staged in
+  a prior round/invocation is merged + resumed (metaByHash covers all owned jobs); a genuine owned orphan
+  (keyword request_key, stale hash) still fails closed. `drained` scoped to owned; counts stay cycle-wide;
+  `ownedJobs=null` = unchanged legacy behaviour. The keyword cycle passes its full owned set every round.
+- **Blocker 2 -- partial invocations keep reports pending (`keyword-rank-cycle.js`).** `buildFinalReports`
+  filtered sources to persisted hashes, so a checkpointed partial invocation returned a weekly-only report
+  that `runReportJobs` treated as runnable -> derive-failed (needs catalog) -> frozen for the cycle. It now
+  returns the COMPLETE canonical required set for the resolved cadence (weekly+catalog; +monthly when weekly
+  validated <4); an unstaged required dep has no succeeded job so the fetch GATE keeps the report PENDING
+  (no derive/failure/snapshot) until a later invocation stages it, then the same cycle derives + saves once.
+  Failed/terminal weekly (or failed required monthly) still blocks honestly. `rollup.perAccount` moved after
+  the final reconstruction (fresh telemetry).
+- **Primary-only DataDoe (`datadoe-connections.js`, `report-planner.js`, `keyword-rank-cycle.js`).** New
+  `classifyDirectoryAccounts` + `CONNECTION_UNAVAILABLE` partition the directory against CONFIGURED
+  connections before planning; a stale `dd-secondary:` account (secondary org retired) is skipped read-only
+  (prefix intact, never routed to primary, snapshots untouched) with zero source jobs / DataDoe calls, and
+  never fails the primary cycle. `buildShadowReportPlan` + `runKeywordRankShadowCycle` return
+  `unavailableAccounts`. Secondary support stays dormant; re-adding the key reactivates it.
+- **Verification (all natural, exit 0).** report-keyword-rank-cycle **15** (+4); report-keyword-rank-e2e
+  **9** (+6); report-planner **30** (+2); test:sync-engine 58; test:report-derivation **207**
+  (66+30+33+20+34+15+9); test:report-contracts 161 (unchanged); test:source-identity 7; `npm run verify` =
+  exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+ untracked
+  HANDOFF.md).

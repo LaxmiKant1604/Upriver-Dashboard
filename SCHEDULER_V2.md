@@ -2365,3 +2365,78 @@ routing); `report-planner.test.js` **28** (+2 one-entry-point); `report-keyword-
 (7); `npm run verify` = exit 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status
 --short` shows only the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with
 Keyword Rank + all reports locked.
+
+## 43. Keyword Rank shared-cycle blockers + primary-only DataDoe (SHADOW MODE, 2026-08-11)
+
+Fixes the two shared-cycle/checkpoint blockers from the integration re-review and adds the owner's
+primary-only DataDoe safety filter. Additive scheduler-v2 code only; `api/datadoe.js` (route), the
+keyword-rank source CONTRACT, `report-source-contracts.js`, `report-derivation.js`, `source-signals.js`
+and every approved FBA/`sync-*` artifact are byte-UNCHANGED. No migration/schedule/control-unlock/push/
+merge/deploy; Keyword Rank + all controls stay locked; `dd-secondary:` namespacing and historical
+snapshots are retained (dormant, not deleted). `HANDOFF.md` untracked/untouched. request_hash, strict
+50,000 caps, five-ID batching, the catalog token-saving state table, the typed blocked/unavailable/invalid
+outcomes, SQP date/window validation, and account/org/bucket isolation are all preserved.
+
+### 43.1 Blocker 1 -- typed source-job ownership scope (`source-worker.js`, `keyword-rank-cycle.js`)
+
+The DB allows one `sync_cycles` row per `(bucket, cycle_date)`, but `runSourceJobs` scanned ALL
+pending/attempted rows in that shared cycle and recorded `MISSING_PLAN` for any row absent from the current
+round's plan -- so a Keyword staged round could fail a generic report's queued source (and vice versa).
+`runSourceJobs` now takes an optional `ownedJobs` (the COMPLETE set of jobs this invocation owns for the
+whole cycle). Ownership is TYPED by `request_key`: a row whose request_key is not owned belongs to another
+family and is left completely untouched (never `MISSING_PLAN`'d). `metaByHash` now covers every owned job
+(a superset of the round's `plannedJobs`), so a job staged in a prior round/invocation is merged + resumed
+rather than mistaken for an orphan; an owned row whose hash is absent from the canonical plan (a stale
+window/version) still fails closed. `drained` is scoped to owned jobs; cycle counts stay cycle-wide.
+`ownedJobs=null` keeps the previous whole-cycle behaviour (every existing caller/test unchanged).
+`runKeywordRankShadowCycle` computes its full owned set (weekly+catalog+monthly per account; the monthly
+window forced only to enumerate the signal-independent hash) and passes it to every `runSourceJobs` call.
+
+### 43.2 Blocker 2 -- partial invocations keep incomplete reports pending (`keyword-rank-cycle.js`)
+
+`buildFinalReports` filtered `plan.sources` to already-persisted hashes, so a checkpointed partial
+invocation (maxJobs:1 / maxRounds:1 / poll or download deadline) could return a Keyword report listing
+weekly only; `runReportJobs` then treated it as runnable, the static derivation required catalog, returned
+`unavailable`, and the report became derive-failed/finished for the cycle. It now returns the COMPLETE
+canonical required set for the resolved cadence (weekly + catalog always; + monthly when the weekly signal
+is a validated < 4), never filtered by staging. A required dependency not yet staged simply has no
+succeeded job, so the report FETCH GATE keeps the report PENDING (no derive, no failure, no snapshot) until
+a later invocation stages + succeeds it -- then the SAME cycle derives and saves exactly once. Failed/
+terminal weekly (or a failed required monthly) still yields the approved honest blocked outcome via the
+gate. `rollup.perAccount` is now computed AFTER the final reconstruction so one-round/deadline-truncated
+telemetry is fresh, not stale.
+
+Partial-report state table (per account, from the report fetch gate over the currently resolved cadence):
+
+| weekly state | monthly (only if weekly validated < 4) | catalog | required set | report outcome |
+| --- | --- | --- | --- | --- |
+| pending/attempted (resumable) | n/a | not staged | weekly + catalog | PENDING (resume) |
+| succeeded >= 4 | n/a | not staged | weekly + catalog | PENDING (await catalog) |
+| succeeded >= 4 | n/a | succeeded | weekly + catalog | DERIVED (weekly) |
+| succeeded < 4 | not staged | not staged | weekly + monthly + catalog | PENDING (await monthly) |
+| succeeded < 4 | succeeded | not staged | weekly + monthly + catalog | PENDING (await catalog) |
+| succeeded < 4 | succeeded | succeeded | weekly + monthly + catalog | DERIVED (monthly/baseline) |
+| succeeded < 4 | failed/disabled | not staged | weekly + monthly + catalog | BLOCKED (typed) |
+| failed/terminal | n/a | not staged | weekly + catalog | BLOCKED (honest) |
+
+### 43.3 Primary-only DataDoe (`datadoe-connections.js`, `report-planner.js`, `keyword-rank-cycle.js`)
+
+The owner removed `DATADOE_API_KEY_SECONDARY` from Vercel, so `getDataDoeConnections()` omits the secondary
+connection. New `classifyDirectoryAccounts(accounts, connections)` + `CONNECTION_UNAVAILABLE` partition the
+directory against the CONFIGURED connections BEFORE planning: a stale `dd-secondary:` account (no configured
+secondary) becomes an inactive/read-only status row (prefix intact, `connectionId:"secondary"`, status
+`CONNECTION_UNAVAILABLE`) -- never planned, never routed to the primary key, snapshots untouched.
+`buildShadowReportPlan` and `runKeywordRankShadowCycle` classify up front, operate only on the active set,
+and return `unavailableAccounts`, so a stale account spends zero source jobs / zero DataDoe calls and never
+fails the primary cycle. Secondary support stays dormant (not deleted); re-adding the key reactivates it.
+
+### 43.4 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-keyword-rank-cycle.test.js` **15** (+4: shared-
+cycle ownership x3, primary-only x1); `report-keyword-rank-e2e.test.js` **9** (+6: maxJobs:1, maxRounds:1,
+deadline-poll, deadline-download, weekly-low staged-across-invocations, unrelated-continues);
+`report-planner.test.js` **30** (+2: classify + buildShadowReportPlan primary-only). `npm run
+test:sync-engine` (58); `npm run test:report-derivation` = **207** (66+30+33+20+34+15+9); `npm run
+test:report-contracts` (**161**, unchanged); `npm run test:source-identity` (7); `npm run verify` = exit 0
++ `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
+files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
