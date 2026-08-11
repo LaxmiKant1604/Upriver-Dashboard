@@ -35,6 +35,7 @@ let shadowSnapshotKey;
 let runReportJobs;
 let reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows;
 let resolveAccountScope, planDailyReporting, planSkuPl, buildShadowReportPlan;
+let SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS;
 let makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY;
 let runSourceJobs, reportControlCatalog, enabledReportKeys;
 let monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths;
@@ -240,6 +241,29 @@ test("planner: organization api scope + fingerprints never mix (same raw id, dif
   const plan = buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: plDash("dd", "secondary") + ":A1", country: "US", currency: "USD" }], reportKeys: ["daily-reporting"], connections: PL_CONN, asOfFor: plAsOfFor });
   assert.deepEqual([...new Set(plan.sourceJobs.map((j) => j.connectionId))].sort(), ["primary", "secondary"]);
   assert.equal(plan.sourceJobs.length, pri.sources.length + sec.sources.length, "no cross-org source-job collapse");
+});
+
+group("planner: Keyword Rank has ONE staged entry point (never the generic builder)");
+
+test("planner: Keyword Rank is excluded from the generic default keys and the PLANNERS dispatch", async () => {
+  assert.ok(!SHADOW_PLANNED_REPORT_KEYS.includes("keyword-rank"), "default generic keys must NOT include keyword-rank");
+  assert.deepEqual([...STAGED_CYCLE_REPORT_KEYS], ["keyword-rank"], "keyword-rank is the staged-cycle key");
+  // The DEFAULT plan (no reportKeys) for a keyword-rank-capable account emits zero keyword-rank reports.
+  const plan = buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: PL_CONN, asOfFor: plAsOfFor });
+  assert.ok(!plan.reportRequests.some((r) => r.reportKey === "keyword-rank"), "generic default plan never plans keyword-rank");
+});
+
+test("planner: buildShadowReportPlan REJECTS an explicitly requested keyword-rank key (fail closed, not silently dropped)", async () => {
+  assert.throws(
+    () => buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], reportKeys: ["keyword-rank"], connections: PL_CONN, asOfFor: plAsOfFor }),
+    /cannot plan staged-cycle report/,
+    "a requested keyword-rank key must fail closed, not be silently ignored",
+  );
+  // Mixed with a valid generic key: still rejected (no partial plan that silently omits keyword-rank).
+  assert.throws(
+    () => buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], reportKeys: ["daily-reporting", "keyword-rank"], connections: PL_CONN, asOfFor: plAsOfFor }),
+    /cannot plan staged-cycle report/,
+  );
 });
 
 group("planner: exact Daily calendar window == live monthBack(asOf, 5).from .. asOf");
@@ -514,7 +538,7 @@ async function main() {
   ({ shadowSnapshotKey } = await import("../lib/server/sync/report-derivation.js"));
   ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ resolveAccountScope, planDailyReporting, planSkuPl, buildShadowReportPlan } = await import("../lib/server/sync/report-planner.js"));
+  ({ resolveAccountScope, planDailyReporting, planSkuPl, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } = await import("../lib/server/sync/daily-ads-loader.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ reportControlCatalog, enabledReportKeys } = await import("../lib/server/sync/report-controls.js"));

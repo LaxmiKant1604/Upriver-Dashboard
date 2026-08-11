@@ -35,7 +35,14 @@ const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_LONG_LOOKBACK_DAYS = 365;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "keyword-rank"]);
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation"]);
+
+// Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
+// are staged per account by runKeywordRankShadowCycle (keyword-rank-cycle.js). It therefore has ONE
+// canonical entry point and MUST NOT flow through the eager generic builder (which would emit weekly +
+// an eager catalog with no account-scoped fallback orchestration). buildShadowReportPlan rejects it
+// fail-closed rather than silently planning or silently dropping a requested key.
+export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank"]);
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
@@ -257,12 +264,13 @@ export function planKeywordRank({ accountId, country, currency, connections, asO
   };
 }
 
+// Generic single-shot planners ONLY. keyword-rank is deliberately absent: it is staged by
+// runKeywordRankShadowCycle (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
 const PLANNERS = {
   "daily-reporting": planDailyReporting,
   "sku-pl": planSkuPl,
   "fba-plan": planFbaPlan,
   reconciliation: planReconciliation,
-  "keyword-rank": planKeywordRank,
 };
 
 /**
@@ -273,10 +281,20 @@ const PLANNERS = {
  *   - reportJobs: buildDependencyPlan's report->sources dependency map (telemetry).
  * `accounts`: [{ accountId, country, currency }] (from the authoritative account directory).
  * `asOfFor(country)` supplies the marketplace-local as-of date (the caller passes marketplaceToday).
- * Only daily-reporting + sku-pl are planned; other keys are ignored. Pure given its inputs; no I/O.
+ * Plans ONLY the generic single-shot reports (SHADOW_PLANNED_REPORT_KEYS); a requested staged-cycle
+ * key (Keyword Rank) is REJECTED fail-closed, never silently planned OR silently dropped. Any other
+ * unknown key is ignored. Pure given its inputs; no I/O.
  */
 export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor }) {
-  const keys = (reportKeys || []).filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
+  const requested = reportKeys || [];
+  // Fail closed: a staged-cycle report (Keyword Rank) has ONE canonical entry point
+  // (runKeywordRankShadowCycle) and must never be planned by -- or silently dropped from -- the generic
+  // eager builder. A caller that explicitly asks for it here is a bug we surface rather than mis-plan.
+  const stagedRequested = requested.filter((key) => STAGED_CYCLE_REPORT_KEYS.includes(key));
+  if (stagedRequested.length) {
+    throw new Error(`buildShadowReportPlan cannot plan staged-cycle report(s) [${stagedRequested.join(", ")}]; use runKeywordRankShadowCycle (account-scoped staged weekly/monthly/catalog cycle).`);
+  }
+  const keys = requested.filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
   const reportRequests = [];
   for (const account of accounts) {
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
