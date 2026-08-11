@@ -6087,3 +6087,52 @@ contracts, and source identity are byte-unchanged; `git diff --check` is clean a
 untracked `HANDOFF.md` remains. Nothing was pushed, merged, deployed, migrated, unlocked,
 enabled, or scheduled. Buy Box remains SHADOW ONLY + locked. The next focused tranche is
 Returns & Refunds (`returns-leakage`) only.
+
+## Scheduler v2: Returns & Refund Leakage derivation + generic planning (SHADOW MODE, 2026-08-11)
+
+Fourth functional report family on Scheduler v2 (see SCHEDULER_V2.md §50), on `feature/scheduler-v2` from
+approval base `5b230e6`. Returns has NO probe / staged activation -- all four sources are INDEPENDENTLY
+required -- so it uses the EXISTING generic owner-scoped source cycle + generic planner, NOT a dedicated
+staged-cycle driver. Three small commits.
+
+**Dependency/window map.** `returns-leakage:returns` (Returns FBA & FBM, raw grain: one row = one returned
+item) `[asOf-59d,asOf]` 50k strict; `returns-leakage:settlements` (Settlements & P&L, grouped by sku/asin/
+type/currency) `[asOf-59d,asOf]` 50k strict; `returns-leakage:traffic` (Sales & Traffic grouped by asin/
+product) `[asOf-59d,asOf]` 50k strict -- distinct identity from Sales Movers traffic (different columns/
+window); `returns-leakage:catalog` no-date 20k strict, SAME canonical hash as Sales Movers + Buy Box catalog.
+
+1. **Pure derivation** -- `derivation-core.js` gained `RETURNS_REASON_BUCKETS` + `classifyReturnReason`
+   (four fixable levers + low-actionability + other), `returnsLeakageReturnsFold` (reason/channel mix, FBA/
+   FBM/pending counts, reasonTotals, FBM-only refunded amount + seller-borne label cost),
+   `returnsLeakageSettlementFold` (currency|ASIN money, ORDER vs REFUND, absolute values, ZERO-CLAMPED
+   return-fee component, COGS), `returnsLeakageTrafficFold` (shipped/refunded pair), `returnsLeakagePayload`
+   (one row per currency|ASIN, no-return/no-refund excluded, catalog->traffic name precedence, catalog-only
+   brand, RAW returnRecordCount, stable topReasons/reasonTotals order), all verbatim from returns.js, zero
+   transport imports. `report-derivation.js` wired the `returns-leakage` adapter (all 4 required): recompute
+   + pin the single `[asOf-59d,asOf]` window; raw Returns rows validated per-ROW (plain object + real date
+   in-window via assertRowsInWindow, never silently filtered); grouped settlements/traffic + no-date catalog
+   validated as plain objects; wrong-window/cross-account/malformed => invalid (LKG, zero writes); missing/
+   failed source => unavailable (LKG). Payload accountId = public context.accountId; rawSellerId sole scope.
+   latestDataDate = window end (deterministic, never Date.now()).
+2. **Planner** -- `planReturnsLeakage` emits the four canonical source requests; added to the generic
+   `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch (driven by `buildShadowReportPlan` +
+   `runStagedSourceCycle`, one export per request_hash/cycle, partial runs resumable). Single-account.
+3. **Tests** -- new `scripts/report-returns.test.js` **28 cases** (wired into `test:report-derivation`):
+   hand-computed production-route fixture deep-equal, reason classification + stable ordering, FBA/FBM/pending
+   + raw returnRecordCount, currency isolation, ORDER/REFUND, return-fee clamp, name/brand precedence,
+   exclusion rules, FBM-only figures, 60-day window + cross-account fail-closed, malformed/future/out-of-window
+   return-date invalid, missing-source LKG, public/raw identity, zero-network, idempotency, real driver path
+   (default+explicit planning, four canonical jobs, shared-catalog dedup, owner-scoped reconciliation,
+   strict-cap, pending-then-saved-once, maxJobs/deferral resume, primary-only stale-secondary skip).
+
+**Report control unchanged.** Only `derivation-core.js`, `report-derivation.js`, `report-planner.js`,
+`report-returns.test.js`, `package.json` changed. `api/datadoe.js` live route + `returns.js` builder
+byte-unchanged; source CONTRACTS, `request_hash`/source identity, Scheduler v1, frontend, migrations, report
+controls, schedules untouched (`test:source-identity` **7**, golden hash unchanged). Secondary DataDoe API
+NOT enabled. Returns stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on every changed file (0); `test:report-derivation`
+**314** (66+30+33+20+34+24+12+27+40+28, was 286); `test:sync-engine` **79**; `test:report-contracts` **161**;
+`test:source-identity` **7**; full `npm run verify` **713 assertions** (was 685) + 2,394-module production
+build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.

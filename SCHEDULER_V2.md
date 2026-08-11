@@ -2886,3 +2886,70 @@ Regression tests (`report-buy-box.test.js` now **40 cases**, +13). `node --check
 `report-buy-box.test.js` changed (+ untracked `HANDOFF.md`). Live route/builder/contracts/request identity/
 Scheduler v1/frontend/migrations/report controls/schedules untouched; secondary DataDoe API not enabled;
 nothing pushed/merged/deployed/unlocked/scheduled; Buy Box remains SHADOW ONLY + locked.
+
+## 50. Returns & Refund Leakage: pure derivation + generic single-shot planning (SHADOW MODE, 2026-08-11)
+
+Fourth functional report family on Scheduler v2 (after Keyword Rank, Sales Movers, Buy Box). Returns has NO
+probe / staged activation -- all four sources are INDEPENDENTLY required -- so it uses the EXISTING generic
+owner-scoped source cycle + generic planner, NOT a dedicated staged-cycle driver. Returns stays **SHADOW
+ONLY + locked**: `api/datadoe.js` live route + `lib/server/reports/returns.js` builder byte-unchanged, the
+source CONTRACTS unchanged, Scheduler v1 + frontend untouched, migration NOT applied, `HANDOFF.md`
+untracked/untouched.
+
+### 50.1 Dependency + window map
+
+| request key | source | window | cap | shared identity |
+| --- | --- | --- | --- | --- |
+| `returns-leakage:returns` | Returns (FBA & FBM) | `[asOf-59d, asOf]` (raw grain, one row = one returned item) | 50,000 (strict) | -- |
+| `returns-leakage:settlements` | Settlements & P&L Components | `[asOf-59d, asOf]` (grouped by sku/asin/type/currency) | 50,000 (strict) | -- |
+| `returns-leakage:traffic` | Sales & Traffic by ASIN | `[asOf-59d, asOf]` (grouped by asin/product) | 50,000 (strict) | distinct from Sales Movers traffic (different columns/window) |
+| `returns-leakage:catalog` | Product Catalog | no-date | 20,000 (strict) | SAME canonical hash as Sales Movers + Buy Box catalog |
+
+### 50.2 Pure derivation (`derivation-core.js`, `report-derivation.js`)
+
+`derivation-core.js` gained the Returns cores, transcribed verbatim from `returns.js`:
+`RETURNS_REASON_BUCKETS` + `classifyReturnReason` (four fixable levers -- product/quality, listing, sizing,
+delivery -- plus low-actionability + "other"), `returnsLeakageReturnsFold` (reason/channel mix, FBA/FBM/
+pending counts, `reasonTotals`, FBM-only refunded amount + seller-borne label cost), `returnsLeakageSettlementFold`
+(currency|ASIN money, ORDER vs REFUND, absolute values, ZERO-CLAMPED return-fee component, COGS on refunded
+units), `returnsLeakageTrafficFold` (shipped/refunded pair), and `returnsLeakagePayload` (one row per
+currency|ASIN, no-return/no-refund rows excluded, catalog->traffic name precedence, catalog-only brand, RAW
+`returnRecordCount`, stable `topReasons`/`reasonTotals` ordering). Currency is NEVER merged. Reuses the
+shared sumField/brand/catalog folds; zero transport imports (transport-boundary test still passes).
+
+`report-derivation.js` wired the `returns-leakage` adapter (all four sources required, `optionalRequestKeys:
+[]`). It RECOMPUTES + pins the single `[asOf-59d, asOf]` window; the raw Returns rows are validated per-ROW
+via `assertRowsInWindow` (plain object + real calendar date inside the 60-day window -- a malformed/
+impossible/future/out-of-window return date => `invalid`, never silently filtered), while the grouped
+settlements/traffic + no-date catalog are validated as plain objects. A wrong-window/cross-account/malformed
+fragment => `invalid` (LKG, zero writes); a missing/failed source => `unavailable` (LKG). Payload `accountId`
+uses authoritative public `context.accountId`; `context.rawSellerId` stays the SOLE source/fragment scope.
+`latestDataDate` = the window end (deterministic; never `Date.now()`).
+
+### 50.3 Generic planner (`report-planner.js`)
+
+`planReturnsLeakage` emits the raw Returns + grouped Settlements + grouped Sales & Traffic over `[asOf-59d,
+asOf]` plus the shared no-date catalog for the one raw seller id; the catalog canonical hash dedupes with
+Sales Movers + Buy Box + other insight catalogs. `returns-leakage` is added to the generic
+`SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch, driven by `buildShadowReportPlan` +
+`runStagedSourceCycle` (one create-export per `request_hash` per cycle; partial `maxJobs`/deferral runs
+leave the report PENDING + resumable).
+
+### 50.4 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). New `scripts/report-returns.test.js` **28 cases** (wired
+into `test:report-derivation`): production-route fixture deep-equal; reason classification + stable
+descending ordering; FBA/FBM/pending + raw `returnRecordCount`; currency|ASIN isolation; ORDER vs REFUND;
+zero-clamped return fee; catalog/traffic name precedence + catalog-only brand; no-return/no-refund exclusion
++ money-only/traffic-only inclusion; FBM-only figures; exact 60-day window + cross-account fail-closed;
+malformed/impossible/future/out-of-window RETURN row dates => invalid; missing/failed source => unavailable +
+LKG; public/raw identity; zero-network derive; idempotency; default+explicit planning include
+`returns-leakage`; exactly four canonical jobs with exact windows/deps/owner/context; shared catalog hash
+matches Buy Box + Sales Movers while returns/settlements/traffic stay distinct; one export per shared catalog
+hash across two owners; Returns reconciliation never stales another owner; strict-cap TRUNCATED => no source
+save => report never derives; report PENDING-then-saved-once + zero network in derive + idempotent; maxJobs +
+poll-deferral resume with one create per hash; primary-only stale dd-secondary skipped read-only.
+`npm run test:report-derivation` **314** (66+30+33+20+34+24+12+27+40+**28**, was 286); `npm run verify` =
+exit 0 + `build:check` (2,394 modules) = **713 assertions** (was 685); `git diff --check` clean; only the
+intended files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled;
+migration still unapplied; Returns remains SHADOW ONLY + locked.
