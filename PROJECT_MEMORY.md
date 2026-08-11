@@ -5452,3 +5452,18 @@ point, typed blocked/unavailable/invalid outcomes, strict caps, account/bucket/o
 hashes, and catalog token-saving state table. Keep shadow mode and every control locked. Do not start
 another adapter, push, merge, deploy, migrate, enable schedules, modify frontend/Scheduler v1, or touch
 untracked `HANDOFF.md` until these two shared-cycle/checkpoint blockers are green.
+
+### Production configuration decision: primary DataDoe only (owner, 2026-08-11)
+
+The owner is removing `DATADOE_API_KEY_SECONDARY` from Vercel and will continue with the original
+primary DataDoe organization only. Keep the secondary organization support and `dd-secondary:`
+namespacing code dormant rather than deleting it: historical secondary snapshots/audit rows remain
+readable, and retaining the fail-closed boundary prevents accidental secondary-to-primary routing.
+`getDataDoeConnections()` already omits the secondary connection when the environment variable is
+absent, so no new secondary DataDoe request should be made. Before production orchestration/cutover,
+filter the account directory against configured connection ids: stale `dd-secondary:` accounts must
+be classified `CONNECTION_UNAVAILABLE`, excluded before source/report planning, and surfaced read-only
+in admin status without failing the primary cycle. Never strip the prefix, never retry them using the
+primary key, never delete their saved snapshots, and never spend a DataDoe token for them. Add a
+primary-only test (no secondary env/connection) proving primary accounts sync normally while a stale
+secondary directory row produces zero source jobs, zero DataDoe calls, and one safe admin status.
