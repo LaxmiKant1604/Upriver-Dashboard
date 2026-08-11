@@ -249,7 +249,7 @@ export async function runStagedSourceCycle({
   let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
 
   const rollup = {
-    cycleId, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0,
+    cycleId, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0,
     deadlineReached: false, drained: false, signals,
   };
   const seenHashes = new Set();
@@ -286,6 +286,7 @@ export async function runStagedSourceCycle({
     rollup.succeeded += res.succeeded;
     rollup.failed += res.failed;
     rollup.skipped += res.skipped;
+    rollup.deferred += res.deferred || 0;
     rollup.counts = res.counts;
 
     const before = JSON.stringify(signals);
@@ -293,11 +294,23 @@ export async function runStagedSourceCycle({
     rollup.signals = signals;
 
     if (res.deadlineReached) { rollup.deadlineReached = true; rollup.drained = false; break; }
+    // Blocker 1: a resumable poll/download deferral adds NO dependency signal, so on a later round the same
+    // hashes are already `allSeen` and signals are unchanged -- which would falsely look like a fixpoint even
+    // though the plan is NOT complete (a source is mid-fetch and `res.drained` is false). Stop immediately on
+    // ANY deferral (as Keyword Rank does), leave drained=false, and NEVER reconcile: a fresh invocation
+    // resumes the export from its persisted export_id, and reconciliation waits for a genuine fixpoint.
+    if ((res.deferred || 0) > 0) { rollup.drained = false; break; }
 
     const planHashes = plannedJobs.map((j) => j.requestHash);
     const allSeen = planHashes.every((h) => seenHashes.has(h));
     planHashes.forEach((h) => seenHashes.add(h));
-    if (allSeen && JSON.stringify(signals) === before) { rollup.drained = res.drained; fixpointReached = true; break; }
+    if (allSeen && JSON.stringify(signals) === before) {
+      // A VALID fixpoint additionally requires a genuinely DRAINED (and, by the guards above, non-deadline,
+      // non-deferred) result -- otherwise the plan is stable but unfinished and must NOT be reconciled.
+      rollup.drained = res.drained;
+      fixpointReached = res.drained === true;
+      break;
+    }
     rollup.drained = res.drained;
   }
   // Reconcile ONLY when the plan fully resolved (fixpoint reached): the accumulated planned membership

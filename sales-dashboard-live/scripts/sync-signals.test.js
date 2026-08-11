@@ -348,6 +348,72 @@ test("Listing Optimizer catalog waits for a validated SQP success", async () => 
   assert.ok(set2.has("sqp-weekly") && set2.has("product-catalog"));
 });
 
+group("generic staged driver: a resumable deferral is NOT a fixpoint (never staled)");
+
+// The optimizer catalog membership (downstream owner), seeded active as a prior full run left it. Its
+// owner is the SAME listing-optimizer/A1/primary owner as the sqp-weekly probe.
+async function seedOptimizerWithActiveCatalog() {
+  const store = makeMemoryStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-07" });
+  const withCat = (await optResolvePlan({ "listing-optimizer:sqp-weekly": { status: "success", validated: true } })).sourceJobs;
+  const catalog = withCat.find((j) => j.requestKey === "listing-optimizer:catalog");
+  // Seed the catalog canonical row (succeeded) + its ACTIVE owner membership.
+  store.upsertSourceJob({ cycleId: cid, bucket: "us", ...catalog });
+  store._rawJob(cid, catalog.requestHash).fetch_status = "succeeded";
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: catalog.requestHash, ownerId: catalog.owner.ownerId, requestKey: catalog.owner.requestKey, reportKey: catalog.owner.reportKey, accountId: catalog.owner.accountId, connectionId: catalog.connectionId, organizationFingerprint: catalog.organizationFingerprint, accountScopeHash: catalog.accountScopeHash }]);
+  return { store, cid, catalog, ownerId: catalog.owner.ownerId };
+}
+const deferProbe = (stage) => (job, s) => ((job.requestKey ?? job.request_key) === "listing-optimizer:sqp-weekly" && s === stage ? { throw: deadlineError() } : { rows: [{ ok: 1 }] });
+const catalogStatus = (store, cid, ownerId, hash) => store._owners(cid).find((m) => m.owner_id === ownerId && m.request_hash === hash).owner_status;
+
+for (const stage of ["poll", "download"]) {
+  test(`a probe ${stage} deferral stops the invocation, does NOT reconcile, and never stales the active downstream membership`, async () => {
+    const { store, cid, catalog, ownerId } = await seedOptimizerWithActiveCatalog();
+    const r = await runStagedSourceCycle(runOpts({ store, dataDoe: makeDataDoe(deferProbe(stage)), resolvePlan: optResolvePlan }));
+    assert.ok(r.deferred >= 1, "the probe deferral is surfaced on the rollup");
+    assert.equal(r.drained, false, "a deferred invocation is not drained");
+    assert.equal(catalogStatus(store, cid, ownerId, catalog.requestHash), "active", `catalog membership is NOT staled after a ${stage} deferral`);
+    // The probe made exactly one create-export (attempted, resumable), never a second one.
+    const probeHash = store.listSourceJobs(cid).find((j) => j.source_key === "sqp-weekly").request_hash;
+    assert.ok(store.listSourceJobs(cid).find((j) => j.request_hash === probeHash).fetch_status === "attempted", "probe left attempted (resumable)");
+  });
+}
+
+test("after a poll deferral, a fresh invocation resumes with one create-export total, reaches a real fixpoint, and reconciles normally", async () => {
+  const { store, cid, catalog, ownerId } = await seedOptimizerWithActiveCatalog();
+  // Invocation 1: probe defers during poll -> stop, no reconcile.
+  const ddDefer = makeDataDoe(deferProbe("poll"));
+  const r1 = await runStagedSourceCycle(runOpts({ store, dataDoe: ddDefer, resolvePlan: optResolvePlan }));
+  assert.ok(r1.deferred >= 1 && r1.drained === false);
+  const probeHash = store.listSourceJobs(cid).find((j) => j.source_key === "sqp-weekly").request_hash;
+  assert.equal(ddDefer.createCount(probeHash), 1, "probe created exactly once in invocation 1");
+  assert.equal(catalogStatus(store, cid, ownerId, catalog.requestHash), "active", "catalog stays active across the deferral");
+  // Invocation 2 (fresh dataDoe): resume the probe (no second create), activate + stage catalog, reach a real
+  // drained fixpoint -> normal reconciliation (catalog still required -> stays active).
+  const ddOk = makeDataDoe(() => ({ rows: [{ ok: 1 }] }));
+  const r2 = await runStagedSourceCycle(runOpts({ store, dataDoe: ddOk, resolvePlan: optResolvePlan }));
+  assert.equal(ddOk.createCount(probeHash), 0, "resume made ZERO second create-export for the probe");
+  assert.equal(r2.deferred, 0);
+  assert.equal(r2.drained, true, "invocation 2 reaches a genuine drained fixpoint");
+  assert.equal(catalogStatus(store, cid, ownerId, catalog.requestHash), "active", "catalog membership stays active after the real fixpoint reconcile");
+  // Total across both invocations: each canonical hash exported at most once.
+  for (const j of store.listSourceJobs(cid)) {
+    const c = ddDefer.createCount(j.request_hash) + ddOk.createCount(j.request_hash);
+    assert.ok(c <= 1, j.source_key + " exported at most once across the resume");
+  }
+});
+
+test("an unrelated owner sharing a canonical hash stays active through a deferred generic invocation", async () => {
+  const { store, cid, catalog, ownerId } = await seedOptimizerWithActiveCatalog();
+  // A second, unrelated owner (a different report) also depends on the same catalog canonical hash.
+  const otherOwner = "other-report-owner";
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: catalog.requestHash, ownerId: otherOwner, requestKey: "brand-sales:catalog", reportKey: "brand-sales", accountId: "A1", connectionId: "primary", organizationFingerprint: "ofp", accountScopeHash: "ash" }]);
+  await runStagedSourceCycle(runOpts({ store, dataDoe: makeDataDoe(deferProbe("poll")), resolvePlan: optResolvePlan }));
+  assert.equal(catalogStatus(store, cid, ownerId, catalog.requestHash), "active", "the optimizer owner stays active");
+  assert.equal(catalogStatus(store, cid, otherOwner, catalog.requestHash), "active", "the unrelated owner is untouched");
+  assert.equal(store._rawJob(cid, catalog.requestHash).fetch_status, "succeeded", "the shared canonical row is preserved");
+});
+
 test("Keyword monthly fallback follows the distinct-period policy; PPC total-sales respects Ads currency", async () => {
   const kwResolve = (signals) => {
     const win = { "keyword-rank:sqp-weekly": [{ from: "2025-07-01", to: "2025-08-06" }], "keyword-rank:catalog": [{ from: "2025-07-01", to: "2025-08-06" }] };
