@@ -191,6 +191,81 @@ test("the staged cycle makes ZERO DataDoe calls beyond the staged submit-set (no
   assert.equal(dd.totalCreates(), 2, "A (weekly >= 4): exactly weekly + catalog");
 });
 
+/* ============================= per-invocation bounds (cumulative maxJobs / deadline) ============================= */
+
+group("keyword-rank cycle: per-invocation bounds are cumulative across rounds");
+
+// A DataDoe double whose weekly poll defers ONCE at the execution deadline (resumable), then succeeds.
+const deadlineError = () => Object.assign(new Error("deferred at the execution deadline"), { code: "DATADOE_DEADLINE" });
+function makeResumableDataDoe(rowsFn) {
+  const create = {};
+  let polls = 0;
+  return {
+    createCount: (h) => create[h] || 0,
+    totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    pollCalls: () => polls,
+    async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; },
+    async poll(job) { polls += 1; if (polls === 1 && job.requestKey === "keyword-rank:sqp-weekly") throw deadlineError(); },
+    async download(job) { return rowsFn(job).rows; },
+  };
+}
+
+test("maxJobs:1 processes AT MOST one source job across ALL rounds (budget is cumulative, not per-round)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Two accounts => two weekly jobs are available in round 0; a cumulative maxJobs:1 must stop after one.
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  assert.equal(r.processed, 1, "exactly one job processed across all rounds");
+  assert.equal(dd.totalCreates(), 1, "no monthly/catalog export is created once the budget is spent");
+});
+
+test("a deadline DEFERRAL during the weekly poll prevents monthly/catalog work and is resumable next invocation", async () => {
+  const store = makeStore();
+  const dd = makeResumableDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }];
+  // Invocation 1: create weekly, persist export_id, then the weekly poll defers -> stop before catalog.
+  const r1 = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(r1.deferred, 1, "the weekly poll deferred (resumable)");
+  assert.equal(r1.failed, 0, "a deadline defer is NOT a failure");
+  assert.equal(dd.totalCreates(), 1, "only the weekly export was created; NO catalog/monthly after the deadline");
+  const weeklyHash = r1.perAccount[0].weeklyHash;
+  assert.equal(store._rawJob(r1.cycleId, weeklyHash).fetch_status, "attempted", "weekly stays attempted (resumable), export_id kept");
+  // Invocation 2: a fresh call resumes the weekly export (no second create), then stages catalog.
+  const r2 = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(dd.createCount(weeklyHash), 1, "the resumed weekly export is NOT created a second time");
+  assert.equal(store._rawJob(r2.cycleId, weeklyHash).fetch_status, "succeeded", "weekly succeeds on resume");
+  const keys = jobsByAccount(store, r2.cycleId).primary.map((x) => x.key).sort();
+  assert.deepEqual(keys, ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "catalog is staged only AFTER the resumed weekly succeeds");
+  assert.equal(dd.totalCreates(), 2, "exactly weekly (inv1) + catalog (inv2); no duplicate POST");
+});
+
+/* ============================= schedule-bucket isolation ============================= */
+
+group("keyword-rank cycle: one cycle never mixes US and non-US schedules");
+
+test("a mixed US/non-US account set is rejected BEFORE opening a cycle or calling DataDoe (zero DataDoe calls)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":C1", country: "CA", currency: "CAD" }];
+  await assert.rejects(
+    runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" }),
+    /does not match account|refuse to mix schedule buckets/,
+  );
+  assert.equal(dd.totalCreates(), 0, "a mixed-bucket input causes ZERO DataDoe calls");
+});
+
+test("an account whose bucket differs from the supplied cycle bucket is rejected (never recorded in the wrong bucket)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // A US account under a non-US cycle bucket must be rejected too (never recorded in a non-US cycle).
+  await assert.rejects(
+    runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "non-us", cycleDate: "2026-08-11" }),
+    /does not match account|refuse to mix schedule buckets/,
+  );
+  assert.equal(dd.totalCreates(), 0, "no DataDoe call for a bucket-mismatched account");
+});
+
 async function main() {
   mark("main(): loading keyword-rank cycle module");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));
