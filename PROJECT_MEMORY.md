@@ -5664,3 +5664,44 @@ section 45. Six small green commits.
   (22+17+6+8+4+12+1); test:report-derivation **213** (66+30+33+20+34+18+12); test:report-contracts 161
   (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run verify` = exit 0 + build
   (2,394 modules); `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: durable many-to-many ownership re-review (Codex, 2026-08-11)
+
+Reviewed `caf27d5`..`20bbef7` on `feature/scheduler-v2` from review commit `5984356`.
+The normalized `sync_source_job_owners` direction is correct: canonical source rows remain one-per-hash,
+different reports can own the same hash through separate memberships, `request_key` is no longer read from
+the canonical table, and the additive migration has not been applied. Independent verification is green:
+`test:sync-engine` 70, `test:report-derivation` 213, `test:report-contracts` 161,
+`test:source-identity` 7, and full `npm run verify` **603 assertions** plus the 2,394-module production
+build (exit 0). `git diff --check` is clean; only untracked `HANDOFF.md` remains.
+
+The tranche is **not approved** because two durable-owner lifecycle/integrity blockers remain:
+
+1. **Bounded invocations can falsely retire dependencies that are still required.** Both
+   `runStagedSourceCycle` and `runKeywordRankShadowCycle` build `plannedMembershipKeys` only from source
+   jobs actually submitted during this invocation, then call `reconcileStaleOwnerMemberships`
+   unconditionally. A later `maxJobs`, `maxRounds`, deadline, or deferred invocation can therefore stage
+   only the first round and mark previously discovered monthly/catalog memberships `stale`, even though
+   the final report plan still requires them. Existing partial-resume tests assert snapshots/export counts
+   but not owner status. Reconcile only against a complete authoritative final dependency set (for Keyword
+   Rank, the final resolved report sources), or skip reconciliation unless full plan resolution is proven.
+   Add regressions for maxJobs/maxRounds/deadline/deferral after prior staged memberships and prove every
+   still-required membership remains active while a genuinely removed dependency alone becomes stale.
+
+2. **`owner_id` is trusted instead of recomputed from the authoritative tuple.** `runSourceJobs` verifies
+   only that the supplied `job.owner.ownerId` appears in the caller-supplied `ownerIds`; it never checks that
+   it equals `sourceJobOwnerId(reportKey, connectionId, organizationFingerprint, accountScopeHash)`.
+   The Supabase owner wrapper also accepts that arbitrary id, while `report_key`/`account_id` may be blank,
+   and the membership schema does not persist `connection_id` even though it is part of owner identity.
+   A buggy caller can consequently place an account/org job under another declared owner before any DB or
+   DataDoe boundary notices. Recompute and compare before every source/owner upsert, require complete owner
+   metadata, persist/validate `connection_id` (additively; migration is unapplied), and add production-wrapper
+   plus worker tests proving wrong report/account/org/connection owner identities fail before any write or
+   DataDoe call. Preserve request_hash exactly.
+
+Also add the missing positive concurrency proof: owner A creates an export and is interrupted during
+poll/download; owner B, with a different report/request_key membership for the same canonical hash, resumes
+the saved export id with **zero second create-export**. Keep SHADOW MODE, controls locked, primary-only live
+routing, one-attempt/cap/LKG behavior, and all previously approved staging semantics. Do not start another
+adapter, push, merge, deploy, apply a migration, enable schedules, modify Scheduler v1/frontend, or touch
+untracked `HANDOFF.md` during this correction pass.
