@@ -5947,6 +5947,37 @@ only). Sales Movers stays SHADOW ONLY + locked.
 build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/scheduled.
 
+## Scheduler v2: Buy Box Loss review blockers (Codex, 2026-08-11)
+
+Reviewed `0becd18`..`3e3b8aa` from approved base `4579f7d`. The pure Buy Box calculations,
+four-slice planner shape, public/raw account separation, strict source contracts, and shared
+catalog/inventory request identities are otherwise sound. Independent verification is green:
+direct Buy Box **27**, `test:report-derivation` **273**, `test:sync-engine` **79**,
+`test:report-contracts` **161**, `test:source-identity` **7**, and full `npm run verify`
+**672 assertions** plus the 2,394-module production build.
+
+**Not approved yet: two blockers.**
+
+1. **Source-row dates are not bound to their validated fragment windows.** The adapter validates
+   fragment metadata, then only calls `assertPlainObjectRows` for daily and inventory rows. A
+   deterministic synthetic check with canonical fragment metadata accepted a daily row dated
+   `2099-01-01` and an inventory row dated `2099-01-02`, derived successfully, and wrote those
+   dates into `observedWindow` / `inventorySnapshotDate`. Every daily row must carry a real calendar
+   date inside its own exact seven-day fragment window; every inventory row must carry a real date
+   inside `[asOf-10d, asOf]`. One malformed, impossible, future, out-of-window, or wrong-slice row
+   must produce typed `invalid`, zero snapshot writes, and preserve last-known-good.
+2. **The claimed generic-cycle tests bypass the real generic planner/driver.** The Buy Box suite does
+   not import or call `buildShadowReportPlan` or `runStagedSourceCycle`; its "generic-cycle" and E2E
+   cases construct jobs directly and call `runSourceJobs`. Add tests through the actual generic entry
+   point proving default/explicit planning, six canonical source jobs, owner-scoped coexistence and
+   reconciliation for shared inventory/catalog hashes, bounded/deferral resume with one create per
+   hash, and report pending-then-saved-once behavior. Include the primary-only stale-secondary
+   read-only path.
+
+Do not change the live route/builder, source contracts, request identity, Scheduler v1, frontend,
+report controls, migrations, or schedules unless a new executable mismatch proves it necessary.
+Buy Box remains SHADOW ONLY + locked pending correction and re-review.
+
 ## Scheduler v2: Buy Box Loss derivation + generic planning (SHADOW MODE, 2026-08-11)
 
 Third functional report family on Scheduler v2 (see SCHEDULER_V2.md §49), on `feature/scheduler-v2` from base
