@@ -5468,6 +5468,52 @@ primary key, never delete their saved snapshots, and never spend a DataDoe token
 primary-only test (no secondary env/connection) proving primary accounts sync normally while a stale
 secondary directory row produces zero source jobs, zero DataDoe calls, and one safe admin status.
 
+## Scheduler v2: shared-cycle ownership + partial/primary-only re-review (Codex, 2026-08-11)
+
+Reviewed `31b5dfb`..`5938f03` on `feature/scheduler-v2` from review commit `9041fc5`
+(including owner decision `db7c347`). The **partial-invocation fix is approved**: final Keyword plans
+now carry the complete cadence dependency set, so `maxJobs:1`, `maxRounds:1`, and poll/download
+deferrals remain fetch-pending, preserve LKG, resume without duplicate create-export, and save exactly
+once. The **primary-only behavior is approved**: configured primary accounts plan normally; stale
+`dd-secondary:` directory rows retain their prefix/snapshots, are returned read-only as
+`CONNECTION_UNAVAILABLE`, and create zero source/report jobs and zero DataDoe calls with no primary
+fallback. Full verification is green: sync-engine 58, report-derivation 207, report-contracts 161,
+source-identity 7, and `npm run verify` **585 assertions** plus the 2,394-module build (exit 0);
+`git diff --check` is clean and only untracked `HANDOFF.md` remains.
+
+The tranche is **not fully approved** because the shared-cycle ownership boundary still has two
+production blockers:
+
+1. **`request_key` is not an account-safe owner identity.** `runSourceJobs` builds `ownedKeys` from
+   request keys and treats every persisted row with a matching key as owned. All accounts for a report
+   share keys such as `keyword-rank:sqp-weekly`. A report/account-scoped manual run for account A can
+   therefore see account B's pending Keyword job in the same `(bucket, cycle_date)`, fail to find B's
+   hash in A's `metaByHash`, and mark B `MISSING_PLAN`. This conflicts directly with the existing admin
+   `accountIds` filter. Scope ownership by a durable tuple at least
+   `(request_key, organization_fingerprint, account_scope_hash)` (or an explicit persisted owner id),
+   not request key alone. That still lets an old-window hash for the same report/account fail as a
+   genuine orphan while leaving another account's same-key job untouched. Validate fail-closed that
+   every `plannedJobs` entry belongs to the declared ownership scope; an empty/mismatched scope must
+   never silently upsert a job and report drained.
+
+2. **The generic staged driver still owns the whole shared cycle.** `runStagedSourceCycle` calls
+   `runSourceJobs` without `ownedJobs`, so `owns()` is true for every row. Once generic and Keyword work
+   coexist in the single daily cycle, a pending Keyword row absent from the generic round plan can still
+   receive `MISSING_PLAN`. The new tests avoid this by making their test-only generic helper pass
+   `ownedJobs`, or by running generic before Keyword exists / after Keyword is already succeeded; they
+   do not exercise the actual generic driver against a simultaneously pending Keyword job. Make the
+   production generic staged path declare a typed owner scope too (or replace both paths with one
+   cumulative cycle orchestrator). Add an E2E test that pre-queues pending generic + pending Keyword
+   rows, then runs the real generic staged driver and the Keyword driver in both orders. Neither may
+   mutate the other's row; genuine same-owner stale hashes still fail closed; each canonical hash is
+   created at most once.
+
+Re-review constraints: do not change the approved partial-report lifecycle or primary-only behavior;
+preserve one-attempt, request hashes, strict caps, token-saving staging, typed outcomes, bucket/account/
+organization isolation, and LKG. Keep shadow mode and controls locked. Do not start another adapter,
+push, merge, deploy, migrate, enable schedules, modify frontend/Scheduler v1, or touch untracked
+`HANDOFF.md` until this exact owner-scope boundary is green.
+
 ## Scheduler v2: Keyword Rank shared-cycle blockers fixed + primary-only DataDoe (Claude, 2026-08-11)
 
 Fixed the two shared-cycle/checkpoint integration blockers from the Codex re-review (`9041fc5`) and added
