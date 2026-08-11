@@ -70,7 +70,13 @@ export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku
 // canonical entry point and MUST NOT flow through the eager generic builder (which would emit weekly +
 // an eager catalog with no account-scoped fallback orchestration). buildShadowReportPlan rejects it
 // fail-closed rather than silently planning or silently dropping a requested key.
-export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank", "sales-movers"]);
+export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank", "sales-movers", "ppc-performance"]);
+
+// PPC Performance lookback (days) -- byte-identical to ppc.js WINDOW_DAYS (30). The total-sales denominator
+// spans [asOf-29d, asOf]; the catalog is no-date. PPC is NEVER in the generic planner: it must not fetch the
+// catalog before the persisted Ads currency signal is validated (that would spend a DataDoe token on an
+// unvalidated/unseeded account), so it is planned ONLY by runPpcShadowCycle via planPpcPerformance below.
+const PPC_WINDOW_DAYS = 30;
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
@@ -344,6 +350,49 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
     sources: decorateSources(sources, { reportKey: "sales-movers", connectionId: scope.connectionId, bucket: scope.bucket }),
     context: { to: end, rawSellerId: scope.rawSellerId },
   };
+}
+
+/**
+ * Plan PPC Performance for ONE account. PPC creates ZERO DataDoe Ads exports -- every advertising figure is
+ * DERIVED from persisted Supabase Ads history. Its only owned DataDoe requests are the shared no-date catalog
+ * and the OPTIONAL total-sales TACoS denominator ([asOf-29d, asOf]). Planning is driven ENTIRELY by the
+ * validated Ads-currency signal so no DataDoe token is spent before the persisted Ads context is validated:
+ *   - Ads read failed / unvalidated / unseeded  -> plan NOTHING (zero tokens; report stays last-known-good);
+ *   - validated Ads with <= 1 currency          -> plan total-sales + catalog (gate includes total-sales);
+ *   - validated Ads with  > 1 currency          -> plan catalog only (gate skips total-sales; TACoS unavailable).
+ * The ads-currency gate lives in the shared resolver (reportSourceRequestHashes); request_hash + primary/
+ * dd-secondary isolation come from there. The shared catalog identity dedupes with Sales Movers/Buy Box/
+ * Returns/Listing Health. This is staged by runPpcShadowCycle, NEVER the generic planner.
+ */
+export function planPpcPerformance({ accountId, country, currency, connections, asOf, adsCurrencySignal = null }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const from = addDaysStr(end, -(PPC_WINDOW_DAYS - 1));
+  const sig = adsCurrencySignal;
+  const adsValidated = !!sig && sig.status === "success" && sig.validated === true;
+  const base = {
+    reportKey: "ppc-performance",
+    reportVersion: REPORT_DERIVATIONS["ppc-performance"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+  // Ads read failed/unvalidated => plan NO DataDoe source (spend zero tokens; the catalog is never fetched
+  // before the Ads context is validated). The report then stays last-known-good via the derive gate.
+  if (!adsValidated) return { ...base, sources: [] };
+  const windowsByRequestKey = {
+    "ppc-performance:total-sales": [{ from, to: end }],
+    "ppc-performance:catalog": [{ from: null, to: null }],
+  };
+  // The resolver's ads-currency gate INCLUDES total-sales only when currencyCount <= 1 (the multi-currency
+  // account plans catalog only); the catalog is unconditional. request_hash isolation comes from the resolver.
+  const sources = reportSourceRequestHashes({
+    reportKey: "ppc-performance", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+    dependencySignals: { "ppc-performance:ads-currency": sig },
+  });
+  return { ...base, sources: decorateSources(sources, { reportKey: "ppc-performance", connectionId: scope.connectionId, bucket: scope.bucket }) };
 }
 
 /**
