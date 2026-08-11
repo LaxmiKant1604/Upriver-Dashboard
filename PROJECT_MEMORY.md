@@ -6330,3 +6330,50 @@ route-parity core or claim the currency-set assertion proves monetary isolation.
 Do not start PPC/Listing Optimizer, alter request identity/contracts, change the live route,
 unlock controls, schedule, migrate, push, merge, or deploy. Keep Listing Health SHADOW ONLY
 and locked pending correction and re-review. Leave untracked `HANDOFF.md` untouched.
+
+## Scheduler v2: Listing Health review blockers fixed (2026-08-12)
+
+Resolves the two blockers above (see SCHEDULER_V2.md §51.6), on `feature/scheduler-v2` from review base
+`114fd4c`. Three small commits, five files.
+
+**B1 -- a static policy is not failure evidence** (`report-worker.js` + tests). `assembleSources` marked a
+failed fragment `disabled` whenever the planned source had a policy, so EXPORT_ERROR/HTTP_500/TIMEOUT/
+TRUNCATED/cache-persist failures of optional `listing-health:listings-raw` were misreported as
+SOURCE_DISABLED and degraded. Fix: thread the canonical `sync_source_jobs` SAFE `error_code` (already in
+`SOURCE_JOB_COLUMNS`) into assembly -- `runReportJobs` builds `errorByHash` beside `statusByHash` and passes
+it through `runOneReport` to `assembleSources`. A fragment is `disabled` ONLY when `fetch_status==='failed'`
+AND `error_code==='SOURCE_DISABLED'` AND the planned policy is present; policy presence alone is never
+evidence, no message/HTTP text is parsed; every other failed/pending/missing/malformed optional outcome
+stays non-disabled => typed unavailable (LKG preserved). Required-source behavior unchanged. Keyword Rank's
+terminal-disabled worker test now seeds the durable SOURCE_DISABLED error_code (34, unchanged).
+
+**B2 -- cross-currency SKU money merge** (`derivation-core.js` + `report-derivation.js`). `listingHealthSalesFold`
+groups saved sales by SKU only, so one SKU with USD 100 + CAD 200 folded into one USD row (sales30d:300). Fix:
+a pure fail-closed guard `assertListingHealthCurrencyIsolation(listingRows, salesRows)` runs in the derive
+BEFORE `listingHealthPayload`/`Fold` and throws typed invalid (zero writes, LKG) when a normalized nonblank
+SKU carries more than one sales currency identity (blank/unknown "?" is its OWN identity, never absorbed) or
+when a nonblank `listing_price_currency` conflicts with the SKU's single sales currency identity (named-vs-
+unknown too). The route-parity core (`api/datadoe.js`, `listing-health.js`, `listingHealthSalesFold`/`Payload`)
+is byte-unchanged; canonical one-currency-per-SKU input stays byte-for-byte payload compatible; different
+SKUs may still carry different currencies.
+
+**Tests** (`report-listing-health.test.js` now **37 cases**, +6): B1 real-worker matrix (durable error_code ->
+assembled fragment state -> report outcome -> zero writes -> prior-snapshot survival) across SOURCE_DISABLED,
+every non-disabled failure code, and empty success; B2 same-SKU USD+CAD / unknown+USD / listing-vs-sales
+mismatch => invalid, matching-currency parity deep-equal, separate-SKU isolation, worker-level mixed-currency
+=> zero writes + LKG.
+
+**Scope guarantees.** Only `report-worker.js`, `derivation-core.js`, `report-derivation.js`,
+`report-keyword-rank.test.js`, `report-listing-health.test.js` changed. `request_hash` / source identity
+untouched (`test:source-identity` **7**, golden hash unchanged). Live route, `listing-health.js` builder,
+source contracts, planner windows, owner reconciliation, Scheduler v1, frontend, migrations, controls,
+schedules untouched. Listing Health stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on every changed file (0); `test:report-derivation`
+**358** (66+30+33+20+34+24+12+27+40+35+37, was 352); `test:sync-engine` **79**; `test:report-contracts`
+**161**; `test:source-identity` **7**; full `npm run verify` **757 assertions** (was 751) + 2,394-module
+production build (exit 0); `git diff --check` clean; only the five intended files changed (+ untracked
+`HANDOFF.md`). Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled. (Note: on this platform
+npm child-process writeSync output is not captured by shell redirection, so the report-derivation block is
+absent from a redirected verify log; it runs + passes at exit 0 and its per-file totals were summed by
+direct `node scripts/*.test.js` invocation.)

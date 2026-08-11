@@ -3066,3 +3066,52 @@ snapshot; maxJobs + poll-deferral resume with one create per hash; primary-only 
 exit 0 + `build:check` (2,394 modules) = **751 assertions** (was 720); `git diff --check` clean; only the
 intended files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled;
 migration still unapplied; Listing Health remains SHADOW ONLY + locked.
+
+### 51.6 Review blocker fixes -- durable disable-evidence + cross-currency isolation (2026-08-12)
+
+**B1 -- a static policy is not failure evidence.** `assembleSources` marked a failed fragment `disabled`
+whenever the planned source merely had a policy (`jobStatus === "failed" && !!s.disabledPolicy`), so an
+`EXPORT_ERROR` / `HTTP_500` / `TIMEOUT` / `TRUNCATED` / cache-persist failure of the optional
+`listing-health:listings-raw` was misreported as `SOURCE_DISABLED` and derived a degraded
+`issuesAvailable:false` snapshot from a generic failure. Fix (`report-worker.js`): the canonical
+`sync_source_jobs` SAFE `error_code` (already in `SOURCE_JOB_COLUMNS`) is threaded into report assembly --
+`runReportJobs` builds `errorByHash` beside `statusByHash` and passes it through `runOneReport` to
+`assembleSources`. A fragment is `disabled` ONLY when `fetch_status==='failed'` AND
+`error_code==='SOURCE_DISABLED'` AND the planned policy is present; policy presence alone is never evidence,
+no message/HTTP text is parsed, and every other failed/pending/missing/malformed optional outcome stays
+non-disabled => typed `unavailable` (LKG preserved). Required-source behavior unchanged. Real-worker B1
+outcome table (optional Listings Raw, four required sources succeeded, prior LKG present):
+
+| durable listings-raw state | assembled.disabled | report outcome | snapshot |
+| --- | --- | --- | --- |
+| failed, error_code `SOURCE_DISABLED` | true | derived (degraded) | saved, `issuesAvailable:false` + enable hint |
+| failed, `EXPORT_ERROR`/`HTTP_500`/`TIMEOUT`/`TRUNCATED`/`CACHE_CONFLICT`/`SAVE_FAILED`/`MALFORMED_PAYLOAD` | false | unavailable | none (prior LKG preserved) |
+| pending / missing | false | unavailable | none (prior LKG preserved) |
+| succeeded (incl. empty rows) | available:true | derived | saved, `issuesAvailable:true` |
+
+**B2 -- cross-currency SKU money merge.** `listingHealthSalesFold` groups saved sales by SKU only, so one
+SKU with USD 100 + CAD 200 folded into a single USD row (`sales30d:300`). Fix: a pure fail-closed guard
+`assertListingHealthCurrencyIsolation(listingRows, salesRows)` (derivation-core.js) runs in the derive BEFORE
+`listingHealthPayload`/`Fold`; the route-parity core (`api/datadoe.js`, `listing-health.js`,
+`listingHealthSalesFold`/`Payload`) is byte-unchanged. B2 currency state table:
+
+| per-SKU input | outcome |
+| --- | --- |
+| one currency identity (named or all-unknown) | allowed |
+| more than one sales identity (USD+CAD, or unknown+USD -- blank/unknown is its OWN identity) | typed `invalid` (LKG) |
+| nonblank listing currency == the single sales identity | allowed |
+| nonblank listing currency != sales identity, OR named listing currency vs unknown sales | typed `invalid` (LKG) |
+| DIFFERENT SKUs each single-currency (e.g. SKU-A USD, SKU-B CAD) | allowed, kept as separate rows |
+
+Regression tests (`report-listing-health.test.js` now **37 cases**, +6): B1 real-worker matrix (durable
+error_code -> assembled fragment state -> report outcome -> zero writes -> prior-snapshot survival) for
+`SOURCE_DISABLED` + every non-disabled code + empty success; B2 same-SKU USD+CAD, unknown+USD, listing/sales
+mismatch + named-vs-unknown => invalid, matching-currency parity deep-equal, separate-SKU isolation, and a
+worker-level mixed-currency => zero writes + LKG. Keyword Rank's terminal-disabled worker test now seeds the
+durable `SOURCE_DISABLED` error_code (34, unchanged). `node --check` (0); `test:report-derivation` **358**
+(66+30+33+20+34+24+12+27+40+35+**37**, was 352); `test:sync-engine` **79**, `test:report-contracts` **161**,
+`test:source-identity` **7** (golden `request_hash` unchanged); full `npm run verify` **757 assertions** (was
+751) + 2,394-module build (exit 0); `git diff --check` clean; only `report-worker.js`, `derivation-core.js`,
+`report-derivation.js`, `report-keyword-rank.test.js`, `report-listing-health.test.js` changed (+ untracked
+`HANDOFF.md`). Live route/builder/contracts/request identity/planner windows/owner reconciliation/Scheduler
+v1/frontend/migrations/controls/schedules untouched; Listing Health remains SHADOW ONLY + locked.
