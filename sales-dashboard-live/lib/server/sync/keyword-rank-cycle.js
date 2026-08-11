@@ -181,6 +181,9 @@ export async function runKeywordRankShadowCycle({
     if (res.deadlineReached) { rollup.deadlineReached = true; rollup.drained = false; break; }
     if ((res.deferred || 0) > 0) { rollup.drained = false; break; }
   }
+  // Reconstruct each account's persisted weekly/monthly state ONE FINAL time BEFORE reading telemetry, so
+  // rollup.perAccount is fresh even after a one-round (or deadline-truncated) invocation -- never stale.
+  if (cycleId) await reconstruct(cycleId);
   rollup.perAccount = state.map((st) => ({
     accountId: st.account.accountId,
     connectionId: st.account.accountId.startsWith("dd-secondary:") ? "dd-secondary" : "primary",
@@ -190,36 +193,31 @@ export async function runKeywordRankShadowCycle({
     monthlySignal: st.monthlySignal,
   }));
 
-  // Blocker 4 -- reconstruct each account's persisted weekly/monthly state ONE FINAL time and return
-  // the canonical per-account report requests (plannedReports) for runReportJobs. Each report depends
-  // ONLY on the sources actually STAGED this cycle (matched by canonical request hash to the persisted
-  // jobs), so the final depends_on is exact: a successful weekly account depends on weekly + catalog; a
-  // successful fallback account on weekly + monthly + catalog. The catalog token is NEVER fabricated --
-  // a failed/disabled weekly or a failed required monthly staged no catalog, so the report neither
-  // lists nor waits forever on it and instead resolves to an honest blocked state via the fetch gate.
-  // Every staged source is REQUIRED (weekly always; catalog once the cadence resolved; monthly when
-  // weekly < 4, where it is genuinely required), so a failed staged dependency blocks honestly.
-  if (cycleId) await reconstruct(cycleId); // reconstruct persisted weekly/monthly state one final time
-  rollup.plannedReports = await buildFinalReports({ state, cycleId, store, connections, bucket });
+  // Blocker 2 -- return the COMPLETE canonical report request per account (never filtered to
+  // already-staged hashes). buildFinalReports lists EVERY source required for the account's currently
+  // resolved cadence; a required dependency that has not yet been staged simply has no succeeded source
+  // job, so the report FETCH GATE keeps the report PENDING (no derive, no failure, no snapshot) until a
+  // later invocation stages + succeeds it -- then the SAME cycle derives and saves exactly once. Failed/
+  // terminal weekly (or a failed required monthly) still yields the approved honest blocked outcome via
+  // the gate. This prevents a checkpointed partial invocation (maxJobs/maxRounds/deadline) from exposing
+  // a runnable-but-incomplete Keyword report that would derive-fail and freeze last-known-good.
+  rollup.plannedReports = buildFinalReports({ state, connections, bucket });
   return rollup;
 }
 
-// Reconstruct each account's final typed signals from persisted state, then return the canonical
-// keyword-rank report request per account whose `sources` are EXACTLY the ones staged this cycle
-// (filtered by persisted request hash), each marked required, with the connection normalized to the
-// driver id. Pure aside from the injected store reads; makes no DataDoe call.
-async function buildFinalReports({ state, cycleId, store, connections, bucket }) {
-  if (!cycleId) return [];
-  const jobs = await store.listSourceJobs(cycleId);
-  const persisted = new Set(jobs.map((j) => j.request_hash ?? j.requestHash));
+// Return the canonical keyword-rank report request per account for the account's currently resolved
+// cadence: weekly + catalog always; + monthly when the weekly signal is a validated < 4 (fallback). Each
+// source is REQUIRED and listed regardless of whether it has been staged yet, so the report fetch gate is
+// pending until every required dependency has a succeeded job. Pure; no I/O, no DataDoe call.
+function buildFinalReports({ state, connections, bucket }) {
   return state.map((st) => {
     const plan = planKeywordRank({
       accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
       connections, asOf: st.asOf, weeklySignal: st.weeklySignal,
     });
-    const sources = plan.sources
-      .filter((s) => persisted.has(s.requestHash))
-      .map((s) => ({ ...s, optional: false }));
+    // planKeywordRank already emits exactly the required set for the resolved cadence (weekly + catalog,
+    // plus monthly iff the weekly signal makes the fallback apply), so no staged/persisted filtering.
+    const sources = plan.sources.map((s) => ({ ...s, optional: false }));
     return {
       reportKey: "keyword-rank",
       reportVersion: plan.reportVersion,

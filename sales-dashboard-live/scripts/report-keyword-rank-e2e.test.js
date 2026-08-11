@@ -210,15 +210,166 @@ test("a FAILED weekly cadence path is BLOCKED (never waits on an unscheduled cat
   const cycle = await runCycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: "C1", country: "US", currency: "USD" }]);
 
   const C = findReport(cycle.plannedReports, "C1");
-  assert.deepEqual(keysOf(C), ["keyword-rank:sqp-weekly"], "C staged ONLY the weekly (no catalog fabricated)");
-  assert.ok(!C.sources.some((s) => s.requestKey === "keyword-rank:catalog"), "the report never lists an unscheduled catalog dependency");
+  // C lists the full canonical required set (weekly + catalog); the FAILED weekly blocks the report at
+  // the fetch gate (a required dependency failed), so catalog is never fetched -- blocked is terminal, so
+  // the report never waits on the unscheduled catalog. Monthly is NOT required (weekly did not resolve < 4).
+  assert.deepEqual(keysOf(C), ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "C lists the full required set (weekly + catalog)");
+  assert.ok(!C.sources.some((s) => s.requestKey === "keyword-rank:sqp-monthly"), "no monthly required (weekly never resolved < 4)");
 
   const { res, saved } = await deriveReports(store, cycle.cycleId, cycle.plannedReports);
-  assert.equal(res.blocked, 1, "the failed-weekly account is blocked");
+  assert.equal(res.blocked, 1, "the failed-weekly account is blocked (required weekly failed)");
   assert.equal(res.succeeded, 1, "the healthy account (A1) still derives");
   assert.ok(!saved.some((s) => s.accountId === "C1"), "no snapshot written for the blocked account");
   assert.equal(store.report("keyword-rank", "C1").fetch_status, "blocked", "C1 report is terminally blocked this cycle");
   assert.deepEqual(store._snapshots.get(SHADOW_KW + "|C1").payload, LKG, "last-known-good preserved for C1");
+});
+
+/* ===================== partial invocations keep incomplete reports PENDING (Blocker 2) ===================== */
+
+group("keyword-rank e2e: checkpointed/partial invocation -> report stays pending -> resume -> derive once");
+
+const bounded = (store, dd, accounts, opts) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", ...opts });
+const deadlineErr = () => Object.assign(new Error("deferred at the execution deadline"), { code: "DATADOE_DEADLINE" });
+// Source double that defers (throws) the FIRST poll or download for a given request key, then succeeds.
+function makeDeferDataDoe(rowsFn, { stage, key }) {
+  const create = {}; let hits = 0;
+  return {
+    createCount: (h) => create[h] || 0,
+    totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; },
+    async poll(job) { if (stage === "poll" && job.requestKey === key) { hits += 1; if (hits === 1) throw deadlineErr(); } },
+    async download(job) { if (stage === "download" && job.requestKey === key) { hits += 1; if (hits === 1) throw deadlineErr(); } return rowsFn(job).rows; },
+  };
+}
+const reportStatus = (store, acct) => { const j = store.report("keyword-rank", acct); return j ? { fetch: j.fetch_status, derive: j.derive_status, save: j.save_status } : null; };
+const savedFor = (calls, acct) => calls.reduce((n, c) => n + c.saved.filter((s) => s.accountId === acct).length, 0);
+
+// Run a partial keyword invocation, derive (report must stay pending), resume unbounded, derive again
+// (report must derive+save exactly once). Returns evidence. `firstDD` may defer; `resumeOpts` bounds resume.
+async function partialThenResume({ account, first, resumeRounds = 3 }) {
+  const store = makeStore();
+  const dd = first.dd;
+  // LKG snapshot from a prior run; partial/pending states must NOT overwrite it.
+  const LKG = { cadence: "weekly", weeklyPeriodCount: 9, rows: [], products: [], catalogBrands: [], periods: ["2024-12-31"], accountId: account.accountId, retrievedAt: null };
+  store.seedSnapshot(SHADOW_KW, account.accountId, LKG);
+  const calls = [];
+
+  const c1 = await bounded(store, dd, [account], first.opts);
+  const d1 = await deriveReports(store, c1.cycleId, c1.plannedReports);
+  calls.push(d1);
+
+  const partial = {
+    pending: d1.res.pending, blocked: d1.res.blocked, failed: d1.res.failed,
+    status: reportStatus(store, account.accountId),
+    lkgIntact: JSON.stringify(store._snapshots.get(SHADOW_KW + "|" + account.accountId).payload) === JSON.stringify(LKG),
+    savedDuringPartial: savedFor(calls, account.accountId),
+  };
+
+  // Resume: a fresh invocation over the SAME cycle finishes the remaining source work, then derives.
+  const c2 = await bounded(store, dd, [account], { maxRounds: resumeRounds });
+  const d2 = await deriveReports(store, c2.cycleId, c2.plannedReports);
+  calls.push(d2);
+  // A redundant third derivation proves the snapshot is written exactly once (idempotent).
+  const d3 = await deriveReports(store, c2.cycleId, c2.plannedReports);
+  calls.push(d3);
+
+  const perHashCreates = c2.plannedReports[0].sources.map((s) => dd.createCount(s.requestHash));
+  return {
+    store, dd, cycleId: c2.cycleId, partial,
+    finalStatus: reportStatus(store, account.accountId),
+    savedTotal: savedFor(calls, account.accountId),
+    finalPayload: store._snapshots.get(SHADOW_KW + "|" + account.accountId).payload,
+    perHashCreates,
+  };
+}
+
+test("maxJobs:1 (weekly-high): weekly succeeds, catalog not staged -> report PENDING (no failure/snapshot), then resumes and derives exactly once", async () => {
+  const r = await partialThenResume({ account: { accountId: "A1", country: "US", currency: "USD" }, first: { dd: makeDataDoe(standardRows), opts: { maxJobs: 1 } } });
+  assert.equal(r.partial.pending, 1, "incomplete report is PENDING, not runnable");
+  assert.equal(r.partial.failed, 0, "no derive failure during the partial invocation");
+  assert.equal(r.partial.status.derive, "pending", "report never marked derive-failed while catalog is unstaged");
+  assert.equal(r.partial.savedDuringPartial, 0, "no snapshot written during the partial invocation");
+  assert.ok(r.partial.lkgIntact, "last-known-good preserved during the partial state");
+  assert.equal(r.finalStatus.derive, "succeeded", "resumes and derives after catalog is staged");
+  assert.equal(r.savedTotal, 1, "exactly one snapshot written across all invocations");
+  assert.equal(r.finalPayload.cadence, "weekly");
+  assert.ok(r.perHashCreates.every((n) => n <= 1), "each canonical hash created at most once (no duplicate export)");
+});
+
+test("maxRounds:1 (weekly-high): catalog round never runs -> report PENDING, then resume derives once", async () => {
+  const r = await partialThenResume({ account: { accountId: "A1", country: "US", currency: "USD" }, first: { dd: makeDataDoe(standardRows), opts: { maxRounds: 1 } } });
+  assert.equal(r.partial.pending, 1);
+  assert.equal(r.partial.savedDuringPartial, 0);
+  assert.ok(r.partial.lkgIntact);
+  assert.equal(r.finalStatus.derive, "succeeded");
+  assert.equal(r.savedTotal, 1);
+  assert.ok(r.perHashCreates.every((n) => n <= 1), "no duplicate export on resume");
+});
+
+test("deadline during the weekly POLL: weekly stays attempted -> report PENDING, resumes with NO duplicate create -> derives once", async () => {
+  const r = await partialThenResume({ account: { accountId: "A1", country: "US", currency: "USD" }, first: { dd: makeDeferDataDoe(standardRows, { stage: "poll", key: "keyword-rank:sqp-weekly" }), opts: {} } });
+  assert.equal(r.partial.pending, 1, "a resumable (attempted) weekly leaves the report PENDING, not blocked");
+  assert.equal(r.partial.failed, 0);
+  assert.equal(r.partial.savedDuringPartial, 0);
+  assert.ok(r.partial.lkgIntact);
+  assert.equal(r.finalStatus.derive, "succeeded");
+  assert.equal(r.savedTotal, 1);
+  assert.ok(r.perHashCreates.every((n) => n <= 1), "resume made no duplicate create-export POST");
+});
+
+test("deadline during the weekly DOWNLOAD: weekly stays attempted -> report PENDING, resumes with no duplicate create -> derives once", async () => {
+  const r = await partialThenResume({ account: { accountId: "A1", country: "US", currency: "USD" }, first: { dd: makeDeferDataDoe(standardRows, { stage: "download", key: "keyword-rank:sqp-weekly" }), opts: {} } });
+  assert.equal(r.partial.pending, 1);
+  assert.equal(r.partial.savedDuringPartial, 0);
+  assert.ok(r.partial.lkgIntact);
+  assert.equal(r.finalStatus.derive, "succeeded");
+  assert.equal(r.savedTotal, 1);
+  assert.ok(r.perHashCreates.every((n) => n <= 1));
+});
+
+test("weekly-low: report stays PENDING while monthly, then catalog, are staged across invocations; derives once at the end", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const account = { accountId: SECONDARY + ":B1", country: "US", currency: "USD" };
+  const LKG = { cadence: "monthly", weeklyPeriodCount: 1, rows: [], products: [], catalogBrands: [], periods: ["2024-11-30"], accountId: account.accountId, retrievedAt: null };
+  store.seedSnapshot(SHADOW_KW, account.accountId, LKG);
+  const calls = [];
+  const derive = async (c) => { const d = await deriveReports(store, c.cycleId, c.plannedReports); calls.push(d); return d; };
+
+  // Invocation 1: weekly only (maxJobs:1). Report requires weekly + monthly + catalog -> PENDING.
+  const c1 = await bounded(store, dd, [account], { maxJobs: 1 });
+  const d1 = await derive(c1);
+  assert.deepEqual(keysOf(c1.plannedReports[0]), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"], "weekly-low report lists the full fallback set up front");
+  assert.equal(d1.res.pending, 1, "pending: monthly + catalog not yet staged");
+
+  // Invocation 2: monthly staged (maxJobs:1). Catalog still missing -> still PENDING.
+  const c2 = await bounded(store, dd, [account], { maxJobs: 1 });
+  const d2 = await derive(c2);
+  assert.equal(d2.res.pending, 1, "still pending: catalog not yet staged");
+  assert.equal(savedFor(calls, account.accountId), 0, "no snapshot while any required dependency is unstaged");
+  assert.equal(JSON.stringify(store._snapshots.get(SHADOW_KW + "|" + account.accountId).payload), JSON.stringify(LKG), "LKG preserved throughout");
+
+  // Invocation 3: catalog staged (unbounded). Now all required sources succeeded -> derive once.
+  const c3 = await bounded(store, dd, [account], {});
+  const d3 = await derive(c3);
+  assert.equal(d3.res.succeeded, 1, "derives once monthly + catalog are present");
+  assert.equal(savedFor(calls, account.accountId), 1, "exactly one snapshot written");
+  assert.equal(store._snapshots.get(SHADOW_KW + "|" + account.accountId).payload.cadence, "monthly", "monthly cadence saved");
+  for (const s of c3.plannedReports[0].sources) assert.ok(dd.createCount(s.requestHash) <= 1, "no duplicate export for " + s.requestKey);
+});
+
+test("an unrelated (complete) report derives normally while an incomplete report stays pending in the same runReportJobs", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // D1 fully drains (weekly + catalog). A1 is bounded to weekly only (catalog pending).
+  const cD = await bounded(store, dd, [{ accountId: "D1", country: "US", currency: "USD" }], {});
+  const cA = await bounded(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }], { maxJobs: 1 });
+  assert.equal(cA.cycleId, cD.cycleId, "same shared cycle");
+  const { res, saved } = await deriveReports(store, cD.cycleId, [cD.plannedReports[0], cA.plannedReports[0]]);
+  assert.equal(res.succeeded, 1, "the complete report (D1) derives");
+  assert.equal(res.pending, 1, "the incomplete report (A1) stays pending");
+  assert.ok(saved.some((s) => s.accountId === "D1") && !saved.some((s) => s.accountId === "A1"), "only the complete report is saved");
+  assert.equal(reportStatus(store, "A1").derive, "pending", "the pending report is never derive-failed");
 });
 
 async function main() {
