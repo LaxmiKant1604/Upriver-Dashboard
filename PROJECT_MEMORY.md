@@ -5896,6 +5896,24 @@ fragment still uses the raw seller ID and primary/dd-secondary request hashes re
 change request identity, source contracts, the live route, Scheduler v1, report controls, or frontend.
 Sales Movers remains SHADOW ONLY + locked pending this correction.
 
+## Scheduler v2: Sales Movers approved (Codex, 2026-08-11)
+
+Reviewed `3db736d`..`4793bf1` from review base `7a410a7`. **Approved.** The Sales Movers adapter now uses
+the authoritative public `context.accountId` in both normal and `dataUnavailable` payloads while retaining
+`context.rawSellerId` exclusively for DataDoe/source-fragment scope validation. A synthetic dormant-secondary
+case proves that a report keyed to `dd-secondary:RAW1` saves a payload with the same public ID, carries its
+catalog brands under that identity, and rejects fragments scoped to either another raw account or the public
+prefixed ID. Primary `A1 -> A1` payload parity and calculations are unchanged; primary/dd-secondary hashes
+remain isolated and the protected live route, builder, source-contract, and source-identity files are
+byte-unchanged.
+
+Independent verification from the checked-out worktree is green: direct Sales Movers suite **27**,
+`test:report-derivation` **246**, `test:sync-engine` **79**, `test:report-contracts` **161**,
+`test:source-identity` **7**, and full `npm run verify` **645 assertions** plus the 2,394-module production
+build. `git diff --check` is clean and only untracked `HANDOFF.md` remains. Nothing was pushed, merged,
+deployed, migrated, unlocked, or scheduled. Sales Movers remains SHADOW ONLY + locked. The next focused
+functional tranche is Buy Box Loss only.
+
 ## Scheduler v2: Sales Movers account-identity blocker fixed (2026-08-11)
 
 Resolves the review blocker above (see SCHEDULER_V2.md §48.6), on `feature/scheduler-v2` from base
