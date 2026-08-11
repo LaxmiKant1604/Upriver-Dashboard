@@ -1555,3 +1555,195 @@ export function assertListingHealthCurrencyIsolation(listingRows, salesRows) {
     }
   }
 }
+
+/* ============================ PPC Performance & Wasted Spend ============================ */
+// PURE cores for PPC Performance, transcribed VERBATIM from lib/server/reports/ppc.js. ALL advertising
+// figures come from the persisted Supabase Ads history (four source_keys), passed in as already-validated
+// rows -- this leaf makes NO network/Supabase/DataDoe call. Money is NEVER combined across currencies
+// (currency is part of every rollup key). The only DataDoe-sourced input is the optional total-sales rows
+// (the TACoS denominator) + the shared catalog; both are passed in. Reuses num/smSumField/brand/catalog.
+
+const PPC_MIN_CLICKS_FOR_WASTE = 10;
+const PPC_ADS_SOURCE_ORIGIN = "Persisted Supabase Amazon Ads history maintained by the scheduled worker";
+
+const ppcMetric = (row, key) => num(row && row.metrics ? row.metrics[key] : 0);
+function ppcEmptyTotals() { return { spend: 0, sales: 0, clicks: 0, impressions: 0, orders: 0, units: 0 }; }
+function ppcAccumulate(target, row, salesKey, ordersKey, unitsKey) {
+  target.spend += ppcMetric(row, "ad_spend");
+  target.sales += ppcMetric(row, salesKey);
+  target.clicks += ppcMetric(row, "ad_clicks");
+  target.impressions += ppcMetric(row, "ad_impressions");
+  target.orders += ppcMetric(row, ordersKey);
+  target.units += ppcMetric(row, unitsKey);
+  return target;
+}
+
+/**
+ * Fold one Ads source into currency-keyed buckets, byte-identical to ppc.js rollupPpcRows. Currency is
+ * part of the storage key so a multi-marketplace account never displays two currencies as one amount; each
+ * bucket keeps campaignTypes (ad-product coverage) + activeDays. Pure.
+ */
+export function rollupPpcRows(rows, keyFn, labelFn, { salesKey, ordersKey, unitsKey }) {
+  const byKey = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const entityKey = keyFn(row);
+    if (entityKey === null || entityKey === undefined || entityKey === "") continue;
+    const currency = String(row.currency || "").trim() || null;
+    const key = `${currency || "?"}|${entityKey}`;
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { key, ...labelFn(row), ...ppcEmptyTotals(), currencies: new Set(), campaignTypes: new Set(), days: new Set() };
+      byKey.set(key, entry);
+    }
+    ppcAccumulate(entry, row, salesKey, ordersKey, unitsKey);
+    if (currency) entry.currencies.add(currency);
+    if (row.campaign_type) entry.campaignTypes.add(row.campaign_type);
+    if (row.metric_date) entry.days.add(row.metric_date);
+  }
+  return [...byKey.values()].map(({ currencies, campaignTypes, days, ...entry }) => ({
+    ...entry,
+    currencies: [...currencies].sort(),
+    campaignTypes: [...campaignTypes].sort(),
+    activeDays: days.size,
+  }));
+}
+
+// The four Ads rollups + the daily campaign series, byte-identical to buildPpcPerformance's keyFn/labelFn.
+export function ppcCampaigns(rows) {
+  return rollupPpcRows(rows,
+    (row) => `${row.campaign_id}|${row.campaign_type}`,
+    (row) => ({
+      campaignId: row.campaign_id || null,
+      campaignName: row.dimensions?.ad_campaign_name || null,
+      campaignType: row.campaign_type || null,
+      campaignStatus: row.dimensions?.ad_campaign_status || null,
+      portfolioName: row.dimensions?.ad_portfolio_name || null,
+      budgetAmount: row.dimensions?.ad_campaign_budget_amount ?? null,
+      budgetType: row.dimensions?.ad_campaign_budget_type || null,
+    }),
+    { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold" });
+}
+export function ppcAsins(rows) {
+  return rollupPpcRows(rows,
+    (row) => row.child_asin,
+    (row) => ({ asin: row.child_asin || null, sku: row.dimensions?.sku || null, productName: row.dimensions?.product_name || null }),
+    { salesKey: "ad_sales_same_sku", ordersKey: "ad_orders_same_sku", unitsKey: "ad_units_sold_same_sku" });
+}
+export function ppcTargets(rows) {
+  return rollupPpcRows(rows,
+    (row) => `${row.targeting_id || row.dimensions?.ad_keyword_id || ""}|${row.campaign_id}|${row.dimensions?.ad_group_id || ""}`,
+    (row) => ({
+      targetText: row.dimensions?.ad_targeting_text || row.dimensions?.ad_keyword || null,
+      matchType: row.dimensions?.ad_match_type || null,
+      keywordStatus: row.dimensions?.ad_keyword_status || null,
+      campaignId: row.campaign_id || null,
+      campaignName: row.dimensions?.ad_campaign_name || null,
+      campaignType: row.campaign_type || null,
+      adGroupName: row.dimensions?.ad_group_name || null,
+    }),
+    { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold_click" });
+}
+export function ppcSearchTerms(rows) {
+  return rollupPpcRows(rows,
+    (row) => `${row.dimensions?.ad_search_term || ""}|${row.campaign_id}|${row.dimensions?.ad_group_id || ""}`,
+    (row) => ({
+      searchTerm: row.dimensions?.ad_search_term || null,
+      matchedKeyword: row.dimensions?.ad_keyword || row.dimensions?.ad_targeting_text || null,
+      matchType: row.dimensions?.ad_match_type || null,
+      campaignId: row.campaign_id || null,
+      campaignName: row.dimensions?.ad_campaign_name || null,
+      campaignType: row.campaign_type || null,
+      adGroupName: row.dimensions?.ad_group_name || null,
+    }),
+    { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold_click" });
+}
+export function ppcDailySeries(campaignRows) {
+  const dailyMap = new Map();
+  for (const row of Array.isArray(campaignRows) ? campaignRows : []) {
+    const date = row.metric_date;
+    if (!date) continue;
+    const currency = String(row.currency || "").trim() || null;
+    const key = `${date}|${currency || "?"}`;
+    const entry = dailyMap.get(key) || { date, currency, ...ppcEmptyTotals() };
+    ppcAccumulate(entry, row, "ad_sales", "ad_orders", "ad_units_sold");
+    dailyMap.set(key, entry);
+  }
+  return [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/**
+ * Full PPC Performance payload, byte-identical to buildPpcPerformance() for the same inputs. `adsRows` are
+ * the four persisted Ads sources' validated rows; `syncStates` the ads_sync_state rows (empty-seeded stays
+ * distinct from unseeded via each source's `sync` + `rows`); `catalogRows` the shared catalog; the TACoS
+ * denominator is EITHER `totalSalesRows` (summed) OR a `totalSalesUnavailable` reason string. `adsSourceDescriptors`
+ * are the four source metadata rows (syncKey/label/coverage/defaultDataset/enableHint) in campaign,asin,
+ * targeting,search-terms order. Currencies never merge. Pure.
+ */
+export function ppcPerformancePayload({
+  accountId, asOf, from, windowDays, minClicksForWaste = PPC_MIN_CLICKS_FOR_WASTE,
+  adsSourceDescriptors, totalSalesSourceLabel, totalSalesLagDays,
+  adsRows, syncStates, catalogRows, totalSalesRows = null, totalSalesUnavailable = null,
+}) {
+  const rows = Array.isArray(adsRows) ? adsRows : [];
+  const descriptors = Array.isArray(adsSourceDescriptors) ? adsSourceDescriptors : [];
+  const [campaignDesc, asinDesc, targetingDesc, searchTermsDesc] = descriptors;
+  const syncByKey = new Map((Array.isArray(syncStates) ? syncStates : []).map((s) => [s.source_key, s]));
+  const bySource = new Map(descriptors.map((d) => [d.syncKey, []]));
+  for (const row of rows) { const b = bySource.get(row.source_key); if (b) b.push(row); }
+  const campaignRows = bySource.get(campaignDesc.syncKey) || [];
+  const asinRows = bySource.get(asinDesc.syncKey) || [];
+  const targetingRows = bySource.get(targetingDesc.syncKey) || [];
+  const searchTermRows = bySource.get(searchTermsDesc.syncKey) || [];
+
+  const campaigns = ppcCampaigns(campaignRows);
+  const asins = ppcAsins(asinRows);
+  const targets = ppcTargets(targetingRows);
+  const searchTerms = ppcSearchTerms(searchTermRows);
+  const daily = ppcDailySeries(campaignRows);
+
+  const currencies = [...new Set(rows.map((row) => row.currency).filter(Boolean))].sort();
+
+  let totalSales = null;
+  let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;
+  if (totalSalesReason == null && Array.isArray(totalSalesRows)) {
+    totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "sales_sum", "total_sales"), 0);
+  }
+
+  const catalog = salesMoversCatalogFold(catalogRows);
+  for (const row of asins) {
+    const meta = row.asin ? catalog.byAsin.get(row.asin) || {} : {};
+    row.productName = row.productName || meta.name || null;
+    row.brand = salesMoversBrandLabel(meta.brand);
+  }
+
+  const latestMetricDate = rows.reduce((latest, row) => (!latest || row.metric_date > latest ? row.metric_date : latest), null);
+
+  const descRows = [campaignRows.length, asinRows.length, targetingRows.length, searchTermRows.length];
+  const sourceAvailability = descriptors.map((d, i) => {
+    const entry = { key: d.syncKey, label: d.label, coverage: d.coverage, rows: descRows[i], sync: syncByKey.get(d.syncKey) || null, defaultDataset: !!d.defaultDataset };
+    if (d.enableHint) entry.enableHint = d.enableHint;
+    return entry;
+  });
+
+  return {
+    accountId,
+    asOf,
+    window: { from, to: asOf, days: windowDays },
+    adsSourceOrigin: PPC_ADS_SOURCE_ORIGIN,
+    minClicksForWaste,
+    adsRowCount: rows.length,
+    latestMetricDate,
+    sourceAvailability,
+    totalSales,
+    totalSalesUnavailable: totalSalesReason,
+    totalSalesSourceLabel,
+    totalSalesLagDays,
+    currencies,
+    daily,
+    campaigns,
+    asins,
+    targets,
+    searchTerms,
+    catalogBrands: catalog.catalogBrands,
+  };
+}

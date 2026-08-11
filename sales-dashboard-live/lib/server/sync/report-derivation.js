@@ -34,6 +34,7 @@ import {
   returnsLeakagePayload,
   listingHealthPayload,
   assertListingHealthCurrencyIsolation,
+  ppcPerformancePayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -99,6 +100,23 @@ const LH_SOURCE_LABEL = "Listings";
 const LH_SALES_SOURCE_LABEL = "Profit by SKU & Date";
 const LH_ISSUES_SOURCE_LABEL = "Listings (Raw JSON)";
 const LH_ISSUES_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable Listings (Raw JSON) to add Amazon's own listing issue codes, severities and suppression flags to this report.";
+
+// PPC Performance constants -- byte-identical to the live builder/sources: ppc.js WINDOW_DAYS (30),
+// SALES_TRAFFIC.label / lagDays (the TACoS denominator), and the four persisted Ads source descriptors
+// (syncKey/label/coverage/defaultDataset/enableHint) in campaign,asin,targeting,search-terms order --
+// coverage for campaign/asin is the hardcoded route wording, targeting/search-terms use the ADS_* coverage.
+// ALL advertising data is DERIVED from persisted ads_daily_source_rows; PPC creates ZERO DataDoe Ads exports.
+const PPC_WINDOW_DAYS = 30;
+const PPC_TOTAL_SALES_LABEL = "Sales & Traffic by ASIN & Date";
+const PPC_TOTAL_SALES_LAG_DAYS = 4;
+const PPC_MULTI_CURRENCY_REASON = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
+const PPC_TOTAL_SALES_DEGRADED_REASON = "TACoS is unavailable because the account total-sales export for the denominator did not complete this cycle; every other PPC figure is still current.";
+const PPC_ADS_SOURCE_DESCRIPTORS = Object.freeze([
+  { syncKey: "campaign-performance-v1", label: "Ad Performance by Campaign & Date", coverage: "All campaign types present in the account", defaultDataset: true },
+  { syncKey: "asin-performance-v1", label: "Ad Performance by ASIN & Date", coverage: "Same-SKU attributed metrics", defaultDataset: true },
+  { syncKey: "keyword-targeting-performance-v1", label: "Keyword Targeting Performance", coverage: "SP + SB + SD", defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Keyword Targeting Performance, then refresh this report again." },
+  { syncKey: "search-terms-performance-v1", label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Search Term Performance (Ads), then refresh this report again." },
+]);
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -864,7 +882,85 @@ const REGISTRY = {
     latestDataDate: (p) => (p && p.inventoryAvailable && isValidCalendarDate(p.inventorySnapshotDate) ? p.inventorySnapshotDate : null),
   },
   "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },
-  "ppc-performance": { snapshotVersion: "ppc-performance/v2d-1", optionalRequestKeys: ["ppc-performance:total-sales"], derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"], derive: null },
+  // PPC Performance: reproduce the api/datadoe.js `ppc-performance` payload. ALL advertising figures are
+  // DERIVED from the persisted Supabase Ads history injected via the derive context (`context.ppcAds`, loaded
+  // + validated by the server-only PPC Ads loader) -- this derive makes ZERO DataDoe/network calls and PPC
+  // creates ZERO Ads exports. The only DataDoe inputs are the REQUIRED shared no-date catalog and the
+  // OPTIONAL total-sales denominator (TACoS). Total-sales is planned ONLY when the validated Ads currency
+  // signal proves <= 1 currency; a >1-currency account skips it by design; a planned-but-failed/degraded
+  // total-sales degrades ONLY TACoS and never blocks campaigns/ASINs/targets/search terms. Currency is never
+  // merged (every rollup key includes currency). Payload accountId is the PUBLIC id; rawSellerId scopes the
+  // DataDoe catalog/total-sales fragments.
+  "ppc-performance": {
+    snapshotVersion: "ppc-performance/v2d-1",
+    optionalRequestKeys: ["ppc-performance:total-sales"],
+    derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
+    derivedContextKeys: ["ppcAds"],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("ppc-performance derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      const from = addDaysStr(asOf, -(PPC_WINDOW_DAYS - 1));
+      // Persisted Ads context (validated by the server-only PPC Ads loader). status !== "ok" means the Ads
+      // read failed / was unvalidated / the account is unseeded (or the 120k row cap was hit) => unavailable
+      // (LKG preserved). A validated EMPTY window (status "ok", adsRows []) is DISTINCT and derives a valid,
+      // honestly-empty report.
+      const ppcAds = context.ppcAds;
+      if (!ppcAds || ppcAds.status !== "ok" || !Array.isArray(ppcAds.adsRows) || !Array.isArray(ppcAds.syncStates)) {
+        throw deriveError("ppc-performance persisted Ads context is unavailable (Ads read failed/unvalidated/unseeded, or the row cap was exceeded); last-known-good preserved.", "unavailable");
+      }
+      // Catalog is REQUIRED: exactly one single-account no-date fragment (a missing/failed catalog =>
+      // unavailable, LKG preserved).
+      const catalogSource = sources["ppc-performance:catalog"];
+      if (!catalogSource || catalogSource.available !== true || !Array.isArray(catalogSource.rows)) {
+        throw deriveError("ppc-performance catalog is required but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
+      }
+      const catalogRows = noDateFragmentRows(catalogSource, "ppc-performance:catalog", rawSellerId);
+      assertPlainObjectRows(catalogRows, "ppc-performance catalog");
+      // TACoS denominator state (total-sales is OPTIONAL and its failure degrades ONLY TACoS):
+      //   > 1 Ads currency  -> not planned; the exact multi-currency explanation.
+      //   <= 1 currency, total-sales succeeded -> sum the validated saved rows.
+      //   <= 1 currency, total-sales missing/failed/degraded/malformed/wrong-window -> safe degraded reason.
+      const currencyCount = new Set(ppcAds.adsRows.map((r) => String((r && r.currency) || "").trim()).filter(Boolean)).size;
+      let totalSalesRows = null;
+      let totalSalesUnavailable = null;
+      if (currencyCount > 1) {
+        totalSalesUnavailable = PPC_MULTI_CURRENCY_REASON;
+      } else {
+        try {
+          const ts = sources["ppc-performance:total-sales"];
+          if (ts && ts.available === true && Array.isArray(ts.rows)) {
+            totalSalesRows = singleAccountFragmentRows(ts, "ppc-performance:total-sales", rawSellerId, from, asOf);
+            assertRowsInWindow(totalSalesRows, from, asOf, "ppc-performance total-sales");
+          } else {
+            totalSalesUnavailable = PPC_TOTAL_SALES_DEGRADED_REASON;
+          }
+        } catch (_e) {
+          // A malformed / cross-account / wrong-window total-sales fragment degrades ONLY TACoS; it must
+          // NEVER invalidate or block the rest of PPC.
+          totalSalesRows = null;
+          totalSalesUnavailable = PPC_TOTAL_SALES_DEGRADED_REASON;
+        }
+      }
+      return ppcPerformancePayload({
+        accountId: publicAccountId, asOf, from, windowDays: PPC_WINDOW_DAYS,
+        adsSourceDescriptors: PPC_ADS_SOURCE_DESCRIPTORS,
+        totalSalesSourceLabel: PPC_TOTAL_SALES_LABEL, totalSalesLagDays: PPC_TOTAL_SALES_LAG_DAYS,
+        adsRows: ppcAds.adsRows, syncStates: ppcAds.syncStates, catalogRows,
+        totalSalesRows, totalSalesUnavailable,
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.campaigns)
+      && Array.isArray(p.asins) && Array.isArray(p.targets) && Array.isArray(p.searchTerms) && Array.isArray(p.daily)
+      && Array.isArray(p.currencies) && Array.isArray(p.sourceAvailability) && Array.isArray(p.catalogBrands)
+      && ("totalSales" in p) && ("totalSalesUnavailable" in p) && ("adsRowCount" in p) && ("latestMetricDate" in p),
+    // Latest real data date = the MAX validated Ads metric_date (source evidence); null for a validated
+    // empty Ads window. Never asOf / fetched_at / saved_at / Date.now().
+    latestDataDate: (p) => (p && isValidCalendarDate(p.latestMetricDate) ? p.latestMetricDate : null),
+  },
 };
 
 // Freeze each entry with computed requiredRequestKeys (declared keys minus optional).
