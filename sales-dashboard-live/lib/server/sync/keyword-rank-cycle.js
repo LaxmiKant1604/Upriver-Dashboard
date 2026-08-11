@@ -172,5 +172,45 @@ export async function runKeywordRankShadowCycle({
     weeklySignal: st.weeklySignal,
     monthlySignal: st.monthlySignal,
   }));
+
+  // Blocker 4 -- reconstruct each account's persisted weekly/monthly state ONE FINAL time and return
+  // the canonical per-account report requests (plannedReports) for runReportJobs. Each report depends
+  // ONLY on the sources actually STAGED this cycle (matched by canonical request hash to the persisted
+  // jobs), so the final depends_on is exact: a successful weekly account depends on weekly + catalog; a
+  // successful fallback account on weekly + monthly + catalog. The catalog token is NEVER fabricated --
+  // a failed/disabled weekly or a failed required monthly staged no catalog, so the report neither
+  // lists nor waits forever on it and instead resolves to an honest blocked state via the fetch gate.
+  // Every staged source is REQUIRED (weekly always; catalog once the cadence resolved; monthly when
+  // weekly < 4, where it is genuinely required), so a failed staged dependency blocks honestly.
+  if (cycleId) await reconstruct(cycleId); // reconstruct persisted weekly/monthly state one final time
+  rollup.plannedReports = await buildFinalReports({ state, cycleId, store, connections, bucket });
   return rollup;
+}
+
+// Reconstruct each account's final typed signals from persisted state, then return the canonical
+// keyword-rank report request per account whose `sources` are EXACTLY the ones staged this cycle
+// (filtered by persisted request hash), each marked required, with the connection normalized to the
+// driver id. Pure aside from the injected store reads; makes no DataDoe call.
+async function buildFinalReports({ state, cycleId, store, connections, bucket }) {
+  if (!cycleId) return [];
+  const jobs = await store.listSourceJobs(cycleId);
+  const persisted = new Set(jobs.map((j) => j.request_hash ?? j.requestHash));
+  return state.map((st) => {
+    const plan = planKeywordRank({
+      accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
+      connections, asOf: st.asOf, weeklySignal: st.weeklySignal,
+    });
+    const sources = plan.sources
+      .filter((s) => persisted.has(s.requestHash))
+      .map((s) => ({ ...s, optional: false }));
+    return {
+      reportKey: "keyword-rank",
+      reportVersion: plan.reportVersion,
+      accountId: plan.accountId,
+      connectionId: DRIVER_CONNECTION_ID[plan.connectionId] || plan.connectionId,
+      bucket: plan.bucket || bucket,
+      sources,
+      context: plan.context,
+    };
+  });
 }
