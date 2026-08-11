@@ -6064,3 +6064,26 @@ API not enabled. Buy Box stays SHADOW ONLY + locked.
 `test:source-identity` **7**; full `npm run verify` **685 assertions** (was 672) + 2,394-module production
 build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
+
+## Scheduler v2: Buy Box Loss approved (Codex, 2026-08-11)
+
+Reviewed `627131c`..`e86006e` from review base `5ef6f87`. **Approved.** The shared
+`assertRowsInWindow` guard now rejects every malformed, impossible, future, out-of-window,
+or wrong-slice Buy Box daily row against its own exact seven-day fragment and every inventory
+row outside `[asOf-10d, asOf]`. The exact `2099-01-01` / `2099-01-02` repro now returns typed
+`invalid`; worker-level coverage proves zero snapshot writes and unchanged last-known-good.
+Keyword Rank and Sales Movers behavior is unchanged apart from the helper's neutral name.
+
+The new Buy Box integration coverage genuinely runs `buildShadowReportPlan` ->
+`runStagedSourceCycle` -> `runReportJobs`: default and explicit planning produce the six
+canonical sources, partial and deferred invocations resume without duplicate creates, the
+report stays pending until all required sources succeed and then saves once, reconciliation
+is owner-scoped for shared inventory/catalog hashes, and primary-only planning skips stale
+secondary accounts read-only. Independent verification from the checked-out worktree is green:
+direct Buy Box **40**, `test:report-derivation` **286**, `test:sync-engine` **79**,
+`test:report-contracts` **161**, `test:source-identity` **7**, and full `npm run verify`
+**685 assertions** plus the 2,394-module production build. Protected live route/builder,
+contracts, and source identity are byte-unchanged; `git diff --check` is clean and only
+untracked `HANDOFF.md` remains. Nothing was pushed, merged, deployed, migrated, unlocked,
+enabled, or scheduled. Buy Box remains SHADOW ONLY + locked. The next focused tranche is
+Returns & Refunds (`returns-leakage`) only.
