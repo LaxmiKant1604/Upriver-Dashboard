@@ -49,23 +49,34 @@ function deadlineError() {
 function makeMemoryStore() {
   const cycles = new Map();
   const jobsByCycle = new Map();
+  const ownersByCycle = new Map(); // cycleId -> Map<owner_id|request_hash, membership>
   const cache = new Map(); // request_hash -> { rows, object_path }
   let seq = 0;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
-  // Mirrors the production getSyncSourceJobs() SELECT exactly (including the owner-identity columns
-  // request_key / organization_fingerprint / account_scope_hash the durable ownership scope reads).
+  // Mirrors the production getSyncSourceJobs() SELECT exactly. request_key is NOT here (it is not a
+  // canonical column and never ownership authority; report ownership lives in sync_source_job_owners).
   const PROD_COLUMNS = [
-    "id", "request_hash", "request_key", "source_id", "source_key", "connection_id",
+    "id", "request_hash", "source_id", "source_key", "connection_id",
     "organization_fingerprint", "account_scope_hash", "fetch_status",
     "attempted_at", "create_export_count", "export_id", "terminal", "error_stage",
     "error_code", "row_count",
   ];
   const prodRow = (j) => Object.fromEntries(PROD_COLUMNS.map((c) => [c, j[c] ?? null]));
+  const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
   return {
     _cache: cache,
+    _owners: (cid) => ownerRows(cid).map((m) => ({ ...m })),
     failSaveFor: new Set(),
     forceLoseClaim: new Set(),
     loadReturns: null, // override loadSourceRows for reconstruction tests
+    upsertSourceJobOwners(memberships) {
+      for (const m of memberships || []) {
+        if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
+        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
+      }
+    },
+    listSourceJobOwners(cid, ownerIds) { const set = new Set(ownerIds || []); return ownerRows(cid).filter((m) => set.has(m.owner_id)).map((m) => ({ ...m })); },
+    recordSourceOwnerStale({ cycleId, requestHash, ownerId, code, message }) { const m = ownersByCycle.get(cycleId) && ownersByCycle.get(cycleId).get(ownerId + "|" + requestHash); if (m) { m.owner_status = "stale"; m.error_code = code || "STALE_PLAN"; m.error_message = message || null; } },
     openCycle({ bucket, cycleDate }) {
       const key = `${bucket}|${cycleDate}`;
       if (!cycles.has(key)) {

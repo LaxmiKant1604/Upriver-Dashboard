@@ -70,18 +70,6 @@ function fetchStatusOf(job) {
   return job.fetch_status ?? job.fetchStatus ?? "pending";
 }
 
-// The durable, account-safe owner identity of a source job/row: the tuple
-// (request_key, organization_fingerprint, account_scope_hash). Reads both the persisted snake_case row
-// shape and the planned camelCase job shape. `complete` is false when any field is empty (an ambiguous
-// owner that must never silently match another scope). The key is a JSON array of the three fields, so
-// it is collision-free regardless of the fields' contents (no separator that could appear inside a hash).
-export function ownerIdentity(job) {
-  const rk = job.request_key ?? job.requestKey ?? "";
-  const org = job.organization_fingerprint ?? job.organizationFingerprint ?? "";
-  const scope = job.account_scope_hash ?? job.accountScopeHash ?? "";
-  return { rk, org, scope, key: JSON.stringify([rk, org, scope]), complete: !!(rk && org && scope) };
-}
-
 // Rebuild the complete canonical job: plan supplies fetch params + policies; the DB row
 // is authoritative for lifecycle state (status / attempted_at / export_id / connection).
 // No 'primary' default — a missing connection id is left undefined so the adapter fails
@@ -226,14 +214,26 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
 
 /**
  * Run (or resume) the source half of ONE cycle for a fixed set of planned source jobs.
- * Idempotent: upserts each planned job (unique cycle_id+request_hash), then processes the
- * still-pending AND resumable-attempted ones, bounded by maxJobs and a wall-clock
- * deadline. Cumulative cycle counts are recomputed from ALL persisted jobs (never reset).
- * Returns progress + per-job outcomes (rows in-memory for signal derivation) and NEVER a
- * secret. A finished cycle is a no-op.
+ *
+ * Ownership (Scheduler v2 many-to-many model): a shared (bucket, cycle_date) cycle can hold canonical
+ * source jobs owned by SEVERAL report families/accounts. `sync_source_jobs` stays ONE row/export per
+ * canonical request_hash; WHO may process/resume/read it lives in `sync_source_job_owners` memberships.
+ * When `ownerIds` is supplied this invocation:
+ *   - validates every plannedJob carries a complete owner membership belonging to a declared owner id
+ *     BEFORE any source/owner upsert (fail closed on empty/malformed/mismatched ownership);
+ *   - upserts the canonical source jobs ONCE by request_hash, then the owner memberships SEPARATELY;
+ *   - loads the union of canonical hashes its declared owners own (durable, active memberships), so two
+ *     owners needing the same hash still produce exactly ONE export and either can resume it;
+ *   - processes ONLY its owned+planned canonical jobs -- another owner's job is never processed, failed,
+ *     counted against maxJobs, or included in owner-scoped `drained`; and
+ *   - never MISSING_PLANs a canonical row: a hash an owner no longer plans is reconciled at the OWNER
+ *     membership level by the driver (stale), never by failing the shared canonical row.
+ * When `ownerIds` is null the invocation owns the whole cycle (legacy single-owner path, unchanged).
+ * Cumulative cycle counts are recomputed from ALL canonical jobs (never owner aliases). A finished cycle
+ * is a no-op. Returns progress + per-job outcomes (rows in-memory for signal derivation); NEVER a secret.
  */
 export async function runSourceJobs({
-  store, dataDoe, plannedJobs, ownedJobs = null,
+  store, dataDoe, plannedJobs, ownerIds = null,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = DEFAULT_RESERVE_MS, maxJobs = Infinity,
 }) {
@@ -257,37 +257,33 @@ export async function runSourceJobs({
     return { ...progress, outcomes };
   }
 
-  // A shared (bucket, cycle_date) cycle can hold source jobs owned by SEVERAL report families/accounts
-  // (only one sync_cycles row exists per bucket/date). `ownedJobs`, when supplied, is the COMPLETE set of
-  // jobs this invocation owns for the whole cycle (a superset of the current round's `plannedJobs`).
-  //
-  // Ownership is a DURABLE, ACCOUNT-SAFE tuple (request_key, organization_fingerprint, account_scope_hash)
-  // -- NOT request_key alone. Every account for a report shares keys like "keyword-rank:sqp-weekly", so a
-  // request-key-only scope would let one account's run touch another account's same-key row. The tuple
-  // isolates accounts (distinct account_scope_hash) and organizations (distinct organization_fingerprint),
-  // while a stale-window hash for the SAME report/account/org still fails as a genuine orphan. None of
-  // these fields feed request_hash. When `ownedJobs` is null the invocation owns the whole cycle
-  // (previous behaviour, unchanged).
-  const ownerScope = ownedJobs ? new Set() : null;
-  if (ownedJobs) {
-    for (const j of ownedJobs) {
-      const id = ownerIdentity(j);
-      if (!id.complete) throw new Error(`ownedJobs entry (request_key "${id.rk}") is missing its organization_fingerprint/account_scope_hash owner identity; refusing an ambiguous ownership scope.`);
-      ownerScope.add(id.key);
+  const usingOwners = Array.isArray(ownerIds);
+  const ownerSet = usingOwners ? new Set(ownerIds.map((id) => String(id || "")).filter(Boolean)) : null;
+  const planned = (plannedJobs || []).filter((j) => j && j.requestHash);
+
+  // Fail closed BEFORE any source/owner upsert (req 10/11): every plannedJob must carry a COMPLETE owner
+  // membership belonging to a DECLARED owner id. An empty scope with planned work, a missing/malformed
+  // membership, or an owner id outside the declared set all throw (never upsert-then-skip).
+  if (usingOwners) {
+    if (!ownerSet.size && planned.length) {
+      throw new Error("runSourceJobs was given planned jobs but an empty ownerIds scope; refusing (fail closed).");
     }
-    // Fail closed BEFORE any upsert: every plannedJobs entry MUST belong to the declared ownership scope,
-    // so we never silently upsert a job the scope would then skip. An empty/mismatched scope throws.
-    for (const job of plannedJobs || []) {
-      if (!job || !job.requestHash) continue;
-      const id = ownerIdentity(job);
-      if (!id.complete || !ownerScope.has(id.key)) {
-        throw new Error(`plannedJobs entry (request_key "${id.rk}") does not belong to the declared ownership scope; refusing to upsert then skip it.`);
+    for (const j of planned) {
+      const o = j.owner || {};
+      const ownerId = String(o.ownerId || "");
+      if (!ownerId || !o.requestKey || !j.organizationFingerprint || !j.accountScopeHash) {
+        throw new Error(`plannedJobs entry (request_key "${o.requestKey || j.requestKey || ""}") is missing its owner membership identity (owner_id / request_key / organization_fingerprint / account_scope_hash); fail closed.`);
+      }
+      if (!ownerSet.has(ownerId)) {
+        throw new Error(`plannedJobs entry (owner_id "${ownerId}") does not belong to the declared owner scope; refusing to upsert then skip it.`);
       }
     }
   }
 
-  for (const job of plannedJobs || []) {
-    if (!job || !job.requestHash) continue;
+  // 1) Upsert the CANONICAL source jobs ONCE by request_hash (dedup: two owners sharing a hash => one row).
+  const metaByHash = new Map();
+  for (const j of planned) if (!metaByHash.has(j.requestHash)) metaByHash.set(j.requestHash, j);
+  for (const job of metaByHash.values()) {
     await store.upsertSourceJob({
       cycleId, bucket,
       requestHash: job.requestHash, requestKey: job.requestKey || "",
@@ -297,30 +293,51 @@ export async function runSourceJobs({
       accountScopeHash: job.accountScopeHash || "", requestMeta: job.requestMeta || {},
     });
   }
-  //   - metaByHash covers every owned job -- a job STAGED in a prior round/invocation can be merged and
-  //     resumed here rather than mistaken for an orphan; and
-  //   - `owns()` uses the owner tuple: a row whose owner tuple is not in scope belongs to another
-  //     family/account and is left completely untouched (never processed, failed, counted, or drained).
-  const metaByHash = new Map([...(ownedJobs || []), ...(plannedJobs || [])].filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
-  const owns = (jobRow) => !ownerScope || ownerScope.has(ownerIdentity(jobRow).key);
-  progress.planned = new Set((plannedJobs || []).filter((j) => j && j.requestHash).map((j) => j.requestHash)).size;
 
+  // 2) Upsert the OWNER memberships SEPARATELY (one per planned owner+source pair). A shared canonical
+  //    hash across two of this invocation's owners produces two memberships against the one canonical row.
+  if (usingOwners && store.upsertSourceJobOwners) {
+    await store.upsertSourceJobOwners(planned.map((j) => ({
+      cycleId, requestHash: j.requestHash, ownerId: j.owner.ownerId, requestKey: j.owner.requestKey,
+      reportKey: j.owner.reportKey || "", accountId: j.owner.accountId || "",
+      organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash,
+    })));
+  }
+
+  // 3) The union of canonical hashes the declared owners own (durable, active memberships across this +
+  //    prior rounds), plus this round's planned hashes. Only these are executed / drained-scoped.
+  let ownedHashes = null;
+  if (usingOwners) {
+    const durable = store.listSourceJobOwners ? await store.listSourceJobOwners(cycleId, [...ownerSet]) : [];
+    ownedHashes = new Set([
+      ...metaByHash.keys(),
+      ...durable.filter((m) => (m.owner_status ?? m.ownerStatus) !== "stale").map((m) => m.request_hash ?? m.requestHash),
+    ]);
+  }
+  const ownsHash = (hash) => !usingOwners || ownedHashes.has(hash);
+  progress.planned = metaByHash.size;
+
+  // 4) Execute. New model: process ONLY this invocation's owned+planned canonical jobs (deduped by hash);
+  //    a canonical row owned but not planned this round is left untouched (readable LKG). Legacy model
+  //    (no ownerIds): scan every row and fail an unplanned one MISSING_PLAN, as before.
   const jobRows = await store.listSourceJobs(cycleId);
-  for (const jobRow of jobRows) {
-    // TYPED ownership scope: never touch (never MISSING_PLAN) a job owned by another report family.
-    if (!owns(jobRow)) continue;
+  const rowByHash = new Map(jobRows.map((r) => [r.request_hash ?? r.requestHash, r]));
+  const executeHashes = usingOwners
+    ? [...metaByHash.keys()].filter(ownsHash)
+    : [...rowByHash.keys()];
+  for (const hash of executeHashes) {
+    const jobRow = rowByHash.get(hash);
+    if (!jobRow) continue;
     const st = fetchStatusOf(jobRow);
-    if (st === "succeeded" || st === "failed" || st === "skipped") continue; // done
+    if (st === "succeeded" || st === "failed" || st === "skipped") continue; // done (a shared hash B already fetched is read, not re-run)
     if (progress.processed >= maxJobs) { progress.deadlineReached = false; break; }
     if (clock() >= deadlineMs - reserveMs) { progress.deadlineReached = true; break; }
 
-    const hash = jobRow.request_hash ?? jobRow.requestHash;
     const meta = metaByHash.get(hash);
     progress.processed += 1;
     if (!meta) {
-      // Owned by this invocation (request_key is ours) but the hash is not in our canonical plan: a
-      // GENUINE orphan (e.g. a stale window/version). Fail it closed -- never silently ignore an owned
-      // orphan, and never fail an unrelated family's job (those were skipped above).
+      // Legacy path only: an unplanned pending/attempted row is a genuine orphan -> fail closed. In the
+      // owner model this never happens (executeHashes are all planned) and stale is an owner-level concern.
       await store.recordSourceFailure({ cycleId, requestHash: hash, exportId: jobRow.export_id ?? null, stage: st === "attempted" ? "poll" : "create-export", code: "MISSING_PLAN", message: "No canonical plan entry for this source job.", terminal: false, durationMs: 0 });
       progress.failed += 1;
       outcomes.push({ requestKey: "", requestHash: hash, status: "failed", validated: false, code: "MISSING_PLAN" });
@@ -331,9 +348,9 @@ export async function runSourceJobs({
     if (outcome) outcomes.push(outcome);
   }
 
-  // Cumulative counts recomputed from ALL persisted jobs (cycle-wide telemetry; resuming or adding
-  // staged jobs never reduces a previous count). `drained` is scoped to OWNED jobs when a typed scope is
-  // supplied, so one owner's completion never depends on another family's still-pending jobs.
+  // Cumulative counts recomputed from ALL CANONICAL jobs (cycle-wide telemetry, never owner aliases).
+  // `drained` is scoped to the declared owners' hashes so one owner's completion never depends on
+  // another owner's still-pending jobs in the shared cycle.
   const allJobs = await store.listSourceJobs(cycleId);
   const counts = {
     sourceTotal: allJobs.length,
@@ -341,7 +358,7 @@ export async function runSourceJobs({
     sourceFailed: allJobs.filter((j) => fetchStatusOf(j) === "failed").length,
   };
   if (store.updateCycleCounts) await store.updateCycleCounts(cycleId, counts);
-  const unfinished = allJobs.some((j) => owns(j) && ["pending", "attempted"].includes(fetchStatusOf(j)));
+  const unfinished = allJobs.some((j) => ownsHash(j.request_hash ?? j.requestHash) && ["pending", "attempted"].includes(fetchStatusOf(j)));
   progress.drained = !unfinished && !progress.deadlineReached;
   progress.counts = counts;
   return { ...progress, outcomes };

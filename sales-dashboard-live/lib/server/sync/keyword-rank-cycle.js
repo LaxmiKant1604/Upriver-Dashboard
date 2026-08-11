@@ -15,7 +15,7 @@
 // deterministic and offline-testable; it makes no DataDoe call itself.
 
 import { runSourceJobs } from "./source-worker.js";
-import { plannedSourceJob } from "./source-sync-driver.js";
+import { plannedSourceJob, reconcileStaleOwnerMemberships } from "./source-sync-driver.js";
 import { keywordWeeklySignal } from "./source-signals.js";
 import { planKeywordRank } from "./report-planner.js";
 import { bucketForCountry } from "./registry.js";
@@ -140,25 +140,18 @@ export async function runKeywordRankShadowCycle({
     const keys = submitKeys(st, round);
     return plan.sources
       .filter((s) => keys.has(s.requestKey))
-      .map((s) => plannedSourceJob("keyword-rank", s, plan.bucket || bucket, DRIVER_CONNECTION_ID[plan.connectionId] || plan.connectionId));
+      .map((s) => plannedSourceJob("keyword-rank", s, plan.bucket || bucket, DRIVER_CONNECTION_ID[plan.connectionId] || plan.connectionId, st.account.accountId));
   });
 
-  // Blocker 1 (shared-cycle ownership) -- the COMPLETE set of source jobs this cycle owns for these
-  // accounts: weekly + catalog + monthly for EVERY account, independent of which round stages each. The
-  // monthly window is forced here (distinctPeriods:0 => the fallback applies) purely to enumerate the
-  // canonical monthly hash; request hashes are signal-independent, so this is exactly the hash real
-  // staging produces. Passed as the worker's TYPED ownership scope so the shared (bucket, cycle_date)
-  // cycle's OTHER report families are never touched, while a keyword job staged in a prior round/
-  // invocation is merged + resumed here (never MISSING_PLAN'd). A genuine keyword orphan (a stale hash
-  // with a keyword request_key) still fails closed.
-  const FORCE_MONTHLY_SIGNAL = { status: "success", validated: true, distinctPeriods: 0 };
-  const ownedJobs = state.flatMap((st) => {
-    const full = planKeywordRank({
-      accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
-      connections, asOf: st.asOf, weeklySignal: FORCE_MONTHLY_SIGNAL,
-    });
-    return full.sources.map((s) => plannedSourceJob("keyword-rank", s, full.bucket || bucket, DRIVER_CONNECTION_ID[full.connectionId] || full.connectionId));
-  });
+  // Owner memberships (sync_source_job_owners): each Keyword account+org is ONE owner (owner_id from
+  // sourceJobOwnerId over report family + connection + org fingerprint + account scope). Every staged
+  // source of that account is a membership under that owner_id. The declared owner set + planned
+  // membership keys accumulate as rounds stage more sources; runSourceJobs processes only THIS cycle's
+  // owned+planned canonical jobs, and OTHER report families sharing the (bucket, cycle_date) cycle are
+  // never touched. A source an account no longer needs (e.g. monthly once weekly resolves >= 4) is
+  // reconciled as a STALE owner membership at the end -- never by failing the shared canonical row.
+  const ownerIdSet = new Set();
+  const plannedMembershipKeys = new Set(); // owner_id|request_hash actually planned this invocation
 
   const rollup = { cycleId: null, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, deadlineReached: false, drained: false };
   let cycleId = null;
@@ -172,7 +165,8 @@ export async function runKeywordRankShadowCycle({
     if (round > 0) await reconstruct(cycleId);
     const planned = planRound();
     const plannedJobs = jobsOf(planned, round);
-    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownedJobs, bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
+    for (const j of plannedJobs) { ownerIdSet.add(j.owner.ownerId); plannedMembershipKeys.add(`${j.owner.ownerId}|${j.requestHash}`); }
+    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
     cycleId = res.cycleId;
     rollup.cycleId = cycleId;
     rollup.rounds = round + 1;
@@ -188,6 +182,10 @@ export async function runKeywordRankShadowCycle({
     if (res.deadlineReached) { rollup.deadlineReached = true; rollup.drained = false; break; }
     if ((res.deferred || 0) > 0) { rollup.drained = false; break; }
   }
+  // Retire any owner membership this invocation no longer plans (e.g. monthly once weekly resolves >= 4)
+  // as STALE at owner scope -- the shared canonical row and every other owner's membership are untouched.
+  await reconcileStaleOwnerMemberships(store, cycleId, [...ownerIdSet], plannedMembershipKeys);
+
   // Reconstruct each account's persisted weekly/monthly state ONE FINAL time BEFORE reading telemetry, so
   // rollup.perAccount is fresh even after a one-round (or deadline-truncated) invocation -- never stale.
   if (cycleId) await reconstruct(cycleId);

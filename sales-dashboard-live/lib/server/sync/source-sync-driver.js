@@ -10,12 +10,13 @@
 // here runs a live DataDoe probe on import.
 
 import { createExport, pollExport, downloadExport } from "../datadoe.js";
-import { organizationFingerprint } from "../source-identity.js";
+import { organizationFingerprint, sourceJobOwnerId } from "../source-identity.js";
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts,
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
+  upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
 } from "../supabase.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import { runSourceJobs } from "./source-worker.js";
@@ -61,7 +62,7 @@ export function normalizeDataDoeConnections(connections) {
 // FAIL CLOSED: connectionId is REQUIRED and explicit ('primary' or 'dd-secondary') — there
 // is no silent 'primary' default anywhere in Scheduler v2 — and the resolved job must carry
 // a non-empty organizationFingerprint. Both are what the adapter verifies before any call.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId) {
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "") {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -69,6 +70,18 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId) {
     throw new Error("plannedSourceJob requires a non-empty organizationFingerprint on the resolved job.");
   }
   const contract = (REPORT_SOURCE_CONTRACTS[reportKey] || []).find((c) => c.requestKey === resolved.requestKey);
+  // The durable OWNER membership for this planned source: a deterministic non-secret owner_id over
+  // (report family, connection/org boundary, org fingerprint, account scope), plus the report request
+  // key as this membership's alias and the SAFE public accountId for admin display. request_key is a
+  // membership alias, NOT canonical ownership authority; the canonical job dedups on request_hash.
+  const ownerId = sourceJobOwnerId({
+    reportKey, connectionId,
+    organizationFingerprint: resolved.organizationFingerprint,
+    accountScopeHash: resolved.accountScopeHash,
+  });
+  if (!ownerId) {
+    throw new Error(`plannedSourceJob could not derive an owner_id for report "${reportKey}" (missing connection/organization/account scope).`);
+  }
   return {
     requestHash: resolved.requestHash,
     requestKey: resolved.requestKey,
@@ -81,6 +94,7 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId) {
     bucket: resolved.bucket || bucket,
     strict: resolved.strict === true,
     limit: resolved.limit,
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || "") },
     fetchParams: {
       columns: contract ? contract.columns : undefined,
       sellerOrVendorIds: resolved.sellerOrVendorIds,
@@ -102,6 +116,11 @@ export function makeSupabaseSourceStore() {
     getCycle: (cycleId) => getSyncCycle(cycleId),
     upsertSourceJob: (job) => upsertSyncSourceJob(job),
     listSourceJobs: (cycleId) => getSyncSourceJobs(cycleId),
+    // Many-to-many owner memberships (sync_source_job_owners) -- canonical jobs stay one row/export.
+    upsertSourceJobOwners: (memberships) => upsertSyncSourceJobOwners(memberships),
+    listSourceJobOwners: (cycleId, ownerIds) => getSyncSourceJobOwners(cycleId, ownerIds),
+    listSourceJobsForOwners: (cycleId, ownerIds) => getSyncSourceJobsForOwners(cycleId, ownerIds),
+    recordSourceOwnerStale: (args) => recordSyncSourceJobOwnerStale(args),
     claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),
     recordExportCreated: (args) => recordSyncSourceExportCreated(args),
     loadSourceRows: (requestHash) => getSourceExportCache(requestHash),
@@ -234,23 +253,26 @@ export async function runStagedSourceCycle({
     deadlineReached: false, drained: false, signals,
   };
   const seenHashes = new Set();
-  // Blocker 2: this generic staged driver declares its OWN typed owner scope so it can share the single
-  // (bucket, cycle_date) cycle with other report families (e.g. Keyword Rank) without touching their jobs.
-  // Ownership is the durable owner tuple (request_key, organization_fingerprint, account_scope_hash) --
-  // see source-worker.ownerIdentity -- so the scope is account/organization safe. The owned set grows as
-  // each round's plan (kickoff + reconstructed/derived fallbacks) reveals more of this driver's jobs; a
-  // job owned by another family is never in it, so runSourceJobs leaves it untouched.
-  const ownedByHash = new Map();
+  // This generic staged driver declares its OWN owner memberships (sync_source_job_owners) so it can
+  // share the single (bucket, cycle_date) cycle with other report families (e.g. Keyword Rank) without
+  // touching their canonical jobs. owner_id (sourceJobOwnerId) is account/organization safe; the declared
+  // owner set + the planned membership keys grow as each round's plan (kickoff + reconstructed/derived
+  // fallbacks) reveals more of this driver's jobs. runSourceJobs processes only THIS driver's owned+
+  // planned canonical jobs; a job owned by another family is never touched.
+  const ownerIdSet = new Set();
+  const plannedMembershipKeys = new Set(); // owner_id|request_hash actually planned this invocation
 
   for (let round = 0; round < maxRounds; round += 1) {
     const plan = await resolvePlan(signals);
     const plannedJobs = (plan && plan.sourceJobs) || [];
-    for (const j of plannedJobs) if (j && j.requestHash) ownedByHash.set(j.requestHash, j);
+    for (const j of plannedJobs) {
+      if (j && j.owner && j.owner.ownerId) { ownerIdSet.add(j.owner.ownerId); plannedMembershipKeys.add(`${j.owner.ownerId}|${j.requestHash}`); }
+    }
     const remaining = maxJobs === Infinity ? Infinity : Math.max(0, maxJobs - rollup.processed);
     if (remaining === 0) { rollup.drained = false; break; }
 
     const res = await runSourceJobs({
-      store, dataDoe, plannedJobs, ownedJobs: [...ownedByHash.values()], bucket, cycleDate, scheduledAt, trigger,
+      store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
       clock, deadlineMs, reserveMs, maxJobs: remaining,
     });
     rollup.cycleId = res.cycleId;
@@ -273,5 +295,24 @@ export async function runStagedSourceCycle({
     if (allSeen && JSON.stringify(signals) === before) { rollup.drained = res.drained; break; }
     rollup.drained = res.drained;
   }
+  await reconcileStaleOwnerMemberships(store, rollup.cycleId, [...ownerIdSet], plannedMembershipKeys);
   return rollup;
+}
+
+// Mark any DURABLE active owner membership (for the declared owners) that this invocation's plan no longer
+// contains as stale -- owner-scoped only. It NEVER touches the shared canonical sync_source_jobs row or
+// any other owner's membership, and never triggers a DataDoe call: a hash another owner still depends on
+// stays executable/resumable/readable, and its last-known-good source data remains valid.
+export async function reconcileStaleOwnerMemberships(store, cycleId, ownerIds, plannedMembershipKeys) {
+  if (!cycleId || !store.listSourceJobOwners || !store.recordSourceOwnerStale || !ownerIds.length) return;
+  const durable = await store.listSourceJobOwners(cycleId, ownerIds);
+  for (const m of durable) {
+    const ownerId = m.owner_id ?? m.ownerId;
+    const requestHash = m.request_hash ?? m.requestHash;
+    const status = m.owner_status ?? m.ownerStatus ?? "active";
+    if (status === "stale") continue;
+    if (!plannedMembershipKeys.has(`${ownerId}|${requestHash}`)) {
+      await store.recordSourceOwnerStale({ cycleId, requestHash, ownerId, code: "STALE_PLAN", message: "Owner plan no longer requires this source; membership retired (canonical source preserved)." });
+    }
+  }
 }
