@@ -14,7 +14,7 @@
 // No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, salesMoversWindows } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
@@ -296,7 +296,9 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
     // Stage the downstream ONLY once the typed probe validates with a real reported date (fail closed via
     // the shared evaluateStagedActivation); the resolver then binds/validates the exact recent+prior weeks.
     const trafficContract = (REPORT_SOURCE_CONTRACTS["sales-movers"] || []).find((c) => c.requestKey === "sales-movers:traffic");
-    if (trafficContract && evaluateStagedActivation(trafficContract.activation, probeSignal)) {
+    // A validated probe date is required to derive the windows; a malformed date stages no downstream (the
+    // derive rejects the bad probe row as invalid instead), so the planner never throws on bad source data.
+    if (trafficContract && evaluateStagedActivation(trafficContract.activation, probeSignal) && isValidCalendarDate(probeSignal.latestReportedDate)) {
       const { recent, prior } = salesMoversWindows(probeSignal.latestReportedDate);
       windowsByRequestKey["sales-movers:traffic"] = [recent, prior];
       windowsByRequestKey["sales-movers:ads"] = [recent, prior];
