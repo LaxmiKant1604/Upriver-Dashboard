@@ -30,6 +30,7 @@ import {
   salesMoversLatestReportedDate,
   salesMoversPayload,
   salesMoversUnavailablePayload,
+  buyBoxLossPayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -44,7 +45,7 @@ import {
 // planMonthWindows/addDaysStr are shared dependency-free window helpers (byte-identical to the
 // api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
 // keeps the pure derivation graph free of any DataDoe transport / Supabase import.
-import { planMonthWindows, addDaysStr } from "../date-windows.js";
+import { planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
 
 // FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
 // constant. The derivation RECOMPUTES the expected inventory start as addDaysStr(asOf, -10) and pins
@@ -65,6 +66,16 @@ const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
 const SM_INVENTORY_LOOKBACK_DAYS = 10;
 const SM_SOURCE_LABEL = "Sales & Traffic by ASIN & Date";
+
+// Buy Box Loss constants -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28) +
+// SLICE_DAYS (7), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), PROFIT_BY_SKU.label, and the fixed
+// price-source label. The derivation RECOMPUTES the four 7-day daily slices + the inventory window from
+// asOf and pins every endpoint, never trusting a caller's fragment windows.
+const BB_WINDOW_DAYS = 28;
+const BB_SLICE_DAYS = 7;
+const BB_INVENTORY_LOOKBACK_DAYS = 10;
+const BB_SOURCE_LABEL = "Profit by SKU & Date";
+const BB_PRICE_SOURCE_LABEL = "FBA Inventory Health";
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -133,14 +144,15 @@ function singleAccountFragmentRows(source, key, rawSellerId, wantFrom, wantTo) {
   return source.rows;
 }
 
-// Sales Movers: traffic and ads must each be EXACTLY the two ordered single-account fragments
-// [recent, prior] whose windows equal salesMoversWindows(latest). A positional window match rejects a
-// reordered/duplicate/partial/extra/missing/cross-account/overlapping fragment. Returns the ordered
-// fragments (with rows) or throws (=> derive-invalid => last-known-good preserved).
-function validateSalesMoversOrderedWindows(source, expected, rawSellerId, key) {
+// A required multi-window source must be EXACTLY the `expected` ordered single-account fragments, whose
+// windows equal the recomputed canonical windows positionally (Sales Movers' [recent, prior]; Buy Box's
+// four ordered 7-day daily slices). A positional match rejects a reordered/duplicate/partial/extra/
+// missing/cross-account/overlapping/wrong-window fragment. Returns the ordered fragments (with rows) or
+// throws (=> derive-invalid => last-known-good preserved, zero writes).
+function validateOrderedSingleAccountWindows(source, expected, rawSellerId, key) {
   const frags = (source && source.fragments) || [];
   if (frags.length !== expected.length) {
-    throw new Error(`${key} must be exactly ${expected.length} ordered single-account fragments (recent, prior); snapshot blocked.`);
+    throw new Error(`${key} must be exactly ${expected.length} ordered single-account fragments; snapshot blocked.`);
   }
   for (let i = 0; i < expected.length; i += 1) {
     const f = frags[i];
@@ -580,8 +592,8 @@ const REGISTRY = {
         }
       }
       // Traffic + Ads: exactly two ordered single-account fragments [recent, prior].
-      const trafficFrags = validateSalesMoversOrderedWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
-      const adsFrags = validateSalesMoversOrderedWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
+      const trafficFrags = validateOrderedSingleAccountWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
+      const adsFrags = validateOrderedSingleAccountWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
       // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
       const inventoryFrom = addDaysStr(asOf, -SM_INVENTORY_LOOKBACK_DAYS);
       const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryFrom, asOf);
@@ -610,7 +622,63 @@ const REGISTRY = {
     // Latest real data date = the latest reported sales date (date-only already), null when unavailable.
     latestDataDate: (p) => (isValidCalendarDate(p && p.salesLatestDate) ? p.salesLatestDate : null),
   },
-  "buy-box-loss": { snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
+  // Buy Box Loss: reproduce the api/datadoe.js `buy-box-loss` payload from the FOUR ordered 7-day raw
+  // daily slices (Profit by SKU & Date), the shared FBA inventory snapshot, and the shared no-date
+  // catalog. ALL three sources are required (optionalRequestKeys: []) -- the report fetch gate keeps the
+  // report PENDING until every slice + inventory + catalog succeeds, so a failed/terminal/truncated/
+  // missing required source never saves (last-known-good preserved). Windows are RECOMPUTED from asOf and
+  // pinned positionally: exactly four ordered non-overlapping 7-day slices covering [asOf-27d, asOf], the
+  // inventory [asOf-10d, asOf], and one no-date catalog -- a wrong/missing/duplicate/reordered/overlapping/
+  // partial/extra/cross-account/malformed fragment throws => derive-invalid => zero writes, LKG preserved.
+  // buybox_percentage is a ratio (page-view weighted, unweighted-mean fallback); null observations are
+  // excluded; currencies never merge. ZERO DataDoe/network calls (pure).
+  "buy-box-loss": {
+    snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("buy-box-loss derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      // rawSellerId (raw DataDoe seller id) is the SOLE source scope: DataDoe request scope + the id every
+      // fragment must carry (cross-account rejection). publicAccountId (context.accountId) is the public/
+      // prefixed id the report job + snapshot row are keyed by and is what the PAYLOAD carries, so the
+      // frontend scopes catalogBrands to the right account. They are equal on the primary route.
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      const from = addDaysStr(asOf, -(BB_WINDOW_DAYS - 1));
+      // All three sources are required; defensively reject a missing/failed/unreadable cache (the worker
+      // fetch gate already keeps such a report PENDING/blocked, but never derive an empty success).
+      for (const key of ["buy-box-loss:daily", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
+        const s = sources[key];
+        if (!s || s.available !== true || !Array.isArray(s.rows)) {
+          throw deriveError(`buy-box-loss ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+        }
+      }
+      // Daily: EXACTLY the four ordered 7-day slices covering [asOf-27d, asOf], recomputed + pinned.
+      const expectedSlices = splitDateRangeByDays(from, asOf, BB_SLICE_DAYS);
+      const dailyFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:daily"], expectedSlices, rawSellerId, "buy-box-loss:daily");
+      // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
+      const inventoryFrom = addDaysStr(asOf, -BB_INVENTORY_LOOKBACK_DAYS);
+      const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryFrom, asOf);
+      // Catalog: exactly one single-account no-date fragment.
+      const catalogRows = noDateFragmentRows(sources["buy-box-loss:catalog"], "buy-box-loss:catalog", rawSellerId);
+      // Every saved fragment row must be a plain object (a non-object row is malformed source data).
+      dailyFrags.forEach((f, i) => assertPlainObjectRows(f.rows, `buy-box-loss daily slice ${i}`));
+      assertPlainObjectRows(inventoryRows, "buy-box-loss inventory");
+      assertPlainObjectRows(catalogRows, "buy-box-loss catalog");
+      return buyBoxLossPayload({
+        accountId: publicAccountId, asOf, from, windowDays: BB_WINDOW_DAYS, sliceDays: BB_SLICE_DAYS,
+        sourceLabel: BB_SOURCE_LABEL, priceSourceLabel: BB_PRICE_SOURCE_LABEL,
+        dailySliceRows: dailyFrags.map((f) => f.rows),
+        inventoryRows, catalogRows,
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
+      && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && !!p.window && typeof p.window === "object"
+      && ("inventoryAvailable" in p) && ("inventorySnapshotDate" in p) && ("observedWindow" in p),
+    // Latest real data date = the latest observed daily date (the observed-window `to`), null when empty.
+    latestDataDate: (p) => (p && p.observedWindow && isValidCalendarDate(p.observedWindow.to) ? p.observedWindow.to : null),
+  },
   "returns-leakage": { snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "listing-health": { snapshotVersion: "listing-health/v2d-1", optionalRequestKeys: ["listing-health:listings-raw"], derivedSourceKeys: [], derive: null },
   "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },

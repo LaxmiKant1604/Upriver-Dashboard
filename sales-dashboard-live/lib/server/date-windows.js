@@ -38,6 +38,21 @@ export function splitDateRangeByMonth(from, to) {
   return windows;
 }
 
+// Split [from, to] into consecutive <=`days`-long windows (the final one capped at `to`). Byte-identical
+// to the lib/server/datadoe.js copy the live builder uses, kept here TRANSPORT-FREE so the Scheduler v2
+// planner and the pure derivation share ONE slicing implementation -- the planner stages exactly the
+// windows the derivation later validates (e.g. Buy Box's 28-day range as four ordered 7-day slices).
+export function splitDateRangeByDays(from, to, days) {
+  const windows = [];
+  let cursor = from;
+  while (cursor <= to) {
+    const end = addDaysStr(cursor, days - 1);
+    windows.push({ from: cursor, to: end < to ? end : to });
+    cursor = addDaysStr(end, 1);
+  }
+  return windows;
+}
+
 export function isFullCalendarMonthWindow(window) {
   const [year, month] = window.from.slice(0, 7).split("-").map(Number);
   return window.from === `${year}-${pad2s(month)}-01`

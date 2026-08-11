@@ -957,3 +957,185 @@ export function salesMoversUnavailablePayload({ accountId, asOf, lagDays, source
     catalogBrands: [],
   };
 }
+
+/* ================================ Buy Box Loss ================================ */
+// PURE cores for Buy Box Loss, transcribed VERBATIM from lib/server/reports/buy-box.js +
+// common.js fetchInventorySnapshot. buybox_percentage is a RATIO on Profit by SKU & Date, so it is
+// NEVER summed: the share is page-view weighted, falling back to an unweighted mean over OBSERVED days
+// only when no observed day had page views. Null buy-box observations are EXCLUDED (a sole seller with
+// no competition is not a 0% loss). Currency+SKU is the aggregation identity; two currencies for one SKU
+// never merge. Missing inventory snapshot stays unavailable/null, never a fabricated zero.
+
+/**
+ * Latest FBA Inventory Health snapshot folded by SKU, byte-identical to common.js fetchInventorySnapshot's
+ * `bySku`. Keeps only the newest date present; first row wins per SKU. Competitive prices are nullable and
+ * kept null (a missing price is never read as "priced at zero"). `available` is snapshot-level presence.
+ */
+export function buyBoxInventoryFold(rows) {
+  const all = Array.isArray(rows) ? rows : [];
+  let snapshotDate = null;
+  for (const row of all) {
+    if (row && row.date && (!snapshotDate || row.date > snapshotDate)) snapshotDate = row.date;
+  }
+  const current = snapshotDate ? all.filter((row) => row.date === snapshotDate) : [];
+  const bySku = new Map();
+  for (const row of current) {
+    const sku = String(row.sku || "").trim();
+    const asin = String(row.child_asin || "").trim();
+    const entry = {
+      sku: sku || null,
+      asin: asin || null,
+      productName: String(row.product_name || "").trim() || null,
+      currency: String(row.currency || "").trim() || null,
+      available: num(row.available),
+      unfulfillable: num(row.unfulfillable_quantity),
+      inbound: num(row.inbound_shipped) + num(row.inbound_received),
+      daysOfSupply: numOrNull(row.days_of_supply),
+      unitsShippedT30: num(row.units_shipped_t30),
+      yourPrice: numOrNull(row.your_price),
+      salesPrice: numOrNull(row.sales_price),
+      featuredOfferPrice: numOrNull(row.featuredoffer_price),
+      lowestPriceNewPlusShipping: numOrNull(row.lowest_price_new_plus_shipping),
+      alert: String(row.alert || "").trim() || null,
+    };
+    if (sku && !bySku.has(sku)) bySku.set(sku, entry);
+  }
+  return { snapshotDate, available: current.length > 0, bySku };
+}
+
+/**
+ * Fold the ordered raw daily slices (an array of row-arrays, oldest slice first, each ordered by date
+ * ASC) into the per (currency|sku) accumulator, byte-identical to buildBuyBoxLoss()'s slice loop. asin /
+ * productName / brand take the FIRST non-empty value seen (slice + date order), so the caller MUST pass
+ * the slices in window order. Tracks the observed min/max date across every row.
+ */
+export function buyBoxDailyFold(sliceRowArrays) {
+  const bySku = new Map();
+  let observedFrom = null;
+  let observedTo = null;
+  for (const rows of Array.isArray(sliceRowArrays) ? sliceRowArrays : []) {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const sku = String(row.sku || "").trim();
+      if (!sku) continue;
+      const currency = String(row.currency || "").trim() || null;
+      const key = `${currency || "?"}|${sku}`;
+      let entry = bySku.get(key);
+      if (!entry) {
+        entry = {
+          sku,
+          asin: String(row.child_asin || "").trim() || null,
+          productName: String(row.product_name || "").trim() || null,
+          brand: String(row.product_brand || "").trim() || null,
+          currency,
+          sales: 0, units: 0, pageViews: 0,
+          buyBoxWeighted: 0, buyBoxWeight: 0, buyBoxSum: 0, buyBoxDays: 0, daysWithSales: 0,
+        };
+        bySku.set(key, entry);
+      }
+      if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
+      if (!entry.brand) entry.brand = String(row.product_brand || "").trim() || null;
+
+      const date = String(row.date || "");
+      if (date) {
+        if (!observedFrom || date < observedFrom) observedFrom = date;
+        if (!observedTo || date > observedTo) observedTo = date;
+      }
+
+      const sales = num(row.total_sales);
+      const units = num(row.total_units_sold);
+      const pageViews = num(row.page_views);
+      entry.sales += sales;
+      entry.units += units;
+      entry.pageViews += pageViews;
+      if (sales !== 0 || units !== 0) entry.daysWithSales += 1;
+
+      // Null buy-box => no featured-offer competition observed; excluded from the share, not counted 0%.
+      const buyBox = numOrNull(row.buybox_percentage);
+      if (buyBox !== null) {
+        entry.buyBoxDays += 1;
+        entry.buyBoxSum += buyBox;
+        if (pageViews > 0) {
+          entry.buyBoxWeighted += buyBox * pageViews;
+          entry.buyBoxWeight += pageViews;
+        }
+      }
+    }
+  }
+  return { bySku, observedFrom, observedTo };
+}
+
+/**
+ * Full Buy Box Loss payload, byte-identical to buildBuyBoxLoss() for the same saved rows. Excludes SKUs
+ * with no sales/units and SKUs with no observed buy-box data; page-view-weighted share with an
+ * unweighted-mean fallback; price/stock evidence null when the snapshot did not carry the SKU. Pure.
+ */
+export function buyBoxLossPayload({
+  accountId, asOf, from, windowDays, sliceDays, sourceLabel, priceSourceLabel,
+  dailySliceRows, inventoryRows, catalogRows,
+}) {
+  const daily = buyBoxDailyFold(dailySliceRows);
+  const inventory = buyBoxInventoryFold(inventoryRows);
+  // The shared common-insight catalog fold (child_asin -> { name, brand, parentAsin }); identical to
+  // common.js fetchCatalog, so Buy Box + Sales Movers + other insight reports share one catalog identity.
+  const catalog = salesMoversCatalogFold(catalogRows);
+
+  const rows = [];
+  const currencies = new Set();
+  for (const entry of daily.bySku.values()) {
+    // Only SKUs that actually sold in the window can have revenue at risk.
+    if (entry.units <= 0 && entry.sales <= 0) continue;
+    if (entry.buyBoxDays === 0) continue; // no observed buy-box data at all
+
+    const weighted = entry.buyBoxWeight > 0;
+    const buyBoxPct = weighted
+      ? entry.buyBoxWeighted / entry.buyBoxWeight
+      : entry.buyBoxSum / entry.buyBoxDays;
+
+    const stock = inventory.bySku.get(entry.sku) || null;
+    const meta = entry.asin ? catalog.byAsin.get(entry.asin) || {} : {};
+    if (entry.currency) currencies.add(entry.currency);
+
+    rows.push({
+      sku: entry.sku,
+      asin: entry.asin,
+      productName: entry.productName || meta.name || null,
+      brand: salesMoversBrandLabel(entry.brand || meta.brand),
+      currency: entry.currency,
+      buyBoxPct,
+      buyBoxBasis: weighted ? "page-view weighted" : "unweighted mean of observed days",
+      buyBoxDays: entry.buyBoxDays,
+      windowDays,
+      sales: entry.sales,
+      units: entry.units,
+      pageViews: entry.pageViews,
+      // Price and stock evidence. null means the snapshot did not carry it, and the client must then
+      // refuse to name a cause.
+      price: stock
+        ? {
+          yourPrice: stock.yourPrice,
+          salesPrice: stock.salesPrice,
+          featuredOfferPrice: stock.featuredOfferPrice,
+          lowestPriceNewPlusShipping: stock.lowestPriceNewPlusShipping,
+          currency: stock.currency,
+        }
+        : null,
+      available: stock ? stock.available : null,
+      unitsShippedT30: stock ? stock.unitsShippedT30 : null,
+      inventoryKnown: Boolean(stock),
+    });
+  }
+
+  return {
+    accountId,
+    asOf,
+    window: { from, to: asOf, days: windowDays, sliceDays },
+    observedWindow: daily.observedFrom && daily.observedTo ? { from: daily.observedFrom, to: daily.observedTo } : null,
+    sourceLabel,
+    priceSourceLabel,
+    inventoryAvailable: inventory.available,
+    inventorySnapshotDate: inventory.snapshotDate,
+    currencies: [...currencies].sort(),
+    rows,
+    catalogBrands: catalog.catalogBrands,
+  };
+}
