@@ -200,11 +200,13 @@ function deriveError(message, deriveStatus) {
   return e;
 }
 
-// Blocker 4: before counting SQP periods or selecting cadence, EVERY row must be a plain object whose
+// Shared, report-neutral row-window guard: EVERY row of a dated fragment must be a plain object whose
 // `date` is a REAL YYYY-MM-DD calendar date INSIDE the exact fragment window [from..to]. Invalid rows are
-// NOT silently filtered -- one malformed / non-calendar / out-of-window row makes the report `invalid`
-// (throws -> derive-invalid -> zero snapshot writes -> last-known-good preserved). Pure.
-function assertSqpRowsInWindow(rows, from, to, label) {
+// NOT silently filtered -- one malformed / non-calendar / future / out-of-window / wrong-slice row makes
+// the report `invalid` (throws -> derive-invalid -> zero snapshot writes -> last-known-good preserved).
+// Used by Keyword Rank (weekly/monthly SQP), Sales Movers (latest-date probe) and Buy Box Loss (each daily
+// 7-day slice + the inventory snapshot window). Pure; behavior unchanged from the former SQP-named helper.
+function assertRowsInWindow(rows, from, to, label) {
   for (const row of rows) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
       throw new Error(`${label} contains a non-object row; snapshot blocked (invalid).`);
@@ -496,7 +498,7 @@ const REGISTRY = {
       // Blocker 4: validate every weekly SQP row (plain object + real calendar date inside the 84-day
       // window) BEFORE counting periods, so a stale/out-of-window/malformed row can never select the
       // wrong cadence or enter a saved payload -- it makes the report invalid instead.
-      assertSqpRowsInWindow(weeklyRows, weeklyFrom, asOf, "keyword-rank weekly SQP");
+      assertRowsInWindow(weeklyRows, weeklyFrom, asOf, "keyword-rank weekly SQP");
       const weeklyPeriods = sqpDistinctPeriods(weeklyRows);
       let cadence = "weekly";
       let rows = weeklyRows;
@@ -513,7 +515,7 @@ const REGISTRY = {
           throw deriveError("keyword-rank monthly SQP fallback is required (weekly < 4 periods) but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
         }
         const monthlyRows = singleAccountFragmentRows(monthly, "keyword-rank:sqp-monthly", rawSellerId, longFrom, asOf);
-        assertSqpRowsInWindow(monthlyRows, longFrom, asOf, "keyword-rank monthly SQP");
+        assertRowsInWindow(monthlyRows, longFrom, asOf, "keyword-rank monthly SQP");
         const monthlyPeriods = sqpDistinctPeriods(monthlyRows);
         if (monthlyPeriods.length >= 2) {
           cadence = "monthly"; rows = monthlyRows; periods = monthlyPeriods;
@@ -573,7 +575,7 @@ const REGISTRY = {
       // Required PROBE: exactly one single-account fragment over [probeFrom, asOf]; every row a plain
       // object with a real calendar date inside that window (recompute the window; never trust the caller).
       const probeRows = singleAccountFragmentRows(sources["sales-movers:sales-latest-probe"], "sales-movers:sales-latest-probe", rawSellerId, probeFrom, asOf);
-      assertSqpRowsInWindow(probeRows, probeFrom, asOf, "sales-movers latest-date probe");
+      assertRowsInWindow(probeRows, probeFrom, asOf, "sales-movers latest-date probe");
       const latestReportedDate = salesMoversLatestReportedDate(probeRows);
       if (!latestReportedDate) {
         // Validated probe, no reported units => a VALID completed dataUnavailable snapshot; no downstream.
@@ -662,9 +664,13 @@ const REGISTRY = {
       const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryFrom, asOf);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["buy-box-loss:catalog"], "buy-box-loss:catalog", rawSellerId);
-      // Every saved fragment row must be a plain object (a non-object row is malformed source data).
-      dailyFrags.forEach((f, i) => assertPlainObjectRows(f.rows, `buy-box-loss daily slice ${i}`));
-      assertPlainObjectRows(inventoryRows, "buy-box-loss inventory");
+      // Bind EVERY source ROW to its validated window, not just the fragment metadata: each daily row must
+      // be a plain object with a real calendar date INSIDE ITS OWN seven-day slice (never merely inside the
+      // 28-day range -- a row in the wrong slice is rejected), and each inventory row must carry a real date
+      // inside [asOf-10d, asOf]. One malformed/impossible/future/out-of-window/wrong-slice row => invalid
+      // (zero writes, LKG preserved); bad rows are NEVER silently filtered. Catalog rows are no-date.
+      dailyFrags.forEach((f, i) => assertRowsInWindow(f.rows, expectedSlices[i].from, expectedSlices[i].to, `buy-box-loss daily slice ${i}`));
+      assertRowsInWindow(inventoryRows, inventoryFrom, asOf, "buy-box-loss inventory");
       assertPlainObjectRows(catalogRows, "buy-box-loss catalog");
       return buyBoxLossPayload({
         accountId: publicAccountId, asOf, from, windowDays: BB_WINDOW_DAYS, sliceDays: BB_SLICE_DAYS,
