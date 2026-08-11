@@ -2616,3 +2616,59 @@ test:report-derivation` **219** (66+30+33+20+34+24+12); `npm run test:report-con
 unchanged); `npm run test:source-identity` (**7**, golden request_hash unchanged); `npm run verify` = exit
 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
 files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 47. Ownership: deferral-safe generic fixpoint + convergent migration (SHADOW MODE, 2026-08-11)
+
+Fixes the two narrow lifecycle/integrity blockers from the re-review. Behavioural scheduler-v2 code +
+the (still UNAPPLIED) ownership migration only; `api/datadoe.js`, the report CONTRACTS,
+`report-derivation.js`, `source-worker.js`, `keyword-rank-cycle.js`, Scheduler v1, and the frontend are
+unchanged. All approved work is preserved: owner-ID recomputation before writes/DataDoe, Keyword Rank
+authoritative reconciliation, interrupted owner-A->owner-B resume, primary-only routing (no
+secondary->primary fallback), one-attempt, strict caps, LKG, five-ID batching, request_hash, partial-report
+PENDING, and SHADOW MODE. `HANDOFF.md` untracked/untouched.
+
+### 47.1 Blocker 1 -- a resumable deferral is never a generic fixpoint (`source-sync-driver.js`)
+
+`runStagedSourceCycle` did not accumulate/inspect `res.deferred`. A poll/download deferral adds no
+dependency signal, so a later round saw the same `allSeen` hashes with unchanged signals and set
+`fixpointReached` true even though `res.drained` was false -- reconciling an incomplete plan and staling
+previously discovered downstream memberships. Now the generic rollup carries `deferred`, accumulates
+`res.deferred`, STOPS immediately on any deferral (drained=false, no reconcile), and a valid fixpoint also
+requires `res.drained === true` at the stable break. A fresh invocation resumes the export from its
+persisted export_id.
+
+Corrected generic fixpoint / reconciliation state table (per round outcome):
+
+| round outcome | drained | deferred | deadline | valid fixpoint? | reconcile? |
+| --- | --- | --- | --- | --- | --- |
+| stable (hashes allSeen + signals unchanged) AND drained | true | 0 | no | YES | reconcile removed deps |
+| stable but NOT drained | false | 0 | no | no | defer |
+| any resumable deferral | false | > 0 | no | no (stop now) | defer |
+| deadline reached | false | any | yes | no | defer |
+| maxJobs / maxRounds truncated | false | any | any | no | defer |
+
+### 47.2 Blocker 2 -- convergent, idempotent ownership migration (`20260811_...`, UNAPPLIED)
+
+The fresh CREATE had typed connection_id, non-empty identity fields, and no blank defaults; the
+existing-table path only added `connection_id text not null default 'primary'` -- weaker, and could
+mislabel an existing secondary membership as primary. Now the typed-connection and non-empty-identity
+checks are NAMED and added via idempotent `pg_constraint`-guarded DO-blocks that run on BOTH paths (the
+CREATE no longer inlines them), so a fresh table and an earlier-shape table converge to the SAME
+constraints. connection_id is added nullable-first, BACKFILLED deterministically from the safe public
+account scope (dd-secondary: prefix => dd-secondary, else primary; fills NULLs and corrects a mislabeled
+primary, NEVER rewrites a secondary account to primary), then set NOT NULL + final default only AFTER the
+backfill. Blank/invalid identity rows FAIL the migration closed (raise); blank defaults are dropped and
+NOT NULL asserted for report_key/account_id/organization_fingerprint/account_scope_hash. Repeated
+execution is idempotent; request_hash and owner_id are never altered; no secret is stored.
+
+### 47.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `sync-signals.test.js` **12** (+4 generic-driver
+poll/download-deferral no-false-stale, resume with one create total, real drained fixpoint, unrelated
+owner untouched); `sync-source-owners.test.js` **17** (+3 both-paths convergence, deterministic backfill,
+malformed-fail-closed + idempotent + no-secret). `npm run test:sync-engine` **79** (22+17+6+12+4+17+1);
+`npm run test:report-derivation` **219** (66+30+33+20+34+24+12); `npm run test:report-contracts`
+(**161**, unchanged); `npm run test:source-identity` (**7**, golden request_hash unchanged); `npm run
+verify` = exit 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only
+the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all
+reports locked.

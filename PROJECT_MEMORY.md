@@ -5777,3 +5777,32 @@ Preserve all approved owner-ID checks, Keyword authoritative reconciliation, cro
 request_hash, primary-only live routing, strict caps, LKG, partial-report behavior, and SHADOW MODE. Do not
 start another adapter, push, merge, deploy, apply the migration, unlock controls, schedule anything, modify
 Scheduler v1/frontend, or touch untracked `HANDOFF.md` during this narrow correction.
+
+## Scheduler v2: ownership lifecycle re-review fixes -- deferral-safe fixpoint + convergent migration (Claude, 2026-08-11)
+
+Fixed the two narrow blockers from the Codex re-review (`9fb8bf2`). Behavioural scheduler-v2 code + the
+(still UNAPPLIED) ownership migration only; `api/datadoe.js`, report CONTRACTS, `report-derivation.js`,
+`source-worker.js`, `keyword-rank-cycle.js`, Scheduler v1, and the frontend are unchanged. All prior
+approved work preserved (owner-ID recomputation, Keyword authoritative reconciliation, cross-owner resume,
+primary-only routing/no fallback, one-attempt, strict caps, LKG, five-ID, request_hash, partial-report
+PENDING, SHADOW MODE). Detail in `SCHEDULER_V2.md` section 47. Two small green commits + docs.
+
+- **Blocker 1 (`source-sync-driver.js`).** `runStagedSourceCycle` ignored `res.deferred`; a poll/download
+  deferral adds no signal, so a later round looked like a fixpoint (allSeen + signals unchanged) while
+  `res.drained` was false -- reconciling an incomplete plan and staling downstream memberships. The generic
+  rollup now carries `deferred`, accumulates `res.deferred`, STOPS immediately on any deferral (drained
+  false, no reconcile), and a valid fixpoint additionally requires `res.drained === true`. A fresh
+  invocation resumes from the persisted export_id.
+- **Blocker 2 (`20260811_sync_source_job_owners.sql`, UNAPPLIED).** The existing-table upgrade path only
+  added `connection_id text not null default 'primary'` -- weaker than the fresh CREATE and able to mislabel
+  a secondary membership as primary. Now the typed-connection + non-empty-identity checks are NAMED and added
+  via idempotent pg_constraint-guarded DO-blocks on BOTH paths (CREATE no longer inlines them), connection_id
+  is added nullable-first + backfilled deterministically from the account scope (dd-secondary: => dd-secondary,
+  else primary; never rewrites a secondary to primary) + finalized NOT NULL/default after backfill; blank/
+  invalid identity rows fail the migration closed; blank defaults dropped + NOT NULL on the identity columns;
+  idempotent re-run; request_hash/owner_id never altered; no secret.
+- **Verification (all natural, exit 0).** sync-signals **12** (+4); sync-source-owners **17** (+3);
+  test:sync-engine **79** (22+17+6+12+4+17+1); test:report-derivation **219** (66+30+33+20+34+24+12);
+  test:report-contracts 161 (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run
+  verify` = exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+
+  untracked HANDOFF.md).
