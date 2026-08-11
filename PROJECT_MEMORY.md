@@ -6458,3 +6458,53 @@ production build (exit 0); `git diff --check` clean; only the intended files cha
 `HANDOFF.md`). Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled. Unresolved live
 assumption: persisted-Ads FRESHNESS (worker sync cadence vs the 30-day window) is surfaced via
 sourceAvailability.sync but the derive does not gate on staleness -- confirm at live unlock.
+
+## Scheduler v2: PPC Performance review blockers (Codex, 2026-08-12)
+
+Reviewed commits `bc7cb02`, `8638376`, `f0ec4e6`, `8b88362`, and `9f90236`
+from approved base `393f3fc`. The pure folds, TACoS degradation, staged-only entry
+point, catalog dedup, strict total-sales handling, and direct PPC test suite are
+otherwise coherent, but PPC is **not approved** yet because two persisted-Ads
+integrity/isolation blockers remain.
+
+1. **An unseeded account is classified as a validated empty Ads window and spends
+   DataDoe tokens.** `loadPersistedPpcAds` filters `ads_sync_state` rows but never
+   validates their completeness/status and never reads the durable successful
+   `ads_sync_coverage` windows. A successful Supabase read returning `rows=[]` and
+   `syncStates=[]` therefore returns `status:"ok"`; `ppcAdsCurrencySignalOf` turns
+   it into `{status:"success", validated:true, currencyCount:0}`; and
+   `planPpcPerformance` emits both `ppc-performance:total-sales` and
+   `ppc-performance:catalog`. Independent checked-out-worktree reproduction:
+   `loadedStatus:"ok"`, zero sync states, and those two planned request keys. This
+   contradicts the tranche's central guarantee that unseeded/unvalidated Ads plan
+   nothing, spend zero tokens, and preserve LKG. The current test named
+   "unavailable/unseeded" proves only a throwing row read; it deliberately ignores
+   the successful empty/no-state result. Fix with a typed per-source coverage policy
+   backed by the already-additive `ads_sync_coverage` successful windows (not by
+   metric-row min/max or `latest_metric_date`, because covered zero-activity days
+   have no row). At minimum the default campaign + ASIN sources must prove complete
+   `[asOf-29d,asOf]` coverage before an empty window is genuine; optional
+   targeting/search availability must be explicit and must not let stale/unproven
+   rows masquerade as current data. Missing/schema-missing/read-failed/partial/stale/
+   malformed/duplicate sync evidence must fail closed with zero DataDoe jobs and LKG.
+
+2. **Persisted Ads rows are not account-bound at row level.** The production
+   `getAdsDailySourceRows` SELECT omits `account_id`, and `validatePpcAdsRows` accepts
+   a row carrying `account_id:"OTHER"` while deriving account A1. The PostgREST
+   account filter is useful but is not the fail-closed row-level isolation proof used
+   by the other Scheduler-v2 adapters; an injected/mis-scoped reader can leak another
+   account's Ads into A1. Select `account_id` and require every row's public account
+   id to equal the authoritative requested account before currency gating or folding.
+   One mismatch/missing id must make the Ads context unavailable/invalid, plan zero
+   DataDoe jobs, write no snapshot, and preserve LKG. Primary-only routing and dormant
+   `dd-secondary:` public-id namespacing must remain intact.
+
+The direct `report-ppc-performance.test.js` run passes its existing 30 assertions,
+which confirms these states are missing test coverage rather than already handled.
+The full `npm run verify` reached `test:report-derivation` after all earlier suites
+passed, then did not terminate in this shared worktree and was interrupted; do not
+claim a new full-suite pass from this review. Add focused loader + real-cycle +
+worker/LKG regressions for both blockers, then rerun every standard suite naturally.
+Do not start Listing Optimizer, alter the live route/folds/source contracts/request
+identity, apply migrations, unlock PPC, schedule, push, merge, or deploy in the
+correction pass. `HANDOFF.md` remains untracked and untouched.
