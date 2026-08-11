@@ -34,6 +34,7 @@
 //   }
 
 import { isDataDoeDeadlineError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
+import { sourceJobOwnerId } from "../source-identity.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -261,9 +262,12 @@ export async function runSourceJobs({
   const ownerSet = usingOwners ? new Set(ownerIds.map((id) => String(id || "")).filter(Boolean)) : null;
   const planned = (plannedJobs || []).filter((j) => j && j.requestHash);
 
-  // Fail closed BEFORE any source/owner upsert (req 10/11): every plannedJob must carry a COMPLETE owner
-  // membership belonging to a DECLARED owner id. An empty scope with planned work, a missing/malformed
-  // membership, or an owner id outside the declared set all throw (never upsert-then-skip).
+  // Fail closed BEFORE any source/owner upsert AND before any DataDoe call (req 10/11 + Blocker 2): every
+  // plannedJob must carry COMPLETE owner metadata, its owner.requestKey must equal the canonical
+  // job.requestKey, and its supplied owner_id must EQUAL the value RECOMPUTED from the authoritative tuple
+  // sourceJobOwnerId(reportKey, connectionId, organization_fingerprint, account_scope_hash). owner_id is
+  // never trusted just because it appears in ownerIds -- so a buggy caller can never place an account/org
+  // job under another declared owner. The recomputed owner must also be in the declared owner scope.
   if (usingOwners) {
     if (!ownerSet.size && planned.length) {
       throw new Error("runSourceJobs was given planned jobs but an empty ownerIds scope; refusing (fail closed).");
@@ -271,8 +275,16 @@ export async function runSourceJobs({
     for (const j of planned) {
       const o = j.owner || {};
       const ownerId = String(o.ownerId || "");
-      if (!ownerId || !o.requestKey || !j.organizationFingerprint || !j.accountScopeHash) {
-        throw new Error(`plannedJobs entry (request_key "${o.requestKey || j.requestKey || ""}") is missing its owner membership identity (owner_id / request_key / organization_fingerprint / account_scope_hash); fail closed.`);
+      const rk = j.requestKey || "";
+      if (!ownerId || !o.reportKey || !o.accountId || !o.requestKey || !j.connectionId || !j.organizationFingerprint || !j.accountScopeHash) {
+        throw new Error(`plannedJobs entry (request_key "${o.requestKey || rk}") is missing owner membership metadata (owner_id / report_key / account_id / request_key / connection_id / organization_fingerprint / account_scope_hash); fail closed.`);
+      }
+      if (o.requestKey !== rk) {
+        throw new Error(`plannedJobs entry owner.request_key "${o.requestKey}" does not match the canonical job request_key "${rk}"; fail closed.`);
+      }
+      const expected = sourceJobOwnerId({ reportKey: o.reportKey, connectionId: j.connectionId, organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash });
+      if (!expected || expected !== ownerId) {
+        throw new Error(`plannedJobs entry (request_key "${rk}") owner_id does not match sourceJobOwnerId(report_key, connection_id, organization_fingerprint, account_scope_hash); refusing (fail closed).`);
       }
       if (!ownerSet.has(ownerId)) {
         throw new Error(`plannedJobs entry (owner_id "${ownerId}") does not belong to the declared owner scope; refusing to upsert then skip it.`);
@@ -299,7 +311,7 @@ export async function runSourceJobs({
   if (usingOwners && store.upsertSourceJobOwners) {
     await store.upsertSourceJobOwners(planned.map((j) => ({
       cycleId, requestHash: j.requestHash, ownerId: j.owner.ownerId, requestKey: j.owner.requestKey,
-      reportKey: j.owner.reportKey || "", accountId: j.owner.accountId || "",
+      reportKey: j.owner.reportKey, accountId: j.owner.accountId, connectionId: j.connectionId,
       organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash,
     })));
   }

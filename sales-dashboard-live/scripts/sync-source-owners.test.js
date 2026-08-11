@@ -58,10 +58,16 @@ test("20260811_sync_source_job_owners.sql creates the table with the required co
   // Composite FK to the canonical source-job identity.
   assert.match(flat, /foreign key \(cycle_id, request_hash\) references public\.sync_source_jobs \(cycle_id, request_hash\) on delete cascade/, "composite FK to sync_source_jobs(cycle_id, request_hash)");
   // Required owner concepts + safe status enum.
-  for (const col of ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id", "organization_fingerprint", "account_scope_hash", "owner_status", "created_at", "updated_at"]) {
+  for (const col of ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id", "connection_id", "organization_fingerprint", "account_scope_hash", "owner_status", "created_at", "updated_at"]) {
     assert.match(sql, new RegExp("\\b" + col + "\\b"), "declares " + col);
   }
   assert.match(flat, /owner_status text not null default 'active' check \(owner_status in \('active', 'stale'\)\)/, "typed owner_status active|stale");
+  // connection_id participates in owner identity and is a supported typed value.
+  assert.match(flat, /connection_id text not null default 'primary' check \(connection_id in \('primary', 'dd-secondary'\)\)/, "typed connection_id primary|dd-secondary");
+  // Owner-identity columns must be non-empty (no ambiguous owner persisted).
+  assert.match(flat, /constraint sync_source_job_owners_identity_nonempty check \(/, "non-empty identity constraint");
+  // Additive/idempotent connection_id guard for an already-created table.
+  assert.match(flat, /alter table public\.sync_source_job_owners add column if not exists connection_id/, "idempotent connection_id add-column guard");
   // RLS: enabled + admin-only read; service-role writes (bypass). No public write policy.
   assert.match(sql, /alter table public\.sync_source_job_owners enable row level security/, "RLS enabled");
   assert.match(sql, /create policy "admins read sync source job owners" on public\.sync_source_job_owners\s+for select to authenticated using \(public\.is_dashboard_admin\(\)\)/, "admin-only read policy");
@@ -89,34 +95,34 @@ test("getSyncSourceJobs SELECTs ONLY real canonical columns (no request_key)", a
   assert.ok(!select.split(",").includes("request_key"), "request_key is NOT selected (not a canonical column / not ownership authority)");
 });
 
-test("upsertSyncSourceJobOwners POSTs memberships with the right conflict key + reactivating body; fails closed before fetch on a malformed membership", async () => {
+test("upsertSyncSourceJobOwners POSTs a valid membership (conflict key + connection_id + reactivating body); fails closed before fetch on incomplete/mismatched identity", async () => {
+  const ownerId = sourceJobOwnerId({ reportKey: "daily-reporting", connectionId: "primary", organizationFingerprint: "org-fp", accountScopeHash: "scope-A1" });
+  const valid = { cycleId: "cyc-1", requestHash: "H1", ownerId, requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "A1", connectionId: "primary", organizationFingerprint: "org-fp", accountScopeHash: "scope-A1" };
   const cap = captureFetch(() => null);
-  try {
-    await upsertSyncSourceJobOwners([{
-      cycleId: "cyc-1", requestHash: "H1", ownerId: "owner-A", requestKey: "daily-reporting:catalog",
-      reportKey: "daily-reporting", accountId: "A1", organizationFingerprint: "org-fp", accountScopeHash: "scope-A1",
-    }]);
-  } finally { cap.restore(); }
+  try { await upsertSyncSourceJobOwners([valid]); } finally { cap.restore(); }
   const c = cap.calls[0];
   assert.match(c.url, /\/rest\/v1\/sync_source_job_owners\?on_conflict=cycle_id,request_hash,owner_id/, "conflict key = (cycle_id, request_hash, owner_id)");
   assert.equal(c.method, "POST");
   assert.match(String(c.headers.Prefer || ""), /resolution=merge-duplicates/, "merge-duplicates reactivation");
   const row = c.body[0];
-  assert.equal(row.owner_id, "owner-A");
+  assert.equal(row.owner_id, ownerId);
+  assert.equal(row.connection_id, "primary", "connection_id (part of owner identity) is persisted");
   assert.equal(row.request_key, "daily-reporting:catalog");
   assert.equal(row.owner_status, "active", "re-declared membership is (re)activated");
   assert.equal(row.error_code, null);
   assert.ok(!("api_key" in row) && !("apikey" in row) && !("secret" in row), "no secret-shaped field in the owner row");
 
-  // Malformed membership (missing owner_id) throws BEFORE any request.
-  const cap2 = captureFetch(() => null);
-  try {
-    await assert.rejects(
-      upsertSyncSourceJobOwners([{ cycleId: "c", requestHash: "H", ownerId: "", requestKey: "k", organizationFingerprint: "o", accountScopeHash: "s" }]),
-      /requires a non-empty owner_id/,
-    );
-    assert.equal(cap2.calls.length, 0, "no PostgREST request issued for a malformed membership");
-  } finally { cap2.restore(); }
+  // Fail-closed-before-fetch cases (each issues ZERO PostgREST requests):
+  const reject = async (m, re) => { const cp = captureFetch(() => null); try { await assert.rejects(upsertSyncSourceJobOwners([m]), re); assert.equal(cp.calls.length, 0, "no request for " + re); } finally { cp.restore(); } };
+  await reject({ ...valid, ownerId: "" }, /requires a non-empty owner_id/);                     // blank owner_id
+  await reject({ ...valid, reportKey: "" }, /requires a non-empty owner_id/);                    // blank report_key
+  await reject({ ...valid, accountId: "" }, /requires a non-empty owner_id/);                    // blank account_id
+  await reject({ ...valid, connectionId: "tertiary" }, /connection_id in \{primary, dd-secondary\}/); // bad connection
+  await reject({ ...valid, connectionId: "" }, /connection_id in \{primary, dd-secondary\}/);    // blank connection
+  await reject({ ...valid, ownerId: ownerId + "x" }, /owner_id does not match sourceJobOwnerId/); // tampered owner_id
+  await reject({ ...valid, organizationFingerprint: "other-org" }, /owner_id does not match sourceJobOwnerId/); // wrong org -> id mismatch
+  await reject({ ...valid, accountScopeHash: "other-scope" }, /owner_id does not match sourceJobOwnerId/); // wrong scope -> id mismatch
+  await reject({ ...valid, reportKey: "reconciliation" }, /owner_id does not match sourceJobOwnerId/); // wrong report -> id mismatch
 });
 
 test("getSyncSourceJobOwners filters by cycle + owner_id in(...) and selects owner columns", async () => {
@@ -176,7 +182,7 @@ function makeStore() {
     getCycle(id) { return find(id); },
     upsertSourceJob(j) { const m = jobs.get(j.cycleId); if (m.has(j.requestHash)) return; m.set(j.requestHash, { request_hash: j.requestHash, request_key: j.requestKey, source_id: j.sourceId, source_key: j.sourceKey, connection_id: j.connectionId, organization_fingerprint: j.organizationFingerprint, account_scope_hash: j.accountScopeHash, fetch_status: "pending", attempted_at: null, create_export_count: 0, export_id: null, terminal: false, row_count: null }); },
     listSourceJobs(id) { return [...((jobs.get(id) && jobs.get(id).values()) || [])].map((j) => ({ ...j })); },
-    upsertSourceJobOwners(ms) { for (const m of ms || []) { if (!owners.has(m.cycleId)) owners.set(m.cycleId, new Map()); owners.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null }); } },
+    upsertSourceJobOwners(ms) { for (const m of ms || []) { if (!owners.has(m.cycleId)) owners.set(m.cycleId, new Map()); owners.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, connection_id: m.connectionId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null }); } },
     listSourceJobOwners(cid, ids) { const s = new Set(ids || []); return orow(cid).filter((m) => s.has(m.owner_id)).map((m) => ({ ...m })); },
     recordSourceOwnerStale({ cycleId, requestHash, ownerId, code, message }) { const m = owners.get(cycleId) && owners.get(cycleId).get(ownerId + "|" + requestHash); if (m) { m.owner_status = "stale"; m.error_code = code || "STALE_PLAN"; m.error_message = message || null; } },
     claimExportAttempt(id, h) { const j = jobs.get(id) && jobs.get(id).get(h); if (j && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },

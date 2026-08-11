@@ -24,7 +24,7 @@ const START = Date.now();
 const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runKeywordRankShadowCycle, runSourceJobs;
+let runKeywordRankShadowCycle, runSourceJobs, sourceJobOwnerId;
 
 const dash = (...p) => p.join("-");
 const CONNS = [
@@ -50,7 +50,7 @@ function makeStore() {
     upsertSourceJobOwners(memberships) {
       for (const m of memberships || []) {
         if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
-        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
+        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, connection_id: m.connectionId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
       }
     },
     listSourceJobOwners(cid, ownerIds) { const set = new Set(ownerIds || []); return ownerRows(cid).filter((m) => set.has(m.owner_id)).map((m) => ({ ...m })); },
@@ -284,16 +284,17 @@ test("an account whose bucket differs from the supplied cycle bucket is rejected
 group("keyword-rank cycle: one shared (bucket, cycle_date) cycle, many owners");
 
 // A generic (non-keyword) source job as another report family would queue it in the SAME cycle, with its
-// OWN owner membership (a different owner_id than any keyword account owner).
-const GEN_OWNER = "gen-owner";
+// OWN owner membership (a different owner_id than any keyword account owner). The owner_id is the REAL
+// recomputed value (the worker validates job.owner.ownerId === sourceJobOwnerId(...)).
+const genOwnerId = () => sourceJobOwnerId({ reportKey: "daily-reporting", connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope" });
 const genericJob = (hash, raw = "G1") => ({
   requestHash: hash, requestKey: "daily-reporting:catalog", sourceId: "gen-src", sourceKey: "product-catalog",
   connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope", requestMeta: {},
   bucket: "us", strict: false, limit: 10,
-  owner: { ownerId: GEN_OWNER, requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" },
+  owner: { ownerId: genOwnerId(), requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" },
   fetchParams: { columns: ["c"], sellerOrVendorIds: [raw], from: null, to: null, options: {} },
 });
-const runGeneric = (store, dd, jobs) => runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownerIds: [GEN_OWNER], bucket: "us", cycleDate: "2026-08-11" });
+const runGeneric = (store, dd, jobs) => runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownerIds: [genOwnerId()], bucket: "us", cycleDate: "2026-08-11" });
 const jobByHash = (store, cid, h) => store.listSourceJobs(cid).find((j) => j.request_hash === h);
 
 test("the Keyword staged worker never fails an unrelated pending generic job (no MISSING_PLAN); both owners complete via their own runner", async () => {
@@ -399,18 +400,19 @@ test("runSourceJobs fails closed when a plannedJob's owner is outside the declar
   const store = makeStore();
   const dd = makeDataDoe(standardRows);
   const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
-  const job = { requestHash: "h-owned", requestKey: "daily-reporting:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1", requestMeta: {}, fetchParams: { columns: ["c"], sellerOrVendorIds: ["G1"], from: null, to: null, options: {} }, owner: { ownerId: "owner-A", requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" } };
-  // Owner id outside the declared scope -> throw BEFORE any source/owner upsert.
+  const validOwnerId = sourceJobOwnerId({ reportKey: "daily-reporting", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1" });
+  const job = { requestHash: "h-owned", requestKey: "daily-reporting:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1", requestMeta: {}, fetchParams: { columns: ["c"], sellerOrVendorIds: ["G1"], from: null, to: null, options: {} }, owner: { ownerId: validOwnerId, requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" } };
+  // A VALID owner id that is outside the declared scope -> throw BEFORE any source/owner upsert.
   await assert.rejects(
-    runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: ["owner-B"], bucket: "us", cycleDate: "2026-08-11" }),
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: ["some-other-owner"], bucket: "us", cycleDate: "2026-08-11" }),
     /does not belong to the declared owner scope/,
   );
   assert.equal(store.listSourceJobs(cid).length, 0, "no canonical job upserted before the fail-closed throw");
   assert.equal(store._owners(cid).length, 0, "no owner membership upserted before the throw");
   // Malformed membership (missing owner_id) is rejected.
   await assert.rejects(
-    runSourceJobs({ store, dataDoe: dd, plannedJobs: [{ ...job, owner: { ...job.owner, ownerId: "" } }], ownerIds: ["owner-A"], bucket: "us", cycleDate: "2026-08-11" }),
-    /missing its owner membership identity/,
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [{ ...job, owner: { ...job.owner, ownerId: "" } }], ownerIds: [validOwnerId], bucket: "us", cycleDate: "2026-08-11" }),
+    /missing owner membership metadata/,
   );
   // Empty owner scope with planned work fails closed.
   await assert.rejects(
@@ -448,6 +450,7 @@ async function main() {
   mark("main(): loading keyword-rank cycle module");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
+  ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
   mark("module loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

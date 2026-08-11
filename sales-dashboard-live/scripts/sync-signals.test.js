@@ -72,7 +72,7 @@ function makeMemoryStore() {
     upsertSourceJobOwners(memberships) {
       for (const m of memberships || []) {
         if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
-        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
+        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, connection_id: m.connectionId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
       }
     },
     listSourceJobOwners(cid, ownerIds) { const set = new Set(ownerIds || []); return ownerRows(cid).filter((m) => set.has(m.owner_id)).map((m) => ({ ...m })); },
@@ -221,7 +221,7 @@ const optResolvePlan = (signals) => {
     win["listing-optimizer:catalog"] = [{ from: null, to: null }];
   }
   const resolved = reportSourceRequestHashes({ reportKey: "listing-optimizer", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, dependencySignals: signals }) || [];
-  return { sourceJobs: resolved.map((r) => plannedSourceJob("listing-optimizer", r, "us", "primary")) };
+  return { sourceJobs: resolved.map((r) => plannedSourceJob("listing-optimizer", r, "us", "primary", "A1")) };
 };
 
 // Prepare a cycle where the SQP job is marked succeeded, with a configurable cached payload.
@@ -307,7 +307,7 @@ const smResolvePlan = (signals) => {
     ? smFullWin(sig.latestReportedDate)
     : { "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }] };
   const resolved = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, dependencySignals: signals }) || [];
-  return { sourceJobs: resolved.map((r) => plannedSourceJob("sales-movers", r, "us", "primary")) };
+  return { sourceJobs: resolved.map((r) => plannedSourceJob("sales-movers", r, "us", "primary", "A1")) };
 };
 const smDataDoe = () => makeDataDoe((job) => ((job.requestKey ?? job.request_key) === "sales-movers:sales-latest-probe"
   ? { rows: [{ date: "2025-07-28", units_sum: 5 }, { date: "2025-07-30", units_sum: 3 }] }
@@ -355,7 +355,7 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
       win["keyword-rank:sqp-monthly"] = [{ from: "2025-05-01", to: "2025-07-31" }];
     }
     const resolved = reportSourceRequestHashes({ reportKey: "keyword-rank", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, fallbackSignals: signals }) || [];
-    return { sourceJobs: resolved.map((r) => plannedSourceJob("keyword-rank", r, "us", "primary")) };
+    return { sourceJobs: resolved.map((r) => plannedSourceJob("keyword-rank", r, "us", "primary", "A1")) };
   };
   const ks = makeMemoryStore();
   const kdd = makeDataDoe((job) => ((job.requestKey ?? job.request_key) === "keyword-rank:sqp-weekly" ? { rows: [{ date: "2025-07-07" }, { date: "2025-07-14" }] } : { rows: [{ a: 1 }] }));
@@ -369,7 +369,7 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
     const cc = signals["ppc-performance:ads-currency"] && signals["ppc-performance:ads-currency"].currencyCount;
     if (cc != null && cc <= 1) win["ppc-performance:total-sales"] = [{ from: "2025-07-08", to: "2025-08-06" }];
     const resolved = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, dependencySignals: signals }) || [];
-    return { sourceJobs: resolved.map((r) => plannedSourceJob("ppc-performance", r, "us", "primary")) };
+    return { sourceJobs: resolved.map((r) => plannedSourceJob("ppc-performance", r, "us", "primary", "A1")) };
   };
   const single = makeMemoryStore();
   const r1 = await runStagedSourceCycle(runOpts({ store: single, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "USD" }] }));

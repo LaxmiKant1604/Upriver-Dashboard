@@ -74,7 +74,7 @@ function makeStore() {
     upsertSourceJobOwners(memberships) {
       for (const m of memberships || []) {
         if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
-        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
+        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, connection_id: m.connectionId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
       }
     },
     listSourceJobOwners(cid, ownerIds) { const set = new Set(ownerIds || []); return ownerRows(cid).filter((m) => set.has(m.owner_id)).map((m) => ({ ...m })); },
@@ -394,7 +394,7 @@ group("keyword-rank e2e: real runStagedSourceCycle + runKeywordRankShadowCycle c
 const GEN_WIN = { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] };
 const genResolve = () => {
   const resolved = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: dash("prim", "key"), ids: ["G1"], windowsByRequestKey: GEN_WIN }) || [];
-  return { sourceJobs: resolved.map((r) => plannedSourceJob("brand-sales", r, "us", "primary")) };
+  return { sourceJobs: resolved.map((r) => plannedSourceJob("brand-sales", r, "us", "primary", "G1")) };
 };
 const runGenericDriver = (store, dd, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: genResolve, bucket: "us", cycleDate: "2026-08-11", ...opts });
 const runKw = (store, dd, accounts, opts = {}) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", ...opts });

@@ -37,16 +37,25 @@ create table if not exists public.sync_source_job_owners (
   request_hash text not null,                 -- canonical source identity (== sync_source_jobs.request_hash)
   owner_id text not null,                      -- deterministic non-secret owner identity (sourceJobOwnerId)
   request_key text not null,                   -- report source alias for THIS membership (diagnostic, never sole authority)
-  report_key text not null default '',         -- report / workflow family (e.g. 'keyword-rank', 'brand-sales')
-  account_id text not null default '',         -- SAFE public account scope (e.g. 'A1', 'dd-secondary:B1') — never a raw secret
-  organization_fingerprint text not null default '', -- non-reversible org fingerprint (never the api key)
-  account_scope_hash text not null default '', -- non-reversible account-scope hash (never raw ids)
+  report_key text not null,                    -- report / workflow family (e.g. 'keyword-rank', 'brand-sales')
+  account_id text not null,                    -- SAFE public account scope (e.g. 'A1', 'dd-secondary:B1') — never a raw secret
+  connection_id text not null default 'primary'
+    check (connection_id in ('primary', 'dd-secondary')), -- part of owner identity; typed org/connection boundary
+  organization_fingerprint text not null,      -- non-reversible org fingerprint (never the api key)
+  account_scope_hash text not null,            -- non-reversible account-scope hash (never raw ids)
   owner_status text not null default 'active'
     check (owner_status in ('active', 'stale')),   -- 'stale' = this owner's plan no longer needs the hash
   error_code text,                             -- SAFE owner-level code only (e.g. 'STALE_PLAN'); never a secret
   error_message text,                          -- SAFE operator string only; never a secret or raw key
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  -- The identity columns that participate in owner_id (report_key/connection_id/organization_fingerprint/
+  -- account_scope_hash) plus the safe scope labels (account_id/request_key) must be non-empty: an
+  -- ambiguous owner identity is never persisted.
+  constraint sync_source_job_owners_identity_nonempty check (
+    char_length(report_key) > 0 and char_length(account_id) > 0 and char_length(request_key) > 0
+    and char_length(organization_fingerprint) > 0 and char_length(account_scope_hash) > 0
+  ),
   -- One membership per (cycle, canonical hash, owner). Two owners of the same hash => two rows.
   constraint sync_source_job_owners_unique unique (cycle_id, request_hash, owner_id),
   -- Composite FK to the canonical source-job identity: a membership can only exist for a real
@@ -55,6 +64,11 @@ create table if not exists public.sync_source_job_owners (
     foreign key (cycle_id, request_hash)
     references public.sync_source_jobs (cycle_id, request_hash) on delete cascade
 );
+
+-- Additive/idempotent guard so a database that already created an earlier version of this (unapplied)
+-- table still gains connection_id (part of owner identity) without a destructive rewrite.
+alter table public.sync_source_job_owners
+  add column if not exists connection_id text not null default 'primary';
 
 create index if not exists sync_source_job_owners_owner_idx
   on public.sync_source_job_owners (cycle_id, owner_id);

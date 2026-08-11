@@ -1,6 +1,9 @@
-// Minimal server-only Supabase REST client. Keeping this dependency-free means
-// Vercel can use the credentials injected by its Supabase Marketplace
-// integration without exposing the secret key in the Vite bundle.
+// Minimal server-only Supabase REST client. It stays client-bundle-free (only server-only imports) so
+// Vercel can use the credentials injected by its Supabase Marketplace integration without exposing the
+// secret key in the Vite bundle. The one import below is the shared, server-only owner-identity helper,
+// used to RECOMPUTE and validate sync_source_job_owners.owner_id before any write (never a secret).
+
+import { sourceJobOwnerId } from "./source-identity.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -705,7 +708,8 @@ export async function getSyncSourceJobs(cycleId) {
    These persist/read WHICH owner scopes may process/resume/read a canonical source, and record safe
    owner-level stale status without ever failing or corrupting the shared canonical row. No secrets. */
 
-const SOURCE_JOB_OWNER_COLUMNS = "id,cycle_id,request_hash,owner_id,request_key,report_key,account_id,organization_fingerprint,account_scope_hash,owner_status,error_code,error_message";
+const SOURCE_JOB_OWNER_COLUMNS = "id,cycle_id,request_hash,owner_id,request_key,report_key,account_id,connection_id,organization_fingerprint,account_scope_hash,owner_status,error_code,error_message";
+const OWNER_CONNECTION_IDS = new Set(["primary", "dd-secondary"]);
 
 // Upsert owner memberships. Reactivation is intended: a re-declared membership resolution=merge-duplicates
 // resets owner_status back to 'active' and clears any prior stale error (an owner that needs the hash
@@ -716,18 +720,33 @@ export async function upsertSyncSourceJobOwners(memberships) {
     const ownerId = String(m.ownerId || m.owner_id || "").trim();
     const requestHash = String(m.requestHash || m.request_hash || "").trim();
     const requestKey = String(m.requestKey || m.request_key || "").trim();
+    const reportKey = String(m.reportKey || m.report_key || "").trim();
+    const accountId = String(m.accountId || m.account_id || "").trim();
+    const connectionId = String(m.connectionId || m.connection_id || "").trim();
     const organizationFingerprint = String(m.organizationFingerprint || m.organization_fingerprint || "").trim();
     const accountScopeHash = String(m.accountScopeHash || m.account_scope_hash || "").trim();
-    if (!ownerId || !requestHash || !requestKey || !organizationFingerprint || !accountScopeHash) {
-      throw new Error("upsertSyncSourceJobOwners requires a non-empty owner_id, request_hash, request_key, organization_fingerprint and account_scope_hash on every membership.");
+    // Complete owner metadata is REQUIRED (nothing blank), and connection_id must be a supported typed
+    // value -- it participates in owner identity.
+    if (!ownerId || !requestHash || !requestKey || !reportKey || !accountId || !organizationFingerprint || !accountScopeHash) {
+      throw new Error("upsertSyncSourceJobOwners requires a non-empty owner_id, request_hash, request_key, report_key, account_id, organization_fingerprint and account_scope_hash on every membership.");
+    }
+    if (!OWNER_CONNECTION_IDS.has(connectionId)) {
+      throw new Error(`upsertSyncSourceJobOwners requires connection_id in {primary, dd-secondary} (got "${connectionId}").`);
+    }
+    // RECOMPUTE the owner identity from its authoritative tuple and reject a supplied owner_id that does
+    // not match -- a buggy caller can never place an account/org job under another owner. Never a secret.
+    const expected = sourceJobOwnerId({ reportKey, connectionId, organizationFingerprint, accountScopeHash });
+    if (!expected || expected !== ownerId) {
+      throw new Error("upsertSyncSourceJobOwners rejected a membership whose owner_id does not match sourceJobOwnerId(reportKey, connectionId, organization_fingerprint, account_scope_hash).");
     }
     return {
       cycle_id: m.cycleId || m.cycle_id,
       request_hash: requestHash,
       owner_id: ownerId,
       request_key: requestKey,
-      report_key: String(m.reportKey || m.report_key || ""),
-      account_id: String(m.accountId || m.account_id || ""),
+      report_key: reportKey,
+      account_id: accountId,
+      connection_id: connectionId,
       organization_fingerprint: organizationFingerprint,
       account_scope_hash: accountScopeHash,
       owner_status: "active",
