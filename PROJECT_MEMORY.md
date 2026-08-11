@@ -5552,3 +5552,36 @@ account/org/bucket isolation preserved. Detail in `SCHEDULER_V2.md` section 43. 
   (66+30+33+20+34+15+9); test:report-contracts 161 (unchanged); test:source-identity 7; `npm run verify` =
   exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+ untracked
   HANDOFF.md).
+
+## Scheduler v2: source-job ownership -- durable account-safe owner tuple + generic driver owner scope (Claude, 2026-08-11)
+
+Fixed the two remaining shared-cycle ownership blockers from the Codex re-review (`726a47f`). **Additive/
+behavioural scheduler-v2 code only** -- `api/datadoe.js`, the report CONTRACTS, `report-derivation.js`,
+`source-signals.js`, the approved partial-report lifecycle, and primary-only behaviour are unchanged. No
+migration (owner columns already exist on `sync_source_jobs`); SHADOW MODE; nothing pushed/merged/deployed/
+migrated; Keyword Rank + all controls locked; `HANDOFF.md` untracked/untouched. request_hash + strict caps
++ five-ID batching + token-saving staging + typed outcomes + LKG preserved. Detail in `SCHEDULER_V2.md`
+section 44. Two small green commits.
+
+- **Blocker 1 (`source-worker.js`, `supabase.js`).** request_key alone is not account-safe -- every account
+  for a report shares keys like keyword-rank:sqp-weekly, so an account-scoped run for A could MISSING_PLAN
+  account B's pending same-key job in the shared cycle. Ownership is now the durable tuple
+  (request_key, organization_fingerprint, account_scope_hash) via `ownerIdentity()`: distinct account scope
+  isolates accounts, distinct org fingerprint isolates orgs; a stale-window hash for the SAME
+  report/account/org still fails as a genuine orphan; another account's/org's row is untouched. None of the
+  tuple fields feed request_hash. Fail-closed BEFORE upsert: every plannedJobs entry must belong to the
+  declared scope (never upsert-then-skip); an ownedJobs entry missing its owner identity throws.
+  `getSyncSourceJobs` now selects request_key/organization_fingerprint/account_scope_hash (existing columns);
+  test stores + the sync-signals PROD_COLUMNS mirror carry them.
+- **Blocker 2 (`source-sync-driver.js`).** The REAL generic `runStagedSourceCycle` owned the whole shared
+  cycle (no ownedJobs) and could MISSING_PLAN a pending Keyword row. It now accumulates its complete typed
+  owner scope across rounds and passes ownedJobs to every runSourceJobs call, so it never touches another
+  family's/account's jobs; owner-scoped drained/one-attempt/resume/deadline behaviour preserved; genuine
+  same-owner orphans still fail closed.
+- **Verification (all natural, exit 0).** report-keyword-rank-cycle **18** (+3); report-keyword-rank-e2e
+  **12** (+3: REAL generic + keyword drivers coexist in one cycle in BOTH orders with pre-queued pending
+  jobs of both families -- no cross-family MISSING_PLAN, both complete, one export per hash, same-key
+  accounts isolated; partial keyword report pending through generic completion then saves once);
+  test:sync-engine 58; test:report-derivation **213** (66+30+33+20+34+18+12); test:report-contracts 161
+  (unchanged); test:source-identity 7; `npm run verify` = exit 0 + build (2,394 modules); `git diff --check`
+  clean; only intended files changed (+ untracked HANDOFF.md).

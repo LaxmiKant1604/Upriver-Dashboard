@@ -2440,3 +2440,49 @@ test:sync-engine` (58); `npm run test:report-derivation` = **207** (66+30+33+20+
 test:report-contracts` (**161**, unchanged); `npm run test:source-identity` (7); `npm run verify` = exit 0
 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
 files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 44. Source-job ownership: durable account-safe owner tuple + generic driver owner scope (SHADOW MODE, 2026-08-11)
+
+Fixes the two remaining shared-cycle ownership blockers from the re-review. Additive/behavioural
+scheduler-v2 code only; `api/datadoe.js` (route), the report CONTRACTS, `report-derivation.js`,
+`source-signals.js`, the approved partial-report lifecycle, and primary-only behaviour are unchanged.
+No migration (the owner columns already exist on `sync_source_jobs`); no schedule/control-unlock/push/
+merge/deploy; Keyword Rank + all controls stay locked; `HANDOFF.md` untracked/untouched. request_hash,
+strict caps, five-ID batching, token-saving staging, typed outcomes, and LKG are all preserved.
+
+### 44.1 Blocker 1 -- request_key is not an account-safe owner identity (`source-worker.js`, `supabase.js`)
+
+`runSourceJobs` scoped ownership by `request_key` alone, but every account for a report shares keys like
+`keyword-rank:sqp-weekly`. An account-scoped manual run for account A could see account B's pending
+same-key job in the shared `(bucket, cycle_date)` cycle, miss B's hash in A's `metaByHash`, and mark B
+`MISSING_PLAN`. Ownership is now the DURABLE tuple `(request_key, organization_fingerprint,
+account_scope_hash)` via `ownerIdentity()`: distinct `account_scope_hash` isolates accounts, distinct
+`organization_fingerprint` isolates organizations, and a stale-window hash for the SAME report/account/org
+still fails as a genuine orphan while another account's/org's same-key row is untouched. None of the tuple
+fields feed `request_hash`. Fail-closed BEFORE any upsert: every `plannedJobs` entry must belong to the
+declared ownership scope (never upsert-then-skip); an `ownedJobs` entry missing its owner identity throws.
+`getSyncSourceJobs()` now SELECTs `request_key`/`organization_fingerprint`/`account_scope_hash` (existing
+columns) so production rows carry the owner identity; the `sync-signals` `PROD_COLUMNS` mirror mirrors it.
+
+### 44.2 Blocker 2 -- the real generic staged driver declares its owner scope (`source-sync-driver.js`)
+
+`runStagedSourceCycle` called `runSourceJobs` without `ownedJobs`, so it owned the whole shared cycle and
+could `MISSING_PLAN` a pending Keyword row. It now accumulates its complete typed owner scope across
+rounds (`ownedByHash`, from each round's kickoff + reconstructed/derived-fallback plan) and passes
+`ownedJobs` to every `runSourceJobs` call. With the tuple owner model, the generic driver never processes,
+fails, counts against `maxJobs`, or influences owner-scoped `drained` for another family's/account's jobs;
+genuine same-owner orphans still fail closed; checkpoint/resume/deadline behaviour is preserved.
+
+### 44.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-keyword-rank-cycle.test.js` **18** (+3:
+account-scoped same-key isolation for two primaries, primary/dd-secondary raw-id isolation, fail-closed
+scope validation; the orphan test now uses A's REAL owner tuple). `report-keyword-rank-e2e.test.js` **12**
+(+3: the REAL generic + keyword drivers coexist in one cycle in BOTH orders with pre-queued pending jobs
+of both families -- no cross-family MISSING_PLAN, both complete, one export per hash, same-key accounts
+isolated; a partial keyword report stays pending through generic completion then saves once). `npm run
+test:sync-engine` (58, `sync-signals` + `sync-source-jobs` stores carry owner identity); `npm run
+test:report-derivation` = **213** (66+30+33+20+34+18+12); `npm run test:report-contracts` (**161**,
+unchanged); `npm run test:source-identity` (7); `npm run verify` = exit 0 + `build:check` (2,394 modules);
+`git diff --check` clean; `git status --short` shows only the intended files (+ untracked `HANDOFF.md`).
+Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
