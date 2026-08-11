@@ -5895,3 +5895,36 @@ snapshot key, payload `accountId`, and frontend-facing brand scope all use the p
 fragment still uses the raw seller ID and primary/dd-secondary request hashes remain isolated. Do not
 change request identity, source contracts, the live route, Scheduler v1, report controls, or frontend.
 Sales Movers remains SHADOW ONLY + locked pending this correction.
+
+## Scheduler v2: Sales Movers account-identity blocker fixed (2026-08-11)
+
+Resolves the review blocker above (see SCHEDULER_V2.md §48.6), on `feature/scheduler-v2` from base
+`7a410a7`. Two small commits, only two files.
+
+**Fix** (`lib/server/sync/report-derivation.js`) -- the Sales Movers adapter now derives
+`publicAccountId = context.accountId` (authoritative public/prefixed id the report job + snapshot row are
+keyed by; fallback to `rawSellerId` only when absent) and passes it to BOTH `salesMoversPayload` and
+`salesMoversUnavailablePayload`. `context.rawSellerId` stays the SOLE source scope: DataDoe request scope,
+`sellerOrVendorIds` validation, and cross-account fragment rejection are byte-unchanged. So for a dormant
+secondary account (public `dd-secondary:RAW1`, raw `RAW1`) the payload `accountId` is now the public id --
+matching the snapshot key, so the frontend scopes `catalogBrands` to the right account. No calculation field
+or payload shape changed; the primary route (public == raw) is byte-identical.
+
+**Tests** (`scripts/report-sales-movers.test.js`, +7 => **27** total): primary `A1`->`A1`; dormant
+secondary payload `accountId` is the PUBLIC id, never raw, with row calculations + `catalogBrands` unchanged;
+`dataUnavailable` path also carries the public id; fragments still require `sellerOrVendorIds === ["RAW1"]`
+(RAW2- and public-id-scoped fragments rejected cross-account); via `runReportJobs` the report job + snapshot
+key + payload `accountId` + brand scope all use the public id while every fragment uses the raw id; primary
+vs dd-secondary probe `request_hash`es stay isolated.
+
+**Scope guarantees.** Only `report-derivation.js` + `report-sales-movers.test.js` changed. `request_hash` /
+source identity untouched (`test:source-identity` **7**, golden hash unchanged). Live route
+(`api/datadoe.js`), builder (`sales-movers.js`), source contracts, Scheduler v1, frontend, migrations, report
+controls, and schedules all untouched. Secondary DataDoe API NOT enabled/restored (offline synthetic coverage
+only). Sales Movers stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on both files (0); `test:report-derivation` **246**
+(66+30+33+20+34+24+12+27, was 239); `test:sync-engine` **79**; `test:report-contracts` **161**;
+`test:source-identity` **7**; full `npm run verify` **645 assertions** (was 638) + 2,394-module production
+build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/migrated/unlocked/scheduled.

@@ -2700,7 +2700,9 @@ in-window, plain-object rows), reads the latest reported date, and:
   ordered ads windows (positional, fail-closed on missing/extra/reordered/overlapping), the shared
   inventory snapshot window `[asOf-10d, asOf]`, and the no-date catalog, then emits the exact production
   payload. A required-but-missing/failed downstream => typed `unavailable`, preserving last-known-good with
-  zero writes. `accountId` is the raw seller id (route parity).
+  zero writes. The payload `accountId` is the authoritative PUBLIC account id (`context.accountId`, e.g.
+  `dd-secondary:RAW1`), matching the snapshot key; `context.rawSellerId` is used ONLY for source scope +
+  fragment validation (see §48.6). They are equal on the primary route.
 
 ### 48.2 Staged planner (`report-planner.js`)
 
@@ -2755,3 +2757,32 @@ catalog/inventory hash -> one export across two owners; full source->plannedRepo
 `npm run test:report-derivation` **239** (66+30+33+20+34+24+12+20); `npm run verify` = exit 0 +
 `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended files
 (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled; migration still unapplied.
+
+### 48.6 Review blocker fix -- public-vs-raw account identity (2026-08-11)
+
+The initial adapter wrote `context.rawSellerId` into BOTH the normal and `dataUnavailable` payload
+`accountId`. For a dormant secondary account (public id `dd-secondary:RAW1`, raw DataDoe seller id `RAW1`)
+the snapshot ROW is keyed by the public id while the payload carried `RAW1`, so the two identities
+disagreed; the frontend scopes `catalogBrands` by `payload.accountId`, so the selected prefixed account
+rejected its own brands (and it would have baked the live-route namespace bug into the scheduler). Primary
+production hid it because public == raw there.
+
+Fix (`report-derivation.js` only): the adapter now derives `publicAccountId = context.accountId` (fallback
+to `rawSellerId` only when absent) and passes it to `salesMoversPayload` + `salesMoversUnavailablePayload`.
+`context.rawSellerId` remains the SOLE source scope -- DataDoe request scope, `sellerOrVendorIds` validation,
+and cross-account fragment rejection are untouched. No calculation field or payload shape changed; the
+primary route is byte-identical (public == raw). `request_hash` / source identity / contracts / live route /
+Scheduler v1 / frontend / migrations unchanged; the secondary DataDoe API stays OFF (synthetic coverage only).
+
+Regression tests (`report-sales-movers.test.js`, **27** total, +7): primary `A1`->`A1`; dormant secondary
+`dd-secondary:RAW1`/`RAW1` -> payload `accountId` is the PUBLIC id (never raw) with row calculations +
+`catalogBrands` unchanged; `dataUnavailable` path carries the public id; fragments still require
+`sellerOrVendorIds === ["RAW1"]` (a RAW2- or public-id-scoped fragment is rejected cross-account); via
+`runReportJobs` the report job + saved snapshot + payload `accountId` + brand scope all use the public id
+while every source fragment uses the raw id; primary vs dd-secondary probe `request_hash`es stay isolated.
+`node --check` (0); `test:report-derivation` **246** (66+30+33+20+34+24+12+**27**); `test:sync-engine`
+**79**, `test:report-contracts` **161**, `test:source-identity` **7** (golden `request_hash` unchanged);
+`npm run verify` = exit 0 + `build:check` (2,394 modules) = **645 assertions** (was 638); `git diff --check`
+clean; only `report-derivation.js` + `report-sales-movers.test.js` changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/unlocked/scheduled; migration still unapplied; Sales Movers remains SHADOW
+ONLY + locked.
