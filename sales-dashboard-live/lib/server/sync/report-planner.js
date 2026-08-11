@@ -14,7 +14,7 @@
 // No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, evaluateAdsCurrencyGate, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
@@ -381,12 +381,14 @@ export function planPpcPerformance({ accountId, country, currency, connections, 
   // Ads read failed/unvalidated => plan NO DataDoe source (spend zero tokens; the catalog is never fetched
   // before the Ads context is validated). The report then stays last-known-good via the derive gate.
   if (!adsValidated) return { ...base, sources: [] };
-  const windowsByRequestKey = {
-    "ppc-performance:total-sales": [{ from, to: end }],
-    "ppc-performance:catalog": [{ from: null, to: null }],
-  };
-  // The resolver's ads-currency gate INCLUDES total-sales only when currencyCount <= 1 (the multi-currency
-  // account plans catalog only); the catalog is unconditional. request_hash isolation comes from the resolver.
+  // The catalog is unconditional; the total-sales WINDOW is emitted ONLY when the ads-currency gate passes
+  // (<= 1 currency), so a multi-currency account plans catalog only and the resolver is never asked to
+  // resolve a source it will gate out. The signal is ALSO passed so the resolver's gate agrees by
+  // construction. request_hash + primary/dd-secondary isolation come from the shared resolver.
+  const windowsByRequestKey = { "ppc-performance:catalog": [{ from: null, to: null }] };
+  if (evaluateAdsCurrencyGate(sig)) {
+    windowsByRequestKey["ppc-performance:total-sales"] = [{ from, to: end }];
+  }
   const sources = reportSourceRequestHashes({
     reportKey: "ppc-performance", apiKey: scope.apiKey, ids: [scope.rawSellerId],
     windowsByRequestKey, marketplaceCountry: scope.country,
