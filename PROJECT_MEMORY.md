@@ -5705,3 +5705,36 @@ the saved export id with **zero second create-export**. Keep SHADOW MODE, contro
 routing, one-attempt/cap/LKG behavior, and all previously approved staging semantics. Do not start another
 adapter, push, merge, deploy, apply a migration, enable schedules, modify Scheduler v1/frontend, or touch
 untracked `HANDOFF.md` during this correction pass.
+
+## Scheduler v2: ownership lifecycle re-review fixes -- safe reconciliation + recomputed owner identity (Claude, 2026-08-11)
+
+Fixed the two durable-owner lifecycle/integrity blockers from the Codex re-review (`0132b23`) plus the
+positive cross-owner concurrency proof. **Additive/behavioural scheduler-v2 code only**; `api/datadoe.js`,
+report CONTRACTS, `report-derivation.js`, Scheduler v1, and the frontend are unchanged. Migration still NOT
+applied. SHADOW MODE; controls locked; `HANDOFF.md` untracked/untouched. request_hash + one-attempt +
+strict caps + LKG + five-ID batching + primary-only routing (no secondary->primary fallback) +
+bucket/account/org isolation + cycle-wide telemetry preserved. Detail in `SCHEDULER_V2.md` section 46.
+Three small green commits (B2, B1, proof tests) + docs.
+
+- **Blocker 1 (`keyword-rank-cycle.js`, `source-sync-driver.js`).** Reconciliation built its keep-set from
+  jobs SUBMITTED this invocation, so a bounded/deadline/deferred invocation could stale still-required
+  monthly/catalog. Keyword now reconciles against each account's COMPLETE AUTHORITATIVE resolved plan
+  (`planKeywordRank(final weeklySignal).sources` incl. required-but-unstaged), and ONLY for accounts whose
+  cadence is a validated success (others defer). The generic `runStagedSourceCycle` reconciles ONLY at its
+  fixpoint (no new hashes + no new signals). A genuinely removed dependency still goes stale; the shared
+  canonical row and other owners are never touched.
+- **Blocker 2 (`source-worker.js`, `supabase.js`, migration).** runSourceJobs no longer trusts
+  `job.owner.ownerId`: before any upsert or DataDoe call it requires complete owner metadata, requires
+  `owner.request_key === job.request_key`, and RECOMPUTES `sourceJobOwnerId(...)`, rejecting a mismatch.
+  `upsertSyncSourceJobOwners` re-validates + recomputes owner_id, requires non-empty report_key/account_id
+  and a typed connection_id, and persists connection_id -- before the POST, never a secret. The unapplied
+  migration additively adds a typed connection_id (+ idempotent guard), NOT NULL report_key/account_id, and
+  a non-empty identity check. request_hash unchanged.
+- **Concurrency proof.** Owner A creates the export for a shared request_hash, defers during poll; owner B
+  (different report/request_key, same canonical hash) resumes the SAME export id with ZERO second
+  create-export; canonical succeeds once, both memberships active.
+- **Verification (all natural, exit 0).** report-keyword-rank-cycle **24** (+6); sync-source-owners **14**
+  (+2); test:sync-engine **72** (22+17+6+8+4+14+1); test:report-derivation **219** (66+30+33+20+34+24+12);
+  test:report-contracts 161 (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run
+  verify` = exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+
+  untracked HANDOFF.md).

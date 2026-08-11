@@ -2553,3 +2553,66 @@ test:sync-engine` **70** (22+17+6+8+4+12+1); `npm run test:report-derivation` **
 unchanged); `npm run test:source-identity` (**7**, golden request_hash unchanged); `npm run verify` = exit
 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
 files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 46. Ownership lifecycle: safe stale reconciliation + recomputed owner identity (SHADOW MODE, 2026-08-11)
+
+Fixes the two durable-owner lifecycle/integrity blockers from the re-review, plus the positive
+cross-owner concurrency proof. Additive/behavioural scheduler-v2 code only; `api/datadoe.js`, the report
+CONTRACTS, `report-derivation.js`, Scheduler v1, and the frontend are unchanged. The migration is still
+NOT applied. request_hash, one-attempt, strict caps, LKG, five-ID batching, primary-only routing (no
+secondary->primary fallback), bucket/account/org isolation, and cycle-wide telemetry are all preserved.
+`HANDOFF.md` untracked/untouched.
+
+### 46.1 Blocker 1 -- safe stale reconciliation (`keyword-rank-cycle.js`, `source-sync-driver.js`)
+
+Both drivers built `plannedMembershipKeys` from jobs SUBMITTED during the invocation, then reconciled
+unconditionally -- so a bounded (maxJobs/maxRounds), deadline-stopped, or deferred invocation could stale
+a still-required monthly/catalog membership it merely had not staged yet. `runKeywordRankShadowCycle` now
+reconciles against each account's COMPLETE AUTHORITATIVE resolved dependency set (after the final signal
+reconstruction, `planKeywordRank(final weeklySignal).sources` -- weekly + catalog, plus monthly when
+weekly < 4, INCLUDING required-but-not-yet-staged sources), keyed by the recomputed owner_id, and ONLY for
+accounts whose cadence is a validated success; an unresolved account defers reconciliation entirely.
+`runStagedSourceCycle` reconciles ONLY when it reached its FIXPOINT (a round added no new hashes and
+derived no new signals), where the accumulated plan is the complete authoritative set. A genuinely removed
+dependency still goes stale; nothing merely-not-yet-staged is retired; the shared canonical row and other
+owners' memberships are never touched.
+
+Stale-reconciliation state table (per owner, at end of invocation):
+
+| invocation outcome | keyword reconciliation | generic reconciliation |
+| --- | --- | --- |
+| fully resolved (cadence validated / fixpoint reached) | reconcile vs authoritative resolved plan | reconcile vs accumulated plan (= complete) |
+| maxJobs / maxRounds truncated | per-account: reconcile only resolved accounts; defer the rest | defer (no fixpoint) |
+| deadline stopped | defer unresolved accounts; resolved accounts vs authoritative plan | defer (no fixpoint) |
+| poll/download deferral | weekly unresolved => defer that account | defer (no fixpoint) |
+| dependency genuinely removed (e.g. weekly resolves >= 4) | monthly absent from authoritative set => stale (canonical row preserved) | absent from complete plan => stale |
+
+### 46.2 Blocker 2 -- recomputed + validated owner identity (`source-worker.js`, `supabase.js`, migration)
+
+`runSourceJobs` no longer trusts `job.owner.ownerId` just because it appears in `ownerIds`. Before ANY
+source/owner upsert or DataDoe call it requires complete owner metadata (owner_id / report_key /
+account_id / request_key / connection_id / organization_fingerprint / account_scope_hash), requires
+`owner.request_key === job.request_key`, and RECOMPUTES `sourceJobOwnerId(report_key, connection_id,
+organization_fingerprint, account_scope_hash)` -- rejecting any supplied owner_id that differs, before the
+declared-scope check. `upsertSyncSourceJobOwners` independently requires non-empty report_key/account_id,
+a typed `connection_id` in {primary, dd-secondary}, recomputes+compares owner_id, and persists
+connection_id -- all before the POST; it never stores a secret. The (unapplied) migration additively adds
+a typed `connection_id` column (+ an idempotent add-column guard), makes report_key/account_id NOT NULL,
+and adds a non-empty owner-identity check. request_hash is unchanged.
+
+### 46.3 Positive cross-owner concurrency proof
+
+Owner A (report A) creates the export for a shared canonical `request_hash`, persists its export_id, and
+is interrupted during poll (deferred/resumable). Owner B (report B -- different request_key + owner_id,
+same canonical hash) resumes that SAME export id with ZERO second create-export; the canonical job
+succeeds exactly once and both owner memberships remain active.
+
+### 46.4 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-keyword-rank-cycle.test.js` **24** (+6 bounded
+no-false-stale / genuine-removal / cross-owner); `sync-source-owners.test.js` **14** (+2 identity-rejection
+matrix + interrupted cross-owner resume). `npm run test:sync-engine` **72** (22+17+6+8+4+14+1); `npm run
+test:report-derivation` **219** (66+30+33+20+34+24+12); `npm run test:report-contracts` (**161**,
+unchanged); `npm run test:source-identity` (**7**, golden request_hash unchanged); `npm run verify` = exit
+0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
+files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
