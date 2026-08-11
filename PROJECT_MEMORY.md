@@ -5806,3 +5806,23 @@ PENDING, SHADOW MODE). Detail in `SCHEDULER_V2.md` section 47. Two small green c
   test:report-contracts 161 (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run
   verify` = exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+
   untracked HANDOFF.md).
+
+## Scheduler v2: durable ownership tranche approved (Codex, 2026-08-11)
+
+Reviewed `8ff4e4f`..`b6d1e0d` on `feature/scheduler-v2` from review commit `9fb8bf2`.
+**Approved.** The generic staged driver now surfaces/stops on resumable deferrals and only reconciles at a
+drained, non-deadline, non-deferred stable fixpoint; deferred poll/download runs retain active downstream
+memberships and resume the persisted export without a second create. The unapplied ownership migration now
+converges fresh and earlier-table paths through deterministic primary/dd-secondary backfill, fail-closed
+identity validation, removal of unsafe blank defaults, NOT NULL finalization, and shared named typed/non-empty
+constraints. Previously approved owner-ID recomputation, Keyword authoritative reconciliation, cross-owner
+resume, primary-only live routing, request_hash/one-attempt/strict-cap/LKG behavior, and partial-report
+lifecycle remain byte-unchanged.
+
+Independent verification from the checked-out worktree is green: direct `node --check` for all changed JS
+tests, `test:sync-engine` **79**, `test:report-derivation` **219**, `test:report-contracts` **161**,
+`test:source-identity` **7**, and full `npm run verify` **618 assertions** plus the 2,394-module production
+build (exit 0). `git diff --check` is clean; only untracked `HANDOFF.md` remains. Migration is still unapplied;
+nothing was pushed/merged/deployed/unlocked/scheduled. The next functional tranche is Sales Movers only:
+faithful pure derivation from the already-declared staged probe -> two-window traffic/ads + shared inventory/
+catalog sources, with an account-scoped shadow-cycle entry point and parity/LKG/token-spend proofs.
