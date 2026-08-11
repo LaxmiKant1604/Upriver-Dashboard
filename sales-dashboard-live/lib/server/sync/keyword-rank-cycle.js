@@ -20,6 +20,7 @@ import { keywordWeeklySignal } from "./source-signals.js";
 import { planKeywordRank } from "./report-planner.js";
 import { bucketForCountry } from "./registry.js";
 import { classifyDirectoryAccounts } from "../datadoe-connections.js";
+import { sourceJobOwnerId } from "../source-identity.js";
 
 // The planner/organization-registry connection id ("primary" | "secondary") -> the source driver's
 // fail-closed connection id ("primary" | "dd-secondary") that plannedSourceJob validates.
@@ -151,7 +152,6 @@ export async function runKeywordRankShadowCycle({
   // never touched. A source an account no longer needs (e.g. monthly once weekly resolves >= 4) is
   // reconciled as a STALE owner membership at the end -- never by failing the shared canonical row.
   const ownerIdSet = new Set();
-  const plannedMembershipKeys = new Set(); // owner_id|request_hash actually planned this invocation
 
   const rollup = { cycleId: null, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, deadlineReached: false, drained: false };
   let cycleId = null;
@@ -165,7 +165,7 @@ export async function runKeywordRankShadowCycle({
     if (round > 0) await reconstruct(cycleId);
     const planned = planRound();
     const plannedJobs = jobsOf(planned, round);
-    for (const j of plannedJobs) { ownerIdSet.add(j.owner.ownerId); plannedMembershipKeys.add(`${j.owner.ownerId}|${j.requestHash}`); }
+    for (const j of plannedJobs) ownerIdSet.add(j.owner.ownerId);
     const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
     cycleId = res.cycleId;
     rollup.cycleId = cycleId;
@@ -182,13 +182,41 @@ export async function runKeywordRankShadowCycle({
     if (res.deadlineReached) { rollup.deadlineReached = true; rollup.drained = false; break; }
     if ((res.deferred || 0) > 0) { rollup.drained = false; break; }
   }
-  // Retire any owner membership this invocation no longer plans (e.g. monthly once weekly resolves >= 4)
-  // as STALE at owner scope -- the shared canonical row and every other owner's membership are untouched.
-  await reconcileStaleOwnerMemberships(store, cycleId, [...ownerIdSet], plannedMembershipKeys);
-
   // Reconstruct each account's persisted weekly/monthly state ONE FINAL time BEFORE reading telemetry, so
   // rollup.perAccount is fresh even after a one-round (or deadline-truncated) invocation -- never stale.
   if (cycleId) await reconstruct(cycleId);
+
+  // Blocker 1 -- reconcile stale owner memberships ONLY against each account's COMPLETE AUTHORITATIVE
+  // resolved dependency set (planKeywordRank for the resolved cadence, which lists EVERY required source
+  // including monthly/catalog even before they are staged), and ONLY for accounts whose cadence is
+  // actually resolved this invocation (weekly a validated success). A bounded/maxRounds/deadline/deferred
+  // invocation that has NOT resolved an account's cadence defers that account's reconciliation entirely,
+  // so a still-required monthly/catalog membership from a prior invocation is never falsely retired. A
+  // genuinely removed dependency (monthly once weekly resolves >= 4) is absent from the authoritative set
+  // and correctly goes stale. This never touches the shared canonical row or another owner's membership.
+  if (cycleId) {
+    const authoritativeKeys = new Set();
+    const reconcileOwnerIds = new Set();
+    for (const st of state) {
+      const w = st.weeklySignal;
+      if (!w || w.status !== "success" || w.validated !== true) continue; // cadence unresolved -> defer
+      const finalPlan = planKeywordRank({
+        accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
+        connections, asOf: st.asOf, weeklySignal: w,
+      });
+      const src0 = finalPlan.sources[0];
+      if (!src0) continue;
+      const ownerId = sourceJobOwnerId({
+        reportKey: "keyword-rank",
+        connectionId: DRIVER_CONNECTION_ID[finalPlan.connectionId] || finalPlan.connectionId,
+        organizationFingerprint: src0.organizationFingerprint, accountScopeHash: src0.accountScopeHash,
+      });
+      if (!ownerId) continue;
+      reconcileOwnerIds.add(ownerId);
+      for (const s of finalPlan.sources) authoritativeKeys.add(`${ownerId}|${s.requestHash}`);
+    }
+    await reconcileStaleOwnerMemberships(store, cycleId, [...reconcileOwnerIds], authoritativeKeys);
+  }
   rollup.perAccount = state.map((st) => ({
     accountId: st.account.accountId,
     connectionId: st.account.accountId.startsWith("dd-secondary:") ? "dd-secondary" : "primary",

@@ -261,6 +261,11 @@ export async function runStagedSourceCycle({
   // planned canonical jobs; a job owned by another family is never touched.
   const ownerIdSet = new Set();
   const plannedMembershipKeys = new Set(); // owner_id|request_hash actually planned this invocation
+  // Blocker 1: stale reconciliation is safe ONLY when the plan is fully resolved -- i.e. the driver
+  // reached its FIXPOINT (a round added no new hashes and derived no new signals). A bounded (maxJobs/
+  // maxRounds), deadline-stopped, or otherwise-truncated invocation has an INCOMPLETE authoritative plan,
+  // so it must NOT retire memberships it merely did not stage yet. `fixpointReached` gates reconciliation.
+  let fixpointReached = false;
 
   for (let round = 0; round < maxRounds; round += 1) {
     const plan = await resolvePlan(signals);
@@ -292,10 +297,15 @@ export async function runStagedSourceCycle({
     const planHashes = plannedJobs.map((j) => j.requestHash);
     const allSeen = planHashes.every((h) => seenHashes.has(h));
     planHashes.forEach((h) => seenHashes.add(h));
-    if (allSeen && JSON.stringify(signals) === before) { rollup.drained = res.drained; break; }
+    if (allSeen && JSON.stringify(signals) === before) { rollup.drained = res.drained; fixpointReached = true; break; }
     rollup.drained = res.drained;
   }
-  await reconcileStaleOwnerMemberships(store, rollup.cycleId, [...ownerIdSet], plannedMembershipKeys);
+  // Reconcile ONLY when the plan fully resolved (fixpoint reached): the accumulated planned membership
+  // keys are then the COMPLETE authoritative dependency set, so a genuinely removed dependency goes stale
+  // while nothing merely-not-yet-staged is retired. A truncated invocation defers reconciliation.
+  if (fixpointReached) {
+    await reconcileStaleOwnerMemberships(store, rollup.cycleId, [...ownerIdSet], plannedMembershipKeys);
+  }
   return rollup;
 }
 
