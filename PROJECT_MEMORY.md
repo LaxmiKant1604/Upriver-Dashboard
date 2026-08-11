@@ -5738,3 +5738,42 @@ Three small green commits (B2, B1, proof tests) + docs.
   test:report-contracts 161 (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run
   verify` = exit 0 + build (2,394 modules); `git diff --check` clean; only intended files changed (+
   untracked HANDOFF.md).
+
+## Scheduler v2: ownership lifecycle fixes re-review (Codex, 2026-08-11)
+
+Reviewed `b67d8d9`..`05601da` on `feature/scheduler-v2` from review commit `0132b23`. The owner-ID
+recomputation is correctly fail-closed before writes/DataDoe, complete metadata + typed connection are
+persisted on the fresh-table path, Keyword Rank reconciles resolved accounts against its authoritative
+final source set, and the interrupted owner-A -> owner-B shared-export resume proof is real (saved export
+id, zero second create, one canonical success, both memberships active). Independent verification is green:
+`test:sync-engine` 72, `test:report-derivation` 219, `test:report-contracts` 161,
+`test:source-identity` 7, and full `npm run verify` **611 assertions** plus the 2,394-module production
+build (exit 0). `git diff --check` is clean; only untracked `HANDOFF.md` remains.
+
+The correction tranche is **not approved** yet because two narrow blockers remain:
+
+1. **The generic driver's fixpoint gate ignores resumable deferrals and can still reconcile an incomplete
+   plan.** `runStagedSourceCycle` does not accumulate/check `res.deferred`. If a source repeatedly defers
+   during poll/download, its outcomes add no signal; on the next round the same hashes are `allSeen` and
+   signals are unchanged, so `fixpointReached` becomes true even though `res.drained` is false. The driver
+   then reconciles only the currently staged keep-set and can stale previously discovered downstream
+   memberships. Stop immediately (as Keyword Rank already does) on any deferral, expose it in rollup, and
+   require a genuinely drained/non-deferred result before declaring a fixpoint. Add a real generic-driver
+   regression: seed active downstream memberships, defer a probe during poll and download, and prove no
+   membership becomes stale; resume with one create total, reach a real fixpoint, then reconcile normally.
+
+2. **The migration's existing-table/idempotent path does not install the promised constraints.** A fresh
+   `create table` gets typed `connection_id`, non-empty identity fields, and no blank defaults. But when the
+   table already exists, the trailing `add column if not exists connection_id text not null default
+   'primary'` adds neither the connection check nor `sync_source_job_owners_identity_nonempty`, and it does
+   not remove old blank defaults/validate existing identity rows. Thus the same migration produces weaker
+   schemas depending on prior state (and can mislabel existing secondary memberships as primary). Make the
+   upgrade path converge to the fresh schema: safely add/backfill connection_id (respecting dormant
+   `dd-secondary:` account prefixes), remove unsafe blank defaults, validate/fail closed on malformed rows,
+   and idempotently add/validate the typed + non-empty constraints. Add a migration-model/static test that
+   starts from the earlier table shape and proves both paths end with equivalent constraints.
+
+Preserve all approved owner-ID checks, Keyword authoritative reconciliation, cross-owner resume, one-attempt,
+request_hash, primary-only live routing, strict caps, LKG, partial-report behavior, and SHADOW MODE. Do not
+start another adapter, push, merge, deploy, apply the migration, unlock controls, schedule anything, modify
+Scheduler v1/frontend, or touch untracked `HANDOFF.md` during this narrow correction.
