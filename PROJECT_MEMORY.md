@@ -6377,3 +6377,31 @@ production build (exit 0); `git diff --check` clean; only the five intended file
 npm child-process writeSync output is not captured by shell redirection, so the report-derivation block is
 absent from a redirected verify log; it runs + passes at exit 0 and its per-file totals were summed by
 direct `node scripts/*.test.js` invocation.)
+
+## Scheduler v2: Listing Health approved (Codex, 2026-08-12)
+
+Re-reviewed correction commits `04f525f`, `0423402`, `6e198ad`, and `9decf13`
+from blocker-review base `114fd4c`. No findings remain. The original B1 reproduction
+now distinguishes durable source outcomes correctly: `EXPORT_ERROR` assembles with
+`disabled:false` and returns typed `unavailable`, while only a failed canonical job
+whose safe durable `error_code` is exactly `SOURCE_DISABLED` and whose plan carries a
+valid policy assembles disabled and saves the approved degraded snapshot. No error
+message or HTTP text is parsed. Keyword Rank's terminal-disabled fallback remains green.
+
+The original B2 reproduction now returns typed `invalid` with no payload for one SKU
+carrying USD 100 plus CAD 200; canonical USD-only data derives unchanged. Unknown+named,
+listing-vs-sales currency mismatch, separate-SKU currencies, and worker-level zero-write
+LKG paths are covered. The live route/payload fold remains unchanged; Scheduler v2 now
+fails closed before that fold can silently merge cross-currency money.
+
+Independent verification from the checked-out worktree: Listing Health **37**, Keyword
+Rank **34**, `test:sync-engine` **79**, `test:report-contracts` **161**,
+`test:source-identity` **7**, and full `npm run verify` **757 assertions** plus the
+2,394-module production build, all exit 0; `git diff --check` clean. Protected route,
+builder, contracts, identity, planner, controls, Scheduler v1, and migrations are
+byte-unchanged from the review base. Only untracked `HANDOFF.md` remains and was not
+touched.
+
+Listing Health is approved as a SHADOW ONLY, locked derivation/planning tranche. The
+next focused tranche is PPC Performance only; do not unlock, schedule, deploy, or start
+Listing Optimizer in the same tranche.
