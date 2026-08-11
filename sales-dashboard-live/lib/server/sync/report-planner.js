@@ -14,7 +14,7 @@
 // No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, salesMoversWindows } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
@@ -35,6 +35,14 @@ const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_LONG_LOOKBACK_DAYS = 365;
 
+// Sales Movers lookbacks (days) -- byte-identical to the live builder/sources: the latest-completed-date
+// probe looks back (SALES_TRAFFIC.lagDays 4 + WINDOW_DAYS*3 = 25) days; the shared FBA inventory snapshot
+// looks back FBA_INVENTORY_HEALTH.snapshotLookbackDays (10). The recent/prior weeks come from
+// salesMoversWindows(latest); WINDOW_DAYS is 7.
+const SM_LAG_DAYS = 4;
+const SM_WINDOW_DAYS = 7;
+const SM_INVENTORY_LOOKBACK_DAYS = 10;
+
 export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation"]);
 
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
@@ -42,7 +50,7 @@ export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku
 // canonical entry point and MUST NOT flow through the eager generic builder (which would emit weekly +
 // an eager catalog with no account-scoped fallback orchestration). buildShadowReportPlan rejects it
 // fail-closed rather than silently planning or silently dropping a requested key.
-export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank"]);
+export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank", "sales-movers"]);
 
 /**
  * Resolve the AUTHORITATIVE single-account scope for the planner from account metadata.
@@ -264,8 +272,55 @@ export function planKeywordRank({ accountId, country, currency, connections, asO
   };
 }
 
-// Generic single-shot planners ONLY. keyword-rank is deliberately absent: it is staged by
-// runKeywordRankShadowCycle (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
+/**
+ * Plan Sales Movers for ONE account from that account's OWN typed latest-sales-date PROBE signal (never a
+ * global request-key signal). Always emits the probe (asOf-25d..asOf). ONLY when the typed probe signal is
+ * a validated success with a real reported date (the contract's `validated_success` + `requireReportedDate`
+ * staged activation) does it emit the downstream: two-window traffic + ads (recent/prior from
+ * salesMoversWindows), the shared FBA inventory snapshot (asOf-10d..asOf), and the shared no-date catalog.
+ * A validated probe with NO date, or a failed/terminal/unvalidated probe, plans no downstream (the derive
+ * then produces the honest dataUnavailable snapshot or the typed blocked/unavailable outcome). request_hash
+ * + primary/dd-secondary isolation come from the shared resolver; the STAGED-cycle driver decides WHEN the
+ * downstream exports are actually spent. Shared inventory/catalog identities dedupe with other reports.
+ */
+export function planSalesMovers({ accountId, country, currency, connections, asOf, probeSignal = null }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const probeFrom = addDaysStr(end, -(SM_LAG_DAYS + SM_WINDOW_DAYS * 3));
+  const windowsByRequestKey = {
+    "sales-movers:sales-latest-probe": [{ from: probeFrom, to: end }],
+  };
+  const dependencySignals = {};
+  if (probeSignal != null) {
+    dependencySignals["sales-movers:sales-latest-probe"] = probeSignal;
+    // Stage the downstream ONLY once the typed probe validates with a real reported date (fail closed via
+    // the shared evaluateStagedActivation); the resolver then binds/validates the exact recent+prior weeks.
+    const trafficContract = (REPORT_SOURCE_CONTRACTS["sales-movers"] || []).find((c) => c.requestKey === "sales-movers:traffic");
+    if (trafficContract && evaluateStagedActivation(trafficContract.activation, probeSignal)) {
+      const { recent, prior } = salesMoversWindows(probeSignal.latestReportedDate);
+      windowsByRequestKey["sales-movers:traffic"] = [recent, prior];
+      windowsByRequestKey["sales-movers:ads"] = [recent, prior];
+      windowsByRequestKey["sales-movers:inventory"] = [{ from: addDaysStr(end, -SM_INVENTORY_LOOKBACK_DAYS), to: end }];
+      windowsByRequestKey["sales-movers:catalog"] = [{ from: null, to: null }];
+    }
+  }
+  const sources = reportSourceRequestHashes({
+    reportKey: "sales-movers", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country, dependencySignals,
+  });
+  return {
+    reportKey: "sales-movers",
+    reportVersion: REPORT_DERIVATIONS["sales-movers"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "sales-movers", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+}
+
+// Generic single-shot planners ONLY. keyword-rank + sales-movers are deliberately absent: they are staged
+// by their own account-scoped shadow cycles (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
 const PLANNERS = {
   "daily-reporting": planDailyReporting,
   "sku-pl": planSkuPl,
