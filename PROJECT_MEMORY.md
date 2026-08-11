@@ -6226,3 +6226,57 @@ Independent verification from the checked-out worktree: direct Returns **35**;
 Returns & Refund Leakage is approved as a shadow derivation/planning tranche. The
 next focused tranche is Listing Health only; do not unlock, schedule, deploy, or
 start PPC/Listing Optimizer in the same tranche.
+
+## Scheduler v2: Listing Health derivation + generic planning (SHADOW MODE, 2026-08-11)
+
+Fifth functional report family on Scheduler v2 (see SCHEDULER_V2.md §51), on `feature/scheduler-v2` from
+approval base `0c61857`. Listing Health has NO probe -- four core sources INDEPENDENTLY required + one
+OPTIONAL degradable enrichment (Listings Raw JSON) -- so it uses the EXISTING generic owner-scoped cycle +
+generic planner, NOT a dedicated staged driver. Three small commits.
+
+**Dependency/window map.** `listing-health:listings` (Listings) no-date 20k required; `listing-health:listings-raw`
+(Listings Raw JSON) no-date 20k OPTIONAL/degradable; `listing-health:sales` (Profit by SKU & Date, grouped)
+`[asOf-29d,asOf]` 50k required; `listing-health:inventory` (FBA Inventory Health) `[asOf-10d,asOf]` 15k
+required, SAME hash as Sales Movers + Buy Box inventory; `listing-health:catalog` no-date 20k required, SAME
+hash as Sales Movers + Buy Box + Returns catalog.
+
+**Listings Raw state table:** validated success (incl empty) => issuesAvailable true; approved degraded
+disabled => derived+saved with issuesAvailable false + exact enableHint; terminal-disabled => blocked (LKG);
+pending/missing/failed-other/unreadable => unavailable (LKG), never a silent empty.
+
+1. **Pure derivation** -- `derivation-core.js` gained `listingHealthParseJson` / `NormaliseIssues` (six-cap)
+   / `NormaliseSummary` (object + one-element-array, BUYABLE/DISCOVERABLE) / `HasLiveOffer`,
+   `listingHealthSalesFold` (per-SKU 30d sales/units/profit, first-non-null-currency-wins, never merged),
+   `listingHealthRawFold`, `listingHealthPayload` (status, FBM/FBA channel, prices/currencies, quantities,
+   latest snapshotAvailable, catalog->listing name precedence + catalog brand, listingCount), verbatim from
+   listing-health.js, zero transport imports. `report-derivation.js` wired the `listing-health` adapter (4
+   required + listings-raw optional): recompute+pin sales/inventory windows; listings/catalog/raw no-date
+   single-account; inventory ROW dates validated real + in-window; all rows plain objects; the Listings Raw
+   state resolved via the assembled source's available/disabled + sourceDisabledOutcome. Payload accountId =
+   public context.accountId; rawSellerId sole scope. latestDataDate = validated inventorySnapshotDate or null.
+2. **Planner** -- `planListingHealth` emits the five canonical requests; added to the generic
+   `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch. Also `decorateSources` now surfaces the resolver's
+   `availabilityPolicy` under the `disabledPolicy` name `assembleSources` reads (a latent gap), so a
+   generic-planned report's degradable source degrades/blocks correctly in the REAL cycle -- inert for every
+   non-degradable source (null policy); keyword-rank + sync-engine + source-identity all green.
+3. **Tests** -- new `scripts/report-listing-health.test.js` **31 cases** (wired into `test:report-derivation`):
+   production-route fixture deep-equal, channel/price/currency/quantities, currency isolation, 30d sales,
+   inventory zero-vs-null-vs-unavailable, name/brand precedence, JSON issues six-cap + malformed tolerance,
+   object/array summaries + flags + live-offer, blank-SKU skip + listingCount, ALL Listings Raw states,
+   window + inventory row-date validation, cross-account + public/raw identity, missing-source LKG,
+   zero-network, idempotency, latestDataDate, real-driver path (five canonical jobs, shared inventory/catalog
+   dedup, owner-scoped reconciliation, strict-cap, pending-then-saved-once, worker-level disabled enrichment,
+   maxJobs/deferral resume, primary-only skip).
+
+**Report control unchanged.** Only `derivation-core.js`, `report-derivation.js`, `report-planner.js`,
+`report-listing-health.test.js`, `report-derivation-core.test.js` (placeholder gate test), `package.json`
+changed. `api/datadoe.js` live route + `listing-health.js` builder byte-unchanged; source CONTRACTS,
+`request_hash`/source identity, Scheduler v1, frontend, migrations, report controls, schedules untouched
+(`test:source-identity` **7**, golden hash unchanged). Secondary DataDoe API NOT enabled. Listing Health
+stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on every changed file (0); `test:report-derivation`
+**352** (66+30+33+20+34+24+12+27+40+35+31, was 321); `test:sync-engine` **79**; `test:report-contracts`
+**161**; `test:source-identity` **7**; full `npm run verify` **751 assertions** (was 720) + 2,394-module
+production build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked
+`HANDOFF.md`). Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.

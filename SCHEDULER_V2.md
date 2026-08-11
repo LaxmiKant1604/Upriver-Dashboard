@@ -2983,3 +2983,86 @@ field) under the 3-arg call. `node --check` (0); `test:report-derivation` **321*
 `report-returns.test.js` changed (+ untracked `HANDOFF.md`). Live route/builder/contracts/request identity/
 planner/generic driver/Scheduler v1/frontend/migrations/controls/schedules untouched; Returns remains SHADOW
 ONLY + locked.
+
+## 51. Listing Health / Suppressed Listings: pure derivation + generic planning (SHADOW MODE, 2026-08-11)
+
+Fifth functional report family on Scheduler v2 (after Keyword Rank, Sales Movers, Buy Box, Returns). Listing
+Health has NO probe / staged activation -- the four core sources are INDEPENDENTLY required and the fifth
+(Listings Raw JSON) is an OPTIONAL, degradable enrichment -- so it uses the EXISTING generic owner-scoped
+source cycle + generic planner, NOT a dedicated staged driver. Listing Health stays **SHADOW ONLY +
+locked**: `api/datadoe.js` live route + `lib/server/reports/listing-health.js` builder byte-unchanged, the
+source CONTRACTS + `source-identity.js` unchanged, Scheduler v1 + frontend untouched, migration NOT applied,
+`HANDOFF.md` untracked/untouched.
+
+### 51.1 Dependency + window map
+
+| request key | source | window | cap | role | shared identity |
+| --- | --- | --- | --- | --- | --- |
+| `listing-health:listings` | Listings | no-date | 20,000 | required | -- |
+| `listing-health:listings-raw` | Listings (Raw JSON) | no-date | 20,000 | OPTIONAL / degradable | -- |
+| `listing-health:sales` | Profit by SKU & Date | `[asOf-29d, asOf]` (grouped) | 50,000 | required | -- |
+| `listing-health:inventory` | FBA Inventory Health | `[asOf-10d, asOf]` | 15,000 | required | SAME hash as Sales Movers + Buy Box inventory |
+| `listing-health:catalog` | Product Catalog | no-date | 20,000 | required | SAME hash as Sales Movers + Buy Box + Returns catalog |
+
+### 51.2 Listings Raw (optional enrichment) state table
+
+| Listings Raw state | derive result | issuesAvailable | notes |
+| --- | --- | --- | --- |
+| validated success (incl. EMPTY rows) | derived | true | build the issues/summary/live-offer fold; empty rows still means "available" |
+| approved DEGRADED disabled (availabilityPolicy) | derived (saved) | false | + exact `LISTINGS_RAW.enableHint`; no issue is invented |
+| terminal-disabled (blocks) | blocked | -- | LKG preserved (would only apply to a terminal policy) |
+| pending / missing / failed-other / unreadable | unavailable | -- | LKG preserved; NEVER a silent empty enrichment |
+
+### 51.3 Pure derivation (`derivation-core.js`, `report-derivation.js`)
+
+`derivation-core.js` gained the Listing Health cores, transcribed verbatim from `listing-health.js`:
+`listingHealthParseJson`, `listingHealthNormaliseIssues` (six-issue cap), `listingHealthNormaliseSummary`
+(object + one-element-array forms, BUYABLE/DISCOVERABLE), `listingHealthHasLiveOffer`,
+`listingHealthSalesFold` (per-SKU 30d sales/units/profit, first-non-null-currency-wins, currencies never
+merged), `listingHealthRawFold`, and `listingHealthPayload` (status, FBM/FBA channel mapping, prices/
+currencies, listing/FBA/inbound/reserved quantities, latest inventory `snapshotAvailable`, catalog->listing
+name precedence + catalog brand, `listingCount`). Reuses the shared sumField/brand/catalog/inventory folds;
+zero transport imports.
+
+`report-derivation.js` wired the `listing-health` adapter (four required sources; `listing-health:listings-raw`
+optional). It RECOMPUTES + pins sales `[asOf-29d, asOf]` + inventory `[asOf-10d, asOf]`; listings / catalog /
+listings-raw are single-account NO-DATE fragments; inventory ROW dates are validated real + inside their
+window; all rows are plain objects. The Listings Raw state is resolved per the table above (via the
+assembled source's `available` / `disabled` + `sourceDisabledOutcome`). A wrong-window/cross-account/
+malformed/bad-date fragment => `invalid` (LKG, zero writes); a missing/failed required source =>
+`unavailable` (LKG). Payload `accountId` uses authoritative public `context.accountId`; `context.rawSellerId`
+stays the SOLE source/fragment scope. `latestDataDate` = the validated `inventorySnapshotDate` (source
+evidence) or null -- never asOf / fetched_at / saved_at / Date.now().
+
+`decorateSources` (planner) now surfaces the resolver's `availabilityPolicy` under the `disabledPolicy` name
+`assembleSources` reads, so a generic-planned report's degradable source degrades/blocks correctly in the
+REAL cycle. Inert for every non-degradable source (null policy) -- Buy Box / Returns / the required sources +
+`request_hash` are unaffected (keyword-rank + sync-engine + source-identity all green).
+
+### 51.4 Generic planner (`report-planner.js`)
+
+`planListingHealth` emits the five canonical requests (no-date Listings + optional Listings Raw + grouped 30d
+Sales + shared inventory + shared no-date catalog) for the one raw seller id; the inventory hash dedupes with
+Sales Movers + Buy Box and the catalog with Sales Movers + Buy Box + Returns. `listing-health` is added to
+the generic `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch, driven by `buildShadowReportPlan` +
+`runStagedSourceCycle` (one create-export per `request_hash` per cycle; partial `maxJobs`/deferral runs leave
+the report PENDING + resumable). Primary-only skip for stale dd-secondary accounts is preserved.
+
+### 51.5 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). New `scripts/report-listing-health.test.js` **31 cases**
+(wired into `test:report-derivation`): production-route fixture deep-equal; status/channel/price/currency/
+quantities; currency isolation; 30d sales join; inventory genuine-zero vs null-vs-unavailable; name/brand
+precedence; JSON issues six-cap + malformed tolerance; object/array summaries + flags + live-offer; blank
+SKU/ASIN skip + listingCount; ALL Listings Raw states (success/empty, degraded, failed/pending/missing,
+terminal); exact windows + inventory row-date validation; cross-account + public/raw identity fail-closed;
+missing/failed required source => unavailable + LKG; zero-network derive; idempotency; latestDataDate =
+inventory snapshot date; default+explicit planning include `listing-health`; exactly five canonical jobs;
+shared inventory/catalog hashes match Sales Movers + Buy Box (+ Returns catalog); one export per shared hash
+across owners; owner reconciliation never stales another owner; strict-cap TRUNCATED => no source/report
+save; report PENDING-then-saved-once; worker-level disabled Listings Raw => valid issuesAvailable:false
+snapshot; maxJobs + poll-deferral resume with one create per hash; primary-only stale dd-secondary skip.
+`npm run test:report-derivation` **352** (66+30+33+20+34+24+12+27+40+35+**31**, was 321); `npm run verify` =
+exit 0 + `build:check` (2,394 modules) = **751 assertions** (was 720); `git diff --check` clean; only the
+intended files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled;
+migration still unapplied; Listing Health remains SHADOW ONLY + locked.
