@@ -5585,3 +5585,47 @@ section 44. Two small green commits.
   test:sync-engine 58; test:report-derivation **213** (66+30+33+20+34+18+12); test:report-contracts 161
   (unchanged); test:source-identity 7; `npm run verify` = exit 0 + build (2,394 modules); `git diff --check`
   clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: durable ownership re-review (Codex, 2026-08-11)
+
+Reviewed `519e5ad`..`aff28cb` on `feature/scheduler-v2` from review commit `726a47f`.
+The in-memory account/org tuple behavior and the real generic-vs-Keyword coexistence tests are green,
+and the previously approved partial-invocation lifecycle plus primary-only DataDoe behavior remain
+unchanged. Independent verification is green: `test:sync-engine` 58, `test:report-derivation` 213,
+`test:report-contracts` 161, `test:source-identity` 7, and full `npm run verify` **585 assertions**
+plus the 2,394-module production build (exit 0); `git diff --check` is clean and only untracked
+`HANDOFF.md` remains.
+
+The ownership tranche is **not approved** because the durable production path and canonical-source
+dedup model still have two blockers:
+
+1. **`request_key` is neither a database column nor persisted by the production wrapper.**
+   `20260807_scheduler_v2.sql` creates `sync_source_jobs` without `request_key`, while
+   `getSyncSourceJobs()` now SELECTs it. That SELECT will fail against the actual migration. Even if
+   a column were added manually, `upsertSyncSourceJob()` does not validate or write `request_key`, so
+   a subsequent invocation cannot reconstruct the supposedly durable owner tuple and will treat the
+   row as an incomplete/non-owned identity. The in-memory stores hide this by writing `request_key`
+   directly. Add an additive migration (safe for both fresh and already-migrated databases), make the
+   field non-empty/not-null, persist it on every source-job upsert, and add production-wrapper/schema
+   tests that inspect the actual PostgREST body and SELECT. Do not claim the existing owner columns
+   already cover this field: only `organization_fingerprint` and `account_scope_hash` currently exist.
+
+2. **A single report-specific `request_key` cannot be the durable owner of a deduplicated canonical
+   source.** `buildDependencyPlan()` intentionally collapses identical `request_hash` values needed by
+   multiple reports into one source job, while those report contracts can carry different request keys
+   (the documented shared catalog/inventory groups are the expected case). One persisted source row can
+   therefore have only one arbitrary `request_key`; a report-wise/manual run using another alias will not
+   own or process that same canonical job, defeating source reuse or producing false orphan behavior.
+   Replace the one-owner-key assumption with an explicit many-to-many ownership model, preferably an
+   additive `sync_source_job_owners` table keyed by `(cycle_id, request_hash, owner_id)` (or an equally
+   concurrency-safe normalized equivalent). `sync_source_jobs` remains one row/export per canonical hash;
+   owner memberships identify which staged driver/report/account scopes may process that row. Prove two
+   different request keys/reports sharing one hash still create exactly one DataDoe export, either owner can
+   resume it, neither can fail the other's unrelated row, and genuine stale jobs inside one owner still fail
+   closed. Preserve account/org isolation in `owner_id`; do not store secrets or change `request_hash`.
+
+Re-review constraints: keep SHADOW MODE and all report controls locked. Preserve the approved partial
+report lifecycle, primary-only handling, one-attempt guard, strict caps, staging/token savings, LKG,
+bucket/account/org isolation, and cycle-wide telemetry. Do not start another adapter, push, merge,
+deploy, apply a migration, enable schedules, modify Scheduler v1/frontend, or touch untracked
+`HANDOFF.md` until the schema round-trip and multi-owner canonical-source tests are green.
