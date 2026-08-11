@@ -26,6 +26,34 @@ const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000;
 
 const VALID_CONNECTION_IDS = new Set(["primary", "dd-secondary"]);
 
+// The connection registry (getDataDoeConnections) speaks its OWN ids -- "primary" | "secondary" --
+// but every durable Scheduler-v2 job and this adapter speak the driver ids "primary" | "dd-secondary".
+// This is the ONE explicit, server-only boundary that reconciles them, so the registry's "secondary"
+// key can actually be selected by a "dd-secondary" job (the bug: makeDataDoeAdapter(getDataDoeConnections())
+// indexed a raw "secondary" and could never resolve a "dd-secondary" job). Idempotent: an already-
+// normalized "dd-secondary"/"primary" passes through unchanged. Fail closed: an unknown id throws, and
+// two connections that normalize to the same driver id are rejected so neither can shadow the other or
+// let a job route to the wrong key.
+const REGISTRY_TO_DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
+
+export function normalizeDataDoeConnections(connections) {
+  const normalized = [];
+  const seen = new Set();
+  for (const conn of connections || []) {
+    const rawId = conn && conn.id;
+    const id = REGISTRY_TO_DRIVER_CONNECTION_ID[rawId] || (VALID_CONNECTION_IDS.has(rawId) ? rawId : null);
+    if (!id) {
+      throw new Error(`Cannot normalize DataDoe connection id "${rawId}" to a driver connection id ('primary' | 'dd-secondary').`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`Ambiguous DataDoe connections: two entries normalize to connection id "${id}".`);
+    }
+    seen.add(id);
+    normalized.push({ ...conn, id });
+  }
+  return normalized;
+}
+
 // Turn a resolved job (from reportSourceRequestHashes) into a planned source job that
 // carries BOTH the durable identity fields and the in-memory fetch params the live
 // adapter needs. fetchParams is NEVER persisted (the DB stores request_meta only).
@@ -100,7 +128,10 @@ export function makeSupabaseSourceStore() {
 // mismatched routing throws BEFORE any DataDoe call — an unresolved secondary job is never
 // silently sent to the primary key. The apiKey is used here and never returned or stored.
 export function makeDataDoeAdapter(connections) {
-  const byId = new Map((connections || []).map((c) => [c.id, c]));
+  // Normalize registry ids ("primary" | "secondary") onto the driver ids the jobs carry
+  // ("primary" | "dd-secondary") at this single boundary, so makeDataDoeAdapter(getDataDoeConnections())
+  // routes a "dd-secondary" job to the SECONDARY key (never a silent primary fallback).
+  const byId = new Map(normalizeDataDoeConnections(connections).map((c) => [c.id, c]));
   function resolveConnection(job) {
     const id = job.connection_id ?? job.connectionId;
     if (id !== "primary" && id !== "dd-secondary") {

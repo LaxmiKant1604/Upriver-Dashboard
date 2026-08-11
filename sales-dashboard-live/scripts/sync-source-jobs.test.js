@@ -426,6 +426,42 @@ test("makeDataDoeAdapter refuses missing/unknown/mismatched routing and a missin
   await assert.rejects(primaryOnly.create({ ...base, connection_id: "dd-secondary", organizationFingerprint: sFp }), /No configured DataDoe connection for "dd-secondary"/);
 });
 
+test("makeDataDoeAdapter normalizes REGISTRY-shaped primary/secondary and routes a dd-secondary job to the SECONDARY key (never primary)", async () => {
+  const primaryKey = PRIMARY_API_KEY;
+  const secondaryKey = SECONDARY_API_KEY;
+  const pFp = organizationFingerprint(primaryKey);
+  const sFp = organizationFingerprint(secondaryKey);
+  // EXACTLY what getDataDoeConnections() returns: id "secondary" (NOT "dd-secondary"), no fingerprint.
+  const registryConns = [
+    { id: "primary", label: "Primary DataDoe", apiKey: primaryKey, accountPrefix: "" },
+    { id: "secondary", label: "Secondary DataDoe", apiKey: secondaryKey, accountPrefix: dash("dd", "secondary") + ":" },
+  ];
+  const adapter = makeDataDoeAdapter(registryConns);
+  const job = { connection_id: "dd-secondary", organizationFingerprint: sFp, sourceId: "src", fetchParams: { columns: ["c"], sellerOrVendorIds: ["A1"], from: null, to: null, limit: 10, options: {} } };
+  // Capture the datadoe-api-key header the adapter sends and return a COMPLETED export so no poll runs;
+  // this proves the dd-secondary job reaches the SECONDARY key with zero network beyond the one create.
+  const seenKeys = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    seenKeys.push(options && options.headers && options.headers["datadoe-api-key"]);
+    return { ok: true, status: 200, headers: { get() { return null; } }, async json() { return { exportId: "e1", status: "COMPLETED" }; } };
+  };
+  try {
+    const created = await adapter.create(job);
+    assert.equal(created.exportId, "e1");
+  } finally { globalThis.fetch = realFetch; }
+  assert.deepEqual(seenKeys, [secondaryKey], "dd-secondary job routed to the SECONDARY api key");
+  assert.ok(!seenKeys.includes(primaryKey), "never falls back to the primary key");
+  // A dd-secondary job carrying the PRIMARY fingerprint is rejected against the SELECTED (secondary)
+  // connection -- proving it is not silently rerouted to primary (that would MATCH and pass).
+  await assert.rejects(adapter.poll({ connection_id: "dd-secondary", organizationFingerprint: pFp }, "e1"), /does not match connection/);
+  // Ambiguous/duplicate normalized ids are rejected at the boundary (both -> "dd-secondary" / "primary").
+  assert.throws(() => makeDataDoeAdapter([{ id: "secondary", apiKey: secondaryKey }, { id: "dd-secondary", apiKey: secondaryKey }]), /Ambiguous/);
+  assert.throws(() => makeDataDoeAdapter([{ id: "primary", apiKey: primaryKey }, { id: "primary", apiKey: primaryKey }]), /Ambiguous/);
+  // An unknown connection id fails closed at construction.
+  assert.throws(() => makeDataDoeAdapter([{ id: "tertiary", apiKey: primaryKey }]), /Cannot normalize DataDoe connection id/);
+});
+
 /* ----------------------------- BLOCKER 3: deadline during poll/download is resumable ----------------------------- */
 
 test("execution-deadline during poll defers (resumable); a fresh invocation later succeeds with one create", async () => {
