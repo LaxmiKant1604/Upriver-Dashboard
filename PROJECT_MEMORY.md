@@ -5868,3 +5868,30 @@ and the frontend untouched; `HANDOFF.md` untracked/untouched.
 production build (exit 0); `git diff --check` clean; only intended files changed (+ untracked `HANDOFF.md`).
 Migration still unapplied; nothing pushed/merged/deployed/unlocked/scheduled. Next functional tranche is a
 separate report family (Buy Box / Returns / Listing Health / PPC / Listing Optimizer) -- not started here.
+
+## Scheduler v2: Sales Movers review blocker (Codex, 2026-08-11)
+
+Reviewed `a9f0402`..`7defa79` on `feature/scheduler-v2` from approved base `9f30a4b`. The staged source
+cycle, conditional downstream requirements, authoritative window validation, strict-cap/LKG behavior,
+owner reconciliation, primary-only skip behavior, and offline payload calculations are otherwise sound.
+Independent verification is green: `test:report-derivation` **239**, `test:sync-engine` **79**,
+`test:report-contracts` **161**, `test:source-identity` **7**, and full `npm run verify` **638 assertions**
+plus the 2,394-module production build.
+
+**Not approved yet: one account-identity blocker.** `report-worker.js` correctly pins the authoritative
+public account ID into `context.accountId`, but the Sales Movers adapter ignores it and writes
+`context.rawSellerId` into both the normal and `dataUnavailable` payloads. A deterministic synthetic check
+with public ID `dd-secondary:RAW1` and source scope `RAW1` derives a snapshot payload whose `accountId` is
+`RAW1`. The snapshot row itself is keyed to `dd-secondary:RAW1`, so the payload and snapshot identity
+disagree. The frontend uses `body.accountId` to scope `catalogBrands`; this mismatch causes the selected
+prefixed account to reject its own report brands. It also bakes an existing live-route namespace bug into
+the new scheduler instead of preserving the dormant secondary namespace. Primary-only production happens
+not to expose it because public and raw IDs are equal there.
+
+Required correction: keep `rawSellerId` exclusively for source-fragment validation and DataDoe request
+scope, but pass authoritative `context.accountId` into `salesMoversPayload` and
+`salesMoversUnavailablePayload`. Add synthetic primary and dormant-secondary tests proving the report job,
+snapshot key, payload `accountId`, and frontend-facing brand scope all use the public ID, while every source
+fragment still uses the raw seller ID and primary/dd-secondary request hashes remain isolated. Do not
+change request identity, source contracts, the live route, Scheduler v1, report controls, or frontend.
+Sales Movers remains SHADOW ONLY + locked pending this correction.
