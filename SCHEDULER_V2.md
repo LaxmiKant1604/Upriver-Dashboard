@@ -2953,3 +2953,33 @@ poll-deferral resume with one create per hash; primary-only stale dd-secondary s
 exit 0 + `build:check` (2,394 modules) = **713 assertions** (was 685); `git diff --check` clean; only the
 intended files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled;
 migration still unapplied; Returns remains SHADOW ONLY + locked.
+
+### 50.5 Review blocker fix -- latestDataDate is an observed source-evidence date (2026-08-11)
+
+Codex review blocker: `returns-leakage` computed `latestDataDate = payload.window.to` (the requested
+`asOf`). A deterministic run with all four source jobs SUCCEEDED but all four cached row arrays EMPTY
+derived a valid empty report whose `latestDataDate` became `2025-08-10` -- a date present in no source row --
+so the Admin Data Sync Center could falsely claim empty/lagged data is current (`fetched_at` already reports
+when the export ran; `latest_data_date` must stay an evidence date).
+
+Fix (`report-derivation.js` only): the internal `latestDataDate(payload, context)` callback invocation was
+extended to `latestDataDate(payload, context, sources)`, passing the SAME validated saved-fragment map the
+derive ran on (present only on a `derived` success, so its rows already passed plain-object / real-calendar-
+date / `[asOf-59d, asOf]` validation). `returns-leakage` now returns the MAXIMUM real date in the validated
+raw Returns rows (`maxIsoDate`), or `null` when that array is empty. A folded-out empty-ASIN row still
+contributes its valid source date. Never `context.to` / `window.to` / `Date.now()` / `fetched_at` /
+`saved_at`. `returnsLeakagePayload` + its route-parity shape are UNCHANGED (no scheduler-only field added);
+every other adapter ignores the third arg and stays behavior-identical.
+
+Regression tests (`report-returns.test.js` now **35 cases**, +7): four empty successful sources => `null`;
+Jul 20 + Jul 31 rows with `asOf` Aug 10 => `2025-07-31` (never Aug 10); a folded-out empty-ASIN row's date
+still counts; impossible/future/out-of-window date => typed `invalid` with `latestDataDate` null; worker-level
+`recordReportSuccess` receives the exact observed date (Jul 31); worker-level out-of-window => report not
+saved + prior LKG preserved + zero writes; Buy Box `latestDataDate` still = `observedWindow.to` (payload
+field) under the 3-arg call. `node --check` (0); `test:report-derivation` **321**
+(66+30+33+20+34+24+12+27+40+**35**, was 314); `test:sync-engine` **79**, `test:report-contracts` **161**,
+`test:source-identity` **7** (golden `request_hash` unchanged); full `npm run verify` **720 assertions** (was
+713) + 2,394-module build (exit 0); `git diff --check` clean; only `report-derivation.js` +
+`report-returns.test.js` changed (+ untracked `HANDOFF.md`). Live route/builder/contracts/request identity/
+planner/generic driver/Scheduler v1/frontend/migrations/controls/schedules untouched; Returns remains SHADOW
+ONLY + locked.

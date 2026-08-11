@@ -6165,3 +6165,36 @@ rows ending before `asOf` => that actual maximum date, and an out-of-window/futu
 typed invalid with zero writes/LKG preserved. Do not change the live route/builder, source
 contracts, request identity, planner, generic driver, Scheduler v1, frontend, migrations,
 controls, or schedules. Returns remains SHADOW ONLY + locked pending correction and re-review.
+
+## Scheduler v2: Returns latestDataDate freshness blocker fixed (2026-08-11)
+
+Resolves the freshness blocker above (see SCHEDULER_V2.md §50.5), on `feature/scheduler-v2` from review base
+`3726e3f`. Two small commits, two files (`report-derivation.js` + `report-returns.test.js`).
+
+**Fix.** `returns-leakage` `latestDataDate` was `payload.window.to` (the requested `asOf`), so four
+successful-but-EMPTY sources derived a valid empty report claiming `latestDataDate: 2025-08-10` -- a date in
+no source row. The internal `latestDataDate(payload, context)` callback invocation in `deriveReportSnapshot`
+was extended to `latestDataDate(payload, context, sources)`, passing the SAME validated saved-fragment map
+(present only on a `derived` success, so its rows already passed plain-object / real-date / `[asOf-59d,
+asOf]` validation). `returns-leakage` now returns the MAXIMUM real date in the validated raw Returns rows
+(`maxIsoDate`), or `null` when empty. A folded-out empty-ASIN row still contributes its valid date. Never
+`context.to` / `window.to` / `Date.now()` / `fetched_at` / `saved_at`. The route-parity `returnsLeakagePayload`
+shape is UNCHANGED (no scheduler-only field); every other adapter ignores the third arg and is
+behavior-identical.
+
+**Tests** (`report-returns.test.js` now **35 cases**, +7): empty sources => null; Jul 20 + Jul 31 with asOf
+Aug 10 => Jul 31 (never Aug 10); folded-out empty-ASIN date still counts; impossible/future/out-of-window =>
+invalid + null; worker-level `recordReportSuccess` gets the exact observed date; worker-level out-of-window
+=> not saved + prior LKG preserved + zero writes; Buy Box `latestDataDate` still = `observedWindow.to` under
+the 3-arg call.
+
+**Scope guarantees.** Only `report-derivation.js` + `report-returns.test.js` changed. `request_hash` /
+source identity untouched (`test:source-identity` **7**, golden hash unchanged). `returnsLeakagePayload`,
+live route, `returns.js` builder, source contracts, planner, generic driver, Scheduler v1, frontend,
+migrations, controls, schedules untouched. Returns stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on both files (0); `test:report-derivation` **321**
+(66+30+33+20+34+24+12+27+40+35, was 314); `test:sync-engine` **79**; `test:report-contracts` **161**;
+`test:source-identity` **7**; full `npm run verify` **720 assertions** (was 713) + 2,394-module production
+build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
