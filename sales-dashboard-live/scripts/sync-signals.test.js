@@ -85,7 +85,7 @@ function makeMemoryStore() {
       const m = jobsByCycle.get(job.cycleId);
       if (m.has(job.requestHash)) return;
       m.set(job.requestHash, {
-        id: `job_${m.size + 1}`, request_hash: job.requestHash, source_id: job.sourceId,
+        id: `job_${m.size + 1}`, request_hash: job.requestHash, request_key: job.requestKey, source_id: job.sourceId,
         source_key: job.sourceKey, connection_id: job.connectionId,
         organization_fingerprint: job.organizationFingerprint, account_scope_hash: job.accountScopeHash,
         request_meta: job.requestMeta, bucket: job.bucket, fetch_status: "pending",

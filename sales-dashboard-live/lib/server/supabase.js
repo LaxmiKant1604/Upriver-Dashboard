@@ -688,7 +688,7 @@ export async function upsertSyncSourceJob(job) {
 
 export async function getSyncSourceJobs(cycleId) {
   const query = new URLSearchParams({
-    select: "id,request_hash,source_id,source_key,connection_id,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count",
+    select: "id,request_hash,request_key,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count",
     cycle_id: `eq.${cycleId}`,
     order: "created_at.asc",
   });

@@ -53,7 +53,7 @@ function makeStore() {
     upsertSourceJob(job) {
       const m = jobsByCycle.get(job.cycleId);
       if (m.has(job.requestHash)) return;
-      m.set(job.requestHash, { request_hash: job.requestHash, request_key: job.requestKey, source_id: job.sourceId, source_key: job.sourceKey, connection_id: job.connectionId, fetch_status: "pending", attempted_at: null, create_export_count: 0, export_id: null, terminal: false, row_count: null, cache_object_path: null });
+      m.set(job.requestHash, { request_hash: job.requestHash, request_key: job.requestKey, source_id: job.sourceId, source_key: job.sourceKey, connection_id: job.connectionId, organization_fingerprint: job.organizationFingerprint, account_scope_hash: job.accountScopeHash, fetch_status: "pending", attempted_at: null, create_export_count: 0, export_id: null, terminal: false, row_count: null, cache_object_path: null });
     },
     listSourceJobs(id) { return [...((jobsByCycle.get(id) && jobsByCycle.get(id).values()) || [])].map((j) => ({ ...j })); },
     claimExportAttempt(id, h) { const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h); if (j && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
@@ -326,18 +326,84 @@ test("running the generic worker FIRST, then the keyword worker: neither fails t
   assert.ok(kwJobs.length >= 2 && kwJobs.every((j) => j.fetch_status === "succeeded"), "keyword jobs all succeeded");
 });
 
-test("a GENUINE keyword orphan (keyword request_key, stale hash absent from the plan) still fails closed (MISSING_PLAN)", async () => {
+test("a GENUINE stale-window hash for A's OWN owner tuple still fails MISSING_PLAN; another account's/org's row is untouched", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Fully stage A1 so we can read A1's REAL owner tuple (org fingerprint + account scope hash).
+  const first = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  const cid = first.cycleId;
+  const a1Catalog = store.listSourceJobs(cid).find((j) => j.request_key === "keyword-rank:catalog");
+  const owner = { organizationFingerprint: a1Catalog.organization_fingerprint, accountScopeHash: a1Catalog.account_scope_hash };
+  assert.ok(owner.organizationFingerprint && owner.accountScopeHash, "A1 has a real owner tuple");
+
+  // A GENUINE orphan: SAME owner tuple as A1 (same request_key + org fp + account scope), stale request_hash.
+  store.upsertSourceJob({ cycleId: cid, requestHash: "kw-A1-stale", requestKey: "keyword-rank:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", ...owner, requestMeta: {} });
+  // Another ACCOUNT's row (different account_scope_hash) and another ORG's row (different org fp) -- NOT owned by A1.
+  store.upsertSourceJob({ cycleId: cid, requestHash: "kw-other-account", requestKey: "keyword-rank:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: owner.organizationFingerprint, accountScopeHash: "other-account-scope", requestMeta: {} });
+  store.upsertSourceJob({ cycleId: cid, requestHash: "kw-other-org", requestKey: "keyword-rank:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "dd-secondary", organizationFingerprint: "other-org-fp", accountScopeHash: owner.accountScopeHash, requestMeta: {} });
+  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
+
+  await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.equal(jobByHash(store, cid, "kw-A1-stale").fetch_status, "failed", "A1's own stale-window hash fails closed");
+  assert.equal(jobByHash(store, cid, "kw-A1-stale").error_code, "MISSING_PLAN");
+  assert.equal(jobByHash(store, cid, "kw-other-account").fetch_status, "pending", "another account's same-key row is untouched");
+  assert.equal(jobByHash(store, cid, "kw-other-org").fetch_status, "pending", "another org's same-key row is untouched");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job still untouched");
+});
+
+group("keyword-rank cycle: account-scoped ownership is account-safe (same request_key across accounts)");
+
+test("an account-scoped run for ONLY A1 leaves account A2's pending same-request-key job untouched (no MISSING_PLAN); each hash created once", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Prime the shared cycle so BOTH primary accounts A1 + A2 have a weekly job, but process only the first
+  // (maxJobs:1) so A2's same-request-key weekly stays PENDING.
+  const primed = await runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: "A2", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  const cid = primed.cycleId;
+  const a2Pending = store.listSourceJobs(cid).find((j) => j.request_key === "keyword-rank:sqp-weekly" && j.fetch_status === "pending");
+  assert.ok(a2Pending, "A2's weekly is pending after the bounded prime run");
+
+  // Account-scoped MANUAL run for ONLY A1 (as the admin accountIds filter would produce).
+  const a1 = await runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(a1.cycleId, cid, "same shared cycle");
+  // A2's pending weekly (same request_key, different account_scope_hash) is UNTOUCHED -- never MISSING_PLAN'd.
+  assert.equal(jobByHash(store, cid, a2Pending.request_hash).fetch_status, "pending", "A2's same-key job stays pending");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN anywhere");
+  assert.ok(store.listSourceJobs(cid).filter((j) => j.fetch_status === "succeeded").length >= 2, "A1 weekly + catalog succeeded");
+  for (const j of store.listSourceJobs(cid)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " created at most once");
+});
+
+test("primary and dd-secondary sharing a raw seller id have disjoint owner tuples; an account-scoped run for one leaves the other's pending same-key job untouched", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Same raw id "X1" under both orgs; prime both weeklies, process only the first (primary), leave secondary pending.
+  const primed = await runKeywordRankShadowCycle({ accounts: [{ accountId: "X1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":X1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  const cid = primed.cycleId;
+  const secPending = store.listSourceJobs(cid).find((j) => j.connection_id === "dd-secondary" && j.fetch_status === "pending");
+  assert.ok(secPending, "the dd-secondary weekly is pending after the prime run");
+  // Account-scoped run for ONLY the primary X1.
+  await runKeywordRankShadowCycle({ accounts: [{ accountId: "X1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(jobByHash(store, cid, secPending.request_hash).fetch_status, "pending", "dd-secondary same-raw-id job untouched (organization isolation)");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN across organizations");
+});
+
+test("runSourceJobs fails closed when a plannedJob does not belong to the declared ownership scope (never upsert-then-skip)", async () => {
   const store = makeStore();
   const dd = makeDataDoe(standardRows);
   const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
-  // A stale keyword catalog row whose hash is NOT in any account's canonical plan (e.g. an old window).
-  store.upsertSourceJob({ cycleId: cid, requestHash: "kw-stale", requestKey: "keyword-rank:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "fp", accountScopeHash: "sc", requestMeta: {} });
-  // An unrelated pending generic row must survive.
-  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
-  await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
-  assert.equal(jobByHash(store, cid, "kw-stale").fetch_status, "failed", "owned keyword orphan fails closed");
-  assert.equal(jobByHash(store, cid, "kw-stale").error_code, "MISSING_PLAN");
-  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job still untouched");
+  const owned = { requestHash: "h-owned", requestKey: "daily-reporting:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1", requestMeta: {}, fetchParams: { columns: ["c"], sellerOrVendorIds: ["G1"], from: null, to: null, options: {} } };
+  // A plannedJob whose owner tuple (different account_scope_hash) is NOT in ownedJobs must throw BEFORE upsert.
+  const foreign = { ...owned, requestHash: "h-foreign", accountScopeHash: "scope-2" };
+  await assert.rejects(
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [foreign], ownedJobs: [owned], bucket: "us", cycleDate: "2026-08-11" }),
+    /does not belong to the declared ownership scope/,
+  );
+  assert.equal(store.listSourceJobs(cid).length, 0, "nothing was upserted before the fail-closed throw");
+  // An ownedJobs entry missing its owner identity is also rejected.
+  await assert.rejects(
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [], ownedJobs: [{ ...owned, organizationFingerprint: "" }], bucket: "us", cycleDate: "2026-08-11" }),
+    /missing its organization_fingerprint\/account_scope_hash/,
+  );
 });
 
 /* ============================= primary-only DataDoe (secondary org retired) ============================= */

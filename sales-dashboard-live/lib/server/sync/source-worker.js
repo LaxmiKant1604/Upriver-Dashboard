@@ -70,6 +70,18 @@ function fetchStatusOf(job) {
   return job.fetch_status ?? job.fetchStatus ?? "pending";
 }
 
+// The durable, account-safe owner identity of a source job/row: the tuple
+// (request_key, organization_fingerprint, account_scope_hash). Reads both the persisted snake_case row
+// shape and the planned camelCase job shape. `complete` is false when any field is empty (an ambiguous
+// owner that must never silently match another scope). The key is a JSON array of the three fields, so
+// it is collision-free regardless of the fields' contents (no separator that could appear inside a hash).
+export function ownerIdentity(job) {
+  const rk = job.request_key ?? job.requestKey ?? "";
+  const org = job.organization_fingerprint ?? job.organizationFingerprint ?? "";
+  const scope = job.account_scope_hash ?? job.accountScopeHash ?? "";
+  return { rk, org, scope, key: JSON.stringify([rk, org, scope]), complete: !!(rk && org && scope) };
+}
+
 // Rebuild the complete canonical job: plan supplies fetch params + policies; the DB row
 // is authoritative for lifecycle state (status / attempted_at / export_id / connection).
 // No 'primary' default — a missing connection id is left undefined so the adapter fails
@@ -245,6 +257,35 @@ export async function runSourceJobs({
     return { ...progress, outcomes };
   }
 
+  // A shared (bucket, cycle_date) cycle can hold source jobs owned by SEVERAL report families/accounts
+  // (only one sync_cycles row exists per bucket/date). `ownedJobs`, when supplied, is the COMPLETE set of
+  // jobs this invocation owns for the whole cycle (a superset of the current round's `plannedJobs`).
+  //
+  // Ownership is a DURABLE, ACCOUNT-SAFE tuple (request_key, organization_fingerprint, account_scope_hash)
+  // -- NOT request_key alone. Every account for a report shares keys like "keyword-rank:sqp-weekly", so a
+  // request-key-only scope would let one account's run touch another account's same-key row. The tuple
+  // isolates accounts (distinct account_scope_hash) and organizations (distinct organization_fingerprint),
+  // while a stale-window hash for the SAME report/account/org still fails as a genuine orphan. None of
+  // these fields feed request_hash. When `ownedJobs` is null the invocation owns the whole cycle
+  // (previous behaviour, unchanged).
+  const ownerScope = ownedJobs ? new Set() : null;
+  if (ownedJobs) {
+    for (const j of ownedJobs) {
+      const id = ownerIdentity(j);
+      if (!id.complete) throw new Error(`ownedJobs entry (request_key "${id.rk}") is missing its organization_fingerprint/account_scope_hash owner identity; refusing an ambiguous ownership scope.`);
+      ownerScope.add(id.key);
+    }
+    // Fail closed BEFORE any upsert: every plannedJobs entry MUST belong to the declared ownership scope,
+    // so we never silently upsert a job the scope would then skip. An empty/mismatched scope throws.
+    for (const job of plannedJobs || []) {
+      if (!job || !job.requestHash) continue;
+      const id = ownerIdentity(job);
+      if (!id.complete || !ownerScope.has(id.key)) {
+        throw new Error(`plannedJobs entry (request_key "${id.rk}") does not belong to the declared ownership scope; refusing to upsert then skip it.`);
+      }
+    }
+  }
+
   for (const job of plannedJobs || []) {
     if (!job || !job.requestHash) continue;
     await store.upsertSourceJob({
@@ -256,18 +297,12 @@ export async function runSourceJobs({
       accountScopeHash: job.accountScopeHash || "", requestMeta: job.requestMeta || {},
     });
   }
-  // A shared (bucket, cycle_date) cycle can hold source jobs owned by SEVERAL report families (only one
-  // sync_cycles row exists per bucket/date). `ownedJobs`, when supplied, is the COMPLETE set of jobs this
-  // invocation owns for the whole cycle (a superset of the current round's `plannedJobs`), so:
   //   - metaByHash covers every owned job -- a job STAGED in a prior round/invocation can be merged and
   //     resumed here rather than mistaken for an orphan; and
-  //   - `ownedKeys` (the request_keys this invocation owns) defines a TYPED processing scope: a row whose
-  //     request_key is not owned belongs to another family and is left completely untouched.
-  // When `ownedJobs` is null the invocation owns the whole cycle (previous behaviour, unchanged).
-  const metaSource = ownedJobs && ownedJobs.length ? [...ownedJobs, ...(plannedJobs || [])] : (plannedJobs || []);
-  const metaByHash = new Map(metaSource.filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
-  const ownedKeys = ownedJobs ? new Set(ownedJobs.map((j) => j && j.requestKey).filter(Boolean)) : null;
-  const owns = (jobRow) => !ownedKeys || ownedKeys.has(jobRow.request_key ?? jobRow.requestKey ?? "");
+  //   - `owns()` uses the owner tuple: a row whose owner tuple is not in scope belongs to another
+  //     family/account and is left completely untouched (never processed, failed, counted, or drained).
+  const metaByHash = new Map([...(ownedJobs || []), ...(plannedJobs || [])].filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
+  const owns = (jobRow) => !ownerScope || ownerScope.has(ownerIdentity(jobRow).key);
   progress.planned = new Set((plannedJobs || []).filter((j) => j && j.requestHash).map((j) => j.requestHash)).size;
 
   const jobRows = await store.listSourceJobs(cycleId);
