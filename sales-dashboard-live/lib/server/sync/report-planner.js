@@ -113,6 +113,11 @@ function decorateSources(sources, { reportKey, connectionId, bucket }) {
     connectionId,
     bucket,
     optional: optionalKeys.has(source.requestKey),
+    // assembleSources reads `disabledPolicy` to detect a source-disabled degraded/terminal state (so the
+    // report worker can degrade or block correctly); the resolver names the SAME normalized policy
+    // `availabilityPolicy`. Surface it under the name the worker reads. A source with no policy stays null,
+    // so this is inert for every non-degradable source (e.g. Buy Box / Returns / the required sources).
+    disabledPolicy: source.availabilityPolicy || null,
   }));
 }
 
