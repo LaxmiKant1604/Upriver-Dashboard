@@ -24,7 +24,7 @@ const START = Date.now();
 const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runKeywordRankShadowCycle;
+let runKeywordRankShadowCycle, runSourceJobs;
 
 const dash = (...p) => p.join("-");
 const CONNS = [
@@ -266,9 +266,84 @@ test("an account whose bucket differs from the supplied cycle bucket is rejected
   assert.equal(dd.totalCreates(), 0, "no DataDoe call for a bucket-mismatched account");
 });
 
+/* ============================= shared-cycle job ownership (Blocker 1) ============================= */
+
+group("keyword-rank cycle: one shared (bucket, cycle_date) cycle, many owners");
+
+// A generic (non-keyword) source job as another report family would queue it in the SAME cycle.
+const genericJob = (hash, raw = "G1") => ({
+  requestHash: hash, requestKey: "daily-reporting:catalog", sourceId: "gen-src", sourceKey: "product-catalog",
+  connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope", requestMeta: {},
+  bucket: "us", strict: false, limit: 10,
+  fetchParams: { columns: ["c"], sellerOrVendorIds: [raw], from: null, to: null, options: {} },
+});
+const runGeneric = (store, dd, jobs) => runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownedJobs: jobs, bucket: "us", cycleDate: "2026-08-11" });
+const jobByHash = (store, cid, h) => store.listSourceJobs(cid).find((j) => j.request_hash === h);
+
+test("the Keyword staged worker never fails an unrelated pending generic job (no MISSING_PLAN); both owners complete via their own runner", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Queue a pending generic source in the shared cycle BEFORE the keyword cycle runs.
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending");
+
+  // Keyword staged worker runs the same shared cycle (primary A1 + dd-secondary B1).
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const kw = await cycle(store, dd, accounts);
+  assert.equal(kw.cycleId, cid, "keyword cycle joined the existing shared cycle");
+  // The generic job is UNTOUCHED (still pending; never MISSING_PLAN'd) and every keyword job succeeded.
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job left untouched");
+  const kwJobs = store.listSourceJobs(cid).filter((j) => String(j.request_key).startsWith("keyword-rank:"));
+  assert.ok(kwJobs.length >= 5 && kwJobs.every((j) => j.fetch_status === "succeeded"), "all keyword jobs succeeded");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN anywhere");
+
+  // The generic worker then completes its own job; keyword jobs stay succeeded and untouched.
+  const gen = await runGeneric(store, dd, [genericJob("gen-1")]);
+  assert.equal(gen.succeeded, 1, "generic worker completes its own job");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "succeeded");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "generic worker MISSING_PLANs nothing either");
+  // Each canonical hash created at most one export; primary/dd-secondary hashes stay disjoint.
+  for (const j of store.listSourceJobs(cid)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " created at most once");
+  const pri = kw.perAccount[0], sec = kw.perAccount[1];
+  assert.notEqual(pri.weeklyHash, sec.weeklyHash, "primary/dd-secondary weekly hashes disjoint");
+});
+
+test("running the generic worker FIRST, then the keyword worker: neither fails the other's jobs (order-independent)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  // Generic worker runs first and completes its own job in the shared cycle.
+  const gen = await runGeneric(store, dd, [genericJob("gen-1")]);
+  assert.equal(gen.succeeded, 1);
+  assert.equal(gen.cycleId, cid, "generic worker joined the shared cycle");
+  // The keyword worker then runs the same cycle; the generic (succeeded) job is untouched, keyword completes.
+  const kw = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.equal(kw.cycleId, cid);
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN in either order");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "succeeded", "generic job stayed succeeded");
+  const kwJobs = store.listSourceJobs(cid).filter((j) => String(j.request_key).startsWith("keyword-rank:"));
+  assert.ok(kwJobs.length >= 2 && kwJobs.every((j) => j.fetch_status === "succeeded"), "keyword jobs all succeeded");
+});
+
+test("a GENUINE keyword orphan (keyword request_key, stale hash absent from the plan) still fails closed (MISSING_PLAN)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  // A stale keyword catalog row whose hash is NOT in any account's canonical plan (e.g. an old window).
+  store.upsertSourceJob({ cycleId: cid, requestHash: "kw-stale", requestKey: "keyword-rank:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "fp", accountScopeHash: "sc", requestMeta: {} });
+  // An unrelated pending generic row must survive.
+  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
+  await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.equal(jobByHash(store, cid, "kw-stale").fetch_status, "failed", "owned keyword orphan fails closed");
+  assert.equal(jobByHash(store, cid, "kw-stale").error_code, "MISSING_PLAN");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job still untouched");
+});
+
 async function main() {
   mark("main(): loading keyword-rank cycle module");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));
+  ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   mark("module loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

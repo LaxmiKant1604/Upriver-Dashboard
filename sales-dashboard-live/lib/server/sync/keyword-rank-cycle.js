@@ -136,6 +136,23 @@ export async function runKeywordRankShadowCycle({
       .map((s) => plannedSourceJob("keyword-rank", s, plan.bucket || bucket, DRIVER_CONNECTION_ID[plan.connectionId] || plan.connectionId));
   });
 
+  // Blocker 1 (shared-cycle ownership) -- the COMPLETE set of source jobs this cycle owns for these
+  // accounts: weekly + catalog + monthly for EVERY account, independent of which round stages each. The
+  // monthly window is forced here (distinctPeriods:0 => the fallback applies) purely to enumerate the
+  // canonical monthly hash; request hashes are signal-independent, so this is exactly the hash real
+  // staging produces. Passed as the worker's TYPED ownership scope so the shared (bucket, cycle_date)
+  // cycle's OTHER report families are never touched, while a keyword job staged in a prior round/
+  // invocation is merged + resumed here (never MISSING_PLAN'd). A genuine keyword orphan (a stale hash
+  // with a keyword request_key) still fails closed.
+  const FORCE_MONTHLY_SIGNAL = { status: "success", validated: true, distinctPeriods: 0 };
+  const ownedJobs = state.flatMap((st) => {
+    const full = planKeywordRank({
+      accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
+      connections, asOf: st.asOf, weeklySignal: FORCE_MONTHLY_SIGNAL,
+    });
+    return full.sources.map((s) => plannedSourceJob("keyword-rank", s, full.bucket || bucket, DRIVER_CONNECTION_ID[full.connectionId] || full.connectionId));
+  });
+
   const rollup = { cycleId: null, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, deadlineReached: false, drained: false };
   let cycleId = null;
   for (let round = 0; round < maxRounds; round += 1) {
@@ -148,7 +165,7 @@ export async function runKeywordRankShadowCycle({
     if (round > 0) await reconstruct(cycleId);
     const planned = planRound();
     const plannedJobs = jobsOf(planned, round);
-    const res = await runSourceJobs({ store, dataDoe, plannedJobs, bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
+    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownedJobs, bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
     cycleId = res.cycleId;
     rollup.cycleId = cycleId;
     rollup.rounds = round + 1;

@@ -221,7 +221,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
  * secret. A finished cycle is a no-op.
  */
 export async function runSourceJobs({
-  store, dataDoe, plannedJobs,
+  store, dataDoe, plannedJobs, ownedJobs = null,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = DEFAULT_RESERVE_MS, maxJobs = Infinity,
 }) {
@@ -256,11 +256,24 @@ export async function runSourceJobs({
       accountScopeHash: job.accountScopeHash || "", requestMeta: job.requestMeta || {},
     });
   }
-  const metaByHash = new Map((plannedJobs || []).filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
-  progress.planned = metaByHash.size;
+  // A shared (bucket, cycle_date) cycle can hold source jobs owned by SEVERAL report families (only one
+  // sync_cycles row exists per bucket/date). `ownedJobs`, when supplied, is the COMPLETE set of jobs this
+  // invocation owns for the whole cycle (a superset of the current round's `plannedJobs`), so:
+  //   - metaByHash covers every owned job -- a job STAGED in a prior round/invocation can be merged and
+  //     resumed here rather than mistaken for an orphan; and
+  //   - `ownedKeys` (the request_keys this invocation owns) defines a TYPED processing scope: a row whose
+  //     request_key is not owned belongs to another family and is left completely untouched.
+  // When `ownedJobs` is null the invocation owns the whole cycle (previous behaviour, unchanged).
+  const metaSource = ownedJobs && ownedJobs.length ? [...ownedJobs, ...(plannedJobs || [])] : (plannedJobs || []);
+  const metaByHash = new Map(metaSource.filter((j) => j && j.requestHash).map((j) => [j.requestHash, j]));
+  const ownedKeys = ownedJobs ? new Set(ownedJobs.map((j) => j && j.requestKey).filter(Boolean)) : null;
+  const owns = (jobRow) => !ownedKeys || ownedKeys.has(jobRow.request_key ?? jobRow.requestKey ?? "");
+  progress.planned = new Set((plannedJobs || []).filter((j) => j && j.requestHash).map((j) => j.requestHash)).size;
 
   const jobRows = await store.listSourceJobs(cycleId);
   for (const jobRow of jobRows) {
+    // TYPED ownership scope: never touch (never MISSING_PLAN) a job owned by another report family.
+    if (!owns(jobRow)) continue;
     const st = fetchStatusOf(jobRow);
     if (st === "succeeded" || st === "failed" || st === "skipped") continue; // done
     if (progress.processed >= maxJobs) { progress.deadlineReached = false; break; }
@@ -270,7 +283,9 @@ export async function runSourceJobs({
     const meta = metaByHash.get(hash);
     progress.processed += 1;
     if (!meta) {
-      // A pending/attempted job with no canonical plan entry: fail closed, never silent.
+      // Owned by this invocation (request_key is ours) but the hash is not in our canonical plan: a
+      // GENUINE orphan (e.g. a stale window/version). Fail it closed -- never silently ignore an owned
+      // orphan, and never fail an unrelated family's job (those were skipped above).
       await store.recordSourceFailure({ cycleId, requestHash: hash, exportId: jobRow.export_id ?? null, stage: st === "attempted" ? "poll" : "create-export", code: "MISSING_PLAN", message: "No canonical plan entry for this source job.", terminal: false, durationMs: 0 });
       progress.failed += 1;
       outcomes.push({ requestKey: "", requestHash: hash, status: "failed", validated: false, code: "MISSING_PLAN" });
@@ -281,8 +296,9 @@ export async function runSourceJobs({
     if (outcome) outcomes.push(outcome);
   }
 
-  // Cumulative counts + drained state: recomputed from ALL persisted jobs so resuming or
-  // adding staged jobs never reduces a previous count.
+  // Cumulative counts recomputed from ALL persisted jobs (cycle-wide telemetry; resuming or adding
+  // staged jobs never reduces a previous count). `drained` is scoped to OWNED jobs when a typed scope is
+  // supplied, so one owner's completion never depends on another family's still-pending jobs.
   const allJobs = await store.listSourceJobs(cycleId);
   const counts = {
     sourceTotal: allJobs.length,
@@ -290,7 +306,7 @@ export async function runSourceJobs({
     sourceFailed: allJobs.filter((j) => fetchStatusOf(j) === "failed").length,
   };
   if (store.updateCycleCounts) await store.updateCycleCounts(cycleId, counts);
-  const unfinished = allJobs.some((j) => ["pending", "attempted"].includes(fetchStatusOf(j)));
+  const unfinished = allJobs.some((j) => owns(j) && ["pending", "attempted"].includes(fetchStatusOf(j)));
   progress.drained = !unfinished && !progress.deadlineReached;
   progress.counts = counts;
   return { ...progress, outcomes };
