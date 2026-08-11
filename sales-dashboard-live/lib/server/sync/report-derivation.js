@@ -549,8 +549,14 @@ const REGISTRY = {
       if (!isValidCalendarDate(asOf)) {
         throw new Error("sales-movers derivation requires an authoritative asOf (context.to) that is a real calendar date.");
       }
-      // accountId in the live payload is ids[0] (the raw seller id); rawSellerId scopes every fragment.
+      // Two DISTINCT identities. rawSellerId (the DataDoe raw seller id) scopes every fragment: it is the
+      // DataDoe request scope AND the sellerOrVendorIds a fragment must carry, so cross-account rows are
+      // rejected. publicAccountId (context.accountId, the authoritative public/prefixed id the report job
+      // + snapshot row are keyed by, e.g. "dd-secondary:RAW1") is what the PAYLOAD carries, so the payload
+      // accountId matches the snapshot key and the frontend scopes catalogBrands to the right account. They
+      // are EQUAL for primary accounts (public == raw), so this is byte-identical on the primary route.
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const probeFrom = addDaysStr(asOf, -(SM_LAG_DAYS + SM_WINDOW_DAYS * 3));
       // Required PROBE: exactly one single-account fragment over [probeFrom, asOf]; every row a plain
       // object with a real calendar date inside that window (recompute the window; never trust the caller).
@@ -559,7 +565,7 @@ const REGISTRY = {
       const latestReportedDate = salesMoversLatestReportedDate(probeRows);
       if (!latestReportedDate) {
         // Validated probe, no reported units => a VALID completed dataUnavailable snapshot; no downstream.
-        return salesMoversUnavailablePayload({ accountId: rawSellerId, asOf, lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, probeFrom });
+        return salesMoversUnavailablePayload({ accountId: publicAccountId, asOf, lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, probeFrom });
       }
       // The reported date must fall inside the probe window; the recent/prior weeks derive from it.
       if (latestReportedDate < probeFrom || latestReportedDate > asOf) {
@@ -589,7 +595,7 @@ const REGISTRY = {
       assertPlainObjectRows(inventoryRows, "sales-movers inventory");
       assertPlainObjectRows(catalogRows, "sales-movers catalog");
       return salesMoversPayload({
-        accountId: rawSellerId, asOf, latestReportedDate, recent, prior,
+        accountId: publicAccountId, asOf, latestReportedDate, recent, prior,
         lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, windowDays: SM_WINDOW_DAYS,
         recentTrafficRows: trafficFrags[0].rows, priorTrafficRows: trafficFrags[1].rows,
         recentAdsRows: adsFrags[0].rows, priorAdsRows: adsFrags[1].rows,
