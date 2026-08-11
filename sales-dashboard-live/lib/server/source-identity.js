@@ -36,6 +36,26 @@ export function organizationFingerprint(apiKey) {
   return sha256(apiKey).slice(0, 24);
 }
 
+// Deterministic, NON-SECRET owner identity for source-job ownership memberships
+// (sync_source_job_owners.owner_id). It distinguishes the four ownership dimensions the durable model
+// requires: report/workflow family (`reportKey`), connection/organization boundary (`connectionId`),
+// organization fingerprint (`organizationFingerprint`), and account scope (`accountScopeHash`). The same
+// report/account/org across staged rounds resolves to the SAME owner_id; different accounts (distinct
+// account_scope_hash) or organizations (distinct organization_fingerprint / connection) never share one;
+// different reports may hold different owner_ids for the SAME request_hash. It NEVER includes an API key,
+// Supabase key, token, or other secret -- organization_fingerprint is itself a non-reversible fingerprint
+// already stored openly, and account_scope_hash is a non-reversible hash of the account ids. Returns null
+// when any dimension is missing, so a caller can fail closed rather than form an ambiguous owner. This
+// value does NOT feed request_hash (source identity is unchanged).
+export function sourceJobOwnerId({ reportKey, connectionId, organizationFingerprint, accountScopeHash }) {
+  const rk = String(reportKey || "").trim();
+  const conn = String(connectionId || "").trim();
+  const org = String(organizationFingerprint || "").trim();
+  const scope = String(accountScopeHash || "").trim();
+  if (!rk || !conn || !org || !scope) return null;
+  return sha256(JSON.stringify(["source-owner/v1", rk, conn, org, scope])).slice(0, 32);
+}
+
 export function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
   const contract = sourceContractForId(sourceId);
   const organizationFingerprint = sha256(apiKey).slice(0, 24);

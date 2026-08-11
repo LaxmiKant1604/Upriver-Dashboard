@@ -686,13 +686,105 @@ export async function upsertSyncSourceJob(job) {
   });
 }
 
+// Canonical source jobs only. request_key is NOT a column here and is NOT ownership authority (report
+// ownership lives in sync_source_job_owners); the SELECT lists only real sync_source_jobs columns.
+const SOURCE_JOB_COLUMNS = "id,request_hash,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count";
+
 export async function getSyncSourceJobs(cycleId) {
   const query = new URLSearchParams({
-    select: "id,request_hash,request_key,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count",
+    select: SOURCE_JOB_COLUMNS,
     cycle_id: `eq.${cycleId}`,
     order: "created_at.asc",
   });
   return request(`/rest/v1/sync_source_jobs?${query}`);
+}
+
+/* ===== Scheduler v2: normalized source-job OWNERSHIP (sync_source_job_owners) wrappers =====
+   Many memberships per canonical (cycle_id, request_hash); unique(cycle_id, request_hash, owner_id).
+   sync_source_jobs stays one row/export per canonical hash with NO report-specific ownership authority.
+   These persist/read WHICH owner scopes may process/resume/read a canonical source, and record safe
+   owner-level stale status without ever failing or corrupting the shared canonical row. No secrets. */
+
+const SOURCE_JOB_OWNER_COLUMNS = "id,cycle_id,request_hash,owner_id,request_key,report_key,account_id,organization_fingerprint,account_scope_hash,owner_status,error_code,error_message";
+
+// Upsert owner memberships. Reactivation is intended: a re-declared membership resolution=merge-duplicates
+// resets owner_status back to 'active' and clears any prior stale error (an owner that needs the hash
+// again this cycle owns it again). Fails closed BEFORE any request on an incomplete membership so an
+// ambiguous/secretless-but-empty owner identity is never written.
+export async function upsertSyncSourceJobOwners(memberships) {
+  const rows = (memberships || []).map((m) => {
+    const ownerId = String(m.ownerId || m.owner_id || "").trim();
+    const requestHash = String(m.requestHash || m.request_hash || "").trim();
+    const requestKey = String(m.requestKey || m.request_key || "").trim();
+    const organizationFingerprint = String(m.organizationFingerprint || m.organization_fingerprint || "").trim();
+    const accountScopeHash = String(m.accountScopeHash || m.account_scope_hash || "").trim();
+    if (!ownerId || !requestHash || !requestKey || !organizationFingerprint || !accountScopeHash) {
+      throw new Error("upsertSyncSourceJobOwners requires a non-empty owner_id, request_hash, request_key, organization_fingerprint and account_scope_hash on every membership.");
+    }
+    return {
+      cycle_id: m.cycleId || m.cycle_id,
+      request_hash: requestHash,
+      owner_id: ownerId,
+      request_key: requestKey,
+      report_key: String(m.reportKey || m.report_key || ""),
+      account_id: String(m.accountId || m.account_id || ""),
+      organization_fingerprint: organizationFingerprint,
+      account_scope_hash: accountScopeHash,
+      owner_status: "active",
+      error_code: null,
+      error_message: null,
+    };
+  });
+  if (!rows.length) return;
+  await request("/rest/v1/sync_source_job_owners?on_conflict=cycle_id,request_hash,owner_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: rows,
+  });
+}
+
+// List memberships for a set of declared owner ids in one cycle (empty owner set => no rows).
+export async function getSyncSourceJobOwners(cycleId, ownerIds) {
+  const owners = [...new Set((ownerIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!owners.length) return [];
+  const query = new URLSearchParams({
+    select: SOURCE_JOB_OWNER_COLUMNS,
+    cycle_id: `eq.${cycleId}`,
+    owner_id: `in.(${owners.join(",")})`,
+    order: "created_at.asc",
+  });
+  return request(`/rest/v1/sync_source_job_owners?${query}`);
+}
+
+// List the CANONICAL source jobs the declared owners depend on: their ACTIVE memberships' request_hashes,
+// deduplicated, then the canonical rows for those hashes. (Powers admin report-wise / owner-scoped sync.)
+export async function getSyncSourceJobsForOwners(cycleId, ownerIds) {
+  const memberships = await getSyncSourceJobOwners(cycleId, ownerIds);
+  const hashes = [...new Set(memberships.filter((m) => m.owner_status !== "stale").map((m) => m.request_hash))];
+  if (!hashes.length) return [];
+  const query = new URLSearchParams({
+    select: SOURCE_JOB_COLUMNS,
+    cycle_id: `eq.${cycleId}`,
+    request_hash: `in.(${hashes.join(",")})`,
+    order: "created_at.asc",
+  });
+  return request(`/rest/v1/sync_source_jobs?${query}`);
+}
+
+// Mark ONE owner's membership stale (its plan no longer needs this hash). This is owner-scoped only: it
+// NEVER touches the canonical sync_source_jobs row or any other owner's membership, so a hash still owned
+// by another owner remains executable/resumable/readable, and no DataDoe call is made for a stale owner.
+export async function recordSyncSourceJobOwnerStale({ cycleId, requestHash, ownerId, code = "STALE_PLAN", message = null }) {
+  const query = new URLSearchParams({
+    cycle_id: `eq.${cycleId}`,
+    request_hash: `eq.${requestHash}`,
+    owner_id: `eq.${ownerId}`,
+  });
+  await request(`/rest/v1/sync_source_job_owners?${query}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: { owner_status: "stale", error_code: code, error_message: message },
+  });
 }
 
 async function patchSyncSourceJob(cycleId, requestHash, body) {
