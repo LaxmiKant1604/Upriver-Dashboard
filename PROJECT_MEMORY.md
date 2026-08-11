@@ -5826,3 +5826,45 @@ build (exit 0). `git diff --check` is clean; only untracked `HANDOFF.md` remains
 nothing was pushed/merged/deployed/unlocked/scheduled. The next functional tranche is Sales Movers only:
 faithful pure derivation from the already-declared staged probe -> two-window traffic/ads + shared inventory/
 catalog sources, with an account-scoped shadow-cycle entry point and parity/LKG/token-spend proofs.
+
+## Scheduler v2: Sales Movers derivation + staged shadow cycle (SHADOW MODE, 2026-08-11)
+
+Second functional report family on Scheduler v2 (see SCHEDULER_V2.md §48), on `feature/scheduler-v2` after
+approval commit `9f30a4b`. Five small green commits:
+1. **Pure derivation** -- `derivation-core.js` gained the verbatim Sales Movers cores
+   (`salesMoversLatestReportedDate/TrafficFold/AdsFold/AdsFor/InventoryFold/CatalogFold/Payload/
+   UnavailablePayload`), operating ONLY on saved fragments with zero DataDoe/Supabase/network imports (the
+   transport-boundary test still passes). `report-derivation.js` replaced the `sales-movers` `derive:null`
+   stub with a pure adapter: probe window `[asOf-25d,asOf]` gate-required, four downstream sources optional;
+   no reported date -> honest `dataUnavailable` (missing sales NEVER zeroed); a valid date binds
+   `salesMoversWindows`, REQUIRES + positionally validates traffic(2)+ads(2)+inventory+catalog and emits the
+   exact production payload; a missing/failed required downstream -> typed `unavailable` with LKG preserved,
+   zero writes. `accountId` = raw seller id (route parity).
+2. **Planner** -- `planSalesMovers` always emits the probe; stages downstream ONLY on a `validated_success`
+   probe with a real, calendar-valid date (`evaluateStagedActivation` + `isValidCalendarDate` guard so a bad
+   date stages nothing and never throws). `sales-movers` added to `STAGED_CYCLE_REPORT_KEYS` (generic
+   planner rejects it fail-closed).
+3. **Cycle** -- new `sales-movers-cycle.js` `runSalesMoversShadowCycle` on the approved owner model:
+   R1 probe-only, R2 traffic(2)+ads(2)+inventory+catalog only after a validated dated probe; primary-only
+   (stale dd-secondary skipped read-only, zero calls), bucket isolation, one owner/account/org, one
+   create-export per request_hash/cycle, persisted-export_id resume, cumulative maxJobs/round/deadline/
+   deferral bounds (partial stays PENDING + resumable), authoritative reconcile only for resolved probes,
+   returns complete `plannedReports`.
+4. **Tests** -- new `scripts/report-sales-movers.test.js` **20 assertions** (wired into
+   `test:report-derivation`): production-route fixture deep-equal, no-date payload, recent/prior sums,
+   mixed-currency withhold, inventory null-vs-genuine-zero, name/brand precedence, zero-tail exclusion,
+   window + cross-account fail-closed, missing-downstream unavailable + LKG, zero-network derive, idempotency,
+   kickoff-only-probe, downstream-once, maxRounds/maxJobs/poll/download resume with no dup export,
+   primary-only + bucket isolation, shared canonical catalog/inventory hash -> one export across two owners,
+   full source->plannedReports->snapshot E2E.
+
+**Report control unchanged.** Sales Movers stays SHADOW ONLY + locked; `api/datadoe.js` live route +
+`lib/server/reports/sales-movers.js` builder byte-unchanged; source CONTRACTS, `request_hash`, Scheduler v1,
+and the frontend untouched; `HANDOFF.md` untracked/untouched.
+
+**Verification (all natural, exit 0).** `node --check` on every changed JS/test file (0);
+`test:report-derivation` **239** (66+30+33+20+34+24+12+20, was 219); `test:report-contracts` 161 +
+`test:source-identity` 7 unchanged; full `npm run verify` **638 assertions** (was 618) + 2,394-module
+production build (exit 0); `git diff --check` clean; only intended files changed (+ untracked `HANDOFF.md`).
+Migration still unapplied; nothing pushed/merged/deployed/unlocked/scheduled. Next functional tranche is a
+separate report family (Buy Box / Returns / Listing Health / PPC / Listing Optimizer) -- not started here.

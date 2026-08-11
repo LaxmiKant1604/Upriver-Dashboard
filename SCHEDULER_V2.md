@@ -2672,3 +2672,86 @@ malformed-fail-closed + idempotent + no-secret). `npm run test:sync-engine` **79
 verify` = exit 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only
 the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all
 reports locked.
+
+## 48. Sales Movers: pure derivation + account-scoped staged shadow cycle (SHADOW MODE, 2026-08-11)
+
+Second functional report family on Scheduler v2 (after Keyword Rank), built entirely on the approved
+staged-source / owner-membership infrastructure. Sales Movers stays **SHADOW ONLY + locked**: not wired to
+any cron/route, `api/datadoe.js` live route + `lib/server/reports/sales-movers.js` builder byte-unchanged,
+the source CONTRACTS unchanged, Scheduler v1 + the frontend untouched, migration NOT applied, `HANDOFF.md`
+untracked/untouched.
+
+### 48.1 Pure derivation (`derivation-core.js`, `report-derivation.js`)
+
+`derivation-core.js` gained the Sales Movers pure cores, transcribed verbatim from the live builder's
+post-fetch logic and operating ONLY on already-SAVED fragments (zero DataDoe/Supabase/network imports --
+still enforced by the transport-boundary test): `salesMoversLatestReportedDate`, `salesMoversTrafficFold`,
+`salesMoversAdsFold` + `salesMoversAdsFor` (mixed-currency withhold), `salesMoversInventoryFold` (latest
+snapshot selection, available/inbound/days-of-supply-min/units-shipped-t30), `salesMoversCatalogFold`
+(locale-sorted `catalogBrands`), `salesMoversPayload`, `salesMoversUnavailablePayload`.
+
+`report-derivation.js` replaced the `sales-movers` `derive:null` registry stub with a pure adapter whose
+`optionalRequestKeys` are the four downstream sources (traffic/ads/inventory/catalog) and whose only
+gate-required source is the probe. It pins + validates the probe window `[asOf-25d, asOf]` (single account,
+in-window, plain-object rows), reads the latest reported date, and:
+- **no date** -> `salesMoversUnavailablePayload` (honest `dataUnavailable`, no downstream requested), a
+  valid completed snapshot -- missing sales are NEVER converted to zero;
+- **valid date** -> binds `salesMoversWindows(latest)`, REQUIRES + validates the two ordered traffic + two
+  ordered ads windows (positional, fail-closed on missing/extra/reordered/overlapping), the shared
+  inventory snapshot window `[asOf-10d, asOf]`, and the no-date catalog, then emits the exact production
+  payload. A required-but-missing/failed downstream => typed `unavailable`, preserving last-known-good with
+  zero writes. `accountId` is the raw seller id (route parity).
+
+### 48.2 Staged planner (`report-planner.js`)
+
+`planSalesMovers(account, probeSignal)` always emits the probe; ONLY when the account's OWN typed probe
+signal is a `validated_success` with a real reported date (shared `evaluateStagedActivation`, plus an
+`isValidCalendarDate` guard so a malformed probe date stages no downstream and never throws) does it emit
+the two-window traffic + ads, the shared inventory snapshot, and the shared no-date catalog. `request_hash`
++ primary/dd-secondary isolation come from the shared resolver, which re-validates the exact recent+prior
+weeks. `sales-movers` was added to `STAGED_CYCLE_REPORT_KEYS` so the generic `buildShadowReportPlan`
+rejects it fail-closed -- it is staged only by its own account-scoped cycle.
+
+### 48.3 Account-scoped staged shadow cycle (`sales-movers-cycle.js`)
+
+`runSalesMoversShadowCycle` reuses the approved owner-model worker (`runSourceJobs`, `plannedSourceJob`,
+`reconcileStaleOwnerMemberships`, `sourceJobOwnerId`). Rounds: **R1** the latest-date probe only; **R2**
+the two-window traffic + ads + shared inventory + catalog, staged ONLY when the reconstructed probe signal
+validated with a real date (`probeHasDate`). Properties (mirrors the Keyword Rank cycle exactly):
+- primary-only classification -- a stale `dd-secondary:` account is skipped read-only (zero DataDoe calls,
+  never routed to primary, prefix/snapshots untouched); schedule-bucket isolation rejects mixed buckets;
+- one owner per account/org; one create-export per canonical `request_hash` per cycle; a fresh invocation
+  reconstructs the probe signal from persisted jobs + saved cache and resumes the persisted `export_id`
+  WITHOUT a second create;
+- cumulative `maxJobs` / `maxRounds` / deadline / deferral bounds keep a partial invocation PENDING +
+  resumable (a deadline/deferral during the probe poll thus prevents downstream work that invocation);
+- a final reconstruct-then-reconcile against the authoritative resolved plan runs ONLY for accounts whose
+  probe actually resolved (validated success), so a bounded run never falsely stales a still-required
+  downstream, a genuinely removed downstream (probe reverts to no-date) still goes stale, and the shared
+  canonical row / other owners are untouched;
+- returns `rollup.plannedReports` (the COMPLETE required set per account) for `runReportJobs`; a
+  not-yet-staged required dependency simply leaves the report PENDING via the fetch gate until a later
+  invocation stages + succeeds it, then the SAME cycle derives + saves exactly once.
+
+### 48.4 State table (per account, per invocation)
+
+| probe outcome | downstream staged | derive result | snapshot |
+| --- | --- | --- | --- |
+| validated success + real date | traffic(2) + ads(2) + inventory + catalog | full Sales Movers payload | saved (completed) |
+| validated success, NO date | none | `dataUnavailable` payload (honest) | saved (completed) |
+| failed / terminal / unvalidated | none | typed blocked/unavailable (gate) | LKG preserved, zero writes |
+| bounded (maxJobs/round/deadline/deferral) | partial | report stays PENDING | resumes next invocation, no dup export |
+
+### 48.5 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). New `scripts/report-sales-movers.test.js` **20
+assertions** (wired into `test:report-derivation`): payload deep-equals a hand-computed production-route
+fixture; no-date `dataUnavailable`; recent/prior sums; mixed-currency withhold; inventory null-vs-genuine-
+zero; name/brand precedence (catalog->recent->prior); zero-tail exclusion; window + cross-account
+fail-closed; missing/failed downstream -> unavailable + LKG; zero-network derive; idempotency; kickoff
+stages only the probe; validated dated probe stages each downstream once; maxRounds/maxJobs/poll/download
+deferrals all resume with no duplicate export; primary-only + bucket isolation; shared canonical
+catalog/inventory hash -> one export across two owners; full source->plannedReports->snapshot E2E.
+`npm run test:report-derivation` **239** (66+30+33+20+34+24+12+20); `npm run verify` = exit 0 +
+`build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended files
+(+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled; migration still unapplied.
