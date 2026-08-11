@@ -25,6 +25,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, sourceJobOwnerId;
 let planBuyBoxLoss, planSalesMovers, addDaysStr, splitDateRangeByDays;
+let buildShadowReportPlan, runStagedSourceCycle, SHADOW_PLANNED_REPORT_KEYS;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -285,6 +286,85 @@ test("15. a missing/failed required source => unavailable, ZERO writes, last-kno
   assert.equal(deriveBB(built2, ctx(), { [invHash]: "failed" }).status, "unavailable", "failed inventory => unavailable (LKG kept)");
 });
 
+group("buy-box derive: every source ROW date is bound to its validated window (Blocker 1)");
+
+// A daily row's date must be a REAL calendar date inside ITS OWN 7-day slice window; an inventory row's
+// date must be a real date inside [asOf-10d, asOf]. A bad row is NEVER silently filtered -- it makes the
+// whole report invalid. `dailyIn(sliceIdx, ...)` builds a daily row for a given slice; overriding its date
+// exercises the guard. The catalog stays no-date.
+const dailyRow = (date, over = {}) => ({ date, sku: "SKU-W", child_asin: "ASIN-W", product_name: "Widget W", product_brand: "Acme", currency: "USD", buybox_percentage: 80, total_sales: 100, total_units_sold: 10, page_views: 50, ...over });
+// A fixture whose slice `sliceIdx` carries exactly the one row `row` (other slices minimal-but-valid).
+const withDailyRow = (sliceIdx, row) => {
+  const base = FIXTURE();
+  const slices = [
+    [dailyRow(SLICES[0].from)], [dailyRow(SLICES[1].from)], [dailyRow(SLICES[2].from)], [dailyRow(SLICES[3].from)],
+  ];
+  slices[sliceIdx] = [row];
+  return { ...base, slices };
+};
+
+test("15b. impossible calendar date (2025-02-30) in a daily row => invalid (never silently filtered)", () => {
+  assert.equal(deriveBB(bbPlanned(withDailyRow(0, dailyRow("2025-02-30")))).status, "invalid");
+});
+
+test("15c. a daily row dated BEFORE or AFTER its slice window => invalid", () => {
+  assert.equal(deriveBB(bbPlanned(withDailyRow(1, dailyRow(addDaysStr(SLICES[1].from, -1))))).status, "invalid", "before slice window => invalid");
+  assert.equal(deriveBB(bbPlanned(withDailyRow(1, dailyRow(addDaysStr(SLICES[1].to, 1))))).status, "invalid", "after slice window => invalid");
+});
+
+test("15d. a daily row placed in the WRONG seven-day slice (valid overall-range date, wrong slice) => invalid", () => {
+  // A date that is valid inside slice 2 but placed in slice 0's fragment: inside the 28-day range, wrong slice.
+  assert.equal(deriveBB(bbPlanned(withDailyRow(0, dailyRow(SLICES[2].from)))).status, "invalid", "in-range but wrong slice => invalid");
+});
+
+test("15e. a FUTURE daily date (2099-01-01) => invalid", () => {
+  assert.equal(deriveBB(bbPlanned(withDailyRow(3, dailyRow("2099-01-01")))).status, "invalid");
+});
+
+test("15f. inventory row dated before asOf-10d or after asOf => invalid", () => {
+  const before = bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(INV_FROM, -1), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
+  assert.equal(deriveBB(before).status, "invalid", "inventory before asOf-10d => invalid");
+  const after = bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(ASOF, 1), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
+  assert.equal(deriveBB(after).status, "invalid", "inventory after asOf => invalid");
+});
+
+test("15g. the exact Codex repro: daily 2099-01-01 + inventory 2099-01-02 no longer derives (=> invalid)", () => {
+  const built = bbPlanned({ ...withDailyRow(0, dailyRow("2099-01-01")), inventory: [invRow("2099-01-02", "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
+  assert.equal(deriveBB(built).status, "invalid", "future daily + future inventory dates are rejected");
+});
+
+test("15h. canonical valid rows still produce the identical payload; observedWindow + snapshot date are the REAL dates", () => {
+  const p = deriveBB(bbPlanned(FIXTURE())).payload;
+  assert.deepEqual(p, expectedFixturePayload(), "row-date validation does not change the canonical payload");
+  assert.deepEqual(p.observedWindow, { from: "2025-07-15", to: "2025-08-05" });
+  assert.equal(p.inventorySnapshotDate, "2025-08-09");
+});
+
+test("15i. worker-level: a bad daily row date => report NOT saved, prior snapshot (last-known-good) preserved, zero writes", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const built = bbPlanned(withDailyRow(0, dailyRow("2099-01-01"))); // a future daily date
+  for (const p of built.planned) {
+    store.upsertSourceJob({ cycleId: cid, requestHash: p.requestHash, requestKey: p.requestKey, sourceId: "s", sourceKey: "k", connectionId: "primary", organizationFingerprint: "org", accountScopeHash: "sch" });
+    store.saveSourceRows({ job: { request_hash: p.requestHash }, rows: built.rows[p.requestHash] || [] });
+    store.recordSourceSuccess({ cycleId: cid, requestHash: p.requestHash, exportId: "e", rowCount: 1, cacheObjectPath: "p/" + p.requestHash });
+  }
+  // A prior good snapshot exists (last-known-good).
+  const lkg = { accountId: ID, prior: true };
+  store.seedSnapshot("scheduler-v2/buy-box-loss", ID, lkg);
+  const plannedReports = [{
+    reportKey: "buy-box-loss", accountId: ID, connectionId: "primary", bucket: "us",
+    sources: built.planned.map((p) => ({ requestKey: p.requestKey, requestHash: p.requestHash, from: p.from, to: p.to, sellerOrVendorIds: p.sellerOrVendorIds, optional: false })),
+    context: { to: ASOF, rawSellerId: ID },
+  }];
+  let saveCalls = 0;
+  const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports });
+  assert.equal(res.succeeded, 0, "the report does not derive/save on a bad source-row date");
+  assert.equal(saveCalls, 0, "zero snapshot writes");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/buy-box-loss|" + ID).payload, lkg, "prior last-known-good snapshot preserved unchanged");
+});
+
 group("buy-box derive: public-vs-raw identity + purity");
 
 const RAW1 = "RAW1";
@@ -362,8 +442,12 @@ function makeDataDoe(opts = {}) {
   const deadlineErr = () => Object.assign(new Error("deferred"), { code: "DATADOE_DEADLINE" });
   const rowsFor = (job) => {
     const rk = job.requestKey || "";
-    if (rk.includes("daily")) return [daily("2025-08-05", "SKU-W", "ASIN-W", "Acme", "USD", 90, 200, 20, 150, "Widget W")];
-    if (rk.includes("inventory")) return [invRow("2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12)];
+    const fp = job.fetchParams || {};
+    // Date each row INSIDE its own validated fragment window (each daily row in its 7-day slice via the
+    // slice `from`; each inventory row on `to` = asOf, inside [asOf-10d, asOf]) so post-Blocker-1 row-date
+    // validation accepts canonical rows.
+    if (rk.includes("daily")) return [daily(fp.from || "2025-08-05", "SKU-W", "ASIN-W", "Acme", "USD", 90, 200, 20, 150, "Widget W")];
+    if (rk.includes("inventory")) return [invRow(fp.to || "2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12)];
     if (rk.includes("catalog")) return [{ child_asin: "ASIN-W", parent_asin: "P1", product_name: "Catalog W", product_brand: "AcmeCat" }];
     return [{ child_asin: "ASIN-W" }];
   };
@@ -516,13 +600,137 @@ test("28. dormant secondary via runReportJobs: report job + snapshot + payload k
   assert.deepEqual(saved[0].payload.catalogBrands, ["AcmeCat", "BetaCat"]);
 });
 
+/* ===== Part C: the REAL production-shadow path -- buildShadowReportPlan -> runStagedSourceCycle -> runReportJobs ===== */
+
+group("buy-box REAL generic path: buildShadowReportPlan -> runStagedSourceCycle -> runReportJobs (Blocker 2)");
+
+const ACCTS = [{ accountId: ID, country: "US", currency: "USD" }];
+const asOfForUS = () => ASOF;
+const shadowPlan = (accounts, keys, connections = CONNS) => buildShadowReportPlan({ accounts, reportKeys: keys, connections, asOfFor: asOfForUS });
+// The generic driver's resolvePlan: build owner-scoped plannedSourceJobs from the REAL plan's report
+// requests (exactly how a production caller feeds runStagedSourceCycle). No test-only job construction.
+const resolveFromPlan = (plan) => () => ({
+  sourceJobs: plan.reportRequests.flatMap((req) => req.sources.map((s) => plannedSourceJob(req.reportKey, s, req.bucket, DRIVER_CONNECTION_ID[req.connectionId] || req.connectionId, req.accountId))),
+});
+const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
+
+test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly six canonical jobs with exact windows/deps/owner/context", () => {
+  assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("buy-box-loss"), "buy-box-loss is a default generic report key");
+  assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "buy-box-loss"), "DEFAULT plan includes buy-box-loss");
+  const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
+  const bb = plan.reportRequests.find((r) => r.reportKey === "buy-box-loss");
+  // Exactly six canonical source jobs: four ordered daily slices + one inventory + one no-date catalog.
+  assert.equal(plan.sourceJobs.length, 6, "exactly six deduplicated canonical source jobs");
+  const dailies = bb.sources.filter((s) => s.requestKey === "buy-box-loss:daily");
+  assert.deepEqual(dailies.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day daily slice windows");
+  const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
+  assert.deepEqual([inv.from, inv.to], [INV_FROM, ASOF], "inventory window asOf-10d..asOf");
+  const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
+  assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
+  // Report dependency map = all six canonical hashes; context carries the raw seller id + asOf.
+  const rj = plan.reportJobs.find((j) => j.reportKey === "buy-box-loss");
+  assert.equal(rj.dependsOn.length, 6, "report depends on all six canonical sources");
+  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the six canonical hashes");
+  assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
+  // Owner metadata: every planned source job is owned by the buy-box-loss owner, recomputed + validated.
+  const jobs = resolveFromPlan(plan)().sourceJobs;
+  assert.equal(jobs.length, 6);
+  assert.ok(jobs.every((j) => j.owner && j.owner.reportKey === "buy-box-loss" && j.owner.accountId === ID && j.owner.ownerId), "each job carries buy-box-loss owner metadata");
+  assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
+});
+
+test("C2. Buy Box stays PENDING until every required source succeeds, then the snapshot is saved EXACTLY once; zero network during derivation", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
+  const saved = [];
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, payload }); return { paramsHash: "ph" }; };
+  // Bounded first invocation: only some of the six sources succeed => the report is still PENDING.
+  const r1 = await runGeneric(store, dd, plan, { maxJobs: 3 });
+  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 6, "not all sources succeeded yet");
+  let res = await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
+  assert.equal(res.succeeded, 0, "report is PENDING while a required source is missing (no save)");
+  assert.equal(saved.length, 0, "zero snapshot writes while pending");
+  // Resume the generic driver to completion.
+  const r2 = await runGeneric(store, dd, plan);
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all six sources succeeded after resume");
+  const realFetch = globalThis.fetch; let hits = 0;
+  globalThis.fetch = () => { hits += 1; throw new Error("network during derivation"); };
+  try { res = await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests }); } finally { globalThis.fetch = realFetch; }
+  assert.equal(hits, 0, "zero DataDoe/network requests during derivation");
+  assert.equal(res.succeeded, 1, "the report derives + saves once all sources are ready");
+  assert.equal(saved.length, 1, "snapshot saved exactly once");
+  assert.equal(saved[0].accountId, ID);
+  // Idempotent: a second report invocation writes no duplicate snapshot.
+  const before = store.saveCalls;
+  await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
+  assert.equal(store.saveCalls, before, "no duplicate snapshot on re-run");
+});
+
+test("C3. maxJobs partial + poll/download deferral resume through the real driver with ONE create-export per request hash", async () => {
+  // maxJobs partial resume.
+  const s1 = makeStore(); const d1 = makeDataDoe();
+  const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
+  await runGeneric(s1, d1, plan, { maxJobs: 2 });
+  const r = await runGeneric(s1, d1, plan);
+  assert.ok(s1.listSourceJobs(r.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after maxJobs resume");
+  for (const j of s1.listSourceJobs(r.cycleId)) assert.ok(d1.createCount(j.request_hash) <= 1, j.request_key + " exported at most once (maxJobs resume)");
+  // Poll-deferral resume: the first invocation defers inventory (no reconcile, memberships stay active).
+  const s2 = makeStore();
+  const dDefer = makeDataDoe({ deferKey: "inventory" });
+  const r1 = await runGeneric(s2, dDefer, plan);
+  assert.ok((r1.deferred || 0) > 0, "the driver surfaces the resumable deferral");
+  const invReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:inventory").requestHash;
+  assert.ok(s2._owners(r1.cycleId).every((m) => m.owner_status === "active"), "no membership staled by a deferral (plan not yet at fixpoint)");
+  const dOk = makeDataDoe();
+  const r2 = await runGeneric(s2, dOk, plan);
+  assert.equal(dDefer.createCount(invReq) + dOk.createCount(invReq), 1, "inventory export created exactly once across the deferral + resume");
+  assert.ok(s2.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after the deferral resume");
+});
+
+test("C4. Buy Box owner reconciliation is owner-scoped: a second owner sharing the inventory/catalog hash is neither staled nor failed", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
+  // Run the real generic driver to its fixpoint (this is when reconciliation of buy-box owners runs).
+  const r = await runGeneric(store, dd, plan);
+  const cid = r.cycleId;
+  const invReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:inventory");
+  const catReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:catalog");
+  // A SECOND owner (Sales Movers) holds a membership on the SAME shared inventory + catalog canonical hashes.
+  for (const [reqKey, src] of [["sales-movers:inventory", invReq], ["sales-movers:catalog", catReq]]) {
+    const ownerId = sourceJobOwnerId({ reportKey: "sales-movers", connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash });
+    store.upsertSourceJobOwners([{ cycleId: cid, requestHash: src.requestHash, ownerId, requestKey: reqKey, reportKey: "sales-movers", accountId: ID, connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash }]);
+  }
+  // Re-run the Buy Box generic driver to fixpoint: its reconciliation must touch ONLY buy-box owners.
+  await runGeneric(store, dd, plan);
+  const smMemberships = store._owners(cid).filter((m) => m.report_key === "sales-movers");
+  assert.equal(smMemberships.length, 2, "the second owner's two shared memberships still exist");
+  assert.ok(smMemberships.every((m) => m.owner_status === "active"), "buy-box reconciliation never stales/fails the second owner");
+  assert.ok(store.listSourceJobs(cid).filter((j) => j.request_hash === invReq.requestHash).every((j) => j.fetch_status === "succeeded"), "the shared canonical inventory job stays succeeded");
+});
+
+test("C5. primary-only: a stale dd-secondary account is skipped read-only with ZERO DataDoe calls and is never routed through the primary key", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const PRIMARY_ONLY = [{ id: "primary", apiKey: dash("prim", "key"), accountPrefix: "" }];
+  const accounts = [{ accountId: ID, country: "US", currency: "USD" }, { accountId: PUB1, country: "US", currency: "USD" }];
+  const plan = shadowPlan(accounts, ["buy-box-loss"], PRIMARY_ONLY);
+  assert.deepEqual(plan.unavailableAccounts.map((a) => a.accountId), [PUB1], "the dd-secondary account is classified unavailable");
+  assert.deepEqual(plan.reportRequests.map((r) => r.accountId), [ID], "only the primary account is planned");
+  const r = await runGeneric(store, dd, plan);
+  const jobs = store.listSourceJobs(r.cycleId);
+  assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
+  assert.ok(jobs.every((j) => !String(j.request_key).includes(dash("dd", "secondary"))), "no dd-secondary source was ever staged");
+  // Zero DataDoe create-exports carry the secondary account (it spent no token).
+  assert.equal(jobs.length, 6, "exactly the six primary-account canonical jobs ran");
+});
+
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ plannedSourceJob } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
-  ({ planBuyBoxLoss, planSalesMovers } = await import("../lib/server/sync/report-planner.js"));
+  ({ planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
+  ({ runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ addDaysStr, splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -27);
   INV_FROM = addDaysStr(ASOF, -10);
