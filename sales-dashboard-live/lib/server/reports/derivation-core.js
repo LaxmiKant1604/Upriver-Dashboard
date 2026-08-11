@@ -1139,3 +1139,211 @@ export function buyBoxLossPayload({
     catalogBrands: catalog.catalogBrands,
   };
 }
+
+/* ============================ Returns & Refund Leakage ============================ */
+// PURE cores for Returns & Refund Leakage, transcribed VERBATIM from lib/server/reports/returns.js.
+// Three sources prove different things: Returns (reason mix + counts; NO quantity/currency column, one row
+// = one returned item), Settlements (the money per currency|ASIN, ORDER vs REFUND), and Sales & Traffic
+// (Amazon's own shipped/refunded unit pair). Currency is NEVER merged; refund money uses absolute values
+// (Amazon posts money-out negative); the return-fee component is clamped at zero so a restocking recovery
+// can never understate leakage. Reuses the shared sumField (smSumField), brand (salesMoversBrandLabel) and
+// catalog (salesMoversCatalogFold) folds. Zero transport imports.
+
+// Amazon's return-reason enum grouped into the four fixable levers + an explicit low-actionability bucket;
+// anything unmatched stays "other". Byte-identical to returns.js RETURN_REASON_BUCKETS.
+export const RETURNS_REASON_BUCKETS = [
+  { key: "product_quality", label: "Product / quality", lever: "Supplier and QC", test: /DEFECT|QUALITY|DAMAGED_BY|MISSING_PART|NOT_WORK|BROKEN|EXPIRED/ },
+  { key: "listing_accuracy", label: "Listing accuracy", lever: "Listing content", test: /NOT_AS_DESCRIB|NOT_COMPATIB|WRONG_ITEM|SWITCHEROO|MISSED_DESCRIPTION|INACCURATE/ },
+  { key: "sizing", label: "Sizing / fit", lever: "Size chart and images", test: /TOO_SMALL|TOO_LARGE|TOO_BIG|APPAREL_STYLE|SIZE|FIT/ },
+  { key: "delivery", label: "Delivery / fulfilment", lever: "Packaging and carrier", test: /UNDELIVERABLE|REFUSED|LATE|NEVER_ARRIVED|IN_TRANSIT|SHIPPING/ },
+  { key: "low_actionability", label: "Low actionability", lever: "Usually not fixable", test: /UNWANTED|NO_REASON|MISORDER|NO_LONGER_NEED|FOUND_CHEAPER|ACCIDENTAL/ },
+];
+
+// Byte-identical to returns.js classifyReturnReason: first matching bucket, else "other".
+export function classifyReturnReason(reason) {
+  const text = String(reason || "").toUpperCase();
+  if (!text) return "other";
+  for (const bucket of RETURNS_REASON_BUCKETS) {
+    if (bucket.test.test(text)) return bucket.key;
+  }
+  return "other";
+}
+
+// Fold return records to ASIN, keeping the reason + channel mix. Byte-identical to returns.js's returns
+// loop. Returns per-ASIN entries plus the account-wide reasonTotals, pending count, and the FBM-only
+// refunded amount / seller-borne label cost (kept separate so they are never shown as an account-wide total).
+export function returnsLeakageReturnsFold(rows) {
+  const returnsByAsin = new Map();
+  const reasonTotals = new Map();
+  let pendingReturnRequests = 0;
+  let fbmRefundedAmount = 0;
+  let fbmLabelCostBorneBySeller = 0;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const reason = String(row.amazon_return_reason || "").trim() || "NO_REASON_GIVEN";
+    const bucket = classifyReturnReason(reason);
+    const channel = String(row.amazon_fulfillment_channel || "").trim().toUpperCase() || "UNKNOWN";
+    const status = String(row.amazon_return_request_status || "").trim();
+    const entry = returnsByAsin.get(asin) || { returnCount: 0, fba: 0, fbm: 0, pending: 0, byBucket: {}, byReason: {}, skus: new Set() };
+    entry.returnCount += 1;
+    if (channel === "FBA") entry.fba += 1;
+    else if (channel === "FBM") entry.fbm += 1;
+    if (/pending/i.test(status)) { entry.pending += 1; pendingReturnRequests += 1; }
+    entry.byBucket[bucket] = (entry.byBucket[bucket] || 0) + 1;
+    entry.byReason[reason] = (entry.byReason[reason] || 0) + 1;
+    const sku = String(row.sku || "").trim();
+    if (sku) entry.skus.add(sku);
+    returnsByAsin.set(asin, entry);
+    reasonTotals.set(reason, (reasonTotals.get(reason) || 0) + 1);
+    fbmRefundedAmount += Math.abs(num(row.amazon_return_refunded_amount));
+    if (/seller/i.test(String(row.amazon_return_label_to_be_paid_by || ""))) {
+      fbmLabelCostBorneBySeller += Math.abs(num(row.amazon_return_label_cost));
+    }
+  }
+  return { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller };
+}
+
+// Fold settlement money per (currency, ASIN). ORDER rows contribute settled sales/units; REFUND rows carry
+// the refunded amount/tax/referral credit, the ZERO-CLAMPED return-fee component, COGS on refunded units,
+// and settled refunded units. Absolute values throughout. Byte-identical to returns.js's settlement loop.
+export function returnsLeakageSettlementFold(rows) {
+  const moneyByKey = new Map();
+  const currencies = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const currency = String(row.currency || "").trim() || null;
+    if (currency) currencies.add(currency);
+    const type = String(row.settlement_type || "").trim().toUpperCase();
+    const key = `${currency || "?"}|${asin}`;
+    const entry = moneyByKey.get(key) || {
+      asin, currency, skus: new Set(),
+      settledSales: 0, settledUnits: 0, refundedAmount: 0, refundTax: 0, refundedReferralFeeCredit: 0,
+      returnFees: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0,
+    };
+    const sku = String(row.sku || "").trim();
+    if (sku) entry.skus.add(sku);
+    if (type === "ORDER") {
+      entry.settledSales += smSumField(row, "item_price_sum", "item_price");
+      entry.settledUnits += smSumField(row, "quantity_sum", "quantity");
+    } else if (type === "REFUND") {
+      entry.refundEvents += 1;
+      entry.refundedAmount += Math.abs(smSumField(row, "refunded_amount_sum", "refunded_amount"));
+      entry.refundTax += Math.abs(smSumField(row, "refund_tax_sum", "refund_tax"));
+      entry.refundedReferralFeeCredit += Math.abs(smSumField(row, "refunded_referral_fee_sum", "refunded_referral_fee"));
+      entry.returnFees += Math.max(0,
+        Math.abs(smSumField(row, "refund_commission_sum", "refund_commission"))
+        + Math.abs(smSumField(row, "return_unit_fee_sum", "fba_customer_return_per_unit_fee"))
+        - Math.abs(smSumField(row, "refund_restocking_fee_sum", "refund_restocking_fee"))
+      );
+      entry.cogsOnRefundedUnits += Math.abs(smSumField(row, "cogs_sum", "cogs_total_value"));
+      entry.refundedUnitsSettled += Math.abs(smSumField(row, "quantity_sum", "quantity"));
+    }
+    moneyByKey.set(key, entry);
+  }
+  return { moneyByKey, currencies };
+}
+
+// Fold Amazon's shipped/refunded unit pair per ASIN. Byte-identical to returns.js's traffic loop.
+export function returnsLeakageTrafficFold(rows) {
+  const trafficByAsin = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const entry = trafficByAsin.get(asin) || { sales: 0, units: 0, unitsShipped: 0, unitsRefunded: 0, productName: null };
+    entry.sales += smSumField(row, "sales_sum", "total_sales");
+    entry.units += smSumField(row, "units_sum", "total_units");
+    entry.unitsShipped += smSumField(row, "units_shipped_sum", "units_shipped");
+    entry.unitsRefunded += smSumField(row, "units_refunded_sum", "units_refunded");
+    if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
+    trafficByAsin.set(asin, entry);
+  }
+  return { trafficByAsin };
+}
+
+/**
+ * Full Returns & Refund Leakage payload, byte-identical to buildReturnsLeakage() for the same saved rows.
+ * One row per (currency, ASIN); an ASIN with no returns AND no refund events AND no refunded traffic units
+ * is excluded. Money never crosses currencies; product-name precedence is catalog -> traffic; brand comes
+ * from the catalog only. `returnRecordCount` is the RAW return-row count (incl. rows the fold skips). Pure.
+ */
+export function returnsLeakagePayload({
+  accountId, asOf, from, windowDays, returnsSourceLabel, moneySourceLabel, rateSourceLabel,
+  rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, trafficRows, catalogRows,
+}) {
+  const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
+  const { moneyByKey, currencies } = returnsLeakageSettlementFold(settlementRows);
+  const { trafficByAsin } = returnsLeakageTrafficFold(trafficRows);
+  const catalog = salesMoversCatalogFold(catalogRows);
+
+  const asins = new Set([
+    ...returnsByAsin.keys(),
+    ...trafficByAsin.keys(),
+    ...[...moneyByKey.values()].map((entry) => entry.asin),
+  ]);
+  const rows = [];
+  for (const asin of asins) {
+    const returns = returnsByAsin.get(asin) || null;
+    const traffic = trafficByAsin.get(asin) || null;
+    // An ASIN can appear under more than one currency; each keeps its own row.
+    const moneyEntries = [...moneyByKey.values()].filter((entry) => entry.asin === asin);
+    const targets = moneyEntries.length ? moneyEntries : [null];
+    const meta = catalog.byAsin.get(asin) || {};
+    for (const money of targets) {
+      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0) || (traffic && traffic.unitsRefunded > 0);
+      if (!hasReturnActivity) continue;
+      const skus = new Set([...(returns?.skus || []), ...(money?.skus || [])]);
+      rows.push({
+        asin,
+        sku: [...skus].sort((a, b) => a.localeCompare(b))[0] || null,
+        skuCount: skus.size,
+        productName: meta.name || traffic?.productName || null,
+        brand: salesMoversBrandLabel(meta.brand),
+        currency: money?.currency || null,
+        returnCount: returns ? returns.returnCount : 0,
+        fbaReturns: returns ? returns.fba : 0,
+        fbmReturns: returns ? returns.fbm : 0,
+        pendingReturnRequests: returns ? returns.pending : 0,
+        reasonBuckets: returns ? returns.byBucket : {},
+        topReasons: returns
+          ? Object.entries(returns.byReason).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([reason, count]) => ({ reason, count }))
+          : [],
+        refundedAmount: money ? money.refundedAmount : 0,
+        refundTax: money ? money.refundTax : 0,
+        returnFees: money ? money.returnFees : 0,
+        refundedReferralFeeCredit: money ? money.refundedReferralFeeCredit : 0,
+        cogsOnRefundedUnits: money ? money.cogsOnRefundedUnits : 0,
+        refundedUnitsSettled: money ? money.refundedUnitsSettled : 0,
+        refundEvents: money ? money.refundEvents : 0,
+        settledSales: money ? money.settledSales : 0,
+        settledUnits: money ? money.settledUnits : 0,
+        hasMoney: Boolean(money),
+        unitsSold: traffic ? traffic.units : null,
+        unitsShipped: traffic ? traffic.unitsShipped : null,
+        unitsRefunded: traffic ? traffic.unitsRefunded : null,
+        sales: traffic ? traffic.sales : null,
+        hasTraffic: Boolean(traffic),
+      });
+    }
+  }
+  return {
+    accountId,
+    asOf,
+    window: { from, to: asOf, days: windowDays },
+    returnsSourceLabel,
+    moneySourceLabel,
+    rateSourceLabel,
+    rateSourceLagDays,
+    returnHistoryDays,
+    returnRecordCount: (Array.isArray(returnRows) ? returnRows : []).length,
+    pendingReturnRequests,
+    fbmOnly: { refundedAmount: fbmRefundedAmount, sellerBorneLabelCost: fbmLabelCostBorneBySeller },
+    reasonTotals: [...reasonTotals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => ({ reason, count, bucket: classifyReturnReason(reason) })),
+    currencies: [...currencies].sort(),
+    rows,
+    catalogBrands: catalog.catalogBrands,
+  };
+}

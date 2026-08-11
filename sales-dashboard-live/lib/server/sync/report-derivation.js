@@ -31,6 +31,7 @@ import {
   salesMoversPayload,
   salesMoversUnavailablePayload,
   buyBoxLossPayload,
+  returnsLeakagePayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -76,6 +77,15 @@ const BB_SLICE_DAYS = 7;
 const BB_INVENTORY_LOOKBACK_DAYS = 10;
 const BB_SOURCE_LABEL = "Profit by SKU & Date";
 const BB_PRICE_SOURCE_LABEL = "FBA Inventory Health";
+
+// Returns & Refund Leakage constants -- byte-identical to the live builder/sources: returns.js WINDOW_DAYS
+// = RETURNS.historyDays (60); the source labels + SALES_TRAFFIC.lagDays (4). The derivation RECOMPUTES the
+// single [asOf-59d, asOf] window from asOf and pins it, never trusting a caller's fragment window.
+const RET_WINDOW_DAYS = 60;
+const RET_RETURNS_LABEL = "Returns (FBA & FBM)";
+const RET_MONEY_LABEL = "Settlements & P&L Components";
+const RET_RATE_LABEL = "Sales & Traffic by ASIN & Date";
+const RET_RATE_LAG_DAYS = 4;
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -685,7 +695,64 @@ const REGISTRY = {
     // Latest real data date = the latest observed daily date (the observed-window `to`), null when empty.
     latestDataDate: (p) => (p && p.observedWindow && isValidCalendarDate(p.observedWindow.to) ? p.observedWindow.to : null),
   },
-  "returns-leakage": { snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
+  // Returns & Refund Leakage: reproduce the api/datadoe.js `returns-leakage` payload from the raw Returns
+  // rows, the grouped Settlements money, the grouped Sales & Traffic pair, and the shared no-date catalog.
+  // ALL four sources are required (optionalRequestKeys: []) -- the fetch gate keeps the report PENDING until
+  // every source succeeds, so a failed/terminal/truncated/missing required source never saves (LKG kept).
+  // The single [asOf-59d, asOf] window is RECOMPUTED from asOf and pinned; returns raw rows must carry a real
+  // date inside it (per-row date bound, never merely fragment metadata); settlements/traffic/catalog are
+  // grouped/no-date so their rows need only be plain objects. A wrong-window/cross-account/malformed/bad-date
+  // fragment or row => invalid (zero writes, LKG preserved); a missing/failed source => unavailable (LKG).
+  // Currency is never merged; refund money is absolute; the return-fee component is zero-clamped. ZERO
+  // DataDoe/network calls (pure).
+  "returns-leakage": {
+    snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("returns-leakage derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      // rawSellerId (raw DataDoe seller id) is the SOLE source scope: DataDoe request scope + the id every
+      // fragment must carry (cross-account rejection). publicAccountId (context.accountId) is the public/
+      // prefixed id the report job + snapshot row are keyed by and is what the PAYLOAD carries.
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      const from = addDaysStr(asOf, -(RET_WINDOW_DAYS - 1));
+      // All four sources are required; defensively reject a missing/failed/unreadable cache (never an empty success).
+      for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic", "returns-leakage:catalog"]) {
+        const s = sources[key];
+        if (!s || s.available !== true || !Array.isArray(s.rows)) {
+          throw deriveError(`returns-leakage ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+        }
+      }
+      // Returns / Settlements / Traffic: exactly one single-account fragment each over [asOf-59d, asOf].
+      const returnRows = singleAccountFragmentRows(sources["returns-leakage:returns"], "returns-leakage:returns", rawSellerId, from, asOf);
+      const settlementRows = singleAccountFragmentRows(sources["returns-leakage:settlements"], "returns-leakage:settlements", rawSellerId, from, asOf);
+      const trafficRows = singleAccountFragmentRows(sources["returns-leakage:traffic"], "returns-leakage:traffic", rawSellerId, from, asOf);
+      // Catalog: exactly one single-account no-date fragment.
+      const catalogRows = noDateFragmentRows(sources["returns-leakage:catalog"], "returns-leakage:catalog", rawSellerId);
+      // Returns are RAW grain (one row = one returned item): every row must be a plain object with a real
+      // calendar date inside [asOf-59d, asOf] -- a malformed/impossible/future/out-of-window row => invalid
+      // (never silently filtered). Settlements + Traffic are GROUPED and Catalog is NO-DATE => plain objects.
+      assertRowsInWindow(returnRows, from, asOf, "returns-leakage returns");
+      assertPlainObjectRows(settlementRows, "returns-leakage settlements");
+      assertPlainObjectRows(trafficRows, "returns-leakage traffic");
+      assertPlainObjectRows(catalogRows, "returns-leakage catalog");
+      return returnsLeakagePayload({
+        accountId: publicAccountId, asOf, from, windowDays: RET_WINDOW_DAYS,
+        returnsSourceLabel: RET_RETURNS_LABEL, moneySourceLabel: RET_MONEY_LABEL,
+        rateSourceLabel: RET_RATE_LABEL, rateSourceLagDays: RET_RATE_LAG_DAYS, returnHistoryDays: RET_WINDOW_DAYS,
+        returnRows, settlementRows, trafficRows, catalogRows,
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
+      && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && Array.isArray(p.reasonTotals)
+      && !!p.window && typeof p.window === "object" && !!p.fbmOnly && typeof p.fbmOnly === "object"
+      && ("returnRecordCount" in p) && ("pendingReturnRequests" in p),
+    // Latest real data date = the window end (asOf), which every validated return row is pinned at or before;
+    // deterministic and authoritative (never Date.now()).
+    latestDataDate: (p) => (p && p.window && isValidCalendarDate(p.window.to) ? p.window.to : null),
+  },
   "listing-health": { snapshotVersion: "listing-health/v2d-1", optionalRequestKeys: ["listing-health:listings-raw"], derivedSourceKeys: [], derive: null },
   "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },
   "ppc-performance": { snapshotVersion: "ppc-performance/v2d-1", optionalRequestKeys: ["ppc-performance:total-sales"], derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"], derive: null },
