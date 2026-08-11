@@ -5629,3 +5629,38 @@ report lifecycle, primary-only handling, one-attempt guard, strict caps, staging
 bucket/account/org isolation, and cycle-wide telemetry. Do not start another adapter, push, merge,
 deploy, apply a migration, enable schedules, modify Scheduler v1/frontend, or touch untracked
 `HANDOFF.md` until the schema round-trip and multi-owner canonical-source tests are green.
+
+## Scheduler v2: durable many-to-many source-job ownership (Claude, 2026-08-11)
+
+Fixed the two durable-ownership blockers from the Codex re-review (`5984356`). Replaced the row-tuple
+ownership model with a normalized many-to-many `sync_source_job_owners` table, because
+`buildDependencyPlan()` dedups identical canonical requests (same `request_hash`) needed by several
+reports into one `sync_source_jobs` row / one export, and those reports can carry different request keys
+(shared catalog/inventory) -- so one canonical row cannot hold one authoritative `request_key`. **Additive
++ behavioural scheduler-v2 code only**; `api/datadoe.js`, report CONTRACTS, `report-derivation.js`,
+Scheduler v1, and the frontend are unchanged. Migration NOT applied. SHADOW MODE; controls locked;
+`HANDOFF.md` untracked/untouched. request_hash + five-ID batching + strict caps + token-saving staging +
+typed outcomes + LKG + partial-report/primary-only behaviour preserved. Detail in `SCHEDULER_V2.md`
+section 45. Six small green commits.
+
+- **Blocker 1 (request_key not a DB column).** `getSyncSourceJobs` SELECT dropped `request_key` (never a
+  canonical column / never ownership authority). request_key now lives on each owner membership (not-null),
+  persisted by `upsertSyncSourceJobOwners`. sync-signals `PROD_COLUMNS` mirror updated to match.
+- **Blocker 2 (one key can't own a shared canonical source).** New `sync_source_job_owners` (migration
+  `20260811_...`, NOT applied): `unique(cycle_id, request_hash, owner_id)` + composite FK to
+  `sync_source_jobs(cycle_id, request_hash)`; owner_status active|stale; admin-only RLS; no secrets.
+  `owner_id = sourceJobOwnerId(reportKey, connectionId, organization_fingerprint, account_scope_hash)` --
+  deterministic, non-secret, account/org/connection/family-safe, independent of request_key/hash.
+- **Worker/drivers.** `runSourceJobs({ ownerIds })` validates plannedJob ownership fail-closed BEFORE any
+  upsert; upserts canonical once by request_hash, memberships separately; loads declared owners' active
+  membership hashes; two owners sharing a hash => one canonical row + one export, either resumes it; never
+  MISSING_PLANs a canonical row (stale is owner-level); canonical cycle counts + owner-scoped drained;
+  legacy no-ownerIds path unchanged. `plannedSourceJob` attaches `owner`; `runStagedSourceCycle` +
+  `runKeywordRankShadowCycle` declare owner ids + `reconcileStaleOwnerMemberships` (owner-scoped, never
+  fails the shared canonical row or another owner). New wrappers: upsert/list owner memberships, list
+  canonical jobs for owners, record owner-stale.
+- **Verification (all natural, exit 0).** new `sync-source-owners` **12** (schema, real PostgREST wrappers,
+  two-reports-one-hash-one-export, owner-scoped stale, owner_id safety); test:sync-engine **70**
+  (22+17+6+8+4+12+1); test:report-derivation **213** (66+30+33+20+34+18+12); test:report-contracts 161
+  (unchanged); test:source-identity 7 (golden request_hash unchanged); `npm run verify` = exit 0 + build
+  (2,394 modules); `git diff --check` clean; only intended files changed (+ untracked HANDOFF.md).

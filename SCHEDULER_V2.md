@@ -2486,3 +2486,70 @@ test:report-derivation` = **213** (66+30+33+20+34+18+12); `npm run test:report-c
 unchanged); `npm run test:source-identity` (7); `npm run verify` = exit 0 + `build:check` (2,394 modules);
 `git diff --check` clean; `git status --short` shows only the intended files (+ untracked `HANDOFF.md`).
 Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 45. Durable many-to-many source-job ownership (SHADOW MODE, 2026-08-11)
+
+Replaces the row-tuple ownership model (a single request_key/org/scope on the canonical row) with a
+normalized many-to-many ownership table, because `buildDependencyPlan()` intentionally collapses
+identical canonical requests (same `request_hash`) needed by several reports into ONE `sync_source_jobs`
+row / one DataDoe export, and those reports can carry different request keys (shared catalog/inventory).
+One canonical row therefore cannot hold one authoritative report `request_key`. Additive + behavioural
+scheduler-v2 code only; `api/datadoe.js`, the report CONTRACTS, `report-derivation.js`, Scheduler v1, and
+the frontend are unchanged. The migration is NOT applied. request_hash, five-ID batching, strict caps,
+token-saving staging, typed outcomes, LKG, and the approved partial-report/primary-only behaviour are all
+preserved. `HANDOFF.md` untracked/untouched.
+
+### 45.1 Schema (`supabase/migrations/20260811_sync_source_job_owners.sql`, NOT applied)
+
+New `public.sync_source_job_owners`: MANY memberships per canonical row. `unique(cycle_id, request_hash,
+owner_id)`; a composite FK `(cycle_id, request_hash) -> sync_source_jobs(cycle_id, request_hash)` (which
+references the existing `sync_source_jobs_cycle_hash_unique`). Columns: `owner_id`, `request_key` (a
+diagnostic membership alias, NEVER sole authority), `report_key`, safe public `account_id`,
+`organization_fingerprint`, `account_scope_hash`, `owner_status` (`active`|`stale`), safe owner-level
+`error_code`/`error_message`, timestamps. Additive + idempotent (`create ... if not exists`, drop/create
+policy) so it is safe on a fresh DB and one already migrated by 20260807; it changes no existing table.
+RLS: service-role writes (bypass), admin-only reads, no non-select policy. No secret is stored.
+`sync_source_jobs` is unchanged -- one row/export per canonical hash, no report-specific ownership.
+
+### 45.2 owner_id (`source-identity.js` `sourceJobOwnerId`)
+
+A deterministic, NON-SECRET identity `sha256(["source-owner/v1", reportKey, connectionId,
+organization_fingerprint, account_scope_hash])[:32]`. It distinguishes report/workflow family +
+connection/organization boundary + organization fingerprint + account scope. Same report/account/org
+across staged rounds => same owner_id; different accounts (distinct account_scope_hash) or organizations
+(distinct organization_fingerprint / connection) never share one; different reports may hold different
+owner_ids for the SAME request_hash. It includes no api key/token/secret (organization_fingerprint and
+account_scope_hash are themselves non-reversible), and does NOT feed request_hash.
+
+### 45.3 Production wrappers (`supabase.js`)
+
+`getSyncSourceJobs` SELECTs only real canonical columns (request_key removed). New: `upsertSyncSourceJob-
+Owners` (POST `on_conflict=cycle_id,request_hash,owner_id`, `resolution=merge-duplicates` reactivation;
+fails closed before any request on an incomplete membership), `getSyncSourceJobOwners(cycleId, ownerIds)`,
+`getSyncSourceJobsForOwners(cycleId, ownerIds)` (active membership hashes -> canonical rows), and
+`recordSyncSourceJobOwnerStale` (PATCH exactly one membership to `stale`, never the canonical row).
+
+### 45.4 Worker + drivers
+
+`runSourceJobs({ ..., ownerIds })`: validates every plannedJob carries a complete owner membership
+belonging to a declared owner id BEFORE any source/owner upsert (fail closed on empty/malformed/
+mismatched); upserts the CANONICAL job once by request_hash, then owner memberships SEPARATELY; loads the
+declared owners' active membership hashes; processes only owned+planned canonical jobs (two owners sharing
+a hash => one export; either resumes it); NEVER MISSING_PLANs a canonical row (stale is owner-level);
+cycle counts stay canonical, `drained` is owner-scoped; the legacy no-ownerIds path is unchanged.
+`plannedSourceJob` attaches `owner` (owner_id + request_key alias + report_key + safe accountId).
+`runStagedSourceCycle` and `runKeywordRankShadowCycle` declare owner ids, accumulate planned membership
+keys, and call `reconcileStaleOwnerMemberships` at the end to retire memberships they no longer plan --
+owner-scoped only, never failing the shared canonical row or another owner. Keyword account-scoped
+signals, partial-report pending, maxJobs/maxRounds/deadline resume, one-attempt, primary-only handling,
+and no-primary-fallback are all preserved.
+
+### 45.5 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). New `sync-source-owners.test.js` **12** (schema, real
+PostgREST wrappers, two-reports-one-hash-one-export, owner-scoped stale, owner_id safety). `npm run
+test:sync-engine` **70** (22+17+6+8+4+12+1); `npm run test:report-derivation` **213** (66+30+33+20+34+18+
+12, ownership + coexistence tests rewired to memberships); `npm run test:report-contracts` (**161**,
+unchanged); `npm run test:source-identity` (**7**, golden request_hash unchanged); `npm run verify` = exit
+0 + `build:check` (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended
+files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
