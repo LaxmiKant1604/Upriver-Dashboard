@@ -2786,3 +2786,69 @@ while every source fragment uses the raw id; primary vs dd-secondary probe `requ
 clean; only `report-derivation.js` + `report-sales-movers.test.js` changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/unlocked/scheduled; migration still unapplied; Sales Movers remains SHADOW
 ONLY + locked.
+
+## 49. Buy Box Loss: pure derivation + generic single-shot planning (SHADOW MODE, 2026-08-11)
+
+Third functional report family on Scheduler v2 (after Keyword Rank + Sales Movers). Buy Box Loss has NO
+probe / staged activation -- all three sources are INDEPENDENTLY required -- so it uses the EXISTING generic
+owner-scoped source cycle + generic planner, never a dedicated staged-cycle driver. Buy Box stays **SHADOW
+ONLY + locked**: `api/datadoe.js` live route + `lib/server/reports/buy-box.js` builder byte-unchanged, the
+source CONTRACTS unchanged, Scheduler v1 + frontend untouched, migration NOT applied, `HANDOFF.md`
+untracked/untouched.
+
+### 49.1 Dependency + window map
+
+| request key | source | window (recomputed from asOf, pinned) | cap | shared identity |
+| --- | --- | --- | --- | --- |
+| `buy-box-loss:daily` | Profit by SKU & Date | FOUR ordered non-overlapping 7-day slices covering `[asOf-27d, asOf]` (`splitDateRangeByDays`) | 50,000/slice (strict) | -- |
+| `buy-box-loss:inventory` | FBA Inventory Health | `[asOf-10d, asOf]` | 15,000 (strict) | SAME canonical hash as `sales-movers:inventory` |
+| `buy-box-loss:catalog` | Product Catalog | no-date | 20,000 (strict) | SAME canonical hash as `sales-movers:catalog` + other insight catalogs |
+
+### 49.2 Pure derivation (`derivation-core.js`, `report-derivation.js`)
+
+`derivation-core.js` gained the Buy Box cores, transcribed verbatim from `buy-box.js` + `common.js`:
+`buyBoxInventoryFold` (latest snapshot by SKU with nullable competitive prices), `buyBoxDailyFold`
+(page-view-weighted buy-box share over `currency|sku`, unweighted-mean fallback ONLY when observed days had
+zero page views, null observations excluded, observed-window tracking), `buyBoxLossPayload` (exclude
+no-sales/no-observed-buybox SKUs; price/stock evidence null when the snapshot lacks the SKU; shared catalog
+fold). `buybox_percentage` is a RATIO and is NEVER summed. Zero transport imports (transport-boundary test
+still passes).
+
+`report-derivation.js` replaced the `buy-box-loss` `derive:null` stub with a pure adapter (all three sources
+required, `optionalRequestKeys: []`). It RECOMPUTES + pins the four 7-day slices (`splitDateRangeByDays`),
+the inventory `[asOf-10d, asOf]`, and the no-date catalog, validating fragments positionally via the
+generalized `validateOrderedSingleAccountWindows` (renamed from `validateSalesMoversOrderedWindows`; Sales
+Movers behavior byte-unchanged). A wrong/missing/duplicate/reordered/overlapping/partial/extra/cross-account/
+malformed fragment => `invalid` (zero writes, LKG preserved); a missing/failed/unreadable required source =>
+`unavailable` (LKG). Payload `accountId` uses authoritative public `context.accountId`; `context.rawSellerId`
+stays the SOLE source/fragment scope (equal on the primary route).
+
+`date-windows.js` gained a transport-free `splitDateRangeByDays` (byte-identical to the `datadoe.js` copy the
+builder uses), so the planner and the derivation share ONE slicing implementation -- the planner stages
+exactly the four windows the derivation later validates, by construction.
+
+### 49.3 Generic planner (`report-planner.js`)
+
+`planBuyBoxLoss` emits the exact route windows (four daily slices + inventory + no-date catalog) for the one
+raw seller id; shared inventory/catalog canonical hashes dedupe with Sales Movers + other insight reports.
+`buy-box-loss` is added to the generic `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch, so it is planned
+by `buildShadowReportPlan` and driven by the generic owner-scoped `runSourceJobs` (one create-export per
+`request_hash` per cycle; partial `maxJobs`/deadline/deferral runs leave the report PENDING + resumable; a
+fresh invocation resumes the persisted export without a second create).
+
+### 49.4 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). New `scripts/report-buy-box.test.js` **27 cases** (wired
+into `test:report-derivation`): production-route fixture deep-equal; weighted vs unweighted-mean-fallback;
+null observations excluded; no-sales + no-observed-buybox exclusion; currency+SKU isolation; price/stock
+evidence; inventory genuine-zero vs null-when-missing vs snapshot-unavailable; name/brand precedence; exact
+four-slice window validation; wrong/missing/duplicate/reordered/partial/extra/cross-account fail-closed;
+missing/failed required source => unavailable + LKG; public-vs-raw identity; zero-network derive; idempotency;
+shared inventory/catalog hashes MATCH Sales Movers + primary/dd-secondary isolation; one export per shared
+`request_hash` across two owners; coexistence never stales/fails another owner; strict-cap TRUNCATED => no
+source save => report never derives; full source->report snapshot E2E keyed by the account; maxJobs +
+poll-deferral resume with no duplicate export; dormant-secondary report job + snapshot + payload keyed by the
+public id. `npm run test:report-derivation` **273** (66+30+33+20+34+24+12+27+27, was 246); `npm run verify` =
+exit 0 + `build:check` (2,394 modules) = **672 assertions** (was 645); `git diff --check` clean; only the
+intended files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled;
+migration still unapplied; Buy Box remains SHADOW ONLY + locked.

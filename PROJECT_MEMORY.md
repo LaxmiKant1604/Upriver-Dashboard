@@ -5946,3 +5946,49 @@ only). Sales Movers stays SHADOW ONLY + locked.
 `test:source-identity` **7**; full `npm run verify` **645 assertions** (was 638) + 2,394-module production
 build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/scheduled.
+
+## Scheduler v2: Buy Box Loss derivation + generic planning (SHADOW MODE, 2026-08-11)
+
+Third functional report family on Scheduler v2 (see SCHEDULER_V2.md §49), on `feature/scheduler-v2` from base
+`4579f7d`. Buy Box Loss has NO probe / staged activation -- all three sources are INDEPENDENTLY required --
+so it uses the EXISTING generic owner-scoped source cycle + generic planner, NOT a dedicated staged-cycle
+driver. Three small commits.
+
+**Dependency/window map.** `buy-box-loss:daily` (Profit by SKU & Date) = FOUR ordered non-overlapping 7-day
+slices covering `[asOf-27d,asOf]`, 50k/slice strict; `buy-box-loss:inventory` (FBA Inventory Health)
+`[asOf-10d,asOf]`, 15k strict, SAME canonical hash as `sales-movers:inventory`; `buy-box-loss:catalog`
+(Product Catalog) no-date, 20k strict, SAME hash as `sales-movers:catalog` + other insight catalogs.
+
+1. **Pure derivation** -- `derivation-core.js` gained `buyBoxInventoryFold` (latest snapshot by SKU +
+   nullable competitive prices), `buyBoxDailyFold` (page-view-weighted buy-box share over `currency|sku`,
+   unweighted-mean fallback only when observed days had zero page views, null observations EXCLUDED,
+   observed-window tracking), `buyBoxLossPayload` (exclude no-sales/no-observed-buybox SKUs; price/stock
+   null when the snapshot lacks the SKU; shared catalog fold), all verbatim from `buy-box.js`/`common.js`,
+   zero transport imports. `report-derivation.js` wired the `buy-box-loss` adapter (all 3 sources required):
+   recompute + pin the 4 slices + inventory + no-date catalog; a wrong/missing/duplicate/reordered/
+   overlapping/partial/extra/cross-account/malformed fragment => invalid (LKG, zero writes); a missing/failed
+   required source => unavailable (LKG). Payload `accountId` = public `context.accountId`; `rawSellerId` is
+   the sole source/fragment scope. Generalized `validateSalesMoversOrderedWindows` ->
+   `validateOrderedSingleAccountWindows` (Sales Movers byte-unchanged). `date-windows.js` gained a
+   transport-free `splitDateRangeByDays` so the planner + derivation share ONE slicing implementation.
+2. **Planner** -- `planBuyBoxLoss` emits the 4 daily slices + inventory + no-date catalog; added to the
+   generic `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS` dispatch (driven by `buildShadowReportPlan` +
+   `runSourceJobs`, one export per `request_hash`/cycle, partial runs resumable).
+3. **Tests** -- new `scripts/report-buy-box.test.js` **27 cases** (wired into `test:report-derivation`):
+   production-route fixture deep-equal, weighted/unweighted branches, null-excluded, no-sales/no-buybox
+   exclusion, currency+SKU isolation, price/stock evidence, inventory zero-vs-null-vs-unavailable, name/brand
+   precedence, exact four-slice window validation, all fail-closed cases, LKG on failure, public/raw identity,
+   zero-network, idempotency, shared-hash match + primary/dd-secondary isolation, one export across two owners,
+   coexistence, strict-cap TRUNCATED, E2E, maxJobs + deferral resume, dormant-secondary keyed by public id.
+
+**Report control unchanged.** Only `derivation-core.js`, `report-derivation.js`, `date-windows.js`,
+`report-planner.js`, `report-buy-box.test.js`, `package.json` changed. `api/datadoe.js` live route +
+`buy-box.js` builder byte-unchanged; source CONTRACTS, `request_hash`/source identity, Scheduler v1, frontend,
+migrations, report controls, schedules untouched (`test:source-identity` **7**, golden hash unchanged).
+Secondary DataDoe API NOT enabled. Buy Box stays SHADOW ONLY + locked.
+
+**Verification (all natural, exit 0).** `node --check` on every changed file (0); `test:report-derivation`
+**273** (66+30+33+20+34+24+12+27+27, was 246); `test:sync-engine` **79**; `test:report-contracts` **161**;
+`test:source-identity` **7**; full `npm run verify` **672 assertions** (was 645) + 2,394-module production
+build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`).
+Nothing pushed/merged/deployed/migrated/unlocked/scheduled.
