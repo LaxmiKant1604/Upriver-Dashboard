@@ -23,7 +23,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let assembleSources, deriveReportSnapshot, runReportJobs, runSalesMoversShadowCycle, addDaysStr, salesMoversWindows, sourceJobOwnerId;
+let assembleSources, deriveReportSnapshot, runReportJobs, runSalesMoversShadowCycle, addDaysStr, salesMoversWindows, sourceJobOwnerId, planSalesMovers;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -240,6 +240,54 @@ test("11. derivation makes ZERO network calls; 12. repeated derivation is idempo
   assert.deepEqual(a, expectedFixturePayload());
 });
 
+/* ===================== public-vs-raw account identity (dormant secondary safety) ===================== */
+
+group("sales-movers identity: payload carries the PUBLIC account id; fragments/scope use the RAW seller id");
+
+// Synthetic dormant-secondary identity: the PUBLIC account id is prefixed (dd-secondary:RAW1) while the raw
+// DataDoe seller id is RAW1. context.accountId is authoritative for the payload; context.rawSellerId scopes
+// every fragment. (The secondary DataDoe API stays OFF -- this is offline synthetic coverage only.)
+const RAW1 = "RAW1";
+const PUB1 = dash("dd", "secondary") + ":RAW1"; // "dd-secondary:RAW1"
+const idCtx = (publicId, rawId) => ctx({ accountId: publicId, rawSellerId: rawId });
+
+test("13a. primary (public==raw==A1): payload.accountId is the public id A1 (route parity unchanged)", () => {
+  const p = deriveSm(smPlanned({ ...FIXTURE(), ids: [ID] }), idCtx(ID, ID)).payload;
+  assert.equal(p.accountId, "A1");
+});
+
+test("13b. dormant secondary: payload.accountId is the PUBLIC prefixed id, NOT the raw seller id", () => {
+  const p = deriveSm(smPlanned({ ...FIXTURE(), ids: [RAW1] }), idCtx(PUB1, RAW1)).payload;
+  assert.equal(p.accountId, PUB1, "payload accountId is the public/prefixed id (matches the snapshot key)");
+  assert.notEqual(p.accountId, RAW1, "payload accountId is NEVER the raw DataDoe seller id");
+  // Calculations are untouched: same rows/windows/brands as the primary-scope fixture.
+  assert.deepEqual(p.rows, expectedFixturePayload().rows, "row calculations unchanged by the identity fix");
+  assert.deepEqual(p.catalogBrands, ["Acme", "Beta"], "catalogBrands travel with the PUBLIC payload accountId");
+});
+
+test("13c. dataUnavailable path: payload.accountId is also the PUBLIC prefixed id", () => {
+  const noDate = { probeRows: [{ date: "2025-08-05", units_sum: 0 }], downstream: false, ids: [RAW1] };
+  const p = deriveSm(smPlanned(noDate), idCtx(PUB1, RAW1)).payload;
+  assert.equal(p.dataUnavailable, true);
+  assert.equal(p.accountId, PUB1, "dataUnavailable payload accountId is the public/prefixed id");
+  assert.notEqual(p.accountId, RAW1);
+});
+
+test("13d. source fragments still require sellerOrVendorIds === [RAW1] (raw seller id) to derive", () => {
+  // Positive: fragments scoped to the raw seller id derive cleanly.
+  assert.equal(deriveSm(smPlanned({ ...FIXTURE(), ids: [RAW1] }), idCtx(PUB1, RAW1)).status, "derived");
+  // A fragment scoped to a DIFFERENT raw seller id is rejected (cross-account).
+  const otherRaw = smPlanned({ ...FIXTURE(), ids: [RAW1] });
+  const ti = otherRaw.planned.findIndex((s) => s.requestKey === "sales-movers:traffic");
+  otherRaw.planned[ti] = { ...otherRaw.planned[ti], sellerOrVendorIds: ["RAW2"] };
+  assert.equal(deriveSm(otherRaw, idCtx(PUB1, RAW1)).status, "invalid", "fragment scoped to RAW2 => cross-account => invalid");
+});
+
+test("13e. a fragment scoped to the PUBLIC prefixed id (not the raw id) is rejected as cross-account", () => {
+  const built = smPlanned({ ...FIXTURE(), ids: [PUB1] }); // every fragment carries dd-secondary:RAW1
+  assert.equal(deriveSm(built, idCtx(PUB1, RAW1)).status, "invalid", "public-id fragments never satisfy raw-id scope");
+});
+
 /* ============================= Part B: staged shadow cycle ============================= */
 
 group("sales-movers cycle: kickoff / staging / resume / isolation / shared-hash dedup");
@@ -389,10 +437,54 @@ test("E2E: source cycle -> final plannedReports -> runReportJobs -> saved sales-
   assert.equal(store.saveCalls, before, "repeated invocation writes no duplicate snapshot");
 });
 
+// Seed a cycle's source jobs as SUCCEEDED with cached rows so runReportJobs can derive offline.
+function seedSucceeded(store, cid, built) {
+  for (const p of built.planned) {
+    store.upsertSourceJob({ cycleId: cid, requestHash: p.requestHash, requestKey: p.requestKey, sourceId: "s", sourceKey: "k", connectionId: "dd-secondary", organizationFingerprint: "org", accountScopeHash: "sch" });
+    store.saveSourceRows({ job: { request_hash: p.requestHash }, rows: built.rows[p.requestHash] || [] });
+    store.recordSourceSuccess({ cycleId: cid, requestHash: p.requestHash, exportId: "e", rowCount: (built.rows[p.requestHash] || []).length, cacheObjectPath: "p/" + p.requestHash });
+  }
+}
+
+test("13f. dormant secondary via runReportJobs: report job + saved snapshot are keyed by the PUBLIC id; payload.accountId matches; brands travel with it", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const built = smPlanned({ ...FIXTURE(), ids: [RAW1] });
+  seedSucceeded(store, cid, built);
+  const plannedReports = [{
+    reportKey: "sales-movers", accountId: PUB1, connectionId: "dd-secondary", bucket: "us",
+    // Report SOURCES carry the RAW seller id (fragment scope); the report is KEYED by the public id.
+    sources: built.planned.map((p) => ({ requestKey: p.requestKey, requestHash: p.requestHash, from: p.from, to: p.to, sellerOrVendorIds: p.sellerOrVendorIds, optional: false })),
+    context: { to: ASOF, rawSellerId: RAW1 },
+  }];
+  const saved = [];
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, payload }); return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports });
+  assert.equal(res.succeeded, 1, "the dd-secondary sales-movers report derived + saved");
+  // Report job is keyed by the PUBLIC account id.
+  assert.ok(store.report("sales-movers", PUB1), "report job keyed by dd-secondary:RAW1");
+  assert.equal(store.report("sales-movers", RAW1), undefined, "no report job keyed by the raw seller id");
+  // Snapshot save + payload both carry the PUBLIC id; catalogBrands travel with it.
+  assert.equal(saved[0].accountId, PUB1, "snapshot saved under the public account id");
+  assert.equal(saved[0].payload.accountId, PUB1, "payload.accountId is the public id (frontend scopes brands to it)");
+  assert.deepEqual(saved[0].payload.catalogBrands, ["Acme", "Beta"], "catalogBrands associated with the public payload accountId");
+});
+
+test("13g. primary and dd-secondary probe request hashes remain isolated (identity fix does not change request_hash)", () => {
+  const primary = planSalesMovers({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
+  const secondary = planSalesMovers({ accountId: PUB1, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
+  const probeHash = (plan) => plan.sources.find((s) => s.requestKey === "sales-movers:sales-latest-probe").requestHash;
+  assert.equal(primary.accountId, "A1"); assert.equal(secondary.accountId, PUB1);
+  assert.equal(primary.connectionId, "primary"); assert.equal(secondary.connectionId, "secondary");
+  assert.notEqual(probeHash(primary), probeHash(secondary), "primary and dd-secondary canonical probe hashes are distinct (isolated org scope)");
+  assert.equal(primary.context.rawSellerId, "A1"); assert.equal(secondary.context.rawSellerId, RAW1);
+});
+
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ runSalesMoversShadowCycle } = await import("../lib/server/sync/sales-movers-cycle.js"));
+  ({ planSalesMovers } = await import("../lib/server/sync/report-planner.js"));
   ({ addDaysStr } = await import("../lib/server/date-windows.js"));
   ({ salesMoversWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
