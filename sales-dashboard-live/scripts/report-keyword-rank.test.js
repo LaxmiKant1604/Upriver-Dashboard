@@ -81,7 +81,7 @@ function makeReportStore() {
   return {
     _snapshots: snapshots,
     saveCalls: 0,
-    seedSource(hash, status) { sourceJobs.push({ request_hash: hash, fetch_status: status }); },
+    seedSource(hash, status, errorCode = null) { sourceJobs.push({ request_hash: hash, fetch_status: status, error_code: errorCode }); },
     seedSnapshot(reportKey, accountId, payload) { snapshots.set(key(reportKey, accountId), { payload }); },
     report(rk, a) { return reportJobs.get(key(rk, a)); },
     listSourceJobs() { return sourceJobs.map((j) => ({ ...j })); },
@@ -302,9 +302,10 @@ const LKG = { cadence: "weekly", periods: ["prior"], rows: [] };
 
 // Run runReportJobs for a keyword-rank plan (+ an unrelated content-changes report). Seeds the source
 // job statuses + cache rows + a prior LKG snapshot; returns { store, savedKeys }.
-async function runKwWorker({ kwSources, statusByHash, rowsByHash }) {
+async function runKwWorker({ kwSources, statusByHash, rowsByHash, errorByHash = {} }) {
   const store = makeReportStore();
-  for (const [h, st] of Object.entries(statusByHash)) store.seedSource(h, st);
+  // The durable safe error_code is what proves a source-disabled outcome (B1); a policy alone never does.
+  for (const [h, st] of Object.entries(statusByHash)) store.seedSource(h, st, errorByHash[h] || null);
   store.seedSource("other-src", "succeeded");
   store.seedSnapshot("scheduler-v2/keyword-rank", ID, LKG);
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rowsByHash, hash) ? { rows: rowsByHash[hash] } : { rows: [] });
@@ -320,6 +321,8 @@ test("keyword-rank worker: BLOCKED (terminal-disabled monthly) is terminal, writ
   const { store, savedKeys } = await runKwWorker({
     kwSources: KW_REPORT_SOURCES({ disabledPolicy: { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" } }),
     statusByHash: { "kw-w": "succeeded", "kw-m": "failed", "kw-c": "succeeded" },
+    // The durable SOURCE_DISABLED error_code (not policy presence) proves the terminal-disabled outcome.
+    errorByHash: { "kw-m": "SOURCE_DISABLED" },
     rowsByHash: { "kw-w": [{ date: "2025-07-01" }], "kw-c": CATALOG },
   });
   assert.ok(!savedKeys.includes("scheduler-v2/keyword-rank"), "no keyword-rank snapshot saved");

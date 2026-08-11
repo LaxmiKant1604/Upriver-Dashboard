@@ -97,7 +97,7 @@ export function buildDeriveContext({ entry, plannedContext, derivedContext, acco
   };
 }
 
-async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes, loadDerivedContext }) {
+async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, errorByHash = {}, clock, maxSnapshotBytes, loadDerivedContext }) {
   const { reportKey, accountId } = planned;
   const started = clock();
   const entry = REPORT_DERIVATIONS[reportKey];
@@ -136,7 +136,7 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     try { payload = await sourceRows(s.requestHash); } catch (_e) { payload = null; }
     loadedByHash.set(s.requestHash, payload);
   }
-  const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash);
+  const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash, errorByHash);
 
   // Load DERIVE-ONLY injected inputs (persisted non-DataDoe rows, e.g. the scheduled Ads rows for
   // Daily Reporting) through an injected callback. These reach the pure adapter via the derive
@@ -233,6 +233,12 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
  *
  * `plannedSources`: [{ requestKey, requestHash, from?, to?, sellerOrVendorIds?, optional?, disabledPolicy? }]
  * `statusByHash`:   { [requestHash]: fetch_status }
+ * `errorByHash`:    { [requestHash]: error_code | null }  -- the canonical sync_source_jobs SAFE error_code.
+ *                   A fragment is `disabled` (a setup state, not a failure) ONLY on a genuine source-disabled
+ *                   DURABLE outcome: fetch_status='failed' AND error_code==='SOURCE_DISABLED' AND the planned
+ *                   availability/disabled policy is present. Policy presence ALONE never proves a disable, and
+ *                   NO other failure (EXPORT_ERROR / HTTP_5xx / TIMEOUT / TRUNCATED / cache-persist) is ever a
+ *                   disable. Error messages / HTTP text are NEVER parsed.
  * `loadedByHash`:   Map/obj requestHash -> { rows, fetched_at? } | null  (from getSourceExportCache)
  *
  * Returns `{ sources, latestFetchedAt }`. For each requestKey:
@@ -248,8 +254,9 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
  *   rows        -- safe concatenation of all fragment rows in that sequence when available
  *                  (identical to sequential fetchExportRows concatenation), else null.
  */
-export function assembleSources(plannedSources, statusByHash, loadedByHash) {
+export function assembleSources(plannedSources, statusByHash, loadedByHash, errorByHash = {}) {
   const get = (h) => (loadedByHash instanceof Map ? loadedByHash.get(h) : loadedByHash[h]);
+  const errorOf = (h) => (errorByHash instanceof Map ? errorByHash.get(h) : (errorByHash ? errorByHash[h] : null)) || null;
   const byKey = new Map();
   let latestFetchedAt = null;
   (plannedSources || []).forEach((s, fragmentIndex) => {
@@ -268,7 +275,12 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash) {
       requestHash: s.requestHash, requestKey: s.requestKey, from: s.from ?? null, to: s.to ?? null,
       sellerOrVendorIds: s.sellerOrVendorIds || null, rows, fetchedAt,
       jobStatus: jobStatus || "missing",
-      disabled: jobStatus === "failed" && !!s.disabledPolicy, disabledPolicy: s.disabledPolicy || null,
+      // `disabled` is a source-DISABLED setup state, proven ONLY by the durable outcome: the canonical job
+      // failed with the safe error_code SOURCE_DISABLED AND a planned disabled/availability policy exists.
+      // A policy alone is not evidence; every OTHER failure (EXPORT_ERROR/HTTP_5xx/TIMEOUT/TRUNCATED/cache-
+      // persist) stays non-disabled and derives as typed unavailable (LKG preserved).
+      disabled: jobStatus === "failed" && errorOf(s.requestHash) === "SOURCE_DISABLED" && !!s.disabledPolicy,
+      errorCode: errorOf(s.requestHash), disabledPolicy: s.disabledPolicy || null,
       optional: !!s.optional,
     });
   });
@@ -321,10 +333,16 @@ export async function runReportJobs({
   const plannedByKey = new Map(plannedReports.filter((p) => p && p.reportKey).map((p) => [`${p.reportKey}|${p.accountId}`, p]));
   progress.planned = plannedByKey.size;
 
-  // Source dependency statuses for gating.
+  // Source dependency statuses for gating + the durable SAFE error_code for source-disabled detection (a
+  // policy is never used as evidence of the actual failure cause -- see assembleSources).
   const sourceJobs = await store.listSourceJobs(cycleId);
   const statusByHash = {};
-  for (const j of sourceJobs) statusByHash[j.request_hash ?? j.requestHash] = j.fetch_status ?? j.fetchStatus;
+  const errorByHash = {};
+  for (const j of sourceJobs) {
+    const h = j.request_hash ?? j.requestHash;
+    statusByHash[h] = j.fetch_status ?? j.fetchStatus;
+    errorByHash[h] = j.error_code ?? j.errorCode ?? null;
+  }
 
   const jobRows = await store.listReportJobs(cycleId);
   for (const jobRow of jobRows) {
@@ -338,7 +356,7 @@ export async function runReportJobs({
 
     let outcome;
     try {
-      outcome = await runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, clock, maxSnapshotBytes, loadDerivedContext });
+      outcome = await runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned, statusByHash, errorByHash, clock, maxSnapshotBytes, loadDerivedContext });
     } catch (error) {
       // Failure isolation: one report throwing never blocks the others.
       await store.recordReportFailure({ cycleId, reportKey: planned.reportKey, accountId: planned.accountId, stage: "derive", code: "DERIVE_CRASH", message: "Report derivation crashed.", terminal: true, durationMs: 0 });
