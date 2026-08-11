@@ -52,8 +52,11 @@ function makeMemoryStore() {
   const cache = new Map(); // request_hash -> { rows, object_path }
   let seq = 0;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
+  // Mirrors the production getSyncSourceJobs() SELECT exactly (including the owner-identity columns
+  // request_key / organization_fingerprint / account_scope_hash the durable ownership scope reads).
   const PROD_COLUMNS = [
-    "id", "request_hash", "source_id", "source_key", "connection_id", "fetch_status",
+    "id", "request_hash", "request_key", "source_id", "source_key", "connection_id",
+    "organization_fingerprint", "account_scope_hash", "fetch_status",
     "attempted_at", "create_export_count", "export_id", "terminal", "error_stage",
     "error_code", "row_count",
   ];

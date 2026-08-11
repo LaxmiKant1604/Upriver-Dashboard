@@ -30,7 +30,7 @@ const START = Date.now();
 const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runKeywordRankShadowCycle, runReportJobs;
+let runKeywordRankShadowCycle, runReportJobs, runStagedSourceCycle, reportSourceRequestHashes, plannedSourceJob;
 
 const dash = (...p) => p.join("-");
 const SECONDARY = dash("dd", "secondary");
@@ -372,10 +372,89 @@ test("an unrelated (complete) report derives normally while an incomplete report
   assert.equal(reportStatus(store, "A1").derive, "pending", "the pending report is never derive-failed");
 });
 
+/* ===================== REAL generic driver + REAL keyword driver share ONE cycle (Blocker 2) ===================== */
+
+group("keyword-rank e2e: real runStagedSourceCycle + runKeywordRankShadowCycle coexist in one shared cycle");
+
+// The REAL generic staged driver, driven over a simple no-fallback report (brand-sales) for account G1
+// on the primary org. Not a test-only runSourceJobs helper -- this is the production runStagedSourceCycle.
+const GEN_WIN = { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] };
+const genResolve = () => {
+  const resolved = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: dash("prim", "key"), ids: ["G1"], windowsByRequestKey: GEN_WIN }) || [];
+  return { sourceJobs: resolved.map((r) => plannedSourceJob("brand-sales", r, "us", "primary")) };
+};
+const runGenericDriver = (store, dd, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: genResolve, bucket: "us", cycleDate: "2026-08-11", ...opts });
+const runKw = (store, dd, accounts, opts = {}) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", ...opts });
+const KW_ACCOUNTS = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: "A2", country: "US", currency: "USD" }];
+const noMissingPlan = (store, cid) => store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN");
+const isKw = (j) => String(j.request_key).startsWith("keyword-rank:");
+const isGen = (j) => String(j.request_key).startsWith("brand-sales:");
+
+async function coexist(order) {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Pre-queue PENDING jobs of BOTH families using the REAL drivers, bounded so some stay pending:
+  //   - keyword [A1,A2] maxJobs:1 -> A1 weekly succeeds, A2 weekly stays PENDING;
+  //   - generic maxJobs:1        -> one brand-sales source succeeds, the other stays PENDING.
+  await runKw(store, dd, KW_ACCOUNTS, { maxJobs: 1 });
+  await runGenericDriver(store, dd, { maxJobs: 1 });
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const pendingBefore = store.listSourceJobs(cid).filter((j) => j.fetch_status === "pending");
+  assert.ok(pendingBefore.some(isKw) && pendingBefore.some(isGen), "both families have a pending job before either unbounded worker runs");
+
+  // Run the REAL drivers UNBOUNDED in the requested order.
+  const steps = order === "generic-first"
+    ? [() => runGenericDriver(store, dd, {}), () => runKw(store, dd, KW_ACCOUNTS, {})]
+    : [() => runKw(store, dd, KW_ACCOUNTS, {}), () => runGenericDriver(store, dd, {})];
+  await steps[0]();
+  assert.ok(noMissingPlan(store, cid), `no MISSING_PLAN after step 1 (${order})`);
+  await steps[1]();
+  assert.ok(noMissingPlan(store, cid), `no MISSING_PLAN after step 2 (${order})`);
+
+  const jobs = store.listSourceJobs(cid);
+  assert.ok(jobs.filter(isGen).length >= 2 && jobs.filter(isGen).every((j) => j.fetch_status === "succeeded"), "all generic jobs succeeded");
+  assert.ok(jobs.filter(isKw).length >= 4 && jobs.filter(isKw).every((j) => j.fetch_status === "succeeded"), "all keyword jobs succeeded (A1 + A2)");
+  for (const j of jobs) assert.ok(dd.createCount(j.request_hash) <= 1, "at most one create-export for " + j.request_key);
+  // Same-request-key keyword jobs for DIFFERENT accounts resolved to distinct hashes (account isolation).
+  const weeklyHashes = jobs.filter((j) => j.request_key === "keyword-rank:sqp-weekly").map((j) => j.request_hash);
+  assert.equal(new Set(weeklyHashes).size, weeklyHashes.length, "A1 and A2 weekly hashes are distinct (same key, isolated)");
+}
+
+test("coexistence order 1: real generic driver first, then real keyword driver -- neither MISSING_PLANs the other; both complete; one export per hash", async () => {
+  await coexist("generic-first");
+});
+
+test("coexistence order 2: real keyword driver first, then real generic driver -- neither MISSING_PLANs the other; both complete; one export per hash", async () => {
+  await coexist("keyword-first");
+});
+
+test("during coexistence a partial keyword report stays PENDING, then saves exactly once after keyword source work completes", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const A1 = { accountId: "A1", country: "US", currency: "USD" };
+  // Keyword bounded to weekly only (catalog unstaged) + the REAL generic driver runs to completion alongside.
+  const kwPartial = await runKw(store, dd, [A1], { maxJobs: 1 });
+  await runGenericDriver(store, dd, {});
+  // The generic driver completing does NOT let the incomplete keyword report derive: catalog is unstaged.
+  const d1 = await deriveReports(store, kwPartial.cycleId, kwPartial.plannedReports);
+  assert.equal(d1.res.pending, 1, "keyword report is PENDING while catalog is unstaged");
+  assert.equal(d1.saved.length, 0, "no snapshot written during the partial state");
+  assert.ok(noMissingPlan(store, kwPartial.cycleId), "generic completion never MISSING_PLANs the pending keyword job");
+  // Resume keyword to completion, then derive: saves exactly once.
+  const kwDone = await runKw(store, dd, [A1], {});
+  const d2 = await deriveReports(store, kwDone.cycleId, kwDone.plannedReports);
+  const d3 = await deriveReports(store, kwDone.cycleId, kwDone.plannedReports);
+  assert.equal(d2.res.succeeded, 1, "derives once keyword sources complete");
+  assert.equal(d2.saved.length + d3.saved.length, 1, "exactly one snapshot across the resumed + redundant derivations");
+  assert.equal(store.report("keyword-rank", "A1").derive_status, "succeeded");
+});
+
 async function main() {
   mark("main(): loading keyword-rank e2e modules");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));
   ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
+  ({ runStagedSourceCycle, plannedSourceJob } = await import("../lib/server/sync/source-sync-driver.js"));
+  ({ reportSourceRequestHashes } = await import("../lib/server/sync/report-source-contracts.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

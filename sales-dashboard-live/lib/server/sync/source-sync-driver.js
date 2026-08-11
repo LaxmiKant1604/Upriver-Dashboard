@@ -234,15 +234,23 @@ export async function runStagedSourceCycle({
     deadlineReached: false, drained: false, signals,
   };
   const seenHashes = new Set();
+  // Blocker 2: this generic staged driver declares its OWN typed owner scope so it can share the single
+  // (bucket, cycle_date) cycle with other report families (e.g. Keyword Rank) without touching their jobs.
+  // Ownership is the durable owner tuple (request_key, organization_fingerprint, account_scope_hash) --
+  // see source-worker.ownerIdentity -- so the scope is account/organization safe. The owned set grows as
+  // each round's plan (kickoff + reconstructed/derived fallbacks) reveals more of this driver's jobs; a
+  // job owned by another family is never in it, so runSourceJobs leaves it untouched.
+  const ownedByHash = new Map();
 
   for (let round = 0; round < maxRounds; round += 1) {
     const plan = await resolvePlan(signals);
     const plannedJobs = (plan && plan.sourceJobs) || [];
+    for (const j of plannedJobs) if (j && j.requestHash) ownedByHash.set(j.requestHash, j);
     const remaining = maxJobs === Infinity ? Infinity : Math.max(0, maxJobs - rollup.processed);
     if (remaining === 0) { rollup.drained = false; break; }
 
     const res = await runSourceJobs({
-      store, dataDoe, plannedJobs, bucket, cycleDate, scheduledAt, trigger,
+      store, dataDoe, plannedJobs, ownedJobs: [...ownedByHash.values()], bucket, cycleDate, scheduledAt, trigger,
       clock, deadlineMs, reserveMs, maxJobs: remaining,
     });
     rollup.cycleId = res.cycleId;
