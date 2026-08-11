@@ -239,7 +239,11 @@ function assertRowsInWindow(rows, from, to, label) {
 //   derivedSourceKeys : persisted non-DataDoe sources (e.g. ads_daily_source_rows)
 //   derive            : PURE ({ sources, context }) -> payload | null (null = not yet wired)
 //   validatePayload   : (payload) -> boolean structural validity (a derived success is real)
-//   latestDataDate    : (payload, context) -> ISO date | null
+//   latestDataDate    : (payload, context, sources) -> ISO date | null. `sources` is the SAME validated
+//                       saved-fragment map the derive ran on (present only on a `derived` success, so its
+//                       rows already passed plain-object / real-calendar-date / in-window validation); an
+//                       adapter may read a source EVIDENCE date from it (e.g. Returns' max raw return date).
+//                       Existing adapters ignore the third arg and stay behavior-identical.
 //
 // requiredRequestKeys are computed from the report's declared contract minus optional keys,
 // so the map can never drift from report-source-contracts.js.
@@ -749,9 +753,18 @@ const REGISTRY = {
       && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && Array.isArray(p.reasonTotals)
       && !!p.window && typeof p.window === "object" && !!p.fbmOnly && typeof p.fbmOnly === "object"
       && ("returnRecordCount" in p) && ("pendingReturnRequests" in p),
-    // Latest real data date = the window end (asOf), which every validated return row is pinned at or before;
-    // deterministic and authoritative (never Date.now()).
-    latestDataDate: (p) => (p && p.window && isValidCalendarDate(p.window.to) ? p.window.to : null),
+    // Latest real data date = the MAXIMUM real date OBSERVED in the already-validated raw Returns rows (each
+    // is a plain object with a real YYYY-MM-DD date inside [asOf-59d, asOf] -- validated in derive above), or
+    // null when that row array is empty. This is a source EVIDENCE date, NOT the requested asOf: four
+    // successful-but-empty sources must report null so the Admin Data Sync Center never claims empty/lagged
+    // data is current. An empty-ASIN raw row (skipped by the fold) still carries a valid source date, so it
+    // counts as freshness evidence. Uses `sources` (the third callback arg); never context.to / window.to /
+    // Date.now() / fetched_at / saved_at.
+    latestDataDate: (p, context, sources) => {
+      const src = sources && sources["returns-leakage:returns"];
+      const rows = src && Array.isArray(src.rows) ? src.rows : [];
+      return maxIsoDate(rows.map((r) => r && r.date));
+    },
   },
   "listing-health": { snapshotVersion: "listing-health/v2d-1", optionalRequestKeys: ["listing-health:listings-raw"], derivedSourceKeys: [], derive: null },
   "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },
@@ -860,7 +873,7 @@ export function deriveReportSnapshot({ reportKey, sources = {}, context = {} }) 
     status: "derived",
     validated: true,
     payload,
-    latestDataDate: entry.latestDataDate(payload, context) || null,
+    latestDataDate: entry.latestDataDate(payload, context, sources) || null,
     errorStage: null,
     reason: null,
   };
