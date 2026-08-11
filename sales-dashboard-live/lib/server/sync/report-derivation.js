@@ -33,6 +33,7 @@ import {
   buyBoxLossPayload,
   returnsLeakagePayload,
   listingHealthPayload,
+  assertListingHealthCurrencyIsolation,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -843,6 +844,10 @@ const REGISTRY = {
       assertPlainObjectRows(catalogRows, "listing-health catalog");
       assertPlainObjectRows(rawRows, "listing-health listings-raw");
       assertRowsInWindow(inventoryRows, inventoryFrom, asOf, "listing-health inventory");
+      // B2 fail-closed currency isolation: the route payload folds sales by SKU only, so a SKU split across
+      // currencies (or a listing currency conflicting with its single sales currency) would silently merge
+      // money. Reject BEFORE folding => typed invalid, zero writes, LKG preserved (route core unchanged).
+      assertListingHealthCurrencyIsolation(listingRows, salesRows);
       return listingHealthPayload({
         accountId: publicAccountId, asOf, salesFrom, windowDays: LH_SALES_WINDOW_DAYS,
         sourceLabel: LH_SOURCE_LABEL, salesSourceLabel: LH_SALES_SOURCE_LABEL, issuesSourceLabel: LH_ISSUES_SOURCE_LABEL,

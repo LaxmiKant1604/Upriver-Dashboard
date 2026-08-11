@@ -1517,3 +1517,41 @@ export function listingHealthPayload({
     catalogBrands: catalog.catalogBrands,
   };
 }
+
+
+// SCHEDULER-V2 FAIL-CLOSED currency-isolation guard for Listing Health (NOT part of the route-parity core;
+// api/datadoe.js + listing-health.js + listingHealthSalesFold/Payload stay byte-unchanged). The route payload
+// emits ONE row per listing and folds sales by SKU only, so saved sales rows that split a single SKU across
+// currencies would silently MERGE money into one row. This runs BEFORE the fold and throws (=> the adapter's
+// typed `invalid`, zero writes, LKG preserved) when any normalized nonblank SKU carries more than one sales
+// currency IDENTITY -- blank/unknown ("?") is its OWN identity, so unknown money can never be absorbed into a
+// named currency. It also rejects a nonblank listing_price_currency that conflicts with the SKU's single sales
+// currency identity (a named listing currency vs an unknown sales identity is also a conflict). Pure; canonical
+// one-currency-per-SKU input passes unchanged (byte-for-byte payload compatible).
+export function assertListingHealthCurrencyIsolation(listingRows, salesRows) {
+  const salesIdentitiesBySku = new Map(); // sku -> Set<identity>  ("?" == blank/unknown, a distinct identity)
+  for (const row of Array.isArray(salesRows) ? salesRows : []) {
+    const sku = String(row.sku || "").trim();
+    if (!sku) continue;
+    const identity = String(row.currency || "").trim() || "?";
+    if (!salesIdentitiesBySku.has(sku)) salesIdentitiesBySku.set(sku, new Set());
+    salesIdentitiesBySku.get(sku).add(identity);
+  }
+  for (const [sku, identities] of salesIdentitiesBySku) {
+    if (identities.size > 1) {
+      throw new Error(`listing-health sales for SKU "${sku}" carry more than one currency identity (${[...identities].sort().join(", ")}); money must never merge across currencies. Snapshot blocked (invalid).`);
+    }
+  }
+  for (const listing of Array.isArray(listingRows) ? listingRows : []) {
+    const sku = String(listing.sku || "").trim();
+    if (!sku) continue;
+    const listingCurrency = String(listing.listing_price_currency || "").trim() || null;
+    if (!listingCurrency) continue; // a blank listing currency falls back to the sales currency; no conflict
+    const identities = salesIdentitiesBySku.get(sku);
+    if (!identities) continue; // the SKU has no sales rows; nothing to reconcile
+    const salesIdentity = [...identities][0]; // exactly one (multi-identity already threw above)
+    if (salesIdentity === "?" || salesIdentity !== listingCurrency) {
+      throw new Error(`listing-health listing currency "${listingCurrency}" for SKU "${sku}" conflicts with its sales currency identity "${salesIdentity}"; snapshot blocked (invalid).`);
+    }
+  }
+}
