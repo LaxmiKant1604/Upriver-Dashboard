@@ -6136,3 +6136,32 @@ NOT enabled. Returns stays SHADOW ONLY + locked.
 `test:source-identity` **7**; full `npm run verify` **713 assertions** (was 685) + 2,394-module production
 build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
+
+## Scheduler v2: Returns & Refund Leakage review blocker (Codex, 2026-08-11)
+
+Reviewed `81f38ea`..`1a4c750` from approved base `5b230e6`. The pure Returns folds,
+route-payload parity, currency isolation, strict required-source handling, exact 60-day
+planner windows, public/raw account separation, shared catalog identity, and real generic
+planner/driver coverage are otherwise sound. Independent verification is green: direct
+Returns **28**, `test:report-derivation` **314**, `test:sync-engine` **79**,
+`test:report-contracts` **161**, `test:source-identity` **7**, and full `npm run verify`
+**713 assertions** plus the 2,394-module production build.
+
+**Not approved yet: one freshness-integrity blocker.** The adapter's `latestDataDate`
+returns `payload.window.to` (the requested `asOf`) rather than a date observed in validated
+source data. A deterministic synthetic run with all four source jobs successfully saved but
+all four payloads empty derives a valid empty report with `latestDataDate: "2025-08-10"`.
+That date is not present in any source row, so the Admin Data Sync Center can falsely claim
+current report data even when the sources contain no dated evidence (and Sales & Traffic is
+explicitly lagged). `fetched_at` / snapshot timestamps already report when the export ran;
+`latest_data_date` must remain an evidence date.
+
+Required correction: calculate Returns `latestDataDate` as the maximum real date in the
+already-validated raw Returns rows, or `null` when none exist. Do not add scheduler-only fields
+to the route-parity payload. If necessary, extend the internal `latestDataDate(payload, context)`
+callback invocation to receive `sources` as a third argument; keep all existing adapters
+behavior-identical. Add direct and worker-level tests proving empty successful sources => null,
+rows ending before `asOf` => that actual maximum date, and an out-of-window/future row remains
+typed invalid with zero writes/LKG preserved. Do not change the live route/builder, source
+contracts, request identity, planner, generic driver, Scheduler v1, frontend, migrations,
+controls, or schedules. Returns remains SHADOW ONLY + locked pending correction and re-review.
