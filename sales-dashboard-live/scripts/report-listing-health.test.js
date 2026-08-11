@@ -43,7 +43,7 @@ let SALES_FROM, INV_FROM; // computed in main()
 let hashSeq = 0;
 const frag = (requestKey, from, to, ids = [ID], extra = {}) => ({ requestKey, requestHash: "h" + (hashSeq += 1), from, to, sellerOrVendorIds: ids, ...extra });
 
-function buildSources(planned, rowsByHash, statusOverride = {}) {
+function buildSources(planned, rowsByHash, statusOverride = {}, errorOverride = {}) {
   const statusByHash = {};
   const loaded = new Map();
   for (const p of planned) {
@@ -51,30 +51,35 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
     statusByHash[p.requestHash] = st;
     if (st === "succeeded") loaded.set(p.requestHash, { rows: Object.prototype.hasOwnProperty.call(rowsByHash, p.requestHash) ? rowsByHash[p.requestHash] : [] });
   }
-  return assembleSources(planned, statusByHash, loaded).sources;
+  // Fourth arg = the durable safe error_code per hash; assembleSources now gates `disabled` on
+  // error_code === "SOURCE_DISABLED" (a policy alone is NOT evidence of a source-disabled outcome).
+  return assembleSources(planned, statusByHash, loaded, errorOverride).sources;
 }
 
 // listings/raw/catalog are no-date; sales [SALES_FROM,ASOF]; inventory [INV_FROM,ASOF]. `rawState` controls
 // the optional Listings Raw fragment: "success" | "disabled" | "disabled-terminal" | "failed" | "pending" |
-// "missing". Returns { planned, rows, statusOverride } already wired for the requested raw state.
-function lhPlanned({ listings = [], raw = [], sales = [], inventory = [], catalog = [], ids = [ID], rawState = "success" } = {}) {
-  const planned = []; const rows = {}; const statusOverride = {};
+// "missing". A "disabled" state carries the DURABLE error_code SOURCE_DISABLED; a plain "failed" carries a
+// NON-disabled code (EXPORT_ERROR) -- proving only SOURCE_DISABLED (not policy presence) degrades. Returns
+// { planned, rows, statusOverride, errorOverride } wired for the requested raw state.
+function lhPlanned({ listings = [], raw = [], sales = [], inventory = [], catalog = [], ids = [ID], rawState = "success", rawErrorCode = null } = {}) {
+  const planned = []; const rows = {}; const statusOverride = {}; const errorOverride = {};
   const add = (key, from, to, data, extra) => { const f = frag(key, from, to, ids, extra); planned.push(f); rows[f.requestHash] = data; return f; };
   add("listing-health:listings", null, null, listings);
   if (rawState !== "missing") {
     const policy = rawState === "disabled" ? DEGRADED : rawState === "disabled-terminal" ? TERMINAL : null;
     const f = add("listing-health:listings-raw", null, null, raw, policy ? { disabledPolicy: policy } : {});
-    if (rawState === "disabled" || rawState === "disabled-terminal" || rawState === "failed") statusOverride[f.requestHash] = "failed";
+    if (rawState === "disabled" || rawState === "disabled-terminal") { statusOverride[f.requestHash] = "failed"; errorOverride[f.requestHash] = "SOURCE_DISABLED"; }
+    else if (rawState === "failed") { statusOverride[f.requestHash] = "failed"; errorOverride[f.requestHash] = rawErrorCode || "EXPORT_ERROR"; }
     else if (rawState === "pending") statusOverride[f.requestHash] = "pending";
   }
   add("listing-health:sales", SALES_FROM, ASOF, sales);
   add("listing-health:inventory", INV_FROM, ASOF, inventory);
   add("listing-health:catalog", null, null, catalog);
-  return { planned, rows, statusOverride };
+  return { planned, rows, statusOverride, errorOverride };
 }
 const ctx = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: ID, ...over });
-const deriveLH = (built, context = ctx(), extraStatus = {}) =>
-  deriveReportSnapshot({ reportKey: "listing-health", sources: buildSources(built.planned, built.rows, { ...built.statusOverride, ...extraStatus }), context });
+const deriveLH = (built, context = ctx(), extraStatus = {}, extraError = {}) =>
+  deriveReportSnapshot({ reportKey: "listing-health", sources: buildSources(built.planned, built.rows, { ...built.statusOverride, ...extraStatus }, { ...built.errorOverride, ...extraError }), context });
 
 // ---- row builders ----
 const listing = (sku, asin, o = {}) => ({
@@ -88,6 +93,7 @@ const sale = (sku, asin, currency, sales, units, profit) => ({ sku, child_asin: 
 const inv = (date, sku, asin, available) => ({ date, sku, child_asin: asin, product_name: `P ${sku}`, currency: "USD", available });
 const cat = (asin, parent, name, brand) => ({ child_asin: asin, parent_asin: parent, product_name: name, product_brand: brand });
 const rawRow = (sku, asin, issues, summaries, offers) => ({ sku, child_asin: asin, summaries, issues, offers });
+const LH_RAW_ROWS = [rawRow("SKU-A", "ASIN-A", JSON.stringify([{ severity: "ERROR", code: 1, message: "x" }]), [{ status: ["BUYABLE"] }], [{ price: { amount: 9.99 } }])];
 
 // ---- the hand-computed production-route fixture ----
 const FIXTURE = () => ({
@@ -239,8 +245,98 @@ test("14. Listings Raw states OTHER than explicit source-disabled => typed unava
     const r = deriveLH(lhPlanned({ ...FIXTURE(), rawState }));
     assert.equal(r.status, "unavailable", `${rawState} Listings Raw => unavailable (LKG preserved)`);
   }
+  // B1: a FAILED listings-raw carrying the degraded POLICY but a NON-disabled durable error_code is NEVER
+  // degraded -- policy presence is not evidence of a source-disabled cause. Every such code => unavailable.
+  for (const rawErrorCode of ["EXPORT_ERROR", "HTTP_500", "TIMEOUT", "TRUNCATED", "CACHE_CONFLICT", "SAVE_FAILED", "MALFORMED_PAYLOAD"]) {
+    const built = lhPlanned({ ...FIXTURE(), rawState: "failed", rawErrorCode });
+    // The planned raw fragment still carries the degraded policy; only the durable error_code differs.
+    built.planned.find((p) => p.requestKey === "listing-health:listings-raw").disabledPolicy = DEGRADED;
+    const r = deriveLH(built);
+    assert.equal(r.status, "unavailable", `${rawErrorCode} (with degraded policy present) => unavailable, NOT degraded`);
+  }
   // A terminally-disabled optional source blocks (not degraded).
   assert.equal(deriveLH(lhPlanned({ ...FIXTURE(), rawState: "disabled-terminal" })).status, "blocked");
+});
+
+group("listing-health derive: cross-currency SKU money isolation fails closed (B2)");
+
+test("b2a. one SKU with USD + CAD sales => invalid (never a merged USD 300 row)", () => {
+  const built = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "" })],
+    sales: [sale("SKU-A", "ASIN-A", "USD", 100, 1, 10), sale("SKU-A", "ASIN-A", "CAD", 200, 2, 20)],
+  });
+  const r = deriveLH(built);
+  assert.equal(r.status, "invalid", "a SKU split across currencies is rejected");
+  assert.equal(r.payload, null, "no merged payload is produced (never USD 300)");
+});
+
+test("b2b. one SKU with unknown(blank) + USD sales => invalid (unknown money is its own identity)", () => {
+  const built = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "" })],
+    sales: [sale("SKU-A", "ASIN-A", "", 100, 1, 10), sale("SKU-A", "ASIN-A", "USD", 200, 2, 20)],
+  });
+  assert.equal(deriveLH(built).status, "invalid", "blank/unknown currency cannot be absorbed into USD");
+});
+
+test("b2c. listing currency vs sales currency mismatch (USD listing, CAD sales) => invalid; named-vs-unknown too", () => {
+  const mismatch = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "USD" })],
+    sales: [sale("SKU-A", "ASIN-A", "CAD", 100, 1, 10)],
+  });
+  assert.equal(deriveLH(mismatch).status, "invalid", "named listing currency conflicts with the sales currency");
+  const namedVsUnknown = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "USD" })],
+    sales: [sale("SKU-A", "ASIN-A", "", 100, 1, 10)],
+  });
+  assert.equal(deriveLH(namedVsUnknown).status, "invalid", "a named listing currency vs an unknown sales currency is invalid");
+});
+
+test("b2d. matching currency (USD listing + USD sales) => derived; the single-currency total is preserved", () => {
+  const built = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "USD" })],
+    sales: [sale("SKU-A", "ASIN-A", "USD", 100, 4, 30)],
+  });
+  const r = deriveLH(built);
+  assert.equal(r.status, "derived");
+  const row = r.payload.rows.find((x) => x.sku === "SKU-A");
+  assert.deepEqual([row.currency, row.sales30d, row.units30d, row.profit30d], ["USD", 100, 4, 30], "one-currency SKU is unchanged");
+  // The full canonical fixture (mixed-currency across DIFFERENT SKUs) still deep-equals the expected payload.
+  assert.deepEqual(deriveLH(lhPlanned(FIXTURE())).payload, expectedFixturePayload(), "canonical parity is byte-for-byte compatible");
+});
+
+test("b2e. DIFFERENT SKUs with different currencies are allowed and kept as separate rows", () => {
+  const built = lhPlanned({
+    listings: [listing("SKU-A", "ASIN-A", { currency: "USD" }), listing("SKU-B", "ASIN-B", { currency: "CAD" })],
+    sales: [sale("SKU-A", "ASIN-A", "USD", 100, 1, 10), sale("SKU-B", "ASIN-B", "CAD", 200, 2, 20)],
+  });
+  const r = deriveLH(built);
+  assert.equal(r.status, "derived");
+  assert.deepEqual(r.payload.rows.map((x) => [x.sku, x.currency, x.sales30d]).sort(), [["SKU-A", "USD", 100], ["SKU-B", "CAD", 200]].sort());
+  assert.deepEqual(r.payload.currencies, ["CAD", "USD"]);
+});
+
+test("b2f. worker-level: a mixed-currency SKU => report NOT saved, prior last-known-good preserved, zero writes", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const plan = shadowPlan(ACCTS, ["listing-health"]);
+  const dd = makeDataDoe();
+  const rowsByKey = {
+    "listing-health:sales": [sale("SKU-A", "ASIN-A", "USD", 100, 1, 10), sale("SKU-A", "ASIN-A", "CAD", 200, 2, 20)], // mixed currency for one SKU
+  };
+  for (const j of resolveFromPlan(plan)().sourceJobs) {
+    store.upsertSourceJob({ cycleId: cid, requestHash: j.requestHash, requestKey: j.requestKey, sourceId: j.sourceId, sourceKey: j.sourceKey, connectionId: j.connectionId, organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash });
+    const rows = rowsByKey[j.requestKey] || (await dd.download({ ...j, fetchParams: j.fetchParams }));
+    store.saveSourceRows({ job: { request_hash: j.requestHash }, rows });
+    store.recordSourceSuccess({ cycleId: cid, requestHash: j.requestHash, exportId: "e", rowCount: rows.length, cacheObjectPath: "p/" + j.requestHash });
+  }
+  const lkg = { accountId: ID, prior: true, marker: "LKG" };
+  store.seedSnapshot("scheduler-v2/listing-health", ID, lkg);
+  const saved = [];
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push({ accountId, payload }); return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
+  assert.equal(res.succeeded, 0, "the mixed-currency report is invalid, not derived");
+  assert.equal(saved.length, 0, "zero snapshot writes");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/listing-health|" + ID).payload, lkg, "prior last-known-good preserved");
 });
 
 group("listing-health derive: window + account validation fail closed");
@@ -498,30 +594,65 @@ test("29. report stays PENDING until the four required sources succeed, then sav
   assert.equal(store.saveCalls, before, "no duplicate snapshot on re-run");
 });
 
-test("30. worker-level DISABLED Listings Raw => a valid unavailable-enrichment snapshot is saved (issuesAvailable false)", async () => {
+// B1 real-worker harness: four required sources SUCCEED (rows from makeDataDoe); the OPTIONAL listings-raw
+// takes the given durable state; a prior last-known-good snapshot exists. Runs the real runReportJobs, and
+// re-derives the assembled listings-raw fragment via the SAME assembleSources the worker uses.
+async function runLHWorker({ rawState, rawErrorCode = null, rawRows = LH_RAW_ROWS }) {
   const store = makeStore();
   const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
   const plan = shadowPlan(ACCTS, ["listing-health"]);
-  const rawSrc = srcOf(plan, "listing-health:listings-raw");
-  assert.ok(rawSrc.disabledPolicy && rawSrc.disabledPolicy.disabledSource === "degraded", "the planned listings-raw source carries the degraded availabilityPolicy");
   const dd = makeDataDoe();
-  // Succeed the four required sources; mark listings-raw FAILED (a genuine source-disabled outcome).
-  const jobs = resolveFromPlan(plan)().sourceJobs;
-  for (const j of jobs) {
+  for (const j of resolveFromPlan(plan)().sourceJobs) {
     store.upsertSourceJob({ cycleId: cid, requestHash: j.requestHash, requestKey: j.requestKey, sourceId: j.sourceId, sourceKey: j.sourceKey, connectionId: j.connectionId, organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash });
     if (j.requestKey === "listing-health:listings-raw") {
-      store.recordSourceFailure({ cycleId: cid, requestHash: j.requestHash, stage: "create", code: "SOURCE_DISABLED", terminal: true });
+      if (rawState === "success") { store.saveSourceRows({ job: { request_hash: j.requestHash }, rows: rawRows }); store.recordSourceSuccess({ cycleId: cid, requestHash: j.requestHash, exportId: "e", rowCount: rawRows.length, cacheObjectPath: "p/" + j.requestHash }); }
+      else { store.recordSourceFailure({ cycleId: cid, requestHash: j.requestHash, stage: "create", code: rawErrorCode, terminal: rawErrorCode === "SOURCE_DISABLED" }); }
     } else {
       store.saveSourceRows({ job: { request_hash: j.requestHash }, rows: (await dd.download({ ...j, fetchParams: j.fetchParams })) });
       store.recordSourceSuccess({ cycleId: cid, requestHash: j.requestHash, exportId: "e", rowCount: 1, cacheObjectPath: "p/" + j.requestHash });
     }
   }
+  const lkg = { accountId: ID, prior: true, marker: "LKG" };
+  store.seedSnapshot("scheduler-v2/listing-health", ID, lkg);
   const saved = [];
-  const saveSnapshot = async ({ accountId, payload }) => { saved.push({ accountId, payload }); return { paramsHash: "ph" }; };
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push({ accountId, payload }); return { paramsHash: "ph" }; };
   const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
-  assert.equal(res.succeeded, 1, "the report saves even though the optional enrichment is disabled");
-  assert.equal(saved[0].payload.issuesAvailable, false, "issuesAvailable false");
-  assert.equal(saved[0].payload.issuesUnavailableReason, ENABLE_HINT, "exact enable hint");
+  const jobsNow = store.listSourceJobs(cid);
+  const rawJob = jobsNow.find((jj) => jj.request_key === "listing-health:listings-raw");
+  const statusByHash = {}; const errorByHash = {}; const loaded = new Map();
+  for (const jj of jobsNow) { statusByHash[jj.request_hash] = jj.fetch_status; errorByHash[jj.request_hash] = jj.error_code ?? null; if (jj.fetch_status === "succeeded") loaded.set(jj.request_hash, store.loadSourceRows(jj.request_hash)); }
+  const assembled = assembleSources(plan.reportRequests[0].sources, statusByHash, loaded, errorByHash).sources["listing-health:listings-raw"];
+  const survivingSnapshot = store._snapshots.get("scheduler-v2/listing-health|" + ID).payload;
+  return { store, cid, res, saved, lkg, assembled, rawJob, survivingSnapshot };
+}
+
+test("30. worker-level B1: only a durable SOURCE_DISABLED error degrades; every other failure => unavailable + LKG; empty success => issuesAvailable true", async () => {
+  const rawSrc = srcOf(shadowPlan(ACCTS, ["listing-health"]), "listing-health:listings-raw");
+  assert.ok(rawSrc.disabledPolicy && rawSrc.disabledPolicy.disabledSource === "degraded", "the planned listings-raw source carries the degraded availabilityPolicy (decorateSources)");
+
+  // (a) genuine SOURCE_DISABLED => derived DEGRADED snapshot (issuesAvailable false + exact hint), fragment disabled.
+  const disabled = await runLHWorker({ rawState: "failed", rawErrorCode: "SOURCE_DISABLED" });
+  assert.equal(disabled.rawJob.error_code, "SOURCE_DISABLED", "durable error_code recorded");
+  assert.equal(disabled.assembled.disabled, true, "assembled fragment disabled ONLY on SOURCE_DISABLED");
+  assert.equal(disabled.res.succeeded, 1, "the report still saves a valid degraded snapshot");
+  assert.equal(disabled.saved[0].payload.issuesAvailable, false);
+  assert.equal(disabled.saved[0].payload.issuesUnavailableReason, ENABLE_HINT);
+
+  // (b) every OTHER durable failure code (with the degraded policy present) => unavailable, ZERO writes, LKG preserved.
+  for (const code of ["EXPORT_ERROR", "HTTP_500", "TIMEOUT", "TRUNCATED", "CACHE_CONFLICT", "SAVE_FAILED", "MALFORMED_PAYLOAD"]) {
+    const r = await runLHWorker({ rawState: "failed", rawErrorCode: code });
+    assert.equal(r.rawJob.error_code, code, `${code}: durable error_code recorded`);
+    assert.equal(r.assembled.disabled, false, `${code}: NOT marked disabled (policy presence is not evidence)`);
+    assert.equal(r.res.succeeded, 0, `${code}: report is unavailable, not derived`);
+    assert.equal(r.saved.length, 0, `${code}: ZERO snapshot writes`);
+    assert.deepEqual(r.survivingSnapshot, r.lkg, `${code}: prior last-known-good snapshot preserved`);
+  }
+
+  // (c) validated EMPTY listings-raw success => issuesAvailable true (never a silent unavailable).
+  const empty = await runLHWorker({ rawState: "success", rawRows: [] });
+  assert.equal(empty.assembled.available, true, "empty success is available (an empty array is valid)");
+  assert.equal(empty.res.succeeded, 1);
+  assert.equal(empty.saved[0].payload.issuesAvailable, true);
 });
 
 test("31. maxJobs partial + poll-deferral resume through the real driver with ONE create-export per hash", async () => {
