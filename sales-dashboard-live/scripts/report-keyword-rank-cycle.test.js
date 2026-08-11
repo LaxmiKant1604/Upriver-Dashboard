@@ -446,6 +446,84 @@ test("a primary account syncs normally while a stale dd-secondary directory row 
   assert.deepEqual(r.plannedReports.map((p) => p.accountId), ["A1"], "only the primary account yields a report plan");
 });
 
+/* ============================= safe stale reconciliation (bounded invocations) ============================= */
+
+group("keyword-rank cycle: bounded invocations never falsely retire still-required memberships");
+
+const B1 = { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }; // weekly = 2 (< 4) => weekly + monthly + catalog
+const kwOwners = (store, cid, accountId) => store._owners(cid).filter((m) => m.report_key === "keyword-rank" && m.account_id === accountId);
+const statusOf = (store, cid, accountId, requestKey) => { const m = kwOwners(store, cid, accountId).find((x) => x.request_key === requestKey); return m ? m.owner_status : null; };
+const kwRun = (store, dd, accounts, opts) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", ...opts });
+
+test("a full weekly-low cycle creates weekly + monthly + catalog ACTIVE memberships", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const r = await kwRun(store, dd, [B1], {});
+  const ms = kwOwners(store, r.cycleId, B1.accountId);
+  assert.deepEqual(ms.map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"]);
+  assert.ok(ms.every((m) => m.owner_status === "active"), "all three memberships active");
+});
+
+test("a later maxRounds:1 invocation does NOT stale the still-required monthly/catalog memberships", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  // maxRounds:1 stages only the weekly round; the OLD reconciler would retire monthly/catalog here.
+  await kwRun(store, dd, [B1], { maxRounds: 1 });
+  assert.equal(statusOf(store, cid, B1.accountId, "keyword-rank:sqp-monthly"), "active", "monthly stays active");
+  assert.equal(statusOf(store, cid, B1.accountId, "keyword-rank:catalog"), "active", "catalog stays active");
+});
+
+test("a later maxJobs:1 invocation does NOT stale monthly/catalog", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  await kwRun(store, dd, [B1], { maxJobs: 1 });
+  assert.ok(kwOwners(store, cid, B1.accountId).every((m) => m.owner_status === "active"), "nothing falsely staled");
+});
+
+test("a deadline/deferral during weekly staging defers reconciliation; resume completes with each hash exported once and all memberships active", async () => {
+  const store = makeStore(); const dd = makeResumableDataDoe(standardRows);
+  // Invocation 1: weekly poll defers (attempted) -> cadence unresolved -> reconciliation deferred; only weekly membership exists.
+  const r1 = await kwRun(store, dd, [B1], {});
+  assert.equal(r1.deferred, 1, "weekly deferred");
+  const weeklyHash = r1.perAccount[0].weeklyHash;
+  assert.ok(kwOwners(store, r1.cycleId, B1.accountId).every((m) => m.owner_status === "active"), "no false stale on the deferred invocation");
+  // Invocation 2 (fresh): resumes weekly (no second create), stages monthly + catalog; all active; hashes exported once.
+  const r2 = await kwRun(store, dd, [B1], {});
+  assert.equal(dd.createCount(weeklyHash), 1, "weekly exported at most once across the resume");
+  const ms = kwOwners(store, r2.cycleId, B1.accountId);
+  assert.deepEqual(ms.map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"]);
+  assert.ok(ms.every((m) => m.owner_status === "active"), "resume leaves every required membership active");
+  for (const j of store.listSourceJobs(r2.cycleId)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " exported at most once");
+});
+
+test("a GENUINELY removed dependency alone becomes stale (a monthly the resolved weekly-high plan no longer needs is retired; weekly + catalog stay active)", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const A1 = { accountId: "A1", country: "US", currency: "USD" }; // weekly = 4 (>= 4) => weekly + catalog, NO monthly
+  const full = await kwRun(store, dd, [A1], {}); const cid = full.cycleId;
+  const own = kwOwners(store, cid, "A1")[0];
+  const ownerId = own.owner_id;
+  assert.deepEqual(kwOwners(store, cid, "A1").map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "weekly-high plan owns weekly + catalog (no monthly)");
+  // Inject a monthly membership + canonical row under A1's OWN owner, as a prior plan version would have.
+  store.upsertSourceJob({ cycleId: cid, requestHash: "A1-monthly-stale", requestKey: "keyword-rank:sqp-monthly", sourceId: "s", sourceKey: "sqp-monthly", connectionId: "primary", organizationFingerprint: own.organization_fingerprint, accountScopeHash: own.account_scope_hash, requestMeta: {} });
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: "A1-monthly-stale", ownerId, requestKey: "keyword-rank:sqp-monthly", reportKey: "keyword-rank", accountId: "A1", connectionId: "primary", organizationFingerprint: own.organization_fingerprint, accountScopeHash: own.account_scope_hash }]);
+  // Re-run the A1 cycle (weekly >= 4): the resolved plan is weekly + catalog, so the injected monthly is stale.
+  await kwRun(store, dd, [A1], {});
+  assert.equal(store._owner(cid, ownerId, "A1-monthly-stale").owner_status, "stale", "the removed monthly membership is retired at owner scope");
+  assert.ok(kwOwners(store, cid, "A1").filter((m) => m.request_hash !== "A1-monthly-stale").every((m) => m.owner_status === "active"), "weekly + catalog stay active");
+  assert.equal(store._rawJob(cid, "A1-monthly-stale").fetch_status, "pending", "canonical row preserved (never failed by the stale owner)");
+});
+
+test("another owner sharing a canonical hash stays ACTIVE while a Keyword owner reconciles", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  // A second owner (generic report) also depends on B1's catalog canonical hash.
+  const catalogHash = kwOwners(store, cid, B1.accountId).find((m) => m.request_key === "keyword-rank:catalog").request_hash;
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: catalogHash, ownerId: genOwnerId(), requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1", connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope" }]);
+  // A later bounded keyword invocation reconciles; the generic owner's membership is never touched.
+  await kwRun(store, dd, [B1], { maxRounds: 1 });
+  const gen = store._owners(cid).find((m) => m.owner_id === genOwnerId());
+  assert.equal(gen.owner_status, "active", "the other owner sharing the canonical hash remains active");
+});
+
 async function main() {
   mark("main(): loading keyword-rank cycle module");
   ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));

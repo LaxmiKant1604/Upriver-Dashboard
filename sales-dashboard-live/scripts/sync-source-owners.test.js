@@ -289,6 +289,61 @@ test("sourceJobOwnerId is deterministic, account/org-safe, and does not depend o
   assert.equal(sourceJobOwnerId({ ...base, organizationFingerprint: "" }), null, "incomplete => null (caller fails closed)");
 });
 
+group("owner-identity validation: wrong identity fails before any Supabase write or DataDoe call");
+
+test("runSourceJobs recomputes owner_id and rejects wrong report/request/connection/org/scope/blank BEFORE any write or DataDoe call", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const base = ownerJob("daily-reporting", "daily-reporting:catalog");
+  const run = (job) => runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: [job.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+  const noSideEffects = () => { assert.equal(store.listSourceJobs(cid).length, 0, "no canonical job written"); assert.equal(store._owners(cid).length, 0, "no owner membership written"); assert.equal(dd.totalCreates(), 0, "no DataDoe create-export"); };
+  await assert.rejects(run({ ...base, owner: { ...base.owner, reportKey: "reconciliation" } }), /owner_id does not match sourceJobOwnerId/); noSideEffects();     // wrong report key
+  await assert.rejects(run({ ...base, owner: { ...base.owner, requestKey: "reconciliation:catalog" } }), /does not match the canonical job request_key/); noSideEffects(); // wrong request key
+  await assert.rejects(run({ ...base, connectionId: "dd-secondary" }), /owner_id does not match sourceJobOwnerId/); noSideEffects();                                 // wrong connection
+  await assert.rejects(run({ ...base, organizationFingerprint: "other-org" }), /owner_id does not match sourceJobOwnerId/); noSideEffects();                          // wrong org fingerprint
+  await assert.rejects(run({ ...base, accountScopeHash: "other-scope" }), /owner_id does not match sourceJobOwnerId/); noSideEffects();                               // wrong account scope
+  await assert.rejects(run({ ...base, owner: { ...base.owner, reportKey: "" } }), /missing owner membership metadata/); noSideEffects();                              // blank report metadata
+  await assert.rejects(run({ ...base, owner: { ...base.owner, accountId: "" } }), /missing owner membership metadata/); noSideEffects();                              // blank account metadata
+});
+
+group("positive concurrency: interrupted cross-owner resume of a shared canonical export");
+
+// A DataDoe double that creates the export, then DEFERS during poll (resumable) -- never a second create.
+function makeDeferOnPoll() {
+  const create = {};
+  return {
+    createCount: (h) => create[h] || 0,
+    totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; },
+    async poll() { throw Object.assign(new Error("deferred at the execution deadline"), { code: "DATADOE_DEADLINE" }); },
+    async download() { return [{ a: 1 }]; },
+  };
+}
+
+test("owner A creates the export and defers during poll; owner B (different report/request_key, same canonical hash) resumes the SAME export id with ZERO second create-export", async () => {
+  const store = makeStore();
+  const x = ownerJob("daily-reporting", "daily-reporting:catalog");  // owner A
+  const y = ownerJob("reconciliation", "reconciliation:catalog");    // owner B -- same request_hash "H", different owner/key
+  assert.notEqual(x.owner.ownerId, y.owner.ownerId);
+  // 1-3) Owner A wins create-export for H, persists export_id, then is interrupted during poll (deferred).
+  const ddA = makeDeferOnPoll();
+  const rA = await runSourceJobs({ store, dataDoe: ddA, plannedJobs: [x], ownerIds: [x.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+  const cid = rA.cycleId;
+  assert.equal(rA.deferred, 1, "owner A deferred during poll (resumable)");
+  assert.equal(ddA.totalCreates(), 1, "owner A made exactly one create-export");
+  assert.equal(store._job(cid, "H").fetch_status, "attempted", "canonical H is attempted (resumable), not failed");
+  assert.equal(store._job(cid, "H").export_id, "e_H", "export_id persisted before poll");
+  // 4-6) Owner B resumes the SAME canonical export: no second create-export; H succeeds once; both memberships valid.
+  const ddB = makeDataDoe();
+  await runSourceJobs({ store, dataDoe: ddB, plannedJobs: [y], ownerIds: [y.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(ddB.createCount("H"), 0, "owner B performed ZERO additional create-export (resumed A's saved export)");
+  assert.equal(store._job(cid, "H").fetch_status, "succeeded", "the canonical job succeeds exactly once");
+  assert.equal(store.listSourceJobs(cid).length, 1, "still ONE canonical row for the shared hash");
+  const owners = store._owners(cid);
+  assert.equal(owners.length, 2, "both owner memberships persist");
+  assert.ok(owners.every((m) => m.owner_status === "active"), "both memberships remain active");
+});
+
 async function main() {
   ({ upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale, getSyncSourceJobs } = await import("../lib/server/supabase.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
