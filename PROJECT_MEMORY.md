@@ -5406,3 +5406,49 @@ preserved. Detail in `SCHEDULER_V2.md` section 42. Committed in four small green
   test:sync-engine **60**; test:report-derivation **195** (66+28+33+20+34+11+3); test:report-contracts 161
   (unchanged); test:source-identity 7; `npm run verify` = exit 0 + build (2,394 modules); `git diff --check`
   clean; only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: Keyword Rank staged-cycle integration re-review (Codex, 2026-08-11)
+
+Reviewed `fcd4f62`..`fd94d26` on `feature/scheduler-v2` from the recorded review base
+`c8e8f16`. The intended fixes are real: registry-shaped secondary connections now normalize at the
+DataDoe adapter boundary; the generic planner rejects Keyword Rank; budgets/deadlines are cumulative;
+bucket mismatches fail before cycle/DataDoe I/O; and a fully drained isolated Keyword cycle produces
+correct weekly/monthly report plans and snapshots. Verification is green: `test:sync-engine` 60,
+`test:report-derivation` 195, `test:report-contracts` 161, `test:source-identity` 7, and full
+`npm run verify` 575 assertions plus the 2,394-module production build (exit 0). `git diff --check`
+is clean and only untracked `HANDOFF.md` remains. This tranche is **not approved** yet because two
+production orchestration blockers remain:
+
+1. **The staged runner can fail unrelated jobs in the one shared daily cycle.** The database enforces
+   one `sync_cycles` row per `(bucket, cycle_date)`. `runKeywordRankShadowCycle` calls
+   `runSourceJobs` with only the current Keyword round's hashes, but `runSourceJobs` scans *all*
+   pending/attempted source rows in that cycle and records `MISSING_PLAN` for every row absent from
+   its local `metaByHash`. Therefore a generic report source already queued in the same cycle can be
+   marked failed by the Keyword runner (and the generic runner can similarly encounter staged
+   Keyword rows). Fix the ownership boundary without weakening orphan protection: either orchestrate
+   all source families through one cumulative canonical plan, or give the worker an explicit scoped
+   processing mode that leaves unrelated hashes untouched while still failing genuine orphan rows
+   owned by that invocation. Add a production-shape test with one cycle containing a pending generic
+   source plus staged Keyword work; both must complete through their proper owner, neither may receive
+   `MISSING_PLAN`, and each canonical hash may create at most one export.
+
+2. **A checkpointed/partial invocation returns runnable incomplete report plans.** With `maxJobs:1`
+   (or `maxRounds:1` / deadline after weekly), the weekly source can succeed before catalog is even
+   staged. `buildFinalReports` filters `plan.sources` to hashes already persisted, so it returns a
+   Keyword report containing weekly only. If the caller passes the advertised `plannedReports`
+   directly to `runReportJobs`, the fetch gate sees only weekly as required, then the static Keyword
+   derivation requires catalog, returns `unavailable`, and `recordSyncReportFailure` makes the report
+   derive-failed/finished for that cycle. A resumed source invocation can later fetch catalog but the
+   report cannot re-derive in the same cycle, preserving stale data unnecessarily. Do not expose a
+   report as runnable until its cadence is resolved and every required staged source is terminal
+   (success or honest failure). Return pending reports separately or include the complete canonical
+   dependency set so the report fetch gate remains pending; never omit a not-yet-staged required
+   dependency. Add E2E tests for `maxJobs:1`, `maxRounds:1`, and poll/download deferral: first invocation
+   writes no report failure/snapshot, a fresh invocation resumes with no duplicate POST, stages the
+   remaining monthly/catalog work, and the same cycle then derives exactly once.
+
+Re-review constraints: preserve the approved real secondary routing, one canonical Keyword entry
+point, typed blocked/unavailable/invalid outcomes, strict caps, account/bucket/org isolation, request
+hashes, and catalog token-saving state table. Keep shadow mode and every control locked. Do not start
+another adapter, push, merge, deploy, migrate, enable schedules, modify frontend/Scheduler v1, or touch
+untracked `HANDOFF.md` until these two shared-cycle/checkpoint blockers are green.
