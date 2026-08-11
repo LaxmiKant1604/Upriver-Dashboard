@@ -5366,3 +5366,43 @@ nothing pushed/merged/deployed/migrated; Keyword Rank + all controls locked; no 
   test:report-derivation **186** (66+26+33+20+34+7); test:sync-engine 57 (unchanged); test:report-contracts
   161 (unchanged); test:source-identity 7; `npm run verify` = **563** + build; `git diff --check` clean;
   only intended files changed (+ untracked HANDOFF.md).
+
+## Scheduler v2: Keyword Rank staged-cycle re-review blockers fixed (one entry point + real routing + cumulative bounds + final plans) (Claude, 2026-08-11)
+
+Fixed the four production-shape integration blockers from the Codex staged-cycle re-review (`c8e8f16`).
+**Additive scheduler-v2 code only** -- `api/datadoe.js`, the keyword-rank source CONTRACT, `source-worker.js`,
+`source-signals.js`, `report-derivation.js`, and every approved `sync-*` / FBA test artifact are byte-UNCHANGED.
+SHADOW MODE; nothing pushed/merged/deployed/migrated; Keyword Rank + all controls locked; no other adapter
+started; `HANDOFF.md` untracked/untouched. request_hash + strict 50,000 caps + catalog token-saving table +
+typed blocked/unavailable/invalid outcomes + SQP date/window validation + primary/dd-secondary isolation all
+preserved. Detail in `SCHEDULER_V2.md` section 42. Committed in four small green commits.
+
+- **Blocker 1 (`report-planner.js`).** Removed `keyword-rank` from `SHADOW_PLANNED_REPORT_KEYS` + the generic
+  `PLANNERS` dispatch; added `STAGED_CYCLE_REPORT_KEYS=["keyword-rank"]`. `buildShadowReportPlan` now REJECTS an
+  explicitly-requested staged-cycle key fail-closed (never eager-plans, never silently drops it). One canonical
+  path = `runKeywordRankShadowCycle`; `planKeywordRank` stays exported for it.
+- **Blocker 2 (`source-sync-driver.js`).** New `normalizeDataDoeConnections()` -- ONE server-only boundary
+  mapping registry ids (`primary`|`secondary`) onto driver ids (`primary`|`dd-secondary`): `secondary`->`dd-secondary`,
+  idempotent pass-through, unknown-id fail-closed, dup/ambiguous rejected. `makeDataDoeAdapter` normalizes before
+  indexing, so `makeDataDoeAdapter(getDataDoeConnections())` routes a dd-secondary job to the SECONDARY key with
+  NO secondary->primary fallback; the org fingerprint still gates the key. Tested with the REAL registry-shaped
+  primary/secondary objects.
+- **Blocker 3 (`keyword-rank-cycle.js`).** `maxJobs` is now CUMULATIVE across rounds (remaining = maxJobs -
+  processed); a spent budget opens no later round; the invocation stops immediately on deadlineReached / resumable
+  deferral; rollup surfaces deferred/deadlineReached/drained; a fresh invocation resumes with no duplicate POST.
+  Schedule-bucket isolation: every account's `bucketForCountry` must equal the cycle bucket, checked BEFORE
+  opening a cycle / calling DataDoe -- mixed/mismatched buckets throw with ZERO DataDoe calls.
+- **Blocker 4 (`keyword-rank-cycle.js` + new `report-keyword-rank-e2e.test.js`).** The cycle reconstructs each
+  account's persisted state one final time and returns `rollup.plannedReports`: the canonical per-account report
+  whose sources are EXACTLY the ones STAGED (matched by request hash), each required. Weekly account => weekly +
+  catalog; fallback account => weekly + monthly + catalog. A failed/disabled cadence stages no catalog, so the
+  report never lists nor waits on it (honest blocked via the fetch gate; catalog availability never fabricated).
+  New offline E2E: source worker -> staged weekly/monthly/catalog -> returned final plans -> `runReportJobs` ->
+  saved snapshots (accounts A weekly + B monthly): exact final depends_on, saved cadence/payload, zero
+  DataDoe/network during derivation, primary/dd-secondary isolation, idempotent (no dup exports/snapshots),
+  failed-weekly blocked with LKG preserved.
+- **Verification (all natural, exit 0).** sync-source-jobs **17** (+1); report-planner **28** (+2);
+  report-keyword-rank-cycle **11** (+4); report-keyword-rank-e2e **3** (new, in test:report-derivation);
+  test:sync-engine **60**; test:report-derivation **195** (66+28+33+20+34+11+3); test:report-contracts 161
+  (unchanged); test:source-identity 7; `npm run verify` = exit 0 + build (2,394 modules); `git diff --check`
+  clean; only intended files changed (+ untracked HANDOFF.md).

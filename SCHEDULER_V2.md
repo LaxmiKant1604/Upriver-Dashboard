@@ -2291,3 +2291,77 @@ fresh-invocation zero-duplicate exports, primary/dd-secondary isolation). `npm r
 (**161**, unchanged); `npm run test:source-identity` (7); `npm run verify` = **563** + `build:check`
 (2,394 modules); `git diff --check` clean; `git status --short` shows only the intended files (+ untracked
 `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with Keyword Rank + all reports locked.
+
+## 42. Keyword Rank staged-cycle re-review blockers fixed: one entry point + real routing + cumulative bounds + final plans (SHADOW MODE, 2026-08-11)
+
+Fixes the four production-shape integration blockers from the staged-cycle re-review. Additive
+scheduler-v2 code only; `api/datadoe.js` (route), the keyword-rank source CONTRACT, `source-worker.js`,
+`source-signals.js`, `report-derivation.js`, and every approved `sync-*` / FBA test artifact are
+byte-UNCHANGED. No migration/schedule/control-unlock/push/merge/deploy; Keyword Rank stays locked; no
+other adapter started. `HANDOFF.md` untracked/untouched. request_hash + source identity unchanged;
+strict 50,000-row SQP caps, the catalog token-saving state table, and the approved typed
+blocked/unavailable/invalid outcomes + SQP row-date/window validation are all preserved.
+
+### 42.1 Blocker 1 -- one canonical Keyword Rank entry point (`report-planner.js`)
+
+`SHADOW_PLANNED_REPORT_KEYS` still contained `keyword-rank`, so the generic `buildShadowReportPlan`
+emitted weekly + an EAGER catalog and bypassed the account-scoped fallback cycle. Fixed: `keyword-rank`
+is removed from `SHADOW_PLANNED_REPORT_KEYS` and from the generic `PLANNERS` dispatch; a new
+`STAGED_CYCLE_REPORT_KEYS = ["keyword-rank"]` marks the staged-only report. `buildShadowReportPlan` now
+REJECTS an explicitly-requested staged-cycle key fail-closed (never silently plans it AND never silently
+drops it). The one canonical path is `runKeywordRankShadowCycle`. `planKeywordRank` stays exported for
+that cycle. Tests: default keys/PLANNERS exclude keyword-rank, the default plan emits zero keyword-rank
+reports, and an explicit (or mixed) keyword-rank request throws.
+
+### 42.2 Blocker 2 -- real secondary connection routing (`source-sync-driver.js`)
+
+`getDataDoeConnections()` returns id `secondary`; durable jobs use `dd-secondary`; `makeDataDoeAdapter()`
+indexed raw ids, so a production-shape probe returned `No configured DataDoe connection for
+"dd-secondary"`. Fixed with `normalizeDataDoeConnections()` -- the ONE explicit, server-only boundary that
+maps registry ids onto the driver ids every job carries: `secondary` -> `dd-secondary`;
+`primary`/`dd-secondary` pass through (idempotent); an unknown id fails closed; two entries that normalize
+to the same driver id are rejected. `makeDataDoeAdapter` normalizes before indexing, so
+`makeDataDoeAdapter(getDataDoeConnections())` routes a `dd-secondary` job to the SECONDARY key with NO
+secondary->primary fallback; the org fingerprint still gates the selected key. Tested with the REAL
+registry-shaped `primary`/`secondary` objects (a dd-secondary job routed to the secondary key; a
+primary-fingerprint dd-secondary job rejected; dup/ambiguous/unknown throw).
+
+### 42.3 Blocker 3 -- cumulative per-invocation bounds + schedule-bucket isolation (`keyword-rank-cycle.js`)
+
+`runKeywordRankShadowCycle` passed the ORIGINAL `maxJobs` to each of three `runSourceJobs` rounds and
+ignored `res.deadlineReached`, so `maxJobs:1` could run weekly + monthly + catalog. Fixed: the budget is
+CUMULATIVE (`remaining = maxJobs - processed`); a spent budget opens no later round; the invocation stops
+immediately on `deadlineReached` or a resumable deferral; the rollup surfaces
+`deferred`/`deadlineReached`/`drained`. A fresh invocation resumes the deferred export + later stages with
+no duplicate POST. Schedule-bucket isolation: every account's `bucketForCountry` must equal the supplied
+cycle bucket, checked BEFORE opening a cycle or calling DataDoe -- a mixed US/non-US (or bucket-mismatched)
+input throws with ZERO DataDoe calls. Tests: `maxJobs:1` processes at most one job across all rounds; a
+weekly-poll deadline prevents monthly/catalog and resumes next invocation; mixed/mismatched buckets reject
+with zero DataDoe calls.
+
+### 42.4 Blocker 4 -- return + execute final report plans (`keyword-rank-cycle.js` + new E2E)
+
+The cycle returned hashes/signals but not the final report requests. Now it reconstructs each account's
+persisted weekly/monthly state one final time and returns `rollup.plannedReports`: the canonical
+keyword-rank report per account whose `sources` are EXACTLY the ones STAGED this cycle (matched by
+canonical request hash to the persisted jobs), each marked required, connection normalized to the driver
+id. A successful weekly account depends on weekly + catalog; a successful fallback account on weekly +
+monthly + catalog. The catalog token is never fabricated -- a failed/disabled weekly or failed required
+monthly staged no catalog, so the report neither lists nor waits on it and resolves to an honest blocked
+state via the fetch gate. New offline E2E `report-keyword-rank-e2e.test.js`: source worker -> staged
+weekly/monthly/catalog -> returned final plans -> `runReportJobs` -> saved shadow snapshots, for a weekly
+account (A) and a monthly account (B). Proves exact final `depends_on` per account, correct saved
+cadence + payload, ZERO DataDoe/network calls during derivation, primary/dd-secondary isolation,
+idempotent re-runs (no duplicate exports/snapshots), and a failed weekly path blocked with last-known-good
+preserved.
+
+### 42.5 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `sync-source-jobs.test.js` **17** (+1 registry-shape
+routing); `report-planner.test.js` **28** (+2 one-entry-point); `report-keyword-rank-cycle.test.js` **11**
+(+4 cumulative bounds + bucket isolation); `report-keyword-rank-e2e.test.js` **3** (new, wired into
+`test:report-derivation`). `npm run test:sync-engine` (**60**); `npm run test:report-derivation` = **195**
+(66+28+33+20+34+11+3); `npm run test:report-contracts` (**161**, unchanged); `npm run test:source-identity`
+(7); `npm run verify` = exit 0 + `build:check` (2,394 modules); `git diff --check` clean; `git status
+--short` shows only the intended files (+ untracked `HANDOFF.md`). Scheduler v2 remains SHADOW MODE with
+Keyword Rank + all reports locked.
