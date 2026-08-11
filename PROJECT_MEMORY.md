@@ -6280,3 +6280,53 @@ stays SHADOW ONLY + locked.
 **161**; `test:source-identity` **7**; full `npm run verify` **751 assertions** (was 720) + 2,394-module
 production build (exit 0); `git diff --check` clean; only the intended files changed (+ untracked
 `HANDOFF.md`). Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
+
+## Scheduler v2: Listing Health review blockers (Codex, 2026-08-11)
+
+Reviewed `4c1b0f7`..`c054610` from approved base `0c61857`. The pure payload
+transcription, exact windows, row-date checks, public/raw identity, shared inventory/catalog
+hashes, generic owner cycle, strict caps, and LKG behavior are otherwise sound. Direct
+Listing Health tests pass **31** and full `npm run verify` exits 0 with **751 assertions**
+plus the 2,394-module production build. Listing Health is **not approved yet** because two
+data-integrity blockers remain.
+
+**B1 -- a policy is being mistaken for an observed failure cause.** `decorateSources()` now
+correctly carries the static `availabilityPolicy`, but `assembleSources()` marks a failed
+fragment disabled solely when that policy exists (`jobStatus === "failed" &&
+!!s.disabledPolicy`). The report worker reduces every source row to a status string and drops
+the durable `error_code`, even though `sync_source_jobs` already stores it. Therefore an
+ordinary `EXPORT_ERROR`, `HTTP_500`, timeout, download failure, cache/save failure, or other
+non-disabled failure of optional `listing-health:listings-raw` is misreported as
+`SOURCE_DISABLED`. Independent reproduction through the real `assembleSources()` produced
+`disabled:true`, then a **derived** snapshot with `issuesAvailable:false` and the DataDoe
+enable-table hint from a generic failed status. That contradicts the approved state table and
+can overwrite freshness/status with a false operational diagnosis.
+
+Required fix: propagate safe durable source outcome metadata into report assembly without
+parsing messages. A fragment may set `disabled:true` only when its canonical job has
+`fetch_status='failed'` **and** `error_code='SOURCE_DISABLED'` and the planned policy validates.
+Every other failed/pending/missing/malformed optional outcome must remain non-disabled and
+derive as typed `unavailable`, preserving LKG. Keep the static policy on the plan, but never
+use policy presence as evidence of the actual failure cause. Add real worker tests for a true
+source-disabled error and at least `EXPORT_ERROR`, `HTTP_500`, `TIMEOUT`, `TRUNCATED`, and
+persist/cache failure outcomes.
+
+**B2 -- Listing Health merges money across currencies by SKU.** Both the live copy and pure
+copy group DataDoe by `sku, child_asin, currency`, but then accumulate `salesBySku` using only
+`sku`. The existing test named "currencies never merge" checks only the sorted currency list,
+not the monetary fold. Independent reproduction with one SKU carrying USD 100 and CAD 200
+derived one row labelled USD with `sales30d:300`, `units30d:3`, and `profit30d:30`, while the
+payload merely listed both currencies. That is a silent cross-currency merge.
+
+Required narrow fix: because the route payload has only one row per listing and the live route
+is protected in this tranche, fail closed in the Scheduler-v2 adapter before folding whenever
+one normalized SKU has more than one currency identity in saved sales rows (treat blank/unknown
+as an identity too, so unknown money cannot be absorbed into a named currency). Also reject a
+nonblank listing currency that conflicts with the single nonblank sales currency for that SKU.
+Return typed `invalid`, write zero snapshots, and preserve LKG. Add direct and worker-level
+mixed-currency/mismatch regressions plus canonical single-currency parity. Do not weaken the
+route-parity core or claim the currency-set assertion proves monetary isolation.
+
+Do not start PPC/Listing Optimizer, alter request identity/contracts, change the live route,
+unlock controls, schedule, migrate, push, merge, or deploy. Keep Listing Health SHADOW ONLY
+and locked pending correction and re-review. Leave untracked `HANDOFF.md` untouched.
