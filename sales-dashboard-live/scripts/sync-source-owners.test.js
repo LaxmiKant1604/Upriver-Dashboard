@@ -1,0 +1,302 @@
+// Scheduler v2 -- durable many-to-many source-job OWNERSHIP: schema + production PostgREST wrappers +
+// multi-owner canonical dedup + owner-scoped stale behaviour (SHADOW MODE, fully offline).
+//
+// This suite does NOT rely only on in-memory stores: Part B stubs globalThis.fetch and inspects the
+// ACTUAL PostgREST URL / select columns / insert body / conflict keys / Prefer headers the production
+// lib/server/supabase.js wrappers emit, and Part A parses the real migration SQL. Part C drives the real
+// runSourceJobs + reconcileStaleOwnerMemberships against a lean in-memory store to prove the multi-owner
+// canonical-dedup and stale-membership semantics.
+//
+// 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy
+// Supabase env. No secret-shaped literals; no process.exit / timers / background work.
+
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { writeSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
+const SB_KEY_ENV = ["SUPABASE", "SERVICE", "ROLE", "KEY"].join("_");
+process.env[SB_KEY_ENV] = process.env[SB_KEY_ENV] || ["test", "svc", "role", "key"].join("-");
+
+let passed = 0;
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+const group = (label) => tests.push({ marker: label });
+const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+let upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale, getSyncSourceJobs;
+let runSourceJobs, reconcileStaleOwnerMemberships, sourceJobOwnerId;
+
+// ---- fetch capture harness (Part B): record every PostgREST request; scripted JSON replies by URL. ----
+function captureFetch(reply = () => []) {
+  const calls = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    const call = { url: String(url), method: opts.method || "GET", headers: opts.headers || {}, body: opts.body ? JSON.parse(opts.body) : undefined };
+    calls.push(call);
+    const data = reply(call);
+    return { ok: true, status: 200, async json() { return data; } };
+  };
+  return { calls, restore: () => { globalThis.fetch = real; } };
+}
+const selectOf = (url) => new URLSearchParams(url.split("?")[1] || "").get("select") || "";
+const paramOf = (url, k) => new URLSearchParams(url.split("?")[1] || "").get(k) || "";
+
+/* ============================= Part A: migration schema ============================= */
+
+group("ownership migration: table, unique, composite FK, RLS, no secrets");
+
+test("20260811_sync_source_job_owners.sql creates the table with the required constraints and admin-only RLS", () => {
+  const sql = readFileSync(join(HERE, "..", "supabase", "migrations", "20260811_sync_source_job_owners.sql"), "utf8");
+  const flat = sql.replace(/\s+/g, " ");
+  assert.match(sql, /create table if not exists public\.sync_source_job_owners/, "creates the ownership table (idempotent)");
+  // Required uniqueness: one membership per (cycle, canonical hash, owner).
+  assert.match(flat, /unique \(cycle_id, request_hash, owner_id\)/, "unique(cycle_id, request_hash, owner_id)");
+  // Composite FK to the canonical source-job identity.
+  assert.match(flat, /foreign key \(cycle_id, request_hash\) references public\.sync_source_jobs \(cycle_id, request_hash\) on delete cascade/, "composite FK to sync_source_jobs(cycle_id, request_hash)");
+  // Required owner concepts + safe status enum.
+  for (const col of ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id", "organization_fingerprint", "account_scope_hash", "owner_status", "created_at", "updated_at"]) {
+    assert.match(sql, new RegExp("\\b" + col + "\\b"), "declares " + col);
+  }
+  assert.match(flat, /owner_status text not null default 'active' check \(owner_status in \('active', 'stale'\)\)/, "typed owner_status active|stale");
+  // RLS: enabled + admin-only read; service-role writes (bypass). No public write policy.
+  assert.match(sql, /alter table public\.sync_source_job_owners enable row level security/, "RLS enabled");
+  assert.match(sql, /create policy "admins read sync source job owners" on public\.sync_source_job_owners\s+for select to authenticated using \(public\.is_dashboard_admin\(\)\)/, "admin-only read policy");
+  assert.ok(!/for (insert|update|delete)/i.test(sql), "no non-select policy (service-role writes bypass RLS)");
+  // Idempotent / additive: touch trigger drop-create, no destructive statement on existing tables.
+  assert.match(sql, /drop trigger if exists sync_source_job_owners_touch/, "idempotent trigger");
+  assert.ok(!/\bdrop table\b|\balter table public\.sync_source_jobs\b/i.test(sql), "does not drop/alter any existing table");
+});
+
+test("the migration stores NO secret-shaped value", () => {
+  const sql = readFileSync(join(HERE, "..", "supabase", "migrations", "20260811_sync_source_job_owners.sql"), "utf8");
+  assert.ok(!/(api[-_ ]?key|secret|service_role_key|bearer|password|token)\s*['"=:]/i.test(sql.replace(/-- .*/g, "")), "no secret-shaped assignment outside comments");
+  assert.ok(!/eyJ[A-Za-z0-9_-]{20,}/.test(sql), "no JWT-shaped literal");
+});
+
+/* ============================= Part B: production PostgREST wrappers ============================= */
+
+group("production wrappers: real SELECT columns, owner membership body/conflict/filters");
+
+test("getSyncSourceJobs SELECTs ONLY real canonical columns (no request_key)", async () => {
+  const cap = captureFetch(() => []);
+  try { await getSyncSourceJobs("cyc-1"); } finally { cap.restore(); }
+  const select = selectOf(cap.calls[0].url);
+  assert.ok(select.includes("request_hash") && select.includes("organization_fingerprint") && select.includes("account_scope_hash"), "keeps real canonical columns");
+  assert.ok(!select.split(",").includes("request_key"), "request_key is NOT selected (not a canonical column / not ownership authority)");
+});
+
+test("upsertSyncSourceJobOwners POSTs memberships with the right conflict key + reactivating body; fails closed before fetch on a malformed membership", async () => {
+  const cap = captureFetch(() => null);
+  try {
+    await upsertSyncSourceJobOwners([{
+      cycleId: "cyc-1", requestHash: "H1", ownerId: "owner-A", requestKey: "daily-reporting:catalog",
+      reportKey: "daily-reporting", accountId: "A1", organizationFingerprint: "org-fp", accountScopeHash: "scope-A1",
+    }]);
+  } finally { cap.restore(); }
+  const c = cap.calls[0];
+  assert.match(c.url, /\/rest\/v1\/sync_source_job_owners\?on_conflict=cycle_id,request_hash,owner_id/, "conflict key = (cycle_id, request_hash, owner_id)");
+  assert.equal(c.method, "POST");
+  assert.match(String(c.headers.Prefer || ""), /resolution=merge-duplicates/, "merge-duplicates reactivation");
+  const row = c.body[0];
+  assert.equal(row.owner_id, "owner-A");
+  assert.equal(row.request_key, "daily-reporting:catalog");
+  assert.equal(row.owner_status, "active", "re-declared membership is (re)activated");
+  assert.equal(row.error_code, null);
+  assert.ok(!("api_key" in row) && !("apikey" in row) && !("secret" in row), "no secret-shaped field in the owner row");
+
+  // Malformed membership (missing owner_id) throws BEFORE any request.
+  const cap2 = captureFetch(() => null);
+  try {
+    await assert.rejects(
+      upsertSyncSourceJobOwners([{ cycleId: "c", requestHash: "H", ownerId: "", requestKey: "k", organizationFingerprint: "o", accountScopeHash: "s" }]),
+      /requires a non-empty owner_id/,
+    );
+    assert.equal(cap2.calls.length, 0, "no PostgREST request issued for a malformed membership");
+  } finally { cap2.restore(); }
+});
+
+test("getSyncSourceJobOwners filters by cycle + owner_id in(...) and selects owner columns", async () => {
+  const cap = captureFetch(() => []);
+  try { await getSyncSourceJobOwners("cyc-1", ["owner-A", "owner-B", "owner-A"]); } finally { cap.restore(); }
+  const url = cap.calls[0].url;
+  assert.match(url, /\/rest\/v1\/sync_source_job_owners\?/);
+  assert.equal(paramOf(url, "cycle_id"), "eq.cyc-1");
+  assert.equal(paramOf(url, "owner_id"), "in.(owner-A,owner-B)", "deduped owner id IN filter");
+  assert.ok(selectOf(url).includes("owner_status"), "selects the owner_status lifecycle column");
+});
+
+test("getSyncSourceJobsForOwners resolves ACTIVE membership hashes then reads the canonical rows", async () => {
+  const cap = captureFetch((call) => {
+    if (call.url.includes("sync_source_job_owners")) {
+      return [
+        { request_hash: "H1", owner_status: "active" },
+        { request_hash: "H2", owner_status: "stale" },
+        { request_hash: "H1", owner_status: "active" },
+      ];
+    }
+    return [];
+  });
+  try { await getSyncSourceJobsForOwners("cyc-1", ["owner-A"]); } finally { cap.restore(); }
+  assert.equal(cap.calls.length, 2, "two requests: memberships then canonical jobs");
+  const jobsUrl = cap.calls[1].url;
+  assert.match(jobsUrl, /\/rest\/v1\/sync_source_jobs\?/);
+  assert.equal(paramOf(jobsUrl, "request_hash"), "in.(H1)", "only ACTIVE, deduped hashes are fetched (stale H2 excluded)");
+});
+
+test("recordSyncSourceJobOwnerStale PATCHes only the one owner membership to stale (never the canonical row)", async () => {
+  const cap = captureFetch(() => null);
+  try { await recordSyncSourceJobOwnerStale({ cycleId: "cyc-1", requestHash: "H1", ownerId: "owner-A", code: "STALE_PLAN", message: "retired" }); } finally { cap.restore(); }
+  const c = cap.calls[0];
+  assert.match(c.url, /\/rest\/v1\/sync_source_job_owners\?/, "targets the owners table, not sync_source_jobs");
+  assert.equal(c.method, "PATCH");
+  assert.equal(paramOf(c.url, "cycle_id"), "eq.cyc-1");
+  assert.equal(paramOf(c.url, "request_hash"), "eq.H1");
+  assert.equal(paramOf(c.url, "owner_id"), "eq.owner-A", "scoped to exactly ONE owner membership");
+  assert.equal(c.body.owner_status, "stale");
+});
+
+/* ============================= Part C: multi-owner canonical dedup + stale ============================= */
+
+group("multi-owner: one canonical row + one export shared by two report owners");
+
+// Lean in-memory store (canonical jobs + owner memberships + source cache).
+function makeStore() {
+  const cycles = new Map(); const jobs = new Map(); const owners = new Map(); const cache = new Map(); let seq = 0;
+  const find = (id) => [...cycles.values()].find((c) => c.id === id) || null;
+  const orow = (cid) => [...((owners.get(cid) && owners.get(cid).values()) || [])];
+  return {
+    _job: (cid, h) => jobs.get(cid) && jobs.get(cid).get(h),
+    _owners: (cid) => orow(cid).map((m) => ({ ...m })),
+    openCycle({ bucket, cycleDate }) { const k = bucket + "|" + cycleDate; if (!cycles.has(k)) { const id = "cyc_" + (seq += 1); cycles.set(k, { id, bucket, status: "pending" }); jobs.set(id, new Map()); } return cycles.get(k).id; },
+    claimCycle(id) { const c = find(id); if (c && c.status === "pending") { c.status = "running"; return true; } return false; },
+    getCycle(id) { return find(id); },
+    upsertSourceJob(j) { const m = jobs.get(j.cycleId); if (m.has(j.requestHash)) return; m.set(j.requestHash, { request_hash: j.requestHash, request_key: j.requestKey, source_id: j.sourceId, source_key: j.sourceKey, connection_id: j.connectionId, organization_fingerprint: j.organizationFingerprint, account_scope_hash: j.accountScopeHash, fetch_status: "pending", attempted_at: null, create_export_count: 0, export_id: null, terminal: false, row_count: null }); },
+    listSourceJobs(id) { return [...((jobs.get(id) && jobs.get(id).values()) || [])].map((j) => ({ ...j })); },
+    upsertSourceJobOwners(ms) { for (const m of ms || []) { if (!owners.has(m.cycleId)) owners.set(m.cycleId, new Map()); owners.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null }); } },
+    listSourceJobOwners(cid, ids) { const s = new Set(ids || []); return orow(cid).filter((m) => s.has(m.owner_id)).map((m) => ({ ...m })); },
+    recordSourceOwnerStale({ cycleId, requestHash, ownerId, code, message }) { const m = owners.get(cycleId) && owners.get(cycleId).get(ownerId + "|" + requestHash); if (m) { m.owner_status = "stale"; m.error_code = code || "STALE_PLAN"; m.error_message = message || null; } },
+    claimExportAttempt(id, h) { const j = jobs.get(id) && jobs.get(id).get(h); if (j && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
+    recordExportCreated({ cycleId, requestHash, exportId }) { jobs.get(cycleId).get(requestHash).export_id = exportId; },
+    loadSourceRows(h) { const e = cache.get(h); return e ? { rows: e.rows } : null; },
+    saveSourceRows({ job, rows }) { const h = job.request_hash != null ? job.request_hash : job.requestHash; cache.set(h, { rows: [...rows] }); return "p/" + h; },
+    recordSourceSuccess({ cycleId, requestHash, exportId, rowCount, cacheObjectPath }) { Object.assign(jobs.get(cycleId).get(requestHash), { fetch_status: "succeeded", export_id: exportId, row_count: rowCount, cache_object_path: cacheObjectPath }); },
+    recordSourceFailure({ cycleId, requestHash, stage, code, terminal }) { Object.assign(jobs.get(cycleId).get(requestHash), { fetch_status: "failed", error_stage: stage, error_code: code, terminal: !!terminal }); },
+    updateCycleCounts() {},
+  };
+}
+function makeDataDoe() { const create = {}; return { createCount: (h) => create[h] || 0, totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0), async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; }, async poll() {}, async download() { return [{ a: 1 }]; } }; }
+
+// The SAME canonical request_hash "H" owned by two different reports (different request_key aliases +
+// different owner_id). Each report contributes its own membership job.
+const org = "org-fp", scope = "scope-A1";
+const jobFor = (reportKey, requestKey) => ({
+  requestHash: "H", requestKey, sourceId: "s", sourceKey: "product-catalog", connectionId: "primary",
+  organizationFingerprint: org, accountScopeHash: scope, requestMeta: {}, bucket: "us", strict: false, limit: 10,
+  owner: { ownerId: null, requestKey, reportKey, accountId: "A1" },
+  fetchParams: { columns: ["c"], sellerOrVendorIds: ["A1"], from: null, to: null, options: {} },
+});
+function ownerJob(reportKey, requestKey) {
+  const j = jobFor(reportKey, requestKey);
+  j.owner.ownerId = sourceJobOwnerId({ reportKey, connectionId: "primary", organizationFingerprint: org, accountScopeHash: scope });
+  return j;
+}
+const runOwner = (store, dd, job) => runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: [job.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+
+async function twoOwnersSharedHash(order) {
+  const store = makeStore(); const dd = makeDataDoe();
+  const x = ownerJob("daily-reporting", "daily-reporting:catalog");
+  const y = ownerJob("reconciliation", "reconciliation:catalog");
+  assert.notEqual(x.owner.ownerId, y.owner.ownerId, "different reports => different owner_id");
+  const first = order === "xy" ? x : y;
+  const second = order === "xy" ? y : x;
+  const r1 = await runOwner(store, dd, first);
+  const r2 = await runOwner(store, dd, second);
+  const cid = r1.cycleId;
+  assert.equal(store.listSourceJobs(cid).length, 1, "exactly ONE canonical sync_source_jobs row for the shared hash");
+  assert.equal(store._owners(cid).length, 2, "exactly TWO owner memberships for that one canonical row");
+  assert.equal(dd.createCount("H"), 1, "exactly ONE DataDoe create-export for the shared hash");
+  assert.equal(store._job(cid, "H").fetch_status, "succeeded");
+  assert.equal(r2.succeeded + r2.processed >= 0, true);
+  assert.equal(dd.totalCreates(), 1, "the second owner resumes/reads the shared result with ZERO additional create-export");
+  return { store, cid };
+}
+
+test("two reports, different request_key, SAME request_hash => one canonical row, two memberships, one create-export (owner X then Y)", async () => {
+  await twoOwnersSharedHash("xy");
+});
+
+test("reverse owner order gives the same result (owner Y then X)", async () => {
+  await twoOwnersSharedHash("yx");
+});
+
+group("owner-scoped stale: never fails the shared canonical row another owner still needs");
+
+test("a stale membership for owner A does NOT fail the shared canonical job or owner B's membership", async () => {
+  const { store, cid } = await twoOwnersSharedHash("xy");
+  const x = ownerJob("daily-reporting", "daily-reporting:catalog");
+  const y = ownerJob("reconciliation", "reconciliation:catalog");
+  // Owner A (daily-reporting) goes stale on the shared hash; owner B (reconciliation) still depends on it.
+  await store.recordSourceOwnerStale({ cycleId: cid, requestHash: "H", ownerId: x.owner.ownerId, code: "STALE_PLAN", message: "retired" });
+  const owners = store._owners(cid);
+  assert.equal(owners.find((m) => m.owner_id === x.owner.ownerId).owner_status, "stale", "A's membership is stale");
+  assert.equal(owners.find((m) => m.owner_id === y.owner.ownerId).owner_status, "active", "B's membership is untouched (active)");
+  assert.equal(store._job(cid, "H").fetch_status, "succeeded", "the shared canonical row is NOT failed/corrupted");
+  assert.equal(store._job(cid, "H").error_code, undefined, "no error recorded on the canonical row");
+  // Owner B re-runs: reads the shared canonical result, still ZERO new create-export.
+  const dd = makeDataDoe();
+  const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs: [y], ownerIds: [y.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(dd.totalCreates(), 0, "owner B makes no new create-export for the already-fetched shared hash");
+  assert.equal(store.listSourceJobs(r.cycleId).length, 1, "still one canonical row");
+});
+
+test("a genuine same-owner stale membership is retired at OWNER scope by reconcileStaleOwnerMemberships (canonical row preserved)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  // Owner A stages TWO sources this cycle: H (kept) and H2 (dropped next plan).
+  const a1 = ownerJob("daily-reporting", "daily-reporting:catalog");
+  const a2 = { ...ownerJob("daily-reporting", "daily-reporting:asin-day-superset"), requestHash: "H2" };
+  a2.owner = { ...a2.owner };
+  await runSourceJobs({ store, dataDoe: dd, plannedJobs: [a1, a2], ownerIds: [a1.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(store._owners(cid).length, 2, "two owner memberships staged");
+  assert.equal(store._job(cid, "H2").fetch_status, "succeeded");
+  // A new invocation's plan keeps ONLY H (drops H2). reconcile marks the H2 membership stale for owner A.
+  const plannedKeys = new Set([`${a1.owner.ownerId}|H`]);
+  await reconcileStaleOwnerMemberships(store, cid, [a1.owner.ownerId], plannedKeys);
+  const owners = store._owners(cid);
+  assert.equal(owners.find((m) => m.request_hash === "H2").owner_status, "stale", "the dropped H2 membership is stale (fails closed at owner scope)");
+  assert.equal(owners.find((m) => m.request_hash === "H").owner_status, "active", "the kept H membership stays active");
+  assert.equal(store._job(cid, "H2").fetch_status, "succeeded", "the canonical H2 row is preserved (never failed by a stale owner)");
+  assert.equal(dd.totalCreates(), 2, "reconciliation makes NO DataDoe call for the stale membership");
+});
+
+test("sourceJobOwnerId is deterministic, account/org-safe, and does not depend on request_key/hash", () => {
+  const base = { reportKey: "keyword-rank", connectionId: "primary", organizationFingerprint: "orgP", accountScopeHash: "scopeA" };
+  assert.equal(sourceJobOwnerId(base), sourceJobOwnerId({ ...base }), "deterministic");
+  assert.notEqual(sourceJobOwnerId(base), sourceJobOwnerId({ ...base, accountScopeHash: "scopeB" }), "different account => different owner");
+  assert.notEqual(sourceJobOwnerId(base), sourceJobOwnerId({ ...base, organizationFingerprint: "orgS" }), "different org => different owner");
+  assert.notEqual(sourceJobOwnerId(base), sourceJobOwnerId({ ...base, connectionId: "dd-secondary" }), "different connection => different owner");
+  assert.notEqual(sourceJobOwnerId(base), sourceJobOwnerId({ ...base, reportKey: "brand-sales" }), "different report family => different owner");
+  assert.equal(sourceJobOwnerId({ ...base, organizationFingerprint: "" }), null, "incomplete => null (caller fails closed)");
+});
+
+async function main() {
+  ({ upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale, getSyncSourceJobs } = await import("../lib/server/supabase.js"));
+  ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
+  ({ reconcileStaleOwnerMemberships } = await import("../lib/server/sync/source-sync-driver.js"));
+  ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
+
+  let failures = 0;
+  for (const t of tests) {
+    if (t.marker) { out("\n# " + t.marker); continue; }
+    try { await t.fn(); passed += 1; out("  ok  " + t.name); }
+    catch (err) { failures += 1; out("FAIL  " + t.name); out(String(err && err.stack ? err.stack : err)); }
+  }
+  out("\n" + passed + " assertions passed");
+  return failures;
+}
+
+main().then((failures) => { if (failures) process.exitCode = 1; }).catch((err) => { out("FATAL " + String(err && err.stack ? err.stack : err)); process.exitCode = 1; });
