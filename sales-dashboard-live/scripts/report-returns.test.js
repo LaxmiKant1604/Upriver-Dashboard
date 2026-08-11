@@ -22,7 +22,7 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, runStagedSourceCycle, sourceJobOwnerId;
-let planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr;
+let planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr, splitDateRangeByDays;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -296,6 +296,115 @@ test("20. derivation makes ZERO network calls; 21. repeated derivation is idempo
   assert.deepEqual(a, expectedFixturePayload());
 });
 
+group("returns latestDataDate: an OBSERVED source-evidence date, never the requested asOf (freshness blocker)");
+
+// latestDataDate must be the MAX real date in the already-validated raw Returns rows (null if none), never
+// context.to / payload.window.to / Date.now(). deriveRet returns the full derive result (status + payload +
+// latestDataDate).
+
+test("f1. four successful-but-EMPTY source payloads => status derived, latestDataDate null (never asOf)", () => {
+  const r = deriveRet(retPlanned({ returns: [], settlements: [], traffic: [], catalog: [] }));
+  assert.equal(r.status, "derived", "empty-but-valid sources derive a valid empty report");
+  assert.deepEqual(r.payload.rows, []);
+  assert.equal(r.payload.window.to, ASOF, "the payload window end is still asOf (route parity)");
+  assert.equal(r.latestDataDate, null, "no dated source evidence => latestDataDate null, NOT asOf");
+});
+
+test("f2. returns rows dated Jul 20 + Jul 31 with asOf Aug 10 => latestDataDate === Jul 31, never Aug 10", () => {
+  const built = retPlanned({ returns: [
+    ret("2025-07-20", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, ""),
+    ret("2025-07-31", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, ""),
+  ] });
+  const r = deriveRet(built);
+  assert.equal(r.status, "derived");
+  assert.equal(r.latestDataDate, "2025-07-31", "the maximum observed return date");
+  assert.notEqual(r.latestDataDate, ASOF, "never the requested asOf");
+});
+
+test("f3. an empty-ASIN return row (folded out) still contributes its valid source date as freshness evidence", () => {
+  const built = retPlanned({ returns: [ret("2025-08-05", "", "", "DEFECTIVE", "FBA", "Approved", -1, 0, "")] });
+  const r = deriveRet(built);
+  assert.equal(r.status, "derived");
+  assert.equal(r.payload.returnRecordCount, 1);
+  assert.equal(r.payload.rows.length, 0, "the empty-ASIN row folds out of the rows");
+  assert.equal(r.latestDataDate, "2025-08-05", "but its validated source date still counts");
+});
+
+test("f4. impossible/future/out-of-window return date => typed invalid, latestDataDate null", () => {
+  for (const bad of ["2025-02-30", "2099-01-01", addDaysStr(ASOF, 1), addDaysStr(FROM, -1)]) {
+    const r = deriveRet(retPlanned({ returns: [ret(bad, "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, "")] }));
+    assert.equal(r.status, "invalid", `${bad} => invalid`);
+    assert.equal(r.latestDataDate, null, `${bad} => latestDataDate null`);
+  }
+});
+
+test("f5. worker-level: recordReportSuccess receives the EXACT observed latestDataDate (Jul 31), not asOf", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const built = retPlanned({
+    returns: [ret("2025-07-20", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, ""), ret("2025-07-31", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -2, 0, "")],
+    settlements: [refund("R1", "SKU-R1", "USD", { amount: -9, qty: -1 })],
+    traffic: [traf("R1", "Widget R1", 100, 10, 9, 1)],
+    catalog: [cat("R1", "P1", "Catalog R1", "Acme")],
+  });
+  for (const p of built.planned) {
+    store.upsertSourceJob({ cycleId: cid, requestHash: p.requestHash, requestKey: p.requestKey, sourceId: "s", sourceKey: "k", connectionId: "primary", organizationFingerprint: "org", accountScopeHash: "sch" });
+    store.saveSourceRows({ job: { request_hash: p.requestHash }, rows: built.rows[p.requestHash] || [] });
+    store.recordSourceSuccess({ cycleId: cid, requestHash: p.requestHash, exportId: "e", rowCount: (built.rows[p.requestHash] || []).length, cacheObjectPath: "p/" + p.requestHash });
+  }
+  const plannedReports = [{
+    reportKey: "returns-leakage", accountId: ID, connectionId: "primary", bucket: "us",
+    sources: built.planned.map((p) => ({ requestKey: p.requestKey, requestHash: p.requestHash, from: p.from, to: p.to, sellerOrVendorIds: p.sellerOrVendorIds, optional: false })),
+    context: { to: ASOF, rawSellerId: ID },
+  }];
+  const saveSnapshot = async () => ({ paramsHash: "ph" });
+  const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports });
+  assert.equal(res.succeeded, 1);
+  assert.equal(store.report("returns-leakage", ID).latest_data_date, "2025-07-31", "worker records the observed evidence date, not asOf");
+});
+
+test("f4b. worker-level: an out-of-window return date => report NOT saved, prior LKG snapshot preserved, no latest_data_date write", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const built = retPlanned({
+    returns: [ret("2099-01-01", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, "")], // future date
+    settlements: [refund("R1", "SKU-R1", "USD", { amount: -9, qty: -1 })],
+    traffic: [traf("R1", "Widget R1", 100, 10, 9, 1)],
+    catalog: [cat("R1", "P1", "Catalog R1", "Acme")],
+  });
+  for (const p of built.planned) {
+    store.upsertSourceJob({ cycleId: cid, requestHash: p.requestHash, requestKey: p.requestKey, sourceId: "s", sourceKey: "k", connectionId: "primary", organizationFingerprint: "org", accountScopeHash: "sch" });
+    store.saveSourceRows({ job: { request_hash: p.requestHash }, rows: built.rows[p.requestHash] || [] });
+    store.recordSourceSuccess({ cycleId: cid, requestHash: p.requestHash, exportId: "e", rowCount: 1, cacheObjectPath: "p/" + p.requestHash });
+  }
+  const lkg = { accountId: ID, prior: true };
+  store.seedSnapshot("scheduler-v2/returns-leakage", ID, lkg);
+  const plannedReports = [{
+    reportKey: "returns-leakage", accountId: ID, connectionId: "primary", bucket: "us",
+    sources: built.planned.map((p) => ({ requestKey: p.requestKey, requestHash: p.requestHash, from: p.from, to: p.to, sellerOrVendorIds: p.sellerOrVendorIds, optional: false })),
+    context: { to: ASOF, rawSellerId: ID },
+  }];
+  let saveCalls = 0;
+  const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: cid, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports });
+  assert.equal(res.succeeded, 0, "invalid source data => report not saved");
+  assert.equal(saveCalls, 0, "zero snapshot writes");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/returns-leakage|" + ID).payload, lkg, "prior last-known-good preserved");
+});
+
+test("f6. other adapters retain their existing latestDataDate results (the sources arg is backward-compatible)", () => {
+  // Buy Box Loss reads its latestDataDate from a PAYLOAD field (observedWindow.to), not from `sources`.
+  // Deriving it through the same 3-arg invocation must yield the max observed daily date, unchanged.
+  const slices = splitDateRangeByDays(addDaysStr(ASOF, -27), ASOF, 7);
+  const planned = []; const rows = {};
+  slices.forEach((w) => { const f = frag("buy-box-loss:daily", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", product_name: "P", product_brand: "B", currency: "USD", buybox_percentage: 90, total_sales: 10, total_units_sold: 1, page_views: 5 }]; });
+  const inv = frag("buy-box-loss:inventory", addDaysStr(ASOF, -10), ASOF); planned.push(inv); rows[inv.requestHash] = [{ date: ASOF, sku: "S", child_asin: "A", product_name: "P", currency: "USD", available: 5, units_shipped_t30: 1 }];
+  const catF = frag("buy-box-loss:catalog", null, null); planned.push(catF); rows[catF.requestHash] = [{ child_asin: "A", parent_asin: "P", product_name: "P", product_brand: "B" }];
+  const r = deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(planned, rows), context: ctx() });
+  assert.equal(r.status, "derived");
+  assert.equal(r.latestDataDate, slices[3].from, "buy-box latestDataDate is unchanged: the payload observedWindow.to (max daily date)");
+});
+
 /* ============================= Part B: real generic planner/driver ============================= */
 
 group("returns generic path: buildShadowReportPlan -> runStagedSourceCycle -> runReportJobs");
@@ -331,7 +440,7 @@ function makeStore() {
     claimReportDerive(_c, rk, a) { const j = reportJobs.get(rkey(rk, a)); if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; } return false; },
     recordReportBlocked({ reportKey, accountId }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); },
     recordReportFailure({ reportKey, accountId, stage, code }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); },
-    recordReportSuccess({ reportKey, accountId }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true }); },
+    recordReportSuccess({ reportKey, accountId, latestDataDate }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true, latest_data_date: latestDataDate ?? null }); },
   };
 }
 
@@ -501,7 +610,7 @@ async function main() {
   ({ plannedSourceJob, runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
   ({ planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
-  ({ addDaysStr } = await import("../lib/server/date-windows.js"));
+  ({ addDaysStr, splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -59);
 
   let failures = 0;
