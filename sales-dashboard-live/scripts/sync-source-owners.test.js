@@ -47,41 +47,91 @@ const paramOf = (url, k) => new URLSearchParams(url.split("?")[1] || "").get(k) 
 
 /* ============================= Part A: migration schema ============================= */
 
-group("ownership migration: table, unique, composite FK, RLS, no secrets");
+group("ownership migration: convergent fresh/upgrade schema, backfill, fail-closed, idempotent, no secrets");
 
-test("20260811_sync_source_job_owners.sql creates the table with the required constraints and admin-only RLS", () => {
-  const sql = readFileSync(join(HERE, "..", "supabase", "migrations", "20260811_sync_source_job_owners.sql"), "utf8");
-  const flat = sql.replace(/\s+/g, " ");
+const OWNERS_SQL = () => readFileSync(join(HERE, "..", "supabase", "migrations", "20260811_sync_source_job_owners.sql"), "utf8");
+
+test("base table, unique, composite FK, admin-only RLS, and no destructive statement on existing tables", () => {
+  const sql = OWNERS_SQL(); const flat = sql.replace(/\s+/g, " ");
   assert.match(sql, /create table if not exists public\.sync_source_job_owners/, "creates the ownership table (idempotent)");
-  // Required uniqueness: one membership per (cycle, canonical hash, owner).
   assert.match(flat, /unique \(cycle_id, request_hash, owner_id\)/, "unique(cycle_id, request_hash, owner_id)");
-  // Composite FK to the canonical source-job identity.
-  assert.match(flat, /foreign key \(cycle_id, request_hash\) references public\.sync_source_jobs \(cycle_id, request_hash\) on delete cascade/, "composite FK to sync_source_jobs(cycle_id, request_hash)");
-  // Required owner concepts + safe status enum.
+  assert.match(flat, /foreign key \(cycle_id, request_hash\) references public\.sync_source_jobs \(cycle_id, request_hash\) on delete cascade/, "composite FK");
   for (const col of ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id", "connection_id", "organization_fingerprint", "account_scope_hash", "owner_status", "created_at", "updated_at"]) {
     assert.match(sql, new RegExp("\\b" + col + "\\b"), "declares " + col);
   }
-  assert.match(flat, /owner_status text not null default 'active' check \(owner_status in \('active', 'stale'\)\)/, "typed owner_status active|stale");
-  // connection_id participates in owner identity and is a supported typed value.
-  assert.match(flat, /connection_id text not null default 'primary' check \(connection_id in \('primary', 'dd-secondary'\)\)/, "typed connection_id primary|dd-secondary");
-  // Owner-identity columns must be non-empty (no ambiguous owner persisted).
-  assert.match(flat, /constraint sync_source_job_owners_identity_nonempty check \(/, "non-empty identity constraint");
-  // Additive/idempotent connection_id guard for an already-created table.
-  assert.match(flat, /alter table public\.sync_source_job_owners add column if not exists connection_id/, "idempotent connection_id add-column guard");
-  // RLS: enabled + admin-only read; service-role writes (bypass). No public write policy.
+  assert.match(flat, /owner_status text not null default 'active' check \(owner_status in \('active', 'stale'\)\)/, "typed owner_status");
   assert.match(sql, /alter table public\.sync_source_job_owners enable row level security/, "RLS enabled");
   assert.match(sql, /create policy "admins read sync source job owners" on public\.sync_source_job_owners\s+for select to authenticated using \(public\.is_dashboard_admin\(\)\)/, "admin-only read policy");
-  assert.ok(!/for (insert|update|delete)/i.test(sql), "no non-select policy (service-role writes bypass RLS)");
-  // Idempotent / additive: touch trigger drop-create, no destructive statement on existing tables.
-  assert.match(sql, /drop trigger if exists sync_source_job_owners_touch/, "idempotent trigger");
+  assert.ok(!/for (insert|update|delete)\s+to/i.test(sql), "no non-select policy (service-role writes bypass RLS)");
   assert.ok(!/\bdrop table\b|\balter table public\.sync_source_jobs\b/i.test(sql), "does not drop/alter any existing table");
+  // request_hash / owner_id are never rewritten by the migration.
+  assert.ok(!/alter column request_hash|alter column owner_id|update[^;]*set[^;]*request_hash|update[^;]*set[^;]*owner_id/i.test(sql), "never alters request_hash or owner_id");
 });
 
-test("the migration stores NO secret-shaped value", () => {
-  const sql = readFileSync(join(HERE, "..", "supabase", "migrations", "20260811_sync_source_job_owners.sql"), "utf8");
+test("BOTH paths converge: the final constraints are established by idempotent statements that run regardless of prior table state", () => {
+  const sql = OWNERS_SQL(); const flat = sql.replace(/\s+/g, " ");
+  // The CREATE must NOT inline the typed-connection or identity-nonempty checks, so an EARLIER table that
+  // already exists (create table if not exists = no-op) still gains them from the idempotent blocks below.
+  const createBlock = sql.slice(0, sql.indexOf(");", sql.indexOf("create table")) );
+  assert.ok(!/check \(connection_id in/i.test(createBlock), "connection check is NOT inlined in CREATE (added convergently instead)");
+  assert.ok(!/identity_nonempty/i.test(createBlock), "identity-nonempty check is NOT inlined in CREATE");
+  // connection_id is added nullable-first, then finalized NOT NULL + default AFTER the backfill.
+  assert.match(flat, /alter table public\.sync_source_job_owners add column if not exists connection_id text;/, "connection_id added (nullable) before backfill");
+  assert.match(flat, /alter column connection_id set not null, alter column connection_id set default 'primary'/, "connection_id finalized NOT NULL + default AFTER backfill");
+  // Unsafe blank defaults removed and NOT NULL asserted for every identity column.
+  for (const c of ["report_key", "account_id", "organization_fingerprint", "account_scope_hash"]) {
+    assert.match(flat, new RegExp("alter column " + c + " drop default"), c + " blank default removed");
+    assert.match(flat, new RegExp("alter column " + c + " set not null"), c + " set NOT NULL");
+  }
+  // NAMED constraints added idempotently (pg_constraint existence guard) so both paths end equivalent.
+  assert.match(flat, /if not exists \(select 1 from pg_constraint\s+where conname = 'sync_source_job_owners_connection_id_check'/, "named connection check added idempotently");
+  assert.match(flat, /add constraint sync_source_job_owners_connection_id_check check \(connection_id in \('primary', 'dd-secondary'\)\)/, "typed connection check");
+  assert.match(flat, /if not exists \(select 1 from pg_constraint\s+where conname = 'sync_source_job_owners_identity_nonempty'/, "named identity check added idempotently");
+  assert.match(flat, /add constraint sync_source_job_owners_identity_nonempty check \(/, "identity-nonempty check");
+});
+
+// The DETERMINISTIC backfill rule the migration applies (dd-secondary: prefix => dd-secondary; else primary),
+// re-implemented here and checked against the SQL's own UPDATE statements + sample accounts.
+const connFor = (accountId) => (String(accountId).startsWith("dd-secondary:") ? "dd-secondary" : "primary");
+
+test("deterministic connection_id backfill: dd-secondary: accounts => dd-secondary, others => primary; a secondary is never rewritten to primary", () => {
+  const flat = OWNERS_SQL().replace(/\s+/g, " ");
+  // Upgrade dd-secondary accounts (fill NULL or correct a mislabeled 'primary'); never touch an existing dd-secondary.
+  assert.match(flat, /update public\.sync_source_job_owners set connection_id = 'dd-secondary' where account_id like 'dd-secondary:%' and coalesce\(connection_id, 'primary'\) = 'primary'/, "dd-secondary backfill/correction");
+  // Fill NULL primary accounts only -- never downgrade a dd-secondary row to primary.
+  assert.match(flat, /update public\.sync_source_job_owners set connection_id = 'primary' where account_id not like 'dd-secondary:%' and connection_id is null/, "primary NULL-only backfill");
+  assert.ok(!/set connection_id = 'primary' where account_id like 'dd-secondary'/i.test(flat), "never rewrites a dd-secondary account to primary");
+  // Sample mapping matches the rule.
+  assert.equal(connFor("dd-secondary:B1"), "dd-secondary");
+  assert.equal(connFor("A1"), "primary");
+  assert.equal(connFor("dd-secondary:xyz"), "dd-secondary");
+});
+
+test("malformed existing identity rows fail the migration closed (raise), never silently accepted", () => {
+  const flat = OWNERS_SQL().replace(/\s+/g, " ");
+  assert.match(flat, /raise exception 'sync_source_job_owners contains rows with a blank\/invalid owner identity/, "fail-closed raise on malformed identity");
+  // The guard checks every identity field + connection_id validity.
+  for (const c of ["report_key", "account_id", "request_key", "organization_fingerprint", "account_scope_hash"]) {
+    assert.match(flat, new RegExp("coalesce\\(" + c + ", ''\\) = ''"), "checks blank " + c);
+  }
+  assert.match(flat, /connection_id is null or connection_id not in \('primary', 'dd-secondary'\)/, "checks connection_id validity");
+});
+
+test("the migration is idempotent (safe to re-run) and stores NO secret", () => {
+  const sql = OWNERS_SQL();
+  assert.match(sql, /create table if not exists/, "table create idempotent");
+  assert.match(sql, /add column if not exists connection_id/, "column add idempotent");
+  assert.match(sql, /create index if not exists sync_source_job_owners_owner_idx/, "index idempotent");
+  assert.match(sql, /create index if not exists sync_source_job_owners_hash_idx/, "index idempotent");
+  assert.match(sql, /drop trigger if exists sync_source_job_owners_touch/, "trigger drop-create idempotent");
+  assert.match(sql, /drop policy if exists "admins read sync source job owners"/, "policy drop-create idempotent");
+  // Constraint adds are guarded by pg_constraint existence checks (re-run adds nothing).
+  assert.equal((sql.match(/if not exists \(select 1 from pg_constraint/g) || []).length, 2, "both named constraints guarded");
+  // No secret-shaped value.
   assert.ok(!/(api[-_ ]?key|secret|service_role_key|bearer|password|token)\s*['"=:]/i.test(sql.replace(/-- .*/g, "")), "no secret-shaped assignment outside comments");
   assert.ok(!/eyJ[A-Za-z0-9_-]{20,}/.test(sql), "no JWT-shaped literal");
 });
+
 
 /* ============================= Part B: production PostgREST wrappers ============================= */
 
