@@ -267,8 +267,8 @@ test("terminal-disabled REQUIRED source blocks only that report", async () => {
 });
 
 test("degraded/optional source unavailable does NOT block the required gate", async () => {
-  // listing-health: listings-raw is OPTIONAL. All REQUIRED keys available + optional missing
-  // must pass the required gate (reaching the derive step, which is not-yet-wired here).
+  // listing-health: listings-raw is OPTIONAL. All REQUIRED keys available + the optional source degraded
+  // must PASS the required gate and reach the (now-wired) derive -- never a gate-level block/unavailable.
   const lh = REPORT_DERIVATIONS["listing-health"];
   const sources = {};
   for (const k of lh.requiredRequestKeys) sources[k] = { available: true, rows: [] };
@@ -276,7 +276,10 @@ test("degraded/optional source unavailable does NOT block the required gate", as
   const r = deriveReportSnapshot({ reportKey: "listing-health", sources });
   assert.notEqual(r.status, "blocked", "an optional degraded source must not block");
   assert.notEqual(r.status, "unavailable", "required keys were all available");
-  assert.equal(r.status, "not-implemented", "gate passed; derive wiring is the pending piece");
+  // The derive is now wired: these fragment-less bare sources reach it and fail derive-validation (invalid),
+  // proving the optional degraded source passed the required gate rather than short-circuiting it. Full
+  // degraded-path parity (a valid issuesAvailable:false snapshot) is proven in report-listing-health.test.js.
+  assert.equal(r.status, "invalid", "gate passed to the wired derive");
 });
 
 test("content-changes derives compact events from saved rows", async () => {

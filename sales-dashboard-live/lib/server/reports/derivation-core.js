@@ -1347,3 +1347,173 @@ export function returnsLeakagePayload({
     catalogBrands: catalog.catalogBrands,
   };
 }
+
+/* ============================ Listing Health / Suppressed Listings ============================ */
+// PURE cores for Listing Health, transcribed VERBATIM from lib/server/reports/listing-health.js.
+// Primary source Listings (no-date) gives status / price / channel / quantities; optional Listings (Raw
+// JSON) adds Amazon's own issues + buyable/discoverable summaries + live-offer detection; Profit by SKU &
+// Date over a trailing 30d window gives sales/units/profit per SKU|currency (currencies NEVER merged);
+// the shared FBA inventory snapshot gives the latest available quantity; the shared catalog gives name/
+// brand. Reuses the shared sumField/brand/catalog/inventory folds. Zero transport imports.
+
+// JSON helpers -- byte-identical to listing-health.js.
+export function listingHealthParseJson(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "object") return value;
+  try { return JSON.parse(String(value)); } catch (e) { return null; }
+}
+
+// Amazon's issues array -> the first six { severity, code, message } the report shows; a row with no
+// usable field is dropped. Byte-identical to normaliseIssues.
+export function listingHealthNormaliseIssues(value) {
+  const parsed = listingHealthParseJson(value);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.slice(0, 6).map((issue) => ({
+    severity: String(issue?.severity || "").toUpperCase() || null,
+    code: issue?.code === undefined || issue?.code === null ? null : String(issue.code),
+    message: String(issue?.message || "").slice(0, 260) || null,
+  })).filter((issue) => issue.severity || issue.code || issue.message);
+}
+
+// `summaries` is an object OR a one-element array; only a genuinely-present buyable/discoverable flag is
+// reported. Byte-identical to normaliseSummary.
+export function listingHealthNormaliseSummary(value) {
+  const parsed = listingHealthParseJson(value);
+  const summary = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!summary || typeof summary !== "object") return { buyable: null, discoverable: null, status: null };
+  const statuses = Array.isArray(summary.status)
+    ? summary.status.map((entry) => String(entry).toUpperCase())
+    : Array.isArray(summary.statuses)
+      ? summary.statuses.map((entry) => String(entry).toUpperCase())
+      : null;
+  return {
+    buyable: statuses ? statuses.includes("BUYABLE") : null,
+    discoverable: statuses ? statuses.includes("DISCOVERABLE") : null,
+    status: statuses ? statuses.join(",") : null,
+  };
+}
+
+// A live offer is any parsed offer whose price amount is finite and > 0; null when there are no offers.
+// Byte-identical to hasLiveOffer.
+export function listingHealthHasLiveOffer(value) {
+  const parsed = listingHealthParseJson(value);
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  return parsed.some((offer) => {
+    const price = offer?.price?.amount ?? offer?.price ?? null;
+    const amount = Number(price);
+    return Number.isFinite(amount) && amount > 0;
+  });
+}
+
+// Fold Profit by SKU & Date to per-SKU sales/units/profit + the account currency set. First non-null
+// currency wins per SKU; currencies never merge. Byte-identical to listing-health.js's sales loop.
+export function listingHealthSalesFold(rows) {
+  const salesBySku = new Map();
+  const currencies = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const sku = String(row.sku || "").trim();
+    if (!sku) continue;
+    const currency = String(row.currency || "").trim() || null;
+    if (currency) currencies.add(currency);
+    const current = salesBySku.get(sku) || { sales: 0, units: 0, profit: 0, currency };
+    current.sales += smSumField(row, "sales_sum", "total_sales");
+    current.units += smSumField(row, "units_sum", "total_units_sold");
+    current.profit += smSumField(row, "profit_sum", "profit");
+    if (!current.currency && currency) current.currency = currency;
+    salesBySku.set(sku, current);
+  }
+  return { salesBySku, currencies };
+}
+
+// Fold the optional Listings (Raw JSON) rows to per-SKU { issues, summary, hasLiveOffer }. Blank-SKU rows
+// are skipped. Byte-identical to listing-health.js's rawBySku loop.
+export function listingHealthRawFold(rows) {
+  const rawBySku = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const sku = String(row.sku || "").trim();
+    if (!sku) continue;
+    rawBySku.set(sku, {
+      issues: listingHealthNormaliseIssues(row.issues),
+      summary: listingHealthNormaliseSummary(row.summaries),
+      hasLiveOffer: listingHealthHasLiveOffer(row.offers),
+    });
+  }
+  return rawBySku;
+}
+
+/**
+ * Full Listing Health payload, byte-identical to buildListingHealth() for the same saved rows. `issuesAvailable`
+ * + `issuesUnavailableReason` are resolved by the CALLER (the adapter distinguishes a validated Raw success
+ * from the approved degraded/disabled state); when issues are unavailable `rawRows` is [] so every row reports
+ * empty issues / null summary / null live-offer. Currencies never merge; inventory stock is null unless the
+ * snapshot carries the SKU; product-name precedence is catalog -> listing name; brand from catalog. Pure.
+ */
+export function listingHealthPayload({
+  accountId, asOf, salesFrom, windowDays, sourceLabel, salesSourceLabel, issuesSourceLabel,
+  issuesAvailable, issuesUnavailableReason, listingRows, salesRows, inventoryRows, catalogRows, rawRows,
+}) {
+  const { salesBySku, currencies } = listingHealthSalesFold(salesRows);
+  const inventory = buyBoxInventoryFold(inventoryRows);
+  const catalog = salesMoversCatalogFold(catalogRows);
+  const rawBySku = issuesAvailable ? listingHealthRawFold(rawRows) : new Map();
+
+  const rows = [];
+  for (const listing of Array.isArray(listingRows) ? listingRows : []) {
+    const sku = String(listing.sku || "").trim();
+    const asin = String(listing.child_asin || "").trim();
+    if (!sku && !asin) continue;
+    const meta = catalog.byAsin.get(asin) || {};
+    const sales = salesBySku.get(sku) || null;
+    const stock = sku ? inventory.bySku.get(sku) || null : null;
+    const raw = rawBySku.get(sku) || null;
+    const channelRaw = String(listing.listing_fulfillment_channel || "").trim().toUpperCase();
+
+    const fbaAvailable = num(listing.fba_quantity_available);
+    const listingQuantity = num(listing.listing_current_quantity);
+    const snapshotAvailable = stock ? num(stock.available) : null;
+
+    rows.push({
+      sku: sku || null,
+      asin: asin || null,
+      productName: meta.name || String(listing.listing_name || "").trim() || null,
+      brand: salesMoversBrandLabel(meta.brand),
+      listingStatus: String(listing.listing_status || "").trim() || null,
+      fulfillmentChannel: channelRaw ? (channelRaw === "DEFAULT" ? "FBM" : "FBA") : null,
+      fulfillmentChannelRaw: channelRaw || null,
+      price: listing.listing_price_value === null || listing.listing_price_value === undefined
+        ? null
+        : num(listing.listing_price_value),
+      currency: String(listing.listing_price_currency || "").trim() || sales?.currency || null,
+      listingQuantity,
+      fbaAvailable,
+      fbaInbound: num(listing.fba_quantity_inbound),
+      fbaReserved: num(listing.fba_quantity_reserved),
+      snapshotAvailable,
+      openDate: listing.listing_open_date || null,
+      sales30d: sales ? sales.sales : 0,
+      units30d: sales ? sales.units : 0,
+      profit30d: sales ? sales.profit : 0,
+      hasSalesData: Boolean(sales),
+      issues: raw ? raw.issues : [],
+      summary: raw ? raw.summary : null,
+      hasLiveOffer: raw ? raw.hasLiveOffer : null,
+    });
+  }
+
+  return {
+    accountId,
+    asOf,
+    salesWindow: { from: salesFrom, to: asOf, days: windowDays },
+    sourceLabel,
+    salesSourceLabel,
+    issuesAvailable,
+    issuesUnavailableReason,
+    issuesSourceLabel,
+    inventoryAvailable: inventory.available,
+    inventorySnapshotDate: inventory.snapshotDate,
+    currencies: [...currencies].sort(),
+    listingCount: (Array.isArray(listingRows) ? listingRows : []).length,
+    rows,
+    catalogBrands: catalog.catalogBrands,
+  };
+}

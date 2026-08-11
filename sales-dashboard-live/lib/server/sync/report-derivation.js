@@ -32,6 +32,7 @@ import {
   salesMoversUnavailablePayload,
   buyBoxLossPayload,
   returnsLeakagePayload,
+  listingHealthPayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -86,6 +87,17 @@ const RET_RETURNS_LABEL = "Returns (FBA & FBM)";
 const RET_MONEY_LABEL = "Settlements & P&L Components";
 const RET_RATE_LABEL = "Sales & Traffic by ASIN & Date";
 const RET_RATE_LAG_DAYS = 4;
+
+// Listing Health constants -- byte-identical to the live builder/sources: listing-health.js
+// SALES_WINDOW_DAYS (30), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), the source labels, and the
+// exact LISTINGS_RAW.enableHint shown when the optional Listings (Raw JSON) enrichment is disabled. The
+// derivation RECOMPUTES the sales/inventory windows from asOf and pins them, never trusting a caller.
+const LH_SALES_WINDOW_DAYS = 30;
+const LH_INVENTORY_LOOKBACK_DAYS = 10;
+const LH_SOURCE_LABEL = "Listings";
+const LH_SALES_SOURCE_LABEL = "Profit by SKU & Date";
+const LH_ISSUES_SOURCE_LABEL = "Listings (Raw JSON)";
+const LH_ISSUES_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable Listings (Raw JSON) to add Amazon's own listing issue codes, severities and suppression flags to this report.";
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -766,7 +778,86 @@ const REGISTRY = {
       return maxIsoDate(rows.map((r) => r && r.date));
     },
   },
-  "listing-health": { snapshotVersion: "listing-health/v2d-1", optionalRequestKeys: ["listing-health:listings-raw"], derivedSourceKeys: [], derive: null },
+  // Listing Health: reproduce the api/datadoe.js `listing-health` payload from the no-date Listings, the
+  // grouped 30d Sales, the shared FBA inventory snapshot, the shared no-date catalog, and the OPTIONAL
+  // no-date Listings (Raw JSON) enrichment. The four non-raw sources are required (fetch gate keeps the
+  // report PENDING until each succeeds); `listing-health:listings-raw` is OPTIONAL + degradable. Windows
+  // are RECOMPUTED from asOf and pinned; inventory ROW dates are validated real + inside [asOf-10d, asOf];
+  // a wrong-window/cross-account/malformed/bad-date fragment => invalid (LKG, zero writes); a missing/failed
+  // required source => unavailable (LKG). Currencies never merge; buy box is never evaluated. ZERO DataDoe/
+  // network calls (pure).
+  "listing-health": {
+    snapshotVersion: "listing-health/v2d-1",
+    optionalRequestKeys: ["listing-health:listings-raw"],
+    derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("listing-health derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      // rawSellerId (raw DataDoe seller id) is the SOLE source scope: DataDoe request scope + the id every
+      // fragment must carry (cross-account rejection). publicAccountId (context.accountId) is the public/
+      // prefixed id the report job + snapshot row are keyed by and is what the PAYLOAD carries.
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      const salesFrom = addDaysStr(asOf, -(LH_SALES_WINDOW_DAYS - 1));
+      const inventoryFrom = addDaysStr(asOf, -LH_INVENTORY_LOOKBACK_DAYS);
+      // The FOUR required sources must be a validated saved array (never an empty-success coercion).
+      for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"]) {
+        const s = sources[key];
+        if (!s || s.available !== true || !Array.isArray(s.rows)) {
+          throw deriveError(`listing-health ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+        }
+      }
+      // Listings + Catalog: exactly one single-account NO-DATE fragment each (from === null, to === null).
+      const listingRows = noDateFragmentRows(sources["listing-health:listings"], "listing-health:listings", rawSellerId);
+      const catalogRows = noDateFragmentRows(sources["listing-health:catalog"], "listing-health:catalog", rawSellerId);
+      // Sales: one single-account fragment over [asOf-29d, asOf]. Inventory: one over [asOf-10d, asOf].
+      const salesRows = singleAccountFragmentRows(sources["listing-health:sales"], "listing-health:sales", rawSellerId, salesFrom, asOf);
+      const inventoryRows = singleAccountFragmentRows(sources["listing-health:inventory"], "listing-health:inventory", rawSellerId, inventoryFrom, asOf);
+      // Optional Listings (Raw JSON) enrichment -- EXACT state handling:
+      //   validated success (incl. empty rows) => issuesAvailable true (build the raw fold);
+      //   the approved degraded/disabled availabilityPolicy => save a valid snapshot with issuesAvailable
+      //     false + the exact enable hint (a terminal-disabled policy would block instead);
+      //   pending / missing / failed-for-other-reasons / unreadable => unavailable (LKG preserved).
+      const rawSource = sources["listing-health:listings-raw"];
+      let issuesAvailable = true;
+      let issuesUnavailableReason = null;
+      let rawRows = [];
+      if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
+        rawRows = noDateFragmentRows(rawSource, "listing-health:listings-raw", rawSellerId);
+      } else if (rawSource && rawSource.disabled === true) {
+        const outcome = sourceDisabledOutcome(rawSource.disabledPolicy || null);
+        if (outcome.blocks) {
+          throw deriveError("listing-health:listings-raw is terminally disabled; snapshot blocked.", "blocked");
+        }
+        issuesAvailable = false;
+        issuesUnavailableReason = LH_ISSUES_ENABLE_HINT;
+      } else {
+        throw deriveError("listing-health:listings-raw is not a validated success and not the approved degraded/disabled state (pending/missing/failed/unreadable); last-known-good preserved.", "unavailable");
+      }
+      // Row-level validation: every listings / sales / catalog / raw row must be a plain object; every
+      // inventory row must carry a real calendar date inside [asOf-10d, asOf] (never silently filtered).
+      assertPlainObjectRows(listingRows, "listing-health listings");
+      assertPlainObjectRows(salesRows, "listing-health sales");
+      assertPlainObjectRows(catalogRows, "listing-health catalog");
+      assertPlainObjectRows(rawRows, "listing-health listings-raw");
+      assertRowsInWindow(inventoryRows, inventoryFrom, asOf, "listing-health inventory");
+      return listingHealthPayload({
+        accountId: publicAccountId, asOf, salesFrom, windowDays: LH_SALES_WINDOW_DAYS,
+        sourceLabel: LH_SOURCE_LABEL, salesSourceLabel: LH_SALES_SOURCE_LABEL, issuesSourceLabel: LH_ISSUES_SOURCE_LABEL,
+        issuesAvailable, issuesUnavailableReason,
+        listingRows, salesRows, inventoryRows, catalogRows, rawRows,
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
+      && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && typeof p.issuesAvailable === "boolean"
+      && !!p.salesWindow && typeof p.salesWindow === "object" && ("inventoryAvailable" in p)
+      && ("inventorySnapshotDate" in p) && ("listingCount" in p) && ("issuesUnavailableReason" in p),
+    // Latest real data date = the validated inventory snapshot date (source evidence), or null. Never asOf /
+    // fetched_at / saved_at / Date.now().
+    latestDataDate: (p) => (p && p.inventoryAvailable && isValidCalendarDate(p.inventorySnapshotDate) ? p.inventorySnapshotDate : null),
+  },
   "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },
   "ppc-performance": { snapshotVersion: "ppc-performance/v2d-1", optionalRequestKeys: ["ppc-performance:total-sales"], derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"], derive: null },
 };
