@@ -6198,3 +6198,31 @@ migrations, controls, schedules untouched. Returns stays SHADOW ONLY + locked.
 `test:source-identity` **7**; full `npm run verify` **720 assertions** (was 713) + 2,394-module production
 build (exit 0); `git diff --check` clean; only the two intended files changed (+ untracked `HANDOFF.md`).
 Nothing pushed/merged/deployed/migrated/unlocked/enabled/scheduled.
+
+## Scheduler v2: Returns & Refund Leakage approved (Codex, 2026-08-11)
+
+Re-reviewed correction commits `aceb3b6`, `a8785d0`, and `8281348` on top of
+review base `3726e3f`. No findings remain. The prior empty-source repro now derives
+successfully with `latestDataDate: null`; validated Returns rows ending on
+`2025-07-31` persist exactly `2025-07-31`, never the requested `asOf`. Invalid,
+future, or out-of-window Returns dates remain typed invalid with zero snapshot
+writes and last-known-good preserved. A folded-out empty-ASIN row correctly still
+counts as source freshness evidence.
+
+The internal third `latestDataDate(payload, context, sources)` argument is supplied
+only after successful source validation and payload validation. Existing adapters
+ignore it; the Buy Box compatibility regression remains green. The live route,
+Returns builder, pure Returns payload core, source contracts, request identity,
+planner, generic driver, Scheduler v1, frontend, migrations, report controls, and
+schedules are byte-unchanged from the review base. Returns remains SHADOW ONLY and
+locked.
+
+Independent verification from the checked-out worktree: direct Returns **35**;
+`test:report-derivation` **321**; `test:sync-engine` **79**;
+`test:report-contracts` **161**; `test:source-identity` **7**; full
+`npm run verify` **720 assertions** plus the 2,394-module production build, all exit
+0; `git diff --check` clean. Only untracked `HANDOFF.md` remains and was not touched.
+
+Returns & Refund Leakage is approved as a shadow derivation/planning tranche. The
+next focused tranche is Listing Health only; do not unlock, schedule, deploy, or
+start PPC/Listing Optimizer in the same tranche.
