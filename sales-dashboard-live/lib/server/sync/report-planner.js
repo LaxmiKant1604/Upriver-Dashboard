@@ -16,7 +16,7 @@
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
-import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr } from "../date-windows.js";
+import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 
@@ -43,7 +43,15 @@ const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
 const SM_INVENTORY_LOOKBACK_DAYS = 10;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation"]);
+// Buy Box Loss lookbacks (days) -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28)
+// + SLICE_DAYS (7) fetch the raw daily grain as four ordered 7-day slices; the shared FBA inventory
+// snapshot looks back FBA_INVENTORY_HEALTH.snapshotLookbackDays (10). So the scheduled windows match the
+// live route exactly, and the derivation (which recomputes the same windows) validates them by construction.
+const BB_WINDOW_DAYS = 28;
+const BB_SLICE_DAYS = 7;
+const BB_INVENTORY_LOOKBACK_DAYS = 10;
+
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss"]);
 
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
 // are staged per account by runKeywordRankShadowCycle (keyword-rank-cycle.js). It therefore has ONE
@@ -321,6 +329,39 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
   };
 }
 
+/**
+ * Plan Buy Box Loss for ONE account. Emits the exact route windows: the raw daily grain (Profit by SKU &
+ * Date) as FOUR ordered non-overlapping 7-day slices covering [asOf-27d, asOf] (splitDateRangeByDays, the
+ * SAME helper the builder + derivation use, so the four slices agree by construction), the shared FBA
+ * inventory snapshot over [asOf-10d, asOf], and the shared no-date catalog -- all for the one raw seller
+ * id. All three sources are INDEPENDENTLY required (no probe / staged activation), so Buy Box uses the
+ * generic owner-scoped source cycle, never a dedicated staged-cycle driver. Shared inventory/catalog
+ * canonical hashes dedupe with Sales Movers + other insight reports.
+ */
+export function planBuyBoxLoss({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const from = addDaysStr(end, -(BB_WINDOW_DAYS - 1));
+  const windowsByRequestKey = {
+    "buy-box-loss:daily": splitDateRangeByDays(from, end, BB_SLICE_DAYS),
+    "buy-box-loss:inventory": [{ from: addDaysStr(end, -BB_INVENTORY_LOOKBACK_DAYS), to: end }],
+    "buy-box-loss:catalog": [{ from: null, to: null }],
+  };
+  const sources = reportSourceRequestHashes({
+    reportKey: "buy-box-loss", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "buy-box-loss",
+    reportVersion: REPORT_DERIVATIONS["buy-box-loss"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "buy-box-loss", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+}
+
 // Generic single-shot planners ONLY. keyword-rank + sales-movers are deliberately absent: they are staged
 // by their own account-scoped shadow cycles (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
 const PLANNERS = {
@@ -328,6 +369,7 @@ const PLANNERS = {
   "sku-pl": planSkuPl,
   "fba-plan": planFbaPlan,
   reconciliation: planReconciliation,
+  "buy-box-loss": planBuyBoxLoss,
 };
 
 /**
