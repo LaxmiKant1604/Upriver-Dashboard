@@ -27,6 +27,9 @@ import {
   fbaPlanPayload,
   keywordRankPayload,
   sqpDistinctPeriods,
+  salesMoversLatestReportedDate,
+  salesMoversPayload,
+  salesMoversUnavailablePayload,
 } from "../reports/derivation-core.js";
 import {
   declaredReportKeys,
@@ -36,6 +39,7 @@ import {
   resolveDailyAdsAvailability,
   validateSkuPlMonthlyWindows,
   isValidCalendarDate,
+  salesMoversWindows,
 } from "./report-source-contracts.js";
 // planMonthWindows/addDaysStr are shared dependency-free window helpers (byte-identical to the
 // api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
@@ -53,6 +57,14 @@ const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 // the long window). The derivation RECOMPUTES both window starts from asOf and pins both endpoints.
 const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_LONG_LOOKBACK_DAYS = 365;
+
+// Sales Movers constants -- byte-identical to the live builder/sources: SALES_TRAFFIC.lagDays (4),
+// sales-movers.js WINDOW_DAYS (7), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), SALES_TRAFFIC.label.
+// The derivation RECOMPUTES the probe/inventory windows from asOf and pins them, never trusting a caller.
+const SM_LAG_DAYS = 4;
+const SM_WINDOW_DAYS = 7;
+const SM_INVENTORY_LOOKBACK_DAYS = 10;
+const SM_SOURCE_LABEL = "Sales & Traffic by ASIN & Date";
 
 // Shadow-mode namespace: v2 snapshots are written under a namespaced report_key so they can
 // NEVER collide with (or overwrite) a production report_snapshots row. Comparison helpers map
@@ -119,6 +131,52 @@ function singleAccountFragmentRows(source, key, rawSellerId, wantFrom, wantTo) {
     && (rawSellerId == null || String(ids[0]).trim() === String(rawSellerId));
   if (!ok) throw new Error(`${key} must be exactly one single-account fragment for its window; snapshot blocked.`);
   return source.rows;
+}
+
+// Sales Movers: traffic and ads must each be EXACTLY the two ordered single-account fragments
+// [recent, prior] whose windows equal salesMoversWindows(latest). A positional window match rejects a
+// reordered/duplicate/partial/extra/missing/cross-account/overlapping fragment. Returns the ordered
+// fragments (with rows) or throws (=> derive-invalid => last-known-good preserved).
+function validateSalesMoversOrderedWindows(source, expected, rawSellerId, key) {
+  const frags = (source && source.fragments) || [];
+  if (frags.length !== expected.length) {
+    throw new Error(`${key} must be exactly ${expected.length} ordered single-account fragments (recent, prior); snapshot blocked.`);
+  }
+  for (let i = 0; i < expected.length; i += 1) {
+    const f = frags[i];
+    const ids = f && f.sellerOrVendorIds;
+    const ok = !!f && typeof f === "object" && !Array.isArray(f)
+      && f.from === expected[i].from && f.to === expected[i].to
+      && Array.isArray(ids) && ids.length === 1
+      && (rawSellerId == null || String(ids[0]).trim() === String(rawSellerId));
+    if (!ok) {
+      throw new Error(`${key} fragment ${i} does not match its expected single-account window ${expected[i].from}..${expected[i].to}; snapshot blocked.`);
+    }
+  }
+  return frags;
+}
+
+// Sales Movers catalog: exactly ONE single-account NO-DATE fragment (from === null, to === null). A dated
+// or multi/zero fragment throws => derive-invalid => last-known-good preserved.
+function noDateFragmentRows(source, key, rawSellerId) {
+  const frags = (source && source.fragments) || [];
+  const f = frags.length === 1 ? frags[0] : null;
+  const ids = f && f.sellerOrVendorIds;
+  const ok = !!f && f.from === null && f.to === null
+    && Array.isArray(ids) && ids.length === 1
+    && (rawSellerId == null || String(ids[0]).trim() === String(rawSellerId));
+  if (!ok) throw new Error(`${key} must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.`);
+  return source.rows;
+}
+
+// Every saved fragment row must be a plain object (a non-object row is malformed source data): one such
+// row makes the report invalid (throws => derive-invalid => zero snapshot writes => last-known-good kept).
+function assertPlainObjectRows(rows, label) {
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`${label} contains a non-object row; snapshot blocked (invalid).`);
+    }
+  }
 }
 
 // Typed-throw helpers so the derive can raise blocked / unavailable (not just invalid). A
@@ -472,7 +530,80 @@ const REGISTRY = {
     // The latest data date is the most recent SQP period in the chosen cadence (date-only already).
     latestDataDate: (p) => maxIsoDate((p.periods || []).map(String)),
   },
-  "sales-movers": { snapshotVersion: "sales-movers/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
+  // Sales Movers: reproduce the api/datadoe.js `sales-movers` payload from the validated saved fragments.
+  // The latest-date PROBE is the only required source; a validated probe with NO reported date derives the
+  // honest dataUnavailable snapshot (no traffic/ads/inventory/catalog requested). A validated probe WITH a
+  // date requires the two-window traffic + ads, the shared inventory snapshot, and the shared no-date
+  // catalog (all optional in the static gate so the no-data path never blocks; the derive enforces them
+  // conditionally). Windows are recomputed from asOf + the probe date and pinned; a missing/failed/
+  // unreadable downstream => unavailable (LKG preserved); a wrong/reordered/duplicate/cross-account/
+  // out-of-window/malformed fragment => invalid (zero writes, LKG preserved). Advertising is never
+  // combined across currencies; inventory is null unless the snapshot is available; buy box is never
+  // evaluated. ZERO DataDoe/network calls (pure).
+  "sales-movers": {
+    snapshotVersion: "sales-movers/v2d-1",
+    optionalRequestKeys: ["sales-movers:traffic", "sales-movers:ads", "sales-movers:inventory", "sales-movers:catalog"],
+    derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("sales-movers derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      // accountId in the live payload is ids[0] (the raw seller id); rawSellerId scopes every fragment.
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const probeFrom = addDaysStr(asOf, -(SM_LAG_DAYS + SM_WINDOW_DAYS * 3));
+      // Required PROBE: exactly one single-account fragment over [probeFrom, asOf]; every row a plain
+      // object with a real calendar date inside that window (recompute the window; never trust the caller).
+      const probeRows = singleAccountFragmentRows(sources["sales-movers:sales-latest-probe"], "sales-movers:sales-latest-probe", rawSellerId, probeFrom, asOf);
+      assertSqpRowsInWindow(probeRows, probeFrom, asOf, "sales-movers latest-date probe");
+      const latestReportedDate = salesMoversLatestReportedDate(probeRows);
+      if (!latestReportedDate) {
+        // Validated probe, no reported units => a VALID completed dataUnavailable snapshot; no downstream.
+        return salesMoversUnavailablePayload({ accountId: rawSellerId, asOf, lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, probeFrom });
+      }
+      // The reported date must fall inside the probe window; the recent/prior weeks derive from it.
+      if (latestReportedDate < probeFrom || latestReportedDate > asOf) {
+        throw new Error(`sales-movers latest reported date ${latestReportedDate} is outside the probe window ${probeFrom}..${asOf}; snapshot blocked.`);
+      }
+      const { recent, prior } = salesMoversWindows(latestReportedDate);
+      // Downstream is REQUIRED now. A missing/failed/unreadable required source => unavailable (LKG kept).
+      for (const key of ["sales-movers:traffic", "sales-movers:ads", "sales-movers:inventory", "sales-movers:catalog"]) {
+        const s = sources[key];
+        if (!s || s.available !== true || !Array.isArray(s.rows)) {
+          throw deriveError(`sales-movers ${key} is required (validated probe date) but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+        }
+      }
+      // Traffic + Ads: exactly two ordered single-account fragments [recent, prior].
+      const trafficFrags = validateSalesMoversOrderedWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
+      const adsFrags = validateSalesMoversOrderedWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
+      // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
+      const inventoryFrom = addDaysStr(asOf, -SM_INVENTORY_LOOKBACK_DAYS);
+      const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryFrom, asOf);
+      // Catalog: exactly one single-account no-date fragment.
+      const catalogRows = noDateFragmentRows(sources["sales-movers:catalog"], "sales-movers:catalog", rawSellerId);
+      // Every saved fragment row must be a plain object.
+      assertPlainObjectRows(trafficFrags[0].rows, "sales-movers traffic (recent)");
+      assertPlainObjectRows(trafficFrags[1].rows, "sales-movers traffic (prior)");
+      assertPlainObjectRows(adsFrags[0].rows, "sales-movers ads (recent)");
+      assertPlainObjectRows(adsFrags[1].rows, "sales-movers ads (prior)");
+      assertPlainObjectRows(inventoryRows, "sales-movers inventory");
+      assertPlainObjectRows(catalogRows, "sales-movers catalog");
+      return salesMoversPayload({
+        accountId: rawSellerId, asOf, latestReportedDate, recent, prior,
+        lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, windowDays: SM_WINDOW_DAYS,
+        recentTrafficRows: trafficFrags[0].rows, priorTrafficRows: trafficFrags[1].rows,
+        recentAdsRows: adsFrags[0].rows, priorAdsRows: adsFrags[1].rows,
+        inventoryRows, catalogRows,
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && typeof p.dataUnavailable === "boolean"
+      && Array.isArray(p.rows) && Array.isArray(p.catalogBrands) && ("salesLatestDate" in p)
+      && (p.dataUnavailable === true
+        || (Array.isArray(p.currencies) && p.buyBoxEvaluated === false && ("inventoryAvailable" in p)
+          && ("inventorySnapshotDate" in p) && !!p.windows && typeof p.windows === "object")),
+    // Latest real data date = the latest reported sales date (date-only already), null when unavailable.
+    latestDataDate: (p) => (isValidCalendarDate(p && p.salesLatestDate) ? p.salesLatestDate : null),
+  },
   "buy-box-loss": { snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "returns-leakage": { snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [], derive: null },
   "listing-health": { snapshotVersion: "listing-health/v2d-1", optionalRequestKeys: ["listing-health:listings-raw"], derivedSourceKeys: [], derive: null },

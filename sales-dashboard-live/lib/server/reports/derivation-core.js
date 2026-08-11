@@ -714,3 +714,246 @@ export function keywordRankPayload({ accountId, cadence, periods, weeklyPeriodCo
     retrievedAt,
   };
 }
+
+// ---- Sales Movers cores -------------------------------------------------------------------
+//
+// Verbatim PURE transcription of the post-fetch folds in lib/server/reports/sales-movers.js and
+// lib/server/reports/common.js -- operating on ALREADY-SAVED source rows instead of DataDoe exports, so
+// this module keeps its ZERO DataDoe/Supabase/network import boundary. The assembled payload is
+// byte-identical to buildSalesMovers() for the same rows. Only the fields the Sales Movers payload
+// actually consumes are folded (prices are per-SKU and unused here).
+
+// numOrNull: preserve "no value" so a missing days-of-supply is null, never a fabricated 0. Byte-identical
+// to lib/server/datadoe.js numOrNull.
+const numOrNull = (v) => {
+  if (v === null || v === undefined || v === "") return null;
+  const value = Number(v);
+  return Number.isFinite(value) ? value : null;
+};
+// Grouped-export sum helper (alias or raw column). Byte-identical to common.js sumField.
+const smSumField = (row, alias, column) => num(row[alias] ?? row[column]);
+// Brand label: trimmed value or "Unassigned". Byte-identical to common.js brandLabel.
+export function salesMoversBrandLabel(value) {
+  return String(value || "").trim() || "Unassigned";
+}
+function smEmptyWindowTotals() {
+  return { sales: 0, units: 0, orders: 0, sessions: 0, pageViews: 0, unitsShipped: 0, unitsRefunded: 0 };
+}
+
+// Latest reported sales date from probe rows: the max `date` whose units are > 0 (a newer zero-units
+// placeholder must NOT anchor a window). Byte-identical to source-signals latestReportedDateFromProbeRows.
+export function salesMoversLatestReportedDate(rows) {
+  let latest = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const date = row && (row.date ?? row.metric_date);
+    if (date && num(row.units_sum ?? row.total_units) > 0 && (!latest || date > latest)) latest = date;
+  }
+  return latest;
+}
+
+// Traffic window fold -> { byAsin, nameByAsin }. Verbatim from sales-movers.js fetchTrafficWindow.
+export function salesMoversTrafficFold(rows) {
+  const byAsin = new Map();
+  const nameByAsin = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const name = String(row.product_name || "").trim();
+    if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
+    const current = byAsin.get(asin) || smEmptyWindowTotals();
+    current.sales += smSumField(row, "sales_sum", "total_sales");
+    current.units += smSumField(row, "units_sum", "total_units");
+    current.orders += smSumField(row, "orders_sum", "total_orders");
+    current.sessions += smSumField(row, "sessions_sum", "session");
+    current.pageViews += smSumField(row, "page_views_sum", "page_views");
+    current.unitsShipped += smSumField(row, "units_shipped_sum", "units_shipped");
+    current.unitsRefunded += smSumField(row, "units_refunded_sum", "units_refunded");
+    byAsin.set(asin, current);
+  }
+  return { byAsin, nameByAsin };
+}
+
+// Ads window fold -> { byAsin (per-ASIN spend/sales/clicks + mixedCurrency/currency), currencies sorted }.
+// Verbatim from sales-movers.js fetchAdsWindow: advertising is NEVER combined across currencies.
+export function salesMoversAdsFold(rows) {
+  const byAsin = new Map();
+  const currencies = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const currency = String(row.currency || "").trim();
+    if (currency) currencies.add(currency);
+    const current = byAsin.get(asin) || { spend: 0, sales: 0, clicks: 0, currencies: new Set() };
+    current.spend += smSumField(row, "ad_spend_sum", "ad_spend");
+    current.sales += smSumField(row, "ad_sales_sum", "ad_sales");
+    current.clicks += smSumField(row, "ad_clicks_sum", "ad_clicks");
+    if (currency) current.currencies.add(currency);
+    byAsin.set(asin, current);
+  }
+  for (const entry of byAsin.values()) {
+    entry.mixedCurrency = entry.currencies.size > 1;
+    entry.currency = entry.currencies.size === 1 ? [...entry.currencies][0] : null;
+  }
+  return { byAsin, currencies: [...currencies].sort() };
+}
+
+// Advertising figures for one ASIN across both windows; withheld (null) when EITHER window is
+// mixed-currency. Verbatim from sales-movers.js adsFor.
+export function salesMoversAdsFor(recent, prior) {
+  const mixed = Boolean(recent?.mixedCurrency || prior?.mixedCurrency);
+  if (mixed) {
+    return {
+      recentSpend: null, recentSales: null, recentClicks: null,
+      priorSpend: null, priorSales: null, priorClicks: null,
+      currency: null, mixedCurrency: true,
+    };
+  }
+  return {
+    recentSpend: num(recent?.spend),
+    recentSales: num(recent?.sales),
+    recentClicks: num(recent?.clicks),
+    priorSpend: num(prior?.spend),
+    priorSales: num(prior?.sales),
+    priorClicks: num(prior?.clicks),
+    currency: recent?.currency || prior?.currency || null,
+    mixedCurrency: false,
+  };
+}
+
+// Inventory fold: pick the LATEST snapshot date present, then fold that snapshot to ASIN. `available` is
+// false when the whole snapshot is missing (=> the payload renders null stock, never zero). Verbatim from
+// common.js fetchInventorySnapshot (only the byAsin fields the Sales Movers payload reads).
+export function salesMoversInventoryFold(rows) {
+  const all = Array.isArray(rows) ? rows : [];
+  let snapshotDate = null;
+  for (const row of all) {
+    if (row && row.date && (!snapshotDate || row.date > snapshotDate)) snapshotDate = row.date;
+  }
+  const current = snapshotDate ? all.filter((row) => row.date === snapshotDate) : [];
+  const byAsin = new Map();
+  for (const row of current) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const entry = {
+      available: num(row.available),
+      unfulfillable: num(row.unfulfillable_quantity),
+      inbound: num(row.inbound_shipped) + num(row.inbound_received),
+      daysOfSupply: numOrNull(row.days_of_supply),
+      unitsShippedT30: num(row.units_shipped_t30),
+    };
+    const folded = byAsin.get(asin) || { asin, available: 0, unfulfillable: 0, inbound: 0, unitsShippedT30: 0, daysOfSupply: null, skuCount: 0 };
+    folded.available += entry.available;
+    folded.unfulfillable += entry.unfulfillable;
+    folded.inbound += entry.inbound;
+    folded.unitsShippedT30 += entry.unitsShippedT30;
+    if (entry.daysOfSupply !== null) {
+      folded.daysOfSupply = folded.daysOfSupply === null ? entry.daysOfSupply : Math.min(folded.daysOfSupply, entry.daysOfSupply);
+    }
+    folded.skuCount += 1;
+    byAsin.set(asin, folded);
+  }
+  return { snapshotDate, available: current.length > 0, byAsin };
+}
+
+// Catalog fold -> { byAsin {name, brand, parentAsin}, catalogBrands locale-sorted }. Verbatim from
+// common.js fetchCatalog.
+export function salesMoversCatalogFold(rows) {
+  const byAsin = new Map();
+  const brands = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin) continue;
+    const brand = String(row.product_brand || "").trim();
+    if (brand) brands.add(brand);
+    if (!byAsin.has(asin)) {
+      byAsin.set(asin, {
+        name: String(row.product_name || "").trim() || null,
+        brand: brand || null,
+        parentAsin: String(row.parent_asin || "").trim() || null,
+      });
+    }
+  }
+  return { byAsin, catalogBrands: [...brands].sort((a, b) => a.localeCompare(b)) };
+}
+
+/**
+ * Full Sales Movers payload, byte-identical to buildSalesMovers() for the same saved rows. Zero-tail
+ * ASINs (both windows fully zero) are dropped; product-name precedence is catalog -> recent traffic ->
+ * prior traffic; inventory is null unless the snapshot is available; buy box is never evaluated. Pure.
+ */
+export function salesMoversPayload({
+  accountId, asOf, latestReportedDate, recent, prior, lagDays, sourceLabel, windowDays,
+  recentTrafficRows, priorTrafficRows, recentAdsRows, priorAdsRows, inventoryRows, catalogRows,
+}) {
+  const recentTraffic = salesMoversTrafficFold(recentTrafficRows);
+  const priorTraffic = salesMoversTrafficFold(priorTrafficRows);
+  const recentAds = salesMoversAdsFold(recentAdsRows);
+  const priorAds = salesMoversAdsFold(priorAdsRows);
+  const inventory = salesMoversInventoryFold(inventoryRows);
+  const catalog = salesMoversCatalogFold(catalogRows);
+
+  const asins = new Set([...recentTraffic.byAsin.keys(), ...priorTraffic.byAsin.keys()]);
+  const rows = [];
+  for (const asin of asins) {
+    const recentTotals = recentTraffic.byAsin.get(asin) || smEmptyWindowTotals();
+    const priorTotals = priorTraffic.byAsin.get(asin) || smEmptyWindowTotals();
+    // Drop the permanent zero tail this source emits for every catalog ASIN.
+    if (
+      recentTotals.sales === 0 && priorTotals.sales === 0
+      && recentTotals.units === 0 && priorTotals.units === 0
+      && recentTotals.sessions === 0 && priorTotals.sessions === 0
+    ) continue;
+    const meta = catalog.byAsin.get(asin) || {};
+    const stock = inventory.byAsin.get(asin) || null;
+    rows.push({
+      asin,
+      productName: meta.name || recentTraffic.nameByAsin.get(asin) || priorTraffic.nameByAsin.get(asin) || null,
+      brand: salesMoversBrandLabel(meta.brand),
+      recent: recentTotals,
+      prior: priorTotals,
+      ads: salesMoversAdsFor(recentAds.byAsin.get(asin), priorAds.byAsin.get(asin)),
+      inventory: inventory.available
+        ? {
+          available: num(stock?.available),
+          inbound: num(stock?.inbound),
+          daysOfSupply: stock?.daysOfSupply ?? null,
+          unitsShippedT30: num(stock?.unitsShippedT30),
+        }
+        : null,
+    });
+  }
+  const currencies = [...new Set([...recentAds.currencies, ...priorAds.currencies])];
+  return {
+    accountId,
+    asOf,
+    salesLatestDate: latestReportedDate,
+    lagDays,
+    sourceLabel,
+    dataUnavailable: false,
+    windows: { recent, prior, days: windowDays },
+    currencies,
+    buyBoxEvaluated: false,
+    inventoryAvailable: inventory.available,
+    inventorySnapshotDate: inventory.snapshotDate,
+    rows,
+    catalogBrands: catalog.catalogBrands,
+  };
+}
+
+// The honest "no completed week to compare" payload -- a VALID completed snapshot when the probe reported
+// no latest sales date. Byte-identical to buildSalesMovers()'s early return. NEVER converts missing sales
+// into zero, and requests no downstream sources.
+export function salesMoversUnavailablePayload({ accountId, asOf, lagDays, sourceLabel, probeFrom }) {
+  return {
+    accountId,
+    asOf,
+    salesLatestDate: null,
+    lagDays,
+    sourceLabel,
+    dataUnavailable: true,
+    unavailableReason: `${sourceLabel} reported no units for this account between ${probeFrom} and ${asOf}, so there is no completed week to compare. This is upstream source availability, not a zero-sales week.`,
+    windows: null,
+    rows: [],
+    catalogBrands: [],
+  };
+}
