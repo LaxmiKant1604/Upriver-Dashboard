@@ -2702,6 +2702,52 @@ reconfirmed in DataDoe) -- not a code bug. The code intentionally does NOT guess
 back to the obsolete long id. Until DataDoe returns rows, the directory correctly reports the accounts
 as `PRODUCT_CATALOG_SOURCE_UNAVAILABLE` while preserving any previously saved brand maps.
 
+#### Re-review: deadline safety, idempotency, usable-mapping, cumulative failures (2026-08-12)
+
+Four Codex re-review blockers on `feature/brand-view-catalog-retry-hotfix`. Nothing pushed/merged/
+deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits `00bbf2d`
+(server), `cef9053` (client), `b2e1369` (tests), + this docs commit. Files: `api/datadoe.js`,
+`src/App.jsx`, `scripts/test-source-cache.mjs`.
+
+1. **Deadline-safe batching.** `BRAND_CATALOG_BATCH_SIZE = 1` -- EXACTLY ONE Product Catalog export
+   per invocation. `pollExport` can run ~45s (9x5s) plus create+download, so a second export in the
+   same request could exceed Vercel's 60s; one-per-invocation is the strict, provable budget. A slow
+   export can never consume the next cursor item (the next item is untouched this request); the browser
+   continues one account per request. DataDoe exports are never parallelised.
+2. **Cumulative typed failures preserved across batches.** Previously a failure that preserved a
+   complete LKG map vanished from the summary when the next continuation reread the "complete" snapshot.
+   Now every attempt records a durable, action-scoped marker on the snapshot
+   (`catalogAttemptActionId` / `catalogAttemptStatus` / `catalogAttemptCode`) -- for a LKG-preserved
+   failure the brand map + success time are untouched and ONLY the typed attempt is written.
+   `sharedSnapshotBrandAccounts` returns `catalogActionFailures`, so the final summary unions
+   never-covered accounts AND this-action LKG-preserved failures. Only typed safe codes, never raw errors.
+3. **Usable mapping required for success.** `usableCatalogBrands` requires a non-empty `child_asin`
+   joined to a real non-empty `product_brand` ("Unassigned" excluded). `{child_asin:"",
+   product_brand:"Bebi Born"}` => `PRODUCT_CATALOG_EMPTY`, preserve LKG, never save complete coverage.
+4. **Once-per-action / durable idempotency.** The client mints one `catalogSyncActionId` per explicit
+   refresh and sends it on every request. `syncAccountBrandCatalog` SKIPS the export and returns the
+   recorded outcome when the account was already attempted under that action id, so replaying or
+   tampering with a continuation spends ZERO duplicate export (a genuinely new action id re-attempts,
+   as a new user action). Fail closed: the continuation cursor is re-authorised + primary-filtered +
+   deduped every request, the action id is validated to a safe token shape, dd-secondary ids are
+   skipped read-only, and the refresh is admin-only server-side.
+
+Unchanged: short source id `68d2de238e` only in create-export; obsolete long id remains a
+canonical/cache alias, never posted, no fallback; `request_hash` stable via the `product-catalog`
+contract key.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **23** (+5: one-export-per-invocation/slow-export, blank-ASIN unusable, blank-ASIN e2e
+=> EMPTY, replay-zero-duplicate-export, early-batch LKG failure in the final cumulative summary; plus
+the 15=>15-attempt and short-id/no-leak tests retained) + `build:check` **2,394 modules**; `git diff
+--check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** This is a retry-flow + data-safety fix; it does NOT make
+Product Catalog available. The short id `68d2de238e` still returns **404 Source not found** in
+production for the tested primary account -- an UPSTREAM primary-organization source-access/config
+issue (enable/authorize "Product Catalog by ASIN" and reconfirm its live short id in DataDoe). The
+code never guesses another id or falls back to the obsolete long id.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
