@@ -21,6 +21,8 @@ import {
   validCatalogActionId,
   catalogSyncEligibleAccounts,
   mergeAccountDirectory,
+  orchestrateBrandCatalogAction,
+  pruneBrandCatalogActionRecords,
   BRAND_CATALOG_BATCH_SIZE,
   SAFE_CATALOG_CODES,
   CATALOG_SOURCE_UNAVAILABLE,
@@ -28,6 +30,8 @@ import {
   CATALOG_TRUNCATED,
   CATALOG_FETCH_FAILED,
   CATALOG_ATTEMPT_PENDING,
+  BRAND_DIRECTORY_ACTION_CONFLICT,
+  BRAND_DIRECTORY_ACTION_UNAVAILABLE,
 } from "../api/datadoe.js";
 import { mergeDiscoveredDataDoeAccounts, resolveDataDoeAccountIds } from "../lib/server/datadoe-connections.js";
 
@@ -713,6 +717,272 @@ await asyncTest("blocker 6: adding accounts needs NO source-code account or coun
     ["zz-brandnew-1", "zz-brandnew-2"],
     "both are scheduled purely from their discovered ids",
   );
+});
+
+/* =============== Server-owned action manifest orchestration (blockers 1-3) =============== */
+
+// In-memory action-manifest store. loadManifest deep-copies so the orchestrator's own
+// object never aliases the stored row; saveManifest deep-copies in. manifest() returns the
+// RAW stored row so a test can simulate the server reordering the authoritative queue.
+function makeManifestStore() {
+  const manifests = new Map();
+  return {
+    manifests,
+    loadManifest: (actionId) => Promise.resolve(manifests.has(actionId) ? JSON.parse(JSON.stringify(manifests.get(actionId))) : null),
+    saveManifest: (actionId, manifest) => { manifests.set(actionId, JSON.parse(JSON.stringify(manifest))); return Promise.resolve(); },
+    manifest: (actionId) => manifests.get(actionId) || null,
+  };
+}
+// Directory shape sharedSnapshotBrandAccounts returns; only the fields the orchestrator reads.
+const dir = (pending = [], unavailable = []) => ({ catalogPendingAccountIds: new Set(pending.map(String)), catalogUnavailable: new Map(unavailable.map((id) => [String(id), CATALOG_SOURCE_UNAVAILABLE])) });
+const ORCH_CONNS = [PRIMARY];
+// A counting fetchCatalog: one call == one DataDoe export. Records the short source id + account.
+function countingFetch() {
+  const calls = { n: 0, accounts: [], sourceIds: [] };
+  const fetchCatalog = ({ sourceId, rawAccountId }) => { calls.n += 1; calls.accounts.push(rawAccountId); calls.sourceIds.push(sourceId); return [{ child_asin: `${rawAccountId}-A1`, product_brand: `Brand-${rawAccountId}` }]; };
+  return { calls, fetchCatalog };
+}
+const firstClick = (actionId, ids, directory, deps, extra = {}) => orchestrateBrandCatalogAction(
+  { actionId, userId: "admin-1", isContinuation: false, authorizedPrimaryIds: ids, directory, connections: ORCH_CONNS, ...extra }, deps);
+const continueAction = (actionId, cursor, ids, deps, extra = {}) => orchestrateBrandCatalogAction(
+  { actionId, userId: "admin-1", isContinuation: true, clientCursor: cursor, authorizedPrimaryIds: ids, directory: {}, connections: ORCH_CONNS, ...extra }, deps);
+
+await asyncTest("orchestration 1: start ACT1 then continue with ACT2 -> 409, zero DataDoe exports", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  const r1 = await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), deps);
+  assert.equal(r1.conflict, false, "ACT1 first click is valid");
+  assert.equal(calls.n, 1, "ACT1 attempted exactly one account (one export)");
+  const before = calls.n;
+  const r2 = await continueAction("ACT2", ["A2"], ["A1", "A2"], deps);
+  assert.equal(r2.conflict, true, "a continuation under a different action id is a conflict");
+  assert.equal(r2.code, BRAND_DIRECTORY_ACTION_CONFLICT);
+  assert.equal(calls.n, before, "the ACT2 continuation created ZERO exports");
+});
+
+await asyncTest("orchestration 2: unknown-action continuation -> 409, zero exports", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const r = await continueAction("NEVER-STARTED", ["A1"], ["A1"], { ...cat, ...man, fetchCatalog });
+  assert.equal(r.conflict, true, "a continuation never creates an action implicitly");
+  assert.equal(r.code, BRAND_DIRECTORY_ACTION_CONFLICT);
+  assert.equal(calls.n, 0, "zero exports");
+});
+
+await asyncTest("orchestration 3: changed admin/user on a continuation -> 409, zero exports", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), deps); // created by admin-1
+  const before = calls.n;
+  const r = await orchestrateBrandCatalogAction({ actionId: "ACT1", userId: "admin-2", isContinuation: true, clientCursor: ["A2"], authorizedPrimaryIds: ["A1", "A2"], directory: {}, connections: ORCH_CONNS }, deps);
+  assert.equal(r.conflict, true, "a different admin cannot drive another admin's action");
+  assert.equal(calls.n, before, "zero exports on wrong admin");
+});
+
+await asyncTest("orchestration 4: tampered cursor (injected/removed/reordered/duplicated) -> 409 before DataDoe", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  await firstClick("ACT1", ["A1", "A2", "A3"], dir(["A1", "A2", "A3"]), deps); // attempts A1 -> remaining [A2,A3]
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A2", "A3"]);
+  const before = calls.n; // == 1
+  for (const [label, cursor] of [["reordered", ["A3", "A2"]], ["injected", ["A2", "A3", "A9"]], ["removed", ["A2"]], ["duplicated", ["A2", "A2"]]]) {
+    const r = await continueAction("ACT1", cursor, ["A1", "A2", "A3"], deps);
+    assert.equal(r.conflict, true, `${label} cursor is a conflict`);
+    assert.equal(r.code, BRAND_DIRECTORY_ACTION_CONFLICT);
+  }
+  assert.equal(calls.n, before, "no tampered cursor created any export");
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A2", "A3"], "the authoritative queue was never mutated by a tampered cursor");
+});
+
+await asyncTest("orchestration 5: the server manifest determines the next account, not catalogSyncAccountIds", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  await firstClick("ACT1", ["A1", "A2", "A3"], dir(["A1", "A2", "A3"]), deps); // remaining [A2,A3]
+  // The server authoritatively reorders its own queue; the client cannot know or change it.
+  man.manifest("ACT1").remaining = ["A3", "A2"];
+  const stale = await continueAction("ACT1", ["A2", "A3"], ["A1", "A2", "A3"], deps); // client's old view
+  assert.equal(stale.conflict, true, "a cursor that does not match the server queue is rejected");
+  const ok = await continueAction("ACT1", ["A3", "A2"], ["A1", "A2", "A3"], deps); // matches server order
+  assert.equal(ok.conflict, false);
+  assert.equal(ok.next, "A3", "the NEXT account is the manifest head (A3), chosen by the server, not the client");
+  assert.deepEqual(ok.remaining, ["A2"], "the server-owned queue advanced by exactly one");
+});
+
+await asyncTest("orchestration 6: claim refusal (concurrent owner) -> zero exports, account not falsely removed, action stays in progress until a durable outcome", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  // Another request already owns the claim for (A1, ACT1); no durable outcome yet.
+  await cat.claimAttempt("A1", "ACT1");
+  const r = await firstClick("ACT1", ["A1"], dir(["A1"]), deps);
+  assert.equal(calls.n, 0, "the request that lost the claim created ZERO exports");
+  assert.equal(r.status, "in-progress", "the action stays in progress");
+  assert.equal(r.disposition, "in-progress");
+  assert.deepEqual(r.remaining, ["A1"], "A1 is NOT falsely removed while the concurrent owner is mid-flight");
+  // Once the owner writes a durable terminal outcome and frees the claim, a continuation advances.
+  await cat.saveAttemptState("A1", "ACT1", { status: "complete", code: null, preservedLkg: false });
+  await cat.releaseAttempt("A1", "ACT1");
+  const done = await continueAction("ACT1", ["A1"], ["A1"], deps);
+  assert.equal(calls.n, 0, "resolving via the durable outcome still creates zero exports in this request");
+  assert.equal(done.disposition, "recorded", "the durable terminal outcome is observed");
+  assert.deepEqual(done.remaining, [], "only now is A1 removed from the queue");
+});
+
+await asyncTest("orchestration 6b: two concurrent same-action first clicks create EXACTLY ONE export", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = { ...cat, ...man, fetchCatalog };
+  const [a, b] = await Promise.all([
+    firstClick("ACT1", ["A1"], dir(["A1"]), deps),
+    firstClick("ACT1", ["A1"], dir(["A1"]), deps),
+  ]);
+  assert.equal(calls.n, 1, "two concurrent same-action requests create exactly one DataDoe export");
+  assert.ok([a, b].some((r) => r.disposition === "exported"), "one request won the claim and exported");
+  assert.ok([a, b].some((r) => r.disposition === "in-progress" || r.disposition === "recorded"), "the other did not export");
+});
+
+await asyncTest("orchestration 7: attempting-marker write failure -> zero exports, typed operational failure, action NOT reported complete", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = {
+    ...cat, ...man, fetchCatalog,
+    saveAttemptState: (id, aid, st) => (st.status === "attempting" ? Promise.reject(new Error("marker persistence failed")) : cat.saveAttemptState(id, aid, st)),
+  };
+  const r = await firstClick("ACT1", ["A1"], dir(["A1"]), deps);
+  assert.equal(calls.n, 0, "no export was created when the attempting marker could not be persisted");
+  assert.equal(r.status, "operational-failure");
+  assert.equal(r.operationalCode, BRAND_DIRECTORY_ACTION_UNAVAILABLE, "typed admin-safe operational-failure code");
+  assert.notEqual(r.status, "complete", "the action is NOT reported complete");
+  assert.deepEqual(r.remaining, ["A1"], "the account is not silently dropped");
+  assert.equal(man.manifest("ACT1").status, "operational-failure", "the durable manifest records the stop");
+});
+
+await asyncTest("orchestration 8: outcome-write failure -> same-action replay creates zero additional exports; durable attempting state remains", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const deps = {
+    ...cat, ...man, fetchCatalog,
+    // The pre-export 'attempting' marker persists; the TERMINAL outcome write fails.
+    saveAttemptState: (id, aid, st) => (st.status === "attempting" ? cat.saveAttemptState(id, aid, st) : Promise.reject(new Error("outcome persistence failed"))),
+  };
+  const r1 = await firstClick("ACT1", ["A1"], dir(["A1"]), deps);
+  assert.equal(calls.n, 1, "the first invocation created its one export");
+  assert.equal(cat.attempt("A1", "ACT1").status, "attempting", "the durable attempting marker remains (terminal write failed)");
+  // Force A1 back onto the authoritative queue to prove a same-action replay cannot re-export it.
+  man.manifest("ACT1").remaining = ["A1"];
+  man.manifest("ACT1").status = "in-progress";
+  const replay = await continueAction("ACT1", ["A1"], ["A1"], deps);
+  assert.equal(calls.n, 1, "the same-action replay created ZERO additional exports");
+  assert.equal(cat.attempt("A1", "ACT1").status, "attempting", "the durable attempting state is still visible");
+  assert.equal(replay.attempted, 0);
+});
+
+await asyncTest("orchestration 9: a newly discovered primary account is automatically included and attempted exactly once", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const NEW = "NEWLY-CONNECTED-1";
+  const src = await readFile(new URL("../api/datadoe.js", import.meta.url), "utf8");
+  assert.doesNotMatch(src, new RegExp(NEW), "the new account id is not hard-coded / mapped in source");
+  const r = await firstClick(`ACT-${NEW}`, [NEW], dir([NEW]), { ...cat, ...man, fetchCatalog });
+  assert.equal(calls.n, 1, "the new account was attempted exactly once");
+  assert.deepEqual(calls.accounts, [NEW]);
+  assert.equal(cat.snapshot(NEW).payload.catalogSyncStatus, "complete");
+  assert.equal(r.status, "complete");
+});
+
+await asyncTest("orchestration 10: an already-complete account is not re-exported (approved eligibility policy preserved)", async () => {
+  const complete = { payload: { catalogBrands: ["DoneBrand"], catalogSyncStatus: "complete", catalogSyncedAt: "2026-08-01T00:00:00.000Z" } };
+  const cat = makeCatalogStore({ COMPLETE1: complete }); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  // COMPLETE1 is not pending/unavailable, so it is not in the eligible queue.
+  const r = await firstClick("ACT1", ["NEW1", "COMPLETE1"], dir(["NEW1"]), { ...cat, ...man, fetchCatalog });
+  assert.deepEqual(r.remaining.concat(calls.accounts).filter((id) => id === "COMPLETE1"), [], "COMPLETE1 is never queued or attempted");
+  assert.deepEqual(calls.accounts, ["NEW1"], "only the new account was exported");
+});
+
+await asyncTest("orchestration 11: a removed account is omitted from the new action and its LKG stays byte-identical", async () => {
+  const good = { source_refreshed_at: "2026-08-01T00:00:00.000Z", payload: { catalogBrands: ["OldBrand"], catalogSyncStatus: "complete", catalogSyncedAt: "2026-08-01T00:00:00.000Z" } };
+  const goodBytes = JSON.stringify(good);
+  const cat = makeCatalogStore({ REMOVED1: good }); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  // Discovery no longer returns REMOVED1; even a stale pending marker cannot schedule it.
+  const r = await firstClick("ACT1", ["STILL1"], dir(["REMOVED1", "STILL1"]), { ...cat, ...man, fetchCatalog });
+  assert.ok(!r.remaining.includes("REMOVED1") && !calls.accounts.includes("REMOVED1"), "the removed account is never queued or attempted");
+  assert.equal(JSON.stringify(cat.snapshot("REMOVED1")), goodBytes, "the removed account's LKG snapshot is byte-identical");
+  // The directory reconciler retains it inactive/read-only.
+  const merged = mergeAccountDirectory([{ id: "REMOVED1", name: "Gone" }, { id: "STILL1", name: "Still" }], [{ id: "STILL1", name: "Still" }]);
+  assert.equal(merged.find((a) => a.id === "REMOVED1")?.active, false);
+});
+
+await asyncTest("orchestration 12: a rediscovered account becomes active again and is eligible per its saved catalog state", async () => {
+  // It reappears in discovery; the directory reconciler flips it back to active.
+  const merged = mergeAccountDirectory([{ id: "R1", name: "R", active: false }], [{ id: "R1", name: "R" }]);
+  assert.equal(merged.find((a) => a.id === "R1")?.active, true, "a rediscovered account is active again");
+  // Its saved catalog is unavailable, so it is eligible and attempted once in the new action.
+  const cat = makeCatalogStore({ R1: { payload: { catalogBrands: [], catalogSyncStatus: "unavailable", catalogSyncCode: CATALOG_SOURCE_UNAVAILABLE } } });
+  const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const r = await firstClick("ACT1", ["R1"], dir([], ["R1"]), { ...cat, ...man, fetchCatalog });
+  assert.deepEqual(calls.accounts, ["R1"], "the rediscovered account is attempted once");
+  assert.equal(r.status, "complete");
+});
+
+await asyncTest("orchestration 13: primary and dd-secondary with the same raw seller id never merge; only primary is attempted", async () => {
+  const merged = mergeDiscoveredDataDoeAccounts([
+    { connection: { id: "primary", label: "Primary DataDoe", accountPrefix: "" }, accounts: [{ id: "SELLER9", name: "Acme" }] },
+    { connection: { id: "secondary", label: "Secondary DataDoe", accountPrefix: "dd-secondary:" }, accounts: [{ id: "SELLER9", name: "Acme" }] },
+  ]);
+  assert.deepEqual(merged.map((a) => a.id).sort(), ["SELLER9", "dd-secondary:SELLER9"]);
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const r = await firstClick("ACT1", merged.map((a) => a.id), dir(["SELLER9", "dd-secondary:SELLER9"]), { ...cat, ...man, fetchCatalog });
+  assert.deepEqual(calls.accounts, ["SELLER9"], "only the primary account reached DataDoe; the dd-secondary id was never routed to primary");
+  assert.ok(!r.remaining.includes("dd-secondary:SELLER9"), "the dormant secondary is never in the primary queue");
+});
+
+await asyncTest("orchestration 14: retention prunes OLD manifest+attempt rows only; active action, LKG and account-directory survive", async () => {
+  const DAY = 86_400_000;
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  const rows = [
+    { report_key: "brand-catalog-action", id: "old-action", updated_at: iso(NOW - 30 * DAY) },
+    { report_key: "brand-catalog-action", id: "active-action", updated_at: iso(NOW - 3_600_000) },
+    { report_key: "brand-catalog-attempt", id: "old-attempt", updated_at: iso(NOW - 30 * DAY) },
+    { report_key: "brand-catalog-attempt", id: "active-attempt", updated_at: iso(NOW - 3_600_000) },
+    { report_key: "brand-catalog", id: "lkg", updated_at: iso(NOW - 400 * DAY) },
+    { report_key: "account-directory", id: "dir", updated_at: iso(NOW - 400 * DAY) },
+  ];
+  const deletedKeys = [];
+  const deleteOlderThan = ({ reportKey, cutoffIso }) => {
+    deletedKeys.push(reportKey);
+    for (let i = rows.length - 1; i >= 0; i--) if (rows[i].report_key === reportKey && rows[i].updated_at < cutoffIso) rows.splice(i, 1);
+    return Promise.resolve();
+  };
+  await pruneBrandCatalogActionRecords({ deleteOlderThan, nowMs: () => NOW });
+  assert.deepEqual(rows.map((r) => r.id).sort(), ["active-action", "active-attempt", "dir", "lkg"], "old manifest+attempt rows pruned; active + LKG + directory survive");
+  assert.deepEqual(deletedKeys.sort(), ["brand-catalog-action", "brand-catalog-attempt"], "retention only ever targets the two action-record keys, never LKG or account-directory");
+});
+
+await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  await firstClick("ACT1", ["A1"], dir(["A1"]), { ...cat, ...man, fetchCatalog });
+  assert.deepEqual(calls.sourceIds, [PRODUCT_CATALOG_SHORT_ID], "the create-export used the short live source id");
+  assert.ok(!calls.sourceIds.includes(PRODUCT_CATALOG_OBSOLETE_LONG_ID), "the obsolete long id is never sent");
+});
+
+await asyncTest("orchestration 16: no raw DataDoe/Supabase error reaches the browser through the orchestrator", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const fetchCatalog = () => { throw new Error(`DataDoe export creation failed (404): {"message":"Source not found","statusCode":404} https://api.datadoe.com/api/v1/exports`); };
+  const r = await firstClick("ACT1", ["A1"], dir(["A1"]), { ...cat, ...man, fetchCatalog });
+  const blob = JSON.stringify([r, man.manifest("ACT1"), cat.snapshot("A1"), cat.attempt("A1", "ACT1")]);
+  assert.doesNotMatch(blob, /Source not found|statusCode|https?:\/\/|api\/v1/i, "no raw DataDoe/Supabase detail in any orchestrator/manifest/attempt state");
+  assert.equal(cat.attempt("A1", "ACT1").code, CATALOG_SOURCE_UNAVAILABLE, "only a typed code is recorded");
+  for (const code of [BRAND_DIRECTORY_ACTION_CONFLICT, BRAND_DIRECTORY_ACTION_UNAVAILABLE]) assert.match(code, /^BRAND_DIRECTORY_ACTION_/, "action codes are typed constants");
 });
 
 console.log(`\n${passed} assertions passed`);
