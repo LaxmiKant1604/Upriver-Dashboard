@@ -222,6 +222,52 @@ test("an ambiguous CROSS-CURRENCY median price within one (ASIN,query) group => 
   ];
   assert.equal(deriveSqp(rows).status, "invalid");
 });
+// ---- FIX 2: strict malformed-evidence rejection (Number()-only validation replaced) ----
+test("malformed SQP evidence (boolean / array / object / whitespace / grouped-digits) => invalid (never coerced)", () => {
+  const base = { date: "2025-06-01", child_asin: "A", search_query: "q" };
+  assert.equal(deriveSqp([{ ...base, search_query_volume: true }]).status, "invalid", "boolean true (Number(true)===1) rejected");
+  assert.equal(deriveSqp([{ ...base, search_query_volume: false }]).status, "invalid", "boolean false (Number(false)===0) rejected");
+  assert.equal(deriveSqp([{ ...base, search_query_total_click_count: [] }]).status, "invalid", "empty array (Number([])===0) rejected");
+  assert.equal(deriveSqp([{ ...base, search_query_total_click_count: [5] }]).status, "invalid", "single-element array (Number([5])===5) rejected");
+  assert.equal(deriveSqp([{ ...base, child_asin_click_count: {} }]).status, "invalid", "object rejected");
+  assert.equal(deriveSqp([{ ...base, child_asin_impression_count: "   " }]).status, "invalid", "whitespace-only string (Number('  ')===0) rejected");
+  assert.equal(deriveSqp([{ ...base, child_asin_median_click_price_value: "1,000" }]).status, "invalid", "grouped-digit string rejected");
+});
+test("valid finite numeric STRINGS are accepted (DataDoe exports numbers as strings) -- parity preserved", () => {
+  const rows = [{ date: "2025-06-01", child_asin: "A", search_query: "q", search_query_volume: "100", child_asin_click_count: "8", child_asin_organic_search_rank: "3", child_asin_median_click_price_value: "25.5", child_asin_median_click_price_currency: "USD" }];
+  const res = deriveSqp(rows);
+  assert.equal(res.status, "derived", "numeric strings parse to finite numbers");
+  const q = res.payload.queries[0];
+  assert.equal(q.volume, 100); assert.equal(q.asinClicks, 8); assert.equal(q.bestRank, 3);
+  assert.equal(q.medianClickPrice, 25.5); assert.equal(q.medianClickPriceCurrency, "USD");
+});
+test("blank/missing median-price currency is a single UNKNOWN identity; mixing unknown with a real currency fails closed", () => {
+  // A lone positive price with a MISSING currency is a valid single (unknown) identity => derives; the
+  // unknown currency surfaces as null, never a fabricated code.
+  const missingOnly = [{ date: "2025-06-01", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 5 }];
+  const r1 = deriveSqp(missingOnly);
+  assert.equal(r1.status, "derived", "a lone missing-currency positive price is a single unknown identity");
+  assert.equal(r1.payload.queries[0].medianClickPrice, 5);
+  assert.equal(r1.payload.queries[0].medianClickPriceCurrency, null, "unknown currency => null, never fabricated");
+  // blank + blank stays ONE unknown identity.
+  const blankBlank = [
+    { date: "2025-06-01", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 5, child_asin_median_click_price_currency: "" },
+    { date: "2025-06-08", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 6, child_asin_median_click_price_currency: "  " },
+  ];
+  assert.equal(deriveSqp(blankBlank).status, "derived", "blank + blank is a single unknown identity");
+  // unknown/blank + USD => two identities => fail closed.
+  const blankPlusUsd = [
+    { date: "2025-06-01", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 5 },
+    { date: "2025-06-08", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 6, child_asin_median_click_price_currency: "USD" },
+  ];
+  assert.equal(deriveSqp(blankPlusUsd).status, "invalid", "blank/unknown + USD fails closed");
+  // USD + EUR => two identities => fail closed (re-affirmed through the identity model).
+  const usdPlusEur = [
+    { date: "2025-06-01", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 5, child_asin_median_click_price_currency: "USD" },
+    { date: "2025-06-08", child_asin: "A", search_query: "q", child_asin_median_click_price_value: 6, child_asin_median_click_price_currency: "EUR" },
+  ];
+  assert.equal(deriveSqp(usdPlusEur).status, "invalid", "USD + EUR fails closed");
+});
 test("wrong SQP window / two SQP fragments / cross-account fragment => invalid", () => {
   // wrong window
   const p1 = loPlanned({ sqpRows: [], catalogRows: okCatalog }); p1.planned[0].from = "2025-05-19";
@@ -342,14 +388,21 @@ function makeStore() {
   };
 }
 
-function makeDataDoe(behavior) {
+// `opts.deferPoll` / `opts.deferDownload` map a requestKey -> how many times to defer that stage with an
+// EXECUTION-deadline error (code DATADOE_DEADLINE) -- the resumable deferral the source worker leaves
+// 'attempted' with its export_id (no second create). The counters persist across invocations of the SAME
+// dataDoe so a resume run drains them and completes.
+function makeDataDoe(behavior, opts = {}) {
   const create = {};
+  const deferPoll = { ...(opts.deferPoll || {}) };
+  const deferDownload = { ...(opts.deferDownload || {}) };
+  const deadlineErr = () => { const e = new Error("DataDoe work deferred before the server execution deadline."); e.code = "DATADOE_DEADLINE"; return e; };
   return {
     createCount: (h) => create[h] || 0,
     totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
     async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; const b = behavior(job); if (b && b.throw) throw b.throw; return { exportId: "e_" + job.requestHash }; },
-    async poll() { /* completes */ },
-    async download(job) { const b = behavior(job); if (b && b.throw) throw b.throw; return (b && b.rows) || []; },
+    async poll(job) { const k = job && job.requestKey; if (k && deferPoll[k] > 0) { deferPoll[k] -= 1; throw deadlineErr(); } },
+    async download(job) { const k = job && job.requestKey; if (k && deferDownload[k] > 0) { deferDownload[k] -= 1; throw deadlineErr(); } const b = behavior(job); if (b && b.throw) throw b.throw; return (b && b.rows) || []; },
   };
 }
 
@@ -449,16 +502,19 @@ test("owner reconciliation runs against the validated-SQP authoritative set; a m
 
 group("listing-optimizer: worker-level LKG + idempotent save");
 
+const stripShadow = (k) => String(k).replace("scheduler-v2/", "");
 function makeReportStore() {
   const reportJobs = new Map();
   const snapshots = new Map();
   const sourceJobs = [];
+  const srcRows = new Map();
   const key = (rk, a) => rk + "|" + a;
   return {
     _snapshots: snapshots,
     saveCalls: 0,
-    seedSource(hash, status, errorCode = null) { sourceJobs.push({ request_hash: hash, fetch_status: status, error_code: errorCode }); },
+    seedSource(hash, status, errorCode = null, rows = null) { sourceJobs.push({ request_hash: hash, fetch_status: status, error_code: errorCode }); if (rows) srcRows.set(hash, rows); },
     seedSnapshot(reportKey, accountId, payload) { snapshots.set(key(reportKey, accountId), { payload }); },
+    loadSourceRows(h) { const r = srcRows.get(h); return r ? { rows: r } : null; },
     report(rk, a) { return reportJobs.get(key(rk, a)); },
     listSourceJobs() { return sourceJobs.map((j) => ({ ...j })); },
     upsertReportJob({ reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) {
@@ -471,9 +527,42 @@ function makeReportStore() {
     recordReportBlocked({ reportKey, accountId }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); },
     recordReportFailure({ reportKey, accountId, stage, code }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); },
     recordReportSuccess({ reportKey, accountId }) { Object.assign(reportJobs.get(key(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true }); },
-    saveReportSnapshot({ reportKey, accountId, payload }) { this.saveCalls += 1; snapshots.set(key(reportKey, accountId), { payload }); },
+    saveReportSnapshot({ reportKey, accountId, payload }) { this.saveCalls += 1; snapshots.set(key(stripShadow(reportKey), accountId), { payload }); return { paramsHash: "ph" }; },
   };
 }
+
+// A combined store: the cycle's source-job/owner/cache interface (makeStore) PLUS the report-job/snapshot
+// interface, so a single object drives runListingOptimizerShadowCycle -> its returned plannedReports ->
+// runReportJobs end-to-end (the partial-invocation lifecycle under real gating).
+function makeFullStore() {
+  const store = makeStore();
+  const reportJobs = new Map();
+  const snapshots = new Map();
+  const rkey = (rk, a) => rk + "|" + a;
+  store.saveCalls = 0;
+  store.reportSnap = (rk, a) => snapshots.get(rkey(rk, a));
+  store.reportJob = (rk, a) => reportJobs.get(rkey(rk, a));
+  store.seedSnapshot = (rk, a, payload) => snapshots.set(rkey(rk, a), { payload });
+  store.upsertReportJob = ({ reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) => {
+    const k = rkey(reportKey, accountId);
+    if (reportJobs.has(k)) return;
+    reportJobs.set(k, { report_key: reportKey, account_id: accountId, connection_id: connectionId, bucket, report_version: reportVersion, depends_on: dependsOn || [], fetch_status: "pending", derive_status: "pending", save_status: "pending", validated: false });
+  };
+  store.listReportJobs = () => [...reportJobs.values()].map((j) => ({ ...j }));
+  store.claimReportDerive = (_c, rk, a) => { const j = reportJobs.get(rkey(rk, a)); if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; } return false; };
+  store.recordReportBlocked = ({ reportKey, accountId }) => { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); };
+  store.recordReportFailure = ({ reportKey, accountId, stage, code }) => { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); };
+  store.recordReportSuccess = ({ reportKey, accountId }) => { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true }); };
+  store.saveReportSnapshot = ({ reportKey, accountId, payload }) => { store.saveCalls += 1; snapshots.set(rkey(stripShadow(reportKey), accountId), { payload }); return { paramsHash: "ph" }; };
+  return store;
+}
+
+// Feed a set of plannedReports through the REAL report worker against a store that already holds this
+// cycle's source jobs + cache.
+const runReports = (store, cycleId, plannedReports) => runReportJobs({
+  store, cycleId, sourceRows: (h) => store.loadSourceRows(h),
+  saveSnapshot: (a) => store.saveReportSnapshot(a), plannedReports,
+});
 
 function loReportRequest(sqpSignal) {
   const plan = planListingOptimizer({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, sqpSignal });
@@ -491,6 +580,117 @@ test("a MISSING required source at the worker => zero writes; last-known-good sn
   await runReportJobs({ store, plannedReports: [rr], bucket: "us", cycleDate: "2026-08-11" });
   assert.equal(store.saveCalls, 0, "no snapshot written on an unavailable derive");
   assert.deepEqual(store._snapshots.get("listing-optimizer|" + ID).payload, LKG, "last-known-good preserved");
+});
+
+/* ===== FIX 1: partial staged-report lifecycle (cycle -> plannedReports -> runReportJobs) ===== */
+
+group("listing-optimizer: partial staged-report lifecycle (pending vs derive)");
+const ACCT = [{ accountId: ID, country: "US", currency: "USD" }];
+const sourceDisabledErr = () => new Error("Source is disabled for this organization."); // matches isSourceDisabledError
+const genericErr = () => new Error("boom"); // classifies to a non-disabled EXPORT_ERROR (LKG-preserving)
+
+test("(1) maxJobs=1 stages only the SQP; the report stays PENDING with the catalog REQUIRED (LKG intact, never a premature unavailable)", async () => {
+  const store = makeFullStore();
+  const dd = makeDataDoe(SQP_OK);
+  const LKG = { sqpAvailable: true, note: "A prior good" };
+  store.seedSnapshot("listing-optimizer", ID, LKG);
+  const r1 = await cycle(store, dd, ACCT, { maxJobs: 1 });
+  assert.ok(!store.listSourceJobs(r1.cycleId).some((j) => j.request_key === "listing-optimizer:catalog"), "catalog not staged under maxJobs=1");
+  const catSrc = r1.plannedReports[0].sources.find((s) => s.requestKey === "listing-optimizer:catalog");
+  assert.equal(catSrc.optional, false, "an unstaged catalog stays REQUIRED so the fetch gate holds the report PENDING");
+  const prog = await runReports(store, r1.cycleId, r1.plannedReports);
+  assert.equal(prog.pending, 1, "the report is PENDING (not derived)");
+  assert.equal(store.saveCalls, 0, "no snapshot written while the catalog is unstaged");
+  assert.equal(store.reportJob("listing-optimizer", ID).derive_status, "pending", "derive was never claimed");
+  assert.deepEqual(store.reportSnap("listing-optimizer", ID).payload, LKG, "last-known-good preserved");
+});
+
+test("(2) resuming the SAME cycle stages the catalog once; the report then derives + saves EXACTLY once (idempotent)", async () => {
+  const store = makeFullStore();
+  const dd = makeDataDoe(SQP_OK);
+  await cycle(store, dd, ACCT, { maxJobs: 1 });            // SQP only (catalog unstaged)
+  const r2 = await cycle(store, dd, ACCT);                  // resume -> catalog staged
+  assert.equal(dd.totalCreates(), 2, "SQP + catalog, each created once (no duplicate)");
+  const p1 = await runReports(store, r2.cycleId, r2.plannedReports);
+  assert.equal(p1.succeeded, 1, "the report derives once every required source resolved");
+  assert.equal(store.saveCalls, 1, "snapshot saved exactly once");
+  assert.equal(store.reportSnap("listing-optimizer", ID).payload.sqpAvailable, true, "a real sqpAvailable:true snapshot");
+  const p2 = await runReports(store, r2.cycleId, r2.plannedReports); // re-run
+  assert.equal(store.saveCalls, 1, "a re-run writes no second snapshot (idempotent)");
+  assert.equal(p2.succeeded, 0, "the finished report is skipped on re-run");
+});
+
+test("(3) poll AND download deferrals keep the report PENDING, then a resume completes it with NO duplicate create-export", async () => {
+  for (const stage of ["deferPoll", "deferDownload"]) {
+    const store = makeFullStore();
+    const dd = makeDataDoe(SQP_OK, { [stage]: { "listing-optimizer:sqp-weekly": 1 } });
+    const r1 = await cycle(store, dd, ACCT);
+    const sqpHash = r1.perAccount[0].sqpHash;
+    assert.equal(dd.createCount(sqpHash), 1, `${stage}: the SQP export was created once before deferring`);
+    const prog1 = await runReports(store, r1.cycleId, r1.plannedReports);
+    assert.equal(prog1.pending, 1, `${stage}: an in-flight (attempted) SQP keeps the report PENDING`);
+    assert.equal(store.saveCalls, 0, `${stage}: nothing saved while the SQP is deferred`);
+    assert.equal(store.reportJob("listing-optimizer", ID).derive_status, "pending", `${stage}: derive never claimed on a deferral`);
+    // Resume: the deferred SQP finishes (no second create), the catalog stages, the report saves once.
+    const r2 = await cycle(store, dd, ACCT);
+    assert.equal(dd.createCount(sqpHash), 1, `${stage}: the SQP export is never re-created on resume`);
+    const prog2 = await runReports(store, r2.cycleId, r2.plannedReports);
+    assert.equal(prog2.succeeded, 1, `${stage}: the report derives after the resume`);
+    assert.equal(store.saveCalls, 1, `${stage}: saved exactly once after resume`);
+  }
+});
+
+test("(4) a durable degraded SOURCE_DISABLED SQP saves the faithful sqpAvailable:false snapshot WITHOUT a catalog export", async () => {
+  const store = makeFullStore();
+  const dd = makeDataDoe((job) => (job.requestKey === "listing-optimizer:sqp-weekly" ? { throw: sourceDisabledErr() } : SQP_OK(job)));
+  const r = await cycle(store, dd, ACCT);
+  assert.ok(!store.listSourceJobs(r.cycleId).some((j) => j.request_key === "listing-optimizer:catalog"), "no catalog export for a disabled SQP");
+  const prog = await runReports(store, r.cycleId, r.plannedReports);
+  assert.equal(prog.pending, 0, "a degraded-disabled SQP is not left pending");
+  assert.equal(store.saveCalls, 1, "the sqpAvailable:false snapshot is saved");
+  assert.equal(store.reportSnap("listing-optimizer", ID).payload.sqpAvailable, false, "faithful sqpAvailable:false payload");
+});
+
+test("(5) a non-disabled failed SQP AND a failed catalog after a successful SQP both preserve last-known-good with zero writes", async () => {
+  // 5a) non-disabled failed SQP => unavailable/LKG (never a premature block or snapshot).
+  const s1 = makeFullStore();
+  const d1 = makeDataDoe((job) => (job.requestKey === "listing-optimizer:sqp-weekly" ? { throw: genericErr() } : SQP_OK(job)));
+  s1.seedSnapshot("listing-optimizer", ID, { sqpAvailable: true, note: "5a LKG" });
+  const ra = await cycle(s1, d1, ACCT);
+  await runReports(s1, ra.cycleId, ra.plannedReports);
+  assert.equal(s1.saveCalls, 0, "5a: a failed SQP writes nothing");
+  assert.deepEqual(s1.reportSnap("listing-optimizer", ID).payload, { sqpAvailable: true, note: "5a LKG" }, "5a: LKG preserved");
+  // 5b) SQP succeeds, catalog fails => unavailable/LKG (never a partial save).
+  const s2 = makeFullStore();
+  const d2 = makeDataDoe((job) => (job.requestKey === "listing-optimizer:catalog" ? { throw: genericErr() } : SQP_OK(job)));
+  s2.seedSnapshot("listing-optimizer", ID, { sqpAvailable: true, note: "5b LKG" });
+  const rb = await cycle(s2, d2, ACCT);
+  await runReports(s2, rb.cycleId, rb.plannedReports);
+  assert.equal(s2.saveCalls, 0, "5b: a failed catalog after a successful SQP writes nothing");
+  assert.deepEqual(s2.reportSnap("listing-optimizer", ID).payload, { sqpAvailable: true, note: "5b LKG" }, "5b: LKG preserved");
+});
+
+test("(6) a PENDING listing-optimizer report never blocks an unrelated COMPLETE report from deriving in the same worker pass", async () => {
+  const store = makeReportStore();
+  // Report A (account A1): SQP succeeded but the catalog is UNSTAGED + REQUIRED => must stay PENDING.
+  const repA = loReportRequest({ status: "success", validated: true });
+  const aSqp = repA.sources.find((s) => s.requestKey === "listing-optimizer:sqp-weekly");
+  const aCat = repA.sources.find((s) => s.requestKey === "listing-optimizer:catalog");
+  aSqp.optional = false; aCat.optional = false; // state-aware: SQP succeeded, catalog unstaged
+  store.seedSource(aSqp.requestHash, "succeeded", null, [{ date: "2025-06-01", child_asin: "A", search_query: "q" }]);
+  store.seedSnapshot("listing-optimizer", ID, { sqpAvailable: true, note: "A prior good" });
+  // Report B (a DIFFERENT complete account): SQP + catalog both succeeded => derives + saves.
+  const planB = planListingOptimizer({ accountId: "B2", country: "US", currency: "USD", connections: CONNS, asOf: ASOF, sqpSignal: { status: "success", validated: true } });
+  const repB = { reportKey: "listing-optimizer", reportVersion: planB.reportVersion, accountId: "B2", connectionId: "primary", bucket: "us", sources: planB.sources.map((s) => ({ ...s, optional: false })), context: planB.context };
+  const bSqp = repB.sources.find((s) => s.requestKey === "listing-optimizer:sqp-weekly");
+  const bCat = repB.sources.find((s) => s.requestKey === "listing-optimizer:catalog");
+  store.seedSource(bSqp.requestHash, "succeeded", null, [{ date: "2025-06-01", child_asin: "A", search_query: "q" }]);
+  store.seedSource(bCat.requestHash, "succeeded", null, [{ child_asin: "A", product_brand: "Acme" }]);
+  await runReports(store, "c1", [repA, repB]);
+  assert.equal(store.saveCalls, 1, "exactly one report (the complete B) saved");
+  assert.ok(store._snapshots.get("listing-optimizer|B2"), "the complete report B derived + saved");
+  assert.equal(store.report("listing-optimizer", ID).derive_status, "pending", "the pending report A never claimed derive");
+  assert.deepEqual(store._snapshots.get("listing-optimizer|" + ID).payload, { sqpAvailable: true, note: "A prior good" }, "A's last-known-good preserved");
 });
 
 console.log; // (no-op guard)
