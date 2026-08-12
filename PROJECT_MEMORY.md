@@ -2612,6 +2612,34 @@ pushed/merged/deployed; Scheduler v1/v2, migrations, and `HANDOFF.md` untouched.
 confirmation that the short id returns rows once the primary catalog table is populated
 remains a deployment gate.
 
+#### Re-review blocker: a zero-row/unusable catalog must not overwrite last-known-good (2026-08-12)
+
+The short-id fix made the catalog fetch SUCCEED with 0 rows (the live primary Catalog
+currently has 0 rows). `buildBrandSalesPayload` then returned a valid payload with
+`asinBrand:{}` / `catalogBrands:[]`, which the brand-sales action SAVED over a previously
+valid Brand Sales snapshot -- production data loss. Fixed: `buildBrandSalesPayload` now
+builds the ASIN->brand map first and validates the catalog BEFORE constructing/returning
+the payload. An empty map -- zero rows OR rows with no usable `child_asin -> product_brand`
+pair -- throws a typed, admin-safe error (`brandSalesUnavailable`) with the exact message
+"Product Catalog has no usable brand mappings yet. Previous saved Brand Sales data was
+preserved." BEFORE `sendLegacyPayload`/`saveReportSnapshot`. So the caller never saves, the
+prior snapshot + its `asinBrand`/`catalogBrands` are preserved, real Order Line Item sales
+are not saved as a new brand-scoped snapshot when attribution is unavailable, "Unassigned"
+is never a real brand, and no raw DataDoe error is exposed. The short live source id
+`68d2de238e`, the alias-only obsolete id, the no-retry/no-fallback rule, and request_hash
+are all unchanged. (Note: `buildBrandSalesPayload` is shared with the paused Scheduler v1
+brand-sales adapter, which now also fails closed on an empty catalog -- the same desired
+LKG-preserving behavior; no scheduler file was edited.)
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** (was 77; +1
+report-store integration test: a throwing build performs ZERO `report_snapshots` writes,
+the seeded last-known-good is unchanged, the lock is released) + sync **23** + source-cache
+**12** (was 10; the zero-row test now asserts a rejection, plus a no-usable-mappings
+rejection and a valid-catalog-still-builds case) + `build:check` **2,394 modules**; `git
+diff --check` clean. Commits `c76f2d0` (fix), `732163b` (tests), + this docs commit. Files:
+`api/datadoe.js`, `scripts/test-source-cache.mjs`, `scripts/test-brand-view.mjs`. Nothing
+pushed/merged/deployed; Scheduler v1/v2, migrations, and `HANDOFF.md` untouched.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
