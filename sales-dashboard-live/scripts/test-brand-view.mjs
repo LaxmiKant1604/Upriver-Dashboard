@@ -31,11 +31,14 @@ const {
   buildBrandInventoryPayload,
   buildBrandInventorySnapshot,
   asinBrandFromSalesPayload,
-  brandByAsinFromCatalogRows,
+  isCompactInventorySnapshot,
+  isStrictCalendarDate,
+  addDays,
   monthBack,
   shiftYear,
   BRAND_VIEW_VERSION,
   BRAND_INVENTORY_SNAPSHOT_KEY,
+  BRAND_INVENTORY_REPORT_VERSION,
 } = await import("../lib/server/reports/brand-view.js");
 
 const { assertAdmin, DashboardAccessError } = await import("../lib/server/supabase.js");
@@ -350,13 +353,16 @@ test("inventory is per marketplace when the saved plan has it, and account-wide 
 });
 
 /* ============================== 2b. compact Brand View FBA inventory bridge ==============================
-   The temporary admin Brand View inventory refresh: a minimal FBA Inventory Health fold that lets Brand View
-   show FBA Inv. / FBA Cover without the full multi-export FBA Shipment Plan build, while never inventing zero.
+   The temporary admin Brand View inventory refresh: a minimal FBA Inventory Health fold with STRICT row
+   validation, an AUTHORITATIVE compact snapshot, and NO live Product Catalog fallback. Window is asOf-10d..asOf.
 */
 
+const INV_TO = "2026-07-28";
+const INV_FROM = "2026-07-18"; // asOf - 10 days (PLAN_INVENTORY_LOOKBACK_DAYS)
+
 // Raw FBA Inventory Health rows for one account. Two marketplaces, a genuine zero,
-// a Nordfell row that must never leak into Bebi Born, and an OLDER-date row that the
-// "latest validated date only" rule must ignore.
+// a Nordfell row that must never leak into Bebi Born, and an OLDER (in-window) date
+// row that the "latest validated date only" rule must ignore.
 const INV_BRAND_BY_ASIN = new Map([
   ["B00BEBI001", "Bebi Born"], ["B00BEBI002", "Bebi Born"],
   ["B00BEBI003", "Bebi Born"], ["B00NORD001", "Nordfell"],
@@ -369,115 +375,137 @@ const INV_ROWS = () => [
   { date: "2026-07-28", marketplace_country_code: "IT", child_asin: "B00NORD001", sku: "IT-9", available: 4000 },
   { date: "2026-07-27", marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "IT-old", available: 99999 },
 ];
+const buildInv = (over = {}) => buildBrandInventoryPayload({
+  accountId: ACCOUNT_A, invRows: INV_ROWS(), brandByAsin: INV_BRAND_BY_ASIN,
+  accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000, ...over,
+});
 
-test("9/10. brand-inventory folds ONLY the latest date, grouped by country and exact brand", () => {
-  const p = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: INV_ROWS(), brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", rowLimit: 15000 });
+/* ---- BLOCKER 1: strict FBA inventory row validation ---- */
+
+test("6/9/10. exact-window boundaries + available=0 accepted; folds ONLY the latest date, by country and exact brand", () => {
+  const p = buildInv();
   assert.equal(p.inventoryDate, "2026-07-28", "latest snapshot date only");
   assert.equal(p.inventoryAvailable, true);
   const cell = (country, brand) => p.inventoryByBrandCountry.find((e) => e.country === country && e.brand === brand);
   assert.equal(cell("IT", "Bebi Born").fbaAvailable, 883, "IT Bebi Born = 600 + 283, never the 99999 older-date row");
   assert.equal(cell("IT", "Bebi Born").skuCount, 2);
   assert.equal(cell("UK", "Bebi Born").fbaAvailable, 912);
+  assert.equal(cell("DE", "Bebi Born").fbaAvailable, 0, "available=0 is accepted as a genuine value");
   assert.equal(cell("IT", "Nordfell").fbaAvailable, 4000, "Nordfell is a separate bucket, never folded into Bebi Born");
-  assert.ok(!p.inventoryByBrandCountry.some((e) => e.brand === "Bebi Born" && e.fbaAvailable === 4000));
+  // Rows exactly ON each window boundary are accepted.
+  const boundary = [
+    { date: INV_FROM, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "F", available: 3 },
+    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "T", available: 7 },
+  ];
+  const bp = buildInv({ invRows: boundary });
+  assert.equal(bp.inventoryDate, INV_TO);
+  assert.equal(bp.inventoryByBrandCountry.find((e) => e.country === "IT").fbaAvailable, 7, "only the latest boundary date folds");
+  assert.equal(isStrictCalendarDate("2024-02-29"), true, "a real leap day round-trips");
 });
 
-test("11. a validated snapshot with zero units for a brand is a genuine zero, not unavailable", () => {
-  const p = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: INV_ROWS(), brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", rowLimit: 15000 });
-  const de = p.inventoryByBrandCountry.find((e) => e.country === "DE" && e.brand === "Bebi Born");
-  assert.equal(de.fbaAvailable, 0, "the covered DE marketplace holds a real zero");
-  const inv = brandInventory(p, "Bebi Born", "IT");
-  assert.equal(inv.scope, "country");
-  assert.equal(inv.byCountry.get("DE"), 0, "brandInventory reports the validated zero, not a blank");
-  assert.equal(inv.accountTotal, 883 + 912 + 0);
+test("1/2/3. impossible, future, malformed and out-of-window dates are rejected (whole payload refused)", () => {
+  const one = (date) => () => buildInv({ invRows: [{ date, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S", available: 1 }] });
+  const safe = (e) => e.brandInventorySafe === true;
+  assert.throws(one("2099-01-01"), safe, "future date");
+  assert.throws(one("2025-02-30"), safe, "impossible calendar date");
+  assert.throws(one("2026-13-40"), safe, "malformed date");
+  assert.throws(one("not-a-date"), safe, "non-date string");
+  assert.throws(one(addDays(INV_FROM, -1)), safe, "one day BEFORE the window");
+  assert.throws(one(addDays(INV_TO, 1)), safe, "one day AFTER the window");
+  assert.equal(isStrictCalendarDate("2025-02-30"), false, "the strict validator rejects the impossible date directly");
+  assert.equal(isStrictCalendarDate("2099-01-01"), true, "2099-01-01 is a valid CALENDAR date; the window check is what rejects it");
 });
 
-test("12. a brand absent from the validated snapshot stays unavailable, never zero", () => {
-  const p = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: INV_ROWS(), brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", rowLimit: 15000 });
-  const inv = brandInventory(p, "Brand Not In Snapshot", "IT");
-  assert.equal(inv.accountTotal, null, "no invented zero for a brand the snapshot never mentions");
-  assert.equal(inv.byCountry.size, 0);
-  // A snapshot that returned no rows at all is unavailable, not a zero window.
-  const empty = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: [], brandByAsin: INV_BRAND_BY_ASIN, rowLimit: 15000 });
-  assert.equal(empty.inventoryAvailable, false);
-  assert.equal(empty.inventoryDate, null);
-  assert.deepEqual(empty.inventoryByBrandCountry, []);
+test("4/5. missing ASIN, non-object rows, and non-finite/malformed/negative available are rejected (never zeroed)", () => {
+  const row = (over) => [{ date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S", available: 1, ...over }];
+  const safe = (e) => e.brandInventorySafe === true;
+  assert.throws(() => buildInv({ invRows: "not-an-array" }), safe, "invRows must be an array");
+  assert.throws(() => buildInv({ invRows: [null] }), safe, "a non-object row");
+  assert.throws(() => buildInv({ invRows: [["array-row"]] }), safe, "an array row");
+  assert.throws(() => buildInv({ invRows: row({ child_asin: "" }) }), safe, "missing ASIN");
+  assert.throws(() => buildInv({ invRows: row({ child_asin: "   " }) }), safe, "blank ASIN");
+  assert.throws(() => buildInv({ invRows: row({ available: -1 }) }), safe, "negative available");
+  assert.throws(() => buildInv({ invRows: row({ available: "5" }) }), safe, "a numeric STRING is not converted, it is rejected");
+  assert.throws(() => buildInv({ invRows: row({ available: null }) }), safe, "null available is not converted to zero");
+  assert.throws(() => buildInv({ invRows: row({ available: undefined }) }), safe, "missing available");
+  assert.throws(() => buildInv({ invRows: row({ available: NaN }) }), safe, "NaN available");
+  assert.throws(() => buildInv({ invRows: row({ available: Infinity }) }), safe, "non-finite available");
 });
 
 test("8. an FBA inventory result exactly at the row cap is refused as truncated and not saved", () => {
-  const atCap = new Array(15000).fill(0).map((_, i) => ({ date: "2026-07-28", marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: `S${i}`, available: 1 }));
-  assert.throws(
-    () => buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: atCap, brandByAsin: INV_BRAND_BY_ASIN, rowLimit: 15000 }),
-    (error) => error.brandInventorySafe === true && /row cap/i.test(error.message)
-  );
-  // Just under the cap is accepted.
-  const underCap = atCap.slice(0, 14999);
-  assert.equal(buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: underCap, brandByAsin: INV_BRAND_BY_ASIN, rowLimit: 15000 }).inventoryAvailable, true);
+  const atCap = new Array(15000).fill(0).map((_, i) => ({ date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: `S${i}`, available: 1 }));
+  assert.throws(() => buildInv({ invRows: atCap }), (error) => error.brandInventorySafe === true && /row cap/i.test(error.message));
+  assert.equal(buildInv({ invRows: atCap.slice(0, 14999) }).inventoryAvailable, true, "just under the cap is accepted");
 });
 
-await asyncTest("3/15. the inventory refresh makes ONE inventory export and reuses the saved brand map (no catalog export)", async () => {
+test("11(z)/12. validated zero is a genuine zero; an absent brand or empty snapshot stays unavailable", () => {
+  const p = buildInv();
+  const inv = brandInventory(p, "Bebi Born", "IT", null);
+  assert.equal(inv.byCountry.get("DE"), 0, "the covered DE marketplace reports a validated zero, not a blank");
+  assert.equal(inv.accountTotal, 883 + 912 + 0);
+  assert.equal(brandInventory(p, "Brand Not In Snapshot", "IT", null).accountTotal, null, "no invented zero for an absent brand");
+  const empty = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: [], brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000 });
+  assert.deepEqual([empty.inventoryAvailable, empty.inventoryDate, empty.inventoryByBrandCountry], [false, null, []]);
+});
+
+/* ---- BLOCKER 3: no second Product Catalog export; missing map fails before the FBA export ---- */
+
+await asyncTest("13. successful refresh spends exactly ONE FBA export and ZERO Catalog exports (<= 3 per account)", async () => {
   let invCalls = 0;
-  let catalogCalls = 0;
-  const getSnapshot = async ({ reportKey }) => (reportKey === "brand-sales"
-    ? { payload: { asinBrand: { B00BEBI001: "Bebi Born", B00BEBI002: "Bebi Born" } }, params: { from: "2025-06-07", to: "2026-07-28" } }
-    : null);
-  const { payload, catalogFetched } = await buildBrandInventorySnapshot({
-    accountId: ACCOUNT_A, accountCountry: "IT", rowLimit: 15000,
-    getSnapshot,
+  const { payload, asinBrandCount } = await buildBrandInventorySnapshot({
+    accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
+    getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales"
+      ? { payload: { asinBrand: { B00BEBI001: "Bebi Born", B00BEBI002: "Bebi Born" } }, params: { to: INV_TO } } : null),
     fetchInventoryRows: async () => { invCalls += 1; return INV_ROWS(); },
-    fetchCatalogRows: async () => { catalogCalls += 1; return []; },
+    // buildBrandInventorySnapshot has NO catalog fetcher parameter -> zero catalog exports by construction.
   });
   assert.equal(invCalls, 1, "exactly one FBA Inventory Health export");
-  assert.equal(catalogCalls, 0, "the saved brand-sales asinBrand map is reused; NO duplicate Product Catalog export");
-  assert.equal(catalogFetched, false);
+  assert.ok(asinBrandCount >= 1, "the saved brand-sales asinBrand map is reused");
   assert.equal(payload.inventoryByBrandCountry.find((e) => e.country === "IT" && e.brand === "Bebi Born").fbaAvailable, 883);
 });
 
-await asyncTest("15b. only when the saved snapshot lacks a brand map is the catalog source fetched, at the sales window", async () => {
-  let catalogArgs = null;
-  const getSnapshot = async ({ reportKey }) => (reportKey === "brand-sales"
-    ? { payload: { rows: [{ product_brand: "Bebi Born" }] }, params: { from: "2025-06-07", to: "2026-07-28" } } // no asinBrand map
-    : null);
-  const { catalogFetched } = await buildBrandInventorySnapshot({
-    accountId: ACCOUNT_A, accountCountry: "IT", rowLimit: 15000,
-    getSnapshot,
-    fetchInventoryRows: async () => INV_ROWS(),
-    fetchCatalogRows: async (window) => { catalogArgs = window; return [{ child_asin: "B00BEBI001", product_brand: "Bebi Born" }]; },
-  });
-  assert.equal(catalogFetched, true, "an older snapshot with no asinBrand falls back to the catalog source");
-  assert.deepEqual(catalogArgs, { from: "2025-06-07", to: "2026-07-28" }, "the catalog window matches brand-sales so the shared source cache serves it (no duplicate export)");
+await asyncTest("11/12. a missing asinBrand (e.g. Brand Sales catalog just failed) fails BEFORE the FBA export: zero exports", async () => {
+  let invCalls = 0;
+  await assert.rejects(
+    () => buildBrandInventorySnapshot({
+      accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
+      getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales" ? { payload: { rows: [{ product_brand: "Bebi Born" }] } } : null), // no asinBrand map
+      fetchInventoryRows: async () => { invCalls += 1; return INV_ROWS(); },
+    }),
+    (error) => error.brandInventorySafe === true && /Brand Sales/i.test(error.message)
+  );
+  assert.equal(invCalls, 0, "no FBA Inventory export is spent when the brand map is missing; no catalog fetcher exists at all");
 });
 
 await asyncTest("7. an inventory DataDoe failure throws (nothing is saved) so a prior good snapshot survives", async () => {
   await assert.rejects(
     () => buildBrandInventorySnapshot({
-      accountId: ACCOUNT_A, accountCountry: "IT", rowLimit: 15000,
+      accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
       getSnapshot: async () => ({ payload: { asinBrand: { B00BEBI001: "Bebi Born" } } }),
       fetchInventoryRows: async () => { throw new Error("simulated DataDoe outage"); },
-      fetchCatalogRows: async () => [],
     }),
     /simulated DataDoe outage/
   );
 });
 
-test("2. the source-fetch action is admin-only on the SERVER, not merely hidden in the UI", () => {
+test("15. the source-fetch action is admin-only on the SERVER, not merely hidden in the UI", () => {
   assert.throws(() => assertAdmin({ role: "member" }), (error) => error instanceof DashboardAccessError && error.status === 403);
   assert.throws(() => assertAdmin({ role: "viewer" }), DashboardAccessError);
   assert.doesNotThrow(() => assertAdmin({ role: "admin" }));
 });
 
-test("14. primary and legacy dd-secondary IDs never mix in the inventory refresh params", () => {
+test("16. primary and legacy dd-secondary IDs never mix in the inventory refresh params", () => {
   const { eligible, skipped } = partitionBrandSourceAccounts([
     { id: "A1", country: "IN" }, { id: "dd-secondary:LEG", country: "GB" },
   ]);
   assert.deepEqual(eligible.map((a) => a.id), ["A1"]);
   assert.deepEqual(skipped.map((a) => a.id), ["dd-secondary:LEG"]);
-  // The inventory params never carry a stripped secondary id: they use the public
-  // id verbatim, so a dd-secondary account can never be routed through the primary key.
   assert.deepEqual(brandInventoryRefreshParams({ id: "A1" }, "2026-08-12"), {
     action: "brand-inventory", reportVersion: "brand-inventory-shared-v1", ids: "A1", to: "2026-08-12",
-  });
+  }, "the public id is used verbatim; a dd-secondary account is never stripped onto the primary key");
 });
+
+/* ---- BLOCKER 2: a valid compact snapshot is authoritative; no stale FBA Plan resurrection ---- */
 
 // A getSnapshot that layers a compact brand-inventory snapshot over the shared fixtures.
 function getSnapshotWithInventory(extra) {
@@ -487,64 +515,73 @@ function getSnapshotWithInventory(extra) {
     return fakeGetSnapshot({ reportKey, accountId });
   };
 }
-
-await asyncTest("13. Brand View consumes the compact brand-inventory snapshot before the fba-plan fallback", async () => {
-  const compact = {
-    [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: {
-      source_refreshed_at: "2026-07-29T06:00:00.000Z",
-      params: { to: "2026-07-28" },
-      payload: {
-        accountId: ACCOUNT_A, inventoryDate: "2026-07-29", inventoryAvailable: true,
-        inventoryByBrandCountry: [
-          { country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 },
-          { country: "DE", brand: "Bebi Born", fbaAvailable: 0, skuCount: 1 },
-        ],
-      },
-    },
-  };
-  const slice = await buildAccountBrandSlice({
-    accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28",
-    account: { name: "Bebi EU", country: "IT" },
-    getSnapshot: getSnapshotWithInventory(compact), getAdsRows: fakeGetAdsRows,
-  });
-  assert.equal(slice.inventory.byCountry.get("IT"), 1234, "the compact snapshot wins over the fba-plan snapshot (883)");
-  assert.equal(slice.inventory.byCountry.get("DE"), 0, "a validated zero is preserved");
-  assert.equal(slice.inventoryDate, "2026-07-29", "inventoryDate comes from the compact snapshot");
-  // Falls back to fba-plan when no compact snapshot exists (unchanged legacy path).
-  const legacySlice = await buildAccountBrandSlice({
-    accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28",
-    account: { name: "Bebi EU", country: "IT" },
-    getSnapshot: fakeGetSnapshot, getAdsRows: fakeGetAdsRows,
-  });
-  assert.equal(legacySlice.inventory.byCountry.get("IT"), 883, "without a compact snapshot the fba-plan value is used");
+const compactSnap = (inventoryByBrandCountry, over = {}) => ({
+  [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: {
+    source_refreshed_at: "2026-07-29T06:00:00.000Z",
+    params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" },
+    payload: { accountId: ACCOUNT_A, inventoryDate: "2026-07-29", inventoryAvailable: inventoryByBrandCountry.length > 0, inventoryByBrandCountry },
+    ...over,
+  },
+});
+const sliceFor = (getSnapshot) => buildAccountBrandSlice({
+  accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28",
+  account: { name: "Bebi EU", country: "IT" }, getSnapshot, getAdsRows: fakeGetAdsRows,
 });
 
-await asyncTest("1. a Brand View portfolio rebuild reads only saved snapshots (zero DataDoe exports)", async () => {
-  const compact = {
-    [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: {
-      source_refreshed_at: "2026-07-29T06:00:00.000Z",
-      payload: {
-        accountId: ACCOUNT_A, inventoryDate: "2026-07-29", inventoryAvailable: true,
-        inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 }],
-      },
-    },
-  };
+test("isCompactInventorySnapshot validates the report version + compact shape", () => {
+  assert.equal(isCompactInventorySnapshot(compactSnap([])[`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]), true);
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: "some-old-version" }, payload: { inventoryByBrandCountry: [] } }), false, "wrong version is not authoritative");
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION }, payload: {} }), false, "no compact shape");
+  assert.equal(isCompactInventorySnapshot(null), false);
+});
+
+await asyncTest("13(auth). a valid compact snapshot is AUTHORITATIVE and wins over the fba-plan snapshot", async () => {
+  const slice = await sliceFor(getSnapshotWithInventory(compactSnap([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 },
+    { country: "DE", brand: "Bebi Born", fbaAvailable: 0, skuCount: 1 },
+  ])));
+  assert.equal(slice.inventory.byCountry.get("IT"), 1234, "compact wins over the fba-plan value (883)");
+  assert.equal(slice.inventory.byCountry.get("DE"), 0, "a validated zero is preserved");
+  assert.equal(slice.inventoryDate, "2026-07-29", "inventoryDate comes from the compact snapshot");
+});
+
+await asyncTest("8(b). an EMPTY valid compact snapshot shows unavailable, NOT a stale FBA Plan value", async () => {
+  const slice = await sliceFor(getSnapshotWithInventory(compactSnap([])));
+  assert.equal(slice.inventory.accountTotal, null, "empty compact => unavailable");
+  assert.equal(slice.inventory.byCountry.size, 0);
+  assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "the stale fba-plan IT value (883) is NOT resurrected");
+});
+
+await asyncTest("9(b). a compact snapshot WITHOUT the selected brand stays unavailable, not stale legacy data", async () => {
+  const slice = await sliceFor(getSnapshotWithInventory(compactSnap([
+    { country: "IT", brand: "Nordfell", fbaAvailable: 5000, skuCount: 9 }, // present, but not Bebi Born
+  ])));
+  assert.equal(slice.inventory.accountTotal, null, "absent brand in a valid compact snapshot => unavailable");
+  assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "no fallback to the stale fba-plan value");
+});
+
+await asyncTest("10. with NO compact snapshot the temporary legacy fba-plan fallback is still allowed", async () => {
+  const slice = await sliceFor(fakeGetSnapshot); // fixtures have an fba-plan snapshot, no brand-inventory
+  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no compact snapshot => legacy fba-plan value is used");
+  // A wrong-version compact snapshot is treated as no valid compact snapshot -> legacy fallback.
+  const wrongVersion = { [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: { params: { reportVersion: "brand-inventory-OLD" }, payload: { inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 1 }] } } };
+  const slice2 = await sliceFor(getSnapshotWithInventory(wrongVersion));
+  assert.equal(slice2.inventory.byCountry.get("IT"), 883, "a wrong-version compact snapshot is not authoritative; legacy fallback applies");
+});
+
+await asyncTest("14. a Brand View portfolio rebuild reads only saved snapshots (zero DataDoe exports)", async () => {
   let snapshotReads = 0;
-  const countingGetSnapshot = ({ reportKey, accountId }) => {
-    snapshotReads += 1;
-    return getSnapshotWithInventory(compact)({ reportKey, accountId });
-  };
-  // The portfolio build has NO DataDoe fetcher parameter at all; it can only read
-  // saved snapshots and persisted Ads rows. A successful build therefore proves a
-  // normal load/refresh spends zero DataDoe exports.
+  const getSnapshot = getSnapshotWithInventory(compactSnap([{ country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 }]));
+  const countingGetSnapshot = ({ reportKey, accountId }) => { snapshotReads += 1; return getSnapshot({ reportKey, accountId }); };
+  // The portfolio build has NO DataDoe fetcher parameter, so a successful build proves
+  // a normal load/refresh spends zero DataDoe exports.
   const portfolio = await buildBrandViewPortfolioSnapshot({
     accountIds: [ACCOUNT_A], brand: "Bebi Born", asOf: "2026-07-28",
     accountsById: { [ACCOUNT_A]: { name: "Bebi EU", country: "IT" } },
     getSnapshot: countingGetSnapshot, getAdsRows: fakeGetAdsRows,
   });
   assert.ok(snapshotReads > 0, "the rebuild read saved snapshots");
-  const italy = portfolio.series.find((row) => row.c === "IT");
-  assert.ok(italy, "the shared portfolio still renders the country series from saved data");
+  assert.ok(portfolio.series.find((row) => row.c === "IT"), "the shared portfolio renders the country series from saved data");
 });
 
 /* ================================================= 3. the built snapshot shape */
