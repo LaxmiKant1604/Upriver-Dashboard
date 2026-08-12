@@ -1,5 +1,35 @@
 # Project Memory
 
+## Integration: merged deployed main (Brand View + Brand Directory hotfix) into feature/scheduler-v2 (2026-08-12)
+
+INTEGRATION ONLY (Codex-directed). Merged `origin/main` @ `be7cb04` (the deployed Brand View / Brand
+Directory catalog retry-flow hotfix, tree === approved `ff54bf2`) into `feature/scheduler-v2` @ `acc5052`
+with a **merge commit** (no rebase; long Scheduler v2 history intact). Merge commit `3c0b3de` (parents
+`acc5052` + `be7cb04`). Backup ref `backup/scheduler-v2-preintegration-acc5052` @ acc5052. Nothing pushed,
+deployed, migrated, enabled, unlocked, or scheduled. `HANDOFF.md` + `.worktrees/` stayed untracked/unstaged.
+
+**3 conflicts, resolved by keeping BOTH sides:**
+- `lib/server/supabase.js` — scheduler's Ads pagination + `isSchemaMissingError` AND main's
+  `getReportSnapshotsOlderThan` / `deleteReportSnapshotByKey` / `isSafeSnapshotRev` /
+  `casUpdateReportSnapshotByRev` (independent helpers; closed `paginateAdDailyMetrics` before the main block).
+- `api/datadoe.js` — `catalogBrandNames` keeps scheduler's `export` AND main's "Unassigned" doc comment
+  (identical body). Main's full Brand Directory hotfix auto-merged in; scheduler exports preserved.
+- `PROJECT_MEMORY.md` — kept both logs (Scheduler v2 entries AND the Brand View hotfix + "Production
+  scheduled sync temporarily paused" entries).
+Auto-merged cleanly: `source-contracts.js`, `App.jsx`, and main's v1-pause (`vercel.json` crons removed;
+`scheduled-sync.yml` `workflow_dispatch`-only). `registry.js` took main's comment-only pause note.
+
+**Invariants held (verified):** `lib/server/datadoe.js` (golden `request_hash` / `sourceRequestIdentity`)
+byte-identical to acc5052; Product Catalog id `68d2de238e` canonical, long id alias-only (never POSTed, no
+fallback); primary-only routing (dd-secondary dormant, never routed to primary); Scheduler v1 **paused**
+(no cron/GitHub-Actions/Vercel-cron auto sync); Scheduler v2 **shadow-only + locked**.
+
+**Verification (all exit 0):** source-identity **7**, report-contracts **161**, brand-view **78**,
+source-cache **73**, sync-engine **79**, report-derivation **402**, insights **54**, sync **23**,
+report-sync-controls **9**; `npm run verify` green + `build:check` **2,395 modules**; `git diff --check`
+clean; no conflict markers. Live Product Catalog 404 unchanged (upstream DataDoe gate). STOP for Codex
+review; Listing Optimizer NOT started.
+
 ## Scheduler v2 Phase 1c — correction re-review blockers fixed (2026-08-07)
 
 Fixed the five re-review blockers on `feature/scheduler-v2` (commits `1d273d2`,
