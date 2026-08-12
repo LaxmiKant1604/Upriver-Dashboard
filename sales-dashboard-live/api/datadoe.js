@@ -365,6 +365,30 @@ function isPrimaryCatalogAccount(accountId) {
   return Boolean(id) && !id.startsWith("dd-secondary:");
 }
 
+// PURE: which accounts a fresh explicit action should attempt once, given the accounts
+// just DISCOVERED from the primary DataDoe organization and the shared-snapshot directory
+// state. Discovery is the sole source of the active set -- a newly added primary account
+// needs no code change, config, or manual mapping to appear here:
+//   - a newly discovered primary account (no snapshot yet -> pending) is scheduled;
+//   - a previously-unavailable primary account is scheduled (retry), never starved;
+//   - an already-complete account is NOT in the pending/unavailable candidate set, so it
+//     is never attempted twice;
+//   - a REMOVED account (absent from the current discovery) is never scheduled, even if a
+//     stale pending/unavailable marker still names it -- its last-known-good snapshot is
+//     left untouched;
+//   - a dormant `dd-secondary:` record is never treated as a primary catalog account.
+export function catalogSyncEligibleAccounts(discoveredAccountIds, directory = {}) {
+  const discoveredPrimary = new Set(
+    [...new Set((discoveredAccountIds || []).map((id) => String(id || "").trim()).filter(Boolean))]
+      .filter(isPrimaryCatalogAccount)
+  );
+  const unavailable = directory.catalogUnavailable instanceof Map
+    ? [...directory.catalogUnavailable.keys()]
+    : (directory.catalogUnavailable || []);
+  const candidate = new Set([...(directory.catalogPendingAccountIds || []), ...unavailable].map((id) => String(id)));
+  return [...candidate].filter((id) => discoveredPrimary.has(id)).sort();
+}
+
 // A catalog counts as brand coverage ONLY when it contains at least one USABLE mapping:
 // a non-empty child_asin joined to a real, non-empty product_brand. "Unassigned" is the
 // no-brand placeholder and is never a real brand. Returns the sorted distinct real
@@ -753,13 +777,36 @@ function stableSelectionId(prefix, accountIds) {
 // browser can establish its account scope from Supabase before it reads the
 // saved Brand View directory. The accounts response still filters this shared
 // record by the requesting user's permissions.
+// PURE: reconcile the freshly discovered accounts with the previously saved directory.
+// Discovery is the source of truth for which accounts are ACTIVE, so a brand-new account
+// simply appears (active), with no code, config, or manual mapping. A previously-known
+// account that is no longer discoverable is RETAINED as inactive/read-only (`active:false`)
+// rather than dropped, so its record and its saved last-known-good data are never deleted;
+// it is also never scheduled again (see catalogSyncEligibleAccounts, which uses discovery).
+// If a removed account is rediscovered later it becomes active again. Every discovered
+// account keeps its real public id (a primary raw seller id is never mutated, a secondary
+// keeps its `dd-secondary:` prefix), so primary and dormant secondary records never merge.
+export function mergeAccountDirectory(priorAccounts, discoveredAccounts) {
+  const discovered = Array.isArray(discoveredAccounts) ? discoveredAccounts : [];
+  const discoveredIds = new Set(discovered.map((account) => String(account.id)));
+  const merged = discovered.map((account) => ({ ...account, active: true }));
+  for (const prior of Array.isArray(priorAccounts) ? priorAccounts : []) {
+    if (discoveredIds.has(String(prior.id))) continue; // superseded by the fresh discovery
+    merged.push({ ...prior, active: false }); // inactive/read-only; record + LKG preserved
+  }
+  return merged;
+}
+
 async function persistAccountDirectory(accounts) {
   if (!isSupabaseConfigured() || !accounts.length) return;
   const reportKey = "account-directory";
   const reportVersion = "account-directory-shared-v1";
   const accountId = "__account-directory__";
   const paramsHash = paramsHashFor(reportVersion, {});
-  const payload = { accounts };
+  // Merge with the prior directory so a removed/inaccessible account becomes inactive
+  // (read-only) instead of vanishing, and no saved snapshot is ever deleted.
+  const prior = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
+  const payload = { accounts: mergeAccountDirectory(prior?.payload?.accounts, accounts) };
   const saved = await saveReportSnapshot({
     reportKey,
     accountId,
@@ -842,12 +889,19 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
     case "accounts":
       return {
         reportKey: "account-directory", reportVersion: "account-directory-shared-v1", accountId: "__account-directory__", params: {}, label: "account directory",
-        present: (payload) => ({
-          ...payload,
-          accounts: access.role === "admin"
-            ? (payload.accounts || [])
-            : (payload.accounts || []).filter((account) => access.accountIds.includes(String(account.id))),
-        }),
+        present: (payload) => {
+          // Inactive (removed/inaccessible) accounts are RETAINED in the durable directory
+          // snapshot as read-only records, but are not offered as selectable accounts, so the
+          // live selector behaves exactly as before. `active !== false` keeps legacy entries
+          // (saved before this field existed) visible.
+          const selectable = (payload.accounts || []).filter((account) => account.active !== false);
+          return {
+            ...payload,
+            accounts: access.role === "admin"
+              ? selectable
+              : selectable.filter((account) => access.accountIds.includes(String(account.id))),
+          };
+        },
       };
     case "brand-directory":
       if (!publicAccountIds.length) return null;
@@ -1893,19 +1947,19 @@ export default async function handler(req, res) {
       // previously-unavailable accounts also require an explicit retry and must never be
       // starved. Page load / normal reads never enter this branch (cache-only above).
       if (wantsRefresh(req)) {
-        // First click: the full eligible set = never-attempted (pending) PLUS
-        // previously-unavailable, primary-only. Continuation: exactly the accounts the
-        // browser carried forward in `catalogSyncAccountIds`, re-authorised and
-        // primary-filtered (fail closed for unknown / secondary / duplicate ids). Either
-        // way the cursor only ever shrinks, so no account is attempted twice and the loop
-        // always terminates.
+        // First click: the eligible set = the accounts JUST DISCOVERED from the primary
+        // organization that still need a one-time attempt (never-attempted/pending PLUS
+        // previously-unavailable), primary-only -- so a newly added primary account is
+        // scheduled automatically with no code change, and a removed account is never
+        // scheduled. Continuation: exactly the accounts the browser carried forward in
+        // `catalogSyncAccountIds`, re-authorised and primary-filtered (fail closed for
+        // unknown / secondary / duplicate ids). Either way the cursor only ever shrinks, so
+        // no account is attempted twice and the loop always terminates.
         const carriedCursor = String(req.query.catalogSyncAccountIds || "").split(",").map((s) => s.trim()).filter(Boolean);
         const authorized = new Set(publicAccountIds.map(String));
         const eligibleCursor = continuingBrandDirectorySync
           ? carriedCursor.filter((id) => authorized.has(id) && isPrimaryCatalogAccount(id))
-          : [...new Set([...directory.catalogPendingAccountIds, ...directory.catalogUnavailable.keys()])]
-              .filter((id) => isPrimaryCatalogAccount(id))
-              .sort();
+          : catalogSyncEligibleAccounts(publicAccountIds, directory);
         const { batch, remainingAccountIds: remaining } = nextCatalogBatch(eligibleCursor, BRAND_CATALOG_BATCH_SIZE);
         remainingAccountIds = remaining;
         if (batch.length) {
