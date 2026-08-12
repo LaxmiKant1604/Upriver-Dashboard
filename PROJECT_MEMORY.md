@@ -2436,6 +2436,30 @@ exact 06:00 local time becomes a business requirement.
 
 ## How to resume cold
 
+## Temporary Brand View DataDoe refresh (2026-08-12)
+
+- Production-main bridge implemented on `codex/brand-view-manual-refresh` in
+  commit `01d8402`; Scheduler v2 work was not touched.
+- Brand View now shows admins a separate **Fetch latest data** action. The
+  existing **Refresh / Build from saved data** action remains Supabase-only.
+- The temporary action refreshes `brand-sales-shared-v1` once per mapped
+  primary account, sequentially, with no browser retry. It then rebuilds the
+  selected portfolio brand from the saved account snapshots so all permitted
+  users read the same result. A Brand Sales refresh can create at most the two
+  existing canonical exports for that account (Order Line Items + Product
+  Catalog), subject to the shared source cache.
+- Individual account failures preserve their last-known-good snapshots and do
+  not stop later accounts. The UI names failed accounts without exposing raw
+  upstream errors.
+- Legacy `dd-secondary:` mappings are deliberately skipped instead of being
+  stripped and sent to the primary API. After moving those sellers to primary,
+  refresh the account directory and brand directory so the saved mapping uses
+  the current primary account IDs.
+- Verification: `npm run verify` passed 54 insight + 61 Brand View + 23 sync +
+  6 source-cache assertions and the full 2,394-module Vite production build.
+  The local browser reached the login screen; authenticated live DataDoe
+  verification remains a deployment gate.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
