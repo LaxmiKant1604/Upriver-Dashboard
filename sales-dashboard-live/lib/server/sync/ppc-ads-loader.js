@@ -24,6 +24,10 @@
 import { addDaysStr } from "../date-windows.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { adsCurrencySignal } from "./source-signals.js";
+// The CLOSED allowlist of admin-safe coverage reason codes -- the SAME set the pure payload leaf uses to
+// sanitize `coverageUnavailableReason`, so the injected-derive contract and the saved payload share ONE source
+// of truth. derivation-core.js is an import-free pure leaf (no transport/storage), so this adds none.
+import { PPC_COVERAGE_REASON_CODES } from "../reports/derivation-core.js";
 
 // The four persisted Ads source_keys PPC reads -- byte-identical to the ADS_* syncKeys the live builder uses.
 // The two DEFAULT datasets (campaign + ASIN) are REQUIRED: their complete coverage gates the whole Ads
@@ -40,6 +44,8 @@ export const PPC_ADS_WINDOW_DAYS = 30;
 export const PPC_MAX_ADS_ROWS = 120000;
 const PPC_SOURCE_KEY_SET = new Set(PPC_SOURCE_KEYS);
 const PPC_REQUIRED_SOURCE_KEY_SET = new Set(PPC_REQUIRED_SOURCE_KEYS);
+// Recognized safe coverage reason codes (the contract validator rejects anything else on an unproven entry).
+const PPC_COVERAGE_REASON_SET = new Set(PPC_COVERAGE_REASON_CODES);
 
 /**
  * PURE fail-closed validation of already-fetched persisted Ads rows against the authoritative window +
@@ -135,11 +141,15 @@ export function evaluateSourceCoverage(coverageState, from, to) {
 /**
  * PURE typed CONTRACT for the `sourceCoverage` a validated PPC Ads context MUST carry. Enforced in BOTH the
  * loader (on its own output) AND the derive adapter (on the injected `context.ppcAds`) so no wrong / future
- * loader wiring can slip an unproven empty snapshot past the durable-coverage gate. Returns { ok, reason }.
- * Requires EXACTLY the four known PPC source keys, each once (no missing / duplicate / unknown key), booleans
- * for required/proven/folded, the `required` flag matching the registry (campaign + ASIN required, targeting +
- * search optional), campaign + ASIN proven AND folded, and every OPTIONAL `folded` exactly equal to its
- * `proven`. No I/O.
+ * loader wiring can slip an unproven empty snapshot -- OR an unsafe `reason` string -- past the durable-coverage
+ * gate. Returns { ok, reason }. Requires EXACTLY the four known PPC source keys, each once (no missing /
+ * duplicate / unknown key), booleans for required/proven/folded, the `required` flag matching the registry
+ * (campaign + ASIN required, targeting + search optional), campaign + ASIN proven AND folded, every OPTIONAL
+ * `folded` exactly equal to its `proven`, AND a consistent, admin-safe `reason`:
+ *   - proven:true            => reason MUST be null (a proven source has no unavailable reason);
+ *   - optional proven:false  => folded:false AND reason MUST be a recognized allowlisted safe code
+ *                               (never a raw DB/HTTP/URL/credential/exception string).
+ * A missing / malformed / contradictory / unknown reason fails closed. No I/O.
  */
 export function validatePpcSourceCoverage(sourceCoverage) {
   if (!Array.isArray(sourceCoverage)) return { ok: false, reason: "source-coverage-not-array" };
@@ -163,6 +173,14 @@ export function validatePpcSourceCoverage(sourceCoverage) {
       // optional targeting / search: folded iff proven (an unproven optional must NOT be folded, and a proven
       // optional must be folded -- a contradiction means tampered/inconsistent evidence).
       return { ok: false, reason: "source-coverage-optional-folded-not-equal-proven" };
+    }
+    // Reason consistency (admin-safe typed-code guarantee): a proven source carries NO reason; an unproven
+    // source (only optional reaches here -- an unproven required already failed above) MUST carry a recognized
+    // allowlisted safe code, so a raw DB/HTTP/URL/credential/exception string is rejected, never persisted.
+    if (entry.proven === true) {
+      if (entry.reason !== null) return { ok: false, reason: "source-coverage-proven-reason-not-null" };
+    } else if (typeof entry.reason !== "string" || !PPC_COVERAGE_REASON_SET.has(entry.reason)) {
+      return { ok: false, reason: "source-coverage-unproven-reason-unsafe" };
     }
   }
   // length === four, no duplicates, no unknown keys, all drawn from the four-key set => all four are present.
