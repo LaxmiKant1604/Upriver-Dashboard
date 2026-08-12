@@ -80,9 +80,11 @@ export function validatePpcAdsRows({ rows, from, to, accountId }) {
 
 /**
  * PURE: do the DURABLE successful coverage windows FULLY span [from, to] with no gap? Overlapping/adjacent
- * windows merge; a malformed window (bad date, from>to) is ignored (fail-closed). Returns true ONLY when the
- * merged successful coverage begins at/before `from` and reaches `to` with no interior gap. Coverage is
- * proven from these windows alone -- NEVER from metric-row min/max or latest_metric_date. No I/O.
+ * windows merge; the merged coverage must begin at/before `from` and reach `to` with no interior gap. This is
+ * the SPAN check only -- structural window validation (real dates, from<=to, plain object) is enforced by
+ * `evaluateSourceCoverage` BEFORE this runs, so a malformed window can no longer be papered over by a valid
+ * sibling. Its defensive filter remains for standalone safety. Coverage is proven from these windows alone --
+ * NEVER from metric-row min/max or latest_metric_date. No I/O.
  */
 export function coverageProvesWindow(windows, from, to) {
   if (!isValidCalendarDate(from) || !isValidCalendarDate(to) || from > to) return false;
@@ -100,17 +102,71 @@ export function coverageProvesWindow(windows, from, to) {
 }
 
 /**
- * PURE: evaluate ONE source's durable coverage state ({ windows, read, ... } from getAdsSyncCoverage) against
- * [from, to]. Returns { proven:boolean, reason:string|null }. A schema-missing / read-failed coverage read or
- * anything short of full-window durable coverage is NOT proven (fail-closed). No I/O.
+ * PURE fail-closed: evaluate ONE source's durable coverage state ({ windows, read, ... } from
+ * getAdsSyncCoverage) against [from, to]. Returns { proven:boolean, reason:string|null }. Hardened so absent /
+ * malformed evidence can NEVER read as proven:
+ *   - the state must be a plain object;
+ *   - `read` must EXPLICITLY equal "ok" (a missing/unknown/schema-missing/read-failed read is NOT success);
+ *   - `windows` must be a real array;
+ *   - EVERY supplied window must be a plain object with real from<=to calendar dates -- ONE malformed window
+ *     invalidates the whole evidence (a valid sibling window must NOT paper over it);
+ *   - and the merged successful windows must fully span [from, to] (partial / gap / stale => not proven).
+ * No I/O.
  */
 export function evaluateSourceCoverage(coverageState, from, to) {
-  const state = coverageState || {};
-  const read = state.read || (state.read === "" ? "" : "ok");
-  if (read === "schema-missing") return { proven: false, reason: "coverage-schema-missing" };
-  if (read !== "ok") return { proven: false, reason: "coverage-read-failed" };
-  if (!coverageProvesWindow(state.windows, from, to)) return { proven: false, reason: "coverage-incomplete" };
+  if (!coverageState || typeof coverageState !== "object" || Array.isArray(coverageState)) {
+    return { proven: false, reason: "coverage-state-malformed" };
+  }
+  const read = coverageState.read;
+  if (read !== "ok") {
+    return { proven: false, reason: read === "schema-missing" ? "coverage-schema-missing" : read === "read-failed" ? "coverage-read-failed" : "coverage-read-not-ok" };
+  }
+  const windows = coverageState.windows;
+  if (!Array.isArray(windows)) return { proven: false, reason: "coverage-windows-not-array" };
+  for (const w of windows) {
+    if (!w || typeof w !== "object" || Array.isArray(w) || !isValidCalendarDate(w.from) || !isValidCalendarDate(w.to) || w.from > w.to) {
+      return { proven: false, reason: "coverage-window-malformed" };
+    }
+  }
+  if (!coverageProvesWindow(windows, from, to)) return { proven: false, reason: "coverage-incomplete" };
   return { proven: true, reason: null };
+}
+
+/**
+ * PURE typed CONTRACT for the `sourceCoverage` a validated PPC Ads context MUST carry. Enforced in BOTH the
+ * loader (on its own output) AND the derive adapter (on the injected `context.ppcAds`) so no wrong / future
+ * loader wiring can slip an unproven empty snapshot past the durable-coverage gate. Returns { ok, reason }.
+ * Requires EXACTLY the four known PPC source keys, each once (no missing / duplicate / unknown key), booleans
+ * for required/proven/folded, the `required` flag matching the registry (campaign + ASIN required, targeting +
+ * search optional), campaign + ASIN proven AND folded, and every OPTIONAL `folded` exactly equal to its
+ * `proven`. No I/O.
+ */
+export function validatePpcSourceCoverage(sourceCoverage) {
+  if (!Array.isArray(sourceCoverage)) return { ok: false, reason: "source-coverage-not-array" };
+  if (sourceCoverage.length !== PPC_SOURCE_KEYS.length) return { ok: false, reason: "source-coverage-wrong-count" };
+  const seen = new Set();
+  for (const entry of sourceCoverage) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { ok: false, reason: "source-coverage-entry-malformed" };
+    const key = String(entry.sourceKey || "");
+    if (!PPC_SOURCE_KEY_SET.has(key)) return { ok: false, reason: "source-coverage-unknown-key" };
+    if (seen.has(key)) return { ok: false, reason: "source-coverage-duplicate-key" };
+    seen.add(key);
+    if (typeof entry.required !== "boolean" || typeof entry.proven !== "boolean" || typeof entry.folded !== "boolean") {
+      return { ok: false, reason: "source-coverage-flags-not-boolean" };
+    }
+    const requiredExpected = PPC_REQUIRED_SOURCE_KEY_SET.has(key);
+    if (entry.required !== requiredExpected) return { ok: false, reason: "source-coverage-required-flag-mismatch" };
+    if (requiredExpected) {
+      // campaign + ASIN are the DEFAULT datasets: a validated context MUST have proven AND folded them.
+      if (entry.proven !== true || entry.folded !== true) return { ok: false, reason: "source-coverage-required-not-proven-folded" };
+    } else if (entry.folded !== entry.proven) {
+      // optional targeting / search: folded iff proven (an unproven optional must NOT be folded, and a proven
+      // optional must be folded -- a contradiction means tampered/inconsistent evidence).
+      return { ok: false, reason: "source-coverage-optional-folded-not-equal-proven" };
+    }
+  }
+  // length === four, no duplicates, no unknown keys, all drawn from the four-key set => all four are present.
+  return { ok: true, reason: null };
 }
 
 // Read the durable coverage for one source, fail-closed. A THROWING/absent coverage reader is treated as a
@@ -181,6 +237,13 @@ export async function loadPersistedPpcAds({ accountId, asOf, getAdsDailySourceRo
   const provenKeys = new Set(sourceCoverage.filter((c) => c.proven).map((c) => c.sourceKey));
   const adsRows = validated.rows.filter((r) => provenKeys.has(String(r.source_key)));
   for (const c of sourceCoverage) c.folded = c.proven; // proven => its rows are folded; unproven => dropped
+
+  // Self-check the coverage contract on the loader's OWN output before declaring the context validated -- the
+  // SAME typed contract the derive adapter re-checks, so a construction drift here also fails closed.
+  const contract = validatePpcSourceCoverage(sourceCoverage);
+  if (!contract.ok) {
+    return { status: "unavailable", reason: `coverage-contract-${contract.reason}`, adsRows: [], syncStates, currencies: [], latestMetricDate: null, sourceCoverage };
+  }
 
   const currencies = [...new Set(adsRows.map((r) => String((r && r.currency) || "").trim()).filter(Boolean))].sort();
   const latestMetricDate = adsRows.reduce((latest, r) => (!latest || r.metric_date > latest ? r.metric_date : latest), null);
