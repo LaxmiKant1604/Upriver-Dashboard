@@ -660,7 +660,6 @@ export async function buildBrandSalesPayload({ apiKey, ids, from, to }) {
     CATALOG_ROW_LIMIT,
     { orderByColumn: "child_asin" }
   );
-  const rows = orderSalesByBrand(rawRows, catalog);
   // Additive ASIN->brand map from the catalog THIS refresh already fetched. It lets
   // the compact Brand View inventory refresh attribute FBA stock to brands without
   // spending a second Product Catalog export. Bounded by the account's catalog size
@@ -672,6 +671,21 @@ export async function buildBrandSalesPayload({ apiKey, ids, from, to }) {
     const brand = String(c.product_brand || "").trim();
     if (asin && brand && !(asin in asinBrand)) asinBrand[asin] = brand;
   }
+  // VALIDATE the Product Catalog BEFORE constructing/returning the payload. A DataDoe
+  // export can succeed yet be UNUSABLE for brand attribution: zero rows (the live
+  // primary Catalog currently has 0 rows), or rows carrying no usable
+  // child_asin -> product_brand pair. Building a snapshot then would save
+  // asinBrand:{} / catalogBrands:[] over a previously valid Brand Sales snapshot and
+  // lose real brand data. Fail closed here (an empty map means no usable mappings), so
+  // the caller never reaches sendLegacyPayload/saveReportSnapshot and the prior snapshot
+  // is preserved. Real Order Line Item sales are NOT saved as a new brand-scoped
+  // snapshot when attribution is unavailable, and "Unassigned" is never a real brand.
+  if (Object.keys(asinBrand).length === 0) {
+    const error = new Error("Product Catalog has no usable brand mappings yet. Previous saved Brand Sales data was preserved.");
+    error.brandSalesUnavailable = true;
+    throw error;
+  }
+  const rows = orderSalesByBrand(rawRows, catalog);
   // Derive the brand list from the account's already-joined sales rows, never
   // from wider catalog metadata, so the header brand filter cannot exceed scope.
   return { rows, catalogBrands: catalogBrandNames(rows), asinBrand };
