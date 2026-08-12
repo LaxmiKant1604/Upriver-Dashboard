@@ -1261,6 +1261,77 @@ await asyncTest("P1 production wrapper: insertReportSnapshotIfAbsent sends ignor
   }
 });
 
+/* =============== P2 fail-closed rev invariant at EVERY boundary =============== */
+
+const MALFORMED_REVS = [undefined, null, 0, -1, 1.5, "1", "abc", NaN, Number.MAX_SAFE_INTEGER, 2 ** 53];
+
+await asyncTest("P2 retention rev invariant: an in-progress manifest with a malformed rev is NEVER expired or deleted -- zero saves/deletes, manifest + attempts preserved", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  for (const badRev of MALFORMED_REVS) {
+    const m = makeRetentionModel(NOW);
+    m.add("ACT1", "in-progress", 40, ["A1", "A2"], 10); // old, expiresAt passed, valid rev 1
+    m.actions.get("ACT1").rev = badRev; // corrupt the stored rev
+    let saves = 0, deletes = 0;
+    const saveManifest = (a, mf) => { saves += 1; return m.saveManifest(a, mf); };
+    const deleteManifest = (a) => { deletes += 1; return m.deleteManifest(a); };
+    const deleteAttempt = (acct, a) => { deletes += 1; return m.deleteAttempt(acct, a); };
+    await pruneBrandCatalogActionRecords({ ...m, saveManifest, deleteManifest, deleteAttempt, nowMs: () => NOW });
+    const tag = String(badRev);
+    assert.equal(saves, 0, `rev=${tag}: retention performed ZERO saves (never expires a malformed rev; never treats it as create)`);
+    assert.equal(deletes, 0, `rev=${tag}: retention performed ZERO deletes`);
+    assert.ok(m.actions.has("ACT1"), `rev=${tag}: the manifest is preserved`);
+    assert.ok(m.attempts.has("ACT1::A1") && m.attempts.has("ACT1::A2"), `rev=${tag}: the attempts are preserved`);
+    assert.equal(m.actions.get("ACT1").status, "in-progress", `rev=${tag}: the action is not expired`);
+  }
+  // Control: a VALID rev is expired normally (proves the guard is not over-broad).
+  const m = makeRetentionModel(NOW);
+  m.add("ACT1", "in-progress", 40, ["A1"], 10); // valid rev 1, expiresAt passed
+  await pruneBrandCatalogActionRecords({ ...m, nowMs: () => NOW });
+  assert.equal(m.actions.get("ACT1").status, "expired", "a valid-rev abandoned action IS expired");
+});
+
+await asyncTest("P2 production wrapper: casUpdateReportSnapshotByRev fails closed on a malformed expectedRev or payload.rev with ZERO fetch calls", async () => {
+  const prev = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SECRET_KEY, svc: process.env.SUPABASE_SERVICE_ROLE_KEY };
+  process.env.SUPABASE_URL = "https://test.supabase.co";
+  process.env.SUPABASE_SECRET_KEY = "test-secret";
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const { casUpdateReportSnapshotByRev } = await import(`../lib/server/supabase.js?p2fresh=${passed}`);
+  const originalFetch = global.fetch;
+  let fetchCalls = 0;
+  try {
+    global.fetch = async () => { fetchCalls += 1; return new Response(JSON.stringify([{ id: "row-1" }]), { status: 200 }); };
+    // Malformed expectedRev -> THROWS before any fetch.
+    for (const badRev of MALFORMED_REVS) {
+      const before = fetchCalls;
+      await assert.rejects(
+        () => casUpdateReportSnapshotByRev({ reportKey: "k", accountId: "a", paramsHash: "h", expectedRev: badRev, payload: { rev: 2 } }),
+        /expectedRev must be a positive safe integer/,
+        `expectedRev=${String(badRev)} rejects`,
+      );
+      assert.equal(fetchCalls, before, `expectedRev=${String(badRev)} made ZERO fetch calls`);
+    }
+    // payload.rev !== expectedRev + 1 (incl. the string-concat "11" shape) -> THROWS before any fetch.
+    for (const badPayloadRev of [undefined, "11", "2", 1, 3, NaN]) {
+      const before = fetchCalls;
+      await assert.rejects(
+        () => casUpdateReportSnapshotByRev({ reportKey: "k", accountId: "a", paramsHash: "h", expectedRev: 1, payload: { rev: badPayloadRev } }),
+        /payload\.rev must equal expectedRev \+ 1/,
+        `payload.rev=${String(badPayloadRev)} rejects`,
+      );
+      assert.equal(fetchCalls, before, `payload.rev=${String(badPayloadRev)} made ZERO fetch calls`);
+    }
+    // A VALID pair issues exactly one PATCH and returns true when a row is returned.
+    const before = fetchCalls;
+    const won = await casUpdateReportSnapshotByRev({ reportKey: "k", accountId: "a", paramsHash: "h", expectedRev: 1, payload: { rev: 2 } });
+    assert.equal(fetchCalls, before + 1, "a valid (expectedRev, payload.rev=expectedRev+1) pair issues exactly one PATCH");
+    assert.equal(won, true, "a returned row means the CAS won");
+  } finally {
+    global.fetch = originalFetch;
+    process.env.SUPABASE_URL = prev.url; process.env.SUPABASE_SECRET_KEY = prev.key;
+    if (prev.svc === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = prev.svc;
+  }
+});
+
 await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const { calls, fetchCatalog } = countingFetch();
