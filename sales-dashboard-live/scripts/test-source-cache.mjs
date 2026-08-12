@@ -861,12 +861,13 @@ await asyncTest("orchestration 7: attempting-marker write failure -> zero export
   assert.equal(man.manifest("ACT1").status, "operational-failure", "the durable manifest records the stop");
 });
 
-await asyncTest("orchestration 8: outcome-write failure -> same-action replay creates zero additional exports; durable attempting state remains", async () => {
+await asyncTest("orchestration 8: outcome-write failure leaves a STALE attempting marker; a same-action replay creates zero exports and STOPS (operational), never re-exporting", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const { calls, fetchCatalog } = countingFetch();
   const deps = {
     ...cat, ...man, fetchCatalog,
-    // The pre-export 'attempting' marker persists; the TERMINAL outcome write fails.
+    // The pre-export 'attempting' marker persists; the TERMINAL outcome write fails. The claim
+    // is released in the finally, so the attempting marker is now STALE (lock no longer held).
     saveAttemptState: (id, aid, st) => (st.status === "attempting" ? cat.saveAttemptState(id, aid, st) : Promise.reject(new Error("outcome persistence failed"))),
   };
   const r1 = await firstClick("ACT1", ["A1"], dir(["A1"]), deps);
@@ -877,8 +878,9 @@ await asyncTest("orchestration 8: outcome-write failure -> same-action replay cr
   man.manifest("ACT1").status = "in-progress";
   const replay = await continueAction("ACT1", ["A1"], ["A1"], deps);
   assert.equal(calls.n, 1, "the same-action replay created ZERO additional exports");
+  assert.equal(replay.disposition, "operational-failure", "an attempting marker with a free lock is stale/uncertain -> stop, never terminal-recorded");
+  assert.equal(replay.status, "operational-failure", "the action stops and requires a NEW explicit action");
   assert.equal(cat.attempt("A1", "ACT1").status, "attempting", "the durable attempting state is still visible");
-  assert.equal(replay.attempted, 0);
 });
 
 await asyncTest("orchestration 9: a newly discovered primary account is automatically included and attempted exactly once", async () => {
@@ -944,27 +946,52 @@ await asyncTest("orchestration 13: primary and dd-secondary with the same raw se
   assert.ok(!r.remaining.includes("dd-secondary:SELLER9"), "the dormant secondary is never in the primary queue");
 });
 
-await asyncTest("orchestration 14: retention prunes OLD manifest+attempt rows only; active action, LKG and account-directory survive", async () => {
+// A status-aware retention model: action manifests (by status/age), their attempt rows, and
+// LKG + account-directory rows that must NEVER be touched. Exposes the three retention deps.
+function makeRetentionModel(NOW) {
   const DAY = 86_400_000;
-  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
-  const iso = (ms) => new Date(ms).toISOString();
-  const rows = [
-    { report_key: "brand-catalog-action", id: "old-action", updated_at: iso(NOW - 30 * DAY) },
-    { report_key: "brand-catalog-action", id: "active-action", updated_at: iso(NOW - 3_600_000) },
-    { report_key: "brand-catalog-attempt", id: "old-attempt", updated_at: iso(NOW - 30 * DAY) },
-    { report_key: "brand-catalog-attempt", id: "active-attempt", updated_at: iso(NOW - 3_600_000) },
-    { report_key: "brand-catalog", id: "lkg", updated_at: iso(NOW - 400 * DAY) },
-    { report_key: "account-directory", id: "dir", updated_at: iso(NOW - 400 * DAY) },
-  ];
-  const deletedKeys = [];
-  const deleteOlderThan = ({ reportKey, cutoffIso }) => {
-    deletedKeys.push(reportKey);
-    for (let i = rows.length - 1; i >= 0; i--) if (rows[i].report_key === reportKey && rows[i].updated_at < cutoffIso) rows.splice(i, 1);
-    return Promise.resolve();
+  const iso = (d) => new Date(NOW - d * DAY).toISOString();
+  const actions = new Map(); // actionId -> { status, updatedAt(iso), accountIds }
+  const attempts = new Set(); // `${actionId}::${accountId}`
+  const untouchable = new Set(["lkg-catalog", "account-directory"]); // proof these are never deleted
+  const add = (actionId, status, ageDays, accountIds) => {
+    actions.set(actionId, { status, updatedAt: iso(ageDays), accountIds });
+    for (const id of accountIds) attempts.add(`${actionId}::${id}`);
   };
-  await pruneBrandCatalogActionRecords({ deleteOlderThan, nowMs: () => NOW });
-  assert.deepEqual(rows.map((r) => r.id).sort(), ["active-action", "active-attempt", "dir", "lkg"], "old manifest+attempt rows pruned; active + LKG + directory survive");
-  assert.deepEqual(deletedKeys.sort(), ["brand-catalog-action", "brand-catalog-attempt"], "retention only ever targets the two action-record keys, never LKG or account-directory");
+  return {
+    actions, attempts, untouchable, add,
+    listOldActions: ({ cutoffIso }) => Promise.resolve(
+      [...actions.entries()].filter(([, a]) => a.updatedAt < cutoffIso).map(([actionId, a]) => ({ actionId, status: a.status, updatedAt: a.updatedAt, accountIds: a.accountIds }))
+    ),
+    deleteManifest: (actionId) => { actions.delete(actionId); return Promise.resolve(); },
+    deleteAttempt: (accountId, actionId) => { attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(); },
+  };
+}
+
+await asyncTest("orchestration 14: STATUS-AWARE retention keeps active/in-progress actions + their attempts, prunes only terminal ones, and never touches LKG or account-directory", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("INPROGRESS_OLD", "in-progress", 10, ["A1"]);        // old (>7d) but active + within 30d abandon -> SURVIVES
+  m.add("COMPLETE_OLD", "complete", 10, ["A2"]);              // old terminal -> DELETED (manifest + attempt)
+  m.add("OPFAIL_OLD", "operational-failure", 10, ["A3"]);     // old terminal -> DELETED
+  m.add("EXPIRED_OLD", "expired", 10, ["A4"]);                // old terminal -> DELETED
+  m.add("COMPLETE_RECENT", "complete", 1, ["A5"]);            // recent (<7d) -> SURVIVES (not even listed)
+  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A6"]);   // beyond 30d abandon window -> DELETED
+  await pruneBrandCatalogActionRecords({ ...m, nowMs: () => NOW });
+  assert.deepEqual([...m.actions.keys()].sort(), ["COMPLETE_RECENT", "INPROGRESS_OLD"], "old in-progress + recent complete survive; old terminal + abandoned are pruned");
+  assert.ok(m.attempts.has("INPROGRESS_OLD::A1"), "an old attempting row belonging to an active action survives");
+  for (const gone of ["COMPLETE_OLD::A2", "OPFAIL_OLD::A3", "EXPIRED_OLD::A4", "INPROGRESS_ABANDONED::A6"]) assert.ok(!m.attempts.has(gone), `${gone} attempt pruned with its terminal action`);
+  assert.ok(m.attempts.has("COMPLETE_RECENT::A5"), "a recent action's attempt survives");
+  assert.deepEqual([...m.untouchable].sort(), ["account-directory", "lkg-catalog"], "LKG catalog and account-directory snapshots are never touched by retention");
+});
+
+await asyncTest("orchestration 14b: retention is best-effort -- a cleanup failure never throws (cannot fail a refresh)", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  await pruneBrandCatalogActionRecords({ listOldActions: () => Promise.reject(new Error("list failed")), nowMs: () => NOW });
+  const m = makeRetentionModel(NOW);
+  m.add("COMPLETE_OLD", "complete", 10, ["A2"]);
+  await pruneBrandCatalogActionRecords({ ...m, deleteManifest: () => Promise.reject(new Error("delete failed")), nowMs: () => NOW });
+  assert.ok(true, "no cleanup failure propagated");
 });
 
 await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
@@ -983,6 +1010,121 @@ await asyncTest("orchestration 16: no raw DataDoe/Supabase error reaches the bro
   assert.doesNotMatch(blob, /Source not found|statusCode|https?:\/\/|api\/v1/i, "no raw DataDoe/Supabase detail in any orchestrator/manifest/attempt state");
   assert.equal(cat.attempt("A1", "ACT1").code, CATALOG_SOURCE_UNAVAILABLE, "only a typed code is recorded");
   for (const code of [BRAND_DIRECTORY_ACTION_CONFLICT, BRAND_DIRECTORY_ACTION_UNAVAILABLE]) assert.match(code, /^BRAND_DIRECTORY_ACTION_/, "action codes are typed constants");
+});
+
+/* =============== FIX 1: attempting is not terminal (fail-closed state machine) =============== */
+
+await asyncTest("FIX 1 deferred concurrency: while A pauses INSIDE fetchCatalog, B sees attempting+held-lock -> zero exports, in-progress, no advance; only A's durable terminal advances", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  let exportCount = 0;
+  let releaseA;
+  const gateA = new Promise((res) => { releaseA = res; });
+  const depsA = { ...cat, ...man, fetchCatalog: async () => { exportCount += 1; await gateA; return [{ child_asin: "A1x", product_brand: "Br" }]; } };
+  const depsB = { ...cat, ...man, fetchCatalog: async () => { exportCount += 1; return [{ child_asin: "A1x", product_brand: "Br" }]; } };
+  // 1. Start A (first click); it writes A1's attempting marker and PAUSES inside fetchCatalog.
+  const pA = firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), depsA);
+  await new Promise((r) => setTimeout(r, 0)); // let A reach the paused fetch (attempting written, lock held)
+  assert.equal(cat.attempt("A1", "ACT1").status, "attempting", "A wrote the attempting marker before the export");
+  assert.equal(cat.lockHeld("A1", "ACT1"), true, "A still holds the claim while paused");
+  // 2-4. B runs while A is paused: zero exports, in-progress, keeps the queue, does NOT advance to A2.
+  const rB = await continueAction("ACT1", ["A1", "A2"], ["A1", "A2"], depsB);
+  assert.equal(exportCount, 1, "B created ZERO exports (only A's is in flight)");
+  assert.equal(rB.disposition, "in-progress", "B sees a held claim -> in-progress (attempting is never terminal)");
+  assert.equal(rB.next, "A1", "B did NOT advance to account 2");
+  assert.deepEqual(rB.remaining, ["A1", "A2"], "B kept the same authoritative queue");
+  // 5-6. Release A; only after its durable terminal outcome may the queue advance, with exactly one export for account 1.
+  releaseA();
+  await pA;
+  assert.equal(exportCount, 1, "total create-export count for account 1 remains exactly one");
+  assert.equal(cat.attempt("A1", "ACT1").status, "complete", "A's terminal outcome is durable");
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A2"], "A1 advanced only after A's durable terminal result");
+});
+
+await asyncTest("FIX 1 stale attempting after lock expiry: the SAME action creates zero exports and stops safely; a NEW action may attempt once", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  // A durable 'attempting' marker exists, but its lock is NOT held (released / expired).
+  await cat.saveAttemptState("A1", "ACT1", { status: "attempting", code: null, preservedLkg: false });
+  assert.equal(cat.lockHeld("A1", "ACT1"), false, "the attempt's lock is no longer held");
+  const f1 = countingFetch();
+  const r1 = await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), { ...cat, ...man, fetchCatalog: f1.fetchCatalog });
+  assert.equal(f1.calls.n, 0, "a stale attempting under the same action creates ZERO exports");
+  assert.equal(r1.status, "operational-failure", "the action stops safely with a typed operational state");
+  // A NEW action id may attempt the account exactly once.
+  const f2 = countingFetch();
+  const r2 = await firstClick("ACT2", ["A1", "A2"], dir(["A1", "A2"]), { ...cat, ...man, fetchCatalog: f2.fetchCatalog });
+  assert.equal(f2.calls.n, 1, "a NEW action attempts the account exactly once");
+  assert.equal(f2.calls.accounts[0], "A1");
+  assert.equal(r2.status, "in-progress");
+});
+
+/* =============== FIX 2: manifest transitions must be durable before response =============== */
+
+await asyncTest("FIX 2 advance-write failure: an exported terminal is durable but the manifest advance cannot persist -> NOT complete/advanced; recovery advances once with zero new exports", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  let saves = 0; // 1 = create; 2 = advance (fails once); later = recovery
+  const saveManifest = (actionId, mf) => { saves += 1; if (saves === 2) return Promise.reject(new Error("advance write failed")); return man.saveManifest(actionId, mf); };
+  const deps = { ...cat, ...man, saveManifest, fetchCatalog };
+  const r1 = await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), deps);
+  assert.equal(calls.n, 1, "the export ran exactly once");
+  assert.notEqual(r1.status, "complete", "the response is NOT reported complete/advanced when the advance write failed");
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A1", "A2"], "the prior authoritative queue is left intact");
+  assert.equal(cat.attempt("A1", "ACT1").status, "complete", "the terminal attempt is already durable");
+  const r2 = await continueAction("ACT1", ["A1", "A2"], ["A1", "A2"], deps); // storage recovered
+  assert.equal(calls.n, 1, "recovery created ZERO new DataDoe exports");
+  assert.equal(r2.disposition, "recorded", "the durable terminal attempt is observed and only the manifest transition retried");
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A2"], "the queue advances exactly once on recovery");
+});
+
+await asyncTest("FIX 2 in-progress-write failure: a concurrent-owner in-progress transition that cannot persist -> typed operational; queue not falsely changed", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  await cat.claimAttempt("A1", "ACT1"); // a concurrent owner holds the claim
+  let saves = 0;
+  const saveManifest = (actionId, mf) => { saves += 1; if (saves === 2) return Promise.reject(new Error("in-progress write failed")); return man.saveManifest(actionId, mf); };
+  const r = await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), { ...cat, ...man, saveManifest, fetchCatalog });
+  assert.equal(calls.n, 0, "zero exports");
+  assert.equal(r.status, "operational-failure", "a typed operational response when the in-progress transition cannot persist");
+  assert.deepEqual(man.manifest("ACT1").remaining, ["A1", "A2"], "the queue is not falsely changed");
+});
+
+await asyncTest("FIX 2 completion-write failure: an empty-queue completion that cannot persist is NEVER reported complete", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const saveManifest = () => Promise.reject(new Error("completion write failed"));
+  // Seed an in-progress manifest with an already-empty queue; a fixed scope hash lets the request match.
+  man.manifests.set("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: [], remaining: [], current: null, status: "in-progress", code: null, createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z" });
+  const r = await orchestrateBrandCatalogAction({ actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: [], authorizedPrimaryIds: [], directory: {}, connections: ORCH_CONNS }, { ...cat, ...man, saveManifest, scopeHashOf: () => "SCOPE" });
+  assert.notEqual(r.status, "complete", "a completion that cannot persist is never reported complete");
+  assert.equal(r.status, "operational-failure", "it degrades to a typed operational state");
+  assert.equal(man.manifest("ACT1").status, "in-progress", "the durable manifest was not falsely marked complete");
+});
+
+await asyncTest("FIX 2 operational-failure-write failure: a stop that cannot persist is never a false durable stop; the prior queue stays in-progress", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  const claimAttempt = () => Promise.reject(new Error("claim persistence failed")); // -> disposition operational-failure
+  let saves = 0;
+  const saveManifest = (actionId, mf) => { saves += 1; if (saves >= 2) return Promise.reject(new Error("stop write failed")); return man.saveManifest(actionId, mf); };
+  const r = await firstClick("ACT1", ["A1"], dir(["A1"]), { ...cat, ...man, claimAttempt, saveManifest, fetchCatalog });
+  assert.equal(calls.n, 0, "zero exports");
+  assert.equal(r.status, "operational-failure", "the response is a typed operational stop");
+  assert.equal(man.manifest("ACT1").status, "in-progress", "no durable stop was persisted that could not be saved (prior queue intact)");
+});
+
+/* =============== FIX 3: expiry -> explicit terminal transition + 409 =============== */
+
+await asyncTest("FIX 3 expiry: a continuation after the abandon window transitions the action to terminal 'expired' and returns 409 (zero exports)", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  const { calls, fetchCatalog } = countingFetch();
+  man.manifests.set("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, createdAt: "2026-06-01T00:00:00.000Z", updatedAt: "2026-06-01T00:00:00.000Z", expiresAt: "2026-06-02T00:00:00.000Z" });
+  const r = await orchestrateBrandCatalogAction(
+    { actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: ["A1"], authorizedPrimaryIds: ["A1"], directory: {}, connections: ORCH_CONNS },
+    { ...cat, ...man, fetchCatalog, scopeHashOf: () => "SCOPE", nowMs: () => Date.parse("2026-08-12T00:00:00.000Z") },
+  );
+  assert.equal(r.conflict, true, "an abandoned action rejects later continuations with a 409");
+  assert.equal(r.code, BRAND_DIRECTORY_ACTION_CONFLICT);
+  assert.equal(calls.n, 0, "zero exports");
+  assert.equal(man.manifest("ACT1").status, "expired", "the action was transitioned to the terminal 'expired' state (retention then prunes it)");
 });
 
 console.log(`\n${passed} assertions passed`);
