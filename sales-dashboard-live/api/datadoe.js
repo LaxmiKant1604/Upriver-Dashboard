@@ -227,10 +227,49 @@ const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
 
 const BRAND_CATALOG_REPORT_KEY = "brand-catalog";
 const BRAND_CATALOG_REPORT_VERSION = "brand-catalog-shared-v1";
-// One account per DataDoe organisation per request keeps each function under
-// Vercel's 60-second limit while allowing primary and secondary catalog work
-// to progress together. The browser continues the explicitly requested sync.
-const BRAND_CATALOG_ACCOUNTS_PER_CONNECTION = 1;
+// A bounded, serverless-safe batch per explicit request. A catalog export that
+// fails (e.g. DataDoe 404) returns immediately, and a successful one is create +
+// poll + download, so a small batch stays well under Vercel's 60-second limit; the
+// browser continues the remaining accounts one bounded batch at a time.
+export const BRAND_CATALOG_BATCH_SIZE = 5;
+
+// Admin-safe catalog outcome codes. NEVER surface a raw DataDoe response body,
+// source id, URL, JSON, status object, key or token to the browser -- only one of
+// these typed codes.
+export const CATALOG_SOURCE_UNAVAILABLE = "PRODUCT_CATALOG_SOURCE_UNAVAILABLE";
+export const CATALOG_EMPTY = "PRODUCT_CATALOG_EMPTY";
+export const CATALOG_TRUNCATED = "PRODUCT_CATALOG_TRUNCATED";
+export const CATALOG_FETCH_FAILED = "PRODUCT_CATALOG_FETCH_FAILED";
+export const SAFE_CATALOG_CODES = new Set([
+  CATALOG_SOURCE_UNAVAILABLE, CATALOG_EMPTY, CATALOG_TRUNCATED, CATALOG_FETCH_FAILED,
+]);
+
+// Map a fetch/transport error to a typed code WITHOUT persisting or returning its
+// raw message. A 404 "Source not found" is a source-access/config issue (the obsolete
+// long id, or an unenabled primary source); the row cap is a truncation; anything else
+// is a generic fetch failure.
+export function classifyCatalogError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/row cap/i.test(message)) return CATALOG_TRUNCATED;
+  if (/\(404\)/.test(message) || /source not found/i.test(message)) return CATALOG_SOURCE_UNAVAILABLE;
+  return CATALOG_FETCH_FAILED;
+}
+
+// PURE: split the work cursor into the accounts attempted THIS request and the typed
+// continuation for the browser. Each account appears in exactly one batch across the
+// explicit action, so it is attempted at most once and the loop always terminates.
+export function nextCatalogBatch(cursorIds, batchSize = BRAND_CATALOG_BATCH_SIZE) {
+  const cursor = [...new Set((cursorIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  return { batch: cursor.slice(0, batchSize), remainingAccountIds: cursor.slice(batchSize) };
+}
+
+// PRIMARY-ONLY: a dormant `dd-secondary:`-prefixed record is skipped read-only. Only a
+// real primary account id (no prefix) is eligible for a live catalog export; a legacy
+// secondary id is never stripped and routed through the primary key.
+function isPrimaryCatalogAccount(accountId) {
+  const id = String(accountId || "").trim();
+  return Boolean(id) && !id.startsWith("dd-secondary:");
+}
 
 function addBrandAccount(brandAccountIds, brand, accountId) {
   const name = String(brand || "").trim();
@@ -386,7 +425,11 @@ async function sharedSnapshotBrandAccounts(accountIds) {
       return;
     }
     if (catalogStatus === "unavailable") {
-      catalogUnavailable.set(id, String(catalogSnapshot?.payload?.catalogSyncError || "Product Catalog is unavailable for this account."));
+      // Only a typed, admin-safe code is carried forward. Any legacy raw
+      // `catalogSyncError` on an older snapshot is IGNORED (never surfaced): unknown
+      // codes normalise to the generic source-unavailable code.
+      const rawCode = String(catalogSnapshot?.payload?.catalogSyncCode || "");
+      catalogUnavailable.set(id, SAFE_CATALOG_CODES.has(rawCode) ? rawCode : CATALOG_SOURCE_UNAVAILABLE);
     } else {
       catalogPendingAccountIds.add(id);
     }
@@ -420,54 +463,85 @@ async function saveBrandCatalogSnapshot(accountId, payload) {
   }
 }
 
-async function syncAccountBrandCatalog({ accountId, rawAccountId, connection }) {
+// Fetch + validate ONE account's Product Catalog and update its brand-catalog snapshot.
+//
+// Fail-closed, last-known-good preserving, and typed:
+//   - a usable catalog (>=1 real brand) saves catalogSyncStatus:"complete";
+//   - a zero-row catalog, a catalog with NO usable child_asin -> product_brand mapping,
+//     a row-cap truncation, a 404 "source not found", a timeout or any fetch error is
+//     typed unavailable and NEVER counts as brand coverage;
+//   - on any unavailable outcome, a PRIOR successful ("complete", non-empty) snapshot is
+//     PRESERVED (never overwritten); the failure is only reported in the response. An
+//     account with no prior success is saved as unavailable with a typed code and NO
+//     fabricated brands.
+// The DataDoe/Supabase I/O is injectable so the whole policy is offline-testable; the
+// live create-export always uses the short source id PRODUCT_CATALOG_SOURCE_ID.
+export async function syncAccountBrandCatalog({ accountId, rawAccountId, connection }, deps = {}) {
+  const fetchCatalog = deps.fetchCatalog || (({ apiKey, sourceId, rawAccountId: raw }) => fetchExportRowsRaw(
+    apiKey, sourceId, PRODUCT_CATALOG_COLUMNS, [raw], null, null, CATALOG_ROW_LIMIT,
+    { orderByColumn: "child_asin", orderByDirection: "ASC" }
+  ));
+  const getPriorSnapshot = deps.getPriorSnapshot || ((id) => getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId: id }));
+  const save = deps.saveSnapshot || saveBrandCatalogSnapshot;
+
+  let code = null;
   try {
-    const rows = await fetchExportRowsRaw(
-      connection.apiKey,
-      PRODUCT_CATALOG_SOURCE_ID,
-      PRODUCT_CATALOG_COLUMNS,
-      [rawAccountId],
-      null,
-      null,
-      CATALOG_ROW_LIMIT,
-      { orderByColumn: "child_asin", orderByDirection: "ASC" }
-    );
-    if (rows.length >= CATALOG_ROW_LIMIT) {
-      throw new Error(`Product Catalog reached the ${CATALOG_ROW_LIMIT.toLocaleString("en-US")} row cap and was not used.`);
+    const rows = await fetchCatalog({ apiKey: connection.apiKey, sourceId: PRODUCT_CATALOG_SOURCE_ID, rawAccountId });
+    const catalogRows = Array.isArray(rows) ? rows : [];
+    if (catalogRows.length >= CATALOG_ROW_LIMIT) {
+      code = CATALOG_TRUNCATED; // possibly truncated -> never trusted as complete coverage
+    } else {
+      const catalogBrands = catalogBrandNames(catalogRows);
+      if (!catalogBrands.length) {
+        code = CATALOG_EMPTY; // zero rows OR no usable child_asin -> product_brand mapping
+      } else {
+        await save(accountId, { catalogBrands, catalogSyncStatus: "complete", catalogSyncedAt: new Date().toISOString() });
+        return { accountId, status: "complete", brandCount: catalogBrands.length };
+      }
     }
-    const payload = {
-      catalogBrands: catalogBrandNames(rows),
-      catalogSyncStatus: "complete",
-      catalogSyncedAt: new Date().toISOString(),
-    };
-    await saveBrandCatalogSnapshot(accountId, payload);
-    return { accountId, status: "complete", brandCount: payload.catalogBrands.length };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // Persist the outcome so the automatic continuation can finish. A later
-    // explicit directory sync retries these accounts after access/credits are
-    // corrected; normal reads never spend DataDoe tokens.
-    await saveBrandCatalogSnapshot(accountId, {
-      catalogBrands: [],
-      catalogSyncStatus: "unavailable",
-      catalogSyncError: message,
-      catalogSyncedAt: new Date().toISOString(),
-    }).catch(() => {});
-    return { accountId, status: "unavailable", error: message };
+    code = classifyCatalogError(error);
   }
+
+  // Unavailable outcome. Never overwrite a prior successful brand map.
+  const prior = await Promise.resolve(getPriorSnapshot(accountId)).catch(() => null);
+  const priorComplete = prior?.payload?.catalogSyncStatus === "complete"
+    && Array.isArray(prior?.payload?.catalogBrands) && prior.payload.catalogBrands.length > 0;
+  if (priorComplete) {
+    return { accountId, status: "unavailable", code, preservedLkg: true };
+  }
+  await Promise.resolve(save(accountId, {
+    catalogBrands: [],
+    catalogSyncStatus: "unavailable",
+    catalogSyncCode: code,
+    catalogSyncedAt: new Date().toISOString(),
+  })).catch(() => {});
+  return { accountId, status: "unavailable", code, preservedLkg: false };
 }
 
-async function syncBrandCatalogBatch(accountIds, connections) {
-  const byConnection = new Map();
-  for (const accountId of [...new Set(accountIds.map(String))].sort()) {
-    const scope = resolveDataDoeAccountIds([accountId], connections);
-    const group = byConnection.get(scope.connection.id) || { connection: scope.connection, accounts: [] };
-    group.accounts.push({ accountId, rawAccountId: scope.rawAccountIds[0], connection: scope.connection });
-    byConnection.set(scope.connection.id, group);
+// Process a BOUNDED, already-sliced batch of accounts sequentially (kind to DataDoe
+// rate limits within the serverless budget). Primary-only: a dormant dd-secondary
+// record, or any id that does not resolve to the primary connection, is skipped
+// read-only and never routed through the primary key. `deps.attemptAccount` is an
+// injection seam so the queue can be driven offline without real I/O.
+export async function syncBrandCatalogBatch(accountIds, connections, deps = {}) {
+  const results = [];
+  for (const accountId of [...new Set((accountIds || []).map(String))]) {
+    if (typeof deps.attemptAccount === "function") {
+      results.push(await deps.attemptAccount(accountId));
+      continue;
+    }
+    if (!isPrimaryCatalogAccount(accountId)) continue;
+    let scope;
+    try {
+      scope = resolveDataDoeAccountIds([accountId], connections);
+    } catch {
+      continue; // unresolvable/dormant -> skip read-only
+    }
+    if (!scope || scope.connection.id !== "primary") continue;
+    results.push(await syncAccountBrandCatalog({ accountId, rawAccountId: scope.rawAccountIds[0], connection: scope.connection }, deps));
   }
-  const work = [...byConnection.values()]
-    .flatMap((group) => group.accounts.slice(0, BRAND_CATALOG_ACCOUNTS_PER_CONNECTION));
-  return Promise.all(work.map(syncAccountBrandCatalog));
+  return results;
 }
 
 function stableSelectionId(prefix, accountIds) {
@@ -1302,6 +1376,10 @@ export default async function handler(req, res) {
     // admin-only on the SERVER, not merely hidden in the UI. A non-refresh read of
     // the saved snapshot stays available to any authorised user (Supabase-only).
     if (action === "brand-inventory" && wantsRefresh(req)) assertAdmin(access);
+    // The Brand Directory manual refresh spends Product Catalog exports (one per
+    // eligible account), so the SOURCE-fetch path is admin-only on the SERVER. A
+    // non-refresh read of the shared directory stays available to any authorised user.
+    if (action === "brand-directory" && wantsRefresh(req)) assertAdmin(access);
     // A new browser may not yet have the shared account directory. Brand View
     // remains usable: on its explicit manual refresh only, discover the
     // accounts the user may access and use them to seed the brand directory.
@@ -1589,45 +1667,63 @@ export default async function handler(req, res) {
       }
       assertAccountAccess(access, publicAccountIds);
       let directory = await sharedSnapshotBrandAccounts(publicAccountIds);
-      let unresolvedAccountIds = [...directory.catalogPendingAccountIds];
       let catalogSync = [];
+      let remainingAccountIds = [];
 
-      // Loading the picker is cache-only. On the explicit button action, seed
-      // one missing account per configured DataDoe organisation, then let the
-      // browser continue in small batches until the shared directory is done.
-      // Existing unavailable catalog snapshots are also retried explicitly,
-      // which lets an administrator recover after adding DataDoe credits.
+      // The explicit directory refresh processes EVERY eligible primary account exactly
+      // once across the action, one bounded batch per request. A typed continuation
+      // cursor -- NOT catalogPendingAccountIds -- drives the browser, because
+      // previously-unavailable accounts also require an explicit retry and must never be
+      // starved. Page load / normal reads never enter this branch (cache-only above).
       if (wantsRefresh(req)) {
-        // A new explicit click retries prior catalog failures after credits or
-        // source access change. Continuation requests process only untouched
-        // accounts, so one blocked account cannot starve the rest of its
-        // DataDoe organisation.
-        const retryUnavailable = String(req.query.retryUnavailable || "") === "1";
-        const retryAccountIds = retryUnavailable ? [...directory.catalogUnavailable.keys()] : [];
-        const targets = [...new Set([...unresolvedAccountIds, ...retryAccountIds])];
-        if (targets.length) {
-          catalogSync = await syncBrandCatalogBatch(targets, connections);
+        // First click: the full eligible set = never-attempted (pending) PLUS
+        // previously-unavailable, primary-only. Continuation: exactly the accounts the
+        // browser carried forward in `catalogSyncAccountIds`. Either way the cursor only
+        // ever shrinks, so no account is attempted twice and the loop always terminates.
+        const carriedCursor = String(req.query.catalogSyncAccountIds || "").split(",").map((s) => s.trim()).filter(Boolean);
+        const authorized = new Set(publicAccountIds.map(String));
+        const eligibleCursor = continuingBrandDirectorySync
+          ? carriedCursor.filter((id) => authorized.has(id) && isPrimaryCatalogAccount(id))
+          : [...new Set([...directory.catalogPendingAccountIds, ...directory.catalogUnavailable.keys()])]
+              .filter((id) => isPrimaryCatalogAccount(id))
+              .sort();
+        const { batch, remainingAccountIds: remaining } = nextCatalogBatch(eligibleCursor, BRAND_CATALOG_BATCH_SIZE);
+        remainingAccountIds = remaining;
+        if (batch.length) {
+          catalogSync = await syncBrandCatalogBatch(batch, connections);
           directory = await sharedSnapshotBrandAccounts(publicAccountIds);
-          unresolvedAccountIds = [...directory.catalogPendingAccountIds];
         }
       }
 
       const saved = serialiseBrandAccountMap(directory.brandAccountIds);
-      const catalogUnavailableAccounts = [...directory.catalogUnavailable.entries()].map(([accountId, error]) => {
+      // Typed, admin-safe unavailable summary. Persisted-unavailable accounts start the
+      // map; this batch's attempts override (a fresh success clears the entry; a fresh
+      // failure sets its typed code). No raw DataDoe body/source id/URL is ever included.
+      const unavailableByAccount = new Map(directory.catalogUnavailable);
+      for (const entry of catalogSync) {
+        if (entry.status === "complete") unavailableByAccount.delete(entry.accountId);
+        else unavailableByAccount.set(entry.accountId, SAFE_CATALOG_CODES.has(entry.code) ? entry.code : CATALOG_SOURCE_UNAVAILABLE);
+      }
+      const catalogUnavailableAccounts = [...unavailableByAccount.entries()].map(([accountId, code]) => {
         const account = (brandDirectoryAccounts || []).find((entry) => String(entry.id) === String(accountId));
-        return { accountId, name: account?.name || accountId, error };
+        return { accountId, name: account?.name || accountId, code };
       });
+      const unavailableByCode = {};
+      for (const { code } of catalogUnavailableAccounts) unavailableByCode[code] = (unavailableByCode[code] || 0) + 1;
+
       await sendLegacyPayload({
         ...saved,
         accounts: brandDirectoryAccounts || [],
         source: catalogSync.length ? "shared-snapshots-and-catalog-sync" : "shared-snapshots",
-        partial: unresolvedAccountIds.length > 0,
-        unresolvedAccountIds,
+        partial: remainingAccountIds.length > 0,
         catalogUnavailableAccounts,
+        catalogUnavailable: { total: catalogUnavailableAccounts.length, byCode: unavailableByCode },
         catalogSync: {
+          attempted: catalogSync.length,
           completed: catalogSync.filter((entry) => entry.status === "complete").length,
-          unavailable: catalogSync.filter((entry) => entry.status === "unavailable").length,
-          pendingAccountIds: unresolvedAccountIds,
+          unavailable: catalogSync.filter((entry) => entry.status !== "complete").length,
+          preservedLkg: catalogSync.filter((entry) => entry.preservedLkg).length,
+          remainingAccountIds,
         },
         message: saved.brands.length
           ? null
