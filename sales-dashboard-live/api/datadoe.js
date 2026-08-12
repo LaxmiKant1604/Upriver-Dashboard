@@ -25,12 +25,14 @@ import {
   assertAccountAccess,
   assertAdmin,
   getAdsDailySourceRows,
+  claimRefreshLock,
   getAdDailyMetrics,
   getDashboardAccess,
   getLatestReportSnapshot,
   getReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
+  releaseRefreshLock,
   saveReportSnapshot,
 } from "../lib/server/supabase.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
@@ -243,9 +245,98 @@ export const CATALOG_SOURCE_UNAVAILABLE = "PRODUCT_CATALOG_SOURCE_UNAVAILABLE";
 export const CATALOG_EMPTY = "PRODUCT_CATALOG_EMPTY";
 export const CATALOG_TRUNCATED = "PRODUCT_CATALOG_TRUNCATED";
 export const CATALOG_FETCH_FAILED = "PRODUCT_CATALOG_FETCH_FAILED";
+// An attempt that was atomically claimed (or is mid-flight / whose outcome write
+// failed) but has no confirmed terminal outcome yet. It is admin-safe and NEVER
+// auto-retried: it waits for a NEW explicit action id. It is not produced by
+// classifyCatalogError (only real transport errors are), so it never masquerades
+// as a source failure.
+export const CATALOG_ATTEMPT_PENDING = "PRODUCT_CATALOG_ATTEMPT_PENDING";
 export const SAFE_CATALOG_CODES = new Set([
-  CATALOG_SOURCE_UNAVAILABLE, CATALOG_EMPTY, CATALOG_TRUNCATED, CATALOG_FETCH_FAILED,
+  CATALOG_SOURCE_UNAVAILABLE, CATALOG_EMPTY, CATALOG_TRUNCATED, CATALOG_FETCH_FAILED, CATALOG_ATTEMPT_PENDING,
 ]);
+
+// Durable, per-(action,account) attempt state, stored SEPARATELY from the
+// brand-catalog LKG snapshot. Keeping it in its own report row is what lets a
+// failed refresh preserve the successful LKG payload byte-for-byte (its
+// source_refreshed_at never advances) AND lets two overlapping actions record
+// their own cumulative failure summaries without clobbering each other, because
+// the params hash below is scoped by BOTH accountId and actionId.
+const BRAND_CATALOG_ATTEMPT_KEY = "brand-catalog-attempt";
+const BRAND_CATALOG_ATTEMPT_VERSION = "brand-catalog-attempt-v1";
+// The claim is held only across ONE export. A single export polls for ~45s max
+// (pollExport 9x5s) plus create + download, so a lock comfortably longer than that
+// but far shorter than any human retry window bounds a crashed invocation without
+// wedging the account: after it expires, only a NEW explicit action re-claims,
+// because the durable "attempting" marker written before create-export still blocks
+// same-action replays.
+const CATALOG_ATTEMPT_LOCK_SECONDS = 90;
+
+// A safe token shape for the correlation id of ONE explicit action. Anything else
+// (missing, PII, oversized, punctuation) is rejected -- never persisted or echoed.
+export function validCatalogActionId(value) {
+  const id = String(value == null ? "" : value);
+  return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : null;
+}
+
+function catalogAttemptHash(accountId, actionId) {
+  return paramsHashFor(BRAND_CATALOG_ATTEMPT_VERSION, { accountId, actionId });
+}
+
+// ATOMIC claim BEFORE any DataDoe create-export. claim_report_refresh_lock is a
+// database upsert-with-expiry: exactly one of two concurrent same-(action,account)
+// requests wins. The loser creates ZERO exports. Keyed by the attempt hash so it is
+// scoped to one action + one account and never collides with a report refresh lock.
+async function defaultClaimCatalogAttempt(accountId, actionId) {
+  return claimRefreshLock({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+    lockSeconds: CATALOG_ATTEMPT_LOCK_SECONDS,
+  });
+}
+
+async function defaultReleaseCatalogAttempt(accountId, actionId) {
+  return releaseRefreshLock({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+  });
+}
+
+// Read THIS action's durable attempt row for one account (exact params hash, not the
+// latest-by-account read) so overlapping actions never read each other's state.
+async function defaultGetCatalogAttemptState(accountId, actionId) {
+  const snapshot = await getReportSnapshot({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+  });
+  return snapshot?.payload || null;
+}
+
+// Persist THIS action's durable attempt state. Never carries a raw DataDoe body --
+// only a typed safe code. This row, not the LKG snapshot, is where a failed refresh
+// is recorded.
+async function defaultSaveCatalogAttemptState(accountId, actionId, state) {
+  const paramsHash = catalogAttemptHash(accountId, actionId);
+  const payload = {
+    actionId,
+    accountId: String(accountId),
+    status: state.status,
+    code: state.code || null,
+    preservedLkg: Boolean(state.preservedLkg),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveReportSnapshot({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash,
+    params: { reportVersion: BRAND_CATALOG_ATTEMPT_VERSION, accountId, actionId },
+    payload,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    sourceRefreshedAt: new Date().toISOString(),
+  });
+}
 
 // Map a fetch/transport error to a typed code WITHOUT persisting or returning its
 // raw message. A 404 "Source not found" is a source-access/config issue (the obsolete
@@ -421,14 +512,16 @@ function snapshotBrandNames(payload) {
   return [...names];
 }
 
-async function sharedSnapshotBrandAccounts(accountIds, { actionId = null } = {}) {
+async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAttemptState = defaultGetCatalogAttemptState } = {}) {
   const brandAccountIds = new Map();
   const coveredAccountIds = new Set();
   const catalogPendingAccountIds = new Set();
   const catalogUnavailable = new Map();
-  // Accounts whose brand map is a preserved last-known-good ("complete") BUT whose latest
-  // attempt under THIS action failed. They stay covered, but their typed failure must
-  // still appear in the cumulative summary even after later continuations reread them.
+  // Accounts whose latest attempt under THIS action did not succeed -- whether their brand
+  // map is a preserved last-known-good ("complete") or absent. Their typed code must appear
+  // in the cumulative summary even after later continuations reread them, and it is read
+  // from the SEPARATE per-(action,account) attempt row so overlapping actions never clobber
+  // each other's summaries.
   const catalogActionFailures = new Map();
   if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
 
@@ -442,11 +535,17 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null } = {})
     const payload = catalogSnapshot?.payload;
     const catalogStatus = payload?.catalogSyncStatus;
     const catalogBrands = snapshotBrandNames(payload);
-    // A this-action failure on a still-complete snapshot (LKG preserved) is surfaced
-    // separately so it is never lost across continuation batches. Typed codes only.
-    if (actionId && payload?.catalogAttemptActionId === actionId && payload?.catalogAttemptStatus === "unavailable") {
-      const attemptCode = String(payload?.catalogAttemptCode || "");
-      catalogActionFailures.set(id, SAFE_CATALOG_CODES.has(attemptCode) ? attemptCode : CATALOG_SOURCE_UNAVAILABLE);
+    // A non-successful attempt under THIS action is surfaced separately so it is never lost
+    // across continuation batches. Read from the durable attempt row (scoped by action +
+    // account); typed safe codes only, never a raw DataDoe body.
+    if (actionId) {
+      const attempt = await Promise.resolve(getAttemptState(id, actionId)).catch(() => null);
+      if (attempt && attempt.status && attempt.status !== "complete") {
+        const attemptCode = String(attempt.code || "");
+        catalogActionFailures.set(id, SAFE_CATALOG_CODES.has(attemptCode)
+          ? attemptCode
+          : (attempt.status === "attempting" ? CATALOG_ATTEMPT_PENDING : CATALOG_SOURCE_UNAVAILABLE));
+      }
     }
     if (catalogStatus === "complete") {
       catalogBrands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
@@ -494,20 +593,24 @@ async function saveBrandCatalogSnapshot(accountId, payload) {
 
 // Fetch + validate ONE account's Product Catalog and update its brand-catalog snapshot.
 //
-// Fail-closed, last-known-good preserving, typed, and idempotent per action:
+// Fail-closed, last-known-good preserving, typed, and once-per-action ATOMIC:
 //   - a USABLE catalog (>=1 non-empty child_asin joined to a real non-empty
 //     product_brand) saves catalogSyncStatus:"complete";
 //   - a zero-row catalog, a catalog with NO usable child_asin -> product_brand mapping,
 //     a row-cap truncation, a 404 "source not found", a timeout or any fetch error is
 //     typed unavailable and NEVER counts as brand coverage;
-//   - on any unavailable outcome, a PRIOR successful ("complete", non-empty) snapshot's
-//     BRAND MAP is PRESERVED (never overwritten); only the typed latest-attempt fields
-//     are recorded on it so the failure still appears in the cumulative summary. An
-//     account with no prior success is saved as unavailable with a typed code and NO
-//     fabricated brands.
-//   - DURABLE IDEMPOTENCY: an account already attempted under this `actionId` returns
-//     its recorded outcome WITHOUT another export, so replaying/tampering with a
-//     continuation cannot repeat a DataDoe export.
+//   - on any unavailable outcome, a PRIOR successful ("complete", non-empty) brand-catalog
+//     snapshot is left BYTE-IDENTICAL (its brand map AND its source_refreshed_at are never
+//     rewritten). The typed failure is recorded in a SEPARATE per-(action,account) attempt
+//     row, so it still appears in the cumulative summary. An account with no prior success
+//     is saved as unavailable with a typed code and NO fabricated brands.
+//   - ATOMIC ONCE-PER-ACTION: the attempt is claimed with a durable lock BEFORE the
+//     create-export and a durable "attempting" marker is written BEFORE the create-export.
+//     Two concurrent same-(action,account) requests therefore create EXACTLY ONE export;
+//     a replay (even after the outcome write fails, the invocation times out post-create,
+//     or the lock has expired) creates ZERO further exports and returns the recorded
+//     outcome. If the claim or the marker write fails, ZERO exports are created. An
+//     unknown/attempting state is admin-safe and waits for a NEW explicit action id.
 // The DataDoe/Supabase I/O is injectable so the whole policy is offline-testable; the
 // live create-export always uses the short source id PRODUCT_CATALOG_SOURCE_ID.
 export async function syncAccountBrandCatalog({ accountId, rawAccountId, connection, actionId = null }, deps = {}) {
@@ -517,67 +620,102 @@ export async function syncAccountBrandCatalog({ accountId, rawAccountId, connect
   ));
   const getPriorSnapshot = deps.getPriorSnapshot || ((id) => getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId: id }));
   const save = deps.saveSnapshot || saveBrandCatalogSnapshot;
+  const claimAttempt = deps.claimAttempt || defaultClaimCatalogAttempt;
+  const releaseAttempt = deps.releaseAttempt || defaultReleaseCatalogAttempt;
+  const getAttemptState = deps.getAttemptState || defaultGetCatalogAttemptState;
+  const saveAttemptState = deps.saveAttemptState || defaultSaveCatalogAttemptState;
   const now = () => new Date().toISOString();
 
-  // Read the prior snapshot ONCE, for both idempotency and last-known-good.
+  // Read the prior LKG snapshot ONCE, to preserve it and to report preservedLkg.
   const prior = await Promise.resolve(getPriorSnapshot(accountId)).catch(() => null);
   const priorPayload = (prior && prior.payload) || null;
   const priorComplete = priorPayload?.catalogSyncStatus === "complete"
     && Array.isArray(priorPayload?.catalogBrands) && priorPayload.catalogBrands.length > 0;
 
-  // Idempotency: this account was already attempted under THIS explicit action -> do not
-  // spend another export; return the recorded outcome. Fail closed to unavailable if the
-  // recorded attempt code is not a known safe code.
-  if (actionId && priorPayload?.catalogAttemptActionId === actionId) {
-    const wasComplete = priorPayload.catalogAttemptStatus === "complete";
+  // Fail closed without an action id: idempotency cannot be scoped, so NO export.
+  const attempting = () => ({ accountId, status: "attempting", code: CATALOG_ATTEMPT_PENDING, preservedLkg: priorComplete, skipped: true });
+  if (!actionId) return attempting();
+
+  const recorded = (state) => {
+    const wasComplete = state.status === "complete";
     return {
       accountId,
-      status: wasComplete ? "complete" : "unavailable",
-      code: wasComplete ? null : (SAFE_CATALOG_CODES.has(priorPayload.catalogAttemptCode) ? priorPayload.catalogAttemptCode : CATALOG_SOURCE_UNAVAILABLE),
-      preservedLkg: !wasComplete && priorComplete,
+      status: wasComplete ? "complete" : (state.status === "attempting" ? "attempting" : "unavailable"),
+      code: wasComplete ? null : (SAFE_CATALOG_CODES.has(state.code) ? state.code : (state.status === "attempting" ? CATALOG_ATTEMPT_PENDING : CATALOG_SOURCE_UNAVAILABLE)),
+      preservedLkg: !wasComplete && (state.preservedLkg || priorComplete),
       skipped: true,
     };
-  }
+  };
 
-  let code = null;
+  // Durable replay guard (fast path, no lock): this account already has a recorded
+  // attempt under THIS action -> return it WITHOUT another export.
+  const priorAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
+  if (priorAttempt && priorAttempt.status) return recorded(priorAttempt);
+
+  // ATOMIC claim BEFORE any DataDoe call. If the claim fails or throws (a concurrent
+  // request holds it, or the lock write failed), create ZERO exports.
+  let claimed = false;
+  try { claimed = Boolean(await claimAttempt(accountId, actionId)); } catch { claimed = false; }
+  if (!claimed) return attempting();
+
   try {
-    const rows = await fetchCatalog({ apiKey: connection.apiKey, sourceId: PRODUCT_CATALOG_SOURCE_ID, rawAccountId });
-    const catalogRows = Array.isArray(rows) ? rows : [];
-    if (catalogRows.length >= CATALOG_ROW_LIMIT) {
-      code = CATALOG_TRUNCATED; // possibly truncated -> never trusted as complete coverage
-    } else {
-      const catalogBrands = usableCatalogBrands(catalogRows); // requires child_asin + real brand
-      if (!catalogBrands.length) {
-        code = CATALOG_EMPTY; // zero rows OR no usable child_asin -> product_brand mapping
-      } else {
-        await Promise.resolve(save(accountId, {
-          catalogBrands, catalogSyncStatus: "complete", catalogSyncedAt: now(),
-          catalogAttemptActionId: actionId, catalogAttemptStatus: "complete", catalogAttemptCode: null,
-        }));
-        return { accountId, status: "complete", brandCount: catalogBrands.length };
-      }
-    }
-  } catch (error) {
-    code = classifyCatalogError(error);
-  }
+    // Re-read under the claim: a prior holder may have written a terminal marker and
+    // released the lock between our fast-path read and this claim. Honour it -> no export.
+    const claimedAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
+    if (claimedAttempt && claimedAttempt.status) return recorded(claimedAttempt);
 
-  // Unavailable outcome (typed). Never REPLACE a prior successful brand map.
-  if (priorComplete) {
-    // Preserve the complete brand map + its success time; record ONLY the typed latest
-    // attempt so (a) the idempotency marker persists and (b) this failure still appears
-    // in the cumulative final summary after later continuations reread this snapshot.
+    // Persist the durable "attempting" marker BEFORE the create-export. If this write
+    // fails, create ZERO exports. Once written, it survives a mid-export timeout and a
+    // failed outcome write, so no replay can re-export this account under this action.
+    try {
+      await saveAttemptState(accountId, actionId, { status: "attempting", code: null, preservedLkg: priorComplete });
+    } catch {
+      return attempting(); // marker write failed -> zero exports
+    }
+
+    let code = null;
+    try {
+      const rows = await fetchCatalog({ apiKey: connection.apiKey, sourceId: PRODUCT_CATALOG_SOURCE_ID, rawAccountId });
+      const catalogRows = Array.isArray(rows) ? rows : [];
+      if (catalogRows.length >= CATALOG_ROW_LIMIT) {
+        code = CATALOG_TRUNCATED; // possibly truncated -> never trusted as complete coverage
+      } else {
+        const catalogBrands = usableCatalogBrands(catalogRows); // requires child_asin + real brand
+        if (!catalogBrands.length) {
+          code = CATALOG_EMPTY; // zero rows OR no usable child_asin -> product_brand mapping
+        } else {
+          await Promise.resolve(save(accountId, {
+            catalogBrands, catalogSyncStatus: "complete", catalogSyncedAt: now(),
+          }));
+          // Record the terminal outcome. If THIS write fails, the "attempting" marker
+          // remains and a replay is a safe no-op (no second export); the LKG is saved.
+          await Promise.resolve(saveAttemptState(accountId, actionId, { status: "complete", code: null, preservedLkg: false })).catch(() => {});
+          return { accountId, status: "complete", brandCount: catalogBrands.length };
+        }
+      }
+    } catch (error) {
+      code = classifyCatalogError(error);
+    }
+
+    // Unavailable outcome (typed). Record it ONLY in the separate attempt row.
+    if (priorComplete) {
+      // Preserve the prior successful brand-catalog snapshot BYTE-FOR-BYTE: its map and
+      // its source_refreshed_at are never rewritten. The typed failure lives in the
+      // attempt row, so it still appears in this action's cumulative summary.
+      await Promise.resolve(saveAttemptState(accountId, actionId, { status: "unavailable", code, preservedLkg: true })).catch(() => {});
+      return { accountId, status: "unavailable", code, preservedLkg: true };
+    }
+    // No prior success: represent unavailable with a typed code and NO fabricated brands.
     await Promise.resolve(save(accountId, {
-      ...priorPayload,
-      catalogAttemptActionId: actionId, catalogAttemptStatus: "unavailable", catalogAttemptCode: code,
+      catalogBrands: [], catalogSyncStatus: "unavailable", catalogSyncCode: code, catalogSyncedAt: now(),
     })).catch(() => {});
-    return { accountId, status: "unavailable", code, preservedLkg: true };
+    await Promise.resolve(saveAttemptState(accountId, actionId, { status: "unavailable", code, preservedLkg: false })).catch(() => {});
+    return { accountId, status: "unavailable", code, preservedLkg: false };
+  } finally {
+    // Release the short-lived claim as soon as this invocation is done. The DURABLE
+    // attempt marker (not the lock) is what blocks same-action replays afterwards.
+    await Promise.resolve(releaseAttempt(accountId, actionId)).catch(() => {});
   }
-  // No prior success: represent unavailable with a typed code and NO fabricated brands.
-  await Promise.resolve(save(accountId, {
-    catalogBrands: [], catalogSyncStatus: "unavailable", catalogSyncCode: code, catalogSyncedAt: now(),
-    catalogAttemptActionId: actionId, catalogAttemptStatus: "unavailable", catalogAttemptCode: code,
-  })).catch(() => {});
-  return { accountId, status: "unavailable", code, preservedLkg: false };
 }
 
 // Process a BOUNDED, already-sliced batch of accounts sequentially (kind to DataDoe
@@ -1453,6 +1591,18 @@ export default async function handler(req, res) {
     // discovery belongs only to the first explicit click; repeating it for
     // every batch would waste DataDoe calls and slow the directory down.
     const continuingBrandDirectorySync = String(req.query.catalogSyncContinue || "") === "1";
+    // Blocker 3: a Brand Directory SYNC (the explicit refresh AND every continuation --
+    // both carry refresh=1) MUST present a valid catalogSyncActionId BEFORE any DataDoe
+    // call, so the once-per-action claim can be scoped. A missing/malformed id on a fresh
+    // refresh is a bad request (400); on a continuation it conflicts with the in-flight
+    // action (409). Cache-only reads never enter this branch and need no action id.
+    const catalogActionId = validCatalogActionId(req.query.catalogSyncActionId);
+    if (action === "brand-directory" && wantsRefresh(req) && !catalogActionId) {
+      res.status(continuingBrandDirectorySync ? 409 : 400).json({
+        error: "A valid catalogSyncActionId is required to sync the Brand Directory. Reload the page and start the refresh again.",
+      });
+      return;
+    }
     if (action === "brand-directory" && wantsRefresh(req) && !continuingBrandDirectorySync) {
       const discovered = await discoverConnectedAccounts(connections);
       discoveredDirectoryAccounts = discovered;
@@ -1729,9 +1879,10 @@ export default async function handler(req, res) {
       }
       assertAccountAccess(access, publicAccountIds);
       // One durable id correlates every request of ONE explicit action; it scopes the
-      // idempotency marker and the cumulative this-action failure summary. Only a safe
-      // token shape is honoured (no raw/PII); an absent id disables cross-request dedupe.
-      const actionId = /^[A-Za-z0-9_-]{1,64}$/.test(String(req.query.catalogSyncActionId || "")) ? String(req.query.catalogSyncActionId) : null;
+      // atomic once-per-action claim, the durable attempt markers and the cumulative
+      // this-action failure summary. It was validated (safe token shape, required for a
+      // sync) BEFORE any DataDoe call above; a cache-only read leaves it null.
+      const actionId = catalogActionId;
       let directory = await sharedSnapshotBrandAccounts(publicAccountIds, { actionId });
       let remainingAccountIds = [];
       let attempted = 0;
