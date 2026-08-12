@@ -7511,3 +7511,52 @@ green; `npm run verify` exit 0 (natural) + `build:check` 2,394 modules; `git dif
 LIVE gate unchanged: both migrations UNAPPLIED => coverage `schema-missing` => PPC fail-closed unavailable until
 applied + worker records windows. Nothing pushed/merged/deployed/unlocked/scheduled. Listing Optimizer NOT
 started (awaiting Codex approval).
+
+## Scheduler v2: Listing Optimizer tranche (staged shadow cycle, 2026-08-12)
+
+Implemented ONLY the Listing Optimizer Scheduler-v2 tranche from base `6fea2ac` (Codex-approved integration
+`3c0b3de`). SCHEDULER_V2.md §56 records the details. Listing Optimizer stays SHADOW ONLY + locked: the live
+`lib/server/reports/listing-optimizer.js` builder is byte-UNCHANGED, source CONTRACTS + `source-identity.js`/
+request_hash unchanged, Scheduler v1 + frontend + Brand View + Product Catalog retry orchestration untouched,
+migrations NOT applied, `HANDOFF.md`/`.worktrees/` untracked/untouched. Canonical catalog source id `68d2de238e`
+kept; obsolete long id remains alias-only (never POSTed). Project-wide incremental ASIN->brand gap-fill NOT
+implemented; no live DataDoe calls (clarification pending). Commits: `142460a` (pure cores), `c780d61` (adapter
++ planner + staged cycle), `0c447a3` (tests + package wiring), + this docs commit.
+
+Design: two-stage staged-cycle report. The SQP kickoff (`listing-optimizer:sqp-weekly`, `[asOf-84d,asOf]`, 15
+cols, 50,000 strict, date ASC) spends exactly ONE export per account per cycle; a validated SQP success --
+INCLUDING a genuine zero-row success -- is the only thing that activates the staged catalog
+(`listing-optimizer:catalog`, no-date, 13 RICH content cols, 20,000 strict, source `68d2de238e`, a request
+identity DISTINCT from the common 4-column insight catalog). Disabled/failed/unvalidated/missing SQP spends
+ZERO catalog exports. Durable `SOURCE_DISABLED` (degraded) => faithful `sqpAvailable:false` snapshot; non-
+disabled SQP failure and post-SQP catalog failure/truncation preserve LKG (never save partial/cap-sized data).
+
+Implementation:
+1. **Pure cores (`derivation-core.js`).** `listingOptimizerPayload` + `listingOptimizerUnavailablePayload`
+   transcribed VERBATIM from `buildListingOptimizer` (SQP `${asin}|${query}` byKey fold, first-wins product
+   dedup, `catalogBrands` incl. literal "Unassigned"). Added fail-closed strictness the live route omits:
+   `optFiniteNum` rejects non-finite count/rank/price; a per-(asin,query) currency Map throws on ambiguous
+   cross-currency median-price + non-string currency. Import-free (no transport/Supabase).
+2. **Adapter (`report-derivation.js`).** `REPORT_DERIVATIONS["listing-optimizer"]` with BOTH keys in
+   `optionalRequestKeys` (static gate never blocks; derive is sole conditional-dependency authority), strict
+   `validatePayload`, `latestDataDate = maxIsoDate(periods)` from validated SQP evidence (null otherwise),
+   public `accountId` in payload, `rawSellerId` scoping only the DataDoe fragments. Fail-closed window/single-
+   account/plain-object/date/scope validation.
+3. **Planner + cycle.** `planListingOptimizer` always emits sqp-weekly; adds catalog only when
+   `evaluateStagedActivation` passes the SQP signal. `listing-optimizer` added to `STAGED_CYCLE_REPORT_KEYS` +
+   `STAGED_CYCLE_ENTRY_POINTS` so `buildShadowReportPlan` rejects it. NEW `listing-optimizer-cycle.js`
+   `runListingOptimizerShadowCycle` (2 rounds: R1 sqp-weekly, R2 catalog on validated SQP) via owner-model
+   `runSourceJobs` (one create-export per request_hash; bounded/deferral resume with no duplicate export;
+   owner-scoped stale reconciliation; primary-only classification).
+
+Verification (all natural, exit 0): `node --check` all changed files; NEW `report-listing-optimizer.test.js`
+**28 assertions** (parity every fold branch; zero-row + disabled/degraded; missing-SQP + catalog-failure LKG;
+strict validation; public/raw separation; kickoff one-export; catalog staged only after validated SQP; distinct
+13-col catalog identity; staged-cycle resume + owner reconciliation + coexistence isolation; worker zero-write/
+LKG + idempotent save; zero-network derive; import-boundary + snapshot-size guards); `test:report-derivation`
+**430** (was 402); `test:sync-engine` (79), `test:report-contracts` (161), `test:source-identity` (7) green;
+`build:check` 2,395 modules; `git diff --check` clean; only intended files changed. Nothing pushed/merged/
+deployed/unlocked/enabled/scheduled/migrated. The live `68d2de238e` 404 remains an upstream DataDoe source-
+access issue (NOT fixed); Listing Optimizer's catalog stage surfaces it as a post-SQP catalog failure
+(=> unavailable, LKG) until DataDoe resolves access. STOP for Codex senior review; nothing beyond Listing
+Optimizer begun.
