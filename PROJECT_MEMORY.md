@@ -3033,6 +3033,60 @@ clean.
 id `68d2de238e` remains an UPSTREAM DataDoe primary-organization source-access/configuration gate until
 it returns rows in a controlled live check.
 
+#### Re-review 7: manifest-transition concurrency -- optimistic CAS on `rev` (2026-08-12)
+
+One remaining P2 race. Retention re-read an in-progress manifest, compared `updatedAt`, then wrote
+`expired` UNCONDITIONALLY; the orchestrator also wrote transitions unconditionally. A continuation
+committing between retention's re-read and its write could be clobbered; if retention wrote first, a
+stale continuation could overwrite `expired`. A read-then-write comparison is not atomic. All approved
+functional orchestration is unchanged. Nothing pushed/merged/deployed/migrated; scheduler branches,
+`HANDOFF.md`, `.worktrees` untouched. Commits `45e1747` (server), `d142813` (tests), + this docs commit.
+Files: `lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs`.
+
+**Mechanism: atomic optimistic concurrency (CAS) on an in-payload version `rev`.** Every EXISTING-manifest
+transition -- in BOTH the orchestrator and retention expiry -- is a compare-and-swap on `rev`. New
+`casUpdateReportSnapshotByRev` issues ONE PostgREST conditional PATCH `?...&payload->>rev=eq.<expected>`
+with `Prefer: return=representation`; the UPDATE's WHERE makes it a single atomic statement, so exactly
+one of two concurrent writers whose expected `rev` matches the stored row wins (returns the row) and the
+other matches zero rows and loses. **No migration** (`rev` lives in the existing jsonb payload). We chose
+an explicit `rev` over `updated_at` (the `report_snapshots_touch_updated_at` trigger would also bump a
+version) because it is writer-controlled, monotonic, immune to timestamp precision, and directly testable;
+it IS the stored row version. `defaultSaveCatalogActionManifest`: `rev == null` -> upsert-create at rev 1;
+else CAS -> new rev on win, `false` on loss, throw on transport error.
+
+Concurrency state table (existing-manifest transition):
+
+| write site | CAS wins | CAS loses (concurrent commit) | transport error |
+|---|---|---|---|
+| orchestrator advance (queue-changing) | advance, status updated | **409** (stale continuation never restores) | in-progress (recovery; terminal attempt durable) |
+| orchestrator completion | complete | **409** | operational (never reports complete) |
+| orchestrator operational-failure | stop persisted | **409** | operational (prior in-progress queue intact) |
+| orchestrator in-progress (concurrent owner) | *(no write -- queue unchanged)* | *(no write)* | *(no write)* |
+| orchestrator continuation-expiry | expired + 409 | 409 (already terminal) | 409 |
+| retention expiry (in-progress -> expired) | expired (pruned later) | **skip** (does not overwrite the continuation) | skip (retry next pass) |
+| create (first click, rev null) | insert at rev 1 | n/a | operational |
+
+The in-progress (concurrent-owner) disposition no longer persists a manifest write: the queue is unchanged,
+so persisting would only bump the version and needlessly lose/steal the CAS race against the owner's real
+advance. Both interleavings are now provably safe:
+- **Race A** (continuation commits between retention's re-read and its expiry CAS): retention's CAS loses
+  -> it does NOT overwrite the continuation.
+- **Race B** (retention expires first): the stale continuation's advance CAS loses -> it 409s and does NOT
+  restore in-progress/complete; no export (the terminal attempt is reused).
+
+Preserved: one export per request, per-(action,account) attempt claims, typed safe codes, LKG,
+attempts-first deletion, dynamic account discovery, primary-only routing, short id `68d2de238e`.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **67** (+1 net: -old updatedAt re-read guard, +P2 race A, +P2 race B; FIX-2 in-progress +
+orchestration-14 model + seeds updated to rev-CAS) + `build:check` **2,394 modules**; `git diff --check`
+clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Concurrency does not touch source access; the short id
+`68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows in a
+controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
