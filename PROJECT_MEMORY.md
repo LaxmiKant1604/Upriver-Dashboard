@@ -2527,6 +2527,55 @@ remains removed from Vercel: after moving legacy dd-secondary sellers to the pri
 organization, refresh the Account Directory and Brand Directory so saved mappings use
 the current primary account ids.
 
+### Brand View FBA inventory bridge — Codex review blockers fixed (2026-08-12)
+
+Fixed the three Codex review blockers on `feature/brand-view-fba-bridge` (base `76476a7`).
+NOT pushed/merged/deployed/migrated; Scheduler v2/v1, frontend design, and `HANDOFF.md`
+untouched. Commits: `2febe7b` (brand-view.js core), `4ad5992` (api/datadoe.js route),
+`d593060` (tests), + this docs commit. Changed files: `api/datadoe.js`,
+`lib/server/reports/brand-view.js`, `scripts/test-brand-view.mjs`.
+
+BLOCKER 1 — strict FBA inventory row validation. `buildBrandInventoryPayload` now takes
+the EXACT `[from,to] = [asOf-10d, asOf]` window and REFUSES the whole payload (admin-safe
+throw, nothing saved, prior snapshot preserved) on any invalid row. Validation state table:
+
+| check | rule | on failure |
+| --- | --- | --- |
+| window | `from`/`to` strict UTC calendar dates, `from<=to` | reject (`brandInventorySafe`) |
+| invRows | must be an array | reject |
+| row cap | `length < rowLimit` (15,000) | reject (truncated) |
+| row shape | plain object (not null / not array) | reject |
+| `date` | `isStrictCalendarDate` round-trip AND inside `[from,to]` | reject (impossible/malformed/future/out-of-window) |
+| `child_asin` | non-empty (trimmed) | reject |
+| `available` | `Number.isFinite(raw) && raw >= 0` — NO coercion | reject (null/""/"5"/NaN/Infinity/negative) |
+| country | row `marketplace_country_code` OR account-country fallback, non-empty | reject |
+
+Only the latest validated date folds; `inventoryAvailable` is true only when rows were
+returned, so a covered brand with 0 units is a genuine zero while an empty/absent brand is
+unavailable.
+
+BLOCKER 2 — compact snapshot is authoritative. `buildAccountBrandSlice` uses
+`isCompactInventorySnapshot` (correct `params.reportVersion === brand-inventory-shared-v1`
++ compact shape) and, when valid, reads it EXCLUSIVELY with no legacy fallback payload. An
+empty compact snapshot or an absent selected brand => unavailable, never a resurrected
+stale FBA Plan value. The legacy fba-plan/listing-health fallback applies only while no
+valid compact snapshot exists (a wrong-version snapshot counts as none).
+
+BLOCKER 3 — no second Product Catalog export. `buildBrandInventorySnapshot` dropped the
+live `fetchCatalogRows` fallback entirely; the API handler passes no catalog fetcher. It
+uses ONLY the saved brand-sales `asinBrand` map; a missing map fails closed BEFORE the FBA
+export. Export-count evidence (tests): successful account = Brand Sales ≤2 + Brand
+Inventory exactly 1 FBA export + 0 Catalog = **≤3**; a missing asinBrand (e.g. Brand Sales
+catalog just failed) = **0 Catalog and 0 FBA exports** (`invCalls === 0`), no second
+Catalog attempt in the same click. LKG evidence: every validation refusal / truncation /
+DataDoe failure throws before `sendLegacyPayload`, so the snapshot is never overwritten.
+
+Verification (exit 0): `node --check` on every changed JS/MJS file; `npm run test:brand-view`
+**77** (was 72) covering the review's 16 required cases; `npm run verify` = insight **54** +
+Brand View **77** + sync **23** + source-cache **6** + `build:check` **2,394-module** build;
+`git diff --check` clean. Nothing pushed/merged/deployed. Live authenticated browser
+verification remains a deployment gate (app auth-gated locally).
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
