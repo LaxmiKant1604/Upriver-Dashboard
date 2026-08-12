@@ -2748,6 +2748,53 @@ production for the tested primary account -- an UPSTREAM primary-organization so
 issue (enable/authorize "Product Catalog by ASIN" and reconfirm its live short id in DataDoe). The
 code never guesses another id or falls back to the obsolete long id.
 
+#### Re-review 2: atomic claim, durable attempt store, action-id gate (2026-08-12)
+
+Five Codex re-review blockers on `feature/brand-view-catalog-retry-hotfix`. The previous fix recorded
+the once-per-action marker by rewriting the LKG snapshot AFTER export (raceable, and it advanced the
+successful snapshot's `source_refreshed_at`). This makes claiming atomic and moves attempt state into
+its own durable row. Nothing pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`,
+`.worktrees` untouched. Commits `2ae4882` (server), `221fe4f` (tests), + this docs commit. Files:
+`api/datadoe.js`, `scripts/test-source-cache.mjs` (the client already mints one valid
+`catalogSyncActionId` per refresh and sends it on every request, so it was unchanged).
+
+Mechanism -- reuses existing primitives, **no migration**:
+- **Atomic claim BEFORE create-export.** `claimRefreshLock` (the `claim_report_refresh_lock` DB
+  upsert-with-expiry) is taken on a key scoped by action + account
+  (`reportKey:"brand-catalog-attempt"`, `paramsHash = paramsHashFor(..., {accountId, actionId})`,
+  90s). Exactly one of two concurrent same-(action,account) requests wins; the loser creates ZERO
+  exports and returns an admin-safe `attempting`/`PRODUCT_CATALOG_ATTEMPT_PENDING`. If the claim
+  throws or is refused -> zero exports.
+- **Durable "attempting" marker BEFORE create-export.** Written to the separate attempt row before
+  the fetch. If that write fails -> release + zero exports. Because it persists independent of the
+  lock, a mid-export timeout, a failed outcome write, or a replay after the lock expired all find it
+  and create ZERO further exports. An unknown/attempting state waits for a NEW explicit action id;
+  it is never auto-retried.
+- **Separate durable attempt store (blocker 4 + 5).** Attempt state lives ONLY in the
+  `brand-catalog-attempt` row, keyed by action + account. A failed refresh therefore leaves the
+  successful `brand-catalog` LKG snapshot **byte-identical** -- its brand map AND its
+  `source_refreshed_at` never move (proven byte-for-byte in the test). Two overlapping actions write
+  different rows, so neither clobbers the other's typed cumulative summary.
+  `sharedSnapshotBrandAccounts` reads this-action failures from the attempt row (exact params hash),
+  not from the LKG payload.
+- **Action-id gate (blocker 3).** `validCatalogActionId` (`/^[A-Za-z0-9_-]{1,64}$/`) is enforced in
+  the handler for every directory SYNC (the refresh AND every continuation both carry `refresh=1`)
+  BEFORE `discoverConnectedAccounts` or any export: missing/malformed on a fresh refresh -> **400**,
+  on a continuation -> **409**. Cache-only reads never enter this branch and need no id.
+  `syncAccountBrandCatalog` also fails closed (no export) when `actionId` is null.
+
+State ownership: `brand-catalog` row = LKG coverage (`catalogSyncStatus` complete/unavailable, brand
+map) and is only written on success or a no-prior-success failure -- NEVER on an LKG-preserved
+failure. `brand-catalog-attempt` row = per-action attempt (`status` attempting/complete/unavailable +
+typed `code` + `preservedLkg`). Only typed safe codes cross either boundary; never a raw DataDoe body.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **28** (+5: two-concurrent=>one-export, claim-write-failure=>zero, outcome-write-failure
++replay=>zero, missing/malformed action id=>zero, failed-refresh LKG byte-identical + per-action row,
+overlapping actions keep separate summaries; the 15-account one-export/request, short-id-only, LKG and
+no-raw-error tests stay green) + `build:check` **2,394 modules**; `git diff --check` clean. Live
+DataDoe 404 note above still stands unchanged.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
