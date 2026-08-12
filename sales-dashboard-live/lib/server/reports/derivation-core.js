@@ -1796,3 +1796,165 @@ export function ppcPerformancePayload({
     catalogBrands: catalog.catalogBrands,
   };
 }
+
+// ---- Listing & Search Optimizer cores -----------------------------------------------------
+//
+// Verbatim PURE transcription of the post-fetch folds in lib/server/reports/listing-optimizer.js
+// (buildListingOptimizer), operating on ALREADY-SAVED source rows instead of DataDoe exports, so this
+// leaf keeps its ZERO DataDoe/Supabase/network import boundary. For VALID inputs the payload is
+// byte-identical to buildListingOptimizer for the same rows. It ADDS fail-closed strictness the live
+// route never needs (it never sees a malformed export): a present-but-non-finite SQP count/rank/price, a
+// malformed (non-string) median-price currency, or a (ASIN, query) group whose positive-price rows span
+// more than one currency THROWS (=> derive-invalid => zero snapshot writes => last-known-good preserved),
+// instead of coercing to 0 / silently keeping the first currency.
+
+// Strict finite extractor for SQP evidence: absent (null/undefined/"") folds to 0 exactly like `num`; a
+// PRESENT value that is not a finite number is REJECTED (the live `num` would coerce it to 0). For every
+// finite value optFiniteNum(v) === num(v), so the happy path stays byte-identical.
+function optFiniteNum(value, label) {
+  if (value === null || value === undefined || value === "") return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    throw new Error(`${label} is not a finite number; snapshot blocked (invalid).`);
+  }
+  return n;
+}
+
+// The faithful sqpAvailable:false snapshot -- byte-identical to buildListingOptimizer's SOURCE_DISABLED
+// return: window + the enable hint + the SQP source label, and empty periods/queries/products/brands.
+export function listingOptimizerUnavailablePayload({ accountId, asOf, from, lookbackDays, sqpUnavailableReason, sqpSourceLabel }) {
+  return {
+    accountId: accountId ?? null,
+    asOf,
+    window: { from, to: asOf, days: lookbackDays },
+    sqpAvailable: false,
+    sqpUnavailableReason,
+    sqpSourceLabel,
+    periods: [],
+    queries: [],
+    products: [],
+    catalogBrands: [],
+  };
+}
+
+// The full faithful payload from validated SQP + catalog rows -- byte-identical to buildListingOptimizer
+// for valid inputs, fail-closed on malformed evidence.
+export function listingOptimizerPayload({ accountId, asOf, from, lookbackDays, sqpRows, catalogRows, sqpSourceLabel, contentSourceLabel }) {
+  // 1) SQP fold: one bucket per (ASIN, query) across the window. Query- + ASIN-level counts are summed; the
+  //    best (lowest positive) organic rank is kept; the FIRST positive median click price + its currency is
+  //    kept. Blank ASIN/query rows are skipped exactly like the live builder.
+  const byKey = new Map();
+  const periods = new Set();
+  const priceCurrenciesByKey = new Map(); // key -> Set of non-empty currencies among positive-price rows
+  for (const row of Array.isArray(sqpRows) ? sqpRows : []) {
+    const asin = String(row.child_asin || "").trim();
+    const query = String(row.search_query || "").trim();
+    if (!asin || !query) continue;
+    const period = String(row.date || "");
+    if (period) periods.add(period);
+
+    const key = `${asin}|${query}`;
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = {
+        asin,
+        query,
+        volume: 0,
+        totalImpressions: 0,
+        totalClicks: 0,
+        totalCartAdds: 0,
+        totalPurchases: 0,
+        asinImpressions: 0,
+        asinClicks: 0,
+        asinCartAdds: 0,
+        asinPurchases: 0,
+        bestRank: null,
+        medianClickPrice: null,
+        medianClickPriceCurrency: null,
+        periodCount: 0,
+      };
+      byKey.set(key, entry);
+    }
+    entry.periodCount += 1;
+    entry.volume += optFiniteNum(row.search_query_volume, "listing-optimizer search_query_volume");
+    entry.totalImpressions += optFiniteNum(row.search_query_total_impression_count, "listing-optimizer search_query_total_impression_count");
+    entry.totalClicks += optFiniteNum(row.search_query_total_click_count, "listing-optimizer search_query_total_click_count");
+    entry.totalCartAdds += optFiniteNum(row.search_query_total_cart_add_count, "listing-optimizer search_query_total_cart_add_count");
+    entry.totalPurchases += optFiniteNum(row.search_query_total_purchase_count, "listing-optimizer search_query_total_purchase_count");
+    entry.asinImpressions += optFiniteNum(row.child_asin_impression_count, "listing-optimizer child_asin_impression_count");
+    entry.asinClicks += optFiniteNum(row.child_asin_click_count, "listing-optimizer child_asin_click_count");
+    entry.asinCartAdds += optFiniteNum(row.child_asin_add_to_cart_count, "listing-optimizer child_asin_add_to_cart_count");
+    entry.asinPurchases += optFiniteNum(row.child_asin_purchase_count, "listing-optimizer child_asin_purchase_count");
+
+    const rank = optFiniteNum(row.child_asin_organic_search_rank, "listing-optimizer child_asin_organic_search_rank");
+    if (rank > 0) entry.bestRank = entry.bestRank === null ? rank : Math.min(entry.bestRank, rank);
+
+    const price = optFiniteNum(row.child_asin_median_click_price_value, "listing-optimizer child_asin_median_click_price_value");
+    if (price > 0) {
+      const rawCurrency = row.child_asin_median_click_price_currency;
+      if (rawCurrency !== null && rawCurrency !== undefined && typeof rawCurrency !== "string") {
+        throw new Error("listing-optimizer child_asin_median_click_price_currency is malformed (not a string); snapshot blocked (invalid).");
+      }
+      const currency = String(rawCurrency || "").trim();
+      if (currency) {
+        if (!priceCurrenciesByKey.has(key)) priceCurrenciesByKey.set(key, new Set());
+        priceCurrenciesByKey.get(key).add(currency);
+      }
+      if (entry.medianClickPrice === null) {
+        entry.medianClickPrice = price;
+        entry.medianClickPriceCurrency = currency || null;
+      }
+    }
+  }
+  // Fail closed on ambiguous cross-currency median-price within a (ASIN, query) group (the live builder
+  // silently keeps the first currency; a scheduled derive must never merge/discard currencies silently).
+  for (const [key, currencies] of priceCurrenciesByKey) {
+    if (currencies.size > 1) {
+      const entry = byKey.get(key);
+      throw new Error(`listing-optimizer (ASIN "${entry.asin}", query "${entry.query}") median click prices span more than one currency (${[...currencies].sort().join(", ")}); a single median price must not merge currencies. Snapshot blocked (invalid).`);
+    }
+  }
+
+  // 2) Catalog products: dedup by ASIN (first wins); bullets (blank dropped), bounded 2,000-char
+  //    description, image presence, BSR (num||null, byte-identical to the builder), brand ("Unassigned"
+  //    when blank). catalogBrands = distinct NON-EMPTY trimmed product_brand (INCLUDING a literal
+  //    "Unassigned"), byte-identical to the builder's `brands` set (NOT catalogBrandNames).
+  const products = [];
+  const brands = new Set();
+  const seen = new Set();
+  for (const row of Array.isArray(catalogRows) ? catalogRows : []) {
+    const asin = String(row.child_asin || "").trim();
+    if (!asin || seen.has(asin)) continue;
+    seen.add(asin);
+    const brand = String(row.product_brand || "").trim();
+    if (brand) brands.add(brand);
+    const bullets = [1, 2, 3, 4, 5]
+      .map((index) => String(row[`product_bullet_point_${index}`] || "").trim())
+      .filter(Boolean);
+    products.push({
+      asin,
+      name: String(row.product_name || "").trim() || null,
+      brand: brand || "Unassigned",
+      category: String(row.product_root_category_name || "").trim() || null,
+      bestSellerRank: num(row.product_root_best_selling_rank) || null,
+      bullets,
+      description: String(row.product_description || "").trim().slice(0, 2000) || null,
+      hasImage: Boolean(String(row.product_image_url || "").trim()),
+    });
+  }
+
+  const sortedPeriods = [...periods].sort();
+  return {
+    accountId: accountId ?? null,
+    asOf,
+    window: { from, to: asOf, days: lookbackDays },
+    sqpAvailable: true,
+    sqpSourceLabel,
+    contentSourceLabel,
+    periods: sortedPeriods,
+    periodCount: sortedPeriods.length,
+    queries: [...byKey.values()],
+    products,
+    catalogBrands: [...brands].sort((a, b) => a.localeCompare(b)),
+  };
+}
