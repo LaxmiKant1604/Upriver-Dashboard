@@ -307,6 +307,34 @@ export async function saveReportSnapshot(snapshot) {
   return rows[0];
 }
 
+/**
+ * Atomic INSERT-IF-ABSENT of one snapshot row, using the natural-key unique index
+ * (report_key, account_id, params_hash). Unlike saveReportSnapshot (merge-upsert), this NEVER
+ * merges or overwrites an existing row: it sends `Prefer: resolution=ignore-duplicates`
+ * (INSERT ... ON CONFLICT DO NOTHING) with `return=representation`, so the response contains the
+ * inserted row when it was absent and is EMPTY on conflict. Returns `true` when a row was
+ * inserted, `false` when the row already existed (conflict), and THROWS on transport/HTTP
+ * failure. Used for first-manifest creation so a delayed second creator loses the race instead
+ * of clobbering an already-advanced action.
+ */
+export async function insertReportSnapshotIfAbsent(snapshot) {
+  const rows = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+    body: {
+      report_key: snapshot.reportKey,
+      account_id: snapshot.accountId,
+      params_hash: snapshot.paramsHash,
+      params: snapshot.params || {},
+      payload: snapshot.payload || null,
+      payload_storage_path: snapshot.payloadStoragePath || null,
+      payload_bytes: snapshot.payloadBytes || 0,
+      source_refreshed_at: snapshot.sourceRefreshedAt || new Date().toISOString(),
+    },
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 const SOURCE_CACHE_BUCKET = "dashboard-snapshots";
 
 export async function getSourceExportCache(requestHash) {

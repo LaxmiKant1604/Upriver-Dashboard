@@ -33,6 +33,7 @@ import {
   getLatestReportSnapshot,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
+  insertReportSnapshotIfAbsent,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   releaseRefreshLock,
@@ -384,6 +385,13 @@ function catalogActionHash(actionId) {
   return paramsHashFor(BRAND_CATALOG_ACTION_VERSION, { actionId });
 }
 
+// A valid optimistic version is a POSITIVE INTEGER. A loaded manifest whose rev is missing,
+// zero, negative, fractional, a string, or otherwise malformed is corrupt/legacy and MUST fail
+// closed -- it is never treated as new (which would bypass CAS and could clobber an advanced row).
+function isPositiveIntRev(value) {
+  return Number.isInteger(value) && value > 0;
+}
+
 // Deterministic hash of the discovered authorized PRIMARY scope. A continuation whose
 // authorized scope no longer hashes to the manifest's value (injected/removed account,
 // changed permissions) is rejected before any DataDoe call.
@@ -402,7 +410,8 @@ async function defaultLoadCatalogActionManifest(actionId) {
 }
 
 // Persist a manifest transition. Contract used by BOTH the orchestrator and retention:
-//   - manifest.rev == null  -> CREATE (first write): upsert-insert at rev 1; returns 1.
+//   - manifest.rev == null  -> CREATE (first write): atomic INSERT-IF-ABSENT at rev 1; returns 1
+//     when inserted, or `false` when a row already exists (create conflict -- never overwritten).
 //   - manifest.rev is set    -> CAS UPDATE: succeeds only if the stored row is still at that
 //     rev; returns the NEW rev on success, or `false` when the CAS lost (a concurrent write
 //     moved the row on). A transport failure THROWS.
@@ -410,8 +419,10 @@ async function defaultSaveCatalogActionManifest(actionId, manifest) {
   const paramsHash = catalogActionHash(actionId);
   const sourceRefreshedAt = manifest.updatedAt || new Date().toISOString();
   if (manifest.rev == null) {
+    // CREATE via atomic INSERT-IF-ABSENT (never merge/overwrite). A delayed second creator that
+    // also loaded "missing" LOSES here instead of clobbering an already-advanced/stopped row.
     const payload = { ...manifest, rev: 1 };
-    await saveReportSnapshot({
+    const inserted = await insertReportSnapshotIfAbsent({
       reportKey: BRAND_CATALOG_ACTION_KEY,
       accountId: BRAND_CATALOG_ACTION_ACCOUNT,
       paramsHash,
@@ -420,7 +431,7 @@ async function defaultSaveCatalogActionManifest(actionId, manifest) {
       payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
       sourceRefreshedAt,
     });
-    return 1;
+    return inserted ? 1 : false; // false => a row already exists (create conflict)
   }
   const expectedRev = manifest.rev;
   const payload = { ...manifest, rev: expectedRev + 1 };
@@ -1070,10 +1081,18 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
       // Far beyond any real refresh; a continuation after this marks the action expired + 409.
       expiresAt: new Date(nowMs() + BRAND_CATALOG_ACTION_ABANDON_DAYS * 86_400_000).toISOString(),
     };
-    // Persist the manifest BEFORE any DataDoe call. If it cannot be persisted, create ZERO
-    // exports and stop with a typed operational failure (never report completion).
-    if (!(await writeManifest(manifest)).ok) return opFailureUnsaved(manifest);
+    // Persist the manifest BEFORE any DataDoe call via atomic INSERT-IF-ABSENT. A CREATE CONFLICT
+    // means another request already created this action (a delayed duplicate first click): create
+    // ZERO exports and return a safe 409 reload -- NEVER overwrite or reopen the existing action.
+    // A transport error stops with a typed operational failure (never report completion).
+    const created = await writeManifest(manifest);
+    if (created.conflict) return CONFLICT;
+    if (!created.ok) return opFailureUnsaved(manifest);
   } else {
+    // A loaded manifest MUST carry a valid positive-integer optimistic version. A missing/zero/
+    // negative/fractional/string/malformed rev is a corrupt/legacy row: fail closed (409) BEFORE
+    // any DataDoe call or write, and NEVER treat it as new (which would bypass CAS).
+    if (!isPositiveIntRev(manifest.rev)) return CONFLICT;
     // An existing action: validate ownership + scope BEFORE any DataDoe call. Wrong admin,
     // a changed/injected/removed scope, an unknown-but-existing action all 409.
     if (manifest.userId && userId && String(manifest.userId) !== String(userId)) return CONFLICT;
