@@ -17,6 +17,7 @@ import {
   syncBrandCatalogBatch,
   classifyCatalogError,
   nextCatalogBatch,
+  usableCatalogBrands,
   BRAND_CATALOG_BATCH_SIZE,
   SAFE_CATALOG_CODES,
   CATALOG_SOURCE_UNAVAILABLE,
@@ -310,9 +311,11 @@ await asyncTest("retry queue: ONE explicit refresh attempts every eligible accou
   const attempts = [];
   let requests = 0;
   let cursor = eligible;
+  let batchSizes = [];
   // Simulate the server cursor + browser continuation loop end to end.
   while (cursor.length && requests < 40) {
     const { batch, remainingAccountIds } = nextCatalogBatch(cursor, BRAND_CATALOG_BATCH_SIZE);
+    batchSizes.push(batch.length);
     await syncBrandCatalogBatch(batch, [PRIMARY], {
       attemptAccount: (id) => { attempts.push(id); return { accountId: id, status: "unavailable", code: CATALOG_SOURCE_UNAVAILABLE }; },
     });
@@ -322,9 +325,24 @@ await asyncTest("retry queue: ONE explicit refresh attempts every eligible accou
   assert.equal(attempts.length, 15, "exactly 15 attempts total -- not 40, not an infinite loop");
   assert.deepEqual([...new Set(attempts)].sort(), eligible.slice().sort(), "every eligible account was attempted");
   attempts.forEach((id, i) => assert.equal(attempts.indexOf(id), i, `${id} was attempted only once`));
-  assert.equal(requests, 3, "15 accounts / batch 5 = 3 bounded requests");
+  assert.equal(requests, 15, "one export per request => 15 requests for 15 accounts");
+  assert.ok(batchSizes.every((n) => n === 1), "each request processes EXACTLY ONE export (deadline-safe)");
   // The 14 previously-failed (old long id) accounts are all attempted, never starved.
   eligible.slice(0, 14).forEach((id) => assert.ok(attempts.includes(id), `${id} (old-long-id error) was retried`));
+});
+
+await asyncTest("blocker 1: one export per invocation -- a slow export cannot consume the next cursor item", async () => {
+  const cursor = ["A1", "A2", "A3"];
+  const { batch, remainingAccountIds } = nextCatalogBatch(cursor, BRAND_CATALOG_BATCH_SIZE);
+  assert.deepEqual(batch, ["A1"], "exactly one account is attempted this request");
+  assert.deepEqual(remainingAccountIds, ["A2", "A3"], "the next cursor items are untouched");
+  const fetched = [];
+  await syncBrandCatalogBatch(batch, [PRIMARY], {
+    getPriorSnapshot: () => Promise.resolve(null), saveSnapshot: () => Promise.resolve(),
+    // Simulate a SLOW export: even if this took ~45s, only A1 is touched this invocation.
+    fetchCatalog: ({ rawAccountId }) => { fetched.push(rawAccountId); return [{ child_asin: "X", product_brand: "Acme" }]; },
+  });
+  assert.deepEqual(fetched, ["A1"], "the slow export touched only A1; A2/A3 were never fetched this request");
 });
 
 test("classifyCatalogError maps to typed codes and never returns a raw body", () => {
@@ -364,12 +382,77 @@ await asyncTest("a prior SUCCESSFUL catalog snapshot survives a later 404 / time
   ];
   for (const f of failures) {
     const store = makeCatalogStore({ A1: good });
-    const result = await syncAccountBrandCatalog(acct("A1"), { ...store, fetchCatalog: f.fetchCatalog });
+    const result = await syncAccountBrandCatalog({ ...acct("A1"), actionId: "ACT1" }, { ...store, fetchCatalog: f.fetchCatalog });
     assert.equal(result.status, "unavailable", `${f.label}: reported unavailable`);
     assert.equal(result.preservedLkg, true, `${f.label}: last-known-good is preserved`);
-    assert.equal(store.saves.length, 0, `${f.label}: the prior successful snapshot is NOT overwritten`);
-    assert.deepEqual(store.snapshot("A1").payload.catalogBrands, ["Bebi Born", "Nordfell"], `${f.label}: the prior brand map is still readable`);
+    const snap = store.snapshot("A1").payload;
+    assert.deepEqual(snap.catalogBrands, ["Bebi Born", "Nordfell"], `${f.label}: the prior brand map is still readable (never replaced)`);
+    assert.equal(snap.catalogSyncStatus, "complete", `${f.label}: the map stays complete (LKG not downgraded)`);
+    // The typed failure is RECORDED on the snapshot (for idempotency + cumulative summary),
+    // but only as an attempt -- the brand map itself is untouched, and no raw error is stored.
+    assert.equal(snap.catalogAttemptStatus, "unavailable");
+    assert.ok(SAFE_CATALOG_CODES.has(snap.catalogAttemptCode), `${f.label}: typed attempt code recorded`);
+    assert.equal(snap.catalogSyncError, undefined, `${f.label}: no raw error persisted`);
   }
+});
+
+test("blocker 3: a row with a blank ASIN and a named brand is NOT usable coverage (PRODUCT_CATALOG_EMPTY)", () => {
+  assert.deepEqual(usableCatalogBrands([{ child_asin: "", product_brand: "Bebi Born" }]), [], "blank ASIN + named brand => no usable mapping");
+  assert.deepEqual(usableCatalogBrands([{ child_asin: "A1", product_brand: "" }]), [], "named ASIN + blank brand => no usable mapping");
+  assert.deepEqual(usableCatalogBrands([{ child_asin: "A1", product_brand: "Unassigned" }]), [], "Unassigned is never a real brand");
+  assert.deepEqual(usableCatalogBrands([{ child_asin: "A1", product_brand: "Bebi Born" }, { child_asin: "", product_brand: "Ghost" }]), ["Bebi Born"], "only the usable row contributes");
+});
+
+await asyncTest("blocker 3 end to end: a blank-ASIN/named-brand catalog yields PRODUCT_CATALOG_EMPTY and never saves complete coverage", async () => {
+  const store = makeCatalogStore();
+  const result = await syncAccountBrandCatalog({ ...acct("A1"), actionId: "ACT1" }, {
+    ...store, fetchCatalog: () => [{ child_asin: "", product_brand: "Bebi Born" }],
+  });
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.code, CATALOG_EMPTY, "no usable child_asin -> product_brand mapping is PRODUCT_CATALOG_EMPTY");
+  assert.equal(store.snapshot("A1").payload.catalogSyncStatus, "unavailable", "complete coverage is never saved");
+  assert.deepEqual(store.snapshot("A1").payload.catalogBrands, [], "no fabricated brand is saved");
+});
+
+await asyncTest("blocker 4: replaying a continuation under the same action id spends ZERO duplicate exports", async () => {
+  const store = makeCatalogStore();
+  let fetchCalls = 0;
+  const attempt = () => syncAccountBrandCatalog({ ...acct("A1"), actionId: "ACT1" }, {
+    ...store, fetchCatalog: () => { fetchCalls += 1; return [{ child_asin: "A1", product_brand: "Bebi Born" }]; },
+  });
+  const first = await attempt();
+  const replay = await attempt(); // identical continuation replay under the SAME action id
+  const replay2 = await attempt();
+  assert.equal(fetchCalls, 1, "exactly ONE export was spent; the replays created NO new export");
+  assert.equal(first.status, "complete");
+  assert.equal(replay.skipped, true, "the replay is a no-op that returns the recorded outcome");
+  assert.equal(replay.status, "complete");
+  assert.equal(replay2.skipped, true);
+  // A genuinely NEW action (different id) re-attempts (one more export) -- that is a new user action, not a replay.
+  const newAction = await syncAccountBrandCatalog({ ...acct("A1"), actionId: "ACT2" }, {
+    ...store, fetchCatalog: () => { fetchCalls += 1; return [{ child_asin: "A1", product_brand: "Bebi Born" }]; },
+  });
+  assert.equal(newAction.skipped, undefined, "a new action id is not a replay");
+  assert.equal(fetchCalls, 2, "a new action spends exactly one more export");
+});
+
+await asyncTest("blocker 2: an early-batch failure that PRESERVES LKG still appears in the final cumulative summary after later batches", async () => {
+  // Mirror the handler's summary predicate: an account is a this-action failure if its
+  // latest attempt under this action failed, whether its map is a preserved LKG or absent.
+  const summaryFor = (store, ids, actionId) => ids.filter((id) => {
+    const p = store.snapshot(id)?.payload;
+    if (!p) return false;
+    if (p.catalogSyncStatus === "unavailable") return true; // no usable saved catalog
+    return p.catalogAttemptActionId === actionId && p.catalogAttemptStatus === "unavailable"; // LKG-preserved failure
+  });
+  const store = makeCatalogStore({ A1: { payload: { catalogBrands: ["Bebi Born"], catalogSyncStatus: "complete", catalogSyncedAt: "2026-08-10T00:00:00.000Z" } } });
+  // Batch 1: A1 (has LKG) fails 404 -> LKG preserved, failure recorded.
+  await syncAccountBrandCatalog({ ...acct("A1"), actionId: "ACT1" }, { ...store, fetchCatalog: () => { throw new Error("DataDoe export creation failed (404): Source not found"); } });
+  assert.deepEqual(summaryFor(store, ["A1", "A2"], "ACT1"), ["A1"], "A1's failure is in the summary after batch 1");
+  // Batch 2: A2 succeeds. Re-reading A1's (still complete) snapshot must NOT drop A1's earlier failure.
+  await syncAccountBrandCatalog({ ...acct("A2"), actionId: "ACT1" }, { ...store, fetchCatalog: () => [{ child_asin: "A2x", product_brand: "Nordfell" }] });
+  assert.equal(store.snapshot("A1").payload.catalogSyncStatus, "complete", "A1's LKG map is still readable");
+  assert.deepEqual(summaryFor(store, ["A1", "A2"], "ACT1"), ["A1"], "A1's early-batch LKG-preserved failure STILL appears in the final summary");
 });
 
 await asyncTest("mixed outcome: a successful account updates its map; a failed account with no prior success saves a typed-unavailable marker (no fabricated brands)", async () => {
