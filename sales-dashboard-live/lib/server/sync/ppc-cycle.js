@@ -30,11 +30,12 @@ const TOTAL_SALES_KEY = "ppc-performance:total-sales";
  * `getAdsDailySourceRows` / `getAdsSyncStates` read the PERSISTED Ads history (never DataDoe). Idempotent:
  * a repeated/fresh call re-loads the same persisted Ads, re-plans, and creates NO duplicate exports. Returns
  * a rollup with per-account Ads status + the final plannedReports for runReportJobs (which loads the Ads rows
- * for the derive via makePpcAdsContextLoader).
+ * for the derive via makePpcAdsContextLoader). `getAdsSyncCoverage(accountId, sourceKey)` reads the DURABLE
+ * successful coverage windows that gate Ads validity (unproven default coverage => the account plans nothing).
  */
 export async function runPpcShadowCycle({
   accounts = [], connections, asOf = null, asOfFor = null, store, dataDoe,
-  getAdsDailySourceRows, getAdsSyncStates,
+  getAdsDailySourceRows, getAdsSyncStates, getAdsSyncCoverage,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 2,
 }) {
@@ -59,7 +60,7 @@ export async function runPpcShadowCycle({
   // Load + validate each account's PERSISTED Ads history ONCE (public account scope) and derive its typed
   // ads-currency signal. This is a Supabase read, NOT a DataDoe export -- PPC makes ZERO DataDoe Ads calls.
   for (const st of state) {
-    st.ads = await loadPersistedPpcAds({ accountId: st.account.accountId, asOf: st.asOf, getAdsDailySourceRows, getAdsSyncStates });
+    st.ads = await loadPersistedPpcAds({ accountId: st.account.accountId, asOf: st.asOf, getAdsDailySourceRows, getAdsSyncStates, getAdsSyncCoverage });
     st.adsSignal = ppcAdsCurrencySignalOf(st.ads);
   }
 
