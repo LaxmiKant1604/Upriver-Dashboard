@@ -1808,16 +1808,42 @@ export function ppcPerformancePayload({
 // more than one currency THROWS (=> derive-invalid => zero snapshot writes => last-known-good preserved),
 // instead of coercing to 0 / silently keeping the first currency.
 
-// Strict finite extractor for SQP evidence: absent (null/undefined/"") folds to 0 exactly like `num`; a
-// PRESENT value that is not a finite number is REJECTED (the live `num` would coerce it to 0). For every
-// finite value optFiniteNum(v) === num(v), so the happy path stays byte-identical.
+// A plain finite DECIMAL numeric string (optional sign, integer/fraction, optional exponent). Deliberately
+// NARROWER than Number(): it rejects hex/octal/binary ("0x10"), "Infinity"/"NaN", grouped digits ("1,000")
+// and other junk that Number() would silently coerce. Whitespace is trimmed by the caller before testing.
+const FINITE_DECIMAL_STRING = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+// Strict finite extractor for SQP evidence. Absent (null/undefined/"") folds to 0 exactly like the live
+// `num`, so every VALID row stays byte-identical. Every PRESENT value must be a finite number OR a
+// syntactically valid finite numeric string; anything else is REJECTED (the live `num` would coerce it):
+//   - a boolean (Number(true) === 1), an array (Number([]) === 0, Number([5]) === 5), an object, a symbol,
+//     a bigint, a function -> rejected by type;
+//   - NaN / Infinity / -Infinity -> rejected as non-finite;
+//   - a whitespace-only string (Number("  ") === 0) or any non-decimal string -> rejected.
 function optFiniteNum(value, label) {
   if (value === null || value === undefined || value === "") return 0;
-  const n = Number(value);
-  if (!Number.isFinite(n)) {
-    throw new Error(`${label} is not a finite number; snapshot blocked (invalid).`);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(`${label} is not a finite number; snapshot blocked (invalid).`);
+    }
+    return value;
   }
-  return n;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      throw new Error(`${label} is a whitespace-only string, not a number; snapshot blocked (invalid).`);
+    }
+    if (!FINITE_DECIMAL_STRING.test(trimmed)) {
+      throw new Error(`${label} is not a valid finite numeric string; snapshot blocked (invalid).`);
+    }
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) {
+      throw new Error(`${label} is not a finite number; snapshot blocked (invalid).`);
+    }
+    return n;
+  }
+  // boolean / object / array / symbol / bigint / function: never a valid numeric evidence value.
+  throw new Error(`${label} is not a finite number or numeric string (got ${typeof value}); snapshot blocked (invalid).`);
 }
 
 // The faithful sqpAvailable:false snapshot -- byte-identical to buildListingOptimizer's SOURCE_DISABLED
@@ -1846,6 +1872,7 @@ export function listingOptimizerPayload({ accountId, asOf, from, lookbackDays, s
   const byKey = new Map();
   const periods = new Set();
   const priceCurrenciesByKey = new Map(); // key -> Set of non-empty currencies among positive-price rows
+  const priceUnknownByKey = new Set();    // keys with >=1 positive-price row whose currency is blank/missing
   for (const row of Array.isArray(sqpRows) ? sqpRows : []) {
     const asin = String(row.child_asin || "").trim();
     const query = String(row.search_query || "").trim();
@@ -1899,6 +1926,11 @@ export function listingOptimizerPayload({ accountId, asOf, from, lookbackDays, s
       if (currency) {
         if (!priceCurrenciesByKey.has(key)) priceCurrenciesByKey.set(key, new Set());
         priceCurrenciesByKey.get(key).add(currency);
+      } else {
+        // A positive median price with a blank/missing currency is an EXPLICIT UNKNOWN identity, NOT a
+        // wildcard that silently adopts a sibling row's currency. Tracking it lets a blank/unknown mixed
+        // with any real currency in the same group fail closed below.
+        priceUnknownByKey.add(key);
       }
       if (entry.medianClickPrice === null) {
         entry.medianClickPrice = price;
@@ -1906,12 +1938,20 @@ export function listingOptimizerPayload({ accountId, asOf, from, lookbackDays, s
       }
     }
   }
-  // Fail closed on ambiguous cross-currency median-price within a (ASIN, query) group (the live builder
-  // silently keeps the first currency; a scheduled derive must never merge/discard currencies silently).
-  for (const [key, currencies] of priceCurrenciesByKey) {
-    if (currencies.size > 1) {
+  // Fail closed on an ambiguous median-price identity within a (ASIN, query) group (the live builder
+  // silently keeps the first currency; a scheduled derive must never merge/discard currencies silently). The
+  // identity set is the distinct non-empty currencies PLUS an "unknown" identity when any positive-price row
+  // had a blank/missing currency, so USD+EUR, blank+USD and blank+EUR all fail, while USD-only, blank-only
+  // and blank+blank stay a single identity.
+  const ambiguousKeys = new Set([...priceCurrenciesByKey.keys(), ...priceUnknownByKey]);
+  for (const key of ambiguousKeys) {
+    const currencies = priceCurrenciesByKey.get(key) || new Set();
+    const identities = currencies.size + (priceUnknownByKey.has(key) ? 1 : 0);
+    if (identities > 1) {
       const entry = byKey.get(key);
-      throw new Error(`listing-optimizer (ASIN "${entry.asin}", query "${entry.query}") median click prices span more than one currency (${[...currencies].sort().join(", ")}); a single median price must not merge currencies. Snapshot blocked (invalid).`);
+      const shown = [...currencies].sort();
+      if (priceUnknownByKey.has(key)) shown.push("(unknown)");
+      throw new Error(`listing-optimizer (ASIN "${entry.asin}", query "${entry.query}") median click prices span more than one currency identity (${shown.join(", ")}); a single median price must not merge currencies. Snapshot blocked (invalid).`);
     }
   }
 
