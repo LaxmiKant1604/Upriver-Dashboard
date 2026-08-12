@@ -24,6 +24,7 @@ let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, planned
 let planPpcPerformance, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr;
 let runPpcShadowCycle, loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader;
 let validatePpcSourceCoverage, evaluateSourceCoverage;
+let ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -756,6 +757,120 @@ test("40. E2E worker snapshot: stale optional (succeeded sync state) saved sourc
   assert.equal(payload.totalSales, 800);
 });
 
+/* ===== Part F: admin-safe coverage reason codes (a raw DB/HTTP/credential string is NEVER persisted) ===== */
+
+group("ppc coverage reason safety: closed allowlist enforced at the derive boundary AND the saved payload");
+
+// Minimal four-source descriptors for DIRECT ppcPerformancePayload calls (campaign, asin, targeting, search).
+const PPC_DESCRIPTORS = [
+  { syncKey: KEYS.campaign, label: "Campaign", coverage: "c", defaultDataset: true },
+  { syncKey: KEYS.asin, label: "ASIN", coverage: "a", defaultDataset: true },
+  { syncKey: KEYS.targeting, label: "Targeting", coverage: "t", defaultDataset: false },
+  { syncKey: KEYS.search, label: "Search", coverage: "s", defaultDataset: false },
+];
+const directPpcPayload = (sourceCoverage, over = {}) => ppcPerformancePayload({
+  accountId: ID, asOf: ASOF, from: FROM, windowDays: 30, adsSourceDescriptors: PPC_DESCRIPTORS,
+  totalSalesSourceLabel: "TS", totalSalesLagDays: 4, adsRows: [], syncStates: [], catalogRows: [], ...over, sourceCoverage,
+});
+// A structurally-valid four-key contract; `searchOver` mutates the unproven-optional search entry under test.
+const covContract = (searchOver = {}) => [
+  { sourceKey: KEYS.campaign, required: true, proven: true, folded: true, reason: null },
+  { sourceKey: KEYS.asin, required: true, proven: true, folded: true, reason: null },
+  { sourceKey: KEYS.targeting, required: false, proven: true, folded: true, reason: null },
+  { sourceKey: KEYS.search, required: false, proven: false, folded: false, reason: "coverage-incomplete", ...searchOver },
+];
+const UNSAFE_REASONS = [
+  "raw-db-error apikey=LEAK",
+  "authorization: Bearer sk-live-abcdef0123456789",
+  "https://xyz.supabase.co/rest/v1/ads_sync_coverage?apikey=SECRET",
+  "PGRST205: relation \"ads_sync_coverage\" does not exist",
+  "Error: connect ETIMEDOUT 10.0.0.5:5432",
+  "SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+];
+
+test("41. validatePpcSourceCoverage reason safety: proven=>reason null; unproven optional=>allowlisted code only", () => {
+  assert.equal(validatePpcSourceCoverage(covContract()).ok, true, "unproven optional with an approved typed reason is valid");
+  assert.equal(validatePpcSourceCoverage(covContract({ reason: "coverage-schema-missing" })).ok, true, "any allowlisted safe code is accepted");
+  // A proven source (required OR optional) MUST carry reason:null.
+  assert.equal(validatePpcSourceCoverage(covContract().map((c) => (c.sourceKey === KEYS.campaign ? { ...c, reason: "coverage-incomplete" } : c))).reason, "source-coverage-proven-reason-not-null", "proven required + non-null reason fails");
+  assert.equal(validatePpcSourceCoverage(covContract({ proven: true, folded: true, reason: "coverage-incomplete" })).reason, "source-coverage-proven-reason-not-null", "proven optional + non-null reason fails");
+  // An unproven optional with an unsafe / unknown / missing / non-string reason fails closed.
+  for (const bad of UNSAFE_REASONS) {
+    assert.equal(validatePpcSourceCoverage(covContract({ reason: bad })).reason, "source-coverage-unproven-reason-unsafe", "unsafe reason rejected: " + bad.slice(0, 22));
+  }
+  assert.equal(validatePpcSourceCoverage(covContract({ reason: undefined })).reason, "source-coverage-unproven-reason-unsafe", "missing reason on unproven optional fails");
+  assert.equal(validatePpcSourceCoverage(covContract({ reason: null })).reason, "source-coverage-unproven-reason-unsafe", "null reason on unproven optional fails");
+  assert.equal(validatePpcSourceCoverage(covContract({ reason: 42 })).reason, "source-coverage-unproven-reason-unsafe", "non-string reason fails");
+});
+
+test("42. normalizePpcCoverageReason: allowlisted code passes; every raw/credential/url/db string => fixed fallback", () => {
+  assert.equal(normalizePpcCoverageReason("coverage-incomplete"), "coverage-incomplete");
+  assert.equal(normalizePpcCoverageReason("coverage-schema-missing"), "coverage-schema-missing");
+  for (const bad of UNSAFE_REASONS) assert.equal(normalizePpcCoverageReason(bad), "coverage-unavailable", "normalized to fallback: " + bad.slice(0, 22));
+  assert.equal(normalizePpcCoverageReason(null), "coverage-unavailable");
+  assert.equal(normalizePpcCoverageReason(undefined), "coverage-unavailable");
+  assert.equal(normalizePpcCoverageReason({ toString: () => "coverage-incomplete" }), "coverage-unavailable", "only a real allowlisted STRING passes, never a coercible object");
+  // Drift guard: every reason evaluateSourceCoverage / proveSourceCoverage can emit IS in the allowlist.
+  const F = FROM, T = ASOF;
+  const produced = [
+    evaluateSourceCoverage(null, F, T).reason,
+    evaluateSourceCoverage({ read: "schema-missing", windows: [] }, F, T).reason,
+    evaluateSourceCoverage({ read: "read-failed", windows: [] }, F, T).reason,
+    evaluateSourceCoverage({ read: "weird", windows: [] }, F, T).reason,
+    evaluateSourceCoverage({ read: "ok", windows: "x" }, F, T).reason,
+    evaluateSourceCoverage({ read: "ok", windows: [null] }, F, T).reason,
+    evaluateSourceCoverage({ read: "ok", windows: [{ from: F, to: addDaysStr(T, -3) }] }, F, T).reason,
+    "coverage-reader-missing", // proveSourceCoverage(no reader) -- not exported, asserted as a literal
+  ];
+  for (const c of produced) assert.ok(c === null || PPC_COVERAGE_REASON_CODES.includes(c), "loader-produced reason allowlisted: " + c);
+});
+
+test("43. direct ppcPerformancePayload can NEVER persist an unsafe reason (normalizes to the fallback)", () => {
+  for (const bad of UNSAFE_REASONS) {
+    const p = directPpcPayload(covContract({ reason: bad }));
+    const sa = Object.fromEntries(p.sourceAvailability.map((s) => [s.key, s]));
+    assert.equal(sa[KEYS.search].coverageUnavailableReason, "coverage-unavailable", "unsafe reason normalized: " + bad.slice(0, 22));
+    assert.ok(!JSON.stringify(p).includes(bad), "the raw string appears NOWHERE in the payload: " + bad.slice(0, 22));
+  }
+  // A proven source emits no reason; an approved code passes through unchanged.
+  const ok = directPpcPayload(covContract({ reason: "coverage-incomplete" }));
+  const okSa = Object.fromEntries(ok.sourceAvailability.map((s) => [s.key, s]));
+  assert.equal(okSa[KEYS.search].coverageUnavailableReason, "coverage-incomplete");
+  assert.equal(okSa[KEYS.campaign].coverageUnavailableReason, null, "proven required has no reason");
+});
+
+test("44. derive + real worker fail closed on an INJECTED unsafe reason => no snapshot, LKG, credential never stored", async () => {
+  const LEAK = "raw-db-error apikey=LEAK";
+  // Derive boundary: a four-key-valid contract whose search entry carries an unsafe reason is rejected.
+  const badReason = okAds(ADS_ROWS(), SYNCS, covContract({ reason: LEAK }));
+  assert.equal(derivePpc(ppcPlanned({ catalog: CATALOG() }), badReason).status, "unavailable", "unsafe coverage reason fails the contract at the derive boundary");
+  // Worker level: a loader that injects the unsafe reason writes ZERO snapshots and preserves LKG.
+  const store = makeStore(); const dd = makeDataDoe(); const lkg = { accountId: ID, prior: true };
+  const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS });
+  const cycle = await runCycle(store, dd, readers);
+  store.seedSnapshot("scheduler-v2/ppc-performance", ID, lkg);
+  const saved = [];
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push(payload); return { paramsHash: "ph" }; };
+  const injectingLoader = async ({ reportKey, accountId, planned }) => {
+    if (reportKey !== "ppc-performance") return {};
+    const full = await makePpcAdsContextLoader(readers)({ reportKey, accountId, planned });
+    const sc = full.ppcAds.sourceCoverage.map((c) => (c.sourceKey === KEYS.search ? { ...c, proven: false, folded: false, reason: LEAK } : c));
+    return { ppcAds: { ...full.ppcAds, sourceCoverage: sc } };
+  };
+  const rj = await runReportJobs({ store, cycleId: cycle.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: cycle.plannedReports, loadDerivedContext: injectingLoader });
+  assert.equal(rj.succeeded, 0, "an unsafe-reason context saves nothing");
+  assert.equal(saved.length, 0, "no snapshot written");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/ppc-performance|" + ID).payload, lkg, "last-known-good preserved");
+  assert.ok(!JSON.stringify(store._snapshots.get("scheduler-v2/ppc-performance|" + ID)).includes("LEAK"), "the credential-shaped string never reached the store");
+});
+
+test("45. live-route payload is unchanged when sourceCoverage is ABSENT (no coverage* fields added)", () => {
+  const p = ppcPerformancePayload({ accountId: ID, asOf: ASOF, from: FROM, windowDays: 30, adsSourceDescriptors: PPC_DESCRIPTORS, totalSalesSourceLabel: "TS", totalSalesLagDays: 4, adsRows: [], syncStates: [], catalogRows: [] });
+  for (const s of p.sourceAvailability) {
+    assert.ok(!("coverageProven" in s) && !("coverageFolded" in s) && !("coverageStatus" in s) && !("coverageUnavailableReason" in s), s.key + " carries NO coverage fields without sourceCoverage");
+  }
+});
+
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
@@ -765,6 +880,7 @@ async function main() {
   ({ planPpcPerformance, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ runPpcShadowCycle } = await import("../lib/server/sync/ppc-cycle.js"));
   ({ loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader, validatePpcSourceCoverage, evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
+  ({ ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES } = await import("../lib/server/reports/derivation-core.js"));
   ({ addDaysStr } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -29);
 
