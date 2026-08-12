@@ -1456,9 +1456,11 @@ function DashboardApp({ session, access, onSignOut }) {
           total: Math.max(1, accounts.length || allowedAccountIds.size),
           account: cursor.length ? `Loading ${cursor.length} remaining account${cursor.length === 1 ? "" : "s"}` : "Product Catalog",
         });
-        // Continue until every eligible account has been attempted once (empty cursor),
-        // or a hard safety cap. One export per request means one account per request, so
-        // the cap is per-account; the cursor strictly shrinks, so the loop always ends.
+        // The server owns the queue: follow its remainingAccountIds only, and pass it back
+        // verbatim as a consistency check (never reorder/inject/drop ids). Stop when the
+        // server reports a typed operational-failure stop (never auto-retry it), when the
+        // queue is empty, or at a hard safety cap. The cursor strictly shrinks, so it ends.
+        if (body.catalogSync?.status === "operational-failure") break;
         if (!cursor.length || batch >= 200) break;
       } while (true);
       setBrandDirectoryBrands(body.brands || []);
