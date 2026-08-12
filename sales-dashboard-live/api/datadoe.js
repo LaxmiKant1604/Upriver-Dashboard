@@ -189,7 +189,14 @@ const ORDER_SALES_GROUP_BY = [
 // Product Catalog by ASIN. This is the authoritative ASIN-to-brand mapping
 // used to populate the brand selector, including brands with no sales in the
 // selected reporting window.
-const PRODUCT_CATALOG_SOURCE_ID = "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8";
+//
+// The live primary DataDoe organization's Export Source ID for this dataset is the
+// SHORT id "68d2de238e". The former long id
+// (68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8) is obsolete and
+// returns DataDoe "404 Source not found", so it is never used for a live request; it
+// remains registered ONLY as a legacy alias in source-contracts.js so cached exports
+// and request_hash identity (derived from the canonical contract key) stay stable.
+const PRODUCT_CATALOG_SOURCE_ID = "68d2de238e";
 const PRODUCT_CATALOG_COLUMNS = [
   "child_asin",
   "parent_asin",
@@ -962,10 +969,14 @@ function normalizeAdRows(rows) {
 }
 
 function catalogBrandNames(rows) {
+  // A successful but zero-row (or fully unmapped) Product Catalog must NOT fabricate a
+  // brand: rows fold unmapped ASINs into the "Unassigned" placeholder, which is not a
+  // real brand and is excluded here (as the Brand directory already excludes it), so an
+  // empty/unavailable catalog yields no brands rather than a fake one.
   return [...new Set(
     rows
       .map((row) => String(row.product_brand || "").trim())
-      .filter(Boolean)
+      .filter((name) => name && name !== "Unassigned")
   )].sort((a, b) => a.localeCompare(b));
 }
 
