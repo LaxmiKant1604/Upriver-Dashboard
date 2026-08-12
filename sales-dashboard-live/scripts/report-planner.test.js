@@ -247,13 +247,13 @@ test("planner: organization api scope + fingerprints never mix (same raw id, dif
 group("planner: Keyword Rank has ONE staged entry point (never the generic builder)");
 
 test("planner: Keyword Rank is excluded from the generic default keys and the PLANNERS dispatch", async () => {
-  for (const k of ["keyword-rank", "sales-movers", "ppc-performance"]) {
+  for (const k of ["keyword-rank", "sales-movers", "ppc-performance", "listing-optimizer"]) {
     assert.ok(!SHADOW_PLANNED_REPORT_KEYS.includes(k), `default generic keys must NOT include ${k}`);
   }
-  assert.deepEqual([...STAGED_CYCLE_REPORT_KEYS], ["keyword-rank", "sales-movers", "ppc-performance"], "keyword-rank + sales-movers + ppc-performance are the staged-cycle keys");
+  assert.deepEqual([...STAGED_CYCLE_REPORT_KEYS], ["keyword-rank", "sales-movers", "ppc-performance", "listing-optimizer"], "keyword-rank + sales-movers + ppc-performance + listing-optimizer are the staged-cycle keys");
   // The DEFAULT plan (no reportKeys) for a capable account emits zero staged-cycle reports.
   const plan = buildShadowReportPlan({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: PL_CONN, asOfFor: plAsOfFor });
-  assert.ok(!plan.reportRequests.some((r) => ["keyword-rank", "sales-movers", "ppc-performance"].includes(r.reportKey)), "generic default plan never plans a staged-cycle report");
+  assert.ok(!plan.reportRequests.some((r) => ["keyword-rank", "sales-movers", "ppc-performance", "listing-optimizer"].includes(r.reportKey)), "generic default plan never plans a staged-cycle report");
 });
 
 test("planner: buildShadowReportPlan REJECTS an explicitly requested keyword-rank key (fail closed, not silently dropped)", async () => {
