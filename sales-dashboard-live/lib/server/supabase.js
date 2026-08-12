@@ -599,6 +599,36 @@ export async function deleteReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
   }).catch(() => {});
 }
 
+/**
+ * Status-aware retention support: list snapshots for one report_key older than a
+ * cutoff, returning enough to decide per-row (payload carries the action status).
+ * Read-only; the caller filters by status and deletes exact rows.
+ */
+export async function getReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
+  const params = new URLSearchParams({
+    select: "report_key,account_id,params_hash,params,payload,updated_at",
+    report_key: `eq.${reportKey}`,
+    updated_at: `lt.${cutoffIso}`,
+  });
+  return request(`/rest/v1/report_snapshots?${params}`);
+}
+
+/**
+ * Delete exactly ONE snapshot row by its natural key. Used by status-aware retention
+ * so an active record is never removed by a report-key-wide age deletion. Best-effort.
+ */
+export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHash }) {
+  const params = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+  });
+  await request(`/rest/v1/report_snapshots?${params}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  }).catch(() => {});
+}
+
 export async function getAdDailyMetrics(accountId, from, to) {
   const query = new URLSearchParams({
     select: "metric_date,currency,ad_sales,ad_spend,ad_clicks",
