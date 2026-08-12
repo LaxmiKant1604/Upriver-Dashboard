@@ -2460,6 +2460,73 @@ exact 06:00 local time becomes a business requirement.
   The local browser reached the login screen; authenticated live DataDoe
   verification remains a deployment gate.
 
+## Brand View FBA inventory bridge (branch feature/brand-view-fba-bridge, 2026-08-12)
+
+Extends the temporary admin "Fetch latest data" action so it also populates CURRENT
+FBA inventory for the selected brand's mapped accounts, fixing the "FBA inventory and
+inventory cover are unavailable because no contributing account has a saved FBA
+Shipment Plan or Listing Health snapshot yet" message. Built on a NEW branch off
+`origin/main` (`1fde048`); Scheduler v2 / Scheduler v1 schedules / migrations /
+`HANDOFF.md` were NOT touched. NOT pushed, merged, or deployed (awaits Codex review).
+
+Design: a minimal dedicated report instead of the ~7-export full FBA Plan. New
+`action=brand-inventory` (reportKey `brand-inventory`, `brand-inventory-shared-v1`)
+fetches only the FBA Inventory Health source
+(`44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823`) over
+`[asOf-10d, asOf]`, DESC, `PLAN_INVENTORY_ROW_LIMIT` (15,000), with a STRICT cap
+(a result at/above the cap is refused as possibly-truncated and NOT saved). It folds
+the latest validated snapshot to `inventoryByBrandCountry:[{country,brand,fbaAvailable,
+skuCount}]` and saves the compact `{accountId,inventoryDate,inventoryAvailable,
+inventoryByBrandCountry}` payload. `buildAccountBrandSlice` consumes this compact
+snapshot BEFORE the legacy fba-plan / listing-health fallback.
+
+DataDoe exports per primary account: **Brand Sales up to 2 (Order Line Items +
+Product Catalog) + Brand Inventory 1 (FBA Inventory Health) = 3 max**, versus ~7 for
+the full FBA Plan. The inventory step spends exactly ONE export: `buildBrandSalesPayload`
+now saves an additive `asinBrand` ({asin:brand}) map from the catalog it already
+fetched, so the inventory refresh reuses that map and creates ZERO Product Catalog
+exports. An older brand-sales snapshot without the map falls back to a catalog fetch
+AT THE brand-sales window, so the shared `source_export_cache` (identical canonical
+identity) serves it with no duplicate export.
+
+Admin/token safety: the source fetch is admin-only ON THE SERVER (`assertAdmin` on
+`brand-inventory` refresh), not merely hidden in the UI; normal Brand View reads and
+"Refresh / Build from saved data" stay Supabase-only (zero DataDoe). The client
+processes accounts SEQUENTIALLY with a single-flight guard, NO retry, and NO automatic
+execution; a per-account failure preserves that account's last-known-good snapshots
+and continues. Legacy `dd-secondary:` mappings are skipped, never stripped and routed
+through the primary key (server also rejects a dd-secondary brand-inventory refresh).
+Raw DataDoe/Supabase error bodies are never surfaced to the browser (only account
+names). The result banner distinguishes Sales refreshed / FBA inventory refreshed /
+Sales failed / FBA inventory failed / legacy dd-secondary skipped.
+
+Changed files (5): `api/datadoe.js`, `lib/server/reports/brand-view.js`,
+`src/lib/brand-source-refresh.js`, `src/views/BrandPortfolio.jsx`,
+`scripts/test-brand-view.mjs`. Commits: `0e5808c` (inventory builders + slice
+preference), `68d5c6e` (brand-inventory action + brand-sales asinBrand), `1e7abaa`
+(UI two-step flow + distinct statuses), `cbad2f2` (regressions), + this docs commit.
+
+Verification (all exit 0): `node --check` on every changed JS/test file; `npm run
+verify` = insight **54** + Brand View **72** (was 61; +11 focused cases) + sync **23**
++ source-cache **6** and the full `build:check` **2,394-module** Vite build. The real
+build-check bundle (1.1 MB) contains `brand-inventory-shared-v1`, `Fetch latest data`,
+`refreshed FBA inventory`, and `FBA inventory failed`; the FBA Inventory Health source
+id, `DATADOE_API_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` are ABSENT from the client
+bundle. Responsive: `.bv-controls` is `flex-wrap:wrap` and `.bv-actions` stacks the
+buttons full-width at the narrow breakpoint (unchanged layout; only alert/confirm text
+changed), so buttons wrap without page overflow at 1440/900/390 px.
+
+Unresolved live assumptions (deployment gates): authenticated live browser
+verification (FBA Inv./FBA Cover showing values after a real inventory refresh, zero
+DataDoe on navigation, no console errors) could not be run locally because the app is
+auth-gated and no production Supabase/DataDoe credentials are present — the local
+browser reaches the login screen only, consistent with prior Brand View handoffs. The
+one live DataDoe export per account (FBA Inventory Health) and the source-cache catalog
+reuse should be confirmed against production once deployed. DATADOE_API_KEY_SECONDARY
+remains removed from Vercel: after moving legacy dd-secondary sellers to the primary
+organization, refresh the Account Directory and Brand Directory so saved mappings use
+the current primary account ids.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
