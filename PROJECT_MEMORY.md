@@ -2640,6 +2640,68 @@ diff --check` clean. Commits `c76f2d0` (fix), `732163b` (tests), + this docs com
 `api/datadoe.js`, `scripts/test-source-cache.mjs`, `scripts/test-brand-view.mjs`. Nothing
 pushed/merged/deployed; Scheduler v1/v2, migrations, and `HANDOFF.md` untouched.
 
+### Brand Directory catalog retry queue + LKG hotfix (branch feature/brand-view-catalog-retry-hotfix, 2026-08-12)
+
+Off `origin/main` @ `d78c746`. Production symptom after a manual Brand Directory refresh: 14
+primary accounts stuck with saved Product Catalog errors referencing the OBSOLETE long source
+id, and 1 primary account retried with the current short id `68d2de238e` which returned DataDoe
+**404 Source not found**. Root cause: the retry only advanced ONE unavailable account
+(`syncBrandCatalogBatch` sliced 1) and the browser continuation followed only
+`catalogPendingAccountIds`, so unavailable accounts were never carried forward -- the same first
+account was retried each click while the other 14 stale errors never advanced.
+
+Fixes (primary DataDoe only; `DATADOE_API_KEY_SECONDARY` removed):
+
+1. **Retry queue.** The handler now drives a TYPED continuation cursor
+   `catalogSync.remainingAccountIds`, not `catalogPendingAccountIds`. First click's cursor = the
+   full eligible set (never-attempted `catalogPendingAccountIds` PLUS previously-`catalogUnavailable`,
+   primary-only, sorted); a continuation carries exactly the accounts the browser forwards in
+   `catalogSyncAccountIds`. `nextCatalogBatch` slices `BRAND_CATALOG_BATCH_SIZE=5` per request and the
+   cursor only shrinks, so each account is attempted AT MOST ONCE per explicit action and the loop
+   always terminates. `fetchBrandDirectory` stays explicit-only (no `useEffect`) -- no auto-retry on
+   load/nav.
+2. **LKG preserved.** `syncAccountBrandCatalog` never overwrites a prior successful brand map on
+   failure. Outcome state table:
+
+   | catalog result | typed code | prior "complete" snapshot exists | action |
+   | --- | --- | --- | --- |
+   | >=1 usable brand | (complete) | -- | save `catalogSyncStatus:"complete"` (fresh map) |
+   | 404 / source not found | `PRODUCT_CATALOG_SOURCE_UNAVAILABLE` | yes | PRESERVE prior; report only |
+   | timeout / other fetch error | `PRODUCT_CATALOG_FETCH_FAILED` | yes | PRESERVE prior; report only |
+   | row-cap truncation | `PRODUCT_CATALOG_TRUNCATED` | yes | PRESERVE prior; report only |
+   | zero rows / no usable child_asin->product_brand | `PRODUCT_CATALOG_EMPTY` | yes | PRESERVE prior; report only |
+   | any unavailable | (typed code) | no | save unavailable marker, NO fabricated brands |
+
+3. **Safe output.** Raw DataDoe bodies / source ids / URLs / status objects / keys are never
+   persisted or returned. `classifyCatalogError` maps to the four typed codes;
+   `sharedSnapshotBrandAccounts` ignores any legacy raw `catalogSyncError`; the response returns only
+   `catalogUnavailableAccounts[].code` + a `catalogUnavailable.byCode` summary; the UI shows e.g.
+   "Product Catalog source is unavailable for 15 primary accounts." The Brand Directory refresh is now
+   admin-only on the SERVER.
+4. **Source id.** The create-export always posts the short id `68d2de238e`; the obsolete long id
+   remains only a canonical/cache alias (never posted, no fallback); `request_hash` stable through the
+   `product-catalog` contract key.
+5. **Zero/unusable catalog** is typed unavailable, never brand coverage, never fabricating "Unassigned".
+6. **Primary-only.** Dormant `dd-secondary:` records are skipped read-only, never stripped onto the
+   primary key.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **18** (+6: 15-attempt-once/terminate, typed classifier, short-id-only + no raw leak,
+LKG survives 404/timeout/truncation/empty/unusable, mixed outcome, primary-only skip) +
+`build:check` **2,394 modules**; `git diff --check` clean. Commits `838e857` (server), `4eb4173`
+(client), `6c68e3a` (tests), + this docs commit. Files: `api/datadoe.js`, `src/App.jsx`,
+`scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed; Scheduler v1/v2, migrations,
+`HANDOFF.md`, and `.worktrees` untouched.
+
+**UNRESOLVED LIVE DataDoe 404 (do not hide).** This is a RETRY-FLOW + data-safety fix only. It does
+NOT make the Product Catalog available. Production already attempted the short id `68d2de238e` for one
+primary account and DataDoe returned **404 Source not found**. If the short id still 404s after this
+fix, that is an UPSTREAM primary-organization source-access/configuration issue (the "Product Catalog
+by ASIN" export source must be enabled/authorized for the primary org, and its live short id
+reconfirmed in DataDoe) -- not a code bug. The code intentionally does NOT guess another id or fall
+back to the obsolete long id. Until DataDoe returns rows, the directory correctly reports the accounts
+as `PRODUCT_CATALOG_SOURCE_UNAVAILABLE` while preserving any previously saved brand maps.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
