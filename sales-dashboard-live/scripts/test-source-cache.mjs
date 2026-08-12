@@ -19,6 +19,8 @@ import {
   nextCatalogBatch,
   usableCatalogBrands,
   validCatalogActionId,
+  catalogSyncEligibleAccounts,
+  mergeAccountDirectory,
   BRAND_CATALOG_BATCH_SIZE,
   SAFE_CATALOG_CODES,
   CATALOG_SOURCE_UNAVAILABLE,
@@ -27,6 +29,7 @@ import {
   CATALOG_FETCH_FAILED,
   CATALOG_ATTEMPT_PENDING,
 } from "../api/datadoe.js";
+import { mergeDiscoveredDataDoeAccounts, resolveDataDoeAccountIds } from "../lib/server/datadoe-connections.js";
 
 // The live primary DataDoe Export Source ID for Product Catalog by ASIN, and the
 // obsolete long id that now returns DataDoe "404 Source not found".
@@ -603,6 +606,113 @@ await asyncTest("primary-only: a dormant dd-secondary account is skipped read-on
   });
   assert.deepEqual(attempted.sort(), ["A1", "A2"], "only primary accounts reached DataDoe; the dd-secondary id was skipped");
   assert.ok(!results.some((r) => String(r.accountId).startsWith("dd-secondary:")), "no dd-secondary result was produced");
+});
+
+/* ===================== Future account auto-discovery (blocker 6) ===================== */
+
+const PRIMARY_CONN = { id: "primary", label: "Primary DataDoe", apiKey: "dd_api_test", accountPrefix: "" };
+const SECONDARY_CONN = { id: "secondary", label: "Secondary DataDoe", apiKey: "dd_api_secondary", accountPrefix: "dd-secondary:" };
+const DATADOE_SRC = await readFile(new URL("../api/datadoe.js", import.meta.url), "utf8");
+
+await asyncTest("blocker 6: a newly added primary account appears purely from discovery (no code/config change)", async () => {
+  // An account id that appears in NO source file: discovery is the only thing that surfaces it.
+  const NOVEL = "acct-novel-93f2c7";
+  assert.doesNotMatch(DATADOE_SRC, new RegExp(NOVEL), "the new account id is NOT hard-coded anywhere in the server");
+  // Discovery merges it into the durable directory as active, with no manual mapping.
+  const merged = mergeAccountDirectory([], [{ id: NOVEL, name: "Novel Co", country: "DE", currency: "EUR" }]);
+  const entry = merged.find((a) => a.id === NOVEL);
+  assert.ok(entry, "the discovered account is present in the directory");
+  assert.equal(entry.active, true, "and it is active");
+  assert.equal(entry.country, "DE", "its discovered country is carried with no source-code country list");
+});
+
+await asyncTest("blocker 6: a newly discovered primary account is appended to the current action and attempted EXACTLY once", async () => {
+  const NEW = "NEW1";
+  // A never-synced account is placed in pending by sharedSnapshotBrandAccounts; model that.
+  const directory = { catalogPendingAccountIds: new Set([NEW]), catalogUnavailable: new Map() };
+  assert.deepEqual(catalogSyncEligibleAccounts([NEW], directory), [NEW], "the new account is eligible for a one-time attempt");
+  // Drive the one-export-per-request cursor loop end to end; the new account is exported once.
+  const store = makeCatalogStore();
+  const fetched = [];
+  let cursor = catalogSyncEligibleAccounts([NEW], directory);
+  let requests = 0;
+  while (cursor.length && requests < 10) {
+    const { batch, remainingAccountIds } = nextCatalogBatch(cursor, BRAND_CATALOG_BATCH_SIZE);
+    await syncBrandCatalogBatch(batch, [PRIMARY], {
+      ...store, actionId: "DISC1",
+      fetchCatalog: ({ rawAccountId }) => { fetched.push(rawAccountId); return [{ child_asin: "A1", product_brand: "NewBrand" }]; },
+    });
+    cursor = remainingAccountIds;
+    requests += 1;
+  }
+  assert.deepEqual(fetched, [NEW], "the new account was attempted exactly once");
+  assert.equal(store.snapshot(NEW).payload.catalogSyncStatus, "complete", "its catalog result is saved");
+});
+
+test("blocker 6: an already-complete account is never attempted again (not in the eligible set)", () => {
+  // COMPLETE1 has a saved complete snapshot, so sharedSnapshotBrandAccounts never lists it in
+  // pending/unavailable; only the pending new account is eligible.
+  const directory = { catalogPendingAccountIds: new Set(["NEW1"]), catalogUnavailable: new Map() };
+  assert.deepEqual(catalogSyncEligibleAccounts(["NEW1", "COMPLETE1"], directory), ["NEW1"], "a complete account is not scheduled a second time");
+});
+
+await asyncTest("blocker 6: a removed account preserves its last-known-good and is NEVER newly scheduled", async () => {
+  const good = { payload: { catalogBrands: ["OldBrand"], catalogSyncStatus: "complete", catalogSyncedAt: "2026-08-01T00:00:00.000Z" } };
+  const store = makeCatalogStore({ REMOVED1: good });
+  // Discovery no longer returns REMOVED1; even a stale pending marker cannot schedule it.
+  const directory = { catalogPendingAccountIds: new Set(["REMOVED1", "STILL1"]), catalogUnavailable: new Map() };
+  assert.deepEqual(catalogSyncEligibleAccounts(["STILL1"], directory), ["STILL1"], "the removed account (absent from discovery) is never scheduled");
+  // Its LKG snapshot is untouched -- nothing deletes it.
+  assert.deepEqual(store.snapshot("REMOVED1").payload.catalogBrands, ["OldBrand"], "the removed account keeps its last-known-good brand map");
+  // The durable directory retains it as inactive/read-only, never dropped.
+  const merged = mergeAccountDirectory(
+    [{ id: "REMOVED1", name: "Gone Co", country: "US" }, { id: "STILL1", name: "Still Co", country: "US" }],
+    [{ id: "STILL1", name: "Still Co", country: "US" }],
+  );
+  assert.equal(merged.find((a) => a.id === "REMOVED1")?.active, false, "the removed account is retained as inactive/read-only");
+  assert.equal(merged.find((a) => a.id === "STILL1")?.active, true, "the still-present account stays active");
+});
+
+await asyncTest("blocker 6: primary and dormant secondary records never merge; the primary public id is used and the legacy secondary id is not mutated", async () => {
+  // The SAME raw seller id is returned by BOTH organisations.
+  const merged = mergeDiscoveredDataDoeAccounts([
+    { connection: PRIMARY_CONN, accounts: [{ id: "SELLER9", name: "Acme" }] },
+    { connection: SECONDARY_CONN, accounts: [{ id: "SELLER9", name: "Acme" }] },
+  ]);
+  assert.deepEqual(merged.map((a) => a.id).sort(), ["SELLER9", "dd-secondary:SELLER9"], "two distinct public ids -- never merged into one");
+  // Only the primary is catalog-eligible; the dormant secondary is skipped.
+  const directory = { catalogPendingAccountIds: new Set(["SELLER9", "dd-secondary:SELLER9"]), catalogUnavailable: new Map() };
+  assert.deepEqual(catalogSyncEligibleAccounts(merged.map((a) => a.id), directory), ["SELLER9"], "only the primary account is scheduled");
+  // Resolution routes each to the right connection: the primary raw id is not mutated and the
+  // secondary keeps its public prefix (its raw id is used only for the secondary API call).
+  const conns = [PRIMARY_CONN, SECONDARY_CONN];
+  const p = resolveDataDoeAccountIds(["SELLER9"], conns);
+  assert.equal(p.connection.id, "primary");
+  assert.equal(p.rawAccountIds[0], "SELLER9", "the primary raw seller id is used verbatim");
+  const s = resolveDataDoeAccountIds(["dd-secondary:SELLER9"], conns);
+  assert.equal(s.connection.id, "secondary");
+  assert.equal(s.rawAccountIds[0], "SELLER9", "the secondary's raw id is used for its own API call");
+  assert.deepEqual(s.accountIds, ["dd-secondary:SELLER9"], "the public secondary id keeps its prefix (never stripped/mutated)");
+});
+
+await asyncTest("blocker 6: adding accounts needs NO source-code account or country list update", async () => {
+  // The active set is derived from live discovery + the persisted directory + the pure
+  // reconcilers -- never a hard-coded enumeration.
+  assert.match(DATADOE_SRC, /discoverConnectedAccounts\(connections\)/, "accounts come from live discovery");
+  assert.match(DATADOE_SRC, /mergeAccountDirectory\(/, "the directory is reconciled from discovery, not a literal list");
+  assert.match(DATADOE_SRC, /catalogSyncEligibleAccounts\(/, "scheduling is derived from discovery, not a literal list");
+  // Two arbitrary, never-before-seen accounts in two different countries flow through with no
+  // code change: discovery -> directory -> eligible, purely from their discovered ids.
+  const a = { id: "zz-brandnew-1", name: "New AU", country: "AU", currency: "AUD" };
+  const b = { id: "zz-brandnew-2", name: "New JP", country: "JP", currency: "JPY" };
+  for (const acc of [a, b]) assert.doesNotMatch(DATADOE_SRC, new RegExp(acc.id), `${acc.id} is not hard-coded`);
+  const merged = mergeAccountDirectory([], [a, b]);
+  assert.deepEqual(merged.map((x) => x.id).sort(), ["zz-brandnew-1", "zz-brandnew-2"], "both new accounts appear from discovery alone");
+  assert.deepEqual(
+    catalogSyncEligibleAccounts(merged.map((x) => x.id), { catalogPendingAccountIds: new Set(merged.map((x) => x.id)) }),
+    ["zz-brandnew-1", "zz-brandnew-2"],
+    "both are scheduled purely from their discovered ids",
+  );
 });
 
 console.log(`\n${passed} assertions passed`);
