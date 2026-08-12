@@ -1672,20 +1672,30 @@ export function ppcDailySeries(campaignRows) {
 }
 
 /**
- * Full PPC Performance payload, byte-identical to buildPpcPerformance() for the same inputs. `adsRows` are
- * the four persisted Ads sources' validated rows; `syncStates` the ads_sync_state rows (empty-seeded stays
- * distinct from unseeded via each source's `sync` + `rows`); `catalogRows` the shared catalog; the TACoS
- * denominator is EITHER `totalSalesRows` (summed) OR a `totalSalesUnavailable` reason string. `adsSourceDescriptors`
- * are the four source metadata rows (syncKey/label/coverage/defaultDataset/enableHint) in campaign,asin,
- * targeting,search-terms order. Currencies never merge. Pure.
+ * Full PPC Performance payload. The CALCULATIONS (campaigns/ASINs/targets/searchTerms/daily/currencies/TACoS/
+ * catalog) are byte-identical to buildPpcPerformance() for the same inputs. `adsRows` are the four persisted
+ * Ads sources' validated rows (the scheduler loader has ALREADY dropped any unproven optional source's rows);
+ * `syncStates` the ads_sync_state rows; `catalogRows` the shared catalog; the TACoS denominator is EITHER
+ * `totalSalesRows` (summed) OR a `totalSalesUnavailable` reason string. `adsSourceDescriptors` are the four
+ * source metadata rows (syncKey/label/coverage/defaultDataset/enableHint) in campaign,asin,targeting,
+ * search-terms order.
+ *
+ * `sourceCoverage` (scheduler-only; the live route passes none) is the typed durable-coverage outcome per
+ * source. When present it enriches EACH sourceAvailability row with ADMIN-SAFE typed fields --
+ * coverageProven / coverageFolded / coverageStatus ("validated" | "unavailable") / coverageUnavailableReason
+ * (a typed code, never a raw DB error) -- so a stale/unproven OPTIONAL source is explicitly unavailable even
+ * when its ads_sync_state last succeeded, and its dropped rows read as 0. This is additive metadata: it does
+ * NOT alter any calculation and the live-route parity fixture only gains these fields. Currencies never merge.
+ * Pure.
  */
 export function ppcPerformancePayload({
   accountId, asOf, from, windowDays, minClicksForWaste = PPC_MIN_CLICKS_FOR_WASTE,
   adsSourceDescriptors, totalSalesSourceLabel, totalSalesLagDays,
-  adsRows, syncStates, catalogRows, totalSalesRows = null, totalSalesUnavailable = null,
+  adsRows, syncStates, sourceCoverage = [], catalogRows, totalSalesRows = null, totalSalesUnavailable = null,
 }) {
   const rows = Array.isArray(adsRows) ? adsRows : [];
   const descriptors = Array.isArray(adsSourceDescriptors) ? adsSourceDescriptors : [];
+  const coverageByKey = new Map((Array.isArray(sourceCoverage) ? sourceCoverage : []).map((c) => [c && c.sourceKey, c]));
   const [campaignDesc, asinDesc, targetingDesc, searchTermsDesc] = descriptors;
   const syncByKey = new Map((Array.isArray(syncStates) ? syncStates : []).map((s) => [s.source_key, s]));
   const bySource = new Map(descriptors.map((d) => [d.syncKey, []]));
@@ -1722,6 +1732,17 @@ export function ppcPerformancePayload({
   const sourceAvailability = descriptors.map((d, i) => {
     const entry = { key: d.syncKey, label: d.label, coverage: d.coverage, rows: descRows[i], sync: syncByKey.get(d.syncKey) || null, defaultDataset: !!d.defaultDataset };
     if (d.enableHint) entry.enableHint = d.enableHint;
+    // Scheduler-only: surface the DURABLE-coverage outcome so an unproven optional source reads as explicitly
+    // unavailable (with 0 folded rows) even when its ads_sync_state last succeeded. Admin-safe typed fields
+    // only -- coverageUnavailableReason is a typed code, never a raw DB error/secret. Absent for the live
+    // route (no sourceCoverage), so its parity payload is unchanged.
+    const cov = coverageByKey.get(d.syncKey);
+    if (cov) {
+      entry.coverageProven = cov.proven === true;
+      entry.coverageFolded = cov.folded === true;
+      entry.coverageStatus = cov.proven === true ? "validated" : "unavailable";
+      entry.coverageUnavailableReason = cov.proven === true ? null : (typeof cov.reason === "string" && cov.reason ? cov.reason : "coverage-unavailable");
+    }
     return entry;
   });
 

@@ -50,6 +50,9 @@ import {
 // api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
 // keeps the pure derivation graph free of any DataDoe transport / Supabase import.
 import { planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
+// PURE typed PPC coverage contract (server-only loader, no transport import): re-enforced here so the derive
+// never folds/saves a PPC snapshot on an injected context that lacks or contradicts the durable-coverage gate.
+import { validatePpcSourceCoverage } from "./ppc-ads-loader.js";
 
 // FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
 // constant. The derivation RECOMPUTES the expected inventory start as addDaysStr(asOf, -10) and pins
@@ -912,6 +915,14 @@ const REGISTRY = {
       if (!ppcAds || ppcAds.status !== "ok" || !Array.isArray(ppcAds.adsRows) || !Array.isArray(ppcAds.syncStates)) {
         throw deriveError("ppc-performance persisted Ads context is unavailable (Ads read failed/unvalidated/unseeded, or the row cap was exceeded); last-known-good preserved.", "unavailable");
       }
+      // Re-enforce the DURABLE-coverage contract on the injected context (the loadDerivedContext boundary is an
+      // injected orchestration seam, so a wrong/future loader could hand back status:"ok" with missing or
+      // contradictory sourceCoverage). Missing/duplicate/unknown keys, mismatched required flags, an unproven
+      // default (campaign/ASIN), or an optional whose folded != proven => fail closed, save nothing, keep LKG.
+      const coverageContract = validatePpcSourceCoverage(ppcAds.sourceCoverage);
+      if (!coverageContract.ok) {
+        throw deriveError(`ppc-performance persisted Ads coverage contract is missing/invalid (${coverageContract.reason}); last-known-good preserved.`, "unavailable");
+      }
       // Catalog is REQUIRED: exactly one single-account no-date fragment (a missing/failed catalog =>
       // unavailable, LKG preserved).
       const catalogSource = sources["ppc-performance:catalog"];
@@ -949,7 +960,7 @@ const REGISTRY = {
         accountId: publicAccountId, asOf, from, windowDays: PPC_WINDOW_DAYS,
         adsSourceDescriptors: PPC_ADS_SOURCE_DESCRIPTORS,
         totalSalesSourceLabel: PPC_TOTAL_SALES_LABEL, totalSalesLagDays: PPC_TOTAL_SALES_LAG_DAYS,
-        adsRows: ppcAds.adsRows, syncStates: ppcAds.syncStates, catalogRows,
+        adsRows: ppcAds.adsRows, syncStates: ppcAds.syncStates, sourceCoverage: ppcAds.sourceCoverage, catalogRows,
         totalSalesRows, totalSalesUnavailable,
       });
     },
