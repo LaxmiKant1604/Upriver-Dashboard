@@ -3285,3 +3285,73 @@ Remaining live gates (unchanged): the `ads_sync_coverage` (`20260810`) + owner (
 UNAPPLIED, so in production the coverage read returns `schema-missing` and PPC is fail-closed unavailable until
 they are applied AND the scheduled worker records successful windows -- the intended gated rollout. A live
 confirmation of the worker's sync cadence vs the 30-day window is still worth doing before PPC is unlocked.
+
+## 54. PPC Performance: coverage-contract re-review blockers CLOSED -- adapter-enforced contract + coverage in the saved payload (SHADOW MODE, 2026-08-12)
+
+Correction pass for the two §53 re-review blockers (PROJECT_MEMORY "PPC correction re-review blockers", Codex
+2026-08-12). PPC stays SHADOW ONLY + locked: `api/datadoe.js` live route + `lib/server/reports/ppc.js` builder
+byte-unchanged, source CONTRACTS + `source-identity.js`/request_hash unchanged, Scheduler v1 + frontend
+untouched, migrations NOT applied, `HANDOFF.md` untracked/untouched.
+
+### 54.1 Blocker 1 -- the durable-coverage contract is now a shared typed check re-enforced in the derive
+
+The loader produced `sourceCoverage`, but the `ppc-performance` derive adapter accepted any injected
+`context.ppcAds` carrying only `status:"ok"` + `adsRows` + `syncStates`; it never required/validated
+`sourceCoverage`. The `loadDerivedContext` boundary is an injected orchestration seam, so a wrong/future loader
+could bypass the gate and save an unproven empty snapshot (the existing coverage-free `okAds` fixture derived
+successfully). Also `evaluateSourceCoverage` was not genuinely fail-closed: a missing `read` defaulted to
+success, and `coverageProvesWindow` silently ignored a malformed window when a valid sibling covered the range.
+
+- New PURE exported contract `validatePpcSourceCoverage(sourceCoverage)` (in `ppc-ads-loader.js`) -> `{ok,reason}`:
+  requires EXACTLY the four known PPC source keys, each once (no missing/duplicate/unknown), boolean
+  required/proven/folded, the `required` flag matching the registry (campaign + ASIN required; targeting +
+  search optional), campaign + ASIN `proven:true` AND `folded:true`, and every OPTIONAL `folded` exactly equal
+  to its `proven`.
+- Enforced in BOTH places: `loadPersistedPpcAds` self-checks its own output before returning `status:"ok"`
+  (`coverage-contract-*` => unavailable), and the derive adapter re-checks `context.ppcAds.sourceCoverage`
+  right after the `status:"ok"` gate and BEFORE folding/catalog/saving. A missing/duplicate/unknown/mismatched/
+  contradictory contract => typed `unavailable`, zero snapshot writes, LKG preserved.
+- `evaluateSourceCoverage` hardened: `read` must EXPLICITLY equal `"ok"` (missing/unknown/`schema-missing`/
+  `read-failed` are never success); `windows` must be a real array; EVERY supplied window must be a plain
+  object with real `from<=to` calendar dates -- ONE malformed window invalidates the whole evidence (a valid
+  sibling cannot paper over it); then the merged windows must fully span `[asOf-29d, asOf]`. Partial / gapped /
+  stale / schema-missing / read-failed all remain unavailable with typed reasons. A genuine fully-covered empty
+  context still derives normally (all four proven+folded, zero rows).
+
+### 54.2 Blocker 2 -- optional coverage status is now propagated into the saved payload
+
+The loader dropped stale optional rows but recorded that only in `ppcAds.sourceCoverage`; the adapter passed
+only `adsRows`+`syncStates` to `ppcPerformancePayload`, whose `sourceAvailability` was built from row counts +
+`ads_sync_state` alone. So a stale/incomplete optional source with a previously succeeded sync state saved as
+succeeded-with-0-rows, not unavailable. Fixed by threading `sourceCoverage` into `ppcPerformancePayload`, which
+now enriches EACH `sourceAvailability` row with ADMIN-SAFE typed fields:
+
+  | field | meaning |
+  | --- | --- |
+  | `coverageProven` | bool -- durable full-window coverage proven |
+  | `coverageFolded` | bool -- this source's rows were folded into the payload |
+  | `coverageStatus` | `"validated"` \| `"unavailable"` |
+  | `coverageUnavailableReason` | a typed code (e.g. `coverage-incomplete`) or null -- NEVER a raw DB error/secret |
+
+A stale/unproven OPTIONAL source is therefore explicitly `coverageStatus:"unavailable"` with 0 rows even when
+its `ads_sync_state` last succeeded (coverage overrides the sync state), and its rows stay excluded from
+campaigns/targets/search-terms and from currency gating. The CALCULATIONS (campaigns/ASINs/targets/searchTerms/
+daily/currencies/TACoS/catalog) are byte-unchanged; the fully-covered route-parity fixture only GAINS these
+additive fields (the live route passes no `sourceCoverage`, so its payload is unchanged).
+
+### 54.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-ppc-performance.test.js` **39 test entries / 40 cases**
+(was 35): enhanced #34 (payload-level stale-optional assertions) and NEW #37 (evaluateSourceCoverage hardening:
+missing-read, malformed-window-plus-valid, non-array, schema-missing/read-failed/partial/stale), #38
+(validatePpcSourceCoverage: count/dup/unknown/flags/required/proven/folded), #39 (derive re-enforces the
+contract -> unavailable/no-snapshot/LKG at both derive + worker level, incl. a broken loader that strips
+sourceCoverage), #40 (E2E worker snapshot: a stale optional with a SUCCEEDED sync state saved
+sourceAvailability-unavailable, rows absent, TACoS intact). `npm run test:report-derivation` **397**
+(66+30+33+20+34+24+12+27+40+35+37+**39**). Focused suites green: `test:sync-engine`, `test:report-contracts`
+(161), `test:source-identity` (7). `npm run verify` = exit 0 (terminated naturally) + `build:check` (2,394
+modules). `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`). Nothing
+pushed/merged/deployed/unlocked/scheduled; migrations still unapplied; PPC remains SHADOW ONLY + locked.
+
+Remaining live gates unchanged from §53 (both migrations UNAPPLIED => coverage `schema-missing` => PPC
+fail-closed unavailable until applied + worker records windows; worker sync-cadence confirmation before unlock).

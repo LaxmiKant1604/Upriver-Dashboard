@@ -6601,3 +6601,44 @@ general suite regression. Keep PPC SHADOW ONLY + locked; do not start Listing
 Optimizer, change the live route/source contracts/request identity/Scheduler v1/UI,
 apply either migration, push, merge, deploy, enable, or schedule. Leave untracked
 `HANDOFF.md` untouched.
+
+## Scheduler v2: PPC coverage-contract re-review blockers CLOSED (correction pass, 2026-08-12)
+
+Fixed ONLY the two §53 re-review blockers from base `d9d8957`; SCHEDULER_V2.md §54 records
+the details. PPC stays SHADOW ONLY + locked (live route, `ppc.js`, source contracts,
+`source-identity.js`/request_hash, Scheduler v1, frontend all unchanged; migrations unapplied;
+`HANDOFF.md` untracked/untouched). Commits: `5d1b474` (loader contract + hardening), `185779c`
+(derive re-enforcement + payload coverage), `30c2a25` (regressions), + this docs commit.
+
+1. **Durable-coverage contract is now enforced INSIDE the derive, not just the loader.** New pure
+   exported `validatePpcSourceCoverage(sourceCoverage)` in `ppc-ads-loader.js` requires exactly the
+   four known source keys, each once (no missing/duplicate/unknown), the registry `required` flags
+   (campaign+ASIN required, targeting+search optional), campaign+ASIN `proven:true`+`folded:true`,
+   and every optional `folded === proven`. Enforced in BOTH `loadPersistedPpcAds` (self-check before
+   `status:"ok"`) AND the `ppc-performance` derive adapter (re-checks `context.ppcAds.sourceCoverage`
+   right after the status gate, before folding/catalog/saving) -- a wrong/injected loader that hands
+   back `status:"ok"` with missing/contradictory coverage now fails closed (typed unavailable, zero
+   snapshot writes, LKG preserved). `evaluateSourceCoverage` hardened to be genuinely fail-closed:
+   `read` must EXPLICITLY equal `"ok"` (a missing read no longer defaults to success); `windows` must
+   be a real array; EVERY supplied window must be a plain object with real `from<=to` dates -- one
+   malformed window invalidates the evidence even if a valid sibling covers the range. Partial/gapped/
+   stale/schema-missing/read-failed stay unavailable; a genuine fully-covered empty still derives.
+
+2. **Optional coverage status is propagated into the saved payload.** `ppcPerformancePayload` now
+   takes `sourceCoverage` and enriches each `sourceAvailability` row with admin-safe typed fields
+   `coverageProven` / `coverageFolded` / `coverageStatus` ("validated"|"unavailable") /
+   `coverageUnavailableReason` (typed code, never a raw DB error). A stale/unproven OPTIONAL source is
+   explicitly `coverageStatus:"unavailable"` with 0 rows even when its `ads_sync_state` last succeeded
+   (coverage overrides the sync state), and its rows stay excluded from campaigns/targets/search-terms
+   and currency gating. Calculations byte-unchanged; the route-parity fixture only gains the additive
+   fields (the live route passes no `sourceCoverage`).
+
+Verification (all natural, exit 0): `node --check` on all changed files; `report-ppc-performance`
+**39 entries / 40 cases** (enhanced #34 payload assertions + new #37 evaluateSourceCoverage hardening,
+#38 validatePpcSourceCoverage, #39 derive re-enforces the contract at derive+worker level incl. a
+loader that strips sourceCoverage, #40 E2E snapshot: stale optional with a SUCCEEDED sync state saved
+unavailable + rows absent + TACoS intact); `test:report-derivation` **397**; `test:sync-engine`,
+`test:report-contracts` (161), `test:source-identity` (7) green; `npm run verify` exit 0 (natural) +
+`build:check` 2,394 modules; `git diff --check` clean. Remaining LIVE gate unchanged: both migrations
+UNAPPLIED => coverage `schema-missing` => PPC fail-closed unavailable until applied + worker records
+windows. Nothing pushed/merged/deployed/unlocked/scheduled. Listing Optimizer NOT started.
