@@ -7556,7 +7556,54 @@ strict validation; public/raw separation; kickoff one-export; catalog staged onl
 LKG + idempotent save; zero-network derive; import-boundary + snapshot-size guards); `test:report-derivation`
 **430** (was 402); `test:sync-engine` (79), `test:report-contracts` (161), `test:source-identity` (7) green;
 `build:check` 2,395 modules; `git diff --check` clean; only intended files changed. Nothing pushed/merged/
-deployed/unlocked/enabled/scheduled/migrated. The live `68d2de238e` 404 remains an upstream DataDoe source-
-access issue (NOT fixed); Listing Optimizer's catalog stage surfaces it as a post-SQP catalog failure
-(=> unavailable, LKG) until DataDoe resolves access. STOP for Codex senior review; nothing beyond Listing
-Optimizer begun.
+deployed/unlocked/enabled/scheduled/migrated. Product Catalog `68d2de238e`: API-created exports were OBSERVED
+COMPLETING and RETURNING ROWS (NOT confirmed unavailable); only the remaining 404/banner stage + per-account
+scoping await DataDoe confirmation. Listing Optimizer's catalog stage stays fail-closed either way (a
+non-completing post-SQP catalog => `unavailable`, last-known-good), so resolving the 404/scoping can only turn
+accounts on. STOP for Codex senior review; nothing beyond Listing Optimizer begun. [Corrected + re-reviewed --
+see the 2026-08-12 re-review entry below.]
+
+## Scheduler v2: Listing Optimizer review blockers CLOSED (re-review correction pass, 2026-08-12)
+
+Fixed ONLY the three Codex Listing Optimizer review findings from base `455a50c`; SCHEDULER_V2.md §56 (updated)
+records the details. Listing Optimizer stays SHADOW ONLY + locked (live `listing-optimizer.js` builder, source
+CONTRACTS, `source-identity.js`/request_hash, Scheduler v1, frontend, Brand View, Product Catalog retry
+orchestration all unchanged; migrations unapplied; `HANDOFF.md`/`.worktrees/` untouched). Canonical catalog
+short id `68d2de238e` + alias + request_hash unchanged; NO fallback/retry added. Commits: `2ad8102`
+(lifecycle), `eb2576b` (validation), `f94b8d6` (tests), + this docs commit.
+
+FIX 1 -- partial staged-report lifecycle (`listing-optimizer-cycle.js`). The cycle's returned plannedReports
+left BOTH sources `optional:true` (from the derivation's optionalRequestKeys), so `required=[]` and the report
+fetch gate was always "ready" -- `runReportJobs` claimed derive and recorded `unavailable` even when the SQP or
+the activated catalog was merely unstaged/pending/deferred (freezing last-known-good instead of retrying in the
+same cycle). Now the cycle threads each source's persisted `fetch_status` (via `reconstruct`/`planRound`) and
+`buildFinalReports` sets STATE-AWARE `optional` flags: a source stays REQUIRED (gate keeps the report PENDING,
+retryable) while unstaged/pending/'attempted' (in-flight/deferred) or succeeded, and becomes OPTIONAL only once
+its job RESOLVED to `failed`/`skipped` so the derive can produce the special outcomes -- durable degraded
+SOURCE_DISABLED SQP => faithful sqpAvailable:false snapshot; non-disabled failed SQP => unavailable/LKG; failed
+catalog after a successful SQP => unavailable/LKG. Mirrors the approved Keyword Rank partial-invocation
+lifecycle; the derive's own optionalRequestKeys stays the fail-closed conditional-dependency authority (not
+"everything optional" nor "everything required").
+
+FIX 2 -- strict malformed-evidence validation (`derivation-core.js`). `optFiniteNum` replaced its
+`Number(value)`-only check (which silently coerced `true`->1, `[]`->0, `[5]`->5, `"  "`->0): it now accepts
+ONLY a finite number or a syntactically valid finite DECIMAL numeric string (regex-guarded; rejects hex/
+"Infinity"/"NaN"/grouped digits) and rejects booleans, arrays, objects, whitespace-only strings, NaN and
+Infinity. Median-price currency now tracks a blank/missing positive-price currency as an EXPLICIT UNKNOWN
+identity, so blank/unknown + USD and USD + EUR both fail closed while USD-only, blank-only and blank+blank stay
+a single identity; valid same-currency route parity is unchanged (numbers and numeric strings fold identically).
+
+FIX 3 -- documentation accuracy. Replaced the "68d2de238e confirmed unavailable / 404 upstream issue" wording
+with the observed reality: API-created Product Catalog exports were seen COMPLETING and RETURNING ROWS; only the
+remaining 404/banner stage + per-account scoping await DataDoe confirmation. Short id/alias/request_hash
+unchanged; no fallback/retry.
+
+Verification (all natural, exit 0): `node --check` all changed files; `report-listing-optimizer.test.js` **37
+assertions** (was 28: +3 FIX-2 regressions -- boolean/array/object/whitespace/grouped-digits rejected, numeric
+strings accepted, unknown+USD / USD+EUR fail closed; +6 FIX-1 lifecycle scenarios -- maxJobs=1 pending+LKG,
+resume saves once idempotent, poll+download deferrals pending-then-resume with no duplicate create, disabled SQP
+saves sqpAvailable:false without catalog, failed SQP + failed catalog preserve LKG zero-writes, pending report
+never blocks a complete report); `npm run test:report-derivation` **439** (was 430); `test:sync-engine` (79),
+`test:report-contracts` (161), `test:source-identity` (7) green; `npm run verify` exit 0 + `build:check`; `git
+diff --check` clean; only the intended files changed. Nothing pushed/merged/deployed/migrated. STOP for Codex
+re-review.

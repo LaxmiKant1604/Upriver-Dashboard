@@ -3515,6 +3515,11 @@ clean; only the intended files changed (+ untracked `HANDOFF.md`/`.worktrees/`).
 pushed/merged/deployed/unlocked/enabled/scheduled/migrated; the live `listing-optimizer.js` builder + source
 identities are byte-unchanged; Listing Optimizer remains SHADOW ONLY + locked, awaiting Codex senior review.
 
-The live Product Catalog `68d2de238e` 404 remains an upstream DataDoe source-access/configuration issue (NOT
-fixed here); Listing Optimizer's catalog stage will surface it as a post-SQP catalog failure (=> `unavailable`,
-LKG) until DataDoe resolves source access.
+Product Catalog `68d2de238e` status (updated 2026-08-12): API-created Product Catalog exports for this source
+were OBSERVED COMPLETING and RETURNING ROWS -- it is NOT confirmed unavailable. What still awaits DataDoe
+confirmation is the remaining 404 / "source not found" banner stage seen on some create-export paths and the
+per-account scoping behavior (which seller/vendor accounts the export is authorized for). The short source id
+`68d2de238e`, its alias, and the request_hash are unchanged, and no fallback/retry was added. Listing
+Optimizer's catalog stage remains fail-closed regardless of the outcome: whenever a post-SQP catalog export
+does not complete for an account, the derive records `unavailable` and preserves last-known-good (never a
+partial save), so resolving the outstanding 404/scoping questions can only turn accounts ON, never corrupt one.
