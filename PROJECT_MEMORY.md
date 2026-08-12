@@ -3087,6 +3087,61 @@ clean.
 `68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows in a
 controlled live check.
 
+#### Re-review 8: creation race -- insert-if-absent + strict rev validation (2026-08-12)
+
+The rev-CAS for existing transitions was approved; one P1 CREATION race remained. Create used
+`saveReportSnapshot` (a merge-upsert), so two same-action requests that both loaded null could both
+write: a delayed creator could OVERWRITE a manifest already advanced/stopped at rev 2 with its initial
+rev-1 payload, and a corrupt/legacy manifest without a valid rev bypassed CAS (treated as new). Commits
+`d2ae274` (server), `ef235cb` (tests), + this docs commit. Files: `lib/server/supabase.js`,
+`api/datadoe.js`, `scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed/migrated; scheduler
+branches, `HANDOFF.md`, `.worktrees` untouched.
+
+**Atomic insert-if-absent creation.** New `insertReportSnapshotIfAbsent` does a POST with `Prefer:
+resolution=ignore-duplicates,return=representation` on the natural-key unique index
+`(report_key,account_id,params_hash)` -- i.e. `INSERT ... ON CONFLICT DO NOTHING RETURNING`. It NEVER
+merges/overwrites: returns `true` when the row was inserted (non-empty representation), `false` on
+conflict (EMPTY representation), and THROWS on transport/HTTP failure. **No migration** (reuses the
+existing unique index). `defaultSaveCatalogActionManifest` create path returns `1` when inserted or
+`false` on conflict; the CAS path for existing revs is unchanged.
+
+**Strict rev validation.** A loaded manifest must carry a POSITIVE INTEGER `rev` (`isPositiveIntRev`).
+Missing / zero / negative / fractional / string / malformed rev fails closed with a **409** BEFORE any
+DataDoe call or write, and is NEVER treated as new (which would bypass CAS).
+
+Creation state table (first-manifest write / loaded-manifest gate):
+
+| situation | outcome | exports |
+|---|---|---|
+| load null, insert-if-absent inserts | create at rev 1, proceed | as usual |
+| load null, insert-if-absent CONFLICT (row exists) | **409** reload -- never overwrite/reopen | 0 |
+| load null, transport error | operational-failure (never report completion) | 0 |
+| loaded manifest, rev is a positive integer | proceed with CAS transitions | as usual |
+| loaded manifest, rev missing/0/neg/fractional/string/NaN | **409** fail closed, no write, no DataDoe | 0 |
+
+Both delayed-create interleavings are proven safe:
+- **A completed then B's delayed create**: A creates+exports+advances to complete (rev 2); B (loaded
+  missing) resumes create -> insert-if-absent CONFLICT -> 409, status/rev unchanged, ZERO exports.
+- **A stopped then B's delayed create**: A commits operational-failure (rev 2); B's delayed create ->
+  409, does NOT reopen, ZERO exports.
+Plus: malformed/missing stored rev -> 409 with zero writes/exports; two normal concurrent first clicks
+-> exactly one export (the loser 409s); and a production-wrapper test proving `insertReportSnapshotIfAbsent`
+sends ignore-duplicates (never merge), distinguishes inserted vs conflict, and throws on transport
+failure (via a cache-busted configured fresh import + mocked fetch, isolated from the suite).
+
+Preserved: one export per request, per-(action,account) attempt claims, rev-CAS for existing manifests,
+typed safe codes, LKG, attempts-first deletion, dynamic discovery, primary-only routing, short id
+`68d2de238e`.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **71** (+4 net: two delayed-create interleavings + rev-validation + production-wrapper; 6b
+updated) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Creation-race hardening does not touch source access; the
+short id `68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows
+in a controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
