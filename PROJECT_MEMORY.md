@@ -2841,6 +2841,87 @@ primary/secondary never merge + secondary id unmutated; adding accounts needs no
 account/country list) + `build:check` **2,394 modules**; `git diff --check` clean. Live DataDoe 404
 note still stands unchanged.
 
+#### Re-review 4: server-owned action manifest + durable queue state machine + retention (2026-08-12)
+
+Three orchestration blockers. The server previously validated only the action-id syntax and trusted
+the browser's `catalogSyncAccountIds` cursor, so a continuation could submit a different valid action
+id and spend another export. Nothing pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`,
+`.worktrees` untouched. Commits `ef2f389` (server), `561698f` (client), `f29197a` (tests), + this docs
+commit. Files: `api/datadoe.js`, `src/App.jsx`, `scripts/test-source-cache.mjs`. Approved blocker-6
+behaviour is preserved unchanged.
+
+**B1 - Durable, server-owned action manifest** (`report_snapshots`, no migration). Report key
+`brand-catalog-action`, fixed account id `__brand-catalog-action__`, differentiated by the action id
+in the params hash. One row per explicit refresh action holds:
+
+| field | meaning |
+|---|---|
+| `actionId` | correlation id for the whole explicit action |
+| `userId` | requesting admin/user identity (where available) |
+| `primaryAccountIds` | discovered authorized PRIMARY account ids (sorted) |
+| `scopeHash` | deterministic hash of `primaryAccountIds` (detects changed/injected/removed scope) |
+| `remaining` | AUTHORITATIVE queue of accounts still to attempt |
+| `current` | account currently in-progress (or null) |
+| `status` | `in-progress` \| `complete` \| `operational-failure` |
+| `code` | typed operational-failure code (else null) |
+| `createdAt` / `updatedAt` | timestamps (updatedAt keeps an active action outside the retention cutoff) |
+
+The manifest -- not the browser cursor -- owns the queue. A first click builds `remaining` from THIS
+action's fresh discovery via `catalogSyncEligibleAccounts` (blocker-6: new primary accounts auto-join,
+removed never do, dd-secondary never primary). A continuation loads the manifest and the client cursor
+is a strict CONSISTENCY CHECK (exact content + order). `orchestrateBrandCatalogAction` returns a plain
+admin-safe **409** BEFORE any DataDoe request for: unknown action, changed action id (continuation with
+no manifest), wrong admin (`userId` mismatch), changed scope (`scopeHash` mismatch -> injected/removed
+account), or injected/removed/reordered/duplicated cursor. A continuation never creates an action
+implicitly. Exactly one export maximum per invocation (the head of `remaining`).
+
+**B2 - Durable queue advancement state machine.** `syncAccountBrandCatalog` now returns a `disposition`
+that tells the orchestrator whether the queue may advance. The account is removed from `remaining` ONLY
+after a durable attempting/terminal state is positively confirmed.
+
+| account/action state | disposition | queue action | exports |
+|---|---|---|---|
+| **pending** (in `remaining`, not yet attempted) | — | stays queued | 0 |
+| **claimed** (won the atomic lock, marker written) | leads to `exported` | — | 1 |
+| **attempting** (durable marker written pre-export) | `exported`/`recorded` | advance (confirmed) | 1 / 0 |
+| **complete** (usable catalog saved) | `exported` (or `recorded` on replay) | advance | 1 / 0 |
+| **unavailable** (typed failure; LKG preserved) | `exported` (or `recorded` on replay) | advance | 1 / 0 |
+| **in-progress** (concurrent owner holds the claim, no terminal yet) | `in-progress` | keep queued, action unresolved | 0 |
+| **operational-failure** (claim or attempting-marker persistence failed) | `operational-failure` | keep queued, STOP action, not complete | 0 |
+| **action-complete** (`remaining` empty) | `none` | — | 0 |
+
+A concurrent claim owner -> zero exports, typed in-progress, the account is NOT falsely removed and the
+action stays unresolved until the durable outcome exists. A claim/attempting-marker persistence failure
+-> zero exports, a typed admin-safe `operational-failure` stop (never reported complete, account never
+silently dropped; the client stops instead of spinning). A failed terminal write keeps the durable
+`attempting` marker so a same-action replay stays at zero exports; an uncertain account is never
+auto-retried under the same action -- only a NEW explicit action attempts it once.
+
+**B3 - Bounded retention.** `pruneBrandCatalogActionRecords` deletes only OLD `brand-catalog-attempt`
+and `brand-catalog-action` rows via the existing `deleteReportSnapshotsOlderThan` (7-day window). It is
+best-effort, runs once per action (first click), never fails a refresh, never deletes active/in-progress
+actions (their `updated_at` is recent, outside the cutoff), and NEVER touches `brand-catalog` LKG or
+`account-directory` snapshots (different report keys). No migration.
+
+No raw DataDoe/Supabase error reaches the browser -- only typed codes
+(`BRAND_DIRECTORY_ACTION_CONFLICT`, `BRAND_DIRECTORY_ACTION_UNAVAILABLE`, and the `PRODUCT_CATALOG_*`
+family). Short Product Catalog id `68d2de238e` remains the only create-export id; the obsolete long id
+is alias-only and never retried.
+
+Verification (exit 0): `node --check` on `api/datadoe.js` + `scripts/test-source-cache.mjs` (App.jsx is
+JSX, validated by `build:check`); `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **51** (+17 orchestration/retention regressions: ACT1->ACT2 409/zero; unknown-action
+409/zero; wrong-admin 409/zero; tampered cursor 409/zero; server manifest picks the next account;
+claim-refusal zero+not-removed+in-progress; two concurrent first clicks => exactly one export;
+attempting-marker-fail zero+operational-failure+not-complete; outcome-write-fail replay zero-additional;
+new account attempted once; complete not re-exported; removed omitted + LKG byte-identical; rediscovered
+active+eligible; primary/dd-secondary never merge; retention prunes only old action/attempt rows; short
+id only; no raw error to browser) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** This is orchestration/data-safety plumbing; it does NOT
+make Product Catalog available. The short id `68d2de238e` remains an UPSTREAM primary-organization
+source-access/configuration issue until it returns rows in a controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
