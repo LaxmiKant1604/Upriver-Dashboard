@@ -665,15 +665,37 @@ export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHa
 }
 
 /**
+ * THE shared optimistic-revision invariant, used at every rev boundary (the manifest
+ * orchestrator, retention, and the CAS helper below): a POSITIVE SAFE integer whose increment
+ * is ALSO a safe integer (so rev + 1 can never overflow Number's safe range or, worse, be a
+ * string that "increments" by concatenation). Rejects missing, zero, negative, fractional,
+ * string, NaN/null, MAX_SAFE_INTEGER, and otherwise-unsafe revisions.
+ */
+export function isSafeSnapshotRev(value) {
+  return Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(value + 1);
+}
+
+/**
  * Optimistic-concurrency (CAS) update of ONE snapshot row's payload, conditional on the
  * stored optimistic version `payload->>rev`. The WHERE includes the expected rev, so the
  * UPDATE is a single atomic statement: exactly one of two concurrent writers whose expected
  * rev matches the stored row wins; the other matches zero rows. Returns `true` when a row was
  * updated (CAS won), `false` when zero rows matched (CAS lost -- a concurrent write moved the
  * row on). THROWS on transport failure so the caller can distinguish "lost the race" from
- * "could not reach the store". Callers pass `payload` already carrying the incremented rev.
+ * "could not reach the store".
+ *
+ * FAIL-CLOSED BEFORE ANY HTTP REQUEST: `expectedRev` must satisfy the shared revision
+ * invariant, and `payload.rev` must equal `expectedRev + 1`. A malformed expectedRev or a
+ * payload whose rev is not the exact increment THROWS without issuing a fetch, so a corrupt
+ * revision can never reach the database (e.g. a string "1" concatenating to "11").
  */
 export async function casUpdateReportSnapshotByRev({ reportKey, accountId, paramsHash, expectedRev, payload, sourceRefreshedAt }) {
+  if (!isSafeSnapshotRev(expectedRev)) {
+    throw new Error("casUpdateReportSnapshotByRev: expectedRev must be a positive safe integer whose increment is safe.");
+  }
+  if (!payload || payload.rev !== expectedRev + 1) {
+    throw new Error("casUpdateReportSnapshotByRev: payload.rev must equal expectedRev + 1.");
+  }
   const params = new URLSearchParams({
     report_key: `eq.${reportKey}`,
     account_id: `eq.${accountId}`,

@@ -34,6 +34,7 @@ import {
   getReportSnapshot,
   getReportSnapshotsOlderThan,
   insertReportSnapshotIfAbsent,
+  isSafeSnapshotRev,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   releaseRefreshLock,
@@ -385,12 +386,10 @@ function catalogActionHash(actionId) {
   return paramsHashFor(BRAND_CATALOG_ACTION_VERSION, { actionId });
 }
 
-// A valid optimistic version is a POSITIVE INTEGER. A loaded manifest whose rev is missing,
-// zero, negative, fractional, a string, or otherwise malformed is corrupt/legacy and MUST fail
-// closed -- it is never treated as new (which would bypass CAS and could clobber an advanced row).
-function isPositiveIntRev(value) {
-  return Number.isInteger(value) && value > 0;
-}
+// The manifest optimistic-version invariant is the SHARED isSafeSnapshotRev (positive safe
+// integer whose increment is safe). A loaded manifest whose rev violates it is corrupt/legacy
+// and MUST fail closed -- never treated as new (which would bypass CAS and could clobber an
+// advanced row), and never used to CAS (a malformed rev could concatenate or overflow).
 
 // Deterministic hash of the discovered authorized PRIMARY scope. A continuation whose
 // authorized scope no longer hashes to the manifest's value (injected/removed account,
@@ -432,6 +431,11 @@ async function defaultSaveCatalogActionManifest(actionId, manifest) {
       sourceRefreshedAt,
     });
     return inserted ? 1 : false; // false => a row already exists (create conflict)
+  }
+  // EXISTING-ROW CAS: a non-null rev MUST satisfy the shared invariant. Fail closed (throw)
+  // BEFORE any write so a malformed rev can never CAS (e.g. a string "1" concatenating to "11").
+  if (!isSafeSnapshotRev(manifest.rev)) {
+    throw new Error("defaultSaveCatalogActionManifest: existing manifest rev is not a positive safe integer.");
   }
   const expectedRev = manifest.rev;
   const payload = { ...manifest, rev: expectedRev + 1 };
@@ -524,6 +528,11 @@ export async function pruneBrandCatalogActionRecords(deps = {}) {
     // do NOT rely on comparing updatedAt.
     if (!current || current.status !== "in-progress") continue;
     if (!(current.expiresAt && Date.parse(current.expiresAt) < nowMs)) continue;
+    // The re-read manifest MUST satisfy the shared revision invariant before any save. A
+    // missing/malformed rev fails closed: SKIP (zero saves, zero deletes) and preserve the
+    // manifest + all its attempts. This also guarantees retention never passes a null rev to
+    // saveManifest -- which would be misinterpreted as first-create.
+    if (!isSafeSnapshotRev(current.rev)) continue;
     // Durably transition to "expired" via a CAS on the rev just read. If a continuation committed
     // between the re-read and here, the CAS LOSES (`confirmed` is false) and retention does NOT
     // overwrite it; the in-progress manifest and all its attempts are preserved for a later pass.
@@ -1089,10 +1098,11 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
     if (created.conflict) return CONFLICT;
     if (!created.ok) return opFailureUnsaved(manifest);
   } else {
-    // A loaded manifest MUST carry a valid positive-integer optimistic version. A missing/zero/
-    // negative/fractional/string/malformed rev is a corrupt/legacy row: fail closed (409) BEFORE
-    // any DataDoe call or write, and NEVER treat it as new (which would bypass CAS).
-    if (!isPositiveIntRev(manifest.rev)) return CONFLICT;
+    // A loaded manifest MUST satisfy the shared revision invariant (positive safe integer whose
+    // increment is safe). A missing/zero/negative/fractional/string/NaN/unsafe rev is a
+    // corrupt/legacy row: fail closed (409) BEFORE any DataDoe call or write, and NEVER treat it
+    // as new (which would bypass CAS).
+    if (!isSafeSnapshotRev(manifest.rev)) return CONFLICT;
     // An existing action: validate ownership + scope BEFORE any DataDoe call. Wrong admin,
     // a changed/injected/removed scope, an unknown-but-existing action all 409.
     if (manifest.userId && userId && String(manifest.userId) !== String(userId)) return CONFLICT;
