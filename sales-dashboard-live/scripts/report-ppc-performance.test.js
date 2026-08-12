@@ -65,11 +65,12 @@ const ppcCtx = (ppcAds, over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: I
 const derivePpc = (built, ppcAds, over, statusOverride) =>
   deriveReportSnapshot({ reportKey: "ppc-performance", sources: buildSources(built.planned, built.rows, statusOverride), context: ppcCtx(ppcAds, over) });
 
-// ---- row builders ----
-const cmp = (date, id, type, m, dims = {}) => ({ source_key: KEYS.campaign, metric_date: date, campaign_id: id, campaign_type: type, currency: m.currency || "USD", dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold: m.units } });
-const asn = (date, asin, currency, m, dims = {}) => ({ source_key: KEYS.asin, metric_date: date, child_asin: asin, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales_same_sku: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders_same_sku: m.orders, ad_units_sold_same_sku: m.units } });
-const tgt = (date, id, campaignId, type, currency, m, dims = {}) => ({ source_key: KEYS.targeting, metric_date: date, targeting_id: id, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
-const stm = (date, campaignId, type, currency, m, dims = {}) => ({ source_key: KEYS.search, metric_date: date, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
+// ---- row builders ---- (every persisted row carries the AUTHORITATIVE public account_id, exactly as the
+// scheduled worker stamps it via publicAccountId(); the PPC loader proves row-level account isolation on it)
+const cmp = (date, id, type, m, dims = {}) => ({ account_id: ID, source_key: KEYS.campaign, metric_date: date, campaign_id: id, campaign_type: type, currency: m.currency || "USD", dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold: m.units } });
+const asn = (date, asin, currency, m, dims = {}) => ({ account_id: ID, source_key: KEYS.asin, metric_date: date, child_asin: asin, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales_same_sku: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders_same_sku: m.orders, ad_units_sold_same_sku: m.units } });
+const tgt = (date, id, campaignId, type, currency, m, dims = {}) => ({ account_id: ID, source_key: KEYS.targeting, metric_date: date, targeting_id: id, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
+const stm = (date, campaignId, type, currency, m, dims = {}) => ({ account_id: ID, source_key: KEYS.search, metric_date: date, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
 const cat = (asin, parent, name, brand) => ({ child_asin: asin, parent_asin: parent, product_name: name, product_brand: brand });
 const ts = (date, sales, units) => ({ date, sales_sum: sales, units_sum: units });
 const sync = (key, o = {}) => ({ account_id: ID, source_key: key, initial_seeded_at: o.seeded ?? "2025-07-01T00:00:00Z", last_daily_sync_at: o.daily ?? "2025-08-10T00:00:00Z", last_monthly_sync_at: null, latest_metric_date: o.latest ?? "2025-08-02", last_status: o.status ?? "ok", last_error: o.error ?? null });
@@ -88,6 +89,20 @@ const ADS_ROWS = () => [
 const CATALOG = () => [cat("ASIN-1", "P1", "Catalog 1", "Acme"), cat("ASIN-2", "P2", "Catalog 2", "Beta")];
 const TOTAL_SALES = () => [ts("2025-08-01", 500, 50), ts("2025-08-02", 300, 30)];
 const okAds = (rows = ADS_ROWS(), syncStates = SYNCS) => ({ status: "ok", adsRows: rows, syncStates, currencies: [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort(), latestMetricDate: rows.reduce((l, r) => (!l || r.metric_date > l ? r.metric_date : l), null) });
+
+// ---- durable ads_sync_coverage states the loader gates Ads validity on ----
+// A source is PROVEN only when its successful windows FULLY span [FROM, ASOF]; the loader NEVER infers
+// coverage from metric-row min/max or latest_metric_date. These helpers build the injected reader's states.
+const covFull = () => ({ windows: [{ from: FROM, to: ASOF }], status: "succeeded", read: "ok" });
+const covState = (over = {}) => ({ windows: over.windows !== undefined ? over.windows : [{ from: FROM, to: ASOF }], status: over.status || "succeeded", read: over.read || "ok", ...(over.latestMetricDate !== undefined ? { latestMetricDate: over.latestMetricDate } : {}) });
+// coverageReader(map): map[account][sourceKey] (or map[account]["*"]) -> a coverage state; no map => every
+// source fully covered. An account/source absent from a provided map reads as an UNSEEDED source (no windows).
+const coverageReader = (mapByAccountSource) => async (accountId, sourceKey) => {
+  if (mapByAccountSource == null) return covFull();
+  const perAccount = mapByAccountSource[accountId] || {};
+  const state = perAccount[sourceKey] !== undefined ? perAccount[sourceKey] : perAccount["*"];
+  return state !== undefined ? state : { windows: [], status: "missing", read: "ok" };
+};
 
 const expectedPayload = () => ({
   accountId: "A1", asOf: "2025-08-10",
@@ -264,12 +279,12 @@ test("15. derivation makes ZERO network calls; 16. repeated derivation is idempo
 group("ppc loader: typed validation + availability (empty vs missing)");
 
 test("17. validatePpcAdsRows accepts canonical rows; rejects malformed/out-of-window/non-finite/bad-source-key", () => {
-  assert.equal(validatePpcAdsRows({ rows: ADS_ROWS(), from: FROM, to: ASOF }).ok, true);
-  assert.equal(validatePpcAdsRows({ rows: [{ ...cmp("2099-01-01", "C1", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }) }], from: FROM, to: ASOF }).ok, false, "future/out-of-window date");
-  assert.equal(validatePpcAdsRows({ rows: [{ ...cmp("2025-02-30", "C1", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }) }], from: FROM, to: ASOF }).ok, false, "impossible date");
-  assert.equal(validatePpcAdsRows({ rows: [{ source_key: "some-other-source", metric_date: "2025-08-01", metrics: {} }], from: FROM, to: ASOF }).ok, false, "source_key not allowed");
-  assert.equal(validatePpcAdsRows({ rows: [{ source_key: KEYS.campaign, metric_date: "2025-08-01", metrics: { ad_spend: Infinity } }], from: FROM, to: ASOF }).ok, false, "non-finite metric");
-  assert.equal(validatePpcAdsRows({ rows: [{ source_key: KEYS.campaign, metric_date: "2025-08-01", metrics: "nope" }], from: FROM, to: ASOF }).ok, false, "metrics not an object");
+  assert.equal(validatePpcAdsRows({ rows: ADS_ROWS(), from: FROM, to: ASOF, accountId: ID }).ok, true);
+  assert.equal(validatePpcAdsRows({ rows: [{ ...cmp("2099-01-01", "C1", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }) }], from: FROM, to: ASOF, accountId: ID }).ok, false, "future/out-of-window date");
+  assert.equal(validatePpcAdsRows({ rows: [{ ...cmp("2025-02-30", "C1", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }) }], from: FROM, to: ASOF, accountId: ID }).ok, false, "impossible date");
+  assert.equal(validatePpcAdsRows({ rows: [{ account_id: ID, source_key: "some-other-source", metric_date: "2025-08-01", metrics: {} }], from: FROM, to: ASOF, accountId: ID }).ok, false, "source_key not allowed");
+  assert.equal(validatePpcAdsRows({ rows: [{ account_id: ID, source_key: KEYS.campaign, metric_date: "2025-08-01", metrics: { ad_spend: Infinity } }], from: FROM, to: ASOF, accountId: ID }).ok, false, "non-finite metric");
+  assert.equal(validatePpcAdsRows({ rows: [{ account_id: ID, source_key: KEYS.campaign, metric_date: "2025-08-01", metrics: "nope" }], from: FROM, to: ASOF, accountId: ID }).ok, false, "metrics not an object");
 });
 
 test("18. loadPersistedPpcAds: validated success (rows) is status ok with sorted currencies + latest metric date", async () => {
@@ -280,6 +295,8 @@ test("18. loadPersistedPpcAds: validated success (rows) is status ok with sorted
   assert.equal(loaded.latestMetricDate, "2025-08-02");
   assert.equal(loaded.adsRows.length, 7);
   assert.equal(loaded.syncStates.length, 4, "only this account's allowed-source sync states are kept");
+  assert.ok(loaded.sourceCoverage.every((c) => c.proven && c.folded), "every source proven + folded when fully covered");
+  assert.deepEqual(loaded.sourceCoverage.filter((c) => c.required).map((c) => c.sourceKey), [KEYS.campaign, KEYS.asin], "campaign + ASIN are the required defaults");
 });
 
 test("19. loadPersistedPpcAds: validated EMPTY window is status ok (distinct from a read failure => unavailable)", async () => {
@@ -301,8 +318,8 @@ test("21. loadPersistedPpcAds: an out-of-window / bad-source-key row fails close
   const outOfWindow = [...ADS_ROWS(), cmp(addDaysStr(FROM, -1), "CX", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 })];
   const r1 = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => outOfWindow });
   assert.equal(r1.status, "unavailable", "one out-of-window row invalidates the whole load");
-  const badSource = [...ADS_ROWS(), { source_key: "amazon-orders-v1", metric_date: "2025-08-01", currency: "USD", dimensions: {}, metrics: {} }];
-  const r2 = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => badSource });
+  const badSource = [...ADS_ROWS(), { account_id: ID, source_key: "amazon-orders-v1", metric_date: "2025-08-01", currency: "USD", dimensions: {}, metrics: {} }];
+  const r2 = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => badSource, getAdsSyncCoverage: coverageReader(null) });
   assert.equal(r2.status, "unavailable", "a disallowed source_key invalidates the whole load");
 });
 
@@ -316,14 +333,16 @@ test("22. ppcAdsCurrencySignalOf: validated => success signal; unavailable => fa
 
 group("ppc real cycle: runPpcShadowCycle -> runReportJobs (zero Ads exports / gate / dedup / LKG / resume)");
 
-function makeAdsReaders(rowsByAccount, syncByAccount) {
+function makeAdsReaders(rowsByAccount, syncByAccount, coverageMap = null) {
   return {
     async getAdsDailySourceRows({ accountId, sourceKeys, from, to, maxRows }) {
+      // The production reader filters account_id = eq.<accountId>; mirror that so rows are account-scoped.
       const all = (rowsByAccount[accountId] || []).filter((r) => sourceKeys.includes(r.source_key) && r.metric_date >= from && r.metric_date <= to);
       if (maxRows && all.length >= maxRows) throw new Error(`more than ${maxRows} saved Amazon Ads rows`);
       return all;
     },
     async getAdsSyncStates(accountIds) { return accountIds.flatMap((a) => syncByAccount[a] || []); },
+    getAdsSyncCoverage: coverageReader(coverageMap),
   };
 }
 
@@ -379,7 +398,7 @@ function makeDataDoe(opts = {}) {
 }
 
 const ACCTS = [{ accountId: ID, country: "US", currency: "USD" }];
-const runCycle = (store, dd, readers, accounts = ACCTS, opts = {}) => runPpcShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, getAdsDailySourceRows: readers.getAdsDailySourceRows, getAdsSyncStates: readers.getAdsSyncStates, bucket: "us", cycleDate: "2026-08-11", ...opts });
+const runCycle = (store, dd, readers, accounts = ACCTS, opts = {}) => runPpcShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, getAdsDailySourceRows: readers.getAdsDailySourceRows, getAdsSyncStates: readers.getAdsSyncStates, getAdsSyncCoverage: readers.getAdsSyncCoverage, bucket: "us", cycleDate: "2026-08-11", ...opts });
 const keyOf = (store, cid) => [...new Set(store.listSourceJobs(cid).map((j) => j.request_key))].sort();
 
 test("23. staged, not generic: ppc-performance is a STAGED_CYCLE key; buildShadowReportPlan rejects it fail-closed", () => {
@@ -404,24 +423,31 @@ test("25. MULTI-currency Ads: gate SKIPS total-sales -> plans catalog ONLY (one 
   assert.equal(dd.totalCreates(), 1);
 });
 
-test("26. Ads read unavailable/unseeded: plans NOTHING -> ZERO DataDoe tokens; report stays LKG", async () => {
+test("26. UNSEEDED Ads (successful [] rows + [] sync + [] coverage): plans NOTHING -> ZERO tokens; LKG kept", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const lkg = { accountId: ID, prior: true };
-  const r = await runCycle(store, dd, makeAdsReaders({}, {})); // no persisted Ads for A1 -> read returns []? make it fail instead
-  // Force a read failure so the Ads context is unvalidated.
-  const store2 = makeStore(); const dd2 = makeDataDoe();
-  const failReaders = { getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => { throw new Error("read failed"); } };
-  const r2 = await runCycle(store2, dd2, failReaders);
-  assert.equal(dd2.totalCreates(), 0, "unvalidated Ads => zero DataDoe exports");
-  assert.equal(store2.listSourceJobs(r2.cycleId).length, 0, "no source jobs staged");
-  // The report derive (via the Ads loader) is unavailable => a prior snapshot survives.
-  store2.seedSnapshot("scheduler-v2/ppc-performance", ID, lkg);
+  // The account is genuinely unseeded: the row read SUCCEEDS returning [], there are no sync states, and NO
+  // durable coverage windows exist ({} => every source reads as missing coverage). This is the exact case the
+  // earlier loader mis-classified as a validated-EMPTY window; it MUST be unavailable so zero tokens are spent.
+  const unseeded = makeAdsReaders({ A1: [] }, { A1: [] }, { A1: {} });
+  const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...unseeded });
+  assert.equal(loaded.status, "unavailable", "unseeded account is NOT a validated-empty window");
+  assert.match(loaded.reason, /required-source/, "unavailable because a required default lacks proven coverage");
+  assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: null }, "fail-closed currency signal");
+  // Through the REAL cycle: zero source jobs, zero DataDoe exports, an empty-sources report plan.
+  const r = await runCycle(store, dd, unseeded);
+  assert.equal(dd.totalCreates(), 0, "unseeded Ads => zero DataDoe exports");
+  assert.equal(store.listSourceJobs(r.cycleId).length, 0, "no source jobs staged");
+  assert.deepEqual(r.plannedReports.map((p) => p.sources.length), [0], "the report plan emits zero sources");
+  assert.equal(r.perAccount[0].adsStatus, "unavailable");
+  // The report derive (via the Ads loader) is unavailable => a prior snapshot survives untouched.
+  store.seedSnapshot("scheduler-v2/ppc-performance", ID, lkg);
   const saved = [];
-  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store2.seedSnapshot(reportKey, accountId, payload); saved.push(payload); return { paramsHash: "ph" }; };
-  const res = await runReportJobs({ store: store2, cycleId: r2.cycleId, sourceRows: (h) => store2.loadSourceRows(h), saveSnapshot, plannedReports: r2.plannedReports, loadDerivedContext: makePpcAdsContextLoader(failReaders) });
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push(payload); return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: r.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: r.plannedReports, loadDerivedContext: makePpcAdsContextLoader(unseeded) });
   assert.equal(res.succeeded, 0, "unavailable Ads => report not saved");
-  assert.deepEqual(store2._snapshots.get("scheduler-v2/ppc-performance|" + ID).payload, lkg, "last-known-good preserved");
-  void r;
+  assert.equal(saved.length, 0, "no report snapshot written");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/ppc-performance|" + ID).payload, lkg, "last-known-good preserved");
 });
 
 test("27. shared catalog canonical hash matches Sales Movers; one export per shared hash across owners", async () => {
@@ -499,10 +525,116 @@ test("31. primary-only: a stale dd-secondary account is skipped read-only with Z
   const store = makeStore(); const dd = makeDataDoe();
   const PRIMARY_ONLY = [{ id: "primary", apiKey: dash("prim", "key"), accountPrefix: "" }];
   const accounts = [{ accountId: ID, country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
-  const r = await runPpcShadowCycle({ accounts, connections: PRIMARY_ONLY, asOf: ASOF, store, dataDoe: dd, getAdsDailySourceRows: makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }).getAdsDailySourceRows, getAdsSyncStates: makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }).getAdsSyncStates, bucket: "us", cycleDate: "2026-08-11" });
+  const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }); // A1 fully covered; the dd-secondary is skipped before any read
+  const r = await runPpcShadowCycle({ accounts, connections: PRIMARY_ONLY, asOf: ASOF, store, dataDoe: dd, getAdsDailySourceRows: readers.getAdsDailySourceRows, getAdsSyncStates: readers.getAdsSyncStates, getAdsSyncCoverage: readers.getAdsSyncCoverage, bucket: "us", cycleDate: "2026-08-11" });
   assert.equal(r.unavailableAccounts.length, 1, "the dd-secondary account is unavailable");
+  assert.ok(store.listSourceJobs(r.cycleId).length > 0, "the primary account DID plan real jobs (routing proof is meaningful)");
   assert.ok(store.listSourceJobs(r.cycleId).every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to primary");
   assert.deepEqual(r.plannedReports.map((p) => p.accountId), ["A1"], "only the primary account yields a report plan");
+});
+
+/* ========== Part D: durable-coverage gate + row-level account isolation (PPC review blockers) ========== */
+
+group("ppc loader: durable ads_sync_coverage gate (validated-empty vs unavailable) + account isolation");
+
+test("32. full campaign+ASIN coverage + [] rows => GENUINE VALIDATED EMPTY (distinct from unavailable)", async () => {
+  const readers = makeAdsReaders({ A1: [] }, { A1: SYNCS }); // full coverage default, but zero saved rows
+  const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...readers });
+  assert.equal(loaded.status, "ok", "a fully-covered zero-activity window is a genuine validated-empty window");
+  assert.deepEqual(loaded.adsRows, []);
+  assert.equal(loaded.latestMetricDate, null, "empty window => latestMetricDate null (never inferred)");
+  assert.deepEqual(loaded.currencies, []);
+  assert.ok(loaded.sourceCoverage.filter((c) => c.required).every((c) => c.proven), "required defaults proven");
+  // Through the derive: an honestly-empty report (derived), NOT unavailable.
+  const r = derivePpc(ppcPlanned({ catalog: CATALOG() }), loaded);
+  assert.equal(r.status, "derived", "validated-empty derives a real, honestly-empty report");
+  assert.equal(r.payload.adsRowCount, 0);
+  assert.equal(r.latestDataDate, null);
+});
+
+test("33. required-source coverage partial/gapped/stale/schema-missing/read-failed/missing => unavailable (LKG)", async () => {
+  const asOfM = (n) => addDaysStr(ASOF, n); const fromP = (n) => addDaysStr(FROM, n);
+  const cases = {
+    "partial suffix (starts after FROM)": { [KEYS.campaign]: covState({ windows: [{ from: fromP(5), to: ASOF }] }), "*": covFull() },
+    "interior gap": { [KEYS.campaign]: covState({ windows: [{ from: FROM, to: asOfM(-10) }, { from: asOfM(-4), to: ASOF }] }), "*": covFull() },
+    "stale (does not reach asOf)": { [KEYS.campaign]: covState({ windows: [{ from: FROM, to: asOfM(-3) }] }), "*": covFull() },
+    "schema-missing table": { [KEYS.campaign]: { windows: [], read: "schema-missing" }, "*": covFull() },
+    "read-failed": { [KEYS.campaign]: { windows: [{ from: FROM, to: ASOF }], read: "read-failed" }, "*": covFull() },
+    "required ASIN missing while campaign covered": { [KEYS.asin]: { windows: [], read: "ok" }, "*": covFull() },
+  };
+  for (const [label, map] of Object.entries(cases)) {
+    const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }, { A1: map });
+    const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...readers });
+    assert.equal(loaded.status, "unavailable", label + " => unavailable");
+    assert.match(loaded.reason, /required-source/, label + " => reason names the required source");
+    assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: null }, label + " => fail-closed signal (plans nothing)");
+  }
+});
+
+test("34. optional targeting/search policy: covered folds; an unproven optional is unavailable + its rows are NEVER folded", async () => {
+  // Required defaults + targeting fully covered; search-terms STALE (does not reach asOf) => unproven optional.
+  const map = { A1: {
+    [KEYS.campaign]: covFull(), [KEYS.asin]: covFull(), [KEYS.targeting]: covFull(),
+    [KEYS.search]: covState({ windows: [{ from: FROM, to: addDaysStr(ASOF, -3) }] }),
+  } };
+  const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }, map);
+  const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...readers });
+  assert.equal(loaded.status, "ok", "required defaults covered => Ads validated");
+  const byKey = Object.fromEntries(loaded.sourceCoverage.map((c) => [c.sourceKey, c]));
+  // Availability state table:
+  assert.deepEqual([byKey[KEYS.campaign].proven, byKey[KEYS.asin].proven, byKey[KEYS.targeting].proven], [true, true, true]);
+  assert.deepEqual([byKey[KEYS.campaign].folded, byKey[KEYS.asin].folded, byKey[KEYS.targeting].folded], [true, true, true]);
+  assert.equal(byKey[KEYS.search].proven, false, "stale search-terms is not proven");
+  assert.equal(byKey[KEYS.search].folded, false, "unproven optional rows are NOT folded");
+  assert.ok(!loaded.adsRows.some((r) => r.source_key === KEYS.search), "no stale search-term row survives the fold");
+  assert.ok(loaded.adsRows.some((r) => r.source_key === KEYS.targeting), "covered targeting rows DO survive");
+  // Derived report shows targeting but an empty search-terms list -- stale data is never presented as current.
+  const r = derivePpc(ppcPlanned({ catalog: CATALOG() }), loaded);
+  assert.equal(r.status, "derived");
+  assert.equal(r.payload.targets.length, 1, "covered targeting is shown");
+  assert.deepEqual(r.payload.searchTerms, [], "stale search-term data is dropped, not shown as current");
+});
+
+test("35. cross-account / missing-account rows fail closed => unavailable, zero jobs/exports, LKG (blocker 2)", async () => {
+  // (a) A leaked row carrying a DIFFERENT account_id than requested invalidates the whole load (never filtered).
+  const cross = [...ADS_ROWS(), { ...cmp("2025-08-02", "CX", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }), account_id: "OTHER" }];
+  const crossReaders = { getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => cross, getAdsSyncCoverage: coverageReader(null) };
+  const l1 = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...crossReaders });
+  assert.equal(l1.status, "unavailable", "one cross-account row fails the whole load closed");
+  assert.equal(l1.reason, "ads-row-account-mismatch");
+  // (b) A row missing account_id entirely is rejected BEFORE any currency gating / folding.
+  const missing = [...ADS_ROWS(), { source_key: KEYS.campaign, metric_date: "2025-08-02", currency: "USD", dimensions: {}, metrics: { ad_spend: 1 } }];
+  const l2 = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, getAdsSyncStates: async () => SYNCS, getAdsDailySourceRows: async () => missing, getAdsSyncCoverage: coverageReader(null) });
+  assert.equal(l2.status, "unavailable");
+  assert.equal(l2.reason, "ads-row-account-missing");
+  // (c) Through the REAL cycle + report worker: zero DataDoe jobs/exports, no snapshot, LKG preserved.
+  const store = makeStore(); const dd = makeDataDoe(); const lkg = { accountId: ID, prior: true };
+  const r = await runCycle(store, dd, crossReaders);
+  assert.equal(dd.totalCreates(), 0, "cross-account leak => zero DataDoe exports");
+  assert.equal(store.listSourceJobs(r.cycleId).length, 0, "no source jobs staged");
+  store.seedSnapshot("scheduler-v2/ppc-performance", ID, lkg);
+  const saved = [];
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push(payload); return { paramsHash: "ph" }; };
+  const res = await runReportJobs({ store, cycleId: r.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: r.plannedReports, loadDerivedContext: makePpcAdsContextLoader(crossReaders) });
+  assert.equal(res.succeeded, 0, "cross-account Ads => report not saved");
+  assert.equal(saved.length, 0, "no snapshot written");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/ppc-performance|" + ID).payload, lkg, "last-known-good preserved");
+});
+
+test("36. dd-secondary public-id namespacing: only rows tagged with the EXACT public id validate; primary/secondary never cross", async () => {
+  const SEC = dash("dd", "secondary") + ":B1";
+  const secRow = (over = {}) => ({ account_id: SEC, source_key: KEYS.campaign, metric_date: "2025-08-02", currency: "USD", dimensions: { ad_campaign_name: "S" }, metrics: { ad_spend: 1, ad_sales: 2, ad_clicks: 1 }, ...over });
+  // Rows correctly tagged with the dd-secondary public id validate under that account.
+  const good = { getAdsSyncStates: async () => [], getAdsDailySourceRows: async () => [secRow()], getAdsSyncCoverage: coverageReader({ [SEC]: { "*": covFull() } }) };
+  const okSec = await loadPersistedPpcAds({ accountId: SEC, asOf: ASOF, ...good });
+  assert.equal(okSec.status, "ok", "dd-secondary rows validate under the dd-secondary public id");
+  assert.equal(okSec.adsRows.length, 1);
+  // A row carrying the PRIMARY public id must NOT validate under the dd-secondary account (no cross-namespace leak).
+  const leakPrimary = { getAdsSyncStates: async () => [], getAdsDailySourceRows: async () => [secRow({ account_id: ID })], getAdsSyncCoverage: coverageReader({ [SEC]: { "*": covFull() } }) };
+  assert.equal((await loadPersistedPpcAds({ accountId: SEC, asOf: ASOF, ...leakPrimary })).status, "unavailable", "a primary-id row never routes into the secondary account");
+  // Symmetrically, a dd-secondary-id row must NOT validate under the primary account.
+  const leakSecondary = { getAdsSyncStates: async () => [], getAdsDailySourceRows: async () => [secRow()], getAdsSyncCoverage: coverageReader({ A1: { "*": covFull() } }) };
+  assert.equal((await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...leakSecondary })).status, "unavailable", "a dd-secondary-id row never routes into the primary account");
 });
 
 async function main() {
