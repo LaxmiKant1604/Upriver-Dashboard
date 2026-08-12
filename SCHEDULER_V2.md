@@ -3355,3 +3355,67 @@ pushed/merged/deployed/unlocked/scheduled; migrations still unapplied; PPC remai
 
 Remaining live gates unchanged from §53 (both migrations UNAPPLIED => coverage `schema-missing` => PPC
 fail-closed unavailable until applied + worker records windows; worker sync-cadence confirmation before unlock).
+
+## 55. PPC Performance: coverage-reason safety re-review blocker CLOSED -- closed allowlist, no raw DB/credential text persisted (SHADOW MODE, 2026-08-12)
+
+Correction pass for the §54 re-review blocker (PROJECT_MEMORY "PPC coverage-contract correction re-review
+blocker", Codex 2026-08-12). `validatePpcSourceCoverage()` validated the four source keys + boolean flags but
+NOT `entry.reason`, so an injected four-key-valid contract with `search.reason: "raw-db-error apikey=LEAK"`
+returned `{ok:true}` and `ppcPerformancePayload()` copied that exact string into the SAVED
+`sourceAvailability[].coverageUnavailableReason` -- breaking the admin-safe typed-code guarantee and risking
+persisted raw database / HTTP / URL / credential text from a future or miswired loader. PPC stays SHADOW ONLY +
+locked: `api/datadoe.js` live route + `lib/server/reports/ppc.js` builder byte-unchanged, source CONTRACTS +
+`source-identity.js`/request_hash unchanged, Scheduler v1 + frontend untouched, migrations NOT applied,
+`HANDOFF.md` untracked/untouched.
+
+### 55.1 Closed allowlist of admin-safe coverage reason codes (single source of truth)
+
+`derivation-core.js` (the import-FREE pure leaf) gains `PPC_COVERAGE_REASON_CODES` (frozen), the fixed fallback
+`PPC_COVERAGE_REASON_FALLBACK = "coverage-unavailable"`, and pure `normalizePpcCoverageReason(reason)`. The
+allowlist is EXACTLY the typed codes the persisted-Ads loader can produce -- `coverage-reader-missing`,
+`coverage-state-malformed`, `coverage-schema-missing`, `coverage-read-failed`, `coverage-read-not-ok`,
+`coverage-windows-not-array`, `coverage-window-malformed`, `coverage-incomplete` (from `evaluateSourceCoverage`
++ `proveSourceCoverage`) -- plus the generic fallback. Any other value (raw DB message, HTTP body, URL,
+authorization text, token/API key, arbitrary caller string, exception message) normalizes to the fallback and
+is NEVER persisted verbatim. Kept in the import-free leaf so `ppc-ads-loader.js`'s contract validator can import
+the SAME set -- ONE source of truth, and derivation-core.js still imports nothing (F3 boundary intact; the loader
+transitively adds no transport/storage).
+
+### 55.2 Reason consistency enforced at the injected derive boundary
+
+`validatePpcSourceCoverage()` now also checks each entry's `reason`:
+  - `proven:true` (required or optional) => `reason` MUST be `null` (`source-coverage-proven-reason-not-null`);
+  - optional `proven:false` => `folded:false` AND `reason` MUST be a recognized allowlisted safe code, else
+    `source-coverage-unproven-reason-unsafe`;
+  - a missing / non-string / unknown / contradictory reason fails closed.
+Because the derive adapter re-runs this contract on the injected `context.ppcAds` before folding/saving, an
+unsafe reason now yields typed `unavailable`, ZERO snapshot writes, LKG preserved. The loader's own self-check
+uses the same validator, so its legitimate output (proven => `null`; unproven optional => a typed code) still
+passes.
+
+### 55.3 `ppcPerformancePayload()` can never persist an arbitrary reason
+
+The saved `coverageUnavailableReason` is now `cov.proven ? null : normalizePpcCoverageReason(cov.reason)` --
+an allowlisted code passes through; anything else becomes `"coverage-unavailable"`. This is defense-in-depth
+independent of the validator: even a direct `ppcPerformancePayload()` call with an unsafe reason emits only a
+safe code. All PPC CALCULATIONS and the fully-covered parity fixture are unchanged; a stale optional still saves
+its approved typed reason (e.g. `coverage-incomplete`); and the live route (no `sourceCoverage`) still gets a
+payload with NO coverage fields.
+
+### 55.4 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-ppc-performance.test.js` **44 test entries / 45 cases**
+(was 39): new #41 (validatePpcSourceCoverage reason safety -- proven=>null, unproven optional=>allowlisted only,
+raw/credential/URL/db strings rejected), #42 (normalizePpcCoverageReason allowlist + a drift guard exercising
+every `evaluateSourceCoverage` branch), #43 (direct `ppcPerformancePayload` normalizes unsafe reasons; the raw
+string appears nowhere in the payload), #44 (derive + real `runReportJobs` fail closed on an injected unsafe
+reason: zero snapshot, LKG, credential never stored), #45 (live-route payload has no coverage fields when
+`sourceCoverage` is absent). `npm run test:report-derivation` **402**
+(66+30+33+20+34+24+12+27+40+35+37+**44**). Focused suites green: `test:sync-engine`, `test:report-contracts`
+(161), `test:source-identity` (7). `npm run verify` = exit 0 (terminated naturally) + `build:check` (2,394
+modules). `git diff --check` clean; only the intended files changed (+ untracked `HANDOFF.md`). Nothing
+pushed/merged/deployed/unlocked/scheduled; migrations still unapplied; PPC remains SHADOW ONLY + locked.
+
+Remaining live gates unchanged from §53 (both migrations UNAPPLIED => coverage `schema-missing` => PPC
+fail-closed unavailable until applied + worker records windows; worker sync-cadence confirmation before unlock).
+Listing Optimizer remains NOT started (awaiting Codex approval of this correction).
