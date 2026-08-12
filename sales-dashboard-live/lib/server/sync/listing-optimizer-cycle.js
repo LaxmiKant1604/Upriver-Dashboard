@@ -64,28 +64,43 @@ export async function runListingOptimizerShadowCycle({
   }
 
   const asOfOf = (a) => (typeof asOfFor === "function" ? asOfFor(a.country) : (a.asOf || asOf));
-  // Per-account tracked state; each account owns its SQP canonical hash (account-scoped).
-  const state = active.map((a) => ({ account: a, asOf: asOfOf(a), sqpHash: null, sqpSignal: null }));
+  // Per-account tracked state; each account owns its SQP + catalog canonical hashes (account-scoped) and the
+  // RAW fetch_status of each (null when the job does not exist yet). The raw statuses drive the state-aware
+  // final dependency flags in buildFinalReports (a source stays REQUIRED -> the report fetch gate keeps the
+  // report PENDING -- while its job is unstaged/pending/in-flight; it becomes OPTIONAL only once its job has
+  // terminally RESOLVED to a non-success the derive must interpret).
+  const state = active.map((a) => ({
+    account: a, asOf: asOfOf(a),
+    sqpHash: null, sqpSignal: null, sqpJobStatus: null,
+    catalogHash: null, catalogJobStatus: null,
+  }));
 
   const loadRows = async (hash) => {
     if (!hash || !store.loadSourceRows) return null;
     try { const p = await store.loadSourceRows(hash); return p && Array.isArray(p.rows) ? p.rows : null; } catch (_e) { return null; }
   };
 
-  // Reconstruct each account's typed SQP signal from ITS OWN persisted job (by hash) + saved cache.
+  // Reconstruct each account's typed SQP signal + the RAW fetch_status of its SQP + catalog jobs, from ITS
+  // OWN persisted jobs (by hash) + saved cache.
   const reconstruct = async (cycleId) => {
     const jobs = await store.listSourceJobs(cycleId);
     const byHash = new Map(jobs.map((j) => [j.request_hash ?? j.requestHash, j]));
     for (const st of state) {
-      if (!st.sqpHash) continue;
-      const j = byHash.get(st.sqpHash);
-      const succeeded = !!j && (j.fetch_status ?? j.fetchStatus) === "succeeded";
-      if (succeeded) {
-        // A cleanly-loaded array (even []) is a validated SQP success; a missing/unreadable cache is NOT.
-        st.sqpSignal = sqpSuccessSignal(await loadRows(st.sqpHash));
-      } else {
-        st.sqpSignal = j ? { status: j.terminal ? "terminal" : "failed", validated: false } : null;
+      if (st.sqpHash) {
+        const j = byHash.get(st.sqpHash);
+        st.sqpJobStatus = j ? (j.fetch_status ?? j.fetchStatus ?? null) : null;
+        const succeeded = !!j && st.sqpJobStatus === "succeeded";
+        if (succeeded) {
+          // A cleanly-loaded array (even []) is a validated SQP success; a missing/unreadable cache is NOT.
+          st.sqpSignal = sqpSuccessSignal(await loadRows(st.sqpHash));
+        } else {
+          st.sqpSignal = j ? { status: j.terminal ? "terminal" : "failed", validated: false } : null;
+        }
       }
+      // The catalog job exists only after a validated SQP success staged it; its raw status decides whether
+      // an unstaged/in-flight catalog keeps the report PENDING (required) or a resolved-failed catalog
+      // reaches the derive (optional -> unavailable/LKG).
+      st.catalogJobStatus = st.catalogHash ? ((byHash.get(st.catalogHash) || {}).fetch_status ?? (byHash.get(st.catalogHash) || {}).fetchStatus ?? null) : null;
     }
   };
 
@@ -97,6 +112,8 @@ export async function runListingOptimizerShadowCycle({
     });
     const sqp = plan.sources.find((s) => s.requestKey === "listing-optimizer:sqp-weekly");
     if (sqp) st.sqpHash = sqp.requestHash;
+    const cat = plan.sources.find((s) => s.requestKey === "listing-optimizer:catalog");
+    if (cat) st.catalogHash = cat.requestHash;
     return { st, plan };
   });
 
@@ -191,16 +208,41 @@ export async function runListingOptimizerShadowCycle({
   return rollup;
 }
 
+// A source job fetch_status is RESOLVED-to-a-non-success (the report derive must interpret it) only when it
+// terminally failed or was skipped. An absent job (null), a still-'pending'/'attempted' (in-flight/deferred)
+// job, or a 'succeeded' job is NOT such a resolution -- the source must stay REQUIRED so the report fetch
+// gate keeps the report PENDING (or, for succeeded, lets it derive) rather than prematurely recording it.
+function resolvedNonSuccess(status) {
+  return status === "failed" || status === "skipped";
+}
+
 // Return the canonical listing-optimizer report request per account for its currently resolved SQP outcome:
-// SQP-weekly always; + the content catalog when the SQP signal is a validated success. Each source keeps
-// the optional/degradable flag decorateSources stamped from the derivation's optionalRequestKeys (SQP-weekly
-// degrades to sqpAvailable:false; the catalog is required), so the report fetch gate + derive stay
-// fail-closed. Pure; no I/O, no DataDoe call.
+// SQP-weekly always; + the content catalog when the SQP signal is a validated success.
+//
+// STATE-AWARE final dependency flags (partial-invocation lifecycle, mirroring Keyword Rank): a source's
+// `optional` flag is derived from its OWN persisted job status so a bounded/deferred/multi-round invocation
+// never exposes a runnable-but-incomplete report that would derive-fail and freeze last-known-good:
+//   - SQP-weekly unstaged / pending / in-flight  => REQUIRED  => fetch gate keeps the report PENDING
+//     (retryable in the SAME cycle); once succeeded it stays required (gate ready -> derive);
+//   - SQP-weekly RESOLVED failed/disabled/skipped => OPTIONAL  => the gate passes it to the derive, which
+//     produces the faithful sqpAvailable:false snapshot (durable degraded SOURCE_DISABLED) or unavailable/
+//     last-known-good (non-disabled failure) -- the special Listing Optimizer outcomes are preserved;
+//   - catalog unstaged / pending / in-flight     => REQUIRED  => report PENDING until the catalog stage
+//     completes in a later round/invocation (then the SAME cycle derives + saves exactly once);
+//   - catalog RESOLVED failed/skipped            => OPTIONAL  => derive => unavailable/last-known-good.
+// This deliberately does NOT make everything optional (which would let an unstaged source derive-fail now)
+// nor everything required (which would turn a degraded SQP into a hard block); the derive's own conditional
+// dependency (REPORT_DERIVATIONS optionalRequestKeys) remains the fail-closed authority. Pure; no I/O.
 function buildFinalReports({ state, connections, bucket }) {
   return state.map((st) => {
     const plan = planListingOptimizer({
       accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
       connections, asOf: st.asOf, sqpSignal: st.sqpSignal,
+    });
+    const sources = plan.sources.map((s) => {
+      if (s.requestKey === "listing-optimizer:sqp-weekly") return { ...s, optional: resolvedNonSuccess(st.sqpJobStatus) };
+      if (s.requestKey === "listing-optimizer:catalog") return { ...s, optional: resolvedNonSuccess(st.catalogJobStatus) };
+      return { ...s, optional: false };
     });
     return {
       reportKey: "listing-optimizer",
@@ -208,7 +250,7 @@ function buildFinalReports({ state, connections, bucket }) {
       accountId: plan.accountId,
       connectionId: DRIVER_CONNECTION_ID[plan.connectionId] || plan.connectionId,
       bucket: plan.bucket || bucket,
-      sources: plan.sources,
+      sources,
       context: plan.context,
     };
   });
