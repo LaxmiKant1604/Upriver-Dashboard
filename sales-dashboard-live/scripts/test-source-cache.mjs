@@ -946,52 +946,156 @@ await asyncTest("orchestration 13: primary and dd-secondary with the same raw se
   assert.ok(!r.remaining.includes("dd-secondary:SELLER9"), "the dormant secondary is never in the primary queue");
 });
 
-// A status-aware retention model: action manifests (by status/age), their attempt rows, and
-// LKG + account-directory rows that must NEVER be touched. Exposes the three retention deps.
+// A status-aware retention model: action manifests (status/age/expiresAt), their attempt rows,
+// and LKG + account-directory rows that must NEVER be touched. `add(id, status, ageDays,
+// accountIds, expiresDaysAgo)`: ageDays/expiresDaysAgo are DAYS BEFORE NOW (a positive
+// expiresDaysAgo means expiresAt has passed; null means no expiresAt). The delete/expiry
+// primitives report ACCURATELY: they resolve true on success and throw when injected to fail.
 function makeRetentionModel(NOW) {
   const DAY = 86_400_000;
   const iso = (d) => new Date(NOW - d * DAY).toISOString();
-  const actions = new Map(); // actionId -> { status, updatedAt(iso), accountIds }
+  const actions = new Map(); // actionId -> { actionId, status, updatedAt, expiresAt, accountIds }
   const attempts = new Set(); // `${actionId}::${accountId}`
   const untouchable = new Set(["lkg-catalog", "account-directory"]); // proof these are never deleted
-  const add = (actionId, status, ageDays, accountIds) => {
-    actions.set(actionId, { status, updatedAt: iso(ageDays), accountIds });
+  const add = (actionId, status, ageDays, accountIds, expiresDaysAgo = null) => {
+    actions.set(actionId, { actionId, status, updatedAt: iso(ageDays), expiresAt: expiresDaysAgo == null ? null : iso(expiresDaysAgo), accountIds });
     for (const id of accountIds) attempts.add(`${actionId}::${id}`);
   };
   return {
     actions, attempts, untouchable, add,
     listOldActions: ({ cutoffIso }) => Promise.resolve(
-      [...actions.entries()].filter(([, a]) => a.updatedAt < cutoffIso).map(([actionId, a]) => ({ actionId, status: a.status, updatedAt: a.updatedAt, accountIds: a.accountIds }))
+      [...actions.values()].filter((a) => a.updatedAt < cutoffIso).map((a) => ({ actionId: a.actionId, status: a.status, updatedAt: a.updatedAt, accountIds: a.accountIds }))
     ),
-    deleteManifest: (actionId) => { actions.delete(actionId); return Promise.resolve(); },
-    deleteAttempt: (accountId, actionId) => { attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(); },
+    loadManifest: (actionId) => Promise.resolve(actions.has(actionId) ? JSON.parse(JSON.stringify(actions.get(actionId))) : null),
+    saveManifest: (actionId, m) => { actions.set(actionId, JSON.parse(JSON.stringify(m))); return Promise.resolve(); },
+    deleteManifest: (actionId) => { actions.delete(actionId); return Promise.resolve(true); },
+    deleteAttempt: (accountId, actionId) => { attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(true); },
   };
 }
 
-await asyncTest("orchestration 14: STATUS-AWARE retention keeps active/in-progress actions + their attempts, prunes only terminal ones, and never touches LKG or account-directory", async () => {
+await asyncTest("orchestration 14: STATUS-AWARE retention deletes only terminal actions (attempts-then-manifest); active in-progress survives; LKG + account-directory untouched", async () => {
   const NOW = Date.parse("2026-08-12T00:00:00.000Z");
   const m = makeRetentionModel(NOW);
-  m.add("INPROGRESS_OLD", "in-progress", 10, ["A1"]);        // old (>7d) but active + within 30d abandon -> SURVIVES
-  m.add("COMPLETE_OLD", "complete", 10, ["A2"]);              // old terminal -> DELETED (manifest + attempt)
+  m.add("INPROGRESS_OLD", "in-progress", 10, ["A1"], -5);     // old but expiresAt in the future -> SURVIVES in-progress
+  m.add("COMPLETE_OLD", "complete", 10, ["A2"]);              // old terminal -> DELETED (attempt then manifest)
   m.add("OPFAIL_OLD", "operational-failure", 10, ["A3"]);     // old terminal -> DELETED
   m.add("EXPIRED_OLD", "expired", 10, ["A4"]);                // old terminal -> DELETED
   m.add("COMPLETE_RECENT", "complete", 1, ["A5"]);            // recent (<7d) -> SURVIVES (not even listed)
-  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A6"]);   // beyond 30d abandon window -> DELETED
   await pruneBrandCatalogActionRecords({ ...m, nowMs: () => NOW });
-  assert.deepEqual([...m.actions.keys()].sort(), ["COMPLETE_RECENT", "INPROGRESS_OLD"], "old in-progress + recent complete survive; old terminal + abandoned are pruned");
+  assert.deepEqual([...m.actions.keys()].sort(), ["COMPLETE_RECENT", "INPROGRESS_OLD"], "old in-progress + recent complete survive; old terminal are pruned");
   assert.ok(m.attempts.has("INPROGRESS_OLD::A1"), "an old attempting row belonging to an active action survives");
-  for (const gone of ["COMPLETE_OLD::A2", "OPFAIL_OLD::A3", "EXPIRED_OLD::A4", "INPROGRESS_ABANDONED::A6"]) assert.ok(!m.attempts.has(gone), `${gone} attempt pruned with its terminal action`);
+  for (const gone of ["COMPLETE_OLD::A2", "OPFAIL_OLD::A3", "EXPIRED_OLD::A4"]) assert.ok(!m.attempts.has(gone), `${gone} attempt pruned with its terminal action`);
   assert.ok(m.attempts.has("COMPLETE_RECENT::A5"), "a recent action's attempt survives");
   assert.deepEqual([...m.untouchable].sort(), ["account-directory", "lkg-catalog"], "LKG catalog and account-directory snapshots are never touched by retention");
 });
 
-await asyncTest("orchestration 14b: retention is best-effort -- a cleanup failure never throws (cannot fail a refresh)", async () => {
+await asyncTest("orchestration 14b: retention is best-effort -- a list or delete failure never throws (cannot fail a refresh)", async () => {
   const NOW = Date.parse("2026-08-12T00:00:00.000Z");
   await pruneBrandCatalogActionRecords({ listOldActions: () => Promise.reject(new Error("list failed")), nowMs: () => NOW });
   const m = makeRetentionModel(NOW);
   m.add("COMPLETE_OLD", "complete", 10, ["A2"]);
   await pruneBrandCatalogActionRecords({ ...m, deleteManifest: () => Promise.reject(new Error("delete failed")), nowMs: () => NOW });
   assert.ok(true, "no cleanup failure propagated");
+});
+
+/* =============== Retention integrity (PROBLEM 1 + PROBLEM 2) =============== */
+
+await asyncTest("retention 1: an attempt-deletion FAILURE leaves the manifest AND every attempt row; a later successful pass deletes attempts then the manifest", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("COMPLETE_OLD", "complete", 10, ["A1", "A2"]);
+  let failA1 = true;
+  const order = [];
+  const deleteAttempt = (accountId, actionId) => { if (accountId === "A1" && failA1) return Promise.reject(new Error("attempt delete failed")); order.push(`A:${accountId}`); m.attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(true); };
+  const deleteManifest = (actionId) => { order.push("M"); m.actions.delete(actionId); return Promise.resolve(true); };
+  await pruneBrandCatalogActionRecords({ ...m, deleteAttempt, deleteManifest, nowMs: () => NOW });
+  assert.ok(m.actions.has("COMPLETE_OLD"), "the manifest survives while an attempt delete is failing");
+  assert.ok(m.attempts.has("COMPLETE_OLD::A1") && m.attempts.has("COMPLETE_OLD::A2"), "no attempt row was orphaned or lost");
+  assert.deepEqual(order, [], "the manifest was NOT deleted (attempts not all confirmed)");
+  // Next pass, storage healthy: attempts deleted first, then the manifest.
+  failA1 = false;
+  await pruneBrandCatalogActionRecords({ ...m, deleteAttempt, deleteManifest, nowMs: () => NOW });
+  assert.ok(!m.actions.has("COMPLETE_OLD"), "the next pass deletes the manifest");
+  assert.ok(!m.attempts.has("COMPLETE_OLD::A1") && !m.attempts.has("COMPLETE_OLD::A2"), "attempts deleted");
+  assert.deepEqual(order, ["A:A1", "A:A2", "M"], "ordering is attempts-first, manifest-last");
+});
+
+await asyncTest("retention 2: a manifest-deletion FAILURE leaves the manifest (attempts may already be gone); a later pass completes cleanup idempotently", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("COMPLETE_OLD", "complete", 10, ["A1"]);
+  let failManifest = true;
+  const deleteManifest = (actionId) => { if (failManifest) return Promise.reject(new Error("manifest delete failed")); m.actions.delete(actionId); return Promise.resolve(true); };
+  await pruneBrandCatalogActionRecords({ ...m, deleteManifest, nowMs: () => NOW });
+  assert.ok(!m.attempts.has("COMPLETE_OLD::A1"), "the attempt row was already deleted (attempts precede the manifest)");
+  assert.ok(m.actions.has("COMPLETE_OLD"), "the manifest survives a failed delete and is retried");
+  // Next pass: the missing attempt row is an idempotent success; the manifest is deleted.
+  failManifest = false;
+  await pruneBrandCatalogActionRecords({ ...m, deleteManifest, nowMs: () => NOW });
+  assert.ok(!m.actions.has("COMPLETE_OLD"), "the next pass completes cleanup idempotently");
+});
+
+await asyncTest("retention 3: an OLD in-progress action past expiresAt is transitioned to 'expired' (not directly deleted); attempts remain until terminal expiry is confirmed", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A1"], 10); // updatedAt 40d, expiresAt 10d ago (passed)
+  const order = [];
+  const deleteManifest = (actionId) => { order.push(`M:${actionId}`); m.actions.delete(actionId); return Promise.resolve(true); };
+  const deleteAttempt = (accountId, actionId) => { order.push(`A:${actionId}:${accountId}`); m.attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(true); };
+  await pruneBrandCatalogActionRecords({ ...m, deleteManifest, deleteAttempt, nowMs: () => NOW });
+  assert.equal(m.actions.get("INPROGRESS_ABANDONED").status, "expired", "the first pass durably persists the terminal 'expired' state");
+  assert.deepEqual(order, [], "the in-progress action was NOT directly deleted");
+  assert.ok(m.attempts.has("INPROGRESS_ABANDONED::A1"), "its attempts remain until the persisted terminal state is observed by a later pass");
+});
+
+await asyncTest("retention 4: an expiry-transition FAILURE preserves the in-progress manifest and all its attempts; the refresh is not failed", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A1", "A2"], 10);
+  const saveManifest = () => Promise.reject(new Error("expiry write failed"));
+  await pruneBrandCatalogActionRecords({ ...m, saveManifest, nowMs: () => NOW });
+  assert.equal(m.actions.get("INPROGRESS_ABANDONED").status, "in-progress", "the action remains in-progress when the expiry write fails");
+  assert.ok(m.attempts.has("INPROGRESS_ABANDONED::A1") && m.attempts.has("INPROGRESS_ABANDONED::A2"), "all attempt rows survive for retry");
+});
+
+await asyncTest("retention 5: a CONFIRMED old expired/complete/operational-failure action has its attempts deleted first, then its manifest", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("EXPIRED_OLD", "expired", 10, ["A1", "A2"]);
+  m.add("COMPLETE_OLD", "complete", 10, ["A3"]);
+  m.add("OPFAIL_OLD", "operational-failure", 10, ["A4"]);
+  const order = [];
+  const deleteAttempt = (accountId, actionId) => { order.push(`A:${actionId}:${accountId}`); m.attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(true); };
+  const deleteManifest = (actionId) => { order.push(`M:${actionId}`); m.actions.delete(actionId); return Promise.resolve(true); };
+  await pruneBrandCatalogActionRecords({ ...m, deleteAttempt, deleteManifest, nowMs: () => NOW });
+  assert.equal(m.actions.size, 0, "all three terminal actions are deleted");
+  assert.equal(m.attempts.size, 0, "all their attempts are deleted");
+  for (const [actionId, accounts] of [["EXPIRED_OLD", ["A1", "A2"]], ["COMPLETE_OLD", ["A3"]], ["OPFAIL_OLD", ["A4"]]]) {
+    const mIdx = order.indexOf(`M:${actionId}`);
+    for (const a of accounts) assert.ok(order.indexOf(`A:${actionId}:${a}`) < mIdx, `${actionId}: attempt ${a} deleted before the manifest`);
+  }
+});
+
+await asyncTest("retention 6: recent in-progress and recent terminal rows survive their retention windows", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("INPROGRESS_RECENT", "in-progress", 1, ["A1"], -5); // recent + expiresAt in the future
+  m.add("COMPLETE_RECENT", "complete", 1, ["A2"]);
+  await pruneBrandCatalogActionRecords({ ...m, nowMs: () => NOW });
+  assert.ok(m.actions.has("INPROGRESS_RECENT") && m.actions.has("COMPLETE_RECENT"), "recent rows survive");
+  assert.ok(m.attempts.has("INPROGRESS_RECENT::A1") && m.attempts.has("COMPLETE_RECENT::A2"), "their attempts survive");
+});
+
+await asyncTest("retention: the expiry re-read guard skips an action that was updated (e.g. continued) since it was listed", async () => {
+  const NOW = Date.parse("2026-08-12T00:00:00.000Z");
+  const m = makeRetentionModel(NOW);
+  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A1"], 10);
+  // Simulate a concurrent continuation: the fresh read shows a different (newer) updatedAt.
+  const loadManifest = () => Promise.resolve({ actionId: "INPROGRESS_ABANDONED", status: "in-progress", updatedAt: new Date(NOW).toISOString(), expiresAt: new Date(NOW - 10 * 86_400_000).toISOString(), accountIds: ["A1"] });
+  let expired = false;
+  const saveManifest = () => { expired = true; return Promise.resolve(); };
+  await pruneBrandCatalogActionRecords({ ...m, loadManifest, saveManifest, nowMs: () => NOW });
+  assert.equal(expired, false, "a recently-updated action is not clobbered by the expiry transition");
 });
 
 await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
