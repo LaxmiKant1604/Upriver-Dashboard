@@ -6548,3 +6548,56 @@ changed. Remaining LIVE gate: the `20260810_ads_sync_coverage` + `20260811` owne
 UNAPPLIED, so production coverage reads `schema-missing` and PPC stays fail-closed unavailable until
 they are applied AND the worker records successful windows -- the intended gated rollout. Nothing
 pushed/merged/deployed/unlocked/scheduled. Listing Optimizer NOT started.
+
+## Scheduler v2: PPC correction re-review blockers (Codex, 2026-08-12)
+
+Re-reviewed correction commits `5c50e30`, `1343fa2`, `ec43edf`, and `3ef5b6b`
+from review base `9070c97`. The two original reproductions are fixed: a successful
+empty row read with no durable coverage now plans zero source jobs/exports and
+preserves LKG, while every persisted Ads row is selected with and validated against
+the authoritative public `account_id`. Primary-only/dormant-secondary isolation,
+validated-empty behavior, strict caps, catalog dedup, request identity, and TACoS
+degradation remain green. PPC is nevertheless **not approved yet** because two
+coverage-contract integration blockers remain.
+
+1. **The derivation adapter does not enforce the durable coverage contract.** The
+   loader returns `sourceCoverage`, but the `ppc-performance` adapter accepts any
+   injected `context.ppcAds` carrying only `status:"ok"`, `adsRows:[]`, and
+   `syncStates:[]`; it never requires or validates `sourceCoverage`. The report
+   worker's derived-context loader is an injected orchestration boundary, so a wrong
+   loader/future wiring can bypass the new gate and save an unproven empty snapshot.
+   Existing direct tests construct exactly this coverage-free `okAds` object and
+   derive successfully. Make coverage validation a shared pure typed contract and
+   enforce it again inside the adapter before folding/saving: exactly the four known
+   source keys, no duplicates/unknowns, required flags matching the registry,
+   campaign+ASIN `proven:true` and `folded:true`, and optional `folded` iff `proven`.
+   Missing/malformed/contradictory evidence must return typed unavailable/invalid,
+   write nothing, and preserve LKG. Also make `evaluateSourceCoverage` genuinely
+   fail-closed: it currently treats a coverage object with a missing `read` field as
+   `read:"ok"`, and `coverageProvesWindow` silently ignores a malformed window when
+   another valid window covers the range. Independent reproduction returns
+   `proven:true` for `{windows:[{from,to}]}` with no `read`, and true for
+   `[malformedWindow, fullValidWindow]`. Require an explicit supported read status,
+   a real windows array, and every supplied window to be structurally valid.
+
+2. **Optional-source coverage is not propagated into the saved payload.** The loader
+   correctly drops stale/unproven targeting/search rows and records that fact only in
+   `ppcAds.sourceCoverage`; the adapter passes only `adsRows` and `syncStates` to
+   `ppcPerformancePayload`, whose `sourceAvailability` is built solely from row counts
+   plus `ads_sync_state`. Therefore an optional source with stale/incomplete coverage
+   but a previously succeeded sync state is saved/displayed as succeeded with zero
+   rows, not as unavailable, contradicting the correction's documented state table.
+   Thread the validated coverage outcome into each `sourceAvailability` row using
+   admin-safe typed fields/reasons, while preserving the fully-covered route-parity
+   payload calculations. Add an end-to-end snapshot assertion, not only a loader
+   assertion, proving stale optional search/targeting is explicitly unavailable and
+   its rows remain absent.
+
+Independent verification from the checked-out worktree: direct PPC **35**, report
+derivation **393**, sync engine **79**, report contracts **161**, source identity
+**7**, and full `npm run verify` **792 assertions** plus the 2,394-module build all
+exit 0 naturally; `git diff --check` clean. These are missing-contract tests, not a
+general suite regression. Keep PPC SHADOW ONLY + locked; do not start Listing
+Optimizer, change the live route/source contracts/request identity/Scheduler v1/UI,
+apply either migration, push, merge, deploy, enable, or schedule. Leave untracked
+`HANDOFF.md` untouched.
