@@ -413,37 +413,77 @@ async function defaultListOldCatalogActions({ cutoffIso }) {
       ...(Array.isArray(payload.remaining) ? payload.remaining : []),
       ...(payload.current ? [payload.current] : []),
     ];
-    return { actionId: payload.actionId || row.params?.actionId || null, status: payload.status || null, updatedAt: row.updated_at || null, accountIds: [...new Set(accountIds.map(String))] };
+    return {
+      actionId: payload.actionId || row.params?.actionId || null,
+      status: payload.status || null,
+      // The PAYLOAD updatedAt is the field we control on every transition; use it (not the
+      // storage column) for the race guard so a re-read compares like-for-like.
+      updatedAt: payload.updatedAt || row.updated_at || null,
+      accountIds: [...new Set(accountIds.map(String))],
+    };
   });
 }
 
-// STATUS-AWARE, BEST-EFFORT retention. Enumerates OLD action manifests and prunes only the
-// TERMINAL ones (complete / operational-failure / expired) together with their attempt rows,
-// via EXACT-ROW deletes. An in-progress action ALWAYS survives (never age-deleted); its
-// attempt rows are never deleted while it lives. brand-catalog LKG and account-directory
-// snapshots use different report keys and are NEVER touched. Must never fail a refresh.
+// STATUS-AWARE, BEST-EFFORT retention with ACCURATE deletion accounting.
+//
+// TERMINAL action (complete / operational-failure / expired), old enough:
+//   - delete EVERY attempt row first, positively confirming each deletion;
+//   - delete the manifest ONLY after all attempt deletions succeeded (attempts-then-manifest);
+//   - if ANY attempt deletion fails: leave the manifest AND the remaining attempts, stop this
+//     action, and let the next pass retry. A missing row is an idempotent success.
+// IN-PROGRESS action, past its expiresAt (abandoned):
+//   - NEVER directly deleted. Re-read its exact manifest, verify it is STILL in-progress and
+//     still expired (guarding against racing a concurrent continuation), then durably transition
+//     it to the terminal "expired" state. Its attempts + manifest are pruned only on a LATER pass
+//     (once the persisted "expired" state is observed). If the expiry write fails, the in-progress
+//     manifest and all its attempts are preserved for retry.
+// brand-catalog LKG and account-directory rows use different report keys and are NEVER touched.
+// Must never fail a refresh.
 export async function pruneBrandCatalogActionRecords(deps = {}) {
   const listOldActions = deps.listOldActions || defaultListOldCatalogActions;
+  const loadManifest = deps.loadManifest || defaultLoadCatalogActionManifest;
+  const saveManifest = deps.saveManifest || defaultSaveCatalogActionManifest;
   const deleteManifest = deps.deleteManifest || ((actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ACTION_KEY, accountId: BRAND_CATALOG_ACTION_ACCOUNT, paramsHash: catalogActionHash(actionId) }));
   const deleteAttempt = deps.deleteAttempt || ((accountId, actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ATTEMPT_KEY, accountId, paramsHash: catalogAttemptHash(accountId, actionId) }));
   const nowMs = typeof deps.nowMs === "function" ? deps.nowMs() : Date.now();
+  const nowIso = deps.now || (() => new Date().toISOString());
   const cutoffIso = new Date(nowMs - BRAND_CATALOG_ACTION_RETENTION_DAYS * 86_400_000).toISOString();
+
+  // A deletion/transition is CONFIRMED only when it resolves truthy (an explicit `false` or a
+  // throw both count as failure). This is the best-effort boundary; the primitive itself reports
+  // accurately and never swallows its own failure.
+  const confirmed = async (fn) => { try { return (await fn()) !== false; } catch { return false; } };
 
   let oldActions;
   try { oldActions = await listOldActions({ cutoffIso }); } catch { return; } // best-effort
   for (const action of oldActions || []) {
-    // A terminal action (or an abandoned in-progress action past the far ABANDON window) is
-    // pruned; an active/in-progress action within the abandon window ALWAYS survives.
-    const abandoned = action.status === "in-progress"
-      && action.updatedAt && Date.parse(action.updatedAt) < nowMs - BRAND_CATALOG_ACTION_ABANDON_DAYS * 86_400_000;
-    if (!TERMINAL_CATALOG_ACTION_STATES.has(action.status) && !abandoned) continue;
     if (!action.actionId) continue;
-    // Delete the attempt rows FIRST, then the manifest -- attempts are only ever removed
-    // together with a confirmed terminal/expired/abandoned action.
-    for (const accountId of action.accountIds || []) {
-      await Promise.resolve(deleteAttempt(accountId, action.actionId)).catch(() => {});
+
+    if (TERMINAL_CATALOG_ACTION_STATES.has(action.status)) {
+      // Attempts first, each positively confirmed; the manifest is deleted LAST and only if all
+      // attempt deletions succeeded, so a failed attempt delete can never orphan its rows.
+      let allAttemptsDeleted = true;
+      for (const accountId of action.accountIds || []) {
+        if (!(await confirmed(() => deleteAttempt(accountId, action.actionId)))) { allAttemptsDeleted = false; break; }
+      }
+      if (!allAttemptsDeleted) continue; // keep the manifest; the next pass retries idempotently
+      await confirmed(() => deleteManifest(action.actionId)); // if this fails, the next pass retries
+      continue;
     }
-    await Promise.resolve(deleteManifest(action.actionId)).catch(() => {});
+
+    // An OLD in-progress action is NEVER directly deleted. Past its expiresAt it is first durably
+    // transitioned to terminal "expired"; a later pass prunes it as terminal.
+    if (action.status !== "in-progress") continue;
+    let current;
+    try { current = await loadManifest(action.actionId); } catch { continue; } // best-effort
+    // Re-verify EXACT identity + state so a recently-updated (e.g. just-continued) action is not
+    // clobbered: it must still be in-progress, still expired, and unchanged since we listed it.
+    if (!current || current.status !== "in-progress") continue;
+    if (!(current.expiresAt && Date.parse(current.expiresAt) < nowMs)) continue;
+    if (current.updatedAt && action.updatedAt && String(current.updatedAt) !== String(action.updatedAt)) continue;
+    // Durably transition to "expired" and CONFIRM. On failure, the in-progress manifest and all
+    // its attempt rows are preserved untouched for a later retry. No attempts are deleted here.
+    await confirmed(() => saveManifest(action.actionId, { ...current, status: "expired", updatedAt: nowIso() }));
   }
 }
 
