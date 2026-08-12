@@ -14,15 +14,16 @@
    export.
 
    WHAT MAY CALL A SOURCE
-     Nothing here. Reads are shared Supabase snapshots. Refresh re-aggregates
-     this brand's accounts from snapshots that already exist, under a cross-user
-     lock, and saves one shared result for everyone.                          */
+     Reads and the normal Refresh action use shared Supabase snapshots only.
+     A separate temporary, admin-only action may refresh the mapped account
+     snapshots from DataDoe before rebuilding this shared Brand View.         */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CalendarRange, Coins, DatabaseZap, Inbox, RefreshCw, Tag } from "lucide-react";
 
 import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { fmtRangeLabel } from "../lib/format.js";
+import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
 import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
 import { DASH } from "../lib/brand-view-tables.js";
@@ -37,6 +38,7 @@ const PORTFOLIO_VERSION = "brand-view-portfolio-v1";
 export default function BrandPortfolio({
   brand, accountIds, accountsKnown, loadReport, refreshReport,
   directoryLoading, directoryError, onLoadBrandDirectory,
+  isAdmin = false, sourceAccounts = [],
 }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -46,7 +48,11 @@ export default function BrandPortfolio({
   const [staleScope, setStaleScope] = useState(null);
   const [tables, setTables] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [sourceRefreshing, setSourceRefreshing] = useState(false);
+  const [sourceProgress, setSourceProgress] = useState(null);
+  const [sourceOutcome, setSourceOutcome] = useState(null);
   const refreshGuard = useRef(false);
+  const sourceRefreshGuard = useRef(false);
 
   // A stable, sorted account signature keeps the snapshot key deterministic no
   // matter what order the directory returned the accounts in.
@@ -104,6 +110,8 @@ export default function BrandPortfolio({
     setSavedAt(null);
     setStaleScope(null);
     setTables(null);
+    setSourceProgress(null);
+    setSourceOutcome(null);
     resetRange();
   }, [brand, idsKey, resetRange]);
 
@@ -135,6 +143,77 @@ export default function BrandPortfolio({
       setRefreshing(false);
     }
   }, [applyReport, displayCurrency, refreshReport, reloadFx, reportParams]);
+
+  const sourceAccountPartition = useMemo(
+    () => partitionBrandSourceAccounts(sourceAccounts),
+    [sourceAccounts]
+  );
+
+  const onFetchLatestData = useCallback(async () => {
+    if (!isAdmin || !reportParams || sourceRefreshGuard.current) return;
+    const eligibleCount = sourceAccountPartition.eligible.length;
+    const skippedCount = sourceAccountPartition.skipped.length;
+    if (!eligibleCount) {
+      setSourceOutcome({
+        tone: "warning",
+        title: "No primary DataDoe accounts are ready",
+        detail: skippedCount
+          ? "The mapped accounts still use legacy Secondary DataDoe ids. Reload the account and brand directories after moving them to the primary organization."
+          : "No mapped account is available for this brand.",
+      });
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Fetch latest DataDoe data for ${eligibleCount} mapped account${eligibleCount === 1 ? "" : "s"}?\n\n`
+      + "This temporary admin action runs accounts sequentially with no automatic retry. "
+      + "Brand Sales can use up to two DataDoe exports per account. Existing saved data is preserved when an account fails."
+    );
+    if (!confirmed) return;
+
+    sourceRefreshGuard.current = true;
+    setSourceRefreshing(true);
+    setSourceOutcome(null);
+    setError(null);
+    try {
+      const outcome = await refreshBrandSourceAccounts({
+        accounts: sourceAccounts,
+        refreshReport,
+        todayForCountry: marketplaceToday,
+        onProgress: setSourceProgress,
+      });
+
+      if (outcome.succeeded.length) {
+        const { body, cachedAt } = await refreshReport(reportParams);
+        applyReport(body, cachedAt);
+        if (isConvertedMode(displayCurrency)) await reloadFx();
+      }
+
+      const failedNames = outcome.failed.map(({ account }) => account.name || account.id);
+      const details = [
+        `${outcome.succeeded.length} of ${outcome.attempted} primary account${outcome.attempted === 1 ? "" : "s"} refreshed.`,
+      ];
+      if (failedNames.length) details.push(`Failed: ${failedNames.join(", ")}. Previous saved data was preserved.`);
+      if (outcome.skipped.length) {
+        details.push(`${outcome.skipped.length} legacy Secondary DataDoe mapping${outcome.skipped.length === 1 ? " was" : "s were"} skipped.`);
+      }
+      setSourceOutcome({
+        tone: failedNames.length || outcome.skipped.length ? "warning" : "success",
+        title: failedNames.length || outcome.skipped.length ? "Latest data fetched with exceptions" : "Latest data fetched",
+        detail: details.join(" "),
+      });
+    } catch {
+      setSourceOutcome({
+        tone: "warning",
+        title: "Latest data could not be fetched",
+        detail: "The refresh sequence stopped before completion. Existing saved snapshots were preserved.",
+      });
+    } finally {
+      sourceRefreshGuard.current = false;
+      setSourceRefreshing(false);
+      setSourceProgress(null);
+    }
+  }, [applyReport, displayCurrency, isAdmin, refreshReport, reloadFx, reportParams, sourceAccountPartition, sourceAccounts]);
 
   /* ------------------------------- exports ------------------------------ */
   const converted = isConvertedMode(displayCurrency);
@@ -181,7 +260,7 @@ export default function BrandPortfolio({
           <div className="page-title">Brand View</div>
           <div className="page-sub">
             {brand
-              ? `${brand} across every account and marketplace that sells it. Reads shared saved data only — Refresh rebuilds this brand from snapshots that already exist and never starts a new source export.`
+              ? `${brand} across every account and marketplace that sells it. Refresh rebuilds from saved data; admins can temporarily fetch latest account data from DataDoe.`
               : "Choose a brand in the header to compare it across every account and marketplace that sells it."}
           </div>
         </div>
@@ -218,11 +297,23 @@ export default function BrandPortfolio({
           hint="Original keeps every marketplace in its own currency and never sums across currencies."
         />
         <div className="bv-actions">
+          {isAdmin && (
+            <button
+              type="button"
+              className="plan-export-btn"
+              onClick={onFetchLatestData}
+              disabled={!reportParams || sourceRefreshing || refreshing}
+              title="Temporary admin action: refresh the mapped primary accounts from DataDoe, then rebuild this Brand View from their saved snapshots."
+            >
+              <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
+              Fetch latest data
+            </button>
+          )}
           <button
             type="button"
             className="plan-export-btn"
             onClick={onRefresh}
-            disabled={!reportParams || refreshing}
+            disabled={!reportParams || refreshing || sourceRefreshing}
             title={reportParams
               ? "Rebuild this brand across its mapped accounts from the shared saved snapshots. No new source export is created."
               : "Choose a brand first"}
@@ -245,6 +336,14 @@ export default function BrandPortfolio({
       )}
 
       {directoryError && <DataQualityAlert tone="warning" title="Some portfolio brands could not be loaded" detail={directoryError} />}
+      {sourceProgress && (
+        <DataQualityAlert
+          tone="info"
+          title={`Fetching latest account data (${Math.min(sourceProgress.completed + 1, sourceProgress.total)} of ${sourceProgress.total})`}
+          detail={sourceProgress.account?.name || sourceProgress.account?.id || "Saving refreshed account snapshots"}
+        />
+      )}
+      {sourceOutcome && <DataQualityAlert tone={sourceOutcome.tone} title={sourceOutcome.title} detail={sourceOutcome.detail} />}
       {staleScope && (
         <DataQualityAlert
           tone="info"
@@ -290,14 +389,22 @@ export default function BrandPortfolio({
             icon={<Inbox size={19} aria-hidden="true" />}
             title="No saved Brand View for this brand yet"
             actions={(
-              <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={refreshing}>
-                <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-                Build from saved data
-              </button>
+              <>
+                {isAdmin && (
+                  <button className="plan-export-btn" type="button" onClick={onFetchLatestData} disabled={sourceRefreshing || refreshing}>
+                    <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
+                    Fetch latest data
+                  </button>
+                )}
+                <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={refreshing || sourceRefreshing}>
+                  <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
+                  Build from saved data
+                </button>
+              </>
             )}
           >
-            {notice} This build reads only snapshots that already exist for the accounts mapped to this brand, so it does
-            not create a new source export.
+            {notice} Build from saved data creates no source export. The temporary admin action fetches each mapped primary
+            account sequentially, then rebuilds this shared Brand View.
           </EmptyState>
         </div>
       ) : model ? (

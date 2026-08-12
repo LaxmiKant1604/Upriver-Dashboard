@@ -54,6 +54,7 @@ const { fxCacheDecision, fxRatesFromProviderPayload, FX_DISPLAY_CURRENCIES } = a
 const { brandViewCsv, brandViewXlsxSheets, exportFilename, metaLines } = await import("../src/lib/brand-view-export.js");
 const { buildXlsx, crc32, sanitizeCell, safeSheetName, columnLetter } = await import("../src/lib/xlsx.js");
 const { paramsHashFor } = await import("../lib/server/report-store.js");
+const { partitionBrandSourceAccounts, refreshBrandSourceAccounts } = await import("../src/lib/brand-source-refresh.js");
 
 let passed = 0;
 function test(name, fn) {
@@ -81,6 +82,51 @@ async function asyncTest(name, fn) {
 }
 
 console.log("Brand View (account-scoped)");
+
+await asyncTest("temporary Brand View source refresh is primary-only, sequential and never retries", async () => {
+  const accounts = [
+    { id: "A2", name: "US account", country: "US" },
+    { id: "A1", name: "India account", country: "IN" },
+    { id: "A1", name: "duplicate", country: "IN" },
+    { id: "dd-secondary:OLD", name: "Legacy secondary", country: "GB" },
+  ];
+  assert.deepEqual(
+    partitionBrandSourceAccounts(accounts),
+    { eligible: [accounts[0], accounts[1]], skipped: [accounts[3]] }
+  );
+
+  const calls = [];
+  const progress = [];
+  let inFlight = 0;
+  const outcome = await refreshBrandSourceAccounts({
+    accounts,
+    todayForCountry: (country) => (country === "US" ? "2026-08-11" : "2026-08-12"),
+    onProgress: (entry) => progress.push(entry),
+    refreshReport: async (params) => {
+      assert.equal(inFlight, 0, "account refreshes must not overlap");
+      inFlight += 1;
+      calls.push(params);
+      await Promise.resolve();
+      inFlight -= 1;
+      if (params.ids === "A2") throw new Error("safe fake failure");
+      return { body: { ok: true } };
+    },
+  });
+
+  assert.deepEqual(calls.map((call) => call.ids), ["A2", "A1"], "a failed account must not stop the next account");
+  assert.deepEqual(calls[1], {
+    action: "brand-sales",
+    reportVersion: "brand-sales-shared-v1",
+    ids: "A1",
+    from: "2025-06-07",
+    to: "2026-08-12",
+  });
+  assert.equal(outcome.attempted, 2);
+  assert.deepEqual(outcome.succeeded.map((account) => account.id), ["A1"]);
+  assert.deepEqual(outcome.failed.map(({ account }) => account.id), ["A2"]);
+  assert.deepEqual(outcome.skipped.map((account) => account.id), ["dd-secondary:OLD"]);
+  assert.deepEqual(progress.map((entry) => entry.completed), [0, 1, 2]);
+});
 
 /* ================================================================== fixtures */
 

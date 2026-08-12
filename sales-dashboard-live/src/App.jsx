@@ -1378,6 +1378,9 @@ function DashboardApp({ session, access, onSignOut }) {
       ? portfolioAccounts.map((account) => String(account.id))
       : (discoveredBrandAccountIds || [])
   ), [discoveredBrandAccountIds, portfolioAccounts, portfolioMappingKnown]);
+  const portfolioSourceAccounts = useMemo(() => (
+    portfolioAccountIds.map((accountId) => accountById[accountId]).filter(Boolean)
+  ), [accountById, portfolioAccountIds]);
   const portfolioScopeResolved = portfolioMappingKnown || discoveredBrandAccountIds !== null;
 
   useEffect(() => {
@@ -2764,6 +2767,8 @@ function DashboardApp({ session, access, onSignOut }) {
           directoryLoading={brandDirectoryLoading}
           directoryError={brandDirectoryError}
           onLoadBrandDirectory={fetchBrandDirectory}
+          isAdmin={isAdmin}
+          sourceAccounts={portfolioSourceAccounts}
         />
       ) : (
       <div className="container">
