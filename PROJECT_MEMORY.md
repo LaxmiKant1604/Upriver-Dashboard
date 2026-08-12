@@ -6508,3 +6508,43 @@ worker/LKG regressions for both blockers, then rerun every standard suite natura
 Do not start Listing Optimizer, alter the live route/folds/source contracts/request
 identity, apply migrations, unlock PPC, schedule, push, merge, or deploy in the
 correction pass. `HANDOFF.md` remains untracked and untouched.
+
+## Scheduler v2: PPC Performance review blockers CLOSED (correction pass, 2026-08-12)
+
+Fixed ONLY the two §52 PPC blockers from base `9070c97`; SCHEDULER_V2.md §53 records the
+details. PPC stays SHADOW ONLY + locked (live route, `ppc.js` builder, source contracts,
+`source-identity.js`, Scheduler v1, frontend all unchanged; migrations unapplied; `HANDOFF.md`
+untracked/untouched). Commits: `5c50e30` (supabase SELECT), `1343fa2` (loader + cycle),
+`ec43edf` (regressions), + this docs commit.
+
+1. **Unseeded Ads no longer become a validated EMPTY window.** `loadPersistedPpcAds` now gates
+   Ads validity on the DURABLE successful `ads_sync_coverage` windows via an INJECTED
+   `getAdsSyncCoverage(accountId, sourceKey)` reader (production = `getDailyAdsCoverage`), NEVER on
+   metric-row min/max or `latest_metric_date`. New pure helpers `coverageProvesWindow` (merge
+   successful windows; reject gaps/partial) + `evaluateSourceCoverage` (schema-missing/read-failed/
+   incomplete => not proven). The two DEFAULT datasets (`campaign-performance-v1`,
+   `asin-performance-v1`) must prove COMPLETE `[asOf-29d, asOf]` coverage before Ads validate;
+   otherwise typed `unavailable` => plan nothing, zero DataDoe exports, no snapshot, LKG preserved
+   (the exact successful-empty/no-state case the old test ignored is now covered). A fully-covered
+   default with ZERO rows stays a genuine validated-empty window. OPTIONAL targeting/search fold
+   ONLY when THEY are fully covered; an unproven/stale optional is shown unavailable in a new typed
+   `sourceCoverage` state table and its rows are NEVER folded as current. `ppcPerformancePayload`
+   output shape is byte-unchanged (route parity intact).
+
+2. **Row-level Ads account isolation.** `getAdsDailySourceRows` now SELECTs `account_id`;
+   `validatePpcAdsRows` takes the authoritative PUBLIC `accountId` and requires every
+   `row.account_id` to equal it -- missing (`ads-row-account-missing`) or mismatched
+   (`ads-row-account-mismatch`) fails the whole load closed BEFORE currency gating/folding.
+   Primary-only routing + dormant `dd-secondary:` public-id namespacing remain isolated (a
+   dd-secondary row never validates under the primary account, and vice-versa).
+
+Verification (all natural, exit 0): `node --check` on all changed files; `report-ppc-performance`
+**35 cases** (rewritten #26 unseeded + new #32 validated-empty, #33 partial/gapped/stale/schema-
+missing/read-failed/missing coverage, #34 optional state table, #35 cross-/missing-account, #36
+dd-secondary namespacing); `test:report-derivation` **393**; `test:sync-engine`,
+`test:report-contracts` (161), `test:source-identity` (7) green; `npm run verify` = exit 0
+(terminated naturally) + `build:check` 2,394 modules; `git diff --check` clean; only intended files
+changed. Remaining LIVE gate: the `20260810_ads_sync_coverage` + `20260811` owner migrations are
+UNAPPLIED, so production coverage reads `schema-missing` and PPC stays fail-closed unavailable until
+they are applied AND the worker records successful windows -- the intended gated rollout. Nothing
+pushed/merged/deployed/unlocked/scheduled. Listing Optimizer NOT started.

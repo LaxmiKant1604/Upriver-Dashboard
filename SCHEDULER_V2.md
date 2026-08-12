@@ -3207,3 +3207,81 @@ window + finite metrics, but their FRESHNESS (whether the scheduled worker's las
 whole window) is surfaced only via each source's `sync` (ads_sync_state) + row count in `sourceAvailability`
 -- the derive does not itself gate on staleness. A live confirmation of the worker's sync cadence vs the
 30-day window is worth doing when PPC is eventually unlocked.
+
+## 53. PPC Performance: persisted-Ads review blockers CLOSED -- durable-coverage gate + row-level account isolation (SHADOW MODE, 2026-08-12)
+
+Correction pass for the two §52 review blockers (PROJECT_MEMORY "PPC Performance review blockers", Codex
+2026-08-12). PPC stays SHADOW ONLY + locked: `api/datadoe.js` live route + `lib/server/reports/ppc.js`
+builder byte-unchanged, source CONTRACTS + `source-identity.js` unchanged, Scheduler v1 + frontend untouched,
+migrations NOT applied, `HANDOFF.md` untracked/untouched. The §52 freshness note above is now the design: the
+derive gates Ads validity on durable coverage (below), not on row min/max.
+
+### 53.1 Blocker 1 -- unseeded Ads no longer become a validated EMPTY window (durable-coverage gate)
+
+The earlier `loadPersistedPpcAds` filtered `ads_sync_state` but never validated durable coverage. A successful
+empty read (`adsRows []`, `syncStates []`) returned `status:"ok"`; `ppcAdsCurrencySignalOf` turned it into
+`{status:"success", validated:true, currencyCount:0}`; and `planPpcPerformance` emitted BOTH
+`ppc-performance:total-sales` and `ppc-performance:catalog` -- spending DataDoe tokens for an account with no
+proven Ads. Fixed by gating on the DURABLE successful `ads_sync_coverage` windows (never metric-row min/max or
+`latest_metric_date`, because a covered zero-activity day has no row):
+
+- `ppc-ads-loader.js` gained an INJECTED `getAdsSyncCoverage(accountId, sourceKey)` reader (production wiring
+  will pass `getDailyAdsCoverage`, which already returns `{ windows, status, latestMetricDate, read }` and
+  degrades an unmigrated table to `read:"schema-missing"`). All coverage I/O stays injected.
+- New PURE helpers: `coverageProvesWindow(windows, from, to)` merges overlapping/adjacent successful windows
+  and returns true ONLY when they fully span `[asOf-29d, asOf]` with no interior gap (malformed windows
+  ignored, fail-closed); `evaluateSourceCoverage(state, from, to)` returns `{proven,reason}` -- schema-missing
+  / read-failed / incomplete => NOT proven.
+- Policy (both DEFAULT datasets REQUIRED, both extras OPTIONAL):
+
+  | source | role | not fully covered => |
+  | --- | --- | --- |
+  | `campaign-performance-v1` (defaultDataset) | REQUIRED | whole Ads context UNAVAILABLE |
+  | `asin-performance-v1` (defaultDataset) | REQUIRED | whole Ads context UNAVAILABLE |
+  | `keyword-targeting-performance-v1` | OPTIONAL | rows DROPPED (never folded); shown unavailable |
+  | `search-terms-performance-v1` | OPTIONAL | rows DROPPED (never folded); shown unavailable |
+
+- Ads-context outcome table (persisted, per account):
+
+  | persisted Ads context | loader status | plan | notes |
+  | --- | --- | --- | --- |
+  | both defaults fully covered, rows present | ok | catalog (+ gated total-sales) | full payload |
+  | both defaults fully covered, ZERO rows | ok | catalog (+ gated total-sales) | genuine VALIDATED EMPTY; `latestMetricDate` null |
+  | a default missing/partial/gapped/stale coverage | unavailable | NOTHING | zero tokens; LKG preserved |
+  | coverage table missing (schema-missing) | unavailable | NOTHING | pre-rollout fail-closed |
+  | coverage read failed | unavailable | NOTHING | fail-closed |
+  | read failed / unseeded / row cap (>120k) / invalid row | unavailable | NOTHING | LKG preserved |
+
+  A typed unavailable yields an unvalidated currency signal, plans zero source jobs, makes zero DataDoe
+  exports, writes no report snapshot, and preserves last-known-good -- unchanged from §52, now REACHED for the
+  unseeded/uncovered case. The loader also returns a typed `sourceCoverage` state table
+  (`{sourceKey, required, proven, reason, folded}`) so the optional-source policy is explicit + testable; the
+  `ppcPerformancePayload` shape is byte-unchanged (route parity intact).
+
+### 53.2 Blocker 2 -- row-level Ads account isolation (fail closed before folding)
+
+Production `getAdsDailySourceRows` now SELECTs `account_id` (it was filtered but not returned).
+`validatePpcAdsRows` takes the authoritative PUBLIC `accountId` and requires EVERY `row.account_id` to equal
+it; a missing (`ads-row-account-missing`) or mismatched (`ads-row-account-mismatch`) id fails the whole load
+closed BEFORE currency gating or folding -- an injected/mis-scoped reader can no longer leak another account's
+Ads into A1. `loadPersistedPpcAds` passes the recomputed public `acct` through. Primary-only routing + dormant
+`dd-secondary:` public-id namespacing remain intact (a dd-secondary row never validates under the primary
+account and vice-versa).
+
+### 53.3 Verification (all natural, exit 0)
+
+`node --check` on every changed JS/test file (0). `report-ppc-performance.test.js` **35 cases** (was 31/30
+entries): rewritten #26 (unseeded successful-empty + no-coverage => unavailable/zero-tokens/LKG) and new
+#32 validated-empty, #33 partial/gapped/stale/schema-missing/read-failed/missing required coverage, #34
+optional targeting/search state table (unproven optional rows never folded), #35 cross-account + missing-
+account rows => unavailable/zero-writes/LKG through the real cycle + `runReportJobs`, #36 dd-secondary public-
+id namespacing. `npm run test:report-derivation` **393** (66+30+33+20+34+24+12+27+40+35+37+**35**). Focused
+suites green: `test:sync-engine`, `test:report-contracts` (161), `test:source-identity` (7). `npm run verify`
+= exit 0 (terminated naturally) + `build:check` (2,394 modules). `git diff --check` clean; only the intended
+files changed (+ untracked `HANDOFF.md`). Nothing pushed/merged/deployed/unlocked/scheduled; migrations still
+unapplied; PPC remains SHADOW ONLY + locked.
+
+Remaining live gates (unchanged): the `ads_sync_coverage` (`20260810`) + owner (`20260811`) migrations are
+UNAPPLIED, so in production the coverage read returns `schema-missing` and PPC is fail-closed unavailable until
+they are applied AND the scheduled worker records successful windows -- the intended gated rollout. A live
+confirmation of the worker's sync cadence vs the 30-day window is still worth doing before PPC is unlocked.
