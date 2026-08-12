@@ -732,7 +732,8 @@ function makeManifestStore() {
     manifests,
     loadManifest: (actionId) => Promise.resolve(manifests.has(actionId) ? JSON.parse(JSON.stringify(manifests.get(actionId))) : null),
     saveManifest: (actionId, manifest) => {
-      if (manifest.rev == null) { // create
+      if (manifest.rev == null) { // CREATE = insert-if-absent (never overwrite)
+        if (manifests.has(actionId)) return Promise.resolve(false); // create conflict
         manifests.set(actionId, JSON.parse(JSON.stringify({ ...manifest, rev: 1 })));
         return Promise.resolve(1);
       }
@@ -846,7 +847,7 @@ await asyncTest("orchestration 6: claim refusal (concurrent owner) -> zero expor
   assert.deepEqual(done.remaining, [], "only now is A1 removed from the queue");
 });
 
-await asyncTest("orchestration 6b: two concurrent same-action first clicks create EXACTLY ONE export", async () => {
+await asyncTest("orchestration 6b: two concurrent same-action first clicks create EXACTLY ONE export (one wins the insert-if-absent, the other 409s)", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const { calls, fetchCatalog } = countingFetch();
   const deps = { ...cat, ...man, fetchCatalog };
@@ -855,8 +856,11 @@ await asyncTest("orchestration 6b: two concurrent same-action first clicks creat
     firstClick("ACT1", ["A1"], dir(["A1"]), deps),
   ]);
   assert.equal(calls.n, 1, "two concurrent same-action requests create exactly one DataDoe export");
-  assert.ok([a, b].some((r) => r.disposition === "exported"), "one request won the claim and exported");
-  assert.ok([a, b].some((r) => r.disposition === "in-progress" || r.disposition === "recorded"), "the other did not export");
+  const winners = [a, b].filter((r) => !r.conflict && r.disposition === "exported");
+  const losers = [a, b].filter((r) => r.conflict === true);
+  assert.equal(winners.length, 1, "exactly one request won the create + exported");
+  assert.equal(losers.length, 1, "the other lost the insert-if-absent race with a 409 and never exported");
+  assert.equal(losers[0].code, BRAND_DIRECTORY_ACTION_CONFLICT);
 });
 
 await asyncTest("orchestration 7: attempting-marker write failure -> zero exports, typed operational failure, action NOT reported complete", async () => {
@@ -981,9 +985,9 @@ function makeRetentionModel(NOW) {
       [...actions.values()].filter((a) => a.updatedAt < cutoffIso).map((a) => ({ actionId: a.actionId, status: a.status, updatedAt: a.updatedAt, accountIds: a.accountIds }))
     ),
     loadManifest: (actionId) => Promise.resolve(actions.has(actionId) ? JSON.parse(JSON.stringify(actions.get(actionId))) : null),
-    // Same rev-CAS contract as production/makeManifestStore.
+    // Same rev-CAS + insert-if-absent contract as production/makeManifestStore.
     saveManifest: (actionId, m) => {
-      if (m.rev == null) { actions.set(actionId, JSON.parse(JSON.stringify({ ...m, rev: 1 }))); return Promise.resolve(1); }
+      if (m.rev == null) { if (actions.has(actionId)) return Promise.resolve(false); actions.set(actionId, JSON.parse(JSON.stringify({ ...m, rev: 1 }))); return Promise.resolve(1); }
       const cur = actions.get(actionId);
       if (!cur || cur.rev !== m.rev) return Promise.resolve(false);
       const rev = m.rev + 1;
@@ -1150,6 +1154,111 @@ await asyncTest("P2 race B: after retention EXPIRES first, a stale continuation'
   assert.equal(r.conflict, true, "the stale continuation gets a 409 (its advance CAS lost)");
   assert.equal(man.manifest("ACT1").status, "expired", "the stale continuation did NOT restore in-progress/complete over the expired row");
   assert.equal(calls.n, 0, "one-export-per-request preserved: the already-terminal account is not re-exported");
+});
+
+/* =============== P1 delayed-CREATE race (insert-if-absent) + rev validation =============== */
+
+await asyncTest("P1 delayed create (A completed): B loaded missing, A creates+advances to complete, B resumes create -> loses, no overwrite, no export", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  // A: normal first click -> creates rev 1, exports A1, advances to complete (rev 2, remaining []).
+  const fA = countingFetch();
+  const rA = await firstClick("ACT1", ["A1"], dir(["A1"]), { ...cat, ...man, fetchCatalog: fA.fetchCatalog });
+  assert.equal(rA.status, "complete");
+  assert.equal(fA.calls.n, 1, "A exported exactly once");
+  const revAfterA = man.manifest("ACT1").rev;
+  // B: loaded "missing" earlier and only now resumes its CREATE (insert-if-absent).
+  const fB = countingFetch();
+  const rB = await orchestrateBrandCatalogAction(
+    { actionId: "ACT1", userId: "admin-1", isContinuation: false, authorizedPrimaryIds: ["A1"], directory: dir(["A1"]), connections: ORCH_CONNS },
+    { ...cat, ...man, loadManifest: () => Promise.resolve(null), fetchCatalog: fB.fetchCatalog },
+  );
+  assert.equal(rB.conflict, true, "the delayed creator loses the insert-if-absent race with a 409");
+  assert.equal(rB.code, BRAND_DIRECTORY_ACTION_CONFLICT);
+  assert.equal(fB.calls.n, 0, "the delayed creator creates ZERO exports");
+  assert.equal(man.manifest("ACT1").status, "complete", "the delayed creator did NOT overwrite the completed manifest");
+  assert.equal(man.manifest("ACT1").rev, revAfterA, "rev is unchanged by the losing create");
+});
+
+await asyncTest("P1 delayed create (A stopped): A commits operational-failure, B resumes create -> loses, does NOT reopen it or export", async () => {
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  // A: create rev 1, then the claim persistence fails -> operational-failure (rev 2).
+  const fA = countingFetch();
+  const rA = await firstClick("ACT1", ["A1"], dir(["A1"]), { ...cat, ...man, claimAttempt: () => Promise.reject(new Error("claim persist failed")), fetchCatalog: fA.fetchCatalog });
+  assert.equal(rA.status, "operational-failure");
+  assert.equal(man.manifest("ACT1").status, "operational-failure");
+  assert.equal(fA.calls.n, 0);
+  const revAfterA = man.manifest("ACT1").rev;
+  // B: delayed create loses the insert-if-absent race.
+  const fB = countingFetch();
+  const rB = await orchestrateBrandCatalogAction(
+    { actionId: "ACT1", userId: "admin-1", isContinuation: false, authorizedPrimaryIds: ["A1"], directory: dir(["A1"]), connections: ORCH_CONNS },
+    { ...cat, ...man, loadManifest: () => Promise.resolve(null), fetchCatalog: fB.fetchCatalog },
+  );
+  assert.equal(rB.conflict, true, "the delayed creator loses with a 409");
+  assert.equal(fB.calls.n, 0, "no export");
+  assert.equal(man.manifest("ACT1").status, "operational-failure", "the stopped action is NOT reopened");
+  assert.equal(man.manifest("ACT1").rev, revAfterA, "rev is unchanged");
+});
+
+await asyncTest("P1 rev validation: a loaded manifest with a missing/zero/negative/fractional/string/malformed rev FAILS CLOSED (409) with zero writes and zero exports", async () => {
+  for (const badRev of [undefined, null, 0, -1, 1.5, "1", "abc", NaN]) {
+    const cat = makeCatalogStore(); const man = makeManifestStore();
+    // Inject a corrupt/legacy row directly (bypassing seed's positive-rev default).
+    man.manifests.set("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, expiresAt: "2027-01-01T00:00:00.000Z", rev: badRev });
+    let writes = 0;
+    const saveManifest = (a, m) => { writes += 1; return man.saveManifest(a, m); };
+    const f = countingFetch();
+    const r = await orchestrateBrandCatalogAction(
+      { actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: ["A1"], authorizedPrimaryIds: ["A1"], directory: {}, connections: ORCH_CONNS },
+      { ...cat, ...man, saveManifest, fetchCatalog: f.fetchCatalog, scopeHashOf: () => "SCOPE" },
+    );
+    assert.equal(r.conflict, true, `rev=${String(badRev)} fails closed with a 409`);
+    assert.equal(writes, 0, `rev=${String(badRev)} performs ZERO manifest writes`);
+    assert.equal(f.calls.n, 0, `rev=${String(badRev)} performs ZERO exports`);
+  }
+  // A valid positive-integer rev is honoured (control).
+  const cat = makeCatalogStore(); const man = makeManifestStore();
+  man.seed("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, expiresAt: "2027-01-01T00:00:00.000Z" }, 3);
+  const f = countingFetch();
+  const r = await orchestrateBrandCatalogAction(
+    { actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: ["A1"], authorizedPrimaryIds: ["A1"], directory: {}, connections: ORCH_CONNS },
+    { ...cat, ...man, fetchCatalog: f.fetchCatalog, scopeHashOf: () => "SCOPE" },
+  );
+  assert.equal(r.conflict, false, "a valid positive-integer rev is honoured");
+  assert.equal(f.calls.n, 1, "and its account is exported once");
+});
+
+await asyncTest("P1 production wrapper: insertReportSnapshotIfAbsent sends ignore-duplicates (never merge) and distinguishes inserted vs conflict", async () => {
+  // The request() helper captures SUPABASE_URL/KEY at import time, so load a FRESH, configured
+  // copy of the module (cache-busted) and mock global.fetch -- isolated from the rest of the suite.
+  const prev = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SECRET_KEY, svc: process.env.SUPABASE_SERVICE_ROLE_KEY };
+  process.env.SUPABASE_URL = "https://test.supabase.co";
+  process.env.SUPABASE_SECRET_KEY = "test-secret";
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const { insertReportSnapshotIfAbsent } = await import(`../lib/server/supabase.js?p1fresh=${passed}`);
+  const originalFetch = global.fetch;
+  const seen = [];
+  const snap = { reportKey: "brand-catalog-action", accountId: "__brand-catalog-action__", paramsHash: "hash-1", params: {}, payload: { rev: 1 }, payloadBytes: 10 };
+  try {
+    // Absent -> the DB INSERTS and returns the row.
+    global.fetch = async (url, options = {}) => { seen.push({ url: String(url), prefer: options.headers?.Prefer || "", method: options.method }); return new Response(JSON.stringify([{ id: "row-1" }]), { status: 201 }); };
+    assert.equal(await insertReportSnapshotIfAbsent(snap), true, "a returned row means INSERTED");
+    // Present -> ON CONFLICT DO NOTHING returns an EMPTY representation.
+    global.fetch = async () => new Response(JSON.stringify([]), { status: 201 });
+    assert.equal(await insertReportSnapshotIfAbsent(snap), false, "an empty representation means CONFLICT (already present, not merged)");
+    // Semantics of the wire request.
+    assert.match(seen[0].url, /on_conflict=report_key/, "targets the natural-key unique index");
+    assert.match(seen[0].prefer, /resolution=ignore-duplicates/, "uses ignore-duplicates (insert-if-absent)");
+    assert.doesNotMatch(seen[0].prefer, /merge-duplicates/, "NEVER merges/overwrites an existing row");
+    assert.match(seen[0].prefer, /return=representation/, "asks for the representation to distinguish inserted vs conflict");
+    // Transport/HTTP failure THROWS (never a silent false).
+    global.fetch = async () => new Response(JSON.stringify({ message: "boom" }), { status: 500 });
+    await assert.rejects(() => insertReportSnapshotIfAbsent(snap), /Supabase request failed/);
+  } finally {
+    global.fetch = originalFetch;
+    process.env.SUPABASE_URL = prev.url; process.env.SUPABASE_SECRET_KEY = prev.key;
+    if (prev.svc === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY; else process.env.SUPABASE_SERVICE_ROLE_KEY = prev.svc;
+  }
 });
 
 await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
