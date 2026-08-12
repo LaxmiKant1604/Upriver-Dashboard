@@ -1675,27 +1675,31 @@ export default async function handler(req, res) {
       const inventoryDirectory = await getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
       const accountCountry = (inventoryDirectory?.payload?.accounts || []).find((entry) => String(entry.id) === publicAccountId)?.country || null;
 
+      // The EXACT expected inventory window the fold validates every row against.
+      const inventoryFrom = addDaysStr(to, -PLAN_INVENTORY_LOOKBACK_DAYS);
       let payload;
       try {
+        // No live Product Catalog fallback: brand-inventory uses ONLY the saved
+        // brand-sales asinBrand map. A missing map fails BEFORE the FBA export, so a
+        // just-failed Brand Sales catalog can never cause a second Catalog export.
         ({ payload } = await buildBrandInventorySnapshot({
           accountId: publicAccountId,
           accountCountry,
+          from: inventoryFrom,
+          to,
           rowLimit: PLAN_INVENTORY_ROW_LIMIT,
           getSnapshot: getLatestReportSnapshot,
           fetchInventoryRows: () => fetchExportRows(
             apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-            addDaysStr(to, -PLAN_INVENTORY_LOOKBACK_DAYS), to, PLAN_INVENTORY_ROW_LIMIT,
+            inventoryFrom, to, PLAN_INVENTORY_ROW_LIMIT,
             { orderByColumn: "date", orderByDirection: "DESC" }
-          ),
-          fetchCatalogRows: ({ from, to: catalogTo }) => fetchExportRows(
-            apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds,
-            from, catalogTo, CATALOG_ROW_LIMIT, { orderByColumn: "child_asin" }
           ),
         }));
       } catch (buildError) {
-        // Never surface a raw DataDoe/Supabase body. A truncation guard is already a
-        // safe typed message; anything else becomes a generic operational message so
-        // the browser only learns the account failed, not the upstream detail.
+        // Never surface a raw DataDoe/Supabase body. A validated refusal (missing brand
+        // map, truncation, invalid row) is already an admin-safe message; anything else
+        // becomes a generic operational message so the browser only learns the account
+        // failed, not the upstream detail.
         if (buildError && buildError.brandInventorySafe) throw buildError;
         throw new Error("FBA inventory could not be refreshed from DataDoe for this account. The previous saved inventory snapshot is preserved.");
       }
