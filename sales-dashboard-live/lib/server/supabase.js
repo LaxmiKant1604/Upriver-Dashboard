@@ -1190,7 +1190,11 @@ export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, m
   const rows = [];
   for (let offset = 0; ; offset += ADS_ROW_PAGE_SIZE) {
     const query = new URLSearchParams({
-      select: "source_key,metric_date,marketplace_country_code,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at",
+      // account_id is SELECTed (not just filtered) so the PPC loader can prove row-level account
+      // isolation fail-closed -- an injected/mis-scoped reader that leaks another account's rows is
+      // rejected by validatePpcAdsRows before any currency gating or folding, never trusted from the
+      // PostgREST filter alone.
+      select: "account_id,source_key,metric_date,marketplace_country_code,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at",
       account_id: `eq.${accountId}`,
       source_key: `in.(${sourceKeys.join(",")})`,
       and: `(metric_date.gte.${from},metric_date.lte.${to})`,
