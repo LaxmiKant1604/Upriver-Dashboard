@@ -316,6 +316,34 @@ export async function saveReportSnapshot(snapshot) {
   return rows[0];
 }
 
+/**
+ * Atomic INSERT-IF-ABSENT of one snapshot row, using the natural-key unique index
+ * (report_key, account_id, params_hash). Unlike saveReportSnapshot (merge-upsert), this NEVER
+ * merges or overwrites an existing row: it sends `Prefer: resolution=ignore-duplicates`
+ * (INSERT ... ON CONFLICT DO NOTHING) with `return=representation`, so the response contains the
+ * inserted row when it was absent and is EMPTY on conflict. Returns `true` when a row was
+ * inserted, `false` when the row already existed (conflict), and THROWS on transport/HTTP
+ * failure. Used for first-manifest creation so a delayed second creator loses the race instead
+ * of clobbering an already-advanced action.
+ */
+export async function insertReportSnapshotIfAbsent(snapshot) {
+  const rows = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+    body: {
+      report_key: snapshot.reportKey,
+      account_id: snapshot.accountId,
+      params_hash: snapshot.paramsHash,
+      params: snapshot.params || {},
+      payload: snapshot.payload || null,
+      payload_storage_path: snapshot.payloadStoragePath || null,
+      payload_bytes: snapshot.payloadBytes || 0,
+      source_refreshed_at: snapshot.sourceRefreshedAt || new Date().toISOString(),
+    },
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 const SOURCE_CACHE_BUCKET = "dashboard-snapshots";
 
 export async function getSourceExportCache(requestHash) {
@@ -1075,6 +1103,89 @@ export async function paginateAdDailyMetrics({ fetchPage, pageSize = AD_DAILY_ME
     cursor = { metric_date: last.metric_date, campaign_id: last.campaign_id, campaign_type: last.campaign_type, currency: last.currency };
   }
   return rows;
+}
+
+/**
+ * Status-aware retention support: list snapshots for one report_key older than a
+ * cutoff, returning enough to decide per-row (payload carries the action status).
+ * Read-only; the caller filters by status and deletes exact rows.
+ */
+export async function getReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
+  const params = new URLSearchParams({
+    select: "report_key,account_id,params_hash,params,payload,updated_at",
+    report_key: `eq.${reportKey}`,
+    updated_at: `lt.${cutoffIso}`,
+  });
+  return request(`/rest/v1/report_snapshots?${params}`);
+}
+
+/**
+ * Delete exactly ONE snapshot row by its natural key. Used by status-aware retention so
+ * an active record is never removed by a report-key-wide age deletion.
+ *
+ * CONTRACT: reports success ACCURATELY -- it resolves `true` only when the DELETE request
+ * itself succeeded (a matched-and-removed row OR an already-absent row, which PostgREST
+ * treats as a 2xx idempotent no-op), and THROWS on any transport/HTTP failure. It does NOT
+ * swallow errors: the caller (retention) owns the best-effort decision, so it can positively
+ * confirm each deletion and, on failure, keep the manifest for the next pass to retry.
+ */
+export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHash }) {
+  const params = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+  });
+  await request(`/rest/v1/report_snapshots?${params}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+  return true;
+}
+
+/**
+ * THE shared optimistic-revision invariant, used at every rev boundary (the manifest
+ * orchestrator, retention, and the CAS helper below): a POSITIVE SAFE integer whose increment
+ * is ALSO a safe integer (so rev + 1 can never overflow Number's safe range or, worse, be a
+ * string that "increments" by concatenation). Rejects missing, zero, negative, fractional,
+ * string, NaN/null, MAX_SAFE_INTEGER, and otherwise-unsafe revisions.
+ */
+export function isSafeSnapshotRev(value) {
+  return Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(value + 1);
+}
+
+/**
+ * Optimistic-concurrency (CAS) update of ONE snapshot row's payload, conditional on the
+ * stored optimistic version `payload->>rev`. The WHERE includes the expected rev, so the
+ * UPDATE is a single atomic statement: exactly one of two concurrent writers whose expected
+ * rev matches the stored row wins; the other matches zero rows. Returns `true` when a row was
+ * updated (CAS won), `false` when zero rows matched (CAS lost -- a concurrent write moved the
+ * row on). THROWS on transport failure so the caller can distinguish "lost the race" from
+ * "could not reach the store".
+ *
+ * FAIL-CLOSED BEFORE ANY HTTP REQUEST: `expectedRev` must satisfy the shared revision
+ * invariant, and `payload.rev` must equal `expectedRev + 1`. A malformed expectedRev or a
+ * payload whose rev is not the exact increment THROWS without issuing a fetch, so a corrupt
+ * revision can never reach the database (e.g. a string "1" concatenating to "11").
+ */
+export async function casUpdateReportSnapshotByRev({ reportKey, accountId, paramsHash, expectedRev, payload, sourceRefreshedAt }) {
+  if (!isSafeSnapshotRev(expectedRev)) {
+    throw new Error("casUpdateReportSnapshotByRev: expectedRev must be a positive safe integer whose increment is safe.");
+  }
+  if (!payload || payload.rev !== expectedRev + 1) {
+    throw new Error("casUpdateReportSnapshotByRev: payload.rev must equal expectedRev + 1.");
+  }
+  const params = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+    "payload->>rev": `eq.${expectedRev}`,
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${params}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: { payload, source_refreshed_at: sourceRefreshedAt || new Date().toISOString() },
+  });
+  return Array.isArray(rows) && rows.length > 0;
 }
 
 export async function getAdDailyMetrics(accountId, from, to) {

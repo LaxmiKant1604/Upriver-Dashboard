@@ -58,8 +58,12 @@ export const SOURCE_CONTRACTS = [
     consumers: ["reconciliation", "returns-leakage"],
   }),
   contract({
+    // The live primary DataDoe short Export Source ID is first; the obsolete long id
+    // (now DataDoe 404) is retained ONLY as a legacy alias so both resolve to this one
+    // canonical contract key. request_hash is derived from the key, so switching the
+    // live request to the short id leaves every cached export and identity unchanged.
     key: "product-catalog",
-    ids: ["68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8"],
+    ids: ["68d2de238e", "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8"],
     label: "Product Catalog by ASIN",
     grain: "asin-current",
     fields: ["child_asin", "parent_asin", "product_name", "product_brand", "sku", "product_root_category_name", "product_root_best_selling_rank", "product_description", "product_bullet_point_1", "product_bullet_point_2", "product_bullet_point_3", "product_bullet_point_4", "product_bullet_point_5", "product_image_url"],

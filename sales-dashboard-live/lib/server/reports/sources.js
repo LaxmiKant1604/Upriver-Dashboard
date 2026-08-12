@@ -59,8 +59,12 @@ export const SETTLEMENTS = {
 // Product Catalog by ASIN. defaultDataset, CONTINUOUS, no date column.
 // Also carries the five bullet points, description, image URL and BSR used by
 // the Listing & Search Optimizer content checks.
+//
+// Uses the live primary DataDoe SHORT Export Source ID "68d2de238e"; the former long
+// id is obsolete (DataDoe 404) and survives only as a legacy alias in
+// source-contracts.js so request_hash identity and cached exports stay stable.
 export const PRODUCT_CATALOG = {
-  id: "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8",
+  id: "68d2de238e",
   table: "amazon_products_by_child_asin",
   label: "Product Catalog by ASIN",
 };

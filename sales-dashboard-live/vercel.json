@@ -4,10 +4,6 @@
       "maxDuration": 60
     }
   },
-  "crons": [
-    { "path": "/api/cron/sync?bucket=non-us", "schedule": "0 2 * * *" },
-    { "path": "/api/cron/sync?bucket=us", "schedule": "30 10 * * *" }
-  ],
   "headers": [
     {
       "source": "/(.*)",
