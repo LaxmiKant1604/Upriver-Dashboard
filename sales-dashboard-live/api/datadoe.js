@@ -25,12 +25,19 @@ import {
   assertAccountAccess,
   assertAdmin,
   getAdsDailySourceRows,
+  casUpdateReportSnapshotByRev,
+  claimRefreshLock,
+  deleteReportSnapshotByKey,
   getAdDailyMetrics,
   getDashboardAccess,
   getLatestReportSnapshot,
   getReportSnapshot,
+  getReportSnapshotsOlderThan,
+  insertReportSnapshotIfAbsent,
+  isSafeSnapshotRev,
   isSupabaseConfigured,
   publishSnapshotUpdate,
+  releaseRefreshLock,
   saveReportSnapshot,
 } from "../lib/server/supabase.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
@@ -227,10 +234,377 @@ const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
 
 const BRAND_CATALOG_REPORT_KEY = "brand-catalog";
 const BRAND_CATALOG_REPORT_VERSION = "brand-catalog-shared-v1";
-// One account per DataDoe organisation per request keeps each function under
-// Vercel's 60-second limit while allowing primary and secondary catalog work
-// to progress together. The browser continues the explicitly requested sync.
-const BRAND_CATALOG_ACCOUNTS_PER_CONNECTION = 1;
+// EXACTLY ONE Product Catalog export per invocation. A single export can poll for
+// close to 45s (pollExport: 9 x 5s) plus create + download, which already approaches
+// Vercel's 60-second limit; running a second export in the same request could exceed
+// it. One-per-invocation is the strict, provable budget guard -- a slow export can
+// never consume the next cursor item because the next item is not touched this request.
+// The browser continues the remaining accounts one at a time. DataDoe exports are NEVER
+// parallelised.
+export const BRAND_CATALOG_BATCH_SIZE = 1;
+
+// Admin-safe catalog outcome codes. NEVER surface a raw DataDoe response body,
+// source id, URL, JSON, status object, key or token to the browser -- only one of
+// these typed codes.
+export const CATALOG_SOURCE_UNAVAILABLE = "PRODUCT_CATALOG_SOURCE_UNAVAILABLE";
+export const CATALOG_EMPTY = "PRODUCT_CATALOG_EMPTY";
+export const CATALOG_TRUNCATED = "PRODUCT_CATALOG_TRUNCATED";
+export const CATALOG_FETCH_FAILED = "PRODUCT_CATALOG_FETCH_FAILED";
+// An attempt that was atomically claimed (or is mid-flight / whose outcome write
+// failed) but has no confirmed terminal outcome yet. It is admin-safe and NEVER
+// auto-retried: it waits for a NEW explicit action id. It is not produced by
+// classifyCatalogError (only real transport errors are), so it never masquerades
+// as a source failure.
+export const CATALOG_ATTEMPT_PENDING = "PRODUCT_CATALOG_ATTEMPT_PENDING";
+export const SAFE_CATALOG_CODES = new Set([
+  CATALOG_SOURCE_UNAVAILABLE, CATALOG_EMPTY, CATALOG_TRUNCATED, CATALOG_FETCH_FAILED, CATALOG_ATTEMPT_PENDING,
+]);
+
+// Durable, per-(action,account) attempt state, stored SEPARATELY from the
+// brand-catalog LKG snapshot. Keeping it in its own report row is what lets a
+// failed refresh preserve the successful LKG payload byte-for-byte (its
+// source_refreshed_at never advances) AND lets two overlapping actions record
+// their own cumulative failure summaries without clobbering each other, because
+// the params hash below is scoped by BOTH accountId and actionId.
+const BRAND_CATALOG_ATTEMPT_KEY = "brand-catalog-attempt";
+const BRAND_CATALOG_ATTEMPT_VERSION = "brand-catalog-attempt-v1";
+// The claim is held only across ONE export. A single export polls for ~45s max
+// (pollExport 9x5s) plus create + download, so a lock comfortably longer than that
+// but far shorter than any human retry window bounds a crashed invocation without
+// wedging the account: after it expires, only a NEW explicit action re-claims,
+// because the durable "attempting" marker written before create-export still blocks
+// same-action replays.
+const CATALOG_ATTEMPT_LOCK_SECONDS = 90;
+
+// A safe token shape for the correlation id of ONE explicit action. Anything else
+// (missing, PII, oversized, punctuation) is rejected -- never persisted or echoed.
+export function validCatalogActionId(value) {
+  const id = String(value == null ? "" : value);
+  return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : null;
+}
+
+function catalogAttemptHash(accountId, actionId) {
+  return paramsHashFor(BRAND_CATALOG_ATTEMPT_VERSION, { accountId, actionId });
+}
+
+// ATOMIC claim BEFORE any DataDoe create-export. claim_report_refresh_lock is a
+// database upsert-with-expiry: exactly one of two concurrent same-(action,account)
+// requests wins. The loser creates ZERO exports. Keyed by the attempt hash so it is
+// scoped to one action + one account and never collides with a report refresh lock.
+async function defaultClaimCatalogAttempt(accountId, actionId) {
+  return claimRefreshLock({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+    lockSeconds: CATALOG_ATTEMPT_LOCK_SECONDS,
+  });
+}
+
+async function defaultReleaseCatalogAttempt(accountId, actionId) {
+  return releaseRefreshLock({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+  });
+}
+
+// Read THIS action's durable attempt row for one account (exact params hash, not the
+// latest-by-account read) so overlapping actions never read each other's state.
+async function defaultGetCatalogAttemptState(accountId, actionId) {
+  const snapshot = await getReportSnapshot({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash: catalogAttemptHash(accountId, actionId),
+  });
+  return snapshot?.payload || null;
+}
+
+// Persist THIS action's durable attempt state. Never carries a raw DataDoe body --
+// only a typed safe code. This row, not the LKG snapshot, is where a failed refresh
+// is recorded.
+async function defaultSaveCatalogAttemptState(accountId, actionId, state) {
+  const paramsHash = catalogAttemptHash(accountId, actionId);
+  const payload = {
+    actionId,
+    accountId: String(accountId),
+    status: state.status,
+    code: state.code || null,
+    preservedLkg: Boolean(state.preservedLkg),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveReportSnapshot({
+    reportKey: BRAND_CATALOG_ATTEMPT_KEY,
+    accountId,
+    paramsHash,
+    params: { reportVersion: BRAND_CATALOG_ATTEMPT_VERSION, accountId, actionId },
+    payload,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    sourceRefreshedAt: new Date().toISOString(),
+  });
+}
+
+// Durable, SERVER-OWNED action manifest. One row per explicit refresh action, keyed by
+// the action id. It -- not the browser cursor -- owns the work queue: the authoritative
+// list of primary accounts still to attempt, the discovered scope, the requesting admin,
+// the status, and an optimistic-concurrency version `rev`. A continuation loads this manifest
+// and may only pass its cursor as a consistency check; it can never define server work or
+// create an action implicitly. Stored in report_snapshots (no migration) under a fixed account
+// id, differentiated by the action id in the params hash. Retention is STATUS-AWARE (see
+// below), so an in-progress action is never removed merely because it is old.
+//
+// CONCURRENCY: EVERY manifest transition (both the orchestrator's and retention's expiry) is a
+// compare-and-swap on `rev` (see defaultSaveCatalogActionManifest). A write succeeds only if the
+// stored row is still at the rev the writer loaded; otherwise it loses the race and the caller
+// re-decides. This makes the two interleavings safe: a continuation that commits between
+// retention's re-read and its expiry write causes retention's CAS to miss (retention does not
+// overwrite it); and if retention expires first, a stale continuation's CAS misses (it cannot
+// restore in-progress/complete over the expired row -> it 409s). This replaces the earlier
+// updatedAt read-then-write, which was not atomic.
+const BRAND_CATALOG_ACTION_KEY = "brand-catalog-action";
+const BRAND_CATALOG_ACTION_VERSION = "brand-catalog-action-v1";
+const BRAND_CATALOG_ACTION_ACCOUNT = "__brand-catalog-action__";
+// Terminal actions older than this window are pruned (manifest + their attempt rows). An
+// in-progress action is NEVER pruned merely because it is old.
+const BRAND_CATALOG_ACTION_RETENTION_DAYS = 7;
+// An in-progress action is considered ABANDONED (and rejected/expired) only after this far
+// longer window, well beyond any real refresh (which completes in seconds). A continuation
+// arriving after it transitions the manifest to the terminal "expired" state and is rejected
+// with a 409; retention then prunes the expired action like any other terminal one.
+const BRAND_CATALOG_ACTION_ABANDON_DAYS = 30;
+// Actions in these states are terminal: safe to prune once older than the retention window,
+// and (for anything other than "complete") a continuation is rejected with a 409.
+const TERMINAL_CATALOG_ACTION_STATES = new Set(["complete", "operational-failure", "expired"]);
+
+// Admin-safe codes for the action orchestrator. A conflict is any request that does not
+// match the server-owned manifest (unknown/changed action, wrong admin, changed scope,
+// tampered cursor). An operational failure is a durable-state persistence failure that
+// stops the action without reporting completion. Neither ever carries a raw body.
+export const BRAND_DIRECTORY_ACTION_CONFLICT = "BRAND_DIRECTORY_ACTION_CONFLICT";
+export const BRAND_DIRECTORY_ACTION_UNAVAILABLE = "BRAND_DIRECTORY_ACTION_UNAVAILABLE";
+
+function catalogActionHash(actionId) {
+  return paramsHashFor(BRAND_CATALOG_ACTION_VERSION, { actionId });
+}
+
+// The manifest optimistic-version invariant is the SHARED isSafeSnapshotRev (positive safe
+// integer whose increment is safe). A loaded manifest whose rev violates it is corrupt/legacy
+// and MUST fail closed -- never treated as new (which would bypass CAS and could clobber an
+// advanced row), and never used to CAS (a malformed rev could concatenate or overflow).
+
+// Deterministic hash of the discovered authorized PRIMARY scope. A continuation whose
+// authorized scope no longer hashes to the manifest's value (injected/removed account,
+// changed permissions) is rejected before any DataDoe call.
+function defaultCatalogScopeHash(accountIds) {
+  const ids = [...new Set((accountIds || []).map((id) => String(id || "").trim()).filter(Boolean))].sort();
+  return paramsHashFor("brand-catalog-action-scope-v1", { ids: ids.join(",") });
+}
+
+async function defaultLoadCatalogActionManifest(actionId) {
+  const snapshot = await getReportSnapshot({
+    reportKey: BRAND_CATALOG_ACTION_KEY,
+    accountId: BRAND_CATALOG_ACTION_ACCOUNT,
+    paramsHash: catalogActionHash(actionId),
+  });
+  return snapshot?.payload || null;
+}
+
+// Persist a manifest transition. Contract used by BOTH the orchestrator and retention:
+//   - manifest.rev == null  -> CREATE (first write): atomic INSERT-IF-ABSENT at rev 1; returns 1
+//     when inserted, or `false` when a row already exists (create conflict -- never overwritten).
+//   - manifest.rev is set    -> CAS UPDATE: succeeds only if the stored row is still at that
+//     rev; returns the NEW rev on success, or `false` when the CAS lost (a concurrent write
+//     moved the row on). A transport failure THROWS.
+async function defaultSaveCatalogActionManifest(actionId, manifest) {
+  const paramsHash = catalogActionHash(actionId);
+  const sourceRefreshedAt = manifest.updatedAt || new Date().toISOString();
+  if (manifest.rev == null) {
+    // CREATE via atomic INSERT-IF-ABSENT (never merge/overwrite). A delayed second creator that
+    // also loaded "missing" LOSES here instead of clobbering an already-advanced/stopped row.
+    const payload = { ...manifest, rev: 1 };
+    const inserted = await insertReportSnapshotIfAbsent({
+      reportKey: BRAND_CATALOG_ACTION_KEY,
+      accountId: BRAND_CATALOG_ACTION_ACCOUNT,
+      paramsHash,
+      params: { reportVersion: BRAND_CATALOG_ACTION_VERSION, actionId },
+      payload,
+      payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+      sourceRefreshedAt,
+    });
+    return inserted ? 1 : false; // false => a row already exists (create conflict)
+  }
+  // EXISTING-ROW CAS: a non-null rev MUST satisfy the shared invariant. Fail closed (throw)
+  // BEFORE any write so a malformed rev can never CAS (e.g. a string "1" concatenating to "11").
+  if (!isSafeSnapshotRev(manifest.rev)) {
+    throw new Error("defaultSaveCatalogActionManifest: existing manifest rev is not a positive safe integer.");
+  }
+  const expectedRev = manifest.rev;
+  const payload = { ...manifest, rev: expectedRev + 1 };
+  const won = await casUpdateReportSnapshotByRev({
+    reportKey: BRAND_CATALOG_ACTION_KEY,
+    accountId: BRAND_CATALOG_ACTION_ACCOUNT,
+    paramsHash,
+    expectedRev,
+    payload,
+    sourceRefreshedAt,
+  });
+  return won ? expectedRev + 1 : false;
+}
+
+async function defaultListOldCatalogActions({ cutoffIso }) {
+  const rows = await getReportSnapshotsOlderThan({ reportKey: BRAND_CATALOG_ACTION_KEY, cutoffIso });
+  return (rows || []).map((row) => {
+    const payload = row.payload || {};
+    const accountIds = [
+      ...(Array.isArray(payload.primaryAccountIds) ? payload.primaryAccountIds : []),
+      ...(Array.isArray(payload.remaining) ? payload.remaining : []),
+      ...(payload.current ? [payload.current] : []),
+    ];
+    return {
+      actionId: payload.actionId || row.params?.actionId || null,
+      status: payload.status || null,
+      // The PAYLOAD updatedAt is the field we control on every transition; use it (not the
+      // storage column) for the race guard so a re-read compares like-for-like.
+      updatedAt: payload.updatedAt || row.updated_at || null,
+      accountIds: [...new Set(accountIds.map(String))],
+    };
+  });
+}
+
+// STATUS-AWARE, BEST-EFFORT retention with ACCURATE deletion accounting.
+//
+// TERMINAL action (complete / operational-failure / expired), old enough:
+//   - delete EVERY attempt row first, positively confirming each deletion;
+//   - delete the manifest ONLY after all attempt deletions succeeded (attempts-then-manifest);
+//   - if ANY attempt deletion fails: leave the manifest AND the remaining attempts, stop this
+//     action, and let the next pass retry. A missing row is an idempotent success.
+// IN-PROGRESS action, past its expiresAt (abandoned):
+//   - NEVER directly deleted. Re-read its exact manifest, verify it is STILL in-progress and
+//     still expired, then durably transition it to the terminal "expired" state via a CAS on the
+//     rev it just read. If a continuation commits between the re-read and the CAS, the CAS LOSES
+//     and retention does not overwrite it. Its attempts + manifest are pruned only on a LATER
+//     pass (once the persisted "expired" state is observed). If the expiry CAS loses or the write
+//     fails, the in-progress manifest and all its attempts are preserved for retry.
+// brand-catalog LKG and account-directory rows use different report keys and are NEVER touched.
+// Must never fail a refresh.
+export async function pruneBrandCatalogActionRecords(deps = {}) {
+  const listOldActions = deps.listOldActions || defaultListOldCatalogActions;
+  const loadManifest = deps.loadManifest || defaultLoadCatalogActionManifest;
+  const saveManifest = deps.saveManifest || defaultSaveCatalogActionManifest;
+  const deleteManifest = deps.deleteManifest || ((actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ACTION_KEY, accountId: BRAND_CATALOG_ACTION_ACCOUNT, paramsHash: catalogActionHash(actionId) }));
+  const deleteAttempt = deps.deleteAttempt || ((accountId, actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ATTEMPT_KEY, accountId, paramsHash: catalogAttemptHash(accountId, actionId) }));
+  const nowMs = typeof deps.nowMs === "function" ? deps.nowMs() : Date.now();
+  const nowIso = deps.now || (() => new Date().toISOString());
+  const cutoffIso = new Date(nowMs - BRAND_CATALOG_ACTION_RETENTION_DAYS * 86_400_000).toISOString();
+
+  // A deletion/transition is CONFIRMED only when it resolves truthy (an explicit `false` or a
+  // throw both count as failure). This is the best-effort boundary; the primitive itself reports
+  // accurately and never swallows its own failure.
+  const confirmed = async (fn) => { try { return (await fn()) !== false; } catch { return false; } };
+
+  let oldActions;
+  try { oldActions = await listOldActions({ cutoffIso }); } catch { return; } // best-effort
+  for (const action of oldActions || []) {
+    if (!action.actionId) continue;
+
+    if (TERMINAL_CATALOG_ACTION_STATES.has(action.status)) {
+      // Attempts first, each positively confirmed; the manifest is deleted LAST and only if all
+      // attempt deletions succeeded, so a failed attempt delete can never orphan its rows.
+      let allAttemptsDeleted = true;
+      for (const accountId of action.accountIds || []) {
+        if (!(await confirmed(() => deleteAttempt(accountId, action.actionId)))) { allAttemptsDeleted = false; break; }
+      }
+      if (!allAttemptsDeleted) continue; // keep the manifest; the next pass retries idempotently
+      await confirmed(() => deleteManifest(action.actionId)); // if this fails, the next pass retries
+      continue;
+    }
+
+    // An OLD in-progress action is NEVER directly deleted. Past its expiresAt it is first durably
+    // transitioned to terminal "expired"; a later pass prunes it as terminal.
+    if (action.status !== "in-progress") continue;
+    let current;
+    try { current = await loadManifest(action.actionId); } catch { continue; } // best-effort
+    // Re-read guard: it must still be in-progress and still expired. The ATOMIC guard against a
+    // racing continuation is the CAS below (on current.rev) -- not this read-then-check -- so we
+    // do NOT rely on comparing updatedAt.
+    if (!current || current.status !== "in-progress") continue;
+    if (!(current.expiresAt && Date.parse(current.expiresAt) < nowMs)) continue;
+    // The re-read manifest MUST satisfy the shared revision invariant before any save. A
+    // missing/malformed rev fails closed: SKIP (zero saves, zero deletes) and preserve the
+    // manifest + all its attempts. This also guarantees retention never passes a null rev to
+    // saveManifest -- which would be misinterpreted as first-create.
+    if (!isSafeSnapshotRev(current.rev)) continue;
+    // Durably transition to "expired" via a CAS on the rev just read. If a continuation committed
+    // between the re-read and here, the CAS LOSES (`confirmed` is false) and retention does NOT
+    // overwrite it; the in-progress manifest and all its attempts are preserved for a later pass.
+    await confirmed(() => saveManifest(action.actionId, { ...current, status: "expired", updatedAt: nowIso() }));
+  }
+}
+
+// Map a fetch/transport error to a typed code WITHOUT persisting or returning its
+// raw message. A 404 "Source not found" is a source-access/config issue (the obsolete
+// long id, or an unenabled primary source); the row cap is a truncation; anything else
+// is a generic fetch failure.
+export function classifyCatalogError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/row cap/i.test(message)) return CATALOG_TRUNCATED;
+  if (/\(404\)/.test(message) || /source not found/i.test(message)) return CATALOG_SOURCE_UNAVAILABLE;
+  return CATALOG_FETCH_FAILED;
+}
+
+// PURE: split the work cursor into the accounts attempted THIS request and the typed
+// continuation for the browser. Each account appears in exactly one batch across the
+// explicit action, so it is attempted at most once and the loop always terminates.
+export function nextCatalogBatch(cursorIds, batchSize = BRAND_CATALOG_BATCH_SIZE) {
+  const cursor = [...new Set((cursorIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  return { batch: cursor.slice(0, batchSize), remainingAccountIds: cursor.slice(batchSize) };
+}
+
+// PRIMARY-ONLY: a dormant `dd-secondary:`-prefixed record is skipped read-only. Only a
+// real primary account id (no prefix) is eligible for a live catalog export; a legacy
+// secondary id is never stripped and routed through the primary key.
+function isPrimaryCatalogAccount(accountId) {
+  const id = String(accountId || "").trim();
+  return Boolean(id) && !id.startsWith("dd-secondary:");
+}
+
+// PURE: which accounts a fresh explicit action should attempt once, given the accounts
+// just DISCOVERED from the primary DataDoe organization and the shared-snapshot directory
+// state. Discovery is the sole source of the active set -- a newly added primary account
+// needs no code change, config, or manual mapping to appear here:
+//   - a newly discovered primary account (no snapshot yet -> pending) is scheduled;
+//   - a previously-unavailable primary account is scheduled (retry), never starved;
+//   - an already-complete account is NOT in the pending/unavailable candidate set, so it
+//     is never attempted twice;
+//   - a REMOVED account (absent from the current discovery) is never scheduled, even if a
+//     stale pending/unavailable marker still names it -- its last-known-good snapshot is
+//     left untouched;
+//   - a dormant `dd-secondary:` record is never treated as a primary catalog account.
+export function catalogSyncEligibleAccounts(discoveredAccountIds, directory = {}) {
+  const discoveredPrimary = new Set(
+    [...new Set((discoveredAccountIds || []).map((id) => String(id || "").trim()).filter(Boolean))]
+      .filter(isPrimaryCatalogAccount)
+  );
+  const unavailable = directory.catalogUnavailable instanceof Map
+    ? [...directory.catalogUnavailable.keys()]
+    : (directory.catalogUnavailable || []);
+  const candidate = new Set([...(directory.catalogPendingAccountIds || []), ...unavailable].map((id) => String(id)));
+  return [...candidate].filter((id) => discoveredPrimary.has(id)).sort();
+}
+
+// A catalog counts as brand coverage ONLY when it contains at least one USABLE mapping:
+// a non-empty child_asin joined to a real, non-empty product_brand. "Unassigned" is the
+// no-brand placeholder and is never a real brand. Returns the sorted distinct real
+// brands from usable rows; an empty result means the catalog is unusable
+// (`PRODUCT_CATALOG_EMPTY`), e.g. a row like {child_asin:"", product_brand:"Bebi Born"}.
+export function usableCatalogBrands(rows) {
+  const brands = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const asin = String(row?.child_asin || "").trim();
+    const brand = String(row?.product_brand || "").trim();
+    if (asin && brand && brand !== "Unassigned") brands.add(brand);
+  }
+  return [...brands].sort((a, b) => a.localeCompare(b));
+}
 
 function addBrandAccount(brandAccountIds, brand, accountId) {
   const name = String(brand || "").trim();
@@ -364,12 +738,18 @@ function snapshotBrandNames(payload) {
   return [...names];
 }
 
-async function sharedSnapshotBrandAccounts(accountIds) {
+async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAttemptState = defaultGetCatalogAttemptState } = {}) {
   const brandAccountIds = new Map();
   const coveredAccountIds = new Set();
   const catalogPendingAccountIds = new Set();
   const catalogUnavailable = new Map();
-  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable };
+  // Accounts whose latest attempt under THIS action did not succeed -- whether their brand
+  // map is a preserved last-known-good ("complete") or absent. Their typed code must appear
+  // in the cumulative summary even after later continuations reread them, and it is read
+  // from the SEPARATE per-(action,account) attempt row so overlapping actions never clobber
+  // each other's summaries.
+  const catalogActionFailures = new Map();
+  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
 
   // The explicit catalog snapshot is authoritative for a complete selector.
   // Other reports are still useful fallback data while an account waits for its
@@ -378,15 +758,32 @@ async function sharedSnapshotBrandAccounts(accountIds) {
   await Promise.all(accountIds.map(async (accountId) => {
     const id = String(accountId);
     const catalogSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
-    const catalogStatus = catalogSnapshot?.payload?.catalogSyncStatus;
-    const catalogBrands = snapshotBrandNames(catalogSnapshot?.payload);
+    const payload = catalogSnapshot?.payload;
+    const catalogStatus = payload?.catalogSyncStatus;
+    const catalogBrands = snapshotBrandNames(payload);
+    // A non-successful attempt under THIS action is surfaced separately so it is never lost
+    // across continuation batches. Read from the durable attempt row (scoped by action +
+    // account); typed safe codes only, never a raw DataDoe body.
+    if (actionId) {
+      const attempt = await Promise.resolve(getAttemptState(id, actionId)).catch(() => null);
+      if (attempt && attempt.status && attempt.status !== "complete") {
+        const attemptCode = String(attempt.code || "");
+        catalogActionFailures.set(id, SAFE_CATALOG_CODES.has(attemptCode)
+          ? attemptCode
+          : (attempt.status === "attempting" ? CATALOG_ATTEMPT_PENDING : CATALOG_SOURCE_UNAVAILABLE));
+      }
+    }
     if (catalogStatus === "complete") {
       catalogBrands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
       coveredAccountIds.add(id);
       return;
     }
     if (catalogStatus === "unavailable") {
-      catalogUnavailable.set(id, String(catalogSnapshot?.payload?.catalogSyncError || "Product Catalog is unavailable for this account."));
+      // Only a typed, admin-safe code is carried forward. Any legacy raw
+      // `catalogSyncError` on an older snapshot is IGNORED (never surfaced): unknown
+      // codes normalise to the generic source-unavailable code.
+      const rawCode = String(payload?.catalogSyncCode || "");
+      catalogUnavailable.set(id, SAFE_CATALOG_CODES.has(rawCode) ? rawCode : CATALOG_SOURCE_UNAVAILABLE);
     } else {
       catalogPendingAccountIds.add(id);
     }
@@ -401,7 +798,7 @@ async function sharedSnapshotBrandAccounts(accountIds) {
       }
     }
   }));
-  return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable };
+  return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
 }
 
 async function saveBrandCatalogSnapshot(accountId, payload) {
@@ -420,54 +817,370 @@ async function saveBrandCatalogSnapshot(accountId, payload) {
   }
 }
 
-async function syncAccountBrandCatalog({ accountId, rawAccountId, connection }) {
-  try {
-    const rows = await fetchExportRowsRaw(
-      connection.apiKey,
-      PRODUCT_CATALOG_SOURCE_ID,
-      PRODUCT_CATALOG_COLUMNS,
-      [rawAccountId],
-      null,
-      null,
-      CATALOG_ROW_LIMIT,
-      { orderByColumn: "child_asin", orderByDirection: "ASC" }
-    );
-    if (rows.length >= CATALOG_ROW_LIMIT) {
-      throw new Error(`Product Catalog reached the ${CATALOG_ROW_LIMIT.toLocaleString("en-US")} row cap and was not used.`);
-    }
-    const payload = {
-      catalogBrands: catalogBrandNames(rows),
-      catalogSyncStatus: "complete",
-      catalogSyncedAt: new Date().toISOString(),
+// Fetch + validate ONE account's Product Catalog and update its brand-catalog snapshot.
+//
+// Fail-closed, last-known-good preserving, typed, and once-per-action ATOMIC:
+//   - a USABLE catalog (>=1 non-empty child_asin joined to a real non-empty
+//     product_brand) saves catalogSyncStatus:"complete";
+//   - a zero-row catalog, a catalog with NO usable child_asin -> product_brand mapping,
+//     a row-cap truncation, a 404 "source not found", a timeout or any fetch error is
+//     typed unavailable and NEVER counts as brand coverage;
+//   - on any unavailable outcome, a PRIOR successful ("complete", non-empty) brand-catalog
+//     snapshot is left BYTE-IDENTICAL (its brand map AND its source_refreshed_at are never
+//     rewritten). The typed failure is recorded in a SEPARATE per-(action,account) attempt
+//     row, so it still appears in the cumulative summary. An account with no prior success
+//     is saved as unavailable with a typed code and NO fabricated brands.
+//   - ATOMIC ONCE-PER-ACTION: the attempt is claimed with a durable lock BEFORE the
+//     create-export and a durable "attempting" marker is written BEFORE the create-export.
+//     Two concurrent same-(action,account) requests therefore create EXACTLY ONE export;
+//     a replay (even after the outcome write fails, the invocation times out post-create,
+//     or the lock has expired) creates ZERO further exports and returns the recorded
+//     outcome. If the claim or the marker write fails, ZERO exports are created. An
+//     unknown/attempting state is admin-safe and waits for a NEW explicit action id.
+// The DataDoe/Supabase I/O is injectable so the whole policy is offline-testable; the
+// live create-export always uses the short source id PRODUCT_CATALOG_SOURCE_ID.
+export async function syncAccountBrandCatalog({ accountId, rawAccountId, connection, actionId = null }, deps = {}) {
+  const fetchCatalog = deps.fetchCatalog || (({ apiKey, sourceId, rawAccountId: raw }) => fetchExportRowsRaw(
+    apiKey, sourceId, PRODUCT_CATALOG_COLUMNS, [raw], null, null, CATALOG_ROW_LIMIT,
+    { orderByColumn: "child_asin", orderByDirection: "ASC" }
+  ));
+  const getPriorSnapshot = deps.getPriorSnapshot || ((id) => getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId: id }));
+  const save = deps.saveSnapshot || saveBrandCatalogSnapshot;
+  const claimAttempt = deps.claimAttempt || defaultClaimCatalogAttempt;
+  const releaseAttempt = deps.releaseAttempt || defaultReleaseCatalogAttempt;
+  const getAttemptState = deps.getAttemptState || defaultGetCatalogAttemptState;
+  const saveAttemptState = deps.saveAttemptState || defaultSaveCatalogAttemptState;
+  const now = () => new Date().toISOString();
+
+  // Read the prior LKG snapshot ONCE, to preserve it and to report preservedLkg.
+  const prior = await Promise.resolve(getPriorSnapshot(accountId)).catch(() => null);
+  const priorPayload = (prior && prior.payload) || null;
+  const priorComplete = priorPayload?.catalogSyncStatus === "complete"
+    && Array.isArray(priorPayload?.catalogBrands) && priorPayload.catalogBrands.length > 0;
+
+  // `disposition` tells the action orchestrator whether a durable attempt state was
+  // positively confirmed (so the queue may advance) or not:
+  //   exported            - one export ran; the "attempting" marker was written first, so
+  //                         a durable state is confirmed -> advance.
+  //   recorded            - a durable TERMINAL state (complete/unavailable) already existed
+  //                         (replay / prior holder finished) -> advance.
+  //   in-progress         - a concurrent request still HOLDS the claim (mid-flight) -> zero
+  //                         exports, keep the account unresolved.
+  //   operational-failure - fail-closed stop: the claim/attempting-marker could not be
+  //                         persisted, OR an "attempting" marker exists whose lock is no
+  //                         longer held (uncertain/stale). Zero exports; a NEW action id is
+  //                         required. "attempting" is NEVER reported as terminal recorded work.
+  // Fail closed without an action id: idempotency cannot be scoped, so NO export.
+  const attempting = (disposition) => ({ accountId, status: "attempting", code: CATALOG_ATTEMPT_PENDING, preservedLkg: priorComplete, skipped: true, disposition });
+  if (!actionId) return attempting("operational-failure");
+
+  const isTerminalState = (state) => state && (state.status === "complete" || state.status === "unavailable");
+  // recorded() is ONLY ever called for a durable TERMINAL state, so the queue may advance.
+  const recorded = (state) => {
+    const wasComplete = state.status === "complete";
+    return {
+      accountId,
+      status: wasComplete ? "complete" : "unavailable",
+      code: wasComplete ? null : (SAFE_CATALOG_CODES.has(state.code) ? state.code : CATALOG_SOURCE_UNAVAILABLE),
+      preservedLkg: !wasComplete && (state.preservedLkg || priorComplete),
+      skipped: true,
+      disposition: "recorded",
     };
-    await saveBrandCatalogSnapshot(accountId, payload);
-    return { accountId, status: "complete", brandCount: payload.catalogBrands.length };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // Persist the outcome so the automatic continuation can finish. A later
-    // explicit directory sync retries these accounts after access/credits are
-    // corrected; normal reads never spend DataDoe tokens.
-    await saveBrandCatalogSnapshot(accountId, {
-      catalogBrands: [],
-      catalogSyncStatus: "unavailable",
-      catalogSyncError: message,
-      catalogSyncedAt: new Date().toISOString(),
-    }).catch(() => {});
-    return { accountId, status: "unavailable", error: message };
+  };
+
+  // Fail-closed classification of an existing NON-terminal ("attempting") marker: is the
+  // original claim still held (mid-flight -> in-progress) or not (stale/uncertain -> stop)?
+  // Determined by trying to acquire the claim: a refusal means it is still held; acquiring a
+  // free/expired lock proves the attempt is stale, so we release it and STOP -- never a
+  // second export under the same action.
+  const classifyAttempting = async () => {
+    let acquired = false;
+    let failed = false;
+    try { acquired = Boolean(await claimAttempt(accountId, actionId)); } catch { failed = true; }
+    if (failed) return attempting("operational-failure"); // cannot tell -> fail closed
+    if (!acquired) return attempting("in-progress"); // the owner still holds the claim
+    await Promise.resolve(releaseAttempt(accountId, actionId)).catch(() => {});
+    return attempting("operational-failure"); // stale attempting with a free lock -> stop
+  };
+
+  // Durable replay guard (fast path): this account already has an attempt under THIS action.
+  // A TERMINAL attempt advances; an "attempting" attempt is NEVER treated as terminal.
+  const priorAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
+  if (isTerminalState(priorAttempt)) return recorded(priorAttempt);
+  if (priorAttempt && priorAttempt.status === "attempting") return classifyAttempting();
+
+  // ATOMIC claim BEFORE any DataDoe call. A THROW is a persistence failure (operational);
+  // a REFUSAL means a concurrent request owns the claim. Either way, ZERO exports here.
+  let claimed = false;
+  let claimFailed = false;
+  try { claimed = Boolean(await claimAttempt(accountId, actionId)); } catch { claimFailed = true; }
+  if (claimFailed) return attempting("operational-failure"); // claim persistence failed -> stop
+  if (!claimed) {
+    // A concurrent owner holds the claim. A TERMINAL durable state means it already finished
+    // (advance); an "attempting"/absent state means it is mid-flight (keep unresolved).
+    const concurrent = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
+    if (isTerminalState(concurrent)) return recorded(concurrent);
+    return attempting("in-progress");
+  }
+
+  try {
+    // Re-read under the claim: a prior holder may have written a state between our fast-path
+    // read and this claim. A TERMINAL state advances; a pre-existing "attempting" marker while
+    // WE now hold the (free/expired) lock is stale -> stop, never a second export.
+    const claimedAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
+    if (isTerminalState(claimedAttempt)) return recorded(claimedAttempt);
+    if (claimedAttempt && claimedAttempt.status === "attempting") return attempting("operational-failure");
+
+    // Persist the durable "attempting" marker BEFORE the create-export. If this write
+    // fails, create ZERO exports and stop the action. Once written, it survives a mid-export
+    // timeout and a failed outcome write, so no replay can re-export this account.
+    try {
+      await saveAttemptState(accountId, actionId, { status: "attempting", code: null, preservedLkg: priorComplete });
+    } catch {
+      return attempting("operational-failure"); // marker write failed -> zero exports, stop
+    }
+
+    let code = null;
+    try {
+      const rows = await fetchCatalog({ apiKey: connection.apiKey, sourceId: PRODUCT_CATALOG_SOURCE_ID, rawAccountId });
+      const catalogRows = Array.isArray(rows) ? rows : [];
+      if (catalogRows.length >= CATALOG_ROW_LIMIT) {
+        code = CATALOG_TRUNCATED; // possibly truncated -> never trusted as complete coverage
+      } else {
+        const catalogBrands = usableCatalogBrands(catalogRows); // requires child_asin + real brand
+        if (!catalogBrands.length) {
+          code = CATALOG_EMPTY; // zero rows OR no usable child_asin -> product_brand mapping
+        } else {
+          await Promise.resolve(save(accountId, {
+            catalogBrands, catalogSyncStatus: "complete", catalogSyncedAt: now(),
+          }));
+          // Record the terminal outcome. If THIS write fails, the "attempting" marker
+          // remains and a replay is a safe no-op (no second export); the LKG is saved.
+          await Promise.resolve(saveAttemptState(accountId, actionId, { status: "complete", code: null, preservedLkg: false })).catch(() => {});
+          return { accountId, status: "complete", brandCount: catalogBrands.length, disposition: "exported" };
+        }
+      }
+    } catch (error) {
+      code = classifyCatalogError(error);
+    }
+
+    // Unavailable outcome (typed). Record it ONLY in the separate attempt row.
+    if (priorComplete) {
+      // Preserve the prior successful brand-catalog snapshot BYTE-FOR-BYTE: its map and
+      // its source_refreshed_at are never rewritten. The typed failure lives in the
+      // attempt row, so it still appears in this action's cumulative summary.
+      await Promise.resolve(saveAttemptState(accountId, actionId, { status: "unavailable", code, preservedLkg: true })).catch(() => {});
+      return { accountId, status: "unavailable", code, preservedLkg: true, disposition: "exported" };
+    }
+    // No prior success: represent unavailable with a typed code and NO fabricated brands.
+    await Promise.resolve(save(accountId, {
+      catalogBrands: [], catalogSyncStatus: "unavailable", catalogSyncCode: code, catalogSyncedAt: now(),
+    })).catch(() => {});
+    await Promise.resolve(saveAttemptState(accountId, actionId, { status: "unavailable", code, preservedLkg: false })).catch(() => {});
+    return { accountId, status: "unavailable", code, preservedLkg: false, disposition: "exported" };
+  } finally {
+    // Release the short-lived claim as soon as this invocation is done. The DURABLE
+    // attempt marker (not the lock) is what blocks same-action replays afterwards.
+    await Promise.resolve(releaseAttempt(accountId, actionId)).catch(() => {});
   }
 }
 
-async function syncBrandCatalogBatch(accountIds, connections) {
-  const byConnection = new Map();
-  for (const accountId of [...new Set(accountIds.map(String))].sort()) {
-    const scope = resolveDataDoeAccountIds([accountId], connections);
-    const group = byConnection.get(scope.connection.id) || { connection: scope.connection, accounts: [] };
-    group.accounts.push({ accountId, rawAccountId: scope.rawAccountIds[0], connection: scope.connection });
-    byConnection.set(scope.connection.id, group);
+// Process a BOUNDED, already-sliced batch of accounts sequentially (kind to DataDoe
+// rate limits within the serverless budget). Primary-only: a dormant dd-secondary
+// record, or any id that does not resolve to the primary connection, is skipped
+// read-only and never routed through the primary key. `deps.attemptAccount` is an
+// injection seam so the queue can be driven offline without real I/O.
+export async function syncBrandCatalogBatch(accountIds, connections, deps = {}) {
+  const actionId = deps.actionId || null;
+  const results = [];
+  for (const accountId of [...new Set((accountIds || []).map(String))]) {
+    if (typeof deps.attemptAccount === "function") {
+      results.push(await deps.attemptAccount(accountId));
+      continue;
+    }
+    if (!isPrimaryCatalogAccount(accountId)) continue;
+    let scope;
+    try {
+      scope = resolveDataDoeAccountIds([accountId], connections);
+    } catch {
+      continue; // unresolvable/dormant -> skip read-only
+    }
+    if (!scope || scope.connection.id !== "primary") continue;
+    results.push(await syncAccountBrandCatalog({ accountId, rawAccountId: scope.rawAccountIds[0], connection: scope.connection, actionId }, deps));
   }
-  const work = [...byConnection.values()]
-    .flatMap((group) => group.accounts.slice(0, BRAND_CATALOG_ACCOUNTS_PER_CONNECTION));
-  return Promise.all(work.map(syncAccountBrandCatalog));
+  return results;
+}
+
+// SERVER-OWNED action orchestrator. The durable manifest -- not the browser cursor --
+// owns the queue. One invocation attempts AT MOST ONE account (one export maximum), and
+// only advances the queue once a durable attempt state is positively confirmed.
+//
+// Returns either { conflict: true, code } (the handler answers a plain admin-safe 409
+// BEFORE any DataDoe call) or an outcome:
+//   { conflict:false, manifest, next, attempted, disposition, remaining, status, operationalCode }
+// where `remaining` is the AUTHORITATIVE server queue and `status` is one of
+// "in-progress" | "complete" | "operational-failure".
+//
+// Blocker-6 behaviour is preserved: a first click derives `remaining` from THIS action's
+// fresh discovery via catalogSyncEligibleAccounts, so newly connected primary accounts
+// automatically join and removed accounts never do; dd-secondary is never primary.
+export async function orchestrateBrandCatalogAction(input, deps = {}) {
+  const {
+    actionId, userId = null, isContinuation = false, clientCursor = [],
+    authorizedPrimaryIds = [], directory = {}, connections = null,
+  } = input || {};
+  const loadManifest = deps.loadManifest || defaultLoadCatalogActionManifest;
+  const saveManifest = deps.saveManifest || defaultSaveCatalogActionManifest;
+  const scopeHashOf = deps.scopeHashOf || defaultCatalogScopeHash;
+  const attemptOne = deps.attemptOne
+    || ((accountId) => syncBrandCatalogBatch([accountId], connections, { ...deps, actionId }).then((r) => r[0] || null));
+  const nowIso = deps.now || (() => new Date().toISOString());
+  const nowMs = typeof deps.nowMs === "function" ? deps.nowMs : (() => Date.now());
+
+  const CONFLICT = { conflict: true, code: BRAND_DIRECTORY_ACTION_CONFLICT };
+  const done = (manifest, extra = {}) => ({
+    conflict: false, manifest, next: null, attempted: 0, disposition: "none",
+    remaining: manifest.remaining || [], status: manifest.status,
+    operationalCode: manifest.status === "operational-failure" ? (manifest.code || BRAND_DIRECTORY_ACTION_UNAVAILABLE) : null,
+    ...extra,
+  });
+  const opFailure = (manifest) => ({
+    conflict: false, manifest, next: manifest.current || null, attempted: 0, disposition: "operational-failure",
+    remaining: manifest.remaining || [], status: "operational-failure",
+    operationalCode: manifest.code || BRAND_DIRECTORY_ACTION_UNAVAILABLE,
+  });
+  const inProgress = (manifest, nextId) => ({
+    conflict: false, manifest, next: nextId, attempted: 0, disposition: "in-progress",
+    remaining: manifest.remaining || [], status: "in-progress", operationalCode: null,
+  });
+  // CAS-aware manifest write. `saveManifest` returns the NEW rev on a confirmed durable write
+  // (create, or a CAS that won), `false` when the CAS LOST (a concurrent writer moved the row
+  // on), and THROWS on a transport failure. Returns:
+  //   { ok:true }                    -> durable write confirmed (new rev threaded onto `m`);
+  //   { ok:false, conflict:true }    -> CAS lost: a concurrent transition committed first, so
+  //                                     the caller must NOT report its own transition;
+  //   { ok:false, conflict:false }   -> transport failure: the row is UNCHANGED.
+  const writeManifest = async (m) => {
+    try {
+      const res = await saveManifest(actionId, m);
+      if (res === false) return { ok: false, conflict: true };
+      if (typeof res === "number") m.rev = res; // thread the new version for the next write
+      return { ok: true };
+    } catch { return { ok: false, conflict: false }; }
+  };
+  const opFailureUnsaved = (m) => opFailure({ ...m, status: "operational-failure", current: m.current || null, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
+
+  // The handler already validated the token shape and 400/409'd a missing id; fail closed.
+  if (!validCatalogActionId(actionId)) return CONFLICT;
+
+  const primaryScope = [...new Set((authorizedPrimaryIds || []).map(String).filter(isPrimaryCatalogAccount))].sort();
+  const scopeHash = scopeHashOf(primaryScope);
+
+  let manifest = await Promise.resolve(loadManifest(actionId)).catch(() => null);
+
+  if (!manifest) {
+    // A continuation must NEVER create an action implicitly (unknown/changed action id).
+    if (isContinuation) return CONFLICT;
+    // First explicit click: build the durable queue from THIS action's fresh discovery.
+    const remaining = catalogSyncEligibleAccounts(primaryScope, directory);
+    manifest = {
+      actionId, userId: userId || null, scopeHash, primaryAccountIds: primaryScope,
+      remaining, current: null, status: remaining.length ? "in-progress" : "complete",
+      code: null, createdAt: nowIso(), updatedAt: nowIso(),
+      // Far beyond any real refresh; a continuation after this marks the action expired + 409.
+      expiresAt: new Date(nowMs() + BRAND_CATALOG_ACTION_ABANDON_DAYS * 86_400_000).toISOString(),
+    };
+    // Persist the manifest BEFORE any DataDoe call via atomic INSERT-IF-ABSENT. A CREATE CONFLICT
+    // means another request already created this action (a delayed duplicate first click): create
+    // ZERO exports and return a safe 409 reload -- NEVER overwrite or reopen the existing action.
+    // A transport error stops with a typed operational failure (never report completion).
+    const created = await writeManifest(manifest);
+    if (created.conflict) return CONFLICT;
+    if (!created.ok) return opFailureUnsaved(manifest);
+  } else {
+    // A loaded manifest MUST satisfy the shared revision invariant (positive safe integer whose
+    // increment is safe). A missing/zero/negative/fractional/string/NaN/unsafe rev is a
+    // corrupt/legacy row: fail closed (409) BEFORE any DataDoe call or write, and NEVER treat it
+    // as new (which would bypass CAS).
+    if (!isSafeSnapshotRev(manifest.rev)) return CONFLICT;
+    // An existing action: validate ownership + scope BEFORE any DataDoe call. Wrong admin,
+    // a changed/injected/removed scope, an unknown-but-existing action all 409.
+    if (manifest.userId && userId && String(manifest.userId) !== String(userId)) return CONFLICT;
+    if (String(manifest.scopeHash) !== String(scopeHash)) return CONFLICT;
+    // An action past its abandon window is stale: transition it to the terminal "expired"
+    // state (best-effort CAS) and reject with a 409. If the CAS loses to a concurrent
+    // retention/continuation write, the row is already moving to a terminal/next state, so a
+    // 409 is still correct. Retention then prunes it like any terminal.
+    if (manifest.status !== "complete" && manifest.expiresAt && nowMs() > Date.parse(manifest.expiresAt)) {
+      if (manifest.status !== "expired") await writeManifest({ ...manifest, status: "expired", updatedAt: nowIso() });
+      return CONFLICT;
+    }
+    // Any already-terminal action (expired / operational-failure) rejects a continuation.
+    if (manifest.status === "expired") return CONFLICT;
+    if (isContinuation) {
+      // The client cursor is a CONSISTENCY CHECK ONLY: it must match the server queue
+      // exactly (content AND order). Injected, removed, reordered or duplicated ids 409.
+      const cursor = (clientCursor || []).map(String);
+      const authoritative = (manifest.remaining || []).map(String);
+      if (cursor.length !== authoritative.length || cursor.some((id, i) => id !== authoritative[i])) return CONFLICT;
+    } else {
+      // First-click REPLAY of an already-created action: idempotent no-op, return state.
+      return done(manifest);
+    }
+  }
+
+  // A stopped action never auto-retries; a new explicit action id is required.
+  if (manifest.status === "operational-failure") return opFailure(manifest);
+
+  const next = (manifest.remaining || [])[0] || null;
+  if (!next) {
+    if (manifest.status !== "complete") {
+      // Completing an empty queue must be a DURABLE CAS before we report it. A CAS conflict
+      // means the action changed under us -> 409; a transport error -> never report complete
+      // (typed operational; the prior queue is intact).
+      const completed = { ...manifest, status: "complete", current: null, updatedAt: nowIso() };
+      const w = await writeManifest(completed);
+      if (w.conflict) return CONFLICT;
+      if (!w.ok) return opFailureUnsaved(manifest);
+      manifest = completed;
+    }
+    return done(manifest);
+  }
+
+  // EXACTLY ONE account this invocation (one export maximum).
+  const result = await attemptOne(next);
+  const disposition = (result && result.disposition) || "in-progress";
+
+  if (disposition === "operational-failure") {
+    // Claim / attempting-marker persistence failed: ZERO exports, stop the action, keep
+    // `next` in the queue (never silently drop it), never report completion. A CAS conflict
+    // means a concurrent transition committed first -> 409; a transport error still returns a
+    // typed operational response with the prior authoritative (in-progress) queue intact.
+    const stopped = { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE, updatedAt: nowIso() };
+    const w = await writeManifest(stopped);
+    if (w.conflict) return CONFLICT;
+    return opFailure(w.ok ? stopped : { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
+  }
+  if (disposition === "in-progress") {
+    // A concurrent request owns the claim: ZERO exports; do NOT advance and do NOT persist a
+    // manifest write. The queue is UNCHANGED, so there is nothing to make durable, and writing
+    // here would only bump the version and needlessly lose/steal the CAS race against the owner's
+    // real (queue-changing) advance. The client re-continues; a later pass observes the owner's
+    // durable outcome. `current` in the response is an informational hint only.
+    return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
+  }
+  // "exported" or "recorded": a durable TERMINAL attempt is positively confirmed. Advance the
+  // queue ONLY if the CAS write wins. A CAS CONFLICT means a concurrent transition (e.g.
+  // retention expiring the action, or another continuation) committed first -> return 409; the
+  // stale continuation NEVER restores in-progress/complete over it. A transport error leaves the
+  // durable terminal attempt in place, so a later continuation re-observes it (recorded) and
+  // retries only the manifest transition, with ZERO new DataDoe exports.
+  const remaining = (manifest.remaining || []).filter((id) => String(id) !== String(next));
+  const advanced = { ...manifest, remaining, current: null, status: remaining.length ? "in-progress" : "complete", updatedAt: nowIso() };
+  const w = await writeManifest(advanced);
+  if (w.conflict) return CONFLICT;
+  if (!w.ok) return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
+  return { conflict: false, manifest: advanced, next, attempted: disposition === "exported" ? 1 : 0, disposition, remaining, status: advanced.status, operationalCode: null };
 }
 
 function stableSelectionId(prefix, accountIds) {
@@ -479,13 +1192,36 @@ function stableSelectionId(prefix, accountIds) {
 // browser can establish its account scope from Supabase before it reads the
 // saved Brand View directory. The accounts response still filters this shared
 // record by the requesting user's permissions.
+// PURE: reconcile the freshly discovered accounts with the previously saved directory.
+// Discovery is the source of truth for which accounts are ACTIVE, so a brand-new account
+// simply appears (active), with no code, config, or manual mapping. A previously-known
+// account that is no longer discoverable is RETAINED as inactive/read-only (`active:false`)
+// rather than dropped, so its record and its saved last-known-good data are never deleted;
+// it is also never scheduled again (see catalogSyncEligibleAccounts, which uses discovery).
+// If a removed account is rediscovered later it becomes active again. Every discovered
+// account keeps its real public id (a primary raw seller id is never mutated, a secondary
+// keeps its `dd-secondary:` prefix), so primary and dormant secondary records never merge.
+export function mergeAccountDirectory(priorAccounts, discoveredAccounts) {
+  const discovered = Array.isArray(discoveredAccounts) ? discoveredAccounts : [];
+  const discoveredIds = new Set(discovered.map((account) => String(account.id)));
+  const merged = discovered.map((account) => ({ ...account, active: true }));
+  for (const prior of Array.isArray(priorAccounts) ? priorAccounts : []) {
+    if (discoveredIds.has(String(prior.id))) continue; // superseded by the fresh discovery
+    merged.push({ ...prior, active: false }); // inactive/read-only; record + LKG preserved
+  }
+  return merged;
+}
+
 async function persistAccountDirectory(accounts) {
   if (!isSupabaseConfigured() || !accounts.length) return;
   const reportKey = "account-directory";
   const reportVersion = "account-directory-shared-v1";
   const accountId = "__account-directory__";
   const paramsHash = paramsHashFor(reportVersion, {});
-  const payload = { accounts };
+  // Merge with the prior directory so a removed/inaccessible account becomes inactive
+  // (read-only) instead of vanishing, and no saved snapshot is ever deleted.
+  const prior = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
+  const payload = { accounts: mergeAccountDirectory(prior?.payload?.accounts, accounts) };
   const saved = await saveReportSnapshot({
     reportKey,
     accountId,
@@ -568,12 +1304,19 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
     case "accounts":
       return {
         reportKey: "account-directory", reportVersion: "account-directory-shared-v1", accountId: "__account-directory__", params: {}, label: "account directory",
-        present: (payload) => ({
-          ...payload,
-          accounts: access.role === "admin"
-            ? (payload.accounts || [])
-            : (payload.accounts || []).filter((account) => access.accountIds.includes(String(account.id))),
-        }),
+        present: (payload) => {
+          // Inactive (removed/inaccessible) accounts are RETAINED in the durable directory
+          // snapshot as read-only records, but are not offered as selectable accounts, so the
+          // live selector behaves exactly as before. `active !== false` keeps legacy entries
+          // (saved before this field existed) visible.
+          const selectable = (payload.accounts || []).filter((account) => account.active !== false);
+          return {
+            ...payload,
+            accounts: access.role === "admin"
+              ? selectable
+              : selectable.filter((account) => access.accountIds.includes(String(account.id))),
+          };
+        },
       };
     case "brand-directory":
       if (!publicAccountIds.length) return null;
@@ -1302,6 +2045,10 @@ export default async function handler(req, res) {
     // admin-only on the SERVER, not merely hidden in the UI. A non-refresh read of
     // the saved snapshot stays available to any authorised user (Supabase-only).
     if (action === "brand-inventory" && wantsRefresh(req)) assertAdmin(access);
+    // The Brand Directory manual refresh spends Product Catalog exports (one per
+    // eligible account), so the SOURCE-fetch path is admin-only on the SERVER. A
+    // non-refresh read of the shared directory stays available to any authorised user.
+    if (action === "brand-directory" && wantsRefresh(req)) assertAdmin(access);
     // A new browser may not yet have the shared account directory. Brand View
     // remains usable: on its explicit manual refresh only, discover the
     // accounts the user may access and use them to seed the brand directory.
@@ -1313,6 +2060,18 @@ export default async function handler(req, res) {
     // discovery belongs only to the first explicit click; repeating it for
     // every batch would waste DataDoe calls and slow the directory down.
     const continuingBrandDirectorySync = String(req.query.catalogSyncContinue || "") === "1";
+    // Blocker 3: a Brand Directory SYNC (the explicit refresh AND every continuation --
+    // both carry refresh=1) MUST present a valid catalogSyncActionId BEFORE any DataDoe
+    // call, so the once-per-action claim can be scoped. A missing/malformed id on a fresh
+    // refresh is a bad request (400); on a continuation it conflicts with the in-flight
+    // action (409). Cache-only reads never enter this branch and need no action id.
+    const catalogActionId = validCatalogActionId(req.query.catalogSyncActionId);
+    if (action === "brand-directory" && wantsRefresh(req) && !catalogActionId) {
+      res.status(continuingBrandDirectorySync ? 409 : 400).json({
+        error: "A valid catalogSyncActionId is required to sync the Brand Directory. Reload the page and start the refresh again.",
+      });
+      return;
+    }
     if (action === "brand-directory" && wantsRefresh(req) && !continuingBrandDirectorySync) {
       const discovered = await discoverConnectedAccounts(connections);
       discoveredDirectoryAccounts = discovered;
@@ -1588,50 +2347,104 @@ export default async function handler(req, res) {
         return;
       }
       assertAccountAccess(access, publicAccountIds);
-      let directory = await sharedSnapshotBrandAccounts(publicAccountIds);
-      let unresolvedAccountIds = [...directory.catalogPendingAccountIds];
-      let catalogSync = [];
+      // One durable id correlates every request of ONE explicit action; it scopes the
+      // atomic once-per-action claim, the durable attempt markers and the cumulative
+      // this-action failure summary. It was validated (safe token shape, required for a
+      // sync) BEFORE any DataDoe call above; a cache-only read leaves it null.
+      const actionId = catalogActionId;
+      let remainingAccountIds = [];
+      let attempted = 0;
+      let catalogSyncStatus = null; // manifest status surfaced to the browser
+      let catalogSyncCode = null;   // typed admin-safe operational-failure code (never raw)
 
-      // Loading the picker is cache-only. On the explicit button action, seed
-      // one missing account per configured DataDoe organisation, then let the
-      // browser continue in small batches until the shared directory is done.
-      // Existing unavailable catalog snapshots are also retried explicitly,
-      // which lets an administrator recover after adding DataDoe credits.
+      // The explicit directory refresh is driven by a durable SERVER-OWNED action manifest
+      // (keyed by actionId), NOT the browser cursor. A first click builds the queue from
+      // THIS action's fresh discovery; a continuation loads the manifest and advances it by
+      // EXACTLY ONE account (one export maximum). The browser cursor is only a consistency
+      // check; anything that does not match the manifest (unknown/changed action, wrong
+      // admin, changed scope, injected/removed/reordered/duplicated cursor) is a plain 409
+      // BEFORE any DataDoe call. Page load / normal reads never enter this branch.
       if (wantsRefresh(req)) {
-        // A new explicit click retries prior catalog failures after credits or
-        // source access change. Continuation requests process only untouched
-        // accounts, so one blocked account cannot starve the rest of its
-        // DataDoe organisation.
-        const retryUnavailable = String(req.query.retryUnavailable || "") === "1";
-        const retryAccountIds = retryUnavailable ? [...directory.catalogUnavailable.keys()] : [];
-        const targets = [...new Set([...unresolvedAccountIds, ...retryAccountIds])];
-        if (targets.length) {
-          catalogSync = await syncBrandCatalogBatch(targets, connections);
-          directory = await sharedSnapshotBrandAccounts(publicAccountIds);
-          unresolvedAccountIds = [...directory.catalogPendingAccountIds];
+        const carriedCursor = String(req.query.catalogSyncAccountIds || "").split(",").map((s) => s.trim()).filter(Boolean);
+        const authorizedPrimaryIds = [...new Set(publicAccountIds.map(String))].filter(isPrimaryCatalogAccount);
+        // The eligible queue is derived from fresh discovery on the FIRST click only; a
+        // continuation lets the manifest own the queue (directory not needed there).
+        const creationDirectory = continuingBrandDirectorySync
+          ? {}
+          : await sharedSnapshotBrandAccounts(publicAccountIds, { actionId });
+        const orchestrated = await orchestrateBrandCatalogAction({
+          actionId,
+          userId: access.userId || null,
+          isContinuation: continuingBrandDirectorySync,
+          clientCursor: carriedCursor,
+          authorizedPrimaryIds,
+          directory: creationDirectory,
+          connections,
+        });
+        if (orchestrated.conflict) {
+          // Admin-safe 409: the request does not match the server-owned action. No DataDoe
+          // export was created. (legacySharedRefresh's lock is released in the finally.)
+          res.status(409).json({
+            error: "This Brand Directory sync request is no longer valid (its action was not found, changed, or its account scope or queue did not match). Reload the page and start the refresh again.",
+            code: orchestrated.code,
+          });
+          return;
         }
+        attempted = orchestrated.attempted;
+        remainingAccountIds = orchestrated.remaining;
+        catalogSyncStatus = orchestrated.status;
+        catalogSyncCode = orchestrated.operationalCode;
+        // Best-effort retention of OLD manifest/attempt rows, ONCE per action (first click
+        // only). Never fails the refresh, never touches active actions, LKG catalog
+        // snapshots or the account directory.
+        if (!continuingBrandDirectorySync) await pruneBrandCatalogActionRecords().catch(() => {});
       }
 
+      // Read the directory for the response over the authorized scope (brand map + typed
+      // cumulative summary). This is Supabase-only and never calls DataDoe.
+      const directory = await sharedSnapshotBrandAccounts(publicAccountIds, { actionId });
       const saved = serialiseBrandAccountMap(directory.brandAccountIds);
-      const catalogUnavailableAccounts = [...directory.catalogUnavailable.entries()].map(([accountId, error]) => {
+      // Typed, admin-safe cumulative summary, derived from the persisted snapshots so no
+      // failure is lost across continuation batches. It unions: accounts with no usable
+      // saved catalog (catalogUnavailable) AND accounts whose complete brand map is a
+      // preserved LKG but whose latest attempt THIS action failed (catalogActionFailures).
+      // Only typed safe codes are included -- never a raw DataDoe body/source id/URL.
+      const unavailableByAccount = new Map();
+      for (const [id, code] of directory.catalogUnavailable) unavailableByAccount.set(id, { code, preservedLkg: false });
+      for (const [id, code] of directory.catalogActionFailures) if (!unavailableByAccount.has(id)) unavailableByAccount.set(id, { code, preservedLkg: true });
+      const catalogUnavailableAccounts = [...unavailableByAccount.entries()].map(([accountId, { code, preservedLkg }]) => {
         const account = (brandDirectoryAccounts || []).find((entry) => String(entry.id) === String(accountId));
-        return { accountId, name: account?.name || accountId, error };
+        return { accountId, name: account?.name || accountId, code, preservedLkg };
       });
+      const unavailableByCode = {};
+      for (const { code } of catalogUnavailableAccounts) unavailableByCode[code] = (unavailableByCode[code] || 0) + 1;
+
+      const operationalFailure = catalogSyncStatus === "operational-failure";
       await sendLegacyPayload({
         ...saved,
         accounts: brandDirectoryAccounts || [],
-        source: catalogSync.length ? "shared-snapshots-and-catalog-sync" : "shared-snapshots",
-        partial: unresolvedAccountIds.length > 0,
-        unresolvedAccountIds,
+        source: attempted ? "shared-snapshots-and-catalog-sync" : "shared-snapshots",
+        // A stopped action is not "more work to poll" -- the browser should stop, not spin.
+        partial: !operationalFailure && remainingAccountIds.length > 0,
         catalogUnavailableAccounts,
-        catalogSync: {
-          completed: catalogSync.filter((entry) => entry.status === "complete").length,
-          unavailable: catalogSync.filter((entry) => entry.status === "unavailable").length,
-          pendingAccountIds: unresolvedAccountIds,
+        catalogUnavailable: {
+          total: catalogUnavailableAccounts.length,
+          byCode: unavailableByCode,
+          preservedLkg: catalogUnavailableAccounts.filter((entry) => entry.preservedLkg).length,
         },
-        message: saved.brands.length
-          ? null
-          : "No brand data is saved yet. The explicit directory sync is loading Product Catalog data account by account; keep this page open until it completes.",
+        catalogSync: {
+          attempted,
+          remainingAccountIds,
+          // The AUTHORITATIVE server-owned action status. "operational-failure" is a typed,
+          // admin-safe stop (no raw DataDoe/Supabase error); the browser must not auto-retry.
+          status: catalogSyncStatus,
+          code: catalogSyncCode,
+        },
+        message: operationalFailure
+          ? "The Brand Directory sync could not be recorded safely and was stopped before completing. No duplicate export was created; start the refresh again to continue."
+          : (saved.brands.length
+            ? null
+            : "No brand data is saved yet. The explicit directory sync is loading Product Catalog data account by account; keep this page open until it completes."),
       });
       return;
     }

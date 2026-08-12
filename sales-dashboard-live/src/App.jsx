@@ -1431,12 +1431,18 @@ function DashboardApp({ session, access, onSignOut }) {
       let body;
       let batch = 0;
       let requestParams = brandDirectoryCacheParams;
+      // One durable id for the whole explicit action, sent on EVERY request. The server
+      // records it per attempted account so a replayed/tampered continuation cannot spend
+      // a second DataDoe export for an account already attempted this action.
+      const actionId = (globalThis.crypto?.randomUUID?.() || `act-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+      // The typed continuation cursor from the server: the accounts still to attempt in
+      // THIS explicit action. It carries never-attempted AND previously-unavailable
+      // accounts and only ever shrinks, so every eligible account is attempted exactly
+      // once and the loop always terminates (never re-spins on one blocked account).
+      let cursor = [];
       do {
-        ({ body } = await refreshSharedReport({
-          ...requestParams,
-          ...(batch === 0 ? { retryUnavailable: "1" } : {}),
-          ...(batch > 0 ? { catalogSyncContinue: "1" } : {}),
-        }));
+        const continuation = batch > 0 ? { catalogSyncContinue: "1", catalogSyncAccountIds: cursor.join(",") } : {};
+        ({ body } = await refreshSharedReport({ ...requestParams, catalogSyncActionId: actionId, ...continuation }));
         batch += 1;
         if (Array.isArray(body.accounts) && body.accounts.length) {
           requestParams = {
@@ -1444,15 +1450,18 @@ function DashboardApp({ session, access, onSignOut }) {
             ids: body.accounts.map((account) => String(account.id)).filter(Boolean).sort().join(","),
           };
         }
-        const pending = body.catalogSync?.pendingAccountIds || [];
+        cursor = body.catalogSync?.remainingAccountIds || [];
         setBrandDirectoryProgress({
-          completed: Math.max(0, (accounts.length || allowedAccountIds.size) - pending.length),
+          completed: Math.max(0, (accounts.length || allowedAccountIds.size) - cursor.length),
           total: Math.max(1, accounts.length || allowedAccountIds.size),
-          account: pending.length ? `Loading ${pending.length} remaining account${pending.length === 1 ? "" : "s"}` : "Product Catalog",
+          account: cursor.length ? `Loading ${cursor.length} remaining account${cursor.length === 1 ? "" : "s"}` : "Product Catalog",
         });
-        // A catalog source can be blocked by DataDoe credits. Do not spin on
-        // an unavailable account; the API returns no pending IDs in that case.
-        if (!pending.length || batch >= 40) break;
+        // The server owns the queue: follow its remainingAccountIds only, and pass it back
+        // verbatim as a consistency check (never reorder/inject/drop ids). Stop when the
+        // server reports a typed operational-failure stop (never auto-retry it), when the
+        // queue is empty, or at a hard safety cap. The cursor strictly shrinks, so it ends.
+        if (body.catalogSync?.status === "operational-failure") break;
+        if (!cursor.length || batch >= 200) break;
       } while (true);
       setBrandDirectoryBrands(body.brands || []);
       setBrandDirectoryAccounts(body.brandAccounts || {});
@@ -1461,22 +1470,14 @@ function DashboardApp({ session, access, onSignOut }) {
       setBrandDirectoryFetchedAt(new Date());
       const unavailable = body.catalogUnavailableAccounts || [];
       if (unavailable.length) {
-        const groups = new Map();
-        unavailable.forEach((account) => {
-          const connection = String(account.accountId || "").startsWith("dd-secondary:")
-            ? "Secondary DataDoe"
-            : "Primary DataDoe";
-          const error = String(account.error || "Product Catalog is unavailable.");
-          const key = `${connection}|${error}`;
-          groups.set(key, (groups.get(key) || 0) + 1);
-        });
-        const detail = [...groups.entries()]
-          .map(([key, count]) => {
-            const [connection, error] = key.split("|");
-            return `${connection}: ${count} account${count === 1 ? "" : "s"} (${error})`;
-          })
-          .join("; ");
-        setBrandDirectoryError(`Product Catalog could not be read. ${detail}`);
+        // Admin-safe: summarise ONLY the typed codes the server returned. A raw DataDoe
+        // response body, source id, URL or status object is never shown.
+        const total = unavailable.length;
+        const allSourceUnavailable = unavailable.every((account) => account.code === "PRODUCT_CATALOG_SOURCE_UNAVAILABLE");
+        const lead = allSourceUnavailable
+          ? `Product Catalog source is unavailable for ${total} primary account${total === 1 ? "" : "s"}.`
+          : `Product Catalog is unavailable for ${total} primary account${total === 1 ? "" : "s"}.`;
+        setBrandDirectoryError(`${lead} This is an upstream DataDoe primary-organization source-access or configuration issue; brands already saved for other accounts are preserved and still shown.`);
       } else if (body.message || body.partial) {
         setBrandDirectoryError(body.message || "Some account catalogs are still pending. Keep this page open while the directory sync completes.");
       }

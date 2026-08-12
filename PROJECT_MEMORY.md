@@ -2640,6 +2640,552 @@ diff --check` clean. Commits `c76f2d0` (fix), `732163b` (tests), + this docs com
 `api/datadoe.js`, `scripts/test-source-cache.mjs`, `scripts/test-brand-view.mjs`. Nothing
 pushed/merged/deployed; Scheduler v1/v2, migrations, and `HANDOFF.md` untouched.
 
+### Brand Directory catalog retry queue + LKG hotfix (branch feature/brand-view-catalog-retry-hotfix, 2026-08-12)
+
+Off `origin/main` @ `d78c746`. Production symptom after a manual Brand Directory refresh: 14
+primary accounts stuck with saved Product Catalog errors referencing the OBSOLETE long source
+id, and 1 primary account retried with the current short id `68d2de238e` which returned DataDoe
+**404 Source not found**. Root cause: the retry only advanced ONE unavailable account
+(`syncBrandCatalogBatch` sliced 1) and the browser continuation followed only
+`catalogPendingAccountIds`, so unavailable accounts were never carried forward -- the same first
+account was retried each click while the other 14 stale errors never advanced.
+
+Fixes (primary DataDoe only; `DATADOE_API_KEY_SECONDARY` removed):
+
+1. **Retry queue.** The handler now drives a TYPED continuation cursor
+   `catalogSync.remainingAccountIds`, not `catalogPendingAccountIds`. First click's cursor = the
+   full eligible set (never-attempted `catalogPendingAccountIds` PLUS previously-`catalogUnavailable`,
+   primary-only, sorted); a continuation carries exactly the accounts the browser forwards in
+   `catalogSyncAccountIds`. `nextCatalogBatch` slices `BRAND_CATALOG_BATCH_SIZE=5` per request and the
+   cursor only shrinks, so each account is attempted AT MOST ONCE per explicit action and the loop
+   always terminates. `fetchBrandDirectory` stays explicit-only (no `useEffect`) -- no auto-retry on
+   load/nav.
+2. **LKG preserved.** `syncAccountBrandCatalog` never overwrites a prior successful brand map on
+   failure. Outcome state table:
+
+   | catalog result | typed code | prior "complete" snapshot exists | action |
+   | --- | --- | --- | --- |
+   | >=1 usable brand | (complete) | -- | save `catalogSyncStatus:"complete"` (fresh map) |
+   | 404 / source not found | `PRODUCT_CATALOG_SOURCE_UNAVAILABLE` | yes | PRESERVE prior; report only |
+   | timeout / other fetch error | `PRODUCT_CATALOG_FETCH_FAILED` | yes | PRESERVE prior; report only |
+   | row-cap truncation | `PRODUCT_CATALOG_TRUNCATED` | yes | PRESERVE prior; report only |
+   | zero rows / no usable child_asin->product_brand | `PRODUCT_CATALOG_EMPTY` | yes | PRESERVE prior; report only |
+   | any unavailable | (typed code) | no | save unavailable marker, NO fabricated brands |
+
+3. **Safe output.** Raw DataDoe bodies / source ids / URLs / status objects / keys are never
+   persisted or returned. `classifyCatalogError` maps to the four typed codes;
+   `sharedSnapshotBrandAccounts` ignores any legacy raw `catalogSyncError`; the response returns only
+   `catalogUnavailableAccounts[].code` + a `catalogUnavailable.byCode` summary; the UI shows e.g.
+   "Product Catalog source is unavailable for 15 primary accounts." The Brand Directory refresh is now
+   admin-only on the SERVER.
+4. **Source id.** The create-export always posts the short id `68d2de238e`; the obsolete long id
+   remains only a canonical/cache alias (never posted, no fallback); `request_hash` stable through the
+   `product-catalog` contract key.
+5. **Zero/unusable catalog** is typed unavailable, never brand coverage, never fabricating "Unassigned".
+6. **Primary-only.** Dormant `dd-secondary:` records are skipped read-only, never stripped onto the
+   primary key.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **18** (+6: 15-attempt-once/terminate, typed classifier, short-id-only + no raw leak,
+LKG survives 404/timeout/truncation/empty/unusable, mixed outcome, primary-only skip) +
+`build:check` **2,394 modules**; `git diff --check` clean. Commits `838e857` (server), `4eb4173`
+(client), `6c68e3a` (tests), + this docs commit. Files: `api/datadoe.js`, `src/App.jsx`,
+`scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed; Scheduler v1/v2, migrations,
+`HANDOFF.md`, and `.worktrees` untouched.
+
+**UNRESOLVED LIVE DataDoe 404 (do not hide).** This is a RETRY-FLOW + data-safety fix only. It does
+NOT make the Product Catalog available. Production already attempted the short id `68d2de238e` for one
+primary account and DataDoe returned **404 Source not found**. If the short id still 404s after this
+fix, that is an UPSTREAM primary-organization source-access/configuration issue (the "Product Catalog
+by ASIN" export source must be enabled/authorized for the primary org, and its live short id
+reconfirmed in DataDoe) -- not a code bug. The code intentionally does NOT guess another id or fall
+back to the obsolete long id. Until DataDoe returns rows, the directory correctly reports the accounts
+as `PRODUCT_CATALOG_SOURCE_UNAVAILABLE` while preserving any previously saved brand maps.
+
+#### Re-review: deadline safety, idempotency, usable-mapping, cumulative failures (2026-08-12)
+
+Four Codex re-review blockers on `feature/brand-view-catalog-retry-hotfix`. Nothing pushed/merged/
+deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits `00bbf2d`
+(server), `cef9053` (client), `b2e1369` (tests), + this docs commit. Files: `api/datadoe.js`,
+`src/App.jsx`, `scripts/test-source-cache.mjs`.
+
+1. **Deadline-safe batching.** `BRAND_CATALOG_BATCH_SIZE = 1` -- EXACTLY ONE Product Catalog export
+   per invocation. `pollExport` can run ~45s (9x5s) plus create+download, so a second export in the
+   same request could exceed Vercel's 60s; one-per-invocation is the strict, provable budget. A slow
+   export can never consume the next cursor item (the next item is untouched this request); the browser
+   continues one account per request. DataDoe exports are never parallelised.
+2. **Cumulative typed failures preserved across batches.** Previously a failure that preserved a
+   complete LKG map vanished from the summary when the next continuation reread the "complete" snapshot.
+   Now every attempt records a durable, action-scoped marker on the snapshot
+   (`catalogAttemptActionId` / `catalogAttemptStatus` / `catalogAttemptCode`) -- for a LKG-preserved
+   failure the brand map + success time are untouched and ONLY the typed attempt is written.
+   `sharedSnapshotBrandAccounts` returns `catalogActionFailures`, so the final summary unions
+   never-covered accounts AND this-action LKG-preserved failures. Only typed safe codes, never raw errors.
+3. **Usable mapping required for success.** `usableCatalogBrands` requires a non-empty `child_asin`
+   joined to a real non-empty `product_brand` ("Unassigned" excluded). `{child_asin:"",
+   product_brand:"Bebi Born"}` => `PRODUCT_CATALOG_EMPTY`, preserve LKG, never save complete coverage.
+4. **Once-per-action / durable idempotency.** The client mints one `catalogSyncActionId` per explicit
+   refresh and sends it on every request. `syncAccountBrandCatalog` SKIPS the export and returns the
+   recorded outcome when the account was already attempted under that action id, so replaying or
+   tampering with a continuation spends ZERO duplicate export (a genuinely new action id re-attempts,
+   as a new user action). Fail closed: the continuation cursor is re-authorised + primary-filtered +
+   deduped every request, the action id is validated to a safe token shape, dd-secondary ids are
+   skipped read-only, and the refresh is admin-only server-side.
+
+Unchanged: short source id `68d2de238e` only in create-export; obsolete long id remains a
+canonical/cache alias, never posted, no fallback; `request_hash` stable via the `product-catalog`
+contract key.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **23** (+5: one-export-per-invocation/slow-export, blank-ASIN unusable, blank-ASIN e2e
+=> EMPTY, replay-zero-duplicate-export, early-batch LKG failure in the final cumulative summary; plus
+the 15=>15-attempt and short-id/no-leak tests retained) + `build:check` **2,394 modules**; `git diff
+--check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** This is a retry-flow + data-safety fix; it does NOT make
+Product Catalog available. The short id `68d2de238e` still returns **404 Source not found** in
+production for the tested primary account -- an UPSTREAM primary-organization source-access/config
+issue (enable/authorize "Product Catalog by ASIN" and reconfirm its live short id in DataDoe). The
+code never guesses another id or falls back to the obsolete long id.
+
+#### Re-review 2: atomic claim, durable attempt store, action-id gate (2026-08-12)
+
+Five Codex re-review blockers on `feature/brand-view-catalog-retry-hotfix`. The previous fix recorded
+the once-per-action marker by rewriting the LKG snapshot AFTER export (raceable, and it advanced the
+successful snapshot's `source_refreshed_at`). This makes claiming atomic and moves attempt state into
+its own durable row. Nothing pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`,
+`.worktrees` untouched. Commits `2ae4882` (server), `221fe4f` (tests), + this docs commit. Files:
+`api/datadoe.js`, `scripts/test-source-cache.mjs` (the client already mints one valid
+`catalogSyncActionId` per refresh and sends it on every request, so it was unchanged).
+
+Mechanism -- reuses existing primitives, **no migration**:
+- **Atomic claim BEFORE create-export.** `claimRefreshLock` (the `claim_report_refresh_lock` DB
+  upsert-with-expiry) is taken on a key scoped by action + account
+  (`reportKey:"brand-catalog-attempt"`, `paramsHash = paramsHashFor(..., {accountId, actionId})`,
+  90s). Exactly one of two concurrent same-(action,account) requests wins; the loser creates ZERO
+  exports and returns an admin-safe `attempting`/`PRODUCT_CATALOG_ATTEMPT_PENDING`. If the claim
+  throws or is refused -> zero exports.
+- **Durable "attempting" marker BEFORE create-export.** Written to the separate attempt row before
+  the fetch. If that write fails -> release + zero exports. Because it persists independent of the
+  lock, a mid-export timeout, a failed outcome write, or a replay after the lock expired all find it
+  and create ZERO further exports. An unknown/attempting state waits for a NEW explicit action id;
+  it is never auto-retried.
+- **Separate durable attempt store (blocker 4 + 5).** Attempt state lives ONLY in the
+  `brand-catalog-attempt` row, keyed by action + account. A failed refresh therefore leaves the
+  successful `brand-catalog` LKG snapshot **byte-identical** -- its brand map AND its
+  `source_refreshed_at` never move (proven byte-for-byte in the test). Two overlapping actions write
+  different rows, so neither clobbers the other's typed cumulative summary.
+  `sharedSnapshotBrandAccounts` reads this-action failures from the attempt row (exact params hash),
+  not from the LKG payload.
+- **Action-id gate (blocker 3).** `validCatalogActionId` (`/^[A-Za-z0-9_-]{1,64}$/`) is enforced in
+  the handler for every directory SYNC (the refresh AND every continuation both carry `refresh=1`)
+  BEFORE `discoverConnectedAccounts` or any export: missing/malformed on a fresh refresh -> **400**,
+  on a continuation -> **409**. Cache-only reads never enter this branch and need no id.
+  `syncAccountBrandCatalog` also fails closed (no export) when `actionId` is null.
+
+State ownership: `brand-catalog` row = LKG coverage (`catalogSyncStatus` complete/unavailable, brand
+map) and is only written on success or a no-prior-success failure -- NEVER on an LKG-preserved
+failure. `brand-catalog-attempt` row = per-action attempt (`status` attempting/complete/unavailable +
+typed `code` + `preservedLkg`). Only typed safe codes cross either boundary; never a raw DataDoe body.
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **28** (+5: two-concurrent=>one-export, claim-write-failure=>zero, outcome-write-failure
++replay=>zero, missing/malformed action id=>zero, failed-refresh LKG byte-identical + per-action row,
+overlapping actions keep separate summaries; the 15-account one-export/request, short-id-only, LKG and
+no-raw-error tests stay green) + `build:check` **2,394 modules**; `git diff --check` clean. Live
+DataDoe 404 note above still stands unchanged.
+
+#### Re-review 3: discovery-driven account auto-scheduling (2026-08-12)
+
+Blocker 6: newly added primary DataDoe accounts must sync with NO code change, deployment, hard-coded
+list, or manual mapping; removed accounts must go read-only without losing their LKG. Nothing
+pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits
+`b0b8acf` (server), `7e6d46f` (tests), + this docs commit. Files: `api/datadoe.js`,
+`scripts/test-source-cache.mjs`.
+
+The admin Brand Directory refresh already rebuilds `publicAccountIds` from live
+`discoverConnectedAccounts` on the first click, so a brand-new primary account (no snapshot -> pending)
+already flowed into the one-export-per-request cursor. This change makes the two decisions PURE,
+tested, and explicitly discovery-driven, and stops removed accounts from being dropped:
+
+- **`catalogSyncEligibleAccounts(discoveredAccountIds, directory)` (pure, exported).** The first-click
+  eligible cursor = the JUST-DISCOVERED primary accounts still needing a one-time attempt (pending OR
+  previously-unavailable), intersected with discovery. A new account is scheduled automatically; a
+  complete account is not in the candidate set (never attempted twice); a REMOVED account (absent from
+  discovery) is never scheduled even if a stale pending/unavailable marker still names it; a
+  `dd-secondary:` record is never primary. The handler's first-click branch now calls it (the
+  continuation branch is unchanged: re-authorise + primary-filter the carried cursor).
+- **`mergeAccountDirectory(prior, discovered)` (pure, exported) + `persistAccountDirectory`.** Discovery
+  is the source of truth for the ACTIVE set. Discovered accounts are `active:true`; a
+  no-longer-discoverable account is RETAINED as `active:false` (inactive/read-only), never dropped, and
+  no saved snapshot is ever deleted (`brand-catalog` is not a retention-managed report; nothing calls
+  delete on it). A rediscovered account flips back to active. The `accounts` selector filters
+  `active !== false`, so the live picker behaves exactly as before (legacy entries with no `active`
+  field stay visible).
+- **Primary vs dormant secondary never merge.** The same raw seller id in both orgs keeps two distinct
+  public ids (`SELLER9` and `dd-secondary:SELLER9`); the primary raw id is used verbatim and the
+  secondary keeps its prefix (`resolveDataDoeAccountIds` routes each; the prefix is stripped only for
+  the secondary's own API call, never mutated on the public id).
+- **Scheduler alignment (no change now).** `lib/server/sync/run-sync.js` already discovers via
+  `fetchAccounts` per connection + `upsertAccountDirectory` with NO hard-coded enumeration, so the
+  "scheduler must later consume the same discovered directory" note is already satisfied on that path;
+  it was intentionally left untouched here.
+
+Page load / navigation stay cache-only (zero exports); discovery + scheduling only run on the explicit
+admin refresh (admin-gated server-side, valid action id required per re-review 2).
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **34** (+6: new account from discovery / no hard-coded id; appended + attempted exactly
+once; complete not attempted twice; removed preserves LKG + never scheduled + retained inactive;
+primary/secondary never merge + secondary id unmutated; adding accounts needs no source-code
+account/country list) + `build:check` **2,394 modules**; `git diff --check` clean. Live DataDoe 404
+note still stands unchanged.
+
+#### Re-review 4: server-owned action manifest + durable queue state machine + retention (2026-08-12)
+
+Three orchestration blockers. The server previously validated only the action-id syntax and trusted
+the browser's `catalogSyncAccountIds` cursor, so a continuation could submit a different valid action
+id and spend another export. Nothing pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`,
+`.worktrees` untouched. Commits `ef2f389` (server), `561698f` (client), `f29197a` (tests), + this docs
+commit. Files: `api/datadoe.js`, `src/App.jsx`, `scripts/test-source-cache.mjs`. Approved blocker-6
+behaviour is preserved unchanged.
+
+**B1 - Durable, server-owned action manifest** (`report_snapshots`, no migration). Report key
+`brand-catalog-action`, fixed account id `__brand-catalog-action__`, differentiated by the action id
+in the params hash. One row per explicit refresh action holds:
+
+| field | meaning |
+|---|---|
+| `actionId` | correlation id for the whole explicit action |
+| `userId` | requesting admin/user identity (where available) |
+| `primaryAccountIds` | discovered authorized PRIMARY account ids (sorted) |
+| `scopeHash` | deterministic hash of `primaryAccountIds` (detects changed/injected/removed scope) |
+| `remaining` | AUTHORITATIVE queue of accounts still to attempt |
+| `current` | account currently in-progress (or null) |
+| `status` | `in-progress` \| `complete` \| `operational-failure` |
+| `code` | typed operational-failure code (else null) |
+| `createdAt` / `updatedAt` | timestamps (updatedAt keeps an active action outside the retention cutoff) |
+
+The manifest -- not the browser cursor -- owns the queue. A first click builds `remaining` from THIS
+action's fresh discovery via `catalogSyncEligibleAccounts` (blocker-6: new primary accounts auto-join,
+removed never do, dd-secondary never primary). A continuation loads the manifest and the client cursor
+is a strict CONSISTENCY CHECK (exact content + order). `orchestrateBrandCatalogAction` returns a plain
+admin-safe **409** BEFORE any DataDoe request for: unknown action, changed action id (continuation with
+no manifest), wrong admin (`userId` mismatch), changed scope (`scopeHash` mismatch -> injected/removed
+account), or injected/removed/reordered/duplicated cursor. A continuation never creates an action
+implicitly. Exactly one export maximum per invocation (the head of `remaining`).
+
+**B2 - Durable queue advancement state machine.** `syncAccountBrandCatalog` now returns a `disposition`
+that tells the orchestrator whether the queue may advance. The account is removed from `remaining` ONLY
+after a durable attempting/terminal state is positively confirmed.
+
+| account/action state | disposition | queue action | exports |
+|---|---|---|---|
+| **pending** (in `remaining`, not yet attempted) | — | stays queued | 0 |
+| **claimed** (won the atomic lock, marker written) | leads to `exported` | — | 1 |
+| **attempting** (durable marker written pre-export) | `exported`/`recorded` | advance (confirmed) | 1 / 0 |
+| **complete** (usable catalog saved) | `exported` (or `recorded` on replay) | advance | 1 / 0 |
+| **unavailable** (typed failure; LKG preserved) | `exported` (or `recorded` on replay) | advance | 1 / 0 |
+| **in-progress** (concurrent owner holds the claim, no terminal yet) | `in-progress` | keep queued, action unresolved | 0 |
+| **operational-failure** (claim or attempting-marker persistence failed) | `operational-failure` | keep queued, STOP action, not complete | 0 |
+| **action-complete** (`remaining` empty) | `none` | — | 0 |
+
+A concurrent claim owner -> zero exports, typed in-progress, the account is NOT falsely removed and the
+action stays unresolved until the durable outcome exists. A claim/attempting-marker persistence failure
+-> zero exports, a typed admin-safe `operational-failure` stop (never reported complete, account never
+silently dropped; the client stops instead of spinning). A failed terminal write keeps the durable
+`attempting` marker so a same-action replay stays at zero exports; an uncertain account is never
+auto-retried under the same action -- only a NEW explicit action attempts it once.
+
+**B3 - Bounded retention.** `pruneBrandCatalogActionRecords` deletes only OLD `brand-catalog-attempt`
+and `brand-catalog-action` rows via the existing `deleteReportSnapshotsOlderThan` (7-day window). It is
+best-effort, runs once per action (first click), never fails a refresh, never deletes active/in-progress
+actions (their `updated_at` is recent, outside the cutoff), and NEVER touches `brand-catalog` LKG or
+`account-directory` snapshots (different report keys). No migration.
+
+No raw DataDoe/Supabase error reaches the browser -- only typed codes
+(`BRAND_DIRECTORY_ACTION_CONFLICT`, `BRAND_DIRECTORY_ACTION_UNAVAILABLE`, and the `PRODUCT_CATALOG_*`
+family). Short Product Catalog id `68d2de238e` remains the only create-export id; the obsolete long id
+is alias-only and never retried.
+
+Verification (exit 0): `node --check` on `api/datadoe.js` + `scripts/test-source-cache.mjs` (App.jsx is
+JSX, validated by `build:check`); `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **51** (+17 orchestration/retention regressions: ACT1->ACT2 409/zero; unknown-action
+409/zero; wrong-admin 409/zero; tampered cursor 409/zero; server manifest picks the next account;
+claim-refusal zero+not-removed+in-progress; two concurrent first clicks => exactly one export;
+attempting-marker-fail zero+operational-failure+not-complete; outcome-write-fail replay zero-additional;
+new account attempted once; complete not re-exported; removed omitted + LKG byte-identical; rediscovered
+active+eligible; primary/dd-secondary never merge; retention prunes only old action/attempt rows; short
+id only; no raw error to browser) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** This is orchestration/data-safety plumbing; it does NOT
+make Product Catalog available. The short id `68d2de238e` remains an UPSTREAM primary-organization
+source-access/configuration issue until it returns rows in a controlled live check.
+
+#### Re-review 5: attempting-not-terminal, durable manifest transitions, status-aware retention (2026-08-12)
+
+Three findings on the orchestration. Nothing pushed/merged/deployed/migrated; scheduler branches,
+`HANDOFF.md`, `.worktrees` untouched; approved blocker-6 behaviour unchanged. Commits `54fc240`
+(report-store helpers), `4039e64` (server), `e3ff897` (tests), + this docs commit. Files:
+`lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs` (no client change -- the
+browser already stops on a typed `operational-failure`, and a 409 surfaces through the existing error
+path).
+
+**FIX 1 - "attempting" is never terminal recorded work.** `syncAccountBrandCatalog` previously returned
+any prior attempt (including `attempting`) as `disposition:"recorded"`, which could advance the queue
+while the original export was still running. Now a NON-terminal marker is classified fail-closed by
+whether the claim is still held (acquire-to-test, then release): held -> `in-progress` (mid-flight);
+free/expired -> stale/uncertain -> a typed operational stop that requires a NEW action id. Only
+`complete`/`unavailable` are terminal `recorded` outcomes that advance. Raw errors are never parsed;
+one export per request.
+
+**FIX 2 - manifest transitions are durable BEFORE the response.** `persistManifestTransition` positively
+confirms every write. On failure the orchestrator NEVER reports advancement/completion/a durable stop,
+creates no new export, and leaves the prior authoritative queue intact. Since a terminal attempt is
+already durable, a failed queue-advance degrades to `in-progress`, so a later continuation re-observes
+the terminal attempt (`recorded`) and retries only the manifest transition with ZERO new exports.
+
+**FIX 3 - status-aware retention (no migration).** New narrow helpers `getReportSnapshotsOlderThan`
+(read old rows + payload) and `deleteReportSnapshotByKey` (exact-row delete) replace report-key-wide age
+deletion. `pruneBrandCatalogActionRecords` enumerates OLD action manifests and deletes ONLY terminal
+ones (`complete`/`operational-failure`/`expired`) -- plus abandoned in-progress actions past a far
+30-day window -- each together with its attempt rows by exact key. An active/in-progress action (and
+its attempts) always survives; `brand-catalog` LKG and `account-directory` are never touched. A
+continuation of an action past its `expiresAt` transitions it to the terminal `expired` state and is
+rejected with a 409. Best-effort; a cleanup failure never throws.
+
+Corrected attempt/action state table:
+
+| observed | claim held? | disposition | queue | exports |
+|---|---|---|---|---|
+| no prior attempt | acquire ok | export -> `exported` | advance | 1 |
+| prior `complete`/`unavailable` (terminal) | n/a | `recorded` | advance | 0 |
+| prior `attempting` | still held | `in-progress` | unchanged | 0 |
+| prior `attempting` | free/expired (stale) | `operational-failure` | stop (new action) | 0 |
+| claim throws / marker write fails | n/a | `operational-failure` | stop | 0 |
+| manifest transition write fails | n/a | `in-progress` (advance) / `operational-failure` (create/in-progress/completion/stop) | prior queue intact | 0 |
+| `remaining` empty + durable complete write | n/a | `none` | complete | 0 |
+
+Retention windows: terminal actions pruned after **7 days**; in-progress actions kept until an
+explicit `expired` transition or the **30-day** abandon window; LKG + account-directory never pruned.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **59** (+8 net: FIX 1 deferred-concurrency A-pauses-in-fetch/B-in-progress-no-advance +
+stale-attempting-stop; orchestration 8 updated to a stop; FIX 2 advance/in-progress/completion/stop
+write-failure + zero-export recovery; FIX 3 status-aware retention + best-effort + expiry->409) +
+`build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Still orchestration/data-safety plumbing; the short id
+`68d2de238e` remains an UPSTREAM primary-organization source-access/configuration issue until it returns
+rows in a controlled live check.
+
+#### Re-review 6: retention integrity -- accurate deletes + expire-before-delete (2026-08-12)
+
+Final retention-integrity finding; all functional orchestration is APPROVED and unchanged. Nothing
+pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits
+`013db6e` (report-store), `3443de5` (server), `ebbc1da` (tests), + this docs commit. Files:
+`lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs`.
+
+**PROBLEM 1 - exact delete no longer hides failure.** `deleteReportSnapshotByKey` used to `.catch`
+internally, so the caller could not tell whether an attempt row was deleted and could delete a manifest
+while orphaning attempt rows. New **exact-delete contract**: it resolves `true` only when the DELETE
+request succeeded (a removed row OR an already-absent row -- an idempotent 2xx no-op) and THROWS on any
+transport/HTTP failure; it never swallows. The best-effort boundary moved to `pruneBrandCatalogActionRecords`.
+**Deletion ordering** per terminal action: delete every attempt row first, positively confirm each (a
+resolved-`false` or a throw both count as failure), and delete the manifest ONLY after all attempt
+deletions succeed. If any attempt deletion fails: keep the manifest AND remaining attempts, stop that
+action, let the next pass retry idempotently. Missing rows count as successful idempotent deletions.
+LKG + account-directory are never touched.
+
+**PROBLEM 2 - in-progress is expired, never directly deleted.** Retention no longer deletes an
+abandoned in-progress manifest. Past its `expiresAt` it re-reads the exact manifest, verifies it is
+STILL `in-progress`, STILL expired, and unchanged since it was listed (payload `updatedAt` guard -- so a
+concurrently-continued action is never clobbered), then durably transitions it to terminal `expired` and
+confirms. Its attempts + manifest are pruned only on a LATER pass, once the persisted `expired` state is
+observed. If the expiry write fails, the in-progress manifest and every attempt row are preserved for
+retry. (A continuation after `expiresAt` still 409s with zero exports -- unchanged.)
+
+Expiry-transition state table (retention pass over an OLD in-progress action):
+
+| re-read state | expiresAt passed? | unchanged since listed? | action | attempts |
+|---|---|---|---|---|
+| in-progress | yes | yes | persist `expired` (confirmed); prune on a later pass | kept |
+| in-progress | yes | NO (continued/updated) | skip (do not clobber) | kept |
+| in-progress | no | — | skip (still active) | kept |
+| not in-progress (already expired/complete/…) | — | — | handled by the terminal branch next pass | — |
+| expiry write FAILS | yes | yes | stays in-progress (retry next pass) | kept |
+
+Failure/retry evidence (tests): attempt-delete failure -> manifest + all attempts survive, no orphan,
+no throw, next pass deletes attempts-then-manifest; manifest-delete failure -> manifest survives + next
+pass idempotent (missing attempt = success); old in-progress -> first pass persists `expired`, not
+deleted, attempts remain; expiry-write failure -> stays in-progress + all attempts survive; confirmed
+old terminal -> attempts first then manifest; recent rows survive; re-read guard skips a continued
+action. Cleanup never throws (best-effort), so a refresh is never failed.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **66** (+7 net: retention 1-6 + the re-read race guard; orchestration 14/14b updated to
+the accurate-delete + expire-before-delete model) + `build:check` **2,394 modules**; `git diff --check`
+clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Retention integrity does not touch source access; the short
+id `68d2de238e` remains an UPSTREAM DataDoe primary-organization source-access/configuration gate until
+it returns rows in a controlled live check.
+
+#### Re-review 7: manifest-transition concurrency -- optimistic CAS on `rev` (2026-08-12)
+
+One remaining P2 race. Retention re-read an in-progress manifest, compared `updatedAt`, then wrote
+`expired` UNCONDITIONALLY; the orchestrator also wrote transitions unconditionally. A continuation
+committing between retention's re-read and its write could be clobbered; if retention wrote first, a
+stale continuation could overwrite `expired`. A read-then-write comparison is not atomic. All approved
+functional orchestration is unchanged. Nothing pushed/merged/deployed/migrated; scheduler branches,
+`HANDOFF.md`, `.worktrees` untouched. Commits `45e1747` (server), `d142813` (tests), + this docs commit.
+Files: `lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs`.
+
+**Mechanism: atomic optimistic concurrency (CAS) on an in-payload version `rev`.** Every EXISTING-manifest
+transition -- in BOTH the orchestrator and retention expiry -- is a compare-and-swap on `rev`. New
+`casUpdateReportSnapshotByRev` issues ONE PostgREST conditional PATCH `?...&payload->>rev=eq.<expected>`
+with `Prefer: return=representation`; the UPDATE's WHERE makes it a single atomic statement, so exactly
+one of two concurrent writers whose expected `rev` matches the stored row wins (returns the row) and the
+other matches zero rows and loses. **No migration** (`rev` lives in the existing jsonb payload). We chose
+an explicit `rev` over `updated_at` (the `report_snapshots_touch_updated_at` trigger would also bump a
+version) because it is writer-controlled, monotonic, immune to timestamp precision, and directly testable;
+it IS the stored row version. `defaultSaveCatalogActionManifest`: `rev == null` -> upsert-create at rev 1;
+else CAS -> new rev on win, `false` on loss, throw on transport error.
+
+Concurrency state table (existing-manifest transition):
+
+| write site | CAS wins | CAS loses (concurrent commit) | transport error |
+|---|---|---|---|
+| orchestrator advance (queue-changing) | advance, status updated | **409** (stale continuation never restores) | in-progress (recovery; terminal attempt durable) |
+| orchestrator completion | complete | **409** | operational (never reports complete) |
+| orchestrator operational-failure | stop persisted | **409** | operational (prior in-progress queue intact) |
+| orchestrator in-progress (concurrent owner) | *(no write -- queue unchanged)* | *(no write)* | *(no write)* |
+| orchestrator continuation-expiry | expired + 409 | 409 (already terminal) | 409 |
+| retention expiry (in-progress -> expired) | expired (pruned later) | **skip** (does not overwrite the continuation) | skip (retry next pass) |
+| create (first click, rev null) | insert at rev 1 | n/a | operational |
+
+The in-progress (concurrent-owner) disposition no longer persists a manifest write: the queue is unchanged,
+so persisting would only bump the version and needlessly lose/steal the CAS race against the owner's real
+advance. Both interleavings are now provably safe:
+- **Race A** (continuation commits between retention's re-read and its expiry CAS): retention's CAS loses
+  -> it does NOT overwrite the continuation.
+- **Race B** (retention expires first): the stale continuation's advance CAS loses -> it 409s and does NOT
+  restore in-progress/complete; no export (the terminal attempt is reused).
+
+Preserved: one export per request, per-(action,account) attempt claims, typed safe codes, LKG,
+attempts-first deletion, dynamic account discovery, primary-only routing, short id `68d2de238e`.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **67** (+1 net: -old updatedAt re-read guard, +P2 race A, +P2 race B; FIX-2 in-progress +
+orchestration-14 model + seeds updated to rev-CAS) + `build:check` **2,394 modules**; `git diff --check`
+clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Concurrency does not touch source access; the short id
+`68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows in a
+controlled live check.
+
+#### Re-review 8: creation race -- insert-if-absent + strict rev validation (2026-08-12)
+
+The rev-CAS for existing transitions was approved; one P1 CREATION race remained. Create used
+`saveReportSnapshot` (a merge-upsert), so two same-action requests that both loaded null could both
+write: a delayed creator could OVERWRITE a manifest already advanced/stopped at rev 2 with its initial
+rev-1 payload, and a corrupt/legacy manifest without a valid rev bypassed CAS (treated as new). Commits
+`d2ae274` (server), `ef235cb` (tests), + this docs commit. Files: `lib/server/supabase.js`,
+`api/datadoe.js`, `scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed/migrated; scheduler
+branches, `HANDOFF.md`, `.worktrees` untouched.
+
+**Atomic insert-if-absent creation.** New `insertReportSnapshotIfAbsent` does a POST with `Prefer:
+resolution=ignore-duplicates,return=representation` on the natural-key unique index
+`(report_key,account_id,params_hash)` -- i.e. `INSERT ... ON CONFLICT DO NOTHING RETURNING`. It NEVER
+merges/overwrites: returns `true` when the row was inserted (non-empty representation), `false` on
+conflict (EMPTY representation), and THROWS on transport/HTTP failure. **No migration** (reuses the
+existing unique index). `defaultSaveCatalogActionManifest` create path returns `1` when inserted or
+`false` on conflict; the CAS path for existing revs is unchanged.
+
+**Strict rev validation.** A loaded manifest must carry a POSITIVE INTEGER `rev` (`isPositiveIntRev`).
+Missing / zero / negative / fractional / string / malformed rev fails closed with a **409** BEFORE any
+DataDoe call or write, and is NEVER treated as new (which would bypass CAS).
+
+Creation state table (first-manifest write / loaded-manifest gate):
+
+| situation | outcome | exports |
+|---|---|---|
+| load null, insert-if-absent inserts | create at rev 1, proceed | as usual |
+| load null, insert-if-absent CONFLICT (row exists) | **409** reload -- never overwrite/reopen | 0 |
+| load null, transport error | operational-failure (never report completion) | 0 |
+| loaded manifest, rev is a positive integer | proceed with CAS transitions | as usual |
+| loaded manifest, rev missing/0/neg/fractional/string/NaN | **409** fail closed, no write, no DataDoe | 0 |
+
+Both delayed-create interleavings are proven safe:
+- **A completed then B's delayed create**: A creates+exports+advances to complete (rev 2); B (loaded
+  missing) resumes create -> insert-if-absent CONFLICT -> 409, status/rev unchanged, ZERO exports.
+- **A stopped then B's delayed create**: A commits operational-failure (rev 2); B's delayed create ->
+  409, does NOT reopen, ZERO exports.
+Plus: malformed/missing stored rev -> 409 with zero writes/exports; two normal concurrent first clicks
+-> exactly one export (the loser 409s); and a production-wrapper test proving `insertReportSnapshotIfAbsent`
+sends ignore-duplicates (never merge), distinguishes inserted vs conflict, and throws on transport
+failure (via a cache-busted configured fresh import + mocked fetch, isolated from the suite).
+
+Preserved: one export per request, per-(action,account) attempt claims, rev-CAS for existing manifests,
+typed safe codes, LKG, attempts-first deletion, dynamic discovery, primary-only routing, short id
+`68d2de238e`.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **71** (+4 net: two delayed-create interleavings + rev-validation + production-wrapper; 6b
+updated) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Creation-race hardening does not touch source access; the
+short id `68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows
+in a controlled live check.
+
+#### Re-review 9: one shared rev invariant, enforced at every boundary (2026-08-12)
+
+The insert-if-absent create and existing-manifest CAS were approved; one fail-closed GAP remained: only
+the ORCHESTRATOR validated a loaded `rev`. Retention CAS-wrote `expired` using `current.rev` without
+validating it, and `defaultSaveCatalogActionManifest` / `casUpdateReportSnapshotByRev` accepted malformed
+non-null revs -- so a string `"1"` would "increment" by concatenation to `"11"`, a `0`/negative/
+fractional/unsafe rev could reach the DB, and a missing rev in retention would be misread as first-create.
+Commits `c4f88d8` (server), `f300b90` (tests), + this docs commit. Files: `lib/server/supabase.js`,
+`api/datadoe.js`, `scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed/migrated; scheduler
+branches, `HANDOFF.md`, `.worktrees` untouched. **No migration.**
+
+**ONE shared invariant** -- `isSafeSnapshotRev(v)` in `lib/server/supabase.js` (imported by `datadoe.js`):
+`Number.isSafeInteger(v) && v > 0 && Number.isSafeInteger(v + 1)` (a positive SAFE integer whose increment
+is also safe). Enforced at EVERY rev boundary. `rev == null` stays valid ONLY for the explicit
+first-create (insert-if-absent) path.
+
+Invalid-revision state table:
+
+| boundary | valid rev | invalid/missing existing rev |
+|---|---|---|
+| orchestrator, after loading an existing manifest | proceed (CAS) | **safe 409** (before any DataDoe call/write) |
+| retention, after re-reading an in-progress manifest, before save | CAS-expire | **skip** -- zero saves, zero deletes; manifest + attempts preserved (never misread null as create) |
+| `defaultSaveCatalogActionManifest`, before the existing-row CAS path | build `payload.rev = rev+1`, CAS | **throw** before any write |
+| `casUpdateReportSnapshotByRev`, before issuing HTTP | PATCH (also requires `payload.rev === expectedRev + 1`) | **throw** before any fetch (zero fetch calls) |
+| first-create (`rev == null`) | insert-if-absent | n/a (only the create path may see null) |
+
+The orchestrator check tightened from "positive integer" to the shared invariant, so it now also rejects
+`MAX_SAFE_INTEGER`/unsafe. `casUpdateReportSnapshotByRev` additionally rejects any `payload.rev` that is
+not exactly `expectedRev + 1`, killing the string-concat "11" shape before it can reach the database.
+
+Preserved: insert-if-absent creation, existing-manifest rev-CAS, one export per request,
+per-(action,account) attempt claims, LKG, attempts-first deletion, dynamic discovery, primary-only
+routing, short id `68d2de238e`; all approved creation-race and two-order CAS tests unchanged and green.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **73** (+2: retention rev-invariant over missing/0/negative/fractional/string/NaN/null/
+MAX_SAFE_INTEGER/unsafe -> zero saves+deletes + preserved; CAS-wrapper malformed expectedRev/payload.rev
+-> zero fetch) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** The rev invariant does not touch source access; the short id
+`68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows in a
+controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
