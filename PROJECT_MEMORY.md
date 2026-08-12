@@ -2980,6 +2980,59 @@ write-failure + zero-export recovery; FIX 3 status-aware retention + best-effort
 `68d2de238e` remains an UPSTREAM primary-organization source-access/configuration issue until it returns
 rows in a controlled live check.
 
+#### Re-review 6: retention integrity -- accurate deletes + expire-before-delete (2026-08-12)
+
+Final retention-integrity finding; all functional orchestration is APPROVED and unchanged. Nothing
+pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits
+`013db6e` (report-store), `3443de5` (server), `ebbc1da` (tests), + this docs commit. Files:
+`lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs`.
+
+**PROBLEM 1 - exact delete no longer hides failure.** `deleteReportSnapshotByKey` used to `.catch`
+internally, so the caller could not tell whether an attempt row was deleted and could delete a manifest
+while orphaning attempt rows. New **exact-delete contract**: it resolves `true` only when the DELETE
+request succeeded (a removed row OR an already-absent row -- an idempotent 2xx no-op) and THROWS on any
+transport/HTTP failure; it never swallows. The best-effort boundary moved to `pruneBrandCatalogActionRecords`.
+**Deletion ordering** per terminal action: delete every attempt row first, positively confirm each (a
+resolved-`false` or a throw both count as failure), and delete the manifest ONLY after all attempt
+deletions succeed. If any attempt deletion fails: keep the manifest AND remaining attempts, stop that
+action, let the next pass retry idempotently. Missing rows count as successful idempotent deletions.
+LKG + account-directory are never touched.
+
+**PROBLEM 2 - in-progress is expired, never directly deleted.** Retention no longer deletes an
+abandoned in-progress manifest. Past its `expiresAt` it re-reads the exact manifest, verifies it is
+STILL `in-progress`, STILL expired, and unchanged since it was listed (payload `updatedAt` guard -- so a
+concurrently-continued action is never clobbered), then durably transitions it to terminal `expired` and
+confirms. Its attempts + manifest are pruned only on a LATER pass, once the persisted `expired` state is
+observed. If the expiry write fails, the in-progress manifest and every attempt row are preserved for
+retry. (A continuation after `expiresAt` still 409s with zero exports -- unchanged.)
+
+Expiry-transition state table (retention pass over an OLD in-progress action):
+
+| re-read state | expiresAt passed? | unchanged since listed? | action | attempts |
+|---|---|---|---|---|
+| in-progress | yes | yes | persist `expired` (confirmed); prune on a later pass | kept |
+| in-progress | yes | NO (continued/updated) | skip (do not clobber) | kept |
+| in-progress | no | — | skip (still active) | kept |
+| not in-progress (already expired/complete/…) | — | — | handled by the terminal branch next pass | — |
+| expiry write FAILS | yes | yes | stays in-progress (retry next pass) | kept |
+
+Failure/retry evidence (tests): attempt-delete failure -> manifest + all attempts survive, no orphan,
+no throw, next pass deletes attempts-then-manifest; manifest-delete failure -> manifest survives + next
+pass idempotent (missing attempt = success); old in-progress -> first pass persists `expired`, not
+deleted, attempts remain; expiry-write failure -> stays in-progress + all attempts survive; confirmed
+old terminal -> attempts first then manifest; recent rows survive; re-read guard skips a continued
+action. Cleanup never throws (best-effort), so a refresh is never failed.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **66** (+7 net: retention 1-6 + the re-read race guard; orchestration 14/14b updated to
+the accurate-delete + expire-before-delete model) + `build:check` **2,394 modules**; `git diff --check`
+clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Retention integrity does not touch source access; the short
+id `68d2de238e` remains an UPSTREAM DataDoe primary-organization source-access/configuration gate until
+it returns rows in a controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
