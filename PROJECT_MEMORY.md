@@ -2795,6 +2795,52 @@ overlapping actions keep separate summaries; the 15-account one-export/request, 
 no-raw-error tests stay green) + `build:check` **2,394 modules**; `git diff --check` clean. Live
 DataDoe 404 note above still stands unchanged.
 
+#### Re-review 3: discovery-driven account auto-scheduling (2026-08-12)
+
+Blocker 6: newly added primary DataDoe accounts must sync with NO code change, deployment, hard-coded
+list, or manual mapping; removed accounts must go read-only without losing their LKG. Nothing
+pushed/merged/deployed/migrated; scheduler branches, `HANDOFF.md`, `.worktrees` untouched. Commits
+`b0b8acf` (server), `7e6d46f` (tests), + this docs commit. Files: `api/datadoe.js`,
+`scripts/test-source-cache.mjs`.
+
+The admin Brand Directory refresh already rebuilds `publicAccountIds` from live
+`discoverConnectedAccounts` on the first click, so a brand-new primary account (no snapshot -> pending)
+already flowed into the one-export-per-request cursor. This change makes the two decisions PURE,
+tested, and explicitly discovery-driven, and stops removed accounts from being dropped:
+
+- **`catalogSyncEligibleAccounts(discoveredAccountIds, directory)` (pure, exported).** The first-click
+  eligible cursor = the JUST-DISCOVERED primary accounts still needing a one-time attempt (pending OR
+  previously-unavailable), intersected with discovery. A new account is scheduled automatically; a
+  complete account is not in the candidate set (never attempted twice); a REMOVED account (absent from
+  discovery) is never scheduled even if a stale pending/unavailable marker still names it; a
+  `dd-secondary:` record is never primary. The handler's first-click branch now calls it (the
+  continuation branch is unchanged: re-authorise + primary-filter the carried cursor).
+- **`mergeAccountDirectory(prior, discovered)` (pure, exported) + `persistAccountDirectory`.** Discovery
+  is the source of truth for the ACTIVE set. Discovered accounts are `active:true`; a
+  no-longer-discoverable account is RETAINED as `active:false` (inactive/read-only), never dropped, and
+  no saved snapshot is ever deleted (`brand-catalog` is not a retention-managed report; nothing calls
+  delete on it). A rediscovered account flips back to active. The `accounts` selector filters
+  `active !== false`, so the live picker behaves exactly as before (legacy entries with no `active`
+  field stay visible).
+- **Primary vs dormant secondary never merge.** The same raw seller id in both orgs keeps two distinct
+  public ids (`SELLER9` and `dd-secondary:SELLER9`); the primary raw id is used verbatim and the
+  secondary keeps its prefix (`resolveDataDoeAccountIds` routes each; the prefix is stripped only for
+  the secondary's own API call, never mutated on the public id).
+- **Scheduler alignment (no change now).** `lib/server/sync/run-sync.js` already discovers via
+  `fetchAccounts` per connection + `upsertAccountDirectory` with NO hard-coded enumeration, so the
+  "scheduler must later consume the same discovered directory" note is already satisfied on that path;
+  it was intentionally left untouched here.
+
+Page load / navigation stay cache-only (zero exports); discovery + scheduling only run on the explicit
+admin refresh (admin-gated server-side, valid action id required per re-review 2).
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **34** (+6: new account from discovery / no hard-coded id; appended + attempted exactly
+once; complete not attempted twice; removed preserves LKG + never scheduled + retained inactive;
+primary/secondary never merge + secondary id unmutated; adding accounts needs no source-code
+account/country list) + `build:check` **2,394 modules**; `git diff --check` clean. Live DataDoe 404
+note still stands unchanged.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
