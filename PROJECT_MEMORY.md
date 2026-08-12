@@ -3142,6 +3142,50 @@ updated) + `build:check` **2,394 modules**; `git diff --check` clean.
 short id `68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows
 in a controlled live check.
 
+#### Re-review 9: one shared rev invariant, enforced at every boundary (2026-08-12)
+
+The insert-if-absent create and existing-manifest CAS were approved; one fail-closed GAP remained: only
+the ORCHESTRATOR validated a loaded `rev`. Retention CAS-wrote `expired` using `current.rev` without
+validating it, and `defaultSaveCatalogActionManifest` / `casUpdateReportSnapshotByRev` accepted malformed
+non-null revs -- so a string `"1"` would "increment" by concatenation to `"11"`, a `0`/negative/
+fractional/unsafe rev could reach the DB, and a missing rev in retention would be misread as first-create.
+Commits `c4f88d8` (server), `f300b90` (tests), + this docs commit. Files: `lib/server/supabase.js`,
+`api/datadoe.js`, `scripts/test-source-cache.mjs`. Nothing pushed/merged/deployed/migrated; scheduler
+branches, `HANDOFF.md`, `.worktrees` untouched. **No migration.**
+
+**ONE shared invariant** -- `isSafeSnapshotRev(v)` in `lib/server/supabase.js` (imported by `datadoe.js`):
+`Number.isSafeInteger(v) && v > 0 && Number.isSafeInteger(v + 1)` (a positive SAFE integer whose increment
+is also safe). Enforced at EVERY rev boundary. `rev == null` stays valid ONLY for the explicit
+first-create (insert-if-absent) path.
+
+Invalid-revision state table:
+
+| boundary | valid rev | invalid/missing existing rev |
+|---|---|---|
+| orchestrator, after loading an existing manifest | proceed (CAS) | **safe 409** (before any DataDoe call/write) |
+| retention, after re-reading an in-progress manifest, before save | CAS-expire | **skip** -- zero saves, zero deletes; manifest + attempts preserved (never misread null as create) |
+| `defaultSaveCatalogActionManifest`, before the existing-row CAS path | build `payload.rev = rev+1`, CAS | **throw** before any write |
+| `casUpdateReportSnapshotByRev`, before issuing HTTP | PATCH (also requires `payload.rev === expectedRev + 1`) | **throw** before any fetch (zero fetch calls) |
+| first-create (`rev == null`) | insert-if-absent | n/a (only the create path may see null) |
+
+The orchestrator check tightened from "positive integer" to the shared invariant, so it now also rejects
+`MAX_SAFE_INTEGER`/unsafe. `casUpdateReportSnapshotByRev` additionally rejects any `payload.rev` that is
+not exactly `expectedRev + 1`, killing the string-concat "11" shape before it can reach the database.
+
+Preserved: insert-if-absent creation, existing-manifest rev-CAS, one export per request,
+per-(action,account) attempt claims, LKG, attempts-first deletion, dynamic discovery, primary-only
+routing, short id `68d2de238e`; all approved creation-race and two-order CAS tests unchanged and green.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **73** (+2: retention rev-invariant over missing/0/negative/fractional/string/NaN/null/
+MAX_SAFE_INTEGER/unsafe -> zero saves+deletes + preserved; CAS-wrapper malformed expectedRev/payload.rev
+-> zero fetch) + `build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** The rev invariant does not touch source access; the short id
+`68d2de238e` remains an UPSTREAM DataDoe source-access/configuration gate until it returns rows in a
+controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
