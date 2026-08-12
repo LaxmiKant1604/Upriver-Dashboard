@@ -26,11 +26,12 @@ import {
   assertAdmin,
   getAdsDailySourceRows,
   claimRefreshLock,
-  deleteReportSnapshotsOlderThan,
+  deleteReportSnapshotByKey,
   getAdDailyMetrics,
   getDashboardAccess,
   getLatestReportSnapshot,
   getReportSnapshot,
+  getReportSnapshotsOlderThan,
   isSupabaseConfigured,
   publishSnapshotUpdate,
   releaseRefreshLock,
@@ -345,15 +346,22 @@ async function defaultSaveCatalogAttemptState(accountId, actionId, state) {
 // and the status. A continuation loads this manifest and may only pass its cursor as a
 // consistency check; it can never define server work or create an action implicitly.
 // Stored in report_snapshots (no migration) under a fixed account id, differentiated by
-// the action id in the params hash, so retention can prune old rows by report_key + age.
+// the action id in the params hash. Retention is STATUS-AWARE (see below), so an
+// in-progress action is never removed merely because it is old.
 const BRAND_CATALOG_ACTION_KEY = "brand-catalog-action";
 const BRAND_CATALOG_ACTION_VERSION = "brand-catalog-action-v1";
 const BRAND_CATALOG_ACTION_ACCOUNT = "__brand-catalog-action__";
-// Old completed/terminal manifests and attempt rows are pruned after this window. An
-// active/in-progress action is written on every step, so its updated_at stays recent and
-// it is never inside the prune cutoff. LKG (brand-catalog) and account-directory rows use
-// different report keys and are NEVER touched by this retention.
+// Terminal actions older than this window are pruned (manifest + their attempt rows). An
+// in-progress action is NEVER pruned merely because it is old.
 const BRAND_CATALOG_ACTION_RETENTION_DAYS = 7;
+// An in-progress action is considered ABANDONED (and rejected/expired) only after this far
+// longer window, well beyond any real refresh (which completes in seconds). A continuation
+// arriving after it transitions the manifest to the terminal "expired" state and is rejected
+// with a 409; retention then prunes the expired action like any other terminal one.
+const BRAND_CATALOG_ACTION_ABANDON_DAYS = 30;
+// Actions in these states are terminal: safe to prune once older than the retention window,
+// and (for anything other than "complete") a continuation is rejected with a 409.
+const TERMINAL_CATALOG_ACTION_STATES = new Set(["complete", "operational-failure", "expired"]);
 
 // Admin-safe codes for the action orchestrator. A conflict is any request that does not
 // match the server-owned manifest (unknown/changed action, wrong admin, changed scope,
@@ -396,15 +404,47 @@ async function defaultSaveCatalogActionManifest(actionId, manifest) {
   });
 }
 
-// BEST-EFFORT retention. Prunes only OLD manifest + attempt rows (by report_key + age);
-// an active action is recent and outside the cutoff, so it survives. Never touches
-// brand-catalog LKG or account-directory snapshots. Must never fail a refresh.
+async function defaultListOldCatalogActions({ cutoffIso }) {
+  const rows = await getReportSnapshotsOlderThan({ reportKey: BRAND_CATALOG_ACTION_KEY, cutoffIso });
+  return (rows || []).map((row) => {
+    const payload = row.payload || {};
+    const accountIds = [
+      ...(Array.isArray(payload.primaryAccountIds) ? payload.primaryAccountIds : []),
+      ...(Array.isArray(payload.remaining) ? payload.remaining : []),
+      ...(payload.current ? [payload.current] : []),
+    ];
+    return { actionId: payload.actionId || row.params?.actionId || null, status: payload.status || null, updatedAt: row.updated_at || null, accountIds: [...new Set(accountIds.map(String))] };
+  });
+}
+
+// STATUS-AWARE, BEST-EFFORT retention. Enumerates OLD action manifests and prunes only the
+// TERMINAL ones (complete / operational-failure / expired) together with their attempt rows,
+// via EXACT-ROW deletes. An in-progress action ALWAYS survives (never age-deleted); its
+// attempt rows are never deleted while it lives. brand-catalog LKG and account-directory
+// snapshots use different report keys and are NEVER touched. Must never fail a refresh.
 export async function pruneBrandCatalogActionRecords(deps = {}) {
-  const deleteOlderThan = deps.deleteOlderThan || deleteReportSnapshotsOlderThan;
+  const listOldActions = deps.listOldActions || defaultListOldCatalogActions;
+  const deleteManifest = deps.deleteManifest || ((actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ACTION_KEY, accountId: BRAND_CATALOG_ACTION_ACCOUNT, paramsHash: catalogActionHash(actionId) }));
+  const deleteAttempt = deps.deleteAttempt || ((accountId, actionId) => deleteReportSnapshotByKey({ reportKey: BRAND_CATALOG_ATTEMPT_KEY, accountId, paramsHash: catalogAttemptHash(accountId, actionId) }));
   const nowMs = typeof deps.nowMs === "function" ? deps.nowMs() : Date.now();
   const cutoffIso = new Date(nowMs - BRAND_CATALOG_ACTION_RETENTION_DAYS * 86_400_000).toISOString();
-  await Promise.resolve(deleteOlderThan({ reportKey: BRAND_CATALOG_ATTEMPT_KEY, cutoffIso })).catch(() => {});
-  await Promise.resolve(deleteOlderThan({ reportKey: BRAND_CATALOG_ACTION_KEY, cutoffIso })).catch(() => {});
+
+  let oldActions;
+  try { oldActions = await listOldActions({ cutoffIso }); } catch { return; } // best-effort
+  for (const action of oldActions || []) {
+    // A terminal action (or an abandoned in-progress action past the far ABANDON window) is
+    // pruned; an active/in-progress action within the abandon window ALWAYS survives.
+    const abandoned = action.status === "in-progress"
+      && action.updatedAt && Date.parse(action.updatedAt) < nowMs - BRAND_CATALOG_ACTION_ABANDON_DAYS * 86_400_000;
+    if (!TERMINAL_CATALOG_ACTION_STATES.has(action.status) && !abandoned) continue;
+    if (!action.actionId) continue;
+    // Delete the attempt rows FIRST, then the manifest -- attempts are only ever removed
+    // together with a confirmed terminal/expired/abandoned action.
+    for (const accountId of action.accountIds || []) {
+      await Promise.resolve(deleteAttempt(accountId, action.actionId)).catch(() => {});
+    }
+    await Promise.resolve(deleteManifest(action.actionId)).catch(() => {});
+  }
 }
 
 // Map a fetch/transport error to a typed code WITHOUT persisting or returning its
@@ -729,31 +769,52 @@ export async function syncAccountBrandCatalog({ accountId, rawAccountId, connect
   // positively confirmed (so the queue may advance) or not:
   //   exported            - one export ran; the "attempting" marker was written first, so
   //                         a durable state is confirmed -> advance.
-  //   recorded            - a durable state already existed (replay / prior holder) -> advance.
-  //   in-progress         - a concurrent request owns the claim and no terminal state exists
-  //                         yet -> zero exports, keep the account unresolved.
-  //   operational-failure - the claim or the attempting-marker could not be persisted ->
-  //                         zero exports, stop the action (never silently drop the account).
+  //   recorded            - a durable TERMINAL state (complete/unavailable) already existed
+  //                         (replay / prior holder finished) -> advance.
+  //   in-progress         - a concurrent request still HOLDS the claim (mid-flight) -> zero
+  //                         exports, keep the account unresolved.
+  //   operational-failure - fail-closed stop: the claim/attempting-marker could not be
+  //                         persisted, OR an "attempting" marker exists whose lock is no
+  //                         longer held (uncertain/stale). Zero exports; a NEW action id is
+  //                         required. "attempting" is NEVER reported as terminal recorded work.
   // Fail closed without an action id: idempotency cannot be scoped, so NO export.
   const attempting = (disposition) => ({ accountId, status: "attempting", code: CATALOG_ATTEMPT_PENDING, preservedLkg: priorComplete, skipped: true, disposition });
   if (!actionId) return attempting("operational-failure");
 
+  const isTerminalState = (state) => state && (state.status === "complete" || state.status === "unavailable");
+  // recorded() is ONLY ever called for a durable TERMINAL state, so the queue may advance.
   const recorded = (state) => {
     const wasComplete = state.status === "complete";
     return {
       accountId,
-      status: wasComplete ? "complete" : (state.status === "attempting" ? "attempting" : "unavailable"),
-      code: wasComplete ? null : (SAFE_CATALOG_CODES.has(state.code) ? state.code : (state.status === "attempting" ? CATALOG_ATTEMPT_PENDING : CATALOG_SOURCE_UNAVAILABLE)),
+      status: wasComplete ? "complete" : "unavailable",
+      code: wasComplete ? null : (SAFE_CATALOG_CODES.has(state.code) ? state.code : CATALOG_SOURCE_UNAVAILABLE),
       preservedLkg: !wasComplete && (state.preservedLkg || priorComplete),
       skipped: true,
       disposition: "recorded",
     };
   };
 
-  // Durable replay guard (fast path, no lock): this account already has a recorded
-  // attempt under THIS action -> return it WITHOUT another export.
+  // Fail-closed classification of an existing NON-terminal ("attempting") marker: is the
+  // original claim still held (mid-flight -> in-progress) or not (stale/uncertain -> stop)?
+  // Determined by trying to acquire the claim: a refusal means it is still held; acquiring a
+  // free/expired lock proves the attempt is stale, so we release it and STOP -- never a
+  // second export under the same action.
+  const classifyAttempting = async () => {
+    let acquired = false;
+    let failed = false;
+    try { acquired = Boolean(await claimAttempt(accountId, actionId)); } catch { failed = true; }
+    if (failed) return attempting("operational-failure"); // cannot tell -> fail closed
+    if (!acquired) return attempting("in-progress"); // the owner still holds the claim
+    await Promise.resolve(releaseAttempt(accountId, actionId)).catch(() => {});
+    return attempting("operational-failure"); // stale attempting with a free lock -> stop
+  };
+
+  // Durable replay guard (fast path): this account already has an attempt under THIS action.
+  // A TERMINAL attempt advances; an "attempting" attempt is NEVER treated as terminal.
   const priorAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
-  if (priorAttempt && priorAttempt.status) return recorded(priorAttempt);
+  if (isTerminalState(priorAttempt)) return recorded(priorAttempt);
+  if (priorAttempt && priorAttempt.status === "attempting") return classifyAttempting();
 
   // ATOMIC claim BEFORE any DataDoe call. A THROW is a persistence failure (operational);
   // a REFUSAL means a concurrent request owns the claim. Either way, ZERO exports here.
@@ -762,18 +823,20 @@ export async function syncAccountBrandCatalog({ accountId, rawAccountId, connect
   try { claimed = Boolean(await claimAttempt(accountId, actionId)); } catch { claimFailed = true; }
   if (claimFailed) return attempting("operational-failure"); // claim persistence failed -> stop
   if (!claimed) {
-    // A concurrent owner holds the claim. Read the durable state: a TERMINAL state means the
-    // owner already finished (advance); otherwise the owner is mid-flight (keep unresolved).
+    // A concurrent owner holds the claim. A TERMINAL durable state means it already finished
+    // (advance); an "attempting"/absent state means it is mid-flight (keep unresolved).
     const concurrent = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
-    if (concurrent && (concurrent.status === "complete" || concurrent.status === "unavailable")) return recorded(concurrent);
+    if (isTerminalState(concurrent)) return recorded(concurrent);
     return attempting("in-progress");
   }
 
   try {
-    // Re-read under the claim: a prior holder may have written a terminal marker and
-    // released the lock between our fast-path read and this claim. Honour it -> no export.
+    // Re-read under the claim: a prior holder may have written a state between our fast-path
+    // read and this claim. A TERMINAL state advances; a pre-existing "attempting" marker while
+    // WE now hold the (free/expired) lock is stale -> stop, never a second export.
     const claimedAttempt = await Promise.resolve(getAttemptState(accountId, actionId)).catch(() => null);
-    if (claimedAttempt && claimedAttempt.status) return recorded(claimedAttempt);
+    if (isTerminalState(claimedAttempt)) return recorded(claimedAttempt);
+    if (claimedAttempt && claimedAttempt.status === "attempting") return attempting("operational-failure");
 
     // Persist the durable "attempting" marker BEFORE the create-export. If this write
     // fails, create ZERO exports and stop the action. Once written, it survives a mid-export
@@ -879,6 +942,7 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
   const attemptOne = deps.attemptOne
     || ((accountId) => syncBrandCatalogBatch([accountId], connections, { ...deps, actionId }).then((r) => r[0] || null));
   const nowIso = deps.now || (() => new Date().toISOString());
+  const nowMs = typeof deps.nowMs === "function" ? deps.nowMs : (() => Date.now());
 
   const CONFLICT = { conflict: true, code: BRAND_DIRECTORY_ACTION_CONFLICT };
   const done = (manifest, extra = {}) => ({
@@ -892,6 +956,18 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
     remaining: manifest.remaining || [], status: "operational-failure",
     operationalCode: manifest.code || BRAND_DIRECTORY_ACTION_UNAVAILABLE,
   });
+  const inProgress = (manifest, nextId) => ({
+    conflict: false, manifest, next: nextId, attempted: 0, disposition: "in-progress",
+    remaining: manifest.remaining || [], status: "in-progress", operationalCode: null,
+  });
+  // POSITIVELY confirm a manifest write. Returns { ok:true } only after the durable write
+  // succeeds; { ok:false } otherwise. Callers must NOT report advancement/completion/stop on
+  // a false result -- they fall back to a typed operational state with the prior queue intact.
+  const persistManifestTransition = async (m) => {
+    try { await saveManifest(actionId, m); return { ok: true }; }
+    catch { return { ok: false }; }
+  };
+  const opFailureUnsaved = (m) => opFailure({ ...m, status: "operational-failure", current: m.current || null, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
 
   // The handler already validated the token shape and 400/409'd a missing id; fail closed.
   if (!validCatalogActionId(actionId)) return CONFLICT;
@@ -910,19 +986,25 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
       actionId, userId: userId || null, scopeHash, primaryAccountIds: primaryScope,
       remaining, current: null, status: remaining.length ? "in-progress" : "complete",
       code: null, createdAt: nowIso(), updatedAt: nowIso(),
+      // Far beyond any real refresh; a continuation after this marks the action expired + 409.
+      expiresAt: new Date(nowMs() + BRAND_CATALOG_ACTION_ABANDON_DAYS * 86_400_000).toISOString(),
     };
     // Persist the manifest BEFORE any DataDoe call. If it cannot be persisted, create ZERO
     // exports and stop with a typed operational failure (never report completion).
-    try {
-      await saveManifest(actionId, manifest);
-    } catch {
-      return opFailure({ ...manifest, status: "operational-failure", code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
-    }
+    if (!(await persistManifestTransition(manifest)).ok) return opFailureUnsaved(manifest);
   } else {
     // An existing action: validate ownership + scope BEFORE any DataDoe call. Wrong admin,
     // a changed/injected/removed scope, an unknown-but-existing action all 409.
     if (manifest.userId && userId && String(manifest.userId) !== String(userId)) return CONFLICT;
     if (String(manifest.scopeHash) !== String(scopeHash)) return CONFLICT;
+    // An action past its abandon window is stale: transition it to the terminal "expired"
+    // state (best-effort) and reject with a 409. Retention then prunes it like any terminal.
+    if (manifest.status !== "complete" && manifest.expiresAt && nowMs() > Date.parse(manifest.expiresAt)) {
+      if (manifest.status !== "expired") await persistManifestTransition({ ...manifest, status: "expired", updatedAt: nowIso() });
+      return CONFLICT;
+    }
+    // Any already-terminal action (expired / operational-failure) rejects a continuation.
+    if (manifest.status === "expired") return CONFLICT;
     if (isContinuation) {
       // The client cursor is a CONSISTENCY CHECK ONLY: it must match the server queue
       // exactly (content AND order). Injected, removed, reordered or duplicated ids 409.
@@ -941,8 +1023,11 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
   const next = (manifest.remaining || [])[0] || null;
   if (!next) {
     if (manifest.status !== "complete") {
-      manifest = { ...manifest, status: "complete", current: null, updatedAt: nowIso() };
-      await Promise.resolve(saveManifest(actionId, manifest)).catch(() => {});
+      // Completing an empty queue must be DURABLE before we report it. If the write fails,
+      // never report complete -- return a typed operational state; the prior queue is intact.
+      const completed = { ...manifest, status: "complete", current: null, updatedAt: nowIso() };
+      if (!(await persistManifestTransition(completed)).ok) return opFailureUnsaved(manifest);
+      manifest = completed;
     }
     return done(manifest);
   }
@@ -952,24 +1037,30 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
   const disposition = (result && result.disposition) || "in-progress";
 
   if (disposition === "operational-failure") {
-    // Claim or attempting-marker persistence failed: ZERO exports, stop the action, keep
-    // `next` in the queue (never silently drop it), never report completion.
-    manifest = { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE, updatedAt: nowIso() };
-    await Promise.resolve(saveManifest(actionId, manifest)).catch(() => {});
-    return opFailure(manifest);
+    // Claim / attempting-marker persistence failed: ZERO exports, stop the action, keep
+    // `next` in the queue (never silently drop it), never report completion. The stop is
+    // best-effort persisted; if the write also fails we still return a typed operational
+    // response, and the prior authoritative (in-progress) queue is left intact.
+    const stopped = { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE, updatedAt: nowIso() };
+    await persistManifestTransition(stopped);
+    return opFailure(stopped);
   }
   if (disposition === "in-progress") {
-    // A concurrent request owns the claim: ZERO exports; do NOT advance; keep the action
-    // unresolved so a later continuation can observe the durable outcome.
-    manifest = { ...manifest, current: next, status: "in-progress", updatedAt: nowIso() };
-    await Promise.resolve(saveManifest(actionId, manifest)).catch(() => {});
-    return { conflict: false, manifest, next, attempted: 0, disposition, remaining: manifest.remaining, status: "in-progress", operationalCode: null };
+    // A concurrent request owns the claim: ZERO exports; do NOT advance. Record `current`
+    // durably; if that write fails, return a typed operational state -- the queue is NOT
+    // falsely changed (the prior in-progress queue with `next` still first stays authoritative).
+    const inprog = { ...manifest, current: next, status: "in-progress", updatedAt: nowIso() };
+    if (!(await persistManifestTransition(inprog)).ok) return opFailureUnsaved(manifest);
+    return inProgress(inprog, next);
   }
-  // "exported" or "recorded": a durable attempt state is positively confirmed -> advance.
+  // "exported" or "recorded": a durable TERMINAL attempt is positively confirmed. Advance the
+  // queue ONLY if the manifest write succeeds. If it fails, do NOT report advancement or
+  // completion: the terminal attempt is already durable, so a later continuation re-observes
+  // it (recorded) and retries only the manifest transition, with ZERO new DataDoe exports.
   const remaining = (manifest.remaining || []).filter((id) => String(id) !== String(next));
-  manifest = { ...manifest, remaining, current: null, status: remaining.length ? "in-progress" : "complete", updatedAt: nowIso() };
-  await Promise.resolve(saveManifest(actionId, manifest)).catch(() => {});
-  return { conflict: false, manifest, next, attempted: disposition === "exported" ? 1 : 0, disposition, remaining, status: manifest.status, operationalCode: null };
+  const advanced = { ...manifest, remaining, current: null, status: remaining.length ? "in-progress" : "complete", updatedAt: nowIso() };
+  if (!(await persistManifestTransition(advanced)).ok) return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
+  return { conflict: false, manifest: advanced, next, attempted: disposition === "exported" ? 1 : 0, disposition, remaining, status: advanced.status, operationalCode: null };
 }
 
 function stableSelectionId(prefix, accountIds) {
