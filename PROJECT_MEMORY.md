@@ -2576,6 +2576,42 @@ Brand View **77** + sync **23** + source-cache **6** + `build:check` **2,394-mod
 `git diff --check` clean. Nothing pushed/merged/deployed. Live authenticated browser
 verification remains a deployment gate (app auth-gated locally).
 
+### Primary DataDoe Product Catalog source id corrected (2026-08-12)
+
+On `feature/brand-view-fba-bridge`. The live primary DataDoe organization's Export Source
+ID for Product Catalog by ASIN is the SHORT id `68d2de238e`. The code used the obsolete
+long id `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8`, which now
+returns DataDoe "404 Source not found", so every catalog fetch (Brand Sales/Brand
+Inventory brand map, plus Sales Movers/Listing Health/Buy Box/PPC/Returns/Listing
+Optimizer catalog joins) failed. Fixed:
+
+- `PRODUCT_CATALOG_SOURCE_ID` (`api/datadoe.js`) and `PRODUCT_CATALOG.id`
+  (`lib/server/reports/sources.js`) now send the short id `68d2de238e` — both live request
+  holders, so no report keeps hitting the 404.
+- `source-contracts.js` product-catalog `ids: ["68d2de238e", "<long id>"]` — the short id is
+  the primary/request id; the long id is a LEGACY ALIAS only.
+- request_hash is derived from the canonical contract KEY (`sourceRequestIdentity` uses
+  `contract.key`), so both ids resolve to key `product-catalog` and every cached export +
+  request identity stays IDENTICAL through the id switch. No retry/fallback to the obsolete
+  id exists — it lives only in the alias list for cache/identity resolution, never a request.
+- Zero-row guard: the live table currently has 0 rows, so a fixed fetch now SUCCEEDS with 0
+  rows. `catalogBrandNames` no longer surfaces the "Unassigned" placeholder, so an empty/
+  unmapped catalog yields no brands and an empty ASIN->brand map — brand mapping is treated
+  as unavailable (Brand Inventory already fails closed on an empty map), never fabricating a
+  brand or a zero; real order sales are preserved. Prior Brand Directory/Brand Sales
+  snapshots are untouched (stable request_hash => same cache keys).
+
+Verification (exit 0): `npm run verify` = insight **54** + Brand View **77** + sync **23** +
+source-cache **10** (was 6; +4: alias resolution, static short-id-in-api check, request_hash
+stability across the alias with the obsolete id never posted, and zero-row catalog
+unavailability) + `build:check` **2,394 modules**; `git diff --check` clean. Commits
+`f43f623` (alias), `6c819cb` (short-id + zero-row guard), `4896fec` (tests), + this docs
+commit. Files: `api/datadoe.js`, `lib/server/reports/sources.js`,
+`lib/server/source-contracts.js`, `scripts/test-source-cache.mjs`. Nothing
+pushed/merged/deployed; Scheduler v1/v2, migrations, and `HANDOFF.md` untouched. Live
+confirmation that the short id returns rows once the primary catalog table is populated
+remains a deployment gate.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
