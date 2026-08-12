@@ -205,42 +205,75 @@ await asyncTest("request_hash is stable across the alias: the short id posts the
   }
 });
 
-await asyncTest("a successful ZERO-ROW Product Catalog is unavailable for brand mapping: no fabricated brands or zeros", async () => {
+// Drive buildBrandSalesPayload with mocked DataDoe exports: the Order Line Items export
+// returns real sales; the Product Catalog export returns whatever `catalogRows` gives.
+// `n` distinguishes account ids so each call has a fresh request_hash (no cache reuse).
+async function runBrandSales(catalogRows, n) {
   const originalFetch = global.fetch;
   const sourceByExport = new Map();
+  const postedSourceIds = [];
   let creates = 0;
   global.fetch = async (url, options = {}) => {
     const target = String(url);
     if (target.endsWith("/exports") && options.method === "POST") {
       creates += 1;
-      const id = `bs-${creates}`;
-      sourceByExport.set(id, JSON.parse(options.body).sourceId);
+      const id = `bs${n}-${creates}`;
+      const sourceId = JSON.parse(options.body).sourceId;
+      sourceByExport.set(id, sourceId);
+      postedSourceIds.push(sourceId);
       return new Response(JSON.stringify({ id, status: "COMPLETED" }), { status: 200 });
     }
-    const raw = target.match(/\/exports\/(bs-\d+)\/raw$/);
+    const raw = target.match(new RegExp(`/exports/(bs${n}-\\d+)/raw$`));
     if (raw) {
-      const sourceId = sourceByExport.get(raw[1]);
-      // The Product Catalog (short id) returns ZERO rows; Order Line Items returns real sales.
-      const rows = sourceId === PRODUCT_CATALOG_SHORT_ID
-        ? []
+      const rows = sourceByExport.get(raw[1]) === PRODUCT_CATALOG_SHORT_ID
+        ? catalogRows
         : [{ date: "2026-08-01", child_asin: "A1", seller_or_vendor_id: "S1", seller_or_vendor_name: "Seller", marketplace_country_code: "US", item_price_currency: "USD", total_sales_sum: 100, total_units_sold_sum: 5 }];
       return new Response(JSON.stringify({ rawContent: JSON.stringify(rows) }), { status: 200 });
     }
     throw new Error(`Unexpected request: ${target}`);
   };
   try {
-    const payload = await buildBrandSalesPayload({ apiKey: "dd_api_test", ids: ["req6-acct"], from: "2026-07-01", to: "2026-08-01" });
-    assert.deepEqual(payload.asinBrand, {}, "an empty catalog yields NO ASIN->brand mapping (brand mapping unavailable)");
-    assert.deepEqual(payload.catalogBrands, [], "no fabricated brand: the 'Unassigned' placeholder is never surfaced as a brand");
-    assert.equal(payload.rows.length, 1, "the real order sales are preserved, not dropped");
-    assert.equal(payload.rows[0].total_sales, 100, "sales stay honest, never fabricated as zero");
-    assert.equal(payload.rows[0].product_brand, "Unassigned", "an unmapped sale is bucketed as Unassigned, which is not a real brand");
-    const usedIds = [...sourceByExport.values()];
-    assert.ok(usedIds.includes(PRODUCT_CATALOG_SHORT_ID), "the catalog export used the short live source id");
-    assert.ok(!usedIds.includes(PRODUCT_CATALOG_OBSOLETE_LONG_ID), "the obsolete long id is never posted, even after a zero-row result (no fallback)");
+    const result = await buildBrandSalesPayload({ apiKey: "dd_api_test", ids: [`req6-acct-${n}`], from: "2026-07-01", to: "2026-08-01" }).then(
+      (payload) => ({ payload, postedSourceIds }),
+      (error) => ({ error, postedSourceIds }),
+    );
+    return result;
   } finally {
     global.fetch = originalFetch;
   }
+}
+
+await asyncTest("a successful ZERO-ROW Product Catalog rejects buildBrandSalesPayload (LKG must not be overwritten)", async () => {
+  const { payload, error, postedSourceIds } = await runBrandSales([], 1);
+  assert.equal(payload, undefined, "no payload is returned");
+  assert.ok(error && error.brandSalesUnavailable === true, "a typed, admin-safe unavailable error is thrown");
+  assert.equal(error.message, "Product Catalog has no usable brand mappings yet. Previous saved Brand Sales data was preserved.");
+  assert.doesNotMatch(error.message, /DataDoe|404|export|http/i, "no raw DataDoe detail is exposed");
+  // The short live id was posted for the catalog; the obsolete id is never posted (no fallback).
+  assert.ok(postedSourceIds.includes(PRODUCT_CATALOG_SHORT_ID), "the catalog export used the short live source id");
+  assert.ok(!postedSourceIds.includes(PRODUCT_CATALOG_OBSOLETE_LONG_ID), "the obsolete long id is never posted, even after a zero-row result");
+});
+
+await asyncTest("a non-empty Catalog with NO usable child_asin -> product_brand mappings also rejects", async () => {
+  // Rows exist but carry no usable ASIN+brand pair (blank asin, blank brand).
+  const unusable = [
+    { child_asin: "", product_brand: "Acme" },
+    { child_asin: "A1", product_brand: "" },
+    { child_asin: "   ", product_brand: "   " },
+  ];
+  const { payload, error } = await runBrandSales(unusable, 2);
+  assert.equal(payload, undefined);
+  assert.ok(error && error.brandSalesUnavailable === true, "an unusable-mapping catalog fails closed just like zero rows");
+  assert.equal(error.message, "Product Catalog has no usable brand mappings yet. Previous saved Brand Sales data was preserved.");
+});
+
+await asyncTest("a valid Catalog with usable brand mappings still builds normally", async () => {
+  const { payload, error } = await runBrandSales([{ child_asin: "A1", product_brand: "Bebi Born" }], 3);
+  assert.equal(error, undefined, "a usable catalog does not reject");
+  assert.deepEqual(payload.asinBrand, { A1: "Bebi Born" }, "the ASIN->brand map is populated");
+  assert.deepEqual(payload.catalogBrands, ["Bebi Born"], "the brand list is derived from the mapped sales");
+  assert.equal(payload.rows[0].total_sales, 100, "real order sales are preserved for the saved snapshot");
+  assert.equal(payload.rows[0].product_brand, "Bebi Born", "the mapped brand is attributed");
 });
 
 console.log(`\n${passed} assertions passed`);

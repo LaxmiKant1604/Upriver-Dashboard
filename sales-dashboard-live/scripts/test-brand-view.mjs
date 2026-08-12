@@ -1019,6 +1019,53 @@ await asyncTest("a second simultaneous refresh is refused by the lock instead of
   }
 });
 
+await asyncTest("a Brand Sales build that throws (unusable Catalog) writes ZERO snapshots and preserves the seeded last-known-good", async () => {
+  // A prior valid Brand Sales snapshot is seeded; any POST would overwrite it.
+  const lkgPayload = { asinBrand: { A1: "Bebi Born" }, catalogBrands: ["Bebi Born"], rows: [{ product_brand: "Bebi Born", total_sales: 500 }] };
+  let seeded = {
+    id: "lkg-1", report_key: "brand-sales", account_id: ACCOUNT_A, params_hash: "ph",
+    params: { reportVersion: "brand-sales-shared-v1", from: "2025-05-01", to: "2026-07-27" },
+    payload: lkgPayload, source_refreshed_at: "2026-07-28T00:00:00.000Z", updated_at: "2026-07-28T00:00:00.000Z",
+  };
+  let snapshotPosts = 0;
+  const stub = installFetchStub((request) => {
+    if (request.url.includes("claim_report_refresh_lock")) return { body: true };
+    if (request.method === "POST" && request.url.includes("/rest/v1/report_snapshots")) {
+      snapshotPosts += 1;
+      seeded = { ...seeded, payload: request.body.payload }; // an overwrite, if it ever happened
+      return { body: [seeded] };
+    }
+    if (request.method === "GET" && request.url.includes("/rest/v1/report_snapshots")) return { body: [seeded] };
+    if (request.method === "DELETE" && request.url.includes("report_refresh_locks")) return { body: null };
+    if (request.url.includes("/rest/v1/dashboard_events")) return { body: null };
+    throw new Error(`unexpected request ${request.method} ${request.url}`);
+  });
+  try {
+    const res = makeRes();
+    // The same typed, admin-safe error buildBrandSalesPayload throws when the Product
+    // Catalog has no usable brand mappings. serveSharedReport saves ONLY on build success.
+    await assert.rejects(
+      () => serveSharedReport({
+        res, refresh: true,
+        reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+        accountId: ACCOUNT_A, params: { from: "2025-05-01", to: "2026-08-01" },
+        label: "Dashboard",
+        build: () => {
+          const error = new Error("Product Catalog has no usable brand mappings yet. Previous saved Brand Sales data was preserved.");
+          error.brandSalesUnavailable = true;
+          throw error;
+        },
+      }),
+      /no usable brand mappings/,
+    );
+    assert.equal(snapshotPosts, 0, "a rejected build performs ZERO snapshot writes");
+    assert.deepEqual(seeded.payload, lkgPayload, "the seeded last-known-good Brand Sales snapshot is unchanged (asinBrand/catalogBrands preserved)");
+    assert.ok(stub.calls.some((c) => c.method === "DELETE" && c.url.includes("report_refresh_locks")), "the refresh lock is still released for a later valid refresh");
+  } finally {
+    stub.restore();
+  }
+});
+
 const { getFxRates } = await import("../lib/server/fx.js");
 
 const CACHED_FX_ROW = {
