@@ -167,7 +167,9 @@ export default function BrandPortfolio({
     const confirmed = window.confirm(
       `Fetch latest DataDoe data for ${eligibleCount} mapped account${eligibleCount === 1 ? "" : "s"}?\n\n`
       + "This temporary admin action runs accounts sequentially with no automatic retry. "
-      + "Brand Sales can use up to two DataDoe exports per account. Existing saved data is preserved when an account fails."
+      + "Each account refreshes Brand Sales (up to two DataDoe exports) and then compact FBA inventory "
+      + "(one FBA Inventory Health export, reusing the Product Catalog it just fetched). "
+      + "Existing saved data is preserved when an account fails."
     );
     if (!confirmed) return;
 
@@ -183,23 +185,31 @@ export default function BrandPortfolio({
         onProgress: setSourceProgress,
       });
 
+      // Rebuild the shared portfolio whenever any account saved new sales OR
+      // inventory, so a fresh FBA snapshot shows up even if that account's sales
+      // step failed.
       if (outcome.succeeded.length) {
         const { body, cachedAt } = await refreshReport(reportParams);
         applyReport(body, cachedAt);
         if (isConvertedMode(displayCurrency)) await reloadFx();
       }
 
-      const failedNames = outcome.failed.map(({ account }) => account.name || account.id);
+      // Report each source outcome distinctly. Only account NAMES are shown; raw
+      // upstream DataDoe/Supabase error bodies are never surfaced in the browser.
+      const nameOf = (account) => account.name || account.id;
       const details = [
-        `${outcome.succeeded.length} of ${outcome.attempted} primary account${outcome.attempted === 1 ? "" : "s"} refreshed.`,
+        `${outcome.salesSucceeded.length} of ${outcome.attempted} account${outcome.attempted === 1 ? "" : "s"} refreshed sales; ${outcome.inventorySucceeded.length} refreshed FBA inventory.`,
       ];
-      if (failedNames.length) details.push(`Failed: ${failedNames.join(", ")}. Previous saved data was preserved.`);
+      if (outcome.salesFailed.length) details.push(`Sales failed: ${outcome.salesFailed.map(({ account }) => nameOf(account)).join(", ")}.`);
+      if (outcome.inventoryFailed.length) details.push(`FBA inventory failed: ${outcome.inventoryFailed.map(({ account }) => nameOf(account)).join(", ")}.`);
+      if (outcome.salesFailed.length || outcome.inventoryFailed.length) details.push("Previous saved data was preserved.");
       if (outcome.skipped.length) {
-        details.push(`${outcome.skipped.length} legacy Secondary DataDoe mapping${outcome.skipped.length === 1 ? " was" : "s were"} skipped.`);
+        details.push(`${outcome.skipped.length} legacy Secondary DataDoe mapping${outcome.skipped.length === 1 ? " was" : "s were"} skipped. Move those sellers to the primary DataDoe organization, then reload the account and brand directories.`);
       }
+      const hasExceptions = outcome.salesFailed.length || outcome.inventoryFailed.length || outcome.skipped.length;
       setSourceOutcome({
-        tone: failedNames.length || outcome.skipped.length ? "warning" : "success",
-        title: failedNames.length || outcome.skipped.length ? "Latest data fetched with exceptions" : "Latest data fetched",
+        tone: hasExceptions ? "warning" : "success",
+        title: hasExceptions ? "Latest data fetched with exceptions" : "Latest data fetched",
         detail: details.join(" "),
       });
     } catch {
