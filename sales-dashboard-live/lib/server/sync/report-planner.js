@@ -34,6 +34,8 @@ const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 // long window), so the scheduled SQP/catalog windows match the live route exactly.
 const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_LONG_LOOKBACK_DAYS = 365;
+// Listing & Search Optimizer SQP lookback (days) -- byte-identical to listing-optimizer.js LOOKBACK_DAYS.
+const OPT_LOOKBACK_DAYS = 84;
 
 // Sales Movers lookbacks (days) -- byte-identical to the live builder/sources: the latest-completed-date
 // probe looks back (SALES_TRAFFIC.lagDays 4 + WINDOW_DAYS*3 = 25) days; the shared FBA inventory snapshot
@@ -70,7 +72,16 @@ export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku
 // canonical entry point and MUST NOT flow through the eager generic builder (which would emit weekly +
 // an eager catalog with no account-scoped fallback orchestration). buildShadowReportPlan rejects it
 // fail-closed rather than silently planning or silently dropping a requested key.
-export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank", "sales-movers", "ppc-performance"]);
+export const STAGED_CYCLE_REPORT_KEYS = Object.freeze(["keyword-rank", "sales-movers", "ppc-performance", "listing-optimizer"]);
+
+// Each staged-cycle report -> the account-scoped shadow cycle a caller must use instead of the generic
+// eager builder. Surfaced in the fail-closed rejection so a mis-routed request names its correct entry point.
+const STAGED_CYCLE_ENTRY_POINTS = Object.freeze({
+  "keyword-rank": "runKeywordRankShadowCycle (staged weekly/monthly/catalog)",
+  "sales-movers": "runSalesMoversShadowCycle (staged probe/traffic/ads/inventory/catalog)",
+  "ppc-performance": "runPpcShadowCycle (persisted-Ads signal gates catalog/total-sales)",
+  "listing-optimizer": "runListingOptimizerShadowCycle (staged SQP-weekly kickoff then content catalog)",
+});
 
 // PPC Performance lookback (days) -- byte-identical to ppc.js WINDOW_DAYS (30). The total-sales denominator
 // spans [asOf-29d, asOf]; the catalog is no-date. PPC is NEVER in the generic planner: it must not fetch the
@@ -398,6 +409,50 @@ export function planPpcPerformance({ accountId, country, currency, connections, 
 }
 
 /**
+ * Plan Listing & Search Optimizer for ONE account from that account's OWN typed SQP-weekly signal (never a
+ * global request-key signal). ALWAYS emits the SQP-weekly kickoff over [asOf-84d, asOf]. ONLY when the typed
+ * SQP signal is a validated success (the contract's `validated_success` staged activation -- a genuine
+ * ZERO-ROW SQP success still activates it) does it emit the rich no-date content catalog. A disabled/failed/
+ * unvalidated/missing SQP plans NO catalog (zero catalog tokens; the derive then produces the honest
+ * sqpAvailable:false snapshot or preserves last-known-good). request_hash + primary/dd-secondary isolation
+ * come from the shared resolver; the STAGED-cycle driver (runListingOptimizerShadowCycle) decides WHEN the
+ * catalog export is actually spent. The rich content catalog identity is DISTINCT from the common 4-column
+ * insight catalog (richer columns => different request_hash), so it deliberately does NOT share that export.
+ */
+export function planListingOptimizer({ accountId, country, currency, connections, asOf, sqpSignal = null }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const end = String(asOf);
+  const sqpFrom = addDaysStr(end, -OPT_LOOKBACK_DAYS);
+  const windowsByRequestKey = {
+    "listing-optimizer:sqp-weekly": [{ from: sqpFrom, to: end }],
+  };
+  const dependencySignals = {};
+  if (sqpSignal != null) {
+    dependencySignals["listing-optimizer:sqp-weekly"] = sqpSignal;
+    // Stage the rich catalog ONLY once the typed SQP signal is a validated success (fail closed via the
+    // shared evaluateStagedActivation; a genuine zero-row SQP success still activates it -- no reported-date
+    // requirement). A disabled/failed/unvalidated SQP leaves the catalog window absent => no catalog source.
+    const catalogContract = (REPORT_SOURCE_CONTRACTS["listing-optimizer"] || []).find((c) => c.requestKey === "listing-optimizer:catalog");
+    if (catalogContract && evaluateStagedActivation(catalogContract.activation, sqpSignal)) {
+      windowsByRequestKey["listing-optimizer:catalog"] = [{ from: null, to: null }];
+    }
+  }
+  const sources = reportSourceRequestHashes({
+    reportKey: "listing-optimizer", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country, dependencySignals,
+  });
+  return {
+    reportKey: "listing-optimizer",
+    reportVersion: REPORT_DERIVATIONS["listing-optimizer"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "listing-optimizer", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to: end, rawSellerId: scope.rawSellerId },
+  };
+}
+
+/**
  * Plan Buy Box Loss for ONE account. Emits the exact route windows: the raw daily grain (Profit by SKU &
  * Date) as FOUR ordered non-overlapping 7-day slices covering [asOf-27d, asOf] (splitDateRangeByDays, the
  * SAME helper the builder + derivation use, so the four slices agree by construction), the shared FBA
@@ -530,7 +585,8 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
   // eager builder. A caller that explicitly asks for it here is a bug we surface rather than mis-plan.
   const stagedRequested = requested.filter((key) => STAGED_CYCLE_REPORT_KEYS.includes(key));
   if (stagedRequested.length) {
-    throw new Error(`buildShadowReportPlan cannot plan staged-cycle report(s) [${stagedRequested.join(", ")}]; use runKeywordRankShadowCycle (account-scoped staged weekly/monthly/catalog cycle).`);
+    const directions = stagedRequested.map((key) => `${key} -> ${STAGED_CYCLE_ENTRY_POINTS[key] || "its account-scoped staged cycle"}`).join("; ");
+    throw new Error(`buildShadowReportPlan cannot plan staged-cycle report(s) [${stagedRequested.join(", ")}]; use ${directions}.`);
   }
   const keys = requested.filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
   // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE planning. A

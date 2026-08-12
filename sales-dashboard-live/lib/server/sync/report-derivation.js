@@ -34,6 +34,8 @@ import {
   returnsLeakagePayload,
   listingHealthPayload,
   assertListingHealthCurrencyIsolation,
+  listingOptimizerPayload,
+  listingOptimizerUnavailablePayload,
   ppcPerformancePayload,
 } from "../reports/derivation-core.js";
 import {
@@ -65,6 +67,15 @@ const FBA_INVENTORY_LOOKBACK_DAYS = 10;
 // the long window). The derivation RECOMPUTES both window starts from asOf and pins both endpoints.
 const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_LONG_LOOKBACK_DAYS = 365;
+
+// Listing & Search Optimizer constants -- byte-identical to lib/server/reports/listing-optimizer.js
+// LOOKBACK_DAYS (84) and the SQP_WEEKLY.label / SQP_WEEKLY.enableHint / PRODUCT_CATALOG.label strings from
+// reports/sources.js. The derivation RECOMPUTES the SQP window start from asOf and pins both endpoints, so
+// a caller that shifts the window is rejected; the label/hint match the live sqpAvailable:false snapshot.
+const OPT_LOOKBACK_DAYS = 84;
+const OPT_SQP_LABEL = "Search Query Performance (SQP) by ASIN (Weekly)";
+const OPT_SQP_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable Search Query Performance (SQP) by ASIN (Weekly), then refresh this report again.";
+const OPT_CATALOG_LABEL = "Product Catalog by ASIN";
 
 // Sales Movers constants -- byte-identical to the live builder/sources: SALES_TRAFFIC.lagDays (4),
 // sales-movers.js WINDOW_DAYS (7), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), SALES_TRAFFIC.label.
@@ -884,7 +895,78 @@ const REGISTRY = {
     // fetched_at / saved_at / Date.now().
     latestDataDate: (p) => (p && p.inventoryAvailable && isValidCalendarDate(p.inventorySnapshotDate) ? p.inventorySnapshotDate : null),
   },
-  "listing-optimizer": { snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly"], derivedSourceKeys: [], derive: null },
+  // Listing & Search Optimizer: reproduce the api/datadoe.js `listing-optimizer` payload from the
+  // validated saved fragments. SQP-weekly is the KICKOFF/required-but-DEGRADABLE source: a durable
+  // SOURCE_DISABLED (degraded) yields the faithful sqpAvailable:false snapshot (save-unavailable-snapshot);
+  // a terminal-disabled SQP => blocked; a missing/failed/unreadable SQP => unavailable (LKG preserved). A
+  // validated SQP success (INCLUDING a genuine zero-row success) then REQUIRES the rich no-date content
+  // catalog (staged only after SQP succeeds); a missing/failed/unreadable catalog after SQP success =>
+  // unavailable (LKG preserved). Windows are recomputed from asOf and pinned; a wrong/multi/zero/
+  // cross-account/out-of-window/malformed fragment => invalid (zero writes, LKG preserved). The derive ALSO
+  // fails closed on non-finite SQP counts/rank/price, a malformed median-price currency, and an ambiguous
+  // cross-currency median-price group -- strictness the live route never needs. ZERO DataDoe/network (pure).
+  "listing-optimizer": {
+    // BOTH request keys are optional in the STATIC gate so the no-data path never blocks: SQP-weekly
+    // degrades (disabled => sqpAvailable:false snapshot) and the catalog is CONDITIONALLY required (only
+    // after a validated SQP success). The derive below enforces the real dependency fail-closed.
+    snapshotVersion: "listing-optimizer/v2d-1", optionalRequestKeys: ["listing-optimizer:sqp-weekly", "listing-optimizer:catalog"], derivedSourceKeys: [],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("listing-optimizer derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      // rawSellerId scopes every DataDoe fragment; the PAYLOAD carries the PUBLIC account id (equal to raw
+      // on the primary route), so the snapshot accountId matches the snapshot key + the frontend scope.
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      const from = addDaysStr(asOf, -OPT_LOOKBACK_DAYS);
+
+      const sqp = sources["listing-optimizer:sqp-weekly"];
+      // Durable SOURCE_DISABLED (degraded) => the faithful sqpAvailable:false snapshot; terminal => blocked.
+      if (sqp && sqp.disabled) {
+        if (sourceDisabledOutcome(sqp.disabledPolicy || null).blocks) {
+          throw deriveError("listing-optimizer SQP source is terminally disabled; snapshot blocked.", "blocked");
+        }
+        return listingOptimizerUnavailablePayload({
+          accountId: publicAccountId, asOf, from, lookbackDays: OPT_LOOKBACK_DAYS,
+          sqpUnavailableReason: OPT_SQP_ENABLE_HINT, sqpSourceLabel: OPT_SQP_LABEL,
+        });
+      }
+      // SQP is REQUIRED to kick off: a validated (cleanly-loaded) array is a success ([] is a real empty
+      // success). A missing/failed/unreadable SQP cache => unavailable (last-known-good preserved).
+      if (!sqp || sqp.available !== true || !Array.isArray(sqp.rows)) {
+        throw deriveError("listing-optimizer SQP is required but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
+      }
+      // Exactly one single-account weekly fragment over [asOf-84d, asOf]; every row a plain object whose
+      // date is a real calendar date inside that exact window (recompute the window; never trust a caller).
+      const sqpRows = singleAccountFragmentRows(sqp, "listing-optimizer:sqp-weekly", rawSellerId, from, asOf);
+      assertRowsInWindow(sqpRows, from, asOf, "listing-optimizer weekly SQP");
+
+      // A validated SQP success (incl. zero rows) ACTIVATES the catalog, which is now REQUIRED. A
+      // terminal-disabled catalog => blocked; a missing/failed/unreadable catalog => unavailable (LKG kept).
+      const catalog = sources["listing-optimizer:catalog"];
+      if (!catalog || catalog.available !== true || !Array.isArray(catalog.rows)) {
+        if (catalog && catalog.disabled && sourceDisabledOutcome(catalog.disabledPolicy || null).blocks) {
+          throw deriveError("listing-optimizer catalog is required after SQP success but disabled; snapshot blocked.", "blocked");
+        }
+        throw deriveError("listing-optimizer catalog is required after SQP success but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
+      }
+      // Exactly one single-account NO-DATE catalog fragment; every row a plain object.
+      const catalogRows = noDateFragmentRows(catalog, "listing-optimizer:catalog", rawSellerId);
+      assertPlainObjectRows(catalogRows, "listing-optimizer catalog");
+
+      return listingOptimizerPayload({
+        accountId: publicAccountId, asOf, from, lookbackDays: OPT_LOOKBACK_DAYS,
+        sqpRows, catalogRows, sqpSourceLabel: OPT_SQP_LABEL, contentSourceLabel: OPT_CATALOG_LABEL,
+      });
+    },
+    validatePayload: (p) => !!p && typeof p === "object" && typeof p.sqpAvailable === "boolean"
+      && !!p.window && typeof p.window === "object"
+      && Array.isArray(p.periods) && Array.isArray(p.queries) && Array.isArray(p.products)
+      && Array.isArray(p.catalogBrands) && ("accountId" in p) && ("asOf" in p),
+    // The latest data date is the most recent SQP weekly period (date-only already); no SQP data => null.
+    latestDataDate: (p) => maxIsoDate((p.periods || []).map(String)),
+  },
   // PPC Performance: reproduce the api/datadoe.js `ppc-performance` payload. ALL advertising figures are
   // DERIVED from the persisted Supabase Ads history injected via the derive context (`context.ppcAds`, loaded
   // + validated by the server-only PPC Ads loader) -- this derive makes ZERO DataDoe/network calls and PPC
