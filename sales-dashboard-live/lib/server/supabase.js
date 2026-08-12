@@ -636,6 +636,30 @@ export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHa
   return true;
 }
 
+/**
+ * Optimistic-concurrency (CAS) update of ONE snapshot row's payload, conditional on the
+ * stored optimistic version `payload->>rev`. The WHERE includes the expected rev, so the
+ * UPDATE is a single atomic statement: exactly one of two concurrent writers whose expected
+ * rev matches the stored row wins; the other matches zero rows. Returns `true` when a row was
+ * updated (CAS won), `false` when zero rows matched (CAS lost -- a concurrent write moved the
+ * row on). THROWS on transport failure so the caller can distinguish "lost the race" from
+ * "could not reach the store". Callers pass `payload` already carrying the incremented rev.
+ */
+export async function casUpdateReportSnapshotByRev({ reportKey, accountId, paramsHash, expectedRev, payload, sourceRefreshedAt }) {
+  const params = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+    "payload->>rev": `eq.${expectedRev}`,
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${params}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: { payload, source_refreshed_at: sourceRefreshedAt || new Date().toISOString() },
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
 export async function getAdDailyMetrics(accountId, from, to) {
   const query = new URLSearchParams({
     select: "metric_date,currency,ad_sales,ad_spend,ad_clicks",

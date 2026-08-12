@@ -25,6 +25,7 @@ import {
   assertAccountAccess,
   assertAdmin,
   getAdsDailySourceRows,
+  casUpdateReportSnapshotByRev,
   claimRefreshLock,
   deleteReportSnapshotByKey,
   getAdDailyMetrics,
@@ -343,11 +344,20 @@ async function defaultSaveCatalogAttemptState(accountId, actionId, state) {
 // Durable, SERVER-OWNED action manifest. One row per explicit refresh action, keyed by
 // the action id. It -- not the browser cursor -- owns the work queue: the authoritative
 // list of primary accounts still to attempt, the discovered scope, the requesting admin,
-// and the status. A continuation loads this manifest and may only pass its cursor as a
-// consistency check; it can never define server work or create an action implicitly.
-// Stored in report_snapshots (no migration) under a fixed account id, differentiated by
-// the action id in the params hash. Retention is STATUS-AWARE (see below), so an
-// in-progress action is never removed merely because it is old.
+// the status, and an optimistic-concurrency version `rev`. A continuation loads this manifest
+// and may only pass its cursor as a consistency check; it can never define server work or
+// create an action implicitly. Stored in report_snapshots (no migration) under a fixed account
+// id, differentiated by the action id in the params hash. Retention is STATUS-AWARE (see
+// below), so an in-progress action is never removed merely because it is old.
+//
+// CONCURRENCY: EVERY manifest transition (both the orchestrator's and retention's expiry) is a
+// compare-and-swap on `rev` (see defaultSaveCatalogActionManifest). A write succeeds only if the
+// stored row is still at the rev the writer loaded; otherwise it loses the race and the caller
+// re-decides. This makes the two interleavings safe: a continuation that commits between
+// retention's re-read and its expiry write causes retention's CAS to miss (retention does not
+// overwrite it); and if retention expires first, a stale continuation's CAS misses (it cannot
+// restore in-progress/complete over the expired row -> it 409s). This replaces the earlier
+// updatedAt read-then-write, which was not atomic.
 const BRAND_CATALOG_ACTION_KEY = "brand-catalog-action";
 const BRAND_CATALOG_ACTION_VERSION = "brand-catalog-action-v1";
 const BRAND_CATALOG_ACTION_ACCOUNT = "__brand-catalog-action__";
@@ -391,17 +401,38 @@ async function defaultLoadCatalogActionManifest(actionId) {
   return snapshot?.payload || null;
 }
 
+// Persist a manifest transition. Contract used by BOTH the orchestrator and retention:
+//   - manifest.rev == null  -> CREATE (first write): upsert-insert at rev 1; returns 1.
+//   - manifest.rev is set    -> CAS UPDATE: succeeds only if the stored row is still at that
+//     rev; returns the NEW rev on success, or `false` when the CAS lost (a concurrent write
+//     moved the row on). A transport failure THROWS.
 async function defaultSaveCatalogActionManifest(actionId, manifest) {
   const paramsHash = catalogActionHash(actionId);
-  await saveReportSnapshot({
+  const sourceRefreshedAt = manifest.updatedAt || new Date().toISOString();
+  if (manifest.rev == null) {
+    const payload = { ...manifest, rev: 1 };
+    await saveReportSnapshot({
+      reportKey: BRAND_CATALOG_ACTION_KEY,
+      accountId: BRAND_CATALOG_ACTION_ACCOUNT,
+      paramsHash,
+      params: { reportVersion: BRAND_CATALOG_ACTION_VERSION, actionId },
+      payload,
+      payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+      sourceRefreshedAt,
+    });
+    return 1;
+  }
+  const expectedRev = manifest.rev;
+  const payload = { ...manifest, rev: expectedRev + 1 };
+  const won = await casUpdateReportSnapshotByRev({
     reportKey: BRAND_CATALOG_ACTION_KEY,
     accountId: BRAND_CATALOG_ACTION_ACCOUNT,
     paramsHash,
-    params: { reportVersion: BRAND_CATALOG_ACTION_VERSION, actionId },
-    payload: manifest,
-    payloadBytes: Buffer.byteLength(JSON.stringify(manifest), "utf8"),
-    sourceRefreshedAt: manifest.updatedAt || new Date().toISOString(),
+    expectedRev,
+    payload,
+    sourceRefreshedAt,
   });
+  return won ? expectedRev + 1 : false;
 }
 
 async function defaultListOldCatalogActions({ cutoffIso }) {
@@ -433,10 +464,11 @@ async function defaultListOldCatalogActions({ cutoffIso }) {
 //     action, and let the next pass retry. A missing row is an idempotent success.
 // IN-PROGRESS action, past its expiresAt (abandoned):
 //   - NEVER directly deleted. Re-read its exact manifest, verify it is STILL in-progress and
-//     still expired (guarding against racing a concurrent continuation), then durably transition
-//     it to the terminal "expired" state. Its attempts + manifest are pruned only on a LATER pass
-//     (once the persisted "expired" state is observed). If the expiry write fails, the in-progress
-//     manifest and all its attempts are preserved for retry.
+//     still expired, then durably transition it to the terminal "expired" state via a CAS on the
+//     rev it just read. If a continuation commits between the re-read and the CAS, the CAS LOSES
+//     and retention does not overwrite it. Its attempts + manifest are pruned only on a LATER
+//     pass (once the persisted "expired" state is observed). If the expiry CAS loses or the write
+//     fails, the in-progress manifest and all its attempts are preserved for retry.
 // brand-catalog LKG and account-directory rows use different report keys and are NEVER touched.
 // Must never fail a refresh.
 export async function pruneBrandCatalogActionRecords(deps = {}) {
@@ -476,13 +508,14 @@ export async function pruneBrandCatalogActionRecords(deps = {}) {
     if (action.status !== "in-progress") continue;
     let current;
     try { current = await loadManifest(action.actionId); } catch { continue; } // best-effort
-    // Re-verify EXACT identity + state so a recently-updated (e.g. just-continued) action is not
-    // clobbered: it must still be in-progress, still expired, and unchanged since we listed it.
+    // Re-read guard: it must still be in-progress and still expired. The ATOMIC guard against a
+    // racing continuation is the CAS below (on current.rev) -- not this read-then-check -- so we
+    // do NOT rely on comparing updatedAt.
     if (!current || current.status !== "in-progress") continue;
     if (!(current.expiresAt && Date.parse(current.expiresAt) < nowMs)) continue;
-    if (current.updatedAt && action.updatedAt && String(current.updatedAt) !== String(action.updatedAt)) continue;
-    // Durably transition to "expired" and CONFIRM. On failure, the in-progress manifest and all
-    // its attempt rows are preserved untouched for a later retry. No attempts are deleted here.
+    // Durably transition to "expired" via a CAS on the rev just read. If a continuation committed
+    // between the re-read and here, the CAS LOSES (`confirmed` is false) and retention does NOT
+    // overwrite it; the in-progress manifest and all its attempts are preserved for a later pass.
     await confirmed(() => saveManifest(action.actionId, { ...current, status: "expired", updatedAt: nowIso() }));
   }
 }
@@ -1000,12 +1033,20 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
     conflict: false, manifest, next: nextId, attempted: 0, disposition: "in-progress",
     remaining: manifest.remaining || [], status: "in-progress", operationalCode: null,
   });
-  // POSITIVELY confirm a manifest write. Returns { ok:true } only after the durable write
-  // succeeds; { ok:false } otherwise. Callers must NOT report advancement/completion/stop on
-  // a false result -- they fall back to a typed operational state with the prior queue intact.
-  const persistManifestTransition = async (m) => {
-    try { await saveManifest(actionId, m); return { ok: true }; }
-    catch { return { ok: false }; }
+  // CAS-aware manifest write. `saveManifest` returns the NEW rev on a confirmed durable write
+  // (create, or a CAS that won), `false` when the CAS LOST (a concurrent writer moved the row
+  // on), and THROWS on a transport failure. Returns:
+  //   { ok:true }                    -> durable write confirmed (new rev threaded onto `m`);
+  //   { ok:false, conflict:true }    -> CAS lost: a concurrent transition committed first, so
+  //                                     the caller must NOT report its own transition;
+  //   { ok:false, conflict:false }   -> transport failure: the row is UNCHANGED.
+  const writeManifest = async (m) => {
+    try {
+      const res = await saveManifest(actionId, m);
+      if (res === false) return { ok: false, conflict: true };
+      if (typeof res === "number") m.rev = res; // thread the new version for the next write
+      return { ok: true };
+    } catch { return { ok: false, conflict: false }; }
   };
   const opFailureUnsaved = (m) => opFailure({ ...m, status: "operational-failure", current: m.current || null, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
 
@@ -1031,16 +1072,18 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
     };
     // Persist the manifest BEFORE any DataDoe call. If it cannot be persisted, create ZERO
     // exports and stop with a typed operational failure (never report completion).
-    if (!(await persistManifestTransition(manifest)).ok) return opFailureUnsaved(manifest);
+    if (!(await writeManifest(manifest)).ok) return opFailureUnsaved(manifest);
   } else {
     // An existing action: validate ownership + scope BEFORE any DataDoe call. Wrong admin,
     // a changed/injected/removed scope, an unknown-but-existing action all 409.
     if (manifest.userId && userId && String(manifest.userId) !== String(userId)) return CONFLICT;
     if (String(manifest.scopeHash) !== String(scopeHash)) return CONFLICT;
     // An action past its abandon window is stale: transition it to the terminal "expired"
-    // state (best-effort) and reject with a 409. Retention then prunes it like any terminal.
+    // state (best-effort CAS) and reject with a 409. If the CAS loses to a concurrent
+    // retention/continuation write, the row is already moving to a terminal/next state, so a
+    // 409 is still correct. Retention then prunes it like any terminal.
     if (manifest.status !== "complete" && manifest.expiresAt && nowMs() > Date.parse(manifest.expiresAt)) {
-      if (manifest.status !== "expired") await persistManifestTransition({ ...manifest, status: "expired", updatedAt: nowIso() });
+      if (manifest.status !== "expired") await writeManifest({ ...manifest, status: "expired", updatedAt: nowIso() });
       return CONFLICT;
     }
     // Any already-terminal action (expired / operational-failure) rejects a continuation.
@@ -1063,10 +1106,13 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
   const next = (manifest.remaining || [])[0] || null;
   if (!next) {
     if (manifest.status !== "complete") {
-      // Completing an empty queue must be DURABLE before we report it. If the write fails,
-      // never report complete -- return a typed operational state; the prior queue is intact.
+      // Completing an empty queue must be a DURABLE CAS before we report it. A CAS conflict
+      // means the action changed under us -> 409; a transport error -> never report complete
+      // (typed operational; the prior queue is intact).
       const completed = { ...manifest, status: "complete", current: null, updatedAt: nowIso() };
-      if (!(await persistManifestTransition(completed)).ok) return opFailureUnsaved(manifest);
+      const w = await writeManifest(completed);
+      if (w.conflict) return CONFLICT;
+      if (!w.ok) return opFailureUnsaved(manifest);
       manifest = completed;
     }
     return done(manifest);
@@ -1078,28 +1124,33 @@ export async function orchestrateBrandCatalogAction(input, deps = {}) {
 
   if (disposition === "operational-failure") {
     // Claim / attempting-marker persistence failed: ZERO exports, stop the action, keep
-    // `next` in the queue (never silently drop it), never report completion. The stop is
-    // best-effort persisted; if the write also fails we still return a typed operational
-    // response, and the prior authoritative (in-progress) queue is left intact.
+    // `next` in the queue (never silently drop it), never report completion. A CAS conflict
+    // means a concurrent transition committed first -> 409; a transport error still returns a
+    // typed operational response with the prior authoritative (in-progress) queue intact.
     const stopped = { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE, updatedAt: nowIso() };
-    await persistManifestTransition(stopped);
-    return opFailure(stopped);
+    const w = await writeManifest(stopped);
+    if (w.conflict) return CONFLICT;
+    return opFailure(w.ok ? stopped : { ...manifest, status: "operational-failure", current: next, code: BRAND_DIRECTORY_ACTION_UNAVAILABLE });
   }
   if (disposition === "in-progress") {
-    // A concurrent request owns the claim: ZERO exports; do NOT advance. Record `current`
-    // durably; if that write fails, return a typed operational state -- the queue is NOT
-    // falsely changed (the prior in-progress queue with `next` still first stays authoritative).
-    const inprog = { ...manifest, current: next, status: "in-progress", updatedAt: nowIso() };
-    if (!(await persistManifestTransition(inprog)).ok) return opFailureUnsaved(manifest);
-    return inProgress(inprog, next);
+    // A concurrent request owns the claim: ZERO exports; do NOT advance and do NOT persist a
+    // manifest write. The queue is UNCHANGED, so there is nothing to make durable, and writing
+    // here would only bump the version and needlessly lose/steal the CAS race against the owner's
+    // real (queue-changing) advance. The client re-continues; a later pass observes the owner's
+    // durable outcome. `current` in the response is an informational hint only.
+    return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
   }
   // "exported" or "recorded": a durable TERMINAL attempt is positively confirmed. Advance the
-  // queue ONLY if the manifest write succeeds. If it fails, do NOT report advancement or
-  // completion: the terminal attempt is already durable, so a later continuation re-observes
-  // it (recorded) and retries only the manifest transition, with ZERO new DataDoe exports.
+  // queue ONLY if the CAS write wins. A CAS CONFLICT means a concurrent transition (e.g.
+  // retention expiring the action, or another continuation) committed first -> return 409; the
+  // stale continuation NEVER restores in-progress/complete over it. A transport error leaves the
+  // durable terminal attempt in place, so a later continuation re-observes it (recorded) and
+  // retries only the manifest transition, with ZERO new DataDoe exports.
   const remaining = (manifest.remaining || []).filter((id) => String(id) !== String(next));
   const advanced = { ...manifest, remaining, current: null, status: remaining.length ? "in-progress" : "complete", updatedAt: nowIso() };
-  if (!(await persistManifestTransition(advanced)).ok) return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
+  const w = await writeManifest(advanced);
+  if (w.conflict) return CONFLICT;
+  if (!w.ok) return inProgress({ ...manifest, current: next, status: "in-progress" }, next);
   return { conflict: false, manifest: advanced, next, attempted: disposition === "exported" ? 1 : 0, disposition, remaining, status: advanced.status, operationalCode: null };
 }
 
