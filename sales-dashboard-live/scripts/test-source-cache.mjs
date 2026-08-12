@@ -721,16 +721,30 @@ await asyncTest("blocker 6: adding accounts needs NO source-code account or coun
 
 /* =============== Server-owned action manifest orchestration (blockers 1-3) =============== */
 
-// In-memory action-manifest store. loadManifest deep-copies so the orchestrator's own
-// object never aliases the stored row; saveManifest deep-copies in. manifest() returns the
-// RAW stored row so a test can simulate the server reordering the authoritative queue.
+// In-memory action-manifest store with the SAME optimistic-concurrency (rev CAS) contract as
+// production: loadManifest deep-copies (carrying the stored rev); saveManifest CREATES at rev 1
+// when the incoming manifest has no rev, otherwise CAS-updates -- returning the new rev when the
+// stored row is still at manifest.rev, or `false` when a concurrent write moved it on. manifest()
+// returns the RAW stored row so a test can simulate the server reordering the queue.
 function makeManifestStore() {
   const manifests = new Map();
   return {
     manifests,
     loadManifest: (actionId) => Promise.resolve(manifests.has(actionId) ? JSON.parse(JSON.stringify(manifests.get(actionId))) : null),
-    saveManifest: (actionId, manifest) => { manifests.set(actionId, JSON.parse(JSON.stringify(manifest))); return Promise.resolve(); },
+    saveManifest: (actionId, manifest) => {
+      if (manifest.rev == null) { // create
+        manifests.set(actionId, JSON.parse(JSON.stringify({ ...manifest, rev: 1 })));
+        return Promise.resolve(1);
+      }
+      const cur = manifests.get(actionId);
+      if (!cur || cur.rev !== manifest.rev) return Promise.resolve(false); // CAS lost
+      const rev = manifest.rev + 1;
+      manifests.set(actionId, JSON.parse(JSON.stringify({ ...manifest, rev })));
+      return Promise.resolve(rev);
+    },
     manifest: (actionId) => manifests.get(actionId) || null,
+    // Seed an EXISTING manifest at a given rev (default 1) -- for tests that model a prior action.
+    seed: (actionId, manifest, rev = 1) => { manifests.set(actionId, JSON.parse(JSON.stringify({ ...manifest, rev }))); },
   };
 }
 // Directory shape sharedSnapshotBrandAccounts returns; only the fields the orchestrator reads.
@@ -958,7 +972,7 @@ function makeRetentionModel(NOW) {
   const attempts = new Set(); // `${actionId}::${accountId}`
   const untouchable = new Set(["lkg-catalog", "account-directory"]); // proof these are never deleted
   const add = (actionId, status, ageDays, accountIds, expiresDaysAgo = null) => {
-    actions.set(actionId, { actionId, status, updatedAt: iso(ageDays), expiresAt: expiresDaysAgo == null ? null : iso(expiresDaysAgo), accountIds });
+    actions.set(actionId, { actionId, status, updatedAt: iso(ageDays), expiresAt: expiresDaysAgo == null ? null : iso(expiresDaysAgo), accountIds, rev: 1 });
     for (const id of accountIds) attempts.add(`${actionId}::${id}`);
   };
   return {
@@ -967,7 +981,15 @@ function makeRetentionModel(NOW) {
       [...actions.values()].filter((a) => a.updatedAt < cutoffIso).map((a) => ({ actionId: a.actionId, status: a.status, updatedAt: a.updatedAt, accountIds: a.accountIds }))
     ),
     loadManifest: (actionId) => Promise.resolve(actions.has(actionId) ? JSON.parse(JSON.stringify(actions.get(actionId))) : null),
-    saveManifest: (actionId, m) => { actions.set(actionId, JSON.parse(JSON.stringify(m))); return Promise.resolve(); },
+    // Same rev-CAS contract as production/makeManifestStore.
+    saveManifest: (actionId, m) => {
+      if (m.rev == null) { actions.set(actionId, JSON.parse(JSON.stringify({ ...m, rev: 1 }))); return Promise.resolve(1); }
+      const cur = actions.get(actionId);
+      if (!cur || cur.rev !== m.rev) return Promise.resolve(false);
+      const rev = m.rev + 1;
+      actions.set(actionId, JSON.parse(JSON.stringify({ ...m, rev })));
+      return Promise.resolve(rev);
+    },
     deleteManifest: (actionId) => { actions.delete(actionId); return Promise.resolve(true); },
     deleteAttempt: (accountId, actionId) => { attempts.delete(`${actionId}::${accountId}`); return Promise.resolve(true); },
   };
@@ -1086,16 +1108,48 @@ await asyncTest("retention 6: recent in-progress and recent terminal rows surviv
   assert.ok(m.attempts.has("INPROGRESS_RECENT::A1") && m.attempts.has("COMPLETE_RECENT::A2"), "their attempts survive");
 });
 
-await asyncTest("retention: the expiry re-read guard skips an action that was updated (e.g. continued) since it was listed", async () => {
+/* =============== P2 manifest-transition concurrency (CAS on rev) -- both interleavings =============== */
+
+await asyncTest("P2 race A: a continuation that COMMITS between retention's re-read and its expiry CAS is NOT overwritten by retention", async () => {
   const NOW = Date.parse("2026-08-12T00:00:00.000Z");
   const m = makeRetentionModel(NOW);
-  m.add("INPROGRESS_ABANDONED", "in-progress", 40, ["A1"], 10);
-  // Simulate a concurrent continuation: the fresh read shows a different (newer) updatedAt.
-  const loadManifest = () => Promise.resolve({ actionId: "INPROGRESS_ABANDONED", status: "in-progress", updatedAt: new Date(NOW).toISOString(), expiresAt: new Date(NOW - 10 * 86_400_000).toISOString(), accountIds: ["A1"] });
-  let expired = false;
-  const saveManifest = () => { expired = true; return Promise.resolve(); };
-  await pruneBrandCatalogActionRecords({ ...m, loadManifest, saveManifest, nowMs: () => NOW });
-  assert.equal(expired, false, "a recently-updated action is not clobbered by the expiry transition");
+  m.add("ACT1", "in-progress", 40, ["A1"], 10); // rev 1, expiresAt passed -> retention will try to expire it
+  const realSave = m.saveManifest;
+  let interleaved = false;
+  const saveManifest = (actionId, mf) => {
+    if (!interleaved) {
+      interleaved = true;
+      // The continuation advances the action to completion (rev 1 -> 2) just BEFORE retention's CAS.
+      realSave(actionId, { ...m.actions.get(actionId), status: "complete", remaining: [], current: null, rev: 1 });
+    }
+    return realSave(actionId, mf); // retention's CAS(expected rev 1) now LOSES to the committed rev 2
+  };
+  await pruneBrandCatalogActionRecords({ ...m, saveManifest, nowMs: () => NOW });
+  assert.equal(m.actions.get("ACT1").status, "complete", "retention did NOT overwrite the continuation's committed state");
+  assert.notEqual(m.actions.get("ACT1").status, "expired", "the continuation was not clobbered to expired");
+  assert.equal(m.actions.get("ACT1").rev, 2, "the continuation's committed version stands");
+});
+
+await asyncTest("P2 race B: after retention EXPIRES first, a stale continuation's CAS loses and it does NOT restore in-progress/complete", async () => {
+  const cat = makeCatalogStore({}); const man = makeManifestStore();
+  man.seed("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z", expiresAt: "2027-01-01T00:00:00.000Z" }, 1);
+  // The continuation loaded a STALE snapshot (rev 1, in-progress) before retention acted.
+  const staleView = JSON.parse(JSON.stringify(man.manifest("ACT1")));
+  const loadManifest = () => Promise.resolve(JSON.parse(JSON.stringify(staleView)));
+  // Retention (elsewhere) commits the terminal "expired" transition FIRST (rev 1 -> 2).
+  const won = await man.saveManifest("ACT1", { ...man.manifest("ACT1"), status: "expired" });
+  assert.equal(won, 2, "retention's expiry CAS won at rev 2");
+  assert.equal(man.manifest("ACT1").status, "expired");
+  // The account attempt is already terminal, so the stale continuation performs NO export.
+  await cat.saveAttemptState("A1", "ACT1", { status: "complete", code: null, preservedLkg: false });
+  const { calls, fetchCatalog } = countingFetch();
+  const r = await orchestrateBrandCatalogAction(
+    { actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: ["A1"], authorizedPrimaryIds: ["A1"], directory: {}, connections: ORCH_CONNS },
+    { ...cat, ...man, loadManifest, fetchCatalog, scopeHashOf: () => "SCOPE" },
+  );
+  assert.equal(r.conflict, true, "the stale continuation gets a 409 (its advance CAS lost)");
+  assert.equal(man.manifest("ACT1").status, "expired", "the stale continuation did NOT restore in-progress/complete over the expired row");
+  assert.equal(calls.n, 0, "one-export-per-request preserved: the already-terminal account is not re-exported");
 });
 
 await asyncTest("orchestration 15: the orchestrated export uses ONLY the short Product Catalog id; the obsolete long id is never sent", async () => {
@@ -1180,23 +1234,27 @@ await asyncTest("FIX 2 advance-write failure: an exported terminal is durable bu
   assert.deepEqual(man.manifest("ACT1").remaining, ["A2"], "the queue advances exactly once on recovery");
 });
 
-await asyncTest("FIX 2 in-progress-write failure: a concurrent-owner in-progress transition that cannot persist -> typed operational; queue not falsely changed", async () => {
+await asyncTest("FIX 2 in-progress (concurrent owner): zero exports, in-progress, queue not falsely changed, and NO racing manifest write is persisted", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const { calls, fetchCatalog } = countingFetch();
   await cat.claimAttempt("A1", "ACT1"); // a concurrent owner holds the claim
-  let saves = 0;
-  const saveManifest = (actionId, mf) => { saves += 1; if (saves === 2) return Promise.reject(new Error("in-progress write failed")); return man.saveManifest(actionId, mf); };
+  // The in-progress transition changes nothing durable, so it must NOT write the manifest (a
+  // write here would only bump the version and needlessly race the owner's real advance).
+  let manifestWrites = 0;
+  const saveManifest = (actionId, mf) => { manifestWrites += 1; return man.saveManifest(actionId, mf); };
   const r = await firstClick("ACT1", ["A1", "A2"], dir(["A1", "A2"]), { ...cat, ...man, saveManifest, fetchCatalog });
   assert.equal(calls.n, 0, "zero exports");
-  assert.equal(r.status, "operational-failure", "a typed operational response when the in-progress transition cannot persist");
+  assert.equal(r.status, "in-progress", "the concurrent-owner response is in-progress");
+  assert.equal(r.disposition, "in-progress");
   assert.deepEqual(man.manifest("ACT1").remaining, ["A1", "A2"], "the queue is not falsely changed");
+  assert.equal(manifestWrites, 1, "only the create wrote the manifest; the in-progress transition persisted nothing");
 });
 
 await asyncTest("FIX 2 completion-write failure: an empty-queue completion that cannot persist is NEVER reported complete", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const saveManifest = () => Promise.reject(new Error("completion write failed"));
   // Seed an in-progress manifest with an already-empty queue; a fixed scope hash lets the request match.
-  man.manifests.set("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: [], remaining: [], current: null, status: "in-progress", code: null, createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z" });
+  man.seed("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: [], remaining: [], current: null, status: "in-progress", code: null, createdAt: "2026-08-12T00:00:00.000Z", updatedAt: "2026-08-12T00:00:00.000Z" });
   const r = await orchestrateBrandCatalogAction({ actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: [], authorizedPrimaryIds: [], directory: {}, connections: ORCH_CONNS }, { ...cat, ...man, saveManifest, scopeHashOf: () => "SCOPE" });
   assert.notEqual(r.status, "complete", "a completion that cannot persist is never reported complete");
   assert.equal(r.status, "operational-failure", "it degrades to a typed operational state");
@@ -1220,7 +1278,7 @@ await asyncTest("FIX 2 operational-failure-write failure: a stop that cannot per
 await asyncTest("FIX 3 expiry: a continuation after the abandon window transitions the action to terminal 'expired' and returns 409 (zero exports)", async () => {
   const cat = makeCatalogStore(); const man = makeManifestStore();
   const { calls, fetchCatalog } = countingFetch();
-  man.manifests.set("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, createdAt: "2026-06-01T00:00:00.000Z", updatedAt: "2026-06-01T00:00:00.000Z", expiresAt: "2026-06-02T00:00:00.000Z" });
+  man.seed("ACT1", { actionId: "ACT1", userId: "admin-1", scopeHash: "SCOPE", primaryAccountIds: ["A1"], remaining: ["A1"], current: null, status: "in-progress", code: null, createdAt: "2026-06-01T00:00:00.000Z", updatedAt: "2026-06-01T00:00:00.000Z", expiresAt: "2026-06-02T00:00:00.000Z" });
   const r = await orchestrateBrandCatalogAction(
     { actionId: "ACT1", userId: "admin-1", isContinuation: true, clientCursor: ["A1"], authorizedPrimaryIds: ["A1"], directory: {}, connections: ORCH_CONNS },
     { ...cat, ...man, fetchCatalog, scopeHashOf: () => "SCOPE", nowMs: () => Date.parse("2026-08-12T00:00:00.000Z") },
