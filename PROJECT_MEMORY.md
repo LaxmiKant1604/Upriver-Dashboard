@@ -2922,6 +2922,64 @@ id only; no raw error to browser) + `build:check` **2,394 modules**; `git diff -
 make Product Catalog available. The short id `68d2de238e` remains an UPSTREAM primary-organization
 source-access/configuration issue until it returns rows in a controlled live check.
 
+#### Re-review 5: attempting-not-terminal, durable manifest transitions, status-aware retention (2026-08-12)
+
+Three findings on the orchestration. Nothing pushed/merged/deployed/migrated; scheduler branches,
+`HANDOFF.md`, `.worktrees` untouched; approved blocker-6 behaviour unchanged. Commits `54fc240`
+(report-store helpers), `4039e64` (server), `e3ff897` (tests), + this docs commit. Files:
+`lib/server/supabase.js`, `api/datadoe.js`, `scripts/test-source-cache.mjs` (no client change -- the
+browser already stops on a typed `operational-failure`, and a 409 surfaces through the existing error
+path).
+
+**FIX 1 - "attempting" is never terminal recorded work.** `syncAccountBrandCatalog` previously returned
+any prior attempt (including `attempting`) as `disposition:"recorded"`, which could advance the queue
+while the original export was still running. Now a NON-terminal marker is classified fail-closed by
+whether the claim is still held (acquire-to-test, then release): held -> `in-progress` (mid-flight);
+free/expired -> stale/uncertain -> a typed operational stop that requires a NEW action id. Only
+`complete`/`unavailable` are terminal `recorded` outcomes that advance. Raw errors are never parsed;
+one export per request.
+
+**FIX 2 - manifest transitions are durable BEFORE the response.** `persistManifestTransition` positively
+confirms every write. On failure the orchestrator NEVER reports advancement/completion/a durable stop,
+creates no new export, and leaves the prior authoritative queue intact. Since a terminal attempt is
+already durable, a failed queue-advance degrades to `in-progress`, so a later continuation re-observes
+the terminal attempt (`recorded`) and retries only the manifest transition with ZERO new exports.
+
+**FIX 3 - status-aware retention (no migration).** New narrow helpers `getReportSnapshotsOlderThan`
+(read old rows + payload) and `deleteReportSnapshotByKey` (exact-row delete) replace report-key-wide age
+deletion. `pruneBrandCatalogActionRecords` enumerates OLD action manifests and deletes ONLY terminal
+ones (`complete`/`operational-failure`/`expired`) -- plus abandoned in-progress actions past a far
+30-day window -- each together with its attempt rows by exact key. An active/in-progress action (and
+its attempts) always survives; `brand-catalog` LKG and `account-directory` are never touched. A
+continuation of an action past its `expiresAt` transitions it to the terminal `expired` state and is
+rejected with a 409. Best-effort; a cleanup failure never throws.
+
+Corrected attempt/action state table:
+
+| observed | claim held? | disposition | queue | exports |
+|---|---|---|---|---|
+| no prior attempt | acquire ok | export -> `exported` | advance | 1 |
+| prior `complete`/`unavailable` (terminal) | n/a | `recorded` | advance | 0 |
+| prior `attempting` | still held | `in-progress` | unchanged | 0 |
+| prior `attempting` | free/expired (stale) | `operational-failure` | stop (new action) | 0 |
+| claim throws / marker write fails | n/a | `operational-failure` | stop | 0 |
+| manifest transition write fails | n/a | `in-progress` (advance) / `operational-failure` (create/in-progress/completion/stop) | prior queue intact | 0 |
+| `remaining` empty + durable complete write | n/a | `none` | complete | 0 |
+
+Retention windows: terminal actions pruned after **7 days**; in-progress actions kept until an
+explicit `expired` transition or the **30-day** abandon window; LKG + account-directory never pruned.
+
+Verification (exit 0): `node --check` on `api/datadoe.js`, `lib/server/supabase.js`,
+`scripts/test-source-cache.mjs`; `npm run verify` = insight **54** + Brand View **78** + sync **23** +
+source-cache **59** (+8 net: FIX 1 deferred-concurrency A-pauses-in-fetch/B-in-progress-no-advance +
+stale-attempting-stop; orchestration 8 updated to a stop; FIX 2 advance/in-progress/completion/stop
+write-failure + zero-export recovery; FIX 3 status-aware retention + best-effort + expiry->409) +
+`build:check` **2,394 modules**; `git diff --check` clean.
+
+**Unresolved live DataDoe 404 (unchanged).** Still orchestration/data-safety plumbing; the short id
+`68d2de238e` remains an UPSTREAM primary-organization source-access/configuration issue until it returns
+rows in a controlled live check.
+
 ## Brand View Country Snapshots (implemented 2026-08-03)
 
 - Brand View now uses the shared `brand-portfolio-shared-v3` report rather
