@@ -116,6 +116,19 @@ export function parseDateStr(value) {
   return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
 }
 
+// STRICT: a real UTC calendar date that round-trips. `parseDateStr` only checks the
+// YYYY-MM-DD shape, so it accepts impossible dates (2025-02-30, 2025-13-40). This
+// rebuilds the date in UTC and confirms every field is unchanged, so an impossible or
+// normalized date is rejected while a genuine leap day (2024-02-29) is accepted.
+export function isStrictCalendarDate(value) {
+  const parts = parseDateStr(value);
+  if (!parts) return false;
+  const dt = new Date(Date.UTC(parts.y, parts.m - 1, parts.d));
+  return dt.getUTCFullYear() === parts.y
+    && dt.getUTCMonth() + 1 === parts.m
+    && dt.getUTCDate() === parts.d;
+}
+
 export function daysInMonth(year, month) {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
@@ -364,9 +377,9 @@ export function brandInventory(planPayload, brand, accountCountry, fallbackPaylo
 // and the "validated empty is zero, missing is unavailable" rule — is unit-testable.
 
 // The saved brand-sales snapshot carries an additive `asinBrand` map ({asin: brand}).
-// Preferring it lets a Brand View inventory refresh skip the Product Catalog export
-// entirely. Returns a Map; an absent/malformed map yields an empty Map (the caller
-// then reuses the catalog source cache instead).
+// It is the ONLY brand map a Brand View inventory refresh uses, so the refresh never
+// spends a Product Catalog export. Returns a Map; an absent/malformed map yields an
+// empty Map (the caller then fails BEFORE the FBA export instead of fetching catalog).
 export function asinBrandFromSalesPayload(salesPayload) {
   const map = new Map();
   const src = salesPayload?.asinBrand;
@@ -380,60 +393,96 @@ export function asinBrandFromSalesPayload(salesPayload) {
   return map;
 }
 
-// Build an ASIN->brand Map from raw Product Catalog rows (child_asin / product_brand).
-export function brandByAsinFromCatalogRows(catalogRows) {
-  const map = new Map();
-  for (const row of catalogRows || []) {
-    const asin = trimmed(row?.child_asin);
-    const brand = trimmed(row?.product_brand);
-    if (asin && brand && !map.has(asin)) map.set(asin, brand);
-  }
-  return map;
+// A refusal the browser may see verbatim: it is a fixed, admin-safe string and never
+// carries a raw DataDoe/Supabase response. Its presence (`brandInventorySafe`) lets the
+// API layer distinguish a validated refusal from an unexpected upstream error.
+function safeInventoryError(message) {
+  const error = new Error(message);
+  error.brandInventorySafe = true;
+  return error;
+}
+
+// A saved brand-inventory snapshot is AUTHORITATIVE only when it is genuinely the
+// compact report — its params record the current compact report version AND its payload
+// carries the compact shape. A wrong-version or malformed snapshot is treated as "no
+// valid compact snapshot" so a version bump never strands Brand View on an unreadable
+// payload, and (once valid) it is used exclusively so stale FBA Plan values cannot
+// resurface.
+export function isCompactInventorySnapshot(snapshot) {
+  return !!snapshot
+    && snapshot.params?.reportVersion === BRAND_INVENTORY_REPORT_VERSION
+    && Array.isArray(snapshot.payload?.inventoryByBrandCountry);
 }
 
 /**
- * PURE fold of FBA Inventory Health rows into the compact brand-inventory payload.
+ * PURE, STRICT validation + fold of FBA Inventory Health rows into the compact
+ * brand-inventory payload. `invRows` are the raw source rows; `brandByAsin` is a Map
+ * (or {asin:brand} object); `[from, to]` is the EXACT expected window (asOf-10d..asOf).
  *
- * `invRows` are the raw source rows (each with date, marketplace_country_code,
- * child_asin, sku, available). `brandByAsin` is a Map (or {asin:brand} object).
- *
- *  - STRICT CAP: a result at or above `rowLimit` may be truncated, so it is REFUSED
- *    (throws). The caller must not save it; the previous good snapshot is preserved.
- *  - Only the LATEST inventory date's rows are folded (older snapshots are ignored).
- *  - Folded by (country, brand); `fbaAvailable` sums `available`; `skuCount` counts
- *    distinct SKUs.
- *  - `inventoryAvailable` is true only when the validated snapshot actually returned
- *    rows, so a brand present with 0 available is a genuine zero, while a brand that
- *    is absent (or a snapshot with no rows) stays unavailable — never invented zero.
+ * The whole payload is REFUSED (throws an admin-safe error) if ANY row is invalid, so a
+ * malformed/truncated export is never saved and the previous snapshot is preserved:
+ *   - `invRows` must be an array; every row a plain object;
+ *   - `row.date` a strict UTC calendar date INSIDE [from, to] (impossible / malformed /
+ *     future / out-of-window dates are rejected, never coerced);
+ *   - `row.child_asin` non-empty;
+ *   - `row.available` finite and >= 0 (a malformed/negative value is rejected, never 0);
+ *   - a country (row marketplace, else the authoritative account-country fallback).
+ * Only the LATEST validated date folds. `inventoryAvailable` is true only when rows were
+ * returned, so a brand present with 0 available is a genuine zero while an empty snapshot
+ * stays unavailable — never invented zero.
  */
-export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, rowLimit }) {
-  const rows = Array.isArray(invRows) ? invRows : [];
-  if (rowLimit && rows.length >= rowLimit) {
-    const error = new Error(`The FBA inventory export reached its ${rowLimit.toLocaleString("en-US")}-row cap, so it may be truncated. The compact Brand View inventory was not saved; the previous snapshot is preserved.`);
-    error.brandInventorySafe = true;
-    throw error;
+export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, from, to, rowLimit }) {
+  const windowFrom = trimmed(from);
+  const windowTo = trimmed(to);
+  if (!isStrictCalendarDate(windowFrom) || !isStrictCalendarDate(windowTo) || windowFrom > windowTo) {
+    throw safeInventoryError("Brand View inventory was requested with an invalid date window and was not saved; the previous snapshot is preserved.");
+  }
+  if (!Array.isArray(invRows)) {
+    throw safeInventoryError("Brand View inventory returned an unexpected shape and was not saved; the previous snapshot is preserved.");
+  }
+  if (rowLimit && invRows.length >= rowLimit) {
+    throw safeInventoryError(`The FBA inventory export reached its ${rowLimit.toLocaleString("en-US")}-row cap, so it may be truncated. The compact Brand View inventory was not saved; the previous snapshot is preserved.`);
   }
   const brandOf = brandByAsin instanceof Map ? brandByAsin : new Map(Object.entries(brandByAsin || {}));
+  const accountFallbackCountry = trimmed(accountCountry).toUpperCase();
 
-  // The latest snapshot date is authoritative. DESC ordering already puts it first,
-  // but recompute here so the fold is correct regardless of the caller's ordering.
+  // Pass 1: STRICTLY validate EVERY row (any invalid row rejects the whole payload) and
+  // find the latest in-window date. A row is validated even if it is not the latest date.
   let inventoryDate = null;
-  for (const row of rows) {
-    const date = trimmed(row?.date);
-    if (date && (!inventoryDate || date > inventoryDate)) inventoryDate = date;
+  for (const row of invRows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw safeInventoryError("Brand View inventory contained a malformed row and was not saved; the previous snapshot is preserved.");
+    }
+    const date = trimmed(row.date);
+    if (!isStrictCalendarDate(date) || date < windowFrom || date > windowTo) {
+      throw safeInventoryError("Brand View inventory contained an impossible, future or out-of-window date and was not saved; the previous snapshot is preserved.");
+    }
+    if (!trimmed(row.child_asin)) {
+      throw safeInventoryError("Brand View inventory contained a row without an ASIN and was not saved; the previous snapshot is preserved.");
+    }
+    // STRICT, no coercion: `available` must already be a finite non-negative number.
+    // Number.isFinite does not coerce, so null / undefined / "" / "5" / NaN / Infinity
+    // are all rejected rather than converted to zero.
+    if (!Number.isFinite(row.available) || row.available < 0) {
+      throw safeInventoryError("Brand View inventory contained a malformed or negative available quantity and was not saved; the previous snapshot is preserved.");
+    }
+    if (!(trimmed(row.marketplace_country_code).toUpperCase() || accountFallbackCountry)) {
+      throw safeInventoryError("Brand View inventory contained a row with no marketplace and no account-country fallback; it was not saved and the previous snapshot is preserved.");
+    }
+    if (!inventoryDate || date > inventoryDate) inventoryDate = date;
   }
 
+  // Pass 2: fold ONLY the latest validated date, by (country, brand).
   const byCountryBrand = new Map();
-  for (const row of rows) {
-    if (inventoryDate && trimmed(row?.date) !== inventoryDate) continue; // latest validated date only
-    const asin = trimmed(row?.child_asin);
-    if (!asin) continue;
-    const country = (trimmed(row?.marketplace_country_code) || trimmed(accountCountry)).toUpperCase();
+  for (const row of invRows) {
+    if (trimmed(row.date) !== inventoryDate) continue;
+    const asin = trimmed(row.child_asin);
+    const country = trimmed(row.marketplace_country_code).toUpperCase() || accountFallbackCountry;
     const brand = brandOf.get(asin) || null;
     const key = `${country}|${brand || ""}`;
-    const bucket = byCountryBrand.get(key) || { country: country || null, brand, fbaAvailable: 0, skus: new Set() };
-    bucket.fbaAvailable += Number(row?.available) || 0;
-    const sku = trimmed(row?.sku);
+    const bucket = byCountryBrand.get(key) || { country, brand, fbaAvailable: 0, skus: new Set() };
+    bucket.fbaAvailable += row.available; // validated finite non-negative number in pass 1
+    const sku = trimmed(row.sku);
     if (sku) bucket.skus.add(sku);
     byCountryBrand.set(key, bucket);
   }
@@ -441,50 +490,42 @@ export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, ac
   return {
     accountId: String(accountId),
     inventoryDate,
-    inventoryAvailable: rows.length > 0,
+    inventoryAvailable: invRows.length > 0,
     inventoryByBrandCountry: [...byCountryBrand.values()].map(({ skus, ...entry }) => ({ ...entry, skuCount: skus.size })),
   };
 }
 
 /**
  * Orchestrate one account's compact brand-inventory refresh with INJECTED readers so
- * the whole flow (catalog reuse decision + the single inventory export + fold) is
+ * the whole flow (brand-map decision + the single inventory export + strict fold) is
  * offline-testable and makes no direct network call itself.
  *
- *  - ASIN->brand is taken from the saved brand-sales snapshot's `asinBrand` map when
- *    present, so NO Product Catalog export is created. Only when that map is missing
- *    (a snapshot saved before the additive field) is `fetchCatalogRows` called, with
- *    the brand-sales window so the canonical Product Catalog identity matches the
- *    preceding brand-sales refresh and the shared source cache serves it.
- *  - `fetchInventoryRows` is the ONE FBA Inventory Health export.
- *  - Returns { payload, catalogFetched, asinBrandCount } so a caller/test can prove
- *    "at most one inventory export" and "no duplicate catalog export".
+ *  - ASIN->brand comes ONLY from the saved brand-sales snapshot's `asinBrand` map.
+ *    There is NO live Product Catalog fallback: if the map is missing this FAILS
+ *    BEFORE the FBA Inventory export, so a just-failed Brand Sales catalog can never
+ *    trigger an immediate second Product Catalog export in the same click.
+ *  - `fetchInventoryRows` is the ONE FBA Inventory Health export, validated by
+ *    `buildBrandInventoryPayload` against the exact `[from, to]` window.
+ *  - Returns { payload, asinBrandCount }.
  */
 export async function buildBrandInventorySnapshot({
-  accountId, accountCountry, rowLimit,
-  getSnapshot, fetchInventoryRows, fetchCatalogRows,
+  accountId, accountCountry, from, to, rowLimit,
+  getSnapshot, fetchInventoryRows,
 }) {
   if (typeof getSnapshot !== "function") throw new Error("A snapshot reader is required.");
   if (typeof fetchInventoryRows !== "function") throw new Error("An inventory reader is required.");
 
   const salesSnapshot = await getSnapshot({ reportKey: "brand-sales", accountId });
-  let brandByAsin = asinBrandFromSalesPayload(salesSnapshot?.payload);
-  let catalogFetched = false;
+  const brandByAsin = asinBrandFromSalesPayload(salesSnapshot?.payload);
   if (!brandByAsin.size) {
-    if (typeof fetchCatalogRows !== "function") {
-      throw new Error("This account has no saved brand map yet. Refresh its Dashboard once so Brand View can attribute FBA inventory to brands, then fetch inventory again.");
-    }
-    const catalogRows = await fetchCatalogRows({
-      from: salesSnapshot?.params?.from || null,
-      to: salesSnapshot?.params?.to || null,
-    });
-    catalogFetched = true;
-    brandByAsin = brandByAsinFromCatalogRows(catalogRows);
+    // FAIL CLOSED before any export: no live catalog fetch, so zero Catalog and zero
+    // FBA exports are spent when the brand map is unavailable.
+    throw safeInventoryError("Brand View inventory needs this account's saved Brand Sales brand map, which is not available. Refresh Brand Sales successfully for this account first, then fetch FBA inventory.");
   }
 
   const invRows = await fetchInventoryRows();
-  const payload = buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, rowLimit });
-  return { payload, catalogFetched, asinBrandCount: brandByAsin.size };
+  const payload = buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, from, to, rowLimit });
+  return { payload, asinBrandCount: brandByAsin.size };
 }
 
 /* ------------------------------------------------------------ the two builds */
@@ -594,21 +635,21 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
   }
   const ads = aggregateBrandAds(adRows, asinBrand, brand);
 
-  // Inventory preference order: the compact brand-inventory snapshot (a minimal,
-  // dedicated FBA Inventory Health roll-up) first, then the full FBA Shipment Plan,
-  // then Listing Health. All three carry per-brand-country data in the same shape,
-  // so Brand View never has to guess; a missing brand stays unavailable, not zero.
+  // Inventory source: a VALID compact brand-inventory snapshot is AUTHORITATIVE. Once
+  // it exists (correct report version + compact shape), it is used EXCLUSIVELY, even
+  // when its rows are empty or the selected brand is absent — an empty/unavailable
+  // compact snapshot shows unavailable, never resurrecting a stale FBA Plan value. The
+  // legacy fba-plan/listing-health fallback is allowed ONLY while no valid compact
+  // snapshot exists yet.
   const brandInventorySnapshot = await readOnce(BRAND_INVENTORY_SNAPSHOT_KEY);
   const planSnapshot = await readOnce("fba-plan");
   const inventoryFallbackSnapshot = await readOnce(INVENTORY_FALLBACK_SNAPSHOT_KEY);
-  const compactPayload = brandInventorySnapshot?.payload;
-  const useCompact = Array.isArray(compactPayload?.inventoryByBrandCountry) && compactPayload.inventoryByBrandCountry.length > 0;
-  const inventory = brandInventory(
-    useCompact ? compactPayload : planSnapshot?.payload,
-    brand,
-    account?.country,
-    inventoryFallbackSnapshot?.payload
-  );
+  const useCompact = isCompactInventorySnapshot(brandInventorySnapshot);
+  const inventory = useCompact
+    // Authoritative: no legacy fallback payload, so an empty compact snapshot or an
+    // absent brand resolves to unavailable rather than an older legacy value.
+    ? brandInventory(brandInventorySnapshot.payload, brand, account?.country, null)
+    : brandInventory(planSnapshot?.payload, brand, account?.country, inventoryFallbackSnapshot?.payload);
   const inventorySnapshot = useCompact
     ? brandInventorySnapshot
     : (inventory.source === INVENTORY_FALLBACK_SNAPSHOT_KEY ? inventoryFallbackSnapshot : planSnapshot);
