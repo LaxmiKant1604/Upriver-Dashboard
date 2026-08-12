@@ -7607,3 +7607,46 @@ never blocks a complete report); `npm run test:report-derivation` **439** (was 4
 `test:report-contracts` (161), `test:source-identity` (7) green; `npm run verify` exit 0 + `build:check`; `git
 diff --check` clean; only the intended files changed. Nothing pushed/merged/deployed/migrated. STOP for Codex
 re-review.
+
+## Scheduler v2: Phase 1e -- canonical orchestration foundation (SHADOW MODE, 2026-08-12)
+
+Built ONE canonical, production-shaped SHADOW dispatcher from base `c7dd94d` (approved Listing Optimizer
+re-review). SCHEDULER_V2.md §57 records the details. New file `lib/server/sync/scheduler-v2-dispatch.js`
+(`runSchedulerV2Shadow` + `classifySchedulerV2ReportKey` + `selectSchedulerV2ReportKeys`) is PURELY ADDITIVE:
+it consumes existing exports (report-planner, the four dedicated cycles, source-sync-driver, report-worker,
+report-controls, datadoe-connections) and modifies NONE of them. SHADOW ONLY + locked: no route/cron/migration/
+deployment/frontend wiring; every current report control stays locked (reportControlCatalog marks every
+Scheduler v2 adapter not-ready, so a real invocation dispatches NOTHING and spends zero tokens); Scheduler v1
+(`run-sync.js`) byte-unchanged; `HANDOFF.md`/`.worktrees/` untouched. Commits: `4da8051` (dispatcher),
+`5bb846a` (tests + wiring), + this docs commit.
+
+What it does:
+1. **One canonical route per report (fail closed).** `classifySchedulerV2ReportKey` -> staged (a dedicated
+   cycle per STAGED_CYCLE_REPORT_KEYS: Keyword Rank / Sales Movers / PPC / Listing Optimizer) | generic
+   (buildShadowReportPlan + runStagedSourceCycle per SHADOW_PLANNED_REPORT_KEYS) | derived-only
+   (DERIVED_ONLY_REPORT_KEYS -> zero exports) | unsupported. Fails closed BEFORE any token on an unsupported/
+   ambiguous key (adapter with no wired path) and on a PPC dispatch missing its persisted-Ads readers.
+2. **Controls + readiness + dynamic discovery + primary-only.** `selectSchedulerV2ReportKeys` -> scheduled
+   picks ready+enabled; manual runs only the named keys and NEVER unlocks a locked report (locked/paused =>
+   zero exports). Accounts discovered via an injected `discoverAccounts()` (nothing hard-coded -> a new primary
+   account auto-participates), then classifyDirectoryAccounts enforces primary-only (stale dd-secondary skipped
+   read-only, never routed through the primary key), filtered to the bucket.
+3. **Shared cycle + cumulative budget + dedup + derive.** All drivers open the SAME (bucket, cycle_date) cycle,
+   so a shared canonical request_hash (e.g. the common no-date catalog) is created ONCE across owners with
+   owner-scoped reconciliation keeping families isolated. ONE cumulative maxJobs + wall-clock deadline spans all
+   drivers (stop before opening the next unit when spent; a deferral/deadline leaves pending/resumable state; a
+   fresh invocation resumes with no duplicate create-export). Collected plannedReports run through runReportJobs
+   ONCE: pending stays pending, blocked terminal, unavailable/invalid preserve LKG, a failed report never blocks
+   an unrelated ready one, and the derive makes ZERO DataDoe/network calls.
+
+Verification (all natural, exit 0): `node --check` module + test; NEW `scheduler-v2-dispatch.test.js` **16
+assertions** (routing/selection/fail-closed; enabled-only dispatch; locked/paused zero exports; manual single;
+derived-only zero source jobs; new primary account auto-included; primary-only stale-secondary skip; generic +
+each dedicated cycle canonical path; shared catalog created once across two active owners; maxJobs + poll-
+deferral resume with no duplicate create; partial pending then saves exactly once; exhausted deadline opens
+nothing; failure isolation); `test:report-derivation` **455** (was 439); `test:sync-engine` (79),
+`test:report-contracts` (161), `test:source-identity` (7), `test:report-sync-controls` (9) green; `build:check`
+(2,395 modules); `git diff --check` clean; only `package.json` changed plus two new files. Nothing pushed/
+merged/deployed/unlocked/enabled/scheduled/migrated; no route/cron/frontend wiring. The project-wide Product
+Catalog ASIN-to-brand gap-fill remains NOT implemented (pending DataDoe account-scoping/filter confirmation).
+STOP after the orchestration foundation for Codex senior review.

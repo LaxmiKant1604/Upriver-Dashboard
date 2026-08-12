@@ -3523,3 +3523,65 @@ per-account scoping behavior (which seller/vendor accounts the export is authori
 Optimizer's catalog stage remains fail-closed regardless of the outcome: whenever a post-SQP catalog export
 does not complete for an account, the derive records `unavailable` and preserves last-known-good (never a
 partial save), so resolving the outstanding 404/scoping questions can only turn accounts ON, never corrupt one.
+
+## 57. Phase 1e -- canonical Scheduler v2 orchestration foundation (SHADOW MODE, 2026-08-12)
+
+With every source-backed Phase 1d derivation adapter implemented + reviewed, Phase 1e adds ONE canonical,
+production-shaped SHADOW dispatcher -- `lib/server/sync/scheduler-v2-dispatch.js`
+(`runSchedulerV2Shadow`) -- that turns "which reports are enabled for which primary accounts" into the correct
+source-cycle + report-derivation calls, WITHOUT knowing any report's internals. It is purely additive: it
+consumes existing exports (planner, cycles, worker, controls, connections) and modifies NONE of them. SHADOW
+ONLY + locked: no route, cron, migration, deployment or frontend wiring; every current control stays locked
+(reportControlCatalog marks every Scheduler v2 adapter not-ready, so a real invocation dispatches NOTHING and
+spends zero tokens); Scheduler v1 (`run-sync.js`) is byte-unchanged; `HANDOFF.md`/`.worktrees/` untouched.
+
+### 57.1 One canonical route per report (fail closed)
+
+`classifySchedulerV2ReportKey(reportKey)` maps each key to EXACTLY ONE route using the AUTHORITATIVE registries
+(so it can never drift): `STAGED_CYCLE_REPORT_KEYS` -> a dedicated account-scoped cycle
+(`runKeywordRankShadowCycle` / `runSalesMoversShadowCycle` / `runPpcShadowCycle` /
+`runListingOptimizerShadowCycle`); `SHADOW_PLANNED_REPORT_KEYS` -> the eager generic plan
+(`buildShadowReportPlan` + `runStagedSourceCycle`); `DERIVED_ONLY_REPORT_KEYS` -> no source cycle (ZERO
+exports); anything else -> `unsupported`. Before opening any cycle or spending any token the dispatcher fails
+closed on an unsupported/ambiguous key (a report with no wired dispatch path -- e.g. an adapter that lacks a
+planner) and on a PPC dispatch missing its persisted-Ads readers, rather than guessing a path. PPC/Keyword
+Rank/Sales Movers/Listing Optimizer can never flow through the generic builder (which already rejects them).
+
+### 57.2 Controls, readiness, dynamic discovery, primary-only
+
+`selectSchedulerV2ReportKeys` reads the control plane: a scheduled run selects ready + schedule-enabled reports;
+a MANUAL request runs ONLY the named keys. A locked/not-ready SOURCE-backed report is never dispatched (zero
+exports); a manual request NEVER unlocks a report. Accounts are discovered DYNAMICALLY via an injected
+`discoverAccounts()` (nothing hard-coded, so a newly connected primary account participates automatically),
+then `classifyDirectoryAccounts` enforces primary-only safety (a stale dd-secondary is skipped read-only and
+never routed through the primary key) and the set is filtered to the invocation's bucket.
+
+### 57.3 Shared cycle, cumulative budget, deduplication, derive
+
+Every driver opens the SAME `(bucket, cycle_date)` cycle, so a canonical `request_hash` shared across reports
+(e.g. the no-date insight catalog shared by Buy Box / Returns / Sales Movers / Listing Health) is created
+ONCE and owner memberships keep the families isolated (reconciliation is owner-scoped -- it never stales
+another report/account owner). A single cumulative `maxJobs` + wall-clock deadline spans ALL drivers: the
+dispatcher stops before opening another unit when the budget is spent, and a deferral/deadline inside a unit
+stops the invocation with pending/resumable state intact -- a fresh invocation resumes with NO duplicate
+create-export (source + report jobs are idempotent/checkpointable). Finally the collected `plannedReports` run
+through `runReportJobs` ONCE (shared cycleId): each report is gated on its own dependencies -- pending stays
+pending, blocked stays terminal, unavailable/invalid preserve last-known-good, and one failed report never
+blocks an unrelated ready one. The derive makes ZERO DataDoe/network calls (the module imports only pure
+leaves + the injected `store.loadSourceRows`).
+
+### 57.4 Verification (all natural, exit 0)
+
+`node --check` on the new module + test. New `scripts/scheduler-v2-dispatch.test.js` **16 assertions** (wired
+into `test:report-derivation`): route classification + selection; fail-closed on an unsupported key and on
+PPC-without-Ads-readers (zero tokens); enabled-only dispatch; a locked report / a paused (ready-but-unscheduled)
+report spends zero exports; manual single-report dispatch; derived-only zero source jobs; a newly connected
+primary account auto-included; primary-only (stale dd-secondary skipped read-only); generic + each dedicated
+cycle through its ONE canonical path; a shared catalog hash created once across two owners (both active);
+maxJobs resume + poll-deferral resume with no duplicate create-export; a partial report pending then saves
+EXACTLY once; an exhausted deadline opens no report; failure isolation (a failing report never blocks a healthy
+one). `npm run test:report-derivation` **455** (was 439); focused suites green: `test:sync-engine` (79),
+`test:report-contracts` (161), `test:source-identity` (7), `test:report-sync-controls` (9); `build:check`
+(2,395 modules); `git diff --check` clean; only `package.json` changed plus two new files. Nothing
+pushed/merged/deployed/unlocked/enabled/scheduled/migrated; no route/cron/frontend wiring; Scheduler v1 +
+every report control remain locked.
