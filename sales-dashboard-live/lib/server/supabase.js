@@ -614,8 +614,14 @@ export async function getReportSnapshotsOlderThan({ reportKey, cutoffIso }) {
 }
 
 /**
- * Delete exactly ONE snapshot row by its natural key. Used by status-aware retention
- * so an active record is never removed by a report-key-wide age deletion. Best-effort.
+ * Delete exactly ONE snapshot row by its natural key. Used by status-aware retention so
+ * an active record is never removed by a report-key-wide age deletion.
+ *
+ * CONTRACT: reports success ACCURATELY -- it resolves `true` only when the DELETE request
+ * itself succeeded (a matched-and-removed row OR an already-absent row, which PostgREST
+ * treats as a 2xx idempotent no-op), and THROWS on any transport/HTTP failure. It does NOT
+ * swallow errors: the caller (retention) owns the best-effort decision, so it can positively
+ * confirm each deletion and, on failure, keep the manifest for the next pass to retry.
  */
 export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHash }) {
   const params = new URLSearchParams({
@@ -626,7 +632,8 @@ export async function deleteReportSnapshotByKey({ reportKey, accountId, paramsHa
   await request(`/rest/v1/report_snapshots?${params}`, {
     method: "DELETE",
     headers: { Prefer: "return=minimal" },
-  }).catch(() => {});
+  });
+  return true;
 }
 
 export async function getAdDailyMetrics(accountId, from, to) {
