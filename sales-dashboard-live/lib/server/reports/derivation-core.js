@@ -1566,6 +1566,32 @@ export function assertListingHealthCurrencyIsolation(listingRows, salesRows) {
 const PPC_MIN_CLICKS_FOR_WASTE = 10;
 const PPC_ADS_SOURCE_ORIGIN = "Persisted Supabase Amazon Ads history maintained by the scheduled worker";
 
+// CLOSED allowlist of admin-safe PPC coverage reason codes. This is the ONLY vocabulary that may ever reach
+// the SAVED `sourceAvailability[].coverageUnavailableReason` field. It is the exact set of typed codes the
+// persisted-Ads loader produces (evaluateSourceCoverage + proveSourceCoverage), plus the generic fallback.
+// Any other value -- a raw database message, HTTP body, URL, authorization text, token/API key, arbitrary
+// caller string, or exception message -- normalizes to the fixed fallback and is NEVER persisted verbatim.
+// This constant lives in this import-FREE pure leaf (no transport/storage) and is imported by the loader's
+// coverage-contract validator so both the derive/payload boundary AND the loader share ONE source of truth.
+export const PPC_COVERAGE_REASON_FALLBACK = "coverage-unavailable";
+export const PPC_COVERAGE_REASON_CODES = Object.freeze([
+  "coverage-reader-missing",
+  "coverage-state-malformed",
+  "coverage-schema-missing",
+  "coverage-read-failed",
+  "coverage-read-not-ok",
+  "coverage-windows-not-array",
+  "coverage-window-malformed",
+  "coverage-incomplete",
+  "coverage-unavailable",
+]);
+const PPC_COVERAGE_REASON_SET = new Set(PPC_COVERAGE_REASON_CODES);
+// Return `reason` iff it is an allowlisted safe code; otherwise the fixed safe fallback. Never returns an
+// arbitrary caller string. Pure.
+export function normalizePpcCoverageReason(reason) {
+  return typeof reason === "string" && PPC_COVERAGE_REASON_SET.has(reason) ? reason : PPC_COVERAGE_REASON_FALLBACK;
+}
+
 const ppcMetric = (row, key) => num(row && row.metrics ? row.metrics[key] : 0);
 function ppcEmptyTotals() { return { spend: 0, sales: 0, clicks: 0, impressions: 0, orders: 0, units: 0 }; }
 function ppcAccumulate(target, row, salesKey, ordersKey, unitsKey) {
@@ -1741,7 +1767,9 @@ export function ppcPerformancePayload({
       entry.coverageProven = cov.proven === true;
       entry.coverageFolded = cov.folded === true;
       entry.coverageStatus = cov.proven === true ? "validated" : "unavailable";
-      entry.coverageUnavailableReason = cov.proven === true ? null : (typeof cov.reason === "string" && cov.reason ? cov.reason : "coverage-unavailable");
+      // A proven source has no reason; an unproven one is normalized to an ALLOWLISTED safe code (or the fixed
+      // fallback) so a raw DB/HTTP/credential string from a miswired/injected loader can never be persisted.
+      entry.coverageUnavailableReason = cov.proven === true ? null : normalizePpcCoverageReason(cov.reason);
     }
     return entry;
   });
