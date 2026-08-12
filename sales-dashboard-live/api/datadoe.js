@@ -80,11 +80,14 @@ import {
   BRAND_VIEW_PORTFOLIO_VERSION,
   BRAND_VIEW_REPORT_KEY,
   BRAND_VIEW_VERSION,
+  BRAND_INVENTORY_SNAPSHOT_KEY,
+  BRAND_INVENTORY_REPORT_VERSION,
   brandViewPortfolioScopeId,
   brandViewScopeId,
   buildBrandViewBrandDirectory,
   buildBrandViewPortfolioSnapshot,
   buildBrandViewSnapshot,
+  buildBrandInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
@@ -104,7 +107,7 @@ async function fetchAccounts(apiKey) {
 
 const ACCOUNT_SCOPED_ACTIONS = new Set([
   "sales", "brand-sales", "daily", "reconciliation", "sku-pl",
-  "keyword-rank", "content-changes", "fba-plan",
+  "keyword-rank", "content-changes", "fba-plan", "brand-inventory",
   // Account-scoped Brand View. Both actions take exactly one account, are
   // authorised against it, and read only that account's saved snapshots.
   "brand-view-brands", "brand-view",
@@ -584,6 +587,15 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
         reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1", accountId,
         params: { from, to }, label: "Dashboard",
       };
+    case "brand-inventory":
+      if (!accountId || !to) return null;
+      // Compact per-account FBA inventory for Brand View. A non-refresh read serves
+      // the saved Supabase snapshot only (zero DataDoe); a refresh is admin-gated in
+      // the handler and creates at most ONE FBA Inventory Health export.
+      return {
+        reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION, accountId,
+        params: { to }, label: "Brand View FBA inventory",
+      };
     case "daily":
       if (!accountId || !from || !to) return null;
       return {
@@ -642,9 +654,20 @@ export async function buildBrandSalesPayload({ apiKey, ids, from, to }) {
     { orderByColumn: "child_asin" }
   );
   const rows = orderSalesByBrand(rawRows, catalog);
+  // Additive ASIN->brand map from the catalog THIS refresh already fetched. It lets
+  // the compact Brand View inventory refresh attribute FBA stock to brands without
+  // spending a second Product Catalog export. Bounded by the account's catalog size
+  // and far smaller than the row set; older snapshots simply lack it and the
+  // inventory refresh then reuses the shared catalog source cache instead.
+  const asinBrand = {};
+  for (const c of catalog) {
+    const asin = String(c.child_asin || "").trim();
+    const brand = String(c.product_brand || "").trim();
+    if (asin && brand && !(asin in asinBrand)) asinBrand[asin] = brand;
+  }
   // Derive the brand list from the account's already-joined sales rows, never
   // from wider catalog metadata, so the header brand filter cannot exceed scope.
-  return { rows, catalogBrands: catalogBrandNames(rows) };
+  return { rows, catalogBrands: catalogBrandNames(rows), asinBrand };
 }
 
 async function discoverConnectedAccounts(connections) {
@@ -1250,6 +1273,10 @@ export default async function handler(req, res) {
     }
     const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
+    // The Brand View inventory SOURCE fetch spends a DataDoe export, so it is
+    // admin-only on the SERVER, not merely hidden in the UI. A non-refresh read of
+    // the saved snapshot stays available to any authorised user (Supabase-only).
+    if (action === "brand-inventory" && wantsRefresh(req)) assertAdmin(access);
     // A new browser may not yet have the shared account directory. Brand View
     // remains usable: on its explicit manual refresh only, discover the
     // accounts the user may access and use them to seed the brand directory.
@@ -1613,6 +1640,65 @@ export default async function handler(req, res) {
       }
       // Single implementation, shared with the scheduled-sync adapter.
       const payload = await buildBrandSalesPayload({ apiKey, ids: sellerOrVendorIds, from, to });
+      await sendLegacyPayload(payload);
+      return;
+    }
+
+    // Compact FBA inventory for Brand View. A non-refresh read was already served
+    // above from the saved snapshot (Supabase-only, zero DataDoe). A refresh is
+    // admin-gated above and creates at most ONE FBA Inventory Health export; it
+    // reuses the Product Catalog source cache from the preceding brand-sales
+    // refresh (or the saved brand-sales asinBrand map) instead of a duplicate
+    // catalog export. Truncated/failed source is refused so a good snapshot survives.
+    if (action === "brand-inventory") {
+      if (!accountScope || accountScope.accountIds.length !== 1) {
+        res.status(400).json({ error: "Brand View inventory requires exactly one selected account." });
+        return;
+      }
+      const publicAccountId = accountScope.accountIds[0];
+      const to = String(req.query.to || "");
+      if (!isDateStr(to)) {
+        res.status(400).json({ error: "Brand View inventory requires an asOf date (to=YYYY-MM-DD)." });
+        return;
+      }
+      // PRIMARY-ONLY: a legacy dd-secondary mapping is skipped, never stripped and
+      // routed through the primary DataDoe key (the secondary key was removed).
+      if (String(publicAccountId).startsWith("dd-secondary:") || accountScope.connection?.id !== "primary" || !apiKey) {
+        res.status(409).json({
+          error: "This account is still mapped to the legacy Secondary DataDoe organization, which is no longer connected. Move it to the primary organization, then reload the account and brand directories.",
+        });
+        return;
+      }
+      const sellerOrVendorIds = accountScope.rawAccountIds;
+      // Best-effort account country for the rare inventory row that omits a
+      // marketplace code. A directory miss is non-fatal (the rows carry it).
+      const inventoryDirectory = await getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
+      const accountCountry = (inventoryDirectory?.payload?.accounts || []).find((entry) => String(entry.id) === publicAccountId)?.country || null;
+
+      let payload;
+      try {
+        ({ payload } = await buildBrandInventorySnapshot({
+          accountId: publicAccountId,
+          accountCountry,
+          rowLimit: PLAN_INVENTORY_ROW_LIMIT,
+          getSnapshot: getLatestReportSnapshot,
+          fetchInventoryRows: () => fetchExportRows(
+            apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
+            addDaysStr(to, -PLAN_INVENTORY_LOOKBACK_DAYS), to, PLAN_INVENTORY_ROW_LIMIT,
+            { orderByColumn: "date", orderByDirection: "DESC" }
+          ),
+          fetchCatalogRows: ({ from, to: catalogTo }) => fetchExportRows(
+            apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds,
+            from, catalogTo, CATALOG_ROW_LIMIT, { orderByColumn: "child_asin" }
+          ),
+        }));
+      } catch (buildError) {
+        // Never surface a raw DataDoe/Supabase body. A truncation guard is already a
+        // safe typed message; anything else becomes a generic operational message so
+        // the browser only learns the account failed, not the upstream detail.
+        if (buildError && buildError.brandInventorySafe) throw buildError;
+        throw new Error("FBA inventory could not be refreshed from DataDoe for this account. The previous saved inventory snapshot is preserved.");
+      }
       await sendLegacyPayload(payload);
       return;
     }
