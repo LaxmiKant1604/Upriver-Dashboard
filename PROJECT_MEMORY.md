@@ -6642,3 +6642,35 @@ unavailable + rows absent + TACoS intact); `test:report-derivation` **397**; `te
 `build:check` 2,394 modules; `git diff --check` clean. Remaining LIVE gate unchanged: both migrations
 UNAPPLIED => coverage `schema-missing` => PPC fail-closed unavailable until applied + worker records
 windows. Nothing pushed/merged/deployed/unlocked/scheduled. Listing Optimizer NOT started.
+
+## Scheduler v2: PPC coverage-contract correction re-review blocker (2026-08-12)
+
+Codex re-reviewed the PPC correction commits `5d1b474`, `185779c`, `30c2a25`, and
+`a10fbe5` on `feature/scheduler-v2`. The structural coverage gate, explicit coverage
+reads, malformed-window rejection, derive-level revalidation, optional-row exclusion,
+and saved availability fields are present. The normal PPC suite passes all 40 cases,
+and full `npm run verify` exits 0 with 796 assertions plus the 2,394-module build.
+
+One blocker remains: `validatePpcSourceCoverage()` validates each entry's source key
+and boolean flags but does not validate or normalize its `reason`. The derive boundary
+accepts injected `context.ppcAds`, and `ppcPerformancePayload()` copies an unproven
+optional entry's `reason` verbatim into the saved snapshot as
+`coverageUnavailableReason`. Independent reproduction: a four-key coverage contract
+with the two required sources proven/folded, targeting proven/folded, and search
+unproven/unfolded with `reason: "raw-db-error apikey=LEAK"` returns `{ ok: true }` and
+saves that exact string. This contradicts the documented admin-safe typed-code
+contract and could persist raw database, HTTP, or credential text from a future or
+miswired loader.
+
+Fix narrowly: define a closed allowlist (or a normalizer with a safe fallback) for the
+coverage reason codes produced by `evaluateSourceCoverage()` / the loader; enforce it
+inside `validatePpcSourceCoverage()` at the injected derive boundary; and have
+`ppcPerformancePayload()` emit only the normalized safe code. A proven source must
+have `reason:null`; an unproven optional must carry an allowed safe code (or normalize
+to a single safe fallback). Add direct validator, direct payload, and real-worker/LKG
+regressions proving arbitrary raw/error/secret-shaped strings are rejected or
+normalized and never saved. Preserve the live-route payload when `sourceCoverage` is
+absent, all PPC calculations, request identity/contracts, primary-only routing,
+Scheduler v1/UI, migrations, and controls. Keep PPC SHADOW ONLY + locked; do not start
+Listing Optimizer, apply migrations, push, merge, deploy, enable, or schedule. Leave
+untracked `HANDOFF.md` untouched.
