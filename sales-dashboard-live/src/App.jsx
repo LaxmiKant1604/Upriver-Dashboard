@@ -1431,6 +1431,10 @@ function DashboardApp({ session, access, onSignOut }) {
       let body;
       let batch = 0;
       let requestParams = brandDirectoryCacheParams;
+      // One durable id for the whole explicit action, sent on EVERY request. The server
+      // records it per attempted account so a replayed/tampered continuation cannot spend
+      // a second DataDoe export for an account already attempted this action.
+      const actionId = (globalThis.crypto?.randomUUID?.() || `act-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
       // The typed continuation cursor from the server: the accounts still to attempt in
       // THIS explicit action. It carries never-attempted AND previously-unavailable
       // accounts and only ever shrinks, so every eligible account is attempted exactly
@@ -1438,7 +1442,7 @@ function DashboardApp({ session, access, onSignOut }) {
       let cursor = [];
       do {
         const continuation = batch > 0 ? { catalogSyncContinue: "1", catalogSyncAccountIds: cursor.join(",") } : {};
-        ({ body } = await refreshSharedReport({ ...requestParams, ...continuation }));
+        ({ body } = await refreshSharedReport({ ...requestParams, catalogSyncActionId: actionId, ...continuation }));
         batch += 1;
         if (Array.isArray(body.accounts) && body.accounts.length) {
           requestParams = {
@@ -1453,8 +1457,9 @@ function DashboardApp({ session, access, onSignOut }) {
           account: cursor.length ? `Loading ${cursor.length} remaining account${cursor.length === 1 ? "" : "s"}` : "Product Catalog",
         });
         // Continue until every eligible account has been attempted once (empty cursor),
-        // or a hard safety cap. A blocked source no longer starves the remaining accounts.
-        if (!cursor.length || batch >= 40) break;
+        // or a hard safety cap. One export per request means one account per request, so
+        // the cap is per-account; the cursor strictly shrinks, so the loop always ends.
+        if (!cursor.length || batch >= 200) break;
       } while (true);
       setBrandDirectoryBrands(body.brands || []);
       setBrandDirectoryAccounts(body.brandAccounts || {});
