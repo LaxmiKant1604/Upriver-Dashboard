@@ -30,23 +30,50 @@ checks lives in `sales-dashboard-live/lib/server/sync/schema-contract.js`. Both 
 
 ---
 
-## 1. Migration order (apply one at a time; each is additive + idempotent)
+## 1. Migration order (apply one at a time; all four are ADDITIVE + IDEMPOTENT)
 
-Apply in this order (each is `create ... if not exists` / `create or replace`; none alters or drops an
-existing table; none touches historical Ads data). **Approval required before each `apply`.**
+Apply in this order. All four are additive and idempotent and **do NOT DROP any table or touch historical Ads
+data**. Steps 1–3 only `create ... if not exists` / `create or replace` (they add NEW tables/RPCs and never
+alter an existing table). Step 4 is different and must be understood before applying: it CONVERGES an
+already-unapplied `sync_source_job_owners` table to a final shape and therefore additively **ALTERs** it —
+`add column if not exists connection_id`, a deterministic backfill of `connection_id` from the SAFE public
+account scope, `alter column ... set not null` / `drop default`, and named `add constraint` checks. It changes
+NO other table and stores NO secret, but it is NOT a pure `create if not exists`. **Approval required before
+each `apply`.**
 
-1. `20260807_scheduler_v2.sql` — `sync_cycles`, `sync_source_jobs`, `sync_report_jobs` +
-   RPCs `open_sync_cycle`, `claim_sync_cycle`, `claim_source_export_attempt`.
-2. `20260810_ads_sync_coverage.sql` — `ads_sync_coverage` (durable Daily/PPC coverage windows).
-3. `20260810_report_sync_controls.sql` — `report_sync_settings` (every report seeded `schedule_enabled=false`).
-4. `20260811_sync_source_job_owners.sql` — `sync_source_job_owners` (many-to-many source ownership;
-   converges idempotently and **fails closed** on a malformed pre-existing identity row).
+1. `20260807_scheduler_v2.sql` — creates `sync_cycles`, `sync_source_jobs`, `sync_report_jobs` +
+   RPCs `open_sync_cycle`, `claim_sync_cycle`, `claim_source_export_attempt` (new objects only).
+2. `20260810_ads_sync_coverage.sql` — creates `ads_sync_coverage` (durable Daily/PPC coverage windows).
+3. `20260810_report_sync_controls.sql` — creates `report_sync_settings` (every report seeded `schedule_enabled=false`).
+4. `20260811_sync_source_job_owners.sql` — establishes `sync_source_job_owners` (many-to-many source
+   ownership). ADDITIVELY **ALTERs / backfills / constrains** an existing earlier-shape owner table so a fresh
+   DB and an already-created earlier-shape table converge to the SAME final schema. It **FAILS CLOSED** (raises
+   and aborts the migration) if any pre-existing owner row has a blank/invalid identity
+   (report_key / account_id / request_key / organization_fingerprint / account_scope_hash) or a
+   connection_id that is not `primary`/`dd-secondary` after backfill — such rows must be repaired or removed
+   BEFORE applying. It never rewrites a `dd-secondary:` account as primary.
 
 > The `pg_cron` / `pg_net` kickoff + its Vault secret are a SEPARATE migration
 > (`20260808_scheduler_v2_kickoff.sql`) that is **intentionally NOT part of this rollout** and is applied only
 > after a fully reviewed live cutover. Applying steps 1–4 alone creates NO DataDoe request and NO schedule.
 
-## 2. Verification queries (run read-only after EACH migration)
+## 2. Two DISTINCT schema checks — do not conflate them
+
+- **STATIC source-compatibility audit** (`auditSchemaContract` / `schedulerV2Preflight`): runs in CI on the
+  **committed SQL text + the committed `supabase.js` wrappers**, BEFORE any migration is applied. It reads
+  files only — it never touches the database, DataDoe, or a secret. It proves the migration SQL and the
+  calling wrappers AGREE (declared tables/columns/unique+named constraints, RPC parameter names/order, and
+  every required wrapper export). A non-empty `blockers` array is a **source/contract** problem and stops
+  rollout. It says NOTHING about whether the objects exist in a live database.
+- **LIVE post-migration schema verification** (the queries below + an optional live `probeSchema`): run against
+  the **actual database AFTER each migration** to confirm the objects were really created/altered as expected
+  (and, for step 4, that the ALTER/backfill succeeded and no row failed the fail-closed identity check). This
+  is a read-only DB check; it is the only check that proves the migration was applied correctly.
+
+Both must pass: the static audit gates whether it is SAFE to apply; the live verification confirms it WAS
+applied correctly. Neither substitutes for the other.
+
+## 2a. Verification queries (LIVE — run read-only after EACH migration)
 
 ```sql
 -- tables exist (expect 6 rows across the four migrations)
