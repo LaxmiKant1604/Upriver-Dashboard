@@ -199,7 +199,11 @@ report. **Approval gate per report.**
 ### Explicit approval checklist (sign off before each live step)
 
 - [x] Gate 0 — preconditions verified (offline evidence in Appendix A, 2026-08-13).
-- [ ] Gate 1a–1d — each migration applied (one at a time). Gate 1a package prepared (Appendix B); **NOT executed** — awaiting explicit human approval.
+- Gate 1a–1d — each migration applied (one at a time):
+  - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
+  - [ ] Gate 1b — `20260810_ads_sync_coverage.sql` (**NOT executed** — awaiting separate Codex review + approval).
+  - [ ] Gate 1c — `20260810_report_sync_controls.sql` (**NOT executed**).
+  - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
@@ -546,3 +550,58 @@ Then re-run `schedulerV2Preflight(...)` (still offline/read-only against the com
   a teardown would be its own separately reviewed migration and is out of scope.
 - Do **NOT** proceed to migrations 2–4, the canary, any control unlock, or the kickoff. Stop for Gate 2 review +
   explicit human approval.
+
+---
+
+## Appendix C — Gate 1a EXECUTION evidence (applied 2026-08-13)
+
+Executed with explicit human approval, from `feature/scheduler-v2` @ `2b6a27e`, following Appendix B exactly.
+Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) — the connection string
+was loaded from `.env.local` and never printed. **Exactly one migration applied: `20260807_scheduler_v2.sql`.**
+
+**Preflight:** HEAD includes `2b6a27e`; migration-1 SHA-256 = `1328bc0f…1bdc691e` (matches the frozen hash);
+`SCHEDULER_V2_READY_REPORT_KEYS` length 0 (every v2 report still locked).
+
+**B.1 live read-only inventory (in a read-only transaction) — CLEAR TO APPLY:**
+- P1 `ledger_exists:true migration_recorded:false` (the ledger table pre-existed from earlier migrations; this
+  migration's row was absent — the documented legitimate case).
+- P2 `sync_cycles / sync_source_jobs / sync_report_jobs` all NULL (absent).
+- P3 all three RPC signatures NULL (absent).
+- P4 same-named constraints/indexes/triggers/policies: 0 / 0 / 0 / 0.
+- P5 prerequisites present: `auth.users`, `public.touch_updated_at()`, `public.is_dashboard_admin()`,
+  `service_role`.
+
+**Apply (B.2 hardened command):** single transaction, `pg_advisory_xact_lock(20260807, 1)` taken before the
+ledger check, `create table if not exists app_schema_migrations`, fail-closed check (not previously recorded),
+migration body applied, **plain** ledger insert, commit → `APPLIED 20260807_scheduler_v2.sql`. No retry needed.
+
+**B.4 post-apply structural verification (read-only) — all V1–V11 PASS:**
+- V1 exact columns present: `sync_cycles` 18, `sync_source_jobs` 27, `sync_report_jobs` 25; key defaults
+  (`connection_id` `'primary'`, `create_export_count` `0`) and `cycle_id NOT NULL` confirmed.
+- V2 named constraints (via `pg_get_constraintdef`): `sync_cycles_bucket_date_unique` = `UNIQUE (bucket,
+  cycle_date)`; `sync_source_jobs_cycle_hash_unique` = `UNIQUE (cycle_id, request_hash)`;
+  `sync_report_jobs_cycle_report_account_unique` = `UNIQUE (cycle_id, report_key, account_id)`;
+  `sync_source_jobs_one_attempt` CHECK = `(((create_export_count = 0) AND (attempted_at IS NULL)) OR
+  ((create_export_count = 1) AND (attempted_at IS NOT NULL)))`; FKs `sync_source_jobs.cycle_id` and
+  `sync_report_jobs.cycle_id` → `sync_cycles(id) ON DELETE CASCADE`, `sync_cycles.created_by` →
+  `auth.users(id) ON DELETE SET NULL`.
+- V3 exactly the six indexes with the expected definitions (incl. the partial `WHERE fetch_status='pending'`).
+- V4 three `sync_*_touch` triggers: enabled (`O`), `BEFORE UPDATE`, `EXECUTE FUNCTION touch_updated_at()`.
+- V5 three admin policies: `SELECT`, to `authenticated` only (single role), `USING is_dashboard_admin()`, no
+  WITH CHECK. (The first V5 pass tripped a node-pg `name[]`→string parsing quirk in the checker, not a schema
+  issue; a corrected read-only re-check confirmed all three exactly.)
+- V6 RLS enabled on all three tables.
+- V7 RPC identities exact: `open_sync_cycle(p_bucket text, p_cycle_date date, p_scheduled_at timestamp with time
+  zone, p_trigger text) → uuid`; `claim_sync_cycle(p_cycle_id uuid) → boolean`;
+  `claim_source_export_attempt(p_cycle_id uuid, p_request_hash text) → boolean`; all `SECURITY DEFINER`,
+  `search_path=public`.
+- V8a no `PUBLIC`/`anon`/`authenticated` EXECUTE on any RPC; V8b `service_role` has EXECUTE on all three.
+- V9 `sync_cycles` row count = 0. V10 exactly one ledger row for `20260807_scheduler_v2.sql`. V11 `cron.job` is
+  absent (`pg_cron` not installed) → no schedule.
+
+**Post-apply invariants:** `SCHEDULER_V2_READY_REPORT_KEYS` still empty; the four migration files remain
+byte-unchanged (all seven Gate 0 hashes intact); no code changed; no DataDoe call/export; no schedule; no
+deployment/push/merge. Scheduler v1 / frontend / routes / cron untouched.
+
+**STOP.** Gates 1b–1d (migrations 2–4), the canary, and any control unlock remain **unapproved** — stop for
+Codex review and separate approval before Gate 1b.

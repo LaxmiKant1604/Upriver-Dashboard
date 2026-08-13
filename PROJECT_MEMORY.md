@@ -7969,3 +7969,31 @@ CONFIRMED: zero live DataDoe calls; zero Supabase writes; zero migrations applie
 schedules enabled; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; Product
 Catalog gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex review + explicit
 human approval before applying `20260807_scheduler_v2.sql`.
+
+## Scheduler v2: Production Rollout Gate 1a EXECUTED -- migration 1 applied (2026-08-13)
+
+With explicit human approval, from `feature/scheduler-v2` @ `2b6a27e`, followed SCHEDULER_V2_ROLLOUT.md Appendix
+B exactly and applied **exactly one migration: `20260807_scheduler_v2.sql`** to production Supabase (POSTGRES_URL
+from .env.local, sslmode=no-verify, never printed). Full evidence in SCHEDULER_V2_ROLLOUT.md Appendix C.
+
+- Preflight: HEAD includes 2b6a27e; migration-1 SHA-256 matches the frozen hash; SCHEDULER_V2_READY_REPORT_KEYS
+  length 0.
+- B.1 read-only inventory: CLEAR (ledger table pre-existed from earlier migrations but migration-1 row absent;
+  no target tables/RPCs/constraints/indexes/triggers/policies; prerequisites auth.users / touch_updated_at() /
+  is_dashboard_admin() / service_role all present).
+- Apply (B.2): single transaction, advisory lock before ledger, fail-closed check, plain ledger insert, commit
+  -> APPLIED. Created 3 tables (sync_cycles, sync_source_jobs, sync_report_jobs), 3 RPCs (open_sync_cycle,
+  claim_sync_cycle, claim_source_export_attempt), 6 indexes, 3 touch triggers, RLS + 3 admin SELECT policies,
+  service_role-only EXECUTE grants.
+- B.4 verification: all V1-V11 PASS (exact columns 18/27/25; named constraints incl. one_attempt CHECK + FK
+  targets/ON DELETE; six indexes; three triggers BEFORE UPDATE->touch_updated_at(); three SELECT policies to
+  authenticated only USING is_dashboard_admin(); RLS on all three; exact RPC identities SECURITY DEFINER
+  search_path=public; no PUBLIC/anon/authenticated EXECUTE + service_role EXECUTE on all three; zero sync_cycles
+  rows; exactly one ledger row; pg_cron absent -> no schedule). One V5 false-negative was a node-pg name[]
+  parsing quirk in the checker, confirmed correct by a corrected read-only re-check -- no DB change.
+
+CONFIRMED: exactly one migration applied (20260807_scheduler_v2.sql); zero DataDoe calls/exports; zero reports
+unlocked (allowlist still empty); zero schedules enabled; zero sync cycles created; no deployment/push/merge;
+Scheduler v1 + frontend + routes + cron untouched; migrations 2-4 UNAPPLIED; the four migration files remain
+byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched/untracked. STOP for
+Codex review + separate approval before Gate 1b.
