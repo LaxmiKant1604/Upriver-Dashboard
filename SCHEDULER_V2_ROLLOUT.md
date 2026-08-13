@@ -1207,8 +1207,8 @@ end $$;
 select to_regclass('public.sync_cycles') as sync_cycles,            -- expect non-NULL
        to_regclass('public.sync_source_jobs') as sync_source_jobs;   -- expect non-NULL
 select con.conname, pg_get_constraintdef(con.oid) as def
-  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
- where rel.relname='sync_source_jobs' and con.contype='u'
+  from pg_constraint con
+ where con.conrelid = 'public.sync_source_jobs'::regclass and con.contype='u'
    and pg_get_constraintdef(con.oid) ilike '%(cycle_id, request_hash)%';  -- expect the UNIQUE (cycle_id, request_hash)
 select to_regprocedure('public.touch_updated_at()') as touch_updated_at,       -- expect non-NULL
        to_regprocedure('public.is_dashboard_admin()') as is_dashboard_admin;    -- expect non-NULL
@@ -1224,53 +1224,52 @@ select to_regclass('public.sync_source_job_owners') as owner_table;   -- NULL =>
 **Branch A — `sync_source_job_owners` ABSENT (fresh-path eligible; this rollout applies ONLY here):**
 
 ```sql
--- A1) confirm EVERY owner object is ABSENT (expect 0 rows from each)
-select conname from pg_constraint where conname in
+-- A1) confirm EVERY owner object is ABSENT IN public (expect 0 rows from each). The table is absent here, so we
+--     join pg_namespace and require nspname='public' (a ::regclass cast would ERROR on an absent relation), and
+--     scope by nspname so a same-named object in ANOTHER schema cannot cause a false STOP.
+select con.conname from pg_constraint con
+  join pg_class rel on rel.oid=con.conrelid join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and con.conname in
   ('sync_source_job_owners_unique','sync_source_job_owners_source_fk',
    'sync_source_job_owners_connection_id_check','sync_source_job_owners_identity_nonempty');  -- expect 0
 select indexname from pg_indexes where schemaname='public'
   and indexname in ('sync_source_job_owners_owner_idx','sync_source_job_owners_hash_idx');    -- expect 0
-select tgname from pg_trigger where not tgisinternal and tgname='sync_source_job_owners_touch';  -- expect 0
-select pol.polname from pg_policy pol join pg_class rel on rel.oid=pol.polrelid
- where rel.relname='sync_source_job_owners';  -- expect 0
+select tg.tgname from pg_trigger tg
+  join pg_class rel on rel.oid=tg.tgrelid join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and not tg.tgisinternal and tg.tgname='sync_source_job_owners_touch';  -- expect 0
+select pol.polname from pg_policy pol
+  join pg_class rel on rel.oid=pol.polrelid join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and rel.relname='sync_source_job_owners';  -- expect 0
 ```
 
 Branch A ⇒ record **fresh-path eligible**; after approval, proceed to H.3.
 
-**Branch B — `sync_source_job_owners` ALREADY EXISTS ⇒ STOP; do NOT apply.** Collect the exact current shape and
-a read-only row classification for a **separate upgrade-path review**. Repair/delete NOTHING.
+**Branch B — `sync_source_job_owners` ALREADY EXISTS ⇒ STOP; do NOT apply.** Collect ONLY the universally-safe
+B0 metadata (schema, constraints, indexes, triggers, policies, RLS) and the row count below — these make **no
+assumption about which columns exist**. Do **NOT** run any column-referencing row classification here: an
+earlier table shape may lack `connection_id` (or other columns), so a fixed classification query would ERROR. The
+shape-specific classification is built and reviewed **separately**, once B0 reveals the actual columns. Repair /
+delete / backfill / alter / dynamically-guess NOTHING. Because the table exists, `::regclass` scopes every
+lookup to `public.sync_source_job_owners` exactly (no cross-schema false result).
 
 ```sql
--- B0) exact current shape
+-- B0) exact current shape (universally safe -- no assumption about which columns exist)
 select ordinal_position, column_name, data_type, is_nullable, column_default from information_schema.columns
  where table_schema='public' and table_name='sync_source_job_owners' order by ordinal_position;
-select con.conname, con.contype, pg_get_constraintdef(con.oid) def from pg_constraint con
-  join pg_class rel on rel.oid=con.conrelid where rel.relname='sync_source_job_owners' order by con.conname;
+select con.conname, con.contype, pg_get_constraintdef(con.oid) as def from pg_constraint con
+ where con.conrelid = 'public.sync_source_job_owners'::regclass order by con.conname;
 select indexname, indexdef from pg_indexes where schemaname='public' and tablename='sync_source_job_owners';
-select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) from pg_trigger tg
-  join pg_class rel on rel.oid=tg.tgrelid where rel.relname='sync_source_job_owners' and not tg.tgisinternal;
-select pol.polname, pol.polcmd, pg_get_expr(pol.polqual,pol.polrelid) from pg_policy pol
-  join pg_class rel on rel.oid=pol.polrelid where rel.relname='sync_source_job_owners';
-select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='sync_source_job_owners';
+select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) as def from pg_trigger tg
+ where tg.tgrelid = 'public.sync_source_job_owners'::regclass and not tg.tgisinternal;
+select pol.polname, pol.polcmd, pg_get_expr(pol.polqual, pol.polrelid) as using_qual from pg_policy pol
+ where pol.polrelid = 'public.sync_source_job_owners'::regclass;
+select relrowsecurity from pg_class where oid = 'public.sync_source_job_owners'::regclass;
 select count(*) as row_count from public.sync_source_job_owners;
-
--- B1) read-only row classification (each a COUNT; DO NOT repair/delete)
-select
-  count(*) filter (where coalesce(report_key,'')='' or coalesce(account_id,'')='' or coalesce(request_key,'')=''
-    or coalesce(organization_fingerprint,'')='' or coalesce(account_scope_hash,'')='') as blank_identity,
-  count(*) filter (where connection_id is null or connection_id not in ('primary','dd-secondary')) as null_or_invalid_conn,
-  count(*) filter (where account_id like 'dd-secondary:%' and connection_id='primary') as secondary_labelled_primary,
-  count(*) filter (where account_id not like 'dd-secondary:%' and connection_id is null) as nonsecondary_null_conn
-  from public.sync_source_job_owners;
-select count(*) as duplicate_memberships from (
-  select cycle_id, request_hash, owner_id from public.sync_source_job_owners group by 1,2,3 having count(*)>1) d;
-select count(*) as dangling_source from public.sync_source_job_owners o
- where not exists (select 1 from public.sync_source_jobs j where j.cycle_id=o.cycle_id and j.request_hash=o.request_hash);
-select count(*) as dangling_cycle from public.sync_source_job_owners o
- where not exists (select 1 from public.sync_cycles c where c.id=o.cycle_id);
 ```
 
-Branch B result ⇒ **return for a separate upgrade-path review; do NOT auto-apply over an existing table.**
+Branch B result ⇒ **hand the B0 output (exact columns + constraints + indexes + triggers + policies + RLS + row
+count) to a separate, shape-specific upgrade-path review that builds the row classification against the columns
+B0 actually reports. Do NOT auto-apply over an existing table, and do NOT run a fixed classification here.**
 
 **STOP (do not apply) if:** Q1 raises; Q2 shows a missing prerequisite / the `sync_source_jobs` UNIQUE
 `(cycle_id, request_hash)` absent / `sync_cycles` non-empty / not 13 paused controls; Branch A shows any owner
@@ -1332,24 +1331,24 @@ select ordinal_position, column_name, data_type, is_nullable, column_default fro
 -- 15 updated_at               timestamp with time zone NO   now()
 
 -- Y2) PRIMARY KEY (id)
-select pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
- where rel.relname='sync_source_job_owners' and con.contype='p';  -- expect PRIMARY KEY (id)
+select pg_get_constraintdef(con.oid) def from pg_constraint con
+ where con.conrelid = 'public.sync_source_job_owners'::regclass and con.contype='p';  -- expect PRIMARY KEY (id)
 
 -- Y3) UNIQUE membership (cycle_id, request_hash, owner_id)
-select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
- where rel.relname='sync_source_job_owners' and con.contype='u';
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con
+ where con.conrelid = 'public.sync_source_job_owners'::regclass and con.contype='u';
 -- expect: sync_source_job_owners_unique UNIQUE (cycle_id, request_hash, owner_id)
 
 -- Y4) the two FKs
-select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
- where rel.relname='sync_source_job_owners' and con.contype='f' order by con.conname;
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con
+ where con.conrelid = 'public.sync_source_job_owners'::regclass and con.contype='f' order by con.conname;
 -- expect: FOREIGN KEY (cycle_id) REFERENCES sync_cycles(id) ON DELETE CASCADE;
 --         sync_source_job_owners_source_fk FOREIGN KEY (cycle_id, request_hash)
 --           REFERENCES sync_source_jobs(cycle_id, request_hash) ON DELETE CASCADE
 
 -- Y5) the three CHECKs
-select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
- where rel.relname='sync_source_job_owners' and con.contype='c' order by con.conname;
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con
+ where con.conrelid = 'public.sync_source_job_owners'::regclass and con.contype='c' order by con.conname;
 -- expect: owner_status = ANY (ARRAY['active'::text, 'stale'::text]);
 --         sync_source_job_owners_connection_id_check  connection_id = ANY (ARRAY['primary'::text, 'dd-secondary'::text]);
 --         sync_source_job_owners_identity_nonempty  char_length(report_key)>0 AND char_length(account_id)>0
@@ -1361,17 +1360,17 @@ select indexname, indexdef from pg_indexes where schemaname='public' and tablena
 --         sync_source_job_owners_owner_idx (cycle_id, owner_id); sync_source_job_owners_hash_idx (cycle_id, request_hash)
 
 -- Y7) trigger enabled, BEFORE UPDATE, touch_updated_at()
-select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) def from pg_trigger tg join pg_class rel on rel.oid=tg.tgrelid
- where rel.relname='sync_source_job_owners' and not tg.tgisinternal;
+select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) def from pg_trigger tg
+ where tg.tgrelid = 'public.sync_source_job_owners'::regclass and not tg.tgisinternal;
 -- expect 1 row: sync_source_job_owners_touch, tgenabled='O', "... BEFORE UPDATE ON public.sync_source_job_owners
 --   FOR EACH ROW EXECUTE FUNCTION touch_updated_at()"
 
 -- Y8) RLS enabled + EXACTLY ONE policy (SELECT, authenticated only, USING is_dashboard_admin(), no WITH CHECK)
-select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='sync_source_job_owners';  -- expect true
+select relrowsecurity from pg_class where oid = 'public.sync_source_job_owners'::regclass;  -- expect true
 select pol.polname, pol.polcmd,
        (select string_agg(rolname, ',' order by rolname) from pg_roles where oid = any(pol.polroles)) as roles,
        pg_get_expr(pol.polqual, pol.polrelid) as using_qual, pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check
-  from pg_policy pol join pg_class rel on rel.oid=pol.polrelid where rel.relname='sync_source_job_owners';
+  from pg_policy pol where pol.polrelid = 'public.sync_source_job_owners'::regclass;
 -- expect exactly 1 row: polcmd='r'; roles='authenticated'; using_qual='is_dashboard_admin()'; with_check NULL
 
 -- Y9) zero owner rows (fresh path)

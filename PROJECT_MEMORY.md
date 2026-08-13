@@ -8146,12 +8146,13 @@ this rollout authorizes ONLY the fresh path (Branch A).
   admin SELECT policy. request_hash and owner_id NEVER rewritten; no secret/DataDoe/RPC/schedule/control change.
 - Replay: raw SQL idempotent, but the ledger + advisory-locked apply must still refuse a repeat.
 - Prepared: H.2 pre-apply inventory with TWO BRANCHES -- Branch A (owner table absent) fresh-path eligible,
-  owner constraints/indexes/trigger/policy absent; Branch B (table exists) STOP + read-only classification (blank
-  identity, null/invalid connection_id, dd-secondary-labelled-primary, nonsecondary null conn, duplicate
-  memberships, dangling source/cycle) returned for a SEPARATE upgrade-path review (no repair/delete). Ledger
-  requires m1/m2/m3==1, m4 absent; prerequisites sync_cycles + sync_source_jobs (+ its UNIQUE(cycle_id,
-  request_hash)) + touch_updated_at()/is_dashboard_admin()/authenticated/service_role; sync_cycles empty; 13
-  paused controls. H.3 hardened FRESH-PATH apply (advisory key (20260811,1); require migrations 1-3 exactly once;
+  owner constraints/indexes/trigger/policy absent; Branch B (table exists) STOP + collect ONLY universally-safe
+  B0 metadata (exact columns, constraints, indexes, triggers, policies, RLS) + row count, then defer to a
+  SEPARATE shape-specific upgrade-path review that builds the row classification against the columns B0 actually
+  reports (no inline column-referencing classification -- an earlier shape may lack connection_id; no
+  repair/delete/backfill/alter). Ledger requires m1/m2/m3==1, m4 absent; prerequisites sync_cycles +
+  sync_source_jobs (+ its UNIQUE(cycle_id, request_hash)) +
+  touch_updated_at()/is_dashboard_admin()/authenticated/service_role; sync_cycles empty; 13 paused controls. H.3 hardened FRESH-PATH apply (advisory key (20260811,1); require migrations 1-3 exactly once;
   refuse if migration 4 recorded; RE-CHECK sync_source_job_owners ABSENT inside the locked txn -- fresh-path only,
   refuse+rollback if it exists; plain INSERT; rollback on error; not db:migrate). H.4 structural verification
   (15 columns exact; PK(id); UNIQUE; both FKs; three CHECKs; the 2 explicit indexes + PK/unique; trigger; RLS +
@@ -8160,6 +8161,12 @@ this rollout authorizes ONLY the fresh path (Branch A).
   backfill/delete/DROP).
 - Authorization: Gate 1d execution authorized ONLY when Branch A (fresh) is confirmed; never auto-apply over an
   existing earlier-shape table.
+- Codex re-review correction (docs-only, same tranche): (1) every Appendix H catalog query is now genuinely
+  public-scoped -- present-table lookups use conrelid/tgrelid/polrelid = 'public.<table>'::regclass; absent-table
+  (Branch A) checks join pg_namespace and require nspname='public' -- so a same-named object in another schema
+  cannot cause a false PASS/STOP. (2) Branch B no longer runs a fixed column-referencing row classification
+  (which would error on an earlier shape lacking connection_id); it collects only universally-safe B0 metadata +
+  row count and defers the shape-specific classification to a separate review.
 
 CONFIRMED: no production connection; no Supabase writes; migration 4 UNAPPLIED; zero DataDoe calls; all controls
 paused and locked (allowlist empty); zero schedules/cycles; nothing pushed/merged/deployed; Scheduler v1 +
