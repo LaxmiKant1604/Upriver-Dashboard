@@ -3988,3 +3988,37 @@ green; `build:check` green (dashboard bundle intact); `git diff --check` clean. 
 pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes + cron
 untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
 .worktrees/ untouched. STOP for Codex re-review.
+
+## 66. Phase 1f re-review-6 -- wrapper exports proven only by a LINE-ANCHORED declaration (SHADOW MODE, 2026-08-13)
+
+A regex after a control condition still forged a wrapper export. `regexStartsHere()` classifies a `/` after a
+`)` as division (correct per JS grammar), so a regex whose CONTENT spells the signature survives in
+`lexJs().code`, and `wrapperExported()` matched the embedded text anywhere in the view. Confirmed repro: remove
+the real `export async function saveReportSnapshot(` and append `if (globalThis.__never)\n  /export async function
+saveReportSnapshot(x)/.test("x");` -- the audit returned `ok:true` with NO `REQUIRED_WRAPPER_MISSING`. Fixed in
+`schema-contract.js` (one module + its test); still SHADOW ONLY. The FK-scope (s64.1) and literal-only endpoint
+(s65) corrections are unchanged.
+
+### 66.1 Line-anchored declaration match
+
+`wrapperExported` now requires a declaration that BEGINS a source line in the structural `code` view:
+`^[ \t]*export async function <name>(` with the multiline flag, using `[ \t]` (never `\s`) between tokens so the
+whole match stays on ONE line. A regex literal cannot contain an unescaped newline, so a regex whose content
+spells the signature always keeps its leading `/` on the same line before `export`; the `^[ \t]*export` anchor
+rejects that mid-line `export` -- and any `export` embedded after other same-line code -- without touching
+`regexStartsHere` or adding a fragile slash-context special case. Comments / strings / template text / detected
+regex are still blanked in `code`. Endpoint checks remain on the approved literals-only view (s65).
+
+### 66.2 Verification
+
+`sync-runtime-composition.test.js` **26** (was 25: +the line-anchored-wrapper regression -- the if(...) /regex/
+repro plus while(...) and for(...) equivalents each => `REQUIRED_WRAPPER_MISSING` (named); the assignment-position
+regex fake stays rejected; a similarly-named export, an object property, a class method, a nested function, and a
+disabled declaration are NOT accepted; a genuine line-start export (incl. leading indentation) is recognized;
+canonical passes). `npm run test:report-derivation` **502** (was 501); `sync-dispatch.test.js` 37;
+`test:report-contracts` (161), `test:report-sync-controls` (9), `test:source-identity` (7), `test:sync-engine`
+green; `build:check` green (dashboard bundle intact); `git diff --check` clean. Only 2 files changed
+(schema-contract.js, sync-runtime-composition.test.js) + these docs. Nothing
+pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes + cron
+untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex re-review.

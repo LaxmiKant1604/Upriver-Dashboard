@@ -7913,3 +7913,29 @@ tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated/en
 DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
 Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
 re-review.
+
+## Scheduler v2: Phase 1f re-review-6 -- wrapper exports proven only by a line-anchored declaration (SHADOW MODE, 2026-08-13)
+
+Fixed the remaining Phase 1f wrapper-export blocker from base `5aba598`. SCHEDULER_V2.md s66 has details. One
+module (`schema-contract.js`) + its test; still SHADOW ONLY. The FK-scope (s64.1) and literal-only endpoint
+(s65) corrections are unchanged.
+
+A regex after a control condition still forged a wrapper export: regexStartsHere() classifies a `/` after a `)`
+as division (correct per JS grammar), so a regex whose CONTENT spells the signature survives in lexJs().code and
+wrapperExported() matched it anywhere. Repro: remove the real `export async function saveReportSnapshot(` and
+append `if (globalThis.__never)\n  /export async function saveReportSnapshot(x)/.test("x");` => audit ok:true,
+no REQUIRED_WRAPPER_MISSING. Fix:
+- wrapperExported now requires a LINE-ANCHORED declaration in the `code` view: `^[ \t]*export async function
+  <name>(` with the multiline flag, `[ \t]` (never `\s`) between tokens so the match stays on one line. A regex
+  literal cannot hold an unescaped newline, so its `export` is always mid-line behind the leading `/` and the
+  anchor rejects it -- no change to regexStartsHere, no slash-context special case.
+- Endpoint checks stay on the literals-only view; comments/strings/template-text/detected regex stay blanked in
+  `code`.
+
+Verification: sync-runtime-composition.test.js **26** (was 25); test:report-derivation **502** (was 501);
+sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-controls (9) / test:source-identity
+(7) / test:sync-engine green; build:check green; git diff --check clean. Commit `5ba5316` (wrapper fix +
+tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated/enabled/scheduled; no live
+DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
+Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
+re-review.
