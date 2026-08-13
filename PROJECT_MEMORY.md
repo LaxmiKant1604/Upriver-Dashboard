@@ -8057,3 +8057,38 @@ ads_sync_coverage has zero rows; zero DataDoe calls/exports; zero reports unlock
 schedules enabled; zero sync cycles created; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes +
 cron untouched; four migration files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md +
 .worktrees/ untouched. STOP for Codex review + separate approval before preparing or executing Gate 1c.
+
+## Scheduler v2: Rollout Gate 1c PREPARED (offline; migration 3 NOT applied) (2026-08-13)
+
+Offline/read-only preparation ONLY for Gate 1c (`20260810_report_sync_controls.sql`); NOT executed. No production
+connection this tranche. Full package in SCHEDULER_V2_ROLLOUT.md Appendix F.
+
+- Migration 3 frozen: SHA-256 544557fb...0938bea4c (unchanged). Per existing evidence: migration 1 applied once,
+  migration 2 applied once, migrations 3-4 unapplied (no production query).
+- Migration 3 objects (inspected): table public.report_sync_settings (4 cols -- report_key text PK;
+  schedule_enabled boolean not null default false; updated_by uuid nullable FK->auth.users(id) ON DELETE SET
+  NULL; updated_at timestamptz not null default now()); named CHECK report_sync_settings_key_nonempty
+  (length(trim(report_key)) > 0); seeds EXACTLY 13 report keys (brand-sales, daily-reporting, reconciliation,
+  fba-plan, sku-pl, keyword-rank, content-changes, sales-movers, listing-health, buy-box-loss, returns-leakage,
+  ppc-performance, listing-optimizer), all schedule_enabled=false, updated_by NULL, via ON CONFLICT DO NOTHING;
+  RLS enabled; EXACTLY ONE policy (SELECT to authenticated USING is_dashboard_admin(), no WITH CHECK). No
+  trigger, RPC, cron, DataDoe, or browser-write policy.
+- Replay: raw SQL IS idempotent (CREATE TABLE IF NOT EXISTS + seed ON CONFLICT DO NOTHING + DROP/CREATE POLICY),
+  but the ledger + advisory-locked apply must still refuse a repeat.
+- Prepared: F.2 pre-apply inventory (ledger via guarded DO block requiring migration1==1, migration2==1,
+  migration3 absent; report_sync_settings + constraint/policy absent; prerequisites auth.users /
+  is_dashboard_admin() / authenticated / service_role; migrations 1-2 objects present); F.3 hardened apply
+  (advisory key (20260810,2) DISTINCT from Gate 1b's (20260810,1); require migrations 1 and 2 recorded exactly
+  once; refuse if migration 3 recorded; plain INSERT; rollback on error; not db:migrate); F.4 structural
+  verification (4 columns exact; PK; key-nonempty CHECK; updated_by FK; PK-only index; no user trigger; RLS +
+  exactly one SELECT policy; exactly the 13 keys with none missing/extra/duplicate; all paused; all updated_by
+  null; ledger 1/1/1; ads_sync_coverage present+empty; sync_cycles empty; no new RPC; no cron;
+  SCHEDULER_V2_READY_REPORT_KEYS still empty); F.5 stop conditions (no destructive rollback/DROP).
+- TWO INDEPENDENT GATES clarified: durable rows paused (schedule_enabled=false) is one gate; the empty code
+  allowlist SCHEDULER_V2_READY_REPORT_KEYS is the second; both must stay closed (a report is live only when both
+  open).
+
+CONFIRMED: no production connection; no Supabase writes; migration 3 UNAPPLIED; zero DataDoe calls; all controls
+remain paused and locked (allowlist empty); no schedule; nothing pushed/merged/deployed; Scheduler v1 + frontend
++ routes + cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md + .worktrees/
+untouched. STOP for Codex review + explicit approval before executing Gate 1c.

@@ -202,7 +202,7 @@ report. **Approval gate per report.**
 - Gate 1a–1d — each migration applied (one at a time):
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
-  - [ ] Gate 1c — `20260810_report_sync_controls.sql` (**NOT executed**).
+  - [ ] Gate 1c — `20260810_report_sync_controls.sql` — package prepared (Appendix F); **NOT executed** — awaiting separate Codex review + approval.
   - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
@@ -859,3 +859,220 @@ deployment/push/merge. Scheduler v1 / frontend / routes / cron untouched.
 **STOP.** Gate 1c (`20260810_report_sync_controls.sql`), Gate 1d (`20260811_sync_source_job_owners.sql`), the
 canary, and any control unlock remain **unapproved** — stop for Codex review and separate approval before
 preparing or executing Gate 1c.
+
+---
+
+## Appendix F — Gate 1c package: apply ONLY `20260810_report_sync_controls.sql` (PREPARED — NOT executed)
+
+> **NOTHING in this appendix has been run.** It is the exact package a reviewer/operator executes **after
+> written approval**, one migration only, then STOPS for verification before Gate 1d. Gates 1a + 1b (migrations
+> 1 + 2) are already applied and verified (Appendices C, E).
+
+Frozen input: `20260810_report_sync_controls.sql` SHA-256 `544557fb…0938bea4c` (Gate 0). **Do NOT use `npm run
+db:migrate`** — it applies every pending file at once.
+
+### F.1 What migration 3 changes (accurate characterization)
+
+- **Deletes nothing** (no `DROP TABLE`, no `TRUNCATE`, no change to any existing table or historical data).
+- **Creates one table** `public.report_sync_settings` (4 columns; `report_key` `PRIMARY KEY`; a named CHECK
+  `report_sync_settings_key_nonempty`; an FK `updated_by → auth.users(id) ON DELETE SET NULL`).
+- **Seeds 13 report-control rows**, all `schedule_enabled=false`, `updated_by` NULL, via `INSERT … ON CONFLICT
+  (report_key) DO NOTHING`.
+- **Enables RLS** and creates **exactly one** policy — `admins read report sync settings`: `SELECT`, to
+  `authenticated`, `USING is_dashboard_admin()`. **No browser-write policy** (writes go through the admin API
+  with the service role).
+- Creates **NO trigger**, **NO RPC**, **NO schedule** (no `pg_cron`/`pg_net`), performs **NO DataDoe call**.
+- **Two independent gates stay closed:** (1) the **durable** control rows are all **PAUSED**
+  (`schedule_enabled=false`); (2) the **code** readiness allowlist `SCHEDULER_V2_READY_REPORT_KEYS` is **EMPTY**.
+  Applying migration 3 only seeds the paused rows — it changes neither gate. A report is live only when **both**
+  gates open (a reviewed allowlist addition **and** `schedule_enabled=true`).
+- **Replay behavior (raw SQL):** migration 3 **is** replay-idempotent by construction — `CREATE TABLE IF NOT
+  EXISTS`, the seed uses `ON CONFLICT (report_key) DO NOTHING`, and the policy is `DROP POLICY IF EXISTS` +
+  `CREATE POLICY`. Even so, the ledger + advisory-locked apply (F.3) **MUST still refuse a repeat** (it fails
+  closed on the migration-3 ledger row) — the sanctioned path never re-runs it.
+- **Prerequisites:** `auth.users` (FK target), `public.is_dashboard_admin()` (policy), the `authenticated` role
+  (policy grantee), and `service_role`; Migrations 1 and 2 must already be applied (each ledger row exactly once).
+
+### F.2 Pre-apply read-only inventory (run + REVIEW FIRST; STOP on any hit)
+
+Expected FIRST-APPLY state: ledger exists; **Migration 1 and Migration 2 each present exactly once**; **Migration
+3 row absent**; `report_sync_settings` + its named constraint/policy **absent**; prerequisites present;
+Migrations 1–2 objects present. Any pre-existing Migration-3 object, or a Migration-3 ledger row, is a **STOP**.
+
+```sql
+-- Q1) ledger -- SAFE whether or not the ledger table exists. Migrations 1 & 2 each EXACTLY once; Migration 3
+--     absent. Emits a typed NOTICE; STOPs (raises) on a violation.
+do $$
+declare
+  v_ledger boolean := to_regclass('public.app_schema_migrations') is not null;
+  v_m1 int := 0; v_m2 int := 0; v_m3 int := 0;
+begin
+  if v_ledger then
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v_m1 using '20260807_scheduler_v2.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v_m2 using '20260810_ads_sync_coverage.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v_m3 using '20260810_report_sync_controls.sql';
+  end if;
+  raise notice 'ledger_exists:% migration1_rows:% migration2_rows:% migration3_rows:%', v_ledger, v_m1, v_m2, v_m3;
+  if not v_ledger then raise exception 'STOP: ledger table absent'; end if;
+  if v_m1 <> 1 then raise exception 'STOP: expected exactly 1 Migration-1 ledger row, found %', v_m1; end if;
+  if v_m2 <> 1 then raise exception 'STOP: expected exactly 1 Migration-2 ledger row, found %', v_m2; end if;
+  if v_m3 <> 0 then raise exception 'STOP: Migration 3 already recorded (% row(s)) -- do NOT re-apply', v_m3; end if;
+end $$;
+-- Expected NOTICE: "ledger_exists:true migration1_rows:1 migration2_rows:1 migration3_rows:0".
+
+-- Q2) Migration 3 target objects must be ABSENT
+select to_regclass('public.report_sync_settings') as report_sync_settings_table;      -- expect NULL
+select conname from pg_constraint where conname='report_sync_settings_key_nonempty';  -- expect 0 rows
+select pol.polname from pg_policy pol join pg_class rel on rel.oid=pol.polrelid        -- expect 0 rows
+ where rel.relname='report_sync_settings';
+
+-- Q3) prerequisites must be present
+select to_regclass('auth.users') as auth_users,                                       -- expect non-NULL
+       to_regprocedure('public.is_dashboard_admin()') as is_dashboard_admin;           -- expect non-NULL
+select rolname from pg_roles where rolname in ('authenticated','service_role') order by rolname;  -- expect 2 rows
+
+-- Q4) Migrations 1 & 2 objects must remain present (do NOT modify)
+select to_regclass('public.sync_cycles') a, to_regclass('public.sync_source_jobs') b, to_regclass('public.sync_report_jobs') c,
+       to_regclass('public.ads_sync_coverage') d,
+       to_regprocedure('public.open_sync_cycle(text, date, timestamptz, text)') e,
+       to_regprocedure('public.claim_sync_cycle(uuid)') f,
+       to_regprocedure('public.claim_source_export_attempt(uuid, text)') g;            -- expect all non-NULL
+```
+
+**STOP (do not apply) if:** Q1 raises; Q2 returns any non-NULL or any row; Q3 shows a missing prerequisite (or
+< 2 roles); or Q4 shows any Migration-1/2 object absent.
+
+### F.3 Hardened apply command (single migration, single transaction, advisory-locked, ledger fail-closed)
+
+Advisory key for Gate 1c = `(20260810, 2)` — **distinct** from Gate 1b's `(20260810, 1)`. Run from
+`sales-dashboard-live/`; `POSTGRES_URL` loaded from `.env.local` and never printed.
+
+```bash
+node --input-type=module -e '
+import pg from "pg"; import { readFileSync } from "node:fs";
+const FILE = "20260810_report_sync_controls.sql";
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+try {
+  await c.query("begin");
+  // 1) transaction-scoped advisory lock (migration-3-specific key), BEFORE any ledger read.
+  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260810, 2]);
+  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
+  // 2) require Migrations 1 AND 2 applied EXACTLY once.
+  const m1 = await c.query("select count(*)::int as n from public.app_schema_migrations where filename=$1", ["20260807_scheduler_v2.sql"]);
+  if (m1.rows[0].n !== 1) throw new Error("REFUSING: expected exactly 1 Migration-1 ledger row, found " + m1.rows[0].n);
+  const m2 = await c.query("select count(*)::int as n from public.app_schema_migrations where filename=$1", ["20260810_ads_sync_coverage.sql"]);
+  if (m2.rows[0].n !== 1) throw new Error("REFUSING: expected exactly 1 Migration-2 ledger row, found " + m2.rows[0].n);
+  // 3) fail closed if Migration 3 already recorded.
+  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [FILE]);
+  if (seen.rowCount) throw new Error("REFUSING: " + FILE + " already applied at " + seen.rows[0].applied_at);
+  // 4) apply migration 3 (its whole body runs inside this one transaction).
+  await c.query(readFileSync("supabase/migrations/" + FILE, "utf8"));
+  // 5) record the ledger row with a PLAIN insert (a duplicate raises -> rollback).
+  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [FILE]);
+  await c.query("commit"); console.log("applied " + FILE);
+} catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
+'
+```
+
+### F.4 Post-apply STRUCTURAL verification (read-only, scoped to `public.report_sync_settings`; every mismatch is a STOP)
+
+```sql
+-- X1) exactly 4 columns in order/type/nullability/default
+select ordinal_position, column_name, data_type, is_nullable, column_default
+  from information_schema.columns
+ where table_schema='public' and table_name='report_sync_settings' order by ordinal_position;
+-- expect exactly 4 rows:
+--  1 report_key       text                       NO   (null)
+--  2 schedule_enabled boolean                    NO   false
+--  3 updated_by       uuid                       YES  (null)
+--  4 updated_at       timestamp with time zone   NO   now()
+
+-- X2) PRIMARY KEY exactly (report_key)
+select con.conname, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='report_sync_settings' and con.contype='p';  -- expect: PRIMARY KEY (report_key)
+
+-- X3) named CHECK report_sync_settings_key_nonempty (non-blank report_key)
+select con.conname, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='report_sync_settings' and con.contype='c';
+-- expect exactly one CHECK named report_sync_settings_key_nonempty, semantics length(trim(report_key)) > 0
+--   (Postgres renders it as CHECK ((length(TRIM(BOTH FROM report_key)) > 0)) or ((length(btrim(report_key)) > 0)))
+
+-- X4) FK updated_by -> auth.users(id) ON DELETE SET NULL
+select con.conname, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='report_sync_settings' and con.contype='f';
+-- expect: FOREIGN KEY (updated_by) REFERENCES auth.users(id) ON DELETE SET NULL
+
+-- X5) indexes: ONLY the PK unique index (report_sync_settings_pkey)
+select indexname, indexdef from pg_indexes where schemaname='public' and tablename='report_sync_settings' order by indexname;
+-- expect exactly 1 row: report_sync_settings_pkey (UNIQUE on report_key)
+
+-- X6) NO user trigger on the table
+select tgname from pg_trigger tg join pg_class rel on rel.oid=tg.tgrelid
+ where rel.relname='report_sync_settings' and not tg.tgisinternal;  -- expect 0 rows
+
+-- X7) RLS enabled + EXACTLY ONE policy (SELECT, authenticated only, USING is_dashboard_admin(), no WITH CHECK)
+select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='report_sync_settings';  -- expect true
+select pol.polname, pol.polcmd,
+       (select string_agg(rolname, ',' order by rolname) from pg_roles where oid = any(pol.polroles)) as roles,
+       pg_get_expr(pol.polqual, pol.polrelid) as using_qual,
+       pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check
+  from pg_policy pol join pg_class rel on rel.oid=pol.polrelid
+ where rel.relname='report_sync_settings';
+-- expect exactly 1 row: polcmd='r'; roles='authenticated'; using_qual='is_dashboard_admin()'; with_check NULL
+
+-- X8) EXACTLY these 13 keys, none missing/extra/duplicate; all paused; updated_by all NULL
+select count(*) as total,
+       count(*) filter (where schedule_enabled) as enabled_count,
+       count(*) filter (where updated_by is not null) as has_updater,
+       count(distinct report_key) as distinct_keys
+  from public.report_sync_settings;  -- expect total=13, enabled_count=0, has_updater=0, distinct_keys=13
+with expected(k) as (values ('brand-sales'),('daily-reporting'),('reconciliation'),('fba-plan'),('sku-pl'),
+  ('keyword-rank'),('content-changes'),('sales-movers'),('listing-health'),('buy-box-loss'),('returns-leakage'),
+  ('ppc-performance'),('listing-optimizer'))
+select (select count(*) from expected e left join public.report_sync_settings r on r.report_key=e.k where r.report_key is null) as missing,
+       (select count(*) from public.report_sync_settings r left join expected e on e.k=r.report_key where e.k is null) as extra;
+-- expect missing=0 and extra=0
+
+-- X9) ledger: Migrations 1, 2, 3 each EXACTLY one row
+select filename, count(*) as n from public.app_schema_migrations
+ where filename in ('20260807_scheduler_v2.sql','20260810_ads_sync_coverage.sql','20260810_report_sync_controls.sql')
+ group by filename order by filename;  -- expect 3 rows, each n=1
+
+-- X10) prior tables unchanged: ads_sync_coverage present + empty; sync_cycles empty
+select to_regclass('public.ads_sync_coverage') as ads_sync_coverage,   -- expect non-NULL
+       (select count(*) from public.ads_sync_coverage) as ads_rows,     -- expect 0
+       (select count(*) from public.sync_cycles) as cycle_rows;         -- expect 0
+
+-- X11) no new RPC; no cron/schedule
+select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public' and proname ilike '%report_sync_settings%';   -- expect 0 rows
+select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no schedule; else check for sync jobs (expect 0)
+```
+
+**Also (offline / code — NOT a DB query):** confirm `SCHEDULER_V2_READY_REPORT_KEYS` is still `Object.freeze([])`
+(empty). **Two independent gates must BOTH stay closed:** the durable control rows are all paused
+(`schedule_enabled=false`, X8) AND the code readiness allowlist is empty. A report is live only when **both**
+open — seeding the paused rows here opens neither.
+
+### F.5 Stop / rollback conditions (Gate 1c)
+
+- The apply is a single advisory-locked transaction with abort-on-error, so any failure leaves the DB
+  **unchanged** (no partial apply). STOP on any error (missing prerequisite, Migration 1 or 2 not recorded
+  exactly once, or Migration 3 already recorded) — do not retry.
+- **STOP on any structural mismatch:** ≠ 4 columns or any differing order/type/nullability/default (X1); PK not
+  exactly `(report_key)` (X2); the `report_sync_settings_key_nonempty` CHECK missing/renamed or not enforcing
+  non-blank `report_key` (X3); FK not `updated_by → auth.users(id) ON DELETE SET NULL` (X4); any index other
+  than the PK (X5); any user trigger (X6); RLS off, ≠ 1 policy, or a policy that is not SELECT / not
+  authenticated-only / missing `is_dashboard_admin()` / has a WITH CHECK (X7); missing / extra / duplicate keys,
+  ≠ 13 rows, any `schedule_enabled=true`, or any `updated_by` not null (X8); any ledger filename ≠ exactly one
+  row (X9); `ads_sync_coverage` absent or non-empty, or `sync_cycles` non-empty (X10); any new RPC or `cron.job`
+  entry (X11); or `SCHEDULER_V2_READY_REPORT_KEYS` not empty (code check).
+- Non-destructive: migration 3 is additive; while every v2 control stays locked (shadow) and every durable row
+  paused, leaving it applied is safe and inert. **No destructive teardown (DROP TABLE) is prepared.** (The raw
+  SQL is replay-idempotent, but the ledger/advisory-locked apply still refuses a repeat.)
+- Do **NOT** proceed to Gate 1d (`20260811_sync_source_job_owners.sql`), the canary, any control unlock, or the
+  kickoff. Stop for review + explicit human approval.
