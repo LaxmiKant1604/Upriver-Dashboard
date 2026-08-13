@@ -276,111 +276,230 @@ that requires explicit human approval.
 file atomically instead. (The kickoff `20260808_scheduler_v2_kickoff.sql` is **not present** in
 `supabase/migrations/`, so no schedule can be applied here regardless.)
 
-**Exact apply command (single file, one transaction, abort+rollback on any error, ledger-consistent).** Uses the
-same connection as `apply-supabase-migrations.mjs` (`POSTGRES_URL` + `sslmode=no-verify` for the Vercel pooler
-cert on Windows):
+### B.1 Pre-apply read-only inventory (run + REVIEW FIRST; STOP on any hit)
+
+Run these read-only queries and review the output **before** the apply. Expected FIRST-APPLY state: **0** ledger
+row for this migration; every target table/RPC/constraint/index/trigger/policy **absent**; every prerequisite
+**present**. If any target object or the ledger row already exists — or any prerequisite is missing — **STOP; do
+not apply**; capture the exact shape (use the B.3 definition queries) and report it for review.
+
+```sql
+-- P1) ledger state for THIS migration (expect 0 rows; note whether the ledger table exists yet)
+select to_regclass('public.app_schema_migrations') as ledger_table;            -- may be NULL on a fresh DB
+select filename, applied_at from public.app_schema_migrations
+ where filename = '20260807_scheduler_v2.sql';                                  -- expect 0 rows
+
+-- P2) target tables already present? (expect all three NULL)
+select to_regclass('public.sync_cycles')     as sync_cycles,
+       to_regclass('public.sync_source_jobs') as sync_source_jobs,
+       to_regclass('public.sync_report_jobs') as sync_report_jobs;
+
+-- P3) the three EXACT RPC signatures already present? (expect all three NULL)
+select to_regprocedure('public.open_sync_cycle(text, date, timestamptz, text)') as open_sync_cycle,
+       to_regprocedure('public.claim_sync_cycle(uuid)')                          as claim_sync_cycle,
+       to_regprocedure('public.claim_source_export_attempt(uuid, text)')         as claim_source_export_attempt;
+
+-- P4) same-named constraints / indexes / triggers / policies already present? (expect 0 rows from EACH)
+select conname from pg_constraint
+ where conname in ('sync_cycles_bucket_date_unique','sync_source_jobs_cycle_hash_unique',
+                   'sync_source_jobs_one_attempt','sync_report_jobs_cycle_report_account_unique');
+select indexname from pg_indexes where schemaname='public'
+ and indexname in ('sync_cycles_bucket_date_idx','sync_source_jobs_cycle_idx','sync_source_jobs_pending_idx',
+                   'sync_source_jobs_source_idx','sync_report_jobs_cycle_idx','sync_report_jobs_report_idx');
+select tgname from pg_trigger
+ where not tgisinternal and tgname in ('sync_cycles_touch','sync_source_jobs_touch','sync_report_jobs_touch');
+select polname from pg_policy
+ where polname in ('admins read sync cycles','admins read sync source jobs','admins read sync report jobs');
+
+-- P5) required PREREQUISITES must ALREADY exist (from earlier migrations); STOP if any is missing
+select to_regclass('auth.users')                      as auth_users,          -- 20260729_dashboard_auth_and_access
+       to_regprocedure('public.touch_updated_at()')   as touch_updated_at,     -- 20260728_shared_dashboard
+       to_regprocedure('public.is_dashboard_admin()') as is_dashboard_admin;   -- 20260729_dashboard_auth_and_access
+select rolname from pg_roles where rolname = 'service_role';                   -- expect exactly 1 row
+```
+
+**STOP (do not apply) if:** P1 returns any ledger row; P2/P3 return any non-NULL; P4 returns any row; or P5 shows
+any NULL / the `service_role` row missing. Report the exact shape for review rather than applying over it.
+
+### B.2 Hardened apply command (single migration, single transaction, advisory-locked, ledger fail-closed)
+
+Applies **only** `20260807_scheduler_v2.sql`, in one transaction, taking a transaction-scoped advisory lock
+**before** touching the ledger, failing closed if the migration is already recorded, inserting the ledger row
+with a **plain** insert (no `ON CONFLICT` — a repeat must surface, not hide), and rolling back on any error. Uses
+the same connection as `apply-supabase-migrations.mjs` (`POSTGRES_URL` + `sslmode=no-verify` for the Vercel
+pooler cert on Windows).
 
 ```bash
 node --input-type=module -e '
 import pg from "pg"; import { readFileSync } from "node:fs";
+const FILE = "20260807_scheduler_v2.sql";
 const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
 const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
 try {
   await c.query("begin");
+  // 1) transaction-scoped advisory lock BEFORE any ledger check/create (auto-released on commit/rollback);
+  //    serializes any concurrent/repeated apply of THIS migration.
+  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260807, 1]);
   await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
-  await c.query(readFileSync("sales-dashboard-live/supabase/migrations/20260807_scheduler_v2.sql", "utf8"));
-  await c.query("insert into public.app_schema_migrations (filename) values ($1) on conflict (filename) do nothing", ["20260807_scheduler_v2.sql"]);
-  await c.query("commit"); console.log("applied 20260807_scheduler_v2.sql");
+  // 2) fail closed if already recorded (do NOT hide a repeat).
+  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [FILE]);
+  if (seen.rowCount) throw new Error("REFUSING: " + FILE + " already applied at " + seen.rows[0].applied_at + " (Gate 1a expects the FIRST apply)");
+  // 3) apply migration 1 (its whole body runs inside this one transaction).
+  await c.query(readFileSync("sales-dashboard-live/supabase/migrations/" + FILE, "utf8"));
+  // 4) record the ledger row with a PLAIN insert (a duplicate raises a PK error -> rollback, surfacing a repeat).
+  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [FILE]);
+  await c.query("commit"); console.log("applied " + FILE);
 } catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
 '
 ```
 
-psql equivalent (if preferred): `PGSSLMODE=no-verify psql "$POSTGRES_URL" -v ON_ERROR_STOP=1 --single-transaction
--c "create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not
-null default now());" -f sales-dashboard-live/supabase/migrations/20260807_scheduler_v2.sql -c "insert into
-public.app_schema_migrations (filename) values ('20260807_scheduler_v2.sql') on conflict (filename) do nothing;"`
+### B.3 What migration 1 changes (accurate characterization)
 
-**This migration is pure additive DDL: it creates NO schedule (no `pg_cron`/`pg_net`) and performs NO DataDoe
-export** (verified by inspection of the frozen file — the only `pg_cron` tokens are comments and a `trigger`
-text-enum column value). It reuses helpers from earlier migrations (`public.touch_updated_at()`,
-`public.is_dashboard_admin()`, `auth.users`); if any is absent the apply errors and the whole transaction rolls
-back (fail closed).
+- **Deletes nothing:** no `DROP TABLE`, no `TRUNCATE`, no change to any existing table or historical Ads/report
+  data. The only `DROP`s are `drop trigger if exists` / `drop policy if exists` for THIS migration's own three
+  triggers and three policies, each immediately re-created (see the transactional note below).
+- **Creates** the three scheduler tables (`sync_cycles`, `sync_source_jobs`, `sync_report_jobs`) and their six
+  indexes (`create table` / `create index if not exists`).
+- **`CREATE OR REPLACE`** for the three RPCs (`open_sync_cycle`, `claim_sync_cycle`,
+  `claim_source_export_attempt`).
+- **Transactionally DROP + CREATE** the three named triggers (`sync_cycles_touch`, `sync_source_jobs_touch`,
+  `sync_report_jobs_touch`) and the three named policies (`admins read sync cycles` / `... source jobs` /
+  `... report jobs`): each is `drop ... if exists` then `create ...`. Because the whole migration runs in ONE
+  transaction, no concurrent reader ever observes a window with the trigger/policy missing.
+- **Enables RLS** on the three tables and sets function EXECUTE to `service_role` only (revokes from
+  `public` / `anon` / `authenticated`).
+- **Creates NO schedule** (no `pg_cron` / `pg_net`) and performs **NO DataDoe call** (verified by inspecting the
+  frozen file: the only `pg_cron` tokens are comments and the `trigger` text-enum column value).
+- **Prerequisites** (from earlier migrations): `public.touch_updated_at()`, `public.is_dashboard_admin()`,
+  `auth.users`, and the `service_role` role. If any is absent the apply errors and the whole transaction rolls
+  back (fail closed) — B.1 checks these before applying.
 
-**Expected objects created by migration 1:**
-- Tables (3): `public.sync_cycles`, `public.sync_source_jobs`, `public.sync_report_jobs`.
-- RPCs (3): `public.open_sync_cycle(text,date,timestamptz,text)→uuid`, `public.claim_sync_cycle(uuid)→boolean`,
-  `public.claim_source_export_attempt(uuid,text)→boolean` (all `security definer`, executable by `service_role`
-  only — revoked from `public`/`anon`/`authenticated`).
-- Named constraints (4): `sync_cycles_bucket_date_unique` (UNIQUE), `sync_source_jobs_cycle_hash_unique`
-  (UNIQUE), `sync_source_jobs_one_attempt` (CHECK), `sync_report_jobs_cycle_report_account_unique` (UNIQUE)
-  — plus inline CHECKs (`bucket`, `trigger`, `status`, `fetch_status`, `create_export_count >= 0`, `error_stage`,
-  `derive_status`, `save_status`).
-- Indexes (6): `sync_cycles_bucket_date_idx`, `sync_source_jobs_cycle_idx`, `sync_source_jobs_pending_idx`,
-  `sync_source_jobs_source_idx`, `sync_report_jobs_cycle_idx`, `sync_report_jobs_report_idx`.
-- Triggers (3): `sync_cycles_touch`, `sync_source_jobs_touch`, `sync_report_jobs_touch` (BEFORE UPDATE →
-  `touch_updated_at()`).
-- RLS enabled on all 3 tables + 3 admin-only SELECT policies (`is_dashboard_admin()`).
+### B.4 Post-apply STRUCTURAL verification (read-only, table-scoped; every mismatch is a STOP)
 
-**Read-only verification queries (run immediately after apply; expected results inline):**
+Run after the apply; compare each result against the expected shape. **Any deviation STOPs the rollout.**
 
 ```sql
--- 1) the 3 tables exist (expect exactly these 3 rows)
-select table_name from information_schema.tables
- where table_schema='public'
-   and table_name in ('sync_cycles','sync_source_jobs','sync_report_jobs')
- order by table_name;
+-- V1) exact columns / types / nullability / defaults (compare per table against the migration text).
+--     expect: sync_cycles 18 cols, sync_source_jobs 27 cols, sync_report_jobs 25 cols.
+select table_name, ordinal_position, column_name, data_type, is_nullable, column_default
+  from information_schema.columns
+ where table_schema='public' and table_name in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by table_name, ordinal_position;
 
--- 2) the 3 RPCs exist (expect 3)
-select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
- where n.nspname='public'
-   and proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
- order by proname;
+-- V2) exact NAMED constraints, scoped to the three tables, via pg_get_constraintdef
+select rel.relname as table_name, con.conname, con.contype, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con
+  join pg_class rel on rel.oid=con.conrelid
+  join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and rel.relname in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by rel.relname, con.conname;
+-- expect (among the PK + inline CHECKs):
+--   sync_cycles_bucket_date_unique                UNIQUE (bucket, cycle_date)
+--   sync_source_jobs_cycle_hash_unique            UNIQUE (cycle_id, request_hash)
+--   sync_source_jobs_one_attempt                  CHECK (((create_export_count = 0 AND attempted_at IS NULL)
+--                                                    OR (create_export_count = 1 AND attempted_at IS NOT NULL)))
+--   sync_report_jobs_cycle_report_account_unique  UNIQUE (cycle_id, report_key, account_id)
+--   FK sync_source_jobs.cycle_id -> sync_cycles(id) ON DELETE CASCADE
+--   FK sync_report_jobs.cycle_id -> sync_cycles(id) ON DELETE CASCADE
+--   FK sync_cycles.created_by    -> auth.users(id)  ON DELETE SET NULL
 
--- 3) the 4 named constraints exist (expect 4)
-select conname from pg_constraint
- where conname in ('sync_cycles_bucket_date_unique','sync_source_jobs_cycle_hash_unique',
-                   'sync_source_jobs_one_attempt','sync_report_jobs_cycle_report_account_unique')
- order by conname;
+-- V3) exactly the SIX explicit indexes + target table + definition (expect 6 rows)
+select tablename, indexname, indexdef from pg_indexes
+ where schemaname='public'
+   and indexname in ('sync_cycles_bucket_date_idx','sync_source_jobs_cycle_idx','sync_source_jobs_pending_idx',
+                     'sync_source_jobs_source_idx','sync_report_jobs_cycle_idx','sync_report_jobs_report_idx')
+ order by indexname;
+-- expect: sync_cycles(bucket, cycle_date DESC); sync_source_jobs(cycle_id, fetch_status);
+--   sync_source_jobs(cycle_id) WHERE fetch_status='pending'; sync_source_jobs(source_id, created_at DESC);
+--   sync_report_jobs(cycle_id, derive_status, save_status); sync_report_jobs(report_key, account_id, created_at DESC).
 
--- 4) RLS is enabled on all 3 tables (expect 3 rows, rowsecurity = true)
+-- V4) exactly three touch triggers: BEFORE UPDATE, enabled, calling public.touch_updated_at() (expect 3 rows)
+select rel.relname as table_name, t.tgname, t.tgenabled as enabled, pg_get_triggerdef(t.oid) as definition
+  from pg_trigger t
+  join pg_class rel on rel.oid=t.tgrelid
+  join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and not t.tgisinternal
+   and rel.relname in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by rel.relname;
+-- expect: tgname sync_*_touch; enabled='O'; definition "... BEFORE UPDATE ON public.<table> FOR EACH ROW
+--         EXECUTE FUNCTION touch_updated_at()".
+
+-- V5) exactly three admin SELECT policies to `authenticated`, qualifier is_dashboard_admin() (expect 3 rows)
+select rel.relname as table_name, pol.polname, pol.polcmd as cmd,
+       array(select rolname from pg_roles where oid = any(pol.polroles)) as roles,
+       pg_get_expr(pol.polqual, pol.polrelid) as using_qual
+  from pg_policy pol
+  join pg_class rel on rel.oid=pol.polrelid
+  join pg_namespace n on n.oid=rel.relnamespace
+ where n.nspname='public' and rel.relname in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by rel.relname;
+-- expect: polcmd='r' (SELECT); roles={authenticated}; using_qual = "is_dashboard_admin()".
+
+-- V6) RLS enabled on all three tables (expect relrowsecurity=true for all three)
 select relname, relrowsecurity from pg_class
  where relnamespace='public'::regnamespace
    and relname in ('sync_cycles','sync_source_jobs','sync_report_jobs')
  order by relname;
 
--- 5) execute grants are service_role-only (expect only service_role for each function)
-select p.proname, r.rolname from pg_proc p
-   join pg_namespace n on n.oid=p.pronamespace
-   cross join lateral aclexplode(p.proacl) a
-   join pg_roles r on r.oid=a.grantee
- where n.nspname='public'
-   and p.proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
-   and a.privilege_type='EXECUTE'
- order by p.proname, r.rolname;
+-- V7) exact RPC identity args/order, return type, SECURITY DEFINER, and search_path=public (expect 3 rows)
+select p.proname,
+       pg_get_function_identity_arguments(p.oid) as identity_args,
+       pg_get_function_result(p.oid)             as returns,
+       p.prosecdef                               as security_definer,
+       p.proconfig                               as config
+  from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public' and p.proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
+ order by p.proname;
+-- expect:
+--   claim_source_export_attempt  "p_cycle_id uuid, p_request_hash text"                       boolean  t  {search_path=public}
+--   claim_sync_cycle             "p_cycle_id uuid"                                             boolean  t  {search_path=public}
+--   open_sync_cycle              "p_bucket text, p_cycle_date date, p_scheduled_at timestamp
+--                                 with time zone, p_trigger text"                              uuid     t  {search_path=public}
 
--- 6) nothing has run yet (expect 0)
+-- V8a) FORBIDDEN execute grantees must be ABSENT (expect 0 rows)
+select p.proname, (case when a.grantee=0 then 'PUBLIC' else r.rolname end) as bad_grantee
+  from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  cross join lateral aclexplode(p.proacl) a
+  left join pg_roles r on r.oid=a.grantee
+ where n.nspname='public' and p.proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
+   and a.privilege_type='EXECUTE' and (a.grantee=0 or r.rolname in ('anon','authenticated'));
+
+-- V8b) service_role MUST have EXECUTE on all three (expect 3 rows); the function owner may also execute.
+select p.proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+  cross join lateral aclexplode(p.proacl) a join pg_roles r on r.oid=a.grantee
+ where n.nspname='public' and p.proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
+   and a.privilege_type='EXECUTE' and r.rolname='service_role';
+
+-- V9) nothing has run yet (expect 0)
 select count(*) as cycle_rows from public.sync_cycles;
 
--- 7) ledger recorded exactly this one migration in this gate (expect 1 row for 20260807_scheduler_v2.sql)
-select filename, applied_at from public.app_schema_migrations
- where filename = '20260807_scheduler_v2.sql';
+-- V10) ledger recorded EXACTLY this one migration in this gate (expect exactly 1 row)
+select filename, applied_at from public.app_schema_migrations where filename='20260807_scheduler_v2.sql';
 
--- 8) NO Scheduler-v2 schedule was created (pg_cron optional; expect 0 rows, or a benign "relation cron.job
---    does not exist" if pg_cron is not installed — either way, migration 1 creates no cron entry)
-select jobid, jobname, schedule from cron.job where command ilike '%sync%';
+-- V11) NO Scheduler-v2 cron entry (pg_cron optional; expect 0 rows, or a benign "relation cron.job does not
+--      exist" if pg_cron is not installed — migration 1 creates no cron entry either way)
+select jobid, jobname, schedule, command from cron.job where command ilike '%sync%' or jobname ilike '%sync%';
 ```
 
 Then re-run `schedulerV2Preflight(...)` (still offline/read-only against the committed source) — it must stay
 `ready:true`, `blockers:[]`, controls locked.
 
-**Stop / rollback conditions (Gate 1a):**
-- The apply is a single transaction with abort-on-error, so any failure leaves the DB **unchanged** (no partial
-  apply). STOP and investigate if the apply errors (e.g. a missing helper function) — do not retry blindly.
-- STOP if any verification query deviates: fewer/more than 3 tables, 3 RPCs, or 4 named constraints; any RLS
-  `rowsecurity=false`; any EXECUTE grantee other than `service_role`; `cycle_rows > 0`; or a `cron.job` row
-  matching sync.
-- Non-destructive rollback: migration 1 is additive + idempotent; while every v2 control stays locked (shadow),
-  leaving it applied is safe and inert. **No destructive teardown (DROP) is prepared** — a teardown would be its
-  own separately reviewed migration and is out of scope.
+### B.5 Stop / rollback conditions (Gate 1a)
+
+- The apply is a single advisory-locked transaction with abort-on-error, so any failure leaves the DB
+  **unchanged** (no partial apply). STOP and investigate on any error (e.g. a missing prerequisite, or the
+  ledger already containing this migration) — do not retry blindly.
+- **STOP on any structural mismatch:** a column set / type / nullability / default that differs from the
+  migration, or V1 counts ≠ 18 / 27 / 25; any named-constraint definition differing (V2 — especially the
+  `sync_source_jobs_one_attempt` CHECK body or an FK target / `ON DELETE` action); ≠ 6 indexes or any differing
+  index definition (V3); ≠ 3 triggers, not `BEFORE UPDATE`, disabled, or not calling `touch_updated_at()` (V4);
+  ≠ 3 policies, not SELECT, wrong role, or missing the `is_dashboard_admin()` qualifier (V5); any
+  `relrowsecurity=false` (V6); any RPC identity-args / return-type / `security_definer` / `search_path=public`
+  mismatch (V7); **any** row from V8a (PUBLIC / anon / authenticated holds EXECUTE) or fewer than 3 rows from
+  V8b (service_role missing EXECUTE); `cycle_rows > 0` (V9); ≠ exactly 1 ledger row (V10); or any `cron.job` row
+  matching sync (V11).
+- Non-destructive rollback: migration 1 is additive and idempotent-on-replay; while every v2 control stays
+  locked (shadow), leaving it applied is safe and inert. **No destructive teardown (DROP TABLE) is prepared** —
+  a teardown would be its own separately reviewed migration and is out of scope.
 - Do **NOT** proceed to migrations 2–4, the canary, any control unlock, or the kickoff. Stop for Gate 2 review +
   explicit human approval.
