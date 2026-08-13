@@ -3777,3 +3777,63 @@ additive files changed (schema-contract.js, runtime-composition.js, sync-runtime
 package.json, SCHEDULER_V2_ROLLOUT.md + these docs). Nothing pushed/merged/deployed/migrated; no live DataDoe
 call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; the Product Catalog
 incremental ASIN-brand gap-fill is NOT started. STOP for Codex senior review.
+
+## 61. Phase 1f re-review -- four blocker fixes + runbook accuracy (SHADOW MODE, 2026-08-13)
+
+Codex's Phase 1f re-review raised four blockers + a runbook correction. All fixed without changing SHADOW
+status: no route/cron/migration/deployment/live-DataDoe/control-unlock/frontend change.
+
+### 61.1 Durable scheduled settings are wired (blocker 1)
+
+`buildSchedulerV2Runtime` now injects the production `getReportSyncSettings` reader. A SCHEDULED `rt.run()`
+loads the durable `report_sync_settings` BEFORE dispatch; a settings-read failure THROWS and fails closed
+before discovery / cycle creation / any Supabase write / any DataDoe export. Caller-supplied `settings` are
+NEVER the production control source (dropped by the run allowlist). Proven: `schedule_enabled=true` selects a
+v2-ready report, `false` does not, a caller `settings` override is ignored, and a settings-read failure fails
+closed before any I/O; manual requests stay readiness-gated and load no settings.
+
+### 61.2 Protected trusted collaborators (blocker 2)
+
+`rt.run(sliceArgs)` accepts ONLY an explicit operational-argument allowlist (`RUN_OPERATIONAL_ARGS`:
+bucket / cycleDate / asOf / asOfFor / manualReportKeys / budget / trigger); the durable settings + every
+trusted collaborator (`controlCatalog`, `connections`, `discoverAccounts`, `store`, `dataDoe`, `saveSnapshot`,
+`ppcAdsProviders`, `loadDerivedContext`) are spread LAST and can NEVER be overridden per run. Test injection
+stays at `buildSchedulerV2Runtime(overrides)`. Regressions prove a reserved run override cannot unlock a
+report, reroute organizations, or replace the shadow saver.
+
+### 61.3 The static migration audit is now real (blocker 3)
+
+`auditSchemaContract` comment-strips the SQL, validates every RPC's exact parameter NAMES + ORDER (a renamed
+`p_request_hash` fails), scopes unique/PK matching to the correct table body (a removed unique whose text
+survives ONLY in a comment fails), audits the critical NAMED invariants by name
+(`sync_source_jobs_one_attempt`, `sync_source_job_owners_source_fk`, the owner `connection_id`/identity
+checks, + the dedup uniques), and proves EVERY `REQUIRED_WRAPPER_EXPORTS` export exists -- so wrapper
+availability is never claimed vacuously when `wrappers=null`. Blockers stay typed + admin-safe.
+
+### 61.4 Locked invocation is zero-I/O (blocker 4)
+
+`runSchedulerV2Shadow` returns a deterministic `{ drained:true, continuationRequired:false, spent:0 }` rollup
+BEFORE `discoverAccounts` / `openCycle` / any store or DataDoe call when no source-backed OR derived-only
+report is dispatchable. Trap tests prove default-locked MANUAL and SCHEDULED runs touch zero
+discovery/store/DataDoe.
+
+### 61.5 Runbook accuracy
+
+`SCHEDULER_V2_ROLLOUT.md` no longer claims none of the migrations alters an existing table: it now states that
+`20260811` additively ALTERs/backfills/constrains an existing earlier-shape owner table and FAILS CLOSED on a
+malformed pre-existing identity row, and it clearly SEPARATES the STATIC source-compatibility audit (committed
+SQL + wrappers, in CI, reads files only) from the LIVE post-migration schema verification (read-only DB
+queries after each apply). Both must pass; neither substitutes for the other.
+
+### 61.6 Verification (all natural, exit 0)
+
+`sync-runtime-composition.test.js` **18** (was 13: +blocker-3 audit hardening, +blocker-1 durable settings x2,
++blocker-2 protected run, +blocker-4 locked zero-I/O). `sync-dispatch.test.js` **37** (unchanged; the locked
+early-return is behaviour-compatible). `npm run test:report-derivation` **494** (was 489); `test:sync-engine`,
+`test:report-contracts` (161), `test:report-sync-controls` (9), `test:source-identity` (7) green;
+`build:check` (2,395 modules) green; `git diff --check` clean. Only the intended files changed
+(schema-contract.js, runtime-composition.js, sync-dispatch.js, sync-runtime-composition.test.js,
+SCHEDULER_V2_ROLLOUT.md + these docs). Nothing pushed/merged/deployed/migrated/enabled/scheduled; no live
+DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; the Product
+Catalog incremental ASIN-brand gap-fill is NOT started; HANDOFF.md + .worktrees/ untouched. STOP for Codex
+re-review.

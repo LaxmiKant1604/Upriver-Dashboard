@@ -7769,3 +7769,40 @@ Verification: `sync-runtime-composition.test.js` **13**; `npm run test:report-de
 call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; the Product Catalog
 incremental ASIN-brand gap-fill is NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
 senior review.
+
+## Scheduler v2: Phase 1f re-review -- four blocker fixes + runbook accuracy (SHADOW MODE, 2026-08-13)
+
+Fixed the four Phase 1f re-review blockers + the runbook correction from base `aeb899a`. SCHEDULER_V2.md s61
+records the details. Still SHADOW ONLY: no route/cron/migration/deployment/live-DataDoe/control-unlock/frontend.
+
+1. **Durable scheduled settings wired (blocker 1).** buildSchedulerV2Runtime injects the production
+   getReportSyncSettings reader. A scheduled rt.run() loads durable report_sync_settings before dispatch; a
+   settings-read failure fails closed before discovery/cycle/write/export. Caller-supplied `settings` are never
+   trusted (dropped by the run allowlist). Manual stays readiness-gated (loads no settings). Proven:
+   schedule_enabled true selects a v2-ready report, false does not, caller settings ignored, read-failure
+   fails closed before any I/O.
+2. **Protected trusted collaborators (blocker 2).** rt.run accepts ONLY RUN_OPERATIONAL_ARGS (bucket/cycleDate/
+   asOf/asOfFor/manualReportKeys/budget/trigger); durable settings + every trusted collaborator (controlCatalog,
+   connections, discoverAccounts, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext) are spread
+   LAST and never overridable per run. Regressions: a reserved override cannot unlock a report, reroute
+   organizations, or replace the shadow saver. Test injection stays at buildSchedulerV2Runtime.
+3. **Real static audit (blocker 3).** auditSchemaContract now comment-strips SQL, validates each RPC's exact
+   param names+order (renamed p_request_hash fails), scopes unique/PK matching to the table body (a removed
+   unique left only in a comment fails), audits critical named invariants by name (sync_source_jobs_one_attempt,
+   sync_source_job_owners_source_fk, owner connection_id/identity checks, dedup uniques), and proves EVERY
+   required wrapper export (no vacuous wrappers=null claim). Typed admin-safe blockers.
+4. **Locked invocation zero-I/O (blocker 4).** runSchedulerV2Shadow returns a deterministic
+   {drained:true, continuationRequired:false, spent:0} rollup BEFORE discovery/openCycle/any store or DataDoe
+   call when nothing (source-backed or derived-only) is dispatchable. Trap tests prove default-locked manual +
+   scheduled runs touch zero discovery/store/DataDoe.
+5. **Runbook accuracy.** SCHEDULER_V2_ROLLOUT.md: removed the "none alters an existing table" claim; states
+   20260811 additively ALTERs/backfills/constrains an existing earlier-shape owner table + fails closed on
+   malformed rows; separates the STATIC source-compat audit from the LIVE post-migration DB verification.
+
+Verification: sync-runtime-composition.test.js **18** (was 13); sync-dispatch.test.js **37**;
+test:report-derivation **494** (was 489); test:sync-engine / test:report-contracts (161) /
+test:report-sync-controls (9) / test:source-identity (7) green; build:check green; git diff --check clean.
+Commits `cec1b5e` (blockers 1-4 code+tests), `5f54e66` (runbook), + this docs commit. CONFIRMED: nothing
+pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes +
+cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
+.worktrees/ untouched/untracked. STOP for Codex re-review.
