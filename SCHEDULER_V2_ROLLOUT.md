@@ -1773,11 +1773,15 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
   CHECK guarantee **≤ 1 create-export per `request_hash` per cycle**, so no duplicate export across slices).
 - **The authoritative create-export / token count is the DB `create_export_count`**, NOT `rollup.spent` (which is
   *processed job work* — jobs advanced, not exports created). After **every** slice and **before** any
-  continuation, read `rt.store.listSourceJobs(rollup.cycleId)` and require: **≤ 2** canonical source rows; only
-  the two expected `brand-sales` source contracts (`order-line-items`, `product-catalog`); each
-  `create_export_count ∈ {0, 1}`; and **`sum(create_export_count) ≤ 2`**. Throw immediately on any mismatch
-  (STOP — do not run another slice). A previously-cached source may make the actual export count **< 2** — do
-  **not** require exactly 2.
+  continuation, read `rt.store.listSourceJobs(rollup.cycleId)` and require: **≤ 2** canonical source rows whose
+  `request_hash`es are **exactly the two plan-derived hashes** (not merely allowed source keys), each matched to
+  its plan source's `source_key` / `source_id` / `connection_id='primary'` / `organization_fingerprint` /
+  `account_scope_hash`; each `create_export_count ∈ {0, 1}`; and **`sum(create_export_count) ≤ 2`**. Also read
+  `rt.store.listSourceJobOwners(cycleId, [ownerId])` (the deterministic plan-derived owner id) and require the
+  **two owner rows** carry the exact `request_key → request_hash` mapping, `owner_status='active'`,
+  `report_key='brand-sales'`, the selected account, and `connection_id='primary'`. Throw immediately on any
+  mismatch (STOP — do not run another slice). A previously-cached source may make the actual export count **< 2**
+  — do **not** require exactly 2.
 
 ### L.4 Before-canary read-only evidence (run + RECORD first; STOP on any failure)
 
@@ -1789,20 +1793,16 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 - Record (safe fields only): the chosen **public account `id`**, its raw seller scope, **country**, derived
   **bucket** (`bucketForCountry(country)` — must equal the `bucket` passed to `run`), **currency**, **`asOf`**
   (marketplace-local latest data date), and a unique reviewed **`cycleDate`**.
-- Confirm the EXACT canonical `brand-sales` product-catalog request is usable for THIS account (L.1) and capture
-  the existing production Brand Sales snapshot identity, WITHOUT exposing payload contents. All columns below are
-  the committed schema (`report_snapshots`: `id, report_key, account_id, params_hash, params, payload,
-  payload_storage_path, payload_bytes, source_refreshed_at, created_at, updated_at`; `source_export_cache`:
-  `request_hash, source_id, object_path, row_count, payload_bytes, fetched_at, expires_at`):
+- The EXACT canonical `brand-sales` product-catalog usability is validated **in-script** (L.5) from the
+  **plan-derived** catalog `request_hash` via `rt.sourceRowLoader()` — a current cache entry, `source_id ===
+  '68d2de238e'`, `rows.length === row_count`, `0 < rows.length < limit`, and ≥ 1 non-blank
+  `child_asin`/`product_brand` (never printed). A generic / other-account catalog is INSUFFICIENT. There is no
+  manual `<PC_REQUEST_HASH>` substitution.
+- Here (read-only, no payload exposed) capture the existing production Brand Sales snapshot identity, prove there
+  are **zero** pre-existing `scheduler-v2/*` shadow snapshots (this is the FIRST canary), and take the payload-free
+  production fingerprint. Committed columns (`report_snapshots`: `id, report_key, account_id, params_hash, params,
+  payload, payload_storage_path, payload_bytes, source_refreshed_at, created_at, updated_at`):
   ```sql
-  -- (a) EXACT canonical brand-sales product-catalog request availability for the account (payload-free).
-  --     <PC_REQUEST_HASH> = the request_hash the brand-sales plan derives for the product-catalog source
-  --     (short id 68d2de238e) for THIS account/window. Expect exactly 1 row with row_count > 0; else STOP.
-  --     (Content check -- non-empty child_asin -> product_brand -- is a bounded read of object_path, done
-  --      out-of-band; a generic/other-account catalog is INSUFFICIENT.)
-  select request_hash, source_id, row_count, payload_bytes, fetched_at, expires_at
-    from public.source_export_cache where request_hash = '<PC_REQUEST_HASH>';
-
   -- (b) existing production brand-sales snapshot IDENTITY for the account (real columns; no payload) -- for parity.
   select id, report_key, account_id, params_hash, payload_storage_path, payload_bytes,
          source_refreshed_at, created_at, updated_at
@@ -1820,6 +1820,9 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
            chr(10) order by id), '')) as production_fingerprint
     from public.report_snapshots
    where report_key not like 'scheduler-v2/%' and account_id = '<SELECTED_ACCOUNT_ID>';
+
+  -- (d) ZERO pre-existing scheduler-v2/* shadow snapshots GLOBALLY for this FIRST canary (expect 0; else STOP).
+  select count(*) as shadow_snapshots from public.report_snapshots where report_key like 'scheduler-v2/%';
   ```
 
 ### L.5 Execution script (current runtime API; secrets from untracked env; snapshots shadow-only)
@@ -1832,22 +1835,25 @@ collaborator writes **only** under `scheduler-v2/<reportKey>` (`scheduler-v2/bra
 ```js
 // Gate 5 canary — ONE primary account, ONE report (brand-sales). Live DataDoe export + Supabase write into
 // Scheduler-v2 tables + scheduler-v2/* snapshots ONLY. No route/cron/frontend/deploy/schedule.
+// The guard logic below is covered by the deterministic offline self-check scripts/gate5-canary-package.test.js.
 import { buildSchedulerV2Runtime } from "./lib/server/sync/runtime-composition.js";
 import { fetchAccounts as realFetchAccounts } from "./lib/server/datadoe.js";
 import { getDataDoeConnections } from "./lib/server/datadoe-connections.js";
-import { bucketForCountry } from "./lib/server/sync/registry.js"; // bucket derivation ('us' | 'non-us')
+import { bucketForCountry } from "./lib/server/sync/registry.js";        // bucket derivation ('us' | 'non-us')
+import { planBrandSales } from "./lib/server/sync/report-planner.js";    // pure/offline canonical brand-sales plan
+import { sourceJobOwnerId } from "./lib/server/source-identity.js";      // deterministic owner id (org/scope-scoped)
 
 const SELECTED_ACCOUNT_ID = "<REVIEWED_PRIMARY_ACCOUNT_ID>";
 const CYCLE_DATE = "<UNIQUE_REVIEWED_YYYY-MM-DD>";   // a unique reviewed cycle date (never a real scheduled one)
 const AS_OF = "<YYYY-MM-DD>";                         // marketplace-local latest data date for the account
-const EXPECTED_SOURCE_KEYS = new Set(["order-line-items", "product-catalog"]); // the ONLY brand-sales sources
+const norm = (s) => String(s ?? "").trim();
 
 // primary-only connection; fail closed unless exactly one configured primary key
-const conns = (getDataDoeConnections() || []).filter((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+const conns = (getDataDoeConnections() || []).filter((c) => c && c.id === "primary" && norm(c.apiKey));
 if (conns.length !== 1) throw new Error("canary: expected exactly one configured primary connection (fail closed)");
 const PRIMARY_API_KEY = conns[0].apiKey;
 
-// ONE real primary discovery, MEMOIZED -- account, bucket, and the injected fetchAccounts all use this single
+// ONE real primary discovery, MEMOIZED -- account, bucket, plan, and the injected fetchAccounts all use this one
 // snapshot (no second network discovery).
 let discoveryPromise = null;
 const discoverOnce = () => (discoveryPromise ??= realFetchAccounts(PRIMARY_API_KEY));
@@ -1857,6 +1863,30 @@ if (selectedAccts.length !== 1) throw new Error(`canary: expected exactly one di
 const account = selectedAccts[0];
 const BUCKET = bucketForCountry(account.country);
 if (BUCKET !== "us" && BUCKET !== "non-us") throw new Error("canary: could not derive a valid bucket (fail closed)");
+
+// PLAN (pure/offline) the exact two brand-sales sources against the SAME discovered account + AS_OF, and validate
+// requestHash / sourceKey / sourceId / connectionId / seller scope / bucket / org fingerprint / account-scope hash
+// / window / strict limits before anything runs.
+const plan = planBrandSales({ accountId: account.id, country: account.country, currency: account.currency, connections: conns, asOf: AS_OF });
+if (plan.reportKey !== "brand-sales" || (plan.sources || []).length !== 2) throw new Error("canary: brand-sales plan did not yield exactly two sources (fail closed)");
+const byKey = new Map(plan.sources.map((s) => [s.requestKey, s]));
+if (byKey.size !== 2) throw new Error("canary: plan has a duplicate requestKey (fail closed)");
+const EXPECT = { "brand-sales:order-lines": { sourceKey: "order-line-items", limit: 50000 },
+                 "brand-sales:catalog":     { sourceKey: "product-catalog", sourceId: "68d2de238e", limit: 10000 } };
+for (const [rk, exp] of Object.entries(EXPECT)) {
+  const s = byKey.get(rk);
+  if (!s) throw new Error(`canary: plan missing ${rk} (fail closed)`);
+  if (s.sourceKey !== exp.sourceKey) throw new Error(`canary: ${rk} sourceKey ${s.sourceKey} != ${exp.sourceKey}`);
+  if (exp.sourceId && s.sourceId !== exp.sourceId) throw new Error(`canary: ${rk} sourceId ${s.sourceId} != ${exp.sourceId} (never the obsolete long id)`);
+  if (s.limit !== exp.limit) throw new Error(`canary: ${rk} limit ${s.limit} != ${exp.limit}`);
+  if (s.connectionId !== "primary") throw new Error(`canary: ${rk} connectionId ${s.connectionId} != primary`);
+  if (s.bucket !== BUCKET) throw new Error(`canary: ${rk} bucket ${s.bucket} != ${BUCKET}`);
+  if (!norm(s.requestHash) || !norm(s.organizationFingerprint) || !norm(s.accountScopeHash)) throw new Error(`canary: ${rk} missing hash/org/scope`);
+  if (!norm(s.from) || !norm(s.to) || s.from > s.to) throw new Error(`canary: ${rk} invalid window ${s.from}..${s.to}`);
+  if (!(Array.isArray(s.sellerOrVendorIds) && s.sellerOrVendorIds.length === 1)) throw new Error(`canary: ${rk} seller scope not a single id`);
+}
+const expectByHash = new Map(plan.sources.map((s) => [s.requestHash, s]));
+const OWNER_IDS = [...new Set(plan.sources.map((s) => sourceJobOwnerId({ reportKey: "brand-sales", connectionId: s.connectionId, organizationFingerprint: s.organizationFingerprint, accountScopeHash: s.accountScopeHash })).filter(Boolean))];
 
 const rt = buildSchedulerV2Runtime({
   connections: conns,                                                       // primary-only; never dd-secondary
@@ -1872,34 +1902,64 @@ const rt = buildSchedulerV2Runtime({
   // scheduler-v2/<reportKey>. We keep the default factory (do NOT override it here).
 });
 
-// bounded continuation on the SAME (bucket, cycleDate): a FRESH per-slice deadline, plus ONE overall deadline and
-// a max slice count. STOP (never busy-loop) when the overall deadline or slice cap is reached.
+// PRE-EXECUTION catalog usability: the EXACT plan-derived catalog request, via rt.sourceRowLoader() (cache-only,
+// current entry). NEVER prints rows or secrets. STOP if the exact request is not usable (no fallback / no long id).
+const catalog = byKey.get("brand-sales:catalog");
+const cache = await rt.sourceRowLoader(catalog.requestHash);              // { ..., source_id, row_count, rows } | null
+if (!cache) throw new Error("canary: no CURRENT product-catalog cache for the exact brand-sales:catalog request (STOP)");
+if (cache.source_id !== "68d2de238e") throw new Error(`canary: catalog cache source_id ${cache.source_id} != 68d2de238e (STOP)`);
+if (!Array.isArray(cache.rows) || cache.rows.length !== cache.row_count) throw new Error("canary: catalog cache rows.length != row_count (STOP)");
+if (!(cache.rows.length > 0 && cache.rows.length < catalog.limit)) throw new Error(`canary: catalog rows ${cache.rows.length} not in (0, ${catalog.limit}) (STOP)`);
+if (!cache.rows.some((r) => r && norm(r.child_asin) !== "" && norm(r.product_brand) !== "")) throw new Error("canary: no non-blank child_asin/product_brand mapping (STOP)");
+
+// bounded continuation on the SAME (bucket, cycleDate). ONE overall deadline; EACH slice deadline is CLAMPED to it
+// with Math.min; STOP before starting a slice when < reserveMs remains (never busy-loop).
+const RESERVE_MS = 5_000;
 const OVERALL_DEADLINE_MS = Date.now() + 15 * 60_000;   // one explicit overall canary budget
 const MAX_SLICES = 8;
 let slices = 0, rollup = null;
 do {
-  if (Date.now() >= OVERALL_DEADLINE_MS) throw new Error("canary: overall deadline exhausted before drain (STOP; do not busy-loop)");
+  if (OVERALL_DEADLINE_MS - Date.now() < RESERVE_MS) throw new Error("canary: overall deadline reached (< reserveMs) before drain (STOP; do not busy-loop)");
   if (++slices > MAX_SLICES) throw new Error("canary: too many continuation slices (fail closed)");
-  const sliceDeadlineMs = Date.now() + 90_000;          // FRESH bounded deadline for THIS slice
+  const sliceDeadlineMs = Math.min(Date.now() + 90_000, OVERALL_DEADLINE_MS);   // FRESH, clamped to the overall deadline
   rollup = await rt.run({
     bucket: BUCKET, cycleDate: CYCLE_DATE, asOf: AS_OF,
     manualReportKeys: ["brand-sales"], maxJobs: 2,
-    deadlineMs: sliceDeadlineMs, reserveMs: 5_000, trigger: "manual",
+    deadlineMs: sliceDeadlineMs, reserveMs: RESERVE_MS, trigger: "manual",
   });
-  // AUTHORITATIVE between-slice guard (read-only): the DB create_export_count -- NOT rollup.spent.
+  // AUTHORITATIVE between-slice guard (read-only): the DB create_export_count -- NOT rollup.spent (processed work).
+  // Require exactly the two PLAN-DERIVED request hashes (not merely allowed source keys), each matched to its plan
+  // source's source_key / source_id / primary connection / org fingerprint / account-scope hash.
   const jobs = (await rt.store.listSourceJobs(rollup.cycleId)) || [];
   if (jobs.length > 2) throw new Error(`canary: >2 canonical source jobs (${jobs.length}) -- STOP`);
-  let totalExports = 0;
+  let totalExports = 0; const seen = new Set();
   for (const j of jobs) {
-    if (!EXPECTED_SOURCE_KEYS.has(j.source_key)) throw new Error(`canary: unexpected source_key '${j.source_key}' -- STOP`);
+    const exp = expectByHash.get(j.request_hash);
+    if (!exp) throw new Error("canary: source row with a request_hash that is not one of the two plan hashes -- STOP");
+    if (seen.has(j.request_hash)) throw new Error("canary: duplicate source row for a request_hash -- STOP");
+    seen.add(j.request_hash);
+    if (j.source_key !== exp.sourceKey || j.source_id !== exp.sourceId) throw new Error(`canary: source_key/source_id mismatch for ${exp.requestKey} -- STOP`);
+    if (j.connection_id !== "primary") throw new Error(`canary: source connection_id ${j.connection_id} != primary -- STOP`);
+    if (j.organization_fingerprint !== exp.organizationFingerprint || j.account_scope_hash !== exp.accountScopeHash) throw new Error(`canary: source org/scope mismatch for ${exp.requestKey} -- STOP`);
     const n = j.create_export_count ?? 0;
-    if (n !== 0 && n !== 1) throw new Error(`canary: create_export_count ${n} for '${j.source_key}' not in {0,1} -- STOP`);
+    if (n !== 0 && n !== 1) throw new Error(`canary: create_export_count ${n} not in {0,1} -- STOP`);
     totalExports += n;
   }
   if (totalExports > 2) throw new Error(`canary: total create-exports ${totalExports} > 2 -- STOP`);
+  // Owner rows for THIS cycle (deterministic owner ids from the plan): the two exact request_key -> request_hash
+  // mappings, active / brand-sales / selected account / primary. (Both sources share ONE owner_id.)
+  const owners = (await rt.store.listSourceJobOwners(rollup.cycleId, OWNER_IDS)) || [];
+  if (jobs.length > 0 && owners.length !== 2) throw new Error(`canary: expected exactly 2 owner rows, got ${owners.length} -- STOP`);
+  const ownerExpect = new Map(plan.sources.map((s) => [s.requestKey, s.requestHash]));
+  for (const o of owners) {
+    if (o.owner_status !== "active" || o.report_key !== "brand-sales" || o.account_id !== SELECTED_ACCOUNT_ID || o.connection_id !== "primary") throw new Error("canary: owner row not active / brand-sales / selected account / primary -- STOP");
+    if (ownerExpect.get(o.request_key) !== o.request_hash) throw new Error(`canary: owner request_key -> request_hash mapping mismatch for ${o.request_key} -- STOP`);
+  }
 } while (rollup && rollup.continuationRequired);
+// After drain, BOTH plan hashes must be present as source rows (L.6 P3); exactly one report job + one shadow
+// snapshot (L.6 P6/P7); production fingerprint unchanged (L.4 (c) vs L.6 P5). Record safe fields only.
 // rollup = { cycleId, selected, accountsDispatched, spent (PROCESSED job work, NOT exports), maxJobs, drained,
-//            continuationRequired, perUnit, reports }  -- record safe fields only (see L.6).
+//            continuationRequired, perUnit, reports }.
 ```
 
 ### L.6 Post-canary read-only checks (record safe fields only; no repair)
@@ -1962,6 +2022,16 @@ select count(*) as snapshot_rows,
          chr(10) order by id), '')) as production_fingerprint
   from public.report_snapshots
  where report_key not like 'scheduler-v2/%' and account_id = '<SELECTED_ACCOUNT_ID>';       -- MUST equal L.4 (c)
+
+-- P6) exactly ONE scheduler-v2/* snapshot GLOBALLY, and it is scheduler-v2/brand-sales for the selected account
+select report_key, account_id from public.report_snapshots where report_key like 'scheduler-v2/%';
+-- expect EXACTLY 1 row: ('scheduler-v2/brand-sales', '<SELECTED_ACCOUNT_ID>').
+
+-- P7) exactly ONE report job: brand-sales / selected account / primary / depends_on == the two plan hashes
+select report_key, account_id, connection_id, depends_on
+  from public.sync_report_jobs where cycle_id = '<CYCLE_ID>';
+-- expect EXACTLY 1 row: report_key='brand-sales', account_id='<SELECTED_ACCOUNT_ID>', connection_id='primary',
+--   depends_on = exactly the two brand-sales request_hashes (order-lines + catalog) -- no more, no fewer.
 ```
 
 Record from the returned `rollup` (safe fields only, **no secrets / no raw provider errors**): `cycleId`,
@@ -1975,14 +2045,27 @@ count** is the DB `sum(create_export_count)` from P3 (and the between-slice guar
 ### L.7 Stop conditions (Gate 5)
 
 STOP immediately (safely ending any read-only transaction; make **no** repair/delete/backfill/write) on **any**
-of: a prerequisite mismatch (no production brand-sales snapshot, or the EXACT canonical brand-sales product-catalog
-request unavailable / `row_count = 0` / no usable `child_asin` → `product_brand` mappings for the selected
-account); more than two create-export attempts total (authoritative DB `sum(create_export_count)`), or a
-duplicate export (`create_export_count > 1`) for a `request_hash`; an ownerless source row, any additional owner
-or account, or a source/owner `organization_fingerprint`/`account_scope_hash` mismatch; **any** account other
-than the selected primary account in `sync_report_jobs` or the owner rows; any `dd-secondary` routing or a
-`connection_id` other than `primary`; any write outside the Scheduler-v2 tables or `scheduler-v2/*` snapshots;
-**any** change to the non-`scheduler-v2/*` production fingerprint (L.4 (c) vs P5); any unsafe/raw error text or a
-`TRUNCATED` / malformed-scope / cross-account row; the overall canary deadline or slice cap reached before drain;
-or any control, allowlist, or schedule change. Do **NOT** proceed to Gate 6 parity, Gate 7 unlock, deployment, or
-scheduling. Stop for review + explicit human approval.
+of: the `brand-sales` plan not yielding exactly the two expected sources with the exact
+`requestHash`/`sourceKey`/`sourceId`/`limit`/window/org/scope; a prerequisite mismatch (no production brand-sales
+snapshot, or the EXACT plan-derived brand-sales product-catalog request unavailable / stale / `source_id ≠
+68d2de238e` / `rows.length ≠ row_count` / not `0 < rows.length < limit` / no usable `child_asin` →
+`product_brand` mapping); **any pre-existing `scheduler-v2/*` snapshot** before the run; a DB source row whose
+`request_hash` is **not one of the two plan hashes**, or whose `source_key`/`source_id`/`connection_id`/
+`organization_fingerprint`/`account_scope_hash` does not match its plan source; more than two create-export
+attempts total (authoritative DB `sum(create_export_count)`), or a duplicate export (`create_export_count > 1`)
+for a `request_hash`; an ownerless source row, an owner `request_key → request_hash` mapping mismatch, any
+additional owner or account, or a source/owner scope mismatch; **any** account other than the selected primary
+account in `sync_report_jobs` or the owner rows; any `dd-secondary` routing or a `connection_id` other than
+`primary`; **not exactly one** `scheduler-v2/*` snapshot globally (or one for another account / not the shadow
+key), or **not exactly one** report job (or a report job whose `depends_on ≠` the two plan hashes); any write
+outside the Scheduler-v2 tables or `scheduler-v2/*` snapshots; **any** change to the non-`scheduler-v2/*`
+production fingerprint (L.4 (c) vs P5); any unsafe/raw error text or a `TRUNCATED` / malformed-scope /
+cross-account row; the overall canary deadline reached (**< `reserveMs` remaining**) or the slice cap reached
+before drain; or any control, allowlist, or schedule change. Do **NOT** proceed to Gate 6 parity, Gate 7 unlock,
+deployment, or scheduling. Stop for review + explicit human approval.
+
+> The guard logic above (plan-source validation, catalog cache, per-slice source + owner checks, shadow/report-job
+> checks, and the deadline clamp/boundary) is exercised by a **deterministic offline self-check**:
+> `scripts/gate5-canary-package.test.js` — it builds the real `planBrandSales()` output and asserts each guard
+> passes on the correct shape and throws on wrong hashes, wrong windows, duplicate/missing sources, a stale/absent
+> catalog cache, pre-existing shadow rows, extra report jobs/snapshots, and the final-slice deadline boundary.

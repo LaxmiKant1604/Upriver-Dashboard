@@ -8335,3 +8335,39 @@ paused and locked (allowlist empty); zero schedules/cycles; migrations 1-4 uncha
 intact); no runtime code changed; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
 untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex review + explicit approval before any live DataDoe
 or Supabase activity (Gate 5 execution).
+
+## Scheduler v2: Gate 5 canary package -- executable/plan-derived hardening + offline self-check test (2026-08-13)
+
+Second Codex re-review round on the Gate 5 canary package (docs + a new offline test; still NOT executed, no
+production connection). SCHEDULER_V2_ROLLOUT.md Appendix L updated + scripts/gate5-canary-package.test.js added.
+
+- Verified pure/offline APIs from code: planBrandSales({accountId,country,currency,connections,asOf}) returns
+  sources with { requestKey, sourceKey, sourceId, sellerOrVendorIds, from, to, limit, requestHash,
+  organizationFingerprint, accountScopeHash, connectionId, bucket, strict }; the two brand-sales sources are
+  brand-sales:order-lines (order-line-items, limit 50000) and brand-sales:catalog (product-catalog, sourceId
+  68d2de238e, limit 10000); both share window+org+scope so sourceJobOwnerId gives ONE shared owner_id (two
+  memberships). rt.sourceRowLoader(hash) == getSourceExportCache -> null or { source_id, row_count, rows(from
+  Storage), ... } (rows have child_asin/product_brand). rt.store.listSourceJobs(cycleId) rows: request_hash,
+  source_id, source_key, connection_id, organization_fingerprint, account_scope_hash, create_export_count (NO
+  account_id). rt.store.listSourceJobOwners(cycleId, ownerIds) needs owner ids (compute from the plan).
+  sync_report_jobs has depends_on (jsonb request_hash array). shadow key scheduler-v2/brand-sales.
+- Fixes: (1) canary script imports+runs planBrandSales against the memoized discovered account+AS_OF and validates
+  exactly two sources (requestHash/sourceKey/sourceId/connectionId/seller scope/bucket/org/scope/window/strict
+  limits). (2) removed manual <PC_REQUEST_HASH> + out-of-band catalog SQL; catalog usability now uses the
+  plan-derived hash + rt.sourceRowLoader() (current entry, source_id===68d2de238e, rows.length===row_count,
+  0<rows<limit, >=1 nonblank child_asin/product_brand; never prints rows/secrets). (3) between-slice guard now
+  requires exactly the two plan-derived request hashes (each matched to source_key/source_id/primary/org/scope)
+  AND the two owner rows' exact request_key->request_hash mapping. (4) before execution require zero scheduler-v2/*
+  snapshots; after success exactly one shadow snapshot globally (scheduler-v2/brand-sales for the account) + exactly
+  one report job (brand-sales/selected/primary/depends_on==the two hashes); production fingerprint unchanged. (5)
+  each slice deadline clamped to the overall deadline with Math.min; stop before a slice when < reserveMs remains.
+- New deterministic offline self-check scripts/gate5-canary-package.test.js (7 blocks) runs real planBrandSales and
+  asserts guards pass on the good shape and throw on wrong hashes/windows, duplicate/missing sources, stale/absent
+  catalog cache, pre-existing shadow rows, extra report jobs/snapshots, and the final-slice deadline boundary.
+  Committed separately from docs. It is offline (no DataDoe/Supabase/network); the 7 frozen Gate 0 files are
+  unchanged (a new test file is not one of them).
+
+CONFIRMED: no production connection; no Supabase write; no DataDoe call/export; no canary executed; controls
+paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes unchanged; nothing
+pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md + .worktrees/ untouched.
+STOP for Codex re-review before Gate 5 execution.
