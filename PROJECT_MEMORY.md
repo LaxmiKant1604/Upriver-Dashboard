@@ -7806,3 +7806,30 @@ Commits `cec1b5e` (blockers 1-4 code+tests), `5f54e66` (runbook), + this docs co
 pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes +
 cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
 .worktrees/ untouched/untracked. STOP for Codex re-review.
+
+## Scheduler v2: Phase 1f re-review-2 -- three final findings (SHADOW MODE, 2026-08-13)
+
+Fixed the three final Phase 1f findings from base `b0edbf5`. SCHEDULER_V2.md s62 records the details. Still
+SHADOW ONLY: no route/cron/migration/deployment/live-DataDoe/control-unlock/frontend. Two modules + one test.
+
+1. **Named constraints PROVEN, not mentioned (finding 1).** auditSchemaContract replaces the global name match
+   with namedConstraintProven(sql, table, spec): a constraint passes ONLY when created for the expected table
+   (CREATE body or ALTER TABLE public.<table> ADD CONSTRAINT), not dropped, and matching the expected KIND +
+   body -- unique/PK columns, one-attempt CHECK tokens, owner FK columns+target, connection_id CHECK, identity
+   CHECK. DROP CONSTRAINT / wrong-table / comment-string-only no longer pass. Regressions: ADD->DROP,
+   wrong-table, mutated CHECK/FK all fail; canonical migrations still pass.
+2. **Total audit + crash-proof preflight (finding 2).** auditSchemaContract always returns
+   {ok,matrix,blockers,requiredWrappers} incl. when supabase.js is missing (previously omitted
+   requiredWrappers => preflight TypeError risk). schedulerV2Preflight defensively normalizes a malformed audit
+   into fail-closed defaults + AUDIT_MALFORMED. Missing wrapper source => typed safe blockers, never a crash.
+3. **Malformed manual fails closed before settings I/O (finding 3).** buildSchedulerV2Runtime.run validates
+   manualReportKeys BEFORE loading durable settings: null/undefined=scheduled; Array (incl [])=manual; any
+   other value fails closed immediately with zero settings reads/discovery/store/writes/DataDoe. Durable
+   scheduled settings + readiness gating preserved.
+
+Verification: sync-runtime-composition.test.js **21** (was 18); test:report-derivation **497** (was 494);
+sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-controls (9) / test:source-identity
+(7) green; build:check green; git diff --check clean. Commits `e39745a` (findings 1-3 code+tests) + this docs
+commit. CONFIRMED: nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler
+v1 + frontend + routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill
+NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex re-review.

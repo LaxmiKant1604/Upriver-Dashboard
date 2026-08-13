@@ -3837,3 +3837,44 @@ SCHEDULER_V2_ROLLOUT.md + these docs). Nothing pushed/merged/deployed/migrated/e
 DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; the Product
 Catalog incremental ASIN-brand gap-fill is NOT started; HANDOFF.md + .worktrees/ untouched. STOP for Codex
 re-review.
+
+## 62. Phase 1f re-review-2 -- three final findings (SHADOW MODE, 2026-08-13)
+
+Three final Phase 1f findings fixed; still SHADOW ONLY (no route/cron/migration/deployment/live-DataDoe/
+control-unlock/frontend). Two modules + one test changed.
+
+### 62.1 Named constraints are PROVEN, not merely mentioned (finding 1)
+
+`auditSchemaContract` replaces the old global name-match with `namedConstraintProven(sql, table, spec)`: a
+constraint passes ONLY when created for the EXPECTED table (inside that table's CREATE body OR via
+`ALTER TABLE public.<table> ADD CONSTRAINT <name>`), is NOT dropped, and matches the expected KIND + body --
+unique/PK columns, the `sync_source_jobs_one_attempt` CHECK tokens, the owner FK columns + reference target
+(`sync_source_job_owners_source_fk` -> `sync_source_jobs(cycle_id, request_hash)`), the connection_id CHECK,
+and the non-empty identity CHECK. A `DROP CONSTRAINT`, a same-named constraint on the WRONG table, or a
+comment/string-only mention no longer passes. Regressions: ADD->DROP fails; correct name on the wrong table
+fails; a mutated CHECK/FK definition fails; the canonical migrations still pass (in-body AND ALTER-ADD forms).
+
+### 62.2 Total audit result + crash-proof preflight (finding 2)
+
+`auditSchemaContract` returns `{ok, matrix, blockers, requiredWrappers}` in EVERY path -- including when
+`supabase.js` is missing/unreadable (it previously omitted `requiredWrappers`, so the preflight could
+TypeError). `schedulerV2Preflight` also DEFENSIVELY normalizes a malformed audit result into fail-closed
+defaults + an `AUDIT_MALFORMED` blocker. A missing wrapper source returns typed SAFE blockers, never a crash.
+
+### 62.3 Malformed manual input fails closed before settings I/O (finding 3)
+
+`buildSchedulerV2Runtime.run` validates `manualReportKeys` BEFORE loading the durable settings: null/undefined
+=> scheduled; an Array (including `[]`) => manual; ANY other value fails closed IMMEDIATELY with zero settings
+reads / discovery / store calls / writes / DataDoe calls. Durable scheduled settings + readiness gating are
+preserved.
+
+### 62.4 Verification
+
+`sync-runtime-composition.test.js` **21** (was 18: +audit-fix-1 constraint proof, +audit-fix-2 total shape,
++fix-3 manual fail-closed). `npm run test:report-derivation` **497** (was 494); `sync-dispatch.test.js` 37;
+`test:report-contracts` (161), `test:report-sync-controls` (9), `test:source-identity` (7) green;
+`build:check` green; `git diff --check` clean. Only 3 files changed (schema-contract.js,
+runtime-composition.js, sync-runtime-composition.test.js) + these docs. Nothing pushed/merged/deployed/
+migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2
+control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched.
+STOP for Codex re-review.
