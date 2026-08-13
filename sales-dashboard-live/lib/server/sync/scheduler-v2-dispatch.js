@@ -23,6 +23,7 @@ import { runListingOptimizerShadowCycle } from "./listing-optimizer-cycle.js";
 import { makePpcAdsContextLoader } from "./ppc-ads-loader.js";
 import { reportControlCatalog } from "./report-controls.js";
 import { DERIVED_ONLY_REPORT_KEYS } from "./report-derivation.js";
+import { isValidCalendarDate } from "./report-source-contracts.js";
 import { classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { bucketForCountry } from "./registry.js";
 
@@ -68,8 +69,25 @@ export function classifySchedulerV2ReportKey(reportKey) {
 export function selectSchedulerV2ReportKeys({ settings = [], manualReportKeys = null, controlCatalog = reportControlCatalog } = {}) {
   const catalog = controlCatalog(settings) || [];
   const readySet = new Set(catalog.filter((c) => c && c.ready).map((c) => c.reportKey));
-  if (Array.isArray(manualReportKeys) && manualReportKeys.length) {
-    return { requested: [...new Set(manualReportKeys.map(String))], readySet, manual: true };
+  // A MANUAL request is ANY array of keys (blocker 3). manualReportKeys = [] is a VALID manual selection
+  // that runs ZERO reports and spends ZERO exports -- it must NEVER fall back to the scheduled enabled set.
+  // Only null/undefined means "not a manual request" (use the schedule). A non-null, non-array value is a
+  // MALFORMED manual input and fails closed: a manual request must name a concrete list of report keys.
+  if (manualReportKeys != null) {
+    if (!Array.isArray(manualReportKeys)) {
+      throw new Error(`selectSchedulerV2ReportKeys: manualReportKeys must be an array of report keys when provided (got ${typeof manualReportKeys}); refusing to select (fail closed).`);
+    }
+    // Every entry must be a non-empty report-key string/number; a null / blank / object / array entry is
+    // malformed and fails closed rather than coercing to "null" / "[object Object]" and mis-routing it.
+    const keys = manualReportKeys.map((k) => {
+      if (typeof k !== "string" && typeof k !== "number") {
+        throw new Error("selectSchedulerV2ReportKeys: every manualReportKeys entry must be a report-key string; refusing to select (fail closed).");
+      }
+      const key = String(k).trim();
+      if (!key) throw new Error("selectSchedulerV2ReportKeys: manualReportKeys contains a blank report key; refusing to select (fail closed).");
+      return key;
+    });
+    return { requested: [...new Set(keys)], readySet, manual: true };
   }
   const enabled = catalog.filter((c) => c && c.ready && c.scheduleEnabled).map((c) => c.reportKey);
   return { requested: enabled, readySet, manual: false };
@@ -83,6 +101,32 @@ const resolveFromGenericPlan = (plan) => () => ({
     (s) => plannedSourceJob(req.reportKey, s, req.bucket, DRIVER_CONNECTION_ID[req.connectionId] || req.connectionId, req.accountId),
   )),
 });
+
+/**
+ * Compose several report-worker `loadDerivedContext` callbacks into ONE that invokes each and MERGES their
+ * results (blocker 2). Every derived-context loader is scoped to a SINGLE report family and returns `{}`
+ * for every other report (Daily's general loader emits `{ adsCoverage }` only for daily-reporting;
+ * makePpcAdsContextLoader emits `{ ppcAds }` only for ppc-performance), so exactly the RELEVANT loader
+ * contributes per report and the merge is disjoint -- one loader can NEVER suppress another. A single
+ * invocation that contains BOTH Daily Reporting and PPC therefore derives Daily `adsCoverage` from the
+ * injected general loader AND PPC `ppcAds` from the PPC loader. A loader that throws contributes nothing
+ * (its fields are simply absent) but never breaks a sibling. Returns null when no loader is supplied and
+ * the single loader unchanged when only one is, so the common paths stay allocation-free.
+ */
+export function composeDerivedContextLoaders(loaders) {
+  const fns = (loaders || []).filter((fn) => typeof fn === "function");
+  if (fns.length === 0) return null;
+  if (fns.length === 1) return fns[0];
+  return async (args) => {
+    const merged = {};
+    for (const fn of fns) {
+      let part = null;
+      try { part = await fn(args); } catch (_e) { part = null; }
+      if (part && typeof part === "object" && !Array.isArray(part)) Object.assign(merged, part);
+    }
+    return merged;
+  };
+}
 
 /**
  * Run ONE bounded SHADOW dispatch slice for a marketplace bucket. Returns a rollup (never a secret):
@@ -140,6 +184,20 @@ export async function runSchedulerV2Shadow({
     throw new Error("runSchedulerV2Shadow: dispatching ppc-performance requires injected ppcAdsProviders (persisted-Ads readers); refusing to dispatch (fail closed).");
   }
 
+  // Blocker 5: generic single-shot planning needs a marketplace-local as-of PER account. Prefer the
+  // injected per-country asOfFor(country); when it is absent, fall back to the VALIDATED global asOf for
+  // EVERY account so generic windows are still the exact canonical ones (never account.asOf = undefined,
+  // which would silently break every date window). If there is generic work to do and neither a valid
+  // asOfFor function nor a valid global asOf is available, fail closed BEFORE opening any cycle.
+  let genericAsOfFor = asOfFor;
+  if (genericKeys.length && typeof genericAsOfFor !== "function") {
+    const globalAsOf = asOf == null ? "" : String(asOf);
+    if (!isValidCalendarDate(globalAsOf)) {
+      throw new Error(`runSchedulerV2Shadow: generic report planning requires either an asOfFor(country) function or a valid global asOf (YYYY-MM-DD); got asOf="${asOf}". Refusing to plan (fail closed).`);
+    }
+    genericAsOfFor = () => globalAsOf;
+  }
+
   // 3) DISCOVER accounts dynamically, classify PRIMARY-ONLY (a stale dd-secondary is skipped read-only and
   //    never routed through the primary key), and keep only this bucket's accounts. Nothing is hard-coded, so
   //    a newly connected primary account is included the moment discovery returns it.
@@ -153,7 +211,7 @@ export async function runSchedulerV2Shadow({
     bucket, cycleId: null, manual,
     selected: dispatchable.map((r) => r.reportKey), lockedOut, derivedOnly,
     unavailableAccounts: unavailable, accountsDispatched: bucketAccounts.map((a) => a.accountId),
-    spent: 0, maxJobs, stoppedForBudget: false, drained: false, perUnit: [], reports: null,
+    spent: 0, maxJobs, stoppedForBudget: false, drained: false, continuationRequired: false, perUnit: [], reports: null,
   };
   const collectedReports = [];
   const budgetLeft = () => (maxJobs === Infinity ? Infinity : Math.max(0, maxJobs - rollup.spent));
@@ -175,7 +233,7 @@ export async function runSchedulerV2Shadow({
     const remaining = budgetLeft();
     let res;
     if (unit.kind === "generic") {
-      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor });
+      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor });
       res = await runStagedSourceCycle({
         store, dataDoe, resolvePlan: resolveFromGenericPlan(plan),
         bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining,
@@ -198,7 +256,12 @@ export async function runSchedulerV2Shadow({
       processed: res.processed || 0, deferred: res.deferred || 0,
       deadlineReached: !!res.deadlineReached, drained: !!res.drained,
     });
-    if (res.deadlineReached || (res.deferred || 0) > 0) { rollup.stoppedForBudget = true; break; }
+    // A unit is INCOMPLETE when it hit the wall-clock deadline, deferred a resumable poll/download, OR
+    // truncated on maxJobs (drained:false with NO deadline/deferral). Any of these means work remains, so
+    // the dispatcher STOPS here -- it neither opens the next unit nor later declares itself drained while a
+    // prior unit still has pending/resumable state. A fresh idempotent invocation resumes from persisted
+    // state with no duplicate create-export (blocker 6).
+    if (res.deadlineReached || (res.deferred || 0) > 0 || res.drained !== true) { rollup.stoppedForBudget = true; break; }
   }
 
   // 5) DERIVE the ready reports from the SAVED source rows (PURE: zero DataDoe/network). runReportJobs gates
@@ -206,7 +269,14 @@ export async function runSchedulerV2Shadow({
   //    invalid preserve last-known-good, and one failed report never blocks an unrelated ready one. Skipped
   //    entirely when no source cycle ran (nothing selected, or every selected report locked/derived-only).
   if (rollup.cycleId && collectedReports.length) {
-    const derivedLoader = loadDerivedContext || (ppcAdsProviders ? makePpcAdsContextLoader(ppcAdsProviders) : null);
+    // Blocker 2: COMPOSE the derived-context loaders so a single invocation containing BOTH Daily Reporting
+    // and PPC derives Daily `adsCoverage` from the injected general loader AND PPC `ppcAds` from
+    // makePpcAdsContextLoader. Each loader is report-scoped (returns {} for other reports), so the two never
+    // suppress each other; the worker still invokes the composed loader once per report and merges safely.
+    const derivedLoader = composeDerivedContextLoaders([
+      loadDerivedContext,
+      ppcAdsProviders ? makePpcAdsContextLoader(ppcAdsProviders) : null,
+    ]);
     rollup.reports = await runReportJobs({
       store, cycleId: rollup.cycleId,
       sourceRows: (h) => store.loadSourceRows(h),
@@ -215,6 +285,14 @@ export async function runSchedulerV2Shadow({
       loadDerivedContext: derivedLoader || undefined,
     });
   }
-  rollup.drained = !rollup.stoppedForBudget;
+  // Blocker 6: `drained` is computed from ACTUAL unit outcomes, never merely "did not stop for budget". It
+  // is true ONLY when EVERY planned source unit was opened AND fully drained (no deadline / deferral /
+  // maxJobs truncation) AND the derive half (when it ran) also drained. A final/only unit returning
+  // drained:false -- including a maxJobs truncation with no deadline/deferral -- therefore makes the
+  // dispatcher drained:false and flags that continuation is required (a fresh invocation resumes).
+  const allUnitsDrained = rollup.perUnit.length === units.length && rollup.perUnit.every((u) => u.drained === true);
+  const reportsDrained = !rollup.reports || rollup.reports.drained === true;
+  rollup.drained = allUnitsDrained && reportsDrained && !rollup.stoppedForBudget;
+  rollup.continuationRequired = !rollup.drained;
   return rollup;
 }

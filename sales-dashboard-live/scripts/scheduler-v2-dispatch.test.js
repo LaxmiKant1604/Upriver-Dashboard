@@ -30,8 +30,9 @@ const START = Date.now();
 const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys;
+let runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders;
 let buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS;
+let addDaysStr, monthStartStr;
 
 const ASOF = "2025-08-10";
 const LO_DATE = "2025-06-01"; // inside [asOf-84d, asOf]
@@ -137,12 +138,15 @@ function dispatch(over = {}) {
   const saver = over.saver || makeSaver();
   const accounts = over.accounts || US_ACCTS;
   const p = runSchedulerV2Shadow({
-    bucket: "us", cycleDate: "2026-08-11", asOf: ASOF, asOfFor: asOfForUS,
+    bucket: "us", cycleDate: "2026-08-11",
+    asOf: "asOf" in over ? over.asOf : ASOF,
+    asOfFor: "asOfFor" in over ? over.asOfFor : asOfForUS,
     connections: over.connections || CONNS,
     discoverAccounts: over.discoverAccounts || (async () => accounts),
     store, dataDoe: dd, saveSnapshot: saver,
     controlCatalog: over.controlCatalog, settings: over.settings, manualReportKeys: over.manualReportKeys,
-    ppcAdsProviders: over.ppcAdsProviders, maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
+    ppcAdsProviders: over.ppcAdsProviders, loadDerivedContext: over.loadDerivedContext,
+    maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
   });
   return { store, dd, saver, promise: p };
 }
@@ -160,7 +164,11 @@ test("classifySchedulerV2ReportKey maps each key to exactly one canonical route"
   assert.equal(classifySchedulerV2ReportKey("buy-box-loss"), "generic");
   assert.equal(classifySchedulerV2ReportKey("returns-leakage"), "generic");
   assert.equal(classifySchedulerV2ReportKey("brand-directory"), "derived-only");
-  assert.equal(classifySchedulerV2ReportKey("brand-sales"), "unsupported", "an adapter with no wired dispatch path is unsupported");
+  // Blocker 1: both controlled, source-backed reports now route through their ONE canonical generic path.
+  assert.equal(classifySchedulerV2ReportKey("brand-sales"), "generic", "brand-sales is a wired generic source-backed report");
+  assert.equal(classifySchedulerV2ReportKey("content-changes"), "generic", "content-changes is a wired generic source-backed report");
+  assert.equal(classifySchedulerV2ReportKey("brand-view"), "derived-only", "a derive-from-snapshots report owns no source contracts");
+  assert.equal(classifySchedulerV2ReportKey("no-such-report"), "unsupported");
   assert.equal(classifySchedulerV2ReportKey("nope"), "unsupported");
 });
 
@@ -176,8 +184,8 @@ test("selectSchedulerV2ReportKeys: scheduled selects ready+enabled; manual runs 
 });
 
 test("an unsupported/ambiguous report key fails closed BEFORE any cycle or token", async () => {
-  const { dd, promise } = dispatch({ manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) });
-  await assert.rejects(promise, /no canonical dispatch path.*brand-sales.*fail closed/s);
+  const { dd, promise } = dispatch({ manualReportKeys: ["no-such-report"], controlCatalog: mkCatalog(["no-such-report"]) });
+  await assert.rejects(promise, /no canonical dispatch path.*no-such-report.*fail closed/s);
   assert.equal(dd.totalCreates(), 0, "zero exports on a fail-closed refusal");
 });
 
@@ -352,11 +360,243 @@ test("(failure isolation) one report whose derive fails never blocks an unrelate
   assert.equal(store.report("listing-optimizer", "A1").derive_status, "succeeded", "the unrelated report succeeded");
 });
 
+/* ===================== blocker 1: brand-sales + content-changes canonical dispatch ===================== */
+
+group("scheduler-v2 dispatch: brand-sales + content-changes canonical dispatch (blocker 1)");
+
+test("(source-plan) brand-sales + content-changes each plan their canonical sources over the exact windows", () => {
+  const plan = buildShadowReportPlan({ accounts: US_ACCTS, reportKeys: ["brand-sales", "content-changes"], connections: CONNS, asOfFor: asOfForUS });
+  const bs = plan.reportRequests.find((r) => r.reportKey === "brand-sales");
+  const cc = plan.reportRequests.find((r) => r.reportKey === "content-changes");
+  assert.ok(bs && cc, "both reports are planned generically");
+  // brand-sales: order-lines + catalog BOTH over [monthStart(asOf)-420d, asOf].
+  const bsFrom = addDaysStr(monthStartStr(ASOF), -420);
+  for (const rk of ["brand-sales:order-lines", "brand-sales:catalog"]) {
+    const s = bs.sources.find((x) => x.requestKey === rk);
+    assert.ok(s, rk + " planned");
+    assert.equal(s.from, bsFrom, rk + " from = monthStart(asOf)-420");
+    assert.equal(s.to, ASOF, rk + " to = asOf");
+  }
+  // content-changes: events is a no-date source; catalog over [asOf-365d, asOf].
+  const ev = cc.sources.find((x) => x.requestKey === "content-changes:events");
+  const cat = cc.sources.find((x) => x.requestKey === "content-changes:catalog");
+  assert.equal(ev.from, null, "events source is no-date (from null)");
+  assert.equal(ev.to, null, "events source is no-date (to null)");
+  assert.equal(cat.from, addDaysStr(ASOF, -365), "catalog from = asOf-365");
+  assert.equal(cat.to, ASOF, "catalog to = asOf");
+});
+
+test("(one canonical path + worker) both dispatch through the ONE generic unit and derive + save", async () => {
+  const keys = ["brand-sales", "content-changes"];
+  const { store, saver, promise } = dispatch({ controlCatalog: mkCatalog(keys, keys) });
+  const r = await promise;
+  const genUnits = r.perUnit.filter((u) => u.kind === "generic");
+  assert.equal(genUnits.length, 1, "exactly one generic unit runs both (no separate paths)");
+  assert.ok(genUnits[0].unit.includes("brand-sales") && genUnits[0].unit.includes("content-changes"), "both share the one generic plan/cycle");
+  assert.ok(!r.perUnit.some((u) => u.kind === "staged"), "neither report opens a dedicated staged cycle");
+  const seen = srcKeys(store, r.cycleId);
+  assert.ok(seen.includes("brand-sales:order-lines") && seen.includes("brand-sales:catalog"), "brand-sales canonical sources created");
+  assert.ok(seen.includes("content-changes:events") && seen.includes("content-changes:catalog"), "content-changes canonical sources created");
+  assert.ok(saver.has("brand-sales", "A1"), "brand-sales derived + saved from its saved source rows");
+  assert.ok(saver.has("content-changes", "A1"), "content-changes derived + saved from its saved source rows");
+});
+
+test("(coexist) brand-sales + content-changes run alongside other reports without blocking them", async () => {
+  // buy-box-loss derives INVALID (minimal rows fail its strict contract), listing-optimizer derives cleanly;
+  // adding brand-sales + content-changes must change neither outcome.
+  const keys = ["brand-sales", "content-changes", "buy-box-loss", "listing-optimizer"];
+  const { saver, promise } = dispatch({ controlCatalog: mkCatalog(keys, keys) });
+  const r = await promise;
+  assert.ok(saver.has("brand-sales", "A1"), "brand-sales saved");
+  assert.ok(saver.has("content-changes", "A1"), "content-changes saved");
+  assert.ok(saver.has("listing-optimizer", "A1"), "the unrelated healthy report still saved");
+  assert.ok(!saver.has("buy-box-loss", "A1"), "the failing report still did not save (isolated)");
+  assert.deepEqual(r.selected.slice().sort(), keys.slice().sort(), "all four are selected/dispatched");
+});
+
+test("(LKG) a failed required source blocks brand-sales and preserves last-known-good (zero save)", async () => {
+  const saver = makeSaver();
+  saver.saved.set("brand-sales|A1", { lkg: true }); // a prior good snapshot
+  const { store, promise } = dispatch({
+    saver, manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]),
+    ddOpts: { failCreateKey: "brand-sales:order-lines" },
+  });
+  await promise;
+  assert.equal(saver.calls, 0, "no snapshot written while a required source failed");
+  assert.deepEqual(saver.saved.get("brand-sales|A1"), { lkg: true }, "the prior last-known-good snapshot is untouched");
+  assert.notEqual(store.report("brand-sales", "A1").derive_status, "succeeded", "brand-sales did not derive-succeed");
+});
+
+test("(request-hash + account isolation) canonical hashes are deterministic and isolated across organizations", () => {
+  const primaryAcct = [{ accountId: "A1", country: "US", currency: "USD", name: "One" }];
+  const secondaryAcct = [{ accountId: dash("dd", "secondary") + ":Z9", country: "US", currency: "USD", name: "Two" }];
+  const hashOf = (accounts) => buildShadowReportPlan({ accounts, reportKeys: ["brand-sales"], connections: CONNS, asOfFor: asOfForUS })
+    .reportRequests[0].sources.find((s) => s.requestKey === "brand-sales:order-lines").requestHash;
+  const hp = hashOf(primaryAcct);
+  const hs = hashOf(secondaryAcct);
+  assert.ok(hp && hs, "both accounts resolve a request hash");
+  assert.notEqual(hp, hs, "primary and dd-secondary organizations never share a canonical request hash");
+  assert.equal(hashOf(primaryAcct), hp, "the request hash is deterministic across replans");
+});
+
+/* ===================== blocker 2: composed derived-context loaders ===================== */
+
+group("scheduler-v2 dispatch: composed derived-context loaders (blocker 2)");
+
+test("composeDerivedContextLoaders invokes only the relevant loader per report and merges safely", async () => {
+  const daily = async ({ reportKey }) => (reportKey === "daily-reporting" ? { adsCoverage: { c: 1 } } : {});
+  const ppc = async ({ reportKey }) => (reportKey === "ppc-performance" ? { ppcAds: { p: 1 } } : {});
+  const composed = composeDerivedContextLoaders([daily, ppc]);
+  assert.deepEqual(await composed({ reportKey: "daily-reporting" }), { adsCoverage: { c: 1 } }, "Daily gets adsCoverage; the PPC loader contributes nothing");
+  assert.deepEqual(await composed({ reportKey: "ppc-performance" }), { ppcAds: { p: 1 } }, "PPC gets ppcAds; the Daily loader contributes nothing");
+  assert.deepEqual(await composed({ reportKey: "brand-sales" }), {}, "an unrelated report gets neither");
+});
+
+test("composeDerivedContextLoaders: passthrough + a throwing loader never suppresses its sibling", async () => {
+  const boom = async () => { throw new Error("boom"); };
+  const ppc = async ({ reportKey }) => (reportKey === "ppc-performance" ? { ppcAds: { p: 1 } } : {});
+  assert.equal(composeDerivedContextLoaders([]), null, "no loaders => null");
+  assert.equal(composeDerivedContextLoaders([ppc]), ppc, "a single loader passes through unchanged");
+  const composed = composeDerivedContextLoaders([boom, ppc]);
+  assert.deepEqual(await composed({ reportKey: "ppc-performance" }), { ppcAds: { p: 1 } }, "the surviving loader still contributes");
+});
+
+test("(daily+ppc in one invocation) both derived contexts load; neither loader suppresses the other", async () => {
+  const seenGeneral = [];
+  const general = async ({ reportKey }) => { seenGeneral.push(reportKey); return reportKey === "daily-reporting" ? { adsCoverage: { mark: "daily" } } : {}; };
+  const covCalls = [];
+  const ppcAds = {
+    getAdsDailySourceRows: async () => [],
+    getAdsSyncStates: async () => [],
+    getAdsSyncCoverage: async (acct, sourceKey) => { covCalls.push([acct, sourceKey]); return null; },
+  };
+  const keys = ["daily-reporting", "ppc-performance"];
+  const { promise } = dispatch({ controlCatalog: mkCatalog(keys, keys), loadDerivedContext: general, ppcAdsProviders: ppcAds });
+  await promise;
+  assert.ok(seenGeneral.includes("daily-reporting"), "the injected general loader derived Daily adsCoverage");
+  assert.ok(covCalls.some(([acct]) => acct === "A1"), "makePpcAdsContextLoader read PPC ppcAds coverage in the SAME invocation");
+});
+
+/* ===================== blocker 3: manual selection semantics ===================== */
+
+group("scheduler-v2 dispatch: manual selection semantics (blocker 3)");
+
+test("(empty manual) manualReportKeys=[] runs ZERO reports and spends ZERO cycles/jobs/exports (never the schedule)", async () => {
+  const catalog = mkCatalog(["brand-sales", "listing-optimizer", "buy-box-loss"], ["brand-sales", "listing-optimizer", "buy-box-loss"]);
+  const { store, dd, saver, promise } = dispatch({ manualReportKeys: [], controlCatalog: catalog });
+  const r = await promise;
+  assert.equal(r.manual, true, "[] is a manual request");
+  assert.deepEqual(r.selected, [], "zero reports selected -- never falls back to the enabled schedule");
+  assert.equal(r.cycleId, null, "no source cycle opened");
+  assert.equal(dd.totalCreates(), 0, "zero DataDoe exports");
+  assert.equal(saver.calls, 0, "zero snapshots saved");
+  assert.equal(store.listReportJobs().length, 0, "zero report jobs created");
+});
+
+test("(selection) selectSchedulerV2ReportKeys treats [] as manual with an empty request", () => {
+  const sel = selectSchedulerV2ReportKeys({ controlCatalog: mkCatalog(["brand-sales"], ["brand-sales"]), manualReportKeys: [] });
+  assert.equal(sel.manual, true);
+  assert.deepEqual(sel.requested, [], "[] never falls back to the scheduled enabled set");
+});
+
+test("(malformed manual) a non-array / blank / non-string manual input fails closed", async () => {
+  assert.throws(() => selectSchedulerV2ReportKeys({ controlCatalog: mkCatalog([]), manualReportKeys: "brand-sales" }), /must be an array.*fail closed/s);
+  assert.throws(() => selectSchedulerV2ReportKeys({ controlCatalog: mkCatalog([]), manualReportKeys: [null] }), /report-key string.*fail closed/s);
+  assert.throws(() => selectSchedulerV2ReportKeys({ controlCatalog: mkCatalog([]), manualReportKeys: ["  "] }), /blank report key.*fail closed/s);
+  const { dd, promise } = dispatch({ manualReportKeys: "brand-sales", controlCatalog: mkCatalog(["brand-sales"]) });
+  await assert.rejects(promise, /must be an array.*fail closed/s);
+  assert.equal(dd.totalCreates(), 0, "zero exports on a malformed manual input");
+});
+
+/* ===================== blocker 5: global asOf vs per-country asOfFor for generic planning ===================== */
+
+group("scheduler-v2 dispatch: global asOf vs per-country asOfFor (blocker 5)");
+
+const genericHashes = (store, cid) => store.listSourceJobs(cid).map((j) => j.request_hash).sort();
+
+test("(global asOf) with NO asOfFor, the validated global asOf drives the EXACT canonical generic windows", async () => {
+  const common = { manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) };
+  const ref = dispatch({ ...common, asOfFor: asOfForUS });
+  const rRef = await ref.promise;
+  const hashesRef = genericHashes(ref.store, rRef.cycleId);
+  const glob = dispatch({ ...common, asOfFor: null, asOf: ASOF });
+  const rGlob = await glob.promise;
+  const hashesGlob = genericHashes(glob.store, rGlob.cycleId);
+  assert.ok(hashesGlob.length > 0, "generic sources were planned from the global asOf");
+  assert.deepEqual(hashesGlob, hashesRef, "global asOf yields byte-identical canonical windows to per-country asOfFor");
+});
+
+test("(per-country asOfFor) asOfFor(country) is honored; a different per-country date => different canonical windows", async () => {
+  const common = { manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) };
+  const ref = dispatch({ ...common, asOfFor: asOfForUS });
+  const hashesRef = genericHashes(ref.store, (await ref.promise).cycleId);
+  const seen = [];
+  const other = dispatch({ ...common, asOfFor: (c) => { seen.push(c); return dash("2025", "07", "01"); } });
+  const hashesOther = genericHashes(other.store, (await other.promise).cycleId);
+  assert.ok(seen.includes("US"), "asOfFor is invoked with the account's marketplace country");
+  assert.notDeepEqual(hashesOther, hashesRef, "a different per-country asOf produces different canonical windows");
+});
+
+test("(asOf fail-closed) generic planning with neither asOfFor nor a valid global asOf fails closed BEFORE any cycle", async () => {
+  const { dd, promise } = dispatch({ manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]), asOfFor: null, asOf: null });
+  await assert.rejects(promise, /generic report planning requires.*asOf.*fail closed/s);
+  assert.equal(dd.totalCreates(), 0, "zero exports on the fail-closed refusal");
+});
+
+/* ===================== blocker 6: drained reflects actual unit outcomes ===================== */
+
+group("scheduler-v2 dispatch: drained reflects actual unit outcomes (blocker 6)");
+
+test("(final/only unit maxJobs) a truncated ONLY unit returns drained:false + continuationRequired, then resumes with NO duplicate exports", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe();
+  const saver = makeSaver();
+  const common = { store, dataDoe: dd, saver, manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) };
+  // brand-sales plans exactly two canonical sources (order-lines + catalog); maxJobs:1 truncates the ONLY unit
+  // with NO deadline and NO deferral -- the pure maxJobs-exhaustion case blocker 6 targets.
+  const r1 = await dispatch({ ...common, maxJobs: 1 }).promise;
+  assert.equal(dd.totalCreates(), 1, "a budget of one spends exactly one export");
+  assert.equal(r1.drained, false, "a final/only unit that did not fully drain => dispatcher drained:false");
+  assert.equal(r1.continuationRequired, true, "continuation is required");
+  assert.ok(r1.stoppedForBudget, "the invocation reports it stopped for budget");
+  assert.equal(saver.calls, 0, "nothing saved while the second source is unstaged");
+  const firstHash = store.listSourceJobs(r1.cycleId).find((j) => j.fetch_status === "succeeded").request_hash;
+  const r2 = await dispatch({ ...common }).promise;
+  assert.equal(dd.createCount(firstHash), 1, "the already-created export is NEVER recreated on resume");
+  assert.equal(dd.totalCreates(), 2, "resume created only the remaining source");
+  assert.equal(r2.drained, true, "the resumed invocation fully drains");
+  assert.equal(r2.continuationRequired, false, "no further continuation required after resume");
+  assert.equal(saver.calls, 1, "brand-sales saves EXACTLY once after resume");
+  assert.ok(saver.has("brand-sales", "A1"));
+});
+
+test("(multi-unit, final unit truncates) an earlier unit fully drains, the final unit truncates => drained:false; resume completes with no duplicate exports", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe();
+  const saver = makeSaver();
+  const keys = ["brand-sales", "listing-optimizer"]; // unit order: generic (2 sources) then the staged cycle
+  const common = { store, dataDoe: dd, saver, controlCatalog: mkCatalog(keys, keys), manualReportKeys: keys };
+  // Budget = 3: brand-sales fully drains (2), listing-optimizer stages its SQP kickoff (1) then truncates.
+  const r1 = await dispatch({ ...common, maxJobs: 3 }).promise;
+  const gen = r1.perUnit.find((u) => u.kind === "generic");
+  const lo = r1.perUnit.find((u) => u.unit === "listing-optimizer");
+  assert.equal(gen.drained, true, "the earlier generic unit fully drained");
+  assert.ok(lo && lo.drained === false, "the final staged unit truncated (drained:false)");
+  assert.equal(r1.drained, false, "a final unit that did not drain makes the dispatcher drained:false");
+  assert.equal(r1.continuationRequired, true, "continuation is required");
+  assert.equal(dd.totalCreates(), 3, "exactly the budget of three exports was spent");
+  const r2 = await dispatch({ ...common }).promise;
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => dd.createCount(j.request_hash) === 1), "no source export is EVER created twice across the resume");
+  assert.equal(r2.drained, true, "the resumed invocation fully drains every unit");
+  assert.ok(saver.has("listing-optimizer", "A1"), "the staged report saves after resume");
+});
+
 /* ============================= runner ============================= */
 
 async function main() {
-  ({ runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys } = await import("../lib/server/sync/scheduler-v2-dispatch.js"));
+  ({ runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders } = await import("../lib/server/sync/scheduler-v2-dispatch.js"));
   ({ buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
+  ({ addDaysStr, monthStartStr } = await import("../lib/server/date-windows.js"));
   void SHADOW_PLANNED_REPORT_KEYS; void STAGED_CYCLE_REPORT_KEYS;
 
   for (const t of tests) {

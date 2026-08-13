@@ -16,7 +16,7 @@
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, evaluateAdsCurrencyGate, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
-import { monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
+import { monthBackStr, monthStartStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 
@@ -24,6 +24,17 @@ import { buildDependencyPlan } from "./planner.js";
 // [monthBack(asOf, 5).from .. asOf] (first day of the month five months back .. today). The prior
 // 150-day approximation (monthStart(asOf)-150d) silently trimmed the first days of the oldest month.
 const DAILY_MONTHS_BACK = 5;
+
+// Brand Sales lookback (days back from asOf's month start) -- byte-identical to the live window
+// (src/App.jsx ~1286 + registry.js): addDaysStr(monthStartStr(asOf), -420). Both the Order Line Items
+// superset AND the Product Catalog span this SAME {from,to} (buildBrandSalesPayload passes one window
+// to both), so the scheduled windows match the live route exactly.
+const BRAND_SALES_MONTH_START_LOOKBACK_DAYS = 420;
+
+// Content Change Alerts catalog lookback (days) -- byte-identical to the api/datadoe.js content-changes
+// route: catalogFrom = addDaysStr(asOf, -365). The notification EVENTS source is no-date (event_time
+// DESC; from/to null); only the catalog carries the 365-day window.
+const CONTENT_CHANGES_CATALOG_LOOKBACK_DAYS = 365;
 
 // FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
 // constant, so the scheduled inventory window (asOf-10d..asOf) matches the live route exactly.
@@ -65,7 +76,7 @@ const RET_WINDOW_DAYS = 60;
 const LH_SALES_WINDOW_DAYS = 30;
 const LH_INVENTORY_LOOKBACK_DAYS = 10;
 
-export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["daily-reporting", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss", "returns-leakage", "listing-health"]);
+export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["brand-sales", "daily-reporting", "content-changes", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss", "returns-leakage", "listing-health"]);
 
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
 // are staged per account by runKeywordRankShadowCycle (keyword-rank-cycle.js). It therefore has ONE
@@ -136,6 +147,68 @@ function decorateSources(sources, { reportKey, connectionId, bucket }) {
     // so this is inert for every non-degradable source (e.g. Buy Box / Returns / the required sources).
     disabledPolicy: source.availabilityPolicy || null,
   }));
+}
+
+/**
+ * Plan Brand Sales (the flagship ALL-brand "Dashboard" report) for ONE account. Emits the Order Line
+ * Items superset + the Product Catalog, BOTH over the SAME [monthStart(asOf)-420d, asOf] window (the
+ * live route passes one {from,to} to both), for the one raw seller id. Both sources are INDEPENDENTLY
+ * required (no probe / staged activation), so Brand Sales uses the generic owner-scoped source cycle,
+ * never a dedicated staged driver. The derive (orderSalesByBrand) reads only the two saved source rows.
+ */
+export function planBrandSales({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const to = String(asOf);
+  const from = addDaysStr(monthStartStr(to), -BRAND_SALES_MONTH_START_LOOKBACK_DAYS);
+  const windowsByRequestKey = {
+    "brand-sales:order-lines": [{ from, to }],
+    "brand-sales:catalog": [{ from, to }],
+  };
+  const sources = reportSourceRequestHashes({
+    reportKey: "brand-sales", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "brand-sales",
+    reportVersion: REPORT_DERIVATIONS["brand-sales"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "brand-sales", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { from, to, rawSellerId: scope.rawSellerId },
+  };
+}
+
+/**
+ * Plan Content Change Alerts for ONE account. Emits the NO-DATE notification EVENTS export (event_time
+ * DESC; from/to null -- the notification stream is the report's only substantive source, and its
+ * contract's structured availabilityPolicy blocks the report when the org disables the source) plus the
+ * Product Catalog over [asOf-365d, asOf], for the one raw seller id. Both sources are INDEPENDENTLY
+ * required (no probe / staged activation), so Content Changes uses the generic owner-scoped source cycle,
+ * never a dedicated staged driver. The derive (contentChangesPayload) reads context.accountId (the
+ * authoritative public id the worker pins) and context.retrievedAt (latest source fetch time), never a clock.
+ */
+export function planContentChanges({ accountId, country, currency, connections, asOf }) {
+  const scope = resolveAccountScope({ accountId, country, currency, connections });
+  const to = String(asOf);
+  const catalogFrom = addDaysStr(to, -CONTENT_CHANGES_CATALOG_LOOKBACK_DAYS);
+  const windowsByRequestKey = {
+    "content-changes:events": [{ from: null, to: null }],
+    "content-changes:catalog": [{ from: catalogFrom, to }],
+  };
+  const sources = reportSourceRequestHashes({
+    reportKey: "content-changes", apiKey: scope.apiKey, ids: [scope.rawSellerId],
+    windowsByRequestKey, marketplaceCountry: scope.country,
+  });
+  return {
+    reportKey: "content-changes",
+    reportVersion: REPORT_DERIVATIONS["content-changes"].snapshotVersion,
+    accountId: scope.accountId,
+    connectionId: scope.connectionId,
+    bucket: scope.bucket,
+    sources: decorateSources(sources, { reportKey: "content-changes", connectionId: scope.connectionId, bucket: scope.bucket }),
+    context: { to, rawSellerId: scope.rawSellerId },
+  };
 }
 
 /**
@@ -557,6 +630,8 @@ export function planListingHealth({ accountId, country, currency, connections, a
 // Generic single-shot planners ONLY. keyword-rank + sales-movers are deliberately absent: they are staged
 // by their own account-scoped shadow cycles (see STAGED_CYCLE_REPORT_KEYS), never dispatched here.
 const PLANNERS = {
+  "brand-sales": planBrandSales,
+  "content-changes": planContentChanges,
   "daily-reporting": planDailyReporting,
   "sku-pl": planSkuPl,
   "fba-plan": planFbaPlan,
