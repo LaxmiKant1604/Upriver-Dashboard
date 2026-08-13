@@ -124,10 +124,18 @@ function makeRuntime(over = {}) {
     getAdsDailySourceRows: over.getAdsDailySourceRows || (async () => []),
     getAdsSyncStates: over.getAdsSyncStates || (async () => []),
     getAdsSyncCoverage: over.getAdsSyncCoverage || (async () => ({ windows: [], status: "missing", read: "ok" })),
+    getReportSyncSettings: over.getReportSyncSettings || (async () => []), // durable scheduled controls (injected)
     controlCatalog: over.controlCatalog, // undefined => production fail-closed default
   });
   return { rt, store, dd, saver };
 }
+
+// A control catalog whose scheduleEnabled is DRIVEN by durable settings (mirrors schedulerV2ReportControlCatalog:
+// `ready` from a fixed v2-ready set; `scheduleEnabled` = ready AND settings[report_key].schedule_enabled===true).
+const settingsAwareCatalog = (readyKeys) => (settings = []) => {
+  const byKey = new Map((settings || []).map((row) => [row.report_key ?? row.reportKey, row]));
+  return readyKeys.map((rk) => ({ reportKey: rk, ready: true, scheduleEnabled: (byKey.get(rk) || {}).schedule_enabled === true }));
+};
 
 // Real-file readers for the audit/preflight (fs reads are permitted; they are not DataDoe exports or db writes).
 const MIG_DIR = join(process.cwd(), "supabase", "migrations");
@@ -268,6 +276,31 @@ test("(audit drift) a renamed table / dropped column / missing RPC / dropped wra
   assert.ok(noFile.blockers.some((b) => b.code === "MIGRATION_MISSING"), "absent migration => MIGRATION_MISSING");
 });
 
+test("(audit blocker 3) RPC param rename, comment-only constraint, removed named invariant, and required-wrapper coverage all fail closed", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const withMut = (mutator) => auditSchemaContract({ readFile: (n) => mutator(n, base[n]) });
+  // 1) Renamed RPC parameter p_request_hash -> p_hash must FAIL (exact names/order validated, not just the name).
+  const renamedParam = withMut((n, t) => n === "20260807_scheduler_v2.sql" ? t.replace(/p_request_hash text/, "p_hash text") : t);
+  assert.ok(renamedParam.blockers.some((b) => b.code === "RPC_PARAM_MISMATCH" && b.rpc === "claim_source_export_attempt"), "renamed p_request_hash => RPC_PARAM_MISMATCH");
+  // 2) A removed UNIQUE constraint whose matching text survives ONLY in a comment must FAIL (comments ignored).
+  const commentedOut = withMut((n, t) => n === "20260807_scheduler_v2.sql"
+    ? t.replace("constraint sync_source_jobs_cycle_hash_unique unique (cycle_id, request_hash),", "-- constraint sync_source_jobs_cycle_hash_unique unique (cycle_id, request_hash)")
+    : t);
+  assert.ok(commentedOut.blockers.some((b) => (b.code === "CONSTRAINT_MISSING" || b.code === "NAMED_CONSTRAINT_MISSING") && b.table === "sync_source_jobs"), "unique-only-in-comment => CONSTRAINT/NAMED_CONSTRAINT_MISSING");
+  // 3) A removed critical named invariant (the one-attempt guard) must FAIL by name.
+  const noOneAttempt = withMut((n, t) => n === "20260807_scheduler_v2.sql" ? t.replace(/constraint sync_source_jobs_one_attempt/g, "constraint sync_source_jobs_one_attempt_GONE") : t);
+  assert.ok(noOneAttempt.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && (b.constraints || []).includes("sync_source_jobs_one_attempt")), "removed one-attempt guard => NAMED_CONSTRAINT_MISSING");
+  // 4) The owner FK + connection/identity constraints are audited by name too.
+  const noFk = withMut((n, t) => n === "20260811_sync_source_job_owners.sql" ? t.replace(/constraint sync_source_job_owners_source_fk/g, "constraint sync_source_job_owners_source_fk_GONE") : t);
+  assert.ok(noFk.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && (b.constraints || []).includes("sync_source_job_owners_source_fk")), "removed owner FK => NAMED_CONSTRAINT_MISSING");
+  // 5) Every REQUIRED wrapper export is verified (not only the per-migration subset): dropping one outside the
+  //    four migrations' tables (saveReportSnapshot) still fails closed.
+  const noSaver = withMut((n, t) => n === "supabase.js" ? t.replace(/export async function saveReportSnapshot\b/, "async function saveReportSnapshot_GONE") : t);
+  assert.ok(noSaver.blockers.some((b) => b.code === "REQUIRED_WRAPPER_MISSING" && b.wrapper === "saveReportSnapshot"), "unexported saveReportSnapshot => REQUIRED_WRAPPER_MISSING");
+  assert.equal(auditSchemaContract({ readFile: (n) => base[n] }).requiredWrappers.ok, true, "all required wrappers exported in the real source");
+});
+
 /* ===================== dispatch behavior via the composed runtime ===================== */
 
 group("runtime composition: dispatch behavior (cache-only, locked, ready cycle, discovery)");
@@ -320,6 +353,94 @@ test("(discovery fail-closed) a discovery failure rejects BEFORE any source expo
   const { rt, dd } = makeRuntime({ controlCatalog: mkCatalog(["brand-sales"]), fetchAccounts: async () => { throw new Error("directory unavailable"); } });
   await assert.rejects(rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS }), /directory unavailable/);
   assert.equal(dd.totalCreates(), 0, "discovery failure spends zero exports (fails closed before dispatch)");
+});
+
+/* ===================== review blockers 1, 2, 4 ===================== */
+
+group("runtime composition: durable settings + protected collaborators + locked zero-I/O (blockers 1,2,4)");
+
+const throwingHalf = (names, label) => Object.fromEntries(names.map((n) => [n, () => { throw new Error("I/O: " + label + "." + n); }]));
+
+test("(blocker 1: durable settings drive selection) scheduled loads report_sync_settings (NOT caller-supplied); manual stays readiness-gated", async () => {
+  const catalog = settingsAwareCatalog(["brand-sales"]); // ready via the v2 set; scheduleEnabled from durable settings
+  // schedule_enabled=true => the v2-ready report is selected.
+  const on = makeRuntime({ controlCatalog: catalog, getReportSyncSettings: async () => [{ report_key: "brand-sales", schedule_enabled: true }] });
+  const rOn = await on.rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS });
+  assert.deepEqual(rOn.selected, ["brand-sales"], "durable schedule_enabled=true selects the v2-ready report");
+  // schedule_enabled=false => NOT selected; a caller-supplied `settings` override is IGNORED (never the control source).
+  const off = makeRuntime({ controlCatalog: catalog, getReportSyncSettings: async () => [{ report_key: "brand-sales", schedule_enabled: false }] });
+  const rOff = await off.rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS, settings: [{ report_key: "brand-sales", schedule_enabled: true }] });
+  assert.deepEqual(rOff.selected, [], "durable schedule_enabled=false does not select; caller-supplied settings are ignored");
+  // A manual request is readiness-gated (a NOT-v2-ready report is locked out) and never loads durable settings.
+  const man = makeRuntime({ controlCatalog: settingsAwareCatalog([]), getReportSyncSettings: async () => { throw new Error("settings must not load for manual"); } });
+  const rMan = await man.rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS, manualReportKeys: ["brand-sales"] });
+  assert.deepEqual(rMan.selected, [], "manual brand-sales (not v2-ready) is readiness-gated => not dispatched");
+  assert.deepEqual(rMan.lockedOut, ["brand-sales"]);
+});
+
+test("(blocker 1: settings fail closed) a getReportSyncSettings failure on a scheduled run fails closed BEFORE discovery/cycle/store/DataDoe", async () => {
+  let discovery = 0;
+  const rt = buildSchedulerV2Runtime({
+    connections: CONNS,
+    makeSourceStore: () => throwingHalf(SOURCE_METHODS, "source"),
+    makeReportStore: () => throwingHalf(REPORT_METHODS, "report"),
+    makeDataDoeAdapter: () => ({ create: () => { throw new Error("create"); }, poll: () => {}, download: () => {} }),
+    makeShadowSnapshotSaver: () => (() => { throw new Error("save"); }),
+    fetchAccounts: async () => { discovery += 1; throw new Error("discovery"); },
+    getReportSyncSettings: async () => { throw new Error("settings read failed"); },
+    controlCatalog: mkCatalog(["brand-sales"]), // even a READY report must not proceed if durable settings cannot load
+  });
+  await assert.rejects(rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS }), /settings read failed/);
+  assert.equal(discovery, 0, "settings-read failure fails closed BEFORE discovery / cycle / store / DataDoe");
+});
+
+test("(blocker 2: reserved run overrides are dropped) a run cannot unlock a report, reroute organizations, or replace the shadow saver", async () => {
+  // A) cannot UNLOCK: malicious controlCatalog + settings are dropped; the trusted (default) catalog keeps it locked.
+  const locked = makeRuntime({ controlCatalog: mkCatalog([]) });
+  const rA = await locked.rt.run({
+    bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS,
+    manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]), settings: [{ report_key: "brand-sales", schedule_enabled: true }],
+  });
+  assert.deepEqual(rA.selected, [], "a reserved controlCatalog/settings override cannot unlock brand-sales");
+  assert.deepEqual(rA.lockedOut, ["brand-sales"]);
+  // B) cannot REROUTE or REPLACE the saver: a READY cycle uses the TRUSTED discovery + saver, never the injected evil ones.
+  let evilSaverCalled = false;
+  const { rt, saver } = makeRuntime({ controlCatalog: mkCatalog(["brand-sales"]) });
+  const rB = await rt.run({
+    bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS,
+    saveSnapshot: async () => { evilSaverCalled = true; return { paramsHash: "evil" }; },
+    connections: [{ id: "primary", apiKey: "evil" }],
+    discoverAccounts: async () => [{ id: "EVIL", country: "US", currency: "USD", name: "Evil" }],
+    dataDoe: { create: () => { throw new Error("evil dataDoe"); }, poll: () => {}, download: () => {} },
+    store: { openCycle: () => { throw new Error("evil store"); } },
+    ppcAdsProviders: {}, loadDerivedContext: async () => ({ adsCoverage: "evil" }),
+  });
+  assert.deepEqual(rB.selected, ["brand-sales"]);
+  assert.equal(saver.calls, 1, "the TRUSTED shadow saver saved");
+  assert.equal(evilSaverCalled, false, "the injected evil saveSnapshot was NEVER called");
+  assert.ok(saver.saved.has("scheduler-v2/brand-sales|A1"), "saved under the trusted shadow namespace for the trusted discovered account A1");
+  assert.deepEqual(rB.accountsDispatched, ["A1"], "the TRUSTED discovery (A1) was used, not the injected EVIL directory");
+});
+
+test("(blocker 4: locked zero-I/O) default-locked MANUAL and SCHEDULED runs return a deterministic drained rollup and touch NO discovery/store/DataDoe", async () => {
+  let discovery = 0, settings = 0;
+  const make = () => buildSchedulerV2Runtime({
+    connections: CONNS,
+    makeSourceStore: () => throwingHalf(SOURCE_METHODS, "source"),
+    makeReportStore: () => throwingHalf(REPORT_METHODS, "report"),
+    makeDataDoeAdapter: () => ({ create: () => { throw new Error("create"); }, poll: () => { throw new Error("poll"); }, download: () => { throw new Error("download"); } }),
+    makeShadowSnapshotSaver: () => (() => { throw new Error("save"); }),
+    fetchAccounts: async () => { discovery += 1; throw new Error("discovery must not run for a locked invocation"); },
+    getReportSyncSettings: async () => { settings += 1; return []; },
+    controlCatalog: () => [], // default fail-closed: nothing v2-ready
+  });
+  const expectDrained = (r) => assert.deepEqual(
+    { selected: r.selected, drained: r.drained, continuationRequired: r.continuationRequired, spent: r.spent, cycleId: r.cycleId },
+    { selected: [], drained: true, continuationRequired: false, spent: 0, cycleId: null });
+  expectDrained(await make().run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", manualReportKeys: ["brand-sales"] })); // MANUAL locked
+  expectDrained(await make().run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10" }));                                    // SCHEDULED locked
+  assert.equal(discovery, 0, "discovery NEVER ran for a locked invocation (zero I/O before dispatch)");
+  assert.equal(settings, 1, "only the scheduled run loaded durable settings once (a control READ); the manual run loaded none");
 });
 
 /* ===================== telemetry safety: no secrets / raw errors ===================== */

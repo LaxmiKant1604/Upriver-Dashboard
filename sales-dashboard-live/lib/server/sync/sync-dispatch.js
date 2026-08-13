@@ -181,6 +181,20 @@ export async function runSchedulerV2Shadow({
     if (!readySet.has(r.reportKey)) { lockedOut.push(r.reportKey); continue; }
     dispatchable.push(r);
   }
+
+  // Blocker 4: a locked invocation with NOTHING to dispatch (no ready source-backed report AND no derived-only
+  // report) performs ZERO I/O -- return a deterministic drained rollup BEFORE discoverAccounts, cycle creation,
+  // or ANY store/DataDoe call. Under the default fail-closed v2 catalog EVERY report is locked, so a real
+  // manual OR scheduled invocation returns here without touching discovery, the store, or DataDoe.
+  if (dispatchable.length === 0 && derivedOnly.length === 0) {
+    return {
+      bucket, cycleId: null, manual,
+      selected: [], lockedOut, derivedOnly,
+      unavailableAccounts: [], accountsDispatched: [],
+      spent: 0, maxJobs, stoppedForBudget: false, drained: true, continuationRequired: false, perUnit: [], reports: null,
+    };
+  }
+
   const dispatchSet = new Set(dispatchable.map((r) => r.reportKey));
   const genericKeys = SHADOW_PLANNED_REPORT_KEYS.filter((k) => dispatchSet.has(k)); // canonical order
   const stagedKeys = STAGED_CYCLE_REPORT_KEYS.filter((k) => dispatchSet.has(k));    // canonical order

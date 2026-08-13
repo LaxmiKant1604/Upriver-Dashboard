@@ -21,12 +21,16 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "sync_cycles",
         unique: [["bucket", "cycle_date"]],
+        namedConstraints: ["sync_cycles_bucket_date_unique"],
         keyColumns: ["id", "bucket", "cycle_date", "trigger", "status", "scheduled_at", "started_at", "finished_at",
           "source_total", "source_succeeded", "source_failed", "report_total", "report_succeeded", "report_failed", "counts"],
       },
       {
         name: "sync_source_jobs",
         unique: [["cycle_id", "request_hash"]],
+        // The one-attempt invariant the rollout token budget relies on (DB-level "one create-export per
+        // (cycle, request_hash)") + the dedup unique. Both are NAMED and audited by name.
+        namedConstraints: ["sync_source_jobs_cycle_hash_unique", "sync_source_jobs_one_attempt"],
         keyColumns: ["cycle_id", "request_hash", "source_id", "source_key", "organization_fingerprint", "connection_id",
           "account_scope_hash", "request_meta", "bucket", "fetch_status", "attempted_at", "create_export_count",
           "export_id", "error_stage", "error_code", "error_message", "terminal", "row_count", "payload_bytes", "cache_object_path"],
@@ -34,6 +38,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "sync_report_jobs",
         unique: [["cycle_id", "report_key", "account_id"]],
+        namedConstraints: ["sync_report_jobs_cycle_report_account_unique"],
         keyColumns: ["cycle_id", "report_key", "report_version", "account_id", "connection_id", "bucket", "depends_on",
           "fetch_status", "derive_status", "save_status", "validated", "error_stage", "error_code", "latest_data_date", "snapshot_params_hash"],
       },
@@ -77,6 +82,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "sync_source_job_owners",
         unique: [["cycle_id", "request_hash", "owner_id"]],
+        // The composite FK to the canonical source-job identity + the owner identity/connection invariants
+        // the rollout relies on (a malformed owner row must fail the migration, never route to primary).
+        namedConstraints: ["sync_source_job_owners_unique", "sync_source_job_owners_source_fk",
+          "sync_source_job_owners_connection_id_check", "sync_source_job_owners_identity_nonempty"],
         keyColumns: ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id",
           "connection_id", "organization_fingerprint", "account_scope_hash", "owner_status", "error_code"],
       },
@@ -86,46 +95,75 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
   },
 ]);
 
-// ---- pure SQL/text probes (no regex on untrusted input; the SQL is our own committed migration) ----
+// ---- pure SQL/text probes (the SQL is our own committed migration; parsing is comment-stripped) ----
 
-// The `create table if not exists public.<name> ( ... );` body, or null. Scoped so a column check for one
-// table never matches a same-named column in another table declared later in the same migration file.
-function tableBody(sql, name) {
-  const head = new RegExp(`create\\s+table\\s+if\\s+not\\s+exists\\s+public\\.${name}\\s*\\(`, "i");
-  const m = head.exec(sql);
+// Remove SQL comments so a constraint/param/table mentioned ONLY in a comment can never satisfy a contract
+// check (blocker 3). Block comments first, then line comments. Our migrations carry no "--"/"/*" inside a
+// string/dollar-quoted literal, so this naive strip is exact for them; it replaces each comment with a space
+// to preserve token boundaries. All structural parsing below runs on the stripped text.
+function stripSqlComments(sql) {
+  return String(sql).replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ");
+}
+
+// Extract the body between the balanced parentheses that immediately follow `header` (a compiled regex whose
+// match ends at the opening "("), or null. Runs on comment-stripped text so parens inside comments never
+// unbalance the walk.
+function balancedBody(cleanSql, header) {
+  const m = header.exec(cleanSql);
   if (!m) return null;
-  // Walk parentheses from the opening "(" to its matching close so we capture exactly this table's body.
   let depth = 0;
-  for (let i = m.index + m[0].length - 1; i < sql.length; i += 1) {
-    const ch = sql[i];
+  for (let i = m.index + m[0].length - 1; i < cleanSql.length; i += 1) {
+    const ch = cleanSql[i];
     if (ch === "(") depth += 1;
-    else if (ch === ")") { depth -= 1; if (depth === 0) return sql.slice(m.index + m[0].length, i); }
+    else if (ch === ")") { depth -= 1; if (depth === 0) return cleanSql.slice(m.index + m[0].length, i); }
   }
   return null;
 }
 
-// A column is declared when its name begins a column line inside the table body (word-boundaried, not inside
-// another identifier). Constraint/index lines never start with a bare column that we check here.
+// The `create table if not exists public.<name> ( ... )` body (comment-stripped), or null. Scoped so a column
+// / constraint check for one table never matches text belonging to another table in the same migration file.
+function tableBody(cleanSql, name) {
+  return balancedBody(cleanSql, new RegExp(`create\\s+table\\s+if\\s+not\\s+exists\\s+public\\.${name}\\s*\\(`, "i"));
+}
+
+// A column is declared when its name begins a column line inside the (comment-stripped) table body.
 function bodyDeclaresColumn(body, column) {
   return new RegExp(`(^|,|\\()\\s*${column}\\s`, "m").test(body);
 }
 
-// A (multi-)column key is backed when the migration declares it as a PRIMARY KEY or UNIQUE -- inline
-// (`col type primary key`) for a single column, or a table constraint `primary key (a, b)` / `unique (a, b)`
-// (optionally NAMED `constraint x unique (...)`). Column order must match.
-function keyIsBacked(sql, body, cols) {
+// A (multi-)column key is backed when THIS TABLE'S body declares it as PRIMARY KEY or UNIQUE -- a table
+// constraint `primary key (a, b)` / `unique (a, b)` (optionally NAMED `constraint x unique (...)`), or, for a
+// single column, an inline `col type primary key`. Matched on the comment-stripped body ONLY (blocker 3), so a
+// removed constraint whose text survives only in a comment does NOT count. Column order must match exactly.
+function keyIsBacked(body, cols) {
+  if (!body) return false;
   const list = cols.map((c) => c.replace(/[^a-z0-9_]/gi, "")).join("\\s*,\\s*");
   const grouped = new RegExp(`(primary\\s+key|unique)\\s*\\(\\s*${list}\\s*\\)`, "i");
-  if (grouped.test(sql)) return true;
-  if (cols.length === 1 && body) {
-    // Inline single-column PRIMARY KEY, e.g. "report_key text primary key".
+  if (grouped.test(body)) return true;
+  if (cols.length === 1) {
     return new RegExp(`(^|,)\\s*${cols[0]}\\s+[a-z0-9_]+[^,]*\\bprimary\\s+key\\b`, "im").test(body);
   }
   return false;
 }
 
-function rpcDeclared(sql, name) {
-  return new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${name}\\s*\\(`, "i").test(sql);
+// A NAMED constraint (inline `constraint <name> ...` OR `alter table ... add constraint <name> ...`) present
+// anywhere in the comment-stripped migration. Audits the critical rollout invariants by NAME.
+function namedConstraintPresent(cleanSql, name) {
+  return new RegExp(`\\bconstraint\\s+${name}\\b`, "i").test(cleanSql);
+}
+
+// The RPC's declared parameter NAMES in signature order (comment-stripped), or null if the function is absent.
+// Each parameter's name is the first token before its type; defaults (`default ...`) are ignored.
+function rpcParamNames(cleanSql, name) {
+  const body = balancedBody(cleanSql, new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${name}\\s*\\(`, "i"));
+  if (body == null) return null;
+  const trimmed = body.trim();
+  if (!trimmed) return [];
+  return trimmed.split(",").map((p) => p.trim()).filter(Boolean).map((p) => p.split(/\s+/)[0].toLowerCase());
+}
+
+function arraysEqual(a, b) {
+  return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 function wrapperExported(source, name) {
@@ -139,6 +177,20 @@ function sourceReferencesTable(source, table) {
 function sourceReferencesRpc(source, rpc) {
   return source.includes(`/rest/v1/rpc/${rpc}`);
 }
+
+// The COMPLETE set of Supabase wrappers the composed Scheduler-v2 runtime depends on. The audit proves EVERY
+// one is exported from the wrapper source, so wrapper availability is never claimed vacuously (blocker 3) --
+// even the readers whose tables live in earlier migrations outside this phase's four (source_export_cache,
+// ads_sync_state, report_snapshots). Kept in sync with runtime-composition.REQUIRED_WRAPPERS (re-exported there).
+export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
+  "openSyncCycle", "claimSyncCycle", "getSyncCycle", "updateSyncCycleCounts", "claimSourceExportAttempt",
+  "upsertSyncSourceJob", "getSyncSourceJobs", "recordSyncSourceSuccess", "recordSyncSourceExportCreated",
+  "recordSyncSourceFailure", "getSyncReportJobs", "upsertSyncReportJob", "claimReportDeriveAttempt",
+  "recordSyncReportBlocked", "recordSyncReportFailure", "recordSyncReportSuccess",
+  "upsertSyncSourceJobOwners", "getSyncSourceJobOwners", "getSyncSourceJobsForOwners", "recordSyncSourceJobOwnerStale",
+  "getSourceExportCache", "getDailyAdsCoverage", "recordAdsCoverageWindows", "getReportSyncSettings",
+  "getAdDailyMetrics", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
+]);
 
 /**
  * STATICALLY audit the declared Scheduler-v2 schema contract against the committed migration SQL and the
@@ -166,33 +218,41 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
 
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
-    const sql = safeRead(entry.migration);
-    const row = { migration: entry.migration, present: sql != null, note: entry.note || null, tables: [], rpcs: [], wrappers: [] };
-    if (sql == null) {
+    const raw = safeRead(entry.migration);
+    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], wrappers: [], namedConstraints: [] };
+    if (raw == null) {
       blockers.push({ code: "MIGRATION_MISSING", migration: entry.migration, message: `migration ${entry.migration} not found` });
       matrix.push(row);
       continue;
     }
+    const sql = stripSqlComments(raw); // ALL structural checks run on the comment-stripped SQL (blocker 3).
     for (const t of entry.tables) {
       const body = tableBody(sql, t.name);
       const declared = body != null;
-      const backedUniques = (t.unique || []).filter((cols) => keyIsBacked(sql, body, cols));
+      const backedUniques = (t.unique || []).filter((cols) => keyIsBacked(body, cols));
       const missingColumns = declared ? (t.keyColumns || []).filter((c) => !bodyDeclaresColumn(body, c)) : (t.keyColumns || []);
+      const missingNamed = (t.namedConstraints || []).filter((n) => !namedConstraintPresent(sql, n));
       const referencedByWrapper = sourceReferencesTable(wrapperSource, t.name);
       if (!declared) blockers.push({ code: "TABLE_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is not created by ${entry.migration}` });
       if (declared && backedUniques.length !== (t.unique || []).length) {
         blockers.push({ code: "CONSTRAINT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing an expected primary-key/unique constraint the wrappers upsert on` });
       }
+      if (missingNamed.length) blockers.push({ code: "NAMED_CONSTRAINT_MISSING", migration: entry.migration, table: t.name, constraints: missingNamed, message: `table public.${t.name} is missing required named constraint(s): ${missingNamed.join(", ")}` });
       if (missingColumns.length) blockers.push({ code: "COLUMN_MISSING", migration: entry.migration, table: t.name, columns: missingColumns, message: `table public.${t.name} is missing wrapper-required column(s): ${missingColumns.join(", ")}` });
       if (!referencedByWrapper) blockers.push({ code: "TABLE_WRAPPER_MISSING", migration: entry.migration, table: t.name, message: `no wrapper references table public.${t.name}` });
-      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), missingColumns, referencedByWrapper });
+      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: (t.namedConstraints || []).filter((n) => !missingNamed.includes(n)), missingColumns, referencedByWrapper });
     }
     for (const r of entry.rpcs) {
-      const declared = rpcDeclared(sql, r.name);
+      const actualParams = rpcParamNames(sql, r.name);
+      const declared = actualParams != null;
+      const expectedParams = (r.params || []).map((p) => p.toLowerCase());
+      const paramsMatch = declared && arraysEqual(actualParams, expectedParams);
       const referencedByWrapper = sourceReferencesRpc(wrapperSource, r.name);
       if (!declared) blockers.push({ code: "RPC_MISSING", migration: entry.migration, rpc: r.name, message: `RPC public.${r.name} is not created by ${entry.migration}` });
+      // The exact parameter names + order MUST match what the wrapper POSTs, or the live call would fail.
+      if (declared && !paramsMatch) blockers.push({ code: "RPC_PARAM_MISMATCH", migration: entry.migration, rpc: r.name, expected: expectedParams, message: `RPC public.${r.name} parameters do not match the expected names/order [${expectedParams.join(", ")}]` });
       if (!referencedByWrapper) blockers.push({ code: "RPC_WRAPPER_MISSING", migration: entry.migration, rpc: r.name, message: `no wrapper calls RPC ${r.name}` });
-      row.rpcs.push({ name: r.name, declared, referencedByWrapper });
+      row.rpcs.push({ name: r.name, declared, paramsMatch, referencedByWrapper });
     }
     for (const w of entry.wrappers) {
       const exported = wrapperExported(wrapperSource, w);
@@ -201,7 +261,14 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
     }
     matrix.push(row);
   }
-  return { ok: blockers.length === 0, matrix, blockers };
+
+  // Prove EVERY required wrapper export exists -- not only the per-migration subset -- so the preflight never
+  // claims wrapper availability that the migration matrix did not actually cover (blocker 3).
+  const missingRequired = REQUIRED_WRAPPER_EXPORTS.filter((w) => !wrapperExported(wrapperSource, w));
+  for (const w of missingRequired) blockers.push({ code: "REQUIRED_WRAPPER_MISSING", wrapper: w, message: `required wrapper ${w}() is not exported from the wrapper source` });
+  const requiredWrappers = { total: REQUIRED_WRAPPER_EXPORTS.length, missing: missingRequired, ok: missingRequired.length === 0 };
+
+  return { ok: blockers.length === 0, matrix, blockers, requiredWrappers };
 }
 
 // The exact table + RPC names this phase depends on (for the preflight's live/probe checks and telemetry).

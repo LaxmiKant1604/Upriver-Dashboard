@@ -19,8 +19,20 @@ import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver }
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
 import { schedulerV2ReportControlCatalog } from "./report-controls.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
-import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
-import { auditSchemaContract, schedulerV2SchemaObjects } from "./schema-contract.js";
+import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings } from "../supabase.js";
+import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
+
+// The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
+// (the single source of truth the static audit also proves every one of); back-compat name for callers/tests.
+export const REQUIRED_WRAPPERS = REQUIRED_WRAPPER_EXPORTS;
+
+// The ONLY per-run arguments a caller may supply to rt.run(). Every trusted collaborator (control plane,
+// routing, stores, saver, loaders, and the durable settings) is fixed by the composition and can NOT be
+// overridden per run (blocker 2). Test injection happens at buildSchedulerV2Runtime(overrides), never per run.
+export const RUN_OPERATIONAL_ARGS = Object.freeze([
+  "bucket", "cycleDate", "asOf", "asOfFor", "manualReportKeys",
+  "clock", "deadlineMs", "reserveMs", "maxJobs", "scheduledAt", "trigger",
+]);
 
 // The single Daily Ads source_key ad_daily_metrics is keyed under (mirrors daily-ads-loader.DAILY_ADS_SOURCE_KEY).
 export { DAILY_ADS_SOURCE_KEY } from "./daily-ads-loader.js";
@@ -115,6 +127,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     makeShadowSnapshotSaver: snapshotSaverFactory = makeShadowSnapshotSaver,
     controlCatalog = schedulerV2ReportControlCatalog,
     fetchAccounts = fetchDataDoeAccounts,
+    getReportSyncSettings: readReportSyncSettings = getReportSyncSettings, // DURABLE scheduled-control source
     // Ads readers -- ALL Supabase, cache-only; NEVER a DataDoe export:
     getAdMetrics = getAdDailyMetrics,             // Daily Reporting ad_daily_metrics reader
     getCoverageState = getDailyAdsCoverage,        // Daily durable ads_sync_coverage reader
@@ -142,14 +155,38 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const loadDerivedContext = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
 
+  // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
   const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog };
+
+  // Load the DURABLE report scheduling controls (report_sync_settings) -- the ONLY production control source
+  // for the scheduled path. A read failure THROWS here, so it fails closed BEFORE runSchedulerV2Shadow does
+  // any discovery / cycle creation / Supabase write / DataDoe export.
+  const loadDurableSettings = async () => {
+    const rows = await readReportSyncSettings();
+    return Array.isArray(rows) ? rows : [];
+  };
+
   return {
     ...collaborators,
     sourceRowLoader,
-    // Run one bounded SHADOW dispatch slice with these composed collaborators. The caller supplies
-    // bucket/cycleDate/asOf(/asOfFor)/budget/trigger. Overrides win (so a test can inject a fake dataDoe or a
-    // ready controlCatalog) but the composed collaborators are the defaults.
-    run: (sliceArgs = {}) => runSchedulerV2Shadow({ ...collaborators, ...sliceArgs }),
+    /**
+     * Run one bounded SHADOW dispatch slice. The caller supplies ONLY operational args (bucket / cycleDate /
+     * asOf(/asOfFor) / manualReportKeys / budget / trigger) -- every other key is DROPPED (blocker 2): a
+     * caller can never override the control catalog, connections, discovery, stores, saver, loaders, or the
+     * durable settings, so a per-run override cannot unlock a report, change organization routing, or replace
+     * the shadow saver. A SCHEDULED run (no manualReportKeys) loads the durable report_sync_settings first and
+     * fails closed on a read error before any I/O (blocker 1); a MANUAL run stays readiness-gated and needs no
+     * durable settings. Trusted collaborators + the durable settings are spread LAST so nothing can shadow them.
+     */
+    run: async (sliceArgs = {}) => {
+      const operational = {};
+      for (const k of RUN_OPERATIONAL_ARGS) if (sliceArgs != null && k in sliceArgs) operational[k] = sliceArgs[k];
+      const manual = Array.isArray(operational.manualReportKeys);
+      // Durable, trusted settings for the scheduled path (never caller-supplied). Loaded (and possibly
+      // failing closed) BEFORE the dispatcher touches discovery/cycle/store/DataDoe.
+      const settings = manual ? [] : await loadDurableSettings();
+      return runSchedulerV2Shadow({ ...operational, settings, ...collaborators });
+    },
   };
 }
 
@@ -202,22 +239,32 @@ export function schedulerV2Preflight(overrides = {}) {
   checks.primaryConnection = { ok: hasPrimary };
   if (!hasPrimary) push({ code: "PRIMARY_CONNECTION_MISSING", message: "primary DataDoe connection is not configured" });
 
-  // 3) Supabase wrapper availability (only when a wrapper module is injected; the static audit below also
-  //    proves each wrapper is EXPORTED from source, so this is a belt-and-suspenders runtime check).
-  if (wrappers) {
-    const missingWrappers = requiredWrappers.filter((n) => typeof wrappers[n] !== "function");
-    checks.wrappers = { required: requiredWrappers.length, missing: missingWrappers, ok: missingWrappers.length === 0 };
-    if (missingWrappers.length) push({ code: "WRAPPER_UNAVAILABLE", wrappers: missingWrappers, message: `required Supabase wrappers unavailable: ${missingWrappers.join(", ")}` });
-  } else {
-    checks.wrappers = { ok: null, reason: "runtime wrapper module not injected (source-level availability is proven by the schema audit)" };
+  // Run the STATIC schema<->wrapper audit ONCE (no db/network). It covers the required tables/RPCs/migration
+  // readiness AND proves EVERY required wrapper is exported, so wrapper availability is never claimed vacuously.
+  const expected = schedulerV2SchemaObjects();
+  let audit = null;
+  if (typeof readFile === "function") {
+    try { audit = auditSchemaContract({ readFile }); } catch (_e) { audit = { ok: false, matrix: [], blockers: [{ code: "AUDIT_FAILED", message: "schema audit could not run" }], requiredWrappers: { total: 0, missing: [], ok: false } }; }
   }
 
-  // 4 + 5) required tables/RPCs + migration readiness -- STATIC schema<->wrapper audit (no db, no network).
-  const expected = schedulerV2SchemaObjects();
-  if (typeof readFile === "function") {
-    let audit;
-    try { audit = auditSchemaContract({ readFile }); } catch (_e) { audit = { ok: false, matrix: [], blockers: [{ code: "AUDIT_FAILED", message: "schema audit could not run" }] }; }
-    checks.schema = { ok: audit.ok, blockerCount: audit.blockers.length, matrix: audit.matrix };
+  // 3) Supabase wrapper availability. With an injected wrapper module: a runtime typeof check. Otherwise: the
+  //    static audit's SOURCE-LEVEL export proof (covering EVERY required wrapper). With NEITHER, availability is
+  //    UNPROVEN and fails closed -- never claimed proven vacuously (blocker 3).
+  if (wrappers) {
+    const missingWrappers = requiredWrappers.filter((n) => typeof wrappers[n] !== "function");
+    checks.wrappers = { source: "runtime-module", required: requiredWrappers.length, missing: missingWrappers, ok: missingWrappers.length === 0 };
+    if (missingWrappers.length) push({ code: "WRAPPER_UNAVAILABLE", wrappers: missingWrappers, message: `required Supabase wrappers unavailable: ${missingWrappers.join(", ")}` });
+  } else if (audit) {
+    // The audit already emits SCHEMA_REQUIRED_WRAPPER_MISSING for any absent export, so it is the proof here.
+    checks.wrappers = { source: "static-audit", required: audit.requiredWrappers.total, missing: audit.requiredWrappers.missing, ok: audit.requiredWrappers.ok };
+  } else {
+    checks.wrappers = { source: "none", ok: null, reason: "no wrapper module and no schema-audit reader; wrapper availability is unproven" };
+    push({ code: "WRAPPER_AVAILABILITY_UNPROVEN", message: "wrapper availability could not be proven; inject a wrapper module or a schema-audit readFile" });
+  }
+
+  // 4 + 5) required tables/RPCs + migration readiness (from the single audit above).
+  if (audit) {
+    checks.schema = { ok: audit.ok, blockerCount: audit.blockers.length, matrix: audit.matrix, requiredWrappers: audit.requiredWrappers };
     for (const b of audit.blockers) push({ ...sanitizeAuditBlocker(b), code: `SCHEMA_${b.code}` });
   } else {
     checks.schema = { ok: null, reason: "static schema audit reader (readFile) not provided" };
@@ -238,20 +285,8 @@ export function schedulerV2Preflight(overrides = {}) {
 // this guarantees no unexpected field -- e.g. a future raw string -- ever leaks into preflight telemetry).
 function sanitizeAuditBlocker(b) {
   const safe = {};
-  for (const k of ["migration", "table", "rpc", "wrapper", "columns", "target", "message"]) {
+  for (const k of ["migration", "table", "rpc", "wrapper", "columns", "constraints", "expected", "target", "message"]) {
     if (b[k] !== undefined) safe[k] = b[k];
   }
   return safe;
 }
-
-// The wrapper functions the composed runtime depends on (checked for availability when a wrapper module is
-// injected; also each is proven EXPORTED by the static schema audit). Kept in sync with schema-contract.js.
-export const REQUIRED_WRAPPERS = Object.freeze([
-  "openSyncCycle", "claimSyncCycle", "getSyncCycle", "updateSyncCycleCounts", "claimSourceExportAttempt",
-  "upsertSyncSourceJob", "getSyncSourceJobs", "recordSyncSourceSuccess", "recordSyncSourceExportCreated",
-  "recordSyncSourceFailure", "getSyncReportJobs", "upsertSyncReportJob", "claimReportDeriveAttempt",
-  "recordSyncReportBlocked", "recordSyncReportFailure", "recordSyncReportSuccess",
-  "upsertSyncSourceJobOwners", "getSyncSourceJobOwners", "getSyncSourceJobsForOwners", "recordSyncSourceJobOwnerStale",
-  "getSourceExportCache", "getDailyAdsCoverage", "recordAdsCoverageWindows", "getReportSyncSettings",
-  "getAdDailyMetrics", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
-]);
