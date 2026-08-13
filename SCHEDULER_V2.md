@@ -3656,3 +3656,53 @@ multi-unit maxJobs truncation returns `drained:false` + `continuationRequired` a
 verify` exit 0 (terminates naturally). `git diff --check` clean; only the intended files changed (+ untracked
 `HANDOFF.md`/`.worktrees/`). Nothing pushed/merged/deployed/unlocked/enabled/scheduled/migrated. STOP for Codex
 re-review.
+
+## 59. Phase 1e re-review-2 -- three follow-up findings (SHADOW MODE, 2026-08-13)
+
+Codex's re-review of §58 raised three findings. All three are fixed WITHOUT changing SHADOW status: no
+route/cron/migration/deployment/frontend wiring, nothing enabled/scheduled, Scheduler v1 (`run-sync.js`) +
+`HANDOFF.md`/`.worktrees/` untouched.
+
+### 59.1 Scheduler-v2 readiness is now DISTINCT from Scheduler v1 `enabled` (finding 1)
+
+§58 relied on `reportControlCatalog.ready` to lock every v2 report, but that flag is derived from the
+Scheduler **v1** registry's `enabled` -- so `brand-sales` (the live v1 Dashboard) read `ready:true`, and giving
+it a v2 dispatch path meant a MANUAL v2 request would have passed the readiness gate. Fixed by adding
+`schedulerV2ReportControlCatalog` (report-controls.js): identical row shape, but `ready` comes from an
+EXPLICIT, fail-closed allowlist `SCHEDULER_V2_READY_REPORT_KEYS` that is **empty** today. The dispatcher
+(`selectSchedulerV2ReportKeys` + `runSchedulerV2Shadow`) now defaults its control plane to this v2 catalog, so
+EVERY v2 report -- brand-sales included -- is v2-locked: a default manual OR scheduled v2 Brand Sales request
+selects nothing and spends **zero** exports. `reportControlCatalog` (v1) is byte-unchanged; flipping a v2
+report on is a deliberate, reviewed cutover on the allowlist, never a side effect of v1 `enabled`.
+
+### 59.2 Strict execution policy on the four new contracts (finding 2)
+
+`brand-sales:order-lines`, `brand-sales:catalog`, `content-changes:events`, `content-changes:catalog` are now
+`strict: true`: a cap-sized (truncated) page is rejected (TRUNCATED, terminal, no partial save) rather than
+deriving Brand Sales / a change feed from silently truncated data. `strict` is execution metadata only -- it is
+NOT passed to `sourceRequestIdentity`, so every `request_hash` is byte-identical (pinned by a golden-hash
+test). They join the scheduler-only strict set (the live route fetches them non-strict; the SOURCE WORKER
+enforces the cap), so the strict-guard parity registry adds them to `SCHEDULER_V2_STRICT`. A worker-level
+regression proves an exactly-cap-sized `brand-sales:order-lines` records TRUNCATED, saves no source payload,
+writes no report snapshot, preserves last-known-good, and never blocks an unrelated report.
+
+### 59.3 Real Daily + PPC combined dispatcher integration (finding 3)
+
+The callback-only Daily+PPC test is replaced by a REAL integration: seed valid durable Daily Ads
+coverage+rows (through `makeDailyAdsContextLoader`) and valid durable PPC campaign+ASIN coverage+rows (through
+`makePpcAdsContextLoader`), run Daily Reporting + PPC in ONE dispatcher invocation, and prove BOTH snapshots
+derive + save (Daily resolves its seeded coverage to `adsAvailability.status==="validated"`; PPC folds the
+seeded campaign+ASIN rows). With the REAL loaders composed, Daily receives ONLY `adsCoverage` and PPC ONLY
+`ppcAds`; a throwing report-specific loader never suppresses its sibling; and derivation makes ZERO
+DataDoe/network calls (every DataDoe fetch is a planned report source -- the ads inputs come from the injected
+Supabase-style readers, and `runReportJobs` is handed no DataDoe transport).
+
+### 59.4 Verification (all natural, exit 0)
+
+`sync-dispatch.test.js` **37 assertions** (was 32: +2 v2-readiness lock, +2 strict/hash + truncation, and the
+callback Daily+PPC test replaced by the real routing + integration pair). `npm run test:report-derivation`
+**476** (was 471); `test:report-contracts` (161, strict-guard registry updated), `test:report-sync-controls`
+(9), `test:sync-engine` (79), `test:source-identity` (7) green; `build:check` (2,395 modules) green. Only the
+intended files changed (report-source-contracts.js, report-controls.js, sync-dispatch.js, sync-dispatch.test.js,
+report-source-contracts.test.mjs + these docs). Nothing pushed/merged/deployed/unlocked/enabled/scheduled/
+migrated. STOP for Codex re-review.

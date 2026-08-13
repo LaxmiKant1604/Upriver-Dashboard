@@ -7695,3 +7695,37 @@ drained:false + resume). `npm run test:report-derivation` **471** (was 455); `te
 `test:report-contracts` (161), `test:source-identity` (7), `test:report-sync-controls` (9) green; `build:check`
 (2,395 modules); `npm run verify` exit 0. `git diff --check` clean; only the intended files changed. STOP for
 Codex re-review.
+
+## Scheduler v2: Phase 1e re-review-2 -- three follow-up findings (SHADOW MODE, 2026-08-13)
+
+Fixed the three §58 re-review findings from base `554b859`. SCHEDULER_V2.md §59 records the details. Still
+SHADOW ONLY: no route/cron/migration/deployment/frontend wiring; nothing enabled/scheduled; Scheduler v1
+(`run-sync.js`) + `HANDOFF.md`/`.worktrees/` untouched; nothing pushed/merged/deployed/migrated.
+
+1. **Scheduler-v2 readiness separated from Scheduler v1 `enabled` (finding 1).** `reportControlCatalog.ready`
+   is derived from the v1 registry `enabled` flag, so `brand-sales` (live v1 Dashboard) read `ready:true` and a
+   MANUAL v2 request could have passed the readiness gate. Added `schedulerV2ReportControlCatalog`
+   (report-controls.js) whose `ready` comes from an EXPLICIT fail-closed allowlist
+   `SCHEDULER_V2_READY_REPORT_KEYS` (EMPTY today). The dispatcher defaults its control plane to it, so EVERY v2
+   report -- brand-sales included -- is v2-locked: a default manual OR scheduled v2 Brand Sales request spends
+   ZERO exports. `reportControlCatalog` (v1) is byte-unchanged; v1 Brand Sales behavior is untouched.
+2. **strict:true on the four new contracts (finding 2).** brand-sales:order-lines / brand-sales:catalog /
+   content-changes:events / content-changes:catalog are now strict (a cap-sized page => TRUNCATED, terminal, no
+   partial save). `strict` stays OUTSIDE sourceRequestIdentity, so request_hash is byte-unchanged (golden test).
+   The source worker enforces the cap; the strict-guard parity registry adds them to SCHEDULER_V2_STRICT. A
+   worker regression proves cap-sized => TRUNCATED, no source payload, no report snapshot, LKG preserved, and an
+   unrelated report still completes.
+3. **Real Daily+PPC combined dispatcher integration (finding 3).** Replaced the callback-only test: seed valid
+   durable Daily Ads coverage+rows (makeDailyAdsContextLoader) + valid durable PPC campaign+ASIN coverage+rows
+   (makePpcAdsContextLoader), run Daily + PPC in ONE invocation, prove BOTH derive+save (Daily
+   adsAvailability=validated; PPC folds the seeded rows), assert Daily receives ONLY adsCoverage + PPC ONLY
+   ppcAds via the REAL loaders, a throwing loader never suppresses its sibling, and derivation makes ZERO
+   DataDoe/network calls (every DataDoe fetch is a planned source; ads come from injected Supabase-style
+   readers; runReportJobs is handed no DataDoe).
+
+Verification (all natural, exit 0): `sync-dispatch.test.js` **37** (was 32); `npm run test:report-derivation`
+**476** (was 471); `test:report-contracts` (161), `test:report-sync-controls` (9), `test:sync-engine` (79),
+`test:source-identity` (7) green; `build:check` (2,395 modules) green. Only the intended files changed
+(report-source-contracts.js, report-controls.js, sync-dispatch.js, sync-dispatch.test.js,
+report-source-contracts.test.mjs + docs). Commits `6bd7e1e` (finding 2), `dbbe284` (findings 1,3), + this docs
+commit. STOP for Codex re-review.
