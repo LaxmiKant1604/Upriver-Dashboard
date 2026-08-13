@@ -8028,3 +8028,32 @@ CONFIRMED: no production connection; no Supabase writes; migration 2 UNAPPLIED; 
 remain locked (allowlist empty); no schedule; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes +
 cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md + .worktrees/ untouched. STOP
 for Codex review + explicit approval before executing Gate 1b.
+
+## Scheduler v2: Production Rollout Gate 1b EXECUTED -- migration 2 applied (2026-08-13)
+
+With explicit human approval, from `feature/scheduler-v2` @ `63c7e51`, followed SCHEDULER_V2_ROLLOUT.md Appendix
+D exactly and applied **exactly one migration this gate: `20260810_ads_sync_coverage.sql`** to production
+Supabase (POSTGRES_URL from .env.local, sslmode=no-verify, never printed). Full evidence in
+SCHEDULER_V2_ROLLOUT.md Appendix E.
+
+- Preflight: HEAD includes 63c7e51; migration-2 SHA-256 matches the frozen hash; SCHEDULER_V2_READY_REPORT_KEYS
+  length 0.
+- D.2 read-only inventory: CLEAR (ledger present; migration1_rows=1; migration2_rows=0; ads_sync_coverage table/
+  index/trigger/policy absent; prerequisites touch_updated_at()/service_role present; migration-1 objects
+  present).
+- Apply (D.3): single transaction, advisory lock (20260810,1) DISTINCT from Gate 1a's (20260807,1), required
+  migration 1 recorded exactly once, fail-closed check, plain ledger insert, commit -> APPLIED. Created table
+  ads_sync_coverage (8 cols), index ads_sync_coverage_lookup_idx, trigger ads_sync_coverage_touch_updated_at,
+  RLS enabled with zero policies.
+- W1-W11 verification (read-only, scoped to public.ads_sync_coverage): all PASS -- exact 8 columns/types/
+  nullability/defaults; PK (account_id, source_key, covered_from, covered_to); status CHECK = (status =
+  'succeeded'::text); lookup index btree (account_id, source_key, covered_from); trigger enabled BEFORE
+  UPDATE->touch_updated_at(); RLS enabled + zero policies; zero rows; migration 1 and migration 2 each exactly
+  one ledger row; no new RPC; pg_cron absent -> no schedule; migration-1 tables + RPCs present. Access model:
+  RLS + no-policy + service_role bypass (no table-ACL exclusivity asserted).
+
+CONFIRMED: exactly migration 2 applied this gate; migration 1 remains intact; migrations 3-4 UNAPPLIED;
+ads_sync_coverage has zero rows; zero DataDoe calls/exports; zero reports unlocked (allowlist empty); zero
+schedules enabled; zero sync cycles created; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes +
+cron untouched; four migration files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex review + separate approval before preparing or executing Gate 1c.

@@ -201,7 +201,7 @@ report. **Approval gate per report.**
 - [x] Gate 0 — preconditions verified (offline evidence in Appendix A, 2026-08-13).
 - Gate 1a–1d — each migration applied (one at a time):
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
-  - [ ] Gate 1b — `20260810_ads_sync_coverage.sql` — package prepared (Appendix D); **NOT executed** — awaiting separate Codex review + approval.
+  - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
   - [ ] Gate 1c — `20260810_report_sync_controls.sql` (**NOT executed**).
   - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
 - [ ] Gate 2 — post-migration verification queries pass.
@@ -806,3 +806,56 @@ exclusivity is **not** asserted here.
   the ONLY sanctioned path and it refuses a repeat — never re-run the raw SQL directly.
 - Do **NOT** proceed to Gate 1c (`20260810_report_sync_controls.sql`), migration 4, the canary, any control
   unlock, or the kickoff. Stop for review + explicit human approval.
+
+---
+
+## Appendix E — Gate 1b EXECUTION evidence (applied 2026-08-13)
+
+Executed with explicit human approval, from `feature/scheduler-v2` @ `63c7e51`, following Appendix D exactly.
+Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
+and never printed. **Exactly one migration applied in this gate: `20260810_ads_sync_coverage.sql`.**
+
+**Preflight:** HEAD includes `63c7e51`; migration-2 SHA-256 = `0750a155…d859b724` (matches the frozen hash);
+`SCHEDULER_V2_READY_REPORT_KEYS` length 0 (every v2 report still locked).
+
+**D.2 live read-only inventory (read-only transaction) — CLEAR TO APPLY:**
+- Q1 `ledger_exists:true migration1_rows:1 migration2_rows:0`.
+- Q2 `ads_sync_coverage` table NULL, `ads_sync_coverage_lookup_idx` NULL, trigger 0 rows, policies 0 rows (all
+  absent).
+- Q3 prerequisites present: `public.touch_updated_at()`, `service_role`.
+- Q4 Migration 1 objects present: `sync_cycles`, `sync_source_jobs`, `sync_report_jobs`, `open_sync_cycle`,
+  `claim_sync_cycle`, `claim_source_export_attempt`.
+
+**Apply (D.3 hardened command):** single transaction, `pg_advisory_xact_lock(20260810, 1)` (distinct from Gate
+1a) before the ledger read, `create table if not exists app_schema_migrations`, required Migration 1 recorded
+exactly once, fail-closed check (Migration 2 not previously recorded), migration body applied, **plain** ledger
+insert, commit → `APPLIED 20260810_ads_sync_coverage.sql`. No retry.
+
+**W1–W11 post-apply structural verification (read-only, scoped to `public.ads_sync_coverage`) — all PASS:**
+- W1 exactly 8 columns in order: `account_id text NOT NULL`, `source_key text NOT NULL`, `covered_from date NOT
+  NULL`, `covered_to date NOT NULL`, `status text NOT NULL default 'succeeded'::text`, `source_refreshed_at
+  timestamptz NOT NULL default now()`, `created_at timestamptz NOT NULL default now()`, `updated_at timestamptz
+  NOT NULL default now()`.
+- W2 `PRIMARY KEY (account_id, source_key, covered_from, covered_to)`.
+- W3 status CHECK = `((status = 'succeeded'::text))` — permits exactly `'succeeded'`.
+- W4 `ads_sync_coverage_lookup_idx` = `btree (account_id, source_key, covered_from)` (plus the PK unique index
+  `ads_sync_coverage_pkey`).
+- W5 trigger `ads_sync_coverage_touch_updated_at`: enabled (`O`), `BEFORE UPDATE`, `EXECUTE FUNCTION
+  touch_updated_at()`.
+- W6 RLS enabled = true; **zero policies** on the table.
+- W7 `ads_sync_coverage` row count = 0.
+- W8 ledger: `20260807_scheduler_v2.sql` = 1 row, `20260810_ads_sync_coverage.sql` = 1 row.
+- W9 no new RPC (no `ads_sync_coverage`-named function). W10 `cron.job` absent (`pg_cron` not installed) → no
+  schedule. W11 Migration 1 tables + RPCs all still present.
+
+**Access model (accurate):** `ads_sync_coverage` has RLS enabled and zero policies, so no browser role
+(`anon`/`authenticated`) can read/write its rows; the `service_role` key bypasses RLS. No table-level ACL
+exclusivity is asserted (not verified).
+
+**Post-apply invariants:** `SCHEDULER_V2_READY_REPORT_KEYS` still empty; the four migration files remain
+byte-unchanged (all seven Gate 0 hashes intact); no code changed; no DataDoe call/export; no schedule; no
+deployment/push/merge. Scheduler v1 / frontend / routes / cron untouched.
+
+**STOP.** Gate 1c (`20260810_report_sync_controls.sql`), Gate 1d (`20260811_sync_source_job_owners.sql`), the
+canary, and any control unlock remain **unapproved** — stop for Codex review and separate approval before
+preparing or executing Gate 1c.
