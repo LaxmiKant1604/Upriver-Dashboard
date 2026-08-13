@@ -594,7 +594,7 @@ test("(multi-unit, final unit truncates) an earlier unit fully drains, the final
 /* ============================= runner ============================= */
 
 async function main() {
-  ({ runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders } = await import("../lib/server/sync/scheduler-v2-dispatch.js"));
+  ({ runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders } = await import("../lib/server/sync/sync-dispatch.js"));
   ({ buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ addDaysStr, monthStartStr } = await import("../lib/server/date-windows.js"));
   void SHADOW_PLANNED_REPORT_KEYS; void STAGED_CYCLE_REPORT_KEYS;
