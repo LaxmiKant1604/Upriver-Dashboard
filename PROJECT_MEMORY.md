@@ -8269,3 +8269,44 @@ was NOT altered or rolled back; zero writes; zero DataDoe calls/exports; all con
 empty); zero schedules/cycles; no canary; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
 untouched; all seven Gate 0 hashes unchanged; no code changed; HANDOFF.md + .worktrees/ untouched. STOP for Codex
 review -- do NOT proceed to canary, control unlock, deployment, or scheduling.
+
+## Scheduler v2: Rollout Gate 5 (one-account shadow canary) PREPARED (offline; NOT executed) (2026-08-13)
+
+Gate 2 approved. Offline/docs-only preparation of the Gate 5 one-account shadow canary against the CURRENT
+runtime APIs; NOT executed, no production connection. Full package in SCHEDULER_V2_ROLLOUT.md Appendix L.
+
+- Verified current runtime API (read from code, not invented): buildSchedulerV2Runtime(overrides) accepts
+  connections / controlCatalog / fetchAccounts / saveSnapshot (default makeShadowSnapshotSaver -> writes ONLY
+  under scheduler-v2/<reportKey>); rt.run(sliceArgs) operational allowlist = bucket, cycleDate, asOf, asOfFor,
+  manualReportKeys, clock, deadlineMs, reserveMs, maxJobs, scheduledAt, trigger; the dispatcher rollup returns
+  { cycleId, selected, accountsDispatched, spent(create-exports), maxJobs, drained, continuationRequired,
+  perUnit, reports }. brand-sales sources = order-line-items + product-catalog; product-catalog LIVE short id
+  68d2de238e (long id ...507b0bafb...17a8 is the obsolete DataDoe-404 alias, never used). shadow key =
+  scheduler-v2/brand-sales; account shape { id, name, country, countryName, currency, locale, timeZone };
+  bucketForCountry from lib/server/sync/registry.js.
+- Canary package (Appendix L): ONE primary account, ONE report brand-sales, only if the account has (1) a
+  current production brand-sales snapshot and (2) confirmed product-catalog 68d2de238e usable rows -- else STOP
+  (no obsolete id, no fallback, no other report/account). Control isolation: NO edit to
+  SCHEDULER_V2_READY_REPORT_KEYS or report_sync_settings; instance-scoped controlCatalog:()=>[{reportKey:
+  'brand-sales', ready:true, scheduleEnabled:false}]; manualReportKeys:['brand-sales']; connections primary-only
+  (fail closed unless exactly one); injected fetchAccounts calls current discovery, filters to the exact account
+  id, fails closed unless exactly one match; never fabricate an account or route dd-secondary through primary.
+  Budget maxJobs=2 + explicit deadlineMs/reserveMs; bounded continuation on SAME (bucket,cycleDate); <=2
+  create-exports total and <=1 per request_hash (DB one_attempt guard); cached sources may reduce below 2; stop
+  on any third export. Before-canary read-only evidence (preflight ready:true/blockers:[]; 13 controls paused;
+  allowlist empty; 5 v2 tables empty; no cron; record account id/scope/country/bucket/currency/asOf/cycleDate +
+  why product-catalog usable; capture existing production brand-sales snapshot identity/hash/updated_at/latest
+  data date + a payload-free production fingerprint, no secrets). Execution script uses the exact current API,
+  loads secrets only from untracked env (never printed), writes snapshots ONLY via makeShadowSnapshotSaver under
+  scheduler-v2/brand-sales, runs no route/cron/frontend/deploy/schedule. Post-canary read-only checks (exactly
+  one sync_cycles row; only the selected account in source/report/owner rows; <=2 source jobs / <=1 export per
+  hash; owner rows active + connection_id='primary' + selected account; exactly one scheduler-v2/brand-sales
+  snapshot on success; production fingerprint unchanged; no dd-secondary/unsafe error/truncation/cross-account;
+  record shadow status/latestDataDate/source hashes/export count/safe error codes only). L.7 STOP conditions
+  cover every mismatch; no repair/backfill/delete; ASIN-brand gap-fill out of scope.
+
+CONFIRMED: no production connection; no Supabase writes; no DataDoe call/export; no canary executed; controls
+paused and locked (allowlist empty); zero schedules/cycles; migrations 1-4 unchanged (all 7 Gate 0 hashes
+intact); no runtime code changed; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
+untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex review + explicit approval before any live DataDoe
+or Supabase activity (Gate 5 execution).
