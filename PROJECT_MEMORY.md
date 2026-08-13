@@ -7729,3 +7729,43 @@ Verification (all natural, exit 0): `sync-dispatch.test.js` **37** (was 32); `np
 (report-source-contracts.js, report-controls.js, sync-dispatch.js, sync-dispatch.test.js,
 report-source-contracts.test.mjs + docs). Commits `6bd7e1e` (finding 2), `dbbe284` (findings 1,3), + this docs
 commit. STOP for Codex re-review.
+
+## Scheduler v2: Phase 1f -- production runtime composition + migration readiness (SHADOW MODE, 2026-08-13)
+
+Started Phase 1f from approved base `1b559ab`. PRODUCTION RUNTIME COMPOSITION + MIGRATION READINESS, purely
+additive + SHADOW ONLY: no route/cron/deployment/migration-application/live-DataDoe-export/control-unlock/
+frontend. SCHEDULER_V2.md s60 records the details. Two new lib modules + one offline test + a plan-only runbook;
+NO existing sync module was modified.
+
+1. **runtime-composition.js.** `buildSchedulerV2Runtime(overrides)` wires runSchedulerV2Shadow's collaborators
+   from the existing primitives (makeSupabaseSourceStore, makeSupabaseReportStore,
+   makeDataDoeAdapter(getDataDoeConnections()), makeSourceRowLoader cache-only, makeShadowSnapshotSaver
+   scheduler-v2/* namespaced, the Daily Ads coverage loader, the PPC persisted-Ads readers, dynamic discovery).
+   Construction is ZERO-I/O; control plane defaults to the fail-closed schedulerV2ReportControlCatalog; every
+   primitive injectable. `combineStores` merges the SOURCE + REPORT store interfaces explicitly and FAILS
+   CLOSED on a non-shared method-name conflict (only listSourceJobs overlaps -- identical getSyncSourceJobs).
+   `makeProductionDiscoverAccounts` gives dynamic primary-only discovery that fails closed on error before any
+   source export. `schedulerV2Preflight` validates env/connection/wrappers/tables+RPC/migration-readiness/
+   v2-locked with ZERO exports + ZERO writes and typed SAFE blockers only (no api key / raw error).
+2. **schema-contract.js.** `SCHEDULER_V2_SCHEMA_CONTRACT` = the compatibility matrix (each unapplied migration
+   -> tables/RPCs/columns/unique-constraints -> calling wrappers) for 20260807_scheduler_v2.sql,
+   20260810_ads_sync_coverage.sql, 20260810_report_sync_controls.sql (table report_sync_settings),
+   20260811_sync_source_job_owners.sql. `auditSchemaContract({readFile})` STATICALLY proves the migration SQL
+   and supabase.js wrappers agree; missing/renamed/mismatched => typed fail-closed blocker. Audit passes on the
+   real migrations; NO migration was modified or applied (none needed a correction).
+3. **sync-runtime-composition.test.js (13 offline tests).** zero-I/O construction; combined store exposes every
+   source+report method + fail-closed conflict; preflight zero exports/writes + typed safe blockers; audit
+   passes on real migrations + fails closed on drift; default v2 controls dispatch zero; injected ready control
+   drives one complete shadow cycle (scheduler-v2/* namespaced, cache-only derive, zero DataDoe in derive); new
+   primary auto-discovered; dormant dd-secondary spends zero exports; discovery failure fails closed; no secret/
+   raw error in telemetry. Wired into `npm run verify`.
+4. **SCHEDULER_V2_ROLLOUT.md (plan only, not executed).** Approval-gated migration order, verification queries,
+   token budget, LKG checks, one-account shadow canary, parity/reconciliation gates, per-report unlock,
+   rollback/stop conditions, explicit per-step approval.
+
+Verification: `sync-runtime-composition.test.js` **13**; `npm run test:report-derivation` **489** (was 476);
+`build:check` (2,395 modules) green. Only additive files changed. Commits `8443e49` (composition+audit+tests),
+`c0f2ba9` (runbook), + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated; no live DataDoe
+call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; the Product Catalog
+incremental ASIN-brand gap-fill is NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
+senior review.
