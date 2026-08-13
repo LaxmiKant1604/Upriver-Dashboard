@@ -3878,3 +3878,39 @@ runtime-composition.js, sync-runtime-composition.test.js) + these docs. Nothing 
 migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2
 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched.
 STOP for Codex re-review.
+
+## 63. Phase 1f re-review-3 -- exact CHECK semantics + SQL-aware lexing in the audit (SHADOW MODE, 2026-08-13)
+
+The migration audit's substring `must` CHECK validation was insufficient: it still passed when the one-attempt
+`AND` became `OR`, `connection_id` permitted an extra value (`'evil'`), the owner identity `AND` became `OR`, or
+a real `ADD CONSTRAINT` was removed and its full text survived ONLY inside a quoted SQL string. Fixed in
+`schema-contract.js` (one module + its test); still SHADOW ONLY.
+
+### 63.1 SQL-aware lexer
+
+`lexSql(sql)` produces two length-aligned views: `clean` (comments blanked, string/dollar contents PRESERVED)
+and `masked` (comments AND every quoted/dollar-quoted STRING blanked -- but dollar-quoted CODE bodies, a
+`$tag$...$tag$` preceded by `do`/`as`, are KEPT with their inner single-quoted strings still blanked, so a real
+`ALTER ... ADD CONSTRAINT` inside a DO block is discovered while `add constraint ...` text living only inside a
+quoted string is not). ALL structural discovery (CREATE TABLE, ALTER/DROP CONSTRAINT, RPC, table, constraint)
+runs on `masked`; a structurally-located CHECK body is read from `clean` so its real string values survive.
+
+### 63.2 Exact CHECK expression comparison
+
+The three critical CHECKs are now validated by an EXACT canonical token comparison (`tokenizeSql`), proving
+exactly: `sync_source_jobs_one_attempt` = `(create_export_count = 0 and attempted_at is null) or
+(create_export_count = 1 and attempted_at is not null)`; `connection_id in ('primary', 'dd-secondary')` and no
+other value; every owner identity field non-empty joined with `and`. AND<->OR, an operand/operator reorder, an
+extra clause, or an extra IN value all change the token list and FAIL. Exact UNIQUE + FK checks + table-scoped
+named-constraint discovery are preserved; blockers stay typed, total, and admin-safe.
+
+### 63.3 Verification
+
+`sync-runtime-composition.test.js` **22** (was 21: +the exact-CHECK/quoted-SQL blocker regression covering all
+four mutations + operand reorder + extra clause + single-quoted AND dollar-quoted quoted-only ADD CONSTRAINT;
+canonical migrations still pass). `npm run test:report-derivation` **498** (was 497); `sync-dispatch.test.js`
+37; `test:report-contracts` (161), `test:report-sync-controls` (9) green; `build:check` green; `git diff
+--check` clean. Only 2 files changed (schema-contract.js, sync-runtime-composition.test.js) + these docs.
+Nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend +
+routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started;
+HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review.

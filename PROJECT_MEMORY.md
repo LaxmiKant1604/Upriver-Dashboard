@@ -7833,3 +7833,28 @@ sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-control
 commit. CONFIRMED: nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler
 v1 + frontend + routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill
 NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex re-review.
+
+## Scheduler v2: Phase 1f re-review-3 -- exact CHECK semantics + SQL-aware audit (SHADOW MODE, 2026-08-13)
+
+Fixed the remaining Phase 1f audit blocker from base `4ede5dc`. SCHEDULER_V2.md s63 has details. One module
+(`schema-contract.js`) + its test; still SHADOW ONLY.
+
+The audit's substring `must` CHECK checks passed even when the one-attempt AND became OR, connection_id gained
+an extra value ('evil'), the owner identity AND became OR, or a real ADD CONSTRAINT was removed and its text
+survived only inside a quoted SQL string. Fix:
+- `lexSql` produces length-aligned `clean` (comments blanked, strings preserved) + `masked` (comments AND
+  quoted/dollar STRING contents blanked; dollar-quoted CODE bodies -- `$$` after do/as -- kept with inner
+  strings still blanked so a DO-block ALTER ADD CONSTRAINT is still discovered). ALL structural discovery runs
+  on `masked`; a located CHECK body is read from `clean` (real string values).
+- The three critical CHECKs are validated by EXACT canonical token comparison (tokenizeSql): one-attempt =
+  (count=0 AND attempted_at IS NULL) OR (count=1 AND attempted_at IS NOT NULL); connection_id IN
+  ('primary','dd-secondary') exactly; every owner identity field non-empty joined with AND. AND<->OR, operand/
+  operator reorder, extra clause, or extra IN value now fail. Exact UNIQUE + FK + table-scoped named-constraint
+  checks preserved; blockers typed/total/admin-safe.
+
+Verification: sync-runtime-composition.test.js **22** (was 21); test:report-derivation **498** (was 497);
+sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-controls (9) green; build:check green;
+git diff --check clean. Commit `02d7c63` (audit correction + tests) + this docs commit. CONFIRMED: nothing
+pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes +
+cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
+.worktrees/ untouched/untracked. STOP for Codex re-review.
