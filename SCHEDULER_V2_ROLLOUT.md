@@ -1,10 +1,14 @@
 # Scheduler v2 — Production Rollout Runbook (Phase 1f)
 
-**Status: PLAN ONLY. Nothing in this runbook has been executed.** Scheduler v2 is in SHADOW MODE: no route,
-cron, deployment, migration application, live DataDoe export, control unlock, or frontend change has been made.
-Every live step below is **gated on explicit human approval** and must be run one step at a time, pausing for
-sign-off before the next. This document is the plan Codex senior review evaluates; it does not authorize any
-step by itself.
+**Status (2026-08-13): Migrations 1–4 have been APPLIED and VERIFIED in production** (Gate 1a–1d — evidence in
+Appendices C, E, G, I). Scheduler v2 otherwise remains in SHADOW MODE and fully closed: it is **locked** (the
+code readiness allowlist `SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable
+`report_sync_settings` rows have `schedule_enabled=false`), **undeployed**, **unscheduled** (no `pg_cron`/`pg_net`
+kickoff applied), and has made **zero DataDoe exports** — every Scheduler-v2 table is empty. No route, deployment,
+live DataDoe export, control unlock, or frontend change has been made. Every remaining live step (Gate 2
+verification onward) is **gated on explicit human approval** and must be run one step at a time, pausing for
+sign-off before the next. This document is the plan Codex senior review evaluates; it does not authorize any step
+by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
 `sales-dashboard-live/lib/server/sync/runtime-composition.js`; the migration↔wrapper compatibility matrix it
@@ -204,7 +208,7 @@ report. **Approval gate per report.**
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
   - [x] **Gate 1c — `20260810_report_sync_controls.sql` applied 2026-08-13** (execution evidence in Appendix G; F.2 clear, X1–X11 all pass).
   - [x] **Gate 1d — `20260811_sync_source_job_owners.sql` applied 2026-08-13** (fresh path / Branch A; execution evidence in Appendix I; H.2 clear, Y1–Y12 all pass).
-- [ ] Gate 2 — post-migration verification queries pass.
+- [ ] Gate 2 — post-migration verification queries pass — package prepared (Appendix J); **NOT executed** — read-only re-verification of migrations 1–4, awaiting explicit approval before any production connection.
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
@@ -556,8 +560,9 @@ Then re-run `schedulerV2Preflight(...)` (still offline/read-only against the com
 ## Appendix C — Gate 1a EXECUTION evidence (applied 2026-08-13)
 
 Executed with explicit human approval, from `feature/scheduler-v2` @ `2b6a27e`, following Appendix B exactly.
-Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) — the connection string
-was loaded from `.env.local` and never printed. **Exactly one migration applied: `20260807_scheduler_v2.sql`.**
+Connected to production Supabase over the configured `POSTGRES_URL` (`sslmode=no-verify`) loaded from untracked
+`.env.local` and never printed (the connection string is NOT committed to the repository). **Exactly one
+migration applied: `20260807_scheduler_v2.sql`.**
 
 **Preflight:** HEAD includes `2b6a27e`; migration-1 SHA-256 = `1328bc0f…1bdc691e` (matches the frozen hash);
 `SCHEDULER_V2_READY_REPORT_KEYS` length 0 (every v2 report still locked).
@@ -812,8 +817,8 @@ exclusivity is **not** asserted here.
 ## Appendix E — Gate 1b EXECUTION evidence (applied 2026-08-13)
 
 Executed with explicit human approval, from `feature/scheduler-v2` @ `63c7e51`, following Appendix D exactly.
-Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
-and never printed. **Exactly one migration applied in this gate: `20260810_ads_sync_coverage.sql`.**
+Connected to production Supabase over the configured `POSTGRES_URL` (`sslmode=no-verify`) loaded from untracked
+`.env.local` and never printed (the connection string is NOT committed to the repository). **Exactly one migration applied in this gate: `20260810_ads_sync_coverage.sql`.**
 
 **Preflight:** HEAD includes `63c7e51`; migration-2 SHA-256 = `0750a155…d859b724` (matches the frozen hash);
 `SCHEDULER_V2_READY_REPORT_KEYS` length 0 (every v2 report still locked).
@@ -1082,8 +1087,8 @@ open — seeding the paused rows here opens neither.
 ## Appendix G — Gate 1c EXECUTION evidence (applied 2026-08-13)
 
 Executed with explicit human approval, from `feature/scheduler-v2` @ `0f34038`, following Appendix F exactly.
-Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
-and never printed. **Exactly one migration applied in this gate: `20260810_report_sync_controls.sql`.**
+Connected to production Supabase over the configured `POSTGRES_URL` (`sslmode=no-verify`) loaded from untracked
+`.env.local` and never printed (the connection string is NOT committed to the repository). **Exactly one migration applied in this gate: `20260810_report_sync_controls.sql`.**
 
 **Preflight:** HEAD includes `0f34038`; migration-3 SHA-256 = `544557fb…0938bea4c` (matches the frozen hash);
 `SCHEDULER_V2_READY_REPORT_KEYS` length 0.
@@ -1423,8 +1428,8 @@ select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no sc
 ## Appendix I — Gate 1d EXECUTION evidence (applied 2026-08-13)
 
 Executed with explicit human approval, from `feature/scheduler-v2` @ `9250663`, following Appendix H exactly.
-Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
-and never printed. **Exactly one migration applied in this gate: `20260811_sync_source_job_owners.sql` — via the
+Connected to production Supabase over the configured `POSTGRES_URL` (`sslmode=no-verify`) loaded from untracked
+`.env.local` and never printed (the connection string is NOT committed to the repository). **Exactly one migration applied in this gate: `20260811_sync_source_job_owners.sql` — via the
 FRESH path (Branch A).**
 
 **Preflight:** HEAD includes `9250663`; migration-4 SHA-256 = `49628c8d…54d98669` (matches the frozen hash);
@@ -1475,3 +1480,160 @@ cron untouched.
 
 **Migrations 1–4 are now applied.** **STOP** — do not proceed to Gate 2, canary execution, deployment, any
 control unlock, or scheduling. Stop for Codex review.
+
+---
+
+## Appendix J — Gate 2 package: read-only re-verification of migrations 1–4 (PREPARED — NOT executed)
+
+> **NOTHING in this appendix has been run.** It is the exact **read-only** package a reviewer/operator executes
+> **after written approval** to re-confirm that the applied schema (migrations 1–4) still matches the contract.
+> It performs **zero writes, zero DataDoe calls/exports, and no control/schedule change** — run it entirely
+> inside a read-only transaction (`begin; set transaction read only; … ; rollback;`). It only reads catalogs +
+> the empty Scheduler-v2 tables. Do **NOT** prepare or run the canary, unlock controls, deploy, push, merge,
+> schedule, or call DataDoe from this gate.
+
+This consolidates and **MUST reproduce every pass** already recorded per migration — V1–V11 (Appendix B.4),
+W1–W11 (Appendix D.4), X1–X11 (Appendix F.4), Y1–Y12 (Appendix H.4) — using **public-scoped** catalog queries
+(exact `public.<rel>::regclass` / `regprocedure` OIDs, or `nspname='public'`). Those per-migration blocks remain
+the authoritative per-object expectations (exact column lists, CHECK bodies, index/trigger/policy definitions);
+G3–G9 below re-read the same objects across all four migrations at once.
+
+### J.1 Cross-cutting read-only verification (run in a read-only transaction)
+
+```sql
+-- G1) all SIX Scheduler-v2 tables present (expect all six non-NULL)
+select to_regclass('public.sync_cycles') a, to_regclass('public.sync_source_jobs') b,
+       to_regclass('public.sync_report_jobs') c, to_regclass('public.ads_sync_coverage') d,
+       to_regclass('public.report_sync_settings') e, to_regclass('public.sync_source_job_owners') f;
+
+-- G2) the FOUR migration ledger rows, each EXACTLY once (expect 4 rows, each n=1)
+select filename, count(*) as n from public.app_schema_migrations
+ where filename in ('20260807_scheduler_v2.sql','20260810_ads_sync_coverage.sql',
+                    '20260810_report_sync_controls.sql','20260811_sync_source_job_owners.sql')
+ group by filename order by filename;
+
+-- G3) exact columns for every table (compare each block to the expected shapes in V1/W1/X1/Y1)
+select table_name, ordinal_position, column_name, data_type, is_nullable, column_default
+  from information_schema.columns
+ where table_schema='public' and table_name in
+   ('sync_cycles','sync_source_jobs','sync_report_jobs','ads_sync_coverage','report_sync_settings','sync_source_job_owners')
+ order by table_name, ordinal_position;
+-- expect column counts: sync_cycles 18, sync_source_jobs 27, sync_report_jobs 25, ads_sync_coverage 8,
+--   report_sync_settings 4, sync_source_job_owners 15.
+
+-- G4) every NAMED constraint on the six tables, scoped by exact public relation OIDs (pg_get_constraintdef)
+select rel.relname as table_name, con.conname, con.contype, pg_get_constraintdef(con.oid) as def
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where con.conrelid in ('public.sync_cycles'::regclass,'public.sync_source_jobs'::regclass,
+   'public.sync_report_jobs'::regclass,'public.ads_sync_coverage'::regclass,
+   'public.report_sync_settings'::regclass,'public.sync_source_job_owners'::regclass)
+ order by rel.relname, con.contype, con.conname;
+-- MUST reproduce every constraint asserted in V2/V3, W2/W3, X2/X3/X4, Y2–Y5: PKs; uniques
+--   (sync_cycles_bucket_date_unique, sync_source_jobs_cycle_hash_unique, sync_report_jobs_cycle_report_account_unique,
+--    sync_source_job_owners_unique); FKs with ON DELETE (sync_source_jobs.cycle_id & sync_report_jobs.cycle_id &
+--    sync_source_job_owners.cycle_id -> sync_cycles(id) CASCADE; sync_source_job_owners_source_fk (cycle_id,
+--    request_hash) -> sync_source_jobs CASCADE; sync_cycles.created_by -> auth.users(id) SET NULL); CHECKs
+--   (sync_source_jobs_one_attempt; report_sync_settings_key_nonempty; ads_sync_coverage status='succeeded';
+--    sync_source_job_owners owner_status active|stale, connection_id primary|dd-secondary, identity_nonempty).
+
+-- G5) all indexes on the six tables (the explicit indexes + each PK/unique index; no unexpected extras)
+select tablename, indexname, indexdef from pg_indexes where schemaname='public'
+ and tablename in ('sync_cycles','sync_source_jobs','sync_report_jobs','ads_sync_coverage','report_sync_settings','sync_source_job_owners')
+ order by tablename, indexname;
+
+-- G6) all USER triggers on the six tables (each enabled 'O', BEFORE UPDATE, EXECUTE FUNCTION touch_updated_at())
+select rel.relname as table_name, tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) as def
+  from pg_trigger tg join pg_class rel on rel.oid=tg.tgrelid
+ where tg.tgrelid in ('public.sync_cycles'::regclass,'public.sync_source_jobs'::regclass,
+   'public.sync_report_jobs'::regclass,'public.ads_sync_coverage'::regclass,
+   'public.report_sync_settings'::regclass,'public.sync_source_job_owners'::regclass)
+   and not tg.tgisinternal
+ order by rel.relname;
+-- expect the five touch triggers (sync_cycles_touch, sync_source_jobs_touch, sync_report_jobs_touch,
+--   ads_sync_coverage_touch_updated_at, sync_source_job_owners_touch); report_sync_settings has NO trigger (X6).
+
+-- G7) RLS enabled on ALL six tables (expect relrowsecurity=true for all six)
+select rel.relname, rel.relrowsecurity from pg_class rel
+ where rel.oid in ('public.sync_cycles'::regclass,'public.sync_source_jobs'::regclass,
+   'public.sync_report_jobs'::regclass,'public.ads_sync_coverage'::regclass,
+   'public.report_sync_settings'::regclass,'public.sync_source_job_owners'::regclass)
+ order by rel.relname;
+
+-- G8) all policies on the six tables (SELECT / authenticated / is_dashboard_admin() / no WITH CHECK)
+select rel.relname as table_name, pol.polname, pol.polcmd,
+       (select string_agg(rolname, ',' order by rolname) from pg_roles where oid = any(pol.polroles)) as roles,
+       pg_get_expr(pol.polqual, pol.polrelid) as using_qual, pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check
+  from pg_policy pol join pg_class rel on rel.oid=pol.polrelid
+ where pol.polrelid in ('public.sync_cycles'::regclass,'public.sync_source_jobs'::regclass,
+   'public.sync_report_jobs'::regclass,'public.ads_sync_coverage'::regclass,
+   'public.report_sync_settings'::regclass,'public.sync_source_job_owners'::regclass)
+ order by rel.relname;
+-- expect EXACTLY 5 policies (sync_cycles, sync_source_jobs, sync_report_jobs, report_sync_settings,
+--   sync_source_job_owners) each polcmd='r', roles='authenticated', using='is_dashboard_admin()', with_check NULL.
+--   ads_sync_coverage has ZERO policies (W6) -- RLS on + no policy (service_role bypass).
+
+-- G9a) the three RPCs: exact identity args, return, SECURITY DEFINER, search_path (via exact regprocedure OIDs)
+select p.proname, pg_get_function_identity_arguments(p.oid) as args, pg_get_function_result(p.oid) as ret,
+       p.prosecdef as security_definer, p.proconfig as config
+  from pg_proc p
+ where p.oid in ('public.open_sync_cycle(text, date, timestamptz, text)'::regprocedure,
+   'public.claim_sync_cycle(uuid)'::regprocedure,
+   'public.claim_source_export_attempt(uuid, text)'::regprocedure)
+ order by p.proname;
+-- expect exactly the V7 identities/returns; prosecdef=true; proconfig contains 'search_path=public'.
+
+-- G9b) RPC EXECUTE ACL: owner + service_role only; PUBLIC/anon/authenticated MUST NOT execute (expect 0 rows)
+select p.proname, (case when a.grantee=0 then 'PUBLIC' else r.rolname end) as bad_grantee
+  from pg_proc p cross join lateral aclexplode(p.proacl) a left join pg_roles r on r.oid=a.grantee
+ where p.oid in ('public.open_sync_cycle(text, date, timestamptz, text)'::regprocedure,
+   'public.claim_sync_cycle(uuid)'::regprocedure,'public.claim_source_export_attempt(uuid, text)'::regprocedure)
+   and a.privilege_type='EXECUTE' and (a.grantee=0 or r.rolname in ('anon','authenticated'));
+-- and service_role HAS execute on all three (expect 3 rows):
+select p.proname from pg_proc p cross join lateral aclexplode(p.proacl) a join pg_roles r on r.oid=a.grantee
+ where p.oid in ('public.open_sync_cycle(text, date, timestamptz, text)'::regprocedure,
+   'public.claim_sync_cycle(uuid)'::regprocedure,'public.claim_source_export_attempt(uuid, text)'::regprocedure)
+   and a.privilege_type='EXECUTE' and r.rolname='service_role';
+
+-- G10) every Scheduler-v2 DATA table is EMPTY (expect 0 for all five)
+select (select count(*) from public.sync_cycles) as sync_cycles,
+       (select count(*) from public.sync_source_jobs) as sync_source_jobs,
+       (select count(*) from public.sync_report_jobs) as sync_report_jobs,
+       (select count(*) from public.sync_source_job_owners) as sync_source_job_owners,
+       (select count(*) from public.ads_sync_coverage) as ads_sync_coverage;
+
+-- G11) exactly 13 report controls, all paused, no duplicate keys
+select count(*) as total, count(*) filter (where schedule_enabled) as enabled, count(distinct report_key) as distinct_keys
+  from public.report_sync_settings;  -- expect total=13, enabled=0, distinct_keys=13
+
+-- G12) exactly the three expected RPCs exist; no cron/schedule
+select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public' and proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt') order by proname;  -- expect these 3
+select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no schedule; else run the next line
+-- select jobid, jobname, schedule from cron.job where jobname ilike '%sync%' or command ilike '%sync%';  -- expect 0 rows
+```
+
+### J.2 Offline checks (no production connection)
+
+- Re-run the **offline** `schedulerV2Preflight(...)` against the **committed** migrations + `supabase.js`
+  wrappers (the same static audit as Gate 0, Appendix A): require `ready:true` and `blockers:[]`. This reads
+  files only — no database, no DataDoe, no secret.
+- Confirm `SCHEDULER_V2_READY_REPORT_KEYS` is still `Object.freeze([])` (empty). Both gates remain closed: the
+  durable controls are paused (G11) **and** the code allowlist is empty.
+
+### J.3 STOP conditions (Gate 2)
+
+**STOP (report; make NO change) if:** any of the six tables is absent (G1); any ledger filename ≠ exactly one row
+(G2); any table's column set / type / nullability / default differs from V1/W1/X1/Y1 or the counts ≠
+18/27/25/8/4/15 (G3); any named constraint is missing / renamed / redefined vs V2-3 / W2-3 / X2-4 / Y2-5 (G4);
+any expected index missing or an unexpected extra index present (G5); any touch trigger missing / disabled / not
+`BEFORE UPDATE` / not `touch_updated_at()`, or a trigger present on `report_sync_settings` (G6); any table's RLS
+not enabled (G7); ≠ 5 policies, or any policy not SELECT / not authenticated-only / missing `is_dashboard_admin()`
+/ with a WITH CHECK, or any policy on `ads_sync_coverage` (G8); any RPC identity / return / `security_definer` /
+`search_path=public` mismatch (G9a); **any** row from the forbidden-grantee ACL query or fewer than 3 service_role
+rows (G9b); any of the five data tables non-empty (G10); ≠ 13 paused controls or a duplicate key (G11); the RPC
+set ≠ exactly the three, or any `cron.job` sync entry (G12); the offline preflight not `ready:true` with
+`blockers:[]`, or `SCHEDULER_V2_READY_REPORT_KEYS` non-empty (J.2).
+- Gate 2 makes **no** repair, write, schema change, or DataDoe call. A mismatch is investigated separately; the
+  applied schema is **not** altered or rolled back.
+- Do **NOT** proceed to the canary (Gate 5), any control unlock (Gate 7), deployment, push, merge, or the
+  `pg_cron` kickoff. Stop for Codex review + explicit human approval.

@@ -8206,3 +8206,31 @@ durable controls all paused; SCHEDULER_V2_READY_REPORT_KEYS empty; no cron/sched
 zero sync cycles; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; four
 migration files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched. STOP
 for Codex review -- do NOT proceed to Gate 2, canary, deployment, control unlock, or scheduling.
+
+## Scheduler v2: Rollout Gate 2 PREPARED + doc corrections (offline; not executed) (2026-08-13)
+
+Gate 1d approved. Offline/docs-only preparation of Gate 2 (read-only re-verification of migrations 1-4); NOT
+executed, no production connection. Full package in SCHEDULER_V2_ROLLOUT.md Appendix J.
+
+- Doc corrections: (1) runbook top status now says migrations 1-4 APPLIED and VERIFIED while Scheduler v2 remains
+  locked (allowlist empty), paused (13 controls schedule_enabled=false), undeployed, unscheduled (no pg_cron
+  kickoff), and zero DataDoe exports (all v2 tables empty). (2) Replaced every "committed POSTGRES_URL" (App
+  C/E/G/I) with "configured POSTGRES_URL loaded from untracked .env.local ... NOT committed to the repository" --
+  never implies the production connection string is committed.
+- Gate 2 package (Appendix J): READ-ONLY production re-verification (run inside a read-only transaction; zero
+  writes, zero DataDoe). G1 six tables present; G2 four ledger rows each exactly once; G3 exact columns per table
+  (counts 18/27/25/8/4/15); G4 all named constraints via pg_get_constraintdef scoped by exact public relation
+  OIDs (reproduces V2-3/W2-3/X2-4/Y2-5); G5 all indexes; G6 all user triggers (5 touch triggers; none on
+  report_sync_settings); G7 RLS on all six; G8 exactly 5 SELECT/authenticated/is_dashboard_admin()/no-WITH-CHECK
+  policies (ads_sync_coverage has zero); G9a/b RPC identities + SECURITY DEFINER + search_path=public + ACL
+  (owner+service_role only; PUBLIC/anon/authenticated forbidden); G10 all five data tables empty; G11 exactly 13
+  paused controls; G12 exactly the 3 RPCs + no cron. J.2 offline: schedulerV2Preflight ready:true/blockers:[]
+  against committed migrations+wrappers, SCHEDULER_V2_READY_REPORT_KEYS empty. J.3 explicit STOP for every
+  mismatch; no repair/write/schema-change/rollback; do not proceed to canary/unlock/deploy/schedule.
+- All Gate 2 catalog queries are public-scoped (public.<rel>::regclass / regprocedure OIDs, or nspname='public').
+
+CONFIRMED: no production connection; no Supabase writes; migrations 1-4 remain applied+verified (schema NOT
+altered/rolled back); zero DataDoe calls; all controls paused and locked (allowlist empty); zero schedules/cycles;
+nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; all seven Gate 0 hashes
+unchanged; docs-only change; HANDOFF.md + .worktrees/ untouched. STOP for Codex review + explicit approval before
+any production connection (Gate 2 execution).
