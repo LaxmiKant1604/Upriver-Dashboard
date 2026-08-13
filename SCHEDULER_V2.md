@@ -3914,3 +3914,43 @@ canonical migrations still pass). `npm run test:report-derivation` **498** (was 
 Nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend +
 routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started;
 HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review.
+
+## 64. Phase 1f re-review-4 -- scope FK REFERENCES + prove wrapper/endpoint evidence from real JS (SHADOW MODE, 2026-08-13)
+
+Two remaining Codex blockers were EVIDENCE-FORGERY gaps in the static migration<->wrapper audit: a mismatched
+schema could pass VACUOUSLY. Fixed in `schema-contract.js` (one module + its test); still SHADOW ONLY.
+
+### 64.1 FK REFERENCES scoped to its own declaration (blocker 1)
+
+`constraintDeclAt` bounded the named constraint + FK columns to `[from,to)` but then scanned the REST of the
+file for `references public.<t>(...)`. So an FK whose own REFERENCES clause was removed could still be "proven"
+by a later/unrelated FK to the same target. Now the REFERENCES match AND its referenced-column balanced range
+must BOTH lie inside the same bounded CREATE-body / ALTER statement (`rm.index < to` and `refRange.close < to`);
+otherwise the target is unproven and the audit reports `NAMED_CONSTRAINT_MISSING`. The canonical inline and
+ALTER-ADD forms are preserved.
+
+### 64.2 Wrapper/endpoint evidence proven from real JavaScript (blocker 2)
+
+`wrapperExported` / `sourceReferencesTable` / `sourceReferencesRpc` scanned RAW source, so a comment, an
+ordinary string, template-string text, or a regex literal shaped like `export async function <name>(` (or an
+endpoint URL living only in a comment) satisfied the check. A JS-aware lexer `lexJs(source)` now produces two
+views: `code` (comments removed AND string / template-text / regex-literal CONTENT blanked) drives structural
+export checks, so `export async function <name>(` matches ONLY a genuine top-level declaration; `text` (comments
+blanked, string/template literal CONTENTS kept, regex blanked) drives endpoint checks, so a `/rest/v1/...`
+endpoint counts only from a real literal, never a comment. Template `${...}` interpolations are lexed as real
+code (regex / string / nested-template aware), so a regex containing a quote INSIDE an interpolation (e.g.
+`.replace(/"/g, '""')`) no longer desyncs the lexer into masking a later real export.
+
+### 64.3 Verification
+
+`sync-runtime-composition.test.js` **24** (was 22: +the FK-out-of-scope regression -- real REFERENCES removed +
+an unrelated later FK to the same target => `NAMED_CONSTRAINT_MISSING` for `sync_source_job_owners_source_fk`;
++the blocker-2 regression -- line/block comment, quoted string, template text, and regex fake exports never
+satisfy an export, a commented endpoint never satisfies a reference, a removed real wrapper =>
+`REQUIRED_WRAPPER_MISSING` (named); canonical passes). `npm run test:report-derivation` **500** (was 498);
+`sync-dispatch.test.js` 37; `test:report-contracts` (161), `test:report-sync-controls` (9),
+`test:source-identity` (7), `test:sync-engine` green; `build:check` green (dashboard bundle intact); `git diff
+--check` clean. Only 2 files changed (schema-contract.js, sync-runtime-composition.test.js) + these docs.
+Nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend +
+routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started;
+HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review.

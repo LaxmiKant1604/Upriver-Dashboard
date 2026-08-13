@@ -7858,3 +7858,32 @@ git diff --check clean. Commit `02d7c63` (audit correction + tests) + this docs 
 pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes +
 cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
 .worktrees/ untouched/untracked. STOP for Codex re-review.
+
+## Scheduler v2: Phase 1f re-review-4 -- scope FK REFERENCES + real-JS wrapper/endpoint evidence (SHADOW MODE, 2026-08-13)
+
+Fixed the two remaining Phase 1f audit blockers from base `7984708`. SCHEDULER_V2.md s64 has details. One
+module (`schema-contract.js`) + its test; still SHADOW ONLY. Both were EVIDENCE-FORGERY gaps: a mismatched
+schema could pass VACUOUSLY.
+
+- **Blocker 1 -- FK REFERENCES scoped to its declaration.** constraintDeclAt bounded the constraint + FK columns
+  to [from,to) but then scanned the REST of the file for `references public.<t>(...)`, so an FK whose own
+  REFERENCES was removed could be "proven" by a later/unrelated FK to the same target. Now the REFERENCES match
+  AND its referenced-column balanced range must BOTH close inside the same CREATE-body / ALTER statement
+  (rm.index < to and refRange.close < to); otherwise the target is unproven => NAMED_CONSTRAINT_MISSING. Inline
+  + ALTER-ADD forms preserved.
+- **Blocker 2 -- wrapper/endpoint evidence from real JS.** wrapperExported / sourceReferencesTable /
+  sourceReferencesRpc scanned RAW source, so a comment, an ordinary string, template text, or a regex literal
+  shaped like `export async function <name>(` (or an endpoint URL only in a comment) passed. New JS-aware lexer
+  lexJs(source) yields two views: `code` (comments + string / template-text / regex CONTENT blanked) drives
+  structural export checks; `text` (comments blanked, string/template literal contents kept, regex blanked)
+  drives endpoint checks. Template ${...} interpolations are lexed as real code (regex/string/nested-template
+  aware), so a regex containing a quote inside an interpolation (e.g. `.replace(/"/g, '""')`) no longer desyncs
+  the lexer into masking a later real export.
+
+Verification: sync-runtime-composition.test.js **24** (was 22); test:report-derivation **500** (was 498);
+sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-controls (9) / test:source-identity
+(7) / test:sync-engine green; build:check green; git diff --check clean. Commit `96c4411` (both blockers,
+code+tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated/enabled/scheduled; no live
+DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
+Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
+re-review.
