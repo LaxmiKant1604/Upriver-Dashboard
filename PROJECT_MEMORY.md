@@ -8172,3 +8172,37 @@ CONFIRMED: no production connection; no Supabase writes; migration 4 UNAPPLIED; 
 paused and locked (allowlist empty); zero schedules/cycles; nothing pushed/merged/deployed; Scheduler v1 +
 frontend + routes + cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md +
 .worktrees/ untouched. STOP for Codex review + explicit approval before executing Gate 1d.
+
+## Scheduler v2: Production Rollout Gate 1d EXECUTED -- migration 4 applied, fresh path (2026-08-13)
+
+With explicit human approval, from `feature/scheduler-v2` @ `9250663`, followed SCHEDULER_V2_ROLLOUT.md Appendix
+H exactly and applied **exactly one migration this gate: `20260811_sync_source_job_owners.sql` via the FRESH path
+(Branch A)** to production Supabase (POSTGRES_URL from .env.local, sslmode=no-verify, never printed). Full
+evidence in SCHEDULER_V2_ROLLOUT.md Appendix I. **Migrations 1-4 are now all applied.**
+
+- Preflight: HEAD includes 9250663; migration-4 SHA-256 matches the frozen hash; SCHEDULER_V2_READY_REPORT_KEYS
+  length 0.
+- H.2 read-only inventory: Q1 ledger m1/m2/m3=1, m4=0; Q2 prerequisites present (sync_cycles + sync_source_jobs
+  + its UNIQUE(cycle_id,request_hash)=sync_source_jobs_cycle_hash_unique; touch_updated_at()/is_dashboard_admin();
+  authenticated+service_role; sync_cycles empty; 13/0 controls); Q3 sync_source_job_owners NULL => Branch A
+  (fresh); A1 owner objects all absent. Branch B NOT taken.
+- Apply (H.3): single transaction, advisory lock (20260811,1), required migrations 1-3 each once, fail-closed
+  check, IN-TRANSACTION re-check that sync_source_job_owners was ABSENT (fresh-path only), plain ledger insert,
+  commit -> APPLIED. Created table sync_source_job_owners (15 cols), PK(id), UNIQUE membership, both FKs, three
+  CHECKs, two explicit indexes + PK/unique, touch trigger, RLS + one admin SELECT policy.
+- Y1-Y12 verification (read-only, public-scoped to sync_source_job_owners): all PASS -- 15 columns exact
+  (connection_id NOT NULL default 'primary'; identity cols NOT NULL no default); PK(id); UNIQUE
+  (cycle_id,request_hash,owner_id); FK cycle_id->sync_cycles(id) and composite FK
+  (cycle_id,request_hash)->sync_source_jobs(...) both ON DELETE CASCADE; CHECKs owner_status active|stale,
+  connection_id primary|dd-secondary, identity_nonempty (5-field char_length>0 AND); 4 indexes (pkey, unique,
+  owner_idx (cycle_id,owner_id), hash_idx (cycle_id,request_hash)); trigger enabled BEFORE UPDATE
+  ->touch_updated_at(); RLS + one SELECT policy to authenticated USING is_dashboard_admin() (no WITH CHECK); zero
+  owner rows; ledger m1/m2/m3/m4=1; sync_cycles + sync_source_jobs + ads_sync_coverage empty; 13 paused controls;
+  no new RPC; pg_cron absent -> no schedule.
+
+CONFIRMED: exactly migration 4 applied this gate (fresh path); migrations 1-3 intact; ALL migrations 1-4 now
+applied; migration 4 has exactly one ledger row; owner table zero rows; existing Scheduler-v2 tables empty; 13
+durable controls all paused; SCHEDULER_V2_READY_REPORT_KEYS empty; no cron/schedule; zero DataDoe calls/exports;
+zero sync cycles; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; four
+migration files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched. STOP
+for Codex review -- do NOT proceed to Gate 2, canary, deployment, control unlock, or scheduling.

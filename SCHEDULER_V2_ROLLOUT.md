@@ -203,7 +203,7 @@ report. **Approval gate per report.**
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
   - [x] **Gate 1c — `20260810_report_sync_controls.sql` applied 2026-08-13** (execution evidence in Appendix G; F.2 clear, X1–X11 all pass).
-  - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` — package prepared (Appendix H); **NOT executed** — awaiting separate Codex review + approval. Fresh-path (Branch A) only; an existing owner table (Branch B) STOPs for a separate upgrade-path review.
+  - [x] **Gate 1d — `20260811_sync_source_job_owners.sql` applied 2026-08-13** (fresh path / Branch A; execution evidence in Appendix I; H.2 clear, Y1–Y12 all pass).
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
@@ -1417,3 +1417,61 @@ select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no sc
   every v2 control stays locked and paused (shadow), leaving it applied is safe and inert. A Branch-B upgrade is
   a separate, reviewed path — never an automatic apply over an existing table.
 - Do **NOT** proceed to the canary or Gate 2. Stop for review + explicit human approval.
+
+---
+
+## Appendix I — Gate 1d EXECUTION evidence (applied 2026-08-13)
+
+Executed with explicit human approval, from `feature/scheduler-v2` @ `9250663`, following Appendix H exactly.
+Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
+and never printed. **Exactly one migration applied in this gate: `20260811_sync_source_job_owners.sql` — via the
+FRESH path (Branch A).**
+
+**Preflight:** HEAD includes `9250663`; migration-4 SHA-256 = `49628c8d…54d98669` (matches the frozen hash);
+`SCHEDULER_V2_READY_REPORT_KEYS` length 0.
+
+**H.2 live read-only inventory (read-only transaction) — Branch A confirmed, CLEAR TO APPLY:**
+- Q1 `ledger:true m1:1 m2:1 m3:1 m4:0`.
+- Q2 prerequisites: `sync_cycles` + `sync_source_jobs` present; the `sync_source_jobs` UNIQUE(cycle_id,
+  request_hash) = `sync_source_jobs_cycle_hash_unique`; `touch_updated_at()` + `is_dashboard_admin()` present;
+  roles `authenticated` + `service_role`; `sync_cycles` empty; controls 13/0 (all paused).
+- Q3 `sync_source_job_owners` NULL ⇒ **Branch A** (fresh path). A1: owner constraints / indexes / trigger /
+  policy all absent (0/0/0/0). **Branch B was not taken** (no existing owner table).
+
+**Apply (H.3 hardened fresh-path command):** single transaction, `pg_advisory_xact_lock(20260811, 1)` before the
+ledger reads, required Migrations 1–3 each recorded exactly once, fail-closed check (Migration 4 not previously
+recorded), **in-transaction re-check that `sync_source_job_owners` was ABSENT** (fresh path only), migration body
+applied, **plain** ledger insert, commit → `APPLIED 20260811_sync_source_job_owners.sql`. No retry.
+
+**Y1–Y12 post-apply structural verification (read-only, scoped to `public.sync_source_job_owners`) — all PASS:**
+- Y1 exactly 15 columns in order (id uuid PK `gen_random_uuid()`; cycle_id/request_hash/owner_id/request_key/
+  report_key/account_id NOT NULL; `connection_id text NOT NULL default 'primary'`; organization_fingerprint/
+  account_scope_hash NOT NULL; `owner_status text NOT NULL default 'active'`; error_code/error_message nullable;
+  created_at/updated_at timestamptz NOT NULL `now()`).
+- Y2 `PRIMARY KEY (id)`. Y3 `sync_source_job_owners_unique UNIQUE (cycle_id, request_hash, owner_id)`.
+- Y4 both FKs: `(cycle_id) → sync_cycles(id) ON DELETE CASCADE`; `sync_source_job_owners_source_fk (cycle_id,
+  request_hash) → sync_source_jobs(cycle_id, request_hash) ON DELETE CASCADE`.
+- Y5 the three CHECKs: `owner_status = ANY (ARRAY['active','stale'])`;
+  `sync_source_job_owners_connection_id_check connection_id = ANY (ARRAY['primary','dd-secondary'])`;
+  `sync_source_job_owners_identity_nonempty` (`char_length > 0` for report_key AND account_id AND request_key
+  AND organization_fingerprint AND account_scope_hash).
+- Y6 four indexes: `sync_source_job_owners_pkey`, `sync_source_job_owners_unique`,
+  `sync_source_job_owners_owner_idx (cycle_id, owner_id)`, `sync_source_job_owners_hash_idx (cycle_id,
+  request_hash)`.
+- Y7 trigger `sync_source_job_owners_touch`: enabled (`O`), `BEFORE UPDATE`, `EXECUTE FUNCTION
+  touch_updated_at()`.
+- Y8 RLS enabled; exactly one policy `admins read sync source job owners` — SELECT, to `authenticated` only,
+  `USING is_dashboard_admin()`, no WITH CHECK.
+- Y9 owner rows = 0. Y10 ledger: migrations 1, 2, 3, 4 each exactly one row. Y11 `sync_cycles`,
+  `sync_source_jobs`, `ads_sync_coverage` all empty; 13 controls, all paused. Y12 no new RPC; `cron.job` absent
+  (`pg_cron` not installed) → no schedule.
+
+**Confirmations:** Migration 4 has exactly one ledger row; the owner table has zero rows; the existing
+Scheduler-v2 tables (`sync_cycles`, `sync_source_jobs`, `ads_sync_coverage`) remain empty; all 13 durable
+controls remain paused; `SCHEDULER_V2_READY_REPORT_KEYS` is still `Object.freeze([])` (empty); no cron/schedule
+exists; zero DataDoe calls/exports occurred (pure additive DDL). All four migration files remain byte-unchanged
+(all seven Gate 0 hashes intact); no code changed; no deployment/push/merge. Scheduler v1 / frontend / routes /
+cron untouched.
+
+**Migrations 1–4 are now applied.** **STOP** — do not proceed to Gate 2, canary execution, deployment, any
+control unlock, or scheduling. Stop for Codex review.
