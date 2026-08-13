@@ -362,6 +362,62 @@ test("(audit blocker: exact CHECK semantics + quoted SQL ignored) AND<->OR, extr
   assert.ok(failsFor(extraClause, "sync_source_jobs_one_attempt"), "extra CHECK clause fails");
 });
 
+test("(audit blocker 1) an FK REFERENCES clause OUTSIDE the constraint's own CREATE-body/ALTER cannot satisfy the FK target: real REFERENCES removed + an unrelated later FK to the same target => NAMED_CONSTRAINT_MISSING; canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const named = (r) => r.blockers.filter((b) => b.code === "NAMED_CONSTRAINT_MISSING");
+  const OWN = "20260811_sync_source_job_owners.sql";
+  // canonical proves the FK -- its REFERENCES lives inside the SAME CREATE body as the constraint.
+  assert.equal(named(A()).length, 0, "canonical proves sync_source_job_owners_source_fk");
+  // Delete the FK's REAL `references public.sync_source_jobs (cycle_id, request_hash)` from the owner table body,
+  // then append an UNRELATED table whose FK references the SAME target LATER in the file. A REFERENCES lookup
+  // that escaped the constraint's [from,to) declaration would wrongly adopt that out-of-scope target; the scoped
+  // lookup must find NO in-scope target and fail closed.
+  const escaped = A((n, t) => n === OWN
+    ? t.replace(/\n\s*references public\.sync_source_jobs \(cycle_id, request_hash\) on delete cascade/, "")
+       + "\ncreate table if not exists public.unrelated_fk_probe (\n"
+       + "  cycle_id uuid,\n  request_hash text,\n"
+       + "  constraint unrelated_fk_probe_fk foreign key (cycle_id, request_hash)\n"
+       + "    references public.sync_source_jobs (cycle_id, request_hash)\n);\n"
+    : t);
+  assert.ok(named(escaped).some((b) => b.constraints.includes("sync_source_job_owners_source_fk")), "FK target satisfiable only by an out-of-scope later REFERENCES => NAMED_CONSTRAINT_MISSING");
+});
+
+test("(audit blocker 2) wrapper-export + endpoint evidence must be REAL JavaScript: comment / string / template-text / regex fakes never satisfy an export, a commented endpoint never satisfies a reference, removing a real wrapper => REQUIRED_WRAPPER_MISSING (named); canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const wrapperMissing = (r, name) => r.blockers.some((b) => b.code === "REQUIRED_WRAPPER_MISSING" && b.wrapper === name) && r.requiredWrappers.missing.includes(name);
+  // canonical: the real supabase.js exports every required wrapper AND references every table/rpc from a real
+  // string/template literal (proves genuine literal endpoints -- including template literals -- still count).
+  const real = A();
+  assert.equal(real.requiredWrappers.ok, true, "canonical: all required wrappers exported");
+  assert.equal(real.blockers.filter((b) => b.code === "REQUIRED_WRAPPER_MISSING" || b.code === "TABLE_WRAPPER_MISSING" || b.code === "RPC_WRAPPER_MISSING").length, 0, "canonical: every table/rpc referenced from a real literal");
+  // Remove the REAL saveReportSnapshot export, then re-add fake "evidence" in four non-code forms. NONE may
+  // satisfy the export: each must STILL report REQUIRED_WRAPPER_MISSING naming saveReportSnapshot.
+  const disable = (t) => t.replace(/export async function saveReportSnapshot\b/, "async function saveReportSnapshot_DISABLED");
+  const fakes = {
+    "line comment": "\n// export async function saveReportSnapshot(x) { return x; }\n",
+    "block comment": "\n/* export async function saveReportSnapshot( */\n",
+    "quoted string": "\nconst f1 = \"export async function saveReportSnapshot(\";\n",
+    "template text": "\nconst f2 = `export async function saveReportSnapshot(`;\n",
+    "regex literal": "\nconst f3 = /export async function saveReportSnapshot\\(/;\n",
+  };
+  for (const [label, fake] of Object.entries(fakes)) {
+    const r = A((n, t) => n === "supabase.js" ? disable(t) + fake : t);
+    assert.ok(wrapperMissing(r, "saveReportSnapshot"), label + " fake export => still REQUIRED_WRAPPER_MISSING (naming saveReportSnapshot)");
+  }
+  // Baseline: removing the real wrapper with NO fake also fails (confirms `disable` truly un-exports it).
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) : t), "saveReportSnapshot"), "removed real wrapper => REQUIRED_WRAPPER_MISSING");
+  // Endpoint evidence: move the ONLY /rest/v1/rpc/open_sync_cycle occurrence into a comment. A comment must NOT
+  // satisfy the RPC reference (genuine literals still do -- proven by the canonical pass above).
+  const commentedRpc = A((n, t) => n === "supabase.js"
+    ? t.replace("\"/rest/v1/rpc/open_sync_cycle\"", "\"/rest/v1/rpc/OPEN_DISABLED\" /* /rest/v1/rpc/open_sync_cycle */")
+    : t);
+  assert.ok(commentedRpc.blockers.some((b) => b.code === "RPC_WRAPPER_MISSING" && b.rpc === "open_sync_cycle"), "endpoint only in a comment => RPC_WRAPPER_MISSING");
+});
+
 test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blockers,requiredWrappers}; a null/throwing supabase.js reader never crashes", () => {
   const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
   const shapeOk = (r) => r && typeof r.ok === "boolean" && Array.isArray(r.matrix) && Array.isArray(r.blockers)

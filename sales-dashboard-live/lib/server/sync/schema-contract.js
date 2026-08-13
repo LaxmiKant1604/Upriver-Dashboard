@@ -260,9 +260,13 @@ function constraintDeclAt(masked, clean, from, to, name) {
     const rre = /\breferences\s+public\.([a-z0-9_]+)\s*\(/ig;
     rre.lastIndex = range.close;
     const rm = rre.exec(masked);
-    if (rm) {
+    // BLOCKER 1: the REFERENCES clause AND its referenced-column list MUST lie inside the SAME bounded
+    // declaration [from, to) as the constraint (its CREATE TABLE body or ALTER TABLE statement) -- never a
+    // later/unrelated statement. A later `references public.<target>(...)` elsewhere in the file cannot satisfy
+    // this FK's target.
+    if (rm && rm.index < to) {
       const refRange = balancedRange(masked, masked.indexOf("(", rm.index + rm[0].length - 1));
-      if (refRange) ref = { table: rm[1].toLowerCase(), columns: splitCols(clean.slice(refRange.open + 1, refRange.close)) };
+      if (refRange && refRange.close < to) ref = { table: rm[1].toLowerCase(), columns: splitCols(clean.slice(refRange.open + 1, refRange.close)) };
     }
   }
   return { kind, innerClean, ref };
@@ -328,16 +332,127 @@ function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-function wrapperExported(source, name) {
-  return new RegExp(`export\\s+async\\s+function\\s+${name}\\s*\\(`).test(source);
+// ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------
+//
+// BLOCKER 2: wrapper-export and endpoint evidence must come from REAL JavaScript syntax -- never a comment, an
+// ordinary string, template-string text, a regex literal, or a property name. `lexJs` produces TWO views of the
+// wrapper source (both keep newlines):
+//   - `code`: comments removed AND every string / template-text / regex-literal CONTENT blanked, so a
+//             structural `export async function <name>(` matches ONLY a genuine top-level declaration -- a
+//             commented-out, quoted, template, or regex-shaped fake is masked away;
+//   - `text`: comments removed but string / template literal CONTENTS preserved (regex literals still blanked),
+//             so a genuine endpoint URL living in a string/template literal is visible while a URL that appears
+//             only in a comment is not.
+// Structural export checks read `code`; endpoint checks read `text`.
+
+// A '/' begins a regex literal (vs a division operator) when the last significant code char / preceding word is
+// in an expression position. A misclassification only ever MASKS MORE (never less) -- real exports/endpoints
+// never follow a '/' -- so it can neither hide a genuine export/endpoint nor admit a forged one.
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "do", "else", "case", "yield", "await", "throw",
+]);
+function regexStartsHere(prevSig, codeSoFar) {
+  if (prevSig === "") return true;
+  if ("([{,;:=!&|?+-*%<>~^".includes(prevSig)) return true;
+  if (/[A-Za-z0-9_$)\]}'"`]/.test(prevSig)) {
+    const m = /([A-Za-z_$][A-Za-z0-9_$]*)\s*$/.exec(codeSoFar);
+    return !!(m && REGEX_PRECEDING_KEYWORDS.has(m[1]));
+  }
+  return true;
+}
+// Skip a '...' / "..." string (s[start] is the quote); return the index AFTER the closer.
+function skipJsString(s, start) {
+  const q = s[start];
+  let i = start + 1;
+  while (i < s.length) {
+    if (s[i] === "\\") { i += 2; continue; }
+    if (s[i] === q) return i + 1;
+    if (s[i] === "\n") return i; // unterminated on the line -- stop defensively
+    i += 1;
+  }
+  return i;
+}
+// Skip a regex literal (s[start] === '/'); return the index AFTER the flags, or null if it is not a well-formed
+// single-line regex (then '/' is an ordinary char, i.e. division).
+function skipJsRegex(s, start) {
+  let i = start + 1;
+  let inClass = false;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "\\") { i += 2; continue; }
+    if (c === "\n") return null;
+    if (c === "[") { inClass = true; i += 1; continue; }
+    if (c === "]") { inClass = false; i += 1; continue; }
+    if (c === "/" && !inClass) { i += 1; while (i < s.length && /[a-z]/i.test(s[i])) i += 1; return i; }
+    i += 1;
+  }
+  return null;
+}
+function lexJs(source) {
+  const s = String(source);
+  let code = "";
+  let text = "";
+  let prevSig = ""; // last significant (non-whitespace) code char
+  const both = (seg) => { code += blankLine(seg); text += blankLine(seg); }; // masked in BOTH (comment / regex)
+  const literal = (seg) => { code += blankLine(seg); text += seg; };          // masked in `code`, kept in `text`
+  const keep = (seg) => { code += seg; text += seg; };                        // real code, kept in both views
+
+  // Lex a `...` template starting at s[startI]==='`'; template TEXT is a literal (masked in `code`, kept in
+  // `text`), each ${...} interpolation is CODE lexed by lexCode (so a regex / string / nested template inside it
+  // is handled with the SAME rules). Returns the index AFTER the closing backtick.
+  function lexTemplate(startI) {
+    literal("`");
+    let i = startI + 1;
+    let run = "";
+    const flush = () => { if (run) { literal(run); run = ""; } };
+    while (i < s.length) {
+      const c = s[i];
+      if (c === "\\") { run += s.slice(i, i + 2); i += 2; continue; }
+      if (c === "`") { flush(); literal("`"); return i + 1; }
+      if (c === "$" && s[i + 1] === "{") { flush(); keep("${"); i = lexCode(i + 2, true); if (s[i] === "}") { keep("}"); i += 1; } continue; }
+      run += c; i += 1;
+    }
+    flush();
+    return i;
+  }
+
+  // Lex code from index i. When `insideInterp`, stop at (and return the index of) the ${...}-closing `}` -- the
+  // one at brace depth 0 -- so object/block braces inside the interpolation are balanced, not mistaken for it.
+  function lexCode(i, insideInterp) {
+    let depth = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (insideInterp && c === "}" && depth === 0) return i;
+      if (c === "/" && s[i + 1] === "/") { let j = i + 2; while (j < s.length && s[j] !== "\n") j += 1; both(s.slice(i, j)); i = j; continue; }
+      if (c === "/" && s[i + 1] === "*") { let j = i + 2; while (j < s.length && !(s[j] === "*" && s[j + 1] === "/")) j += 1; j = Math.min(j + 2, s.length); both(s.slice(i, j)); i = j; continue; }
+      if (c === "'" || c === '"') { const end = skipJsString(s, i); literal(s.slice(i, end)); prevSig = c; i = end; continue; }
+      if (c === "`") { i = lexTemplate(i); prevSig = "`"; continue; }
+      if (c === "/" && regexStartsHere(prevSig, code)) { const end = skipJsRegex(s, i); if (end != null) { both(s.slice(i, end)); prevSig = "/"; i = end; continue; } }
+      if (c === "{") { depth += 1; keep(c); prevSig = "{"; i += 1; continue; }
+      if (c === "}") { depth -= 1; keep(c); prevSig = "}"; i += 1; continue; }
+      keep(c); if (!/\s/.test(c)) prevSig = c; i += 1;
+    }
+    return i;
+  }
+
+  lexCode(0, false);
+  return { code, text };
 }
 
-function sourceReferencesTable(source, table) {
-  return source.includes(`/rest/v1/${table}?`) || source.includes(`/rest/v1/${table}"`) || source.includes(`/rest/v1/${table}\``);
+// `codeMasked` is the wrapper source's `code` view (comments + literal contents blanked), so this matches a
+// GENUINE top-level `export async function <name>(` only -- never a commented/quoted/template/regex fake.
+function wrapperExported(codeMasked, name) {
+  return new RegExp(`\\bexport\\s+async\\s+function\\s+${name}\\s*\\(`).test(codeMasked);
 }
 
-function sourceReferencesRpc(source, rpc) {
-  return source.includes(`/rest/v1/rpc/${rpc}`);
+// `textView` is the wrapper source's `text` view (comments blanked, string/template literal contents kept), so
+// a `/rest/v1/<table>` endpoint counts only from a real literal, never from a comment.
+function sourceReferencesTable(textView, table) {
+  return textView.includes(`/rest/v1/${table}?`) || textView.includes(`/rest/v1/${table}"`) || textView.includes(`/rest/v1/${table}\``);
+}
+
+function sourceReferencesRpc(textView, rpc) {
+  return textView.includes(`/rest/v1/rpc/${rpc}`);
 }
 
 // The COMPLETE set of Supabase wrappers the composed Scheduler-v2 runtime depends on. The audit proves EVERY
@@ -384,6 +499,11 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       requiredWrappers: { total: REQUIRED_WRAPPER_EXPORTS.length, missing: [...REQUIRED_WRAPPER_EXPORTS], ok: false },
     };
   }
+  // JS-aware views of the wrapper source: `wrapperCode` (comments + literal contents blanked) proves genuine
+  // exported async functions; `wrapperText` (comments blanked, literal contents kept) proves genuine endpoint
+  // URLs. Neither a comment, string, template text, nor regex literal can forge structural export evidence, and
+  // no comment can forge endpoint evidence (blocker 2).
+  const { code: wrapperCode, text: wrapperText } = lexJs(wrapperSource);
 
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
@@ -407,7 +527,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       // CHECK expression. A wrong-table, dropped, or comment/quoted-string-only mention is unproven (fix 1).
       const namedResults = (t.namedConstraints || []).map((c) => ({ name: c.name, ...namedConstraintProven(masked, clean, t.name, c) }));
       const unprovenNamed = namedResults.filter((r) => !r.proven);
-      const referencedByWrapper = sourceReferencesTable(wrapperSource, t.name);
+      const referencedByWrapper = sourceReferencesTable(wrapperText, t.name);
       if (!declared) blockers.push({ code: "TABLE_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is not created by ${entry.migration}` });
       if (declared && backedUniques.length !== (t.unique || []).length) {
         blockers.push({ code: "CONSTRAINT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing an expected primary-key/unique constraint the wrappers upsert on` });
@@ -422,7 +542,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       const declared = actualParams != null;
       const expectedParams = (r.params || []).map((p) => p.toLowerCase());
       const paramsMatch = declared && arraysEqual(actualParams, expectedParams);
-      const referencedByWrapper = sourceReferencesRpc(wrapperSource, r.name);
+      const referencedByWrapper = sourceReferencesRpc(wrapperText, r.name);
       if (!declared) blockers.push({ code: "RPC_MISSING", migration: entry.migration, rpc: r.name, message: `RPC public.${r.name} is not created by ${entry.migration}` });
       // The exact parameter names + order MUST match what the wrapper POSTs, or the live call would fail.
       if (declared && !paramsMatch) blockers.push({ code: "RPC_PARAM_MISMATCH", migration: entry.migration, rpc: r.name, expected: expectedParams, message: `RPC public.${r.name} parameters do not match the expected names/order [${expectedParams.join(", ")}]` });
@@ -430,7 +550,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       row.rpcs.push({ name: r.name, declared, paramsMatch, referencedByWrapper });
     }
     for (const w of entry.wrappers) {
-      const exported = wrapperExported(wrapperSource, w);
+      const exported = wrapperExported(wrapperCode, w);
       if (!exported) blockers.push({ code: "WRAPPER_MISSING", migration: entry.migration, wrapper: w, message: `wrapper ${w}() is not exported from the wrapper source` });
       row.wrappers.push({ name: w, exported });
     }
@@ -439,7 +559,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
 
   // Prove EVERY required wrapper export exists -- not only the per-migration subset -- so the preflight never
   // claims wrapper availability that the migration matrix did not actually cover (blocker 3).
-  const missingRequired = REQUIRED_WRAPPER_EXPORTS.filter((w) => !wrapperExported(wrapperSource, w));
+  const missingRequired = REQUIRED_WRAPPER_EXPORTS.filter((w) => !wrapperExported(wrapperCode, w));
   for (const w of missingRequired) blockers.push({ code: "REQUIRED_WRAPPER_MISSING", wrapper: w, message: `required wrapper ${w}() is not exported from the wrapper source` });
   const requiredWrappers = { total: REQUIRED_WRAPPER_EXPORTS.length, missing: missingRequired, ok: missingRequired.length === 0 };
 
