@@ -1734,11 +1734,16 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
   its two canonical source contracts are `order-line-items` and `product-catalog`).
 - Use `brand-sales` **only if** the chosen account has **both**: (1) a current production Brand Sales snapshot
   (`report_snapshots` under `report_key='brand-sales'`) for later Gate 6 parity; (2) confirmed **Product Catalog
-  source `68d2de238e` availability with usable rows** for that account. `68d2de238e` is the **live short** Export
-  Source ID; the long id `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8` is the **obsolete
-  (DataDoe-404)** alias and must **never** be used.
-- **If either prerequisite cannot be confirmed, STOP.** Do not use the obsolete catalog ID, do not add a
-  fallback/retry, and do not substitute another report or account without review.
+  usability for THIS account and the EXACT canonical `brand-sales` product-catalog request** — the request built
+  from the live short source id `68d2de238e`, the contract's columns (incl. `child_asin`, `product_brand`), and
+  the account's window/scope (compute its `request_hash` via the same source identity the `brand-sales` plan
+  uses). Require a `source_export_cache` entry for THAT exact `request_hash` with `row_count > 0`, and a bounded
+  payload read showing **non-empty usable `child_asin` → `product_brand` mappings**. A generic catalog success
+  for **another account**, or a **different catalog shape/id**, is INSUFFICIENT. The long id
+  `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8` is the **obsolete (DataDoe-404)** alias and
+  must **never** be used.
+- **If either prerequisite (or the exact catalog evidence) cannot be confirmed, STOP.** Do not use the obsolete
+  catalog ID, do not add a fallback/retry, and do not substitute another report or account without review.
 - Product Catalog **incremental ASIN-brand gap-fill remains OUT OF SCOPE** for this canary.
 
 ### L.2 Control isolation (no control/allowlist/settings change)
@@ -1751,21 +1756,28 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 - Drive the run with `manualReportKeys: ['brand-sales']` (a MANUAL, readiness-gated run).
 - Restrict `connections` to the **configured primary connection only** (`id === 'primary'` with an `apiKey`);
   fail closed unless exactly one is configured. Never route a `dd-secondary:` account through the primary key.
-- Inject `fetchAccounts` so it calls the **current** primary discovery (`fetchAccounts(apiKey)` from
-  `lib/server/datadoe.js`), filters to the exact selected account `id`, and **fails closed unless exactly one
-  match** is found. Never hard-code a fabricated account record.
+- Inject `fetchAccounts` so it validates it received the **selected primary `apiKey`** and returns **exactly the
+  one real discovered account** from the single memoized discovery snapshot (L.5) — no second network call, no
+  fabricated record, no `dd-secondary` fallback.
+- The snapshot saver: `buildSchedulerV2Runtime` accepts a **`makeShadowSnapshotSaver` FACTORY** override; its
+  **default factory** constructs the trusted `saveSnapshot` collaborator, which writes **only** under
+  `scheduler-v2/<reportKey>`. `saveSnapshot` itself is NOT a per-construction override — **keep the default
+  factory** for the canary (do not override `makeShadowSnapshotSaver`).
 
 ### L.3 Budget (cumulative, ≤ 2 create-exports)
 
 - `brand-sales` has at most **two** canonical source request hashes (`order-line-items`, `product-catalog`), so
-  set **`maxJobs: 2`** and an explicit wall-clock **`deadlineMs`** + **`reserveMs`** reserve.
+  set **`maxJobs: 2`** and, per slice, a fresh explicit wall-clock **`deadlineMs`** + **`reserveMs`** reserve.
 - Permit **bounded continuation slices only on the SAME `(bucket, cycleDate)`** (a fresh `rt.run(...)` resumes
   from persisted state; the DB one-attempt guard `claim_source_export_attempt` + the `sync_source_jobs_one_attempt`
   CHECK guarantee **≤ 1 create-export per `request_hash` per cycle**, so no duplicate export across slices).
-- Across ALL continuations require **create-export count ≤ 2 total** and **no duplicate create-export per
-  `request_hash`**. Between slices, tally `sum(create_export_count)` over `sync_source_jobs` for this `cycle_id`
-  (read-only); **STOP on any third export attempt**. A previously-cached source may make the actual export count
-  **< 2** — do **not** require exactly 2.
+- **The authoritative create-export / token count is the DB `create_export_count`**, NOT `rollup.spent` (which is
+  *processed job work* — jobs advanced, not exports created). After **every** slice and **before** any
+  continuation, read `rt.store.listSourceJobs(rollup.cycleId)` and require: **≤ 2** canonical source rows; only
+  the two expected `brand-sales` source contracts (`order-line-items`, `product-catalog`); each
+  `create_export_count ∈ {0, 1}`; and **`sum(create_export_count) ≤ 2`**. Throw immediately on any mismatch
+  (STOP — do not run another slice). A previously-cached source may make the actual export count **< 2** — do
+  **not** require exactly 2.
 
 ### L.4 Before-canary read-only evidence (run + RECORD first; STOP on any failure)
 
@@ -1776,20 +1788,36 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
   cover all of these — re-run them read-only).
 - Record (safe fields only): the chosen **public account `id`**, its raw seller scope, **country**, derived
   **bucket** (`bucketForCountry(country)` — must equal the `bucket` passed to `run`), **currency**, **`asOf`**
-  (marketplace-local latest data date), and a unique reviewed **`cycleDate`**; and **why Product Catalog
-  `68d2de238e` is known usable** for this account (e.g. a recent successful `product-catalog` export in
-  `source_export_cache`, or a bounded source-metadata check — never the obsolete id).
-- Capture the existing **non-shadow** Brand Sales snapshot identity for later parity, WITHOUT exposing payload
-  secrets:
+  (marketplace-local latest data date), and a unique reviewed **`cycleDate`**.
+- Confirm the EXACT canonical `brand-sales` product-catalog request is usable for THIS account (L.1) and capture
+  the existing production Brand Sales snapshot identity, WITHOUT exposing payload contents. All columns below are
+  the committed schema (`report_snapshots`: `id, report_key, account_id, params_hash, params, payload,
+  payload_storage_path, payload_bytes, source_refreshed_at, created_at, updated_at`; `source_export_cache`:
+  `request_hash, source_id, object_path, row_count, payload_bytes, fetched_at, expires_at`):
   ```sql
-  -- production brand-sales snapshot identity for the account (no payload) -- BEFORE the canary
-  select report_key, account_id, snapshot_params_hash, updated_at, latest_data_date
+  -- (a) EXACT canonical brand-sales product-catalog request availability for the account (payload-free).
+  --     <PC_REQUEST_HASH> = the request_hash the brand-sales plan derives for the product-catalog source
+  --     (short id 68d2de238e) for THIS account/window. Expect exactly 1 row with row_count > 0; else STOP.
+  --     (Content check -- non-empty child_asin -> product_brand -- is a bounded read of object_path, done
+  --      out-of-band; a generic/other-account catalog is INSUFFICIENT.)
+  select request_hash, source_id, row_count, payload_bytes, fetched_at, expires_at
+    from public.source_export_cache where request_hash = '<PC_REQUEST_HASH>';
+
+  -- (b) existing production brand-sales snapshot IDENTITY for the account (real columns; no payload) -- for parity.
+  select id, report_key, account_id, params_hash, payload_storage_path, payload_bytes,
+         source_refreshed_at, created_at, updated_at
     from public.report_snapshots
    where report_key = 'brand-sales' and account_id = '<SELECTED_ACCOUNT_ID>'
    order by updated_at desc limit 5;
-  -- and a payload-free fingerprint to prove it is unchanged after the canary:
-  select report_key, count(*) as rows, max(updated_at) as max_updated,
-         md5(string_agg(snapshot_params_hash, ',' order by snapshot_params_hash)) as hash_fingerprint
+
+  -- (c) production (non-shadow) snapshot FINGERPRINT for the account -- payload-free + deterministic. Run this
+  --     query IDENTICALLY before (here) and after (L.6 P5) and require the two results are byte-identical.
+  select count(*) as snapshot_rows,
+         md5(coalesce(string_agg(
+           id::text || '|' || params_hash || '|' || md5(coalesce(payload::text, '')) || '|' ||
+           coalesce(payload_storage_path, '') || '|' || payload_bytes::text || '|' ||
+           source_refreshed_at::text || '|' || created_at::text || '|' || updated_at::text,
+           chr(10) order by id), '')) as production_fingerprint
     from public.report_snapshots
    where report_key not like 'scheduler-v2/%' and account_id = '<SELECTED_ACCOUNT_ID>';
   ```
@@ -1798,8 +1826,8 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 
 Run from `sales-dashboard-live/`. Secrets (`POSTGRES_URL`, `DATADOE_API_KEY`, `SUPABASE_*`) come **only** from the
 untracked local environment / `.env.local` and are **never printed**. Uses the exact current constructor + `run`
-argument names; the default `saveSnapshot` is `makeShadowSnapshotSaver`, which writes **only** under
-`scheduler-v2/<reportKey>` (`scheduler-v2/brand-sales`).
+argument names. The `makeShadowSnapshotSaver` factory is left at its default, so the trusted `saveSnapshot`
+collaborator writes **only** under `scheduler-v2/<reportKey>` (`scheduler-v2/brand-sales`).
 
 ```js
 // Gate 5 canary — ONE primary account, ONE report (brand-sales). Live DataDoe export + Supabase write into
@@ -1812,94 +1840,149 @@ import { bucketForCountry } from "./lib/server/sync/registry.js"; // bucket deri
 const SELECTED_ACCOUNT_ID = "<REVIEWED_PRIMARY_ACCOUNT_ID>";
 const CYCLE_DATE = "<UNIQUE_REVIEWED_YYYY-MM-DD>";   // a unique reviewed cycle date (never a real scheduled one)
 const AS_OF = "<YYYY-MM-DD>";                         // marketplace-local latest data date for the account
+const EXPECTED_SOURCE_KEYS = new Set(["order-line-items", "product-catalog"]); // the ONLY brand-sales sources
 
 // primary-only connection; fail closed unless exactly one configured primary key
 const conns = (getDataDoeConnections() || []).filter((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
 if (conns.length !== 1) throw new Error("canary: expected exactly one configured primary connection (fail closed)");
+const PRIMARY_API_KEY = conns[0].apiKey;
+
+// ONE real primary discovery, MEMOIZED -- account, bucket, and the injected fetchAccounts all use this single
+// snapshot (no second network discovery).
+let discoveryPromise = null;
+const discoverOnce = () => (discoveryPromise ??= realFetchAccounts(PRIMARY_API_KEY));
+const directory = (await discoverOnce()) || [];
+const selectedAccts = directory.filter((a) => a && a.id === SELECTED_ACCOUNT_ID);
+if (selectedAccts.length !== 1) throw new Error(`canary: expected exactly one discovered primary account for ${SELECTED_ACCOUNT_ID}; got ${selectedAccts.length} (fail closed)`);
+const account = selectedAccts[0];
+const BUCKET = bucketForCountry(account.country);
+if (BUCKET !== "us" && BUCKET !== "non-us") throw new Error("canary: could not derive a valid bucket (fail closed)");
 
 const rt = buildSchedulerV2Runtime({
   connections: conns,                                                       // primary-only; never dd-secondary
   controlCatalog: () => [{ reportKey: "brand-sales", ready: true, scheduleEnabled: false }], // instance-scoped unlock
   fetchAccounts: async (apiKey) => {
-    const all = (await realFetchAccounts(apiKey)) || [];                    // CURRENT primary discovery
-    const match = all.filter((a) => a && a.id === SELECTED_ACCOUNT_ID);     // exact selected account only
-    if (match.length !== 1) throw new Error(`canary: expected exactly one matching primary account for ${SELECTED_ACCOUNT_ID}; got ${match.length} (fail closed)`);
-    return match;                                                            // never a fabricated record
+    if (apiKey !== PRIMARY_API_KEY) throw new Error("canary: fetchAccounts called with a non-primary apiKey (fail closed)");
+    const all = (await discoverOnce()) || [];                              // SAME memoized snapshot -- no 2nd call
+    const match = all.filter((a) => a && a.id === SELECTED_ACCOUNT_ID);    // exactly the one real discovered account
+    if (match.length !== 1) throw new Error(`canary: expected exactly one matching primary account; got ${match.length} (fail closed)`);
+    return match;                                                          // never fabricated; never dd-secondary
   },
-  // saveSnapshot defaults to makeShadowSnapshotSaver -> writes ONLY under scheduler-v2/<reportKey>
+  // makeShadowSnapshotSaver is a FACTORY override; leaving it default => trusted saveSnapshot writes ONLY under
+  // scheduler-v2/<reportKey>. We keep the default factory (do NOT override it here).
 });
 
-const account = ((await realFetchAccounts(conns[0].apiKey)) || []).find((a) => a && a.id === SELECTED_ACCOUNT_ID);
-if (!account) throw new Error("canary: selected account not returned by current discovery (fail closed)");
-const BUCKET = bucketForCountry(account.country);                           // must be 'us' | 'non-us'
-if (BUCKET !== "us" && BUCKET !== "non-us") throw new Error("canary: could not derive a valid bucket (fail closed)");
-
-const DEADLINE_MS = Date.now() + 90_000;                                    // explicit wall-clock deadline
+// bounded continuation on the SAME (bucket, cycleDate): a FRESH per-slice deadline, plus ONE overall deadline and
+// a max slice count. STOP (never busy-loop) when the overall deadline or slice cap is reached.
+const OVERALL_DEADLINE_MS = Date.now() + 15 * 60_000;   // one explicit overall canary budget
+const MAX_SLICES = 8;
 let slices = 0, rollup = null;
 do {
-  if (++slices > 6) throw new Error("canary: too many continuation slices (fail closed)");
+  if (Date.now() >= OVERALL_DEADLINE_MS) throw new Error("canary: overall deadline exhausted before drain (STOP; do not busy-loop)");
+  if (++slices > MAX_SLICES) throw new Error("canary: too many continuation slices (fail closed)");
+  const sliceDeadlineMs = Date.now() + 90_000;          // FRESH bounded deadline for THIS slice
   rollup = await rt.run({
     bucket: BUCKET, cycleDate: CYCLE_DATE, asOf: AS_OF,
     manualReportKeys: ["brand-sales"], maxJobs: 2,
-    deadlineMs: DEADLINE_MS, reserveMs: 5_000, trigger: "manual",
+    deadlineMs: sliceDeadlineMs, reserveMs: 5_000, trigger: "manual",
   });
-  // BETWEEN slices (read-only): tally sum(create_export_count) for rollup.cycleId over sync_source_jobs; if it
-  // exceeds 2, or any single request_hash shows create_export_count > 1, STOP immediately (do not continue).
+  // AUTHORITATIVE between-slice guard (read-only): the DB create_export_count -- NOT rollup.spent.
+  const jobs = (await rt.store.listSourceJobs(rollup.cycleId)) || [];
+  if (jobs.length > 2) throw new Error(`canary: >2 canonical source jobs (${jobs.length}) -- STOP`);
+  let totalExports = 0;
+  for (const j of jobs) {
+    if (!EXPECTED_SOURCE_KEYS.has(j.source_key)) throw new Error(`canary: unexpected source_key '${j.source_key}' -- STOP`);
+    const n = j.create_export_count ?? 0;
+    if (n !== 0 && n !== 1) throw new Error(`canary: create_export_count ${n} for '${j.source_key}' not in {0,1} -- STOP`);
+    totalExports += n;
+  }
+  if (totalExports > 2) throw new Error(`canary: total create-exports ${totalExports} > 2 -- STOP`);
 } while (rollup && rollup.continuationRequired);
-// rollup = { cycleId, selected, accountsDispatched, spent (create-exports), maxJobs, drained,
+// rollup = { cycleId, selected, accountsDispatched, spent (PROCESSED job work, NOT exports), maxJobs, drained,
 //            continuationRequired, perUnit, reports }  -- record safe fields only (see L.6).
 ```
 
 ### L.6 Post-canary read-only checks (record safe fields only; no repair)
+
+`sync_source_jobs` has **no `account_id`** column; source-account isolation is verified by joining
+`sync_source_jobs` to `sync_source_job_owners` on `(cycle_id, request_hash)`. `sync_report_jobs.account_id`
+exists and is checked separately.
 
 ```sql
 -- P1) exactly ONE sync_cycles row for the reviewed bucket/cycleDate (expect 1)
 select id, bucket, cycle_date, status, source_total, source_succeeded, source_failed
   from public.sync_cycles where bucket = '<BUCKET>' and cycle_date = '<CYCLE_DATE>';
 
--- P2) only the selected account appears in source/report/owner rows (expect ZERO rows from each)
-select distinct account_id from public.sync_source_jobs      where cycle_id = '<CYCLE_ID>' and account_id is not null and account_id <> '<SELECTED_ACCOUNT_ID>';
-select distinct account_id from public.sync_report_jobs      where cycle_id = '<CYCLE_ID>' and account_id <> '<SELECTED_ACCOUNT_ID>';
-select distinct account_id from public.sync_source_job_owners where cycle_id = '<CYCLE_ID>' and account_id <> '<SELECTED_ACCOUNT_ID>';
+-- P2) SOURCE isolation via the owner join (sync_source_jobs has NO account_id). Expect ZERO rows from each:
+-- (i) any source row with NO owner membership (ownerless) -- fail
+select s.request_hash, s.source_key from public.sync_source_jobs s
+ where s.cycle_id = '<CYCLE_ID>'
+   and not exists (select 1 from public.sync_source_job_owners o
+                    where o.cycle_id = s.cycle_id and o.request_hash = s.request_hash);
+-- (ii) any owner membership that is NOT active / brand-sales / selected account / primary / matching scope -- fail
+select o.request_hash, o.owner_status, o.report_key, o.account_id, o.connection_id
+  from public.sync_source_job_owners o
+  join public.sync_source_jobs s on s.cycle_id = o.cycle_id and s.request_hash = o.request_hash
+ where o.cycle_id = '<CYCLE_ID>'
+   and ( o.owner_status <> 'active'
+      or o.report_key <> 'brand-sales'
+      or o.account_id <> '<SELECTED_ACCOUNT_ID>'
+      or o.connection_id <> 'primary'
+      or o.organization_fingerprint is distinct from s.organization_fingerprint
+      or o.account_scope_hash is distinct from s.account_scope_hash );
+-- (iii) any owner account_id other than the selected one (additional account) -- fail
+select distinct o.account_id from public.sync_source_job_owners o
+ where o.cycle_id = '<CYCLE_ID>' and o.account_id <> '<SELECTED_ACCOUNT_ID>';
+-- (iv) sync_report_jobs.account_id (this table HAS account_id) -- only the selected account (fail otherwise)
+select distinct account_id from public.sync_report_jobs
+ where cycle_id = '<CYCLE_ID>' and account_id <> '<SELECTED_ACCOUNT_ID>';
 
 -- P3) at most TWO canonical source jobs; at most ONE create-export per request_hash; total exports <= 2
+--     (sync_source_jobs columns: request_hash, source_key, fetch_status, create_export_count, terminal, error_code)
 select request_hash, source_key, fetch_status, create_export_count, terminal, error_code
   from public.sync_source_jobs where cycle_id = '<CYCLE_ID>' order by source_key;  -- expect <= 2 rows, each create_export_count in (0,1)
 select coalesce(sum(create_export_count),0) as total_exports,
        coalesce(max(create_export_count),0) as max_per_hash
   from public.sync_source_jobs where cycle_id = '<CYCLE_ID>';  -- expect total_exports <= 2 and max_per_hash <= 1
 
--- P4) owner memberships are ACTIVE and correctly account/org scoped (no cross-account, no dd-secondary routing)
+-- P4) owner memberships snapshot for the record (all rows expected active / primary / selected account)
 select owner_status, connection_id, account_id, report_key, error_code
   from public.sync_source_job_owners where cycle_id = '<CYCLE_ID>';
--- expect owner_status='active', connection_id='primary', account_id='<SELECTED_ACCOUNT_ID>' for every row.
 
--- P5) exactly ONE scheduler-v2/brand-sales snapshot when derivation succeeded (expect 1); and NO production change
-select report_key, account_id, snapshot_params_hash, updated_at, latest_data_date
+-- P5) exactly ONE scheduler-v2/brand-sales snapshot when derivation succeeded (real columns; no payload)
+select id, report_key, account_id, params_hash, payload_bytes, source_refreshed_at, created_at, updated_at
   from public.report_snapshots
  where report_key = 'scheduler-v2/brand-sales' and account_id = '<SELECTED_ACCOUNT_ID>';   -- expect 1 (on success)
--- Re-run the BEFORE payload-free production fingerprint (L.4) and require it is byte-identical:
-select report_key, count(*) as rows, max(updated_at) as max_updated,
-       md5(string_agg(snapshot_params_hash, ',' order by snapshot_params_hash)) as hash_fingerprint
+-- Re-run the L.4 (c) production FINGERPRINT query IDENTICALLY and require it EQUALS the before value:
+select count(*) as snapshot_rows,
+       md5(coalesce(string_agg(
+         id::text || '|' || params_hash || '|' || md5(coalesce(payload::text, '')) || '|' ||
+         coalesce(payload_storage_path, '') || '|' || payload_bytes::text || '|' ||
+         source_refreshed_at::text || '|' || created_at::text || '|' || updated_at::text,
+         chr(10) order by id), '')) as production_fingerprint
   from public.report_snapshots
- where report_key not like 'scheduler-v2/%' and account_id = '<SELECTED_ACCOUNT_ID>';       -- MUST equal the before value
+ where report_key not like 'scheduler-v2/%' and account_id = '<SELECTED_ACCOUNT_ID>';       -- MUST equal L.4 (c)
 ```
 
 Record from the returned `rollup` (safe fields only, **no secrets / no raw provider errors**): `cycleId`,
-`selected`, `accountsDispatched` (must be `['<SELECTED_ACCOUNT_ID>']`), `spent` (create-export count), `drained`
-/ `continuationRequired`, each `perUnit`, and from `rollup.reports` the per-report shadow **status**,
-**latestDataDate**, **snapshotParamsHash**, and any **SAFE error code** — plus the source `request_hash`es and
-per-hash `create_export_count` from P3. Prove the before/after production snapshot fingerprints (L.4 vs P5) are
-**unchanged**.
+`selected`, `accountsDispatched` (must be `['<SELECTED_ACCOUNT_ID>']`), `spent` (**processed job work, not the
+export count**), `drained` / `continuationRequired`, each `perUnit`, and from `rollup.reports` the per-report
+shadow **status**, **latestDataDate**, and any **SAFE error code**. The **authoritative create-export / token
+count** is the DB `sum(create_export_count)` from P3 (and the between-slice guard) — plus the source
+`request_hash`es and per-hash `create_export_count`. Prove the before/after production snapshot fingerprints
+(L.4 (c) vs P5) are **identical**.
 
 ### L.7 Stop conditions (Gate 5)
 
 STOP immediately (safely ending any read-only transaction; make **no** repair/delete/backfill/write) on **any**
-of: a prerequisite mismatch (no production brand-sales snapshot, or Product Catalog `68d2de238e`
-unavailable/empty for the selected account); more than two create-export attempts total, or a duplicate export
-for a `request_hash`; **any** account other than the selected primary account appearing in any source/report/
-owner row; any `dd-secondary` routing or a `connection_id` other than `primary`; any write outside the
-Scheduler-v2 tables or `scheduler-v2/*` snapshots; **any** change to a non-`scheduler-v2/*` production snapshot
-(fingerprint differs); any unsafe/raw error text or a `TRUNCATED`/malformed-scope/cross-account row; or any
-control, allowlist, or schedule change. Do **NOT** proceed to Gate 6 parity, Gate 7 unlock, deployment, or
+of: a prerequisite mismatch (no production brand-sales snapshot, or the EXACT canonical brand-sales product-catalog
+request unavailable / `row_count = 0` / no usable `child_asin` → `product_brand` mappings for the selected
+account); more than two create-export attempts total (authoritative DB `sum(create_export_count)`), or a
+duplicate export (`create_export_count > 1`) for a `request_hash`; an ownerless source row, any additional owner
+or account, or a source/owner `organization_fingerprint`/`account_scope_hash` mismatch; **any** account other
+than the selected primary account in `sync_report_jobs` or the owner rows; any `dd-secondary` routing or a
+`connection_id` other than `primary`; any write outside the Scheduler-v2 tables or `scheduler-v2/*` snapshots;
+**any** change to the non-`scheduler-v2/*` production fingerprint (L.4 (c) vs P5); any unsafe/raw error text or a
+`TRUNCATED` / malformed-scope / cross-account row; the overall canary deadline or slice cap reached before drain;
+or any control, allowlist, or schedule change. Do **NOT** proceed to Gate 6 parity, Gate 7 unlock, deployment, or
 scheduling. Stop for review + explicit human approval.

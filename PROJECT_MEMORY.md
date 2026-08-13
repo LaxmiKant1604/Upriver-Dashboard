@@ -8276,14 +8276,39 @@ Gate 2 approved. Offline/docs-only preparation of the Gate 5 one-account shadow 
 runtime APIs; NOT executed, no production connection. Full package in SCHEDULER_V2_ROLLOUT.md Appendix L.
 
 - Verified current runtime API (read from code, not invented): buildSchedulerV2Runtime(overrides) accepts
-  connections / controlCatalog / fetchAccounts / saveSnapshot (default makeShadowSnapshotSaver -> writes ONLY
-  under scheduler-v2/<reportKey>); rt.run(sliceArgs) operational allowlist = bucket, cycleDate, asOf, asOfFor,
-  manualReportKeys, clock, deadlineMs, reserveMs, maxJobs, scheduledAt, trigger; the dispatcher rollup returns
-  { cycleId, selected, accountsDispatched, spent(create-exports), maxJobs, drained, continuationRequired,
-  perUnit, reports }. brand-sales sources = order-line-items + product-catalog; product-catalog LIVE short id
-  68d2de238e (long id ...507b0bafb...17a8 is the obsolete DataDoe-404 alias, never used). shadow key =
-  scheduler-v2/brand-sales; account shape { id, name, country, countryName, currency, locale, timeZone };
-  bucketForCountry from lib/server/sync/registry.js.
+  connections / controlCatalog / fetchAccounts / makeShadowSnapshotSaver (a FACTORY override whose DEFAULT
+  factory constructs the trusted saveSnapshot collaborator that writes ONLY under scheduler-v2/<reportKey>;
+  saveSnapshot itself is NOT a per-construction override -- the canary keeps the default factory); rt.run(sliceArgs)
+  operational allowlist = bucket, cycleDate, asOf, asOfFor, manualReportKeys, clock, deadlineMs, reserveMs,
+  maxJobs, scheduledAt, trigger; the dispatcher rollup returns { cycleId, selected, accountsDispatched,
+  spent(=PROCESSED job work, NOT create-export count), maxJobs, drained, continuationRequired, perUnit, reports }
+  -- the authoritative create-export/token count is the DB sum(create_export_count) via
+  rt.store.listSourceJobs(cycleId), which returns rows with snake_case keys (request_hash, source_key,
+  create_export_count, connection_id, organization_fingerprint, account_scope_hash; NO account_id column).
+  brand-sales sources = order-line-items + product-catalog; product-catalog LIVE short id 68d2de238e (long id
+  ...507b0bafb...17a8 is the obsolete DataDoe-404 alias, never used). shadow key = scheduler-v2/brand-sales;
+  account shape { id, name, country, countryName, currency, locale, timeZone }; bucketForCountry from
+  lib/server/sync/registry.js. report_snapshots real columns: id, report_key, account_id, params_hash, params,
+  payload, payload_storage_path, payload_bytes, source_refreshed_at, created_at, updated_at (NO
+  snapshot_params_hash / latest_data_date). source_export_cache columns: request_hash, source_id, object_path,
+  row_count, payload_bytes, fetched_at, expires_at.
+- Codex re-review corrections (docs-only, same tranche): (1) report_snapshots queries use only real columns and a
+  payload-free deterministic fingerprint over id/params_hash/md5(payload)/payload_storage_path/payload_bytes/
+  source_refreshed_at/created_at/updated_at, run IDENTICALLY before/after. (2) source-account isolation joins
+  sync_source_jobs->sync_source_job_owners on (cycle_id, request_hash) -- never queries the non-existent
+  sync_source_jobs.account_id -- requiring every source row to have only active brand-sales/selected-account/
+  primary memberships with matching organization_fingerprint+account_scope_hash, failing on an ownerless source
+  or any extra owner/account; sync_report_jobs.account_id checked separately. (3) between-slice guard is
+  executable: after each rt.run and before continuation, call rt.store.listSourceJobs(rollup.cycleId), require <=2
+  rows of only the two expected brand-sales source keys, each create_export_count in {0,1}, sum<=2, throw on any
+  mismatch (DB value authoritative). (4) each slice gets a FRESH deadlineMs=Date.now()+90_000 plus ONE overall
+  canary deadline + MAX_SLICES; stop (not busy-loop) when exhausted; same bucket/cycleDate. (5) one memoized real
+  discovery promise; account+bucket derived from it; injected fetchAccounts validates the primary apiKey and
+  returns exactly that one discovered account (no second discovery/fabricated/dd-secondary). (6) saver wording
+  corrected (factory override; default builds trusted saveSnapshot; keep default). (7) product-catalog evidence
+  hardened to the EXACT canonical brand-sales product-catalog request_hash for the selected account with
+  row_count>0 and non-empty child_asin->product_brand mappings; a generic/other-account catalog is insufficient;
+  STOP if absent; never the obsolete long id / no fallback.
 - Canary package (Appendix L): ONE primary account, ONE report brand-sales, only if the account has (1) a
   current production brand-sales snapshot and (2) confirmed product-catalog 68d2de238e usable rows -- else STOP
   (no obsolete id, no fallback, no other report/account). Control isolation: NO edit to
