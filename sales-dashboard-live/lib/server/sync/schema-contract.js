@@ -32,7 +32,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         // (cycle, request_hash)") + the dedup unique. Audited by name, KIND, and (for the CHECK) body tokens.
         namedConstraints: [
           { name: "sync_source_jobs_cycle_hash_unique", kind: "unique", columns: ["cycle_id", "request_hash"] },
-          { name: "sync_source_jobs_one_attempt", kind: "check", must: ["create_export_count = 0", "attempted_at is null", "create_export_count = 1", "attempted_at is not null"] },
+          // EXACT one-attempt semantics: only (count=0 AND attempted_at IS NULL) OR (count=1 AND attempted_at IS
+          // NOT NULL). Compared as an exact canonical token sequence, so AND<->OR, an operand/operator reorder,
+          // or an extra clause fails.
+          { name: "sync_source_jobs_one_attempt", kind: "check", canonical: "(create_export_count = 0 and attempted_at is null) or (create_export_count = 1 and attempted_at is not null)" },
         ],
         keyColumns: ["cycle_id", "request_hash", "source_id", "source_key", "organization_fingerprint", "connection_id",
           "account_scope_hash", "request_meta", "bucket", "fetch_status", "attempted_at", "create_export_count",
@@ -91,8 +94,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         namedConstraints: [
           { name: "sync_source_job_owners_unique", kind: "unique", columns: ["cycle_id", "request_hash", "owner_id"] },
           { name: "sync_source_job_owners_source_fk", kind: "foreign key", columns: ["cycle_id", "request_hash"], references: { table: "sync_source_jobs", columns: ["cycle_id", "request_hash"] } },
-          { name: "sync_source_job_owners_connection_id_check", kind: "check", must: ["connection_id in", "'primary'", "'dd-secondary'"] },
-          { name: "sync_source_job_owners_identity_nonempty", kind: "check", must: ["char_length(report_key) > 0", "char_length(account_id) > 0", "char_length(request_key) > 0", "char_length(organization_fingerprint) > 0", "char_length(account_scope_hash) > 0"] },
+          // EXACTLY the two allowed connection ids -- no extra value (e.g. 'evil') can slip in.
+          { name: "sync_source_job_owners_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          // EVERY owner identity field non-empty, joined with AND (an AND->OR weakening fails).
+          { name: "sync_source_job_owners_identity_nonempty", kind: "check", canonical: "char_length(report_key) > 0 and char_length(account_id) > 0 and char_length(request_key) > 0 and char_length(organization_fingerprint) > 0 and char_length(account_scope_hash) > 0" },
         ],
         keyColumns: ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id",
           "connection_id", "organization_fingerprint", "account_scope_hash", "owner_status", "error_code"],
@@ -103,35 +108,90 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
   },
 ]);
 
-// ---- pure SQL/text probes (the SQL is our own committed migration; parsing is comment-stripped) ----
+// ---- SQL-aware lexical layer -----------------------------------------------------------------------------
+//
+// The blocker: comments AND quoted/dollar-quoted STRINGS must never satisfy structural discovery (CREATE
+// TABLE, ALTER TABLE ADD/DROP CONSTRAINT, RPC, table, constraint), yet a real CHECK body's string literals
+// must be preserved so their exact values are validated. `lexSql` produces TWO length-aligned views:
+//   - `clean`  : comments removed (blanked to spaces), string/dollar-quoted contents PRESERVED;
+//   - `masked` : comments removed AND every string literal / dollar-quoted STRING blanked -- but dollar-quoted
+//                CODE bodies (a `$tag$...$tag$` preceded by `do`/`as`, i.e. a DO block or function body) are
+//                KEPT, with their inner single-quoted strings still blanked (so a real ALTER ... ADD CONSTRAINT
+//                inside a DO block IS discovered, while `... add constraint ...` text living only inside a
+//                quoted string is NOT).
+// Both are the SAME LENGTH as the input, so an index located in `masked` maps to the real text in `clean`.
+// ALL structural discovery runs on `masked`; only a structurally-located CHECK body is read from `clean`.
 
-// Remove SQL comments so a constraint/param/table mentioned ONLY in a comment can never satisfy a contract
-// check (blocker 3). Block comments first, then line comments. Our migrations carry no "--"/"/*" inside a
-// string/dollar-quoted literal, so this naive strip is exact for them; it replaces each comment with a space
-// to preserve token boundaries. All structural parsing below runs on the stripped text.
-function stripSqlComments(sql) {
-  return String(sql).replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ");
+const blankLine = (str) => String(str).replace(/[^\n]/g, " "); // length-preserving blank (keep newlines)
+
+function dollarTagAt(s, i) {
+  if (s[i] !== "$") return null;
+  const m = /^\$([a-zA-Z_][a-zA-Z0-9_]*)?\$/.exec(s.slice(i));
+  return m ? m[0] : null;
 }
 
-// Extract the body between the balanced parentheses that immediately follow `header` (a compiled regex whose
-// match ends at the opening "("), or null. Runs on comment-stripped text so parens inside comments never
-// unbalance the walk.
-function balancedBody(cleanSql, header) {
-  const m = header.exec(cleanSql);
-  if (!m) return null;
+function precedingKeyword(s, i) {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(s[j])) j -= 1;
+  let start = j;
+  while (start >= 0 && /[a-zA-Z0-9_]/.test(s[start])) start -= 1;
+  return s.slice(start + 1, j + 1).toLowerCase();
+}
+
+function lexSql(sql) {
+  const s = String(sql);
+  let clean = "";
+  let masked = "";
+  const emit = (c, m) => { clean += c; masked += m; };
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "-" && s[i + 1] === "-") { let j = i; while (j < s.length && s[j] !== "\n") j += 1; const seg = s.slice(i, j); emit(blankLine(seg), blankLine(seg)); i = j; continue; }
+    if (c === "/" && s[i + 1] === "*") { let j = i + 2; while (j < s.length && !(s[j] === "*" && s[j + 1] === "/")) j += 1; j = Math.min(j + 2, s.length); const seg = s.slice(i, j); emit(blankLine(seg), blankLine(seg)); i = j; continue; }
+    if (c === "'") { let j = i + 1; while (j < s.length) { if (s[j] === "'" && s[j + 1] === "'") { j += 2; continue; } if (s[j] === "'") { j += 1; break; } j += 1; } const seg = s.slice(i, j); emit(seg, blankLine(seg)); i = j; continue; }
+    const tag = dollarTagAt(s, i);
+    if (tag) {
+      const endIdx = s.indexOf(tag, i + tag.length);
+      const end = endIdx < 0 ? s.length : endIdx + tag.length;
+      const kw = precedingKeyword(s, i);
+      if (kw === "do" || kw === "as") { // CODE body: keep, but recurse so inner comments/strings are handled.
+        const innerStart = i + tag.length;
+        const innerEnd = endIdx < 0 ? s.length : endIdx;
+        emit(s.slice(i, innerStart), s.slice(i, innerStart));
+        const inner = lexSql(s.slice(innerStart, innerEnd));
+        emit(inner.clean, inner.masked);
+        emit(s.slice(innerEnd, end), s.slice(innerEnd, end));
+      } else { const seg = s.slice(i, end); emit(seg, blankLine(seg)); } // dollar-quoted STRING literal
+      i = end; continue;
+    }
+    emit(c, c); i += 1;
+  }
+  return { clean, masked };
+}
+
+// { open, close } indices of the balanced parens starting at `text[openIdx] === "("`, or null.
+function balancedRange(text, openIdx) {
+  if (openIdx < 0 || text[openIdx] !== "(") return null;
   let depth = 0;
-  for (let i = m.index + m[0].length - 1; i < cleanSql.length; i += 1) {
-    const ch = cleanSql[i];
-    if (ch === "(") depth += 1;
-    else if (ch === ")") { depth -= 1; if (depth === 0) return cleanSql.slice(m.index + m[0].length, i); }
+  for (let i = openIdx; i < text.length; i += 1) {
+    if (text[i] === "(") depth += 1;
+    else if (text[i] === ")") { depth -= 1; if (depth === 0) return { open: openIdx, close: i }; }
   }
   return null;
 }
 
-// The `create table if not exists public.<name> ( ... )` body (comment-stripped), or null. Scoped so a column
-// / constraint check for one table never matches text belonging to another table in the same migration file.
-function tableBody(cleanSql, name) {
-  return balancedBody(cleanSql, new RegExp(`create\\s+table\\s+if\\s+not\\s+exists\\s+public\\.${name}\\s*\\(`, "i"));
+// The CREATE TABLE body paren range in `masked` (indices), or null. Scoped so a column/constraint check for one
+// table never matches text belonging to another table -- and a CREATE TABLE mentioned only in a comment/string
+// is invisible in `masked`.
+function tableBodyRange(masked, name) {
+  const m = new RegExp(`create\\s+table\\s+if\\s+not\\s+exists\\s+public\\.${name}\\s*\\(`, "i").exec(masked);
+  if (!m) return null;
+  return balancedRange(masked, masked.indexOf("(", m.index + m[0].length - 1));
+}
+
+function tableBody(masked, name) {
+  const r = tableBodyRange(masked, name);
+  return r ? masked.slice(r.open + 1, r.close) : null;
 }
 
 // A column is declared when its name begins a column line inside the (comment-stripped) table body.
@@ -154,90 +214,114 @@ function keyIsBacked(body, cols) {
   return false;
 }
 
-// Inner text of the balanced parenthetical starting at `text[openIdx] === "("`, or null.
-function extractBalancedAt(text, openIdx) {
-  if (openIdx < 0 || text[openIdx] !== "(") return null;
-  let depth = 0;
-  for (let i = openIdx; i < text.length; i += 1) {
-    if (text[i] === "(") depth += 1;
-    else if (text[i] === ")") { depth -= 1; if (depth === 0) return text.slice(openIdx + 1, i); }
-  }
-  return null;
-}
-
 const normalizeSql = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
 const splitCols = (inner) => normalizeSql(inner).split(",").map((c) => c.trim()).filter(Boolean);
 
-// Parse the constraint declaration that begins at `constraint <name>` inside `scopeText`. Returns
-// { kind, inner, ref } where kind is 'unique'|'primary key'|'check'|'foreign key', inner is the FIRST balanced
-// (...) after the kind keyword (columns for unique/pk/fk, the predicate for check), and ref (FK only) is the
-// referenced { table, columns }. Returns null if `constraint <name>` is absent from scopeText.
-function parseConstraintDecl(scopeText, name) {
-  const nameM = new RegExp(`\\bconstraint\\s+${name}\\b`, "i").exec(scopeText);
-  if (!nameM) return null;
-  const tail = scopeText.slice(nameM.index + nameM[0].length);
-  const kindM = /\b(primary\s+key|foreign\s+key|unique|check)\b/i.exec(tail);
-  if (!kindM) return { kind: null, inner: null, ref: null };
-  const kind = kindM[1].replace(/\s+/g, " ").toLowerCase();
-  const afterKind = tail.slice(kindM.index + kindM[0].length);
-  const inner = extractBalancedAt(afterKind, afterKind.indexOf("("));
-  let ref = null;
-  if (kind === "foreign key") {
-    const refM = /\breferences\s+public\.([a-z0-9_]+)\s*\(/i.exec(afterKind);
-    if (refM) {
-      const refOpen = afterKind.indexOf("(", refM.index + refM[0].length - 1);
-      ref = { table: refM[1].toLowerCase(), columns: splitCols(extractBalancedAt(afterKind, refOpen)) };
-    }
+// Lex a SQL expression into an EXACT canonical token list: identifiers/keywords/numbers lowercased,
+// string literals kept case-sensitively (Postgres string values are case-sensitive), operators (=, <, >, <=,
+// >=, <>, !=) and parens/commas as their own tokens. Whitespace is insignificant. Two expressions are
+// semantically identical ONLY when their token lists are identical -- so AND<->OR, an operand/operator reorder,
+// an extra clause, or an extra IN value all change the token list and fail.
+function tokenizeSql(expr) {
+  const s = String(expr || "");
+  const toks = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i += 1; continue; }
+    if (c === "'") { let j = i + 1; let lit = "'"; while (j < s.length) { if (s[j] === "'" && s[j + 1] === "'") { lit += "''"; j += 2; continue; } lit += s[j]; if (s[j] === "'") { j += 1; break; } j += 1; } toks.push(lit); i = j; continue; }
+    if (c === "(" || c === ")" || c === ",") { toks.push(c); i += 1; continue; }
+    if (c === "<" || c === ">" || c === "=" || c === "!") { const two = c + (s[i + 1] || ""); if (["<=", ">=", "<>", "!="].includes(two)) { toks.push(two); i += 2; } else { toks.push(c); i += 1; } continue; }
+    if (/[a-z0-9_]/i.test(c)) { let j = i; let w = ""; while (j < s.length && /[a-z0-9_]/i.test(s[j])) { w += s[j]; j += 1; } toks.push(w.toLowerCase()); i = j; continue; }
+    toks.push(c); i += 1;
   }
-  return { kind, inner, ref };
+  return toks;
 }
 
-// Locate a named constraint's declaration SCOPED to `table`: either inline in that table's CREATE body, or via
-// `ALTER TABLE (ONLY)? public.<table> ... ADD CONSTRAINT <name> <decl>` (same statement, up to ';'). A
-// constraint declared on a DIFFERENT table, or only in a comment/string, is NOT found here.
-function namedConstraintScopedDecl(cleanSql, table, name) {
-  const body = tableBody(cleanSql, table);
-  if (body) { const inBody = parseConstraintDecl(body, name); if (inBody) return inBody; }
-  const alterRe = new RegExp(`alter\\s+table\\s+(?:only\\s+)?public\\.${table}\\b[^;]*?\\badd\\s+constraint\\s+${name}\\b([^;]*)`, "i");
-  const am = alterRe.exec(cleanSql);
-  if (am) return parseConstraintDecl(`constraint ${name} ${am[1]}`, name);
+// Parse the constraint declaration whose `constraint <name>` lies in `masked[from..to)`. Returns
+// { kind, innerClean, ref }: kind ('unique'|'primary key'|'check'|'foreign key'), innerClean = the FIRST
+// balanced (...) after the kind keyword read from `clean` (so a CHECK body keeps its REAL string values), and
+// ref (FK only) = the referenced { table, columns }. Located ENTIRELY in `masked`; bodies read from `clean`.
+function constraintDeclAt(masked, clean, from, to, name) {
+  const re = new RegExp(`\\bconstraint\\s+${name}\\b`, "ig");
+  re.lastIndex = Math.max(0, from);
+  const nameM = re.exec(masked);
+  if (!nameM || nameM.index >= to) return null;
+  const kre = /\b(primary\s+key|foreign\s+key|unique|check)\b/ig;
+  kre.lastIndex = nameM.index + nameM[0].length;
+  const km = kre.exec(masked);
+  if (!km || km.index >= to) return { kind: null, innerClean: null, ref: null };
+  const kind = km[0].replace(/\s+/g, " ").toLowerCase();
+  const range = balancedRange(masked, masked.indexOf("(", km.index + km[0].length));
+  if (!range) return { kind, innerClean: null, ref: null };
+  const innerClean = clean.slice(range.open + 1, range.close);
+  let ref = null;
+  if (kind === "foreign key") {
+    const rre = /\breferences\s+public\.([a-z0-9_]+)\s*\(/ig;
+    rre.lastIndex = range.close;
+    const rm = rre.exec(masked);
+    if (rm) {
+      const refRange = balancedRange(masked, masked.indexOf("(", rm.index + rm[0].length - 1));
+      if (refRange) ref = { table: rm[1].toLowerCase(), columns: splitCols(clean.slice(refRange.open + 1, refRange.close)) };
+    }
+  }
+  return { kind, innerClean, ref };
+}
+
+// Locate a named constraint's declaration SCOPED to `table`: inline in that table's CREATE body, OR via a real
+// `ALTER TABLE (ONLY)? public.<table> ... ADD CONSTRAINT <name> ...` statement. A constraint on a DIFFERENT
+// table, or one whose text lives only in a comment/quoted string (invisible in `masked`), is NOT found.
+function namedConstraintScopedDecl(masked, clean, table, name) {
+  const bodyRange = tableBodyRange(masked, table);
+  if (bodyRange) { const d = constraintDeclAt(masked, clean, bodyRange.open + 1, bodyRange.close, name); if (d) return d; }
+  const alterRe = new RegExp(`alter\\s+table\\s+(?:only\\s+)?public\\.${table}\\b`, "ig");
+  let am;
+  while ((am = alterRe.exec(masked))) {
+    const semi = masked.indexOf(";", am.index);
+    const stmtEnd = semi < 0 ? masked.length : semi;
+    const addRe = new RegExp(`\\badd\\s+constraint\\s+${name}\\b`, "ig");
+    addRe.lastIndex = am.index;
+    const addM = addRe.exec(masked);
+    if (addM && addM.index < stmtEnd) { const d = constraintDeclAt(masked, clean, addM.index, stmtEnd + 1, name); if (d) return d; }
+  }
   return null;
 }
 
-// A named constraint is PROVEN only when it is CREATED for the expected table (in that table's CREATE body or an
-// ALTER TABLE public.<table> ADD CONSTRAINT), is NOT dropped, and -- for critical invariants -- matches the
-// expected KIND and (unique/pk) columns, (fk) columns + reference target, or (check) required body tokens.
-// Returns { proven, reason }. A DROP CONSTRAINT of the name anywhere, a wrong-table declaration, or a
-// comment/string-only mention never passes.
-function namedConstraintProven(cleanSql, table, expected) {
+// A named constraint is PROVEN only when CREATED for the expected table (CREATE body or ALTER ... ADD
+// CONSTRAINT), NOT dropped, and matching the expected KIND and: (unique/pk) exact columns; (fk) exact columns +
+// reference target; (check) the EXACT canonical expression (token-for-token). A DROP CONSTRAINT of the name (in
+// real DDL, not a string), a wrong-table declaration, or a comment/quoted-string-only mention never passes.
+function namedConstraintProven(masked, clean, table, expected) {
   const name = expected.name;
-  if (new RegExp(`\\bdrop\\s+constraint\\s+(?:if\\s+exists\\s+)?${name}\\b`, "i").test(cleanSql)) return { proven: false, reason: "dropped" };
-  const decl = namedConstraintScopedDecl(cleanSql, table, name);
+  if (new RegExp(`\\bdrop\\s+constraint\\s+(?:if\\s+exists\\s+)?${name}\\b`, "i").test(masked)) return { proven: false, reason: "dropped" };
+  const decl = namedConstraintScopedDecl(masked, clean, table, name);
   if (!decl) return { proven: false, reason: "absent-or-wrong-table" };
   if (expected.kind && decl.kind !== expected.kind) return { proven: false, reason: "kind-mismatch" };
-  if (expected.columns && !arraysEqual(splitCols(decl.inner || ""), expected.columns.map((c) => c.toLowerCase()))) {
+  if (expected.columns && !arraysEqual(splitCols(decl.innerClean || ""), expected.columns.map((c) => c.toLowerCase()))) {
     return { proven: false, reason: "columns-mismatch" };
   }
   if (expected.references) {
     const ok = decl.ref && decl.ref.table === expected.references.table && arraysEqual(decl.ref.columns, expected.references.columns.map((c) => c.toLowerCase()));
     if (!ok) return { proven: false, reason: "fk-target-mismatch" };
   }
-  if (expected.must) {
-    const body = normalizeSql(decl.inner || "");
-    const missing = expected.must.filter((s) => !body.includes(normalizeSql(s)));
-    if (missing.length) return { proven: false, reason: "check-body-mismatch" };
+  if (expected.canonical && !arraysEqual(tokenizeSql(decl.innerClean || ""), tokenizeSql(expected.canonical))) {
+    return { proven: false, reason: "check-body-mismatch" };
   }
   return { proven: true, reason: null };
 }
 
-// The RPC's declared parameter NAMES in signature order (comment-stripped), or null if the function is absent.
-// Each parameter's name is the first token before its type; defaults (`default ...`) are ignored.
-function rpcParamNames(cleanSql, name) {
-  const body = balancedBody(cleanSql, new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${name}\\s*\\(`, "i"));
-  if (body == null) return null;
-  const trimmed = body.trim();
-  if (!trimmed) return [];
-  return trimmed.split(",").map((p) => p.trim()).filter(Boolean).map((p) => p.split(/\s+/)[0].toLowerCase());
+// The RPC's declared parameter NAMES in signature order (from `masked`, so a `create ... function public.<name>`
+// appearing only in a comment/string is invisible), or null if the function signature is absent. Each
+// parameter's name is the first token before its type; a `default '...'` value is blanked in `masked` and
+// ignored anyway.
+function rpcParamNames(masked, name) {
+  const m = new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${name}\\s*\\(`, "i").exec(masked);
+  if (!m) return null;
+  const range = balancedRange(masked, masked.indexOf("(", m.index + m[0].length - 1));
+  if (!range) return null;
+  const body = masked.slice(range.open + 1, range.close).trim();
+  if (!body) return [];
+  return body.split(",").map((p) => p.trim()).filter(Boolean).map((p) => p.split(/\s+/)[0].toLowerCase());
 }
 
 function arraysEqual(a, b) {
@@ -310,16 +394,18 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       matrix.push(row);
       continue;
     }
-    const sql = stripSqlComments(raw); // ALL structural checks run on the comment-stripped SQL (blocker 3).
+    // SQL-aware lexing: `masked` (comments + quoted/dollar-string CONTENTS blanked) drives ALL structural
+    // discovery; `clean` (strings preserved) supplies a real CHECK body once one is structurally located.
+    const { clean, masked } = lexSql(raw);
     for (const t of entry.tables) {
-      const body = tableBody(sql, t.name);
+      const body = tableBody(masked, t.name);
       const declared = body != null;
       const backedUniques = (t.unique || []).filter((cols) => keyIsBacked(body, cols));
       const missingColumns = declared ? (t.keyColumns || []).filter((c) => !bodyDeclaresColumn(body, c)) : (t.keyColumns || []);
       // Each named constraint must be PROVEN for THIS table (created in its CREATE body or via ALTER TABLE
-      // public.<table> ADD CONSTRAINT), not dropped, and matching the expected kind/columns/FK-target/CHECK
-      // body tokens. A wrong-table, dropped, or comment/string-only mention is unproven (fix 1).
-      const namedResults = (t.namedConstraints || []).map((c) => ({ name: c.name, ...namedConstraintProven(sql, t.name, c) }));
+      // public.<table> ADD CONSTRAINT), not dropped, and matching the expected kind/columns/FK-target/exact
+      // CHECK expression. A wrong-table, dropped, or comment/quoted-string-only mention is unproven (fix 1).
+      const namedResults = (t.namedConstraints || []).map((c) => ({ name: c.name, ...namedConstraintProven(masked, clean, t.name, c) }));
       const unprovenNamed = namedResults.filter((r) => !r.proven);
       const referencedByWrapper = sourceReferencesTable(wrapperSource, t.name);
       if (!declared) blockers.push({ code: "TABLE_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is not created by ${entry.migration}` });
@@ -332,7 +418,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper });
     }
     for (const r of entry.rpcs) {
-      const actualParams = rpcParamNames(sql, r.name);
+      const actualParams = rpcParamNames(masked, r.name);
       const declared = actualParams != null;
       const expectedParams = (r.params || []).map((p) => p.toLowerCase());
       const paramsMatch = declared && arraysEqual(actualParams, expectedParams);

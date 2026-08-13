@@ -327,6 +327,41 @@ test("(audit fix 1) named constraints are PROVEN for the expected table by kind/
   assert.ok(named(badFkCols).some((b) => b.constraints.includes("sync_source_job_owners_source_fk")), "mutated FK columns => NAMED_CONSTRAINT_MISSING");
 });
 
+test("(audit blocker: exact CHECK semantics + quoted SQL ignored) AND<->OR, extra IN value, operand reorder / extra clause, and quoted-only ADD CONSTRAINT all fail; canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const failsFor = (r, name) => r.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.constraints.includes(name));
+  const V2 = "20260807_scheduler_v2.sql", OWN = "20260811_sync_source_job_owners.sql";
+  assert.equal(A().ok, true, "canonical migrations still prove every exact CHECK (do-block ALTER ADDs discovered)");
+  // 1) one-attempt AND -> OR weakening.
+  const andOr = A((n, t) => n === V2 ? t.replace("create_export_count = 0 and attempted_at is null", "create_export_count = 0 or attempted_at is null") : t);
+  assert.ok(failsFor(andOr, "sync_source_jobs_one_attempt"), "one-attempt AND->OR fails");
+  // 2) connection_id permits an extra value 'evil'.
+  const extraVal = A((n, t) => n === OWN ? t.replace("connection_id in ('primary', 'dd-secondary')", "connection_id in ('primary', 'dd-secondary', 'evil')") : t);
+  assert.ok(failsFor(extraVal, "sync_source_job_owners_connection_id_check"), "connection_id extra value 'evil' fails");
+  // 3) owner identity AND -> OR weakening.
+  const idOr = A((n, t) => n === OWN ? t.replace("char_length(report_key) > 0 and char_length(account_id) > 0", "char_length(report_key) > 0 or char_length(account_id) > 0") : t);
+  assert.ok(failsFor(idOr, "sync_source_job_owners_identity_nonempty"), "identity AND->OR fails");
+  // 4a) the real one-attempt CHECK removed; its full text survives ONLY inside a single-quoted string.
+  const quotedSingle = A((n, t) => n === V2
+    ? t.replace(/constraint sync_source_jobs_one_attempt check \([\s\S]*?\)\s*\)/, "x_removed_placeholder integer")
+       + "\ncomment on table public.sync_source_jobs is 'constraint sync_source_jobs_one_attempt check ((create_export_count = 0 and attempted_at is null) or (create_export_count = 1 and attempted_at is not null))';\n"
+    : t);
+  assert.ok(failsFor(quotedSingle, "sync_source_jobs_one_attempt"), "ADD text only inside a single-quoted string fails");
+  // 4b) the real connection_id ALTER removed; its full text survives ONLY inside a dollar-quoted string.
+  const quotedDollar = A((n, t) => n === OWN
+    ? t.replace(/alter table public\.sync_source_job_owners\s*\n\s*add constraint sync_source_job_owners_connection_id_check check \(connection_id in \('primary', 'dd-secondary'\)\);/,
+      "perform $q$ alter table public.sync_source_job_owners add constraint sync_source_job_owners_connection_id_check check (connection_id in ('primary', 'dd-secondary')) $q$;")
+    : t);
+  assert.ok(failsFor(quotedDollar, "sync_source_job_owners_connection_id_check"), "ADD text only inside a dollar-quoted string fails");
+  // 5) operand reorder + 6) extra clause both change the exact token sequence => fail.
+  const reorder = A((n, t) => n === V2 ? t.replace("create_export_count = 0 and attempted_at is null", "attempted_at is null and create_export_count = 0") : t);
+  assert.ok(failsFor(reorder, "sync_source_jobs_one_attempt"), "operand reorder fails");
+  const extraClause = A((n, t) => n === V2 ? t.replace("(create_export_count = 1 and attempted_at is not null)", "(create_export_count = 1 and attempted_at is not null and 1 = 1)") : t);
+  assert.ok(failsFor(extraClause, "sync_source_jobs_one_attempt"), "extra CHECK clause fails");
+});
+
 test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blockers,requiredWrappers}; a null/throwing supabase.js reader never crashes", () => {
   const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
   const shapeOk = (r) => r && typeof r.ok === "boolean" && Array.isArray(r.matrix) && Array.isArray(r.blockers)
