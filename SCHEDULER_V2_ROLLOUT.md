@@ -202,7 +202,7 @@ report. **Approval gate per report.**
 - Gate 1a–1d — each migration applied (one at a time):
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
-  - [ ] Gate 1c — `20260810_report_sync_controls.sql` — package prepared (Appendix F); **NOT executed** — awaiting separate Codex review + approval.
+  - [x] **Gate 1c — `20260810_report_sync_controls.sql` applied 2026-08-13** (execution evidence in Appendix G; F.2 clear, X1–X11 all pass).
   - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
@@ -1076,3 +1076,54 @@ open — seeding the paused rows here opens neither.
   SQL is replay-idempotent, but the ledger/advisory-locked apply still refuses a repeat.)
 - Do **NOT** proceed to Gate 1d (`20260811_sync_source_job_owners.sql`), the canary, any control unlock, or the
   kickoff. Stop for review + explicit human approval.
+
+---
+
+## Appendix G — Gate 1c EXECUTION evidence (applied 2026-08-13)
+
+Executed with explicit human approval, from `feature/scheduler-v2` @ `0f34038`, following Appendix F exactly.
+Connected to production Supabase over the committed `POSTGRES_URL` (`sslmode=no-verify`) loaded from `.env.local`
+and never printed. **Exactly one migration applied in this gate: `20260810_report_sync_controls.sql`.**
+
+**Preflight:** HEAD includes `0f34038`; migration-3 SHA-256 = `544557fb…0938bea4c` (matches the frozen hash);
+`SCHEDULER_V2_READY_REPORT_KEYS` length 0.
+
+**F.2 live read-only inventory (read-only transaction) — CLEAR TO APPLY:**
+- Q1 `ledger_exists:true migration1_rows:1 migration2_rows:1 migration3_rows:0`.
+- Q2 `report_sync_settings` NULL, `report_sync_settings_key_nonempty` 0 rows, policies 0 rows (all absent).
+- Q3 prerequisites present: `auth.users`, `public.is_dashboard_admin()`, roles `authenticated` + `service_role`.
+- Q4 Migration 1 & 2 objects present: `sync_cycles`, `sync_source_jobs`, `sync_report_jobs`, `ads_sync_coverage`,
+  and the three RPCs.
+
+**Apply (F.3 hardened command):** single transaction, `pg_advisory_xact_lock(20260810, 2)` (distinct from Gate
+1b's `(20260810, 1)`) before the ledger reads, required Migrations 1 and 2 each recorded exactly once,
+fail-closed check (Migration 3 not previously recorded), migration body applied, **plain** ledger insert, commit
+→ `APPLIED 20260810_report_sync_controls.sql`. No retry.
+
+**X1–X11 post-apply structural verification (read-only, scoped to `public.report_sync_settings`) — all PASS:**
+- X1 exactly 4 columns in order: `report_key text NOT NULL`, `schedule_enabled boolean NOT NULL default false`,
+  `updated_by uuid NULL`, `updated_at timestamptz NOT NULL default now()`.
+- X2 `PRIMARY KEY (report_key)`.
+- X3 named CHECK `report_sync_settings_key_nonempty` = `((length(TRIM(BOTH FROM report_key)) > 0))` — non-blank
+  `report_key` (the only CHECK).
+- X4 FK `updated_by → auth.users(id) ON DELETE SET NULL`.
+- X5 only the PK unique index `report_sync_settings_pkey`.
+- X6 zero user triggers.
+- X7 RLS enabled; exactly one policy `admins read report sync settings` — SELECT, to `authenticated` only,
+  `USING is_dashboard_admin()`, no WITH CHECK.
+- X8 exactly the 13 approved keys (`total=13, distinct=13, missing=0, extra=0`); every `schedule_enabled=false`;
+  every `updated_by` NULL.
+- X9 ledger: migrations 1, 2, 3 each exactly one row.
+- X10 `ads_sync_coverage` present and empty (0 rows); `sync_cycles` empty (0 rows).
+- X11 no new RPC; `cron.job` absent (`pg_cron` not installed) → no schedule.
+
+**Two independent gates confirmed CLOSED:** (1) durable controls — all 13 rows `schedule_enabled=false` (X8);
+(2) code readiness allowlist — `SCHEDULER_V2_READY_REPORT_KEYS` still `Object.freeze([])` (empty). A report is
+live only when both open; neither is opened here.
+
+**Post-apply invariants:** the four migration files remain byte-unchanged (all seven Gate 0 hashes intact); no
+code changed; no DataDoe call/export; no schedule; no deployment/push/merge. Scheduler v1 / frontend / routes /
+cron untouched.
+
+**STOP.** Gate 1d (`20260811_sync_source_job_owners.sql`), the canary, and any control unlock remain
+**unapproved** — stop for Codex review and separate approval before preparing or executing Gate 1d.

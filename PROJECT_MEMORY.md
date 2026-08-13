@@ -8092,3 +8092,33 @@ CONFIRMED: no production connection; no Supabase writes; migration 3 UNAPPLIED; 
 remain paused and locked (allowlist empty); no schedule; nothing pushed/merged/deployed; Scheduler v1 + frontend
 + routes + cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md + .worktrees/
 untouched. STOP for Codex review + explicit approval before executing Gate 1c.
+
+## Scheduler v2: Production Rollout Gate 1c EXECUTED -- migration 3 applied (2026-08-13)
+
+With explicit human approval, from `feature/scheduler-v2` @ `0f34038`, followed SCHEDULER_V2_ROLLOUT.md Appendix
+F exactly and applied **exactly one migration this gate: `20260810_report_sync_controls.sql`** to production
+Supabase (POSTGRES_URL from .env.local, sslmode=no-verify, never printed). Full evidence in
+SCHEDULER_V2_ROLLOUT.md Appendix G.
+
+- Preflight: HEAD includes 0f34038; migration-3 SHA-256 matches the frozen hash; SCHEDULER_V2_READY_REPORT_KEYS
+  length 0.
+- F.2 read-only inventory: CLEAR (ledger m1=1, m2=1, m3=0; report_sync_settings + constraint + policy absent;
+  prerequisites auth.users / is_dashboard_admin() / authenticated / service_role present; migrations 1-2 objects
+  present).
+- Apply (F.3): single transaction, advisory lock (20260810,2) DISTINCT from Gate 1b (20260810,1), required
+  migrations 1 and 2 recorded exactly once, fail-closed check, plain ledger insert, commit -> APPLIED. Created
+  table report_sync_settings (4 cols), seeded 13 paused rows, RLS enabled with one admin SELECT policy.
+- X1-X11 verification (read-only, scoped to public.report_sync_settings): all PASS -- 4 columns exact; PK
+  (report_key); CHECK report_sync_settings_key_nonempty = length(trim(both from report_key)) > 0; FK updated_by
+  -> auth.users(id) ON DELETE SET NULL; PK-only index; zero user triggers; RLS + exactly one SELECT policy to
+  authenticated USING is_dashboard_admin() (no WITH CHECK); exactly the 13 keys (missing=0, extra=0, distinct=13)
+  all schedule_enabled=false and updated_by NULL; ledger m1=m2=m3=1; ads_sync_coverage present+empty; sync_cycles
+  empty; no new RPC; pg_cron absent -> no schedule.
+- TWO INDEPENDENT GATES confirmed CLOSED: durable controls all paused (schedule_enabled=false) AND code
+  allowlist SCHEDULER_V2_READY_REPORT_KEYS empty. A report is live only when both open; neither opened here.
+
+CONFIRMED: exactly migration 3 applied this gate; migrations 1-2 intact; migration 4 UNAPPLIED; exactly 13
+durable controls, all paused; code readiness allowlist empty; zero DataDoe calls/exports; zero sync cycles; zero
+schedules; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; four migration
+files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched. STOP for Codex
+review + separate approval before Gate 1d.
