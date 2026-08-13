@@ -181,7 +181,15 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     run: async (sliceArgs = {}) => {
       const operational = {};
       for (const k of RUN_OPERATIONAL_ARGS) if (sliceArgs != null && k in sliceArgs) operational[k] = sliceArgs[k];
-      const manual = Array.isArray(operational.manualReportKeys);
+      // Fix 3: classify manual vs scheduled BEFORE any settings I/O. null/undefined => scheduled; an Array
+      // (including []) => manual. ANY other value is a MALFORMED manual request that fails closed IMMEDIATELY
+      // -- zero settings reads, discovery, store calls, writes, or DataDoe calls. (The dispatcher re-validates
+      // it too, but that runs only AFTER the durable settings load, so this pre-check keeps the read off.)
+      const mrk = operational.manualReportKeys;
+      if (mrk != null && !Array.isArray(mrk)) {
+        throw new Error(`buildSchedulerV2Runtime.run: manualReportKeys must be null/undefined (scheduled) or an array (manual, including []); got ${typeof mrk}. Refusing (fail closed).`);
+      }
+      const manual = Array.isArray(mrk);
       // Durable, trusted settings for the scheduled path (never caller-supplied). Loaded (and possibly
       // failing closed) BEFORE the dispatcher touches discovery/cycle/store/DataDoe.
       const settings = manual ? [] : await loadDurableSettings();
@@ -245,6 +253,19 @@ export function schedulerV2Preflight(overrides = {}) {
   let audit = null;
   if (typeof readFile === "function") {
     try { audit = auditSchemaContract({ readFile }); } catch (_e) { audit = { ok: false, matrix: [], blockers: [{ code: "AUDIT_FAILED", message: "schema audit could not run" }], requiredWrappers: { total: 0, missing: [], ok: false } }; }
+    // Fix 2: DEFENSIVELY normalize the result so a malformed/partial audit can NEVER crash the preflight with a
+    // TypeError (audit.requiredWrappers / audit.blockers / audit.matrix). Missing pieces become fail-closed
+    // defaults + an AUDIT_MALFORMED blocker, so an unexpected shape fails closed rather than passing vacuously.
+    const rw = audit && audit.requiredWrappers;
+    const malformed = !audit || !Array.isArray(audit.blockers) || !Array.isArray(audit.matrix)
+      || !rw || typeof rw !== "object" || !Array.isArray(rw.missing);
+    audit = {
+      ok: !!audit && audit.ok === true && !malformed,
+      matrix: audit && Array.isArray(audit.matrix) ? audit.matrix : [],
+      blockers: audit && Array.isArray(audit.blockers) ? audit.blockers.slice() : [],
+      requiredWrappers: rw && Array.isArray(rw.missing) ? { total: Number(rw.total) || 0, missing: rw.missing, ok: rw.ok === true } : { total: 0, missing: [], ok: false },
+    };
+    if (malformed) audit.blockers.push({ code: "AUDIT_MALFORMED", message: "schema audit returned a malformed result; failing closed" });
   }
 
   // 3) Supabase wrapper availability. With an injected wrapper module: a runtime typeof check. Otherwise: the

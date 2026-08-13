@@ -301,6 +301,51 @@ test("(audit blocker 3) RPC param rename, comment-only constraint, removed named
   assert.equal(auditSchemaContract({ readFile: (n) => base[n] }).requiredWrappers.ok, true, "all required wrappers exported in the real source");
 });
 
+test("(audit fix 1) named constraints are PROVEN for the expected table by kind/body: ADD->DROP, wrong table, mutated CHECK/FK all fail; canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const named = (r) => r.blockers.filter((b) => b.code === "NAMED_CONSTRAINT_MISSING");
+  // canonical: the real migrations prove every named constraint (inline CREATE-body AND ALTER TABLE ADD forms).
+  assert.equal(A().blockers.filter((b) => b.code === "NAMED_CONSTRAINT_MISSING").length, 0, "canonical migrations prove all named constraints");
+  // ADD then DROP the one-attempt CHECK => not proven (present-then-removed).
+  const dropped = A((n, t) => n === "20260807_scheduler_v2.sql" ? t + "\nalter table public.sync_source_jobs drop constraint sync_source_jobs_one_attempt;\n" : t);
+  assert.ok(named(dropped).some((b) => b.constraints.includes("sync_source_jobs_one_attempt")), "ADD->DROP one_attempt => NAMED_CONSTRAINT_MISSING");
+  // Correct name on the WRONG table (move the connection_id CHECK's ALTER to a different table) => not proven.
+  const wrongTable = A((n, t) => n === "20260811_sync_source_job_owners.sql"
+    ? t.replace("alter table public.sync_source_job_owners\n      add constraint sync_source_job_owners_connection_id_check", "alter table public.sync_cycles\n      add constraint sync_source_job_owners_connection_id_check")
+    : t);
+  assert.ok(named(wrongTable).some((b) => b.constraints.includes("sync_source_job_owners_connection_id_check")), "correct name on the wrong table => NAMED_CONSTRAINT_MISSING");
+  // Mutated CHECK body (create_export_count = 1 -> = 2) => not proven.
+  const badCheck = A((n, t) => n === "20260807_scheduler_v2.sql" ? t.replace("create_export_count = 1", "create_export_count = 2") : t);
+  assert.ok(named(badCheck).some((b) => b.constraints.includes("sync_source_jobs_one_attempt")), "mutated one_attempt CHECK body => NAMED_CONSTRAINT_MISSING");
+  // Mutated FK target (references public.sync_source_jobs -> public.sync_cycles) => not proven.
+  const badFk = A((n, t) => n === "20260811_sync_source_job_owners.sql" ? t.replace("references public.sync_source_jobs", "references public.sync_cycles") : t);
+  assert.ok(named(badFk).some((b) => b.constraints.includes("sync_source_job_owners_source_fk")), "mutated FK target => NAMED_CONSTRAINT_MISSING");
+  // Mutated FK columns => not proven.
+  const badFkCols = A((n, t) => n === "20260811_sync_source_job_owners.sql" ? t.replace("foreign key (cycle_id, request_hash)", "foreign key (cycle_id, owner_id)") : t);
+  assert.ok(named(badFkCols).some((b) => b.constraints.includes("sync_source_job_owners_source_fk")), "mutated FK columns => NAMED_CONSTRAINT_MISSING");
+});
+
+test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blockers,requiredWrappers}; a null/throwing supabase.js reader never crashes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  const shapeOk = (r) => r && typeof r.ok === "boolean" && Array.isArray(r.matrix) && Array.isArray(r.blockers)
+    && r.requiredWrappers && typeof r.requiredWrappers.total === "number" && Array.isArray(r.requiredWrappers.missing) && typeof r.requiredWrappers.ok === "boolean";
+  const nullSrc = auditSchemaContract({ readFile: (n) => (n === "supabase.js" ? null : base[n]) });
+  assert.ok(shapeOk(nullSrc), "missing supabase.js still returns the TOTAL result shape");
+  assert.equal(nullSrc.ok, false);
+  assert.ok(nullSrc.blockers.some((b) => b.code === "WRAPPER_SOURCE_MISSING"), "missing wrapper source => typed WRAPPER_SOURCE_MISSING");
+  assert.equal(nullSrc.requiredWrappers.ok, false);
+  const throwSrc = auditSchemaContract({ readFile: (n) => { if (n === "supabase.js") throw new Error("EACCES"); return base[n]; } });
+  assert.ok(shapeOk(throwSrc), "a throwing supabase.js reader still returns the TOTAL result shape (no crash)");
+  // The preflight must also survive a missing wrapper source WITHOUT crashing, returning typed safe blockers.
+  const pf = schedulerV2Preflight({ env: { DATADOE_API_KEY: "x", SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k" }, getConnections: () => CONNS, controlCatalog: mkCatalog([]), readFile: (n) => (n === "supabase.js" ? null : "x") });
+  assert.equal(pf.ready, false, "preflight fails closed when the wrapper source is unreadable");
+  assert.equal(pf.checks.wrappers.ok, false, "wrapper availability is NOT claimed proven");
+  assert.ok(pf.blockers.every((b) => typeof b.code === "string"), "every preflight blocker is a typed safe code");
+  assert.ok(!JSON.stringify(pf).includes(PRIMARY_KEY), "no secret in preflight telemetry");
+});
+
 /* ===================== dispatch behavior via the composed runtime ===================== */
 
 group("runtime composition: dispatch behavior (cache-only, locked, ready cycle, discovery)");
@@ -441,6 +486,35 @@ test("(blocker 4: locked zero-I/O) default-locked MANUAL and SCHEDULED runs retu
   expectDrained(await make().run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10" }));                                    // SCHEDULED locked
   assert.equal(discovery, 0, "discovery NEVER ran for a locked invocation (zero I/O before dispatch)");
   assert.equal(settings, 1, "only the scheduled run loaded durable settings once (a control READ); the manual run loaded none");
+});
+
+test("(fix 3) a malformed manualReportKeys fails closed BEFORE any settings read / discovery / store / DataDoe; null=scheduled, []=manual are preserved", async () => {
+  let settings = 0, discovery = 0;
+  const rt = buildSchedulerV2Runtime({
+    connections: CONNS,
+    makeSourceStore: () => throwingHalf(SOURCE_METHODS, "source"),
+    makeReportStore: () => throwingHalf(REPORT_METHODS, "report"),
+    makeDataDoeAdapter: () => ({ create: () => { throw new Error("create"); }, poll: () => {}, download: () => {} }),
+    makeShadowSnapshotSaver: () => (() => { throw new Error("save"); }),
+    fetchAccounts: async () => { discovery += 1; throw new Error("discovery"); },
+    getReportSyncSettings: async () => { settings += 1; return []; },
+    controlCatalog: () => [], // nothing v2-ready
+  });
+  // Every non-null, non-array manualReportKeys is a malformed manual request that fails closed with ZERO I/O.
+  for (const bad of ["brand-sales", 123, {}, true, () => {}]) {
+    await assert.rejects(rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", manualReportKeys: bad }), /manualReportKeys must be null\/undefined .* or an array .* Refusing \(fail closed\)/s);
+  }
+  assert.equal(settings, 0, "a malformed manual request read ZERO durable settings");
+  assert.equal(discovery, 0, "a malformed manual request performed ZERO discovery / store / DataDoe");
+  // null/undefined => scheduled (loads durable settings once, then locked zero-I/O); [] => manual (loads none).
+  const rSched = await rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10" });
+  assert.deepEqual(rSched.selected, [], "scheduled run stays readiness-gated (nothing v2-ready)");
+  assert.equal(settings, 1, "the scheduled run loaded durable settings once");
+  const rEmpty = await rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", manualReportKeys: [] });
+  assert.equal(rEmpty.manual, true, "[] is a manual request");
+  assert.deepEqual(rEmpty.selected, [], "manual [] selects nothing");
+  assert.equal(settings, 1, "manual [] loaded NO additional durable settings");
+  assert.equal(discovery, 0, "no discovery across the locked scheduled + empty-manual runs");
 });
 
 /* ===================== telemetry safety: no secrets / raw errors ===================== */

@@ -21,7 +21,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "sync_cycles",
         unique: [["bucket", "cycle_date"]],
-        namedConstraints: ["sync_cycles_bucket_date_unique"],
+        namedConstraints: [{ name: "sync_cycles_bucket_date_unique", kind: "unique", columns: ["bucket", "cycle_date"] }],
         keyColumns: ["id", "bucket", "cycle_date", "trigger", "status", "scheduled_at", "started_at", "finished_at",
           "source_total", "source_succeeded", "source_failed", "report_total", "report_succeeded", "report_failed", "counts"],
       },
@@ -29,8 +29,11 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         name: "sync_source_jobs",
         unique: [["cycle_id", "request_hash"]],
         // The one-attempt invariant the rollout token budget relies on (DB-level "one create-export per
-        // (cycle, request_hash)") + the dedup unique. Both are NAMED and audited by name.
-        namedConstraints: ["sync_source_jobs_cycle_hash_unique", "sync_source_jobs_one_attempt"],
+        // (cycle, request_hash)") + the dedup unique. Audited by name, KIND, and (for the CHECK) body tokens.
+        namedConstraints: [
+          { name: "sync_source_jobs_cycle_hash_unique", kind: "unique", columns: ["cycle_id", "request_hash"] },
+          { name: "sync_source_jobs_one_attempt", kind: "check", must: ["create_export_count = 0", "attempted_at is null", "create_export_count = 1", "attempted_at is not null"] },
+        ],
         keyColumns: ["cycle_id", "request_hash", "source_id", "source_key", "organization_fingerprint", "connection_id",
           "account_scope_hash", "request_meta", "bucket", "fetch_status", "attempted_at", "create_export_count",
           "export_id", "error_stage", "error_code", "error_message", "terminal", "row_count", "payload_bytes", "cache_object_path"],
@@ -38,7 +41,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "sync_report_jobs",
         unique: [["cycle_id", "report_key", "account_id"]],
-        namedConstraints: ["sync_report_jobs_cycle_report_account_unique"],
+        namedConstraints: [{ name: "sync_report_jobs_cycle_report_account_unique", kind: "unique", columns: ["cycle_id", "report_key", "account_id"] }],
         keyColumns: ["cycle_id", "report_key", "report_version", "account_id", "connection_id", "bucket", "depends_on",
           "fetch_status", "derive_status", "save_status", "validated", "error_stage", "error_code", "latest_data_date", "snapshot_params_hash"],
       },
@@ -84,8 +87,13 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         unique: [["cycle_id", "request_hash", "owner_id"]],
         // The composite FK to the canonical source-job identity + the owner identity/connection invariants
         // the rollout relies on (a malformed owner row must fail the migration, never route to primary).
-        namedConstraints: ["sync_source_job_owners_unique", "sync_source_job_owners_source_fk",
-          "sync_source_job_owners_connection_id_check", "sync_source_job_owners_identity_nonempty"],
+        // Audited by name, KIND, columns, FK target, and CHECK body tokens -- scoped to THIS table.
+        namedConstraints: [
+          { name: "sync_source_job_owners_unique", kind: "unique", columns: ["cycle_id", "request_hash", "owner_id"] },
+          { name: "sync_source_job_owners_source_fk", kind: "foreign key", columns: ["cycle_id", "request_hash"], references: { table: "sync_source_jobs", columns: ["cycle_id", "request_hash"] } },
+          { name: "sync_source_job_owners_connection_id_check", kind: "check", must: ["connection_id in", "'primary'", "'dd-secondary'"] },
+          { name: "sync_source_job_owners_identity_nonempty", kind: "check", must: ["char_length(report_key) > 0", "char_length(account_id) > 0", "char_length(request_key) > 0", "char_length(organization_fingerprint) > 0", "char_length(account_scope_hash) > 0"] },
+        ],
         keyColumns: ["cycle_id", "request_hash", "owner_id", "request_key", "report_key", "account_id",
           "connection_id", "organization_fingerprint", "account_scope_hash", "owner_status", "error_code"],
       },
@@ -146,10 +154,80 @@ function keyIsBacked(body, cols) {
   return false;
 }
 
-// A NAMED constraint (inline `constraint <name> ...` OR `alter table ... add constraint <name> ...`) present
-// anywhere in the comment-stripped migration. Audits the critical rollout invariants by NAME.
-function namedConstraintPresent(cleanSql, name) {
-  return new RegExp(`\\bconstraint\\s+${name}\\b`, "i").test(cleanSql);
+// Inner text of the balanced parenthetical starting at `text[openIdx] === "("`, or null.
+function extractBalancedAt(text, openIdx) {
+  if (openIdx < 0 || text[openIdx] !== "(") return null;
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i += 1) {
+    if (text[i] === "(") depth += 1;
+    else if (text[i] === ")") { depth -= 1; if (depth === 0) return text.slice(openIdx + 1, i); }
+  }
+  return null;
+}
+
+const normalizeSql = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+const splitCols = (inner) => normalizeSql(inner).split(",").map((c) => c.trim()).filter(Boolean);
+
+// Parse the constraint declaration that begins at `constraint <name>` inside `scopeText`. Returns
+// { kind, inner, ref } where kind is 'unique'|'primary key'|'check'|'foreign key', inner is the FIRST balanced
+// (...) after the kind keyword (columns for unique/pk/fk, the predicate for check), and ref (FK only) is the
+// referenced { table, columns }. Returns null if `constraint <name>` is absent from scopeText.
+function parseConstraintDecl(scopeText, name) {
+  const nameM = new RegExp(`\\bconstraint\\s+${name}\\b`, "i").exec(scopeText);
+  if (!nameM) return null;
+  const tail = scopeText.slice(nameM.index + nameM[0].length);
+  const kindM = /\b(primary\s+key|foreign\s+key|unique|check)\b/i.exec(tail);
+  if (!kindM) return { kind: null, inner: null, ref: null };
+  const kind = kindM[1].replace(/\s+/g, " ").toLowerCase();
+  const afterKind = tail.slice(kindM.index + kindM[0].length);
+  const inner = extractBalancedAt(afterKind, afterKind.indexOf("("));
+  let ref = null;
+  if (kind === "foreign key") {
+    const refM = /\breferences\s+public\.([a-z0-9_]+)\s*\(/i.exec(afterKind);
+    if (refM) {
+      const refOpen = afterKind.indexOf("(", refM.index + refM[0].length - 1);
+      ref = { table: refM[1].toLowerCase(), columns: splitCols(extractBalancedAt(afterKind, refOpen)) };
+    }
+  }
+  return { kind, inner, ref };
+}
+
+// Locate a named constraint's declaration SCOPED to `table`: either inline in that table's CREATE body, or via
+// `ALTER TABLE (ONLY)? public.<table> ... ADD CONSTRAINT <name> <decl>` (same statement, up to ';'). A
+// constraint declared on a DIFFERENT table, or only in a comment/string, is NOT found here.
+function namedConstraintScopedDecl(cleanSql, table, name) {
+  const body = tableBody(cleanSql, table);
+  if (body) { const inBody = parseConstraintDecl(body, name); if (inBody) return inBody; }
+  const alterRe = new RegExp(`alter\\s+table\\s+(?:only\\s+)?public\\.${table}\\b[^;]*?\\badd\\s+constraint\\s+${name}\\b([^;]*)`, "i");
+  const am = alterRe.exec(cleanSql);
+  if (am) return parseConstraintDecl(`constraint ${name} ${am[1]}`, name);
+  return null;
+}
+
+// A named constraint is PROVEN only when it is CREATED for the expected table (in that table's CREATE body or an
+// ALTER TABLE public.<table> ADD CONSTRAINT), is NOT dropped, and -- for critical invariants -- matches the
+// expected KIND and (unique/pk) columns, (fk) columns + reference target, or (check) required body tokens.
+// Returns { proven, reason }. A DROP CONSTRAINT of the name anywhere, a wrong-table declaration, or a
+// comment/string-only mention never passes.
+function namedConstraintProven(cleanSql, table, expected) {
+  const name = expected.name;
+  if (new RegExp(`\\bdrop\\s+constraint\\s+(?:if\\s+exists\\s+)?${name}\\b`, "i").test(cleanSql)) return { proven: false, reason: "dropped" };
+  const decl = namedConstraintScopedDecl(cleanSql, table, name);
+  if (!decl) return { proven: false, reason: "absent-or-wrong-table" };
+  if (expected.kind && decl.kind !== expected.kind) return { proven: false, reason: "kind-mismatch" };
+  if (expected.columns && !arraysEqual(splitCols(decl.inner || ""), expected.columns.map((c) => c.toLowerCase()))) {
+    return { proven: false, reason: "columns-mismatch" };
+  }
+  if (expected.references) {
+    const ok = decl.ref && decl.ref.table === expected.references.table && arraysEqual(decl.ref.columns, expected.references.columns.map((c) => c.toLowerCase()));
+    if (!ok) return { proven: false, reason: "fk-target-mismatch" };
+  }
+  if (expected.must) {
+    const body = normalizeSql(decl.inner || "");
+    const missing = expected.must.filter((s) => !body.includes(normalizeSql(s)));
+    if (missing.length) return { proven: false, reason: "check-body-mismatch" };
+  }
+  return { proven: true, reason: null };
 }
 
 // The RPC's declared parameter NAMES in signature order (comment-stripped), or null if the function is absent.
@@ -212,8 +290,15 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
 
   const wrapperSource = safeRead(wrapperSourceName);
   if (wrapperSource == null) {
-    // Without the wrapper source we cannot prove any contract; fail closed rather than pass vacuously.
-    return { ok: false, matrix: [], blockers: [{ code: "WRAPPER_SOURCE_MISSING", target: wrapperSourceName, message: "wrapper source file could not be read" }] };
+    // Without the wrapper source we cannot prove any contract; fail closed rather than pass vacuously. The
+    // result is still TOTAL -- {ok, matrix, blockers, requiredWrappers} -- so no caller (e.g. the preflight)
+    // ever dereferences an undefined field (fix 2). Every required wrapper is reported missing (unprovable).
+    return {
+      ok: false,
+      matrix: [],
+      blockers: [{ code: "WRAPPER_SOURCE_MISSING", target: wrapperSourceName, message: "wrapper source file could not be read" }],
+      requiredWrappers: { total: REQUIRED_WRAPPER_EXPORTS.length, missing: [...REQUIRED_WRAPPER_EXPORTS], ok: false },
+    };
   }
 
   const matrix = [];
@@ -231,16 +316,20 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       const declared = body != null;
       const backedUniques = (t.unique || []).filter((cols) => keyIsBacked(body, cols));
       const missingColumns = declared ? (t.keyColumns || []).filter((c) => !bodyDeclaresColumn(body, c)) : (t.keyColumns || []);
-      const missingNamed = (t.namedConstraints || []).filter((n) => !namedConstraintPresent(sql, n));
+      // Each named constraint must be PROVEN for THIS table (created in its CREATE body or via ALTER TABLE
+      // public.<table> ADD CONSTRAINT), not dropped, and matching the expected kind/columns/FK-target/CHECK
+      // body tokens. A wrong-table, dropped, or comment/string-only mention is unproven (fix 1).
+      const namedResults = (t.namedConstraints || []).map((c) => ({ name: c.name, ...namedConstraintProven(sql, t.name, c) }));
+      const unprovenNamed = namedResults.filter((r) => !r.proven);
       const referencedByWrapper = sourceReferencesTable(wrapperSource, t.name);
       if (!declared) blockers.push({ code: "TABLE_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is not created by ${entry.migration}` });
       if (declared && backedUniques.length !== (t.unique || []).length) {
         blockers.push({ code: "CONSTRAINT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing an expected primary-key/unique constraint the wrappers upsert on` });
       }
-      if (missingNamed.length) blockers.push({ code: "NAMED_CONSTRAINT_MISSING", migration: entry.migration, table: t.name, constraints: missingNamed, message: `table public.${t.name} is missing required named constraint(s): ${missingNamed.join(", ")}` });
+      if (unprovenNamed.length) blockers.push({ code: "NAMED_CONSTRAINT_MISSING", migration: entry.migration, table: t.name, constraints: unprovenNamed.map((r) => r.name), message: `table public.${t.name} has unproven required named constraint(s): ${unprovenNamed.map((r) => `${r.name} (${r.reason})`).join(", ")}` });
       if (missingColumns.length) blockers.push({ code: "COLUMN_MISSING", migration: entry.migration, table: t.name, columns: missingColumns, message: `table public.${t.name} is missing wrapper-required column(s): ${missingColumns.join(", ")}` });
       if (!referencedByWrapper) blockers.push({ code: "TABLE_WRAPPER_MISSING", migration: entry.migration, table: t.name, message: `no wrapper references table public.${t.name}` });
-      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: (t.namedConstraints || []).filter((n) => !missingNamed.includes(n)), missingColumns, referencedByWrapper });
+      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper });
     }
     for (const r of entry.rpcs) {
       const actualParams = rpcParamNames(sql, r.name);
