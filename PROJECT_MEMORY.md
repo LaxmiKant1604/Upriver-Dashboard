@@ -8122,3 +8122,46 @@ durable controls, all paused; code readiness allowlist empty; zero DataDoe calls
 schedules; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; four migration
 files byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched. STOP for Codex
 review + separate approval before Gate 1d.
+
+## Scheduler v2: Rollout Gate 1d PREPARED (offline; migration 4 NOT applied) (2026-08-13)
+
+Offline/read-only preparation ONLY for Gate 1d (`20260811_sync_source_job_owners.sql`); NOT executed. No
+production connection this tranche. Full package in SCHEDULER_V2_ROLLOUT.md Appendix H. HIGHER RISK: this
+migration supports BOTH a fresh-table path and an earlier-shape UPGRADE path (backfill + NOT NULL + constraints);
+this rollout authorizes ONLY the fresh path (Branch A).
+
+- Migration 4 frozen: SHA-256 49628c8d...54d98669 (unchanged). Per existing evidence: migrations 1-3 applied
+  once, migration 4 unapplied (no production query).
+- Migration 4 objects (inspected): table public.sync_source_job_owners with EXACTLY 15 columns (id uuid PK
+  gen_random_uuid(); cycle_id uuid NN; request_hash text NN; owner_id text NN; request_key text NN; report_key
+  text NN; account_id text NN; connection_id text -> converged NN default 'primary'; organization_fingerprint
+  text NN; account_scope_hash text NN; owner_status text NN default 'active'; error_code text; error_message
+  text; created_at tstz NN now(); updated_at tstz NN now()); PK(id); UNIQUE membership
+  sync_source_job_owners_unique(cycle_id,request_hash,owner_id); FK cycle_id->sync_cycles(id) ON DELETE CASCADE;
+  composite FK sync_source_job_owners_source_fk(cycle_id,request_hash)->sync_source_jobs(cycle_id,request_hash)
+  ON DELETE CASCADE; CHECK owner_status in (active,stale); named CHECK connection_id in (primary,dd-secondary);
+  named CHECK identity_nonempty (5 char_length>0 fields ANDed); connection_id backfill (dd-secondary: prefix ->
+  dd-secondary; others null -> primary; never downgrades secondary); drop unsafe defaults + SET NOT NULL; two
+  explicit indexes (owner_idx (cycle_id,owner_id), hash_idx (cycle_id,request_hash)); touch trigger; RLS + one
+  admin SELECT policy. request_hash and owner_id NEVER rewritten; no secret/DataDoe/RPC/schedule/control change.
+- Replay: raw SQL idempotent, but the ledger + advisory-locked apply must still refuse a repeat.
+- Prepared: H.2 pre-apply inventory with TWO BRANCHES -- Branch A (owner table absent) fresh-path eligible,
+  owner constraints/indexes/trigger/policy absent; Branch B (table exists) STOP + read-only classification (blank
+  identity, null/invalid connection_id, dd-secondary-labelled-primary, nonsecondary null conn, duplicate
+  memberships, dangling source/cycle) returned for a SEPARATE upgrade-path review (no repair/delete). Ledger
+  requires m1/m2/m3==1, m4 absent; prerequisites sync_cycles + sync_source_jobs (+ its UNIQUE(cycle_id,
+  request_hash)) + touch_updated_at()/is_dashboard_admin()/authenticated/service_role; sync_cycles empty; 13
+  paused controls. H.3 hardened FRESH-PATH apply (advisory key (20260811,1); require migrations 1-3 exactly once;
+  refuse if migration 4 recorded; RE-CHECK sync_source_job_owners ABSENT inside the locked txn -- fresh-path only,
+  refuse+rollback if it exists; plain INSERT; rollback on error; not db:migrate). H.4 structural verification
+  (15 columns exact; PK(id); UNIQUE; both FKs; three CHECKs; the 2 explicit indexes + PK/unique; trigger; RLS +
+  one SELECT policy; zero owner rows; ledger 1/1/1/1; sync_cycles + sync_source_jobs + ads_sync_coverage empty;
+  13 paused controls; no new RPC; no cron; allowlist empty). H.5 stop conditions (no destructive rollback/repair/
+  backfill/delete/DROP).
+- Authorization: Gate 1d execution authorized ONLY when Branch A (fresh) is confirmed; never auto-apply over an
+  existing earlier-shape table.
+
+CONFIRMED: no production connection; no Supabase writes; migration 4 UNAPPLIED; zero DataDoe calls; all controls
+paused and locked (allowlist empty); zero schedules/cycles; nothing pushed/merged/deployed; Scheduler v1 +
+frontend + routes + cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex review + explicit approval before executing Gate 1d.

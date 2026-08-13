@@ -203,7 +203,7 @@ report. **Approval gate per report.**
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
   - [x] **Gate 1c — `20260810_report_sync_controls.sql` applied 2026-08-13** (execution evidence in Appendix G; F.2 clear, X1–X11 all pass).
-  - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
+  - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` — package prepared (Appendix H); **NOT executed** — awaiting separate Codex review + approval. Fresh-path (Branch A) only; an existing owner table (Branch B) STOPs for a separate upgrade-path review.
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
@@ -1127,3 +1127,294 @@ cron untouched.
 
 **STOP.** Gate 1d (`20260811_sync_source_job_owners.sql`), the canary, and any control unlock remain
 **unapproved** — stop for Codex review and separate approval before preparing or executing Gate 1d.
+
+---
+
+## Appendix H — Gate 1d package: apply ONLY `20260811_sync_source_job_owners.sql` (PREPARED — NOT executed)
+
+> **NOTHING in this appendix has been run.** It is the exact package a reviewer/operator executes **after
+> written approval**, one migration only, then STOPS. Gates 1a–1c (migrations 1–3) are already applied and
+> verified (Appendices C, E, G). **Higher risk:** this migration supports BOTH a fresh-table path **and** an
+> earlier-shape UPGRADE path (backfill + `NOT NULL` + constraints). **This rollout authorizes ONLY the fresh
+> path (Branch A).** If the owner table already exists (Branch B), STOP and return for a separate upgrade-path
+> review — do **NOT** auto-apply over an existing table.
+
+Frozen input: `20260811_sync_source_job_owners.sql` SHA-256 `49628c8d…54d98669` (Gate 0). **Do NOT use `npm run
+db:migrate`.**
+
+### H.1 What migration 4 changes (accurate characterization)
+
+- **Deletes nothing** (never `DROP TABLE`/`TRUNCATE`; the only DROPs are `DROP TRIGGER IF EXISTS` / `DROP POLICY
+  IF EXISTS` for its OWN trigger/policy, immediately re-created; changes NO other table).
+- **Creates one table** `public.sync_source_job_owners` — **15 columns** (fresh-path order): `id uuid PK default
+  gen_random_uuid()`, `cycle_id uuid NOT NULL`, `request_hash text NOT NULL`, `owner_id text NOT NULL`,
+  `request_key text NOT NULL`, `report_key text NOT NULL`, `account_id text NOT NULL`, `connection_id text`
+  (converged to `NOT NULL default 'primary'`), `organization_fingerprint text NOT NULL`, `account_scope_hash text
+  NOT NULL`, `owner_status text NOT NULL default 'active'`, `error_code text`, `error_message text`, `created_at
+  timestamptz NOT NULL default now()`, `updated_at timestamptz NOT NULL default now()`.
+- **Constraints:** PK `(id)`; UNIQUE membership `sync_source_job_owners_unique (cycle_id, request_hash,
+  owner_id)`; FK `cycle_id → sync_cycles(id) ON DELETE CASCADE`; composite FK `sync_source_job_owners_source_fk
+  (cycle_id, request_hash) → sync_source_jobs(cycle_id, request_hash) ON DELETE CASCADE`; CHECK `owner_status in
+  ('active','stale')`; named CHECK `sync_source_job_owners_connection_id_check` (`connection_id in
+  ('primary','dd-secondary')`); named CHECK `sync_source_job_owners_identity_nonempty` (`char_length > 0` for
+  report_key AND account_id AND request_key AND organization_fingerprint AND account_scope_hash).
+- **Convergence (runs on both paths; no-ops on a fresh 0-row table):** `ADD COLUMN IF NOT EXISTS connection_id`;
+  deterministic `connection_id` backfill (a `dd-secondary:`-prefixed account ⇒ `dd-secondary`; other NULLs ⇒
+  `primary`; **never downgrades** a secondary to primary); a fail-closed DO block that ABORTS if any existing row
+  has a blank identity field or a null/invalid `connection_id`; removal of unsafe blank defaults + `SET NOT NULL`
+  on report_key/account_id/organization_fingerprint/account_scope_hash + `connection_id SET NOT NULL SET DEFAULT
+  'primary'`.
+- **Two explicit indexes:** `sync_source_job_owners_owner_idx (cycle_id, owner_id)`,
+  `sync_source_job_owners_hash_idx (cycle_id, request_hash)` (plus the PK + unique-constraint indexes).
+- **Trigger** `sync_source_job_owners_touch` — `BEFORE UPDATE` → `touch_updated_at()`.
+- **RLS enabled; one policy** `admins read sync source job owners`: SELECT, to `authenticated`, `USING
+  is_dashboard_admin()`. No browser-write policy.
+- `request_hash` and `owner_id` are **NEVER rewritten** (no `ALTER` touches them). **No secret is stored; no
+  DataDoe call; no RPC; no schedule; no control change.**
+- **Prerequisites:** `sync_cycles` + `sync_source_jobs` (FK targets — incl. the `sync_source_jobs` UNIQUE
+  `(cycle_id, request_hash)` the composite FK references), `touch_updated_at()`, `is_dashboard_admin()`, the
+  `authenticated` + `service_role` roles; Migrations 1–3 already applied.
+- **Replay:** the raw SQL is idempotent (create/add-if-not-exists, guarded `ADD CONSTRAINT`, DROP/CREATE
+  trigger+policy, idempotent `ALTER`s), but the ledger + advisory-locked apply MUST still refuse a repeat.
+
+### H.2 Pre-apply read-only inventory — TWO BRANCHES (run + REVIEW FIRST)
+
+**Ledger + prerequisites (both branches):**
+
+```sql
+-- Q1) ledger: Migrations 1-3 each EXACTLY once, Migration 4 absent (guarded DO block; SAFE if ledger absent)
+do $$
+declare v_ledger boolean := to_regclass('public.app_schema_migrations') is not null;
+  v1 int:=0; v2 int:=0; v3 int:=0; v4 int:=0;
+begin
+  if v_ledger then
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v1 using '20260807_scheduler_v2.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v2 using '20260810_ads_sync_coverage.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v3 using '20260810_report_sync_controls.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v4 using '20260811_sync_source_job_owners.sql';
+  end if;
+  raise notice 'ledger:% m1:% m2:% m3:% m4:%', v_ledger, v1, v2, v3, v4;
+  if not v_ledger then raise exception 'STOP: ledger absent'; end if;
+  if v1<>1 then raise exception 'STOP: Migration 1 rows=%', v1; end if;
+  if v2<>1 then raise exception 'STOP: Migration 2 rows=%', v2; end if;
+  if v3<>1 then raise exception 'STOP: Migration 3 rows=%', v3; end if;
+  if v4<>0 then raise exception 'STOP: Migration 4 already recorded (rows=%)', v4; end if;
+end $$;
+-- Expected NOTICE: "ledger:true m1:1 m2:1 m3:1 m4:0".
+
+-- Q2) prerequisites: FK-target tables; the exact sync_source_jobs UNIQUE(cycle_id,request_hash); helpers; roles;
+--     and the shadow invariants (sync_cycles empty, 13 paused controls)
+select to_regclass('public.sync_cycles') as sync_cycles,            -- expect non-NULL
+       to_regclass('public.sync_source_jobs') as sync_source_jobs;   -- expect non-NULL
+select con.conname, pg_get_constraintdef(con.oid) as def
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='sync_source_jobs' and con.contype='u'
+   and pg_get_constraintdef(con.oid) ilike '%(cycle_id, request_hash)%';  -- expect the UNIQUE (cycle_id, request_hash)
+select to_regprocedure('public.touch_updated_at()') as touch_updated_at,       -- expect non-NULL
+       to_regprocedure('public.is_dashboard_admin()') as is_dashboard_admin;    -- expect non-NULL
+select rolname from pg_roles where rolname in ('authenticated','service_role') order by rolname;  -- expect 2 rows
+select (select count(*) from public.sync_cycles) as sync_cycles_rows;   -- expect 0 (remains empty)
+select count(*) as controls_total, count(*) filter (where schedule_enabled) as controls_enabled
+  from public.report_sync_settings;  -- expect 13 and 0
+
+-- Q3) BRANCH DISCRIMINATOR
+select to_regclass('public.sync_source_job_owners') as owner_table;   -- NULL => Branch A; non-NULL => Branch B
+```
+
+**Branch A — `sync_source_job_owners` ABSENT (fresh-path eligible; this rollout applies ONLY here):**
+
+```sql
+-- A1) confirm EVERY owner object is ABSENT (expect 0 rows from each)
+select conname from pg_constraint where conname in
+  ('sync_source_job_owners_unique','sync_source_job_owners_source_fk',
+   'sync_source_job_owners_connection_id_check','sync_source_job_owners_identity_nonempty');  -- expect 0
+select indexname from pg_indexes where schemaname='public'
+  and indexname in ('sync_source_job_owners_owner_idx','sync_source_job_owners_hash_idx');    -- expect 0
+select tgname from pg_trigger where not tgisinternal and tgname='sync_source_job_owners_touch';  -- expect 0
+select pol.polname from pg_policy pol join pg_class rel on rel.oid=pol.polrelid
+ where rel.relname='sync_source_job_owners';  -- expect 0
+```
+
+Branch A ⇒ record **fresh-path eligible**; after approval, proceed to H.3.
+
+**Branch B — `sync_source_job_owners` ALREADY EXISTS ⇒ STOP; do NOT apply.** Collect the exact current shape and
+a read-only row classification for a **separate upgrade-path review**. Repair/delete NOTHING.
+
+```sql
+-- B0) exact current shape
+select ordinal_position, column_name, data_type, is_nullable, column_default from information_schema.columns
+ where table_schema='public' and table_name='sync_source_job_owners' order by ordinal_position;
+select con.conname, con.contype, pg_get_constraintdef(con.oid) def from pg_constraint con
+  join pg_class rel on rel.oid=con.conrelid where rel.relname='sync_source_job_owners' order by con.conname;
+select indexname, indexdef from pg_indexes where schemaname='public' and tablename='sync_source_job_owners';
+select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) from pg_trigger tg
+  join pg_class rel on rel.oid=tg.tgrelid where rel.relname='sync_source_job_owners' and not tg.tgisinternal;
+select pol.polname, pol.polcmd, pg_get_expr(pol.polqual,pol.polrelid) from pg_policy pol
+  join pg_class rel on rel.oid=pol.polrelid where rel.relname='sync_source_job_owners';
+select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='sync_source_job_owners';
+select count(*) as row_count from public.sync_source_job_owners;
+
+-- B1) read-only row classification (each a COUNT; DO NOT repair/delete)
+select
+  count(*) filter (where coalesce(report_key,'')='' or coalesce(account_id,'')='' or coalesce(request_key,'')=''
+    or coalesce(organization_fingerprint,'')='' or coalesce(account_scope_hash,'')='') as blank_identity,
+  count(*) filter (where connection_id is null or connection_id not in ('primary','dd-secondary')) as null_or_invalid_conn,
+  count(*) filter (where account_id like 'dd-secondary:%' and connection_id='primary') as secondary_labelled_primary,
+  count(*) filter (where account_id not like 'dd-secondary:%' and connection_id is null) as nonsecondary_null_conn
+  from public.sync_source_job_owners;
+select count(*) as duplicate_memberships from (
+  select cycle_id, request_hash, owner_id from public.sync_source_job_owners group by 1,2,3 having count(*)>1) d;
+select count(*) as dangling_source from public.sync_source_job_owners o
+ where not exists (select 1 from public.sync_source_jobs j where j.cycle_id=o.cycle_id and j.request_hash=o.request_hash);
+select count(*) as dangling_cycle from public.sync_source_job_owners o
+ where not exists (select 1 from public.sync_cycles c where c.id=o.cycle_id);
+```
+
+Branch B result ⇒ **return for a separate upgrade-path review; do NOT auto-apply over an existing table.**
+
+**STOP (do not apply) if:** Q1 raises; Q2 shows a missing prerequisite / the `sync_source_jobs` UNIQUE
+`(cycle_id, request_hash)` absent / `sync_cycles` non-empty / not 13 paused controls; Branch A shows any owner
+object already present; **or Branch B applies at all** (owner table exists).
+
+### H.3 Hardened FRESH-PATH apply (single migration, single transaction, advisory-locked, fresh-path-only)
+
+Advisory key = `(20260811, 1)`. Requires Migrations 1–3 each exactly once, refuses a recorded Migration 4, and —
+critically — **re-checks INSIDE the locked transaction that `sync_source_job_owners` is ABSENT** (fresh path
+only); if the table exists it rolls back and STOPs for the Branch-B upgrade review. Run from
+`sales-dashboard-live/`; `POSTGRES_URL` from `.env.local`, never printed.
+
+```bash
+node --input-type=module -e '
+import pg from "pg"; import { readFileSync } from "node:fs";
+const FILE = "20260811_sync_source_job_owners.sql";
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode","no-verify");
+const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+try {
+  await c.query("begin");
+  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260811, 1]);
+  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
+  for (const [f, n] of [["20260807_scheduler_v2.sql",1],["20260810_ads_sync_coverage.sql",2],["20260810_report_sync_controls.sql",3]]) {
+    const r = await c.query("select count(*)::int as n from public.app_schema_migrations where filename=$1", [f]);
+    if (r.rows[0].n !== 1) throw new Error("REFUSING: expected exactly 1 Migration-" + n + " ledger row, found " + r.rows[0].n);
+  }
+  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [FILE]);
+  if (seen.rowCount) throw new Error("REFUSING: " + FILE + " already applied at " + seen.rows[0].applied_at);
+  const exists = await c.query("select to_regclass($1) as t", ["public.sync_source_job_owners"]);
+  if (exists.rows[0].t !== null) throw new Error("REFUSING: sync_source_job_owners already exists -- fresh-path apply only; run the Branch-B upgrade-path review");
+  await c.query(readFileSync("supabase/migrations/" + FILE, "utf8"));
+  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [FILE]);
+  await c.query("commit"); console.log("applied " + FILE);
+} catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
+'
+```
+
+### H.4 Post-apply STRUCTURAL verification (read-only, scoped to `public.sync_source_job_owners`; every mismatch is a STOP)
+
+```sql
+-- Y1) exactly 15 columns in order/type/nullability/default
+select ordinal_position, column_name, data_type, is_nullable, column_default from information_schema.columns
+ where table_schema='public' and table_name='sync_source_job_owners' order by ordinal_position;
+-- expect 15 rows:
+--  1 id                       uuid                     NO   gen_random_uuid()
+--  2 cycle_id                 uuid                     NO   (null)
+--  3 request_hash             text                     NO   (null)
+--  4 owner_id                 text                     NO   (null)
+--  5 request_key              text                     NO   (null)
+--  6 report_key               text                     NO   (null)
+--  7 account_id               text                     NO   (null)
+--  8 connection_id            text                     NO   'primary'::text
+--  9 organization_fingerprint text                     NO   (null)
+-- 10 account_scope_hash       text                     NO   (null)
+-- 11 owner_status             text                     NO   'active'::text
+-- 12 error_code               text                     YES  (null)
+-- 13 error_message            text                     YES  (null)
+-- 14 created_at               timestamp with time zone NO   now()
+-- 15 updated_at               timestamp with time zone NO   now()
+
+-- Y2) PRIMARY KEY (id)
+select pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='sync_source_job_owners' and con.contype='p';  -- expect PRIMARY KEY (id)
+
+-- Y3) UNIQUE membership (cycle_id, request_hash, owner_id)
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='sync_source_job_owners' and con.contype='u';
+-- expect: sync_source_job_owners_unique UNIQUE (cycle_id, request_hash, owner_id)
+
+-- Y4) the two FKs
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='sync_source_job_owners' and con.contype='f' order by con.conname;
+-- expect: FOREIGN KEY (cycle_id) REFERENCES sync_cycles(id) ON DELETE CASCADE;
+--         sync_source_job_owners_source_fk FOREIGN KEY (cycle_id, request_hash)
+--           REFERENCES sync_source_jobs(cycle_id, request_hash) ON DELETE CASCADE
+
+-- Y5) the three CHECKs
+select con.conname, pg_get_constraintdef(con.oid) def from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='sync_source_job_owners' and con.contype='c' order by con.conname;
+-- expect: owner_status = ANY (ARRAY['active'::text, 'stale'::text]);
+--         sync_source_job_owners_connection_id_check  connection_id = ANY (ARRAY['primary'::text, 'dd-secondary'::text]);
+--         sync_source_job_owners_identity_nonempty  char_length(report_key)>0 AND char_length(account_id)>0
+--           AND char_length(request_key)>0 AND char_length(organization_fingerprint)>0 AND char_length(account_scope_hash)>0
+
+-- Y6) indexes: the PK + unique + the two explicit owner/hash indexes (4 total)
+select indexname, indexdef from pg_indexes where schemaname='public' and tablename='sync_source_job_owners' order by indexname;
+-- expect: sync_source_job_owners_pkey (id); sync_source_job_owners_unique (cycle_id, request_hash, owner_id);
+--         sync_source_job_owners_owner_idx (cycle_id, owner_id); sync_source_job_owners_hash_idx (cycle_id, request_hash)
+
+-- Y7) trigger enabled, BEFORE UPDATE, touch_updated_at()
+select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) def from pg_trigger tg join pg_class rel on rel.oid=tg.tgrelid
+ where rel.relname='sync_source_job_owners' and not tg.tgisinternal;
+-- expect 1 row: sync_source_job_owners_touch, tgenabled='O', "... BEFORE UPDATE ON public.sync_source_job_owners
+--   FOR EACH ROW EXECUTE FUNCTION touch_updated_at()"
+
+-- Y8) RLS enabled + EXACTLY ONE policy (SELECT, authenticated only, USING is_dashboard_admin(), no WITH CHECK)
+select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='sync_source_job_owners';  -- expect true
+select pol.polname, pol.polcmd,
+       (select string_agg(rolname, ',' order by rolname) from pg_roles where oid = any(pol.polroles)) as roles,
+       pg_get_expr(pol.polqual, pol.polrelid) as using_qual, pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check
+  from pg_policy pol join pg_class rel on rel.oid=pol.polrelid where rel.relname='sync_source_job_owners';
+-- expect exactly 1 row: polcmd='r'; roles='authenticated'; using_qual='is_dashboard_admin()'; with_check NULL
+
+-- Y9) zero owner rows (fresh path)
+select count(*) as owner_rows from public.sync_source_job_owners;  -- expect 0
+
+-- Y10) ledger: Migrations 1-4 each EXACTLY one row
+select filename, count(*) as n from public.app_schema_migrations
+ where filename in ('20260807_scheduler_v2.sql','20260810_ads_sync_coverage.sql','20260810_report_sync_controls.sql','20260811_sync_source_job_owners.sql')
+ group by filename order by filename;  -- expect 4 rows, each n=1
+
+-- Y11) prior tables intact: sync_cycles empty, sync_source_jobs empty, ads_sync_coverage empty; 13 paused controls
+select (select count(*) from public.sync_cycles) as sync_cycles,
+       (select count(*) from public.sync_source_jobs) as sync_source_jobs,
+       (select count(*) from public.ads_sync_coverage) as ads_sync_coverage;  -- expect 0, 0, 0
+select count(*) as controls_total, count(*) filter (where schedule_enabled) as controls_enabled
+  from public.report_sync_settings;  -- expect 13 and 0
+
+-- Y12) no new RPC; no cron/schedule
+select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public' and proname ilike '%sync_source_job_owners%';  -- expect 0 rows
+select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no schedule; else check for sync jobs (expect 0)
+```
+
+**Also (offline / code — NOT a DB query):** confirm `SCHEDULER_V2_READY_REPORT_KEYS` is still `Object.freeze([])`
+(empty). Both gates stay closed — durable controls paused (Y11) AND the code allowlist empty.
+
+### H.5 Stop / rollback conditions (Gate 1d)
+
+- The apply is a single advisory-locked, fresh-path-only transaction with abort-on-error, so any failure leaves
+  the DB **unchanged** (no partial apply). STOP on any error (missing prerequisite, Migrations 1–3 not each
+  exactly once, Migration 4 already recorded, **or the owner table already exists** — the in-transaction fresh
+  guard). Do not retry.
+- **STOP on any structural mismatch:** ≠ 15 columns or any differing order/type/nullability/default (Y1 — esp.
+  `connection_id NOT NULL default 'primary'`, and report_key/account_id/organization_fingerprint/
+  account_scope_hash NOT NULL with no default); PK not `(id)` (Y2); UNIQUE not `(cycle_id, request_hash,
+  owner_id)` (Y3); either FK missing / wrong target / wrong `ON DELETE` (Y4); any of the three CHECKs missing or
+  not enforcing exactly `active|stale` / `primary|dd-secondary` / the 5-field non-empty AND (Y5); missing the two
+  explicit indexes or an unexpected extra index (Y6); the trigger absent/disabled/not BEFORE UPDATE/not
+  `touch_updated_at()` (Y7); RLS off, ≠ 1 policy, or a policy not SELECT / not authenticated-only / missing
+  `is_dashboard_admin()` / with a WITH CHECK (Y8); owner rows > 0 (Y9); any ledger filename ≠ exactly one row
+  (Y10); `sync_cycles`/`sync_source_jobs`/`ads_sync_coverage` non-empty or ≠ 13 paused controls (Y11); any new
+  RPC or cron entry (Y12); or `SCHEDULER_V2_READY_REPORT_KEYS` not empty (code check).
+- **No destructive rollback, repair, backfill, delete, or DROP** is prepared. Migration 4 is additive; while
+  every v2 control stays locked and paused (shadow), leaving it applied is safe and inert. A Branch-B upgrade is
+  a separate, reviewed path — never an automatic apply over an existing table.
+- Do **NOT** proceed to the canary or Gate 2. Stop for review + explicit human approval.
