@@ -201,7 +201,7 @@ report. **Approval gate per report.**
 - [x] Gate 0 — preconditions verified (offline evidence in Appendix A, 2026-08-13).
 - Gate 1a–1d — each migration applied (one at a time):
   - [x] **Gate 1a — `20260807_scheduler_v2.sql` applied 2026-08-13** (execution evidence in Appendix C; B.1 clear, B.4 V1–V11 all pass).
-  - [ ] Gate 1b — `20260810_ads_sync_coverage.sql` (**NOT executed** — awaiting separate Codex review + approval).
+  - [ ] Gate 1b — `20260810_ads_sync_coverage.sql` — package prepared (Appendix D); **NOT executed** — awaiting separate Codex review + approval.
   - [ ] Gate 1c — `20260810_report_sync_controls.sql` (**NOT executed**).
   - [ ] Gate 1d — `20260811_sync_source_job_owners.sql` (**NOT executed**).
 - [ ] Gate 2 — post-migration verification queries pass.
@@ -605,3 +605,204 @@ deployment/push/merge. Scheduler v1 / frontend / routes / cron untouched.
 
 **STOP.** Gates 1b–1d (migrations 2–4), the canary, and any control unlock remain **unapproved** — stop for
 Codex review and separate approval before Gate 1b.
+
+---
+
+## Appendix D — Gate 1b package: apply ONLY `20260810_ads_sync_coverage.sql` (PREPARED — NOT executed)
+
+> **NOTHING in this appendix has been run.** It is the exact package a reviewer/operator executes **after
+> written approval**, one migration only, then STOPS for verification before Gate 1c. Gate 1a (migration 1) is
+> already applied and verified (Appendix C).
+
+Frozen input: `20260810_ads_sync_coverage.sql` SHA-256 `0750a155…d859b724` (Gate 0). **Do NOT use `npm run
+db:migrate`** — it applies every pending file (migrations 2–4) at once.
+
+### D.1 What migration 2 changes (accurate characterization)
+
+- **Deletes nothing** (no `DROP`, no `TRUNCATE`, no change to any existing table or historical data).
+- **Creates one table** `public.ads_sync_coverage` (8 columns; a composite `PRIMARY KEY`; a `status` CHECK),
+  one index `ads_sync_coverage_lookup_idx`, and one trigger `ads_sync_coverage_touch_updated_at`
+  (`BEFORE UPDATE` → `touch_updated_at()`).
+- **Enables RLS** on the table and creates **NO policy**. Access model: no browser role (`anon`/`authenticated`)
+  has a policy, so browsers **cannot read or write** rows; the `service_role` key **bypasses RLS** (the scheduler
+  writes, the Daily loader reads). This is enforced by RLS-enabled + no-policy + service-role-bypass — **not** by
+  a table GRANT/ACL; **no table-level ACL exclusivity is asserted** (not verified).
+- Creates **NO RPC**, **NO schedule** (no `pg_cron`/`pg_net`), performs **NO DataDoe call**.
+- **Replay note:** unlike migration 1, migration 2's `create trigger` has **no** `drop trigger if exists`, so the
+  **raw SQL is NOT independently replay-idempotent** — re-running it raises "trigger already exists". This is
+  safe for the FIRST transactional apply, but the ledger + advisory-locked apply (D.3) **MUST refuse a repeat**
+  (it fails closed on the migration-2 ledger row), which is what prevents a second execution.
+- **Prerequisites:** `public.touch_updated_at()` (from `20260728_shared_dashboard.sql`) and the `service_role`
+  role; **Migration 1 must already be applied** (its ledger row present exactly once).
+
+### D.2 Pre-apply read-only inventory (run + REVIEW FIRST; STOP on any hit)
+
+Expected FIRST-APPLY state: ledger exists; **Migration 1 row present exactly once**; **Migration 2 row absent**;
+`ads_sync_coverage` + its index + its trigger **absent**; prerequisites present; Migration 1 objects still
+present (do not modify). Any pre-existing Migration-2 object, or a Migration-2 ledger row, is a **STOP**.
+
+```sql
+-- Q1) ledger state -- SAFE whether or not the ledger table exists. Migration 1 must be recorded EXACTLY once and
+--     Migration 2 must be absent. Emits a typed NOTICE; STOPs (raises) on a violation.
+do $$
+declare
+  v_ledger_exists boolean := to_regclass('public.app_schema_migrations') is not null;
+  v_m1 int := 0; v_m2 int := 0;
+begin
+  if v_ledger_exists then
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v_m1 using '20260807_scheduler_v2.sql';
+    execute 'select count(*) from public.app_schema_migrations where filename=$1' into v_m2 using '20260810_ads_sync_coverage.sql';
+  end if;
+  raise notice 'ledger_exists:% migration1_rows:% migration2_rows:%', v_ledger_exists, v_m1, v_m2;
+  if not v_ledger_exists then raise exception 'STOP: ledger table absent (Migration 1 must already be applied)'; end if;
+  if v_m1 <> 1 then raise exception 'STOP: expected exactly 1 Migration-1 ledger row, found %', v_m1; end if;
+  if v_m2 <> 0 then raise exception 'STOP: Migration 2 already recorded (% row(s)) -- do NOT re-apply', v_m2; end if;
+end $$;
+-- Expected NOTICE: "ledger_exists:true migration1_rows:1 migration2_rows:0".
+
+-- Q2) Migration 2 target objects must be ABSENT
+select to_regclass('public.ads_sync_coverage')            as ads_sync_coverage_table,  -- expect NULL
+       to_regclass('public.ads_sync_coverage_lookup_idx') as lookup_idx;               -- expect NULL
+select tgname from pg_trigger where not tgisinternal and tgname='ads_sync_coverage_touch_updated_at';  -- expect 0 rows
+select pol.polname from pg_policy pol join pg_class rel on rel.oid=pol.polrelid        -- expect 0 rows
+ where rel.relname='ads_sync_coverage';
+
+-- Q3) prerequisites must be present
+select to_regprocedure('public.touch_updated_at()') as touch_updated_at;               -- expect non-NULL
+select rolname from pg_roles where rolname='service_role';                             -- expect exactly 1 row
+
+-- Q4) Migration 1 objects must remain present (do NOT modify)
+select to_regclass('public.sync_cycles') a, to_regclass('public.sync_source_jobs') b, to_regclass('public.sync_report_jobs') c,
+       to_regprocedure('public.open_sync_cycle(text, date, timestamptz, text)') d,
+       to_regprocedure('public.claim_sync_cycle(uuid)') e,
+       to_regprocedure('public.claim_source_export_attempt(uuid, text)') f;            -- expect all non-NULL
+```
+
+**STOP (do not apply) if:** Q1 raises (ledger absent / Migration 1 ≠ 1 / Migration 2 already recorded); Q2
+returns any non-NULL or any row (a Migration-2 object already exists); Q3 shows a missing prerequisite; or Q4
+shows any Migration-1 object absent. Report the exact shape for review rather than applying over it.
+
+### D.3 Hardened apply command (single migration, single transaction, advisory-locked, ledger fail-closed)
+
+Advisory key for Gate 1b = `(20260810, 1)` — **distinct** from Gate 1a's `(20260807, 1)`. (Gate 1c
+`20260810_report_sync_controls.sql` shares the `20260810` date and MUST use a different key, e.g. `(20260810,
+2)`; Gate 1d → `(20260811, 1)`.) Run from `sales-dashboard-live/`; `POSTGRES_URL` is loaded from `.env.local`
+and never printed (as in Gate 1a).
+
+```bash
+node --input-type=module -e '
+import pg from "pg"; import { readFileSync } from "node:fs";
+const FILE = "20260810_ads_sync_coverage.sql";
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+try {
+  await c.query("begin");
+  // 1) transaction-scoped advisory lock (migration-2-specific key), BEFORE any ledger read.
+  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260810, 1]);
+  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
+  // 2) require Migration 1 applied EXACTLY once.
+  const m1 = await c.query("select count(*)::int as n from public.app_schema_migrations where filename=$1", ["20260807_scheduler_v2.sql"]);
+  if (m1.rows[0].n !== 1) throw new Error("REFUSING: expected exactly 1 Migration-1 ledger row, found " + m1.rows[0].n);
+  // 3) fail closed if Migration 2 already recorded (do NOT hide a repeat -- migration 2 is not replay-safe).
+  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [FILE]);
+  if (seen.rowCount) throw new Error("REFUSING: " + FILE + " already applied at " + seen.rows[0].applied_at);
+  // 4) apply migration 2 (its whole body runs inside this one transaction).
+  await c.query(readFileSync("supabase/migrations/" + FILE, "utf8"));
+  // 5) record the ledger row with a PLAIN insert (a duplicate raises -> rollback, surfacing a repeat).
+  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [FILE]);
+  await c.query("commit"); console.log("applied " + FILE);
+} catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
+'
+```
+
+### D.4 Post-apply STRUCTURAL verification (read-only, table-scoped; every mismatch is a STOP)
+
+```sql
+-- W1) table exists + EXACTLY 8 columns in this order/type/nullability/default
+select ordinal_position, column_name, data_type, is_nullable, column_default
+  from information_schema.columns
+ where table_schema='public' and table_name='ads_sync_coverage'
+ order by ordinal_position;
+-- expect exactly 8 rows:
+--  1 account_id          text                       NO   (null)
+--  2 source_key          text                       NO   (null)
+--  3 covered_from        date                       NO   (null)
+--  4 covered_to          date                       NO   (null)
+--  5 status              text                       NO   'succeeded'::text
+--  6 source_refreshed_at timestamp with time zone   NO   now()
+--  7 created_at          timestamp with time zone   NO   now()
+--  8 updated_at          timestamp with time zone   NO   now()
+
+-- W2) PRIMARY KEY exactly (account_id, source_key, covered_from, covered_to)
+select con.conname, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='ads_sync_coverage' and con.contype='p';
+-- expect: PRIMARY KEY (account_id, source_key, covered_from, covered_to)
+
+-- W3) the status CHECK permits EXACTLY 'succeeded' (single allowed value)
+select con.conname, pg_get_constraintdef(con.oid) as definition
+  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
+ where rel.relname='ads_sync_coverage' and con.contype='c';
+-- expect one CHECK equivalent to: (status = 'succeeded'::text)  -- i.e. only 'succeeded' is permitted
+
+-- W4) indexes: the PK unique index + ads_sync_coverage_lookup_idx (account_id, source_key, covered_from)
+select indexname, indexdef from pg_indexes
+ where schemaname='public' and tablename='ads_sync_coverage' order by indexname;
+-- expect ads_sync_coverage_lookup_idx = btree (account_id, source_key, covered_from)
+
+-- W5) trigger enabled, BEFORE UPDATE, calls touch_updated_at()
+select tg.tgname, tg.tgenabled, pg_get_triggerdef(tg.oid) as definition
+  from pg_trigger tg join pg_class rel on rel.oid=tg.tgrelid
+ where rel.relname='ads_sync_coverage' and not tg.tgisinternal;
+-- expect 1 row: tgenabled='O'; "... BEFORE UPDATE ON public.ads_sync_coverage FOR EACH ROW EXECUTE FUNCTION touch_updated_at()"
+
+-- W6) RLS enabled + ZERO policies
+select relrowsecurity from pg_class where relnamespace='public'::regnamespace and relname='ads_sync_coverage';  -- expect true
+select count(*) as policy_count from pg_policy pol join pg_class rel on rel.oid=pol.polrelid
+ where rel.relname='ads_sync_coverage';  -- expect 0
+
+-- W7) zero rows immediately after the migration
+select count(*) as rows from public.ads_sync_coverage;  -- expect 0
+
+-- W8) ledger: Migration 1 AND Migration 2 each EXACTLY one row
+select filename, count(*) as n from public.app_schema_migrations
+ where filename in ('20260807_scheduler_v2.sql','20260810_ads_sync_coverage.sql')
+ group by filename order by filename;  -- expect 2 rows, each n=1
+
+-- W9) NO new RPC introduced by migration 2 (it declares none)
+select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public' and proname ilike '%ads_sync_coverage%';  -- expect 0 rows
+
+-- W10) no cron/schedule (guard cron.job with to_regclass first)
+select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no schedule; if present, run the next line
+-- select jobid, jobname, schedule from cron.job where command ilike '%ads_sync_coverage%' or jobname ilike '%sync%';  -- expect 0
+
+-- W11) Migration 1 objects UNCHANGED / still present (do NOT modify)
+select to_regclass('public.sync_cycles') a, to_regclass('public.sync_source_jobs') b, to_regclass('public.sync_report_jobs') c,
+       to_regprocedure('public.open_sync_cycle(text, date, timestamptz, text)') d,
+       to_regprocedure('public.claim_sync_cycle(uuid)') e,
+       to_regprocedure('public.claim_source_export_attempt(uuid, text)') f;  -- expect all non-NULL
+```
+
+**Access model (accurate):** `ads_sync_coverage` has **RLS enabled and zero policies**, so no browser role
+(`anon`/`authenticated`) can read or write its rows; the `service_role` key **bypasses RLS** (scheduler writes,
+Daily loader reads). This is enforced by RLS + absence of policy, **not** by a table GRANT/ACL — table-level ACL
+exclusivity is **not** asserted here.
+
+### D.5 Stop / rollback conditions (Gate 1b)
+
+- The apply is a single advisory-locked transaction with abort-on-error, so any failure leaves the DB
+  **unchanged** (no partial apply). STOP on any error (missing prerequisite, Migration 1 not recorded exactly
+  once, or Migration 2 already recorded) — do not retry.
+- **STOP on any structural mismatch:** ≠ 8 columns or any differing column order/type/nullability/default (W1);
+  PK not exactly `(account_id, source_key, covered_from, covered_to)` (W2); the `status` CHECK permitting
+  anything other than exactly `'succeeded'` (W3); a missing / renamed / mis-defined `ads_sync_coverage_lookup_idx`
+  (W4); the trigger absent, disabled, not `BEFORE UPDATE`, or not calling `touch_updated_at()` (W5); RLS not
+  enabled or **any** policy present (W6); rows > 0 (W7); either ledger filename ≠ exactly one row (W8); any
+  unexpected new RPC (W9); any `cron.job` entry (W10); or any Migration-1 object missing (W11).
+- Non-destructive: migration 2 is additive; while every v2 control stays locked (shadow), leaving it applied is
+  safe and inert. **No destructive teardown (DROP) is prepared.** Because migration 2's raw SQL is **not
+  replay-idempotent** (`CREATE TRIGGER` without `DROP TRIGGER IF EXISTS`), the ledger/advisory-locked apply is
+  the ONLY sanctioned path and it refuses a repeat — never re-run the raw SQL directly.
+- Do **NOT** proceed to Gate 1c (`20260810_report_sync_controls.sql`), migration 4, the canary, any control
+  unlock, or the kickoff. Stop for review + explicit human approval.

@@ -7983,8 +7983,9 @@ from .env.local, sslmode=no-verify, never printed). Full evidence in SCHEDULER_V
   is_dashboard_admin() / service_role all present).
 - Apply (B.2): single transaction, advisory lock before ledger, fail-closed check, plain ledger insert, commit
   -> APPLIED. Created 3 tables (sync_cycles, sync_source_jobs, sync_report_jobs), 3 RPCs (open_sync_cycle,
-  claim_sync_cycle, claim_source_export_attempt), 6 indexes, 3 touch triggers, RLS + 3 admin SELECT policies,
-  service_role-only EXECUTE grants.
+  claim_sync_cycle, claim_source_export_attempt), 6 indexes, 3 touch triggers, RLS + 3 admin SELECT policies.
+  Per-RPC EXECUTE: PUBLIC, anon and authenticated cannot execute; service_role has EXECUTE; the function owner
+  retains its owner privilege.
 - B.4 verification: all V1-V11 PASS (exact columns 18/27/25; named constraints incl. one_attempt CHECK + FK
   targets/ON DELETE; six indexes; three triggers BEFORE UPDATE->touch_updated_at(); three SELECT policies to
   authenticated only USING is_dashboard_admin(); RLS on all three; exact RPC identities SECURITY DEFINER
@@ -7997,3 +7998,33 @@ unlocked (allowlist still empty); zero schedules enabled; zero sync cycles creat
 Scheduler v1 + frontend + routes + cron untouched; migrations 2-4 UNAPPLIED; the four migration files remain
 byte-unchanged (Gate 0 hashes intact); no code changed; HANDOFF.md + .worktrees/ untouched/untracked. STOP for
 Codex review + separate approval before Gate 1b.
+
+## Scheduler v2: Rollout Gate 1b PREPARED (offline; migration 2 NOT applied) (2026-08-13)
+
+Offline/read-only preparation ONLY for Gate 1b (`20260810_ads_sync_coverage.sql`); NOT executed. No production
+connection this tranche. Full package in SCHEDULER_V2_ROLLOUT.md Appendix D. Also corrected the Gate 1a memory
+wording ("service_role-only EXECUTE grants" -> PUBLIC/anon/authenticated cannot execute; service_role has
+EXECUTE; the owner retains its owner privilege) without altering the approved Gate 1a result.
+
+- Migration 2 frozen: SHA-256 0750a155...d859b724 (unchanged). Migration 1 remains documented as applied; per
+  existing evidence migrations 2-4 remain unapplied (no production query).
+- Migration 2 objects (inspected): table public.ads_sync_coverage (8 cols; composite PK (account_id, source_key,
+  covered_from, covered_to); status CHECK = only 'succeeded'); index ads_sync_coverage_lookup_idx (account_id,
+  source_key, covered_from); trigger ads_sync_coverage_touch_updated_at (BEFORE UPDATE -> touch_updated_at());
+  RLS enabled with ZERO policy (browsers cannot read/write; service_role bypasses RLS; no table-ACL exclusivity
+  asserted). No RPC, no schedule, no DataDoe.
+- Replay note: migration 2's `create trigger` has NO `drop trigger if exists`, so the raw SQL is NOT
+  replay-idempotent; the ledger + advisory-locked apply must refuse a repeat (it fails closed on the migration-2
+  ledger row).
+- Prepared: D.2 pre-apply read-only inventory (ledger via guarded DO block requiring migration-1 row == 1 and
+  migration-2 absent; target objects absent; prerequisites touch_updated_at()/service_role; migration-1 objects
+  still present); D.3 hardened apply (advisory key (20260810,1) DISTINCT from Gate 1a's (20260807,1); require
+  migration 1 recorded exactly once; refuse if migration 2 recorded; plain INSERT; rollback on error; not
+  db:migrate); D.4 structural verification (8 columns exact; PK; status CHECK; lookup index; trigger; RLS + zero
+  policies; zero rows; each ledger filename exactly one row; no new RPC; no cron; migration-1 objects unchanged);
+  D.5 stop conditions (no destructive rollback/DROP).
+
+CONFIRMED: no production connection; no Supabase writes; migration 2 UNAPPLIED; zero DataDoe calls; controls
+remain locked (allowlist empty); no schedule; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes +
+cron untouched; all seven Gate 0 hashes unchanged; docs-only change; HANDOFF.md + .worktrees/ untouched. STOP
+for Codex review + explicit approval before executing Gate 1b.
