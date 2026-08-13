@@ -211,7 +211,7 @@ report. **Approval gate per report.**
   - [x] **Gate 1b — `20260810_ads_sync_coverage.sql` applied 2026-08-13** (execution evidence in Appendix E; D.2 clear, W1–W11 all pass).
   - [x] **Gate 1c — `20260810_report_sync_controls.sql` applied 2026-08-13** (execution evidence in Appendix G; F.2 clear, X1–X11 all pass).
   - [x] **Gate 1d — `20260811_sync_source_job_owners.sql` applied 2026-08-13** (fresh path / Branch A; execution evidence in Appendix I; H.2 clear, Y1–Y12 all pass).
-- [ ] Gate 2 — post-migration verification queries pass — package prepared (Appendix J); **NOT executed** — read-only re-verification of migrations 1–4, awaiting explicit approval before any production connection.
+- [x] **Gate 2 — read-only re-verification of migrations 1–4 PASSED 2026-08-13** (execution evidence in Appendix K; J.1 G1–G12 all pass, J.2 offline preflight `ready:true`/`blockers:[]`).
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
@@ -1669,3 +1669,50 @@ set ≠ exactly the three, or any `cron.job` sync entry (G12); the offline prefl
   applied schema is **not** altered or rolled back.
 - Do **NOT** proceed to the canary (Gate 5), any control unlock (Gate 7), deployment, push, merge, or the
   `pg_cron` kickoff. Stop for Codex review + explicit human approval.
+
+---
+
+## Appendix K — Gate 2 EXECUTION evidence (read-only re-verification, 2026-08-13)
+
+Executed with explicit human approval, from `feature/scheduler-v2` @ `8dcd535`, running Appendix J exactly.
+Connected to production Supabase over the configured `POSTGRES_URL` (`sslmode=no-verify`) loaded from untracked
+`.env.local` and never printed (the connection string is NOT committed). **Read-only only** — J.1 ran inside a
+single `begin; set transaction read only; … rollback;` transaction (only SELECT / catalog reads); **zero writes,
+zero repairs, zero DataDoe calls/exports, no control/schedule change.**
+
+**Preflight:** HEAD includes `8dcd535`; all seven Gate 0 hashes match; `SCHEDULER_V2_READY_REPORT_KEYS` length 0.
+
+**J.1 read-only transaction (G1–G12) — ALL PASS:**
+- G1 all six tables present (`sync_cycles`, `sync_source_jobs`, `sync_report_jobs`, `ads_sync_coverage`,
+  `report_sync_settings`, `sync_source_job_owners`). G2 the four ledger rows each exactly once.
+- G3 exact columns per table (counts 18 / 27 / 25 / 8 / 4 / 15; ordered names match V1/W1/X1/Y1).
+- G4 every named constraint reproduced: uniques (`sync_cycles_bucket_date_unique`,
+  `sync_source_jobs_cycle_hash_unique`, `sync_report_jobs_cycle_report_account_unique`,
+  `sync_source_job_owners_unique`); FKs with `ON DELETE` (the three `cycle_id → sync_cycles(id)` CASCADE;
+  `sync_source_job_owners_source_fk (cycle_id, request_hash) → sync_source_jobs` CASCADE;
+  `sync_cycles.created_by → auth.users(id)` SET NULL); CHECKs (`sync_source_jobs_one_attempt`;
+  `report_sync_settings_key_nonempty`; `ads_sync_coverage` status='succeeded'; `sync_source_job_owners`
+  owner_status active|stale, connection_id primary|dd-secondary, identity_nonempty 5-field AND).
+- G5 exact index set per table (explicit indexes + each PK/unique index; no unexpected extras). G6 the five touch
+  triggers enabled (`O`), `BEFORE UPDATE`, `touch_updated_at()`; `report_sync_settings` has none. G7 RLS enabled
+  on all six.
+- G8 exactly 5 policies (one each on sync_cycles / sync_source_jobs / sync_report_jobs / report_sync_settings /
+  sync_source_job_owners), each SELECT / `authenticated` only / `USING is_dashboard_admin()` / no WITH CHECK;
+  `ads_sync_coverage` has ZERO policies.
+- G9a the three RPC identities/returns exact, `prosecdef=true`, `proconfig={search_path=public}`. G9b hardened
+  ACL: **no** EXECUTE grantee other than the owner (inherent) or `service_role` — PUBLIC / anon / authenticated /
+  arbitrary roles all absent (0 rows); `service_role` holds EXECUTE on all three (3 rows).
+- G10 the five operational/data tables all empty. G11 exactly 13 controls, all `schedule_enabled=false`,
+  distinct_keys=13. G12 exactly the three RPCs; `cron.job` absent (`pg_cron` not installed) → no schedule (the
+  documented cron follow-up was not needed).
+
+**J.2 offline (no production connection):** `schedulerV2Preflight(...)` against the committed migrations +
+`supabase.js` (fetch-trapped) returned **`ready:true`, `blockers:[]`**; `SCHEDULER_V2_READY_REPORT_KEYS` remains
+`Object.freeze([])` (empty). Both gates stay closed: durable controls paused **and** the code allowlist empty.
+
+**Result:** every Gate 2 check passed; the applied schema (migrations 1–4) matches the contract and was **not**
+altered or rolled back. All seven Gate 0 hashes remain byte-unchanged; no code changed; no deployment/push/merge.
+Scheduler v1 / frontend / routes / cron untouched.
+
+**STOP** — do not run a canary (Gate 5), unlock a report or enable a durable control (Gate 7), deploy, push,
+merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review.

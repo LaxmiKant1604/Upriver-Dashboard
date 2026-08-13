@@ -8240,3 +8240,32 @@ altered/rolled back); zero DataDoe calls; all controls paused and locked (allowl
 nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; all seven Gate 0 hashes
 unchanged; docs-only change; HANDOFF.md + .worktrees/ untouched. STOP for Codex review + explicit approval before
 any production connection (Gate 2 execution).
+
+## Scheduler v2: Production Rollout Gate 2 EXECUTED -- read-only re-verification PASSED (2026-08-13)
+
+With explicit human approval, from `feature/scheduler-v2` @ `8dcd535`, ran SCHEDULER_V2_ROLLOUT.md Appendix J
+exactly against production Supabase. READ-ONLY: J.1 ran inside one begin/set transaction read only/rollback (only
+SELECT + catalog reads; zero writes/repairs/DataDoe). POSTGRES_URL from untracked .env.local, never printed. Full
+evidence in SCHEDULER_V2_ROLLOUT.md Appendix K.
+
+- Preflight: HEAD includes 8dcd535; all 7 Gate 0 hashes match; SCHEDULER_V2_READY_REPORT_KEYS length 0.
+- J.1 G1-G12 ALL PASS: G1 six tables present; G2 four ledger rows each exactly once; G3 exact columns
+  (18/27/25/8/4/15); G4 all named constraints (uniques, one_attempt CHECK, key_nonempty CHECK, ads status CHECK,
+  owner_status/connection_id/identity CHECKs, three cycle_id FKs CASCADE, source_fk CASCADE, created_by SET
+  NULL); G5 exact index set per table; G6 five touch triggers enabled BEFORE UPDATE->touch_updated_at()
+  (report_sync_settings none); G7 RLS on all six; G8 exactly 5 SELECT/authenticated/is_dashboard_admin()/no-WITH-
+  CHECK policies (ads_sync_coverage zero); G9a RPC identities+SECURITY DEFINER+search_path=public; G9b hardened
+  ACL -- no EXECUTE grantee other than owner(inherent)+service_role (PUBLIC/anon/authenticated/arbitrary all
+  absent), service_role EXECUTE on all 3; G10 five data tables empty; G11 exactly 13 paused controls
+  (distinct=13); G12 exactly 3 RPCs + cron.job absent (no schedule).
+- J.2 offline: schedulerV2Preflight ready:true/blockers:[] (fetch-trapped, committed migrations+wrappers);
+  SCHEDULER_V2_READY_REPORT_KEYS empty. Both gates closed (durable paused + code allowlist empty).
+- One verification-script bug (G8 policy query referenced pg_class rel without the join) errored inside the
+  read-only txn -> clean rollback (no write); fixed the read-only checker (added the join) and re-ran; not a
+  schema defect and no DB change.
+
+CONFIRMED: read-only Gate 2 re-verification passed; the applied schema (migrations 1-4) matches the contract and
+was NOT altered or rolled back; zero writes; zero DataDoe calls/exports; all controls paused and locked (allowlist
+empty); zero schedules/cycles; no canary; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
+untouched; all seven Gate 0 hashes unchanged; no code changed; HANDOFF.md + .worktrees/ untouched. STOP for Codex
+review -- do NOT proceed to canary, control unlock, deployment, or scheduling.
