@@ -334,16 +334,21 @@ function arraysEqual(a, b) {
 
 // ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------
 //
-// BLOCKER 2: wrapper-export and endpoint evidence must come from REAL JavaScript syntax -- never a comment, an
-// ordinary string, template-string text, a regex literal, or a property name. `lexJs` produces TWO views of the
-// wrapper source (both keep newlines):
-//   - `code`: comments removed AND every string / template-text / regex-literal CONTENT blanked, so a
-//             structural `export async function <name>(` matches ONLY a genuine top-level declaration -- a
-//             commented-out, quoted, template, or regex-shaped fake is masked away;
-//   - `text`: comments removed but string / template literal CONTENTS preserved (regex literals still blanked),
-//             so a genuine endpoint URL living in a string/template literal is visible while a URL that appears
-//             only in a comment is not.
-// Structural export checks read `code`; endpoint checks read `text`.
+// BLOCKER 2 + endpoint-evidence hardening: wrapper-export and endpoint evidence must come from REAL JavaScript
+// syntax -- never a comment, template-string text, a regex literal, a property name, OR ordinary code (an
+// identifier, a division `a/b`, or a ternary `a ? b : c`). `lexJs` produces TWO length-aligned views (both keep
+// newlines AND the input length, so nothing shifts):
+//   - `code`: comments, string / template-text / regex-literal CONTENT, and literal delimiters all blanked;
+//             ordinary code (including ${...} interpolation code) KEPT. A structural `export async function
+//             <name>(` therefore matches ONLY a genuine top-level declaration -- a commented, quoted, template,
+//             or regex fake is masked away.
+//   - `literals`: ONLY genuine string CONTENT and template QUASI text kept; comments, regex, delimiters, and ALL
+//             ordinary code (including interpolation code) blanked. Because delimiters and boundaries are
+//             blanked, two adjacent literals -- or a literal spliced with ordinary code -- can NEVER concatenate
+//             into fake endpoint evidence, and ordinary `a/rest/v1/x` division / `x ? y : z` ternary code
+//             contributes nothing. A genuine nested string literal INSIDE a ${...} is preserved (it is itself a
+//             literal); the ordinary interpolation code around it is not.
+// Structural export checks read `code`; endpoint checks read ONLY `literals`.
 
 // A '/' begins a regex literal (vs a division operator) when the last significant code char / preceding word is
 // in an expression position. A misclassification only ever MASKS MORE (never less) -- real exports/endpoints
@@ -391,25 +396,38 @@ function skipJsRegex(s, start) {
 function lexJs(source) {
   const s = String(source);
   let code = "";
-  let text = "";
+  let lits = "";
   let prevSig = ""; // last significant (non-whitespace) code char
-  const both = (seg) => { code += blankLine(seg); text += blankLine(seg); }; // masked in BOTH (comment / regex)
-  const literal = (seg) => { code += blankLine(seg); text += seg; };          // masked in `code`, kept in `text`
-  const keep = (seg) => { code += seg; text += seg; };                        // real code, kept in both views
+  const both = (seg) => { code += blankLine(seg); lits += blankLine(seg); }; // blank in BOTH: comment / regex / delimiter
+  const codeOnly = (seg) => { code += seg; lits += blankLine(seg); };         // real ordinary code -- structural view only
+  const litOnly = (seg) => { code += blankLine(seg); lits += seg; };          // genuine string CONTENT / template QUASI text
 
-  // Lex a `...` template starting at s[startI]==='`'; template TEXT is a literal (masked in `code`, kept in
-  // `text`), each ${...} interpolation is CODE lexed by lexCode (so a regex / string / nested template inside it
-  // is handled with the SAME rules). Returns the index AFTER the closing backtick.
+  // Emit a '...'/"..." string: BOTH delimiters blanked in every view; the CONTENT is kept ONLY in `lits` (so an
+  // `export ...` inside a string is masked in `code`, and the delimiter blanking keeps this literal's content
+  // from concatenating with an adjacent literal or with surrounding code). Returns the index AFTER the closer.
+  function lexString(startI) {
+    const q = s[startI];
+    const end = skipJsString(s, startI);
+    const terminated = end - 1 > startI && s[end - 1] === q;
+    both(q);
+    if (terminated) { litOnly(s.slice(startI + 1, end - 1)); both(s[end - 1]); }
+    else both(s.slice(startI + 1, end)); // unterminated -- blank the remainder in both
+    return end;
+  }
+
+  // Lex a `...` template: the backtick and ${ } delimiters are blanked in `lits`; QUASI text is kept in `lits`;
+  // each ${...} is CODE lexed by lexCode (a genuine nested string literal inside it is preserved via litOnly;
+  // ordinary interpolation code is not). Returns the index AFTER the closing backtick.
   function lexTemplate(startI) {
-    literal("`");
+    both("`");
     let i = startI + 1;
     let run = "";
-    const flush = () => { if (run) { literal(run); run = ""; } };
+    const flush = () => { if (run) { litOnly(run); run = ""; } };
     while (i < s.length) {
       const c = s[i];
       if (c === "\\") { run += s.slice(i, i + 2); i += 2; continue; }
-      if (c === "`") { flush(); literal("`"); return i + 1; }
-      if (c === "$" && s[i + 1] === "{") { flush(); keep("${"); i = lexCode(i + 2, true); if (s[i] === "}") { keep("}"); i += 1; } continue; }
+      if (c === "`") { flush(); both("`"); return i + 1; }
+      if (c === "$" && s[i + 1] === "{") { flush(); codeOnly("${"); i = lexCode(i + 2, true); if (s[i] === "}") { codeOnly("}"); i += 1; } continue; }
       run += c; i += 1;
     }
     flush();
@@ -418,6 +436,7 @@ function lexJs(source) {
 
   // Lex code from index i. When `insideInterp`, stop at (and return the index of) the ${...}-closing `}` -- the
   // one at brace depth 0 -- so object/block braces inside the interpolation are balanced, not mistaken for it.
+  // ALL ordinary code goes through codeOnly, so it appears in `code` but NEVER in `lits`.
   function lexCode(i, insideInterp) {
     let depth = 0;
     while (i < s.length) {
@@ -425,18 +444,18 @@ function lexJs(source) {
       if (insideInterp && c === "}" && depth === 0) return i;
       if (c === "/" && s[i + 1] === "/") { let j = i + 2; while (j < s.length && s[j] !== "\n") j += 1; both(s.slice(i, j)); i = j; continue; }
       if (c === "/" && s[i + 1] === "*") { let j = i + 2; while (j < s.length && !(s[j] === "*" && s[j + 1] === "/")) j += 1; j = Math.min(j + 2, s.length); both(s.slice(i, j)); i = j; continue; }
-      if (c === "'" || c === '"') { const end = skipJsString(s, i); literal(s.slice(i, end)); prevSig = c; i = end; continue; }
+      if (c === "'" || c === '"') { i = lexString(i); prevSig = c; continue; }
       if (c === "`") { i = lexTemplate(i); prevSig = "`"; continue; }
       if (c === "/" && regexStartsHere(prevSig, code)) { const end = skipJsRegex(s, i); if (end != null) { both(s.slice(i, end)); prevSig = "/"; i = end; continue; } }
-      if (c === "{") { depth += 1; keep(c); prevSig = "{"; i += 1; continue; }
-      if (c === "}") { depth -= 1; keep(c); prevSig = "}"; i += 1; continue; }
-      keep(c); if (!/\s/.test(c)) prevSig = c; i += 1;
+      if (c === "{") { depth += 1; codeOnly(c); prevSig = "{"; i += 1; continue; }
+      if (c === "}") { depth -= 1; codeOnly(c); prevSig = "}"; i += 1; continue; }
+      codeOnly(c); if (!/\s/.test(c)) prevSig = c; i += 1;
     }
     return i;
   }
 
   lexCode(0, false);
-  return { code, text };
+  return { code, literals: lits };
 }
 
 // `codeMasked` is the wrapper source's `code` view (comments + literal contents blanked), so this matches a
@@ -445,14 +464,16 @@ function wrapperExported(codeMasked, name) {
   return new RegExp(`\\bexport\\s+async\\s+function\\s+${name}\\s*\\(`).test(codeMasked);
 }
 
-// `textView` is the wrapper source's `text` view (comments blanked, string/template literal contents kept), so
-// a `/rest/v1/<table>` endpoint counts only from a real literal, never from a comment.
-function sourceReferencesTable(textView, table) {
-  return textView.includes(`/rest/v1/${table}?`) || textView.includes(`/rest/v1/${table}"`) || textView.includes(`/rest/v1/${table}\``);
+// `litView` is the wrapper source's `literals` view (ONLY genuine string CONTENT + template QUASI text; every
+// comment, regex, delimiter, and all ordinary code blanked). A `/rest/v1/<table>` endpoint therefore counts
+// ONLY when it appears literally inside a real string/template literal -- never from a comment, a regex, an
+// identifier, a division expression, a ternary, or literal-plus-code splicing (boundaries are blank).
+function sourceReferencesTable(litView, table) {
+  return litView.includes(`/rest/v1/${table}?`) || litView.includes(`/rest/v1/${table}"`) || litView.includes(`/rest/v1/${table}\``);
 }
 
-function sourceReferencesRpc(textView, rpc) {
-  return textView.includes(`/rest/v1/rpc/${rpc}`);
+function sourceReferencesRpc(litView, rpc) {
+  return litView.includes(`/rest/v1/rpc/${rpc}`);
 }
 
 // The COMPLETE set of Supabase wrappers the composed Scheduler-v2 runtime depends on. The audit proves EVERY
@@ -499,11 +520,11 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       requiredWrappers: { total: REQUIRED_WRAPPER_EXPORTS.length, missing: [...REQUIRED_WRAPPER_EXPORTS], ok: false },
     };
   }
-  // JS-aware views of the wrapper source: `wrapperCode` (comments + literal contents blanked) proves genuine
-  // exported async functions; `wrapperText` (comments blanked, literal contents kept) proves genuine endpoint
-  // URLs. Neither a comment, string, template text, nor regex literal can forge structural export evidence, and
-  // no comment can forge endpoint evidence (blocker 2).
-  const { code: wrapperCode, text: wrapperText } = lexJs(wrapperSource);
+  // JS-aware views of the wrapper source: `wrapperCode` (comments + literal contents + delimiters blanked, real
+  // code kept) proves genuine exported async functions; `wrapperLiterals` (ONLY genuine string content + template
+  // quasi text kept) proves genuine endpoint URLs. No comment, string/template text, regex, identifier, division,
+  // ternary, or literal-plus-code splice can forge structural export OR endpoint evidence (blocker 2 + endpoint).
+  const { code: wrapperCode, literals: wrapperLiterals } = lexJs(wrapperSource);
 
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
@@ -527,7 +548,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       // CHECK expression. A wrong-table, dropped, or comment/quoted-string-only mention is unproven (fix 1).
       const namedResults = (t.namedConstraints || []).map((c) => ({ name: c.name, ...namedConstraintProven(masked, clean, t.name, c) }));
       const unprovenNamed = namedResults.filter((r) => !r.proven);
-      const referencedByWrapper = sourceReferencesTable(wrapperText, t.name);
+      const referencedByWrapper = sourceReferencesTable(wrapperLiterals, t.name);
       if (!declared) blockers.push({ code: "TABLE_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is not created by ${entry.migration}` });
       if (declared && backedUniques.length !== (t.unique || []).length) {
         blockers.push({ code: "CONSTRAINT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing an expected primary-key/unique constraint the wrappers upsert on` });
@@ -542,7 +563,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       const declared = actualParams != null;
       const expectedParams = (r.params || []).map((p) => p.toLowerCase());
       const paramsMatch = declared && arraysEqual(actualParams, expectedParams);
-      const referencedByWrapper = sourceReferencesRpc(wrapperText, r.name);
+      const referencedByWrapper = sourceReferencesRpc(wrapperLiterals, r.name);
       if (!declared) blockers.push({ code: "RPC_MISSING", migration: entry.migration, rpc: r.name, message: `RPC public.${r.name} is not created by ${entry.migration}` });
       // The exact parameter names + order MUST match what the wrapper POSTs, or the live call would fail.
       if (declared && !paramsMatch) blockers.push({ code: "RPC_PARAM_MISMATCH", migration: entry.migration, rpc: r.name, expected: expectedParams, message: `RPC public.${r.name} parameters do not match the expected names/order [${expectedParams.join(", ")}]` });

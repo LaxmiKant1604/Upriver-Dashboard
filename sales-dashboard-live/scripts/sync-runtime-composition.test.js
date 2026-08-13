@@ -418,6 +418,44 @@ test("(audit blocker 2) wrapper-export + endpoint evidence must be REAL JavaScri
   assert.ok(commentedRpc.blockers.some((b) => b.code === "RPC_WRAPPER_MISSING" && b.rpc === "open_sync_cycle"), "endpoint only in a comment => RPC_WRAPPER_MISSING");
 });
 
+test("(audit blocker: endpoint evidence only from real literals) division / ternary / identifiers / split-splices / ${ordinary code} never forge an endpoint; genuine single/double/template literals (and a genuine nested literal inside ${...}) do; canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const rpcMissing = (r) => r.blockers.some((b) => b.code === "RPC_WRAPPER_MISSING" && b.rpc === "open_sync_cycle");
+  const tblMissing = (r) => r.blockers.some((b) => b.code === "TABLE_WRAPPER_MISSING" && b.table === "sync_cycles");
+  // Remove the genuine endpoint literals so ONLY the appended fake could satisfy the reference.
+  const stripRpc = (t) => t.replaceAll("\"/rest/v1/rpc/open_sync_cycle\"", "\"/rest/v1/rpc/OPEN_DISABLED\"");
+  const stripTbl = (t) => t.replaceAll("/rest/v1/sync_cycles?", "/rest/v1/DISABLED_cycles?");
+  // canonical: genuine double-quoted (open_sync_cycle) + template-literal (sync_cycles) endpoints are recognized.
+  const real = A();
+  assert.ok(!rpcMissing(real) && !tblMissing(real), "canonical: genuine string + template endpoints recognized");
+  // (1) RPC division expression `a/rest/v1/rpc/open_sync_cycle` is ordinary CODE, not a literal.
+  const rpcDiv = A((n, t) => n === "supabase.js" ? stripRpc(t) + "\nfunction fake(a, rest, v1, rpc, open_sync_cycle) {\n  return a/rest/v1/rpc/open_sync_cycle;\n}\n" : t);
+  assert.ok(rpcMissing(rpcDiv), "RPC division expression => RPC_WRAPPER_MISSING");
+  // (2) Table division/ternary `a/rest/v1/sync_cycles ? yes : no` (spaced AND unspaced) is ordinary CODE.
+  const tblTernary = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nfunction fakeTable(a, rest, v1, sync_cycles, yes, no) {\n  return a/rest/v1/sync_cycles ? yes : no;\n}\n" : t);
+  assert.ok(tblMissing(tblTernary), "table ternary (spaced) => TABLE_WRAPPER_MISSING");
+  const tblTernary2 = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nfunction fakeTable2(a, rest, v1, sync_cycles, yes, no) {\n  return a/rest/v1/sync_cycles?yes:no;\n}\n" : t);
+  assert.ok(tblMissing(tblTernary2), "table ternary (unspaced) => TABLE_WRAPPER_MISSING");
+  // (3) Split across two adjacent string literals, or a literal spliced with code, must NOT concatenate.
+  const splitLit = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nconst sp = \"/rest/v1/sync_cycles\" + \"?on_conflict=x\";\n" : t);
+  assert.ok(tblMissing(splitLit), "adjacent-literal split => TABLE_WRAPPER_MISSING (boundaries stay blank)");
+  const litCode = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nconst lc = \"/rest/v1/sync_cycles\" + qs;\n" : t);
+  assert.ok(tblMissing(litCode), "literal + code splice => TABLE_WRAPPER_MISSING");
+  // (4) Endpoint text inside ${ordinary code} does NOT count; inside a genuine nested string literal it DOES.
+  const interpCode = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nconst ic = `p${ z/rest/v1/sync_cycles?y:w }q`;\n" : t);
+  assert.ok(tblMissing(interpCode), "endpoint as ${ordinary code} => TABLE_WRAPPER_MISSING");
+  const interpLit = A((n, t) => n === "supabase.js" ? stripTbl(t) + "\nconst il = `p${ cond ? \"/rest/v1/sync_cycles?\" : \"\" }q`;\n" : t);
+  assert.ok(!tblMissing(interpLit), "genuine nested string literal inside ${...} => recognized");
+  // (5) A regex literal shaped like the endpoint is blanked in the literal view.
+  const rpcRegex = A((n, t) => n === "supabase.js" ? stripRpc(t) + "\nconst rx = /\\/rest\\/v1\\/rpc\\/open_sync_cycle/;\n" : t);
+  assert.ok(rpcMissing(rpcRegex), "regex-shaped endpoint => RPC_WRAPPER_MISSING");
+  // (6) Genuine SINGLE-quoted endpoint literal is recognized (double-quoted + template proven by canonical).
+  const singleQuoted = A((n, t) => n === "supabase.js" ? t.replace("\"/rest/v1/rpc/open_sync_cycle\"", "'/rest/v1/rpc/open_sync_cycle'") : t);
+  assert.ok(!rpcMissing(singleQuoted), "genuine single-quoted endpoint => recognized");
+});
+
 test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blockers,requiredWrappers}; a null/throwing supabase.js reader never crashes", () => {
   const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
   const shapeOk = (r) => r && typeof r.ok === "boolean" && Array.isArray(r.matrix) && Array.isArray(r.blockers)
