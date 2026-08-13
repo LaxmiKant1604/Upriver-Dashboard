@@ -831,15 +831,19 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "listing-optimizer:catalog": "listing-optimizer.js",
   };
   // Scheduler-v2 INTEGRITY strictness (separate from the legacy route-backed sets above). These
-  // contracts are strict at the SCHEDULER boundary even though the legacy api/datadoe.js route fetches
-  // them non-strict: a cap-sized page for any of them (understated FBA sales/stock, a missing
-  // AWD/inventory ASIN, or a catalog that turns known products into "Unassigned") is indistinguishable
-  // from truncation. They are deliberately NOT backed by a route rows.length>=LIMIT guard -- the
-  // source worker enforces the cap (asserted below), so they must NOT be added to OPERATIONAL_STRICT.
+  // contracts are strict at the SCHEDULER boundary even though the legacy api/datadoe.js / App.jsx route
+  // fetches them non-strict: a cap-sized page for any of them (understated FBA sales/stock, a missing
+  // AWD/inventory ASIN, a catalog that turns known products into "Unassigned", or a truncated DESC content-
+  // change stream that drops the newest events) is indistinguishable from truncation. They are deliberately
+  // NOT backed by a route rows.length>=LIMIT guard -- the source worker enforces the cap (asserted below),
+  // so they must NOT be added to OPERATIONAL_STRICT. Brand Sales + Content Changes join this set in the
+  // Phase 1e re-review (their canonical Scheduler-v2 dispatch is strict even though the live route is not).
   const SCHEDULER_V2_STRICT = [
     "reconciliation:catalog",
     "fba-plan:monthly-units", "fba-plan:current-daily-dates", "fba-plan:catalog",
     "fba-plan:inventory-health", "fba-plan:awd",
+    "brand-sales:order-lines", "brand-sales:catalog",
+    "content-changes:events", "content-changes:catalog",
   ];
   const routeBacked = new Set([...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)]);
   // The categories are disjoint: a strict key is EITHER route-backed OR scheduler-only, never both.

@@ -200,6 +200,11 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "brand-sales": [
     {
       requestKey: "brand-sales:order-lines",
+      // Scheduler-v2 integrity: a cap-sized page is indistinguishable from truncation, so reject it
+      // (TRUNCATED, terminal, no partial save) rather than derive brand sales from a silently truncated
+      // window. `strict` is execution metadata only -- it is NOT passed to sourceRequestIdentity, so
+      // request_hash is unchanged. The live App.jsx route fetches non-strict; the scheduler is stricter.
+      strict: true,
       sourceKey: "order-line-items",
       columns: ORDER_SALES_COLUMNS,
       limit: 50000, // ORDER_SALES_ROW_LIMIT
@@ -211,6 +216,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "brand-sales:catalog",
+      // Strict like every other Scheduler-v2 catalog: a cap-sized catalog would silently turn known
+      // products into "Unassigned". Reject it (TRUNCATED, terminal). `strict` stays outside request_hash.
+      strict: true,
       sourceKey: "product-catalog",
       columns: PRODUCT_CATALOG_COLUMNS,
       limit: 10000, // CATALOG_ROW_LIMIT
@@ -441,6 +449,10 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "content-changes": [
     {
       requestKey: "content-changes:events",
+      // Scheduler-v2 integrity: a cap-sized notification page means the DESC event stream was truncated,
+      // so the newest events could be missing. Reject it (TRUNCATED, terminal, no partial save) rather than
+      // derive an incomplete change feed. `strict` is execution metadata only (outside request_hash).
+      strict: true,
       sourceKey: "content-changes",
       columns: CONTENT_CHANGE_COLUMNS,
       limit: 1000, // CONTENT_CHANGE_ROW_LIMIT
@@ -455,6 +467,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
     {
       requestKey: "content-changes:catalog",
+      // Strict like every other Scheduler-v2 catalog: a cap-sized catalog would silently turn known
+      // products into "Unassigned". Reject it (TRUNCATED, terminal). `strict` stays outside request_hash.
+      strict: true,
       sourceKey: "product-catalog",
       columns: PRODUCT_CATALOG_COLUMNS,
       limit: 10000, // CATALOG_ROW_LIMIT
