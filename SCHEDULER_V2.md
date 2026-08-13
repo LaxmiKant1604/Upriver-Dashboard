@@ -3585,3 +3585,74 @@ one). `npm run test:report-derivation` **455** (was 439); focused suites green: 
 (2,395 modules); `git diff --check` clean; only `package.json` changed plus two new files. Nothing
 pushed/merged/deployed/unlocked/enabled/scheduled/migrated; no route/cron/frontend wiring; Scheduler v1 +
 every report control remain locked.
+
+## 58. Phase 1e re-review -- six dispatcher blockers fixed + neutral filenames (SHADOW MODE, 2026-08-13)
+
+Codex's Phase 1e re-review raised six blockers on the canonical SHADOW dispatcher. All six are fixed WITHOUT
+changing SHADOW status: the dispatcher is wired to NO cron/route/migration/deployment/frontend, and NO
+readiness/schedule control is flipped (`registry.js` + `report-controls.js` are byte-unchanged), so the
+SCHEDULED selection stays empty (nothing is schedule-enabled) and every shadow snapshot stays namespaced
+(`scheduler-v2/<key>`, never a production row). Scheduler v1 (`run-sync.js`) + `HANDOFF.md`/`.worktrees/`
+untouched. NOTE on readiness: `reportControlCatalog` derives `ready` from the Scheduler v1 registry's
+`enabled` flag, so `brand-sales` reads `ready:true` because Scheduler v1 ALREADY runs the live Dashboard --
+content-changes and every other not-yet-cutover v2 report stay `ready:false` (locked). Giving brand-sales a
+canonical v2 path therefore means a MANUAL v2 invocation could fetch its (already-live) sources into the
+namespaced shadow cache; the SCHEDULED path and the unwired dispatcher still dispatch nothing on their own, and
+this work enables/schedules/wires NOTHING new. The dispatcher's canonical module + test now live at the NEUTRAL
+paths
+`lib/server/sync/sync-dispatch.js` + `scripts/sync-dispatch.test.js` (the `scheduler-v2-dispatch.*` filename
+family is retired -- see 58.4). Commits: `5c6c9c0` (dispatcher/planner correctness + regressions),
+`7930d8b` (neutral filenames), + this docs commit.
+
+### 58.1 Two omitted controlled reports now have a canonical path (blocker 1)
+
+brand-sales + content-changes each already had an approved source contract AND a wired derivation adapter but NO
+planner, so `classifySchedulerV2ReportKey` returned `unsupported` and the dispatcher refused them. Added
+`planBrandSales` (Order Line Items + Product Catalog, BOTH over `[monthStart(asOf)-420d, asOf]`) and
+`planContentChanges` (the NO-DATE notification events export + a `[asOf-365d, asOf]` catalog), and registered
+both in `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS`. Both now route through the ONE generic canonical path
+(reusing their approved contracts + adapters, NOT a second path), share the single `(bucket, cycle_date)`
+cycle, and coexist with other reports without blocking them. Windows are byte-identical to the live routes
+(`src/App.jsx` brand-sales; `api/datadoe.js` content-changes catalog `addDaysStr(asOf, -365)`).
+
+### 58.2 Composed derived-context loaders (blocker 2)
+
+`composeDerivedContextLoaders([...])` merges the injected general (Daily `adsCoverage`) loader and PPC's
+`makePpcAdsContextLoader` (`ppcAds`) so a single invocation containing BOTH Daily Reporting and PPC derives
+BOTH. Each loader is report-scoped (returns `{}` for other reports), so the merge is disjoint and one loader
+can NEVER suppress the other; a throwing loader contributes nothing but never breaks its sibling. A single
+loader passes through unchanged and no loaders yields null (allocation-free common paths).
+
+### 58.3 Manual-mode + global-asOf + drained (blockers 3, 5, 6)
+
+- Blocker 3: ANY Array `manualReportKeys` (including `[]`) is a manual request. `[]` runs ZERO reports/exports
+  and NEVER falls back to the scheduled enabled set; a non-array, blank, or non-string entry fails closed.
+- Blocker 5: generic planning preserves the global `asOf` -- when no per-country `asOfFor` is injected, the
+  VALIDATED global `asOf` drives the EXACT canonical windows for every account (never `account.asOf`
+  undefined); missing/invalid with generic work to do fails closed BEFORE any cycle.
+- Blocker 6: `drained` is computed from ACTUAL unit outcomes. A final/only unit returning `drained:false` --
+  including a maxJobs truncation with NO deadline/deferral -- makes the dispatcher `drained:false` and sets
+  `continuationRequired:true`; a fresh idempotent invocation resumes with NO duplicate create-export.
+
+### 58.4 Neutral filenames from committed Git blobs (blocker 4)
+
+The reintroduced `scheduler-v2-*` filename family is retired. `lib/server/sync/sync-dispatch.js` +
+`scripts/sync-dispatch.test.js` are GENUINELY FRESH files (distinct inodes, `links=1`) written from the
+COMMITTED Git blobs of the previous paths (NOT `git mv`, not a working-tree copy); the two old paths are removed
+from Git AND the worktree; the test import, `package.json` (`test:report-derivation`), and these docs are
+updated. Each new file independently supports `stat`/head-read, `node --check`, direct execution, and natural
+exit (exit 0).
+
+### 58.5 Verification (all natural, exit 0)
+
+`sync-dispatch.test.js` now **32 assertions** (was 16): the original 16 PLUS blocker regressions -- brand-sales
++ content-changes offline source-plan / worker (derive+save) / LKG (a failed required source preserves LKG,
+zero save) / deterministic request-hash + cross-organization account isolation; both coexisting with other
+reports without blocking them; Daily + PPC derived contexts in ONE invocation (neither loader suppresses the
+other); empty + malformed manual selection; global-asOf vs per-country asOfFor + asOf fail-closed; final-unit +
+multi-unit maxJobs truncation returns `drained:false` + `continuationRequired` and resumes duplicate-free.
+`npm run test:report-derivation` **471** (was 455); `test:sync-engine` (79), `test:report-contracts` (161),
+`test:source-identity` (7), `test:report-sync-controls` (9) green; `build:check` (2,395 modules); `npm run
+verify` exit 0 (terminates naturally). `git diff --check` clean; only the intended files changed (+ untracked
+`HANDOFF.md`/`.worktrees/`). Nothing pushed/merged/deployed/unlocked/enabled/scheduled/migrated. STOP for Codex
+re-review.

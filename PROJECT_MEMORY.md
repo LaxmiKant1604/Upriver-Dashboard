@@ -7650,3 +7650,48 @@ nothing; failure isolation); `test:report-derivation` **455** (was 439); `test:s
 merged/deployed/unlocked/enabled/scheduled/migrated; no route/cron/frontend wiring. The project-wide Product
 Catalog ASIN-to-brand gap-fill remains NOT implemented (pending DataDoe account-scoping/filter confirmation).
 STOP after the orchestration foundation for Codex senior review.
+
+## Scheduler v2: Phase 1e re-review -- six dispatcher blockers fixed (SHADOW MODE, 2026-08-13)
+
+Fixed the six Phase 1e Codex re-review blockers on the canonical SHADOW dispatcher from base `0f65afa`.
+SCHEDULER_V2.md §58 records the details. Still SHADOW ONLY: the dispatcher is wired to NO cron/route/migration/
+deployment/frontend, NO readiness/schedule control is flipped (`registry.js` + `report-controls.js`
+byte-unchanged), the SCHEDULED selection stays empty (nothing schedule-enabled), and shadow snapshots stay
+namespaced (`scheduler-v2/<key>`). `reportControlCatalog` derives `ready` from Scheduler v1's `enabled` flag, so
+`brand-sales` is `ready:true` because Scheduler v1 ALREADY runs the live Dashboard; content-changes + every
+other not-yet-cutover v2 report stay `ready:false` (locked). Giving brand-sales a canonical v2 path means a
+MANUAL v2 call could fetch its already-live sources into the namespaced shadow cache; this work
+enables/schedules/wires NOTHING new. Scheduler v1 (`run-sync.js`) + `HANDOFF.md`/`.worktrees/` untouched;
+nothing pushed/merged/deployed/enabled/scheduled/migrated.
+
+1. **Canonical path for brand-sales + content-changes (blocker 1).** Both had an approved source contract + a
+   wired derivation adapter but NO planner, so they classified `unsupported`. Added `planBrandSales`
+   (order-lines + catalog over `[monthStart(asOf)-420d, asOf]`) + `planContentChanges` (no-date events +
+   `[asOf-365d, asOf]` catalog) and registered them in `SHADOW_PLANNED_REPORT_KEYS` + `PLANNERS`, so each routes
+   through its ONE generic canonical path, shares the single cycle, and coexists with other reports.
+2. **Composed derived-context loaders (blocker 2).** `composeDerivedContextLoaders` merges the general Daily
+   `adsCoverage` loader + PPC `makePpcAdsContextLoader` (`ppcAds`); one invocation with Daily + PPC derives
+   BOTH, each loader is report-scoped so neither suppresses the other, and a throwing loader never breaks its
+   sibling.
+3. **Any Array manualReportKeys (incl. []) is manual (blocker 3).** `[]` runs zero reports/exports and never
+   falls back to the scheduled enabled set; a non-array/blank/non-string entry fails closed.
+4. **Neutral filenames (blocker 4).** Retired the `scheduler-v2-*` filename family: `sync-dispatch.js` +
+   `scripts/sync-dispatch.test.js` are FRESH files (distinct inodes, links=1) written from the COMMITTED Git
+   blobs of the old paths (NOT git mv); old paths removed from Git + worktree; test import + `package.json`
+   (`test:report-derivation`) + docs updated. Each new file independently supports stat/head-read, `node
+   --check`, direct execution, and natural exit (exit 0).
+5. **Preserve global asOf for generic planning (blocker 5).** When no per-country `asOfFor` is injected, the
+   validated global `asOf` drives the exact canonical generic windows; missing/invalid with generic work fails
+   closed before any cycle.
+6. **drained from actual unit outcomes (blocker 6).** A final/only unit returning `drained:false` (incl. maxJobs
+   exhaustion with no deadline/deferral) makes the dispatcher `drained:false` + `continuationRequired:true`;
+   resume is duplicate-export-free.
+
+Verification (all natural, exit 0): `node --check` + stat/head-read/direct-exec on both fresh files; NEW
+`sync-dispatch.test.js` **32 assertions** (was 16: +16 blocker regressions -- source-plan/worker/LKG/request-
+hash/account-isolation for brand-sales + content-changes; coexistence; Daily+PPC contexts in one invocation;
+empty/malformed manual; global-asOf vs per-country asOfFor + fail-closed; final-unit + multi-unit maxJobs
+drained:false + resume). `npm run test:report-derivation` **471** (was 455); `test:sync-engine` (79),
+`test:report-contracts` (161), `test:source-identity` (7), `test:report-sync-controls` (9) green; `build:check`
+(2,395 modules); `npm run verify` exit 0. `git diff --check` clean; only the intended files changed. STOP for
+Codex re-review.
