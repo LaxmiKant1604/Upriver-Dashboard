@@ -284,10 +284,27 @@ row for this migration; every target table/RPC/constraint/index/trigger/policy *
 not apply**; capture the exact shape (use the B.3 definition queries) and report it for review.
 
 ```sql
--- P1) ledger state for THIS migration (expect 0 rows; note whether the ledger table exists yet)
-select to_regclass('public.app_schema_migrations') as ledger_table;            -- may be NULL on a fresh DB
-select filename, applied_at from public.app_schema_migrations
- where filename = '20260807_scheduler_v2.sql';                                  -- expect 0 rows
+-- P1) ledger state for THIS migration -- SAFE whether or not the ledger table exists yet. Step A checks
+--     to_regclass FIRST; step B: if the table is absent, the recorded count is logically zero and the table is
+--     NOT queried; step C: if present, query it (via dynamic EXECUTE, so a missing table can never raise a
+--     "relation does not exist" parse error). Emits a typed NOTICE and STOPs (raises) only if THIS row exists.
+do $$
+declare
+  v_ledger_exists boolean := to_regclass('public.app_schema_migrations') is not null;   -- A
+  v_migration_recorded boolean := false;                                                -- B: absent => zero
+begin
+  if v_ledger_exists then                                                               -- C: present => query
+    execute 'select exists (select 1 from public.app_schema_migrations where filename = $1)'
+      into v_migration_recorded using '20260807_scheduler_v2.sql';
+  end if;
+  raise notice 'ledger_exists:% migration_recorded:%', v_ledger_exists, v_migration_recorded;
+  if v_migration_recorded then
+    raise exception 'STOP: 20260807_scheduler_v2.sql already recorded in app_schema_migrations (Gate 1a expects the FIRST apply)';
+  end if;
+end $$;
+-- Expected NOTICE: "ledger_exists:false migration_recorded:false" (fresh DB), OR
+--                  "ledger_exists:true  migration_recorded:false" (ledger already created by earlier migrations).
+-- Any "migration_recorded:true" raises the STOP above -- do NOT apply.
 
 -- P2) target tables already present? (expect all three NULL)
 select to_regclass('public.sync_cycles')     as sync_cycles,
@@ -318,8 +335,32 @@ select to_regclass('auth.users')                      as auth_users,          --
 select rolname from pg_roles where rolname = 'service_role';                   -- expect exactly 1 row
 ```
 
-**STOP (do not apply) if:** P1 returns any ledger row; P2/P3 return any non-NULL; P4 returns any row; or P5 shows
-any NULL / the `service_role` row missing. Report the exact shape for review rather than applying over it.
+A read-only **Node/pg** equivalent of P1 (checks `to_regclass` first, queries the table only when present):
+
+```bash
+node --input-type=module -e '
+import pg from "pg";
+const FILE = "20260807_scheduler_v2.sql";
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+try {
+  const reg = await c.query("select to_regclass($1) as t", ["public.app_schema_migrations"]);
+  const ledgerExists = reg.rows[0].t !== null;
+  let migrationRecorded = false;
+  if (ledgerExists) migrationRecorded = (await c.query("select 1 from public.app_schema_migrations where filename=$1", [FILE])).rowCount > 0;
+  console.log("ledger_exists:" + ledgerExists + " migration_recorded:" + migrationRecorded);
+  if (migrationRecorded) console.log("STOP: this migration is already recorded -- do NOT apply");
+} finally { await c.end(); }
+'
+```
+
+> The `app_schema_migrations` ledger table may **legitimately already exist** — it is created by the first-ever
+> run of the migration runner, so any earlier migration will have created it. `ledger_exists:true` is therefore
+> fine; only **this** migration's row must be absent. Judge P1 solely by `migration_recorded`.
+
+**STOP (do not apply) if:** P1 reports `migration_recorded:true`; P2/P3 return any non-NULL; P4 returns any row;
+or P5 shows any NULL / the `service_role` row missing. Report the exact shape for review rather than applying over
+it.
 
 ### B.2 Hardened apply command (single migration, single transaction, advisory-locked, ledger fail-closed)
 
@@ -366,8 +407,10 @@ try {
   `sync_report_jobs_touch`) and the three named policies (`admins read sync cycles` / `... source jobs` /
   `... report jobs`): each is `drop ... if exists` then `create ...`. Because the whole migration runs in ONE
   transaction, no concurrent reader ever observes a window with the trigger/policy missing.
-- **Enables RLS** on the three tables and sets function EXECUTE to `service_role` only (revokes from
-  `public` / `anon` / `authenticated`).
+- **Enables RLS** on the three tables. For each of the three RPCs it **revokes EXECUTE from `PUBLIC`, `anon`
+  and `authenticated`** and then **explicitly grants EXECUTE to `service_role`**; the function **owner retains
+  its owner privilege** (owners may always execute their own functions). Net: only the owner and `service_role`
+  can execute — checked by V8a/V8b.
 - **Creates NO schedule** (no `pg_cron` / `pg_net`) and performs **NO DataDoe call** (verified by inspecting the
   frozen file: the only `pg_cron` tokens are comments and the `trigger` text-enum column value).
 - **Prerequisites** (from earlier migrations): `public.touch_updated_at()`, `public.is_dashboard_admin()`,
