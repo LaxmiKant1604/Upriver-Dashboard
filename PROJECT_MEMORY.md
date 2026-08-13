@@ -7887,3 +7887,29 @@ code+tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrat
 DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
 Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
 re-review.
+
+## Scheduler v2: Phase 1f re-review-5 -- endpoint evidence only from real literals (SHADOW MODE, 2026-08-13)
+
+Fixed the remaining Phase 1f endpoint-evidence blocker from base `1b48e15`. SCHEDULER_V2.md s65 has details.
+One module (`schema-contract.js`) + its test; still SHADOW ONLY. The FK-scope correction (s64.1) is unchanged.
+
+The re-review-4 `lexJs().text` view kept comments-stripped ORDINARY CODE alongside literal contents, and
+sourceReferencesTable/sourceReferencesRpc searched that merged view -- so valid, non-executed JS forged endpoint
+evidence. Confirmed repros: `function fake(a, rest, v1, rpc, open_sync_cycle){ return a/rest/v1/rpc/open_sync_cycle; }`
+(divisions) => audit ok:true, no RPC_WRAPPER_MISSING; `a/rest/v1/sync_cycles?yes:no` (ternary) => sync_cycles
+read as referenced. Fix:
+- lexJs now returns `{ code, literals }` (the merged `text` view is removed). `literals` keeps ONLY genuine
+  string CONTENT and template QUASI text; comments, regex, string/template DELIMITERS, and ALL ordinary code
+  (including ${...} interpolation code) are blanked. Delimiter/boundary blanking stops adjacent literals -- or a
+  literal spliced with code -- from concatenating into fake evidence; a genuine nested string literal inside a
+  ${...} is still preserved, the ordinary code around it is not.
+- sourceReferencesTable/sourceReferencesRpc search ONLY `literals`; wrapperExported keeps the structural `code`
+  view.
+
+Verification: sync-runtime-composition.test.js **25** (was 24); test:report-derivation **501** (was 500);
+sync-dispatch.test.js 37; test:report-contracts (161) / test:report-sync-controls (9) / test:source-identity
+(7) / test:sync-engine green; build:check green; git diff --check clean. Commit `e295f38` (endpoint fix +
+tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated/enabled/scheduled; no live
+DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
+Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
+re-review.

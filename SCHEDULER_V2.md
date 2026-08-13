@@ -3954,3 +3954,37 @@ satisfy an export, a commented endpoint never satisfies a reference, a removed r
 Nothing pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend +
 routes + cron untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started;
 HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review.
+
+## 65. Phase 1f re-review-5 -- endpoint evidence only from REAL string/template literals (SHADOW MODE, 2026-08-13)
+
+The re-review-4 `lexJs().text` view kept comments-stripped ORDINARY CODE alongside literal contents, and the
+endpoint checks searched that merged view -- so valid, non-executed JavaScript forged endpoint evidence. Two
+confirmed repros: appending `function fake(a, rest, v1, rpc, open_sync_cycle){ return a/rest/v1/rpc/open_sync_cycle; }`
+(a chain of divisions) made the audit return `ok:true` with NO `RPC_WRAPPER_MISSING`; a `a/rest/v1/sync_cycles?yes:no`
+ternary made `sync_cycles` read as referenced. Fixed in `schema-contract.js` (one module + its test); still
+SHADOW ONLY. The approved FK-scope correction (s64.1) is unchanged.
+
+### 65.1 A dedicated literal-only view
+
+`lexJs` now returns `{ code, literals }` (the merged `text` view is gone). `literals` keeps ONLY genuine string
+CONTENT and template QUASI text; comments, regex literals, string/template DELIMITERS, and ALL ordinary code
+(including `${...}` interpolation code) are blanked. Both views stay length-aligned. Because delimiters and
+boundaries are blanked, two adjacent literals -- or a literal spliced with ordinary code (`"/rest/v1/x" + qs`) --
+can NEVER concatenate into fake evidence, and an `a/rest/v1/x` division or `x ? y : z` ternary contributes
+nothing. A genuine nested string literal INSIDE a `${...}` is preserved (it is itself a literal); the ordinary
+interpolation code around it is not. `sourceReferencesTable` / `sourceReferencesRpc` search ONLY `literals`;
+`wrapperExported` keeps using the structural `code` view.
+
+### 65.2 Verification
+
+`sync-runtime-composition.test.js` **25** (was 24: +the endpoint-evidence regression -- RPC division +
+table division/ternary spaced AND unspaced => `RPC_WRAPPER_MISSING` / `TABLE_WRAPPER_MISSING`; adjacent-literal
+split and literal+code splice do not join; endpoint text inside `${ordinary code}` does not count while a genuine
+nested string literal inside `${...}` does; regex-shaped endpoint fails; genuine single-quoted endpoint passes;
+canonical passes). `npm run test:report-derivation` **501** (was 500); `sync-dispatch.test.js` 37;
+`test:report-contracts` (161), `test:report-sync-controls` (9), `test:source-identity` (7), `test:sync-engine`
+green; `build:check` green (dashboard bundle intact); `git diff --check` clean. Only 2 files changed
+(schema-contract.js, sync-runtime-composition.test.js) + these docs. Nothing
+pushed/merged/deployed/migrated/enabled/scheduled; no live DataDoe call; Scheduler v1 + frontend + routes + cron
+untouched; every v2 control remains locked; Product Catalog ASIN-brand gap-fill NOT started; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex re-review.
