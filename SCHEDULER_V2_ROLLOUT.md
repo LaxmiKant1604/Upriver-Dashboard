@@ -4,8 +4,11 @@
 Appendices C, E, G, I). Scheduler v2 otherwise remains in SHADOW MODE and fully closed: it is **locked** (the
 code readiness allowlist `SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable
 `report_sync_settings` rows have `schedule_enabled=false`), **undeployed**, **unscheduled** (no `pg_cron`/`pg_net`
-kickoff applied), and has made **zero DataDoe exports** — every Scheduler-v2 table is empty. No route, deployment,
-live DataDoe export, control unlock, or frontend change has been made. Every remaining live step (Gate 2
+kickoff applied), and has made **zero DataDoe exports**. The five operational/data tables — `sync_cycles`,
+`sync_source_jobs`, `sync_report_jobs`, `sync_source_job_owners`, `ads_sync_coverage` — are **empty**;
+`report_sync_settings` contains **exactly the 13 seeded control rows, all `schedule_enabled=false`**. No route,
+deployment, live DataDoe export, control unlock, or frontend change has been made. Every remaining live step
+(Gate 2
 verification onward) is **gated on explicit human approval** and must be run one step at a time, pausing for
 sign-off before the next. This document is the plan Codex senior review evaluates; it does not authorize any step
 by itself.
@@ -1501,6 +1504,13 @@ G3–G9 below re-read the same objects across all four migrations at once.
 ### J.1 Cross-cutting read-only verification (run in a read-only transaction)
 
 ```sql
+-- Run this ENTIRE block as ONE read-only transaction. BEGIN + SET TRANSACTION READ ONLY guarantee that any
+-- accidental non-SELECT would ERROR (nothing can be written), and the trailing ROLLBACK releases the snapshot.
+-- Every statement below is a SELECT / catalog read, and there is NO branch inside the transaction, so the final
+-- ROLLBACK can never be skipped.
+begin;
+set transaction read only;
+
 -- G1) all SIX Scheduler-v2 tables present (expect all six non-NULL)
 select to_regclass('public.sync_cycles') a, to_regclass('public.sync_source_jobs') b,
        to_regclass('public.sync_report_jobs') c, to_regclass('public.ads_sync_coverage') d,
@@ -1582,17 +1592,30 @@ select p.proname, pg_get_function_identity_arguments(p.oid) as args, pg_get_func
  order by p.proname;
 -- expect exactly the V7 identities/returns; prosecdef=true; proconfig contains 'search_path=public'.
 
--- G9b) RPC EXECUTE ACL: owner + service_role only; PUBLIC/anon/authenticated MUST NOT execute (expect 0 rows)
-select p.proname, (case when a.grantee=0 then 'PUBLIC' else r.rolname end) as bad_grantee
-  from pg_proc p cross join lateral aclexplode(p.proacl) a left join pg_roles r on r.oid=a.grantee
+-- G9b) RPC EXECUTE ACL -- ONLY the function owner (inherent privilege) and service_role may hold EXECUTE.
+--      Enumerate EVERY EXECUTE grantee for each RPC and FAIL on any grantee that is neither the owner
+--      (a.grantee = p.proowner) nor service_role. PUBLIC (a.grantee = 0), anon, authenticated, or ANY arbitrary
+--      extra role therefore all appear here => STOP. Expect 0 rows.
+select p.proname,
+       (case when a.grantee = 0 then 'PUBLIC'
+             when a.grantee = p.proowner then '(owner)'
+             else coalesce(r.rolname, a.grantee::text) end) as forbidden_execute_grantee
+  from pg_proc p
+  cross join lateral aclexplode(p.proacl) a
+  left join pg_roles r on r.oid = a.grantee
  where p.oid in ('public.open_sync_cycle(text, date, timestamptz, text)'::regprocedure,
    'public.claim_sync_cycle(uuid)'::regprocedure,'public.claim_source_export_attempt(uuid, text)'::regprocedure)
-   and a.privilege_type='EXECUTE' and (a.grantee=0 or r.rolname in ('anon','authenticated'));
--- and service_role HAS execute on all three (expect 3 rows):
-select p.proname from pg_proc p cross join lateral aclexplode(p.proacl) a join pg_roles r on r.oid=a.grantee
+   and a.privilege_type = 'EXECUTE'
+   and a.grantee <> p.proowner                                          -- owner's inherent EXECUTE is allowed
+   and a.grantee not in (select oid from pg_roles where rolname = 'service_role')  -- the one explicit grant
+ order by p.proname, forbidden_execute_grantee;  -- expect 0 rows (any row => a non-owner/non-service_role holds EXECUTE)
+-- Separately: service_role HAS EXECUTE on ALL THREE RPCs (expect exactly 3 rows -- one per RPC):
+select p.proname from pg_proc p
+  cross join lateral aclexplode(p.proacl) a join pg_roles r on r.oid = a.grantee
  where p.oid in ('public.open_sync_cycle(text, date, timestamptz, text)'::regprocedure,
    'public.claim_sync_cycle(uuid)'::regprocedure,'public.claim_source_export_attempt(uuid, text)'::regprocedure)
-   and a.privilege_type='EXECUTE' and r.rolname='service_role';
+   and a.privilege_type = 'EXECUTE' and r.rolname = 'service_role'
+ order by p.proname;
 
 -- G10) every Scheduler-v2 DATA table is EMPTY (expect 0 for all five)
 select (select count(*) from public.sync_cycles) as sync_cycles,
@@ -1605,11 +1628,20 @@ select (select count(*) from public.sync_cycles) as sync_cycles,
 select count(*) as total, count(*) filter (where schedule_enabled) as enabled, count(distinct report_key) as distinct_keys
   from public.report_sync_settings;  -- expect total=13, enabled=0, distinct_keys=13
 
--- G12) exactly the three expected RPCs exist; no cron/schedule
+-- G12) exactly the three expected RPCs exist; and pg_cron presence (single, unconditional, branch-free check)
 select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
  where n.nspname='public' and proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt') order by proname;  -- expect these 3
-select to_regclass('cron.job') as cron_job;  -- if NULL: pg_cron absent -> no schedule; else run the next line
--- select jobid, jobname, schedule from cron.job where jobname ilike '%sync%' or command ilike '%sync%';  -- expect 0 rows
+select to_regclass('cron.job') as cron_job;  -- expect NULL (pg_cron not installed -> no schedule can exist)
+
+rollback;  -- read-only transaction: no write occurred; release the snapshot. Always runs (no branch above it).
+```
+
+If — and only if — G12 returns a **non-NULL** `cron_job` (i.e. `pg_cron` is installed), run this SEPARATE
+read-only follow-up **outside** the transaction above (it is also a plain SELECT; it is kept out of the fixed
+`begin … rollback` block precisely so that block stays branch-free and always rolls back):
+
+```sql
+select jobid, jobname, schedule from cron.job where jobname ilike '%sync%' or command ilike '%sync%';  -- expect 0 rows; any row => STOP
 ```
 
 ### J.2 Offline checks (no production connection)

@@ -8214,17 +8214,23 @@ executed, no production connection. Full package in SCHEDULER_V2_ROLLOUT.md Appe
 
 - Doc corrections: (1) runbook top status now says migrations 1-4 APPLIED and VERIFIED while Scheduler v2 remains
   locked (allowlist empty), paused (13 controls schedule_enabled=false), undeployed, unscheduled (no pg_cron
-  kickoff), and zero DataDoe exports (all v2 tables empty). (2) Replaced every "committed POSTGRES_URL" (App
+  kickoff), and zero DataDoe exports; the five operational/data tables (sync_cycles, sync_source_jobs,
+  sync_report_jobs, sync_source_job_owners, ads_sync_coverage) are empty while report_sync_settings holds exactly
+  13 rows all schedule_enabled=false (NOT "every table empty"). (2) Replaced every "committed POSTGRES_URL" (App
   C/E/G/I) with "configured POSTGRES_URL loaded from untracked .env.local ... NOT committed to the repository" --
   never implies the production connection string is committed.
-- Gate 2 package (Appendix J): READ-ONLY production re-verification (run inside a read-only transaction; zero
-  writes, zero DataDoe). G1 six tables present; G2 four ledger rows each exactly once; G3 exact columns per table
-  (counts 18/27/25/8/4/15); G4 all named constraints via pg_get_constraintdef scoped by exact public relation
-  OIDs (reproduces V2-3/W2-3/X2-4/Y2-5); G5 all indexes; G6 all user triggers (5 touch triggers; none on
-  report_sync_settings); G7 RLS on all six; G8 exactly 5 SELECT/authenticated/is_dashboard_admin()/no-WITH-CHECK
-  policies (ads_sync_coverage has zero); G9a/b RPC identities + SECURITY DEFINER + search_path=public + ACL
-  (owner+service_role only; PUBLIC/anon/authenticated forbidden); G10 all five data tables empty; G11 exactly 13
-  paused controls; G12 exactly the 3 RPCs + no cron. J.2 offline: schedulerV2Preflight ready:true/blockers:[]
+- Gate 2 package (Appendix J): READ-ONLY production re-verification. J.1 is an explicit read-only transaction --
+  begin; set transaction read only; ...G1-G12 (all SELECT/catalog reads, no in-transaction branch)...; rollback;
+  -- so no write is possible and the trailing ROLLBACK can never be skipped. G1 six tables present; G2 four
+  ledger rows each exactly once; G3 exact columns per table (counts 18/27/25/8/4/15); G4 all named constraints
+  via pg_get_constraintdef scoped by exact public relation OIDs (reproduces V2-3/W2-3/X2-4/Y2-5); G5 all indexes;
+  G6 all user triggers (5 touch triggers; none on report_sync_settings); G7 RLS on all six; G8 exactly 5
+  SELECT/authenticated/is_dashboard_admin()/no-WITH-CHECK policies (ads_sync_coverage has zero); G9a RPC
+  identities + SECURITY DEFINER + search_path=public; G9b hardened ACL -- enumerates EVERY EXECUTE grantee per
+  RPC and fails on any grantee that is neither the function owner (inherent) nor service_role (so PUBLIC/anon/
+  authenticated/any arbitrary extra role all fail), plus a separate assertion that service_role has EXECUTE on
+  all three; G10 the five data tables empty; G11 exactly 13 paused controls; G12 exactly the 3 RPCs + single
+  unconditional to_regclass('cron.job') (pg_cron absent). J.2 offline: schedulerV2Preflight ready:true/blockers:[]
   against committed migrations+wrappers, SCHEDULER_V2_READY_REPORT_KEYS empty. J.3 explicit STOP for every
   mismatch; no repair/write/schema-change/rollback; do not proceed to canary/unlock/deploy/schedule.
 - All Gate 2 catalog queries are public-scoped (public.<rel>::regclass / regprocedure OIDs, or nspname='public').
