@@ -7939,3 +7939,33 @@ tests) + this docs commit. CONFIRMED: nothing pushed/merged/deployed/migrated/en
 DataDoe call; Scheduler v1 + frontend + routes + cron untouched; every v2 control remains locked; Product
 Catalog ASIN-brand gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex
 re-review.
+
+## Scheduler v2: Production Rollout Gate 0 -- offline/read-only preflight preparation (2026-08-13)
+
+Codex APPROVED Phase 1f. Gate 0 (offline preparation ONLY) executed on `feature/scheduler-v2` @ `4163974`. No
+migration applied, no DataDoe call, no Supabase write, no deploy, no schedule, no control unlock. Full evidence
+in SCHEDULER_V2_ROLLOUT.md Appendix A (Gate 0) + Appendix B (prepared, UNEXECUTED Gate 1a package for migration
+1). Approved audit/runtime code was NOT modified (Gate 0 exposed no defect).
+
+- Committed-state invariants confirmed: HEAD includes 4163974; `SCHEDULER_V2_READY_REPORT_KEYS` empty (all v2
+  reports locked); Scheduler v1 unchanged (`git diff HEAD` empty); primary-DataDoe-only (dormant dd-secondary is
+  read-only, never routed through the primary key; no secondary key required; no fallback).
+- Offline verify (npm wrapper stalled as documented; run direct): insights 54, brand-view 78, sync 23,
+  source-cache 73, sync-engine 79, report-derivation 502, source-identity 7, report-contracts 161,
+  report-sync-controls 9 = **986** verify-suite assertions; build:check green; git diff --check clean; node
+  --check on all Phase 1f modules/tests OK.
+- Zero-side-effect static preflight (real migrations + supabase.js, global fetch trap + allowlisted readFile):
+  audit ok:true, blockers:[], requiredWrappers.ok:true (28/28); pf.ready:true, blockers:[], v2ControlsLocked
+  {ready:[],scheduled:[],ok:true}; **0 network calls**, only the 5 expected files read (0 violations), 0 writes,
+  0 DataDoe, 0 discovery.
+- Frozen SHA-256 recorded for the 4 migrations + schema-contract.js + runtime-composition.js + supabase.js
+  (Appendix A). Migrations byte-unchanged and unapplied.
+- Gate 1a prepared but NOT executed: single-file atomic apply of `20260807_scheduler_v2.sql` (NOT `db:migrate`,
+  which applies all four), read-only verification queries, expected objects (3 tables / 3 RPCs / 4 named
+  constraints / 6 indexes / 3 triggers / RLS + service_role-only grants), non-destructive stop conditions.
+  Migration 1 creates NO schedule and performs NO DataDoe export (no pg_cron/pg_net; kickoff file absent).
+
+CONFIRMED: zero live DataDoe calls; zero Supabase writes; zero migrations applied; zero reports unlocked; zero
+schedules enabled; nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; Product
+Catalog gap-fill NOT started; HANDOFF.md + .worktrees/ untouched/untracked. STOP for Codex review + explicit
+human approval before applying `20260807_scheduler_v2.sql`.

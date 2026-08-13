@@ -198,10 +198,189 @@ report. **Approval gate per report.**
 
 ### Explicit approval checklist (sign off before each live step)
 
-- [ ] Gate 0 — preconditions verified.
-- [ ] Gate 1a–1d — each migration applied (one at a time).
+- [x] Gate 0 — preconditions verified (offline evidence in Appendix A, 2026-08-13).
+- [ ] Gate 1a–1d — each migration applied (one at a time). Gate 1a package prepared (Appendix B); **NOT executed** — awaiting explicit human approval.
 - [ ] Gate 2 — post-migration verification queries pass.
 - [ ] Gate 5 — one-account shadow canary run.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
 - [ ] Kickoff (`20260808_scheduler_v2_kickoff.sql`) — separate, later, fully-reviewed step (NOT in this phase).
+
+---
+
+## Appendix A — Gate 0 offline evidence (executed 2026-08-13, read-only)
+
+Gate 0 is **offline/read-only preparation only**. No migration applied, no DataDoe call, no Supabase write, no
+deploy, no schedule, no control unlock. Verified against `feature/scheduler-v2` @ `4163974` (Codex-approved
+Phase 1f).
+
+**Committed-state invariants (all confirmed):**
+- HEAD includes `4163974` (`git merge-base --is-ancestor` = yes); working tree clean except untracked
+  `.worktrees/` and `HANDOFF.md`.
+- `SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([])` — **every** v2 report locked (empty fail-closed allowlist).
+- Scheduler v1 unchanged: `git diff HEAD` is empty; v1 `reportControlCatalog` untouched.
+- Primary-DataDoe-only: discovery skips a dormant `dd-secondary:` account read-only and **never** routes it
+  through the primary key (`runtime-composition.js` `makeProductionDiscoverAccounts` / classify); no secondary
+  API key is required (connections without an `apiKey` are skipped). No secondary→primary fallback exists.
+
+**Offline verification (npm run verify stalled on the Windows npm process-spawn wrapper as documented; every
+component run directly):**
+
+| suite | result |
+|---|---|
+| `test:insights` | 54 |
+| `test:brand-view` | 78 |
+| `test:sync` | 23 |
+| `test:source-cache` | 73 |
+| `test:sync-engine` (7 files) | 79 (22+17+6+12+4+17+1) |
+| `test:report-derivation` (15 files) | 502 |
+| `test:source-identity` | 7 |
+| `test:report-contracts` | 161 |
+| `test:report-sync-controls` | 9 |
+| **verify test total** | **986** |
+| `build:check` | green (dashboard bundle intact, >500 kB chunk present) |
+| `git diff --check` | clean |
+| `node --check` (schema-contract.js, runtime-composition.js, report-controls.js, sync-runtime-composition.test.js, sync-dispatch.test.js) | all OK |
+
+**Zero-side-effect static preflight** (`schedulerV2Preflight` over the real committed migrations + `supabase.js`,
+with a global `fetch` trap and an allowlisted `readFile`/`getConnections`):
+- static audit `ok:true`, `blockers:[]`, `requiredWrappers.ok:true` (28/28 exported, 0 missing);
+- `pf.ready:true`, `pf.blockers:[]`; `checks.v2ControlsLocked = {ready:[], scheduled:[], ok:true}`;
+- **network(fetch) calls: 0**; files read = exactly the 4 migrations + `supabase.js` (0 unexpected reads);
+  `getConnections` called once (read-only, no network); **zero writes, zero DataDoe, zero discovery**.
+
+**Frozen input SHA-256 (do not edit; re-verify before Gate 1):**
+
+```
+1328bc0fdbe430670d2ea1dc8bdf4b1a223feb04cd6eb5c0080ef26a1bdc691e  supabase/migrations/20260807_scheduler_v2.sql
+0750a155a0c46a6e6ae3d24cea7835b8840f0e2c3a0d22670b595222d859b724  supabase/migrations/20260810_ads_sync_coverage.sql
+544557fb29b1ae8e03e9c8d263d8b2fba73853853273f30c517cbc30938bea4c  supabase/migrations/20260810_report_sync_controls.sql
+49628c8d701b3d1ca3b22b131bd8d8f8122585cd0461133f094a7a0154d98669  supabase/migrations/20260811_sync_source_job_owners.sql
+534cad4767e980456a99a30180b20a4546f35ff69ca144c970a3f6c08f4fdb95  lib/server/sync/schema-contract.js
+8d22e8133d25dc50158dae5ca13d77c30f3542a7f8084ce9794d34387943793c  lib/server/sync/runtime-composition.js
+8ca6d7092665bda62593faf5b9c5677a822eee1b9c650be734bf2105be123ae7  lib/server/supabase.js
+```
+
+**Gate 0 conclusion:** all offline checks pass. Cleared to PREPARE Gate 1 (below). **Not** cleared to apply —
+that requires explicit human approval.
+
+---
+
+## Appendix B — Gate 1a package: apply ONLY `20260807_scheduler_v2.sql` (PREPARED — NOT executed)
+
+> **NOTHING in this appendix has been run.** It is the exact package a reviewer/operator executes **after
+> written approval**, one migration only, then STOPS for Gate 2 verification before migrations 2–4.
+
+**Do NOT use `npm run db:migrate` for Gate 1.** `scripts/apply-supabase-migrations.mjs` applies **every** pending
+`.sql` file (migrations 1–4) in one run — that is Gate 1a–1d at once, which this gate forbids. Apply the single
+file atomically instead. (The kickoff `20260808_scheduler_v2_kickoff.sql` is **not present** in
+`supabase/migrations/`, so no schedule can be applied here regardless.)
+
+**Exact apply command (single file, one transaction, abort+rollback on any error, ledger-consistent).** Uses the
+same connection as `apply-supabase-migrations.mjs` (`POSTGRES_URL` + `sslmode=no-verify` for the Vercel pooler
+cert on Windows):
+
+```bash
+node --input-type=module -e '
+import pg from "pg"; import { readFileSync } from "node:fs";
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+try {
+  await c.query("begin");
+  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
+  await c.query(readFileSync("sales-dashboard-live/supabase/migrations/20260807_scheduler_v2.sql", "utf8"));
+  await c.query("insert into public.app_schema_migrations (filename) values ($1) on conflict (filename) do nothing", ["20260807_scheduler_v2.sql"]);
+  await c.query("commit"); console.log("applied 20260807_scheduler_v2.sql");
+} catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
+'
+```
+
+psql equivalent (if preferred): `PGSSLMODE=no-verify psql "$POSTGRES_URL" -v ON_ERROR_STOP=1 --single-transaction
+-c "create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not
+null default now());" -f sales-dashboard-live/supabase/migrations/20260807_scheduler_v2.sql -c "insert into
+public.app_schema_migrations (filename) values ('20260807_scheduler_v2.sql') on conflict (filename) do nothing;"`
+
+**This migration is pure additive DDL: it creates NO schedule (no `pg_cron`/`pg_net`) and performs NO DataDoe
+export** (verified by inspection of the frozen file — the only `pg_cron` tokens are comments and a `trigger`
+text-enum column value). It reuses helpers from earlier migrations (`public.touch_updated_at()`,
+`public.is_dashboard_admin()`, `auth.users`); if any is absent the apply errors and the whole transaction rolls
+back (fail closed).
+
+**Expected objects created by migration 1:**
+- Tables (3): `public.sync_cycles`, `public.sync_source_jobs`, `public.sync_report_jobs`.
+- RPCs (3): `public.open_sync_cycle(text,date,timestamptz,text)→uuid`, `public.claim_sync_cycle(uuid)→boolean`,
+  `public.claim_source_export_attempt(uuid,text)→boolean` (all `security definer`, executable by `service_role`
+  only — revoked from `public`/`anon`/`authenticated`).
+- Named constraints (4): `sync_cycles_bucket_date_unique` (UNIQUE), `sync_source_jobs_cycle_hash_unique`
+  (UNIQUE), `sync_source_jobs_one_attempt` (CHECK), `sync_report_jobs_cycle_report_account_unique` (UNIQUE)
+  — plus inline CHECKs (`bucket`, `trigger`, `status`, `fetch_status`, `create_export_count >= 0`, `error_stage`,
+  `derive_status`, `save_status`).
+- Indexes (6): `sync_cycles_bucket_date_idx`, `sync_source_jobs_cycle_idx`, `sync_source_jobs_pending_idx`,
+  `sync_source_jobs_source_idx`, `sync_report_jobs_cycle_idx`, `sync_report_jobs_report_idx`.
+- Triggers (3): `sync_cycles_touch`, `sync_source_jobs_touch`, `sync_report_jobs_touch` (BEFORE UPDATE →
+  `touch_updated_at()`).
+- RLS enabled on all 3 tables + 3 admin-only SELECT policies (`is_dashboard_admin()`).
+
+**Read-only verification queries (run immediately after apply; expected results inline):**
+
+```sql
+-- 1) the 3 tables exist (expect exactly these 3 rows)
+select table_name from information_schema.tables
+ where table_schema='public'
+   and table_name in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by table_name;
+
+-- 2) the 3 RPCs exist (expect 3)
+select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+ where n.nspname='public'
+   and proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
+ order by proname;
+
+-- 3) the 4 named constraints exist (expect 4)
+select conname from pg_constraint
+ where conname in ('sync_cycles_bucket_date_unique','sync_source_jobs_cycle_hash_unique',
+                   'sync_source_jobs_one_attempt','sync_report_jobs_cycle_report_account_unique')
+ order by conname;
+
+-- 4) RLS is enabled on all 3 tables (expect 3 rows, rowsecurity = true)
+select relname, relrowsecurity from pg_class
+ where relnamespace='public'::regnamespace
+   and relname in ('sync_cycles','sync_source_jobs','sync_report_jobs')
+ order by relname;
+
+-- 5) execute grants are service_role-only (expect only service_role for each function)
+select p.proname, r.rolname from pg_proc p
+   join pg_namespace n on n.oid=p.pronamespace
+   cross join lateral aclexplode(p.proacl) a
+   join pg_roles r on r.oid=a.grantee
+ where n.nspname='public'
+   and p.proname in ('open_sync_cycle','claim_sync_cycle','claim_source_export_attempt')
+   and a.privilege_type='EXECUTE'
+ order by p.proname, r.rolname;
+
+-- 6) nothing has run yet (expect 0)
+select count(*) as cycle_rows from public.sync_cycles;
+
+-- 7) ledger recorded exactly this one migration in this gate (expect 1 row for 20260807_scheduler_v2.sql)
+select filename, applied_at from public.app_schema_migrations
+ where filename = '20260807_scheduler_v2.sql';
+
+-- 8) NO Scheduler-v2 schedule was created (pg_cron optional; expect 0 rows, or a benign "relation cron.job
+--    does not exist" if pg_cron is not installed — either way, migration 1 creates no cron entry)
+select jobid, jobname, schedule from cron.job where command ilike '%sync%';
+```
+
+Then re-run `schedulerV2Preflight(...)` (still offline/read-only against the committed source) — it must stay
+`ready:true`, `blockers:[]`, controls locked.
+
+**Stop / rollback conditions (Gate 1a):**
+- The apply is a single transaction with abort-on-error, so any failure leaves the DB **unchanged** (no partial
+  apply). STOP and investigate if the apply errors (e.g. a missing helper function) — do not retry blindly.
+- STOP if any verification query deviates: fewer/more than 3 tables, 3 RPCs, or 4 named constraints; any RLS
+  `rowsecurity=false`; any EXECUTE grantee other than `service_role`; `cycle_rows > 0`; or a `cron.job` row
+  matching sync.
+- Non-destructive rollback: migration 1 is additive + idempotent; while every v2 control stays locked (shadow),
+  leaving it applied is safe and inert. **No destructive teardown (DROP) is prepared** — a teardown would be its
+  own separately reviewed migration and is out of scope.
+- Do **NOT** proceed to migrations 2–4, the canary, any control unlock, or the kickoff. Stop for Gate 2 review +
+  explicit human approval.
