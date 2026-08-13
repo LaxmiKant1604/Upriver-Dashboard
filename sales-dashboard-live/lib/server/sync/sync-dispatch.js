@@ -6,10 +6,12 @@
 // driver so identical canonical source hashes fetch once, threads a single cumulative maxJobs + wall-clock
 // budget across all drivers, and finally derives the ready reports (zero DataDoe/network in the derive).
 //
-// SHADOW MODE: not wired to any cron/route; every current report control is locked (reportControlCatalog
-// marks Scheduler v2 adapters not-ready), so a real invocation dispatches NOTHING and spends zero tokens. The
-// store, dataDoe, account-directory provider, persisted-Ads readers and snapshot saver are all INJECTED, so
-// the dispatcher is deterministic and offline-testable and makes no DataDoe/Supabase call of its own.
+// SHADOW MODE: not wired to any cron/route; readiness comes from the fail-closed schedulerV2ReportControlCatalog
+// (Scheduler-v2 readiness, DISTINCT from Scheduler v1's `enabled`), whose v2-ready allowlist is EMPTY -- so
+// every Scheduler v2 report, including the v1-live brand-sales, is locked and a real invocation (manual or
+// scheduled) dispatches NOTHING and spends zero tokens. The store, dataDoe, account-directory provider,
+// persisted-Ads readers and snapshot saver are all INJECTED, so the dispatcher is deterministic and
+// offline-testable and makes no DataDoe/Supabase call of its own.
 //
 // It creates NO cron, route, migration, deployment or frontend wiring, and unlocks no report.
 
@@ -21,7 +23,7 @@ import { runSalesMoversShadowCycle } from "./sales-movers-cycle.js";
 import { runPpcShadowCycle } from "./ppc-cycle.js";
 import { runListingOptimizerShadowCycle } from "./listing-optimizer-cycle.js";
 import { makePpcAdsContextLoader } from "./ppc-ads-loader.js";
-import { reportControlCatalog } from "./report-controls.js";
+import { schedulerV2ReportControlCatalog } from "./report-controls.js";
 import { DERIVED_ONLY_REPORT_KEYS } from "./report-derivation.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { classifyDirectoryAccounts } from "../datadoe-connections.js";
@@ -63,10 +65,12 @@ export function classifySchedulerV2ReportKey(reportKey) {
  *   - a scheduled run selects the reports that are ready AND schedule-enabled.
  * Returns `{ requested, readySet, manual }`. `readySet` (reports whose adapter is runtime-ready) is used by the
  * dispatcher to keep a locked/not-ready report from spending a single export -- a manual request NEVER unlocks
- * a report. `controlCatalog` is injectable for offline tests; it defaults to the real reportControlCatalog,
- * under which every Scheduler v2 report is not-ready, so a production invocation selects nothing.
+ * a report. `controlCatalog` is injectable for offline tests; it defaults to the fail-closed
+ * schedulerV2ReportControlCatalog (Scheduler-v2 readiness, DISTINCT from Scheduler v1's `enabled`), under which
+ * EVERY Scheduler v2 report -- including brand-sales, which Scheduler v1 runs live -- is not-ready, so a
+ * production invocation (manual or scheduled) selects it into neither ready nor scheduled and spends zero exports.
  */
-export function selectSchedulerV2ReportKeys({ settings = [], manualReportKeys = null, controlCatalog = reportControlCatalog } = {}) {
+export function selectSchedulerV2ReportKeys({ settings = [], manualReportKeys = null, controlCatalog = schedulerV2ReportControlCatalog } = {}) {
   const catalog = controlCatalog(settings) || [];
   const readySet = new Set(catalog.filter((c) => c && c.ready).map((c) => c.reportKey));
   // A MANUAL request is ANY array of keys (blocker 3). manualReportKeys = [] is a VALID manual selection
@@ -141,7 +145,7 @@ export function composeDerivedContextLoaders(loaders) {
  */
 export async function runSchedulerV2Shadow({
   bucket, cycleDate, asOf = null, asOfFor = null,
-  settings = [], manualReportKeys = null, controlCatalog = reportControlCatalog,
+  settings = [], manualReportKeys = null, controlCatalog = schedulerV2ReportControlCatalog,
   connections, discoverAccounts,
   store, dataDoe, saveSnapshot,
   ppcAdsProviders = null, loadDerivedContext = null,

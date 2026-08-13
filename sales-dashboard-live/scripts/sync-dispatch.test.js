@@ -32,7 +32,9 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 let runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders;
 let buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS;
-let addDaysStr, monthStartStr;
+let addDaysStr, monthStartStr, monthBackStr;
+let makeDailyAdsContextLoader, makePpcAdsContextLoader;
+let reportControlCatalog, schedulerV2ReportControlCatalog;
 
 const ASOF = "2025-08-10";
 const LO_DATE = "2025-06-01"; // inside [asOf-84d, asOf]
@@ -72,7 +74,56 @@ function makeDataDoe(opts = {}) {
       const k = job.requestKey || "";
       if (opts.deferPollKey && k === opts.deferPollKey) { pollHits[k] = (pollHits[k] || 0) + 1; if (pollHits[k] === 1) throw deadlineErr(); }
     },
-    async download(job) { return rowsFor(job); },
+    async download(job) {
+      // capKey: return an EXACTLY-cap-sized page for that source so a strict contract rejects it as TRUNCATED.
+      if (opts.capKey && (job.requestKey || "") === opts.capKey) return new Array(Number(job.limit)).fill({ x: 1 });
+      return rowsFor(job);
+    },
+  };
+}
+
+// A dataDoe that returns FAITHFUL download rows for named request keys (else rowsFor) and RECORDS every
+// downloaded request key -- used by the Daily+PPC integration to prove derivation makes zero DataDoe calls.
+function seededDataDoe(faithful = {}) {
+  const dd = makeDataDoe();
+  const fetched = [];
+  const baseDownload = dd.download;
+  dd.download = async (job, exportId) => {
+    fetched.push(job.requestKey || "");
+    return Object.prototype.hasOwnProperty.call(faithful, job.requestKey || "") ? faithful[job.requestKey] : baseDownload(job, exportId);
+  };
+  dd.fetchedKeys = () => fetched.slice();
+  return dd;
+}
+
+// Wide durable coverage that trivially spans any requested window (the resolvers clamp it to [from,to], so
+// a validated/proven state results without pinning exact dates). Used to seed valid Daily + PPC coverage.
+const WIDE_COVERAGE = [{ from: "2000-01-01", to: "2099-12-31" }];
+
+// Real Daily Ads context loader seeds: injected ad_daily_metrics reader + durable ads_sync_coverage reader
+// (Supabase-style, NEVER DataDoe). Records reader calls so a test can prove the derive read from here.
+function makeDailyAdsSeed() {
+  const calls = { metrics: 0, coverage: 0 };
+  return {
+    calls,
+    getAdMetrics: async (_accountId, _from, _to) => { calls.metrics += 1; return [{ metric_date: "2025-08-01", currency: "USD", ad_sales: 40, ad_spend: 10, ad_clicks: 100 }]; },
+    getCoverageState: async (_accountId, _sourceKey) => { calls.coverage += 1; return { windows: WIDE_COVERAGE, status: "succeeded", read: "ok", latestMetricDate: "2025-08-01" }; },
+  };
+}
+
+// Real PPC persisted-Ads providers: seeded campaign+ASIN rows + durable coverage (all four sources proven).
+// Supabase-style readers, NEVER DataDoe. Records reader calls.
+function makePpcAdsSeed() {
+  const calls = { rows: 0, states: 0, coverage: 0 };
+  const rows = [
+    { account_id: "A1", source_key: "campaign-performance-v1", metric_date: "2025-08-01", currency: "USD", dimensions: {}, metrics: { ad_spend: 10, ad_sales: 40, ad_clicks: 100 } },
+    { account_id: "A1", source_key: "asin-performance-v1", metric_date: "2025-08-01", currency: "USD", dimensions: {}, metrics: { ad_spend: 6, ad_sales_same_sku: 30, ad_clicks: 40 } },
+  ];
+  return {
+    calls,
+    getAdsDailySourceRows: async ({ accountId, sourceKeys, from, to }) => { calls.rows += 1; return rows.filter((r) => r.account_id === accountId && sourceKeys.includes(r.source_key) && r.metric_date >= from && r.metric_date <= to); },
+    getAdsSyncStates: async (_accountIds) => { calls.states += 1; return []; },
+    getAdsSyncCoverage: async (_accountId, _sourceKey) => { calls.coverage += 1; return { windows: WIDE_COVERAGE, status: "succeeded", read: "ok" }; },
   };
 }
 
@@ -461,20 +512,49 @@ test("composeDerivedContextLoaders: passthrough + a throwing loader never suppre
   assert.deepEqual(await composed({ reportKey: "ppc-performance" }), { ppcAds: { p: 1 } }, "the surviving loader still contributes");
 });
 
-test("(daily+ppc in one invocation) both derived contexts load; neither loader suppresses the other", async () => {
-  const seenGeneral = [];
-  const general = async ({ reportKey }) => { seenGeneral.push(reportKey); return reportKey === "daily-reporting" ? { adsCoverage: { mark: "daily" } } : {}; };
-  const covCalls = [];
-  const ppcAds = {
-    getAdsDailySourceRows: async () => [],
-    getAdsSyncStates: async () => [],
-    getAdsSyncCoverage: async (acct, sourceKey) => { covCalls.push([acct, sourceKey]); return null; },
-  };
+test("(routing, real loaders) the real Daily + PPC loaders give each report ONLY its own field; a throwing sibling never suppresses", async () => {
+  const daily = makeDailyAdsSeed();
+  const ppc = makePpcAdsSeed();
+  const dailyLoader = makeDailyAdsContextLoader({ connections: CONNS, getAdMetrics: daily.getAdMetrics, getCoverageState: daily.getCoverageState });
+  const ppcLoader = makePpcAdsContextLoader({ getAdsDailySourceRows: ppc.getAdsDailySourceRows, getAdsSyncStates: ppc.getAdsSyncStates, getAdsSyncCoverage: ppc.getAdsSyncCoverage });
+  const composed = composeDerivedContextLoaders([dailyLoader, ppcLoader]);
+  // Daily Reporting (ALL brand) -> ONLY adsCoverage (the PPC loader returns {} for it).
+  const ctxD = await composed({ reportKey: "daily-reporting", accountId: "A1", planned: { context: { brand: "ALL", from: monthBackStr(ASOF, 5), to: ASOF, currency: "USD", rawSellerId: "A1" } } });
+  assert.deepEqual(Object.keys(ctxD).sort(), ["adsCoverage"], "Daily receives ONLY adsCoverage");
+  // PPC Performance -> ONLY ppcAds (the Daily loader returns {} for it), validated from the seeded coverage.
+  const ctxP = await composed({ reportKey: "ppc-performance", accountId: "A1", planned: { context: { to: ASOF, rawSellerId: "A1" } } });
+  assert.deepEqual(Object.keys(ctxP).sort(), ["ppcAds"], "PPC receives ONLY ppcAds");
+  assert.equal(ctxP.ppcAds.status, "ok", "PPC ppcAds validated from the seeded durable campaign+ASIN coverage");
+  // One throwing report-specific loader never suppresses its sibling.
+  const boom = async () => { throw new Error("boom"); };
+  const survived = composeDerivedContextLoaders([boom, ppcLoader]);
+  const ctxP2 = await survived({ reportKey: "ppc-performance", accountId: "A1", planned: { context: { to: ASOF, rawSellerId: "A1" } } });
+  assert.deepEqual(Object.keys(ctxP2).sort(), ["ppcAds"], "a throwing sibling does not suppress the surviving PPC loader");
+});
+
+test("(daily+ppc integration) one dispatcher invocation derives + saves BOTH Daily and PPC from seeded durable coverage/rows; derivation makes zero DataDoe calls", async () => {
+  const store = makeStore();
+  const saver = makeSaver();
+  const daily = makeDailyAdsSeed();
+  const ppc = makePpcAdsSeed();
+  // Faithful Daily superset so the sales snapshot is meaningful; PPC catalog/total-sales come from rowsFor.
+  const dd = seededDataDoe({ "daily-reporting:asin-day-superset": [{ date: "2025-08-01", seller_or_vendor_id: "A1", total_sales_sum: 100, total_units_sum: 5 }] });
+  const general = makeDailyAdsContextLoader({ connections: CONNS, getAdMetrics: daily.getAdMetrics, getCoverageState: daily.getCoverageState });
   const keys = ["daily-reporting", "ppc-performance"];
-  const { promise } = dispatch({ controlCatalog: mkCatalog(keys, keys), loadDerivedContext: general, ppcAdsProviders: ppcAds });
-  await promise;
-  assert.ok(seenGeneral.includes("daily-reporting"), "the injected general loader derived Daily adsCoverage");
-  assert.ok(covCalls.some(([acct]) => acct === "A1"), "makePpcAdsContextLoader read PPC ppcAds coverage in the SAME invocation");
+  await dispatch({ store, dataDoe: dd, saver, controlCatalog: mkCatalog(keys, keys), loadDerivedContext: general, ppcAdsProviders: ppc }).promise;
+  // BOTH snapshots derive + save.
+  assert.ok(saver.has("daily-reporting", "A1"), "Daily Reporting derived + saved");
+  assert.ok(saver.has("ppc-performance", "A1"), "PPC Performance derived + saved");
+  // Daily consumed the seeded durable Ads coverage (validated); PPC folded the seeded campaign+ASIN rows.
+  assert.equal(saver.saved.get("daily-reporting|A1").adsAvailability.status, "validated", "Daily resolved the seeded durable Ads coverage to validated");
+  assert.equal(saver.saved.get("ppc-performance|A1").adsRowCount, 2, "PPC folded the two seeded campaign+ASIN Ads rows");
+  // The derive-context loaders read from injected Supabase-style readers (NEVER DataDoe).
+  assert.ok(daily.calls.metrics > 0 && daily.calls.coverage > 0, "the Daily loader read ad_daily_metrics + durable coverage");
+  assert.ok(ppc.calls.rows > 0 && ppc.calls.coverage > 0, "the PPC loader read persisted Ads rows + durable coverage");
+  // ZERO DataDoe/network in derivation: no persisted-Ads source was EVER fetched via DataDoe (Daily ads come
+  // from the loader; PPC creates zero Ads exports). Every DataDoe download was a planned report source.
+  const allowed = ["daily-reporting:asin-day-superset", "daily-reporting:catalog", "ppc-performance:catalog", "ppc-performance:total-sales"];
+  assert.ok(dd.fetchedKeys().every((k) => allowed.includes(k)), "every DataDoe fetch was a planned source; derivation issued zero DataDoe/network calls");
 });
 
 /* ===================== blocker 3: manual selection semantics ===================== */
@@ -591,12 +671,84 @@ test("(multi-unit, final unit truncates) an earlier unit fully drains, the final
   assert.ok(saver.has("listing-optimizer", "A1"), "the staged report saves after resume");
 });
 
+/* ===================== re-review finding 1: Scheduler-v2 readiness is fail-closed + distinct from v1 ===================== */
+
+group("scheduler-v2 dispatch: v2 readiness is fail-closed, distinct from v1 (finding 1)");
+
+test("(v1 vs v2 readiness) Scheduler v1 readiness is unchanged; Scheduler v2 readiness is fail-closed for EVERY report", () => {
+  const v1 = reportControlCatalog([]);
+  const v2 = schedulerV2ReportControlCatalog([]);
+  assert.equal(v1.find((c) => c.reportKey === "brand-sales").ready, true, "Scheduler v1 still runs Brand Sales (v1 readiness untouched)");
+  assert.equal(v2.find((c) => c.reportKey === "brand-sales").ready, false, "Scheduler v2 Brand Sales is locked (fail-closed, NOT derived from v1 enabled)");
+  assert.ok(v2.every((c) => c.ready === false && c.scheduleEnabled === false), "EVERY Scheduler v2 report is not-ready + not-scheduled by default");
+});
+
+test("(default v2 lock) a DEFAULT manual OR scheduled Brand Sales request is locked out and spends ZERO exports", async () => {
+  // No injected controlCatalog => the dispatcher uses its fail-closed schedulerV2ReportControlCatalog default.
+  const sched = await dispatch({}).promise; // scheduled (no manualReportKeys)
+  assert.deepEqual(sched.selected, [], "scheduled v2 selects nothing (no report is v2 schedule-enabled)");
+  assert.equal(sched.cycleId, null, "scheduled v2 opens no source cycle");
+  const dd = makeDataDoe();
+  const man = await dispatch({ dataDoe: dd, manualReportKeys: ["brand-sales"] }).promise; // manual Brand Sales
+  assert.deepEqual(man.selected, [], "manual Brand Sales is NOT dispatched under the fail-closed v2 catalog");
+  assert.deepEqual(man.lockedOut, ["brand-sales"], "brand-sales is reported locked-out (v2 not-ready)");
+  assert.equal(dd.totalCreates(), 0, "a default v2 Brand Sales request spends ZERO exports");
+});
+
+/* ===================== re-review finding 2: strict truncation on the newly dispatched contracts ===================== */
+
+group("scheduler-v2 dispatch: strict truncation on the new contracts (finding 2)");
+
+test("(strict + hash invariance) all four newly dispatched contracts are strict:true; request_hash is unchanged (golden)", () => {
+  // Golden hashes captured at HEAD 554b859 BEFORE strict was added; strict stays OUTSIDE sourceRequestIdentity.
+  const GOLDEN = {
+    "brand-sales:order-lines": "72a5ecdc9d8992a2bd60f222682155ca694cf9e18a37f5c291b225dd6895c315",
+    "brand-sales:catalog": "0e9c4e5a4653e92e8fb4aea2de50b5cade8f3f379daddce5bc8e3f392b33abac",
+    "content-changes:events": "94e6c902b901cb48fe3ce785144f8a0d6529c635c702d376be71a5d5e7b29d69",
+    "content-changes:catalog": "314e46657501b9d6515cefa0b10bd8b9bc661ba958312986213755dfb9751acf",
+  };
+  const plan = buildShadowReportPlan({ accounts: US_ACCTS, reportKeys: ["brand-sales", "content-changes"], connections: CONNS, asOfFor: asOfForUS });
+  let checked = 0;
+  for (const rk of ["brand-sales", "content-changes"]) {
+    for (const s of plan.reportRequests.find((r) => r.reportKey === rk).sources) {
+      assert.equal(s.strict, true, s.requestKey + " carries strict:true");
+      assert.equal(s.requestHash, GOLDEN[s.requestKey], s.requestKey + " request_hash is unchanged by strict");
+      checked += 1;
+    }
+  }
+  assert.equal(checked, 4, "all four new contracts were checked");
+});
+
+test("(strict truncation) an exactly-cap-sized brand-sales source records TRUNCATED, saves no payload/snapshot, keeps LKG, and never blocks an unrelated report", async () => {
+  const store = makeStore();
+  const saver = makeSaver();
+  saver.saved.set("brand-sales|A1", { lkg: true }); // a prior good snapshot (must be preserved)
+  const dd = makeDataDoe({ capKey: "brand-sales:order-lines" }); // that source's download returns EXACTLY the row cap
+  const keys = ["brand-sales", "content-changes"];
+  const r = await dispatch({ store, dataDoe: dd, saver, controlCatalog: mkCatalog(keys, keys) }).promise;
+  const ol = store.listSourceJobs(r.cycleId).find((j) => j.request_key === "brand-sales:order-lines");
+  // records TRUNCATED (terminal) + saves NO source payload.
+  assert.equal(ol.fetch_status, "failed", "the cap-sized strict source is failed");
+  assert.equal(ol.error_code, "TRUNCATED", "it records TRUNCATED");
+  assert.equal(ol.terminal, true, "TRUNCATED is terminal (no in-cycle retry)");
+  assert.equal(store.loadSourceRows(ol.request_hash), null, "no source payload was saved for the truncated source");
+  // writes NO report snapshot + preserves last-known-good.
+  assert.equal(saver.calls, 1, "brand-sales wrote no snapshot (only the unrelated report saved)");
+  assert.deepEqual(saver.saved.get("brand-sales|A1"), { lkg: true }, "the prior last-known-good brand-sales snapshot is untouched");
+  assert.notEqual(store.report("brand-sales", "A1").derive_status, "succeeded", "brand-sales did not derive-succeed");
+  // does NOT prevent an unrelated source/report from completing.
+  assert.ok(saver.has("content-changes", "A1"), "the unrelated content-changes report still derived + saved");
+});
+
 /* ============================= runner ============================= */
 
 async function main() {
   ({ runSchedulerV2Shadow, classifySchedulerV2ReportKey, selectSchedulerV2ReportKeys, composeDerivedContextLoaders } = await import("../lib/server/sync/sync-dispatch.js"));
   ({ buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
-  ({ addDaysStr, monthStartStr } = await import("../lib/server/date-windows.js"));
+  ({ addDaysStr, monthStartStr, monthBackStr } = await import("../lib/server/date-windows.js"));
+  ({ makeDailyAdsContextLoader } = await import("../lib/server/sync/daily-ads-loader.js"));
+  ({ makePpcAdsContextLoader } = await import("../lib/server/sync/ppc-ads-loader.js"));
+  ({ reportControlCatalog, schedulerV2ReportControlCatalog } = await import("../lib/server/sync/report-controls.js"));
   void SHADOW_PLANNED_REPORT_KEYS; void STAGED_CYCLE_REPORT_KEYS;
 
   for (const t of tests) {
