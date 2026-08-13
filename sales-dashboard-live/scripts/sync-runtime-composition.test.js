@@ -456,6 +456,40 @@ test("(audit blocker: endpoint evidence only from real literals) division / tern
   assert.ok(!rpcMissing(singleQuoted), "genuine single-quoted endpoint => recognized");
 });
 
+test("(audit blocker: wrapper export proven only by a line-anchored declaration) a regex after if/while/for control conditions, a similarly-named export, an object property, a method, a nested function, and a disabled declaration never satisfy a wrapper; a genuine line-start export does; canonical passes", () => {
+  const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
+  base["supabase.js"] = realReadFile("supabase.js");
+  const A = (mut) => auditSchemaContract({ readFile: (n) => mut ? mut(n, base[n]) : base[n] });
+  const wrapperMissing = (r) => r.blockers.some((b) => b.code === "REQUIRED_WRAPPER_MISSING" && b.wrapper === "saveReportSnapshot") && r.requiredWrappers.missing.includes("saveReportSnapshot");
+  const disable = (t) => t.replace(/export async function saveReportSnapshot\b/, "async function saveReportSnapshot_DISABLED");
+  // canonical: the genuine line-start `export async function saveReportSnapshot(` is recognized.
+  assert.equal(A().requiredWrappers.missing.includes("saveReportSnapshot"), false, "canonical: genuine line-start export recognized");
+  // A regex classified (per JS grammar) as DIVISION after an if(...) `)` keeps its content in the `code` view,
+  // but the signature is mid-line (behind the leading `/`), so the line-anchored declaration match rejects it.
+  const ifRegex = "\nif (globalThis.__never)\n  /export async function saveReportSnapshot(x)/.test(\"x\");\n";
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) + ifRegex : t)), "if(...) /regex/ => REQUIRED_WRAPPER_MISSING (named)");
+  // Equivalent regex statements after while / for control conditions fail identically.
+  const whileRegex = "\nwhile (globalThis.__never)\n  /export async function saveReportSnapshot(x)/.test(\"x\");\n";
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) + whileRegex : t)), "while(...) /regex/ => REQUIRED_WRAPPER_MISSING");
+  const forRegex = "\nfor (; globalThis.__never; )\n  /export async function saveReportSnapshot(x)/.test(\"x\");\n";
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) + forRegex : t)), "for(...) /regex/ => REQUIRED_WRAPPER_MISSING");
+  // Assignment-position regex fake remains rejected (it is a DETECTED regex, blanked in `code`).
+  const assignRegex = "\nconst f3 = /export async function saveReportSnapshot\\(/;\n";
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) + assignRegex : t)), "assignment-position regex fake => REQUIRED_WRAPPER_MISSING");
+  // Near-miss declarations: a similarly-named export, an object property, a class method, and a nested function
+  // must NOT be accepted for `saveReportSnapshot` (the name must begin a line-anchored export ... function ... `(`).
+  const near = "\nexport async function saveReportSnapshotV2(x) { return x; }\n"
+    + "\nconst obj = { saveReportSnapshot: async function () { return 1; } };\n"
+    + "\nclass Repo { async saveReportSnapshot() { return 2; } }\n"
+    + "\nfunction outer() { async function saveReportSnapshot() { return 3; } }\n";
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) + near : t)), "similar-name / property / method / nested => REQUIRED_WRAPPER_MISSING");
+  // A disabled (un-exported) declaration is not accepted.
+  assert.ok(wrapperMissing(A((n, t) => n === "supabase.js" ? disable(t) : t)), "disabled declaration => REQUIRED_WRAPPER_MISSING");
+  // A genuine top-level export re-added with leading indentation is still recognized (optional leading ws).
+  const reAdd = A((n, t) => n === "supabase.js" ? disable(t) + "\n  export async function saveReportSnapshot(snapshot) { return snapshot; }\n" : t);
+  assert.equal(reAdd.requiredWrappers.missing.includes("saveReportSnapshot"), false, "genuine indented line-start export => recognized");
+});
+
 test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blockers,requiredWrappers}; a null/throwing supabase.js reader never crashes", () => {
   const base = {}; for (const e of SCHEDULER_V2_SCHEMA_CONTRACT) base[e.migration] = realReadFile(e.migration);
   const shapeOk = (r) => r && typeof r.ok === "boolean" && Array.isArray(r.matrix) && Array.isArray(r.blockers)

@@ -458,10 +458,18 @@ function lexJs(source) {
   return { code, literals: lits };
 }
 
-// `codeMasked` is the wrapper source's `code` view (comments + literal contents blanked), so this matches a
-// GENUINE top-level `export async function <name>(` only -- never a commented/quoted/template/regex fake.
+// A required wrapper is proven ONLY by a genuine `export async function <name>(` declaration that BEGINS a
+// source line (optional leading whitespace only) in the structural `code` view. LINE-ANCHORING is the crux: a
+// regex literal cannot contain an unescaped newline, so a regex whose content spells the signature always keeps
+// its leading `/` on the SAME line before `export` -- even when the regex is (correctly, per JS grammar)
+// classified as division after a `)`/`]` control condition (`if (...) /export async function <name>(x)/`) and
+// its content therefore survives in `code`. The `^[ \t]*export` anchor rejects that mid-line `export`, as well
+// as an `export` embedded after any other same-line code. Comments / strings / template text / detected regex
+// are already blanked in `code`; this additionally defeats the embedded-in-code and mid-line forms without any
+// fragile slash-context special-casing. `[ \t]` (never `\s`) between tokens keeps the match on ONE line so a
+// newline can never bridge unrelated code into the signature.
 function wrapperExported(codeMasked, name) {
-  return new RegExp(`\\bexport\\s+async\\s+function\\s+${name}\\s*\\(`).test(codeMasked);
+  return new RegExp(`^[ \\t]*export[ \\t]+async[ \\t]+function[ \\t]+${name}[ \\t]*\\(`, "m").test(codeMasked);
 }
 
 // `litView` is the wrapper source's `literals` view (ONLY genuine string CONTENT + template QUASI text; every
