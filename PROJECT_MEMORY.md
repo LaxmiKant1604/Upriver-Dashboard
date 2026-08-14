@@ -8578,3 +8578,64 @@ no production connection, Supabase write, DataDoe call, migration, deploy, push,
 Scheduler v1, frontend behavior/design, routes other than the internal continuation/error-mapping handling,
 cron, request_hash pins, source contracts, applied migrations, Appendix M, HANDOFF.md, and .worktrees/
 untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
+
+## Scheduler v2: manual-continuation durable completion + marker identity + retryable safety (2026-08-14)
+
+Fifth Codex round on this tranche: fixed three remaining blockers OFFLINE (Gate 5 NOT executed; Appendix M and
+the worker lifecycle untouched). Commit f45e483 (code/tests), then this docs commit.
+
+- BLOCKER 1 (durable completion): the marker was removed on completion regardless of whether the durable
+  source-cache save actually happened. Fixed: persistSourceRows returns a boolean (true ONLY on a confirmed
+  save; false on Supabase-unconfigured / cache-unavailable / <3s deadline / oversized payload / save-threw);
+  finishRows returns { rows, persisted } and cap-sized rows (>= limit) are never durably persisted (persisted
+  false). runManualSourceAttempt removes the manual-source-attempt marker ONLY when persisted===true --
+  in-memory caching alone is insufficient. An unconfirmed persist RETAINS the "polling" marker + exportId so a
+  later invocation resumes/re-downloads the SAME export with zero new create POSTs. Two-invocation regression
+  proven at module level (persist unconfirmed -> retained -> fresh transport resumes E1, zero creates, then a
+  confirmed persist removes it) and integration level (real fetchExportRows: inv1 completes with persistence
+  unconfirmed offline -> marker retained; inv2 bypassSourceCache i.e. memory cleared -> resumes E1, zero new
+  creates, one POST total).
+- BLOCKER 2 (marker identity validation): new markerIdentityMatches() runs the instant a marker is loaded,
+  BEFORE any resume/re-claim/create branch or mutation. Requires version, request_hash,
+  organizationFingerprint, sourceId, a safe rev, a known status, a valid status/exportId/code combination
+  (polling => nonblank exportId + null code; creating => null exportId + null code; failed => null exportId +
+  a typed CREATE_FAILED(_NNN)?/EXPORT_FAILED code), and parseable createdAt/updatedAt/expiresAt to ALL match
+  the current request. Any missing/mismatched/malformed field fails closed as typed
+  MANUAL_SOURCE_ATTEMPT_UNCERTAIN with zero DataDoe calls and zero marker mutation. 20 negative cases (one per
+  field + every status/exportId/code combo + malformed timestamps) + a positive resume control.
+- BLOCKER 3 (retryable safety): classifyDataDoeRouteError emits retryable:true ONLY when the error carries
+  durableContinuation === true. A plain object, an arbitrary MANUAL_SOURCE_* code, an in-progress code without
+  durable evidence, or a deadline/poll-pending without a durable continuation is admin-safe and non-retryable
+  (503/504 retryable:false). Only in-progress WITH durable evidence -> 504 retryable:true. Fixed safe
+  messages; exportId + raw DataDoe/Supabase text never reach the browser.
+
+Durable manual-continuation state table (report_snapshots marker; report_key 'manual-source-attempt'):
+| Situation                                   | status    | exportId | create POSTs | route response          |
+| No marker                                   | (insert)  | -        | 1 (winner)   | -                       |
+| Claim not writable                          | none      | -        | 0            | 503 retryable:false     |
+| Loaded marker fails identity validation     | untouched | -        | 0            | 503 retryable:false     |
+| Concurrent/replay sees fresh creating       | untouched | null     | 0            | 504 retryable:true      |
+| Create ok                                   | polling   | Ex (CAS) | -            | -                       |
+| Poll-window/deadline after Ex               | polling   | Ex kept  | 0            | 504 retryable:true      |
+| Later request, same hash (valid marker)     | resume    | Ex       | 0            | rows                    |
+| Completion, persist CONFIRMED               | removed   | -        | -            | rows                    |
+| Completion, persist UNCONFIRMED             | polling   | Ex kept  | 0            | rows (resume next time) |
+| Definite create failure                     | failed    | null     | -            | re-claimable (CAS)      |
+| Ambiguous create / CAS throw|loss           | creating  | -        | 0 forever    | 503 retryable:false     |
+| Expired creating (owner died)               | creating  | -        | 0            | 503 retryable:false     |
+| Valid source-cache hit                      | not read  | -        | 0            | rows (before marker)    |
+
+- Preserved: one create-export per request_hash; the 55s route DataDoe budget + 5s headroom + 5s-first-cadence
+  poll; request identity + golden request_hash pins; SHADOW MODE with every control locked/paused; applied
+  migrations byte-unchanged (all 7 Gate 0 hashes match); Scheduler v1 + frontend + cron + source contracts
+  untouched.
+- Verification: node --check on all 4 changed files OK; direct -- manual-source-continuation 21,
+  datadoe-poll-export 14, test-source-cache 73, sync-source-jobs, sync-signals, sync-dispatch 37,
+  runtime-composition 26, brand-view 78 -- all exit 0; npm run verify 33/33 steps incl. build:check, exit 0 in
+  ~81s; git diff --check clean. Changed files: lib/server/manual-source-continuation.js, lib/server/datadoe.js,
+  api/datadoe.js, scripts/manual-source-continuation.test.js.
+
+CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist empty); Gate 5 NOT executed;
+no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
+Scheduler v1, frontend, cron, source contracts, request_hash pins, Appendix M, applied migrations, HANDOFF.md,
+and .worktrees/ untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
