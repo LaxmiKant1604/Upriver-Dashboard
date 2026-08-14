@@ -8685,3 +8685,51 @@ CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist 
 no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
 Scheduler v1, frontend, cron, source contracts, request_hash pins, Appendix M, applied migrations, HANDOFF.md,
 and .worktrees/ untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
+
+## Scheduler v2: Gate 5 one-account brand-sales SHADOW canary EXECUTED -- SUCCESS (2026-08-14)
+
+With explicit human approval + a Codex-approved narrow package correction (catalog cache -> advisory, not a
+start gate; committed 5db39f2), executed the Appendix L one-account brand-sales shadow canary from HEAD after
+5db39f2. FIRST live Scheduler-v2 DataDoe exports + Supabase write. Secrets loaded via node --env-file=../.env.local
+into the process env only (never printed/committed).
+
+- Package correction (5db39f2, docs+test only; no production/source-contract/hash/migration change): the
+  pre-existing product-catalog source_export_cache entry is ADVISORY usability evidence, NOT a Gate 5 start
+  gate (the source worker never uses it to skip create-export; requiring a current entry would force an extra
+  warm-up export outside the 2-export budget; DataDoe confirmed Product Catalog is org-wide + API-exportable).
+  gate5-canary-package.test.js: checkCatalogCache (hard guard) -> assessCatalogEvidence (advisory classifier
+  absent|current-usable|current-unusable; never throws on absent/expired). Preserved exactly: pinned planner
+  validation + final-drain guard. New regressions: absent/expired never blocks start; current cache advisory
+  only; wrong planner identity still blocks; missing/failed/truncated fresh catalog still fails closed at final
+  drain. 11/11. Appendix L.1/L.4/L.5/L.7 updated to match.
+- Preconditions (read-only): preflight ready:true/blockers:[]; 13 controls schedule_enabled=false; allowlist
+  empty; 5 v2 tables empty; no cron sync (pg_cron absent); zero pre-existing scheduler-v2/*; one primary
+  connection, no secondary; fresh discovery 30 primary accounts (memoized once).
+- SELECTED (exactly one): fbd72f10-2e86-42a1-afe5-df4d93b25ede (DE/EUR, bucket non-us). asOf 2026-08-13, window
+  2025-06-07..2026-08-13. cycleDate 2026-08-14, cycleId 57afc1fb-6694-4925-8961-4730f5a8f4df. Catalog evidence
+  ADVISORY = absent (the exact plan-derived catalog cache had expired ~15 min earlier -> validated the
+  correction end-to-end: absent cache did NOT block the run).
+- Result (all L.6 P1-P7 PASS): exactly TWO create-exports, one per request_hash --
+  brand-sales:order-lines (order-line-items, hash f1270dc16e...) succeeded create_export_count=1, 190 rows;
+  brand-sales:catalog (product-catalog 68d2de238e, hash ee35b3f2e7...) succeeded create_export_count=1, 3452
+  rows (non-cap-sized). sum(create_export_count)=2, max_per_hash=1. Two owner memberships, one plan-derived
+  owner_id 39d8b5b0a9..., active/brand-sales/selected/primary, exact request_key->request_hash mapping; no
+  ownerless row, no other account. One report job brand-sales/selected/primary depends_on == the two hashes.
+  Exactly one scheduler-v2/brand-sales shadow snapshot for the account (payload_bytes 48762) and exactly one
+  scheduler-v2/* globally. Production Brand Sales fingerprint BYTE-IDENTICAL before/after
+  (cba3fb264b31dd6a5c35b20e8df2ccab, 7 rows -> 7) -- no production report_snapshots row overwritten. One
+  sync_cycles row (non-us,2026-08-14) source_total=2 succeeded=2 failed=0 (status=running: a manual drained run
+  does not mark the cycle terminal; all work completed).
+- The run drained in 2 slices (slice 1 spent=2 processed work + both exports; slice 2 drained=true, derive +
+  shadow snapshot saved). A cosmetic print bug in the throwaway run script (rollup.reports is an object, not an
+  array) threw AFTER the final-drain guard passed and rt.run returned -- zero effect on DB state or the export
+  budget; the post-canary L.6 checks independently confirmed full success. Throwaway canary scripts
+  (__canary_*.mjs) were deleted; only docs/evidence committed.
+- Verify: npm run verify 33/33 incl. build:check; git diff --check clean; all 7 Gate 0 hashes unchanged
+  (ac62a3a...). Both readiness gates remain locked/paused.
+
+CONFIRMED: exactly ONE account, ONE report (brand-sales); exactly TWO create-exports (one per hash); no obsolete
+catalog id; no dd-secondary; no warm-up/retry/third export; one shadow snapshot only; production fingerprint
+unchanged; no control/allowlist/schedule change; nothing pushed/merged/deployed/migrated/unlocked/scheduled;
+Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex review;
+do NOT proceed to another account, Gate 6 parity, Gate 7 unlock, deployment, or scheduling.

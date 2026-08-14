@@ -1719,14 +1719,15 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 
 ---
 
-## Appendix L — Gate 5 one-account shadow canary (PREPARED — NOT executed)
+## Appendix L — Gate 5 one-account shadow canary (EXECUTED 2026-08-14 — SUCCESS)
 
-> **NOTHING in this appendix has been run.** It is the exact package a reviewer/operator executes **after
-> written approval**, for **exactly ONE primary account and ONE report (`brand-sales`)**, then STOPS. It is the
-> FIRST step that makes a live DataDoe export + Supabase write — but **only** into Scheduler-v2 tables and
-> `scheduler-v2/*` shadow snapshots, never a production `report_snapshots` row and never a control/schedule
-> change. It supersedes the earlier §5 sketch with the CURRENT runtime API. No route, cron, deployment, frontend,
-> or scheduled invocation is involved.
+> **EXECUTED 2026-08-14 with explicit approval** for **exactly ONE primary account and ONE report
+> (`brand-sales`)**, then STOPPED. Made the FIRST live DataDoe exports (exactly TWO — one Order Line Items, one
+> Product Catalog `68d2de238e`) + a single `scheduler-v2/brand-sales` shadow snapshot — **only** into
+> Scheduler-v2 tables and the `scheduler-v2/*` shadow namespace, never a production `report_snapshots` row and
+> never a control/schedule change. No route, cron, deployment, frontend, or scheduled invocation was involved.
+> The safe evidence is in Appendix L.8 (and PROJECT_MEMORY.md). The procedure below (L.1–L.7) is the exact
+> package that was run.
 
 ### L.1 Scope + report choice + prerequisites
 
@@ -2139,6 +2140,42 @@ deployment, or scheduling. Stop for review + explicit human approval.
 > create-export per hash, and the final-slice deadline boundary — and that an **absent/expired/unusable catalog
 > cache is advisory and never blocks canary start**, while a failed/truncated/missing fresh catalog source still
 > fails closed at the final drain.
+
+### L.8 Execution evidence (EXECUTED 2026-08-14 — SUCCESS; safe fields only)
+
+Ran from `sales-dashboard-live/` with `node --env-file=../.env.local` (secrets loaded into the process env only,
+never printed/committed). Offline preflight `ready:true / blockers:[]`; 13 durable controls `schedule_enabled=false`;
+`SCHEDULER_V2_READY_REPORT_KEYS` empty; the five v2 tables empty; no `cron.job` sync schedule (pg_cron absent);
+zero pre-existing `scheduler-v2/*` snapshots. One primary connection configured, no secondary. Fresh live
+discovery (30 primary accounts, memoized once).
+
+- **Selected account** (exactly one): `fbd72f10-2e86-42a1-afe5-df4d93b25ede` (country DE, currency EUR, bucket
+  `non-us`). **`asOf` 2026-08-13**, window `2025-06-07 .. 2026-08-13`. **`cycleDate` 2026-08-14**;
+  **`cycleId` 57afc1fb-6694-4925-8961-4730f5a8f4df**.
+- **Catalog evidence (advisory): `absent`** — the account's exact plan-derived catalog cache had expired ~15 min
+  earlier; per the correction this did NOT block the run, and the source worker created its own fresh export.
+- **Sources — exactly two, one create-export each** (`sum(create_export_count)=2`, `max_per_hash=1`):
+  - `brand-sales:order-lines` (`order-line-items`): request_hash `f1270dc16e…`, `fetch_status=succeeded`,
+    `create_export_count=1`, 190 rows.
+  - `brand-sales:catalog` (`product-catalog`, source id `68d2de238e` — never the obsolete long id): request_hash
+    `ee35b3f2e7…`, `fetch_status=succeeded`, `create_export_count=1`, 3452 rows (non-cap-sized; `< 10000`).
+- **Owner memberships**: exactly two, one plan-derived `owner_id` `39d8b5b0a9…`, `owner_status=active`,
+  `report_key=brand-sales`, selected account, `connection_id=primary`, exact `request_key → request_hash`
+  mapping; no ownerless source row; no other account.
+- **Report job**: exactly one — `brand-sales` / selected account / `primary` / `depends_on` == the two plan
+  hashes (`f1270dc16e…`, `ee35b3f2e7…`), no more/fewer.
+- **Shadow snapshot**: exactly one `scheduler-v2/brand-sales` for the selected account (`payload_bytes=48762`),
+  and exactly one `scheduler-v2/*` snapshot globally.
+- **Production isolation**: the account's non-shadow Brand Sales fingerprint is **byte-identical**
+  before/after (`cba3fb264b31dd6a5c35b20e8df2ccab`, 7 snapshot rows → 7). No production `report_snapshots` row
+  overwritten; no other account/report/source owner created or changed.
+- **Cycle**: exactly one `sync_cycles` row for (`non-us`, `2026-08-14`) — `source_total=2`, `source_succeeded=2`,
+  `source_failed=0` (cycle `status=running`: a manual drained run does not transition the cycle to a terminal
+  status; all source/report/snapshot work completed and every L.6 check passed).
+
+Post-canary L.6 P1–P7 all PASS. `npm run verify` 33/33 incl. `build:check`; `git diff --check` clean; all 7
+Gate 0 hashes unchanged (`ac62a3a…`). Both readiness gates remain locked/paused; nothing pushed/merged/
+deployed/migrated/unlocked/scheduled. STOP for Codex review after this single canary.
 
 ## Appendix M — Organization-wide Product Catalog: confirmed contract + reviewed design (NOT implemented)
 
