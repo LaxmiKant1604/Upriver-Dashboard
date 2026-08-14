@@ -294,17 +294,34 @@ function assertRowsInWindow(rows, from, to, label) {
 // so the map can never drift from report-source-contracts.js.
 const REGISTRY = {
   "brand-sales": {
-    snapshotVersion: "brand-sales/v2d-1",
+    // v2d-2: the payload now carries the ADDITIVE first-wins `asinBrand` map, matching the live route's
+    // buildBrandSalesPayload ({ rows, catalogBrands, asinBrand }) -- Brand View reads it from the saved
+    // brand-sales payload for FBA inventory brand attribution (Gate 6 Cycle-1 parity finding).
+    snapshotVersion: "brand-sales/v2d-2",
     optionalRequestKeys: [],
     derivedSourceKeys: [],
     derive: ({ sources }) => {
-      const rows = orderSalesByBrand(
-        sources["brand-sales:order-lines"].rows,
-        sources["brand-sales:catalog"].rows,
-      );
-      return { rows, catalogBrands: catalogBrandNames(rows) };
+      const catalogRows = sources["brand-sales:catalog"].rows;
+      // Additive ASIN->brand map, FIRST-WINS per child_asin with blank asin/brand skipped -- byte-identical
+      // semantics to the live route (api/datadoe.js buildBrandSalesPayload).
+      const asinBrand = {};
+      for (const c of catalogRows) {
+        const asin = String((c && c.child_asin) || "").trim();
+        const brand = String((c && c.product_brand) || "").trim();
+        if (asin && brand && !(asin in asinBrand)) asinBrand[asin] = brand;
+      }
+      // Route-identical fail-closed guard (brandSalesUnavailable): a catalog with ZERO usable brand mappings
+      // must never overwrite a previously valid Brand Sales snapshot with asinBrand:{} / lost attribution.
+      // Typed unavailable => zero writes, last-known-good preserved, a later cycle retries.
+      if (Object.keys(asinBrand).length === 0) {
+        throw deriveError("brand-sales Product Catalog has no usable ASIN->brand mappings; last-known-good preserved.", "unavailable");
+      }
+      const rows = orderSalesByBrand(sources["brand-sales:order-lines"].rows, catalogRows);
+      return { rows, catalogBrands: catalogBrandNames(rows), asinBrand };
     },
-    validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.catalogBrands),
+    validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.catalogBrands)
+      && !!p.asinBrand && typeof p.asinBrand === "object" && !Array.isArray(p.asinBrand)
+      && Object.keys(p.asinBrand).length > 0,
     latestDataDate: (p) => maxIsoDate((p.rows || []).map((r) => r.date)),
   },
   "content-changes": {

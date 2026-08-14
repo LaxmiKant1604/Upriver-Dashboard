@@ -236,6 +236,46 @@ test("brand-sales derives from saved rows (matches orderSalesByBrand); latest-da
   // unpriced_units preserved (the 0-sales/3-units group), never dropped.
   const acme = r.payload.rows.find((x) => x.product_brand === "Acme" && x.date === "2025-06-02");
   assert.equal(acme.unpriced_units, 3);
+  // PARITY (Gate 6 Cycle-1 finding): the payload must carry the ADDITIVE first-wins ASIN->brand map the live
+  // route saves ({ rows, catalogBrands, asinBrand }) -- Brand View reads it from the saved brand-sales
+  // payload for FBA inventory brand attribution.
+  assert.deepEqual(r.payload.asinBrand, { ASIN000001: "Acme", ASIN000002: "Beta" });
+});
+
+test("brand-sales asinBrand map is FIRST-WINS per child_asin and skips blank asin/brand (route-identical)", async () => {
+  const catalog = [
+    { child_asin: "ASIN000001", product_brand: "Acme" },
+    { child_asin: "ASIN000001", product_brand: "Later" },   // duplicate asin: first wins
+    { child_asin: "  ", product_brand: "Blank" },            // blank asin skipped
+    { child_asin: "ASIN000003", product_brand: "   " },      // blank brand skipped
+    { child_asin: "ASIN000002", product_brand: "Beta" },
+  ];
+  const r = deriveReportSnapshot({ reportKey: "brand-sales", sources: {
+    "brand-sales:order-lines": { available: true, rows: ORDER_ROWS },
+    "brand-sales:catalog": { available: true, rows: catalog },
+  } });
+  assert.equal(r.status, "derived");
+  assert.deepEqual(r.payload.asinBrand, { ASIN000001: "Acme", ASIN000002: "Beta" });
+});
+
+test("brand-sales catalog with ZERO usable brand mappings -> typed unavailable (LKG preserved), route-identical fail-closed", async () => {
+  const r = deriveReportSnapshot({ reportKey: "brand-sales", sources: {
+    "brand-sales:order-lines": { available: true, rows: ORDER_ROWS },
+    "brand-sales:catalog": { available: true, rows: [{ child_asin: "ASIN000001" }, { product_brand: "NoAsin" }] },
+  } });
+  assert.equal(r.status, "unavailable");
+  assert.equal(r.payload, null, "must NOT save asinBrand:{} over a previously valid Brand Sales snapshot");
+});
+
+test("brand-sales validatePayload requires a nonempty plain-object asinBrand (missing/array/empty rejected)", async () => {
+  const { REPORT_DERIVATIONS } = await import("../lib/server/sync/report-derivation.js");
+  const validate = REPORT_DERIVATIONS["brand-sales"].validatePayload;
+  const good = { rows: [], catalogBrands: [], asinBrand: { A: "B" } };
+  assert.equal(validate(good), true);
+  assert.equal(validate({ rows: [], catalogBrands: [] }), false, "missing asinBrand rejected");
+  assert.equal(validate({ rows: [], catalogBrands: [], asinBrand: [] }), false, "array asinBrand rejected");
+  assert.equal(validate({ rows: [], catalogBrands: [], asinBrand: {} }), false, "empty asinBrand rejected");
+  assert.equal(validate({ rows: [], catalogBrands: [], asinBrand: null }), false, "null asinBrand rejected");
 });
 
 test("cache MISS is not an empty success (required source unavailable -> not derived)", async () => {
