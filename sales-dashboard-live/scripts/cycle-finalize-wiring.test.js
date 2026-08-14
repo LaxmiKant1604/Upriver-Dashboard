@@ -4,7 +4,9 @@
 // audit/preflight fail closed when Migration 5 / the RPC / the wrapper / the triggers are missing OR malformed;
 // the trigger audit is a BOUNDED STRUCTURAL proof (timing/events/level/function/table + no create-then-drop);
 // and the guard FUNCTION's critical behavior (cycle_id immutable, FOR SHARE lock, terminal reject, missing
-// parent fail-closed) is proven against the ACTUAL SQL. No network/DataDoe/Supabase (global fetch is mocked).
+// parent fail-closed) is proven against the ACTUAL SQL with each condition BOUND to a RAISE in its OWN IF block
+// (an unrelated/moved/commented/stringified raise never satisfies it). finished_at is validated as a strict
+// RFC3339 timestamptz. No network/DataDoe/Supabase (global fetch is mocked).
 //
 // 7-bit ASCII, LF. Run: node scripts/cycle-finalize-wiring.test.js
 
@@ -93,6 +95,23 @@ test("(wrapper strict) open-work FAIL CLOSED on missing cycle / wrong id / non-r
   await withRpc({ disposition: "open-work", cycle: goodRunning("c1", { source_succeeded: 3, source_failed: 0, source_total: 2 }) }, async () => { await assert.rejects(() => finalizeSyncCycle("c1"), /counters are missing\/unsafe\/incoherent/); });
 });
 
+test("(wrapper strict, Finding 2) finished_at requires a full RFC3339 timestamptz -- accepts Z and +00:00, rejects everything else", async () => {
+  // ACCEPT: representative valid Z and numeric-offset timestamptz values (with and without fractional seconds).
+  for (const ts of ["2026-08-14T09:31:57.861Z", "2026-08-14T09:31:57Z", "2026-08-14T09:31:57.861+00:00", "2026-08-14T09:31:57+00:00", "2026-08-14T04:01:57-05:30"]) {
+    await withRpc({ disposition: "finalized", cycle: goodTerminal("c1", { finished_at: ts }) }, async () => {
+      assert.equal((await finalizeSyncCycle("c1")).disposition, "finalized", `must accept ${ts}`);
+    });
+  }
+  // REJECT: bare integers, date-only, timezone-less, impossible calendar dates, out-of-range time/offset
+  // components, blanks, and non-strings (number / array / object).
+  const bad = ["0", "1", "2026-08-14", "2026-08-14T09:31:57", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-08-14T25:00:00Z", "2026-08-14T09:60:00Z", "2026-08-14T09:31:61Z", "2026-08-14T09:31:57+25:00", "2026-08-14T09:31:57+00:70", "", "   ", 1723627917861, ["2026-08-14T09:31:57Z"], { at: "2026-08-14T09:31:57Z" }];
+  for (const ts of bad) {
+    await withRpc({ disposition: "finalized", cycle: goodTerminal("c1", { finished_at: ts }) }, async () => {
+      await assert.rejects(() => finalizeSyncCycle("c1"), /valid finished_at/, `must reject ${JSON.stringify(ts)}`);
+    });
+  }
+});
+
 test("(wrapper strict) not-found/invalid-status carrying a cycle, and unknown/malformed dispositions, FAIL CLOSED", async () => {
   await withRpc({ disposition: "not-found", cycle: goodTerminal("c1") }, async () => { await assert.rejects(() => finalizeSyncCycle("c1"), /must not carry a cycle/); });
   await withRpc({ disposition: "invalid-status", cycle: goodRunning("c1") }, async () => { await assert.rejects(() => finalizeSyncCycle("c1"), /must not carry a cycle/); });
@@ -161,6 +180,35 @@ test("(SQL guard-function mutations) removed cycle_id guard / removed FOR SHARE 
   // a string/comment cannot forge the guard: put the guard code ONLY inside a string literal
   const stringFake = M5_SQL.replace("v_status text;", "v_status text; v_fake text := 'NEW.cycle_id is distinct from OLD.cycle_id for share succeeded partial failed';").replace(/if TG_OP = 'UPDATE' and NEW\.cycle_id is distinct from OLD\.cycle_id then[\s\S]*?end if;/i, "-- removed real guard");
   assert.ok(auditCodes(stringFake).includes("GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "a string literal cannot forge the cycle_id guard");
+});
+
+// Each guard condition must RAISE in ITS OWN IF block: a raise in a DIFFERENT block, moved before/after the
+// block, or hidden in a comment/string must NOT satisfy it (the bug: a global RAISE regex passed spuriously).
+test("(SQL guard-function BOUNDED-IF) each condition must RAISE inside its own block -- an unrelated raise never satisfies it", () => {
+  const CYCLE = /if TG_OP = 'UPDATE' and NEW\.cycle_id is distinct from OLD\.cycle_id then[\s\S]*?end if;/;
+  const NF = /if not found then\s+raise exception 'parent sync cycle[\s\S]*?end if;/;
+  const TERM = /if v_status in \('succeeded', 'partial', 'failed'\) then[\s\S]*?end if;/;
+  const cycHead = "if TG_OP = 'UPDATE' and NEW.cycle_id is distinct from OLD.cycle_id then";
+  const nfHead = "if not found then";
+  const termHead = "if v_status in ('succeeded', 'partial', 'failed') then";
+  const block = (head, body) => `${head}\n    ${body}\n  end if;`;
+  const has = (sql, code) => auditCodes(sql).includes(code);
+  // 1) cycle_id block: raise replaced by NULL / PERFORM; comment + string raise fakes; raise moved AFTER the
+  //    block; and the condition+raise split across SEPARATE blocks -- all must fail closed.
+  assert.ok(has(M5_SQL.replace(CYCLE, block(cycHead, "null;")), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: NULL instead of raise");
+  assert.ok(has(M5_SQL.replace(CYCLE, block(cycHead, "perform 1;")), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: PERFORM 1 instead of raise");
+  assert.ok(has(M5_SQL.replace(CYCLE, block(cycHead, "-- raise exception 'fake';\n    null;")), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: comment raise fake");
+  assert.ok(has(M5_SQL.replace(CYCLE, block(cycHead, "perform 'raise exception';")), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: string-literal raise fake");
+  assert.ok(has(M5_SQL.replace(CYCLE, `${block(cycHead, "null;")}\n  raise exception 'moved';`), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: raise moved outside the block");
+  assert.ok(has(M5_SQL.replace(CYCLE, `${block(cycHead, "null;")}\n  ${block("if true then", "raise exception 'elsewhere';")}`), "GUARD_CYCLE_ID_IMMUTABLE_MISSING"), "cycle_id: condition and raise in separate blocks");
+  // 2) missing-parent block: NULL / comment raise fake.
+  assert.ok(has(M5_SQL.replace(NF, block(nfHead, "null;")), "GUARD_MISSING_PARENT_NOT_FAILCLOSED"), "not-found: NULL instead of raise");
+  assert.ok(has(M5_SQL.replace(NF, block(nfHead, "-- raise exception 'x';\n    null;")), "GUARD_MISSING_PARENT_NOT_FAILCLOSED"), "not-found: comment raise fake");
+  // 3) terminal block: PERFORM 1 / NULL.
+  assert.ok(has(M5_SQL.replace(TERM, block(termHead, "perform 1;")), "GUARD_TERMINAL_REJECT_MISSING"), "terminal: PERFORM 1 instead of raise");
+  assert.ok(has(M5_SQL.replace(TERM, block(termHead, "null;")), "GUARD_TERMINAL_REJECT_MISSING"), "terminal: NULL instead of raise");
+  // control: the untouched guard function passes every bound check.
+  assert.ok(!auditCodes(M5_SQL).some((c) => c.startsWith("GUARD_")), "the real guard function passes all bound checks");
 });
 
 test("(SQL static) signature, running-guard, disposition set, and no-table-added invariants hold", () => {

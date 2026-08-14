@@ -385,28 +385,56 @@ function functionBodyViews(clean, masked, fnName) {
   return { clean: clean.slice(open + 2, close), masked: masked.slice(open + 2, close) };
 }
 
-// Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR (Finding 2). Each check requires the CODE structure
-// in `masked` (a string/comment cannot forge it) and, where a specific literal matters, the literal in `clean`
-// (comments blanked), so neither a comment nor a string alone satisfies any check. Returns typed problems.
+// BOUNDED PL/pgSQL IF-block proof (Finding 2): does the IF block WHOSE HEADER matches `headerRe` (in the
+// function body's `masked` view) itself contain a RAISE EXCEPTION BEFORE its OWN matching END IF? The body is
+// bounded by depth-tracking IF openers / `end if` closers, so a raise in ANOTHER block, or moved before/after
+// this block, never satisfies it. The raise is proven in `masked` (a comment/string cannot forge it); an
+// optional `headerStrRe` requires a specific string literal in the block HEADER (checked in `clean`, so a
+// comment cannot forge it, and the masked header code anchors it to the real condition).
+function ifBlockRaises(body, { headerRe, headerStrRe }) {
+  const h = headerRe.exec(body.masked);
+  if (!h) return false;
+  if (headerStrRe && !headerStrRe.test(body.clean.slice(h.index, h.index + h[0].length))) return false;
+  let depth = 1;
+  const re = /\bend\s+if\b|\bif\b/gi;
+  re.lastIndex = h.index + h[0].length;                    // start scanning AFTER the header's `then`
+  let m, end = -1;
+  while ((m = re.exec(body.masked)) !== null) {
+    if (m[0].toLowerCase().startsWith("end")) { if (--depth === 0) { end = m.index; break; } }
+    else depth += 1;                                        // a nested IF opener
+  }
+  if (end < 0) return false;
+  return /\braise\s+exception\b/i.test(body.masked.slice(h.index + h[0].length, end));
+}
+
+// Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR (Finding 2), each condition BOUND to its OWN
+// rejecting IF block (so removing one block's raise fails even if another block still raises). FOR SHARE is a
+// locking clause (not an IF block) and is proven separately in `masked`.
 function auditGuardFunction(clean, masked, fnName) {
   const body = functionBodyViews(clean, masked, fnName);
   if (!body) return [{ code: "GUARD_FUNCTION_MISSING", reason: "function body not found" }];
   const problems = [];
-  // (a) UPDATE cannot change cycle_id.
-  if (!/new\.cycle_id\s+is\s+distinct\s+from\s+old\.cycle_id/i.test(body.masked) || !/tg_op\s*=\s*'update'/i.test(body.clean)) {
-    problems.push({ code: "GUARD_CYCLE_ID_IMMUTABLE_MISSING", reason: "no TG_OP='UPDATE' AND NEW.cycle_id is distinct from OLD.cycle_id guard" });
+  // (1) UPDATE cannot change cycle_id -- its OWN IF block raises.
+  if (!ifBlockRaises(body, {
+    headerRe: /\bif\b[^;]*?\bnew\.cycle_id\s+is\s+distinct\s+from\s+old\.cycle_id\s+then/i,
+    headerStrRe: /\btg_op\s*=\s*'update'/i,
+  })) {
+    problems.push({ code: "GUARD_CYCLE_ID_IMMUTABLE_MISSING", reason: "the TG_OP='UPDATE' AND NEW.cycle_id IS DISTINCT FROM OLD.cycle_id block does not RAISE EXCEPTION before its END IF" });
   }
-  // (b) parent sync_cycles row locked FOR SHARE.
+  // (2) parent sync_cycles row locked FOR SHARE (a lock clause, not an IF block).
   if (!/from\s+public\.sync_cycles\s+where\s+id\s*=\s*new\.cycle_id\s+for\s+share/i.test(body.masked)) {
     problems.push({ code: "GUARD_FOR_SHARE_MISSING", reason: "parent sync_cycles row is not locked FOR SHARE" });
   }
-  // (c) terminal succeeded|partial|failed parents rejected (exact ordered set).
-  if (!/v_status\s+in\s*\(/i.test(body.masked) || !/'succeeded'\s*,\s*'partial'\s*,\s*'failed'/i.test(body.clean) || !/raise\s+exception/i.test(body.masked)) {
-    problems.push({ code: "GUARD_TERMINAL_REJECT_MISSING", reason: "no rejection of terminal (succeeded|partial|failed) parents" });
+  // (3) missing parent fails closed -- the IF NOT FOUND block raises.
+  if (!ifBlockRaises(body, { headerRe: /\bif\s+not\s+found\s+then/i })) {
+    problems.push({ code: "GUARD_MISSING_PARENT_NOT_FAILCLOSED", reason: "the IF NOT FOUND block does not RAISE EXCEPTION before its END IF" });
   }
-  // (d) missing parent fails closed.
-  if (!/if\s+not\s+found\s+then/i.test(body.masked) || !/raise\s+exception/i.test(body.masked)) {
-    problems.push({ code: "GUARD_MISSING_PARENT_NOT_FAILCLOSED", reason: "a missing parent cycle does not fail closed" });
+  // (4) terminal succeeded|partial|failed parents rejected -- the v_status IN (...) block raises.
+  if (!ifBlockRaises(body, {
+    headerRe: /\bif\s+v_status\s+in\s*\([^;]*?\)\s+then/i,
+    headerStrRe: /'succeeded'\s*,\s*'partial'\s*,\s*'failed'/i,
+  })) {
+    problems.push({ code: "GUARD_TERMINAL_REJECT_MISSING", reason: "the v_status IN ('succeeded','partial','failed') block does not RAISE EXCEPTION before its END IF" });
   }
   return problems;
 }
