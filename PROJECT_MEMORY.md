@@ -8371,3 +8371,46 @@ CONFIRMED: no production connection; no Supabase write; no DataDoe call/export; 
 paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes unchanged; nothing
 pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md + .worktrees/ untouched.
 STOP for Codex re-review before Gate 5 execution.
+
+## Scheduler v2: Gate 5 canary package -- plan-property pinning, final-drain export count, verify wiring (2026-08-14)
+
+Third Codex re-review round on the Gate 5 canary package (still NOT executed; no production connection; no
+DataDoe/Supabase I/O). Two commits: tests/wiring (scripts/gate5-canary-package.test.js + package.json), then
+docs (SCHEDULER_V2_ROLLOUT.md Appendix L + this log).
+
+- Plan pinning (L.5 + test checkPlanSources): before rt.run the canary now INDEPENDENTLY pins every critical
+  plan property: plan.accountId === SELECTED_ACCOUNT_ID; sellerOrVendorIds exactly [SELECTED_ACCOUNT_ID] (the
+  primary PUBLIC account id IS the raw seller id -- publicAccountId); BOTH windows exactly
+  [addDaysStr(monthStartStr(AS_OF), -420), AS_OF] (imports the real date-windows helpers); strict === true on
+  both sources; the EXACT source ids for BOTH sources -- order-line-items
+  89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778 and product-catalog 68d2de238e (the sourceId
+  check is now unconditional); distinct request hashes; and OWNER_IDS must dedupe to EXACTLY ONE nonblank
+  plan-derived owner id (EXPECTED_OWNER_ID) -- every owner row's owner_id must equal it (new guard in the
+  owner-row loop).
+- New fail-closed regressions (test): both sources shifted to the SAME valid-but-wrong window; wrong seller id
+  and a widened multi-id scope; strict:false; wrong Order Line Items source id; wrong plan accountId; owner-id
+  derivation yielding zero (blank org/scope) or two (divergent org) ids; wrong/blank/missing owner_id on owner
+  rows.
+- Export-count description corrected (L.1 / L.3 / L.5 / L.6 P3 / L.7 + test): the pre-existing product-catalog
+  source_export_cache entry is a USABILITY prerequisite only (proof the exact canonical request yields usable
+  data) -- the source worker NEVER skips create-export because of it (verified in source-worker.js: a pending
+  job always claims then creates). create_export_count=0 is only ever a mid-drain partial/failed-slice state (a
+  job not yet attempted), never "cache reuse"; mid-drain total <= 2 stands, but a SUCCESSFUL fresh drained
+  canary must end with EXACTLY two succeeded source rows, create_export_count === 1 for each exact plan hash --
+  enforced by a new executable FINAL-DRAIN guard in L.5 and checkFinalSourceJobs in the test. Removed the test
+  that labeled catalog create_export_count=0 as cache reuse. This SUPERSEDES the earlier "cached sources may
+  reduce below 2" / "do not require exactly 2" wording in the 2026-08-13 entries.
+- Wiring: package.json gains test:gate5-canary-package (node scripts/gate5-canary-package.test.js) and npm run
+  verify now includes it (before build:check).
+- Verification: direct run 10/10 blocks pass. The known npm-wrapper quirk again: nested `npm run` chains inside
+  `verify` do not execute on this machine (npm 11.11.0, cmd script shell; exit 0 in ~2s with no child output,
+  from both Git Bash and PowerShell), so the full chain was executed by invoking every sub-script's node command
+  directly in verify order (insights, brand-view, sync, source-cache, 7 sync-engine suites, 15
+  report-derivation suites, source-identity, report-contracts, report-sync-controls, gate5-canary-package,
+  build-check): ALL PASS (exit 0 each). Single-level `npm run <script>` works fine. L.5 script block re-checked
+  with node --check (parse-only): OK.
+
+CONFIRMED: no production connection; no Supabase write; no DataDoe call/export; no canary executed; controls
+paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes unchanged (only the test file,
+package.json, and docs changed); nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
+untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review before Gate 5 execution.
