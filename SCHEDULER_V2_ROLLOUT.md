@@ -11,14 +11,19 @@ succeeded source jobs**, **one report job**, and **two owner memberships**; ther
 spent **exactly two DataDoe create-exports total** (one Order Line Items, one Product Catalog `68d2de238e`); the
 production Brand Sales `report_snapshots` fingerprint is **byte-identical** (no production snapshot overwritten);
 and `report_sync_settings` still contains **exactly the 13 seeded control rows, all `schedule_enabled=false`**. No
-control unlock, deployment, schedule, route, or frontend change has been made. **KNOWN DEFECT UNDER CORRECTION
-(Blocker 1):** the canary cycle is still `status='running'` (`finished_at` null, report counters unwritten)
-because the dispatcher did not finalize the drained cycle — this is NOT an acceptable terminal state; the fix
-(dispatcher-owned finalization + the PREPARED/UNAPPLIED `20260815_sync_cycle_finalize.sql`) is committed and
-awaits review, and the running canary cycle is reconciled to its terminal state only via the reviewed Appendix N
-procedure after approval. **Gate 6 is BLOCKED** on that correction. Every remaining live step is **gated on
-explicit human approval**, one step at a time. This document is the plan Codex senior review evaluates; it does
-not authorize any step by itself.
+control unlock, deployment, schedule, route, or frontend change has been made. **KNOWN DEFECT — NOT YET RESOLVED
+IN PRODUCTION (Blocker 1):** the canary cycle is still `status='running'` (`finished_at` null, report counters
+unwritten) because the dispatcher did not finalize the drained cycle — this is NOT an acceptable terminal state.
+The CODE fix is complete (dispatcher-owned finalization with a TOTAL typed disposition; the production wiring —
+the `finalizeSyncCycle` wrapper, the composed-store `finalizeCycle`, the audited RPC/trigger contract, and the
+fail-closed preflight/dispatcher; the complete-scheduled-scope-only auto-finalize semantics that closes the
+manual-subset hole; and the hardened guarded `finalize_sync_cycle` RPC + append-guard triggers in
+`20260815_sync_cycle_finalize.sql`). **But the defect is NOT resolved in production**: `20260815_...` remains
+**PREPARED and UNAPPLIED**, so nothing yet finalizes a live cycle, and the running Gate-5 canary cycle is
+reconciled to its terminal state only via the reviewed **Appendix N** procedure — which runs only **after**
+Migration 5 is applied via its own reviewed Gate. **Gate 6 is BLOCKED** until Migration 5 is applied and the
+canary cycle reconciled. Every remaining live step is **gated on explicit human approval**, one step at a time.
+This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
 `sales-dashboard-live/lib/server/sync/runtime-composition.js`; the migration↔wrapper compatibility matrix it
@@ -222,11 +227,12 @@ report. **Approval gate per report.**
 - [x] **Gate 5 — one-account brand-sales SHADOW canary EXECUTED 2026-08-14 — SUCCESS** (execution evidence in
   Appendix L.8). Exactly ONE primary account, `brand-sales` only, exactly TWO create-exports (one Order Line
   Items, one Product Catalog `68d2de238e`), one `scheduler-v2/brand-sales` shadow snapshot; production Brand
-  Sales fingerprint byte-identical; controls still locked/paused; no deploy/schedule. **KNOWN FOLLOW-UP (under
-  correction):** the canary's `sync_cycles` row is still `status='running'` (finished_at null) because the
-  dispatcher did not finalize a drained cycle — this is the Blocker-1 lifecycle defect now fixed in code
-  (`20260815_sync_cycle_finalize.sql` PREPARED/UNAPPLIED + Appendix N reconciliation, both pending review),
-  NOT an acceptable terminal state.
+  Sales fingerprint byte-identical; controls still locked/paused; no deploy/schedule. **KNOWN FOLLOW-UP — NOT
+  RESOLVED IN PRODUCTION:** the canary's `sync_cycles` row is still `status='running'` (finished_at null) because
+  the dispatcher did not finalize a drained cycle. The Blocker-1 CODE fix (production wiring + typed disposition +
+  complete-scope-only scope semantics + hardened `20260815_sync_cycle_finalize.sql`) is complete, but the defect
+  is not resolved until `20260815_...` is applied via a reviewed Gate and the canary cycle reconciled (Appendix
+  N) — both still pending. `status='running'` is NOT an acceptable terminal state.
 - [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles. **BLOCKED** pending the cycle-lifecycle
   finalization correction (Blocker 1) being reviewed + applied, and the running Gate-5 canary cycle reconciled
   to its terminal state (Appendix N).
@@ -2188,14 +2194,15 @@ discovery (30 primary accounts, memoized once).
 - **Cycle**: exactly one `sync_cycles` row for (`non-us`, `2026-08-14`, id `57afc1fb-…`) — `source_total=2`,
   `source_succeeded=2`, `source_failed=0`. **`status='running'` with `finished_at` null and report counters
   unwritten is a LIFECYCLE DEFECT (Blocker 1), NOT an acceptable terminal result:** all source/report/snapshot
-  work completed and every L.6 check passed, but the dispatcher did not finalize the drained cycle. The fix
-  (dispatcher-owned finalization + the guarded `finalize_sync_cycle` RPC/trigger in the PREPARED, UNAPPLIED
-  `20260815_sync_cycle_finalize.sql`) is committed; the running canary cycle stays exactly as-is until the
-  reviewed reconciliation (Appendix N) runs after the fix is approved.
+  work completed and every L.6 check passed, but the dispatcher did not finalize the drained cycle. The CODE fix
+  (dispatcher-owned finalization + typed disposition + complete-scope-only auto-finalize + the hardened guarded
+  `finalize_sync_cycle` RPC/triggers in the PREPARED, UNAPPLIED `20260815_sync_cycle_finalize.sql`) is complete,
+  but the defect is **not resolved in production** until that migration is applied via a reviewed Gate and the
+  canary cycle reconciled (Appendix N). The running canary cycle stays exactly as-is until then.
 
-Post-canary L.6 P1–P7 all PASS. `npm run verify` 33/33 incl. `build:check`; `git diff --check` clean; all 7
-Gate 0 hashes unchanged (`ac62a3a…`). Both readiness gates remain locked/paused; nothing pushed/merged/
-deployed/migrated/unlocked/scheduled. STOP for Codex review after this single canary.
+Post-canary L.6 P1–P7 all PASS. `npm run verify` (at execution time) incl. `build:check`; `git diff --check`
+clean. Both readiness gates remain locked/paused; nothing pushed/merged/deployed/migrated/unlocked/scheduled.
+STOP for Codex review after this single canary.
 
 ## Appendix M — Organization-wide Product Catalog: confirmed contract + reviewed design (NOT implemented)
 
@@ -2358,17 +2365,19 @@ Gate 5 canary (Appendix L) keeps validating the CURRENT plan-derived identities 
 
 ### N.1 Preconditions (read-only; STOP on any mismatch)
 - `20260815_sync_cycle_finalize.sql` has been applied via a reviewed Gate (the `finalize_sync_cycle` RPC and the
-  `*_no_append_terminal` triggers exist); migrations 1–4 remain byte-unchanged (all 7 Gate 0 hashes intact).
+  three `*_no_append_terminal` triggers exist); migrations 1–4 remain byte-unchanged.
 - The target cycle is still `status='running'`, `finished_at` null, and its source/report/owner/snapshot rows
   are exactly the Appendix L.8 evidence (2 succeeded source jobs, 1 report job, 2 owner memberships, 1 shadow
   snapshot). Confirm zero open source/report jobs: no `sync_source_jobs.fetch_status in ('pending','attempted')`
   and no non-finished `sync_report_jobs` for the cycle.
 
 ### N.2 Reconcile (guarded; one cycle only)
-- Call `select * from public.finalize_sync_cycle('57afc1fb-6694-4925-8961-4730f5a8f4df', 'running');` ONCE.
-  The RPC is guarded: it finalizes only a `running` cycle with zero open source/report jobs, recomputes the
-  authoritative source **and** report counters, stamps `finished_at`, and returns the finalized row (or null if
-  the guard/precondition is not met — in which case STOP and report, make no manual edit).
+- Call `select public.finalize_sync_cycle('57afc1fb-6694-4925-8961-4730f5a8f4df');` ONCE. The RPC takes ONLY the
+  cycle id (no expect-status parameter) and returns a `jsonb` `{ disposition, cycle }`. It finalizes only a
+  `running` cycle with zero open source/report jobs, recomputes the authoritative source **and** report
+  counters, and stamps `finished_at`. **Require `disposition = 'finalized'`** with the expected cycle. Any other
+  disposition — `already-terminal` / `open-work` / `not-found` / `invalid-status` — means the preconditions did
+  not hold: STOP and report, make no manual edit.
 
 ### N.3 Post-reconciliation (read-only; record safe fields only)
 - Expect the cycle row: `status='succeeded'` (all source + report work succeeded — 2/2 sources, 1/1 report),

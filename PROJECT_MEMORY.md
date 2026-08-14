@@ -8786,3 +8786,57 @@ Supabase write, migration applied, control unlock, deploy, push, merge, or sched
 cycle + its source/report/owner/snapshot rows are UNCHANGED; SHADOW MODE with controls locked/paused;
 20260815_sync_cycle_finalize.sql is PREPARED + UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex
 re-review; Gate 6 remains blocked pending this correction.
+
+## Scheduler v2: cycle-finalization production wiring + typed disposition + manual-subset fix + Migration 5 hardening (2026-08-14)
+
+Codex re-review of the Blocker-1 lifecycle fix found 5 code/wiring findings + 1 docs finding. Fixed OFFLINE
+(migrations 1-4 byte-unchanged; Migration 5 still UNAPPLIED; no production side effect; Gate 5 NOT re-run).
+Codex explicitly authorized modifying the formerly-frozen supabase.js / schema-contract.js /
+runtime-composition.js for the wiring this round -- so those 3 Gate-0-code hashes change (the ac62a3a combined
+hash no longer applies); ONLY migrations 1-4 must stay byte-unchanged (confirmed). Commit 107b4a6 (code/tests),
+then the docs commit.
+
+- F1 PRODUCTION WIRING: supabase.js gains an exported finalizeSyncCycle(cycleId) wrapper (POSTs { p_cycle_id }
+  to /rest/v1/rpc/finalize_sync_cycle; returns the typed disposition; throws safe on transport/malformed).
+  source-sync-driver.makeSupabaseSourceStore exposes finalizeCycle -> that RPC (so buildSchedulerV2Runtime's
+  composed store has it). schema-contract adds the Migration 5 entry (RPC params [p_cycle_id] + the 3
+  append-guard triggers) + finalizeSyncCycle in REQUIRED_WRAPPER_EXPORTS + a new triggerDeclared() + trigger
+  audit (TRIGGER_MISSING); runtime-composition surfaces the trigger field. Preflight now FAILS CLOSED if
+  Migration 5 / RPC / wrapper / any trigger is missing. Dispatcher: removed the silent optional/no-op -- a
+  drained SCHEDULED cycle with finalization unavailable now THROWS (never claims success).
+- F2 TOTAL TYPED DISPOSITION: finalize_sync_cycle returns jsonb { disposition, cycle } with
+  finalized|already-terminal|open-work|not-found|invalid-status (no ambiguous null). Dispatcher:
+  finalized/already-terminal -> complete (continuationRequired=false); open-work -> drained=false +
+  continuationRequired=true; unknown/invalid/malformed -> fail closed; non-drained/maxJobs/deferral -> no
+  finalize call.
+- F3 MANUAL-SUBSET HOLE (durable solution = direction a): auto-finalization is attempted ONLY for a COMPLETE
+  SCHEDULED scope (manual=false). A MANUAL run is a partial subset and NEVER auto-finalizes, so a later manual
+  run for a different report on the SAME (bucket,cycleDate) can still append; a manual cycle is closed only by
+  an explicit reviewed operation (Appendix N). This is why the Gate 5 canary (manual) legitimately stayed
+  running. Regression: manual brand-sales then manual content-changes on the same cycle both append + drain
+  (content-changes was NOT pre-seeded). NOT solved by checking only currently-existing child rows.
+- F4 MIGRATION 5 HARDENED: removed p_expect_status (signature now exactly finalize_sync_cycle(p_cycle_id uuid);
+  status='running' required internally). The append-guard trigger forbids changing a child row's cycle_id
+  (immutable) AND rejects any insert/update whose parent cycle is terminal -> a row can never be added to,
+  altered in, or MOVED OUT OF a terminal cycle. FOR UPDATE (finalize) / FOR SHARE (trigger) on the one cycle
+  row keep both orderings deadlock-safe. No table/column added.
+- F5 REGRESSIONS: cycle-lifecycle.test.js (15) -- state table; typed dispositions; open-work; idempotent; both
+  concurrency orderings; scheduled auto-finalize vs manual no-finalize; the unplanned-manual-subset regression;
+  open-work->continuation; fail-closed on unavailable + malformed disposition; maxJobs/deferral no-finalize +
+  ZERO duplicate create-export on resume. New cycle-finalize-wiring.test.js (13) -- real composed store has
+  finalizeCycle; audit/preflight fail closed on missing migration/RPC/trigger/wrapper + RPC_PARAM_MISMATCH if
+  p_expect_status re-added; fetch-mocked wrapper (exact { p_cycle_id }, typed ack round-trip, safe failure);
+  STATIC SQL mutation checks against the ACTUAL Migration 5 (no p_expect_status; status='running' guard; cycle_id
+  immutable + terminal-parent reject; FOR UPDATE/FOR SHARE; adds no table). Both wired into package.json +
+  verify.mjs. Updated sync-dispatch / sync-runtime-composition test stores with a modeled finalizeCycle.
+- F6 DOCS: runbook header + checklist + L.8 + Appendix N updated to say the CODE fix is complete but the defect
+  is NOT resolved in production until Migration 5 is applied via a reviewed Gate and the canary cycle reconciled
+  (Appendix N). Gate 6 remains BLOCKED. Appendix N stays PREPARED + UNEXECUTED; its RPC call updated to the new
+  1-arg signature + typed-disposition check (require 'finalized').
+- Verify: node --check all changed JS OK; npm run verify 35/35 incl. build:check; git diff --check clean;
+  migrations 1-4 byte-unchanged (1328bc0f/0750a155/544557fb/49628c8d); Migration 5 UNAPPLIED.
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + its rows are UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql is
+PREPARED + UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
