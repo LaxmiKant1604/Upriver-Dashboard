@@ -2151,35 +2151,119 @@ catalog request identity is a CURRENT-implementation **cache-key artifact only**
 genuinely seller-scoped** (its rows carry and depend on the seller/vendor scope). The Gate 5 canary continues
 to validate the EXACT identity the CURRENT planner derives; this appendix changes no canary step.
 
-### M.2 Reviewed organization-wide Catalog design (separation of concerns)
+### M.2 Reviewed organization-wide Catalog design (canonical scope vs owner scope — corrected)
 
-- **Canonical source scope/hash: organization-wide.** ONE canonical Product Catalog request identity per
-  organization (per `organizationFingerprint`), derived from the org credential + the contract's
-  columns/limit/ordering + the final (M.3-confirmed) filter/window semantics — and **NOT** from any
-  per-account seller id. One org ⇒ one catalog `request_hash` per cycle window.
-- **Owner memberships stay account/report-specific.** `sync_source_job_owners` rows remain per
-  `(report_key, account, connection, org/scope)` — every report/account needing the catalog holds its OWN
-  active membership pointing at the ONE org-wide canonical `request_hash`. The Appendix L P2 isolation model
-  (ownerless-row / membership-scope checks) is unchanged in shape; only the number of distinct canonical
-  catalog hashes shrinks to one per organization.
-- **One shared saved catalog/map.** A single `source_export_cache` entry (and the derived shared ASIN → brand
-  map) per organization catalog identity; every derive reads the same saved rows. Blank-brand ASINs (M.1 #6)
-  stay unmapped — never "Unassigned".
-- **No duplicate export per account.** The existing DB one-attempt guard (`claim_source_export_attempt` +
-  the one-attempt CHECK) already dedupes by `request_hash`; with ONE org-wide hash there is at most ONE
-  catalog create-export per cycle for the WHOLE organization, regardless of account count.
-- **Automatic reuse for newly discovered accounts.** A newly discovered account's plan resolves the SAME
-  org-wide hash, so onboarding adds only a new owner-membership row; the existing canonical job, export, and
-  saved catalog/map are reused — zero additional catalog tokens.
+> **Why the correction:** the CURRENT implementation uses ONE `accountScopeHash` value for BOTH the source
+> identity (`sourceRequestIdentity` hashes it into `request_hash`) AND the owner identity
+> (`sourceJobOwnerId({reportKey, connectionId, organizationFingerprint, accountScopeHash})`), and the worker
+> **re-derives and enforces** `owner_id` from the canonical job's scope (source-worker.js owner validation).
+> If the canonical catalog scope simply became org-wide, every account's catalog `owner_id` would COLLAPSE
+> into one — destroying per-account ownership. The design below separates the two scopes explicitly.
 
-**Rejected shortcut (do NOT implement):** normalizing or hard-coding `accountScopeHash` (hashing a constant /
-empty scope, or aliasing every account onto one account's hash) while the request still carries per-account
-seller ids. That would (a) make the stored identity lie about the actual request, (b) silently alias
-genuinely account-scoped requests if ever applied beyond the catalog, (c) bypass the resolver's
-single-account invariants instead of modeling scope, and (d) leave no explicit contract-level record that the
-source is org-wide. The correct change is a first-class **organization scope** in the source contract +
-resolver + planner (a typed scope the identity derivation understands), landed as reviewed code with tests —
-only after M.3 resolves.
+**Two distinct scopes, never conflated:**
+
+- **Canonical source scope — ORGANIZATION-WIDE.** Used for the Product Catalog `request_hash` and the
+  canonical `sync_source_jobs` metadata. ONE canonical catalog identity per organization, derived from the
+  org credential (`organizationFingerprint`) + the contract's columns/limit/ordering + the final
+  (M.3-confirmed) filter/window semantics — **never** from any per-account seller id. The canonical row's
+  stored scope value is a typed organization-scope token (see field discussion below), identical no matter
+  which account plans first.
+- **Owner scope — ACCOUNT-SPECIFIC.** Used for `sourceJobOwnerId` and every `sync_source_job_owners`
+  membership. Each owning report/account derives its `owner_id` from ITS OWN account scope (the account's
+  raw-seller scope hash, as today), so N accounts needing the catalog produce **N distinct owner ids** and N
+  membership rows — all pointing at the ONE org-wide canonical `request_hash`. **No owner-ID collapse.**
+
+**Required contract / resolver / planner / type changes (reviewed, NOT implemented):**
+
+- `REPORT_SOURCE_CONTRACTS` (and/or `SOURCE_CONTRACTS`): a new explicit, typed per-contract field — e.g.
+  `sourceScope: "organization" | "account"` (default `"account"`, so every existing contract is untouched
+  by omission). Only Product Catalog contracts would declare `"organization"`, and only at the deliberate
+  cutover.
+- `reportSourceRequestHashes` (resolver): for an `"organization"`-scope contract, compute the identity from
+  the org fingerprint + request meta + a canonical org-scope token — NOT from the seller-id chunk — while
+  **still returning the account's own scope** on the resolved source (e.g. a separate `ownerScopeHash`
+  field) so owner derivation stays account-specific. The single-account safety check
+  (`requiresSingleAccountSource`) continues to apply to account-scoped sources only.
+- `sourceRequestIdentity` / `source-identity.js`: accept the typed scope so the org-wide identity is
+  first-class (an explicit `scope:"organization"` token hashed in place of the per-account
+  `accountScopeHash`) — never a fake/constant "account" hash pretending to be one.
+- `sourceJobOwnerId`: derivation INPUT changes from "the canonical job's accountScopeHash" to "the OWNER's
+  account scope hash" (an explicit parameter fed from the plan's account scope). For account-scoped sources
+  the two values are identical, so existing owner ids do not change.
+- `source-worker.js` owner validation: recompute/enforce `owner_id` from the **membership's** account scope
+  (owner-level metadata), not the canonical job's scope; a membership whose owner scope does not belong to
+  the planning account still fails closed.
+- Planner (`report-planner.js` / `decorateSources`): carries BOTH values on each planned source — canonical
+  identity fields (org-wide for the catalog) and the owner's account scope — so `buildDependencyPlan`,
+  the drivers, and the workers never re-conflate them.
+
+**Schema / migration question:** `sync_source_jobs.account_scope_hash` and
+`sync_source_job_owners.account_scope_hash` both exist today. Option A (no migration): store the canonical
+org-scope token in the canonical row's `account_scope_hash` and the account scope in each membership row —
+works, but the column name then lies for org-scope rows and the L.6 P2 equality check
+(`o.account_scope_hash = s.account_scope_hash`) must become scope-aware. Option B (small additive
+migration): add an explicit `source_scope` column (default `'account'`) to `sync_source_jobs` so canonical
+rows are self-describing and P2 checks branch on it. **Recommendation: Option B** — self-describing state
+beats overloading, and the migration is additive/non-destructive — but the choice is made at implementation
+review, not here, and NO migration is prepared or applied now.
+
+**Canonical metadata stability:** every canonical field of the org-wide row (source_id, org fingerprint,
+canonical scope token, request meta, hash) derives ONLY from org-level inputs — no "first account to plan
+wins", no account ordering sensitivity. Two accounts planning in either order produce byte-identical
+canonical rows and identities.
+
+**Primary organization isolation:** the org fingerprint (derived from the connection's own apiKey) stays
+inside the identity, so a `dd-secondary` organization gets its OWN org-wide catalog hash; requests, caches,
+maps, and memberships never cross organizations, and retired-secondary accounts stay read-only exactly as
+today.
+
+**One shared saved catalog/map:** a single `source_export_cache` entry (and one derived ASIN → brand map)
+per organization catalog identity; every derive reads the same saved rows. Blank-brand ASINs (M.1 #6) stay
+unmapped — never "Unassigned".
+
+**No duplicate export per account:** the existing DB one-attempt guard (`claim_source_export_attempt` + the
+one-attempt CHECK) already dedupes by `request_hash`; with ONE org-wide hash there is at most ONE catalog
+create-export per cycle for the WHOLE organization, regardless of account count.
+
+**Automatic reuse for newly discovered accounts:** a newly discovered account's plan resolves the SAME
+org-wide hash, so onboarding adds only a new (account-specific) owner-membership row; the existing canonical
+job, export, and saved catalog/map are reused — zero additional catalog tokens.
+
+**Compatibility / migration for existing account-scoped cache entries:** existing per-account catalog cache
+entries and their `request_hash` identities remain valid and readable until natural expiry — no rewrite,
+delete, or backfill. The org-wide identity starts EMPTY and is seeded by its own first export at the
+deliberate cutover; until that cutover the CURRENT per-account identities (including the Gate 5 canary's
+plan-derived hash and every golden `request_hash` pin) stay byte-unchanged. The legacy browser route keeps
+its current identity until it is migrated deliberately, with parity evidence.
+
+**Tests required BEFORE implementation (all offline/deterministic):**
+
+1. Identity: an `"organization"`-scope identity ignores seller ids and account planning order; is stable
+   across accounts; differs between organizations (primary vs dd-secondary); every `"account"`-scope
+   identity (all golden `request_hash` pins) is byte-unchanged.
+2. Resolver: an org-scope contract resolves ONE request regardless of account count; the resolved source
+   still carries the account's own owner scope; account-scoped sources keep the single-account fail-closed
+   invariant; unknown scope values fail closed.
+3. Owner derivation: N accounts ⇒ N distinct owner ids pointing at ONE canonical hash (no collapse); the
+   worker's owner validation passes for each account's own membership and fails closed for a
+   wrong/mismatched owner scope.
+4. Worker/driver: one create-export total for the org-wide hash with multiple owners; either owner can
+   resume; stale-membership reconciliation unchanged.
+5. P2/L.6 checks: updated isolation queries pass for org-scope canonical rows with account-scoped
+   memberships and still FAIL on genuinely mis-scoped memberships.
+6. Cache compatibility: old per-account entries readable until expiry; new org-wide entry independent;
+   no cross-org reuse.
+
+**Explicitly REJECTED (do NOT implement):**
+
+- using ONE ACCOUNT's `accountScopeHash` as the canonical org-wide scope (first-account-wins identity —
+  unstable, account-ordering-dependent, and a lie about the request);
+- a CONSTANT `accountScopeHash` shortcut (hard-coding/normalizing the scope while the identity still
+  claims to be account-scoped — overloads the meaning, invites silent aliasing, leaves no typed record);
+- including per-account seller IDs in the organization-wide request identity (would fracture the one
+  canonical hash back into per-account hashes);
+- changing ANY identity before DataDoe confirms the marketplace, `child_asin`, and date/filter semantics
+  (M.3) — the golden `request_hash` pins stay untouched until then.
 
 ### M.3 Deliberately unresolved (pending DataDoe follow-up — do not guess)
 

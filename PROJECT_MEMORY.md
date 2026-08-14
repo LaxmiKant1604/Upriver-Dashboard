@@ -8467,3 +8467,60 @@ paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes 
 lib/server/datadoe.js, scripts/verify.mjs, scripts/datadoe-poll-export.test.js, package.json, docs -- none
 frozen); nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md +
 .worktrees/ untouched. STOP for Codex review.
+
+## Scheduler v2: resumable poll-pending deferral, real serverless deadline, Appendix M scope separation (2026-08-14)
+
+Third Codex round on this tranche: fixed the three confirmed blockers OFFLINE (Gate 5 NOT executed). Commits:
+ca463a4 (code/tests: Blockers 1-2), then the docs commit (Blocker 3 + this entry).
+
+- BLOCKER 1 (resumable poll exhaustion): pollExport now throws a TYPED DataDoePollPendingError (code
+  DATADOE_POLL_PENDING, carries exportId) when the bounded 9-attempt window is exhausted by ONLY temporary
+  states (repeated status-GET 404 / ordinary PENDING). Terminal outcomes (status 500, FAILED, ERROR,
+  BLOCKED_NO_TOKENS, create-POST 404) still throw plain errors and are recorded as genuine failures.
+  source-worker's deferIfDeadline generalized to deferIfResumable: poll-pending defers EXACTLY like a deadline
+  deferral -- durable row stays fetch_status='attempted' with its export_id, deferred+=1, drained=false
+  (continuation required), NO recordSourceFailure, never a second create-export POST; the next invocation for
+  the same cycle/request_hash resumes the SAVED export id via the existing 'attempted' path and completes.
+  classifyFetchError gains a defensive non-terminal POLL_PENDING branch; plain "timed out" errors still
+  classify TIMEOUT (policy unchanged). One-attempt / request_hash / strict-cap / ownership / LKG untouched.
+  Durable lifecycle proven by regression: pending -> attempted(+export_id E1, create_export_count=1) ->
+  [poll-pending or deadline: STAYS attempted+E1, no failure row] -> succeeded(row_count set) with
+  create_export_count still exactly 1 and ZERO creates in invocation 2.
+- BLOCKER 2 (real 60s bound): api/datadoe.js handler now runs inside withDataDoeDeadline(now + 55_000) --
+  vercel.json maxDuration=60 NOT increased; 5s shutdown headroom. The deadline plumbing (ddFetch pre-check +
+  AbortController on in-flight requests + budget-aware sleep()) bounds NETWORK time, rate-limit/429 sleeps,
+  and poll cadence sleeps; no new request starts when insufficient time remains; no process.exit/forced
+  timers. Typed deadline/poll-pending errors map to a retryable 504 (not a generic 500). Scheduler v2 already
+  runs per-slice deadlines; a deadline after export_id is saved surfaces the same resumable deferred outcome.
+- Tests (scripts/datadoe-poll-export.test.js, deterministic fake clock + instant recorded timers + scripted
+  fetch): 11/11 -- 404->pending->completed; repeated-404 AND repeated-PENDING exhaustion -> typed signal (9
+  GETs, 0 POSTs, non-terminal); real failures unchanged incl. create-404; exactly-one-create full flow;
+  deadline vs slow HTTP (2 GETs fit a 20s budget at 9s latency each, third never starts, elapsed <= budget,
+  every request started with headroom); deadline vs rate-limit sleep (spacing sleep defers, no extra request);
+  deadline before first GET (0 GETs); worker resume x3 (404 / PENDING / deadline) proving the lifecycle above.
+- BLOCKER 3 (Appendix M corrected, design-only): the previous M.2 wrongly implied owner memberships could
+  stay as-is -- but sourceJobOwnerId currently derives from the SAME accountScopeHash as the source identity
+  and the worker re-derives/enforces owner_id from the canonical job's scope, so an org-wide canonical scope
+  would COLLAPSE all catalog owner ids into one. Rewritten M.2 separates: canonical source scope =
+  ORGANIZATION-WIDE (request_hash + canonical sync_source_jobs metadata; stable regardless of account
+  planning order; org fingerprint keeps primary/dd-secondary isolation) vs owner scope = ACCOUNT-SPECIFIC
+  (sourceJobOwnerId + each membership row; N accounts => N distinct owner ids pointing at ONE canonical hash).
+  Documented: required contract/resolver/planner/type changes (typed sourceScope field, resolver returns a
+  separate ownerScopeHash, sourceJobOwnerId takes the OWNER's scope, worker validates against membership
+  scope); schema options (Option A overload account_scope_hash + scope-aware P2 vs Option B additive
+  source_scope column -- recommended, decided at implementation review, nothing prepared/applied now);
+  compatibility (existing per-account cache entries + golden request_hash pins byte-unchanged until a
+  deliberate cutover; org-wide identity seeds itself fresh); and 6 required offline test families before any
+  implementation. Explicitly REJECTED: one account's accountScopeHash as canonical; a constant
+  accountScopeHash shortcut; per-account seller IDs inside the org-wide identity; ANY identity change before
+  DataDoe confirms marketplace/child_asin/date-filter semantics (M.3 unchanged).
+- Verification: node --check on all changed files OK; direct runs -- datadoe-poll-export 11, sync-source-jobs
+  17, sync-signals 12, fba-strict-source-worker 1, sync-dispatch 37, sync-runtime-composition 26,
+  test-source-cache 73 -- all exit 0; npm run verify (real direct runner) 32/32 steps green incl. build:check,
+  exit 0 in 44s; git diff --check clean.
+
+CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist empty); Gate 5 NOT executed;
+no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
+Scheduler v1, frontend, routes (behavior: the api route only gains the deadline wrapper + 504 mapping), cron,
+request_hash golden pins, and applied migrations untouched; all 7 Gate 0 hashes unchanged; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex re-review.
