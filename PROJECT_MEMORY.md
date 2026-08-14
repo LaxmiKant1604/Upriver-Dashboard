@@ -9058,3 +9058,40 @@ id 68d2de238e only): us 53 initial/59 MAX unique hashes, non-us 52/58 (generic d
 
 STATE NOW: Gate 6 Cycle 1 COMPLETE with evidence; Cycle 2 / unlock / publish / deploy / schedule all BLOCKED
 pending Codex review + explicit human approval. Commits: bb37a4e (code/tests fix), docs follow.
+
+## Scheduler v2: Gate-6 blocker remediation -- timeout-safe slicing + Ads-sync allowlist (OFFLINE, 2026-08-15)
+
+Codex-directed offline remediation of the Cycle-1 blockers (30 DataDoe terminal TIMEOUTs; empty
+ads_sync_coverage blocking PPC). Commit 8b085e0 (code/tests), then docs (SCHEDULER_V2_ROLLOUT Appendix Q).
+NOTHING executed: no production/DataDoe/Supabase call, no Cycle 2, no Ads sync, no control change.
+
+- PART A (classification, Appendix Q.1): all 30 timeouts mapped from the memoized Cycle-1 plan. Rule: only
+  per-day-grouped (groupBy includes date) or raw-dated sources are SAFE_TO_SLICE (a window partition
+  partitions rows exactly). SAFE+SLICED: daily superset, recon order-lines+settlements, returns raw.
+  NOT_SLICEABLE: grouped-without-date (sku-pl, fba monthly-units, listing-health sales, sales-movers
+  traffic/ads, returns settlements/traffic), no-date/current-state (catalog, listings, content-changes),
+  sqp-weekly (fold slice-safe but the staged cycles track ONE weekly fragment hash as the activation signal),
+  buy-box already at the 7d floor. fba-inventory-health = LATEST_SNAPSHOT_SLICEABLE (provable; deferred).
+- PART B (slicing): planner emits <=7-day slices (TIMEOUT_SAFE_SLICE_DAYS=7; within calendar months for
+  month-scoped sources; NEWEST-FIRST for the DESC returns source so concatenation reproduces the former
+  whole-window DESC order). Derive-side slicedFragmentRows() accepts ONLY the recomputed exact slice sequence
+  and binds EVERY row to its OWN fragment window; recon six-complete-month integrity moved to the context
+  window with unchanged strictness. Strict caps/LKG/identity/owner/primary-only/one-create-per-hash unchanged;
+  no retry/fallback source. Intentional hash changes GOLDEN-pinned. Budget: initial unique exports us 53->128,
+  non-us 52->127 (~2.4x more, each ~4-7x smaller).
+- Deep-equality proofs (timeout-slicing.test.js, 14 assertions, wired into verify): sliced derive deep-equals
+  the former unsplit calculation for all three reports; window invariants (ordered/gapless/no-overlap/exact
+  coverage/month-bounded/DESC, incl. leap Feb); malformed-fragment fail-closed matrix; resume across bounded
+  invocations with exactly one create-export per hash; one failed slice blocks only its own report.
+- PART D (Ads-sync canary prep): runAdsSync(countries, sourceKeys, { accountIds }) optional EXACT allowlist +
+  pure fail-closed resolveAdsAccountAllowlist (unknown/duplicate/blank/dd-secondary/non-primary throw; only
+  freshly discovered primary accounts; coverage recorded only after durable persistence, per-source
+  independent). Absent => byte-for-byte unchanged (both existing callers pass 2 args). Tests prove the two
+  Gate-6 accounts can be targeted without syncing any other US/IN account. Ads sync NOT executed.
+- PART C (DataDoe support matrix, Q.4): per unsplittable timed-out source -- name/short-id, safe windows used,
+  terminal TIMEOUT outcome, and the exact question: "What API-supported filter or export partition should be
+  used for this source, and what are its processing/row limits?" No keys/payloads/export IDs committed.
+- Verification: npm run verify 36/36 across 16 suites (new timeout-slicing suite registered) incl. build:check;
+  git diff --check clean; migrations 1-5 untouched; controls locked/paused.
+
+STOP for Codex review. Cycle 2 / Ads-sync execution / unlock / deploy / schedule remain BLOCKED.

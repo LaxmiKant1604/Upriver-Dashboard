@@ -2604,3 +2604,104 @@ strict finalize-acknowledgement validation passed on both calls.
 
 **STOP.** Cycle 2, control unlock, publishing, deployment, and scheduling all remain BLOCKED pending Codex
 review of this evidence and explicit human approval.
+
+---
+
+## Appendix Q — Gate-6 blocker remediation: timeout classification, timeout-safe slicing, Ads-sync canary prep (2026-08-15; OFFLINE code/tests only)
+
+Remediates the Cycle-1 blockers entirely offline (commit `8b085e0` code/tests; this appendix docs-only).
+Nothing was executed: no production/DataDoe/Supabase call, no Cycle 2, no Ads sync, no control change.
+
+### Q.1 Timeout classification matrix (all 30 Cycle-1 terminal TIMEOUTs)
+
+Classification rule: a source is SAFE_TO_SLICE only when its output rows are PER-DAY (its groupBy includes
+`date`, or it is raw grain with a real per-row date) — then any partition of the window partitions the rows
+exactly and concatenation reproduces the fold. A groupBy WITHOUT date returns whole-window aggregate rows
+(slicing changes row identity); no-date/current-state sources have no window to slice.
+
+| request key (timeouts us/non-us) | source / id-prefix | window | grouping | strict/limit | classification |
+|---|---|---|---|---|---|
+| daily-reporting:asin-day-superset (2/2) | sales-traffic-asin-date `401ffcd7e5` | per-month | [date,seller,asin]+sums | ✓/50k | **SAFE_TO_SLICE — SLICED** |
+| reconciliation:order-lines (0/2) | order-line-items `89b27535d2…` | per-month | incl. date + sums | ✓/50k | **SAFE_TO_SLICE — SLICED** |
+| reconciliation:settlements (1/2) | settlements `732dac689a…` | per-month | incl. date + sums | ✓/50k | **SAFE_TO_SLICE — SLICED** |
+| returns-leakage:returns (1/0) | returns `27c6fc0ec6…` | 60d, date DESC | raw dated rows | ✓/50k | **SAFE_TO_SLICE — SLICED (newest-first)** |
+| keyword-rank:sqp-weekly (1/0) + listing-optimizer:sqp-weekly (1/1) | sqp-weekly `81aa5b4cc2…` | 84d | raw dated rows | ✓/50k | **NOT_SLICEABLE (pipeline)** — the fold is slice-safe, but the STAGED cycles track ONE weekly fragment hash as the activation signal (single-fragment contract); slicing requires a staged-driver redesign. Deferred; in the DataDoe matrix. |
+| sku-pl:monthly-profit (1/2) | profit-by-sku-date `57a0cb319c…` | per-month | [sku,…] NO date | ✓/50k | **NOT_SLICEABLE** (whole-month aggregate rows; six-complete-month contract) |
+| fba-plan:monthly-units (1/1) | sales-traffic-asin-date | per-month | [child_asin] NO date | ✓/30k | **NOT_SLICEABLE** (whole-month aggregate rows) |
+| listing-health:sales (0/1) | profit-by-sku-date | 30d | [sku,asin,currency] NO date | ✓/50k | **NOT_SLICEABLE** |
+| sales-movers:traffic (1/1) + :ads (1/1) | sales-traffic / profit-by-sku | 7d probe-derived pairs | NO date | ✓/50k | **NOT_SLICEABLE** (already 7d; grouped without date) |
+| buy-box-loss:daily (1/1) | profit-by-sku-date | 7d slices (existing) | incl. date | ✓/50k | **already at the 7d policy floor** — a 7d slice still TIMEOUTed → DataDoe matrix |
+| fba-plan:inventory-health (0/1) + sales-movers:inventory (0/1) | fba-inventory-health `44fc5ba0ce…` | 10d snapshot | date-DESC snapshot rows | ✓/15k | **LATEST_SNAPSHOT_SLICEABLE** (provable: a partition preserves the union, so latest-date selection is unchanged) — deferred pending DataDoe limits |
+| content-changes:events (1/0) | content-changes `aec3d59769…` | no-date (event_time DESC) | raw | ✓/1k | **NOT_SLICEABLE (no-date)** |
+| fba-plan:awd / listings (1/0) | listings `ba689c05d7…` | no-date | raw | ✓/10k | **NOT_SLICEABLE (no-date)** |
+| sales-movers:catalog / product-catalog (0/1) | product-catalog `68d2de238e` | no-date/current-state | raw | ✓/20k | **NOT_SLICEABLE (current-state)** |
+
+Totals: us 13 + non-us 17 = 30 ✓. **10 of the 30 timed-out exports belonged to the now-sliced contracts**
+(daily superset 4, reconciliation 5, returns 1) — and every unfailed sibling window of those contracts is
+protected by the same change. The remaining 20 are classified above and carried in the DataDoe support
+matrix (Q.4).
+
+### Q.2 Changed request/window contracts (INTENTIONAL request_hash changes; golden-pinned)
+
+- `daily-reporting:asin-day-superset`: `per-month` → **`per-slice(<=7d, within each calendar month)`** over the
+  same `monthStart(asOf)-150..asOf` coverage (ordered ASC, gapless, non-overlapping, exact from/to).
+- `reconciliation:order-lines` + `:settlements`: `per-month (6 complete months)` → **`per-slice(<=7d, within
+  each of the 6 months)`**; the six-complete-calendar-month integrity is enforced on the context window and the
+  derive recomputes + requires the EXACT slice sequence.
+- `returns-leakage:returns`: `range asOf-59d..asOf` → **`per-slice(<=7d), NEWEST-FIRST`** (source is date DESC;
+  concatenation reproduces the former whole-window DESC order exactly).
+- Derive-side (`slicedFragmentRows`): only the exact recomputed sequence is accepted (reordered/duplicate/
+  missing/extra/wrong-window/cross-account rejected) and EVERY row must lie inside its OWN fragment window.
+- Golden tests pin the new hashes for a fixed synthetic input (`timeout-slicing.test.js`); the browser routes
+  are untouched (the scheduler's request identities deliberately diverge for these three families).
+- Unchanged: strict caps (now per-slice — stricter), LKG semantics, public/raw identity, owner scope,
+  primary-only routing, one create-export per request_hash, no retry/fallback source.
+
+### Q.3 Export-count budget (before → after; the deliberate trade-off)
+
+| bucket | Cycle-1 initial unique | post-slicing initial unique | delta |
+|---|---|---|---|
+| us (`26f7a1a6…`) | 53 | **128** | +75 (superset 6→27, recon orders 6→27, recon settlements 6→27, returns 1→9; dedup unchanged) |
+| non-us (`d658442d…`) | 52 | **127** | +75 |
+
+~2.4× more create-exports, each ~4–7× smaller — sized so the largest single export a sliced source can request
+is ≤7 days of rows (the whole-month/60-day exports were what TIMEOUTed).
+
+### Q.4 DataDoe support matrix — unsplittable timed-out sources (questions for DataDoe)
+
+For EVERY entry: our request used the exact safe windows/filters shown in Q.1, strict row caps, and the export
+terminally reported TIMEOUT while processing. **The question for each is the same: “What API-supported filter
+or export partition should be used for this source, and what are its processing/row limits?”**
+
+| source (name / short id-prefix) | windows/filters we used | terminal outcome |
+|---|---|---|
+| Profit by SKU & Date `57a0cb319c…` | one calendar month (sku-pl), 30d (listing-health sales), 7d slices (buy-box) — grouped by SKU | TIMEOUT (5 exports) |
+| Sales & Traffic by ASIN & Date `401ffcd7e5` | one calendar month grouped by child_asin (fba-plan monthly-units); 7d probe-derived grouped windows (sales-movers traffic) | TIMEOUT (4 exports) |
+| Settlements `732dac689a…` | one calendar month, grouped incl. date | TIMEOUT (3 exports) — now sliced ≤7d; residual risk if 7d still times out |
+| SQP Weekly `81aa5b4cc2…` | 84d raw weekly rows | TIMEOUT (3 exports) — fold slice-safe; staged single-fragment signal blocks slicing without redesign |
+| FBA Inventory Health `44fc5ba0ce…` | 10d snapshot lookback | TIMEOUT (2 exports) |
+| Product Catalog `68d2de238e` | current-state, 4 columns, 20k cap | TIMEOUT (1 export, non-us) |
+| Content Change Alerts `aec3d59769…` | no-date, event_time DESC, 1k cap | TIMEOUT (1 export) |
+| Listings `ba689c05d7…` | no-date, 4 columns (AWD) | TIMEOUT (1 export) |
+| Returns `27c6fc0ec6…` | 60d raw | TIMEOUT (1 export) — now sliced ≤7d newest-first |
+
+No API keys, payload rows, or export IDs appear here or in any committed evidence.
+
+### Q.5 Account-bounded Ads-sync preparation (PPC prerequisite; NOT executed)
+
+`runAdsSync(countries, sourceKeys, { accountIds })` gains an OPTIONAL exact public-account allowlist
+(`resolveAdsAccountAllowlist`, pure + fail-closed): selects ONLY freshly discovered primary accounts; throws on
+unknown/duplicate/blank/`dd-secondary:`/non-primary ids; never routes a secondary account through the primary
+key (selection returns discovered account objects with their OWN connections); coverage windows are recorded
+ONLY after durable Ads persistence (unchanged order, per-source independent — campaign + ASIN each exactly
+covered; targeting/search independent). Absent allowlist ⇒ byte-for-byte unchanged (both existing callers pass
+two arguments). Tests prove the two Gate-6 accounts (`26f7a1a6…` US, `d658442d…` IN) can be targeted without
+selecting any other US/IN account. **The Ads sync itself was NOT run** — executing it (to populate
+`ads_sync_coverage` for the PPC prerequisite) remains a separate explicitly-approved step.
+
+### Q.6 Verification
+
+`npm run verify` **36/36 across 16 suites** (the new `timeout-slicing` suite is wired in) incl. `build:check`;
+`git diff --check` clean; migrations 1–5 untouched; controls locked/paused; no readiness/durable-settings/
+frontend/cron/route/Scheduler-v1 change. **STOP for Codex review.** Cycle 2 / Ads-sync execution / unlock /
+deploy / schedule all remain BLOCKED pending review + explicit approval.
