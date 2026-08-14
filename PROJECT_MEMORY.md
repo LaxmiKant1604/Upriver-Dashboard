@@ -9095,3 +9095,34 @@ NOTHING executed: no production/DataDoe/Supabase call, no Cycle 2, no Ads sync, 
   git diff --check clean; migrations 1-5 untouched; controls locked/paused.
 
 STOP for Codex review. Cycle 2 / Ads-sync execution / unlock / deploy / schedule remain BLOCKED.
+
+## Scheduler v2: three Codex Ads-sync findings fixed -- requiredCoverage + always-release lock + DI harness (OFFLINE, 2026-08-15)
+
+Fixed the three Codex findings on the Gate-6 Ads-sync canary prep (Appendix Q.5). Commit a72c259 (code/tests),
+docs Appendix R. Approved timeout slicing (Appendix Q) UNCHANGED. Nothing executed (no Ads sync, no Cycle 2).
+
+- FINDING 1 (account-bounded requiredCoverage): runAdsSync(countries, sourceKeys, { accountIds,
+  requiredCoverage:{from,to} }). requiredCoverage allowed ONLY with a non-empty accountIds allowlist; strict real
+  YYYY-MM-DD, from<=to, future/out-of-range/malformed rejected; VALIDATED BEFORE the lock (validateAdsSyncOptions).
+  In coverage mode the exact [from,to] is the DataDoe export window for EVERY source (never pickMode/windowFor; an
+  existing 'daily' ads_sync_state can never shorten it); the exact successful window is recorded in
+  ads_sync_coverage; coverageStateRecord PRESERVES cadence timestamps (initial/daily/monthly) rather than falsely
+  stamping a normal run; latest_metric_date + last_status='succeeded' written ONLY after durable Ads rows AND a
+  positive coverage ack (write==='ok' AND recorded===batch length); unconfirmed/mismatched ack FAILS CLOSED
+  (failed state, coverageFailedAccounts, no advanced latest_metric_date). Existing 2-arg callers byte-compatible
+  (no options => unchanged cadence path; normal-run coverage still best-effort/ignored).
+- FINDING 2 (lock always released): added releaseRefreshLock; whole post-claim body in try/finally -> lock
+  released EXACTLY ONCE on every post-claim outcome (success/partial/discovery-failure/allowlist-rejection/
+  DataDoe-failure/coverage-write-failure); the 'skipped' path never releases (lock belongs to another run).
+- FINDING 3 (executable harness): extracted DI core runAdsSyncWithDeps(deps,...) + production wrapper runAdsSync
+  = runAdsSyncWithDeps(PRODUCTION_ADS_SYNC_DEPS,...). New scripts/ads-sync-canary.test.js (15 assertions, wired
+  into verify) drives the real core with injected trusted collaborators and proves every listed property
+  (exact-two-account export; zero calls/writes for unrelated US/IN + dd-secondary; daily-state cannot shorten
+  window; campaign+ASIN 30-day coverage => evaluateSourceCoverage proven===true; optional sources independent;
+  malformed/unknown/duplicate => zero exports; failed persistence => zero coverage; null/mismatched ack => fail
+  closed; lock released exactly once; no secret/raw error in results; absent options preserve behavior). The
+  former source-text proof was removed from timeout-slicing.test.js (now 11 assertions).
+- Unchanged: timeout slicing, source IDs, request hashes, Scheduler v1 cadence, controls, frontend, routes,
+  migrations. npm run verify 37/37 across 17 suites incl. build:check; git diff --check clean.
+
+STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.

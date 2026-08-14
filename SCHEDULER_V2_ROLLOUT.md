@@ -2705,3 +2705,59 @@ selecting any other US/IN account. **The Ads sync itself was NOT run** — execu
 `git diff --check` clean; migrations 1–5 untouched; controls locked/paused; no readiness/durable-settings/
 frontend/cron/route/Scheduler-v1 change. **STOP for Codex review.** Cycle 2 / Ads-sync execution / unlock /
 deploy / schedule all remain BLOCKED pending review + explicit approval.
+
+---
+
+## Appendix R — Ads-sync `requiredCoverage` canary contract (2026-08-15; OFFLINE code/tests only; NOT executed)
+
+Fixes the three Codex Ads-sync findings on Appendix Q.5's canary preparation (commit `a72c259` code/tests; this
+appendix docs-only). Nothing was executed — the Ads sync itself remains a separate explicitly-approved step.
+The approved timeout slicing (Appendix Q) is unchanged.
+
+### R.1 The option
+
+`runAdsSync(countries, sourceKeys, { accountIds, requiredCoverage: { from, to } })`. `requiredCoverage` is the
+account-bounded exact-window backfill the PPC prerequisite needs. It is **validated before the lock is claimed**
+and is **allowed only with a non-empty `accountIds` allowlist** (it can never widen an unbounded country sweep):
+strict real `YYYY-MM-DD`, `from ≤ to`, `to` not in the future, `from ≥ 2000-01-01`. In coverage mode the exact
+`[from, to]` is the DataDoe export window for **every** selected source — `pickMode`/`windowFor` are never
+called, so an existing `ads_sync_state` that would otherwise pick a 21-day `daily` window can never shorten it.
+
+### R.2 Exact per-batch effect (state + coverage), coverage mode
+
+Order per batch: **1)** fetch the exact window → **2)** `upsertAdsDailyRows` (+ `ad_daily_metrics` for
+campaign) — durable rows FIRST → **3)** `recordAdsCoverageWindows` and REQUIRE a positive acknowledgement
+(`write==='ok'` AND one recorded row per account) → **4)** only then write the success state.
+
+| table | on positive coverage ack | on unconfirmed/mismatched/failed ack (fail closed) |
+|---|---|---|
+| `ads_daily_source_rows` | upserted (durable, natural key) | upserted (rows already fetched) — but never marked a success |
+| `ad_daily_metrics` (campaign only) | upserted | upserted |
+| `ads_sync_coverage` | one row per (source, account): `covered_from=from`, `covered_to=to`, `status='succeeded'` | **no coverage row written** (or a non-`ok` write → treated as unconfirmed) |
+| `ads_sync_state` | `last_status='succeeded'`; `latest_metric_date` advanced from the saved rows; **`initial_seeded_at` / `last_daily_sync_at` / `last_monthly_sync_at` PRESERVED verbatim** (not a cadence run) | `last_status='failed'`; `latest_metric_date` **not advanced**; cadence timestamps untouched; account in `coverageFailedAccounts` |
+
+The recorded `[from, to]` (e.g. the 30-day PPC window `[asOf-29, asOf]`) is exactly what
+`evaluateSourceCoverage(state, from, to)` needs to return `proven === true` for campaign + ASIN; optional
+targeting/search coverage is recorded independently (only when those sources are requested). Existing
+two-argument callers (`runAdsSync(countries)` / `runAdsSync(countries, [sourceKey])`) are byte-for-byte
+behavior-compatible: no options ⇒ the unchanged cadence path (coverage stays best-effort/ignored).
+
+### R.3 Lock + architecture
+
+`releaseRefreshLock` is added and the whole post-claim body runs in `try/finally`, so the lock is released
+**exactly once on every post-claim outcome** (success, partial/deadline, discovery failure, allowlist
+rejection, DataDoe failure, coverage-write failure); the `skipped` path (lock held by another run) never
+releases. The worker is now a dependency-injected core `runAdsSyncWithDeps(deps, …)` with a production wrapper
+`runAdsSync = runAdsSyncWithDeps(PRODUCTION_ADS_SYNC_DEPS, …)`.
+
+### R.4 Verification
+
+New `scripts/ads-sync-canary.test.js` (**15 assertions**) drives the real core with injected trusted
+collaborators (no network/Supabase/real lock) and proves all listed properties (exact-two-account export;
+zero calls/writes for unrelated US/IN + dd-secondary; daily-state cannot shorten the window; campaign+ASIN
+30-day coverage ⇒ `proven===true`; optional sources independent; malformed/unknown/duplicate ⇒ zero exports;
+failed persistence ⇒ zero coverage; null/mismatched ack ⇒ fail closed; lock released exactly once; no
+secret/raw error in results; absent options preserve behavior). The former source-text proof was removed.
+`npm run verify` **37/37 across 17 suites** incl. `build:check`; `git diff --check` clean; slicing/source IDs/
+request hashes/Scheduler-v1 cadence/controls/frontend/routes/migrations unchanged. **STOP for Codex review.**
+Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending review + explicit approval.
