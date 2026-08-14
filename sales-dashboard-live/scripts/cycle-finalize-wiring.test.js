@@ -4,10 +4,11 @@
 // audit/preflight fail closed when Migration 5 / the RPC / the wrapper / the triggers are missing OR malformed;
 // the trigger audit is a BOUNDED STRUCTURAL proof (timing/events/level/function/table + no create-then-drop);
 // and the guard FUNCTION's critical behavior (cycle_id immutable, FOR SHARE lock, terminal reject, missing
-// parent fail-closed) is proven against the ACTUAL SQL with each condition BOUND to a DIRECT, UNCONDITIONAL
-// RAISE on its OWN IF block's initial true branch (an unrelated/moved/commented/stringified raise, or one nested
-// in an inner IF / ELSE / ELSIF, never satisfies it). finished_at is validated as a strict RFC3339 timestamptz
-// (Z or +/-HH:MM only). No network/DataDoe/Supabase (global fetch is mocked).
+// parent fail-closed) is proven against the ACTUAL SQL with each condition bound to a RAISE EXCEPTION as the
+// FIRST executable statement on its own IF block's true path (an unrelated/moved/commented/stringified raise, one
+// nested in an inner IF/ELSE/ELSIF, or any RETURN/PERFORM/NULL/assignment before it, never satisfies it) AND the
+// function carrying NO EXCEPTION handler that could swallow those raises. finished_at is validated as a strict
+// RFC3339 timestamptz (Z or +/-HH:MM only). No network/DataDoe/Supabase (global fetch is mocked).
 //
 // 7-bit ASCII, LF. Run: node scripts/cycle-finalize-wiring.test.js
 
@@ -234,6 +235,33 @@ test("(SQL guard-function BRANCH-AWARE) a raise nested in an inner IF / ELSE / E
   }
   // control: the untouched guard function -- a direct unconditional raise on each initial branch -- still passes.
   assert.ok(!auditCodes(M5_SQL).some((c) => c.startsWith("GUARD_")), "the real guard function passes all branch-aware checks");
+});
+
+// RAISE EXCEPTION must be the FIRST executable statement on each guard's true path (only whitespace/comments may
+// precede it), and the function must carry NO EXCEPTION handler that could swallow the raises.
+test("(SQL guard-function FIRST-STATEMENT) RAISE must be the first executable statement; no EXCEPTION handler may swallow it", () => {
+  const CYCLE = /if TG_OP = 'UPDATE' and NEW\.cycle_id is distinct from OLD\.cycle_id then[\s\S]*?end if;/;
+  const NF = /if not found then\s+raise exception 'parent sync cycle[\s\S]*?end if;/;
+  const TERM = /if v_status in \('succeeded', 'partial', 'failed'\) then[\s\S]*?end if;/;
+  const cycHead = "if TG_OP = 'UPDATE' and NEW.cycle_id is distinct from OLD.cycle_id then";
+  const nfHead = "if not found then";
+  const termHead = "if v_status in ('succeeded', 'partial', 'failed') then";
+  const R = "raise exception 'x' using errcode = 'raise_exception';";
+  const pre = (head, stmt) => `${head}\n    ${stmt}\n    ${R}\n  end if;`;              // an executable statement BEFORE the raise
+  const cmt = (head) => `${head}\n    -- a benign comment, then a direct raise\n    ${R}\n  end if;`;
+  const has = (sql, code) => auditCodes(sql).includes(code);
+  for (const [head, re, code] of [[cycHead, CYCLE, "GUARD_CYCLE_ID_IMMUTABLE_MISSING"], [nfHead, NF, "GUARD_MISSING_PARENT_NOT_FAILCLOSED"], [termHead, TERM, "GUARD_TERMINAL_REJECT_MISSING"]]) {
+    assert.ok(has(M5_SQL.replace(re, pre(head, "return NEW;")), code), `${code}: RETURN NEW before RAISE must fail`);
+    assert.ok(has(M5_SQL.replace(re, pre(head, "perform 1;")), code), `${code}: PERFORM 1 before RAISE must fail`);
+    assert.ok(has(M5_SQL.replace(re, pre(head, "null;")), code), `${code}: NULL before RAISE must fail`);
+    assert.ok(has(M5_SQL.replace(re, pre(head, "v_status := 'x';")), code), `${code}: assignment before RAISE must fail`);
+    assert.ok(!has(M5_SQL.replace(re, cmt(head)), code), `${code}: a comment/whitespace before a direct raise stays accepted`);
+  }
+  // an outer BEGIN ... EXCEPTION WHEN OTHERS THEN RETURN NEW that swallows the guard raises -> fail closed.
+  const swallow = M5_SQL.replace("return NEW;", "return NEW;\nexception when others then\n    return NEW;");
+  assert.ok(auditCodes(swallow).includes("GUARD_EXCEPTION_HANDLER_PRESENT"), "an EXCEPTION handler that could swallow the raises must fail closed");
+  // control: untouched Migration 5 passes -- a direct raise first on each path, no EXCEPTION handler.
+  assert.ok(!auditCodes(M5_SQL).some((c) => c.startsWith("GUARD_")), "the real guard function passes the first-statement + no-handler checks");
 });
 
 test("(SQL static) signature, running-guard, disposition set, and no-table-added invariants hold", () => {

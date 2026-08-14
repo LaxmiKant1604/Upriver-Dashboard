@@ -385,49 +385,35 @@ function functionBodyViews(clean, masked, fnName) {
   return { clean: clean.slice(open + 2, close), masked: masked.slice(open + 2, close) };
 }
 
-// BOUNDED PL/pgSQL IF-block proof: does the IF block WHOSE HEADER matches `headerRe` (in the function body's
-// `masked` view) reject with a DIRECT, UNCONDITIONAL RAISE EXCEPTION? Scanning the outer block's body (masked,
-// so comments/strings are blanked), a qualifying raise must:
-//   - occur at the TOP LEVEL of the outer IF (depth 0), NOT inside a nested IF/CASE/LOOP/BEGIN(exception) block;
-//   - occur on the outer IF's INITIAL true branch, i.e. BEFORE any depth-0 ELSE or ELSIF;
-//   - appear before the outer IF's own END IF.
-// So a raise hidden in a nested IF, in an ELSE/ELSIF branch, moved after END IF, or forged in a comment/string
-// never satisfies it. An optional `headerStrRe` requires a specific string literal in the block HEADER (checked
-// in `clean`, so a comment cannot forge it, and the masked header code anchors it to the real condition).
+// PL/pgSQL guard proof: RAISE EXCEPTION must be the FIRST EXECUTABLE STATEMENT on the true path of the IF block
+// WHOSE HEADER matches `headerRe` (in the function body's `masked` view). Because `masked` blanks BOTH comments
+// and strings to whitespace, the text immediately after the header's THEN -- once leading whitespace/comments are
+// skipped -- must begin with exactly `RAISE EXCEPTION`. Any other executable statement first (RETURN, PERFORM,
+// NULL, an assignment, a nested IF/CASE/LOOP/BEGIN block), a raise moved after END IF, or a raise forged in a
+// comment/string, all fail. An optional `headerStrRe` requires a specific string literal in the block HEADER
+// (checked in `clean`, so a comment cannot forge it, and the masked header code anchors it to the real condition).
 function ifBlockRaises(body, { headerRe, headerStrRe }) {
   const h = headerRe.exec(body.masked);
   if (!h) return false;
   if (headerStrRe && !headerStrRe.test(body.clean.slice(h.index, h.index + h[0].length))) return false;
-  // Tokens that matter, longest/compound forms FIRST so `end if` is never split into `end` + `if`, and `elsif`
-  // is never split into `else` + `if`.
-  const re = /\braise\s+exception\b|\bend\s+if\b|\bend\s+case\b|\bend\s+loop\b|\belsif\b|\belse\b|\bif\b|\bcase\b|\bloop\b|\bbegin\b|\bend\b/gi;
-  re.lastIndex = h.index + h[0].length;                    // start scanning AFTER the outer header's `then`
-  let depth = 0;                                           // 0 == directly in the outer IF's body
-  let leftInitial = false;                                 // set once a depth-0 ELSE/ELSIF is seen
-  let m;
-  while ((m = re.exec(body.masked)) !== null) {
-    const tok = m[0].toLowerCase().replace(/\s+/g, " ");
-    if (tok === "raise exception") {
-      if (depth === 0 && !leftInitial) return true;        // direct, unconditional, initial-branch rejection
-    } else if (tok === "if" || tok === "case" || tok === "loop" || tok === "begin") {
-      depth += 1;                                          // enter a nested block
-    } else if (tok === "end if" || tok === "end case" || tok === "end loop" || tok === "end") {
-      if (depth === 0) break;                              // the outer IF's own END IF -> stop
-      depth -= 1;                                          // close a nested block
-    } else if (tok === "elsif" || tok === "else") {
-      if (depth === 0) leftInitial = true;                // left the outer IF's initial true branch
-    }
-  }
-  return false;
+  return /^\s*raise\s+exception\b/i.test(body.masked.slice(h.index + h[0].length));
 }
 
-// Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR (Finding 2), each condition BOUND to its OWN
-// rejecting IF block (so removing one block's raise fails even if another block still raises). FOR SHARE is a
-// locking clause (not an IF block) and is proven separately in `masked`.
+// Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR, each condition BOUND to its OWN rejecting IF block
+// with RAISE EXCEPTION as the FIRST executable statement (so removing/deferring one block's raise fails even if
+// another block still raises). FOR SHARE is a locking clause (not an IF block) and is proven separately in
+// `masked`; and the whole function must carry NO EXCEPTION handler that could swallow those raises.
 function auditGuardFunction(clean, masked, fnName) {
   const body = functionBodyViews(clean, masked, fnName);
   if (!body) return [{ code: "GUARD_FUNCTION_MISSING", reason: "function body not found" }];
   const problems = [];
+  // (0) The function must contain NO exception handler that could catch/swallow the guard raises. plpgsql spells
+  // a handler section `EXCEPTION WHEN ...`; a `RAISE EXCEPTION` (the raises themselves) is never followed by WHEN,
+  // and strings are blanked in `masked`, so this matches only a real handler section -- the approved function has
+  // none.
+  if (/\bexception\s+when\b/i.test(body.masked)) {
+    problems.push({ code: "GUARD_EXCEPTION_HANDLER_PRESENT", reason: "an EXCEPTION handler is present that could catch/swallow the guard raises" });
+  }
   // (1) UPDATE cannot change cycle_id -- its OWN IF block raises.
   if (!ifBlockRaises(body, {
     headerRe: /\bif\b[^;]*?\bnew\.cycle_id\s+is\s+distinct\s+from\s+old\.cycle_id\s+then/i,
