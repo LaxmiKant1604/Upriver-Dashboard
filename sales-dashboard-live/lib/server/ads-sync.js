@@ -316,7 +316,48 @@ export function verifyCronRequest(req, res) {
   return true;
 }
 
-export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source) => source.key)) {
+/**
+ * FAIL-CLOSED optional account allowlist for a controlled Ads-sync canary (Gate 6 PPC prerequisite).
+ * Pure. `discovered` = the freshly discovered accounts (public ids + their connections) AFTER country
+ * filtering; `accountIds` = the exact PUBLIC account ids the caller wants to sync. Returns the selected
+ * subset in discovery order. Throws (never a partial/guessed selection) on:
+ *   - a malformed allowlist (not a non-empty array of non-blank strings);
+ *   - a duplicate id in the allowlist;
+ *   - a `dd-secondary:`-prefixed id (a secondary-organization account must NEVER be a canary target and is
+ *     never routed through the primary key -- selection only ever picks a DISCOVERED account object, which
+ *     carries its OWN connection);
+ *   - an id whose discovered account is not on the PRIMARY connection (defense in depth);
+ *   - an id that is NOT among the freshly discovered accounts (unknown/stale/out-of-country id).
+ */
+export function resolveAdsAccountAllowlist(discovered, accountIds) {
+  if (!Array.isArray(accountIds) || accountIds.length === 0) {
+    throw new Error("Ads-sync account allowlist must be a non-empty array of public account ids (fail closed).");
+  }
+  const wanted = new Set();
+  for (const raw of accountIds) {
+    const id = typeof raw === "string" ? raw.trim() : "";
+    if (!id) throw new Error("Ads-sync account allowlist contains a blank/non-string id (fail closed).");
+    if (wanted.has(id)) throw new Error(`Ads-sync account allowlist contains a duplicate id (fail closed).`);
+    if (id.startsWith("dd-secondary:")) {
+      throw new Error("Ads-sync account allowlist must not name a dd-secondary account; secondary organizations are never canary targets (fail closed).");
+    }
+    wanted.add(id);
+  }
+  const byId = new Map((discovered || []).map((account) => [account.id, account]));
+  const selected = [];
+  for (const id of wanted) {
+    const account = byId.get(id);
+    if (!account) throw new Error(`Ads-sync account allowlist id is not among the freshly discovered accounts for this scope (fail closed).`);
+    if (!account.connection || account.connection.id !== "primary") {
+      throw new Error("Ads-sync account allowlist resolved a non-primary account; refusing (fail closed).");
+    }
+    selected.push(account);
+  }
+  // Discovery order (deterministic), not allowlist order.
+  return (discovered || []).filter((account) => wanted.has(account.id));
+}
+
+export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source) => source.key), { accountIds = null } = {}) {
   const connections = getDataDoeConnections();
   const now = new Date().toISOString();
   const to = now.slice(0, 10);
@@ -332,7 +373,7 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
   if (!locked) return { status: "skipped", reason: "A country Ads sync is already running.", scope };
 
   const startedAt = Date.now();
-  const accounts = [];
+  let accounts = [];
   const publicAccountIds = new Set();
   for (const connection of connections) {
     const discovered = await fetchAccounts(connection.apiKey);
@@ -351,6 +392,10 @@ export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source
       });
     }
   }
+  // Optional EXACT public-account allowlist (controlled canary, e.g. the Gate-6 PPC prerequisite): select
+  // ONLY freshly discovered primary accounts; fail closed on any unknown/duplicate/blank/dd-secondary id.
+  // When absent (the default and every existing caller), behavior is unchanged.
+  if (accountIds != null) accounts = resolveAdsAccountAllowlist(accounts, accountIds);
   const previousStates = await getAdsSyncStates(accounts.map((account) => account.id));
   const states = new Map(previousStates.map((state) => [`${state.account_id}|${state.source_key}`, state]));
   const summary = { status: "completed", scope, accounts: accounts.length, rows: 0, sources: {}, deferred: false };

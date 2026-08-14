@@ -22,6 +22,7 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, runStagedSourceCycle, sourceJobOwnerId;
+let DERIVE_TIMEOUT_SAFE_SLICE_DAYS;
 let planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr, splitDateRangeByDays;
 
 const ID = "A1";
@@ -52,11 +53,22 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// One single-account fragment per source over [FROM, ASOF]; catalog is no-date.
+// Returns is TIMEOUT-SAFE SLICED (<=7-day slices over [FROM, ASOF] -- the shape the derive now requires),
+// each raw dated row distributed into its own slice; settlements/traffic stay one grouped whole-window
+// fragment each (grouped WITHOUT date -- not sliceable); catalog is no-date.
 function retPlanned({ returns = [], settlements = [], traffic = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
   const add = (key, from, to, data) => { const f = frag(key, from, to, ids); planned.push(f); rows[f.requestHash] = data; };
-  add("returns-leakage:returns", FROM, ASOF, returns);
+  // NEWEST-FIRST slices (returns is fetched date DESC): the concatenation of per-slice rows reproduces the
+  // former whole-window DESC order exactly.
+  const slices = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
+  slices.forEach((slice, i) => {
+    const inSlice = returns.filter((r) => typeof r.date === "string" && r.date >= slice.from && r.date <= slice.to);
+    // Rows whose date matches NO slice (malformed/out-of-window fixtures) land in the FIRST slice so the
+    // derive's per-slice row-window binding still sees -- and rejects -- them (fail-closed test paths).
+    const orphans = i === 0 ? returns.filter((r) => !(typeof r.date === "string" && slices.some((w) => r.date >= w.from && r.date <= w.to))) : [];
+    add("returns-leakage:returns", slice.from, slice.to, [...inSlice, ...orphans]);
+  });
   add("returns-leakage:settlements", FROM, ASOF, settlements);
   add("returns-leakage:traffic", FROM, ASOF, traffic);
   add("returns-leakage:catalog", null, null, catalog);
@@ -472,18 +484,25 @@ const resolveFromPlan = (plan) => () => ({
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 const srcOf = (plan, key) => plan.reportRequests[0].sources.find((s) => s.requestKey === key);
 
-test("22. default AND explicit planning include returns-leakage; the plan holds exactly four canonical jobs with exact windows/deps/owner/context", () => {
+test("22. default AND explicit planning include returns-leakage; the plan holds the sliced returns sequence + three canonical single-window jobs", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("returns-leakage"), "returns-leakage is a default generic report key");
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "returns-leakage"), "DEFAULT plan includes returns-leakage");
   const plan = shadowPlan(ACCTS, ["returns-leakage"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "returns-leakage");
-  assert.equal(plan.sourceJobs.length, 4, "exactly four deduplicated canonical source jobs");
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic"]) {
-    assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [FROM, ASOF], `${key} window asOf-59d..asOf`);
+  // GOLDEN (Gate-6 timeout remediation): returns is <=7-day sliced NEWEST-FIRST; settlements/traffic/catalog
+  // stay one job each. Total deduplicated jobs = slices + 3.
+  const expectedSlices = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
+  const retJobs = plan.reportRequests[0].sources.filter((s) => s.requestKey === "returns-leakage:returns");
+  assert.deepEqual(retJobs.map((s) => ({ from: s.from, to: s.to })), expectedSlices, "returns = the exact newest-first <=7d slice sequence");
+  assert.equal(retJobs[0].to, ASOF, "newest slice first");
+  assert.equal(retJobs[retJobs.length - 1].from, FROM, "oldest slice last; exact original coverage");
+  assert.equal(plan.sourceJobs.length, expectedSlices.length + 3, "sliced returns + settlements + traffic + catalog");
+  for (const key of ["returns-leakage:settlements", "returns-leakage:traffic"]) {
+    assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [FROM, ASOF], `${key} window asOf-59d..asOf (grouped -- unsliced)`);
   }
   assert.deepEqual([srcOf(plan, "returns-leakage:catalog").from, srcOf(plan, "returns-leakage:catalog").to], [null, null], "no-date catalog");
   const rj = plan.reportJobs.find((j) => j.reportKey === "returns-leakage");
-  assert.equal(rj.dependsOn.length, 4, "report depends on all four canonical sources");
+  assert.equal(rj.dependsOn.length, expectedSlices.length + 3, "report depends on every slice + the three canonical sources");
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort());
   assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
   const jobs = resolveFromPlan(plan)().sourceJobs;
@@ -600,12 +619,13 @@ test("29. primary-only: a stale dd-secondary account is skipped read-only with Z
   const r = await runGeneric(store, dd, plan);
   const jobs = store.listSourceJobs(r.cycleId);
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
-  assert.equal(jobs.length, 4, "exactly the four primary-account canonical jobs ran");
+  const sliceCount = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).length;
+  assert.equal(jobs.length, sliceCount + 3, "exactly the primary-account canonical jobs ran (sliced returns + 3)");
 });
 
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
-  ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
+  ({ deriveReportSnapshot, DERIVE_TIMEOUT_SAFE_SLICE_DAYS } = await import("../lib/server/sync/report-derivation.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ plannedSourceJob, runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));

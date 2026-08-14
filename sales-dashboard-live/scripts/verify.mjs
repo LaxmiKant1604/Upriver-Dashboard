@@ -43,6 +43,7 @@ const SUITES = [
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",
+  "test:timeout-slicing",
   "build:check",
 ];
 

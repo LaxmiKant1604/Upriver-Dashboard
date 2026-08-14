@@ -51,7 +51,7 @@ import {
 // planMonthWindows/addDaysStr are shared dependency-free window helpers (byte-identical to the
 // api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
 // keeps the pure derivation graph free of any DataDoe transport / Supabase import.
-import { planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
+import { planMonthWindows, addDaysStr, splitDateRangeByDays, splitDateRangeByMonth, isFullCalendarMonthWindow } from "../date-windows.js";
 // PURE typed PPC coverage contract (server-only loader, no transport import): re-enforced here so the derive
 // never folds/saves a PPC snapshot on an injected context that lacks or contradicts the durable-coverage gate.
 import { validatePpcSourceCoverage } from "./ppc-ads-loader.js";
@@ -223,6 +223,27 @@ function validateOrderedSingleAccountWindows(source, expected, rawSellerId, key)
   return frags;
 }
 
+// Gate-6 Cycle-1 timeout remediation -- the derive-side contract for TIMEOUT-SAFE SLICED sources. Must stay
+// equal to report-planner.js TIMEOUT_SAFE_SLICE_DAYS (asserted by the slicing parity tests; report-derivation
+// cannot import report-planner without creating an import cycle). The expected fragment sequence is RECOMPUTED
+// here from the report's own window facts -- never trusted from the planner/caller.
+export const DERIVE_TIMEOUT_SAFE_SLICE_DAYS = 7;
+
+// Validate a timeout-safe SLICED dated source: fragments must be EXACTLY the recomputed expected slice
+// sequence (ordered, positional -- validateOrderedSingleAccountWindows rejects reordered/duplicate/partial/
+// extra/missing/cross-account/wrong-window), AND every fragment's rows must each be a plain object whose real
+// calendar date lies inside THAT fragment's own window (a row outside its own slice -- even if inside the
+// overall range -- is rejected). Returns the source's canonical concatenated rows. Throws => derive-invalid
+// => zero writes => last-known-good preserved.
+function slicedFragmentRows(source, expectedSlices, rawSellerId, label) {
+  const frags = validateOrderedSingleAccountWindows(source, expectedSlices, rawSellerId, label);
+  for (const f of frags) {
+    if (!Array.isArray(f.rows)) throw new Error(`${label} fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
+    assertRowsInWindow(f.rows, f.from, f.to, `${label} slice ${f.from}..${f.to}`);
+  }
+  return source.rows;
+}
+
 // Sales Movers catalog: exactly ONE single-account NO-DATE fragment (from === null, to === null). A dated
 // or multi/zero fragment throws => derive-invalid => last-known-good preserved.
 function noDateFragmentRows(source, key, rawSellerId) {
@@ -360,7 +381,21 @@ const REGISTRY = {
     // the planned account/brand/from/to scope (the snapshot identity stays in the planned scope).
     derivedContextKeys: ["adsCoverage"],
     derive: ({ sources, context }) => {
-      const supersetRows = sources["daily-reporting:asin-day-superset"].rows;
+      // Timeout-safe sliced superset: RECOMPUTE the expected <=7-day-within-month slice sequence from the
+      // planned window and accept ONLY exactly that ordered single-account sequence, every row bound to its
+      // own fragment window. The superset rows are per-day grouped, so the concatenation is IDENTICAL to the
+      // former whole-month fetch (proven in the slicing parity tests).
+      const winFrom = context.from != null ? String(context.from) : "";
+      const winTo = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(winFrom) || !isValidCalendarDate(winTo) || winFrom > winTo) {
+        throw new Error("daily-reporting derivation requires an authoritative planned from/to window.");
+      }
+      const expectedSlices = splitDateRangeByMonth(winFrom, winTo)
+        .flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
+      const supersetRows = slicedFragmentRows(
+        sources["daily-reporting:asin-day-superset"], expectedSlices,
+        context.rawSellerId != null ? String(context.rawSellerId) : null, "daily-reporting:asin-day-superset",
+      );
       const catalogRows = sources["daily-reporting:catalog"].rows;
       const brand = context.brand ?? "ALL";
       // Named-brand path: catalog ASIN->brand join, folded to one row/day, NO ads (like the route).
@@ -482,18 +517,36 @@ const REGISTRY = {
       const from = context.from ?? null;
       const to = context.to ?? null;
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
-      const orderFrags = sources["reconciliation:order-lines"].fragments || [];
-      const settleFrags = sources["reconciliation:settlements"].fragments || [];
-      const catalogFrags = sources["reconciliation:catalog"].fragments || [];
-      const orderCheck = validateSkuPlMonthlyWindows({ from, to, windows: orderFrags.map((f) => ({ from: f.from, to: f.to, sellerOrVendorIds: f.sellerOrVendorIds })) });
-      if (!orderCheck.ok) throw new Error(`reconciliation order-lines six-complete-calendar-month contract violated (${orderCheck.reason}); snapshot blocked.`);
-      const settleCheck = validateSkuPlMonthlyWindows({ from, to, windows: settleFrags.map((f) => ({ from: f.from, to: f.to, sellerOrVendorIds: f.sellerOrVendorIds })) });
-      if (!settleCheck.ok) throw new Error(`reconciliation settlements six-complete-calendar-month contract violated (${settleCheck.reason}); snapshot blocked.`);
-      // One account across BOTH sources; never cross-account/organization. When a rawSellerId is
-      // planned it is authoritative and both sources must match it.
-      if (orderCheck.accountId !== settleCheck.accountId) throw new Error("reconciliation orders and settlements resolve different accounts; snapshot blocked.");
-      if (rawSellerId != null && orderCheck.accountId !== rawSellerId) throw new Error("reconciliation fragments do not match the planned account; snapshot blocked.");
+      // SIX-COMPLETE-CALENDAR-MONTH integrity now lives on the CONTEXT window (the fragment shape changed to
+      // timeout-safe <=7-day slices): from..to must still span exactly six complete consecutive calendar
+      // months -- the same strict month-set the pre-slicing validator enforced on the fragments themselves.
+      if (!isValidCalendarDate(from) || !isValidCalendarDate(to) || from > to) {
+        throw new Error("reconciliation six-complete-calendar-month contract violated (invalid-context-window); snapshot blocked.");
+      }
+      const expectedMonths = splitDateRangeByMonth(from, to);
+      if (expectedMonths.length !== 6 || expectedMonths.some((w) => !isFullCalendarMonthWindow(w))) {
+        throw new Error("reconciliation six-complete-calendar-month contract violated (not-six-complete-calendar-months); snapshot blocked.");
+      }
+      // Timeout-safe sliced orders + settlements: EXACTLY the recomputed <=7-day-within-month slice sequence
+      // (ordered, single-account, no duplicate/missing/extra/reordered/partial/cross-account fragment), every
+      // per-day-grouped row bound to its own slice window. Concatenation is IDENTICAL to the former
+      // whole-month fetch (proven in the slicing parity tests); month bucketing folds from row.date.
+      const expectedSlices = expectedMonths.flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
+      const orderRows = slicedFragmentRows(sources["reconciliation:order-lines"], expectedSlices, rawSellerId, "reconciliation:order-lines");
+      const settlementRows = slicedFragmentRows(sources["reconciliation:settlements"], expectedSlices, rawSellerId, "reconciliation:settlements");
+      // One account across BOTH sources; never cross-account/organization. slicedFragmentRows already pins
+      // every fragment to the PLANNED rawSellerId when planned; this cross-source check also fails closed
+      // when no rawSellerId was planned (defense in depth -- the two sources must still agree).
+      const accountsSeen = new Set();
+      for (const s of [sources["reconciliation:order-lines"], sources["reconciliation:settlements"]]) {
+        for (const f of s.fragments || []) {
+          const ids = f && f.sellerOrVendorIds;
+          if (Array.isArray(ids) && ids.length === 1) accountsSeen.add(String(ids[0]).trim());
+        }
+      }
+      if (accountsSeen.size !== 1) throw new Error("reconciliation orders and settlements resolve different accounts; snapshot blocked.");
       // Catalog: exactly ONE single-account fragment spanning the full six-month window.
+      const catalogFrags = sources["reconciliation:catalog"].fragments || [];
       const catFrag = catalogFrags.length === 1 ? catalogFrags[0] : null;
       const catIds = catFrag && catFrag.sellerOrVendorIds;
       const catOk = !!catFrag && catFrag.from === from && catFrag.to === to
@@ -502,9 +555,9 @@ const REGISTRY = {
       if (!catOk) throw new Error("reconciliation catalog must be exactly one single-account full-range fragment; snapshot blocked.");
       return reconciliationPayload({
         from, to,
-        months: orderCheck.months,
-        orderRows: sources["reconciliation:order-lines"].rows,
-        settlementRows: sources["reconciliation:settlements"].rows,
+        months: expectedMonths.map((m) => m.from.slice(0, 7)),
+        orderRows,
+        settlementRows,
         catalogRows: sources["reconciliation:catalog"].rows,
       });
     },
@@ -791,16 +844,20 @@ const REGISTRY = {
           throw deriveError(`returns-leakage ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
         }
       }
-      // Returns / Settlements / Traffic: exactly one single-account fragment each over [asOf-59d, asOf].
-      const returnRows = singleAccountFragmentRows(sources["returns-leakage:returns"], "returns-leakage:returns", rawSellerId, from, asOf);
+      // Returns: timeout-safe SLICED raw grain -- EXACTLY the recomputed <=7-day slice sequence over
+      // [asOf-59d, asOf], NEWEST-FIRST (returns is fetched date DESC; each date lives in exactly one slice,
+      // so newest-first slices with DESC rows concatenate to the former whole-window DESC order exactly),
+      // single-account, every raw returned-item row bound to its OWN slice window.
+      const expectedReturnSlices = splitDateRangeByDays(from, asOf, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
+      const returnRows = slicedFragmentRows(sources["returns-leakage:returns"], expectedReturnSlices, rawSellerId, "returns-leakage:returns");
+      // Settlements / Traffic: GROUPED WITHOUT date (whole-window aggregate rows -- NOT sliceable), exactly
+      // one single-account fragment each over [asOf-59d, asOf].
       const settlementRows = singleAccountFragmentRows(sources["returns-leakage:settlements"], "returns-leakage:settlements", rawSellerId, from, asOf);
       const trafficRows = singleAccountFragmentRows(sources["returns-leakage:traffic"], "returns-leakage:traffic", rawSellerId, from, asOf);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["returns-leakage:catalog"], "returns-leakage:catalog", rawSellerId);
-      // Returns are RAW grain (one row = one returned item): every row must be a plain object with a real
-      // calendar date inside [asOf-59d, asOf] -- a malformed/impossible/future/out-of-window row => invalid
-      // (never silently filtered). Settlements + Traffic are GROUPED and Catalog is NO-DATE => plain objects.
-      assertRowsInWindow(returnRows, from, asOf, "returns-leakage returns");
+      // Settlements + Traffic are GROUPED and Catalog is NO-DATE => plain objects (the returns rows were
+      // already per-slice window-bound above -- a stronger check than the former whole-range bound).
       assertPlainObjectRows(settlementRows, "returns-leakage settlements");
       assertPlainObjectRows(trafficRows, "returns-leakage traffic");
       assertPlainObjectRows(catalogRows, "returns-leakage catalog");

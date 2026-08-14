@@ -90,7 +90,17 @@ function seededDataDoe(faithful = {}) {
   const baseDownload = dd.download;
   dd.download = async (job, exportId) => {
     fetched.push(job.requestKey || "");
-    return Object.prototype.hasOwnProperty.call(faithful, job.requestKey || "") ? faithful[job.requestKey] : baseDownload(job, exportId);
+    if (!Object.prototype.hasOwnProperty.call(faithful, job.requestKey || "")) return baseDownload(job, exportId);
+    const rows = faithful[job.requestKey];
+    // Timeout-safe sliced sources fetch one export PER SLICE; a dated seeded row belongs only to the slice
+    // whose window contains it (exactly what the real DataDoe export returns for that window). The canonical
+    // job carries its window under fetchParams (plannedSourceJob shape).
+    const from = job.fetchParams ? job.fetchParams.from : job.from;
+    const to = job.fetchParams ? job.fetchParams.to : job.to;
+    if (from != null && to != null && Array.isArray(rows)) {
+      return rows.filter((r) => typeof (r && r.date) !== "string" || (r.date >= from && r.date <= to));
+    }
+    return rows;
   };
   dd.fetchedKeys = () => fetched.slice();
   return dd;

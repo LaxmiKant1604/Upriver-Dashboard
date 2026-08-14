@@ -258,7 +258,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: RECON_ORDER_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      windowKind: "per-month:6 complete calendar months",
+      // Timeout-safe slicing (Gate-6 Cycle-1): <=7-day slices WITHIN each of the six calendar months. Rows
+      // are per-day grouped, so slices concatenate identically; whole-month fragments TIMEOUTed.
+      windowKind: "per-slice(<=7d, within each of the 6 complete calendar months)",
     },
     {
       requestKey: "reconciliation:settlements",
@@ -270,7 +272,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: RECON_SETTLEMENT_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      windowKind: "per-month:6 complete calendar months",
+      // Timeout-safe slicing (Gate-6 Cycle-1): <=7-day slices WITHIN each of the six calendar months. Rows
+      // are per-day grouped, so slices concatenate identically; whole-month fragments TIMEOUTed.
+      windowKind: "per-slice(<=7d, within each of the 6 complete calendar months)",
     },
     {
       requestKey: "reconciliation:catalog",
@@ -300,7 +304,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: DAILY_SALES_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      windowKind: "per-month:monthStart(asOf)-150..asOf",
+      // Timeout-safe slicing (Gate-6 Cycle-1): <=7-day slices WITHIN each calendar month. Rows are per-day
+      // grouped, so the slices concatenate to the identical monthly superset; whole-month fragments TIMEOUTed.
+      windowKind: "per-slice(<=7d, within each calendar month):monthStart(asOf)-150..asOf",
     },
     {
       requestKey: "daily-reporting:catalog",
@@ -616,7 +622,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "DESC",
       // Raw grain: the Returns source has no quantity column, so one row IS one
       // returned item and counting rows is the only correct count.
-      windowKind: "range:asOf-59d..asOf (RETURNS.historyDays)",
+      // Timeout-safe slicing (Gate-6 Cycle-1): <=7-day slices of the 60-day range. Raw dated rows
+      // concatenate identically; the single 60-day range TIMEOUTed.
+      windowKind: "per-slice(<=7d):asOf-59d..asOf (RETURNS.historyDays)",
       strict: true,
     },
     {

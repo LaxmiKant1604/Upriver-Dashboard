@@ -404,13 +404,16 @@ test("reconciliation catalog uses PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT, n
 });
 
 /* --- executable parity: daily-reporting (ASIN/day superset + catalog) --- */
-test("daily-reporting ASIN/day superset matches DAILY_BRAND_SALES_* constants (monthly-segmented)", () => {
+test("daily-reporting ASIN/day superset matches DAILY_BRAND_SALES_* constants (timeout-safe sliced within months)", () => {
   const c = byKey(daily, "daily-reporting:asin-day-superset");
   assert.deepEqual(c.columns, constArray("DAILY_BRAND_SALES_COLUMNS"));
   assert.deepEqual(c.groupBy, constArray("DAILY_BRAND_SALES_GROUP_BY"));
   assert.deepEqual(c.aggregations, constAggregations("DAILY_SALES_AGGREGATIONS"));
-  assert.equal(c.limit, constNumber("DAILY_BRAND_ROW_LIMIT")); // strict per-month cap
-  assert.ok(c.windowKind.startsWith("per-month"), "superset must be monthly-segmented");
+  assert.equal(c.limit, constNumber("DAILY_BRAND_ROW_LIMIT")); // strict per-slice cap (stricter than per-month)
+  // GOLDEN (Gate-6 timeout remediation): the scheduler slices <=7d WITHIN each calendar month; the rows are
+  // per-day grouped so the slices concatenate to the identical superset. (The live browser route stays
+  // monthly-segmented -- an intentional, documented divergence of the scheduler's request windows.)
+  assert.ok(c.windowKind.startsWith("per-slice(<=7d, within each calendar month)"), "superset must be timeout-safe sliced within months");
 });
 test("daily-reporting catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT; no compact all-brand export", () => {
   const c = byKey(daily, "daily-reporting:catalog");

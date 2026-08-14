@@ -30,6 +30,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 // Assigned in main() after the dummy env is set.
 let assembleSources, deriveReportSnapshot;
+let splitDateRangeByDays, DERIVE_TIMEOUT_SAFE_SLICE_DAYS;
 let reconciliationOrders, reconciliationSettlements, reconciliationPayload;
 let planReconciliation, resolveAccountScope;
 
@@ -64,16 +65,20 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// The six monthly order + settlement fragments (empty by default) + one full-range catalog.
+// The TIMEOUT-SAFE SLICED order + settlement fragments (<=7-day slices WITHIN each of the six months --
+// the shape the derive now requires) + one full-range catalog. Month-keyed fixture rows are distributed
+// into their slice by row.date, so the concatenation equals the former monthly fixture exactly.
 function reconPlanned({ orderRowsByMonth = {}, settleRowsByMonth = {}, catalogRows = [], ids = [ID] } = {}) {
   const planned = [];
   const rows = {};
   for (const m of MONTHS) {
     const w = monthWindow(m);
-    const of = frag("reconciliation:order-lines", w.from, w.to, ids);
-    planned.push(of); rows[of.requestHash] = orderRowsByMonth[m] || [];
-    const sf = frag("reconciliation:settlements", w.from, w.to, ids);
-    planned.push(sf); rows[sf.requestHash] = settleRowsByMonth[m] || [];
+    for (const slice of splitDateRangeByDays(w.from, w.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS)) {
+      const of = frag("reconciliation:order-lines", slice.from, slice.to, ids);
+      planned.push(of); rows[of.requestHash] = (orderRowsByMonth[m] || []).filter((r) => r.date >= slice.from && r.date <= slice.to);
+      const sf = frag("reconciliation:settlements", slice.from, slice.to, ids);
+      planned.push(sf); rows[sf.requestHash] = (settleRowsByMonth[m] || []).filter((r) => r.date >= slice.from && r.date <= slice.to);
+    }
   }
   const cf = frag("reconciliation:catalog", FROM, TO, ids);
   planned.push(cf); rows[cf.requestHash] = catalogRows;
@@ -269,12 +274,19 @@ test("reconciliation: derivation is idempotent (same inputs -> identical payload
 
 group("reconciliation: planner (single account, six months, deterministic hashes)");
 
-test("planReconciliation: emits six order + six settlement months + one full-range catalog for ONE account", () => {
+test("planReconciliation: emits timeout-safe <=7d slices within the six months + one full-range catalog for ONE account", () => {
   const req = planReconciliation({ accountId: ID, country: "US", currency: "USD", connections: PL_CONN, asOf: "2025-08-10" });
   assert.equal(req.reportKey, "reconciliation");
   const byKey = (k) => req.sources.filter((s) => s.requestKey === k);
-  assert.equal(byKey("reconciliation:order-lines").length, 6);
-  assert.equal(byKey("reconciliation:settlements").length, 6);
+  // GOLDEN (Gate-6 timeout remediation): each of the six months is sliced into <=7-day fragments (the exact
+  // expected sequence the derive recomputes). Feb 2025 (28d) -> 4, 30d months -> 5, 31d months -> 5.
+  const expectedSlices = MONTHS.flatMap((m) => splitDateRangeByDays(monthWindow(m).from, monthWindow(m).to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
+  assert.deepEqual(byKey("reconciliation:order-lines").map((s) => ({ from: s.from, to: s.to })), expectedSlices);
+  assert.deepEqual(byKey("reconciliation:settlements").map((s) => ({ from: s.from, to: s.to })), expectedSlices);
+  // ordered, gapless, non-overlapping, exact original coverage; every slice inside ONE calendar month.
+  assert.equal(expectedSlices[0].from, "2025-02-01");
+  assert.equal(expectedSlices[expectedSlices.length - 1].to, "2025-07-31");
+  for (const s of expectedSlices) assert.ok(s.from <= s.to && s.from.slice(0, 7) === s.to.slice(0, 7));
   assert.equal(byKey("reconciliation:catalog").length, 1);
   // Every fragment is single-account (one raw seller id).
   assert.ok(req.sources.every((s) => s.sellerOrVendorIds.length === 1 && s.sellerOrVendorIds[0] === ID));
@@ -301,7 +313,8 @@ test("planReconciliation: fails closed on a missing account currency", () => {
 async function main() {
   mark("main(): loading reconciliation modules");
   ({ assembleSources } = await import("../lib/server/sync/report-worker.js"));
-  ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
+  ({ deriveReportSnapshot, DERIVE_TIMEOUT_SAFE_SLICE_DAYS } = await import("../lib/server/sync/report-derivation.js"));
+  ({ splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
   ({ reconciliationOrders, reconciliationSettlements, reconciliationPayload } = await import("../lib/server/reports/derivation-core.js"));
   ({ planReconciliation, resolveAccountScope } = await import("../lib/server/sync/report-planner.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");

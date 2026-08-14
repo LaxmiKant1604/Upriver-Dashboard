@@ -76,6 +76,22 @@ const RET_WINDOW_DAYS = 60;
 const LH_SALES_WINDOW_DAYS = 30;
 const LH_INVENTORY_LOOKBACK_DAYS = 10;
 
+// Gate-6 Cycle-1 timeout remediation: DataDoe terminally TIMEOUTed the largest dated exports (whole-month
+// Sales&Traffic/order/settlement fragments, the 60-day Returns range). For sources whose rows are PER-DAY
+// (their groupBy -- or raw grain -- includes `date`), any partition of the window partitions the output rows
+// EXACTLY, so smaller non-overlapping fragments concatenate to the identical fold. These sources now plan
+// bounded <=7-day slices (the established buy-box slicing policy, splitDateRangeByDays -- ordered, gapless,
+// non-overlapping, exact original from/to). Month-scoped sources slice WITHIN each calendar month so every
+// fragment still lies in exactly one month (reconciliation's month-set integrity is preserved by
+// construction). Sources whose groupBy EXCLUDES date (whole-window aggregate rows: sku-pl monthly-profit,
+// fba-plan monthly-units, listing-health sales, sales-movers traffic/ads, returns settlements/traffic) and
+// no-date/current-state sources are NOT sliced -- splitting would change their row identity/semantics.
+// This is an INTENTIONAL request-window change: the affected request_hashes change and are golden-tested.
+const TIMEOUT_SAFE_SLICE_DAYS = 7;
+const sliceWindowByDays = (from, to) => splitDateRangeByDays(from, to, TIMEOUT_SAFE_SLICE_DAYS);
+const sliceMonthsByDays = (months) => months.flatMap((m) => sliceWindowByDays(m.from, m.to));
+export { TIMEOUT_SAFE_SLICE_DAYS };
+
 export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["brand-sales", "daily-reporting", "content-changes", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss", "returns-leakage", "listing-health"]);
 
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
@@ -222,7 +238,9 @@ export function planDailyReporting({ accountId, country, currency, connections, 
   const from = monthBackStr(asOf, DAILY_MONTHS_BACK);
   const to = String(asOf);
   const windowsByRequestKey = {
-    "daily-reporting:asin-day-superset": splitDateRangeByMonth(from, to),
+    // Timeout-safe slicing: monthly fragments TIMEOUTed on large accounts. Rows are per-day grouped
+    // ([date, seller, asin]), so <=7-day slices WITHIN each month concatenate to the identical superset.
+    "daily-reporting:asin-day-superset": sliceMonthsByDays(splitDateRangeByMonth(from, to)),
     "daily-reporting:catalog": [{ from, to }],
   };
   const sources = reportSourceRequestHashes({
@@ -282,8 +300,12 @@ export function planReconciliation({ accountId, country, currency, connections, 
   const span = sixCompleteCalendarMonths(asOf);
   if (!span) throw new Error(`reconciliation planner could not compute six complete calendar months from asOf "${asOf}".`);
   const windowsByRequestKey = {
-    "reconciliation:order-lines": span.months,
-    "reconciliation:settlements": span.months,
+    // Timeout-safe slicing: whole-month order/settlement fragments TIMEOUTed on large accounts. Both are
+    // per-day grouped (their groupBy includes `date`), so <=7-day slices WITHIN each of the six calendar
+    // months concatenate to the identical fold; every fragment lies in exactly one month, preserving the
+    // six-complete-month integrity by construction. The catalog stays one full-range fragment.
+    "reconciliation:order-lines": sliceMonthsByDays(span.months),
+    "reconciliation:settlements": sliceMonthsByDays(span.months),
     "reconciliation:catalog": [{ from: span.from, to: span.to }],
   };
   const sources = reportSourceRequestHashes({
@@ -572,7 +594,13 @@ export function planReturnsLeakage({ accountId, country, currency, connections, 
   const end = String(asOf);
   const from = addDaysStr(end, -(RET_WINDOW_DAYS - 1));
   const windowsByRequestKey = {
-    "returns-leakage:returns": [{ from, to: end }],
+    // Timeout-safe slicing: the single 60-day raw Returns range TIMEOUTed on a large account. Returns rows
+    // are RAW returned-item grain with a real per-row date, so <=7-day slices concatenate to the identical
+    // row set. Returns is fetched date DESC, so the slices are ordered NEWEST-FIRST: each slice's rows
+    // arrive DESC and every date lives in exactly one slice, so the concatenation reproduces the former
+    // whole-window DESC order exactly. Settlements/traffic are GROUPED WITHOUT date (whole-window aggregate
+    // rows) and the catalog is no-date -- none of those can be sliced; they stay single-window.
+    "returns-leakage:returns": sliceWindowByDays(from, end).reverse(),
     "returns-leakage:settlements": [{ from, to: end }],
     "returns-leakage:traffic": [{ from, to: end }],
     "returns-leakage:catalog": [{ from: null, to: null }],

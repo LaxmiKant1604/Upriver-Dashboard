@@ -39,7 +39,7 @@ let SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS;
 let classifyDirectoryAccounts, CONNECTION_UNAVAILABLE;
 let makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY;
 let runSourceJobs, reportControlCatalog, enabledReportKeys;
-let monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths;
+let monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, splitDateRangeByDays, addDaysStr;
 let paginateAdDailyMetrics, isSchemaMissingError, getDailyAdsCoverage, recordAdsCoverageWindows;
 let liveMonthBack;
 
@@ -301,13 +301,24 @@ test("buildShadowReportPlan (primary-only): a primary account plans normally; a 
 
 group("planner: exact Daily calendar window == live monthBack(asOf, 5).from .. asOf");
 
-test("planner: Daily plan spans the exact six-calendar-month window with monthly segmentation", async () => {
+test("planner: Daily plan spans the exact six-calendar-month window with timeout-safe <=7d-within-month slicing", async () => {
   const req = plDailyRequest("A1", "US", "USD");
   assert.equal(req.context.from, "2026-03-01", "first day of the month five months back (NOT a 150-day approximation)");
   assert.equal(req.context.to, PL_AS_OF);
-  const expected = splitDateRangeByMonth("2026-03-01", PL_AS_OF);
+  // GOLDEN (Gate-6 timeout remediation): superset fragments are <=7-day slices WITHIN each calendar month --
+  // ordered, gapless, non-overlapping, exact original coverage. This is the INTENTIONAL window change that
+  // moves the superset request_hashes off the whole-month identities.
+  const expected = splitDateRangeByMonth("2026-03-01", PL_AS_OF)
+    .flatMap((m) => splitDateRangeByDays(m.from, m.to, 7));
   const superset = req.sources.filter((s) => s.requestKey === "daily-reporting:asin-day-superset");
-  assert.deepEqual(superset.map((s) => ({ from: s.from, to: s.to })), expected, "one superset fragment per calendar month");
+  assert.deepEqual(superset.map((s) => ({ from: s.from, to: s.to })), expected, "<=7-day slices within each calendar month");
+  // exact coverage invariants: starts at from, ends at to, contiguous, each slice <= 7 days, month-bounded.
+  assert.equal(superset[0].from, "2026-03-01");
+  assert.equal(superset[superset.length - 1].to, PL_AS_OF);
+  for (let i = 1; i < superset.length; i += 1) assert.equal(superset[i].from, addDaysStr(superset[i - 1].to, 1), "contiguous, no gap/overlap");
+  for (const s of superset) {
+    assert.ok(s.from <= s.to && s.from.slice(0, 7) === s.to.slice(0, 7), "each slice lies inside one calendar month");
+  }
   const catalog = req.sources.filter((s) => s.requestKey === "daily-reporting:catalog");
   assert.deepEqual({ from: catalog[0].from, to: catalog[0].to }, { from: "2026-03-01", to: PL_AS_OF });
   assert.deepEqual([...new Set(req.sources.map((s) => s.requestKey))].sort(), ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
@@ -576,7 +587,7 @@ async function main() {
   ({ makeDailyAdsContextLoader, canonicalizeAdRows, buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } = await import("../lib/server/sync/daily-ads-loader.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ reportControlCatalog, enabledReportKeys } = await import("../lib/server/sync/report-controls.js"));
-  ({ monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths } = await import("../lib/server/date-windows.js"));
+  ({ monthBackStr, splitDateRangeByMonth, sixCompleteCalendarMonths, splitDateRangeByDays, addDaysStr } = await import("../lib/server/date-windows.js"));
   ({ paginateAdDailyMetrics, isSchemaMissingError, getDailyAdsCoverage, recordAdsCoverageWindows } = await import("../lib/server/supabase.js"));
   ({ monthBack: liveMonthBack } = await import("../src/lib/format.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
