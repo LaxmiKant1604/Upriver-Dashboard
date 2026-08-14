@@ -321,36 +321,69 @@ async function readPersistedSourceRows(requestHash) {
   }
 }
 
-// Persist rows to the DURABLE shared source cache. Returns `true` ONLY when the row set was
-// positively saved; returns `false` on every non-persisting path -- Supabase unconfigured, the
-// cache marked temporarily unavailable, too little deadline left, an oversized payload, or a
-// save that threw. The boolean is authoritative: a manual attempt marker is retained (so a later
-// invocation resumes the same export) whenever this returns false.
+// Test-only seam: inject a fake source-cache saver so the durable-acknowledgement validation in
+// persistSourceRows can be driven fully offline (scripting saveSourceExportCache's resolved value)
+// without Supabase. Production NEVER sets this.
+let sourceCacheSaverOverride = null;
+export function __setSourceCacheSaverForTests(fn) { sourceCacheSaverOverride = fn || null; }
+
+// Positive durable-acknowledgement check for a saveSourceExportCache() result. saveSourceExportCache
+// resolves the persisted `source_export_cache` metadata row on success -- but it resolves NULL when
+// PostgREST returns no representation row, so a non-throwing call is NOT proof of a durable save.
+// Returns true ONLY when `saved` is a non-null object whose typed fields ALL match this exact request
+// identity and saved row set: request_hash, source_id, organization_fingerprint, account_scope_hash,
+// row_count, and a non-empty object_path. Any null/undefined/non-object value, or ANY mismatched
+// field, is false. Only these typed columns are compared -- no raw storage/DB payload is inspected
+// or surfaced (so no storage/database detail can leak through this check).
+export function isConfirmedSourceCacheAck(saved, { identity, sourceId, rowCount }) {
+  if (!saved || typeof saved !== "object") return false;
+  if (saved.request_hash !== identity.requestHash) return false;
+  if (saved.source_id !== String(sourceId)) return false;
+  if (saved.organization_fingerprint !== identity.organizationFingerprint) return false;
+  if (saved.account_scope_hash !== identity.accountScopeHash) return false;
+  if (saved.row_count !== rowCount) return false;
+  if (typeof saved.object_path !== "string" || saved.object_path.trim() === "") return false;
+  return true;
+}
+
+// Persist rows to the DURABLE shared source cache. Returns `true` ONLY when saveSourceExportCache
+// resolves a POSITIVELY MATCHING acknowledgement row (isConfirmedSourceCacheAck). Returns `false`
+// on every non-persisting path -- Supabase unconfigured, the cache marked temporarily unavailable,
+// too little deadline left, an oversized payload, a save that threw, OR a save that resolved
+// without a validated ack (null / empty / mismatched metadata). The boolean is authoritative: a
+// manual attempt marker is retained (so a later invocation resumes the same export with zero new
+// create-export POSTs) whenever this returns false. In-memory caching alone never confirms a
+// durable save.
 async function persistSourceRows({ identity, sourceId, rows, cacheHours }) {
-  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return false;
+  const testSaver = sourceCacheSaverOverride; // null in production
+  if (!testSaver && (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil)) return false;
   const deadlineRemaining = remainingDeadlineMs();
   if (deadlineRemaining !== null && deadlineRemaining < 3000) return false;
   const serialised = JSON.stringify({ rows });
   const payloadBytes = Buffer.byteLength(serialised, "utf8");
   if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return false;
   const expiresAt = new Date(Date.now() + cacheHours * 3600_000).toISOString();
+  let saved;
   try {
-    await saveSourceExportCache({
+    saved = await (testSaver || saveSourceExportCache)({
       ...identity,
       sourceId: String(sourceId),
       rows,
       payloadBytes,
       expiresAt,
     });
-    if (Date.now() - sourceCacheLastPrunedAt > 15 * 60_000) {
-      sourceCacheLastPrunedAt = Date.now();
-      await pruneSourceExportCache().catch(() => {});
-    }
-    return true;
   } catch {
-    sourceCacheUnavailableUntil = Date.now() + 60_000;
+    if (!testSaver) sourceCacheUnavailableUntil = Date.now() + 60_000;
     return false;
   }
+  // A non-throwing save is NOT durable confirmation: require a positively matching acknowledgement
+  // row before reporting success (which is what licenses the manual attempt marker's removal).
+  if (!isConfirmedSourceCacheAck(saved, { identity, sourceId, rowCount: rows.length })) return false;
+  if (!testSaver && Date.now() - sourceCacheLastPrunedAt > 15 * 60_000) {
+    sourceCacheLastPrunedAt = Date.now();
+    await pruneSourceExportCache().catch(() => {});
+  }
+  return true;
 }
 
 async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit, options) {

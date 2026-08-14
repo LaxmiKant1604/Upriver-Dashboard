@@ -102,6 +102,7 @@ function mkTransport({ createResult, pollThrows = null, downloadRows = [{ r: 1 }
 let runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides, ManualSourceContinuationError;
 let MANUAL_CONTINUATION_IN_PROGRESS, MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN;
 let fetchExportRows, withDataDoeDeadline, isDataDoePollPendingError, isDataDoeDeadlineError, DataDoePollPendingError, DataDoeDeadlineError;
+let isConfirmedSourceCacheAck, __setSourceCacheSaverForTests;
 let classifyDataDoeRouteError;
 
 const runAttempt = (store, transport, requestHash = "h1") => runManualSourceAttempt({
@@ -513,6 +514,121 @@ test("(non-durable fallback) without a durable store, a resumable escape is NOT 
   __setManualSourceContinuationTestOverrides(null);
 });
 
+// ================= durable-cache acknowledgement validation (persistSourceRows) =================
+
+test("(durable ack: unit) isConfirmedSourceCacheAck is true ONLY for a fully matching row", async () => {
+  const identity = { requestHash: "rh1", organizationFingerprint: "of1", accountScopeHash: "as1" };
+  const ctx = { identity, sourceId: "src-1", rowCount: 2 };
+  const good = { request_hash: "rh1", source_id: "src-1", organization_fingerprint: "of1", account_scope_hash: "as1", row_count: 2, object_path: "source-cache/v1/rh/rh1.json" };
+  assert.equal(isConfirmedSourceCacheAck(good, ctx), true, "a fully matching ack confirms");
+  // absent / malformed shapes
+  for (const bad of [null, undefined, 0, "row", 42, [], true]) {
+    assert.equal(isConfirmedSourceCacheAck(bad, ctx), false, `non-object ack (${String(bad)}) is not confirmation`);
+  }
+  assert.equal(isConfirmedSourceCacheAck({}, ctx), false, "an empty object is not confirmation");
+  // each single mismatched / missing field fails closed
+  const mism = [
+    ["wrong request_hash", { request_hash: "WRONG" }],
+    ["wrong source_id", { source_id: "WRONG" }],
+    ["wrong organization_fingerprint", { organization_fingerprint: "WRONG" }],
+    ["wrong account_scope_hash", { account_scope_hash: "WRONG" }],
+    ["wrong row_count", { row_count: 3 }],
+    ["row_count as string", { row_count: "2" }],
+    ["blank object_path", { object_path: "   " }],
+    ["empty object_path", { object_path: "" }],
+    ["missing object_path", { object_path: undefined }],
+    ["null object_path", { object_path: null }],
+  ];
+  for (const [label, override] of mism) {
+    const row = { ...good, ...override };
+    if ("object_path" in override && override.object_path === undefined) delete row.object_path;
+    assert.equal(isConfirmedSourceCacheAck(row, ctx), false, `${label}: not confirmation`);
+  }
+  // source_id is compared as String(sourceId) -- a numeric context still matches its stringified row value
+  assert.equal(isConfirmedSourceCacheAck({ ...good, source_id: "7" }, { identity, sourceId: 7, rowCount: 2 }), true, "String(sourceId) comparison");
+});
+
+// Build a fully-matching ack FROM the exact argument persistSourceRows hands the saver, so the test
+// never needs to know the computed request_hash/org/scope up front.
+const matchingAck = (arg) => ({
+  request_hash: arg.requestHash,
+  source_id: arg.sourceId,
+  organization_fingerprint: arg.organizationFingerprint,
+  account_scope_hash: arg.accountScopeHash,
+  row_count: arg.rows.length,
+  object_path: `source-cache/v1/${String(arg.requestHash).slice(0, 2)}/${arg.requestHash}.json`,
+});
+
+test("(durable ack: integration) every unconfirmed acknowledgement RETAINS the marker; a fresh invocation creates ZERO exports", async () => {
+  const badAcks = [
+    ["null ack (resolves null, no throw)", () => null],
+    ["empty object", () => ({})],
+    ["wrong request_hash", (a) => ({ ...matchingAck(a), request_hash: "WRONG-HASH" })],
+    ["wrong source_id", (a) => ({ ...matchingAck(a), source_id: "WRONG-SRC" })],
+    ["wrong organization_fingerprint", (a) => ({ ...matchingAck(a), organization_fingerprint: "WRONG-ORG" })],
+    ["wrong account_scope_hash", (a) => ({ ...matchingAck(a), account_scope_hash: "WRONG-SCOPE" })],
+    ["wrong row_count", (a) => ({ ...matchingAck(a), row_count: a.rows.length + 1 })],
+    ["blank object_path", (a) => ({ ...matchingAck(a), object_path: "   " })],
+  ];
+  let n = 0;
+  for (const [label, mk] of badAcks) {
+    n += 1;
+    resetHttp();
+    const store = fakeStore();
+    __setManualSourceContinuationTestOverrides({ enabled: true, store });
+    __setSourceCacheSaverForTests(async (arg) => mk(arg));
+    try {
+      const src = `src-ack-bad-${n}`;
+      const rows = [{ ok: n }, { ok: n * 10 }];
+      // inv1: create E1 -> COMPLETED -> download -> finishRows -> persistSourceRows(seam) => unconfirmed
+      fetchQueue = [
+        { status: 200, body: { exportId: "E1", status: "PENDING" } },
+        { status: 200, body: { status: "COMPLETED" } },
+        { status: 200, body: { rawContent: JSON.stringify(rows) } },
+      ];
+      const got1 = await fetchExportRows("kAck", src, ["a"], ["S1"], "2026-05-01", "2026-05-31", 100, {});
+      assert.deepEqual(got1, rows, `${label}: inv1 still returns rows`);
+      assert.equal(posts().length, 1, `${label}: exactly one create in inv1`);
+      const kept = [...store.rows.values()][0];
+      assert.ok(kept && kept.status === "polling" && kept.exportId === "E1", `${label}: marker RETAINED (in-memory rows never license removal)`);
+      // inv2: a separate invocation with process-local memory cleared (bypassSourceCache) -- must
+      // resume E1 through the marker and create ZERO new exports.
+      fetchQueue = [
+        { status: 200, body: { status: "COMPLETED" } },
+        { status: 200, body: { rawContent: JSON.stringify(rows) } },
+      ];
+      const got2 = await fetchExportRows("kAck", src, ["a"], ["S1"], "2026-05-01", "2026-05-31", 100, { bypassSourceCache: true });
+      assert.deepEqual(got2, rows, `${label}: inv2 returns rows`);
+      assert.equal(posts().length, 1, `${label}: invocation 2 created ZERO new exports (ONE POST total)`);
+    } finally {
+      __setManualSourceContinuationTestOverrides(null);
+      __setSourceCacheSaverForTests(null);
+    }
+  }
+});
+
+test("(durable ack: integration) a fully matching acknowledgement REMOVES the marker", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  __setSourceCacheSaverForTests(async (arg) => matchingAck(arg));
+  try {
+    const rows = [{ ok: 1 }];
+    fetchQueue = [
+      { status: 200, body: { exportId: "E1", status: "PENDING" } },
+      { status: 200, body: { status: "COMPLETED" } },
+      { status: 200, body: { rawContent: JSON.stringify(rows) } },
+    ];
+    const got = await fetchExportRows("kAck", "src-ack-good", ["a"], ["S1"], "2026-06-01", "2026-06-30", 100, {});
+    assert.deepEqual(got, rows);
+    assert.equal(posts().length, 1, "one create");
+    assert.equal(store.rows.size, 0, "a positively-matching durable ack removes the marker");
+  } finally {
+    __setManualSourceContinuationTestOverrides(null);
+    __setSourceCacheSaverForTests(null);
+  }
+});
+
 // ================= route error mapping =================
 
 test("(route mapping) retryable:true ONLY with durableContinuation===true; plain/arbitrary codes never retryable; admin-safe", async () => {
@@ -559,6 +675,7 @@ async function main() {
   ({
     fetchExportRows, withDataDoeDeadline, isDataDoePollPendingError, isDataDoeDeadlineError,
     DataDoePollPendingError, DataDoeDeadlineError,
+    isConfirmedSourceCacheAck, __setSourceCacheSaverForTests,
   } = await import("../lib/server/datadoe.js"));
   ({ classifyDataDoeRouteError } = await import("../api/datadoe.js"));
   for (const t of tests) {
