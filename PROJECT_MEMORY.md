@@ -8912,3 +8912,32 @@ CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no producti
 Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
 cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
 UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
+
+## Scheduler v2: direct unconditional guard raise + exact +/-HH:MM offset (2026-08-14)
+
+Codex re-review found 2 more findings. Fixed OFFLINE (migrations 1-4 byte-unchanged; Migration 5 still UNAPPLIED
+and byte-identical to HEAD -- no SQL change this round; no production side effect; Gate 5 NOT re-run). Commit
+8669ab2 (code/tests), then docs. Status UNCHANGED: the lifecycle fix is code-complete but NOT resolved in
+production until Migration 5 is applied via a reviewed Gate and the canary cycle reconciled (Appendix N); Gate 6
+remains BLOCKED.
+
+- FINDING 1 (direct unconditional raise per guard): ifBlockRaises previously accepted a RAISE EXCEPTION hidden
+  in a nested IF or an ELSE/ELSIF branch (it only checked the whole bounded block body). It now walks the matched
+  outer IF block tracking nesting depth (if/case/loop/begin openers; end if/case/loop + bare end closers) and
+  branch state, and accepts a raise ONLY when it is at depth 0 of the outer IF, on its INITIAL true branch
+  (before any depth-0 ELSE/ELSIF), and not inside a nested block. Applied independently to cycle-id-immutability,
+  missing-parent, and terminal-parent. New failures proven against the ACTUAL Migration 5: raise nested in an
+  inner IF; raise in ELSE; raise in ELSIF (plus the prior moved-after-END-IF and comment/string fakes). The real
+  guard (a direct unconditional raise on each initial branch) still passes.
+- FINDING 2 (exact RFC3339 timezone syntax): the finished_at regex now accepts only Z/z OR a strict +HH:MM /
+  -HH:MM numeric offset (the colon and both offset digits are REQUIRED). Rejects +0530, -0530, +05, -05; keeps
+  +05:30 and -05:30. All calendar/time/finite-instant checks retained.
+- Tests: cycle-finalize-wiring 13 (+1 BRANCH-AWARE guard-mutation test: nested-IF/ELSE/ELSIF raise for all three
+  guards; the finished_at matrix extended with the colon-less/truncated offset rejects and a +05:30 accept).
+  node --check clean; npm run verify 35/35 incl. build:check; git diff --check clean; migrations 1-4 byte-unchanged
+  (1328bc0f/0750a155/544557fb/49628c8d); Migration 5 UNAPPLIED.
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
+UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
