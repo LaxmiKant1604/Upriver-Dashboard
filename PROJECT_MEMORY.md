@@ -8840,3 +8840,42 @@ CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no producti
 Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
 cycle + its rows are UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql is
 PREPARED + UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
+
+## Scheduler v2: strict finalize-acknowledgement validation + exact Migration-5 trigger/function audit (2026-08-14)
+
+Codex re-review of the finalization wiring found 2 findings. Fixed OFFLINE (migrations 1-4 byte-unchanged;
+Migration 5 still UNAPPLIED; no production side effect; Gate 5 NOT re-run). Commit ca232bf (code/tests), then
+docs. Overall status UNCHANGED: the lifecycle fix is code-complete but the defect is NOT resolved in production
+until Migration 5 is applied via a reviewed Gate and the canary cycle reconciled (Appendix N); Gate 6 remains
+BLOCKED.
+
+- FINDING 1 (fail-closed finalization acknowledgement): supabase.js now has ONE shared validateFinalizeResponse()
+  that every finalize response passes through. finalized/already-terminal require a plain cycle object with
+  id === requested cycleId, status in succeeded|partial|failed, a valid nonblank finished_at, and all six
+  source/report counters as safe nonnegative integers with succeeded+failed <= total per family (rejects
+  missing/string/fractional/negative/unsafe/incoherent/wrong-cycle/running/null). open-work now also requires a
+  validated cycle (matching id, status running, finished_at null, coherent counters) -- so Migration 5's RPC was
+  updated to return to_jsonb(v_cycle) for open-work too. not-found/invalid-status must carry NO cycle. Unknown
+  extra fields ignored; unknown dispositions + contradictory combos throw safely. Dispatcher relies only on the
+  validated result and now throws on a malformed positive ack (finalized/already-terminal without a terminal
+  cycle) -- never leaves drained=true. Removed the old test that accepted every disposition with cycle:null;
+  added the full regression matrix + a dispatcher malformed-positive fail-closed test.
+- FINDING 2 (exact Migration-5 trigger/function audit): schema-contract.triggerDeclared (name+table regex)
+  replaced by triggerStructurallyValid() -- a BOUNDED structural proof on the masked SQL view: expected public
+  table, BEFORE timing, EXACTLY INSERT OR UPDATE events, FOR EACH ROW, EXECUTE FUNCTION
+  public.reject_append_to_terminal_cycle(), and NO subsequent DROP TRIGGER for that trigger/table. New
+  auditGuardFunction() extracts the reject_append_to_terminal_cycle body (masked for code, clean for literals,
+  so comments/strings cannot forge it) and proves: UPDATE cannot change cycle_id; parent locked FOR SHARE;
+  terminal succeeded|partial|failed parents rejected; MISSING parent fails closed (Migration 5's trigger now
+  raises on `not found`). Typed blockers TRIGGER_INVALID / GUARD_* (runtime-composition surfaces the trigger/
+  target fields). Mutation tests: wrong timing, DELETE, INSERT-only, UPDATE-only, statement-level, wrong
+  function, wrong table, create-then-drop, comment fake, removed cycle_id guard, removed FOR SHARE, weakened
+  terminal set, removed missing-parent guard, string-literal forgery -- all caught; real SQL passes.
+- Tests: cycle-finalize-wiring 10 (rewritten), cycle-lifecycle 16 (+1). node --check clean; npm run verify
+  35/35 incl. build:check; git diff --check clean; migrations 1-4 byte-unchanged (1328bc0f/0750a155/544557fb/
+  49628c8d); Migration 5 UNAPPLIED.
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
+UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
