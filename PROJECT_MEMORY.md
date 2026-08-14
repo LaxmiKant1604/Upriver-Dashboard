@@ -8414,3 +8414,56 @@ CONFIRMED: no production connection; no Supabase write; no DataDoe call/export; 
 paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes unchanged (only the test file,
 package.json, and docs changed); nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron
 untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review before Gate 5 execution.
+
+## Scheduler v2: verify runner, pollExport 404 hardening, org-wide Product Catalog contract + design (2026-08-14)
+
+Fixed the newly confirmed blockers OFFLINE (Gate 5 NOT executed; no production connection; no DataDoe call;
+no Supabase write; no control/schedule/deploy change). Three commits: (1) pollExport hardening + deterministic
+tests, (2) direct Node verify runner + wiring, (3) docs/design (this entry + SCHEDULER_V2_ROLLOUT.md).
+
+- REAL `npm run verify` restored: the nested-npm chain ("npm run a && npm run b && ...") is a SILENT NO-OP on
+  this machine (npm 11.11.0 + cmd.exe script shell: echoes the chain, exit 0 in ~2s, no child ever runs -- from
+  both Git Bash and PowerShell). New scripts/verify.mjs runs every suite's test files + build-check
+  SEQUENTIALLY via process.execPath with inherited stdio and immediate nonzero exit on first failure; the step
+  list is DERIVED from package.json's own scripts (a non-"node scripts/..." step fails closed, so nothing can
+  be silently skipped). `npm run verify` now invokes the runner. PROVEN: all 32 steps across 12 suites executed
+  with each suite printing its own total (54/78/23/73; sync-engine 22+17+6+12+4+17+1; report-derivation
+  66+30+33+20+34+24+12+27+40+35+37+44+37+37+26; 7; 161; 9; gate5 10; poll-export 4) and build:check ran last
+  (vite build + bundle-size assertion) -- exit 0 in 65s. Includes gate5-canary-package.test.js and the new
+  datadoe-poll-export suite.
+- pollExport hardened per DataDoe's CONFIRMED behavior (a status GET too soon after the create POST can 404
+  before the export is visible): the 5s cadence sleep now runs BEFORE each status GET (so the first GET waits
+  5s; 9x5s = 45s total sleep budget unchanged -> Vercel 60s bound preserved); a status-GET 404 is TEMPORARY
+  (still pending) within the same bounded window; a 404 outliving all attempts becomes the normal poll timeout
+  (classified TIMEOUT, non-terminal, resumable by the saved export_id); NEVER a second create-export POST (the
+  poller only GETs; the scheduler resume path reuses export_id); a 404 on the CREATE POST and non-404 status
+  errors stay real failures. New deterministic offline suite scripts/datadoe-poll-export.test.js (stubbed
+  timers recording delays + scripted fetch queue recording method/url): 404->pending->completed,
+  repeated-404 timeout (full 9-attempt window, zero POSTs), non-404/FAILED/BLOCKED_NO_TOKENS/create-404 real
+  failures, and the full fetchExportRows flow proving EXACTLY ONE create-export POST with a mid-poll 404. 4/4.
+- CONFIRMED Product Catalog contract recorded (DataDoe support + our own byte-level comparison, Appendix M.1):
+  the dataset is ORGANIZATION-WIDE; sellerOrVendorIds is accepted but IGNORED; downloads for different accounts
+  are BYTE-IDENTICAL; current files contain NO marketplace_id; ONE file can seed the shared ASIN->brand map;
+  43 blank-brand ASINs remain UNMAPPED (honest gap), never "Unassigned".
+- Gate 5 docs corrected (Appendix L L.1/L.4/L.5): removed the claim that the catalog request is account-scoped
+  DATA -- the seller id inside today's canonical catalog request identity is a CURRENT-implementation cache-key
+  artifact only; Order Line Items remains genuinely seller-scoped. The canary still validates the EXACT
+  identity the CURRENT planner derives (no canary step changed); "other-account catalog insufficient" is now
+  stated as the mechanical cache-identity fact (the loader reads only the plan-derived hash). The final PC
+  request identity, marketplace filter, child_asin filter, and date behavior are DELIBERATELY UNRESOLVED
+  pending DataDoe's follow-up -- no guessing.
+- Reviewed org-wide Catalog design prepared (Appendix M.2, design only, NOT implemented): canonical source
+  scope/hash organization-wide (per organizationFingerprint, never per-account seller ids); owner memberships
+  stay account/report-specific (all pointing at the ONE org-wide hash; P2 isolation shape unchanged); ONE
+  shared saved catalog/ASIN->brand map; no duplicate export per account (existing one-attempt guard + one hash
+  => at most one catalog create-export per cycle per org); automatic reuse for newly discovered accounts (new
+  owner membership only, zero extra tokens). REJECTED shortcut: normalizing/hard-coding accountScopeHash while
+  requests still carry seller ids (identity would lie; aliasing risk; bypasses single-account invariants). The
+  correct change is a first-class organization scope in contract+resolver+planner, only after the follow-up
+  (M.3).
+
+CONFIRMED: Gate 5 NOT executed; no production connection; no DataDoe call/export; no Supabase write; controls
+paused and locked (allowlist empty); zero schedules/cycles; all 7 Gate 0 hashes unchanged (changed files:
+lib/server/datadoe.js, scripts/verify.mjs, scripts/datadoe-poll-export.test.js, package.json, docs -- none
+frozen); nothing pushed/merged/deployed; Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md +
+.worktrees/ untouched. STOP for Codex review.

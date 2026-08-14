@@ -1734,15 +1734,21 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
   its two canonical source contracts are `order-line-items` and `product-catalog`).
 - Use `brand-sales` **only if** the chosen account has **both**: (1) a current production Brand Sales snapshot
   (`report_snapshots` under `report_key='brand-sales'`) for later Gate 6 parity; (2) confirmed **Product Catalog
-  usability for THIS account and the EXACT canonical `brand-sales` product-catalog request** — the request built
-  from the live short source id `68d2de238e`, the contract's columns (incl. `child_asin`, `product_brand`), and
-  the account's window/scope (compute its `request_hash` via the same source identity the `brand-sales` plan
-  uses). Require a `source_export_cache` entry for THAT exact `request_hash` with `row_count > 0`, and a bounded
-  payload read showing **non-empty usable `child_asin` → `product_brand` mappings**. This existing cache entry is
-  **usability evidence only** — proof the exact canonical request yields usable data — **not a pre-export
-  shortcut**: the canary's fresh cycle still creates its own catalog export (the source worker never skips
-  `create-export` because a cache entry exists), so a fully successful canary spends exactly two create-exports.
-  A generic catalog success for **another account**, or a **different catalog shape/id**, is INSUFFICIENT. The long id
+  usability for the EXACT canonical `brand-sales` product-catalog request the CURRENT plan derives** — the
+  request built from the live short source id `68d2de238e`, the contract's columns (incl. `child_asin`,
+  `product_brand`), and the window/scope values the current planner emits (compute its `request_hash` via the
+  same source identity the `brand-sales` plan uses). **Confirmed contract (Appendix M): the Product Catalog
+  DATASET is organization-wide** — DataDoe ignores `sellerOrVendorIds` for this source and downloads requested
+  for different accounts are byte-identical — so the seller id inside this request identity is a
+  CURRENT-implementation cache-key artifact, **not** a data scope (Order Line Items remains genuinely
+  seller-scoped). Require a `source_export_cache` entry for THAT exact `request_hash` with `row_count > 0`, and
+  a bounded payload read showing **non-empty usable `child_asin` → `product_brand` mappings**. This existing
+  cache entry is **usability evidence only** — proof the exact canonical request yields usable data — **not a
+  pre-export shortcut**: the canary's fresh cycle still creates its own catalog export (the source worker never
+  skips `create-export` because a cache entry exists), so a fully successful canary spends exactly two
+  create-exports. A catalog cached under a **different `request_hash`** (another account's identity, or a
+  different catalog shape/id) is MECHANICALLY insufficient — `rt.sourceRowLoader()` reads only the plan-derived
+  hash — even though the underlying catalog data is organization-wide. The long id
   `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8` is the **obsolete (DataDoe-404)** alias and
   must **never** be used.
 - **If either prerequisite (or the exact catalog evidence) cannot be confirmed, STOP.** Do not use the obsolete
@@ -1803,8 +1809,9 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 - The EXACT canonical `brand-sales` product-catalog usability is validated **in-script** (L.5) from the
   **plan-derived** catalog `request_hash` via `rt.sourceRowLoader()` — a current cache entry, `source_id ===
   '68d2de238e'`, `rows.length === row_count`, `0 < rows.length < limit`, and ≥ 1 non-blank
-  `child_asin`/`product_brand` (never printed). A generic / other-account catalog is INSUFFICIENT. There is no
-  manual `<PC_REQUEST_HASH>` substitution.
+  `child_asin`/`product_brand` (never printed). A catalog entry under any other `request_hash` is MECHANICALLY
+  insufficient (the loader reads only the plan-derived hash; the organization-wide dataset — Appendix M — does
+  not change the cache identity the CURRENT plan derives). There is no manual `<PC_REQUEST_HASH>` substitution.
 - Here (read-only, no payload exposed) capture the existing production Brand Sales snapshot identity, prove there
   are **zero** pre-existing `scheduler-v2/*` shadow snapshots (this is the FIRST canary), and take the payload-free
   production fingerprint. Committed columns (`report_snapshots`: `id, report_key, account_id, params_hash, params,
@@ -1876,7 +1883,10 @@ if (BUCKET !== "us" && BUCKET !== "non-us") throw new Error("canary: could not d
 // INDEPENDENTLY pin every critical property before anything runs: plan.accountId, the exact seller scope
 // (the primary PUBLIC account id IS the raw seller id -- publicAccountId), BOTH windows exactly
 // [addDaysStr(monthStartStr(AS_OF), -420), AS_OF], strict === true, the EXACT source ids for BOTH sources,
-// limits, connection, bucket, hashes, org fingerprint, account-scope hash.
+// limits, connection, bucket, hashes, org fingerprint, account-scope hash. NOTE: the catalog's seller id is
+// pinned as part of the CURRENT canonical request identity (a cache-key fact) -- the catalog DATASET itself
+// is organization-wide (Appendix M; DataDoe ignores sellerOrVendorIds for it). Order Line Items is genuinely
+// seller-scoped.
 const plan = planBrandSales({ accountId: account.id, country: account.country, currency: account.currency, connections: conns, asOf: AS_OF });
 if (plan.reportKey !== "brand-sales" || (plan.sources || []).length !== 2) throw new Error("canary: brand-sales plan did not yield exactly two sources (fail closed)");
 if (plan.accountId !== SELECTED_ACCOUNT_ID) throw new Error(`canary: plan accountId ${plan.accountId} != ${SELECTED_ACCOUNT_ID} (fail closed)`);
@@ -2117,3 +2127,68 @@ deployment, or scheduling. Stop for review + explicit human approval.
 > id, wrong hashes, duplicate/missing sources, a wrong/blank/missing `owner_id`, a stale/absent catalog cache,
 > pre-existing shadow rows, extra report jobs/snapshots, a final drain without exactly one create-export per
 > hash, and the final-slice deadline boundary.
+
+## Appendix M — Organization-wide Product Catalog: confirmed contract + reviewed design (NOT implemented)
+
+> **Design only.** Nothing in this appendix is implemented, and NO code, contract, planner, resolver, or
+> identity change is made on its basis yet. The final Product Catalog request identity is **deliberately
+> unresolved** until DataDoe's follow-up answers arrive (M.3).
+
+### M.1 Confirmed Product Catalog contract (DataDoe support + our own byte-level comparison, 2026-08-14)
+
+1. Product Catalog is an **organization-wide dataset**: an export returns the organization's catalog
+   regardless of which account requested it.
+2. **`sellerOrVendorIds` is accepted but IGNORED** by DataDoe for this source.
+3. **Downloaded files requested for different accounts are byte-identical.**
+4. Current files contain **no `marketplace_id`** (no per-marketplace partition key in the payload).
+5. **One downloaded file can seed the shared ASIN → brand map** for every account in the organization.
+6. **43 blank-brand ASINs remain UNMAPPED** — an honest gap surfaced as unmapped, **never coerced to
+   "Unassigned"**.
+
+Consequences for existing docs: the earlier Gate 5 phrasing that treated the catalog request as
+account-scoped DATA is corrected in Appendix L (L.1/L.4/L.5) — the seller id inside today's canonical
+catalog request identity is a CURRENT-implementation **cache-key artifact only**. **Order Line Items remains
+genuinely seller-scoped** (its rows carry and depend on the seller/vendor scope). The Gate 5 canary continues
+to validate the EXACT identity the CURRENT planner derives; this appendix changes no canary step.
+
+### M.2 Reviewed organization-wide Catalog design (separation of concerns)
+
+- **Canonical source scope/hash: organization-wide.** ONE canonical Product Catalog request identity per
+  organization (per `organizationFingerprint`), derived from the org credential + the contract's
+  columns/limit/ordering + the final (M.3-confirmed) filter/window semantics — and **NOT** from any
+  per-account seller id. One org ⇒ one catalog `request_hash` per cycle window.
+- **Owner memberships stay account/report-specific.** `sync_source_job_owners` rows remain per
+  `(report_key, account, connection, org/scope)` — every report/account needing the catalog holds its OWN
+  active membership pointing at the ONE org-wide canonical `request_hash`. The Appendix L P2 isolation model
+  (ownerless-row / membership-scope checks) is unchanged in shape; only the number of distinct canonical
+  catalog hashes shrinks to one per organization.
+- **One shared saved catalog/map.** A single `source_export_cache` entry (and the derived shared ASIN → brand
+  map) per organization catalog identity; every derive reads the same saved rows. Blank-brand ASINs (M.1 #6)
+  stay unmapped — never "Unassigned".
+- **No duplicate export per account.** The existing DB one-attempt guard (`claim_source_export_attempt` +
+  the one-attempt CHECK) already dedupes by `request_hash`; with ONE org-wide hash there is at most ONE
+  catalog create-export per cycle for the WHOLE organization, regardless of account count.
+- **Automatic reuse for newly discovered accounts.** A newly discovered account's plan resolves the SAME
+  org-wide hash, so onboarding adds only a new owner-membership row; the existing canonical job, export, and
+  saved catalog/map are reused — zero additional catalog tokens.
+
+**Rejected shortcut (do NOT implement):** normalizing or hard-coding `accountScopeHash` (hashing a constant /
+empty scope, or aliasing every account onto one account's hash) while the request still carries per-account
+seller ids. That would (a) make the stored identity lie about the actual request, (b) silently alias
+genuinely account-scoped requests if ever applied beyond the catalog, (c) bypass the resolver's
+single-account invariants instead of modeling scope, and (d) leave no explicit contract-level record that the
+source is org-wide. The correct change is a first-class **organization scope** in the source contract +
+resolver + planner (a typed scope the identity derivation understands), landed as reviewed code with tests —
+only after M.3 resolves.
+
+### M.3 Deliberately unresolved (pending DataDoe follow-up — do not guess)
+
+The final org-wide request identity is NOT fixed here. Blocked on DataDoe's answers about:
+- whether a **marketplace filter** exists/behaves server-side for this source (current files carry no
+  `marketplace_id` — M.1 #4);
+- whether a **`child_asin` filter** is honored;
+- the source's **date behavior** (no-date vs windowed semantics for this dataset);
+- the exact request payload the org-wide identity should therefore hash (columns/window/filters).
+
+Until then: no planner/resolver/contract change, no new hash scheme, no migration of cached entries, and the
+Gate 5 canary (Appendix L) keeps validating the CURRENT plan-derived identities unchanged.
