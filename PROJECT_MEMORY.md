@@ -8639,3 +8639,49 @@ CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist 
 no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
 Scheduler v1, frontend, cron, source contracts, request_hash pins, Appendix M, applied migrations, HANDOFF.md,
 and .worktrees/ untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
+
+## Scheduler v2: durable source-cache save requires a validated acknowledgement row (2026-08-14)
+
+Sixth Codex round on this tranche: fixed the final Gate 5 blocker OFFLINE (Gate 5 NOT executed). Commit
+0e27ade (code/tests), then this docs commit.
+
+- BLOCKER: persistSourceRows treated any non-throwing saveSourceExportCache() call as a confirmed durable save.
+  But saveSourceExportCache returns `saved[0] || null` -- it resolves NULL when PostgREST returns no
+  representation row -- so persisted could be true (and the manual-source-attempt marker removed) without a
+  positive durable write.
+- FIX (lib/server/datadoe.js): new isConfirmedSourceCacheAck(saved, { identity, sourceId, rowCount }) returns
+  true ONLY when the returned metadata row is a non-null object whose typed fields ALL match:
+  request_hash===identity.requestHash, source_id===String(sourceId),
+  organization_fingerprint===identity.organizationFingerprint, account_scope_hash===identity.accountScopeHash,
+  row_count===rows.length, and a non-empty object_path. null/undefined/non-object/any mismatched field => false.
+  Only these typed columns are compared -- no raw storage/DB payload is inspected or surfaced. persistSourceRows
+  now captures saveSourceExportCache's return and returns true ONLY when the ack validates; a null/empty/
+  mismatched ack returns false (joining the existing false paths: Supabase unconfigured, cache temporarily
+  unavailable, <3s deadline, oversized payload, save threw). Prune runs only after a confirmed ack. Added a
+  test-only seam __setSourceCacheSaverForTests (production never sets it) to drive the validation offline.
+- Marker behavior (unchanged in shape): on an unconfirmed ack the "polling" marker + exportId are RETAINED, so
+  a later invocation resumes/re-downloads the SAME export with zero new create-export POSTs; the marker is
+  removed ONLY after a fully validated durable acknowledgement. In-memory rows never license removal.
+- State-table impact: the "Completion, persist CONFIRMED -> marker removed" row now means specifically "a
+  positively-matching source_export_cache acknowledgement row was returned"; "Completion, persist UNCONFIRMED
+  -> marker retained (resume next time), zero creates" now ALSO covers a save that RESOLVED null / empty /
+  mismatched metadata (not only unconfigured/unavailable/deadline/oversized/threw). No new states; the gate is
+  strictly tightened.
+- Tests (scripts/manual-source-continuation.test.js, 24/24): unit -- isConfirmedSourceCacheAck true only for a
+  fully matching row; false for null/undefined/non-object/empty and every single mismatched/missing field
+  (request_hash, source_id, org fingerprint, account scope, row_count, blank/empty/missing/null object_path) +
+  the String(sourceId) comparison. Integration via fetchExportRows -- for each unconfirmed ack (null, empty
+  object, wrong request_hash, wrong source_id, wrong org, wrong scope, wrong row_count, blank object_path) inv1
+  completes but the marker is retained and inv2 with process-local memory cleared resumes E1 with zero new
+  creates (one POST total); a fully matching ack removes the marker. Existing save-throw, low-deadline,
+  oversized, cap-sized, concurrency, marker-identity, durable-completion, and retryable-response tests stay
+  green.
+- Verification: node --check on the changed file OK; direct -- manual-source-continuation 24, datadoe-poll-export
+  14, test-source-cache 73, sync-source-jobs, sync-signals, sync-dispatch 37, runtime-composition 26 -- all exit
+  0; npm run verify 33/33 steps incl. build:check, exit 0; git diff --check clean. Changed files:
+  lib/server/datadoe.js, scripts/manual-source-continuation.test.js.
+
+CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist empty); Gate 5 NOT executed;
+no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
+Scheduler v1, frontend, cron, source contracts, request_hash pins, Appendix M, applied migrations, HANDOFF.md,
+and .worktrees/ untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
