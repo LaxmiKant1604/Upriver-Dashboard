@@ -1,9 +1,16 @@
 // Gate 5 canary-package — deterministic OFFLINE executable self-check of the SCHEDULER_V2_ROLLOUT.md Appendix L
 // canary guards. It runs the REAL (pure, offline) planBrandSales() to obtain the exact two brand-sales source
 // request identities, then asserts every canary guard PASSES on the correct shape and THROWS on each documented
-// failure: wrong hashes, wrong windows, duplicate/missing sources, stale/absent catalog cache, pre-existing
-// shadow rows, extra report jobs/snapshots, and the final-slice deadline boundary. NO network, DataDoe, or
-// Supabase I/O -- planBrandSales and sourceJobOwnerId are pure hashing.
+// failure: wrong account/seller scope, shifted or wrong windows, strict:false, wrong source ids, wrong hashes,
+// duplicate/missing sources, wrong/missing owner ids, stale/absent catalog cache, pre-existing shadow rows,
+// extra report jobs/snapshots, a final drain without exactly one create-export per hash, and the final-slice
+// deadline boundary. NO network, DataDoe, or Supabase I/O -- planBrandSales and sourceJobOwnerId are pure hashing.
+//
+// Export-count semantics (L.1/L.3): the pre-existing product-catalog source_export_cache entry is a USABILITY
+// prerequisite only (proof the exact canonical request yields usable data) -- the source worker NEVER skips
+// create-export because of it. create_export_count = 0 is a mid-drain partial/failed-slice state (a job not yet
+// attempted), never "cache reuse"; a SUCCESSFUL fresh drained canary ends with EXACTLY two succeeded source rows
+// (the two plan hashes), each create_export_count === 1.
 //
 // 7-bit ASCII, LF. Run: node scripts/gate5-canary-package.test.js
 
@@ -15,33 +22,47 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let planBrandSales, sourceJobOwnerId;
+let planBrandSales, sourceJobOwnerId, addDaysStr, monthStartStr;
 
 // ---- the Appendix L canary guards (pure; mirror the L.5/L.6 inline logic) ----
 const norm = (s) => String(s ?? "").trim();
 
-function checkPlanSources(plan) {
+// Exact live source ids (lib/server/source-contracts.js SOURCE_CONTRACTS ids[0]).
+const OLI_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778"; // order-line-items
+const CATALOG_SOURCE_ID = "68d2de238e"; // product-catalog (live short id; long id is the obsolete 404 alias)
+
+// Pin every critical plan property INDEPENDENTLY before any run: account, seller scope, exact windows,
+// strict, exact source ids, limits, connection, bucket, hashes, org/scope. The primary public account id
+// IS the raw seller id (publicAccountId), so sellerOrVendorIds must be exactly [selectedAccountId].
+function checkPlanSources(plan, selectedAccountId, asOf) {
   if (!plan || plan.reportKey !== "brand-sales") throw new Error("plan: not brand-sales");
+  if (plan.accountId !== selectedAccountId) throw new Error(`plan: accountId ${plan.accountId} != ${selectedAccountId}`);
   const src = plan.sources || [];
   if (src.length !== 2) throw new Error(`plan: expected 2 sources, got ${src.length}`);
   const byKey = new Map(src.map((s) => [s.requestKey, s]));
   if (byKey.size !== 2) throw new Error("plan: duplicate requestKey");
+  // BOTH windows must be exactly [addDaysStr(monthStartStr(asOf), -420), asOf] -- the live route window.
+  const expFrom = addDaysStr(monthStartStr(asOf), -420);
   const EXPECT = {
-    "brand-sales:order-lines": { sourceKey: "order-line-items", limit: 50000 },
-    "brand-sales:catalog": { sourceKey: "product-catalog", sourceId: "68d2de238e", limit: 10000 },
+    "brand-sales:order-lines": { sourceKey: "order-line-items", sourceId: OLI_SOURCE_ID, limit: 50000 },
+    "brand-sales:catalog": { sourceKey: "product-catalog", sourceId: CATALOG_SOURCE_ID, limit: 10000 },
   };
   for (const [rk, exp] of Object.entries(EXPECT)) {
     const s = byKey.get(rk);
     if (!s) throw new Error(`plan: missing source ${rk}`);
     if (s.sourceKey !== exp.sourceKey) throw new Error(`plan: ${rk} sourceKey ${s.sourceKey} != ${exp.sourceKey}`);
-    if (exp.sourceId && s.sourceId !== exp.sourceId) throw new Error(`plan: ${rk} sourceId ${s.sourceId} != ${exp.sourceId}`);
+    if (s.sourceId !== exp.sourceId) throw new Error(`plan: ${rk} sourceId ${s.sourceId} != ${exp.sourceId}`);
     if (s.limit !== exp.limit) throw new Error(`plan: ${rk} limit ${s.limit} != ${exp.limit}`);
     if (s.connectionId !== "primary") throw new Error(`plan: ${rk} connectionId ${s.connectionId} != primary`);
     if (s.bucket !== plan.bucket) throw new Error(`plan: ${rk} bucket mismatch`);
+    if (s.strict !== true) throw new Error(`plan: ${rk} strict ${s.strict} != true`);
     if (!norm(s.requestHash)) throw new Error(`plan: ${rk} missing requestHash`);
     if (!norm(s.organizationFingerprint) || !norm(s.accountScopeHash)) throw new Error(`plan: ${rk} missing org/scope`);
     if (!norm(s.from) || !norm(s.to) || s.from > s.to) throw new Error(`plan: ${rk} invalid window ${s.from}..${s.to}`);
-    if (!(Array.isArray(s.sellerOrVendorIds) && s.sellerOrVendorIds.length === 1)) throw new Error(`plan: ${rk} seller scope not single`);
+    if (s.from !== expFrom || s.to !== asOf) throw new Error(`plan: ${rk} window ${s.from}..${s.to} != expected ${expFrom}..${asOf}`);
+    if (!(Array.isArray(s.sellerOrVendorIds) && s.sellerOrVendorIds.length === 1 && s.sellerOrVendorIds[0] === selectedAccountId)) {
+      throw new Error(`plan: ${rk} seller scope != [${selectedAccountId}]`);
+    }
   }
   const [a, b] = src;
   if (a.from !== b.from || a.to !== b.to) throw new Error("plan: sources have different windows");
@@ -50,9 +71,22 @@ function checkPlanSources(plan) {
   return { orderLines: byKey.get("brand-sales:order-lines"), catalog: byKey.get("brand-sales:catalog") };
 }
 
+// Plan-derived owner ids (mirrors L.5 OWNER_IDS): both sources share connection/org/scope, so exactly
+// ONE nonblank deterministic owner id must survive the dedupe (sourceJobOwnerId returns null on any
+// blank input, so a blank org/scope fails closed here rather than silently widening the owner query).
+function ownerIdsOf(plan) {
+  return [...new Set((plan.sources || []).map((s) => sourceJobOwnerId({ reportKey: "brand-sales", connectionId: s.connectionId, organizationFingerprint: s.organizationFingerprint, accountScopeHash: s.accountScopeHash })).filter(Boolean))];
+}
+function checkOwnerIds(ownerIds) {
+  if (!Array.isArray(ownerIds) || ownerIds.length !== 1 || !norm(ownerIds[0])) {
+    throw new Error(`owner-ids: expected exactly one nonblank plan-derived owner id, got ${JSON.stringify(ownerIds)}`);
+  }
+  return ownerIds[0];
+}
+
 function checkCatalogCache(cache, catalogSource) {
   if (!cache) throw new Error("catalog: no current source_export_cache entry for the exact request (stale/absent)");
-  if (cache.source_id !== "68d2de238e") throw new Error(`catalog: source_id ${cache.source_id} != 68d2de238e`);
+  if (cache.source_id !== CATALOG_SOURCE_ID) throw new Error(`catalog: source_id ${cache.source_id} != ${CATALOG_SOURCE_ID}`);
   const rows = cache.rows;
   if (!Array.isArray(rows)) throw new Error("catalog: no rows");
   if (rows.length !== cache.row_count) throw new Error(`catalog: rows.length ${rows.length} != row_count ${cache.row_count}`);
@@ -62,6 +96,9 @@ function checkCatalogCache(cache, catalogSource) {
   return true;
 }
 
+// Between-slice (mid-drain) guard: identity-pinned rows only; create_export_count 0 means the job has
+// NOT been attempted yet in a partial/failed slice (the DB claim increments it to 1 on the one allowed
+// attempt) -- it never means "cache reuse". The final-drain guard below requires exactly 1 per hash.
 function checkSliceSourceJobs(jobs, plan) {
   const expectByHash = new Map(plan.sources.map((s) => [s.requestHash, s]));
   const list = jobs || [];
@@ -91,11 +128,29 @@ function requireBothSourcesPresent(jobs, plan) {
   return true;
 }
 
-function checkOwnerRows(owners, plan, selectedAccountId) {
+// FINAL-DRAIN guard (successful fresh canary + saved shadow snapshot): the pre-existing catalog cache is
+// usability evidence only -- the worker never skips create-export because of it -- so the final state is
+// EXACTLY two source rows (the two plan hashes), each fetch_status='succeeded' and create_export_count===1.
+// A 0-export row here means the job never exported (partial/failed drain), NOT cache reuse: fail closed.
+function checkFinalSourceJobs(jobs, plan) {
+  checkSliceSourceJobs(jobs, plan);
+  requireBothSourcesPresent(jobs, plan);
+  const list = jobs || [];
+  if (list.length !== 2) throw new Error(`final: expected exactly 2 source jobs, got ${list.length}`);
+  for (const j of list) {
+    if (j.fetch_status !== "succeeded") throw new Error(`final: fetch_status ${j.fetch_status} != succeeded`);
+    const n = j.create_export_count ?? 0;
+    if (n !== 1) throw new Error(`final: create_export_count ${n} != 1 for ${String(j.request_hash).slice(0, 12)} (a fresh drained canary creates exactly one export per hash)`);
+  }
+  return true;
+}
+
+function checkOwnerRows(owners, plan, selectedAccountId, expectedOwnerId) {
   const list = owners || [];
   if (list.length !== 2) throw new Error(`owners: expected 2, got ${list.length}`);
   const expect = new Map(plan.sources.map((s) => [s.requestKey, s.requestHash]));
   for (const o of list) {
+    if (!norm(o.owner_id) || o.owner_id !== expectedOwnerId) throw new Error(`owners: owner_id ${JSON.stringify(o.owner_id ?? null)} != expected for ${o.request_key}`);
     if (o.owner_status !== "active") throw new Error(`owners: ${o.request_key} not active`);
     if (o.report_key !== "brand-sales") throw new Error(`owners: report_key ${o.report_key}`);
     if (o.account_id !== selectedAccountId) throw new Error(`owners: account_id ${o.account_id}`);
@@ -139,23 +194,28 @@ function shouldStopBeforeSlice(now, overallDeadlineMs, reserveMs) { return (over
 
 // ---- fixtures built from the REAL plan ----
 const ACCT = "A1";
-const mkPlan = () => planBrandSales({ accountId: ACCT, country: "US", currency: "USD", connections: [{ id: "primary", apiKey: "canary-test-key" }], asOf: "2026-08-01" });
+const AS_OF = "2026-08-01";
+const mkPlan = () => planBrandSales({ accountId: ACCT, country: "US", currency: "USD", connections: [{ id: "primary", apiKey: "canary-test-key" }], asOf: AS_OF });
 const goodSourceJob = (s, exp = 1) => ({ id: "j-" + s.requestHash.slice(0, 6), request_hash: s.requestHash, source_id: s.sourceId, source_key: s.sourceKey, connection_id: "primary", organization_fingerprint: s.organizationFingerprint, account_scope_hash: s.accountScopeHash, fetch_status: "succeeded", create_export_count: exp, terminal: false, error_code: null });
-const goodOwner = (s) => ({ owner_id: "o1", request_hash: s.requestHash, request_key: s.requestKey, report_key: "brand-sales", account_id: ACCT, connection_id: "primary", organization_fingerprint: s.organizationFingerprint, account_scope_hash: s.accountScopeHash, owner_status: "active" });
-const goodCatalogCache = (cat, rowCount = 3) => ({ request_hash: cat.requestHash, source_id: "68d2de238e", object_path: "x", row_count: rowCount, payload_bytes: 10, fetched_at: "t", expires_at: "t", rows: Array.from({ length: rowCount }, (_, i) => ({ child_asin: "B00" + i, product_brand: "Brand" + i })) });
+const goodOwner = (s) => ({ owner_id: sourceJobOwnerId({ reportKey: "brand-sales", connectionId: "primary", organizationFingerprint: s.organizationFingerprint, accountScopeHash: s.accountScopeHash }), request_hash: s.requestHash, request_key: s.requestKey, report_key: "brand-sales", account_id: ACCT, connection_id: "primary", organization_fingerprint: s.organizationFingerprint, account_scope_hash: s.accountScopeHash, owner_status: "active" });
+const goodCatalogCache = (cat, rowCount = 3) => ({ request_hash: cat.requestHash, source_id: CATALOG_SOURCE_ID, object_path: "x", row_count: rowCount, payload_bytes: 10, fetched_at: "t", expires_at: "t", rows: Array.from({ length: rowCount }, (_, i) => ({ child_asin: "B00" + i, product_brand: "Brand" + i })) });
 
 // ================= tests =================
 
 test("(good) the real plan + correct DB rows pass every guard", () => {
   const plan = mkPlan();
-  const { orderLines, catalog } = checkPlanSources(plan);
-  assert.equal(catalog.sourceId, "68d2de238e");
+  const { orderLines, catalog } = checkPlanSources(plan, ACCT, AS_OF);
+  assert.equal(catalog.sourceId, CATALOG_SOURCE_ID);
+  assert.equal(orderLines.sourceId, OLI_SOURCE_ID);
   assert.equal(orderLines.sourceKey, "order-line-items");
+  const ownerId = checkOwnerIds(ownerIdsOf(plan));
+  assert.ok(norm(ownerId));
   assert.ok(checkCatalogCache(goodCatalogCache(catalog), catalog));
   const jobs = plan.sources.map((s) => goodSourceJob(s, 1));
   assert.deepEqual(checkSliceSourceJobs(jobs, plan), { total: 2, count: 2 });
   assert.ok(requireBothSourcesPresent(jobs, plan));
-  assert.ok(checkOwnerRows(plan.sources.map(goodOwner), plan, ACCT));
+  assert.ok(checkFinalSourceJobs(jobs, plan));
+  assert.ok(checkOwnerRows(plan.sources.map(goodOwner), plan, ACCT, ownerId));
   assert.ok(checkShadowBefore(0));
   assert.ok(checkShadowAfter([{ report_key: "scheduler-v2/brand-sales", account_id: ACCT }], ACCT));
   assert.ok(checkReportJob([{ report_key: "brand-sales", account_id: ACCT, connection_id: "primary", depends_on: plan.sources.map((s) => s.requestHash) }], plan, ACCT));
@@ -170,20 +230,42 @@ test("(plan) wrong/duplicate/missing sources and wrong window fail closed", () =
   assert.throws(() => checkSliceSourceJobs([goodSourceJob({ ...plan.sources[1], requestHash: "deadbeef" }, 1)], plan), /unexpected request_hash/);
   // duplicate source (two order-lines, no catalog)
   const dup = { ...plan, sources: [plan.sources[0], { ...plan.sources[0] }] };
-  assert.throws(() => checkPlanSources(dup), /duplicate requestKey|missing source brand-sales:catalog/);
+  assert.throws(() => checkPlanSources(dup, ACCT, AS_OF), /duplicate requestKey|missing source brand-sales:catalog/);
   // missing a source (only one)
-  assert.throws(() => checkPlanSources({ ...plan, sources: [plan.sources[0]] }), /expected 2 sources/);
+  assert.throws(() => checkPlanSources({ ...plan, sources: [plan.sources[0]] }, ACCT, AS_OF), /expected 2 sources/);
   // wrong window (from > to)
   const badWin = { ...plan, sources: plan.sources.map((s) => ({ ...s, from: "2027-01-01", to: "2026-01-01" })) };
-  assert.throws(() => checkPlanSources(badWin), /invalid window/);
+  assert.throws(() => checkPlanSources(badWin, ACCT, AS_OF), /invalid window/);
   // divergent windows across the two sources
   const splitWin = { ...plan, sources: [plan.sources[0], { ...plan.sources[1], to: "2026-07-31" }] };
-  assert.throws(() => checkPlanSources(splitWin), /different windows/);
+  assert.throws(() => checkPlanSources(splitWin, ACCT, AS_OF), /!= expected|different windows/);
   void badHash;
 });
 
+test("(plan pinning) wrong account, wrong seller scope, shifted window, strict:false, wrong OLI source id fail closed", () => {
+  const plan = mkPlan();
+  // the plan's public account id must be the reviewed selected account
+  assert.throws(() => checkPlanSources(plan, "B2", AS_OF), /accountId/);
+  assert.throws(() => checkPlanSources({ ...plan, accountId: "B2" }, ACCT, AS_OF), /accountId/);
+  // wrong seller id (valid shape, wrong account) and a widened multi-id scope
+  const wrongSeller = { ...plan, sources: plan.sources.map((s) => ({ ...s, sellerOrVendorIds: ["B2"] })) };
+  assert.throws(() => checkPlanSources(wrongSeller, ACCT, AS_OF), /seller scope/);
+  const twoSellers = { ...plan, sources: plan.sources.map((s) => ({ ...s, sellerOrVendorIds: [ACCT, "B2"] })) };
+  assert.throws(() => checkPlanSources(twoSellers, ACCT, AS_OF), /seller scope/);
+  // BOTH sources shifted to the SAME valid-but-wrong window (from<=to, identical across sources) must
+  // still fail: the window is pinned to [addDaysStr(monthStartStr(AS_OF), -420), AS_OF] exactly.
+  const shifted = { ...plan, sources: plan.sources.map((s) => ({ ...s, from: addDaysStr(s.from, -1), to: addDaysStr(s.to, -1) })) };
+  assert.throws(() => checkPlanSources(shifted, ACCT, AS_OF), /!= expected/);
+  // strict:false on either source (execution metadata a tampered plan could drop)
+  const lax = { ...plan, sources: plan.sources.map((s) => s.requestKey === "brand-sales:order-lines" ? { ...s, strict: false } : s) };
+  assert.throws(() => checkPlanSources(lax, ACCT, AS_OF), /strict/);
+  // wrong Order Line Items source id (e.g. swapped with the catalog id)
+  const badOli = { ...plan, sources: plan.sources.map((s) => s.requestKey === "brand-sales:order-lines" ? { ...s, sourceId: CATALOG_SOURCE_ID } : s) };
+  assert.throws(() => checkPlanSources(badOli, ACCT, AS_OF), /sourceId/);
+});
+
 test("(catalog cache) stale/absent, wrong id, count/limit, and blank-mapping all fail closed", () => {
-  const { catalog } = checkPlanSources(mkPlan());
+  const { catalog } = checkPlanSources(mkPlan(), ACCT, AS_OF);
   assert.throws(() => checkCatalogCache(null, catalog), /stale\/absent|no current/);            // stale/absent
   assert.throws(() => checkCatalogCache({ ...goodCatalogCache(catalog), source_id: "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8" }, catalog), /source_id/);  // obsolete long id
   assert.throws(() => checkCatalogCache({ ...goodCatalogCache(catalog, 3), row_count: 4 }, catalog), /row_count/);   // rows != row_count
@@ -205,22 +287,53 @@ test("(slice) wrong hash/key/id/connection/org/scope, dup, >2 rows, and export>1
   assert.throws(() => checkSliceSourceJobs([goodSourceJob(ol, 2)], plan), /not in \{0,1\}/);               // export > 1
   assert.throws(() => checkSliceSourceJobs([goodSourceJob(ol), goodSourceJob(ol)], plan), /duplicate source row/);
   assert.throws(() => checkSliceSourceJobs([goodSourceJob(ol), goodSourceJob(cat), goodSourceJob(cat)], plan), />2 canonical source jobs/);
-  // final-drain completeness: only one source present
-  assert.throws(() => requireBothSourcesPresent([goodSourceJob(ol)], plan), /missing source row for brand-sales:catalog/);
-  // cached source (export 0) is allowed (< 2 total)
+  // mid-drain PARTIAL slice: a not-yet-attempted job may still show create_export_count 0 (it has not
+  // been claimed/exported yet). That is a between-slice state ONLY -- never "cache reuse" -- and the
+  // final-drain guard still requires exactly 1 per hash after a successful drain.
   assert.deepEqual(checkSliceSourceJobs([goodSourceJob(ol, 1), goodSourceJob(cat, 0)], plan), { total: 1, count: 2 });
 });
 
-test("(owners) count, mapping, status, account, connection fail closed", () => {
+test("(final drain) success requires exactly 2 succeeded source jobs, create_export_count === 1 each", () => {
   const plan = mkPlan();
   const [ol, cat] = plan.sources;
-  assert.throws(() => checkOwnerRows([goodOwner(ol)], plan, ACCT), /expected 2/);
+  assert.ok(checkFinalSourceJobs([goodSourceJob(ol, 1), goodSourceJob(cat, 1)], plan));
+  // only one source row after drain: the catalog job is missing entirely
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1)], plan), /missing source row for brand-sales:catalog/);
+  // a 0-export row after a "successful" drain means that job never exported (the pre-existing catalog
+  // cache is a usability prerequisite, NOT a pre-export shortcut) -- fail closed, never "cache reuse"
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1), goodSourceJob(cat, 0)], plan), /!= 1/);
+  // a non-succeeded final row (failed/terminal drain) fails closed
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1), { ...goodSourceJob(cat, 1), fetch_status: "failed" }], plan), /succeeded/);
+});
+
+test("(owner ids) not exactly one nonblank plan-derived owner id fails closed", () => {
+  const plan = mkPlan();
+  const ownerId = checkOwnerIds(ownerIdsOf(plan));
+  assert.ok(norm(ownerId));
+  // blank org fingerprint -> sourceJobOwnerId returns null -> NO owner id survives -> fail closed
+  assert.throws(() => checkOwnerIds(ownerIdsOf({ sources: plan.sources.map((s) => ({ ...s, organizationFingerprint: "" })) })), /exactly one nonblank/);
+  // blank scope hash -> same fail-closed path
+  assert.throws(() => checkOwnerIds(ownerIdsOf({ sources: plan.sources.map((s) => ({ ...s, accountScopeHash: "" })) })), /exactly one nonblank/);
+  // divergent org across the two sources -> TWO distinct owner ids -> fail closed
+  assert.throws(() => checkOwnerIds(ownerIdsOf({ sources: [plan.sources[0], { ...plan.sources[1], organizationFingerprint: "other" }] })), /exactly one nonblank/);
+});
+
+test("(owners) count, owner_id, mapping, status, account, connection fail closed", () => {
+  const plan = mkPlan();
+  const ownerId = checkOwnerIds(ownerIdsOf(plan));
+  const [ol, cat] = plan.sources;
+  assert.throws(() => checkOwnerRows([goodOwner(ol)], plan, ACCT, ownerId), /expected 2/);
+  // wrong owner_id on a membership row (not the plan-derived deterministic owner)
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), owner_id: "deadbeef" }, goodOwner(cat)], plan, ACCT, ownerId), /owner_id/);
+  // missing/blank owner_id
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), owner_id: "" }, goodOwner(cat)], plan, ACCT, ownerId), /owner_id/);
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), owner_id: null }, goodOwner(cat)], plan, ACCT, ownerId), /owner_id/);
   // swapped request_key -> request_hash mapping
   const swapped = [{ ...goodOwner(ol), request_hash: cat.requestHash }, { ...goodOwner(cat), request_hash: ol.requestHash }];
-  assert.throws(() => checkOwnerRows(swapped, plan, ACCT), /mapping mismatch/);
-  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), owner_status: "stale" }, goodOwner(cat)], plan, ACCT), /not active/);
-  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), account_id: "B2" }, goodOwner(cat)], plan, ACCT), /account_id/);
-  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), connection_id: "dd-secondary" }, goodOwner(cat)], plan, ACCT), /connection_id/);
+  assert.throws(() => checkOwnerRows(swapped, plan, ACCT, ownerId), /mapping mismatch/);
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), owner_status: "stale" }, goodOwner(cat)], plan, ACCT, ownerId), /not active/);
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), account_id: "B2" }, goodOwner(cat)], plan, ACCT, ownerId), /account_id/);
+  assert.throws(() => checkOwnerRows([{ ...goodOwner(ol), connection_id: "dd-secondary" }, goodOwner(cat)], plan, ACCT, ownerId), /connection_id/);
 });
 
 test("(shadow + report job) pre-existing shadow, extra/missing snapshot, extra/mis-scoped report job fail closed", () => {
@@ -254,7 +367,7 @@ test("(deadline boundary) slice deadline clamps to overall; stop before slice un
 async function main() {
   ({ planBrandSales } = await import("../lib/server/sync/report-planner.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
-  void sourceJobOwnerId;
+  ({ addDaysStr, monthStartStr } = await import("../lib/server/date-windows.js"));
   for (const t of tests) {
     try { await t.fn(); passed += 1; out("  ok  " + t.name); }
     catch (e) { out("FAIL  " + t.name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; return; }
