@@ -8524,3 +8524,57 @@ no production connection, Supabase write, DataDoe call, migration, deploy, push,
 Scheduler v1, frontend, routes (behavior: the api route only gains the deadline wrapper + 504 mapping), cron,
 request_hash golden pins, and applied migrations untouched; all 7 Gate 0 hashes unchanged; HANDOFF.md +
 .worktrees/ untouched. STOP for Codex re-review.
+
+## Scheduler v2: durable manual-export continuation + real-elapsed-time deadline harness (2026-08-14)
+
+Fourth Codex round on this tranche: fixed the two remaining findings OFFLINE (Gate 5 NOT executed; Appendix M
+and the worker lifecycle untouched as approved). Commits: 0b2c39e (code/tests), then this docs commit.
+
+- FINDING 1 (manual /api/datadoe continuation): new lib/server/manual-source-continuation.js -- a durable
+  attempt marker keyed by the EXACT canonical request_hash, stored via the approved report_snapshots
+  INSERT-IF-ABSENT + rev-CAS action-manifest pattern (no new migration; dedicated non-colliding identity
+  report_key='manual-source-attempt' / account='__manual-source-attempt__' / params_hash over requestHash).
+  Marker payload is safe typed state only (requestHash, organizationFingerprint, sourceId, status, exportId,
+  code, rev, createdAt, updatedAt, expiresAt) -- never an API key, raw error, rows, or response body.
+  State model: atomic insert-if-absent claim (creating) BEFORE the create POST (only the winner POSTs; claim
+  not writable => typed MANUAL_SOURCE_CONTINUATION_UNAVAILABLE, no POST); a concurrent/replayed request makes
+  ZERO POSTs and gets typed MANUAL_SOURCE_IN_PROGRESS (retryable) without touching the owner's marker; the
+  exportId is persisted via rev-CAS to 'polling' BEFORE any poll; poll-window/deadline escapes preserve the
+  marker+exportId and carry durableContinuation=true; a SEPARATE later HTTP request recomputes the hash,
+  loads the saved exportId, resumes poll/download with zero new creates; completion persists rows through the
+  NORMAL source cache first, then removes the marker; a DEFINITE create failure (DataDoe answered the POST
+  with an error status) records only CREATE_FAILED_<status> and is re-claimable via CAS; an AMBIGUOUS create
+  outcome (deadline/abort/transport mid-POST, or a no-id response) or ANY marker-transition failure fails
+  closed -- marker stays 'creating', expires (10 min TTL) into typed MANUAL_SOURCE_ATTEMPT_UNCERTAIN, and is
+  NEVER silently re-created (clearing an uncertain marker is a deliberate admin deleteReportSnapshotByKey);
+  'polling' markers never block (resume is free) and are removed on completion; cache hits return BEFORE any
+  marker read or export. fetchSourceChunk routes through the protocol whenever isSupabaseConfigured() (test
+  override seam for offline suites); the legacy no-store path marks escapes durableContinuation=false.
+  Route: exported classifyDataDoeRouteError -- deadline/poll-pending => 504 with retryable = (durable
+  continuation exists); IN_PROGRESS => 504 retryable:true; UNAVAILABLE/UNCERTAIN => 503 retryable:false;
+  FIXED safe messages only; exportId and raw DataDoe/Supabase text never reach the browser. maxDuration=60 /
+  55s DataDoe budget / 5s headroom unchanged; no client auto-retry loops; refresh locks + LKG untouched.
+- FINDING 2 (deadline tests model real time + aborts): the deadline section of
+  scripts/datadoe-poll-export.test.js now runs under an injected deterministic virtual clock/scheduler --
+  every setTimeout becomes a virtual timer, FIRING a timer ADVANCES the same clock Date.now() reads (so
+  cadence, rate-limit, and 429 retry sleeps all consume simulated budget), and a slow fetch stays PENDING on
+  a virtual timer, honors options.signal, and rejects AbortError when ddFetch's own deadline abort timer
+  fires -- proving ddFetch translates its abort into DataDoeDeadlineError. No real 5s waits. Regressions:
+  (1) cadence 5s + HTTP 4s latency charged to one 12s budget (elapsed exactly 9000ms; second cadence defers);
+  (2) budget < one cadence => zero GETs, clock unmoved; (3) remaining budget 700ms => the HTTP request never
+  starts; (4) an in-flight 60s GET under a 10s budget is aborted at EXACTLY t=9250ms (deadline - 750ms
+  headroom), abort observed by the stub via AbortSignal; (5) rate-limit spacing sleep (1.2s budget) and a
+  429 retry-after sleep (2.9s budget) defer with no extra request; (6) elapsed simulated time never exceeds
+  the bound in every case; (7) poll-pending stays distinct from execution-deadline; (8) the Scheduler-v2
+  two-invocation worker resume regressions (404 / PENDING / deadline) stay green.
+- Tests: datadoe-poll-export 14/14; manual-source-continuation 17/17 (new suite, wired as
+  test:manual-source-continuation into package.json + verify.mjs). Direct re-runs: source-cache 73,
+  brand-view 78, sync-source-jobs, sync-signals, sync-dispatch 37, runtime-composition 26 -- all exit 0.
+  node --check on all changed files OK. npm run verify: 33/33 steps across 13 suites incl. build:check,
+  exit 0 in 81s. git diff --check clean. Untracked: only HANDOFF.md + .worktrees/.
+
+CONFIRMED: SHADOW MODE; every Scheduler-v2 control locked and paused (allowlist empty); Gate 5 NOT executed;
+no production connection, Supabase write, DataDoe call, migration, deploy, push, merge, unlock, or schedule;
+Scheduler v1, frontend behavior/design, routes other than the internal continuation/error-mapping handling,
+cron, request_hash pins, source contracts, applied migrations, Appendix M, HANDOFF.md, and .worktrees/
+untouched; all 7 Gate 0 hashes unchanged. STOP for Codex re-review.
