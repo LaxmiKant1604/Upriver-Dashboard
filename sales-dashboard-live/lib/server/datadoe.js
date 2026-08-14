@@ -68,6 +68,26 @@ export function isDataDoeDeadlineError(error) {
   return error?.code === "DATADOE_DEADLINE" || error instanceof DataDoeDeadlineError;
 }
 
+// Typed poll-window-exhausted signal: the bounded poll window ended while the export was
+// still in a TEMPORARY state (repeated status-GET 404 before the export becomes visible,
+// or an ordinary PENDING/processing status). This is NOT a failure: the export id is
+// valid and the SAME id can be polled again by a later invocation. Scheduler v2 treats it
+// exactly like a deadline deferral (job stays 'attempted' with its export_id; no failure
+// recorded; never a second create-export POST). Genuine terminal outcomes (status-GET
+// 500, FAILED / ERROR / BLOCKED_NO_TOKENS, create-POST 404) still throw plain errors.
+export class DataDoePollPendingError extends Error {
+  constructor(exportId) {
+    super("DataDoe export is still processing after the bounded poll window. Retry shortly to resume the same export.");
+    this.name = "DataDoePollPendingError";
+    this.code = "DATADOE_POLL_PENDING";
+    this.exportId = exportId ?? null;
+  }
+}
+
+export function isDataDoePollPendingError(error) {
+  return error?.code === "DATADOE_POLL_PENDING" || error instanceof DataDoePollPendingError;
+}
+
 // AsyncLocalStorage lets every existing report builder inherit the scheduled
 // invocation deadline without threading a new argument through every helper.
 // Browser-triggered/manual routes do not call this wrapper and keep their
@@ -214,10 +234,14 @@ export async function pollExport(apiKey, exportId) {
   // (2) treat a status-GET 404 as "not visible yet" (still pending) within
   // this SAME bounded window -- never terminal, and NEVER answered by a second
   // create-export POST (the export id is fixed; this function only ever GETs).
-  // A 404 that outlives every attempt becomes the normal poll timeout
-  // (non-terminal, resumable by export_id -- still no second create). Any
-  // other non-OK status stays a real failure, as does a 404 on the CREATE
-  // POST itself (createExport above throws on any non-OK response).
+  //
+  // Terminal states (a non-404 non-OK status, FAILED / ERROR / BLOCKED_NO_TOKENS)
+  // throw INSIDE the loop, so reaching the end of the window means every
+  // observation was TEMPORARY (404 not-yet-visible, or PENDING/processing).
+  // That exhaustion is NOT a failure: throw the typed DataDoePollPendingError
+  // so callers can leave the job 'attempted' with its export_id and RESUME the
+  // SAME export later (Scheduler v2 defers exactly like a deadline deferral;
+  // still never a second create-export POST).
   const maxAttempts = 9;
   const delayMs = 5000;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -231,7 +255,7 @@ export async function pollExport(apiKey, exportId) {
       throw new Error(`DataDoe export failed to process (${body.status}).`);
     }
   }
-  throw new Error("DataDoe export timed out while processing. Try a shorter date range.");
+  throw new DataDoePollPendingError(exportId);
 }
 
 export async function downloadExport(apiKey, exportId) {

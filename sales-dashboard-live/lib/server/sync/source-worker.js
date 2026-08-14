@@ -33,7 +33,7 @@
 //     download(job, exportId) -> rows            // returns the rows array (or throws)
 //   }
 
-import { isDataDoeDeadlineError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
+import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
 import { sourceJobOwnerId } from "../source-identity.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
@@ -48,6 +48,12 @@ function approxPayloadBytes(rows) {
 export function classifyFetchError(error, stage = "create-export") {
   if (isDataDoeDeadlineError(error)) {
     return { stage, code: "TIMEOUT", message: "DataDoe work deferred at the execution deadline.", terminal: false };
+  }
+  // Defensive: the typed poll-window-exhausted signal is normally intercepted as a resumable
+  // deferral BEFORE classification (an export_id always exists at the poll stage). If it ever
+  // reaches classification anyway it must stay non-terminal so the export can still be resumed.
+  if (isDataDoePollPendingError(error)) {
+    return { stage, code: "POLL_PENDING", message: "DataDoe export still processing at the end of the bounded poll window; resumable.", terminal: false };
   }
   if (isSourceDisabledError(error)) {
     return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true };
@@ -107,13 +113,15 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     return { requestKey, requestHash, status: terminal ? "terminal" : "failed", validated: false, code };
   };
 
-  // An EXECUTION-deadline deferral (our withDataDoeDeadline, NOT a DataDoe processing
-  // timeout) after an export id is saved is RESUMABLE: leave the job 'attempted' with its
-  // export_id and record nothing, so the next bounded invocation resumes poll/download
-  // without a second create-export. Returns a deferral outcome only when export_id exists;
-  // otherwise the caller falls through to a normal failure.
-  const deferIfDeadline = (error, stage) => {
-    if (isDataDoeDeadlineError(error) && exportId) {
+  // A RESUMABLE deferral after an export id is saved: either an EXECUTION-deadline deferral
+  // (our withDataDoeDeadline, NOT a DataDoe processing timeout) or the typed poll-window
+  // exhaustion (DataDoePollPendingError -- the bounded window saw ONLY temporary states:
+  // repeated status-GET 404 / ordinary PENDING). Both leave the job 'attempted' with its
+  // export_id and record NOTHING (no source failure), so the next bounded invocation resumes
+  // poll/download of the SAME export without a second create-export. Returns a deferral
+  // outcome only when export_id exists; otherwise the caller falls through to a normal failure.
+  const deferIfResumable = (error, stage) => {
+    if ((isDataDoeDeadlineError(error) || isDataDoePollPendingError(error)) && exportId) {
       progress.deferred += 1;
       return { requestKey, requestHash, status: "deferred", validated: false, resumable: true, stage };
     }
@@ -153,7 +161,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   try {
     await runWithDeadline(() => dataDoe.poll(job, exportId));
   } catch (error) {
-    const deferral = deferIfDeadline(error, "poll");
+    const deferral = deferIfResumable(error, "poll");
     if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "poll");
     return fail(cls.stage, cls.code, cls.message, cls.terminal);
@@ -164,7 +172,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   try {
     rows = await runWithDeadline(() => dataDoe.download(job, exportId));
   } catch (error) {
-    const deferral = deferIfDeadline(error, "download");
+    const deferral = deferIfResumable(error, "download");
     if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "download");
     return fail(cls.stage, cls.code, cls.message, cls.terminal);

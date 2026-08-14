@@ -55,12 +55,15 @@ import {
   downloadExport,
   fetchAccounts as fetchAccountsRaw,
   fetchExportRows as fetchExportRowsRaw,
+  isDataDoeDeadlineError,
+  isDataDoePollPendingError,
   isDateStr,
   isFullCalendarMonthWindow,
   num,
   pad2s,
   pollExport,
   splitDateRangeByMonth,
+  withDataDoeDeadline,
 } from "../lib/server/datadoe.js";
 import {
   connectionForApiKey,
@@ -2044,7 +2047,21 @@ export function mergeSalesAndAds(salesRows, adRows) {
   return salesRows;
 }
 
-export default async function handler(req, res) {
+// Absolute DataDoe execution budget for THIS serverless function (Blocker 2). vercel.json pins
+// maxDuration to 60s (NOT increased); the DataDoe transport gets 55s so 5s of shutdown headroom
+// remains for response serialization / snapshot persistence after the last DataDoe operation.
+// withDataDoeDeadline threads the deadline through AsyncLocalStorage, so EVERY DataDoe request
+// (ddFetch pre-checks + an AbortController on the in-flight request), every rate-limit/429-retry
+// sleep, and every poll cadence sleep inside this invocation is bounded -- no new request starts
+// when insufficient time remains, and no sleep can run past the budget. No process.exit, no
+// forced timers: work stops by the typed DataDoeDeadlineError surfacing through the normal path.
+const ROUTE_DATADOE_BUDGET_MS = 55_000;
+
+export default function handler(req, res) {
+  return withDataDoeDeadline(Date.now() + ROUTE_DATADOE_BUDGET_MS, () => handleDataDoe(req, res));
+}
+
+async function handleDataDoe(req, res) {
   let legacySharedRefresh = null;
   try {
     const access = await getDashboardAccess(req);
@@ -3329,6 +3346,13 @@ export default async function handler(req, res) {
 
     res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=brand-view-portfolio, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
+    // The typed deadline/poll-pending signals are RETRYABLE, not server faults: the export (if
+    // one was created) is still processing and a fresh request can resume or re-read it. Surface
+    // 504 with a clean retry hint instead of a generic 500.
+    if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
+      res.status(504).json({ error: "DataDoe is still processing this request. Please retry in a moment.", retryable: true });
+      return;
+    }
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   } finally {
