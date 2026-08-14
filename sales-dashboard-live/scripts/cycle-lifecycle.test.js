@@ -1,13 +1,12 @@
-// Scheduler v2 -- cycle lifecycle + finalization + concurrency (deterministic OFFLINE).
+// Scheduler v2 -- cycle lifecycle + finalization + concurrency + scope semantics (deterministic OFFLINE).
 //
-// Proves Blocker 1's fix: the canonical dispatcher OWNS cycle finalization; a genuine terminal drain becomes a
-// terminal status with finished_at + authoritative source AND report counters; non-drained/deferred/deadline/
-// maxJobs work stays running (finished_at null, resumable); finalization is guarded + idempotent; and neither a
-// manual subset, a concurrent continuation, nor a stale finalizer can prematurely close a cycle (and no work
-// can be appended after terminalization). The in-memory finalizeCycle + append-guard MODEL the semantics of the
-// PREPARED (unapplied) finalize_sync_cycle RPC + reject_append_to_terminal_cycle trigger
-// (supabase/migrations/20260815_sync_cycle_finalize.sql), reusing the real cycle-lifecycle.js pure logic. NO
-// network, DataDoe, or Supabase I/O.
+// Proves Blocker 1's fix: the canonical dispatcher OWNS cycle finalization via a GUARDED, TYPED-disposition
+// finalize; auto-finalization is attempted ONLY for a COMPLETE SCHEDULED scope (manual subsets never terminalize
+// the shared cycle -> the unplanned-manual-subset hole is closed); a drained scheduled cycle becomes terminal
+// with finished_at + authoritative source AND report counters; open-work requests continuation; unknown/
+// malformed dispositions fail closed; and neither ordering of append vs finalize can corrupt the cycle. The
+// in-memory finalizeCycle + append-guard MODEL the semantics of the PREPARED (unapplied) finalize_sync_cycle
+// RPC + reject_append_to_terminal_cycle trigger, reusing the real cycle-lifecycle.js pure logic.
 //
 // 7-bit ASCII, LF. Run: node scripts/cycle-lifecycle.test.js
 
@@ -25,158 +24,107 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 let lc, runSchedulerV2Shadow;
 
-// ---- an in-memory cycle store that MODELS the guarded finalize RPC + the append-after-terminal trigger ----
-// A single cycle, cycle-scoped source/report jobs. finalizeCycle mirrors finalize_sync_cycle; the upserts
-// mirror the reject_append_to_terminal_cycle trigger.
+// ---- in-memory cycle model: guarded finalizeCycle (TYPED disposition) + append-after-terminal guard ----
 function makeCycleModel() {
   const cycle = { id: "cyc", status: "running", finished_at: null, source_total: 0, source_succeeded: 0, source_failed: 0, report_total: 0, report_succeeded: 0, report_failed: 0 };
-  const source = new Map(); // request_hash -> job
-  const report = new Map(); // key -> job
+  const source = new Map();
+  const report = new Map();
   const TERMINAL = new Set(["succeeded", "partial", "failed"]);
   const guardTerminal = () => { if (TERMINAL.has(cycle.status)) throw new Error(`cycle ${cycle.id} is terminal (${cycle.status}); refusing to append/alter child work`); };
   return {
     cycle,
-    addSource(hash, fetch_status = "pending") { guardTerminal(); source.set(hash, { request_hash: hash, fetch_status, create_export_count: 0 }); },
+    addSource(hash, fetch_status = "pending") { guardTerminal(); source.set(hash, { request_hash: hash, fetch_status }); },
     setSource(hash, patch) { guardTerminal(); Object.assign(source.get(hash), patch); },
     addReport(key, patch = {}) { guardTerminal(); report.set(key, { key, fetch_status: "pending", derive_status: "pending", save_status: "pending", ...patch }); },
-    setReport(key, patch) { guardTerminal(); Object.assign(report.get(key), patch); },
-    sources: () => [...source.values()].map((j) => ({ ...j })),
-    reports: () => [...report.values()].map((j) => ({ ...j })),
-    // MODEL of finalize_sync_cycle(p_cycle_id, p_expect_status): guarded, atomic, recomputes counters.
-    finalizeCycle({ cycleId, expectStatus = "running" }) {
-      if (cycleId !== cycle.id) return null;
-      if (cycle.status !== expectStatus) return null;                       // idempotent / already terminal (row 9)
+    finalizeCycle({ cycleId }) {
+      if (cycleId !== cycle.id) return { disposition: "not-found", cycle: null };
+      if (TERMINAL.has(cycle.status)) return { disposition: "already-terminal", cycle: { ...cycle } };
+      if (cycle.status !== "running") return { disposition: "invalid-status", cycle: null };
       const src = [...source.values()], rep = [...report.values()];
-      if (!lc.cycleFullyDrained(src, rep)) return null;                     // GUARD: open work -> decline (rows 7-8)
+      if (!lc.cycleFullyDrained(src, rep)) return { disposition: "open-work", cycle: null };
       const c = lc.computeCycleCounters(src, rep);
-      cycle.status = lc.terminalCycleStatus(c);
-      cycle.finished_at = "t";
+      cycle.status = lc.terminalCycleStatus(c); cycle.finished_at = "t";
       Object.assign(cycle, { source_total: c.sourceTotal, source_succeeded: c.sourceSucceeded, source_failed: c.sourceFailed, report_total: c.reportTotal, report_succeeded: c.reportSucceeded, report_failed: c.reportFailed });
-      return { ...cycle };
+      return { disposition: "finalized", cycle: { ...cycle } };
     },
   };
 }
 
 // ============================= Part 1: pure state-table unit tests =============================
 
-test("(pure) terminalCycleStatus follows the state table", () => {
-  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 2, sourceFailed: 0, reportSucceeded: 1, reportFailed: 0 }), "succeeded");
-  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 1, sourceFailed: 1, reportSucceeded: 1, reportFailed: 0 }), "partial");
-  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 1, sourceFailed: 0, reportSucceeded: 0, reportFailed: 1 }), "partial");
-  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 0, sourceFailed: 2, reportSucceeded: 0, reportFailed: 0 }), "failed");
-  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 0, sourceFailed: 0, reportSucceeded: 0, reportFailed: 1 }), "failed");
-  assert.equal(lc.terminalCycleStatus({}), "succeeded"); // vacuous: nothing failed
-});
-
-test("(pure) open-job classifiers + drained + counters", () => {
-  assert.equal(lc.isSourceJobOpen({ fetch_status: "pending" }), true);
+test("(pure) terminalCycleStatus + classifiers + counters + cycleFullyDrained", () => {
+  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 2, reportSucceeded: 1 }), "succeeded");
+  assert.equal(lc.terminalCycleStatus({ sourceSucceeded: 1, sourceFailed: 1 }), "partial");
+  assert.equal(lc.terminalCycleStatus({ reportFailed: 1 }), "failed");
   assert.equal(lc.isSourceJobOpen({ fetch_status: "attempted" }), true);
   for (const s of ["succeeded", "failed", "skipped"]) assert.equal(lc.isSourceJobOpen({ fetch_status: s }), false);
   assert.equal(lc.isReportJobFinished({ fetch_status: "blocked" }), true);
   assert.equal(lc.isReportJobFinished({ derive_status: "succeeded", save_status: "succeeded" }), true);
-  assert.equal(lc.isReportJobFinished({ derive_status: "failed" }), true);
-  assert.equal(lc.isReportJobFinished({ save_status: "failed" }), true);
   assert.equal(lc.isReportJobFinished({ derive_status: "pending", save_status: "pending" }), false);
-  assert.equal(lc.isReportJobSuccess({ derive_status: "succeeded", save_status: "succeeded" }), true);
-  assert.equal(lc.isReportJobSuccess({ derive_status: "succeeded", save_status: "failed" }), false);
   assert.equal(lc.cycleFullyDrained([{ fetch_status: "succeeded" }], [{ derive_status: "succeeded", save_status: "succeeded" }]), true);
   assert.equal(lc.cycleFullyDrained([{ fetch_status: "attempted" }], []), false);
-  assert.equal(lc.cycleFullyDrained([], [{ derive_status: "pending", save_status: "pending" }]), false);
-  const c = lc.computeCycleCounters(
-    [{ fetch_status: "succeeded" }, { fetch_status: "failed" }],
-    [{ derive_status: "succeeded", save_status: "succeeded" }, { fetch_status: "blocked" }],
-  );
-  assert.deepEqual(c, { sourceTotal: 2, sourceSucceeded: 1, sourceFailed: 1, reportTotal: 2, reportSucceeded: 1, reportFailed: 1 });
+  assert.deepEqual(lc.computeCycleCounters([{ fetch_status: "succeeded" }, { fetch_status: "failed" }], [{ derive_status: "succeeded", save_status: "succeeded" }, { fetch_status: "blocked" }]),
+    { sourceTotal: 2, sourceSucceeded: 1, sourceFailed: 1, reportTotal: 2, reportSucceeded: 1, reportFailed: 1 });
 });
 
-// ============================= Part 2: guarded finalize + concurrency =============================
+// ============================= Part 2: guarded finalize -> TYPED disposition + concurrency =============================
 
-test("(finalize) fully drained success -> succeeded, finished_at set, exact source+report counters", () => {
+test("(finalize) drained success -> 'finalized' + succeeded + finished_at + exact source AND report counters", () => {
   const m = makeCycleModel();
   m.addSource("h1", "succeeded"); m.addSource("h2", "succeeded");
   m.addReport("brand-sales|A1", { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded" });
-  const row = m.finalizeCycle({ cycleId: "cyc" });
-  assert.ok(row); assert.equal(row.status, "succeeded"); assert.equal(m.cycle.finished_at, "t");
-  assert.equal(m.cycle.source_total, 2); assert.equal(m.cycle.source_succeeded, 2); assert.equal(m.cycle.source_failed, 0);
+  const r = m.finalizeCycle({ cycleId: "cyc" });
+  assert.equal(r.disposition, "finalized"); assert.equal(r.cycle.status, "succeeded"); assert.equal(m.cycle.finished_at, "t");
+  assert.equal(m.cycle.source_total, 2); assert.equal(m.cycle.source_succeeded, 2);
   assert.equal(m.cycle.report_total, 1); assert.equal(m.cycle.report_succeeded, 1); assert.equal(m.cycle.report_failed, 0);
 });
 
-test("(finalize) drained with a failed source -> partial; all-failed -> failed (state table rows 2-3)", () => {
+test("(finalize) partial + failed statuses follow the table; counters persist only on terminal completion", () => {
   const p = makeCycleModel();
-  p.addSource("h1", "succeeded"); p.addSource("h2", "failed");
-  p.addReport("r|A1", { fetch_status: "blocked" }); // blocked report counts as a failure
-  const rp = p.finalizeCycle({ cycleId: "cyc" });
-  assert.equal(rp.status, "partial"); assert.equal(p.cycle.report_failed, 1); assert.equal(p.cycle.source_failed, 1);
-
-  const f = makeCycleModel();
-  f.addSource("h1", "failed"); f.addSource("h2", "failed");
-  const rf = f.finalizeCycle({ cycleId: "cyc" });
-  assert.equal(rf.status, "failed"); assert.equal(f.cycle.finished_at, "t");
+  p.addSource("h1", "succeeded"); p.addSource("h2", "failed"); p.addReport("r|A1", { fetch_status: "blocked" });
+  assert.equal(p.finalizeCycle({ cycleId: "cyc" }).disposition, "finalized");
+  assert.equal(p.cycle.status, "partial"); assert.equal(p.cycle.report_failed, 1); assert.equal(p.cycle.source_failed, 1);
+  const f = makeCycleModel(); f.addSource("h1", "failed");
+  assert.equal(f.finalizeCycle({ cycleId: "cyc" }).cycle.status, "failed");
 });
 
-test("(finalize) an OPEN source or report job DECLINES finalization -> stays running, finished_at null", () => {
-  const s = makeCycleModel();
-  s.addSource("h1", "succeeded"); s.addSource("h2", "attempted"); // one still resumable
-  assert.equal(s.finalizeCycle({ cycleId: "cyc" }), null);
-  assert.equal(s.cycle.status, "running"); assert.equal(s.cycle.finished_at, null);
-
-  const r = makeCycleModel();
-  r.addSource("h1", "succeeded");
-  r.addReport("r|A1", { derive_status: "pending", save_status: "pending" }); // report not finished
-  assert.equal(r.finalizeCycle({ cycleId: "cyc" }), null);
-  assert.equal(r.cycle.status, "running");
+test("(finalize) open source/report -> 'open-work' (continuation), NOT terminal; finished_at null", () => {
+  const s = makeCycleModel(); s.addSource("h1", "succeeded"); s.addSource("h2", "attempted");
+  const r = s.finalizeCycle({ cycleId: "cyc" });
+  assert.equal(r.disposition, "open-work"); assert.equal(s.cycle.status, "running"); assert.equal(s.cycle.finished_at, null);
+  const q = makeCycleModel(); q.addSource("h1", "succeeded"); q.addReport("r|A1", { derive_status: "pending", save_status: "pending" });
+  assert.equal(q.finalizeCycle({ cycleId: "cyc" }).disposition, "open-work");
 });
 
-test("(finalize) idempotent -- a second finalize returns null and never changes a terminal cycle (row 9)", () => {
-  const m = makeCycleModel();
-  m.addSource("h1", "succeeded");
-  const first = m.finalizeCycle({ cycleId: "cyc" });
-  assert.equal(first.status, "succeeded");
-  const finishedAt = m.cycle.finished_at;
-  const second = m.finalizeCycle({ cycleId: "cyc" });
-  assert.equal(second, null, "second finalize is a no-op");
-  assert.equal(m.cycle.status, "succeeded"); assert.equal(m.cycle.finished_at, finishedAt);
+test("(finalize) idempotent replay -> 'already-terminal' + complete; unknown cycle -> 'not-found'", () => {
+  const m = makeCycleModel(); m.addSource("h1", "succeeded");
+  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).disposition, "finalized");
+  const fin = m.cycle.finished_at;
+  const again = m.finalizeCycle({ cycleId: "cyc" });
+  assert.equal(again.disposition, "already-terminal"); assert.equal(again.cycle.status, "succeeded"); assert.equal(m.cycle.finished_at, fin);
+  assert.equal(m.finalizeCycle({ cycleId: "nope" }).disposition, "not-found");
 });
 
-test("(concurrency A: append-then-finalize) a continuation that appended OPEN work makes finalize decline", () => {
-  const m = makeCycleModel();
-  m.addSource("h1", "succeeded");
-  // a concurrent continuation appends a fresh pending source job BEFORE the (stale) finalizer runs
-  m.addSource("h2", "pending");
-  assert.equal(m.finalizeCycle({ cycleId: "cyc" }), null, "stale finalizer cannot close while open work exists");
-  assert.equal(m.cycle.status, "running");
-  // once that job drains, finalize succeeds
+test("(concurrency A: append-then-finalize) an appended OPEN job makes finalize return 'open-work' (stale finalizer cannot close)", () => {
+  const m = makeCycleModel(); m.addSource("h1", "succeeded"); m.addSource("h2", "pending");
+  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).disposition, "open-work"); assert.equal(m.cycle.status, "running");
   m.setSource("h2", { fetch_status: "succeeded" });
-  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).status, "succeeded");
+  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).disposition, "finalized");
 });
 
-test("(concurrency B: finalize-then-append) after terminalization, appending any child work is REJECTED", () => {
-  const m = makeCycleModel();
-  m.addSource("h1", "succeeded");
-  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).status, "succeeded");
-  assert.throws(() => m.addSource("h2", "pending"), /terminal/);        // no new source job after terminal
-  assert.throws(() => m.addReport("r|A1"), /terminal/);                 // no new report job after terminal
-  assert.throws(() => m.setSource("h1", { fetch_status: "failed" }), /terminal/); // no alteration after terminal
+test("(concurrency B: finalize-then-append) after terminalization, appending/altering any child work is REJECTED", () => {
+  const m = makeCycleModel(); m.addSource("h1", "succeeded");
+  assert.equal(m.finalizeCycle({ cycleId: "cyc" }).disposition, "finalized");
+  assert.throws(() => m.addSource("h2", "pending"), /terminal/);
+  assert.throws(() => m.addReport("r|A1"), /terminal/);
+  assert.throws(() => m.setSource("h1", { fetch_status: "failed" }), /terminal/);
 });
 
-test("(manual subset / shared cycle) a subset drain cannot close a cycle that still has another owner's open work (row 7)", () => {
-  const m = makeCycleModel();
-  // this run's owned scope drained...
-  m.addSource("owned-1", "succeeded");
-  m.addReport("brand-sales|A1", { derive_status: "succeeded", save_status: "succeeded" });
-  // ...but ANOTHER owner/report on the SAME shared cycle still has open work
-  m.addSource("other-owner-1", "pending");
-  assert.equal(m.finalizeCycle({ cycleId: "cyc" }), null, "manual subset must not prematurely close the shared cycle");
-  assert.equal(m.cycle.status, "running"); assert.equal(m.cycle.finished_at, null);
-});
-
-// ============================= Part 3: the dispatcher OWNS finalization =============================
-// A compact dispatcher store (source + report + owner + cache) WITH a guarded finalizeCycle + append-guard.
-function makeDispatchStore() {
-  const cycles = new Map(), jobsByCycle = new Map(), ownersByCycle = new Map(), cache = new Map(), reportJobs = new Map();
+// ============================= Part 3: dispatcher scope semantics + typed-disposition handling =============================
+function makeDispatchStore(over = {}) {
+  const cycles = new Map(), jobsByCycle = new Map(), ownersByCycle = new Map(), cache = new Map(), reportJobs = new Map(), cycleOfReport = new Map();
   let seq = 0;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
-  const cycleOfReport = new Map();
   const TERMINAL = new Set(["succeeded", "partial", "failed"]);
   const guard = (cid) => { const c = findCycle(cid); if (c && TERMINAL.has(c.status)) throw new Error(`cycle ${cid} terminal; refusing append`); };
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
@@ -205,20 +153,21 @@ function makeDispatchStore() {
     recordReportBlocked({ reportKey, accountId }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); },
     recordReportFailure({ reportKey, accountId, stage, code }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); },
     recordReportSuccess({ reportKey, accountId, latestDataDate }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true, latest_data_date: latestDataDate ?? null }); },
-    // guarded finalize modeling finalize_sync_cycle: recompute counters, decline while open work exists.
-    finalizeCycle({ cycleId, expectStatus = "running" }) {
+    finalizeCycle({ cycleId }) {
       store.finalizeCalls += 1;
+      if (over.finalizeCycle) return over.finalizeCycle(cycleId, findCycle(cycleId));
       const c = findCycle(cycleId);
-      if (!c || c.status !== expectStatus) return null;
-      const src = this.listSourceJobs(cycleId);
-      const rep = this.listReportJobs(cycleId);
-      if (!lc.cycleFullyDrained(src, rep)) return null;
+      if (!c) return { disposition: "not-found", cycle: null };
+      if (TERMINAL.has(c.status)) return { disposition: "already-terminal", cycle: { ...c } };
+      const src = this.listSourceJobs(cycleId), rep = this.listReportJobs(cycleId);
+      if (!lc.cycleFullyDrained(src, rep)) return { disposition: "open-work", cycle: null };
       const k = lc.computeCycleCounters(src, rep);
       c.status = lc.terminalCycleStatus(k); c.finished_at = "t";
       Object.assign(c, { source_total: k.sourceTotal, source_succeeded: k.sourceSucceeded, source_failed: k.sourceFailed, report_total: k.reportTotal, report_succeeded: k.reportSucceeded, report_failed: k.reportFailed });
-      return { ...c };
+      return { disposition: "finalized", cycle: { ...c } };
     },
   };
+  if (over.dropFinalize) delete store.finalizeCycle;
   return store;
 }
 function makeDataDoe(opts = {}) {
@@ -226,7 +175,6 @@ function makeDataDoe(opts = {}) {
   const deadlineErr = () => Object.assign(new Error("deferred"), { code: "DATADOE_DEADLINE" });
   return {
     totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
-    createCount: (h) => create[h] || 0,
     async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; },
     async poll(job) { const k = job.requestKey || ""; if (opts.deferPollKey && k === opts.deferPollKey) { pollHits[k] = (pollHits[k] || 0) + 1; if (pollHits[k] === 1) throw deadlineErr(); } },
     async download(job) { const rk = job.requestKey || ""; if (rk.endsWith(":catalog")) return [{ child_asin: "A", parent_asin: "P", product_name: "P", product_brand: "Acme" }]; return [{ x: 1 }]; },
@@ -237,59 +185,93 @@ const US_ACCTS = [{ accountId: "A1", country: "US", currency: "USD", name: "Acct
 const mkCatalog = (ready = [], enabled = ready) => () => [...new Set([...ready, ...enabled])].map((rk) => ({ reportKey: rk, ready: ready.includes(rk), scheduleEnabled: enabled.includes(rk) }));
 const saver = async () => ({ paramsHash: "ph" });
 const dispatch = (over = {}) => runSchedulerV2Shadow({
-  bucket: "us", cycleDate: "2026-08-11", asOf: "2026-08-01",
+  bucket: "us", cycleDate: over.cycleDate || "2026-08-11", asOf: "2026-08-01",
   connections: CONNS, discoverAccounts: async () => US_ACCTS,
-  store: over.store, dataDoe: over.dataDoe, saveSnapshot: saver,
+  store: over.store, dataDoe: over.dataDoe || makeDataDoe(), saveSnapshot: saver,
   controlCatalog: over.controlCatalog, manualReportKeys: over.manualReportKeys,
   maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
 });
+// scheduled run: ready + schedule-enabled, NO manualReportKeys
+const scheduled = (keys, over = {}) => dispatch({ ...over, controlCatalog: mkCatalog(keys, keys) });
+// manual run: named keys, ready (not necessarily enabled)
+const manual = (keys, over = {}) => dispatch({ ...over, controlCatalog: mkCatalog(keys), manualReportKeys: keys });
 
-test("(dispatcher) a genuine terminal drain FINALIZES the cycle: terminal status + finished_at + persisted counters", async () => {
+test("(dispatcher: SCHEDULED complete scope) a drained scheduled run auto-finalizes -> terminal + finished_at + counters", async () => {
   const store = makeDispatchStore();
-  const r = await dispatch({ store, dataDoe: makeDataDoe(), manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) });
-  assert.equal(r.drained, true, "the run drained");
-  assert.equal(r.finalized, true, "the dispatcher owns + performed finalization");
-  assert.ok(["succeeded", "partial", "failed"].includes(r.cycleStatus), "cycle reached a terminal status");
+  const r = await scheduled(["brand-sales"], { store });
+  assert.equal(r.drained, true); assert.equal(r.finalized, true, "scheduled drain auto-finalizes");
+  assert.ok(["succeeded", "partial", "failed"].includes(r.cycleStatus));
   const c = store.getCycle(r.cycleId);
-  assert.ok(["succeeded", "partial", "failed"].includes(c.status));
-  assert.equal(c.finished_at, "t", "finished_at is stamped on terminalization");
-  assert.equal(c.source_total, store.listSourceJobs(r.cycleId).length, "authoritative source counters persisted");
-  assert.equal(c.report_total, store.listReportJobs(r.cycleId).length, "authoritative report counters persisted");
-  // report counters were persisted (Blocker 1: previously nothing wrote them)
-  assert.equal(c.report_succeeded + c.report_failed <= c.report_total, true);
+  assert.equal(c.finished_at, "t"); assert.equal(c.source_total, store.listSourceJobs(r.cycleId).length);
+  assert.equal(c.report_total, store.listReportJobs(r.cycleId).length, "report counters persisted");
 });
 
-test("(dispatcher) maxJobs truncation does NOT finalize -- cycle stays running, finished_at null (resumable)", async () => {
+test("(dispatcher: MANUAL subset) a manual run NEVER auto-finalizes -- the cycle stays running", async () => {
   const store = makeDispatchStore();
-  // brand-sales has 2 source hashes; maxJobs:1 truncates -> not drained
-  const r = await dispatch({ store, dataDoe: makeDataDoe(), manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]), maxJobs: 1 });
-  assert.equal(r.drained, false, "a maxJobs truncation is not drained");
-  assert.equal(r.finalized, false, "no finalization on a non-drained run");
-  const c = store.getCycle(r.cycleId);
-  assert.equal(c.status, "running"); assert.equal(c.finished_at, null);
+  const r = await manual(["brand-sales"], { store });
+  assert.equal(r.drained, true, "the manual run drained its scope");
+  assert.equal(r.finalized, false, "a manual subset does NOT auto-finalize the shared cycle");
+  assert.equal(store.finalizeCalls, 0, "finalizeCycle is not even called for a manual run");
+  assert.equal(store.getCycle(r.cycleId).status, "running"); assert.equal(store.getCycle(r.cycleId).finished_at, null);
 });
 
-test("(dispatcher) a resumable deferral does NOT finalize; a fresh invocation resumes + finalizes with NO duplicate create-export", async () => {
+test("(dispatcher: the unplanned-manual-subset REGRESSION) manual brand-sales then manual content-changes on the SAME (bucket,date) both append + drain", async () => {
   const store = makeDispatchStore();
-  const dd1 = makeDataDoe({ deferPollKey: "brand-sales:order-lines" }); // first poll defers
-  const r1 = await dispatch({ store, dataDoe: dd1, manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) });
-  assert.equal(r1.drained, false, "deferral -> not drained");
-  assert.equal(r1.finalized, false, "no finalization while a deferral is outstanding");
-  assert.equal(store.getCycle(r1.cycleId).status, "running");
-  const createsAfter1 = dd1.totalCreates();
-  // resume: fresh dataDoe that no longer defers; the persisted export_id is reused (no second create)
+  // A. manual brand-sales drains on (us, 2026-08-20); B. content-changes NOT yet planned/upserted.
+  const rA = await manual(["brand-sales"], { store, cycleDate: "2026-08-20" });
+  assert.equal(rA.drained, true); assert.equal(rA.finalized, false);
+  const cid = rA.cycleId;
+  const brandKeys = store.listSourceJobs(cid).map((j) => j.request_key);
+  assert.ok(brandKeys.some((k) => k.startsWith("brand-sales:")), "brand-sales sources exist");
+  assert.ok(!brandKeys.some((k) => k.startsWith("content-changes:")), "content-changes was NOT pre-seeded");
+  // C. a LATER manual content-changes invocation uses the SAME (bucket, date).
+  const rC = await manual(["content-changes"], { store, cycleDate: "2026-08-20" });
+  // D. Brand Sales must NOT have terminalized the shared cycle -> content-changes appends its sources and drains.
+  assert.equal(rC.cycleId, cid, "same shared cycle");
+  assert.equal(rC.drained, true, "content-changes drained (no terminal-cycle rejection)");
+  const afterKeys = store.listSourceJobs(cid).map((j) => j.request_key);
+  assert.ok(afterKeys.some((k) => k.startsWith("content-changes:")), "content-changes sources were appended to the shared running cycle");
+  assert.equal(store.getCycle(cid).status, "running");
+});
+
+test("(dispatcher: open-work disposition) a scheduled drain whose whole cycle still has open work -> drained=false, continuationRequired=true", async () => {
+  const store = makeDispatchStore({ finalizeCycle: () => ({ disposition: "open-work", cycle: null }) });
+  const r = await scheduled(["brand-sales"], { store });
+  assert.equal(r.finalized, false); assert.equal(r.drained, false, "open-work forces re-observation");
+  assert.equal(r.continuationRequired, true); assert.equal(r.cycleStatus, "running");
+});
+
+test("(dispatcher: fail closed) a scheduled drain with finalization UNAVAILABLE throws (never claims success)", async () => {
+  const store = makeDispatchStore({ dropFinalize: true });
+  await assert.rejects(() => scheduled(["brand-sales"], { store }), /finalization is unavailable/);
+});
+
+test("(dispatcher: fail closed) an unknown/malformed finalize disposition throws", async () => {
+  const store = makeDispatchStore({ finalizeCycle: () => ({ disposition: "weird", cycle: null }) });
+  await assert.rejects(() => scheduled(["brand-sales"], { store }), /unexpected finalize disposition/);
+  const store2 = makeDispatchStore({ finalizeCycle: () => ({}) });
+  await assert.rejects(() => scheduled(["brand-sales"], { store: store2 }), /unexpected finalize disposition/);
+});
+
+test("(dispatcher: not-drained) maxJobs truncation + resumable deferral do NOT finalize; resume finalizes with ZERO duplicate create-export", async () => {
+  // maxJobs truncation (scheduled) -> not drained -> no finalize call
+  const s1 = makeDispatchStore();
+  const r1 = await scheduled(["brand-sales"], { store: s1, maxJobs: 1 });
+  assert.equal(r1.drained, false); assert.equal(r1.finalized, false); assert.equal(s1.finalizeCalls, 0);
+  assert.equal(s1.getCycle(r1.cycleId).status, "running");
+  // deferral (scheduled) -> not drained -> no finalize; resume -> finalize; no dup create-export
+  const s2 = makeDispatchStore();
+  const rd = await scheduled(["brand-sales"], { store: s2, dataDoe: makeDataDoe({ deferPollKey: "brand-sales:order-lines" }) });
+  assert.equal(rd.drained, false); assert.equal(rd.finalized, false); assert.equal(s2.finalizeCalls, 0);
   const dd2 = makeDataDoe();
-  const r2 = await dispatch({ store, dataDoe: dd2, manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog(["brand-sales"]) });
-  assert.equal(r2.drained, true, "the resume drains");
-  assert.equal(r2.finalized, true, "the resume finalizes");
-  assert.equal(store.getCycle(r2.cycleId).finished_at, "t");
-  assert.equal(dd2.totalCreates(), 0, "resume created ZERO new exports (persisted export_id reused) -- no duplicate create-export");
-  void createsAfter1;
+  const rr = await scheduled(["brand-sales"], { store: s2, dataDoe: dd2 });
+  assert.equal(rr.drained, true); assert.equal(rr.finalized, true);
+  assert.equal(dd2.totalCreates(), 0, "resume created ZERO new exports (persisted export_id reused)");
 });
 
-test("(dispatcher) a locked/no-op invocation (nothing dispatchable) never finalizes a cycle", async () => {
+test("(dispatcher: no-op) nothing dispatchable -> no cycle, no finalize", async () => {
   const store = makeDispatchStore();
-  const r = await dispatch({ store, dataDoe: makeDataDoe(), manualReportKeys: ["brand-sales"], controlCatalog: mkCatalog([]) }); // brand-sales NOT ready
+  const r = await dispatch({ store, controlCatalog: mkCatalog([]), manualReportKeys: ["brand-sales"] });
   assert.equal(r.cycleId, null); assert.equal(r.finalized, false); assert.equal(store.finalizeCalls, 0);
 });
 

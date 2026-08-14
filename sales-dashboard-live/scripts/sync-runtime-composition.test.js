@@ -40,7 +40,7 @@ const CONNS_WITH_SECONDARY = [...CONNS, { id: "secondary", apiKey: dash("dd", "s
 
 const SOURCE_METHODS = ["openCycle", "claimCycle", "getCycle", "upsertSourceJob", "listSourceJobs", "upsertSourceJobOwners",
   "listSourceJobOwners", "listSourceJobsForOwners", "recordSourceOwnerStale", "claimExportAttempt", "recordExportCreated",
-  "loadSourceRows", "saveSourceRows", "recordSourceSuccess", "recordSourceFailure", "updateCycleCounts"];
+  "loadSourceRows", "saveSourceRows", "recordSourceSuccess", "recordSourceFailure", "updateCycleCounts", "finalizeCycle"];
 const REPORT_METHODS = ["listSourceJobs", "upsertReportJob", "listReportJobs", "claimReportDerive", "recordReportBlocked",
   "recordReportFailure", "recordReportSuccess"];
 
@@ -68,6 +68,16 @@ function makeBackingStore() {
     recordSourceSuccess({ cycleId, requestHash, exportId, rowCount, cacheObjectPath }) { Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "succeeded", export_id: exportId, row_count: rowCount, cache_object_path: cacheObjectPath }); },
     recordSourceFailure({ cycleId, requestHash, stage, code, terminal }) { Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "failed", error_stage: stage, error_code: code, terminal: !!terminal }); },
     updateCycleCounts() {},
+    // Models finalize_sync_cycle: typed disposition; finalizes only a running cycle with no open source jobs.
+    finalizeCycle({ cycleId }) {
+      const c = findCycle(cycleId);
+      if (!c) return { disposition: "not-found", cycle: null };
+      if (["succeeded", "partial", "failed"].includes(c.status)) return { disposition: "already-terminal", cycle: { ...c } };
+      const open = store.listSourceJobs(cycleId).some((j) => ["pending", "attempted"].includes(j.fetch_status));
+      if (open) return { disposition: "open-work", cycle: null };
+      c.status = "succeeded"; c.finished_at = "t";
+      return { disposition: "finalized", cycle: { ...c } };
+    },
     report(rk, a) { return reportJobs.get(rkey(rk, a)); },
     listReportJobs() { return [...reportJobs.values()].map((j) => ({ ...j })); },
     upsertReportJob({ reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) { const k = rkey(reportKey, accountId); if (reportJobs.has(k)) return; reportJobs.set(k, { report_key: reportKey, account_id: accountId, connection_id: connectionId, bucket, report_version: reportVersion, depends_on: dependsOn || [], fetch_status: "pending", derive_status: "pending", save_status: "pending", validated: false }); },

@@ -106,6 +106,23 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     rpcs: [],
     wrappers: ["upsertSyncSourceJobOwners", "getSyncSourceJobOwners", "getSyncSourceJobsForOwners", "recordSyncSourceJobOwnerStale"],
   },
+  {
+    // Cycle finalization (Blocker 1). Adds NO table/column (sync_cycles already carries status / finished_at /
+    // source_* / report_* from 20260807); provides the guarded finalize RPC + the append-after-terminal triggers
+    // the dispatcher-owned finalization depends on. The RPC takes ONLY p_cycle_id (no expect-status param).
+    migration: "20260815_sync_cycle_finalize.sql",
+    tables: [],
+    rpcs: [
+      { name: "finalize_sync_cycle", params: ["p_cycle_id"] },
+    ],
+    triggers: [
+      { name: "sync_source_jobs_no_append_terminal", table: "sync_source_jobs" },
+      { name: "sync_source_job_owners_no_append_terminal", table: "sync_source_job_owners" },
+      { name: "sync_report_jobs_no_append_terminal", table: "sync_report_jobs" },
+    ],
+    wrappers: ["finalizeSyncCycle"],
+    note: "Guarded finalize_sync_cycle RPC + reject_append_to_terminal_cycle triggers on the 3 child tables (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -332,6 +349,13 @@ function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
+// A trigger is declared when a `create trigger <name> ... on public.<table>` statement exists in `masked`
+// (comments/strings blanked, so a create-trigger appearing only in a comment/string is invisible). `[^;]*`
+// bounds the scan to the single CREATE TRIGGER statement, so it never bleeds across statements/triggers.
+function triggerDeclared(masked, name, table) {
+  return new RegExp(`create\\s+trigger\\s+${name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i").test(masked);
+}
+
 // ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------
 //
 // BLOCKER 2 + endpoint-evidence hardening: wrapper-export and endpoint evidence must come from REAL JavaScript
@@ -489,7 +513,7 @@ function sourceReferencesRpc(litView, rpc) {
 // even the readers whose tables live in earlier migrations outside this phase's four (source_export_cache,
 // ads_sync_state, report_snapshots). Kept in sync with runtime-composition.REQUIRED_WRAPPERS (re-exported there).
 export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
-  "openSyncCycle", "claimSyncCycle", "getSyncCycle", "updateSyncCycleCounts", "claimSourceExportAttempt",
+  "openSyncCycle", "claimSyncCycle", "getSyncCycle", "updateSyncCycleCounts", "finalizeSyncCycle", "claimSourceExportAttempt",
   "upsertSyncSourceJob", "getSyncSourceJobs", "recordSyncSourceSuccess", "recordSyncSourceExportCreated",
   "recordSyncSourceFailure", "getSyncReportJobs", "upsertSyncReportJob", "claimReportDeriveAttempt",
   "recordSyncReportBlocked", "recordSyncReportFailure", "recordSyncReportSuccess",
@@ -537,7 +561,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
     const raw = safeRead(entry.migration);
-    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], wrappers: [], namedConstraints: [] };
+    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], triggers: [], wrappers: [], namedConstraints: [] };
     if (raw == null) {
       blockers.push({ code: "MIGRATION_MISSING", migration: entry.migration, message: `migration ${entry.migration} not found` });
       matrix.push(row);
@@ -577,6 +601,11 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       if (declared && !paramsMatch) blockers.push({ code: "RPC_PARAM_MISMATCH", migration: entry.migration, rpc: r.name, expected: expectedParams, message: `RPC public.${r.name} parameters do not match the expected names/order [${expectedParams.join(", ")}]` });
       if (!referencedByWrapper) blockers.push({ code: "RPC_WRAPPER_MISSING", migration: entry.migration, rpc: r.name, message: `no wrapper calls RPC ${r.name}` });
       row.rpcs.push({ name: r.name, declared, paramsMatch, referencedByWrapper });
+    }
+    for (const tg of entry.triggers || []) {
+      const declared = triggerDeclared(masked, tg.name, tg.table);
+      if (!declared) blockers.push({ code: "TRIGGER_MISSING", migration: entry.migration, trigger: tg.name, table: tg.table, message: `trigger ${tg.name} on public.${tg.table} is not created by ${entry.migration}` });
+      row.triggers.push({ name: tg.name, table: tg.table, declared });
     }
     for (const w of entry.wrappers) {
       const exported = wrapperExported(wrapperCode, w);

@@ -4,51 +4,54 @@
 -- >>> and is applied ONLY via a reviewed single-file Gate after approval, exactly like migrations 1-4 were.
 -- >>> Migrations 1-4 (20260807 / 20260810 x2 / 20260811) are FROZEN and are NOT modified or reapplied here.
 --
--- WHY: the canonical dispatcher (runSchedulerV2Shadow) computes drained/continuationRequired but there is no
--- guarded way to mark a genuinely-drained cycle terminal: `updateSyncCycleCounts` is an UNGUARDED PATCH and
--- never sets finished_at, so a Gate-5-style drained cycle stays status='running' with finished_at null and no
--- persisted report counters. This adds the two DB primitives the fix needs:
---   1. finalize_sync_cycle(cycle_id) -- a GUARDED, atomic running->terminal transition that recomputes the
---      authoritative source AND report counters, stamps finished_at, and picks the terminal status from the
---      documented state table (lib/server/sync/cycle-lifecycle.js). It finalizes ONLY a 'running' cycle that
---      has ZERO open source/report jobs, so a manual subset, a concurrent continuation that appended open
---      work, or a stale finalizer can never prematurely close a cycle -- and a replay against an already
---      terminal cycle is a no-op (returns null).
---   2. reject_append_to_terminal_cycle -- a BEFORE INSERT/UPDATE trigger on the three child tables that blocks
---      adding/altering any source/report/owner row once the parent cycle is terminal, so a concurrent
---      invocation cannot add work after terminalization.
--- The finalize UPDATE takes FOR UPDATE on the cycle row and the trigger takes FOR SHARE, so the two orderings
--- serialize: if an append commits first, finalize sees the open job and declines; if finalize commits first,
--- the append's trigger sees the terminal status and raises. Adds NO table/column (sync_cycles already has
--- status/finished_at/source_*/report_* from 20260807) and no schedule/cron; SECURITY DEFINER + service_role
--- only, matching the existing RPCs.
+-- WHY: the canonical dispatcher computes drained/continuationRequired but there was no guarded way to mark a
+-- genuinely-drained cycle terminal (updateSyncCycleCounts is an UNGUARDED PATCH and never sets finished_at), so
+-- a drained cycle stayed status='running'. This adds the two DB primitives the fix needs:
+--   1. finalize_sync_cycle(cycle_id) -> jsonb -- a GUARDED, atomic running->terminal transition that recomputes
+--      the authoritative source AND report counters, stamps finished_at, and picks the terminal status from the
+--      documented state table (lib/server/sync/cycle-lifecycle.js). It returns a TOTAL, TYPED disposition (never
+--      an ambiguous null): 'finalized' | 'already-terminal' | 'open-work' | 'not-found' | 'invalid-status'. It
+--      finalizes ONLY a 'running' cycle with ZERO open source/report jobs; there is NO p_expect_status parameter,
+--      so a caller can never smuggle a non-'running' expectation to reopen/re-finalize a terminal cycle.
+--   2. reject_append_to_terminal_cycle -- a BEFORE INSERT/UPDATE trigger on the three child tables that (a)
+--      forbids changing a child row's cycle_id outright, and (b) blocks adding/altering any child row whose
+--      (unchanged) parent cycle is terminal -- so a row can never be added to, altered in, or moved out of a
+--      terminal cycle.
+-- Concurrency: the finalize UPDATE holds FOR UPDATE on the cycle row while it reads the child tables and flips
+-- the status; the trigger takes FOR SHARE on the same cycle row. So every child append/update SERIALIZES against
+-- an in-flight finalize on the one cycle row -- if a child append commits first, finalize sees the open job and
+-- returns 'open-work'; if finalize commits first, the child append's trigger sees the terminal status and
+-- raises. Both paths lock ONLY the cycle row, in the same order, so the two orderings are deadlock-safe.
+-- Adds NO table/column (sync_cycles already has status/finished_at/source_*/report_* from 20260807) and no
+-- schedule/cron; SECURITY DEFINER + service_role only, matching the existing RPCs.
 
 -- ---------------------------------------------------------------------------
--- 1. finalize_sync_cycle -- guarded, atomic running->terminal finalization.
+-- 1. finalize_sync_cycle -- guarded, atomic running->terminal finalization; TOTAL typed disposition.
 -- ---------------------------------------------------------------------------
-create or replace function public.finalize_sync_cycle(
-  p_cycle_id uuid,
-  p_expect_status text default 'running'
-)
-returns public.sync_cycles
+create or replace function public.finalize_sync_cycle(p_cycle_id uuid)
+returns jsonb
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  v_cycle public.sync_cycles;
-  v_src_total int; v_src_ok int; v_src_fail int; v_src_open int;
-  v_rep_total int; v_rep_ok int; v_rep_fail int; v_rep_open int;
   v_status text;
   v_row public.sync_cycles;
+  v_src_total int; v_src_ok int; v_src_fail int; v_src_open int;
+  v_rep_total int; v_rep_ok int; v_rep_fail int; v_rep_open int;
+  v_new_status text;
 begin
-  -- Lock the cycle row so a concurrent finalize / append serializes on it.
-  select * into v_cycle from public.sync_cycles where id = p_cycle_id for update;
+  -- Lock the cycle row so a concurrent finalize / child append serializes on it.
+  select status into v_status from public.sync_cycles where id = p_cycle_id for update;
   if not found then
-    return null;                          -- unknown cycle
+    return jsonb_build_object('disposition', 'not-found', 'cycle', null);
   end if;
-  if v_cycle.status is distinct from p_expect_status then
-    return null;                          -- already terminal / not running: idempotent no-op (row 9)
+  if v_status in ('succeeded', 'partial', 'failed') then
+    select * into v_row from public.sync_cycles where id = p_cycle_id;   -- already closed: idempotent, complete
+    return jsonb_build_object('disposition', 'already-terminal', 'cycle', to_jsonb(v_row));
+  end if;
+  if v_status <> 'running' then
+    return jsonb_build_object('disposition', 'invalid-status', 'cycle', null);  -- e.g. 'pending' (never finalized)
   end if;
 
   -- Authoritative source counters. OPEN = pending/attempted (mid create-export/poll/download, resumable).
@@ -59,14 +62,11 @@ begin
     into v_src_total, v_src_ok, v_src_fail, v_src_open
     from public.sync_source_jobs where cycle_id = p_cycle_id;
 
-  -- Authoritative report counters. FINISHED mirrors report-worker.reportJobFinished:
-  --   blocked | (derive succeeded AND save succeeded) | derive failed/skipped | save failed.
-  -- SUCCESS = derive succeeded AND save succeeded. OPEN = not finished.
+  -- Authoritative report counters. FINISHED mirrors report-worker.reportJobFinished; SUCCESS = derive+save
+  -- succeeded; OPEN = not finished.
   select count(*),
          count(*) filter (where derive_status = 'succeeded' and save_status = 'succeeded'),
-         count(*) filter (where (fetch_status = 'blocked'
-                             or derive_status in ('failed', 'skipped')
-                             or save_status = 'failed')
+         count(*) filter (where (fetch_status = 'blocked' or derive_status in ('failed', 'skipped') or save_status = 'failed')
                             and not (derive_status = 'succeeded' and save_status = 'succeeded')),
          count(*) filter (where not (fetch_status = 'blocked'
                              or (derive_status = 'succeeded' and save_status = 'succeeded')
@@ -75,34 +75,34 @@ begin
     into v_rep_total, v_rep_ok, v_rep_fail, v_rep_open
     from public.sync_report_jobs where cycle_id = p_cycle_id;
 
-  -- GUARD: finalize ONLY when the WHOLE cycle is drained. Any open source/report job means a continuation
-  -- (this run's or a concurrent owner's) can still append/advance work -> leave the cycle running (rows 7-8).
   if v_src_open > 0 or v_rep_open > 0 then
-    return null;
+    return jsonb_build_object('disposition', 'open-work', 'cycle', null);   -- continuation required (rows 7-8)
   end if;
 
-  -- Terminal status from the state table: succeeded (nothing failed) | failed (nothing succeeded) | partial.
   if v_src_fail = 0 and v_rep_fail = 0 then
-    v_status := 'succeeded';
+    v_new_status := 'succeeded';
   elsif v_src_ok = 0 and v_rep_ok = 0 then
-    v_status := 'failed';
+    v_new_status := 'failed';
   else
-    v_status := 'partial';
+    v_new_status := 'partial';
   end if;
 
   update public.sync_cycles
-     set status = v_status,
+     set status = v_new_status,
          finished_at = now(),
          source_total = v_src_total, source_succeeded = v_src_ok, source_failed = v_src_fail,
          report_total = v_rep_total, report_succeeded = v_rep_ok, report_failed = v_rep_fail
-   where id = p_cycle_id and status = p_expect_status   -- race guard: a concurrent finalizer that already flipped loses here
+   where id = p_cycle_id and status = 'running'
    returning * into v_row;
-  return v_row;                            -- null when the WHERE lost the race
+  if not found then
+    return jsonb_build_object('disposition', 'invalid-status', 'cycle', null);  -- unreachable under FOR UPDATE; fail closed
+  end if;
+  return jsonb_build_object('disposition', 'finalized', 'cycle', to_jsonb(v_row));
 end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 2. reject_append_to_terminal_cycle -- block new/changed child work once terminal.
+-- 2. reject_append_to_terminal_cycle -- forbid cycle_id changes + block work in a terminal cycle.
 -- ---------------------------------------------------------------------------
 create or replace function public.reject_append_to_terminal_cycle()
 returns trigger
@@ -113,8 +113,14 @@ as $$
 declare
   v_status text;
 begin
+  -- A child row's cycle_id is IMMUTABLE: forbid moving a row between cycles (so a row can never be moved OUT of
+  -- a terminal cycle, nor INTO one). Checked before the parent lookup so a mutation attempt fails outright.
+  if TG_OP = 'UPDATE' and NEW.cycle_id is distinct from OLD.cycle_id then
+    raise exception 'child row cycle_id is immutable (% -> %); refusing to move it between cycles', OLD.cycle_id, NEW.cycle_id
+      using errcode = 'raise_exception';
+  end if;
   -- FOR SHARE serializes against finalize_sync_cycle's FOR UPDATE: if a finalize is committing, this blocks
-  -- until it commits and then sees the terminal status.
+  -- until it commits and then sees the (now terminal) status.
   select status into v_status from public.sync_cycles where id = NEW.cycle_id for share;
   if v_status in ('succeeded', 'partial', 'failed') then
     raise exception 'sync cycle % is terminal (%); refusing to append/alter child work', NEW.cycle_id, v_status
@@ -142,5 +148,5 @@ create trigger sync_report_jobs_no_append_terminal
 -- ---------------------------------------------------------------------------
 -- Grants -- service_role only, matching the existing Scheduler-v2 RPCs.
 -- ---------------------------------------------------------------------------
-revoke all on function public.finalize_sync_cycle(uuid, text) from public, anon, authenticated;
-grant execute on function public.finalize_sync_cycle(uuid, text) to service_role;
+revoke all on function public.finalize_sync_cycle(uuid) from public, anon, authenticated;
+grant execute on function public.finalize_sync_cycle(uuid) to service_role;

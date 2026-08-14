@@ -42,6 +42,7 @@ const SUITES = [
   "test:datadoe-poll-export",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
+  "test:cycle-finalize-wiring",
   "build:check",
 ];
 

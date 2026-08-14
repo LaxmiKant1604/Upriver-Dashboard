@@ -675,6 +675,27 @@ export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSuccee
   });
 }
 
+// finalize_sync_cycle: the GUARDED cycle finalization RPC (20260815_sync_cycle_finalize.sql). It returns a
+// TOTAL, TYPED disposition -- never an ambiguous null -- so the dispatcher can act on each case distinctly:
+//   'finalized'        -> this call flipped running -> terminal (cycle carries the terminal status + counters);
+//   'already-terminal' -> the cycle was already terminal (idempotent, complete);
+//   'open-work'        -> still running with open source/report work (continuation required);
+//   'not-found'        -> unknown cycle id;
+//   'invalid-status'   -> the cycle is neither running nor terminal (e.g. pending) -- fail closed.
+// The RPC takes ONLY p_cycle_id (there is NO expect-status parameter to smuggle). A transport/HTTP failure
+// throws inside request() (safe message; never a raw body); a malformed/unknown disposition also throws here,
+// so a caller can never claim success while finalization is unavailable.
+const FINALIZE_DISPOSITIONS = new Set(["finalized", "already-terminal", "open-work", "not-found", "invalid-status"]);
+export async function finalizeSyncCycle(cycleId) {
+  const body = await request("/rest/v1/rpc/finalize_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
+  const result = Array.isArray(body) ? body[0] : body;
+  const disposition = result && typeof result.disposition === "string" ? result.disposition : null;
+  if (!disposition || !FINALIZE_DISPOSITIONS.has(disposition)) {
+    throw new Error("finalizeSyncCycle: malformed or unknown finalize disposition; failing closed.");
+  }
+  return { disposition, cycle: (result && result.cycle) || null };
+}
+
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller
 // that made the first (and only) create-export POST for this (cycle, request_hash).
 export async function claimSourceExportAttempt(cycleId, requestHash) {

@@ -12,7 +12,7 @@
 import { createExport, pollExport, downloadExport } from "../datadoe.js";
 import { organizationFingerprint, sourceJobOwnerId } from "../source-identity.js";
 import {
-  openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts,
+  openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
@@ -138,6 +138,10 @@ export function makeSupabaseSourceStore() {
     recordSourceSuccess: (args) => recordSyncSourceSuccess(args),
     recordSourceFailure: (args) => recordSyncSourceFailure(args),
     updateCycleCounts: (cycleId, counts) => updateSyncCycleCounts(cycleId, counts),
+    // Dispatcher-owned cycle finalization (Blocker 1): the guarded finalize_sync_cycle RPC, returning a typed
+    // disposition. The canonical dispatcher calls this on a complete drained SCHEDULED scope; a source-family
+    // driver never calls it.
+    finalizeCycle: ({ cycleId }) => finalizeSyncCycle(cycleId),
   };
 }
 

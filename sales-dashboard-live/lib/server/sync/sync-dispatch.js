@@ -315,23 +315,39 @@ export async function runSchedulerV2Shadow({
   rollup.continuationRequired = !rollup.drained;
 
   // 6) FINALIZE the shared cycle -- the CANONICAL DISPATCHER owns this; a source-family driver must NEVER
-  //    finalize the shared (bucket, cycle_date) cycle early (a partial source drain is not a finished cycle).
-  //    Attempt finalization ONLY on a genuine terminal drain of THIS run's scope (rollup.drained). The store's
-  //    GUARDED finalize (finalize_sync_cycle RPC -- see cycle-lifecycle.js + 20260815_sync_cycle_finalize.sql)
-  //    then atomically re-checks the WHOLE cycle: it flips running->terminal with authoritative source AND
-  //    report counters + finished_at ONLY when zero source/report jobs remain open, else it leaves the cycle
-  //    running (finished_at null). So a manual subset, a concurrent continuation that appended open work, or a
-  //    stale finalizer can NEVER prematurely close a cycle that still has open work, and a replay against an
-  //    already-terminal cycle is a no-op. Non-drained / deferred / deadline / maxJobs-truncated runs skip this
-  //    entirely and stay running (resumable). The store may omit finalizeCycle (no-op) until the reviewed RPC
-  //    lands; the dispatcher owns the decision regardless.
+  //    finalize the shared (bucket, cycle_date) cycle early. SCOPE SEMANTICS (fixes the manual-subset hole):
+  //    auto-finalization is attempted ONLY for a COMPLETE SCHEDULED scope. A scheduled run plans + upserts its
+  //    ENTIRE ready+scheduled scope before draining, so "no open child jobs" is a genuine complete-cycle signal.
+  //    A MANUAL run is a partial subset that must NEVER terminalize the shared cycle -- a later manual run for a
+  //    different report may still append to the same (bucket, cycleDate) -- so a manual run leaves the cycle
+  //    running and is closed only by an explicit reviewed operation (Appendix N). Non-drained / deferred /
+  //    deadline / maxJobs-truncated runs never call finalization.
+  //
+  //    The store's finalize (finalize_sync_cycle RPC -- 20260815_sync_cycle_finalize.sql) returns a TOTAL TYPED
+  //    disposition; the dispatcher acts on each case and NEVER claims success while finalization is unavailable.
   rollup.finalized = false;
   rollup.cycleStatus = null;
-  if (rollup.drained && rollup.cycleId && typeof store.finalizeCycle === "function") {
-    const finalizedRow = await store.finalizeCycle({ cycleId: rollup.cycleId, expectStatus: "running" });
-    if (finalizedRow && finalizedRow.status) {
-      rollup.finalized = true;
-      rollup.cycleStatus = finalizedRow.status;
+  if (rollup.drained && rollup.cycleId && !manual) {
+    if (typeof store.finalizeCycle !== "function") {
+      // A lifecycle-enabled deployment must never report a drained scheduled cycle as complete while
+      // finalization is unavailable: fail closed rather than silently no-op.
+      throw new Error("runSchedulerV2Shadow: cycle finalization is unavailable (store.finalizeCycle missing); refusing to complete a drained scheduled cycle (fail closed).");
+    }
+    const disp = await store.finalizeCycle({ cycleId: rollup.cycleId });
+    const d = disp && disp.disposition;
+    if (d === "finalized" || d === "already-terminal") {
+      // The cycle is complete (this run closed it, or another already did). drained stays true / continuation false.
+      rollup.finalized = d === "finalized";
+      rollup.cycleStatus = (disp.cycle && disp.cycle.status) || (d === "already-terminal" ? "terminal" : null);
+    } else if (d === "open-work") {
+      // The WHOLE cycle still has open source/report work (a concurrent scope). Re-observe on a fresh
+      // invocation: this run is NOT the completion of the cycle.
+      rollup.drained = false;
+      rollup.continuationRequired = true;
+      rollup.cycleStatus = "running";
+    } else {
+      // not-found / invalid-status / unknown / malformed -> fail closed (never claim a completed cycle).
+      throw new Error(`runSchedulerV2Shadow: unexpected finalize disposition "${d}" for cycle ${rollup.cycleId}; failing closed.`);
     }
   }
   return rollup;

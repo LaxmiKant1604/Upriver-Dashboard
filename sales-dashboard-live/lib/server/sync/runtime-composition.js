@@ -306,7 +306,7 @@ export function schedulerV2Preflight(overrides = {}) {
 // this guarantees no unexpected field -- e.g. a future raw string -- ever leaks into preflight telemetry).
 function sanitizeAuditBlocker(b) {
   const safe = {};
-  for (const k of ["migration", "table", "rpc", "wrapper", "columns", "constraints", "expected", "target", "message"]) {
+  for (const k of ["migration", "table", "rpc", "trigger", "wrapper", "columns", "constraints", "expected", "target", "message"]) {
     if (b[k] !== undefined) safe[k] = b[k];
   }
   return safe;

@@ -23,12 +23,23 @@
 // | 9 | already TERMINAL (idempotent replay)                       | unchanged terminal          | unchanged   |
 //
 // Rows 1-3 are decided by `terminalCycleStatus`. Rows 4-6: the dispatcher does NOT attempt finalization when
-// its run did not drain (drained=false). Rows 7-9: the dispatcher DOES attempt finalization (its run drained),
-// but the GUARDED store.finalizeCycle atomically re-checks the WHOLE cycle -- it finalizes ONLY a `running`
-// cycle with ZERO open source/report jobs, so a manual subset (7), a concurrent continuation (8), or a stale
-// finalizer (also 8) can never prematurely close a cycle that still has open work, and a replay against an
-// already-terminal cycle (9) is a no-op. The append-after-terminal guard (a trigger) additionally prevents any
-// new source/report/owner row from being added once the cycle is terminal.
+// its run did not drain (drained=false).
+//
+// SCOPE SEMANTICS (the manual-subset fix): auto-finalization is attempted ONLY for a COMPLETE SCHEDULED scope.
+// A scheduled run plans + upserts its ENTIRE ready+scheduled scope before draining, so "no open child jobs" is
+// a genuine complete-cycle signal. A MANUAL run is a partial subset -- it may plan only some reports, and a
+// later manual run for a DIFFERENT report can legitimately append to the same (bucket, cycleDate) -- so a
+// manual run NEVER auto-finalizes (row 7); its cycle stays `running` and is closed only by an explicit reviewed
+// operation (the direct `finalize_sync_cycle` call, e.g. SCHEDULER_V2_ROLLOUT.md Appendix N). This is why the
+// Gate 5 canary (a manual run) legitimately left its cycle `running`.
+//
+// The guarded finalize (finalize_sync_cycle RPC -- 20260815_sync_cycle_finalize.sql, PREPARED/UNAPPLIED)
+// atomically re-checks the WHOLE cycle under a FOR UPDATE lock and returns a TOTAL, TYPED disposition (never an
+// ambiguous null): `finalized` (running->terminal now, rows 1-3), `already-terminal` (idempotent replay, row 9),
+// `open-work` (still-open source/report jobs from a concurrent continuation/scope -> continuation required, row
+// 8), `not-found`, or `invalid-status`. The append-after-terminal trigger additionally forbids changing a child
+// row's cycle_id and blocks any insert/update whose parent cycle is terminal -- so a row can never be added to,
+// altered in, or moved out of a terminal cycle.
 // ======================================================================
 
 // A source job is OPEN (not yet terminal for the cycle) while it is pending or attempted (an attempted job is
