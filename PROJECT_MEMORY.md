@@ -8733,3 +8733,56 @@ catalog id; no dd-secondary; no warm-up/retry/third export; one shadow snapshot 
 unchanged; no control/allowlist/schedule change; nothing pushed/merged/deployed/migrated/unlocked/scheduled;
 Scheduler v1 + frontend + routes + cron untouched; HANDOFF.md + .worktrees/ untouched. STOP for Codex review;
 do NOT proceed to another account, Gate 6 parity, Gate 7 unlock, deployment, or scheduling.
+
+## Scheduler v2: cycle-lifecycle finalization fix (Blocker 1) + runbook status refresh (Blocker 2) (2026-08-14)
+
+Codex re-review of the executed Gate 5 canary found two blockers. Fixed OFFLINE (no production side effect;
+Gate 5 NOT re-run). Commit 197c1a8 (code/tests), then the docs commit.
+
+- BLOCKER 1 (drained-cycle lifecycle incomplete): the canonical dispatcher (runSchedulerV2Shadow) computed
+  drained/continuationRequired but never finalized the cycle, so the Gate 5 canary cycle (57afc1fb...) is stuck
+  status='running', finished_at null, report counters unwritten (only source counters were persisted by the
+  source worker). FIX:
+  - New lib/server/sync/cycle-lifecycle.js (pure): the documented cycle lifecycle STATE TABLE (rows 1-9) +
+    terminalCycleStatus (succeeded=nothing failed / failed=nothing succeeded / partial) + open-job classifiers
+    (isSourceJobOpen; isReportJobFinished/Open/Success mirroring report-worker) + computeCycleCounters +
+    cycleFullyDrained. This JS is the reference the guarded RPC mirrors.
+  - sync-dispatch.js OWNS finalization: after computing drained it calls store.finalizeCycle({cycleId,
+    expectStatus:'running'}) ONLY on a genuine terminal drain of this run's scope, recording rollup.finalized/
+    cycleStatus. A source-family driver never finalizes the shared cycle. Non-drained/deferred/deadline/maxJobs
+    runs stay running (finished_at null, resumable). Inert (no-op) unless the store exposes finalizeCycle, so
+    existing behavior is unchanged until the reviewed RPC lands.
+  - New PREPARED, UNAPPLIED migration supabase/migrations/20260815_sync_cycle_finalize.sql: finalize_sync_cycle
+    RPC (guarded, atomic running->terminal; recomputes authoritative source AND report counters; sets
+    finished_at; finalizes ONLY a running cycle with ZERO open source/report jobs; race guard WHERE
+    status='running'; returns null otherwise) + reject_append_to_terminal_cycle BEFORE INSERT/UPDATE trigger on
+    sync_source_jobs / sync_source_job_owners / sync_report_jobs (blocks appending work after terminalization);
+    FOR UPDATE (finalize) vs FOR SHARE (trigger) serialize both orderings; service_role only. Adds NO
+    table/column (sync_cycles already has status/finished_at/source_*/report_* from migration 1). Applied ONLY
+    via a reviewed Gate, NOT db:migrate; migrations 1-4 untouched.
+  - Tests scripts/cycle-lifecycle.test.js (13; wired into package.json + verify.mjs): pure state table; guarded
+    finalize -> succeeded/partial/failed with finished_at + exact source+report counters; open source/report
+    job declines finalization (stays running); idempotent replay (2nd finalize null, unchanged); both
+    concurrency orderings (append-then-finalize declines; finalize-then-append rejected); manual-subset /
+    shared-cycle cannot be prematurely closed; dispatcher integration proving it finalizes ONLY on a genuine
+    drain (not maxJobs/deferral), persists report counters, and a resume creates ZERO duplicate exports.
+- BLOCKER 2 (stale runbook status): SCHEDULER_V2_ROLLOUT.md header + checklist refreshed -- Gate 5 marked [x]
+  EXECUTED 2026-08-14 SUCCESS; removed the stale "zero DataDoe exports / five operational tables empty" current-
+  status claims; recorded the exact safe current state (one canary cycle, two succeeded source jobs, one report
+  job, two owner memberships, one scheduler-v2/brand-sales shadow snapshot, two exports total, production
+  fingerprint unchanged, 13 controls still paused, no deploy/schedule); recorded status='running' as the
+  Blocker-1 lifecycle defect UNDER CORRECTION (not an acceptable terminal result); Gate 6 marked BLOCKED pending
+  the correction. New Appendix N: a reviewed, zero-DataDoe reconciliation that finalizes ONLY the running Gate-5
+  canary cycle via finalize_sync_cycle AFTER the fix is approved+applied (prepared, NOT executed; does not alter
+  the canary rows). The historical Appendix A-K "empty tables/zero exports" statements are left intact (accurate
+  for their 2026-08-13 gate times).
+- Verify: node --check on changed JS OK; npm run verify 34/34 incl. build:check; git diff --check clean; all 7
+  Gate 0 hashes unchanged (ac62a3a...); migrations 1-4 byte-unchanged. Existing sync-dispatch (37) /
+  runtime-composition (26) / sync-source-jobs / sync-signals suites still pass (dispatcher change inert without
+  a store finalizeCycle).
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + its source/report/owner/snapshot rows are UNCHANGED; SHADOW MODE with controls locked/paused;
+20260815_sync_cycle_finalize.sql is PREPARED + UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex
+re-review; Gate 6 remains blocked pending this correction.
