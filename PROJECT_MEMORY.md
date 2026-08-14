@@ -8971,3 +8971,42 @@ CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no producti
 Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
 cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
 UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for FINAL Codex review; Gate 6 remains blocked.
+
+## Scheduler v2: Migration 5 APPLIED + Gate-5 canary cycle RECONCILED (Blocker 1 RESOLVED IN PRODUCTION, 2026-08-14)
+
+EXECUTED with explicit human authorization, narrowly scoped: apply ONLY 20260815_sync_cycle_finalize.sql, then
+(only after full verification) run Appendix N for ONLY the existing Gate-5 canary cycle. Zero DataDoe calls; no
+Gate-5 re-run; no control unlock/deploy/push/merge/schedule; Gate 6 NOT started. Evidence: SCHEDULER_V2_ROLLOUT
+Appendix O (migration gate) + Appendix N.4 (reconciliation); runbook status header + gate checklist updated.
+
+- PREFLIGHT (offline, all pass): HEAD 6b36544; migrations 1-4 SHA-256 unchanged (1328bc0f/0750a155/544557fb/
+  49628c8d); Migration 5 frozen at SHA-256 5222a8e55c89bbcb21fe10b9f1f755d795aecee69f4ac0d5a15c61d459823759 and
+  byte-identical to HEAD; npm run verify 35/35; git diff --check clean; SCHEDULER_V2_READY_REPORT_KEYS empty;
+  POSTGRES_URL present+nonblank in the git-ignored untracked env file (checked by name only, never printed).
+- INVENTORY (production, read-only txn, all pass): ledger rows 1-4 exactly once, Migration 5 zero; RPC/guard
+  function/3 triggers ABSENT; 4 tables with expected shapes; roles exist; canary cycle exactly per L.8 (running,
+  2/2/0, 0 open, 1 finished report job, 2 active owners, v2 counts 1/2/1/2); 1 shadow snapshot; fingerprint
+  cba3fb264b31dd6a5c35b20e8df2ccab (7 rows); 13 controls disabled; pg_cron absent.
+- APPLY (one txn, one commit, no retry): pg_advisory_xact_lock(20260815,1) BEFORE ledger reads; 1-4 re-checked
+  exactly-once; fail-closed already-recorded + already-present-object checks; file SHA-256 re-verified in-script
+  before execution; frozen body executed; PLAIN ledger insert; single COMMIT. Ledger applied_at
+  2026-08-14T16:27:31.800Z.
+- POST-VERIFY (read-only, all pass): RPC exactly (p_cycle_id uuid) returns jsonb, SECURITY DEFINER,
+  search_path=public; anon/authenticated/PUBLIC cannot execute, service_role can, owner postgres reported; guard
+  body BYTE-IDENTICAL to the approved migration body (1180 chars); exactly 3 triggers, each tgtype=23 enabled on
+  its exact table executing the guard fn (schema proven by OID join; pg_get_triggerdef serializes the fn
+  unqualified -- expected); ledger 1-5 exactly once; migration 1-4 objects unchanged (RPCs, *_touch triggers,
+  column counts 18/27/25/15, RLS); ZERO data rows changed (canary still running at this point).
+- RECONCILE (Appendix N, all pass): preconditions re-proven read-only (running/finished_at null; 2 succeeded
+  sources, 0 open; 1 derived+saved report job, 0 unfinished; 2 active primary owners; 1 shadow snapshot;
+  fingerprint match; no other cycle); before-image digests captured; then EXACTLY ONE call
+  select public.finalize_sync_cycle('57afc1fb-6694-4925-8961-4730f5a8f4df') -> disposition='finalized',
+  status='succeeded', finished_at=2026-08-14T16:34:30.312782Z, source 2/2/0, report 1/1/0 (every
+  strict-acknowledgement expectation met). Post: ONLY the cycle row changed -- source/report/owner/shadow digests
+  byte-identical, fingerprint cba3fb26... unchanged, controls 13/0, one cycle row, pg_cron absent.
+- The .sql file stays byte-frozen in git (header "PREPARED -- UNAPPLIED" is historical review text; the ledger
+  row is authoritative). npm run verify unaffected (no code change; docs-only commits this round).
+
+STATE NOW: migrations 1-5 applied; Blocker 1 RESOLVED IN PRODUCTION; canary cycle terminal succeeded; SHADOW
+MODE locked/paused/undeployed/unscheduled unchanged. STOP for Codex review. Gate 6 remains BLOCKED pending
+parity across >= 2 cycles under the corrected lifecycle + explicit human approval.

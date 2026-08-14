@@ -1,28 +1,31 @@
 # Scheduler v2 — Production Rollout Runbook (Phase 1f)
 
-**Status (2026-08-14): Migrations 1–4 APPLIED + VERIFIED; the Gate 5 one-account brand-sales SHADOW canary has
-been EXECUTED (SUCCESS).** Scheduler v2 otherwise remains in SHADOW MODE and closed: it is **locked** (the code
-readiness allowlist `SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable `report_sync_settings`
-rows have `schedule_enabled=false`), **undeployed**, and **unscheduled** (no `pg_cron`/`pg_net` kickoff applied;
-no cron sync job). **Exact current operational state after the Gate 5 canary (Appendix L.8):** the Scheduler-v2
-tables now hold **one canary cycle** (`sync_cycles`: 1 row, `(non-us, 2026-08-14)`, id `57afc1fb-…`), **two
-succeeded source jobs**, **one report job**, and **two owner memberships**; there is **exactly one
-`scheduler-v2/brand-sales` shadow snapshot** (and exactly one `scheduler-v2/*` snapshot globally); the canary
-spent **exactly two DataDoe create-exports total** (one Order Line Items, one Product Catalog `68d2de238e`); the
-production Brand Sales `report_snapshots` fingerprint is **byte-identical** (no production snapshot overwritten);
-and `report_sync_settings` still contains **exactly the 13 seeded control rows, all `schedule_enabled=false`**. No
-control unlock, deployment, schedule, route, or frontend change has been made. **KNOWN DEFECT — NOT YET RESOLVED
-IN PRODUCTION (Blocker 1):** the canary cycle is still `status='running'` (`finished_at` null, report counters
-unwritten) because the dispatcher did not finalize the drained cycle — this is NOT an acceptable terminal state.
-The CODE fix is complete (dispatcher-owned finalization with a TOTAL typed disposition; the production wiring —
-the `finalizeSyncCycle` wrapper, the composed-store `finalizeCycle`, the audited RPC/trigger contract, and the
-fail-closed preflight/dispatcher; the complete-scheduled-scope-only auto-finalize semantics that closes the
-manual-subset hole; and the hardened guarded `finalize_sync_cycle` RPC + append-guard triggers in
-`20260815_sync_cycle_finalize.sql`). **But the defect is NOT resolved in production**: `20260815_...` remains
-**PREPARED and UNAPPLIED**, so nothing yet finalizes a live cycle, and the running Gate-5 canary cycle is
-reconciled to its terminal state only via the reviewed **Appendix N** procedure — which runs only **after**
-Migration 5 is applied via its own reviewed Gate. **Gate 6 is BLOCKED** until Migration 5 is applied and the
-canary cycle reconciled. Every remaining live step is **gated on explicit human approval**, one step at a time.
+**Status (2026-08-14): Migrations 1–5 APPLIED + VERIFIED; the Gate 5 one-account brand-sales SHADOW canary has
+been EXECUTED (SUCCESS) and its cycle RECONCILED to `succeeded` via Appendix N (EXECUTED 2026-08-14).**
+Scheduler v2 otherwise remains in SHADOW MODE and closed: it is **locked** (the code readiness allowlist
+`SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable `report_sync_settings` rows have
+`schedule_enabled=false`), **undeployed**, and **unscheduled** (no `pg_cron`/`pg_net` kickoff applied; no cron
+sync job). **Exact current operational state:** the Scheduler-v2 tables hold **one canary cycle** (`sync_cycles`:
+1 row, `(non-us, 2026-08-14)`, id `57afc1fb-…`) — now **terminal `status='succeeded'`** with `finished_at`
+`2026-08-14T16:34:30.312782Z` and authoritative counters `source 2/2/0`, `report 1/1/0` (Appendix N.4) — **two
+succeeded source jobs**, **one report job**, and **two owner memberships** (all byte-unchanged by the
+reconciliation); there is **exactly one `scheduler-v2/brand-sales` shadow snapshot** (and exactly one
+`scheduler-v2/*` snapshot globally); the canary spent **exactly two DataDoe create-exports total** (one Order
+Line Items, one Product Catalog `68d2de238e`; the reconciliation spent ZERO); the production Brand Sales
+`report_snapshots` fingerprint is **byte-identical** (`cba3fb26…`, 7 rows — unchanged through the canary, the
+Migration-5 gate, AND the reconciliation); and `report_sync_settings` still contains **exactly the 13 seeded
+control rows, all `schedule_enabled=false`**. No control unlock, deployment, schedule, route, or frontend change
+has been made. **BLOCKER 1 (drained-cycle lifecycle) — RESOLVED IN PRODUCTION 2026-08-14:** the CODE fix
+(dispatcher-owned finalization with a TOTAL typed disposition; the `finalizeSyncCycle` wrapper + composed-store
+`finalizeCycle`; the audited RPC/trigger contract; the fail-closed preflight/dispatcher; the
+complete-scheduled-scope-only auto-finalize semantics) was reviewed and committed, **`20260815_sync_cycle_
+finalize.sql` was applied via its own reviewed single-file Gate (Appendix O)**, and the one running Gate-5
+canary cycle was **reconciled via the reviewed Appendix N procedure** — `disposition='finalized'`, zero DataDoe
+calls, no child/snapshot/control row touched. The `.sql` file itself stays byte-frozen (SHA-256 `5222a8e5…`;
+its "PREPARED — UNAPPLIED" header note is historical text from review, kept to preserve the frozen hash — the
+ledger row `2026-08-14T16:27:31.800Z` is authoritative). **Gate 6 remains BLOCKED**: parity/reconciliation must
+be established across **≥ 2 cycles under the corrected lifecycle**, each behind explicit human approval, before
+any control unlock. Every remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -227,15 +230,16 @@ report. **Approval gate per report.**
 - [x] **Gate 5 — one-account brand-sales SHADOW canary EXECUTED 2026-08-14 — SUCCESS** (execution evidence in
   Appendix L.8). Exactly ONE primary account, `brand-sales` only, exactly TWO create-exports (one Order Line
   Items, one Product Catalog `68d2de238e`), one `scheduler-v2/brand-sales` shadow snapshot; production Brand
-  Sales fingerprint byte-identical; controls still locked/paused; no deploy/schedule. **KNOWN FOLLOW-UP — NOT
-  RESOLVED IN PRODUCTION:** the canary's `sync_cycles` row is still `status='running'` (finished_at null) because
-  the dispatcher did not finalize a drained cycle. The Blocker-1 CODE fix (production wiring + typed disposition +
-  complete-scope-only scope semantics + hardened `20260815_sync_cycle_finalize.sql`) is complete, but the defect
-  is not resolved until `20260815_...` is applied via a reviewed Gate and the canary cycle reconciled (Appendix
-  N) — both still pending. `status='running'` is NOT an acceptable terminal state.
-- [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles. **BLOCKED** pending the cycle-lifecycle
-  finalization correction (Blocker 1) being reviewed + applied, and the running Gate-5 canary cycle reconciled
-  to its terminal state (Appendix N).
+  Sales fingerprint byte-identical; controls still locked/paused; no deploy/schedule.
+- [x] **Migration-5 gate — `20260815_sync_cycle_finalize.sql` applied 2026-08-14** (single guarded transaction,
+  advisory lock `(20260815,1)`, plain ledger insert; execution evidence in Appendix O; read-only inventory +
+  post-verification all PASS; zero data rows changed).
+- [x] **Appendix N reconciliation EXECUTED 2026-08-14 — the Gate-5 canary cycle is terminal.** One
+  `finalize_sync_cycle` call, `disposition='finalized'`, `status='succeeded'`, `finished_at` set, counters
+  `2/2/0` + `1/1/0`; source/report/owner/snapshot rows byte-unchanged (digest-proven); zero DataDoe calls
+  (evidence in Appendix N.4). Blocker 1 is RESOLVED IN PRODUCTION.
+- [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles under the corrected lifecycle. **BLOCKED**
+  pending that parity evidence and explicit human approval (nothing here authorizes it).
 - [ ] Gate 7 — per-report control unlock (repeat per report).
 - [ ] Kickoff (`20260808_scheduler_v2_kickoff.sql`) — separate, later, fully-reviewed step (NOT in this phase).
 
@@ -2199,6 +2203,9 @@ discovery (30 primary accounts, memoized once).
   `finalize_sync_cycle` RPC/triggers in the PREPARED, UNAPPLIED `20260815_sync_cycle_finalize.sql`) is complete,
   but the defect is **not resolved in production** until that migration is applied via a reviewed Gate and the
   canary cycle reconciled (Appendix N). The running canary cycle stays exactly as-is until then.
+  *(UPDATE 2026-08-14: both steps have since been EXECUTED — Migration 5 applied via its reviewed gate
+  (Appendix O) and this cycle reconciled to `succeeded` (Appendix N.4). This paragraph is kept as the historical
+  record of the state at canary time.)*
 
 Post-canary L.6 P1–P7 all PASS. `npm run verify` (at execution time) incl. `build:check`; `git diff --check`
 clean. Both readiness gates remain locked/paused; nothing pushed/merged/deployed/migrated/unlocked/scheduled.
@@ -2353,9 +2360,10 @@ The final org-wide request identity is NOT fixed here. Blocked on DataDoe's answ
 Until then: no planner/resolver/contract change, no new hash scheme, no migration of cached entries, and the
 Gate 5 canary (Appendix L) keeps validating the CURRENT plan-derived identities unchanged.
 
-## Appendix N — Gate 5 canary cycle reconciliation (PREPARED — NOT executed; zero DataDoe)
+## Appendix N — Gate 5 canary cycle reconciliation (EXECUTED 2026-08-14 — SUCCESS; zero DataDoe)
 
-> **NOTHING here has been run.** It reconciles ONLY the single Gate 5 canary cycle
+> **N.1–N.3 are the reviewed procedure as prepared; N.4 is the execution evidence.** It reconciles ONLY the
+> single Gate 5 canary cycle
 > (`sync_cycles` id `57afc1fb-6694-4925-8961-4730f5a8f4df`, `(non-us, 2026-08-14)`) that the Blocker-1
 > lifecycle defect left `status='running'`. It is executed ONLY **after** the lifecycle fix (dispatcher-owned
 > finalization + `20260815_sync_cycle_finalize.sql`) is reviewed and that migration is applied via its own
@@ -2386,3 +2394,96 @@ Gate 5 canary (Appendix L) keeps validating the CURRENT plan-derived identities 
   cycle-row-only finalize) and that exactly one `scheduler-v2/brand-sales` shadow snapshot exists. No other
   cycle/account/report/source/owner is touched. STOP for review; do not proceed to Gate 6 until parity is
   established across ≥ 2 cycles under the corrected lifecycle.
+
+### N.4 EXECUTION evidence (EXECUTED 2026-08-14 — SUCCESS; safe fields only)
+
+Executed from `sales-dashboard-live/` with `node --env-file=../.env.local` (secrets loaded into the process env
+only, never printed/committed), immediately after the Appendix O Migration-5 gate passed its full read-only
+post-verification. Zero DataDoe calls; the ONLY write in this phase is the one `finalize_sync_cycle` UPDATE of
+the one canary cycle row.
+
+- **Preconditions (read-only, ALL PASS before the call):** cycle `57afc1fb-6694-4925-8961-4730f5a8f4df` was
+  `status='running'` / `finished_at IS NULL`; exactly 2 succeeded source jobs, 0 `pending`/`attempted`; exactly
+  1 report job with `derive_status='succeeded'` + `save_status='succeeded'`, 0 unfinished; exactly 2 active
+  `primary` owner memberships for `brand-sales` / the selected account; exactly 1 `scheduler-v2/brand-sales`
+  shadow snapshot (and 1 `scheduler-v2/*` globally); production Brand Sales payload-free fingerprint
+  `cba3fb264b31dd6a5c35b20e8df2ccab` (7 rows) matched Appendix L.8; no other `sync_cycles` row (global v2 row
+  counts 1/2/1/2); 13 controls all `schedule_enabled=false`. Payload-free per-table digests (source jobs /
+  report job / owners / shadow snapshot) captured as the before-images.
+- **The one call:** `select public.finalize_sync_cycle('57afc1fb-6694-4925-8961-4730f5a8f4df');` — executed
+  EXACTLY ONCE. Result: **`disposition='finalized'`** with the full cycle row as evidence — id matching,
+  **`status='succeeded'`**, **`finished_at=2026-08-14T16:34:30.312782Z`**, **`source_total=2 /
+  source_succeeded=2 / source_failed=0`**, **`report_total=1 / report_succeeded=1 / report_failed=0`** — every
+  strict-acknowledgement expectation met.
+- **Post-checks (read-only, ALL PASS):** the persisted cycle row is terminal with exactly those counters; the
+  source-job / report-job / owner-membership / shadow-snapshot digests are **byte-identical** to the
+  before-images (nothing but the one cycle row changed); production fingerprint still
+  `cba3fb264b31dd6a5c35b20e8df2ccab` (7 rows); 13 controls still all `schedule_enabled=false`; still exactly one
+  `sync_cycles` row; `pg_cron` still absent.
+
+**Blocker 1 is RESOLVED IN PRODUCTION.** Gate 6 remains BLOCKED pending parity across ≥ 2 cycles under the
+corrected lifecycle, each behind explicit human approval. STOP for Codex review.
+
+---
+
+## Appendix O — Migration-5 gate EXECUTION evidence (applied 2026-08-14; single guarded transaction)
+
+Applies ONLY `20260815_sync_cycle_finalize.sql` — the Blocker-1 finalization primitives (the guarded
+`finalize_sync_cycle(p_cycle_id uuid)` RPC + the `reject_append_to_terminal_cycle` BEFORE-trigger on the three
+child tables). Executed with explicit human authorization, from `sales-dashboard-live/` with
+`node --env-file=../.env.local` (secrets never printed/committed). No `db:migrate`, no retry.
+
+### O.1 Offline preflight (all PASS)
+
+HEAD `6b36544` on `feature/scheduler-v2` (includes the final-review commits `eb543ea`/`6b36544`); migrations 1–4
+SHA-256 unchanged (`1328bc0f / 0750a155 / 544557fb / 49628c8d`); **Migration 5 frozen at SHA-256
+`5222a8e55c89bbcb21fe10b9f1f755d795aecee69f4ac0d5a15c61d459823759`** and byte-identical to HEAD; `npm run
+verify` 35/35 incl. `build:check`; `git diff --check` clean; `SCHEDULER_V2_READY_REPORT_KEYS` frozen empty;
+working tree only `HANDOFF.md` + `.worktrees/` untracked; `POSTGRES_URL` present + nonblank in the git-ignored
+untracked env file (checked by NAME only).
+
+### O.2 Production read-only inventory (all PASS; run in a `read only` transaction)
+
+`app_schema_migrations` exists; migrations 1–4 each **exactly one** ledger row; Migration 5 **zero** rows;
+`sync_cycles` (18 cols) / `sync_source_jobs` (27) / `sync_report_jobs` (25) / `sync_source_job_owners` (15) all
+present with the expected column sets; `finalize_sync_cycle` **absent** (0 overloads);
+`reject_append_to_terminal_cycle` **absent**; all three `*_no_append_terminal` triggers **absent**; roles
+`service_role`/`anon`/`authenticated` exist; the Gate-5 canary cycle matched Appendix L.8 exactly (running,
+source counters 2/2/0, report counters unwritten 0/0/0, hash prefixes `ee35b3f2e7…`/`f1270dc16e…` both
+succeeded, 0 open; 1 finished report job; 2 active owner memberships; global v2 row counts 1/2/1/2); exactly 1
+`scheduler-v2/brand-sales` snapshot (1 globally); production fingerprint `cba3fb264b31dd6a5c35b20e8df2ccab`
+(7 rows); 13 controls all `schedule_enabled=false`; `pg_cron` absent (no `cron.job`).
+
+### O.3 The apply (ONE transaction, ONE commit)
+
+In order, inside a single `BEGIN … COMMIT`: (1) `pg_advisory_xact_lock(20260815, 1)` acquired BEFORE any ledger
+read; (2) migrations 1–4 re-checked exactly-once in-transaction; (3) fail-closed check that Migration 5 was not
+already recorded; (4) re-check that the RPC, guard function, and all three triggers were still absent; (5) the
+migration file's SHA-256 re-verified in-script against the frozen `5222a8e5…` BEFORE execution, then the frozen
+body executed; (6) ledger row recorded with a **plain INSERT** (no `ON CONFLICT`); (7) single `COMMIT`. Any
+error would have rolled back everything; none occurred. **Ledger `applied_at = 2026-08-14T16:27:31.800Z`.**
+
+### O.4 Read-only post-verification (all PASS; run in a `read only` transaction)
+
+- **RPC:** exactly one `finalize_sync_cycle` overload; signature exactly `(p_cycle_id uuid)`; returns `jsonb`;
+  `SECURITY DEFINER`; `proconfig = [search_path=public]`.
+- **Privileges:** `anon` × / `authenticated` × / `service_role` ✓ (`has_function_privilege`); the ACL
+  (`postgres=X/postgres;service_role=X/postgres`) contains NO empty-grantee entry, so **PUBLIC cannot execute**;
+  owner `postgres` retains execute (accurately reported — expected for the definer).
+- **Guard function:** present; returns `trigger`; `SECURITY DEFINER`; body **byte-identical to the approved
+  migration body** (1180 chars, `prosrc` exact string match).
+- **Triggers:** exactly 3 `*_no_append_terminal`; each `tgtype=23` (BEFORE INSERT OR UPDATE, FOR EACH ROW),
+  `tgenabled='O'`, on its exact table (`sync_source_jobs` / `sync_source_job_owners` / `sync_report_jobs`),
+  executing `public.reject_append_to_terminal_cycle` **proven by OID join** (`tgfoid` → `pg_proc`/
+  `pg_namespace`; `pg_get_triggerdef` serializes the function unqualified because `public` is on the
+  serialization path — the OID join is the authoritative schema proof).
+- **Ledger:** migrations 1–5 each exactly one row.
+- **Migrations 1–4 unchanged:** the three migration-1 RPCs present; the three `*_touch` triggers present; table
+  column counts unchanged (18/27/25/15); RLS still enabled on all four tables.
+- **Zero data changed:** canary cycle STILL `running`/`finished_at` null at this point (untouched by the
+  migration); v2 row counts 1/2/1/2; 1 shadow snapshot; fingerprint `cba3fb26…` unchanged; 13 controls all
+  disabled; `pg_cron` absent.
+
+The `.sql` file remains byte-frozen in git (its "PREPARED — UNAPPLIED" header comment is the historical review
+text; the ledger row is authoritative for applied-state). Reconciliation of the canary cycle followed
+immediately as Appendix N.4. STOP for Codex review; Gate 6 remains BLOCKED.
