@@ -683,17 +683,54 @@ export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSuccee
 //   'not-found'        -> unknown cycle id;
 //   'invalid-status'   -> the cycle is neither running nor terminal (e.g. pending) -- fail closed.
 // The RPC takes ONLY p_cycle_id (there is NO expect-status parameter to smuggle). A transport/HTTP failure
-// throws inside request() (safe message; never a raw body); a malformed/unknown disposition also throws here,
-// so a caller can never claim success while finalization is unavailable.
-const FINALIZE_DISPOSITIONS = new Set(["finalized", "already-terminal", "open-work", "not-found", "invalid-status"]);
+// throws inside request() (safe message; never a raw body). The response is STRICTLY validated below and any
+// contradictory / malformed shape throws, so a caller can never treat a broken acknowledgement as success.
+const FINALIZE_TERMINAL_STATUSES = new Set(["succeeded", "partial", "failed"]);
+const isSafeNonNegInt = (v) => Number.isSafeInteger(v) && v >= 0;
+const isValidTimestamp = (v) => typeof v === "string" && v.trim() !== "" && Number.isFinite(Date.parse(v));
+const countersCoherent = (c) => {
+  const fields = ["source_total", "source_succeeded", "source_failed", "report_total", "report_succeeded", "report_failed"];
+  if (!fields.every((f) => isSafeNonNegInt(c[f]))) return false;              // reject missing/string/fractional/negative/unsafe
+  if (c.source_succeeded + c.source_failed > c.source_total) return false;    // succeeded+failed cannot exceed total
+  if (c.report_succeeded + c.report_failed > c.report_total) return false;
+  return true;
+};
+const isPlainObject = (v) => v != null && typeof v === "object" && !Array.isArray(v);
+
+// The ONE strict validator every finalize response passes through. Returns { disposition, cycle } only when the
+// shape is fully coherent for its disposition; otherwise throws a safe error (fail closed). Unknown EXTRA fields
+// are ignored; unknown dispositions and contradictory combinations throw.
+function validateFinalizeResponse(result, cycleId) {
+  if (!isPlainObject(result)) throw new Error("finalizeSyncCycle: malformed finalize response; failing closed.");
+  const disposition = typeof result.disposition === "string" ? result.disposition : null;
+  const cycle = result.cycle;
+  if (disposition === "finalized" || disposition === "already-terminal") {
+    if (!isPlainObject(cycle)) throw new Error(`finalizeSyncCycle: '${disposition}' without a cycle object; failing closed.`);
+    if (cycle.id !== cycleId) throw new Error("finalizeSyncCycle: finalize acknowledgement for a different cycle id; failing closed.");
+    if (!FINALIZE_TERMINAL_STATUSES.has(cycle.status)) throw new Error(`finalizeSyncCycle: '${disposition}' cycle status "${cycle.status}" is not terminal; failing closed.`);
+    if (!isValidTimestamp(cycle.finished_at)) throw new Error("finalizeSyncCycle: terminal cycle is missing a valid finished_at; failing closed.");
+    if (!countersCoherent(cycle)) throw new Error("finalizeSyncCycle: terminal cycle counters are missing/unsafe/incoherent; failing closed.");
+    return { disposition, cycle };
+  }
+  if (disposition === "open-work") {
+    if (!isPlainObject(cycle)) throw new Error("finalizeSyncCycle: 'open-work' without a cycle object; failing closed.");
+    if (cycle.id !== cycleId) throw new Error("finalizeSyncCycle: open-work acknowledgement for a different cycle id; failing closed.");
+    if (cycle.status !== "running") throw new Error(`finalizeSyncCycle: 'open-work' cycle status "${cycle.status}" is not running; failing closed.`);
+    if (cycle.finished_at != null) throw new Error("finalizeSyncCycle: 'open-work' cycle has a finished_at; failing closed.");
+    if (!countersCoherent(cycle)) throw new Error("finalizeSyncCycle: open-work cycle counters are missing/unsafe/incoherent; failing closed.");
+    return { disposition, cycle };
+  }
+  if (disposition === "not-found" || disposition === "invalid-status") {
+    if (cycle != null) throw new Error(`finalizeSyncCycle: '${disposition}' must not carry a cycle; failing closed.`);
+    return { disposition, cycle: null };
+  }
+  throw new Error("finalizeSyncCycle: unknown finalize disposition; failing closed.");
+}
+
 export async function finalizeSyncCycle(cycleId) {
   const body = await request("/rest/v1/rpc/finalize_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
   const result = Array.isArray(body) ? body[0] : body;
-  const disposition = result && typeof result.disposition === "string" ? result.disposition : null;
-  if (!disposition || !FINALIZE_DISPOSITIONS.has(disposition)) {
-    throw new Error("finalizeSyncCycle: malformed or unknown finalize disposition; failing closed.");
-  }
-  return { disposition, cycle: (result && result.cycle) || null };
+  return validateFinalizeResponse(result, cycleId);
 }
 
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller

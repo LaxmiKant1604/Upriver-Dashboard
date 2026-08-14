@@ -253,6 +253,17 @@ test("(dispatcher: fail closed) an unknown/malformed finalize disposition throws
   await assert.rejects(() => scheduled(["brand-sales"], { store: store2 }), /unexpected finalize disposition/);
 });
 
+test("(dispatcher: fail closed) a malformed POSITIVE ack (finalized/already-terminal without a terminal cycle) throws -- never leaves drained=true", async () => {
+  for (const bad of [
+    () => ({ disposition: "finalized", cycle: null }),
+    () => ({ disposition: "finalized", cycle: { id: "x", status: "running" } }),
+    () => ({ disposition: "already-terminal", cycle: null }),
+  ]) {
+    const store = makeDispatchStore({ finalizeCycle: bad });
+    await assert.rejects(() => scheduled(["brand-sales"], { store }), /malformed positive finalize acknowledgement/);
+  }
+});
+
 test("(dispatcher: not-drained) maxJobs truncation + resumable deferral do NOT finalize; resume finalizes with ZERO duplicate create-export", async () => {
   // maxJobs truncation (scheduled) -> not drained -> no finalize call
   const s1 = makeDispatchStore();

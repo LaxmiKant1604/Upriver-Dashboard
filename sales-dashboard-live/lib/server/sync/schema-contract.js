@@ -120,6 +120,9 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       { name: "sync_source_job_owners_no_append_terminal", table: "sync_source_job_owners" },
       { name: "sync_report_jobs_no_append_terminal", table: "sync_report_jobs" },
     ],
+    // The guard function whose critical behavior is structurally proven (cycle_id immutable, FOR SHARE lock,
+    // terminal-parent reject, missing-parent fail-closed).
+    guardFunctions: ["reject_append_to_terminal_cycle"],
     wrappers: ["finalizeSyncCycle"],
     note: "Guarded finalize_sync_cycle RPC + reject_append_to_terminal_cycle triggers on the 3 child tables (PREPARED, UNAPPLIED).",
   },
@@ -349,11 +352,63 @@ function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-// A trigger is declared when a `create trigger <name> ... on public.<table>` statement exists in `masked`
-// (comments/strings blanked, so a create-trigger appearing only in a comment/string is invisible). `[^;]*`
-// bounds the scan to the single CREATE TRIGGER statement, so it never bleeds across statements/triggers.
-function triggerDeclared(masked, name, table) {
-  return new RegExp(`create\\s+trigger\\s+${name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i").test(masked);
+// BOUNDED STRUCTURAL proof of an append-guard trigger (Finding 2): an EXACT
+//   `create trigger <name> before insert or update on public.<table> for each row
+//    execute function public.reject_append_to_terminal_cycle()`
+// on `masked` (comments/strings blanked, so a comment/string can never satisfy it). The single regex pins the
+// timing (BEFORE), the EXACT events (INSERT OR UPDATE -- not DELETE, not INSERT-only/UPDATE-only, not extra
+// events since `on` must immediately follow `update`), the level (FOR EACH ROW -- rejects statement-level),
+// the table (public.<table>), and the executed function. A `drop trigger` for THIS trigger/table AFTER the
+// create (create-then-drop) makes it absent at apply time -> invalid.
+function triggerStructurallyValid(masked, name, table) {
+  const re = new RegExp(
+    `create\\s+trigger\\s+${name}\\s+before\\s+insert\\s+or\\s+update\\s+on\\s+public\\.${table}\\s+for\\s+each\\s+row\\s+execute\\s+function\\s+public\\.reject_append_to_terminal_cycle\\s*\\(\\s*\\)`,
+    "i",
+  );
+  const m = re.exec(masked);
+  if (!m) return { valid: false, reason: "no exact 'before insert or update on public." + table + " for each row execute function public.reject_append_to_terminal_cycle()'" };
+  const dropRe = new RegExp(`drop\\s+trigger\\s+(if\\s+exists\\s+)?${name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i");
+  if (dropRe.test(masked.slice(m.index + m[0].length))) return { valid: false, reason: "a DROP TRIGGER for this trigger appears after the create" };
+  return { valid: true, reason: null };
+}
+
+// The `$$...$$` body of `create or replace function public.<fnName>()`, in BOTH lexed views (length-aligned),
+// or null. The lexer keeps `as $$...$$` CODE bodies in `masked` (inner strings blanked) and preserves them in
+// `clean` (strings kept), so structural code is read from `masked` and exact string literals from `clean`.
+function functionBodyViews(clean, masked, fnName) {
+  const m = new RegExp(`create\\s+or\\s+replace\\s+function\\s+public\\.${fnName}\\s*\\(`, "i").exec(masked);
+  if (!m) return null;
+  const open = masked.indexOf("$$", m.index);
+  if (open < 0) return null;
+  const close = masked.indexOf("$$", open + 2);
+  if (close < 0) return null;
+  return { clean: clean.slice(open + 2, close), masked: masked.slice(open + 2, close) };
+}
+
+// Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR (Finding 2). Each check requires the CODE structure
+// in `masked` (a string/comment cannot forge it) and, where a specific literal matters, the literal in `clean`
+// (comments blanked), so neither a comment nor a string alone satisfies any check. Returns typed problems.
+function auditGuardFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "GUARD_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  // (a) UPDATE cannot change cycle_id.
+  if (!/new\.cycle_id\s+is\s+distinct\s+from\s+old\.cycle_id/i.test(body.masked) || !/tg_op\s*=\s*'update'/i.test(body.clean)) {
+    problems.push({ code: "GUARD_CYCLE_ID_IMMUTABLE_MISSING", reason: "no TG_OP='UPDATE' AND NEW.cycle_id is distinct from OLD.cycle_id guard" });
+  }
+  // (b) parent sync_cycles row locked FOR SHARE.
+  if (!/from\s+public\.sync_cycles\s+where\s+id\s*=\s*new\.cycle_id\s+for\s+share/i.test(body.masked)) {
+    problems.push({ code: "GUARD_FOR_SHARE_MISSING", reason: "parent sync_cycles row is not locked FOR SHARE" });
+  }
+  // (c) terminal succeeded|partial|failed parents rejected (exact ordered set).
+  if (!/v_status\s+in\s*\(/i.test(body.masked) || !/'succeeded'\s*,\s*'partial'\s*,\s*'failed'/i.test(body.clean) || !/raise\s+exception/i.test(body.masked)) {
+    problems.push({ code: "GUARD_TERMINAL_REJECT_MISSING", reason: "no rejection of terminal (succeeded|partial|failed) parents" });
+  }
+  // (d) missing parent fails closed.
+  if (!/if\s+not\s+found\s+then/i.test(body.masked) || !/raise\s+exception/i.test(body.masked)) {
+    problems.push({ code: "GUARD_MISSING_PARENT_NOT_FAILCLOSED", reason: "a missing parent cycle does not fail closed" });
+  }
+  return problems;
 }
 
 // ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------
@@ -561,7 +616,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
     const raw = safeRead(entry.migration);
-    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], triggers: [], wrappers: [], namedConstraints: [] };
+    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], triggers: [], guardFunctions: [], wrappers: [], namedConstraints: [] };
     if (raw == null) {
       blockers.push({ code: "MIGRATION_MISSING", migration: entry.migration, message: `migration ${entry.migration} not found` });
       matrix.push(row);
@@ -603,9 +658,14 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       row.rpcs.push({ name: r.name, declared, paramsMatch, referencedByWrapper });
     }
     for (const tg of entry.triggers || []) {
-      const declared = triggerDeclared(masked, tg.name, tg.table);
-      if (!declared) blockers.push({ code: "TRIGGER_MISSING", migration: entry.migration, trigger: tg.name, table: tg.table, message: `trigger ${tg.name} on public.${tg.table} is not created by ${entry.migration}` });
-      row.triggers.push({ name: tg.name, table: tg.table, declared });
+      const { valid, reason } = triggerStructurallyValid(masked, tg.name, tg.table);
+      if (!valid) blockers.push({ code: "TRIGGER_INVALID", migration: entry.migration, trigger: tg.name, table: tg.table, message: `trigger ${tg.name} on public.${tg.table} is not a valid BEFORE INSERT OR UPDATE ... FOR EACH ROW EXECUTE FUNCTION public.reject_append_to_terminal_cycle() (${reason})` });
+      row.triggers.push({ name: tg.name, table: tg.table, valid });
+    }
+    for (const fn of entry.guardFunctions || []) {
+      const problems = auditGuardFunction(clean, masked, fn);
+      for (const p of problems) blockers.push({ code: p.code, migration: entry.migration, target: fn, message: `guard function public.${fn}: ${p.reason}` });
+      row.guardFunctions.push({ name: fn, ok: problems.length === 0, problems: problems.map((p) => p.code) });
     }
     for (const w of entry.wrappers) {
       const exported = wrapperExported(wrapperCode, w);

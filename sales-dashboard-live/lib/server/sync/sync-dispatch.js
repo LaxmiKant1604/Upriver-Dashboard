@@ -336,9 +336,14 @@ export async function runSchedulerV2Shadow({
     const disp = await store.finalizeCycle({ cycleId: rollup.cycleId });
     const d = disp && disp.disposition;
     if (d === "finalized" || d === "already-terminal") {
-      // The cycle is complete (this run closed it, or another already did). drained stays true / continuation false.
+      // Rely ONLY on a sound positive acknowledgement: a terminal cycle object. Never leave drained=true after a
+      // malformed positive (the store's wrapper already strictly validates; this is defense in depth).
+      const terminalStatus = disp.cycle && typeof disp.cycle === "object" ? disp.cycle.status : null;
+      if (!["succeeded", "partial", "failed"].includes(terminalStatus)) {
+        throw new Error(`runSchedulerV2Shadow: malformed positive finalize acknowledgement (disposition "${d}" without a terminal cycle) for cycle ${rollup.cycleId}; failing closed.`);
+      }
       rollup.finalized = d === "finalized";
-      rollup.cycleStatus = (disp.cycle && disp.cycle.status) || (d === "already-terminal" ? "terminal" : null);
+      rollup.cycleStatus = terminalStatus;
     } else if (d === "open-work") {
       // The WHOLE cycle still has open source/report work (a concurrent scope). Re-observe on a fresh
       // invocation: this run is NOT the completion of the cycle.
