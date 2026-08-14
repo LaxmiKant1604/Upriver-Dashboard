@@ -8879,3 +8879,36 @@ CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no producti
 Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
 cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
 UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
+
+## Scheduler v2: per-condition guard-raise binding + strict RFC3339 finished_at (2026-08-14)
+
+Codex re-review found 2 more findings on the finalization wiring. Fixed OFFLINE (migrations 1-4 byte-unchanged;
+Migration 5 still UNAPPLIED and byte-identical to HEAD -- no SQL change this round; no production side effect;
+Gate 5 NOT re-run). Commit 48959d0 (code/tests), then docs. Status UNCHANGED: the lifecycle fix is code-complete
+but NOT resolved in production until Migration 5 is applied via a reviewed Gate and the canary cycle reconciled
+(Appendix N); Gate 6 remains BLOCKED.
+
+- FINDING 1 (guard audit must bind each condition to its OWN rejection): auditGuardFunction previously passed
+  when a required RAISE EXCEPTION was removed, because a raise ELSEWHERE satisfied a global regex. New
+  ifBlockRaises() finds the IF block whose header matches the guard condition (in the SQL-aware `masked` view)
+  and, bounded by its OWN matching END IF via IF-nesting depth, proves a RAISE EXCEPTION appears INSIDE that
+  block. A raise in a different block, moved before/after the block, or hidden in a comment/string no longer
+  satisfies it; an optional header string literal is checked in `clean`. Three bound conditions: TG_OP='UPDATE'
+  AND NEW.cycle_id IS DISTINCT FROM OLD.cycle_id; IF NOT FOUND after the parent SELECT; v_status IN
+  (succeeded|partial|failed). FOR SHARE (a lock, not an IF block) and the timing/event/level/function/table/
+  no-drop-trigger structural checks are unchanged. Mutations proven to fail closed against the ACTUAL Migration 5:
+  terminal raise -> PERFORM 1; missing-parent block -> NULL; cycle-id block -> NULL; raise moved outside its IF;
+  condition and raise in separate IF blocks; comment/string raise fakes.
+- FINDING 2 (strict finished_at): replaced Date.parse-only validation with strict RFC3339 timestamptz validation
+  -- string ONLY; full date + T + time + timezone (Z or a valid numeric offset); a REAL calendar date + valid
+  time/offset components; a finite parsed instant. Accepts representative valid Z and +00:00 (and numeric-offset)
+  values; rejects "0"/"1", date-only, timezone-less, 2026-02-30T00:00:00Z, out-of-range hours/minutes/seconds/
+  offsets, blanks, numbers, arrays, and objects. All other acknowledgement/counter validation unchanged.
+- Tests: cycle-finalize-wiring 12 (+2: a BOUNDED-IF guard-mutation test and a strict finished_at accept/reject
+  matrix). node --check clean; npm run verify 35/35 incl. build:check; git diff --check clean; migrations 1-4
+  byte-unchanged (1328bc0f/0750a155/544557fb/49628c8d); Migration 5 UNAPPLIED.
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
+UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
