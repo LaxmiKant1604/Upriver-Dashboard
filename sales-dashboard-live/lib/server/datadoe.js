@@ -203,18 +203,33 @@ export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds,
 
 export async function pollExport(apiKey, exportId) {
   // DataDoe recommends a five-second poll cadence and exports can take close
-  // to 30 seconds. Keep this below Vercel's 60-second function limit.
+  // to 30 seconds. Keep this below Vercel's 60-second function limit: the
+  // cadence sleep runs at the START of each attempt (9 x 5s = 45s of sleeps,
+  // the same total budget as before -- the old loop slept AFTER each attempt,
+  // including a useless final sleep), so the bound is unchanged.
+  //
+  // Confirmed DataDoe behaviour: a status GET issued too soon after the
+  // create-export POST can return HTTP 404 before the export becomes visible.
+  // So (1) always wait one 5s cadence BEFORE the first status GET, and
+  // (2) treat a status-GET 404 as "not visible yet" (still pending) within
+  // this SAME bounded window -- never terminal, and NEVER answered by a second
+  // create-export POST (the export id is fixed; this function only ever GETs).
+  // A 404 that outlives every attempt becomes the normal poll timeout
+  // (non-terminal, resumable by export_id -- still no second create). Any
+  // other non-OK status stays a real failure, as does a 404 on the CREATE
+  // POST itself (createExport above throws on any non-OK response).
   const maxAttempts = 9;
   const delayMs = 5000;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await sleep(delayMs); // cadence first: also the wait before the FIRST status GET
     const r = await ddFetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
+    if (r.status === 404) continue; // export not visible yet: temporary within the bounded window
     if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
     const body = await r.json();
     if (body.status === "COMPLETED") return body;
     if (["FAILED", "ERROR", "BLOCKED_NO_TOKENS"].includes(body.status)) {
       throw new Error(`DataDoe export failed to process (${body.status}).`);
     }
-    await sleep(delayMs);
   }
   throw new Error("DataDoe export timed out while processing. Try a shorter date range.");
 }
