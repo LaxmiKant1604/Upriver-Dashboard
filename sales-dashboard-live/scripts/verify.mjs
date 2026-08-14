@@ -41,6 +41,7 @@ const SUITES = [
   "test:gate5-canary-package",
   "test:datadoe-poll-export",
   "test:manual-source-continuation",
+  "test:cycle-lifecycle",
   "build:check",
 ];
 

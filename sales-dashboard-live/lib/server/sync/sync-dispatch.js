@@ -192,6 +192,7 @@ export async function runSchedulerV2Shadow({
       selected: [], lockedOut, derivedOnly,
       unavailableAccounts: [], accountsDispatched: [],
       spent: 0, maxJobs, stoppedForBudget: false, drained: true, continuationRequired: false, perUnit: [], reports: null,
+      finalized: false, cycleStatus: null, // no cycle was opened -> nothing to finalize
     };
   }
 
@@ -312,5 +313,26 @@ export async function runSchedulerV2Shadow({
   const reportsDrained = !rollup.reports || rollup.reports.drained === true;
   rollup.drained = allUnitsDrained && reportsDrained && !rollup.stoppedForBudget;
   rollup.continuationRequired = !rollup.drained;
+
+  // 6) FINALIZE the shared cycle -- the CANONICAL DISPATCHER owns this; a source-family driver must NEVER
+  //    finalize the shared (bucket, cycle_date) cycle early (a partial source drain is not a finished cycle).
+  //    Attempt finalization ONLY on a genuine terminal drain of THIS run's scope (rollup.drained). The store's
+  //    GUARDED finalize (finalize_sync_cycle RPC -- see cycle-lifecycle.js + 20260815_sync_cycle_finalize.sql)
+  //    then atomically re-checks the WHOLE cycle: it flips running->terminal with authoritative source AND
+  //    report counters + finished_at ONLY when zero source/report jobs remain open, else it leaves the cycle
+  //    running (finished_at null). So a manual subset, a concurrent continuation that appended open work, or a
+  //    stale finalizer can NEVER prematurely close a cycle that still has open work, and a replay against an
+  //    already-terminal cycle is a no-op. Non-drained / deferred / deadline / maxJobs-truncated runs skip this
+  //    entirely and stay running (resumable). The store may omit finalizeCycle (no-op) until the reviewed RPC
+  //    lands; the dispatcher owns the decision regardless.
+  rollup.finalized = false;
+  rollup.cycleStatus = null;
+  if (rollup.drained && rollup.cycleId && typeof store.finalizeCycle === "function") {
+    const finalizedRow = await store.finalizeCycle({ cycleId: rollup.cycleId, expectStatus: "running" });
+    if (finalizedRow && finalizedRow.status) {
+      rollup.finalized = true;
+      rollup.cycleStatus = finalizedRow.status;
+    }
+  }
   return rollup;
 }
