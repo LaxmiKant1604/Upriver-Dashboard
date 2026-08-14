@@ -40,6 +40,7 @@ const SUITES = [
   "test:report-sync-controls",
   "test:gate5-canary-package",
   "test:datadoe-poll-export",
+  "test:manual-source-continuation",
   "build:check",
 ];
 

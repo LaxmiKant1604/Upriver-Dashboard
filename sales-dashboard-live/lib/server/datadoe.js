@@ -33,6 +33,14 @@ import {
   pruneSourceExportCache,
   saveSourceExportCache,
 } from "./supabase.js";
+// Durable manual-export continuation (finding: a 504-retry after poll-pending/deadline must
+// resume the SAME export, never create another). The protocol lives in its own module and is
+// keyed by the exact canonical request_hash; fetchSourceChunk routes through it whenever the
+// durable store exists.
+import {
+  manualSourceContinuationEnabled,
+  runManualSourceAttempt,
+} from "./manual-source-continuation.js";
 
 export const DATADOE_BASE = "https://api.datadoe.com/api/v1";
 
@@ -359,19 +367,50 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
   const existing = sourceExportInflight.get(identity.requestHash);
   if (existing) return existing;
 
-  const work = (async () => {
-    const created = await createExport(apiKey, sourceId, columns, ids, from, to, limit, options);
-    const exportId = created.exportId || created.id;
-    if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
-    const rows = await downloadExport(apiKey, exportId);
+  // Shared completion: remember + persist through the NORMAL source cache. A result on the cap
+  // may be truncated. Strict callers reject it; do not persist it where another report could
+  // mistake it for complete data.
+  const finishRows = async (rows) => {
     const expiresAt = Date.now() + cacheHours * 3600_000;
     rememberSourceRows(identity.requestHash, rows, expiresAt);
-    // A result on the cap may be truncated. Strict callers reject it; do not
-    // persist it where another report could mistake it for complete data.
     if (rows.length < limit) {
       await persistSourceRows({ identity, sourceId, rows, cacheHours });
     }
     return rows;
+  };
+
+  const work = (async () => {
+    if (manualSourceContinuationEnabled()) {
+      // Durable continuation (production): the marker protocol guarantees at most one
+      // create-export per request_hash attempt, persists the exportId before polling, and lets
+      // a LATER HTTP request (a fresh serverless invocation) resume the same export.
+      return runManualSourceAttempt({
+        requestHash: identity.requestHash,
+        organizationFingerprint: identity.organizationFingerprint,
+        sourceId: String(sourceId),
+        create: () => createExport(apiKey, sourceId, columns, ids, from, to, limit, options),
+        poll: (exportId) => pollExport(apiKey, exportId),
+        download: (exportId) => downloadExport(apiKey, exportId),
+        finishRows,
+        isResumableEscape: (error) => isDataDoePollPendingError(error) || isDataDoeDeadlineError(error),
+        // DEFINITE create failure = DataDoe ANSWERED the POST with an error status (the stable
+        // createExport message shape). Deadline/abort/transport errors stay AMBIGUOUS.
+        isDefiniteCreateFailure: (error) => /export creation failed \(\d{3}\)/.test(error instanceof Error ? error.message : String(error)),
+      });
+    }
+    // No durable store (local dev / offline tests): legacy single-invocation flow. A resumable
+    // escape here has NO durable continuation -- mark it so the route never answers
+    // retryable:true for a request that would have to create a NEW export.
+    try {
+      const created = await createExport(apiKey, sourceId, columns, ids, from, to, limit, options);
+      const exportId = created.exportId || created.id;
+      if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
+      const rows = await downloadExport(apiKey, exportId);
+      return await finishRows(rows);
+    } catch (error) {
+      if (isDataDoePollPendingError(error) || isDataDoeDeadlineError(error)) error.durableContinuation = false;
+      throw error;
+    }
   })();
   sourceExportInflight.set(identity.requestHash, work);
   try {

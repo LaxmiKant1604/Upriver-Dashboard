@@ -1,22 +1,19 @@
 // DataDoe pollExport + execution-deadline hardening — deterministic OFFLINE tests.
 //
-// Confirmed DataDoe status behaviour: a status GET issued too soon after the create-export POST can
-// return HTTP 404 before the export becomes visible. The poller must (1) wait one 5s cadence BEFORE the
-// first status GET, (2) treat a status-GET 404 as temporary within the SAME bounded poll window,
-// (3) NEVER issue a second create-export POST, (4) keep create-POST 404 and non-404 status errors as
-// real failures, and (5) surface a TYPED resumable signal when the bounded window is exhausted by ONLY
-// temporary states (repeated 404 / ordinary PENDING) -- DataDoePollPendingError -- which Scheduler v2's
-// source worker defers exactly like a deadline deferral: the durable job stays fetch_status='attempted'
-// with its export_id, deferred increments, drained stays false, NO source failure is recorded, and a
-// fresh invocation resumes the SAME export id (total create-export count stays exactly one).
+// Poller contract (confirmed DataDoe behaviour): wait one 5s cadence BEFORE the first status GET;
+// a status-GET 404 is temporary within the bounded window; exhaustion by ONLY temporary states
+// (repeated 404 / ordinary PENDING) throws the TYPED resumable DataDoePollPendingError; terminal
+// outcomes (status 500, FAILED/ERROR/BLOCKED_NO_TOKENS, create-POST 404) stay real failures; the
+// poller NEVER issues a create-export POST. Scheduler v2 defers the typed signal exactly like a
+// deadline deferral and resumes the SAME export id in a later invocation.
 //
-// The absolute execution deadline (withDataDoeDeadline) must cover NETWORK time and RATE-LIMIT sleeps,
-// not just cadence sleeps: no new request starts when insufficient time remains, and slow HTTP cannot
-// push work past the configured budget (the typed DataDoeDeadlineError surfaces instead).
-//
-// Deterministic: globalThis.setTimeout fires immediately while RECORDING each requested delay;
-// globalThis.fetch is a scripted queue RECORDING method/url/start-time; Date.now is a controllable fake
-// clock that responders advance to simulate HTTP latency. No network, no DataDoe, no Supabase.
+// Deadline harness (finding 2): deadline tests run under an injected DETERMINISTIC virtual
+// clock/scheduler -- every setTimeout becomes a virtual timer, firing a timer ADVANCES the same
+// clock Date.now() reads, a slow fetch stays PENDING on a virtual timer and listens to
+// options.signal (rejecting AbortError when ddFetch's own deadline abort fires), and the pump
+// drives timers in time order until the promise settles. So cadence sleeps, rate-limit/429
+// sleeps, AND HTTP latency are all charged to one absolute deadline; in-flight aborts are real;
+// and no test ever waits real seconds.
 //
 // 7-bit ASCII, LF. Run: node scripts/datadoe-poll-export.test.js
 
@@ -28,21 +25,66 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-// ---- controllable fake clock: real time until a test freezes/advances it ----
+// ---- virtual deterministic clock + scheduler (deadline tests) ----
 const realDateNow = Date.now.bind(Date);
-let fakeNow = null; // null => real clock
-Date.now = () => (fakeNow ?? realDateNow());
-
-// ---- deterministic timer stub: fire immediately, record every requested delay in order ----
-const events = []; // ordered log of { type: "sleep", ms } and { type: "fetch", method, url, at }
 const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+let virtual = null; // { now, timers: [{ at, fn, id }], nextId }
+
+Date.now = () => (virtual ? virtual.now : realDateNow());
 globalThis.setTimeout = (fn, ms, ...args) => {
-  events.push({ type: "sleep", ms: Number(ms) || 0 });
-  return realSetTimeout(fn, 0, ...args);
+  const delay = Math.max(0, Number(ms) || 0);
+  events.push({ type: "sleep", ms: delay });
+  if (virtual) {
+    const id = virtual.nextId++;
+    virtual.timers.push({ at: virtual.now + delay, fn: () => fn(...args), id });
+    return { __vid: id };
+  }
+  return realSetTimeout(fn, 0, ...args); // simple mode: fire immediately (delay recorded above)
+};
+globalThis.clearTimeout = (handle) => {
+  if (handle && handle.__vid != null) {
+    if (virtual) virtual.timers = virtual.timers.filter((t) => t.id !== handle.__vid);
+    return undefined;
+  }
+  return realClearTimeout(handle);
 };
 
-// ---- scripted fetch stub: shift the next queued responder, record method+url+time, fail on overrun.
-// A responder may carry latencyMs: the fake clock advances by that much, simulating slow HTTP. ----
+const tick = () => new Promise((resolve) => realSetTimeout(resolve, 0));
+
+// Drive a promise to settlement by firing virtual timers in time order; each firing advances the
+// shared clock. Fails loudly on a deadlock (pending promise, no timers) instead of hanging.
+async function pump(promise) {
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  for (let guard = 0; guard < 100000; guard++) {
+    await tick(); // flush microtask continuations first
+    if (settled) return;
+    if (!virtual || virtual.timers.length === 0) {
+      await tick();
+      if (settled) return;
+      throw new Error("virtual deadlock: promise pending with no scheduled timers");
+    }
+    virtual.timers.sort((a, b) => a.at - b.at);
+    const next = virtual.timers.shift();
+    if (next.at > virtual.now) virtual.now = next.at; // ADVANCE the shared clock
+    next.fn();
+  }
+  throw new Error("pump guard exceeded");
+}
+async function pumpError(factory) {
+  let caught = null;
+  const p = factory().catch((e) => { caught = e; });
+  await pump(p);
+  return caught;
+}
+async function withVirtual(baseNow, fn) {
+  virtual = { now: baseNow, timers: [], nextId: 1 };
+  try { return await fn(); } finally { virtual = null; }
+}
+
+// ---- ordered event log + scripted, abort-aware fetch stub ----
+const events = []; // { type: "sleep", ms } | { type: "fetch", method, url, at } | { type: "abort", at }
 let fetchQueue = [];
 const mkRes = ({ status = 200, body = {} }) => ({
   ok: status >= 200 && status < 300,
@@ -52,13 +94,28 @@ const mkRes = ({ status = 200, body = {} }) => ({
   text: async () => JSON.stringify(body),
   clone() { return this; },
 });
-globalThis.fetch = async (url, options = {}) => {
+globalThis.fetch = (url, options = {}) => {
   const method = (options.method || "GET").toUpperCase();
   events.push({ type: "fetch", method, url: String(url), at: Date.now() });
   const next = fetchQueue.shift();
-  if (!next) throw new Error(`unexpected fetch: ${method} ${url}`);
-  if (next.latencyMs && fakeNow !== null) fakeNow += next.latencyMs; // slow HTTP consumes budget
-  return mkRes(next);
+  if (!next) return Promise.reject(new Error(`unexpected fetch: ${method} ${url}`));
+  const latency = Math.max(0, Number(next.latencyMs) || 0);
+  if (!virtual || latency === 0) return Promise.resolve(mkRes(next));
+  // Slow fetch in virtual mode: stays PENDING on a virtual timer and honors options.signal --
+  // an abort cancels the response timer and rejects with a genuine AbortError.
+  return new Promise((resolve, reject) => {
+    const signal = options.signal;
+    const abortError = () => { const e = new Error("This operation was aborted"); e.name = "AbortError"; return e; };
+    if (signal && signal.aborted) { reject(abortError()); return; }
+    const handle = globalThis.setTimeout(() => resolve(mkRes(next)), latency);
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        globalThis.clearTimeout(handle);
+        events.push({ type: "abort", at: Date.now() });
+        reject(abortError());
+      }, { once: true });
+    }
+  });
 };
 
 const resetLog = () => { events.length = 0; fetchQueue = []; };
@@ -68,13 +125,18 @@ const statusGets = (id) => fetches().filter((e) => e.method === "GET" && e.url.e
 const cadenceSleeps = () => events.filter((e) => e.type === "sleep" && e.ms === 5000);
 const firstIndex = (pred) => events.findIndex(pred);
 
-let pollExport, createExport, fetchExportRows, withDataDoeDeadline;
+let pollExport, createExport, fetchExportRows, withDataDoeDeadline, ddFetch;
 let DataDoeDeadlineError, isDataDoeDeadlineError, isDataDoePollPendingError;
 let classifyFetchError, runSourceJobs;
 
+// Ascending virtual bases, always ahead of the real clock so the module's rate limiter
+// (stamped with earlier real/virtual times) never inserts an artificial first-call sleep.
+let baseCursor = null;
+const nextBase = () => { baseCursor = (baseCursor ?? realDateNow()) + 600_000; return baseCursor; };
+
 // ---- compact in-memory store for the worker-level regression (models the SQL RPC surface) ----
 function mkStore() {
-  const jobs = new Map(); // request_hash -> row
+  const jobs = new Map();
   let failureCalls = 0;
   return {
     jobs,
@@ -119,12 +181,12 @@ const PLANNED = Object.freeze({
   requestMeta: {}, strict: false, limit: 50000,
 });
 
-// ================= poller tests =================
+// ================= poller tests (simple mode) =================
 
 test("(404 -> pending -> completed) status-GET 404 is temporary; poll resolves; zero POSTs; 5s wait precedes the FIRST GET", async () => {
   resetLog();
   fetchQueue = [
-    { status: 404, body: { message: "Export not found" } },   // too-soon GET: export not visible yet
+    { status: 404, body: { message: "Export not found" } },
     { status: 200, body: { status: "PENDING" } },
     { status: 200, body: { status: "COMPLETED", id: "e1" } },
   ];
@@ -152,7 +214,6 @@ test("(repeated-404 exhaustion) TYPED poll-pending signal -- resumable, never te
   const cls = classifyFetchError(caught, "poll");
   assert.equal(cls.code, "POLL_PENDING");
   assert.equal(cls.terminal, false, "poll-pending is NEVER terminal");
-  // Policy unchanged for a genuine plain processing-timeout error (e.g. ads-sync): still TIMEOUT.
   assert.equal(classifyFetchError(new Error("DataDoe export timed out while processing.")).code, "TIMEOUT");
 });
 
@@ -185,7 +246,6 @@ test("(non-404 failures stay real) status 500 throws immediately; FAILED/ERROR/B
     assert.ok(!isDataDoePollPendingError(caught), `${st} is a genuine failure, never poll-pending`);
   }
 
-  // A 404 on the CREATE POST itself is a real failure (source unavailable), never retried/absorbed.
   resetLog();
   fetchQueue = [{ status: 404, body: { message: "Source not found", statusCode: 404 } }];
   await assert.rejects(
@@ -199,10 +259,10 @@ test("(exactly one create-export) full flow with a too-soon 404 mid-poll still m
   resetLog();
   const rows = [{ a: 1 }, { a: 2 }];
   fetchQueue = [
-    { status: 200, body: { exportId: "exp-1", status: "PENDING" } },              // POST create (the only one)
-    { status: 404, body: {} },                                                    // status GET: not visible yet
-    { status: 200, body: { status: "COMPLETED" } },                               // status GET: done
-    { status: 200, body: { rawContent: JSON.stringify(rows) } },                  // GET raw download
+    { status: 200, body: { exportId: "exp-1", status: "PENDING" } },
+    { status: 404, body: {} },
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
   ];
   const got = await fetchExportRows("k", "src-1", ["a"], ["S1"], "2026-01-01", "2026-01-31", 100, { bypassSourceCache: true });
   assert.deepEqual(got, rows);
@@ -211,61 +271,100 @@ test("(exactly one create-export) full flow with a too-soon 404 mid-poll still m
   assert.equal(fetches().filter((e) => e.url.endsWith("/exports/exp-1/raw")).length, 1, "one download");
 });
 
-// ================= execution-deadline tests (fake clock) =================
+// ================= execution-deadline regressions (virtual clock; sleeps ADVANCE time) =================
 
-test("(deadline vs slow HTTP) slow status GETs consume the budget; the next step defers -- no request starts past the bound", async () => {
+test("(deadline: cadence + HTTP latency share ONE budget) both are charged; the next cadence defers within the bound", async () => {
   resetLog();
-  const base = realDateNow() + 600_000; // ahead of the real rate-limiter timestamp: no artificial first sleep
-  fakeNow = base;
-  const DEADLINE = base + 20_000;
-  // Each status GET "takes" 9s of wall clock. Budget 20s => two GETs fit (18s); the third attempt's
-  // cadence sleep sees < 5s+headroom remaining and surfaces the typed deadline error instead.
-  fetchQueue = [
-    { status: 200, body: { status: "PENDING" }, latencyMs: 9_000 },
-    { status: 200, body: { status: "PENDING" }, latencyMs: 9_000 },
-  ];
-  let caught = null;
-  await withDataDoeDeadline(DEADLINE, () => pollExport("k", "slow")).catch((e) => { caught = e; });
-  assert.ok(isDataDoeDeadlineError(caught), "typed DataDoeDeadlineError (deadline covers HTTP latency, not just sleeps)");
-  assert.ok(!isDataDoePollPendingError(caught), "a deadline stop is distinct from poll-window exhaustion");
-  assert.equal(statusGets("slow").length, 2, "no third status GET starts once the budget cannot fit it");
-  assert.ok(fakeNow - base <= 20_000, "simulated elapsed time never exceeds the configured deadline");
-  for (const f of fetches()) assert.ok(f.at <= DEADLINE - 750, "every request STARTED with more than the shutdown headroom remaining");
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    const BUDGET = 12_000;
+    // attempt 1: cadence sleep advances to +5000; the GET's 4s latency advances to +9000 (PENDING).
+    // attempt 2: cadence pre-check sees 3000ms remaining < 5s cadence + headroom -> typed deferral.
+    fetchQueue = [{ status: 200, body: { status: "PENDING" }, latencyMs: 4_000 }];
+    const caught = await pumpError(() => withDataDoeDeadline(base + BUDGET, () => pollExport("k", "slow1")));
+    assert.ok(isDataDoeDeadlineError(caught), "typed DataDoeDeadlineError");
+    assert.ok(!isDataDoePollPendingError(caught), "a deadline stop stays distinct from poll-window exhaustion");
+    assert.equal(statusGets("slow1").length, 1, "only the first GET ran; the second cadence never started");
+    assert.equal(virtual.now - base, 9_000, "5s cadence + 4s HTTP latency were BOTH charged to the same clock");
+    assert.ok(virtual.now - base <= BUDGET, "elapsed simulated time never exceeds the configured bound");
+  });
 });
 
-test("(deadline vs rate-limit sleep) the 2-req/sec spacing sleep is budget-aware: it defers instead of running past the bound", async () => {
+test("(deadline before first cadence) insufficient budget for one cadence => zero status GETs", async () => {
   resetLog();
-  const base = realDateNow() + 1_200_000;
-  fakeNow = base;
-  // Pre-seed the rate limiter OUTSIDE any deadline: this fetch stamps lastCall = base.
-  fetchQueue = [{ status: 200, body: { ok: true } }];
-  const r0 = await (await import("../lib/server/datadoe.js")).ddFetch("https://api.datadoe.com/api/v1/x", {});
-  assert.equal(r0.status, 200);
-  const fetchesBefore = fetches().length;
-  // Now a SECOND request 0ms later under a 1.2s budget: the ~550ms spacing sleep + 750ms headroom
-  // exceed the remaining budget, so the rate-limit sleep itself surfaces the deadline error BEFORE
-  // any request starts.
-  let caught = null;
-  await withDataDoeDeadline(base + 1_200, () => (import("../lib/server/datadoe.js").then((m) => m.ddFetch("https://api.datadoe.com/api/v1/y", {})))).catch((e) => { caught = e; });
-  assert.ok(isDataDoeDeadlineError(caught), "rate-limit spacing is bounded by the same deadline");
-  assert.equal(fetches().length, fetchesBefore, "NO extra request started beyond the deadline");
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    const caught = await pumpError(() => withDataDoeDeadline(base + 4_000, () => pollExport("k", "late")));
+    assert.ok(isDataDoeDeadlineError(caught));
+    assert.equal(statusGets("late").length, 0, "never starts a request when insufficient time remains");
+    assert.equal(virtual.now, base, "nothing advanced the clock -- the cadence sleep never ran");
+  });
 });
 
-test("(deadline before first GET) a poll invoked with < one cadence of budget defers immediately -- zero status GETs", async () => {
+test("(deadline blocks the request itself) insufficient remaining budget => the HTTP request never starts", async () => {
   resetLog();
-  const base = realDateNow() + 1_800_000;
-  fakeNow = base;
-  let caught = null;
-  await withDataDoeDeadline(base + 5_500, () => pollExport("k", "late")).catch((e) => { caught = e; });
-  assert.ok(isDataDoeDeadlineError(caught));
-  assert.equal(statusGets("late").length, 0, "never starts a request when insufficient time remains");
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    fetchQueue = [{ status: 200, body: {} }];
+    const caught = await pumpError(() => withDataDoeDeadline(base + 700, () => ddFetch("https://api.datadoe.com/api/v1/blocked", {})));
+    assert.ok(isDataDoeDeadlineError(caught), "ddFetch's own pre-check defers inside the shutdown headroom");
+    assert.equal(fetches().length, 0, "NO request was started");
+  });
 });
 
-// ================= worker-level regression (Blocker 1) =================
-// First invocation wins the claim and creates export E once; the poll window exhausts on ONLY
-// temporary states (or the execution deadline); the durable row stays attempted with export_id E,
-// deferred >= 1, drained=false, NO source failure. A second invocation resumes E, creates ZERO new
-// exports, downloads, validates, succeeds. Total create-export count stays exactly one.
+test("(deadline aborts an in-flight slow GET) the AbortSignal fires at deadline-headroom and becomes DataDoeDeadlineError", async () => {
+  resetLog();
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    const BUDGET = 10_000;
+    // cadence -> +5000; the GET would take 60s, so ddFetch's own deadline abort timer fires at
+    // remaining-750 = +9250. The pending fetch rejects AbortError; ddFetch translates it.
+    fetchQueue = [{ status: 200, body: { status: "PENDING" }, latencyMs: 60_000 }];
+    const caught = await pumpError(() => withDataDoeDeadline(base + BUDGET, () => pollExport("k", "hung")));
+    assert.ok(isDataDoeDeadlineError(caught), "the in-flight abort surfaces as the typed deadline error");
+    assert.equal(statusGets("hung").length, 1, "the GET started once and was cancelled -- never retried past the bound");
+    const abortEvent = events.find((e) => e.type === "abort");
+    assert.ok(abortEvent, "the fetch stub observed the AbortSignal");
+    assert.equal(abortEvent.at - base, 9_250, "aborted exactly at deadline - headroom");
+    assert.ok(virtual.now - base <= BUDGET, "elapsed simulated time never exceeds the configured bound");
+  });
+});
+
+test("(deadline vs rate-limit spacing) the 2-req/sec spacing sleep is budget-aware and blocks a second request", async () => {
+  resetLog();
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    // Pre-seed OUTSIDE any deadline: stamps the rate limiter at `base`.
+    fetchQueue = [{ status: 200, body: { ok: true } }];
+    const seeded = ddFetch("https://api.datadoe.com/api/v1/x", {});
+    await pump(seeded);
+    assert.equal((await seeded).status, 200);
+    const before = fetches().length;
+    // A second request 0ms later under a 1.2s budget: the ~550ms spacing sleep + 750ms headroom
+    // exceed the remaining budget, so the spacing sleep itself defers BEFORE any request starts.
+    const caught = await pumpError(() => withDataDoeDeadline(base + 1_200, () => ddFetch("https://api.datadoe.com/api/v1/y", {})));
+    assert.ok(isDataDoeDeadlineError(caught));
+    assert.equal(fetches().length, before, "NO extra request started beyond the deadline");
+    assert.ok(virtual.now - base <= 1_200, "elapsed simulated time never exceeds the configured bound");
+  });
+});
+
+test("(deadline vs 429 retry sleep) the retry-after sleep consumes budget and cannot start another request", async () => {
+  resetLog();
+  const base = nextBase();
+  await withVirtual(base, async () => {
+    const BUDGET = 2_900;
+    // One 429 (1s latency). The retry path would sleep retryAfterSeconds*1000+250 = 2250ms, but
+    // only 1900ms remain -> the retry sleep defers; the retry request NEVER starts.
+    fetchQueue = [{ status: 429, body: { retryAfterSeconds: 2 }, latencyMs: 1_000 }];
+    const caught = await pumpError(() => withDataDoeDeadline(base + BUDGET, () => ddFetch("https://api.datadoe.com/api/v1/limited", {})));
+    assert.ok(isDataDoeDeadlineError(caught), "the 429 retry sleep is bounded by the same deadline");
+    assert.equal(fetches().length, 1, "exactly one request; the 429 retry never started");
+    assert.ok(virtual.now - base <= BUDGET, "elapsed simulated time never exceeds the configured bound");
+  });
+});
+
+// ================= worker-level regression (Scheduler v2 two-invocation resume) =================
 
 for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) {
   test(`(worker resume: ${cause}) attempted+export_id preserved, deferred, drained:false, then resumed with ZERO new creates`, async () => {
@@ -281,7 +380,6 @@ for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) 
     if (cause === "repeated-404") fetchQueue = Array.from({ length: 9 }, () => ({ status: 404, body: {} }));
     if (cause === "repeated-PENDING") fetchQueue = Array.from({ length: 9 }, () => ({ status: 200, body: { status: "PENDING" } }));
 
-    // ---- invocation 1: create once, exhaust the temporary window, DEFER (no failure) ----
     const run1 = await runSourceJobs({ store, dataDoe: dd, plannedJobs: [PLANNED], bucket: "us", cycleDate: "2026-08-14" });
     const row1 = store.jobs.get("h1");
     assert.equal(creates.count, 1, "exactly one create-export in invocation 1");
@@ -296,7 +394,6 @@ for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) 
     assert.equal(o1.status, "deferred");
     assert.equal(o1.resumable, true);
 
-    // ---- invocation 2: resume the SAME export id; zero new creates; succeed ----
     resetLog();
     fetchQueue = [{ status: 200, body: { status: "COMPLETED" } }];
     const dd2 = { create: async () => { creates.count += 1; return { exportId: "E2-WRONG" }; }, poll: realPoll, download: async () => [{ a: 1 }] };
@@ -317,7 +414,7 @@ for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) 
 
 async function main() {
   ({
-    pollExport, createExport, fetchExportRows, withDataDoeDeadline,
+    pollExport, createExport, fetchExportRows, withDataDoeDeadline, ddFetch,
     DataDoeDeadlineError, isDataDoeDeadlineError, isDataDoePollPendingError,
   } = await import("../lib/server/datadoe.js"));
   ({ classifyFetchError, runSourceJobs } = await import("../lib/server/sync/source-worker.js"));

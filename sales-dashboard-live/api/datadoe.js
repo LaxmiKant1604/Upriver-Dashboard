@@ -73,6 +73,12 @@ import {
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
 } from "../lib/server/datadoe-connections.js";
+// Typed manual-continuation signals for the route's error mapping: retryable:true is allowed
+// only when a durable continuation exists (see classifyDataDoeRouteError below).
+import {
+  MANUAL_CONTINUATION_IN_PROGRESS,
+  isManualSourceContinuationError,
+} from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
@@ -2061,6 +2067,33 @@ export default function handler(req, res) {
   return withDataDoeDeadline(Date.now() + ROUTE_DATADOE_BUDGET_MS, () => handleDataDoe(req, res));
 }
 
+// Typed-error -> HTTP mapping for the route's final catch. FIXED safe messages only (no raw
+// DataDoe/Supabase text, no exportId, no marker contents). `retryable: true` is allowed ONLY
+// when a DURABLE continuation exists: either the escaping deadline/poll-pending error was
+// flagged durableContinuation=true by the continuation protocol (the exportId is persisted and
+// a later request resumes it), or another invocation durably owns the in-progress marker.
+// Without a durable continuation a retry would create a NEW export, so retryable stays false.
+// Exported for the offline suite; returns null for errors this mapping does not own.
+export function classifyDataDoeRouteError(err) {
+  if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
+    return {
+      status: 504,
+      body: {
+        error: "DataDoe is still processing this request. Please retry in a moment.",
+        retryable: err != null && err.durableContinuation === true,
+      },
+    };
+  }
+  if (isManualSourceContinuationError(err)) {
+    if (err.code === MANUAL_CONTINUATION_IN_PROGRESS) {
+      return { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } };
+    }
+    // CONTINUATION_UNAVAILABLE / UNCERTAIN / unknown manual-source code: fail closed, no retry hint.
+    return { status: 503, body: { error: "This data fetch could not be durably tracked and needs review before retrying.", retryable: false } };
+  }
+  return null;
+}
+
 async function handleDataDoe(req, res) {
   let legacySharedRefresh = null;
   try {
@@ -3346,11 +3379,11 @@ async function handleDataDoe(req, res) {
 
     res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=brand-view-portfolio, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
-    // The typed deadline/poll-pending signals are RETRYABLE, not server faults: the export (if
-    // one was created) is still processing and a fresh request can resume or re-read it. Surface
-    // 504 with a clean retry hint instead of a generic 500.
-    if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
-      res.status(504).json({ error: "DataDoe is still processing this request. Please retry in a moment.", retryable: true });
+    // Typed DataDoe deadline / poll-pending / continuation signals get fixed safe messages and a
+    // retryable flag that is true ONLY when a durable continuation exists (see the classifier).
+    const mapped = classifyDataDoeRouteError(err);
+    if (mapped) {
+      res.status(mapped.status).json(mapped.body);
       return;
     }
     const status = err instanceof DashboardAccessError ? err.status : 500;
