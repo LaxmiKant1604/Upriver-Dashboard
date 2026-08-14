@@ -8941,3 +8941,33 @@ CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no producti
 Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
 cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
 UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for Codex re-review; Gate 6 remains blocked.
+
+## Scheduler v2: RAISE must be the first executable statement per guard + no swallowing handler (2026-08-14)
+
+Codex found 1 more finding. Fixed OFFLINE (migrations 1-4 byte-unchanged; Migration 5 still UNAPPLIED and
+byte-identical to HEAD -- no SQL change; supabase.js untouched, so the RFC3339 finished_at correction is unchanged;
+no production side effect; Gate 5 NOT re-run). Commit eb543ea (code/tests), then docs. Status UNCHANGED: the
+lifecycle fix is code-complete but NOT resolved in production until Migration 5 is applied via a reviewed Gate and
+the canary cycle reconciled (Appendix N); Gate 6 remains BLOCKED.
+
+- FINDING (RAISE is the first executable statement + no swallowing handler): ifBlockRaises previously accepted a
+  RAISE EXCEPTION anywhere on the true branch, so a statement (RETURN/PERFORM/NULL/assignment) before it slipped
+  through. Because the SQL-aware `masked` view blanks BOTH comments and strings to whitespace, it now requires the
+  text immediately after the matched header's THEN to begin -- after skipping whitespace/comments -- with exactly
+  RAISE EXCEPTION (/^\s*raise\s+exception\b/). Any other executable statement first, a raise moved after END IF, a
+  nested IF/CASE/LOOP/BEGIN block, or a comment/string forgery all fail; whitespace/comments before a direct raise
+  stay accepted. Applied independently to cycle-id, missing-parent, terminal-parent. auditGuardFunction also fails
+  closed with a new GUARD_EXCEPTION_HANDLER_PRESENT when the function has an EXCEPTION handler section (`EXCEPTION
+  WHEN ...`, distinguished from the `RAISE EXCEPTION` raises; strings blanked in `masked` so only a real handler
+  matches) -- the approved function has none.
+- Tests: cycle-finalize-wiring 14 (+1 FIRST-STATEMENT guard-mutation test: RETURN NEW / PERFORM 1 / NULL /
+  assignment before RAISE for all three guards fail; a comment before a direct raise stays accepted; an outer
+  BEGIN...EXCEPTION WHEN OTHERS THEN RETURN NEW is caught; untouched Migration 5 accepted). The prior BOUNDED-IF
+  and BRANCH-AWARE guard tests still pass under the stricter rule. node --check clean; npm run verify 35/35 incl.
+  build:check; git diff --check clean; migrations 1-4 byte-unchanged (1328bc0f/0750a155/544557fb/49628c8d);
+  Migration 5 UNAPPLIED.
+
+CONFIRMED (no production side effect this round): Gate 5 NOT re-run; no production connection, DataDoe call,
+Supabase write, migration applied, control unlock, deploy, push, merge, or schedule; the running Gate-5 canary
+cycle + rows UNCHANGED; SHADOW MODE with controls locked/paused; 20260815_sync_cycle_finalize.sql PREPARED +
+UNAPPLIED; HANDOFF.md + .worktrees/ untouched. STOP for FINAL Codex review; Gate 6 remains blocked.
