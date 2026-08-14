@@ -34,8 +34,12 @@
 //   5. A separate later HTTP request recomputes the same request_hash, loads the marker, and
 //      resumes poll/download of the SAVED export id -- zero new create POSTs.
 //   6. Completion: rows are persisted through the normal source cache FIRST (the injected
-//      finishRows), then the marker is removed (best-effort; a stale "polling" marker is
-//      harmless because the source cache is always consulted before this module).
+//      finishRows). The marker is removed ONLY when that durable persistence is POSITIVELY
+//      CONFIRMED (finishRows -> { persisted:true }). In-memory caching alone is insufficient, so a
+//      skipped/failed persist, a low deadline, an oversized payload, or cap-sized rows all leave
+//      the "polling" marker (with its exportId) in place -- a later invocation then resumes and
+//      re-downloads the SAME export with zero new create-export POSTs. A stale "polling" marker
+//      left after a confirmed durable save is harmless (the source cache is consulted first).
 //   7. DEFINITE create failure (DataDoe answered the POST with an error status): the marker
 //      records only the admin-safe typed code and becomes "failed" -- re-claimable via CAS,
 //      because no export was created.
@@ -112,6 +116,45 @@ const uncertainErr = () => new ManualSourceContinuationError(
 
 const attemptParamsHash = (requestHash) => paramsHashFor(MANUAL_SOURCE_ATTEMPT_VERSION, { requestHash });
 const norm = (value) => String(value ?? "").trim();
+
+// The only marker states the protocol writes. Any other value is malformed => fail closed.
+const KNOWN_MARKER_STATUSES = new Set(["creating", "polling", "failed"]);
+// A "failed" marker carries exactly one of these admin-safe typed codes.
+const FAILED_MARKER_CODE_RE = /^(CREATE_FAILED(_\d{3})?|EXPORT_FAILED)$/;
+
+/**
+ * Validate a LOADED marker against the CURRENT request identity BEFORE any DataDoe call or any
+ * marker mutation (Blocker 2). Returns true only when EVERY field is present, well-formed, and
+ * matches: the marker version, the exact request_hash, the organization fingerprint, the source
+ * id, a known status, a status/exportId/code combination the protocol actually writes, a safe
+ * rev, and parseable timestamps. Any missing/mismatched/malformed field returns false, and the
+ * caller then fails closed (zero DataDoe calls, zero marker mutation). Pure; never throws.
+ */
+function markerIdentityMatches(marker, { requestHash, organizationFingerprint, sourceId }) {
+  if (!marker || typeof marker !== "object") return false;
+  if (marker.version !== MANUAL_SOURCE_ATTEMPT_VERSION) return false;
+  if (!isSafeSnapshotRev(marker.rev)) return false;
+  if (norm(marker.requestHash) !== norm(requestHash)) return false;
+  if (norm(marker.organizationFingerprint) !== norm(organizationFingerprint)) return false;
+  if (norm(marker.sourceId) !== norm(sourceId)) return false;
+  if (!KNOWN_MARKER_STATUSES.has(marker.status)) return false;
+  const exportId = norm(marker.exportId);
+  const code = marker.code == null ? null : String(marker.code);
+  if (marker.status === "polling") {
+    if (!exportId) return false;      // a polling marker MUST carry the export id to resume
+    if (code !== null) return false;  // ...and carries no failure code
+  } else if (marker.status === "creating") {
+    if (exportId) return false;       // the claim precedes the export id
+    if (code !== null) return false;
+  } else if (marker.status === "failed") {
+    if (exportId) return false;       // a failed attempt has no resumable export id
+    if (code === null || !FAILED_MARKER_CODE_RE.test(code)) return false; // typed code required
+  }
+  for (const field of ["createdAt", "updatedAt", "expiresAt"]) {
+    if (!Number.isFinite(Date.parse(marker[field]))) return false;
+  }
+  return true;
+}
 
 // ---- default durable store on report_snapshots (insert-if-absent + rev-CAS + delete) ----
 // save() contract (identical to the brand-catalog manifest saver): marker.rev == null =>
@@ -190,7 +233,9 @@ export function manualSourceContinuationEnabled() {
  *   requestHash, organizationFingerprint, sourceId,       // safe identity fields (marker body)
  *   create()  -> DataDoe create response,                  // exactly-once via the marker claim
  *   poll(exportId), download(exportId) -> rows,
- *   finishRows(rows) -> rows,                              // persists via the NORMAL source cache
+ *   finishRows(rows) -> { rows, persisted },               // persists via the NORMAL source cache;
+ *                                                          // `persisted` true ONLY on a confirmed
+ *                                                          // durable save (gates marker removal)
  *   isResumableEscape(error) -> boolean,                   // poll-pending OR execution deadline
  *   isDefiniteCreateFailure(error) -> boolean,             // DataDoe ANSWERED the POST with an error
  *   deps?: { store }                                       // test injection (else overrides/default)
@@ -245,9 +290,19 @@ export async function runManualSourceAttempt(input) {
       // request retries the download WITHOUT any new export.
       throw error;
     }
-    const result = await finishRows(rows); // normal source cache FIRST (state 6)
-    try { await store.remove(requestHash); } catch { /* best-effort: cache now serves this hash */ }
-    return result;
+    // State 6 -- DURABLE completion. finishRows persists through the NORMAL source cache and
+    // reports whether that persistence was POSITIVELY CONFIRMED ({ rows, persisted }). The marker
+    // is removed ONLY on a confirmed durable save: in-memory caching alone is insufficient, and a
+    // skipped/failed persist, a low deadline, an oversized payload, or cap-sized rows all leave
+    // `persisted` false. In that case the "polling" marker (with its exportId) is RETAINED so a
+    // later invocation resumes/re-downloads the SAME export with zero new create-export POSTs.
+    const result = await finishRows(rows);
+    const outRows = result && Object.prototype.hasOwnProperty.call(result, "rows") ? result.rows : result;
+    const persisted = !!(result && result.persisted === true);
+    if (persisted) {
+      try { await store.remove(requestHash); } catch { /* best-effort: durable cache now serves this hash */ }
+    }
+    return outRows;
   }
 
   // The claim winner's create -> record exportId -> poll/download path.
@@ -290,8 +345,13 @@ export async function runManualSourceAttempt(input) {
   }
 
   if (marker) {
-    if (!isSafeSnapshotRev(marker.rev)) throw uncertainErr(); // corrupt/legacy: never bypass CAS
-    if (marker.status === "polling" && norm(marker.exportId)) {
+    // Blocker 2: a loaded marker must match the current request identity in EVERY field before any
+    // DataDoe call or any marker mutation. A missing/mismatched/malformed field fails closed here
+    // (zero DataDoe calls, zero marker writes) rather than resuming, re-claiming, or creating.
+    if (!markerIdentityMatches(marker, { requestHash, organizationFingerprint, sourceId })) {
+      throw uncertainErr();
+    }
+    if (marker.status === "polling") {
       return resumePollDownload(marker); // state 5: resume the saved export; zero creates
     }
     if (marker.status === "creating") {

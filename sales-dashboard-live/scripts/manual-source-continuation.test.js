@@ -86,18 +86,20 @@ const deadlineErr = () => { const e = new Error("deferred"); e.code = "DATADOE_D
 const isResumableEscape = (e) => e != null && (e.code === "DATADOE_POLL_PENDING" || e.code === "DATADOE_DEADLINE");
 const isDefiniteCreateFailure = (e) => /export creation failed \(\d{3}\)/.test(e instanceof Error ? e.message : String(e));
 
-function mkTransport({ createResult, pollThrows = null, downloadRows = [{ r: 1 }] } = {}) {
+// finishRows returns { rows, persisted } -- `persisted` gates marker removal. Default true; set
+// t.persistResult = false to simulate a skipped/failed/oversized/low-deadline/cap-sized persist.
+function mkTransport({ createResult, pollThrows = null, downloadRows = [{ r: 1 }], persistResult = true } = {}) {
   const t = {
-    creates: 0, polls: 0, downloads: 0, finished: [],
+    creates: 0, polls: 0, downloads: 0, finished: [], persistResult,
     create: async () => { t.creates += 1; if (createResult instanceof Error) throw createResult; return createResult || { exportId: "E1", status: "PENDING" }; },
     poll: async () => { t.polls += 1; if (pollThrows) throw pollThrows; },
     download: async () => { t.downloads += 1; return downloadRows; },
-    finishRows: async (rows) => { t.finished.push(rows); return rows; },
+    finishRows: async (rows) => { t.finished.push(rows); return { rows, persisted: t.persistResult === true }; },
   };
   return t;
 }
 
-let runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides;
+let runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides, ManualSourceContinuationError;
 let MANUAL_CONTINUATION_IN_PROGRESS, MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN;
 let fetchExportRows, withDataDoeDeadline, isDataDoePollPendingError, isDataDoeDeadlineError, DataDoePollPendingError, DataDoeDeadlineError;
 let classifyDataDoeRouteError;
@@ -120,6 +122,46 @@ test("(happy path) claim -> exactly one create -> exportId CAS -> poll/download 
   assert.equal(t.finished.length, 1, "rows persisted through the injected source-cache step");
   assert.equal(store.rows.size, 0, "marker removed AFTER completion");
   assert.equal(store.calls.remove, 1);
+});
+
+test("(durable completion) an UNCONFIRMED persist RETAINS the marker; a fresh invocation resumes E1 with ZERO new creates (two-invocation regression)", async () => {
+  const store = fakeStore();
+  // invocation 1: download succeeds but the durable source-cache persist is NOT confirmed
+  // (skipped/failed/oversized/low-deadline/cap-sized). In-memory caching alone is insufficient,
+  // so the marker MUST be retained with its export id.
+  const tA = mkTransport({ persistResult: false });
+  const rows1 = await runAttempt(store, tA);
+  assert.deepEqual(rows1, [{ r: 1 }], "invocation 1 still returns its rows to the caller");
+  assert.equal(tA.creates, 1);
+  assert.equal(store.calls.remove, 0, "the marker was NOT removed on an unconfirmed persist");
+  const kept = store.rows.get("h1");
+  assert.ok(kept, "marker retained");
+  assert.equal(kept.status, "polling");
+  assert.equal(kept.exportId, "E1", "the export id is preserved for a durable resume");
+  // invocation 2: a SEPARATE invocation (fresh transport == process-local memory cleared). It must
+  // resume E1 -- create ZERO new exports -- and now that persistence is confirmed, remove the marker.
+  const tB = mkTransport({ persistResult: true });
+  const rows2 = await runAttempt(store, tB);
+  assert.deepEqual(rows2, [{ r: 1 }]);
+  assert.equal(tB.creates, 0, "invocation 2 created ZERO exports");
+  assert.equal(tB.polls, 1, "it resumed by polling the saved export id");
+  assert.equal(tB.downloads, 1, "and re-downloaded E1");
+  assert.equal(store.rows.size, 0, "marker removed once durable persistence is confirmed");
+});
+
+test("(durable completion: persistence never confirms) repeated resume keeps the marker and NEVER creates again", async () => {
+  const store = fakeStore();
+  const t1 = mkTransport({ persistResult: false });
+  await runAttempt(store, t1);
+  assert.equal(store.rows.get("h1").status, "polling");
+  // even after several separate invocations that all fail to persist, no second export is created
+  for (let i = 0; i < 3; i++) {
+    const tN = mkTransport({ persistResult: false });
+    const rowsN = await runAttempt(store, tN);
+    assert.deepEqual(rowsN, [{ r: 1 }]);
+    assert.equal(tN.creates, 0, `resume ${i}: zero new creates`);
+    assert.equal(store.rows.get("h1").exportId, "E1", `resume ${i}: marker + export id retained`);
+  }
 });
 
 test("(concurrent first requests) exactly ONE create POST; the loser gets typed IN_PROGRESS retryable:true and never overwrites", async () => {
@@ -271,14 +313,71 @@ test("(hash isolation) an in-flight marker for one request_hash never affects an
   assert.equal(store.rows.get("h1").status, "polling", "h1 marker untouched");
 });
 
-test("(corrupt marker rev) fails closed as UNCERTAIN; zero creates", async () => {
+// ---- Blocker 2: marker identity validation before ANY DataDoe call or marker mutation ----
+const nowIso = () => new Date().toISOString();
+const futureIso = () => new Date(Date.now() + 3_600_000).toISOString();
+const validPollingMarker = () => ({
+  version: "manual-source-attempt-v1", requestHash: "h1", organizationFingerprint: "orgA",
+  sourceId: "src-1", status: "polling", exportId: "E1", code: null,
+  createdAt: nowIso(), updatedAt: nowIso(), expiresAt: futureIso(), rev: 3,
+});
+
+test("(marker identity: valid) a correct polling marker resumes -- the guard is not over-tight", async () => {
   const store = fakeStore();
-  store.rows.set("h1", { version: "manual-source-attempt-v1", requestHash: "h1", status: "polling", exportId: "E1", rev: "1" });
+  store.rows.set("h1", validPollingMarker());
   const t = mkTransport({});
-  let caught = null;
-  await runAttempt(store, t).catch((e) => { caught = e; });
-  assert.equal(caught.code, MANUAL_CONTINUATION_UNCERTAIN);
-  assert.equal(t.creates, 0);
+  const rows = await runAttempt(store, t);
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(t.creates, 0, "resumed with zero creates");
+  assert.equal(t.polls, 1);
+});
+
+test("(marker identity: every mismatched/malformed field) fails closed -- zero DataDoe calls, zero marker mutation", async () => {
+  const cases = [
+    ["wrong version", { version: "manual-source-attempt-v2" }],
+    ["missing version", { version: undefined }],
+    ["wrong requestHash", { requestHash: "hX" }],
+    ["wrong organizationFingerprint", { organizationFingerprint: "orgB" }],
+    ["missing organizationFingerprint", { organizationFingerprint: "" }],
+    ["wrong sourceId", { sourceId: "src-2" }],
+    ["missing sourceId", { sourceId: "" }],
+    ["unsafe rev (string)", { rev: "3" }],
+    ["unsafe rev (zero)", { rev: 0 }],
+    ["unsafe rev (negative)", { rev: -1 }],
+    ["missing rev", { rev: undefined }],
+    ["unknown status", { status: "weird" }],
+    ["polling without exportId", { exportId: "" }],
+    ["polling carrying a code", { code: "EXPORT_FAILED" }],
+    ["creating with an exportId", { status: "creating", exportId: "E1", code: null }],
+    ["failed with an exportId", { status: "failed", exportId: "E1", code: "CREATE_FAILED_404" }],
+    ["failed without a code", { status: "failed", exportId: "", code: null }],
+    ["failed with an invalid code", { status: "failed", exportId: "", code: "NONSENSE" }],
+    ["malformed expiresAt", { expiresAt: "not-a-date" }],
+    ["malformed createdAt", { createdAt: "nope" }],
+    ["malformed updatedAt", { updatedAt: "" }],
+  ];
+  for (const [label, override] of cases) {
+    const store = fakeStore();
+    const marker = { ...validPollingMarker(), ...override };
+    if ("version" in override && override.version === undefined) delete marker.version;
+    if ("rev" in override && override.rev === undefined) delete marker.rev;
+    store.rows.set("h1", marker);
+    const savesBefore = store.calls.save;
+    const removesBefore = store.calls.remove;
+    const before = JSON.stringify(marker);
+    const t = mkTransport({});
+    let caught = null;
+    await runAttempt(store, t).catch((e) => { caught = e; });
+    assert.ok(isManualSourceContinuationError(caught), `${label}: typed continuation error`);
+    assert.equal(caught.code, MANUAL_CONTINUATION_UNCERTAIN, `${label}: fails closed as UNCERTAIN`);
+    assert.equal(caught.retryable, false, `${label}: non-retryable`);
+    assert.equal(t.creates, 0, `${label}: ZERO create calls`);
+    assert.equal(t.polls, 0, `${label}: ZERO poll calls`);
+    assert.equal(t.downloads, 0, `${label}: ZERO download calls`);
+    assert.equal(store.calls.save, savesBefore, `${label}: ZERO marker save mutation`);
+    assert.equal(store.calls.remove, removesBefore, `${label}: ZERO marker remove`);
+    assert.equal(JSON.stringify(store.rows.get("h1")), before, `${label}: marker bytes untouched`);
+  }
 });
 
 test("(marker payload shape) safe typed fields only -- never an api key, rows, or raw error text", async () => {
@@ -322,7 +421,43 @@ test("(two-request integration: poll-pending) request A creates E1 + poll-pends;
   const got = await fetchExportRows("kA", "src-manual-1", ["a"], ["S1"], "2026-01-01", "2026-01-31", 100, {});
   assert.deepEqual(got, rows);
   assert.equal(posts().length, 1, "EXACTLY ONE create-export POST across both requests");
-  assert.equal(store.rows.size, 0, "marker removed after the resumed completion");
+  // Offline the durable source cache is unconfigured, so persistence is NOT confirmed and the
+  // marker is RETAINED (polling, E1) -- completion never drops the marker on an unconfirmed persist,
+  // so any further resume still makes zero creates. (In production, with the cache configured, a
+  // confirmed persist removes it; that branch is proven by the module-level durable-completion test.)
+  const afterB = [...store.rows.values()][0];
+  assert.equal(afterB.status, "polling");
+  assert.equal(afterB.exportId, "E1");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+test("(two-invocation integration: persist unconfirmed) inv1 completes but keeps the marker; inv2 with cleared memory resumes E1 -- ZERO new creates", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  // inv1: create E1 -> COMPLETED -> download rows. Offline persistSourceRows returns false (Supabase
+  // unconfigured), so durable persistence is NOT confirmed and the marker is retained with E1.
+  const rows = [{ ok: 7 }];
+  fetchQueue = [
+    { status: 200, body: { exportId: "E1", status: "PENDING" } },
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got1 = await fetchExportRows("kD", "src-manual-4", ["a"], ["S1"], "2026-04-01", "2026-04-30", 100, {});
+  assert.deepEqual(got1, rows, "inv1 returns rows to the caller");
+  assert.equal(posts().length, 1);
+  const kept = [...store.rows.values()][0];
+  assert.equal(kept.status, "polling");
+  assert.equal(kept.exportId, "E1", "marker RETAINED with export id because persistence was not confirmed");
+  // inv2: a separate invocation with process-local memory cleared. bypassSourceCache skips the
+  // in-memory + durable reads, so it must go through the marker and resume E1 -- zero new creates.
+  fetchQueue = [
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got2 = await fetchExportRows("kD", "src-manual-4", ["a"], ["S1"], "2026-04-01", "2026-04-30", 100, { bypassSourceCache: true });
+  assert.deepEqual(got2, rows);
+  assert.equal(posts().length, 1, "invocation 2 created ZERO new exports -- ONE create POST total");
   __setManualSourceContinuationTestOverrides(null);
 });
 
@@ -380,25 +515,37 @@ test("(non-durable fallback) without a durable store, a resumable escape is NOT 
 
 // ================= route error mapping =================
 
-test("(route mapping) retryable:true ONLY with a durable continuation; fixed safe messages; no raw text", async () => {
+test("(route mapping) retryable:true ONLY with durableContinuation===true; plain/arbitrary codes never retryable; admin-safe", async () => {
   const durablePending = new DataDoePollPendingError("E1"); durablePending.durableContinuation = true;
-  const bareP = new DataDoePollPendingError("E1"); bareP.durableContinuation = false;
+  const bareP = new DataDoePollPendingError("E1"); // no durable flag
   const durableDeadline = new DataDoeDeadlineError(); durableDeadline.durableContinuation = true;
   const bareDeadline = new DataDoeDeadlineError();
   assert.deepEqual(classifyDataDoeRouteError(durablePending), { status: 504, body: { error: "DataDoe is still processing this request. Please retry in a moment.", retryable: true } });
-  assert.equal(classifyDataDoeRouteError(bareP).body.retryable, false);
+  assert.equal(classifyDataDoeRouteError(bareP).body.retryable, false, "poll-pending WITHOUT a durable continuation is not retryable");
   assert.equal(classifyDataDoeRouteError(durableDeadline).body.retryable, true);
   assert.equal(classifyDataDoeRouteError(bareDeadline).body.retryable, false, "a deadline WITHOUT a durable continuation must not invite a token-spending retry");
-  const inProgress = { code: MANUAL_CONTINUATION_IN_PROGRESS, message: "raw internal detail" };
-  const mappedInProgress = classifyDataDoeRouteError(inProgress);
-  assert.deepEqual(mappedInProgress, { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } });
-  for (const code of [MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN]) {
-    const mapped = classifyDataDoeRouteError({ code, message: "raw supabase text with secrets" });
-    assert.equal(mapped.status, 503);
-    assert.equal(mapped.body.retryable, false);
-    assert.ok(!mapped.body.error.includes("raw supabase"), "fixed safe message only");
+
+  // A REAL in-progress error carries durableContinuation===true (another request owns the durable marker).
+  const realInProgress = new ManualSourceContinuationError(MANUAL_CONTINUATION_IN_PROGRESS, true, "internal detail");
+  assert.equal(realInProgress.durableContinuation, true);
+  assert.deepEqual(classifyDataDoeRouteError(realInProgress), { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } });
+
+  // A PLAIN object with the in-progress code but NO durable evidence must NEVER be retryable.
+  const plainInProgress = { code: MANUAL_CONTINUATION_IN_PROGRESS, message: "raw internal detail" };
+  const mappedPlain = classifyDataDoeRouteError(plainInProgress);
+  assert.equal(mappedPlain.status, 503, "no durable evidence -> admin-safe 503, not a 504 retry");
+  assert.equal(mappedPlain.body.retryable, false, "a plain object without durableContinuation is never retryable");
+  assert.ok(!JSON.stringify(mappedPlain).includes("raw internal"), "never the error's own text");
+  // An in-progress code with an explicit false durable flag is likewise non-retryable.
+  assert.equal(classifyDataDoeRouteError({ code: MANUAL_CONTINUATION_IN_PROGRESS, durableContinuation: false }).body.retryable, false);
+
+  // Unavailable / uncertain / unknown MANUAL_SOURCE_* codes: admin-safe, non-retryable, no raw text.
+  for (const code of [MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN, "MANUAL_SOURCE_SOMETHING_NEW"]) {
+    const mapped = classifyDataDoeRouteError({ code, message: "raw supabase text with secrets", durableContinuation: true });
+    assert.equal(mapped.status, 503, `${code}: admin-safe 503`);
+    assert.equal(mapped.body.retryable, false, `${code}: non-retryable even if a bogus durable flag is present`);
+    assert.ok(!mapped.body.error.includes("raw supabase"), `${code}: fixed safe message only`);
   }
-  assert.ok(!JSON.stringify(mappedInProgress).includes("raw internal"), "never the error's own text");
   assert.ok(!JSON.stringify(classifyDataDoeRouteError(durablePending)).includes("E1"), "exportId never reaches the browser");
   assert.equal(classifyDataDoeRouteError(new Error("ordinary failure")), null, "other errors keep their existing handling");
 });
@@ -406,6 +553,7 @@ test("(route mapping) retryable:true ONLY with a durable continuation; fixed saf
 async function main() {
   ({
     runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides,
+    ManualSourceContinuationError,
     MANUAL_CONTINUATION_IN_PROGRESS, MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN,
   } = await import("../lib/server/manual-source-continuation.js"));
   ({

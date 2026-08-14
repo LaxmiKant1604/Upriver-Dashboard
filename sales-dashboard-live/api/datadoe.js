@@ -2075,20 +2075,28 @@ export default function handler(req, res) {
 // Without a durable continuation a retry would create a NEW export, so retryable stays false.
 // Exported for the offline suite; returns null for errors this mapping does not own.
 export function classifyDataDoeRouteError(err) {
+  // The SINGLE source of truth for a retry hint: positive durable evidence. `retryable: true` is
+  // emitted ONLY when the error object itself carries durableContinuation === true (the continuation
+  // protocol sets it when the export id is persisted and a later request can resume the SAME export,
+  // or when another invocation durably owns the in-progress marker). A plain object, an arbitrary
+  // MANUAL_SOURCE_* code, or any error lacking that flag can never be retryable.
+  const durable = err != null && err.durableContinuation === true;
   if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
     return {
       status: 504,
       body: {
         error: "DataDoe is still processing this request. Please retry in a moment.",
-        retryable: err != null && err.durableContinuation === true,
+        retryable: durable,
       },
     };
   }
   if (isManualSourceContinuationError(err)) {
-    if (err.code === MANUAL_CONTINUATION_IN_PROGRESS) {
+    // Only an in-progress signal WITH durable evidence invites a retry (another request owns the
+    // durable marker). Everything else -- unavailable, uncertain, an unknown MANUAL_SOURCE_* code,
+    // or an in-progress code without durable evidence -- is admin-safe and non-retryable.
+    if (err.code === MANUAL_CONTINUATION_IN_PROGRESS && durable) {
       return { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } };
     }
-    // CONTINUATION_UNAVAILABLE / UNCERTAIN / unknown manual-source code: fail closed, no retry hint.
     return { status: 503, body: { error: "This data fetch could not be durably tracked and needs review before retrying.", retryable: false } };
   }
   return null;

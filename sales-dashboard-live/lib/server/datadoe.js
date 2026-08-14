@@ -321,13 +321,18 @@ async function readPersistedSourceRows(requestHash) {
   }
 }
 
+// Persist rows to the DURABLE shared source cache. Returns `true` ONLY when the row set was
+// positively saved; returns `false` on every non-persisting path -- Supabase unconfigured, the
+// cache marked temporarily unavailable, too little deadline left, an oversized payload, or a
+// save that threw. The boolean is authoritative: a manual attempt marker is retained (so a later
+// invocation resumes the same export) whenever this returns false.
 async function persistSourceRows({ identity, sourceId, rows, cacheHours }) {
-  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return;
+  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return false;
   const deadlineRemaining = remainingDeadlineMs();
-  if (deadlineRemaining !== null && deadlineRemaining < 3000) return;
+  if (deadlineRemaining !== null && deadlineRemaining < 3000) return false;
   const serialised = JSON.stringify({ rows });
   const payloadBytes = Buffer.byteLength(serialised, "utf8");
-  if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return;
+  if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return false;
   const expiresAt = new Date(Date.now() + cacheHours * 3600_000).toISOString();
   try {
     await saveSourceExportCache({
@@ -341,8 +346,10 @@ async function persistSourceRows({ identity, sourceId, rows, cacheHours }) {
       sourceCacheLastPrunedAt = Date.now();
       await pruneSourceExportCache().catch(() => {});
     }
+    return true;
   } catch {
     sourceCacheUnavailableUntil = Date.now() + 60_000;
+    return false;
   }
 }
 
@@ -367,16 +374,18 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
   const existing = sourceExportInflight.get(identity.requestHash);
   if (existing) return existing;
 
-  // Shared completion: remember + persist through the NORMAL source cache. A result on the cap
-  // may be truncated. Strict callers reject it; do not persist it where another report could
-  // mistake it for complete data.
+  // Shared completion: remember (in-memory) + persist (DURABLE cache), returning BOTH the rows and
+  // whether durable persistence was positively confirmed. In-memory caching alone is NOT durable,
+  // so `persisted` is what licenses a manual attempt marker to be removed. A result on the cap may
+  // be truncated: strict callers reject it, and cap-sized rows are never durably persisted (so
+  // `persisted` is false and the marker is retained for a resumable re-download).
   const finishRows = async (rows) => {
     const expiresAt = Date.now() + cacheHours * 3600_000;
     rememberSourceRows(identity.requestHash, rows, expiresAt);
-    if (rows.length < limit) {
-      await persistSourceRows({ identity, sourceId, rows, cacheHours });
-    }
-    return rows;
+    const persisted = rows.length < limit
+      ? await persistSourceRows({ identity, sourceId, rows, cacheHours })
+      : false;
+    return { rows, persisted };
   };
 
   const work = (async () => {
@@ -406,7 +415,8 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
       const exportId = created.exportId || created.id;
       if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
       const rows = await downloadExport(apiKey, exportId);
-      return await finishRows(rows);
+      const finished = await finishRows(rows);
+      return finished.rows;
     } catch (error) {
       if (isDataDoePollPendingError(error) || isDataDoeDeadlineError(error)) error.durableContinuation = false;
       throw error;
