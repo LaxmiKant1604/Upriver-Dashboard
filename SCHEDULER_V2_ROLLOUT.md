@@ -23,9 +23,16 @@ finalize.sql` was applied via its own reviewed single-file Gate (Appendix O)**, 
 canary cycle was **reconciled via the reviewed Appendix N procedure** — `disposition='finalized'`, zero DataDoe
 calls, no child/snapshot/control row touched. The `.sql` file itself stays byte-frozen (SHA-256 `5222a8e5…`;
 its "PREPARED — UNAPPLIED" header note is historical text from review, kept to preserve the frozen hash — the
-ledger row `2026-08-14T16:27:31.800Z` is authoritative). **Gate 6 remains BLOCKED**: parity/reconciliation must
-be established across **≥ 2 cycles under the corrected lifecycle**, each behind explicit human approval, before
-any control unlock. Every remaining live step is **gated on explicit human approval**, one step at a time.
+ledger row `2026-08-14T16:27:31.800Z` is authoritative). **Gate 6 Shadow Parity CYCLE 1 was EXECUTED 2026-08-14
+with explicit authorization** (Appendix P): one production-shaped SHADOW cycle per bucket for ALL 13 reports on
+two representative accounts — both cycles drained and finalized to an honest **`partial`** under the corrected
+lifecycle (us `57/44/13` sources + `13/2/11` reports; non-us `56/39/17` + `13/3/10`); 5 new `scheduler-v2/*`
+snapshots; production fingerprints byte-identical; ONE parity defect found and FIXED in code (the brand-sales
+derive now emits the route's additive `asinBrand` map — commit `bb37a4e`); 30 DataDoe export TIMEOUTs on the
+largest datasets and the EMPTY durable `ads_sync_coverage` (PPC prerequisite) are recorded as upstream findings
+needing DataDoe/Ads-sync input. **Cycle 2 is NOT started**: it is BLOCKED pending Codex review of the Cycle-1
+evidence and explicit human approval, and no control unlock/publish/deploy/schedule has happened. Every
+remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -238,8 +245,14 @@ report. **Approval gate per report.**
   `finalize_sync_cycle` call, `disposition='finalized'`, `status='succeeded'`, `finished_at` set, counters
   `2/2/0` + `1/1/0`; source/report/owner/snapshot rows byte-unchanged (digest-proven); zero DataDoe calls
   (evidence in Appendix N.4). Blocker 1 is RESOLVED IN PRODUCTION.
-- [ ] Gate 6 — parity/reconciliation stable across ≥ 2 cycles under the corrected lifecycle. **BLOCKED**
-  pending that parity evidence and explicit human approval (nothing here authorizes it).
+- [x] **Gate 6 Shadow Parity CYCLE 1 — EXECUTED 2026-08-14 (all 13 reports, 2 buckets/accounts; evidence in
+  Appendix P).** Both bucket cycles drained + finalized `partial` under the corrected lifecycle; budgets held
+  (57≤59 / 56≤58 create-exports, ≤1 per hash); production fingerprints byte-identical; LKG preserved on every
+  failure; 1 parity defect (brand-sales `asinBrand`) found + FIXED (`bb37a4e`); upstream findings recorded
+  (30 DataDoe TIMEOUTs on the largest datasets; empty durable `ads_sync_coverage` blocks the PPC prerequisite).
+- [ ] Gate 6 Shadow Parity CYCLE 2 (+ stability across ≥ 2 cycles). **BLOCKED** pending Codex review of the
+  Cycle-1 evidence and explicit human approval (nothing here authorizes it). Cycle 2 should land the fixed
+  brand-sales payload (`asinBrand`) and re-observe the TIMEOUT-prone large exports.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
 - [ ] Kickoff (`20260808_scheduler_v2_kickoff.sql`) — separate, later, fully-reviewed step (NOT in this phase).
 
@@ -2487,3 +2500,107 @@ error would have rolled back everything; none occurred. **Ledger `applied_at = 2
 The `.sql` file remains byte-frozen in git (its "PREPARED — UNAPPLIED" header comment is the historical review
 text; the ledger row is authoritative for applied-state). Reconciliation of the canary cycle followed
 immediately as Appendix N.4. STOP for Codex review; Gate 6 remains BLOCKED.
+
+---
+
+## Appendix P — Gate 6 Shadow Parity CYCLE 1 EXECUTION evidence (2026-08-14; all 13 reports; SHADOW)
+
+Explicitly authorized live scope: ONE production-shaped SHADOW parity cycle for all 13 Scheduler-v2 reports on
+representative primary accounts. Executed from `sales-dashboard-live/` with `node --env-file=../.env.local`
+(secrets never printed/committed). **No control unlock, publish, deploy, merge, push, schedule, or Cycle 2.**
+Writes: scheduler-v2 tables + `scheduler-v2/*` snapshots ONLY; instance-scoped readiness only (the durable
+controls and `SCHEDULER_V2_READY_REPORT_KEYS` stayed locked; verified 13× `schedule_enabled=false` before and
+after). HEAD at execution `f0d424b`; `npm run verify` 35/35 before AND after (incl. the Cycle-1 fix commit).
+
+### P.1 Scope, accounts, plans, budget
+
+- **Report keys (authoritative, from `report_sync_settings`):** brand-sales, buy-box-loss, content-changes,
+  daily-reporting, fba-plan, keyword-rank, listing-health, listing-optimizer, ppc-performance, reconciliation,
+  returns-leakage, sales-movers, sku-pl — passed as `manualReportKeys` (exactly these 13; `lockedOut=[]` each
+  slice, `derivedOnly=[]`).
+- **ONE live primary-account discovery** (30 accounts), memoized to a snapshot reused by every later phase;
+  never fabricated; dd-secondary never routed (primary-only connection; every owner row `connection_id='primary'`).
+- **Selected accounts:** US bucket `26f7a1a6-…` (US/USD; freshest+largest production brand-sales snapshot);
+  non-US bucket `d658442d-…` (IN/INR; 6 production report snapshots — the widest parity baseline). `asOf
+  2026-08-13` (stable, both buckets), `cycleDate 2026-08-15` (unique; `(non-us, 2026-08-14)` is the TERMINAL
+  Gate-5 cycle, protected by the append-guard triggers).
+- **Plan-before-export budget** (real planners, validated against the authoritative `SOURCE_CONTRACTS` registry;
+  catalog = short id `68d2de238e` everywhere; every source strict-flagged/windowed/owner-derived; per-report
+  max source counts recorded): **us 53 initial unique hashes / 59 MAX** (incl. staged fallback+activation
+  ceilings; fba-plan carries the US-only AWD source), **non-us 52 / 58**; generic dedup saved 3 hashes per
+  bucket (the shared no-date insight catalog across buy-box/returns/listing-health + the shared inventory
+  snapshot). PPC planned ZERO sources by design (see P.3).
+
+### P.2 Execution + budgets + finalization (per bucket)
+
+Bounded resumable slices (`maxJobs 8`/slice, 90s slice deadline, 5s reserve, overall per-invocation budget),
+resumed until drained; after EVERY slice an authoritative DB budget guard re-checked `create_export_count`
+(≤ 1 per request_hash; total ≤ the precomputed MAX; every hash either plan-pinned or owner-proven to a staged
+family; `connection_id='primary'` on every row). Manual runs never auto-finalize; after full drain + zero open
+source/report jobs + all 13 report jobs present, `finalize_sync_cycle` was called EXACTLY ONCE per bucket cycle.
+
+| bucket | cycle | slices | create-exports (actual/MAX) | sources ok/failed | finalize |
+|---|---|---|---|---|---|
+| us | `56422a66-9f23-43c9-9c8d-8a9427f8f36a` | 22 | **57 / 59** (≤1 per hash) | 44 / 13 | `finalized`, **`partial`**, `finished_at 2026-08-14T18:24:51.385779Z`, source `57/44/13`, report `13/2/11` |
+| non-us | `ac4cba6f-3214-4d9b-9be7-35c572890edf` | 20 | **56 / 58** (≤1 per hash) | 39 / 17 | `finalized`, **`partial`**, `finished_at 2026-08-14T18:24:51.892947Z`, source `56/39/17`, report `13/3/10` |
+
+Deferral/resume behavior observed repeatedly (poll-pending → `attempted` → resumed, no duplicate create-export);
+the corrected lifecycle held end-to-end: honest `partial` terminal statuses with authoritative counters, and the
+strict finalize-acknowledgement validation passed on both calls.
+
+### P.3 The 13 report outcomes (per bucket; typed, evidence-backed)
+
+- **us `26f7a1a6-…`:** brand-sales **succeeded** (shadow 232,753 B); listing-health **succeeded** (697,584 B);
+  buy-box-loss / content-changes / daily-reporting / fba-plan / keyword-rank / reconciliation / returns-leakage /
+  sales-movers / sku-pl **blocked** (`SOURCE_BLOCKED` — a required source TIMEOUTed; LKG preserved);
+  listing-optimizer **unavailable** (`SOURCE_UNAVAILABLE` — its SQP-weekly export TIMEOUTed);
+  ppc-performance **unavailable** (`SOURCE_UNAVAILABLE` — empty durable Ads coverage; zero tokens spent).
+- **non-us `d658442d-…`:** brand-sales **succeeded** (329,897 B); content-changes **succeeded** (680 B);
+  keyword-rank **succeeded** (5,042,535 B); buy-box-loss / daily-reporting / fba-plan / listing-health /
+  reconciliation / returns-leakage / sales-movers / sku-pl **blocked** (`SOURCE_BLOCKED`); listing-optimizer +
+  ppc-performance **unavailable** (as above).
+- **PPC prerequisite (stopped PPC only; every other safe report continued):** durable `ads_sync_coverage` holds
+  **0 rows** — the table postdates the production Ads-sync pause, and the only approved population path (the
+  paused v1 Ads sync) has not run since. Missing for BOTH accounts: required `campaign-performance-v1` +
+  `asin-performance-v1` (and optional `keyword-targeting-performance-v1` + `search-terms-performance-v1`) over
+  `[2026-07-15 .. 2026-08-13]`. Coverage was NOT fabricated and NOT derived from metric-row min/max
+  (`ad_daily_metrics` has 31,864 rows; `ads_sync_state` 196 — history exists, durable coverage evidence does
+  not). **Needs a reviewed decision on running the approved Ads-sync path before PPC can join a parity cycle.**
+- **DataDoe TIMEOUT findings (30 total: 13 us / 17 non-us; each `create_export_count=1`, typed safe failure,
+  zero duplicates/retry storms):** consistently the LARGEST datasets — `sales-traffic-asin-date` monthly
+  fragments, `profit-by-sku-date` monthly fragments, `settlements`, `sqp-weekly`, `returns`, `listings`,
+  `content-changes` events, one `product-catalog` (non-us), `fba-inventory-health`, `order-line-items` monthly
+  fragments (non-us). These are DataDoe-side export processing timeouts (the export itself reported timed-out;
+  distinct from the resumable poll-pending path, which worked). **Needs DataDoe input on large-export
+  processing limits/latency before Cycle-2 stability can be assessed.**
+
+### P.4 Parity, isolation, LKG, Brand View
+
+- **Production isolation (byte-proof):** payload-free fingerprints identical before/after for BOTH selected
+  accounts (`26f7a1a6…`: 4 rows, `0642f2c8…`; `d658442d…`: 8 rows, `190b4444…`) AND the Gate-5 canary account
+  (`cba3fb26…`, 7 rows); the Gate-5 cycle row + child rows (2/1/2) untouched; 13 durable controls still
+  `schedule_enabled=false`; `pg_cron` absent. Exactly **6** `scheduler-v2/*` snapshots exist (5 new + Gate-5's).
+- **LKG preservation:** for EVERY non-succeeded report (both buckets) no `scheduler-v2/<report>` snapshot was
+  written, and every existing production snapshot (e.g. non-us listing-health / listing-optimizer /
+  ppc-performance / returns-leakage / sales-movers) is byte-preserved (covered by the account fingerprints).
+- **Owner/organization isolation:** all 62+62 owner rows active/`primary`/selected-account; exactly ONE
+  organization fingerprint per cycle; ZERO ownerless source jobs; every report job scoped to its account.
+- **Zero network in derivation:** structural (the derive receives no DataDoe adapter — offline-proven by the
+  import-boundary tests) + observed (the final drain invocations performed ZERO `api.datadoe.com` calls while
+  the derive transitions completed; per-invocation host/method fetch accounting recorded).
+- **brand-sales field parity (both buckets):** row schema IDENTICAL; catalogBrands overlap complete (shadow adds
+  1 new brand on us — fresher data); overlapping-window sales totals delta **0.067% (us)** / **0.296% (non-us)**
+  (production snapshots are 1–6 days older than `asOf 2026-08-13`). **ONE real defect found:** the newer us
+  production payload carries the additive `asinBrand` map; the scheduler derive omitted it → **FIXED in
+  `bb37a4e`** (route-identical first-wins map + fail-closed empty-map guard + `validatePayload` + version bump
+  `brand-sales/v2d-2`; 69 derivation assertions). The Cycle-1 shadow snapshots predate the fix; Cycle 2 lands
+  the corrected payload. First-shadow reports with no production baseline (us listing-health; non-us
+  content-changes + keyword-rank) are recorded as parity-N/A baselines for Cycle 2.
+- **Brand View:** rebuilt OFFLINE (global.fetch removed → any network call would throw) for BOTH selected
+  accounts + the Gate-5 account from saved production snapshots only: brand directory (1 brand each, from
+  brand-sales) + a full per-brand slice each (inventory present, no ads error, nothing skipped). Missing
+  coverage reported explicitly (none — all 3 accounts rebuilt). The organization-wide Product Catalog identity
+  redesign (Appendix M) was NOT introduced.
+
+**STOP.** Cycle 2, control unlock, publishing, deployment, and scheduling all remain BLOCKED pending Codex
+review of this evidence and explicit human approval.

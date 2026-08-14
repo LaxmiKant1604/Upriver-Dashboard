@@ -9010,3 +9010,51 @@ Appendix O (migration gate) + Appendix N.4 (reconciliation); runbook status head
 STATE NOW: migrations 1-5 applied; Blocker 1 RESOLVED IN PRODUCTION; canary cycle terminal succeeded; SHADOW
 MODE locked/paused/undeployed/unscheduled unchanged. STOP for Codex review. Gate 6 remains BLOCKED pending
 parity across >= 2 cycles under the corrected lifecycle + explicit human approval.
+
+## Scheduler v2: Gate 6 Shadow Parity CYCLE 1 EXECUTED -- all 13 reports, 2 buckets (2026-08-14)
+
+Explicitly authorized live scope executed (evidence: SCHEDULER_V2_ROLLOUT Appendix P). One production-shaped
+SHADOW parity cycle per bucket for ALL 13 authoritative report keys (from report_sync_settings) via
+manualReportKeys + instance-scoped readiness ONLY (durable controls + SCHEDULER_V2_READY_REPORT_KEYS stayed
+locked, verified before/after). ONE live primary discovery (30 accounts, memoized). Selected: us
+26f7a1a6-689a-4084-8260-7add262918e5 (US/USD), non-us d658442d-6273-4c2d-aeda-f247e638ef98 (IN/INR, 6 prod
+reports). asOf 2026-08-13, cycleDate 2026-08-15 (the terminal Gate-5 (non-us, 2026-08-14) cycle is
+trigger-guarded). Plan-before-export budget from real planners validated against SOURCE_CONTRACTS (catalog short
+id 68d2de238e only): us 53 initial/59 MAX unique hashes, non-us 52/58 (generic dedup saved 3/bucket).
+
+- EXECUTION: bounded resumable slices (maxJobs 8, 90s slices), DB budget guard EVERY slice (<=1 create-export
+  per hash; total <= MAX; hashes plan-pinned or staged-owner-proven; primary-only). us cycle
+  56422a66-9f23-43c9-9c8d-8a9427f8f36a: 57/59 exports, 44 ok / 13 TIMEOUT. non-us cycle
+  ac4cba6f-3214-4d9b-9be7-35c572890edf: 56/58, 39 ok / 17 TIMEOUT. Deferral/resume (poll-pending -> attempted)
+  observed working repeatedly; zero duplicate exports.
+- FINALIZATION (manual runs never auto-finalize): after drain + zero open jobs + all 13 report jobs present,
+  finalize_sync_cycle called EXACTLY ONCE per cycle -> disposition='finalized', honest status='partial' both;
+  us source 57/44/13 + report 13/2/11; non-us 56/39/17 + 13/3/10; strict-ack validation passed.
+- OUTCOMES: us succeeded brand-sales (232,753 B) + listing-health (697,584 B); non-us succeeded brand-sales
+  (329,897 B) + content-changes (680 B) + keyword-rank (5,042,535 B); the rest typed blocked (SOURCE_BLOCKED,
+  required source TIMEOUTed) or unavailable (SOURCE_UNAVAILABLE: listing-optimizer SQP timeout;
+  ppc-performance empty durable Ads coverage) -- LKG preserved everywhere (no shadow snapshot written for any
+  non-succeeded report; production snapshots byte-preserved).
+- PPC PREREQUISITE FINDING: ads_sync_coverage has 0 rows (table postdates the v1 Ads-sync pause; only approved
+  population path is paused). Missing for both accounts: campaign-performance-v1 + asin-performance-v1
+  (required; + 2 optional) over 2026-07-15..2026-08-13. NOT fabricated, NOT derived from metric min/max. PPC
+  stopped, everything else continued. Needs a reviewed decision on running the approved Ads-sync path.
+- DATADOE FINDING: 30 export TIMEOUTs (13 us / 17 non-us) on the LARGEST datasets (sales-traffic + profit-by-sku
+  monthly fragments, settlements, sqp-weekly, returns, listings, content-changes, one catalog, inventory,
+  order-lines) -- DataDoe-side processing timeouts, each cec=1, typed safe failure. Needs DataDoe input on
+  large-export limits before Cycle-2 stability.
+- PARITY: brand-sales row schema IDENTICAL both buckets; catalogBrands overlap complete; overlapping-window
+  sales delta 0.067% (us) / 0.296% (non-us). ONE real defect: the live route saves the additive asinBrand map
+  (Brand View reads it for FBA inventory attribution); the scheduler derive omitted it -> FIXED commit bb37a4e
+  (route-identical first-wins map + fail-closed empty-map guard + validatePayload + version brand-sales/v2d-2;
+  tests first, 69 derivation assertions; verify 35/35). Cycle-1 shadow snapshots predate the fix; Cycle 2 lands
+  the corrected payload.
+- ISOLATION/PROOFS: production fingerprints byte-identical before/after for both accounts AND the Gate-5
+  account (cba3fb26..., 7 rows); Gate-5 cycle + child rows untouched; 62+62 owner rows all active/primary/
+  selected-account, one org fingerprint per cycle, zero ownerless jobs; exactly 6 scheduler-v2/* snapshots
+  (5 new + Gate-5's); 13 controls disabled; pg_cron absent; zero-network derive proven structurally + observed
+  (final drain invocations made zero api.datadoe.com calls); Brand View rebuilt OFFLINE (fetch removed) for 3
+  accounts from saved snapshots (directory + full brand slice each); Appendix M redesign NOT introduced.
+
+STATE NOW: Gate 6 Cycle 1 COMPLETE with evidence; Cycle 2 / unlock / publish / deploy / schedule all BLOCKED
+pending Codex review + explicit human approval. Commits: bb37a4e (code/tests fix), docs follow.
