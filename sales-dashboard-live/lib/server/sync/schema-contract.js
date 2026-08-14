@@ -385,26 +385,40 @@ function functionBodyViews(clean, masked, fnName) {
   return { clean: clean.slice(open + 2, close), masked: masked.slice(open + 2, close) };
 }
 
-// BOUNDED PL/pgSQL IF-block proof (Finding 2): does the IF block WHOSE HEADER matches `headerRe` (in the
-// function body's `masked` view) itself contain a RAISE EXCEPTION BEFORE its OWN matching END IF? The body is
-// bounded by depth-tracking IF openers / `end if` closers, so a raise in ANOTHER block, or moved before/after
-// this block, never satisfies it. The raise is proven in `masked` (a comment/string cannot forge it); an
-// optional `headerStrRe` requires a specific string literal in the block HEADER (checked in `clean`, so a
-// comment cannot forge it, and the masked header code anchors it to the real condition).
+// BOUNDED PL/pgSQL IF-block proof: does the IF block WHOSE HEADER matches `headerRe` (in the function body's
+// `masked` view) reject with a DIRECT, UNCONDITIONAL RAISE EXCEPTION? Scanning the outer block's body (masked,
+// so comments/strings are blanked), a qualifying raise must:
+//   - occur at the TOP LEVEL of the outer IF (depth 0), NOT inside a nested IF/CASE/LOOP/BEGIN(exception) block;
+//   - occur on the outer IF's INITIAL true branch, i.e. BEFORE any depth-0 ELSE or ELSIF;
+//   - appear before the outer IF's own END IF.
+// So a raise hidden in a nested IF, in an ELSE/ELSIF branch, moved after END IF, or forged in a comment/string
+// never satisfies it. An optional `headerStrRe` requires a specific string literal in the block HEADER (checked
+// in `clean`, so a comment cannot forge it, and the masked header code anchors it to the real condition).
 function ifBlockRaises(body, { headerRe, headerStrRe }) {
   const h = headerRe.exec(body.masked);
   if (!h) return false;
   if (headerStrRe && !headerStrRe.test(body.clean.slice(h.index, h.index + h[0].length))) return false;
-  let depth = 1;
-  const re = /\bend\s+if\b|\bif\b/gi;
-  re.lastIndex = h.index + h[0].length;                    // start scanning AFTER the header's `then`
-  let m, end = -1;
+  // Tokens that matter, longest/compound forms FIRST so `end if` is never split into `end` + `if`, and `elsif`
+  // is never split into `else` + `if`.
+  const re = /\braise\s+exception\b|\bend\s+if\b|\bend\s+case\b|\bend\s+loop\b|\belsif\b|\belse\b|\bif\b|\bcase\b|\bloop\b|\bbegin\b|\bend\b/gi;
+  re.lastIndex = h.index + h[0].length;                    // start scanning AFTER the outer header's `then`
+  let depth = 0;                                           // 0 == directly in the outer IF's body
+  let leftInitial = false;                                 // set once a depth-0 ELSE/ELSIF is seen
+  let m;
   while ((m = re.exec(body.masked)) !== null) {
-    if (m[0].toLowerCase().startsWith("end")) { if (--depth === 0) { end = m.index; break; } }
-    else depth += 1;                                        // a nested IF opener
+    const tok = m[0].toLowerCase().replace(/\s+/g, " ");
+    if (tok === "raise exception") {
+      if (depth === 0 && !leftInitial) return true;        // direct, unconditional, initial-branch rejection
+    } else if (tok === "if" || tok === "case" || tok === "loop" || tok === "begin") {
+      depth += 1;                                          // enter a nested block
+    } else if (tok === "end if" || tok === "end case" || tok === "end loop" || tok === "end") {
+      if (depth === 0) break;                              // the outer IF's own END IF -> stop
+      depth -= 1;                                          // close a nested block
+    } else if (tok === "elsif" || tok === "else") {
+      if (depth === 0) leftInitial = true;                // left the outer IF's initial true branch
+    }
   }
-  if (end < 0) return false;
-  return /\braise\s+exception\b/i.test(body.masked.slice(h.index + h[0].length, end));
+  return false;
 }
 
 // Prove reject_append_to_terminal_cycle's CRITICAL BEHAVIOR (Finding 2), each condition BOUND to its OWN

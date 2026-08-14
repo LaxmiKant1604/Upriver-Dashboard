@@ -4,9 +4,10 @@
 // audit/preflight fail closed when Migration 5 / the RPC / the wrapper / the triggers are missing OR malformed;
 // the trigger audit is a BOUNDED STRUCTURAL proof (timing/events/level/function/table + no create-then-drop);
 // and the guard FUNCTION's critical behavior (cycle_id immutable, FOR SHARE lock, terminal reject, missing
-// parent fail-closed) is proven against the ACTUAL SQL with each condition BOUND to a RAISE in its OWN IF block
-// (an unrelated/moved/commented/stringified raise never satisfies it). finished_at is validated as a strict
-// RFC3339 timestamptz. No network/DataDoe/Supabase (global fetch is mocked).
+// parent fail-closed) is proven against the ACTUAL SQL with each condition BOUND to a DIRECT, UNCONDITIONAL
+// RAISE on its OWN IF block's initial true branch (an unrelated/moved/commented/stringified raise, or one nested
+// in an inner IF / ELSE / ELSIF, never satisfies it). finished_at is validated as a strict RFC3339 timestamptz
+// (Z or +/-HH:MM only). No network/DataDoe/Supabase (global fetch is mocked).
 //
 // 7-bit ASCII, LF. Run: node scripts/cycle-finalize-wiring.test.js
 
@@ -95,16 +96,16 @@ test("(wrapper strict) open-work FAIL CLOSED on missing cycle / wrong id / non-r
   await withRpc({ disposition: "open-work", cycle: goodRunning("c1", { source_succeeded: 3, source_failed: 0, source_total: 2 }) }, async () => { await assert.rejects(() => finalizeSyncCycle("c1"), /counters are missing\/unsafe\/incoherent/); });
 });
 
-test("(wrapper strict, Finding 2) finished_at requires a full RFC3339 timestamptz -- accepts Z and +00:00, rejects everything else", async () => {
-  // ACCEPT: representative valid Z and numeric-offset timestamptz values (with and without fractional seconds).
-  for (const ts of ["2026-08-14T09:31:57.861Z", "2026-08-14T09:31:57Z", "2026-08-14T09:31:57.861+00:00", "2026-08-14T09:31:57+00:00", "2026-08-14T04:01:57-05:30"]) {
+test("(wrapper strict, Finding 2) finished_at requires a full RFC3339 timestamptz -- accepts Z and +/-HH:MM, rejects everything else", async () => {
+  // ACCEPT: valid Z/z and STRICT +HH:MM/-HH:MM offsets (with and without fractional seconds).
+  for (const ts of ["2026-08-14T09:31:57.861Z", "2026-08-14T09:31:57Z", "2026-08-14T09:31:57z", "2026-08-14T09:31:57.861+00:00", "2026-08-14T09:31:57+00:00", "2026-08-14T09:31:57+05:30", "2026-08-14T04:01:57-05:30"]) {
     await withRpc({ disposition: "finalized", cycle: goodTerminal("c1", { finished_at: ts }) }, async () => {
       assert.equal((await finalizeSyncCycle("c1")).disposition, "finalized", `must accept ${ts}`);
     });
   }
-  // REJECT: bare integers, date-only, timezone-less, impossible calendar dates, out-of-range time/offset
-  // components, blanks, and non-strings (number / array / object).
-  const bad = ["0", "1", "2026-08-14", "2026-08-14T09:31:57", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-08-14T25:00:00Z", "2026-08-14T09:60:00Z", "2026-08-14T09:31:61Z", "2026-08-14T09:31:57+25:00", "2026-08-14T09:31:57+00:70", "", "   ", 1723627917861, ["2026-08-14T09:31:57Z"], { at: "2026-08-14T09:31:57Z" }];
+  // REJECT: colon-less / truncated numeric offsets (+0530/-0530/+05/-05), bare integers, date-only,
+  // timezone-less, impossible calendar dates, out-of-range time/offset components, blanks, and non-strings.
+  const bad = ["2026-08-14T09:31:57+0530", "2026-08-14T09:31:57-0530", "2026-08-14T09:31:57+05", "2026-08-14T09:31:57-05", "0", "1", "2026-08-14", "2026-08-14T09:31:57", "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-08-14T25:00:00Z", "2026-08-14T09:60:00Z", "2026-08-14T09:31:61Z", "2026-08-14T09:31:57+25:00", "2026-08-14T09:31:57+00:70", "", "   ", 1723627917861, ["2026-08-14T09:31:57Z"], { at: "2026-08-14T09:31:57Z" }];
   for (const ts of bad) {
     await withRpc({ disposition: "finalized", cycle: goodTerminal("c1", { finished_at: ts }) }, async () => {
       await assert.rejects(() => finalizeSyncCycle("c1"), /valid finished_at/, `must reject ${JSON.stringify(ts)}`);
@@ -209,6 +210,30 @@ test("(SQL guard-function BOUNDED-IF) each condition must RAISE inside its own b
   assert.ok(has(M5_SQL.replace(TERM, block(termHead, "null;")), "GUARD_TERMINAL_REJECT_MISSING"), "terminal: NULL instead of raise");
   // control: the untouched guard function passes every bound check.
   assert.ok(!auditCodes(M5_SQL).some((c) => c.startsWith("GUARD_")), "the real guard function passes all bound checks");
+});
+
+// The rejection must be a DIRECT, UNCONDITIONAL raise on the guard's INITIAL true branch: a raise nested inside
+// another IF, or in an ELSE / ELSIF branch, must NOT satisfy it (applied to all three guards).
+test("(SQL guard-function BRANCH-AWARE) a raise nested in an inner IF / ELSE / ELSIF never satisfies a guard", () => {
+  const CYCLE = /if TG_OP = 'UPDATE' and NEW\.cycle_id is distinct from OLD\.cycle_id then[\s\S]*?end if;/;
+  const NF = /if not found then\s+raise exception 'parent sync cycle[\s\S]*?end if;/;
+  const TERM = /if v_status in \('succeeded', 'partial', 'failed'\) then[\s\S]*?end if;/;
+  const cycHead = "if TG_OP = 'UPDATE' and NEW.cycle_id is distinct from OLD.cycle_id then";
+  const nfHead = "if not found then";
+  const termHead = "if v_status in ('succeeded', 'partial', 'failed') then";
+  const R = "raise exception 'x' using errcode = 'raise_exception';";
+  // Each variant hides the raise off the guard's initial true branch.
+  const nested = (head) => `${head}\n    if false then\n      ${R}\n    end if;\n  end if;`;   // raise in a nested IF
+  const elseR = (head) => `${head}\n    null;\n  else\n    ${R}\n  end if;`;                      // raise in ELSE
+  const elsifR = (head) => `${head}\n    null;\n  elsif true then\n    ${R}\n  end if;`;          // raise in ELSIF
+  const has = (sql, code) => auditCodes(sql).includes(code);
+  for (const [head, re, code] of [[cycHead, CYCLE, "GUARD_CYCLE_ID_IMMUTABLE_MISSING"], [nfHead, NF, "GUARD_MISSING_PARENT_NOT_FAILCLOSED"], [termHead, TERM, "GUARD_TERMINAL_REJECT_MISSING"]]) {
+    assert.ok(has(M5_SQL.replace(re, nested(head)), code), `${code}: raise nested in an inner IF must fail`);
+    assert.ok(has(M5_SQL.replace(re, elseR(head)), code), `${code}: raise in ELSE must fail`);
+    assert.ok(has(M5_SQL.replace(re, elsifR(head)), code), `${code}: raise in ELSIF must fail`);
+  }
+  // control: the untouched guard function -- a direct unconditional raise on each initial branch -- still passes.
+  assert.ok(!auditCodes(M5_SQL).some((c) => c.startsWith("GUARD_")), "the real guard function passes all branch-aware checks");
 });
 
 test("(SQL static) signature, running-guard, disposition set, and no-table-added invariants hold", () => {

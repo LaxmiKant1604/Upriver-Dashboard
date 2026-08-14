@@ -689,13 +689,14 @@ const FINALIZE_TERMINAL_STATUSES = new Set(["succeeded", "partial", "failed"]);
 const isSafeNonNegInt = (v) => Number.isSafeInteger(v) && v >= 0;
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 // STRICT RFC3339 timestamptz (the PostgREST/Postgres to_jsonb representation): a string ONLY, with a full date +
-// 'T' + time + a timezone (Z or a valid numeric offset), a REAL calendar date + valid time/offset components,
-// AND a finite parsed instant. Rejects "0"/"1", date-only, timezone-less, 2026-02-30T00:00:00Z, out-of-range
-// hours/minutes/seconds/offsets, blanks, numbers, arrays, and objects. (Accepts optional fractional seconds and
-// either a 2-digit or HH:MM offset so the real Postgres output is accepted.)
+// 'T' + time + a timezone that is EXACTLY 'Z'/'z' OR a numeric offset in strict '+HH:MM'/'-HH:MM' form (the
+// colon and both offset digits are REQUIRED -- '+0530', '+05' and the like are rejected), a REAL calendar date +
+// valid time/offset components, AND a finite parsed instant. Rejects "0"/"1", date-only, timezone-less,
+// 2026-02-30T00:00:00Z, out-of-range hours/minutes/seconds/offsets, blanks, numbers, arrays, and objects.
+// (Accepts optional fractional seconds so the real Postgres output is accepted.)
 function isValidTimestamp(v) {
   if (typeof v !== "string") return false;
-  const m = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:[Zz]|([+-])(\d{2})(?::?(\d{2}))?)$/.exec(v);
+  const m = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/.exec(v);
   if (!m) return false;
   const year = +m[1], month = +m[2], day = +m[3], hour = +m[4], min = +m[5], sec = +m[6];
   if (month < 1 || month > 12) return false;
@@ -703,7 +704,7 @@ function isValidTimestamp(v) {
   const dim = month === 2 && isLeap ? 29 : DAYS_IN_MONTH[month - 1];
   if (day < 1 || day > dim) return false;                 // real calendar date (rejects 2026-02-30)
   if (hour > 23 || min > 59 || sec > 59) return false;    // valid time components
-  if (m[7]) { if (+m[8] > 23 || +(m[9] || 0) > 59) return false; } // valid numeric offset
+  if (m[7]) { if (+m[8] > 23 || +m[9] > 59) return false; } // valid +HH:MM / -HH:MM offset
   return Number.isFinite(Date.parse(v));                  // finite parsed instant
 }
 const countersCoherent = (c) => {
