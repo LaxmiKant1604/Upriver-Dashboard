@@ -44,6 +44,7 @@ const SUITES = [
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",
   "test:timeout-slicing",
+  "test:ads-sync-canary",
   "build:check",
 ];
 

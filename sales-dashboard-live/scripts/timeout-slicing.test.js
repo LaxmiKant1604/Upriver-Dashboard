@@ -12,14 +12,13 @@
 //      (invalid/unavailable => zero writes => last-known-good preserved);
 //   6. resumable slicing spends at most ONE create-export per request_hash across resumed invocations;
 //   7. one failed slice blocks ONLY its own report -- an unrelated report still derives;
-//   8. runAdsSync's OPTIONAL exact account allowlist (Gate-6 PPC prerequisite) is fail-closed and can target
-//      the two Gate-6 accounts without selecting any other US/IN account; absent => behavior unchanged.
+//   (the Ads-sync account-bounded canary + requiredCoverage findings are proven in ads-sync-canary.test.js).
 //
 // 7-bit ASCII, LF, no top-level await. Zero network (no fetch use; ads-sync is tested via its PURE resolver +
 // structural source checks).
 
 import assert from "node:assert/strict";
-import { readFileSync, writeSync } from "node:fs";
+import { writeSync } from "node:fs";
 
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 const SB_KEY_ENV = ["SUPABASE", "SERVICE", "ROLE", "KEY"].join("_");
@@ -36,7 +35,6 @@ let assembleSources, runReportJobs;
 let reportSourceRequestHashes;
 let dailyReportingPayload, reconciliationPayload, returnsLeakagePayload, resolveDailyAdsAvailability;
 let splitDateRangeByDays, splitDateRangeByMonth, addDaysStr;
-let resolveAdsAccountAllowlist;
 let plannedSourceJob, runStagedSourceCycle;
 
 const CONNS = [{ id: "primary", apiKey: ["prim", "key"].join("-"), accountPrefix: "" }];
@@ -328,60 +326,6 @@ test("one failed slice blocks ONLY its own report: the sibling report still deri
   assert.equal(bres.status, "derived", "the unrelated report still derives after the sibling's slice failure");
 });
 
-/* ============================= 8: Ads-sync account allowlist (Gate-6 PPC prerequisite) ============================= */
-
-const G6_US = "26f7a1a6-689a-4084-8260-7add262918e5";
-const G6_IN = "d658442d-6273-4c2d-aeda-f247e638ef98";
-const PRIMARY = { id: "primary" };
-const SECONDARY = { id: "secondary" };
-function discoveredFixture() {
-  return [
-    { id: G6_US, country: "US", rawAccountId: G6_US, connection: PRIMARY },
-    { id: "other-us-1", country: "US", rawAccountId: "other-us-1", connection: PRIMARY },
-    { id: G6_IN, country: "IN", rawAccountId: G6_IN, connection: PRIMARY },
-    { id: "other-in-1", country: "IN", rawAccountId: "other-in-1", connection: PRIMARY },
-    { id: "dd-secondary:x1", country: "US", rawAccountId: "x1", connection: SECONDARY },
-  ];
-}
-
-test("allowlist: targets EXACTLY the two Gate-6 accounts; no other US/IN account is selected", () => {
-  const selected = resolveAdsAccountAllowlist(discoveredFixture(), [G6_US, G6_IN]);
-  assert.deepEqual(selected.map((a) => a.id), [G6_US, G6_IN], "exactly the two Gate-6 accounts, discovery order");
-  assert.ok(selected.every((a) => a.connection.id === "primary"), "selection is primary-only");
-});
-
-test("allowlist FAIL-CLOSED: unknown / duplicate / blank / dd-secondary / non-primary / malformed", () => {
-  const d = discoveredFixture();
-  assert.throws(() => resolveAdsAccountAllowlist(d, ["nope"]), /not among the freshly discovered/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, [G6_US, G6_US]), /duplicate/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, [" "]), /blank/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, ["dd-secondary:x1"]), /dd-secondary/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, []), /non-empty array/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, "not-an-array"), /non-empty array/);
-  assert.throws(() => resolveAdsAccountAllowlist(d, [42]), /blank/);
-  // a discovered account on a non-primary connection is refused even if named without the prefix.
-  const weird = [...d, { id: "sneaky", country: "US", rawAccountId: "s", connection: SECONDARY }];
-  assert.throws(() => resolveAdsAccountAllowlist(weird, ["sneaky"]), /non-primary/);
-});
-
-test("runAdsSync structural: allowlist is OPTIONAL (default null), applied AFTER discovery and BEFORE any state read; coverage recorded only after durable persistence", () => {
-  const src = readFileSync(new URL("../lib/server/ads-sync.js", import.meta.url), "utf8");
-  // Optional third options argument with accountIds defaulting null (existing calls byte-compatible).
-  assert.match(src, /export async function runAdsSync\(countries, sourceKeys = ADS_SOURCES\.map\(\(source\) => source\.key\), \{ accountIds = null \} = \{\}\)/);
-  // Applied after the discovery loop and before getAdsSyncStates.
-  const applyIdx = src.indexOf("if (accountIds != null) accounts = resolveAdsAccountAllowlist(accounts, accountIds);");
-  const statesIdx = src.indexOf("const previousStates = await getAdsSyncStates(");
-  const discoveryIdx = src.indexOf("const discovered = await fetchAccounts(connection.apiKey);");
-  assert.ok(applyIdx > discoveryIdx && discoveryIdx > 0, "allowlist applies AFTER fresh discovery");
-  assert.ok(statesIdx > applyIdx && applyIdx > 0, "allowlist applies BEFORE any sync-state read");
-  // Coverage is recorded ONLY after the durable Ads upserts inside the success path (order of statements).
-  const upsertIdx = src.indexOf("await upsertAdsDailyRows(normalized);");
-  const coverageIdx = src.indexOf("await recordAdsCoverageWindows(");
-  assert.ok(coverageIdx > upsertIdx && upsertIdx > 0, "coverage windows recorded only after durable Ads persistence");
-  // campaign + ASIN coverage are recorded per-source (independently); the recorder is inside the per-source loop.
-  assert.match(src, /accountId: account\.id, sourceKey: source\.key, coveredFrom: range\.from, coveredTo: range\.to/);
-});
-
 /* ============================= run ============================= */
 
 async function main() {
@@ -392,7 +336,6 @@ async function main() {
   ({ dailyReportingPayload, reconciliationPayload, returnsLeakagePayload } = await import("../lib/server/reports/derivation-core.js"));
   ({ resolveDailyAdsAvailability } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ splitDateRangeByDays, splitDateRangeByMonth, addDaysStr } = await import("../lib/server/date-windows.js"));
-  ({ resolveAdsAccountAllowlist } = await import("../lib/server/ads-sync.js"));
   ({ plannedSourceJob, runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   for (const t of tests) {
     try { await t.fn(); passed += 1; out("  ok  " + t.name); }

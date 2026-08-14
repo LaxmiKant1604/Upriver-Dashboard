@@ -1,5 +1,6 @@
 import {
   claimRefreshLock,
+  releaseRefreshLock,
   getAdsSyncStates,
   upsertAdDailyMetrics,
   upsertAdsDailyRows,
@@ -303,6 +304,68 @@ function countryMatches(account, countries) {
   return countries === "OTHER" ? !MANAGED_COUNTRIES.has(account.country) : countries.includes(account.country);
 }
 
+// Successful state record for a BOUNDED requiredCoverage canary. Unlike stateRecord it PRESERVES every cadence
+// timestamp (initial/daily/monthly) verbatim -- a controlled exact-window backfill is NOT a normal cadence run,
+// so it must never falsely stamp initial_seeded_at / last_daily_sync_at / last_monthly_sync_at. It only advances
+// latest_metric_date (from the durably-persisted rows) and marks last_status succeeded.
+function coverageStateRecord(accountId, sourceKey, previous, latestMetricDate, now) {
+  return {
+    account_id: accountId,
+    source_key: sourceKey,
+    initial_seeded_at: previous?.initial_seeded_at || null,
+    last_daily_sync_at: previous?.last_daily_sync_at || null,
+    last_monthly_sync_at: previous?.last_monthly_sync_at || null,
+    latest_metric_date: latestMetricDate || previous?.latest_metric_date || null,
+    last_status: "succeeded",
+    last_error: null,
+  };
+}
+
+// Strict real YYYY-MM-DD: exact shape AND a real calendar date (round-trips through UTC so 2026-02-30 is rejected).
+function isStrictYmd(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const d = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
+}
+
+// The oldest window start a requiredCoverage canary may request -- anything earlier is out of range.
+const ADS_COVERAGE_MIN_DATE = "2000-01-01";
+
+/**
+ * Validate the BASIC shape of runAdsSync options BEFORE any lock is claimed (fail closed, no lock held on a
+ * bad request). Returns the normalized { accountIds, requiredCoverage }. Rules for requiredCoverage (the
+ * account-bounded exact-window canary option):
+ *   - allowed ONLY with a non-empty accountIds allowlist (it can never widen an unbounded country sweep);
+ *   - strict real YYYY-MM-DD from/to with from <= to;
+ *   - to must not be in the future; from must not be out of range (before ADS_COVERAGE_MIN_DATE).
+ * NOTE: this validates option SHAPE only. Resolving the allowlist against freshly discovered accounts happens
+ * AFTER the lock (it needs discovery) and is fail-closed there too.
+ */
+export function validateAdsSyncOptions(options = {}, today) {
+  if (options == null || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("Ads sync options must be an object (fail closed).");
+  }
+  const { accountIds = null, requiredCoverage = null } = options;
+  if (accountIds != null && !Array.isArray(accountIds)) {
+    throw new Error("Ads sync accountIds must be an array of public account ids (fail closed).");
+  }
+  if (requiredCoverage == null) return { accountIds, requiredCoverage: null };
+  if (!Array.isArray(accountIds) || accountIds.length === 0) {
+    throw new Error("Ads sync requiredCoverage requires a non-empty accountIds allowlist (fail closed).");
+  }
+  if (typeof requiredCoverage !== "object" || Array.isArray(requiredCoverage)) {
+    throw new Error("Ads sync requiredCoverage must be an object { from, to } (fail closed).");
+  }
+  const { from, to } = requiredCoverage;
+  if (!isStrictYmd(from) || !isStrictYmd(to)) {
+    throw new Error("Ads sync requiredCoverage.from/to must be strict real YYYY-MM-DD dates (fail closed).");
+  }
+  if (from > to) throw new Error("Ads sync requiredCoverage.from must be <= to (fail closed).");
+  if (typeof today === "string" && to > today) throw new Error("Ads sync requiredCoverage.to must not be in the future (fail closed).");
+  if (from < ADS_COVERAGE_MIN_DATE) throw new Error("Ads sync requiredCoverage.from is out of range (fail closed).");
+  return { accountIds, requiredCoverage: { from, to } };
+}
+
 export function verifyCronRequest(req, res) {
   const secret = process.env.CRON_SECRET;
   if (!secret) {
@@ -357,109 +420,186 @@ export function resolveAdsAccountAllowlist(discovered, accountIds) {
   return (discovered || []).filter((account) => wanted.has(account.id));
 }
 
-export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source) => source.key), { accountIds = null } = {}) {
-  const connections = getDataDoeConnections();
-  const now = new Date().toISOString();
+// The trusted collaborators runAdsSync's DEPENDENCY-INJECTED core needs. Production wires the real Supabase
+// wrappers + the DataDoe network readers here; tests inject deterministic doubles (finding: executable harness
+// around a DI core, not a source-text proof). Every I/O touch point is here; the pure helpers stay module-level.
+export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
+  getConnections: getDataDoeConnections,
+  fetchAccounts,                 // DataDoe accounts GET (network)
+  fetchRange,                    // DataDoe create-export + download (network)
+  claimRefreshLock,
+  releaseRefreshLock,
+  getAdsSyncStates,
+  upsertAdsDailyRows,
+  upsertAdDailyMetrics,
+  upsertAdsSyncStates,
+  recordAdsCoverageWindows,
+  now: () => new Date().toISOString(),
+});
+
+/**
+ * Dependency-injected core of the country Ads sync. Behavior for the existing two-argument callers is
+ * unchanged (no options => the normal cadence path). Adds the account-bounded requiredCoverage canary and a
+ * lock that is ALWAYS released (try/finally on every post-claim outcome). See runAdsSync for the production
+ * entry point. `deps` supplies every I/O collaborator, so this whole function is deterministically testable.
+ */
+export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURCES.map((source) => source.key), options = {}) {
+  const {
+    getConnections, fetchAccounts: fetchAccountsDep, fetchRange: fetchRangeDep,
+    claimRefreshLock: claimLock, releaseRefreshLock: releaseLock,
+    getAdsSyncStates: getStates, upsertAdsDailyRows: upsertRows, upsertAdDailyMetrics: upsertMetrics,
+    upsertAdsSyncStates: upsertStates, recordAdsCoverageWindows: recordCoverage, now: nowFn,
+  } = deps;
+
+  const now = nowFn();
   const to = now.slice(0, 10);
   const scope = countries === "OTHER" ? "OTHER" : [...countries].sort().join(",");
   const selectedSources = ADS_SOURCES.filter((source) => sourceKeys.includes(source.key));
   if (!selectedSources.length) throw new Error("No supported Ads source was requested.");
-  const locked = await claimRefreshLock({
+
+  // Validate the BASIC option shape BEFORE claiming the lock (a bad request never holds a lock).
+  const { accountIds, requiredCoverage } = validateAdsSyncOptions(options, to);
+  const coverageMode = requiredCoverage != null;
+
+  const lockKey = {
     reportKey: "automated-ads-sync-v1",
     accountId: scope,
     paramsHash: `daily-country-run:${selectedSources.map((source) => source.key).sort().join(",")}`,
-    lockSeconds: 600,
-  });
+  };
+  const locked = await claimLock({ ...lockKey, lockSeconds: 600 });
   if (!locked) return { status: "skipped", reason: "A country Ads sync is already running.", scope };
 
-  const startedAt = Date.now();
-  let accounts = [];
-  const publicAccountIds = new Set();
-  for (const connection of connections) {
-    const discovered = await fetchAccounts(connection.apiKey);
-    for (const account of discovered) {
-      if (!countryMatches(account, countries)) continue;
-      const id = publicAccountId(connection, account.id);
-      // A raw DataDoe ID is only unique inside its own organisation. Keep a
-      // matching secondary ID as a distinct, namespaced sync target.
-      if (publicAccountIds.has(id)) continue;
-      publicAccountIds.add(id);
-      accounts.push({
-        ...account,
-        rawAccountId: account.id,
-        id,
-        connection,
-      });
+  // EVERY post-claim outcome (success, partial/deadline, discovery failure, allowlist rejection, DataDoe
+  // failure, coverage-write failure) releases the lock EXACTLY ONCE via this finally.
+  try {
+    const connections = getConnections();
+    const startedAt = Date.now();
+    let accounts = [];
+    const publicAccountIds = new Set();
+    for (const connection of connections) {
+      const discovered = await fetchAccountsDep(connection.apiKey); // discovery failure throws -> finally releases
+      for (const account of discovered) {
+        if (!countryMatches(account, countries)) continue;
+        const id = publicAccountId(connection, account.id);
+        // A raw DataDoe ID is only unique inside its own organisation. Keep a
+        // matching secondary ID as a distinct, namespaced sync target.
+        if (publicAccountIds.has(id)) continue;
+        publicAccountIds.add(id);
+        accounts.push({ ...account, rawAccountId: account.id, id, connection });
+      }
     }
-  }
-  // Optional EXACT public-account allowlist (controlled canary, e.g. the Gate-6 PPC prerequisite): select
-  // ONLY freshly discovered primary accounts; fail closed on any unknown/duplicate/blank/dd-secondary id.
-  // When absent (the default and every existing caller), behavior is unchanged.
-  if (accountIds != null) accounts = resolveAdsAccountAllowlist(accounts, accountIds);
-  const previousStates = await getAdsSyncStates(accounts.map((account) => account.id));
-  const states = new Map(previousStates.map((state) => [`${state.account_id}|${state.source_key}`, state]));
-  const summary = { status: "completed", scope, accounts: accounts.length, rows: 0, sources: {}, deferred: false };
+    // Optional EXACT public-account allowlist (controlled canary, e.g. the Gate-6 PPC prerequisite): select
+    // ONLY freshly discovered primary accounts; fail closed on any unknown/duplicate/blank/dd-secondary id
+    // (the throw propagates to the finally, releasing the lock). Absent => every discovered account (unchanged).
+    if (accountIds != null) accounts = resolveAdsAccountAllowlist(accounts, accountIds);
 
-  for (const source of selectedSources) {
-    const work = new Map();
-    for (const account of accounts) {
-      const previous = states.get(`${account.id}|${source.key}`);
-      const mode = pickMode(previous, source, now);
-      // DataDoe API keys are organisation-scoped; a single export must never
-      // carry account IDs belonging to two different organisations.
-      const workKey = `${account.connection.id}|${mode}`;
-      const group = work.get(workKey) || [];
-      group.push({ account, previous });
-      work.set(workKey, group);
-    }
-    summary.sources[source.key] = { initial: 0, daily: 0, monthly: 0, rows: 0, failedAccounts: [] };
+    const previousStates = await getStates(accounts.map((account) => account.id));
+    const states = new Map(previousStates.map((state) => [`${state.account_id}|${state.source_key}`, state]));
+    const summary = { status: "completed", scope, accounts: accounts.length, rows: 0, sources: {}, deferred: false };
+    if (coverageMode) summary.coverageMode = true;
 
-    for (const [workKey, entries] of work) {
-      const [, mode] = workKey.split("|");
-      for (const batch of chunks(entries, source.batchSize)) {
-        if (Date.now() - startedAt > WORK_BUDGET_MS) {
-          summary.status = "partial";
-          summary.deferred = true;
-          return summary;
-        }
-        const range = windowFor(source, mode, to);
-        const connection = batch[0].account.connection;
-        const ids = batch.map((entry) => entry.account.rawAccountId);
-        try {
-          const rows = await fetchRange(connection.apiKey, source, ids, range.from, range.to);
-          const normalized = rows.map((row) => rowRecord(source, row, now, connection));
-          await upsertAdsDailyRows(normalized);
-          if (source.key === "campaign-performance-v1") {
-            await upsertAdDailyMetrics(campaignMetricRecords(normalized));
+    for (const source of selectedSources) {
+      const work = new Map();
+      for (const account of accounts) {
+        const previous = states.get(`${account.id}|${source.key}`);
+        // coverageMode: NO pickMode -- a bounded canary is one fixed 'coverage' work group per connection and
+        // never shortens its window to a cadence mode. Existing ads_sync_state can NEVER downshift the window.
+        const mode = coverageMode ? "coverage" : pickMode(previous, source, now);
+        // DataDoe API keys are organisation-scoped; a single export must never
+        // carry account IDs belonging to two different organisations.
+        const workKey = `${account.connection.id}|${mode}`;
+        const group = work.get(workKey) || [];
+        group.push({ account, previous });
+        work.set(workKey, group);
+      }
+      summary.sources[source.key] = coverageMode
+        ? { coverage: 0, rows: 0, failedAccounts: [], coverageFailedAccounts: [] }
+        : { initial: 0, daily: 0, monthly: 0, rows: 0, failedAccounts: [] };
+
+      for (const [workKey, entries] of work) {
+        const [, mode] = workKey.split("|");
+        for (const batch of chunks(entries, source.batchSize)) {
+          if (Date.now() - startedAt > WORK_BUDGET_MS) {
+            summary.status = "partial";
+            summary.deferred = true;
+            return summary; // finally releases the lock
           }
-          const latestDateByAccount = new Map();
-          for (const row of normalized) {
-            if (!latestDateByAccount.get(row.account_id) || latestDateByAccount.get(row.account_id) < row.metric_date) {
-              latestDateByAccount.set(row.account_id, row.metric_date);
+          // EXACT window: coverageMode uses requiredCoverage verbatim for EVERY source; it NEVER calls windowFor.
+          const range = coverageMode ? { from: requiredCoverage.from, to: requiredCoverage.to } : windowFor(source, mode, to);
+          const connection = batch[0].account.connection;
+          const ids = batch.map((entry) => entry.account.rawAccountId);
+          try {
+            const rows = await fetchRangeDep(connection.apiKey, source, ids, range.from, range.to);
+            const normalized = rows.map((row) => rowRecord(source, row, now, connection));
+            // DURABLE Ads-row persistence FIRST -- latest_metric_date + successful state are written only after.
+            await upsertRows(normalized);
+            if (source.key === "campaign-performance-v1") {
+              await upsertMetrics(campaignMetricRecords(normalized));
             }
+            const latestDateByAccount = new Map();
+            for (const row of normalized) {
+              if (!latestDateByAccount.get(row.account_id) || latestDateByAccount.get(row.account_id) < row.metric_date) {
+                latestDateByAccount.set(row.account_id, row.metric_date);
+              }
+            }
+            if (coverageMode) {
+              // Record the EXACT successful window, then REQUIRE a positive persistence acknowledgement (write ok
+              // AND one recorded row per account) BEFORE marking the sync succeeded -- fail closed otherwise.
+              const ack = await recordCoverage(batch.map(({ account }) => ({
+                accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
+              })));
+              const confirmed = !!ack && ack.write === "ok" && ack.recorded === batch.length;
+              if (!confirmed) {
+                // Coverage NOT positively confirmed: do NOT advance latest_metric_date or mark succeeded.
+                const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("COVERAGE_UNCONFIRMED"), now));
+                await upsertStates(failed);
+                summary.sources[source.key].coverageFailedAccounts.push(...batch.map((entry) => entry.account.id));
+                continue;
+              }
+              // Confirmed: advance latest_metric_date + mark succeeded, PRESERVING cadence timestamps.
+              const savedStates = batch.map(({ account, previous }) => coverageStateRecord(account.id, source.key, previous, latestDateByAccount.get(account.id), now));
+              await upsertStates(savedStates);
+              savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
+              summary.rows += normalized.length;
+              summary.sources[source.key].coverage += batch.length;
+              summary.sources[source.key].rows += normalized.length;
+            } else {
+              // NORMAL cadence path -- UNCHANGED behavior. Coverage recording stays best-effort (its return is
+              // ignored: a missing/unmigrated table is a safe no-op that must never break a cadence sync).
+              const savedStates = batch.map(({ account, previous }) => stateRecord(
+                account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now
+              ));
+              await upsertStates(savedStates);
+              await recordCoverage(batch.map(({ account }) => ({
+                accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
+              })));
+              savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
+              summary.rows += normalized.length;
+              summary.sources[source.key][mode] += batch.length;
+              summary.sources[source.key].rows += normalized.length;
+            }
+          } catch (error) {
+            // A DataDoe/persistence failure marks ONLY this batch's accounts failed; the raw error goes into the
+            // durable state record (truncated), NEVER into the returned summary (which carries account ids only).
+            const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, error, now));
+            await upsertStates(failed);
+            summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
           }
-          const savedStates = batch.map(({ account, previous }) => stateRecord(
-            account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now
-          ));
-          await upsertAdsSyncStates(savedStates);
-          // Record the exact SUCCESSFULLY-covered window per account so the Daily Reporting
-          // scheduler can prove coverage (a zero-ad day has no metric row, so first/last metric
-          // dates cannot). Best-effort: additive table, never changes the export cadence, and a
-          // missing (unmigrated) table is a silent no-op that never breaks this sync.
-          await recordAdsCoverageWindows(batch.map(({ account }) => ({
-            accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
-          })));
-          savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
-          summary.rows += normalized.length;
-          summary.sources[source.key][mode] += batch.length;
-          summary.sources[source.key].rows += normalized.length;
-        } catch (error) {
-          const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, error, now));
-          await upsertAdsSyncStates(failed);
-          summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
         }
       }
     }
+    return summary;
+  } finally {
+    // Release the lock on EVERY post-claim outcome (never on the 'skipped' path -- that lock belongs to another run).
+    await releaseLock(lockKey);
   }
-  return summary;
+}
+
+/**
+ * Production country Ads sync. Thin wrapper over the DI core with the real collaborators. Existing
+ * two-argument callers (runAdsSync(countries) / runAdsSync(countries, [sourceKey])) are byte-for-byte
+ * behavior-compatible (options default to {} => the normal cadence path).
+ */
+export async function runAdsSync(countries, sourceKeys = ADS_SOURCES.map((source) => source.key), options = {}) {
+  return runAdsSyncWithDeps(PRODUCTION_ADS_SYNC_DEPS, countries, sourceKeys, options);
 }

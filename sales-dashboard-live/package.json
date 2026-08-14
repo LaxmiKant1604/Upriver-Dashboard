@@ -23,6 +23,7 @@
     "test:cycle-lifecycle": "node scripts/cycle-lifecycle.test.js",
     "test:cycle-finalize-wiring": "node scripts/cycle-finalize-wiring.test.js",
     "test:timeout-slicing": "node scripts/timeout-slicing.test.js",
+    "test:ads-sync-canary": "node scripts/ads-sync-canary.test.js",
     "verify": "node scripts/verify.mjs",
     "db:migrate": "node scripts/apply-supabase-migrations.mjs"
   },
