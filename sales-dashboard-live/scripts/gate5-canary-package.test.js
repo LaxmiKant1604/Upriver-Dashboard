@@ -2,15 +2,17 @@
 // canary guards. It runs the REAL (pure, offline) planBrandSales() to obtain the exact two brand-sales source
 // request identities, then asserts every canary guard PASSES on the correct shape and THROWS on each documented
 // failure: wrong account/seller scope, shifted or wrong windows, strict:false, wrong source ids, wrong hashes,
-// duplicate/missing sources, wrong/missing owner ids, stale/absent catalog cache, pre-existing shadow rows,
-// extra report jobs/snapshots, a final drain without exactly one create-export per hash, and the final-slice
-// deadline boundary. NO network, DataDoe, or Supabase I/O -- planBrandSales and sourceJobOwnerId are pure hashing.
+// duplicate/missing sources, wrong/missing owner ids, pre-existing shadow rows, extra report jobs/snapshots, a
+// final drain without exactly one create-export per hash, and the final-slice deadline boundary. NO network,
+// DataDoe, or Supabase I/O -- planBrandSales and sourceJobOwnerId are pure hashing.
 //
-// Export-count semantics (L.1/L.3): the pre-existing product-catalog source_export_cache entry is a USABILITY
-// prerequisite only (proof the exact canonical request yields usable data) -- the source worker NEVER skips
-// create-export because of it. create_export_count = 0 is a mid-drain partial/failed-slice state (a job not yet
-// attempted), never "cache reuse"; a SUCCESSFUL fresh drained canary ends with EXACTLY two succeeded source rows
-// (the two plan hashes), each create_export_count === 1.
+// Catalog-cache semantics (Codex correction to L.1/L.4): the pre-existing product-catalog source_export_cache
+// entry is ADVISORY USABILITY EVIDENCE ONLY -- it is NEVER a source-worker create-export shortcut and NEVER a
+// Gate 5 START GATE. A MISSING or EXPIRED catalog cache does NOT block starting the canary (the source worker
+// always creates its own fresh catalog export). Export-count semantics (L.3): create_export_count = 0 is a
+// mid-drain partial/failed-slice state (a job not yet attempted), never "cache reuse"; a SUCCESSFUL fresh
+// drained canary ends with EXACTLY two succeeded source rows (the two plan hashes), each create_export_count
+// === 1 -- the authoritative integrity guarantee that a fresh, valid catalog export actually happened.
 //
 // 7-bit ASCII, LF. Run: node scripts/gate5-canary-package.test.js
 
@@ -84,16 +86,23 @@ function checkOwnerIds(ownerIds) {
   return ownerIds[0];
 }
 
-function checkCatalogCache(cache, catalogSource) {
-  if (!cache) throw new Error("catalog: no current source_export_cache entry for the exact request (stale/absent)");
-  if (cache.source_id !== CATALOG_SOURCE_ID) throw new Error(`catalog: source_id ${cache.source_id} != ${CATALOG_SOURCE_ID}`);
+// ADVISORY catalog evidence (Codex correction to L.1/L.4): the pre-existing product-catalog
+// source_export_cache entry is USABILITY EVIDENCE ONLY -- never a source-worker shortcut and never a Gate 5
+// START GATE. A MISSING or EXPIRED cache (rt.sourceRowLoader returns null for an expired entry, because
+// getSourceExportCache filters expires_at > now) must NOT block starting the canary: the source worker ALWAYS
+// creates its own fresh catalog export (never skips create-export because a cache exists). This classifies the
+// evidence for the record WITHOUT throwing on absent/expired, and NEVER changes what the source worker does.
+// Returns "absent" (missing OR expired) | "current-usable" | "current-unusable". The real integrity guarantee
+// is the FINAL-DRAIN guard: the fresh catalog export must succeed with create_export_count === 1 and
+// non-cap-sized rows, else the run fails closed with no shadow snapshot (checkFinalSourceJobs).
+function assessCatalogEvidence(cache, catalogSource) {
+  if (!cache) return "absent"; // missing OR expired -- advisory, NON-BLOCKING (Gate 5 starts anyway)
   const rows = cache.rows;
-  if (!Array.isArray(rows)) throw new Error("catalog: no rows");
-  if (rows.length !== cache.row_count) throw new Error(`catalog: rows.length ${rows.length} != row_count ${cache.row_count}`);
-  if (!(rows.length > 0 && rows.length < catalogSource.limit)) throw new Error(`catalog: rows.length ${rows.length} not in (0, ${catalogSource.limit})`);
-  const usable = rows.some((r) => r && norm(r.child_asin) !== "" && norm(r.product_brand) !== "");
-  if (!usable) throw new Error("catalog: no non-blank child_asin/product_brand mapping");
-  return true;
+  const usable = cache.source_id === CATALOG_SOURCE_ID
+    && Array.isArray(rows) && rows.length === cache.row_count
+    && rows.length > 0 && rows.length < catalogSource.limit
+    && rows.some((r) => r && norm(r.child_asin) !== "" && norm(r.product_brand) !== "");
+  return usable ? "current-usable" : "current-unusable";
 }
 
 // Between-slice (mid-drain) guard: identity-pinned rows only; create_export_count 0 means the job has
@@ -210,7 +219,7 @@ test("(good) the real plan + correct DB rows pass every guard", () => {
   assert.equal(orderLines.sourceKey, "order-line-items");
   const ownerId = checkOwnerIds(ownerIdsOf(plan));
   assert.ok(norm(ownerId));
-  assert.ok(checkCatalogCache(goodCatalogCache(catalog), catalog));
+  assert.equal(assessCatalogEvidence(goodCatalogCache(catalog), catalog), "current-usable"); // advisory only
   const jobs = plan.sources.map((s) => goodSourceJob(s, 1));
   assert.deepEqual(checkSliceSourceJobs(jobs, plan), { total: 2, count: 2 });
   assert.ok(requireBothSourcesPresent(jobs, plan));
@@ -264,16 +273,44 @@ test("(plan pinning) wrong account, wrong seller scope, shifted window, strict:f
   assert.throws(() => checkPlanSources(badOli, ACCT, AS_OF), /sourceId/);
 });
 
-test("(catalog cache) stale/absent, wrong id, count/limit, and blank-mapping all fail closed", () => {
+test("(catalog evidence is ADVISORY) absent/expired never blocks canary start; a current cache is classified but non-blocking", () => {
   const { catalog } = checkPlanSources(mkPlan(), ACCT, AS_OF);
-  assert.throws(() => checkCatalogCache(null, catalog), /stale\/absent|no current/);            // stale/absent
-  assert.throws(() => checkCatalogCache({ ...goodCatalogCache(catalog), source_id: "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8" }, catalog), /source_id/);  // obsolete long id
-  assert.throws(() => checkCatalogCache({ ...goodCatalogCache(catalog, 3), row_count: 4 }, catalog), /row_count/);   // rows != row_count
-  assert.throws(() => checkCatalogCache({ ...goodCatalogCache(catalog, 0), rows: [] }, catalog), /not in \(0/);      // empty
-  const atLimit = goodCatalogCache(catalog, catalog.limit); atLimit.row_count = catalog.limit; // rows.length == limit
-  assert.throws(() => checkCatalogCache(atLimit, catalog), /not in \(0/);
+  // MISSING or EXPIRED (rt.sourceRowLoader returns null for an expired entry) -> "absent"; NEVER throws, never
+  // blocks starting Gate 5. The source worker creates its own fresh catalog export regardless.
+  assert.equal(assessCatalogEvidence(null, catalog), "absent");
+  assert.equal(assessCatalogEvidence(undefined, catalog), "absent");
+  // A current, usable cache -> "current-usable" (advisory; does NOT license skipping the fresh export).
+  assert.equal(assessCatalogEvidence(goodCatalogCache(catalog, 3), catalog), "current-usable");
+  // A present-but-unusable cache is classified "current-unusable" -- recorded, but STILL non-blocking (the
+  // canary starts and the fresh export is the authoritative source of the catalog rows).
+  assert.equal(assessCatalogEvidence({ ...goodCatalogCache(catalog), source_id: "68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8" }, catalog), "current-unusable"); // obsolete long id
+  assert.equal(assessCatalogEvidence({ ...goodCatalogCache(catalog, 3), row_count: 4 }, catalog), "current-unusable");   // rows != row_count
+  assert.equal(assessCatalogEvidence({ ...goodCatalogCache(catalog, 0), rows: [] }, catalog), "current-unusable");       // empty
+  const atLimit = goodCatalogCache(catalog, catalog.limit); atLimit.row_count = catalog.limit;                          // cap-sized
+  assert.equal(assessCatalogEvidence(atLimit, catalog), "current-unusable");
   const blank = goodCatalogCache(catalog, 2); blank.rows = [{ child_asin: "", product_brand: "" }, { child_asin: "  ", product_brand: null }];
-  assert.throws(() => checkCatalogCache(blank, catalog), /non-blank/);
+  assert.equal(assessCatalogEvidence(blank, catalog), "current-unusable");                                              // blank mapping
+});
+
+test("(catalog advisory does NOT weaken the run) absent/expired/unusable evidence still requires a real fresh export at final drain", () => {
+  const plan = mkPlan();
+  const [ol, cat] = plan.sources;
+  // Whatever the advisory catalog evidence says, the FINAL-DRAIN guard is unchanged: exactly two succeeded
+  // source rows, create_export_count === 1 EACH (a real fresh catalog export), else fail closed.
+  for (const evidence of [null, undefined, goodCatalogCache(cat, 3), { ...goodCatalogCache(cat), source_id: "wrong" }]) {
+    void assessCatalogEvidence(evidence, cat); // advisory only -- never gates the run
+  }
+  // success: both hashes exported exactly once
+  assert.ok(checkFinalSourceJobs([goodSourceJob(ol, 1), goodSourceJob(cat, 1)], plan));
+  // a fresh catalog export that FAILED (not succeeded) -> fail closed, no snapshot
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1), { ...goodSourceJob(cat, 1), fetch_status: "failed" }], plan), /succeeded/);
+  // a fresh catalog export that was TRUNCATED/cap-sized -> the strict worker marks it failed+terminal, so the
+  // final row is not 'succeeded' -> fail closed
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1), { ...goodSourceJob(cat, 1), fetch_status: "failed", terminal: true, error_code: "TRUNCATED" }], plan), /succeeded/);
+  // the catalog source row MISSING at final drain -> fail closed
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1)], plan), /missing source row for brand-sales:catalog/);
+  // a catalog row that never exported (create_export_count 0) after a "successful" drain -> fail closed
+  assert.throws(() => checkFinalSourceJobs([goodSourceJob(ol, 1), goodSourceJob(cat, 0)], plan), /!= 1/);
 });
 
 test("(slice) wrong hash/key/id/connection/org/scope, dup, >2 rows, and export>1 fail closed", () => {

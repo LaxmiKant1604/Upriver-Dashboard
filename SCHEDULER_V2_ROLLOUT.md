@@ -1732,27 +1732,28 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 
 - **Exactly one primary DataDoe account** and **exactly one report: `brand-sales`** (a generic single-shot;
   its two canonical source contracts are `order-line-items` and `product-catalog`).
-- Use `brand-sales` **only if** the chosen account has **both**: (1) a current production Brand Sales snapshot
-  (`report_snapshots` under `report_key='brand-sales'`) for later Gate 6 parity; (2) confirmed **Product Catalog
-  usability for the EXACT canonical `brand-sales` product-catalog request the CURRENT plan derives** — the
-  request built from the live short source id `68d2de238e`, the contract's columns (incl. `child_asin`,
-  `product_brand`), and the window/scope values the current planner emits (compute its `request_hash` via the
-  same source identity the `brand-sales` plan uses). **Confirmed contract (Appendix M): the Product Catalog
-  DATASET is organization-wide** — DataDoe ignores `sellerOrVendorIds` for this source and downloads requested
-  for different accounts are byte-identical — so the seller id inside this request identity is a
-  CURRENT-implementation cache-key artifact, **not** a data scope (Order Line Items remains genuinely
-  seller-scoped). Require a `source_export_cache` entry for THAT exact `request_hash` with `row_count > 0`, and
-  a bounded payload read showing **non-empty usable `child_asin` → `product_brand` mappings**. This existing
-  cache entry is **usability evidence only** — proof the exact canonical request yields usable data — **not a
-  pre-export shortcut**: the canary's fresh cycle still creates its own catalog export (the source worker never
-  skips `create-export` because a cache entry exists), so a fully successful canary spends exactly two
-  create-exports. A catalog cached under a **different `request_hash`** (another account's identity, or a
-  different catalog shape/id) is MECHANICALLY insufficient — `rt.sourceRowLoader()` reads only the plan-derived
-  hash — even though the underlying catalog data is organization-wide. The long id
+- **Hard prerequisite:** the chosen account has a **current production Brand Sales snapshot** (`report_snapshots`
+  under `report_key='brand-sales'`) for later Gate 6 parity. If absent, STOP (pick another account).
+- **Product Catalog usability is ADVISORY EVIDENCE, not a start gate (Codex correction).** DataDoe has confirmed
+  Product Catalog is an **organization-wide, API-exportable** dataset (Appendix M; DataDoe ignores
+  `sellerOrVendorIds`, downloads for different accounts are byte-identical), and the source worker **never**
+  consults `source_export_cache` to skip a create-export. So a **missing or EXPIRED** pre-existing catalog cache
+  for the plan-derived `request_hash` must **NOT** block starting Gate 5 — requiring a *current* entry would
+  force an extra warm-up export outside the approved two-export budget. Record, for the evidence, whether a
+  **current** exact-hash catalog cache exists and (if so) that it is usable (`source_id === '68d2de238e'`,
+  `rows.length === row_count`, `0 < rows.length < limit`, ≥ 1 non-blank `child_asin` → `product_brand`), via
+  `rt.sourceRowLoader()` on the plan-derived catalog `request_hash` — but treat `absent` / `current-usable` /
+  `current-unusable` as **advisory** and proceed either way. The catalog cache is keyed by the exact canonical
+  request identity (short source id `68d2de238e`, the contract's columns incl. `child_asin`/`product_brand`, and
+  the planner's window/scope); the seller id inside it is a cache-key artifact, not a data scope (Order Line
+  Items remains genuinely seller-scoped). The long id
   `68d2de238e8d1a47bc56a981a99d54558507b0bafb1e09f1b3e95fb7750a17a8` is the **obsolete (DataDoe-404)** alias and
   must **never** be used.
-- **If either prerequisite (or the exact catalog evidence) cannot be confirmed, STOP.** Do not use the obsolete
-  catalog ID, do not add a fallback/retry, and do not substitute another report or account without review.
+- **The authoritative catalog integrity guarantee is the fresh export at final drain (L.5), NOT the cache.** The
+  canary's own catalog export must succeed with `create_export_count === 1` and **non-cap-sized** rows the
+  derive can use. If that fresh catalog export **fails / is empty / malformed / cap-sized / unavailable**: no
+  shadow snapshot is saved, production/LKG data is preserved, and the run STOPS with the typed failure — **no
+  retry and no third export** (strict `strict:true` + the final-drain guard enforce this).
 - Product Catalog **incremental ASIN-brand gap-fill remains OUT OF SCOPE** for this canary.
 
 ### L.2 Control isolation (no control/allowlist/settings change)
@@ -1806,12 +1807,12 @@ merge, or create a schedule / apply the `pg_cron` kickoff. Stop for Codex review
 - Record (safe fields only): the chosen **public account `id`**, its raw seller scope, **country**, derived
   **bucket** (`bucketForCountry(country)` — must equal the `bucket` passed to `run`), **currency**, **`asOf`**
   (marketplace-local latest data date), and a unique reviewed **`cycleDate`**.
-- The EXACT canonical `brand-sales` product-catalog usability is validated **in-script** (L.5) from the
-  **plan-derived** catalog `request_hash` via `rt.sourceRowLoader()` — a current cache entry, `source_id ===
-  '68d2de238e'`, `rows.length === row_count`, `0 < rows.length < limit`, and ≥ 1 non-blank
-  `child_asin`/`product_brand` (never printed). A catalog entry under any other `request_hash` is MECHANICALLY
-  insufficient (the loader reads only the plan-derived hash; the organization-wide dataset — Appendix M — does
-  not change the cache identity the CURRENT plan derives). There is no manual `<PC_REQUEST_HASH>` substitution.
+- The canonical `brand-sales` product-catalog usability is **RECORDED (advisory)** in-script (L.5) from the
+  **plan-derived** catalog `request_hash` via `rt.sourceRowLoader()` — classified `absent` (missing OR expired),
+  `current-usable` (`source_id === '68d2de238e'`, `rows.length === row_count`, `0 < rows.length < limit`, ≥ 1
+  non-blank `child_asin`/`product_brand`; never printed), or `current-unusable`. This is **advisory only and
+  does NOT gate the run**: a missing/expired/unusable pre-existing cache does not stop Gate 5 (the source worker
+  creates a fresh catalog export). There is no manual `<PC_REQUEST_HASH>` substitution.
 - Here (read-only, no payload exposed) capture the existing production Brand Sales snapshot identity, prove there
   are **zero** pre-existing `scheduler-v2/*` shadow snapshots (this is the FIRST canary), and take the payload-free
   production fingerprint. Committed columns (`report_snapshots`: `id, report_key, account_id, params_hash, params,
@@ -1932,15 +1933,22 @@ const rt = buildSchedulerV2Runtime({
   // scheduler-v2/<reportKey>. We keep the default factory (do NOT override it here).
 });
 
-// PRE-EXECUTION catalog usability: the EXACT plan-derived catalog request, via rt.sourceRowLoader() (cache-only,
-// current entry). NEVER prints rows or secrets. STOP if the exact request is not usable (no fallback / no long id).
+// PRE-EXECUTION catalog usability -- ADVISORY EVIDENCE ONLY (Codex correction). The EXACT plan-derived catalog
+// request, via rt.sourceRowLoader() (cache-only; returns null for a MISSING or EXPIRED entry). NEVER prints rows
+// or secrets. A missing/expired/unusable cache does NOT stop Gate 5 -- the source worker creates its own fresh
+// catalog export. We only RECORD the evidence classification; the authoritative catalog integrity check is the
+// final-drain guard (a real fresh export with create_export_count === 1 and non-cap-sized rows).
 const catalog = byKey.get("brand-sales:catalog");
 const cache = await rt.sourceRowLoader(catalog.requestHash);              // { ..., source_id, row_count, rows } | null
-if (!cache) throw new Error("canary: no CURRENT product-catalog cache for the exact brand-sales:catalog request (STOP)");
-if (cache.source_id !== "68d2de238e") throw new Error(`canary: catalog cache source_id ${cache.source_id} != 68d2de238e (STOP)`);
-if (!Array.isArray(cache.rows) || cache.rows.length !== cache.row_count) throw new Error("canary: catalog cache rows.length != row_count (STOP)");
-if (!(cache.rows.length > 0 && cache.rows.length < catalog.limit)) throw new Error(`canary: catalog rows ${cache.rows.length} not in (0, ${catalog.limit}) (STOP)`);
-if (!cache.rows.some((r) => r && norm(r.child_asin) !== "" && norm(r.product_brand) !== "")) throw new Error("canary: no non-blank child_asin/product_brand mapping (STOP)");
+let catalogEvidence = "absent";                                          // "absent" | "current-usable" | "current-unusable"
+if (cache) {
+  const rows = cache.rows;
+  const usable = cache.source_id === "68d2de238e" && Array.isArray(rows) && rows.length === cache.row_count
+    && rows.length > 0 && rows.length < catalog.limit
+    && rows.some((r) => r && norm(r.child_asin) !== "" && norm(r.product_brand) !== "");
+  catalogEvidence = usable ? "current-usable" : "current-unusable";
+}
+// (record catalogEvidence for the evidence log; do NOT throw on absent/expired/unusable -- advisory only)
 
 // bounded continuation on the SAME (bucket, cycleDate). ONE overall deadline; EACH slice deadline is CLAMPED to it
 // with Math.min; STOP before starting a slice when < reserveMs remains (never busy-loop).
@@ -2096,10 +2104,12 @@ count** is the DB `sum(create_export_count)` from P3 (and the between-slice guar
 
 STOP immediately (safely ending any read-only transaction; make **no** repair/delete/backfill/write) on **any**
 of: the `brand-sales` plan not yielding exactly the two expected sources with the exact
-`requestHash`/`sourceKey`/`sourceId`/`limit`/window/org/scope; a prerequisite mismatch (no production brand-sales
-snapshot, or the EXACT plan-derived brand-sales product-catalog request unavailable / stale / `source_id ≠
-68d2de238e` / `rows.length ≠ row_count` / not `0 < rows.length < limit` / no usable `child_asin` →
-`product_brand` mapping); **any pre-existing `scheduler-v2/*` snapshot** before the run; a DB source row whose
+`requestHash`/`sourceKey`/`sourceId`/`limit`/window/org/scope; **no production brand-sales snapshot** for the
+selected account (the one remaining hard prerequisite; a **missing / expired / unusable pre-existing catalog
+cache does NOT stop the run** — it is advisory only); the canary's own **fresh catalog export** failing / empty
+/ malformed / cap-sized (`strict:true` TRUNCATED) / unavailable, so the final drain lacks two succeeded source
+rows (no shadow snapshot is saved; LKG preserved; no retry, no third export); **any pre-existing
+`scheduler-v2/*` snapshot** before the run; a DB source row whose
 `request_hash` is **not one of the two plan hashes**, or whose `source_key`/`source_id`/`connection_id`/
 `organization_fingerprint`/`account_scope_hash` does not match its plan source; more than two create-export
 attempts total (authoritative DB `sum(create_export_count)`), or a duplicate export (`create_export_count > 1`)
@@ -2118,15 +2128,17 @@ before drain; or any control, allowlist, or schedule change. Do **NOT** proceed 
 deployment, or scheduling. Stop for review + explicit human approval.
 
 > The guard logic above (plan-source validation with the pinned account/seller-scope/exact-window/strict/
-> source-id properties, the single plan-derived owner id, catalog cache, per-slice source + owner checks, the
-> final-drain exactly-one-export-per-hash guard, shadow/report-job checks, and the deadline clamp/boundary) is
-> exercised by a **deterministic offline self-check**: `scripts/gate5-canary-package.test.js`
-> (`npm run test:gate5-canary-package`; part of `npm run verify`) — it builds the real `planBrandSales()` output
-> and asserts each guard passes on the correct shape and throws on a wrong account/seller id, both sources
-> shifted to the same valid-but-wrong window, `strict:false`, a wrong Order Line Items or Product Catalog source
-> id, wrong hashes, duplicate/missing sources, a wrong/blank/missing `owner_id`, a stale/absent catalog cache,
-> pre-existing shadow rows, extra report jobs/snapshots, a final drain without exactly one create-export per
-> hash, and the final-slice deadline boundary.
+> source-id properties, the single plan-derived owner id, the **advisory** catalog-evidence classifier, per-slice
+> source + owner checks, the final-drain exactly-one-export-per-hash guard, shadow/report-job checks, and the
+> deadline clamp/boundary) is exercised by a **deterministic offline self-check**:
+> `scripts/gate5-canary-package.test.js` (`npm run test:gate5-canary-package`; part of `npm run verify`) — it
+> builds the real `planBrandSales()` output and asserts each guard passes on the correct shape and throws on a
+> wrong account/seller id, both sources shifted to the same valid-but-wrong window, `strict:false`, a wrong
+> Order Line Items or Product Catalog source id, wrong hashes, duplicate/missing sources, a wrong/blank/missing
+> `owner_id`, pre-existing shadow rows, extra report jobs/snapshots, a final drain without exactly one
+> create-export per hash, and the final-slice deadline boundary — and that an **absent/expired/unusable catalog
+> cache is advisory and never blocks canary start**, while a failed/truncated/missing fresh catalog source still
+> fails closed at the final drain.
 
 ## Appendix M — Organization-wide Product Catalog: confirmed contract + reviewed design (NOT implemented)
 
