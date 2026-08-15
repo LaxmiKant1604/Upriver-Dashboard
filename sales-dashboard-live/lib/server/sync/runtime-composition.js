@@ -218,17 +218,24 @@ export function buildSchedulerV2CanaryRuntime(overrides = {}) {
   if (!Array.isArray(canaryAccountIds) || canaryAccountIds.length === 0) {
     throw new Error("buildSchedulerV2CanaryRuntime requires canaryAccountIds: a non-empty array of exact public account ids (build-time, reviewed).");
   }
-  const ids = canaryAccountIds.map((id) => String(id ?? "").trim());
-  const bad = ids.filter((id) => id.length === 0 || id.startsWith("dd-secondary:"));
-  if (bad.length) {
-    throw new Error("buildSchedulerV2CanaryRuntime: every canary account id must be a nonblank exact PRIMARY public id (no dd-secondary prefix); refusing to compose (fail closed).");
+  // Reject -- never NORMALIZE -- a noncanonical id: each must be a string with NO leading/trailing whitespace,
+  // nonblank, and not dd-secondary-prefixed. Trimming a reviewed id could silently point the canary at a
+  // DIFFERENT account, so a noncanonical id is a composition error the operator must fix in the reviewed list.
+  for (const id of canaryAccountIds) {
+    if (typeof id !== "string" || id !== id.trim() || id.trim().length === 0 || id.startsWith("dd-secondary:")) {
+      throw new Error("buildSchedulerV2CanaryRuntime: every canary account id must be a nonblank exact PRIMARY public id -- a string with NO leading/trailing whitespace and no dd-secondary prefix (ids are NOT normalized); refusing to compose (fail closed).");
+    }
+  }
+  // Reject DUPLICATE ids: a duplicated reviewed id is an authoring mistake, never silently deduplicated.
+  if (new Set(canaryAccountIds).size !== canaryAccountIds.length) {
+    throw new Error("buildSchedulerV2CanaryRuntime: duplicate canary account id(s); refusing to compose (fail closed).");
   }
   // The canary's account scope IS its rollout state -- fixed at build time; the dispatcher still validates
   // each id against fresh primary discovery on every run. `rest` may not smuggle a different rollout source.
   delete rest.getAccountRollout;
   return buildSchedulerV2Runtime({
     ...rest,
-    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...ids] }),
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...canaryAccountIds] }),
   });
 }
 

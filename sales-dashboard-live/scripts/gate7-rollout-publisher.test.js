@@ -199,12 +199,17 @@ const assertZeroWork = (r, dd, saver, counts, { discovered = false } = {}) => {
 // ---- publisher fixtures --------------------------------------------------------------------------
 
 const SHADOW_TS = "2026-08-14T10:00:00.000Z";
-const JOB_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"; // the exact snapshot identity the job saved
+// The shadow row's params EXACTLY as makeShadowSnapshotSaver saved them: { reportVersion, accountId, ...context }.
+const SHADOW_PARAMS = { reportVersion: dash("sales", "movers") + "/v2d-1", accountId: "IN1", to: "2026-08-14" };
+// The GENUINE snapshot identity: paramsHashFor(SHADOW_PARAMS.reportVersion, SHADOW_PARAMS). Recomputed in
+// loadModules() from the SAME hasher the saver + the publisher's provenance check use, so a fixture snapshot
+// really was produced by its own params (never a made-up hash the provenance check would reject).
+let JOB_HASH;
 function mkPubDeps(over = {}) {
   const calls = { settings: 0, rollout: 0, discover: 0, approval: 0, job: 0, shadow: 0, storage: 0, publish: [] };
   const shadow = {
     params_hash: JOB_HASH,
-    params: { reportVersion: dash("sales", "movers") + "/v2d-1", accountId: "IN1", to: "2026-08-14" },
+    params: { ...SHADOW_PARAMS },
     // A payload the REAL sales-movers derivation validator accepts as an AVAILABLE result.
     payload: {
       accountId: "IN1", asOf: "2026-08-14", dataUnavailable: false, rows: [], catalogBrands: [],
@@ -286,16 +291,28 @@ test("(A1) the DEFAULT durable state and every non-ok read select ZERO accounts"
   }
 });
 
-test("(A2) allowlist mode selects by EXACT public id only; stale rows match nothing and are reported", () => {
+test("(A2) allowlist mode selects by EXACT CANONICAL public id only; stale rows match nothing and are reported", () => {
   const disc = [{ accountId: "US1", country: "US" }, IN1, IN2];
-  const r = resolveRolloutAccounts({ read: "ok", allPrimary: false, enabledAccountIds: [" IN1 ", "GONE9"] }, disc);
-  assert.deepEqual(r.selectedIds, ["IN1"], "exact-id match only (trimmed)");
+  const r = resolveRolloutAccounts({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1", "GONE9"] }, disc);
+  assert.deepEqual(r.selectedIds, ["IN1"], "exact CANONICAL id match only");
   assert.deepEqual(r.accounts, [IN1], "discovery order preserved; original row object kept");
   assert.deepEqual(r.staleIds, ["GONE9"], "unknown allowlist row reported stale, selects nothing");
   assert.equal(r.reason, "allowlist");
   // A partial/prefix/case id can never match.
   const r2 = resolveRolloutAccounts({ read: "ok", allPrimary: false, enabledAccountIds: ["IN", "in1", "IN11"] }, disc);
   assert.deepEqual(r2.accounts, [], "no wildcard, no prefix, no case-folding");
+});
+
+test("(A2b) a NONCANONICAL durable id fails closed -- never silently trimmed into another account", () => {
+  const disc = [{ accountId: "US1", country: "US" }, IN1, IN2];
+  // " IN1 " is NOT trimmed-and-matched to IN1; a single noncanonical id makes the whole allowlist untrusted.
+  for (const bad of [[" IN1 "], ["IN1 "], [" IN1"], ["\tIN1"], ["  "], ["IN1", " IN2 "], [123]]) {
+    const r = resolveRolloutAccounts({ read: "ok", allPrimary: false, enabledAccountIds: bad }, disc);
+    assert.deepEqual(r.accounts, [], JSON.stringify(bad) + " selects zero");
+    assert.equal(r.reason, "rollout-noncanonical-id", JSON.stringify(bad) + " => rollout-noncanonical-id");
+  }
+  // A genuinely canonical, blank-free id still selects normally (control).
+  assert.deepEqual(resolveRolloutAccounts({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }, disc).selectedIds, ["IN1"]);
 });
 
 test("(A3) dd-secondary is rejected on BOTH sides (discovered account and allowlist row)", () => {
@@ -349,6 +366,18 @@ test("(B4) the DEFAULT durable state (zero rows, all_primary=false) drains BEFOR
   const r = await promise;
   assertZeroWork(r, dd, saver, counts);
   assert.deepEqual(r.accountRollout, { selected: 0, reason: "zero-accounts-enabled" });
+});
+
+test("(B4b) a NONCANONICAL durable id drains BEFORE discovery (fail closed; never trimmed into an account)", async () => {
+  const GK = SHADOW_PLANNED_REPORT_KEYS[0];
+  const { dd, saver, counts, promise } = dispatch({
+    bucket: "non-us", accounts: [IN1],
+    controlCatalog: mkCatalog([GK]),
+    loadAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [" IN1 "] }),
+  });
+  const r = await promise;
+  assertZeroWork(r, dd, saver, counts);
+  assert.deepEqual(r.accountRollout, { selected: 0, reason: "rollout-noncanonical-id" }, "a whitespace-padded durable id spends zero discovery/cycle/store/DataDoe I/O");
 });
 
 test("(B5) allowlist [IN1] out of a 30-account discovery: ONLY IN1 is dispatched; every write is IN1's", async () => {
@@ -484,8 +513,9 @@ test("(B11) the BUILD-TIME trusted canary composition scopes accounts with NO pe
   assert.equal(rgh.cycleId, null, "an undiscovered canary id opens no cycle");
   assert.equal(ghost.dd.totalCreates() + ghost.saver.calls, 0, "and spends nothing");
   assert.deepEqual(rgh.accountRollout, { selected: 0, staleIds: ["GHOST9"], reason: "allowlist" });
-  // (c) build-time validation: empty / blank / dd-secondary ids REFUSE to compose.
-  for (const bad of [[], [""], ["  "], [SEC_ID], ["A1", SEC_ID]]) {
+  // (c) build-time validation: empty / blank / dd-secondary / WHITESPACE-PADDED / DUPLICATE ids REFUSE to
+  //     compose (ids are NEVER normalized -- a trimmed id could point the canary at a different account).
+  for (const bad of [[], [""], ["  "], [SEC_ID], ["A1", SEC_ID], [" A1 "], ["A1 "], ["\tA1"], ["A1", "A1"], [123]]) {
     assert.throws(() => mkCanary(bad, dir), /canary/i, JSON.stringify(bad) + " must not compose");
   }
   // (d) NO per-run bypass: run-level rollout/scope args are dropped (RUN_OPERATIONAL_ARGS is pinned).
@@ -567,13 +597,26 @@ group("D. Supabase wrappers: typed fail-closed reads + the CAS publish primitive
 test("(D1) getSchedulerAccountRollout: ok / schema-missing / read-failed are typed; non-ok selects zero", async () => {
   let s = stubFetch((rec) => {
     if (rec.url.includes("scheduler_rollout_mode")) return { json: [{ all_primary: false }] };
-    if (rec.url.includes("scheduler_account_rollout")) return { json: [{ account_id: " IN1 " }, { account_id: "" }] };
+    if (rec.url.includes("scheduler_account_rollout")) return { json: [{ account_id: "IN1" }, { account_id: "IN2" }] };
     return { json: [] };
   });
   try {
     const ok = await getSchedulerAccountRollout();
-    assert.deepEqual(ok, { read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }, "trimmed, empties dropped");
+    assert.deepEqual(ok, { read: "ok", allPrimary: false, enabledAccountIds: ["IN1", "IN2"] }, "canonical ids pass through EXACTLY (no trim, order preserved)");
   } finally { s.restore(); }
+  // A NONCANONICAL durable id (whitespace) fails the READ closed -- it is NEVER trimmed into another account.
+  for (const badId of [" IN1 ", "IN1 ", "\tIN1", "  "]) {
+    s = stubFetch((rec) => {
+      if (rec.url.includes("scheduler_rollout_mode")) return { json: [{ all_primary: false }] };
+      if (rec.url.includes("scheduler_account_rollout")) return { json: [{ account_id: "IN1" }, { account_id: badId }] };
+      return { json: [] };
+    });
+    try {
+      const nc = await getSchedulerAccountRollout();
+      assert.deepEqual(nc, { read: "noncanonical-id", allPrimary: false, enabledAccountIds: [] }, JSON.stringify(badId) + " => noncanonical-id read");
+      assert.deepEqual(resolveRolloutAccounts(nc, [IN1]).accounts, [], "noncanonical-id read selects zero");
+    } finally { s.restore(); }
+  }
   s = stubFetch(() => ({ ok: false, status: 404, json: { code: "PGRST205", message: "Could not find the table 'public.scheduler_rollout_mode' in the schema cache" } }));
   try {
     const miss = await getSchedulerAccountRollout();
@@ -597,48 +640,89 @@ test("(D2) getSchedulerPublishApproval: approved only on an exact approved=true 
   try { assert.deepEqual(await getSchedulerPublishApproval(SM, "IN1"), { read: "read-failed", approved: false }); } finally { s.restore(); }
 });
 
-test("(D3) publishLiveSnapshotIfNewer: insert-if-absent, strictly-older guarded PATCH, one natural-key row only", async () => {
-  const args = { reportKey: SM, accountId: "IN1", paramsHash: "h".repeat(40), params: { reportVersion: SM + "-v1", to: "2026-08-14" }, payload: { ok: true }, payloadBytes: 11, sourceRefreshedAt: SHADOW_TS };
-  // (a) inserted: the row did not exist.
-  let s = stubFetch(() => ({ json: [{ report_key: SM }] }));
+test("(D3) publishLiveSnapshotIfNewer CAS: insert / strictly-older replace / newer-live / equal-freshness identity", async () => {
+  const CAND_PARAMS = { reportVersion: SM + "-v1", to: "2026-08-14" };
+  const CAND_PAYLOAD = { ok: true, rows: [1, 2, 3] };
+  const args = { reportKey: SM, accountId: "IN1", paramsHash: "h".repeat(40), params: CAND_PARAMS, payload: CAND_PAYLOAD, payloadBytes: 20, sourceRefreshedAt: SHADOW_TS };
+  const OLDER = "2026-08-10T00:00:00.000Z";
+  const NEWER = "2026-08-20T00:00:00.000Z";
+  // A dispatcher keyed by request KIND (insert POST / readLive GET / PATCH / storage GET). `live` is the row
+  // the readLive GET returns; `storagePayload` is what a storage GET returns (or throws when `storageFail`).
+  const casStub = ({ insert = [], live = null, patch = [], storagePayload, storageFail = false }) => stubFetch((rec) => {
+    if (rec.method === "POST") return { json: insert };
+    if (rec.method === "PATCH") return { json: patch };
+    if (rec.url.includes("/storage/v1/object/")) return storageFail ? { ok: false, status: 500 } : { json: storagePayload === undefined ? null : storagePayload };
+    return { json: live == null ? [] : [live] }; // readLive GET
+  });
+
+  // (a) INSERTED: absent row -> a single insert-if-absent write, natural-key targeted, no read/patch.
+  let s = casStub({ insert: [{ report_key: SM }] });
   try {
     const r = await publishLiveSnapshotIfNewer(args);
-    assert.deepEqual(r, { outcome: "inserted", liveRefreshedAt: SHADOW_TS });
+    assert.deepEqual(r, { outcome: "inserted" });
     assert.equal(s.calls.length, 1, "one write, nothing else");
     assert.ok(s.calls[0].url.includes("on_conflict=report_key,account_id,params_hash"), "natural-key conflict target");
     assert.equal(s.calls[0].headers.Prefer, "resolution=ignore-duplicates,return=representation", "idempotent insert");
-    assert.equal(s.calls[0].body.report_key, SM);
-    assert.equal(s.calls[0].body.account_id, "IN1");
-    assert.equal(s.calls[0].body.source_refreshed_at, SHADOW_TS);
   } finally { s.restore(); }
-  // (b) replaced: conflict, live row strictly OLDER -- the guarded PATCH targets ONLY the one natural-key
-  //     row. The scenario starts from an older STORAGE-BACKED live row: a successful replacement writes the
-  //     inline payload AND explicitly clears payload_storage_path, so no stale storage pointer can survive
-  //     beside the new inline payload.
-  s = stubFetch((rec, n) => (n === 1 ? { json: [] } : { json: [{ report_key: SM, payload_storage_path: null }] }));
+
+  // (b) REPLACED: conflict, live STRICTLY OLDER. insert(empty) -> readLive(older) -> guarded PATCH clears the
+  //     storage pointer and writes the inline payload; the lt filter pins it to a strictly-older row.
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: null, payload_storage_path: "old/obj.json", source_refreshed_at: OLDER }, patch: [{ report_key: SM }] });
   try {
     const r = await publishLiveSnapshotIfNewer(args);
-    assert.equal(r.outcome, "replaced");
-    assert.equal(s.calls[1].method, "PATCH");
-    const patchUrl = decodeURIComponent(s.calls[1].url);
-    assert.ok(patchUrl.includes("report_key=eq." + SM), "pinned to the exact report");
-    assert.ok(patchUrl.includes("account_id=eq.IN1"), "pinned to the exact account");
-    assert.ok(patchUrl.includes("params_hash=eq." + args.paramsHash), "pinned to the exact params identity");
+    assert.deepEqual(r, { outcome: "replaced" });
+    const patch = s.calls.find((c) => c.method === "PATCH");
+    const patchUrl = decodeURIComponent(patch.url);
+    assert.ok(patchUrl.includes("report_key=eq." + SM) && patchUrl.includes("account_id=eq.IN1") && patchUrl.includes("params_hash=eq." + args.paramsHash), "pinned to the ONE natural-key row");
     assert.ok(patchUrl.includes("source_refreshed_at=lt." + SHADOW_TS), "replaces ONLY a strictly-older live row");
-    assert.ok(Object.prototype.hasOwnProperty.call(s.calls[1].body, "payload_storage_path"), "the PATCH body carries the pointer column explicitly");
-    assert.equal(s.calls[1].body.payload_storage_path, null, "replacement CLEARS the storage pointer (an older storage-backed row cannot keep serving its old object)");
-    assert.deepEqual(s.calls[1].body.payload, args.payload, "the inline payload is what replaced it");
+    assert.equal(patch.body.payload_storage_path, null, "replacement CLEARS the storage pointer");
+    assert.deepEqual(patch.body.payload, CAND_PAYLOAD, "the inline payload is what replaced it");
   } finally { s.restore(); }
-  // (c) skipped: conflict and NOT older -- live wins byte-identically. The guarded PATCH matched ZERO rows
-  //     (its strictly-older filter excluded the equal/newer row), so the ONLY calls are the idempotent
-  //     insert attempt, the zero-row PATCH, and a plain read-back -- no write ever touched the live row.
-  s = stubFetch((rec, n) => (n <= 2 ? { json: [] } : { json: [{ source_refreshed_at: "2026-08-20T00:00:00.000Z" }] }));
+
+  // (c) NEWER-LIVE: conflict, live STRICTLY NEWER -> zero write (insert + readLive only, no PATCH).
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: CAND_PAYLOAD, payload_storage_path: null, source_refreshed_at: NEWER } });
   try {
     const r = await publishLiveSnapshotIfNewer(args);
-    assert.deepEqual(r, { outcome: "skipped", liveRefreshedAt: "2026-08-20T00:00:00.000Z" });
-    assert.equal(s.calls.length, 3, "exactly insert-attempt + guarded PATCH + read-back");
-    assert.equal(s.calls[2].method, "GET", "the third call is a read, never a write");
-    assert.ok(decodeURIComponent(s.calls[1].url).includes("source_refreshed_at=lt." + SHADOW_TS), "the equal/newer live row was excluded by the strictly-older filter (byte-identical)");
+    assert.deepEqual(r, { outcome: "newer-live" });
+    assert.ok(!s.calls.some((c) => c.method === "PATCH"), "a strictly-newer live row is NEVER patched");
+  } finally { s.restore(); }
+
+  // (d) ALREADY-CURRENT: EQUAL freshness + canonically identical params (reordered keys) + identical inline
+  //     payload -> zero write. Proves equality is PROVEN, not assumed from the timestamp.
+  s = casStub({ insert: [], live: { params: { to: "2026-08-14", reportVersion: SM + "-v1" }, payload: { rows: [1, 2, 3], ok: true }, payload_storage_path: null, source_refreshed_at: SHADOW_TS } });
+  try {
+    const r = await publishLiveSnapshotIfNewer(args);
+    assert.deepEqual(r, { outcome: "already-current" });
+    assert.ok(!s.calls.some((c) => c.method === "PATCH"), "no write when already current");
+  } finally { s.restore(); }
+
+  // (e) PUBLISH-CONFLICT: EQUAL freshness but DIFFERENT payload -> zero write, live LKG untouched.
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: { ok: true, rows: [9, 9, 9] }, payload_storage_path: null, source_refreshed_at: SHADOW_TS } });
+  try {
+    assert.deepEqual(await publishLiveSnapshotIfNewer(args), { outcome: "conflict" });
+    assert.ok(!s.calls.some((c) => c.method === "PATCH"), "an equal-timestamp content mismatch is NEVER overwritten");
+  } finally { s.restore(); }
+
+  // (f) PUBLISH-CONFLICT: EQUAL freshness but DIFFERENT params -> zero write.
+  s = casStub({ insert: [], live: { params: { reportVersion: SM + "-v1", to: "2026-08-13" }, payload: CAND_PAYLOAD, payload_storage_path: null, source_refreshed_at: SHADOW_TS } });
+  try { assert.deepEqual(await publishLiveSnapshotIfNewer(args), { outcome: "conflict" }); } finally { s.restore(); }
+
+  // (g) STORAGE-BACKED live row at EQUAL freshness, hydrated identical -> already-current (no write).
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: null, payload_storage_path: "live/obj.json", source_refreshed_at: SHADOW_TS }, storagePayload: { ok: true, rows: [1, 2, 3] } });
+  try {
+    assert.deepEqual(await publishLiveSnapshotIfNewer(args), { outcome: "already-current" });
+    assert.ok(s.calls.some((c) => c.url.includes("/storage/v1/object/")), "the live storage payload was HYDRATED for comparison");
+  } finally { s.restore(); }
+
+  // (h) STORAGE-BACKED live row at EQUAL freshness, hydrated DIFFERENT -> conflict (no write).
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: null, payload_storage_path: "live/obj.json", source_refreshed_at: SHADOW_TS }, storagePayload: { ok: true, rows: [4, 5, 6] } });
+  try { assert.deepEqual(await publishLiveSnapshotIfNewer(args), { outcome: "conflict" }); } finally { s.restore(); }
+
+  // (i) STORAGE UNREADABLE at EQUAL freshness -> cannot prove identity -> conflict (fail closed, no write).
+  s = casStub({ insert: [], live: { params: CAND_PARAMS, payload: null, payload_storage_path: "live/obj.json", source_refreshed_at: SHADOW_TS }, storageFail: true });
+  try {
+    assert.deepEqual(await publishLiveSnapshotIfNewer(args), { outcome: "conflict" });
+    assert.ok(!s.calls.some((c) => c.method === "PATCH"), "an unprovable equal-timestamp row is never overwritten");
   } finally { s.restore(); }
 });
 
@@ -785,14 +869,41 @@ test("(E5) publish EXACTLY ONCE with the EXACT live identity the frontend reads"
   assert.equal(res.liveReportKey, SM);
 });
 
-test("(E6) a REPLAY is idempotent and a NEWER live snapshot always wins; a transport failure is a typed safe disposition", async () => {
-  const replay = await pub({ publishRes: { outcome: "skipped", liveRefreshedAt: SHADOW_TS } });
-  assert.equal(replay.res.disposition, "already-current", "same timestamp => replay, no duplicate");
-  const newer = await pub({ publishRes: { outcome: "skipped", liveRefreshedAt: "2026-08-20T00:00:00.000Z" } });
+test("(E6) the CAS outcome maps to the typed disposition: replay idempotent, newer-live wins, EQUAL-freshness content mismatch => publish-conflict; transport failure is typed-safe", async () => {
+  // The primitive already decided against the REAL live row; the publisher only maps its typed outcome.
+  const replay = await pub({ publishRes: { outcome: "already-current" } });
+  assert.equal(replay.res.disposition, "already-current", "proven-identical replay => no duplicate");
+  const newer = await pub({ publishRes: { outcome: "newer-live" } });
   assert.equal(newer.res.disposition, "newer-live", "a newer live row is never overwritten");
+  // EQUAL source_refreshed_at but DIFFERENT content is NOT assumed to be a replay -> publish-conflict (zero
+  // write, live LKG byte-identical). A fresh shadow cycle with newer source evidence is the safe remediation.
+  const conflict = await pub({ publishRes: { outcome: "conflict" } });
+  assert.equal(conflict.res.disposition, "publish-conflict", "equal-timestamp content mismatch => publish-conflict, never a blind overwrite");
+  assert.equal(conflict.res.liveReportKey, SM, "typed-safe identity only -- no payload/path/digest leaked");
   const failed = await pub({ publishThrows: true });
   assert.equal(failed.res.disposition, "publish-failed");
   assert.deepEqual(Object.keys(failed.res).sort(), ["accountId", "disposition", "reportKey"], "typed safe fields ONLY -- no raw error leaks");
+});
+
+test("(E6b) HASH PROVENANCE: the loaded shadow.params must RECOMPUTE to job.snapshot_params_hash (an unchanged row hash + mutated params fails)", async () => {
+  // (a) same row params_hash + MUTATED params (so paramsHashFor(params) != the hash) => invalid-snapshot.
+  const mutated = { ...mkPubDeps().shadow, params: { ...SHADOW_PARAMS, to: "2026-08-13" } }; // hash field still JOB_HASH
+  const a = await pub({ shadow: mutated });
+  assert.equal(a.res.disposition, "invalid-snapshot", "row hash unchanged but params no longer derive it => rejected");
+  assert.equal(a.calls.publish.length, 0);
+  // (b) params whose reportVersion does NOT derive the claimed hash => invalid-snapshot (recompute mismatch),
+  //     even though the version also fails the derivation-version check -- provenance is proven independently.
+  const wrongVer = { ...mkPubDeps().shadow, params: { ...SHADOW_PARAMS, reportVersion: SM + "/v2d-9" } };
+  const b = await pub({ shadow: wrongVer });
+  assert.equal(b.res.disposition, "invalid-snapshot");
+  // (c) the row's params_hash echoes the job hash but the RECOMPUTE differs (params tampered post-save) =>
+  //     still invalid even if we force the row hash to match: recompute is the independent third check.
+  const forced = { ...mkPubDeps().shadow, params_hash: JOB_HASH, params: { ...SHADOW_PARAMS, to: "2026-08-12" } };
+  const c = await pub({ shadow: forced, job: { cycle_id: "cyc-1", validated: true, snapshot_params_hash: JOB_HASH, derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded" } });
+  assert.equal(c.res.disposition, "invalid-snapshot", "recompute(params) != job hash => rejected before hydration/publish");
+  // (d) the GENUINE job-linked snapshot (recompute == row hash == job hash) still publishes.
+  const ok = await pub({});
+  assert.equal(ok.res.disposition, "published");
 });
 
 test("(E7) every observed disposition is in the typed PUBLISH_DISPOSITIONS contract", () => {
@@ -853,18 +964,22 @@ const realReadFile = (name) => readFileSync(name === "supabase.js"
   ? path.join(ROOT, "lib", "server", "supabase.js")
   : path.join(MIGRATION_DIR, name), "utf8");
 
-test("(EM1) the REAL migration 6 proves every DB-enforced constraint: nonblank ids, dd-secondary rejection, audited decisions", () => {
+test("(EM1) the REAL migration 6 proves every DB-enforced constraint: nonblank + CANONICAL ids, dd-secondary rejection, audited decisions", () => {
   const audit = auditSchemaContract({ readFile: realReadFile });
   assert.equal(audit.ok, true, "the full schema contract audits clean: " + JSON.stringify(audit.blockers));
   const m6 = audit.matrix.find((m) => m.migration === "20260816_account_rollout.sql");
   const constraintNames = m6.tables.flatMap((t) => t.namedConstraints.map((c) => `${t.name}.${c.name}:${c.proven}`));
   assert.deepEqual(constraintNames, [
     "scheduler_account_rollout.scheduler_account_rollout_account_id_nonblank:true",
+    "scheduler_account_rollout.scheduler_account_rollout_account_id_canonical:true",
     "scheduler_account_rollout.scheduler_account_rollout_account_id_primary_only:true",
     "scheduler_rollout_mode.scheduler_rollout_mode_singleton:true",
     "scheduler_publish_approvals.scheduler_publish_approvals_report_key_nonblank:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_report_key_canonical:true",
     "scheduler_publish_approvals.scheduler_publish_approvals_account_id_nonblank:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_account_id_canonical:true",
     "scheduler_publish_approvals.scheduler_publish_approvals_account_id_primary_only:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_approved_by_canonical:true",
     "scheduler_publish_approvals.scheduler_publish_approvals_audited:true",
   ], "every table-scoped constraint proof passes against the real migration");
 });
@@ -884,6 +999,43 @@ test("(EM2) an UNAUDITED/weakened approvals schema FAILS the contract (blank dec
   const noPrefix = auditSchemaContract({ readFile: tamper((t) => t.replace(/,\s*constraint scheduler_account_rollout_account_id_primary_only check \(account_id not like 'dd-secondary:%'\)/, "")) });
   assert.equal(noPrefix.ok, false);
   assert.ok(noPrefix.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.table === "scheduler_account_rollout"), "dropping the prefix rejection is a typed blocker");
+});
+
+test("(EM3) each CANONICAL-identity constraint is table-scoped, exact, and MANDATORY (removal fails the contract)", () => {
+  const real6 = realReadFile("20260816_account_rollout.sql");
+  const tamper = (mutate) => (name) => (name === "20260816_account_rollout.sql" ? mutate(real6) : realReadFile(name));
+  // Baseline: all four canonical constraints prove against the real migration.
+  const CANON = [
+    ["scheduler_account_rollout", "scheduler_account_rollout_account_id_canonical", "account_id = btrim(account_id)"],
+    ["scheduler_publish_approvals", "scheduler_publish_approvals_report_key_canonical", "report_key = btrim(report_key)"],
+    ["scheduler_publish_approvals", "scheduler_publish_approvals_account_id_canonical", "account_id = btrim(account_id)"],
+    ["scheduler_publish_approvals", "scheduler_publish_approvals_approved_by_canonical", "approved_by = btrim(approved_by)"],
+  ];
+  const base = auditSchemaContract({ readFile: realReadFile });
+  for (const [table, name] of CANON) {
+    const row = base.matrix.find((m) => m.migration === "20260816_account_rollout.sql").tables.find((t) => t.name === table);
+    assert.ok(row.namedConstraints.some((c) => c.name === name && c.proven), name + " proves for " + table);
+  }
+  // (a) MANDATORY: removing ANY canonical constraint (literal, name-scoped) => NAMED_CONSTRAINT_MISSING for
+  //     its OWN table. The name is in the literal, so the two identical `account_id = btrim(account_id)`
+  //     bodies (one per table) are removed INDEPENDENTLY -- proving each is table-scoped.
+  for (const [table, name, body] of CANON) {
+    const decl = `constraint ${name} check (${body})`;
+    assert.ok(real6.includes(decl), name + " declaration is present verbatim in the migration");
+    const removed = auditSchemaContract({ readFile: tamper((t) => t.replace(decl, "")) });
+    assert.equal(removed.ok, false, name + " removal must fail the contract");
+    assert.ok(removed.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.table === table && b.constraints.includes(name)), name + " => typed blocker on " + table);
+    // The OTHER table's identically-bodied canonical constraint is UNAFFECTED (table-scoped removal).
+    const otherCanon = CANON.find(([t2, n2]) => n2 !== name && t2 !== table && base.matrix);
+    if (otherCanon) assert.ok(!removed.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.constraints && b.constraints.includes(otherCanon[1])), "removing " + name + " leaves other-table canonical constraints intact");
+  }
+  // (b) EXACT: the allowlist canonical check WEAKENED to a tautology (btrim(x) = btrim(x)) fails the token
+  //     comparison (name-scoped literal so ONLY that constraint changes).
+  const weakened = auditSchemaContract({ readFile: tamper((t) => t.replace(
+    "constraint scheduler_account_rollout_account_id_canonical check (account_id = btrim(account_id))",
+    "constraint scheduler_account_rollout_account_id_canonical check (btrim(account_id) = btrim(account_id))")) });
+  assert.equal(weakened.ok, false);
+  assert.ok(weakened.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.constraints.includes("scheduler_account_rollout_account_id_canonical")), "a weakened canonical body fails the EXACT token comparison");
 });
 
 // =================================================================================================
@@ -936,6 +1088,28 @@ test("(F2) each params builder emits the EXACT live params shape and fails close
   for (const k of Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS)) {
     assert.equal(lp(k, {}), null, k + ": missing planned params fail closed");
     assert.equal(lp(k, { from: "2026-7-1", to: "2026-8-14" }), null, k + ": malformed dates fail closed");
+  }
+});
+
+test("(F2b) STRICT calendar-date validation: impossible dates and reversed from/to fail; leap-day + boundaries pass", () => {
+  const lp = (k, p) => SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[k].liveParams(p);
+  const RANGE = ["brand-sales", "reconciliation", "sku-pl", "daily-reporting"]; // { from, to } contracts
+  const TO = ["keyword-rank", "fba-plan", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"]; // { to } contracts
+  // IMPOSSIBLE dates are rejected everywhere (2026-02-30, 2026-13-01, non-leap Feb 29, 0000-00-00, bad shape).
+  for (const bad of ["2026-02-30", "2026-13-01", "2026-00-10", "2026-02-29", "0000-00-00", "2026-8-14", "2026-08-1", "20260814", "2026-08-14 ", ""]) {
+    for (const k of TO) assert.equal(lp(k, { to: bad }), null, k + ": impossible `to` " + JSON.stringify(bad) + " fails closed");
+    for (const k of RANGE) assert.equal(lp(k, { from: "2026-07-01", to: bad }), null, k + ": impossible `to` " + JSON.stringify(bad) + " fails closed");
+    for (const k of RANGE) assert.equal(lp(k, { from: bad, to: "2026-08-14" }), null, k + ": impossible `from` " + JSON.stringify(bad) + " fails closed");
+  }
+  // REVERSED from/to (from > to) is rejected; from == to is allowed (a single-day window).
+  for (const k of RANGE) {
+    assert.equal(lp(k, { from: "2026-08-14", to: "2026-07-01" }), null, k + ": reversed from/to fails closed");
+    assert.ok(lp(k, { from: "2026-08-14", to: "2026-08-14" }), k + ": from == to (single day) is allowed");
+  }
+  // LEAP DAY (real) + calendar BOUNDARIES pass everywhere.
+  for (const good of ["2024-02-29", "2026-01-01", "2026-12-31"]) {
+    for (const k of TO) assert.ok(lp(k, { to: good }), k + ": valid date " + good + " passes");
+    for (const k of RANGE) assert.ok(lp(k, { from: "2020-01-01", to: good }), k + ": valid range end " + good + " passes");
   }
 });
 
@@ -996,6 +1170,8 @@ async function loadModules() {
   ({ SCHEDULER_V2_READY_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ paramsHashFor } = await import("../lib/server/report-store.js"));
+  // The GENUINE snapshot hash for the fixture params, from the SAME hasher the saver + publisher use.
+  JOB_HASH = paramsHashFor(SHADOW_PARAMS.reportVersion, SHADOW_PARAMS);
   ({ getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer } = await import("../lib/server/supabase.js"));
   const sm = await import("../lib/server/reports/sales-movers.js");
   const lh = await import("../lib/server/reports/listing-health.js");

@@ -9,6 +9,10 @@
 //   - default durable state (no rows, all_primary=false) => ZERO accounts;
 //   - allowlist mode (all_primary=false)       => ONLY discovered PRIMARY accounts whose EXACT public id has
 //                                                 an enabled=true row; stale/unknown rows select nothing;
+//   - NONCANONICAL durable id (leading/trailing whitespace, or blank) => ZERO accounts (never silently
+//                                                 trimmed into another account -- Migration 6 + the reader
+//                                                 already guarantee canonical ids; this is the shared
+//                                                 last-line defense for every caller);
 //   - all-primary mode (all_primary=true)      => EVERY discovered primary account (a deliberate durable
 //                                                 switch -- newly connected primary accounts join
 //                                                 automatically with no code change);
@@ -41,9 +45,12 @@ export function resolveRolloutAccounts(rolloutState, discoveredPrimary) {
     return { accounts: primary, selectedIds: primary.map(idOf), staleIds: [], reason: "all-primary" };
   }
   const enabled = Array.isArray(rolloutState.enabledAccountIds) ? rolloutState.enabledAccountIds : [];
-  const wanted = new Set(
-    enabled.map((x) => String(x || "").trim()).filter((id) => id.length > 0 && !id.startsWith(SECONDARY_PREFIX)),
-  );
+  // Fail closed on a NONCANONICAL durable id (not a string, or not btrim-equal to itself, or blank): NEVER
+  // trim a durable id -- trimming " IN1 " into "IN1" could silently select a DIFFERENT account. A single
+  // noncanonical id makes the whole durable allowlist untrustworthy => zero accounts.
+  const noncanonical = enabled.some((x) => typeof x !== "string" || x !== x.trim() || x.trim().length === 0);
+  if (noncanonical) return { accounts: [], selectedIds: [], staleIds: [], reason: "rollout-noncanonical-id" };
+  const wanted = new Set(enabled.filter((id) => !id.startsWith(SECONDARY_PREFIX)));
   if (wanted.size === 0) return { accounts: [], selectedIds: [], staleIds: [], reason: "allowlist-empty" };
   const accounts = primary.filter((a) => wanted.has(idOf(a)));
   const matched = new Set(accounts.map(idOf));

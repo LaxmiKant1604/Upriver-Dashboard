@@ -28,9 +28,11 @@ create table if not exists public.scheduler_account_rollout (
   note text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  -- DB-enforced identity integrity: a blank id or a dd-secondary-prefixed id can never be stored, so a
-  -- malformed allowlist row cannot exist to be mis-read (the resolver rejects them too; defense in depth).
+  -- DB-enforced identity integrity: a blank id, a NONCANONICAL id (leading/trailing whitespace), or a
+  -- dd-secondary-prefixed id can never be stored, so a malformed allowlist row cannot exist to be mis-read
+  -- or silently trimmed into another account (the reader/resolver reject them too; defense in depth).
   constraint scheduler_account_rollout_account_id_nonblank check (char_length(btrim(account_id)) > 0),
+  constraint scheduler_account_rollout_account_id_canonical check (account_id = btrim(account_id)),
   constraint scheduler_account_rollout_account_id_primary_only check (account_id not like 'dd-secondary:%')
 );
 
@@ -63,8 +65,13 @@ create table if not exists public.scheduler_publish_approvals (
   updated_at timestamptz not null default now(),
   primary key (report_key, account_id),
   constraint scheduler_publish_approvals_report_key_nonblank check (char_length(btrim(report_key)) > 0),
+  constraint scheduler_publish_approvals_report_key_canonical check (report_key = btrim(report_key)),
   constraint scheduler_publish_approvals_account_id_nonblank check (char_length(btrim(account_id)) > 0),
+  constraint scheduler_publish_approvals_account_id_canonical check (account_id = btrim(account_id)),
   constraint scheduler_publish_approvals_account_id_primary_only check (account_id not like 'dd-secondary:%'),
+  -- Every publish DECISION is auditable AND canonically attributed: approved_by carries WHO with no
+  -- leading/trailing whitespace, approved_at carries WHEN.
+  constraint scheduler_publish_approvals_approved_by_canonical check (approved_by = btrim(approved_by)),
   constraint scheduler_publish_approvals_audited check (char_length(btrim(approved_by)) > 0 and approved_at is not null)
 );
 

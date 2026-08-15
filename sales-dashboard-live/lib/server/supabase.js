@@ -1402,19 +1402,24 @@ export async function recordAdsCoverageWindows(rows) {
 
 /**
  * Gate-7 DURABLE ACCOUNT ROLLOUT state (20260816_account_rollout.sql -- PREPARED). Typed + FAIL-CLOSED:
- *   { read: "ok"|"schema-missing"|"read-failed", allPrimary: boolean, enabledAccountIds: string[] }
+ *   { read: "ok"|"schema-missing"|"read-failed"|"noncanonical-id", allPrimary: boolean, enabledAccountIds: string[] }
  * A non-"ok" read MUST select zero accounts (the resolver enforces it); default durable state (no rows,
- * all_primary=false) also selects zero. Never throws; never returns a partial/guessed state as "ok".
+ * all_primary=false) also selects zero. The enabled ids are returned EXACTLY as stored -- NEVER trimmed: a
+ * durable id must already be canonical (Migration 6 enforces account_id = btrim(account_id) + nonblank), so a
+ * NONCANONICAL id here (leading/trailing whitespace or blank) means the integrity constraint is absent or was
+ * bypassed. Rather than silently trim it into a DIFFERENT account, the whole read fails closed
+ * ("noncanonical-id" => zero accounts). Never throws; never returns a partial/guessed state as "ok".
  */
 export async function getSchedulerAccountRollout() {
   try {
     const modeRows = await request("/rest/v1/scheduler_rollout_mode?select=all_primary&id=eq.1");
     const allowRows = await request("/rest/v1/scheduler_account_rollout?select=account_id&enabled=eq.true&order=account_id.asc");
     const allPrimary = !!(modeRows && modeRows[0] && modeRows[0].all_primary === true);
-    const enabledAccountIds = (allowRows || [])
-      .map((r) => String(r.account_id || "").trim())
-      .filter((id) => id.length > 0);
-    return { read: "ok", allPrimary, enabledAccountIds };
+    const rawIds = (allowRows || []).map((r) => (r && typeof r.account_id === "string" ? r.account_id : ""));
+    // Fail closed on a NONCANONICAL durable id (never silently trim it into another account).
+    const noncanonical = rawIds.some((v) => v !== v.trim() || v.trim().length === 0);
+    if (noncanonical) return { read: "noncanonical-id", allPrimary: false, enabledAccountIds: [] };
+    return { read: "ok", allPrimary, enabledAccountIds: rawIds };
   } catch (error) {
     return {
       read: isSchemaMissingError(error) ? "schema-missing" : "read-failed",
@@ -1444,58 +1449,122 @@ export async function getSchedulerPublishApproval(reportKey, accountId) {
   }
 }
 
+// Deterministic canonical JSON: recursively sort object keys so two structurally-identical values always
+// stringify to the SAME string regardless of key insertion order. Used ONLY to compare a candidate snapshot
+// against the existing live row at EQUAL source freshness -- the result never leaves this module (only a
+// typed outcome is returned; a payload/path/digest is never handed to a caller).
+function canonicalJsonString(value) {
+  const sortDeep = (v) => {
+    if (Array.isArray(v)) return v.map(sortDeep);
+    if (v && typeof v === "object") {
+      const o = {};
+      for (const k of Object.keys(v).sort()) o[k] = sortDeep(v[k]);
+      return o;
+    }
+    return v;
+  };
+  return JSON.stringify(sortDeep(value));
+}
+
 /**
- * Gate-7 shadow-to-live CAS publish primitive on the natural key (report_key, account_id, params_hash):
- *   1. INSERT-IF-ABSENT (ignore-duplicates + representation): inserted => { outcome: "inserted" }.
- *   2. On conflict, a GUARDED PATCH that replaces the row ONLY when the existing live
- *      source_refreshed_at is STRICTLY OLDER than the incoming snapshot's -- so a replay can never
- *      duplicate a publish and a NEWER live snapshot always wins. Skipped => reads the live row's
- *      source_refreshed_at so the caller can classify already-current vs newer-live.
+ * Gate-7 shadow-to-live CAS publish primitive on the natural key (report_key, account_id, params_hash).
+ * Returns ONLY a typed outcome -- never a payload, storage path, digest, or raw DB response:
+ *   1. INSERT-IF-ABSENT (ignore-duplicates + representation): the row was absent => { outcome: "inserted" }.
+ *   2. On conflict, READ the existing live row (params + payload + storage pointer + source_refreshed_at)
+ *      and classify by SOURCE FRESHNESS, fail-closed:
+ *        - live source_refreshed_at STRICTLY OLDER  => guarded PATCH (CAS-filtered on `lt`) replaces it and
+ *          CLEARS payload_storage_path (inline payload wins) => { outcome: "replaced" };
+ *        - live STRICTLY NEWER                       => { outcome: "newer-live" } (zero write);
+ *        - live EQUAL freshness + canonically IDENTICAL params AND payload (the live payload is HYDRATED from
+ *          storage when the row is storage-backed) => { outcome: "already-current" } (zero write);
+ *        - live EQUAL freshness but DIFFERENT params/payload/storage content, OR the live payload cannot be
+ *          proven identical (unreadable storage / missing content / uncomparable timestamps)
+ *          => { outcome: "conflict" } (zero write, live LKG byte-identical -- an equal timestamp is NEVER an
+ *          unconditional overwrite; the safe remediation is a fresh shadow cycle with NEWER source evidence).
  * Touches ONLY the one (report_key, account_id, params_hash) row -- never another account/report. Throws on
- * transport failure (the caller maps to a typed safe disposition).
+ * transport failure (the caller maps it to a typed safe disposition).
  */
 export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt }) {
+  const candTs = String(sourceRefreshedAt ?? "").trim();
+  const candParams = params || {};
+  const candPayload = payload == null ? null : payload;
   const body = {
     report_key: reportKey,
     account_id: accountId,
     params_hash: paramsHash,
-    params: params || {},
-    payload: payload || null,
+    params: candParams,
+    payload: candPayload,
     payload_storage_path: null,
     payload_bytes: payloadBytes || 0,
     source_refreshed_at: sourceRefreshedAt,
   };
+  // 1) INSERT-IF-ABSENT. Only inserts when the natural-key row does not yet exist.
   const inserted = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
     method: "POST",
     headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
     body,
   });
-  if (Array.isArray(inserted) && inserted.length > 0) return { outcome: "inserted", liveRefreshedAt: sourceRefreshedAt };
-  const filter = new URLSearchParams({
-    report_key: `eq.${reportKey}`,
-    account_id: `eq.${accountId}`,
-    params_hash: `eq.${paramsHash}`,
-    source_refreshed_at: `lt.${sourceRefreshedAt}`,
-  });
-  const replaced = await request(`/rest/v1/report_snapshots?${filter}`, {
-    method: "PATCH",
-    headers: { Prefer: "return=representation" },
-    // The replacement writes the INLINE payload, so the storage pointer MUST be cleared explicitly: a
-    // strictly-older live row that was storage-backed would otherwise keep a stale payload_storage_path
-    // beside the new inline payload and readers could serve the OLD stored object.
-    body: { params: body.params, payload: body.payload, payload_storage_path: null, payload_bytes: body.payload_bytes, source_refreshed_at: body.source_refreshed_at },
-  });
-  if (Array.isArray(replaced) && replaced.length > 0) return { outcome: "replaced", liveRefreshedAt: sourceRefreshedAt };
-  // Neither inserted nor replaced: the live row exists and is NOT older. Read its timestamp for classification.
-  const check = new URLSearchParams({
-    select: "source_refreshed_at",
-    report_key: `eq.${reportKey}`,
-    account_id: `eq.${accountId}`,
-    params_hash: `eq.${paramsHash}`,
-    limit: "1",
-  });
-  const rows = await request(`/rest/v1/report_snapshots?${check}`);
-  return { outcome: "skipped", liveRefreshedAt: rows && rows[0] ? rows[0].source_refreshed_at : null };
+  if (Array.isArray(inserted) && inserted.length > 0) return { outcome: "inserted" };
+
+  // 2) The row exists: READ its full identity so the CAS decision is made on real content, never assumed.
+  const readLive = async () => {
+    const q = new URLSearchParams({
+      select: "params,payload,payload_storage_path,source_refreshed_at",
+      report_key: `eq.${reportKey}`,
+      account_id: `eq.${accountId}`,
+      params_hash: `eq.${paramsHash}`,
+      limit: "1",
+    });
+    const rows = await request(`/rest/v1/report_snapshots?${q}`);
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  };
+  const live = await readLive();
+  if (!live) return { outcome: "conflict" }; // vanished between insert and read -> fail closed, no write
+
+  // EQUAL-or-NEWER classifier: EQUAL freshness demands PROVEN content identity (params AND payload, the live
+  // payload hydrated from storage when needed); anything unprovable is a conflict, never an overwrite.
+  const classifyNonOlder = async (row) => {
+    const liveTs = String(row.source_refreshed_at ?? "").trim();
+    if (liveTs === "" || candTs === "") return { outcome: "conflict" }; // uncomparable freshness -> fail closed
+    if (liveTs > candTs) return { outcome: "newer-live" };
+    if (liveTs !== candTs) return { outcome: "conflict" }; // strictly older reached here only via a race -> no blind write
+    // EQUAL freshness: prove params AND payload are canonically identical.
+    if (canonicalJsonString(row.params) !== canonicalJsonString(candParams)) return { outcome: "conflict" };
+    let livePayload = row.payload;
+    if (livePayload == null && String(row.payload_storage_path ?? "").trim() !== "") {
+      try {
+        livePayload = await getReportSnapshotStoragePayload(String(row.payload_storage_path).trim());
+      } catch (_e) {
+        return { outcome: "conflict" }; // unreadable live storage -> cannot prove identity -> no write
+      }
+    }
+    if (livePayload == null || candPayload == null) return { outcome: "conflict" };
+    if (canonicalJsonString(livePayload) !== canonicalJsonString(candPayload)) return { outcome: "conflict" };
+    return { outcome: "already-current" };
+  };
+
+  const liveTs = String(live.source_refreshed_at ?? "").trim();
+  if (liveTs !== "" && candTs !== "" && liveTs < candTs) {
+    // STRICTLY OLDER: guarded replacement. The `lt` filter keeps this a CAS -- if a concurrent write advanced
+    // the row to >= candidate between our read and this PATCH, it matches ZERO rows and we re-classify (never
+    // a blind overwrite). The inline payload wins, so payload_storage_path is cleared explicitly.
+    const filter = new URLSearchParams({
+      report_key: `eq.${reportKey}`,
+      account_id: `eq.${accountId}`,
+      params_hash: `eq.${paramsHash}`,
+      source_refreshed_at: `lt.${sourceRefreshedAt}`,
+    });
+    const replaced = await request(`/rest/v1/report_snapshots?${filter}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: { params: candParams, payload: candPayload, payload_storage_path: null, payload_bytes: body.payload_bytes, source_refreshed_at: sourceRefreshedAt },
+    });
+    if (Array.isArray(replaced) && replaced.length > 0) return { outcome: "replaced" };
+    const live2 = await readLive();
+    if (!live2) return { outcome: "conflict" };
+    return classifyNonOlder(live2);
+  }
+  return classifyNonOlder(live);
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per

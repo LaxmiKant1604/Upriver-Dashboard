@@ -212,12 +212,14 @@ export async function runSchedulerV2Shadow({
   }
   const rolloutState = await loadAccountRollout();
   {
-    // Probe the resolver with an EMPTY directory so the state's own normalization decides: a failed read,
-    // or an allowlist with no VALID id (blank / dd-secondary-prefixed rows are dropped by the same shared
-    // implementation), can never select an account -- so neither spends even the read-only discovery call.
+    // Probe the resolver with an EMPTY directory so the state's own normalization decides: a failed read, a
+    // NONCANONICAL durable id, or an allowlist with no VALID id (blank / dd-secondary-prefixed rows are
+    // dropped by the same shared implementation) can never select an account -- so none of them spends even
+    // the read-only discovery call.
     const probe = resolveRolloutAccounts(rolloutState, []);
-    if (probe.reason === "rollout-read-not-ok" || probe.reason === "allowlist-empty") {
-      return drainedNoOp({ accountRollout: { selected: 0, reason: probe.reason === "rollout-read-not-ok" ? "rollout-read-not-ok" : "zero-accounts-enabled" } });
+    if (probe.reason === "rollout-read-not-ok" || probe.reason === "rollout-noncanonical-id" || probe.reason === "allowlist-empty") {
+      const drainReason = probe.reason === "allowlist-empty" ? "zero-accounts-enabled" : probe.reason;
+      return drainedNoOp({ accountRollout: { selected: 0, reason: drainReason } });
     }
   }
 
