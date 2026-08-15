@@ -9465,3 +9465,43 @@ byte-identical, all Gate-7 code/tests unchanged.
   hashes recomputed unchanged; git diff --check clean; only SCHEDULER_V2_ROLLOUT.md + PROJECT_MEMORY.md changed.
 
 STOP for Codex re-review + explicit human approval. Do not execute Gate 7a.
+
+## Scheduler v2 Gate 7a Appendix W — final documentation blockers fixed (docs-only, 2026-08-15); Migration 6 still UNAPPLIED
+
+Four final Gate 7a documentation blockers fixed OFFLINE, docs-only. No production connection; nothing executed.
+Migration 6 UNAPPLIED (SHA-256 0d715eb...ba4a735 unchanged), migrations 1-5 byte-identical, all Gate-7 code/
+tests unchanged.
+
+- BLOCKER 1 (exact Migration-6 column contract): W.4 now validates an EXACT ordered contract for all 15 columns
+  across the three tables (COLUMN_CONTRACT) -- ordinal position, column name, PostgreSQL data_type, is_nullable,
+  and normalized default (casts + whitespace normalized) -- replacing the old count + partial spot-checks. Any
+  missing/renamed/reordered/extra/wrongly-typed/-nullable/-defaulted column throws a typed STOP; colTotal must be
+  15. Expected: account_rollout(account_id text NN nodef, enabled bool NN false, note text NULL, created_at/
+  updated_at tstz NN now()); rollout_mode(id smallint NN 1, all_primary bool NN false, updated_at tstz NN now());
+  publish_approvals(report_key/account_id text NN nodef, approved bool NN false, approved_by/approved_at NN
+  nodef, created_at/updated_at tstz NN now()).
+- BLOCKER 2 (known pre-apply lifecycle + no-append trigger OID/tgtype): W.1 asserts EXACTLY five sync_cycles
+  (CYCLES) before capturing the digest -- ids 57afc1fb(succeeded 2/2/0,1/1/0), 56422a66(partial 57/44/13,13/2/11
+  us C1), ac4cba6f(partial 56/39/17,13/3/10 non-us C1), b0415a5b(partial 135/84/51,13/4/9 us C2),
+  c70879e8(succeeded 133/133/0,13/13/0 non-us C2) -- exact status + counters, every finished_at non-null, no
+  extra/running cycle. Both W.1 and W.4 no-append trigger loops now additionally prove exact public table OID
+  (tgrelid=$::regclass + rel_ok), exact guard fn OID (tgfoid=to_regprocedure), tgenabled='O', and tgtype=23
+  (ROW|BEFORE|INSERT|UPDATE). W.4 also re-asserts the five terminal cycles post-apply (no cycle created).
+- BLOCKER 3 (cron in W.4): added the same fail-closed cron.job assertion to the W.4 runner that W.1 uses
+  (to_regclass('cron.job') then count) so W.4 actually proves no Scheduler-v2 schedule rather than only claiming
+  it; prose updated to say both W.1 and W.4 run the real check.
+- BLOCKER 4 (status header): replaced the stale 'one canary cycle' current-state claim with the FIVE recorded
+  terminal cycles (Gate-5 canary + two Gate-6 Cycle-1 + two Gate-6 Cycle-2), each with id/status/source+report
+  counters and non-null finished_at; noted their shadow snapshots live only under scheduler-v2/*. Historical
+  sections (Appendix L/N/O/P/T) unchanged; the five-cycle counters match the Appendix P (56422a66/ac4cba6f) and
+  Appendix T (b0415a5b/c70879e8) finalization tables exactly.
+- Preserved (all approved hardening): genuine read-only W.1/W.4 (BEGIN; SET TRANSACTION READ ONLY; finally
+  ROLLBACK); public/OID scoping; payload-free count+content digest before/after commit; complete owner/
+  service_role ACL before commit; single advisory-locked transaction (pg_advisory_xact_lock(20260816,1)); frozen
+  single migration; plain ledger INSERT; Migration-6 SHA 0d715eb...ba4a735; migrations 1-5 byte-identical; empty
+  readiness allowlist; 13 paused controls; no db:migrate/retry/repair/DROP.
+- Validation: all 3 embedded Node runners pass node --check (no ${ interpolation, balanced parens); 50 doc ```
+  fences balanced; all six frozen migration hashes recomputed unchanged; git diff --check clean; only
+  SCHEDULER_V2_ROLLOUT.md + PROJECT_MEMORY.md changed.
+
+STOP for Codex re-review + explicit human approval. Do not execute Gate 7a.

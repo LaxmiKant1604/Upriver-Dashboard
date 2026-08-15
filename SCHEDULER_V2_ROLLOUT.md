@@ -5,13 +5,16 @@ been EXECUTED (SUCCESS) and its cycle RECONCILED to `succeeded` via Appendix N (
 Scheduler v2 otherwise remains in SHADOW MODE and closed: it is **locked** (the code readiness allowlist
 `SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable `report_sync_settings` rows have
 `schedule_enabled=false`), **undeployed**, and **unscheduled** (no `pg_cron`/`pg_net` kickoff applied; no cron
-sync job). **Exact current operational state:** the Scheduler-v2 tables hold **one canary cycle** (`sync_cycles`:
-1 row, `(non-us, 2026-08-14)`, id `57afc1fb-…`) — now **terminal `status='succeeded'`** with `finished_at`
-`2026-08-14T16:34:30.312782Z` and authoritative counters `source 2/2/0`, `report 1/1/0` (Appendix N.4) — **two
-succeeded source jobs**, **one report job**, and **two owner memberships** (all byte-unchanged by the
-reconciliation); there is **exactly one `scheduler-v2/brand-sales` shadow snapshot** (and exactly one
-`scheduler-v2/*` snapshot globally); the canary spent **exactly two DataDoe create-exports total** (one Order
-Line Items, one Product Catalog `68d2de238e`; the reconciliation spent ZERO); the production Brand Sales
+sync job). **Exact current operational state (FIVE terminal cycles; NO cycle running):** the Scheduler-v2
+`sync_cycles` table holds **exactly five rows**, each terminal (`succeeded`/`partial`) with a non-null
+`finished_at` — the Gate-5 canary + the two Gate-6 Cycle-1 + the two Gate-6 Cycle-2 shadow cycles:
+`57afc1fb-6694-4925-8961-4730f5a8f4df` **`succeeded`** (sources 2/2/0, reports 1/1/0 — Gate-5 canary, Appendix N.4);
+`56422a66-9f23-43c9-9c8d-8a9427f8f36a` **`partial`** (sources 57/44/13, reports 13/2/11 — Gate-6 Cycle-1 us, Appendix P);
+`ac4cba6f-3214-4d9b-9be7-35c572890edf` **`partial`** (sources 56/39/17, reports 13/3/10 — Gate-6 Cycle-1 non-us, Appendix P);
+`b0415a5b-3926-48b0-885e-5dfb61489d74` **`partial`** (sources 135/84/51, reports 13/4/9 — Gate-6 Cycle-2 us, Appendix T);
+`c70879e8-006b-4dba-9896-813106b5aa74` **`succeeded`** (sources 133/133/0, reports 13/13/0 — Gate-6 Cycle-2 non-us, Appendix T).
+Their shadow snapshots live ONLY under the `scheduler-v2/*` namespace (never a production `report_snapshots`
+key); the production Brand Sales
 `report_snapshots` fingerprint is **byte-identical** (`cba3fb26…`, 7 rows — unchanged through the canary, the
 Migration-5 gate, AND the reconciliation); and `report_sync_settings` still contains **exactly the 13 seeded
 control rows, all `schedule_enabled=false`**. No control unlock, deployment, schedule, route, or frontend change
@@ -3370,9 +3373,12 @@ migration present, so no schedule can be applied here regardless. No `DROP`, no 
 
 `gate7a-w1-inventory.mjs` runs inside `BEGIN; SET TRANSACTION READ ONLY` and **always ROLLBACKs** (in a
 `finally`, even when an assertion throws), so it can never write. Every existence/absence check is scoped to the
-exact `public` OID. It captures and PRINTS the unchanged-data **BASELINE** (`cycles_count`/`cycles_digest`/
-`snap_count`/`snap_digest`) — record that line; W.4 re-checks against it. **STOP on any thrown assertion** (the
-exact reason prints); do not apply.
+exact `public` OID; each Migration-5 no-append trigger is proven on its exact table OID + guard-function OID with
+`tgenabled='O'` and `tgtype=23`. Before capturing the baseline it asserts the **KNOWN lifecycle: EXACTLY the five
+recorded terminal cycles** (ids / status / source+report counters / non-null `finished_at`, no extra or running
+cycle). It then captures and PRINTS the unchanged-data **BASELINE** (`cycles_count`/`cycles_digest`/`snap_count`/
+`snap_digest`) — record that line; W.4 re-checks against it. **STOP on any thrown assertion** (the exact reason
+prints); do not apply.
 
 ```bash
 cat > gate7a-w1-inventory.mjs <<'NODE'
@@ -3392,6 +3398,14 @@ const NOAPPEND = [["sync_source_jobs_no_append_terminal","public.sync_source_job
                   ["sync_source_job_owners_no_append_terminal","public.sync_source_job_owners"],
                   ["sync_report_jobs_no_append_terminal","public.sync_report_jobs"]];
 const OPS = { sync_cycles:18, sync_source_jobs:27, sync_report_jobs:25, sync_source_job_owners:15 };
+// The KNOWN pre-apply lifecycle: exactly these five terminal cycles [status, s_total,s_ok,s_fail, r_total,r_ok,r_fail].
+const CYCLES = {
+  "57afc1fb-6694-4925-8961-4730f5a8f4df": ["succeeded", 2, 2, 0, 1, 1, 0],
+  "56422a66-9f23-43c9-9c8d-8a9427f8f36a": ["partial", 57, 44, 13, 13, 2, 11],
+  "ac4cba6f-3214-4d9b-9be7-35c572890edf": ["partial", 56, 39, 17, 13, 3, 10],
+  "b0415a5b-3926-48b0-885e-5dfb61489d74": ["partial", 135, 84, 51, 13, 4, 9],
+  "c70879e8-006b-4dba-9896-813106b5aa74": ["succeeded", 133, 133, 0, 13, 13, 0],
+};
 // Deterministic unchanged-data digest: per-row md5 over the WHOLE row (payload content included), aggregated in
 // a stable order. Only the 32-char md5 is emitted -- NEVER a payload/path.
 const DIGEST_SQL =
@@ -3447,10 +3461,14 @@ try {
   ok((await c.query("select to_regprocedure('public.finalize_sync_cycle(uuid)') o")).rows[0].o !== null, "finalize_sync_cycle(uuid) missing");
   ok((await c.query("select to_regprocedure('public.reject_append_to_terminal_cycle()') o")).rows[0].o !== null, "reject_append_to_terminal_cycle() missing");
   for (const [trig, tbl] of NOAPPEND) {
-    const r = (await c.query("select (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok" +
+    const r = (await c.query("select t.tgenabled, t.tgtype, (t.tgrelid = $2::regclass) rel_ok," +
+      " (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok" +
       " from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
     ok(r.length === 1, "no-append trigger " + trig + " not found on exactly " + tbl);
-    ok(r[0].fn_ok === true, trig + " does not execute public.reject_append_to_terminal_cycle");
+    ok(r[0].rel_ok === true, trig + " not on the exact public table OID " + tbl);
+    ok(r[0].fn_ok === true, trig + " does not execute public.reject_append_to_terminal_cycle by OID");
+    ok(r[0].tgenabled === "O", trig + " not enabled (tgenabled=" + r[0].tgenabled + ")");
+    ok(Number(r[0].tgtype) === 23, trig + " tgtype=" + r[0].tgtype + " (expected 23 = ROW|BEFORE|INSERT|UPDATE)");
   }
 
   // Exactly 13 report controls, ALL paused.
@@ -3464,11 +3482,26 @@ try {
   if (cronInstalled) cronJobs = (await c.query("select count(*)::int c from cron.job")).rows[0].c;
   ok(cronJobs === 0, cronJobs + " cron job(s) present (expected 0)");
 
+  // KNOWN pre-apply lifecycle: EXACTLY the five recorded terminal cycles, exact counters, every finished_at
+  // non-null, and NO extra cycle -- validated BEFORE the baseline digest is captured/trusted.
+  const cyc = (await c.query("select id::text id, status s, source_total st, source_succeeded ss, source_failed sf," +
+    " report_total rt, report_succeeded rs, report_failed rf, (finished_at is not null) fin from public.sync_cycles")).rows;
+  ok(cyc.length === 5, "expected EXACTLY 5 sync_cycles, got " + cyc.length);
+  for (const id of Object.keys(CYCLES)) ok(cyc.some((r) => r.id === id), "missing expected sync_cycle " + id);
+  for (const r of cyc) {
+    const e = CYCLES[r.id];
+    ok(e !== undefined, "unexpected sync_cycle " + r.id);
+    ok(r.s === e[0], r.id + " status " + r.s + " (expected " + e[0] + ")");
+    ok(Number(r.st) === e[1] && Number(r.ss) === e[2] && Number(r.sf) === e[3], r.id + " source counters " + [r.st, r.ss, r.sf] + " (expected " + [e[1], e[2], e[3]] + ")");
+    ok(Number(r.rt) === e[4] && Number(r.rs) === e[5] && Number(r.rf) === e[6], r.id + " report counters " + [r.rt, r.rs, r.rf] + " (expected " + [e[4], e[5], e[6]] + ")");
+    ok(r.fin === true, r.id + " finished_at is null (expected terminal)");
+  }
+
   // BASELINE unchanged-data digests (payload content hashed; NEVER printed). RECORD this line for W.4.
   const b = (await c.query(DIGEST_SQL)).rows[0];
   console.log("BASELINE cycles_count=" + b.cycles_count + " cycles_digest=" + b.cycles_digest +
               " snap_count=" + b.snap_count + " snap_digest=" + b.snap_digest);
-  console.log("W.1 INVENTORY PASS -- all pre-apply invariants hold; transaction rolls back (read-only).");
+  console.log("W.1 INVENTORY PASS -- five terminal cycles + all pre-apply invariants hold; transaction rolls back (read-only).");
 } finally {
   await c.query("rollback").catch(() => {});
   await c.end();
@@ -3604,8 +3637,13 @@ rm gate7a-w2-apply.mjs
 ### W.4 Post-apply read-only verification (genuinely read-only; rolls back always)
 
 `gate7a-w4-verify.mjs` runs inside `BEGIN; SET TRANSACTION READ ONLY` and **always ROLLBACKs** (in a `finally`),
-scoping every check to the exact `public` OID. Provide the W.1 BASELINE via env vars so the unchanged-data
-re-check is exact:
+scoping every check to the exact `public` OID. It validates the **exact ordered 15-column contract** (ordinal
+position, name, PostgreSQL type, nullability, normalized default) across the three tables, the 11 CHECK
+constraints + PKs, the singleton row + empty data tables, the three touch triggers (BEFORE-UPDATE-FOR-EACH-ROW,
+`tgtype=19`, executing `public.scheduler_rollout_touch` by OID), RLS + zero policies, the complete
+owner/`service_role` ACL, the Migration-1–5 objects (incl. each no-append trigger's OID / `tgenabled='O'` /
+`tgtype=23`), the **five recorded terminal cycles**, the paused 13 controls, the **`cron.job` fail-closed
+check**, and the unchanged-data digest. Provide the W.1 BASELINE via env vars so the digest re-check is exact:
 
 ```bash
 export W1_CYCLES_COUNT=<from W.1>  W1_CYCLES_DIGEST=<from W.1>  W1_SNAP_COUNT=<from W.1>  W1_SNAP_DIGEST=<from W.1>
@@ -3616,7 +3654,37 @@ const PRIOR = ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","202
                "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql"];
 const M6_TABLES = ["public.scheduler_account_rollout","public.scheduler_rollout_mode","public.scheduler_publish_approvals"];
 const SHORT = ["scheduler_account_rollout","scheduler_rollout_mode","scheduler_publish_approvals"];
-const COLS = { scheduler_account_rollout:5, scheduler_rollout_mode:3, scheduler_publish_approvals:7 };
+// EXACT ordered column contract for all 15 columns: [name, PostgreSQL type, is_nullable, normalized default].
+const COLUMN_CONTRACT = {
+  scheduler_account_rollout: [
+    ["account_id", "text", "NO", null],
+    ["enabled", "boolean", "NO", "false"],
+    ["note", "text", "YES", null],
+    ["created_at", "timestamp with time zone", "NO", "now()"],
+    ["updated_at", "timestamp with time zone", "NO", "now()"],
+  ],
+  scheduler_rollout_mode: [
+    ["id", "smallint", "NO", "1"],
+    ["all_primary", "boolean", "NO", "false"],
+    ["updated_at", "timestamp with time zone", "NO", "now()"],
+  ],
+  scheduler_publish_approvals: [
+    ["report_key", "text", "NO", null],
+    ["account_id", "text", "NO", null],
+    ["approved", "boolean", "NO", "false"],
+    ["approved_by", "text", "NO", null],
+    ["approved_at", "timestamp with time zone", "NO", null],
+    ["created_at", "timestamp with time zone", "NO", "now()"],
+    ["updated_at", "timestamp with time zone", "NO", "now()"],
+  ],
+};
+const CYCLES = {
+  "57afc1fb-6694-4925-8961-4730f5a8f4df": ["succeeded", 2, 2, 0, 1, 1, 0],
+  "56422a66-9f23-43c9-9c8d-8a9427f8f36a": ["partial", 57, 44, 13, 13, 2, 11],
+  "ac4cba6f-3214-4d9b-9be7-35c572890edf": ["partial", 56, 39, 17, 13, 3, 10],
+  "b0415a5b-3926-48b0-885e-5dfb61489d74": ["partial", 135, 84, 51, 13, 4, 9],
+  "c70879e8-006b-4dba-9896-813106b5aa74": ["succeeded", 133, 133, 0, 13, 13, 0],
+};
 const OPS = { sync_cycles:18, sync_source_jobs:27, sync_report_jobs:25, sync_source_job_owners:15 };
 const PK = { scheduler_account_rollout:"PRIMARY KEY (account_id)", scheduler_rollout_mode:"PRIMARY KEY (id)",
              scheduler_publish_approvals:"PRIMARY KEY (report_key, account_id)" };
@@ -3661,19 +3729,28 @@ try {
   await c.query("begin");
   await c.query("set transaction read only");
 
-  // Tables present + exact column counts + key defaults/nullability.
-  for (const [t, n] of Object.entries(COLS)) {
+  // EXACT ordered column contract -- ordinal position, name, PostgreSQL type, nullability, normalized default --
+  // for ALL 15 columns across the three tables. Any missing/renamed/reordered/extra/wrongly-typed/-nullable/
+  // -defaulted column throws a typed STOP. (Casts like ::smallint and surrounding whitespace are normalized.)
+  const normDefault = (d) => (d === null || d === undefined ? null : String(d).replace(/::[a-z ]+/g, "").replace(/\s+/g, " ").trim().toLowerCase());
+  let colTotal = 0;
+  for (const [t, contract] of Object.entries(COLUMN_CONTRACT)) {
     ok((await c.query("select to_regclass($1) o", ["public." + t])).rows[0].o !== null, t + " table missing");
-    const cc = (await c.query("select count(*)::int c from information_schema.columns where table_schema='public' and table_name=$1", [t])).rows[0].c;
-    ok(cc === n, t + " has " + cc + " columns (expected " + n + ")");
+    const rows = (await c.query("select ordinal_position op, column_name cn, data_type dt, is_nullable nu, column_default cd" +
+      " from information_schema.columns where table_schema='public' and table_name=$1 order by ordinal_position", [t])).rows;
+    ok(rows.length === contract.length, t + " has " + rows.length + " columns (expected " + contract.length + ")");
+    colTotal += rows.length;
+    for (let i = 0; i < contract.length; i++) {
+      const [name, type, nullable, def] = contract[i];
+      const r = rows[i];
+      ok(Number(r.op) === i + 1, t + "." + name + " ordinal " + r.op + " (expected " + (i + 1) + ")");
+      ok(r.cn === name, t + " column #" + (i + 1) + " is " + r.cn + " (expected " + name + ")");
+      ok(r.dt === type, t + "." + name + " type " + r.dt + " (expected " + type + ")");
+      ok(r.nu === nullable, t + "." + name + " nullability " + r.nu + " (expected " + nullable + ")");
+      ok(normDefault(r.cd) === normDefault(def), t + "." + name + " default [" + r.cd + "] (expected [" + (def === null ? "no default" : def) + "])");
+    }
   }
-  const col = async (t, cn) => (await c.query("select is_nullable, column_default from information_schema.columns where table_schema='public' and table_name=$1 and column_name=$2", [t, cn])).rows[0];
-  ok((await col("scheduler_account_rollout", "enabled")).column_default === "false", "enabled default != false");
-  ok((await col("scheduler_rollout_mode", "all_primary")).column_default === "false", "all_primary default != false");
-  ok((await col("scheduler_rollout_mode", "id")).column_default === "1", "id default != 1");
-  ok((await col("scheduler_publish_approvals", "approved")).column_default === "false", "approved default != false");
-  ok((await col("scheduler_publish_approvals", "approved_by")).is_nullable === "NO", "approved_by must be NOT NULL");
-  ok((await col("scheduler_publish_approvals", "approved_at")).is_nullable === "NO", "approved_at must be NOT NULL");
+  ok(colTotal === 15, "expected 15 columns across the 3 tables, got " + colTotal);
 
   // PKs, scoped by conrelid OID.
   for (const [t, def] of Object.entries(PK)) {
@@ -3735,20 +3812,45 @@ try {
   for (const [t, n] of Object.entries(OPS)) ok((await c.query("select count(*)::int c from information_schema.columns where table_schema='public' and table_name=$1", [t])).rows[0].c === n, t + " column count changed");
   ok((await c.query("select to_regprocedure('public.finalize_sync_cycle(uuid)') o")).rows[0].o !== null, "finalize_sync_cycle missing");
   for (const [trig, tbl] of NOAPPEND) {
-    const r = (await c.query("select (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
-    ok(r.length === 1 && r[0].fn_ok === true, "no-append trigger " + trig + " changed/missing on " + tbl);
+    const r = (await c.query("select t.tgenabled, t.tgtype, (t.tgrelid = $2::regclass) rel_ok," +
+      " (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok" +
+      " from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
+    ok(r.length === 1, "no-append trigger " + trig + " changed/missing on " + tbl);
+    ok(r[0].rel_ok === true, trig + " not on the exact public table OID " + tbl);
+    ok(r[0].fn_ok === true, trig + " does not execute public.reject_append_to_terminal_cycle by OID");
+    ok(r[0].tgenabled === "O", trig + " not enabled (tgenabled=" + r[0].tgenabled + ")");
+    ok(Number(r[0].tgtype) === 23, trig + " tgtype=" + r[0].tgtype + " (expected 23 = ROW|BEFORE|INSERT|UPDATE)");
   }
 
   // 13 controls paused.
   const ctrl = (await c.query("select count(*)::int total, count(*) filter (where schedule_enabled)::int enabled from public.report_sync_settings")).rows[0];
   ok(ctrl.total === 13 && ctrl.enabled === 0, "controls total=" + ctrl.total + " enabled=" + ctrl.enabled + " (expected 13/0)");
 
+  // No Scheduler-v2 pg_cron schedule (same fail-closed check as W.1; W.4 independently proves it post-apply).
+  const cronInstalled = (await c.query("select to_regclass('cron.job') is not null e")).rows[0].e;
+  let cronJobs = 0;
+  if (cronInstalled) cronJobs = (await c.query("select count(*)::int c from cron.job")).rows[0].c;
+  ok(cronJobs === 0, cronJobs + " cron job(s) present (expected 0)");
+
+  // NO cycle created by Gate 7a: EXACTLY the five recorded terminal cycles remain, counters unchanged.
+  const cyc = (await c.query("select id::text id, status s, source_total st, source_succeeded ss, source_failed sf," +
+    " report_total rt, report_succeeded rs, report_failed rf, (finished_at is not null) fin from public.sync_cycles")).rows;
+  ok(cyc.length === 5, "expected EXACTLY 5 sync_cycles post-apply, got " + cyc.length);
+  for (const id of Object.keys(CYCLES)) ok(cyc.some((r) => r.id === id), "missing expected sync_cycle " + id);
+  for (const r of cyc) {
+    const e = CYCLES[r.id];
+    ok(e !== undefined, "unexpected sync_cycle " + r.id);
+    ok(r.s === e[0] && Number(r.st) === e[1] && Number(r.ss) === e[2] && Number(r.sf) === e[3] &&
+       Number(r.rt) === e[4] && Number(r.rs) === e[5] && Number(r.rf) === e[6] && r.fin === true,
+       r.id + " terminal state changed");
+  }
+
   // Unchanged-data digest re-check vs the W.1 BASELINE (independent, after commit).
   for (const k of ["cycles_count", "cycles_digest", "snap_count", "snap_digest"]) ok(EXPECT[k] !== undefined && EXPECT[k] !== "", "set W1_" + k.toUpperCase() + " from the W.1 BASELINE before running W.4");
   const now = (await c.query(DIGEST_SQL)).rows[0];
   for (const k of ["cycles_count", "cycles_digest", "snap_count", "snap_digest"]) ok(String(now[k]) === String(EXPECT[k]), "unchanged-data drift in " + k + " (W.1 baseline " + EXPECT[k] + " != post-commit " + now[k] + ")");
 
-  console.log("W.4 VERIFY PASS -- Migration-6 objects exact; ACL owner+service_role only; data plane byte-identical to the W.1 baseline; migrations 1-5 + 13 paused controls intact; transaction rolls back (read-only).");
+  console.log("W.4 VERIFY PASS -- 15-column contract exact; ACL owner+service_role only; data plane byte-identical to the W.1 baseline; five terminal cycles + migrations 1-5 + 13 paused controls intact; no cron; transaction rolls back (read-only).");
 } finally {
   await c.query("rollback").catch(() => {});
   await c.end();
@@ -3762,8 +3864,9 @@ rm gate7a-w4-verify.mjs
   is still `Object.freeze([])`. This is a **code** invariant (no DB object); Gate 7a cannot change it.
 - **No publisher invocation / DataDoe call / cycle creation / schedule:** Gate 7a runs ONLY the migration DDL +
   one ledger INSERT. The W.2 in-transaction digest compare + the W.4 post-commit re-check prove `sync_cycles` and
-  every `scheduler-v2/*` `report_snapshots` row are byte-identical (content-hashed), so no cycle was opened and no
-  snapshot changed; W.1/W.4 prove no Scheduler-v2 `pg_cron` schedule.
+  every `scheduler-v2/*` `report_snapshots` row are byte-identical (content-hashed); W.4 additionally re-asserts
+  the **exact five terminal cycles** (so no cycle was opened) and runs the **same fail-closed `cron.job` check as
+  W.1** (so no Scheduler-v2 schedule exists) — both are real runner assertions, not prose claims.
 
 ### W.5 STOP conditions (every mismatch halts Gate 7a; report the exact shape, do not repair in place)
 
@@ -3772,7 +3875,9 @@ rm gate7a-w4-verify.mjs
 - **Pre-apply (W.1):** any thrown `STOP:` — Migration-6 ledger row present or a migration-1–5 count ≠ 1; any
   Migration-6 table/function/trigger/constraint already present in `public`; a prerequisite missing; an
   operational table absent or a column count ≠ 18/27/25/15; `finalize_sync_cycle` missing or a no-append trigger
-  not OID-mapped to its exact table+guard function; controls total ≠ 13 or enabled ≠ 0; a `cron.job` present →
+  not OID-mapped to its exact table+guard function, not `tgenabled='O'`, or `tgtype≠23`; **not EXACTLY the five
+  recorded terminal cycles (ids / status / source+report counters / non-null `finished_at`) — any extra, missing,
+  miscounted, or still-running cycle**; controls total ≠ 13 or enabled ≠ 0; a `cron.job` present →
   **STOP; do not apply; capture the exact reason.**
 - **Apply (W.2):** the runner refuses (rolls back, NO ledger row) on — frozen SHA-256 mismatch; a prerequisite not
   recorded exactly once; Migration 6 already recorded; any target object already present; **any `sync_cycles` /
@@ -3780,16 +3885,18 @@ rm gate7a-w4-verify.mjs
   owner or `service_role`, or `service_role` not holding exactly SELECT+INSERT+UPDATE**; any DDL error; a
   duplicate ledger PK. **On ANY refusal, STOP and report; never retry with `db:migrate`, never `DROP` to
   "repair", never force.**
-- **Post-apply (W.4):** any thrown `STOP:` — a column/default/nullability deviation; a wrong PK; ≠ 11 CHECK
-  constraints, an unexpected/renamed constraint, any `convalidated=false`, or a normalized body mismatch (the
-  printed `got [...]` shows the exact serialization); the rollout-mode row not exactly `(1,false)` or not exactly
-  one row; any rollout/approval row present; a trigger not BEFORE-UPDATE-FOR-EACH-ROW (`tgtype≠19`) / not enabled
-  / not executing `public.scheduler_rollout_touch` by OID; the function missing or wrong return/language; RLS not
-  enabled on all three; ANY policy present; an unexpected ACL grantee or `service_role` privileges ≠
-  SELECT+INSERT+UPDATE; Migration-6 ledger ≠ 1 or a migration-1–5 count ≠ 1; a migration-1–5 object changed;
-  controls ≠ 13/0; or the unchanged-data digest ≠ the W.1 baseline → **STOP. The migration transaction already
-  committed, so do NOT attempt a destructive rollback/DROP — capture the deviation and escalate for reviewed
-  remediation.**
+- **Post-apply (W.4):** any thrown `STOP:` — **any of the 15 columns wrong by ordinal position / name /
+  PostgreSQL type / nullability / normalized default (missing, renamed, reordered, extra, wrongly typed,
+  nullable, or defaulted)**; a wrong PK; ≠ 11 CHECK constraints, an unexpected/renamed constraint, any
+  `convalidated=false`, or a normalized body mismatch (the printed `got [...]` shows the exact serialization); the
+  rollout-mode row not exactly `(1,false)` or not exactly one row; any rollout/approval row present; a touch
+  trigger not BEFORE-UPDATE-FOR-EACH-ROW (`tgtype≠19`) / not enabled / not executing `public.scheduler_rollout_touch`
+  by OID; the function missing or wrong return/language; RLS not enabled on all three; ANY policy present; an
+  unexpected ACL grantee or `service_role` privileges ≠ SELECT+INSERT+UPDATE; Migration-6 ledger ≠ 1 or a
+  migration-1–5 count ≠ 1; a migration-1–5 object changed or a no-append trigger not `tgenabled='O'`/`tgtype=23`/
+  OID-mapped; **not EXACTLY the five recorded terminal cycles**; a `cron.job` present; controls ≠ 13/0; or the
+  unchanged-data digest ≠ the W.1 baseline → **STOP. The migration transaction already committed, so do NOT
+  attempt a destructive rollback/DROP — capture the deviation and escalate for reviewed remediation.**
 
 ### W.6 Zero-production-side-effect confirmation (THIS preparation turn)
 
