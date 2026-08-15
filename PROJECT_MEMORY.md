@@ -9737,3 +9737,39 @@ hashes. Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix Z.
 
 STOP after Brand Sales verification, per authorization. Remaining 12 reports paused/unapproved; USA excluded
 (Y.5); no cron created.
+
+## Scheduler v2 Gate 7b PHASE 2 ATTEMPT 2026-08-15 — HALTED at Phase C by a DataDoe timeout; step-17 rollback; NOTHING published
+
+Authorized Phase 2: generate/validate/publish the remaining 12 reports for the IN account; no deploy, no schedule.
+Outcome: HALTED at Phase C (shadow-cycle gate) by a DataDoe export-timeout blocker; rolled back per step 17; nothing
+published. Production stays exact merge commit 0ea9f34 (deploy p7un5uel8); brand-sales/IN stays live. Full evidence:
+SCHEDULER_V2_ROLLOUT.md Appendix AA.
+
+- PHASE A (preflight) PASS: alias -> p7un5uel8/0ea9f34 HTTP200; durable exact (1 IN rollout, all_primary=false, 1
+  approval brand-sales/IN, brand-sales=true + 12 false, no cron); fresh discovery (30 active) = 1 active primary IN;
+  PPC coverage proven asOf 2026-08-14 window [2026-07-16..2026-08-14] 2 required sources proven+folded single
+  currency; npm run verify 39/19 green; git diff --check clean. Baselines: IN live 9 rows (16eae8af), non-IN live
+  164 rows (cc9c2c91).
+- PHASE B PASS: enabled exactly the 12 report_sync_settings (brand-sales stays true) => 13/13; no cron; no approvals.
+- PHASE C FAILED: one manual shadow cycle (non-us / cycleDate 2026-08-18 / asOf 2026-08-14) for the 12 + IN only,
+  bounded slices resuming the same cycle dfca8f75. Plan fanned out to 122 canonical source jobs (settlements×30,
+  sales-traffic-asin-date×33, order-line-items×29, profit-by-sku-date×11, returns×9, product-catalog×5, etc.).
+  Per-slice isolation held (IN-only, <=12 keys, cec<=1, no orphan source job, no non-IN work, live snapshots
+  unchanged). BLOCKER: daily-reporting REQUIRED source sales-traffic-asin-date (request_key
+  daily-reporting:asin-day-superset) had 3 slices FAIL -- create-export TIMEOUT (x2) + poll EXPORT_ERROR (x1),
+  terminal=false, cec=1. A FAILED source job is skipped on resume and NEVER retried (source-worker execute loop
+  line ~352). daily-reporting optionalRequestKeys=[] (all required) + exact-sliced-superset derive => it cannot
+  reach validated+succeeded in this cycle. No retry/fallback/second cycle authorized. Nature: DataDoe infra timeout
+  (same class as Gate-6 Cycle-2 USA timeouts, Appendix Q.4/T.6), NOT a code defect.
+- STEP-17 ROLLBACK (executed): 12 settings -> schedule_enabled=false; brand-sales stays true (1/13 enabled); rollout
+  unchanged (1 IN enabled, all_primary=false); approvals unchanged (brand-sales/IN only -- none ever added for the
+  12); no cron. LKG preserved: IN live 9 rows (16eae8af) + non-IN live 164 rows (cc9c2c91) byte-identical to
+  preflight; no snapshot deleted/overwritten. Shadow cycle dfca8f75 left intact (shadow namespace only, zero live
+  impact; cannot finalize while non-drained; no further DataDoe spent).
+- Guardrails honored: no code change; no deploy/push/merge; no USA; no all_primary; no cron; no DataDoe
+  retry/fallback; no obsolete Product Catalog id; no snapshot/LKG deletion. Phases D/E not reached.
+
+STOP for review. Phase 2 cannot complete under this authorization (a required daily-reporting source timed out at
+DataDoe; no retry permitted). Next (separate authorization): re-attempt one fresh bounded shadow cycle for the 12 +
+IN when DataDoe sales-traffic-asin-date is stable, and/or resolve Appendix-Q.4 DataDoe stability for the large
+sliced sources. brand-sales/IN remains live and correct.

@@ -4255,3 +4255,63 @@ phased steps A→D, each behind its own read-only verification. Every runner was
 **STOP.** Per the authorization, execution halted after Brand Sales verification. The remaining 12 reports stay
 paused + unapproved; USA stays excluded (Y.5); no cron was created. Rollback levers (Y.3) remain available and
 reversible with no data loss.
+
+## Appendix AA — Gate 7b PHASE 2 ATTEMPT (2026-08-15 — remaining-12 IN cutover; HALTED at Phase C by a DataDoe timeout; step-17 rollback; NOTHING published)
+
+**Authorized scope (Phase 2):** generate, validate, and publish the remaining **12** reports for the proven **IN
+account** — **no deployment, no scheduling** — one report at a time behind read-only verification. Outcome:
+**HALTED at Phase C** by a DataDoe export-timeout blocker; per step 17 the 12 settings were returned to false and
+**nothing was published**. Production code stays the exact merge commit `0ea9f34` (deploy `p7un5uel8`); brand-sales
+for IN stays live and untouched.
+
+### AA.A Preflight (read-only) — PASS
+- Production alias `upriverdashboard.vercel.app` → deploy `p7un5uel8` (merge tree `0ea9f34`), HTTP 200.
+- Durable state exact: rollout = 1 enabled IN (`all_primary=false`); approvals = 1 (`brand-sales`/IN); settings
+  `brand-sales=true` + other 12 false; no `pg_cron`.
+- Fresh primary discovery (30 active) revalidated exactly one active PRIMARY IN match = the enabled rollout id.
+- Payload-free fingerprints captured: IN live = 9 rows (`16eae8af…`, across brand-catalog:1, brand-sales:3,
+  listing-health:1, listing-optimizer:1, ppc-performance:1, returns-leakage:1, sales-movers:1); non-IN live = 164
+  rows (`cc9c2c91…`).
+- PPC durable coverage proven for asOf `2026-08-14` (window `[2026-07-16..2026-08-14]`, 2 required sources
+  proven+folded, single currency, latestMetricDate 2026-08-14).
+- `npm run verify` green (39 steps / 19 suites incl. build:check); `git diff --check` clean.
+
+### AA.B Prepare the 12 — PASS
+- `report_sync_settings.schedule_enabled=true` set for exactly the 12 (brand-sales stays true) ⇒ **13/13 enabled**;
+  no cron; no scheduled trigger; **no approvals inserted** (Phase C precedes any approval). Enabling settings alone
+  dispatches/publishes nothing.
+
+### AA.C One bounded combined shadow cycle — FAILED (DataDoe timeout) → step-17 rollback
+- Ran one manual Scheduler-v2 SHADOW cycle for exactly the 12 + IN only: bucket `non-us`, cycleDate `2026-08-18`,
+  asOf `2026-08-14`, bounded slices (`maxJobs=40`, ~90s deadline), resuming the same cycle. Cycle `dfca8f75…`.
+- The 12-report plan fanned out to **122 canonical source jobs** (staged per-entity/per-slice sources:
+  order-line-items×29, settlements×30, sales-traffic-asin-date×33, profit-by-sku-date×11, returns×9,
+  product-catalog×5, fba-inventory-health×2, listings/listings-raw/content-changes×1). Per-slice isolation held
+  throughout (IN-only owners/jobs, ≤12 report keys, `create_export_count ≤ 1` per request_hash, no ownerless
+  source jobs, no non-IN work, live snapshots unchanged).
+- **BLOCKER (typed):** `daily-reporting`'s REQUIRED source `sales-traffic-asin-date` (request_key
+  `daily-reporting:asin-day-superset`) had **3 slices FAIL** — `stage=create-export code=TIMEOUT` (×2) and
+  `stage=poll code=EXPORT_ERROR` (×1), each `terminal=false`, `create_export_count=1`. A **failed** source job is
+  treated as done and **skipped on resume — never retried** (`source-worker.js` execute loop). `daily-reporting`
+  declares `optionalRequestKeys: []` (ALL sources required) and its derive reconstructs the EXACT sliced superset
+  sequence, so a failed required slice means it **cannot reach `validated=true` / derive+save succeeded** in this
+  cycle. Retry / fallback / a second cycle are **not authorized** (and step 11 authorizes exactly ONE cycle).
+- **Nature:** a DataDoe export-infrastructure timeout (same class as the Gate-6 Cycle-2 USA timeouts, Appendix
+  Q.4 / T.6) — **not a code defect**. The one-attempt guard held (no duplicate create-export; `cec ≤ 1`).
+- **Step-17 rollback (executed):** returned the 12 `report_sync_settings` to `schedule_enabled=false`; **brand-sales
+  stays true** (1/13 enabled); rollout unchanged (1 IN enabled, `all_primary=false`); approvals unchanged
+  (`brand-sales`/IN only — none were ever added for the 12); no cron. **Every LKG preserved** — IN live 9 rows
+  (`16eae8af…`) and non-IN live 164 rows (`cc9c2c91…`) **byte-identical to preflight**; no snapshot deleted or
+  overwritten. The shadow cycle `dfca8f75…` is left intact (scheduler-v2/* shadow namespace only; **zero live
+  impact**; it cannot be finalized while non-drained, and no further DataDoe was spent to drain a cycle that
+  cannot pass Phase C).
+
+### AA.D Guardrails honored
+No code change; no deploy/push/merge; no USA/other-account work; no `all_primary`; no cron/scheduling; no DataDoe
+retry/fallback; no obsolete Product Catalog id; no deletion of any snapshot or LKG. Phases D/E were **not** reached.
+
+**STOP for review.** Phase 2 cannot complete under the current authorization because a required `daily-reporting`
+source timed out at DataDoe and no retry is permitted. Recommended next steps (each a SEPARATE authorization): (1)
+re-attempt one fresh bounded shadow cycle for the 12 + IN when DataDoe `sales-traffic-asin-date` is stable; and/or
+(2) resolve the Appendix-Q.4 DataDoe stability questions for the large sliced sources before retrying. brand-sales
+for IN remains live and correct throughout.
