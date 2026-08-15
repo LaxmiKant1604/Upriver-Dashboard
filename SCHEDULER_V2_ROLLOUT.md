@@ -98,12 +98,19 @@ ACL gate passed with `service_role` = EXACTLY SELECT/INSERT/UPDATE on all three 
 post-commit); the data plane is byte-identical to the W.1 baseline (digest-proven: `cycles_digest=a8c97132…`,
 `snap_digest=3c4a1ed7…`). **All three tables are EMPTY except the seeded singleton `scheduler_rollout_mode
 (1, all_primary=false)`, so the durable rollout selects ZERO accounts and NOTHING is approved — the system
-stays fully off at the data layer.** Migrations 1–5 remain byte-identical; `SCHEDULER_V2_READY_REPORT_KEYS`
-frozen empty; all 13 `report_sync_settings` rows `schedule_enabled=false`; no `pg_cron`; no
-route/frontend/deploy change. No DataDoe call, report/account enable, publish, deploy, push, merge, cron, or
-next-gate advance was performed. The next gate (Appendix V — the IN-only enable package) remains BLOCKED
-pending Codex review + a separate explicit authorization. Every remaining live step is **gated on explicit
-human approval**, one step at a time.
+stays fully off at the data layer.** Migrations 1–5 remain byte-identical; all 13 `report_sync_settings` rows
+`schedule_enabled=false`; no `pg_cron`; no route/frontend/deploy change. **GATE 7b PREPARED (2026-08-15,
+OFFLINE — NOT DEPLOYED): the reviewed code cutover flips `SCHEDULER_V2_READY_REPORT_KEYS` to EXACTLY the 13
+`CONTROLLED_REPORT_KEYS`** (the reports the IN account cleared in Gate 6). Readiness ON changes no runtime
+behavior on its own — the durable account rollout (ZERO accounts), the durable report controls (13 paused), and
+the per-(report, account) publish approval (none) still gate every dispatch/publish, proven by
+`scripts/gate7b-in-cutover.test.js` (7 checks: readiness=exactly-13; no-account zero-I/O; IN-only dispatches
+only IN; USA/others zero; paused-settings block; no auto-publish) and full `npm run verify` (39 steps / 19
+suites incl. `build:check`). **The reviewed IN-only all-13 production cutover sequence + exact rollback is
+Appendix Y; USA stays fully excluded and needs a SEPARATE per-`(report, account)` gate (Y.5).** Nothing in Gate
+7b has been deployed/published/scheduled and no production connection was made preparing it. The next gate
+(Appendix Y — Gate-7b IN cutover) remains BLOCKED pending Codex review + a separate explicit authorization.
+Every remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3098,9 +3105,12 @@ gating input for US-account stability.**
 
 Implements the account-bounded rollout foundation the T.6 judgement permits: the proven IN account can LATER
 be enabled to run and publish Scheduler-v2 reports while the US and every unrelated account remain untouched,
-with a separate explicit all-primary switch preserved for the eventual full rollout. **Everything in this
-appendix is INERT until (a) migration 6 is applied via its own reviewed gate and (b) durable rows are
-explicitly written (Appendix V) — neither has happened.** No production connection was made in Gate 7.
+with a separate explicit all-primary switch preserved for the eventual full rollout. **Migration 6 is now
+APPLIED (Gate 7a — Appendix X), so the tables/constraints/triggers exist; the foundation is still INERT at the
+DATA layer: `scheduler_account_rollout` + `scheduler_publish_approvals` are EMPTY and `scheduler_rollout_mode`
+is the seeded `(1, all_primary=false)`, so ZERO accounts are selected and NOTHING is approved.** The reviewed
+IN-only enable sequence (write the durable rows, enable settings, publish one report at a time) is the SEPARATE
+Gate-7b package (Appendix Y); Appendix V is retained as the original prepared plan.
 
 ### U.1 Migration 6 — `20260816_account_rollout.sql` (**APPLIED 2026-08-15 via Appendix X**; frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`; the `.sql` file's "PREPARED — UNAPPLIED" header comment is historical review text kept to preserve the frozen hash — the ledger row is authoritative)
 
@@ -3303,12 +3313,13 @@ HARNESS defaults (all-primary loader injection): `sync-dispatch.test.js` 37, `sy
 
 ---
 
-## Appendix V — Gate-7 IN-only rollout package (PREPARED — NOT EXECUTED)
+## Appendix V — Gate-7 IN-only rollout package (SUPERSEDED by Appendix Y; retained for history)
 
-**Nothing in this appendix has been run.** It is the exact, reviewed enable sequence a FUTURE explicitly
-authorized gate would execute, one step at a time, each with its own read-only verification. Executing it
-requires: Codex review of the Gate-7 code, explicit human approval naming the IN account, and the standing
-per-migration gate procedure (sections 1–2a).
+**SUPERSEDED:** the operational IN cutover is now the Gate-7b package in **Appendix Y** (all-13 IN cutover;
+readiness is a single reviewed CODE flip rather than a per-report readiness edit). **Migration 6 is APPLIED
+(Gate 7a — Appendix X), so this appendix's migration-apply step is DONE.** Appendix V is kept as the original
+prepared plan; execute **Appendix Y** instead. Nothing further in this appendix has been run beyond the
+already-completed migration apply.
 
 Let `IN_ACCOUNT` = the exact public account id of the proven IN primary account (`d658442d-…` — the full id
 is re-read from live discovery at execution time; never guessed or hard-coded). **Every durable id written
@@ -3316,12 +3327,12 @@ below (`account_id`, `report_key`, `approved_by`) must be CANONICAL — no leadi
 migration-6 `= btrim(...)` constraints reject a noncanonical value, and the reader/resolver fail closed on
 one rather than trimming it into a different account.**
 
-1. **Apply migration 6** (`20260816_account_rollout.sql`) via the standard single-file guarded-transaction
-   gate (advisory lock, pre/post read-only verification, ledger row). Verify: 3 tables exist, RLS enabled,
-   zero policies, `scheduler_rollout_mode` = exactly `(1, all_primary=false)`, the other two tables empty.
-   At this point the system is STILL fully off (the zero-account default, proven by tests B1/B4).
+1. **Migration 6 is already APPLIED** (`20260816_account_rollout.sql`; Gate 7a — Appendix X). The three tables
+   exist with RLS enabled, zero policies, `scheduler_rollout_mode` = exactly `(1, all_primary=false)`, and the
+   other two tables empty; `service_role` holds exactly SELECT/INSERT/UPDATE. No migration step remains here.
+   At this point the system is STILL fully off at the data layer (the zero-account default, proven by Y2).
 2. **Preflight** — run the no-side-effect runtime preflight; the migration-6 schema-contract entry and the
-   three wrappers must audit clean.
+   wrappers must audit clean.
 3. **Enable the IN account (allowlist row):** insert into `scheduler_account_rollout` the single row
    `(account_id='<IN_ACCOUNT>', enabled=true, note='Gate-7 IN-only rollout — approved <date>')`.
    Verify: exactly ONE enabled row; `all_primary` still false. Scheduled runs remain no-ops (every report is
@@ -4028,3 +4039,132 @@ rows = 1, and `service_role` = `["INSERT","SELECT","UPDATE"]` on each of the thr
 
 **STOP.** Gate 7a is complete. The next gate (Appendix V — the IN-only enable package) remains BLOCKED pending
 Codex review of this evidence and a separate explicit authorization.
+
+---
+
+## Appendix Y — Gate 7b: IN-account all-13-report production cutover (PREPARED — NOT EXECUTED)
+
+**Nothing in this appendix has been run.** It is the exact, reviewed sequence a FUTURE explicitly authorized
+gate executes to bring the **IN account only** live for **all 13 Scheduler-v2 reports**, one report at a time,
+each step behind its own read-only verification. **USA stays completely excluded** (see Y.5). Executing it
+requires: Codex review of the Gate-7b code (below), explicit human approval naming the IN account, and the
+standing gate discipline (single, reviewed, reversible steps; fail closed on any mismatch).
+
+### Y.0 Starting state (must hold before Gate 7b)
+
+- HEAD includes `63346bd`; **Migration 6 is APPLIED exactly once** (Gate 7a — Appendix X): the three tables +
+  11 constraints + touch triggers exist; RLS on, zero policies; `service_role` = exactly SELECT/INSERT/UPDATE.
+- `scheduler_account_rollout` and `scheduler_publish_approvals` are **EMPTY**; `scheduler_rollout_mode` =
+  `(1, all_primary=false)`.
+- All 13 `report_sync_settings` rows are **paused** (`schedule_enabled=false`).
+- The reviewed branch flips `SCHEDULER_V2_READY_REPORT_KEYS` to **exactly the 13 `CONTROLLED_REPORT_KEYS`** (the
+  code cutover) — but this is NOT yet deployed.
+- No Scheduler-v2 `pg_cron` schedule exists.
+- The IN account `d658442d-…` passed Gate-6 Cycle 2 with **all 13 reports succeeded** (Appendix T.3).
+
+### Y.1 The reviewed CODE change (this branch; deploy is a later step)
+
+`lib/server/sync/report-controls.js`: `SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([...CONTROLLED_REPORT_KEYS])`
+(exactly the 13 approved keys — the reports the IN account cleared in Gate 6). This is the CODE gate only.
+Readiness ON dispatches or publishes **nothing** by itself: the durable account rollout (default ZERO accounts),
+the durable `report_sync_settings` (all paused), and the per-(report, account) publish approval (none) all remain
+closed. The no-side-effect preflight's `v2ControlsLocked` check is updated to fail closed only on an
+**unexpected/non-approved** ready key or a report scheduled with EMPTY durable settings (an approved report merely
+being ready is expected post-cutover). Regressions (`scripts/gate7b-in-cutover.test.js`, 7 checks): **Y1** readiness
+= exactly the 13, each a valid live contract; **Y2** no rollout rows ⇒ a scheduled run (even with all 13 settings
+enabled) is a zero-I/O drained no-op before discovery; **Y3a** only IN enabled ⇒ all 13 selected and
+`accountsDispatched=[IN]`; **Y3b** a real IN dispatch writes owners / report jobs / shadow snapshots scoped to IN
+only; **Y4** USA and every other account produce zero (out-of-allowlist non-US excluded by rollout; US excluded by
+bucket AND the IN-only rollout); **Y5** durable `schedule_enabled=false` still prevents dispatch; **Y6** the
+dispatcher never auto-publishes (no import; a full IN cycle writes only `scheduler-v2/*` shadow snapshots). Full
+`npm run verify` green (39 steps / 19 suites incl. `build:check`).
+
+### Y.2 Reviewed production sequence (one step at a time; verify before the next)
+
+Let `IN_ACCOUNT` = the exact public id of the proven IN primary account (`d658442d-…`; **re-read from live
+discovery at execution time**, never hard-coded). Every durable id written (`account_id`, `report_key`,
+`approved_by`) must be CANONICAL — no leading/trailing whitespace (the migration-6 `= btrim(...)` constraints
+reject a noncanonical value, and the reader/resolver fail closed on one).
+
+1. **Deploy the reviewed branch** while the durable data stays CLOSED (rollout empty, `rollout_mode`
+   `(1,false)`, all 13 settings paused, no approvals). The readiness flip alone changes no runtime behavior.
+2. **Reconfirm the deployment is INERT** (read-only): the no-side-effect preflight audits clean and reports
+   `v2ControlsLocked.ok=true` (readiness = the 13 approved keys, nothing scheduled); a scheduled dispatch is a
+   drained no-op (zero accounts); `scheduler_account_rollout` / `scheduler_publish_approvals` empty;
+   `report_sync_settings` 13× `schedule_enabled=false`; no `pg_cron`. **STOP if any is not so.**
+3. **Discover + positively verify the full IN primary public account ID** from live DataDoe discovery: it must
+   be an ACTIVE PRIMARY account (not `dd-secondary:`-prefixed), its full public id, and the same account that
+   passed Gate-6 Cycle 2 (`d658442d-…`). Record the exact id as `IN_ACCOUNT`.
+4. **Enable the IN account — exactly one allowlist row:**
+   `insert into public.scheduler_account_rollout (account_id, enabled, note) values ('<IN_ACCOUNT>', true, 'Gate-7b IN cutover — approved <date>');`
+   Verify: exactly ONE enabled row; `scheduler_rollout_mode.all_primary` STILL false. Scheduled runs still
+   dispatch nothing (all settings paused).
+5. **Enable `report_sync_settings` ONE report at a time** (recommended order: `brand-sales` first — the
+   deepest-verified — then the rest): `update public.report_sync_settings set schedule_enabled=true where
+   report_key='<report>';`. After each, verify a scheduled shadow run selects exactly that report for exactly
+   IN, and no other report/account moves.
+6. **Run one controlled SHADOW cycle** — either one bounded cycle per newly-enabled report, or one bounded
+   all-13 IN cycle once all 13 are enabled — via the trusted composition (instance-scoped, IN-only, bounded
+   slices, ≤1 create per hash). Writes stay under `scheduler-v2/*` + the scheduler tables ONLY.
+7. **Require terminal SUCCEEDED jobs + valid shadow snapshots:** each report's `sync_report_jobs` row must be
+   `validated=true`, `derive_status='succeeded'`, `save_status='succeeded'` inside a terminal `succeeded`/`partial`
+   cycle, with a `scheduler-v2/<report>` snapshot for IN that passes the derivation's `validatePayload` and is
+   NOT `dataUnavailable`. **STOP on any non-terminal / failed / blocked / invalid report.**
+8. **Insert ONE audited publish approval per (report, IN account):**
+   `insert into public.scheduler_publish_approvals (report_key, account_id, approved, approved_by, approved_at) values ('<report>', '<IN_ACCOUNT>', true, '<operator>', now());`
+   (`approved_by`/`approved_at` are DB-required and canonical.)
+9. **Publish ONE report at a time** through the trusted composition:
+   `buildSchedulerV2Publisher().publish('<report>', '<IN_ACCOUNT>')` from a trusted operator context (NEVER a
+   browser route). Expect `published` (or `already-current`/`newer-live` on a benign replay). The four gates
+   (code readiness + durable report enable + durable account enable resolved against fresh discovery + explicit
+   approval) plus the exact job-snapshot binding + CAS all apply. **STOP on `publish-conflict` or any
+   non-publishing disposition** and remediate with a fresh shadow cycle (never an equal-timestamp overwrite).
+10. **Verify each live snapshot via the frontend's EXACT natural identity + payload contract:** read
+    `report_snapshots` by the pinned live `(report_key, account_id, params_hash)` (`paramsHashFor(liveReportVersion,
+    liveParams)`; the 13 mappings in U.4) and confirm the frontend's own route serves it. The payload must match
+    the derivation's `validatePayload` shape for that report.
+11. **Preserve + compare the previous live fingerprint BEFORE and AFTER every publication:** capture the live
+    payload-free fingerprint for `(report_key, IN_ACCOUNT)` before publishing; after, confirm the row advanced to
+    the new snapshot identity AND that **no OTHER account's or report's** live snapshot changed (compare their
+    fingerprints byte-for-byte). The previous live last-known-good is preserved on any non-publishing outcome.
+
+### Y.3 Exact rollback (any point; reversible; never destroys LKG)
+
+- **Pause a report:** `update public.report_sync_settings set schedule_enabled=false where report_key='<report>';`
+  — the scheduled path stops dispatching it immediately.
+- **Revoke a publish approval (audited):** `update public.scheduler_publish_approvals set approved=false,
+  approved_by='<operator>', approved_at=now() where report_key='<report>' and account_id='<IN_ACCOUNT>';` — a
+  revocation is itself an audited decision row (WHO + WHEN required).
+- **Disable the IN account:** `update public.scheduler_account_rollout set enabled=false where
+  account_id='<IN_ACCOUNT>';` — the rollout immediately selects zero accounts (fail closed).
+- **Remove readiness keys ONLY through a reviewed CODE rollback** (revert the `SCHEDULER_V2_READY_REPORT_KEYS`
+  flip on the branch + redeploy) — never by hand at runtime.
+- **NEVER delete a live last-known-good (`report_snapshots`) row.** Rollback disables/ pauses/ revokes; it does
+  not delete published or prior LKG snapshots. The publisher's CAS already preserves LKG on every failure.
+
+Each lever independently returns the system to fail-closed zero with no code change (except the readiness
+rollback) and no data loss.
+
+### Y.4 Guardrails (do NOT, in this gate)
+
+- **Do NOT add USA (or any non-IN account) to `scheduler_account_rollout`.** Only `IN_ACCOUNT` gets an enabled
+  row; `all_primary` stays false.
+- **Do NOT create any `pg_cron`/`pg_net` schedule.** Gate 7b is operator-driven, one report at a time; scheduling
+  is a separate future gate.
+- No DataDoe call outside the reviewed shadow cycle; no deploy/push/merge beyond the single reviewed branch
+  deploy in step 1; no advance to any further rollout gate.
+
+### Y.5 USA partial rollout needs a SEPARATE report-account execution gate
+
+Gate-6 Cycle 2 left **IN = 13/13 (PASS)** and **USA = 4/13 (PARTIAL — 9 DataDoe TIMEOUTs, zero code defects;
+Appendix T.6)**. The current durable controls are an **account-level** gate (`scheduler_account_rollout` enables
+an account for ALL its ready reports) plus a **report-level** gate (`report_sync_settings` enables a report for
+ALL enabled accounts). This product **cannot safely express "IN = all 13 AND USA = only the 4 that passed"** — an
+enabled USA row + a report enabled for IN would also expose USA to that report, and USA's 9 timeout-prone reports
+must not go live. Therefore **USA partial rollout is OUT OF SCOPE for Gate 7b** and requires a **separate,
+reviewed report-account execution gate** — a per-`(report, account)` durable enable (not just per-report and
+per-account) — designed and reviewed after the Appendix Q.4 DataDoe stability questions are resolved for the US
+account. Until then USA stays excluded (no `scheduler_account_rollout` row).
+
+**STOP.** Gate 7b hands back for Codex review. No deploy, no durable row, no settings change, no publish, no cron,
+no production connection has happened in this preparation.

@@ -9615,3 +9615,46 @@ bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7 and executed ex
 
 STOP for Codex review. The next gate (Appendix V IN-only enable package) remains BLOCKED pending review + a
 separate explicit authorization.
+
+## Scheduler v2 Gate 7b PREPARED (OFFLINE, 2026-08-15): IN-account all-13-report cutover — readiness flipped to 13; NOT deployed
+
+Prepared the Gate-7b IN cutover entirely offline. No deploy/publish/schedule/production connection. Migration 6
+stays applied (Gate 7a); durable data stays closed (rollout/approvals empty, mode (1,false), 13 settings paused).
+
+- CODE (commit code/tests first): report-controls.js SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([...
+  CONTROLLED_REPORT_KEYS]) -- the reviewed CODE cutover (all 13 reports v2-ready; the IN account cleared them in
+  Gate-6 Cycle 2). Readiness ON dispatches/publishes NOTHING by itself: the durable account rollout (ZERO
+  accounts) + report_sync_settings (13 paused) + per-(report,account) publish approval (none) still gate
+  everything.
+- Preflight #6 (runtime-composition.js) reframed: was "fail closed if ANY report ready" (readiness must be
+  empty); now fails closed only on an UNEXPECTED/non-approved ready key OR a report scheduled with EMPTY durable
+  settings (an approved ready-but-not-scheduled report is EXPECTED post-cutover). Imports CONTROLLED_REPORT_KEYS.
+- Comments updated (report-publisher.js, publisher-composition.js): code-lock is no longer "frozen EMPTY"; it's
+  the 13 approved keys, and gates 2-4 still apply.
+- Breaking tests fixed for the new posture: sync-dispatch 702 (v2 readiness = the 13; not schedule-enabled by
+  default) + 710 (default lock now via durable data: empty rollout drains a manual run); composition 529
+  (default lock via empty durable rollout) + 256 (V2_CONTROLS_UNLOCKED fires on scheduled-by-default OR
+  unexpected-ready, NOT on an approved ready key); gate7 E1 (readiness=exactly-13; code-lock still works via
+  injected codeReadyKeys=[]; unknown key => unknown-report) + EC1 (composition wires code-lock via build-time
+  codeReadyKeys=[]).
+- NEW regressions: scripts/gate7b-in-cutover.test.js (7 checks) -- Y1 readiness=exactly-13 (each a valid live
+  contract); Y2 no rollout rows => scheduled run (all 13 settings enabled) zero-I/O drained before discovery; Y3a
+  only IN enabled => all 13 SELECTED + accountsDispatched=[IN]; Y3b real IN dispatch scopes owners/report
+  jobs/shadow snapshots to IN only; Y4 USA + every other account ZERO (out-of-allowlist non-US excluded by
+  rollout, US excluded by bucket AND IN-only rollout); Y5 paused settings still block; Y6 dispatcher never
+  auto-publishes (no import; only scheduler-v2/* shadow snapshots). Registered in package.json + verify.mjs.
+  npm run verify: 39 steps / 19 suites incl build:check; git diff --check clean.
+- DOCS (commit separately): corrected stale text -- Appendix U preamble now "Migration 6 APPLIED; INERT at the
+  DATA layer" (removed "neither has happened"); Appendix V marked SUPERSEDED by Appendix Y and its migration-apply
+  step 1 removed (Migration 6 already applied); status header records the Gate-7b cutover prepared + not deployed.
+  NEW Appendix Y: reviewed IN-only all-13 production cutover sequence (deploy inert -> reconfirm inert -> discover
+  + verify IN id -> one enabled rollout row -> enable settings one report at a time -> shadow cycle -> require
+  terminal succeeded jobs + valid snapshots -> one audited publish approval per (report,IN) -> publish one report
+  at a time via buildSchedulerV2Publisher -> verify live via the frontend's exact natural identity/payload ->
+  preserve+compare live fingerprint before/after every publish), exact rollback (schedule_enabled=false;
+  approved=false with approved_by/approved_at; scheduler_account_rollout.enabled=false; readiness keys removed only
+  via reviewed CODE rollback; NEVER delete LKG snapshots), guardrails (no USA row; no cron), and Y.5: USA partial
+  (4/13) needs a SEPARATE per-(report,account) execution gate -- the account-only gate cannot safely express IN=13
+  and USA=4.
+
+STOP for Codex review. Gate 7b not deployed; USA excluded; no cron.
