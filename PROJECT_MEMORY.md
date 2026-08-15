@@ -9269,3 +9269,42 @@ executed.
   run verify 37/37 across 17 suites incl. build:check; git diff --check clean.
 
 STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
+
+## Scheduler v2 Gate 7: account-rollout + publisher foundation (OFFLINE, 2026-08-15) — INERT until applied/enabled
+
+Gate-6 judgement recorded (T.6): NON-US PASS 13/13 (cycle succeeded 133/133/0); US PARTIAL 4/13 (every
+failure a US-account DataDoe TIMEOUT, zero code defects; Q.4 remains gating); GLOBAL UNLOCK NOT APPROVED.
+Gate-7 implements the account-bounded rollout foundation entirely OFFLINE — no production connection, no
+migration applied, no push/deploy/unlock/publish/schedule.
+
+- Migration 6 `20260816_account_rollout.sql` PREPARED, NOT APPLIED: `scheduler_account_rollout` (exact-id
+  allowlist, enabled default false), `scheduler_rollout_mode` (single row, all_primary default false),
+  `scheduler_publish_approvals` ((report_key, account_id), approved default false). Additive only; RLS, no
+  policies; service_role grants; shared touch trigger. Schema-contract entry + 3 REQUIRED wrappers audited.
+- Durable account gate (ADDITIONAL to report readiness, neither weakened): typed fail-closed reader
+  `getSchedulerAccountRollout` + pure `resolveRolloutAccounts` (lib/server/sync/account-rollout.js) — zero by
+  default; exact public ids only; stale rows spend nothing; dd-secondary rejected both sides; all-primary a
+  separate durable switch that auto-includes new primary accounts.
+- Dispatcher enforcement (sync-dispatch.js, SCHEDULED only): trusted loader REQUIRED (missing => refuse,
+  zero I/O); state loaded BEFORE discovery (read failure / zero-valid-allowlist => drained no-op, spent 0,
+  zero cycle/store/DataDoe); resolver filters bucket accounts BEFORE openCycle; rollup carries
+  accountRollout {selected, staleIds, reason}. Manual canaries UNCHANGED (no loader, no filtering).
+  runtime-composition: loadAccountRollout is a trusted collaborator, NOT in RUN_OPERATIONAL_ARGS.
+- Shadow-to-live publisher (lib/server/sync/report-publisher.js) DISABLED BY DEFAULT, invoked by NOTHING:
+  4 independent gates (code readiness frozen EMPTY + report_sync_settings enable + account rollout + explicit
+  publish approval), derive+save-succeeded job in terminal succeeded/partial cycle, strict snapshot
+  validation (version/account/validatePayload/NOT dataUnavailable/nonblank refreshed_at), 13 live contracts
+  statically pinned from api/datadoe.js + insight module constants, CAS publishLiveSnapshotIfNewer
+  (insert-if-absent, strictly-older guarded PATCH => replay idempotent, newer live wins, LKG preserved),
+  typed dispositions only.
+- Regressions: NEW scripts/gate7-rollout-publisher.test.js — 31 checks (resolver, dispatcher enforcement,
+  composed-runtime override immunity, wrapper typed reads + CAS vs stubbed fetch, all publisher gates +
+  exactly-once/replay/newer-live/LKG, 13 pinned mappings vs live source truths, structural no-route-imports).
+  Existing suites: only harness defaults updated (all-primary loader): sync-dispatch 37,
+  runtime-composition 26, cycle-lifecycle 16. npm run verify: 38 steps / 18 suites green incl. build:check;
+  git diff --check clean.
+- Docs: SCHEDULER_V2_ROLLOUT.md status header updated; T.6 judgement; Appendix U (foundation contract);
+  Appendix V (PREPARED, NOT-executed IN-only enable package: apply migration 6 -> preflight -> IN allowlist
+  row -> per-report enable -> per-(report,account) publish approval -> rollback levers).
+
+STOP for Codex review. Migration 6 unapplied; all enables/approvals/unlock/deploy/schedule remain BLOCKED.

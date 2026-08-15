@@ -30,9 +30,22 @@ lifecycle (us `57/44/13` sources + `13/2/11` reports; non-us `56/39/17` + `13/3/
 snapshots; production fingerprints byte-identical; ONE parity defect found and FIXED in code (the brand-sales
 derive now emits the route's additive `asinBrand` map — commit `bb37a4e`); 30 DataDoe export TIMEOUTs on the
 largest datasets and the EMPTY durable `ads_sync_coverage` (PPC prerequisite) are recorded as upstream findings
-needing DataDoe/Ads-sync input. **Cycle 2 is NOT started**: it is BLOCKED pending Codex review of the Cycle-1
-evidence and explicit human approval, and no control unlock/publish/deploy/schedule has happened. Every
-remaining live step is **gated on explicit human approval**, one step at a time.
+needing DataDoe/Ads-sync input. **Gate 6 Shadow Parity CYCLE 2 was EXECUTED 2026-08-15 with explicit
+authorization** (Appendix T) after the timeout-slicing + Ads-coverage remediations. **Gate-6 completion
+judgement (recorded 2026-08-15): NON-US = PASS (13/13 reports succeeded; cycle `succeeded` 133/133/0 sources);
+US = PARTIAL (4/13 reports; cycle `partial` 135/84/51 — every failure a US-account DataDoe export TIMEOUT,
+zero code defects); a GLOBAL unlock is NOT approved.** The Appendix Q.4 DataDoe questions remain the gating
+input for US-account stability. **Gate 7 (2026-08-15, OFFLINE code/tests only): the productionization
+foundation is IMPLEMENTED but INERT** — (a) migration 6 `20260816_account_rollout.sql` is **PREPARED and NOT
+APPLIED** (durable per-account rollout allowlist + a separate durable all-primary switch, both defaulting to
+ZERO accounts, + explicit per-(report,account) publish approvals); (b) the dispatcher now REQUIRES the trusted
+durable rollout for every SCHEDULED run and fails closed to a zero-I/O drained no-op on a read failure or the
+default zero-account state (manual shadow canaries unchanged); (c) a reviewed shadow-to-live publisher exists
+but is QUADRUPLE-LOCKED (code readiness — still frozen EMPTY — + durable report enable + durable account
+enable + explicit publish approval) with CAS newer-live-wins semantics against the 13 statically pinned live
+report contracts; NO route, cron, or dispatcher path invokes it (Appendix U). A PREPARED, NOT-executed
+IN-only rollout package is Appendix V. No control unlock, publish, deploy, schedule, or migration apply has
+happened in Gate 7. Every remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3005,5 +3018,182 @@ account's exports appear to hit an organization/dataset-level DataDoe processing
 window size. **The Appendix Q.4 DataDoe questions (processing/row limits, supported partitions) remain the
 gating input for US-account stability.**
 
-**STOP.** Gate-6 completion judgement / unlock / deploy / schedule remain BLOCKED pending Codex review +
-explicit human approval.
+**STOP.** Unlock / deploy / schedule remain BLOCKED pending Codex review + explicit human approval.
+
+### T.6 Gate-6 completion judgement (recorded 2026-08-15)
+
+- **NON-US: PASS.** All 13 reports derived, validated, and saved (`13/13/0`); the cycle finalized `succeeded`
+  with `133/133/0` sources; ZERO code defects; timeout-safe slicing proven effective end-to-end on the IN
+  account (zero failures across identical window sizes that time out for the US account).
+- **US: PARTIAL.** 4/13 reports succeeded (brand-sales, content-changes, keyword-rank, listing-optimizer;
+  T.3); the cycle finalized `partial` with `135/84/51` sources. Every failure is a US-account DataDoe export
+  TIMEOUT (typed, no retry, one create per hash); NONE is a scheduler code defect. The Appendix Q.4 DataDoe
+  questions remain the gating input.
+- **GLOBAL UNLOCK: NOT APPROVED.** No report key enters `SCHEDULER_V2_READY_REPORT_KEYS`, all 13
+  `report_sync_settings` rows stay `schedule_enabled=false`, and nothing is deployed or scheduled. The
+  judgement permits ONLY preparing an account-bounded (IN-only) rollout foundation — implemented OFFLINE and
+  INERT in Appendix U, with the prepared-but-NOT-executed enable package in Appendix V.
+
+---
+
+## Appendix U — Gate-7 productionization foundation (2026-08-15; OFFLINE code/tests only; migration PREPARED — NOT APPLIED)
+
+Implements the account-bounded rollout foundation the T.6 judgement permits: the proven IN account can LATER
+be enabled to run and publish Scheduler-v2 reports while the US and every unrelated account remain untouched,
+with a separate explicit all-primary switch preserved for the eventual full rollout. **Everything in this
+appendix is INERT until (a) migration 6 is applied via its own reviewed gate and (b) durable rows are
+explicitly written (Appendix V) — neither has happened.** No production connection was made in Gate 7.
+
+### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED)
+
+Three ADDITIVE tables (no existing table/RPC/trigger/policy touched; RLS enabled with NO policies;
+`select/insert/update` granted to `service_role` only; the shared `scheduler_rollout_touch()` BEFORE UPDATE
+trigger maintains `updated_at`):
+
+| table | key | columns | default state |
+|---|---|---|---|
+| `scheduler_account_rollout` | `account_id` (text PK) | `enabled bool DEFAULT false`, `note`, timestamps | zero rows => ZERO accounts |
+| `scheduler_rollout_mode` | `id smallint PK CHECK (id=1)` | `all_primary bool DEFAULT false` | seeded single row `(1,false)` |
+| `scheduler_publish_approvals` | `(report_key, account_id)` PK | `approved bool DEFAULT false`, `approved_by`, `approved_at`, timestamps | zero rows => NOTHING approved |
+
+The static schema contract (`schema-contract.js`) carries the migration-6 entry + the three new REQUIRED
+wrapper exports, so the no-side-effect preflight audits the pairing exactly like migrations 1–5.
+
+### U.2 Durable account-rollout semantics (one shared implementation)
+
+`getSchedulerAccountRollout()` (supabase.js) returns the TYPED state
+`{ read: "ok"|"schema-missing"|"read-failed", allPrimary, enabledAccountIds }` and never throws. The PURE
+resolver `resolveRolloutAccounts(state, discoveredPrimary)` (`lib/server/sync/account-rollout.js`) is the
+ONLY selection implementation:
+
+- `read !== "ok"` => ZERO accounts (a read/schema failure can never widen scope);
+- default durable state (no enabled rows, `all_primary=false`) => ZERO accounts;
+- allowlist mode => ONLY discovered ACTIVE PRIMARY accounts whose EXACT public id has an `enabled=true` row —
+  no wildcard, no prefix/case matching, no implicit fallback; stale/unknown rows match nothing, spend nothing,
+  and are reported as `staleIds`;
+- `all_primary=true` (separate deliberate durable switch) => EVERY discovered primary account, so a newly
+  connected primary account joins automatically with NO code change;
+- `dd-secondary:`-prefixed ids are rejected on BOTH sides (discovered account AND allowlist row) — a stale
+  secondary can never enter scheduled scope or be routed through the primary key.
+
+This gate is ADDITIONAL to (and independent of) report-level readiness: `SCHEDULER_V2_READY_REPORT_KEYS`
+(still frozen EMPTY) and the 13 paused `report_sync_settings` rows are unchanged and unweakened.
+
+### U.3 Trusted runtime enforcement (scheduled runs only)
+
+`buildSchedulerV2Runtime` composes `loadAccountRollout` from the trusted wrapper; it is NOT in
+`RUN_OPERATIONAL_ARGS`, so a per-run caller can never supply, replace, or bypass it (proven by test). The
+dispatcher (`runSchedulerV2Shadow`):
+
+1. A SCHEDULED run WITHOUT the trusted loader REFUSES to dispatch (fail closed, zero I/O).
+2. The rollout state is loaded BEFORE discovery; a failed read OR a state whose allowlist normalizes to zero
+   valid ids returns a `drained:true, spent:0` no-op with ZERO discovery/cycle/store/DataDoe work.
+3. After primary-only classification, the resolver filters the bucket's accounts BEFORE `openCycle`/source
+   planning; zero selected => the same zero-write drained no-op. The rollup records
+   `accountRollout: { selected, staleIds, reason }`.
+4. MANUAL shadow canaries are UNCHANGED: explicit, operator-scoped, never rollout-filtered, and never
+   require the loader — exactly the Gate-5/Gate-6 procedure.
+
+### U.4 Reviewed shadow-to-live publisher (DISABLED BY DEFAULT; nothing invokes it)
+
+`lib/server/sync/report-publisher.js` — `publishSchedulerV2Snapshot(deps, { reportKey, accountId })`
+promotes ONE validated `scheduler-v2/<reportKey>` shadow snapshot to the EXACT live `report_snapshots`
+identity the frontend reads. Publishing requires ALL FOUR independent gates (each fails closed):
+
+1. **Code readiness** — the key is in `SCHEDULER_V2_READY_REPORT_KEYS` (frozen EMPTY => disabled today);
+2. **Durable report enable** — `report_sync_settings.schedule_enabled === true`;
+3. **Durable account enable** — the U.2 resolver selects the exact account;
+4. **Explicit publish approval** — `scheduler_publish_approvals.approved === true` for the exact
+   `(report_key, account_id)`.
+
+Source-of-truth gate: only a report job with `derive_status='succeeded' AND save_status='succeeded'` inside a
+TERMINAL cycle (`succeeded`, or `partial` with that exact report succeeded). Snapshot gate: the LATEST
+`scheduler-v2/<reportKey>` snapshot must match the derivation `snapshotVersion`, the exact account, pass the
+derivation's own `validatePayload`, NOT declare `dataUnavailable:true`, and carry a nonblank
+`source_refreshed_at`; the live params builder fails closed on any missing/malformed planned param. The write
+is the CAS primitive `publishLiveSnapshotIfNewer` (supabase.js): INSERT-if-absent on the natural key
+`(report_key, account_id, params_hash)`, else a guarded PATCH that replaces ONLY a strictly-older live row —
+so a REPLAY can never duplicate a publish (`already-current`) and a NEWER live snapshot always wins
+(`newer-live`); live last-known-good is preserved on EVERY failure. Typed safe dispositions only
+(`PUBLISH_DISPOSITIONS`); params hashing uses the live `paramsHashFor` and the live stored-params shape
+`{ reportVersion, ...params }`. NO api route, cron, or dispatcher path imports the publisher (structurally
+tested); no browser route can promote.
+
+The 13 canonical mappings (transcribed from the executable live routes — `api/datadoe.js`
+`sharedSnapshotSpec` + the six insight `serveSharedReport` sites — and statically pinned by tests F1–F3):
+
+| scheduler report | live `report_key` | live `reportVersion` | live params |
+|---|---|---|---|
+| brand-sales | brand-sales | brand-sales-shared-v1 | `{ from, to }` |
+| daily-reporting | daily-reporting | daily-reporting-shared-v1 | `{ from, to, brand }` (`"ALL"` default) |
+| reconciliation | reconciliation | reconciliation-shared-v1 | `{ from, to }` |
+| sku-pl | sku-pl | sku-pl-shared-v1 | `{ from, to }` |
+| keyword-rank | keyword-rank | keyword-rank-shared-v1 | `{ to }` |
+| content-changes | content-changes | content-changes-shared-v1 | `{ asOf }` (the planner's `to`) |
+| fba-plan | fba-plan | fba-plan-shared-v1 | `{ to }` |
+| sales-movers | sales-movers | sales-movers-v1 | `{ to }` |
+| listing-health | listing-health | listing-health-v1 | `{ to }` |
+| buy-box-loss | buy-box-loss | buy-box-loss-v1 | `{ to }` |
+| returns-leakage | returns-leakage | returns-leakage-v1 | `{ to }` |
+| ppc-performance | ppc-performance | ppc-performance-v1 | `{ to }` |
+| listing-optimizer | listing-optimizer | listing-optimizer-v1 | `{ to }` |
+
+### U.5 Executable regression evidence (offline; zero I/O)
+
+`scripts/gate7-rollout-publisher.test.js` — **31 checks** in 7 groups (registered in `package.json` +
+`scripts/verify.mjs`): (A) pure resolver fail-closed semantics; (B) dispatcher enforcement — default
+locked/empty controls = zero I/O, missing-loader refusal, read-failure fail-closed, zero-default drain,
+ONLY IN selected from a 30-account discovery with every write account-scoped, the same allowlist leaving the
+US bucket untouched, dd-secondary excluded via both vectors, stale rows spending zero, all-primary
+auto-including a new primary account, manual canaries unchanged; (C) `RUN_OPERATIONAL_ARGS` pinned + a
+malicious per-run override dropped by the composed runtime; (D) wrapper typed reads + CAS primitive semantics
+against stubbed fetch (insert / replace-strictly-older / skip-and-classify, single natural-key row); (E) the
+publisher's default code lock, all four gates, LKG preservation for every non-successful/invalid/unavailable
+state, exactly-once publish with the exact live identity, idempotent replay, newer-live-wins, typed
+transport-failure disposition; (F) the 13 contracts statically pinned against `api/datadoe.js` literals and
+the live insight modules' exported constants; (G) structural isolation (no api/ reference to the
+publisher / rollout / CAS primitive; the dispatcher never auto-publishes). Existing suites updated only in
+their HARNESS defaults (all-primary loader injection): `sync-dispatch.test.js` 37,
+`sync-runtime-composition.test.js` 26, `cycle-lifecycle.test.js` 16 — all green; full `npm run verify` green
+(38 steps / 18 suites including `build:check`).
+
+---
+
+## Appendix V — Gate-7 IN-only rollout package (PREPARED — NOT EXECUTED)
+
+**Nothing in this appendix has been run.** It is the exact, reviewed enable sequence a FUTURE explicitly
+authorized gate would execute, one step at a time, each with its own read-only verification. Executing it
+requires: Codex review of the Gate-7 code, explicit human approval naming the IN account, and the standing
+per-migration gate procedure (sections 1–2a).
+
+Let `IN_ACCOUNT` = the exact public account id of the proven IN primary account (`d658442d-…` — the full id
+is re-read from live discovery at execution time; never guessed or hard-coded).
+
+1. **Apply migration 6** (`20260816_account_rollout.sql`) via the standard single-file guarded-transaction
+   gate (advisory lock, pre/post read-only verification, ledger row). Verify: 3 tables exist, RLS enabled,
+   zero policies, `scheduler_rollout_mode` = exactly `(1, all_primary=false)`, the other two tables empty.
+   At this point the system is STILL fully off (the zero-account default, proven by tests B1/B4).
+2. **Preflight** — run the no-side-effect runtime preflight; the migration-6 schema-contract entry and the
+   three wrappers must audit clean.
+3. **Enable the IN account (allowlist row):** insert into `scheduler_account_rollout` the single row
+   `(account_id='<IN_ACCOUNT>', enabled=true, note='Gate-7 IN-only rollout — approved <date>')`.
+   Verify: exactly ONE enabled row; `all_primary` still false. Scheduled runs remain no-ops (every report is
+   still locked + paused).
+4. **Per-report enable, ONE report at a time** (starting with `brand-sales`, the deepest-verified report):
+   add the key to `SCHEDULER_V2_READY_REPORT_KEYS` (code review + deploy gate) and set its ONE
+   `report_sync_settings.schedule_enabled=true` row. Verify a scheduled shadow run selects exactly
+   (report x IN account) and nothing else.
+5. **Publish approval, ONE (report, account) at a time:** insert into `scheduler_publish_approvals` the row
+   `(report_key='<report>', account_id='<IN_ACCOUNT>', approved=true, approved_by='<operator>',
+   approved_at=now())`, then invoke the publisher for that exact pair from a trusted operator context (NEVER
+   a browser route), expecting `published`, and verify the live row via its natural key + the frontend's own
+   route. The live fingerprint procedure (section 4) brackets the first publish.
+6. **Rollback at ANY point:** set the allowlist row `enabled=false` / delete the approval row / remove the
+   report key — each independently returns the system to fail-closed zero with no code change and no data
+   loss (live LKG rows untouched).
+
+The all-primary switch (`scheduler_rollout_mode.all_primary=true`) is NOT part of this package; it is a
+separate future gate requiring its own review after US-account DataDoe stability (Q.4) is resolved.
+
+**STOP.** Gate-7 hands back for Codex review. No migration applied, no row written, no unlock, no publish,
+no deploy, no schedule.
