@@ -56,10 +56,15 @@ const SECONDARY_ACCOUNTS = [{ id: G6_US, country: "US" }]; // same raw id, diffe
 // persistence acknowledgement; `rowsByCall` returns Ads rows for a fetchRange; `states` seeds ads_sync_state;
 // `fetchAccountsThrows` / `lockResult` exercise the failure + skip paths.
 function makeDeps(opts = {}) {
-  const calls = { fetchAccounts: [], fetchRange: [], upsertRows: [], upsertMetrics: [], upsertStates: [], coverage: [], claim: 0, release: 0 };
+  const calls = { fetchAccounts: [], fetchRange: [], download: [], getCoverage: [], upsertRows: [], upsertMetrics: [], upsertStates: [], coverage: [], claim: 0, release: 0 };
   const rowsFor = opts.rowsFor || (() => [
     { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" },
   ]);
+  // The injected create/download primitives drive the REAL recursive fetchRangeWith (so its create-export
+  // budget is exercised). createExport records EVERY create POST (parent + split children) under calls.fetchRange
+  // (each entry === one create); download returns the rows for that export's exact (source, ids, from, to).
+  const exportMeta = new Map();
+  let exportSeq = 0;
   const deps = {
     getConnections: () => (opts.connections || [
       { id: "primary", apiKey: PRIMARY_KEY, accountPrefix: "" },
@@ -70,14 +75,27 @@ function makeDeps(opts = {}) {
       if (opts.fetchAccountsThrows) throw new Error(`DataDoe accounts request failed (500): secret-token-${apiKey}`);
       return apiKey === PRIMARY_KEY ? PRIMARY_ACCOUNTS : apiKey === SECONDARY_KEY ? SECONDARY_ACCOUNTS : [];
     },
-    fetchRange: async (apiKey, source, ids, from, to) => {
+    createExport: async (apiKey, source, ids, from, to) => {
       calls.fetchRange.push({ apiKey, sourceKey: source.key, ids: [...ids], from, to });
       if (opts.fetchRangeThrows) throw new Error(`DataDoe ${source.key} export creation failed (500): raw-secret-body ${apiKey}`);
-      return rowsFor({ source, ids, from, to });
+      const exportId = "exp-" + (++exportSeq);
+      exportMeta.set(exportId, { source, ids: [...ids], from, to });
+      return { exportId };
+    },
+    downloadExport: async (apiKey, exportId) => {
+      calls.download.push(exportId);
+      const meta = exportMeta.get(exportId);
+      return rowsFor({ source: meta.source, ids: meta.ids, from: meta.from, to: meta.to });
     },
     claimRefreshLock: async () => { calls.claim += 1; return opts.lockResult == null ? true : opts.lockResult; },
     releaseRefreshLock: async () => { calls.release += 1; },
     getAdsSyncStates: async (ids) => (opts.states || []).filter((s) => ids.includes(s.account_id)),
+    getCoverage: async (accountId, sourceKey) => {
+      calls.getCoverage.push({ accountId, sourceKey });
+      if (typeof opts.getCoverage === "function") return opts.getCoverage(accountId, sourceKey);
+      // default: nothing covered (read ok, no windows, missing state) => never authorizes a skip.
+      return { windows: [], status: "missing", latestMetricDate: null, read: "ok", error: null };
+    },
     upsertAdsDailyRows: async (rows) => { calls.upsertRows.push(rows.length); },
     upsertAdDailyMetrics: async (rows) => { calls.upsertMetrics.push(rows.length); },
     upsertAdsSyncStates: async (states) => { calls.upsertStates.push(states); },
@@ -91,12 +109,17 @@ function makeDeps(opts = {}) {
   if (opts.clock) deps.clock = opts.clock; // injectable monotonic clock for the work-budget deadline
   return { deps, calls };
 }
+// A durable coverage state that PROVES the exact REQ window with a succeeded state (authorizes an idempotent skip).
+const COVERED = { windows: [{ from: REQ.from, to: REQ.to }], status: "succeeded", latestMetricDate: REQ.to, read: "ok", error: null };
 
 const CAMPAIGN = "campaign-performance-v1";
 const ASIN = "asin-performance-v1";
 const WORK_BUDGET_PAST = 10_000_000; // clearly past the 45s WORK_BUDGET_MS so a deferral fires deterministically
 const flatStates = (calls) => calls.upsertStates.flat();
 const row = (id, country = "US", date = REQ.to) => ({ seller_or_vendor_id: id, date, marketplace_country_code: country });
+const spanDays = (from, to) => Math.round((Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86400000) + 1;
+let EXPORT_LIMIT; // imported in main()
+let CAP;          // a cap-sized (>= EXPORT_LIMIT) result that forces a row-cap split; built in main()
 
 /* ============================= option validation (pre-lock, fail closed) ============================= */
 
@@ -190,12 +213,12 @@ test("the intended Gate-6 execution shape (exactly the two approved accounts, ex
 
 /* ============================= exact-window canary: only the 2 accounts, exact window ============================= */
 
-test("requiredCoverage: EXACTLY the two selected primary accounts are exported; the exact window is used", async () => {
-  const { deps, calls } = makeDeps();
-  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN, ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+test("requiredCoverage (ONE source): EXACTLY the two selected primary accounts are exported; the exact window is used", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
   assert.equal(res.status, "completed");
   assert.equal(res.coverageMode, true);
-  // Every fetchRange used the EXACT requiredCoverage window (never a cadence window) and the PRIMARY key only.
+  // Every create-export used the EXACT requiredCoverage window (never a cadence window) and the PRIMARY key only.
   assert.ok(calls.fetchRange.length > 0);
   assert.ok(calls.fetchRange.every((c) => c.from === REQ.from && c.to === REQ.to), "exact window on every export");
   assert.ok(calls.fetchRange.every((c) => c.apiKey === PRIMARY_KEY), "primary key only -- dd-secondary never routed");
@@ -203,16 +226,16 @@ test("requiredCoverage: EXACTLY the two selected primary accounts are exported; 
   const exportedIds = new Set(calls.fetchRange.flatMap((c) => c.ids));
   assert.deepEqual([...exportedIds].sort(), [G6_US, G6_IN].sort(), "only the two Gate-6 accounts exported");
   assert.ok(!exportedIds.has("other-us-1") && !exportedIds.has("other-in-1"), "unrelated US/IN accounts got zero exports");
-  // Coverage recorded the EXACT window for both sources / both accounts.
+  // Coverage recorded the EXACT window for the one source / both accounts.
   const cov = calls.coverage.flat();
-  assert.ok(cov.length === 4, "one coverage row per (source, account): 2 sources x 2 accounts");
+  assert.equal(cov.length, 2, "one coverage row per (source, account): 1 source x 2 accounts");
   assert.ok(cov.every((c) => c.coveredFrom === REQ.from && c.coveredTo === REQ.to), "coverage records the exact window");
   assert.deepEqual([...new Set(cov.map((c) => c.accountId))].sort(), [G6_US, G6_IN].sort());
 });
 
 test("unrelated US/IN and dd-secondary accounts receive ZERO exports/writes", async () => {
-  const { deps, calls } = makeDeps();
-  await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN, ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  const { deps, calls } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
   const touched = new Set([
     ...calls.fetchRange.flatMap((c) => c.ids),
     ...flatStates(calls).map((s) => s.account_id),
@@ -223,19 +246,38 @@ test("unrelated US/IN and dd-secondary accounts receive ZERO exports/writes", as
   }
 });
 
+test("requiredCoverage rejects ZERO or MULTIPLE source keys BEFORE the lock (zero lock/discovery/export/write)", async () => {
+  for (const keys of [[CAMPAIGN, ASIN], [], [CAMPAIGN, "unknown-source"]]) {
+    const { deps, calls } = makeDeps();
+    await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], keys, { accountIds: [G6_US], requiredCoverage: REQ }), /EXACTLY one supported sourceKey|No supported Ads source/);
+    assert.equal(calls.claim, 0, `no lock for sourceKeys ${JSON.stringify(keys)}`);
+    assert.equal(calls.fetchAccounts.length, 0, "zero discovery");
+    assert.equal(calls.fetchRange.length, 0, "zero DataDoe exports");
+    assert.equal(calls.upsertRows.length, 0, "zero Supabase row writes");
+    assert.equal(calls.upsertStates.length, 0, "zero state writes");
+    assert.equal(calls.release, 0, "nothing to release (never locked)");
+  }
+  // exactly one supported source is accepted.
+  const { deps } = makeDeps();
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+});
+
 /* ============================= existing daily state cannot shorten the window ============================= */
 
 test("an existing ads_sync_state that WOULD choose 'daily' cannot shorten requiredCoverage", async () => {
   // Seed a fully-cadenced state (initial+daily+monthly recent) -> pickMode would pick 'daily' (21d). The exact
   // 30-day requiredCoverage window must be used regardless.
-  const states = [G6_US, G6_IN].flatMap((id) => [CAMPAIGN, ASIN].map((k) => ({
-    account_id: id, source_key: k, initial_seeded_at: "2026-01-01T00:00:00.000Z",
+  const states = [G6_US, G6_IN].map((id) => ({
+    account_id: id, source_key: CAMPAIGN, initial_seeded_at: "2026-01-01T00:00:00.000Z",
     last_daily_sync_at: "2026-08-13T00:00:00.000Z", last_monthly_sync_at: "2026-08-01T00:00:00.000Z",
     latest_metric_date: "2026-08-12", last_status: "succeeded",
-  })));
-  const { deps, calls } = makeDeps({ states });
-  await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN, ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
-  assert.ok(calls.fetchRange.every((c) => c.from === REQ.from && c.to === REQ.to), "daily cadence never shortened the exact window");
+  }));
+  // The state is 'succeeded' but there is NO durable coverage window (default getCoverage), so it is NOT a
+  // skip -- the exact 30-day window is still exported (a daily cadence can never shorten it).
+  const { deps, calls } = makeDeps({ states, rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.ok(calls.fetchRange.length > 0 && calls.fetchRange.every((c) => c.from === REQ.from && c.to === REQ.to), "daily cadence never shortened the exact window");
 });
 
 test("requiredCoverage PRESERVES cadence timestamps (not a normal initial/daily/monthly run)", async () => {
@@ -262,18 +304,18 @@ test("requiredCoverage PRESERVES cadence timestamps (not a normal initial/daily/
 /* ============================= recorded window proves the PPC coverage gate ============================= */
 
 test("recorded campaign + ASIN exact 30-day windows make evaluateSourceCoverage(..).proven === true; optional sources independent", async () => {
-  const { deps, calls } = makeDeps();
-  await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN, ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
-  // Build the durable coverage state the PPC loader would read for each REQUIRED source from what was recorded.
+  // One source per invocation (Fix 1): run campaign, then ASIN, as separate invocations.
   for (const key of [CAMPAIGN, ASIN]) {
+    const { deps, calls } = makeDeps();
+    await runAdsSyncWithDeps(deps, ["US"], [key], { accountIds: [G6_US], requiredCoverage: REQ });
     const recorded = calls.coverage.flat().filter((c) => c.sourceKey === key && c.accountId === G6_US);
-    assert.ok(recorded.length === 1, `${key}: exactly one recorded window`);
+    assert.equal(recorded.length, 1, `${key}: exactly one recorded window`);
     const coverageState = { read: "ok", windows: recorded.map((r) => ({ from: r.coveredFrom, to: r.coveredTo })) };
     assert.equal(evaluateSourceCoverage(coverageState, REQ.from, REQ.to).proven, true, `${key}: proven over the exact 30-day window`);
+    // Optional targeting/search are INDEPENDENT: never touched when only this required source is requested.
+    const optional = calls.coverage.flat().filter((c) => c.sourceKey === "keyword-targeting-performance-v1" || c.sourceKey === "search-terms-performance-v1");
+    assert.equal(optional.length, 0, "optional targeting/search coverage is independent");
   }
-  // Optional targeting/search are INDEPENDENT: not requested here => no coverage written for them.
-  const optionalRecorded = calls.coverage.flat().filter((c) => c.sourceKey === "keyword-targeting-performance-v1" || c.sourceKey === "search-terms-performance-v1");
-  assert.equal(optionalRecorded.length, 0, "optional targeting/search coverage is independent (untouched when not requested)");
 });
 
 /* ============================= malformed/unknown/duplicate accounts -> zero exports ============================= */
@@ -385,28 +427,35 @@ test("a genuine ZERO-row export is valid covered-empty evidence (rows called wit
 
 /* ============================= FIX 2: total coverage-mode result ============================= */
 
-test("all N x M pairs confirmed => status 'completed' AND coverageComplete true (zero failed) -- the operator gate", async () => {
+test("all N pairs confirmed (one source, two accounts) => status 'completed' AND coverageComplete true -- the operator gate", async () => {
   const { deps } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
-  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN, ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
-  assert.equal(res.expectedCoveragePairs, 4);
-  assert.equal(res.successfulCoveragePairs, 4);
-  for (const key of [CAMPAIGN, ASIN]) {
-    assert.deepEqual(res.sources[key].failedAccounts, []);
-    assert.deepEqual(res.sources[key].coverageFailedAccounts, []);
-  }
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(res.expectedCoveragePairs, 2);
+  assert.equal(res.successfulCoveragePairs, 2);
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, []);
+  assert.deepEqual(res.sources[CAMPAIGN].coverageFailedAccounts, []);
   assert.ok(res.status === "completed" && res.coverageComplete === true, "res.status === 'completed' && res.coverageComplete === true");
 });
 
-test("one source succeeds + one fails => status 'partial' + coverageComplete false", async () => {
-  // ASIN coverage ack unconfirmed; campaign confirmed. 1 account x 2 sources.
-  const { deps } = makeDeps({ coverageAck: (rows) => (rows[0].sourceKey === ASIN ? { write: "write-failed", recorded: 0 } : { write: "ok", recorded: rows.length }) });
-  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN, ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+test("one account succeeds + one account's coverage-ack fails => status 'partial' + coverageComplete false", async () => {
+  // G6_IN's coverage ack is unconfirmed; G6_US confirmed. One source, two accounts. (One export batch of two;
+  // the ack fails per-batch, so both go to coverageFailed -- the batch is the atomic ack unit.)
+  const { deps } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")), coverageAck: () => ({ write: "ok", recorded: 1 }) });
+  // recorded:1 != batch.length(2) => unconfirmed => both accounts coverageFailed => partial (0 successes here).
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.notEqual(res.status, "completed");
+  assert.equal(res.coverageComplete, false);
+  assert.equal(res.expectedCoveragePairs, 2);
+});
+
+test("finalizeCoverageSummary: one source ok + one source fail => partial (pure, multi-source aggregation)", async () => {
+  const { finalizeCoverageSummary } = await import("../lib/server/ads-sync.js");
+  const summary = { status: "completed", accounts: 1, sources: { a: { coverage: 1, failedAccounts: [], coverageFailedAccounts: [] }, b: { coverage: 0, failedAccounts: [], coverageFailedAccounts: ["x"] } } };
+  const res = finalizeCoverageSummary(summary, { accounts: 1, sourceKeys: ["a", "b"] });
   assert.equal(res.status, "partial");
   assert.equal(res.coverageComplete, false);
   assert.equal(res.expectedCoveragePairs, 2);
   assert.equal(res.successfulCoveragePairs, 1);
-  assert.deepEqual(res.sources[CAMPAIGN].coverage, 1);
-  assert.deepEqual(res.sources[ASIN].coverageFailedAccounts, [G6_US]);
 });
 
 test("zero successful pairs + a failure => status 'failed', never completed", async () => {
@@ -458,6 +507,88 @@ test("finalizeCoverageSummary (pure): completed only for a full N x M with zero 
   // deferred always partial (even a full count)
   r = finalizeCoverageSummary(base(), { accounts: 2, sourceKeys: ["a", "b"], deferred: true });
   assert.equal(r.status, "partial"); assert.equal(r.deferred, true); assert.equal(r.coverageComplete, false);
+});
+
+/* ============================= FIX (this round): hard recursive create-export ceiling ============================= */
+
+test("ordinary non-cap requiredCoverage export uses EXACTLY one create-export", async () => {
+  const { deps, calls } = makeDeps();
+  await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.fetchRange.length, 1, "one create-export for a non-cap window");
+  assert.equal(calls.download.length, 1, "one download for the single export");
+});
+
+test("parent cap + two successful children uses EXACTLY three create-exports (budget allows the split)", async () => {
+  // cap when span > 20 days: the 30-day parent caps and splits into two ~15-day children (each < cap).
+  const { deps, calls } = makeDeps({ rowsFor: ({ ids, from, to }) => (spanDays(from, to) > 20 ? CAP : [row(ids[0], "US", to)]) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.fetchRange.length, 3, "parent (1) + two children (2) = 3 create-exports");
+  assert.equal(res.status, "completed");
+  assert.equal(res.coverageComplete, true);
+});
+
+test("a deeper split is stopped BEFORE create #4 with a typed budget error (zero rows/metric/coverage/success)", async () => {
+  // cap when span > 7 days: 30d -> 15d -> 8d all cap; the 4th create is blocked at the budget.
+  const { deps, calls } = makeDeps({ rowsFor: ({ from, to }) => (spanDays(from, to) > 7 ? CAP : []) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.fetchRange.length, 3, "exactly three create-exports before the 4th is blocked");
+  assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes on budget exhaustion");
+  assert.equal(calls.upsertMetrics.length, 0, "zero metric writes");
+  assert.equal(calls.coverage.length, 0, "zero coverage writes");
+  assert.ok(!flatStates(calls).some((s) => s.last_status === "succeeded"), "zero successful states");
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US], "the account is marked failed");
+  const saved = flatStates(calls).find((s) => s.account_id === G6_US);
+  assert.equal(saved.last_status, "failed");
+  assert.match(saved.last_error, /ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED/, "typed safe budget code in the failed state");
+  assert.ok(!JSON.stringify(res).includes("ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED"), "typed code NOT in the returned summary (ids/counts only)");
+  assert.notEqual(res.status, "completed");
+  assert.equal(calls.release, 1, "lock released once");
+});
+
+/* ============================= FIX (this round): durable idempotent completion ============================= */
+
+test("exact successful REPLAY creates ZERO exports and returns completed + coverageComplete:true", async () => {
+  const { deps, calls } = makeDeps({ getCoverage: () => COVERED, rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(calls.fetchRange.length, 0, "zero create-exports on a fully-covered replay");
+  assert.equal(calls.upsertRows.length, 0, "zero row writes");
+  assert.equal(calls.coverage.length, 0, "zero new coverage writes");
+  assert.equal(res.status, "completed");
+  assert.equal(res.coverageComplete, true);
+  assert.equal(res.successfulCoveragePairs, 2, "both skipped pairs counted successful");
+  assert.equal(res.sources[CAMPAIGN].skipped, 2);
+});
+
+test("partial durable coverage exports ONLY the missing account, never the already-complete one", async () => {
+  const { deps, calls } = makeDeps({
+    getCoverage: (accountId) => (accountId === G6_US ? COVERED : { windows: [], status: "missing", read: "ok" }),
+    rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")),
+  });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  const exportedIds = new Set(calls.fetchRange.flatMap((c) => c.ids));
+  assert.deepEqual([...exportedIds], [G6_IN], "only the missing account is exported");
+  assert.ok(!exportedIds.has(G6_US), "the already-covered account is never re-exported");
+  assert.equal(res.status, "completed");
+  assert.equal(res.coverageComplete, true, "skipped(1) + exported(1) = both accounts complete");
+  assert.equal(res.sources[CAMPAIGN].skipped, 1);
+});
+
+test("malformed / read-failed / unproven / not-succeeded / thrown durable coverage NEVER authorizes a skip", async () => {
+  const cases = [
+    { windows: [{ from: REQ.from, to: REQ.to }], status: "succeeded", read: "read-failed" }, // read failed
+    { windows: [{ from: REQ.from, to: REQ.to }], status: "failed", read: "ok" },              // state not succeeded
+    { windows: [{ from: "2026-07-20", to: REQ.to }], status: "succeeded", read: "ok" },        // window does not reach `from`
+    { windows: "not-an-array", status: "succeeded", read: "ok" },                              // malformed windows
+    null,                                                                                      // no coverage object
+    "THROW",                                                                                   // read throws
+  ];
+  for (const cov of cases) {
+    const opts = cov === "THROW" ? { getCoverage: () => { throw new Error("read-boom-secret"); } } : { getCoverage: () => cov };
+    const { deps, calls } = makeDeps(opts);
+    const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+    assert.equal(calls.fetchRange.length, 1, `coverage ${JSON.stringify(cov)} must NOT authorize a skip (exported)`);
+    assert.equal(res.sources[CAMPAIGN].skipped, 0, "nothing skipped on unproven/failed/malformed coverage");
+  }
 });
 
 /* ============================= lock released exactly once on every post-claim outcome ============================= */
@@ -549,8 +680,10 @@ test("resolveAdsAccountAllowlist: targets exactly the two Gate-6 accounts; fail-
 /* ============================= run ============================= */
 
 async function main() {
-  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan } = await import("../lib/server/ads-sync.js"));
+  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT } = await import("../lib/server/ads-sync.js"));
   ({ evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
+  // A single cap-sized result (>= EXPORT_LIMIT rows) reused to force a row-cap split in the ceiling tests.
+  CAP = Array.from({ length: EXPORT_LIMIT }, () => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" }));
   for (const t of tests) {
     try { await t.fn(); passed += 1; out("  ok  " + t.name); }
     catch (e) { out("FAIL  " + t.name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; return; }

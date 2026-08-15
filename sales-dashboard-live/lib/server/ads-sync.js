@@ -6,11 +6,16 @@ import {
   upsertAdsDailyRows,
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
+  getDailyAdsCoverage,
 } from "./supabase.js";
 import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js";
+// PURE durable-coverage proof (server-only; no transport import) -- used to skip an already-covered
+// requiredCoverage pair. Reused from the PPC loader so the "complete window proven" rule is IDENTICAL to the
+// gate the PPC report itself applies. No import cycle (ppc-ads-loader imports no transport/ads-sync).
+import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
-const EXPORT_LIMIT = 50000;
+export const EXPORT_LIMIT = 50000;
 // The DataDoe five-seller-id chunk. Also the requiredCoverage allowlist ceiling: a bounded canary must fit in
 // ONE export batch per source (so it can never become an accidental organization-wide run).
 export const MAX_IDS_PER_EXPORT = 5;
@@ -127,6 +132,11 @@ export const ADS_SOURCES = [
 // Currently 60 (asin/search-terms initialDays). Derived, so it can never drift from the source contracts.
 export const MAX_REQUIRED_COVERAGE_DAYS = Math.max(...ADS_SOURCES.map((source) => source.initialDays));
 
+// HARD recursive create-export ceiling for ONE requiredCoverage invocation: the parent export plus at most two
+// child exports from a single row-cap split. A fourth create attempt fails closed with a typed/admin-safe
+// ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED error, so a runaway split can never spend unbounded DataDoe tokens.
+export const MAX_REQUIRED_COVERAGE_CREATE_EXPORTS = 3;
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -209,16 +219,29 @@ async function downloadExport(apiKey, exportId) {
   return typeof body.rawContent === "string" ? JSON.parse(body.rawContent) : (Array.isArray(body) ? body : []);
 }
 
-async function fetchRange(apiKey, source, ids, from, to) {
-  const created = await createExport(apiKey, source, ids, from, to);
-  const rows = await downloadExport(apiKey, created.exportId || created.id);
+// Recursively fetch [from,to], splitting on the row cap. `create`/`download` are INJECTED (network in
+// production; deterministic doubles in tests), so the ceiling below is exercised by the executable harness --
+// not a source-text proof. `budget` (when present) is an invocation-scoped { count, max } enforced BEFORE every
+// create-export POST: a bounded coverage canary can never create more than `max` exports. A cap-sized single
+// day, or an exhausted budget, throws a typed/admin-safe error (no raw row / id / secret).
+async function fetchRangeWith(create, download, apiKey, source, ids, from, to, budget) {
+  if (budget) {
+    if (budget.count >= budget.max) {
+      const error = new Error(`ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED (max ${budget.max} create-exports per requiredCoverage invocation)`);
+      error.code = "ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED";
+      throw error;
+    }
+    budget.count += 1;
+  }
+  const created = await create(apiKey, source, ids, from, to);
+  const rows = await download(apiKey, created.exportId || created.id);
   if (rows.length < EXPORT_LIMIT) return rows;
   if (from === to) {
     throw new Error(`${source.key} reached the ${EXPORT_LIMIT.toLocaleString("en-US")} row cap for ${from}; the source must be partitioned further before it can be saved safely.`);
   }
   const middle = addDays(from, Math.floor(daysBetween(from, to) / 2));
-  const left = await fetchRange(apiKey, source, ids, from, middle);
-  const right = await fetchRange(apiKey, source, ids, addDays(middle, 1), to);
+  const left = await fetchRangeWith(create, download, apiKey, source, ids, from, middle, budget);
+  const right = await fetchRangeWith(create, download, apiKey, source, ids, addDays(middle, 1), to, budget);
   return [...left, ...right];
 }
 
@@ -528,10 +551,12 @@ export function resolveAdsAccountAllowlist(discovered, accountIds) {
 export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
   getConnections: getDataDoeConnections,
   fetchAccounts,                 // DataDoe accounts GET (network)
-  fetchRange,                    // DataDoe create-export + download (network)
+  createExport,                  // ONE DataDoe create-export POST (network)
+  downloadExport,                // DataDoe export status-poll + download (network)
   claimRefreshLock,
   releaseRefreshLock,
   getAdsSyncStates,
+  getCoverage: getDailyAdsCoverage, // durable coverage/state reader (for the idempotent skip)
   upsertAdsDailyRows,
   upsertAdDailyMetrics,
   upsertAdsSyncStates,
@@ -548,8 +573,8 @@ export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
  */
 export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURCES.map((source) => source.key), options = {}) {
   const {
-    getConnections, fetchAccounts: fetchAccountsDep, fetchRange: fetchRangeDep,
-    claimRefreshLock: claimLock, releaseRefreshLock: releaseLock,
+    getConnections, fetchAccounts: fetchAccountsDep, createExport: createExportDep, downloadExport: downloadExportDep,
+    claimRefreshLock: claimLock, releaseRefreshLock: releaseLock, getCoverage,
     getAdsSyncStates: getStates, upsertAdsDailyRows: upsertRows, upsertAdDailyMetrics: upsertMetrics,
     upsertAdsSyncStates: upsertStates, recordAdsCoverageWindows: recordCoverage, now: nowFn,
   } = deps;
@@ -564,6 +589,12 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   // Validate the BASIC option shape BEFORE claiming the lock (a bad request never holds a lock).
   const { accountIds, requiredCoverage } = validateAdsSyncOptions(options, to);
   const coverageMode = requiredCoverage != null;
+
+  // A requiredCoverage invocation does EXACTLY ONE source's work (one source, one export batch). Reject zero or
+  // multiple source keys BEFORE the lock -- zero lock / discovery / DataDoe / Supabase activity on rejection.
+  if (coverageMode && ((Array.isArray(sourceKeys) ? sourceKeys.length : 0) !== 1 || selectedSources.length !== 1)) {
+    throw new Error("Ads sync requiredCoverage requires EXACTLY one supported sourceKey per invocation (one source, one export batch); fail closed.");
+  }
 
   const lockKey = {
     reportKey: "automated-ads-sync-v1",
@@ -601,6 +632,9 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
     const states = new Map(previousStates.map((state) => [`${state.account_id}|${state.source_key}`, state]));
     const summary = { status: "completed", scope, accounts: accounts.length, rows: 0, sources: {}, deferred: false };
     if (coverageMode) summary.coverageMode = true;
+    // ONE invocation-scoped create-export budget for the whole requiredCoverage run (one source, one batch, so
+    // parent + up to two split children). Null in cadence mode => the recursion is unbounded as before.
+    const coverageExportBudget = coverageMode ? { count: 0, max: MAX_REQUIRED_COVERAGE_CREATE_EXPORTS } : null;
 
     for (const source of selectedSources) {
       const work = new Map();
@@ -617,7 +651,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
         work.set(workKey, group);
       }
       summary.sources[source.key] = coverageMode
-        ? { coverage: 0, rows: 0, failedAccounts: [], coverageFailedAccounts: [] }
+        ? { coverage: 0, skipped: 0, rows: 0, failedAccounts: [], coverageFailedAccounts: [] }
         : { initial: 0, daily: 0, monthly: 0, rows: 0, failedAccounts: [] };
 
       for (const [workKey, entries] of work) {
@@ -633,17 +667,44 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
           // EXACT window: coverageMode uses requiredCoverage verbatim for EVERY source; it NEVER calls windowFor.
           const range = coverageMode ? { from: requiredCoverage.from, to: requiredCoverage.to } : windowFor(source, mode, to);
           const connection = batch[0].account.connection;
-          const ids = batch.map((entry) => entry.account.rawAccountId);
+
+          // DURABLE IDEMPOTENT COMPLETION (coverage mode): skip an account whose durable coverage ALREADY proves
+          // the complete requested [from,to] window AND whose ads_sync_state.last_status is succeeded -- a safely
+          // skipped pair counts as SUCCESSFUL and creates ZERO exports. Only the UNCOVERED accounts are exported
+          // (never a fully-covered account). A read failure / malformed coverage NEVER authorizes a skip.
+          let workingBatch = batch;
+          if (coverageMode) {
+            const missing = [];
+            for (const entry of batch) {
+              let covered = false;
+              try {
+                const cov = await getCoverage(entry.account.id, source.key);
+                covered = !!cov && cov.read === "ok" && cov.status === "succeeded"
+                  && evaluateSourceCoverage(cov, range.from, range.to).proven === true;
+              } catch (_e) { covered = false; }
+              if (covered) {
+                summary.sources[source.key].coverage += 1;   // safely-skipped pair == successful
+                summary.sources[source.key].skipped += 1;
+              } else {
+                missing.push(entry);
+              }
+            }
+            if (missing.length === 0) continue; // every account already covered -> zero create-exports for this batch
+            workingBatch = missing;
+          }
+
+          const ids = workingBatch.map((entry) => entry.account.rawAccountId);
           try {
-            const rows = await fetchRangeDep(connection.apiKey, source, ids, range.from, range.to);
-            // FIX 1: validate the export against the EXACT batch BEFORE any row/metric/coverage/state write. Any
-            // malformed/cross-account/missing-id/wrong-marketplace evidence rejects the WHOLE batch (typed safe
-            // failed state only). A genuine zero-row export ([]) is valid covered-empty evidence.
-            const evidence = validateExportBatchRows(source, rows, batch, connection);
+            // FIX 2: the recursive fetch honors the invocation create-export budget (checked before every POST).
+            const rows = await fetchRangeWith(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget);
+            // FIX 1: validate the export against the EXACT working batch BEFORE any row/metric/coverage/state
+            // write. Any malformed/cross-account/missing-id/wrong-marketplace evidence rejects the WHOLE batch
+            // (typed safe failed state only). A genuine zero-row export ([]) is valid covered-empty evidence.
+            const evidence = validateExportBatchRows(source, rows, workingBatch, connection);
             if (!evidence.ok) {
-              const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error(`INVALID_EXPORT_EVIDENCE (${evidence.reason})`), now));
+              const failed = workingBatch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error(`INVALID_EXPORT_EVIDENCE (${evidence.reason})`), now));
               await upsertStates(failed);
-              summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
+              summary.sources[source.key].failedAccounts.push(...workingBatch.map((entry) => entry.account.id));
               continue; // zero row/metric/coverage/success writes for this batch
             }
             const normalized = rows.map((row) => rowRecord(source, row, now, connection));
@@ -661,45 +722,46 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
             if (coverageMode) {
               // Record the EXACT successful window, then REQUIRE a positive persistence acknowledgement (write ok
               // AND one recorded row per account) BEFORE marking the sync succeeded -- fail closed otherwise.
-              const ack = await recordCoverage(batch.map(({ account }) => ({
+              const ack = await recordCoverage(workingBatch.map(({ account }) => ({
                 accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
               })));
-              const confirmed = !!ack && ack.write === "ok" && ack.recorded === batch.length;
+              const confirmed = !!ack && ack.write === "ok" && ack.recorded === workingBatch.length;
               if (!confirmed) {
                 // Coverage NOT positively confirmed: do NOT advance latest_metric_date or mark succeeded.
-                const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("COVERAGE_UNCONFIRMED"), now));
+                const failed = workingBatch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("COVERAGE_UNCONFIRMED"), now));
                 await upsertStates(failed);
-                summary.sources[source.key].coverageFailedAccounts.push(...batch.map((entry) => entry.account.id));
+                summary.sources[source.key].coverageFailedAccounts.push(...workingBatch.map((entry) => entry.account.id));
                 continue;
               }
               // Confirmed: advance latest_metric_date + mark succeeded, PRESERVING cadence timestamps.
-              const savedStates = batch.map(({ account, previous }) => coverageStateRecord(account.id, source.key, previous, latestDateByAccount.get(account.id), now));
+              const savedStates = workingBatch.map(({ account, previous }) => coverageStateRecord(account.id, source.key, previous, latestDateByAccount.get(account.id), now));
               await upsertStates(savedStates);
               savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
               summary.rows += normalized.length;
-              summary.sources[source.key].coverage += batch.length;
+              summary.sources[source.key].coverage += workingBatch.length;
               summary.sources[source.key].rows += normalized.length;
             } else {
               // NORMAL cadence path -- UNCHANGED behavior. Coverage recording stays best-effort (its return is
               // ignored: a missing/unmigrated table is a safe no-op that must never break a cadence sync).
-              const savedStates = batch.map(({ account, previous }) => stateRecord(
+              const savedStates = workingBatch.map(({ account, previous }) => stateRecord(
                 account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now
               ));
               await upsertStates(savedStates);
-              await recordCoverage(batch.map(({ account }) => ({
+              await recordCoverage(workingBatch.map(({ account }) => ({
                 accountId: account.id, sourceKey: source.key, coveredFrom: range.from, coveredTo: range.to, sourceRefreshedAt: now,
               })));
               savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
               summary.rows += normalized.length;
-              summary.sources[source.key][mode] += batch.length;
+              summary.sources[source.key][mode] += workingBatch.length;
               summary.sources[source.key].rows += normalized.length;
             }
           } catch (error) {
-            // A DataDoe/persistence failure marks ONLY this batch's accounts failed; the raw error goes into the
-            // durable state record (truncated), NEVER into the returned summary (which carries account ids only).
-            const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, error, now));
+            // A DataDoe/persistence failure marks ONLY this working batch's accounts failed; the raw error goes
+            // into the durable state record (truncated), NEVER into the returned summary (account ids only). The
+            // typed ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED code (fetchRangeWith) also lands here as a safe failure.
+            const failed = workingBatch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, error, now));
             await upsertStates(failed);
-            summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
+            summary.sources[source.key].failedAccounts.push(...workingBatch.map((entry) => entry.account.id));
           }
         }
       }
