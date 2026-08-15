@@ -2720,10 +2720,11 @@ The approved timeout slicing (Appendix Q) is unchanged.
 account-bounded exact-window backfill the PPC prerequisite needs. It is **validated before the lock is claimed**
 and is **allowed only with an `accountIds` allowlist of 1..`MAX_IDS_PER_EXPORT` (5) ids** (it can never widen an
 unbounded country sweep, and it fits in ONE export batch per source so it can never go organization-wide):
-strict real `YYYY-MM-DD`, `from ≤ to`, `to` not in the future, and the **inclusive window span ≤
-`MAX_REQUIRED_COVERAGE_DAYS`** (see R.7). In coverage mode the exact `[from, to]` is the DataDoe export window
-for **every** selected source — `pickMode`/`windowFor` are never called, so an existing `ads_sync_state` that
-would otherwise pick a 21-day `daily` window can never shorten it.
+strict real `YYYY-MM-DD`, `from ≤ to`, `to` not in the future, the **inclusive window span ≤
+`MAX_REQUIRED_COVERAGE_DAYS`** (see R.7), and **EXACTLY one supported `sourceKey`** per invocation (see R.8). In
+coverage mode the exact `[from, to]` is the DataDoe export window for the selected source — `pickMode`/`windowFor`
+are never called, so an existing `ads_sync_state` that would otherwise pick a 21-day `daily` window can never
+shorten it.
 
 ### R.2 Exact per-batch effect (state + coverage), coverage mode
 
@@ -2783,7 +2784,7 @@ injected dep (`clock: () => Date.now()`) so the deferral path is deterministical
 
 ### R.6 Verification
 
-`scripts/ads-sync-canary.test.js` (**32 assertions**) drives the real DI core with injected trusted
+`scripts/ads-sync-canary.test.js` (**40 assertions**) drives the real DI core with injected trusted
 collaborators (no network/Supabase/real lock) and proves every listed property, incl. the fixes: one
 selected + one unrelated row ⇒ zero writes; missing/blank seller ⇒ whole batch fails; wrong marketplace ⇒ whole
 batch fails; non-array ⇒ whole batch fails; both selected accounts in one batch succeed; zero-row export ⇒
@@ -2813,7 +2814,44 @@ zero lock/discovery/export/write calls):
   (5)** — one export batch per source, preventing an accidental organization-wide run. **5 accepted, 6
   rejected.** The intended Gate-6 execution remains exactly the **two approved accounts**.
 
-Regressions added (part of the 32): `MAX_REQUIRED_COVERAGE_DAYS===60` and `MAX_IDS_PER_EXPORT===5`;
-`inclusiveDaySpan` across leap-day and year boundaries; 60-accepted/61-rejected; 5-accepted/6-rejected; the
-30-day PPC window accepted; overlong-window + excessive-account requests rejected **before the lock** with zero
-lock/discovery/export/write; malformed rejected before lock; the two-account Gate-6 shape validates.
+Regressions: `MAX_REQUIRED_COVERAGE_DAYS===60` and `MAX_IDS_PER_EXPORT===5`; `inclusiveDaySpan` across leap-day
+and year boundaries; 60-accepted/61-rejected; 5-accepted/6-rejected; the 30-day PPC window accepted;
+overlong-window + excessive-account requests rejected **before the lock** with zero lock/discovery/export/write;
+malformed rejected before lock; the two-account Gate-6 shape validates.
+
+### R.8 Production-token guards — one source, export ceiling, idempotent skip (fix, 2026-08-15; commit `52f6a3d`)
+
+Three guards so a requiredCoverage canary can never over-spend DataDoe create-export tokens:
+
+- **One source per invocation.** A requiredCoverage run must name **exactly one supported `sourceKey`** (one
+  source, one export batch). Zero or multiple keys are rejected **before `claimRefreshLock`** → zero lock /
+  discovery / DataDoe / Supabase activity on rejection. The Gate-6 PPC prerequisite therefore runs campaign and
+  ASIN as **separate** invocations, each returning its own `completed` + `coverageComplete:true`.
+- **Hard recursive export ceiling.** `MAX_REQUIRED_COVERAGE_CREATE_EXPORTS = 3`, threaded as one
+  invocation-scoped `{ count, max }` through the recursive fetch and checked **before every create-export POST**.
+  Parent-cap + two split children is allowed; a **fourth create fails closed** with a typed/admin-safe
+  `ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED` error. On exhaustion: **zero** Ads-row / metric / coverage /
+  successful-state writes; the failed state carries **only** the typed code (never in the returned summary); the
+  lock releases once. To keep this executable (not a source-text proof), the DI core injects `createExport` +
+  `downloadExport` and drives the real recursive `fetchRangeWith`, so the harness exercises the actual ceiling.
+- **Durable idempotent completion.** Before exporting an account/source pair, read durable coverage; **skip it
+  only** when `evaluateSourceCoverage` proves the complete requested `[from, to]` window **and**
+  `ads_sync_state.last_status === "succeeded"`. Skipped pairs count as **successful** in `coverageComplete`; only
+  the **missing** account is exported (never a complete one). A fully-covered **replay creates zero exports** and
+  returns `completed` + `coverageComplete:true`. A read failure / malformed / unproven / not-succeeded coverage
+  **never** authorizes a skip.
+
+| final state table (unchanged from R.5, plus the new terminal causes) | `status` | `coverageComplete` |
+|---|---|---|
+| every pair fully covered (exported or safely skipped), zero failures | `completed` | `true` |
+| a create-export budget exhaustion / invalid evidence / unconfirmed ack | `partial` or `failed` | `false` |
+| ≥ 2 or 0 source keys, overlong window, > 5 accounts, malformed options | rejected **before the lock** (throws) | n/a |
+
+Regressions (part of the 40): multiple/zero source keys rejected pre-lock with zero I/O; non-cap uses exactly
+one create; parent-cap + two children uses exactly three; deeper split stopped before create #4; budget
+exhaustion writes nothing and keeps the typed code out of the summary; exact successful replay creates zero
+exports; partial durable coverage exports only the missing account; malformed/read-failed/unproven/thrown
+coverage never authorizes a skip. `npm run verify` **37/37 across 17 suites** incl. `build:check`; `git diff
+--check` clean; timeout slicing / requiredCoverage semantics / lock release / source IDs / request hashes /
+Scheduler-v1 cadence / controls / frontend / routes / migrations **unchanged**. **STOP for Codex review.**
+Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending review + explicit approval.

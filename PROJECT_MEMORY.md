@@ -9175,3 +9175,33 @@ semantics / DI structure / lock release UNCHANGED. Nothing executed.
   --check clean.
 
 STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
+
+## Scheduler v2: requiredCoverage production-token guards -- one source + export ceiling + idempotent skip (OFFLINE, 2026-08-15)
+
+Commit 52f6a3d (code/tests), docs Appendix R.8. Timeout slicing / requiredCoverage semantics / lock release /
+source IDs / request hashes / Scheduler-v1 cadence UNCHANGED; normal 2-arg cadence byte-compatible. Nothing
+executed.
+
+- FIX 1 (one source per invocation): a requiredCoverage run must name EXACTLY one supported sourceKey (one
+  source, one export batch). Zero/multiple keys rejected BEFORE claimRefreshLock -> zero lock/discovery/DataDoe/
+  Supabase. Gate-6 PPC runs campaign and ASIN as SEPARATE invocations.
+- FIX 2 (hard recursive export ceiling): MAX_REQUIRED_COVERAGE_CREATE_EXPORTS=3, one invocation-scoped
+  {count,max} threaded through the recursive fetch and checked BEFORE every create-export POST. Parent-cap + two
+  children allowed; the 4th create fails closed with typed/admin-safe ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED. On
+  exhaustion: zero rows/metric/coverage/successful-state writes; failed state carries only the typed code (never
+  in the summary); lock released once. To make it EXECUTABLE, the DI core now injects createExport +
+  downloadExport and drives the real recursive fetchRangeWith (module fetchRange -> fetchRangeWith(create,
+  download, ..., budget)).
+- FIX 3 (durable idempotent completion): before exporting an account/source pair, read durable coverage
+  (injected getCoverage = getDailyAdsCoverage); SKIP only when evaluateSourceCoverage proves the complete
+  requested [from,to] window AND ads_sync_state.last_status==='succeeded'. Skipped pairs count as successful in
+  coverageComplete; only the MISSING account is exported (never a complete one); a fully-covered replay creates
+  ZERO exports -> completed + coverageComplete:true. Read failure / malformed / unproven / not-succeeded coverage
+  never authorizes a skip. evaluateSourceCoverage imported from ppc-ads-loader (no cycle).
+- Regressions: ads-sync-canary.test.js 32 -> 40 assertions (multiple/zero source keys pre-lock zero I/O; non-cap
+  1 create; parent-cap+2 children = 3; deeper split stopped before #4; budget exhaustion zero-writes + typed
+  code out of summary; exact replay zero exports; partial coverage exports only the missing account; malformed/
+  read-failed/unproven/thrown coverage never skips). Multi-source coverage tests restructured to one-source. npm
+  run verify 37/37 across 17 suites incl. build:check; git diff --check clean.
+
+STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
