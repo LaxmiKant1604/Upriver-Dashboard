@@ -35,7 +35,9 @@
 //   13. all 13 scheduler->live report_key/reportVersion/params mappings are STATICALLY PINNED against the
 //       real live route truths (api/datadoe.js literals + the insight modules' exported constants);
 //   14. STRUCTURAL isolation: no api/ route (browser-reachable surface) imports the publisher or the
-//       rollout module, the dispatcher never auto-publishes, and the v2 code lock is still frozen EMPTY.
+//       rollout module, and the dispatcher never auto-publishes. (Post-Gate-7b the v2 readiness allowlist is
+//       the 13 approved keys; the durable account rollout + report controls + publish approval still gate
+//       every dispatch/publish.)
 //
 // 7-bit ASCII, LF, no top-level await; dynamic imports after a dummy Supabase env.
 
@@ -64,6 +66,7 @@ let SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, PUBLISH_DISPOSITIONS, publishSchedulerV2S
 let buildSchedulerV2Publisher;
 let auditSchemaContract;
 let SCHEDULER_V2_READY_REPORT_KEYS;
+let CONTROLLED_REPORT_KEYS;
 let SHADOW_PLANNED_REPORT_KEYS;
 let paramsHashFor;
 let getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer;
@@ -729,16 +732,25 @@ test("(D3) publishLiveSnapshotIfNewer CAS: insert / strictly-older replace / new
 // =================================================================================================
 group("E. publisher: disabled by default; 4 independent gates; CAS; typed dispositions; LKG preserved");
 
-test("(E1) DEFAULT = code-locked: the frozen-empty ready set disables publishing before ANY collaborator runs", async () => {
-  assert.deepEqual([...SCHEDULER_V2_READY_REPORT_KEYS], [], "the v2 code lock is still frozen EMPTY");
-  const h = mkPubDeps({ deps: { codeReadyKeys: undefined } });
-  delete h.deps.codeReadyKeys; // fall back to the production default (SCHEDULER_V2_READY_REPORT_KEYS)
+test("(E1) code readiness = EXACTLY the 13 approved keys (Gate-7b cutover); the code-lock gate still refuses an unknown key with ZERO collaborator calls", async () => {
+  // Post-Gate-7b: production readiness is EXACTLY the 13 CONTROLLED_REPORT_KEYS (no extras), NOT empty.
+  assert.deepEqual([...SCHEDULER_V2_READY_REPORT_KEYS].slice().sort(), [...CONTROLLED_REPORT_KEYS].slice().sort(), "readiness = exactly the 13 approved keys");
+  assert.equal(SCHEDULER_V2_READY_REPORT_KEYS.length, 13, "exactly 13, no extras");
+  // The code-lock gate STILL functions (defensive): with an injected EMPTY codeReadyKeys, a known report is
+  // code-locked BEFORE any collaborator runs -- proving the gate mechanism independent of the production set.
+  const h = mkPubDeps({ deps: { codeReadyKeys: [] } });
   const res = await publishSchedulerV2Snapshot(h.deps, { reportKey: SM, accountId: "IN1" });
   observedDispositions.add(res.disposition);
   assert.equal(res.disposition, "code-locked");
   assert.deepEqual(
     [h.calls.settings, h.calls.rollout, h.calls.discover, h.calls.approval, h.calls.job, h.calls.shadow, h.calls.storage, h.calls.publish.length],
     [0, 0, 0, 0, 0, 0, 0, 0], "zero collaborator calls");
+  // With the PRODUCTION default readiness (the 13 keys), an UNKNOWN report key is still refused (unknown-report).
+  const h2 = mkPubDeps({ deps: { codeReadyKeys: undefined } });
+  delete h2.deps.codeReadyKeys; // production default (SCHEDULER_V2_READY_REPORT_KEYS)
+  const unknown = await publishSchedulerV2Snapshot(h2.deps, { reportKey: "not-a-v2-report", accountId: "IN1" });
+  observedDispositions.add(unknown.disposition);
+  assert.equal(unknown.disposition, "unknown-report", "an unknown key is refused at the contract lookup");
 });
 
 test("(E2) each gate fails closed with a typed disposition and ZERO publish calls", async () => {
@@ -914,8 +926,9 @@ test("(E7) every observed disposition is in the typed PUBLISH_DISPOSITIONS contr
 // =================================================================================================
 group("E2. trusted publisher composition (build-time wiring; the publish() caller can inject NOTHING)");
 
-test("(EC1) the DEFAULT composition is code-locked and exposes ONLY publish(reportKey, accountId)", async () => {
+test("(EC1) the composition exposes ONLY publish(reportKey, accountId), is frozen, and wires the code-lock gate (refuses before discovery)", async () => {
   const rt = buildSchedulerV2Publisher({
+    codeReadyKeys: [], // BUILD-TIME seam: force the code lock to prove the composition wires it + refuses early
     connections: CONNS,
     fetchAccounts: async () => { throw new Error("discovery must not run for a code-locked publish"); },
   });
@@ -923,7 +936,7 @@ test("(EC1) the DEFAULT composition is code-locked and exposes ONLY publish(repo
   assert.ok(Object.isFrozen(rt), "the composition is frozen");
   const res = await rt.publish(SM, "IN1");
   observedDispositions.add(res.disposition);
-  assert.equal(res.disposition, "code-locked", "the production frozen-EMPTY ready set is bound by default");
+  assert.equal(res.disposition, "code-locked", "the code-lock gate is bound; a non-ready key is refused before discovery runs");
 });
 
 test("(EC2) a publish() caller cannot inject code readiness or any trusted collaborator", async () => {
@@ -1245,7 +1258,7 @@ async function loadModules() {
   ({ SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, PUBLISH_DISPOSITIONS, publishSchedulerV2Snapshot } = await import("../lib/server/sync/report-publisher.js"));
   ({ buildSchedulerV2Publisher } = await import("../lib/server/sync/publisher-composition.js"));
   ({ auditSchemaContract } = await import("../lib/server/sync/schema-contract.js"));
-  ({ SCHEDULER_V2_READY_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
+  ({ SCHEDULER_V2_READY_REPORT_KEYS, CONTROLLED_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ paramsHashFor } = await import("../lib/server/report-store.js"));
   // The GENUINE snapshot hash for the fixture params, from the SAME hasher the saver + publisher use.

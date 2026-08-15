@@ -699,24 +699,32 @@ test("(multi-unit, final unit truncates) an earlier unit fully drains, the final
 
 group("scheduler-v2 dispatch: v2 readiness is fail-closed, distinct from v1 (finding 1)");
 
-test("(v1 vs v2 readiness) Scheduler v1 readiness is unchanged; Scheduler v2 readiness is fail-closed for EVERY report", () => {
+test("(v1 vs v2 readiness) Scheduler v1 readiness is unchanged; Scheduler v2 readiness = the 13 approved keys (Gate-7b), still NOT schedule-enabled by default", () => {
   const v1 = reportControlCatalog([]);
   const v2 = schedulerV2ReportControlCatalog([]);
   assert.equal(v1.find((c) => c.reportKey === "brand-sales").ready, true, "Scheduler v1 still runs Brand Sales (v1 readiness untouched)");
-  assert.equal(v2.find((c) => c.reportKey === "brand-sales").ready, false, "Scheduler v2 Brand Sales is locked (fail-closed, NOT derived from v1 enabled)");
-  assert.ok(v2.every((c) => c.ready === false && c.scheduleEnabled === false), "EVERY Scheduler v2 report is not-ready + not-scheduled by default");
+  // Gate-7b cutover: every Scheduler-v2 report is now v2-ready (all 13 passed live-cutover review) ...
+  assert.equal(v2.find((c) => c.reportKey === "brand-sales").ready, true, "Scheduler v2 Brand Sales is now cutover-ready (Gate-7b)");
+  assert.ok(v2.every((c) => c.ready === true), "EVERY Scheduler v2 report is v2-ready post-cutover");
+  // ... but readiness alone dispatches NOTHING: with EMPTY durable settings, none is schedule-enabled.
+  assert.ok(v2.every((c) => c.scheduleEnabled === false), "no report is schedule-enabled by default (durable report_sync_settings gate that)");
 });
 
-test("(default v2 lock) a DEFAULT manual OR scheduled Brand Sales request is locked out and spends ZERO exports", async () => {
-  // No injected controlCatalog => the dispatcher uses its fail-closed schedulerV2ReportControlCatalog default.
-  const sched = await dispatch({}).promise; // scheduled (no manualReportKeys)
-  assert.deepEqual(sched.selected, [], "scheduled v2 selects nothing (no report is v2 schedule-enabled)");
+test("(default v2 lock via durable data) with readiness ON (Gate-7b), a default scheduled OR manual run STILL spends ZERO exports because the durable data is closed", async () => {
+  // Scheduled default (empty durable settings): readiness is ON for all 13 but nothing is schedule-enabled,
+  // so the scheduled run selects nothing and opens no cycle.
+  const sched = await dispatch({}).promise; // scheduled (no manualReportKeys); harness default rollout is all-primary
+  assert.deepEqual(sched.selected, [], "scheduled v2 selects nothing (no report is durably schedule-enabled)");
   assert.equal(sched.cycleId, null, "scheduled v2 opens no source cycle");
+  assert.equal(sched.spent, 0, "scheduled v2 spends zero");
+  // Manual brand-sales with the PRODUCTION-DEFAULT durable rollout (ZERO accounts): readiness passes, but the
+  // empty account rollout drains the run before any cycle/export (the manual path is NOT gated by settings, so
+  // the account rollout is the operative lock here).
   const dd = makeDataDoe();
-  const man = await dispatch({ dataDoe: dd, manualReportKeys: ["brand-sales"] }).promise; // manual Brand Sales
-  assert.deepEqual(man.selected, [], "manual Brand Sales is NOT dispatched under the fail-closed v2 catalog");
-  assert.deepEqual(man.lockedOut, ["brand-sales"], "brand-sales is reported locked-out (v2 not-ready)");
-  assert.equal(dd.totalCreates(), 0, "a default v2 Brand Sales request spends ZERO exports");
+  const man = await dispatch({ dataDoe: dd, manualReportKeys: ["brand-sales"], loadAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [] }) }).promise;
+  assert.equal(man.cycleId, null, "manual brand-sales with an EMPTY durable rollout opens no cycle");
+  assert.deepEqual(man.accountRollout, { selected: 0, reason: "zero-accounts-enabled" }, "drained by the empty durable rollout");
+  assert.equal(dd.totalCreates(), 0, "a default manual Brand Sales request spends ZERO exports");
 });
 
 /* ===================== re-review finding 2: strict truncation on the newly dispatched contracts ===================== */

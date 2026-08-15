@@ -3,8 +3,10 @@
 // Promotes ONE validated scheduler-v2/<reportKey> shadow snapshot into the EXACT live report_snapshots
 // identity the frontend already reads -- and nothing else. Publishing happens ONLY when ALL FOUR independent
 // gates hold (each fails closed):
-//   1. CODE readiness  -- reportKey is in SCHEDULER_V2_READY_REPORT_KEYS (frozen EMPTY today, so the publisher
-//                         is disabled by default at the code level);
+//   1. CODE readiness  -- reportKey is in SCHEDULER_V2_READY_REPORT_KEYS (post-Gate-7b: EXACTLY the 13 approved
+//                         CONTROLLED_REPORT_KEYS; an unknown/rogue key is still code-locked). Passing this gate
+//                         does NOT publish -- gates 2-4 (durable report enable, durable account enable, and an
+//                         explicit publish approval) remain, and are all closed at cutover;
 //   2. DURABLE report enable -- report_sync_settings.schedule_enabled === true for the report;
 //   3. DURABLE account enable -- the Gate-7 account rollout selects the exact account (allowlist/all-primary);
 //   4. EXPLICIT publish approval -- scheduler_publish_approvals.approved === true for the exact
@@ -125,7 +127,8 @@ const CAS_OUTCOME_DISPOSITION = Object.freeze({
  * Publish ONE (reportKey, accountId) shadow snapshot to its live identity, fail-closed. `deps` supplies every
  * trusted collaborator (the trusted production composition wires them; tests inject doubles -- a caller of
  * the composed publish() can NEVER supply any of these):
- *   codeReadyKeys        -- default SCHEDULER_V2_READY_REPORT_KEYS (frozen EMPTY => publisher disabled);
+ *   codeReadyKeys        -- default SCHEDULER_V2_READY_REPORT_KEYS (post-Gate-7b: the 13 approved keys; an
+ *                        unknown key is code-locked); passing this gate still requires gates 2-4;
  *   getReportSyncSettings() -> rows with { report_key, schedule_enabled };
  *   loadAccountRollout() -> typed rollout state (getSchedulerAccountRollout);
  *   discoverPrimaryAccounts() -> FRESH (memoized per composition) classified ACTIVE PRIMARY directory rows

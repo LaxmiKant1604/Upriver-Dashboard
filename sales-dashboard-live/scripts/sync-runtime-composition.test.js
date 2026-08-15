@@ -251,9 +251,16 @@ test("(typed blockers) missing config / missing audit reader / unlocked control 
   assert.ok(codes.includes("ENV_MISSING"), "missing env => ENV_MISSING");
   assert.ok(codes.includes("PRIMARY_CONNECTION_MISSING"), "unconfigured connection => PRIMARY_CONNECTION_MISSING");
   assert.ok(codes.includes("SCHEMA_AUDIT_UNAVAILABLE"), "no readFile => SCHEMA_AUDIT_UNAVAILABLE (never a vacuous pass)");
-  // An unexpectedly-unlocked v2 control fails closed.
-  const unlocked = schedulerV2Preflight({ env: { DATADOE_API_KEY: "x", SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k" }, getConnections: () => CONNS, controlCatalog: mkCatalog(["brand-sales"]), readFile: realReadFile });
-  assert.ok(unlocked.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "a ready v2 control => V2_CONTROLS_UNLOCKED");
+  // Post-Gate-7b the preflight fails closed on (a) a report SCHEDULED with empty durable settings, or (b) an
+  // UNEXPECTED (non-approved) ready key -- never on an approved report merely being ready.
+  const env = { DATADOE_API_KEY: "x", SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k" };
+  const scheduled = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["brand-sales"]), readFile: realReadFile }); // mkCatalog marks it scheduleEnabled
+  assert.ok(scheduled.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "a scheduled-by-default v2 control => V2_CONTROLS_UNLOCKED");
+  const rogue = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["not-a-controlled-report"], []), readFile: realReadFile }); // ready but not scheduled, and NOT approved
+  assert.ok(rogue.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "an unexpected (non-approved) ready key => V2_CONTROLS_UNLOCKED");
+  // An APPROVED report merely being ready (not scheduled) is EXPECTED post-cutover -- no blocker.
+  const approvedReady = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["brand-sales"], []), readFile: realReadFile }); // ready, NOT scheduled
+  assert.ok(!approvedReady.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "an approved ready-but-not-scheduled report is NOT a blocker");
 });
 
 /* ===================== migration readiness (static audit) ===================== */
@@ -526,12 +533,14 @@ test("(audit fix 2) auditSchemaContract always returns a TOTAL {ok,matrix,blocke
 
 group("runtime composition: dispatch behavior (cache-only, locked, ready cycle, discovery)");
 
-test("(default locked) the composed runtime with DEFAULT v2 controls dispatches zero reports/exports", async () => {
-  const { rt, dd } = makeRuntime({}); // no controlCatalog override => production fail-closed default
+test("(default locked via durable data) with readiness ON (Gate-7b) but the durable rollout EMPTY, the composed runtime dispatches zero reports/exports", async () => {
+  // Production-default durable state = ZERO rollout accounts. The default catalog now marks all 13 v2-ready,
+  // but the empty durable rollout drains a manual run before any cycle/export.
+  const { rt, dd } = makeRuntime({ getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [] }) });
   const r = await rt.run({ bucket: "us", cycleDate: "2026-08-11", asOf: "2025-08-10", asOfFor: asOfForUS, manualReportKeys: ["brand-sales"] });
-  assert.deepEqual(r.selected, [], "brand-sales is v2-locked by the default catalog");
-  assert.deepEqual(r.lockedOut, ["brand-sales"]);
-  assert.equal(dd.totalCreates(), 0, "zero DataDoe exports under the default locked controls");
+  assert.equal(r.cycleId, null, "no cycle opens under the default-empty durable rollout");
+  assert.deepEqual(r.accountRollout, { selected: 0, reason: "zero-accounts-enabled" }, "drained by the empty durable rollout");
+  assert.equal(dd.totalCreates(), 0, "zero DataDoe exports under the default-empty durable rollout");
 });
 
 test("(ready cycle) an injected ready control drives ONE complete shadow cycle; snapshot is scheduler-v2/* namespaced; derivation is cache-only (zero DataDoe in derive)", async () => {

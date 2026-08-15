@@ -46,6 +46,7 @@ const SUITES = [
   "test:timeout-slicing",
   "test:ads-sync-canary",
   "test:gate7-rollout-publisher",
+  "test:gate7b-in-cutover",
   "build:check",
 ];
 

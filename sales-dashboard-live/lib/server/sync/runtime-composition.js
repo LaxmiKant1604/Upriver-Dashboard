@@ -17,7 +17,7 @@ import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-driver.js";
 import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
-import { schedulerV2ReportControlCatalog } from "./report-controls.js";
+import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS } from "./report-controls.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
@@ -333,12 +333,19 @@ export function schedulerV2Preflight(overrides = {}) {
     push({ code: "SCHEMA_AUDIT_UNAVAILABLE", message: "schema contract audit reader was not provided; cannot prove migration readiness" });
   }
 
-  // 6) v2 controls remain locked -- fail closed if ANY report is v2-ready or v2-scheduled.
+  // 6) v2 controls -- fail closed if any UNEXPECTED (non-approved) report is v2-ready, OR if ANY report is
+  //    v2-scheduled with EMPTY durable settings (nothing may dispatch by default). Post-Gate-7b the readiness
+  //    allowlist is EXACTLY the 13 approved CONTROLLED_REPORT_KEYS, so a ready APPROVED report is expected (not
+  //    a blocker); only an unknown/rogue ready key or a scheduled-by-default report is refused. This preflight
+  //    is no-I/O: it cannot read the durable account rollout / report_sync_settings that gate the live run --
+  //    those are verified against production separately (Appendix W / Appendix Y).
   const catalog = (typeof controlCatalog === "function" ? controlCatalog([]) : []) || [];
   const ready = catalog.filter((c) => c && c.ready).map((c) => c.reportKey);
   const scheduled = catalog.filter((c) => c && c.scheduleEnabled).map((c) => c.reportKey);
-  checks.v2ControlsLocked = { ready, scheduled, ok: ready.length === 0 && scheduled.length === 0 };
-  if (ready.length || scheduled.length) push({ code: "V2_CONTROLS_UNLOCKED", ready, scheduled, message: "a Scheduler v2 control is unexpectedly ready/scheduled; refusing (fail closed)" });
+  const approvedReady = new Set(CONTROLLED_REPORT_KEYS);
+  const unexpectedReady = ready.filter((k) => !approvedReady.has(k));
+  checks.v2ControlsLocked = { ready, scheduled, unexpectedReady, ok: unexpectedReady.length === 0 && scheduled.length === 0 };
+  if (unexpectedReady.length || scheduled.length) push({ code: "V2_CONTROLS_UNLOCKED", ready: unexpectedReady, scheduled, message: "a Scheduler v2 control is unexpectedly ready (non-approved) or scheduled with empty durable settings; refusing (fail closed)" });
 
   return { ready: blockers.length === 0, blockers, checks, expected };
 }

@@ -39,7 +39,8 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     loadStoragePayload = getReportSnapshotStoragePayload,
     publishLive = publishLiveSnapshotIfNewer,
     // BUILD-TIME test seam only (like every override above): production callers pass nothing and get the
-    // FROZEN EMPTY production set -- the composed publish() surface has no way to supply or widen this.
+    // frozen production readiness set (post-Gate-7b: the 13 approved keys) -- the composed publish() surface
+    // has no way to supply or widen this, and gates 2-4 (durable enable + approval) still gate every publish.
     codeReadyKeys = SCHEDULER_V2_READY_REPORT_KEYS,
   } = overrides;
 
