@@ -72,8 +72,13 @@ REMAINS UNAPPLIED (new frozen SHA-256 `0d715eb78724c6a9c942fde9948b2e995e2f9466d
 migrations 1–5 byte-identical.** No control unlock, publish, deploy, schedule, or migration apply has happened
 in Gate 7. **Gate 7 PASSED final Codex review; the Gate 7a APPLY package (apply ONLY
 `20260816_account_rollout.sql`, the reviewed single-file gate) is PREPARED as Appendix W but NOT EXECUTED** —
-no production connection was made preparing it. Every remaining live step is **gated on explicit human
-approval**, one step at a time.
+no production connection was made preparing it. **Appendix W was HARDENED per Codex re-review (2026-08-15,
+docs-only):** its inventory/verification steps are genuinely read-only (`BEGIN; SET TRANSACTION READ ONLY; …`
+with an always-ROLLBACK `finally`), every object check is scoped to the exact `public` relation/function OID (a
+same-named object in another schema can neither PASS nor false-STOP), the unchanged-data claim is backed by
+deterministic count+content digests compared before/after the apply (no "counts alone"), and the complete table
+ACL is enumerated + asserted before COMMIT. Every remaining live step is **gated on explicit human approval**,
+one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3324,19 +3329,24 @@ no deploy, no schedule.
 
 > **NOTHING in this appendix has been run.** No production connection was made preparing it. It is the exact
 > package a reviewer/operator executes **only after explicit written human approval**, one migration file only,
-> then STOPS for W.4 verification. It follows the identical, already-reviewed single-file gate shape used for
-> Migration 5 (Appendix O) and Migration 1 (Appendix B).
+> then STOPS for W.4. It follows the reviewed single-file gate shape of Migration 5 (Appendix O) and Migration 1
+> (Appendix B), hardened per Codex re-review: the verification steps are **genuinely read-only** (executed inside
+> `BEGIN; SET TRANSACTION READ ONLY; … ROLLBACK`, rolled back even on an assertion failure), every object check
+> is **scoped to the exact `public` relation/function OID** (a same-named object in another schema can neither
+> PASS nor false-STOP), the unchanged-data claim is backed by **deterministic count+content digests** compared
+> before/after the apply (never "counts alone"), and the **complete table ACL** is enumerated and asserted
+> before COMMIT.
 
-**Do NOT use `npm run db:migrate` for Gate 7a.** `scripts/apply-supabase-migrations.mjs` applies **every**
-pending `.sql` file it finds — here that is Migration 6 alone, but the gate still forbids the bulk runner so the
-apply stays single-file, advisory-locked, hash-verified, and ledger-fail-closed. There is **no** Scheduler-v2
-kickoff/cron migration in `supabase/migrations/`, so no schedule can be applied here regardless.
+**Working directory + connection:** run every command below from **`sales-dashboard-live/`** (where `pg` resolves
+and the git-ignored `../.env.local` holds `POSTGRES_URL`). Each runner is a throwaway `.mjs` file created via a
+quoted heredoc and **removed after** (never committed). **Do NOT use `npm run db:migrate`** — it would bulk-apply;
+Gate 7a is single-file, advisory-locked, hash-verified, ledger-fail-closed. There is no Scheduler-v2 kickoff/cron
+migration present, so no schedule can be applied here regardless. No `DROP`, no retry, no destructive repair.
 
 ### W.0 Offline preflight (must ALL PASS before connecting)
 
-- **HEAD** on `feature/scheduler-v2` includes **`85d49a0`** (Gate-7 correction-tranche-2 docs) — Gate 7 passed
-  final Codex review at this HEAD.
-- **Frozen input SHA-256 (re-verify byte-for-byte before connecting; the apply script re-checks #6 in-process):**
+- **HEAD** on `feature/scheduler-v2` includes **`85d49a0`** — Gate 7 passed final Codex review at this HEAD.
+- **Frozen input SHA-256 (re-verify byte-for-byte before connecting; the W.2 apply re-checks #6 in-process):**
 
 ```
 1328bc0fdbe430670d2ea1dc8bdf4b1a223feb04cd6eb5c0080ef26a1bdc691e  supabase/migrations/20260807_scheduler_v2.sql        (migration 1 — FROZEN)
@@ -3351,406 +3361,435 @@ kickoff/cron migration in `supabase/migrations/`, so no schedule can be applied 
   `lib/server/sync/report-controls.js`) — a code check, not a DB object; re-grep before apply.
 - `npm run verify` green (38 steps / 18 suites incl. `build:check`); `git diff --check` clean; working tree only
   `HANDOFF.md` + `.worktrees/` untracked.
-- `POSTGRES_URL` present + nonblank in the git-ignored untracked env file (checked by NAME only; never printed).
+- `POSTGRES_URL` present + nonblank in `../.env.local` (checked by NAME only; never printed).
 
 **STOP** if HEAD does not contain `85d49a0`, any of the six hashes differs, the readiness allowlist is non-empty,
 `verify`/`diff --check` is not clean, or `POSTGRES_URL` is absent.
 
-### W.1 Pre-apply read-only inventory (run + REVIEW FIRST; STOP on any hit)
+### W.1 Pre-apply read-only inventory (genuinely read-only; rolls back always)
 
-Run these read-only queries and review the output **before** the apply. Expected FIRST-APPLY state: Migration 6
-has **0** ledger rows; every Migration-6 table / function / trigger / constraint is **absent**; every
-prerequisite and every migration-1–5 object is **present + intact**; 13 controls all paused; no Scheduler-v2
-`pg_cron` schedule. If ANY Migration-6 target object or its ledger row already exists — or any prerequisite /
-prior-migration object is missing — **STOP; do not apply**; capture the exact shape and report it for review.
-
-```sql
--- W1) Migration-6 ledger row must be ABSENT; migrations 1-5 must each be recorded EXACTLY ONCE.
---     SAFE whether or not the ledger table exists yet (checks to_regclass first, queries via dynamic EXECUTE).
-do $$
-declare
-  v_ledger_exists boolean := to_regclass('public.app_schema_migrations') is not null;
-  v_m6 boolean := false;
-  v_counts text := '(ledger absent)';
-begin
-  if v_ledger_exists then
-    execute 'select exists (select 1 from public.app_schema_migrations where filename = $1)'
-      into v_m6 using '20260816_account_rollout.sql';
-    execute $q$
-      select string_agg(f || '=' || c::text, ' ')
-        from (
-          select m.f, coalesce(count(l.filename),0) c
-            from (values ('20260807_scheduler_v2.sql'),('20260810_ads_sync_coverage.sql'),
-                         ('20260810_report_sync_controls.sql'),('20260811_sync_source_job_owners.sql'),
-                         ('20260815_sync_cycle_finalize.sql'),('20260816_account_rollout.sql')) m(f)
-            left join public.app_schema_migrations l on l.filename = m.f
-           group by m.f order by m.f
-        ) s
-    $q$ into v_counts;
-  end if;
-  raise notice 'ledger_exists:% m6_recorded:% counts:[%]', v_ledger_exists, v_m6, v_counts;
-  if v_m6 then
-    raise exception 'STOP: 20260816_account_rollout.sql already recorded (Gate 7a expects the FIRST apply)';
-  end if;
-end $$;
--- Expected NOTICE: ledger_exists:true  m6_recorded:false
---   counts:[20260807_scheduler_v2.sql=1 20260810_ads_sync_coverage.sql=1 20260810_report_sync_controls.sql=1
---           20260811_sync_source_job_owners.sql=1 20260815_sync_cycle_finalize.sql=1 20260816_account_rollout.sql=0]
--- STOP if any migration-1..5 count is not exactly 1, or m6_recorded:true.
-
--- W2) the three Migration-6 tables must be ABSENT (expect all three NULL).
-select to_regclass('public.scheduler_account_rollout')   as scheduler_account_rollout,
-       to_regclass('public.scheduler_rollout_mode')       as scheduler_rollout_mode,
-       to_regclass('public.scheduler_publish_approvals')  as scheduler_publish_approvals;
-
--- W3) the trigger function must be ABSENT (expect NULL).
-select to_regprocedure('public.scheduler_rollout_touch()') as scheduler_rollout_touch;
-
--- W4) the three Migration-6 triggers must be ABSENT (expect 0 rows).
-select tgname from pg_trigger
- where not tgisinternal
-   and tgname in ('scheduler_account_rollout_touch','scheduler_rollout_mode_touch','scheduler_publish_approvals_touch');
-
--- W5) all 11 Migration-6 named constraints must be ABSENT (expect 0 rows).
-select conname from pg_constraint
- where conname in (
-   'scheduler_account_rollout_account_id_nonblank','scheduler_account_rollout_account_id_canonical',
-   'scheduler_account_rollout_account_id_primary_only','scheduler_rollout_mode_singleton',
-   'scheduler_publish_approvals_report_key_nonblank','scheduler_publish_approvals_report_key_canonical',
-   'scheduler_publish_approvals_account_id_nonblank','scheduler_publish_approvals_account_id_canonical',
-   'scheduler_publish_approvals_account_id_primary_only','scheduler_publish_approvals_approved_by_canonical',
-   'scheduler_publish_approvals_audited');
-
--- W6) required PREREQUISITES must ALREADY exist; STOP on any NULL / missing role.
-select to_regclass('public.app_schema_migrations') as app_schema_migrations,  -- ledger
-       to_regclass('public.report_sync_settings')  as report_sync_settings,   -- migration 3 (13 controls)
-       to_regclass('auth.users')                    as auth_users,             -- auth prerequisite
-       to_regprocedure('public.touch_updated_at()') as touch_updated_at;       -- shared touch fn (NOT reused here, sanity)
-select rolname from pg_roles where rolname in ('service_role','anon','authenticated') order by rolname; -- expect 3 rows
-
--- W7) the five operational Scheduler-v2 tables + report_sync_settings must be present + INTACT (expect 6 non-NULL).
-select to_regclass('public.sync_cycles')          as sync_cycles,
-       to_regclass('public.sync_source_jobs')      as sync_source_jobs,
-       to_regclass('public.sync_report_jobs')      as sync_report_jobs,
-       to_regclass('public.sync_source_job_owners')as sync_source_job_owners,
-       to_regclass('public.ads_sync_coverage')     as ads_sync_coverage,
-       to_regclass('public.report_sync_settings')  as report_sync_settings;
--- Column-count sanity (expect 18 / 27 / 25 / 15 for the four sync tables; matches Appendix O.2):
-select table_name, count(*) as cols from information_schema.columns
- where table_schema='public' and table_name in ('sync_cycles','sync_source_jobs','sync_report_jobs','sync_source_job_owners')
- group by table_name order by table_name;
-
--- W8) existing Gate-5/Gate-6 evidence intact: the finalize RPC + its three guard triggers still present
---     (migration 5), and the Gate-5 canary cycle still terminal succeeded (untouched by Gate 7a).
-select to_regprocedure('public.finalize_sync_cycle(uuid)') as finalize_sync_cycle;     -- expect non-NULL
-select count(*) as no_append_triggers from pg_trigger
- where not tgisinternal and tgname in
-   ('sync_source_jobs_no_append_terminal','sync_source_job_owners_no_append_terminal','sync_report_jobs_no_append_terminal');
--- expect no_append_triggers = 3
-select id, status, source_total, source_succeeded, source_failed, report_total, report_succeeded, report_failed
-  from public.sync_cycles order by created_at;
--- expect the Gate-5 canary 57afc1fb-... status='succeeded' (2/2/0 sources, 1/1/0 reports) + the two Gate-6
--- Cycle-2 cycles (non-us c70879e8-... 'succeeded' 133/133/0; us b0415a5b-... 'partial' 135/84/51) -- read-only.
-
--- W9) exactly 13 report controls, ALL paused (expect total=13, enabled=0).
-select count(*) as total, count(*) filter (where schedule_enabled) as enabled from public.report_sync_settings;
-
--- W10) NO Scheduler-v2 pg_cron schedule (expect 0 rows; also SAFE if cron is not installed).
-do $$
-declare v_has_cron boolean := to_regclass('cron.job') is not null; v_n int := 0;
-begin
-  if v_has_cron then execute 'select count(*) from cron.job' into v_n; end if;
-  raise notice 'cron_installed:% cron_jobs:%', v_has_cron, v_n;
-end $$;
--- expect cron_installed:false (or, if installed, zero Scheduler-v2 jobs); STOP if any Scheduler-v2 schedule exists.
-```
-
-A read-only **Node/pg** equivalent of W1 (checks `to_regclass` first, queries the ledger only when present):
+`gate7a-w1-inventory.mjs` runs inside `BEGIN; SET TRANSACTION READ ONLY` and **always ROLLBACKs** (in a
+`finally`, even when an assertion throws), so it can never write. Every existence/absence check is scoped to the
+exact `public` OID. It captures and PRINTS the unchanged-data **BASELINE** (`cycles_count`/`cycles_digest`/
+`snap_count`/`snap_digest`) — record that line; W.4 re-checks against it. **STOP on any thrown assertion** (the
+exact reason prints); do not apply.
 
 ```bash
-node --input-type=module -e '
+cat > gate7a-w1-inventory.mjs <<'NODE'
 import pg from "pg";
-const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
-const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
-try {
-  const reg = await c.query("select to_regclass($1) as t", ["public.app_schema_migrations"]);
-  const ledgerExists = reg.rows[0].t !== null;
-  let m6 = false, counts = "(ledger absent)";
-  if (ledgerExists) {
-    m6 = (await c.query("select 1 from public.app_schema_migrations where filename=$1",
-      ["20260816_account_rollout.sql"])).rowCount > 0;
-    const r = await c.query(
-      `select m.f, coalesce(count(l.filename),0)::int c
-         from (values ($1),($2),($3),($4),($5),($6)) m(f)
-         left join public.app_schema_migrations l on l.filename=m.f group by m.f order by m.f`,
-      ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","20260810_report_sync_controls.sql",
-       "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql","20260816_account_rollout.sql"]);
-    counts = r.rows.map(x => x.f + "=" + x.c).join(" ");
-  }
-  console.log("ledger_exists:" + ledgerExists + " m6_recorded:" + m6 + " counts:[" + counts + "]");
-  if (m6) console.log("STOP: 20260816_account_rollout.sql already recorded -- do NOT apply");
-} finally { await c.end(); }
-'
-```
-
-> The `app_schema_migrations` ledger legitimately already exists (created by the first-ever migration run).
-> `ledger_exists:true` is fine; only **Migration 6's** row must be absent AND migrations 1-5 each recorded once.
-
-### W.2 Hardened apply command (single migration, single transaction, advisory-locked, hash-verified, ledger fail-closed)
-
-Applies **only** `20260816_account_rollout.sql`, in ONE transaction: acquires the transaction-scoped advisory
-lock **before** any ledger/object read; requires migrations 1-5 recorded exactly once; refuses if Migration 6 is
-already recorded; re-checks every Migration-6 target object is absent **inside the transaction**; re-verifies the
-frozen SHA-256 **before executing**; runs the frozen file; records the ledger row with a **plain** INSERT (no
-`ON CONFLICT` — a repeat must surface, not hide); COMMITs once; rolls back on any mismatch/error. Same connection
-convention as `apply-supabase-migrations.mjs` (`POSTGRES_URL` + `sslmode=no-verify` for the Vercel pooler cert
-on Windows). No `db:migrate`, no retry, no `DROP`, no destructive repair.
-
-```bash
-node --input-type=module -e '
-import pg from "pg"; import { readFileSync } from "node:fs"; import { createHash } from "node:crypto";
-const FILE = "20260816_account_rollout.sql";
-const PATH = "sales-dashboard-live/supabase/migrations/" + FILE;
-const FROZEN = "0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735";
+const M6 = "20260816_account_rollout.sql";
 const PRIOR = ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","20260810_report_sync_controls.sql",
                "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql"];
 const M6_TABLES = ["public.scheduler_account_rollout","public.scheduler_rollout_mode","public.scheduler_publish_approvals"];
+const M6_TRIGGERS = ["scheduler_account_rollout_touch","scheduler_rollout_mode_touch","scheduler_publish_approvals_touch"];
 const M6_CONSTRAINTS = ["scheduler_account_rollout_account_id_nonblank","scheduler_account_rollout_account_id_canonical",
   "scheduler_account_rollout_account_id_primary_only","scheduler_rollout_mode_singleton",
   "scheduler_publish_approvals_report_key_nonblank","scheduler_publish_approvals_report_key_canonical",
   "scheduler_publish_approvals_account_id_nonblank","scheduler_publish_approvals_account_id_canonical",
   "scheduler_publish_approvals_account_id_primary_only","scheduler_publish_approvals_approved_by_canonical",
   "scheduler_publish_approvals_audited"];
-// (0) verify the frozen hash BEFORE connecting/applying.
-const body = readFileSync(PATH, "utf8");
-const sha = createHash("sha256").update(readFileSync(PATH)).digest("hex");
-if (sha !== FROZEN) throw new Error("REFUSING: " + FILE + " SHA-256 " + sha + " != frozen " + FROZEN);
+const NOAPPEND = [["sync_source_jobs_no_append_terminal","public.sync_source_jobs"],
+                  ["sync_source_job_owners_no_append_terminal","public.sync_source_job_owners"],
+                  ["sync_report_jobs_no_append_terminal","public.sync_report_jobs"]];
+const OPS = { sync_cycles:18, sync_source_jobs:27, sync_report_jobs:25, sync_source_job_owners:15 };
+// Deterministic unchanged-data digest: per-row md5 over the WHOLE row (payload content included), aggregated in
+// a stable order. Only the 32-char md5 is emitted -- NEVER a payload/path.
+const DIGEST_SQL =
+  "select (select count(*)::int from public.sync_cycles) as cycles_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select id::text k, md5(sc::text) rh from public.sync_cycles sc) q), 'EMPTY') as cycles_digest," +
+  " (select count(*)::int from public.report_snapshots where report_key like 'scheduler-v2/%') as snap_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select (report_key||'/'||account_id||'/'||params_hash) k, md5(rs::text) rh" +
+  "      from public.report_snapshots rs where report_key like 'scheduler-v2/%') q), 'EMPTY') as snap_digest";
+const ok = (cond, msg) => { if (!cond) throw new Error("STOP: " + msg); };
 const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
-const c = new pg.Client({ connectionString: url.toString() }); await c.connect();
+const c = new pg.Client({ connectionString: url.toString() });
+await c.connect();
 try {
   await c.query("begin");
-  // (1) transaction-scoped advisory lock BEFORE any ledger/object check (auto-released on commit/rollback).
-  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260816, 1]);
-  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
-  // (2) migrations 1-5 must be recorded EXACTLY once.
+  await c.query("set transaction read only");   // GENUINE read-only: any write below would throw.
+
+  // Ledger: table present; migrations 1-5 each exactly once; Migration 6 absent.
+  ok((await c.query("select to_regclass('public.app_schema_migrations') is not null e")).rows[0].e, "app_schema_migrations ledger absent");
   for (const f of PRIOR) {
     const n = (await c.query("select count(*)::int c from public.app_schema_migrations where filename=$1", [f])).rows[0].c;
-    if (n !== 1) throw new Error("REFUSING: prerequisite migration " + f + " has " + n + " ledger rows (expected exactly 1)");
+    ok(n === 1, "prerequisite migration " + f + " has " + n + " ledger rows (expected 1)");
   }
-  // (3) fail closed if Migration 6 already recorded (do NOT hide a repeat).
-  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [FILE]);
-  if (seen.rowCount) throw new Error("REFUSING: " + FILE + " already applied at " + seen.rows[0].applied_at);
-  // (4) re-check ALL target objects are ABSENT inside the transaction (fail closed if any pre-exists).
-  for (const t of M6_TABLES) {
-    if ((await c.query("select to_regclass($1) as t", [t])).rows[0].t !== null) throw new Error("REFUSING: table " + t + " already exists");
+  ok((await c.query("select count(*)::int c from public.app_schema_migrations where filename=$1", [M6])).rows[0].c === 0,
+     M6 + " already recorded (Gate 7a is the FIRST apply)");
+
+  // Migration-6 target objects ABSENT, each PUBLIC-scoped (a same-named object in another schema never matches).
+  for (const t of M6_TABLES) ok((await c.query("select to_regclass($1) o", [t])).rows[0].o === null, "target table " + t + " already exists");
+  ok((await c.query("select to_regprocedure('public.scheduler_rollout_touch()') o")).rows[0].o === null, "public.scheduler_rollout_touch() already exists");
+  ok((await c.query("select count(*)::int c from pg_trigger t join pg_class rel on rel.oid=t.tgrelid" +
+     " join pg_namespace n on n.oid=rel.relnamespace where not t.tgisinternal and n.nspname='public' and t.tgname=any($1)", [M6_TRIGGERS])).rows[0].c === 0,
+     "a Migration-6 trigger already exists on a public relation");
+  ok((await c.query("select count(*)::int c from pg_constraint con join pg_namespace n on n.oid=con.connamespace" +
+     " where n.nspname='public' and con.conname=any($1)", [M6_CONSTRAINTS])).rows[0].c === 0,
+     "a Migration-6 named constraint already exists in public");
+
+  // Prerequisites present.
+  ok((await c.query("select to_regclass('public.report_sync_settings') o")).rows[0].o !== null, "report_sync_settings missing");
+  ok((await c.query("select to_regclass('auth.users') o")).rows[0].o !== null, "auth.users missing");
+  const roles = (await c.query("select array_agg(rolname order by rolname) a from pg_roles where rolname in ('service_role','anon','authenticated')")).rows[0].a || [];
+  ok(roles.length === 3, "expected service_role/anon/authenticated, got " + roles);
+
+  // Operational Scheduler-v2 tables present + exact column counts; ads_sync_coverage present.
+  for (const [t, cols] of Object.entries(OPS)) {
+    const n = (await c.query("select count(*)::int c from information_schema.columns where table_schema='public' and table_name=$1", [t])).rows[0].c;
+    ok(n === cols, "public." + t + " has " + n + " columns (expected " + cols + ")");
   }
-  if ((await c.query("select to_regprocedure($1) as p", ["public.scheduler_rollout_touch()"])).rows[0].p !== null) throw new Error("REFUSING: scheduler_rollout_touch() already exists");
-  const cn = (await c.query("select count(*)::int c from pg_constraint where conname = any($1)", [M6_CONSTRAINTS])).rows[0].c;
-  if (cn !== 0) throw new Error("REFUSING: " + cn + " Migration-6 named constraint(s) already exist");
-  const tg = (await c.query("select count(*)::int c from pg_trigger where not tgisinternal and tgname = any($1)",
-    [["scheduler_account_rollout_touch","scheduler_rollout_mode_touch","scheduler_publish_approvals_touch"]])).rows[0].c;
-  if (tg !== 0) throw new Error("REFUSING: " + tg + " Migration-6 trigger(s) already exist");
-  // (5) execute ONLY the frozen Migration-6 body (whole file runs inside this one transaction).
+  ok((await c.query("select to_regclass('public.ads_sync_coverage') o")).rows[0].o !== null, "ads_sync_coverage missing");
+
+  // Gate-5/6 evidence: finalize RPC present; each no-append trigger on its EXACT table, executing the EXACT
+  // guard function -- proven by OID (tgrelid + tgfoid), never by name.
+  ok((await c.query("select to_regprocedure('public.finalize_sync_cycle(uuid)') o")).rows[0].o !== null, "finalize_sync_cycle(uuid) missing");
+  ok((await c.query("select to_regprocedure('public.reject_append_to_terminal_cycle()') o")).rows[0].o !== null, "reject_append_to_terminal_cycle() missing");
+  for (const [trig, tbl] of NOAPPEND) {
+    const r = (await c.query("select (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok" +
+      " from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
+    ok(r.length === 1, "no-append trigger " + trig + " not found on exactly " + tbl);
+    ok(r[0].fn_ok === true, trig + " does not execute public.reject_append_to_terminal_cycle");
+  }
+
+  // Exactly 13 report controls, ALL paused.
+  const ctrl = (await c.query("select count(*)::int total, count(*) filter (where schedule_enabled)::int enabled from public.report_sync_settings")).rows[0];
+  ok(ctrl.total === 13, "expected 13 report controls, got " + ctrl.total);
+  ok(ctrl.enabled === 0, ctrl.enabled + " report control(s) schedule_enabled=true (expected 0)");
+
+  // No Scheduler-v2 pg_cron schedule.
+  const cronInstalled = (await c.query("select to_regclass('cron.job') is not null e")).rows[0].e;
+  let cronJobs = 0;
+  if (cronInstalled) cronJobs = (await c.query("select count(*)::int c from cron.job")).rows[0].c;
+  ok(cronJobs === 0, cronJobs + " cron job(s) present (expected 0)");
+
+  // BASELINE unchanged-data digests (payload content hashed; NEVER printed). RECORD this line for W.4.
+  const b = (await c.query(DIGEST_SQL)).rows[0];
+  console.log("BASELINE cycles_count=" + b.cycles_count + " cycles_digest=" + b.cycles_digest +
+              " snap_count=" + b.snap_count + " snap_digest=" + b.snap_digest);
+  console.log("W.1 INVENTORY PASS -- all pre-apply invariants hold; transaction rolls back (read-only).");
+} finally {
+  await c.query("rollback").catch(() => {});
+  await c.end();
+}
+NODE
+node --env-file=../.env.local gate7a-w1-inventory.mjs
+rm gate7a-w1-inventory.mjs
+```
+
+### W.2 Hardened apply (single migration, single transaction, advisory-locked, hash-verified, digest- + ACL-guarded, ledger fail-closed)
+
+`gate7a-w2-apply.mjs` verifies the frozen SHA-256 **before connecting**; then, in ONE transaction: takes
+`pg_advisory_xact_lock(20260816, 1)` **before** any ledger/object read; requires migrations 1-5 recorded exactly
+once; refuses if Migration 6 is already recorded; re-checks (OID/public-scoped) every Migration-6 target object is
+absent; **captures the unchanged-data digest BEFORE the DDL**; runs ONLY the frozen file; **re-digests AFTER the
+DDL and throws on any drift**; **asserts the COMPLETE table ACL** (every explicit grantee is the table owner or
+`service_role`; `service_role` has EXACTLY SELECT+INSERT+UPDATE) — all **before** the ledger insert/COMMIT, so any
+unexpected privilege or data drift rolls the whole migration back; records the ledger row with a **plain** INSERT;
+COMMITs once. Any error rolls back. No `db:migrate`, no retry, no `DROP`.
+
+```bash
+cat > gate7a-w2-apply.mjs <<'NODE'
+import pg from "pg"; import { readFileSync } from "node:fs"; import { createHash } from "node:crypto";
+const M6 = "20260816_account_rollout.sql";
+const PATH = "supabase/migrations/" + M6;   // run from sales-dashboard-live/
+const FROZEN = "0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735";
+const PRIOR = ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","20260810_report_sync_controls.sql",
+               "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql"];
+const M6_TABLES = ["public.scheduler_account_rollout","public.scheduler_rollout_mode","public.scheduler_publish_approvals"];
+const M6_TRIGGERS = ["scheduler_account_rollout_touch","scheduler_rollout_mode_touch","scheduler_publish_approvals_touch"];
+const M6_CONSTRAINTS = ["scheduler_account_rollout_account_id_nonblank","scheduler_account_rollout_account_id_canonical",
+  "scheduler_account_rollout_account_id_primary_only","scheduler_rollout_mode_singleton",
+  "scheduler_publish_approvals_report_key_nonblank","scheduler_publish_approvals_report_key_canonical",
+  "scheduler_publish_approvals_account_id_nonblank","scheduler_publish_approvals_account_id_canonical",
+  "scheduler_publish_approvals_account_id_primary_only","scheduler_publish_approvals_approved_by_canonical",
+  "scheduler_publish_approvals_audited"];
+const SHORT = ["scheduler_account_rollout","scheduler_rollout_mode","scheduler_publish_approvals"];
+const DIGEST_SQL =
+  "select (select count(*)::int from public.sync_cycles) as cycles_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select id::text k, md5(sc::text) rh from public.sync_cycles sc) q), 'EMPTY') as cycles_digest," +
+  " (select count(*)::int from public.report_snapshots where report_key like 'scheduler-v2/%') as snap_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select (report_key||'/'||account_id||'/'||params_hash) k, md5(rs::text) rh" +
+  "      from public.report_snapshots rs where report_key like 'scheduler-v2/%') q), 'EMPTY') as snap_digest";
+const ok = (cond, msg) => { if (!cond) throw new Error("REFUSING: " + msg); };
+// (0) verify the frozen hash BEFORE connecting/applying.
+const bytes = readFileSync(PATH);
+const sha = createHash("sha256").update(bytes).digest("hex");
+ok(sha === FROZEN, M6 + " SHA-256 " + sha + " != frozen " + FROZEN);
+const body = bytes.toString("utf8");
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() });
+await c.connect();
+try {
+  await c.query("begin");
+  // (1) transaction-scoped advisory lock BEFORE any ledger/object read.
+  await c.query("select pg_advisory_xact_lock($1::int, $2::int)", [20260816, 1]);
+  await c.query("create table if not exists public.app_schema_migrations (filename text primary key, applied_at timestamptz not null default now())");
+  // (2) migrations 1-5 each recorded exactly once.
+  for (const f of PRIOR) {
+    const n = (await c.query("select count(*)::int c from public.app_schema_migrations where filename=$1", [f])).rows[0].c;
+    ok(n === 1, "prerequisite migration " + f + " has " + n + " ledger rows (expected 1)");
+  }
+  // (3) fail closed if Migration 6 already recorded.
+  const seen = await c.query("select applied_at from public.app_schema_migrations where filename=$1", [M6]);
+  ok(seen.rowCount === 0, M6 + " already applied at " + (seen.rows[0] && seen.rows[0].applied_at));
+  // (4) re-check Migration-6 objects ABSENT (OID/public-scoped) inside the transaction.
+  for (const t of M6_TABLES) ok((await c.query("select to_regclass($1) o", [t])).rows[0].o === null, "table " + t + " already exists");
+  ok((await c.query("select to_regprocedure('public.scheduler_rollout_touch()') o")).rows[0].o === null, "scheduler_rollout_touch() already exists");
+  ok((await c.query("select count(*)::int c from pg_trigger t join pg_class rel on rel.oid=t.tgrelid" +
+     " join pg_namespace n on n.oid=rel.relnamespace where not t.tgisinternal and n.nspname='public' and t.tgname=any($1)", [M6_TRIGGERS])).rows[0].c === 0, "a Migration-6 trigger already exists in public");
+  ok((await c.query("select count(*)::int c from pg_constraint con join pg_namespace n on n.oid=con.connamespace" +
+     " where n.nspname='public' and con.conname=any($1)", [M6_CONSTRAINTS])).rows[0].c === 0, "a Migration-6 named constraint already exists in public");
+  // (5) capture the unchanged-data BASELINE inside the transaction, BEFORE the DDL.
+  const before = (await c.query(DIGEST_SQL)).rows[0];
+  // (6) execute ONLY the frozen Migration-6 body (whole file inside this one transaction).
   await c.query(body);
-  // (6) record the ledger row with a PLAIN insert (a duplicate raises a PK error -> rollback, surfacing a repeat).
-  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [FILE]);
-  // (7) single commit.
-  await c.query("commit"); console.log("applied " + FILE);
-} catch (e) { await c.query("rollback"); throw e; } finally { await c.end(); }
-'
+  // (7) UNCHANGED-DATA proof: re-digest AFTER the DDL, BEFORE the ledger insert; any drift throws -> rollback.
+  const after = (await c.query(DIGEST_SQL)).rows[0];
+  for (const k of ["cycles_count", "cycles_digest", "snap_count", "snap_digest"]) {
+    ok(String(before[k]) === String(after[k]), "data-plane drift in " + k + " during apply (" + before[k] + " -> " + after[k] + ")");
+  }
+  // (8) COMPLETE ACL proof BEFORE COMMIT: every explicit grantee is the table owner or service_role, and
+  //     service_role has EXACTLY {SELECT, INSERT, UPDATE}. Any other grantee/privilege rolls the migration back.
+  const owners = Object.fromEntries((await c.query(
+    "select rel.relname, o.rolname owner from pg_class rel join pg_roles o on o.oid=rel.relowner where rel.oid=any($1::regclass[])", [M6_TABLES])).rows.map((r) => [r.relname, r.owner]));
+  const acl = (await c.query(
+    "select rel.relname, coalesce(r.rolname,'PUBLIC') grantee, a.privilege_type" +
+    " from pg_class rel cross join lateral aclexplode(rel.relacl) a left join pg_roles r on r.oid=a.grantee" +
+    " where rel.oid=any($1::regclass[]) order by rel.relname, grantee, a.privilege_type", [M6_TABLES])).rows;
+  for (const row of acl) ok(row.grantee === "service_role" || row.grantee === owners[row.relname], "unexpected ACL grantee " + row.grantee + " on " + row.relname);
+  for (const t of SHORT) {
+    const svc = acl.filter((r) => r.relname === t && r.grantee === "service_role").map((r) => r.privilege_type).sort();
+    ok(JSON.stringify(svc) === JSON.stringify(["INSERT", "SELECT", "UPDATE"]), "service_role privileges on " + t + " are [" + svc + "] (expected exactly SELECT,INSERT,UPDATE)");
+  }
+  // (9) ledger row: PLAIN insert (a duplicate raises a PK error -> rollback, surfacing a repeat).
+  await c.query("insert into public.app_schema_migrations (filename) values ($1)", [M6]);
+  // (10) single commit.
+  await c.query("commit");
+  console.log("applied " + M6 + " (data plane unchanged; ACL asserted before commit)");
+} catch (e) {
+  await c.query("rollback").catch(() => {});
+  throw e;
+} finally {
+  await c.end();
+}
+NODE
+node --env-file=../.env.local gate7a-w2-apply.mjs
+rm gate7a-w2-apply.mjs
 ```
 
 ### W.3 What Migration 6 changes (accurate characterization)
 
-- **Deletes nothing:** no `DROP TABLE`, `TRUNCATE`, or change to any existing table / historical data. The only
+- **Deletes nothing:** no `DROP TABLE`, `TRUNCATE`, or change to any existing table / historical row. The only
   `DROP`s are `drop trigger if exists` for THIS migration's own three touch triggers, each immediately re-created
-  inside the same transaction (no reader ever sees a missing-trigger window). **No `DROP` repair, ever.**
+  inside the same transaction. **No `DROP` repair, ever.**
 - **Creates** three ADDITIVE tables — `scheduler_account_rollout` (5 cols), `scheduler_rollout_mode` (3 cols),
   `scheduler_publish_approvals` (7 cols) — with their PKs and **11 named CHECK constraints** (nonblank + canonical
   + primary-only identity, the rollout-mode singleton, and the audited-decision constraint).
-- **`CREATE OR REPLACE`** the one trigger function `public.scheduler_rollout_touch()` (returns `trigger`,
-  plpgsql; sets `NEW.updated_at = now()`), and **DROP+CREATE** the three BEFORE-UPDATE FOR-EACH-ROW touch
-  triggers that call it (one per table).
+- **`CREATE OR REPLACE`** the one trigger function `public.scheduler_rollout_touch()` and **DROP+CREATE** the
+  three BEFORE-UPDATE FOR-EACH-ROW touch triggers that call it (one per table).
 - **Seeds** the singleton `scheduler_rollout_mode` row `(1, all_primary=false)` with `on conflict (id) do
-  nothing` (idempotent; never overwrites a deliberate value).
-- **Enables RLS** on all three tables and creates **ZERO policies** (anon/authenticated see nothing;
-  `service_role` bypasses RLS). **Revokes ALL** from `PUBLIC`/`anon`/`authenticated` and **grants
-  SELECT/INSERT/UPDATE to `service_role`** on each table.
+  nothing` (idempotent).
+- **Enables RLS** on all three tables and creates **ZERO policies**; **revokes ALL** from
+  `PUBLIC`/`anon`/`authenticated` and **grants SELECT/INSERT/UPDATE to `service_role`** on each table (asserted by
+  W.2 step 8 before commit and re-proven in W.4).
 - **Creates NO schedule** (no `pg_cron`/`pg_net`), performs **NO DataDoe call**, opens **no cycle**, writes **no
   snapshot**, and does **not** touch `SCHEDULER_V2_READY_REPORT_KEYS`, `report_sync_settings`, or any migration
-  1-5 object. Because every table uses `create table if not exists`, a partially pre-existing table would skip
-  constraint creation — which is exactly why W.1 + the in-transaction re-check (W.2 step 4) require every target
-  object ABSENT before applying.
-- **Prerequisites:** `public.app_schema_migrations`, the `service_role` role, and (for the fail-closed
-  operational posture the wrappers rely on) `report_sync_settings`. If any is absent the apply errors and the
-  whole transaction rolls back (fail closed) — W.1 checks these first.
+  1-5 object. Every table uses `create table if not exists`, which is exactly why W.1 + the W.2 in-transaction
+  re-check require every target object ABSENT before applying.
 
-### W.4 Post-apply read-only verification (run after the apply; every mismatch is a STOP)
+### W.4 Post-apply read-only verification (genuinely read-only; rolls back always)
 
-Run in a `read only` transaction; compare each result against the expected shape.
+`gate7a-w4-verify.mjs` runs inside `BEGIN; SET TRANSACTION READ ONLY` and **always ROLLBACKs** (in a `finally`),
+scoping every check to the exact `public` OID. Provide the W.1 BASELINE via env vars so the unchanged-data
+re-check is exact:
 
-```sql
--- V1) exact columns / types / nullability / defaults (expect 5 / 3 / 7 columns).
-select table_name, ordinal_position, column_name, data_type, is_nullable, column_default
-  from information_schema.columns
- where table_schema='public'
-   and table_name in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
- order by table_name, ordinal_position;
--- expect scheduler_account_rollout : account_id text NOT NULL (no default); enabled boolean NOT NULL default false;
---        note text NULL; created_at timestamptz NOT NULL default now(); updated_at timestamptz NOT NULL default now().
--- expect scheduler_rollout_mode    : id smallint NOT NULL default 1; all_primary boolean NOT NULL default false;
---        updated_at timestamptz NOT NULL default now().
--- expect scheduler_publish_approvals: report_key text NOT NULL; account_id text NOT NULL; approved boolean NOT NULL
---        default false; approved_by text NOT NULL; approved_at timestamptz NOT NULL; created_at timestamptz NOT NULL
---        default now(); updated_at timestamptz NOT NULL default now().
+```bash
+export W1_CYCLES_COUNT=<from W.1>  W1_CYCLES_DIGEST=<from W.1>  W1_SNAP_COUNT=<from W.1>  W1_SNAP_DIGEST=<from W.1>
+cat > gate7a-w4-verify.mjs <<'NODE'
+import pg from "pg";
+const M6 = "20260816_account_rollout.sql";
+const PRIOR = ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","20260810_report_sync_controls.sql",
+               "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql"];
+const M6_TABLES = ["public.scheduler_account_rollout","public.scheduler_rollout_mode","public.scheduler_publish_approvals"];
+const SHORT = ["scheduler_account_rollout","scheduler_rollout_mode","scheduler_publish_approvals"];
+const COLS = { scheduler_account_rollout:5, scheduler_rollout_mode:3, scheduler_publish_approvals:7 };
+const OPS = { sync_cycles:18, sync_source_jobs:27, sync_report_jobs:25, sync_source_job_owners:15 };
+const PK = { scheduler_account_rollout:"PRIMARY KEY (account_id)", scheduler_rollout_mode:"PRIMARY KEY (id)",
+             scheduler_publish_approvals:"PRIMARY KEY (report_key, account_id)" };
+const TRIG = [["scheduler_account_rollout_touch","public.scheduler_account_rollout"],
+              ["scheduler_rollout_mode_touch","public.scheduler_rollout_mode"],
+              ["scheduler_publish_approvals_touch","public.scheduler_publish_approvals"]];
+const NOAPPEND = [["sync_source_jobs_no_append_terminal","public.sync_source_jobs"],
+                  ["sync_source_job_owners_no_append_terminal","public.sync_source_job_owners"],
+                  ["sync_report_jobs_no_append_terminal","public.sync_report_jobs"]];
+// Expected normalized CHECK bodies (whitespace collapsed, lowercased). Postgres renders NOT LIKE as !~~.
+const CHK = {
+  scheduler_account_rollout: {
+    scheduler_account_rollout_account_id_nonblank: "check ((char_length(btrim(account_id)) > 0))",
+    scheduler_account_rollout_account_id_canonical: "check ((account_id = btrim(account_id)))",
+    scheduler_account_rollout_account_id_primary_only: "check ((account_id !~~ 'dd-secondary:%'::text))" },
+  scheduler_rollout_mode: { scheduler_rollout_mode_singleton: "check ((id = 1))" },
+  scheduler_publish_approvals: {
+    scheduler_publish_approvals_report_key_nonblank: "check ((char_length(btrim(report_key)) > 0))",
+    scheduler_publish_approvals_report_key_canonical: "check ((report_key = btrim(report_key)))",
+    scheduler_publish_approvals_account_id_nonblank: "check ((char_length(btrim(account_id)) > 0))",
+    scheduler_publish_approvals_account_id_canonical: "check ((account_id = btrim(account_id)))",
+    scheduler_publish_approvals_account_id_primary_only: "check ((account_id !~~ 'dd-secondary:%'::text))",
+    scheduler_publish_approvals_approved_by_canonical: "check ((approved_by = btrim(approved_by)))",
+    scheduler_publish_approvals_audited: "check (((char_length(btrim(approved_by)) > 0) and (approved_at is not null)))" },
+};
+const DIGEST_SQL =
+  "select (select count(*)::int from public.sync_cycles) as cycles_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select id::text k, md5(sc::text) rh from public.sync_cycles sc) q), 'EMPTY') as cycles_digest," +
+  " (select count(*)::int from public.report_snapshots where report_key like 'scheduler-v2/%') as snap_count," +
+  " coalesce((select md5(string_agg(rh, ',' order by k)) from" +
+  "   (select (report_key||'/'||account_id||'/'||params_hash) k, md5(rs::text) rh" +
+  "      from public.report_snapshots rs where report_key like 'scheduler-v2/%') q), 'EMPTY') as snap_digest";
+const norm = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+const ok = (cond, msg) => { if (!cond) throw new Error("STOP: " + msg); };
+const EXPECT = { cycles_count: process.env.W1_CYCLES_COUNT, cycles_digest: process.env.W1_CYCLES_DIGEST,
+                 snap_count: process.env.W1_SNAP_COUNT, snap_digest: process.env.W1_SNAP_DIGEST };
+const url = new URL(process.env.POSTGRES_URL); url.searchParams.set("sslmode", "no-verify");
+const c = new pg.Client({ connectionString: url.toString() });
+await c.connect();
+try {
+  await c.query("begin");
+  await c.query("set transaction read only");
 
--- V2) PKs (expect: account_id) / (id) / (report_key, account_id).
-select rel.relname as table_name, con.conname, pg_get_constraintdef(con.oid) as definition
-  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
-  join pg_namespace n on n.oid=rel.relnamespace
- where n.nspname='public' and con.contype='p'
-   and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
- order by rel.relname;
+  // Tables present + exact column counts + key defaults/nullability.
+  for (const [t, n] of Object.entries(COLS)) {
+    ok((await c.query("select to_regclass($1) o", ["public." + t])).rows[0].o !== null, t + " table missing");
+    const cc = (await c.query("select count(*)::int c from information_schema.columns where table_schema='public' and table_name=$1", [t])).rows[0].c;
+    ok(cc === n, t + " has " + cc + " columns (expected " + n + ")");
+  }
+  const col = async (t, cn) => (await c.query("select is_nullable, column_default from information_schema.columns where table_schema='public' and table_name=$1 and column_name=$2", [t, cn])).rows[0];
+  ok((await col("scheduler_account_rollout", "enabled")).column_default === "false", "enabled default != false");
+  ok((await col("scheduler_rollout_mode", "all_primary")).column_default === "false", "all_primary default != false");
+  ok((await col("scheduler_rollout_mode", "id")).column_default === "1", "id default != 1");
+  ok((await col("scheduler_publish_approvals", "approved")).column_default === "false", "approved default != false");
+  ok((await col("scheduler_publish_approvals", "approved_by")).is_nullable === "NO", "approved_by must be NOT NULL");
+  ok((await col("scheduler_publish_approvals", "approved_at")).is_nullable === "NO", "approved_at must be NOT NULL");
 
--- V3) all 11 named CHECK constraints, table-scoped, VALID, with exact bodies (expect 11 rows).
-select rel.relname as table_name, con.conname, con.convalidated, pg_get_constraintdef(con.oid) as definition
-  from pg_constraint con join pg_class rel on rel.oid=con.conrelid
-  join pg_namespace n on n.oid=rel.relnamespace
- where n.nspname='public' and con.contype='c'
-   and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
- order by rel.relname, con.conname;
--- expect (convalidated=true for ALL 11; Postgres serializes NOT LIKE as !~~):
---   scheduler_account_rollout_account_id_nonblank        CHECK ((char_length(btrim(account_id)) > 0))
---   scheduler_account_rollout_account_id_canonical       CHECK ((account_id = btrim(account_id)))
---   scheduler_account_rollout_account_id_primary_only    CHECK ((account_id !~~ 'dd-secondary:%'::text))
---   scheduler_rollout_mode_singleton                     CHECK ((id = 1))
---   scheduler_publish_approvals_report_key_nonblank      CHECK ((char_length(btrim(report_key)) > 0))
---   scheduler_publish_approvals_report_key_canonical     CHECK ((report_key = btrim(report_key)))
---   scheduler_publish_approvals_account_id_nonblank      CHECK ((char_length(btrim(account_id)) > 0))
---   scheduler_publish_approvals_account_id_canonical     CHECK ((account_id = btrim(account_id)))
---   scheduler_publish_approvals_account_id_primary_only  CHECK ((account_id !~~ 'dd-secondary:%'::text))
---   scheduler_publish_approvals_approved_by_canonical    CHECK ((approved_by = btrim(approved_by)))
---   scheduler_publish_approvals_audited                  CHECK (((char_length(btrim(approved_by)) > 0) AND (approved_at IS NOT NULL)))
--- (The static schema audit already pinned these EXACT canonical bodies token-for-token — tests EM1/EM3;
---  this DB check confirms presence + validity + table-scope. Any missing/extra/renamed constraint STOPs.)
+  // PKs, scoped by conrelid OID.
+  for (const [t, def] of Object.entries(PK)) {
+    const r = (await c.query("select pg_get_constraintdef(con.oid) d from pg_constraint con where con.conrelid=$1::regclass and con.contype='p'", ["public." + t])).rows;
+    ok(r.length === 1 && r[0].d === def, t + " PK is " + (r[0] && r[0].d) + " (expected " + def + ")");
+  }
 
--- V4) singleton scheduler_rollout_mode row (expect EXACTLY one row: id=1, all_primary=false).
-select id, all_primary from public.scheduler_rollout_mode;
+  // 11 named CHECK constraints, scoped by conrelid OID, validated, exact (normalized) bodies. Total must be 11.
+  let total = 0;
+  for (const [t, expect] of Object.entries(CHK)) {
+    const rows = (await c.query("select con.conname, con.convalidated, pg_get_constraintdef(con.oid) d from pg_constraint con where con.conrelid=$1::regclass and con.contype='c' order by con.conname", ["public." + t])).rows;
+    total += rows.length;
+    ok(rows.length === Object.keys(expect).length, t + " has " + rows.length + " CHECK constraints (expected " + Object.keys(expect).length + ")");
+    for (const row of rows) {
+      ok(expect[row.conname] !== undefined, "unexpected CHECK " + row.conname + " on " + t);
+      ok(row.convalidated === true, row.conname + " is NOT validated");
+      ok(norm(row.d) === norm(expect[row.conname]), row.conname + " body mismatch: got [" + row.d + "]");
+    }
+  }
+  ok(total === 11, "expected 11 CHECK constraints across the 3 tables, got " + total);
 
--- V5) scheduler_account_rollout + scheduler_publish_approvals hold ZERO rows.
-select (select count(*) from public.scheduler_account_rollout)  as rollout_rows,
-       (select count(*) from public.scheduler_publish_approvals) as approval_rows;
--- expect rollout_rows=0, approval_rows=0.
+  // Singleton row (1,false); the two data tables EMPTY.
+  const mode = (await c.query("select id, all_primary from public.scheduler_rollout_mode")).rows;
+  ok(mode.length === 1 && Number(mode[0].id) === 1 && mode[0].all_primary === false, "scheduler_rollout_mode is not exactly (1,false)");
+  ok((await c.query("select count(*)::int c from public.scheduler_account_rollout")).rows[0].c === 0, "scheduler_account_rollout is not empty");
+  ok((await c.query("select count(*)::int c from public.scheduler_publish_approvals")).rows[0].c === 0, "scheduler_publish_approvals is not empty");
 
--- V6) exactly three touch triggers: BEFORE UPDATE, enabled, FOR EACH ROW, calling scheduler_rollout_touch
---     (proven by OID join -- authoritative -- and cross-checked by pg_get_triggerdef + tgtype=19). Expect 3 rows.
-select rel.relname as table_name, t.tgname, t.tgenabled as enabled, t.tgtype,
-       fn.proname as exec_function, fnns.nspname as exec_schema,
-       pg_get_triggerdef(t.oid) as definition
-  from pg_trigger t
-  join pg_class rel on rel.oid=t.tgrelid
-  join pg_namespace n on n.oid=rel.relnamespace
-  join pg_proc fn on fn.oid=t.tgfoid
-  join pg_namespace fnns on fnns.oid=fn.pronamespace
- where n.nspname='public' and not t.tgisinternal
-   and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
- order by rel.relname;
--- expect: tgname scheduler_*_touch; enabled='O'; tgtype=19 (ROW|BEFORE|UPDATE); exec_schema='public';
---         exec_function='scheduler_rollout_touch'; definition "... BEFORE UPDATE ON public.<table> FOR EACH ROW
---         EXECUTE FUNCTION scheduler_rollout_touch()".
+  // Three touch triggers: BEFORE UPDATE, FOR EACH ROW, enabled, executing public.scheduler_rollout_touch by OID.
+  ok((await c.query("select to_regprocedure('public.scheduler_rollout_touch()') o")).rows[0].o !== null, "scheduler_rollout_touch() missing");
+  for (const [trig, tbl] of TRIG) {
+    const r = (await c.query("select t.tgenabled, t.tgtype, (t.tgfoid = to_regprocedure('public.scheduler_rollout_touch()')) fn_ok from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
+    ok(r.length === 1, trig + " not found on exactly " + tbl);
+    ok(r[0].fn_ok === true, trig + " does not execute public.scheduler_rollout_touch");
+    ok(r[0].tgenabled === "O", trig + " not enabled (tgenabled=" + r[0].tgenabled + ")");
+    ok(Number(r[0].tgtype) === 19, trig + " tgtype=" + r[0].tgtype + " (expected 19 = ROW|BEFORE|UPDATE)");
+  }
+  const fn = (await c.query("select pg_get_function_result(p.oid) ret, l.lanname from pg_proc p join pg_language l on l.oid=p.prolang where p.oid=to_regprocedure('public.scheduler_rollout_touch()')")).rows[0];
+  ok(fn.ret === "trigger", "scheduler_rollout_touch returns " + fn.ret);
+  ok(fn.lanname === "plpgsql", "scheduler_rollout_touch language " + fn.lanname);
 
--- V6b) the trigger function exists, returns trigger, plpgsql (expect 1 row).
-select p.proname, pg_get_function_result(p.oid) as returns, l.lanname
-  from pg_proc p join pg_namespace n on n.oid=p.pronamespace join pg_language l on l.oid=p.prolang
- where n.nspname='public' and p.proname='scheduler_rollout_touch';
--- expect: scheduler_rollout_touch | trigger | plpgsql.
+  // RLS enabled on all 3 (OID-scoped); ZERO policies.
+  for (const t of M6_TABLES) ok((await c.query("select relrowsecurity from pg_class where oid=$1::regclass", [t])).rows[0].relrowsecurity === true, t + " RLS not enabled");
+  ok((await c.query("select count(*)::int c from pg_policy where polrelid=any($1::regclass[])", [M6_TABLES])).rows[0].c === 0, "a policy exists on a Migration-6 table (expected 0)");
 
--- V7) RLS enabled on all three tables (expect relrowsecurity=true for all three).
-select relname, relrowsecurity from pg_class
- where relnamespace='public'::regnamespace
-   and relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
- order by relname;
+  // COMPLETE ACL proof: every explicit grantee is the owner or service_role; service_role EXACTLY SELECT+INSERT+UPDATE.
+  const owners = Object.fromEntries((await c.query("select rel.relname, o.rolname owner from pg_class rel join pg_roles o on o.oid=rel.relowner where rel.oid=any($1::regclass[])", [M6_TABLES])).rows.map((r) => [r.relname, r.owner]));
+  const acl = (await c.query("select rel.relname, coalesce(r.rolname,'PUBLIC') grantee, a.privilege_type from pg_class rel cross join lateral aclexplode(rel.relacl) a left join pg_roles r on r.oid=a.grantee where rel.oid=any($1::regclass[]) order by rel.relname, grantee, a.privilege_type", [M6_TABLES])).rows;
+  for (const row of acl) ok(row.grantee === "service_role" || row.grantee === owners[row.relname], "unexpected ACL grantee " + row.grantee + " on " + row.relname);
+  for (const t of SHORT) {
+    const svc = acl.filter((r) => r.relname === t && r.grantee === "service_role").map((r) => r.privilege_type).sort();
+    ok(JSON.stringify(svc) === JSON.stringify(["INSERT", "SELECT", "UPDATE"]), "service_role privileges on " + t + " are [" + svc + "] (expected SELECT,INSERT,UPDATE)");
+  }
 
--- V8) ZERO policies on the three tables (RLS enabled with NO browser policy -> expect 0 rows).
-select rel.relname as table_name, pol.polname from pg_policy pol
-  join pg_class rel on rel.oid=pol.polrelid join pg_namespace n on n.oid=rel.relnamespace
- where n.nspname='public' and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals');
+  // Ledger: Migration 6 exactly once; migrations 1-5 each exactly once.
+  ok((await c.query("select count(*)::int c from public.app_schema_migrations where filename=$1", [M6])).rows[0].c === 1, M6 + " ledger count != 1");
+  for (const f of PRIOR) ok((await c.query("select count(*)::int c from public.app_schema_migrations where filename=$1", [f])).rows[0].c === 1, f + " ledger count != 1");
 
--- V9) grants: PUBLIC/anon/authenticated have NO privilege (expect 0 rows); service_role has SELECT+INSERT+UPDATE
---     on all three (expect 9 rows: 3 tables x 3 privileges).
-select rel.relname, (case when a.grantee=0 then 'PUBLIC' else r.rolname end) as bad_grantee, a.privilege_type
-  from pg_class rel join pg_namespace n on n.oid=rel.relnamespace
-  cross join lateral aclexplode(rel.relacl) a
-  left join pg_roles r on r.oid=a.grantee
- where n.nspname='public' and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
-   and (a.grantee=0 or r.rolname in ('anon','authenticated'));   -- expect 0 rows
-select rel.relname, a.privilege_type from pg_class rel join pg_namespace n on n.oid=rel.relnamespace
-  cross join lateral aclexplode(rel.relacl) a join pg_roles r on r.oid=a.grantee
- where n.nspname='public' and rel.relname in ('scheduler_account_rollout','scheduler_rollout_mode','scheduler_publish_approvals')
-   and r.rolname='service_role' and a.privilege_type in ('SELECT','INSERT','UPDATE')
- order by rel.relname, a.privilege_type;                         -- expect 9 rows (SELECT/INSERT/UPDATE x 3 tables)
+  // Migrations 1-5 objects UNCHANGED: column counts + finalize RPC + 3 no-append triggers (OID-proven).
+  for (const [t, n] of Object.entries(OPS)) ok((await c.query("select count(*)::int c from information_schema.columns where table_schema='public' and table_name=$1", [t])).rows[0].c === n, t + " column count changed");
+  ok((await c.query("select to_regprocedure('public.finalize_sync_cycle(uuid)') o")).rows[0].o !== null, "finalize_sync_cycle missing");
+  for (const [trig, tbl] of NOAPPEND) {
+    const r = (await c.query("select (t.tgfoid = to_regprocedure('public.reject_append_to_terminal_cycle()')) fn_ok from pg_trigger t where not t.tgisinternal and t.tgname=$1 and t.tgrelid=$2::regclass", [trig, tbl])).rows;
+    ok(r.length === 1 && r[0].fn_ok === true, "no-append trigger " + trig + " changed/missing on " + tbl);
+  }
 
--- V10) Migration-6 ledger row EXACTLY once; migrations 1-5 each EXACTLY once (expect 6 rows, each count=1).
-select m.f, coalesce(count(l.filename),0) as ledger_rows
-  from (values ('20260807_scheduler_v2.sql'),('20260810_ads_sync_coverage.sql'),
-               ('20260810_report_sync_controls.sql'),('20260811_sync_source_job_owners.sql'),
-               ('20260815_sync_cycle_finalize.sql'),('20260816_account_rollout.sql')) m(f)
-  left join public.app_schema_migrations l on l.filename=m.f
- group by m.f order by m.f;
+  // 13 controls paused.
+  const ctrl = (await c.query("select count(*)::int total, count(*) filter (where schedule_enabled)::int enabled from public.report_sync_settings")).rows[0];
+  ok(ctrl.total === 13 && ctrl.enabled === 0, "controls total=" + ctrl.total + " enabled=" + ctrl.enabled + " (expected 13/0)");
 
--- V11) migrations 1-5 objects UNCHANGED: the four sync tables' column counts + the finalize RPC + 3 guard
---      triggers still present (expect 18/27/25/15, finalize non-NULL, no_append=3).
-select table_name, count(*) as cols from information_schema.columns
- where table_schema='public' and table_name in ('sync_cycles','sync_source_jobs','sync_report_jobs','sync_source_job_owners')
- group by table_name order by table_name;
-select to_regprocedure('public.finalize_sync_cycle(uuid)') as finalize_sync_cycle;
-select count(*) as no_append from pg_trigger where not tgisinternal and tgname in
-  ('sync_source_jobs_no_append_terminal','sync_source_job_owners_no_append_terminal','sync_report_jobs_no_append_terminal');
+  // Unchanged-data digest re-check vs the W.1 BASELINE (independent, after commit).
+  for (const k of ["cycles_count", "cycles_digest", "snap_count", "snap_digest"]) ok(EXPECT[k] !== undefined && EXPECT[k] !== "", "set W1_" + k.toUpperCase() + " from the W.1 BASELINE before running W.4");
+  const now = (await c.query(DIGEST_SQL)).rows[0];
+  for (const k of ["cycles_count", "cycles_digest", "snap_count", "snap_digest"]) ok(String(now[k]) === String(EXPECT[k]), "unchanged-data drift in " + k + " (W.1 baseline " + EXPECT[k] + " != post-commit " + now[k] + ")");
 
--- V12) 13 report controls remain paused (expect total=13, enabled=0).
-select count(*) as total, count(*) filter (where schedule_enabled) as enabled from public.report_sync_settings;
-
--- V13) zero durable data-plane change: no NEW sync cycle, snapshot count unchanged, no schedule.
-select count(*) as sync_cycles_rows from public.sync_cycles;   -- expect UNCHANGED vs W.8 (Gate-5 + 2 Gate-6 cycles)
-select count(*) as v2_snapshots from public.report_snapshots where report_key like 'scheduler-v2/%'; -- expect UNCHANGED
-do $$ declare v_has boolean := to_regclass('cron.job') is not null; v_n int := 0;
-begin if v_has then execute 'select count(*) from cron.job' into v_n; end if;
-      raise notice 'cron_installed:% cron_jobs:%', v_has, v_n; end $$;   -- expect no Scheduler-v2 schedule
+  console.log("W.4 VERIFY PASS -- Migration-6 objects exact; ACL owner+service_role only; data plane byte-identical to the W.1 baseline; migrations 1-5 + 13 paused controls intact; transaction rolls back (read-only).");
+} finally {
+  await c.query("rollback").catch(() => {});
+  await c.end();
+}
+NODE
+node --env-file=../.env.local gate7a-w4-verify.mjs
+rm gate7a-w4-verify.mjs
 ```
 
 - **Code readiness allowlist:** re-grep `lib/server/sync/report-controls.js` — `SCHEDULER_V2_READY_REPORT_KEYS`
-  is still `Object.freeze([])`. This is a **code** invariant (no DB object); Gate 7a does not — and cannot —
-  change it.
+  is still `Object.freeze([])`. This is a **code** invariant (no DB object); Gate 7a cannot change it.
 - **No publisher invocation / DataDoe call / cycle creation / schedule:** Gate 7a runs ONLY the migration DDL +
-  one ledger INSERT. It imports no publisher, opens no cycle, writes no `report_snapshots` row, and calls no
-  DataDoe/Ads endpoint. V13 confirms the data plane is byte-unchanged.
+  one ledger INSERT. The W.2 in-transaction digest compare + the W.4 post-commit re-check prove `sync_cycles` and
+  every `scheduler-v2/*` `report_snapshots` row are byte-identical (content-hashed), so no cycle was opened and no
+  snapshot changed; W.1/W.4 prove no Scheduler-v2 `pg_cron` schedule.
 
 ### W.5 STOP conditions (every mismatch halts Gate 7a; report the exact shape, do not repair in place)
 
-**Offline (W.0):** HEAD missing `85d49a0`; any of the six migration SHA-256 differs; `SCHEDULER_V2_READY_REPORT_KEYS`
-non-empty; `npm run verify` or `git diff --check` not clean; `POSTGRES_URL` absent → **STOP, do not connect.**
-
-**Pre-apply (W.1):** `m6_recorded:true`; any migration-1–5 ledger count ≠ 1; W2 any table non-NULL; W3 function
-non-NULL; W4 any trigger row; W5 any constraint row; W6 any prerequisite NULL or `service_role` missing; W7 any
-operational table NULL or a column count ≠ 18/27/25/15; W8 `finalize_sync_cycle` NULL, no_append ≠ 3, or a
-Gate-5/Gate-6 cycle not matching its recorded terminal state; W9 total ≠ 13 or enabled ≠ 0; W10 a Scheduler-v2
-cron job present → **STOP; do not apply; capture the exact shape for review.**
-
-**Apply (W.2):** the script itself refuses (rolls back, no ledger row) on — frozen SHA-256 mismatch; a
-prerequisite migration not recorded exactly once; Migration 6 already recorded; any Migration-6 table / function
-/ constraint / trigger already present; any DDL error; a duplicate ledger PK. **On ANY such refusal, STOP and
-report; never retry with `db:migrate`, never `DROP` to "repair", never force.**
-
-**Post-apply (W.4):** any column/type/nullability/default deviation (V1); a wrong PK (V2); fewer/more than the 11
-named CHECKs or any `convalidated=false` or a body that does not match its expected serialization (V3); the
-rollout-mode row not exactly `(1,false)` or not exactly one row (V4); any rollout/approval row present (V5); a
-trigger not BEFORE UPDATE FOR EACH ROW / not enabled / not calling `public.scheduler_rollout_touch` by OID (V6);
-the function missing or wrong return/language (V6b); RLS not enabled on all three (V7); ANY policy present (V8);
-any PUBLIC/anon/authenticated grant, or `service_role` missing SELECT/INSERT/UPDATE (V9); Migration-6 ledger
-count ≠ 1 or any migration-1–5 count ≠ 1 (V10); a migration-1–5 object changed (V11); controls total ≠ 13 or
-enabled ≠ 0 (V12); a NEW sync cycle, a changed `scheduler-v2/*` snapshot count, or any Scheduler-v2 schedule
-(V13); or the code readiness allowlist non-empty → **STOP; the migration transaction already committed, so do
-NOT attempt a destructive rollback/DROP — capture the deviation and escalate for reviewed remediation.**
+- **Offline (W.0):** HEAD missing `85d49a0`; any of the six migration SHA-256 differs; `SCHEDULER_V2_READY_REPORT_KEYS`
+  non-empty; `verify`/`diff --check` not clean; `POSTGRES_URL` absent → **STOP, do not connect.**
+- **Pre-apply (W.1):** any thrown `STOP:` — Migration-6 ledger row present or a migration-1–5 count ≠ 1; any
+  Migration-6 table/function/trigger/constraint already present in `public`; a prerequisite missing; an
+  operational table absent or a column count ≠ 18/27/25/15; `finalize_sync_cycle` missing or a no-append trigger
+  not OID-mapped to its exact table+guard function; controls total ≠ 13 or enabled ≠ 0; a `cron.job` present →
+  **STOP; do not apply; capture the exact reason.**
+- **Apply (W.2):** the runner refuses (rolls back, NO ledger row) on — frozen SHA-256 mismatch; a prerequisite not
+  recorded exactly once; Migration 6 already recorded; any target object already present; **any `sync_cycles` /
+  `scheduler-v2/*` digest drift between the pre-DDL and post-DDL snapshots**; **any ACL grantee other than the
+  owner or `service_role`, or `service_role` not holding exactly SELECT+INSERT+UPDATE**; any DDL error; a
+  duplicate ledger PK. **On ANY refusal, STOP and report; never retry with `db:migrate`, never `DROP` to
+  "repair", never force.**
+- **Post-apply (W.4):** any thrown `STOP:` — a column/default/nullability deviation; a wrong PK; ≠ 11 CHECK
+  constraints, an unexpected/renamed constraint, any `convalidated=false`, or a normalized body mismatch (the
+  printed `got [...]` shows the exact serialization); the rollout-mode row not exactly `(1,false)` or not exactly
+  one row; any rollout/approval row present; a trigger not BEFORE-UPDATE-FOR-EACH-ROW (`tgtype≠19`) / not enabled
+  / not executing `public.scheduler_rollout_touch` by OID; the function missing or wrong return/language; RLS not
+  enabled on all three; ANY policy present; an unexpected ACL grantee or `service_role` privileges ≠
+  SELECT+INSERT+UPDATE; Migration-6 ledger ≠ 1 or a migration-1–5 count ≠ 1; a migration-1–5 object changed;
+  controls ≠ 13/0; or the unchanged-data digest ≠ the W.1 baseline → **STOP. The migration transaction already
+  committed, so do NOT attempt a destructive rollback/DROP — capture the deviation and escalate for reviewed
+  remediation.**
 
 ### W.6 Zero-production-side-effect confirmation (THIS preparation turn)
 
@@ -3759,4 +3798,4 @@ no DataDoe call, no snapshot published, no report unlocked, no durable control c
 merge, no schedule. Migration 6 (`20260816_account_rollout.sql`) remains **UNAPPLIED** and byte-frozen at SHA-256
 `0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`; migrations 1–5 are byte-identical; all
 touched Gate-7 code files are unchanged (docs-only commit). **STOP.** Gate 7a executes ONLY after Codex review of
-this package **and** explicit human approval, one migration file, then stops for W.4.
+this hardened package **and** explicit human approval — one migration file, then stop for W.4.

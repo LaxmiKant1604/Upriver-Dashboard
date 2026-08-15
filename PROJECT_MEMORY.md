@@ -9427,3 +9427,41 @@ connection and executed nothing; docs-only commit.
 
 STOP for Codex review + explicit human approval. Gate 7a executes one migration file, then stops for W.4.
 Migration 6 UNAPPLIED; enables/approvals/unlock/deploy/schedule remain BLOCKED.
+
+## Scheduler v2 Gate 7a package HARDENED per Codex re-review (docs-only, 2026-08-15) — Migration 6 still UNAPPLIED
+
+Four Codex blockers on the Gate 7a Appendix W apply package fixed OFFLINE, docs-only. No production connection,
+nothing executed; Migration 6 remains UNAPPLIED (SHA-256 0d715eb...ba4a735 unchanged), migrations 1-5
+byte-identical, all Gate-7 code/tests unchanged.
+
+- BLOCKER 1 (genuine read-only): W.1 pre-apply inventory + W.4 post-verify are now executable Node/pg runners
+  (throwaway .mjs via quoted heredoc, run from sales-dashboard-live/ with --env-file=../.env.local) that do
+  BEGIN; SET TRANSACTION READ ONLY; ...; and ROLLBACK in a finally -- rollback happens even when an assertion
+  throws. No longer merely described as read-only.
+- BLOCKER 2 (exact public object scope): every pg_trigger/pg_constraint/pg_class/pg_policy check is scoped to
+  the exact public OID (tgrelid=$::regclass, conrelid=$::regclass, polrelid=any(::regclass[]),
+  connamespace/relnamespace='public'). Migration-5 no-append triggers proven by OID mapping
+  sync_source_jobs_no_append_terminal->public.sync_source_jobs, ..._owners->public.sync_source_job_owners,
+  sync_report_jobs_...->public.sync_report_jobs, each executing public.reject_append_to_terminal_cycle proven
+  via tgfoid=to_regprocedure(...). M6 touch triggers proven by tgfoid=to_regprocedure(scheduler_rollout_touch).
+  Same-named objects in another schema can neither PASS nor false-STOP. M6 absence checks likewise scoped.
+- BLOCKER 3 (real unchanged-data evidence): deterministic count+CONTENT digest baseline for public.sync_cycles
+  (md5 over whole-row, ordered by id) and public.report_snapshots WHERE report_key LIKE 'scheduler-v2/%'
+  (md5 over whole-row incl. payload, ordered by report_key/account_id/params_hash) -- only the md5 is emitted,
+  never a payload. W.1 captures+prints BASELINE. W.2 captures in-transaction BEFORE the DDL, re-digests AFTER
+  the DDL BEFORE the ledger insert/COMMIT, and throws on any drift (rolls back). W.4 independently re-checks
+  after commit against the W.1 baseline (via env vars). Removed the unsupported "counts alone prove
+  byte-identical" claim.
+- BLOCKER 4 (complete ACL proof): W.2 (before COMMIT) and W.4 enumerate every explicit table ACL grantee via
+  aclexplode(relacl) for all three M6 tables; fail on any grantee other than the table owner (resolved via
+  relowner) or service_role (PUBLIC/anon/authenticated/any arbitrary role -> throw); and separately assert
+  service_role holds EXACTLY {SELECT,INSERT,UPDATE} per table. The pre-COMMIT assertion means unexpected
+  default privileges roll the migration back.
+- Preserved: single-file, pg_advisory_xact_lock(20260816,1), plain ledger INSERT, no db:migrate/retry/repair/
+  DROP; Migration 6 SHA-256; migrations 1-5 byte-identical; SCHEDULER_V2_READY_REPORT_KEYS empty; 13 controls
+  paused.
+- Validation: all 3 embedded Node runners pass node --check; 50 doc ``` fences balanced; runner SQL has no ${
+  interpolation and balanced parens; quoted heredocs are shell-safe for single quotes; all six frozen migration
+  hashes recomputed unchanged; git diff --check clean; only SCHEDULER_V2_ROLLOUT.md + PROJECT_MEMORY.md changed.
+
+STOP for Codex re-review + explicit human approval. Do not execute Gate 7a.
