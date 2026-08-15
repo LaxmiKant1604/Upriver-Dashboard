@@ -1,0 +1,10 @@
+# Normalize line endings so every checkout (Windows/macOS/Linux) gets LF for source and
+# test files. This keeps `node --check`, editors, and readers from tripping over CRLF or
+# platform-specific checkout artifacts.
+*.mjs text eol=lf
+*.js  text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.md  text eol=lf
+*.sql text eol=lf
+*.css text eol=lf

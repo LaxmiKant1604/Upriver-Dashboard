@@ -38,6 +38,7 @@ import BrandView from "./views/BrandView.jsx";
 // switcher. It renders the same three reports through the same shared tables,
 // currency system and exports as BrandView above; only the account set differs.
 import BrandPortfolio from "./views/BrandPortfolio.jsx";
+import DataSyncCenter from "./views/DataSyncCenter.jsx";
 
 const INITIAL_ADMIN_EMAIL = "laxmikant@upriver.in";
 
@@ -2701,7 +2702,7 @@ function DashboardApp({ session, access, onSignOut }) {
   // Brand View owns its own account/brand/date/currency control bar, so the
   // global scope cluster is hidden there rather than showing two account
   // pickers that could disagree. Every other view keeps its existing header.
-  const showGlobalScope = view !== "access" && view !== "brandview";
+  const showGlobalScope = view !== "access" && view !== "sync-center" && view !== "brandview";
 
   return (
     <div className="dash-root">
@@ -2747,6 +2748,8 @@ function DashboardApp({ session, access, onSignOut }) {
           />
 
       {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
+
+      {view === "sync-center" && isAdmin && <DataSyncCenter accessToken={session.access_token} />}
 
       {view === "brandview" && (
         <BrandView

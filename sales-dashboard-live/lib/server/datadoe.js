@@ -12,15 +12,35 @@
 //   a from/to range, and must order by a column that actually exists.
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
 import { marketplaceProfile } from "../marketplaces.js";
-import { cacheHoursForSource, sourceContractForId } from "./source-contracts.js";
+import { cacheHoursForSource } from "./source-contracts.js";
+// The canonical source request identity (request_hash) lives in a shared module so
+// the scheduler can compute the same hash without this DataDoe/report module graph.
+// Byte-identical to the previous in-file implementation: the source cache stays valid.
+import { sourceRequestIdentity } from "./source-identity.js";
+// Account-ID batching lives in a dependency-free leaf so the scheduler shares the
+// exact 5-ID chunking. Re-exported here so existing importers of these symbols from
+// this module (e.g. api/datadoe.js) keep working unchanged.
+import { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds } from "./id-batching.js";
+export { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds };
+// Pure calendar/window helpers live in a dependency-free leaf (so the "pure" report-derivation
+// graph never transitively reaches this transport/storage module). Imported for local use
+// (splitDateRangeByDays needs addDaysStr) and re-exported so existing importers keep working.
+import { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "./date-windows.js";
 import {
   getSourceExportCache,
   isSupabaseConfigured,
   pruneSourceExportCache,
   saveSourceExportCache,
 } from "./supabase.js";
+// Durable manual-export continuation (finding: a 504-retry after poll-pending/deadline must
+// resume the SAME export, never create another). The protocol lives in its own module and is
+// keyed by the exact canonical request_hash; fetchSourceChunk routes through it whenever the
+// durable store exists.
+import {
+  manualSourceContinuationEnabled,
+  runManualSourceAttempt,
+} from "./manual-source-continuation.js";
 
 export const DATADOE_BASE = "https://api.datadoe.com/api/v1";
 
@@ -31,7 +51,8 @@ export const ENDPOINTS = {
   exportRaw: (id) => `${DATADOE_BASE}/exports/${id}/raw`,
 };
 
-export const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
+// MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT now lives in ./id-batching.js (imported +
+// re-exported above).
 
 export function authHeaders(apiKey) {
   return {
@@ -53,6 +74,26 @@ export class DataDoeDeadlineError extends Error {
 
 export function isDataDoeDeadlineError(error) {
   return error?.code === "DATADOE_DEADLINE" || error instanceof DataDoeDeadlineError;
+}
+
+// Typed poll-window-exhausted signal: the bounded poll window ended while the export was
+// still in a TEMPORARY state (repeated status-GET 404 before the export becomes visible,
+// or an ordinary PENDING/processing status). This is NOT a failure: the export id is
+// valid and the SAME id can be polled again by a later invocation. Scheduler v2 treats it
+// exactly like a deadline deferral (job stays 'attempted' with its export_id; no failure
+// recorded; never a second create-export POST). Genuine terminal outcomes (status-GET
+// 500, FAILED / ERROR / BLOCKED_NO_TOKENS, create-POST 404) still throw plain errors.
+export class DataDoePollPendingError extends Error {
+  constructor(exportId) {
+    super("DataDoe export is still processing after the bounded poll window. Retry shortly to resume the same export.");
+    this.name = "DataDoePollPendingError";
+    this.code = "DATADOE_POLL_PENDING";
+    this.exportId = exportId ?? null;
+  }
+}
+
+export function isDataDoePollPendingError(error) {
+  return error?.code === "DATADOE_POLL_PENDING" || error instanceof DataDoePollPendingError;
 }
 
 // AsyncLocalStorage lets every existing report builder inherit the scheduled
@@ -190,20 +231,39 @@ export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds,
 
 export async function pollExport(apiKey, exportId) {
   // DataDoe recommends a five-second poll cadence and exports can take close
-  // to 30 seconds. Keep this below Vercel's 60-second function limit.
+  // to 30 seconds. Keep this below Vercel's 60-second function limit: the
+  // cadence sleep runs at the START of each attempt (9 x 5s = 45s of sleeps,
+  // the same total budget as before -- the old loop slept AFTER each attempt,
+  // including a useless final sleep), so the bound is unchanged.
+  //
+  // Confirmed DataDoe behaviour: a status GET issued too soon after the
+  // create-export POST can return HTTP 404 before the export becomes visible.
+  // So (1) always wait one 5s cadence BEFORE the first status GET, and
+  // (2) treat a status-GET 404 as "not visible yet" (still pending) within
+  // this SAME bounded window -- never terminal, and NEVER answered by a second
+  // create-export POST (the export id is fixed; this function only ever GETs).
+  //
+  // Terminal states (a non-404 non-OK status, FAILED / ERROR / BLOCKED_NO_TOKENS)
+  // throw INSIDE the loop, so reaching the end of the window means every
+  // observation was TEMPORARY (404 not-yet-visible, or PENDING/processing).
+  // That exhaustion is NOT a failure: throw the typed DataDoePollPendingError
+  // so callers can leave the job 'attempted' with its export_id and RESUME the
+  // SAME export later (Scheduler v2 defers exactly like a deadline deferral;
+  // still never a second create-export POST).
   const maxAttempts = 9;
   const delayMs = 5000;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await sleep(delayMs); // cadence first: also the wait before the FIRST status GET
     const r = await ddFetch(ENDPOINTS.exportStatus(exportId), { headers: authHeaders(apiKey) });
+    if (r.status === 404) continue; // export not visible yet: temporary within the bounded window
     if (!r.ok) throw new Error(`DataDoe export status check failed (${r.status})`);
     const body = await r.json();
     if (body.status === "COMPLETED") return body;
     if (["FAILED", "ERROR", "BLOCKED_NO_TOKENS"].includes(body.status)) {
       throw new Error(`DataDoe export failed to process (${body.status}).`);
     }
-    await sleep(delayMs);
   }
-  throw new Error("DataDoe export timed out while processing. Try a shorter date range.");
+  throw new DataDoePollPendingError(exportId);
 }
 
 export async function downloadExport(apiKey, exportId) {
@@ -216,13 +276,7 @@ export async function downloadExport(apiKey, exportId) {
   return Array.isArray(body) ? body : [];
 }
 
-export function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
+// chunkArray now lives in ./id-batching.js (imported + re-exported above).
 
 const SOURCE_CACHE_MAX_OBJECT_BYTES = 8 * 1024 * 1024;
 const SOURCE_MEMORY_CACHE_MAX = 24;
@@ -231,36 +285,9 @@ const sourceMemoryCache = new Map();
 let sourceCacheUnavailableUntil = 0;
 let sourceCacheLastPrunedAt = 0;
 
-function sha256(value) {
-  return createHash("sha256").update(String(value)).digest("hex");
-}
-
-function stableValue(value) {
-  if (Array.isArray(value)) return value.map(stableValue);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
-  );
-}
-
-function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
-  const contract = sourceContractForId(sourceId);
-  const organizationFingerprint = sha256(apiKey).slice(0, 24);
-  const accountScopeHash = sha256([...ids].map(String).sort().join("\u001f"));
-  const requestMeta = stableValue({
-    source: contract?.key || String(sourceId),
-    columns: [...columns].map(String).sort(),
-    from: from || null,
-    to: to || null,
-    limit,
-    groupBy: [...(options.groupBy || [])].map(String).sort(),
-    aggregations: [...(options.aggregations || [])].map(stableValue).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
-    orderByColumn: options.orderByColumn || "date",
-    orderByDirection: options.orderByDirection || "ASC",
-  });
-  const requestHash = sha256(JSON.stringify({ organizationFingerprint, accountScopeHash, requestMeta }));
-  return { requestHash, organizationFingerprint, accountScopeHash, requestMeta };
-}
+// sha256 / stableValue / sourceRequestIdentity were moved verbatim to
+// ./source-identity.js (imported above) so the scheduler shares one identity
+// implementation. No behaviour change; request_hash values are byte-identical.
 
 function rememberSourceRows(requestHash, rows, expiresAt) {
   sourceMemoryCache.delete(requestHash);
@@ -294,29 +321,69 @@ async function readPersistedSourceRows(requestHash) {
   }
 }
 
+// Test-only seam: inject a fake source-cache saver so the durable-acknowledgement validation in
+// persistSourceRows can be driven fully offline (scripting saveSourceExportCache's resolved value)
+// without Supabase. Production NEVER sets this.
+let sourceCacheSaverOverride = null;
+export function __setSourceCacheSaverForTests(fn) { sourceCacheSaverOverride = fn || null; }
+
+// Positive durable-acknowledgement check for a saveSourceExportCache() result. saveSourceExportCache
+// resolves the persisted `source_export_cache` metadata row on success -- but it resolves NULL when
+// PostgREST returns no representation row, so a non-throwing call is NOT proof of a durable save.
+// Returns true ONLY when `saved` is a non-null object whose typed fields ALL match this exact request
+// identity and saved row set: request_hash, source_id, organization_fingerprint, account_scope_hash,
+// row_count, and a non-empty object_path. Any null/undefined/non-object value, or ANY mismatched
+// field, is false. Only these typed columns are compared -- no raw storage/DB payload is inspected
+// or surfaced (so no storage/database detail can leak through this check).
+export function isConfirmedSourceCacheAck(saved, { identity, sourceId, rowCount }) {
+  if (!saved || typeof saved !== "object") return false;
+  if (saved.request_hash !== identity.requestHash) return false;
+  if (saved.source_id !== String(sourceId)) return false;
+  if (saved.organization_fingerprint !== identity.organizationFingerprint) return false;
+  if (saved.account_scope_hash !== identity.accountScopeHash) return false;
+  if (saved.row_count !== rowCount) return false;
+  if (typeof saved.object_path !== "string" || saved.object_path.trim() === "") return false;
+  return true;
+}
+
+// Persist rows to the DURABLE shared source cache. Returns `true` ONLY when saveSourceExportCache
+// resolves a POSITIVELY MATCHING acknowledgement row (isConfirmedSourceCacheAck). Returns `false`
+// on every non-persisting path -- Supabase unconfigured, the cache marked temporarily unavailable,
+// too little deadline left, an oversized payload, a save that threw, OR a save that resolved
+// without a validated ack (null / empty / mismatched metadata). The boolean is authoritative: a
+// manual attempt marker is retained (so a later invocation resumes the same export with zero new
+// create-export POSTs) whenever this returns false. In-memory caching alone never confirms a
+// durable save.
 async function persistSourceRows({ identity, sourceId, rows, cacheHours }) {
-  if (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil) return;
+  const testSaver = sourceCacheSaverOverride; // null in production
+  if (!testSaver && (!isSupabaseConfigured() || Date.now() < sourceCacheUnavailableUntil)) return false;
   const deadlineRemaining = remainingDeadlineMs();
-  if (deadlineRemaining !== null && deadlineRemaining < 3000) return;
+  if (deadlineRemaining !== null && deadlineRemaining < 3000) return false;
   const serialised = JSON.stringify({ rows });
   const payloadBytes = Buffer.byteLength(serialised, "utf8");
-  if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return;
+  if (payloadBytes > SOURCE_CACHE_MAX_OBJECT_BYTES) return false;
   const expiresAt = new Date(Date.now() + cacheHours * 3600_000).toISOString();
+  let saved;
   try {
-    await saveSourceExportCache({
+    saved = await (testSaver || saveSourceExportCache)({
       ...identity,
       sourceId: String(sourceId),
       rows,
       payloadBytes,
       expiresAt,
     });
-    if (Date.now() - sourceCacheLastPrunedAt > 15 * 60_000) {
-      sourceCacheLastPrunedAt = Date.now();
-      await pruneSourceExportCache().catch(() => {});
-    }
   } catch {
-    sourceCacheUnavailableUntil = Date.now() + 60_000;
+    if (!testSaver) sourceCacheUnavailableUntil = Date.now() + 60_000;
+    return false;
   }
+  // A non-throwing save is NOT durable confirmation: require a positively matching acknowledgement
+  // row before reporting success (which is what licenses the manual attempt marker's removal).
+  if (!isConfirmedSourceCacheAck(saved, { identity, sourceId, rowCount: rows.length })) return false;
+  if (!testSaver && Date.now() - sourceCacheLastPrunedAt > 15 * 60_000) {
+    sourceCacheLastPrunedAt = Date.now();
+    await pruneSourceExportCache().catch(() => {});
+  }
+  return true;
 }
 
 async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit, options) {
@@ -340,19 +407,53 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
   const existing = sourceExportInflight.get(identity.requestHash);
   if (existing) return existing;
 
-  const work = (async () => {
-    const created = await createExport(apiKey, sourceId, columns, ids, from, to, limit, options);
-    const exportId = created.exportId || created.id;
-    if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
-    const rows = await downloadExport(apiKey, exportId);
+  // Shared completion: remember (in-memory) + persist (DURABLE cache), returning BOTH the rows and
+  // whether durable persistence was positively confirmed. In-memory caching alone is NOT durable,
+  // so `persisted` is what licenses a manual attempt marker to be removed. A result on the cap may
+  // be truncated: strict callers reject it, and cap-sized rows are never durably persisted (so
+  // `persisted` is false and the marker is retained for a resumable re-download).
+  const finishRows = async (rows) => {
     const expiresAt = Date.now() + cacheHours * 3600_000;
     rememberSourceRows(identity.requestHash, rows, expiresAt);
-    // A result on the cap may be truncated. Strict callers reject it; do not
-    // persist it where another report could mistake it for complete data.
-    if (rows.length < limit) {
-      await persistSourceRows({ identity, sourceId, rows, cacheHours });
+    const persisted = rows.length < limit
+      ? await persistSourceRows({ identity, sourceId, rows, cacheHours })
+      : false;
+    return { rows, persisted };
+  };
+
+  const work = (async () => {
+    if (manualSourceContinuationEnabled()) {
+      // Durable continuation (production): the marker protocol guarantees at most one
+      // create-export per request_hash attempt, persists the exportId before polling, and lets
+      // a LATER HTTP request (a fresh serverless invocation) resume the same export.
+      return runManualSourceAttempt({
+        requestHash: identity.requestHash,
+        organizationFingerprint: identity.organizationFingerprint,
+        sourceId: String(sourceId),
+        create: () => createExport(apiKey, sourceId, columns, ids, from, to, limit, options),
+        poll: (exportId) => pollExport(apiKey, exportId),
+        download: (exportId) => downloadExport(apiKey, exportId),
+        finishRows,
+        isResumableEscape: (error) => isDataDoePollPendingError(error) || isDataDoeDeadlineError(error),
+        // DEFINITE create failure = DataDoe ANSWERED the POST with an error status (the stable
+        // createExport message shape). Deadline/abort/transport errors stay AMBIGUOUS.
+        isDefiniteCreateFailure: (error) => /export creation failed \(\d{3}\)/.test(error instanceof Error ? error.message : String(error)),
+      });
     }
-    return rows;
+    // No durable store (local dev / offline tests): legacy single-invocation flow. A resumable
+    // escape here has NO durable continuation -- mark it so the route never answers
+    // retryable:true for a request that would have to create a NEW export.
+    try {
+      const created = await createExport(apiKey, sourceId, columns, ids, from, to, limit, options);
+      const exportId = created.exportId || created.id;
+      if (created.status !== "COMPLETED") await pollExport(apiKey, exportId);
+      const rows = await downloadExport(apiKey, exportId);
+      const finished = await finishRows(rows);
+      return finished.rows;
+    } catch (error) {
+      if (isDataDoePollPendingError(error) || isDataDoeDeadlineError(error)) error.durableContinuation = false;
+      throw error;
+    }
   })();
   sourceExportInflight.set(identity.requestHash, work);
   try {
@@ -391,35 +492,15 @@ export async function fetchExportRowsStrict(apiKey, sourceId, columns, ids, from
   return rows;
 }
 
-/* ===== Date helpers (UTC, string based) ===== */
-export const pad2s = (n) => String(n).padStart(2, "0");
-
-export function daysInMonthUTC(y, m /* 1..12 */) {
-  return new Date(Date.UTC(y, m, 0)).getUTCDate();
-}
-
-export function addDaysStr(s, n) {
-  const [y, m, d] = s.split("-").map(Number);
-  const t = Date.UTC(y, m - 1, d) + n * 86400000;
-  const dt = new Date(t);
-  return `${dt.getUTCFullYear()}-${pad2s(dt.getUTCMonth() + 1)}-${pad2s(dt.getUTCDate())}`;
-}
+/* ===== Date helpers (UTC, string based) =====
+ * The pure calendar-date/window helpers live in the dependency-free ../date-windows.js leaf so
+ * modules that need them (e.g. the report-derivation boundary) do NOT transitively depend on this
+ * transport/storage module (which imports supabase.js). They are RE-EXPORTED here unchanged so
+ * every existing `import { ... } from "../datadoe.js"` caller keeps working byte-for-byte. */
+export { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow };
 
 export function isDateStr(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
-}
-
-export function splitDateRangeByMonth(from, to) {
-  const windows = [];
-  let cursor = from;
-  while (cursor <= to) {
-    const [y, m] = cursor.split("-").map(Number);
-    const monthEnd = `${y}-${pad2s(m)}-${pad2s(daysInMonthUTC(y, m))}`;
-    const end = monthEnd < to ? monthEnd : to;
-    windows.push({ from: cursor, to: end });
-    cursor = addDaysStr(end, 1);
-  }
-  return windows;
 }
 
 // Fixed-length day windows, used where a source is at raw row grain and a whole
@@ -433,12 +514,6 @@ export function splitDateRangeByDays(from, to, days) {
     cursor = addDaysStr(end, 1);
   }
   return windows;
-}
-
-export function isFullCalendarMonthWindow(window) {
-  const [year, month] = window.from.slice(0, 7).split("-").map(Number);
-  return window.from === `${year}-${pad2s(month)}-01`
-    && window.to === `${year}-${pad2s(month)}-${pad2s(daysInMonthUTC(year, month))}`;
 }
 
 // DataDoe returns HTTP 400 with this wording when a non-default table has not

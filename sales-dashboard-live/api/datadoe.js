@@ -55,12 +55,15 @@ import {
   downloadExport,
   fetchAccounts as fetchAccountsRaw,
   fetchExportRows as fetchExportRowsRaw,
+  isDataDoeDeadlineError,
+  isDataDoePollPendingError,
   isDateStr,
   isFullCalendarMonthWindow,
   num,
   pad2s,
   pollExport,
   splitDateRangeByMonth,
+  withDataDoeDeadline,
 } from "../lib/server/datadoe.js";
 import {
   connectionForApiKey,
@@ -70,6 +73,12 @@ import {
   resolveDataDoeAccountIds,
   scopeDataDoeRows,
 } from "../lib/server/datadoe-connections.js";
+// Typed manual-continuation signals for the route's error mapping: retryable:true is allowed
+// only when a durable continuation exists (see classifyDataDoeRouteError below).
+import {
+  MANUAL_CONTINUATION_IN_PROGRESS,
+  isManualSourceContinuationError,
+} from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
@@ -1631,7 +1640,11 @@ async function fetchSqpRows(apiKey, sourceId, sellerOrVendorIds, from, to) {
   return rows;
 }
 
-function orderSalesByBrand(rows, catalogRows) {
+// Exported so an INDEPENDENT parity harness (scripts/scheduler-v2-report-derivation.test.mjs)
+// can execute this production fold and the extracted pure copy in
+// lib/server/reports/derivation-core.js side by side and assert they never drift. Runtime
+// behavior is unchanged (adding `export` only).
+export function orderSalesByBrand(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim();
@@ -1680,7 +1693,9 @@ function orderSalesByBrand(rows, catalogRows) {
   return [...totals.values()];
 }
 
-function normalizeDailySalesRows(rows) {
+// Exported so the Scheduler v2 Daily Reporting derivation can run the SAME normalization
+// independently for its route-vs-shadow parity harness (runtime unchanged).
+export function normalizeDailySalesRows(rows) {
   return rows.map((row) => ({
     ...row,
     total_sales: num(row.total_sales_sum ?? row.total_sales),
@@ -1690,7 +1705,8 @@ function normalizeDailySalesRows(rows) {
 
 // Join the ASIN-level daily export to the account's catalog, then fold the
 // chosen brand back to one row per day for the existing Daily Reporting table.
-function dailyRowsForBrand(rows, catalogRows, brand) {
+// Exported for the Scheduler v2 named-brand derivation parity harness.
+export function dailyRowsForBrand(rows, catalogRows, brand) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim();
@@ -1716,7 +1732,8 @@ function dailyRowsForBrand(rows, catalogRows, brand) {
   return [...totals.values()];
 }
 
-function normalizeAdRows(rows) {
+// Exported for the Scheduler v2 Daily Reporting derivation parity harness (runtime unchanged).
+export function normalizeAdRows(rows) {
   return rows.map((row) => ({
     ...row,
     ad_sales: num(row.ad_sales_sum ?? row.ad_sales),
@@ -1725,7 +1742,7 @@ function normalizeAdRows(rows) {
   }));
 }
 
-function catalogBrandNames(rows) {
+export function catalogBrandNames(rows) {
   // A successful but zero-row (or fully unmapped) Product Catalog must NOT fabricate a
   // brand: rows fold unmapped ASINs into the "Unassigned" placeholder, which is not a
   // real brand and is excluded here (as the Brand directory already excludes it), so an
@@ -1769,7 +1786,7 @@ function notificationAsins(value) {
   return [...found].sort();
 }
 
-function compactContentChangeEvents(rows, catalogRows) {
+export function compactContentChangeEvents(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
     const asin = String(catalogRow.child_asin || "").trim().toUpperCase();
@@ -1878,17 +1895,14 @@ async function reconciliationRowsByMonth(apiKey, sourceId, columns, ids, from, t
 // (currency|sku|child_asin), with per-month numeric sums kept under `byMonth`.
 // Each month is aggregated server-side by DataDoe; hitting the row cap throws so
 // a truncated (misleading) P&L is never returned as complete.
-async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
+// PURE fold: combine per-month SKU P&L batches into one row per (currency|sku|child_asin) with
+// per-month numeric sums under `byMonth`. Extracted verbatim from the fetch loop below and
+// exported so the Scheduler v2 SKU P&L derivation runs the IDENTICAL fold independently for its
+// route-vs-shadow parity harness. `monthlyBatches`: [{ monthKey, rows }] in canonical (window)
+// order; the fold is additive per bucket, and entry insertion/order matches the batch+row order.
+export function foldSkuPlMonthlyRows(monthlyBatches) {
   const combined = new Map();
-  for (const window of windows) {
-    const monthKey = window.from.slice(0, 7);
-    const rows = await fetchExportRows(
-      apiKey, SKU_PL_SOURCE_ID, SKU_PL_COLUMNS, sellerOrVendorIds, window.from, window.to, SKU_PL_ROW_LIMIT,
-      { groupBy: SKU_PL_GROUP_BY, aggregations: SKU_PL_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" }
-    );
-    if (rows.length >= SKU_PL_ROW_LIMIT) {
-      throw new Error(`SKU P&L export reached the ${SKU_PL_ROW_LIMIT.toLocaleString("en-US")} row cap for ${monthKey}. The report was not saved because a partial P&L would be misleading.`);
-    }
+  for (const { monthKey, rows } of monthlyBatches) {
     for (const row of rows) {
       const sku = String(row.sku || "").trim();
       const childAsin = String(row.child_asin || "").trim();
@@ -1924,6 +1938,22 @@ async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
   return [...combined.values()];
 }
 
+async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
+  const monthlyBatches = [];
+  for (const window of windows) {
+    const monthKey = window.from.slice(0, 7);
+    const rows = await fetchExportRows(
+      apiKey, SKU_PL_SOURCE_ID, SKU_PL_COLUMNS, sellerOrVendorIds, window.from, window.to, SKU_PL_ROW_LIMIT,
+      { groupBy: SKU_PL_GROUP_BY, aggregations: SKU_PL_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" }
+    );
+    if (rows.length >= SKU_PL_ROW_LIMIT) {
+      throw new Error(`SKU P&L export reached the ${SKU_PL_ROW_LIMIT.toLocaleString("en-US")} row cap for ${monthKey}. The report was not saved because a partial P&L would be misleading.`);
+    }
+    monthlyBatches.push({ monthKey, rows });
+  }
+  return foldSkuPlMonthlyRows(monthlyBatches);
+}
+
 async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
   const allRows = [];
   for (const window of splitDateRangeByMonth(from, to)) {
@@ -1937,6 +1967,12 @@ async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
       DAILY_BRAND_ROW_LIMIT,
       { groupBy: DAILY_BRAND_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
     );
+    // Strict: a month exactly at the row cap is indistinguishable from a truncated
+    // one. Reject it BEFORE appending, so an understated all-brand / named-brand
+    // total is never derived or saved; the previous good snapshot is preserved.
+    if (rows.length >= DAILY_BRAND_ROW_LIMIT) {
+      throw new Error(`Daily Reporting sales export reached the ${DAILY_BRAND_ROW_LIMIT.toLocaleString("en-US")} row cap for ${window.from.slice(0, 7)}. The report was not saved because a partial month would understate brand and all-brand totals.`);
+    }
     allRows.push(...rows);
   }
   return allRows;
@@ -1984,7 +2020,8 @@ async function planAsinUnits(apiKey, ids, from, to) {
 // (account, date). Ad totals attach to the first sales row for each key so
 // downstream range sums count them exactly once; days with ad activity but no
 // sales row get a synthetic zero-sales row.
-function mergeSalesAndAds(salesRows, adRows) {
+// Exported for the Scheduler v2 Daily Reporting derivation parity harness (runtime unchanged).
+export function mergeSalesAndAds(salesRows, adRows) {
   const firstByKey = new Map();
   for (const r of salesRows) {
     const key = `${r.seller_or_vendor_id}|${r.date}`;
@@ -2016,7 +2053,56 @@ function mergeSalesAndAds(salesRows, adRows) {
   return salesRows;
 }
 
-export default async function handler(req, res) {
+// Absolute DataDoe execution budget for THIS serverless function (Blocker 2). vercel.json pins
+// maxDuration to 60s (NOT increased); the DataDoe transport gets 55s so 5s of shutdown headroom
+// remains for response serialization / snapshot persistence after the last DataDoe operation.
+// withDataDoeDeadline threads the deadline through AsyncLocalStorage, so EVERY DataDoe request
+// (ddFetch pre-checks + an AbortController on the in-flight request), every rate-limit/429-retry
+// sleep, and every poll cadence sleep inside this invocation is bounded -- no new request starts
+// when insufficient time remains, and no sleep can run past the budget. No process.exit, no
+// forced timers: work stops by the typed DataDoeDeadlineError surfacing through the normal path.
+const ROUTE_DATADOE_BUDGET_MS = 55_000;
+
+export default function handler(req, res) {
+  return withDataDoeDeadline(Date.now() + ROUTE_DATADOE_BUDGET_MS, () => handleDataDoe(req, res));
+}
+
+// Typed-error -> HTTP mapping for the route's final catch. FIXED safe messages only (no raw
+// DataDoe/Supabase text, no exportId, no marker contents). `retryable: true` is allowed ONLY
+// when a DURABLE continuation exists: either the escaping deadline/poll-pending error was
+// flagged durableContinuation=true by the continuation protocol (the exportId is persisted and
+// a later request resumes it), or another invocation durably owns the in-progress marker.
+// Without a durable continuation a retry would create a NEW export, so retryable stays false.
+// Exported for the offline suite; returns null for errors this mapping does not own.
+export function classifyDataDoeRouteError(err) {
+  // The SINGLE source of truth for a retry hint: positive durable evidence. `retryable: true` is
+  // emitted ONLY when the error object itself carries durableContinuation === true (the continuation
+  // protocol sets it when the export id is persisted and a later request can resume the SAME export,
+  // or when another invocation durably owns the in-progress marker). A plain object, an arbitrary
+  // MANUAL_SOURCE_* code, or any error lacking that flag can never be retryable.
+  const durable = err != null && err.durableContinuation === true;
+  if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
+    return {
+      status: 504,
+      body: {
+        error: "DataDoe is still processing this request. Please retry in a moment.",
+        retryable: durable,
+      },
+    };
+  }
+  if (isManualSourceContinuationError(err)) {
+    // Only an in-progress signal WITH durable evidence invites a retry (another request owns the
+    // durable marker). Everything else -- unavailable, uncertain, an unknown MANUAL_SOURCE_* code,
+    // or an in-progress code without durable evidence -- is admin-safe and non-retryable.
+    if (err.code === MANUAL_CONTINUATION_IN_PROGRESS && durable) {
+      return { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } };
+    }
+    return { status: 503, body: { error: "This data fetch could not be durably tracked and needs review before retrying.", retryable: false } };
+  }
+  return null;
+}
+
+async function handleDataDoe(req, res) {
   let legacySharedRefresh = null;
   try {
     const access = await getDashboardAccess(req);
@@ -3301,6 +3387,13 @@ export default async function handler(req, res) {
 
     res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=brand-view-portfolio, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
+    // Typed DataDoe deadline / poll-pending / continuation signals get fixed safe messages and a
+    // retryable flag that is true ONLY when a durable continuation exists (see the classifier).
+    const mapped = classifyDataDoeRouteError(err);
+    if (mapped) {
+      res.status(mapped.status).json(mapped.body);
+      return;
+    }
     const status = err instanceof DashboardAccessError ? err.status : 500;
     res.status(status).json({ error: err instanceof Error ? err.message : "Unexpected server error." });
   } finally {

@@ -1,0 +1,688 @@
+// Manual DataDoe export continuation — deterministic OFFLINE tests of the durable attempt-marker
+// protocol (lib/server/manual-source-continuation.js) and its wiring through fetchSourceChunk and
+// the /api/datadoe route error mapping.
+//
+// The finding: Scheduler v2 resumes its persisted export_id, but the manual path only held the
+// in-flight export in process memory -- after a 504 retryable:true, the NEXT HTTP request (a fresh
+// serverless invocation) called createExport again and could spend another token. The durable
+// marker (report_snapshots INSERT-IF-ABSENT + rev-CAS, keyed by the exact canonical request_hash)
+// makes request B resume request A's export with ZERO new create POSTs.
+//
+// No network, DataDoe, or Supabase: the marker store is an injected in-memory fake; DataDoe HTTP
+// is a scripted global-fetch queue; timers fire immediately (recorded); real clock.
+//
+// 7-bit ASCII, LF. Run: node scripts/manual-source-continuation.test.js
+
+import assert from "node:assert/strict";
+import { writeSync } from "node:fs";
+
+process.env.DATADOE_API_KEY = process.env.DATADOE_API_KEY || "dd_api_test";
+
+let passed = 0;
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
+
+// ---- instant timers (recorded) + scripted fetch ----
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, 0, ...args);
+const tick = () => new Promise((resolve) => realSetTimeout(resolve, 0));
+
+let fetchQueue = [];
+const fetchLog = [];
+const mkRes = ({ status = 200, body = {} }) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: { get: () => null },
+  json: async () => body,
+  text: async () => JSON.stringify(body),
+  clone() { return this; },
+});
+globalThis.fetch = async (url, options = {}) => {
+  const method = (options.method || "GET").toUpperCase();
+  fetchLog.push({ method, url: String(url) });
+  const next = fetchQueue.shift();
+  if (!next) throw new Error(`unexpected fetch: ${method} ${url}`);
+  return mkRes(next);
+};
+const posts = () => fetchLog.filter((e) => e.method === "POST");
+const resetHttp = () => { fetchQueue = []; fetchLog.length = 0; };
+
+// ---- in-memory marker store (models insert-if-absent + rev-CAS + delete), with spies ----
+function fakeStore() {
+  const rows = new Map(); // requestHash -> payload (with rev)
+  const calls = { load: 0, save: 0, remove: 0 };
+  let failNext = null; // "load" | "save-throw" | "save-lose"
+  return {
+    rows, calls,
+    failNext: (mode) => { failNext = mode; },
+    async load(h) {
+      calls.load += 1;
+      if (failNext === "load") { failNext = null; throw new Error("supabase down (raw)"); }
+      const p = rows.get(h);
+      return p ? { ...p } : null;
+    },
+    async save(h, marker) {
+      calls.save += 1;
+      if (failNext === "save-throw") { failNext = null; throw new Error("supabase down (raw)"); }
+      if (failNext === "save-lose") { failNext = null; return false; }
+      if (marker.rev == null) {
+        if (rows.has(h)) return false;
+        rows.set(h, { ...marker, rev: 1 });
+        return 1;
+      }
+      const current = rows.get(h);
+      if (!current || current.rev !== marker.rev) return false;
+      rows.set(h, { ...marker, rev: marker.rev + 1 });
+      return marker.rev + 1;
+    },
+    async remove(h) { calls.remove += 1; rows.delete(h); return true; },
+  };
+}
+
+// ---- fake transport for module-level protocol tests ----
+const pollPendingErr = () => { const e = new Error("still processing"); e.code = "DATADOE_POLL_PENDING"; return e; };
+const deadlineErr = () => { const e = new Error("deferred"); e.code = "DATADOE_DEADLINE"; return e; };
+const isResumableEscape = (e) => e != null && (e.code === "DATADOE_POLL_PENDING" || e.code === "DATADOE_DEADLINE");
+const isDefiniteCreateFailure = (e) => /export creation failed \(\d{3}\)/.test(e instanceof Error ? e.message : String(e));
+
+// finishRows returns { rows, persisted } -- `persisted` gates marker removal. Default true; set
+// t.persistResult = false to simulate a skipped/failed/oversized/low-deadline/cap-sized persist.
+function mkTransport({ createResult, pollThrows = null, downloadRows = [{ r: 1 }], persistResult = true } = {}) {
+  const t = {
+    creates: 0, polls: 0, downloads: 0, finished: [], persistResult,
+    create: async () => { t.creates += 1; if (createResult instanceof Error) throw createResult; return createResult || { exportId: "E1", status: "PENDING" }; },
+    poll: async () => { t.polls += 1; if (pollThrows) throw pollThrows; },
+    download: async () => { t.downloads += 1; return downloadRows; },
+    finishRows: async (rows) => { t.finished.push(rows); return { rows, persisted: t.persistResult === true }; },
+  };
+  return t;
+}
+
+let runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides, ManualSourceContinuationError;
+let MANUAL_CONTINUATION_IN_PROGRESS, MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN;
+let fetchExportRows, withDataDoeDeadline, isDataDoePollPendingError, isDataDoeDeadlineError, DataDoePollPendingError, DataDoeDeadlineError;
+let isConfirmedSourceCacheAck, __setSourceCacheSaverForTests;
+let classifyDataDoeRouteError;
+
+const runAttempt = (store, transport, requestHash = "h1") => runManualSourceAttempt({
+  requestHash, organizationFingerprint: "orgA", sourceId: "src-1",
+  create: transport.create, poll: transport.poll, download: transport.download,
+  finishRows: transport.finishRows, isResumableEscape, isDefiniteCreateFailure,
+  deps: { store },
+});
+
+// ================= module-level protocol tests =================
+
+test("(happy path) claim -> exactly one create -> exportId CAS -> poll/download -> cache first -> marker removed", async () => {
+  const store = fakeStore();
+  const t = mkTransport({});
+  const rows = await runAttempt(store, t);
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(t.creates, 1);
+  assert.equal(t.finished.length, 1, "rows persisted through the injected source-cache step");
+  assert.equal(store.rows.size, 0, "marker removed AFTER completion");
+  assert.equal(store.calls.remove, 1);
+});
+
+test("(durable completion) an UNCONFIRMED persist RETAINS the marker; a fresh invocation resumes E1 with ZERO new creates (two-invocation regression)", async () => {
+  const store = fakeStore();
+  // invocation 1: download succeeds but the durable source-cache persist is NOT confirmed
+  // (skipped/failed/oversized/low-deadline/cap-sized). In-memory caching alone is insufficient,
+  // so the marker MUST be retained with its export id.
+  const tA = mkTransport({ persistResult: false });
+  const rows1 = await runAttempt(store, tA);
+  assert.deepEqual(rows1, [{ r: 1 }], "invocation 1 still returns its rows to the caller");
+  assert.equal(tA.creates, 1);
+  assert.equal(store.calls.remove, 0, "the marker was NOT removed on an unconfirmed persist");
+  const kept = store.rows.get("h1");
+  assert.ok(kept, "marker retained");
+  assert.equal(kept.status, "polling");
+  assert.equal(kept.exportId, "E1", "the export id is preserved for a durable resume");
+  // invocation 2: a SEPARATE invocation (fresh transport == process-local memory cleared). It must
+  // resume E1 -- create ZERO new exports -- and now that persistence is confirmed, remove the marker.
+  const tB = mkTransport({ persistResult: true });
+  const rows2 = await runAttempt(store, tB);
+  assert.deepEqual(rows2, [{ r: 1 }]);
+  assert.equal(tB.creates, 0, "invocation 2 created ZERO exports");
+  assert.equal(tB.polls, 1, "it resumed by polling the saved export id");
+  assert.equal(tB.downloads, 1, "and re-downloaded E1");
+  assert.equal(store.rows.size, 0, "marker removed once durable persistence is confirmed");
+});
+
+test("(durable completion: persistence never confirms) repeated resume keeps the marker and NEVER creates again", async () => {
+  const store = fakeStore();
+  const t1 = mkTransport({ persistResult: false });
+  await runAttempt(store, t1);
+  assert.equal(store.rows.get("h1").status, "polling");
+  // even after several separate invocations that all fail to persist, no second export is created
+  for (let i = 0; i < 3; i++) {
+    const tN = mkTransport({ persistResult: false });
+    const rowsN = await runAttempt(store, tN);
+    assert.deepEqual(rowsN, [{ r: 1 }]);
+    assert.equal(tN.creates, 0, `resume ${i}: zero new creates`);
+    assert.equal(store.rows.get("h1").exportId, "E1", `resume ${i}: marker + export id retained`);
+  }
+});
+
+test("(concurrent first requests) exactly ONE create POST; the loser gets typed IN_PROGRESS retryable:true and never overwrites", async () => {
+  const store = fakeStore();
+  let releaseCreate;
+  const gate = new Promise((resolve) => { releaseCreate = resolve; });
+  const t1 = mkTransport({});
+  t1.create = async () => { t1.creates += 1; await gate; return { exportId: "E1", status: "PENDING" }; };
+  const p1 = runAttempt(store, t1);
+  p1.catch(() => {});
+  await tick(); await tick(); // request A holds the durable "creating" claim, create in flight
+  assert.equal(t1.creates, 1);
+  const t2 = mkTransport({});
+  let caught = null;
+  await runAttempt(store, t2).catch((e) => { caught = e; });
+  assert.ok(isManualSourceContinuationError(caught));
+  assert.equal(caught.code, MANUAL_CONTINUATION_IN_PROGRESS);
+  assert.equal(caught.retryable, true, "the owner's durable marker exists, so retry is honest");
+  assert.equal(t2.creates, 0, "the concurrent request made ZERO create POSTs");
+  assert.equal(store.rows.get("h1").status, "creating", "the owner's marker was never overwritten");
+  releaseCreate();
+  await p1;
+  assert.equal(store.rows.size, 0);
+  assert.equal(t1.creates + t2.creates, 1, "exactly one create total");
+});
+
+test("(poll-pending after E1, then a separate request) marker keeps exportId; request B resumes with ZERO creates", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ pollThrows: pollPendingErr() });
+  let caught = null;
+  await runAttempt(store, tA).catch((e) => { caught = e; });
+  assert.equal(tA.creates, 1);
+  assert.equal(caught.code, "DATADOE_POLL_PENDING");
+  assert.equal(caught.durableContinuation, true, "escape is flagged durable -- the route may say retryable:true");
+  const marker = store.rows.get("h1");
+  assert.equal(marker.status, "polling");
+  assert.equal(marker.exportId, "E1", "exportId persisted BEFORE polling and preserved by the escape");
+  // request B: separate invocation (fresh transport; the in-memory promise is long gone)
+  const tB = mkTransport({});
+  const rows = await runAttempt(store, tB);
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(tB.creates, 0, "request B resumed the SAVED export: zero new create POSTs");
+  assert.equal(tB.polls, 1);
+  assert.equal(store.rows.size, 0, "marker removed after the resumed completion");
+});
+
+test("(execution deadline after E1) same durable resume path as poll-pending", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ pollThrows: deadlineErr() });
+  let caught = null;
+  await runAttempt(store, tA).catch((e) => { caught = e; });
+  assert.equal(caught.code, "DATADOE_DEADLINE");
+  assert.equal(caught.durableContinuation, true);
+  assert.equal(store.rows.get("h1").exportId, "E1");
+  const tB = mkTransport({});
+  await runAttempt(store, tB);
+  assert.equal(tA.creates + tB.creates, 1, "exactly one create across the deadline + resume");
+});
+
+test("(claim write failure) typed CONTINUATION_UNAVAILABLE, retryable:false, create NEVER called", async () => {
+  const store = fakeStore();
+  store.failNext("save-throw");
+  const t = mkTransport({});
+  let caught = null;
+  await runAttempt(store, t).catch((e) => { caught = e; });
+  assert.equal(caught.code, MANUAL_CONTINUATION_UNAVAILABLE);
+  assert.equal(caught.retryable, false, "no durable continuation could be established");
+  assert.equal(t.creates, 0, "failed claim => NO create-export (fail closed)");
+});
+
+test("(exportId transition failure: CAS throw AND CAS loss) fail closed; no duplicate POST ever for that marker", async () => {
+  for (const mode of ["save-throw", "save-lose"]) {
+    const store = fakeStore();
+    const t = mkTransport({});
+    const original = store.save.bind(store);
+    let saves = 0;
+    store.save = async (h, m) => { saves += 1; if (saves === 2) { store.failNext(mode); } return original(h, m); }; // claim ok; exportId CAS fails
+    let caught = null;
+    await runAttempt(store, t).catch((e) => { caught = e; });
+    assert.equal(t.creates, 1, `${mode}: the one create happened`);
+    assert.equal(caught.code, MANUAL_CONTINUATION_UNCERTAIN, `${mode}: typed uncertain (never terminal-raw)`);
+    assert.equal(caught.retryable, false);
+    // a follow-up request must NOT auto-create for this marker
+    const t2 = mkTransport({});
+    let caught2 = null;
+    await runAttempt(store, t2).catch((e) => { caught2 = e; });
+    assert.equal(t2.creates, 0, `${mode}: zero duplicate POSTs`);
+    assert.equal(caught2.code, MANUAL_CONTINUATION_IN_PROGRESS, `${mode}: fresh creating marker -> in-progress`);
+  }
+});
+
+test("(definite create failure) admin-safe typed code only; marker becomes failed and IS re-claimable", async () => {
+  const store = fakeStore();
+  const boom = new Error('DataDoe export creation failed (404): {"message":"Source not found","statusCode":404}');
+  const tA = mkTransport({ createResult: boom });
+  await runAttempt(store, tA).catch(() => {});
+  assert.equal(tA.creates, 1);
+  const marker = store.rows.get("h1");
+  assert.equal(marker.status, "failed");
+  assert.equal(marker.code, "CREATE_FAILED_404", "only the status digits survive");
+  assert.ok(!JSON.stringify([...store.rows.values()]).includes("Source not found"), "no raw DataDoe text in the marker");
+  // definite failure = no export existed: a later request may safely re-claim and create
+  const tB = mkTransport({});
+  const rows = await runAttempt(store, tB);
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(tB.creates, 1, "re-claimed via CAS after a DEFINITE failure only");
+});
+
+test("(ambiguous create outcome) marker stays creating; fresh => in-progress; expired => UNCERTAIN; never auto-created", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ createResult: new Error("socket hang up") }); // NOT the definite shape
+  await runAttempt(store, tA).catch(() => {});
+  assert.equal(tA.creates, 1);
+  assert.equal(store.rows.get("h1").status, "creating", "ambiguous outcome leaves the claim in place");
+  const t2 = mkTransport({});
+  let caught = null;
+  await runAttempt(store, t2).catch((e) => { caught = e; });
+  assert.equal(caught.code, MANUAL_CONTINUATION_IN_PROGRESS, "fresh marker: in-progress");
+  assert.equal(t2.creates, 0);
+  // conservative retention: once expired, the outcome is UNCERTAIN -- surfaced, never silently retried
+  store.rows.get("h1").expiresAt = new Date(Date.now() - 1000).toISOString();
+  const t3 = mkTransport({});
+  let caught3 = null;
+  await runAttempt(store, t3).catch((e) => { caught3 = e; });
+  assert.equal(caught3.code, MANUAL_CONTINUATION_UNCERTAIN);
+  assert.equal(caught3.retryable, false);
+  assert.equal(t3.creates, 0, "an uncertain create is NEVER silently retried");
+});
+
+test("(genuine export failure during poll) marker records EXPORT_FAILED; no resumable flag", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ pollThrows: new Error("DataDoe export failed to process (FAILED).") });
+  let caught = null;
+  await runAttempt(store, tA).catch((e) => { caught = e; });
+  assert.ok(!isManualSourceContinuationError(caught) && caught.durableContinuation !== true);
+  assert.equal(store.rows.get("h1").status, "failed");
+  assert.equal(store.rows.get("h1").code, "EXPORT_FAILED");
+});
+
+test("(hash isolation) an in-flight marker for one request_hash never affects another", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ pollThrows: pollPendingErr() });
+  await runAttempt(store, tA, "h1").catch(() => {});
+  assert.equal(store.rows.get("h1").status, "polling");
+  const tB = mkTransport({});
+  const rows = await runAttempt(store, tB, "h2");
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(tB.creates, 1, "h2 proceeds independently");
+  assert.equal(store.rows.get("h1").status, "polling", "h1 marker untouched");
+});
+
+// ---- Blocker 2: marker identity validation before ANY DataDoe call or marker mutation ----
+const nowIso = () => new Date().toISOString();
+const futureIso = () => new Date(Date.now() + 3_600_000).toISOString();
+const validPollingMarker = () => ({
+  version: "manual-source-attempt-v1", requestHash: "h1", organizationFingerprint: "orgA",
+  sourceId: "src-1", status: "polling", exportId: "E1", code: null,
+  createdAt: nowIso(), updatedAt: nowIso(), expiresAt: futureIso(), rev: 3,
+});
+
+test("(marker identity: valid) a correct polling marker resumes -- the guard is not over-tight", async () => {
+  const store = fakeStore();
+  store.rows.set("h1", validPollingMarker());
+  const t = mkTransport({});
+  const rows = await runAttempt(store, t);
+  assert.deepEqual(rows, [{ r: 1 }]);
+  assert.equal(t.creates, 0, "resumed with zero creates");
+  assert.equal(t.polls, 1);
+});
+
+test("(marker identity: every mismatched/malformed field) fails closed -- zero DataDoe calls, zero marker mutation", async () => {
+  const cases = [
+    ["wrong version", { version: "manual-source-attempt-v2" }],
+    ["missing version", { version: undefined }],
+    ["wrong requestHash", { requestHash: "hX" }],
+    ["wrong organizationFingerprint", { organizationFingerprint: "orgB" }],
+    ["missing organizationFingerprint", { organizationFingerprint: "" }],
+    ["wrong sourceId", { sourceId: "src-2" }],
+    ["missing sourceId", { sourceId: "" }],
+    ["unsafe rev (string)", { rev: "3" }],
+    ["unsafe rev (zero)", { rev: 0 }],
+    ["unsafe rev (negative)", { rev: -1 }],
+    ["missing rev", { rev: undefined }],
+    ["unknown status", { status: "weird" }],
+    ["polling without exportId", { exportId: "" }],
+    ["polling carrying a code", { code: "EXPORT_FAILED" }],
+    ["creating with an exportId", { status: "creating", exportId: "E1", code: null }],
+    ["failed with an exportId", { status: "failed", exportId: "E1", code: "CREATE_FAILED_404" }],
+    ["failed without a code", { status: "failed", exportId: "", code: null }],
+    ["failed with an invalid code", { status: "failed", exportId: "", code: "NONSENSE" }],
+    ["malformed expiresAt", { expiresAt: "not-a-date" }],
+    ["malformed createdAt", { createdAt: "nope" }],
+    ["malformed updatedAt", { updatedAt: "" }],
+  ];
+  for (const [label, override] of cases) {
+    const store = fakeStore();
+    const marker = { ...validPollingMarker(), ...override };
+    if ("version" in override && override.version === undefined) delete marker.version;
+    if ("rev" in override && override.rev === undefined) delete marker.rev;
+    store.rows.set("h1", marker);
+    const savesBefore = store.calls.save;
+    const removesBefore = store.calls.remove;
+    const before = JSON.stringify(marker);
+    const t = mkTransport({});
+    let caught = null;
+    await runAttempt(store, t).catch((e) => { caught = e; });
+    assert.ok(isManualSourceContinuationError(caught), `${label}: typed continuation error`);
+    assert.equal(caught.code, MANUAL_CONTINUATION_UNCERTAIN, `${label}: fails closed as UNCERTAIN`);
+    assert.equal(caught.retryable, false, `${label}: non-retryable`);
+    assert.equal(t.creates, 0, `${label}: ZERO create calls`);
+    assert.equal(t.polls, 0, `${label}: ZERO poll calls`);
+    assert.equal(t.downloads, 0, `${label}: ZERO download calls`);
+    assert.equal(store.calls.save, savesBefore, `${label}: ZERO marker save mutation`);
+    assert.equal(store.calls.remove, removesBefore, `${label}: ZERO marker remove`);
+    assert.equal(JSON.stringify(store.rows.get("h1")), before, `${label}: marker bytes untouched`);
+  }
+});
+
+test("(marker payload shape) safe typed fields only -- never an api key, rows, or raw error text", async () => {
+  const store = fakeStore();
+  const tA = mkTransport({ pollThrows: pollPendingErr() });
+  await runAttempt(store, tA).catch(() => {});
+  const marker = store.rows.get("h1");
+  assert.deepEqual(Object.keys(marker).sort(), ["code", "createdAt", "expiresAt", "exportId", "organizationFingerprint", "requestHash", "rev", "sourceId", "status", "updatedAt", "version"].sort());
+  const blob = JSON.stringify(marker);
+  assert.ok(!blob.includes("dd_api_test") && !/apiKey/i.test(blob), "no credential material");
+});
+
+// ================= integration: two separate HTTP-style requests through fetchExportRows =================
+
+test("(two-request integration: poll-pending) request A creates E1 + poll-pends; request B resumes E1 -- ONE POST total", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  // request A: create POST -> E1, then the full temporary window (9 x 404) -> typed escape
+  fetchQueue = [
+    { status: 200, body: { exportId: "E1", status: "PENDING" } },
+    ...Array.from({ length: 9 }, () => ({ status: 404, body: {} })),
+  ];
+  let caughtA = null;
+  await fetchExportRows("kA", "src-manual-1", ["a"], ["S1"], "2026-01-01", "2026-01-31", 100, {}).catch((e) => { caughtA = e; });
+  assert.ok(isDataDoePollPendingError(caughtA));
+  assert.equal(caughtA.durableContinuation, true, "durable marker exists -> the route may answer retryable:true");
+  assert.equal(posts().length, 1);
+  assert.equal(store.rows.size, 1);
+  const marker = [...store.rows.values()][0];
+  assert.equal(marker.status, "polling");
+  assert.equal(marker.exportId, "E1");
+  // request B: a separate invocation -- request A's in-memory in-flight promise is GONE (its
+  // rejected work was dropped in fetchSourceChunk's finally). B recomputes the same request_hash,
+  // loads the marker, and resumes E1.
+  const rows = [{ ok: 1 }];
+  fetchQueue = [
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got = await fetchExportRows("kA", "src-manual-1", ["a"], ["S1"], "2026-01-01", "2026-01-31", 100, {});
+  assert.deepEqual(got, rows);
+  assert.equal(posts().length, 1, "EXACTLY ONE create-export POST across both requests");
+  // Offline the durable source cache is unconfigured, so persistence is NOT confirmed and the
+  // marker is RETAINED (polling, E1) -- completion never drops the marker on an unconfirmed persist,
+  // so any further resume still makes zero creates. (In production, with the cache configured, a
+  // confirmed persist removes it; that branch is proven by the module-level durable-completion test.)
+  const afterB = [...store.rows.values()][0];
+  assert.equal(afterB.status, "polling");
+  assert.equal(afterB.exportId, "E1");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+test("(two-invocation integration: persist unconfirmed) inv1 completes but keeps the marker; inv2 with cleared memory resumes E1 -- ZERO new creates", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  // inv1: create E1 -> COMPLETED -> download rows. Offline persistSourceRows returns false (Supabase
+  // unconfigured), so durable persistence is NOT confirmed and the marker is retained with E1.
+  const rows = [{ ok: 7 }];
+  fetchQueue = [
+    { status: 200, body: { exportId: "E1", status: "PENDING" } },
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got1 = await fetchExportRows("kD", "src-manual-4", ["a"], ["S1"], "2026-04-01", "2026-04-30", 100, {});
+  assert.deepEqual(got1, rows, "inv1 returns rows to the caller");
+  assert.equal(posts().length, 1);
+  const kept = [...store.rows.values()][0];
+  assert.equal(kept.status, "polling");
+  assert.equal(kept.exportId, "E1", "marker RETAINED with export id because persistence was not confirmed");
+  // inv2: a separate invocation with process-local memory cleared. bypassSourceCache skips the
+  // in-memory + durable reads, so it must go through the marker and resume E1 -- zero new creates.
+  fetchQueue = [
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got2 = await fetchExportRows("kD", "src-manual-4", ["a"], ["S1"], "2026-04-01", "2026-04-30", 100, { bypassSourceCache: true });
+  assert.deepEqual(got2, rows);
+  assert.equal(posts().length, 1, "invocation 2 created ZERO new exports -- ONE create POST total");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+test("(two-request integration: execution deadline after E1) request B resumes -- ONE POST total", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  // request A runs under a 5s DataDoe budget: the create POST fits, the exportId is persisted,
+  // and the first 5s poll cadence cannot fit (5s remaining <= 5s + headroom) -> typed deadline.
+  fetchQueue = [{ status: 200, body: { exportId: "E9", status: "PENDING" } }];
+  let caughtA = null;
+  await withDataDoeDeadline(Date.now() + 5_000, () => fetchExportRows("kB", "src-manual-2", ["a"], ["S1"], "2026-02-01", "2026-02-28", 100, {})).catch((e) => { caughtA = e; });
+  assert.ok(isDataDoeDeadlineError(caughtA));
+  assert.equal(caughtA.durableContinuation, true);
+  assert.equal(posts().length, 1);
+  assert.equal([...store.rows.values()][0].exportId, "E9", "exportId persisted BEFORE the deadline hit");
+  const rows = [{ ok: 2 }];
+  fetchQueue = [
+    { status: 200, body: { status: "COMPLETED" } },
+    { status: 200, body: { rawContent: JSON.stringify(rows) } },
+  ];
+  const got = await fetchExportRows("kB", "src-manual-2", ["a"], ["S1"], "2026-02-01", "2026-02-28", 100, {});
+  assert.deepEqual(got, rows);
+  assert.equal(posts().length, 1, "EXACTLY ONE create-export POST across deadline + resume");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+test("(cache-first) a warm source cache returns before ANY marker read or DataDoe request", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  const loadsBefore = store.calls.load;
+  // src-manual-1 completed in the poll-pending integration test above; its rows are in the
+  // in-process source memory cache under the same identity.
+  const got = await fetchExportRows("kA", "src-manual-1", ["a"], ["S1"], "2026-01-01", "2026-01-31", 100, {});
+  assert.deepEqual(got, [{ ok: 1 }]);
+  assert.equal(fetchLog.length, 0, "zero DataDoe requests");
+  assert.equal(store.calls.load, loadsBefore, "zero marker reads -- the cache answered first");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+test("(non-durable fallback) without a durable store, a resumable escape is NOT flagged durable", async () => {
+  resetHttp();
+  __setManualSourceContinuationTestOverrides({ enabled: false });
+  fetchQueue = [
+    { status: 200, body: { exportId: "E5", status: "PENDING" } },
+    ...Array.from({ length: 9 }, () => ({ status: 404, body: {} })),
+  ];
+  let caught = null;
+  await fetchExportRows("kC", "src-manual-3", ["a"], ["S1"], "2026-03-01", "2026-03-31", 100, {}).catch((e) => { caught = e; });
+  assert.ok(isDataDoePollPendingError(caught));
+  assert.equal(caught.durableContinuation, false, "no durable continuation could be established");
+  __setManualSourceContinuationTestOverrides(null);
+});
+
+// ================= durable-cache acknowledgement validation (persistSourceRows) =================
+
+test("(durable ack: unit) isConfirmedSourceCacheAck is true ONLY for a fully matching row", async () => {
+  const identity = { requestHash: "rh1", organizationFingerprint: "of1", accountScopeHash: "as1" };
+  const ctx = { identity, sourceId: "src-1", rowCount: 2 };
+  const good = { request_hash: "rh1", source_id: "src-1", organization_fingerprint: "of1", account_scope_hash: "as1", row_count: 2, object_path: "source-cache/v1/rh/rh1.json" };
+  assert.equal(isConfirmedSourceCacheAck(good, ctx), true, "a fully matching ack confirms");
+  // absent / malformed shapes
+  for (const bad of [null, undefined, 0, "row", 42, [], true]) {
+    assert.equal(isConfirmedSourceCacheAck(bad, ctx), false, `non-object ack (${String(bad)}) is not confirmation`);
+  }
+  assert.equal(isConfirmedSourceCacheAck({}, ctx), false, "an empty object is not confirmation");
+  // each single mismatched / missing field fails closed
+  const mism = [
+    ["wrong request_hash", { request_hash: "WRONG" }],
+    ["wrong source_id", { source_id: "WRONG" }],
+    ["wrong organization_fingerprint", { organization_fingerprint: "WRONG" }],
+    ["wrong account_scope_hash", { account_scope_hash: "WRONG" }],
+    ["wrong row_count", { row_count: 3 }],
+    ["row_count as string", { row_count: "2" }],
+    ["blank object_path", { object_path: "   " }],
+    ["empty object_path", { object_path: "" }],
+    ["missing object_path", { object_path: undefined }],
+    ["null object_path", { object_path: null }],
+  ];
+  for (const [label, override] of mism) {
+    const row = { ...good, ...override };
+    if ("object_path" in override && override.object_path === undefined) delete row.object_path;
+    assert.equal(isConfirmedSourceCacheAck(row, ctx), false, `${label}: not confirmation`);
+  }
+  // source_id is compared as String(sourceId) -- a numeric context still matches its stringified row value
+  assert.equal(isConfirmedSourceCacheAck({ ...good, source_id: "7" }, { identity, sourceId: 7, rowCount: 2 }), true, "String(sourceId) comparison");
+});
+
+// Build a fully-matching ack FROM the exact argument persistSourceRows hands the saver, so the test
+// never needs to know the computed request_hash/org/scope up front.
+const matchingAck = (arg) => ({
+  request_hash: arg.requestHash,
+  source_id: arg.sourceId,
+  organization_fingerprint: arg.organizationFingerprint,
+  account_scope_hash: arg.accountScopeHash,
+  row_count: arg.rows.length,
+  object_path: `source-cache/v1/${String(arg.requestHash).slice(0, 2)}/${arg.requestHash}.json`,
+});
+
+test("(durable ack: integration) every unconfirmed acknowledgement RETAINS the marker; a fresh invocation creates ZERO exports", async () => {
+  const badAcks = [
+    ["null ack (resolves null, no throw)", () => null],
+    ["empty object", () => ({})],
+    ["wrong request_hash", (a) => ({ ...matchingAck(a), request_hash: "WRONG-HASH" })],
+    ["wrong source_id", (a) => ({ ...matchingAck(a), source_id: "WRONG-SRC" })],
+    ["wrong organization_fingerprint", (a) => ({ ...matchingAck(a), organization_fingerprint: "WRONG-ORG" })],
+    ["wrong account_scope_hash", (a) => ({ ...matchingAck(a), account_scope_hash: "WRONG-SCOPE" })],
+    ["wrong row_count", (a) => ({ ...matchingAck(a), row_count: a.rows.length + 1 })],
+    ["blank object_path", (a) => ({ ...matchingAck(a), object_path: "   " })],
+  ];
+  let n = 0;
+  for (const [label, mk] of badAcks) {
+    n += 1;
+    resetHttp();
+    const store = fakeStore();
+    __setManualSourceContinuationTestOverrides({ enabled: true, store });
+    __setSourceCacheSaverForTests(async (arg) => mk(arg));
+    try {
+      const src = `src-ack-bad-${n}`;
+      const rows = [{ ok: n }, { ok: n * 10 }];
+      // inv1: create E1 -> COMPLETED -> download -> finishRows -> persistSourceRows(seam) => unconfirmed
+      fetchQueue = [
+        { status: 200, body: { exportId: "E1", status: "PENDING" } },
+        { status: 200, body: { status: "COMPLETED" } },
+        { status: 200, body: { rawContent: JSON.stringify(rows) } },
+      ];
+      const got1 = await fetchExportRows("kAck", src, ["a"], ["S1"], "2026-05-01", "2026-05-31", 100, {});
+      assert.deepEqual(got1, rows, `${label}: inv1 still returns rows`);
+      assert.equal(posts().length, 1, `${label}: exactly one create in inv1`);
+      const kept = [...store.rows.values()][0];
+      assert.ok(kept && kept.status === "polling" && kept.exportId === "E1", `${label}: marker RETAINED (in-memory rows never license removal)`);
+      // inv2: a separate invocation with process-local memory cleared (bypassSourceCache) -- must
+      // resume E1 through the marker and create ZERO new exports.
+      fetchQueue = [
+        { status: 200, body: { status: "COMPLETED" } },
+        { status: 200, body: { rawContent: JSON.stringify(rows) } },
+      ];
+      const got2 = await fetchExportRows("kAck", src, ["a"], ["S1"], "2026-05-01", "2026-05-31", 100, { bypassSourceCache: true });
+      assert.deepEqual(got2, rows, `${label}: inv2 returns rows`);
+      assert.equal(posts().length, 1, `${label}: invocation 2 created ZERO new exports (ONE POST total)`);
+    } finally {
+      __setManualSourceContinuationTestOverrides(null);
+      __setSourceCacheSaverForTests(null);
+    }
+  }
+});
+
+test("(durable ack: integration) a fully matching acknowledgement REMOVES the marker", async () => {
+  resetHttp();
+  const store = fakeStore();
+  __setManualSourceContinuationTestOverrides({ enabled: true, store });
+  __setSourceCacheSaverForTests(async (arg) => matchingAck(arg));
+  try {
+    const rows = [{ ok: 1 }];
+    fetchQueue = [
+      { status: 200, body: { exportId: "E1", status: "PENDING" } },
+      { status: 200, body: { status: "COMPLETED" } },
+      { status: 200, body: { rawContent: JSON.stringify(rows) } },
+    ];
+    const got = await fetchExportRows("kAck", "src-ack-good", ["a"], ["S1"], "2026-06-01", "2026-06-30", 100, {});
+    assert.deepEqual(got, rows);
+    assert.equal(posts().length, 1, "one create");
+    assert.equal(store.rows.size, 0, "a positively-matching durable ack removes the marker");
+  } finally {
+    __setManualSourceContinuationTestOverrides(null);
+    __setSourceCacheSaverForTests(null);
+  }
+});
+
+// ================= route error mapping =================
+
+test("(route mapping) retryable:true ONLY with durableContinuation===true; plain/arbitrary codes never retryable; admin-safe", async () => {
+  const durablePending = new DataDoePollPendingError("E1"); durablePending.durableContinuation = true;
+  const bareP = new DataDoePollPendingError("E1"); // no durable flag
+  const durableDeadline = new DataDoeDeadlineError(); durableDeadline.durableContinuation = true;
+  const bareDeadline = new DataDoeDeadlineError();
+  assert.deepEqual(classifyDataDoeRouteError(durablePending), { status: 504, body: { error: "DataDoe is still processing this request. Please retry in a moment.", retryable: true } });
+  assert.equal(classifyDataDoeRouteError(bareP).body.retryable, false, "poll-pending WITHOUT a durable continuation is not retryable");
+  assert.equal(classifyDataDoeRouteError(durableDeadline).body.retryable, true);
+  assert.equal(classifyDataDoeRouteError(bareDeadline).body.retryable, false, "a deadline WITHOUT a durable continuation must not invite a token-spending retry");
+
+  // A REAL in-progress error carries durableContinuation===true (another request owns the durable marker).
+  const realInProgress = new ManualSourceContinuationError(MANUAL_CONTINUATION_IN_PROGRESS, true, "internal detail");
+  assert.equal(realInProgress.durableContinuation, true);
+  assert.deepEqual(classifyDataDoeRouteError(realInProgress), { status: 504, body: { error: "Another request is already fetching this data. Please retry in a moment.", retryable: true } });
+
+  // A PLAIN object with the in-progress code but NO durable evidence must NEVER be retryable.
+  const plainInProgress = { code: MANUAL_CONTINUATION_IN_PROGRESS, message: "raw internal detail" };
+  const mappedPlain = classifyDataDoeRouteError(plainInProgress);
+  assert.equal(mappedPlain.status, 503, "no durable evidence -> admin-safe 503, not a 504 retry");
+  assert.equal(mappedPlain.body.retryable, false, "a plain object without durableContinuation is never retryable");
+  assert.ok(!JSON.stringify(mappedPlain).includes("raw internal"), "never the error's own text");
+  // An in-progress code with an explicit false durable flag is likewise non-retryable.
+  assert.equal(classifyDataDoeRouteError({ code: MANUAL_CONTINUATION_IN_PROGRESS, durableContinuation: false }).body.retryable, false);
+
+  // Unavailable / uncertain / unknown MANUAL_SOURCE_* codes: admin-safe, non-retryable, no raw text.
+  for (const code of [MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN, "MANUAL_SOURCE_SOMETHING_NEW"]) {
+    const mapped = classifyDataDoeRouteError({ code, message: "raw supabase text with secrets", durableContinuation: true });
+    assert.equal(mapped.status, 503, `${code}: admin-safe 503`);
+    assert.equal(mapped.body.retryable, false, `${code}: non-retryable even if a bogus durable flag is present`);
+    assert.ok(!mapped.body.error.includes("raw supabase"), `${code}: fixed safe message only`);
+  }
+  assert.ok(!JSON.stringify(classifyDataDoeRouteError(durablePending)).includes("E1"), "exportId never reaches the browser");
+  assert.equal(classifyDataDoeRouteError(new Error("ordinary failure")), null, "other errors keep their existing handling");
+});
+
+async function main() {
+  ({
+    runManualSourceAttempt, isManualSourceContinuationError, __setManualSourceContinuationTestOverrides,
+    ManualSourceContinuationError,
+    MANUAL_CONTINUATION_IN_PROGRESS, MANUAL_CONTINUATION_UNAVAILABLE, MANUAL_CONTINUATION_UNCERTAIN,
+  } = await import("../lib/server/manual-source-continuation.js"));
+  ({
+    fetchExportRows, withDataDoeDeadline, isDataDoePollPendingError, isDataDoeDeadlineError,
+    DataDoePollPendingError, DataDoeDeadlineError,
+    isConfirmedSourceCacheAck, __setSourceCacheSaverForTests,
+  } = await import("../lib/server/datadoe.js"));
+  ({ classifyDataDoeRouteError } = await import("../api/datadoe.js"));
+  for (const t of tests) {
+    try { await t.fn(); passed += 1; out("  ok  " + t.name); }
+    catch (e) { out("FAIL  " + t.name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; return; }
+  }
+  out("\n" + passed + " assertions passed");
+}
+
+main();

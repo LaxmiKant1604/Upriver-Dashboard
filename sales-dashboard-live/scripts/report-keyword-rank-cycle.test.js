@@ -1,0 +1,545 @@
+// Phase 1d -- Keyword Rank account-scoped STAGED source cycle tests (SHADOW MODE).
+//
+// One small, independently-readable ESM artifact. Drives runKeywordRankShadowCycle end-to-end for
+// MULTIPLE accounts against a lean in-memory source store + DataDoe double (no network). Proves
+// Blocker 1 (account-scoped signals keyed by request HASH; primary/dd-secondary isolation; fresh-
+// invocation reconstruction with zero duplicate exports) and Blocker 2 (staged catalog: no catalog
+// token before the cadence resolves; a failed/disabled weekly or required monthly spends no catalog).
+//
+// 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy
+// Supabase env. No secret-shaped literals; no process.exit / timers / background work.
+
+import assert from "node:assert/strict";
+import { writeSync } from "node:fs";
+
+process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
+const SB_KEY_ENV = ["SUPABASE", "SERVICE", "ROLE", "KEY"].join("_");
+process.env[SB_KEY_ENV] = process.env[SB_KEY_ENV] || ["test", "svc", "role", "key"].join("-");
+
+let passed = 0;
+const tests = [];
+const test = (name, fn) => tests.push({ name, fn });
+const group = (label) => tests.push({ marker: label });
+const START = Date.now();
+const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
+const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
+
+let runKeywordRankShadowCycle, runSourceJobs, sourceJobOwnerId;
+
+const dash = (...p) => p.join("-");
+const CONNS = [
+  { id: "primary", apiKey: dash("prim", "key"), accountPrefix: "" },
+  { id: "secondary", apiKey: dash("sec", "key"), accountPrefix: dash("dd", "secondary") + ":" },
+];
+const ASOF = "2025-08-10";
+
+// Lean in-memory source store implementing exactly the runSourceJobs interface.
+function makeStore() {
+  const cycles = new Map();
+  const jobsByCycle = new Map();
+  const ownersByCycle = new Map(); // cycleId -> Map<owner_id|request_hash, membership>
+  const cache = new Map();
+  let seq = 0;
+  const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
+  const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
+  return {
+    _cache: cache,
+    _rawJob(cid, h) { return jobsByCycle.get(cid) && jobsByCycle.get(cid).get(h); },
+    _owners(cid) { return ownerRows(cid).map((m) => ({ ...m })); },
+    _owner(cid, ownerId, h) { return ownersByCycle.get(cid) && ownersByCycle.get(cid).get(ownerId + "|" + h); },
+    upsertSourceJobOwners(memberships) {
+      for (const m of memberships || []) {
+        if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
+        ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, { cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey, report_key: m.reportKey, account_id: m.accountId, connection_id: m.connectionId, organization_fingerprint: m.organizationFingerprint, account_scope_hash: m.accountScopeHash, owner_status: "active", error_code: null, error_message: null });
+      }
+    },
+    listSourceJobOwners(cid, ownerIds) { const set = new Set(ownerIds || []); return ownerRows(cid).filter((m) => set.has(m.owner_id)).map((m) => ({ ...m })); },
+    listSourceJobsForOwners(cid, ownerIds) { const set = new Set(ownerIds || []); const hashes = new Set(ownerRows(cid).filter((m) => set.has(m.owner_id) && m.owner_status !== "stale").map((m) => m.request_hash)); return this.listSourceJobs(cid).filter((j) => hashes.has(j.request_hash)); },
+    recordSourceOwnerStale({ cycleId, requestHash, ownerId, code, message }) { const m = ownersByCycle.get(cycleId) && ownersByCycle.get(cycleId).get(ownerId + "|" + requestHash); if (m) { m.owner_status = "stale"; m.error_code = code || "STALE_PLAN"; m.error_message = message || null; } },
+    openCycle({ bucket, cycleDate }) {
+      const k = bucket + "|" + cycleDate;
+      if (!cycles.has(k)) { const id = "cyc_" + (seq += 1); cycles.set(k, { id, bucket, cycle_date: cycleDate, status: "pending" }); jobsByCycle.set(id, new Map()); }
+      return cycles.get(k).id;
+    },
+    claimCycle(id) { const c = findCycle(id); if (c && c.status === "pending") { c.status = "running"; return true; } return false; },
+    getCycle(id) { return findCycle(id); },
+    upsertSourceJob(job) {
+      const m = jobsByCycle.get(job.cycleId);
+      if (m.has(job.requestHash)) return;
+      m.set(job.requestHash, { request_hash: job.requestHash, request_key: job.requestKey, source_id: job.sourceId, source_key: job.sourceKey, connection_id: job.connectionId, organization_fingerprint: job.organizationFingerprint, account_scope_hash: job.accountScopeHash, fetch_status: "pending", attempted_at: null, create_export_count: 0, export_id: null, terminal: false, row_count: null, cache_object_path: null });
+    },
+    listSourceJobs(id) { return [...((jobsByCycle.get(id) && jobsByCycle.get(id).values()) || [])].map((j) => ({ ...j })); },
+    claimExportAttempt(id, h) { const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h); if (j && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
+    recordExportCreated({ cycleId, requestHash, exportId }) { jobsByCycle.get(cycleId).get(requestHash).export_id = exportId; },
+    loadSourceRows(h) { const e = cache.get(h); return e ? { rows: e.rows } : null; },
+    saveSourceRows({ job, rows, version }) { const h = job.request_hash != null ? job.request_hash : job.requestHash; cache.set(h, { rows: [...rows], object_path: "p/" + h + "/" + version }); return "p/" + h + "/" + version; },
+    recordSourceSuccess({ cycleId, requestHash, exportId, rowCount, cacheObjectPath }) { Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "succeeded", export_id: exportId, row_count: rowCount, cache_object_path: cacheObjectPath }); },
+    recordSourceFailure({ cycleId, requestHash, stage, code, terminal, rowCount }) { const j = jobsByCycle.get(cycleId).get(requestHash); Object.assign(j, { fetch_status: "failed", error_stage: stage, error_code: code, terminal: !!terminal }); if (rowCount != null) j.row_count = rowCount; },
+    updateCycleCounts() { /* not asserted */ },
+  };
+}
+
+// DataDoe double; `behavior(job)` -> { rows } | { throw }. Tracks create-export counts per hash.
+function makeDataDoe(behavior) {
+  const create = {};
+  return {
+    createCount: (h) => create[h] || 0,
+    totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; const b = behavior(job); if (b && b.throw) throw b.throw; return { exportId: "e_" + job.requestHash }; },
+    async poll() { /* completes */ },
+    async download(job) { const b = behavior(job); if (b && b.throw) throw b.throw; return (b && b.rows) || []; },
+  };
+}
+
+// Standard cadence rows: A1 weekly=4 periods, others weekly=2 periods; monthly=3 periods; catalog=1 row.
+const rawOf = (job) => job.fetchParams.sellerOrVendorIds[0];
+const standardRows = (job) => {
+  const rk = job.requestKey; const raw = rawOf(job);
+  if (rk === "keyword-rank:sqp-weekly") return { rows: raw === "A1" ? [{ date: "2025-06-01" }, { date: "2025-06-08" }, { date: "2025-06-15" }, { date: "2025-06-22" }] : [{ date: "2025-07-01" }, { date: "2025-07-08" }] };
+  if (rk === "keyword-rank:sqp-monthly") return { rows: [{ date: "2025-05-01" }, { date: "2025-06-01" }, { date: "2025-07-01" }] };
+  return { rows: [{ child_asin: "ASIN1", product_brand: "Acme" }] };
+};
+
+const cycle = (store, dataDoe, accounts) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe, bucket: "us", cycleDate: "2026-08-11" });
+// Which request keys were created for a given raw seller id (via each job's connection + our knowledge
+// that A1 is primary and dd-secondary:* is secondary). We inspect the persisted source jobs.
+function jobsByAccount(store, cycleId) {
+  const out = {};
+  for (const j of store.listSourceJobs(cycleId)) {
+    (out[j.connection_id] || (out[j.connection_id] = [])).push({ key: j.request_key, status: j.fetch_status });
+  }
+  return out;
+}
+
+/* ============================= two-account staged execution ============================= */
+
+group("keyword-rank cycle: two-account account-scoped staged execution");
+
+test("A (weekly >= 4) creates weekly + catalog and NO monthly; B (weekly < 4) creates weekly + monthly + catalog", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r = await cycle(store, dd, accounts);
+  const byAcct = jobsByAccount(store, r.cycleId);
+  const keys = (conn) => (byAcct[conn] || []).map((x) => x.key).sort();
+  assert.deepEqual(keys("primary"), ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "A: weekly + catalog, NO monthly");
+  assert.deepEqual(keys("dd-secondary"), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"], "B: weekly + monthly + catalog");
+  assert.equal(r.perAccount[0].monthlyHash, null, "A never plans a monthly request");
+  assert.equal(r.perAccount[1].weeklySignal.distinctPeriods, 2, "B weekly reconstructed to 2 periods (account-scoped)");
+  assert.equal(r.perAccount[0].weeklySignal.distinctPeriods, 4, "A weekly reconstructed to 4 periods (account-scoped)");
+});
+
+test("primary and dd-secondary accounts with the SAME raw id resolve DISJOINT hashes and never share a signal", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Same raw id "X1" under both organizations. Primary weekly returns 2 periods; dd-secondary too.
+  const rows = (job) => (job.requestKey === "keyword-rank:sqp-weekly" ? { rows: [{ date: "2025-07-01" }, { date: "2025-07-08" }] } : standardRows(job));
+  const dd2 = makeDataDoe(rows);
+  const accounts = [{ accountId: "X1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":X1", country: "US", currency: "USD" }];
+  const r = await cycle(store, dd2, accounts);
+  const pri = r.perAccount[0], sec = r.perAccount[1];
+  assert.notEqual(pri.weeklyHash, sec.weeklyHash, "same raw id -> different weekly hash per organization");
+  assert.notEqual(pri.monthlyHash, sec.monthlyHash, "same raw id -> different monthly hash per organization");
+  // Each account reconstructed its own weekly signal from its own hash (no cross-consumption).
+  assert.equal(pri.weeklySignal.distinctPeriods, 2);
+  assert.equal(sec.weeklySignal.distinctPeriods, 2);
+  void dd;
+});
+
+/* ============================= catalog token-saving state table ============================= */
+
+group("keyword-rank cycle: staged catalog spends no token before cadence");
+
+test("a FAILED weekly spends ONLY the weekly export (no monthly, no catalog)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe((job) => (job.requestKey === "keyword-rank:sqp-weekly" ? { throw: new Error("DataDoe export creation failed (500).") } : standardRows(job)));
+  const r = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  const keys = jobsByAccount(store, r.cycleId).primary.map((x) => x.key).sort();
+  assert.deepEqual(keys, ["keyword-rank:sqp-weekly"], "weekly only; no catalog token spent on a failed weekly");
+});
+
+test("a DISABLED weekly (source-disabled) spends ONLY the weekly export (terminal; no catalog)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe((job) => (job.requestKey === "keyword-rank:sqp-weekly" ? { throw: new Error("source is disabled for this organization") } : standardRows(job)));
+  const r = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  const rows = jobsByAccount(store, r.cycleId).primary;
+  assert.deepEqual(rows.map((x) => x.key).sort(), ["keyword-rank:sqp-weekly"]);
+  assert.equal(rows[0].status, "failed", "disabled weekly recorded failed (terminal); no catalog token");
+});
+
+test("weekly < 4 with a FAILED required monthly spends weekly + monthly but NO catalog", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe((job) => (job.requestKey === "keyword-rank:sqp-monthly" ? { throw: new Error("DataDoe export creation failed (500).") } : standardRows(job)));
+  const r = await cycle(store, dd, [{ accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }]);
+  const keys = jobsByAccount(store, r.cycleId)["dd-secondary"].map((x) => x.key).sort();
+  assert.deepEqual(keys, ["keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"], "monthly attempted but NO catalog token on a failed required monthly");
+});
+
+/* ============================= fresh invocation / no duplicate exports ============================= */
+
+group("keyword-rank cycle: fresh invocation reconstructs without duplicate exports");
+
+test("a repeated/fresh invocation reconstructs the same account-scoped signals and creates ZERO duplicate exports", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r1 = await cycle(store, dd, accounts);
+  const afterFirst = dd.totalCreates();
+  // Exactly: A weekly+catalog (2) + B weekly+monthly+catalog (3) = 5 distinct create-exports.
+  assert.equal(afterFirst, 5, "first cycle creates exactly 5 exports (A:2, B:3)");
+  const r2 = await cycle(store, dd, accounts);
+  assert.equal(dd.totalCreates(), afterFirst, "a fresh invocation creates NO duplicate exports");
+  // Each hash was created at most once (one-create-export-per-request-hash-per-cycle).
+  for (const j of store.listSourceJobs(r2.cycleId)) {
+    assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " export created at most once");
+  }
+  assert.equal(r1.cycleId, r2.cycleId, "same cycle (bucket|date) resumed, not a new one");
+});
+
+test("the staged cycle makes ZERO DataDoe calls beyond the staged submit-set (no eager catalog/monthly)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Only account A with weekly >= 4: exactly weekly + catalog (2), never a monthly export.
+  await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.equal(dd.totalCreates(), 2, "A (weekly >= 4): exactly weekly + catalog");
+});
+
+/* ============================= per-invocation bounds (cumulative maxJobs / deadline) ============================= */
+
+group("keyword-rank cycle: per-invocation bounds are cumulative across rounds");
+
+// A DataDoe double whose weekly poll defers ONCE at the execution deadline (resumable), then succeeds.
+const deadlineError = () => Object.assign(new Error("deferred at the execution deadline"), { code: "DATADOE_DEADLINE" });
+function makeResumableDataDoe(rowsFn) {
+  const create = {};
+  let polls = 0;
+  return {
+    createCount: (h) => create[h] || 0,
+    totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    pollCalls: () => polls,
+    async create(job) { create[job.requestHash] = (create[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; },
+    async poll(job) { polls += 1; if (polls === 1 && job.requestKey === "keyword-rank:sqp-weekly") throw deadlineError(); },
+    async download(job) { return rowsFn(job).rows; },
+  };
+}
+
+test("maxJobs:1 processes AT MOST one source job across ALL rounds (budget is cumulative, not per-round)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Two accounts => two weekly jobs are available in round 0; a cumulative maxJobs:1 must stop after one.
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  assert.equal(r.processed, 1, "exactly one job processed across all rounds");
+  assert.equal(dd.totalCreates(), 1, "no monthly/catalog export is created once the budget is spent");
+});
+
+test("a deadline DEFERRAL during the weekly poll prevents monthly/catalog work and is resumable next invocation", async () => {
+  const store = makeStore();
+  const dd = makeResumableDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }];
+  // Invocation 1: create weekly, persist export_id, then the weekly poll defers -> stop before catalog.
+  const r1 = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(r1.deferred, 1, "the weekly poll deferred (resumable)");
+  assert.equal(r1.failed, 0, "a deadline defer is NOT a failure");
+  assert.equal(dd.totalCreates(), 1, "only the weekly export was created; NO catalog/monthly after the deadline");
+  const weeklyHash = r1.perAccount[0].weeklyHash;
+  assert.equal(store._rawJob(r1.cycleId, weeklyHash).fetch_status, "attempted", "weekly stays attempted (resumable), export_id kept");
+  // Invocation 2: a fresh call resumes the weekly export (no second create), then stages catalog.
+  const r2 = await runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(dd.createCount(weeklyHash), 1, "the resumed weekly export is NOT created a second time");
+  assert.equal(store._rawJob(r2.cycleId, weeklyHash).fetch_status, "succeeded", "weekly succeeds on resume");
+  const keys = jobsByAccount(store, r2.cycleId).primary.map((x) => x.key).sort();
+  assert.deepEqual(keys, ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "catalog is staged only AFTER the resumed weekly succeeds");
+  assert.equal(dd.totalCreates(), 2, "exactly weekly (inv1) + catalog (inv2); no duplicate POST");
+});
+
+/* ============================= schedule-bucket isolation ============================= */
+
+group("keyword-rank cycle: one cycle never mixes US and non-US schedules");
+
+test("a mixed US/non-US account set is rejected BEFORE opening a cycle or calling DataDoe (zero DataDoe calls)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":C1", country: "CA", currency: "CAD" }];
+  await assert.rejects(
+    runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" }),
+    /does not match account|refuse to mix schedule buckets/,
+  );
+  assert.equal(dd.totalCreates(), 0, "a mixed-bucket input causes ZERO DataDoe calls");
+});
+
+test("an account whose bucket differs from the supplied cycle bucket is rejected (never recorded in the wrong bucket)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // A US account under a non-US cycle bucket must be rejected too (never recorded in a non-US cycle).
+  await assert.rejects(
+    runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "non-us", cycleDate: "2026-08-11" }),
+    /does not match account|refuse to mix schedule buckets/,
+  );
+  assert.equal(dd.totalCreates(), 0, "no DataDoe call for a bucket-mismatched account");
+});
+
+/* ============================= shared-cycle job ownership (Blocker 1) ============================= */
+
+group("keyword-rank cycle: one shared (bucket, cycle_date) cycle, many owners");
+
+// A generic (non-keyword) source job as another report family would queue it in the SAME cycle, with its
+// OWN owner membership (a different owner_id than any keyword account owner). The owner_id is the REAL
+// recomputed value (the worker validates job.owner.ownerId === sourceJobOwnerId(...)).
+const genOwnerId = () => sourceJobOwnerId({ reportKey: "daily-reporting", connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope" });
+const genericJob = (hash, raw = "G1") => ({
+  requestHash: hash, requestKey: "daily-reporting:catalog", sourceId: "gen-src", sourceKey: "product-catalog",
+  connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope", requestMeta: {},
+  bucket: "us", strict: false, limit: 10,
+  owner: { ownerId: genOwnerId(), requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" },
+  fetchParams: { columns: ["c"], sellerOrVendorIds: [raw], from: null, to: null, options: {} },
+});
+const runGeneric = (store, dd, jobs) => runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownerIds: [genOwnerId()], bucket: "us", cycleDate: "2026-08-11" });
+const jobByHash = (store, cid, h) => store.listSourceJobs(cid).find((j) => j.request_hash === h);
+
+test("the Keyword staged worker never fails an unrelated pending generic job (no MISSING_PLAN); both owners complete via their own runner", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Queue a pending generic source in the shared cycle BEFORE the keyword cycle runs.
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending");
+
+  // Keyword staged worker runs the same shared cycle (primary A1 + dd-secondary B1).
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const kw = await cycle(store, dd, accounts);
+  assert.equal(kw.cycleId, cid, "keyword cycle joined the existing shared cycle");
+  // The generic job is UNTOUCHED (still pending; never MISSING_PLAN'd) and every keyword job succeeded.
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "unrelated generic job left untouched");
+  const kwJobs = store.listSourceJobs(cid).filter((j) => String(j.request_key).startsWith("keyword-rank:"));
+  assert.ok(kwJobs.length >= 5 && kwJobs.every((j) => j.fetch_status === "succeeded"), "all keyword jobs succeeded");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN anywhere");
+
+  // The generic worker then completes its own job; keyword jobs stay succeeded and untouched.
+  const gen = await runGeneric(store, dd, [genericJob("gen-1")]);
+  assert.equal(gen.succeeded, 1, "generic worker completes its own job");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "succeeded");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "generic worker MISSING_PLANs nothing either");
+  // Each canonical hash created at most one export; primary/dd-secondary hashes stay disjoint.
+  for (const j of store.listSourceJobs(cid)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " created at most once");
+  const pri = kw.perAccount[0], sec = kw.perAccount[1];
+  assert.notEqual(pri.weeklyHash, sec.weeklyHash, "primary/dd-secondary weekly hashes disjoint");
+});
+
+test("running the generic worker FIRST, then the keyword worker: neither fails the other's jobs (order-independent)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  // Generic worker runs first and completes its own job in the shared cycle.
+  const gen = await runGeneric(store, dd, [genericJob("gen-1")]);
+  assert.equal(gen.succeeded, 1);
+  assert.equal(gen.cycleId, cid, "generic worker joined the shared cycle");
+  // The keyword worker then runs the same cycle; the generic (succeeded) job is untouched, keyword completes.
+  const kw = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.equal(kw.cycleId, cid);
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN in either order");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "succeeded", "generic job stayed succeeded");
+  const kwJobs = store.listSourceJobs(cid).filter((j) => String(j.request_key).startsWith("keyword-rank:"));
+  assert.ok(kwJobs.length >= 2 && kwJobs.every((j) => j.fetch_status === "succeeded"), "keyword jobs all succeeded");
+});
+
+test("a canonical row an owner no longer plans is NEVER failed MISSING_PLAN; the shared row + other owners stay intact", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Fully stage A1 (weekly + catalog succeed). No unrelated row is ever MISSING_PLAN'd by the worker.
+  const first = await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  const cid = first.cycleId;
+  // A pending generic row (a different owner) staged into the same cycle stays untouched across a re-run.
+  store.upsertSourceJob({ cycleId: cid, ...genericJob("gen-1") });
+  await cycle(store, dd, [{ accountId: "A1", country: "US", currency: "USD" }]);
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "the worker never MISSING_PLANs a canonical row in the owner model");
+  assert.equal(jobByHash(store, cid, "gen-1").fetch_status, "pending", "another owner's canonical row is untouched");
+  // A1's own sources all succeeded and its owner memberships are active (not stale).
+  const a1Owner = store._owners(cid).find((m) => m.report_key === "keyword-rank");
+  assert.ok(a1Owner, "A1 owner membership persisted");
+  assert.ok(store._owners(cid).filter((m) => m.report_key === "keyword-rank").every((m) => m.owner_status === "active"), "A1 memberships stay active (nothing stale for a fully-needed plan)");
+});
+
+group("keyword-rank cycle: account-scoped ownership is account-safe (same request_key across accounts)");
+
+test("an account-scoped run for ONLY A1 leaves account A2's pending same-request-key job untouched (no MISSING_PLAN); each hash created once", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Prime the shared cycle so BOTH primary accounts A1 + A2 have a weekly job, but process only the first
+  // (maxJobs:1) so A2's same-request-key weekly stays PENDING.
+  const primed = await runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: "A2", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  const cid = primed.cycleId;
+  const a2Pending = store.listSourceJobs(cid).find((j) => j.request_key === "keyword-rank:sqp-weekly" && j.fetch_status === "pending");
+  assert.ok(a2Pending, "A2's weekly is pending after the bounded prime run");
+
+  // Account-scoped MANUAL run for ONLY A1 (as the admin accountIds filter would produce).
+  const a1 = await runKeywordRankShadowCycle({ accounts: [{ accountId: "A1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(a1.cycleId, cid, "same shared cycle");
+  // A2's pending weekly (same request_key, different account_scope_hash) is UNTOUCHED -- never MISSING_PLAN'd.
+  assert.equal(jobByHash(store, cid, a2Pending.request_hash).fetch_status, "pending", "A2's same-key job stays pending");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN anywhere");
+  assert.ok(store.listSourceJobs(cid).filter((j) => j.fetch_status === "succeeded").length >= 2, "A1 weekly + catalog succeeded");
+  for (const j of store.listSourceJobs(cid)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " created at most once");
+});
+
+test("primary and dd-secondary sharing a raw seller id have disjoint owner tuples; an account-scoped run for one leaves the other's pending same-key job untouched", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  // Same raw id "X1" under both orgs; prime both weeklies, process only the first (primary), leave secondary pending.
+  const primed = await runKeywordRankShadowCycle({ accounts: [{ accountId: "X1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":X1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", maxJobs: 1 });
+  const cid = primed.cycleId;
+  const secPending = store.listSourceJobs(cid).find((j) => j.connection_id === "dd-secondary" && j.fetch_status === "pending");
+  assert.ok(secPending, "the dd-secondary weekly is pending after the prime run");
+  // Account-scoped run for ONLY the primary X1.
+  await runKeywordRankShadowCycle({ accounts: [{ accountId: "X1", country: "US", currency: "USD" }], connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(jobByHash(store, cid, secPending.request_hash).fetch_status, "pending", "dd-secondary same-raw-id job untouched (organization isolation)");
+  assert.ok(store.listSourceJobs(cid).every((j) => j.error_code !== "MISSING_PLAN"), "no MISSING_PLAN across organizations");
+});
+
+test("runSourceJobs fails closed when a plannedJob's owner is outside the declared owner scope, empty, or malformed (never upsert-then-skip)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });
+  const validOwnerId = sourceJobOwnerId({ reportKey: "daily-reporting", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1" });
+  const job = { requestHash: "h-owned", requestKey: "daily-reporting:catalog", sourceId: "s", sourceKey: "product-catalog", connectionId: "primary", organizationFingerprint: "org-1", accountScopeHash: "scope-1", requestMeta: {}, fetchParams: { columns: ["c"], sellerOrVendorIds: ["G1"], from: null, to: null, options: {} }, owner: { ownerId: validOwnerId, requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1" } };
+  // A VALID owner id that is outside the declared scope -> throw BEFORE any source/owner upsert.
+  await assert.rejects(
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: ["some-other-owner"], bucket: "us", cycleDate: "2026-08-11" }),
+    /does not belong to the declared owner scope/,
+  );
+  assert.equal(store.listSourceJobs(cid).length, 0, "no canonical job upserted before the fail-closed throw");
+  assert.equal(store._owners(cid).length, 0, "no owner membership upserted before the throw");
+  // Malformed membership (missing owner_id) is rejected.
+  await assert.rejects(
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [{ ...job, owner: { ...job.owner, ownerId: "" } }], ownerIds: [validOwnerId], bucket: "us", cycleDate: "2026-08-11" }),
+    /missing owner membership metadata/,
+  );
+  // Empty owner scope with planned work fails closed.
+  await assert.rejects(
+    runSourceJobs({ store, dataDoe: dd, plannedJobs: [job], ownerIds: [], bucket: "us", cycleDate: "2026-08-11" }),
+    /empty ownerIds scope/,
+  );
+});
+
+/* ============================= primary-only DataDoe (secondary org retired) ============================= */
+
+group("keyword-rank cycle: primary-only config skips stale dd-secondary accounts (zero secondary requests)");
+
+test("a primary account syncs normally while a stale dd-secondary directory row is skipped read-only (zero jobs, zero DataDoe calls, prefix intact)", async () => {
+  const store = makeStore();
+  const dd = makeDataDoe(standardRows);
+  const PRIMARY_ONLY = [{ id: "primary", apiKey: dash("prim", "key"), accountPrefix: "" }];
+  const accounts = [{ accountId: "A1", country: "US", currency: "USD" }, { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }];
+  const r = await runKeywordRankShadowCycle({ accounts, connections: PRIMARY_ONLY, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11" });
+  // The primary account synced (weekly >= 4 => weekly + catalog); the stale secondary spent nothing.
+  assert.equal(dd.totalCreates(), 2, "only the primary account's exports were created");
+  const byAcct = jobsByAccount(store, r.cycleId);
+  assert.deepEqual(Object.keys(byAcct), ["primary"], "only primary-connection source jobs exist");
+  assert.ok(!store.listSourceJobs(r.cycleId).some((j) => String(j.request_hash).includes("B1")), "no source job for the stale account");
+  // The stale account is returned read-only with its prefix intact and never routed to primary.
+  assert.equal(r.perAccount.length, 1, "only the active (primary) account is tracked");
+  assert.equal(r.unavailableAccounts.length, 1);
+  assert.equal(r.unavailableAccounts[0].accountId, dash("dd", "secondary") + ":B1", "prefix retained");
+  assert.equal(r.unavailableAccounts[0].status, "CONNECTION_UNAVAILABLE");
+  assert.equal(r.unavailableAccounts[0].readOnly, true);
+  // The primary report plan is complete and drives normally; the stale account contributes no report.
+  assert.deepEqual(r.plannedReports.map((p) => p.accountId), ["A1"], "only the primary account yields a report plan");
+});
+
+/* ============================= safe stale reconciliation (bounded invocations) ============================= */
+
+group("keyword-rank cycle: bounded invocations never falsely retire still-required memberships");
+
+const B1 = { accountId: dash("dd", "secondary") + ":B1", country: "US", currency: "USD" }; // weekly = 2 (< 4) => weekly + monthly + catalog
+const kwOwners = (store, cid, accountId) => store._owners(cid).filter((m) => m.report_key === "keyword-rank" && m.account_id === accountId);
+const statusOf = (store, cid, accountId, requestKey) => { const m = kwOwners(store, cid, accountId).find((x) => x.request_key === requestKey); return m ? m.owner_status : null; };
+const kwRun = (store, dd, accounts, opts) => runKeywordRankShadowCycle({ accounts, connections: CONNS, asOf: ASOF, store, dataDoe: dd, bucket: "us", cycleDate: "2026-08-11", ...opts });
+
+test("a full weekly-low cycle creates weekly + monthly + catalog ACTIVE memberships", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const r = await kwRun(store, dd, [B1], {});
+  const ms = kwOwners(store, r.cycleId, B1.accountId);
+  assert.deepEqual(ms.map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"]);
+  assert.ok(ms.every((m) => m.owner_status === "active"), "all three memberships active");
+});
+
+test("a later maxRounds:1 invocation does NOT stale the still-required monthly/catalog memberships", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  // maxRounds:1 stages only the weekly round; the OLD reconciler would retire monthly/catalog here.
+  await kwRun(store, dd, [B1], { maxRounds: 1 });
+  assert.equal(statusOf(store, cid, B1.accountId, "keyword-rank:sqp-monthly"), "active", "monthly stays active");
+  assert.equal(statusOf(store, cid, B1.accountId, "keyword-rank:catalog"), "active", "catalog stays active");
+});
+
+test("a later maxJobs:1 invocation does NOT stale monthly/catalog", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  await kwRun(store, dd, [B1], { maxJobs: 1 });
+  assert.ok(kwOwners(store, cid, B1.accountId).every((m) => m.owner_status === "active"), "nothing falsely staled");
+});
+
+test("a deadline/deferral during weekly staging defers reconciliation; resume completes with each hash exported once and all memberships active", async () => {
+  const store = makeStore(); const dd = makeResumableDataDoe(standardRows);
+  // Invocation 1: weekly poll defers (attempted) -> cadence unresolved -> reconciliation deferred; only weekly membership exists.
+  const r1 = await kwRun(store, dd, [B1], {});
+  assert.equal(r1.deferred, 1, "weekly deferred");
+  const weeklyHash = r1.perAccount[0].weeklyHash;
+  assert.ok(kwOwners(store, r1.cycleId, B1.accountId).every((m) => m.owner_status === "active"), "no false stale on the deferred invocation");
+  // Invocation 2 (fresh): resumes weekly (no second create), stages monthly + catalog; all active; hashes exported once.
+  const r2 = await kwRun(store, dd, [B1], {});
+  assert.equal(dd.createCount(weeklyHash), 1, "weekly exported at most once across the resume");
+  const ms = kwOwners(store, r2.cycleId, B1.accountId);
+  assert.deepEqual(ms.map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-monthly", "keyword-rank:sqp-weekly"]);
+  assert.ok(ms.every((m) => m.owner_status === "active"), "resume leaves every required membership active");
+  for (const j of store.listSourceJobs(r2.cycleId)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " exported at most once");
+});
+
+test("a GENUINELY removed dependency alone becomes stale (a monthly the resolved weekly-high plan no longer needs is retired; weekly + catalog stay active)", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const A1 = { accountId: "A1", country: "US", currency: "USD" }; // weekly = 4 (>= 4) => weekly + catalog, NO monthly
+  const full = await kwRun(store, dd, [A1], {}); const cid = full.cycleId;
+  const own = kwOwners(store, cid, "A1")[0];
+  const ownerId = own.owner_id;
+  assert.deepEqual(kwOwners(store, cid, "A1").map((m) => m.request_key).sort(), ["keyword-rank:catalog", "keyword-rank:sqp-weekly"], "weekly-high plan owns weekly + catalog (no monthly)");
+  // Inject a monthly membership + canonical row under A1's OWN owner, as a prior plan version would have.
+  store.upsertSourceJob({ cycleId: cid, requestHash: "A1-monthly-stale", requestKey: "keyword-rank:sqp-monthly", sourceId: "s", sourceKey: "sqp-monthly", connectionId: "primary", organizationFingerprint: own.organization_fingerprint, accountScopeHash: own.account_scope_hash, requestMeta: {} });
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: "A1-monthly-stale", ownerId, requestKey: "keyword-rank:sqp-monthly", reportKey: "keyword-rank", accountId: "A1", connectionId: "primary", organizationFingerprint: own.organization_fingerprint, accountScopeHash: own.account_scope_hash }]);
+  // Re-run the A1 cycle (weekly >= 4): the resolved plan is weekly + catalog, so the injected monthly is stale.
+  await kwRun(store, dd, [A1], {});
+  assert.equal(store._owner(cid, ownerId, "A1-monthly-stale").owner_status, "stale", "the removed monthly membership is retired at owner scope");
+  assert.ok(kwOwners(store, cid, "A1").filter((m) => m.request_hash !== "A1-monthly-stale").every((m) => m.owner_status === "active"), "weekly + catalog stay active");
+  assert.equal(store._rawJob(cid, "A1-monthly-stale").fetch_status, "pending", "canonical row preserved (never failed by the stale owner)");
+});
+
+test("another owner sharing a canonical hash stays ACTIVE while a Keyword owner reconciles", async () => {
+  const store = makeStore(); const dd = makeDataDoe(standardRows);
+  const full = await kwRun(store, dd, [B1], {}); const cid = full.cycleId;
+  // A second owner (generic report) also depends on B1's catalog canonical hash.
+  const catalogHash = kwOwners(store, cid, B1.accountId).find((m) => m.request_key === "keyword-rank:catalog").request_hash;
+  store.upsertSourceJobOwners([{ cycleId: cid, requestHash: catalogHash, ownerId: genOwnerId(), requestKey: "daily-reporting:catalog", reportKey: "daily-reporting", accountId: "G1", connectionId: "primary", organizationFingerprint: "gen-fp", accountScopeHash: "gen-scope" }]);
+  // A later bounded keyword invocation reconciles; the generic owner's membership is never touched.
+  await kwRun(store, dd, [B1], { maxRounds: 1 });
+  const gen = store._owners(cid).find((m) => m.owner_id === genOwnerId());
+  assert.equal(gen.owner_status, "active", "the other owner sharing the canonical hash remains active");
+});
+
+async function main() {
+  mark("main(): loading keyword-rank cycle module");
+  ({ runKeywordRankShadowCycle } = await import("../lib/server/sync/keyword-rank-cycle.js"));
+  ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
+  ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
+  mark("module loaded; running " + tests.filter((t) => !t.marker).length + " tests");
+
+  let failures = 0;
+  for (const t of tests) {
+    if (t.marker) { mark("group -> " + t.marker); continue; }
+    try { await t.fn(); passed += 1; out("  ok  " + t.name); }
+    catch (err) { failures += 1; out("FAIL  " + t.name); out(String(err && err.stack ? err.stack : err)); }
+  }
+  out("\n" + passed + " assertions passed");
+  mark("done: " + passed + " passed, " + failures + " failed");
+  return failures;
+}
+
+main().then((failures) => { if (failures) process.exitCode = 1; }).catch((err) => { out("FATAL " + String(err && err.stack ? err.stack : err)); process.exitCode = 1; });

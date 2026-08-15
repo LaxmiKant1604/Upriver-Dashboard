@@ -29,7 +29,10 @@ import {
 // A refresh that produces more than this is a design problem, not something to
 // silently truncate or silently keep out of the shared store. Every new report
 // aggregates server-side specifically to stay far below it.
-const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+// Canonical shared-snapshot payload ceiling now lives in the dependency-free limits leaf so
+// every write path enforces ONE value. Imported locally (used below) and re-exported.
+import { MAX_SNAPSHOT_BYTES } from "./report-limits.js";
+export { MAX_SNAPSHOT_BYTES };
 
 const DEFAULT_LOCK_SECONDS = 240;
 

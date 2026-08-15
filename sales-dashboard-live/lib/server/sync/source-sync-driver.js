@@ -1,0 +1,345 @@
+// Scheduler v2 Phase 1c — SHADOW-MODE composition driver.
+//
+// Wires the pure source worker (source-worker.js) to real Supabase + DataDoe I/O and
+// runs the STAGED loop. A brand-new invocation RECONSTRUCTS dependency signals from
+// PERSISTED successful source jobs + their saved payloads (and persisted ads rows) — it
+// never trusts in-memory-only or browser signals — then plans downstream/fallback jobs
+// through the approved Phase 1b resolver.
+//
+// SHADOW MODE: not imported by any route, cron, or Scheduler v1 (run-sync.js). Nothing
+// here runs a live DataDoe probe on import.
+
+import { createExport, pollExport, downloadExport } from "../datadoe.js";
+import { organizationFingerprint, sourceJobOwnerId } from "../source-identity.js";
+import {
+  openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
+  upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt,
+  recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
+  getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
+  upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
+} from "../supabase.js";
+import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
+import { runSourceJobs } from "./source-worker.js";
+import { atomicSaveSourcePayload } from "./source-cache.js";
+import { deriveSignalsFromOutcomes, SIGNAL_PRODUCERS, adsCurrencySignal } from "./source-signals.js";
+
+const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000;
+
+const VALID_CONNECTION_IDS = new Set(["primary", "dd-secondary"]);
+
+// The connection registry (getDataDoeConnections) speaks its OWN ids -- "primary" | "secondary" --
+// but every durable Scheduler-v2 job and this adapter speak the driver ids "primary" | "dd-secondary".
+// This is the ONE explicit, server-only boundary that reconciles them, so the registry's "secondary"
+// key can actually be selected by a "dd-secondary" job (the bug: makeDataDoeAdapter(getDataDoeConnections())
+// indexed a raw "secondary" and could never resolve a "dd-secondary" job). Idempotent: an already-
+// normalized "dd-secondary"/"primary" passes through unchanged. Fail closed: an unknown id throws, and
+// two connections that normalize to the same driver id are rejected so neither can shadow the other or
+// let a job route to the wrong key.
+const REGISTRY_TO_DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
+
+export function normalizeDataDoeConnections(connections) {
+  const normalized = [];
+  const seen = new Set();
+  for (const conn of connections || []) {
+    const rawId = conn && conn.id;
+    const id = REGISTRY_TO_DRIVER_CONNECTION_ID[rawId] || (VALID_CONNECTION_IDS.has(rawId) ? rawId : null);
+    if (!id) {
+      throw new Error(`Cannot normalize DataDoe connection id "${rawId}" to a driver connection id ('primary' | 'dd-secondary').`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`Ambiguous DataDoe connections: two entries normalize to connection id "${id}".`);
+    }
+    seen.add(id);
+    normalized.push({ ...conn, id });
+  }
+  return normalized;
+}
+
+// Turn a resolved job (from reportSourceRequestHashes) into a planned source job that
+// carries BOTH the durable identity fields and the in-memory fetch params the live
+// adapter needs. fetchParams is NEVER persisted (the DB stores request_meta only).
+//
+// FAIL CLOSED: connectionId is REQUIRED and explicit ('primary' or 'dd-secondary') — there
+// is no silent 'primary' default anywhere in Scheduler v2 — and the resolved job must carry
+// a non-empty organizationFingerprint. Both are what the adapter verifies before any call.
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "") {
+  if (!VALID_CONNECTION_IDS.has(connectionId)) {
+    throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
+  }
+  if (!resolved.organizationFingerprint) {
+    throw new Error("plannedSourceJob requires a non-empty organizationFingerprint on the resolved job.");
+  }
+  const contract = (REPORT_SOURCE_CONTRACTS[reportKey] || []).find((c) => c.requestKey === resolved.requestKey);
+  // The durable OWNER membership for this planned source: a deterministic non-secret owner_id over
+  // (report family, connection/org boundary, org fingerprint, account scope), plus the report request
+  // key as this membership's alias and the SAFE public accountId for admin display. request_key is a
+  // membership alias, NOT canonical ownership authority; the canonical job dedups on request_hash.
+  const ownerId = sourceJobOwnerId({
+    reportKey, connectionId,
+    organizationFingerprint: resolved.organizationFingerprint,
+    accountScopeHash: resolved.accountScopeHash,
+  });
+  if (!ownerId) {
+    throw new Error(`plannedSourceJob could not derive an owner_id for report "${reportKey}" (missing connection/organization/account scope).`);
+  }
+  return {
+    requestHash: resolved.requestHash,
+    requestKey: resolved.requestKey,
+    sourceId: resolved.sourceId,
+    sourceKey: resolved.sourceKey,
+    connectionId,
+    organizationFingerprint: resolved.organizationFingerprint,
+    accountScopeHash: resolved.accountScopeHash,
+    requestMeta: resolved.requestMeta,
+    bucket: resolved.bucket || bucket,
+    strict: resolved.strict === true,
+    limit: resolved.limit,
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || "") },
+    fetchParams: {
+      columns: contract ? contract.columns : undefined,
+      sellerOrVendorIds: resolved.sellerOrVendorIds,
+      from: resolved.from,
+      to: resolved.to,
+      limit: resolved.limit,
+      options: resolved.options,
+    },
+  };
+}
+
+// Production store: maps the worker's injected interface to lib/server/supabase.js.
+export function makeSupabaseSourceStore() {
+  const storage = sourceCacheStorageAdapter();
+  const metadata = sourceCacheMetadataAdapter();
+  return {
+    openCycle: (args) => openSyncCycle(args),
+    claimCycle: (cycleId) => claimSyncCycle(cycleId),
+    getCycle: (cycleId) => getSyncCycle(cycleId),
+    upsertSourceJob: (job) => upsertSyncSourceJob(job),
+    listSourceJobs: (cycleId) => getSyncSourceJobs(cycleId),
+    // Many-to-many owner memberships (sync_source_job_owners) -- canonical jobs stay one row/export.
+    upsertSourceJobOwners: (memberships) => upsertSyncSourceJobOwners(memberships),
+    listSourceJobOwners: (cycleId, ownerIds) => getSyncSourceJobOwners(cycleId, ownerIds),
+    listSourceJobsForOwners: (cycleId, ownerIds) => getSyncSourceJobsForOwners(cycleId, ownerIds),
+    recordSourceOwnerStale: (args) => recordSyncSourceJobOwnerStale(args),
+    claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),
+    recordExportCreated: (args) => recordSyncSourceExportCreated(args),
+    loadSourceRows: (requestHash) => getSourceExportCache(requestHash),
+    saveSourceRows: ({ job, rows, payloadBytes, version }) => atomicSaveSourcePayload({
+      storage, metadata,
+      requestHash: job.request_hash ?? job.requestHash,
+      sourceId: job.source_id ?? job.sourceId,
+      organizationFingerprint: job.organization_fingerprint ?? job.organizationFingerprint ?? "",
+      accountScopeHash: job.account_scope_hash ?? job.accountScopeHash ?? "",
+      requestMeta: job.request_meta ?? job.requestMeta ?? {},
+      rows, payloadBytes,
+      expiresAt: new Date(Date.now() + SOURCE_CACHE_TTL_MS).toISOString(),
+      version,
+    }),
+    recordSourceSuccess: (args) => recordSyncSourceSuccess(args),
+    recordSourceFailure: (args) => recordSyncSourceFailure(args),
+    updateCycleCounts: (cycleId, counts) => updateSyncCycleCounts(cycleId, counts),
+    // Dispatcher-owned cycle finalization (Blocker 1): the guarded finalize_sync_cycle RPC, returning a typed
+    // disposition. The canonical dispatcher calls this on a complete drained SCHEDULED scope; a source-family
+    // driver never calls it.
+    finalizeCycle: ({ cycleId }) => finalizeSyncCycle(cycleId),
+  };
+}
+
+// Production DataDoe adapter with FAIL-CLOSED organization routing. A source job may run
+// ONLY on the connection that owns it: connection_id must be an explicit, valid id, and
+// the job's organizationFingerprint must match that connection's key. Missing / unknown /
+// mismatched routing throws BEFORE any DataDoe call — an unresolved secondary job is never
+// silently sent to the primary key. The apiKey is used here and never returned or stored.
+export function makeDataDoeAdapter(connections) {
+  // Normalize registry ids ("primary" | "secondary") onto the driver ids the jobs carry
+  // ("primary" | "dd-secondary") at this single boundary, so makeDataDoeAdapter(getDataDoeConnections())
+  // routes a "dd-secondary" job to the SECONDARY key (never a silent primary fallback).
+  const byId = new Map(normalizeDataDoeConnections(connections).map((c) => [c.id, c]));
+  function resolveConnection(job) {
+    const id = job.connection_id ?? job.connectionId;
+    if (id !== "primary" && id !== "dd-secondary") {
+      throw new Error(`Source job has a missing/invalid connection id "${id}".`);
+    }
+    const conn = byId.get(id);
+    if (!conn || !conn.apiKey) throw new Error(`No configured DataDoe connection for "${id}".`);
+    const expected = conn.organizationFingerprint || organizationFingerprint(conn.apiKey);
+    const jobFingerprint = job.organizationFingerprint ?? job.organization_fingerprint;
+    // Unconditional: a missing fingerprint is a hard failure, and it must match the
+    // selected connection. A secondary job can never be routed to the primary key.
+    if (!jobFingerprint) {
+      throw new Error(`Source job for connection "${id}" is missing its organization fingerprint.`);
+    }
+    if (jobFingerprint !== expected) {
+      throw new Error(`Source job organization does not match connection "${id}"; refusing to route it.`);
+    }
+    return conn;
+  }
+  return {
+    create: async (job) => {
+      const conn = resolveConnection(job); // throws before createExport
+      const p = job.fetchParams;
+      if (!p || !p.columns) throw new Error("Planned source job is missing its fetch parameters.");
+      const created = await createExport(conn.apiKey, job.sourceId ?? job.source_id, p.columns, p.sellerOrVendorIds, p.from, p.to, p.limit, p.options || {});
+      return { exportId: created.exportId || created.id, completed: created.status === "COMPLETED" };
+    },
+    poll: async (job, exportId) => { const conn = resolveConnection(job); await pollExport(conn.apiKey, exportId); },
+    download: async (job, exportId) => { const conn = resolveConnection(job); return downloadExport(conn.apiKey, exportId); },
+  };
+}
+
+/**
+ * Reconstruct the typed signals a brand-new worker process needs from PERSISTED state:
+ * the kickoff plan gives the signal-producing request keys -> hashes; for each whose DB
+ * job SUCCEEDED, the saved payload is loaded and the signal re-derived. A failed /
+ * terminal / not-yet-successful primary contributes no activating signal. PPC ads currency
+ * comes from persisted ads rows (never a live export). No browser/UI input is trusted.
+ */
+export async function reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider }) {
+  const signals = {};
+  const kickoff = await resolvePlan({});
+  const producers = (kickoff.sourceJobs || []).filter((j) => SIGNAL_PRODUCERS[j.requestKey]);
+  const jobs = await store.listSourceJobs(cycleId);
+  const byHash = new Map(jobs.map((j) => [j.request_hash ?? j.requestHash, j]));
+  for (const p of producers) {
+    const jobRow = byHash.get(p.requestHash);
+    const status = jobRow && (jobRow.fetch_status ?? jobRow.fetchStatus);
+    if (status !== "succeeded") continue; // only a validated saved success can activate downstream
+
+    // Distinguish a genuine empty success from missing/corrupt cached data. ONLY a payload
+    // that LOADS cleanly with an array `rows` (possibly []) is a validated success. A cache
+    // miss, a read error, or a payload whose `rows` is not an array is UNAVAILABLE — it must
+    // NOT be reconstructed as validated:true, or a missing SQP payload could wrongly activate
+    // catalog / monthly-fallback work.
+    let rows = null;
+    try {
+      const payload = store.loadSourceRows ? await store.loadSourceRows(p.requestHash) : null;
+      if (payload && Array.isArray(payload.rows)) rows = payload.rows;
+    } catch (_readError) {
+      rows = null;
+    }
+    if (rows === null) {
+      // Persisted job says succeeded, but its cached payload is missing/unreadable/malformed:
+      // a safe source-cache-unavailable state that activates NOTHING downstream.
+      signals[p.requestKey] = SIGNAL_PRODUCERS[p.requestKey]({ requestKey: p.requestKey, status: "failed", validated: false, unavailableReason: "source-cache-unavailable" });
+      continue;
+    }
+    signals[p.requestKey] = SIGNAL_PRODUCERS[p.requestKey]({ requestKey: p.requestKey, status: "success", validated: true, rows });
+  }
+  if (adsRowsProvider) {
+    // A validated currency read requires a real array of persisted ads rows. A missing/failed
+    // read must NOT present as currencyCount 0 (which would schedule total-sales); it is
+    // unavailable, so total-sales stays unscheduled (fail closed).
+    let adsRows = null;
+    try { adsRows = await adsRowsProvider(); } catch (_e) { adsRows = null; }
+    signals["ppc-performance:ads-currency"] = Array.isArray(adsRows)
+      ? adsCurrencySignal(adsRows)
+      : { status: "failed", validated: false, currencyCount: null };
+  }
+  return signals;
+}
+
+/**
+ * Run (or resume) ONE cycle end to end in staged rounds. Reconstructs signals from
+ * persisted state first (so a fresh invocation plans downstream without repeating a
+ * primary export), then: plan -> execute -> derive fresh signals -> re-plan -> execute,
+ * bounded by maxRounds, maxJobs, and the wall-clock deadline. Never exposes a secret.
+ */
+export async function runStagedSourceCycle({
+  store, dataDoe, resolvePlan, adsRowsProvider, extraSignals = {},
+  bucket, cycleDate, scheduledAt = null, trigger = "manual",
+  clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 5,
+}) {
+  const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+  let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
+
+  const rollup = {
+    cycleId, rounds: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0,
+    deadlineReached: false, drained: false, signals,
+  };
+  const seenHashes = new Set();
+  // This generic staged driver declares its OWN owner memberships (sync_source_job_owners) so it can
+  // share the single (bucket, cycle_date) cycle with other report families (e.g. Keyword Rank) without
+  // touching their canonical jobs. owner_id (sourceJobOwnerId) is account/organization safe; the declared
+  // owner set + the planned membership keys grow as each round's plan (kickoff + reconstructed/derived
+  // fallbacks) reveals more of this driver's jobs. runSourceJobs processes only THIS driver's owned+
+  // planned canonical jobs; a job owned by another family is never touched.
+  const ownerIdSet = new Set();
+  const plannedMembershipKeys = new Set(); // owner_id|request_hash actually planned this invocation
+  // Blocker 1: stale reconciliation is safe ONLY when the plan is fully resolved -- i.e. the driver
+  // reached its FIXPOINT (a round added no new hashes and derived no new signals). A bounded (maxJobs/
+  // maxRounds), deadline-stopped, or otherwise-truncated invocation has an INCOMPLETE authoritative plan,
+  // so it must NOT retire memberships it merely did not stage yet. `fixpointReached` gates reconciliation.
+  let fixpointReached = false;
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    const plan = await resolvePlan(signals);
+    const plannedJobs = (plan && plan.sourceJobs) || [];
+    for (const j of plannedJobs) {
+      if (j && j.owner && j.owner.ownerId) { ownerIdSet.add(j.owner.ownerId); plannedMembershipKeys.add(`${j.owner.ownerId}|${j.requestHash}`); }
+    }
+    const remaining = maxJobs === Infinity ? Infinity : Math.max(0, maxJobs - rollup.processed);
+    if (remaining === 0) { rollup.drained = false; break; }
+
+    const res = await runSourceJobs({
+      store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
+      clock, deadlineMs, reserveMs, maxJobs: remaining,
+    });
+    rollup.cycleId = res.cycleId;
+    rollup.rounds = round + 1;
+    rollup.processed += res.processed;
+    rollup.succeeded += res.succeeded;
+    rollup.failed += res.failed;
+    rollup.skipped += res.skipped;
+    rollup.deferred += res.deferred || 0;
+    rollup.counts = res.counts;
+
+    const before = JSON.stringify(signals);
+    signals = { ...signals, ...deriveSignalsFromOutcomes(res.outcomes) };
+    rollup.signals = signals;
+
+    if (res.deadlineReached) { rollup.deadlineReached = true; rollup.drained = false; break; }
+    // Blocker 1: a resumable poll/download deferral adds NO dependency signal, so on a later round the same
+    // hashes are already `allSeen` and signals are unchanged -- which would falsely look like a fixpoint even
+    // though the plan is NOT complete (a source is mid-fetch and `res.drained` is false). Stop immediately on
+    // ANY deferral (as Keyword Rank does), leave drained=false, and NEVER reconcile: a fresh invocation
+    // resumes the export from its persisted export_id, and reconciliation waits for a genuine fixpoint.
+    if ((res.deferred || 0) > 0) { rollup.drained = false; break; }
+
+    const planHashes = plannedJobs.map((j) => j.requestHash);
+    const allSeen = planHashes.every((h) => seenHashes.has(h));
+    planHashes.forEach((h) => seenHashes.add(h));
+    if (allSeen && JSON.stringify(signals) === before) {
+      // A VALID fixpoint additionally requires a genuinely DRAINED (and, by the guards above, non-deadline,
+      // non-deferred) result -- otherwise the plan is stable but unfinished and must NOT be reconciled.
+      rollup.drained = res.drained;
+      fixpointReached = res.drained === true;
+      break;
+    }
+    rollup.drained = res.drained;
+  }
+  // Reconcile ONLY when the plan fully resolved (fixpoint reached): the accumulated planned membership
+  // keys are then the COMPLETE authoritative dependency set, so a genuinely removed dependency goes stale
+  // while nothing merely-not-yet-staged is retired. A truncated invocation defers reconciliation.
+  if (fixpointReached) {
+    await reconcileStaleOwnerMemberships(store, rollup.cycleId, [...ownerIdSet], plannedMembershipKeys);
+  }
+  return rollup;
+}
+
+// Mark any DURABLE active owner membership (for the declared owners) that this invocation's plan no longer
+// contains as stale -- owner-scoped only. It NEVER touches the shared canonical sync_source_jobs row or
+// any other owner's membership, and never triggers a DataDoe call: a hash another owner still depends on
+// stays executable/resumable/readable, and its last-known-good source data remains valid.
+export async function reconcileStaleOwnerMemberships(store, cycleId, ownerIds, plannedMembershipKeys) {
+  if (!cycleId || !store.listSourceJobOwners || !store.recordSourceOwnerStale || !ownerIds.length) return;
+  const durable = await store.listSourceJobOwners(cycleId, ownerIds);
+  for (const m of durable) {
+    const ownerId = m.owner_id ?? m.ownerId;
+    const requestHash = m.request_hash ?? m.requestHash;
+    const status = m.owner_status ?? m.ownerStatus ?? "active";
+    if (status === "stale") continue;
+    if (!plannedMembershipKeys.has(`${ownerId}|${requestHash}`)) {
+      await store.recordSourceOwnerStale({ cycleId, requestHash, ownerId, code: "STALE_PLAN", message: "Owner plan no longer requires this source; membership retired (canonical source preserved)." });
+    }
+  }
+}
