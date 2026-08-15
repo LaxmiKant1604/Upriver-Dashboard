@@ -9396,3 +9396,34 @@ Three final Gate-7 Codex blockers fixed offline; no production connection, no mi
   dates; U.5 43-check evidence; V canonical-id requirement note.
 
 STOP for Codex re-review. Migration 6 unapplied; enables/approvals/unlock/deploy/schedule remain BLOCKED.
+
+## Scheduler v2 Gate 7a APPLY package PREPARED (docs-only, 2026-08-15) — Migration 6 NOT YET APPLIED
+
+Gate 7 passed final Codex review at HEAD 85d49a0. Prepared (NOT executed) the reviewed single-file apply gate
+for ONLY 20260816_account_rollout.sql -- Appendix W in SCHEDULER_V2_ROLLOUT.md. This turn made NO production
+connection and executed nothing; docs-only commit.
+
+- Migration 6 frozen SHA-256 0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735 reconfirmed
+  byte-exact; migrations 1-5 SHA-256 unchanged (1328bc0f / 0750a155 / 544557fb / 49628c8d / 5222a8e5).
+  Ledger table public.app_schema_migrations (filename PK, applied_at); connection POSTGRES_URL + sslmode=no-verify.
+- Appendix W mirrors the reviewed Migration-5 gate (Appendix O) / Migration-1 gate (Appendix B): W.0 offline
+  preflight (HEAD+6 hashes+readiness empty+verify/diff clean); W.1 guarded read-only pre-apply inventory
+  (M6 ledger row absent + migrations 1-5 each exactly one; 3 tables/function/3 triggers/11 constraints absent;
+  prerequisites present; 5 operational sync tables + report_sync_settings intact w/ 18/27/25/15 col counts;
+  Gate-5 canary + 2 Gate-6 cycles intact; finalize RPC + 3 no-append triggers present; 13 controls all
+  schedule_enabled=false; no Scheduler-v2 pg_cron); W.2 single-file single-transaction apply (advisory lock
+  pg_advisory_xact_lock(20260816,1) BEFORE ledger/object checks; require migrations 1-5 recorded once; refuse
+  if M6 recorded; in-transaction re-check all target objects absent; verify frozen hash BEFORE executing;
+  execute frozen body; plain ledger INSERT; single COMMIT; rollback on any error; no db:migrate/DROP/retry);
+  W.3 accurate change characterization; W.4 read-only post-verify (3 tables exact cols/PKs/defaults; 11 named
+  CHECKs valid w/ exact serialized bodies -- NOT LIKE renders as !~~; singleton (1,false); zero rollout/approval
+  rows; 3 BEFORE-UPDATE FOR-EACH-ROW triggers -> scheduler_rollout_touch by OID + tgtype=19; RLS on + ZERO
+  policies; no PUBLIC/anon/authenticated grant, service_role SELECT/INSERT/UPDATE x3; M6 ledger=1 + migrations
+  1-5=1 each; migrations 1-5 objects unchanged; 13 controls paused; readiness allowlist empty; no cycle/
+  snapshot/schedule change); W.5 STOP conditions for every mismatch (no destructive rollback/DROP -- migration
+  already committed => escalate); W.6 zero-side-effect confirmation.
+- Both embedded Node/pg snippets pass node --check offline. Docs commit only; code + all migration files
+  byte-unchanged; git diff --check clean.
+
+STOP for Codex review + explicit human approval. Gate 7a executes one migration file, then stops for W.4.
+Migration 6 UNAPPLIED; enables/approvals/unlock/deploy/schedule remain BLOCKED.
