@@ -3446,8 +3446,13 @@ try {
   // Prerequisites present.
   ok((await c.query("select to_regclass('public.report_sync_settings') o")).rows[0].o !== null, "report_sync_settings missing");
   ok((await c.query("select to_regclass('auth.users') o")).rows[0].o !== null, "auth.users missing");
-  const roles = (await c.query("select array_agg(rolname order by rolname) a from pg_roles where rolname in ('service_role','anon','authenticated')")).rows[0].a || [];
-  ok(roles.length === 3, "expected service_role/anon/authenticated, got " + roles);
+  const roles = (await c.query(
+    "select rolname::text rolname from pg_roles where rolname in ('service_role','anon','authenticated') order by rolname"
+  )).rows.map((r) => r.rolname);
+  ok(
+    JSON.stringify(roles) === JSON.stringify(["anon", "authenticated", "service_role"]),
+    "expected exactly anon/authenticated/service_role, got [" + roles.join(",") + "]"
+  );
 
   // Operational Scheduler-v2 tables present + exact column counts; ads_sync_coverage present.
   for (const [t, cols] of Object.entries(OPS)) {

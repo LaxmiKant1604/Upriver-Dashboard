@@ -9505,3 +9505,36 @@ tests unchanged.
   SCHEDULER_V2_ROLLOUT.md + PROJECT_MEMORY.md changed.
 
 STOP for Codex re-review + explicit human approval. Do not execute Gate 7a.
+
+## Scheduler v2 Gate 7a W.1 false-STOP fixed (docs-only, 2026-08-15) — Migration 6 still UNAPPLIED
+
+Gate 7a was AUTHORIZED and execution attempted; W.0 offline preflight PASSED; W.1 read-only inventory HALTED
+with a typed false STOP at the roles prerequisite check. No production write occurred (W.1 is BEGIN; SET
+TRANSACTION READ ONLY; finally ROLLBACK), W.2 apply was NOT run, Migration 6 remains UNAPPLIED.
+
+- ROOT CAUSE (verified offline via pg.types.getTypeParser(1003)): the W.1 runner used
+  `array_agg(rolname order by rolname)`, which returns PostgreSQL name[] (OID 1003). node-postgres has no
+  parser for name[], so it returns the RAW string "{anon,authenticated,service_role}" (length 33) instead of a
+  JS array; `roles.length === 3` was therefore false and threw
+  `STOP: expected service_role/anon/authenticated, got {anon,authenticated,service_role}` even though all three
+  roles ARE present (the error text itself lists them). Every W.1 check BEFORE the roles line passed (ledger
+  present + migrations 1-5 each once + Migration 6 absent + M6 tables/function/triggers/constraints absent +
+  report_sync_settings/auth.users present), confirming the production DB was in the expected clean pre-apply
+  state; the only failure was the parser defect.
+- CORRECTION (docs-only, Appendix W.1): replaced the array_agg-based check with a parser-independent exact-row
+  check --
+    const roles = (await c.query("select rolname::text rolname from pg_roles where rolname in
+      ('service_role','anon','authenticated') order by rolname")).rows.map((r) => r.rolname);
+    ok(JSON.stringify(roles) === JSON.stringify(["anon","authenticated","service_role"]),
+       "expected exactly anon/authenticated/service_role, got [" + roles.join(",") + "]");
+  rolname::text (OID 25) is parsed by node-pg as a string; .rows.map yields a real 3-element ordered JS array.
+  This is now an EXACT-set check (stronger than the old length===3): a missing OR unexpected role fails. No
+  other W.1 assertion weakened. `array_agg(rolname...)` confirmed to occur EXACTLY once in Appendix W (the W.4
+  ACL checks use aclexplode, not array_agg).
+- Validation: all 3 embedded Appendix W runners pass node --check (no ${ interpolation, balanced parens); 50
+  doc ``` fences balanced; zero residual array_agg(rolname); all six frozen migration hashes recomputed
+  unchanged (Migration 6 = 0d715eb...ba4a735); git diff --check clean; only SCHEDULER_V2_ROLLOUT.md +
+  PROJECT_MEMORY.md changed. No production connection this turn; W.1/W.2/W.4 NOT executed; migrations 1-5
+  byte-identical; readiness allowlist empty; 13 controls paused; no code/test/migration/control/schedule change.
+
+STOP for Codex re-review. After approval, re-authorize to execute W.0 -> W.1 -> W.2 -> W.4 exactly.
