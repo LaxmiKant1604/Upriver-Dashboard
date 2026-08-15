@@ -31,6 +31,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES;
+let MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan;
 let evaluateSourceCoverage;
 
 const G6_US = "26f7a1a6-689a-4084-8260-7add262918e5";
@@ -103,13 +104,13 @@ test("validateAdsSyncOptions: requiredCoverage requires a non-empty allowlist + 
   // requiredCoverage without an allowlist -> reject.
   assert.throws(() => validateAdsSyncOptions({ requiredCoverage: REQ }, TODAY), /requires a non-empty accountIds allowlist/);
   assert.throws(() => validateAdsSyncOptions({ accountIds: [], requiredCoverage: REQ }, TODAY), /non-empty accountIds allowlist/);
-  // malformed / non-real / from>to / future / out-of-range.
+  // malformed / non-real / from>to / future / overlong-span.
   const A = { accountIds: [G6_US] };
   assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "2026-7-16", to: "2026-08-14" } }, TODAY), /strict real YYYY-MM-DD/);
   assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "2026-02-30", to: "2026-08-14" } }, TODAY), /strict real YYYY-MM-DD/);
   assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "2026-08-14", to: "2026-07-16" } }, TODAY), /from must be <= to/);
   assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "2026-07-16", to: "2026-08-15" } }, TODAY), /must not be in the future/);
-  assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "1999-12-31", to: "2026-08-14" } }, TODAY), /out of range/);
+  assert.throws(() => validateAdsSyncOptions({ ...A, requiredCoverage: { from: "1999-12-31", to: "2026-08-14" } }, TODAY), /the maximum is 60/);
   assert.throws(() => validateAdsSyncOptions({ accountIds: "x" }, TODAY), /accountIds must be an array/);
   assert.throws(() => validateAdsSyncOptions([], TODAY), /options must be an object/);
   // a clean requiredCoverage validates.
@@ -123,6 +124,68 @@ test("bad option shape is rejected BEFORE the lock is claimed (no lock held on a
   await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { requiredCoverage: REQ }), /allowlist/);
   assert.equal(calls.claim, 0, "the lock was never claimed for an invalid request");
   assert.equal(calls.release, 0, "nothing to release");
+});
+
+/* ============================= canonical requiredCoverage budget bounds ============================= */
+
+test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initialDays) and MAX_IDS_PER_EXPORT===5", () => {
+  assert.equal(MAX_REQUIRED_COVERAGE_DAYS, Math.max(...ADS_SOURCES.map((s) => s.initialDays)), "derived from the source contracts");
+  assert.equal(MAX_REQUIRED_COVERAGE_DAYS, 60, "currently 60 (asin/search-terms initialDays)");
+  assert.equal(MAX_IDS_PER_EXPORT, 5);
+});
+
+test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year boundary", () => {
+  assert.equal(inclusiveDaySpan("2026-07-16", "2026-08-14"), 30, "the intended 30-day PPC window");
+  assert.equal(inclusiveDaySpan("2026-08-14", "2026-08-14"), 1, "single day is inclusive-1");
+  assert.equal(inclusiveDaySpan("2026-06-16", "2026-08-14"), 60, "exactly 60 inclusive days");
+  assert.equal(inclusiveDaySpan("2026-06-15", "2026-08-14"), 61, "61 inclusive days");
+  // leap Feb 2024 (29 days): Feb 1..29 (29) + Mar 1 (1) = 30 inclusive.
+  assert.equal(inclusiveDaySpan("2024-02-01", "2024-03-01"), 30);
+  // non-leap Feb 2023 (28 days): Feb 1..28 (28) + Mar 1..2 (2) = 30 inclusive (one fewer March day than leap).
+  assert.equal(inclusiveDaySpan("2023-02-01", "2023-03-02"), 30);
+  // year boundary.
+  assert.equal(inclusiveDaySpan("2025-12-15", "2026-01-13"), 30);
+});
+
+test("validateAdsSyncOptions budget bounds: <=60 inclusive days + <=5 accounts accepted; 61 days / 6 accounts rejected", () => {
+  const ids2 = [G6_US, G6_IN];
+  // exactly 60 inclusive days ending TODAY.
+  assert.deepEqual(validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-06-16", to: TODAY } }, TODAY).requiredCoverage, { from: "2026-06-16", to: TODAY });
+  // the intended exact 30-day PPC window.
+  assert.deepEqual(validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: REQ }, TODAY).requiredCoverage, REQ);
+  // 61 inclusive days => rejected.
+  assert.throws(() => validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-06-15", to: TODAY } }, TODAY), /61 inclusive days; the maximum is 60/);
+  // exactly 5 accounts accepted at SHAPE validation (resolution against discovery is a later, separate gate).
+  const five = ["a", "b", "c", "d", "e"];
+  assert.deepEqual(validateAdsSyncOptions({ accountIds: five, requiredCoverage: REQ }, TODAY).accountIds, five);
+  // 6 accounts => rejected (would exceed one export batch per source).
+  assert.throws(() => validateAdsSyncOptions({ accountIds: ["a", "b", "c", "d", "e", "f"], requiredCoverage: REQ }, TODAY), /at most 5 accountIds/);
+  // malformed still rejected (from>to / non-real date / future).
+  assert.throws(() => validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-02-30", to: TODAY } }, TODAY), /strict real YYYY-MM-DD/);
+});
+
+test("overlong window / excessive accounts are rejected BEFORE the lock: zero lock/discovery/export/write", async () => {
+  for (const opts of [
+    { accountIds: [G6_US], requiredCoverage: { from: "2026-06-15", to: TODAY } },   // 61 days
+    { accountIds: [G6_US, "b", "c", "d", "e", "f"], requiredCoverage: REQ },         // 6 accounts
+  ]) {
+    const { deps, calls } = makeDeps();
+    await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], opts), /the maximum is 60|at most 5 accountIds/);
+    assert.equal(calls.claim, 0, "zero lock calls");
+    assert.equal(calls.fetchAccounts.length, 0, "zero discovery");
+    assert.equal(calls.fetchRange.length, 0, "zero DataDoe exports");
+    assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes");
+    assert.equal(calls.upsertStates.length, 0, "zero state writes");
+    assert.equal(calls.coverage.length, 0, "zero coverage writes");
+    assert.equal(calls.release, 0, "nothing to release (never locked)");
+  }
+});
+
+test("the intended Gate-6 execution shape (exactly the two approved accounts, exact 30-day window) validates", () => {
+  const norm = validateAdsSyncOptions({ accountIds: [G6_US, G6_IN], requiredCoverage: REQ }, TODAY);
+  assert.deepEqual(norm, { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.ok(norm.accountIds.length <= MAX_IDS_PER_EXPORT, "two accounts fit in one export batch per source");
+  assert.ok(inclusiveDaySpan(REQ.from, REQ.to) <= MAX_REQUIRED_COVERAGE_DAYS, "30-day PPC window within the 60-day ceiling");
 });
 
 /* ============================= exact-window canary: only the 2 accounts, exact window ============================= */
@@ -486,7 +549,7 @@ test("resolveAdsAccountAllowlist: targets exactly the two Gate-6 accounts; fail-
 /* ============================= run ============================= */
 
 async function main() {
-  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES } = await import("../lib/server/ads-sync.js"));
+  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan } = await import("../lib/server/ads-sync.js"));
   ({ evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
   for (const t of tests) {
     try { await t.fn(); passed += 1; out("  ok  " + t.name); }

@@ -11,7 +11,9 @@ import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js
 
 const BASE = "https://api.datadoe.com/api/v1";
 const EXPORT_LIMIT = 50000;
-const MAX_IDS_PER_EXPORT = 5;
+// The DataDoe five-seller-id chunk. Also the requiredCoverage allowlist ceiling: a bounded canary must fit in
+// ONE export batch per source (so it can never become an accidental organization-wide run).
+export const MAX_IDS_PER_EXPORT = 5;
 const POLL_DELAY_MS = 5000;
 const POLL_ATTEMPTS = 9;
 const WORK_BUDGET_MS = 45000;
@@ -119,6 +121,11 @@ export const ADS_SOURCES = [
     keyFields: ["ad_search_term", "ad_keyword_id", "ad_campaign_id", "ad_group_id", "ad_campaign_type"],
   },
 ];
+
+// The canonical requiredCoverage window ceiling: the LARGEST initial backfill any Ads source declares. A
+// bounded coverage canary can request at most this many inclusive calendar days -- never an arbitrary span.
+// Currently 60 (asin/search-terms initialDays). Derived, so it can never drift from the source contracts.
+export const MAX_REQUIRED_COVERAGE_DAYS = Math.max(...ADS_SOURCES.map((source) => source.initialDays));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -409,18 +416,26 @@ function isStrictYmd(value) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
 
-// The oldest window start a requiredCoverage canary may request -- anything earlier is out of range.
-const ADS_COVERAGE_MIN_DATE = "2000-01-01";
+// Inclusive calendar-day span of [from..to] via STRICT UTC calendar arithmetic: both endpoints are UTC
+// midnights, so the millisecond difference is an exact whole number of days (leap days and year boundaries
+// are counted naturally); +1 makes it inclusive (from===to => 1). `from`/`to` are pre-validated strict
+// YYYY-MM-DD, so Date.parse never yields NaN here.
+export function inclusiveDaySpan(from, to) {
+  const f = Date.parse(`${from}T00:00:00.000Z`);
+  const t = Date.parse(`${to}T00:00:00.000Z`);
+  return Math.round((t - f) / 86400000) + 1;
+}
 
 /**
  * Validate the BASIC shape of runAdsSync options BEFORE any lock is claimed (fail closed, no lock held on a
  * bad request). Returns the normalized { accountIds, requiredCoverage }. Rules for requiredCoverage (the
  * account-bounded exact-window canary option):
- *   - allowed ONLY with a non-empty accountIds allowlist (it can never widen an unbounded country sweep);
- *   - strict real YYYY-MM-DD from/to with from <= to;
- *   - to must not be in the future; from must not be out of range (before ADS_COVERAGE_MIN_DATE).
- * NOTE: this validates option SHAPE only. Resolving the allowlist against freshly discovered accounts happens
- * AFTER the lock (it needs discovery) and is fail-closed there too.
+ *   - allowed ONLY with an accountIds allowlist of 1..MAX_IDS_PER_EXPORT ids (it can never widen an unbounded
+ *     country sweep, and it fits in ONE export batch per source so it can never go organization-wide);
+ *   - strict real YYYY-MM-DD from/to with from <= to; to must not be in the future;
+ *   - the inclusive window span must be <= MAX_REQUIRED_COVERAGE_DAYS (the largest Ads-source initial backfill).
+ * NOTE: this validates option SHAPE + hard bounds only. Resolving the allowlist against freshly discovered
+ * accounts happens AFTER the lock (it needs discovery) and is fail-closed there too.
  */
 export function validateAdsSyncOptions(options = {}, today) {
   if (options == null || typeof options !== "object" || Array.isArray(options)) {
@@ -434,6 +449,9 @@ export function validateAdsSyncOptions(options = {}, today) {
   if (!Array.isArray(accountIds) || accountIds.length === 0) {
     throw new Error("Ads sync requiredCoverage requires a non-empty accountIds allowlist (fail closed).");
   }
+  if (accountIds.length > MAX_IDS_PER_EXPORT) {
+    throw new Error(`Ads sync requiredCoverage allows at most ${MAX_IDS_PER_EXPORT} accountIds (one export batch per source); got ${accountIds.length} (fail closed).`);
+  }
   if (typeof requiredCoverage !== "object" || Array.isArray(requiredCoverage)) {
     throw new Error("Ads sync requiredCoverage must be an object { from, to } (fail closed).");
   }
@@ -443,7 +461,10 @@ export function validateAdsSyncOptions(options = {}, today) {
   }
   if (from > to) throw new Error("Ads sync requiredCoverage.from must be <= to (fail closed).");
   if (typeof today === "string" && to > today) throw new Error("Ads sync requiredCoverage.to must not be in the future (fail closed).");
-  if (from < ADS_COVERAGE_MIN_DATE) throw new Error("Ads sync requiredCoverage.from is out of range (fail closed).");
+  const days = inclusiveDaySpan(from, to);
+  if (days > MAX_REQUIRED_COVERAGE_DAYS) {
+    throw new Error(`Ads sync requiredCoverage window is ${days} inclusive days; the maximum is ${MAX_REQUIRED_COVERAGE_DAYS} (fail closed).`);
+  }
   return { accountIds, requiredCoverage: { from, to } };
 }
 
