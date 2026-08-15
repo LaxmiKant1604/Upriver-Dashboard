@@ -9152,3 +9152,26 @@ release UNCHANGED. Nothing executed.
   --check clean.
 
 STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
+
+## Scheduler v2: requiredCoverage canonical budget bounds -- window span + account count (OFFLINE, 2026-08-15)
+
+Commit 30f3980 (code/tests), docs Appendix R.7. Replaced the arbitrary 2000-01-01 floor with hard bounds
+DERIVED from the source contracts, both validated BEFORE claimRefreshLock. Timeout slicing / requiredCoverage
+semantics / DI structure / lock release UNCHANGED. Nothing executed.
+
+- Window span: MAX_REQUIRED_COVERAGE_DAYS = Math.max(...ADS_SOURCES.map(s => s.initialDays)) = 60 (asin/search-
+  terms initialDays; derived so it can never drift). New pure inclusiveDaySpan(from,to) = inclusive calendar-day
+  span via strict UTC calendar arithmetic (leap days + year boundaries natural). A window longer than the max is
+  rejected; strict-real-date / from<=to / non-future retained. 60 inclusive days accepted, 61 rejected; the
+  30-day PPC window accepted.
+- Account count (requiredCoverage mode only): allowlist nonempty and <= MAX_IDS_PER_EXPORT (now exported; 5) --
+  one export batch per source, no accidental org-wide run. 5 accepted, 6 rejected; the Gate-6 two-account shape
+  validates.
+- Both bounds live in validateAdsSyncOptions (pre-lock), so an overlong/excessive request => zero
+  lock/discovery/export/write.
+- Regressions: ads-sync-canary.test.js 27 -> 32 assertions (constants; inclusiveDaySpan leap/year-boundary;
+  60-accept/61-reject; 5-accept/6-reject; 30-day PPC accept; pre-lock rejection zero-effect; malformed pre-lock;
+  Gate-6 two-account shape; cadence unchanged). npm run verify 37/37 across 17 suites incl. build:check; git diff
+  --check clean.
+
+STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.

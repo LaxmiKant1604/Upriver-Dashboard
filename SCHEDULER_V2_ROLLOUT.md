@@ -2718,10 +2718,12 @@ The approved timeout slicing (Appendix Q) is unchanged.
 
 `runAdsSync(countries, sourceKeys, { accountIds, requiredCoverage: { from, to } })`. `requiredCoverage` is the
 account-bounded exact-window backfill the PPC prerequisite needs. It is **validated before the lock is claimed**
-and is **allowed only with a non-empty `accountIds` allowlist** (it can never widen an unbounded country sweep):
-strict real `YYYY-MM-DD`, `from ≤ to`, `to` not in the future, `from ≥ 2000-01-01`. In coverage mode the exact
-`[from, to]` is the DataDoe export window for **every** selected source — `pickMode`/`windowFor` are never
-called, so an existing `ads_sync_state` that would otherwise pick a 21-day `daily` window can never shorten it.
+and is **allowed only with an `accountIds` allowlist of 1..`MAX_IDS_PER_EXPORT` (5) ids** (it can never widen an
+unbounded country sweep, and it fits in ONE export batch per source so it can never go organization-wide):
+strict real `YYYY-MM-DD`, `from ≤ to`, `to` not in the future, and the **inclusive window span ≤
+`MAX_REQUIRED_COVERAGE_DAYS`** (see R.7). In coverage mode the exact `[from, to]` is the DataDoe export window
+for **every** selected source — `pickMode`/`windowFor` are never called, so an existing `ads_sync_state` that
+would otherwise pick a 21-day `daily` window can never shorten it.
 
 ### R.2 Exact per-batch effect (state + coverage), coverage mode
 
@@ -2781,15 +2783,37 @@ injected dep (`clock: () => Date.now()`) so the deferral path is deterministical
 
 ### R.6 Verification
 
-`scripts/ads-sync-canary.test.js` (**27 assertions**, +12) drives the real DI core with injected trusted
-collaborators (no network/Supabase/real lock) and proves every listed property, incl. the two new fixes: one
+`scripts/ads-sync-canary.test.js` (**32 assertions**) drives the real DI core with injected trusted
+collaborators (no network/Supabase/real lock) and proves every listed property, incl. the fixes: one
 selected + one unrelated row ⇒ zero writes; missing/blank seller ⇒ whole batch fails; wrong marketplace ⇒ whole
 batch fails; non-array ⇒ whole batch fails; both selected accounts in one batch succeed; zero-row export ⇒
 validated-empty coverage; all N×M pairs ⇒ `completed` + `coverageComplete:true`; null/mismatched ack ⇒ never
 completed; one source ok + one fail ⇒ `partial` + `coverageComplete:false`; state-write failure cannot return
 completed; deadline cannot return completed (⇒ `partial`+`deferred`); no secret/raw error in results; lock
 released exactly once on every post-claim path; two-argument cadence behavior unchanged; + a pure
-`finalizeCoverageSummary` unit. `npm run verify` **37/37 across 17 suites** incl. `build:check`; `git diff
---check` clean; timeout slicing / `requiredCoverage` / DI structure / lock release / source IDs / request hashes
-/ Scheduler-v1 cadence / controls / frontend / routes / migrations **unchanged**. **STOP for Codex review.**
-Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending review + explicit approval.
+`finalizeCoverageSummary` unit; + the R.7 budget bounds. `npm run verify` **37/37 across 17 suites** incl.
+`build:check`; `git diff --check` clean; timeout slicing / `requiredCoverage` / DI structure / lock release /
+source IDs / request hashes / Scheduler-v1 cadence / controls / frontend / routes / migrations **unchanged**.
+**STOP for Codex review.** Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending
+review + explicit approval.
+
+### R.7 Canonical requiredCoverage budget bounds (fix, 2026-08-15; commit `30f3980`)
+
+The arbitrary `2000-01-01` floor is replaced by **canonical hard bounds derived from the source contracts**,
+both checked in `validateAdsSyncOptions` **before `claimRefreshLock`** (so an overlong/excessive request makes
+zero lock/discovery/export/write calls):
+
+- **Window span:** `MAX_REQUIRED_COVERAGE_DAYS = Math.max(...ADS_SOURCES.map(s => s.initialDays))` — currently
+  **60** (asin / search-terms `initialDays`; derived, so it can never drift from the contracts). A new pure
+  `inclusiveDaySpan(from, to)` computes the **inclusive** calendar-day span with strict UTC calendar arithmetic
+  (both endpoints are UTC midnights, so leap days and year boundaries are counted naturally). A window whose
+  inclusive span exceeds the maximum is rejected; the strict-real-date / `from ≤ to` / non-future checks are
+  retained. The intended **30-day PPC window is accepted**; **60 inclusive days accepted, 61 rejected**.
+- **Account count (requiredCoverage mode only):** the allowlist must be nonempty and **≤ `MAX_IDS_PER_EXPORT`
+  (5)** — one export batch per source, preventing an accidental organization-wide run. **5 accepted, 6
+  rejected.** The intended Gate-6 execution remains exactly the **two approved accounts**.
+
+Regressions added (part of the 32): `MAX_REQUIRED_COVERAGE_DAYS===60` and `MAX_IDS_PER_EXPORT===5`;
+`inclusiveDaySpan` across leap-day and year boundaries; 60-accepted/61-rejected; 5-accepted/6-rejected; the
+30-day PPC window accepted; overlong-window + excessive-account requests rejected **before the lock** with zero
+lock/discovery/export/write; malformed rejected before lock; the two-account Gate-6 shape validates.
