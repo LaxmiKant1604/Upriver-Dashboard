@@ -9201,6 +9201,45 @@ STATE NOW: the empty-ads_sync_coverage PPC blocker (Appendix P.3) is RESOLVED fo
 PPC can join Cycle 2. STOP: Cycle 2 / unlock / deploy / schedule remain BLOCKED pending Codex review + explicit
 human approval.
 
+## Scheduler v2: Gate-6 Shadow Parity CYCLE 2 EXECUTED -- non-us FULLY SUCCEEDED 13/13 (2026-08-15)
+
+Explicitly authorized (evidence: SCHEDULER_V2_ROLLOUT Appendix T). Same two accounts, all 13 reports, asOf
+2026-08-14, cycleDate 2026-08-16 (pre-verified unused; canonical bucketForCountry). Prechecks ALL PASS (HEAD
+6e528e0; verify 37/37 before+after; coverage re-proven; fingerprints baselined; no dd-secondary; controls
+paused; no cron). Offline plans: us MAX 135 unique hashes (== <=135 ceiling), non-us 134; PPC planned
+catalog+total-sales both buckets.
+
+- EXECUTION: bounded resumable slices with per-slice DB guards (<=1 create/hash; total <= MAX; plan-pinned or
+  staged-owner-proven; primary-only; zero ownerless). Mid-run the per-slice deadline was widened 90s->300s
+  (OPERATIONAL only -- the ~125-job sliced plan re-upserts consumed a 90s slice before the staged units); one
+  transient runner 'fetch failed' resumed cleanly with no duplicate export.
+- RESULTS: us cycle b0415a5b-3926-48b0-885e-5dfb61489d74 -> finalized 'partial' (135/135 creates; sources
+  135/84/51; reports 13/4/9). non-us cycle c70879e8-006b-4dba-9896-813106b5aa74 -> finalized 'SUCCEEDED'
+  (133/134 creates; sources 133/133/0; reports 13/13/0) -- the FIRST fully-successful all-13-report cycle.
+  Both finalized via exactly one finalize_sync_cycle call each, strict ack passed.
+- OUTCOMES: non-us ALL 13 SUCCEEDED (incl. PPC). us 4 succeeded (brand-sales, content-changes, keyword-rank,
+  listing-optimizer) + 9 SOURCE_BLOCKED -- every one a DataDoe terminal TIMEOUT.
+- MANDATORY PROOFS: PPC non-us payload sourceAvailability = ALL FOUR sources coverageProven+coverageFolded
+  'validated' (campaign 3,754 + asin 6,146 folded; targeting 8,993 + search 6,290 optional folded; 25,183 ads
+  rows; INR single currency; TACoS present); us PPC blocked by its catalog TIMEOUT (machinery proven on
+  non-us). brand-sales LATEST snapshots BOTH v2d-2 with 3,190 asinBrand mappings (identical maps == the
+  ORGANIZATION-WIDE catalog dataset, documented deferred Appendix-M design, not a pipeline defect). Sliced
+  windows exact (27 daily / 29+29 recon / 9 returns, both cycles). Regressions: none on non-us; us
+  listing-health regressed to SOURCE_BLOCKED via upstream TIMEOUTs (Cycle-1 snapshot preserved). LKG
+  byte-preserved for every non-succeeded report; production fingerprints byte-identical (3 accounts). Owners
+  142/142 + 140/140 active/primary/scoped; zero ownerless. Derive zero-DataDoe.
+- BLOCKER MATRIX: code defects NONE (two apparent proof failures were throwaway-proof-script artifacts --
+  missing ORDER BY on the snapshot read + probing the loader field name instead of the payload's;
+  re-verified clean). DataDoe limitations: 51 unique US-account source TIMEOUTs (11/27 daily slices, 12/29 +
+  11/29 recon slices, 4/9 returns slices, sku-pl months, fba/buy-box/listing-health/sales-movers/ppc
+  no-date+range sources). IN account: ZERO failures over identical window sizes => slicing proven effective;
+  the US failures look like an org/dataset-level DataDoe processing bottleneck independent of window size.
+  Appendix Q.4 DataDoe questions remain the gating input.
+- Throwaway scripts removed; verify 37/37 after; git diff --check clean.
+
+STOP: Gate-6 completion judgement / unlock / deploy / schedule remain BLOCKED pending Codex review + explicit
+human approval.
+
 ## Scheduler v2: requiredCoverage production-token guards -- one source + export ceiling + idempotent skip (OFFLINE, 2026-08-15)
 
 Commit 52f6a3d (code/tests), docs Appendix R.8. Timeout slicing / requiredCoverage semantics / lock release /

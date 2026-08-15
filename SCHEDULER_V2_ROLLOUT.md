@@ -257,9 +257,15 @@ report. **Approval gate per report.**
   8 `succeeded` states with cadence timestamps unchanged, unrelated-account digests byte-identical. The empty
   `ads_sync_coverage` PPC blocker is RESOLVED — `evaluateSourceCoverage(..).proven === true` for campaign+ASIN
   on both accounts for asOf `2026-08-14`.
-- [ ] Gate 6 Shadow Parity CYCLE 2 (+ stability across ≥ 2 cycles). **BLOCKED** pending Codex review and
-  explicit human approval (nothing here authorizes it). Cycle 2 should land the fixed brand-sales payload
-  (`asinBrand`), exercise the timeout-safe sliced windows, and let PPC join via the now-proven Ads coverage.
+- [x] **Gate 6 Shadow Parity CYCLE 2 — EXECUTED 2026-08-15 (all 13 reports, 2 buckets; evidence in Appendix
+  T).** non-us cycle **`succeeded` 133/133 sources, 13/13 reports** — the first fully-successful all-13 cycle;
+  us cycle `partial` (84/135 sources; 4 succeeded / 9 SOURCE_BLOCKED reports — all remaining failures are
+  DataDoe TIMEOUTs on the US account). PPC succeeded on non-us with all four Ads coverages validated; the
+  corrected `brand-sales/v2d-2` payload (nonempty `asinBrand`) landed for BOTH accounts; sliced windows exact;
+  budgets held (135≤135 / 133≤134, ≤1 create per hash); LKG + fingerprints byte-preserved; ZERO code defects
+  found (remaining blockers are upstream DataDoe processing limits).
+- [ ] Gate 6 completion — parity stability judgement across the two executed cycles + the DataDoe answer on
+  US-account export processing limits. **BLOCKED** pending Codex review + explicit human approval.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
 - [ ] Kickoff (`20260808_scheduler_v2_kickoff.sql`) — separate, later, fully-reviewed step (NOT in this phase).
 
@@ -2914,3 +2920,90 @@ no retry was needed or performed; total 4 create-exports, 28,889 Ads rows.
   disabled. Throwaway scripts removed; `npm run verify` 37/37 after; `git diff --check` clean.
 
 **STOP.** Cycle 2 / unlock / deploy / schedule remain BLOCKED pending Codex review + explicit human approval.
+
+---
+
+## Appendix T — Gate-6 Shadow Parity CYCLE 2 EXECUTION evidence (2026-08-15; all 13 reports, both buckets)
+
+Explicitly authorized: Cycle 2 for the SAME two approved accounts (US `26f7a1a6-…`, IN `d658442d-…`), all 13
+reports, `asOf 2026-08-14`, `cycleDate 2026-08-16` (pre-verified unused for both buckets; buckets derived by
+the canonical `bucketForCountry`). Executed from `sales-dashboard-live/` with `node --env-file=../.env.local`
+(secrets never printed/committed); throwaway scripts removed after. **No unlock, deploy, schedule, push, or
+control change.**
+
+### T.1 Precheck + plan (before any write)
+
+HEAD `6e528e0`; `npm run verify` 37/37 before AND after; one primary connection, NO dd-secondary; both accounts
+freshly discovered (one live discovery, memoized); ledger 1–5 exactly once; 13 controls paused; readiness
+allowlist empty; no cron; campaign+ASIN durable coverage RE-PROVEN for both accounts over
+`2026-07-16..2026-08-14`; production fingerprints baselined for both accounts + the Gate-5 account (identical
+to the Cycle-1 values). OFFLINE plans validated against the authoritative registry (catalog short-id only,
+primary-only, per-account seller scope, one owner per family): **us MAX 135 unique hashes (== the ≤135
+ceiling), non-us 134**; PPC planned catalog + total-sales on BOTH buckets (validated single-currency signal).
+
+### T.2 Execution + finalization
+
+Bounded resumable slices (maxJobs 8; the per-slice deadline was widened 90s→300s mid-run as an OPERATIONAL
+parameter only — the ~125-job sliced plan re-upserts consumed a 90s slice before reaching the staged units;
+all semantic guards unchanged). After EVERY slice a DB guard re-proved: ≤1 create-export per hash, total ≤ the
+planned MAX, every hash plan-pinned or staged-owner-proven, primary-only, zero ownerless jobs. One transient
+runner-level `fetch failed` interrupted one us invocation; the durable state resumed with no duplicate export
+(counters continuous). Manual runs never auto-finalize; after full drain + zero open jobs + all-13-planned
+checks, `finalize_sync_cycle` was called EXACTLY ONCE per cycle (strict acknowledgement validation passed):
+
+| bucket | cycle | create-exports (actual/MAX) | finalize | source counters | report counters |
+|---|---|---|---|---|---|
+| us | `b0415a5b-3926-48b0-885e-5dfb61489d74` | **135 / 135** | `finalized`, **`partial`**, `2026-08-15T08:48:30.239541Z` | 135/84/51 | 13/4/9 |
+| non-us | `c70879e8-006b-4dba-9896-813106b5aa74` | **133 / 134** | `finalized`, **`succeeded`**, `2026-08-15T08:48:30.959091Z` | **133/133/0** | **13/13/0** |
+
+### T.3 The 26 report outcomes
+
+- **non-us (IN): ALL 13 SUCCEEDED** — brand-sales, buy-box-loss, content-changes, daily-reporting, fba-plan,
+  keyword-rank, listing-health, listing-optimizer, **ppc-performance**, reconciliation, returns-leakage,
+  sales-movers, sku-pl. The first fully-successful all-13-report Scheduler-v2 cycle.
+- **us (US): 4 succeeded** — brand-sales, content-changes, keyword-rank, listing-optimizer; **9
+  `SOURCE_BLOCKED`** (buy-box-loss, daily-reporting, fba-plan, listing-health, ppc-performance,
+  reconciliation, returns-leakage, sales-movers, sku-pl) — every one caused by DataDoe terminal TIMEOUTs (T.5).
+
+### T.4 Mandatory proofs
+
+- **PPC:** non-us SUCCEEDED with the payload's `sourceAvailability` showing ALL FOUR sources
+  `coverageProven:true / coverageFolded:true / "validated"` (campaign 3,754 + ASIN 6,146 default rows folded;
+  targeting 8,993 + search 6,290 optional folded per their proven coverage; 25,183 ads rows; single currency
+  INR; TACoS denominator present). us PPC was `SOURCE_BLOCKED` by its shared insight-catalog TIMEOUT — the PPC
+  machinery itself is proven working end-to-end.
+- **asinBrand:** the LATEST brand-sales snapshots for BOTH accounts are **`brand-sales/v2d-2` with 3,190
+  asinBrand mappings** (the Cycle-1 v2d-1 rows remain as history under their own params hash). NOTE: the two
+  accounts' maps are identical because the Product Catalog dataset is ORGANIZATION-WIDE (DataDoe ignores
+  seller scope for it) — the documented, deferred Appendix-M identity design; not a pipeline defect.
+- **Sliced windows:** daily superset 27 slices, reconciliation order-lines/settlements 29 each, returns 9 —
+  exact canonical ordered/gapless/non-overlapping counts in BOTH cycles (the derive additionally enforces the
+  exact sequences; every succeeded sliced report proves them end-to-end).
+- **Regressions:** non-us — none (all Cycle-1 successes succeeded again, plus the other 10). us — brand-sales
+  succeeded again; **listing-health regressed to `SOURCE_BLOCKED`** (its listings/inventory/catalog exports
+  TIMEOUTed THIS cycle after succeeding in Cycle 1 — upstream latency variance; its Cycle-1 shadow snapshot is
+  byte-preserved).
+- **LKG:** every non-succeeded report preserved its prior shadow snapshot byte-for-byte (updated_at +
+  payload_bytes unchanged); production fingerprints byte-identical for BOTH accounts + the Gate-5 account.
+- **Owners:** 142/142 (us) + 140/140 (non-us) all active/primary/correctly scoped; ZERO ownerless jobs.
+- **Derivation:** zero DataDoe calls (structural import-boundary proof + drained invocations performing derive
+  transitions with zero `api.datadoe.com` traffic).
+
+### T.5 Remaining blocker matrix
+
+**Code defects: NONE.** (Two apparent proof failures were artifacts of the throwaway proof script itself —
+a snapshot query missing `ORDER BY updated_at DESC` and probing the loader's field name instead of the
+payload's — both re-verified clean.)
+
+**DataDoe limitations (all on the US account; 57 failed source-owner rows / 51 unique source jobs, each
+`create_export_count=1`, typed safe TIMEOUT, no retry, no second export):** daily superset 11 of 27 ≤7-day
+slices; reconciliation order-lines 12/29 + settlements 11/29 slices; returns 4/9 slices; sku-pl 4 whole-month
+fragments; fba-plan monthly-units/inventory/catalog/AWD; buy-box daily/inventory/catalog; listing-health
+listings/inventory/catalog; sales-movers inventory/catalog; returns traffic/catalog; ppc catalog. The IN
+account had ZERO failures over the same window sizes, so the ≤7-day slicing is proven effective — the US
+account's exports appear to hit an organization/dataset-level DataDoe processing bottleneck independent of
+window size. **The Appendix Q.4 DataDoe questions (processing/row limits, supported partitions) remain the
+gating input for US-account stability.**
+
+**STOP.** Gate-6 completion judgement / unlock / deploy / schedule remain BLOCKED pending Codex review +
+explicit human approval.
