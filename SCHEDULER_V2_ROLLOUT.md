@@ -100,13 +100,17 @@ post-commit); the data plane is byte-identical to the W.1 baseline (digest-prove
 (1, all_primary=false)`, so the durable rollout selects ZERO accounts and NOTHING is approved — the system
 stays fully off at the data layer.** Migrations 1–5 remain byte-identical; all 13 `report_sync_settings` rows
 `schedule_enabled=false`; no `pg_cron`; no route/frontend/deploy change. **GATE 7b PREPARED (2026-08-15,
-OFFLINE — NOT DEPLOYED): the reviewed code cutover flips `SCHEDULER_V2_READY_REPORT_KEYS` to EXACTLY the 13
-`CONTROLLED_REPORT_KEYS`** (the reports the IN account cleared in Gate 6). Readiness ON changes no runtime
-behavior on its own — the durable account rollout (ZERO accounts), the durable report controls (13 paused), and
-the per-(report, account) publish approval (none) still gate every dispatch/publish, proven by
-`scripts/gate7b-in-cutover.test.js` (7 checks: readiness=exactly-13; no-account zero-I/O; IN-only dispatches
-only IN; USA/others zero; paused-settings block; no auto-publish) and full `npm run verify` (39 steps / 19
-suites incl. `build:check`). **The reviewed IN-only all-13 production cutover sequence + exact rollback is
+OFFLINE — NOT DEPLOYED): the reviewed code cutover sets `SCHEDULER_V2_READY_REPORT_KEYS` to an EXPLICIT
+hand-authored frozen literal of the 13 individually-approved report keys** (the reports the IN account cleared
+in Gate 6; NEVER derived/spread from `CONTROLLED_REPORT_KEYS` — a future controlled report cannot inherit
+readiness, and the preflight fails closed with typed `V2_READINESS_*` blockers on a duplicate/unknown/miscounted/
+non-contract list or a ready key outside the literal). Readiness ON changes no runtime behavior on its own — the
+durable account rollout (ZERO accounts), the durable report controls (13 paused), and the per-(report, account)
+publish approval (none) still gate every dispatch/publish, proven by `scripts/gate7b-in-cutover.test.js` (6
+checks incl. a per-report all-13 real-dispatch IN-only ownership proof: `selected=[report]`,
+`accountsDispatched=[IN]`, owners/jobs/snapshots scoped to IN, USA + other-non-US zero) plus the
+explicit-readiness-allowlist regression (a synthetic future controlled report never auto-becomes-ready) and full
+`npm run verify` (39 steps / 19 suites incl. `build:check`). **The reviewed IN-only all-13 production cutover sequence + exact rollback is
 Appendix Y; USA stays fully excluded and needs a SEPARATE per-`(report, account)` gate (Y.5).** Nothing in Gate
 7b has been deployed/published/scheduled and no production connection was made preparing it. The next gate
 (Appendix Y — Gate-7b IN cutover) remains BLOCKED pending Codex review + a separate explicit authorization.
@@ -4057,27 +4061,42 @@ standing gate discipline (single, reviewed, reversible steps; fail closed on any
 - `scheduler_account_rollout` and `scheduler_publish_approvals` are **EMPTY**; `scheduler_rollout_mode` =
   `(1, all_primary=false)`.
 - All 13 `report_sync_settings` rows are **paused** (`schedule_enabled=false`).
-- The reviewed branch flips `SCHEDULER_V2_READY_REPORT_KEYS` to **exactly the 13 `CONTROLLED_REPORT_KEYS`** (the
-  code cutover) — but this is NOT yet deployed.
+- The reviewed branch sets `SCHEDULER_V2_READY_REPORT_KEYS` to an **explicit hand-authored frozen literal of
+  the 13 individually-approved report keys** (the code cutover) — but this is NOT yet deployed.
 - No Scheduler-v2 `pg_cron` schedule exists.
 - The IN account `d658442d-…` passed Gate-6 Cycle 2 with **all 13 reports succeeded** (Appendix T.3).
 
 ### Y.1 The reviewed CODE change (this branch; deploy is a later step)
 
-`lib/server/sync/report-controls.js`: `SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([...CONTROLLED_REPORT_KEYS])`
-(exactly the 13 approved keys — the reports the IN account cleared in Gate 6). This is the CODE gate only.
-Readiness ON dispatches or publishes **nothing** by itself: the durable account rollout (default ZERO accounts),
-the durable `report_sync_settings` (all paused), and the per-(report, account) publish approval (none) all remain
-closed. The no-side-effect preflight's `v2ControlsLocked` check is updated to fail closed only on an
-**unexpected/non-approved** ready key or a report scheduled with EMPTY durable settings (an approved report merely
-being ready is expected post-cutover). Regressions (`scripts/gate7b-in-cutover.test.js`, 7 checks): **Y1** readiness
-= exactly the 13, each a valid live contract; **Y2** no rollout rows ⇒ a scheduled run (even with all 13 settings
-enabled) is a zero-I/O drained no-op before discovery; **Y3a** only IN enabled ⇒ all 13 selected and
-`accountsDispatched=[IN]`; **Y3b** a real IN dispatch writes owners / report jobs / shadow snapshots scoped to IN
-only; **Y4** USA and every other account produce zero (out-of-allowlist non-US excluded by rollout; US excluded by
-bucket AND the IN-only rollout); **Y5** durable `schedule_enabled=false` still prevents dispatch; **Y6** the
-dispatcher never auto-publishes (no import; a full IN cycle writes only `scheduler-v2/*` shadow snapshots). Full
-`npm run verify` green (39 steps / 19 suites incl. `build:check`).
+`lib/server/sync/report-controls.js`: `SCHEDULER_V2_READY_REPORT_KEYS` is an **EXPLICIT frozen literal of the 13
+individually-approved report keys** — authored by hand, **NEVER derived/spread from `CONTROLLED_REPORT_KEYS`, the
+registry, planners, contracts, or settings** — so a FUTURE controlled report can never inherit readiness; it
+becomes v2-ready ONLY via an explicit reviewed edit to this literal. `CONTROLLED_REPORT_KEYS` remains the general
+user-facing control catalog (unchanged). The literal (in order):
+`brand-sales, daily-reporting, reconciliation, fba-plan, sku-pl, keyword-rank, content-changes, sales-movers,
+listing-health, buy-box-loss, returns-leakage, ppc-performance, listing-optimizer`.
+
+This is the CODE gate only. Readiness ON dispatches or publishes **nothing** by itself: the durable account
+rollout (default ZERO accounts), the durable `report_sync_settings` (all paused), and the per-(report, account)
+publish approval (none) all remain closed. The no-side-effect preflight now (6a) validates the readiness literal —
+exactly 13 UNIQUE keys, each an existing controlled report with a pinned live snapshot contract, failing closed
+with typed `V2_READINESS_COUNT / _DUPLICATE / _UNKNOWN / _NO_CONTRACT` blockers — and (6b) requires the catalog's
+ready set to be a SUBSET of that literal and nothing scheduled with empty settings (`V2_CONTROLS_UNLOCKED`), so a
+future controlled report not in the literal stays not-ready.
+
+Regressions: `scripts/sync-runtime-composition.test.js` adds an explicit-readiness-allowlist test — the literal is
+proven hand-authored (source assignment has no spread/derivation), a **synthetic future controlled report never
+becomes ready automatically**, and duplicate / 14-key / 12-key / unknown / no-contract lists each fail closed with
+the typed blocker. `scripts/gate7b-in-cutover.test.js` (6 checks): **Y1** readiness = exactly the 13, each a valid
+live contract; **Y2** no rollout rows ⇒ a scheduled run (even with all 13 settings enabled) is a zero-I/O drained
+no-op before discovery; **Y3** EVERY one of the 13 reports, dispatched through its REAL planner path with a mixed
+discovery (IN + another non-US + a US account) and an IN-only rollout, produces exactly the requested report with
+`selected=[report]`, `accountsDispatched=[IN]`, every source-job owner + report job + shadow snapshot scoped to IN,
+and ZERO owners/jobs/snapshots/exports for the US and the other non-US account (ownership evidence per report — no
+selection-only shortcut; a report that legitimately stays pending still creates only IN-scoped durable work);
+**Y4** the US bucket + IN-only rollout drains (US spends zero); **Y5** durable `schedule_enabled=false` still
+prevents dispatch; **Y6** the dispatcher never auto-publishes (no import; a full IN cycle writes only
+`scheduler-v2/*` shadow snapshots). Full `npm run verify` green (39 steps / 19 suites incl. `build:check`).
 
 ### Y.2 Reviewed production sequence (one step at a time; verify before the next)
 

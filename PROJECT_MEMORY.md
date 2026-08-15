@@ -9658,3 +9658,38 @@ stays applied (Gate 7a); durable data stays closed (rollout/approvals empty, mod
   and USA=4.
 
 STOP for Codex review. Gate 7b not deployed; USA excluded; no cron.
+
+## Scheduler v2 Gate 7b: two Codex blockers fixed (OFFLINE, 2026-08-15) — explicit readiness literal + per-report IN-only proof
+
+Both Gate-7b Codex blockers fixed offline. No deploy/publish/schedule/production connection. Migration 6 stays
+applied + byte-identical; migrations 1-5 unchanged; durable data stays closed.
+
+- BLOCKER 1 (independent explicit readiness gate): report-controls.js SCHEDULER_V2_READY_REPORT_KEYS is now an
+  EXPLICIT hand-authored Object.freeze([...13 quoted keys...]) -- NOT spread/derived from CONTROLLED_REPORT_KEYS,
+  the registry, planners, contracts, or settings. CONTROLLED_REPORT_KEYS unchanged (general control catalog). The
+  13 literal (in order): brand-sales, daily-reporting, reconciliation, fba-plan, sku-pl, keyword-rank,
+  content-changes, sales-movers, listing-health, buy-box-loss, returns-leakage, ppc-performance, listing-optimizer.
+  schedulerV2Preflight (runtime-composition.js) now: (6a) validates the readiness literal -- exactly 13 UNIQUE
+  keys, each in CONTROLLED_REPORT_KEYS AND with a SCHEDULER_LIVE_SNAPSHOT_CONTRACTS entry -- with typed blockers
+  V2_READINESS_COUNT / _DUPLICATE / _UNKNOWN / _NO_CONTRACT; (6b) requires the catalog's ready set to be a SUBSET
+  of the literal + nothing scheduled with empty settings (V2_CONTROLS_UNLOCKED). New optional readyKeys override
+  (build-time test seam). Imports SCHEDULER_V2_READY_REPORT_KEYS + SCHEDULER_LIVE_SNAPSHOT_CONTRACTS (no import
+  cycle). Regression (sync-runtime-composition.test.js, +1 => 27 assertions): readiness is a distinct array (not
+  the CONTROLLED object), source assignment has no spread/derivation (grep-proven), a SYNTHETIC future controlled
+  report never auto-becomes-ready (not in the literal; a catalog marking it ready => V2_CONTROLS_UNLOCKED), and
+  duplicate/14-key/12-key/unknown/no-contract lists each fail closed with the typed blocker.
+- BLOCKER 2 (all 13 real dispatch IN-only): gate7b-in-cutover.test.js Y3 replaced the maxJobs=0 selection-only +
+  brand-sales-only proofs with a loop over ALL 13 report keys. Each report is dispatched through its REAL
+  planner/dispatcher path with injected offline transports + a MIXED discovery [IN1 approved, IN2 another non-US,
+  US1 US] and a durable rollout of ONLY IN1. Per report asserts: selected=[that key]; accountsDispatched=[IN1];
+  every source-job owner belongs to IN1; every report job belongs to IN1; every shadow snapshot belongs to IN1;
+  every source job is owned by an IN1 owner (so no US1/IN2 export possible); US1 + IN2 have zero
+  owners/jobs/snapshots. Ownership evidence, not selection-only (item 10). Retained: Y2 no-rollout zero-I/O
+  drained before discovery; Y4 US-bucket + IN-only rollout drains (US zero); Y5 paused settings block dispatch;
+  Y6 dispatcher never auto-publishes (no import; only scheduler-v2/* shadow snapshots).
+- Verification: node --check clean; affected suites green (composition 27, gate7 45, gate7b 6, sync-dispatch 37);
+  npm run verify 39 steps / 19 suites incl build:check; git diff --check clean. Docs (Appendix Y.1 + status
+  header) updated to the explicit-literal + per-report-evidence framing. Migrations byte-unchanged. HANDOFF.md /
+  .worktrees untouched.
+
+STOP for Codex re-review. Gate 7b not deployed; USA excluded; no cron.
