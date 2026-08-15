@@ -9354,3 +9354,45 @@ byte-identical, nothing pushed/deployed/unlocked/published/scheduled.
   publish via composition, V.6 audited revocation, V.7 canary composition note.
 
 STOP for Codex re-review. Migration 6 unapplied; enables/approvals/unlock/deploy/schedule remain BLOCKED.
+
+## Scheduler v2 Gate 7 CORRECTION TRANCHE 2: three Codex blockers fixed (OFFLINE, 2026-08-15) — Migration 6 still UNAPPLIED
+
+Three final Gate-7 Codex blockers fixed offline; no production connection, no migration applied, migrations
+1-5 byte-identical, nothing pushed/deployed/unlocked/published/scheduled.
+
+- BLOCKER 1 (equal-freshness publication must not assume payload equality): publishLiveSnapshotIfNewer
+  (supabase.js) rewritten -- on natural-key conflict it READS the live row and classifies by
+  source_refreshed_at, fail-closed: strictly-older => guarded PATCH (lt filter) that clears
+  payload_storage_path => replaced/published; strictly-newer => newer-live (zero write); EQUAL freshness =>
+  canonical-JSON compare of live-vs-candidate params AND payload (live payload HYDRATED via
+  getReportSnapshotStoragePayload when storage-backed) -> already-current ONLY when PROVEN identical, else
+  typed "conflict" (zero write, live LKG byte-identical). NO unconditional equal-timestamp overwrite. The
+  primitive returns ONLY a typed outcome (never a payload/path/digest). Publisher maps conflict ->
+  publish-conflict (added to PUBLISH_DISPOSITIONS). Safe remediation for a conflict = a fresh shadow cycle
+  with newer source evidence.
+- BLOCKER 2 (prove shadow.params created job.snapshot_params_hash): report-publisher.js recomputes
+  paramsHashFor(params.reportVersion, params) EXACTLY as makeShadowSnapshotSaver and requires recompute ===
+  row.params_hash === job.snapshot_params_hash (all three), rejecting a same-hash/mutated-params row BEFORE
+  hydration/publish. The 13 SCHEDULER_LIVE_SNAPSHOT_CONTRACTS liveParams builders now use the shared strict
+  isValidCalendarDate (impossible dates 2026-02-30 / 2026-13-01 / non-leap Feb 29 rejected) and every from/to
+  contract requires from <= to; all 13 exact live param shapes preserved.
+- BLOCKER 3 (canonical durable identities): migration 6 (UNAPPLIED; new frozen SHA-256
+  0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735) adds 4 named canonical constraints
+  (account_id/report_key/approved_by = btrim(...)) alongside the retained nonblank/primary-only/audited ones
+  (11 named constraints total). getSchedulerAccountRollout returns enabled ids EXACTLY (no trim) and fails
+  closed with read "noncanonical-id" on any whitespace/blank id; resolveRolloutAccounts fails closed with
+  reason "rollout-noncanonical-id"; the dispatcher probe drains before discovery on it.
+  buildSchedulerV2CanaryRuntime rejects (never normalizes) whitespace-padded/blank/dd-secondary AND DUPLICATE
+  ids. schema-contract.js carries exact table-scoped canonical CHECK proofs.
+- Tests: gate7-rollout-publisher.test.js 38 -> 43 checks (A2b noncanonical resolver; B4b noncanonical
+  dispatcher drain; B11 whitespace/duplicate canary rejection; D1 reader noncanonical fail-closed + D3 full
+  CAS freshness matrix incl equal-timestamp identical/conflict/storage-hydrated; E6 publish-conflict + E6b
+  hash provenance; EM1/EM3 11 canonical constraints table-scoped/exact/mandatory; F2b strict dates +
+  reversed from/to). Suites: sync-dispatch 37, runtime-composition 26, cycle-lifecycle 16,
+  cycle-finalize-wiring 14 green. npm run verify: 38 steps / 18 suites incl build:check; git diff --check
+  clean.
+- Docs: status header CORRECTION TRANCHE 2 block + new frozen hash; U.1 canonical constraint table (11) +
+  reader/resolver/canary fail-closed note; U.4 equal-freshness CAS state table + hash provenance + strict
+  dates; U.5 43-check evidence; V canonical-id requirement note.
+
+STOP for Codex re-review. Migration 6 unapplied; enables/approvals/unlock/deploy/schedule remain BLOCKED.

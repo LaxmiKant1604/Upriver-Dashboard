@@ -55,10 +55,22 @@ never publish, even under all_primary), via the trusted `buildSchedulerV2Publish
 `publish(reportKey, accountId)` caller can inject nothing; (4) the CAS replacement explicitly clears
 `payload_storage_path`; (5) migration 6 carries DB-enforced identity + audited-decision constraints
 (nonblank ids, dd-secondary rejection, nonblank `approved_by` + non-null `approved_at` on EVERY decision
-row), proven by exact table-scoped schema-contract audits — migration 6 REMAINS UNAPPLIED (new frozen
-SHA-256 `11186a07…88cfac5`); migrations 1–5 byte-identical. No control unlock, publish, deploy, schedule, or
-migration apply has happened in Gate 7. Every remaining live step is **gated on explicit human approval**,
-one step at a time.
+row), proven by exact table-scoped schema-contract audits — migration 6 REMAINS UNAPPLIED; migrations 1–5
+byte-identical. **Gate-7 CORRECTION TRANCHE 2 (2026-08-15, OFFLINE, post-Codex-review):** (1) equal-freshness
+publication no longer assumes payload equality — the CAS primitive, at an EQUAL `source_refreshed_at`,
+canonically compares live-vs-candidate params AND payload (hydrating a storage-backed live row) and returns
+`already-current` ONLY when PROVEN identical, else a typed `publish-conflict` (zero write, live LKG
+byte-identical); a strictly-newer live row wins, a strictly-older is guard-replaced; there is NO unconditional
+equal-timestamp overwrite; (2) the publisher now PROVES `shadow.params` produced `job.snapshot_params_hash` by
+recomputing `paramsHashFor(params.reportVersion, params)` and requiring the recompute, the row's `params_hash`,
+and the job hash to be ALL identical, and swaps the regex date test for the shared STRICT calendar-date
+validator (impossible dates + reversed `from/to` rejected; each of the 13 exact live param shapes preserved);
+(3) migration 6 adds named canonical-identity constraints (`account_id`/`report_key`/`approved_by` =
+`btrim(...)`) and the rollout reader/resolver + `buildSchedulerV2CanaryRuntime` now FAIL CLOSED on noncanonical
+durable ids (never silently trimmed into another account; the canary also rejects duplicate ids). **Migration 6
+REMAINS UNAPPLIED (new frozen SHA-256 `0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`);
+migrations 1–5 byte-identical.** No control unlock, publish, deploy, schedule, or migration apply has happened
+in Gate 7. Every remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3057,7 +3069,7 @@ with a separate explicit all-primary switch preserved for the eventual full roll
 appendix is INERT until (a) migration 6 is applied via its own reviewed gate and (b) durable rows are
 explicitly written (Appendix V) — neither has happened.** No production connection was made in Gate 7.
 
-### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED; frozen SHA-256 `11186a07cfe75f909812648643928b8f8b1c2f703e1c6a05dbec46e3688cfac5`)
+### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED; frozen SHA-256 `0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`)
 
 Three ADDITIVE tables (no existing table/RPC/trigger/policy touched; RLS enabled with NO policies;
 `select/insert/update` granted to `service_role` only; the shared `scheduler_rollout_touch()` BEFORE UPDATE
@@ -3075,12 +3087,24 @@ CHECK in the static schema audit — removal or weakening is a typed `NAMED_CONS
 | constraint | table | enforces |
 |---|---|---|
 | `…_account_id_nonblank` | scheduler_account_rollout | `char_length(btrim(account_id)) > 0` |
+| `…_account_id_canonical` | scheduler_account_rollout | `account_id = btrim(account_id)` — no leading/trailing whitespace |
 | `…_account_id_primary_only` | scheduler_account_rollout | `account_id NOT LIKE 'dd-secondary:%'` |
 | `scheduler_rollout_mode_singleton` | scheduler_rollout_mode | `id = 1` |
 | `…_report_key_nonblank` | scheduler_publish_approvals | `char_length(btrim(report_key)) > 0` |
+| `…_report_key_canonical` | scheduler_publish_approvals | `report_key = btrim(report_key)` |
 | `…_account_id_nonblank` | scheduler_publish_approvals | `char_length(btrim(account_id)) > 0` |
+| `…_account_id_canonical` | scheduler_publish_approvals | `account_id = btrim(account_id)` |
 | `…_account_id_primary_only` | scheduler_publish_approvals | `account_id NOT LIKE 'dd-secondary:%'` |
+| `…_approved_by_canonical` | scheduler_publish_approvals | `approved_by = btrim(approved_by)` |
 | `scheduler_publish_approvals_audited` | scheduler_publish_approvals | `char_length(btrim(approved_by)) > 0 AND approved_at IS NOT NULL` — EVERY decision row (approval OR revocation) carries WHO and WHEN |
+
+The **eleven** named constraints are all proven `true` by the static audit (test EM1); removal of any is a typed
+`NAMED_CONSTRAINT_MISSING` blocker and a weakened CHECK body fails the exact-token comparison (tests EM2/EM3).
+The rollout reader (`getSchedulerAccountRollout`) and the pure resolver (`resolveRolloutAccounts`) additionally
+FAIL CLOSED on a noncanonical durable id at read time (a `noncanonical-id` read / `rollout-noncanonical-id`
+resolver reason ⇒ zero accounts) — a whitespace-padded id is NEVER trimmed into a different account — and
+`buildSchedulerV2CanaryRuntime` rejects (never normalizes) whitespace-padded, blank, dd-secondary, or DUPLICATE
+reviewed ids at compose time.
 
 The static schema contract (`schema-contract.js`) carries the migration-6 entry (tables + the seven named
 constraints above) plus the REQUIRED wrapper exports (now also `getLatestSyncReportJob`, `getReportSnapshot`,
@@ -3149,21 +3173,39 @@ Source-of-truth gate (exact job snapshot binding): the LATEST report job must ha
 `derive_status='succeeded' AND save_status='succeeded'`, a TERMINAL cycle (`succeeded`, or `partial` with
 that exact report succeeded), AND a nonblank `snapshot_params_hash`. The shadow snapshot is then loaded by
 the EXACT natural identity that job saved — `(scheduler-v2/<reportKey>, accountId, job.snapshot_params_hash)`
-— never an unrelated "latest" row, and the returned row must ECHO the same `params_hash` (job A can never
-authorize snapshot B; blank/missing/mismatched hashes never publish). The row must also match the derivation
-`snapshotVersion`, the exact account, and carry a nonblank `source_refreshed_at`. A storage-backed payload
-(`payload NULL` + `payload_storage_path`) hydrates through the trusted storage loader; a missing/unreadable
-object fails CLOSED (live LKG preserved). The hydrated/inline payload must pass the derivation's own
-`validatePayload` and must NOT declare `dataUnavailable:true`; the live params builder fails closed on any
-missing/malformed planned param. The write is the CAS primitive `publishLiveSnapshotIfNewer` (supabase.js):
-INSERT-if-absent on the natural key `(report_key, account_id, params_hash)`, else a guarded PATCH that
-replaces ONLY a strictly-older live row AND explicitly sets `payload_storage_path=NULL` (an older
-storage-backed live row can never keep serving its stale stored object) — so a REPLAY can never duplicate a
-publish (`already-current`) and a NEWER live row wins byte-identically (`newer-live`, zero-row PATCH); live
-last-known-good is preserved on EVERY failure. Typed safe dispositions only (`PUBLISH_DISPOSITIONS`); params
-hashing uses the live `paramsHashFor` and the live stored-params shape `{ reportVersion, ...params }`. NO
-api route, cron, or dispatcher path imports the publisher OR the composition (structurally tested); no
-browser route can promote.
+— never an unrelated "latest" row. **HASH PROVENANCE (correction tranche 2):** the publisher recomputes
+`paramsHashFor(params.reportVersion, params)` EXACTLY as `makeShadowSnapshotSaver` did and requires the
+recomputed hash, the returned row's `params_hash`, AND `job.snapshot_params_hash` to be ALL identical — a row
+whose stored params were mutated after saving (same hash, different params) fails here, BEFORE any hydration
+or publish (job A can never authorize snapshot B; blank/missing/mismatched hashes never publish). The row must
+also match the derivation `snapshotVersion`, the exact account, and carry a nonblank `source_refreshed_at`.
+**STRICT calendar-date params (correction tranche 2):** the 13 live-param builders use the shared
+`isValidCalendarDate` validator (impossible dates — `2026-02-30`, `2026-13-01`, a non-leap Feb 29 — rejected)
+and every `from/to` contract additionally requires `from <= to`; each of the 13 exact live param shapes is
+preserved. A storage-backed payload (`payload NULL` + `payload_storage_path`) hydrates through the trusted
+storage loader; a missing/unreadable object fails CLOSED (live LKG preserved). The hydrated/inline payload
+must pass the derivation's own `validatePayload` and must NOT declare `dataUnavailable:true`; the live params
+builder fails closed on any missing/malformed planned param.
+
+The write is the CAS primitive `publishLiveSnapshotIfNewer` (supabase.js): INSERT-if-absent on the natural
+key `(report_key, account_id, params_hash)`; on conflict it READS the live row and classifies by SOURCE
+FRESHNESS, fail-closed — **equal freshness is NEVER an unconditional overwrite (correction tranche 2):**
+
+| live vs candidate `source_refreshed_at` | live-vs-candidate content | outcome | write | disposition |
+|---|---|---|---|---|
+| absent (row did not exist) | — | `inserted` | insert | `published` |
+| strictly OLDER | — | `replaced` (guarded PATCH `lt`; clears `payload_storage_path`) | replace | `published` |
+| strictly NEWER | — | `newer-live` | none | `newer-live` |
+| EQUAL | canonically IDENTICAL params AND payload (live payload hydrated when storage-backed) | `already-current` | none | `already-current` |
+| EQUAL | DIFFERENT params/payload/storage content, OR live payload unprovable (unreadable/missing) | `conflict` | none | `publish-conflict` |
+
+Content identity uses deterministic canonical-JSON comparison entirely inside the primitive — a payload,
+storage path, or digest is NEVER returned to a caller (only the typed outcome). A `publish-conflict` leaves the
+live LKG byte-identical; the safe remediation is a FRESH shadow cycle with NEWER source evidence (never an
+equal-timestamp overwrite). Live last-known-good is preserved on EVERY failure. Typed safe dispositions only
+(`PUBLISH_DISPOSITIONS`, now including `publish-conflict`); live params hashing uses the live `paramsHashFor`
+and the live stored-params shape `{ reportVersion, ...params }`. NO api route, cron, or dispatcher path imports
+the publisher OR the composition (structurally tested); no browser route can promote.
 
 The 13 canonical mappings (transcribed from the executable live routes — `api/datadoe.js`
 `sharedSnapshotSpec` + the six insight `serveSharedReport` sites — and statically pinned by tests F1–F3):
@@ -3184,37 +3226,42 @@ The 13 canonical mappings (transcribed from the executable live routes — `api/
 | ppc-performance | ppc-performance | ppc-performance-v1 | `{ to }` |
 | listing-optimizer | listing-optimizer | listing-optimizer-v1 | `{ to }` |
 
-### U.5 Executable regression evidence (offline; zero I/O; correction tranche)
+### U.5 Executable regression evidence (offline; zero I/O; correction tranche 2)
 
-`scripts/gate7-rollout-publisher.test.js` — **38 checks** in 9 groups (registered in `package.json` +
+`scripts/gate7-rollout-publisher.test.js` — **43 checks** in 9 groups (registered in `package.json` +
 `scripts/verify.mjs`): (A) pure resolver fail-closed semantics; (B) dispatcher enforcement — default
 locked/empty controls = zero I/O, missing-loader refusal for EVERY dispatch, read-failure fail-closed
 (zero discovery/cycle/store/DataDoe I/O), zero-default drain, ONLY IN selected from a 30-account discovery
 with every write account-scoped, the same allowlist leaving the US bucket untouched, dd-secondary excluded
-via both vectors, stale rows spending zero, all-primary auto-including a new primary account, a MANUAL
-production run unable to bypass the rollout (B10: refusal without the loader, zero-default drain, read-
-failure drain, allowlist-bounded manual accounts), the build-time canary composition (B11: exact reviewed
-ids run, undiscovered ids select nothing, blank/empty/dd-secondary inputs refuse to compose, per-run
-widening attempts dropped); (C) `RUN_OPERATIONAL_ARGS` pinned + a malicious per-run override dropped by the
-composed runtime; (D) wrapper typed reads + CAS primitive semantics against stubbed fetch — insert /
-replace-strictly-older (starting from an older STORAGE-BACKED live row, proving `payload_storage_path` is
-explicitly cleared) / equal-or-newer byte-identical skip (exactly insert-attempt + zero-row PATCH +
-read-back), single natural-key row; (E) the publisher's default code lock, all four gates, the REAL-discovery
-account gate (undiscovered / all-primary-undiscovered / discovered-dd-secondary can never publish), the
-exact job snapshot binding (unvalidated / hash-less jobs never publish; a mismatched `params_hash` echo —
-job A cannot authorize snapshot B — never publishes), storage-backed hydration (exact job-linked inline AND
-storage-backed snapshots publish; missing/unreadable/truncated/unavailable hydrations preserve live LKG),
-exactly-once publish with the exact live identity, idempotent replay, newer-live-wins, typed
-transport-failure disposition; (EC) the trusted publisher composition — default composition code-locked,
-`publish()` caller can inject nothing, ONE memoized fresh discovery across publishes; (EM) migration-6 audit
-integrity — the real migration proves all 7 named constraints; removing OR weakening the audited-decision /
-prefix-rejection constraints is a typed `NAMED_CONSTRAINT_MISSING` blocker; (F) the 13 contracts statically
-pinned against `api/datadoe.js` literals and the live insight modules' exported constants; (G) structural
-isolation (no api/ reference to the publisher / composition / rollout / CAS primitive; the dispatcher never
-auto-publishes). Existing suites updated only in their HARNESS defaults (all-primary loader injection):
-`sync-dispatch.test.js` 37, `sync-runtime-composition.test.js` 26, `cycle-lifecycle.test.js` 16,
-`cycle-finalize-wiring.test.js` 14 — all green; full `npm run verify` green (38 steps / 18 suites including
-`build:check`).
+via both vectors, stale rows spending zero, all-primary auto-including a new primary account, a NONCANONICAL
+durable id draining BEFORE discovery (B4b), a MANUAL production run unable to bypass the rollout (B10:
+refusal without the loader, zero-default drain, read-failure drain, allowlist-bounded manual accounts), the
+build-time canary composition (B11: exact reviewed ids run, undiscovered ids select nothing,
+blank/empty/dd-secondary/**whitespace/duplicate** inputs refuse to compose, per-run widening attempts
+dropped); the pure resolver fails closed on a noncanonical durable id (A2b); (C) `RUN_OPERATIONAL_ARGS`
+pinned + a malicious per-run override dropped by the composed runtime; (D) wrapper typed reads (incl. the
+reader failing closed on a noncanonical durable id) + the CAS primitive's full freshness matrix against
+stubbed fetch — insert / strictly-older guarded replace (clears `payload_storage_path`) / strictly-newer
+zero-write / EQUAL-freshness canonical identity (already-current when proven identical INLINE or hydrated
+from storage; `publish-conflict` on differing params/payload/storage or unreadable storage); (E) the
+publisher's default code lock, all four gates, the REAL-discovery account gate (undiscovered /
+all-primary-undiscovered / discovered-dd-secondary can never publish), the exact job snapshot binding with
+HASH PROVENANCE (unvalidated / hash-less jobs never publish; a mismatched `params_hash` echo AND a
+recompute-mismatch — mutated stored params — never publish; E6b), storage-backed hydration (exact job-linked
+inline AND storage-backed snapshots publish; missing/unreadable/truncated/unavailable hydrations preserve
+live LKG), exactly-once publish, idempotent replay, newer-live-wins, EQUAL-freshness content mismatch =>
+`publish-conflict`, typed transport-failure disposition; (EC) the trusted publisher composition — default
+composition code-locked, `publish()` caller can inject nothing, ONE memoized fresh discovery across
+publishes; (EM) migration-6 audit integrity — the real migration proves all **11** named constraints;
+removing OR weakening the audited-decision / prefix-rejection / **canonical-identity** constraints is a typed
+`NAMED_CONSTRAINT_MISSING` blocker, and each canonical constraint is proven table-scoped/exact/mandatory
+(EM3); (F) the 13 contracts statically pinned against `api/datadoe.js` literals and the live insight modules'
+exported constants, plus STRICT calendar-date validation (impossible dates + reversed `from/to` rejected;
+leap-day + boundaries pass; F2b); (G) structural isolation (no api/ reference to the publisher / composition
+/ rollout / CAS primitive; the dispatcher never auto-publishes). Existing suites updated only in their
+HARNESS defaults (all-primary loader injection): `sync-dispatch.test.js` 37, `sync-runtime-composition.test.js`
+26, `cycle-lifecycle.test.js` 16, `cycle-finalize-wiring.test.js` 14 — all green; full `npm run verify` green
+(38 steps / 18 suites including `build:check`).
 
 ---
 
@@ -3226,7 +3273,10 @@ requires: Codex review of the Gate-7 code, explicit human approval naming the IN
 per-migration gate procedure (sections 1–2a).
 
 Let `IN_ACCOUNT` = the exact public account id of the proven IN primary account (`d658442d-…` — the full id
-is re-read from live discovery at execution time; never guessed or hard-coded).
+is re-read from live discovery at execution time; never guessed or hard-coded). **Every durable id written
+below (`account_id`, `report_key`, `approved_by`) must be CANONICAL — no leading/trailing whitespace: the
+migration-6 `= btrim(...)` constraints reject a noncanonical value, and the reader/resolver fail closed on
+one rather than trimming it into a different account.**
 
 1. **Apply migration 6** (`20260816_account_rollout.sql`) via the standard single-file guarded-transaction
    gate (advisory lock, pre/post read-only verification, ledger row). Verify: 3 tables exist, RLS enabled,
