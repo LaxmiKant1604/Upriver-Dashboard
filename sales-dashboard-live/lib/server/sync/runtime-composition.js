@@ -17,7 +17,8 @@ import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-driver.js";
 import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
-import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS } from "./report-controls.js";
+import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
+import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
@@ -250,7 +251,10 @@ export const REQUIRED_RUNTIME_ENV = Object.freeze(["DATADOE_API_KEY", "SUPABASE_
  *   3. the required Supabase wrappers are available;
  *   4. the required Scheduler-v2 tables/RPCs are declared and match the calling wrappers (static schema audit);
  *   5. the four unapplied migrations are present + contract-compatible (migration readiness);
- *   6. every Scheduler-v2 control is still LOCKED (fail closed if any is ready/scheduled).
+ *   6a. the EXPLICIT v2 readiness allowlist is exactly 13 unique keys, each a controlled report with a live
+ *       snapshot contract (fail closed with V2_READINESS_COUNT/_DUPLICATE/_UNKNOWN/_NO_CONTRACT); and
+ *   6b. the catalog's ready set is a SUBSET of that literal and nothing is scheduled with empty settings
+ *       (fail closed with V2_CONTROLS_UNLOCKED) -- so a future controlled report not in the literal stays not-ready.
  * Returns `{ ready, blockers, checks, expected }`. `blockers` carry ONLY typed, SAFE codes + operator messages
  * -- never an api key, a raw Supabase/DataDoe error, or a secret. It performs no write and no DataDoe export.
  *
@@ -266,6 +270,9 @@ export function schedulerV2Preflight(overrides = {}) {
     wrappers = null,
     requiredWrappers = REQUIRED_WRAPPERS,
     readFile = null,
+    // The EXPLICIT v2 readiness allowlist to validate. Production passes nothing => the frozen literal; a
+    // test may inject a malformed list to prove the typed readiness blockers fire (build-time seam only).
+    readyKeys = SCHEDULER_V2_READY_REPORT_KEYS,
   } = overrides;
 
   const blockers = [];
@@ -333,19 +340,36 @@ export function schedulerV2Preflight(overrides = {}) {
     push({ code: "SCHEMA_AUDIT_UNAVAILABLE", message: "schema contract audit reader was not provided; cannot prove migration readiness" });
   }
 
-  // 6) v2 controls -- fail closed if any UNEXPECTED (non-approved) report is v2-ready, OR if ANY report is
-  //    v2-scheduled with EMPTY durable settings (nothing may dispatch by default). Post-Gate-7b the readiness
-  //    allowlist is EXACTLY the 13 approved CONTROLLED_REPORT_KEYS, so a ready APPROVED report is expected (not
-  //    a blocker); only an unknown/rogue ready key or a scheduled-by-default report is refused. This preflight
-  //    is no-I/O: it cannot read the durable account rollout / report_sync_settings that gate the live run --
-  //    those are verified against production separately (Appendix W / Appendix Y).
+  // 6a) v2 readiness ALLOWLIST integrity. The EXPLICIT SCHEDULER_V2_READY_REPORT_KEYS literal must be exactly
+  //     13 UNIQUE keys, each an EXISTING controlled report (in CONTROLLED_REPORT_KEYS) with a pinned live
+  //     snapshot contract. A duplicate / unknown / missing / non-contract key fails closed with a typed
+  //     blocker. Because readiness is an explicit hand-authored literal (NEVER derived from
+  //     CONTROLLED_REPORT_KEYS), a future controlled report cannot inherit readiness -- it is simply absent
+  //     from this literal until an explicit reviewed edit adds it.
+  const readyList = Array.isArray(readyKeys) ? readyKeys : [];
+  const readyLiteral = new Set(readyList);
+  const controlled = new Set(CONTROLLED_REPORT_KEYS);
+  const duplicates = [...new Set(readyList.filter((k, i) => readyList.indexOf(k) !== i))];
+  const unknownReady = readyList.filter((k) => !controlled.has(k));
+  const missingContract = readyList.filter((k) => !SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[k]);
+  const countOk = readyList.length === 13 && readyLiteral.size === 13;
+  checks.v2ReadinessAllowlist = { count: readyList.length, unique: readyLiteral.size, duplicates, unknownReady, missingContract, ok: countOk && duplicates.length === 0 && unknownReady.length === 0 && missingContract.length === 0 };
+  if (!countOk) push({ code: "V2_READINESS_COUNT", count: readyList.length, unique: readyLiteral.size, message: "the v2 readiness allowlist must be exactly 13 unique report keys" });
+  if (duplicates.length) push({ code: "V2_READINESS_DUPLICATE", keys: duplicates, message: "the v2 readiness allowlist contains duplicate keys" });
+  if (unknownReady.length) push({ code: "V2_READINESS_UNKNOWN", keys: unknownReady, message: "a v2 readiness key is not a controlled report" });
+  if (missingContract.length) push({ code: "V2_READINESS_NO_CONTRACT", keys: missingContract, message: "a v2 readiness key has no live snapshot contract" });
+
+  // 6b) v2 controls. The catalog's READY set must be a SUBSET of the explicit readiness literal (a controlled
+  //     report NOT in the literal -- e.g. a future report -- must stay NOT-ready), and nothing may be
+  //     scheduled with EMPTY durable settings. This preflight is no-I/O: it cannot read the durable account
+  //     rollout / report_sync_settings that gate the live run -- those are verified against production
+  //     separately (Appendix W / Appendix Y).
   const catalog = (typeof controlCatalog === "function" ? controlCatalog([]) : []) || [];
   const ready = catalog.filter((c) => c && c.ready).map((c) => c.reportKey);
   const scheduled = catalog.filter((c) => c && c.scheduleEnabled).map((c) => c.reportKey);
-  const approvedReady = new Set(CONTROLLED_REPORT_KEYS);
-  const unexpectedReady = ready.filter((k) => !approvedReady.has(k));
-  checks.v2ControlsLocked = { ready, scheduled, unexpectedReady, ok: unexpectedReady.length === 0 && scheduled.length === 0 };
-  if (unexpectedReady.length || scheduled.length) push({ code: "V2_CONTROLS_UNLOCKED", ready: unexpectedReady, scheduled, message: "a Scheduler v2 control is unexpectedly ready (non-approved) or scheduled with empty durable settings; refusing (fail closed)" });
+  const readyOutsideLiteral = ready.filter((k) => !readyLiteral.has(k));
+  checks.v2ControlsLocked = { ready, scheduled, readyOutsideLiteral, ok: readyOutsideLiteral.length === 0 && scheduled.length === 0 };
+  if (readyOutsideLiteral.length || scheduled.length) push({ code: "V2_CONTROLS_UNLOCKED", ready: readyOutsideLiteral, scheduled, message: "a Scheduler v2 control is ready OUTSIDE the explicit readiness allowlist, or scheduled with empty durable settings; refusing (fail closed)" });
 
   return { ready: blockers.length === 0, blockers, checks, expected };
 }

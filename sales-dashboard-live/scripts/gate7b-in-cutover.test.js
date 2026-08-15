@@ -184,39 +184,42 @@ test("(Y2) NO rollout account rows: a scheduled run (all 13 settings enabled) is
   assert.deepEqual(r.accountRollout, { selected: 0, reason: "zero-accounts-enabled" });
 });
 
-test("(Y3a) ONLY IN enabled: all 13 reports are SELECTED and accountsDispatched = [IN] (USA + other-non-us excluded)", async () => {
-  // maxJobs=0 bounds the run to selection + account resolution (zero exports) so all 13 can be proven selected.
-  const { dd, saver, counts, promise } = dispatch({ accounts: [IN1, IN2, US1], loadAccountRollout: inAllowlist, maxJobs: 0 });
-  const r = await promise;
-  assert.deepEqual([...r.selected].slice().sort(), [...CONTROLLED_REPORT_KEYS].slice().sort(), "all 13 reports selected");
-  assert.deepEqual(r.accountsDispatched, ["IN1"], "ONLY the IN account is dispatched");
-  assert.deepEqual(r.accountRollout, { selected: 1, staleIds: [], reason: "allowlist" });
-  assert.equal(counts.discover, 1, "discovery ran once");
-  assert.equal(dd.totalCreates(), 0, "maxJobs=0 => zero exports (selection proof only)");
-  assert.equal(saver.calls, 0, "zero snapshots at maxJobs=0");
-});
-
-test("(Y3b) ONLY IN enabled: a real IN dispatch writes source-job owners / report jobs / shadow snapshots scoped to IN ONLY", async () => {
-  // brand-sales only (a pure generic report) so the run completes without heavy staged/Ads wiring, proving the
-  // ACCOUNT scoping that is identical for every report (the rollout filter runs once, before any report).
-  const { store, saver, promise } = dispatch({
-    accounts: [IN1, IN2, US1],
-    settings: [{ report_key: "brand-sales", schedule_enabled: true }],
-    loadAccountRollout: inAllowlist,
-  });
-  const r = await promise;
-  assert.deepEqual(r.accountsDispatched, ["IN1"], "only IN1 dispatched");
-  assert.ok(r.cycleId, "a cycle opened for IN1's work");
-  const owners = store._owners(r.cycleId);
-  assert.ok(owners.length > 0, "source-job owners recorded");
-  assert.ok(owners.every((m) => m.account_id === "IN1"), "EVERY source-job owner belongs to IN1");
-  assert.ok(store.listReportJobs().every((j) => j.account_id === "IN1"), "EVERY report job belongs to IN1");
-  assert.ok(saver.keys().every((k) => k.endsWith("|IN1")), "EVERY shadow snapshot belongs to IN1");
-  // USA + the other non-US account appear in ZERO owners / report jobs / snapshots.
-  for (const other of ["US1", "IN2"]) {
-    assert.ok(!owners.some((m) => m.account_id === other), other + " has zero source-job owners");
-    assert.ok(!store.listReportJobs().some((j) => j.account_id === other), other + " has zero report jobs");
-    assert.ok(!saver.keys().some((k) => k.endsWith("|" + other)), other + " has zero shadow snapshots");
+test("(Y3) EVERY one of the 13 reports: a REAL dispatch (mixed IN/other-non-US/US discovery, IN-only rollout) produces exactly the requested report scoped to IN ONLY; US + the other non-US account get ZERO", async () => {
+  // Each report is dispatched through its REAL planner/dispatcher path with injected offline transports and a
+  // MIXED discovery [IN1 (approved), IN2 (another non-US), US1 (US)]. The durable rollout contains ONLY IN1.
+  // No selection-only shortcut: for each report we assert the actual OWNERSHIP of the durable work created.
+  for (const key of CONTROLLED_REPORT_KEYS) {
+    const { store, dd, saver, counts, promise } = dispatch({
+      bucket: "non-us", accounts: [IN1, IN2, US1],
+      settings: [{ report_key: key, schedule_enabled: true }],
+      loadAccountRollout: inAllowlist,
+    });
+    const r = await promise;
+    // Selection is exactly the requested key; exactly the IN account is dispatched.
+    assert.deepEqual(r.selected, [key], key + ": selected is exactly the requested report");
+    assert.deepEqual(r.accountsDispatched, ["IN1"], key + ": accountsDispatched is exactly [IN]");
+    assert.deepEqual(r.accountRollout, { selected: 1, staleIds: [], reason: "allowlist" }, key + ": rollout selected only IN");
+    assert.equal(counts.discover, 1, key + ": discovery ran once");
+    // OWNERSHIP evidence: every durable row this report created belongs to IN1 (item 10: even if the report
+    // legitimately stays pending/blocked with offline fixtures, its durable work must be IN-scoped).
+    const owners = store._owners(r.cycleId);
+    assert.ok(owners.length > 0, key + ": created source-job owners (real dispatch, not a selection-only result)");
+    assert.ok(owners.every((m) => m.account_id === "IN1"), key + ": EVERY source-job owner belongs to IN1");
+    assert.ok(store.listReportJobs().length > 0, key + ": created a report job");
+    assert.ok(store.listReportJobs().every((j) => j.account_id === "IN1"), key + ": EVERY report job belongs to IN1");
+    assert.ok(saver.keys().every((k) => k.endsWith("|IN1")), key + ": EVERY shadow snapshot (if any) belongs to IN1");
+    // US1 (US bucket) and IN2 (another non-US, out of the allowlist) get ZERO owners / report jobs / snapshots.
+    for (const other of ["US1", "IN2"]) {
+      assert.ok(!owners.some((m) => m.account_id === other), key + ": " + other + " has zero source-job owners");
+      assert.ok(!store.listReportJobs().some((j) => j.account_id === other), key + ": " + other + " has zero report jobs");
+      assert.ok(!saver.keys().some((k) => k.endsWith("|" + other)), key + ": " + other + " has zero shadow snapshots");
+    }
+    // Zero exports for US1/IN2: a DataDoe export is created only via a source job, and EVERY source job in the
+    // cycle is IN1-owned (asserted above) -- so no US1/IN2 export can exist; dd is fresh per dispatch, so its
+    // whole total is IN1's work. Every source job belongs to an IN1 owner (no ownerless / cross-account job).
+    const sourceJobs = store.listSourceJobs(r.cycleId);
+    const ownedHashes = new Set(owners.map((m) => m.request_hash));
+    assert.ok(sourceJobs.every((j) => ownedHashes.has(j.request_hash)), key + ": every source job is owned by an IN1 owner (no US1/IN2 export possible)");
   }
 });
 

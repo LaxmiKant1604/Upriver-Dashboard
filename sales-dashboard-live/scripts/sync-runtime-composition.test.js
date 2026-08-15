@@ -29,6 +29,7 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let buildSchedulerV2Runtime, combineStores, makeProductionDiscoverAccounts, schedulerV2Preflight, REQUIRED_WRAPPERS;
+let CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS;
 let auditSchemaContract, SCHEDULER_V2_SCHEMA_CONTRACT;
 
 const dash = (...p) => p.join("-");
@@ -251,16 +252,52 @@ test("(typed blockers) missing config / missing audit reader / unlocked control 
   assert.ok(codes.includes("ENV_MISSING"), "missing env => ENV_MISSING");
   assert.ok(codes.includes("PRIMARY_CONNECTION_MISSING"), "unconfigured connection => PRIMARY_CONNECTION_MISSING");
   assert.ok(codes.includes("SCHEMA_AUDIT_UNAVAILABLE"), "no readFile => SCHEMA_AUDIT_UNAVAILABLE (never a vacuous pass)");
-  // Post-Gate-7b the preflight fails closed on (a) a report SCHEDULED with empty durable settings, or (b) an
-  // UNEXPECTED (non-approved) ready key -- never on an approved report merely being ready.
+  // Post-Gate-7b the preflight fails closed on (a) a report SCHEDULED with empty durable settings, or (b) a
+  // report ready OUTSIDE the explicit readiness literal -- never on an approved literal report merely being ready.
   const env = { DATADOE_API_KEY: "x", SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k" };
   const scheduled = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["brand-sales"]), readFile: realReadFile }); // mkCatalog marks it scheduleEnabled
   assert.ok(scheduled.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "a scheduled-by-default v2 control => V2_CONTROLS_UNLOCKED");
-  const rogue = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["not-a-controlled-report"], []), readFile: realReadFile }); // ready but not scheduled, and NOT approved
-  assert.ok(rogue.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "an unexpected (non-approved) ready key => V2_CONTROLS_UNLOCKED");
+  const rogue = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["not-a-controlled-report"], []), readFile: realReadFile }); // ready but not in the literal
+  assert.ok(rogue.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "a ready key OUTSIDE the readiness literal => V2_CONTROLS_UNLOCKED");
   // An APPROVED report merely being ready (not scheduled) is EXPECTED post-cutover -- no blocker.
   const approvedReady = schedulerV2Preflight({ env, getConnections: () => CONNS, controlCatalog: mkCatalog(["brand-sales"], []), readFile: realReadFile }); // ready, NOT scheduled
   assert.ok(!approvedReady.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED"), "an approved ready-but-not-scheduled report is NOT a blocker");
+});
+
+test("(explicit readiness allowlist) readiness is a hand-authored 13-key literal, NOT derived; a synthetic FUTURE controlled report never becomes ready automatically; malformed lists fail closed with typed blockers", () => {
+  const env = { DATADOE_API_KEY: "x", SUPABASE_URL: "u", SUPABASE_SERVICE_ROLE_KEY: "k" };
+  const FUTURE = "future-controlled-report-x"; // imagine a later release adds this to CONTROLLED_REPORT_KEYS
+  // (1) readiness is EXACTLY 13 unique keys, its OWN array (not the CONTROLLED_REPORT_KEYS object/spread) and a
+  //     SUBSET of the controlled catalog -- proving it is authored independently, not inherited.
+  assert.equal(SCHEDULER_V2_READY_REPORT_KEYS.length, 13);
+  assert.equal(new Set(SCHEDULER_V2_READY_REPORT_KEYS).size, 13, "no duplicates");
+  assert.notStrictEqual(SCHEDULER_V2_READY_REPORT_KEYS, CONTROLLED_REPORT_KEYS, "readiness is a distinct array, never the CONTROLLED array itself");
+  assert.ok(SCHEDULER_V2_READY_REPORT_KEYS.every((k) => CONTROLLED_REPORT_KEYS.includes(k)), "every readiness key is a controlled report");
+  // (2) the SOURCE assignment is a literal that does NOT spread/derive from CONTROLLED_REPORT_KEYS/registry/etc.
+  const src = readFileSync(join(process.cwd(), "lib", "server", "sync", "report-controls.js"), "utf8");
+  const decl = /export const SCHEDULER_V2_READY_REPORT_KEYS\s*=\s*Object\.freeze\(\[([\s\S]*?)\]\)/.exec(src);
+  assert.ok(decl, "SCHEDULER_V2_READY_REPORT_KEYS is a frozen array literal");
+  assert.ok(!/\.\.\.|CONTROLLED_REPORT_KEYS|SYNC_REGISTRY|\.map\(|SCHEDULER_LIVE_SNAPSHOT_CONTRACTS|report_sync_settings/.test(decl[1]), "the literal is not spread/derived from CONTROLLED/registry/planner/contract/settings");
+  assert.equal((decl[1].match(/"/g) || []).length, 26, "exactly 13 double-quoted string literals (13 keys)");
+  // (3) a FUTURE controlled report is NOT in the readiness literal => the catalog's readiness test (an exact
+  //     Set membership on the literal) is false for it => it never becomes ready automatically.
+  assert.ok(!new Set(SCHEDULER_V2_READY_REPORT_KEYS).has(FUTURE), "a future controlled report is NOT in the readiness literal");
+  // (4) and if some path DID mark the future report ready, the preflight fails closed (readyOutsideLiteral).
+  const rogue = schedulerV2Preflight({ env, getConnections: () => CONNS, readFile: realReadFile, controlCatalog: () => [{ reportKey: FUTURE, ready: true, scheduleEnabled: false }] });
+  assert.ok(rogue.blockers.some((b) => b.code === "V2_CONTROLS_UNLOCKED" && (b.ready || []).includes(FUTURE)), "a report ready OUTSIDE the literal => V2_CONTROLS_UNLOCKED");
+  // (5) typed readiness-allowlist blockers on malformed lists (injected readyKeys build-time seam).
+  const dup = schedulerV2Preflight({ env, getConnections: () => CONNS, readFile: realReadFile, controlCatalog: mkCatalog([]), readyKeys: [...SCHEDULER_V2_READY_REPORT_KEYS.slice(0, 12), "brand-sales"] });
+  assert.ok(dup.blockers.some((b) => b.code === "V2_READINESS_DUPLICATE"), "a duplicate key => V2_READINESS_DUPLICATE");
+  const fourteen = schedulerV2Preflight({ env, getConnections: () => CONNS, readFile: realReadFile, controlCatalog: mkCatalog([]), readyKeys: [...SCHEDULER_V2_READY_REPORT_KEYS, FUTURE] });
+  assert.ok(fourteen.blockers.some((b) => b.code === "V2_READINESS_COUNT"), "14 keys => V2_READINESS_COUNT");
+  assert.ok(fourteen.blockers.some((b) => b.code === "V2_READINESS_UNKNOWN" && (b.keys || []).includes(FUTURE)), "a non-controlled readiness key => V2_READINESS_UNKNOWN");
+  assert.ok(fourteen.blockers.some((b) => b.code === "V2_READINESS_NO_CONTRACT" && (b.keys || []).includes(FUTURE)), "a readiness key with no live contract => V2_READINESS_NO_CONTRACT");
+  const twelve = schedulerV2Preflight({ env, getConnections: () => CONNS, readFile: realReadFile, controlCatalog: mkCatalog([]), readyKeys: SCHEDULER_V2_READY_REPORT_KEYS.slice(0, 12) });
+  assert.ok(twelve.blockers.some((b) => b.code === "V2_READINESS_COUNT"), "12 keys (a missing key) => V2_READINESS_COUNT");
+  // (6) the REAL literal audits clean (no readiness blocker).
+  const good = schedulerV2Preflight({ env, getConnections: () => CONNS, readFile: realReadFile, controlCatalog: mkCatalog([]) });
+  assert.ok(!good.blockers.some((b) => /^V2_READINESS/.test(b.code)), "the real 13-key literal produces no readiness blocker");
+  assert.equal(good.checks.v2ReadinessAllowlist.ok, true, "v2ReadinessAllowlist.ok=true for the real literal");
 });
 
 /* ===================== migration readiness (static audit) ===================== */
@@ -723,6 +760,7 @@ test("(no secrets) preflight + dispatch telemetry never contain an api key or a 
 
 async function main() {
   ({ buildSchedulerV2Runtime, combineStores, makeProductionDiscoverAccounts, schedulerV2Preflight, REQUIRED_WRAPPERS } = await import("../lib/server/sync/runtime-composition.js"));
+  ({ CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ auditSchemaContract, SCHEDULER_V2_SCHEMA_CONTRACT } = await import("../lib/server/sync/schema-contract.js"));
   void makeProductionDiscoverAccounts;
 
