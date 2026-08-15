@@ -1038,6 +1038,67 @@ test("(EM3) each CANONICAL-identity constraint is table-scoped, exact, and MANDA
   assert.ok(weakened.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.constraints.includes("scheduler_account_rollout_account_id_canonical")), "a weakened canonical body fails the EXACT token comparison");
 });
 
+test("(EM4) least-privilege service_role ACL: proven for all 3 tables; missing-revoke / GRANT ALL / added-DELETE / wrong-table / comment-only / string-only each FAIL with a typed blocker", () => {
+  const real6 = realReadFile("20260816_account_rollout.sql");
+  const tamper = (mutate) => (name) => (name === "20260816_account_rollout.sql" ? mutate(real6) : realReadFile(name));
+  const TABLES = ["scheduler_account_rollout", "scheduler_rollout_mode", "scheduler_publish_approvals"];
+  const REVOKE = (t) => `revoke all on public.${t} from public, anon, authenticated, service_role;`;
+  const GRANT = (t) => `grant select, insert, update on public.${t} to service_role;`;
+
+  // Baseline: the REAL migration REVOKEs ALL from service_role AND grants EXACTLY {select,insert,update} on
+  // all three tables (so Supabase's default-privilege ALL is stripped -- no delete/truncate/references/
+  // trigger/maintain).
+  const base = auditSchemaContract({ readFile: realReadFile });
+  assert.equal(base.ok, true, "real migration audits clean: " + JSON.stringify(base.blockers));
+  for (const t of TABLES) {
+    assert.ok(real6.includes(REVOKE(t)), "REVOKE ALL ... from service_role present verbatim for " + t);
+    assert.ok(real6.includes(GRANT(t)), "GRANT select,insert,update to service_role present verbatim for " + t);
+    const row = base.matrix.find((m) => m.migration === "20260816_account_rollout.sql").tables.find((x) => x.name === t);
+    assert.ok(row.serviceRoleAcl && row.serviceRoleAcl.ok, t + " service_role ACL proven");
+  }
+
+  const T = "scheduler_account_rollout"; // the audit is table-scoped; mutate one table
+  const failsWith = (code, mutate, label) => {
+    const a = auditSchemaContract({ readFile: tamper(mutate) });
+    assert.equal(a.ok, false, label + " must fail the contract");
+    assert.ok(a.blockers.some((b) => b.code === code && b.table === T), label + " => typed " + code + " on " + T);
+    return a;
+  };
+
+  // (a) MISSING REVOKE (the exact original production defect): drop service_role from the revoke list -- the
+  //     Supabase default ALL grant survives, so this must be caught.
+  failsWith("SERVICE_ROLE_REVOKE_MISSING",
+    (t) => t.replace(REVOKE(T), `revoke all on public.${T} from public, anon, authenticated;`), "missing REVOKE-from-service_role");
+
+  // (b) GRANT ALL instead of exactly SIU.
+  const grantAll = failsWith("SERVICE_ROLE_GRANT_MISMATCH",
+    (t) => t.replace(GRANT(T), `grant all on public.${T} to service_role;`), "GRANT ALL");
+  assert.ok(grantAll.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH" && /\[all\]/.test(b.message)), "GRANT ALL reports the [all] set");
+
+  // (c) added DELETE beyond SIU.
+  const withDelete = failsWith("SERVICE_ROLE_GRANT_MISMATCH",
+    (t) => t.replace(GRANT(T), `grant select, insert, update, delete on public.${T} to service_role;`), "added DELETE");
+  assert.ok(withDelete.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH" && /delete/.test(b.message)), "added DELETE reported in the got-set");
+
+  // (d) WRONG TABLE: the grant names a different object, so THIS table has no service_role grant.
+  failsWith("SERVICE_ROLE_GRANT_MISSING",
+    (t) => t.replace(GRANT(T), `grant select, insert, update on public.some_other_table to service_role;`), "wrong-table grant");
+
+  // (e) COMMENT-ONLY grant: masked blanks comments, so a commented grant proves nothing.
+  failsWith("SERVICE_ROLE_GRANT_MISSING",
+    (t) => t.replace(GRANT(T), `-- ${GRANT(T)}`), "comment-only grant");
+
+  // (f) STRING-ONLY grant: the grant text lives only inside a string literal (blanked in masked).
+  failsWith("SERVICE_ROLE_GRANT_MISSING",
+    (t) => t.replace(GRANT(T), `select '${GRANT(T)}'::text;`), "string-only grant");
+
+  // TABLE-SCOPING: a mutation on scheduler_account_rollout leaves the other two tables' ACL proofs intact.
+  const scoped = auditSchemaContract({ readFile: tamper((t) => t.replace(GRANT(T), `-- ${GRANT(T)}`)) });
+  for (const other of ["scheduler_rollout_mode", "scheduler_publish_approvals"]) {
+    assert.ok(!scoped.blockers.some((b) => /SERVICE_ROLE/.test(b.code) && b.table === other), other + " ACL unaffected by a " + T + " mutation");
+  }
+});
+
 // =================================================================================================
 group("F. all 13 scheduler->live mappings statically pinned against the REAL live route truths");
 
@@ -1156,6 +1217,23 @@ test("(G2) the dispatcher never auto-publishes and the publisher touches no rout
   const publisher = readFileSync(path.join(ROOT, "lib", "server", "sync", "report-publisher.js"), "utf8");
   assert.ok(!/from "\.\.\/\.\.\/\.\.\/api\//.test(publisher), "the publisher imports no api route");
   assert.ok(!publisher.includes("supabase.js"), "the publisher is PURE DI -- production wiring stays outside");
+});
+
+test("(G3) the rollout-table wrappers need only SELECT/INSERT/UPDATE -- every runtime reference is a read (no write method), and NO DELETE targets the three tables (revoke/disable are UPDATEs, never DELETEs)", () => {
+  const src = readFileSync(path.join(ROOT, "lib", "server", "supabase.js"), "utf8");
+  const TABLES = ["scheduler_account_rollout", "scheduler_rollout_mode", "scheduler_publish_approvals"];
+  for (const t of TABLES) {
+    assert.ok(new RegExp(`/rest/v1/${t}\\b`).test(src), t + " is referenced by a wrapper");
+    // Every runtime `request(...<table>...)` is a DEFAULT GET (read): no method option appears within the
+    // request arguments after the URL. A POST/PATCH/DELETE against these tables would surface here.
+    for (const method of ["POST", "PATCH", "DELETE"]) {
+      assert.ok(!new RegExp(`/rest/v1/${t}\\b[\\s\\S]{0,300}?method:\\s*["']${method}["']`).test(src), `no ${method} request targets public.${t} (runtime wrappers only read)`);
+      assert.ok(!new RegExp(`method:\\s*["']${method}["'][\\s\\S]{0,300}?/rest/v1/${t}\\b`).test(src), `no ${method} request targets public.${t} (method-first form)`);
+    }
+  }
+  // The migration grants EXACTLY these three privileges -- SELECT for the wrappers, INSERT+UPDATE for the
+  // operator's enable/approve (INSERT) and disable/revoke (UPDATE) in Appendix V. DELETE/TRUNCATE never needed.
+  assert.ok(!/\bgrant\b[^;]*\b(delete|truncate|references|trigger|maintain)\b[^;]*\bto\s+service_role/i.test(realReadFile("20260816_account_rollout.sql")), "the migration never grants service_role delete/truncate/references/trigger/maintain");
 });
 
 // =================================================================================================

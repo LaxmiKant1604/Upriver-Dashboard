@@ -144,6 +144,9 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "scheduler_account_rollout_account_id_canonical", kind: "check", canonical: "account_id = btrim(account_id)" },
           { name: "scheduler_account_rollout_account_id_primary_only", kind: "check", canonical: "account_id not like 'dd-secondary:%'" },
         ],
+        // Least-privilege service_role ACL: REVOKE ALL from service_role (strip the Supabase default-privilege
+        // ALL grant) THEN grant exactly select/insert/update -- no delete/truncate/references/trigger/maintain.
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         keyColumns: ["account_id", "enabled", "note", "created_at", "updated_at"],
       },
       {
@@ -152,6 +155,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         namedConstraints: [
           { name: "scheduler_rollout_mode_singleton", kind: "check", canonical: "id = 1" },
         ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         keyColumns: ["id", "all_primary", "updated_at"],
       },
       {
@@ -170,6 +174,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "scheduler_publish_approvals_approved_by_canonical", kind: "check", canonical: "approved_by = btrim(approved_by)" },
           { name: "scheduler_publish_approvals_audited", kind: "check", canonical: "char_length(btrim(approved_by)) > 0 and approved_at is not null" },
         ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         keyColumns: ["report_key", "account_id", "approved", "approved_by", "approved_at", "created_at", "updated_at"],
       },
     ],
@@ -401,6 +406,52 @@ function rpcParamNames(masked, name) {
 
 function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+// BOUNDED STRUCTURAL proof of the least-privilege `service_role` ACL for ONE table, on `masked` (comments AND
+// string CONTENTS blanked, so a comment-only or string-only REVOKE/GRANT can never satisfy it). Because
+// Supabase applies project-level DEFAULT PRIVILEGES that grant `service_role` ALL on every new public table,
+// the migration MUST both (1) REVOKE ALL [PRIVILEGES] ... ON public.<table> FROM ... service_role (stripping
+// that default), and (2) GRANT exactly {select, insert, update} ... ON public.<table> TO ... service_role.
+// Each match is pinned to the EXACT `public.<table>` object with a trailing word boundary, so a REVOKE/GRANT
+// on a DIFFERENT table can neither satisfy nor pollute THIS table's proof; the privilege portion is bounded to
+// a single statement (`[^;]`), so cross-statement bleed is impossible. Returns [] when both hold, else typed
+// problems. A GRANT ALL, an added DELETE/TRUNCATE/etc., a missing REVOKE, a wrong-table statement, or
+// comment/string-only text each yields a typed blocker.
+function auditServiceRoleAcl(masked, table, expected) {
+  const problems = [];
+  const namesServiceRole = (list) => /\bservice_role\b/i.test(list);
+
+  // (1) REVOKE ALL ... ON public.<table> FROM ... service_role.
+  let revoked = false;
+  const reRevoke = new RegExp(`\\brevoke\\s+(?:grant\\s+option\\s+for\\s+)?all(?:\\s+privileges)?\\s+on\\s+(?:table\\s+)?public\\.${table}\\b\\s+from\\s+([^;]*)`, "ig");
+  let rm;
+  while ((rm = reRevoke.exec(masked))) { if (namesServiceRole(rm[1])) { revoked = true; break; } }
+  if (expected.revokeAll && !revoked) {
+    problems.push({ code: "SERVICE_ROLE_REVOKE_MISSING", reason: `no REVOKE ALL ... ON public.${table} FROM ... service_role (Supabase default privileges would otherwise leave service_role with ALL)` });
+  }
+
+  // (2) UNION of every GRANT ... ON public.<table> TO ... service_role privilege list must equal exactly the
+  //     expected set. `[^;]` bounds each privilege list to its own statement (no cross-statement bleed).
+  const granted = new Set();
+  let sawGrant = false;
+  const reGrant = new RegExp(`\\bgrant\\s+([^;]*?)\\s+on\\s+(?:table\\s+)?public\\.${table}\\b\\s+to\\s+([^;]*)`, "ig");
+  let gm;
+  while ((gm = reGrant.exec(masked))) {
+    if (!namesServiceRole(gm[2])) continue;
+    sawGrant = true;
+    for (const p of gm[1].split(",").map((x) => x.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean)) {
+      granted.add(p === "all privileges" ? "all" : p);
+    }
+  }
+  const want = [...(expected.grants || [])].map((p) => p.toLowerCase()).sort();
+  const got = [...granted].sort();
+  if (!sawGrant) {
+    problems.push({ code: "SERVICE_ROLE_GRANT_MISSING", reason: `no GRANT ... ON public.${table} TO service_role` });
+  } else if (!arraysEqual(got, want)) {
+    problems.push({ code: "SERVICE_ROLE_GRANT_MISMATCH", reason: `service_role grants on public.${table} are [${got.join(", ")}] (expected exactly [${want.join(", ")}])` });
+  }
+  return problems;
 }
 
 // BOUNDED STRUCTURAL proof of an append-guard trigger (Finding 2): an EXACT
@@ -666,7 +717,9 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
  *   - `matrix`: one row per migration -> { present, tables:[{name, declared, backedUniques, missingColumns,
  *       referencedByWrapper}], rpcs:[{name, declared, referencedByWrapper}], wrappers:[{name, exported}] };
  *   - `blockers`: typed SAFE codes (MIGRATION_MISSING / TABLE_MISSING / CONSTRAINT_MISSING / COLUMN_MISSING /
- *       RPC_MISSING / RPC_WRAPPER_MISSING / TABLE_WRAPPER_MISSING / WRAPPER_MISSING) -- never a raw SQL line.
+ *       NAMED_CONSTRAINT_MISSING / SERVICE_ROLE_REVOKE_MISSING / SERVICE_ROLE_GRANT_MISSING /
+ *       SERVICE_ROLE_GRANT_MISMATCH / RPC_MISSING / RPC_WRAPPER_MISSING / TABLE_WRAPPER_MISSING /
+ *       WRAPPER_MISSING) -- never a raw SQL line.
  * `readFile(relPath)` resolves a migration by basename and the wrapper source by the sentinel
  * "supabase.js"; it MUST throw or return null for an absent file (treated as MIGRATION_MISSING / a fatal
  * WRAPPER_SOURCE_MISSING). Pure given `readFile` (no fs/network/db import here).
@@ -726,7 +779,10 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       if (unprovenNamed.length) blockers.push({ code: "NAMED_CONSTRAINT_MISSING", migration: entry.migration, table: t.name, constraints: unprovenNamed.map((r) => r.name), message: `table public.${t.name} has unproven required named constraint(s): ${unprovenNamed.map((r) => `${r.name} (${r.reason})`).join(", ")}` });
       if (missingColumns.length) blockers.push({ code: "COLUMN_MISSING", migration: entry.migration, table: t.name, columns: missingColumns, message: `table public.${t.name} is missing wrapper-required column(s): ${missingColumns.join(", ")}` });
       if (!referencedByWrapper) blockers.push({ code: "TABLE_WRAPPER_MISSING", migration: entry.migration, table: t.name, message: `no wrapper references table public.${t.name}` });
-      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper });
+      // Least-privilege service_role ACL (proven only when declared as a contract requirement for this table).
+      const aclProblems = t.serviceRoleAcl ? auditServiceRoleAcl(masked, t.name, t.serviceRoleAcl) : [];
+      for (const p of aclProblems) blockers.push({ code: p.code, migration: entry.migration, table: t.name, message: `table public.${t.name} service_role ACL: ${p.reason}` });
+      row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper, serviceRoleAcl: t.serviceRoleAcl ? { ok: aclProblems.length === 0, problems: aclProblems.map((p) => p.code) } : null });
     }
     for (const r of entry.rpcs) {
       const actualParams = rpcParamNames(masked, r.name);

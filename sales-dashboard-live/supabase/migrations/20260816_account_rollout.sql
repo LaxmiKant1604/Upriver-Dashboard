@@ -104,16 +104,25 @@ create trigger scheduler_publish_approvals_touch
   for each row execute function public.scheduler_rollout_touch();
 
 -- ---------------------------------------------------------------------------
--- RLS + grants -- service_role only (RLS enabled with NO policies: anon/authenticated see nothing;
--- service_role bypasses RLS). Matches the fail-closed posture of the scheduler tables.
+-- RLS + grants -- service_role gets EXACTLY select/insert/update (RLS enabled with NO policies:
+-- anon/authenticated see nothing; service_role bypasses RLS). Matches the fail-closed posture of the
+-- scheduler tables.
+--
+-- IMPORTANT (least privilege): Supabase applies project-level DEFAULT PRIVILEGES that grant service_role ALL
+-- on every newly created public table, so a plain `grant select,insert,update` would LEAVE service_role with
+-- the full set (delete/truncate/references/trigger/maintain). We therefore REVOKE ALL from service_role too
+-- BEFORE granting, so service_role ends with EXACTLY select/insert/update -- no delete/truncate/references/
+-- trigger/maintain. The revokes name only public/anon/authenticated/service_role, so the table OWNER's
+-- inherent privileges are untouched. The wrappers need only SELECT/INSERT/UPDATE (a revocation/disable is an
+-- UPDATE of approved/enabled=false, never a DELETE).
 -- ---------------------------------------------------------------------------
 alter table public.scheduler_account_rollout enable row level security;
 alter table public.scheduler_rollout_mode enable row level security;
 alter table public.scheduler_publish_approvals enable row level security;
 
-revoke all on public.scheduler_account_rollout from public, anon, authenticated;
-revoke all on public.scheduler_rollout_mode from public, anon, authenticated;
-revoke all on public.scheduler_publish_approvals from public, anon, authenticated;
+revoke all on public.scheduler_account_rollout from public, anon, authenticated, service_role;
+revoke all on public.scheduler_rollout_mode from public, anon, authenticated, service_role;
+revoke all on public.scheduler_publish_approvals from public, anon, authenticated, service_role;
 grant select, insert, update on public.scheduler_account_rollout to service_role;
 grant select, insert, update on public.scheduler_rollout_mode to service_role;
 grant select, insert, update on public.scheduler_publish_approvals to service_role;
