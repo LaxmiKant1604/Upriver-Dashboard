@@ -155,8 +155,9 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const ppcAdsProviders = { getAdsDailySourceRows: ppcRows, getAdsSyncStates: ppcStates, getAdsSyncCoverage: ppcCoverage };
   const loadDerivedContext = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
-  // Gate-7 durable ACCOUNT gate loader (scheduled runs only; the dispatcher enforces it). Trusted + fixed:
-  // RUN_OPERATIONAL_ARGS does not include it, so a per-run caller can never widen (or narrow) account scope.
+  // Gate-7 durable ACCOUNT gate loader (the dispatcher enforces it on EVERY dispatch, scheduled AND manual --
+  // manualReportKeys selects reports only, never accounts). Trusted + fixed: RUN_OPERATIONAL_ARGS does not
+  // include it, so a per-run caller can never widen (or narrow) account scope.
   const loadAccountRollout = async () => getAccountRollout();
 
   // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
@@ -200,6 +201,35 @@ export function buildSchedulerV2Runtime(overrides = {}) {
       return runSchedulerV2Shadow({ ...operational, settings, ...collaborators });
     },
   };
+}
+
+/**
+ * BUILD-TIME trusted CANARY composition (Gate-5/6 style isolated shadow canaries). The operator's reviewed
+ * account scope is fixed HERE, at composition time, as EXACT public account ids -- there is NO per-run
+ * account-scope argument and NO rollout bypass: the composed runtime's trusted rollout loader returns an
+ * allowlist of exactly these ids, and the dispatcher still intersects them with FRESH primary discovery on
+ * every run (an id that is not a currently discovered ACTIVE PRIMARY account selects nothing; dd-secondary
+ * is rejected up front). Everything else -- stores, adapters, saver, control catalog (still fail-closed),
+ * report readiness -- is the ordinary trusted composition; reports must STILL be selected explicitly
+ * (manualReportKeys) and remain readiness-gated.
+ */
+export function buildSchedulerV2CanaryRuntime(overrides = {}) {
+  const { canaryAccountIds, ...rest } = overrides;
+  if (!Array.isArray(canaryAccountIds) || canaryAccountIds.length === 0) {
+    throw new Error("buildSchedulerV2CanaryRuntime requires canaryAccountIds: a non-empty array of exact public account ids (build-time, reviewed).");
+  }
+  const ids = canaryAccountIds.map((id) => String(id ?? "").trim());
+  const bad = ids.filter((id) => id.length === 0 || id.startsWith("dd-secondary:"));
+  if (bad.length) {
+    throw new Error("buildSchedulerV2CanaryRuntime: every canary account id must be a nonblank exact PRIMARY public id (no dd-secondary prefix); refusing to compose (fail closed).");
+  }
+  // The canary's account scope IS its rollout state -- fixed at build time; the dispatcher still validates
+  // each id against fresh primary discovery on every run. `rest` may not smuggle a different rollout source.
+  delete rest.getAccountRollout;
+  return buildSchedulerV2Runtime({
+    ...rest,
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...ids] }),
+  });
 }
 
 // The required env keys the Scheduler-v2 runtime needs (names only -- values are NEVER read into telemetry).

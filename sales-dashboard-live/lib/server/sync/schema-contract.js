@@ -136,22 +136,41 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       {
         name: "scheduler_account_rollout",
         unique: [["account_id"]],
+        // DB-enforced identity integrity, audited by EXACT canonical CHECK bodies scoped to THIS table: a
+        // blank account id or a dd-secondary-prefixed id can never be stored (the resolver also rejects them
+        // at read time -- defense in depth, both layers proven).
+        namedConstraints: [
+          { name: "scheduler_account_rollout_account_id_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "scheduler_account_rollout_account_id_primary_only", kind: "check", canonical: "account_id not like 'dd-secondary:%'" },
+        ],
         keyColumns: ["account_id", "enabled", "note", "created_at", "updated_at"],
       },
       {
         name: "scheduler_rollout_mode",
         unique: [["id"]],
+        namedConstraints: [
+          { name: "scheduler_rollout_mode_singleton", kind: "check", canonical: "id = 1" },
+        ],
         keyColumns: ["id", "all_primary", "updated_at"],
       },
       {
         name: "scheduler_publish_approvals",
         unique: [["report_key", "account_id"]],
+        // Every publish DECISION row (approval or revocation) must be genuinely auditable: nonblank
+        // report_key/account_id, primary-only account identity, and a DB-required nonblank approved_by +
+        // non-null approved_at. An unaudited/blank decision row fails this contract.
+        namedConstraints: [
+          { name: "scheduler_publish_approvals_report_key_nonblank", kind: "check", canonical: "char_length(btrim(report_key)) > 0" },
+          { name: "scheduler_publish_approvals_account_id_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "scheduler_publish_approvals_account_id_primary_only", kind: "check", canonical: "account_id not like 'dd-secondary:%'" },
+          { name: "scheduler_publish_approvals_audited", kind: "check", canonical: "char_length(btrim(approved_by)) > 0 and approved_at is not null" },
+        ],
         keyColumns: ["report_key", "account_id", "approved", "approved_by", "approved_at", "created_at", "updated_at"],
       },
     ],
     rpcs: [],
     wrappers: ["getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer"],
-    note: "Durable account rollout (allowlist + all-primary switch) + publish approvals (PREPARED, UNAPPLIED).",
+    note: "Durable account rollout (allowlist + all-primary switch) + audited publish approvals (PREPARED, UNAPPLIED).",
   },
 ]);
 
@@ -631,6 +650,9 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "getSourceExportCache", "getDailyAdsCoverage", "recordAdsCoverageWindows", "getReportSyncSettings",
   "getAdDailyMetrics", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
   "getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer",
+  // Gate-7 publisher reads: the exact-identity job row (+ its cycle status), the exact-identity shadow
+  // snapshot, and the trusted storage hydration for a storage-backed snapshot payload.
+  "getLatestSyncReportJob", "getReportSnapshot", "getReportSnapshotStoragePayload",
 ]);
 
 /**

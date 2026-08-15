@@ -9,15 +9,20 @@
 //   3. DURABLE account enable -- the Gate-7 account rollout selects the exact account (allowlist/all-primary);
 //   4. EXPLICIT publish approval -- scheduler_publish_approvals.approved === true for the exact
 //                        (report_key, account_id).
-// It publishes ONLY a report job whose derive_status AND save_status succeeded inside a TERMINAL source cycle
-// (succeeded, or partial WITH that exact report succeeded), reads the LATEST scheduler-v2/<reportKey> snapshot
-// for the account, validates payload shape (REPORT_DERIVATIONS.validatePayload) + report version + account +
-// params BEFORE any write, maps to the CANONICAL live report_key/version/params contract (inspected from the
-// real api/datadoe.js routes -- never guessed), and writes via a compare-and-swap primitive so a REPLAY can
-// never duplicate a publish and a NEWER live snapshot always wins. Live LKG is preserved on EVERY failure
-// (no write happens unless every validation passed). Returns TYPED SAFE dispositions only -- never a payload,
-// a raw DB/HTTP error, or a secret. Publishing one (report, account) can never touch another (the CAS
-// primitive is keyed to the one natural-key row). NO browser route imports this module (structurally tested).
+// It publishes ONLY a VALIDATED report job (validated=true, derive+save succeeded) inside a TERMINAL source
+// cycle (succeeded, or partial WITH that exact report succeeded), and loads the shadow snapshot by the EXACT
+// natural identity that job proved it saved -- (scheduler-v2/<reportKey>, accountId, job.snapshot_params_hash)
+// -- never an unrelated "latest" row (job A can never authorize snapshot B). The account gate resolves the
+// durable rollout against REAL fresh primary discovery (memoized per composition), so an undiscovered/stale
+// or dd-secondary account can never publish, even under all_primary=true. It validates payload shape
+// (REPORT_DERIVATIONS.validatePayload) + report version + account + params_hash echo BEFORE any write,
+// hydrates a storage-backed payload through the trusted loader (missing/unreadable => fail closed), maps to
+// the CANONICAL live report_key/version/params contract (inspected from the real api/datadoe.js routes --
+// never guessed), and writes via a compare-and-swap primitive so a REPLAY can never duplicate a publish and
+// a NEWER live snapshot always wins. Live LKG is preserved on EVERY failure (no write happens unless every
+// validation passed). Returns TYPED SAFE dispositions only -- never a payload, a raw DB/HTTP error, or a
+// secret. Publishing one (report, account) can never touch another (the CAS primitive is keyed to the one
+// natural-key row). NO browser route imports this module (structurally tested).
 
 import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
 import { SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
@@ -99,22 +104,29 @@ export const PUBLISH_DISPOSITIONS = Object.freeze([
 
 /**
  * Publish ONE (reportKey, accountId) shadow snapshot to its live identity, fail-closed. `deps` supplies every
- * trusted collaborator (production wiring below; tests inject doubles):
+ * trusted collaborator (the trusted production composition wires them; tests inject doubles -- a caller of
+ * the composed publish() can NEVER supply any of these):
  *   codeReadyKeys        -- default SCHEDULER_V2_READY_REPORT_KEYS (frozen EMPTY => publisher disabled);
  *   getReportSyncSettings() -> rows with { report_key, schedule_enabled };
  *   loadAccountRollout() -> typed rollout state (getSchedulerAccountRollout);
+ *   discoverPrimaryAccounts() -> FRESH (memoized per composition) classified ACTIVE PRIMARY directory rows
+ *                        [{ accountId, ... }] -- the account gate resolves the durable rollout against THIS
+ *                        real discovery, never a synthetic record, so an undiscovered/stale account or a
+ *                        dd-secondary account can never publish, including under all_primary=true;
  *   getPublishApproval(reportKey, accountId) -> { read, approved };
- *   getLatestReportJob(reportKey, accountId) -> { derive_status, save_status, cycle_status } | null
- *                        (the report job in its LATEST cycle + that cycle's status);
- *   getShadowSnapshot(shadowKey, accountId) -> LATEST { payload, params, source_refreshed_at } | null;
+ *   getLatestReportJob(reportKey, accountId) -> { cycle_id, validated, snapshot_params_hash, derive_status,
+ *                        save_status, cycle_status } | null (the LATEST job row + its OWN cycle's status);
+ *   getShadowSnapshot(shadowKey, accountId, paramsHash) -> the EXACT-identity row
+ *                        { params_hash, params, payload, payload_storage_path, source_refreshed_at } | null;
+ *   loadStoragePayload(objectPath) -> parsed payload | null (trusted storage hydration; throws on transport);
  *   publishLive({...}) -> { outcome: "inserted"|"replaced"|"skipped", liveRefreshedAt } (CAS primitive).
  * Returns { disposition, reportKey, accountId, liveReportKey?, paramsHash? } -- typed safe fields ONLY.
  */
 export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId }) {
   const {
     codeReadyKeys = SCHEDULER_V2_READY_REPORT_KEYS,
-    getReportSyncSettings, loadAccountRollout, getPublishApproval,
-    getLatestReportJob, getShadowSnapshot, publishLive,
+    getReportSyncSettings, loadAccountRollout, discoverPrimaryAccounts, getPublishApproval,
+    getLatestReportJob, getShadowSnapshot, loadStoragePayload, publishLive,
   } = deps || {};
   const key = norm(reportKey);
   const acct = norm(accountId);
@@ -131,36 +143,63 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId })
     const row = settings.find((s) => s && String(s.report_key ?? s.reportKey) === key);
     if (!row || row.schedule_enabled !== true) return { disposition: "report-disabled", ...base };
 
-    // GATE 3 -- durable account enable (the Gate-7 rollout must select this EXACT account).
+    // GATE 3 -- durable account enable, resolved against REAL fresh primary discovery (never a synthetic
+    // record): the requested id must be a CURRENTLY DISCOVERED active primary account that the durable
+    // rollout state selects. An unknown/stale id and every dd-secondary id fail here -- including when
+    // all_primary=true (all-primary widens to every DISCOVERED primary account, nothing else).
     const rollout = await loadAccountRollout();
-    const resolved = resolveRolloutAccounts(rollout, [{ accountId: acct }]);
-    if (resolved.accounts.length !== 1) return { disposition: "account-disabled", ...base };
+    const discovered = (await discoverPrimaryAccounts()) || [];
+    const resolved = resolveRolloutAccounts(rollout, discovered);
+    if (!resolved.selectedIds.includes(acct)) return { disposition: "account-disabled", ...base };
 
     // GATE 4 -- explicit durable publish approval for the exact (report, account).
     const approval = await getPublishApproval(key, acct);
     if (!approval || approval.read !== "ok" || approval.approved !== true) return { disposition: "publish-not-approved", ...base };
 
-    // SOURCE-OF-TRUTH -- the report job must have derive+save succeeded inside a TERMINAL cycle (succeeded,
-    // or partial WITH this exact report succeeded). Anything else -- running, failed, blocked, missing -- is
-    // not publishable (live LKG preserved).
+    // SOURCE-OF-TRUTH -- the LATEST report job must be a VALIDATED success (validated=true AND derive+save
+    // succeeded) inside a TERMINAL cycle (succeeded, or partial WITH this exact report succeeded), and must
+    // carry the EXACT snapshot identity it saved (nonblank snapshot_params_hash). Anything else -- running,
+    // failed, blocked, missing, unvalidated, or hash-less -- is not publishable (live LKG preserved).
     const job = await getLatestReportJob(key, acct);
-    const jobOk = !!job && job.derive_status === "succeeded" && job.save_status === "succeeded"
-      && (job.cycle_status === "succeeded" || job.cycle_status === "partial");
+    const jobHash = job ? norm(job.snapshot_params_hash) : "";
+    const jobOk = !!job && job.validated === true
+      && job.derive_status === "succeeded" && job.save_status === "succeeded"
+      && (job.cycle_status === "succeeded" || job.cycle_status === "partial")
+      && jobHash !== "";
     if (!jobOk) return { disposition: "not-successful", ...base };
 
-    // SNAPSHOT -- the exact scheduler-v2/<reportKey> identity, strictly validated BEFORE any write.
-    const shadow = await getShadowSnapshot(shadowSnapshotKey(key), acct);
+    // SNAPSHOT -- loaded by the EXACT natural identity the job proved it saved:
+    // (scheduler-v2/<reportKey>, accountId, job.snapshot_params_hash). A "latest" row or any other snapshot
+    // can never stand in: the returned row must echo the SAME params_hash (job A can never authorize
+    // snapshot B), match the derivation version and the exact account, and carry a nonblank refresh time.
+    const shadow = await getShadowSnapshot(shadowSnapshotKey(key), acct, jobHash);
     const entry = REPORT_DERIVATIONS[key];
     const params = shadow && typeof shadow.params === "object" && shadow.params != null ? shadow.params : null;
-    const payload = shadow ? shadow.payload : null;
+    const hashOk = !!shadow && norm(shadow.params_hash) === jobHash;
     const versionOk = !!params && params.reportVersion === (entry && entry.snapshotVersion);
     const accountOk = !!params && norm(params.accountId) === acct;
-    const payloadOk = !!entry && typeof entry.validatePayload === "function" && payload != null && entry.validatePayload(payload) === true;
+    const refreshedOk = !!shadow && norm(shadow.source_refreshed_at) !== "";
+    if (!shadow || !hashOk || !versionOk || !accountOk || !refreshedOk) return { disposition: "invalid-snapshot", ...base };
+
+    // PAYLOAD -- inline, or HYDRATED from the trusted storage pointer. A snapshot with neither an inline
+    // payload nor a readable storage payload is unpublishable (missing/unreadable storage fails CLOSED and
+    // the live LKG stays untouched).
+    let payload = shadow.payload;
+    if (payload == null) {
+      const storagePath = norm(shadow.payload_storage_path);
+      if (!storagePath || typeof loadStoragePayload !== "function") return { disposition: "invalid-snapshot", ...base };
+      try {
+        payload = await loadStoragePayload(storagePath);
+      } catch (_e) {
+        payload = null;
+      }
+      if (payload == null) return { disposition: "invalid-snapshot", ...base };
+    }
+    const payloadOk = !!entry && typeof entry.validatePayload === "function" && entry.validatePayload(payload) === true;
     // A derived payload that DECLARES itself unavailable is structurally valid but must NEVER be promoted
     // over the live row (the live LKG for that report/account stays untouched).
     const availableOk = !(payload && payload.dataUnavailable === true);
-    const refreshedOk = !!shadow && norm(shadow.source_refreshed_at) !== "";
-    if (!shadow || !versionOk || !accountOk || !payloadOk || !availableOk || !refreshedOk) return { disposition: "invalid-snapshot", ...base };
+    if (!payloadOk || !availableOk) return { disposition: "invalid-snapshot", ...base };
 
     // LIVE identity -- canonical mapping; a missing/malformed planned param fails closed.
     const liveParams = contract.liveParams(params);

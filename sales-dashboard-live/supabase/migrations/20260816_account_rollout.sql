@@ -27,16 +27,22 @@ create table if not exists public.scheduler_account_rollout (
   enabled boolean not null default false,
   note text,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  -- DB-enforced identity integrity: a blank id or a dd-secondary-prefixed id can never be stored, so a
+  -- malformed allowlist row cannot exist to be mis-read (the resolver rejects them too; defense in depth).
+  constraint scheduler_account_rollout_account_id_nonblank check (char_length(btrim(account_id)) > 0),
+  constraint scheduler_account_rollout_account_id_primary_only check (account_id not like 'dd-secondary:%')
 );
 
 -- ---------------------------------------------------------------------------
 -- 2. scheduler_rollout_mode -- the SINGLETON deliberate all-primary switch (default false).
 -- ---------------------------------------------------------------------------
 create table if not exists public.scheduler_rollout_mode (
-  id smallint primary key default 1 check (id = 1),
+  id smallint primary key default 1,
   all_primary boolean not null default false,
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  -- Named singleton constraint so the static schema audit proves it exactly.
+  constraint scheduler_rollout_mode_singleton check (id = 1)
 );
 -- Seed the singleton row so reads are deterministic; never overwrites an existing deliberate value.
 insert into public.scheduler_rollout_mode (id, all_primary) values (1, false)
@@ -49,11 +55,17 @@ create table if not exists public.scheduler_publish_approvals (
   report_key text not null,
   account_id text not null,
   approved boolean not null default false,
-  approved_by text,
-  approved_at timestamptz,
+  -- EVERY row is an explicit publish DECISION (an approval OR a revocation) and must be auditable: WHO
+  -- decided and WHEN are DB-required, so an unaudited/blank decision row can never exist.
+  approved_by text not null,
+  approved_at timestamptz not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  primary key (report_key, account_id)
+  primary key (report_key, account_id),
+  constraint scheduler_publish_approvals_report_key_nonblank check (char_length(btrim(report_key)) > 0),
+  constraint scheduler_publish_approvals_account_id_nonblank check (char_length(btrim(account_id)) > 0),
+  constraint scheduler_publish_approvals_account_id_primary_only check (account_id not like 'dd-secondary:%'),
+  constraint scheduler_publish_approvals_audited check (char_length(btrim(approved_by)) > 0 and approved_at is not null)
 );
 
 -- ---------------------------------------------------------------------------

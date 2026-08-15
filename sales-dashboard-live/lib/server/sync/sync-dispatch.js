@@ -200,17 +200,18 @@ export async function runSchedulerV2Shadow({
     return { ...drainedNoOp(), selected: [] };
   }
 
-  // Gate-7 DURABLE ACCOUNT ROLLOUT -- an ADDITIONAL, INDEPENDENT gate for SCHEDULED runs only (a manual
-  // shadow canary stays explicit and isolated: its account scope comes from the operator's reviewed run,
-  // never from the durable rollout). The rollout state is loaded BEFORE discovery so a read/schema failure
-  // -- or the default zero-account state -- performs ZERO discovery/cycle/store/DataDoe work (fail closed;
-  // no wildcard, no implicit fallback). A caller cannot override the loader (runtime composition fixes it).
-  let rolloutState = null;
-  if (!manual) {
-    if (typeof loadAccountRollout !== "function") {
-      throw new Error("runSchedulerV2Shadow: a SCHEDULED run requires the trusted durable account-rollout loader (loadAccountRollout); refusing to dispatch (fail closed).");
-    }
-    rolloutState = await loadAccountRollout();
+  // Gate-7 DURABLE ACCOUNT ROLLOUT -- an ADDITIONAL, INDEPENDENT gate for EVERY dispatch, SCHEDULED and
+  // MANUAL alike. manualReportKeys selects REPORTS only; it can never widen ACCOUNT scope -- the durable
+  // rollout state governs which accounts may spend, always. (An isolated canary that needs a specific
+  // account scope uses the BUILD-TIME trusted canary composition -- buildSchedulerV2CanaryRuntime -- whose
+  // exact ids are still intersected with FRESH primary discovery below; there is NO per-run bypass.) The
+  // rollout state is loaded BEFORE discovery so a read/schema failure -- or the default zero-account state
+  // -- performs ZERO discovery/cycle/store/DataDoe work (fail closed; no wildcard, no implicit fallback).
+  if (typeof loadAccountRollout !== "function") {
+    throw new Error("runSchedulerV2Shadow: every dispatch (scheduled AND manual) requires the trusted durable account-rollout loader (loadAccountRollout); refusing to dispatch (fail closed).");
+  }
+  const rolloutState = await loadAccountRollout();
+  {
     // Probe the resolver with an EMPTY directory so the state's own normalization decides: a failed read,
     // or an allowlist with no VALID id (blank / dd-secondary-prefixed rows are dropped by the same shared
     // implementation), can never select an account -- so neither spends even the read-only discovery call.
@@ -250,18 +251,15 @@ export async function runSchedulerV2Shadow({
     .map((a) => ({ accountId: a.accountId ?? a.id, country: a.country, currency: a.currency, name: a.name }))
     .filter((a) => a.accountId && bucketForCountry(a.country) === bucket);
 
-  // Gate-7 rollout FILTER (scheduled only; applied BEFORE any cycle/source planning): keep exactly the
-  // discovered primary accounts the durable state selects -- allowlist rows by EXACT public id, or every
-  // primary account under the deliberate all-primary switch. Stale/unknown allowlist rows match nothing and
-  // spend nothing. Zero selected accounts => a drained no-op with ZERO cycle/store/DataDoe writes.
-  let rolloutInfo = null;
-  if (!manual) {
-    const resolved = resolveRolloutAccounts(rolloutState, bucketAccounts);
-    bucketAccounts = resolved.accounts;
-    rolloutInfo = { selected: resolved.selectedIds.length, staleIds: resolved.staleIds, reason: resolved.reason };
-    if (bucketAccounts.length === 0) {
-      return drainedNoOp({ unavailableAccounts: unavailable, accountRollout: rolloutInfo });
-    }
+  // Gate-7 rollout FILTER (EVERY dispatch, scheduled AND manual; applied BEFORE any cycle/source planning):
+  // keep exactly the discovered primary accounts the durable state selects -- allowlist rows by EXACT public
+  // id, or every primary account under the deliberate all-primary switch. Stale/unknown allowlist rows match
+  // nothing and spend nothing. Zero selected accounts => a drained no-op with ZERO cycle/store/DataDoe writes.
+  const resolved = resolveRolloutAccounts(rolloutState, bucketAccounts);
+  bucketAccounts = resolved.accounts;
+  const rolloutInfo = { selected: resolved.selectedIds.length, staleIds: resolved.staleIds, reason: resolved.reason };
+  if (bucketAccounts.length === 0) {
+    return drainedNoOp({ unavailableAccounts: unavailable, accountRollout: rolloutInfo });
   }
 
   const rollup = {

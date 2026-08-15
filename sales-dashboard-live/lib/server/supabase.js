@@ -1053,6 +1053,44 @@ export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, l
   });
 }
 
+/**
+ * Gate-7 publisher read: the LATEST sync_report_jobs row for one exact (report_key, account_id) with the
+ * fields the publisher's success gate REQUIRES bound together -- cycle_id, validated, snapshot_params_hash,
+ * derive/save status -- plus the OWNING cycle's status via the cycle_id FK embed (so "terminal cycle" is
+ * proven against the exact cycle this job ran in, never a different cycle). Returns a TYPED flat row or null.
+ */
+export async function getLatestSyncReportJob(reportKey, accountId) {
+  const query = new URLSearchParams({
+    select: "cycle_id,report_key,account_id,derive_status,save_status,validated,snapshot_params_hash,created_at,sync_cycles(status)",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "created_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/sync_report_jobs?${query}`);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return null;
+  const cycle = Array.isArray(row.sync_cycles) ? row.sync_cycles[0] : row.sync_cycles;
+  return {
+    cycle_id: row.cycle_id,
+    report_key: row.report_key,
+    account_id: row.account_id,
+    derive_status: row.derive_status,
+    save_status: row.save_status,
+    validated: row.validated === true,
+    snapshot_params_hash: row.snapshot_params_hash ?? null,
+    cycle_status: cycle && typeof cycle === "object" ? (cycle.status ?? null) : null,
+  };
+}
+
+// Gate-7 publisher hydration: a report snapshot whose payload was offloaded to Storage is read back through
+// this ONE trusted loader (same private bucket as every dashboard snapshot object). Returns the parsed JSON
+// payload, or null when the object is absent; throws on a transport failure -- the publisher fails closed on
+// BOTH (live last-known-good is preserved).
+export async function getReportSnapshotStoragePayload(objectPath) {
+  return getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath);
+}
+
 // Injected adapters for the ATOMIC source-cache save (lib/server/sync/source-cache.js):
 // Storage put/get/delete on the private source-cache bucket, and the source_export_cache
 // pointer read/write. Kept as adapters so the atomic algorithm stays offline-testable.
@@ -1442,7 +1480,10 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
   const replaced = await request(`/rest/v1/report_snapshots?${filter}`, {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
-    body: { params: body.params, payload: body.payload, payload_bytes: body.payload_bytes, source_refreshed_at: body.source_refreshed_at },
+    // The replacement writes the INLINE payload, so the storage pointer MUST be cleared explicitly: a
+    // strictly-older live row that was storage-backed would otherwise keep a stale payload_storage_path
+    // beside the new inline payload and readers could serve the OLD stored object.
+    body: { params: body.params, payload: body.payload, payload_storage_path: null, payload_bytes: body.payload_bytes, source_refreshed_at: body.source_refreshed_at },
   });
   if (Array.isArray(replaced) && replaced.length > 0) return { outcome: "replaced", liveRefreshedAt: sourceRefreshedAt };
   // Neither inserted nor replaced: the live row exists and is NOT older. Read its timestamp for classification.

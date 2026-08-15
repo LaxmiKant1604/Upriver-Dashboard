@@ -3,7 +3,10 @@
 // Proves, with ZERO real DataDoe/Supabase (every backend injected; the wrapper tests stub global fetch):
 //   1.  DEFAULT locked/empty controls => a real scheduled invocation performs ZERO discovery / cycle /
 //       export / publish work (drained no-op before any I/O);
-//   2.  a scheduled run with READY reports but NO trusted rollout loader REFUSES to dispatch (fail closed);
+//   2.  EVERY dispatch (scheduled AND manual) with READY reports but NO trusted rollout loader REFUSES to
+//       run (fail closed) -- a manual production run can never bypass the durable rollout; manualReportKeys
+//       selects REPORTS only, and the BUILD-TIME trusted canary composition (exact ids, validated against
+//       fresh primary discovery) is the ONLY way to scope an isolated canary -- no per-run bypass exists;
 //   3.  a rollout read/schema failure selects ZERO accounts BEFORE discovery;
 //   4.  the DEFAULT durable state (no rows, all_primary=false) selects ZERO accounts BEFORE discovery;
 //   5.  an exact-id allowlist selects ONLY the enabled account out of a 30-account discovery -- the other
@@ -17,10 +20,18 @@
 //   10. the Supabase wrappers are typed + fail-closed (ok / schema-missing / read-failed) and the CAS
 //       publish primitive is insert-if-absent + strictly-older guarded PATCH on the ONE natural-key row;
 //   11. the publisher is DISABLED BY DEFAULT (code lock) and publishes ONLY when code readiness + durable
-//       report enable + durable account enable + explicit publish approval ALL hold;
-//   12. publish exactly once; a replay is idempotent (already-current); a newer live snapshot wins
-//       (newer-live); failed/blocked/running/invalid/stale snapshots NEVER touch live (LKG preserved);
-//       wrong report/account/params/version can never publish; dispositions are typed-safe only;
+//       report enable + durable account enable (resolved against REAL memoized fresh discovery -- an
+//       undiscovered/stale or dd-secondary account can never publish, even under all_primary) + explicit
+//       publish approval ALL hold; the trusted composition's publish(reportKey, accountId) caller can
+//       inject NOTHING (no code readiness, no collaborator);
+//   12. publication binds to the EXACT successful job snapshot: a VALIDATED derive+save-succeeded job in a
+//       terminal cycle names its snapshot_params_hash, the shadow row is loaded by that exact natural
+//       identity and must echo the same hash (job A can never authorize snapshot B; blank/missing/
+//       mismatched hashes never publish); storage-backed payloads hydrate through the trusted loader and a
+//       missing/unreadable object fails CLOSED; publish exactly once; replay idempotent (already-current);
+//       a newer live row wins byte-identically (newer-live); a CAS replacement CLEARS payload_storage_path;
+//       failed/blocked/running/invalid/unavailable/stale snapshots NEVER touch live (LKG preserved);
+//       unaudited/blank approval schema rows fail the schema contract (EM1/EM2);
 //   13. all 13 scheduler->live report_key/reportVersion/params mappings are STATICALLY PINNED against the
 //       real live route truths (api/datadoe.js literals + the insight modules' exported constants);
 //   14. STRUCTURAL isolation: no api/ route (browser-reachable surface) imports the publisher or the
@@ -48,8 +59,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let resolveRolloutAccounts;
 let runSchedulerV2Shadow;
-let buildSchedulerV2Runtime, RUN_OPERATIONAL_ARGS;
+let buildSchedulerV2Runtime, buildSchedulerV2CanaryRuntime, RUN_OPERATIONAL_ARGS;
 let SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, PUBLISH_DISPOSITIONS, publishSchedulerV2Snapshot;
+let buildSchedulerV2Publisher;
+let auditSchemaContract;
 let SCHEDULER_V2_READY_REPORT_KEYS;
 let SHADOW_PLANNED_REPORT_KEYS;
 let paramsHashFor;
@@ -186,9 +199,11 @@ const assertZeroWork = (r, dd, saver, counts, { discovered = false } = {}) => {
 // ---- publisher fixtures --------------------------------------------------------------------------
 
 const SHADOW_TS = "2026-08-14T10:00:00.000Z";
+const JOB_HASH = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"; // the exact snapshot identity the job saved
 function mkPubDeps(over = {}) {
-  const calls = { settings: 0, rollout: 0, approval: 0, job: 0, shadow: 0, publish: [] };
+  const calls = { settings: 0, rollout: 0, discover: 0, approval: 0, job: 0, shadow: 0, storage: 0, publish: [] };
   const shadow = {
+    params_hash: JOB_HASH,
     params: { reportVersion: dash("sales", "movers") + "/v2d-1", accountId: "IN1", to: "2026-08-14" },
     // A payload the REAL sales-movers derivation validator accepts as an AVAILABLE result.
     payload: {
@@ -196,16 +211,30 @@ function mkPubDeps(over = {}) {
       salesLatestDate: "2026-08-13", currencies: ["INR"], buyBoxEvaluated: false,
       inventoryAvailable: true, inventorySnapshotDate: "2026-08-13", windows: { recent: {}, prior: {} },
     },
+    payload_storage_path: null,
     source_refreshed_at: SHADOW_TS,
   };
-  const seen = { shadowKey: null, shadowAcct: null };
+  const seen = { shadowKey: null, shadowAcct: null, shadowHash: null, storagePath: null };
   const deps = {
     codeReadyKeys: [dash("sales", "movers")],
     getReportSyncSettings: async () => { calls.settings += 1; return [{ report_key: dash("sales", "movers"), schedule_enabled: true }]; },
     loadAccountRollout: async () => { calls.rollout += 1; return { read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }; },
+    // REAL-shaped fresh discovery: IN1 is a currently discovered active primary account.
+    discoverPrimaryAccounts: async () => { calls.discover += 1; return "discovered" in over ? over.discovered : [IN1, ...US_ACCTS]; },
     getPublishApproval: async () => { calls.approval += 1; return { read: "ok", approved: true }; },
-    getLatestReportJob: async () => { calls.job += 1; return { derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded" }; },
-    getShadowSnapshot: async (k, a) => { calls.shadow += 1; seen.shadowKey = k; seen.shadowAcct = a; return "shadow" in over ? over.shadow : shadow; },
+    getLatestReportJob: async () => {
+      calls.job += 1;
+      return "job" in over ? over.job : {
+        cycle_id: "cyc-1", validated: true, snapshot_params_hash: JOB_HASH,
+        derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded",
+      };
+    },
+    getShadowSnapshot: async (k, a, h) => { calls.shadow += 1; seen.shadowKey = k; seen.shadowAcct = a; seen.shadowHash = h; return "shadow" in over ? over.shadow : shadow; },
+    loadStoragePayload: async (p) => {
+      calls.storage += 1; seen.storagePath = p;
+      if (over.storageThrows) throw new Error("storage transport boom");
+      return "storagePayload" in over ? over.storagePayload : null;
+    },
     publishLive: async (args) => {
       calls.publish.push(args);
       if (over.publishThrows) throw new Error("transport boom");
@@ -387,13 +416,86 @@ test("(B9) all-primary AUTO-INCLUDES a newly connected primary account with no c
   assert.deepEqual((await after.promise).accountsDispatched, ["IN1", "IN2"], "IN2 joins the moment discovery returns it");
 });
 
-test("(B10) a MANUAL shadow canary is unchanged: no rollout loader needed, accounts NOT rollout-filtered", async () => {
+test("(B10) a MANUAL production run can NOT bypass the durable rollout: reports-only selection, account scope always durable", async () => {
   const GK = SHADOW_PLANNED_REPORT_KEYS[0];
-  const { promise } = dispatch({ manualReportKeys: [GK], controlCatalog: mkCatalog([GK]), accounts: US_ACCTS });
-  const r = await promise; // no loadAccountRollout passed -- must NOT throw
-  assert.equal(r.manual, true);
-  assert.deepEqual(r.accountsDispatched, ["A1"], "manual scope = the operator's explicit run, not the durable rollout");
-  assert.equal(r.accountRollout, null, "no rollout filtering on the manual path");
+  // (a) manual WITHOUT the trusted loader REFUSES to dispatch (no bypass exists).
+  const a = dispatch({ manualReportKeys: [GK], controlCatalog: mkCatalog([GK]), loadAccountRollout: undefined });
+  await assert.rejects(a.promise, /trusted durable account-rollout loader/);
+  assert.equal(a.counts.discover + a.counts.opens + a.dd.totalCreates() + a.saver.calls, 0, "zero I/O before the refusal");
+  // (b) manual + the DEFAULT durable zero state => drained no-op BEFORE discovery.
+  const b = dispatch({ manualReportKeys: [GK], controlCatalog: mkCatalog([GK]), loadAccountRollout: zeroDefaultState });
+  const rb = await b.promise;
+  assertZeroWork(rb, b.dd, b.saver, b.counts);
+  assert.deepEqual(rb.accountRollout, { selected: 0, reason: "zero-accounts-enabled" });
+  // (c) manual + a rollout READ FAILURE => drained no-op BEFORE discovery (fail closed).
+  const c = dispatch({ manualReportKeys: [GK], controlCatalog: mkCatalog([GK]), loadAccountRollout: async () => ({ read: "read-failed", allPrimary: true, enabledAccountIds: [] }) });
+  const rc = await c.promise;
+  assertZeroWork(rc, c.dd, c.saver, c.counts);
+  // (d) manual + a durable allowlist: manualReportKeys still selects the REPORT; the ACCOUNT scope is the
+  //     durable state's -- an account outside it never dispatches.
+  const d = dispatch({
+    manualReportKeys: [GK], controlCatalog: mkCatalog([GK]),
+    accounts: [...US_ACCTS, { accountId: "A2", country: "US", currency: "USD", name: "Two" }],
+    loadAccountRollout: okAllowlist(["A1"]),
+  });
+  const rd = await d.promise;
+  assert.equal(rd.manual, true);
+  assert.deepEqual(rd.selected, [GK], "manualReportKeys selected the report");
+  assert.deepEqual(rd.accountsDispatched, ["A1"], "the durable allowlist bounded the manual run's accounts");
+  assert.deepEqual(rd.accountRollout, { selected: 1, staleIds: [], reason: "allowlist" });
+});
+
+test("(B11) the BUILD-TIME trusted canary composition scopes accounts with NO per-run bypass", async () => {
+  const GK = SHADOW_PLANNED_REPORT_KEYS[0];
+  const SOURCE_METHODS = ["openCycle", "claimCycle", "getCycle", "upsertSourceJob", "listSourceJobs", "upsertSourceJobOwners",
+    "listSourceJobOwners", "listSourceJobsForOwners", "recordSourceOwnerStale", "claimExportAttempt", "recordExportCreated",
+    "loadSourceRows", "saveSourceRows", "recordSourceSuccess", "recordSourceFailure", "updateCycleCounts", "finalizeCycle"];
+  const REPORT_METHODS = ["listSourceJobs", "upsertReportJob", "listReportJobs", "claimReportDerive", "recordReportBlocked",
+    "recordReportFailure", "recordReportSuccess"];
+  const pick = (store, names) => Object.fromEntries(names.map((n) => [n, store[n].bind(store)]));
+  const mkCanary = (ids, directory) => {
+    const backing = makeStore();
+    const dd = makeDataDoe();
+    const saver = makeSaver();
+    const rt = buildSchedulerV2CanaryRuntime({
+      canaryAccountIds: ids,
+      connections: CONNS,
+      makeSourceStore: () => pick(backing, SOURCE_METHODS),
+      makeReportStore: () => pick(backing, REPORT_METHODS),
+      makeDataDoeAdapter: () => dd,
+      makeShadowSnapshotSaver: () => saver,
+      fetchAccounts: async () => directory,
+      getAdMetrics: async () => [], getCoverageState: async () => ({ windows: [], status: "missing", read: "ok" }),
+      getAdsDailySourceRows: async () => [], getAdsSyncStates: async () => [],
+      getAdsSyncCoverage: async () => ({ windows: [], status: "missing", read: "ok" }),
+      getReportSyncSettings: async () => [],
+      controlCatalog: mkCatalog([GK]),
+    });
+    return { rt, dd, saver };
+  };
+  const dir = [{ id: "A1", country: "US", currency: "USD", name: "One" }, { id: "A2", country: "US", currency: "USD", name: "Two" }];
+  // (a) exact reviewed ids run EXACTLY those accounts (manual reports selection unchanged).
+  const good = mkCanary(["A1"], dir);
+  const rg = await good.rt.run({ bucket: "us", cycleDate: "2026-08-16", asOf: ASOF, manualReportKeys: [GK] });
+  assert.deepEqual(rg.accountsDispatched, ["A1"], "the canary runs exactly its reviewed account");
+  // (b) an id that fresh discovery does NOT return selects NOTHING (validated against real discovery).
+  const ghost = mkCanary(["GHOST9"], dir);
+  const rgh = await ghost.rt.run({ bucket: "us", cycleDate: "2026-08-16", asOf: ASOF, manualReportKeys: [GK] });
+  assert.equal(rgh.cycleId, null, "an undiscovered canary id opens no cycle");
+  assert.equal(ghost.dd.totalCreates() + ghost.saver.calls, 0, "and spends nothing");
+  assert.deepEqual(rgh.accountRollout, { selected: 0, staleIds: ["GHOST9"], reason: "allowlist" });
+  // (c) build-time validation: empty / blank / dd-secondary ids REFUSE to compose.
+  for (const bad of [[], [""], ["  "], [SEC_ID], ["A1", SEC_ID]]) {
+    assert.throws(() => mkCanary(bad, dir), /canary/i, JSON.stringify(bad) + " must not compose");
+  }
+  // (d) NO per-run bypass: run-level rollout/scope args are dropped (RUN_OPERATIONAL_ARGS is pinned).
+  const pinned = mkCanary(["A1"], dir);
+  const rp = await pinned.rt.run({
+    bucket: "us", cycleDate: "2026-08-17", asOf: ASOF, manualReportKeys: [GK],
+    loadAccountRollout: okAllPrimary, getAccountRollout: okAllPrimary,
+    canaryAccountIds: ["A1", "A2"], discoverAccounts: async () => dir,
+  });
+  assert.deepEqual(rp.accountsDispatched, ["A1"], "a per-run widening attempt changes nothing");
 });
 
 // =================================================================================================
@@ -509,8 +611,11 @@ test("(D3) publishLiveSnapshotIfNewer: insert-if-absent, strictly-older guarded 
     assert.equal(s.calls[0].body.account_id, "IN1");
     assert.equal(s.calls[0].body.source_refreshed_at, SHADOW_TS);
   } finally { s.restore(); }
-  // (b) replaced: conflict, live row strictly OLDER -- the guarded PATCH targets ONLY the one natural-key row.
-  s = stubFetch((rec, n) => (n === 1 ? { json: [] } : { json: [{ report_key: SM }] }));
+  // (b) replaced: conflict, live row strictly OLDER -- the guarded PATCH targets ONLY the one natural-key
+  //     row. The scenario starts from an older STORAGE-BACKED live row: a successful replacement writes the
+  //     inline payload AND explicitly clears payload_storage_path, so no stale storage pointer can survive
+  //     beside the new inline payload.
+  s = stubFetch((rec, n) => (n === 1 ? { json: [] } : { json: [{ report_key: SM, payload_storage_path: null }] }));
   try {
     const r = await publishLiveSnapshotIfNewer(args);
     assert.equal(r.outcome, "replaced");
@@ -520,13 +625,20 @@ test("(D3) publishLiveSnapshotIfNewer: insert-if-absent, strictly-older guarded 
     assert.ok(patchUrl.includes("account_id=eq.IN1"), "pinned to the exact account");
     assert.ok(patchUrl.includes("params_hash=eq." + args.paramsHash), "pinned to the exact params identity");
     assert.ok(patchUrl.includes("source_refreshed_at=lt." + SHADOW_TS), "replaces ONLY a strictly-older live row");
+    assert.ok(Object.prototype.hasOwnProperty.call(s.calls[1].body, "payload_storage_path"), "the PATCH body carries the pointer column explicitly");
+    assert.equal(s.calls[1].body.payload_storage_path, null, "replacement CLEARS the storage pointer (an older storage-backed row cannot keep serving its old object)");
+    assert.deepEqual(s.calls[1].body.payload, args.payload, "the inline payload is what replaced it");
   } finally { s.restore(); }
-  // (c) skipped: conflict and NOT older -- live wins; the live timestamp is read back for classification.
+  // (c) skipped: conflict and NOT older -- live wins byte-identically. The guarded PATCH matched ZERO rows
+  //     (its strictly-older filter excluded the equal/newer row), so the ONLY calls are the idempotent
+  //     insert attempt, the zero-row PATCH, and a plain read-back -- no write ever touched the live row.
   s = stubFetch((rec, n) => (n <= 2 ? { json: [] } : { json: [{ source_refreshed_at: "2026-08-20T00:00:00.000Z" }] }));
   try {
     const r = await publishLiveSnapshotIfNewer(args);
     assert.deepEqual(r, { outcome: "skipped", liveRefreshedAt: "2026-08-20T00:00:00.000Z" });
+    assert.equal(s.calls.length, 3, "exactly insert-attempt + guarded PATCH + read-back");
     assert.equal(s.calls[2].method, "GET", "the third call is a read, never a write");
+    assert.ok(decodeURIComponent(s.calls[1].url).includes("source_refreshed_at=lt." + SHADOW_TS), "the equal/newer live row was excluded by the strictly-older filter (byte-identical)");
   } finally { s.restore(); }
 });
 
@@ -540,7 +652,9 @@ test("(E1) DEFAULT = code-locked: the frozen-empty ready set disables publishing
   const res = await publishSchedulerV2Snapshot(h.deps, { reportKey: SM, accountId: "IN1" });
   observedDispositions.add(res.disposition);
   assert.equal(res.disposition, "code-locked");
-  assert.deepEqual([h.calls.settings, h.calls.rollout, h.calls.approval, h.calls.job, h.calls.shadow, h.calls.publish.length], [0, 0, 0, 0, 0, 0], "zero collaborator calls");
+  assert.deepEqual(
+    [h.calls.settings, h.calls.rollout, h.calls.discover, h.calls.approval, h.calls.job, h.calls.shadow, h.calls.storage, h.calls.publish.length],
+    [0, 0, 0, 0, 0, 0, 0, 0], "zero collaborator calls");
 });
 
 test("(E2) each gate fails closed with a typed disposition and ZERO publish calls", async () => {
@@ -559,40 +673,62 @@ test("(E2) each gate fails closed with a typed disposition and ZERO publish call
     assert.equal(res.disposition, want);
     assert.equal(calls.publish.length, 0, want + " never publishes");
   }
-  // A dd-secondary account can never publish, even under all-primary.
-  const sec = await pub({ deps: { loadAccountRollout: okAllPrimary } }, { reportKey: SM, accountId: SEC_ID });
-  assert.equal(sec.res.disposition, "account-disabled");
-  assert.equal(sec.calls.publish.length, 0);
 });
 
-test("(E3) only a derive+save-SUCCEEDED job in a TERMINAL succeeded/partial cycle can publish; all else preserves live LKG", async () => {
+test("(E2b) the account gate resolves against REAL fresh discovery: undiscovered and dd-secondary accounts can NEVER publish, even under all_primary", async () => {
+  // (a) allowlisted but NOT currently discovered => account-disabled (a stale allowlist row publishes nothing).
+  const stale = await pub({ discovered: US_ACCTS }); // IN1 enabled, but discovery has no IN1
+  assert.equal(stale.res.disposition, "account-disabled");
+  // (b) all_primary=true + undiscovered account => account-disabled (all-primary widens ONLY to discovered primaries).
+  const ghost = await pub({ deps: { loadAccountRollout: okAllPrimary } , discovered: US_ACCTS }, { reportKey: SM, accountId: "GHOST9" });
+  assert.equal(ghost.res.disposition, "account-disabled");
+  // (c) a DISCOVERED dd-secondary account (secondary connection configured => classified active) still cannot
+  //     publish under all_primary: the resolver rejects the prefix.
+  const sec = await pub({ deps: { loadAccountRollout: okAllPrimary }, discovered: [IN1, SEC_ROW] }, { reportKey: SM, accountId: SEC_ID });
+  assert.equal(sec.res.disposition, "account-disabled");
+  // (d) the discovery IS consulted on the happy path (never a synthetic record).
+  const ok = await pub({});
+  assert.equal(ok.res.disposition, "published");
+  assert.equal(ok.calls.discover, 1, "the account gate read the real discovery exactly once");
+  for (const r of [stale, ghost, sec]) assert.equal(r.calls.publish.length, 0, "no gated case ever published");
+});
+
+test("(E3) only a VALIDATED derive+save-SUCCEEDED job (with its exact snapshot hash) in a TERMINAL succeeded/partial cycle can publish", async () => {
+  const GOOD = { cycle_id: "cyc-1", validated: true, snapshot_params_hash: JOB_HASH, derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded" };
   const bad = [
     null,
-    { derive_status: "failed", save_status: "pending", cycle_status: "succeeded" },
-    { derive_status: "succeeded", save_status: "failed", cycle_status: "succeeded" },
-    { derive_status: "skipped", save_status: "skipped", cycle_status: "succeeded" }, // blocked report
-    { derive_status: "succeeded", save_status: "succeeded", cycle_status: "running" },
-    { derive_status: "succeeded", save_status: "succeeded", cycle_status: "failed" },
-    { derive_status: "succeeded", save_status: "succeeded", cycle_status: null },
+    { ...GOOD, derive_status: "failed", save_status: "pending" },
+    { ...GOOD, save_status: "failed" },
+    { ...GOOD, derive_status: "skipped", save_status: "skipped" }, // blocked report
+    { ...GOOD, cycle_status: "running" },
+    { ...GOOD, cycle_status: "failed" },
+    { ...GOOD, cycle_status: null },
+    { ...GOOD, validated: false },                       // an unvalidated "success" can never publish
+    { ...GOOD, snapshot_params_hash: null },             // a hash-less job authorizes NO snapshot
+    { ...GOOD, snapshot_params_hash: "" },
+    { ...GOOD, snapshot_params_hash: "   " },
   ];
   for (const job of bad) {
-    const { res, calls } = await pub({ deps: { getLatestReportJob: async () => job } });
-    assert.equal(res.disposition, "not-successful");
-    assert.equal(calls.publish.length, 0, "live LKG untouched");
+    const { res, calls } = await pub({ job });
+    assert.equal(res.disposition, "not-successful", JSON.stringify(job && { v: job.validated, d: job.derive_status, s: job.save_status, c: job.cycle_status, h: job.snapshot_params_hash }));
+    assert.equal(calls.publish.length + calls.shadow, 0, "no snapshot read, no publish -- live LKG untouched");
   }
-  const partial = await pub({ deps: { getLatestReportJob: async () => ({ derive_status: "succeeded", save_status: "succeeded", cycle_status: "partial" }) } });
+  const partial = await pub({ job: { ...GOOD, cycle_status: "partial" } });
   assert.equal(partial.res.disposition, "published", "a partial cycle WITH this exact report succeeded may publish");
 });
 
-test("(E4) an unavailable/blocked/invalid/truncated/stale/null/malformed snapshot can NEVER publish", async () => {
+test("(E4) an unavailable/blocked/invalid/truncated/stale/null/malformed/mismatched snapshot can NEVER publish", async () => {
   const good = mkPubDeps().shadow;
   const variants = [
-    ["null snapshot", null],
+    ["null snapshot (job hash points at nothing)", null],
+    ["MISMATCHED params_hash echo (job A cannot authorize snapshot B)", { ...good, params_hash: "b".repeat(40) }],
+    ["blank params_hash echo", { ...good, params_hash: "" }],
     ["wrong report version", { ...good, params: { ...good.params, reportVersion: SM + "/v2d-0" } }],
     ["wrong account identity", { ...good, params: { ...good.params, accountId: "US9" } }],
     ["payload fails the derivation validator", { ...good, payload: { accountId: "IN1", asOf: "2026-08-14" } }],
     ["structurally-valid but UNAVAILABLE payload", { ...good, payload: { accountId: "IN1", asOf: "2026-08-14", dataUnavailable: true, rows: [], catalogBrands: [], salesLatestDate: null } }],
-    ["null payload", { ...good, payload: null }],
+    ["null payload with NO storage pointer", { ...good, payload: null }],
+    ["null payload with a BLANK storage pointer", { ...good, payload: null, payload_storage_path: "   " }],
     ["blank source_refreshed_at", { ...good, source_refreshed_at: "  " }],
     ["missing planned param (no live identity)", { ...good, params: { reportVersion: good.params.reportVersion, accountId: "IN1" } }],
     ["malformed params", { ...good, params: "oops" }],
@@ -604,11 +740,38 @@ test("(E4) an unavailable/blocked/invalid/truncated/stale/null/malformed snapsho
   }
 });
 
+test("(E4b) storage-backed shadow payloads: the exact job-linked snapshot publishes; missing/unreadable storage fails CLOSED", async () => {
+  const base = mkPubDeps().shadow;
+  const goodPayload = base.payload;
+  const stored = { ...base, payload: null, payload_storage_path: "report-snapshots/scheduler-v2/sales-movers/IN1.json" };
+  // (a) a readable storage payload publishes -- hydrated through the trusted loader, byte-counted inline.
+  const ok = await pub({ shadow: stored, storagePayload: goodPayload });
+  assert.equal(ok.res.disposition, "published");
+  assert.equal(ok.calls.storage, 1, "hydrated exactly once");
+  assert.equal(ok.seen.storagePath, stored.payload_storage_path, "hydrated from the row's OWN pointer");
+  assert.deepEqual(ok.calls.publish[0].payload, goodPayload, "the HYDRATED payload is what publishes");
+  assert.equal(ok.calls.publish[0].payloadBytes, Buffer.byteLength(JSON.stringify(goodPayload), "utf8"));
+  // (b) a MISSING storage object (loader returns null) fails closed; live LKG untouched.
+  const missing = await pub({ shadow: stored, storagePayload: null });
+  assert.equal(missing.res.disposition, "invalid-snapshot");
+  // (c) an UNREADABLE storage object (loader throws) fails closed; live LKG untouched.
+  const broken = await pub({ shadow: stored, storageThrows: true });
+  assert.equal(broken.res.disposition, "invalid-snapshot");
+  // (d) a hydrated payload that fails validation (e.g. truncated JSON shape) fails closed.
+  const truncated = await pub({ shadow: stored, storagePayload: { accountId: "IN1" } });
+  assert.equal(truncated.res.disposition, "invalid-snapshot");
+  // (e) a hydrated payload that declares itself UNAVAILABLE fails closed.
+  const unavailable = await pub({ shadow: stored, storagePayload: { accountId: "IN1", asOf: "2026-08-14", dataUnavailable: true, rows: [], catalogBrands: [], salesLatestDate: null } });
+  assert.equal(unavailable.res.disposition, "invalid-snapshot");
+  for (const r of [missing, broken, truncated, unavailable]) assert.equal(r.calls.publish.length, 0, "no failed hydration ever published");
+});
+
 test("(E5) publish EXACTLY ONCE with the EXACT live identity the frontend reads", async () => {
   const { res, calls, seen, shadow } = await pub();
   assert.equal(res.disposition, "published");
   assert.equal(seen.shadowKey, "scheduler-v2/" + SM, "reads the exact scheduler-v2/<reportKey> shadow identity");
   assert.equal(seen.shadowAcct, "IN1");
+  assert.equal(seen.shadowHash, JOB_HASH, "loaded by the JOB'S OWN snapshot_params_hash -- never a 'latest' row");
   assert.equal(calls.publish.length, 1, "exactly one CAS write");
   const w = calls.publish[0];
   const wantHash = paramsHashFor(SM + "-v1", { to: "2026-08-14" });
@@ -635,6 +798,92 @@ test("(E6) a REPLAY is idempotent and a NEWER live snapshot always wins; a trans
 test("(E7) every observed disposition is in the typed PUBLISH_DISPOSITIONS contract", () => {
   assert.ok(observedDispositions.size >= 9, "the suite exercised the disposition space");
   for (const d of observedDispositions) assert.ok(PUBLISH_DISPOSITIONS.includes(d), d + " is a declared typed disposition");
+});
+
+// =================================================================================================
+group("E2. trusted publisher composition (build-time wiring; the publish() caller can inject NOTHING)");
+
+test("(EC1) the DEFAULT composition is code-locked and exposes ONLY publish(reportKey, accountId)", async () => {
+  const rt = buildSchedulerV2Publisher({
+    connections: CONNS,
+    fetchAccounts: async () => { throw new Error("discovery must not run for a code-locked publish"); },
+  });
+  assert.deepEqual(Object.keys(rt), ["publish"], "no other surface");
+  assert.ok(Object.isFrozen(rt), "the composition is frozen");
+  const res = await rt.publish(SM, "IN1");
+  observedDispositions.add(res.disposition);
+  assert.equal(res.disposition, "code-locked", "the production frozen-EMPTY ready set is bound by default");
+});
+
+test("(EC2) a publish() caller cannot inject code readiness or any trusted collaborator", async () => {
+  let discoveries = 0;
+  const fakes = mkPubDeps({});
+  const rt = buildSchedulerV2Publisher({
+    connections: [CONNS[0]], // one configured connection => fetchAccounts count == discovery count
+    fetchAccounts: async () => { discoveries += 1; return [{ id: "IN1", country: "IN", currency: "INR", name: "India One" }]; },
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }),
+    getSettings: fakes.deps.getReportSyncSettings,
+    getApproval: fakes.deps.getPublishApproval,
+    getJob: fakes.deps.getLatestReportJob,
+    getSnapshot: async ({ reportKey, accountId, paramsHash }) => fakes.deps.getShadowSnapshot(reportKey, accountId, paramsHash),
+    loadStoragePayload: fakes.deps.loadStoragePayload,
+    publishLive: fakes.deps.publishLive,
+    codeReadyKeys: [SM], // BUILD-TIME test seam (production passes nothing => frozen EMPTY)
+  });
+  // Injection attempts through the ONLY public surface: extra args are ignored; a non-string coerces to ""
+  // (=> unknown-report). Nothing a caller passes can reach the composed collaborators.
+  const evil = { codeReadyKeys: [SM], deps: { publishLive: async () => ({ outcome: "inserted" }) }, toString: () => SM };
+  const r1 = await rt.publish(evil, "IN1");
+  observedDispositions.add(r1.disposition);
+  assert.equal(r1.disposition, "unknown-report", "a non-string reportKey (object smuggling deps) is refused, never coerced into scope");
+  const r2 = await rt.publish(SM, "IN1", { codeReadyKeys: ["anything"], publishLive: async () => ({ outcome: "inserted" }) });
+  assert.equal(r2.disposition, "published", "a third argument is IGNORED -- the composed collaborators did the work");
+  assert.equal(fakes.calls.publish.length, 1, "exactly the composed CAS primitive published");
+  // Memoized fresh discovery: a second publish reuses the composition's ONE discovery read.
+  const r3 = await rt.publish(SM, "IN1");
+  assert.equal(r3.disposition, "published");
+  assert.equal(discoveries, 1, "ONE memoized fresh discovery served both publishes");
+});
+
+// =================================================================================================
+group("E3. migration-6 audit integrity (DB-enforced identity + audited approval decisions)");
+
+const MIGRATION_DIR = path.join(ROOT, "supabase", "migrations");
+const realReadFile = (name) => readFileSync(name === "supabase.js"
+  ? path.join(ROOT, "lib", "server", "supabase.js")
+  : path.join(MIGRATION_DIR, name), "utf8");
+
+test("(EM1) the REAL migration 6 proves every DB-enforced constraint: nonblank ids, dd-secondary rejection, audited decisions", () => {
+  const audit = auditSchemaContract({ readFile: realReadFile });
+  assert.equal(audit.ok, true, "the full schema contract audits clean: " + JSON.stringify(audit.blockers));
+  const m6 = audit.matrix.find((m) => m.migration === "20260816_account_rollout.sql");
+  const constraintNames = m6.tables.flatMap((t) => t.namedConstraints.map((c) => `${t.name}.${c.name}:${c.proven}`));
+  assert.deepEqual(constraintNames, [
+    "scheduler_account_rollout.scheduler_account_rollout_account_id_nonblank:true",
+    "scheduler_account_rollout.scheduler_account_rollout_account_id_primary_only:true",
+    "scheduler_rollout_mode.scheduler_rollout_mode_singleton:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_report_key_nonblank:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_account_id_nonblank:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_account_id_primary_only:true",
+    "scheduler_publish_approvals.scheduler_publish_approvals_audited:true",
+  ], "every table-scoped constraint proof passes against the real migration");
+});
+
+test("(EM2) an UNAUDITED/weakened approvals schema FAILS the contract (blank decisions cannot become possible silently)", () => {
+  const real6 = realReadFile("20260816_account_rollout.sql");
+  const tamper = (mutate) => (name) => (name === "20260816_account_rollout.sql" ? mutate(real6) : realReadFile(name));
+  // (a) the audited-decision constraint removed entirely => typed blocker.
+  const removed = auditSchemaContract({ readFile: tamper((t) => t.replace(/,\s*constraint scheduler_publish_approvals_audited check \(char_length\(btrim\(approved_by\)\) > 0 and approved_at is not null\)/, "")) });
+  assert.equal(removed.ok, false);
+  assert.ok(removed.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.table === "scheduler_publish_approvals" && b.constraints.includes("scheduler_publish_approvals_audited")), "removal is a typed NAMED_CONSTRAINT_MISSING blocker");
+  // (b) the constraint WEAKENED (approved_at requirement dropped) => exact-canonical-body mismatch.
+  const weakened = auditSchemaContract({ readFile: tamper((t) => t.replace("check (char_length(btrim(approved_by)) > 0 and approved_at is not null)", "check (char_length(btrim(approved_by)) > 0)")) });
+  assert.equal(weakened.ok, false);
+  assert.ok(weakened.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.table === "scheduler_publish_approvals"), "a weakened CHECK body fails the exact token comparison");
+  // (c) the dd-secondary rejection dropped from the allowlist table => typed blocker.
+  const noPrefix = auditSchemaContract({ readFile: tamper((t) => t.replace(/,\s*constraint scheduler_account_rollout_account_id_primary_only check \(account_id not like 'dd-secondary:%'\)/, "")) });
+  assert.equal(noPrefix.ok, false);
+  assert.ok(noPrefix.blockers.some((b) => b.code === "NAMED_CONSTRAINT_MISSING" && b.table === "scheduler_account_rollout"), "dropping the prefix rejection is a typed blocker");
 });
 
 // =================================================================================================
@@ -721,6 +970,7 @@ test("(G1) NO api/ route references the publisher or the rollout module (recursi
   for (const f of files) {
     const src = readFileSync(f, "utf8");
     assert.ok(!src.includes("report-publisher"), path.relative(ROOT, f) + " must not import the publisher");
+    assert.ok(!src.includes("publisher-composition"), path.relative(ROOT, f) + " must not import the trusted publisher composition");
     assert.ok(!src.includes("account-rollout"), path.relative(ROOT, f) + " must not import the rollout module");
     assert.ok(!src.includes("publishLiveSnapshotIfNewer"), path.relative(ROOT, f) + " must not reach the CAS publish primitive");
   }
@@ -739,8 +989,10 @@ test("(G2) the dispatcher never auto-publishes and the publisher touches no rout
 async function loadModules() {
   ({ resolveRolloutAccounts } = await import("../lib/server/sync/account-rollout.js"));
   ({ runSchedulerV2Shadow } = await import("../lib/server/sync/sync-dispatch.js"));
-  ({ buildSchedulerV2Runtime, RUN_OPERATIONAL_ARGS } = await import("../lib/server/sync/runtime-composition.js"));
+  ({ buildSchedulerV2Runtime, buildSchedulerV2CanaryRuntime, RUN_OPERATIONAL_ARGS } = await import("../lib/server/sync/runtime-composition.js"));
   ({ SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, PUBLISH_DISPOSITIONS, publishSchedulerV2Snapshot } = await import("../lib/server/sync/report-publisher.js"));
+  ({ buildSchedulerV2Publisher } = await import("../lib/server/sync/publisher-composition.js"));
+  ({ auditSchemaContract } = await import("../lib/server/sync/schema-contract.js"));
   ({ SCHEDULER_V2_READY_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ paramsHashFor } = await import("../lib/server/report-store.js"));
