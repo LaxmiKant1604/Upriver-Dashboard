@@ -9176,6 +9176,31 @@ semantics / DI structure / lock release UNCHANGED. Nothing executed.
 
 STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
 
+## Scheduler v2: Gate-6 Ads coverage prerequisite EXECUTED -- 4 bounded requiredCoverage invocations (2026-08-15)
+
+Explicitly authorized live task (evidence: SCHEDULER_V2_ROLLOUT Appendix S). Populated durable ads_sync_coverage
+for EXACTLY the two approved accounts (US 26f7a1a6-..., IN d658442d-...) over the exact window
+2026-07-16..2026-08-14 (30 inclusive days; prepares PPC for asOf 2026-08-14) via FOUR SEPARATE one-source
+requiredCoverage invocations of the guarded runAdsSync. global.fetch wrapped (counts only; tripwire at a 4th
+create POST); throwaway scripts removed after.
+
+- Prechecks ALL PASS: HEAD e8a43e2; verify 37/37; one primary connection, NO dd-secondary; both accounts freshly
+  discovered primary US/IN; ledger 1-5 exactly once; 13 controls disabled; readiness allowlist empty; no cron.
+  Baselines: src-rows selected 0 / unrelated 265,741; metrics 0 / 31,864; state 4 (IN, all failed) / 192;
+  coverage 0 / 0.
+- Invocations (each: completed + coverageComplete:true, 2/2 pairs, zero failed, EXACTLY 1 create-export):
+  campaign 4,217 rows (+4,217 ad_daily_metrics); asin 7,211; keyword-targeting (optional) 9,750; search-terms
+  (optional) 7,711. Total 4 creates, 28,889 rows. No retries.
+- Postchecks ALL PASS: unrelated-account counts+digests byte-identical across all 4 tables; selected writes only
+  (coverage 0->8 exact-window succeeded; state 4->8 all succeeded); cadence timestamps unchanged (IN's failed
+  rows became succeeded WITHOUT stamping a cadence run; US rows new with null cadence); PPC gate
+  evaluateSourceCoverage proven===true for campaign+ASIN on both accounts; sync_cycles still 3; controls still
+  disabled. verify 37/37 after; git diff --check clean.
+
+STATE NOW: the empty-ads_sync_coverage PPC blocker (Appendix P.3) is RESOLVED for the two Gate-6 accounts --
+PPC can join Cycle 2. STOP: Cycle 2 / unlock / deploy / schedule remain BLOCKED pending Codex review + explicit
+human approval.
+
 ## Scheduler v2: requiredCoverage production-token guards -- one source + export ceiling + idempotent skip (OFFLINE, 2026-08-15)
 
 Commit 52f6a3d (code/tests), docs Appendix R.8. Timeout slicing / requiredCoverage semantics / lock release /

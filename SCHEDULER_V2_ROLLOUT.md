@@ -250,9 +250,16 @@ report. **Approval gate per report.**
   (57≤59 / 56≤58 create-exports, ≤1 per hash); production fingerprints byte-identical; LKG preserved on every
   failure; 1 parity defect (brand-sales `asinBrand`) found + FIXED (`bb37a4e`); upstream findings recorded
   (30 DataDoe TIMEOUTs on the largest datasets; empty durable `ads_sync_coverage` blocks the PPC prerequisite).
-- [ ] Gate 6 Shadow Parity CYCLE 2 (+ stability across ≥ 2 cycles). **BLOCKED** pending Codex review of the
-  Cycle-1 evidence and explicit human approval (nothing here authorizes it). Cycle 2 should land the fixed
-  brand-sales payload (`asinBrand`) and re-observe the TIMEOUT-prone large exports.
+- [x] **Gate-6 Ads coverage prerequisite — EXECUTED 2026-08-15 (Appendix S).** Four bounded one-source
+  `requiredCoverage` invocations for exactly the two approved accounts over `[2026-07-16 .. 2026-08-14]`
+  (30 inclusive days): campaign + ASIN (required) and targeting + search-terms (optional) ALL `completed` +
+  `coverageComplete:true`, one create-export each (≤3 budget held), 8 exact-window `succeeded` coverage records,
+  8 `succeeded` states with cadence timestamps unchanged, unrelated-account digests byte-identical. The empty
+  `ads_sync_coverage` PPC blocker is RESOLVED — `evaluateSourceCoverage(..).proven === true` for campaign+ASIN
+  on both accounts for asOf `2026-08-14`.
+- [ ] Gate 6 Shadow Parity CYCLE 2 (+ stability across ≥ 2 cycles). **BLOCKED** pending Codex review and
+  explicit human approval (nothing here authorizes it). Cycle 2 should land the fixed brand-sales payload
+  (`asinBrand`), exercise the timeout-safe sliced windows, and let PPC join via the now-proven Ads coverage.
 - [ ] Gate 7 — per-report control unlock (repeat per report).
 - [ ] Kickoff (`20260808_scheduler_v2_kickoff.sql`) — separate, later, fully-reviewed step (NOT in this phase).
 
@@ -2855,3 +2862,55 @@ coverage never authorizes a skip. `npm run verify` **37/37 across 17 suites** in
 --check` clean; timeout slicing / requiredCoverage semantics / lock release / source IDs / request hashes /
 Scheduler-v1 cadence / controls / frontend / routes / migrations **unchanged**. **STOP for Codex review.**
 Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending review + explicit approval.
+
+---
+
+## Appendix S — Gate-6 Ads coverage prerequisite EXECUTION evidence (2026-08-15; bounded requiredCoverage canary)
+
+Explicitly authorized live task: populate durable `ads_sync_coverage` for EXACTLY the two approved Gate-6
+accounts (US `26f7a1a6-…`, IN `d658442d-…`) over the exact window `[2026-07-16 .. 2026-08-14]` (30 inclusive
+days — prepares PPC for asOf `2026-08-14`), via FOUR SEPARATE one-source `requiredCoverage` invocations of the
+guarded `runAdsSync` (R.1–R.8 contract). Executed from `sales-dashboard-live/` with `node --env-file=../.env.local`
+(secrets never printed/committed); `global.fetch` was wrapped in the throwaway runner to count DataDoe calls
+(hostname/method/class only — never keys, export ids, rows, or payloads) with a hard tripwire at a 4th
+create-export POST. Throwaway scripts removed after execution. **No Cycle 2, no unlock, no deploy, no schedule.**
+
+### S.1 Prechecks (ALL PASS before any write)
+
+HEAD `e8a43e2`; `npm run verify` 37/37; env names present (values never read into evidence); exactly ONE
+configured primary connection and NO dd-secondary (nothing to route); both accounts freshly discovered as
+primary US/IN; ledger migrations 1–5 exactly once; 13 durable controls `schedule_enabled=false`;
+`SCHEDULER_V2_READY_REPORT_KEYS` frozen empty (offline); `pg_cron` absent. Baselines captured (counts +
+order-independent narrow-projection digests, selected vs unrelated accounts): `ads_daily_source_rows`
+selected 0 / unrelated 265,741; `ad_daily_metrics` 0 / 31,864; `ads_sync_state` 4 (all IN, all `failed`,
+cadence timestamps captured) / 192; `ads_sync_coverage` 0 / 0.
+
+### S.2 The four invocations (separate processes, in order; each one source, both accounts, exact window)
+
+| # | source | kind | outcome | create-POSTs (≤3) | rows persisted | durable proof |
+|---|---|---|---|---|---|---|
+| 1 | `campaign-performance-v1` | required | **`completed` + `coverageComplete:true`, 2/2 pairs, zero failed** | **1** | 4,217 (+`ad_daily_metrics` 4,217) | 2 exact-window `succeeded` coverage rows; both states `succeeded` (lmd US `2026-08-13` / IN `2026-08-14`) |
+| 2 | `asin-performance-v1` | required | **`completed` + `coverageComplete:true`, 2/2, zero failed** | **1** | 7,211 | 2 exact-window `succeeded` coverage rows; both states `succeeded` |
+| 3 | `keyword-targeting-performance-v1` | optional | `completed` + `coverageComplete:true` (recorded) | **1** | 9,750 | 2 exact-window `succeeded` coverage rows; both states `succeeded` |
+| 4 | `search-terms-performance-v1` | optional | `completed` + `coverageComplete:true` (recorded) | **1** | 7,711 | 2 exact-window `succeeded` coverage rows; both states `succeeded` |
+
+Both REQUIRED gates passed independently (status/coverageComplete/pairs/zero-failed/budget/durable checks);
+no retry was needed or performed; total 4 create-exports, 28,889 Ads rows.
+
+### S.3 Postchecks (ALL PASS, read-only)
+
+- **Unrelated accounts byte-identical:** counts + digests unchanged across all four tables
+  (`ads_daily_source_rows` 265,741; `ad_daily_metrics` 31,864; `ads_sync_state` 192; `ads_sync_coverage` 0).
+- **Only the two selected accounts written:** selected rows `ads_daily_source_rows` 0→28,889;
+  `ad_daily_metrics` 0→4,217; `ads_sync_state` 4→8 (all `succeeded`); `ads_sync_coverage` 0→**8** (4 sources ×
+  2 accounts, all `succeeded`, all exactly `2026-07-16..2026-08-14`).
+- **Cadence preserved:** every selected state row's `initial_seeded_at` / `last_daily_sync_at` /
+  `last_monthly_sync_at` is unchanged vs the baseline (the IN account's four pre-existing `failed` rows became
+  `succeeded` without stamping a cadence run; the US account's four new rows carry null cadence timestamps).
+- **PPC gate provably satisfied:** `evaluateSourceCoverage({read:"ok",windows},"2026-07-16","2026-08-14").proven
+  === true` for campaign + ASIN on BOTH accounts — the empty-coverage PPC blocker from Appendix P.3 is
+  **RESOLVED** for the two Gate-6 accounts.
+- Scheduler surfaces untouched: `sync_cycles` still 3 (Gate-5 + two Gate-6 Cycle-1 cycles); 13 controls still
+  disabled. Throwaway scripts removed; `npm run verify` 37/37 after; `git diff --check` clean.
+
+**STOP.** Cycle 2 / unlock / deploy / schedule remain BLOCKED pending Codex review + explicit human approval.
