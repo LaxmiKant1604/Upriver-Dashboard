@@ -9308,3 +9308,49 @@ migration applied, no push/deploy/unlock/publish/schedule.
   row -> per-report enable -> per-(report,account) publish approval -> rollback levers).
 
 STOP for Codex review. Migration 6 unapplied; all enables/approvals/unlock/deploy/schedule remain BLOCKED.
+
+## Scheduler v2 Gate 7 CORRECTION TRANCHE: five Codex findings fixed (OFFLINE, 2026-08-15) — Migration 6 still UNAPPLIED
+
+All five Gate-7 Codex findings fixed offline; no production connection, no migration applied, migrations 1-5
+byte-identical, nothing pushed/deployed/unlocked/published/scheduled.
+
+- FINDING 1 (rollout gates ALL dispatch): runSchedulerV2Shadow now REQUIRES the trusted rollout loader for
+  scheduled AND production-manual runs — manualReportKeys selects REPORTS only, never accounts; read
+  failure / zero-valid-allowlist drains BEFORE discovery with zero cycle/store/DataDoe I/O. Isolated
+  canaries: NEW buildSchedulerV2CanaryRuntime (runtime-composition.js) — exact reviewed account ids fixed at
+  BUILD time (blank/empty/dd-secondary refuse to compose), become the composed rollout state, still
+  intersected with fresh primary discovery each run; no per-run bypass (RUN_OPERATIONAL_ARGS unchanged).
+  Gate7 test B10 replaced (manual cannot bypass), B11 added (canary composition).
+- FINDING 2 (exact job snapshot binding): publisher job gate now requires cycle_id + validated=true +
+  derive/save succeeded + terminal succeeded/partial cycle + NONBLANK snapshot_params_hash (NEW wrapper
+  getLatestSyncReportJob embeds the owning cycle's status via the FK). The shadow snapshot is loaded by the
+  EXACT natural identity (scheduler-v2/<key>, accountId, job.snapshot_params_hash) via getReportSnapshot —
+  never a "latest" row — and must ECHO the same params_hash (job A cannot authorize snapshot B). Storage-
+  backed payloads hydrate via NEW getReportSnapshotStoragePayload; missing/unreadable/invalid hydration
+  fails CLOSED preserving live LKG.
+- FINDING 3 (real discovery in the account gate): the publisher resolves the durable rollout against REAL
+  memoized fresh primary discovery (never a synthetic [{accountId}]) — undiscovered/stale accounts and every
+  dd-secondary account can never publish, INCLUDING under all_primary=true. NEW trusted composition
+  lib/server/sync/publisher-composition.js buildSchedulerV2Publisher(): build-time collaborator binding
+  (test-seam pattern identical to buildSchedulerV2Runtime), frozen surface publish(reportKey, accountId) —
+  a publish() caller can inject nothing; ONE memoized discovery per composition. Unwired from routes/cron.
+- FINDING 4 (CAS pointer clearing): publishLiveSnapshotIfNewer's guarded PATCH now explicitly sets
+  payload_storage_path:null when replacing with the inline payload; regression starts from an older
+  storage-backed live row and proves the pointer clears; equal/newer live rows stay byte-identical (zero-row
+  PATCH + read-back only).
+- FINDING 5 (migration-6 audit integrity): 20260816_account_rollout.sql (UNAPPLIED; new frozen SHA-256
+  11186a07cfe75f909812648643928b8f8b1c2f703e1c6a05dbec46e3688cfac5) adds 7 named CHECK constraints —
+  nonblank account_id/report_key, dd-secondary prefix rejection on both account tables, rollout-mode
+  singleton, and scheduler_publish_approvals_audited (nonblank approved_by AND approved_at not null on
+  EVERY decision row incl. revocations; approved_by/approved_at now NOT NULL columns). schema-contract.js
+  migration-6 entry carries exact table-scoped canonical CHECK proofs; removing OR weakening one is a typed
+  NAMED_CONSTRAINT_MISSING blocker (tests EM1/EM2). REQUIRED_WRAPPER_EXPORTS +3 (getLatestSyncReportJob,
+  getReportSnapshot, getReportSnapshotStoragePayload).
+- Tests: gate7-rollout-publisher.test.js 31 -> 38 checks (9 groups; all 11 mandated regressions). Suites:
+  sync-dispatch 37, runtime-composition 26, cycle-lifecycle 16, cycle-finalize-wiring 14 — green. npm run
+  verify: 38 steps / 18 suites green incl. build:check; git diff --check clean.
+- Docs: status header correction-tranche block; U.1 constraint table + new frozen hash; U.3 every-dispatch
+  enforcement + canary composition; U.4 exact-binding publisher + composition; U.5 38-check evidence; V.5
+  publish via composition, V.6 audited revocation, V.7 canary composition note.
+
+STOP for Codex re-review. Migration 6 unapplied; enables/approvals/unlock/deploy/schedule remain BLOCKED.
