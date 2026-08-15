@@ -87,12 +87,15 @@ function makeDeps(opts = {}) {
     },
     now: () => NOW,
   };
+  if (opts.clock) deps.clock = opts.clock; // injectable monotonic clock for the work-budget deadline
   return { deps, calls };
 }
 
 const CAMPAIGN = "campaign-performance-v1";
 const ASIN = "asin-performance-v1";
+const WORK_BUDGET_PAST = 10_000_000; // clearly past the 45s WORK_BUDGET_MS so a deferral fires deterministically
 const flatStates = (calls) => calls.upsertStates.flat();
+const row = (id, country = "US", date = REQ.to) => ({ seller_or_vendor_id: id, date, marketplace_country_code: country });
 
 /* ============================= option validation (pre-lock, fail closed) ============================= */
 
@@ -248,7 +251,150 @@ test("null / mismatched coverage acknowledgement FAILS CLOSED (no success, no ad
     assert.equal(saved.last_status, "failed", "unconfirmed coverage never marks the sync succeeded");
     assert.equal(saved.latest_metric_date, "2026-01-01", "latest_metric_date NOT advanced on unconfirmed coverage");
     assert.equal(calls.release, 1, "lock released exactly once");
+    // FIX 2: the TOTAL result is never 'completed' on an unconfirmed ack.
+    assert.notEqual(res.status, "completed", `ack ${JSON.stringify(ack)} => never completed`);
+    assert.equal(res.coverageComplete, false);
   }
+});
+
+/* ============================= FIX 1: per-batch row validation (reject before any write) ============================= */
+
+test("selected row + unrelated-account row => WHOLE batch rejected: zero rows/metrics/coverage/success writes", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => [row(G6_US, "US"), row("other-us-1", "US")] });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes");
+  assert.equal(calls.upsertMetrics.length, 0, "zero metric writes");
+  assert.equal(calls.coverage.length, 0, "zero coverage writes");
+  assert.ok(!flatStates(calls).some((s) => s.last_status === "succeeded"), "zero successful states");
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US], "the requested batch account is marked failed");
+  assert.notEqual(res.status, "completed");
+  assert.equal(res.coverageComplete, false);
+});
+
+test("missing / blank seller id fails the WHOLE batch (zero writes)", async () => {
+  for (const bad of [row("", "US"), { date: REQ.to, marketplace_country_code: "US" }]) {
+    const { deps, calls } = makeDeps({ rowsFor: () => [row(G6_US, "US"), bad] });
+    const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+    assert.equal(calls.upsertRows.length, 0, "zero row writes");
+    assert.equal(calls.coverage.length, 0, "zero coverage writes");
+    assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US]);
+  }
+});
+
+test("wrong marketplace for a selected raw id fails the WHOLE batch (zero writes)", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => [row(G6_US, "IN")] }); // G6_US is a US account
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.upsertRows.length, 0);
+  assert.equal(calls.coverage.length, 0);
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US]);
+});
+
+test("a non-array export result fails the WHOLE batch (zero writes)", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => ({ not: "an-array" }) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.upsertRows.length, 0);
+  assert.equal(calls.coverage.length, 0);
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US]);
+});
+
+test("rows for BOTH selected accounts in one batch succeed (per-row marketplace matched)", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => [row(G6_US, "US"), row(G6_IN, "IN")] });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  assert.equal(res.coverageComplete, true);
+  assert.ok(calls.upsertRows.length >= 1, "rows persisted");
+  const cov = calls.coverage.flat();
+  assert.deepEqual([...new Set(cov.map((c) => c.accountId))].sort(), [G6_US, G6_IN].sort(), "both accounts covered");
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, []);
+});
+
+test("a genuine ZERO-row export is valid covered-empty evidence (rows called with [], coverage recorded, state succeeded)", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => [] });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  assert.equal(res.coverageComplete, true);
+  assert.equal(calls.upsertRows.length, 1, "upsertAdsDailyRows called with the (empty) validated result");
+  const cov = calls.coverage.flat();
+  assert.equal(cov.length, 1, "covered-empty coverage recorded");
+  assert.ok(cov.every((c) => c.coveredFrom === REQ.from && c.coveredTo === REQ.to));
+  assert.equal(flatStates(calls).find((s) => s.account_id === G6_US).last_status, "succeeded");
+});
+
+/* ============================= FIX 2: total coverage-mode result ============================= */
+
+test("all N x M pairs confirmed => status 'completed' AND coverageComplete true (zero failed) -- the operator gate", async () => {
+  const { deps } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN, ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(res.expectedCoveragePairs, 4);
+  assert.equal(res.successfulCoveragePairs, 4);
+  for (const key of [CAMPAIGN, ASIN]) {
+    assert.deepEqual(res.sources[key].failedAccounts, []);
+    assert.deepEqual(res.sources[key].coverageFailedAccounts, []);
+  }
+  assert.ok(res.status === "completed" && res.coverageComplete === true, "res.status === 'completed' && res.coverageComplete === true");
+});
+
+test("one source succeeds + one fails => status 'partial' + coverageComplete false", async () => {
+  // ASIN coverage ack unconfirmed; campaign confirmed. 1 account x 2 sources.
+  const { deps } = makeDeps({ coverageAck: (rows) => (rows[0].sourceKey === ASIN ? { write: "write-failed", recorded: 0 } : { write: "ok", recorded: rows.length }) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN, ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "partial");
+  assert.equal(res.coverageComplete, false);
+  assert.equal(res.expectedCoveragePairs, 2);
+  assert.equal(res.successfulCoveragePairs, 1);
+  assert.deepEqual(res.sources[CAMPAIGN].coverage, 1);
+  assert.deepEqual(res.sources[ASIN].coverageFailedAccounts, [G6_US]);
+});
+
+test("zero successful pairs + a failure => status 'failed', never completed", async () => {
+  const { deps } = makeDeps({ coverageAck: { write: "ok", recorded: 0 } });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "failed");
+  assert.equal(res.coverageComplete, false);
+});
+
+test("a success-path state-write failure cannot return 'completed' (fails closed; no raw error in summary)", async () => {
+  const { deps, calls } = makeDeps();
+  const orig = deps.upsertAdsSyncStates;
+  deps.upsertAdsSyncStates = async (states) => {
+    if (states.some((s) => s.last_status === "succeeded")) throw new Error("STATE_WRITE_FAILED secret-token");
+    return orig(states); // failed-state writes still record
+  };
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.notEqual(res.status, "completed");
+  assert.equal(res.coverageComplete, false);
+  assert.ok(!JSON.stringify(res).includes("secret"), "no raw state-write error in the summary");
+  assert.equal(calls.release, 1, "lock released exactly once");
+});
+
+test("a work-budget deadline cannot return 'completed' => partial + deferred (injected clock; released once)", async () => {
+  const seq = [0]; // first clock() = startedAt = 0; the next is past the budget, so the first batch defers.
+  let n = 0;
+  const { deps, calls } = makeDeps({ clock: () => (n++ === 0 ? seq[0] : WORK_BUDGET_PAST) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "partial");
+  assert.equal(res.deferred, true);
+  assert.equal(res.coverageComplete, false);
+  assert.equal(calls.fetchRange.length, 0, "deferred before any export");
+  assert.equal(calls.release, 1, "lock released exactly once on deferral");
+});
+
+test("finalizeCoverageSummary (pure): completed only for a full N x M with zero failures; deferred => partial", async () => {
+  const base = () => ({ status: "completed", accounts: 2, sources: { a: { coverage: 2, failedAccounts: [], coverageFailedAccounts: [] }, b: { coverage: 2, failedAccounts: [], coverageFailedAccounts: [] } } });
+  const { finalizeCoverageSummary } = await import("../lib/server/ads-sync.js");
+  let r = finalizeCoverageSummary(base(), { accounts: 2, sourceKeys: ["a", "b"] });
+  assert.equal(r.status, "completed"); assert.equal(r.coverageComplete, true); assert.equal(r.expectedCoveragePairs, 4); assert.equal(r.successfulCoveragePairs, 4);
+  // one failure -> partial
+  const s2 = base(); s2.sources.b = { coverage: 1, failedAccounts: ["x"], coverageFailedAccounts: [] };
+  r = finalizeCoverageSummary(s2, { accounts: 2, sourceKeys: ["a", "b"] });
+  assert.equal(r.status, "partial"); assert.equal(r.coverageComplete, false);
+  // zero successes + failures -> failed
+  const s3 = { status: "completed", accounts: 1, sources: { a: { coverage: 0, failedAccounts: ["x"], coverageFailedAccounts: [] } } };
+  r = finalizeCoverageSummary(s3, { accounts: 1, sourceKeys: ["a"] });
+  assert.equal(r.status, "failed"); assert.equal(r.coverageComplete, false);
+  // deferred always partial (even a full count)
+  r = finalizeCoverageSummary(base(), { accounts: 2, sourceKeys: ["a", "b"], deferred: true });
+  assert.equal(r.status, "partial"); assert.equal(r.deferred, true); assert.equal(r.coverageComplete, false);
 });
 
 /* ============================= lock released exactly once on every post-claim outcome ============================= */

@@ -321,6 +321,87 @@ function coverageStateRecord(accountId, sourceKey, previous, latestMetricDate, n
   };
 }
 
+/**
+ * Validate a DataDoe export result against the EXACT batch it was requested for, BEFORE any row / metric /
+ * coverage / success-state write. The whole batch is rejected (a typed safe failure, zero writes) on any
+ * malformed / cross-account / unknown-account / missing-id / duplicate-scope / wrong-marketplace evidence:
+ *   - the result must be an ARRAY (a non-array result is not evidence);
+ *   - every row must be a plain object;
+ *   - seller_or_vendor_id must be NONBLANK and EXACTLY one of THIS batch's rawAccountIds;
+ *   - it must resolve THROUGH the batch's discovered account object -- the resolved public account id AND the
+ *     account's connection must match the batch (so a same-raw-id row from another organisation is rejected);
+ *   - when the source declares the marketplace_country_code dimension, the row's marketplace must equal the
+ *     discovered account's country.
+ * A GENUINE successful export with ZERO rows ([]) is VALID covered-empty evidence. Returns { ok, reason }
+ * where reason is a SAFE slug (never a raw row / id / secret). Pure.
+ */
+function validateExportBatchRows(source, rows, batch, connection) {
+  if (!Array.isArray(rows)) return { ok: false, reason: "result-not-an-array" };
+  // One raw id -> its discovered account object. The batch shares ONE connection/mode work group and its
+  // accounts have distinct raw ids (discovery dedups on the public id), so this map has no duplicate scope.
+  const byRawId = new Map(batch.map((entry) => [entry.account.rawAccountId, entry.account]));
+  const hasMarketplace = Array.isArray(source.dimensions) && source.dimensions.includes("marketplace_country_code");
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return { ok: false, reason: "non-object-row" };
+    const sellerId = String(row.seller_or_vendor_id || "").trim();
+    if (!sellerId) return { ok: false, reason: "missing-seller-id" };
+    const account = byRawId.get(sellerId);
+    if (!account) return { ok: false, reason: "cross-account-or-unknown-seller-id" };
+    if (!account.connection || account.connection.id !== connection.id) return { ok: false, reason: "connection-mismatch" };
+    if (publicAccountId(account.connection, sellerId) !== account.id) return { ok: false, reason: "public-account-mismatch" };
+    if (hasMarketplace) {
+      const marketplace = String(row.marketplace_country_code || "").trim().toUpperCase();
+      if (marketplace !== String(account.country || "").trim().toUpperCase()) return { ok: false, reason: "wrong-marketplace" };
+    }
+  }
+  return { ok: true, reason: null };
+}
+
+/**
+ * PURE finalizer for a requiredCoverage summary -> a TOTAL coverage-mode result. For N selected accounts x M
+ * selected sources, expectedCoveragePairs = N x M and a pair is SUCCESSFUL only when it had durable Ads rows
+ * (or a validated empty result), a confirmed exact coverage acknowledgement, AND successful state persistence
+ * (each such pair incremented `summary.sources[key].coverage`). Sets:
+ *   - expectedCoveragePairs / successfulCoveragePairs;
+ *   - coverageComplete = every pair succeeded AND no failure AND not deferred;
+ *   - status: completed (all pairs) | partial (some successes with failures, or a work-budget deferral) |
+ *     failed (zero successful pairs with at least one failure).
+ * `completed` therefore IMPLIES coverageComplete === true and zero failedAccounts/coverageFailedAccounts.
+ * `deferred` reflects a work-budget deadline (always => partial). No I/O.
+ */
+export function finalizeCoverageSummary(summary, { accounts, sourceKeys, deferred = false }) {
+  const expectedCoveragePairs = Number(accounts) * (Array.isArray(sourceKeys) ? sourceKeys.length : 0);
+  let successfulCoveragePairs = 0;
+  const failed = new Set();
+  const coverageFailed = new Set();
+  for (const key of sourceKeys || []) {
+    const s = summary.sources[key] || {};
+    successfulCoveragePairs += Number(s.coverage) || 0;
+    for (const id of s.failedAccounts || []) failed.add(id);
+    for (const id of s.coverageFailedAccounts || []) coverageFailed.add(id);
+  }
+  const anyFailure = failed.size > 0 || coverageFailed.size > 0;
+  const allPairsSucceeded = expectedCoveragePairs > 0 && successfulCoveragePairs === expectedCoveragePairs && !anyFailure && !deferred;
+
+  summary.expectedCoveragePairs = expectedCoveragePairs;
+  summary.successfulCoveragePairs = successfulCoveragePairs;
+  summary.coverageComplete = allPairsSucceeded;
+  if (allPairsSucceeded) {
+    summary.status = "completed";
+    summary.deferred = false;
+  } else if (deferred) {
+    summary.status = "partial";
+    summary.deferred = true;
+  } else if (successfulCoveragePairs === 0 && anyFailure) {
+    summary.status = "failed";
+    summary.deferred = false;
+  } else {
+    summary.status = "partial";
+    summary.deferred = false;
+  }
+  return summary;
+}
+
 // Strict real YYYY-MM-DD: exact shape AND a real calendar date (round-trips through UTC so 2026-02-30 is rejected).
 function isStrictYmd(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -435,6 +516,7 @@ export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
   now: () => new Date().toISOString(),
+  clock: () => Date.now(), // monotonic ms for the work-budget deadline (injectable so the deferral is testable)
 });
 
 /**
@@ -450,6 +532,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
     getAdsSyncStates: getStates, upsertAdsDailyRows: upsertRows, upsertAdDailyMetrics: upsertMetrics,
     upsertAdsSyncStates: upsertStates, recordAdsCoverageWindows: recordCoverage, now: nowFn,
   } = deps;
+  const clock = typeof deps.clock === "function" ? deps.clock : () => Date.now();
 
   const now = nowFn();
   const to = now.slice(0, 10);
@@ -473,7 +556,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   // failure, coverage-write failure) releases the lock EXACTLY ONCE via this finally.
   try {
     const connections = getConnections();
-    const startedAt = Date.now();
+    const startedAt = clock();
     let accounts = [];
     const publicAccountIds = new Set();
     for (const connection of connections) {
@@ -519,7 +602,9 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
       for (const [workKey, entries] of work) {
         const [, mode] = workKey.split("|");
         for (const batch of chunks(entries, source.batchSize)) {
-          if (Date.now() - startedAt > WORK_BUDGET_MS) {
+          if (clock() - startedAt > WORK_BUDGET_MS) {
+            // Work-budget deferral -> partial (resumable). Coverage mode gets a TOTAL result via the finalizer.
+            if (coverageMode) return finalizeCoverageSummary(summary, { accounts: accounts.length, sourceKeys: selectedSources.map((s) => s.key), deferred: true }); // finally releases the lock
             summary.status = "partial";
             summary.deferred = true;
             return summary; // finally releases the lock
@@ -530,6 +615,16 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
           const ids = batch.map((entry) => entry.account.rawAccountId);
           try {
             const rows = await fetchRangeDep(connection.apiKey, source, ids, range.from, range.to);
+            // FIX 1: validate the export against the EXACT batch BEFORE any row/metric/coverage/state write. Any
+            // malformed/cross-account/missing-id/wrong-marketplace evidence rejects the WHOLE batch (typed safe
+            // failed state only). A genuine zero-row export ([]) is valid covered-empty evidence.
+            const evidence = validateExportBatchRows(source, rows, batch, connection);
+            if (!evidence.ok) {
+              const failed = batch.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error(`INVALID_EXPORT_EVIDENCE (${evidence.reason})`), now));
+              await upsertStates(failed);
+              summary.sources[source.key].failedAccounts.push(...batch.map((entry) => entry.account.id));
+              continue; // zero row/metric/coverage/success writes for this batch
+            }
             const normalized = rows.map((row) => rowRecord(source, row, now, connection));
             // DURABLE Ads-row persistence FIRST -- latest_metric_date + successful state are written only after.
             await upsertRows(normalized);
@@ -588,7 +683,11 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
         }
       }
     }
-    return summary;
+    // Coverage mode returns a TOTAL result (completed only when every N x M pair fully succeeded); a normal
+    // cadence run returns the unchanged summary (no coverageComplete field -- backward-compatible).
+    return coverageMode
+      ? finalizeCoverageSummary(summary, { accounts: accounts.length, sourceKeys: selectedSources.map((s) => s.key), deferred: false })
+      : summary;
   } finally {
     // Release the lock on EVERY post-claim outcome (never on the 'skipped' path -- that lock belongs to another run).
     await releaseLock(lockKey);
