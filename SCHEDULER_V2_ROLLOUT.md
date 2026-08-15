@@ -4315,3 +4315,54 @@ source timed out at DataDoe and no retry is permitted. Recommended next steps (e
 re-attempt one fresh bounded shadow cycle for the 12 + IN when DataDoe `sales-traffic-asin-date` is stable; and/or
 (2) resolve the Appendix-Q.4 DataDoe stability questions for the large sliced sources before retrying. brand-sales
 for IN remains live and correct throughout.
+
+## Appendix AB — Gate 7b Phase 2 RECOVERY drain HALTED by authorization (2026-08-16; drain-all superseded; cycle intact/resumable; NOTHING finalized or published)
+
+**Authorized recovery (then superseded):** a recovery gate authorized *draining the EXISTING `dfca8f75…` cycle
+without retrying failed exports, finalizing it honestly (partial), and publishing only independently-succeeded IN
+reports* — **no new cycle**. Partway through the bounded drain, DataDoe instability proved broad (create-export
+`TIMEOUT`s concentrated on `sales-traffic-asin-date`), so a follow-up authorization **superseded the drain-all** and
+directed a **graceful STOP after the in-flight slice**: do not finalize, do not publish, keep the rollback state.
+Reason given: ~6 succeeded vs ~8 failed with ~107 pending ⇒ continuing would spend a large export budget with very
+low probability of completing report dependencies.
+
+### AB.1 Recovery mechanics used (before the stop)
+- **Resumed the SAME cycle only** (`non-us` / `2026-08-18` / manual / 12 reports / IN), bounded ~90s slices — never
+  a new cycle.
+- **Create-export TRIPWIRE:** a wrapped DataDoe adapter that aborts **before** any create-export POST for a
+  `request_hash` already failed/attempted in this cycle (defense-in-depth atop the source-worker's skip-failed rule
+  and the durable one-attempt claim). **It never fired.**
+- **Per-slice invariants** enforced every continuation: same `cycleId`, no new cycle, the failed hashes stay
+  `create_export_count=1`, every hash `≤1`, IN-only owners/report jobs, production live snapshots unchanged.
+- The monitoring DB connection was hardened to a `pg.Pool` after a first run's long-lived `Client` was dropped
+  ("Connection terminated unexpectedly"); the cycle **persisted and resumed idempotently with no duplicate export**.
+
+### AB.2 Graceful stop (executed)
+Killed the background drain loop and removed its runner (no possible re-launch); **no new slice started; no
+additional DataDoe export created; no failed/attempted job retried, reset, or reopened; no new cycle; the cycle was
+NOT finalized (open jobs remain); nothing published; nothing deleted.** The one-attempt claim + per-step durable
+persistence guarantee an interrupted in-flight request leaves at most an `attempted` row with its saved `export_id`
+(`create_export_count=1`) — never a duplicate.
+
+### AB.3 Halt state — read-only capture of `dfca8f75…` (status **running**, NOT finalized)
+- **122 source jobs:** succeeded **8**, failed **9**, attempted **4**, pending **101**.
+- **Failures are ALL `sales-traffic-asin-date`:** `create-export/TIMEOUT` ×8, `poll/EXPORT_ERROR` ×1 — DataDoe
+  export-infrastructure instability concentrated on this one sliced source; **no code defect**.
+- **max `create_export_count` = 1** (0 rows > 1) — **no duplicate export** across both resumes and the interrupt.
+- **IN-ONLY:** every source-job owner and report job is scoped to the IN account (`d658442d…`), report keys ⊆ the
+  authorized 12, no ownerless source jobs.
+- **0 reports complete:** all 8 materialized report jobs are `derive=pending/save=pending` (most sources still
+  pending) — **nothing was publishable at the stop point.**
+- **Live fingerprints UNCHANGED:** IN 9 rows (`16eae8af…`) + non-IN 164 rows (`cc9c2c91…`) == Appendix-AA.
+- **Controls == rollback state:** rollout = 1 IN enabled (`all_primary=false`); approvals = {`brand-sales`/IN};
+  `report_sync_settings` enabled = {`brand-sales`} (other 12 paused); no `pg_cron`.
+
+### AB.4 Status + next steps
+Gate 7b Phase 2 remains **INCOMPLETE**. `dfca8f75…` is **left intact and fully resumable** (deleted nothing).
+brand-sales for IN stays live, approved, and byte-identical; the remaining 12 reports stay paused + unapproved; USA
+and every other account are byte-identical; no cron; `all_primary=false`. A future **separate** authorization can
+either (a) resume + honestly finalize this same cycle (expected `partial`) and publish only the reports whose full
+source set independently succeeded, or (b) discard it and re-attempt fresh — **only after** DataDoe
+`sales-traffic-asin-date` stability is resolved (Appendix Q.4), since that single source is the dominant failure.
+
+**STOP for Codex review.** Halt evidence is docs-only and unpushed; production stays on `0ea9f34`.

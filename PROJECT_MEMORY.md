@@ -9773,3 +9773,35 @@ STOP for review. Phase 2 cannot complete under this authorization (a required da
 DataDoe; no retry permitted). Next (separate authorization): re-attempt one fresh bounded shadow cycle for the 12 +
 IN when DataDoe sales-traffic-asin-date is stable, and/or resolve Appendix-Q.4 DataDoe stability for the large
 sliced sources. brand-sales/IN remains live and correct.
+
+## Scheduler v2 Gate 7b Phase 2 RECOVERY drain HALTED by authorization 2026-08-16 — cycle intact/resumable; nothing finalized/published
+
+A recovery gate authorized draining the EXISTING dfca8f75 cycle (no new cycle) without retrying failed exports,
+finalizing honestly (partial), and publishing only independently-succeeded IN reports. Midway the DataDoe
+instability proved broad (create-export TIMEOUTs concentrated on sales-traffic-asin-date), so a follow-up
+authorization SUPERSEDED drain-all and directed a graceful STOP after the in-flight slice (no finalize, no publish,
+keep rollback state). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AB.
+
+- RECOVERY MECHANICS (before stop): resumed the SAME cycle only (non-us/2026-08-18/manual/12 reports/IN), bounded
+  ~90s slices. Create-export TRIPWIRE = wrapped DataDoe adapter aborting BEFORE any create-export POST for a
+  request_hash already failed/attempted (defense-in-depth atop source-worker skip-failed + one-attempt claim); it
+  never fired. Per-slice invariants enforced (same cycleId, no new cycle, failed hashes stay cec=1, every hash <=1,
+  IN-only, live snapshots unchanged). Monitoring conn hardened Client->pg.Pool after a dropped-connection crash; the
+  cycle persisted and resumed idempotently (no duplicate export).
+- GRACEFUL STOP (executed via TaskStop + removing the runner): no new slice; no additional DataDoe export; no
+  retry/reset/reopen of any failed/attempted job; no new cycle; NOT finalized (open jobs remain); nothing published;
+  nothing deleted.
+- HALT STATE (read-only) of dfca8f75 (status=running, finished_at=null): 122 source jobs = succeeded 8 / failed 9 /
+  attempted 4 / pending 101. Failures ALL sales-traffic-asin-date: create-export/TIMEOUT x8 + poll/EXPORT_ERROR x1
+  (DataDoe infra instability on this one sliced source; no code defect). max create_export_count=1 (0 rows>1) -> no
+  duplicate export. IN-only (owners+report jobs scoped to IN, keys subset of the 12, no ownerless source jobs). 0
+  reports complete (all 8 report jobs derive=pending/save=pending) -> nothing publishable. Live fingerprints
+  UNCHANGED: IN 9 rows (16eae8af) + non-IN 164 rows (cc9c2c91) == Appendix-AA. Controls == rollback state: rollout=1
+  IN enabled, all_primary=false, approvals={brand-sales/IN}, settings enabled={brand-sales} (12 paused), no cron.
+- STATUS: Gate 7b Phase 2 INCOMPLETE; dfca8f75 left intact + fully resumable (deleted nothing). brand-sales/IN stays
+  live/approved/byte-identical; 12 reports paused/unapproved; USA + others byte-identical; no cron. Future SEPARATE
+  authorization can resume+finalize this cycle (expected partial) and publish only reports whose full source set
+  independently succeeded, OR discard + re-attempt fresh -- only after DataDoe sales-traffic-asin-date stability
+  (Appendix Q.4) is resolved.
+
+STOP for Codex review. Docs-only + unpushed; production stays on 0ea9f34.
