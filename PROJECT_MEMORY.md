@@ -9581,3 +9581,37 @@ TRUNCATE,UPDATE), not exactly SELECT/INSERT/UPDATE.
   controls/publish/deploy/schedule.
 
 STOP for Codex review. Re-authorize to execute W.0 -> W.1 -> W.2 -> W.4 against the NEW frozen hash.
+
+## Scheduler v2 Gate 7a EXECUTED SUCCESSFULLY 2026-08-15 — Migration 6 now APPLIED (least-privilege ACL)
+
+Gate 7a was RE-AUTHORIZED against HEAD 69fa168 + frozen SHA-256
+bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7 and executed exactly per Appendix W
+(W.0 -> W.1 -> W.2 -> W.4). Evidence recorded in SCHEDULER_V2_ROLLOUT.md Appendix X.
+
+- W.0 offline preflight: PASS (HEAD 69fa168 exact; 6 hashes match, M6=bd03301...; readiness empty; verify 38/18;
+  diff clean; POSTGRES_URL present). 3 runners extracted verbatim + node --check clean; W.2 FROZEN=new hash.
+- W.1 read-only inventory: PASS (all assertions incl. corrected parser-independent roles check). BASELINE
+  cycles_count=5 cycles_digest=a8c97132102dd9e40ea46a799f54bb33 snap_count=23
+  snap_digest=3c4a1ed7284a615e5fc9ecac4d94cf01.
+- W.2 apply (one transaction, one commit): SUCCESS -- "applied 20260816_account_rollout.sql (data plane
+  unchanged; ACL asserted before commit)". Advisory lock (20260816,1); frozen hash verified; migrations 1-5 each
+  once + M6 absent re-checked in-tx; pre/post-DDL data digest identical; pre-COMMIT ACL asserted (service_role =
+  EXACTLY SELECT/INSERT/UPDATE, every grantee owner or service_role); plain ledger INSERT; COMMIT. Ledger
+  applied_at 2026-08-15T14:37:02.726Z; M6 ledger rows = 1.
+- W.4 read-only post-apply verify: PASS -- 15-column contract exact; 11 CHECK constraints valid; PKs; singleton
+  (1,false); rollout+approval tables empty; 3 touch triggers tgtype=19 -> scheduler_rollout_touch by OID; RLS on,
+  ZERO policies; service_role = EXACTLY SELECT/INSERT/UPDATE, no PUBLIC/anon/authenticated; ledger M6=1 +
+  migrations 1-5=1; migrations 1-5 objects unchanged; five terminal cycles unchanged; 13 controls paused; no
+  cron; data-plane digest byte-identical to the W.1 baseline. Independent read-only snapshot: applied_at
+  2026-08-15T14:37:02.726Z, M6 ledger=1, service_role=["INSERT","SELECT","UPDATE"] on all 3 tables.
+- CURRENT STATE: Migration 6 APPLIED; the 3 tables + trigger fn + 3 touch triggers + 11 constraints exist; all 3
+  tables EMPTY except the seeded singleton scheduler_rollout_mode (1, all_primary=false) => durable rollout
+  selects ZERO accounts and NOTHING is approved (system fully off at the data layer). Migrations 1-5
+  byte-identical; SCHEDULER_V2_READY_REPORT_KEYS empty; 13 report_sync_settings all schedule_enabled=false; no
+  pg_cron; no route/frontend/deploy change. The .sql file stays byte-frozen (its "PREPARED -- UNAPPLIED" header
+  comment is historical; the ledger row is authoritative).
+- NOT DONE (not authorized): no DataDoe call, report/account enable, publish, deploy, push, merge, cron/schedule,
+  or next-gate advance. Throwaway runner scripts removed after execution. Docs-only evidence commit.
+
+STOP for Codex review. The next gate (Appendix V IN-only enable package) remains BLOCKED pending review + a
+separate explicit authorization.

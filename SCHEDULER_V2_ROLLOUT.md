@@ -90,9 +90,20 @@ genuine defect was fixed OFFLINE: the migration now `REVOKE ALL … FROM public,
 then `GRANT SELECT, INSERT, UPDATE … TO service_role` on all three tables (least privilege; no
 delete/truncate/references/trigger/maintain), proven by a new static `auditServiceRoleAcl` (typed blockers
 `SERVICE_ROLE_REVOKE_MISSING`/`_GRANT_MISSING`/`_GRANT_MISMATCH`) and regressions (Gate-7 suite 45 checks;
-Appendix U.1/U.5). **The migration body changed, so the frozen SHA-256 is NEW
-(`bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`); Gate 7a must be RE-AUTHORIZED before
-re-execution.** Every remaining live step is **gated on explicit human approval**, one step at a time.
+Appendix U.1/U.5). The migration body changed, so the frozen SHA-256 became NEW
+(`bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`). **Gate 7a was then RE-AUTHORIZED and
+EXECUTED SUCCESSFULLY 2026-08-15 against that hash (Appendix X): W.0 / W.1 / W.2 / W.4 ALL PASSED, and
+Migration 6 is now APPLIED** — ledger `applied_at 2026-08-15T14:37:02.726Z` (exactly one row); the pre-COMMIT
+ACL gate passed with `service_role` = EXACTLY SELECT/INSERT/UPDATE on all three tables (W.4 re-proved it
+post-commit); the data plane is byte-identical to the W.1 baseline (digest-proven: `cycles_digest=a8c97132…`,
+`snap_digest=3c4a1ed7…`). **All three tables are EMPTY except the seeded singleton `scheduler_rollout_mode
+(1, all_primary=false)`, so the durable rollout selects ZERO accounts and NOTHING is approved — the system
+stays fully off at the data layer.** Migrations 1–5 remain byte-identical; `SCHEDULER_V2_READY_REPORT_KEYS`
+frozen empty; all 13 `report_sync_settings` rows `schedule_enabled=false`; no `pg_cron`; no
+route/frontend/deploy change. No DataDoe call, report/account enable, publish, deploy, push, merge, cron, or
+next-gate advance was performed. The next gate (Appendix V — the IN-only enable package) remains BLOCKED
+pending Codex review + a separate explicit authorization. Every remaining live step is **gated on explicit
+human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3091,7 +3102,7 @@ with a separate explicit all-primary switch preserved for the eventual full roll
 appendix is INERT until (a) migration 6 is applied via its own reviewed gate and (b) durable rows are
 explicitly written (Appendix V) — neither has happened.** No production connection was made in Gate 7.
 
-### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED; frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`)
+### U.1 Migration 6 — `20260816_account_rollout.sql` (**APPLIED 2026-08-15 via Appendix X**; frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`; the `.sql` file's "PREPARED — UNAPPLIED" header comment is historical review text kept to preserve the frozen hash — the ledger row is authoritative)
 
 Three ADDITIVE tables (no existing table/RPC/trigger/policy touched; RLS enabled with NO policies;
 `select/insert/update` granted to `service_role` only; the shared `scheduler_rollout_touch()` BEFORE UPDATE
@@ -3344,9 +3355,10 @@ no deploy, no schedule.
 
 ---
 
-## Appendix W — Gate 7a APPLY package: apply ONLY `20260816_account_rollout.sql` (PREPARED — NOT EXECUTED)
+## Appendix W — Gate 7a APPLY package: apply ONLY `20260816_account_rollout.sql` (**EXECUTED 2026-08-15 — see Appendix X for evidence**)
 
-> **NOTHING in this appendix has been run.** No production connection was made preparing it. It is the exact
+> **This package was EXECUTED 2026-08-15 (Appendix X): W.0/W.1/W.2/W.4 all PASSED and Migration 6 is now
+> APPLIED.** It is retained verbatim as the reviewed procedure. It is the exact
 > package a reviewer/operator executes **only after explicit written human approval**, one migration file only,
 > then STOPS for W.4. It follows the reviewed single-file gate shape of Migration 5 (Appendix O) and Migration 1
 > (Appendix B), hardened per Codex re-review: the verification steps are **genuinely read-only** (executed inside
@@ -3934,3 +3946,85 @@ merge, no schedule. Migration 6 (`20260816_account_rollout.sql`) remains **UNAPP
 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`; migrations 1–5 are byte-identical; all
 touched Gate-7 code files are unchanged (docs-only commit). **STOP.** Gate 7a executes ONLY after Codex review of
 this hardened package **and** explicit human approval — one migration file, then stop for W.4.
+
+---
+
+## Appendix X — Gate 7a EXECUTION evidence (APPLIED 2026-08-15; single guarded transaction; Migration 6 now APPLIED)
+
+Applies ONLY `20260816_account_rollout.sql` (the durable account-rollout control plane: `scheduler_account_rollout`,
+`scheduler_rollout_mode`, `scheduler_publish_approvals` + the shared touch trigger, 11 named constraints, RLS with
+zero policies, and the least-privilege `service_role` ACL). Executed with explicit human authorization against
+HEAD `69fa168` and the frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`, exactly
+per the reviewed Appendix W (W.0 → W.1 → W.2 → W.4), from `sales-dashboard-live/` with `node --env-file=../.env.local`
+(secrets never printed/committed). No `db:migrate`, no retry, no runner modification. This is the second Gate-7a
+execution attempt; the first (against the prior hash) correctly failed CLOSED at the pre-COMMIT ACL gate and rolled
+back — see the status header — after which the migration's `service_role` grants were corrected to least privilege.
+
+### X.1 W.0 offline preflight (all PASS)
+
+HEAD `69fa168` (exact); all six Scheduler-v2 migration SHA-256 match their frozen values (migration 6 =
+`bd03301c…c61457a7`; migrations 1–5 byte-identical); `SCHEDULER_V2_READY_REPORT_KEYS` frozen empty; `npm run verify`
+green (38 steps / 18 suites incl. `build:check`); `git diff --check` clean; working tree only `HANDOFF.md` +
+`.worktrees/` untracked; `POSTGRES_URL` present + nonblank (checked by NAME only). The three Appendix W runners were
+extracted verbatim from the committed doc and `node --check`-clean; the W.2 runner's `FROZEN` constant equals the
+new hash.
+
+### X.2 W.1 read-only inventory (PASS; rolled back)
+
+`gate7a-w1-inventory.mjs` (inside `BEGIN; SET TRANSACTION READ ONLY; … finally ROLLBACK`) passed EVERY assertion:
+ledger present with migrations 1–5 each exactly once and Migration 6 absent; the three Migration-6 tables /
+`scheduler_rollout_touch()` / its three triggers / its 11 named constraints all absent; prerequisites present
+(`report_sync_settings`, `auth.users`, and EXACTLY roles `anon`/`authenticated`/`service_role` via the corrected
+parser-independent check); the five operational sync tables present with column counts 18/27/25/15 +
+`ads_sync_coverage`; `finalize_sync_cycle` + the three no-append triggers OID-mapped to their exact tables + guard
+function with `tgenabled='O'` and `tgtype=23`; **EXACTLY the five recorded terminal cycles** (`57afc1fb` succeeded
+2/2/0·1/1/0; `56422a66` partial 57/44/13·13/2/11; `ac4cba6f` partial 56/39/17·13/3/10; `b0415a5b` partial
+135/84/51·13/4/9; `c70879e8` succeeded 133/133/0·13/13/0), every `finished_at` non-null; 13 report controls all
+`schedule_enabled=false`; no `cron.job`. **Recorded BASELINE (payload-free): `cycles_count=5`,
+`cycles_digest=a8c97132102dd9e40ea46a799f54bb33`, `snap_count=23`, `snap_digest=3c4a1ed7284a615e5fc9ecac4d94cf01`.**
+
+### X.3 W.2 apply — ONE transaction, ONE commit (SUCCESS)
+
+`gate7a-w2-apply.mjs` result: **`applied 20260816_account_rollout.sql (data plane unchanged; ACL asserted before
+commit)`**. In order, inside a single `BEGIN … COMMIT`: (0) the file's SHA-256 was re-verified against the frozen
+`bd03301c…` BEFORE connecting; (1) `pg_advisory_xact_lock(20260816, 1)` acquired before any ledger/object read;
+(2) migrations 1–5 confirmed recorded exactly once; (3) Migration 6 confirmed not already recorded; (4) every
+Migration-6 target object re-confirmed ABSENT (OID/public-scoped) inside the transaction; (5) the pre-DDL
+unchanged-data baseline captured; (6) the frozen migration body executed; (7) the post-DDL digest re-captured and
+compared — **no `sync_cycles` / `scheduler-v2/*` drift**; (8) the COMPLETE ACL asserted BEFORE commit — every
+explicit grantee is the table owner or `service_role`, and **`service_role` holds EXACTLY `{SELECT, INSERT,
+UPDATE}`** on each table (the correction that the first attempt's gate demanded); (9) the ledger row recorded with
+a PLAIN `INSERT` (no `ON CONFLICT`); (10) a single `COMMIT`. **Ledger `applied_at = 2026-08-15T14:37:02.726Z`;
+Migration 6 ledger rows = 1.**
+
+### X.4 W.4 read-only post-apply verification (all PASS; rolled back)
+
+`gate7a-w4-verify.mjs` result: **`W.4 VERIFY PASS -- 15-column contract exact; ACL owner+service_role only; data
+plane byte-identical to the W.1 baseline; five terminal cycles + migrations 1-5 + 13 paused controls intact; no
+cron; transaction rolls back (read-only).`** Proven post-commit: the three tables' EXACT ordered 15-column contract
+(name / PostgreSQL type / nullability / normalized default); all 11 named CHECK constraints present + `convalidated`
+with exact bodies; PKs; the singleton `scheduler_rollout_mode` row `(1,false)`; zero rows in
+`scheduler_account_rollout` + `scheduler_publish_approvals`; the three BEFORE-UPDATE-FOR-EACH-ROW touch triggers
+(`tgtype=19`) executing `public.scheduler_rollout_touch` by OID; RLS enabled with **zero policies**; **no
+PUBLIC/anon/authenticated grant and `service_role` = EXACTLY SELECT+INSERT+UPDATE** on all three; Migration-6 ledger
+= 1 and migrations 1–5 each = 1; migrations 1–5 objects unchanged (column counts + `finalize_sync_cycle` + the three
+no-append triggers OID/`tgenabled`/`tgtype=23`); the five terminal cycles unchanged; 13 controls paused; no cron;
+and the unchanged-data digest **byte-identical to the W.1 baseline** (`cycles_digest=a8c97132…`, `snap_digest=3c4a1ed7…`).
+
+An independent read-only evidence snapshot confirmed: `applied_at 2026-08-15T14:37:02.726Z`, Migration-6 ledger
+rows = 1, and `service_role` = `["INSERT","SELECT","UPDATE"]` on each of the three tables.
+
+### X.5 State + guardrails
+
+- **Migration 6 is now APPLIED** (ledger authoritative); the three tables + trigger function + three touch triggers
+  + 11 constraints exist; all three tables are **EMPTY except** the seeded singleton `scheduler_rollout_mode (1,
+  all_primary=false)`. The durable rollout therefore selects **ZERO accounts** and NOTHING is approved — the system
+  stays fully off at the data layer.
+- **UNCHANGED:** migrations 1–5 byte-identical; the five terminal cycles + all `scheduler-v2/*` snapshots
+  byte-identical (digest-proven); `SCHEDULER_V2_READY_REPORT_KEYS` frozen empty; 13 `report_sync_settings` rows all
+  `schedule_enabled=false`; no `pg_cron` schedule; no route/frontend/deploy change.
+- **NOT DONE (not authorized):** no DataDoe call; no report/account enable; no publish; no deploy/push/merge; no
+  cron/schedule; no advance to the next rollout gate. The throwaway runner scripts were removed after execution.
+
+**STOP.** Gate 7a is complete. The next gate (Appendix V — the IN-only enable package) remains BLOCKED pending
+Codex review of this evidence and a separate explicit authorization.
