@@ -71,7 +71,7 @@ validator (impossible dates + reversed `from/to` rejected; each of the 13 exact 
 (3) migration 6 adds named canonical-identity constraints (`account_id`/`report_key`/`approved_by` =
 `btrim(...)`) and the rollout reader/resolver + `buildSchedulerV2CanaryRuntime` now FAIL CLOSED on noncanonical
 durable ids (never silently trimmed into another account; the canary also rejects duplicate ids). **Migration 6
-REMAINS UNAPPLIED (new frozen SHA-256 `0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`);
+REMAINS UNAPPLIED (new frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`);
 migrations 1–5 byte-identical.** No control unlock, publish, deploy, schedule, or migration apply has happened
 in Gate 7. **Gate 7 PASSED final Codex review; the Gate 7a APPLY package (apply ONLY
 `20260816_account_rollout.sql`, the reviewed single-file gate) is PREPARED as Appendix W but NOT EXECUTED** —
@@ -80,8 +80,19 @@ docs-only):** its inventory/verification steps are genuinely read-only (`BEGIN; 
 with an always-ROLLBACK `finally`), every object check is scoped to the exact `public` relation/function OID (a
 same-named object in another schema can neither PASS nor false-STOP), the unchanged-data claim is backed by
 deterministic count+content digests compared before/after the apply (no "counts alone"), and the complete table
-ACL is enumerated + asserted before COMMIT. Every remaining live step is **gated on explicit human approval**,
-one step at a time.
+ACL is enumerated + asserted before COMMIT. **Gate 7a EXECUTION was AUTHORIZED and ATTEMPTED (2026-08-15):**
+W.0 offline preflight PASSED; corrected W.1 read-only inventory PASSED (baseline `cycles_count=5`/`snap_count=23`);
+**W.2 REFUSED at the pre-COMMIT ACL gate** — inside the transaction `service_role` held ALL 8 PostgreSQL-17
+table privileges (Supabase project-level DEFAULT PRIVILEGES grant `service_role` ALL on every new public table),
+not the required exactly SELECT/INSERT/UPDATE. The ACL gate did its job: **the transaction ROLLED BACK before
+the ledger insert/COMMIT, Migration 6 remained UNAPPLIED, and the W.1 baseline re-read byte-identical.** The
+genuine defect was fixed OFFLINE: the migration now `REVOKE ALL … FROM public, anon, authenticated, service_role`
+then `GRANT SELECT, INSERT, UPDATE … TO service_role` on all three tables (least privilege; no
+delete/truncate/references/trigger/maintain), proven by a new static `auditServiceRoleAcl` (typed blockers
+`SERVICE_ROLE_REVOKE_MISSING`/`_GRANT_MISSING`/`_GRANT_MISMATCH`) and regressions (Gate-7 suite 45 checks;
+Appendix U.1/U.5). **The migration body changed, so the frozen SHA-256 is NEW
+(`bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`); Gate 7a must be RE-AUTHORIZED before
+re-execution.** Every remaining live step is **gated on explicit human approval**, one step at a time.
 This document is the plan Codex senior review evaluates; it does not authorize any step by itself.
 
 The composed runtime + the no-side-effect preflight this runbook drives live in
@@ -3080,7 +3091,7 @@ with a separate explicit all-primary switch preserved for the eventual full roll
 appendix is INERT until (a) migration 6 is applied via its own reviewed gate and (b) durable rows are
 explicitly written (Appendix V) — neither has happened.** No production connection was made in Gate 7.
 
-### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED; frozen SHA-256 `0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`)
+### U.1 Migration 6 — `20260816_account_rollout.sql` (PREPARED, NOT APPLIED; frozen SHA-256 `bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`)
 
 Three ADDITIVE tables (no existing table/RPC/trigger/policy touched; RLS enabled with NO policies;
 `select/insert/update` granted to `service_role` only; the shared `scheduler_rollout_touch()` BEFORE UPDATE
@@ -3237,9 +3248,9 @@ The 13 canonical mappings (transcribed from the executable live routes — `api/
 | ppc-performance | ppc-performance | ppc-performance-v1 | `{ to }` |
 | listing-optimizer | listing-optimizer | listing-optimizer-v1 | `{ to }` |
 
-### U.5 Executable regression evidence (offline; zero I/O; correction tranche 2)
+### U.5 Executable regression evidence (offline; zero I/O; correction tranche 2 + ACL correction)
 
-`scripts/gate7-rollout-publisher.test.js` — **43 checks** in 9 groups (registered in `package.json` +
+`scripts/gate7-rollout-publisher.test.js` — **45 checks** in 9 groups (registered in `package.json` +
 `scripts/verify.mjs`): (A) pure resolver fail-closed semantics; (B) dispatcher enforcement — default
 locked/empty controls = zero I/O, missing-loader refusal for EVERY dispatch, read-failure fail-closed
 (zero discovery/cycle/store/DataDoe I/O), zero-default drain, ONLY IN selected from a 30-account discovery
@@ -3266,10 +3277,15 @@ composition code-locked, `publish()` caller can inject nothing, ONE memoized fre
 publishes; (EM) migration-6 audit integrity — the real migration proves all **11** named constraints;
 removing OR weakening the audited-decision / prefix-rejection / **canonical-identity** constraints is a typed
 `NAMED_CONSTRAINT_MISSING` blocker, and each canonical constraint is proven table-scoped/exact/mandatory
-(EM3); (F) the 13 contracts statically pinned against `api/datadoe.js` literals and the live insight modules'
+(EM3); **least-privilege `service_role` ACL — all three tables prove REVOKE-ALL-from-`service_role` + exactly
+`{select,insert,update}`, and the missing-revoke / GRANT-ALL / added-DELETE / wrong-table / comment-only /
+string-only mutations each fail with a typed `SERVICE_ROLE_*` blocker (EM4)**; (F) the 13 contracts statically
+pinned against `api/datadoe.js` literals and the live insight modules'
 exported constants, plus STRICT calendar-date validation (impossible dates + reversed `from/to` rejected;
 leap-day + boundaries pass; F2b); (G) structural isolation (no api/ reference to the publisher / composition
-/ rollout / CAS primitive; the dispatcher never auto-publishes). Existing suites updated only in their
+/ rollout / CAS primitive; the dispatcher never auto-publishes) **plus the rollout-table wrapper privilege
+proof (G3): the runtime wrappers only READ the three tables (no POST/PATCH/DELETE), so SELECT/INSERT/UPDATE
+suffices and DELETE/TRUNCATE are never needed**. Existing suites updated only in their
 HARNESS defaults (all-primary loader injection): `sync-dispatch.test.js` 37, `sync-runtime-composition.test.js`
 26, `cycle-lifecycle.test.js` 16, `cycle-finalize-wiring.test.js` 14 — all green; full `npm run verify` green
 (38 steps / 18 suites including `build:check`).
@@ -3357,7 +3373,7 @@ migration present, so no schedule can be applied here regardless. No `DROP`, no 
 544557fb29b1ae8e03e9c8d263d8b2fba73853853273f30c517cbc30938bea4c  supabase/migrations/20260810_report_sync_controls.sql(migration 3 — FROZEN)
 49628c8d701b3d1ca3b22b131bd8d8f8122585cd0461133f094a7a0154d98669  supabase/migrations/20260811_sync_source_job_owners.sql(migration 4 — FROZEN)
 5222a8e55c89bbcb21fe10b9f1f755d795aecee69f4ac0d5a15c61d459823759  supabase/migrations/20260815_sync_cycle_finalize.sql (migration 5 — FROZEN)
-0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735  supabase/migrations/20260816_account_rollout.sql     (migration 6 — THE ONE TO APPLY)
+bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7  supabase/migrations/20260816_account_rollout.sql     (migration 6 — THE ONE TO APPLY)
 ```
 
 - `SCHEDULER_V2_READY_REPORT_KEYS` still **frozen empty** (`Object.freeze([])` in
@@ -3532,7 +3548,7 @@ cat > gate7a-w2-apply.mjs <<'NODE'
 import pg from "pg"; import { readFileSync } from "node:fs"; import { createHash } from "node:crypto";
 const M6 = "20260816_account_rollout.sql";
 const PATH = "supabase/migrations/" + M6;   // run from sales-dashboard-live/
-const FROZEN = "0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735";
+const FROZEN = "bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7";
 const PRIOR = ["20260807_scheduler_v2.sql","20260810_ads_sync_coverage.sql","20260810_report_sync_controls.sql",
                "20260811_sync_source_job_owners.sql","20260815_sync_cycle_finalize.sql"];
 const M6_TABLES = ["public.scheduler_account_rollout","public.scheduler_rollout_mode","public.scheduler_publish_approvals"];
@@ -3632,8 +3648,15 @@ rm gate7a-w2-apply.mjs
 - **Seeds** the singleton `scheduler_rollout_mode` row `(1, all_primary=false)` with `on conflict (id) do
   nothing` (idempotent).
 - **Enables RLS** on all three tables and creates **ZERO policies**; **revokes ALL** from
-  `PUBLIC`/`anon`/`authenticated` and **grants SELECT/INSERT/UPDATE to `service_role`** on each table (asserted by
-  W.2 step 8 before commit and re-proven in W.4).
+  `PUBLIC`/`anon`/`authenticated` **AND `service_role`** (stripping the Supabase project-level default-privilege
+  ALL grant), then **grants EXACTLY SELECT/INSERT/UPDATE to `service_role`** on each table — no
+  delete/truncate/references/trigger/maintain; the table owner's inherent privileges are untouched. The static
+  `auditServiceRoleAcl` proves both the REVOKE-ALL-from-`service_role` and the exact `{select,insert,update}`
+  grant per table (typed blockers `SERVICE_ROLE_REVOKE_MISSING`/`_GRANT_MISSING`/`_GRANT_MISMATCH`; comment/
+  string-only, wrong-table, GRANT-ALL, and added-DELETE evidence all fail — EM4). The runtime wrappers only READ
+  these tables; the operator's enable/approve is an INSERT and disable/revoke is an UPDATE (`enabled`/`approved`
+  = false), never a DELETE (G3). The applied grant posture is asserted by W.2 step 8 before commit and re-proven
+  in W.4.
 - **Creates NO schedule** (no `pg_cron`/`pg_net`), performs **NO DataDoe call**, opens **no cycle**, writes **no
   snapshot**, and does **not** touch `SCHEDULER_V2_READY_REPORT_KEYS`, `report_sync_settings`, or any migration
   1-5 object. Every table uses `create table if not exists`, which is exactly why W.1 + the W.2 in-transaction
@@ -3908,6 +3931,6 @@ rm gate7a-w4-verify.mjs
 This turn made **no production connection** and executed **nothing** against the database: no migration applied,
 no DataDoe call, no snapshot published, no report unlocked, no durable control changed, no deploy, no push, no
 merge, no schedule. Migration 6 (`20260816_account_rollout.sql`) remains **UNAPPLIED** and byte-frozen at SHA-256
-`0d715eb78724c6a9c942fde9948b2e995e2f9466d67e7b635464d8a33ba4a735`; migrations 1–5 are byte-identical; all
+`bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7`; migrations 1–5 are byte-identical; all
 touched Gate-7 code files are unchanged (docs-only commit). **STOP.** Gate 7a executes ONLY after Codex review of
 this hardened package **and** explicit human approval — one migration file, then stop for W.4.

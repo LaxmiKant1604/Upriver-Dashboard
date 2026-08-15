@@ -9538,3 +9538,46 @@ TRANSACTION READ ONLY; finally ROLLBACK), W.2 apply was NOT run, Migration 6 rem
   byte-identical; readiness allowlist empty; 13 controls paused; no code/test/migration/control/schedule change.
 
 STOP for Codex re-review. After approval, re-authorize to execute W.0 -> W.1 -> W.2 -> W.4 exactly.
+
+## Scheduler v2 Gate 7a: Migration-6 service_role ACL defect fixed to least privilege (OFFLINE, 2026-08-15) — new frozen hash; Migration 6 still UNAPPLIED
+
+Gate 7a was AUTHORIZED and execution ATTEMPTED. W.0 offline preflight PASSED; corrected W.1 read-only inventory
+PASSED (baseline cycles_count=5 cycles_digest=a8c97132102dd9e40ea46a799f54bb33 snap_count=23
+snap_digest=3c4a1ed7284a615e5fc9ecac4d94cf01). W.2 REFUSED at the pre-COMMIT ACL gate: inside the transaction
+service_role held ALL 8 PostgreSQL-17 table privileges (DELETE,INSERT,MAINTAIN,REFERENCES,SELECT,TRIGGER,
+TRUNCATE,UPDATE), not exactly SELECT/INSERT/UPDATE.
+
+- ROOT CAUSE (genuine defect, not a false STOP): Supabase applies project-level DEFAULT PRIVILEGES that GRANT
+  service_role ALL on every new public table. The old migration revoked only from public/anon/authenticated
+  (NOT service_role), then granted select/insert/update (a subset), so service_role kept ALL. The W.2 ACL gate
+  correctly caught the unexpected privilege set and rolled the transaction back BEFORE the ledger insert/commit.
+  Migration 6 remained UNAPPLIED; a read-only W.1 re-run confirmed byte-identical baseline (M6 absent,
+  migrations 1-5 each once, 5 terminal cycles, digests unchanged). The MAINTAIN privilege confirms prod is
+  PostgreSQL 17.
+- FIX (offline, code/tests commit 20e35c2): 20260816_account_rollout.sql now, for each of the 3 tables,
+  `revoke all on public.<t> from public, anon, authenticated, service_role;` THEN
+  `grant select, insert, update on public.<t> to service_role;` -- least privilege (no delete/truncate/
+  references/trigger/maintain); the table owner's inherent privileges are untouched. No change to columns/
+  constraints/triggers/RLS/seed/behavior.
+- AUDIT: new auditServiceRoleAcl (schema-contract.js) proves, on the SQL-aware `masked` view (comments +
+  string contents blanked), that each EXACT public.<table> (1) REVOKEs ALL from service_role and (2) the union
+  of GRANT ... to service_role privileges equals exactly {select,insert,update}. Pinned to public.<table> with
+  a trailing \b and single-statement [^;] bounding. New typed blockers SERVICE_ROLE_REVOKE_MISSING /
+  SERVICE_ROLE_GRANT_MISSING / SERVICE_ROLE_GRANT_MISMATCH. Contract entries carry serviceRoleAcl
+  {revokeAll:true, grants:[select,insert,update]} for all 3 tables.
+- REGRESSIONS (gate7-rollout-publisher.test.js 43 -> 45): EM4 proves the real ACL for all 3 tables + the
+  missing-revoke / GRANT ALL / added-DELETE / wrong-table / comment-only / string-only mutations each fail with
+  the expected typed blocker (+ table-scoping); G3 proves the runtime wrappers only READ the 3 tables (no
+  POST/PATCH/DELETE), revoke/disable are UPDATEs (enabled/approved=false) never DELETEs, and the migration
+  grants service_role no delete/truncate/references/trigger/maintain.
+- HASH: NEW Migration-6 SHA-256 bd03301ce71c13db419cf950e537c46f4e1fe7d8fd2c8291952c667ac61457a7 (SUPERSEDES
+  the prior 0d715eb...ba4a735, which is now stale). Replaced in all SCHEDULER_V2_ROLLOUT.md Gate-7/7a authoritative
+  references + the W.0 preflight table + the W.2 FROZEN runner constant. Gate 7a must be RE-AUTHORIZED before
+  re-execution (the migration body changed).
+- Docs (commit separate): status header records the aborted W.2 + the fix + new hash; U.1 grants description +
+  U.5 (45 checks, EM4/G3) updated. npm run verify: 38 steps / 18 suites incl build:check; node --check clean;
+  git diff --check clean; migrations 1-5 byte-identical. OFFLINE only: no production connection this turn;
+  W.1/W.2/W.4 not re-run; Migration 6 NOT applied; W.2/W.4 exact ACL assertions unchanged; no
+  controls/publish/deploy/schedule.
+
+STOP for Codex review. Re-authorize to execute W.0 -> W.1 -> W.2 -> W.4 against the NEW frozen hash.
