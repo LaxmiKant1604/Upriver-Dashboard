@@ -1362,6 +1362,101 @@ export async function recordAdsCoverageWindows(rows) {
   }
 }
 
+/**
+ * Gate-7 DURABLE ACCOUNT ROLLOUT state (20260816_account_rollout.sql -- PREPARED). Typed + FAIL-CLOSED:
+ *   { read: "ok"|"schema-missing"|"read-failed", allPrimary: boolean, enabledAccountIds: string[] }
+ * A non-"ok" read MUST select zero accounts (the resolver enforces it); default durable state (no rows,
+ * all_primary=false) also selects zero. Never throws; never returns a partial/guessed state as "ok".
+ */
+export async function getSchedulerAccountRollout() {
+  try {
+    const modeRows = await request("/rest/v1/scheduler_rollout_mode?select=all_primary&id=eq.1");
+    const allowRows = await request("/rest/v1/scheduler_account_rollout?select=account_id&enabled=eq.true&order=account_id.asc");
+    const allPrimary = !!(modeRows && modeRows[0] && modeRows[0].all_primary === true);
+    const enabledAccountIds = (allowRows || [])
+      .map((r) => String(r.account_id || "").trim())
+      .filter((id) => id.length > 0);
+    return { read: "ok", allPrimary, enabledAccountIds };
+  } catch (error) {
+    return {
+      read: isSchemaMissingError(error) ? "schema-missing" : "read-failed",
+      allPrimary: false,
+      enabledAccountIds: [],
+    };
+  }
+}
+
+/**
+ * Gate-7 durable PUBLISH approval for one exact (report_key, account_id). Typed + fail-closed:
+ *   { read: "ok"|"schema-missing"|"read-failed", approved: boolean }
+ * Absent row / non-"ok" read => approved:false. Never throws.
+ */
+export async function getSchedulerPublishApproval(reportKey, accountId) {
+  try {
+    const query = new URLSearchParams({
+      select: "approved",
+      report_key: `eq.${reportKey}`,
+      account_id: `eq.${accountId}`,
+      limit: "1",
+    });
+    const rows = await request(`/rest/v1/scheduler_publish_approvals?${query}`);
+    return { read: "ok", approved: !!(rows && rows[0] && rows[0].approved === true) };
+  } catch (error) {
+    return { read: isSchemaMissingError(error) ? "schema-missing" : "read-failed", approved: false };
+  }
+}
+
+/**
+ * Gate-7 shadow-to-live CAS publish primitive on the natural key (report_key, account_id, params_hash):
+ *   1. INSERT-IF-ABSENT (ignore-duplicates + representation): inserted => { outcome: "inserted" }.
+ *   2. On conflict, a GUARDED PATCH that replaces the row ONLY when the existing live
+ *      source_refreshed_at is STRICTLY OLDER than the incoming snapshot's -- so a replay can never
+ *      duplicate a publish and a NEWER live snapshot always wins. Skipped => reads the live row's
+ *      source_refreshed_at so the caller can classify already-current vs newer-live.
+ * Touches ONLY the one (report_key, account_id, params_hash) row -- never another account/report. Throws on
+ * transport failure (the caller maps to a typed safe disposition).
+ */
+export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt }) {
+  const body = {
+    report_key: reportKey,
+    account_id: accountId,
+    params_hash: paramsHash,
+    params: params || {},
+    payload: payload || null,
+    payload_storage_path: null,
+    payload_bytes: payloadBytes || 0,
+    source_refreshed_at: sourceRefreshedAt,
+  };
+  const inserted = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+    body,
+  });
+  if (Array.isArray(inserted) && inserted.length > 0) return { outcome: "inserted", liveRefreshedAt: sourceRefreshedAt };
+  const filter = new URLSearchParams({
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+    source_refreshed_at: `lt.${sourceRefreshedAt}`,
+  });
+  const replaced = await request(`/rest/v1/report_snapshots?${filter}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: { params: body.params, payload: body.payload, payload_bytes: body.payload_bytes, source_refreshed_at: body.source_refreshed_at },
+  });
+  if (Array.isArray(replaced) && replaced.length > 0) return { outcome: "replaced", liveRefreshedAt: sourceRefreshedAt };
+  // Neither inserted nor replaced: the live row exists and is NOT older. Read its timestamp for classification.
+  const check = new URLSearchParams({
+    select: "source_refreshed_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${check}`);
+  return { outcome: "skipped", liveRefreshedAt: rows && rows[0] ? rows[0].source_refreshed_at : null };
+}
+
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
 // request, so this pages. If an account's window genuinely exceeds the budget
 // the caller throws rather than aggregating a partial window, because a

@@ -217,6 +217,10 @@ function dispatch(over = {}) {
     store, dataDoe: dd, saveSnapshot: saver,
     controlCatalog: over.controlCatalog, settings: over.settings, manualReportKeys: over.manualReportKeys,
     ppcAdsProviders: over.ppcAdsProviders, loadDerivedContext: over.loadDerivedContext,
+    // Gate-7 durable account rollout: SCHEDULED runs require the trusted loader. The harness default is the
+    // deliberate all-primary state so the pre-Gate-7 scheduled-path semantics (every discovered primary
+    // account participates) are preserved for the existing suite; gate-specific tests override it.
+    loadAccountRollout: "loadAccountRollout" in over ? over.loadAccountRollout : (async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] })),
     maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
   });
   return { store, dd, saver, promise: p };

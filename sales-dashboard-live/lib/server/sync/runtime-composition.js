@@ -19,7 +19,7 @@ import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver }
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
 import { schedulerV2ReportControlCatalog } from "./report-controls.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
-import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings } from "../supabase.js";
+import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
 // The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
@@ -128,6 +128,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     controlCatalog = schedulerV2ReportControlCatalog,
     fetchAccounts = fetchDataDoeAccounts,
     getReportSyncSettings: readReportSyncSettings = getReportSyncSettings, // DURABLE scheduled-control source
+    getAccountRollout = getSchedulerAccountRollout, // DURABLE account-rollout source (Gate-7; fail-closed typed reader)
     // Ads readers -- ALL Supabase, cache-only; NEVER a DataDoe export:
     getAdMetrics = getAdDailyMetrics,             // Daily Reporting ad_daily_metrics reader
     getCoverageState = getDailyAdsCoverage,        // Daily durable ads_sync_coverage reader
@@ -154,9 +155,12 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const ppcAdsProviders = { getAdsDailySourceRows: ppcRows, getAdsSyncStates: ppcStates, getAdsSyncCoverage: ppcCoverage };
   const loadDerivedContext = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
+  // Gate-7 durable ACCOUNT gate loader (scheduled runs only; the dispatcher enforces it). Trusted + fixed:
+  // RUN_OPERATIONAL_ARGS does not include it, so a per-run caller can never widen (or narrow) account scope.
+  const loadAccountRollout = async () => getAccountRollout();
 
   // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
-  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog };
+  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout };
 
   // Load the DURABLE report scheduling controls (report_sync_settings) -- the ONLY production control source
   // for the scheduled path. A read failure THROWS here, so it fails closed BEFORE runSchedulerV2Shadow does

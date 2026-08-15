@@ -16,6 +16,7 @@
 // It creates NO cron, route, migration, deployment or frontend wiring, and unlocks no report.
 
 import { buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } from "./report-planner.js";
+import { resolveRolloutAccounts } from "./account-rollout.js";
 import { runStagedSourceCycle, plannedSourceJob } from "./source-sync-driver.js";
 import { runReportJobs } from "./report-worker.js";
 import { runKeywordRankShadowCycle } from "./keyword-rank-cycle.js";
@@ -149,6 +150,7 @@ export async function runSchedulerV2Shadow({
   connections, discoverAccounts,
   store, dataDoe, saveSnapshot,
   ppcAdsProviders = null, loadDerivedContext = null,
+  loadAccountRollout = null,
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity,
   scheduledAt = null, trigger = "manual",
 }) {
@@ -186,14 +188,36 @@ export async function runSchedulerV2Shadow({
   // report) performs ZERO I/O -- return a deterministic drained rollup BEFORE discoverAccounts, cycle creation,
   // or ANY store/DataDoe call. Under the default fail-closed v2 catalog EVERY report is locked, so a real
   // manual OR scheduled invocation returns here without touching discovery, the store, or DataDoe.
+  const drainedNoOp = (extra = {}) => ({
+    bucket, cycleId: null, manual,
+    selected: dispatchable.map((r) => r.reportKey), lockedOut, derivedOnly,
+    unavailableAccounts: [], accountsDispatched: [],
+    spent: 0, maxJobs, stoppedForBudget: false, drained: true, continuationRequired: false, perUnit: [], reports: null,
+    finalized: false, cycleStatus: null, // no cycle was opened -> nothing to finalize
+    ...extra,
+  });
   if (dispatchable.length === 0 && derivedOnly.length === 0) {
-    return {
-      bucket, cycleId: null, manual,
-      selected: [], lockedOut, derivedOnly,
-      unavailableAccounts: [], accountsDispatched: [],
-      spent: 0, maxJobs, stoppedForBudget: false, drained: true, continuationRequired: false, perUnit: [], reports: null,
-      finalized: false, cycleStatus: null, // no cycle was opened -> nothing to finalize
-    };
+    return { ...drainedNoOp(), selected: [] };
+  }
+
+  // Gate-7 DURABLE ACCOUNT ROLLOUT -- an ADDITIONAL, INDEPENDENT gate for SCHEDULED runs only (a manual
+  // shadow canary stays explicit and isolated: its account scope comes from the operator's reviewed run,
+  // never from the durable rollout). The rollout state is loaded BEFORE discovery so a read/schema failure
+  // -- or the default zero-account state -- performs ZERO discovery/cycle/store/DataDoe work (fail closed;
+  // no wildcard, no implicit fallback). A caller cannot override the loader (runtime composition fixes it).
+  let rolloutState = null;
+  if (!manual) {
+    if (typeof loadAccountRollout !== "function") {
+      throw new Error("runSchedulerV2Shadow: a SCHEDULED run requires the trusted durable account-rollout loader (loadAccountRollout); refusing to dispatch (fail closed).");
+    }
+    rolloutState = await loadAccountRollout();
+    // Probe the resolver with an EMPTY directory so the state's own normalization decides: a failed read,
+    // or an allowlist with no VALID id (blank / dd-secondary-prefixed rows are dropped by the same shared
+    // implementation), can never select an account -- so neither spends even the read-only discovery call.
+    const probe = resolveRolloutAccounts(rolloutState, []);
+    if (probe.reason === "rollout-read-not-ok" || probe.reason === "allowlist-empty") {
+      return drainedNoOp({ accountRollout: { selected: 0, reason: probe.reason === "rollout-read-not-ok" ? "rollout-read-not-ok" : "zero-accounts-enabled" } });
+    }
   }
 
   const dispatchSet = new Set(dispatchable.map((r) => r.reportKey));
@@ -222,14 +246,29 @@ export async function runSchedulerV2Shadow({
   //    a newly connected primary account is included the moment discovery returns it.
   const directoryRows = (await discoverAccounts()) || [];
   const { active, unavailable } = classifyDirectoryAccounts(directoryRows, connections);
-  const bucketAccounts = active
+  let bucketAccounts = active
     .map((a) => ({ accountId: a.accountId ?? a.id, country: a.country, currency: a.currency, name: a.name }))
     .filter((a) => a.accountId && bucketForCountry(a.country) === bucket);
+
+  // Gate-7 rollout FILTER (scheduled only; applied BEFORE any cycle/source planning): keep exactly the
+  // discovered primary accounts the durable state selects -- allowlist rows by EXACT public id, or every
+  // primary account under the deliberate all-primary switch. Stale/unknown allowlist rows match nothing and
+  // spend nothing. Zero selected accounts => a drained no-op with ZERO cycle/store/DataDoe writes.
+  let rolloutInfo = null;
+  if (!manual) {
+    const resolved = resolveRolloutAccounts(rolloutState, bucketAccounts);
+    bucketAccounts = resolved.accounts;
+    rolloutInfo = { selected: resolved.selectedIds.length, staleIds: resolved.staleIds, reason: resolved.reason };
+    if (bucketAccounts.length === 0) {
+      return drainedNoOp({ unavailableAccounts: unavailable, accountRollout: rolloutInfo });
+    }
+  }
 
   const rollup = {
     bucket, cycleId: null, manual,
     selected: dispatchable.map((r) => r.reportKey), lockedOut, derivedOnly,
     unavailableAccounts: unavailable, accountsDispatched: bucketAccounts.map((a) => a.accountId),
+    accountRollout: rolloutInfo,
     spent: 0, maxJobs, stoppedForBudget: false, drained: false, continuationRequired: false, perUnit: [], reports: null,
   };
   const collectedReports = [];

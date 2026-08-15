@@ -189,6 +189,9 @@ const dispatch = (over = {}) => runSchedulerV2Shadow({
   connections: CONNS, discoverAccounts: async () => US_ACCTS,
   store: over.store, dataDoe: over.dataDoe || makeDataDoe(), saveSnapshot: saver,
   controlCatalog: over.controlCatalog, manualReportKeys: over.manualReportKeys,
+  // Gate-7 durable account rollout: SCHEDULED runs require the trusted loader; the harness default is the
+  // deliberate all-primary state so this suite's pre-Gate-7 lifecycle semantics are preserved.
+  loadAccountRollout: "loadAccountRollout" in over ? over.loadAccountRollout : (async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] })),
   maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
 });
 // scheduled run: ready + schedule-enabled, NO manualReportKeys

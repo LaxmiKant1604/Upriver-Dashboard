@@ -45,6 +45,7 @@ const SUITES = [
   "test:cycle-finalize-wiring",
   "test:timeout-slicing",
   "test:ads-sync-canary",
+  "test:gate7-rollout-publisher",
   "build:check",
 ];
 

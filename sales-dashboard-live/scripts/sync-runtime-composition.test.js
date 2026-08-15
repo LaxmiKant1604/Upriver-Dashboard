@@ -135,6 +135,9 @@ function makeRuntime(over = {}) {
     getAdsSyncStates: over.getAdsSyncStates || (async () => []),
     getAdsSyncCoverage: over.getAdsSyncCoverage || (async () => ({ windows: [], status: "missing", read: "ok" })),
     getReportSyncSettings: over.getReportSyncSettings || (async () => []), // durable scheduled controls (injected)
+    // Gate-7 durable account rollout: the harness default is the deliberate all-primary state so the
+    // pre-Gate-7 composed-runtime semantics hold for this suite; gate-specific tests override it.
+    getAccountRollout: "getAccountRollout" in over ? over.getAccountRollout : (async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] })),
     controlCatalog: over.controlCatalog, // undefined => production fail-closed default
   });
   return { rt, store, dd, saver };

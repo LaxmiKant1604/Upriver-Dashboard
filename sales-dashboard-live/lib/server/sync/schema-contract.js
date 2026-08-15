@@ -126,6 +126,33 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["finalizeSyncCycle"],
     note: "Guarded finalize_sync_cycle RPC + reject_append_to_terminal_cycle triggers on the 3 child tables (PREPARED, UNAPPLIED).",
   },
+  {
+    // Gate-7 ACCOUNT ROLLOUT control plane: the durable, fail-closed ACCOUNT gate (allowlist + deliberate
+    // all-primary switch) and the per-(report, account) publish approvals. ADDITIVE only -- no existing table
+    // is touched; report_sync_settings / report-level readiness are NOT weakened (the account gate is an
+    // additional, independent gate).
+    migration: "20260816_account_rollout.sql",
+    tables: [
+      {
+        name: "scheduler_account_rollout",
+        unique: [["account_id"]],
+        keyColumns: ["account_id", "enabled", "note", "created_at", "updated_at"],
+      },
+      {
+        name: "scheduler_rollout_mode",
+        unique: [["id"]],
+        keyColumns: ["id", "all_primary", "updated_at"],
+      },
+      {
+        name: "scheduler_publish_approvals",
+        unique: [["report_key", "account_id"]],
+        keyColumns: ["report_key", "account_id", "approved", "approved_by", "approved_at", "created_at", "updated_at"],
+      },
+    ],
+    rpcs: [],
+    wrappers: ["getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer"],
+    note: "Durable account rollout (allowlist + all-primary switch) + publish approvals (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -603,6 +630,7 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "upsertSyncSourceJobOwners", "getSyncSourceJobOwners", "getSyncSourceJobsForOwners", "recordSyncSourceJobOwnerStale",
   "getSourceExportCache", "getDailyAdsCoverage", "recordAdsCoverageWindows", "getReportSyncSettings",
   "getAdDailyMetrics", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
+  "getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer",
 ]);
 
 /**
