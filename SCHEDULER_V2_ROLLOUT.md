@@ -2750,14 +2750,46 @@ rejection, DataDoe failure, coverage-write failure); the `skipped` path (lock he
 releases. The worker is now a dependency-injected core `runAdsSyncWithDeps(deps, …)` with a production wrapper
 `runAdsSync = runAdsSyncWithDeps(PRODUCTION_ADS_SYNC_DEPS, …)`.
 
-### R.4 Verification
+### R.4 Per-batch row validation (fix, 2026-08-15; commit `539bdfa`)
 
-New `scripts/ads-sync-canary.test.js` (**15 assertions**) drives the real core with injected trusted
-collaborators (no network/Supabase/real lock) and proves all listed properties (exact-two-account export;
-zero calls/writes for unrelated US/IN + dd-secondary; daily-state cannot shorten the window; campaign+ASIN
-30-day coverage ⇒ `proven===true`; optional sources independent; malformed/unknown/duplicate ⇒ zero exports;
-failed persistence ⇒ zero coverage; null/mismatched ack ⇒ fail closed; lock released exactly once; no
-secret/raw error in results; absent options preserve behavior). The former source-text proof was removed.
-`npm run verify` **37/37 across 17 suites** incl. `build:check`; `git diff --check` clean; slicing/source IDs/
-request hashes/Scheduler-v1 cadence/controls/frontend/routes/migrations unchanged. **STOP for Codex review.**
+Before ANY row/metric/coverage/success-state write, `validateExportBatchRows(source, rows, batch, connection)`
+(pure) rejects the **whole batch** on any malformed/cross-account evidence: the result must be an array; every
+row a plain object; `seller_or_vendor_id` nonblank and **exactly one of the batch's rawAccountIds**, resolved
+**through the batch's discovered account object** (resolved public id + connection must match the batch); and,
+when the source declares the `marketplace_country_code` dimension, the row marketplace must equal the discovered
+account's country. A rejected batch records **only** a typed safe failed state (`INVALID_EXPORT_EVIDENCE
+(<slug>)`) for the requested accounts — zero row/metric/coverage/success writes. A **genuine zero-row export
+(`[]`)** stays valid covered-empty evidence.
+
+### R.5 Total coverage-mode result (fix, 2026-08-15; commit `539bdfa`)
+
+`finalizeCoverageSummary(summary, { accounts, sourceKeys, deferred })` (pure) turns per-source counts into a
+TOTAL result. `expectedCoveragePairs = N accounts × M sources`; a pair is successful only with durable Ads rows
+(or a validated empty result) **and** a confirmed exact coverage ack **and** successful state persistence.
+
+| terminal condition | `status` | `coverageComplete` |
+|---|---|---|
+| every N×M pair succeeded, zero failures, not deferred | `completed` | `true` |
+| some successful pairs + any failure | `partial` | `false` |
+| zero successful pairs + any failure | `failed` | `false` |
+| work-budget deadline (deferral) | `partial` (`deferred:true`) | `false` |
+
+`completed` therefore **implies** `coverageComplete === true` and zero `failedAccounts`/`coverageFailedAccounts`,
+so the live operator can require **`res.status === "completed" && res.coverageComplete === true`**. Normal
+cadence summaries are byte-for-byte unchanged (no `coverageComplete` field). The work-budget clock is now an
+injected dep (`clock: () => Date.now()`) so the deferral path is deterministically testable.
+
+### R.6 Verification
+
+`scripts/ads-sync-canary.test.js` (**27 assertions**, +12) drives the real DI core with injected trusted
+collaborators (no network/Supabase/real lock) and proves every listed property, incl. the two new fixes: one
+selected + one unrelated row ⇒ zero writes; missing/blank seller ⇒ whole batch fails; wrong marketplace ⇒ whole
+batch fails; non-array ⇒ whole batch fails; both selected accounts in one batch succeed; zero-row export ⇒
+validated-empty coverage; all N×M pairs ⇒ `completed` + `coverageComplete:true`; null/mismatched ack ⇒ never
+completed; one source ok + one fail ⇒ `partial` + `coverageComplete:false`; state-write failure cannot return
+completed; deadline cannot return completed (⇒ `partial`+`deferred`); no secret/raw error in results; lock
+released exactly once on every post-claim path; two-argument cadence behavior unchanged; + a pure
+`finalizeCoverageSummary` unit. `npm run verify` **37/37 across 17 suites** incl. `build:check`; `git diff
+--check` clean; timeout slicing / `requiredCoverage` / DI structure / lock release / source IDs / request hashes
+/ Scheduler-v1 cadence / controls / frontend / routes / migrations **unchanged**. **STOP for Codex review.**
 Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED pending review + explicit approval.

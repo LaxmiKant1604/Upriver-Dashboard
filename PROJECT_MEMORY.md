@@ -9126,3 +9126,29 @@ docs Appendix R. Approved timeout slicing (Appendix Q) UNCHANGED. Nothing execut
   migrations. npm run verify 37/37 across 17 suites incl. build:check; git diff --check clean.
 
 STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
+
+## Scheduler v2: two more Ads-sync findings fixed -- per-batch row validation + total coverage result (OFFLINE, 2026-08-15)
+
+Commit 539bdfa (code/tests), docs Appendix R.4-R.6. Timeout slicing / requiredCoverage / DI structure / lock
+release UNCHANGED. Nothing executed.
+
+- FIX 1 (validate every returned row against the exact batch, before any write): new pure
+  validateExportBatchRows(source, rows, batch, connection). Rejects the WHOLE batch on: non-array result;
+  non-object row; blank seller_or_vendor_id; seller id not exactly one of the batch rawAccountIds; resolved
+  public account / connection mismatch (a same-raw-id row from another org is rejected); wrong
+  marketplace_country_code vs the discovered account country (when the source declares that dimension). A
+  rejected batch writes ONLY a typed safe failed state (INVALID_EXPORT_EVIDENCE (<slug>)) -- zero
+  row/metric/coverage/success writes. A genuine zero-row export ([]) stays valid covered-empty evidence.
+- FIX 2 (total coverage-mode result): new pure finalizeCoverageSummary(summary, { accounts, sourceKeys,
+  deferred }). expectedCoveragePairs = N x M; a pair succeeds only with durable rows (or validated empty) +
+  confirmed exact coverage ack + successful state persistence (increments sources[key].coverage). status:
+  completed (all pairs, zero failures, not deferred) => coverageComplete:true; partial (some successes with
+  failures, or deferral); failed (zero successes + a failure). completed IMPLIES coverageComplete===true + zero
+  failed/coverageFailed, so the operator gate is res.status==='completed' && res.coverageComplete===true. Normal
+  cadence summaries unchanged (no coverageComplete field). Work-budget clock is now an injected dep so the
+  deferral is deterministically testable.
+- Regressions: ads-sync-canary.test.js 15 -> 27 assertions (all 13 listed cases + a pure finalizer unit).
+  Existing two-arg cadence behavior unchanged. npm run verify 37/37 across 17 suites incl. build:check; git diff
+  --check clean.
+
+STOP for Codex review. Ads-sync execution / Cycle 2 / unlock / deploy / schedule remain BLOCKED.
