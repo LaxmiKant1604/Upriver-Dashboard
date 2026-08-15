@@ -9693,3 +9693,47 @@ applied + byte-identical; migrations 1-5 unchanged; durable data stays closed.
   .worktrees untouched.
 
 STOP for Codex re-review. Gate 7b not deployed; USA excluded; no cron.
+
+## Scheduler v2 Gate 7b PHASE 1 EXECUTED SUCCESSFULLY 2026-08-15 — deployed INERT + Brand-Sales-only IN cutover LIVE
+
+Authorized Phase 1: deploy Scheduler-v2 to production inert, then cut over ONLY Brand Sales for the proven IN
+account (d658442d-…); USA + the other 12 reports stay excluded. Ran phased A→D, each behind its own read-only
+verification. Throwaway read-mostly .mjs runners (removed after); never printed secrets/payloads/export-ids/full
+hashes. Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix Z.
+
+- PREFLIGHT (A): npm run verify green; git diff --check clean; Migration 6 applied once (hash bd03301… frozen);
+  rollout empty, mode (1,false), approvals empty, 13 settings paused, no cron; durable baseline byte-identical to
+  Gate-7a (5 cycles digest a8c9713…, 23 scheduler-v2 snapshots digest 3c4a1ed…); IN Brand Sales live baseline = 2
+  rows, fingerprint 898aed784cd….
+- MERGE + DEPLOY INERT (B): merged feature/scheduler-v2 → main --no-ff => merge commit 0ea9f345… (0ea9f34);
+  pushed origin/main. Deployed the EXACT merge-commit tree via `vercel deploy --prod` from repo root (project root
+  dir sales-dashboard-live) => deployment p7un5uel8 (dpl_4o6JFFQ…), ● Ready, holds prod alias
+  upriverdashboard.vercel.app, HTTP 200. Re-verified deploy caused ZERO durable effect (cycles/v2-snapshots/rollout/
+  approvals/settings/cron/IN-fingerprint all unchanged). Docs-evidence commit intentionally NOT pushed, to keep
+  production pinned to the verified merge-commit tree.
+- IN ACCOUNT GATE (C): one fresh DataDoe discovery (30 active); resolved EXACTLY one active PRIMARY IN match
+  (d658442d…, canonical, not dd-secondary); inserted EXACTLY one scheduler_account_rollout row (enabled=true, exact
+  IN id, audited note), all_primary stays false; verified only IN enabled, USA + all others excluded, 13 settings
+  paused, approvals empty.
+- BRAND SALES CUTOVER (D): (16) brand-sales schedule_enabled=true only; (17) one bounded manual IN shadow cycle
+  (non-us, cycleDate 2026-08-17, asOf 2026-08-14) drained in 1 slice (2 exports), finalizeSyncCycle => finalized/
+  succeeded, cycle 460777e0…; (18) verified cycle succeeded (src 2/2, rep 1/1, 0 failures), owners+report job ONLY
+  brand-sales/IN, version brand-sales/v2d-2 validated derive+save succeeded, both exports create_export_count=1,
+  Product Catalog source_id=68d2de238e… the ONLY catalog, shadow v2d-2 payload valid (rows=1188, catalogBrands=2,
+  asinBrand object 3190 keys nonempty), live IN fingerprint UNCHANGED pre-publish; (19) inserted exactly one audited
+  scheduler_publish_approvals row (brand-sales, IN, approved=true, approved_by=laxmikant@superboring.in, approved_at
+  now); (20/21) buildSchedulerV2Publisher().publish('brand-sales', IN) once => disposition=published, live identity
+  brand-sales/IN/brand-sales-shared-v1/window [2025-06-07..2026-08-14]/params_hash 297b6257…; (22) exact live
+  identity present + API read path serves it; live payload BYTE-IDENTICAL to the validated shadow; 170 OTHER live
+  rows byte-identical (USA + every other account/report untouched); IN brand-sales 2→3 (2 preserved + 1 new); no
+  other report published.
+- END STATE: main=0ea9f34 (deployed p7un5uel8, HTTP 200); rollout=1 enabled IN row (all_primary=false); approvals=1
+  (brand-sales/IN); settings=brand-sales enabled + 12 paused; no cron. IN Brand Sales now served by a Scheduler-v2
+  publish; everything else fail-closed. Reversible via Y.3 levers (no data loss). Errors fixed mid-run
+  (test/env-only, no production defect): report_sync_settings.updated_by is UUID (dropped bogus text label);
+  sync_cycles.trigger CHECK enum = {pg_cron,github,vercel,manual} (used manual); owner_status stays 'active' on
+  success (not a terminal), source-job `terminal` flag marks non-retryable FAILURE not success (relied on
+  fetch_status=succeeded + cycle counts); Product Catalog short id lives in source_id, not request_meta.
+
+STOP after Brand Sales verification, per authorization. Remaining 12 reports paused/unapproved; USA excluded
+(Y.5); no cron created.

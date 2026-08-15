@@ -4187,3 +4187,71 @@ account. Until then USA stays excluded (no `scheduler_account_rollout` row).
 
 **STOP.** Gate 7b hands back for Codex review. No deploy, no durable row, no settings change, no publish, no cron,
 no production connection has happened in this preparation.
+
+## Appendix Z — Gate 7b PHASE 1 EXECUTION evidence (2026-08-15 — EXECUTED: deploy INERT + Brand-Sales-only IN cutover; SUCCESS)
+
+**Authorized scope (Phase 1 of Gate 7b):** deploy Scheduler-v2 to production **inert**, then cut over **ONLY
+Brand Sales** for the proven **IN account** (`d658442d-…`). USA and the other 12 reports stay excluded. Ran as
+phased steps A→D, each behind its own read-only verification. Every runner was a throwaway read-mostly `.mjs`
+(removed after use) that connected read-only where possible (`BEGIN; SET TRANSACTION READ ONLY; … ROLLBACK`) and
+**never printed secrets, payloads, export ids, or full sensitive hashes**. Starting HEAD included `4b1179d`.
+
+### Z.A Preflight (read-only) — PASS
+- `npm run verify` green; `git diff --check` clean.
+- Migration 6 applied exactly once; frozen ledger hash `bd03301…` unchanged.
+- `scheduler_account_rollout` empty; `scheduler_rollout_mode`=(1, false); `scheduler_publish_approvals` empty;
+  all 13 `report_sync_settings` paused; no Scheduler-v2 `pg_cron`.
+- Durable baseline byte-identical to Gate-7a: 5 `sync_cycles` (digest `a8c9713…`), 23 `scheduler-v2/*` snapshots
+  (digest `3c4a1ed…`).
+- IN Brand Sales live baseline captured: 2 live rows, payload-free combined fingerprint `898aed784cd…`.
+
+### Z.B Merge + deploy INERT — PASS
+- Merged `feature/scheduler-v2` → `main` `--no-ff` (history preserved): **merge commit `0ea9f345…` (`0ea9f34`)**;
+  pushed to `origin/main`.
+- Deployed the **exact merge-commit tree** to Vercel Production via `vercel deploy --prod` from the repo root
+  (project root dir `sales-dashboard-live`): deployment **`p7un5uel8`** (`dpl_4o6JFFQ…`), **● Ready**, holds the
+  production alias `upriverdashboard.vercel.app`, app returns HTTP **200**.
+- Deploy caused **zero durable effect** (re-verified read-only): cycles=5 / v2-snapshots=23 (both digests
+  unchanged), rollout empty, approvals empty, mode (1, false), 13 settings paused, no cron, IN Brand Sales
+  fingerprint unchanged.
+- **Note:** the docs-evidence commit (this appendix) is intentionally **not pushed**, so the verified production
+  deployment stays pinned to the exact merge-commit tree.
+
+### Z.C Exact IN account gate — PASS
+- One fresh primary DataDoe discovery: 30 active accounts.
+- Resolved **exactly one** ACTIVE PRIMARY account matching the proven IN identity (`d658442d…`) — canonical, not
+  `dd-secondary`; failed closed otherwise.
+- Inserted **exactly one** `scheduler_account_rollout` row (`enabled=true`, exact IN id, note "Gate-7b Phase 1 IN
+  cutover (Brand Sales) — approved 2026-08-15"). `all_primary` stays false. Verified only IN enabled; USA + every
+  other account excluded; 13 settings still paused; approvals empty.
+
+### Z.D Brand-Sales-only cutover — PASS
+- **(16)** `report_sync_settings.schedule_enabled=true` for **brand-sales only**; other 12 paused.
+- **(17)** One bounded manual Scheduler-v2 Brand Sales shadow cycle for IN (`non-us`, cycleDate `2026-08-17`, asOf
+  `2026-08-14`) via `buildSchedulerV2Runtime().run(...)`: drained in a single bounded slice (2 exports), then
+  `finalizeSyncCycle` → **finalized / succeeded**. Cycle `460777e0…`.
+- **(18)** Verified: cycle `non-us/2026-08-17/manual/succeeded` (src 2/2, rep 1/1, 0 failures); owners + report
+  job **ONLY brand-sales / IN** (`request_keys={brand-sales:catalog, brand-sales:order-lines}`); report version
+  `brand-sales/v2d-2`, `validated`, derive+save succeeded; both source exports `create_export_count=1`; Product
+  Catalog `source_id=68d2de238e…` the ONLY catalog; shadow v2d-2 payload VALID (rows=1188, catalogBrands=2,
+  `asinBrand` object with 3190 keys, nonempty); **live IN Brand Sales fingerprint UNCHANGED before publishing**.
+- **(19)** Inserted **exactly one** audited `scheduler_publish_approvals` row (`brand-sales`, IN, `approved=true`,
+  `approved_by='laxmikant@superboring.in'`, `approved_at=now()`).
+- **(20/21)** `buildSchedulerV2Publisher().publish('brand-sales', IN)` once → disposition **`published`**; live
+  identity `brand-sales` / IN / `brand-sales-shared-v1` / window `[2025-06-07..2026-08-14]` / params_hash
+  `297b6257…`.
+- **(22)** Verified: exact live natural identity present; the API read path (`getReportSnapshot`) serves it; live
+  payload **byte-identical** to the validated shadow (rows=1188, catalogBrands=2, `asinBrand` 3190 keys); **170
+  other live rows BYTE-IDENTICAL** (USA + every other account/report unchanged); IN Brand Sales live rows **2→3**
+  (both pre-existing rows preserved, 1 new); **no other report published**.
+
+### Z.E End state
+- **Deployed:** `main` = `0ea9f34` (merge); production = `p7un5uel8` (merge tree); HTTP 200.
+- **Durable controls:** `scheduler_account_rollout` = 1 enabled IN row (`all_primary=false`);
+  `scheduler_publish_approvals` = 1 row (`brand-sales`, IN, approved); `report_sync_settings` = brand-sales enabled,
+  other 12 paused; no `pg_cron`.
+- **Live:** IN Brand Sales is now served by a Scheduler-v2-published snapshot; all other accounts/reports untouched.
+
+**STOP.** Per the authorization, execution halted after Brand Sales verification. The remaining 12 reports stay
+paused + unapproved; USA stays excluded (Y.5); no cron was created. Rollback levers (Y.3) remain available and
+reversible with no data loss.
