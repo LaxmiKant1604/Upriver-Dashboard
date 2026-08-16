@@ -9907,6 +9907,28 @@ Appendix AE.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
 
+## Guarded production deploy + publish-ready IN rollout — EXECUTED 2026-08-16
+
+- User authorized commit, deploy, and publication of whatever was ready. `npm run verify` passed 41/21 including
+  build-check; focused PPC 51/51 and currency 5/5 passed. Reviewed `main`
+  `02c2ef5858cb4bcb6b11ca5da5611e3fd5e080e1` was pushed and deployed as Vercel
+  `dpl_GzXYRLSKGYJKwMzU5oTVozkfn56x`; `https://upriverdashboard.vercel.app` returned HTTP 200.
+- Scope stayed fail-closed: exact IN account `d658442d-6273-4c2d-aeda-f247e638ef98`, `all_primary=false`, no Europe,
+  USA, other account, or cron. The old halted `dfca8f75...` cycle was not touched.
+- Fresh cycle `cf6bb0ff-4269-4b19-a7ce-a8b932aa36ff` (`non-us`, cycleDate 2026-08-19,
+  asOf 2026-08-15) finalized `partial`: sources 127/88/39; reports 12/3/9. Strict per-slice isolation and
+  one-create-per-hash guards held. Successful reports were content-changes, keyword-rank, and listing-optimizer.
+- Typed DataDoe timeouts blocked the other nine: order-line-items x16, settlements x10, profit-by-sku-date x8,
+  product-catalog x2, returns x2, listings-raw x1. No failed hash was retried and no blocked/unavailable snapshot was
+  published.
+- The trusted publisher published the three successful reports after exact job/cycle/hash/shadow validation.
+  Production now has exactly four enabled+approved IN reports: brand-sales, content-changes, keyword-rank, and
+  listing-optimizer. Unrelated live fingerprints and the shadow fingerprint stayed byte-identical through each
+  publication. Final live snapshot count/digest: 176 / `4058535b9a3944b8ab774c927d88329a`; shadow count 26.
+- Automatic Scheduler-v2 cadence remains unscheduled. The remaining nine IN reports require fresh successful
+  DataDoe exports or a reviewed upstream partition/remediation. Europe and USA require separate account-specific
+  canaries and publication approvals.
+
 ## OLI correction — Codex re-review blocker fixes round 3 OFFLINE on main 2026-08-16 (code+tests a1de539, docs separate); verify green 41/21; NOT deployed
 
 Codex re-review of round 2 (622716f / Appendix AE) raised 2 more blockers; both fixed offline on main (no deploy/push/

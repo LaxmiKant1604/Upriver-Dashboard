@@ -1,6 +1,15 @@
 # Scheduler v2 — Production Rollout Runbook (Phase 1f)
 
-**Status (2026-08-14): Migrations 1–5 APPLIED + VERIFIED; the Gate 5 one-account brand-sales SHADOW canary has
+**Current status (2026-08-16, supersedes the historical status below):** reviewed `main` commit
+`02c2ef5858cb4bcb6b11ca5da5611e3fd5e080e1` is pushed and deployed to production as Vercel deployment
+`dpl_GzXYRLSKGYJKwMzU5oTVozkfn56x` (`p7un5uel8` was superseded), with the production alias
+`upriverdashboard.vercel.app` returning HTTP 200. The durable rollout remains restricted to the one approved IN
+account (`d658442d-6273-4c2d-aeda-f247e638ef98`), `all_primary=false`, and no cron exists. Four IN reports are now
+live and approved: `brand-sales`, `content-changes`, `keyword-rank`, and `listing-optimizer`. The other nine reports
+remain disabled and unapproved after an honest fresh-cycle failure caused by typed DataDoe export timeouts. Europe,
+USA, and every other account remain excluded. See Appendix AI for the complete execution evidence.
+
+**Historical status (2026-08-14): Migrations 1–5 APPLIED + VERIFIED; the Gate 5 one-account brand-sales SHADOW canary has
 been EXECUTED (SUCCESS) and its cycle RECONCILED to `succeeded` via Appendix N (EXECUTED 2026-08-14).**
 Scheduler v2 otherwise remains in SHADOW MODE and closed: it is **locked** (the code readiness allowlist
 `SCHEDULER_V2_READY_REPORT_KEYS` is empty), **paused** (all 13 durable `report_sync_settings` rows have
@@ -4665,3 +4674,65 @@ through injected DI seams / direct pure-fold calls — no network/DB call).
 
 **STOP for Codex re-review.** Code+tests `dbd4726`, docs `<this commit>`; **not pushed** — production stays on
 `0ea9f34`; nothing deployed.
+
+## Appendix AI — Guarded production deploy + publish-ready IN rollout (EXECUTED 2026-08-16)
+
+### AI.1 Authorization, verification, push, and deploy
+- The operator explicitly authorized committing, deploying, and making every ready report live.
+- `npm run verify` passed all **41 steps across 21 suites**, including `build:check`; focused PPC tests passed
+  **51/51** and currency tests passed **5/5**. `git diff --check` was clean.
+- Reviewed `main` commit `02c2ef5858cb4bcb6b11ca5da5611e3fd5e080e1` was pushed to `origin/main`.
+- The Git-connected production deploy completed as `dpl_GzXYRLSKGYJKwMzU5oTVozkfn56x`; the production alias
+  `https://upriverdashboard.vercel.app` returned HTTP 200 and rendered the dashboard sign-in screen.
+- Production secrets were loaded only from the untracked environment file; no value was printed or committed.
+
+### AI.2 Pre-execution baseline and scope
+- Durable rollout: exactly one enabled IN account (`d658442d-6273-4c2d-aeda-f247e638ef98`), `all_primary=false`.
+- Durable controls/approvals: only `brand-sales` enabled and approved. No `pg_cron` Scheduler-v2 job existed.
+- Live snapshots: count **173**, digest `80cc74fb9a3647594d2d0ba9fa22e28e`; shadow snapshots: count **23**,
+  digest `c088e1dd8e60b7315238912d5e9bcd8c`.
+- The earlier halted cycle `dfca8f75...` remained `running` at 8 succeeded / 9 failed / 4 attempted / 101 pending.
+  It was not resumed, retried, reset, finalized, or mutated.
+- Europe, USA, and every account except the exact approved IN account were out of scope and excluded.
+
+### AI.3 Fresh bounded IN-only shadow cycle
+- A new cycle was opened for the remaining 12 reports only: bucket `non-us`, cycle date `2026-08-19`,
+  `asOf=2026-08-15`, cycle `cf6bb0ff-4269-4b19-a7ce-a8b932aa36ff`.
+- The first operator invocation stopped on a throwaway guard comparing a PostgreSQL `date` through a timezone-bearing
+  JavaScript value. The guard was corrected to compare `cycle_date::text`, and the same cycle was resumed. This was
+  an operator-check defect, not a scheduler defect; no second cycle or duplicate export was created.
+- Per-slice guards proved: IN-only owners/report jobs; no ownerless source jobs; every
+  `create_export_count <= 1`; zero duplicate creates; only catalog source `68d2de238e`; unchanged live snapshots;
+  unchanged unrelated-account shadows; unchanged controls; and no mutation of `dfca8f75...`.
+- The cycle drained and was finalized exactly once to **`partial`** with `finished_at` set: sources
+  **127 total / 88 succeeded / 39 failed**, reports **12 total / 3 succeeded / 9 failed**.
+- Successful reports: `content-changes`, `keyword-rank`, `listing-optimizer`.
+- Failed/unavailable reports: `buy-box-loss`, `daily-reporting`, `fba-plan`, `listing-health`, `ppc-performance`,
+  `reconciliation`, `returns-leakage`, `sales-movers`, `sku-pl`.
+- Typed upstream failure breakdown: `order-line-items` create-export TIMEOUT x16; `settlements` TIMEOUT x10;
+  `profit-by-sku-date` TIMEOUT x8; `product-catalog` TIMEOUT x2; `returns` TIMEOUT x2; `listings-raw` TIMEOUT x1.
+  The one-attempt guard held; no failed hash was retried.
+
+### AI.4 Publish-ready results
+- Only the three succeeded reports were enabled and given audited IN-only publish approvals.
+- `buildSchedulerV2Publisher()` returned `published` for all three:
+  - `content-changes` — 680-byte validated live payload;
+  - `keyword-rank` — 5,042,282-byte validated live payload;
+  - `listing-optimizer` — 6,581,954-byte validated live payload.
+- Every candidate was tied to its exact succeeded report job, terminal cycle, params hash, and validated shadow
+  snapshot. Live natural-identity reads confirmed inline payloads, no stale storage pointer, and a nonblank
+  `source_refreshed_at`.
+- Before/after publication, unrelated live data stayed byte-identical: non-IN count **164**, digest
+  `fb353dadee4457ec81fce45fb2c1fb15`; unrelated IN rows count **172**, digest
+  `6811ddf83379750f57f6ae8d7a1b681c`. Shadow state also stayed stable during publishing: count **26**, digest
+  `47ac4c6f963a1216342822e4f9ad3f9d`.
+
+### AI.5 Final production state and stop
+- Exact enabled + approved IN reports: `brand-sales`, `content-changes`, `keyword-rank`, `listing-optimizer`.
+- The other nine reports are disabled and unapproved; no unavailable/blocked snapshot was published.
+- Final live snapshot count is **176**, digest `4058535b9a3944b8ab774c927d88329a`; shadow count is **26**.
+- Rollout remains exactly one IN account; `all_primary=false`; no Europe/USA account was added; no cron exists.
+- The dashboard deployment is live and usable for the four approved IN reports. Automatic Scheduler-v2 cadence is
+  still intentionally unscheduled. Completing the other nine reports requires fresh successful DataDoe exports (or
+  a reviewed DataDoe-supported partition/remediation); Europe and USA each require their own account-specific canary
+  and publication gate.
