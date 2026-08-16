@@ -130,7 +130,20 @@ function makeStore() {
     },
     listSourceJobOwners(cid, ids) { const s = new Set(ids || []); return ownerRows(cid).filter((m) => s.has(m.owner_id)).map((m) => ({ ...m })); },
     recordSourceOwnerStale({ cycleId, requestHash, ownerId, code }) { const m = ownersByCycle.get(cycleId) && ownersByCycle.get(cycleId).get(ownerId + "|" + requestHash); if (m) { m.owner_status = "stale"; m.error_code = code || "STALE_PLAN"; } },
-    claimExportAttempt(id, h) { const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h); if (j && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
+    // Models claim_source_export_attempt WITH the Blocker-2 `fetch_status='pending'` guard (mutually
+    // exclusive with adoptSourceCache): only a still-pending, unattempted row can be claimed.
+    claimExportAttempt(id, h) { const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h); if (j && j.fetch_status === "pending" && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
+    // Models adopt_source_export_cache (Blocker 2): the ATOMIC CAS. Adopts a durable cache entry ONLY while
+    // the row is pending/unattempted/create_export_count=0, leaving create_export_count=0 and attempted_at
+    // null and export_id null (constraint-legal). Returns the typed 'adopted' | 'not-adopted' acknowledgement.
+    adoptSourceCache({ cycleId, requestHash, rowCount, payloadBytes, cacheObjectPath }) {
+      const j = jobsByCycle.get(cycleId) && jobsByCycle.get(cycleId).get(requestHash);
+      if (j && j.fetch_status === "pending" && j.attempted_at === null && j.create_export_count === 0) {
+        Object.assign(j, { fetch_status: "succeeded", export_id: null, row_count: rowCount, payload_bytes: payloadBytes, cache_object_path: cacheObjectPath, error_stage: null, error_code: null });
+        return "adopted";
+      }
+      return "not-adopted";
+    },
     recordExportCreated({ cycleId, requestHash, exportId }) { jobsByCycle.get(cycleId).get(requestHash).export_id = exportId; },
     loadSourceRows(h) {
       const e = cache.get(h);
@@ -231,13 +244,22 @@ test("order. SOURCE_TRANCHE_ORDER is the documented 5-tranche order and covers e
   assert.equal(flat.length, new Set(flat).size, "each source family appears in exactly one tranche");
 });
 
-test("descriptor. makeSourceTranche selects by source_key or request_hash, is idempotent, and fails closed on a malformed spec", () => {
+test("descriptor. makeSourceTranche is IMMUTABLE + UNFORGEABLE, selects by source_key or request_hash, idempotent, fails closed (Blocker 5)", () => {
   const t = makeSourceTranche({ sourceKeys: ["order-line-items"] });
-  assert.ok(isSourceTranche(t) && t.sourceKeys instanceof Set && typeof t.selects === "function", "frozen descriptor shape");
+  assert.ok(isSourceTranche(t) && Object.isFrozen(t) && Array.isArray(t.sourceKeys) && typeof t.selects === "function", "immutable frozen descriptor with array membership (never a mutable Set)");
+  assert.ok(Object.isFrozen(t.sourceKeys), "the exposed membership is a FROZEN array");
   assert.equal(t.selects({ sourceKey: "order-line-items" }), true);
   assert.equal(t.selects({ source_key: "order-line-items" }), true, "snake_case canonical job field");
   assert.equal(t.selects({ sourceKey: "product-catalog" }), false);
-  assert.equal(makeSourceTranche(t), t, "already-built descriptor passes through unchanged (idempotent)");
+  // Immutable policy: mutating (or attempting to mutate) the exposed membership can NEVER widen selects().
+  try { t.sourceKeys.push("EVIL"); } catch (_e) { /* a frozen array throws under module strict mode */ }
+  assert.equal(t.selects({ sourceKey: "EVIL" }), false, "policy cannot be widened by mutating the exposed membership array");
+  assert.equal(makeSourceTranche(t), t, "a GENUINE built descriptor passes through unchanged (idempotent)");
+  // Unforgeable: a hand-built look-alike carrying an arbitrary selects() is NOT a tranche and is never adopted
+  // as trusted policy -- it is treated as a (here malformed) spec and rejected, so selects() can't be smuggled.
+  assert.equal(isSourceTranche({ selects: () => true, sourceKeys: new Set(["x"]) }), false, "a forged look-alike is not a tranche");
+  assert.equal(isSourceTranche(Object.freeze({ selects: () => true, sourceKeys: ["x"] })), false, "even a frozen forged look-alike is not a tranche (no private brand)");
+  assert.throws(() => makeSourceTranche({ selects: () => true, sourceKeys: new Set(["x"]) }), /nonblank strings/, "a forged object's arbitrary selects() is never adopted (Set fails the string-array gate)");
   const h = makeSourceTranche({ requestHashes: ["abc123"] });
   assert.equal(h.selects({ requestHash: "abc123" }), true);
   assert.equal(h.selects({ requestHash: "zzz" }), false);
@@ -349,6 +371,57 @@ test("5. expired / mismatched (source_id or scope) / malformed (non-array) / cap
     assert.notEqual(outcome && outcome.reused, true, label + ": the outcome is never flagged reused");
     assert.equal(store._rawJob(r.cycleId, oli.requestHash).create_export_count, 1, label + ": one real claimed attempt");
   }
+});
+
+test("cas. cache-adopt CAS vs create-claim on the SAME pending row: exactly ONE winner, zero unnecessary POSTs (Blocker 2)", async () => {
+  // Adopt-first: the reuse wins; a subsequent create-claim on the now-succeeded row is refused (zero POST).
+  {
+    const store = makeStore();
+    const cid = store.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store.claimCycle(cid);
+    const oli = oneOliJob(acct(ID));
+    store.upsertSourceJob({ cycleId: cid, requestHash: oli.requestHash, requestKey: oli.requestKey, sourceId: oli.sourceId, sourceKey: oli.sourceKey, connectionId: oli.connectionId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash });
+    assert.equal(store.adoptSourceCache({ cycleId: cid, requestHash: oli.requestHash, rowCount: 1, payloadBytes: 10, cacheObjectPath: "p.json" }), "adopted", "adopt wins on the pending row");
+    assert.equal(store.claimExportAttempt(cid, oli.requestHash), false, "the create-claim on the now-succeeded row is refused (zero POST)");
+    const j = store._rawJob(cid, oli.requestHash);
+    assert.equal(j.fetch_status, "succeeded"); assert.equal(j.create_export_count, 0); assert.equal(j.attempted_at, null); assert.equal(j.export_id, null);
+  }
+  // Claim-first: the create-claim wins; a subsequent cache-adopt is refused (no clobber of the in-flight export).
+  {
+    const store = makeStore();
+    const cid = store.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store.claimCycle(cid);
+    const oli = oneOliJob(acct(ID));
+    store.upsertSourceJob({ cycleId: cid, requestHash: oli.requestHash, requestKey: oli.requestKey, sourceId: oli.sourceId, sourceKey: oli.sourceKey, connectionId: oli.connectionId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash });
+    assert.equal(store.claimExportAttempt(cid, oli.requestHash), true, "create-claim wins on the pending row");
+    assert.equal(store.adoptSourceCache({ cycleId: cid, requestHash: oli.requestHash, rowCount: 1, payloadBytes: 10, cacheObjectPath: "p.json" }), "not-adopted", "cache-adopt on the now-attempted row is refused (no clobber)");
+    const j = store._rawJob(cid, oli.requestHash);
+    assert.equal(j.fetch_status, "attempted"); assert.equal(j.create_export_count, 1);
+  }
+});
+
+test("reuseonly-miss. reuseOnly with NO durable cache creates ZERO exports, returns MISSING_REUSABLE_SOURCE, leaves the job pending (Blocker 3)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const oli = oneOliJob(acct(ID));
+  const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs: [oli], ownerIds: [oli.owner.ownerId], bucket: "us", cycleDate: CYCLE_DATE, reuseOnly: true });
+  assert.equal(dd.totalCreates(), 0, "ZERO create POSTs in reuseOnly rehearsal");
+  const outcome = r.outcomes.find((o) => o.requestHash === oli.requestHash);
+  assert.equal(outcome.code, "MISSING_REUSABLE_SOURCE", "typed missing-reusable-source outcome");
+  assert.ok((r.missingReusable || 0) >= 1, "the pass counts a missing reusable source");
+  assert.equal(store._rawJob(r.cycleId, oli.requestHash).fetch_status, "pending", "the job stays pending (blocked, never a POST, never falsely failed)");
+  assert.equal(store._rawJob(r.cycleId, oli.requestHash).create_export_count, 0, "create_export_count stays 0");
+});
+
+test("reuseonly-hit. reuseOnly WITH a current exact durable cache adopts via the atomic CAS with ZERO exports (Blocker 3 + 2)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const oli = oneOliJob(acct(ID));
+  const rows = [ord("R1", "Widget", 100, 10, "USD", ASOF)];
+  store._seedCache(oli.requestHash, { rows, source_id: oli.sourceId, organization_fingerprint: oli.organizationFingerprint, account_scope_hash: oli.accountScopeHash, object_path: "durable/" + oli.requestHash + ".json", row_count: rows.length, payload_bytes: 55, expires_at: FUTURE_TTL() });
+  const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs: [oli], ownerIds: [oli.owner.ownerId], bucket: "us", cycleDate: CYCLE_DATE, reuseOnly: true });
+  assert.equal(dd.totalCreates(), 0, "ZERO create POSTs");
+  const outcome = r.outcomes.find((o) => o.requestHash === oli.requestHash);
+  assert.equal(outcome.reused, true, "reused via the atomic CAS even in reuseOnly");
+  const j = store._rawJob(r.cycleId, oli.requestHash);
+  assert.equal(j.fetch_status, "succeeded"); assert.equal(j.export_id, null); assert.equal(j.create_export_count, 0);
+  assert.equal(j.cache_object_path, "durable/" + oli.requestHash + ".json", "points at the existing durable object");
 });
 
 /* ============================= Part D: existing export resume / no manual adoption ============================= */

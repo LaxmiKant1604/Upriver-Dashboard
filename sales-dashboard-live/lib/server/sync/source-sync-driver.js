@@ -13,7 +13,7 @@ import { createExport, pollExport, downloadExport } from "../datadoe.js";
 import { organizationFingerprint, sourceJobOwnerId } from "../source-identity.js";
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
-  upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt,
+  upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt, adoptSourceExportCache,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
   upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
@@ -122,6 +122,9 @@ export function makeSupabaseSourceStore() {
     listSourceJobsForOwners: (cycleId, ownerIds) => getSyncSourceJobsForOwners(cycleId, ownerIds),
     recordSourceOwnerStale: (args) => recordSyncSourceJobOwnerStale(args),
     claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),
+    // Blocker 2: the atomic cache-adoption CAS (adopt_source_export_cache), returning a typed
+    // 'adopted' | 'not-adopted' acknowledgement. Mutually exclusive with claimExportAttempt.
+    adoptSourceCache: (args) => adoptSourceExportCache(args),
     recordExportCreated: (args) => recordSyncSourceExportCreated(args),
     loadSourceRows: (requestHash) => getSourceExportCache(requestHash),
     saveSourceRows: ({ job, rows, payloadBytes, version }) => atomicSaveSourcePayload({
@@ -251,6 +254,8 @@ export async function runStagedSourceCycle({
   // BUILD-TIME source-tranche selector (Part A); passed straight to runSourceJobs. A filtered pass never
   // drains, so it never reaches the fixpoint below -- no owner membership is reconciled mid-tranche.
   sourceTranche = null,
+  // BUILD-TIME reuseOnly rehearsal flag (Blocker 3); passed straight to runSourceJobs.
+  reuseOnly = false,
 }) {
   const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
   let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
@@ -285,7 +290,7 @@ export async function runStagedSourceCycle({
 
     const res = await runSourceJobs({
       store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
-      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
+      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
     });
     rollup.cycleId = res.cycleId;
     rollup.rounds = round + 1;

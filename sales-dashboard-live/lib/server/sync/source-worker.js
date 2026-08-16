@@ -100,7 +100,7 @@ function mergeJob(meta, jobRow) {
  * derivation. Never throws for an expected source failure — it records a safe failure and
  * returns a non-success outcome so the cycle continues.
  */
-async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline }) {
+async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false }) {
   const requestHash = job.requestHash;
   const requestKey = job.requestKey || "";
   const started = clock();
@@ -157,16 +157,41 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
         && typeof cachedRowCount === "number" && cachedRowCount === cachedRows.length
         && !(job.strict === true && cachedRows.length >= Number(job.limit));
       if (confirmed) {
-        // ZERO DataDoe calls, no fabricated export id, point the job at the already-saved object. This
-        // leaves create_export_count=0 and attempted_at=null (the claim RPC is never touched).
+        const payloadBytes = typeof cachedBytes === "number" ? cachedBytes : approxPayloadBytes(cachedRows);
+        // Blocker 2: ATOMIC compare-and-set adoption. adopt_source_export_cache flips the job
+        // pending -> succeeded ONLY while it is still pending/unattempted/create_export_count=0, and is
+        // mutually exclusive with claim_source_export_attempt (both require fetch_status='pending'). So a
+        // concurrent create-claim and this reuse have exactly ONE winner and ZERO fabricated export ids.
+        if (typeof store.adoptSourceCache === "function") {
+          const ack = await store.adoptSourceCache({
+            cycleId, requestHash, rowCount: cachedRowCount, payloadBytes, cacheObjectPath: cachedPath,
+          });
+          if (ack === "adopted") {
+            progress.succeeded += 1;
+            return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
+          }
+          // 'not-adopted': the row was concurrently advanced (claimed/succeeded/failed). Do NOT record
+          // anything over the winner; a fresh invocation re-reads the true status and resumes/skips.
+          progress.skipped += 1;
+          return { requestKey, requestHash, status: "skipped", validated: false, reason: "adopt-not-won" };
+        }
+        // Back-compat: a store without the atomic CAS (older injected test/canary store) keeps the prior
+        // record-success reuse. ZERO DataDoe calls, no fabricated export id (create_export_count stays 0).
         await store.recordSourceSuccess({
           cycleId, requestHash, exportId: null, rowCount: cachedRowCount,
-          payloadBytes: typeof cachedBytes === "number" ? cachedBytes : approxPayloadBytes(cachedRows),
-          durationMs: clock() - started, cacheObjectPath: cachedPath,
+          payloadBytes, durationMs: clock() - started, cacheObjectPath: cachedPath,
         });
         progress.succeeded += 1;
         return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
       }
+    }
+    // Blocker 3: reuseOnly REHEARSAL gate. No durable exact cache entry was adopted above, and a pending
+    // job has no saved export_id to resume, so this source is NOT reusable. A rehearsal pass must create
+    // ZERO exports: leave the job pending (blocked, NOT failed), record nothing durable, and return a
+    // typed MISSING_REUSABLE_SOURCE outcome as evidence. The create-export POST is never reached.
+    if (reuseOnly) {
+      progress.missingReusable += 1;
+      return { requestKey, requestHash, status: "missing-reusable-source", validated: false, code: "MISSING_REUSABLE_SOURCE" };
     }
     const won = await store.claimExportAttempt(cycleId, requestHash);
     if (!won) { progress.skipped += 1; return { requestKey, requestHash, status: "skipped", validated: false, reason: "already-attempted" }; }
@@ -287,12 +312,16 @@ export async function runSourceJobs({
   // full plan is still upserted (all canonical jobs + owner memberships). null => execute everything
   // (behavior byte-identical to before). NEVER a per-run/untrusted argument (see runtime-composition).
   sourceTranche = null,
+  // BUILD-TIME reuseOnly REHEARSAL flag (Blocker 3). When true a pending job that cannot be satisfied by a
+  // durable cache adoption (or a saved export_id resume) creates ZERO exports and returns
+  // MISSING_REUSABLE_SOURCE. NEVER a per-run/untrusted argument (see runtime-composition).
+  reuseOnly = false,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
     cycleId: null, claimedCycle: false, alreadyFinished: false,
     planned: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, attemptsWon: 0, deferred: 0,
-    deadlineReached: false, drained: false,
+    missingReusable: 0, deadlineReached: false, drained: false,
   };
   const outcomes = [];
   const runWithDeadline = (fn) => withDataDoeDeadline(deadlineMs === Infinity ? Infinity : deadlineMs - reserveMs, fn);
@@ -419,7 +448,7 @@ export async function runSourceJobs({
       continue;
     }
     const job = mergeJob(meta, jobRow);
-    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline });
+    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly });
     if (outcome) outcomes.push(outcome);
   }
 

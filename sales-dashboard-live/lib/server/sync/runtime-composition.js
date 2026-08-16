@@ -106,6 +106,19 @@ export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fe
   };
 }
 
+// Blocker 3: the create-export TRIPWIRE. In reuseOnly rehearsal a create-export POST must NEVER happen. This
+// wrapper lets poll/download through unchanged (resuming an already-saved export_id via GET/status/raw is
+// always allowed) but makes any create-export attempt throw loudly, so not even a future worker bug can spend
+// a token during zero-token rehearsal. It is defense in depth on top of the worker's own reuseOnly gate.
+function withCreateExportTripwire(adapter) {
+  return {
+    ...adapter,
+    create: async () => {
+      throw new Error("CREATE_EXPORT_TRIPWIRE: reuseOnly rehearsal attempted a DataDoe create-export; refusing (zero-token rehearsal).");
+    },
+  };
+}
+
 /**
  * Assemble the full set of injected collaborators runSchedulerV2Shadow needs, from production primitives.
  * Returns `{ connections, store, dataDoe, saveSnapshot, sourceRowLoader, ppcAdsProviders, loadDerivedContext,
@@ -141,11 +154,16 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     // spec is normalized via makeSourceTranche; an already-built descriptor passes through unchanged. It is
     // fixed HERE (a trusted collaborator), NEVER on RUN_OPERATIONAL_ARGS, so no per-run caller can set it.
     sourceTranche = null,
+    // BUILD-TIME reuseOnly REHEARSAL flag (Blocker 3). true => zero-token rehearsal: the worker only reuses a
+    // durable cache adoption or a saved export_id, and the DataDoe adapter is wrapped with a create-export
+    // TRIPWIRE so any create POST throws. Fixed HERE (trusted), NEVER on RUN_OPERATIONAL_ARGS.
+    reuseOnly = false,
   } = overrides;
 
   const normalizedSourceTranche = sourceTranche == null
     ? null
     : (isSourceTranche(sourceTranche) ? sourceTranche : makeSourceTranche(sourceTranche));
+  const reuseOnlyMode = !!reuseOnly;
 
   // Resolve connections ONCE (an env read via getDataDoeConnections, or an injected array). No network/db.
   const connections = connectionsOverride != null ? connectionsOverride : getConnections();
@@ -159,7 +177,11 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     { shared: ["listSourceJobs"] }, // both are the identical getSyncSourceJobs wrapper (source store is canonical)
   );
 
-  const dataDoe = makeAdapter(connections);
+  // Blocker 3: in reuseOnly rehearsal the adapter is wrapped with a create-export TRIPWIRE (poll/download of
+  // an already-saved export_id still pass; only create-export POSTs throw), so not even a worker bug can spend
+  // a token. The worker's own reuseOnly gate returns MISSING_REUSABLE_SOURCE before create is ever reached;
+  // this is defense in depth. A non-reuseOnly runtime uses the ordinary adapter unchanged.
+  const dataDoe = reuseOnlyMode ? withCreateExportTripwire(makeAdapter(connections)) : makeAdapter(connections);
   const saveSnapshot = snapshotSaverFactory();        // writes ONLY under the scheduler-v2/* shadow namespace
   const sourceRowLoader = sourceRowLoaderFactory();    // cache-only getSourceExportCache (== store.loadSourceRows)
   const ppcAdsProviders = { getAdsDailySourceRows: ppcRows, getAdsSyncStates: ppcStates, getAdsSyncCoverage: ppcCoverage };
@@ -171,7 +193,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const loadAccountRollout = async () => getAccountRollout();
 
   // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
-  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout, sourceTranche: normalizedSourceTranche };
+  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout, sourceTranche: normalizedSourceTranche, reuseOnly: reuseOnlyMode };
 
   // Load the DURABLE report scheduling controls (report_sync_settings) -- the ONLY production control source
   // for the scheduled path. A read failure THROWS here, so it fails closed BEFORE runSchedulerV2Shadow does

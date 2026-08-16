@@ -158,6 +158,10 @@ export async function runSchedulerV2Shadow({
   // unit executes only the selected families this pass; the full plan is still upserted, so the next
   // tranche resumes the same (bucket, cycle_date) cycle. null => execute everything (unchanged).
   sourceTranche = null,
+  // BUILD-TIME reuseOnly REHEARSAL flag (Blocker 3). Supplied ONLY by the trusted composition; NEVER a
+  // per-run operational arg. When true, every source unit creates ZERO exports -- a pending job that cannot
+  // be satisfied by a durable cache adoption or a saved export_id resume returns MISSING_REUSABLE_SOURCE.
+  reuseOnly = false,
 }) {
   if (bucket !== "us" && bucket !== "non-us") {
     throw new Error(`runSchedulerV2Shadow requires an explicit cycle bucket of 'us' or 'non-us' (got "${bucket}").`);
@@ -299,14 +303,14 @@ export async function runSchedulerV2Shadow({
       const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor });
       res = await runStagedSourceCycle({
         store, dataDoe, resolvePlan: resolveFromGenericPlan(plan),
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
       });
       collectedReports.push(...plan.reportRequests);
     } else {
       const runner = STAGED_RUNNERS[unit.reportKey];
       const args = {
         accounts: bucketAccounts, connections, asOf, asOfFor, store, dataDoe,
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
       };
       if (unit.reportKey === "ppc-performance") Object.assign(args, ppcAdsProviders);
       res = await runner(args);

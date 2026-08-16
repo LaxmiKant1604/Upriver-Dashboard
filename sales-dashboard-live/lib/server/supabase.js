@@ -763,6 +763,27 @@ export async function claimSourceExportAttempt(cycleId, requestHash) {
   });
 }
 
+// adopt_source_export_cache (Blocker 2): the ATOMIC cache-reuse compare-and-set.
+// Returns a TYPED acknowledgement — 'adopted' only for the caller that won the
+// pending->succeeded transition from a durable cache entry (zero DataDoe,
+// create_export_count stays 0, attempted_at stays NULL, no fabricated export id),
+// or 'not-adopted' when the job was already attempted/succeeded/failed/absent (the
+// caller must NOT create an export and must fall through to resume/skip). It is
+// mutually exclusive with claim_source_export_attempt on the same pending row.
+export async function adoptSourceExportCache({ cycleId, requestHash, rowCount, payloadBytes, cacheObjectPath }) {
+  const body = await request("/rest/v1/rpc/adopt_source_export_cache", {
+    method: "POST",
+    body: {
+      p_cycle_id: cycleId,
+      p_request_hash: requestHash,
+      p_row_count: rowCount,
+      p_payload_bytes: payloadBytes,
+      p_object_path: cacheObjectPath,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.

@@ -7,18 +7,30 @@
 // families stay pending/retryable, so the cycle stays non-drained and the NEXT tranche resumes the
 // SAME (bucket, cycle_date) cycle. A null tranche means "execute everything" (behavior unchanged).
 //
-// The selector is a FROZEN descriptor. It selects by canonical source_key (the common case: run one
-// source family at a time) OR by an explicit request_hash allowlist. Both fail closed on a malformed
-// spec so a buggy caller can never widen execution to an unintended family.
+// The selector is a genuinely IMMUTABLE, UNFORGEABLE descriptor (Blocker 5). It selects by canonical
+// source_key (the common case: run one source family at a time) OR by an explicit request_hash allowlist.
+// Both fail closed on a malformed spec so a buggy caller can never widen execution to an unintended family.
+//
+// IMMUTABILITY / TRUST MODEL (why not a plain frozen object with a Set):
+//   - The membership set is kept PRIVATE inside the built closure; the descriptor exposes only FROZEN
+//     ARRAY snapshots (`sourceKeys` / `requestHashes`) for inspection, never a mutable Set a caller could
+//     `.add()` to and thereby widen trusted policy after construction.
+//   - `selects(job)` is a FIXED function built HERE from the validated spec. A tranche NEVER adopts a
+//     caller-supplied `selects()` -- a spec's own `selects` property (if any) is ignored, and a forged
+//     "already-built" object is rejected (see below), so an arbitrary predicate can never become policy.
+//   - Authenticity is a module-PRIVATE Symbol brand (TRANCHE_BRAND). Only makeSourceTranche can stamp it,
+//     so isSourceTranche cannot be satisfied by any object a caller constructs; idempotent normalization
+//     therefore passes through only genuine, this-module-built descriptors.
 
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 
-// A descriptor is recognised as an already-built tranche (idempotent normalization) when it carries a
-// selects() function and a sourceKeys Set. Callers may pass EITHER a raw spec OR a built descriptor.
+// Module-private brand. Not exported, so no external caller can place it on a forged object.
+const TRANCHE_BRAND = Symbol("source-tranche/v2");
+
+// A value is a genuine built tranche ONLY if it carries the private brand (and is frozen). Duck-typing on
+// a `selects` function / a Set is deliberately NOT used: that let a caller forge a policy object.
 export function isSourceTranche(value) {
-  return !!value && typeof value === "object"
-    && typeof value.selects === "function"
-    && value.sourceKeys instanceof Set;
+  return !!value && typeof value === "object" && value[TRANCHE_BRAND] === true && Object.isFrozen(value);
 }
 
 function requireNonblankStringArray(arr, label) {
@@ -35,14 +47,16 @@ function requireNonblankStringArray(arr, label) {
 }
 
 /**
- * Build a FROZEN, validated tranche descriptor `{ name, mode, sourceKeys:Set, requestHashes:Set, selects(job) }`.
+ * Build a genuinely IMMUTABLE, branded tranche descriptor
+ * `{ name, mode, sourceKeys:frozen[], requestHashes:frozen[], selects(job) }` (Blocker 5).
  * Accepts EXACTLY ONE of:
  *   - `{ sourceKeys: [nonblank strings], name? }` -> selects(job) is true iff the deduped/canonical job's
- *     source_key (job.sourceKey || job.source_key) is in the set;
+ *     source_key (job.sourceKey || job.source_key) is in the (private) set;
  *   - `{ requestHashes: [nonblank strings], name? }` -> selects(job) is true iff job.requestHash
- *     (job.requestHash || job.request_hash) is in the set.
+ *     (job.requestHash || job.request_hash) is in the (private) set.
  * A malformed spec (not an object, both/neither selector, a blank/non-string entry) THROWS (fail closed).
- * An already-built descriptor is returned unchanged (idempotent), so build-time normalization is safe.
+ * A GENUINE already-built (branded, frozen) descriptor is returned unchanged (idempotent); a spec's own
+ * `selects`/`sourceKeys`-Set properties are NEVER trusted -- only the validated string arrays are used.
  */
 export function makeSourceTranche(spec) {
   if (isSourceTranche(spec)) return spec;
@@ -59,25 +73,32 @@ export function makeSourceTranche(spec) {
   }
 
   const mode = hasSourceKeys ? "sourceKeys" : "requestHashes";
+  // requireNonblankStringArray fails closed on a Set (not an Array), so a forged `{ sourceKeys: new Set() }`
+  // can never slip through as a spec; only a real nonblank string ARRAY is accepted.
   const values = requireNonblankStringArray(hasSourceKeys ? spec.sourceKeys : spec.requestHashes, mode);
-  const set = new Set(values);
-  const sourceKeys = hasSourceKeys ? set : new Set();
-  const requestHashes = hasRequestHashes ? set : new Set();
+  // PRIVATE membership set (closure-local, never exposed). Lookup is O(1); policy cannot be mutated later.
+  const memberSet = new Set(values);
+  const memberList = Object.freeze([...memberSet]);
+  const sourceKeys = hasSourceKeys ? memberList : Object.freeze([]);
+  const requestHashes = hasRequestHashes ? memberList : Object.freeze([]);
   const name = (typeof spec.name === "string" && spec.name.trim() !== "")
     ? spec.name
-    : (hasSourceKeys ? [...set].join("+") : `requestHashes(${set.size})`);
+    : (hasSourceKeys ? memberList.join("+") : `requestHashes(${memberSet.size})`);
 
   const selects = (job) => {
     if (!job || typeof job !== "object") return false;
     if (mode === "sourceKeys") {
       const key = job.sourceKey ?? job.source_key ?? "";
-      return sourceKeys.has(key);
+      return memberSet.has(key);
     }
     const hash = job.requestHash ?? job.request_hash ?? "";
-    return requestHashes.has(hash);
+    return memberSet.has(hash);
   };
 
-  return Object.freeze({ name, mode, sourceKeys, requestHashes, selects });
+  const descriptor = { name, mode, sourceKeys, requestHashes, selects };
+  // Stamp the private brand as a non-enumerable, non-writable, non-configurable own property, then freeze.
+  Object.defineProperty(descriptor, TRANCHE_BRAND, { value: true, enumerable: false, writable: false, configurable: false });
+  return Object.freeze(descriptor);
 }
 
 // ---------------------------------------------------------------------------------------------------

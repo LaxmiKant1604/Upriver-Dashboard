@@ -46,6 +46,7 @@ export async function runListingOptimizerShadowCycle({
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 2,
   sourceTranche = null, // BUILD-TIME source-tranche selector (Part A); passed through to runSourceJobs.
+  reuseOnly = false,    // BUILD-TIME reuseOnly rehearsal flag (Blocker 3); passed through to runSourceJobs.
 }) {
   // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE any planning. A
   // stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary key,
@@ -148,7 +149,7 @@ export async function runListingOptimizerShadowCycle({
     const planned = planRound();
     const plannedJobs = jobsOf(planned, round);
     for (const j of plannedJobs) ownerIdSet.add(j.owner.ownerId);
-    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche });
+    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly });
     cycleId = res.cycleId;
     rollup.cycleId = cycleId;
     rollup.rounds = round + 1;
