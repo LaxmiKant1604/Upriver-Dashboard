@@ -4622,3 +4622,46 @@ weakened.
 
 **STOP for Codex re-review.** Code+tests `1fb09c1`, docs `<this commit>`; **not pushed** — production stays on
 `0ea9f34`; nothing deployed.
+
+## Appendix AH — Codex re-review blocker fix, round 5: PPC canonical-currency consistency (OFFLINE, 2026-08-16; code+tests `dbd4726`; NOT deployed)
+
+Codex re-review of Appendix AG raised one consistency blocker; fixed **offline on `main`** (no deploy/push/publish/
+DataDoe/Supabase; controls/approvals/rollout/cron untouched; the running cycle `dfca8f75` not resumed; the approved
+Returns implementation unchanged). `npm run verify` green — **41 steps / 21 suites** (incl. `build:check`); `git diff
+--check` clean.
+
+### AH.1 The bug
+Ads rows `[{currency:"usd"},{currency:"USD"}]` canonicalize to ONE currency (USD), so `adsCurrencySignal` ⇒
+`single-valid` and the scheduler **planner** schedules the OLI slices. But the **live** `buildPpcPerformance` used a
+raw case-sensitive `currencies.length` (⇒ 2 ⇒ "multiple", skipped OLI) and the scheduler **derive adapter**
+(`report-derivation.js`) used a raw distinct-nonblank count (⇒ "multiple" **after** the exports were spent). Planner /
+live / derive disagreed, and the derive threw away exports the planner had already fetched.
+
+### AH.2 The fix — one canonical interpretation everywhere
+- **Live `ppc.js` `buildPpcPerformance`:** removed the raw `currencies.length` decision from the TACoS gate; it now
+  classifies `adsCurrencyEvidence(adsRows)` **once, before any OLI fetch** — `multiple` ⇒ the exact multi-currency
+  reason, `empty`/`invalid` ⇒ the exact mismatch reason (both **zero** OLI calls), `single-valid` ⇒ the OLI
+  fetch/validate/sum loop.
+- **Derive adapter `report-derivation.js`:** replaced its raw `new Set(...).size > 1` branch with the same
+  `adsCurrencyEvidence` 4-state logic and the **same exact reason strings** (added
+  `PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON`, copied verbatim from `derivation-core.js`). `empty`/`invalid`
+  short-circuit to the mismatch reason with no `ts` read (matching the live builder); `single-valid` keeps the `ts`
+  read + the degraded fallback.
+- **Consistency:** the planner gate, the live builder, the derive adapter, and the pure `ppcPerformancePayload` fold
+  now all key on the same four evidence states with byte-identical reasons (verified: the MULTI string appears in 2
+  sites and the MISMATCH string in 3 sites, all identical).
+- **Canonicalized currency identities** (both `ppc.js` and the byte-equivalent `derivation-core.js` twin): the payload
+  `currencies` field and the `rollupPpcRows` + daily-series currency keys use `canonicalCurrency`, so `usd`+`USD`
+  collapse to one money identity (`["USD"]`, one campaign bucket) — no false multi-currency KPI suppression and no
+  duplicate campaign rows — while `USD` vs `EUR` stay distinct and a malformed currency buckets under `"?"`.
+
+### AH.3 Executable regressions (tests 48–51)
+`usd`+`USD` ⇒ one canonical identity (`currencies == ["USD"]`, one campaign row), OLI **allowed**, TACoS **computes**,
+and the signal / planner gate / live builder / derive+pure fold **all agree** (test 49). `USD`+`EUR` ⇒ `multiple` ⇒
+**zero** OLI calls + the exact multi-currency reason in the live builder **and** the derive. `USD`+blank and `"US D"`
+⇒ `invalid` ⇒ **zero** OLI calls + the exact mismatch reason in both. The prior one-create-per-`request_hash` dedup and
+every earlier reason string remain byte-exact. No production side effects (the transport regressions drive the code
+through injected DI seams / direct pure-fold calls — no network/DB call).
+
+**STOP for Codex re-review.** Code+tests `dbd4726`, docs `<this commit>`; **not pushed** — production stays on
+`0ea9f34`; nothing deployed.

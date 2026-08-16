@@ -9970,3 +9970,34 @@ Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AG.
   docs separately.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
+
+## PPC canonical-currency consistency — Codex re-review round 5 OFFLINE on main 2026-08-16 (code+tests dbd4726, docs separate); verify green 41/21; NOT deployed
+
+Codex re-review of round 4 (1fb09c1 / Appendix AG) raised 1 consistency blocker; fixed offline on main (no deploy/push/
+publish/DataDoe/Supabase; controls/approvals/rollout/cron untouched; dfca8f75 not resumed; approved Returns impl
+unchanged). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AH.
+
+- BUG: Ads [{currency:"usd"},{currency:"USD"}] canonicalize to ONE currency (USD) => adsCurrencySignal single-valid =>
+  planner schedules OLI; but the live buildPpcPerformance used a raw case-sensitive currencies.length (=>2=>"multiple",
+  skipped OLI) and the derive adapter used a raw distinct-nonblank count (=>"multiple" AFTER exports spent). Planner/
+  live/derive disagreed and discarded already-fetched exports.
+- FIX: (1) live ppc.js removed the raw currencies.length gate; classifies adsCurrencyEvidence once BEFORE any OLI fetch
+  (multiple=>multi reason, empty/invalid=>mismatch reason, both ZERO OLI; single-valid=>fetch/validate/sum). (2) derive
+  adapter (report-derivation.js) replaced its raw Set().size>1 branch with the same 4-state logic + byte-identical
+  reasons (added PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON copied verbatim from derivation-core.js; empty/invalid
+  short-circuit to mismatch with no ts read; single-valid keeps ts read + degraded fallback). (3) planner/live/derive/
+  pure now all key on the same 4 states with byte-identical reasons (MULTI x2, MISMATCH x3, all identical). (4)
+  canonicalized the payload currencies field + rollupPpcRows + daily currency keys (both ppc.js and the derivation-core
+  twin, byte-equivalent) via canonicalCurrency, so usd+USD => one identity/bucket while USD vs EUR stay distinct.
+- Tests 48-51: usd+USD one canonical identity + OLI allowed + TACoS computes + signal/planner/live/derive AGREE (test
+  49); USD+EUR multiple => 0 OLI + exact reason (live+derive); USD+blank/"US D" invalid => 0 OLI + exact reason
+  (live+derive). One-create-per-request_hash dedup + all prior reason strings byte-exact; live+pure byte-equivalent.
+- Verify: npm run verify green (41 steps / 21 suites incl build:check); git diff --check clean; no assertions weakened.
+  No production side effects (transport tests use injected stubs / direct pure-fold calls, no network/DB call).
+- Impl history: delegated to a fresh agent (completed without stalling, stopped without committing); I independently
+  re-verified, rigorously reviewed the full diff (the 4-state gate in live+derive, the byte-identical reason strings,
+  the canonicalization in both twins, and the 4-way agreement test 49 + zero-OLI reason tests 50-51), confirmed the one
+  flagged reason change (empty/invalid derive => mismatch not degraded) is the intended consistency, and committed
+  code/tests (dbd4726) then docs separately.
+
+STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
