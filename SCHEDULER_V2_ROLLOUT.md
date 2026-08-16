@@ -4736,3 +4736,117 @@ through injected DI seams / direct pure-fold calls — no network/DB call).
   still intentionally unscheduled. Completing the other nine reports requires fresh successful DataDoe exports (or
   a reviewed DataDoe-supported partition/remediation); Europe and USA each require their own account-specific canary
   and publication gate.
+
+## Appendix AJ — Source-first tranche orchestration (OFFLINE, 2026-08-17; code+tests `1c61c7c`; docs `<this commit>`; NOT deployed)
+
+### AJ.1 Why (motivation from Appendix AI)
+The guarded IN rollout (Appendix AI) confirmed the report-first fan-out's failure mode empirically: opening all 12
+reports at once created ~127 source jobs whose create-exports overwhelmed the primary DataDoe — `order-line-items`
+create-export **TIMEOUT x16**, `settlements` x10, `profit-by-sku-date` x8, `product-catalog` x2, `returns` x2,
+`listings-raw` x1 — leaving 9 of 12 reports unavailable. Source-first orchestration inverts the driver: drain ONE
+canonical source family across the approved accounts, save + validate it durably, reuse it everywhere it is shared,
+then move to the next family. A report is derived only after ALL its exact source dependencies are validated (the
+existing `reportFetchGate`, unchanged). This bounds concurrent DataDoe pressure to a single family at a time and makes
+a shared source (e.g. the one OLI slice five reports need) cost exactly one export.
+
+This work is **shadow/offline only**: no production, DataDoe, Supabase, deploy, schedule, control, approval, or
+cycle-resume. `npm run verify` green — **42 steps / 22 suites** (incl. `build:check`); `git diff --check` clean;
+focused `test:source-tranche` 16/16. The running cycle `dfca8f75...` is untouched; these commits are LOCAL-only
+(unpushed) — `origin/main` and the deployed production remain at `02c2ef5` (the Appendix AI baseline).
+
+### AJ.2 The tranche selector (build-time, plan-derived, fail-closed)
+`lib/server/sync/source-tranche.js` (pure, zero I/O):
+- `makeSourceTranche(spec)` returns a FROZEN `{ name, mode, sourceKeys:Set, requestHashes:Set, selects(job) }`. It
+  accepts EXACTLY ONE of `{ sourceKeys:[...] }` or `{ requestHashes:[...] }` (both / neither / blank / non-object ⇒
+  throw). `selects(job)` reads `job.sourceKey ?? job.source_key` (or `job.requestHash ?? job.request_hash`), so it
+  matches a canonical job in either camel or snake case. Idempotent: an already-built descriptor passes through unchanged.
+- It is fixed at COMPOSE time only: `buildSchedulerV2Runtime` gained a `sourceTranche` override (normalized, added to the
+  trusted `collaborators`, NEVER on `RUN_OPERATIONAL_ARGS`), and `buildSchedulerV2SourceTrancheRuntime(spec, overrides)`
+  deletes any `sourceTranche` smuggled through `overrides` before fixing the reviewed one (mirrors
+  `buildSchedulerV2CanaryRuntime`). No per-run / untrusted caller can widen execution to an unintended family.
+
+### AJ.3 Exact source order (`SOURCE_TRANCHE_ORDER`)
+`sourceTrancheOrder()` derives the order from `REPORT_SOURCE_CONTRACTS` and cross-checks it at module load: a fetched
+family with no tranche, a classified family no contract declares, or a family in two tranches all THROW
+(drift / gap / overlap fail closed). Tranche 1 must be exactly OLI and tranche 2 exactly the catalog. Resulting order:
+
+| # | Tranche | Source families | Rationale |
+|---|---------|-----------------|-----------|
+| 1 | `order-line-items` | order-line-items | the single canonical OLI sales fragment (5 reports share it) |
+| 2 | `product-catalog` | product-catalog | organization-wide catalog (identity/coverage for the rest) |
+| 3 | `date-sliceable` | settlements, returns, profit-by-sku-date, sales-traffic-asin-date | remaining date-windowed history families |
+| 4 | `current-state` | listings, listings-raw, fba-inventory-health, content-changes | current-state snapshots (no/short as-of) |
+| 5 | `staged-signal` | sqp-weekly, sqp-monthly | staged / signal-dependent SQP families |
+
+`sales-traffic-asin-date` is exclusive to Sales Movers, but the FAMILY carries a date window, so it is classified
+date-sliceable (tranche 3); each family appears in exactly one tranche and their union equals the declared contract
+source set (proven by the `order` test).
+
+### AJ.4 Source-first state table (one tranche pass over a shared cycle)
+For a single `runSourceJobs` pass with tranche T over bucket/cycle_date C:
+
+| Job class | Upserted? | Executed this pass? | End state after the pass | Next tranche |
+|-----------|-----------|---------------------|--------------------------|--------------|
+| In T, `pending`, no cache | yes | yes (claim→create→poll→download→save) | `succeeded` (export_id set) or `failed`/`deferred` | done, or retryable |
+| In T, `pending`, EXACT cache hit | yes | reuse (0 DataDoe) | `succeeded`, export_id NULL, cache_object_path set | done |
+| In T, `attempted` (export_id saved) | yes | resume poll/download only (0 create) | `succeeded`/`failed`/`deferred` | resumable |
+| NOT in T | yes | no | stays `pending` | executed when its tranche runs |
+| Owner membership (any family) | yes (full plan) | n/a | `active` | carried in the shared cycle |
+
+Because every planned family is upserted BEFORE the execution filter, a filtered pass leaves the un-selected families
+`pending`; `drained = !unfinished && !deadlineReached` where `unfinished` scans ALL owned canonical jobs (not just the
+executed subset), so a narrowed tranche is NEVER drained and the dispatcher does not finalize the cycle. The next
+`buildSchedulerV2SourceTrancheRuntime(next)` invocation re-opens the SAME `(bucket, cycle_date)` cycle (`openCycle` is
+keyed on it) and executes the next family with no duplicate export for already-succeeded hashes (tests 8 + 9). A `null`
+tranche (every existing caller) executes every family — behavior byte-identical to before.
+
+### AJ.5 Cache-reuse acceptance matrix (Part C, BEFORE any create-export)
+The reuse path runs only for a `pending` job and only when `store.loadSourceRows` exists (injected test/canary stores
+without it keep the old path). It reuses the durable `source_export_cache` entry iff ALL hold; ANY miss records nothing
+and falls through to the normal one-create path:
+
+| Condition | Accept requires | On failure |
+|-----------|-----------------|------------|
+| Entry exists + unexpired | `getSourceExportCache` non-null (its query is `expires_at > now`) | miss ⇒ create |
+| Rows present + array | `Array.isArray(entry.rows)` | malformed ⇒ create |
+| Source identity | `entry.source_id === job.sourceId` (nonblank) | mismatch ⇒ create |
+| Organization identity | `entry.organization_fingerprint === job.organizationFingerprint` (nonblank) | mismatch ⇒ create |
+| Account scope identity | `entry.account_scope_hash === job.accountScopeHash` (nonblank) | mismatch ⇒ create |
+| Object path present | nonblank `entry.object_path` | blank ⇒ create |
+| Integrity | `entry.row_count === entry.rows.length` (a number) | mismatch ⇒ create |
+| Not truncated | NOT (`job.strict === true` AND `rows.length >= job.limit`) | cap-sized ⇒ create |
+
+`request_hash` already folds org + account scope + full request meta; the explicit source_id / org / scope equality
+checks are belt-and-suspenders. On confirm, `recordSourceSuccess({ exportId:null, rowCount, payloadBytes,
+cacheObjectPath })` — ZERO DataDoe calls, the claim RPC is NEVER touched, so `create_export_count` stays `0` and
+`attempted_at` stays `null`, and NO export id is fabricated. A reused row is distinguishable from a freshly-fetched one
+ONLY by `export_id IS NULL AND cache_object_path IS NOT NULL`. Proven by test 4 (accept) and test 5's five sub-cases
+(expired / mismatched source_id / mismatched scope / non-array / cap-sized all ⇒ exactly one create).
+
+### AJ.6 Preserved invariants (NOT weakened)
+- One create-export POST per `request_hash`; export_id persisted before poll; `attempted` rows resume via poll/download
+  with zero new POSTs (the reuse block is skipped for non-pending jobs). Tests 6 + 12.
+- Canonical dedup (one row per hash) + full owner memberships; owner_id recomputed and scope-checked; no ownerless /
+  cross-account / cross-organization job. Tests 2 + 13.
+- Derive gate unchanged: a report stays pending until ALL its deps succeed; a failed dep preserves LKG and never blocks
+  an unrelated complete report. Tests 10 + 11.
+- Request hashes (`source-identity.js`), source contracts (`report-source-contracts.js`), and report folds/payloads are
+  untouched — the tranche order only READS the contracts for its drift cross-check.
+
+### AJ.7 Residual DataDoe questions (for Codex senior review)
+1. **Manual/UI-export adoption is deliberately UNSUPPORTED.** DataDoe's export GET does not return the original request
+   parameters (columns / groupBy / aggregations / from / to / limit / account scope), so a UI-visible export cannot be
+   proven to equal a canonical `request_hash`. Reuse therefore requires a durable `source_export_cache` row keyed by the
+   exact hash (test 7 proves a source-name-only "manual" entry is rejected and a real export is created instead). **Open
+   question:** is there any DataDoe endpoint that returns an export's full original request parameters? If so, a SEPARATE
+   reviewed adoption design (recompute the hash from the returned params, then confirm) would be required — an unsafe
+   name-only match must never be added.
+2. **Reuse telemetry shape.** A reused job intentionally has `create_export_count=0` / `attempted_at=null` /
+   `export_id=null` and points at the pre-existing object. Confirm this shape is acceptable for dashboards/alerting,
+   since a reused job is distinguishable only by `export_id IS NULL AND cache_object_path IS NOT NULL`.
+3. **No live confirmation yet.** All 14 requirements are proven against in-memory stores + an injected DataDoe spy; the
+   TTL/reuse behavior is validated only against the modeled `expires_at > now` gate. A one-account READ-ONLY shadow
+   confirmation is warranted before any cutover — NOT done here.
+
+**STOP for Codex senior review.** Code+tests `1c61c7c`, docs `<this commit>`; **not pushed** — `origin/main` and the
+deployed production remain at `02c2ef5`; nothing deployed, scheduled, or resumed.

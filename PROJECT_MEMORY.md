@@ -10023,3 +10023,44 @@ unchanged). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AH.
   code/tests (dbd4726) then docs separately.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
+
+## Source-first tranche orchestration — OFFLINE on main 2026-08-17 (code+tests 1c61c7c, docs separate); verify green 42/22; NOT deployed
+
+Inverts the Scheduler-v2 driver from report-first fan-out to source-first: drain ONE canonical source family across the
+approved accounts, save+validate durably, reuse it everywhere shared, then the next family; derive a report only after
+ALL its deps validate (existing reportFetchGate, unchanged). Motivated by Appendix AI's IN rollout, which empirically hit
+the report-first timeout storm (OLI create-export TIMEOUT x16, settlements x10, profit-by-sku-date x8, ...). Full
+evidence: SCHEDULER_V2_ROLLOUT.md Appendix AJ. Offline only (no production/DataDoe/Supabase/deploy/schedule/control/
+approval; dfca8f75 not resumed).
+
+- Part A: new pure lib/server/sync/source-tranche.js. makeSourceTranche(spec) => FROZEN {name,mode,sourceKeys:Set,
+  requestHashes:Set,selects(job)}; EXACTLY ONE of sourceKeys/requestHashes (else throw), fail-closed, idempotent;
+  selects reads sourceKey??source_key (or requestHash??request_hash). SOURCE_TRANCHE_ORDER + sourceTrancheOrder() derived
+  from + cross-checked against REPORT_SOURCE_CONTRACTS (drift/gap/overlap throws at module load): order-line-items ->
+  product-catalog -> date-sliceable -> current-state -> staged-signal. Build-time only: buildSchedulerV2Runtime gained a
+  sourceTranche collaborator (NOT on RUN_OPERATIONAL_ARGS); buildSchedulerV2SourceTrancheRuntime fixes it at compose time
+  and deletes any smuggled override (canary precedent). Threaded through runSchedulerV2Shadow -> runStagedSourceCycle +
+  all 4 staged runners -> runSourceJobs, narrowing executeHashes ONLY. The upsert loops still run over the FULL plan (all
+  canonical jobs + owner memberships), so un-selected families stay pending; drained = !unfinished (unfinished scans ALL
+  owned canonical jobs, not the executed subset) => a filtered tranche is never drained => the next tranche re-opens the
+  SAME (bucket,cycle_date) cycle with no dup export. null tranche = byte-identical no-op.
+- Part C: confirmed-exact-match durable cache reuse BEFORE create-export, gated on store.loadSourceRows. Accept iff array
+  rows + source_id/org/scope identity (all nonblank) + nonblank object_path + row_count===rows.length + NOT(strict &&
+  rows.length>=limit); ANY miss => record nothing, fall through to the unchanged one-create path. On confirm:
+  recordSourceSuccess({exportId:null, cacheObjectPath}) => ZERO DataDoe, create_export_count=0, attempted_at=null, no
+  fabricated export id (a reused row = export_id IS NULL AND cache_object_path IS NOT NULL). getSourceExportCache now also
+  selects organization_fingerprint + account_scope_hash (it already downloads the payload rows + is TTL-gated).
+- Parts B/D/E: OLI hash-sharing via real contracts/identity (5 reports -> 1 hash/slice); export_id resume preserved
+  (reuse block skipped for non-pending jobs, 0 create); manual/UI-export adoption UNSUPPORTED + documented (DataDoe GET
+  lacks the original request params to prove hash identity); deterministic order + derive-as-deps-validate.
+- Tests: new scripts/source-tranche.test.js (16 assertions: 14 requirements + order + descriptor + composition proofs)
+  driving the REAL runSourceJobs/runStagedSourceCycle/runReportJobs + real contracts/identity + injected DataDoe spy;
+  registered in package.json + verify.mjs. Verify green (42 steps / 22 suites incl build:check); git diff --check clean.
+- Impl history: delegated to a fresh agent (a7c15e648, completed without stalling, stopped WITHOUT committing); I
+  independently re-verified, rigorously reviewed the full diff (confirmed the tranche narrows EXECUTION only with the full
+  plan+owners upserted; drained scoped to the full owned pending set; cache-reuse matrix + zero-export bookkeeping via
+  production recordSyncSourceSuccess which never touches create_export_count/attempted_at; getSourceExportCache returns
+  rows so reuse is functional-not-inert; null path byte-identical; hashes/contracts/folds not weakened; each of the 14
+  tests proves its requirement), then committed code/tests (1c61c7c) then docs separately.
+
+STOP for Codex senior review. Offline only; not pushed; origin/main + the deployed production remain at 02c2ef5 (these commits are local-only); nothing deployed, scheduled, or resumed.
