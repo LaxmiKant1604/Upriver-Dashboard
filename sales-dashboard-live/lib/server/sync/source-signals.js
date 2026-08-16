@@ -79,9 +79,18 @@ export function optimizerSqpSignal(outcome) {
 // row makes the state "invalid" (a currencyless-but-spending Ads row must never read as a clean single
 // currency), so evaluateAdsCurrencyGate returns false and total-sales (TACoS) is NOT scheduled (fail closed).
 export function adsCurrencySignal(adsRows) {
-  if (!Array.isArray(adsRows)) return { status: "failed", validated: false, currencyCount: 0, state: "invalid" };
+  if (!Array.isArray(adsRows)) return failedAdsCurrencySignal();
   const evidence = adsCurrencyEvidence(adsRows);
   return { status: "success", validated: true, currencyCount: evidence.currencyCount, state: evidence.state };
+}
+
+// The ONE fail-closed Ads-currency signal, produced wherever an Ads-currency read is unavailable/failed
+// (non-array rows here, a failed persisted load in ppc-ads-loader.js, a missing reconstruct read in
+// source-sync-driver.js). Centralised so the typed shape cannot drift: it VALIDATES via
+// validateAdsCurrencySignal (status "failed", validated false, currencyCount 0 non-negative-integer, state
+// "invalid") and evaluateAdsCurrencyGate returns false, so TACoS/oli-sales is NEVER scheduled (fail closed).
+export function failedAdsCurrencySignal() {
+  return { status: "failed", validated: false, currencyCount: 0, state: "invalid" };
 }
 
 // The three source-job request keys that PRODUCE a staged/fallback signal, mapped to

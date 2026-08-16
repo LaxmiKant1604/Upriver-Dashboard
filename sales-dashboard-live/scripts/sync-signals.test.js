@@ -23,6 +23,7 @@ const MIG_DIR = join(ROOT, "supabase", "migrations");
 const v2 = readFileSync(join(MIG_DIR, "20260807_scheduler_v2.sql"), "utf8");
 let runSourceJobs, classifyFetchError, salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes;
 let runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter, reportSourceRequestHashes, salesMoversWindows, validateSourcePayload, upsertSyncSourceJob;
+let validateAdsCurrencySignal, evaluateAdsCurrencyGate;
 
 let passed = 0;
 const tests = [];
@@ -263,12 +264,17 @@ test("reconstructSignals: a genuine empty success ({rows:[]}) activates downstre
   }
 });
 
-test("reconstructSignals: a failed/unavailable ads read yields no scheduling currency (not count 0)", async () => {
+test("reconstructSignals: a failed/unavailable ads read yields the TYPED fail-closed currency signal (validates + gates false, never schedules)", async () => {
   const store = makeMemoryStore();
   const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-07" });
   const s = await reconstructSignals({ store, cycleId: cid, resolvePlan: async () => ({ sourceJobs: [] }), adsRowsProvider: async () => { throw new Error("ads read failed"); } });
-  assert.equal(s["ppc-performance:ads-currency"].validated, false);
-  assert.equal(s["ppc-performance:ads-currency"].currencyCount, null);
+  const sig = s["ppc-performance:ads-currency"];
+  // Blocker 2: a failed/unavailable ads read is the ONE shared TYPED fail-closed signal, never the old
+  // {currencyCount:null} shape that validateAdsCurrencySignal rejects. It VALIDATES cleanly and the gate
+  // returns false, so TACoS/oli-sales is never scheduled from an unavailable currency read (fail closed).
+  assert.deepEqual(sig, { status: "failed", validated: false, currencyCount: 0, state: "invalid" });
+  assert.doesNotThrow(() => validateAdsCurrencySignal(sig), "the driver-produced fail-closed signal validates (no throw)");
+  assert.equal(evaluateAdsCurrencyGate(sig), false, "the fail-closed signal gates total-sales OFF");
 });
 
 /* ----------------------------- signals (pure) ----------------------------- */
@@ -462,6 +468,11 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
   const invalid = makeMemoryStore();
   const r3 = await runStagedSourceCycle(runOpts({ store: invalid, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "" }] }));
   assert.deepEqual(sources(invalid, r3.cycleId), ["product-catalog"], "blank Ads row => invalid => gate fails closed => no order-line-items export");
+  // Blocker 2: a FAILED/unavailable ads read (the provider throws) yields the TYPED fail-closed signal
+  // (state "invalid") through the REAL driver, so the resolver schedules ZERO ppc-performance:oli-sales.
+  const failedRead = makeMemoryStore();
+  const r4 = await runStagedSourceCycle(runOpts({ store: failedRead, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => { throw new Error("ads read failed"); } }));
+  assert.deepEqual(sources(failedRead, r4.cycleId), ["product-catalog"], "failed ads read => typed fail-closed signal => no order-line-items export");
 });
 
 test("classifyFetchError maps to SAFE codes/terminality and never echoes the raw error", async () => {
@@ -499,7 +510,7 @@ async function main() {
   ({ runSourceJobs, classifyFetchError } = await step("source-worker.js", "../lib/server/sync/source-worker.js"));
   ({ salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes } = await step("source-signals.js", "../lib/server/sync/source-signals.js"));
   ({ runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter } = await step("source-sync-driver.js", "../lib/server/sync/source-sync-driver.js"));
-  ({ reportSourceRequestHashes, salesMoversWindows } = await step("report-source-contracts.js", "../lib/server/sync/report-source-contracts.js"));
+  ({ reportSourceRequestHashes, salesMoversWindows, validateAdsCurrencySignal, evaluateAdsCurrencyGate } = await step("report-source-contracts.js", "../lib/server/sync/report-source-contracts.js"));
   ({ validateSourcePayload } = await step("source-cache.js", "../lib/server/sync/source-cache.js"));
   const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob;
   const total = tests.filter((t) => !t.marker).length;

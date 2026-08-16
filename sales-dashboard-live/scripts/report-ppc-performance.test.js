@@ -25,6 +25,7 @@ let planPpcPerformance, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_R
 let runPpcShadowCycle, loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader;
 let validatePpcSourceCoverage, evaluateSourceCoverage;
 let ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES;
+let buildPpcPerformance, ORDER_LINE_ITEMS;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -370,7 +371,7 @@ test("21. loadPersistedPpcAds: an out-of-window / bad-source-key row fails close
 test("22. ppcAdsCurrencySignalOf: validated => success signal; unavailable => fail-closed (never success)", () => {
   assert.deepEqual(ppcAdsCurrencySignalOf(okAds()), { status: "success", validated: true, currencyCount: 1, state: "single-valid" });
   assert.deepEqual(ppcAdsCurrencySignalOf(okAds([])), { status: "success", validated: true, currencyCount: 0, state: "empty" });
-  assert.deepEqual(ppcAdsCurrencySignalOf({ status: "unavailable" }), { status: "failed", validated: false, currencyCount: null });
+  assert.deepEqual(ppcAdsCurrencySignalOf({ status: "unavailable" }), { status: "failed", validated: false, currencyCount: 0, state: "invalid" });
 });
 
 /* ============================= Part C: real cycle + report worker ============================= */
@@ -480,7 +481,7 @@ test("26. UNSEEDED Ads (successful [] rows + [] sync + [] coverage): plans NOTHI
   const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...unseeded });
   assert.equal(loaded.status, "unavailable", "unseeded account is NOT a validated-empty window");
   assert.match(loaded.reason, /required-source/, "unavailable because a required default lacks proven coverage");
-  assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: null }, "fail-closed currency signal");
+  assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: 0, state: "invalid" }, "fail-closed currency signal (typed shape that validates + gates false)");
   // Through the REAL cycle: zero source jobs, zero DataDoe exports, an empty-sources report plan.
   const r = await runCycle(store, dd, unseeded);
   assert.equal(dd.totalCreates(), 0, "unseeded Ads => zero DataDoe exports");
@@ -614,7 +615,7 @@ test("33. required-source coverage partial/gapped/stale/schema-missing/read-fail
     const loaded = await loadPersistedPpcAds({ accountId: ID, asOf: ASOF, ...readers });
     assert.equal(loaded.status, "unavailable", label + " => unavailable");
     assert.match(loaded.reason, /required-source/, label + " => reason names the required source");
-    assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: null }, label + " => fail-closed signal (plans nothing)");
+    assert.deepEqual(ppcAdsCurrencySignalOf(loaded), { status: "failed", validated: false, currencyCount: 0, state: "invalid" }, label + " => fail-closed signal (plans nothing)");
   }
 });
 
@@ -935,8 +936,58 @@ test("46. Blocker 1: the TACoS fold sums ONLY for a single valid Ads currency ma
   assert.equal(p1.adsRowCount, 1, "the malformed-currency Ads row is still counted; rest of PPC intact");
 });
 
+group("ppc LIVE builder: OLI total-sales export is GATED behind the Ads-currency evidence (transport ordering)");
+
+test("47. Blocker 1 (LIVE/manual buildPpcPerformance): zero OLI total-sales exports unless a SINGLE VALID canonical Ads currency is proven; rest of PPC intact", async () => {
+  // A REAL buildPpcPerformance invocation driven ONLY through the injected DI seam (no network/DB): sync
+  // states [], catalog [], Ads rows = the scenario rows, and fetchExportRowsStrict replaced by a SPY that
+  // counts OLI total-sales export calls (matched by the ORDER_LINE_ITEMS source id) and returns []. The gate
+  // must classify the Ads currency BEFORE any OLI fetch, so a non-single-valid currency spends ZERO exports.
+  const adsRowsOf = (currencies) => currencies.map((currency, i) => ({
+    account_id: ID, source_key: KEYS.campaign, metric_date: "2025-08-01",
+    campaign_id: "C" + i, campaign_type: "SP", currency, dimensions: {}, metrics: {},
+  }));
+  const run = async (currencies) => {
+    let oliCalls = 0;
+    const deps = {
+      getAdsSyncStates: async () => [],
+      fetchCatalog: async () => [],
+      getAdsDailySourceRows: async () => adsRowsOf(currencies),
+      // Spy on the strict OLI export transport: any call carrying the ORDER_LINE_ITEMS source id is an OLI
+      // total-sales export. Returning [] keeps this offline while still exercising the real fetch path.
+      fetchExportRowsStrict: async (_apiKey, sourceId) => { if (sourceId === ORDER_LINE_ITEMS.id) oliCalls += 1; return []; },
+    };
+    const payload = await buildPpcPerformance({ apiKey: dash("test", "key"), ids: [ID], to: ASOF }, deps);
+    return { oliCalls, payload };
+  };
+
+  // A single valid canonical Ads currency OPENS the gate: the OLI total-sales export may run (>= 1 call).
+  const single = await run(["USD"]);
+  assert.ok(single.oliCalls >= 1, "single valid USD Ads currency opens the OLI total-sales gate (OLI may run)");
+  assert.ok(Array.isArray(single.payload.campaigns) && Array.isArray(single.payload.asins), "full PPC payload present");
+
+  // Every NON-single-valid evidence state => ZERO OLI export calls AND TACoS unavailable, rest of PPC intact.
+  const zeroCases = {
+    "empty Ads rows (state empty)": [],
+    "all-blank currency (state invalid)": [""],
+    "malformed 'US D' (state invalid)": ["US D"],
+    "valid USD + a blank row (state invalid)": ["USD", ""],
+    "multiple USD+EUR (state multiple)": ["USD", "EUR"],
+  };
+  for (const [label, currencies] of Object.entries(zeroCases)) {
+    const { oliCalls, payload } = await run(currencies);
+    assert.equal(oliCalls, 0, label + " => ZERO OLI total-sales export calls (gated BEFORE any fetch)");
+    assert.equal(payload.totalSales, null, label + " => TACoS unavailable (never summed)");
+    assert.ok(payload.totalSalesUnavailable, label + " => a typed unavailable reason is set");
+    assert.ok(Array.isArray(payload.campaigns) && Array.isArray(payload.asins), label + " => the rest of the PPC payload is intact");
+    assert.equal(payload.adsRowCount, currencies.length, label + " => every Ads row is still counted in the report");
+  }
+});
+
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
+  ({ buildPpcPerformance } = await import("../lib/server/reports/ppc.js"));
+  ({ ORDER_LINE_ITEMS } = await import("../lib/server/reports/sources.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
   ({ plannedSourceJob } = await import("../lib/server/sync/source-sync-driver.js"));

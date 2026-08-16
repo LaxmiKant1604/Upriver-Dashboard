@@ -23,7 +23,7 @@
 
 import { addDaysStr } from "../date-windows.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
-import { adsCurrencySignal } from "./source-signals.js";
+import { adsCurrencySignal, failedAdsCurrencySignal } from "./source-signals.js";
 // The CLOSED allowlist of admin-safe coverage reason codes -- the SAME set the pure payload leaf uses to
 // sanitize `coverageUnavailableReason`, so the injected-derive contract and the saved payload share ONE source
 // of truth. derivation-core.js is an import-free pure leaf (no transport/storage), so this adds none.
@@ -276,7 +276,7 @@ export async function loadPersistedPpcAds({ accountId, asOf, getAdsDailySourceRo
 export function ppcAdsCurrencySignalOf(loaded) {
   return loaded && loaded.status === "ok" && Array.isArray(loaded.adsRows)
     ? adsCurrencySignal(loaded.adsRows)
-    : { status: "failed", validated: false, currencyCount: null };
+    : failedAdsCurrencySignal();
 }
 
 /**

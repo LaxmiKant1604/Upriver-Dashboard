@@ -34,6 +34,7 @@ import {
   requiresSingleAccountSource,
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
+import { failedAdsCurrencySignal } from "../lib/server/sync/source-signals.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
 import { canonicalOliSlices, planMonthWindows } from "../lib/server/date-windows.js";
 import { chunkAccountIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT } from "../lib/server/id-batching.js";
@@ -1297,6 +1298,11 @@ test("ads-currency signal + gate are typed and fail closed", () => {
   assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 2, state: "multiple" }), false); // by design
   assert.equal(evaluateAdsCurrencyGate({ status: "failed", validated: true, currencyCount: 1, state: "single-valid" }), false);
   assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: false, currencyCount: 1, state: "single-valid" }), false); // fail closed
+  // Blocker 2: the ONE shared failedAdsCurrencySignal() producer emits a typed shape that VALIDATES (no throw)
+  // and gates OFF -- every unavailable/read-failed ads-currency signal is typed-consistent by construction.
+  assert.deepEqual(failedAdsCurrencySignal(), { status: "failed", validated: false, currencyCount: 0, state: "invalid" });
+  assert.doesNotThrow(() => validateAdsCurrencySignal(failedAdsCurrencySignal()));
+  assert.equal(evaluateAdsCurrencyGate(failedAdsCurrencySignal()), false);
 });
 
 test("normalizeFailurePolicy validates enums, rejects HTTP-code text, freezes the result", () => {

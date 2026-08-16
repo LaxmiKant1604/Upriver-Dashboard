@@ -21,7 +21,7 @@ import {
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import { runSourceJobs } from "./source-worker.js";
 import { atomicSaveSourcePayload } from "./source-cache.js";
-import { deriveSignalsFromOutcomes, SIGNAL_PRODUCERS, adsCurrencySignal } from "./source-signals.js";
+import { deriveSignalsFromOutcomes, SIGNAL_PRODUCERS, adsCurrencySignal, failedAdsCurrencySignal } from "./source-signals.js";
 
 const SOURCE_CACHE_TTL_MS = 20 * 3600 * 1000;
 
@@ -233,7 +233,7 @@ export async function reconstructSignals({ store, cycleId, resolvePlan, adsRowsP
     try { adsRows = await adsRowsProvider(); } catch (_e) { adsRows = null; }
     signals["ppc-performance:ads-currency"] = Array.isArray(adsRows)
       ? adsCurrencySignal(adsRows)
-      : { status: "failed", validated: false, currencyCount: null };
+      : failedAdsCurrencySignal();
   }
   return signals;
 }
