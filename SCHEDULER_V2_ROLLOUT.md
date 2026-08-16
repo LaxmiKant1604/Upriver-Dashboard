@@ -4366,3 +4366,56 @@ source set independently succeeded, or (b) discard it and re-attempt fresh — *
 `sales-traffic-asin-date` stability is resolved (Appendix Q.4), since that single source is the dominant failure.
 
 **STOP for Codex review.** Halt evidence is docs-only and unpushed; production stays on `0ea9f34`.
+
+## Appendix AC — Order Line Items source correction (OFFLINE, 2026-08-16; code+tests commit `feb0c83`; NOT deployed)
+
+**Approved business decision:** Order Line Items (OLI — `item_price_value` = sales, `quantity` = ordered units,
+`item_price_currency` = currency; sourceId `89b27535…`) is the **canonical sales/units source** for
+daily-reporting, fba-plan, buy-box-loss, returns-leakage, ppc-performance. Implemented **offline on `main`** —
+**no deploy/push/merge, no production/DataDoe/Supabase call**; the running Phase-2 cycle `dfca8f75` was NOT
+touched; brand-sales/IN's live snapshot is unchanged.
+
+### AC.1 What changed (per report)
+| Report | Change | Shadow ver | Live ver |
+|---|---|---|---|
+| daily-reporting | sales/units → OLI; `item_price_currency` added to columns+groupBy; folds key currency in | `/v2d-1`→`/v2d-2` | `daily-reporting-shared-v1` (unchanged) |
+| fba-plan | monthly-units + current-daily-dates → OLI `quantity` (units are currency-agnostic; no currency column) | `/v2d-1`→`/v2d-2` | `fba-plan-shared-v1` (unchanged) |
+| ppc-performance | TACoS denominator → OLI sales, grouped by `item_price_currency`; sums ONLY the single Ads currency, degrades (typed reason) on any mismatch/mix | `/v2d-1`→`/v2d-2` | `ppc-performance-v1` (unchanged) |
+| buy-box-loss | ADD `buy-box-loss:ordered` (OLI, grouped `sku,child_asin,item_price_currency`) for sales/units, joined on `currency\|sku`; Profit-by-SKU retained ONLY for `buybox_percentage` + `page_views` | `/v2d-1`→`/v2d-2` | `buy-box-loss-v1` (unchanged) |
+| returns-leakage | denominator `units_shipped` → **ordered units** (OLI `quantity`, relabeled "Ordered Units"); numerator → **Returns record count** (was Sales&Traffic `units_refunded`); `units_shipped`/`units_refunded` dropped; frontend rate/labels/CSV updated | `/v2d-1`→`/v2d-2` | `returns-leakage-v1`→**`-v2`** (payload field rename) |
+
+Aggregation **aliases** were preserved (`total_sales_sum`/`total_units_sum`/`sales_sum`/`units_sum`) so downstream
+folds changed only for currency isolation. Live route builders (`api/datadoe.js`, `reports/{ppc,returns,buy-box}.js`)
+and the scheduler folds (`derivation-core.js`) were edited as **byte-identical twins**; contract constants updated
+in lockstep so the parity tests stay green.
+
+### AC.2 Reports still legitimately using Sales & Traffic by ASIN & Date
+**`sales-movers` ONLY** (probe + `sales-movers:traffic`) — it needs `session`/`page_views`/`total_orders`, which OLI
+does not carry. Its `sales-movers:ads` still uses Profit by SKU & Date (unchanged). The `sales-traffic-asin-date`
+contract's `consumers` list is now exactly `["sales-movers"]`. (Reports unaffected by this change: `sku-pl`,
+`listing-health`, `reconciliation` keep their existing sources; `brand-sales`/`reconciliation` already used OLI.)
+
+### AC.3 Judgment calls flagged for senior review
+1. **returns-leakage re-sourcing:** numerator = Returns record count (item 4); denominator = OLI ordered units
+   (item 7). The old Sales&Traffic shipped/refunded pair no longer exists. An ASIN with orders but **no returns and
+   no refund events** is now **excluded** from the leakage report (documented in `report-returns.test.js` test 9).
+2. **returns `sales`** (OLI `item_price_value`) is summed per-ASIN; the return RATE is currency-safe (units are
+   currency-agnostic) and settlement money stays currency-isolated. The informational `sales` field is not
+   currency-keyed and is unused by the UI.
+3. **buy-box join** requires `profit-by-sku.currency` == OLI `item_price_currency` for the same SKU; a mismatch
+   excludes that SKU (fail-closed, never a fabricated cross-source number).
+4. **PPC TACoS** sums only OLI rows in the single Ads currency; any mismatch/mix degrades TACoS with a typed reason
+   — never a cross-currency sum.
+
+### AC.4 Verification (item 9)
+`npm run verify` **green — 40 steps / 20 suites** (incl. `build:check`). New `scripts/oli-source-correction.test.js`
+(14 deterministic, network-free tests) proves (a)–(j): OLI source keys for the five; none plan a Sales&Traffic
+request; sales-movers keeps Sales&Traffic; buy-box buybox%/page-views from Profit-by-SKU with OLI sales/units;
+PPC TACoS sums-in-Ads-currency + degrades on mismatch/mix; daily brand totals = sum of ASIN-level OLI rows;
+fba-plan uses OLI `quantity` (ignores `total_units`); returns denominator = ordered units; cross-currency never
+merges (daily/buy-box/returns → separate rows); a cross-account OLI fragment fails closed (derive-invalid, no
+partial write); deterministic one-export-per-`request_hash` with distinct per-report identities. Golden
+daily-reporting request-hashes recaptured; live↔scheduler parity preserved.
+
+**STOP for Codex senior review.** Code+tests committed `feb0c83`, docs `<this commit>`; **not pushed** — production
+stays on `0ea9f34`, and this correction is not deployed/rolled out by this work.

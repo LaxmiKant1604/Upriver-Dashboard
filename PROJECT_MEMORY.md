@@ -9805,3 +9805,37 @@ keep rollback state). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AB.
   (Appendix Q.4) is resolved.
 
 STOP for Codex review. Docs-only + unpushed; production stays on 0ea9f34.
+
+## Order Line Items source correction — OFFLINE on main 2026-08-16 (code+tests feb0c83, docs separate); verify green; NOT deployed
+
+Approved business decision: Order Line Items (OLI; item_price_value=sales, quantity=ordered units,
+item_price_currency; sourceId 89b27535…) is the canonical sales/units source for daily-reporting, fba-plan,
+buy-box-loss, returns-leakage, ppc-performance. Sales & Traffic by ASIN & Date now has exactly ONE consumer:
+sales-movers (needs session/page_views/total_orders that OLI lacks). Full evidence: SCHEDULER_V2_ROLLOUT.md
+Appendix AC.
+
+- Implemented OFFLINE on main: NO deploy/push/merge, NO production/DataDoe/Supabase call. Running Phase-2 cycle
+  dfca8f75 untouched; brand-sales/IN live snapshot unchanged.
+- daily/fba/ppc/returns: swapped sales-traffic-asin-date -> order-line-items for sales/units. Aggregation ALIASES
+  preserved (total_sales_sum/total_units_sum/sales_sum/units_sum); money aggregations add item_price_currency to
+  columns+groupBy and every fold keys currency in (never combines currencies); fba-plan units carry no currency
+  (quantity is currency-agnostic).
+- buy-box-loss: ADDED buy-box-loss:ordered (OLI grouped sku+child_asin+item_price_currency) for sales/units joined
+  on currency|sku; Profit-by-SKU retained ONLY for buybox_percentage + page_views.
+- returns-leakage: denominator units_shipped -> ordered units (OLI quantity, relabeled "Ordered Units"); numerator
+  -> Returns record count (was Sales&Traffic units_refunded); units_shipped/units_refunded dropped; frontend
+  (insights.js + ReturnsLeakage.jsx) rate/labels/CSV updated; an ordered-only ASIN with no returns/refunds is now
+  excluded from the leakage report.
+- ppc-performance: TACoS denominator sums ONLY OLI rows in the single Ads currency; degrades (typed reason) on any
+  currency mismatch/mix.
+- Versions: shadow snapshotVersion v2d-1 -> v2d-2 for all 5. Live liveReportVersion bumped ONLY returns-leakage
+  (v1 -> v2, payload field rename); other 4 live versions unchanged (payload-compatible). Live route builders +
+  scheduler folds edited as byte-identical twins; parity tests green.
+- Verification: npm run verify green (40 steps / 20 suites incl build:check). New scripts/
+  oli-source-correction.test.js (14 tests) proves item-9 (a)-(j). Golden daily request-hashes recaptured.
+- Impl history: fba-plan + start-of-daily by one delegated agent; two agent sessions stalled on infra
+  (stream watchdog) so a fresh agent finished daily/ppc/buy-box/returns + frontend + tests, then I rigorously
+  reviewed the full diff (currency isolation, returns re-source, buy-box join, TACoS, golden hashes, no weakened
+  assertions) before committing.
+
+STOP for Codex senior review. Offline only; not pushed; production stays on 0ea9f34; correction not deployed.
