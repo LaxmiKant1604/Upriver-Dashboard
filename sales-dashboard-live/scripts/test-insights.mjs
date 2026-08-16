@@ -507,6 +507,51 @@ test("Blocker 3: the portfolio return rate is a PROVEN PARTIAL over rows with kn
   assert.notEqual(rate, (2 / 70) * 100, "never the understated complete rate that includes withheld rows' ordered units");
 });
 
+// Blocker 2: eligibility + partial semantics (rows are shaped exactly as returnsPortfolioRate reads them).
+test("Blocker 2: a lag-inflated row (returned > ordered) is excluded from BOTH => rate null + partial", () => {
+  const { rate, ratePartial } = returnsPortfolioRate([{ returnedUnits: 20, orderedUnits: 10 }]);
+  assert.equal(rate, null, "a lag-inflated row is not eligible; nothing proven => rate null (UI reads unavailable-partial)");
+  assert.equal(ratePartial, true, "excluded lag-inflated evidence => proven partial");
+});
+
+test("Blocker 2: returned units with no usable denominator (ordered null / 0) => excluded => partial", () => {
+  const { rate, ratePartial } = returnsPortfolioRate([
+    { returnedUnits: 3, orderedUnits: null },
+    { returnedUnits: 2, orderedUnits: 0 },
+  ]);
+  assert.equal(rate, null, "no eligible ordered units => rate null");
+  assert.equal(ratePartial, true, "returns with no denominator are excluded evidence => proven partial");
+});
+
+test("Blocker 2: mixed eligible + ineligible => the proven eligible-only rate + partial", () => {
+  const { rate, ratePartial } = returnsPortfolioRate([
+    { returnedUnits: 2, orderedUnits: 10 },    // eligible: 2/10
+    { returnedUnits: null, orderedUnits: 40 }, // (i) withheld over real ordered units
+    { returnedUnits: 5, orderedUnits: 0 },     // (ii) no denominator
+    { returnedUnits: 30, orderedUnits: 10 },   // (iii) lag-inflated
+  ]);
+  assert.equal(rate, (2 / 10) * 100, "rate = proven eligible-only = 20% (ineligible ordered units never dilute it)");
+  assert.equal(ratePartial, true, "any excluded rate-moving evidence => partial");
+});
+
+test("Blocker 2: ALL-ineligible rows => rate null + partial", () => {
+  const { rate, ratePartial } = returnsPortfolioRate([
+    { returnedUnits: null, orderedUnits: 5 },  // withheld over ordered units
+    { returnedUnits: 9, orderedUnits: 4 },     // lag-inflated
+  ]);
+  assert.equal(rate, null);
+  assert.equal(ratePartial, true);
+});
+
+test("Blocker 2: fully-eligible control (no ineligible rows) => exact proven rate + NOT partial", () => {
+  const { rate, ratePartial } = returnsPortfolioRate([
+    { returnedUnits: 3, orderedUnits: 10 },
+    { returnedUnits: 2, orderedUnits: 10 },
+  ]);
+  assert.equal(rate, (5 / 20) * 100, "5 returned / 20 ordered = 25%");
+  assert.equal(ratePartial, false, "no excluded evidence => complete, not partial");
+});
+
 test("a return cause is only named when one bucket is at least half the returns", () => {
   const rows = buildReturnsRows(returnsData, "ALL");
   const insights = buildReturnsInsights(returnsData, rows);

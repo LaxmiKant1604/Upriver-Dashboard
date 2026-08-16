@@ -368,8 +368,8 @@ test("21. loadPersistedPpcAds: an out-of-window / bad-source-key row fails close
 });
 
 test("22. ppcAdsCurrencySignalOf: validated => success signal; unavailable => fail-closed (never success)", () => {
-  assert.deepEqual(ppcAdsCurrencySignalOf(okAds()), { status: "success", validated: true, currencyCount: 1 });
-  assert.deepEqual(ppcAdsCurrencySignalOf(okAds([])), { status: "success", validated: true, currencyCount: 0 });
+  assert.deepEqual(ppcAdsCurrencySignalOf(okAds()), { status: "success", validated: true, currencyCount: 1, state: "single-valid" });
+  assert.deepEqual(ppcAdsCurrencySignalOf(okAds([])), { status: "success", validated: true, currencyCount: 0, state: "empty" });
   assert.deepEqual(ppcAdsCurrencySignalOf({ status: "unavailable" }), { status: "failed", validated: false, currencyCount: null });
 });
 
@@ -499,7 +499,7 @@ test("26. UNSEEDED Ads (successful [] rows + [] sync + [] coverage): plans NOTHI
 
 test("27. shared catalog canonical hash matches Sales Movers; one export per shared hash across owners", async () => {
   const store = makeStore(); const dd = makeDataDoe();
-  const ppcPlan = planPpcPerformance({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, adsCurrencySignal: { status: "success", validated: true, currencyCount: 1 } });
+  const ppcPlan = planPpcPerformance({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, adsCurrencySignal: { status: "success", validated: true, currencyCount: 1, state: "single-valid" } });
   const sm = planSalesMovers({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, probeSignal: { status: "success", validated: true, latestReportedDate: "2025-08-08" } });
   const ppcCat = ppcPlan.sources.find((s) => s.requestKey === "ppc-performance:catalog");
   assert.equal(ppcCat.requestHash, sm.sources.find((s) => s.requestKey === "sales-movers:catalog").requestHash, "shared catalog identity with Sales Movers");
@@ -906,6 +906,33 @@ test("45. live-route payload is unchanged when sourceCoverage is ABSENT (no cove
   for (const s of p.sourceAvailability) {
     assert.ok(!("coverageProven" in s) && !("coverageFolded" in s) && !("coverageStatus" in s) && !("coverageUnavailableReason" in s), s.key + " carries NO coverage fields without sourceCoverage");
   }
+});
+
+test("46. Blocker 1: the TACoS fold sums ONLY for a single valid Ads currency matched by every OLI row (canonicalized); else unavailable, never summed", () => {
+  // Drives the PURE scheduler fold directly so the evidence classifier (not the scheduler's raw pre-count)
+  // decides. adsRows carry only a currency (unmatched source_key => not folded, but still count for currency).
+  const ads = (currency) => [{ currency, metric_date: "2025-08-01" }];
+  const oli = (currency) => [{ item_price_currency: currency, total_sales_sum: 100 }];
+  const tacos = (adsRows, totalSalesRows) => directPpcPayload([], { adsRows, totalSalesRows });
+
+  // single valid Ads currency + every OLI row matching (canonicalized both sides) => summed.
+  assert.equal(tacos(ads("USD"), oli("USD")).totalSales, 100, "USD Ads + USD OLI => summed");
+  assert.equal(tacos(ads("usd"), oli("USD")).totalSales, 100, "lowercase Ads 'usd' normalizes to USD => summed");
+  assert.equal(tacos(ads("USD"), oli("usd")).totalSales, 100, "lowercase OLI 'usd' normalizes to USD => summed");
+
+  // Ads side fails closed: malformed (embedded space), empty rows => never summed.
+  const p1 = tacos(ads("US D"), oli("USD"));
+  assert.equal(p1.totalSales, null, "malformed 'US D' Ads currency => invalid => never summed");
+  assert.ok(/different currency/i.test(p1.totalSalesUnavailable), "typed currency-ambiguity reason");
+  assert.equal(tacos([], oli("USD")).totalSales, null, "empty Ads rows => no currency to match => unavailable");
+
+  // OLI side fails closed: mismatch, malformed, or ANY blank row among valid ones => never summed.
+  assert.equal(tacos(ads("USD"), oli("CAD")).totalSales, null, "USD Ads + CAD OLI => mismatch => unavailable");
+  assert.equal(tacos(ads("USD"), oli("US D")).totalSales, null, "USD Ads + malformed OLI => unavailable");
+  assert.equal(tacos(ads("USD"), [{ item_price_currency: "USD", total_sales_sum: 100 }, { item_price_currency: "", total_sales_sum: 50 }]).totalSales, null, "any blank OLI currency => never sums a currencyless row");
+
+  // TACoS unavailable NEVER collapses the rest of the payload.
+  assert.equal(p1.adsRowCount, 1, "the malformed-currency Ads row is still counted; rest of PPC intact");
 });
 
 async function main() {

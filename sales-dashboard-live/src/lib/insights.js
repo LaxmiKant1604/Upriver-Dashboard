@@ -1274,23 +1274,32 @@ export function buildReturnsRows(data, selectedBrand) {
     });
 }
 
-// Blocker 3: the portfolio return rate is a PROVEN rate. Numerator AND denominator sum ONLY over rows whose
-// returnedUnits is KNOWN (non-null). A withheld-returnedUnits row (a currency-ambiguous ASIN) is EXCLUDED
-// from BOTH -- its ordered units must NOT sit in the denominator, which would understate the rate. When any
-// such withheld row also carries ordered units (so it WOULD have contributed to the denominator), the KPI is
-// a PROVEN PARTIAL rate: ratePartial=true, so the UI marks it "partial" rather than presenting an understated
-// complete rate. rate is null when no proven ordered units exist.
+// Blocker 2: the portfolio return rate is a PROVEN rate. A row is ELIGIBLE for the rate ONLY when its
+// returnedUnits is KNOWN (not null/undefined) AND orderedUnits > 0 AND it is NOT lag-inflated
+// (returnedUnits <= orderedUnits). Numerator (returnedUnits) AND denominator (orderedUnits) sum ONLY over
+// eligible rows; an ineligible row contributes to NEITHER. ratePartial is set true whenever excluded
+// evidence could move the rate:
+//   (i)   currency-ambiguous withheld row -- returnedUnits null while orderedUnits > 0;
+//   (ii)  returns with no usable denominator -- returnedUnits known but orderedUnits <= 0 / null;
+//   (iii) lag-inflated -- returnedUnits > orderedUnits (a late return whose order is outside the window;
+//         summing it would push the rate above 100%).
+// rate is null when no proven ordered units exist. The UI then reads ratePartial to decide whether a null
+// rate is an explicit "unavailable, partial" state or a plain "—".
 export function returnsPortfolioRate(rows) {
   let provenReturned = 0;
   let provenOrdered = 0;
   let ratePartial = false;
   for (const row of Array.isArray(rows) ? rows : []) {
+    const orderedUnits = Number(row.orderedUnits);
     if (row.returnedUnits === null || row.returnedUnits === undefined) {
-      if ((Number(row.orderedUnits) || 0) > 0) ratePartial = true;
+      if (orderedUnits > 0) ratePartial = true; // (i) withheld returns over real ordered units
       continue;
     }
-    provenReturned += Number(row.returnedUnits) || 0;
-    provenOrdered += Number(row.orderedUnits) || 0;
+    const returnedUnits = Number(row.returnedUnits);
+    if (!(orderedUnits > 0)) { ratePartial = true; continue; }     // (ii) no usable denominator
+    if (returnedUnits > orderedUnits) { ratePartial = true; continue; } // (iii) lag-inflated
+    provenReturned += returnedUnits;
+    provenOrdered += orderedUnits;
   }
   return {
     rate: provenOrdered > 0 ? (provenReturned / provenOrdered) * 100 : null,

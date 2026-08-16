@@ -1087,7 +1087,7 @@ const retWin = {
 // windows are exactly salesMoversWindows("2025-07-30").
 const SM_PROBE_OK = { "sales-movers:sales-latest-probe": { status: "success", validated: true, latestReportedDate: "2025-07-30" } };
 const OPT_SQP_OK = { "listing-optimizer:sqp-weekly": { status: "success", validated: true } };
-const PPC_CUR_OK = { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1 } };
+const PPC_CUR_OK = { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1, state: "single-valid" } };
 
 for (const [rep, win, sig] of [["sales-movers", smWin, SM_PROBE_OK], ["buy-box-loss", bbWin, undefined], ["returns-leakage", retWin, undefined]]) {
   for (const n of [0, 1, 5, 6, 11]) {
@@ -1287,11 +1287,16 @@ test("staged signal + activation are typed and fail closed", () => {
 test("ads-currency signal + gate are typed and fail closed", () => {
   assert.throws(() => validateAdsCurrencySignal({ status: "success", validated: true, currencyCount: 1.5 }), /currencyCount/);
   assert.throws(() => validateAdsCurrencySignal({ status: "bogus", validated: true, currencyCount: 1 }), /status/);
-  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 0 }), true);
-  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 1 }), true);
-  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 2 }), false); // by design
-  assert.equal(evaluateAdsCurrencyGate({ status: "failed", validated: true, currencyCount: 1 }), false);
-  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: false, currencyCount: 1 }), false); // fail closed
+  // Blocker 1: `state` is a REQUIRED, typed field (one of the four evidence literals).
+  assert.throws(() => validateAdsCurrencySignal({ status: "success", validated: true, currencyCount: 1 }), /state/); // missing state
+  assert.throws(() => validateAdsCurrencySignal({ status: "success", validated: true, currencyCount: 1, state: "bogus" }), /state/); // bad state literal
+  // The gate passes ONLY for a single valid canonical currency; empty/invalid/multiple all fail closed.
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 1, state: "single-valid" }), true);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 0, state: "empty" }), false); // empty: no ads currency to match
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 1, state: "invalid" }), false); // any blank/malformed row
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: true, currencyCount: 2, state: "multiple" }), false); // by design
+  assert.equal(evaluateAdsCurrencyGate({ status: "failed", validated: true, currencyCount: 1, state: "single-valid" }), false);
+  assert.equal(evaluateAdsCurrencyGate({ status: "success", validated: false, currencyCount: 1, state: "single-valid" }), false); // fail closed
 });
 
 test("normalizeFailurePolicy validates enums, rejects HTTP-code text, freezes the result", () => {
@@ -1389,20 +1394,23 @@ test("Listing Optimizer — a malformed SQP signal fails closed", () => {
 
 /* ---- FIX 3: PPC currency gate + failure policy state table ---- */
 
-test("PPC — 0 or 1 Ads currency activates total-sales; >1 skips it; catalog stays active regardless", () => {
-  const plan = (currencyCount) => keysOf(reportSourceRequestHashes({
+test("PPC — a single VALID Ads currency activates total-sales; empty/invalid/multiple skip it; catalog stays active regardless", () => {
+  // Mirrors planPpcPerformance: the oli window is offered ONLY when the gate passes (state "single-valid").
+  // Offering it for a gated-out state is itself a resolver error, so a fail-closed state plans catalog only.
+  const plan = (state, currencyCount) => keysOf(reportSourceRequestHashes({
     reportKey: "ppc-performance", apiKey: "k", ids: ["A1"],
-    windowsByRequestKey: currencyCount <= 1 ? ppcWin : ppcCatOnly,
-    dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount } },
+    windowsByRequestKey: state === "single-valid" ? ppcWin : ppcCatOnly,
+    dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount, state } },
   }));
-  assert.deepEqual(plan(0), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
-  assert.deepEqual(plan(1), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
-  assert.deepEqual(plan(2), ["ppc-performance:catalog"]); // multi-currency: TACoS unavailable by design; catalog still enriches ASINs
+  assert.deepEqual(plan("single-valid", 1), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
+  assert.deepEqual(plan("empty", 0), ["ppc-performance:catalog"]); // empty: no ads currency to match => TACoS unavailable
+  assert.deepEqual(plan("invalid", 1), ["ppc-performance:catalog"]); // a blank/malformed Ads row => fail closed
+  assert.deepEqual(plan("multiple", 2), ["ppc-performance:catalog"]); // multi-currency: TACoS unavailable by design; catalog still enriches ASINs
 });
 
 test("PPC — missing/unvalidated currency signal skips total-sales (fail closed); malformed throws; catalog always stays", () => {
   assert.deepEqual(keysOf(reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly })), ["ppc-performance:catalog"]); // missing
-  assert.deepEqual(keysOf(reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: false, currencyCount: 1 } } })), ["ppc-performance:catalog"]); // unvalidated
+  assert.deepEqual(keysOf(reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: false, currencyCount: 1, state: "single-valid" } } })), ["ppc-performance:catalog"]); // unvalidated
   assert.throws(() => reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcCatOnly, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: -1 } } }), /currencyCount/); // malformed
 });
 

@@ -13,6 +13,8 @@
 // failed/terminal/timed-out primary preserves the prior report and spends no new
 // downstream export (matching the approved staged policy).
 
+import { adsCurrencyEvidence } from "../currency.js";
+
 function toNum(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
@@ -69,23 +71,17 @@ export function optimizerSqpSignal(outcome) {
   return { status: base.status, validated: base.status === "success" };
 }
 
-// PPC Ads currency -> { status, validated, currencyCount }, derived from persisted
-// ads_daily_source_rows (never a live Ads export). Each row's currency is canonicalized
-// (trim + UPPERCASE) so "usd"/"USD" are one identity. currencyCount is the number of
-// distinct non-empty canonical currencies PLUS one extra "violation" bucket when ANY
-// included Ads row has a blank/malformed currency (Blocker 2): a currencyless-but-spending
-// Ads row must never read as a clean single currency, so USD + a blank row => currencyCount 2
-// => evaluateAdsCurrencyGate returns false and total-sales (TACoS) is NOT scheduled (fail closed).
+// PPC Ads currency -> { status, validated, currencyCount, state }, derived from persisted
+// ads_daily_source_rows (never a live Ads export) via the shared adsCurrencyEvidence classifier
+// (lib/server/currency.js), so the signal and the TACoS folds agree by construction. `state` is the
+// 4-state evidence ("single-valid" | "empty" | "invalid" | "multiple"); the GATE keys on `state`.
+// currencyCount stays the distinct-VALID canonical-currency count for back-compat. A blank/malformed
+// row makes the state "invalid" (a currencyless-but-spending Ads row must never read as a clean single
+// currency), so evaluateAdsCurrencyGate returns false and total-sales (TACoS) is NOT scheduled (fail closed).
 export function adsCurrencySignal(adsRows) {
-  if (!Array.isArray(adsRows)) return { status: "failed", validated: false, currencyCount: 0 };
-  const currencies = new Set();
-  let hasBlankCurrency = false;
-  for (const row of adsRows) {
-    const currency = String((row && row.currency) || "").trim().toUpperCase();
-    if (currency) currencies.add(currency);
-    else hasBlankCurrency = true;
-  }
-  return { status: "success", validated: true, currencyCount: currencies.size + (hasBlankCurrency ? 1 : 0) };
+  if (!Array.isArray(adsRows)) return { status: "failed", validated: false, currencyCount: 0, state: "invalid" };
+  const evidence = adsCurrencyEvidence(adsRows);
+  return { status: "success", validated: true, currencyCount: evidence.currencyCount, state: evidence.state };
 }
 
 // The three source-job request keys that PRODUCE a staged/fallback signal, mapped to

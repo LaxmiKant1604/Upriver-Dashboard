@@ -18,6 +18,7 @@
 // account total sales, which is required for TACoS and cannot come from an Ads
 // table. It runs on explicit refresh only and is saved into the shared snapshot.
 
+import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
 import { addDaysStr, num, canonicalOliSlices } from "../datadoe.js";
 import { getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
@@ -238,22 +239,19 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
         );
         for (const row of sliceRows) salesRows.push(row);
       }
-      // Blocker 2/3: require EXACTLY ONE nonblank canonical Ads currency AND NO included Ads row with a
-      // blank/malformed currency; then EVERY OLI total-sales row MUST carry a nonblank canonical currency
-      // EQUAL to it. If any Ads OR OLI row's currency is missing/blank/malformed/mismatched, or the rows mix
-      // currencies, TACoS is unavailable and NO row is summed (never sum a currencyless row into a currency
-      // denominator). Only when the single Ads currency is unambiguous and every OLI row matches it do we sum.
-      const adsBlankCurrency = adsRows.some((row) => !String((row && row.currency) || "").trim());
-      const adsCurrency = (!adsBlankCurrency && currencies.length === 1) ? String(currencies[0] || "").trim().toUpperCase() : null;
+      // Blocker 1: TACoS is available ONLY when the persisted Ads rows carry a SINGLE VALID canonical
+      // currency (adsCurrencyEvidence state "single-valid") AND every OLI total-sales row's
+      // canonicalCurrency(item_price_currency) is non-null AND EQUAL to it. Any empty/blank/malformed/mixed
+      // Ads currency, or any missing/blank/malformed/mismatched OLI currency, leaves TACoS unavailable and
+      // NO row is summed (never sum a currencyless/ambiguous row into a currency denominator).
+      const adsEvidence = adsCurrencyEvidence(adsRows);
+      const adsCurrency = adsEvidence.state === "single-valid" ? adsEvidence.currency : null;
       if (!adsCurrency) {
         totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+      } else if (!salesRows.every((row) => canonicalCurrency(row.item_price_currency) === adsCurrency)) {
+        totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
       } else {
-        const rowCurrencies = salesRows.map((row) => String(row.item_price_currency || "").trim().toUpperCase());
-        if (!rowCurrencies.every((c) => c && c === adsCurrency)) {
-          totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
-        } else {
-          totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "total_sales_sum", "item_price_value"), 0);
-        }
+        totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "total_sales_sum", "item_price_value"), 0);
       }
     } catch (error) {
       // TACoS is the only metric that needs this. Losing it must not lose the

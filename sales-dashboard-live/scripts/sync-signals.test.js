@@ -283,14 +283,18 @@ test("dependency signals are derived ONLY from validated saved results", async (
   assert.deepEqual(deriveSignalsFromOutcomes([{ requestKey: "sales-movers:catalog", status: "success", validated: true, rows: [] }]), {});
   assert.deepEqual(keywordWeeklySignal({ status: "success", validated: true, rows: [{ date: "2025-07-01" }, { date: "2025-07-08" }, { date: "2025-07-01" }] }), { status: "success", validated: true, distinctPeriods: 2 });
   assert.deepEqual(optimizerSqpSignal({ status: "success", validated: true, rows: [] }), { status: "success", validated: true });
-  // Blocker 2: a blank/malformed Ads currency is its OWN violation bucket, and currencies canonicalize
-  // (trim + UPPERCASE). So a clean single currency + any blank row can NEVER read as a clean single
-  // currency: currencyCount reflects the blank => evaluateAdsCurrencyGate false => TACoS not scheduled.
-  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }, { currency: "CAD" }, { currency: "" }]), { status: "success", validated: true, currencyCount: 3 }, "two currencies + a blank => 3 (blank is its own bucket)");
-  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "usd" }]), { status: "success", validated: true, currencyCount: 1 }, "case-canonicalized: usd == USD");
-  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "  " }]), { status: "success", validated: true, currencyCount: 2 }, "clean single currency + a whitespace-only row => 2 (fail closed at the gate)");
-  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }]), { status: "success", validated: true, currencyCount: 1 }, "clean single currency => 1 (gate passes)");
-  assert.deepEqual(adsCurrencySignal([]), { status: "success", validated: true, currencyCount: 0 }, "no ads rows => 0 (sane zero-metric handling)");
+  // Blocker 1: adsCurrencySignal folds via the shared adsCurrencyEvidence classifier. `state` is the
+  // 4-state evidence and the GATE keys on it; currencyCount stays the distinct-VALID canonical count
+  // (currencies canonicalize: trim + UPPERCASE). ANY blank/malformed row => state "invalid" (fail closed),
+  // so a clean single currency + any blank/malformed row can NEVER read as a clean single currency.
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }, { currency: "CAD" }, { currency: "" }]), { status: "success", validated: true, currencyCount: 2, state: "invalid" }, "two valid currencies + a blank row => state invalid; count = distinct-valid 2");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "usd" }]), { status: "success", validated: true, currencyCount: 1, state: "single-valid" }, "case-canonicalized: usd == USD => single-valid");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "  " }]), { status: "success", validated: true, currencyCount: 1, state: "invalid" }, "clean single currency + a whitespace-only row => invalid (fail closed at the gate)");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "US D" }]), { status: "success", validated: true, currencyCount: 1, state: "invalid" }, "a malformed nonblank currency (embedded space) => invalid, never a clean single");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }]), { status: "success", validated: true, currencyCount: 1, state: "single-valid" }, "clean single currency => single-valid (gate passes)");
+  assert.deepEqual(adsCurrencySignal([{ currency: "CAD" }, { currency: "USD" }]), { status: "success", validated: true, currencyCount: 2, state: "multiple" }, "two distinct valid currencies => multiple (gate fails)");
+  assert.deepEqual(adsCurrencySignal([]), { status: "success", validated: true, currencyCount: 0, state: "empty" }, "no ads rows => empty (gate fails; NOT single-valid)");
+  assert.deepEqual(adsCurrencySignal(null), { status: "failed", validated: false, currencyCount: 0, state: "invalid" }, "non-array => failed + invalid (fail closed)");
   assert.deepEqual(salesMoversProbeSignal({ status: "success", validated: true, rows: [{ date: "2025-07-30", units_sum: 2 }, { date: "2025-07-28", units_sum: 9 }] }), { status: "success", validated: true, latestReportedDate: "2025-07-30" });
 });
 
@@ -439,8 +443,10 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
 
   const ppcResolve = (signals) => {
     const win = { "ppc-performance:catalog": [{ from: null, to: null }] };
-    const cc = signals["ppc-performance:ads-currency"] && signals["ppc-performance:ads-currency"].currencyCount;
-    if (cc != null && cc <= 1) win["ppc-performance:oli-sales"] = [{ from: "2025-07-08", to: "2025-08-06" }];
+    // Mirrors planPpcPerformance: offer the oli window ONLY when the ads-currency gate passes (state
+    // "single-valid"). Empty/invalid/multiple never schedule the total-sales export.
+    const sig = signals["ppc-performance:ads-currency"];
+    if (sig && sig.state === "single-valid") win["ppc-performance:oli-sales"] = [{ from: "2025-07-08", to: "2025-08-06" }];
     const resolved = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, dependencySignals: signals }) || [];
     return { sourceJobs: resolved.map((r) => plannedSourceJob("ppc-performance", r, "us", "primary", "A1")) };
   };
@@ -450,6 +456,12 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
   const multi = makeMemoryStore();
   const r2 = await runStagedSourceCycle(runOpts({ store: multi, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "CAD" }] }));
   assert.deepEqual(sources(multi, r2.cycleId), ["product-catalog"]);
+  // Blocker 1: a clean single currency + a BLANK Ads row => state "invalid" => the real ads-currency gate
+  // fails closed even though the test resolver would offer the oli window (its distinct-valid count is 1).
+  // ZERO ppc-performance:oli-sales exports are scheduled.
+  const invalid = makeMemoryStore();
+  const r3 = await runStagedSourceCycle(runOpts({ store: invalid, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "" }] }));
+  assert.deepEqual(sources(invalid, r3.cycleId), ["product-catalog"], "blank Ads row => invalid => gate fails closed => no order-line-items export");
 });
 
 test("classifyFetchError maps to SAFE codes/terminality and never echoes the raw error", async () => {

@@ -1301,10 +1301,13 @@ export function salesMoversWindows(latestReportedDate) {
  * Unvalidated: do not schedule (fail closed). Malformed: throw.
  */
 const ADS_CURRENCY_STATUSES = new Set(["success", "failed", "terminal"]);
+// The 4-state Ads-currency evidence (lib/server/currency.js adsCurrencyEvidence). The gate keys on
+// `state`; the count is retained only for back-compat/telemetry.
+const ADS_CURRENCY_STATES = new Set(["single-valid", "empty", "invalid", "multiple"]);
 
 export function validateAdsCurrencySignal(signal) {
   if (signal == null || typeof signal !== "object" || Array.isArray(signal)) {
-    throw new Error("Ads-currency signal must be an object with status/validated/currencyCount.");
+    throw new Error("Ads-currency signal must be an object with status/validated/currencyCount/state.");
   }
   if (!ADS_CURRENCY_STATUSES.has(signal.status)) {
     throw new Error(`Invalid ads-currency signal status "${signal.status}".`);
@@ -1315,6 +1318,9 @@ export function validateAdsCurrencySignal(signal) {
   if (!(Number.isInteger(signal.currencyCount) && signal.currencyCount >= 0)) {
     throw new Error("Ads-currency signal.currencyCount must be a non-negative integer.");
   }
+  if (!ADS_CURRENCY_STATES.has(signal.state)) {
+    throw new Error(`Invalid ads-currency signal state "${signal.state}".`);
+  }
   return signal;
 }
 
@@ -1323,7 +1329,10 @@ export function evaluateAdsCurrencyGate(signal) {
   // A non-success or unvalidated currency read is not a trustworthy basis: do not
   // schedule total-sales (TACoS stays unavailable; the rest of PPC still derives).
   if (sig.status !== "success" || !sig.validated) return false;
-  return sig.currencyCount <= 1;
+  // Schedule total-sales ONLY for a single valid canonical Ads currency. EMPTY (no ads rows),
+  // INVALID (any blank/malformed row) and MULTIPLE all fail closed -- a currencyless/ambiguous
+  // denominator would be meaningless, so ZERO ppc-performance:oli-sales exports are planned.
+  return sig.state === "single-valid";
 }
 
 /* ===================== generic source FAILURE policy =====================
@@ -1380,7 +1389,7 @@ function resolveDependencyMeta(contract, signals) {
   const dependsOn = contract.dependsOnRequestKey || contract.dependsOnSignal || null;
   const sig = dependsOn != null && dependsOn in signals ? signals[dependsOn] : null;
   const required = contract.dependencyMode === "staged" ? "validated success (fresh)"
-    : contract.dependencyMode === "ads-currency-gate" ? "validated, <= 1 currency"
+    : contract.dependencyMode === "ads-currency-gate" ? "validated, single valid currency"
     : contract.dependencyMode === "fallback" ? "validated success/last-known-good under threshold"
     : "unknown";
   return Object.freeze({
@@ -1490,7 +1499,8 @@ export function normalizeAvailabilityPolicy(policy) {
  *     plans only when the primary's `{status,validated,latestReportedDate?}` proves a
  *     fresh validated success (with a real reported date where required).
  *   - `dependencyMode:"ads-currency-gate"` (PPC total-sales) plans only when a validated
- *     `{status,validated,currencyCount}` Ads-currency signal proves <= 1 currency.
+ *     `{status,validated,currencyCount,state}` Ads-currency signal proves a single valid
+ *     canonical currency (state "single-valid"); empty/invalid/multiple all fail closed.
  * At kickoff (no signals) only the unconditional primaries are planned. A malformed
  * signal or unsupported condition throws a safe configuration error (fail closed).
  *

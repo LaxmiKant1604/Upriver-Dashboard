@@ -319,7 +319,7 @@ const bbOli = () => reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKe
 const ppcOli = () => reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
   "ppc-performance:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -29), OLI_ASOF),
   "ppc-performance:catalog": [{ from: null, to: null }],
-}, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1 } } }).filter((r) => r.requestKey === "ppc-performance:oli-sales");
+}, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1, state: "single-valid" } } }).filter((r) => r.requestKey === "ppc-performance:oli-sales");
 const retOli = () => reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
   "returns-leakage:returns": [{ from: addDaysStr(OLI_ASOF, -59), to: OLI_ASOF }],
   "returns-leakage:settlements": [{ from: addDaysStr(OLI_ASOF, -59), to: OLI_ASOF }],

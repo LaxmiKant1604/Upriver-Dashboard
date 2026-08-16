@@ -1,6 +1,8 @@
 // Scheduler v2 Phase 1d -- PURE report-calculation cores (no network, no DB).
 //
-// This is a dependency-free leaf: it imports NOTHING (no DataDoe transport, no Supabase).
+// This is a transport-free leaf: its ONLY import is the dependency-free lib/server/currency.js
+// (no DataDoe transport, no Supabase) -- so the shared canonical-currency helpers keep the TACoS
+// fold byte-identical to buildPpcPerformance() without pulling any forbidden module into this graph.
 // Report calculations are extracted here VERBATIM from api/datadoe.js so that:
 //   1. the existing browser/API route keeps ONE implementation (it now imports these),
 //      guaranteeing byte-identical output -- proven by scripts/report-source-contracts and
@@ -11,6 +13,8 @@
 // Every function is pure: given the same rows it returns the same result, mutating only
 // its own local accumulators. Currency is NEVER converted (each fold keys by currency or
 // records a conflict); FX lives only in the display layer.
+
+import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
 
 // Numeric coercion identical to lib/server/datadoe.js `num` (Number(v) || 0), kept local so
 // this leaf pulls in no transport module.
@@ -1864,22 +1868,20 @@ export function ppcPerformancePayload({
   let totalSales = null;
   let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;
   if (totalSalesReason == null && Array.isArray(totalSalesRows)) {
-    // Blocker 2/3: require EXACTLY ONE nonblank canonical Ads currency AND NO included Ads row with a
-    // blank/malformed currency; THEN every canonical OLI total-sales row MUST carry a nonblank canonical
-    // currency EQUAL to it. Any missing/blank/malformed/mismatched, OR mixed currencies (Ads OR OLI) =>
-    // TACoS unavailable and NO row is summed (never sum a currencyless row into a currency denominator).
-    // Only when the single Ads currency is unambiguous and every OLI row matches it do we sum item_price_value.
-    const adsBlankCurrency = rows.some((row) => !String((row && row.currency) || "").trim());
-    const adsCurrency = (!adsBlankCurrency && currencies.length === 1) ? String(currencies[0] || "").trim().toUpperCase() : null;
+    // Blocker 1: TACoS is available ONLY when the Ads rows carry a SINGLE VALID canonical currency
+    // (adsCurrencyEvidence state "single-valid") AND every OLI total-sales row's
+    // canonicalCurrency(item_price_currency) is non-null AND EQUAL to it. Any empty/blank/malformed/mixed
+    // Ads currency, or any missing/blank/malformed/mismatched OLI currency, leaves TACoS unavailable and
+    // NO row is summed (never sum a currencyless/ambiguous row into a currency denominator).
+    // Byte-equivalent to buildPpcPerformance()'s TACoS block.
+    const adsEvidence = adsCurrencyEvidence(rows);
+    const adsCurrency = adsEvidence.state === "single-valid" ? adsEvidence.currency : null;
     if (!adsCurrency) {
       totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+    } else if (!totalSalesRows.every((row) => canonicalCurrency(row.item_price_currency) === adsCurrency)) {
+      totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
     } else {
-      const rowCurrencies = totalSalesRows.map((row) => String(row.item_price_currency || "").trim().toUpperCase());
-      if (!rowCurrencies.every((c) => c && c === adsCurrency)) {
-        totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
-      } else {
-        totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "total_sales_sum", "item_price_value"), 0);
-      }
+      totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "total_sales_sum", "item_price_value"), 0);
     }
   }
 
