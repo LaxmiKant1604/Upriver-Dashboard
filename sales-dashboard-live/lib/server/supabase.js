@@ -784,6 +784,36 @@ export async function adoptSourceExportCache({ cycleId, requestHash, rowCount, p
   return Array.isArray(body) ? body[0] : body;
 }
 
+// assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the
+// (existing or newly assigned) batch_index for (family, account). An already-assigned account keeps its
+// index (never reshuffled); a new account is placed into a non-full or fresh batch under the 5-cap.
+export async function assignSourceAccountBatch({ batchFamily, accountId, connectionId, organizationFingerprint, max = 5 }) {
+  const body = await request("/rest/v1/rpc/assign_source_account_batch", {
+    method: "POST",
+    body: {
+      p_batch_family: batchFamily,
+      p_account_id: accountId,
+      p_connection_id: connectionId,
+      p_organization_fingerprint: organizationFingerprint,
+      p_max: max,
+    },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "number" ? value : Number(value);
+}
+
+// Read the durable batch membership for one family (admin/service-role only). Returns rows
+// { account_id, batch_index, connection_id, organization_fingerprint }.
+export async function listSourceBatchMembership(batchFamily) {
+  const query = new URLSearchParams({
+    select: "account_id,batch_index,connection_id,organization_fingerprint",
+    batch_family: `eq.${batchFamily}`,
+    order: "batch_index.asc,account_id.asc",
+  });
+  const rows = await request(`/rest/v1/source_batch_membership?${query}`);
+  return Array.isArray(rows) ? rows : [];
+}
+
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.
