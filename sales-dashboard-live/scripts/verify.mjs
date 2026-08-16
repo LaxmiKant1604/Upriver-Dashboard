@@ -39,6 +39,7 @@ const SUITES = [
   "test:source-identity",
   "test:report-contracts",
   "test:oli-source-correction",
+  "test:source-tranche",
   "test:report-sync-controls",
   "test:gate5-canary-package",
   "test:datadoe-poll-export",

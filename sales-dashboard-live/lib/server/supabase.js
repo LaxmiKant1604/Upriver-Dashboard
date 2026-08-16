@@ -348,7 +348,9 @@ const SOURCE_CACHE_BUCKET = "dashboard-snapshots";
 
 export async function getSourceExportCache(requestHash) {
   const query = new URLSearchParams({
-    select: "request_hash,source_id,object_path,row_count,payload_bytes,fetched_at,expires_at",
+    // organization_fingerprint + account_scope_hash are returned so a confirmed-exact-match cache reuse
+    // can belt-and-suspenders assert scope identity (request_hash already folds them in; kept strict).
+    select: "request_hash,source_id,organization_fingerprint,account_scope_hash,object_path,row_count,payload_bytes,fetched_at,expires_at",
     request_hash: `eq.${requestHash}`,
     expires_at: `gt.${new Date().toISOString()}`,
     limit: "1",

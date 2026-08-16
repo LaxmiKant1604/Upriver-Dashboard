@@ -46,6 +46,7 @@ export async function runKeywordRankShadowCycle({
   accounts = [], connections, asOf = null, asOfFor = null, store, dataDoe,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 3,
+  sourceTranche = null, // BUILD-TIME source-tranche selector (Part A); passed through to runSourceJobs.
 }) {
   // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE any planning.
   // A stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary
@@ -166,7 +167,7 @@ export async function runKeywordRankShadowCycle({
     const planned = planRound();
     const plannedJobs = jobsOf(planned, round);
     for (const j of plannedJobs) ownerIdSet.add(j.owner.ownerId);
-    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining });
+    const res = await runSourceJobs({ store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche });
     cycleId = res.cycleId;
     rollup.cycleId = cycleId;
     rollup.rounds = round + 1;

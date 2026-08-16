@@ -153,6 +153,11 @@ export async function runSchedulerV2Shadow({
   loadAccountRollout = null,
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity,
   scheduledAt = null, trigger = "manual",
+  // BUILD-TIME source-tranche selector (Part A). Supplied ONLY by the trusted composition
+  // (buildSchedulerV2SourceTrancheRuntime); NEVER a per-run operational arg. When present, each source
+  // unit executes only the selected families this pass; the full plan is still upserted, so the next
+  // tranche resumes the same (bucket, cycle_date) cycle. null => execute everything (unchanged).
+  sourceTranche = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") {
     throw new Error(`runSchedulerV2Shadow requires an explicit cycle bucket of 'us' or 'non-us' (got "${bucket}").`);
@@ -294,14 +299,14 @@ export async function runSchedulerV2Shadow({
       const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor });
       res = await runStagedSourceCycle({
         store, dataDoe, resolvePlan: resolveFromGenericPlan(plan),
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
       });
       collectedReports.push(...plan.reportRequests);
     } else {
       const runner = STAGED_RUNNERS[unit.reportKey];
       const args = {
         accounts: bucketAccounts, connections, asOf, asOfFor, store, dataDoe,
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
       };
       if (unit.reportKey === "ppc-performance") Object.assign(args, ppcAdsProviders);
       res = await runner(args);

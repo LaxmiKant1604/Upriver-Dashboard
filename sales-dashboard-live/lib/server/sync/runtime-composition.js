@@ -20,6 +20,7 @@ import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
 import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
+import { makeSourceTranche, isSourceTranche } from "./source-tranche.js";
 import { getAdDailyMetrics, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
@@ -136,7 +137,15 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     getAdsDailySourceRows: ppcRows = getAdsDailySourceRows,   // PPC persisted Ads rows reader
     getAdsSyncStates: ppcStates = getAdsSyncStates,           // PPC ads_sync_state reader
     getAdsSyncCoverage: ppcCoverage = getDailyAdsCoverage,    // PPC durable coverage reader (same generic reader)
+    // BUILD-TIME source-tranche selector (Part A). null => execute every source family (unchanged). A raw
+    // spec is normalized via makeSourceTranche; an already-built descriptor passes through unchanged. It is
+    // fixed HERE (a trusted collaborator), NEVER on RUN_OPERATIONAL_ARGS, so no per-run caller can set it.
+    sourceTranche = null,
   } = overrides;
+
+  const normalizedSourceTranche = sourceTranche == null
+    ? null
+    : (isSourceTranche(sourceTranche) ? sourceTranche : makeSourceTranche(sourceTranche));
 
   // Resolve connections ONCE (an env read via getDataDoeConnections, or an injected array). No network/db.
   const connections = connectionsOverride != null ? connectionsOverride : getConnections();
@@ -162,7 +171,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const loadAccountRollout = async () => getAccountRollout();
 
   // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
-  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout };
+  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout, sourceTranche: normalizedSourceTranche };
 
   // Load the DURABLE report scheduling controls (report_sync_settings) -- the ONLY production control source
   // for the scheduled path. A read failure THROWS here, so it fails closed BEFORE runSchedulerV2Shadow does
@@ -238,6 +247,21 @@ export function buildSchedulerV2CanaryRuntime(overrides = {}) {
     ...rest,
     getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...canaryAccountIds] }),
   });
+}
+
+/**
+ * BUILD-TIME trusted SOURCE-TRANCHE composition (Part A). A reviewed operator invokes this ONCE per tranche
+ * in SOURCE_TRANCHE_ORDER to drain the canonical source families one at a time. The tranche is FIXED here at
+ * compose time (mirrors buildSchedulerV2CanaryRuntime): any `sourceTranche` smuggled in `overrides` is deleted
+ * so it can never be widened, and the built descriptor is threaded through as a trusted collaborator (never on
+ * RUN_OPERATIONAL_ARGS). Everything else is the ordinary trusted composition -- reports stay readiness-gated,
+ * accounts stay rollout-gated, and the source half still upserts the FULL plan while executing only the
+ * selected families, so the next tranche resumes the same (bucket, cycle_date) cycle with no duplicate export.
+ */
+export function buildSchedulerV2SourceTrancheRuntime(spec, overrides = {}) {
+  const rest = { ...overrides };
+  delete rest.sourceTranche; // FIX the tranche at compose time; reject any smuggled per-run/override tranche.
+  return buildSchedulerV2Runtime({ ...rest, sourceTranche: makeSourceTranche(spec) });
 }
 
 // The required env keys the Scheduler-v2 runtime needs (names only -- values are NEVER read into telemetry).

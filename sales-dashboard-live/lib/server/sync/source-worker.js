@@ -130,6 +130,44 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
 
   // ---- STEPS 1-3: create-export (only for a pending job that wins the atomic claim) ----
   if (status === "pending") {
+    // ---- Part C: confirmed-exact-match DURABLE source-cache reuse, BEFORE any create-export ----
+    // A reviewed reuse path that spends ZERO DataDoe calls when a durable, TTL-valid cache entry proves
+    // the EXACT canonical request (same request_hash) was already fetched + saved for this exact
+    // source_id + organization + account scope. store.loadSourceRows is already TTL-gated (expires_at>now)
+    // and array-validated. Reuse is CONFIRMED only when every belt-and-suspenders identity + integrity
+    // check holds; ANY miss / expired / unreadable / malformed / mismatched / cap-sized / unconfirmed
+    // entry records NOTHING and falls through to the normal claim -> create -> poll -> download -> save
+    // path (exactly one create POST per hash). Gated on the store exposing a cache reader, so injected
+    // test/canary stores without one keep the old path unchanged.
+    if (typeof store.loadSourceRows === "function") {
+      let entry = null;
+      try { entry = await store.loadSourceRows(requestHash); } catch (_e) { entry = null; }
+      const cachedRows = entry && Array.isArray(entry.rows) ? entry.rows : null;
+      const cachedSourceId = entry ? (entry.source_id ?? entry.sourceId) : undefined;
+      const cachedOrgFp = entry ? (entry.organization_fingerprint ?? entry.organizationFingerprint) : undefined;
+      const cachedScope = entry ? (entry.account_scope_hash ?? entry.accountScopeHash) : undefined;
+      const cachedPath = entry ? (entry.object_path ?? entry.objectPath) : undefined;
+      const cachedRowCount = entry ? (entry.row_count ?? entry.rowCount) : undefined;
+      const cachedBytes = entry ? (entry.payload_bytes ?? entry.payloadBytes) : undefined;
+      const confirmed = !!cachedRows
+        && !!cachedSourceId && cachedSourceId === job.sourceId
+        && !!cachedOrgFp && cachedOrgFp === job.organizationFingerprint
+        && !!cachedScope && cachedScope === job.accountScopeHash
+        && typeof cachedPath === "string" && cachedPath.trim() !== ""
+        && typeof cachedRowCount === "number" && cachedRowCount === cachedRows.length
+        && !(job.strict === true && cachedRows.length >= Number(job.limit));
+      if (confirmed) {
+        // ZERO DataDoe calls, no fabricated export id, point the job at the already-saved object. This
+        // leaves create_export_count=0 and attempted_at=null (the claim RPC is never touched).
+        await store.recordSourceSuccess({
+          cycleId, requestHash, exportId: null, rowCount: cachedRowCount,
+          payloadBytes: typeof cachedBytes === "number" ? cachedBytes : approxPayloadBytes(cachedRows),
+          durationMs: clock() - started, cacheObjectPath: cachedPath,
+        });
+        progress.succeeded += 1;
+        return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
+      }
+    }
     const won = await store.claimExportAttempt(cycleId, requestHash);
     if (!won) { progress.skipped += 1; return { requestKey, requestHash, status: "skipped", validated: false, reason: "already-attempted" }; }
     progress.attemptsWon += 1;
@@ -245,6 +283,10 @@ export async function runSourceJobs({
   store, dataDoe, plannedJobs, ownerIds = null,
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = DEFAULT_RESERVE_MS, maxJobs = Infinity,
+  // BUILD-TIME source-tranche selector (Part A). When present, EXECUTE only the jobs it selects; the
+  // full plan is still upserted (all canonical jobs + owner memberships). null => execute everything
+  // (behavior byte-identical to before). NEVER a per-run/untrusted argument (see runtime-composition).
+  sourceTranche = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -342,9 +384,22 @@ export async function runSourceJobs({
   //    (no ownerIds): scan every row and fail an unplanned one MISSING_PLAN, as before.
   const jobRows = await store.listSourceJobs(cycleId);
   const rowByHash = new Map(jobRows.map((r) => [r.request_hash ?? r.requestHash, r]));
-  const executeHashes = usingOwners
+  const executeHashesAll = usingOwners
     ? [...metaByHash.keys()].filter(ownsHash)
     : [...rowByHash.keys()];
+  // Build-time tranche NARROWING (Part A): execute only the selected source families this pass. The
+  // upsert loops above already ran over the FULL planned set, so every canonical job + owner membership
+  // is durably created; unselected families stay pending/retryable, `drained` stays false (below), and
+  // the NEXT tranche resumes this exact (bucket, cycle_date) cycle. selects() reads source_key (or the
+  // request_hash allowlist) off the canonical job. A null tranche keeps executeHashes identical.
+  const executeHashes = (sourceTranche && typeof sourceTranche.selects === "function")
+    ? executeHashesAll.filter((hash) => {
+      const meta = metaByHash.get(hash);
+      const jobRow = rowByHash.get(hash);
+      const sourceKey = (meta && meta.sourceKey) || (jobRow && (jobRow.source_key ?? jobRow.sourceKey)) || "";
+      return sourceTranche.selects({ sourceKey, requestHash: hash });
+    })
+    : executeHashesAll;
   for (const hash of executeHashes) {
     const jobRow = rowByHash.get(hash);
     if (!jobRow) continue;

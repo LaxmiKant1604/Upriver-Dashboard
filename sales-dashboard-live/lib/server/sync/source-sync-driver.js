@@ -248,6 +248,9 @@ export async function runStagedSourceCycle({
   store, dataDoe, resolvePlan, adsRowsProvider, extraSignals = {},
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 5,
+  // BUILD-TIME source-tranche selector (Part A); passed straight to runSourceJobs. A filtered pass never
+  // drains, so it never reaches the fixpoint below -- no owner membership is reconciled mid-tranche.
+  sourceTranche = null,
 }) {
   const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
   let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
@@ -282,7 +285,7 @@ export async function runStagedSourceCycle({
 
     const res = await runSourceJobs({
       store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
-      clock, deadlineMs, reserveMs, maxJobs: remaining,
+      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche,
     });
     rollup.cycleId = res.cycleId;
     rollup.rounds = round + 1;

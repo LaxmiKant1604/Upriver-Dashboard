@@ -18,6 +18,7 @@
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
     "test:oli-source-correction": "node scripts/oli-source-correction.test.js",
+    "test:source-tranche": "node scripts/source-tranche.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
     "test:gate5-canary-package": "node scripts/gate5-canary-package.test.js",
     "test:datadoe-poll-export": "node scripts/datadoe-poll-export.test.js",
