@@ -4419,3 +4419,65 @@ daily-reporting request-hashes recaptured; live↔scheduler parity preserved.
 
 **STOP for Codex senior review.** Code+tests committed `feb0c83`, docs `<this commit>`; **not pushed** — production
 stays on `0ea9f34`, and this correction is not deployed/rolled out by this work.
+
+## Appendix AD — Codex senior-review blocker fixes on the OLI correction (OFFLINE, 2026-08-16; code+tests `dee77b7`; NOT deployed)
+
+Codex senior review of Appendix AC raised six blockers. All are fixed **offline on `main`** (no deploy/push/DataDoe/
+Supabase; the running cycle `dfca8f75` and brand-sales/IN live snapshot untouched). `npm run verify` green — **40
+steps / 20 suites** (incl. `build:check`).
+
+### AD.1 Real cross-report OLI reuse (was: "same source id is insufficient")
+- New calendar-anchored slicer `canonicalOliSlices(from,to)` in `date-windows.js` — intra-month bins
+  `[1-7],[8-14],[15-21],[22-28],[29-monthEnd]` clamped to `[from,to]`. Anchored to the CALENDAR (not to `from`), so
+  reports ending at the same `asOf` share every interior + boundary slice; only each report's oldest (window-start)
+  slice differs.
+- ONE **canonical account-scoped OLI sales fragment** (`OLI_SALES_*`, parity source of truth in `api/datadoe.js`,
+  mirrored in `report-source-contracts.js`): columns `[date, seller_or_vendor_id, sku, child_asin,
+  item_price_currency]`, aggregations `item_price_value→total_sales_sum` + `quantity→total_units_sum`, order
+  `date ASC`, limit 50000. `daily-reporting:oli-sales`, `fba-plan:oli-sales`, `buy-box-loss:oli-sales`,
+  `returns-leakage:oli-sales`, `ppc-performance:oli-sales` all use this EXACT spec — so on an overlapping slice they
+  produce the **same `request_hash` → one DataDoe export owned by multiple reports** (`owner_id` includes
+  `reportKey`; the proven shared-`product-catalog` pattern). Each report rolls the canonical grain down to its own
+  view (daily sums over sku+child_asin per date/seller/currency; fba derives per-ASIN monthly units + the latest-date
+  probe from the ONE fragment; buy-box/returns key by currency; ppc filters to the Ads currency). **Reconciliation
+  stays separate** (it needs order-level fields: `amazon_order_id`/`amazon_order_status`/…). Strict-cap, LKG, and
+  single-account/organization isolation preserved on every fragment.
+- Tests: the old "buy-box ≠ returns OLI hash" assertion is **replaced** by (i) cross-report hash EQUALITY on the
+  shared August `[01-07]` slice, (ii) one `request_hash` → **three distinct report owners**, (iii) exactly one
+  create-export per `request_hash`; plus `canonicalOliSlices` alignment tests.
+
+### AD.2 Returns currency correctness (live `returns.js` + pure `derivation-core.js`)
+Ordered evidence is folded by **`currency|ASIN`** (never ASIN alone); each row's `sales`/`orderedUnits` come from THAT
+currency only (never a combined total copied into every settlement-currency row). Returns records carry no currency,
+so a **multi-currency ASIN** puts its `returnCount` on exactly ONE deterministic primary row (greatest ordered units;
+tie-break lexicographic currency), 0 on the others, and **withholds the rate** (`returnedUnits=null`) on all its rows.
+USD+CAD regressions prove: no duplicated counts (per-ASIN `returnCount` sum = true record count), no duplicated
+sales/units, per-currency isolation, and the withheld rate.
+
+### AD.3 PPC TACoS currency validation (live `ppc.js` + pure `derivation-core.js`)
+Require **exactly one** Ads currency; then EVERY non-empty OLI total-sales row must carry a nonblank **canonical**
+(trim+UPPERCASE) currency EQUAL to it. Any missing/blank/malformed/mismatched, or a currency mix ⇒ TACoS unavailable
+(typed reason), and **no row is summed** — a currencyless row is never summed into a currency denominator. Regressions
+cover match / mismatch / mix / blank.
+
+### AD.4 Daily Reporting Ads currency
+The daily Ads export now requests **`ad_campaign_budget_currency`** (added to columns AND groupBy) and
+`normalizeAdRows` normalizes it into `currency` (canonical UPPERCASE, or null when blank). The currency-keyed
+`mergeSalesAndAds` merges an Ads row ONLY into the OLI sales row of the SAME currency; a blank/unprovable Ads currency
+is `null` and never merges (fail-closed — the sales row simply shows no ads). This also fixes a latent bug from
+Appendix AC (the currency-keyed merge with currencyless ad rows would never have merged). Regressions: USD sales +
+USD ads → one merged row; blank/mismatched ads → no merge.
+
+### AD.5 Text + cleanup
+Corrected Daily (Order Line Items) and Returns (rate = Returns-record count ÷ OLI ordered units) wording and removed
+the last stale Sales & Traffic `units_shipped`/`units_refunded` statements (sales-movers legitimately keeps Sales &
+Traffic; `units_shipped_t30` is the unrelated FBA-inventory metric). Removed dead constants left by the earlier
+per-report approach (`PLAN_UNITS_*`, `PLAN_DAILY_*`, `PPC_TOTAL_SALES_*`, `planAsinUnits`, `PLAN_SALES_ROW_LIMIT`).
+
+### AD.6 Versions + verification
+Shadow `snapshotVersion` `v2d-2 → v2d-3` for the five (canonical grain changed); returns live version stays
+`returns-leakage-v2` (field names unchanged, values corrected). Live builders and scheduler pure folds kept
+byte-equivalent (parity harnesses green). Adversarial tests added for every finding.
+
+**STOP for Codex re-review.** Code+tests `dee77b7`, docs `<this commit>`; **not pushed** — production stays on
+`0ea9f34`; nothing deployed.

@@ -9839,3 +9839,38 @@ Appendix AC.
   assertions) before committing.
 
 STOP for Codex senior review. Offline only; not pushed; production stays on 0ea9f34; correction not deployed.
+
+## OLI correction — Codex blocker fixes OFFLINE on main 2026-08-16 (code+tests dee77b7, docs separate); verify green 40/40; NOT deployed
+
+Codex senior review of the OLI correction (feb0c83 / Appendix AC) raised 6 blockers; all fixed offline on main (no
+deploy/push/DataDoe/Supabase; running cycle dfca8f75 + brand-sales/IN untouched). Full evidence: SCHEDULER_V2_ROLLOUT.md
+Appendix AD.
+
+- B1 REAL cross-report OLI reuse: added calendar-anchored slicer canonicalOliSlices(from,to) (intra-month bins
+  1-7/8-14/15-21/22-28/29-end, clamped) + ONE canonical OLI sales fragment OLI_SALES_* (cols [date,seller,sku,
+  child_asin,item_price_currency]; aggs item_price_value->total_sales_sum + quantity->total_units_sum; order date ASC;
+  limit 50000) referenced IDENTICALLY by daily/fba/buy-box/returns/ppc via <report>:oli-sales keys. Overlapping
+  calendar slices => EQUAL request_hash => ONE export owned by MULTIPLE reports (owner_id includes reportKey; proven
+  shared-catalog pattern). Each report rolls the canonical grain to its own view; fba derives per-ASIN monthly units +
+  latest-date probe from the one fragment. Reconciliation stays separate (order-level fields). Replaced the old
+  distinct-hash test with cross-report hash-equality + multi-owner + one-export tests + slicer-alignment tests.
+- B2 returns currency: ordered folded by currency|ASIN; per-currency sales/orderedUnits (never a combined total copied
+  across); multi-currency ASIN puts returnCount on ONE deterministic primary row (0 others) and WITHHOLDS the rate
+  (returnedUnits null) on all rows. USD+CAD regressions prove no duplicated counts/sales/units.
+- B3 PPC currency: exactly one Ads currency required; every non-empty OLI total-sales row must carry a nonblank
+  canonical (trim+UPPER) currency == it; blank/malformed/mismatched/mixed => unavailable; never sums a currencyless row.
+- B4 daily ads currency: daily Ads export now carries ad_campaign_budget_currency (cols+groupBy), normalized to
+  currency; currency-keyed merge only joins same-currency ads into OLI sales rows; blank/mismatch never merges (fixes a
+  latent currencyless-merge bug from feb0c83).
+- B5 text + cleanup: corrected daily/returns wording; removed last stale Sales&Traffic units_shipped/units_refunded
+  statements (sales-movers keeps sales-traffic; units_shipped_t30 is the FBA-inventory metric); removed dead constants
+  (PLAN_UNITS_*/PLAN_DAILY_*/PPC_TOTAL_SALES_*/planAsinUnits/PLAN_SALES_ROW_LIMIT).
+- B6 verify + versions: shadow snapshotVersion v2d-2 -> v2d-3 (grain changed); returns live version stays v2. Live
+  builders + scheduler pure folds kept byte-equivalent (parity green). npm run verify green (40 steps / 20 suites incl
+  build:check). Adversarial tests added for every finding.
+- Impl history: delegated to a fresh agent that completed code+tests (verify-green) then stalled on infra mid dead-const
+  cleanup; I finished the cleanup, rigorously reviewed the full diff (canonicalOliSlices, cross-report hash-equality +
+  multi-owner tests, returns per-currency no-duplication + withheld rate, ppc/daily currency gates, no weakened
+  assertions), re-verified green, and committed code/tests (dee77b7) then docs separately.
+
+STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
