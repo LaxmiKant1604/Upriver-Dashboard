@@ -92,7 +92,7 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
   "returns-leakage": Object.freeze({
-    liveReportKey: "returns-leakage", liveReportVersion: "returns-leakage-v1",
+    liveReportKey: "returns-leakage", liveReportVersion: "returns-leakage-v2",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
   "ppc-performance": Object.freeze({

@@ -439,7 +439,7 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
   };
   const single = makeMemoryStore();
   const r1 = await runStagedSourceCycle(runOpts({ store: single, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "USD" }] }));
-  assert.ok(new Set(sources(single, r1.cycleId)).has("sales-traffic-asin-date"));
+  assert.ok(new Set(sources(single, r1.cycleId)).has("order-line-items"));
   const multi = makeMemoryStore();
   const r2 = await runStagedSourceCycle(runOpts({ store: multi, dataDoe: makeDataDoe(() => ({ rows: [{ a: 1 }] })), resolvePlan: ppcResolve, adsRowsProvider: async () => [{ currency: "USD" }, { currency: "CAD" }] }));
   assert.deepEqual(sources(multi, r2.cycleId), ["product-catalog"]);

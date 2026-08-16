@@ -23,7 +23,10 @@ export const SOURCE_CONTRACTS = [
     label: "Order Line Items",
     grain: "order-item",
     fields: ["date", "order_date", "amazon_order_id", "sku", "child_asin", "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_country_code", "quantity", "item_price_value", "item_price_currency", "item_tax_value", "amazon_order_status", "fulfillment_channel", "order_is_business"],
-    consumers: ["dashboard", "reconciliation", "fba-plan:ordered-units", "daily-reporting:ordered-sales"],
+    // Canonical sales/ordered-units source (item_price_value for sales, quantity for
+    // ordered units). Daily Reporting, FBA Plan, Buy Box Loss, Returns Leakage and PPC
+    // read sales/units here; Sales Movers keeps Sales & Traffic (it needs sessions/page views).
+    consumers: ["dashboard", "reconciliation", "daily-reporting", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"],
   }),
   contract({
     key: "sales-traffic-asin-date",
@@ -31,7 +34,9 @@ export const SOURCE_CONTRACTS = [
     label: "Sales & Traffic by ASIN & Date",
     grain: "asin-day",
     fields: ["date", "child_asin", "product_name", "total_sales", "total_units", "total_orders", "session", "page_views", "units_shipped", "units_refunded"],
-    consumers: ["daily-reporting", "fba-plan", "sales-movers", "returns-leakage", "ppc-performance"],
+    // Sales Movers is the only remaining consumer: it needs sessions/page views/total_orders,
+    // which Order Line Items does not carry. Every sales/units consumer moved to order-line-items.
+    consumers: ["sales-movers"],
   }),
   contract({
     key: "profit-by-sku-date",
@@ -172,17 +177,17 @@ export const SOURCE_CONTRACTS = [
 // the upstream report/source they read instead of inventing another export.
 export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "brand-sales": ["order-line-items", "product-catalog"],
-  "daily-reporting": ["sales-traffic-asin-date", "product-catalog", "ads-campaign-date"],
+  "daily-reporting": ["order-line-items", "product-catalog", "ads-campaign-date"],
   reconciliation: ["order-line-items", "settlements", "product-catalog"],
-  "fba-plan": ["sales-traffic-asin-date", "product-catalog", "fba-inventory-health", "listings"],
+  "fba-plan": ["order-line-items", "product-catalog", "fba-inventory-health", "listings"],
   "sku-pl": ["profit-by-sku-date"],
   "keyword-rank": ["sqp-weekly", "sqp-monthly", "product-catalog"],
   "content-changes": ["content-changes", "product-catalog"],
   "sales-movers": ["sales-traffic-asin-date", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
   "listing-health": ["listings", "listings-raw", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
-  "buy-box-loss": ["profit-by-sku-date", "fba-inventory-health", "product-catalog"],
-  "returns-leakage": ["returns", "settlements", "sales-traffic-asin-date", "product-catalog"],
-  "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date", "sales-traffic-asin-date", "product-catalog"],
+  "buy-box-loss": ["order-line-items", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
+  "returns-leakage": ["returns", "settlements", "order-line-items", "product-catalog"],
+  "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],
   "listing-optimizer": ["sqp-weekly", "product-catalog"],
   "brand-view": ["brand-sales", "ads-asin-date", "fba-plan"],
   "priority-feed": ["sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"],

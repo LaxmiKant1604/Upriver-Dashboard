@@ -1127,7 +1127,7 @@ test("(F1) exactly 13 contracts; key/version/params pinned; insight versions equ
     "sales-movers": "sales-movers-v1",
     "listing-health": "listing-health-v1",
     "buy-box-loss": "buy-box-loss-v1",
-    "returns-leakage": "returns-leakage-v1",
+    "returns-leakage": "returns-leakage-v2",
     "ppc-performance": "ppc-performance-v1",
     "listing-optimizer": "listing-optimizer-v1",
   };

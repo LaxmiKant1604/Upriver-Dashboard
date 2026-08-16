@@ -16,6 +16,7 @@
     "test:report-derivation": "node scripts/report-derivation-core.test.js && node scripts/report-planner.test.js && node scripts/report-fba-plan.test.js && node scripts/report-reconciliation.test.js && node scripts/report-keyword-rank.test.js && node scripts/report-keyword-rank-cycle.test.js && node scripts/report-keyword-rank-e2e.test.js && node scripts/report-sales-movers.test.js && node scripts/report-buy-box.test.js && node scripts/report-returns.test.js && node scripts/report-listing-health.test.js && node scripts/report-ppc-performance.test.js && node scripts/report-listing-optimizer.test.js && node scripts/sync-dispatch.test.js && node scripts/sync-runtime-composition.test.js",
     "test:source-identity": "node scripts/source-identity.test.mjs",
     "test:report-contracts": "node scripts/report-source-contracts.test.mjs",
+    "test:oli-source-correction": "node scripts/oli-source-correction.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
     "test:gate5-canary-package": "node scripts/gate5-canary-package.test.js",
     "test:datadoe-poll-export": "node scripts/datadoe-poll-export.test.js",

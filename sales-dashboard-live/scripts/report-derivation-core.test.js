@@ -812,15 +812,15 @@ test("P2-date: impossible derived latest date fails at VALIDATE; previous snapsh
 
 group("daily-reporting derivation (all-brand + named-brand)");
 
-// ASIN/day Sales & Traffic superset: {date, seller_or_vendor_id, child_asin, total_sales_sum,
-// total_units_sum}. Multiple sellers (>5-ID scenario), a duplicate ASIN across sellers, a
-// zero-priced/units row, and a second month.
+// ASIN/day Order Line Items superset: {date, seller_or_vendor_id, child_asin, item_price_currency,
+// total_sales_sum, total_units_sum}. Multiple sellers (>5-ID scenario), a duplicate ASIN across sellers,
+// a zero-priced/units row, and a second month. item_price_currency is carried so the fold isolates it.
 const DR_SUPERSET = [
-  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000001", total_sales_sum: 100, total_units_sum: 4 },
-  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000002", total_sales_sum: 50, total_units_sum: 2 },
-  { date: "2025-05-01", seller_or_vendor_id: "S2", child_asin: "ASIN000001", total_sales_sum: 30, total_units_sum: 1 },
-  { date: "2025-05-02", seller_or_vendor_id: "S1", child_asin: "ASIN000001", total_sales_sum: 0, total_units_sum: 3 },
-  { date: "2025-06-01", seller_or_vendor_id: "S1", child_asin: "ASIN000003", total_sales_sum: 20, total_units_sum: 1 },
+  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000001", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 4 },
+  { date: "2025-05-01", seller_or_vendor_id: "S1", child_asin: "ASIN000002", item_price_currency: "USD", total_sales_sum: 50, total_units_sum: 2 },
+  { date: "2025-05-01", seller_or_vendor_id: "S2", child_asin: "ASIN000001", item_price_currency: "USD", total_sales_sum: 30, total_units_sum: 1 },
+  { date: "2025-05-02", seller_or_vendor_id: "S1", child_asin: "ASIN000001", item_price_currency: "USD", total_sales_sum: 0, total_units_sum: 3 },
+  { date: "2025-06-01", seller_or_vendor_id: "S1", child_asin: "ASIN000003", item_price_currency: "USD", total_sales_sum: 20, total_units_sum: 1 },
 ];
 const DR_CATALOG = [
   { child_asin: "ASIN000001", product_brand: "Acme" },
@@ -850,15 +850,17 @@ const adsCoverage = (over = {}) => ({
   ...over,
 });
 
-// Independent oracle for the compact all-brand export: sum the superset per (date, seller),
-// first-seen order (this is what DataDoe's server-side group-by-date produces from the same source).
+// Independent oracle for the compact all-brand export: sum the superset per (date, seller, currency),
+// first-seen order (this is what DataDoe's server-side group-by [date, seller, item_price_currency]
+// produces from the same Order Line Items source). Currency is carried so each currency stays isolated.
 function compactOracleFromSuperset(rows) {
   const out = [];
   const seen = new Map();
   for (const r of rows) {
-    const k = `${r.date}|${r.seller_or_vendor_id}`;
+    const currency = r.currency ?? r.item_price_currency ?? null;
+    const k = `${r.date}|${r.seller_or_vendor_id}|${currency ?? ""}`;
     let c = seen.get(k);
-    if (!c) { c = { date: r.date, seller_or_vendor_id: r.seller_or_vendor_id, total_sales_sum: 0, total_units_sum: 0 }; seen.set(k, c); out.push(c); }
+    if (!c) { c = { date: r.date, seller_or_vendor_id: r.seller_or_vendor_id, currency, total_sales_sum: 0, total_units_sum: 0 }; seen.set(k, c); out.push(c); }
     c.total_sales_sum += r.total_sales_sum;
     c.total_units_sum += r.total_units_sum;
   }

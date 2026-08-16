@@ -560,8 +560,12 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const end = String(asOf);
   const from = addDaysStr(end, -(BB_WINDOW_DAYS - 1));
+  // The ordered OLI sales/units source uses the SAME four 7-day slices as the daily buy-box
+  // source, so the two agree by construction and join on currency|sku per window.
+  const dailySlices = splitDateRangeByDays(from, end, BB_SLICE_DAYS);
   const windowsByRequestKey = {
-    "buy-box-loss:daily": splitDateRangeByDays(from, end, BB_SLICE_DAYS),
+    "buy-box-loss:daily": dailySlices,
+    "buy-box-loss:ordered": dailySlices,
     "buy-box-loss:inventory": [{ from: addDaysStr(end, -BB_INVENTORY_LOOKBACK_DAYS), to: end }],
     "buy-box-loss:catalog": [{ from: null, to: null }],
   };
@@ -598,11 +602,11 @@ export function planReturnsLeakage({ accountId, country, currency, connections, 
     // are RAW returned-item grain with a real per-row date, so <=7-day slices concatenate to the identical
     // row set. Returns is fetched date DESC, so the slices are ordered NEWEST-FIRST: each slice's rows
     // arrive DESC and every date lives in exactly one slice, so the concatenation reproduces the former
-    // whole-window DESC order exactly. Settlements/traffic are GROUPED WITHOUT date (whole-window aggregate
+    // whole-window DESC order exactly. Settlements/ordered are GROUPED WITHOUT date (whole-window aggregate
     // rows) and the catalog is no-date -- none of those can be sliced; they stay single-window.
     "returns-leakage:returns": sliceWindowByDays(from, end).reverse(),
     "returns-leakage:settlements": [{ from, to: end }],
-    "returns-leakage:traffic": [{ from, to: end }],
+    "returns-leakage:ordered": [{ from, to: end }],
     "returns-leakage:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({

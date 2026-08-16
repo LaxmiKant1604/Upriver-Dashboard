@@ -96,13 +96,14 @@ const BB_SOURCE_LABEL = "Profit by SKU & Date";
 const BB_PRICE_SOURCE_LABEL = "FBA Inventory Health";
 
 // Returns & Refund Leakage constants -- byte-identical to the live builder/sources: returns.js WINDOW_DAYS
-// = RETURNS.historyDays (60); the source labels + SALES_TRAFFIC.lagDays (4). The derivation RECOMPUTES the
-// single [asOf-59d, asOf] window from asOf and pins it, never trusting a caller's fragment window.
+// = RETURNS.historyDays (60); the source labels + ORDER_LINE_ITEMS.lagDays (0). The return-rate denominator
+// is ordered units from Order Line Items; the numerator is the Returns record count. The derivation
+// RECOMPUTES the single [asOf-59d, asOf] window from asOf and pins it, never trusting a caller's fragment.
 const RET_WINDOW_DAYS = 60;
 const RET_RETURNS_LABEL = "Returns (FBA & FBM)";
 const RET_MONEY_LABEL = "Settlements & P&L Components";
-const RET_RATE_LABEL = "Sales & Traffic by ASIN & Date";
-const RET_RATE_LAG_DAYS = 4;
+const RET_RATE_LABEL = "Order Line Items";
+const RET_RATE_LAG_DAYS = 0;
 
 // Listing Health constants -- byte-identical to the live builder/sources: listing-health.js
 // SALES_WINDOW_DAYS (30), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), the source labels, and the
@@ -116,13 +117,13 @@ const LH_ISSUES_SOURCE_LABEL = "Listings (Raw JSON)";
 const LH_ISSUES_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable Listings (Raw JSON) to add Amazon's own listing issue codes, severities and suppression flags to this report.";
 
 // PPC Performance constants -- byte-identical to the live builder/sources: ppc.js WINDOW_DAYS (30),
-// SALES_TRAFFIC.label / lagDays (the TACoS denominator), and the four persisted Ads source descriptors
+// ORDER_LINE_ITEMS.label / lagDays (the TACoS denominator), and the four persisted Ads source descriptors
 // (syncKey/label/coverage/defaultDataset/enableHint) in campaign,asin,targeting,search-terms order --
 // coverage for campaign/asin is the hardcoded route wording, targeting/search-terms use the ADS_* coverage.
 // ALL advertising data is DERIVED from persisted ads_daily_source_rows; PPC creates ZERO DataDoe Ads exports.
 const PPC_WINDOW_DAYS = 30;
-const PPC_TOTAL_SALES_LABEL = "Sales & Traffic by ASIN & Date";
-const PPC_TOTAL_SALES_LAG_DAYS = 4;
+const PPC_TOTAL_SALES_LABEL = "Order Line Items";
+const PPC_TOTAL_SALES_LAG_DAYS = 0;
 const PPC_MULTI_CURRENCY_REASON = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
 const PPC_TOTAL_SALES_DEGRADED_REASON = "TACoS is unavailable because the account total-sales export for the denominator did not complete this cycle; every other PPC figure is still current.";
 const PPC_ADS_SOURCE_DESCRIPTORS = Object.freeze([
@@ -375,7 +376,7 @@ const REGISTRY = {
   // core imports no Supabase. All-brand rows/units re-aggregate additively; there are no ratio
   // fields to sum (daily ratios are recomputed in the browser from these base sums).
   "daily-reporting": {
-    snapshotVersion: "daily-reporting/v2d-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
+    snapshotVersion: "daily-reporting/v2d-2", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
     // Blocker 1: ONLY `adsCoverage` may be injected through the derive context. The worker's
     // per-report allowlist drops any other derived field and never lets a derived input override
     // the planned account/brand/from/to scope (the snapshot identity stays in the planned scope).
@@ -435,7 +436,7 @@ const REGISTRY = {
   // -> derive-invalid -> last-known-good preserved) so it can never silently become zero, while a
   // VALIDATED empty AWD source is honored as "no AWD rows". Non-US never plans or reads AWD.
   "fba-plan": {
-    snapshotVersion: "fba-plan/v2d-1", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
+    snapshotVersion: "fba-plan/v2d-2", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -754,8 +755,10 @@ const REGISTRY = {
     latestDataDate: (p) => (isValidCalendarDate(p && p.salesLatestDate) ? p.salesLatestDate : null),
   },
   // Buy Box Loss: reproduce the api/datadoe.js `buy-box-loss` payload from the FOUR ordered 7-day raw
-  // daily slices (Profit by SKU & Date), the shared FBA inventory snapshot, and the shared no-date
-  // catalog. ALL three sources are required (optionalRequestKeys: []) -- the report fetch gate keeps the
+  // daily buy-box slices (Profit by SKU & Date -> buybox_percentage + page_views), the FOUR matching
+  // ordered slices (Order Line Items -> ordered sales/units, joined on currency|sku), the shared FBA
+  // inventory snapshot, and the shared no-date catalog. ALL four sources are required
+  // (optionalRequestKeys: []) -- the report fetch gate keeps the
   // report PENDING until every slice + inventory + catalog succeeds, so a failed/terminal/truncated/
   // missing required source never saves (last-known-good preserved). Windows are RECOMPUTED from asOf and
   // pinned positionally: exactly four ordered non-overlapping 7-day slices covering [asOf-27d, asOf], the
@@ -764,7 +767,7 @@ const REGISTRY = {
   // buybox_percentage is a ratio (page-view weighted, unweighted-mean fallback); null observations are
   // excluded; currencies never merge. ZERO DataDoe/network calls (pure).
   "buy-box-loss": {
-    snapshotVersion: "buy-box-loss/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    snapshotVersion: "buy-box-loss/v2d-2", optionalRequestKeys: [], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -779,7 +782,7 @@ const REGISTRY = {
       const from = addDaysStr(asOf, -(BB_WINDOW_DAYS - 1));
       // All three sources are required; defensively reject a missing/failed/unreadable cache (the worker
       // fetch gate already keeps such a report PENDING/blocked, but never derive an empty success).
-      for (const key of ["buy-box-loss:daily", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
+      for (const key of ["buy-box-loss:daily", "buy-box-loss:ordered", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`buy-box-loss ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -788,6 +791,15 @@ const REGISTRY = {
       // Daily: EXACTLY the four ordered 7-day slices covering [asOf-27d, asOf], recomputed + pinned.
       const expectedSlices = splitDateRangeByDays(from, asOf, BB_SLICE_DAYS);
       const dailyFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:daily"], expectedSlices, rawSellerId, "buy-box-loss:daily");
+      // Ordered (Order Line Items) sales/units: the SAME four ordered 7-day slices, positionally validated
+      // (reordered/duplicate/partial/extra/missing/cross-account/wrong-window rejected). The rows are GROUPED
+      // by (sku, child_asin, item_price_currency) so they carry NO date column -- bind the slice windows +
+      // account, then require plain-object rows (a per-row date cannot be checked on a dateless grouped export).
+      const orderedFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:ordered"], expectedSlices, rawSellerId, "buy-box-loss:ordered");
+      orderedFrags.forEach((f) => {
+        if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:ordered fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
+        assertPlainObjectRows(f.rows, `buy-box-loss:ordered slice ${f.from}..${f.to}`);
+      });
       // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
       const inventoryFrom = addDaysStr(asOf, -BB_INVENTORY_LOOKBACK_DAYS);
       const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryFrom, asOf);
@@ -805,6 +817,7 @@ const REGISTRY = {
         accountId: publicAccountId, asOf, from, windowDays: BB_WINDOW_DAYS, sliceDays: BB_SLICE_DAYS,
         sourceLabel: BB_SOURCE_LABEL, priceSourceLabel: BB_PRICE_SOURCE_LABEL,
         dailySliceRows: dailyFrags.map((f) => f.rows),
+        orderedSliceRows: orderedFrags.map((f) => f.rows),
         inventoryRows, catalogRows,
       });
     },
@@ -815,17 +828,17 @@ const REGISTRY = {
     latestDataDate: (p) => (p && p.observedWindow && isValidCalendarDate(p.observedWindow.to) ? p.observedWindow.to : null),
   },
   // Returns & Refund Leakage: reproduce the api/datadoe.js `returns-leakage` payload from the raw Returns
-  // rows, the grouped Settlements money, the grouped Sales & Traffic pair, and the shared no-date catalog.
+  // rows, the grouped Settlements money, the grouped Order Line Items ordered units, and the shared no-date catalog.
   // ALL four sources are required (optionalRequestKeys: []) -- the fetch gate keeps the report PENDING until
   // every source succeeds, so a failed/terminal/truncated/missing required source never saves (LKG kept).
   // The single [asOf-59d, asOf] window is RECOMPUTED from asOf and pinned; returns raw rows must carry a real
-  // date inside it (per-row date bound, never merely fragment metadata); settlements/traffic/catalog are
+  // date inside it (per-row date bound, never merely fragment metadata); settlements/ordered/catalog are
   // grouped/no-date so their rows need only be plain objects. A wrong-window/cross-account/malformed/bad-date
   // fragment or row => invalid (zero writes, LKG preserved); a missing/failed source => unavailable (LKG).
   // Currency is never merged; refund money is absolute; the return-fee component is zero-clamped. ZERO
   // DataDoe/network calls (pure).
   "returns-leakage": {
-    snapshotVersion: "returns-leakage/v2d-1", optionalRequestKeys: [], derivedSourceKeys: [],
+    snapshotVersion: "returns-leakage/v2d-2", optionalRequestKeys: [], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -838,7 +851,7 @@ const REGISTRY = {
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const from = addDaysStr(asOf, -(RET_WINDOW_DAYS - 1));
       // All four sources are required; defensively reject a missing/failed/unreadable cache (never an empty success).
-      for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic", "returns-leakage:catalog"]) {
+      for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`returns-leakage ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -850,22 +863,22 @@ const REGISTRY = {
       // single-account, every raw returned-item row bound to its OWN slice window.
       const expectedReturnSlices = splitDateRangeByDays(from, asOf, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
       const returnRows = slicedFragmentRows(sources["returns-leakage:returns"], expectedReturnSlices, rawSellerId, "returns-leakage:returns");
-      // Settlements / Traffic: GROUPED WITHOUT date (whole-window aggregate rows -- NOT sliceable), exactly
+      // Settlements / Ordered: GROUPED WITHOUT date (whole-window aggregate rows -- NOT sliceable), exactly
       // one single-account fragment each over [asOf-59d, asOf].
       const settlementRows = singleAccountFragmentRows(sources["returns-leakage:settlements"], "returns-leakage:settlements", rawSellerId, from, asOf);
-      const trafficRows = singleAccountFragmentRows(sources["returns-leakage:traffic"], "returns-leakage:traffic", rawSellerId, from, asOf);
+      const orderedRows = singleAccountFragmentRows(sources["returns-leakage:ordered"], "returns-leakage:ordered", rawSellerId, from, asOf);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["returns-leakage:catalog"], "returns-leakage:catalog", rawSellerId);
-      // Settlements + Traffic are GROUPED and Catalog is NO-DATE => plain objects (the returns rows were
+      // Settlements + Ordered are GROUPED and Catalog is NO-DATE => plain objects (the returns rows were
       // already per-slice window-bound above -- a stronger check than the former whole-range bound).
       assertPlainObjectRows(settlementRows, "returns-leakage settlements");
-      assertPlainObjectRows(trafficRows, "returns-leakage traffic");
+      assertPlainObjectRows(orderedRows, "returns-leakage ordered");
       assertPlainObjectRows(catalogRows, "returns-leakage catalog");
       return returnsLeakagePayload({
         accountId: publicAccountId, asOf, from, windowDays: RET_WINDOW_DAYS,
         returnsSourceLabel: RET_RETURNS_LABEL, moneySourceLabel: RET_MONEY_LABEL,
         rateSourceLabel: RET_RATE_LABEL, rateSourceLagDays: RET_RATE_LAG_DAYS, returnHistoryDays: RET_WINDOW_DAYS,
-        returnRows, settlementRows, trafficRows, catalogRows,
+        returnRows, settlementRows, orderedRows, catalogRows,
       });
     },
     validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
@@ -1051,7 +1064,7 @@ const REGISTRY = {
   // merged (every rollup key includes currency). Payload accountId is the PUBLIC id; rawSellerId scopes the
   // DataDoe catalog/total-sales fragments.
   "ppc-performance": {
-    snapshotVersion: "ppc-performance/v2d-1",
+    snapshotVersion: "ppc-performance/v2d-2",
     optionalRequestKeys: ["ppc-performance:total-sales"],
     derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
     derivedContextKeys: ["ppcAds"],

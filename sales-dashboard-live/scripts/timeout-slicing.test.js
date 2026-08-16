@@ -174,15 +174,15 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
     { date: "2025-07-15", sku: "S", child_asin: "R1", amazon_order_id: "O", amazon_return_reason: "TOO_SMALL", amazon_fulfillment_channel: "FBM", amazon_return_request_status: "PendingApproval", amazon_return_refunded_amount: -5, amazon_return_label_cost: -1, amazon_return_label_to_be_paid_by: "Amazon" },
   ];
   const settlements = [{ sku: "S", child_asin: "R1", settlement_type: "ORDER", currency: "USD", item_price_sum: 200, quantity_sum: 20 }];
-  const traffic = [{ child_asin: "R1", product_name: "W", sales_sum: 500, units_sum: 50, units_shipped_sum: 48, units_refunded_sum: 5 }];
+  const ordered = [{ child_asin: "R1", item_price_currency: "USD", product_name: "W", sales_sum: 500, units_sum: 50 }];
   const catalog = [{ child_asin: "R1", parent_asin: "P", product_name: "W", product_brand: "Acme" }];
   const slices = splitDateRangeByDays(from, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
   const r = slicedPlanned("returns-leakage:returns", slices, returns);
   const se = frag("returns-leakage:settlements", from, ASOF);
-  const tr = frag("returns-leakage:traffic", from, ASOF);
+  const tr = frag("returns-leakage:ordered", from, ASOF);
   const ca = frag("returns-leakage:catalog", null, null);
   const planned = [...r.planned, se, tr, ca];
-  const byHash = new Map([...r.byHash, [se.requestHash, settlements], [tr.requestHash, traffic], [ca.requestHash, catalog]]);
+  const byHash = new Map([...r.byHash, [se.requestHash, settlements], [tr.requestHash, ordered], [ca.requestHash, catalog]]);
   const res = deriveReportSnapshot({ reportKey: "returns-leakage", sources: buildSources(planned, byHash), context: { to: ASOF, rawSellerId: ID, accountId: ID } });
   assert.equal(res.status, "derived");
   // FORMER calculation: the pure builder over the unsplit DESC-ordered rows with the identical route labels
@@ -191,8 +191,8 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
   const former = returnsLeakagePayload({
     accountId: ID, asOf: ASOF, from, windowDays: RET_WINDOW_DAYS,
     returnsSourceLabel: "Returns (FBA & FBM)", moneySourceLabel: "Settlements & P&L Components",
-    rateSourceLabel: "Sales & Traffic by ASIN & Date", rateSourceLagDays: 4, returnHistoryDays: RET_WINDOW_DAYS,
-    returnRows: returns, settlementRows: settlements, trafficRows: traffic, catalogRows: catalog,
+    rateSourceLabel: "Order Line Items", rateSourceLagDays: 0, returnHistoryDays: RET_WINDOW_DAYS,
+    returnRows: returns, settlementRows: settlements, orderedRows: ordered, catalogRows: catalog,
   });
   assert.deepEqual(res.payload, former, "sliced fragments reproduce the former unsplit payload EXACTLY");
 });
@@ -212,8 +212,8 @@ test("GOLDEN: the sliced request windows produce the pinned request_hashes for a
   assert.equal(daily.length, 27, "6 calendar months (Mar..Aug-partial) -> 27 slices");
   assert.deepEqual([daily[0].from, daily[0].to], ["2025-03-01", "2025-03-07"]);
   assert.deepEqual([daily[daily.length - 1].from, daily[daily.length - 1].to], ["2025-08-08", "2025-08-10"]);
-  assert.equal(daily[0].requestHash, "e5c813d1e9028b35d6273709c032d76d9045aa846e2f0bb125f3289551409b9a");
-  assert.equal(daily[daily.length - 1].requestHash, "102ee8e217865d135274dcd4b183c5bb3002217f37640c3d8346f1dcb5a34981");
+  assert.equal(daily[0].requestHash, "99939b3b01c5ce7f66146307dfff8517a31fdbe9900f4c7133e5b0706b742f61");
+  assert.equal(daily[daily.length - 1].requestHash, "1d6aaab02c1a7183182661a054ade43c782d1af5e9032c575e8c00a8c75b6af9");
 });
 
 /* ============================= 5: malformed-fragment fail-closed matrix ============================= */

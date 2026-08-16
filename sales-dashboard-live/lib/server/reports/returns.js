@@ -14,9 +14,9 @@
 //     carry the real refunded amount for BOTH FBA and FBM, plus the return fees
 //     and the COGS attached to the refunded units, with an explicit `currency`.
 //
-//  3. Sales & Traffic by ASIN & Date — Amazon's own `units_shipped` and
-//     `units_refunded` per ASIN, which is the cleanest matched pair for a return
-//     rate. That source can lag about four days, which the report displays.
+//  3. Order Line Items — ordered `quantity` per ASIN (the return-rate
+//     DENOMINATOR). The return-rate NUMERATOR is the count of Returns records
+//     (one row = one returned item). Near-real-time, so effectively no lag.
 //
 // Refunds are distinguished from pending and cancelled activity structurally,
 // not by guesswork: a refund only exists once Amazon posts a REFUND settlement
@@ -25,11 +25,11 @@
 
 import { num } from "../datadoe.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
-import { RETURNS, ROW_LIMITS, SALES_TRAFFIC, SETTLEMENTS } from "./sources.js";
+import { ORDER_LINE_ITEMS, RETURNS, ROW_LIMITS, SETTLEMENTS } from "./sources.js";
 import { addDaysStr } from "../datadoe.js";
 
 export const RETURNS_REPORT_KEY = "returns-leakage";
-export const RETURNS_VERSION = "returns-leakage-v1";
+export const RETURNS_VERSION = "returns-leakage-v2";
 
 // Matched to the documented availability of the Returns source.
 const WINDOW_DAYS = RETURNS.historyDays;
@@ -60,12 +60,14 @@ const SETTLEMENT_AGGREGATIONS = [
   { column: "cogs_total_value", aggregation: "sum", alias: "cogs_sum" },
 ];
 
-const TRAFFIC_GROUP_BY = ["child_asin", "product_name"];
-const TRAFFIC_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "units_sum" },
-  { column: "units_shipped", aggregation: "sum", alias: "units_shipped_sum" },
-  { column: "units_refunded", aggregation: "sum", alias: "units_refunded_sum" },
+// Ordered units are the return-rate DENOMINATOR, from Order Line Items (quantity). The RETURNED
+// units NUMERATOR is the count of Returns records per ASIN (one row = one returned item), so this
+// source no longer carries units_shipped/units_refunded. Grouped by child_asin + item_price_currency
+// so DataDoe never sums money across currencies.
+const ORDERED_GROUP_BY = ["child_asin", "item_price_currency"];
+const ORDERED_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
 ];
 
 /**
@@ -114,16 +116,16 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     "Returns settlement export"
   );
 
-  // 3) Amazon's own shipped/refunded unit pair for the return rate.
-  const trafficRows = await fetchExportRowsStrict(
-    apiKey, SALES_TRAFFIC.id, TRAFFIC_GROUP_BY, ids, from, to, ROW_LIMITS.aggregated,
+  // 3) Ordered units per ASIN (the return-rate denominator) from Order Line Items.
+  const orderedRows = await fetchExportRowsStrict(
+    apiKey, ORDER_LINE_ITEMS.id, ORDERED_GROUP_BY, ids, from, to, ROW_LIMITS.aggregated,
     {
-      groupBy: TRAFFIC_GROUP_BY,
-      aggregations: TRAFFIC_AGGREGATIONS,
+      groupBy: ORDERED_GROUP_BY,
+      aggregations: ORDERED_AGGREGATIONS,
       orderByColumn: "child_asin",
       orderByDirection: "ASC",
     },
-    "Returns sales-and-traffic export"
+    "Returns ordered-units export"
   );
 
   const catalog = await fetchCatalog(apiKey, ids);
@@ -223,38 +225,38 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     moneyByKey.set(key, entry);
   }
 
-  /* ----- Amazon's shipped / refunded units per ASIN ----- */
-  const trafficByAsin = new Map();
-  for (const row of trafficRows) {
+  /* ----- ordered units + sales per ASIN (the return-rate denominator) ----- */
+  const orderedByAsin = new Map();
+  for (const row of orderedRows) {
     const asin = String(row.child_asin || "").trim();
     if (!asin) continue;
-    const entry = trafficByAsin.get(asin) || { sales: 0, units: 0, unitsShipped: 0, unitsRefunded: 0, productName: null };
-    entry.sales += sumField(row, "sales_sum", "total_sales");
-    entry.units += sumField(row, "units_sum", "total_units");
-    entry.unitsShipped += sumField(row, "units_shipped_sum", "units_shipped");
-    entry.unitsRefunded += sumField(row, "units_refunded_sum", "units_refunded");
+    const entry = orderedByAsin.get(asin) || { sales: 0, orderedUnits: 0, productName: null };
+    entry.sales += sumField(row, "sales_sum", "item_price_value");
+    entry.orderedUnits += sumField(row, "units_sum", "quantity");
     if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
-    trafficByAsin.set(asin, entry);
+    orderedByAsin.set(asin, entry);
   }
 
   /* ----- assemble one row per (currency, ASIN) ----- */
   const asins = new Set([
     ...returnsByAsin.keys(),
-    ...trafficByAsin.keys(),
+    ...orderedByAsin.keys(),
     ...[...moneyByKey.values()].map((entry) => entry.asin),
   ]);
 
   const rows = [];
   for (const asin of asins) {
     const returns = returnsByAsin.get(asin) || null;
-    const traffic = trafficByAsin.get(asin) || null;
+    const ordered = orderedByAsin.get(asin) || null;
     // An ASIN can appear under more than one currency; each keeps its own row.
     const moneyEntries = [...moneyByKey.values()].filter((entry) => entry.asin === asin);
     const targets = moneyEntries.length ? moneyEntries : [null];
     const meta = catalog.byAsin.get(asin) || {};
 
     for (const money of targets) {
-      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0) || (traffic && traffic.unitsRefunded > 0);
+      // A return-leakage candidate has actual return records OR settlement refund events. Ordered
+      // units alone (no returns, no refunds) is not leakage.
+      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0);
       if (!hasReturnActivity) continue;
 
       const skus = new Set([...(returns?.skus || []), ...(money?.skus || [])]);
@@ -262,7 +264,7 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
         asin,
         sku: [...skus].sort((a, b) => a.localeCompare(b))[0] || null,
         skuCount: skus.size,
-        productName: meta.name || traffic?.productName || null,
+        productName: meta.name || ordered?.productName || null,
         brand: brandLabel(meta.brand),
         currency: money?.currency || null,
 
@@ -288,12 +290,11 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
         settledUnits: money ? money.settledUnits : 0,
         hasMoney: Boolean(money),
 
-        // Amazon's own matched pair for the rate.
-        unitsSold: traffic ? traffic.units : null,
-        unitsShipped: traffic ? traffic.unitsShipped : null,
-        unitsRefunded: traffic ? traffic.unitsRefunded : null,
-        sales: traffic ? traffic.sales : null,
-        hasTraffic: Boolean(traffic),
+        // Return rate = returned units (Returns record count) / ordered units (Order Line Items).
+        orderedUnits: ordered ? ordered.orderedUnits : null,
+        returnedUnits: returns ? returns.returnCount : null,
+        sales: ordered ? ordered.sales : null,
+        hasOrdered: Boolean(ordered),
       });
     }
   }
@@ -304,8 +305,8 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     window: { from, to, days: WINDOW_DAYS },
     returnsSourceLabel: RETURNS.label,
     moneySourceLabel: SETTLEMENTS.label,
-    rateSourceLabel: SALES_TRAFFIC.label,
-    rateSourceLagDays: SALES_TRAFFIC.lagDays,
+    rateSourceLabel: ORDER_LINE_ITEMS.label,
+    rateSourceLagDays: ORDER_LINE_ITEMS.lagDays,
     returnHistoryDays: RETURNS.historyDays,
     returnRecordCount: returnRows.length,
     pendingReturnRequests,

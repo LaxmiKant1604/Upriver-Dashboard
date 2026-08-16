@@ -114,7 +114,7 @@ function fbaReportPlan(planned, rows) {
   const store = makeReportStore();
   for (const p of planned) store.seedSourceSucceeded(p.requestHash);
   const sources = planned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
-  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-1", sources, context: usContext() };
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-2", sources, context: usContext() };
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
   return { store, plannedReport, sourceRows };
 }
@@ -380,7 +380,7 @@ test("planFbaPlan: organizations never share a request hash", () => {
 });
 
 test("foldPlanAsinUnits: sums grouped child_asin units in first-seen order", () => {
-  const m = foldPlanAsinUnits([{ child_asin: "B", units_sum: 2 }, { child_asin: "A", units_sum: 3 }, { child_asin: "B", total_units: 5 }]);
+  const m = foldPlanAsinUnits([{ child_asin: "B", units_sum: 2 }, { child_asin: "A", units_sum: 3 }, { child_asin: "B", quantity: 5 }]);
   assert.deepEqual([...m.entries()], [["B", 7], ["A", 3]]);
 });
 

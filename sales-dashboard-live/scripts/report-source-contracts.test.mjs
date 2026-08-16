@@ -443,16 +443,17 @@ test("fba-plan monthly-units matches the inline child_asin units export (planAsi
   const c = byKey(fba, "fba-plan:monthly-units");
   assert.deepEqual(c.columns, ["child_asin"]);
   assert.deepEqual(c.groupBy, ["child_asin"]);
-  assert.deepEqual(c.aggregations, [{ column: "total_units", aggregation: "sum", alias: "units_sum" }]);
+  assert.deepEqual(c.aggregations, [{ column: "quantity", aggregation: "sum", alias: "units_sum" }]);
   assert.equal(c.limit, constNumber("PLAN_SALES_ROW_LIMIT"));
   assert.equal(c.orderByColumn, "child_asin");
+  assert.equal(c.sourceKey, "order-line-items");
   assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["child_asin"]'), "planAsinUnits child_asin export must exist");
 });
 test("fba-plan current-daily-dates matches the inline date units export (limit 500)", () => {
   const c = byKey(fba, "fba-plan:current-daily-dates");
   assert.deepEqual(c.columns, ["date"]);
   assert.deepEqual(c.groupBy, ["date"]);
-  assert.deepEqual(c.aggregations, [{ column: "total_units", aggregation: "sum", alias: "units_sum" }]);
+  assert.deepEqual(c.aggregations, [{ column: "quantity", aggregation: "sum", alias: "units_sum" }]);
   assert.equal(c.limit, 500);
   assert.equal(c.orderByColumn, "date");
   assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["date"]'), "current-daily date export must exist");
@@ -817,11 +818,12 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "sales-movers:inventory": "common.js",
     "sales-movers:catalog": "common.js",
     "buy-box-loss:daily": "buy-box.js",
+    "buy-box-loss:ordered": "buy-box.js",
     "buy-box-loss:inventory": "common.js",
     "buy-box-loss:catalog": "common.js",
     "returns-leakage:returns": "returns.js",
     "returns-leakage:settlements": "returns.js",
-    "returns-leakage:traffic": "returns.js",
+    "returns-leakage:ordered": "returns.js",
     "returns-leakage:catalog": "common.js",
     "listing-health:listings": "listing-health.js",
     "listing-health:listings-raw": "listing-health.js",
@@ -990,11 +992,12 @@ const INSIGHT_SPEC = [
   { rk: "sales-movers:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "sales-movers:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "buy-box-loss:daily", file: "buy-box.js", cols: "DAILY_COLUMNS", group: null, aggs: null, src: "profit-by-sku-date", limit: 50000, oc: "date", od: "ASC", strict: true },
+  { rk: "buy-box-loss:ordered", file: "buy-box.js", cols: "ORDERED_GROUP_BY", group: "ORDERED_GROUP_BY", aggs: "ORDERED_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "sku", od: "ASC", strict: true },
   { rk: "buy-box-loss:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "buy-box-loss:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:returns", file: "returns.js", cols: "RETURN_COLUMNS", group: null, aggs: null, src: "returns", limit: 50000, oc: "date", od: "DESC", strict: true },
   { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
-  { rk: "returns-leakage:traffic", file: "returns.js", cols: "TRAFFIC_GROUP_BY", group: "TRAFFIC_GROUP_BY", aggs: "TRAFFIC_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "returns-leakage:ordered", file: "returns.js", cols: "ORDERED_GROUP_BY", group: "ORDERED_GROUP_BY", aggs: "ORDERED_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Health
   { rk: "listing-health:listings", file: "listing-health.js", cols: "LISTING_COLUMNS", group: null, aggs: null, src: "listings", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
@@ -1003,7 +1006,7 @@ const INSIGHT_SPEC = [
   { rk: "listing-health:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "listing-health:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // PPC Performance (ads are derived; this is the only owned export besides catalog)
-  { rk: "ppc-performance:total-sales", file: "ppc.js", cols: "TOTAL_SALES_GROUP_BY", group: "TOTAL_SALES_GROUP_BY", aggs: "TOTAL_SALES_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 500, oc: "date", od: "ASC", strict: true },
+  { rk: "ppc-performance:total-sales", file: "ppc.js", cols: "TOTAL_SALES_GROUP_BY", group: "TOTAL_SALES_GROUP_BY", aggs: "TOTAL_SALES_AGGREGATIONS", src: "order-line-items", limit: 500, oc: "date", od: "ASC", strict: true },
   { rk: "ppc-performance:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Optimizer (richer SQP + richer content catalog; both intentionally unshared)
   { rk: "listing-optimizer:sqp-weekly", file: "listing-optimizer.js", cols: "SQP_COLUMNS", group: null, aggs: null, src: "sqp-weekly", limit: 50000, oc: "date", od: "ASC", strict: true, policy: "degraded" },
@@ -1063,13 +1066,17 @@ const bbWin = {
     { from: "2025-07-10", to: "2025-07-16" }, { from: "2025-07-17", to: "2025-07-23" },
     { from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-31", to: "2025-08-06" },
   ],
+  "buy-box-loss:ordered": [
+    { from: "2025-07-10", to: "2025-07-16" }, { from: "2025-07-17", to: "2025-07-23" },
+    { from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-31", to: "2025-08-06" },
+  ],
   "buy-box-loss:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
   "buy-box-loss:catalog": [{ from: null, to: null }],
 };
 const retWin = {
   "returns-leakage:returns": [{ from: "2025-06-08", to: "2025-08-06" }],
   "returns-leakage:settlements": [{ from: "2025-06-08", to: "2025-08-06" }],
-  "returns-leakage:traffic": [{ from: "2025-06-08", to: "2025-08-06" }],
+  "returns-leakage:ordered": [{ from: "2025-06-08", to: "2025-08-06" }],
   "returns-leakage:catalog": [{ from: null, to: null }],
 };
 
@@ -1125,11 +1132,11 @@ test("(12) the FBA inventory snapshot is ONE request identity shared by Sales Mo
   assert.equal(inv("sales-movers", smWin, SM_PROBE_OK), inv("buy-box-loss", bbWin));
 });
 
-test("same source, different identity: Sales Movers traffic vs Returns traffic do NOT deduplicate", () => {
-  const sm = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK }).find((r) => r.requestKey === "sales-movers:traffic");
-  const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:traffic");
-  assert.equal(sm.sourceId, ret.sourceId); // same DataDoe source id...
-  assert.notEqual(sm.requestHash, ret.requestHash); // ...but different columns/aggregations/window => distinct request
+test("same source, different identity: Buy Box ordered vs Returns ordered (both Order Line Items) do NOT deduplicate", () => {
+  const bb = reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin }).find((r) => r.requestKey === "buy-box-loss:ordered");
+  const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:ordered");
+  assert.equal(bb.sourceId, ret.sourceId); // same DataDoe source id (Order Line Items)...
+  assert.notEqual(bb.requestHash, ret.requestHash); // ...but different columns/aggregations/window => distinct request
 });
 
 test("(11) sales-movers primary vs dd-secondary organizations remain isolated (different hashes)", () => {

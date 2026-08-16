@@ -25,8 +25,9 @@ import {
   fetchCatalog,
   fetchExportRowsStrict,
   fetchInventorySnapshot,
+  sumField,
 } from "./common.js";
-import { PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
+import { ORDER_LINE_ITEMS, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
 
 export const BUY_BOX_REPORT_KEY = "buy-box-loss";
 export const BUY_BOX_VERSION = "buy-box-loss-v1";
@@ -35,7 +36,9 @@ const WINDOW_DAYS = 28;
 const SLICE_DAYS = 7;
 
 // Raw daily columns only — no groupBy, because a weighted ratio cannot be
-// produced by a SUM aggregation.
+// produced by a SUM aggregation. Ordered sales/units are NOT read here anymore; they come
+// from Order Line Items (ORDERED_* below), so this source now supplies ONLY the buy-box ratio
+// + page views (the page-view-weighted share) plus the join dimensions/metadata.
 const DAILY_COLUMNS = [
   "date",
   "sku",
@@ -44,9 +47,16 @@ const DAILY_COLUMNS = [
   "product_brand",
   "currency",
   "buybox_percentage",
-  "total_sales",
-  "total_units_sold",
   "page_views",
+];
+
+// Ordered sales/units from Order Line Items, grouped by sku + child_asin + item_price_currency
+// so DataDoe never sums money across currencies; the fold keeps each currency isolated and joins
+// to the daily buy-box rows on currency|sku.
+const ORDERED_GROUP_BY = ["sku", "child_asin", "item_price_currency"];
+const ORDERED_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
 ];
 
 export async function buildBuyBoxLoss({ apiKey, ids, to }) {
@@ -55,6 +65,8 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
 
   // key = currency|sku so two currencies for one SKU are never merged.
   const bySku = new Map();
+  // Ordered sales/units keyed the SAME way (currency|sku) from Order Line Items; joined below.
+  const bySkuOrdered = new Map();
   let observedFrom = null;
   let observedTo = null;
 
@@ -77,15 +89,12 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
           productName: String(row.product_name || "").trim() || null,
           brand: String(row.product_brand || "").trim() || null,
           currency,
-          sales: 0,
-          units: 0,
           pageViews: 0,
           // Weighted numerator/denominator for the buy-box share.
           buyBoxWeighted: 0,
           buyBoxWeight: 0,
           buyBoxSum: 0,
           buyBoxDays: 0,
-          daysWithSales: 0,
         };
         bySku.set(key, entry);
       }
@@ -98,13 +107,8 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
         if (!observedTo || date > observedTo) observedTo = date;
       }
 
-      const sales = num(row.total_sales);
-      const units = num(row.total_units_sold);
       const pageViews = num(row.page_views);
-      entry.sales += sales;
-      entry.units += units;
       entry.pageViews += pageViews;
-      if (sales !== 0 || units !== 0) entry.daysWithSales += 1;
 
       // Null buy-box normally means "no featured-offer competition observed"
       // (a sole seller). Those days are excluded from the share rather than
@@ -119,6 +123,24 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
         }
       }
     }
+
+    // Ordered sales/units for the SAME slice from Order Line Items (item_price_value / quantity),
+    // grouped per (sku, child_asin, item_price_currency) so money never crosses currencies.
+    const orderedRows = await fetchExportRowsStrict(
+      apiKey, ORDER_LINE_ITEMS.id, ORDERED_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.rawGrain,
+      { groupBy: ORDERED_GROUP_BY, aggregations: ORDERED_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" },
+      `Buy Box ordered export (${slice.from} to ${slice.to})`
+    );
+    for (const row of orderedRows) {
+      const sku = String(row.sku || "").trim();
+      if (!sku) continue;
+      const currency = String(row.item_price_currency || "").trim() || null;
+      const key = `${currency || "?"}|${sku}`;
+      let entry = bySkuOrdered.get(key);
+      if (!entry) { entry = { sales: 0, units: 0 }; bySkuOrdered.set(key, entry); }
+      entry.sales += sumField(row, "sales_sum", "item_price_value");
+      entry.units += sumField(row, "units_sum", "quantity");
+    }
   }
 
   const inventory = await fetchInventorySnapshot(apiKey, ids, to);
@@ -127,8 +149,10 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
   const rows = [];
   const currencies = new Set();
   for (const entry of bySku.values()) {
+    // Ordered sales/units join on the SAME currency|sku identity used by the buy-box fold.
+    const sold = bySkuOrdered.get(`${entry.currency || "?"}|${entry.sku}`) || { sales: 0, units: 0 };
     // Only SKUs that actually sold in the window can have revenue at risk.
-    if (entry.units <= 0 && entry.sales <= 0) continue;
+    if (sold.units <= 0 && sold.sales <= 0) continue;
     if (entry.buyBoxDays === 0) continue; // no observed buy-box data at all
 
     const weighted = entry.buyBoxWeight > 0;
@@ -150,8 +174,8 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       buyBoxBasis: weighted ? "page-view weighted" : "unweighted mean of observed days",
       buyBoxDays: entry.buyBoxDays,
       windowDays: WINDOW_DAYS,
-      sales: entry.sales,
-      units: entry.units,
+      sales: sold.sales,
+      units: sold.units,
       pageViews: entry.pageViews,
       // Price and stock evidence. null means the snapshot did not carry it, and
       // the client must then refuse to name a cause.

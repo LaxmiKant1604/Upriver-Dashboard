@@ -21,7 +21,7 @@
 import { addDaysStr, num } from "../datadoe.js";
 import { getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
-import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, ROW_LIMITS, SALES_TRAFFIC } from "./sources.js";
+import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
 
 export const PPC_REPORT_KEY = "ppc-performance";
 export const PPC_VERSION = "ppc-performance-v1";
@@ -39,11 +39,18 @@ const SOURCE_KEYS = [
   ADS_SEARCH_TERMS.syncKey,
 ];
 
-const TOTAL_SALES_GROUP_BY = ["date"];
+// TACoS denominator = total ordered sales from Order Line Items (item_price_value),
+// grouped by date + item_price_currency so DataDoe never sums money across currencies.
+const TOTAL_SALES_GROUP_BY = ["date", "item_price_currency"];
 const TOTAL_SALES_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "units_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
 ];
+// The account total-sales denominator must be in the SAME currency as the Ads spend.
+// The ads-currency gate upstream guarantees <=1 Ads currency; when the Order Line Items
+// rows carry a different currency (or mix), TACoS degrades rather than summing across them.
+const TOTAL_SALES_CURRENCY_MISMATCH_REASON =
+  "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
 
 function metric(row, key) {
   return num(row.metrics?.[key]);
@@ -213,7 +220,7 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
   } else {
     try {
       const salesRows = await fetchExportRowsStrict(
-        apiKey, SALES_TRAFFIC.id, TOTAL_SALES_GROUP_BY, ids, from, to, ROW_LIMITS.dateRollup,
+        apiKey, ORDER_LINE_ITEMS.id, TOTAL_SALES_GROUP_BY, ids, from, to, ROW_LIMITS.dateRollup,
         {
           groupBy: TOTAL_SALES_GROUP_BY,
           aggregations: TOTAL_SALES_AGGREGATIONS,
@@ -222,7 +229,15 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
         },
         "PPC total-sales export"
       );
-      totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "sales_sum", "total_sales"), 0);
+      // Currency isolation: sum ONLY Order Line Items rows in the single Ads currency. If any
+      // row carries a different (non-empty) currency, degrade TACoS -- never sum across currencies.
+      const adsCurrency = currencies.length === 1 ? currencies[0] : null;
+      const oliCurrencies = [...new Set(salesRows.map((row) => row.item_price_currency).filter(Boolean))];
+      if (oliCurrencies.some((c) => c !== adsCurrency)) {
+        totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+      } else {
+        totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "sales_sum", "item_price_value"), 0);
+      }
     } catch (error) {
       // TACoS is the only metric that needs this. Losing it must not lose the
       // whole report, so it degrades to "unavailable" rather than throwing.
@@ -259,8 +274,8 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
     ],
     totalSales,
     totalSalesUnavailable,
-    totalSalesSourceLabel: SALES_TRAFFIC.label,
-    totalSalesLagDays: SALES_TRAFFIC.lagDays,
+    totalSalesSourceLabel: ORDER_LINE_ITEMS.label,
+    totalSalesLagDays: ORDER_LINE_ITEMS.lagDays,
     currencies,
     daily,
     campaigns,

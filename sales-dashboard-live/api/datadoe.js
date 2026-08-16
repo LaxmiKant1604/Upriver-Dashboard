@@ -1465,23 +1465,28 @@ const CONTENT_CHANGE_COLUMNS = [
   "payload",
 ];
 
-// Daily Reporting sales source: "Sales & Traffic by ASIN & Date" (401ffcd7e5),
-// the user-confirmed accurate report. It is per-ASIN, so DataDoe aggregates it
-// by account/date before the server returns it to the dashboard.
-const DAILY_SALES_SOURCE_ID = "401ffcd7e5";
+// Daily Reporting sales source: "Order Line Items" (89b27535...), the canonical
+// ordered-sales/units source (item_price_value for sales, quantity for ordered
+// units). item_price_currency is in the group-by so DataDoe never sums money across
+// currencies; the fold keeps each currency isolated. (Aliases total_sales_sum/
+// total_units_sum are preserved so the downstream folds are unchanged except for
+// currency isolation.)
+const DAILY_SALES_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
 const DAILY_SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
+  "item_price_currency",
 ];
-const DAILY_SALES_GROUP_BY = ["date", "seller_or_vendor_id"];
+const DAILY_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "item_price_currency"];
 const DAILY_SALES_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "total_units_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 // A named brand needs ASIN-level grouping before it can be joined to the
 // Product Catalog. The all-brand report keeps the more compact date grouping.
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin"];
-const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "child_asin"];
+// Both carry item_price_currency for currency isolation.
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
 
 // Advertising source (ad sales / spend / clicks), merged into the daily report
 // by (account, date).
@@ -1567,11 +1572,10 @@ const SQP_WEEKLY_LOOKBACK_DAYS = 84;
 const SQP_MONTHLY_LOOKBACK_DAYS = 365;
 
 // ===== FBA Shipment Plan sources (verified against api/v1/spec/data-scheme) =====
-// Per-ASIN unit sales. "Sales & Traffic by ASIN & Date" (401ffcd7e5) exposes
-// child_asin + total_units and is the report the Daily Reporting view already
-// reconciled to Seller Central. It is used here for the 3 completed months and
-// current-month MTD unit velocity.
-const PLAN_SALES_SOURCE_ID = "401ffcd7e5";
+// Per-ASIN ordered units. "Order Line Items" (89b27535...) exposes child_asin +
+// quantity (ordered units) and is the canonical sales/demand source. It is used
+// here for the 3 completed months and current-month MTD unit velocity.
+const PLAN_SALES_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
 // Live FBA inventory snapshot. "FBA Inventory Health" (44fc5ba0...) is the only
 // source that splits reserved into reserved_fc_transfer / reserved_fc_processing
 // / reserved_customer_order and splits inbound into working / shipped / received,
@@ -1698,8 +1702,10 @@ export function orderSalesByBrand(rows, catalogRows) {
 export function normalizeDailySalesRows(rows) {
   return rows.map((row) => ({
     ...row,
-    total_sales: num(row.total_sales_sum ?? row.total_sales),
-    total_units: num(row.total_units_sum ?? row.total_units),
+    // Carry the Order Line Items currency so downstream keeps each currency isolated.
+    currency: row.currency ?? row.item_price_currency ?? null,
+    total_sales: num(row.total_sales_sum ?? row.item_price_value),
+    total_units: num(row.total_units_sum ?? row.quantity),
   }));
 }
 
@@ -1716,16 +1722,19 @@ export function dailyRowsForBrand(rows, catalogRows, brand) {
   const totals = new Map();
   for (const row of rows) {
     if (brandByAsin.get(String(row.child_asin || "").trim()) !== brand) continue;
-    const key = `${row.seller_or_vendor_id}|${row.date}`;
+    // Currency isolation: a (seller, date) pair is folded per currency, never across.
+    const currency = row.currency ?? row.item_price_currency ?? null;
+    const key = `${row.seller_or_vendor_id}|${row.date}|${currency ?? ""}`;
     const current = totals.get(key) || {
       date: row.date,
       seller_or_vendor_id: row.seller_or_vendor_id,
+      currency,
       total_sales: 0,
       total_units: 0,
       total_units_sold: 0,
     };
-    current.total_sales += num(row.total_sales_sum ?? row.total_sales);
-    current.total_units += num(row.total_units_sum ?? row.total_units);
+    current.total_sales += num(row.total_sales_sum ?? row.item_price_value);
+    current.total_units += num(row.total_units_sum ?? row.quantity);
     current.total_units_sold = current.total_units;
     totals.set(key, current);
   }
@@ -2001,17 +2010,17 @@ function planMonthWindows(toStr) {
   return { completed, current };
 }
 
-// Sum per-ASIN units for one grouped Sales & Traffic export window.
+// Sum per-ASIN ordered units for one grouped Order Line Items export window.
 async function planAsinUnits(apiKey, ids, from, to) {
   const rows = await fetchExportRows(
     apiKey, PLAN_SALES_SOURCE_ID, ["child_asin"], ids, from, to, PLAN_SALES_ROW_LIMIT,
-    { groupBy: ["child_asin"], aggregations: [{ column: "total_units", aggregation: "sum", alias: "units_sum" }], orderByColumn: "child_asin", orderByDirection: "ASC" }
+    { groupBy: ["child_asin"], aggregations: [{ column: "quantity", aggregation: "sum", alias: "units_sum" }], orderByColumn: "child_asin", orderByDirection: "ASC" }
   );
   const byAsin = new Map();
   for (const r of rows) {
     const asin = String(r.child_asin || "").trim();
     if (!asin) continue;
-    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.total_units));
+    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.quantity));
   }
   return byAsin;
 }
@@ -2024,11 +2033,12 @@ async function planAsinUnits(apiKey, ids, from, to) {
 export function mergeSalesAndAds(salesRows, adRows) {
   const firstByKey = new Map();
   for (const r of salesRows) {
-    const key = `${r.seller_or_vendor_id}|${r.date}`;
+    // Currency isolation: ad rows only merge into the sales row of the SAME currency.
+    const key = `${r.seller_or_vendor_id}|${r.date}|${r.currency ?? ""}`;
     if (!firstByKey.has(key)) firstByKey.set(key, r);
   }
   for (const a of adRows) {
-    const key = `${a.seller_or_vendor_id}|${a.date}`;
+    const key = `${a.seller_or_vendor_id}|${a.date}|${a.currency ?? ""}`;
     const target = firstByKey.get(key);
     if (target) {
       target.ad_sales = num(target.ad_sales) + num(a.ad_sales);
@@ -2981,7 +2991,7 @@ async function handleDataDoe(req, res) {
       // projection is not diluted by dates the source has not populated yet.
       const dateRows = await fetchExportRows(
         apiKey, PLAN_SALES_SOURCE_ID, ["date"], sellerOrVendorIds, current.from, current.to, 500,
-        { groupBy: ["date"], aggregations: [{ column: "total_units", aggregation: "sum", alias: "units_sum" }], orderByColumn: "date", orderByDirection: "ASC" }
+        { groupBy: ["date"], aggregations: [{ column: "quantity", aggregation: "sum", alias: "units_sum" }], orderByColumn: "date", orderByDirection: "ASC" }
       );
       let salesLatestDate = null;
       for (const r of dateRows) {

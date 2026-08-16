@@ -150,8 +150,10 @@ export function compactContentChangeEvents(rows, catalogRows) {
 export function normalizeDailySalesRows(rows) {
   return rows.map((row) => ({
     ...row,
-    total_sales: num(row.total_sales_sum ?? row.total_sales),
-    total_units: num(row.total_units_sum ?? row.total_units),
+    // Carry the Order Line Items currency so downstream keeps each currency isolated.
+    currency: row.currency ?? row.item_price_currency ?? null,
+    total_sales: num(row.total_sales_sum ?? row.item_price_value),
+    total_units: num(row.total_units_sum ?? row.quantity),
   }));
 }
 
@@ -176,16 +178,19 @@ export function dailyRowsForBrand(rows, catalogRows, brand) {
   const totals = new Map();
   for (const row of rows) {
     if (brandByAsin.get(String(row.child_asin || "").trim()) !== brand) continue;
-    const key = `${row.seller_or_vendor_id}|${row.date}`;
+    // Currency isolation: a (seller, date) pair is folded per currency, never across.
+    const currency = row.currency ?? row.item_price_currency ?? null;
+    const key = `${row.seller_or_vendor_id}|${row.date}|${currency ?? ""}`;
     const current = totals.get(key) || {
       date: row.date,
       seller_or_vendor_id: row.seller_or_vendor_id,
+      currency,
       total_sales: 0,
       total_units: 0,
       total_units_sold: 0,
     };
-    current.total_sales += num(row.total_sales_sum ?? row.total_sales);
-    current.total_units += num(row.total_units_sum ?? row.total_units);
+    current.total_sales += num(row.total_sales_sum ?? row.item_price_value);
+    current.total_units += num(row.total_units_sum ?? row.quantity);
     current.total_units_sold = current.total_units;
     totals.set(key, current);
   }
@@ -198,11 +203,12 @@ export function mergeSalesAndAds(salesRows, adRows) {
   const out = salesRows.slice();
   const firstByKey = new Map();
   for (const r of out) {
-    const key = `${r.seller_or_vendor_id}|${r.date}`;
+    // Currency isolation: ad rows only merge into the sales row of the SAME currency.
+    const key = `${r.seller_or_vendor_id}|${r.date}|${r.currency ?? ""}`;
     if (!firstByKey.has(key)) firstByKey.set(key, r);
   }
   for (const a of adRows) {
-    const key = `${a.seller_or_vendor_id}|${a.date}`;
+    const key = `${a.seller_or_vendor_id}|${a.date}|${a.currency ?? ""}`;
     const target = firstByKey.get(key);
     if (target) {
       target.ad_sales = num(target.ad_sales) + num(a.ad_sales);
@@ -237,15 +243,18 @@ export function mergeSalesAndAds(salesRows, adRows) {
 export function rollupSupersetToDaily(supersetRows) {
   const byKey = new Map();
   for (const row of supersetRows) {
-    const key = `${row.date}|${row.seller_or_vendor_id}`;
+    // Currency isolation: sum the superset per (date, seller, currency) -- never across currencies.
+    const currency = row.currency ?? row.item_price_currency ?? null;
+    const key = `${row.date}|${row.seller_or_vendor_id}|${currency ?? ""}`;
     const current = byKey.get(key) || {
       date: row.date,
       seller_or_vendor_id: row.seller_or_vendor_id,
+      currency,
       total_sales_sum: 0,
       total_units_sum: 0,
     };
-    current.total_sales_sum += num(row.total_sales_sum ?? row.total_sales);
-    current.total_units_sum += num(row.total_units_sum ?? row.total_units);
+    current.total_sales_sum += num(row.total_sales_sum ?? row.item_price_value);
+    current.total_units_sum += num(row.total_units_sum ?? row.quantity);
     byKey.set(key, current);
   }
   return [...byKey.values()];
@@ -489,15 +498,15 @@ export function reconciliationPayload({ from, to, months, orderRows, settlementR
 //      `fba-plan` handler (the DataDoe fetches are replaced by injected saved source rows). Kept
 //      dependency-free here; proven equal to the route formula by the FBA parity harness. ----
 
-// Sum per-ASIN units for one grouped Sales & Traffic window (verbatim of planAsinUnits's fold).
-// Returns a Map(asin -> units) in first-seen row order (child_asin ASC as saved), so downstream
-// ASIN ordering matches the route exactly.
+// Sum per-ASIN ordered units for one grouped Order Line Items window (verbatim of planAsinUnits's
+// fold). Returns a Map(asin -> units) in first-seen row order (child_asin ASC as saved), so
+// downstream ASIN ordering matches the route exactly.
 export function foldPlanAsinUnits(rows) {
   const byAsin = new Map();
   for (const r of rows || []) {
     const asin = String(r.child_asin || "").trim();
     if (!asin) continue;
-    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.total_units));
+    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.quantity));
   }
   return byAsin;
 }
@@ -1027,8 +1036,8 @@ export function buyBoxDailyFold(sliceRowArrays) {
           productName: String(row.product_name || "").trim() || null,
           brand: String(row.product_brand || "").trim() || null,
           currency,
-          sales: 0, units: 0, pageViews: 0,
-          buyBoxWeighted: 0, buyBoxWeight: 0, buyBoxSum: 0, buyBoxDays: 0, daysWithSales: 0,
+          pageViews: 0,
+          buyBoxWeighted: 0, buyBoxWeight: 0, buyBoxSum: 0, buyBoxDays: 0,
         };
         bySku.set(key, entry);
       }
@@ -1041,13 +1050,8 @@ export function buyBoxDailyFold(sliceRowArrays) {
         if (!observedTo || date > observedTo) observedTo = date;
       }
 
-      const sales = num(row.total_sales);
-      const units = num(row.total_units_sold);
       const pageViews = num(row.page_views);
-      entry.sales += sales;
-      entry.units += units;
       entry.pageViews += pageViews;
-      if (sales !== 0 || units !== 0) entry.daysWithSales += 1;
 
       // Null buy-box => no featured-offer competition observed; excluded from the share, not counted 0%.
       const buyBox = numOrNull(row.buybox_percentage);
@@ -1065,15 +1069,40 @@ export function buyBoxDailyFold(sliceRowArrays) {
 }
 
 /**
- * Full Buy Box Loss payload, byte-identical to buildBuyBoxLoss() for the same saved rows. Excludes SKUs
- * with no sales/units and SKUs with no observed buy-box data; page-view-weighted share with an
- * unweighted-mean fallback; price/stock evidence null when the snapshot did not carry the SKU. Pure.
+ * Fold the ordered Order Line Items slices (grouped by sku + child_asin + item_price_currency, aggregations
+ * item_price_value->sales_sum / quantity->units_sum) into a per (currency|sku) map of { sales, units },
+ * byte-identical to buildBuyBoxLoss()'s ordered slice loop. Currency is NEVER merged (it is part of the key).
+ */
+export function buyBoxOrderedFold(sliceRowArrays) {
+  const bySku = new Map();
+  for (const rows of Array.isArray(sliceRowArrays) ? sliceRowArrays : []) {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const sku = String(row.sku || "").trim();
+      if (!sku) continue;
+      const currency = String(row.item_price_currency || "").trim() || null;
+      const key = `${currency || "?"}|${sku}`;
+      let entry = bySku.get(key);
+      if (!entry) { entry = { sales: 0, units: 0 }; bySku.set(key, entry); }
+      entry.sales += smSumField(row, "sales_sum", "item_price_value");
+      entry.units += smSumField(row, "units_sum", "quantity");
+    }
+  }
+  return bySku;
+}
+
+/**
+ * Full Buy Box Loss payload, byte-identical to buildBuyBoxLoss() for the same saved rows. Ordered sales/units
+ * come from the Order Line Items slices (joined on currency|sku); buybox_percentage + page_views + the
+ * page-view-weighted share come from the Profit by SKU daily slices. Excludes SKUs with no ordered sales/units
+ * and SKUs with no observed buy-box data; page-view-weighted share with an unweighted-mean fallback;
+ * price/stock evidence null when the snapshot did not carry the SKU. Currency never merges. Pure.
  */
 export function buyBoxLossPayload({
   accountId, asOf, from, windowDays, sliceDays, sourceLabel, priceSourceLabel,
-  dailySliceRows, inventoryRows, catalogRows,
+  dailySliceRows, orderedSliceRows, inventoryRows, catalogRows,
 }) {
   const daily = buyBoxDailyFold(dailySliceRows);
+  const ordered = buyBoxOrderedFold(orderedSliceRows);
   const inventory = buyBoxInventoryFold(inventoryRows);
   // The shared common-insight catalog fold (child_asin -> { name, brand, parentAsin }); identical to
   // common.js fetchCatalog, so Buy Box + Sales Movers + other insight reports share one catalog identity.
@@ -1082,8 +1111,10 @@ export function buyBoxLossPayload({
   const rows = [];
   const currencies = new Set();
   for (const entry of daily.bySku.values()) {
+    // Ordered sales/units join on the SAME currency|sku identity used by the buy-box fold.
+    const sold = ordered.get(`${entry.currency || "?"}|${entry.sku}`) || { sales: 0, units: 0 };
     // Only SKUs that actually sold in the window can have revenue at risk.
-    if (entry.units <= 0 && entry.sales <= 0) continue;
+    if (sold.units <= 0 && sold.sales <= 0) continue;
     if (entry.buyBoxDays === 0) continue; // no observed buy-box data at all
 
     const weighted = entry.buyBoxWeight > 0;
@@ -1105,8 +1136,8 @@ export function buyBoxLossPayload({
       buyBoxBasis: weighted ? "page-view weighted" : "unweighted mean of observed days",
       buyBoxDays: entry.buyBoxDays,
       windowDays,
-      sales: entry.sales,
-      units: entry.units,
+      sales: sold.sales,
+      units: sold.units,
       pageViews: entry.pageViews,
       // Price and stock evidence. null means the snapshot did not carry it, and the client must then
       // refuse to name a cause.
@@ -1143,8 +1174,9 @@ export function buyBoxLossPayload({
 /* ============================ Returns & Refund Leakage ============================ */
 // PURE cores for Returns & Refund Leakage, transcribed VERBATIM from lib/server/reports/returns.js.
 // Three sources prove different things: Returns (reason mix + counts; NO quantity/currency column, one row
-// = one returned item), Settlements (the money per currency|ASIN, ORDER vs REFUND), and Sales & Traffic
-// (Amazon's own shipped/refunded unit pair). Currency is NEVER merged; refund money uses absolute values
+// = one returned item -- also the return-rate NUMERATOR), Settlements (the money per currency|ASIN, ORDER
+// vs REFUND), and Order Line Items (ordered units per ASIN -- the return-rate DENOMINATOR). Currency is
+// NEVER merged; refund money uses absolute values
 // (Amazon posts money-out negative); the return-fee component is clamped at zero so a restocking recovery
 // can never understate leakage. Reuses the shared sumField (smSumField), brand (salesMoversBrandLabel) and
 // catalog (salesMoversCatalogFold) folds. Zero transport imports.
@@ -1245,60 +1277,61 @@ export function returnsLeakageSettlementFold(rows) {
   return { moneyByKey, currencies };
 }
 
-// Fold Amazon's shipped/refunded unit pair per ASIN. Byte-identical to returns.js's traffic loop.
-export function returnsLeakageTrafficFold(rows) {
-  const trafficByAsin = new Map();
+// Fold ordered sales/units per ASIN (Order Line Items -> the return-rate denominator). Byte-identical
+// to returns.js's ordered loop.
+export function returnsLeakageOrderedFold(rows) {
+  const orderedByAsin = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
     const asin = String(row.child_asin || "").trim();
     if (!asin) continue;
-    const entry = trafficByAsin.get(asin) || { sales: 0, units: 0, unitsShipped: 0, unitsRefunded: 0, productName: null };
-    entry.sales += smSumField(row, "sales_sum", "total_sales");
-    entry.units += smSumField(row, "units_sum", "total_units");
-    entry.unitsShipped += smSumField(row, "units_shipped_sum", "units_shipped");
-    entry.unitsRefunded += smSumField(row, "units_refunded_sum", "units_refunded");
+    const entry = orderedByAsin.get(asin) || { sales: 0, orderedUnits: 0, productName: null };
+    entry.sales += smSumField(row, "sales_sum", "item_price_value");
+    entry.orderedUnits += smSumField(row, "units_sum", "quantity");
     if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
-    trafficByAsin.set(asin, entry);
+    orderedByAsin.set(asin, entry);
   }
-  return { trafficByAsin };
+  return { orderedByAsin };
 }
 
 /**
  * Full Returns & Refund Leakage payload, byte-identical to buildReturnsLeakage() for the same saved rows.
- * One row per (currency, ASIN); an ASIN with no returns AND no refund events AND no refunded traffic units
- * is excluded. Money never crosses currencies; product-name precedence is catalog -> traffic; brand comes
- * from the catalog only. `returnRecordCount` is the RAW return-row count (incl. rows the fold skips). Pure.
+ * One row per (currency, ASIN); an ASIN with no returns AND no refund events is excluded. Money never
+ * crosses currencies; product-name precedence is catalog -> ordered; brand comes from the catalog only.
+ * `returnRecordCount` is the RAW return-row count (incl. rows the fold skips). Pure.
  */
 export function returnsLeakagePayload({
   accountId, asOf, from, windowDays, returnsSourceLabel, moneySourceLabel, rateSourceLabel,
-  rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, trafficRows, catalogRows,
+  rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, orderedRows, catalogRows,
 }) {
   const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
   const { moneyByKey, currencies } = returnsLeakageSettlementFold(settlementRows);
-  const { trafficByAsin } = returnsLeakageTrafficFold(trafficRows);
+  const { orderedByAsin } = returnsLeakageOrderedFold(orderedRows);
   const catalog = salesMoversCatalogFold(catalogRows);
 
   const asins = new Set([
     ...returnsByAsin.keys(),
-    ...trafficByAsin.keys(),
+    ...orderedByAsin.keys(),
     ...[...moneyByKey.values()].map((entry) => entry.asin),
   ]);
   const rows = [];
   for (const asin of asins) {
     const returns = returnsByAsin.get(asin) || null;
-    const traffic = trafficByAsin.get(asin) || null;
+    const ordered = orderedByAsin.get(asin) || null;
     // An ASIN can appear under more than one currency; each keeps its own row.
     const moneyEntries = [...moneyByKey.values()].filter((entry) => entry.asin === asin);
     const targets = moneyEntries.length ? moneyEntries : [null];
     const meta = catalog.byAsin.get(asin) || {};
     for (const money of targets) {
-      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0) || (traffic && traffic.unitsRefunded > 0);
+      // A return-leakage candidate has actual return records OR settlement refund events. Ordered
+      // units alone (no returns, no refunds) is not leakage.
+      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0);
       if (!hasReturnActivity) continue;
       const skus = new Set([...(returns?.skus || []), ...(money?.skus || [])]);
       rows.push({
         asin,
         sku: [...skus].sort((a, b) => a.localeCompare(b))[0] || null,
         skuCount: skus.size,
-        productName: meta.name || traffic?.productName || null,
+        productName: meta.name || ordered?.productName || null,
         brand: salesMoversBrandLabel(meta.brand),
         currency: money?.currency || null,
         returnCount: returns ? returns.returnCount : 0,
@@ -1319,11 +1352,11 @@ export function returnsLeakagePayload({
         settledSales: money ? money.settledSales : 0,
         settledUnits: money ? money.settledUnits : 0,
         hasMoney: Boolean(money),
-        unitsSold: traffic ? traffic.units : null,
-        unitsShipped: traffic ? traffic.unitsShipped : null,
-        unitsRefunded: traffic ? traffic.unitsRefunded : null,
-        sales: traffic ? traffic.sales : null,
-        hasTraffic: Boolean(traffic),
+        // Return rate = returned units (Returns record count) / ordered units (Order Line Items).
+        orderedUnits: ordered ? ordered.orderedUnits : null,
+        returnedUnits: returns ? returns.returnCount : null,
+        sales: ordered ? ordered.sales : null,
+        hasOrdered: Boolean(ordered),
       });
     }
   }
@@ -1697,6 +1730,13 @@ export function ppcDailySeries(campaignRows) {
   return [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
+// The account total-sales denominator must be in the SAME currency as the Ads spend. The
+// ads-currency gate upstream guarantees <=1 Ads currency; when the Order Line Items rows carry a
+// different currency (or mix), TACoS degrades rather than summing across them. Byte-identical to
+// ppc.js TOTAL_SALES_CURRENCY_MISMATCH_REASON.
+const PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON =
+  "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
+
 /**
  * Full PPC Performance payload. The CALCULATIONS (campaigns/ASINs/targets/searchTerms/daily/currencies/TACoS/
  * catalog) are byte-identical to buildPpcPerformance() for the same inputs. `adsRows` are the four persisted
@@ -1742,7 +1782,15 @@ export function ppcPerformancePayload({
   let totalSales = null;
   let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;
   if (totalSalesReason == null && Array.isArray(totalSalesRows)) {
-    totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "sales_sum", "total_sales"), 0);
+    // Currency isolation: sum ONLY Order Line Items rows in the single Ads currency. If any row
+    // carries a different (non-empty) currency, degrade TACoS -- never sum across currencies.
+    const adsCurrency = currencies.length === 1 ? currencies[0] : null;
+    const oliCurrencies = [...new Set(totalSalesRows.map((row) => row.item_price_currency).filter(Boolean))];
+    if (oliCurrencies.some((c) => c !== adsCurrency)) {
+      totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+    } else {
+      totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "sales_sum", "item_price_value"), 0);
+    }
   }
 
   const catalog = salesMoversCatalogFold(catalogRows);

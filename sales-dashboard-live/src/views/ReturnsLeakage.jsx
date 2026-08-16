@@ -43,7 +43,7 @@ const ACCESSORS = {
   returnFees: (row) => Number(row.returnFees) || 0,
   returnCount: (row) => row.returnCount,
   returnRate: (row) => row.returnRate,
-  unitsShipped: (row) => row.unitsShipped,
+  orderedUnits: (row) => row.orderedUnits,
   refundedUnitsSettled: (row) => Number(row.refundedUnitsSettled) || 0,
   cogsOnRefundedUnits: (row) => Number(row.cogsOnRefundedUnits) || 0,
   actionableShare: (row) => row.actionableShare,
@@ -62,8 +62,8 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
   const totals = useMemo(() => {
     const leakage = rows.reduce((sum, row) => sum + row.totalLeakage, 0);
     const returned = rows.reduce((sum, row) => sum + (row.returnCount || 0), 0);
-    const shipped = rows.reduce((sum, row) => sum + (Number(row.unitsShipped) || 0), 0);
-    const refundedUnits = rows.reduce((sum, row) => sum + (Number(row.unitsRefunded) || 0), 0);
+    const ordered = rows.reduce((sum, row) => sum + (Number(row.orderedUnits) || 0), 0);
+    const returnedUnits = rows.reduce((sum, row) => sum + (Number(row.returnedUnits) || 0), 0);
     const actionable = rows.reduce((sum, row) => sum + (row.actionableCount || 0), 0);
     return {
       leakage,
@@ -71,7 +71,7 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
       cogs: rows.reduce((sum, row) => sum + (Number(row.cogsOnRefundedUnits) || 0), 0),
       // A portfolio return rate is recomputed from the summed units, never
       // averaged from the per-product rates.
-      rate: shipped > 0 ? (refundedUnits / shipped) * 100 : null,
+      rate: ordered > 0 ? (returnedUnits / ordered) * 100 : null,
       actionableShare: returned > 0 ? (actionable / returned) * 100 : null,
     };
   }, [rows]);
@@ -120,8 +120,8 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
     "COGS on Refunded Units": Number(row.cogsOnRefundedUnits || 0).toFixed(2),
     "Returned Items": row.returnCount || 0,
     "Refunded Units (settled)": Math.round(Number(row.refundedUnitsSettled) || 0),
-    "Units Shipped (window)": row.unitsShipped === null ? "" : Math.round(row.unitsShipped),
-    "Units Refunded (Amazon)": row.unitsRefunded === null ? "" : Math.round(row.unitsRefunded),
+    "Units Ordered (window)": row.orderedUnits === null ? "" : Math.round(row.orderedUnits),
+    "Units Returned (records)": row.returnedUnits === null ? "" : Math.round(row.returnedUnits),
     "Return Rate %": row.returnRate === null ? (row.lagInflated ? "withheld - lag artefact" : "") : row.returnRate.toFixed(1),
     "FBA Returns": row.fbaReturns || 0,
     "FBM Returns": row.fbmReturns || 0,
@@ -174,7 +174,7 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
         <StatRow stats={[
           { label: "Return leakage", value: totalMoney(totals.leakage, money, fmtMoney), tone: totals.leakage > 0 && !money.mixed ? "bad" : "good", hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Returned items", value: nInt(totals.returned) },
-          { label: "Return rate", value: totals.rate === null ? "—" : fmtRate(totals.rate), hint: "Units refunded divided by units shipped, recomputed from the summed units" },
+          { label: "Return rate", value: totals.rate === null ? "—" : fmtRate(totals.rate), hint: "Units returned divided by ordered units, recomputed from the summed units" },
           { label: "Fixable share", value: totals.actionableShare === null ? "—" : fmtRate(totals.actionableShare, 0), hint: "Product, listing and sizing reasons as a share of all returns" },
           { label: "COGS on refunded units", value: totalMoney(totals.cogs, money, fmtMoney), hint: "Goods value tied to refunded units. Not counted as leakage: the source does not say whether the stock came back sellable." },
         ]} />
@@ -216,7 +216,7 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
                   <SortTh label="COGS Refunded" col="cogsOnRefundedUnits" sort={sort} onSort={onSort} hint="Goods value on refunded units. Not included in leakage." />
                   <SortTh label="Returned Items" col="returnCount" sort={sort} onSort={onSort} />
                   <SortTh label="Refunded Units" col="refundedUnitsSettled" sort={sort} onSort={onSort} />
-                  <SortTh label="Units Shipped" col="unitsShipped" sort={sort} onSort={onSort} />
+                  <SortTh label="Ordered Units" col="orderedUnits" sort={sort} onSort={onSort} />
                   <SortTh label="Return Rate" col="returnRate" sort={sort} onSort={onSort} />
                   <SortTh label="Fixable %" col="actionableShare" sort={sort} onSort={onSort} />
                   <SortTh label="Dominant Reason" col="dominantBucket" sort={sort} onSort={onSort} align="left" />
@@ -232,10 +232,10 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
                     <td className="mono">{row.cogsOnRefundedUnits ? fmtMoney(row.cogsOnRefundedUnits, row.currency || currency) : "—"}</td>
                     <td className="mono">{nInt(row.returnCount)}</td>
                     <td className="mono">{nInt(row.refundedUnitsSettled)}</td>
-                    <td className="mono">{row.unitsShipped === null ? "—" : nInt(row.unitsShipped)}</td>
+                    <td className="mono">{row.orderedUnits === null ? "—" : nInt(row.orderedUnits)}</td>
                     <td className="mono">
                       {row.returnRate === null
-                        ? <span className="movers-unattributed" title={row.lagInflated ? "More units were refunded than shipped inside this window, so these returns belong to earlier sales. A percentage here would be meaningless, so it is withheld and the row is ranked by money instead." : "No shipped units in the window to divide by."}>{row.lagInflated ? "lag*" : "—"}</span>
+                        ? <span className="movers-unattributed" title={row.lagInflated ? "More units were returned than ordered inside this window, so these returns belong to earlier orders. A percentage here would be meaningless, so it is withheld and the row is ranked by money instead." : "No ordered units in the window to divide by."}>{row.lagInflated ? "lag*" : "—"}</span>
                         : fmtRate(row.returnRate)}
                     </td>
                     <td className="mono">{row.actionableShare === null ? "—" : fmtRate(row.actionableShare, 0)}</td>

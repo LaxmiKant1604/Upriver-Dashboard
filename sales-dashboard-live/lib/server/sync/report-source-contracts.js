@@ -83,22 +83,24 @@ const RECON_SETTLEMENT_AGGREGATIONS = [
   { column: "total", aggregation: "sum", alias: "total_sum" },
 ];
 
-// daily-reporting: the scheduler fetches the ASIN/day Sales & Traffic SUPERSET
+// daily-reporting: the scheduler fetches the ASIN/day Order Line Items SUPERSET
 // (api/datadoe.js fetchDailyBrandSalesRows: monthly-segmented, child_asin grain) once
 // per account plus Product Catalog once, and DERIVES both the all-brand total (sum
 // sales/units per date over child_asin) and every named brand (join ASIN->brand via
 // catalog) from those saved rows. There is NO per-brand export and NO separate compact
 // all-brand export: the browser's compact all-brand export groups the SAME source
-// (401ffcd7e5) by [date, seller_or_vendor_id] with the SAME aggregations, so it is a
-// strict roll-up of this superset (grouped by [date, seller_or_vendor_id, child_asin]).
+// (89b27535...) by [date, seller_or_vendor_id, item_price_currency] with the SAME
+// aggregations, so it is a strict roll-up of this superset (grouped by
+// [date, seller_or_vendor_id, child_asin, item_price_currency]). item_price_currency is
+// in the group-by so DataDoe never sums money across currencies; every fold isolates it.
 // Ads are derived from the scheduled Ads sources (ads_daily_source_rows). See
 // REPORT_DERIVATION below. (LIVE GATE: reconcile superset-summed all-brand vs the
 // compact total once before permanently retiring the compact export.)
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin"];
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
 const DAILY_BRAND_SALES_GROUP_BY = [...DAILY_BRAND_SALES_COLUMNS];
 const DAILY_SALES_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "total_sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "total_units_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 
 // keyword-rank: fetchSqpRows (raw SQP rows, strict truncation) + a 365-day catalog.
@@ -108,13 +110,15 @@ const SQP_COLUMNS = ["date", "child_asin", "search_query", "search_query_volume"
 const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_notification_type", "notification_metadata", "payload"];
 
 // fba-plan: planAsinUnits (monthly, child_asin) + a current-month daily-date probe +
-// catalog + FBA Inventory Health + US-only AWD listings.
+// catalog + FBA Inventory Health + US-only AWD listings. Ordered units are the canonical
+// demand signal from Order Line Items (quantity), so both grouped units exports sum
+// `quantity` (a currency-agnostic unit count -- NO currency column is added here).
 const PLAN_UNITS_COLUMNS = ["child_asin"];
 const PLAN_UNITS_GROUP_BY = ["child_asin"];
-const PLAN_UNITS_AGGREGATIONS = [{ column: "total_units", aggregation: "sum", alias: "units_sum" }];
+const PLAN_UNITS_AGGREGATIONS = [{ column: "quantity", aggregation: "sum", alias: "units_sum" }];
 const PLAN_DAILY_COLUMNS = ["date"];
 const PLAN_DAILY_GROUP_BY = ["date"];
-const PLAN_DAILY_AGGREGATIONS = [{ column: "total_units", aggregation: "sum", alias: "units_sum" }];
+const PLAN_DAILY_AGGREGATIONS = [{ column: "quantity", aggregation: "sum", alias: "units_sum" }];
 const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
 const LISTINGS_AWD_COLUMNS = ["child_asin", "sku", "fnsku", "awd_available_distributable_quantity"];
 
@@ -150,7 +154,17 @@ const SM_ADS_AGGREGATIONS = [
 ];
 
 // buy-box.js
-const BB_DAILY_COLUMNS = ["date", "sku", "child_asin", "product_name", "product_brand", "currency", "buybox_percentage", "total_sales", "total_units_sold", "page_views"];
+// Daily (Profit by SKU & Date) now supplies ONLY the buy-box ratio + page views (the
+// page-view-weighted share) plus the dimensions/metadata; ordered sales/units move to Order
+// Line Items (buy-box-loss:ordered), joined on currency|sku.
+const BB_DAILY_COLUMNS = ["date", "sku", "child_asin", "product_name", "product_brand", "currency", "buybox_percentage", "page_views"];
+// Ordered sales/units from Order Line Items, grouped by sku + child_asin + item_price_currency
+// so DataDoe never sums money across currencies; the fold keeps each currency isolated.
+const BB_ORDERED_COLUMNS = ["sku", "child_asin", "item_price_currency"];
+const BB_ORDERED_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
+];
 
 // returns.js
 const RET_RETURN_COLUMNS = ["date", "sku", "child_asin", "amazon_order_id", "amazon_return_reason", "amazon_fulfillment_channel", "amazon_return_request_status", "amazon_return_refunded_amount", "amazon_return_label_cost", "amazon_return_label_to_be_paid_by"];
@@ -166,12 +180,13 @@ const RET_SETTLEMENT_AGGREGATIONS = [
   { column: "fba_customer_return_per_unit_fee", aggregation: "sum", alias: "return_unit_fee_sum" },
   { column: "cogs_total_value", aggregation: "sum", alias: "cogs_sum" },
 ];
-const RET_TRAFFIC_COLUMNS = ["child_asin", "product_name"];
-const RET_TRAFFIC_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "units_sum" },
-  { column: "units_shipped", aggregation: "sum", alias: "units_shipped_sum" },
-  { column: "units_refunded", aggregation: "sum", alias: "units_refunded_sum" },
+// Ordered units per ASIN (the return-rate denominator) from Order Line Items, grouped by child_asin +
+// item_price_currency so DataDoe never sums money across currencies. The returned-units numerator is the
+// Returns record count (returns-leakage:returns); units_shipped/units_refunded are no longer read.
+const RET_ORDERED_COLUMNS = ["child_asin", "item_price_currency"];
+const RET_ORDERED_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
 ];
 
 // listing-health.js
@@ -185,10 +200,12 @@ const LH_SALES_AGGREGATIONS = [
 ];
 
 // ppc.js — the ONE DataDoe export PPC makes (TACoS denominator); ads are derived.
-const PPC_TOTAL_SALES_COLUMNS = ["date"];
+// Order Line Items sales (item_price_value), grouped by date + item_price_currency so
+// DataDoe never sums money across currencies; the fold keeps only the Ads currency.
+const PPC_TOTAL_SALES_COLUMNS = ["date", "item_price_currency"];
 const PPC_TOTAL_SALES_AGGREGATIONS = [
-  { column: "total_sales", aggregation: "sum", alias: "sales_sum" },
-  { column: "total_units", aggregation: "sum", alias: "units_sum" },
+  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "units_sum" },
 ];
 
 // listing-optimizer.js — richer SQP + a richer content catalog; deliberately NOT
@@ -297,7 +314,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     {
       requestKey: "daily-reporting:asin-day-superset",
       strict: true,
-      sourceKey: "sales-traffic-asin-date",
+      sourceKey: "order-line-items",
       columns: DAILY_BRAND_SALES_COLUMNS,
       limit: 50000, // DAILY_BRAND_ROW_LIMIT (strict: per-month cap => terminal, no partial save)
       groupBy: DAILY_BRAND_SALES_GROUP_BY,
@@ -320,7 +337,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "range:monthStart(asOf)-150..asOf",
     },
   ],
-  // FBA Shipment Plan (single account). Two Sales & Traffic exports with DIFFERENT
+  // FBA Shipment Plan (single account). Two Order Line Items exports with DIFFERENT
   // columns (child_asin units vs date units) => distinct request identities, never
   // shared. Catalog + Inventory Health ranges, and a US-only no-date AWD listing.
   // Every fba-plan source is Scheduler-v2 strict: a result at (or above) its row cap is
@@ -331,7 +348,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     {
       requestKey: "fba-plan:monthly-units",
       strict: true,
-      sourceKey: "sales-traffic-asin-date",
+      sourceKey: "order-line-items",
       columns: PLAN_UNITS_COLUMNS,
       limit: 30000, // PLAN_SALES_ROW_LIMIT
       groupBy: PLAN_UNITS_GROUP_BY,
@@ -343,7 +360,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     {
       requestKey: "fba-plan:current-daily-dates",
       strict: true,
-      sourceKey: "sales-traffic-asin-date",
+      sourceKey: "order-line-items",
       columns: PLAN_DAILY_COLUMNS,
       limit: 500,
       groupBy: PLAN_DAILY_GROUP_BY,
@@ -586,6 +603,21 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
     {
+      requestKey: "buy-box-loss:ordered",
+      sourceKey: "order-line-items",
+      columns: BB_ORDERED_COLUMNS,
+      limit: 50000, // ROW_LIMITS.rawGrain
+      groupBy: BB_ORDERED_COLUMNS,
+      aggregations: BB_ORDERED_AGGREGATIONS,
+      orderByColumn: "sku",
+      orderByDirection: "ASC",
+      // Ordered sales/units (item_price_value / quantity) from Order Line Items, the same
+      // FOUR 7-day slices as :daily; joined to the daily buy-box rows on currency|sku. Grouped
+      // per (sku, child_asin, item_price_currency) so money never sums across currencies.
+      windowKind: "per-7day-slice:asOf-27d..asOf (4 slices)",
+      strict: true,
+    },
+    {
       requestKey: "buy-box-loss:inventory",
       sourceKey: "fba-inventory-health",
       columns: INSIGHT_INVENTORY_COLUMNS,
@@ -640,16 +672,17 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
     {
-      requestKey: "returns-leakage:traffic",
-      sourceKey: "sales-traffic-asin-date",
-      columns: RET_TRAFFIC_COLUMNS,
+      requestKey: "returns-leakage:ordered",
+      sourceKey: "order-line-items",
+      columns: RET_ORDERED_COLUMNS,
       limit: 50000, // ROW_LIMITS.aggregated
-      groupBy: RET_TRAFFIC_COLUMNS,
-      aggregations: RET_TRAFFIC_AGGREGATIONS,
+      groupBy: RET_ORDERED_COLUMNS,
+      aggregations: RET_ORDERED_AGGREGATIONS,
       orderByColumn: "child_asin",
       orderByDirection: "ASC",
-      // Same source as Sales Movers traffic but a different column/aggregation set
-      // and window => a distinct request identity; deliberately NOT shared.
+      // Ordered units per ASIN (the return-rate denominator) from Order Line Items; grouped per
+      // (child_asin, item_price_currency) so money never sums across currencies. Distinct request
+      // identity from every other OLI export (different columns/aggregations/window).
       windowKind: "range:asOf-59d..asOf",
       strict: true,
     },
@@ -735,7 +768,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   "ppc-performance": [
     {
       requestKey: "ppc-performance:total-sales",
-      sourceKey: "sales-traffic-asin-date",
+      sourceKey: "order-line-items",
       columns: PPC_TOTAL_SALES_COLUMNS,
       limit: 500, // ROW_LIMITS.dateRollup
       groupBy: PPC_TOTAL_SALES_COLUMNS,
@@ -866,8 +899,8 @@ export const REPORT_DERIVATION = Object.freeze({
     outputs: ["all-brand", "named-brand (every brand for the account)"],
     derivedFrom: ["daily-reporting:asin-day-superset", "daily-reporting:catalog"],
     strategy:
-      "Fetch the ASIN/day Sales & Traffic superset once per account (monthly-segmented) "
-      + "and Product Catalog once; sum the superset over child_asin per (date, seller) for "
+      "Fetch the ASIN/day Order Line Items superset once per account (monthly-segmented) "
+      + "and Product Catalog once; sum the superset over child_asin per (date, seller, currency) for "
       + "the all-brand total, and join ASIN->brand via the catalog for every named brand. "
       + "No per-brand export; no compact all-brand export.",
     adsFrom: "ads_daily_source_rows (scheduled Ads sources)",
@@ -904,7 +937,7 @@ export const REPORT_SOURCE_COVERAGE = Object.freeze({
   "keyword-rank": "complete",
   "content-changes": "complete",
   "sales-movers": "complete", // traffic+ads (2 windows each), inventory, catalog, latest-date probe
-  "buy-box-loss": "complete", // raw daily (4x7-day slices), inventory, catalog
+  "buy-box-loss": "complete", // daily buy-box (4x7-day slices) + ordered OLI (4x7-day slices), inventory, catalog
   "returns-leakage": "complete", // returns raw, settlements, traffic, catalog
   "listing-health": "complete", // listings, listings-raw (degraded), sales, inventory, catalog
   "ppc-performance": "complete", // total-sales export + catalog; ads DERIVED from persisted rows

@@ -34,7 +34,7 @@ const CONNS = [
   { id: "secondary", apiKey: dash("sec", "key"), accountPrefix: dash("dd", "secondary") + ":" },
 ];
 const ORIGIN = "Persisted Supabase Amazon Ads history maintained by the scheduled worker";
-const TS_LABEL = "Sales & Traffic by ASIN & Date";
+const TS_LABEL = "Order Line Items";
 const MULTI_CCY = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
 const DEGRADED = "TACoS is unavailable because the account total-sales export for the denominator did not complete this cycle; every other PPC figure is still current.";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
@@ -124,7 +124,7 @@ const expectedPayload = () => ({
     { key: KEYS.targeting, label: "Keyword Targeting Performance", coverage: "SP + SB + SD", rows: 1, sync: SYNCS[2], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Keyword Targeting Performance, then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
     { key: KEYS.search, label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", rows: 1, sync: SYNCS[3], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Search Term Performance (Ads), then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
   ],
-  totalSales: 800, totalSalesUnavailable: null, totalSalesSourceLabel: TS_LABEL, totalSalesLagDays: 4,
+  totalSales: 800, totalSalesUnavailable: null, totalSalesSourceLabel: TS_LABEL, totalSalesLagDays: 0,
   currencies: ["USD"],
   daily: [
     { date: "2025-08-01", currency: "USD", spend: 18, sales: 40, clicks: 120, impressions: 1200, orders: 5, units: 6 },

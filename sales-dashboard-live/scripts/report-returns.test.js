@@ -3,7 +3,7 @@
 // Part A drives deriveReportSnapshot("returns-leakage") against hand-built saved fragments and proves the
 // pure payload deep-equals a hand-computed production-route fixture, plus reason classification + stable
 // ordering, FBA/FBM/pending counts, currency isolation, ORDER vs REFUND money, the zero-clamped return fee,
-// catalog/traffic name precedence, no-return/no-refund exclusion, public/raw identity, the exact 60-day
+// catalog/ordered name precedence, no-return/no-refund exclusion, public/raw identity, the exact 60-day
 // window, malformed/out-of-window return dates fail-closed, missing-source LKG, and zero network. Part B
 // drives the REAL buildShadowReportPlan -> runStagedSourceCycle -> runReportJobs path (shared-catalog dedup,
 // coexistence, strict-cap, resume, primary-only, pending-then-saved-once).
@@ -34,7 +34,7 @@ const CONNS = [
 ];
 const RETURNS_LABEL = "Returns (FBA & FBM)";
 const MONEY_LABEL = "Settlements & P&L Components";
-const RATE_LABEL = "Sales & Traffic by ASIN & Date";
+const RATE_LABEL = "Order Line Items";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
 
 let FROM; // asOf-59d, computed in main()
@@ -54,9 +54,9 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
 }
 
 // Returns is TIMEOUT-SAFE SLICED (<=7-day slices over [FROM, ASOF] -- the shape the derive now requires),
-// each raw dated row distributed into its own slice; settlements/traffic stay one grouped whole-window
+// each raw dated row distributed into its own slice; settlements/ordered stay one grouped whole-window
 // fragment each (grouped WITHOUT date -- not sliceable); catalog is no-date.
-function retPlanned({ returns = [], settlements = [], traffic = [], catalog = [], ids = [ID] } = {}) {
+function retPlanned({ returns = [], settlements = [], ordered = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
   const add = (key, from, to, data) => { const f = frag(key, from, to, ids); planned.push(f); rows[f.requestHash] = data; };
   // NEWEST-FIRST slices (returns is fetched date DESC): the concatenation of per-slice rows reproduces the
@@ -70,7 +70,7 @@ function retPlanned({ returns = [], settlements = [], traffic = [], catalog = []
     add("returns-leakage:returns", slice.from, slice.to, [...inSlice, ...orphans]);
   });
   add("returns-leakage:settlements", FROM, ASOF, settlements);
-  add("returns-leakage:traffic", FROM, ASOF, traffic);
+  add("returns-leakage:ordered", FROM, ASOF, ordered);
   add("returns-leakage:catalog", null, null, catalog);
   return { planned, rows };
 }
@@ -91,7 +91,7 @@ const refund = (asin, sku, currency, o) => ({
   refund_commission_sum: o.commission || 0, return_unit_fee_sum: o.unitFee || 0, refund_restocking_fee_sum: o.restock || 0,
   cogs_sum: o.cogs || 0, quantity_sum: o.qty || 0,
 });
-const traf = (asin, name, sales, units, shipped, refunded) => ({ child_asin: asin, product_name: name, sales_sum: sales, units_sum: units, units_shipped_sum: shipped, units_refunded_sum: refunded });
+const ord = (asin, name, sales, units) => ({ child_asin: asin, item_price_currency: "USD", product_name: name, sales_sum: sales, units_sum: units });
 const cat = (asin, parent, name, brand) => ({ child_asin: asin, parent_asin: parent, product_name: name, product_brand: brand });
 
 // ---- the hand-computed production-route fixture ----
@@ -108,18 +108,18 @@ const FIXTURE = () => ({
     refund("R1", "SKU-R1", "USD", { amount: -30, tax: -3, referral: -4, commission: -5, unitFee: -2, restock: -1, cogs: -12, qty: -3 }),
     refund("R1", "SKU-R1", "CAD", { amount: -15, tax: 0, referral: 0, commission: -3, unitFee: 0, restock: -10, cogs: -5, qty: -1 }), // returnFees clamps to 0 (3-10)
     refund("RX", "SKU-X", "USD", { amount: -9, commission: -1, unitFee: -1, restock: 0, cogs: -2, qty: -1 }),                          // money-only ASIN
-    order("RY", "SKU-Y", "USD", 100, 10),                                                                                             // order-only, no refund/returns/traffic -> excluded
+    order("RY", "SKU-Y", "USD", 100, 10),                                                                                             // order-only, no refund/returns -> excluded
     order("", "", "USD", 50, 5),                                                                                                       // empty ASIN -> skipped
   ],
-  traffic: [
-    traf("R1", "Widget R1", 500, 50, 48, 5),
-    traf("R2", "Widget R2", 100, 10, 9, 0),
-    traf("RT", "Widget RT", 80, 8, 8, 2),   // traffic-only, refunded units > 0 -> included
-    traf("RN", "Widget RN", 60, 6, 6, 0),   // traffic-only, no refunded units -> excluded
+  ordered: [
+    ord("R1", "Widget R1", 500, 50),
+    ord("R2", "Widget R2", 100, 10),
+    ord("RT", "Widget RT", 80, 8),   // ordered-only (no returns/refunds) -> excluded
+    ord("RN", "Widget RN", 60, 6),   // ordered-only (no returns/refunds) -> excluded
   ],
   catalog: [
     cat("R1", "P1", "Catalog R1", "Acme"),
-    cat("R2", "P2", "", "Beta"),   // blank catalog name -> traffic name fallback
+    cat("R2", "P2", "", "Beta"),   // blank catalog name -> ordered name fallback
     cat("RT", "P3", "Catalog RT", ""), // blank brand -> Unassigned; brand not added to catalogBrands
   ],
 });
@@ -127,7 +127,7 @@ const expectedFixturePayload = () => ({
   accountId: "A1", asOf: "2025-08-10",
   window: { from: FROM, to: "2025-08-10", days: 60 },
   returnsSourceLabel: RETURNS_LABEL, moneySourceLabel: MONEY_LABEL, rateSourceLabel: RATE_LABEL,
-  rateSourceLagDays: 4, returnHistoryDays: 60,
+  rateSourceLagDays: 0, returnHistoryDays: 60,
   returnRecordCount: 5, pendingReturnRequests: 2,
   fbmOnly: { refundedAmount: 23, sellerBorneLabelCost: 2 },
   reasonTotals: [
@@ -137,11 +137,10 @@ const expectedFixturePayload = () => ({
   ],
   currencies: ["CAD", "USD"],
   rows: [
-    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "USD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 30, refundTax: 3, returnFees: 6, refundedReferralFeeCredit: 4, cogsOnRefundedUnits: 12, refundedUnitsSettled: 3, refundEvents: 1, settledSales: 200, settledUnits: 20, hasMoney: true, unitsSold: 50, unitsShipped: 48, unitsRefunded: 5, sales: 500, hasTraffic: true },
-    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "CAD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 15, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 5, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, unitsSold: 50, unitsShipped: 48, unitsRefunded: 5, sales: 500, hasTraffic: true },
-    { asin: "R2", sku: "SKU-R2", skuCount: 1, productName: "Widget R2", brand: "Beta", currency: null, returnCount: 1, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 1, reasonBuckets: { low_actionability: 1 }, topReasons: [{ reason: "NO_REASON_GIVEN", count: 1 }], refundedAmount: 0, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, unitsSold: 10, unitsShipped: 9, unitsRefunded: 0, sales: 100, hasTraffic: true },
-    { asin: "RT", sku: null, skuCount: 0, productName: "Catalog RT", brand: "Unassigned", currency: null, returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 0, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, unitsSold: 8, unitsShipped: 8, unitsRefunded: 2, sales: 80, hasTraffic: true },
-    { asin: "RX", sku: "SKU-X", skuCount: 1, productName: null, brand: "Unassigned", currency: "USD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 9, refundTax: 0, returnFees: 2, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 2, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, unitsSold: null, unitsShipped: null, unitsRefunded: null, sales: null, hasTraffic: false },
+    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "USD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 30, refundTax: 3, returnFees: 6, refundedReferralFeeCredit: 4, cogsOnRefundedUnits: 12, refundedUnitsSettled: 3, refundEvents: 1, settledSales: 200, settledUnits: 20, hasMoney: true, orderedUnits: 50, returnedUnits: 3, sales: 500, hasOrdered: true },
+    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "CAD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 15, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 5, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: 50, returnedUnits: 3, sales: 500, hasOrdered: true },
+    { asin: "R2", sku: "SKU-R2", skuCount: 1, productName: "Widget R2", brand: "Beta", currency: null, returnCount: 1, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 1, reasonBuckets: { low_actionability: 1 }, topReasons: [{ reason: "NO_REASON_GIVEN", count: 1 }], refundedAmount: 0, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, orderedUnits: 10, returnedUnits: 1, sales: 100, hasOrdered: true },
+    { asin: "RX", sku: "SKU-X", skuCount: 1, productName: null, brand: "Unassigned", currency: "USD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 9, refundTax: 0, returnFees: 2, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 2, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: null, returnedUnits: null, sales: null, hasOrdered: false },
   ],
   catalogBrands: ["Acme", "Beta"],
 });
@@ -198,21 +197,22 @@ test("7. return-fee component is clamped at zero (restocking recovery cannot mak
   assert.equal(p.rows.find((r) => r.asin === "R1" && r.currency === "CAD").returnFees, 0, "commission 3 - restock 10 clamps to 0");
 });
 
-test("8. catalog/name/brand precedence: catalog -> traffic name; brand from catalog only (Unassigned when blank)", () => {
+test("8. catalog/name/brand precedence: catalog -> ordered name; brand from catalog only (Unassigned when blank)", () => {
   const p = deriveRet(retPlanned(FIXTURE())).payload;
   assert.equal(p.rows.find((r) => r.asin === "R1" && r.currency === "USD").productName, "Catalog R1", "catalog name wins");
-  assert.equal(p.rows.find((r) => r.asin === "R2").productName, "Widget R2", "blank catalog name -> traffic name");
-  assert.equal(p.rows.find((r) => r.asin === "RX").productName, null, "no catalog + no traffic -> null");
-  assert.equal(p.rows.find((r) => r.asin === "RT").brand, "Unassigned", "blank catalog brand -> Unassigned");
+  assert.equal(p.rows.find((r) => r.asin === "R2").productName, "Widget R2", "blank catalog name -> ordered name");
+  assert.equal(p.rows.find((r) => r.asin === "RX").productName, null, "no catalog + no ordered -> null");
+  assert.equal(p.rows.find((r) => r.asin === "RX").brand, "Unassigned", "no catalog entry -> Unassigned brand");
   assert.equal(p.rows.find((r) => r.asin === "R1" && r.currency === "USD").brand, "Acme");
 });
 
-test("9. no-return/no-refund rows are excluded; money-only + traffic-only rows are included", () => {
+test("9. rows with no returns AND no refund events are excluded; money-only + returns-only rows are included", () => {
   const p = deriveRet(retPlanned(FIXTURE())).payload;
-  assert.ok(!p.rows.some((r) => r.asin === "RY"), "order-only ASIN (no refund/returns/traffic) excluded");
-  assert.ok(!p.rows.some((r) => r.asin === "RN"), "traffic-only ASIN with 0 refunded units excluded");
-  assert.ok(p.rows.some((r) => r.asin === "RX" && r.hasMoney && !r.hasTraffic), "money-only ASIN included");
-  assert.ok(p.rows.some((r) => r.asin === "RT" && !r.hasMoney && r.hasTraffic), "traffic-only ASIN (refunded units) included");
+  assert.ok(!p.rows.some((r) => r.asin === "RY"), "order-only settlement ASIN (no refund/returns) excluded");
+  assert.ok(!p.rows.some((r) => r.asin === "RN"), "ordered-only ASIN (no returns/refunds) excluded");
+  assert.ok(!p.rows.some((r) => r.asin === "RT"), "ordered-only ASIN (no returns/refunds) excluded, even with ordered units");
+  assert.ok(p.rows.some((r) => r.asin === "RX" && r.hasMoney && !r.hasOrdered), "money-only ASIN included");
+  assert.ok(p.rows.some((r) => r.asin === "R2" && !r.hasMoney && r.hasOrdered), "returns ASIN with ordered units but no settlement money included");
 });
 
 test("10. FBM-only refunded amount + seller-borne label cost are reported separately", () => {
@@ -222,8 +222,8 @@ test("10. FBM-only refunded amount + seller-borne label cost are reported separa
 
 test("11. row order + full labels/lag/window match the live route", () => {
   const p = deriveRet(retPlanned(FIXTURE())).payload;
-  assert.deepEqual(p.rows.map((r) => `${r.asin}/${r.currency}`), ["R1/USD", "R1/CAD", "R2/null", "RT/null", "RX/USD"]);
-  assert.deepEqual([p.returnsSourceLabel, p.moneySourceLabel, p.rateSourceLabel, p.rateSourceLagDays, p.returnHistoryDays], [RETURNS_LABEL, MONEY_LABEL, RATE_LABEL, 4, 60]);
+  assert.deepEqual(p.rows.map((r) => `${r.asin}/${r.currency}`), ["R1/USD", "R1/CAD", "R2/null", "RX/USD"]);
+  assert.deepEqual([p.returnsSourceLabel, p.moneySourceLabel, p.rateSourceLabel, p.rateSourceLagDays, p.returnHistoryDays], [RETURNS_LABEL, MONEY_LABEL, RATE_LABEL, 0, 60]);
   assert.deepEqual(p.window, { from: FROM, to: ASOF, days: 60 });
 });
 
@@ -234,9 +234,9 @@ test("12. the exact 60-day single windows are required; the canonical fixture de
   assert.equal(FROM, addDaysStr(ASOF, -59), "returns window start = asOf-59d");
 });
 
-test("13. wrong-window returns/settlements/traffic + dated catalog fail closed (invalid)", () => {
+test("13. wrong-window returns/settlements/ordered + dated catalog fail closed (invalid)", () => {
   const good = FIXTURE();
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered"]) {
     const built = retPlanned(good);
     const i = built.planned.findIndex((p) => p.requestKey === key);
     built.planned[i] = { ...built.planned[i], from: addDaysStr(FROM, -1) };
@@ -249,7 +249,7 @@ test("13. wrong-window returns/settlements/traffic + dated catalog fail closed (
 });
 
 test("14. cross-account fragments fail closed (invalid)", () => {
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic", "returns-leakage:catalog"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
     const built = retPlanned(FIXTURE());
     const i = built.planned.findIndex((p) => p.requestKey === key);
     built.planned[i] = { ...built.planned[i], sellerOrVendorIds: ["OTHER"] };
@@ -268,7 +268,7 @@ test("15. malformed / impossible / future / out-of-window RETURN row dates fail 
 });
 
 test("16. a missing/failed required source => unavailable, ZERO writes, last-known-good preserved", () => {
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:traffic", "returns-leakage:catalog"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
     const built = retPlanned(FIXTURE());
     const hash = built.planned.find((p) => p.requestKey === key).requestHash;
     assert.equal(deriveRet(built, ctx(), { [hash]: "failed" }).status, "unavailable", `failed ${key} => unavailable (LKG kept)`);
@@ -315,7 +315,7 @@ group("returns latestDataDate: an OBSERVED source-evidence date, never the reque
 // latestDataDate).
 
 test("f1. four successful-but-EMPTY source payloads => status derived, latestDataDate null (never asOf)", () => {
-  const r = deriveRet(retPlanned({ returns: [], settlements: [], traffic: [], catalog: [] }));
+  const r = deriveRet(retPlanned({ returns: [], settlements: [], ordered: [], catalog: [] }));
   assert.equal(r.status, "derived", "empty-but-valid sources derive a valid empty report");
   assert.deepEqual(r.payload.rows, []);
   assert.equal(r.payload.window.to, ASOF, "the payload window end is still asOf (route parity)");
@@ -356,7 +356,7 @@ test("f5. worker-level: recordReportSuccess receives the EXACT observed latestDa
   const built = retPlanned({
     returns: [ret("2025-07-20", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, ""), ret("2025-07-31", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -2, 0, "")],
     settlements: [refund("R1", "SKU-R1", "USD", { amount: -9, qty: -1 })],
-    traffic: [traf("R1", "Widget R1", 100, 10, 9, 1)],
+    ordered: [ord("R1", "Widget R1", 100, 10)],
     catalog: [cat("R1", "P1", "Catalog R1", "Acme")],
   });
   for (const p of built.planned) {
@@ -381,7 +381,7 @@ test("f4b. worker-level: an out-of-window return date => report NOT saved, prior
   const built = retPlanned({
     returns: [ret("2099-01-01", "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -1, 0, "")], // future date
     settlements: [refund("R1", "SKU-R1", "USD", { amount: -9, qty: -1 })],
-    traffic: [traf("R1", "Widget R1", 100, 10, 9, 1)],
+    ordered: [ord("R1", "Widget R1", 100, 10)],
     catalog: [cat("R1", "P1", "Catalog R1", "Acme")],
   });
   for (const p of built.planned) {
@@ -409,7 +409,8 @@ test("f6. other adapters retain their existing latestDataDate results (the sourc
   // Deriving it through the same 3-arg invocation must yield the max observed daily date, unchanged.
   const slices = splitDateRangeByDays(addDaysStr(ASOF, -27), ASOF, 7);
   const planned = []; const rows = {};
-  slices.forEach((w) => { const f = frag("buy-box-loss:daily", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", product_name: "P", product_brand: "B", currency: "USD", buybox_percentage: 90, total_sales: 10, total_units_sold: 1, page_views: 5 }]; });
+  slices.forEach((w) => { const f = frag("buy-box-loss:daily", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", product_name: "P", product_brand: "B", currency: "USD", buybox_percentage: 90, page_views: 5 }]; });
+  slices.forEach((w) => { const f = frag("buy-box-loss:ordered", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ sku: "S", child_asin: "A", item_price_currency: "USD", sales_sum: 10, units_sum: 1 }]; });
   const inv = frag("buy-box-loss:inventory", addDaysStr(ASOF, -10), ASOF); planned.push(inv); rows[inv.requestHash] = [{ date: ASOF, sku: "S", child_asin: "A", product_name: "P", currency: "USD", available: 5, units_shipped_t30: 1 }];
   const catF = frag("buy-box-loss:catalog", null, null); planned.push(catF); rows[catF.requestHash] = [{ child_asin: "A", parent_asin: "P", product_name: "P", product_brand: "B" }];
   const r = deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(planned, rows), context: ctx() });
@@ -463,7 +464,7 @@ function makeDataDoe(opts = {}) {
     const rk = job.requestKey || ""; const fp = job.fetchParams || {};
     if (rk.includes("returns-leakage:returns")) return [ret(fp.to || ASOF, "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -5, 0, "")];
     if (rk.includes("settlements")) return [refund("R1", "SKU-R1", "USD", { amount: -9, commission: -1, unitFee: -1, cogs: -2, qty: -1 })];
-    if (rk.includes("returns-leakage:traffic")) return [traf("R1", "Widget R1", 100, 10, 9, 1)];
+    if (rk.includes("returns-leakage:ordered")) return [ord("R1", "Widget R1", 100, 10)];
     if (rk.includes("catalog")) return [cat("R1", "P1", "Catalog R1", "Acme")];
     return [{ child_asin: "R1" }];
   };
@@ -489,15 +490,15 @@ test("22. default AND explicit planning include returns-leakage; the plan holds 
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "returns-leakage"), "DEFAULT plan includes returns-leakage");
   const plan = shadowPlan(ACCTS, ["returns-leakage"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "returns-leakage");
-  // GOLDEN (Gate-6 timeout remediation): returns is <=7-day sliced NEWEST-FIRST; settlements/traffic/catalog
+  // GOLDEN (Gate-6 timeout remediation): returns is <=7-day sliced NEWEST-FIRST; settlements/ordered/catalog
   // stay one job each. Total deduplicated jobs = slices + 3.
   const expectedSlices = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
   const retJobs = plan.reportRequests[0].sources.filter((s) => s.requestKey === "returns-leakage:returns");
   assert.deepEqual(retJobs.map((s) => ({ from: s.from, to: s.to })), expectedSlices, "returns = the exact newest-first <=7d slice sequence");
   assert.equal(retJobs[0].to, ASOF, "newest slice first");
   assert.equal(retJobs[retJobs.length - 1].from, FROM, "oldest slice last; exact original coverage");
-  assert.equal(plan.sourceJobs.length, expectedSlices.length + 3, "sliced returns + settlements + traffic + catalog");
-  for (const key of ["returns-leakage:settlements", "returns-leakage:traffic"]) {
+  assert.equal(plan.sourceJobs.length, expectedSlices.length + 3, "sliced returns + settlements + ordered + catalog");
+  for (const key of ["returns-leakage:settlements", "returns-leakage:ordered"]) {
     assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [FROM, ASOF], `${key} window asOf-59d..asOf (grouped -- unsliced)`);
   }
   assert.deepEqual([srcOf(plan, "returns-leakage:catalog").from, srcOf(plan, "returns-leakage:catalog").to], [null, null], "no-date catalog");
@@ -510,15 +511,15 @@ test("22. default AND explicit planning include returns-leakage; the plan holds 
   assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
 });
 
-test("23. the no-date catalog canonical hash is SHARED with Buy Box + Sales Movers; returns/settlements/traffic are distinct", () => {
+test("23. the no-date catalog canonical hash is SHARED with Buy Box + Sales Movers; returns/settlements/ordered are distinct", () => {
   const retPlan = shadowPlan(ACCTS, ["returns-leakage"]);
   const bb = planBuyBoxLoss({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
   const sm = planSalesMovers({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, probeSignal: { status: "success", validated: true, latestReportedDate: "2025-08-08" } });
   const retCat = srcOf(retPlan, "returns-leakage:catalog").requestHash;
   assert.equal(retCat, bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog").requestHash, "shared catalog identity with Buy Box");
   assert.equal(retCat, sm.sources.find((s) => s.requestKey === "sales-movers:catalog").requestHash, "shared catalog identity with Sales Movers");
-  // The returns traffic uses a different column/window set than Sales Movers traffic => distinct identity.
-  assert.notEqual(srcOf(retPlan, "returns-leakage:traffic").requestHash, sm.sources.find((s) => s.requestKey === "sales-movers:traffic").requestHash, "returns traffic is NOT shared with Sales Movers traffic");
+  // The returns ordered (Order Line Items) uses a different source/column/window set than Sales Movers traffic => distinct identity.
+  assert.notEqual(srcOf(retPlan, "returns-leakage:ordered").requestHash, sm.sources.find((s) => s.requestKey === "sales-movers:traffic").requestHash, "returns ordered is NOT shared with Sales Movers traffic");
 });
 
 test("24. one canonical export per shared catalog request_hash across Returns + Buy Box owners", async () => {

@@ -55,10 +55,33 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// Build Buy Box planned fragments + rows: four ordered daily slices under ONE request key, inventory, catalog.
-function bbPlanned({ slices = [[], [], [], []], inventory = [], catalog = [], ids = [ID] } = {}) {
+// Derive an Order Line Items ordered slice (grouped by sku|child_asin|item_price_currency, aggregations
+// sales_sum/units_sum) from a Profit-by-SKU daily fixture slice, so the joined ordered sales/units equal
+// the former daily sales/units and every existing fixture resolves unchanged. Sales/units now come from
+// buy-box-loss:ordered; the daily source supplies only buybox_percentage + page_views.
+const orderedFromDaily = (sliceRows) => {
+  const byKey = new Map();
+  for (const r of sliceRows || []) {
+    const sku = String(r.sku || "").trim();
+    if (!sku) continue;
+    const currency = r.currency ?? null;
+    const key = `${currency ?? "?"}|${sku}`;
+    let e = byKey.get(key);
+    if (!e) { e = { sku, child_asin: r.child_asin, item_price_currency: currency, sales_sum: 0, units_sum: 0 }; byKey.set(key, e); }
+    e.sales_sum += Number(r.total_sales || 0);
+    e.units_sum += Number(r.total_units_sold || 0);
+  }
+  return [...byKey.values()];
+};
+
+// Build Buy Box planned fragments + rows: four ordered daily buy-box slices + four matching ordered OLI
+// slices (each under ONE request key), inventory, catalog. The ordered slices default to being derived
+// from the daily slices (so sales/units resolve to the same totals) but may be supplied explicitly.
+function bbPlanned({ slices = [[], [], [], []], ordered = null, inventory = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
+  const orderedSlices = ordered || slices.map(orderedFromDaily);
   SLICES.forEach((w, i) => { const f = frag("buy-box-loss:daily", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = slices[i] || []; });
+  SLICES.forEach((w, i) => { const f = frag("buy-box-loss:ordered", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = orderedSlices[i] || []; });
   const inv = frag("buy-box-loss:inventory", INV_FROM, ASOF, ids); planned.push(inv); rows[inv.requestHash] = inventory;
   const cat = frag("buy-box-loss:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   return { planned, rows };
@@ -446,6 +469,7 @@ function makeDataDoe(opts = {}) {
     // Date each row INSIDE its own validated fragment window (each daily row in its 7-day slice via the
     // slice `from`; each inventory row on `to` = asOf, inside [asOf-10d, asOf]) so post-Blocker-1 row-date
     // validation accepts canonical rows.
+    if (rk.includes("ordered")) return [{ sku: "SKU-W", child_asin: "ASIN-W", item_price_currency: "USD", sales_sum: 200, units_sum: 20 }];
     if (rk.includes("daily")) return [daily(fp.from || "2025-08-05", "SKU-W", "ASIN-W", "Acme", "USD", 90, 200, 20, 150, "Widget W")];
     if (rk.includes("inventory")) return [invRow(fp.to || "2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12)];
     if (rk.includes("catalog")) return [{ child_asin: "ASIN-W", parent_asin: "P1", product_name: "Catalog W", product_brand: "AcmeCat" }];
@@ -555,7 +579,7 @@ test("26. partial invocation (maxJobs) resumes without a duplicate create-export
   const store = makeStore(); const dd = makeDataDoe();
   const plan = bbPlan();
   const jobs = jobsFromPlan(plan);
-  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 6 canonical jobs this invocation
+  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 10 canonical jobs this invocation
   assert.ok(r1.processed <= 2);
   const r2 = await runSrc(store, dd, jobs); // resume the rest
   assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after resume");
@@ -614,27 +638,30 @@ const resolveFromPlan = (plan) => () => ({
 });
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 
-test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly six canonical jobs with exact windows/deps/owner/context", () => {
+test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly ten canonical jobs with exact windows/deps/owner/context", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("buy-box-loss"), "buy-box-loss is a default generic report key");
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "buy-box-loss"), "DEFAULT plan includes buy-box-loss");
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "buy-box-loss");
-  // Exactly six canonical source jobs: four ordered daily slices + one inventory + one no-date catalog.
-  assert.equal(plan.sourceJobs.length, 6, "exactly six deduplicated canonical source jobs");
+  // Exactly ten canonical source jobs: four daily buy-box slices + four ordered OLI slices + one
+  // inventory + one no-date catalog.
+  assert.equal(plan.sourceJobs.length, 10, "exactly ten deduplicated canonical source jobs");
   const dailies = bb.sources.filter((s) => s.requestKey === "buy-box-loss:daily");
   assert.deepEqual(dailies.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day daily slice windows");
+  const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:ordered");
+  assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day OLI slice windows match the daily slices");
   const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
   assert.deepEqual([inv.from, inv.to], [INV_FROM, ASOF], "inventory window asOf-10d..asOf");
   const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
   assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
-  // Report dependency map = all six canonical hashes; context carries the raw seller id + asOf.
+  // Report dependency map = all ten canonical hashes; context carries the raw seller id + asOf.
   const rj = plan.reportJobs.find((j) => j.reportKey === "buy-box-loss");
-  assert.equal(rj.dependsOn.length, 6, "report depends on all six canonical sources");
-  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the six canonical hashes");
+  assert.equal(rj.dependsOn.length, 10, "report depends on all ten canonical sources");
+  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the ten canonical hashes");
   assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
   // Owner metadata: every planned source job is owned by the buy-box-loss owner, recomputed + validated.
   const jobs = resolveFromPlan(plan)().sourceJobs;
-  assert.equal(jobs.length, 6);
+  assert.equal(jobs.length, 10);
   assert.ok(jobs.every((j) => j.owner && j.owner.reportKey === "buy-box-loss" && j.owner.accountId === ID && j.owner.ownerId), "each job carries buy-box-loss owner metadata");
   assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
 });
@@ -644,15 +671,15 @@ test("C2. Buy Box stays PENDING until every required source succeeds, then the s
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, payload }); return { paramsHash: "ph" }; };
-  // Bounded first invocation: only some of the six sources succeed => the report is still PENDING.
+  // Bounded first invocation: only some of the ten sources succeed => the report is still PENDING.
   const r1 = await runGeneric(store, dd, plan, { maxJobs: 3 });
-  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 6, "not all sources succeeded yet");
+  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 10, "not all sources succeeded yet");
   let res = await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
   assert.equal(res.succeeded, 0, "report is PENDING while a required source is missing (no save)");
   assert.equal(saved.length, 0, "zero snapshot writes while pending");
   // Resume the generic driver to completion.
   const r2 = await runGeneric(store, dd, plan);
-  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all six sources succeeded after resume");
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all ten sources succeeded after resume");
   const realFetch = globalThis.fetch; let hits = 0;
   globalThis.fetch = () => { hits += 1; throw new Error("network during derivation"); };
   try { res = await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests }); } finally { globalThis.fetch = realFetch; }
@@ -720,7 +747,7 @@ test("C5. primary-only: a stale dd-secondary account is skipped read-only with Z
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
   assert.ok(jobs.every((j) => !String(j.request_key).includes(dash("dd", "secondary"))), "no dd-secondary source was ever staged");
   // Zero DataDoe create-exports carry the secondary account (it spent no token).
-  assert.equal(jobs.length, 6, "exactly the six primary-account canonical jobs ran");
+  assert.equal(jobs.length, 10, "exactly the ten primary-account canonical jobs ran");
 });
 
 async function main() {

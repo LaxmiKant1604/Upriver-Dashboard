@@ -246,8 +246,8 @@ test("SQL: claim_sync_cycle atomically moves pending -> running and stamps start
 test("api/datadoe.js declares the corrected source-id constants", () => {
   assert.ok(/ORDER_LINE_ITEMS_SOURCE_ID\s*=\s*"89b27535/.test(datadoeSrc));
   assert.ok(/PRODUCT_CATALOG_SOURCE_ID\s*=\s*"68d2de/.test(datadoeSrc));
-  assert.ok(/PLAN_SALES_SOURCE_ID\s*=\s*"401ffcd7e5"/.test(datadoeSrc), "FBA velocity = Sales & Traffic 401ffcd7e5");
-  assert.ok(/DAILY_SALES_SOURCE_ID\s*=\s*"401ffcd7e5"/.test(datadoeSrc));
+  assert.ok(/PLAN_SALES_SOURCE_ID\s*=\s*"89b27535/.test(datadoeSrc), "FBA velocity = Order Line Items 89b27535 (ordered quantity)");
+  assert.ok(/DAILY_SALES_SOURCE_ID\s*=\s*"89b27535/.test(datadoeSrc), "Daily Reporting sales = Order Line Items 89b27535");
 });
 
 test("buildBrandSalesPayload uses Order Line Items + Product Catalog, NOT Sales & Traffic", () => {

@@ -1239,13 +1239,13 @@ export function buildReturnsRows(data, selectedBrand) {
       // and calling it a loss would be an unsupported claim.
       const totalLeakage = (Number(row.refundedAmount) || 0) + (Number(row.returnFees) || 0);
 
-      const unitsShipped = Number(row.unitsShipped) || 0;
-      const unitsRefunded = Number(row.unitsRefunded) || 0;
-      // A window that catches returns of earlier sales can report more refunded
-      // units than shipped units. That is a lag artefact, not a >100% rate, so
+      const orderedUnits = Number(row.orderedUnits) || 0;
+      const returnedUnits = Number(row.returnedUnits) || 0;
+      // A window that catches returns of earlier orders can report more returned
+      // units than ordered units. That is a lag artefact, not a >100% rate, so
       // the rate is withheld and the row is ranked by money instead.
-      const lagInflated = unitsShipped > 0 && unitsRefunded > unitsShipped;
-      const returnRate = unitsShipped > 0 && !lagInflated ? (unitsRefunded / unitsShipped) * 100 : null;
+      const lagInflated = orderedUnits > 0 && returnedUnits > orderedUnits;
+      const returnRate = orderedUnits > 0 && !lagInflated ? (returnedUnits / orderedUnits) * 100 : null;
 
       const buckets = row.reasonBuckets || {};
       const bucketEntries = Object.entries(buckets).sort((a, b) => b[1] - a[1]);
@@ -1287,7 +1287,7 @@ export function buildReturnsInsights(data, rows) {
     let severity = severityFromExposure({ share, moneyAtRisk: row.totalLeakage });
     // A high return rate on a real volume is a product problem even when the
     // absolute money is mid-sized.
-    if (row.returnRate !== null && row.returnRate >= 15 && (row.unitsShipped || 0) >= 20 && severity === "low") {
+    if (row.returnRate !== null && row.returnRate >= 15 && (row.orderedUnits || 0) >= 20 && severity === "low") {
       severity = "medium";
     }
 
@@ -1311,7 +1311,7 @@ export function buildReturnsInsights(data, rows) {
         { label: "Seller-borne return fees", value: Number(row.returnFees || 0).toFixed(2) },
         { label: "Returned items", value: row.returnCount || 0 },
         { label: "Refunded units (settled)", value: Math.round(Number(row.refundedUnitsSettled) || 0) },
-        { label: "Units shipped in window", value: row.unitsShipped === null ? null : Math.round(row.unitsShipped) },
+        { label: "Units ordered in window", value: row.orderedUnits === null ? null : Math.round(row.orderedUnits) },
         { label: "Return rate", value: row.returnRate === null ? (row.lagInflated ? "withheld — lag artefact" : null) : `${row.returnRate.toFixed(1)}%` },
         { label: "Top reason", value: row.topReasons?.[0] ? `${row.topReasons[0].reason} (${row.topReasons[0].count})` : null },
         { label: "Fixable share of returns", value: row.actionableShare === null ? null : `${row.actionableShare.toFixed(0)}%` },

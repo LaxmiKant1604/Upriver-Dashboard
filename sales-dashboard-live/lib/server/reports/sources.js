@@ -42,6 +42,10 @@ export const ORDER_LINE_ITEMS = {
   id: "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778",
   table: "amazon_order_items_with_cogs",
   label: "Order Line Items",
+  // Near-real-time ordered sales (delayed about an hour), so effectively no
+  // multi-day reporting lag. This is the canonical sales/ordered-units source for
+  // daily-reporting, fba-plan, buy-box-loss, returns-leakage and ppc-performance.
+  lagDays: 0,
 };
 
 // Settlements & P&L Components. defaultDataset. INITIAL 730 days,
