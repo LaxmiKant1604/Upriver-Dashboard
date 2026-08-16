@@ -26,6 +26,7 @@ let runPpcShadowCycle, loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySi
 let validatePpcSourceCoverage, evaluateSourceCoverage;
 let ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES;
 let buildPpcPerformance, ORDER_LINE_ITEMS;
+let adsCurrencySignal, evaluateAdsCurrencyGate;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -37,6 +38,7 @@ const CONNS = [
 const ORIGIN = "Persisted Supabase Amazon Ads history maintained by the scheduled worker";
 const TS_LABEL = "Order Line Items";
 const MULTI_CCY = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
+const MISMATCH_CCY = "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
 const DEGRADED = "TACoS is unavailable because the account total-sales export for the denominator did not complete this cycle; every other PPC figure is still current.";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
 const KEYS = { campaign: "campaign-performance-v1", asin: "asin-performance-v1", targeting: "keyword-targeting-performance-v1", search: "search-terms-performance-v1" };
@@ -984,6 +986,116 @@ test("47. Blocker 1 (LIVE/manual buildPpcPerformance): zero OLI total-sales expo
   }
 });
 
+group("ppc usd/USD consistency: planner / live / derive / pure fold ALL agree on the canonical currency");
+
+// A REAL buildPpcPerformance run through the injected DI seam only (no network/DB): sync states [], catalog [],
+// Ads rows = `adsRows`, and fetchExportRowsStrict a SPY that counts OLI total-sales export calls and returns
+// `oliRows` on the FIRST OLI call (then [] so a multi-slice window never double-counts the same fixture rows).
+const liveRun = async (adsRows, oliRows = []) => {
+  let oliCalls = 0;
+  const payload = await buildPpcPerformance({ apiKey: dash("test", "key"), ids: [ID], to: ASOF }, {
+    getAdsSyncStates: async () => [],
+    fetchCatalog: async () => [],
+    getAdsDailySourceRows: async () => adsRows,
+    fetchExportRowsStrict: async (_apiKey, sourceId) => {
+      if (sourceId !== ORDER_LINE_ITEMS.id) return [];
+      oliCalls += 1;
+      return oliCalls === 1 ? oliRows : [];
+    },
+  });
+  return { oliCalls, payload };
+};
+
+test("48. usd + USD Ads canonicalize to ONE currency identity: payload.currencies == ['USD'], a campaign in BOTH usd+USD rows folds to ONE row, OLI runs, TACoS computes (live + pure)", async () => {
+  // Two campaign rows for the SAME campaign id/type, one currency "usd" and one "USD". A raw case-sensitive Set
+  // treated these as TWO currencies (["USD","usd"]) and split the campaign into two buckets; canonicalizing the
+  // rollup key AND the payload `currencies` collapses them into ONE money identity.
+  const rows = [
+    cmp("2025-08-01", "C1", "SP", { spend: 10, sales: 40, clicks: 100, impr: 1000, orders: 5, units: 6, currency: "usd" }, { ad_campaign_name: "Camp 1" }),
+    cmp("2025-08-02", "C1", "SP", { spend: 5, sales: 20, clicks: 50, impr: 500, orders: 2, units: 3, currency: "USD" }, { ad_campaign_name: "Camp 1" }),
+  ];
+  const oliUsd = [ts("2025-08-01", 700, 70)]; // one USD OLI total-sales row => the denominator matches
+
+  // LIVE builder via the DI seam (offline): OLI rows are USD, so the gate OPENS and TACoS computes.
+  const { oliCalls, payload: live } = await liveRun(rows, oliUsd);
+  assert.deepEqual(live.currencies, ["USD"], "usd + USD => ONE canonical currency identity ['USD'] (never ['USD','usd'])");
+  assert.equal(live.campaigns.length, 1, "the SAME campaign in usd + USD rows folds to ONE row (canonical rollup key)");
+  assert.deepEqual(live.campaigns[0].currencies, ["USD"], "the folded campaign carries ONE canonical currency");
+  assert.equal(live.campaigns[0].spend, 15, "both usd + USD rows sum into the ONE canonical bucket (10 + 5)");
+  assert.ok(oliCalls >= 1, "single canonical currency OPENS the OLI total-sales gate (>= 1 OLI call)");
+  assert.equal(live.totalSales, 700, "TACoS computes: USD OLI total-sales summed against the canonical USD Ads currency");
+  assert.equal(live.totalSalesUnavailable, null, "TACoS available for usd + USD");
+
+  // PURE fold agrees byte-for-byte on the canonicalization + the sum.
+  const pure = directPpcPayload([], { adsRows: rows, totalSalesRows: oliUsd });
+  assert.deepEqual(pure.currencies, ["USD"], "pure fold: usd + USD => ['USD']");
+  assert.equal(pure.campaigns.length, 1, "pure fold folds the campaign to ONE row");
+  assert.equal(pure.totalSales, 700, "pure fold TACoS computes");
+});
+
+test("49. usd + USD AGREEMENT: signal.state, the planner gate, the live builder, and the derive/pure fold ALL treat usd+USD as ONE single-valid currency", async () => {
+  const rows = [
+    cmp("2025-08-01", "C1", "SP", { spend: 10, sales: 40, clicks: 100, impr: 1000, orders: 5, units: 6, currency: "usd" }, { ad_campaign_name: "Camp 1" }),
+    cmp("2025-08-02", "C1", "SP", { spend: 5, sales: 20, clicks: 50, impr: 500, orders: 2, units: 3, currency: "USD" }, { ad_campaign_name: "Camp 1" }),
+  ];
+  // 1) The SIGNAL the planner keys on.
+  const signal = adsCurrencySignal(rows);
+  assert.equal(signal.state, "single-valid", "signal: usd + USD => single-valid");
+  assert.equal(signal.currencyCount, 1, "signal: ONE distinct canonical currency");
+  // 2) The PLANNER gate => schedules the OLI total-sales export.
+  assert.equal(evaluateAdsCurrencyGate(signal), true, "planner gate opens => OLI total-sales scheduled");
+  // 3) The LIVE builder => the OLI export actually runs; NEVER multi-currency.
+  const { oliCalls, payload: live } = await liveRun(rows, []);
+  assert.ok(oliCalls >= 1, "live builder runs the OLI export for the single canonical currency");
+  assert.notEqual(live.totalSalesUnavailable, MULTI_CCY, "live builder NEVER reports multi-currency for usd + USD");
+  // 4) The DERIVE adapter + pure fold => NOT multi-currency; reads OLI + sums (canonical currencies).
+  const derived = derivePpc(ppcPlanned({ catalog: CATALOG(), totalSales: TOTAL_SALES() }), okAds(rows)).payload;
+  assert.equal(derived.totalSalesUnavailable, null, "derive: usd + USD is NOT multi-currency; TACoS computes");
+  assert.equal(derived.totalSales, 800, "derive TACoS sums the USD OLI total-sales denominator");
+  assert.deepEqual(derived.currencies, ["USD"], "derive payload currencies canonicalized to ['USD']");
+});
+
+test("50. USD + EUR => state 'multiple' => ZERO OLI calls AND the EXACT multi-currency reason, in the LIVE builder AND the derive", async () => {
+  // LIVE: two distinct valid canonical currencies => the gate withholds BEFORE any OLI fetch.
+  const { oliCalls, payload: live } = await liveRun([
+    cmp("2025-08-01", "C1", "SP", { spend: 10, sales: 40, clicks: 100, impr: 1000, orders: 5, units: 6, currency: "USD" }, {}),
+    cmp("2025-08-01", "C2", "SP", { spend: 3, sales: 9, clicks: 12, impr: 90, orders: 1, units: 1, currency: "EUR" }, {}),
+  ], [ts("2025-08-01", 500, 50)]);
+  assert.equal(oliCalls, 0, "multiple currencies => ZERO OLI total-sales export calls (gated BEFORE any fetch)");
+  assert.equal(live.totalSales, null, "TACoS unavailable for multiple currencies");
+  assert.equal(live.totalSalesUnavailable, MULTI_CCY, "LIVE: the EXACT multi-currency reason");
+  assert.deepEqual(live.currencies, ["EUR", "USD"], "both distinct currencies present, canonical");
+
+  // DERIVE: the same evidence-state decision + the same exact reason (the planner already spent the OLI; the
+  // derive must NOT re-report a raw case-sensitive count and throw the export away).
+  const eurRows = [...ADS_ROWS(), cmp("2025-08-03", "C9", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1, currency: "EUR" }, { ad_campaign_name: "Camp 9" })];
+  const derived = derivePpc(ppcPlanned({ catalog: CATALOG(), totalSales: TOTAL_SALES() }), okAds(eurRows)).payload;
+  assert.equal(derived.totalSales, null, "derive TACoS unavailable for multiple currencies");
+  assert.equal(derived.totalSalesUnavailable, MULTI_CCY, "DERIVE: the EXACT multi-currency reason");
+  assert.deepEqual(derived.currencies, ["EUR", "USD"]);
+});
+
+test("51. USD + blank AND USD + 'US D' => state 'invalid' => ZERO OLI calls AND the EXACT currency-mismatch reason, in the LIVE builder AND the derive", async () => {
+  for (const [label, bad] of [["blank", ""], ["malformed 'US D'", "US D"]]) {
+    // LIVE: a blank/malformed Ads currency fails closed BEFORE any OLI fetch (cmp's `|| "USD"` fallback is
+    // overridden so the row genuinely carries the blank/malformed currency under test).
+    const badLive = { ...cmp("2025-08-01", "C2", "SP", { spend: 3, sales: 9, clicks: 12, impr: 90, orders: 1, units: 1 }, {}), currency: bad };
+    const { oliCalls, payload: live } = await liveRun([
+      cmp("2025-08-01", "C1", "SP", { spend: 10, sales: 40, clicks: 100, impr: 1000, orders: 5, units: 6, currency: "USD" }, {}),
+      badLive,
+    ], [ts("2025-08-01", 500, 50)]);
+    assert.equal(oliCalls, 0, "USD + " + label + " => ZERO OLI total-sales export calls (gated BEFORE any fetch)");
+    assert.equal(live.totalSales, null, "USD + " + label + " => TACoS unavailable");
+    assert.equal(live.totalSalesUnavailable, MISMATCH_CCY, "LIVE USD + " + label + ": the EXACT currency-mismatch reason");
+
+    // DERIVE: the same invalid-state decision + the same exact reason; NO OLI processing.
+    const badRows = [...ADS_ROWS(), { ...cmp("2025-08-03", "C8", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1 }, {}), currency: bad }];
+    const derived = derivePpc(ppcPlanned({ catalog: CATALOG(), totalSales: TOTAL_SALES() }), okAds(badRows)).payload;
+    assert.equal(derived.totalSales, null, "DERIVE USD + " + label + " => TACoS unavailable");
+    assert.equal(derived.totalSalesUnavailable, MISMATCH_CCY, "DERIVE USD + " + label + ": the EXACT currency-mismatch reason");
+  }
+});
+
 async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ buildPpcPerformance } = await import("../lib/server/reports/ppc.js"));
@@ -997,6 +1109,8 @@ async function main() {
   ({ loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader, validatePpcSourceCoverage, evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
   ({ ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES } = await import("../lib/server/reports/derivation-core.js"));
   ({ addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
+  ({ adsCurrencySignal } = await import("../lib/server/sync/source-signals.js"));
+  ({ evaluateAdsCurrencyGate } = await import("../lib/server/sync/report-source-contracts.js"));
   FROM = addDaysStr(ASOF, -29);
 
   let failures = 0;

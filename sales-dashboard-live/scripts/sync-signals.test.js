@@ -301,6 +301,12 @@ test("dependency signals are derived ONLY from validated saved results", async (
   assert.deepEqual(adsCurrencySignal([{ currency: "CAD" }, { currency: "USD" }]), { status: "success", validated: true, currencyCount: 2, state: "multiple" }, "two distinct valid currencies => multiple (gate fails)");
   assert.deepEqual(adsCurrencySignal([]), { status: "success", validated: true, currencyCount: 0, state: "empty" }, "no ads rows => empty (gate fails; NOT single-valid)");
   assert.deepEqual(adsCurrencySignal(null), { status: "failed", validated: false, currencyCount: 0, state: "invalid" }, "non-array => failed + invalid (fail closed)");
+  // usd/USD consistency: the planner gate keys on `state`, so the usd+USD single-valid signal SCHEDULES the OLI
+  // total-sales export EXACTLY as a clean single currency would, while multiple/invalid fail closed. This is the
+  // planner half of the planner/live/derive/pure agreement that usd == USD (one canonical currency, one decision).
+  assert.equal(evaluateAdsCurrencyGate(adsCurrencySignal([{ currency: "usd" }, { currency: "USD" }])), true, "planner gate SCHEDULES total-sales for a usd+USD single canonical currency");
+  assert.equal(evaluateAdsCurrencyGate(adsCurrencySignal([{ currency: "USD" }, { currency: "EUR" }])), false, "planner gate withholds total-sales for USD+EUR (multiple)");
+  assert.equal(evaluateAdsCurrencyGate(adsCurrencySignal([{ currency: "USD" }, { currency: "" }])), false, "planner gate withholds total-sales for USD+blank (invalid)");
   assert.deepEqual(salesMoversProbeSignal({ status: "success", validated: true, rows: [{ date: "2025-07-30", units_sum: 2 }, { date: "2025-07-28", units_sum: 9 }] }), { status: "success", validated: true, latestReportedDate: "2025-07-30" });
 });
 

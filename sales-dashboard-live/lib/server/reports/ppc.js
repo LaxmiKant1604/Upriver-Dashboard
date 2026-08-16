@@ -55,6 +55,11 @@ const OLI_SALES_AGGREGATIONS = [
 // rows carry a different currency (or mix), TACoS degrades rather than summing across them.
 const TOTAL_SALES_CURRENCY_MISMATCH_REASON =
   "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
+// More than ONE distinct VALID canonical Ads currency: a combined total-sales denominator across two live
+// currencies would be meaningless. Named as a const (kept byte-identical to report-derivation.js's
+// PPC_MULTI_CURRENCY_REASON) so this string can never drift between the live builder and the scheduler derive.
+const PPC_MULTI_CURRENCY_REASON =
+  "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
 
 function metric(row, key) {
   return num(row.metrics?.[key]);
@@ -88,7 +93,7 @@ export function rollupPpcRows(rows, keyFn, labelFn, { salesKey, ordersKey, units
     // A campaign, target, or search term can only be summed with rows in the
     // same currency. Including currency in the storage key prevents a
     // multi-marketplace account from displaying INR + USD as one amount.
-    const currency = String(row.currency || "").trim() || null;
+    const currency = canonicalCurrency(row.currency);
     const key = `${currency || "?"}|${entityKey}`;
     let entry = byKey.get(key);
     if (!entry) {
@@ -216,7 +221,7 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
   for (const row of campaignRows) {
     const date = row.metric_date;
     if (!date) continue;
-    const currency = String(row.currency || "").trim() || null;
+    const currency = canonicalCurrency(row.currency);
     const key = `${date}|${currency || "?"}`;
     const entry = dailyMap.get(key) || { date, currency, ...emptyTotals() };
     accumulate(entry, row, "ad_sales", "ad_orders", "ad_units_sold");
@@ -226,53 +231,59 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
 
   // TACoS needs total account sales, which no Ads table carries. One small
   // grouped export, on explicit refresh only, saved into the shared snapshot.
-  const currencies = [...new Set(adsRows.map((row) => row.currency).filter(Boolean))].sort();
+  //
+  // usd/USD consistency: CLASSIFY the Ads currency evidence ONCE, up front, via the SHARED canonical
+  // adsCurrencyEvidence -- the SAME 4-state classifier the scheduler planner gate (evaluateAdsCurrencyGate),
+  // the pure ppcPerformancePayload fold, and the derive adapter use -- so "usd" + "USD" canonicalize to ONE
+  // currency (state "single-valid") HERE exactly as they do in the planner, instead of a raw case-sensitive
+  // Set counting them as two and skipping the OLI slices the planner already scheduled. This gate is entered
+  // BEFORE any canonicalOliSlices/fetchExportRowsStrict call, so the non-single-valid states make ZERO OLI calls.
+  const adsEvidence = adsCurrencyEvidence(adsRows);
+  // Payload currency identities are canonicalized too, so "usd" + "USD" collapse to ["USD"] (never ["USD","usd"])
+  // and the UI's multi-currency KPI suppression no longer false-positives on mere casing.
+  const currencies = [...new Set(adsRows.map((row) => canonicalCurrency(row.currency)).filter(Boolean))].sort();
   let totalSales = null;
   let totalSalesUnavailable = null;
-  if (currencies.length > 1) {
-    totalSalesUnavailable = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
+  if (adsEvidence.state === "multiple") {
+    // > 1 distinct VALID canonical Ads currency: a combined denominator is meaningless. ZERO OLI calls.
+    totalSalesUnavailable = PPC_MULTI_CURRENCY_REASON;
+  } else if (adsEvidence.state !== "single-valid") {
+    // "empty" (no Ads rows) or "invalid" (any blank/absent/malformed like "US D"): fail closed BEFORE spending
+    // any OLI export -- the fetch loop is NEVER entered, exactly ZERO fetchExportRowsStrict calls.
+    totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
   } else {
-    // Blocker 1 (transport ordering): CLASSIFY the Ads currency BEFORE spending any OLI export. TACoS is
-    // available ONLY when the persisted Ads rows carry a SINGLE VALID canonical currency (adsCurrencyEvidence
-    // state "single-valid"). Any empty / all-blank / valid+blank / malformed ("US D") Ads currency fails
-    // closed HERE and the OLI total-sales fetch loop is NEVER entered -- exactly ZERO fetchExportRowsStrict
-    // calls. (The outer >1-currency branch above already handles the multiple-currency case, unchanged.)
-    const adsEvidence = adsCurrencyEvidence(adsRows);
-    const adsCurrency = adsEvidence.state === "single-valid" ? adsEvidence.currency : null;
-    if (!adsCurrency) {
-      totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
-    } else {
-      try {
-        // The ONE canonical OLI sales fragment over [from, to], sliced by canonicalOliSlices so its interior +
-        // asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
-        const salesRows = [];
-        for (const slice of canonicalOliSlices(from, to)) {
-          const sliceRows = await fetchExportRowsStrictFn(
-            apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
-            {
-              groupBy: OLI_SALES_GROUP_BY,
-              aggregations: OLI_SALES_AGGREGATIONS,
-              orderByColumn: "date",
-              orderByDirection: "ASC",
-            },
-            `PPC total-sales export (${slice.from} to ${slice.to})`
-          );
-          for (const row of sliceRows) salesRows.push(row);
-        }
-        // The Ads currency is now a proven single valid canonical code: TACoS sums ONLY when every OLI
-        // total-sales row's canonicalCurrency(item_price_currency) is non-null AND EQUAL to it. Any
-        // missing/blank/malformed/mismatched OLI currency leaves TACoS unavailable and NO row is summed
-        // (never sum a currencyless/ambiguous row into a currency denominator).
-        if (!salesRows.every((row) => canonicalCurrency(row.item_price_currency) === adsCurrency)) {
-          totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
-        } else {
-          totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "total_sales_sum", "item_price_value"), 0);
-        }
-      } catch (error) {
-        // TACoS is the only metric that needs this. Losing it must not lose the
-        // whole report, so it degrades to "unavailable" rather than throwing.
-        totalSalesUnavailable = error instanceof Error ? error.message : String(error);
+    // state "single-valid": the persisted Ads rows carry ONE proven canonical currency. Enter the OLI loop.
+    const adsCurrency = adsEvidence.currency;
+    try {
+      // The ONE canonical OLI sales fragment over [from, to], sliced by canonicalOliSlices so its interior +
+      // asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
+      const salesRows = [];
+      for (const slice of canonicalOliSlices(from, to)) {
+        const sliceRows = await fetchExportRowsStrictFn(
+          apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
+          {
+            groupBy: OLI_SALES_GROUP_BY,
+            aggregations: OLI_SALES_AGGREGATIONS,
+            orderByColumn: "date",
+            orderByDirection: "ASC",
+          },
+          `PPC total-sales export (${slice.from} to ${slice.to})`
+        );
+        for (const row of sliceRows) salesRows.push(row);
       }
+      // The Ads currency is now a proven single valid canonical code: TACoS sums ONLY when every OLI
+      // total-sales row's canonicalCurrency(item_price_currency) is non-null AND EQUAL to it. Any
+      // missing/blank/malformed/mismatched OLI currency leaves TACoS unavailable and NO row is summed
+      // (never sum a currencyless/ambiguous row into a currency denominator).
+      if (!salesRows.every((row) => canonicalCurrency(row.item_price_currency) === adsCurrency)) {
+        totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+      } else {
+        totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "total_sales_sum", "item_price_value"), 0);
+      }
+    } catch (error) {
+      // TACoS is the only metric that needs this. Losing it must not lose the
+      // whole report, so it degrades to "unavailable" rather than throwing.
+      totalSalesUnavailable = error instanceof Error ? error.message : String(error);
     }
   }
 

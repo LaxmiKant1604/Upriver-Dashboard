@@ -1733,7 +1733,7 @@ export function rollupPpcRows(rows, keyFn, labelFn, { salesKey, ordersKey, units
   for (const row of Array.isArray(rows) ? rows : []) {
     const entityKey = keyFn(row);
     if (entityKey === null || entityKey === undefined || entityKey === "") continue;
-    const currency = String(row.currency || "").trim() || null;
+    const currency = canonicalCurrency(row.currency);
     const key = `${currency || "?"}|${entityKey}`;
     let entry = byKey.get(key);
     if (!entry) {
@@ -1807,7 +1807,7 @@ export function ppcDailySeries(campaignRows) {
   for (const row of Array.isArray(campaignRows) ? campaignRows : []) {
     const date = row.metric_date;
     if (!date) continue;
-    const currency = String(row.currency || "").trim() || null;
+    const currency = canonicalCurrency(row.currency);
     const key = `${date}|${currency || "?"}`;
     const entry = dailyMap.get(key) || { date, currency, ...ppcEmptyTotals() };
     ppcAccumulate(entry, row, "ad_sales", "ad_orders", "ad_units_sold");
@@ -1863,7 +1863,10 @@ export function ppcPerformancePayload({
   const searchTerms = ppcSearchTerms(searchTermRows);
   const daily = ppcDailySeries(campaignRows);
 
-  const currencies = [...new Set(rows.map((row) => row.currency).filter(Boolean))].sort();
+  // Canonicalized currency identities: "usd" + "USD" collapse to ["USD"] (never ["USD","usd"]), byte-equivalent
+  // to buildPpcPerformance()'s payload `currencies`, so the UI's multi-currency KPI suppression never
+  // false-positives on mere casing and the two builders stay parity-equal.
+  const currencies = [...new Set(rows.map((row) => canonicalCurrency(row.currency)).filter(Boolean))].sort();
 
   let totalSales = null;
   let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;

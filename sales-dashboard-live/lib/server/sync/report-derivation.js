@@ -56,6 +56,10 @@ import { planMonthWindows, addDaysStr, splitDateRangeByDays, splitDateRangeByMon
 // PURE typed PPC coverage contract (server-only loader, no transport import): re-enforced here so the derive
 // never folds/saves a PPC snapshot on an injected context that lacks or contradicts the durable-coverage gate.
 import { validatePpcSourceCoverage } from "./ppc-ads-loader.js";
+// PURE dependency-free leaf (safe here -- pulls no transport into the derivation graph): the SHARED 4-state
+// Ads-currency classifier, so the derive adapter interprets "usd" + "USD" as ONE currency exactly as the
+// planner gate, the live buildPpcPerformance, and the pure ppcPerformancePayload fold do.
+import { adsCurrencyEvidence } from "../currency.js";
 
 // FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
 // constant. The derivation RECOMPUTES the expected inventory start as addDaysStr(asOf, -10) and pins
@@ -127,6 +131,10 @@ const PPC_TOTAL_SALES_LABEL = "Order Line Items";
 const PPC_TOTAL_SALES_LAG_DAYS = 0;
 const PPC_MULTI_CURRENCY_REASON = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
 const PPC_TOTAL_SALES_DEGRADED_REASON = "TACoS is unavailable because the account total-sales export for the denominator did not complete this cycle; every other PPC figure is still current.";
+// Ads currency is empty / all-blank / malformed ("US D") -> total-sales cannot share the Ads currency. Copied
+// VERBATIM from lib/server/reports/derivation-core.js's PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON so the derive's
+// reason for the "empty"/"invalid" states matches the live builder AND the pure fold byte-for-byte.
+const PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON = "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
 const PPC_ADS_SOURCE_DESCRIPTORS = Object.freeze([
   { syncKey: "campaign-performance-v1", label: "Ad Performance by Campaign & Date", coverage: "All campaign types present in the account", defaultDataset: true },
   { syncKey: "asin-performance-v1", label: "Ad Performance by ASIN & Date", coverage: "Same-SKU attributed metrics", defaultDataset: true },
@@ -1098,15 +1106,22 @@ const REGISTRY = {
       }
       const catalogRows = noDateFragmentRows(catalogSource, "ppc-performance:catalog", rawSellerId);
       assertPlainObjectRows(catalogRows, "ppc-performance catalog");
-      // TACoS denominator state (total-sales is OPTIONAL and its failure degrades ONLY TACoS):
-      //   > 1 Ads currency  -> not planned; the exact multi-currency explanation.
-      //   <= 1 currency, total-sales succeeded -> sum the validated saved rows.
-      //   <= 1 currency, total-sales missing/failed/degraded/malformed/wrong-window -> safe degraded reason.
-      const currencyCount = new Set(ppcAds.adsRows.map((r) => String((r && r.currency) || "").trim()).filter(Boolean)).size;
+      // TACoS denominator state (total-sales is OPTIONAL and its failure degrades ONLY TACoS). Classify the Ads
+      // currency evidence with the SHARED canonical adsCurrencyEvidence -- the SAME 4-state classifier the planner
+      // gate (evaluateAdsCurrencyGate), the live buildPpcPerformance, and the pure ppcPerformancePayload fold use --
+      // so "usd" + "USD" canonicalize to ONE currency ("single-valid") here EXACTLY as in the planner. (A raw
+      // case-sensitive Set counted usd/USD as two and reported "multiple" AFTER the planner had already spent the
+      // OLI slices, so planner / live / derive disagreed.) States, with reasons byte-identical to the live builder:
+      //   "multiple"          -> combined denominator meaningless; the exact multi-currency explanation; NO ts read.
+      //   "empty" | "invalid" -> Ads currency missing/blank/malformed; the exact currency-mismatch reason; NO ts read.
+      //   "single-valid"      -> read + validate the saved OLI total-sales rows; the pure fold re-checks + sums them.
+      const adsEvidence = adsCurrencyEvidence(ppcAds.adsRows);
       let totalSalesRows = null;
       let totalSalesUnavailable = null;
-      if (currencyCount > 1) {
+      if (adsEvidence.state === "multiple") {
         totalSalesUnavailable = PPC_MULTI_CURRENCY_REASON;
+      } else if (adsEvidence.state !== "single-valid") {
+        totalSalesUnavailable = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
       } else {
         try {
           const ts = sources["ppc-performance:oli-sales"];

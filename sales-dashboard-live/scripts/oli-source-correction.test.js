@@ -213,6 +213,22 @@ test("(d) PPC TACoS DEGRADES (never sums across currencies) when OLI sales are a
   assert.ok(/different currency/i.test(blank.totalSalesUnavailable));
 });
 
+test("(d) PPC TACoS treats mixed-case Ads currency usd + USD as ONE canonical currency: the campaign folds to one row, currencies == ['USD'], OLI sums", () => {
+  // usd/USD consistency: a raw case-sensitive Set once read ["USD","usd"] (two currencies) -- which BOTH split the
+  // campaign into two buckets AND flipped TACoS to a multi-currency withhold. Canonicalizing the rollup key + the
+  // payload `currencies` collapses usd and USD into ONE money identity, so the OLI denominator sums as expected.
+  const usdUsdAds = [
+    { source_key: "campaign", metric_date: "2025-08-01", campaign_id: "C1", campaign_type: "SP", currency: "usd", dimensions: { ad_campaign_name: "C1" }, metrics: { ad_spend: 10, ad_sales: 20, ad_clicks: 5 } },
+    { source_key: "campaign", metric_date: "2025-08-02", campaign_id: "C1", campaign_type: "SP", currency: "USD", dimensions: { ad_campaign_name: "C1" }, metrics: { ad_spend: 4, ad_sales: 8, ad_clicks: 2 } },
+  ];
+  const p = ppcCall({ adsRows: usdUsdAds, totalSalesRows: [{ date: "2025-08-01", item_price_currency: "USD", total_sales_sum: 500 }] });
+  assert.deepEqual(p.currencies, ["USD"], "usd + USD => ONE canonical currency ['USD'] (never ['USD','usd'])");
+  assert.equal(p.campaigns.length, 1, "the same campaign in usd + USD rows folds to ONE row");
+  assert.equal(p.campaigns[0].spend, 14, "both usd + USD rows sum into the ONE canonical bucket (10 + 4)");
+  assert.equal(p.totalSales, 500, "OLI total-sales sums against the canonical USD Ads currency (never multi-currency)");
+  assert.equal(p.totalSalesUnavailable, null);
+});
+
 /* ---------------------- (h) cross-currency is fail-closed (never merged) across the OLI reports ---------------------- */
 
 test("(h) daily reporting NEVER merges two currencies for one (date, seller) -> separate rows", () => {
