@@ -1274,6 +1274,30 @@ export function buildReturnsRows(data, selectedBrand) {
     });
 }
 
+// Blocker 3: the portfolio return rate is a PROVEN rate. Numerator AND denominator sum ONLY over rows whose
+// returnedUnits is KNOWN (non-null). A withheld-returnedUnits row (a currency-ambiguous ASIN) is EXCLUDED
+// from BOTH -- its ordered units must NOT sit in the denominator, which would understate the rate. When any
+// such withheld row also carries ordered units (so it WOULD have contributed to the denominator), the KPI is
+// a PROVEN PARTIAL rate: ratePartial=true, so the UI marks it "partial" rather than presenting an understated
+// complete rate. rate is null when no proven ordered units exist.
+export function returnsPortfolioRate(rows) {
+  let provenReturned = 0;
+  let provenOrdered = 0;
+  let ratePartial = false;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row.returnedUnits === null || row.returnedUnits === undefined) {
+      if ((Number(row.orderedUnits) || 0) > 0) ratePartial = true;
+      continue;
+    }
+    provenReturned += Number(row.returnedUnits) || 0;
+    provenOrdered += Number(row.orderedUnits) || 0;
+  }
+  return {
+    rate: provenOrdered > 0 ? (provenReturned / provenOrdered) * 100 : null,
+    ratePartial,
+  };
+}
+
 export function buildReturnsInsights(data, rows) {
   if (!data) return [];
   const freshness = freshnessNote({

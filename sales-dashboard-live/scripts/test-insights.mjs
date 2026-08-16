@@ -29,6 +29,7 @@ import {
   optimizerQueryMetrics,
   buildReturnsInsights,
   buildReturnsRows,
+  returnsPortfolioRate,
   ppcMetrics,
   salesMoversCompletenessWarning,
   sortInsights,
@@ -483,6 +484,27 @@ test("a return rate above 100% is withheld as a lag artefact", () => {
   assert.equal(byAsin.R100.returnRate, (20 / 150) * 100);
   assert.equal(byAsin.R200.lagInflated, true);
   assert.equal(byAsin.R200.returnRate, null, "must not report a rate above 100%");
+});
+
+test("Blocker 3: the portfolio return rate is a PROVEN PARTIAL over rows with known returned units, never an understated complete rate", () => {
+  // A currency-ambiguous ASIN (M) spans USD + CAD, so its returnedUnits are WITHHELD (null) on BOTH rows.
+  // A single-currency ASIN (S) has a known count. The proven rate must divide S's returned units by S's
+  // ordered units ONLY -- M's ordered units (which have no proven numerator) must NOT sit in the denominator.
+  const data = {
+    ...returnsData,
+    currencies: ["CAD", "USD"],
+    rows: [
+      { asin: "M", sku: "SKU-M", skuCount: 1, productName: "Multi", brand: "Alpha", currency: "USD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 0, returnFees: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, orderedUnits: 30, returnedUnits: null, sales: 300, hasOrdered: true },
+      { asin: "M", sku: "SKU-M", skuCount: 1, productName: "Multi", brand: "Alpha", currency: "CAD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 0, returnFees: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, orderedUnits: 20, returnedUnits: null, sales: 200, hasOrdered: true },
+      { asin: "S", sku: "SKU-S", skuCount: 1, productName: "Single", brand: "Alpha", currency: "USD", returnCount: 2, fbaReturns: 2, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: { product_quality: 2 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }], refundedAmount: 40, returnFees: 5, cogsOnRefundedUnits: 0, refundedUnitsSettled: 2, refundEvents: 2, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: 20, returnedUnits: 2, sales: 200, hasOrdered: true },
+    ],
+  };
+  const rows = buildReturnsRows(data, "ALL");
+  const { rate, ratePartial } = returnsPortfolioRate(rows);
+  assert.equal(rate, (2 / 20) * 100, "proven rate = S returned / S ordered = 10% (M's ordered units excluded)");
+  assert.equal(ratePartial, true, "the KPI is a proven PARTIAL because a withheld ASIN carries ordered units");
+  // The understated 'complete' rate would spread S's 2 returns over ALL 70 ordered units (2/70 ≈ 2.86%).
+  assert.notEqual(rate, (2 / 70) * 100, "never the understated complete rate that includes withheld rows' ordered units");
 });
 
 test("a return cause is only named when one bucket is at least half the returns", () => {

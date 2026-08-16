@@ -9,6 +9,7 @@ import {
   buildReturnsInsights,
   buildReturnsRows,
   insightExportRows,
+  returnsPortfolioRate,
 } from "../lib/insights.js";
 import { downloadCsv, reportFilename } from "../lib/csv.js";
 import { fmtDateHuman, fmtMoney, fmtRate, nInt } from "../lib/format.js";
@@ -62,16 +63,18 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
   const totals = useMemo(() => {
     const leakage = rows.reduce((sum, row) => sum + row.totalLeakage, 0);
     const returned = rows.reduce((sum, row) => sum + (row.returnCount || 0), 0);
-    const ordered = rows.reduce((sum, row) => sum + (Number(row.orderedUnits) || 0), 0);
-    const returnedUnits = rows.reduce((sum, row) => sum + (Number(row.returnedUnits) || 0), 0);
     const actionable = rows.reduce((sum, row) => sum + (row.actionableCount || 0), 0);
+    // A portfolio return rate is a PROVEN rate recomputed from the summed units of ONLY the rows whose
+    // returned units are known — never averaged from per-product rates, and never diluted by a
+    // currency-ambiguous ASIN's ordered units (which would understate it). When such a withheld row carries
+    // ordered units, ratePartial marks the KPI as a proven partial.
+    const { rate, ratePartial } = returnsPortfolioRate(rows);
     return {
       leakage,
       returned,
       cogs: rows.reduce((sum, row) => sum + (Number(row.cogsOnRefundedUnits) || 0), 0),
-      // A portfolio return rate is recomputed from the summed units, never
-      // averaged from the per-product rates.
-      rate: ordered > 0 ? (returnedUnits / ordered) * 100 : null,
+      rate,
+      ratePartial,
       actionableShare: returned > 0 ? (actionable / returned) * 100 : null,
     };
   }, [rows]);
@@ -174,7 +177,7 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
         <StatRow stats={[
           { label: "Return leakage", value: totalMoney(totals.leakage, money, fmtMoney), tone: totals.leakage > 0 && !money.mixed ? "bad" : "good", hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Returned items", value: nInt(totals.returned) },
-          { label: "Return rate", value: totals.rate === null ? "—" : fmtRate(totals.rate), hint: "Units returned divided by ordered units, recomputed from the summed units" },
+          { label: "Return rate", value: totals.rate === null ? "—" : (totals.ratePartial ? `${fmtRate(totals.rate)} · partial` : fmtRate(totals.rate)), hint: totals.ratePartial ? "Partial — excludes currency-ambiguous ASINs whose returned units cannot be attributed to a single currency. Computed from proven rows only: units returned divided by ordered units." : "Units returned divided by ordered units, recomputed from the summed units" },
           { label: "Fixable share", value: totals.actionableShare === null ? "—" : fmtRate(totals.actionableShare, 0), hint: "Product, listing and sizing reasons as a share of all returns" },
           { label: "COGS on refunded units", value: totalMoney(totals.cogs, money, fmtMoney), hint: "Goods value tied to refunded units. Not counted as leakage: the source does not say whether the stock came back sellable." },
         ]} />

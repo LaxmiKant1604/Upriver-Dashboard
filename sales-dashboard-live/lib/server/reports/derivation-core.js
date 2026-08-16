@@ -1352,7 +1352,9 @@ export function returnsLeakagePayload({
   rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, orderedRows, catalogRows,
 }) {
   const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
-  const { moneyByKey, currencies } = returnsLeakageSettlementFold(settlementRows);
+  // Blocker 3: settlement-fold currencies are no longer the payload's `currencies`; that field is now the
+  // union of the currencies EMITTED on the rows (computed at the return below). Only moneyByKey is needed here.
+  const { moneyByKey } = returnsLeakageSettlementFold(settlementRows);
   const { orderedByKey } = returnsLeakageOrderedFold(orderedRows);
   const catalog = salesMoversCatalogFold(catalogRows);
 
@@ -1452,7 +1454,10 @@ export function returnsLeakagePayload({
     reasonTotals: [...reasonTotals.entries()]
       .sort((a, b) => b[1] - a[1])
       .map(([reason, count]) => ({ reason, count, bucket: classifyReturnReason(reason) })),
-    currencies: [...currencies].sort(),
+    // Blocker 3: the CANONICAL union of the nonblank `currency` values actually EMITTED on the payload rows
+    // (deduped, sorted) -- NOT the settlement-fold currencies. An ASIN with returns + ordered units in a
+    // currency that has NO settlement money still emits that currency on a row, so it must appear here.
+    currencies: [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort(),
     rows,
     catalogBrands: catalog.catalogBrands,
   };
@@ -1859,11 +1864,13 @@ export function ppcPerformancePayload({
   let totalSales = null;
   let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;
   if (totalSalesReason == null && Array.isArray(totalSalesRows)) {
-    // Blocker 3: require EXACTLY ONE Ads currency; then EVERY canonical OLI total-sales row MUST carry a
-    // nonblank canonical currency EQUAL to it. Any missing/blank/malformed/mismatched, OR mixed currencies
-    // => TACoS unavailable and NO row is summed (never sum a currencyless row into a currency denominator).
-    // Only when every row's canonical currency == the single Ads currency do we sum item_price_value.
-    const adsCurrency = currencies.length === 1 ? String(currencies[0] || "").trim().toUpperCase() : null;
+    // Blocker 2/3: require EXACTLY ONE nonblank canonical Ads currency AND NO included Ads row with a
+    // blank/malformed currency; THEN every canonical OLI total-sales row MUST carry a nonblank canonical
+    // currency EQUAL to it. Any missing/blank/malformed/mismatched, OR mixed currencies (Ads OR OLI) =>
+    // TACoS unavailable and NO row is summed (never sum a currencyless row into a currency denominator).
+    // Only when the single Ads currency is unambiguous and every OLI row matches it do we sum item_price_value.
+    const adsBlankCurrency = rows.some((row) => !String((row && row.currency) || "").trim());
+    const adsCurrency = (!adsBlankCurrency && currencies.length === 1) ? String(currencies[0] || "").trim().toUpperCase() : null;
     if (!adsCurrency) {
       totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
     } else {

@@ -438,10 +438,14 @@ test("daily-reporting derivation strategy derives all-brand + named-brand from t
   assert.deepEqual(d.derivedFrom, ["daily-reporting:oli-sales", "daily-reporting:catalog"]);
   assert.ok(d.outputs.includes("all-brand"));
   assert.ok(/no per-brand export/i.test(d.strategy));
-  // Structural token-saving proof: the ASIN/day builder is monthly-segmented in code,
-  // so a named-brand report never triggers its own per-brand DataDoe export.
+  // Structural token-saving proof: the ASIN/day builder is the ONE canonical OLI superset fetch, so a
+  // named-brand report never triggers its own per-brand DataDoe export. Blocker 1: it is sliced by
+  // canonicalOliSlices (calendar-anchored bins), NOT splitDateRangeByMonth, so its interior + asOf-boundary
+  // slices share request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance.
   assert.ok(DD.includes("async function fetchDailyBrandSalesRows"));
-  assert.ok(/for \(const window of splitDateRangeByMonth\(from, to\)\)/.test(DD.slice(DD.indexOf("fetchDailyBrandSalesRows"))), "named-brand fetch must be monthly-segmented");
+  const fdBody = DD.slice(DD.indexOf("async function fetchDailyBrandSalesRows"));
+  assert.ok(/for \(const window of canonicalOliSlices\(from, to\)\)/.test(fdBody), "named-brand fetch must be sliced by canonicalOliSlices");
+  assert.ok(!/splitDateRangeByMonth/.test(fdBody.slice(0, fdBody.indexOf("\n}\n"))), "named-brand fetch must NOT use splitDateRangeByMonth");
 });
 
 /* --- executable parity: fba-plan (ONE canonical OLI sales fragment; Blocker 1) --- */

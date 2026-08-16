@@ -17,8 +17,8 @@ import { REPORT_SOURCE_CONTRACTS, reportSourceRequestHashes } from "../lib/serve
 import { SOURCE_CONTRACTS, REPORT_SOURCE_REQUIREMENTS } from "../lib/server/source-contracts.js";
 import { deriveReportSnapshot } from "../lib/server/sync/report-derivation.js";
 import { assembleSources } from "../lib/server/sync/report-worker.js";
-import { addDaysStr, splitDateRangeByDays, canonicalOliSlices } from "../lib/server/date-windows.js";
-import { sourceJobOwnerId } from "../lib/server/source-identity.js";
+import { addDaysStr, splitDateRangeByDays, canonicalOliSlices, planMonthWindows } from "../lib/server/date-windows.js";
+import { sourceJobOwnerId, sourceRequestIdentity } from "../lib/server/source-identity.js";
 import {
   ppcPerformancePayload,
   buyBoxLossPayload,
@@ -326,37 +326,86 @@ const retOli = () => reportSourceRequestHashes({ reportKey: "returns-leakage", a
   "returns-leakage:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -59), OLI_ASOF),
   "returns-leakage:catalog": [{ from: null, to: null }],
 } }).filter((r) => r.requestKey === "returns-leakage:oli-sales");
+// Blocker 1e: daily-reporting and fba-plan ALSO emit the canonical OLI sales fragment (planDailyReporting /
+// planFbaPlan slice by canonicalOliSlices), so ALL FIVE reports share the overlapping August slice hash.
+const DAILY_FROM = addDaysStr(OLI_ASOF, -70); // any from <= 2025-08-01 clamps to the SAME calendar-anchored [1-7] bin
+const dailyOli = () => reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
+  "daily-reporting:oli-sales": canonicalOliSlices(DAILY_FROM, OLI_ASOF),
+  "daily-reporting:catalog": [{ from: DAILY_FROM, to: OLI_ASOF }],
+} }).filter((r) => r.requestKey === "daily-reporting:oli-sales");
+const FBA_PLAN = planMonthWindows(OLI_ASOF); // 3 completed months + current MTD, exactly as planFbaPlan uses
+const fbaOli = () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], marketplaceCountry: "US", windowsByRequestKey: {
+  "fba-plan:oli-sales": canonicalOliSlices(FBA_PLAN.completed[0].from, FBA_PLAN.current.to),
+  "fba-plan:catalog": [{ from: FBA_PLAN.completed[0].from, to: FBA_PLAN.current.to }],
+  "fba-plan:inventory-health": [{ from: addDaysStr(OLI_ASOF, -30), to: OLI_ASOF }],
+  "fba-plan:awd": [{ from: null, to: null }],
+} }).filter((r) => r.requestKey === "fba-plan:oli-sales");
+
+// The request_hash the LIVE (browser/manual) datadoe.js fetch produces for one canonical OLI slice: the
+// EXACT canonical OLI spec (sourceId 89b27535, OLI columns/groupBy/aggregations, 50000 cap, orderBy date/ASC)
+// -- byte-identical to what fetchDailyBrandSalesRows and the fba route now pass per canonicalOliSlices slice.
+// (report-source-contracts.test.mjs independently proves the datadoe.js constants == this canonical spec.)
+const liveOliRequestHash = (slice, ids = ["A1"], apiKey = "k") => sourceRequestIdentity({
+  apiKey, sourceId: OLI_ID, columns: ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"],
+  ids, from: slice.from, to: slice.to, limit: 50000,
+  options: {
+    groupBy: ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"],
+    aggregations: [{ column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" }, { column: "quantity", aggregation: "sum", alias: "total_units_sum" }],
+    orderByColumn: "date", orderByDirection: "ASC",
+  },
+}).requestHash;
 
 // An interior August bin [1-7] that the 28-day, 30-day AND 60-day windows all fully cover (asOf 2025-08-10).
 const SHARED_SLICE = { from: "2025-08-01", to: "2025-08-07" };
 const findShared = (jobs) => jobs.find((r) => r.from === SHARED_SLICE.from && r.to === SHARED_SLICE.to);
 
-test("(i) cross-report EQUALITY: ppc / buy-box / returns share ONE request_hash on the overlapping canonical slice", () => {
-  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli());
-  assert.ok(bb && ppc && ret, "all three reports emit the shared August slice");
-  assert.equal(bb.sourceId, ppc.sourceId); assert.equal(ppc.sourceId, ret.sourceId); // one Order Line Items source id
-  // Identical canonical spec + window + account + org => IDENTICAL request identity across all three reports.
-  assert.equal(bb.requestHash, ppc.requestHash, "buy-box and ppc share the request_hash on the overlapping slice");
-  assert.equal(ppc.requestHash, ret.requestHash, "ppc and returns share the request_hash on the overlapping slice");
+test("(i) cross-report EQUALITY: daily / fba / ppc / buy-box / returns share ONE request_hash on the overlapping canonical slice", () => {
+  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli()), daily = findShared(dailyOli()), fba = findShared(fbaOli());
+  assert.ok(bb && ppc && ret && daily && fba, "all FIVE reports emit the shared August slice");
+  // one Order Line Items source id across all five.
+  for (const j of [ppc, ret, daily, fba]) assert.equal(bb.sourceId, j.sourceId);
+  // Identical canonical spec + window + account + org => IDENTICAL request identity across all five reports.
+  assert.equal(new Set([bb.requestHash, ppc.requestHash, ret.requestHash, daily.requestHash, fba.requestHash]).size, 1,
+    "daily / fba / ppc / buy-box / returns all share ONE request_hash on the overlapping slice");
 });
 
 test("(ii) ONE source job per shared request_hash carries MULTIPLE distinct report owners (owner_id includes reportKey)", () => {
-  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli());
+  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli()), daily = findShared(dailyOli()), fba = findShared(fbaOli());
   // ONE export identity...
-  assert.equal(new Set([bb.requestHash, ppc.requestHash, ret.requestHash]).size, 1, "exactly one request_hash (one export) across the three reports");
-  // ...owned by THREE distinct report owners (deterministic owner_id keyed by reportKey + connection + org + scope).
+  assert.equal(new Set([bb.requestHash, ppc.requestHash, ret.requestHash, daily.requestHash, fba.requestHash]).size, 1, "exactly one request_hash (one export) across the five reports");
+  // ...owned by FIVE distinct report owners (deterministic owner_id keyed by reportKey + connection + org + scope).
   const owner = (job, reportKey) => sourceJobOwnerId({ reportKey, connectionId: "primary", organizationFingerprint: job.organizationFingerprint, accountScopeHash: job.accountScopeHash });
-  const owners = [owner(bb, "buy-box-loss"), owner(ppc, "ppc-performance"), owner(ret, "returns-leakage")];
+  const owners = [owner(bb, "buy-box-loss"), owner(ppc, "ppc-performance"), owner(ret, "returns-leakage"), owner(daily, "daily-reporting"), owner(fba, "fba-plan")];
   for (const o of owners) assert.ok(o, "each owner_id is well-formed (non-null)");
-  assert.equal(new Set(owners).size, 3, "the one shared export is owned by three distinct report owners");
+  assert.equal(new Set(owners).size, 5, "the one shared export is owned by five distinct report owners");
 });
 
 test("(iii) exactly one create-export per request_hash: the shared slice dedupes to a single identity", () => {
-  const shared = [...bbOli(), ...ppcOli(), ...retOli()].filter((r) => r.from === SHARED_SLICE.from && r.to === SHARED_SLICE.to);
-  assert.equal(shared.length, 3, "three report jobs reference the shared slice");
+  const shared = [...bbOli(), ...ppcOli(), ...retOli(), ...dailyOli(), ...fbaOli()].filter((r) => r.from === SHARED_SLICE.from && r.to === SHARED_SLICE.to);
+  assert.equal(shared.length, 5, "five report jobs reference the shared slice");
   assert.equal(new Set(shared.map((r) => r.requestHash)).size, 1, "...but they collapse to ONE request_hash => one create-export");
   // Deterministic: re-resolving reproduces byte-identical request identities (stable one-export-per-hash).
-  assert.deepEqual(bbOli().map((r) => r.requestHash), bbOli().map((r) => r.requestHash), "request identity is deterministic");
+  assert.deepEqual(dailyOli().map((r) => r.requestHash), dailyOli().map((r) => r.requestHash), "request identity is deterministic");
+});
+
+test("(iv) LIVE == SCHEDULER request identity for daily + fba: the live datadoe.js OLI fetch produces the SAME request_hash the scheduler contract does, per canonical slice", () => {
+  // Daily: every canonical slice of the live fetchDailyBrandSalesRows window hashes IDENTICALLY to the
+  // scheduler daily-reporting:oli-sales contract job for the same slice+account (so a manual refresh reuses
+  // the scheduled export instead of spending a new one).
+  const dailyJobs = dailyOli();
+  const dailyByWindow = new Map(dailyJobs.map((j) => [`${j.from}|${j.to}`, j.requestHash]));
+  for (const slice of canonicalOliSlices(DAILY_FROM, OLI_ASOF)) {
+    assert.equal(liveOliRequestHash(slice), dailyByWindow.get(`${slice.from}|${slice.to}`), `live daily OLI fetch == scheduler daily-reporting:oli-sales for ${slice.from}..${slice.to}`);
+  }
+  // FBA: same equality over the fba [completed[0].from .. asOf] canonical slices.
+  const fbaJobs = fbaOli();
+  const fbaByWindow = new Map(fbaJobs.map((j) => [`${j.from}|${j.to}`, j.requestHash]));
+  for (const slice of canonicalOliSlices(FBA_PLAN.completed[0].from, FBA_PLAN.current.to)) {
+    assert.equal(liveOliRequestHash(slice), fbaByWindow.get(`${slice.from}|${slice.to}`), `live fba OLI fetch == scheduler fba-plan:oli-sales for ${slice.from}..${slice.to}`);
+  }
+  // And the shared August slice ties the live identity to ALL five reports (one export, many owners).
+  assert.equal(liveOliRequestHash(SHARED_SLICE), findShared(dailyOli()).requestHash, "live == scheduler on the shared slice (daily)");
+  assert.equal(liveOliRequestHash(SHARED_SLICE), findShared(fbaOli()).requestHash, "live == scheduler on the shared slice (fba)");
 });
 
 async function main() {

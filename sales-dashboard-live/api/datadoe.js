@@ -63,6 +63,7 @@ import {
   pad2s,
   pollExport,
   splitDateRangeByMonth,
+  canonicalOliSlices,
   withDataDoeDeadline,
 } from "../lib/server/datadoe.js";
 import {
@@ -1472,12 +1473,14 @@ const CONTENT_CHANGE_COLUMNS = [
 // total_units_sum are preserved so the downstream folds are unchanged except for
 // currency isolation.)
 const DAILY_SALES_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
+// DAILY_SALES_COLUMNS is retained only for the /datadoe pass-through debug handler; the compact all-brand
+// export (with DAILY_SALES_GROUP_BY) was removed in Blocker 1 -- all-brand now derives from the canonical
+// Order Line Items superset (fetchDailyBrandSalesRows + rollupSupersetToDaily).
 const DAILY_SALES_COLUMNS = [
   "date",
   "seller_or_vendor_id",
   "item_price_currency",
 ];
-const DAILY_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "item_price_currency"];
 const DAILY_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -1726,6 +1729,31 @@ export function normalizeDailySalesRows(rows) {
     total_sales: num(row.total_sales_sum ?? row.item_price_value),
     total_units: num(row.total_units_sum ?? row.quantity),
   }));
+}
+
+// Fold the ASIN-level canonical OLI superset to one row per (date, seller, currency). Byte-identical twin
+// of lib/server/reports/derivation-core.js rollupSupersetToDaily (kept as a separate copy under the same
+// twin discipline as normalizeDailySalesRows / dailyRowsForBrand). The all-brand Daily Reporting rows are
+// derived from THIS rollup of the SAME superset the named-brand path fetches, so the live route matches the
+// scheduler for both modes (Blocker 1) and no separate compact all-brand export is spent.
+export function rollupSupersetToDaily(supersetRows) {
+  const byKey = new Map();
+  for (const row of supersetRows) {
+    // Currency isolation: sum the superset per (date, seller, currency) -- never across currencies.
+    const currency = row.currency ?? row.item_price_currency ?? null;
+    const key = `${row.date}|${row.seller_or_vendor_id}|${currency ?? ""}`;
+    const current = byKey.get(key) || {
+      date: row.date,
+      seller_or_vendor_id: row.seller_or_vendor_id,
+      currency,
+      total_sales_sum: 0,
+      total_units_sum: 0,
+    };
+    current.total_sales_sum += num(row.total_sales_sum ?? row.item_price_value);
+    current.total_units_sum += num(row.total_units_sum ?? row.quantity);
+    byKey.set(key, current);
+  }
+  return [...byKey.values()];
 }
 
 // Join the ASIN-level daily export to the account's catalog, then fold the
@@ -1992,18 +2020,25 @@ async function fetchSkuPlRows(apiKey, sellerOrVendorIds, windows) {
 
 async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
   const allRows = [];
-  for (const window of splitDateRangeByMonth(from, to)) {
+  // Blocker 1: slice by canonicalOliSlices (calendar-anchored bins [1-7],[8-14],[15-21],[22-28],[29-end])
+  // and fetch each slice with the EXACT canonical Order Line Items spec (OLI_SALES_COLUMNS / GROUP_BY /
+  // AGGREGATIONS, orderByColumn:"date" / orderByDirection:"ASC" passed EXPLICITLY). This makes the live
+  // named-brand + all-brand superset byte-identical in request identity to the scheduler
+  // daily-reporting:oli-sales fragments, so overlapping slices reuse ONE DataDoe export across the five
+  // OLI reports. DAILY_BRAND_SALES_COLUMNS/GROUP_BY and DAILY_BRAND_ROW_LIMIT are byte-equal to their
+  // OLI_SALES_* counterparts; the strict cap keeps the daily constant name.
+  for (const window of canonicalOliSlices(from, to)) {
     const rows = await fetchExportRows(
       apiKey,
       DAILY_SALES_SOURCE_ID,
-      DAILY_BRAND_SALES_COLUMNS,
+      OLI_SALES_COLUMNS,
       sellerOrVendorIds,
       window.from,
       window.to,
       DAILY_BRAND_ROW_LIMIT,
-      { groupBy: DAILY_BRAND_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
+      { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" }
     );
-    // Strict: a month exactly at the row cap is indistinguishable from a truncated
+    // Strict: a slice exactly at the row cap is indistinguishable from a truncated
     // one. Reject it BEFORE appending, so an understated all-brand / named-brand
     // total is never derived or saved; the previous good snapshot is preserved.
     if (rows.length >= DAILY_BRAND_ROW_LIMIT) {
@@ -2686,17 +2721,12 @@ async function handleDataDoe(req, res) {
         return;
       }
 
-      const salesRaw = await fetchExportRows(
-        apiKey,
-        DAILY_SALES_SOURCE_ID,
-        DAILY_SALES_COLUMNS,
-        sellerOrVendorIds,
-        from,
-        to,
-        DAILY_ROW_LIMIT,
-        { groupBy: DAILY_SALES_GROUP_BY, aggregations: DAILY_SALES_AGGREGATIONS }
-      );
-      const rows = normalizeDailySalesRows(salesRaw);
+      // Blocker 1: derive all-brand from the SAME canonical Order Line Items superset the named-brand path
+      // fetches (no separate compact all-brand export). rollupSupersetToDaily folds the ASIN-level superset
+      // to one row per (date, seller, currency) exactly like the scheduler's dailyReportingPayload ALL
+      // branch, so the live route == the scheduler for BOTH modes.
+      const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
+      const rows = normalizeDailySalesRows(rollupSupersetToDaily(salesRaw));
       for (const r of rows) r.total_units_sold = r.total_units;
       // The scheduled Ads worker owns campaign data. Reading its saved
       // upserts avoids another DataDoe export whenever a user opens or
@@ -2988,10 +3018,21 @@ async function handleDataDoe(req, res) {
       // single shared fragment (byte-identical spec to the other OLI reports, so overlapping calendar
       // slices reuse one export). Units are a currency-agnostic count, so this sums total_units_sum
       // ACROSS currencies (the canonical rows still carry currency for the money-keyed reports).
-      const oliSalesRows = await fetchExportRows(
-        apiKey, PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS, sellerOrVendorIds, completed[0].from, current.to, OLI_SALES_ROW_LIMIT,
-        { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" }
-      );
+      // Blocker 1: slice by canonicalOliSlices so the fba fragment's interior + asOf-boundary slices are
+      // byte-identical in request identity to the scheduler + daily + the other OLI reports (one export,
+      // many owners). Per-slice strict cap: a slice at the row cap is indistinguishable from a truncated
+      // one, so it is rejected BEFORE appending (an understated velocity would misplan shipments).
+      const oliSalesRows = [];
+      for (const slice of canonicalOliSlices(completed[0].from, current.to)) {
+        const sliceRows = await fetchExportRows(
+          apiKey, PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS, sellerOrVendorIds, slice.from, slice.to, OLI_SALES_ROW_LIMIT,
+          { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" }
+        );
+        if (sliceRows.length >= OLI_SALES_ROW_LIMIT) {
+          throw new Error(`FBA Shipment Plan sales export reached the ${OLI_SALES_ROW_LIMIT.toLocaleString("en-US")} row cap for ${slice.from} to ${slice.to}. The report was not saved because a partial slice would understate demand velocity.`);
+        }
+        oliSalesRows.push(...sliceRows);
+      }
       const asinSet = new Set();
       const unitsByAsinByMonth = {}; // asin -> { monthKey: units }
       const mtdByAsin = new Map();   // asin -> current-month units

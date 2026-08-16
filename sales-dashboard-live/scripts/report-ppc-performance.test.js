@@ -226,6 +226,18 @@ test("6. MULTI-currency Ads => total-sales skipped by design; exact multi-curren
   assert.deepEqual(p.currencies, ["CAD", "USD"]);
 });
 
+test("6b. Blocker 2: an Ads row with a BLANK currency => TACoS unavailable (never sums a currencyless Ads row); rest of PPC intact", () => {
+  // A single nonblank Ads currency (USD) PLUS an included Ads row whose currency is blank must NOT read as
+  // a clean single currency: the TACoS denominator is withheld and NOTHING is summed, even though every
+  // OLI total-sales row is USD. This is the adversarial case the ads-currency gate + payload guard close.
+  const blankRow = { ...cmp("2025-08-03", "C4", "SP", { spend: 2, sales: 2, clicks: 2, impr: 2, orders: 1, units: 1 }, { ad_campaign_name: "Camp 4" }), currency: "" };
+  const p = derivePpc(ppcPlanned({ catalog: CATALOG(), totalSales: TOTAL_SALES() }), okAds([...ADS_ROWS(), blankRow])).payload;
+  assert.equal(p.totalSales, null, "a blank Ads currency blocks the TACoS denominator (never sums)");
+  assert.ok(/different currency/i.test(p.totalSalesUnavailable), "typed currency-ambiguity reason");
+  assert.ok(p.campaigns.length >= 2, "campaigns/rest of PPC unaffected by the TACoS withhold");
+  assert.equal(p.adsRowCount, ADS_ROWS().length + 1, "the blank-currency Ads row is still counted in the report");
+});
+
 test("7. planned total-sales FAILED / MISSING => degrade ONLY TACoS; campaigns/ASINs/targets/search terms intact", () => {
   // total-sales fragment failed.
   const built = ppcPlanned({ catalog: CATALOG(), totalSales: TOTAL_SALES() });

@@ -185,12 +185,10 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
 
   /* ----- fold settlement money per (currency, ASIN) ----- */
   const moneyByKey = new Map();
-  const currencies = new Set();
   for (const row of settlementRows) {
     const asin = String(row.child_asin || "").trim();
     if (!asin) continue;
     const currency = String(row.currency || "").trim() || null;
-    if (currency) currencies.add(currency);
     const type = String(row.settlement_type || "").trim().toUpperCase();
     const key = `${currency || "?"}|${asin}`;
     const entry = moneyByKey.get(key) || {
@@ -359,7 +357,9 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     reasonTotals: [...reasonTotals.entries()]
       .sort((a, b) => b[1] - a[1])
       .map(([reason, count]) => ({ reason, count, bucket: classifyReturnReason(reason) })),
-    currencies: [...currencies].sort(),
+    // Blocker 3: the CANONICAL union of the nonblank `currency` values actually EMITTED on the payload rows
+    // (deduped, sorted) -- NOT the settlement-fold currencies. Keeps live == pure derivation-core.
+    currencies: [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort(),
     rows,
     catalogBrands: catalog.catalogBrands,
   };

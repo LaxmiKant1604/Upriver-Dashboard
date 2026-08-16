@@ -238,11 +238,13 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
         );
         for (const row of sliceRows) salesRows.push(row);
       }
-      // Blocker 3: require EXACTLY ONE Ads currency; then EVERY OLI total-sales row MUST carry a nonblank
-      // canonical currency EQUAL to it. If any row's currency is missing/blank/malformed/mismatched, or the
-      // rows mix currencies, TACoS is unavailable and NO row is summed (never sum a currencyless row into a
-      // currency denominator). Only when every row's canonical currency == the single Ads currency do we sum.
-      const adsCurrency = currencies.length === 1 ? String(currencies[0] || "").trim().toUpperCase() : null;
+      // Blocker 2/3: require EXACTLY ONE nonblank canonical Ads currency AND NO included Ads row with a
+      // blank/malformed currency; then EVERY OLI total-sales row MUST carry a nonblank canonical currency
+      // EQUAL to it. If any Ads OR OLI row's currency is missing/blank/malformed/mismatched, or the rows mix
+      // currencies, TACoS is unavailable and NO row is summed (never sum a currencyless row into a currency
+      // denominator). Only when the single Ads currency is unambiguous and every OLI row matches it do we sum.
+      const adsBlankCurrency = adsRows.some((row) => !String((row && row.currency) || "").trim());
+      const adsCurrency = (!adsBlankCurrency && currencies.length === 1) ? String(currencies[0] || "").trim().toUpperCase() : null;
       if (!adsCurrency) {
         totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
       } else {

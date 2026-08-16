@@ -70,16 +70,22 @@ export function optimizerSqpSignal(outcome) {
 }
 
 // PPC Ads currency -> { status, validated, currencyCount }, derived from persisted
-// ads_daily_source_rows (never a live Ads export). currencyCount is the number of
-// distinct non-empty currencies across the saved rows.
+// ads_daily_source_rows (never a live Ads export). Each row's currency is canonicalized
+// (trim + UPPERCASE) so "usd"/"USD" are one identity. currencyCount is the number of
+// distinct non-empty canonical currencies PLUS one extra "violation" bucket when ANY
+// included Ads row has a blank/malformed currency (Blocker 2): a currencyless-but-spending
+// Ads row must never read as a clean single currency, so USD + a blank row => currencyCount 2
+// => evaluateAdsCurrencyGate returns false and total-sales (TACoS) is NOT scheduled (fail closed).
 export function adsCurrencySignal(adsRows) {
   if (!Array.isArray(adsRows)) return { status: "failed", validated: false, currencyCount: 0 };
   const currencies = new Set();
+  let hasBlankCurrency = false;
   for (const row of adsRows) {
-    const currency = String((row && row.currency) || "").trim();
+    const currency = String((row && row.currency) || "").trim().toUpperCase();
     if (currency) currencies.add(currency);
+    else hasBlankCurrency = true;
   }
-  return { status: "success", validated: true, currencyCount: currencies.size };
+  return { status: "success", validated: true, currencyCount: currencies.size + (hasBlankCurrency ? 1 : 0) };
 }
 
 // The three source-job request keys that PRODUCE a staged/fallback signal, mapped to

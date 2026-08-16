@@ -283,7 +283,14 @@ test("dependency signals are derived ONLY from validated saved results", async (
   assert.deepEqual(deriveSignalsFromOutcomes([{ requestKey: "sales-movers:catalog", status: "success", validated: true, rows: [] }]), {});
   assert.deepEqual(keywordWeeklySignal({ status: "success", validated: true, rows: [{ date: "2025-07-01" }, { date: "2025-07-08" }, { date: "2025-07-01" }] }), { status: "success", validated: true, distinctPeriods: 2 });
   assert.deepEqual(optimizerSqpSignal({ status: "success", validated: true, rows: [] }), { status: "success", validated: true });
-  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }, { currency: "CAD" }, { currency: "" }]), { status: "success", validated: true, currencyCount: 2 });
+  // Blocker 2: a blank/malformed Ads currency is its OWN violation bucket, and currencies canonicalize
+  // (trim + UPPERCASE). So a clean single currency + any blank row can NEVER read as a clean single
+  // currency: currencyCount reflects the blank => evaluateAdsCurrencyGate false => TACoS not scheduled.
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }, { currency: "CAD" }, { currency: "" }]), { status: "success", validated: true, currencyCount: 3 }, "two currencies + a blank => 3 (blank is its own bucket)");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "usd" }]), { status: "success", validated: true, currencyCount: 1 }, "case-canonicalized: usd == USD");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "  " }]), { status: "success", validated: true, currencyCount: 2 }, "clean single currency + a whitespace-only row => 2 (fail closed at the gate)");
+  assert.deepEqual(adsCurrencySignal([{ currency: "USD" }, { currency: "USD" }]), { status: "success", validated: true, currencyCount: 1 }, "clean single currency => 1 (gate passes)");
+  assert.deepEqual(adsCurrencySignal([]), { status: "success", validated: true, currencyCount: 0 }, "no ads rows => 0 (sane zero-metric handling)");
   assert.deepEqual(salesMoversProbeSignal({ status: "success", validated: true, rows: [{ date: "2025-07-30", units_sum: 2 }, { date: "2025-07-28", units_sum: 9 }] }), { status: "success", validated: true, latestReportedDate: "2025-07-30" });
 });
 

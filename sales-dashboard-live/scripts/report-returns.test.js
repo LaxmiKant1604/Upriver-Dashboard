@@ -401,6 +401,16 @@ test("b2d. the return RATE is WITHHELD (returnedUnits null) on every row of a mu
   assert.equal(s1.orderedUnits, 20, "its ordered denominator is intact");
 });
 
+test("b2e. Blocker 3: payload.currencies is the UNION of the currencies EMITTED on the rows, NOT the settlement-fold currencies", () => {
+  const p = deriveRet(retPlanned(B2_FIXTURE())).payload;
+  // Emitted rows: M1/USD, M1/CAD, S1/USD. The ONLY settlement is a CAD refund, so the settlement-fold
+  // currencies would be just ["CAD"] -- the ordered-only USD would be DROPPED by the old logic. The corrected
+  // field is the deduped, sorted union of the nonblank row currencies actually emitted, so USD is present.
+  assert.deepEqual(p.currencies, ["CAD", "USD"], "currencies == union of emitted row currencies (incl. the ordered-only USD)");
+  const emitted = [...new Set(p.rows.map((row) => row.currency).filter(Boolean))].sort();
+  assert.deepEqual(p.currencies, emitted, "exactly the deduped, sorted union of emitted row currencies");
+});
+
 group("returns latestDataDate: an OBSERVED source-evidence date, never the requested asOf (freshness blocker)");
 
 // latestDataDate must be the MAX real date in the already-validated raw Returns rows (null if none), never
@@ -635,6 +645,25 @@ test("24. one canonical export per shared catalog request_hash across Returns + 
   assert.equal(dd.createCount(catSrc.requestHash), 1, "the shared catalog export is created exactly once");
   assert.equal(store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === catSrc.requestHash).length, 1, "one canonical catalog row");
   assert.equal(store._owners(r.cycleId).filter((m) => m.request_hash === catSrc.requestHash).length, 2, "two owner memberships share the one canonical hash");
+});
+
+test("24b. Blocker 1: TWO OLI reports (buy-box + returns) share ONE canonical OLI-slice export owned by BOTH (one create-export, two report owners)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  // Build ONE shadow plan for TWO of the five OLI reports at the SAME account/asOf. Their canonical OLI
+  // fragments are calendar-anchored (canonicalOliSlices), so an interior slice both windows cover resolves
+  // to the IDENTICAL request_hash -- two report jobs, ONE source identity.
+  const plan = shadowPlan(ACCTS, ["buy-box-loss", "returns-leakage"]);
+  const jobs = resolveFromPlan(plan)().sourceJobs;
+  const bbOli = jobs.filter((j) => j.requestKey === "buy-box-loss:oli-sales");
+  const retOli = jobs.filter((j) => j.requestKey === "returns-leakage:oli-sales");
+  const shared = bbOli.find((b) => retOli.some((r) => r.requestHash === b.requestHash));
+  assert.ok(shared, "buy-box and returns share at least one canonical OLI slice request_hash");
+  const sharedJobs = jobs.filter((j) => j.requestHash === shared.requestHash);
+  assert.equal(new Set(sharedJobs.map((j) => j.owner.reportKey)).size, 2, "the shared OLI slice is referenced by TWO distinct report owners");
+  const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownerIds: [...new Set(jobs.map((j) => j.owner.ownerId))], bucket: "us", cycleDate: "2026-08-11" });
+  assert.equal(dd.createCount(shared.requestHash), 1, "the shared canonical OLI slice export is created EXACTLY once");
+  assert.equal(store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === shared.requestHash).length, 1, "one canonical OLI source job for the shared slice");
+  assert.equal(store._owners(r.cycleId).filter((m) => m.request_hash === shared.requestHash).length, 2, "the ONE canonical export carries TWO report-owner memberships");
 });
 
 test("25. shared-owner reconciliation: Returns owner reconciliation never stales/fails a second owner sharing the catalog", async () => {
