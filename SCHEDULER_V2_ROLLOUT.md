@@ -4481,3 +4481,55 @@ byte-equivalent (parity harnesses green). Adversarial tests added for every find
 
 **STOP for Codex re-review.** Code+tests `dee77b7`, docs `<this commit>`; **not pushed** — production stays on
 `0ea9f34`; nothing deployed.
+
+## Appendix AE — Codex re-review blocker fixes, round 2 (OFFLINE, 2026-08-16; code+tests `622716f`; NOT deployed)
+
+Codex re-review of Appendix AD raised three more blockers; all fixed **offline on `main`** (no deploy/push/DataDoe/
+Supabase; the running cycle `dfca8f75` and brand-sales/IN live snapshot untouched). `npm run verify` green — **40
+steps / 20 suites** (incl. `build:check`); `git diff --check` clean.
+
+### AE.1 Real manual + scheduler OLI reuse in the LIVE Daily + FBA paths
+The scheduler contracts already used the canonical fragment + `canonicalOliSlices`, but the **live (browser/manual)**
+Daily and FBA paths did not, so their `request_hash`es didn't match the scheduler's and no export was actually reused.
+- `api/datadoe.js fetchDailyBrandSalesRows` now slices by `canonicalOliSlices(from,to)` and fetches each slice with
+  the **exact** canonical OLI spec (`OLI_SALES_COLUMNS/GROUP_BY/AGGREGATIONS`, limit 50000, `orderByColumn:"date"`,
+  `orderByDirection:"ASC"`) — so the manual named-brand + all-brand superset is byte-identical in request identity to
+  the scheduler `daily-reporting:oli-sales` fragments.
+- The Daily **ALL-brand** branch no longer spends a separate compact export; it derives all-brand from the SAME
+  canonical superset via `rollupSupersetToDaily` (a byte-identical twin added to `api/datadoe.js`), matching the
+  scheduler's `dailyReportingPayload` ALL branch. Removed the now-dead `DAILY_SALES_GROUP_BY` (a few `DAILY_*`
+  constants remain, still required by the text-parity harness / `/datadoe` pass-through debug handler).
+- The **FBA** route's OLI fetch now loops `canonicalOliSlices(completed[0].from, current.to)` with a per-slice strict
+  cap (was one unsliced fetch).
+- Tests: the cross-report proof now spans **all five** OLI reports sharing one `request_hash` on the shared slice; a
+  new **(iv)** asserts **LIVE == SCHEDULER request identity** for daily + fba on every canonical slice (a manual
+  refresh reuses the scheduled export); and an **executable worker-level `24b`** builds a 2-report shadow plan, runs
+  `runSourceJobs`, and asserts the shared canonical OLI slice yields **one create-export + two report-owner
+  memberships**.
+
+### AE.2 PPC TACoS fail-closed on ANY currency ambiguity (Ads or OLI)
+- `adsCurrencySignal` (`source-signals.js`) now canonicalizes each row's currency (trim + UPPERCASE) and counts a
+  **blank/malformed** Ads currency as its own violation bucket: `USD + a blank row ⇒ currencyCount 2 ⇒
+  evaluateAdsCurrencyGate false ⇒ total-sales (TACoS) is not planned** (fail closed at the gate).
+- The pure `ppcPerformancePayload` **and** the live `buildPpcPerformance` twin require **exactly one nonblank
+  canonical Ads currency AND no blank Ads row**, then every nonempty OLI total-sales row must carry that same
+  canonical currency; any missing/blank/malformed/mismatched/mixed (Ads or OLI) ⇒ `totalSales=null` + typed reason,
+  never summed. **Everything else in the PPC payload is preserved** when TACoS is unavailable.
+- **Known residual (safe):** an all-blank Ads-rows set passes the gate as count 1 (an unnecessary scheduled export in
+  that corruption case), but the payload guard still fails TACoS closed — so no wrong number is ever shown; the
+  realistic single-currency-plus-blank case fails closed at the gate.
+
+### AE.3 Returns aggregate-rate accuracy + currencies union
+- The portfolio return rate is now a **PROVEN** rate (`returnsPortfolioRate` in `insights.js`): the numerator AND
+  denominator sum only over rows whose `returnedUnits` is known. A withheld-`returnedUnits` row (a currency-ambiguous
+  ASIN) is **excluded from BOTH** — its ordered units never sit in the denominator to understate the rate. When such a
+  row carries ordered units the KPI is a **proven PARTIAL**, marked "· partial" with a tooltip in `ReturnsLeakage.jsx`,
+  never an understated complete rate.
+- Payload `currencies` (live `returns.js` + pure `derivation-core.js`) is now the canonical **union of the nonblank
+  currencies emitted on the rows** (deduped, sorted) — not the settlement-fold currencies (so an ordered-only currency
+  is no longer dropped). Live == pure.
+- Tests: mixed-currency regressions prove the proven-partial rate, the partial marker, and `payload.currencies` =
+  emitted-row union.
+
+**STOP for Codex re-review.** Code+tests `622716f`, docs `<this commit>`; **not pushed** — production stays on
+`0ea9f34`; nothing deployed.

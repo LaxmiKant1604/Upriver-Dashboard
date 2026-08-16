@@ -9874,3 +9874,35 @@ Appendix AD.
   assertions), re-verified green, and committed code/tests (dee77b7) then docs separately.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
+
+## OLI correction — Codex re-review blocker fixes round 2 OFFLINE on main 2026-08-16 (code+tests 622716f, docs separate); verify green 40/40; NOT deployed
+
+Codex re-review of the OLI blocker fixes (dee77b7 / Appendix AD) raised 3 more blockers; all fixed offline on main (no
+deploy/push/DataDoe/Supabase; running cycle dfca8f75 + brand-sales/IN untouched). Full evidence: SCHEDULER_V2_ROLLOUT.md
+Appendix AE.
+
+- B1 real manual+scheduler OLI reuse in the LIVE Daily+FBA paths: live fetchDailyBrandSalesRows now slices by
+  canonicalOliSlices with the EXACT canonical OLI spec (OLI_SALES cols/groupBy/aggs, limit 50000, orderBy date/ASC) =>
+  manual request_hash == scheduler daily-reporting:oli-sales. Daily ALL-brand derives from the SAME superset via
+  rollupSupersetToDaily (byte-identical twin added to api/datadoe.js); compact all-brand export removed. FBA OLI fetch
+  sliced by canonicalOliSlices (per-slice strict cap). Tests: all FIVE OLI reports share one request_hash on the shared
+  slice; new (iv) proves LIVE==SCHEDULER request identity per slice for daily+fba; executable worker-level 24b proves
+  one create-export + two report-owner memberships for the shared canonical OLI slice.
+- B2 PPC TACoS fail-closed on ANY currency ambiguity: adsCurrencySignal canonicalizes + counts a blank/malformed Ads
+  currency as a violation (USD+blank => count 2 => gate false => total-sales not planned). Live+pure require exactly one
+  nonblank canonical Ads currency AND no blank Ads row AND every OLI row that same currency; else TACoS unavailable, no
+  row summed; rest of PPC intact. Residual (safe): all-blank ads set passes the gate (wasteful export) but the payload
+  guard still fails TACoS closed (no wrong number).
+- B3 returns rate + currencies: portfolio rate is a PROVEN rate (returnsPortfolioRate) -- a withheld-returnedUnits row is
+  excluded from BOTH numerator and denominator (ordered units never understate); when such a row has ordered units the
+  KPI is a proven PARTIAL, marked "· partial" in the UI. Payload currencies = canonical union of nonblank currencies
+  emitted on the rows (live+pure), not settlement-fold currencies.
+- Verify: npm run verify green (40 steps / 20 suites incl build:check); git diff --check clean. Live builders +
+  scheduler pure folds kept byte-equivalent (parity green); the daily parity assertion was STRENGTHENED (requires
+  canonicalOliSlices, forbids splitDateRangeByMonth). Adversarial tests for every finding; no assertion weakened.
+- Impl history: delegated to a fresh agent that completed all 3 blockers to verify-green (this time WITHOUT stalling)
+  and stopped without committing; I independently re-verified, rigorously reviewed the full diff (live datadoe reuse,
+  the (i)-(iv) + 24b reuse proofs, ads/OLI currency gates, proven-partial rate, currencies union, and the parity-test
+  strengthening), confirmed nothing was weakened, then committed code/tests (622716f) then docs separately.
+
+STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
