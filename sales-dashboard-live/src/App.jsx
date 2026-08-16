@@ -2487,8 +2487,8 @@ function DashboardApp({ session, access, onSignOut }) {
   const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [brandRows, rangeFrom, rangeTo]);
   const kpi = useMemo(() => aggregate(scopedRows), [scopedRows]);
   const aov = kpi.orders > 0 ? kpi.sales / kpi.orders : 0;
-  // The sales source (401ffcd7e5) has no order-count column, so Orders / AOV
-  // show "—" unless an orders figure is actually present on the rows.
+  // The Order Line Items sales source carries item_price_value (sales) + quantity (units) but no
+  // order-count column, so Orders / AOV show "—" unless an orders figure is actually present on the rows.
   const hasOrders = useMemo(() => brandRows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [brandRows]);
 
   /* Period-over-period change for the selected range, measured against the
@@ -3082,7 +3082,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className="footer-note">
           ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
-          Sales and units are sourced from DataDoe Sales & Traffic by ASIN & Date. {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export." : "Advertising metrics show — for a named brand because the connected advertising export is account-level and cannot be assigned accurately to a product brand."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
+          Sales and ordered units are sourced from DataDoe Order Line Items (item_price_value / quantity). {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export." : "Advertising metrics show — for a named brand because the connected advertising export is account-level and cannot be assigned accurately to a product brand."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
       </div>
       )}

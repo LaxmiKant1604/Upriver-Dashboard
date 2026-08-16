@@ -16,7 +16,7 @@
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, evaluateAdsCurrencyGate, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
-import { monthBackStr, monthStartStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays } from "../date-windows.js";
+import { monthBackStr, monthStartStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays, canonicalOliSlices } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 
@@ -238,9 +238,10 @@ export function planDailyReporting({ accountId, country, currency, connections, 
   const from = monthBackStr(asOf, DAILY_MONTHS_BACK);
   const to = String(asOf);
   const windowsByRequestKey = {
-    // Timeout-safe slicing: monthly fragments TIMEOUTed on large accounts. Rows are per-day grouped
-    // ([date, seller, asin]), so <=7-day slices WITHIN each month concatenate to the identical superset.
-    "daily-reporting:asin-day-superset": sliceMonthsByDays(splitDateRangeByMonth(from, to)),
+    // Blocker 1: the ONE canonical Order Line Items sales fragment, sliced by canonicalOliSlices
+    // (calendar-anchored bins). Interior + asOf-boundary slices share request_hashes with the other OLI
+    // reports (one export, many owners); the per-day grouped slices concatenate to the identical superset.
+    "daily-reporting:oli-sales": canonicalOliSlices(from, to),
     "daily-reporting:catalog": [{ from, to }],
   };
   const sources = reportSourceRequestHashes({
@@ -337,11 +338,9 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   const { completed, current } = planMonthWindows(asOfStr);
   const isUS = scope.country === "US";
   const windowsByRequestKey = {
-    "fba-plan:monthly-units": [
-      ...completed.map((m) => ({ from: m.from, to: m.to })),
-      { from: current.from, to: current.to },
-    ],
-    "fba-plan:current-daily-dates": [{ from: current.from, to: current.to }],
+    // Blocker 1: ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf], sliced by
+    // canonicalOliSlices. Per-ASIN monthly units + the current-month latest-date probe are DERIVED from it.
+    "fba-plan:oli-sales": canonicalOliSlices(completed[0].from, current.to),
     "fba-plan:catalog": [{ from: completed[0].from, to: current.to }],
     "fba-plan:inventory-health": [{ from: addDaysStr(asOfStr, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOfStr }],
   };
@@ -493,7 +492,7 @@ export function planPpcPerformance({ accountId, country, currency, connections, 
   // construction. request_hash + primary/dd-secondary isolation come from the shared resolver.
   const windowsByRequestKey = { "ppc-performance:catalog": [{ from: null, to: null }] };
   if (evaluateAdsCurrencyGate(sig)) {
-    windowsByRequestKey["ppc-performance:total-sales"] = [{ from, to: end }];
+    windowsByRequestKey["ppc-performance:oli-sales"] = canonicalOliSlices(from, end);
   }
   const sources = reportSourceRequestHashes({
     reportKey: "ppc-performance", apiKey: scope.apiKey, ids: [scope.rawSellerId],
@@ -560,12 +559,13 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const end = String(asOf);
   const from = addDaysStr(end, -(BB_WINDOW_DAYS - 1));
-  // The ordered OLI sales/units source uses the SAME four 7-day slices as the daily buy-box
-  // source, so the two agree by construction and join on currency|sku per window.
+  // The daily buy-box source keeps its four 7-day slices; the canonical OLI sales/units source is sliced
+  // by canonicalOliSlices (Blocker 1) so its interior + asOf-boundary slices share request_hashes with the
+  // other OLI reports. Both cover [asOf-27d, asOf] and the fold joins them on currency|sku.
   const dailySlices = splitDateRangeByDays(from, end, BB_SLICE_DAYS);
   const windowsByRequestKey = {
     "buy-box-loss:daily": dailySlices,
-    "buy-box-loss:ordered": dailySlices,
+    "buy-box-loss:oli-sales": canonicalOliSlices(from, end),
     "buy-box-loss:inventory": [{ from: addDaysStr(end, -BB_INVENTORY_LOOKBACK_DAYS), to: end }],
     "buy-box-loss:catalog": [{ from: null, to: null }],
   };
@@ -606,7 +606,9 @@ export function planReturnsLeakage({ accountId, country, currency, connections, 
     // rows) and the catalog is no-date -- none of those can be sliced; they stay single-window.
     "returns-leakage:returns": sliceWindowByDays(from, end).reverse(),
     "returns-leakage:settlements": [{ from, to: end }],
-    "returns-leakage:ordered": [{ from, to: end }],
+    // Blocker 1: canonical OLI sales fragment sliced by canonicalOliSlices (shares request_hashes with the
+    // other OLI reports); the fold binds ordered evidence per (currency, child_asin) — Blocker 2.
+    "returns-leakage:oli-sales": canonicalOliSlices(from, end),
     "returns-leakage:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({

@@ -26,7 +26,7 @@ export { MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, chunkArray, chunkAccountIds };
 // Pure calendar/window helpers live in a dependency-free leaf (so the "pure" report-derivation
 // graph never transitively reaches this transport/storage module). Imported for local use
 // (splitDateRangeByDays needs addDaysStr) and re-exported so existing importers keep working.
-import { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow } from "./date-windows.js";
+import { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow, canonicalOliSlices } from "./date-windows.js";
 import {
   getSourceExportCache,
   isSupabaseConfigured,
@@ -497,7 +497,7 @@ export async function fetchExportRowsStrict(apiKey, sourceId, columns, ids, from
  * modules that need them (e.g. the report-derivation boundary) do NOT transitively depend on this
  * transport/storage module (which imports supabase.js). They are RE-EXPORTED here unchanged so
  * every existing `import { ... } from "../datadoe.js"` caller keeps working byte-for-byte. */
-export { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow };
+export { pad2s, daysInMonthUTC, addDaysStr, splitDateRangeByMonth, isFullCalendarMonthWindow, canonicalOliSlices };
 
 export function isDateStr(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));

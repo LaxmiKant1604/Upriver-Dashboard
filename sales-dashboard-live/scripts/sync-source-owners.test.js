@@ -313,7 +313,7 @@ test("a genuine same-owner stale membership is retired at OWNER scope by reconci
   const store = makeStore(); const dd = makeDataDoe();
   // Owner A stages TWO sources this cycle: H (kept) and H2 (dropped next plan).
   const a1 = ownerJob("daily-reporting", "daily-reporting:catalog");
-  const a2 = { ...ownerJob("daily-reporting", "daily-reporting:asin-day-superset"), requestHash: "H2" };
+  const a2 = { ...ownerJob("daily-reporting", "daily-reporting:oli-sales"), requestHash: "H2" };
   a2.owner = { ...a2.owner };
   await runSourceJobs({ store, dataDoe: dd, plannedJobs: [a1, a2], ownerIds: [a1.owner.ownerId], bucket: "us", cycleDate: "2026-08-11" });
   const cid = store.openCycle({ bucket: "us", cycleDate: "2026-08-11" });

@@ -53,6 +53,34 @@ export function splitDateRangeByDays(from, to, days) {
   return windows;
 }
 
+// Calendar-anchored intra-month slicer for the ONE canonical Order Line Items sales fragment shared by
+// daily-reporting, fba-plan, buy-box-loss, returns-leakage and ppc-performance. For each calendar month
+// overlapping [from, to] (splitDateRangeByMonth), emit the FIXED calendar bins [1-7],[8-14],[15-21],
+// [22-28],[29-monthEnd], each CLAMPED to [max(from, binStart), min(to, binEnd)] and SKIPPED when empty.
+// Pure/UTC. The bins are anchored to the CALENDAR (day 1,8,15,22,29), NOT to `from`, so two reports with
+// DIFFERENT window starts but the SAME `to` (asOf) produce byte-identical interior + asOf-boundary slices:
+// identical (from, to) => identical request_hash => ONE DataDoe export reused by MULTIPLE report owners.
+// For a FULL calendar month this yields exactly [1-7,8-14,15-21,22-28,29-end] (the former daily scheme);
+// for a partial first month it stays calendar-anchored (e.g. from day 10 clamps the [8-14] bin to [10-14]).
+export function canonicalOliSlices(from, to) {
+  const slices = [];
+  for (const month of splitDateRangeByMonth(from, to)) {
+    const [y, m] = month.from.slice(0, 7).split("-").map(Number);
+    const monthEnd = daysInMonthUTC(y, m);
+    const bins = [[1, 7], [8, 14], [15, 21], [22, 28], [29, monthEnd]];
+    for (const [binStartDay, binEndDay] of bins) {
+      if (binStartDay > monthEnd) continue; // e.g. a 28-day February has no [29-..] bin
+      const binStart = `${y}-${pad2s(m)}-${pad2s(binStartDay)}`;
+      const binEnd = `${y}-${pad2s(m)}-${pad2s(binEndDay)}`;
+      const sliceFrom = binStart < from ? from : binStart;
+      const sliceTo = binEnd > to ? to : binEnd;
+      if (sliceFrom > sliceTo) continue; // empty after clamping to [from, to]
+      slices.push({ from: sliceFrom, to: sliceTo });
+    }
+  }
+  return slices;
+}
+
 export function isFullCalendarMonthWindow(window) {
   const [year, month] = window.from.slice(0, 7).split("-").map(Number);
   return window.from === `${year}-${pad2s(month)}-01`

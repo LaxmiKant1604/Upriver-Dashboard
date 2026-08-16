@@ -34,7 +34,7 @@ let DERIVE_TIMEOUT_SAFE_SLICE_DAYS, deriveReportSnapshot;
 let assembleSources, runReportJobs;
 let reportSourceRequestHashes;
 let dailyReportingPayload, reconciliationPayload, returnsLeakagePayload, resolveDailyAdsAvailability;
-let splitDateRangeByDays, splitDateRangeByMonth, addDaysStr;
+let splitDateRangeByDays, splitDateRangeByMonth, addDaysStr, canonicalOliSlices;
 let plannedSourceJob, runStagedSourceCycle;
 
 const CONNS = [{ id: "primary", apiKey: ["prim", "key"].join("-"), accountPrefix: "" }];
@@ -89,7 +89,7 @@ function assertExactCoverage(slices, from, to, { monthBounded = false, desc = fa
 test("daily superset slices: ordered ASC, month-bounded, exact coverage (incl. leap February)", () => {
   for (const asOf of ["2025-08-10", "2024-03-05", "2026-01-31", "2024-07-31"]) {
     const req = planDailyReporting({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf });
-    const slices = req.sources.filter((s) => s.requestKey === "daily-reporting:asin-day-superset").map((s) => ({ from: s.from, to: s.to }));
+    const slices = req.sources.filter((s) => s.requestKey === "daily-reporting:oli-sales").map((s) => ({ from: s.from, to: s.to }));
     assertExactCoverage(slices, req.context.from, req.context.to, { monthBounded: true });
   }
 });
@@ -111,6 +111,40 @@ test("returns slices: NEWEST-FIRST (source is date DESC), exact 60-day coverage"
   assertExactCoverage(slices, addDaysStr(ASOF, -59), ASOF, { desc: true });
 });
 
+// Blocker 1a: the canonical cross-report OLI slicer. Calendar-anchored bins, not anchored to `from`, so
+// different window STARTS with the SAME asOf share every interior slice (=> shared request_hashes).
+test("canonicalOliSlices: full / partial-start / cross-month / asOf-mid-bin; different starts + same asOf share every interior slice", () => {
+  // Full calendar month -> the fixed [1-7],[8-14],[15-21],[22-28],[29-end] bins.
+  assert.deepEqual(canonicalOliSlices("2025-07-01", "2025-07-31"), [
+    { from: "2025-07-01", to: "2025-07-07" }, { from: "2025-07-08", to: "2025-07-14" },
+    { from: "2025-07-15", to: "2025-07-21" }, { from: "2025-07-22", to: "2025-07-28" },
+    { from: "2025-07-29", to: "2025-07-31" },
+  ]);
+  // Partial-start month: the first bin stays CALENDAR-anchored (clamped to `from`), NOT re-anchored to `from`.
+  assert.deepEqual(canonicalOliSlices("2025-07-10", "2025-07-31")[0], { from: "2025-07-10", to: "2025-07-14" });
+  // A 28-day February has NO [29-..] bin.
+  assert.equal(canonicalOliSlices("2025-02-01", "2025-02-28").length, 4);
+  // Cross-month: contiguous, month-bounded bins across the boundary.
+  const xm = canonicalOliSlices("2025-07-18", "2025-08-14");
+  assert.deepEqual(xm[0], { from: "2025-07-18", to: "2025-07-21" });
+  assert.deepEqual(xm[xm.length - 1], { from: "2025-08-08", to: "2025-08-14" });
+  // asOf mid-bin: the final (current-month) bin is clamped to asOf.
+  assert.deepEqual(canonicalOliSlices("2025-08-01", "2025-08-14"), [
+    { from: "2025-08-01", to: "2025-08-07" }, { from: "2025-08-08", to: "2025-08-14" },
+  ]);
+  // Different window STARTS but the SAME asOf share EVERY interior slice.
+  const asOf = "2025-08-14";
+  const shortW = canonicalOliSlices(addDaysStr(asOf, -29), asOf); // ppc-like 30d window
+  const longW = canonicalOliSlices(addDaysStr(asOf, -59), asOf);  // returns-like 60d window
+  const key = (s) => s.from + ".." + s.to;
+  const longKeys = new Set(longW.map(key));
+  const interior = shortW.slice(1).map(key); // every slice except the clamped (partial) first one
+  assert.ok(interior.length > 0);
+  for (const k of interior) assert.ok(longKeys.has(k), "interior slice " + k + " is shared across both windows");
+  // The clamped first slice of the shorter window is NOT shared (its `from` differs).
+  assert.ok(!longKeys.has(key(shortW[0])), "the partial first slice is window-specific, never falsely shared");
+});
+
 /* ============================= 3: split == former-unsplit deep equality ============================= */
 
 test("daily-reporting: SLICED derive deep-equals the former UNSPLIT calculation (same concatenated rows)", () => {
@@ -123,7 +157,7 @@ test("daily-reporting: SLICED derive deep-equals the former UNSPLIT calculation 
   ];
   const catalog = [{ child_asin: "A1", product_brand: "Acme" }];
   const slices = splitDateRangeByMonth(from, to).flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
-  const { planned, byHash } = slicedPlanned("daily-reporting:asin-day-superset", slices, rows, ["S1"]);
+  const { planned, byHash } = slicedPlanned("daily-reporting:oli-sales", slices, rows, ["S1"]);
   const cat = frag("daily-reporting:catalog", from, to, ["S1"]);
   planned.push(cat); byHash.set(cat.requestHash, catalog);
   const context = { brand: "ALL", from, to, rawSellerId: "S1", currency: "USD", accountId: ID };
@@ -174,15 +208,16 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
     { date: "2025-07-15", sku: "S", child_asin: "R1", amazon_order_id: "O", amazon_return_reason: "TOO_SMALL", amazon_fulfillment_channel: "FBM", amazon_return_request_status: "PendingApproval", amazon_return_refunded_amount: -5, amazon_return_label_cost: -1, amazon_return_label_to_be_paid_by: "Amazon" },
   ];
   const settlements = [{ sku: "S", child_asin: "R1", settlement_type: "ORDER", currency: "USD", item_price_sum: 200, quantity_sum: 20 }];
-  const ordered = [{ child_asin: "R1", item_price_currency: "USD", product_name: "W", sales_sum: 500, units_sum: 50 }];
+  const ordered = [{ date: "2025-08-01", seller_or_vendor_id: ID, sku: "S", child_asin: "R1", item_price_currency: "USD", product_name: "W", total_sales_sum: 500, total_units_sum: 50 }];
   const catalog = [{ child_asin: "R1", parent_asin: "P", product_name: "W", product_brand: "Acme" }];
-  const slices = splitDateRangeByDays(from, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
-  const r = slicedPlanned("returns-leakage:returns", slices, returns);
+  const returnSlices = splitDateRangeByDays(from, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
+  const r = slicedPlanned("returns-leakage:returns", returnSlices, returns);
+  // Blocker 1: the canonical OLI sales fragment is sliced by canonicalOliSlices (per-row date binding).
+  const oli = slicedPlanned("returns-leakage:oli-sales", canonicalOliSlices(from, ASOF), ordered);
   const se = frag("returns-leakage:settlements", from, ASOF);
-  const tr = frag("returns-leakage:ordered", from, ASOF);
   const ca = frag("returns-leakage:catalog", null, null);
-  const planned = [...r.planned, se, tr, ca];
-  const byHash = new Map([...r.byHash, [se.requestHash, settlements], [tr.requestHash, ordered], [ca.requestHash, catalog]]);
+  const planned = [...r.planned, ...oli.planned, se, ca];
+  const byHash = new Map([...r.byHash, ...oli.byHash, [se.requestHash, settlements], [ca.requestHash, catalog]]);
   const res = deriveReportSnapshot({ reportKey: "returns-leakage", sources: buildSources(planned, byHash), context: { to: ASOF, rawSellerId: ID, accountId: ID } });
   assert.equal(res.status, "derived");
   // FORMER calculation: the pure builder over the unsplit DESC-ordered rows with the identical route labels
@@ -200,20 +235,21 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
 /* ============================= 4: GOLDEN request hashes (intentional change) ============================= */
 
 test("GOLDEN: the sliced request windows produce the pinned request_hashes for a fixed synthetic input", () => {
-  // Fixed input (PIN_KEY / A1 / asOf 2025-08-10). These hashes CHANGED intentionally with the slicing --
-  // pinning the first+last slice of each affected key locks the new identities against silent drift.
+  // Fixed input (PIN_KEY / A1 / asOf 2025-08-10). These hashes CHANGED intentionally with the CANONICAL OLI
+  // fragment (Blocker 1: columns now [date, seller_or_vendor_id, sku, child_asin, item_price_currency],
+  // sliced by canonicalOliSlices) -- pinning the first+last slice locks the new identities against silent drift.
   const daily = reportSourceRequestHashes({
     reportKey: "daily-reporting", apiKey: ["PIN", "KEY"].join("_"), ids: ["A1"],
     windowsByRequestKey: {
-      "daily-reporting:asin-day-superset": splitDateRangeByMonth("2025-03-01", "2025-08-10").flatMap((m) => splitDateRangeByDays(m.from, m.to, 7)),
+      "daily-reporting:oli-sales": canonicalOliSlices("2025-03-01", "2025-08-10"),
       "daily-reporting:catalog": [{ from: "2025-03-01", to: "2025-08-10" }],
     }, marketplaceCountry: "US",
-  }).filter((s) => s.requestKey === "daily-reporting:asin-day-superset");
+  }).filter((s) => s.requestKey === "daily-reporting:oli-sales");
   assert.equal(daily.length, 27, "6 calendar months (Mar..Aug-partial) -> 27 slices");
   assert.deepEqual([daily[0].from, daily[0].to], ["2025-03-01", "2025-03-07"]);
   assert.deepEqual([daily[daily.length - 1].from, daily[daily.length - 1].to], ["2025-08-08", "2025-08-10"]);
-  assert.equal(daily[0].requestHash, "99939b3b01c5ce7f66146307dfff8517a31fdbe9900f4c7133e5b0706b742f61");
-  assert.equal(daily[daily.length - 1].requestHash, "1d6aaab02c1a7183182661a054ade43c782d1af5e9032c575e8c00a8c75b6af9");
+  assert.equal(daily[0].requestHash, "02d7aa16453067833ee637e53b4fcf792f0b97a0d612d7f16953f52117123761");
+  assert.equal(daily[daily.length - 1].requestHash, "8fcc3346f1159eb883364af9991a24dc1ddc83a1781d3c81883edbd2c6aa1b15");
 });
 
 /* ============================= 5: malformed-fragment fail-closed matrix ============================= */
@@ -225,13 +261,13 @@ test("malformed sliced fragments fail closed (LKG): reordered / duplicate / miss
   const context = { brand: "ALL", from, to, rawSellerId: "S1", currency: "USD", accountId: ID };
   const slices = splitDateRangeByMonth(from, to).flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
   const build = (mutate) => {
-    const { planned, byHash } = slicedPlanned("daily-reporting:asin-day-superset", slices, rows, ["S1"]);
+    const { planned, byHash } = slicedPlanned("daily-reporting:oli-sales", slices, rows, ["S1"]);
     const cat = frag("daily-reporting:catalog", from, to, ["S1"]);
     planned.push(cat); byHash.set(cat.requestHash, catalog);
     mutate(planned, byHash);
     return deriveReportSnapshot({ reportKey: "daily-reporting", sources: buildSources(planned, byHash), context });
   };
-  const supersetOf = (planned) => planned.filter((p) => p.requestKey === "daily-reporting:asin-day-superset");
+  const supersetOf = (planned) => planned.filter((p) => p.requestKey === "daily-reporting:oli-sales");
   // control: untouched sliced plan derives.
   assert.equal(build(() => {}).status, "derived");
   // reordered slices
@@ -241,10 +277,10 @@ test("malformed sliced fragments fail closed (LKG): reordered / duplicate / miss
   r = build((planned) => { const s = supersetOf(planned); s[1].from = s[0].from; s[1].to = s[0].to; });
   assert.equal(r.status, "invalid", "duplicate slice rejected");
   // missing slice
-  r = build((planned) => { const i = planned.findIndex((p) => p.requestKey === "daily-reporting:asin-day-superset"); planned.splice(i, 1); });
+  r = build((planned) => { const i = planned.findIndex((p) => p.requestKey === "daily-reporting:oli-sales"); planned.splice(i, 1); });
   assert.equal(r.status, "invalid", "missing slice rejected");
   // extra slice
-  r = build((planned, byHash) => { const x = frag("daily-reporting:asin-day-superset", "2025-08-11", "2025-08-11", ["S1"]); planned.push(x); byHash.set(x.requestHash, []); });
+  r = build((planned, byHash) => { const x = frag("daily-reporting:oli-sales", "2025-08-11", "2025-08-11", ["S1"]); planned.push(x); byHash.set(x.requestHash, []); });
   assert.equal(r.status, "invalid", "extra slice rejected");
   // wrong window (first slice shifted)
   r = build((planned) => { supersetOf(planned)[0].to = "2025-03-08"; });
@@ -305,7 +341,7 @@ test("sliced sources resume across bounded invocations with at most ONE create-e
 test("one failed slice blocks ONLY its own report: the sibling report still derives (failure isolation)", async () => {
   const from = "2025-03-01", to = ASOF;
   const slices = splitDateRangeByMonth(from, to).flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
-  const daily = slicedPlanned("daily-reporting:asin-day-superset", slices, [], ["S1"]);
+  const daily = slicedPlanned("daily-reporting:oli-sales", slices, [], ["S1"]);
   const dcat = frag("daily-reporting:catalog", from, to, ["S1"]);
   // brand-sales (sibling) with healthy sources.
   const bsOrders = frag("brand-sales:order-lines", "2024-06-01", to, ["S1"]);
@@ -335,7 +371,7 @@ async function main() {
   ({ reportSourceRequestHashes } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ dailyReportingPayload, reconciliationPayload, returnsLeakagePayload } = await import("../lib/server/reports/derivation-core.js"));
   ({ resolveDailyAdsAvailability } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ splitDateRangeByDays, splitDateRangeByMonth, addDaysStr } = await import("../lib/server/date-windows.js"));
+  ({ splitDateRangeByDays, splitDateRangeByMonth, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ plannedSourceJob, runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   for (const t of tests) {
     try { await t.fn(); passed += 1; out("  ok  " + t.name); }

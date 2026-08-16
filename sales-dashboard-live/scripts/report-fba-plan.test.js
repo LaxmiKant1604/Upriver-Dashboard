@@ -8,7 +8,8 @@
 // genuine-zero inventory -> zero, latest-inventory-snapshot-only, representative stable SKU,
 // completed + MTD units, catalog brand/name mapping, FC-transfer/inbound overlap adjustment,
 // inventoryByBrandCountry folding, removal of zero-sales/zero-stock ASINs, duplicate/missing/
-// reordered month + cross-account rejection, last-known-good preservation, and idempotent derivation.
+// reordered/cross-account oli-sales fragment rejection, last-known-good preservation, and idempotent
+// derivation.
 // Also parity-checks the shared planMonthWindows helper against the route formula.
 //
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy
@@ -32,7 +33,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 // Assigned in main() after the dummy env is set.
 let assembleSources, deriveReportSnapshot, runReportJobs;
 let fbaPlanPayload, foldPlanAsinUnits;
-let planMonthWindows, addDaysStr, planFbaPlan;
+let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -65,12 +66,20 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// Build the FBA planned fragments + loaded rows. `unitRowsByIdx` aligns to WINS (0..2 completed, 3 MTD).
-function fbaPlanned({ unitRowsByIdx = [[], [], [], []], dailyRows = [], catalogRows = [], invRows = [], awdRows = [], ids = [ID], includeAwd = true } = {}) {
+// Build the ONE canonical fba-plan:oli-sales source (its fragments ARE canonicalOliSlices(
+// completed[0].from, asOf)) plus catalog / inventory-health / AWD. `oliByIdx` aligns canonical rows to
+// WINS (0..2 completed months, 3 the current MTD month); each row is bucketed into the slice whose window
+// contains its `date`, so foldOliSalesToFbaInputs reconstructs the SAME per-ASIN monthly + MTD units and
+// current-month latest-date probe the former monthly-units + current-daily-dates fragments encoded.
+function fbaPlanned({ oliByIdx = [[], [], [], []], catalogRows = [], invRows = [], awdRows = [], ids = [ID], includeAwd = true } = {}) {
   const planned = [];
   const rows = {};
-  WINS.forEach((w, i) => { const f = frag("fba-plan:monthly-units", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = unitRowsByIdx[i] || []; });
-  const dd = frag("fba-plan:current-daily-dates", WINS[3].from, WINS[3].to, ids); planned.push(dd); rows[dd.requestHash] = dailyRows;
+  const allOli = oliByIdx.flat();
+  for (const s of canonicalOliSlices(WINS[0].from, ASOF)) {
+    const f = frag("fba-plan:oli-sales", s.from, s.to, ids);
+    planned.push(f);
+    rows[f.requestHash] = allOli.filter((r) => r.date >= s.from && r.date <= s.to);
+  }
   const cat = frag("fba-plan:catalog", WINS[0].from, WINS[3].to, ids); planned.push(cat); rows[cat.requestHash] = catalogRows;
   const inv = frag("fba-plan:inventory-health", INV_WINDOW.from, INV_WINDOW.to, ids); planned.push(inv); rows[inv.requestHash] = invRows;
   if (includeAwd) { const awd = frag("fba-plan:awd", null, null, ids); planned.push(awd); rows[awd.requestHash] = awdRows; }
@@ -114,19 +123,26 @@ function fbaReportPlan(planned, rows) {
   const store = makeReportStore();
   for (const p of planned) store.seedSourceSucceeded(p.requestHash);
   const sources = planned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
-  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-2", sources, context: usContext() };
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-3", sources, context: usContext() };
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
   return { store, plannedReport, sourceRows };
 }
 
 // ---- shared parity fixture (a US account with sales, inventory + AWD) ----
-const UNITS = [
-  [{ child_asin: "ASIN1", units_sum: 10 }, { child_asin: "ASIN2", units_sum: 5 }], // May
-  [{ child_asin: "ASIN1", units_sum: 20 }],                                        // Jun
-  [{ child_asin: "ASIN1", units_sum: 7 }],                                         // Jul
-  [{ child_asin: "ASIN1", units_sum: 3 }],                                         // Aug MTD
+// The ONE canonical Order Line Items sales source, as rows aligned to WINS (0..2 completed months,
+// 3 the current MTD month). Units are currency-agnostic, so foldOliSalesToFbaInputs sums total_units_sum
+// per ASIN per month and probes the latest current-month date whose units are > 0. The Aug 08-06 ZERO
+// row proves a newer zero-units date never anchors salesLatestDate (it stays 2025-08-05, elapsedDays 5).
+const oliRow = (date, child_asin, units) => ({
+  date, seller_or_vendor_id: ID, sku: null, child_asin,
+  item_price_currency: "USD", total_sales_sum: 0, total_units_sum: units,
+});
+const OLI = [
+  [oliRow("2025-05-04", "ASIN1", 10), oliRow("2025-05-04", "ASIN2", 5)], // May: ASIN1 10, ASIN2 5
+  [oliRow("2025-06-03", "ASIN1", 20)],                                   // Jun: ASIN1 20
+  [oliRow("2025-07-02", "ASIN1", 7)],                                    // Jul: ASIN1 7
+  [oliRow("2025-08-01", "ASIN1", 2), oliRow("2025-08-05", "ASIN1", 1), oliRow("2025-08-06", "ASIN1", 0)], // Aug MTD 3; latest units>0 = 08-05
 ];
-const DAILY = [{ date: "2025-08-01", units_sum: 2 }, { date: "2025-08-05", units_sum: 4 }, { date: "2025-08-06", units_sum: 0 }];
 const CATALOG = [{ child_asin: "ASIN1", product_brand: "Acme", product_name: "Widget" }, { child_asin: "ASIN2", product_brand: "Beta", product_name: "Gadget" }];
 const INV = [
   { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", marketplace_country_code: "US", available: 100, reserved_fc_transfer: 8, reserved_fc_processing: 1, inbound_shipped: 5, inbound_received: 2, inbound_working: 0, product_name: "Widget Inv" },
@@ -163,7 +179,7 @@ const EXPECTED = {
 group("fba-plan: exact route-payload parity (US with AWD)");
 
 test("fba-plan: US payload deep-equals the hand-computed route payload", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const res = deriveFba(planned, rows);
   assert.equal(res.status, "derived");
   assert.deepEqual(res.payload, EXPECTED);
@@ -173,29 +189,29 @@ test("fba-plan: US payload deep-equals the hand-computed route payload", () => {
 test("fba-plan: representative SKU is the first localeCompare SKU (stable across refreshes)", () => {
   // ASIN1 has two inventory SKUs; the representative is the first ascending.
   const inv = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-Z", available: 1 }, { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-A", available: 1 }];
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: inv, awdRows: [] });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: [] });
   const row = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN1");
   assert.equal(row.sku, "SKU-A");
 });
 
 test("fba-plan: FC-transfer/inbound overlap is subtracted (max(0, fcTransfer - inboundShipped))", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   assert.equal(deriveFba(planned, rows).payload.rows[0].reservedFcTransfer, 3); // 8 - 5
   // Floor at zero when inbound exceeds the FC-transfer reserve.
   const inv2 = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 1, reserved_fc_transfer: 2, inbound_shipped: 9 }];
-  const two = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: inv2, awdRows: [] });
+  const two = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv2, awdRows: [] });
   assert.equal(deriveFba(two.planned, two.rows).payload.rows[0].reservedFcTransfer, 0);
 });
 
 test("fba-plan: completed-month + MTD units are preserved per ASIN", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const a1 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN1");
   assert.deepEqual(a1.unitsByMonth, { "2025-05": 10, "2025-06": 20, "2025-07": 7 });
   assert.equal(a1.mtdUnits, 3);
 });
 
 test("fba-plan: only the latest inventory snapshot date is folded", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const p = deriveFba(planned, rows).payload;
   assert.equal(p.inventoryDate, "2025-08-06");
   assert.equal(p.rows[0].fbaAvailable, 100, "the older 999 snapshot row is ignored");
@@ -207,7 +223,7 @@ test("fba-plan: inventoryByBrandCountry folds per (marketplace, brand)", () => {
     { date: "2025-08-06", child_asin: "ASIN2", sku: "S2", marketplace_country_code: "CA", available: 4 },
   ];
   const cat = [{ child_asin: "ASIN1", product_brand: "Acme" }, { child_asin: "ASIN2", product_brand: "Beta" }];
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: [[], [], [], []], dailyRows: [], catalogRows: cat, invRows: inv, awdRows: [] });
+  const { planned, rows } = fbaPlanned({ oliByIdx: [[], [], [], []], catalogRows: cat, invRows: inv, awdRows: [] });
   const fold = deriveFba(planned, rows).payload.inventoryByBrandCountry;
   assert.deepEqual(fold, [
     { country: "US", brand: "Acme", fbaAvailable: 10, skuCount: 1 },
@@ -220,7 +236,7 @@ test("fba-plan: inventoryByBrandCountry folds per (marketplace, brand)", () => {
 group("fba-plan: AWD is US-only and never silently zero");
 
 test("fba-plan: non-US account plans + reads NO AWD; awdAvailable false, per-row awdAvailable null", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, includeAwd: false });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, includeAwd: false });
   const p = deriveFba(planned, rows, usContext({ marketCountry: "CA", isUS: false })).payload;
   assert.equal(p.isUS, false);
   assert.equal(p.awdAvailable, false);
@@ -228,21 +244,21 @@ test("fba-plan: non-US account plans + reads NO AWD; awdAvailable false, per-row
 });
 
 test("fba-plan: a US account with a MISSING AWD source blocks (never a silent zero)", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, includeAwd: false });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, includeAwd: false });
   const res = deriveFba(planned, rows, usContext());
   assert.equal(res.status, "invalid");
   assert.equal(res.payload, null, "no snapshot -> last-known-good preserved");
 });
 
 test("fba-plan: a US account with a FAILED AWD source blocks", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const awdHash = planned.find((p) => p.requestKey === "fba-plan:awd").requestHash;
   const res = deriveFba(planned, rows, usContext(), { [awdHash]: "failed" });
   assert.equal(res.status, "invalid");
 });
 
 test("fba-plan: a VALIDATED EMPTY AWD source is NOT a failure (no AWD rows -> genuine zero)", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: [] });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: [] });
   const p = deriveFba(planned, rows, usContext()).payload;
   assert.equal(p.awdAvailable, false, "empty AWD => availability false");
   assert.equal(p.rows[0].awdAvailable, 0, "US row AWD is a genuine 0, not null");
@@ -253,7 +269,7 @@ test("fba-plan: a VALIDATED EMPTY AWD source is NOT a failure (no AWD rows -> ge
 group("fba-plan: inventory availability (null vs genuine zero)");
 
 test("fba-plan: an EMPTY inventory snapshot makes every FBA field null (not zero)", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: [], awdRows: [] });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: [], awdRows: [] });
   const p = deriveFba(planned, rows).payload;
   assert.equal(p.inventoryAvailable, false);
   const a1 = p.rows.find((r) => r.asin === "ASIN1");
@@ -263,7 +279,7 @@ test("fba-plan: an EMPTY inventory snapshot makes every FBA field null (not zero
 });
 
 test("fba-plan: a present snapshot with the ASIN absent yields genuine ZERO FBA stock", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const a2 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN2");
   assert.equal(a2.fbaAvailable, 0, "snapshot exists but ASIN2 absent => 0");
   assert.equal(a2.reservedFcTransfer, 0);
@@ -272,39 +288,39 @@ test("fba-plan: a present snapshot with the ASIN absent yields genuine ZERO FBA 
 test("fba-plan: zero-sales + zero-stock ASINs are dropped from rows", () => {
   // ASIN3 has no sales, no inventory, no AWD -> excluded. ASIN1 stays (has sales).
   const cat = [...CATALOG, { child_asin: "ASIN3", product_brand: "Gamma", product_name: "Ghost" }];
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: cat, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: cat, invRows: INV, awdRows: AWD });
   const asins = deriveFba(planned, rows).payload.rows.map((r) => r.asin);
   assert.ok(!asins.includes("ASIN3"), "a catalog-only zero-activity ASIN is not emitted");
 });
 
 /* ============================= fragment-contract enforcement ============================= */
 
-group("fba-plan: monthly-units window + account enforcement");
+group("fba-plan: oli-sales slice window + account enforcement");
 
-test("fba-plan: a reordered monthly-units fragment is rejected", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.map((p, i) => ({ p, i })).filter(({ p }) => p.requestKey === "fba-plan:monthly-units").map(({ i }) => i);
-  [planned[idx[0]], planned[idx[1]]] = [planned[idx[1]], planned[idx[0]]];
+test("fba-plan: a reordered oli-sales fragment is rejected", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.map((p, i) => ({ p, i })).filter(({ p }) => p.requestKey === "fba-plan:oli-sales").map(({ i }) => i);
+  [planned[idx[0]], planned[idx[1]]] = [planned[idx[1]], planned[idx[0]]]; // two adjacent slices swapped
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
-test("fba-plan: a duplicated month (wrong window) is rejected", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.map((p, i) => ({ p, i })).filter(({ p }) => p.requestKey === "fba-plan:monthly-units").map(({ i }) => i);
-  planned[idx[2]] = { ...planned[idx[2]], from: "2025-05-01", to: "2025-05-31" }; // Jul slot now duplicates May
+test("fba-plan: a duplicated oli-sales slice (wrong window) is rejected", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.map((p, i) => ({ p, i })).filter(({ p }) => p.requestKey === "fba-plan:oli-sales").map(({ i }) => i);
+  planned[idx[2]] = { ...planned[idx[2]], from: "2025-05-01", to: "2025-05-07" }; // third slice now duplicates the first slice window
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
-test("fba-plan: a missing monthly-units fragment (only three) is rejected", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:monthly-units");
+test("fba-plan: a missing oli-sales fragment (one slice removed) is rejected", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:oli-sales");
   planned.splice(idx, 1);
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
-test("fba-plan: a cross-account monthly-units fragment is rejected", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:monthly-units");
+test("fba-plan: a cross-account oli-sales fragment is rejected", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:oli-sales");
   planned[idx] = { ...planned[idx], sellerOrVendorIds: ["OTHER"] };
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
@@ -318,14 +334,14 @@ test("fba-plan: derivation performs ZERO fetch/DataDoe calls", async () => {
   const calls = [];
   globalThis.fetch = async (u) => { calls.push(String(u)); throw new Error("NO_FETCH_DURING_DERIVATION"); };
   try {
-    const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+    const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
     assert.equal(deriveFba(planned, rows).status, "derived");
   } finally { globalThis.fetch = original; }
   assert.equal(calls.length, 0);
 });
 
 test("fba-plan: an unavailable required source preserves last-known-good (no snapshot)", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const catHash = planned.find((p) => p.requestKey === "fba-plan:catalog").requestHash;
   const res = deriveFba(planned, rows, usContext(), { [catHash]: "failed" });
   assert.equal(res.status, "unavailable");
@@ -333,7 +349,7 @@ test("fba-plan: an unavailable required source preserves last-known-good (no sna
 });
 
 test("fba-plan: derivation is idempotent (same inputs -> identical payload)", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   assert.deepEqual(deriveFba(planned, rows).payload, deriveFba(planned, rows).payload);
 });
 
@@ -358,8 +374,9 @@ test("planMonthWindows: matches the route formula (3 completed months + current 
 test("planFbaPlan: US account emits every source incl. AWD, single-account, deterministic hashes", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
   const keys = [...new Set(req.sources.map((s) => s.requestKey))].sort();
-  assert.deepEqual(keys, ["fba-plan:awd", "fba-plan:catalog", "fba-plan:current-daily-dates", "fba-plan:inventory-health", "fba-plan:monthly-units"]);
-  assert.equal(req.sources.filter((s) => s.requestKey === "fba-plan:monthly-units").length, 4, "3 completed + MTD");
+  assert.deepEqual(keys, ["fba-plan:awd", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:oli-sales"]);
+  const expectedOliSlices = canonicalOliSlices(planMonthWindows(ASOF).completed[0].from, ASOF);
+  assert.equal(req.sources.filter((s) => s.requestKey === "fba-plan:oli-sales").length, expectedOliSlices.length, "one fragment per canonical OLI slice (3 completed months + current MTD)");
   assert.ok(req.sources.every((s) => s.sellerOrVendorIds.length === 1 && s.sellerOrVendorIds[0] === ID));
   assert.deepEqual(req.context, { to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true });
   const b = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF }).sources.map((s) => s.requestHash);
@@ -394,7 +411,7 @@ test("fba-plan: the canonical inventory window IS addDaysStr(asOf,-10)..asOf and
 });
 
 test("fba-plan: a SHORTENED inventory lookback (from > asOf-10) blocks; payload null", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
   planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) };
   const res = deriveFba(planned, rows);
@@ -403,21 +420,21 @@ test("fba-plan: a SHORTENED inventory lookback (from > asOf-10) blocks; payload 
 });
 
 test("fba-plan: an EXTENDED inventory lookback (from < asOf-10) blocks", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
   planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -11) };
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
 test("fba-plan: a wrong inventory `to` (!= asOf) blocks", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
   planned[idx] = { ...planned[idx], to: addDaysStr(ASOF, -1) };
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
 test("fba-plan: a DATED AWD fragment (from/to not null) blocks; payload null", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:awd");
   planned[idx] = { ...planned[idx], from: "2025-08-01", to: ASOF };
   const res = deriveFba(planned, rows);
@@ -426,7 +443,7 @@ test("fba-plan: a DATED AWD fragment (from/to not null) blocks; payload null", (
 });
 
 test("fba-plan: EXACT canonical windows still derive the identical payload", () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   assert.deepEqual(deriveFba(planned, rows).payload, EXPECTED);
 });
 
@@ -441,7 +458,7 @@ test("planFbaPlan emits the canonical inventory (asOf-10..asOf) + no-date AWD wi
 });
 
 test("fba-plan worker: a shortened-inventory derive writes ZERO snapshots and preserves last-known-good", async () => {
-  const { planned, rows } = fbaPlanned({ unitRowsByIdx: UNITS, dailyRows: DAILY, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
   planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // shortened -> derive invalid before save
   const { store, plannedReport, sourceRows } = fbaReportPlan(planned, rows);
@@ -461,7 +478,7 @@ async function main() {
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
-  ({ planMonthWindows, addDaysStr } = await import("../lib/server/date-windows.js"));
+  ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ planFbaPlan } = await import("../lib/server/sync/report-planner.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 

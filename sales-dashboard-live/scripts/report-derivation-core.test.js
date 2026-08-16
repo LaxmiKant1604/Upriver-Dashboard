@@ -37,7 +37,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads,
     shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS, DERIVE_TIMEOUT_SAFE_SLICE_DAYS;
 let runReportJobs, assembleSources, buildDeriveContext;
-let splitDateRangeByMonth, splitDateRangeByDays;
+let splitDateRangeByMonth, splitDateRangeByDays, canonicalOliSlices;
 let reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows;
 let makeShadowSnapshotSaver;
 // Leaf (Scheduler v2) pure cores.
@@ -918,8 +918,7 @@ test("daily named-brand: catalog join EQUALS the production dailyRowsForBrand (f
 // silently drift from the contract.
 function seedDailyCycle() {
   const store = makeMemoryReportStore();
-  const slices = splitDateRangeByMonth(DR_FROM, DR_TO)
-    .flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
+  const slices = canonicalOliSlices(DR_FROM, DR_TO);
   const entries = slices.map((w, i) => ({
     hash: `h_slice_${i}`,
     window: w,
@@ -932,7 +931,7 @@ function seedDailyCycle() {
     ["h_cat", DR_CATALOG],
   ]));
   const plannedReports = [plan("daily-reporting", "A1", [
-    ...entries.map((e) => src("daily-reporting:asin-day-superset", e.hash, { sellerOrVendorIds: ["S1"], from: e.window.from, to: e.window.to })),
+    ...entries.map((e) => src("daily-reporting:oli-sales", e.hash, { sellerOrVendorIds: ["S1"], from: e.window.from, to: e.window.to })),
     src("daily-reporting:catalog", "h_cat"),
   ], { context: { brand: "ALL", from: DR_FROM, to: DR_TO, rawSellerId: "S1", currency: "USD" } })];
   // Ads are injected as a typed coverage contract; the derive layers Ads on the sales snapshot.
@@ -1520,7 +1519,7 @@ async function main() {
   mark("main(): loading report-derivation core modules");
   ({ REPORT_DERIVATIONS, deriveReportSnapshot, reportDerivationCoverage, compareReportPayloads, shadowSnapshotKey, DERIVED_ONLY_REPORT_KEYS, DERIVE_TIMEOUT_SAFE_SLICE_DAYS } = await import("../lib/server/sync/report-derivation.js"));
   ({ runReportJobs, assembleSources, buildDeriveContext } = await import("../lib/server/sync/report-worker.js"));
-  ({ splitDateRangeByMonth, splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
+  ({ splitDateRangeByMonth, splitDateRangeByDays, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ reportSourceRequestHashes, isValidCalendarDate, resolveDailyAdsAvailability, validateSkuPlMonthlyWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   const core = await import("../lib/server/reports/derivation-core.js");
   ({ orderSalesByBrand, catalogBrandNames, compactContentChangeEvents, contentChangesPayload } = core);

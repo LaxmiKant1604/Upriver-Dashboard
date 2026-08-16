@@ -157,10 +157,17 @@ export function normalizeDailySalesRows(rows) {
   }));
 }
 
-// Verbatim copy of api/datadoe.js normalizeAdRows.
+// Verbatim copy of api/datadoe.js normalizeAdRows. Blocker 4: the Ads currency is normalized from
+// ad_campaign_budget_currency into `currency` (canonical UPPERCASE, or null when blank/unprovable) so
+// the currency-keyed mergeSalesAndAds only merges an Ads row into the OLI sales row of the SAME currency.
+// A currency-less Ads row (currency === null) never merges into a currency'd sales row (fail-closed). An
+// already-normalized `currency` (the Supabase-saved / planner-loaded ad rows) is preserved.
 export function normalizeAdRows(rows) {
   return rows.map((row) => ({
     ...row,
+    currency: (row.currency != null && String(row.currency).trim() !== "")
+      ? String(row.currency).trim().toUpperCase()
+      : (String(row.ad_campaign_budget_currency || "").trim().toUpperCase() || null),
     ad_sales: num(row.ad_sales_sum ?? row.ad_sales),
     ad_spend: num(row.ad_spend_sum ?? row.ad_spend),
     ad_clicks: num(row.ad_clicks_sum ?? row.ad_clicks),
@@ -233,12 +240,12 @@ export function mergeSalesAndAds(salesRows, adRows) {
   return out;
 }
 
-// Scheduler-only roll-up: the browser's compact all-brand export groups the SAME Sales & Traffic
-// source by [date, seller_or_vendor_id] with the SAME aggregations, so it is a strict roll-up of
-// the ASIN/day superset (grouped by [date, seller_or_vendor_id, child_asin]). Summing the superset
-// over child_asin per (date, seller) reproduces the exact compact export rows
-// ({date, seller_or_vendor_id, total_sales_sum, total_units_sum}) in first-seen order. This is the
-// ONLY new fold (there is no standalone production function for it: the route uses the server-side
+// Scheduler-only roll-up: the browser's compact all-brand export groups the SAME Order Line Items
+// source by [date, seller_or_vendor_id] with the SAME aggregations, so it is a strict roll-up of the
+// canonical ASIN/day superset (grouped by [date, seller_or_vendor_id, sku, child_asin, item_price_currency]).
+// Summing the superset over sku + child_asin per (date, seller, currency) reproduces the exact compact
+// export rows ({date, seller_or_vendor_id, total_sales_sum, total_units_sum}) in first-seen order. This is
+// the ONLY new fold (there is no standalone production function for it: the route uses the server-side
 // grouped export). It is proven equal to the production compact calculation in the parity harness.
 export function rollupSupersetToDaily(supersetRows) {
   const byKey = new Map();
@@ -509,6 +516,43 @@ export function foldPlanAsinUnits(rows) {
     byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.quantity));
   }
   return byAsin;
+}
+
+// Fold the ONE canonical Order Line Items sales fragment (Blocker 1) into the per-month FBA inputs
+// fbaPlanPayload expects. The canonical rows carry {date, seller_or_vendor_id, sku, child_asin,
+// item_price_currency, total_units_sum}; units are a currency-agnostic COUNT so this sums
+// total_units_sum ACROSS currencies. Returns synthetic grouped rows shaped like the former per-month
+// exports so fbaPlanPayload + the live route are unchanged downstream:
+//   completedUnitRows -- [ [{child_asin, units_sum}], ... ] aligned to `completed`, ASIN in first-seen
+//                        (date-ordered) row order (byte-identical between live route + scheduler).
+//   mtdUnitRows       -- [{child_asin, units_sum}] for the current MTD month.
+//   dailyDateRows     -- [{date, units_sum}] summed per current-month date (the latest-date probe).
+// A row whose month is outside the completed+current set is ignored (the fragment window is exactly
+// those four months, so this only guards malformed input). Pure.
+export function foldOliSalesToFbaInputs(rows, completed, current) {
+  const completedKeys = (completed || []).map((m) => String(m.key));
+  const currentKey = current ? String(current.key) : "";
+  const known = new Set([...completedKeys, currentKey]);
+  const byMonthAsin = new Map(); // monthKey -> Map(asin -> units), asin insertion order = first-seen
+  const byDate = new Map();       // current-month date -> summed units
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const date = String((r && r.date) || "");
+    const mk = date.slice(0, 7);
+    const asin = String((r && r.child_asin) || "").trim();
+    const units = num(r && (r.total_units_sum ?? r.quantity));
+    if (asin && known.has(mk)) {
+      let m = byMonthAsin.get(mk);
+      if (!m) { m = new Map(); byMonthAsin.set(mk, m); }
+      m.set(asin, (m.get(asin) || 0) + units);
+    }
+    if (mk === currentKey && date) byDate.set(date, (byDate.get(date) || 0) + units);
+  }
+  const rowsForMonth = (mk) => [...(byMonthAsin.get(mk) || new Map())].map(([child_asin, units_sum]) => ({ child_asin, units_sum }));
+  return {
+    completedUnitRows: completedKeys.map(rowsForMonth),
+    mtdUnitRows: rowsForMonth(currentKey),
+    dailyDateRows: [...byDate].sort((a, b) => a[0].localeCompare(b[0])).map(([date, units_sum]) => ({ date, units_sum })),
+  };
 }
 
 /**
@@ -1069,9 +1113,11 @@ export function buyBoxDailyFold(sliceRowArrays) {
 }
 
 /**
- * Fold the ordered Order Line Items slices (grouped by sku + child_asin + item_price_currency, aggregations
- * item_price_value->sales_sum / quantity->units_sum) into a per (currency|sku) map of { sales, units },
- * byte-identical to buildBuyBoxLoss()'s ordered slice loop. Currency is NEVER merged (it is part of the key).
+ * Fold the ordered slices of the ONE CANONICAL Order Line Items sales fragment (grouped by
+ * [date, seller_or_vendor_id, sku, child_asin, item_price_currency], aggregations item_price_value->
+ * total_sales_sum / quantity->total_units_sum) into a per (currency|sku) map of { sales, units },
+ * byte-identical to buildBuyBoxLoss()'s ordered slice loop. Currency is NEVER merged (it is part of the
+ * key); the canonical date/seller columns are summed away into the currency|sku join key.
  */
 export function buyBoxOrderedFold(sliceRowArrays) {
   const bySku = new Map();
@@ -1083,8 +1129,8 @@ export function buyBoxOrderedFold(sliceRowArrays) {
       const key = `${currency || "?"}|${sku}`;
       let entry = bySku.get(key);
       if (!entry) { entry = { sales: 0, units: 0 }; bySku.set(key, entry); }
-      entry.sales += smSumField(row, "sales_sum", "item_price_value");
-      entry.units += smSumField(row, "units_sum", "quantity");
+      entry.sales += smSumField(row, "total_sales_sum", "item_price_value");
+      entry.units += smSumField(row, "total_units_sum", "quantity");
     }
   }
   return bySku;
@@ -1277,20 +1323,22 @@ export function returnsLeakageSettlementFold(rows) {
   return { moneyByKey, currencies };
 }
 
-// Fold ordered sales/units per ASIN (Order Line Items -> the return-rate denominator). Byte-identical
-// to returns.js's ordered loop.
+// Fold ordered sales/units per (currency, ASIN) from the canonical Order Line Items fragment (the
+// return-rate denominator, bound per currency -- Blocker 2). Byte-identical to returns.js's ordered loop.
 export function returnsLeakageOrderedFold(rows) {
-  const orderedByAsin = new Map();
+  const orderedByKey = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
     const asin = String(row.child_asin || "").trim();
     if (!asin) continue;
-    const entry = orderedByAsin.get(asin) || { sales: 0, orderedUnits: 0, productName: null };
-    entry.sales += smSumField(row, "sales_sum", "item_price_value");
-    entry.orderedUnits += smSumField(row, "units_sum", "quantity");
+    const currency = String(row.item_price_currency || "").trim() || null;
+    const key = `${currency || "?"}|${asin}`;
+    const entry = orderedByKey.get(key) || { asin, currency, sales: 0, orderedUnits: 0, productName: null };
+    entry.sales += smSumField(row, "total_sales_sum", "item_price_value");
+    entry.orderedUnits += smSumField(row, "total_units_sum", "quantity");
     if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
-    orderedByAsin.set(asin, entry);
+    orderedByKey.set(key, entry);
   }
-  return { orderedByAsin };
+  return { orderedByKey };
 }
 
 /**
@@ -1305,41 +1353,69 @@ export function returnsLeakagePayload({
 }) {
   const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
   const { moneyByKey, currencies } = returnsLeakageSettlementFold(settlementRows);
-  const { orderedByAsin } = returnsLeakageOrderedFold(orderedRows);
+  const { orderedByKey } = returnsLeakageOrderedFold(orderedRows);
   const catalog = salesMoversCatalogFold(catalogRows);
 
   const asins = new Set([
     ...returnsByAsin.keys(),
-    ...orderedByAsin.keys(),
+    ...[...orderedByKey.values()].map((entry) => entry.asin),
     ...[...moneyByKey.values()].map((entry) => entry.asin),
   ]);
   const rows = [];
   for (const asin of asins) {
     const returns = returnsByAsin.get(asin) || null;
-    const ordered = orderedByAsin.get(asin) || null;
-    // An ASIN can appear under more than one currency; each keeps its own row.
-    const moneyEntries = [...moneyByKey.values()].filter((entry) => entry.asin === asin);
-    const targets = moneyEntries.length ? moneyEntries : [null];
     const meta = catalog.byAsin.get(asin) || {};
-    for (const money of targets) {
-      // A return-leakage candidate has actual return records OR settlement refund events. Ordered
-      // units alone (no returns, no refunds) is not leakage.
-      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0);
+    // The ASIN's currency universe = union of settlement-money currencies + ordered currencies. Each row's
+    // orderedUnits/sales/refund money come from THAT currency ONLY (never a combined total copied across).
+    const byCurrency = new Map();
+    for (const m of [...moneyByKey.values()].filter((e) => e.asin === asin)) {
+      const c = m.currency ?? null;
+      const slot = byCurrency.get(c) || { currency: c, money: null, ordered: null };
+      slot.money = m; byCurrency.set(c, slot);
+    }
+    for (const o of [...orderedByKey.values()].filter((e) => e.asin === asin)) {
+      const c = o.currency ?? null;
+      const slot = byCurrency.get(c) || { currency: c, money: null, ordered: null };
+      slot.ordered = o; byCurrency.set(c, slot);
+    }
+    // An ASIN with returns but NO money and NO ordered evidence has a single null-currency row.
+    if (byCurrency.size === 0 && returns) byCurrency.set(null, { currency: null, money: null, ordered: null });
+    const slots = [...byCurrency.values()];
+    const multiCurrency = slots.length > 1;
+    // Returns carry no currency. SINGLE currency: the sole row holds the returnCount + returnedUnits (rate
+    // known). MULTIPLE currencies: the returnCount goes on exactly ONE deterministic PRIMARY row (greatest
+    // ordered units; tie-break lexicographically smallest currency), 0 on the others, and returnedUnits is
+    // WITHHELD (null) on ALL of the ASIN's rows so the rate is never computed from a currency-ambiguous count.
+    let primary = null;
+    if (returns && multiCurrency) {
+      primary = slots.slice().sort((a, b) => {
+        const ua = a.ordered ? a.ordered.orderedUnits : 0;
+        const ub = b.ordered ? b.ordered.orderedUnits : 0;
+        if (ub !== ua) return ub - ua;
+        return String(a.currency ?? "").localeCompare(String(b.currency ?? ""));
+      })[0];
+    }
+    for (const slot of slots) {
+      const money = slot.money;
+      const ordered = slot.ordered;
+      const isReturnHolder = Boolean(returns) && (!multiCurrency || slot === primary);
+      // A return-leakage candidate row holds the ASIN's returns OR has its OWN currency's refund events.
+      const hasReturnActivity = isReturnHolder || (money && money.refundEvents > 0);
       if (!hasReturnActivity) continue;
-      const skus = new Set([...(returns?.skus || []), ...(money?.skus || [])]);
+      const skus = new Set([...(isReturnHolder ? returns.skus : []), ...(money?.skus || [])]);
       rows.push({
         asin,
         sku: [...skus].sort((a, b) => a.localeCompare(b))[0] || null,
         skuCount: skus.size,
         productName: meta.name || ordered?.productName || null,
         brand: salesMoversBrandLabel(meta.brand),
-        currency: money?.currency || null,
-        returnCount: returns ? returns.returnCount : 0,
-        fbaReturns: returns ? returns.fba : 0,
-        fbmReturns: returns ? returns.fbm : 0,
-        pendingReturnRequests: returns ? returns.pending : 0,
-        reasonBuckets: returns ? returns.byBucket : {},
-        topReasons: returns
+        currency: slot.currency,
+        returnCount: isReturnHolder ? returns.returnCount : 0,
+        fbaReturns: isReturnHolder ? returns.fba : 0,
+        fbmReturns: isReturnHolder ? returns.fbm : 0,
+        pendingReturnRequests: isReturnHolder ? returns.pending : 0,
+        reasonBuckets: isReturnHolder ? returns.byBucket : {},
+        topReasons: isReturnHolder
           ? Object.entries(returns.byReason).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([reason, count]) => ({ reason, count }))
           : [],
         refundedAmount: money ? money.refundedAmount : 0,
@@ -1352,9 +1428,10 @@ export function returnsLeakagePayload({
         settledSales: money ? money.settledSales : 0,
         settledUnits: money ? money.settledUnits : 0,
         hasMoney: Boolean(money),
-        // Return rate = returned units (Returns record count) / ordered units (Order Line Items).
+        // Return rate = returned units (Returns record count) / ordered units (Order Line Items), per THIS
+        // currency. returnedUnits is WITHHELD (null) whenever the ASIN spans multiple currencies.
         orderedUnits: ordered ? ordered.orderedUnits : null,
-        returnedUnits: returns ? returns.returnCount : null,
+        returnedUnits: (!multiCurrency && isReturnHolder) ? returns.returnCount : null,
         sales: ordered ? ordered.sales : null,
         hasOrdered: Boolean(ordered),
       });
@@ -1782,14 +1859,20 @@ export function ppcPerformancePayload({
   let totalSales = null;
   let totalSalesReason = totalSalesUnavailable != null ? totalSalesUnavailable : null;
   if (totalSalesReason == null && Array.isArray(totalSalesRows)) {
-    // Currency isolation: sum ONLY Order Line Items rows in the single Ads currency. If any row
-    // carries a different (non-empty) currency, degrade TACoS -- never sum across currencies.
-    const adsCurrency = currencies.length === 1 ? currencies[0] : null;
-    const oliCurrencies = [...new Set(totalSalesRows.map((row) => row.item_price_currency).filter(Boolean))];
-    if (oliCurrencies.some((c) => c !== adsCurrency)) {
+    // Blocker 3: require EXACTLY ONE Ads currency; then EVERY canonical OLI total-sales row MUST carry a
+    // nonblank canonical currency EQUAL to it. Any missing/blank/malformed/mismatched, OR mixed currencies
+    // => TACoS unavailable and NO row is summed (never sum a currencyless row into a currency denominator).
+    // Only when every row's canonical currency == the single Ads currency do we sum item_price_value.
+    const adsCurrency = currencies.length === 1 ? String(currencies[0] || "").trim().toUpperCase() : null;
+    if (!adsCurrency) {
       totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
     } else {
-      totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "sales_sum", "item_price_value"), 0);
+      const rowCurrencies = totalSalesRows.map((row) => String(row.item_price_currency || "").trim().toUpperCase());
+      if (!rowCurrencies.every((c) => c && c === adsCurrency)) {
+        totalSalesReason = PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+      } else {
+        totalSales = totalSalesRows.reduce((sum, row) => sum + smSumField(row, "total_sales_sum", "item_price_value"), 0);
+      }
     }
   }
 

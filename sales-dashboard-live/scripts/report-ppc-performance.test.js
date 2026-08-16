@@ -4,7 +4,7 @@
 // proves payload parity, currency isolation, coverage labels, the TACoS states, catalog gating, and purity.
 // Part B tests the typed persisted-Ads loader (validation, availability, the 120k cap, empty-vs-missing).
 // Part C drives the REAL runPpcShadowCycle + runReportJobs (via makePpcAdsContextLoader) and proves ZERO
-// DataDoe Ads exports, one conditional total-sales export, catalog dedup, the ads-currency gate, LKG, and
+// DataDoe Ads exports, the conditional canonical OLI total-sales slices, catalog dedup, the ads-currency gate, LKG, and
 // resume.
 
 import assert from "node:assert/strict";
@@ -21,7 +21,7 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, sourceJobOwnerId;
-let planPpcPerformance, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr;
+let planPpcPerformance, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr, canonicalOliSlices;
 let runPpcShadowCycle, loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader;
 let validatePpcSourceCoverage, evaluateSourceCoverage;
 let ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES;
@@ -55,12 +55,30 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// Build the PPC source fragments: no-date catalog (required) + optional total-sales over [FROM, ASOF].
+// Build the PPC source fragments: no-date catalog (required) + the OPTIONAL canonical Order Line Items
+// total-sales denominator (ppc-performance:oli-sales), sliced by canonicalOliSlices(FROM, ASOF) into one
+// ordered single-account fragment per calendar-anchored slice, with every row bound to its own slice window
+// (exactly as the derive re-validates via slicedFragmentRows). A row outside every slice is appended to the
+// LAST fragment so the derive's window guard rejects it (degrading ONLY TACoS, never the report). `tsHash`
+// is the FIRST oli-sales fragment hash: failing it makes the whole sliced source unavailable => TACoS degrades.
 function ppcPlanned({ catalog = [], totalSales = [], includeTotalSales = true, ids = [ID] } = {}) {
   const planned = []; const rows = {};
   const cat = frag("ppc-performance:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   let tsHash = null;
-  if (includeTotalSales) { const ts = frag("ppc-performance:total-sales", FROM, ASOF, ids); planned.push(ts); rows[ts.requestHash] = totalSales; tsHash = ts.requestHash; }
+  if (includeTotalSales) {
+    const slices = canonicalOliSlices(FROM, ASOF);
+    const perSlice = slices.map(() => []);
+    for (const row of totalSales) {
+      let idx = slices.findIndex((s) => row.date >= s.from && row.date <= s.to);
+      if (idx === -1) idx = slices.length - 1; // out-of-window row => last slice => derive window guard rejects it
+      perSlice[idx].push(row);
+    }
+    slices.forEach((slice, i) => {
+      const f = frag("ppc-performance:oli-sales", slice.from, slice.to, ids);
+      planned.push(f); rows[f.requestHash] = perSlice[i];
+      if (i === 0) tsHash = f.requestHash;
+    });
+  }
   return { planned, rows, tsHash };
 }
 const ppcCtx = (ppcAds, over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: ID, ppcAds, ...over });
@@ -74,7 +92,11 @@ const asn = (date, asin, currency, m, dims = {}) => ({ account_id: ID, source_ke
 const tgt = (date, id, campaignId, type, currency, m, dims = {}) => ({ account_id: ID, source_key: KEYS.targeting, metric_date: date, targeting_id: id, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
 const stm = (date, campaignId, type, currency, m, dims = {}) => ({ account_id: ID, source_key: KEYS.search, metric_date: date, campaign_id: campaignId, campaign_type: type, currency, dimensions: dims, metrics: { ad_spend: m.spend, ad_sales: m.sales, ad_clicks: m.clicks, ad_impressions: m.impr, ad_orders: m.orders, ad_units_sold_click: m.units } });
 const cat = (asin, parent, name, brand) => ({ child_asin: asin, parent_asin: parent, product_name: name, product_brand: brand });
-const ts = (date, sales, units) => ({ date, sales_sum: sales, units_sum: units });
+// One canonical Order Line Items total-sales row: grouped by [date, seller_or_vendor_id, sku, child_asin,
+// item_price_currency] with the item_price_value->total_sales_sum / quantity->total_units_sum aggregations.
+// The currency is UPPERCASE-canonical and (by default) equal to the single USD Ads currency so the TACoS
+// gate sums it; pass a different/blank currency to exercise the mismatch path.
+const ts = (date, sales, units, currency = "USD") => ({ date, seller_or_vendor_id: ID, sku: "SKU-1", child_asin: "ASIN-1", item_price_currency: currency, total_sales_sum: sales, total_units_sum: units });
 const sync = (key, o = {}) => ({ account_id: ID, source_key: key, initial_seeded_at: o.seeded ?? "2025-07-01T00:00:00Z", last_daily_sync_at: o.daily ?? "2025-08-10T00:00:00Z", last_monthly_sync_at: null, latest_metric_date: o.latest ?? "2025-08-02", last_status: o.status ?? "ok", last_error: o.error ?? null });
 
 // ---- hand-computed fixture ----
@@ -396,7 +418,9 @@ function makeDataDoe(opts = {}) {
   const rowsFor = (job) => {
     const rk = job.requestKey || ""; const fp = job.fetchParams || {};
     if (rk.includes("catalog")) return CATALOG();
-    if (rk.includes("total-sales")) return [ts(fp.from || FROM, 500, 50), ts(fp.to || ASOF, 300, 30)];
+    // The canonical OLI total-sales fragment is sliced by canonicalOliSlices; each slice returns ONLY the rows
+    // whose date falls in its window, so the fragments concatenate to the exact hand-computed denominator (800).
+    if (rk.includes("oli-sales")) return TOTAL_SALES().filter((r) => r.date >= (fp.from || FROM) && r.date <= (fp.to || ASOF));
     return [{ x: 1 }];
   };
   return {
@@ -416,16 +440,17 @@ test("23. staged, not generic: ppc-performance is a STAGED_CYCLE key; buildShado
   assert.throws(() => buildShadowReportPlan({ accounts: ACCTS, reportKeys: ["ppc-performance"], connections: CONNS, asOfFor: () => ASOF }), /staged-cycle/i);
 });
 
-test("24. validated <=1 currency: plans EXACTLY catalog + total-sales; ZERO DataDoe Ads exports", async () => {
+test("24. validated <=1 currency: plans EXACTLY catalog + oli-sales; ZERO DataDoe Ads exports", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const r = await runCycle(store, dd, makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }));
-  assert.deepEqual(keyOf(store, r.cycleId), ["ppc-performance:catalog", "ppc-performance:total-sales"], "only catalog + total-sales");
-  assert.equal(dd.totalCreates(), 2, "exactly two DataDoe exports");
-  assert.ok(dd.createdKeys.every((k) => k === "ppc-performance:catalog" || k === "ppc-performance:total-sales"), "NO Ads-source export was ever created");
+  assert.deepEqual(keyOf(store, r.cycleId), ["ppc-performance:catalog", "ppc-performance:oli-sales"], "only catalog + oli-sales");
+  // 7 exports = 1 shared no-date catalog + the 6 canonicalOliSlices(FROM, ASOF) total-sales slices.
+  assert.equal(dd.totalCreates(), 7, "exactly seven DataDoe exports (catalog + six canonical OLI slices)");
+  assert.ok(dd.createdKeys.every((k) => k === "ppc-performance:catalog" || k === "ppc-performance:oli-sales"), "NO Ads-source export was ever created");
   assert.ok(!dd.createdKeys.some((k) => /campaign-performance|asin-performance|targeting-performance|search-terms-performance|ads-/.test(k)), "zero Ads exports");
 });
 
-test("25. MULTI-currency Ads: gate SKIPS total-sales -> plans catalog ONLY (one export, still zero Ads exports)", async () => {
+test("25. MULTI-currency Ads: gate SKIPS oli-sales -> plans catalog ONLY (one export, still zero Ads exports)", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const rows = [...ADS_ROWS(), cmp("2025-08-03", "C9", "SP", { spend: 1, sales: 1, clicks: 1, impr: 1, orders: 1, units: 1, currency: "CAD" })];
   const r = await runCycle(store, dd, makeAdsReaders({ A1: rows }, { A1: SYNCS }));
@@ -490,19 +515,19 @@ test("28. E2E: cycle -> runReportJobs -> saved snapshot; zero network in derive;
   assert.equal(hits, 0, "zero network during derivation");
   assert.equal(res.succeeded, 1, "PPC derived + saved");
   assert.equal(saved[0].accountId, ID);
-  assert.equal(saved[0].totalSales, 800, "TACoS denominator summed from the total-sales export");
+  assert.equal(saved[0].totalSales, 800, "TACoS denominator summed from the canonical OLI total-sales slices");
   assert.equal(saved[0].adsRowCount, 7);
   const before = store.saveCalls;
   await runReportJobs({ store, cycleId: cycle.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: cycle.plannedReports, loadDerivedContext: makePpcAdsContextLoader(readers) });
   assert.equal(store.saveCalls, before, "no duplicate snapshot on re-run");
 });
 
-test("29. total-sales strict-cap TRUNCATED degrades ONLY TACoS; the report still saves (catalog succeeded)", async () => {
-  const store = makeStore(); const dd = makeDataDoe({ capKey: "total-sales" });
+test("29. oli-sales strict-cap TRUNCATED degrades ONLY TACoS; the report still saves (catalog succeeded)", async () => {
+  const store = makeStore(); const dd = makeDataDoe({ capKey: "oli-sales" });
   const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS });
   const cycle = await runCycle(store, dd, readers);
-  const tsJob = store.listSourceJobs(cycle.cycleId).find((j) => j.request_key === "ppc-performance:total-sales");
-  assert.ok(tsJob.fetch_status === "failed" && tsJob.error_code === "TRUNCATED", "capped total-sales fails TRUNCATED");
+  const tsJob = store.listSourceJobs(cycle.cycleId).find((j) => j.request_key === "ppc-performance:oli-sales");
+  assert.ok(tsJob.fetch_status === "failed" && tsJob.error_code === "TRUNCATED", "capped oli-sales fails TRUNCATED");
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.seedSnapshot(reportKey, accountId, payload); saved.push(payload); return { paramsHash: "ph" }; };
   const res = await runReportJobs({ store, cycleId: cycle.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: cycle.plannedReports, loadDerivedContext: makePpcAdsContextLoader(readers) });
@@ -520,13 +545,13 @@ test("30. maxJobs partial + poll-deferral resume through the real cycle with ONE
   assert.ok(s1.listSourceJobs(r.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after maxJobs resume");
   for (const j of s1.listSourceJobs(r.cycleId)) assert.ok(d1.createCount(j.request_hash) <= 1, j.request_key + " exported at most once");
   const s2 = makeStore();
-  const dDefer = makeDataDoe({ deferKey: "total-sales" });
+  const dDefer = makeDataDoe({ deferKey: "oli-sales" });
   const r1 = await runCycle(s2, dDefer, readers);
   assert.ok((r1.deferred || 0) > 0, "the driver surfaces the resumable deferral");
-  const tsHash = store2Hash(s2, r1.cycleId, "ppc-performance:total-sales");
+  const tsHash = store2Hash(s2, r1.cycleId, "ppc-performance:oli-sales");
   const dOk = makeDataDoe();
   const r2 = await runCycle(s2, dOk, readers);
-  assert.equal(dDefer.createCount(tsHash) + dOk.createCount(tsHash), 1, "total-sales exported exactly once across deferral + resume");
+  assert.equal(dDefer.createCount(tsHash) + dOk.createCount(tsHash), 1, "oli-sales slice exported exactly once across deferral + resume");
   assert.ok(s2.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"));
 });
 function store2Hash(store, cid, key) { return store.listSourceJobs(cid).find((j) => j.request_key === key).request_hash; }
@@ -881,7 +906,7 @@ async function main() {
   ({ runPpcShadowCycle } = await import("../lib/server/sync/ppc-cycle.js"));
   ({ loadPersistedPpcAds, validatePpcAdsRows, ppcAdsCurrencySignalOf, makePpcAdsContextLoader, validatePpcSourceCoverage, evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
   ({ ppcPerformancePayload, normalizePpcCoverageReason, PPC_COVERAGE_REASON_CODES } = await import("../lib/server/reports/derivation-core.js"));
-  ({ addDaysStr } = await import("../lib/server/date-windows.js"));
+  ({ addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -29);
 
   let failures = 0;

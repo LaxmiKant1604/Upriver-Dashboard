@@ -562,7 +562,7 @@ test("(daily+ppc integration) one dispatcher invocation derives + saves BOTH Dai
   const daily = makeDailyAdsSeed();
   const ppc = makePpcAdsSeed();
   // Faithful Daily superset so the sales snapshot is meaningful; PPC catalog/total-sales come from rowsFor.
-  const dd = seededDataDoe({ "daily-reporting:asin-day-superset": [{ date: "2025-08-01", seller_or_vendor_id: "A1", total_sales_sum: 100, total_units_sum: 5 }] });
+  const dd = seededDataDoe({ "daily-reporting:oli-sales": [{ date: "2025-08-01", seller_or_vendor_id: "A1", total_sales_sum: 100, total_units_sum: 5 }] });
   const general = makeDailyAdsContextLoader({ connections: CONNS, getAdMetrics: daily.getAdMetrics, getCoverageState: daily.getCoverageState });
   const keys = ["daily-reporting", "ppc-performance"];
   await dispatch({ store, dataDoe: dd, saver, controlCatalog: mkCatalog(keys, keys), loadDerivedContext: general, ppcAdsProviders: ppc }).promise;
@@ -577,7 +577,7 @@ test("(daily+ppc integration) one dispatcher invocation derives + saves BOTH Dai
   assert.ok(ppc.calls.rows > 0 && ppc.calls.coverage > 0, "the PPC loader read persisted Ads rows + durable coverage");
   // ZERO DataDoe/network in derivation: no persisted-Ads source was EVER fetched via DataDoe (Daily ads come
   // from the loader; PPC creates zero Ads exports). Every DataDoe download was a planned report source.
-  const allowed = ["daily-reporting:asin-day-superset", "daily-reporting:catalog", "ppc-performance:catalog", "ppc-performance:total-sales"];
+  const allowed = ["daily-reporting:oli-sales", "daily-reporting:catalog", "ppc-performance:catalog", "ppc-performance:oli-sales"];
   assert.ok(dd.fetchedKeys().every((k) => allowed.includes(k)), "every DataDoe fetch was a planned source; derivation issued zero DataDoe/network calls");
 });
 

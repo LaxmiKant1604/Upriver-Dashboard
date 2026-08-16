@@ -18,7 +18,7 @@
 // account total sales, which is required for TACoS and cannot come from an Ads
 // table. It runs on explicit refresh only and is saved into the shared snapshot.
 
-import { addDaysStr, num } from "../datadoe.js";
+import { addDaysStr, num, canonicalOliSlices } from "../datadoe.js";
 import { getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
 import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
@@ -39,12 +39,15 @@ const SOURCE_KEYS = [
   ADS_SEARCH_TERMS.syncKey,
 ];
 
-// TACoS denominator = total ordered sales from Order Line Items (item_price_value),
-// grouped by date + item_price_currency so DataDoe never sums money across currencies.
-const TOTAL_SALES_GROUP_BY = ["date", "item_price_currency"];
-const TOTAL_SALES_AGGREGATIONS = [
-  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
-  { column: "quantity", aggregation: "sum", alias: "units_sum" },
+// TACoS denominator = total ordered sales from the ONE CANONICAL Order Line Items sales fragment
+// (Blocker 1), grouped by [date, seller_or_vendor_id, sku, child_asin, item_price_currency] so DataDoe
+// never sums money across currencies and this export is byte-identical to the other OLI reports (shared
+// request_hashes on overlapping calendar-anchored slices => one export, many owners). The fold sums
+// item_price_value per currency; TACoS validates that the single currency present equals the Ads currency.
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 // The account total-sales denominator must be in the SAME currency as the Ads spend.
 // The ads-currency gate upstream guarantees <=1 Ads currency; when the Order Line Items
@@ -219,24 +222,36 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
     totalSalesUnavailable = "TACoS is unavailable because this account's saved Ads rows use multiple currencies. A combined total-sales denominator would be meaningless.";
   } else {
     try {
-      const salesRows = await fetchExportRowsStrict(
-        apiKey, ORDER_LINE_ITEMS.id, TOTAL_SALES_GROUP_BY, ids, from, to, ROW_LIMITS.dateRollup,
-        {
-          groupBy: TOTAL_SALES_GROUP_BY,
-          aggregations: TOTAL_SALES_AGGREGATIONS,
-          orderByColumn: "date",
-          orderByDirection: "ASC",
-        },
-        "PPC total-sales export"
-      );
-      // Currency isolation: sum ONLY Order Line Items rows in the single Ads currency. If any
-      // row carries a different (non-empty) currency, degrade TACoS -- never sum across currencies.
-      const adsCurrency = currencies.length === 1 ? currencies[0] : null;
-      const oliCurrencies = [...new Set(salesRows.map((row) => row.item_price_currency).filter(Boolean))];
-      if (oliCurrencies.some((c) => c !== adsCurrency)) {
+      // The ONE canonical OLI sales fragment over [from, to], sliced by canonicalOliSlices so its interior +
+      // asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
+      const salesRows = [];
+      for (const slice of canonicalOliSlices(from, to)) {
+        const sliceRows = await fetchExportRowsStrict(
+          apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
+          {
+            groupBy: OLI_SALES_GROUP_BY,
+            aggregations: OLI_SALES_AGGREGATIONS,
+            orderByColumn: "date",
+            orderByDirection: "ASC",
+          },
+          `PPC total-sales export (${slice.from} to ${slice.to})`
+        );
+        for (const row of sliceRows) salesRows.push(row);
+      }
+      // Blocker 3: require EXACTLY ONE Ads currency; then EVERY OLI total-sales row MUST carry a nonblank
+      // canonical currency EQUAL to it. If any row's currency is missing/blank/malformed/mismatched, or the
+      // rows mix currencies, TACoS is unavailable and NO row is summed (never sum a currencyless row into a
+      // currency denominator). Only when every row's canonical currency == the single Ads currency do we sum.
+      const adsCurrency = currencies.length === 1 ? String(currencies[0] || "").trim().toUpperCase() : null;
+      if (!adsCurrency) {
         totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
       } else {
-        totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "sales_sum", "item_price_value"), 0);
+        const rowCurrencies = salesRows.map((row) => String(row.item_price_currency || "").trim().toUpperCase());
+        if (!rowCurrencies.every((c) => c && c === adsCurrency)) {
+          totalSalesUnavailable = TOTAL_SALES_CURRENCY_MISMATCH_REASON;
+        } else {
+          totalSales = salesRows.reduce((sum, row) => sum + sumField(row, "total_sales_sum", "item_price_value"), 0);
+        }
       }
     } catch (error) {
       // TACoS is the only metric that needs this. Losing it must not lose the

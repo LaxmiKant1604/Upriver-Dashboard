@@ -188,7 +188,7 @@ function plSeedCache(request) {
   const byHash = new Map();
   let firstSuperset = true;
   for (const s of request.sources) {
-    if (s.requestKey === "daily-reporting:asin-day-superset") { byHash.set(s.requestHash, firstSuperset ? PL_SUPERSET : []); firstSuperset = false; }
+    if (s.requestKey === "daily-reporting:oli-sales") { byHash.set(s.requestHash, firstSuperset ? PL_SUPERSET : []); firstSuperset = false; }
     else if (s.requestKey === "daily-reporting:catalog") byHash.set(s.requestHash, PL_CATALOG);
   }
   return byHash;
@@ -310,7 +310,7 @@ test("planner: Daily plan spans the exact six-calendar-month window with timeout
   // moves the superset request_hashes off the whole-month identities.
   const expected = splitDateRangeByMonth("2026-03-01", PL_AS_OF)
     .flatMap((m) => splitDateRangeByDays(m.from, m.to, 7));
-  const superset = req.sources.filter((s) => s.requestKey === "daily-reporting:asin-day-superset");
+  const superset = req.sources.filter((s) => s.requestKey === "daily-reporting:oli-sales");
   assert.deepEqual(superset.map((s) => ({ from: s.from, to: s.to })), expected, "<=7-day slices within each calendar month");
   // exact coverage invariants: starts at from, ends at to, contiguous, each slice <= 7 days, month-bounded.
   assert.equal(superset[0].from, "2026-03-01");
@@ -321,7 +321,7 @@ test("planner: Daily plan spans the exact six-calendar-month window with timeout
   }
   const catalog = req.sources.filter((s) => s.requestKey === "daily-reporting:catalog");
   assert.deepEqual({ from: catalog[0].from, to: catalog[0].to }, { from: "2026-03-01", to: PL_AS_OF });
-  assert.deepEqual([...new Set(req.sources.map((s) => s.requestKey))].sort(), ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
+  assert.deepEqual([...new Set(req.sources.map((s) => s.requestKey))].sort(), ["daily-reporting:catalog", "daily-reporting:oli-sales"]);
   assert.equal(req.context.brand, "ALL");
 });
 
@@ -563,7 +563,7 @@ test("planner: five-ID batching unchanged for multi-account reports; daily/sku r
   const ids = Array.from({ length: 6 }, (_, i) => "id" + i);
   const jobs = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids, windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] } });
   assert.equal(jobs.filter((j) => j.requestKey === "brand-sales:order-lines").length, 2, "6 ids -> two five-ID chunks");
-  assert.throws(() => reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: { "daily-reporting:asin-day-superset": [{ from: "2026-03-01", to: "2026-03-31" }], "daily-reporting:catalog": [{ from: "2026-03-01", to: "2026-03-31" }] } }), /single account/);
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: { "daily-reporting:oli-sales": [{ from: "2026-03-01", to: "2026-03-31" }], "daily-reporting:catalog": [{ from: "2026-03-01", to: "2026-03-31" }] } }), /single account/);
 });
 
 test("planner: admin report controls stay LOCKED for daily-reporting + sku-pl", async () => {

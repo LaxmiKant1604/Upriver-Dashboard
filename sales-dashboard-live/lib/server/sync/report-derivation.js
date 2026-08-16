@@ -25,6 +25,7 @@ import {
   skuPlPayload,
   reconciliationPayload,
   fbaPlanPayload,
+  foldOliSalesToFbaInputs,
   keywordRankPayload,
   sqpDistinctPeriods,
   salesMoversLatestReportedDate,
@@ -51,7 +52,7 @@ import {
 // planMonthWindows/addDaysStr are shared dependency-free window helpers (byte-identical to the
 // api/datadoe.js fba-plan route copies; proven equal in the FBA parity harness). Reaching them here
 // keeps the pure derivation graph free of any DataDoe transport / Supabase import.
-import { planMonthWindows, addDaysStr, splitDateRangeByDays, splitDateRangeByMonth, isFullCalendarMonthWindow } from "../date-windows.js";
+import { planMonthWindows, addDaysStr, splitDateRangeByDays, splitDateRangeByMonth, isFullCalendarMonthWindow, canonicalOliSlices } from "../date-windows.js";
 // PURE typed PPC coverage contract (server-only loader, no transport import): re-enforced here so the derive
 // never folds/saves a PPC snapshot on an injected context that lacks or contradicts the durable-coverage gate.
 import { validatePpcSourceCoverage } from "./ppc-ads-loader.js";
@@ -376,7 +377,7 @@ const REGISTRY = {
   // core imports no Supabase. All-brand rows/units re-aggregate additively; there are no ratio
   // fields to sum (daily ratios are recomputed in the browser from these base sums).
   "daily-reporting": {
-    snapshotVersion: "daily-reporting/v2d-2", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
+    snapshotVersion: "daily-reporting/v2d-3", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
     // Blocker 1: ONLY `adsCoverage` may be injected through the derive context. The worker's
     // per-report allowlist drops any other derived field and never lets a derived input override
     // the planned account/brand/from/to scope (the snapshot identity stays in the planned scope).
@@ -391,11 +392,10 @@ const REGISTRY = {
       if (!isValidCalendarDate(winFrom) || !isValidCalendarDate(winTo) || winFrom > winTo) {
         throw new Error("daily-reporting derivation requires an authoritative planned from/to window.");
       }
-      const expectedSlices = splitDateRangeByMonth(winFrom, winTo)
-        .flatMap((m) => splitDateRangeByDays(m.from, m.to, DERIVE_TIMEOUT_SAFE_SLICE_DAYS));
+      const expectedSlices = canonicalOliSlices(winFrom, winTo);
       const supersetRows = slicedFragmentRows(
-        sources["daily-reporting:asin-day-superset"], expectedSlices,
-        context.rawSellerId != null ? String(context.rawSellerId) : null, "daily-reporting:asin-day-superset",
+        sources["daily-reporting:oli-sales"], expectedSlices,
+        context.rawSellerId != null ? String(context.rawSellerId) : null, "daily-reporting:oli-sales",
       );
       const catalogRows = sources["daily-reporting:catalog"].rows;
       const brand = context.brand ?? "ALL";
@@ -436,7 +436,7 @@ const REGISTRY = {
   // -> derive-invalid -> last-known-good preserved) so it can never silently become zero, while a
   // VALIDATED empty AWD source is honored as "no AWD rows". Non-US never plans or reads AWD.
   "fba-plan": {
-    snapshotVersion: "fba-plan/v2d-2", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
+    snapshotVersion: "fba-plan/v2d-3", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -447,21 +447,16 @@ const REGISTRY = {
       // Recompute the exact route windows from asOf (never trust caller-supplied month boundaries).
       const { completed, current } = planMonthWindows(asOf);
 
-      // 1) monthly-units == [completed0, completed1, completed2, currentMTD], in order, single-account.
-      const expectedUnitWindows = [
-        ...completed.map((m) => ({ from: m.from, to: m.to })),
-        { from: current.from, to: current.to },
-      ];
-      const unitFrags = sources["fba-plan:monthly-units"].fragments || [];
-      const unitCheck = validateFbaMonthlyUnitsWindows(unitFrags, expectedUnitWindows, rawSellerId);
-      if (!unitCheck.ok) {
-        throw new Error(`fba-plan monthly-units contract violated (${unitCheck.reason}); snapshot blocked.`);
-      }
-      const completedUnitRows = completed.map((_m, i) => unitFrags[i].rows);
-      const mtdUnitRows = unitFrags[completed.length].rows;
+      // 1) ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf], sliced by
+      // canonicalOliSlices (Blocker 1). Validate the exact ordered slice sequence AND bind every row to its
+      // own slice window (the canonical rows carry `date`), then fold to the per-month FBA inputs: per-ASIN
+      // units for each completed month + the MTD month, and the current-month per-date units (latest-date
+      // probe). Units are a currency-agnostic count, so the fold sums total_units_sum across currencies.
+      const expectedOliSlices = canonicalOliSlices(completed[0].from, current.to);
+      const oliSalesRows = slicedFragmentRows(sources["fba-plan:oli-sales"], expectedOliSlices, rawSellerId, "fba-plan:oli-sales");
+      const { completedUnitRows, mtdUnitRows, dailyDateRows } = foldOliSalesToFbaInputs(oliSalesRows, completed, current);
 
       // 2) single-account single-fragment required ranges.
-      const dailyDateRows = singleAccountFragmentRows(sources["fba-plan:current-daily-dates"], "fba-plan:current-daily-dates", rawSellerId, current.from, current.to);
       const catalogRows = singleAccountFragmentRows(sources["fba-plan:catalog"], "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
       // Inventory window is EXACTLY [asOf - 10d .. asOf]. Recompute the expected start here and pin
       // BOTH endpoints (a shortened or extended lookback fragment is rejected -> derive-invalid ->
@@ -767,7 +762,7 @@ const REGISTRY = {
   // buybox_percentage is a ratio (page-view weighted, unweighted-mean fallback); null observations are
   // excluded; currencies never merge. ZERO DataDoe/network calls (pure).
   "buy-box-loss": {
-    snapshotVersion: "buy-box-loss/v2d-2", optionalRequestKeys: [], derivedSourceKeys: [],
+    snapshotVersion: "buy-box-loss/v2d-3", optionalRequestKeys: [], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -782,7 +777,7 @@ const REGISTRY = {
       const from = addDaysStr(asOf, -(BB_WINDOW_DAYS - 1));
       // All three sources are required; defensively reject a missing/failed/unreadable cache (the worker
       // fetch gate already keeps such a report PENDING/blocked, but never derive an empty success).
-      for (const key of ["buy-box-loss:daily", "buy-box-loss:ordered", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
+      for (const key of ["buy-box-loss:daily", "buy-box-loss:oli-sales", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`buy-box-loss ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -791,14 +786,15 @@ const REGISTRY = {
       // Daily: EXACTLY the four ordered 7-day slices covering [asOf-27d, asOf], recomputed + pinned.
       const expectedSlices = splitDateRangeByDays(from, asOf, BB_SLICE_DAYS);
       const dailyFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:daily"], expectedSlices, rawSellerId, "buy-box-loss:daily");
-      // Ordered (Order Line Items) sales/units: the SAME four ordered 7-day slices, positionally validated
-      // (reordered/duplicate/partial/extra/missing/cross-account/wrong-window rejected). The rows are GROUPED
-      // by (sku, child_asin, item_price_currency) so they carry NO date column -- bind the slice windows +
-      // account, then require plain-object rows (a per-row date cannot be checked on a dateless grouped export).
-      const orderedFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:ordered"], expectedSlices, rawSellerId, "buy-box-loss:ordered");
-      orderedFrags.forEach((f) => {
-        if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:ordered fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
-        assertPlainObjectRows(f.rows, `buy-box-loss:ordered slice ${f.from}..${f.to}`);
+      // Ordered (canonical OLI sales): the canonicalOliSlices sequence over [asOf-27d, asOf] (Blocker 1),
+      // positionally validated (reordered/duplicate/partial/extra/missing/cross-account/wrong-window rejected).
+      // The canonical rows carry `date`, so bind EVERY row to its OWN slice window (stronger than the former
+      // dateless plain-object check).
+      const expectedOliSlices = canonicalOliSlices(from, asOf);
+      const orderedFrags = validateOrderedSingleAccountWindows(sources["buy-box-loss:oli-sales"], expectedOliSlices, rawSellerId, "buy-box-loss:oli-sales");
+      orderedFrags.forEach((f, i) => {
+        if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:oli-sales fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
+        assertRowsInWindow(f.rows, expectedOliSlices[i].from, expectedOliSlices[i].to, `buy-box-loss oli-sales slice ${f.from}..${f.to}`);
       });
       // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
       const inventoryFrom = addDaysStr(asOf, -BB_INVENTORY_LOOKBACK_DAYS);
@@ -838,7 +834,7 @@ const REGISTRY = {
   // Currency is never merged; refund money is absolute; the return-fee component is zero-clamped. ZERO
   // DataDoe/network calls (pure).
   "returns-leakage": {
-    snapshotVersion: "returns-leakage/v2d-2", optionalRequestKeys: [], derivedSourceKeys: [],
+    snapshotVersion: "returns-leakage/v2d-3", optionalRequestKeys: [], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -851,7 +847,7 @@ const REGISTRY = {
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const from = addDaysStr(asOf, -(RET_WINDOW_DAYS - 1));
       // All four sources are required; defensively reject a missing/failed/unreadable cache (never an empty success).
-      for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
+      for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:oli-sales", "returns-leakage:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`returns-leakage ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -863,16 +859,18 @@ const REGISTRY = {
       // single-account, every raw returned-item row bound to its OWN slice window.
       const expectedReturnSlices = splitDateRangeByDays(from, asOf, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
       const returnRows = slicedFragmentRows(sources["returns-leakage:returns"], expectedReturnSlices, rawSellerId, "returns-leakage:returns");
-      // Settlements / Ordered: GROUPED WITHOUT date (whole-window aggregate rows -- NOT sliceable), exactly
-      // one single-account fragment each over [asOf-59d, asOf].
+      // Settlements: GROUPED WITHOUT date (whole-window aggregate rows -- NOT sliceable), exactly one
+      // single-account fragment over [asOf-59d, asOf].
       const settlementRows = singleAccountFragmentRows(sources["returns-leakage:settlements"], "returns-leakage:settlements", rawSellerId, from, asOf);
-      const orderedRows = singleAccountFragmentRows(sources["returns-leakage:ordered"], "returns-leakage:ordered", rawSellerId, from, asOf);
+      // Ordered (canonical OLI sales): the canonicalOliSlices sequence over [asOf-59d, asOf] (Blocker 1),
+      // positionally validated + every row bound to its OWN slice window (the canonical rows carry `date`).
+      const expectedOliSlices = canonicalOliSlices(from, asOf);
+      const orderedRows = slicedFragmentRows(sources["returns-leakage:oli-sales"], expectedOliSlices, rawSellerId, "returns-leakage:oli-sales");
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["returns-leakage:catalog"], "returns-leakage:catalog", rawSellerId);
-      // Settlements + Ordered are GROUPED and Catalog is NO-DATE => plain objects (the returns rows were
-      // already per-slice window-bound above -- a stronger check than the former whole-range bound).
+      // Settlements is GROUPED and Catalog is NO-DATE => plain objects (returns + ordered rows are already
+      // per-slice window-bound above -- a stronger check than the former whole-range bound).
       assertPlainObjectRows(settlementRows, "returns-leakage settlements");
-      assertPlainObjectRows(orderedRows, "returns-leakage ordered");
       assertPlainObjectRows(catalogRows, "returns-leakage catalog");
       return returnsLeakagePayload({
         accountId: publicAccountId, asOf, from, windowDays: RET_WINDOW_DAYS,
@@ -1064,8 +1062,8 @@ const REGISTRY = {
   // merged (every rollup key includes currency). Payload accountId is the PUBLIC id; rawSellerId scopes the
   // DataDoe catalog/total-sales fragments.
   "ppc-performance": {
-    snapshotVersion: "ppc-performance/v2d-2",
-    optionalRequestKeys: ["ppc-performance:total-sales"],
+    snapshotVersion: "ppc-performance/v2d-3",
+    optionalRequestKeys: ["ppc-performance:oli-sales"],
     derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
     derivedContextKeys: ["ppcAds"],
     derive: ({ sources, context }) => {
@@ -1111,10 +1109,12 @@ const REGISTRY = {
         totalSalesUnavailable = PPC_MULTI_CURRENCY_REASON;
       } else {
         try {
-          const ts = sources["ppc-performance:total-sales"];
+          const ts = sources["ppc-performance:oli-sales"];
           if (ts && ts.available === true && Array.isArray(ts.rows)) {
-            totalSalesRows = singleAccountFragmentRows(ts, "ppc-performance:total-sales", rawSellerId, from, asOf);
-            assertRowsInWindow(totalSalesRows, from, asOf, "ppc-performance total-sales");
+            // Canonical OLI sales fragment sliced by canonicalOliSlices (Blocker 1): validate the ordered
+            // slice sequence + bind every row to its own slice window (the canonical rows carry `date`).
+            const expectedOliSlices = canonicalOliSlices(from, asOf);
+            totalSalesRows = slicedFragmentRows(ts, expectedOliSlices, rawSellerId, "ppc-performance:oli-sales");
           } else {
             totalSalesUnavailable = PPC_TOTAL_SALES_DEGRADED_REASON;
           }

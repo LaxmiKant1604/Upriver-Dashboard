@@ -22,7 +22,7 @@ import { sourceJobOwnerId } from "../source-identity.js";
 // The planner/organization-registry connection id ("primary" | "secondary") -> the source driver's
 // fail-closed connection id ("primary" | "dd-secondary") that plannedSourceJob validates.
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
-const TOTAL_SALES_KEY = "ppc-performance:total-sales";
+const TOTAL_SALES_KEY = "ppc-performance:oli-sales";
 
 /**
  * Run the PPC shadow source cycle for a set of accounts, account-scoped. `accounts`: [{ accountId, country,

@@ -35,6 +35,7 @@ import {
 } from "../lib/server/sync/report-source-contracts.js";
 import { REPORT_SOURCE_REQUIREMENTS, sourceContractForKey } from "../lib/server/source-contracts.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
+import { canonicalOliSlices, planMonthWindows } from "../lib/server/date-windows.js";
 import { chunkAccountIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT } from "../lib/server/id-batching.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -294,7 +295,7 @@ test("sku-pl rejects a multi-account scope (grouped rows carry no seller/vendor 
 
 test("daily-reporting rejects a multi-account scope; single account resolves", () => {
   const dailyWin = {
-    "daily-reporting:asin-day-superset": [{ from: "2025-05-01", to: "2025-05-31" }],
+    "daily-reporting:oli-sales": canonicalOliSlices("2025-05-01", "2025-05-31"),
     "daily-reporting:catalog": [{ from: "2025-05-01", to: "2025-05-31" }],
   };
   const one = reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1"], windowsByRequestKey: dailyWin });
@@ -368,11 +369,14 @@ const reconMonths = ["2025-03", "2025-04", "2025-05", "2025-06", "2025-07", "202
 const reconRange = [{ from: "2025-03-01", to: "2025-08-28" }];
 const reconWin = { "reconciliation:order-lines": reconMonths, "reconciliation:settlements": reconMonths, "reconciliation:catalog": reconRange };
 
-const fbaMonths = [{ from: "2025-05-01", to: "2025-05-31" }, { from: "2025-06-01", to: "2025-06-30" }, { from: "2025-07-01", to: "2025-07-31" }, { from: "2025-08-01", to: "2025-08-06" }];
+const FBA_ASOF = "2025-08-06";
+const fbaPlanMonths = planMonthWindows(FBA_ASOF); // completed[0].from = 2025-05-01, current.to = asOf
+const fbaOliSlices = canonicalOliSlices(fbaPlanMonths.completed[0].from, FBA_ASOF);
 const fbaBase = {
-  "fba-plan:monthly-units": fbaMonths,
-  "fba-plan:current-daily-dates": [{ from: "2025-08-01", to: "2025-08-06" }],
-  "fba-plan:catalog": [{ from: "2025-05-01", to: "2025-08-06" }],
+  // Blocker 1: ONE canonical OLI sales fragment sliced by canonicalOliSlices over the 3-completed-month +
+  // current-MTD span (replaces the former fba-plan:monthly-units + fba-plan:current-daily-dates pair).
+  "fba-plan:oli-sales": fbaOliSlices,
+  "fba-plan:catalog": [{ from: fbaPlanMonths.completed[0].from, to: FBA_ASOF }],
   "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
 };
 const fbaWithAwd = { ...fbaBase, "fba-plan:awd": [{ from: null, to: null }] };
@@ -403,17 +407,19 @@ test("reconciliation catalog uses PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT, n
   assert.equal(c.orderByColumn, "child_asin");
 });
 
-/* --- executable parity: daily-reporting (ASIN/day superset + catalog) --- */
-test("daily-reporting ASIN/day superset matches DAILY_BRAND_SALES_* constants (timeout-safe sliced within months)", () => {
-  const c = byKey(daily, "daily-reporting:asin-day-superset");
+/* --- executable parity: daily-reporting (canonical OLI sales superset + catalog) --- */
+test("daily-reporting oli-sales superset matches the canonical OLI fragment (DAILY_BRAND_SALES_* = OLI_SALES_*)", () => {
+  const c = byKey(daily, "daily-reporting:oli-sales");
   assert.deepEqual(c.columns, constArray("DAILY_BRAND_SALES_COLUMNS"));
   assert.deepEqual(c.groupBy, constArray("DAILY_BRAND_SALES_GROUP_BY"));
   assert.deepEqual(c.aggregations, constAggregations("DAILY_SALES_AGGREGATIONS"));
-  assert.equal(c.limit, constNumber("DAILY_BRAND_ROW_LIMIT")); // strict per-slice cap (stricter than per-month)
-  // GOLDEN (Gate-6 timeout remediation): the scheduler slices <=7d WITHIN each calendar month; the rows are
-  // per-day grouped so the slices concatenate to the identical superset. (The live browser route stays
-  // monthly-segmented -- an intentional, documented divergence of the scheduler's request windows.)
-  assert.ok(c.windowKind.startsWith("per-slice(<=7d, within each calendar month)"), "superset must be timeout-safe sliced within months");
+  // Blocker 1: the daily superset IS the canonical OLI sales fragment (byte-identical to OLI_SALES_*).
+  assert.deepEqual(c.columns, constArray("OLI_SALES_COLUMNS"));
+  assert.deepEqual(c.aggregations, constAggregations("OLI_SALES_AGGREGATIONS"));
+  assert.equal(c.limit, constNumber("DAILY_BRAND_ROW_LIMIT")); // strict per-slice cap
+  // Blocker 1: sliced by canonicalOliSlices (calendar-anchored bins) so interior + asOf-boundary slices
+  // share request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance.
+  assert.ok(c.windowKind.startsWith("canonicalOliSlices"), "superset must be sliced by canonicalOliSlices");
 });
 test("daily-reporting catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMIT; no compact all-brand export", () => {
   const c = byKey(daily, "daily-reporting:catalog");
@@ -422,14 +428,14 @@ test("daily-reporting catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMI
   assert.equal(c.groupBy, null);
   // No per-brand and no compact all-brand export: exactly two owned exports.
   assert.equal(daily.length, 2);
-  assert.deepEqual(daily.map((x) => x.requestKey), ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
+  assert.deepEqual(daily.map((x) => x.requestKey), ["daily-reporting:oli-sales", "daily-reporting:catalog"]);
   // Ads remain a derived dependency, not an owned export.
   assert.ok((REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-campaign-date"));
 });
 test("daily-reporting derivation strategy derives all-brand + named-brand from the superset (no per-brand export)", () => {
   const d = REPORT_DERIVATION["daily-reporting"];
   assert.ok(d && Array.isArray(d.derivedFrom));
-  assert.deepEqual(d.derivedFrom, ["daily-reporting:asin-day-superset", "daily-reporting:catalog"]);
+  assert.deepEqual(d.derivedFrom, ["daily-reporting:oli-sales", "daily-reporting:catalog"]);
   assert.ok(d.outputs.includes("all-brand"));
   assert.ok(/no per-brand export/i.test(d.strategy));
   // Structural token-saving proof: the ASIN/day builder is monthly-segmented in code,
@@ -438,26 +444,19 @@ test("daily-reporting derivation strategy derives all-brand + named-brand from t
   assert.ok(/for \(const window of splitDateRangeByMonth\(from, to\)\)/.test(DD.slice(DD.indexOf("fetchDailyBrandSalesRows"))), "named-brand fetch must be monthly-segmented");
 });
 
-/* --- executable parity: fba-plan --- */
-test("fba-plan monthly-units matches the inline child_asin units export (planAsinUnits)", () => {
-  const c = byKey(fba, "fba-plan:monthly-units");
-  assert.deepEqual(c.columns, ["child_asin"]);
-  assert.deepEqual(c.groupBy, ["child_asin"]);
-  assert.deepEqual(c.aggregations, [{ column: "quantity", aggregation: "sum", alias: "units_sum" }]);
-  assert.equal(c.limit, constNumber("PLAN_SALES_ROW_LIMIT"));
-  assert.equal(c.orderByColumn, "child_asin");
-  assert.equal(c.sourceKey, "order-line-items");
-  assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["child_asin"]'), "planAsinUnits child_asin export must exist");
-});
-test("fba-plan current-daily-dates matches the inline date units export (limit 500)", () => {
-  const c = byKey(fba, "fba-plan:current-daily-dates");
-  assert.deepEqual(c.columns, ["date"]);
-  assert.deepEqual(c.groupBy, ["date"]);
-  assert.deepEqual(c.aggregations, [{ column: "quantity", aggregation: "sum", alias: "units_sum" }]);
-  assert.equal(c.limit, 500);
+/* --- executable parity: fba-plan (ONE canonical OLI sales fragment; Blocker 1) --- */
+test("fba-plan oli-sales matches the canonical OLI sales fragment constants (folded to per-ASIN monthly units)", () => {
+  const c = byKey(fba, "fba-plan:oli-sales");
+  assert.deepEqual(c.columns, constArray("OLI_SALES_COLUMNS"));
+  assert.deepEqual(c.groupBy, constArray("OLI_SALES_GROUP_BY"));
+  assert.deepEqual(c.aggregations, constAggregations("OLI_SALES_AGGREGATIONS"));
+  assert.equal(c.limit, constNumber("OLI_SALES_ROW_LIMIT"));
   assert.equal(c.orderByColumn, "date");
-  assert.ok(DD.includes('PLAN_SALES_SOURCE_ID, ["date"]'), "current-daily date export must exist");
-  assert.ok(DD.includes("current.from, current.to, 500,"), "date export limit 500 must exist");
+  assert.equal(c.orderByDirection, "ASC");
+  assert.equal(c.sourceKey, "order-line-items");
+  // The live fba route fetches the canonical fragment and folds per-ASIN monthly units + the latest-date
+  // probe from it (foldOliSalesToFbaInputs derives the same inputs the payload assembly consumes).
+  assert.ok(DD.includes("PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS"), "fba route must fetch the canonical OLI fragment");
 });
 test("fba-plan catalog / inventory-health / awd match their constants", () => {
   const cat = byKey(fba, "fba-plan:catalog");
@@ -484,31 +483,32 @@ test("reconciliation segments orders + settlements per month; catalog stays a si
   assert.equal(got.length, 13); // 6 + 6 + 1, single chunk (no cross-product)
   assert.equal(new Set(got.filter((r) => r.requestKey === "reconciliation:order-lines").map((r) => r.requestHash)).size, 6);
 });
-test("fba-plan monthly-units has one request per month; total is additive, not multiplied", () => {
+test("fba-plan oli-sales is one canonical fragment per canonicalOliSlices window; total is additive", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  assert.equal(got.filter((r) => r.requestKey === "fba-plan:monthly-units").length, 4);
-  assert.equal(got.filter((r) => r.requestKey === "fba-plan:current-daily-dates").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:oli-sales").length, fbaOliSlices.length);
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:catalog").length, 1);
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:inventory-health").length, 1);
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
-  assert.equal(got.length, 8); // 4+1+1+1+1
+  assert.equal(got.length, fbaOliSlices.length + 3);
 });
 
-/* --- same source id, different identity, never shared --- */
-test("fba-plan's two Sales & Traffic exports have distinct identities even at the same window", () => {
+/* --- one canonical OLI source id; distinct windows => distinct identities --- */
+test("fba-plan's canonical OLI fragments all use the OLI source id with per-window identities", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  const mu = got.find((r) => r.requestKey === "fba-plan:monthly-units" && r.from === "2025-08-01");
-  const dd = got.find((r) => r.requestKey === "fba-plan:current-daily-dates");
-  assert.equal(mu.sourceId, dd.sourceId); // same Sales & Traffic source id
-  assert.equal(mu.from, dd.from);
-  assert.equal(mu.to, dd.to); // same window
-  assert.notEqual(mu.requestHash, dd.requestHash); // different columns => not a shared export
+  const oli = got.filter((r) => r.requestKey === "fba-plan:oli-sales");
+  assert.ok(oli.length > 1);
+  assert.equal(new Set(oli.map((r) => r.sourceId)).size, 1); // one Order Line Items source id
+  assert.equal(new Set(oli.map((r) => r.requestHash)).size, oli.length); // distinct windows => distinct hashes
+  const augSlice = oli.find((r) => r.from === "2025-08-01");
+  assert.ok(augSlice, "the current-month Aug slice is present");
+  assert.equal(augSlice.sourceId, oli[0].sourceId); // same Order Line Items source id
+  assert.notEqual(augSlice.requestHash, oli[0].requestHash); // different windows => distinct hashes
 });
 
 /* --- country-driven US-only AWD --- */
 test("fba-plan resolves without AWD for a non-US account", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "IN" });
-  assert.ok(got.length === 7);
+  assert.ok(got.length === fbaOliSlices.length + 2); // oli-sales slices + catalog + inventory, no AWD
   assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"));
 });
 test("fba-plan resolves AWD as a no-date request for a US account", () => {
@@ -555,7 +555,7 @@ for (const n of [0, 1, 5, 6, 11]) {
 }
 
 test("validation still applies to the new reports (missing required key throws)", () => {
-  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:monthly-units": fbaMonths }, marketplaceCountry: "IN" }), /Missing windows/);
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:oli-sales": fbaOliSlices }, marketplaceCountry: "IN" }), /Missing windows/);
 });
 
 /* ===================== keyword-rank + content-changes ===================== */
@@ -782,8 +782,8 @@ test("rejectsAtCap accepts 49,999 and rejects exactly 50,000 (and above)", () =>
   assert.equal(rejectsAtCap(0, 50000), false);
 });
 
-test("Daily ASIN/day superset contract is marked strict:true", () => {
-  assert.equal(byKey(daily, "daily-reporting:asin-day-superset").strict, true);
+test("Daily canonical OLI sales superset contract is marked strict:true", () => {
+  assert.equal(byKey(daily, "daily-reporting:oli-sales").strict, true);
 });
 
 test("fetchDailyBrandSalesRows enforces the row cap in executable code (rejects before append)", () => {
@@ -800,7 +800,7 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   // machine-readable strict flag must never claim a safeguard the builder lacks.
   // Operational reports guard with a named per-report LIMIT constant in api/datadoe.js.
   const OPERATIONAL_STRICT = {
-    "daily-reporting:asin-day-superset": "DAILY_BRAND_ROW_LIMIT",
+    "daily-reporting:oli-sales": "DAILY_BRAND_ROW_LIMIT",
     "sku-pl:monthly-profit": "SKU_PL_ROW_LIMIT",
     "keyword-rank:sqp-weekly": "SQP_ROW_LIMIT",
     "keyword-rank:sqp-monthly": "SQP_ROW_LIMIT",
@@ -818,19 +818,19 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "sales-movers:inventory": "common.js",
     "sales-movers:catalog": "common.js",
     "buy-box-loss:daily": "buy-box.js",
-    "buy-box-loss:ordered": "buy-box.js",
+    "buy-box-loss:oli-sales": "buy-box.js",
     "buy-box-loss:inventory": "common.js",
     "buy-box-loss:catalog": "common.js",
     "returns-leakage:returns": "returns.js",
     "returns-leakage:settlements": "returns.js",
-    "returns-leakage:ordered": "returns.js",
+    "returns-leakage:oli-sales": "returns.js",
     "returns-leakage:catalog": "common.js",
     "listing-health:listings": "listing-health.js",
     "listing-health:listings-raw": "listing-health.js",
     "listing-health:sales": "listing-health.js",
     "listing-health:inventory": "common.js",
     "listing-health:catalog": "common.js",
-    "ppc-performance:total-sales": "ppc.js",
+    "ppc-performance:oli-sales": "ppc.js",
     "ppc-performance:catalog": "common.js",
     "listing-optimizer:sqp-weekly": "listing-optimizer.js",
     "listing-optimizer:catalog": "listing-optimizer.js",
@@ -845,7 +845,7 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   // Phase 1e re-review (their canonical Scheduler-v2 dispatch is strict even though the live route is not).
   const SCHEDULER_V2_STRICT = [
     "reconciliation:catalog",
-    "fba-plan:monthly-units", "fba-plan:current-daily-dates", "fba-plan:catalog",
+    "fba-plan:oli-sales", "fba-plan:catalog",
     "fba-plan:inventory-health", "fba-plan:awd",
     "brand-sales:order-lines", "brand-sales:catalog",
     "content-changes:events", "content-changes:catalog",
@@ -954,7 +954,7 @@ test("execution metadata does NOT change request_hash (identity ignores strict/p
 
 test("Scheduler-v2 integrity: every fba-plan resolved job + reconciliation:catalog is strict:true", () => {
   const fbaJobs = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  for (const rk of ["fba-plan:monthly-units", "fba-plan:current-daily-dates", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:awd"]) {
+  for (const rk of ["fba-plan:oli-sales", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:awd"]) {
     const jobs = fbaJobs.filter((j) => j.requestKey === rk);
     assert.ok(jobs.length >= 1, rk + " must resolve at least one job");
     for (const j of jobs) assert.equal(j.strict, true, rk + " resolved job must be strict:true");
@@ -992,12 +992,12 @@ const INSIGHT_SPEC = [
   { rk: "sales-movers:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "sales-movers:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "buy-box-loss:daily", file: "buy-box.js", cols: "DAILY_COLUMNS", group: null, aggs: null, src: "profit-by-sku-date", limit: 50000, oc: "date", od: "ASC", strict: true },
-  { rk: "buy-box-loss:ordered", file: "buy-box.js", cols: "ORDERED_GROUP_BY", group: "ORDERED_GROUP_BY", aggs: "ORDERED_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "sku", od: "ASC", strict: true },
+  { rk: "buy-box-loss:oli-sales", file: "buy-box.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "buy-box-loss:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "buy-box-loss:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:returns", file: "returns.js", cols: "RETURN_COLUMNS", group: null, aggs: null, src: "returns", limit: 50000, oc: "date", od: "DESC", strict: true },
   { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
-  { rk: "returns-leakage:ordered", file: "returns.js", cols: "ORDERED_GROUP_BY", group: "ORDERED_GROUP_BY", aggs: "ORDERED_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
+  { rk: "returns-leakage:oli-sales", file: "returns.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "returns-leakage:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Health
   { rk: "listing-health:listings", file: "listing-health.js", cols: "LISTING_COLUMNS", group: null, aggs: null, src: "listings", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
@@ -1006,7 +1006,7 @@ const INSIGHT_SPEC = [
   { rk: "listing-health:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "listing-health:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // PPC Performance (ads are derived; this is the only owned export besides catalog)
-  { rk: "ppc-performance:total-sales", file: "ppc.js", cols: "TOTAL_SALES_GROUP_BY", group: "TOTAL_SALES_GROUP_BY", aggs: "TOTAL_SALES_AGGREGATIONS", src: "order-line-items", limit: 500, oc: "date", od: "ASC", strict: true },
+  { rk: "ppc-performance:oli-sales", file: "ppc.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "ppc-performance:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Optimizer (richer SQP + richer content catalog; both intentionally unshared)
   { rk: "listing-optimizer:sqp-weekly", file: "listing-optimizer.js", cols: "SQP_COLUMNS", group: null, aggs: null, src: "sqp-weekly", limit: 50000, oc: "date", od: "ASC", strict: true, policy: "degraded" },
@@ -1066,17 +1066,16 @@ const bbWin = {
     { from: "2025-07-10", to: "2025-07-16" }, { from: "2025-07-17", to: "2025-07-23" },
     { from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-31", to: "2025-08-06" },
   ],
-  "buy-box-loss:ordered": [
-    { from: "2025-07-10", to: "2025-07-16" }, { from: "2025-07-17", to: "2025-07-23" },
-    { from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-31", to: "2025-08-06" },
-  ],
+  // Blocker 1: canonical OLI sales fragment sliced by canonicalOliSlices over the buy-box 28-day window.
+  "buy-box-loss:oli-sales": canonicalOliSlices("2025-07-10", "2025-08-06"),
   "buy-box-loss:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
   "buy-box-loss:catalog": [{ from: null, to: null }],
 };
 const retWin = {
   "returns-leakage:returns": [{ from: "2025-06-08", to: "2025-08-06" }],
   "returns-leakage:settlements": [{ from: "2025-06-08", to: "2025-08-06" }],
-  "returns-leakage:ordered": [{ from: "2025-06-08", to: "2025-08-06" }],
+  // Blocker 1: canonical OLI sales fragment sliced by canonicalOliSlices over the returns 60-day window.
+  "returns-leakage:oli-sales": canonicalOliSlices("2025-06-08", "2025-08-06"),
   "returns-leakage:catalog": [{ from: null, to: null }],
 };
 
@@ -1132,11 +1131,16 @@ test("(12) the FBA inventory snapshot is ONE request identity shared by Sales Mo
   assert.equal(inv("sales-movers", smWin, SM_PROBE_OK), inv("buy-box-loss", bbWin));
 });
 
-test("same source, different identity: Buy Box ordered vs Returns ordered (both Order Line Items) do NOT deduplicate", () => {
-  const bb = reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin }).find((r) => r.requestKey === "buy-box-loss:ordered");
-  const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:ordered");
-  assert.equal(bb.sourceId, ret.sourceId); // same DataDoe source id (Order Line Items)...
-  assert.notEqual(bb.requestHash, ret.requestHash); // ...but different columns/aggregations/window => distinct request
+test("(Blocker 1) Buy Box + Returns SHARE the same request_hash on an overlapping canonical OLI slice (one export, many owners)", () => {
+  const bb = reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin }).filter((r) => r.requestKey === "buy-box-loss:oli-sales");
+  const ret = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).filter((r) => r.requestKey === "returns-leakage:oli-sales");
+  // A calendar-anchored interior slice that BOTH the 28-day and 60-day windows fully cover.
+  const shared = { from: "2025-07-22", to: "2025-07-28" };
+  const bbSlice = bb.find((r) => r.from === shared.from && r.to === shared.to);
+  const retSlice = ret.find((r) => r.from === shared.from && r.to === shared.to);
+  assert.ok(bbSlice && retSlice, "both reports emit the shared interior slice");
+  assert.equal(bbSlice.sourceId, retSlice.sourceId); // same Order Line Items source id...
+  assert.equal(bbSlice.requestHash, retSlice.requestHash); // ...and IDENTICAL canonical spec + window => ONE export shared by both owners
 });
 
 test("(11) sales-movers primary vs dd-secondary organizations remain isolated (different hashes)", () => {
@@ -1164,7 +1168,8 @@ const lhWin = {
   "listing-health:catalog": [{ from: null, to: null }],
 };
 const ppcWin = {
-  "ppc-performance:total-sales": [{ from: "2025-07-08", to: "2025-08-06" }],
+  // Blocker 1: canonical OLI sales fragment sliced by canonicalOliSlices over the ppc 30-day window.
+  "ppc-performance:oli-sales": canonicalOliSlices("2025-07-08", "2025-08-06"),
   "ppc-performance:catalog": [{ from: null, to: null }],
 };
 const optWin = {
@@ -1219,7 +1224,7 @@ test("(13) Listing Optimizer's catalog and SQP do NOT deduplicate with the commo
 
 test("(14) PPC creates NO Ads DataDoe source jobs; ads are declared derived from persisted rows", () => {
   const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK });
-  assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))].sort(), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
+  assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))].sort(), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
   for (const c of REPORT_SOURCE_CONTRACTS["ppc-performance"]) assert.ok(!/^ads-/.test(c.sourceKey), "PPC owns no Ads source");
   assert.deepEqual(REPORT_DERIVED_SOURCE_KEYS["ppc-performance"], ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"]);
   assert.ok(/getAdsDailySourceRows/.test(builderText("ppc.js")), "PPC builder must read persisted ads rows, not fetch an export");
@@ -1386,8 +1391,8 @@ test("PPC — 0 or 1 Ads currency activates total-sales; >1 skips it; catalog st
     windowsByRequestKey: currencyCount <= 1 ? ppcWin : ppcCatOnly,
     dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount } },
   }));
-  assert.deepEqual(plan(0), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
-  assert.deepEqual(plan(1), ["ppc-performance:catalog", "ppc-performance:total-sales"]);
+  assert.deepEqual(plan(0), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
+  assert.deepEqual(plan(1), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
   assert.deepEqual(plan(2), ["ppc-performance:catalog"]); // multi-currency: TACoS unavailable by design; catalog still enriches ASINs
 });
 
@@ -1399,7 +1404,7 @@ test("PPC — missing/unvalidated currency signal skips total-sales (fail closed
 
 test("PPC total-sales carries an immutable failurePolicy (degrade, blocks:false, never partial); catalog has none", () => {
   const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK });
-  const ts = jobs.find((j) => j.requestKey === "ppc-performance:total-sales");
+  const ts = jobs.find((j) => j.requestKey === "ppc-performance:oli-sales");
   const cat = jobs.find((j) => j.requestKey === "ppc-performance:catalog");
   assert.equal(ts.strict, true); // strict row cap...
   assert.equal(ts.failurePolicy.onFailure, "degrade");
@@ -1416,9 +1421,9 @@ test("PPC total-sales carries an immutable failurePolicy (degrade, blocks:false,
 
 test("PPC total-sales failurePolicy + dependency are execution metadata: request_hash is unchanged", () => {
   const ts = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK })
-    .find((j) => j.requestKey === "ppc-performance:total-sales");
+    .find((j) => j.requestKey === "ppc-performance:oli-sales");
   const expected = sourceRequestIdentity({
-    apiKey: "k", sourceId: ts.sourceId, columns: byKey(REPORT_SOURCE_CONTRACTS["ppc-performance"], "ppc-performance:total-sales").columns,
+    apiKey: "k", sourceId: ts.sourceId, columns: byKey(REPORT_SOURCE_CONTRACTS["ppc-performance"], "ppc-performance:oli-sales").columns,
     ids: ts.sellerOrVendorIds, from: ts.from, to: ts.to, limit: ts.limit, options: ts.options,
   }).requestHash;
   assert.equal(ts.requestHash, expected); // identity ignores failurePolicy + dependency

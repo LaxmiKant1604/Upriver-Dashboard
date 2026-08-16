@@ -17,7 +17,8 @@ import { REPORT_SOURCE_CONTRACTS, reportSourceRequestHashes } from "../lib/serve
 import { SOURCE_CONTRACTS, REPORT_SOURCE_REQUIREMENTS } from "../lib/server/source-contracts.js";
 import { deriveReportSnapshot } from "../lib/server/sync/report-derivation.js";
 import { assembleSources } from "../lib/server/sync/report-worker.js";
-import { addDaysStr, splitDateRangeByDays } from "../lib/server/date-windows.js";
+import { addDaysStr, splitDateRangeByDays, canonicalOliSlices } from "../lib/server/date-windows.js";
+import { sourceJobOwnerId } from "../lib/server/source-identity.js";
 import {
   ppcPerformancePayload,
   buyBoxLossPayload,
@@ -35,13 +36,13 @@ const OLI_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778
 const OLI_SOURCES = new Map(SOURCE_CONTRACTS.map((c) => [c.key, c]));
 // The five reports that MUST have moved off Sales & Traffic onto Order Line Items.
 const CORRECTED = ["daily-reporting", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"];
-// The exact OLI request keys each corrected report now owns.
+// The exact OLI request keys each corrected report now owns (Blocker 1: ONE canonical fragment each).
 const OLI_REQUEST_KEYS = {
-  "daily-reporting": ["daily-reporting:asin-day-superset"],
-  "fba-plan": ["fba-plan:monthly-units", "fba-plan:current-daily-dates"],
-  "buy-box-loss": ["buy-box-loss:ordered"],
-  "returns-leakage": ["returns-leakage:ordered"],
-  "ppc-performance": ["ppc-performance:total-sales"],
+  "daily-reporting": ["daily-reporting:oli-sales"],
+  "fba-plan": ["fba-plan:oli-sales"],
+  "buy-box-loss": ["buy-box-loss:oli-sales"],
+  "returns-leakage": ["returns-leakage:oli-sales"],
+  "ppc-performance": ["ppc-performance:oli-sales"],
 };
 const contractsFor = (reportKey) => REPORT_SOURCE_CONTRACTS[reportKey] || [];
 const byKey = (reportKey, requestKey) => contractsFor(reportKey).find((c) => c.requestKey === requestKey);
@@ -130,7 +131,7 @@ test("(c) buy-box derives a page-view-weighted buybox% + page views from profit-
     ]],
     // Order Line Items ordered rows: sales/units.
     orderedSliceRows: [[
-      { sku: "SKU1", child_asin: "ASIN1", item_price_currency: "USD", sales_sum: 300, units_sum: 30 },
+      { date: "2025-07-15", seller_or_vendor_id: "S1", sku: "SKU1", child_asin: "ASIN1", item_price_currency: "USD", total_sales_sum: 300, total_units_sum: 30 },
     ]],
     inventoryRows: [], catalogRows: [],
   });
@@ -156,7 +157,7 @@ test("(g) returns-leakage rate uses OLI ordered units as denominator and Returns
       { date: "2025-08-02", child_asin: "A1", sku: "S1", amazon_return_reason: "TOO_SMALL", amazon_fulfillment_channel: "FBA", amazon_return_request_status: "Approved", amazon_return_refunded_amount: -3 },
     ],
     settlementRows: [],
-    orderedRows: [{ child_asin: "A1", item_price_currency: "USD", sales_sum: 500, units_sum: 100 }],
+    orderedRows: [{ date: "2025-08-01", seller_or_vendor_id: "S1", sku: "S1", child_asin: "A1", item_price_currency: "USD", total_sales_sum: 500, total_units_sum: 100 }],
     catalogRows: [],
   });
   const row = ret.rows.find((r) => r.asin === "A1");
@@ -184,8 +185,8 @@ const ppcCall = (over = {}) => ppcPerformancePayload({
 
 test("(d) PPC TACoS sums OLI sales that match the single Ads currency", () => {
   const p = ppcCall({ totalSalesRows: [
-    { date: "2025-08-01", item_price_currency: "USD", sales_sum: 400 },
-    { date: "2025-08-02", item_price_currency: "USD", sales_sum: 100 },
+    { date: "2025-08-01", item_price_currency: "USD", total_sales_sum: 400 },
+    { date: "2025-08-02", item_price_currency: "USD", total_sales_sum: 100 },
   ] });
   assert.deepEqual(p.currencies, ["USD"], "single Ads currency");
   assert.equal(p.totalSales, 500, "OLI sales summed in the Ads currency");
@@ -193,16 +194,23 @@ test("(d) PPC TACoS sums OLI sales that match the single Ads currency", () => {
 });
 
 test("(d) PPC TACoS DEGRADES (never sums across currencies) when OLI sales are a different currency than Ads", () => {
-  const p = ppcCall({ totalSalesRows: [{ date: "2025-08-01", item_price_currency: "CAD", sales_sum: 400 }] });
+  const p = ppcCall({ totalSalesRows: [{ date: "2025-08-01", item_price_currency: "CAD", total_sales_sum: 400 }] });
   assert.equal(p.totalSales, null, "no cross-currency sum");
   assert.ok(/different currency/i.test(p.totalSalesUnavailable), "typed currency-mismatch degrade reason");
   // A MIX (one matching + one mismatching) also degrades rather than partially summing.
   const mix = ppcCall({ totalSalesRows: [
-    { date: "2025-08-01", item_price_currency: "USD", sales_sum: 400 },
-    { date: "2025-08-02", item_price_currency: "CAD", sales_sum: 100 },
+    { date: "2025-08-01", item_price_currency: "USD", total_sales_sum: 400 },
+    { date: "2025-08-02", item_price_currency: "CAD", total_sales_sum: 100 },
   ] });
   assert.equal(mix.totalSales, null, "a currency mix degrades, never partially sums");
   assert.ok(/different currency/i.test(mix.totalSalesUnavailable));
+  // Blocker 3: a BLANK-currency OLI row is never summed into a currency denominator (TACoS unavailable).
+  const blank = ppcCall({ totalSalesRows: [
+    { date: "2025-08-01", item_price_currency: "USD", total_sales_sum: 400 },
+    { date: "2025-08-02", item_price_currency: "", total_sales_sum: 100 },
+  ] });
+  assert.equal(blank.totalSales, null, "a blank-currency row degrades, never sums a currencyless row");
+  assert.ok(/different currency/i.test(blank.totalSalesUnavailable));
 });
 
 /* ---------------------- (h) cross-currency is fail-closed (never merged) across the OLI reports ---------------------- */
@@ -227,8 +235,8 @@ test("(h) buy-box NEVER merges two currencies for one SKU -> a separate row per 
       { date: "2025-07-15", sku: "SKU1", child_asin: "ASIN1", currency: "CAD", buybox_percentage: 70, page_views: 10 },
     ]],
     orderedSliceRows: [[
-      { sku: "SKU1", child_asin: "ASIN1", item_price_currency: "USD", sales_sum: 100, units_sum: 10 },
-      { sku: "SKU1", child_asin: "ASIN1", item_price_currency: "CAD", sales_sum: 200, units_sum: 20 },
+      { date: "2025-07-15", seller_or_vendor_id: "S1", sku: "SKU1", child_asin: "ASIN1", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 },
+      { date: "2025-07-15", seller_or_vendor_id: "S1", sku: "SKU1", child_asin: "ASIN1", item_price_currency: "CAD", total_sales_sum: 200, total_units_sum: 20 },
     ]],
     inventoryRows: [], catalogRows: [],
   });
@@ -249,7 +257,7 @@ test("(h) returns money NEVER merges currencies: one settlement REFUND per curre
     returnsSourceLabel: "Returns (FBA & FBM)", moneySourceLabel: "Settlements & P&L Components",
     rateSourceLabel: "Order Line Items", rateSourceLagDays: 0, returnHistoryDays: 60,
     returnRows: [], settlementRows: [refund("USD", -30), refund("CAD", -15)],
-    orderedRows: [{ child_asin: "A1", item_price_currency: "USD", sales_sum: 500, units_sum: 50 }], catalogRows: [],
+    orderedRows: [{ date: "2025-08-01", seller_or_vendor_id: "S1", sku: "S1", child_asin: "A1", item_price_currency: "USD", total_sales_sum: 500, total_units_sum: 50 }], catalogRows: [],
   });
   const a1 = ret.rows.filter((r) => r.asin === "A1");
   assert.equal(a1.length, 2, "USD and CAD refunds keep a separate row each");
@@ -282,8 +290,10 @@ test("(h) a CROSS-ACCOUNT returns OLI ordered fragment fails closed (derive-inva
     planned.push(f); rows[f.requestHash] = [];
   }
   const se = frag("returns-leakage:settlements", FROM, ASOF); planned.push(se); rows[se.requestHash] = [];
-  // The OLI ordered fragment is scoped to ANOTHER seller id -> cross-account.
-  const od = frag("returns-leakage:ordered", FROM, ASOF, ["OTHER"]); planned.push(od); rows[od.requestHash] = [];
+  // The canonical OLI sales fragments (canonicalOliSlices) are scoped to ANOTHER seller id -> cross-account.
+  for (const s of canonicalOliSlices(FROM, ASOF)) {
+    const od = frag("returns-leakage:oli-sales", s.from, s.to, ["OTHER"]); planned.push(od); rows[od.requestHash] = [];
+  }
   const ca = frag("returns-leakage:catalog", null, null); planned.push(ca); rows[ca.requestHash] = [];
   const res = deriveReportSnapshot({
     reportKey: "returns-leakage",
@@ -294,38 +304,59 @@ test("(h) a CROSS-ACCOUNT returns OLI ordered fragment fails closed (derive-inva
   assert.ok(!res.payload, "no partial payload is written when a source fails closed");
 });
 
-/* ---------------------- (i) one create-export per request_hash (stable + distinct identities) ---------------------- */
+/* ---------------------- (i)/(ii)/(iii) REAL cross-report OLI reuse: shared hash, multiple owners, one export ---------------------- */
 
-test("(i) OLI request identities are deterministic (one export per hash) and distinct per report", () => {
-  const slices = [
-    { from: "2025-07-14", to: "2025-07-20" }, { from: "2025-07-21", to: "2025-07-27" },
-    { from: "2025-07-28", to: "2025-08-03" }, { from: "2025-08-04", to: "2025-08-10" },
-  ];
-  const bbWin = {
-    "buy-box-loss:daily": slices,
-    "buy-box-loss:ordered": slices,
-    "buy-box-loss:inventory": [{ from: "2025-07-31", to: "2025-08-10" }],
-    "buy-box-loss:catalog": [{ from: null, to: null }],
-  };
-  const resolve = () => reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin });
-  const a = resolve();
-  const b = resolve();
-  // Identical inputs => identical request identities: the source worker creates ONE export per request_hash.
-  assert.deepEqual(a.map((r) => r.requestHash), b.map((r) => r.requestHash), "request identity is deterministic");
-  const ordered = a.filter((r) => r.requestKey === "buy-box-loss:ordered");
-  assert.equal(ordered.length, 4, "four ordered slices");
-  assert.equal(new Set(ordered.map((r) => r.requestHash)).size, 4, "each slice is a distinct export identity (never collapsed)");
-  // The Buy Box OLI request must NOT share an identity with the Returns OLI request (different columns/window),
-  // so a shared canonical hash can never under-export one report's ordered units.
-  const retWin = {
-    "returns-leakage:returns": [{ from: "2025-06-12", to: "2025-08-10" }],
-    "returns-leakage:settlements": [{ from: "2025-06-12", to: "2025-08-10" }],
-    "returns-leakage:ordered": [{ from: "2025-06-12", to: "2025-08-10" }],
-    "returns-leakage:catalog": [{ from: null, to: null }],
-  };
-  const retOrdered = reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: retWin }).find((r) => r.requestKey === "returns-leakage:ordered");
-  assert.equal(retOrdered.sourceId, ordered[0].sourceId, "same DataDoe source id (Order Line Items)...");
-  assert.notEqual(retOrdered.requestHash, ordered[0].requestHash, "...but a distinct request identity");
+// All the OLI reports share ONE asOf; their canonical fragments are calendar-anchored (canonicalOliSlices),
+// so an interior slice that two reports both cover has the IDENTICAL request_hash => ONE DataDoe export owned
+// by BOTH reports (owner_id includes reportKey, so the SAME request_hash carries MULTIPLE distinct owners).
+const OLI_ASOF = "2025-08-10";
+const bbOli = () => reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
+  "buy-box-loss:daily": [{ from: "2025-07-14", to: "2025-07-20" }],
+  "buy-box-loss:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -27), OLI_ASOF),
+  "buy-box-loss:inventory": [{ from: "2025-07-31", to: OLI_ASOF }],
+  "buy-box-loss:catalog": [{ from: null, to: null }],
+} }).filter((r) => r.requestKey === "buy-box-loss:oli-sales");
+const ppcOli = () => reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
+  "ppc-performance:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -29), OLI_ASOF),
+  "ppc-performance:catalog": [{ from: null, to: null }],
+}, dependencySignals: { "ppc-performance:ads-currency": { status: "success", validated: true, currencyCount: 1 } } }).filter((r) => r.requestKey === "ppc-performance:oli-sales");
+const retOli = () => reportSourceRequestHashes({ reportKey: "returns-leakage", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
+  "returns-leakage:returns": [{ from: addDaysStr(OLI_ASOF, -59), to: OLI_ASOF }],
+  "returns-leakage:settlements": [{ from: addDaysStr(OLI_ASOF, -59), to: OLI_ASOF }],
+  "returns-leakage:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -59), OLI_ASOF),
+  "returns-leakage:catalog": [{ from: null, to: null }],
+} }).filter((r) => r.requestKey === "returns-leakage:oli-sales");
+
+// An interior August bin [1-7] that the 28-day, 30-day AND 60-day windows all fully cover (asOf 2025-08-10).
+const SHARED_SLICE = { from: "2025-08-01", to: "2025-08-07" };
+const findShared = (jobs) => jobs.find((r) => r.from === SHARED_SLICE.from && r.to === SHARED_SLICE.to);
+
+test("(i) cross-report EQUALITY: ppc / buy-box / returns share ONE request_hash on the overlapping canonical slice", () => {
+  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli());
+  assert.ok(bb && ppc && ret, "all three reports emit the shared August slice");
+  assert.equal(bb.sourceId, ppc.sourceId); assert.equal(ppc.sourceId, ret.sourceId); // one Order Line Items source id
+  // Identical canonical spec + window + account + org => IDENTICAL request identity across all three reports.
+  assert.equal(bb.requestHash, ppc.requestHash, "buy-box and ppc share the request_hash on the overlapping slice");
+  assert.equal(ppc.requestHash, ret.requestHash, "ppc and returns share the request_hash on the overlapping slice");
+});
+
+test("(ii) ONE source job per shared request_hash carries MULTIPLE distinct report owners (owner_id includes reportKey)", () => {
+  const bb = findShared(bbOli()), ppc = findShared(ppcOli()), ret = findShared(retOli());
+  // ONE export identity...
+  assert.equal(new Set([bb.requestHash, ppc.requestHash, ret.requestHash]).size, 1, "exactly one request_hash (one export) across the three reports");
+  // ...owned by THREE distinct report owners (deterministic owner_id keyed by reportKey + connection + org + scope).
+  const owner = (job, reportKey) => sourceJobOwnerId({ reportKey, connectionId: "primary", organizationFingerprint: job.organizationFingerprint, accountScopeHash: job.accountScopeHash });
+  const owners = [owner(bb, "buy-box-loss"), owner(ppc, "ppc-performance"), owner(ret, "returns-leakage")];
+  for (const o of owners) assert.ok(o, "each owner_id is well-formed (non-null)");
+  assert.equal(new Set(owners).size, 3, "the one shared export is owned by three distinct report owners");
+});
+
+test("(iii) exactly one create-export per request_hash: the shared slice dedupes to a single identity", () => {
+  const shared = [...bbOli(), ...ppcOli(), ...retOli()].filter((r) => r.from === SHARED_SLICE.from && r.to === SHARED_SLICE.to);
+  assert.equal(shared.length, 3, "three report jobs reference the shared slice");
+  assert.equal(new Set(shared.map((r) => r.requestHash)).size, 1, "...but they collapse to ONE request_hash => one create-export");
+  // Deterministic: re-resolving reproduces byte-identical request identities (stable one-export-per-hash).
+  assert.deepEqual(bbOli().map((r) => r.requestHash), bbOli().map((r) => r.requestHash), "request identity is deterministic");
 });
 
 async function main() {

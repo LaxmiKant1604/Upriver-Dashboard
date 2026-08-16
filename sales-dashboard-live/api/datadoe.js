@@ -1482,20 +1482,40 @@ const DAILY_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
-// A named brand needs ASIN-level grouping before it can be joined to the
-// Product Catalog. The all-brand report keeps the more compact date grouping.
-// Both carry item_price_currency for currency isolation.
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
-const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
+// A named brand needs ASIN-level grouping before it can be joined to the Product Catalog. The all-brand
+// report keeps the more compact date grouping. Both carry item_price_currency for currency isolation.
+// The named-brand superset IS the CANONICAL Order Line Items sales fragment (Blocker 1): grouped by
+// [date, seller, sku, child_asin, item_price_currency] so it is byte-identical to OLI_SALES_* and shares
+// request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance on overlapping slices.
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
 
-// Advertising source (ad sales / spend / clicks), merged into the daily report
-// by (account, date).
+// ===== CANONICAL Order Line Items sales fragment (Blocker 1 — parity source of truth) =====
+// ONE fragment spec shared IDENTICALLY by daily-reporting (the superset above), fba-plan, buy-box-loss,
+// returns-leakage and ppc-performance so overlapping calendar-anchored slices (canonicalOliSlices) produce
+// EQUAL request_hashes => one DataDoe export reused by MULTIPLE report owners. Mirrored in
+// lib/server/sync/report-source-contracts.js (OLI_SALES_*) and referenced by the live builders in
+// lib/server/reports/{buy-box,returns,ppc}.js. item_price_currency is in the group-by so DataDoe never sums
+// money across currencies; every downstream fold keys currency in and re-aggregates to its own grain.
+const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
+];
+const OLI_SALES_ROW_LIMIT = 50000;
+
+// Advertising source (ad sales / spend / clicks), merged into the daily report by (account, date, currency).
+// ad_campaign_budget_currency is carried + normalized to `currency` (Blocker 4) so the currency-keyed
+// mergeSalesAndAds only merges an Ads row into the OLI sales row of the SAME currency; a blank/unprovable
+// Ads currency becomes null and never merges (fail-closed: the sales row simply shows no ads).
 const ADS_SOURCE_ID = "08cdc77d3d";
 const ADS_COLUMNS = [
   "date",
   "seller_or_vendor_id",
+  "ad_campaign_budget_currency",
 ];
-const ADS_GROUP_BY = ["date", "seller_or_vendor_id"];
+const ADS_GROUP_BY = ["date", "seller_or_vendor_id", "ad_campaign_budget_currency"];
 const ADS_AGGREGATIONS = [
   { column: "ad_sales", aggregation: "sum", alias: "ad_sales_sum" },
   { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
@@ -1612,7 +1632,6 @@ const LISTINGS_AWD_COLUMNS = [
 // the front of the result, so the row limit only ever drops older snapshots.
 const PLAN_INVENTORY_LOOKBACK_DAYS = 10;
 const PLAN_INVENTORY_ROW_LIMIT = 15000;
-const PLAN_SALES_ROW_LIMIT = 30000;
 
 const DASHBOARD_ROW_LIMIT = 5000;
 // Order rows are grouped by day and ASIN before download. A year of data can
@@ -1742,9 +1761,17 @@ export function dailyRowsForBrand(rows, catalogRows, brand) {
 }
 
 // Exported for the Scheduler v2 Daily Reporting derivation parity harness (runtime unchanged).
+// Blocker 4: normalize the Ads currency from ad_campaign_budget_currency into `currency` (canonical
+// UPPERCASE, or null when blank/unprovable) so the currency-keyed mergeSalesAndAds only merges an Ads
+// row into the OLI sales row of the SAME currency. A currency-less Ads row (currency === null) never
+// merges into a currency'd sales row (fail-closed: no misleading cross-currency merge). An already-
+// normalized `currency` (e.g. the Supabase-saved ad rows) is preserved.
 export function normalizeAdRows(rows) {
   return rows.map((row) => ({
     ...row,
+    currency: (row.currency != null && String(row.currency).trim() !== "")
+      ? String(row.currency).trim().toUpperCase()
+      : (String(row.ad_campaign_budget_currency || "").trim().toUpperCase() || null),
     ad_sales: num(row.ad_sales_sum ?? row.ad_sales),
     ad_spend: num(row.ad_spend_sum ?? row.ad_spend),
     ad_clicks: num(row.ad_clicks_sum ?? row.ad_clicks),
@@ -2008,21 +2035,6 @@ function planMonthWindows(toStr) {
     daysInMonth: daysInMonthUTC(ty, tm),
   };
   return { completed, current };
-}
-
-// Sum per-ASIN ordered units for one grouped Order Line Items export window.
-async function planAsinUnits(apiKey, ids, from, to) {
-  const rows = await fetchExportRows(
-    apiKey, PLAN_SALES_SOURCE_ID, ["child_asin"], ids, from, to, PLAN_SALES_ROW_LIMIT,
-    { groupBy: ["child_asin"], aggregations: [{ column: "quantity", aggregation: "sum", alias: "units_sum" }], orderByColumn: "child_asin", orderByDirection: "ASC" }
-  );
-  const byAsin = new Map();
-  for (const r of rows) {
-    const asin = String(r.child_asin || "").trim();
-    if (!asin) continue;
-    byAsin.set(asin, (byAsin.get(asin) || 0) + num(r.units_sum ?? r.quantity));
-  }
-  return byAsin;
 }
 
 // Fold advertising rows (ad_sales/ad_spend/ad_clicks) into the sales rows by
@@ -2971,31 +2983,38 @@ async function handleDataDoe(req, res) {
       const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
       const isUS = String(account?.country || "").toUpperCase() === "US";
 
-      // 1) Per-ASIN units for each completed month.
+      // 1) ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf] (Blocker 1).
+      // Per-ASIN ordered units per month AND the current-month latest sales date are DERIVED from this
+      // single shared fragment (byte-identical spec to the other OLI reports, so overlapping calendar
+      // slices reuse one export). Units are a currency-agnostic count, so this sums total_units_sum
+      // ACROSS currencies (the canonical rows still carry currency for the money-keyed reports).
+      const oliSalesRows = await fetchExportRows(
+        apiKey, PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS, sellerOrVendorIds, completed[0].from, current.to, OLI_SALES_ROW_LIMIT,
+        { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" }
+      );
       const asinSet = new Set();
       const unitsByAsinByMonth = {}; // asin -> { monthKey: units }
-      for (const mo of completed) {
-        const byAsin = await planAsinUnits(apiKey, sellerOrVendorIds, mo.from, mo.to);
-        for (const [asin, units] of byAsin) {
+      const mtdByAsin = new Map();   // asin -> current-month units
+      const unitsByDate = new Map(); // current-month date -> summed units (latest-date probe)
+      const completedMonthKeys = new Set(completed.map((m) => m.key));
+      for (const r of oliSalesRows) {
+        const date = String(r.date || "");
+        const mk = date.slice(0, 7);
+        const asin = String(r.child_asin || "").trim();
+        const units = num(r.total_units_sum ?? r.quantity);
+        if (asin && (mk === current.key || completedMonthKeys.has(mk))) {
           asinSet.add(asin);
-          (unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {}))[mo.key] = units;
+          const byMonth = unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {});
+          byMonth[mk] = (byMonth[mk] || 0) + units;
+          if (mk === current.key) mtdByAsin.set(asin, (mtdByAsin.get(asin) || 0) + units);
         }
+        if (mk === current.key && date) unitsByDate.set(date, (unitsByDate.get(date) || 0) + units);
       }
-
-      // 2a) Current-month MTD units per ASIN (grouped by ASIN, so it stays small
-      // and cannot be truncated by an ASIN*day row explosion).
-      const mtdByAsin = await planAsinUnits(apiKey, sellerOrVendorIds, current.from, current.to);
-      for (const asin of mtdByAsin.keys()) asinSet.add(asin);
-      // 2b) Latest completed sales date in the current month (grouped by date
-      // only, ~1 row/day). Elapsed days are measured to this date so the MTD
-      // projection is not diluted by dates the source has not populated yet.
-      const dateRows = await fetchExportRows(
-        apiKey, PLAN_SALES_SOURCE_ID, ["date"], sellerOrVendorIds, current.from, current.to, 500,
-        { groupBy: ["date"], aggregations: [{ column: "quantity", aggregation: "sum", alias: "units_sum" }], orderByColumn: "date", orderByDirection: "ASC" }
-      );
+      // 2b) Latest current-month date whose summed units > 0. Elapsed days are measured to this date so
+      // the MTD projection is not diluted by dates the source has not populated yet.
       let salesLatestDate = null;
-      for (const r of dateRows) {
-        if (num(r.units_sum) > 0 && r.date && (!salesLatestDate || r.date > salesLatestDate)) salesLatestDate = r.date;
+      for (const [date, units] of unitsByDate) {
+        if (units > 0 && (!salesLatestDate || date > salesLatestDate)) salesLatestDate = date;
       }
       // Elapsed days = day-of-month of the latest completed sales date, so the
       // MTD projection uses the true covered days rather than the raw calendar
@@ -3096,7 +3115,7 @@ async function handleDataDoe(req, res) {
       // in ascending (localeCompare) order, so it is stable across refreshes.
       // Only ASINs with real activity are kept: any unit sales in the window, or
       // any live FBA/AWD stock. This drops the large tail of zero-sales,
-      // zero-stock catalog ASINs that the Sales & Traffic source emits daily.
+      // zero-stock ASINs that the Product Catalog lists but Order Line Items never sold.
       const rows = [];
       for (const asin of asinSet) {
         const inv = invByAsin[asin] || null;

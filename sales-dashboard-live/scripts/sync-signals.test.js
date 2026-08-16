@@ -433,7 +433,7 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
   const ppcResolve = (signals) => {
     const win = { "ppc-performance:catalog": [{ from: null, to: null }] };
     const cc = signals["ppc-performance:ads-currency"] && signals["ppc-performance:ads-currency"].currencyCount;
-    if (cc != null && cc <= 1) win["ppc-performance:total-sales"] = [{ from: "2025-07-08", to: "2025-08-06" }];
+    if (cc != null && cc <= 1) win["ppc-performance:oli-sales"] = [{ from: "2025-07-08", to: "2025-08-06" }];
     const resolved = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "K", ids: ["A1"], windowsByRequestKey: win, dependencySignals: signals }) || [];
     return { sourceJobs: resolved.map((r) => plannedSourceJob("ppc-performance", r, "us", "primary", "A1")) };
   };

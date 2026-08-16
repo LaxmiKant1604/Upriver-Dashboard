@@ -96,12 +96,23 @@ const RECON_SETTLEMENT_AGGREGATIONS = [
 // Ads are derived from the scheduled Ads sources (ads_daily_source_rows). See
 // REPORT_DERIVATION below. (LIVE GATE: reconcile superset-summed all-brand vs the
 // compact total once before permanently retiring the compact export.)
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "child_asin", "item_price_currency"];
-const DAILY_BRAND_SALES_GROUP_BY = [...DAILY_BRAND_SALES_COLUMNS];
-const DAILY_SALES_AGGREGATIONS = [
+// ===== CANONICAL Order Line Items sales fragment (Blocker 1) — MIRRORS api/datadoe.js OLI_SALES_* =====
+// ONE fragment spec shared IDENTICALLY by daily-reporting, fba-plan, buy-box-loss, returns-leakage and
+// ppc-performance so overlapping calendar-anchored slices (canonicalOliSlices) produce EQUAL request_hashes
+// => one DataDoe export owned by MULTIPLE reports. item_price_currency is in the group-by so DataDoe never
+// sums money across currencies; each report's fold re-aggregates to its own grain (currency kept in key).
+const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_GROUP_BY = [...OLI_SALES_COLUMNS];
+const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
+const OLI_SALES_ROW_LIMIT = 50000; // DAILY_BRAND_ROW_LIMIT / ROW_LIMITS.aggregated (strict per-slice cap)
+
+// Daily Reporting's ASIN/day superset IS the canonical fragment (byte-identical to OLI_SALES_*).
+const DAILY_BRAND_SALES_COLUMNS = OLI_SALES_COLUMNS;
+const DAILY_BRAND_SALES_GROUP_BY = OLI_SALES_GROUP_BY;
+const DAILY_SALES_AGGREGATIONS = OLI_SALES_AGGREGATIONS;
 
 // keyword-rank: fetchSqpRows (raw SQP rows, strict truncation) + a 365-day catalog.
 const SQP_COLUMNS = ["date", "child_asin", "search_query", "search_query_volume", "search_query_total_impression_count", "search_query_total_click_count", "search_query_total_purchase_count", "child_asin_impression_count", "child_asin_click_count", "child_asin_purchase_count", "child_asin_organic_search_rank"];
@@ -109,16 +120,9 @@ const SQP_COLUMNS = ["date", "child_asin", "search_query", "search_query_volume"
 // content-changes: a no-date notification export (event_time DESC) + a 365-day catalog.
 const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_notification_type", "notification_metadata", "payload"];
 
-// fba-plan: planAsinUnits (monthly, child_asin) + a current-month daily-date probe +
-// catalog + FBA Inventory Health + US-only AWD listings. Ordered units are the canonical
-// demand signal from Order Line Items (quantity), so both grouped units exports sum
-// `quantity` (a currency-agnostic unit count -- NO currency column is added here).
-const PLAN_UNITS_COLUMNS = ["child_asin"];
-const PLAN_UNITS_GROUP_BY = ["child_asin"];
-const PLAN_UNITS_AGGREGATIONS = [{ column: "quantity", aggregation: "sum", alias: "units_sum" }];
-const PLAN_DAILY_COLUMNS = ["date"];
-const PLAN_DAILY_GROUP_BY = ["date"];
-const PLAN_DAILY_AGGREGATIONS = [{ column: "quantity", aggregation: "sum", alias: "units_sum" }];
+// fba-plan: derives per-ASIN monthly units + the current-month latest-sales-date probe from the ONE
+// shared canonical Order Line Items sales fragment (OLI_SALES_*, Blocker 1) -- no dedicated units export --
+// plus catalog + FBA Inventory Health + US-only AWD listings.
 const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
 const LISTINGS_AWD_COLUMNS = ["child_asin", "sku", "fnsku", "awd_available_distributable_quantity"];
 
@@ -156,7 +160,7 @@ const SM_ADS_AGGREGATIONS = [
 // buy-box.js
 // Daily (Profit by SKU & Date) now supplies ONLY the buy-box ratio + page views (the
 // page-view-weighted share) plus the dimensions/metadata; ordered sales/units move to Order
-// Line Items (buy-box-loss:ordered), joined on currency|sku.
+// Line Items (buy-box-loss:oli-sales), joined on currency|sku.
 const BB_DAILY_COLUMNS = ["date", "sku", "child_asin", "product_name", "product_brand", "currency", "buybox_percentage", "page_views"];
 // Ordered sales/units from Order Line Items, grouped by sku + child_asin + item_price_currency
 // so DataDoe never sums money across currencies; the fold keeps each currency isolated.
@@ -199,14 +203,8 @@ const LH_SALES_AGGREGATIONS = [
   { column: "profit", aggregation: "sum", alias: "profit_sum" },
 ];
 
-// ppc.js — the ONE DataDoe export PPC makes (TACoS denominator); ads are derived.
-// Order Line Items sales (item_price_value), grouped by date + item_price_currency so
-// DataDoe never sums money across currencies; the fold keeps only the Ads currency.
-const PPC_TOTAL_SALES_COLUMNS = ["date", "item_price_currency"];
-const PPC_TOTAL_SALES_AGGREGATIONS = [
-  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
-  { column: "quantity", aggregation: "sum", alias: "units_sum" },
-];
+// ppc.js — PPC's TACoS denominator (total account sales) comes from the shared canonical Order Line
+// Items sales fragment (OLI_SALES_*, Blocker 1); all advertising figures are derived from persisted rows.
 
 // listing-optimizer.js — richer SQP + a richer content catalog; deliberately NOT
 // deduplicated with Keyword Rank's SQP or the common insight catalog (columns differ).
@@ -312,18 +310,21 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   // + REPORT_DERIVATION). Ads derived from the scheduled Ads sources.
   "daily-reporting": [
     {
-      requestKey: "daily-reporting:asin-day-superset",
+      requestKey: "daily-reporting:oli-sales",
       strict: true,
       sourceKey: "order-line-items",
-      columns: DAILY_BRAND_SALES_COLUMNS,
-      limit: 50000, // DAILY_BRAND_ROW_LIMIT (strict: per-month cap => terminal, no partial save)
-      groupBy: DAILY_BRAND_SALES_GROUP_BY,
-      aggregations: DAILY_SALES_AGGREGATIONS,
+      columns: OLI_SALES_COLUMNS,
+      limit: OLI_SALES_ROW_LIMIT, // strict per-slice cap => terminal, no partial save
+      groupBy: OLI_SALES_GROUP_BY,
+      aggregations: OLI_SALES_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      // Timeout-safe slicing (Gate-6 Cycle-1): <=7-day slices WITHIN each calendar month. Rows are per-day
-      // grouped, so the slices concatenate to the identical monthly superset; whole-month fragments TIMEOUTed.
-      windowKind: "per-slice(<=7d, within each calendar month):monthStart(asOf)-150..asOf",
+      // Blocker 1: the ONE canonical Order Line Items sales fragment, sliced by canonicalOliSlices
+      // (calendar-anchored [1-7],[8-14],[15-21],[22-28],[29-end] bins clamped to the window). Interior +
+      // asOf-boundary slices share request_hashes with fba-plan / buy-box-loss / returns-leakage /
+      // ppc-performance => one export, many owners. Rows are per-day grouped so the slices concatenate to
+      // the identical superset that all-brand + every named brand derive from.
+      windowKind: "canonicalOliSlices:monthStart(asOf)-150..asOf",
     },
     {
       requestKey: "daily-reporting:catalog",
@@ -346,28 +347,19 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   // is intentionally stricter and rejects a cap-sized page (TRUNCATED) rather than persist/derive it.
   "fba-plan": [
     {
-      requestKey: "fba-plan:monthly-units",
+      requestKey: "fba-plan:oli-sales",
       strict: true,
       sourceKey: "order-line-items",
-      columns: PLAN_UNITS_COLUMNS,
-      limit: 30000, // PLAN_SALES_ROW_LIMIT
-      groupBy: PLAN_UNITS_GROUP_BY,
-      aggregations: PLAN_UNITS_AGGREGATIONS,
-      orderByColumn: "child_asin",
-      orderByDirection: "ASC",
-      windowKind: "per-month:3 completed months + current MTD",
-    },
-    {
-      requestKey: "fba-plan:current-daily-dates",
-      strict: true,
-      sourceKey: "order-line-items",
-      columns: PLAN_DAILY_COLUMNS,
-      limit: 500,
-      groupBy: PLAN_DAILY_GROUP_BY,
-      aggregations: PLAN_DAILY_AGGREGATIONS,
+      columns: OLI_SALES_COLUMNS,
+      limit: OLI_SALES_ROW_LIMIT,
+      groupBy: OLI_SALES_GROUP_BY,
+      aggregations: OLI_SALES_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      windowKind: "range:current month (first..asOf)",
+      // Blocker 1: ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf], sliced by
+      // canonicalOliSlices. Per-ASIN monthly units AND the current-month latest-date probe are DERIVED from
+      // this single fragment (foldOliSalesToFbaInputs); it shares request_hashes with the other OLI reports.
+      windowKind: "canonicalOliSlices:completed[0].from..asOf (3 completed months + current MTD)",
     },
     {
       requestKey: "fba-plan:catalog",
@@ -603,18 +595,19 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
     {
-      requestKey: "buy-box-loss:ordered",
+      requestKey: "buy-box-loss:oli-sales",
       sourceKey: "order-line-items",
-      columns: BB_ORDERED_COLUMNS,
-      limit: 50000, // ROW_LIMITS.rawGrain
-      groupBy: BB_ORDERED_COLUMNS,
-      aggregations: BB_ORDERED_AGGREGATIONS,
-      orderByColumn: "sku",
+      columns: OLI_SALES_COLUMNS,
+      limit: OLI_SALES_ROW_LIMIT, // ROW_LIMITS.rawGrain
+      groupBy: OLI_SALES_GROUP_BY,
+      aggregations: OLI_SALES_AGGREGATIONS,
+      orderByColumn: "date",
       orderByDirection: "ASC",
-      // Ordered sales/units (item_price_value / quantity) from Order Line Items, the same
-      // FOUR 7-day slices as :daily; joined to the daily buy-box rows on currency|sku. Grouped
-      // per (sku, child_asin, item_price_currency) so money never sums across currencies.
-      windowKind: "per-7day-slice:asOf-27d..asOf (4 slices)",
+      // Blocker 1: the ONE canonical Order Line Items sales fragment over the SAME 28-day window as :daily,
+      // sliced by canonicalOliSlices so its interior + asOf-boundary slices share request_hashes with the
+      // other OLI reports. The fold re-aggregates to (currency|sku) and joins to the daily buy-box rows on
+      // currency|sku; money never sums across currencies (currency is in the group-by + the fold key).
+      windowKind: "canonicalOliSlices:asOf-27d..asOf",
       strict: true,
     },
     {
@@ -672,18 +665,19 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
     {
-      requestKey: "returns-leakage:ordered",
+      requestKey: "returns-leakage:oli-sales",
       sourceKey: "order-line-items",
-      columns: RET_ORDERED_COLUMNS,
-      limit: 50000, // ROW_LIMITS.aggregated
-      groupBy: RET_ORDERED_COLUMNS,
-      aggregations: RET_ORDERED_AGGREGATIONS,
-      orderByColumn: "child_asin",
+      columns: OLI_SALES_COLUMNS,
+      limit: OLI_SALES_ROW_LIMIT, // ROW_LIMITS.aggregated
+      groupBy: OLI_SALES_GROUP_BY,
+      aggregations: OLI_SALES_AGGREGATIONS,
+      orderByColumn: "date",
       orderByDirection: "ASC",
-      // Ordered units per ASIN (the return-rate denominator) from Order Line Items; grouped per
-      // (child_asin, item_price_currency) so money never sums across currencies. Distinct request
-      // identity from every other OLI export (different columns/aggregations/window).
-      windowKind: "range:asOf-59d..asOf",
+      // Blocker 1: the ONE canonical Order Line Items sales fragment over [asOf-59d, asOf], sliced by
+      // canonicalOliSlices so its interior + asOf-boundary slices share request_hashes with the other OLI
+      // reports. The fold re-aggregates to (currency, child_asin) so ordered evidence is bound PER CURRENCY
+      // (Blocker 2 -- never ASIN alone); money never sums across currencies (currency is in the key).
+      windowKind: "canonicalOliSlices:asOf-59d..asOf",
       strict: true,
     },
     {
@@ -767,18 +761,19 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   ],
   "ppc-performance": [
     {
-      requestKey: "ppc-performance:total-sales",
+      requestKey: "ppc-performance:oli-sales",
       sourceKey: "order-line-items",
-      columns: PPC_TOTAL_SALES_COLUMNS,
-      limit: 500, // ROW_LIMITS.dateRollup
-      groupBy: PPC_TOTAL_SALES_COLUMNS,
-      aggregations: PPC_TOTAL_SALES_AGGREGATIONS,
+      columns: OLI_SALES_COLUMNS,
+      limit: OLI_SALES_ROW_LIMIT,
+      groupBy: OLI_SALES_GROUP_BY,
+      aggregations: OLI_SALES_AGGREGATIONS,
       orderByColumn: "date",
       orderByDirection: "ASC",
-      // The only DataDoe export PPC makes: total account sales for the TACoS
-      // denominator (no Ads table carries it). All advertising figures are DERIVED
-      // from persisted ads_daily_source_rows — PPC creates NO Ads export.
-      windowKind: "range:asOf-29d..asOf",
+      // Blocker 1: the ONE canonical Order Line Items sales fragment (TACoS denominator; no Ads table carries
+      // it) over [asOf-29d, asOf], sliced by canonicalOliSlices so it shares request_hashes with the other OLI
+      // reports. All advertising figures are DERIVED from persisted ads_daily_source_rows — PPC creates NO Ads
+      // export. Blocker 3 validates the single OLI currency == the single Ads currency before summing.
+      windowKind: "canonicalOliSlices:asOf-29d..asOf",
       strict: true,
       // Planned only when a validated Ads-currency signal proves <= 1 currency. The
       // builder skips this export when persisted Ads rows mix currencies (a combined
@@ -897,7 +892,7 @@ export function requiresSingleAccountSource(reportKey) {
 export const REPORT_DERIVATION = Object.freeze({
   "daily-reporting": {
     outputs: ["all-brand", "named-brand (every brand for the account)"],
-    derivedFrom: ["daily-reporting:asin-day-superset", "daily-reporting:catalog"],
+    derivedFrom: ["daily-reporting:oli-sales", "daily-reporting:catalog"],
     strategy:
       "Fetch the ASIN/day Order Line Items superset once per account (monthly-segmented) "
       + "and Product Catalog once; sum the superset over child_asin per (date, seller, currency) for "
@@ -911,7 +906,7 @@ export const REPORT_DERIVATION = Object.freeze({
   },
   "ppc-performance": {
     outputs: ["account/campaign/ASIN/target/search-term PPC metrics + TACoS"],
-    derivedFrom: ["ads_daily_source_rows", "ppc-performance:total-sales", "ppc-performance:catalog"],
+    derivedFrom: ["ads_daily_source_rows", "ppc-performance:oli-sales", "ppc-performance:catalog"],
     strategy:
       "All advertising figures come from persisted ads_daily_source_rows (four scheduled "
       + "Ads sources), joined to product names via the common catalog. The scheduler makes "

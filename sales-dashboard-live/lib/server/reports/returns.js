@@ -23,7 +23,7 @@
 // event, whereas a cancelled order never settles at all and a pending return is
 // visible as `amazon_return_request_status = PendingApproval`.
 
-import { num } from "../datadoe.js";
+import { num, canonicalOliSlices } from "../datadoe.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
 import { ORDER_LINE_ITEMS, RETURNS, ROW_LIMITS, SETTLEMENTS } from "./sources.js";
 import { addDaysStr } from "../datadoe.js";
@@ -60,14 +60,17 @@ const SETTLEMENT_AGGREGATIONS = [
   { column: "cogs_total_value", aggregation: "sum", alias: "cogs_sum" },
 ];
 
-// Ordered units are the return-rate DENOMINATOR, from Order Line Items (quantity). The RETURNED
-// units NUMERATOR is the count of Returns records per ASIN (one row = one returned item), so this
-// source no longer carries units_shipped/units_refunded. Grouped by child_asin + item_price_currency
-// so DataDoe never sums money across currencies.
-const ORDERED_GROUP_BY = ["child_asin", "item_price_currency"];
-const ORDERED_AGGREGATIONS = [
-  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
-  { column: "quantity", aggregation: "sum", alias: "units_sum" },
+// Ordered units are the return-rate DENOMINATOR, from the ONE CANONICAL Order Line Items sales fragment
+// (Blocker 1): item_price_value ordered sales + quantity ordered units. The RETURNED units NUMERATOR is
+// the count of Returns records per ASIN (one row = one returned item). Grouped by
+// [date, seller_or_vendor_id, sku, child_asin, item_price_currency] so DataDoe never sums money across
+// currencies and this export is byte-identical to the other OLI reports (shared request_hashes on
+// overlapping calendar-anchored slices => one export, many owners). The fold re-aggregates to
+// (currency, child_asin) so ordered evidence is bound per currency (Blocker 2) — never ASIN alone.
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 
 /**
@@ -116,17 +119,23 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     "Returns settlement export"
   );
 
-  // 3) Ordered units per ASIN (the return-rate denominator) from Order Line Items.
-  const orderedRows = await fetchExportRowsStrict(
-    apiKey, ORDER_LINE_ITEMS.id, ORDERED_GROUP_BY, ids, from, to, ROW_LIMITS.aggregated,
-    {
-      groupBy: ORDERED_GROUP_BY,
-      aggregations: ORDERED_AGGREGATIONS,
-      orderByColumn: "child_asin",
-      orderByDirection: "ASC",
-    },
-    "Returns ordered-units export"
-  );
+  // 3) Ordered sales/units per (currency, ASIN) from the ONE canonical Order Line Items fragment over the
+  // SAME 60-day window, sliced by canonicalOliSlices so its interior + asOf-boundary slices share
+  // request_hashes with the other OLI reports (one export, many owners).
+  const orderedRows = [];
+  for (const slice of canonicalOliSlices(from, to)) {
+    const sliceRows = await fetchExportRowsStrict(
+      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
+      {
+        groupBy: OLI_SALES_GROUP_BY,
+        aggregations: OLI_SALES_AGGREGATIONS,
+        orderByColumn: "date",
+        orderByDirection: "ASC",
+      },
+      `Returns ordered-units export (${slice.from} to ${slice.to})`
+    );
+    for (const row of sliceRows) orderedRows.push(row);
+  }
 
   const catalog = await fetchCatalog(apiKey, ids);
 
@@ -225,60 +234,90 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
     moneyByKey.set(key, entry);
   }
 
-  /* ----- ordered units + sales per ASIN (the return-rate denominator) ----- */
-  const orderedByAsin = new Map();
+  /* ----- ordered sales/units per (currency, ASIN) -- ordered evidence bound per currency (Blocker 2) ----- */
+  const orderedByKey = new Map();
   for (const row of orderedRows) {
     const asin = String(row.child_asin || "").trim();
     if (!asin) continue;
-    const entry = orderedByAsin.get(asin) || { sales: 0, orderedUnits: 0, productName: null };
-    entry.sales += sumField(row, "sales_sum", "item_price_value");
-    entry.orderedUnits += sumField(row, "units_sum", "quantity");
+    const currency = String(row.item_price_currency || "").trim() || null;
+    const key = `${currency || "?"}|${asin}`;
+    const entry = orderedByKey.get(key) || { asin, currency, sales: 0, orderedUnits: 0, productName: null };
+    entry.sales += sumField(row, "total_sales_sum", "item_price_value");
+    entry.orderedUnits += sumField(row, "total_units_sum", "quantity");
     if (!entry.productName) entry.productName = String(row.product_name || "").trim() || null;
-    orderedByAsin.set(asin, entry);
+    orderedByKey.set(key, entry);
   }
 
-  /* ----- assemble one row per (currency, ASIN) ----- */
+  /* ----- assemble one row per (currency, ASIN); Returns records carry NO currency (Blocker 2) ----- */
   const asins = new Set([
     ...returnsByAsin.keys(),
-    ...orderedByAsin.keys(),
+    ...[...orderedByKey.values()].map((entry) => entry.asin),
     ...[...moneyByKey.values()].map((entry) => entry.asin),
   ]);
 
   const rows = [];
   for (const asin of asins) {
     const returns = returnsByAsin.get(asin) || null;
-    const ordered = orderedByAsin.get(asin) || null;
-    // An ASIN can appear under more than one currency; each keeps its own row.
-    const moneyEntries = [...moneyByKey.values()].filter((entry) => entry.asin === asin);
-    const targets = moneyEntries.length ? moneyEntries : [null];
     const meta = catalog.byAsin.get(asin) || {};
-
-    for (const money of targets) {
-      // A return-leakage candidate has actual return records OR settlement refund events. Ordered
-      // units alone (no returns, no refunds) is not leakage.
-      const hasReturnActivity = Boolean(returns) || (money && money.refundEvents > 0);
+    // The ASIN's currency universe = union of settlement-money currencies + ordered currencies. Each row's
+    // orderedUnits/sales/refund money come from THAT currency ONLY (never a combined total copied across).
+    const byCurrency = new Map();
+    for (const m of [...moneyByKey.values()].filter((e) => e.asin === asin)) {
+      const c = m.currency ?? null;
+      const slot = byCurrency.get(c) || { currency: c, money: null, ordered: null };
+      slot.money = m; byCurrency.set(c, slot);
+    }
+    for (const o of [...orderedByKey.values()].filter((e) => e.asin === asin)) {
+      const c = o.currency ?? null;
+      const slot = byCurrency.get(c) || { currency: c, money: null, ordered: null };
+      slot.ordered = o; byCurrency.set(c, slot);
+    }
+    // An ASIN with returns but NO money and NO ordered evidence has a single null-currency row.
+    if (byCurrency.size === 0 && returns) byCurrency.set(null, { currency: null, money: null, ordered: null });
+    const slots = [...byCurrency.values()];
+    const multiCurrency = slots.length > 1;
+    // Returns carry no currency. SINGLE currency: the sole row holds the returnCount + returnedUnits (rate
+    // known). MULTIPLE currencies: the returnCount goes on exactly ONE deterministic PRIMARY row (greatest
+    // ordered units; tie-break lexicographically smallest currency), 0 on the others, and returnedUnits is
+    // WITHHELD (null) on ALL of the ASIN's rows so the rate is never computed from a currency-ambiguous count.
+    let primary = null;
+    if (returns && multiCurrency) {
+      primary = slots.slice().sort((a, b) => {
+        const ua = a.ordered ? a.ordered.orderedUnits : 0;
+        const ub = b.ordered ? b.ordered.orderedUnits : 0;
+        if (ub !== ua) return ub - ua;
+        return String(a.currency ?? "").localeCompare(String(b.currency ?? ""));
+      })[0];
+    }
+    for (const slot of slots) {
+      const money = slot.money;
+      const ordered = slot.ordered;
+      const isReturnHolder = Boolean(returns) && (!multiCurrency || slot === primary);
+      // A return-leakage candidate row holds the ASIN's returns OR has its OWN currency's refund events.
+      const hasReturnActivity = isReturnHolder || (money && money.refundEvents > 0);
       if (!hasReturnActivity) continue;
 
-      const skus = new Set([...(returns?.skus || []), ...(money?.skus || [])]);
+      const skus = new Set([...(isReturnHolder ? returns.skus : []), ...(money?.skus || [])]);
       rows.push({
         asin,
         sku: [...skus].sort((a, b) => a.localeCompare(b))[0] || null,
         skuCount: skus.size,
         productName: meta.name || ordered?.productName || null,
         brand: brandLabel(meta.brand),
-        currency: money?.currency || null,
+        currency: slot.currency,
 
-        // Counts from the Returns source (row count = returned items).
-        returnCount: returns ? returns.returnCount : 0,
-        fbaReturns: returns ? returns.fba : 0,
-        fbmReturns: returns ? returns.fbm : 0,
-        pendingReturnRequests: returns ? returns.pending : 0,
-        reasonBuckets: returns ? returns.byBucket : {},
-        topReasons: returns
+        // Counts from the Returns source (row count = returned items) -- ONLY the return-holder row carries
+        // them, so an ASIN's return count is NEVER duplicated across its currency rows.
+        returnCount: isReturnHolder ? returns.returnCount : 0,
+        fbaReturns: isReturnHolder ? returns.fba : 0,
+        fbmReturns: isReturnHolder ? returns.fbm : 0,
+        pendingReturnRequests: isReturnHolder ? returns.pending : 0,
+        reasonBuckets: isReturnHolder ? returns.byBucket : {},
+        topReasons: isReturnHolder
           ? Object.entries(returns.byReason).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([reason, count]) => ({ reason, count }))
           : [],
 
-        // Money from settlement REFUND events only.
+        // Money from settlement REFUND events only (this currency).
         refundedAmount: money ? money.refundedAmount : 0,
         refundTax: money ? money.refundTax : 0,
         returnFees: money ? money.returnFees : 0,
@@ -290,9 +329,10 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
         settledUnits: money ? money.settledUnits : 0,
         hasMoney: Boolean(money),
 
-        // Return rate = returned units (Returns record count) / ordered units (Order Line Items).
+        // Return rate = returned units (Returns record count) / ordered units (Order Line Items), per THIS
+        // currency. returnedUnits is WITHHELD (null) whenever the ASIN spans multiple currencies.
         orderedUnits: ordered ? ordered.orderedUnits : null,
-        returnedUnits: returns ? returns.returnCount : null,
+        returnedUnits: (!multiCurrency && isReturnHolder) ? returns.returnCount : null,
         sales: ordered ? ordered.sales : null,
         hasOrdered: Boolean(ordered),
       });

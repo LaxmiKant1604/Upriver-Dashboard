@@ -1240,12 +1240,16 @@ export function buildReturnsRows(data, selectedBrand) {
       const totalLeakage = (Number(row.refundedAmount) || 0) + (Number(row.returnFees) || 0);
 
       const orderedUnits = Number(row.orderedUnits) || 0;
+      // returnedUnits is the Returns-record count for the ASIN, or WITHHELD (null) when the ASIN spans
+      // multiple currencies (a currency-ambiguous count cannot be divided by a per-currency denominator)
+      // or has no Returns records at all. A withheld count => the rate is unavailable, never a false 0%.
+      const rateWithheld = row.returnedUnits === null || row.returnedUnits === undefined;
       const returnedUnits = Number(row.returnedUnits) || 0;
       // A window that catches returns of earlier orders can report more returned
       // units than ordered units. That is a lag artefact, not a >100% rate, so
       // the rate is withheld and the row is ranked by money instead.
       const lagInflated = orderedUnits > 0 && returnedUnits > orderedUnits;
-      const returnRate = orderedUnits > 0 && !lagInflated ? (returnedUnits / orderedUnits) * 100 : null;
+      const returnRate = (!rateWithheld && orderedUnits > 0 && !lagInflated) ? (returnedUnits / orderedUnits) * 100 : null;
 
       const buckets = row.reasonBuckets || {};
       const bucketEntries = Object.entries(buckets).sort((a, b) => b[1] - a[1]);

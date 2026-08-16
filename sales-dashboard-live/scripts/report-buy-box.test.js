@@ -24,7 +24,7 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, sourceJobOwnerId;
-let planBuyBoxLoss, planSalesMovers, addDaysStr, splitDateRangeByDays;
+let planBuyBoxLoss, planSalesMovers, addDaysStr, splitDateRangeByDays, canonicalOliSlices;
 let buildShadowReportPlan, runStagedSourceCycle, SHADOW_PLANNED_REPORT_KEYS;
 
 const ID = "A1";
@@ -38,8 +38,10 @@ const SOURCE_LABEL = "Profit by SKU & Date";
 const PRICE_LABEL = "FBA Inventory Health";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
 
-// Windows (computed once main() has imported the helpers).
-let FROM, INV_FROM, SLICES;
+// Windows (computed once main() has imported the helpers). SLICES = the four 7-day daily buy-box slices;
+// OLI_SLICES = the canonicalOliSlices calendar-anchored bins for the ONE canonical Order Line Items sales
+// fragment (Blocker 1) -- no longer the same windows as the daily slices.
+let FROM, INV_FROM, SLICES, OLI_SLICES;
 
 let hashSeq = 0;
 const frag = (requestKey, from, to, ids = [ID]) => ({ requestKey, requestHash: "h" + (hashSeq += 1), from, to, sellerOrVendorIds: ids });
@@ -55,33 +57,48 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
   return assembleSources(planned, statusByHash, loaded).sources;
 }
 
-// Derive an Order Line Items ordered slice (grouped by sku|child_asin|item_price_currency, aggregations
-// sales_sum/units_sum) from a Profit-by-SKU daily fixture slice, so the joined ordered sales/units equal
-// the former daily sales/units and every existing fixture resolves unchanged. Sales/units now come from
-// buy-box-loss:ordered; the daily source supplies only buybox_percentage + page_views.
-const orderedFromDaily = (sliceRows) => {
-  const byKey = new Map();
-  for (const r of sliceRows || []) {
-    const sku = String(r.sku || "").trim();
-    if (!sku) continue;
-    const currency = r.currency ?? null;
-    const key = `${currency ?? "?"}|${sku}`;
-    let e = byKey.get(key);
-    if (!e) { e = { sku, child_asin: r.child_asin, item_price_currency: currency, sales_sum: 0, units_sum: 0 }; byKey.set(key, e); }
-    e.sales_sum += Number(r.total_sales || 0);
-    e.units_sum += Number(r.total_units_sold || 0);
+// Build the ONE CANONICAL Order Line Items ordered fragments (Blocker 1) from a Profit-by-SKU daily
+// fixture. Each daily row with a sku becomes a canonical ordered row
+//   { date, seller_or_vendor_id, sku, child_asin, item_price_currency, total_sales_sum, total_units_sum }
+// binned into the canonicalOliSlices slice whose window CONTAINS its date, so the joined ordered sales/units
+// re-aggregate (currency|sku) to the SAME totals as the former daily sales/units and every ordered row is
+// bound to its own validated slice window. A row whose date falls outside every canonical slice (a bad /
+// out-of-range date under test) is skipped from the ordered evidence -- the separate daily row-date guard is
+// what rejects it. Returns an array of row arrays aligned to OLI_SLICES (empty slices kept). Sales/units now
+// come from buy-box-loss:oli-sales; the daily source supplies only buybox_percentage + page_views.
+const canonicalOrderedFromDaily = (dailySlices, ids = [ID]) => {
+  const seller = ids[0];
+  const bins = OLI_SLICES.map(() => []);
+  for (const sliceRows of dailySlices || []) {
+    for (const r of sliceRows || []) {
+      const sku = String(r.sku || "").trim();
+      if (!sku) continue;
+      const date = String(r.date || "");
+      const idx = OLI_SLICES.findIndex((w) => date >= w.from && date <= w.to);
+      if (idx < 0) continue; // date outside every canonical slice window -> not ordered evidence
+      bins[idx].push({
+        date,
+        seller_or_vendor_id: seller,
+        sku,
+        child_asin: r.child_asin,
+        item_price_currency: r.currency ?? null,
+        total_sales_sum: Number(r.total_sales || 0),
+        total_units_sum: Number(r.total_units_sold || 0),
+      });
+    }
   }
-  return [...byKey.values()];
+  return bins;
 };
 
-// Build Buy Box planned fragments + rows: four ordered daily buy-box slices + four matching ordered OLI
-// slices (each under ONE request key), inventory, catalog. The ordered slices default to being derived
-// from the daily slices (so sales/units resolve to the same totals) but may be supplied explicitly.
+// Build Buy Box planned fragments + rows: four ordered 7-day daily buy-box slices + the SIX canonicalOliSlices
+// ordered OLI slices (each under ONE request key, buy-box-loss:oli-sales), inventory, catalog. The ordered
+// slices default to being derived + re-binned from the daily slices (so the re-aggregated per-SKU sales/units
+// resolve to the same totals) but may be supplied explicitly (already aligned to OLI_SLICES).
 function bbPlanned({ slices = [[], [], [], []], ordered = null, inventory = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
-  const orderedSlices = ordered || slices.map(orderedFromDaily);
+  const orderedSlices = ordered || canonicalOrderedFromDaily(slices, ids);
   SLICES.forEach((w, i) => { const f = frag("buy-box-loss:daily", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = slices[i] || []; });
-  SLICES.forEach((w, i) => { const f = frag("buy-box-loss:ordered", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = orderedSlices[i] || []; });
+  OLI_SLICES.forEach((w, i) => { const f = frag("buy-box-loss:oli-sales", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = orderedSlices[i] || []; });
   const inv = frag("buy-box-loss:inventory", INV_FROM, ASOF, ids); planned.push(inv); rows[inv.requestHash] = inventory;
   const cat = frag("buy-box-loss:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   return { planned, rows };
@@ -467,9 +484,9 @@ function makeDataDoe(opts = {}) {
     const rk = job.requestKey || "";
     const fp = job.fetchParams || {};
     // Date each row INSIDE its own validated fragment window (each daily row in its 7-day slice via the
-    // slice `from`; each inventory row on `to` = asOf, inside [asOf-10d, asOf]) so post-Blocker-1 row-date
-    // validation accepts canonical rows.
-    if (rk.includes("ordered")) return [{ sku: "SKU-W", child_asin: "ASIN-W", item_price_currency: "USD", sales_sum: 200, units_sum: 20 }];
+    // slice `from`; each canonical OLI ordered row on its canonicalOliSlices `from`; each inventory row on
+    // `to` = asOf, inside [asOf-10d, asOf]) so post-Blocker-1 row-date validation accepts canonical rows.
+    if (rk.includes("oli-sales")) return [{ date: fp.from || "2025-08-05", seller_or_vendor_id: ID, sku: "SKU-W", child_asin: "ASIN-W", item_price_currency: "USD", total_sales_sum: 200, total_units_sum: 20 }];
     if (rk.includes("daily")) return [daily(fp.from || "2025-08-05", "SKU-W", "ASIN-W", "Acme", "USD", 90, 200, 20, 150, "Widget W")];
     if (rk.includes("inventory")) return [invRow(fp.to || "2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12)];
     if (rk.includes("catalog")) return [{ child_asin: "ASIN-W", parent_asin: "P1", product_name: "Catalog W", product_brand: "AcmeCat" }];
@@ -579,7 +596,7 @@ test("26. partial invocation (maxJobs) resumes without a duplicate create-export
   const store = makeStore(); const dd = makeDataDoe();
   const plan = bbPlan();
   const jobs = jobsFromPlan(plan);
-  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 10 canonical jobs this invocation
+  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 12 canonical jobs this invocation
   assert.ok(r1.processed <= 2);
   const r2 = await runSrc(store, dd, jobs); // resume the rest
   assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after resume");
@@ -638,30 +655,30 @@ const resolveFromPlan = (plan) => () => ({
 });
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 
-test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly ten canonical jobs with exact windows/deps/owner/context", () => {
+test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly twelve canonical jobs with exact windows/deps/owner/context", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("buy-box-loss"), "buy-box-loss is a default generic report key");
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "buy-box-loss"), "DEFAULT plan includes buy-box-loss");
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "buy-box-loss");
-  // Exactly ten canonical source jobs: four daily buy-box slices + four ordered OLI slices + one
-  // inventory + one no-date catalog.
-  assert.equal(plan.sourceJobs.length, 10, "exactly ten deduplicated canonical source jobs");
+  // Exactly twelve canonical source jobs: four 7-day daily buy-box slices + six canonicalOliSlices ordered
+  // OLI slices + one inventory + one no-date catalog.
+  assert.equal(plan.sourceJobs.length, 12, "exactly twelve deduplicated canonical source jobs");
   const dailies = bb.sources.filter((s) => s.requestKey === "buy-box-loss:daily");
   assert.deepEqual(dailies.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day daily slice windows");
-  const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:ordered");
-  assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day OLI slice windows match the daily slices");
+  const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:oli-sales");
+  assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), OLI_SLICES.map((s) => `${s.from}..${s.to}`), "six canonicalOliSlices ordered OLI slice windows");
   const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
   assert.deepEqual([inv.from, inv.to], [INV_FROM, ASOF], "inventory window asOf-10d..asOf");
   const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
   assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
-  // Report dependency map = all ten canonical hashes; context carries the raw seller id + asOf.
+  // Report dependency map = all twelve canonical hashes; context carries the raw seller id + asOf.
   const rj = plan.reportJobs.find((j) => j.reportKey === "buy-box-loss");
-  assert.equal(rj.dependsOn.length, 10, "report depends on all ten canonical sources");
-  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the ten canonical hashes");
+  assert.equal(rj.dependsOn.length, 12, "report depends on all twelve canonical sources");
+  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the twelve canonical hashes");
   assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
   // Owner metadata: every planned source job is owned by the buy-box-loss owner, recomputed + validated.
   const jobs = resolveFromPlan(plan)().sourceJobs;
-  assert.equal(jobs.length, 10);
+  assert.equal(jobs.length, 12);
   assert.ok(jobs.every((j) => j.owner && j.owner.reportKey === "buy-box-loss" && j.owner.accountId === ID && j.owner.ownerId), "each job carries buy-box-loss owner metadata");
   assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
 });
@@ -671,15 +688,15 @@ test("C2. Buy Box stays PENDING until every required source succeeds, then the s
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, payload }); return { paramsHash: "ph" }; };
-  // Bounded first invocation: only some of the ten sources succeed => the report is still PENDING.
+  // Bounded first invocation: only some of the twelve sources succeed => the report is still PENDING.
   const r1 = await runGeneric(store, dd, plan, { maxJobs: 3 });
-  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 10, "not all sources succeeded yet");
+  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 12, "not all sources succeeded yet");
   let res = await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
   assert.equal(res.succeeded, 0, "report is PENDING while a required source is missing (no save)");
   assert.equal(saved.length, 0, "zero snapshot writes while pending");
   // Resume the generic driver to completion.
   const r2 = await runGeneric(store, dd, plan);
-  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all ten sources succeeded after resume");
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all twelve sources succeeded after resume");
   const realFetch = globalThis.fetch; let hits = 0;
   globalThis.fetch = () => { hits += 1; throw new Error("network during derivation"); };
   try { res = await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests }); } finally { globalThis.fetch = realFetch; }
@@ -747,7 +764,7 @@ test("C5. primary-only: a stale dd-secondary account is skipped read-only with Z
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
   assert.ok(jobs.every((j) => !String(j.request_key).includes(dash("dd", "secondary"))), "no dd-secondary source was ever staged");
   // Zero DataDoe create-exports carry the secondary account (it spent no token).
-  assert.equal(jobs.length, 10, "exactly the ten primary-account canonical jobs ran");
+  assert.equal(jobs.length, 12, "exactly the twelve primary-account canonical jobs ran");
 });
 
 async function main() {
@@ -758,10 +775,11 @@ async function main() {
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
   ({ planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
-  ({ addDaysStr, splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
+  ({ addDaysStr, splitDateRangeByDays, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -27);
   INV_FROM = addDaysStr(ASOF, -10);
   SLICES = splitDateRangeByDays(FROM, ASOF, 7);
+  OLI_SLICES = canonicalOliSlices(FROM, ASOF);
 
   let failures = 0;
   for (const t of tests) {

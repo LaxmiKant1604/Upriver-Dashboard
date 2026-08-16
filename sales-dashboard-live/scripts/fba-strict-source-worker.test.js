@@ -105,16 +105,19 @@ test("a cap-sized FBA source records TRUNCATED, persists nothing, unrelated sour
   const store = makeStore();
   // Resolve a REAL fba-plan job so the CONTRACT strict flag + real row limit flow onto the planned
   // job (non-US => AWD gated out; supply the four applicable windows).
+  // ONE canonical Order Line Items sales fragment now backs FBA (fba-plan:oli-sales), sliced by
+  // canonicalOliSlices (calendar-anchored bins over completed[0].from..asOf). A single representative
+  // canonical slice is enough to drive the strict-cap guard; per-ASIN monthly units + the current-month
+  // latest-date probe are DERIVED from this one fragment (the former monthly-units/current-daily-dates keys).
   const fbaWin = {
-    "fba-plan:monthly-units": [{ from: "2025-05-01", to: "2025-05-31" }],
-    "fba-plan:current-daily-dates": [{ from: "2025-08-01", to: "2025-08-06" }],
+    "fba-plan:oli-sales": [{ from: "2025-05-01", to: "2025-05-07" }],
     "fba-plan:catalog": [{ from: "2025-05-01", to: "2025-08-06" }],
     "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
   };
   const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWin, marketplaceCountry: "CA" });
-  const units = resolved.find((r) => r.requestKey === "fba-plan:monthly-units");
-  assert.equal(units.strict, true, "the fba-plan:monthly-units contract is strict:true");
-  const capped = plannedSourceJob("fba-plan", units, "us", "primary");
+  const oli = resolved.find((r) => r.requestKey === "fba-plan:oli-sales");
+  assert.equal(oli.strict, true, "the fba-plan:oli-sales contract is strict:true");
+  const capped = plannedSourceJob("fba-plan", oli, "us", "primary");
 
   // The capped source returns EXACTLY job.limit rows (rows.length === limit) -- indistinguishable from
   // truncation, so the strict guard must reject it. Use the contract's real limit (no in-test shrink).
@@ -123,16 +126,16 @@ test("a cap-sized FBA source records TRUNCATED, persists nothing, unrelated sour
   const bs = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] } });
   const other = plannedSourceJob("brand-sales", bs.find((r) => r.requestKey === "brand-sales:catalog"), "us", "primary");
 
-  const dd = makeDataDoe((job) => (job.requestHash === units.requestHash ? cappedRows : [{ ok: 1 }]));
+  const dd = makeDataDoe((job) => (job.requestHash === oli.requestHash ? cappedRows : [{ ok: 1 }]));
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [capped, other] }));
 
   // Capped FBA source: recorded TRUNCATED at the validate stage, terminal, and NOTHING persisted.
-  const cappedJob = store._rawJob(res.cycleId, units.requestHash);
+  const cappedJob = store._rawJob(res.cycleId, oli.requestHash);
   assert.equal(cappedJob.error_code, "TRUNCATED");
   assert.equal(cappedJob.error_stage, "validate");
   assert.equal(cappedJob.terminal, true);
   assert.equal(cappedJob.row_count, capped.limit, "the cap count is recorded (rows.length === limit)");
-  assert.equal(store._cache.has(units.requestHash), false, "no source payload persisted for the capped FBA source");
+  assert.equal(store._cache.has(oli.requestHash), false, "no source payload persisted for the capped FBA source");
   // The unrelated source completes and persists (one source failing never blocks another).
   assert.equal(store._cache.has(other.requestHash), true, "the unrelated source persisted its payload");
   assert.equal(store._rawJob(res.cycleId, other.requestHash).fetch_status, "succeeded");
@@ -140,10 +143,10 @@ test("a cap-sized FBA source records TRUNCATED, persists nothing, unrelated sour
   assert.equal(res.succeeded, 1);
 
   // A repeated worker run must NOT attempt the truncated export again (terminal failure is skipped).
-  const downloadsBefore = dd.downloadCount(units.requestHash);
+  const downloadsBefore = dd.downloadCount(oli.requestHash);
   const res2 = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [capped, other] }));
-  assert.equal(dd.downloadCount(units.requestHash), downloadsBefore, "the truncated FBA export is not downloaded again");
-  assert.equal(dd.createCount(units.requestHash), 1, "exactly one create-export ever issued for the truncated source");
+  assert.equal(dd.downloadCount(oli.requestHash), downloadsBefore, "the truncated FBA export is not downloaded again");
+  assert.equal(dd.createCount(oli.requestHash), 1, "exactly one create-export ever issued for the truncated source");
   assert.equal(res2.processed, 0, "no pending/attempted jobs remain to process on the repeat run");
 });
 

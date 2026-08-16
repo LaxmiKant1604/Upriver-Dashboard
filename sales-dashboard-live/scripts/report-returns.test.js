@@ -23,7 +23,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 let assembleSources, deriveReportSnapshot, runReportJobs, runSourceJobs, plannedSourceJob, runStagedSourceCycle, sourceJobOwnerId;
 let DERIVE_TIMEOUT_SAFE_SLICE_DAYS;
-let planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr, splitDateRangeByDays;
+let planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, addDaysStr, splitDateRangeByDays, canonicalOliSlices;
 
 const ID = "A1";
 const ASOF = "2025-08-10";
@@ -54,8 +54,10 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
 }
 
 // Returns is TIMEOUT-SAFE SLICED (<=7-day slices over [FROM, ASOF] -- the shape the derive now requires),
-// each raw dated row distributed into its own slice; settlements/ordered stay one grouped whole-window
-// fragment each (grouped WITHOUT date -- not sliceable); catalog is no-date.
+// each raw dated row distributed into its own slice; ordered is the ONE CANONICAL Order Line Items sales
+// fragment (Blocker 1), sliced by canonicalOliSlices(FROM, ASOF) with each canonical row bound to the slice
+// whose window contains its own `date`; settlements stay one grouped whole-window fragment (grouped WITHOUT
+// date -- not sliceable); catalog is no-date.
 function retPlanned({ returns = [], settlements = [], ordered = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
   const add = (key, from, to, data) => { const f = frag(key, from, to, ids); planned.push(f); rows[f.requestHash] = data; };
@@ -70,7 +72,16 @@ function retPlanned({ returns = [], settlements = [], ordered = [], catalog = []
     add("returns-leakage:returns", slice.from, slice.to, [...inSlice, ...orphans]);
   });
   add("returns-leakage:settlements", FROM, ASOF, settlements);
-  add("returns-leakage:ordered", FROM, ASOF, ordered);
+  // Blocker 1: ordered = the ONE canonical OLI sales fragment, sliced by canonicalOliSlices (chronological,
+  // calendar-anchored) EXACTLY as the derive validates returns-leakage:oli-sales. Each ordered row lands in
+  // the slice whose window contains its own `date`; rows matching NO slice land in the FIRST slice so the
+  // derive's per-slice row-window binding still sees -- and rejects -- them (fail-closed test paths).
+  const oliSlices = canonicalOliSlices(FROM, ASOF);
+  oliSlices.forEach((slice, i) => {
+    const inSlice = ordered.filter((r) => typeof r.date === "string" && r.date >= slice.from && r.date <= slice.to);
+    const orphans = i === 0 ? ordered.filter((r) => !(typeof r.date === "string" && oliSlices.some((w) => r.date >= w.from && r.date <= w.to))) : [];
+    add("returns-leakage:oli-sales", slice.from, slice.to, [...inSlice, ...orphans]);
+  });
   add("returns-leakage:catalog", null, null, catalog);
   return { planned, rows };
 }
@@ -91,7 +102,13 @@ const refund = (asin, sku, currency, o) => ({
   refund_commission_sum: o.commission || 0, return_unit_fee_sum: o.unitFee || 0, refund_restocking_fee_sum: o.restock || 0,
   cogs_sum: o.cogs || 0, quantity_sum: o.qty || 0,
 });
-const ord = (asin, name, sales, units) => ({ child_asin: asin, item_price_currency: "USD", product_name: name, sales_sum: sales, units_sum: units });
+// Canonical OLI sales row (Blocker 1): { date, seller_or_vendor_id, sku, child_asin, item_price_currency,
+// total_sales_sum, total_units_sum }. `currency`/`date` are per-row so multi-currency fixtures are
+// expressible; `date` defaults to ASOF (inside [FROM, ASOF], lands in the final canonicalOliSlices bin).
+const ord = (asin, name, sales, units, currency = "USD", date = ASOF) => ({
+  date, seller_or_vendor_id: ID, sku: "SKU-" + asin, child_asin: asin,
+  item_price_currency: currency, product_name: name, total_sales_sum: sales, total_units_sum: units,
+});
 const cat = (asin, parent, name, brand) => ({ child_asin: asin, parent_asin: parent, product_name: name, product_brand: brand });
 
 // ---- the hand-computed production-route fixture ----
@@ -137,9 +154,13 @@ const expectedFixturePayload = () => ({
   ],
   currencies: ["CAD", "USD"],
   rows: [
-    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "USD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 30, refundTax: 3, returnFees: 6, refundedReferralFeeCredit: 4, cogsOnRefundedUnits: 12, refundedUnitsSettled: 3, refundEvents: 1, settledSales: 200, settledUnits: 20, hasMoney: true, orderedUnits: 50, returnedUnits: 3, sales: 500, hasOrdered: true },
-    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "CAD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 15, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 5, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: 50, returnedUnits: 3, sales: 500, hasOrdered: true },
-    { asin: "R2", sku: "SKU-R2", skuCount: 1, productName: "Widget R2", brand: "Beta", currency: null, returnCount: 1, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 1, reasonBuckets: { low_actionability: 1 }, topReasons: [{ reason: "NO_REASON_GIVEN", count: 1 }], refundedAmount: 0, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, orderedUnits: 10, returnedUnits: 1, sales: 100, hasOrdered: true },
+    // R1 spans TWO currencies (USD ordered + USD refund + CAD refund) => MULTI-CURRENCY: the returnCount goes
+    // on the USD row (greatest ordered units = 50), the CAD row carries returnCount 0, and returnedUnits is
+    // WITHHELD (null) on BOTH rows (currency-ambiguous rate). Ordered evidence is per currency: only USD has
+    // ordered units/sales, so the CAD row has orderedUnits/sales null + hasOrdered false.
+    { asin: "R1", sku: "SKU-R1", skuCount: 2, productName: "Catalog R1", brand: "Acme", currency: "USD", returnCount: 3, fbaReturns: 2, fbmReturns: 1, pendingReturnRequests: 1, reasonBuckets: { product_quality: 2, sizing: 1 }, topReasons: [{ reason: "DEFECTIVE", count: 2 }, { reason: "TOO_SMALL", count: 1 }], refundedAmount: 30, refundTax: 3, returnFees: 6, refundedReferralFeeCredit: 4, cogsOnRefundedUnits: 12, refundedUnitsSettled: 3, refundEvents: 1, settledSales: 200, settledUnits: 20, hasMoney: true, orderedUnits: 50, returnedUnits: null, sales: 500, hasOrdered: true },
+    { asin: "R1", sku: "SKU-R1", skuCount: 1, productName: "Catalog R1", brand: "Acme", currency: "CAD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 15, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 5, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: null, returnedUnits: null, sales: null, hasOrdered: false },
+    { asin: "R2", sku: "SKU-R2", skuCount: 1, productName: "Widget R2", brand: "Beta", currency: "USD", returnCount: 1, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 1, reasonBuckets: { low_actionability: 1 }, topReasons: [{ reason: "NO_REASON_GIVEN", count: 1 }], refundedAmount: 0, refundTax: 0, returnFees: 0, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 0, refundedUnitsSettled: 0, refundEvents: 0, settledSales: 0, settledUnits: 0, hasMoney: false, orderedUnits: 10, returnedUnits: 1, sales: 100, hasOrdered: true },
     { asin: "RX", sku: "SKU-X", skuCount: 1, productName: null, brand: "Unassigned", currency: "USD", returnCount: 0, fbaReturns: 0, fbmReturns: 0, pendingReturnRequests: 0, reasonBuckets: {}, topReasons: [], refundedAmount: 9, refundTax: 0, returnFees: 2, refundedReferralFeeCredit: 0, cogsOnRefundedUnits: 2, refundedUnitsSettled: 1, refundEvents: 1, settledSales: 0, settledUnits: 0, hasMoney: true, orderedUnits: null, returnedUnits: null, sales: null, hasOrdered: false },
   ],
   catalogBrands: ["Acme", "Beta"],
@@ -222,7 +243,7 @@ test("10. FBM-only refunded amount + seller-borne label cost are reported separa
 
 test("11. row order + full labels/lag/window match the live route", () => {
   const p = deriveRet(retPlanned(FIXTURE())).payload;
-  assert.deepEqual(p.rows.map((r) => `${r.asin}/${r.currency}`), ["R1/USD", "R1/CAD", "R2/null", "RX/USD"]);
+  assert.deepEqual(p.rows.map((r) => `${r.asin}/${r.currency}`), ["R1/USD", "R1/CAD", "R2/USD", "RX/USD"]);
   assert.deepEqual([p.returnsSourceLabel, p.moneySourceLabel, p.rateSourceLabel, p.rateSourceLagDays, p.returnHistoryDays], [RETURNS_LABEL, MONEY_LABEL, RATE_LABEL, 0, 60]);
   assert.deepEqual(p.window, { from: FROM, to: ASOF, days: 60 });
 });
@@ -236,7 +257,7 @@ test("12. the exact 60-day single windows are required; the canonical fixture de
 
 test("13. wrong-window returns/settlements/ordered + dated catalog fail closed (invalid)", () => {
   const good = FIXTURE();
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:oli-sales"]) {
     const built = retPlanned(good);
     const i = built.planned.findIndex((p) => p.requestKey === key);
     built.planned[i] = { ...built.planned[i], from: addDaysStr(FROM, -1) };
@@ -249,7 +270,7 @@ test("13. wrong-window returns/settlements/ordered + dated catalog fail closed (
 });
 
 test("14. cross-account fragments fail closed (invalid)", () => {
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:oli-sales", "returns-leakage:catalog"]) {
     const built = retPlanned(FIXTURE());
     const i = built.planned.findIndex((p) => p.requestKey === key);
     built.planned[i] = { ...built.planned[i], sellerOrVendorIds: ["OTHER"] };
@@ -268,7 +289,7 @@ test("15. malformed / impossible / future / out-of-window RETURN row dates fail 
 });
 
 test("16. a missing/failed required source => unavailable, ZERO writes, last-known-good preserved", () => {
-  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:ordered", "returns-leakage:catalog"]) {
+  for (const key of ["returns-leakage:returns", "returns-leakage:settlements", "returns-leakage:oli-sales", "returns-leakage:catalog"]) {
     const built = retPlanned(FIXTURE());
     const hash = built.planned.find((p) => p.requestKey === key).requestHash;
     assert.equal(deriveRet(built, ctx(), { [hash]: "failed" }).status, "unavailable", `failed ${key} => unavailable (LKG kept)`);
@@ -306,6 +327,78 @@ test("20. derivation makes ZERO network calls; 21. repeated derivation is idempo
   assert.equal(hits, 0, "zero DataDoe/network calls during derivation");
   assert.deepEqual(a, b, "repeated derivation is idempotent");
   assert.deepEqual(a, expectedFixturePayload());
+});
+
+group("returns derive: Blocker 2 currency correctness -- no duplicated counts/sales/units; rate withheld when currency-ambiguous");
+
+// A dedicated fixture pinning Blocker 2 independently of the main FIXTURE. M1 is a GENUINE USD+CAD
+// multi-currency ASIN: it has ordered units in BOTH currencies (USD 30 / CAD 20) AND a CAD refund, so BOTH
+// currency rows are emitted (the CAD row via its own refund activity). USD (greatest ordered units) is the
+// deterministic PRIMARY return holder. S1 is single-currency USD (ordered 20 units, 2 returns). Every
+// expectation below is HAND-WRITTEN -- never read back from the derived payload -- so correctness is pinned.
+const B2_FIXTURE = () => ({
+  returns: [
+    ret("2025-08-01", "M1", "SKU-M1", "DEFECTIVE", "FBA", "Approved", 0, 0, ""),
+    ret("2025-08-02", "M1", "SKU-M1", "DEFECTIVE", "FBA", "Approved", 0, 0, ""),
+    ret("2025-08-03", "M1", "SKU-M1", "DEFECTIVE", "FBA", "Approved", 0, 0, ""),
+    ret("2025-08-04", "M1", "SKU-M1", "TOO_SMALL", "FBM", "Approved", 0, 0, ""),  // M1 => 4 return records
+    ret("2025-08-05", "S1", "SKU-S1", "DEFECTIVE", "FBA", "Approved", 0, 0, ""),
+    ret("2025-08-06", "S1", "SKU-S1", "DEFECTIVE", "FBA", "Approved", 0, 0, ""),  // S1 => 2 return records
+  ],
+  settlements: [
+    refund("M1", "SKU-M1", "CAD", { amount: -10, qty: -1 }), // the CAD row's OWN return activity (so it emits)
+  ],
+  ordered: [
+    ord("M1", "M One", 300, 30, "USD"), // USD ordered: 30 units / 300 sales
+    ord("M1", "M One", 100, 20, "CAD"), // CAD ordered: 20 units / 100 sales
+    ord("S1", "S One", 200, 20, "USD"), // single-currency USD: 20 units / 200 sales
+  ],
+  catalog: [],
+});
+
+test("b2a. no duplicated return counts: the PRIMARY currency row carries the count, others 0; the per-ASIN sum equals the true return-record count", () => {
+  const r = deriveRet(retPlanned(B2_FIXTURE()));
+  assert.equal(r.status, "derived");
+  const m1 = r.payload.rows.filter((row) => row.asin === "M1");
+  const usd = m1.find((row) => row.currency === "USD");
+  const cad = m1.find((row) => row.currency === "CAD");
+  assert.equal(usd.returnCount, 4, "USD (greatest ordered units = 30) is the deterministic primary return holder");
+  assert.equal(cad.returnCount, 0, "the non-primary currency row carries returnCount 0");
+  assert.equal(m1.reduce((s, row) => s + row.returnCount, 0), 4, "summing returnCount across the ASIN's currency rows = its 4 true return records (never duplicated)");
+  assert.deepEqual(cad.reasonBuckets, {}, "non-holder currency row carries no reason mix");
+  assert.deepEqual(cad.topReasons, []);
+  assert.deepEqual([usd.fbaReturns, usd.fbmReturns], [3, 1], "the channel counts also live ONLY on the primary row");
+  assert.deepEqual([cad.fbaReturns, cad.fbmReturns], [0, 0]);
+});
+
+test("b2b. no duplicated sales / ordered units / refund money: each currency row holds ONLY its own currency's totals", () => {
+  const p = deriveRet(retPlanned(B2_FIXTURE())).payload;
+  const usd = p.rows.find((row) => row.asin === "M1" && row.currency === "USD");
+  const cad = p.rows.find((row) => row.asin === "M1" && row.currency === "CAD");
+  assert.deepEqual([usd.orderedUnits, usd.sales], [30, 300], "USD row = the USD ordered total only");
+  assert.deepEqual([cad.orderedUnits, cad.sales], [20, 100], "CAD row = the CAD ordered total only (its own, not copied)");
+  assert.deepEqual([usd.refundedAmount, cad.refundedAmount], [0, 10], "refund money stays on its own currency row (only CAD refunded)");
+});
+
+test("b2c. per-currency ordered units are isolated: a currency row is NEVER the combined cross-currency total", () => {
+  const p = deriveRet(retPlanned(B2_FIXTURE())).payload;
+  const usd = p.rows.find((row) => row.asin === "M1" && row.currency === "USD");
+  const cad = p.rows.find((row) => row.asin === "M1" && row.currency === "CAD");
+  assert.equal(usd.orderedUnits, 30);
+  assert.notEqual(usd.orderedUnits, 50, "the USD row is NOT the combined USD+CAD ordered total (30+20)");
+  assert.equal(usd.orderedUnits + cad.orderedUnits, 50, "the two currency rows PARTITION the 50 combined ordered units");
+});
+
+test("b2d. the return RATE is WITHHELD (returnedUnits null) on every row of a multi-currency ASIN, and PRESENT (returnedUnits === returnCount) on a single-currency ASIN", () => {
+  const p = deriveRet(retPlanned(B2_FIXTURE())).payload;
+  const m1 = p.rows.filter((row) => row.asin === "M1");
+  assert.equal(m1.length, 2, "both M1 currency rows are emitted");
+  assert.ok(m1.every((row) => row.returnedUnits === null), "currency-ambiguous rate withheld on ALL of the multi-currency ASIN's rows");
+  const s1 = p.rows.find((row) => row.asin === "S1");
+  assert.equal(s1.currency, "USD", "the single-currency ASIN keeps its one currency row");
+  assert.equal(s1.returnCount, 2);
+  assert.equal(s1.returnedUnits, 2, "single-currency ASIN keeps returnedUnits === returnCount (rate known)");
+  assert.equal(s1.orderedUnits, 20, "its ordered denominator is intact");
 });
 
 group("returns latestDataDate: an OBSERVED source-evidence date, never the requested asOf (freshness blocker)");
@@ -410,7 +503,9 @@ test("f6. other adapters retain their existing latestDataDate results (the sourc
   const slices = splitDateRangeByDays(addDaysStr(ASOF, -27), ASOF, 7);
   const planned = []; const rows = {};
   slices.forEach((w) => { const f = frag("buy-box-loss:daily", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", product_name: "P", product_brand: "B", currency: "USD", buybox_percentage: 90, page_views: 5 }]; });
-  slices.forEach((w) => { const f = frag("buy-box-loss:ordered", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ sku: "S", child_asin: "A", item_price_currency: "USD", sales_sum: 10, units_sum: 1 }]; });
+  // Blocker 1: buy-box ordered is the canonical OLI sales fragment sliced by canonicalOliSlices over the SAME
+  // [asOf-27d, asOf] window; each canonical row carries a `date` inside its own slice window.
+  canonicalOliSlices(addDaysStr(ASOF, -27), ASOF).forEach((w) => { const f = frag("buy-box-loss:oli-sales", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", item_price_currency: "USD", total_sales_sum: 10, total_units_sum: 1 }]; });
   const inv = frag("buy-box-loss:inventory", addDaysStr(ASOF, -10), ASOF); planned.push(inv); rows[inv.requestHash] = [{ date: ASOF, sku: "S", child_asin: "A", product_name: "P", currency: "USD", available: 5, units_shipped_t30: 1 }];
   const catF = frag("buy-box-loss:catalog", null, null); planned.push(catF); rows[catF.requestHash] = [{ child_asin: "A", parent_asin: "P", product_name: "P", product_brand: "B" }];
   const r = deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(planned, rows), context: ctx() });
@@ -464,7 +559,7 @@ function makeDataDoe(opts = {}) {
     const rk = job.requestKey || ""; const fp = job.fetchParams || {};
     if (rk.includes("returns-leakage:returns")) return [ret(fp.to || ASOF, "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -5, 0, "")];
     if (rk.includes("settlements")) return [refund("R1", "SKU-R1", "USD", { amount: -9, commission: -1, unitFee: -1, cogs: -2, qty: -1 })];
-    if (rk.includes("returns-leakage:ordered")) return [ord("R1", "Widget R1", 100, 10)];
+    if (rk.includes("returns-leakage:oli-sales")) return [ord("R1", "Widget R1", 100, 10, "USD", fp.to || ASOF)];
     if (rk.includes("catalog")) return [cat("R1", "P1", "Catalog R1", "Acme")];
     return [{ child_asin: "R1" }];
   };
@@ -485,25 +580,29 @@ const resolveFromPlan = (plan) => () => ({
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 const srcOf = (plan, key) => plan.reportRequests[0].sources.find((s) => s.requestKey === key);
 
-test("22. default AND explicit planning include returns-leakage; the plan holds the sliced returns sequence + three canonical single-window jobs", () => {
+test("22. default AND explicit planning include returns-leakage; the plan holds the sliced returns sequence + the canonical OLI-sales slice sequence + two single-window jobs", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("returns-leakage"), "returns-leakage is a default generic report key");
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "returns-leakage"), "DEFAULT plan includes returns-leakage");
   const plan = shadowPlan(ACCTS, ["returns-leakage"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "returns-leakage");
-  // GOLDEN (Gate-6 timeout remediation): returns is <=7-day sliced NEWEST-FIRST; settlements/ordered/catalog
-  // stay one job each. Total deduplicated jobs = slices + 3.
+  // GOLDEN: returns is <=7-day sliced NEWEST-FIRST; ordered (oli-sales) is the ONE canonical OLI sales
+  // fragment sliced by canonicalOliSlices CHRONOLOGICALLY (Blocker 1); settlements + catalog stay one job
+  // each. Total deduplicated jobs = returnSlices + oliSlices + 2.
   const expectedSlices = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).reverse();
   const retJobs = plan.reportRequests[0].sources.filter((s) => s.requestKey === "returns-leakage:returns");
   assert.deepEqual(retJobs.map((s) => ({ from: s.from, to: s.to })), expectedSlices, "returns = the exact newest-first <=7d slice sequence");
   assert.equal(retJobs[0].to, ASOF, "newest slice first");
   assert.equal(retJobs[retJobs.length - 1].from, FROM, "oldest slice last; exact original coverage");
-  assert.equal(plan.sourceJobs.length, expectedSlices.length + 3, "sliced returns + settlements + ordered + catalog");
-  for (const key of ["returns-leakage:settlements", "returns-leakage:ordered"]) {
-    assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [FROM, ASOF], `${key} window asOf-59d..asOf (grouped -- unsliced)`);
-  }
+  const expectedOliSlices = canonicalOliSlices(FROM, ASOF);
+  const oliJobs = plan.reportRequests[0].sources.filter((s) => s.requestKey === "returns-leakage:oli-sales");
+  assert.deepEqual(oliJobs.map((s) => ({ from: s.from, to: s.to })), expectedOliSlices, "oli-sales = the exact canonicalOliSlices sequence (chronological, calendar-anchored)");
+  assert.equal(oliJobs[0].from, FROM, "first canonical slice starts at the window start");
+  assert.equal(oliJobs[oliJobs.length - 1].to, ASOF, "last canonical slice ends at asOf");
+  assert.equal(plan.sourceJobs.length, expectedSlices.length + expectedOliSlices.length + 2, "sliced returns + canonical oli-sales slices + settlements + catalog");
+  assert.deepEqual([srcOf(plan, "returns-leakage:settlements").from, srcOf(plan, "returns-leakage:settlements").to], [FROM, ASOF], "settlements window asOf-59d..asOf (grouped -- unsliced)");
   assert.deepEqual([srcOf(plan, "returns-leakage:catalog").from, srcOf(plan, "returns-leakage:catalog").to], [null, null], "no-date catalog");
   const rj = plan.reportJobs.find((j) => j.reportKey === "returns-leakage");
-  assert.equal(rj.dependsOn.length, expectedSlices.length + 3, "report depends on every slice + the three canonical sources");
+  assert.equal(rj.dependsOn.length, expectedSlices.length + expectedOliSlices.length + 2, "report depends on every returns slice + every oli-sales slice + settlements + catalog");
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort());
   assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
   const jobs = resolveFromPlan(plan)().sourceJobs;
@@ -511,7 +610,7 @@ test("22. default AND explicit planning include returns-leakage; the plan holds 
   assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
 });
 
-test("23. the no-date catalog canonical hash is SHARED with Buy Box + Sales Movers; returns/settlements/ordered are distinct", () => {
+test("23. the no-date catalog canonical hash is SHARED with Buy Box + Sales Movers; returns/settlements/oli-sales are distinct", () => {
   const retPlan = shadowPlan(ACCTS, ["returns-leakage"]);
   const bb = planBuyBoxLoss({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
   const sm = planSalesMovers({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, probeSignal: { status: "success", validated: true, latestReportedDate: "2025-08-08" } });
@@ -519,7 +618,7 @@ test("23. the no-date catalog canonical hash is SHARED with Buy Box + Sales Move
   assert.equal(retCat, bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog").requestHash, "shared catalog identity with Buy Box");
   assert.equal(retCat, sm.sources.find((s) => s.requestKey === "sales-movers:catalog").requestHash, "shared catalog identity with Sales Movers");
   // The returns ordered (Order Line Items) uses a different source/column/window set than Sales Movers traffic => distinct identity.
-  assert.notEqual(srcOf(retPlan, "returns-leakage:ordered").requestHash, sm.sources.find((s) => s.requestKey === "sales-movers:traffic").requestHash, "returns ordered is NOT shared with Sales Movers traffic");
+  assert.notEqual(srcOf(retPlan, "returns-leakage:oli-sales").requestHash, sm.sources.find((s) => s.requestKey === "sales-movers:traffic").requestHash, "returns oli-sales is NOT shared with Sales Movers traffic");
 });
 
 test("24. one canonical export per shared catalog request_hash across Returns + Buy Box owners", async () => {
@@ -621,7 +720,8 @@ test("29. primary-only: a stale dd-secondary account is skipped read-only with Z
   const jobs = store.listSourceJobs(r.cycleId);
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
   const sliceCount = splitDateRangeByDays(FROM, ASOF, DERIVE_TIMEOUT_SAFE_SLICE_DAYS).length;
-  assert.equal(jobs.length, sliceCount + 3, "exactly the primary-account canonical jobs ran (sliced returns + 3)");
+  const oliSliceCount = canonicalOliSlices(FROM, ASOF).length;
+  assert.equal(jobs.length, sliceCount + oliSliceCount + 2, "exactly the primary-account canonical jobs ran (sliced returns + canonical oli-sales + settlements + catalog)");
 });
 
 async function main() {
@@ -631,7 +731,7 @@ async function main() {
   ({ plannedSourceJob, runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
   ({ planReturnsLeakage, planBuyBoxLoss, planSalesMovers, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
-  ({ addDaysStr, splitDateRangeByDays } = await import("../lib/server/date-windows.js"));
+  ({ addDaysStr, splitDateRangeByDays, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -59);
 
   let failures = 0;

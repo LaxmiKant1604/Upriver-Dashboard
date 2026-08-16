@@ -19,7 +19,7 @@
 // those fields are actually present; otherwise the row says the cause is
 // unconfirmed.
 
-import { addDaysStr, num, numOrNull, splitDateRangeByDays } from "../datadoe.js";
+import { addDaysStr, num, numOrNull, splitDateRangeByDays, canonicalOliSlices } from "../datadoe.js";
 import {
   brandLabel,
   fetchCatalog,
@@ -50,13 +50,16 @@ const DAILY_COLUMNS = [
   "page_views",
 ];
 
-// Ordered sales/units from Order Line Items, grouped by sku + child_asin + item_price_currency
-// so DataDoe never sums money across currencies; the fold keeps each currency isolated and joins
-// to the daily buy-box rows on currency|sku.
-const ORDERED_GROUP_BY = ["sku", "child_asin", "item_price_currency"];
-const ORDERED_AGGREGATIONS = [
-  { column: "item_price_value", aggregation: "sum", alias: "sales_sum" },
-  { column: "quantity", aggregation: "sum", alias: "units_sum" },
+// Ordered sales/units from the ONE CANONICAL Order Line Items sales fragment (Blocker 1), grouped by
+// [date, seller_or_vendor_id, sku, child_asin, item_price_currency] so DataDoe never sums money across
+// currencies and this export is byte-identical to daily-reporting / fba-plan / returns-leakage /
+// ppc-performance. The fold re-aggregates to (currency|sku), joining to the daily buy-box rows on
+// currency|sku. Fetched over the SAME 28-day window as :daily but sliced by canonicalOliSlices, so its
+// interior + asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_AGGREGATIONS = [
+  { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
+  { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 
 export async function buildBuyBoxLoss({ apiKey, ids, to }) {
@@ -124,11 +127,17 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       }
     }
 
-    // Ordered sales/units for the SAME slice from Order Line Items (item_price_value / quantity),
-    // grouped per (sku, child_asin, item_price_currency) so money never crosses currencies.
+  }
+
+  // Ordered sales/units from the ONE canonical Order Line Items fragment over the SAME 28-day window,
+  // sliced by canonicalOliSlices so its interior + asOf-boundary slices share request_hashes with the
+  // other OLI reports (one export, many owners). Re-aggregated to (currency|sku); money never crosses
+  // currencies (currency is in the key). The canonical rows also carry date/seller, which the fold sums
+  // away into the currency|sku join key.
+  for (const slice of canonicalOliSlices(from, to)) {
     const orderedRows = await fetchExportRowsStrict(
-      apiKey, ORDER_LINE_ITEMS.id, ORDERED_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.rawGrain,
-      { groupBy: ORDERED_GROUP_BY, aggregations: ORDERED_AGGREGATIONS, orderByColumn: "sku", orderByDirection: "ASC" },
+      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.rawGrain,
+      { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" },
       `Buy Box ordered export (${slice.from} to ${slice.to})`
     );
     for (const row of orderedRows) {
@@ -138,8 +147,8 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       const key = `${currency || "?"}|${sku}`;
       let entry = bySkuOrdered.get(key);
       if (!entry) { entry = { sales: 0, units: 0 }; bySkuOrdered.set(key, entry); }
-      entry.sales += sumField(row, "sales_sum", "item_price_value");
-      entry.units += sumField(row, "units_sum", "quantity");
+      entry.sales += sumField(row, "total_sales_sum", "item_price_value");
+      entry.units += sumField(row, "total_units_sum", "quantity");
     }
   }
 
