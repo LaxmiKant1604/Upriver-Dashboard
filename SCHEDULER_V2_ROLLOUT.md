@@ -4533,3 +4533,49 @@ Daily and FBA paths did not, so their `request_hash`es didn't match the schedule
 
 **STOP for Codex re-review.** Code+tests `622716f`, docs `<this commit>`; **not pushed** — production stays on
 `0ea9f34`; nothing deployed.
+
+## Appendix AF — Codex re-review blocker fixes, round 3 (OFFLINE, 2026-08-16; code+tests `a1de539`; NOT deployed)
+
+Codex re-review of Appendix AE raised two more blockers; both fixed **offline on `main`** (no deploy/push/DataDoe/
+Supabase; the running cycle `dfca8f75` and brand-sales/IN live snapshot untouched). `npm run verify` green — **41
+steps / 21 suites** (incl. `build:check` and the new `test:currency` suite); `git diff --check` clean.
+
+### AF.1 Strict PPC currency evidence
+- New **dependency-free leaf** `lib/server/currency.js` (imports nothing — safe for the transport-free derivation
+  graph): `canonicalCurrency(value)` accepts ONLY a trimmed, UPPERCASE ISO-style 3-letter code (`^[A-Z]{3}$`) and
+  returns it or `null` (`"usd"→"USD"`, `"US D"`/`"USDX"`/`""`/`null → null`); and a shared 4-state
+  `adsCurrencyEvidence(rows)` classifier → `single-valid` | `empty` | `invalid` | `multiple` (any blank/absent/
+  malformed row ⇒ `invalid`).
+- `adsCurrencySignal` (`source-signals.js`) now folds via `adsCurrencyEvidence` and carries an explicit `state`;
+  `validateAdsCurrencySignal` requires it; `evaluateAdsCurrencyGate` returns true **only** for
+  `state==="single-valid"`. So **empty / all-blank / malformed / multiple** Ads evidence all fail closed and
+  `planPpcPerformance` emits **zero** `ppc-performance:oli-sales` exports (case (a) alone schedules). This closes the
+  AE.2 residual (all-blank previously passed the gate).
+- Both TACoS folds — live `buildPpcPerformance` and the pure `ppcPerformancePayload` twin (byte-equivalent) — decide
+  via `adsCurrencyEvidence(...).state==="single-valid"` and require every OLI total-sales row's
+  `canonicalCurrency(item_price_currency)` to be non-null and equal to that single valid Ads currency. This fixes the
+  real bug: a **malformed-but-nonblank** Ads currency (e.g. `"US D"`) previously read as valid and could be summed —
+  now it fails closed. The rest of the PPC payload is preserved when TACoS is unavailable.
+- Regressions at every layer (`currency.test.mjs`, signal matrix in `sync-signals.test.js`, gate/planner in
+  `report-source-contracts.test.mjs` + a planner zero-export case, live+scheduler fold matrix in
+  `report-ppc-performance.test.js` test 46): `US D`, USD+blank, all-blank, empty, mixed, lowercase-valid,
+  matching-valid.
+- Safety note: the fail-closed signal literals (`{failed,false,currencyCount:null}`) in `ppc-ads-loader.js` /
+  `source-sync-driver.js` are structurally guarded — `planPpcPerformance` early-returns on `!validated` **before** the
+  gate, so a stateless failed signal never reaches `validateAdsCurrencySignal` (the same guard that already protected
+  the pre-existing `currencyCount:null`).
+
+### AF.2 Correct proven/partial Returns portfolio rate
+- `returnsPortfolioRate` (`insights.js`): a row is **eligible** for the rate ONLY when `returnedUnits` is known AND
+  `orderedUnits > 0` AND it is **not lag-inflated** (`returnedUnits ≤ orderedUnits`). Ineligible rows contribute to
+  **neither** the numerator nor the denominator (previously lag-inflated rows were summed and no-denominator rows
+  leaked into the numerator). `ratePartial` is set whenever excluded evidence could move the rate: (i) a
+  currency-ambiguous withheld row, (ii) returns with no usable denominator, (iii) lag-inflated.
+- `ReturnsLeakage.jsx`: when no eligible denominator remains, the KPI shows an **explicit "unavailable · partial"**
+  state (with a tooltip naming the exclusions) — never a numeric rate and never a plain "—" that reads as
+  complete/no-returns.
+- Regressions (`test-insights.mjs`): 20 returned / 10 ordered (lag-inflated), returns with null/zero ordered, mixed
+  eligible+ineligible, all-ineligible, and a fully-eligible control.
+
+**STOP for Codex re-review.** Code+tests `a1de539`, docs `<this commit>`; **not pushed** — production stays on
+`0ea9f34`; nothing deployed.

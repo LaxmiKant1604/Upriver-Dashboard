@@ -9906,3 +9906,34 @@ Appendix AE.
   strengthening), confirmed nothing was weakened, then committed code/tests (622716f) then docs separately.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
+
+## OLI correction — Codex re-review blocker fixes round 3 OFFLINE on main 2026-08-16 (code+tests a1de539, docs separate); verify green 41/21; NOT deployed
+
+Codex re-review of round 2 (622716f / Appendix AE) raised 2 more blockers; both fixed offline on main (no deploy/push/
+DataDoe/Supabase; dfca8f75 + brand-sales/IN untouched). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AF.
+
+- B1 strict PPC currency evidence: new dependency-free leaf lib/server/currency.js -> canonicalCurrency (^[A-Z]{3}$,
+  trim+UPPER, else null) + shared 4-state adsCurrencyEvidence (single-valid/empty/invalid/multiple; any
+  blank/absent/malformed row => invalid). adsCurrencySignal carries `state`; validateAdsCurrencySignal requires it;
+  evaluateAdsCurrencyGate schedules the OLI total-sales export ONLY for state=single-valid => empty/all-blank/
+  malformed/multiple => ZERO OLI exports (closes the AE.2 all-blank residual). Both TACoS folds (live+pure,
+  byte-equivalent) gate on single-valid AND require every OLI row canonicalCurrency == the single valid Ads currency
+  -- fixes the real bug where a malformed-nonblank "US D" previously read valid and could be summed. Rest of PPC
+  preserved. Regressions at currency-leaf/signal/planner/live-fold/scheduler-fold. Fail-closed signal literals
+  (currencyCount:null, no state) are structurally guarded (planPpcPerformance early-returns on !validated before the
+  gate -- same guard that already protected currencyCount:null).
+- B2 proven/partial Returns rate: a row is eligible ONLY when returnedUnits known AND orderedUnits>0 AND not
+  lag-inflated (returnedUnits<=orderedUnits); ineligible rows excluded from BOTH numerator and denominator (previously
+  lag-inflated rows were summed + no-denominator rows leaked into the numerator). ratePartial set for any excluded
+  rate-moving evidence (currency-ambiguous, returns-without-denominator, lag-inflated). No eligible denominator =>
+  UI shows explicit "unavailable · partial" (never a numeric rate, never a bare complete-looking dash). Regressions:
+  20/10 lag, null/zero ordered, mixed, all-ineligible, fully-eligible control.
+- Verify: npm run verify green (41 steps / 21 suites incl build:check + new test:currency); git diff --check clean;
+  live+scheduler folds byte-equivalent (parity green); derivation-core's only new import is the pure currency leaf; no
+  assertions weakened.
+- Impl history: delegated to a fresh agent (completed without stalling, stopped without committing); I independently
+  re-verified, rigorously reviewed the full diff (currency.js, the 4-state gate wiring through signal/planner/both
+  folds, the malformed-currency fix, the fail-closed guard, returns eligibility math + unavailable-partial UI, and
+  all regression cases), confirmed nothing weakened, then committed code/tests (a1de539) then docs separately.
+
+STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
