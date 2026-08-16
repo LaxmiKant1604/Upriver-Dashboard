@@ -4579,3 +4579,46 @@ steps / 21 suites** (incl. `build:check` and the new `test:currency` suite); `gi
 
 **STOP for Codex re-review.** Code+tests `a1de539`, docs `<this commit>`; **not pushed** — production stays on
 `0ea9f34`; nothing deployed.
+
+## Appendix AG — Codex re-review blocker fixes, round 4 (OFFLINE, 2026-08-16; code+tests `1fb09c1`; NOT deployed)
+
+Codex re-review of Appendix AF raised two more blockers; both fixed **offline on `main`** (no deploy/push/publish/
+DataDoe/Supabase; controls/approvals/cron untouched; the running cycle `dfca8f75` not resumed; the approved Returns
+implementation unchanged). `npm run verify` green — **41 steps / 21 suites** (incl. `build:check`); `git diff --check`
+clean.
+
+### AG.1 Live/manual PPC zero-export currency gate (transport ordering)
+The AF.1 fix made the pure scheduler fold and the planner fail closed, but the **live** `buildPpcPerformance` still
+fetched the OLI total-sales slices **before** classifying the Ads currency — so empty/all-blank/`US D`/USD+blank Ads
+still spent OLI export calls.
+- `lib/server/reports/ppc.js`: the Ads currency is now classified with `adsCurrencyEvidence` **before** any
+  `canonicalOliSlices` / `fetchExportRowsStrict` call. The OLI fetch loop is entered **only** when
+  `state === "single-valid"`; empty / all-blank / valid+blank / malformed (`"US D"`) fail closed up front and spend
+  **exactly zero** OLI export calls. The existing `currencies.length > 1` branch (the distinct multi-currency reason)
+  is kept **unchanged** so the live path stays byte-parity with the scheduler's `PPC_MULTI_CURRENCY_REASON`; the
+  OLI-row currency check and the degrade `try/catch` are preserved for the single-valid path. The rest of the PPC
+  payload and the unconditional catalog fetch are untouched.
+- A **minimal DI seam** (an optional second `deps` argument; production callers pass none, and the strict-transport
+  default remains a genuine `fetchExportRowsStrict` call — so the contract suite's strict-transport guard stays
+  genuinely satisfied) makes the live path executably testable.
+- New **test 47** drives a real `buildPpcPerformance` through injected stubs with an OLI-export **spy**: single valid
+  USD ⇒ OLI may run (≥1 call); empty / all-blank / `"US D"` / USD+blank / USD+EUR ⇒ **0** OLI export calls, `totalSales`
+  null, a typed unavailable reason, and the rest of PPC intact (every Ads row still counted). This is the executable
+  live-path transport-ordering regression Codex required (not a pure-fold or planner-only test).
+
+### AG.2 Totally typed failed Ads-currency signals
+- One shared producer `failedAdsCurrencySignal()` → `{status:"failed", validated:false, currencyCount:0,
+  state:"invalid"}` in `source-signals.js`, now used by `adsCurrencySignal` (non-array), `ppcAdsCurrencySignalOf`
+  (`ppc-ads-loader.js`) and `reconstructSignals` (`source-sync-driver.js`) — so the fail-closed shape cannot drift.
+  The old `{...,currencyCount:null}` was **rejected** by `validateAdsCurrencySignal`; the typed shape validates cleanly.
+- Tests prove a failed/unavailable ads read (a) validates via `validateAdsCurrencySignal` (no throw), (b) gates OFF via
+  `evaluateAdsCurrencyGate`, and (c) schedules **zero** `ppc-performance:oli-sales` sources through the real
+  `runStagedSourceCycle` driver. The `currencyCount:null` pins in `report-ppc-performance.test.js` /
+  `sync-signals.test.js` are updated to the typed shape (coverage strengthened, not removed).
+
+**No production side effects:** the transport test runs entirely on injected stubs (no network/DB call). Live builders
+and scheduler pure folds kept byte-equivalent (the pure `ppcPerformancePayload` twin is unchanged); no assertions
+weakened.
+
+**STOP for Codex re-review.** Code+tests `1fb09c1`, docs `<this commit>`; **not pushed** — production stays on
+`0ea9f34`; nothing deployed.

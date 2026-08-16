@@ -9937,3 +9937,36 @@ DataDoe/Supabase; dfca8f75 + brand-sales/IN untouched). Full evidence: SCHEDULER
   all regression cases), confirmed nothing weakened, then committed code/tests (a1de539) then docs separately.
 
 STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
+
+## OLI/PPC — Codex re-review blocker fixes round 4 OFFLINE on main 2026-08-16 (code+tests 1fb09c1, docs separate); verify green 41/21; NOT deployed
+
+Codex re-review of round 3 (a1de539 / Appendix AF) raised 2 more blockers; both fixed offline on main (no deploy/push/
+publish/DataDoe/Supabase; controls/approvals/cron untouched; dfca8f75 not resumed; approved Returns impl unchanged).
+Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AG.
+
+- B1 live PPC zero-export gate (transport ordering): lib/server/reports/ppc.js buildPpcPerformance now classifies the
+  Ads currency with adsCurrencyEvidence BEFORE any canonicalOliSlices/fetchExportRowsStrict call. The OLI total-sales
+  fetch loop is entered ONLY when state=single-valid; empty/all-blank/valid+blank/malformed("US D") fail closed up
+  front => EXACTLY ZERO OLI export calls. The outer currencies.length>1 branch (multi-currency reason) is kept
+  unchanged for scheduler parity (PPC_MULTI_CURRENCY_REASON). Minimal DI seam (optional 2nd `deps` arg; production
+  callers pass none; strict-transport default stays a genuine fetchExportRowsStrict call so the contract strict guard
+  is genuinely satisfied) makes the live path executably testable. New test 47 drives a REAL buildPpcPerformance with
+  injected stubs + an OLI-export spy: single-valid USD => OLI may run; empty/all-blank/US D/USD+blank/USD+EUR => 0 OLI
+  calls, totalSales null, rest of PPC intact. Pure ppcPerformancePayload twin untouched (validates, doesn't fetch).
+- B2 typed failed Ads-currency signals: one shared failedAdsCurrencySignal() => {failed,false,0,invalid} in
+  source-signals.js, used by adsCurrencySignal (non-array), ppcAdsCurrencySignalOf, and source-sync-driver
+  reconstructSignals -- so the fail-closed shape can't drift. The old {currencyCount:null} was rejected by
+  validateAdsCurrencySignal; the typed shape validates. Tests prove a failed/unavailable read validates (no throw),
+  gates false, and the real runStagedSourceCycle driver schedules zero ppc-performance:oli-sales; currencyCount:null
+  pins updated to the typed shape (strengthened, not removed).
+- Verify: npm run verify green (41 steps / 21 suites incl build:check); git diff --check clean; live+scheduler folds
+  byte-equivalent; strict-transport contract guard genuinely satisfied; no assertions weakened. No production side
+  effects (transport test uses injected stubs, no network/DB call).
+- Impl history: delegated to a fresh agent (completed without stalling, stopped without committing); I independently
+  re-verified (writing verify output to a file to avoid the process.exit-free-runner pipe artifact), rigorously
+  reviewed the full diff (transport ordering before the fetch, the executable OLI-call-count test 47 for all 5
+  ambiguous cases, the DI-seam strict-transport forwarder, the shared failed-signal producer + its 3 usages + the
+  validates/gates-false/planner-zero proofs), confirmed nothing weakened, then committed code/tests (1fb09c1) then
+  docs separately.
+
+STOP for Codex re-review. Offline only; not pushed; production stays on 0ea9f34; nothing deployed.
