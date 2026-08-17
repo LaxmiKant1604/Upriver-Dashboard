@@ -1,5 +1,41 @@
 # Project Memory
 
+## Scheduler v2 Blocker 4c prep — senior-review gaps closed (source-batch owner identity + schema audit, 2026-08-17)
+
+Closed the five remaining senior-review gaps on `main` BEFORE starting Blocker 4c. SHADOW MODE unchanged;
+nothing pushed/merged/deployed/migrated/enabled; Scheduler v1, frontend, and manual refresh untouched. Full
+`npm run verify` green (44 steps across 24 suites incl. build:check, 2,395 modules).
+
+- **Gap 1 — authoritative batch account records.** `plannedBatchSourceJobs(reportKey, resolvedBatch, bucket,
+  connectionId, batchAccounts)` now takes `batchAccounts = [{ accountId, rawSellerId }]`. The INDIVIDUAL owner
+  scope is computed INTERNALLY as `accountScopeHash([rawSellerId])` (inside `plannedSourceJob`); a
+  caller-provided owner HASH is never accepted.
+- **Gap 2 — batch-set proof before any source/owner upsert.** `plannedBatchSourceJobs` throws (no partial
+  plan returned) unless the batch account set EXACTLY equals `resolvedBatch.sellerOrVendorIds`: every
+  rawSellerId nonblank, accounts unique, <=5, no missing/extra seller, valid connection + non-empty org
+  fingerprint, and `accountScopeHash(sellerOrVendorIds) === resolvedBatch.accountScopeHash`.
+- **Gap 3 — fail-closed multi-id owner scope.** `plannedSourceJob` fails closed when
+  `resolved.sellerOrVendorIds` has >1 id and no authoritative individual rawSellerId is supplied; the legacy
+  fallback to the canonical (batch) scope is allowed ONLY for a <=1-id source. Every production planner
+  resolves `ids:[rawSellerId]` (single account), so only the two brand-sales five-ID-batch unit tests changed
+  (they now build via the sanctioned `plannedBatchSourceJobs`).
+- **Gap 4 — stronger schema-contract audit.** (a) required indexes proven by EXACT columns/order
+  (INDEX_COLUMNS_MISMATCH); (b) the touch trigger proven STRUCTURALLY — BEFORE UPDATE / FOR EACH ROW /
+  public.touch_updated_at() (TABLE_TRIGGER_INVALID); (c) `adopt_source_export_cache` body proven — cache row
+  FOR UPDATE, expiry gate, full 6-field identity/integrity comparison, DB-owned adoption values, and
+  pending/unattempted/count=0 CAS; (d) `assign_source_account_batch` body proven — per-family advisory xact
+  lock, hard <=5 cap, and existing connection/org scope rejection (the direct-write ban is already covered by
+  the SELECT-only service_role ACL).
+- **Gap 5 — mutation regressions.** 11 new `schema-contract-mutation` cases (wrong index columns;
+  AFTER/DELETE/statement/wrong-function trigger; removed cache lock/expiry/identity check; removed advisory
+  lock; cap widened to 6; removed existing-scope rejection) each surface their OWN typed audit blocker (which
+  the preflight re-emits as `SCHEMA_<code>`, ready=false). Baseline (real files) still audits CLEAN.
+
+Files: `lib/server/sync/source-sync-driver.js`, `lib/server/sync/schema-contract.js`,
+`scripts/source-tranche.test.js`, `scripts/sync-source-jobs.test.js`, `scripts/schema-contract-mutation.test.js`.
+Golden `request_hash`, five-ID batching, and the two UNAPPLIED 20260817 migrations' SQL are unchanged (the
+static audit only READS them). Blocker 4c not yet started.
+
 ## Integration: merged deployed main (Brand View + Brand Directory hotfix) into feature/scheduler-v2 (2026-08-12)
 
 INTEGRATION ONLY (Codex-directed). Merged `origin/main` @ `be7cb04` (the deployed Brand View / Brand

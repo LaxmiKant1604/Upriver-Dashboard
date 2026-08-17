@@ -349,7 +349,9 @@ test("4b. FIVE accounts BATCH into ONE canonical source row and retain FIVE sepa
     organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
     bucket: "us", strict: true, limit: c.limit, from: "2025-07-14", to: "2025-07-20", options, sellerOrVendorIds: sellers,
   };
-  const batchAccounts = accts.map((a) => ({ accountId: a.accountId, ownerAccountScopeHash: accountScopeHash([a.rawSellerId]) }));
+  // Gap 1: pass AUTHORITATIVE account records { accountId, rawSellerId }; the owner scope is computed
+  // INTERNALLY as accountScopeHash([rawSellerId]) -- never a caller-provided hash.
+  const batchAccounts = accts.map((a) => ({ accountId: a.accountId, rawSellerId: a.rawSellerId }));
   const jobs = plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", batchAccounts);
   assert.equal(jobs.length, 5, "five planned entries (one per account)");
   assert.equal(new Set(jobs.map((j) => j.requestHash)).size, 1, "all five share ONE canonical request_hash (the batch)");
@@ -365,6 +367,40 @@ test("4b. FIVE accounts BATCH into ONE canonical source row and retain FIVE sepa
   assert.equal(new Set(owners.map((m) => m.account_scope_hash)).size, 5, "five distinct INDIVIDUAL owner scopes");
   assert.ok(owners.every((m) => m.account_scope_hash !== id.accountScopeHash), "no owner uses the BATCH scope as its owner scope (Blocker 4b)");
   assert.equal(dd.createCount(id.requestHash), 1, "the shared batched OLI export is created EXACTLY once");
+});
+
+test("4c. plannedBatchSourceJobs computes owner scope from rawSellerId and FAILS CLOSED on any batch-set / scope / rawSellerId mismatch (senior review gaps 1-3)", () => {
+  const sellers = ["S1", "S2", "S3"];
+  const c = oliContract("returns-leakage", "returns-leakage:oli-sales");
+  const options = { groupBy: c.groupBy || undefined, aggregations: c.aggregations || undefined, orderByColumn: c.orderByColumn, orderByDirection: c.orderByDirection };
+  const id = sourceRequestIdentity({ apiKey: "k", sourceId: OLI_SOURCE_ID(), columns: c.columns, ids: sellers, from: "2025-07-14", to: "2025-07-20", limit: c.limit, options });
+  const resolvedBatch = {
+    requestHash: id.requestHash, requestKey: "returns-leakage:oli-sales", sourceId: OLI_SOURCE_ID(), sourceKey: "order-line-items",
+    organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
+    bucket: "us", strict: true, limit: c.limit, from: "2025-07-14", to: "2025-07-20", options, sellerOrVendorIds: sellers,
+  };
+  const ok = [{ accountId: "ACC1", rawSellerId: "S1" }, { accountId: "ACC2", rawSellerId: "S2" }, { accountId: "ACC3", rawSellerId: "S3" }];
+  // Gap 1: the well-formed batch plans; each owner scope is accountScopeHash([rawSellerId]) (computed internally),
+  // distinct per account, and never the shared batch scope.
+  const good = plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", ok);
+  assert.equal(new Set(good.map((j) => j.owner.accountScopeHash)).size, 3, "three distinct INDIVIDUAL owner scopes");
+  assert.ok(good.every((j) => j.owner.accountScopeHash === accountScopeHash([ok.find((a) => a.accountId === j.owner.accountId).rawSellerId])), "owner scope == accountScopeHash([rawSellerId])");
+  assert.ok(good.every((j) => j.owner.accountScopeHash !== id.accountScopeHash), "no owner reuses the BATCH scope");
+  // Gap 2: a MISSING seller (set != sellerOrVendorIds) is rejected before any upsert.
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", ok.slice(0, 2)), /does not equal resolvedBatch\.sellerOrVendorIds/);
+  // Gap 2: a WRONG seller (right count, wrong member) is rejected.
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", [{ accountId: "ACC1", rawSellerId: "S1" }, { accountId: "ACC2", rawSellerId: "S2" }, { accountId: "ACC3", rawSellerId: "SX" }]), /does not equal resolvedBatch\.sellerOrVendorIds/);
+  // Gap 2: a duplicate rawSellerId is rejected.
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", [{ accountId: "ACC1", rawSellerId: "S1" }, { accountId: "ACC2", rawSellerId: "S1" }, { accountId: "ACC3", rawSellerId: "S3" }]), /duplicate rawSellerId/);
+  // Gap 1: a blank rawSellerId is rejected (the raw id is authoritative; no caller hash is accepted).
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", [{ accountId: "ACC1", rawSellerId: "" }, { accountId: "ACC2", rawSellerId: "S2" }, { accountId: "ACC3", rawSellerId: "S3" }]), /nonblank rawSellerId/);
+  // Gap 2: more than 5 accounts is a hard-capped rejection.
+  const six = ["S1", "S2", "S3", "S4", "S5", "S6"].map((s, i) => ({ accountId: "ACC" + (i + 1), rawSellerId: s }));
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", six), /at most 5 accounts/);
+  // Gap 2: a resolvedBatch whose scope is inconsistent with its own sellerOrVendorIds is rejected.
+  assert.throws(() => plannedBatchSourceJobs("returns-leakage", { ...resolvedBatch, accountScopeHash: "WRONG-BATCH-SCOPE" }, "us", "primary", ok), /does not equal accountScopeHash\(sellerOrVendorIds\)/);
+  // Gap 3: plannedSourceJob itself fails closed for a multi-id (batched) resolved with no individual rawSellerId.
+  assert.throws(() => plannedSourceJob("returns-leakage", resolvedBatch, "us", "primary", "ACC1"), /requires an authoritative individual rawSellerId/);
 });
 
 /* ============================= Part C: durable cache reuse ============================= */

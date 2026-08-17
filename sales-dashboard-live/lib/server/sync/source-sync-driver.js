@@ -10,7 +10,7 @@
 // here runs a live DataDoe probe on import.
 
 import { createExport, pollExport, downloadExport } from "../datadoe.js";
-import { organizationFingerprint, sourceJobOwnerId } from "../source-identity.js";
+import { organizationFingerprint, sourceJobOwnerId, accountScopeHash } from "../source-identity.js";
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt, adoptSourceExportCache,
@@ -62,7 +62,15 @@ export function normalizeDataDoeConnections(connections) {
 // FAIL CLOSED: connectionId is REQUIRED and explicit ('primary' or 'dd-secondary') — there
 // is no silent 'primary' default anywhere in Scheduler v2 — and the resolved job must carry
 // a non-empty organizationFingerprint. Both are what the adapter verifies before any call.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerAccountScopeHash = null) {
+//
+// OWNER SCOPE (Blocker 4b + senior review gaps 1 & 3): the owner membership's account_scope_hash is the
+// INDIVIDUAL account's scope, NEVER the (possibly batched) canonical job scope. It is computed INTERNALLY from
+// an authoritative individual `ownerRawSellerId` as accountScopeHash([ownerRawSellerId]) -- a caller-provided
+// owner HASH is never accepted. When no rawSellerId is supplied, the legacy fallback to the canonical
+// resolved.accountScopeHash is permitted ONLY for a single-account source (0 or 1 seller id, where the
+// canonical scope already IS the individual scope); a MULTI-id (batched) source with no authoritative
+// rawSellerId FAILS CLOSED rather than collapsing every batch member onto the one shared batch scope.
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -75,11 +83,22 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
   // key as this membership's alias and the SAFE public accountId for admin display. request_key is a
   // membership alias, NOT canonical ownership authority; the canonical job dedups on request_hash.
   //
-  // Blocker 4b -- OWNER scope is the INDIVIDUAL account (one exact report/account). For a single-account job
-  // it equals the canonical job scope; for a BATCHED job it is the individual account's scope, NEVER the
-  // batch scope (which would collide all <=5 batch members onto one owner_id). It defaults to the resolved
-  // job scope, so single-account planning is byte-identical.
-  const ownerScope = ownerAccountScopeHash != null ? ownerAccountScopeHash : resolved.accountScopeHash;
+  // The INDIVIDUAL owner scope. An authoritative rawSellerId is hashed HERE (accountScopeHash([id])); a
+  // caller-supplied owner hash is never accepted. Absent one, fall back to the canonical scope ONLY for a
+  // single-account source (<=1 seller id) -- a batched source (>1) fails closed.
+  const sellerIds = Array.isArray(resolved.sellerOrVendorIds) ? resolved.sellerOrVendorIds : [];
+  let ownerScope;
+  if (ownerRawSellerId != null) {
+    const raw = String(ownerRawSellerId);
+    if (raw.trim() === "") {
+      throw new Error("plannedSourceJob: ownerRawSellerId, when supplied, must be a nonblank individual seller id (fail closed).");
+    }
+    ownerScope = accountScopeHash([raw]);
+  } else if (sellerIds.length <= 1) {
+    ownerScope = resolved.accountScopeHash; // single-account source: the canonical scope IS the individual scope
+  } else {
+    throw new Error(`plannedSourceJob: a batched source with ${sellerIds.length} seller ids requires an authoritative individual rawSellerId for its owner scope; refusing to fall back to the canonical batch scope (fail closed).`);
+  }
   const ownerId = sourceJobOwnerId({
     reportKey, connectionId,
     organizationFingerprint: resolved.organizationFingerprint,
@@ -113,13 +132,78 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
   };
 }
 
-// Build the <=5 planned source jobs for ONE batched canonical source (Blocker 4b): the SAME canonical job
-// (one request_hash over the sorted batch seller ids) with ONE owner membership PER account, each carrying
-// that account's INDIVIDUAL owner scope + SAFE public accountId, so five accounts own the one shared export
-// without owner-id collisions. `resolvedBatch` is the batch's resolved source (batch request_hash + batch
-// account_scope_hash); `batchAccounts` is [{ accountId, ownerAccountScopeHash }] (the individual scopes).
+// Build the <=5 planned source jobs for ONE batched canonical source (Blocker 4b + senior review gaps 1 & 2):
+// the SAME canonical job (one request_hash over the sorted batch seller ids) with ONE owner membership PER
+// account, each carrying that account's INDIVIDUAL owner scope + SAFE public accountId, so the <=5 accounts own
+// the single shared export without owner-id collisions. `resolvedBatch` is the batch's resolved source (batch
+// request_hash + batch account_scope_hash over sellerOrVendorIds).
+//
+// `batchAccounts` is the AUTHORITATIVE account-record list `[{ accountId, rawSellerId }]` -- a SAFE public
+// accountId plus that account's INDIVIDUAL raw seller id. The individual owner scope is computed INTERNALLY
+// (accountScopeHash([rawSellerId]) inside plannedSourceJob); a caller-provided owner HASH is NEVER accepted
+// (gap 1).
+//
+// FAIL CLOSED before ANY source/owner upsert (gap 2): the batch account set must EXACTLY equal
+// resolvedBatch.sellerOrVendorIds -- every rawSellerId nonblank, the accounts unique, at most 5, covering
+// exactly the canonical batch sellers (no missing, no extra), on a valid connection with a non-empty
+// organization fingerprint, and with the resolvedBatch's own canonical scope equal to
+// accountScopeHash(sellerOrVendorIds). Any mismatch THROWS, so no partial/mis-owned plan is ever returned.
 export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connectionId, batchAccounts) {
-  return (batchAccounts || []).map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.ownerAccountScopeHash));
+  if (!VALID_CONNECTION_IDS.has(connectionId)) {
+    throw new Error(`plannedBatchSourceJobs requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
+  }
+  if (!resolvedBatch || !resolvedBatch.organizationFingerprint) {
+    throw new Error("plannedBatchSourceJobs requires a non-empty organizationFingerprint on the resolved batch (fail closed).");
+  }
+  const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
+  if (accounts.length === 0) {
+    throw new Error("plannedBatchSourceJobs requires a non-empty batchAccounts list (fail closed).");
+  }
+  if (accounts.length > 5) {
+    throw new Error(`plannedBatchSourceJobs: a source batch covers at most 5 accounts (got ${accounts.length}); refusing (fail closed).`);
+  }
+  // Each authoritative record must carry a nonblank public accountId AND a nonblank individual rawSellerId.
+  const accountIds = [];
+  const rawSellerIds = [];
+  for (const a of accounts) {
+    const accountId = a && typeof a.accountId === "string" ? a.accountId : "";
+    const rawSellerId = a && typeof a.rawSellerId === "string" ? a.rawSellerId : "";
+    if (accountId.trim() === "") {
+      throw new Error("plannedBatchSourceJobs: every batch account requires a nonblank public accountId (fail closed).");
+    }
+    if (rawSellerId.trim() === "") {
+      throw new Error("plannedBatchSourceJobs: every batch account requires a nonblank rawSellerId (fail closed).");
+    }
+    accountIds.push(accountId);
+    rawSellerIds.push(rawSellerId);
+  }
+  if (new Set(rawSellerIds).size !== rawSellerIds.length) {
+    throw new Error("plannedBatchSourceJobs: duplicate rawSellerId across batch accounts; refusing (fail closed).");
+  }
+  if (new Set(accountIds).size !== accountIds.length) {
+    throw new Error("plannedBatchSourceJobs: duplicate accountId across batch accounts; refusing (fail closed).");
+  }
+  // The batch account set must EXACTLY equal the canonical batch sellers (no missing, no extra). The canonical
+  // scope must also be accountScopeHash(those sellers) -- otherwise the owner memberships would not correspond
+  // to the export this shared job actually fetches.
+  const canonicalIds = (Array.isArray(resolvedBatch.sellerOrVendorIds) ? resolvedBatch.sellerOrVendorIds : []).map((x) => String(x == null ? "" : x));
+  if (canonicalIds.length === 0 || canonicalIds.some((x) => x.trim() === "")) {
+    throw new Error("plannedBatchSourceJobs: resolvedBatch.sellerOrVendorIds must be a non-empty list of nonblank seller ids (fail closed).");
+  }
+  if (new Set(canonicalIds).size !== canonicalIds.length) {
+    throw new Error("plannedBatchSourceJobs: resolvedBatch.sellerOrVendorIds contains duplicate seller ids (fail closed).");
+  }
+  const want = new Set(canonicalIds);
+  const got = new Set(rawSellerIds.map((x) => String(x)));
+  const missing = [...want].filter((x) => !got.has(x));
+  const extra = [...got].filter((x) => !want.has(x));
+  if (missing.length || extra.length) {
+    throw new Error(`plannedBatchSourceJobs: the batch account set does not equal resolvedBatch.sellerOrVendorIds (missing: [${missing.join(", ")}], extra: [${extra.join(", ")}]); refusing (fail closed).`);
+  }
+  if (accountScopeHash(canonicalIds) !== resolvedBatch.accountScopeHash) {
+    throw new Error("plannedBatchSourceJobs: resolvedBatch.accountScopeHash does not equal accountScopeHash(sellerOrVendorIds); refusing (fail closed).");
+  }
+  return accounts.map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.rawSellerId));
 }
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.

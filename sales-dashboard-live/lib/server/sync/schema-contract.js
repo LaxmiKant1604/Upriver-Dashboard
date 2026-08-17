@@ -193,6 +193,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       { name: "adopt_source_export_cache", params: ["p_cycle_id", "p_request_hash", "p_expected_source_id", "p_expected_organization_fingerprint", "p_expected_account_scope_hash", "p_expected_object_path", "p_expected_row_count", "p_expected_payload_bytes"] },
       { name: "claim_source_export_attempt", params: ["p_cycle_id", "p_request_hash"] },
     ],
+    // STRUCTURAL body proof (senior review gap 4c): the adoption CAS must LOCK the real cache row FOR UPDATE,
+    // gate on the DB expiry, compare the FULL identity/integrity set against the caller's expectations, write
+    // the DB row's OWN values, and CAS only a still pending/unattempted/count=0 job. Removing any is a blocker.
+    provenFunctions: [{ name: "adopt_source_export_cache", proof: "adopt-cache" }],
     wrappers: ["adoptSourceExportCache", "claimSourceExportAttempt"],
     note: "Atomic cache-validated adoption CAS + claim mutual-exclusion (REPLACES 20260807 claim; PREPARED, UNAPPLIED).",
   },
@@ -211,15 +215,22 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         // Finding 4: least-privilege ACL -- REVOKE ALL from service_role then GRANT SELECT ONLY. All writes go
         // through assign_source_account_batch (SECURITY DEFINER), so no direct service-role write can bypass <=5.
         serviceRoleAcl: { revokeAll: true, grants: ["select"] },
-        requiredIndexes: ["source_batch_membership_family_idx"],
+        // Gap 4a: the required index is proven by NAME *and* EXACT columns/order -- a wrong-column index fails.
+        requiredIndexes: [{ name: "source_batch_membership_family_idx", columns: ["batch_family", "batch_index"] }],
         rlsEnabled: true,
-        requiredTriggers: ["source_batch_membership_touch"],
+        // Gap 4b: the touch trigger is proven STRUCTURALLY -- BEFORE UPDATE, FOR EACH ROW, executing exactly
+        // public.touch_updated_at(). An AFTER/DELETE/statement-level/wrong-function trigger fails.
+        requiredTriggers: [{ name: "source_batch_membership_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["batch_family", "account_id", "batch_index", "connection_id", "organization_fingerprint"],
       },
     ],
     rpcs: [
       { name: "assign_source_account_batch", params: ["p_batch_family", "p_account_id", "p_connection_id", "p_organization_fingerprint", "p_max"] },
     ],
+    // STRUCTURAL body proof (senior review gap 4d): the assignment RPC must take the per-family advisory xact
+    // lock, hard-cap the maximum to 5, and REJECT an existing membership whose connection/organization scope
+    // differs (no silent re-home). The direct-write ban is proven separately by the SELECT-only service_role ACL.
+    provenFunctions: [{ name: "assign_source_account_batch", proof: "assign-batch" }],
     wrappers: ["assignSourceAccountBatch", "listSourceBatchMembership"],
     note: "Stable <=5-account batch membership + transactional assign RPC (PREPARED, UNAPPLIED).",
   },
@@ -501,11 +512,41 @@ function auditServiceRoleAcl(masked, table, expected) {
 function indexPresent(masked, table, indexName) {
   return new RegExp(`create\\s+index\\s+(?:if\\s+not\\s+exists\\s+)?${indexName}\\s+on\\s+public\\.${table}\\b`, "i").test(masked);
 }
+// The EXACT ordered column list of a `create index <name> on public.<table> [using <m>] (col, ...)` in `masked`
+// (comments/strings blanked, so a comment/string can never satisfy it), or null when the index is absent. Index
+// columns are plain identifiers, so the masked view preserves them; the order is significant (gap 4a).
+function indexColumns(masked, table, indexName) {
+  const m = new RegExp(`create\\s+index\\s+(?:if\\s+not\\s+exists\\s+)?${indexName}\\s+on\\s+public\\.${table}\\b\\s*(?:using\\s+[a-z0-9_]+\\s*)?\\(`, "i").exec(masked);
+  if (!m) return null;
+  const range = balancedRange(masked, masked.indexOf("(", m.index + m[0].length - 1));
+  if (!range) return null;
+  return splitCols(masked.slice(range.open + 1, range.close));
+}
 function rlsEnabledFor(masked, table) {
   return new RegExp(`alter\\s+table\\s+public\\.${table}\\s+enable\\s+row\\s+level\\s+security`, "i").test(masked);
 }
 function triggerPresentFor(masked, table, name) {
   return new RegExp(`create\\s+trigger\\s+${name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i").test(masked);
+}
+// BOUNDED STRUCTURAL proof of a GENERIC (non append-guard) trigger against an expected spec (gap 4b): the EXACT
+//   `create trigger <name> <timing> <event[ or event...]> on public.<table> for each {row|statement}
+//    execute {function|procedure} public.<fn>()`
+// on `masked`. The single regex pins the timing (BEFORE/AFTER), the EXACT event list (order-anchored: `on` must
+// immediately follow the last event, so a DELETE/INSERT or an extra event fails), the level (rejects the wrong
+// FOR EACH), the table, and the executed function. A `drop trigger` for THIS trigger AFTER the create makes it
+// absent at apply time -> invalid.
+function genericTriggerValid(masked, table, spec) {
+  const events = (spec.events || []).map((e) => String(e).toLowerCase()).join("\\s+or\\s+");
+  const level = spec.level === "statement" ? "for\\s+each\\s+statement" : "for\\s+each\\s+row";
+  const re = new RegExp(
+    `create\\s+trigger\\s+${spec.name}\\s+${spec.timing}\\s+${events}\\s+on\\s+public\\.${table}\\s+${level}\\s+execute\\s+(?:function|procedure)\\s+public\\.${spec.function}\\s*\\(\\s*\\)`,
+    "i",
+  );
+  const m = re.exec(masked);
+  if (!m) return { valid: false, reason: `no exact '${spec.timing} ${(spec.events || []).join(" or ")} on public.${table} for each ${spec.level || "row"} execute function public.${spec.function}()'` };
+  const dropRe = new RegExp(`drop\\s+trigger\\s+(?:if\\s+exists\\s+)?${spec.name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i");
+  if (dropRe.test(masked.slice(m.index + m[0].length))) return { valid: false, reason: "a DROP TRIGGER for this trigger appears after the create" };
+  return { valid: true, reason: null };
 }
 
 // BOUNDED STRUCTURAL proof of an append-guard trigger (Finding 2): an EXACT
@@ -593,6 +634,89 @@ function auditGuardFunction(clean, masked, fnName) {
     problems.push({ code: "GUARD_TERMINAL_REJECT_MISSING", reason: "the v_status IN ('succeeded','partial','failed') block does not RAISE EXCEPTION before its END IF" });
   }
   return problems;
+}
+
+// Prove adopt_source_export_cache's CRITICAL behavior (senior review gap 4c). Read from the function body's
+// `masked` (structure; string literals blanked) + `clean` (string literals preserved). The adoption CAS must:
+//   (1) LOCK the ACTUAL current cache row FOR UPDATE (keyed by request_hash) -- never a stale unlocked read;
+//   (2) gate on the DB expiry (v_cache.expires_at <= now()), not the caller's value;
+//   (3) compare the FULL identity/integrity set (all six fields) against the caller's expectations;
+//   (4) write the DB row's OWN values (row_count / payload_bytes / object_path), never the caller's; and
+//   (5) CAS only a still pending / unattempted / create_export_count=0 job (the one-attempt invariant).
+function auditAdoptCacheFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "ADOPT_CACHE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  // (1) FOR UPDATE lock on the real cache row keyed by request_hash (bounded to the one SELECT statement).
+  if (!/from\s+public\.source_export_cache\b[^;]*\bwhere\s+request_hash\s*=\s*p_request_hash\b[^;]*\bfor\s+update\b/i.test(M)) {
+    problems.push({ code: "ADOPT_CACHE_ROW_LOCK_MISSING", reason: "does not SELECT ... FROM public.source_export_cache WHERE request_hash = p_request_hash FOR UPDATE" });
+  }
+  // (2) expiry gate on the AUTHORITATIVE db value.
+  if (!/v_cache\.expires_at\s*<=\s*now\s*\(\s*\)/i.test(M)) {
+    problems.push({ code: "ADOPT_CACHE_EXPIRY_GATE_MISSING", reason: "does not gate on v_cache.expires_at <= now()" });
+  }
+  // (3) FULL identity/integrity comparison: every field vs the caller's expectation.
+  const idFields = [
+    ["source_id", "p_expected_source_id"],
+    ["organization_fingerprint", "p_expected_organization_fingerprint"],
+    ["account_scope_hash", "p_expected_account_scope_hash"],
+    ["object_path", "p_expected_object_path"],
+    ["row_count", "p_expected_row_count"],
+    ["payload_bytes", "p_expected_payload_bytes"],
+  ];
+  const missingId = idFields.filter(([f, p]) => !new RegExp(`v_cache\\.${f}\\s+is\\s+distinct\\s+from\\s+${p}\\b`, "i").test(M));
+  if (missingId.length) {
+    problems.push({ code: "ADOPT_CACHE_IDENTITY_CHECK_MISSING", reason: `missing identity/integrity comparison(s): ${missingId.map(([f]) => f).join(", ")}` });
+  }
+  // (4) the adoption writes the DB row's OWN values (never the caller's expectations).
+  const dbOwned = [["row_count", "v_cache\\.row_count"], ["payload_bytes", "v_cache\\.payload_bytes"], ["cache_object_path", "v_cache\\.object_path"]];
+  const missingOwned = dbOwned.filter(([col, val]) => !new RegExp(`\\b${col}\\s*=\\s*${val}\\b`, "i").test(M));
+  if (missingOwned.length) {
+    problems.push({ code: "ADOPT_CACHE_DB_OWNED_VALUES_MISSING", reason: `adoption does not write DB-owned value(s): ${missingOwned.map(([c]) => c).join(", ")}` });
+  }
+  // (5) CAS predicate: adopt only a still pending/unattempted/count=0 job. The 'pending' literal is read from
+  //     `clean` (it is blanked in `masked`); the structural guards are read from `masked`.
+  const casOk = /\bfetch_status\s*=\s*'pending'/i.test(C) && /\battempted_at\s+is\s+null\b/i.test(M) && /\bcreate_export_count\s*=\s*0\b/i.test(M);
+  if (!casOk) {
+    problems.push({ code: "ADOPT_CACHE_CAS_PREDICATE_MISSING", reason: "the adoption UPDATE is not gated on fetch_status='pending' AND attempted_at IS NULL AND create_export_count = 0" });
+  }
+  return problems;
+}
+
+// Prove assign_source_account_batch's CRITICAL behavior (senior review gap 4d): it (1) serialises assignments
+// within a family via a per-family advisory xact lock; (2) hard-caps the per-family maximum to EXACTLY 5 (a
+// widened cap fails); and (3) REJECTS an existing membership whose stored connection/organization scope differs
+// from the caller's (RAISE EXCEPTION, no silent re-home). The direct-write ban is enforced by the SELECT-only
+// service_role ACL, audited separately.
+function auditAssignBatchFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "ASSIGN_BATCH_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const compact = M.replace(/\s+/g, "").toLowerCase();
+  // (1) per-family advisory xact lock.
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_batch_family\s*\)\s*\)/i.test(M)) {
+    problems.push({ code: "ASSIGN_BATCH_ADVISORY_LOCK_MISSING", reason: "does not take pg_advisory_xact_lock(hashtext(p_batch_family))" });
+  }
+  // (2) hard <=5 cap: the effective max is least(greatest(coalesce(p_max, 5), 1), 5). Pins the ceiling to
+  //     EXACTLY 5, so widening the outer bound (e.g. ...,6)) fails.
+  if (!compact.includes("least(greatest(coalesce(p_max,5),1),5)")) {
+    problems.push({ code: "ASSIGN_BATCH_MAX_CAP_MISSING", reason: "the per-family maximum is not hard-capped to 5 via least(greatest(coalesce(p_max,5),1),5)" });
+  }
+  // (3) an existing membership with a DIFFERENT connection/organization scope is REJECTED with RAISE EXCEPTION.
+  if (!ifBlockRaises(body, { headerRe: /\bif\s+v_conn\s+is\s+distinct\s+from\s+p_connection_id\s+or\s+v_org\s+is\s+distinct\s+from\s+p_organization_fingerprint\s+then/i })) {
+    problems.push({ code: "ASSIGN_BATCH_SCOPE_MATCH_MISSING", reason: "an existing membership with a different connection/organization scope is not rejected with RAISE EXCEPTION" });
+  }
+  return problems;
+}
+
+// Dispatch a declared RPC-body structural proof by its `proof` tag.
+function auditProvenFunction(clean, masked, proof, fnName) {
+  if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
+  if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
+  return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 
 // ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------
@@ -808,7 +932,7 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
   const matrix = [];
   for (const entry of SCHEDULER_V2_SCHEMA_CONTRACT) {
     const raw = safeRead(entry.migration);
-    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], triggers: [], guardFunctions: [], wrappers: [], namedConstraints: [] };
+    const row = { migration: entry.migration, present: raw != null, note: entry.note || null, tables: [], rpcs: [], triggers: [], guardFunctions: [], provenFunctions: [], wrappers: [], namedConstraints: [] };
     if (raw == null) {
       blockers.push({ code: "MIGRATION_MISSING", migration: entry.migration, message: `migration ${entry.migration} not found` });
       matrix.push(row);
@@ -838,13 +962,34 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       // Least-privilege service_role ACL (proven only when declared as a contract requirement for this table).
       const aclProblems = t.serviceRoleAcl ? auditServiceRoleAcl(masked, t.name, t.serviceRoleAcl) : [];
       for (const p of aclProblems) blockers.push({ code: p.code, migration: entry.migration, table: t.name, message: `table public.${t.name} service_role ACL: ${p.reason}` });
-      // Required index(es) / RLS enablement / generic trigger(s) (Finding 3). Each proven only when declared.
-      const missingIndexes = (t.requiredIndexes || []).filter((ix) => !indexPresent(masked, t.name, ix));
-      for (const ix of missingIndexes) blockers.push({ code: "INDEX_MISSING", migration: entry.migration, table: t.name, index: ix, message: `table public.${t.name} is missing required index ${ix}` });
+      // Required index(es): proven by NAME and (when declared) EXACT columns/order (gap 4a).
+      for (const ixSpec of (t.requiredIndexes || [])) {
+        const spec = typeof ixSpec === "string" ? { name: ixSpec, columns: null } : ixSpec;
+        const cols = indexColumns(masked, t.name, spec.name);
+        if (cols == null) {
+          if (!indexPresent(masked, t.name, spec.name)) blockers.push({ code: "INDEX_MISSING", migration: entry.migration, table: t.name, index: spec.name, message: `table public.${t.name} is missing required index ${spec.name}` });
+          else blockers.push({ code: "INDEX_COLUMNS_MISMATCH", migration: entry.migration, table: t.name, index: spec.name, message: `index ${spec.name} on public.${t.name} has an unreadable column list` });
+          continue;
+        }
+        if (spec.columns && !arraysEqual(cols, spec.columns.map((c) => c.toLowerCase()))) {
+          blockers.push({ code: "INDEX_COLUMNS_MISMATCH", migration: entry.migration, table: t.name, index: spec.name, expected: spec.columns, message: `index ${spec.name} on public.${t.name} columns are [${cols.join(", ")}] (expected exactly [${spec.columns.join(", ")}])` });
+        }
+      }
       const rlsOk = t.rlsEnabled ? rlsEnabledFor(masked, t.name) : true;
       if (t.rlsEnabled && !rlsOk) blockers.push({ code: "RLS_NOT_ENABLED", migration: entry.migration, table: t.name, message: `table public.${t.name} does not ENABLE ROW LEVEL SECURITY` });
-      const missingTriggers = (t.requiredTriggers || []).filter((tg) => !triggerPresentFor(masked, t.name, tg));
-      for (const tg of missingTriggers) blockers.push({ code: "TABLE_TRIGGER_MISSING", migration: entry.migration, table: t.name, trigger: tg, message: `table public.${t.name} is missing required trigger ${tg}` });
+      // Required trigger(s): proven STRUCTURALLY when a spec object declares timing/events/level/function (gap
+      // 4b), else name-presence only. An absent name is MISSING; a present-but-malformed trigger is INVALID.
+      for (const tgSpec of (t.requiredTriggers || [])) {
+        const spec = typeof tgSpec === "string" ? { name: tgSpec } : tgSpec;
+        if (!triggerPresentFor(masked, t.name, spec.name)) {
+          blockers.push({ code: "TABLE_TRIGGER_MISSING", migration: entry.migration, table: t.name, trigger: spec.name, message: `table public.${t.name} is missing required trigger ${spec.name}` });
+          continue;
+        }
+        if (spec.timing || spec.events || spec.level || spec.function) {
+          const v = genericTriggerValid(masked, t.name, spec);
+          if (!v.valid) blockers.push({ code: "TABLE_TRIGGER_INVALID", migration: entry.migration, table: t.name, trigger: spec.name, message: `trigger ${spec.name} on public.${t.name} is not the required trigger (${v.reason})` });
+        }
+      }
       row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper, serviceRoleAcl: t.serviceRoleAcl ? { ok: aclProblems.length === 0, problems: aclProblems.map((p) => p.code) } : null });
     }
     for (const r of entry.rpcs) {
@@ -868,6 +1013,15 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       const problems = auditGuardFunction(clean, masked, fn);
       for (const p of problems) blockers.push({ code: p.code, migration: entry.migration, target: fn, message: `guard function public.${fn}: ${p.reason}` });
       row.guardFunctions.push({ name: fn, ok: problems.length === 0, problems: problems.map((p) => p.code) });
+    }
+    // STRUCTURAL RPC-body proofs (gap 4c/4d): each declared function's critical behavior is proven token-aware
+    // in `masked` (structure) + `clean` (string literals). A removed lock / expiry / identity check / DB-owned
+    // value / CAS predicate (adopt) or a removed advisory lock / widened cap / removed scope rejection (assign)
+    // each surfaces a typed blocker.
+    for (const pf of entry.provenFunctions || []) {
+      const problems = auditProvenFunction(clean, masked, pf.proof, pf.name);
+      for (const p of problems) blockers.push({ code: p.code, migration: entry.migration, target: pf.name, message: `function public.${pf.name}: ${p.reason}` });
+      row.provenFunctions.push({ name: pf.name, proof: pf.proof, ok: problems.length === 0, problems: problems.map((p) => p.code) });
     }
     for (const w of entry.wrappers) {
       const exported = wrapperExported(wrapperCode, w);

@@ -92,6 +92,67 @@ test("wrapper-missing. a removed adoptSourceExportCache wrapper => REQUIRED_WRAP
   assert.ok(!a.ok && hasBlocker(a, "REQUIRED_WRAPPER_MISSING"), "REQUIRED_WRAPPER_MISSING");
 });
 
+/* --- senior review gap 4/5: STRUCTURAL index / trigger / RPC-body proofs each fail closed when weakened --- */
+
+// Every mutation below WEAKENS a structural invariant the runtime preflight relies on; each must surface its
+// OWN typed blocker (the preflight re-emits these as SCHEMA_<code> and refuses to turn on). The baseline test
+// above already proves the REAL files carry ALL of these intact.
+
+test("index-columns. a WRONG-column/order required index => INDEX_COLUMNS_MISMATCH (gap 4a)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("(batch_family, batch_index)", "(batch_index, batch_family)") });
+  assert.ok(!a.ok && hasBlocker(a, "INDEX_COLUMNS_MISMATCH"), "INDEX_COLUMNS_MISMATCH");
+});
+
+test("trigger-after. an AFTER (not BEFORE) touch trigger => TABLE_TRIGGER_INVALID (gap 4b)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("source_batch_membership_touch before update", "source_batch_membership_touch after update") });
+  assert.ok(!a.ok && hasBlocker(a, "TABLE_TRIGGER_INVALID"), "TABLE_TRIGGER_INVALID (AFTER)");
+});
+
+test("trigger-delete. a DELETE (not UPDATE) touch trigger => TABLE_TRIGGER_INVALID (gap 4b)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("before update on public.source_batch_membership", "before delete on public.source_batch_membership") });
+  assert.ok(!a.ok && hasBlocker(a, "TABLE_TRIGGER_INVALID"), "TABLE_TRIGGER_INVALID (DELETE)");
+});
+
+test("trigger-statement. a FOR EACH STATEMENT (not ROW) touch trigger => TABLE_TRIGGER_INVALID (gap 4b)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("for each row execute function public.touch_updated_at", "for each statement execute function public.touch_updated_at") });
+  assert.ok(!a.ok && hasBlocker(a, "TABLE_TRIGGER_INVALID"), "TABLE_TRIGGER_INVALID (STATEMENT)");
+});
+
+test("trigger-wrong-fn. a touch trigger executing the WRONG function => TABLE_TRIGGER_INVALID (gap 4b)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("execute function public.touch_updated_at()", "execute function public.not_touch_updated_at()") });
+  assert.ok(!a.ok && hasBlocker(a, "TABLE_TRIGGER_INVALID"), "TABLE_TRIGGER_INVALID (wrong function)");
+});
+
+test("adopt-no-lock. a removed FOR UPDATE cache-row lock => ADOPT_CACHE_ROW_LOCK_MISSING (gap 4c)", () => {
+  const a = auditWith({ [REUSE]: (t) => t.replace("for update;", ";") });
+  assert.ok(!a.ok && hasBlocker(a, "ADOPT_CACHE_ROW_LOCK_MISSING"), "ADOPT_CACHE_ROW_LOCK_MISSING");
+});
+
+test("adopt-no-expiry. a removed expiry gate => ADOPT_CACHE_EXPIRY_GATE_MISSING (gap 4c)", () => {
+  const a = auditWith({ [REUSE]: (t) => t.replace("v_cache.expires_at <= now()", "false") });
+  assert.ok(!a.ok && hasBlocker(a, "ADOPT_CACHE_EXPIRY_GATE_MISSING"), "ADOPT_CACHE_EXPIRY_GATE_MISSING");
+});
+
+test("adopt-no-identity. a removed identity/integrity comparison => ADOPT_CACHE_IDENTITY_CHECK_MISSING (gap 4c)", () => {
+  const a = auditWith({ [REUSE]: (t) => t.replace("or v_cache.row_count is distinct from p_expected_row_count", "") });
+  assert.ok(!a.ok && hasBlocker(a, "ADOPT_CACHE_IDENTITY_CHECK_MISSING"), "ADOPT_CACHE_IDENTITY_CHECK_MISSING");
+});
+
+test("assign-no-lock. a removed advisory lock => ASSIGN_BATCH_ADVISORY_LOCK_MISSING (gap 4d)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("perform pg_advisory_xact_lock(hashtext(p_batch_family));", "perform 1;") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_ADVISORY_LOCK_MISSING"), "ASSIGN_BATCH_ADVISORY_LOCK_MISSING");
+});
+
+test("assign-cap-6. a maximum widened to 6 => ASSIGN_BATCH_MAX_CAP_MISSING (gap 4d)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("least(greatest(coalesce(p_max, 5), 1), 5)", "least(greatest(coalesce(p_max, 5), 1), 6)") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_MAX_CAP_MISSING"), "ASSIGN_BATCH_MAX_CAP_MISSING");
+});
+
+test("assign-no-scope-reject. a removed existing connection/organization scope rejection => ASSIGN_BATCH_SCOPE_MATCH_MISSING (gap 4d)", () => {
+  const a = auditWith({ [BATCH]: (t) => t.replace("if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then", "if false then") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_SCOPE_MATCH_MISSING"), "ASSIGN_BATCH_SCOPE_MATCH_MISSING");
+});
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

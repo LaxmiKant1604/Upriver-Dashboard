@@ -17,7 +17,7 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 // role-credential-shaped literal exists in the bytes; the code reads the assembled name unchanged.
 const SRK_ENV = frag("SUPABASE", "_SERVICE", "_ROLE", "_KEY");
 process.env[SRK_ENV] = process.env[SRK_ENV] || dash("test", "svc", "role", "key");
-let runSourceJobs, plannedSourceJob, makeDataDoeAdapter, reportSourceRequestHashes, organizationFingerprint, validateSourcePayload;
+let runSourceJobs, plannedSourceJob, plannedBatchSourceJobs, makeDataDoeAdapter, reportSourceRequestHashes, organizationFingerprint, validateSourcePayload, accountScopeHash;
 
 let passed = 0;
 const tests = [];
@@ -351,7 +351,12 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
     "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }],
   };
   const resolved = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "K", ids: ["A1", "A2"], windowsByRequestKey: win });
-  const planned = resolved.map((r) => plannedSourceJob("brand-sales", r, "us", "primary"));
+  // A multi-account chunk now goes through the SANCTIONED batch path (senior review gaps 1-3): plannedSourceJob
+  // fails closed for a >1-id source without an individual rawSellerId, so a batch is built via
+  // plannedBatchSourceJobs -- one canonical job per source, one owner membership per account (each carrying its
+  // individual rawSellerId scope). The fetch/dedup behavior proven here is unchanged.
+  const batchOf = (r) => plannedBatchSourceJobs("brand-sales", r, "us", "primary", r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })));
+  const planned = resolved.flatMap(batchOf);
   const oli = resolved.find((r) => r.requestKey === "brand-sales:order-lines");
   const seen = [];
   const dd = {
@@ -361,7 +366,8 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
     download: async () => [{ ok: 1 }],
   };
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: planned }));
-  assert.equal(res.succeeded, planned.length);
+  // Deduped by request_hash: the two distinct canonical sources (order-lines + catalog) each succeed once.
+  assert.equal(res.succeeded, new Set(planned.map((j) => j.requestHash)).size);
   const j = seen.find((x) => x.requestHash === oli.requestHash);
   assert.ok(j);
   assert.equal(j.requestKey, "brand-sales:order-lines");
@@ -380,12 +386,15 @@ test("five-ID chunks remain separate jobs, each created once; primary/dd-seconda
     "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }],
     "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }],
   };
+  // Each five-ID chunk is planned through the sanctioned batch path (senior review gaps 1-3): its accounts are
+  // the chunk's own seller ids, so one canonical job per chunk carries one owner membership per account.
+  const batchOf = (conn) => (r) => plannedBatchSourceJobs("brand-sales", r, "us", conn, r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })));
   const primary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: PRIMARY_API_KEY, ids, windowsByRequestKey: win })
-    .map((r) => plannedSourceJob("brand-sales", r, "us", "primary"));
+    .flatMap(batchOf("primary"));
   const secondary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: SECONDARY_API_KEY, ids: ["A1"], windowsByRequestKey: win })
-    .map((r) => plannedSourceJob("brand-sales", r, "us", "dd-secondary"));
+    .flatMap(batchOf("dd-secondary"));
   const oli = primary.filter((j) => j.requestKey === "brand-sales:order-lines");
-  assert.equal(oli.length, 2);
+  assert.equal(new Set(oli.map((j) => j.requestHash)).size, 2); // two OLI chunks => two distinct canonical hashes
   const pHashes = new Set(primary.map((j) => j.requestHash));
   for (const j of secondary) assert.ok(!pHashes.has(j.requestHash));
   const dd = makeDataDoe(() => ({ rows: [{ a: 1 }] }));
@@ -404,6 +413,27 @@ test("plannedSourceJob requires an explicit primary/dd-secondary connection id",
   assert.throws(() => plannedSourceJob("brand-sales", resolved, "us", "tertiary"), /explicit connectionId/);
   assert.throws(() => plannedSourceJob("brand-sales", { ...resolved, organizationFingerprint: "" }, "us", "primary"), /organizationFingerprint/);
   assert.doesNotThrow(() => plannedSourceJob("brand-sales", resolved, "us", "dd-secondary"));
+});
+
+test("plannedSourceJob owner scope: single-account fallback OK; multi-id batched source needs an authoritative rawSellerId (senior review gap 3)", async () => {
+  const resolved = reportSourceRequestHashes({
+    reportKey: "brand-sales", apiKey: "K", ids: ["A1"],
+    windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] },
+  })[0];
+  // A single-account resolved (exactly one seller id): the canonical scope IS the individual scope, so the
+  // legacy fallback (no rawSellerId) is permitted and the owner scope equals the resolved account scope.
+  assert.equal(resolved.sellerOrVendorIds.length, 1, "brand-sales resolves a single account");
+  const single = plannedSourceJob("brand-sales", resolved, "us", "primary", "A1");
+  assert.equal(single.owner.accountScopeHash, resolved.accountScopeHash, "single-account owner scope == canonical scope (fallback)");
+  // A BATCHED resolved (>1 seller id) with NO authoritative rawSellerId FAILS CLOSED -- it must never collapse
+  // every batch member onto the shared batch scope. (The batch scope is the scope over BOTH ids.)
+  const batched = { ...resolved, sellerOrVendorIds: ["A1", "A2"], accountScopeHash: accountScopeHash(["A1", "A2"]) };
+  assert.throws(() => plannedSourceJob("brand-sales", batched, "us", "primary", "A1"), /authoritative individual rawSellerId/);
+  // Supplying the authoritative individual rawSellerId is accepted and hashes internally (never a caller hash).
+  const owned = plannedSourceJob("brand-sales", batched, "us", "primary", "A1", "A1");
+  assert.equal(owned.owner.accountScopeHash, accountScopeHash(["A1"]), "owner scope == accountScopeHash([rawSellerId])");
+  assert.notEqual(owned.owner.accountScopeHash, batched.accountScopeHash, "the individual owner scope is NOT the batch scope");
+  assert.throws(() => plannedSourceJob("brand-sales", batched, "us", "primary", "A1", "   "), /nonblank individual seller id/);
 });
 
 test("makeDataDoeAdapter refuses missing/unknown/mismatched routing and a missing secondary key (zero DataDoe calls)", async () => {
@@ -514,9 +544,9 @@ async function main() {
   };
 
   ({ runSourceJobs } = await step("source-worker.js", "../lib/server/sync/source-worker.js"));
-  ({ plannedSourceJob, makeDataDoeAdapter } = await step("source-sync-driver.js", "../lib/server/sync/source-sync-driver.js"));
+  ({ plannedSourceJob, plannedBatchSourceJobs, makeDataDoeAdapter } = await step("source-sync-driver.js", "../lib/server/sync/source-sync-driver.js"));
   ({ reportSourceRequestHashes } = await step("report-source-contracts.js", "../lib/server/sync/report-source-contracts.js"));
-  ({ organizationFingerprint } = await step("source-identity.js", "../lib/server/source-identity.js"));
+  ({ organizationFingerprint, accountScopeHash } = await step("source-identity.js", "../lib/server/source-identity.js"));
   ({ validateSourcePayload } = await step("source-cache.js", "../lib/server/sync/source-cache.js"));
   const total = tests.filter((t) => !t.marker).length;
   mark("all imports resolved; running " + total + " tests");
