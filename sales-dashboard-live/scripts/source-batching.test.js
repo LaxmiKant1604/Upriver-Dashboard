@@ -116,6 +116,53 @@ test("seller-ids. batchSellerIds is sorted + deduped and yields ONE shared reque
   assert.equal(h, direct, "the batch presents exactly the canonical request_hash over its sorted seller ids");
 });
 
+// In-memory model of assign_source_account_batch (the durable RPC): stable index, transactional <=5 cap, and
+// the Finding-5 existing-scope match. The real cap is enforced by pg_advisory_xact_lock + this same logic; the
+// real WRITE path is exclusively this RPC (service_role has SELECT-only on the table -- Finding 4).
+function makeDurableAssigner(max = 5) {
+  const rows = [];
+  return {
+    rows,
+    assign(family, accountId, connectionId, orgFp) {
+      const existing = rows.find((r) => r.batch_family === family && r.account_id === accountId);
+      if (existing) {
+        if (existing.connection_id !== connectionId || existing.organization_fingerprint !== orgFp) {
+          throw new Error(`existing membership for account ${accountId} in family ${family} has a different connection/organization scope; refusing (no mutation)`);
+        }
+        return existing.batch_index;
+      }
+      const counts = new Map();
+      for (const r of rows.filter((r) => r.batch_family === family)) counts.set(r.batch_index, (counts.get(r.batch_index) || 0) + 1);
+      let idx = null;
+      for (const [i, c] of [...counts.entries()].sort((a, b) => a[0] - b[0])) if (c < max) { idx = i; break; }
+      if (idx === null) idx = counts.size === 0 ? 0 : Math.max(...counts.keys()) + 1;
+      rows.push({ batch_family: family, account_id: accountId, batch_index: idx, connection_id: connectionId, organization_fingerprint: orgFp });
+      return idx;
+    },
+  };
+}
+
+test("assign-scope. an existing membership with a DIFFERENT connection/organization raises a typed error WITHOUT mutation (Finding 5)", () => {
+  const a = makeDurableAssigner();
+  assert.equal(a.assign("fam", "acct-1", "primary", "org-a"), 0, "first assignment");
+  assert.equal(a.rows.length, 1);
+  assert.throws(() => a.assign("fam", "acct-1", "dd-secondary", "org-a"), /different connection\/organization scope/, "different connection => raise");
+  assert.throws(() => a.assign("fam", "acct-1", "primary", "org-b"), /different connection\/organization scope/, "different organization => raise");
+  assert.equal(a.rows.length, 1, "no mutation occurred on a scope mismatch");
+  assert.equal(a.assign("fam", "acct-1", "primary", "org-a"), 0, "the exact-scope re-assignment still returns the stable index");
+});
+
+test("assign-cap. the assignment RPC enforces the <=5 cap transactionally and is stable on re-assign (Finding 4 behavioral model)", () => {
+  const a = makeDurableAssigner();
+  const ids = Array.from({ length: 6 }, (_, i) => a.assign("fam", `acct-${i + 1}`, "primary", "org-a"));
+  assert.deepEqual(ids, [0, 0, 0, 0, 0, 1], "fill-first: five in batch 0, the sixth opens batch 1 (no batch > 5)");
+  const counts = new Map();
+  for (const r of a.rows) counts.set(r.batch_index, (counts.get(r.batch_index) || 0) + 1);
+  assert.ok([...counts.values()].every((c) => c <= 5), "no batch exceeds five");
+  assert.equal(a.assign("fam", "acct-1", "primary", "org-a"), 0, "re-assigning an existing account is stable (returns its index, no new row)");
+  assert.equal(a.rows.length, 6, "no duplicate row created on re-assign");
+});
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

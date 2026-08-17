@@ -13,13 +13,20 @@
 -- or fresh batch) and must NOT reshuffle any existing account (which would
 -- invalidate every existing request_hash and cached export). Durable membership is
 -- that stable assignment; the five-account maximum is enforced transactionally.
+--
+-- LEAST PRIVILEGE (senior review Finding 4): service_role may only SELECT this
+-- table. ALL writes go through assign_source_account_batch (SECURITY DEFINER, owned
+-- by the migration role which owns the table), which is the ONLY path that can
+-- INSERT — so a direct service-role INSERT/UPDATE/DELETE cannot bypass the <=5 cap
+-- or the stable-assignment / scope-match rules (it is denied by table privileges).
 
 create table if not exists public.source_batch_membership (
   batch_family text not null,                 -- stable compatibility key (lib/server/sync/source-batching.batchFamilyKey)
   account_id text not null,                    -- SAFE public account id (individual account); never a raw secret
-  batch_index integer not null check (batch_index >= 0),
+  batch_index integer not null
+    constraint source_batch_membership_batch_index_nonneg check (batch_index >= 0),
   connection_id text not null default 'primary'
-    check (connection_id in ('primary', 'dd-secondary')),
+    constraint source_batch_membership_connection_id_check check (connection_id in ('primary', 'dd-secondary')),
   organization_fingerprint text not null,      -- non-reversible org fingerprint (never the api key)
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -35,11 +42,13 @@ create trigger source_batch_membership_touch before update on public.source_batc
 -- ---------------------------------------------------------------------------
 -- assign_source_account_batch — STABLE, transactional <=5 assignment. Returns the
 -- (existing or newly assigned) batch_index for (family, account). An account that
--- already has a membership returns its EXISTING index unchanged (never reshuffled).
--- A new account is placed into the SMALLEST-index batch with < p_max members, or a
--- fresh batch when all are full. pg_advisory_xact_lock(hashtext(family)) serialises
--- assignments within a family so two concurrent inserts can never push a batch past
--- the maximum. p_max is hard-capped to 1..5 so no caller can widen the batch size.
+-- already has a membership returns its EXISTING index unchanged (never reshuffled)
+-- BUT ONLY when its stored connection_id + organization_fingerprint EXACTLY match
+-- the supplied canonical scope (Finding 5) — otherwise it raises a typed safe error
+-- with NO mutation. A new account is placed into the SMALLEST-index batch with
+-- < p_max members, or a fresh batch when all are full. pg_advisory_xact_lock(
+-- hashtext(family)) serialises assignments within a family so two concurrent
+-- inserts can never push a batch past the maximum. p_max is hard-capped to 1..5.
 -- ---------------------------------------------------------------------------
 create or replace function public.assign_source_account_batch(
   p_batch_family text,
@@ -55,6 +64,8 @@ set search_path = public
 as $$
 declare
   v_index integer;
+  v_conn text;
+  v_org text;
   v_max integer := least(greatest(coalesce(p_max, 5), 1), 5);
 begin
   if coalesce(btrim(p_batch_family), '') = '' or coalesce(btrim(p_account_id), '') = '' then
@@ -69,10 +80,17 @@ begin
 
   perform pg_advisory_xact_lock(hashtext(p_batch_family));
 
-  select batch_index into v_index
+  select batch_index, connection_id, organization_fingerprint
+    into v_index, v_conn, v_org
     from public.source_batch_membership
    where batch_family = p_batch_family and account_id = p_account_id;
   if found then
+    -- Finding 5: an existing membership is reused ONLY when its stored scope exactly matches the supplied
+    -- canonical connection/organization. A mismatch is an identity error, not a silent re-home: raise a
+    -- typed safe error (SAFE public ids only) WITHOUT mutating anything.
+    if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then
+      raise exception 'assign_source_account_batch: existing membership for account % in family % has a different connection/organization scope; refusing (no mutation)', p_account_id, p_batch_family;
+    end if;
     return v_index;
   end if;
 
@@ -107,7 +125,10 @@ drop policy if exists "admins read source batch membership" on public.source_bat
 create policy "admins read source batch membership" on public.source_batch_membership
   for select to authenticated using (public.is_dashboard_admin());
 
-revoke all on table public.source_batch_membership from public, anon, authenticated;
+-- Least-privilege ACL (Finding 4): strip the Supabase default-privilege ALL grant, then grant SELECT ONLY
+-- to service_role. Every write must go through assign_source_account_batch (SECURITY DEFINER), so no direct
+-- service-role INSERT/UPDATE/DELETE can bypass the <=5 cap / stable assignment / scope-match rules.
+revoke all on table public.source_batch_membership from public, anon, authenticated, service_role;
+grant select on table public.source_batch_membership to service_role;
 revoke all on function public.assign_source_account_batch(text, text, text, text, integer) from public, anon, authenticated;
-grant all on table public.source_batch_membership to service_role;
 grant execute on function public.assign_source_account_batch(text, text, text, text, integer) to service_role;

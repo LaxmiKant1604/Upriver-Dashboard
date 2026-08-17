@@ -133,13 +133,24 @@ function makeStore() {
     // Models claim_source_export_attempt WITH the Blocker-2 `fetch_status='pending'` guard (mutually
     // exclusive with adoptSourceCache): only a still-pending, unattempted row can be claimed.
     claimExportAttempt(id, h) { const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h); if (j && j.fetch_status === "pending" && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; } return false; },
-    // Models adopt_source_export_cache (Blocker 2): the ATOMIC CAS. Adopts a durable cache entry ONLY while
-    // the row is pending/unattempted/create_export_count=0, leaving create_export_count=0 and attempted_at
-    // null and export_id null (constraint-legal). Returns the typed 'adopted' | 'not-adopted' acknowledgement.
-    adoptSourceCache({ cycleId, requestHash, rowCount, payloadBytes, cacheObjectPath }) {
+    // Models the HARDENED adopt_source_export_cache (Blocker 2 + senior review): re-reads the ACTUAL current
+    // cache entry and validates identity/integrity + expiry against the caller's EXPECTATIONS before adopting
+    // the job with the cache row's OWN values. Returns the typed 'adopted' | 'not-adopted' | 'cache-changed' |
+    // 'cache-expired'. Adoption leaves create_export_count=0, attempted_at null, export_id null (constraint-legal).
+    adoptSourceCache({ cycleId, requestHash, sourceId, organizationFingerprint, accountScopeHash, objectPath, rowCount, payloadBytes }) {
+      const e = cache.get(requestHash);
+      if (!e) return "cache-changed";
+      if (e.expires_at && new Date(e.expires_at).getTime() <= Date.now()) return "cache-expired";
+      const mismatch = e.source_id !== sourceId
+        || e.organization_fingerprint !== organizationFingerprint
+        || e.account_scope_hash !== accountScopeHash
+        || e.object_path !== objectPath
+        || e.row_count !== rowCount
+        || e.payload_bytes !== payloadBytes;
+      if (mismatch) return "cache-changed";
       const j = jobsByCycle.get(cycleId) && jobsByCycle.get(cycleId).get(requestHash);
       if (j && j.fetch_status === "pending" && j.attempted_at === null && j.create_export_count === 0) {
-        Object.assign(j, { fetch_status: "succeeded", export_id: null, row_count: rowCount, payload_bytes: payloadBytes, cache_object_path: cacheObjectPath, error_stage: null, error_code: null });
+        Object.assign(j, { fetch_status: "succeeded", export_id: null, row_count: e.row_count, payload_bytes: e.payload_bytes, cache_object_path: e.object_path, error_stage: null, error_code: null });
         return "adopted";
       }
       return "not-adopted";
@@ -373,14 +384,21 @@ test("5. expired / mismatched (source_id or scope) / malformed (non-array) / cap
   }
 });
 
+const seedExactCacheAndJob = (store, cid, oli, over = {}) => {
+  const entry = { rows: [{ x: 1 }], source_id: oli.sourceId, organization_fingerprint: oli.organizationFingerprint, account_scope_hash: oli.accountScopeHash, object_path: "p.json", row_count: 1, payload_bytes: 10, expires_at: FUTURE_TTL(), ...over };
+  store._seedCache(oli.requestHash, entry);
+  store.upsertSourceJob({ cycleId: cid, requestHash: oli.requestHash, requestKey: oli.requestKey, sourceId: oli.sourceId, sourceKey: oli.sourceKey, connectionId: oli.connectionId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash });
+  return entry;
+};
+const adoptExpect = (cid, oli, over = {}) => ({ cycleId: cid, requestHash: oli.requestHash, sourceId: oli.sourceId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash, objectPath: "p.json", rowCount: 1, payloadBytes: 10, ...over });
+
 test("cas. cache-adopt CAS vs create-claim on the SAME pending row: exactly ONE winner, zero unnecessary POSTs (Blocker 2)", async () => {
   // Adopt-first: the reuse wins; a subsequent create-claim on the now-succeeded row is refused (zero POST).
   {
     const store = makeStore();
     const cid = store.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store.claimCycle(cid);
-    const oli = oneOliJob(acct(ID));
-    store.upsertSourceJob({ cycleId: cid, requestHash: oli.requestHash, requestKey: oli.requestKey, sourceId: oli.sourceId, sourceKey: oli.sourceKey, connectionId: oli.connectionId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash });
-    assert.equal(store.adoptSourceCache({ cycleId: cid, requestHash: oli.requestHash, rowCount: 1, payloadBytes: 10, cacheObjectPath: "p.json" }), "adopted", "adopt wins on the pending row");
+    const oli = oneOliJob(acct(ID)); seedExactCacheAndJob(store, cid, oli);
+    assert.equal(store.adoptSourceCache(adoptExpect(cid, oli)), "adopted", "adopt wins on the pending row");
     assert.equal(store.claimExportAttempt(cid, oli.requestHash), false, "the create-claim on the now-succeeded row is refused (zero POST)");
     const j = store._rawJob(cid, oli.requestHash);
     assert.equal(j.fetch_status, "succeeded"); assert.equal(j.create_export_count, 0); assert.equal(j.attempted_at, null); assert.equal(j.export_id, null);
@@ -389,13 +407,68 @@ test("cas. cache-adopt CAS vs create-claim on the SAME pending row: exactly ONE 
   {
     const store = makeStore();
     const cid = store.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store.claimCycle(cid);
-    const oli = oneOliJob(acct(ID));
-    store.upsertSourceJob({ cycleId: cid, requestHash: oli.requestHash, requestKey: oli.requestKey, sourceId: oli.sourceId, sourceKey: oli.sourceKey, connectionId: oli.connectionId, organizationFingerprint: oli.organizationFingerprint, accountScopeHash: oli.accountScopeHash });
+    const oli = oneOliJob(acct(ID)); seedExactCacheAndJob(store, cid, oli);
     assert.equal(store.claimExportAttempt(cid, oli.requestHash), true, "create-claim wins on the pending row");
-    assert.equal(store.adoptSourceCache({ cycleId: cid, requestHash: oli.requestHash, rowCount: 1, payloadBytes: 10, cacheObjectPath: "p.json" }), "not-adopted", "cache-adopt on the now-attempted row is refused (no clobber)");
+    assert.equal(store.adoptSourceCache(adoptExpect(cid, oli)), "not-adopted", "cache-adopt on the now-attempted row is refused (no clobber)");
     const j = store._rawJob(cid, oli.requestHash);
     assert.equal(j.fetch_status, "attempted"); assert.equal(j.create_export_count, 1);
   }
+});
+
+test("cas-validate. adopt returns cache-changed on ANY identity/integrity mismatch and cache-expired past TTL (caller values are only expectations)", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store.claimCycle(cid);
+  const oli = oneOliJob(acct(ID)); seedExactCacheAndJob(store, cid, oli);
+  // Each mismatched EXPECTATION is rejected against the actual locked cache row (models cache-pointer replacement).
+  assert.equal(store.adoptSourceCache(adoptExpect(cid, oli, { objectPath: "REPLACED.json" })), "cache-changed", "object_path replaced => cache-changed");
+  assert.equal(store.adoptSourceCache(adoptExpect(cid, oli, { rowCount: 999 })), "cache-changed", "row_count changed => cache-changed");
+  assert.equal(store.adoptSourceCache(adoptExpect(cid, oli, { payloadBytes: 999 })), "cache-changed", "payload_bytes changed => cache-changed");
+  assert.equal(store.adoptSourceCache(adoptExpect(cid, oli, { sourceId: "OTHER" })), "cache-changed", "source_id changed => cache-changed");
+  assert.equal(store.adoptSourceCache(adoptExpect(cid, oli, { accountScopeHash: "OTHER" })), "cache-changed", "account scope changed => cache-changed");
+  assert.equal(store._rawJob(cid, oli.requestHash).fetch_status, "pending", "no mismatch ever mutated the job");
+  // Expired cache row.
+  const store2 = makeStore();
+  const cid2 = store2.openCycle({ bucket: "us", cycleDate: CYCLE_DATE }); store2.claimCycle(cid2);
+  const oli2 = oneOliJob(acct(ID)); seedExactCacheAndJob(store2, cid2, oli2, { expires_at: PAST_TTL() });
+  assert.equal(store2.adoptSourceCache(adoptExpect(cid2, oli2)), "cache-expired", "expired cache row => cache-expired");
+  assert.equal(store2._rawJob(cid2, oli2.requestHash).fetch_status, "pending", "an expired row never mutates the job");
+});
+
+test("cas-failclosed. a store with cache evidence but a MISSING adopt CAS fails closed with ZERO creates (no non-CAS fallback)", async () => {
+  const base = makeStore();
+  const oli = oneOliJob(acct(ID));
+  base._seedCache(oli.requestHash, { rows: [{ x: 1 }], source_id: oli.sourceId, organization_fingerprint: oli.organizationFingerprint, account_scope_hash: oli.accountScopeHash, object_path: "p.json", row_count: 1, payload_bytes: 10, expires_at: FUTURE_TTL() });
+  const noCas = { ...base, adoptSourceCache: undefined }; // durable cache present, but the atomic CAS is unavailable
+  const dd = makeDataDoe();
+  const r = await runSourceJobs({ store: noCas, dataDoe: dd, plannedJobs: [oli], ownerIds: [oli.owner.ownerId], bucket: "us", cycleDate: CYCLE_DATE });
+  assert.equal(dd.totalCreates(), 0, "ZERO create POSTs (never fabricate, never fall back to a non-CAS record-success)");
+  const outcome = r.outcomes.find((o) => o.requestHash === oli.requestHash);
+  assert.equal(outcome.code, "ADOPT_CAS_UNAVAILABLE", "fails closed with a typed ADOPT_CAS_UNAVAILABLE");
+});
+
+test("cas-malformed. a MALFORMED adopt acknowledgement fails closed with ZERO creates", async () => {
+  const base = makeStore();
+  const oli = oneOliJob(acct(ID));
+  base._seedCache(oli.requestHash, { rows: [{ x: 1 }], source_id: oli.sourceId, organization_fingerprint: oli.organizationFingerprint, account_scope_hash: oli.accountScopeHash, object_path: "p.json", row_count: 1, payload_bytes: 10, expires_at: FUTURE_TTL() });
+  const badAck = { ...base, adoptSourceCache: () => "totally-unexpected-value" };
+  const dd = makeDataDoe();
+  const r = await runSourceJobs({ store: badAck, dataDoe: dd, plannedJobs: [oli], ownerIds: [oli.owner.ownerId], bucket: "us", cycleDate: CYCLE_DATE });
+  assert.equal(dd.totalCreates(), 0, "ZERO create POSTs on a malformed acknowledgement");
+  const outcome = r.outcomes.find((o) => o.requestHash === oli.requestHash);
+  assert.equal(outcome.code, "ADOPT_ACK_MALFORMED", "fails closed with a typed ADOPT_ACK_MALFORMED");
+});
+
+test("cas-changed-e2e. a cache-changed acknowledgement mid-adoption falls through to a fresh create (never fabricates)", async () => {
+  const base = makeStore();
+  const oli = oneOliJob(acct(ID));
+  base._seedCache(oli.requestHash, { rows: [{ x: 1 }], source_id: oli.sourceId, organization_fingerprint: oli.organizationFingerprint, account_scope_hash: oli.accountScopeHash, object_path: "p.json", row_count: 1, payload_bytes: 10, expires_at: FUTURE_TTL() });
+  // The cache the worker validated was replaced between its read and the CAS -> the RPC returns cache-changed.
+  const replaced = { ...base, adoptSourceCache: () => "cache-changed" };
+  const dd = makeDataDoe();
+  const r = await runSourceJobs({ store: replaced, dataDoe: dd, plannedJobs: [oli], ownerIds: [oli.owner.ownerId], bucket: "us", cycleDate: CYCLE_DATE });
+  assert.equal(dd.createCount(oli.requestHash), 1, "falls through to exactly one fresh create (the stale cache is not reused, never fabricated)");
+  const outcome = r.outcomes.find((o) => o.requestHash === oli.requestHash);
+  assert.notEqual(outcome && outcome.reused, true, "the outcome is never flagged reused");
 });
 
 test("reuseonly-miss. reuseOnly with NO durable cache creates ZERO exports, returns MISSING_REUSABLE_SOURCE, leaves the job pending (Blocker 3)", async () => {

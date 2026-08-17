@@ -763,25 +763,29 @@ export async function claimSourceExportAttempt(cycleId, requestHash) {
   });
 }
 
-// adopt_source_export_cache (Blocker 2): the ATOMIC cache-reuse compare-and-set.
-// Returns a TYPED acknowledgement — 'adopted' only for the caller that won the
-// pending->succeeded transition from a durable cache entry (zero DataDoe,
-// create_export_count stays 0, attempted_at stays NULL, no fabricated export id),
-// or 'not-adopted' when the job was already attempted/succeeded/failed/absent (the
-// caller must NOT create an export and must fall through to resume/skip). It is
-// mutually exclusive with claim_source_export_attempt on the same pending row.
-export async function adoptSourceExportCache({ cycleId, requestHash, rowCount, payloadBytes, cacheObjectPath }) {
+// adopt_source_export_cache (Blocker 2 + senior review): the ATOMIC, cache-validated
+// compare-and-set. The caller's identity/integrity fields are EXPECTATIONS; the RPC
+// re-reads and LOCKS the actual current source_export_cache row and validates it
+// before adopting the source job with the DB row's OWN values. Returns a TYPED
+// acknowledgement string — 'adopted' | 'not-adopted' | 'cache-changed' | 'cache-expired'
+// — or null if the response is not a string (the worker treats a null/unknown value
+// as a malformed acknowledgement and fails closed with zero create POSTs).
+export async function adoptSourceExportCache({ cycleId, requestHash, sourceId, organizationFingerprint, accountScopeHash, objectPath, rowCount, payloadBytes }) {
   const body = await request("/rest/v1/rpc/adopt_source_export_cache", {
     method: "POST",
     body: {
       p_cycle_id: cycleId,
       p_request_hash: requestHash,
-      p_row_count: rowCount,
-      p_payload_bytes: payloadBytes,
-      p_object_path: cacheObjectPath,
+      p_expected_source_id: sourceId,
+      p_expected_organization_fingerprint: organizationFingerprint,
+      p_expected_account_scope_hash: accountScopeHash,
+      p_expected_object_path: objectPath,
+      p_expected_row_count: rowCount,
+      p_expected_payload_bytes: payloadBytes,
     },
   });
-  return Array.isArray(body) ? body[0] : body;
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : null;
 }
 
 // assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the

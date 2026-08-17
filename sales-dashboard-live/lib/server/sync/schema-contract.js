@@ -182,6 +182,47 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer"],
     note: "Durable account rollout (allowlist + all-primary switch) + audited publish approvals (PREPARED, UNAPPLIED).",
   },
+  {
+    // Atomic, cache-validated reuse adoption + claim mutual-exclusion (Blocker 2 + senior review). Adds the new
+    // adopt CAS and REPLACES claim_source_export_attempt (the fetch_status='pending' guard). No new table.
+    migration: "20260817_scheduler_v2_reuse_cas.sql",
+    tables: [],
+    rpcs: [
+      // EXACT 8-param adoption CAS: the caller's identity/integrity fields are EXPECTATIONS the RPC validates
+      // against the ACTUAL locked cache row before adopting the job with the DB row's own values.
+      { name: "adopt_source_export_cache", params: ["p_cycle_id", "p_request_hash", "p_expected_source_id", "p_expected_organization_fingerprint", "p_expected_account_scope_hash", "p_expected_object_path", "p_expected_row_count", "p_expected_payload_bytes"] },
+      { name: "claim_source_export_attempt", params: ["p_cycle_id", "p_request_hash"] },
+    ],
+    wrappers: ["adoptSourceExportCache", "claimSourceExportAttempt"],
+    note: "Atomic cache-validated adoption CAS + claim mutual-exclusion (REPLACES 20260807 claim; PREPARED, UNAPPLIED).",
+  },
+  {
+    // STABLE <=5-account source batch membership (Blocker 4). One table + one transactional assignment RPC.
+    migration: "20260817_source_batch_membership.sql",
+    tables: [
+      {
+        name: "source_batch_membership",
+        unique: [["batch_family", "account_id"]],
+        namedConstraints: [
+          { name: "source_batch_membership_pk", kind: "primary key", columns: ["batch_family", "account_id"] },
+          { name: "source_batch_membership_batch_index_nonneg", kind: "check", canonical: "batch_index >= 0" },
+          { name: "source_batch_membership_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+        ],
+        // Finding 4: least-privilege ACL -- REVOKE ALL from service_role then GRANT SELECT ONLY. All writes go
+        // through assign_source_account_batch (SECURITY DEFINER), so no direct service-role write can bypass <=5.
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredIndexes: ["source_batch_membership_family_idx"],
+        rlsEnabled: true,
+        requiredTriggers: ["source_batch_membership_touch"],
+        keyColumns: ["batch_family", "account_id", "batch_index", "connection_id", "organization_fingerprint"],
+      },
+    ],
+    rpcs: [
+      { name: "assign_source_account_batch", params: ["p_batch_family", "p_account_id", "p_connection_id", "p_organization_fingerprint", "p_max"] },
+    ],
+    wrappers: ["assignSourceAccountBatch", "listSourceBatchMembership"],
+    note: "Stable <=5-account batch membership + transactional assign RPC (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -454,6 +495,19 @@ function auditServiceRoleAcl(masked, table, expected) {
   return problems;
 }
 
+// BOUNDED presence proofs on `masked` (comments AND string CONTENTS blanked, so a comment/string can never
+// satisfy them) for a table's required INDEX / RLS-enablement / generic (non append-guard) TRIGGER. Each is
+// pinned to the EXACT public.<table> object with a trailing word boundary (senior-review Finding 3).
+function indexPresent(masked, table, indexName) {
+  return new RegExp(`create\\s+index\\s+(?:if\\s+not\\s+exists\\s+)?${indexName}\\s+on\\s+public\\.${table}\\b`, "i").test(masked);
+}
+function rlsEnabledFor(masked, table) {
+  return new RegExp(`alter\\s+table\\s+public\\.${table}\\s+enable\\s+row\\s+level\\s+security`, "i").test(masked);
+}
+function triggerPresentFor(masked, table, name) {
+  return new RegExp(`create\\s+trigger\\s+${name}\\b[^;]*\\bon\\s+public\\.${table}\\b`, "i").test(masked);
+}
+
 // BOUNDED STRUCTURAL proof of an append-guard trigger (Finding 2): an EXACT
 //   `create trigger <name> before insert or update on public.<table> for each row
 //    execute function public.reject_append_to_terminal_cycle()`
@@ -709,6 +763,8 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   // Gate-7 publisher reads: the exact-identity job row (+ its cycle status), the exact-identity shadow
   // snapshot, and the trusted storage hydration for a storage-backed snapshot payload.
   "getLatestSyncReportJob", "getReportSnapshot", "getReportSnapshotStoragePayload",
+  // Blocker 2 + 4 (senior review): the atomic cache-adoption CAS and the stable <=5 batch assignment/read.
+  "adoptSourceExportCache", "assignSourceAccountBatch", "listSourceBatchMembership",
 ]);
 
 /**
@@ -782,6 +838,13 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       // Least-privilege service_role ACL (proven only when declared as a contract requirement for this table).
       const aclProblems = t.serviceRoleAcl ? auditServiceRoleAcl(masked, t.name, t.serviceRoleAcl) : [];
       for (const p of aclProblems) blockers.push({ code: p.code, migration: entry.migration, table: t.name, message: `table public.${t.name} service_role ACL: ${p.reason}` });
+      // Required index(es) / RLS enablement / generic trigger(s) (Finding 3). Each proven only when declared.
+      const missingIndexes = (t.requiredIndexes || []).filter((ix) => !indexPresent(masked, t.name, ix));
+      for (const ix of missingIndexes) blockers.push({ code: "INDEX_MISSING", migration: entry.migration, table: t.name, index: ix, message: `table public.${t.name} is missing required index ${ix}` });
+      const rlsOk = t.rlsEnabled ? rlsEnabledFor(masked, t.name) : true;
+      if (t.rlsEnabled && !rlsOk) blockers.push({ code: "RLS_NOT_ENABLED", migration: entry.migration, table: t.name, message: `table public.${t.name} does not ENABLE ROW LEVEL SECURITY` });
+      const missingTriggers = (t.requiredTriggers || []).filter((tg) => !triggerPresentFor(masked, t.name, tg));
+      for (const tg of missingTriggers) blockers.push({ code: "TABLE_TRIGGER_MISSING", migration: entry.migration, table: t.name, trigger: tg, message: `table public.${t.name} is missing required trigger ${tg}` });
       row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper, serviceRoleAcl: t.serviceRoleAcl ? { ok: aclProblems.length === 0, problems: aclProblems.map((p) => p.code) } : null });
     }
     for (const r of entry.rpcs) {

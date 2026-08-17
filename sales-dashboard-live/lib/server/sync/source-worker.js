@@ -158,31 +158,42 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
         && !(job.strict === true && cachedRows.length >= Number(job.limit));
       if (confirmed) {
         const payloadBytes = typeof cachedBytes === "number" ? cachedBytes : approxPayloadBytes(cachedRows);
-        // Blocker 2: ATOMIC compare-and-set adoption. adopt_source_export_cache flips the job
-        // pending -> succeeded ONLY while it is still pending/unattempted/create_export_count=0, and is
-        // mutually exclusive with claim_source_export_attempt (both require fetch_status='pending'). So a
+        // Finding 2: durable cache evidence exists, so the ATOMIC CAS is MANDATORY -- there is NO non-CAS
+        // fallback. A store missing a well-formed adoptSourceCache must FAIL CLOSED (never fabricate success,
+        // never create). Production preflight requires the wrapper + RPC, so this only guards a misconfigured
+        // or injected store.
+        if (typeof store.adoptSourceCache !== "function") {
+          return fail("create-export", "ADOPT_CAS_UNAVAILABLE", "Durable cache evidence exists but the atomic adopt CAS is unavailable; refusing to create or fabricate (fail closed).", false);
+        }
+        // Blocker 2 + senior review: the caller's values are EXPECTATIONS. adopt_source_export_cache
+        // re-reads + LOCKS the ACTUAL current cache row, validates full identity + integrity + expiry, and
+        // adopts the job with the DB row's OWN values ONLY while still pending/unattempted/count=0. It is
+        // mutually exclusive with claim_source_export_attempt (both require fetch_status='pending'), so a
         // concurrent create-claim and this reuse have exactly ONE winner and ZERO fabricated export ids.
-        if (typeof store.adoptSourceCache === "function") {
-          const ack = await store.adoptSourceCache({
-            cycleId, requestHash, rowCount: cachedRowCount, payloadBytes, cacheObjectPath: cachedPath,
-          });
-          if (ack === "adopted") {
-            progress.succeeded += 1;
-            return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
-          }
-          // 'not-adopted': the row was concurrently advanced (claimed/succeeded/failed). Do NOT record
-          // anything over the winner; a fresh invocation re-reads the true status and resumes/skips.
+        const ack = await store.adoptSourceCache({
+          cycleId, requestHash,
+          sourceId: job.sourceId, organizationFingerprint: job.organizationFingerprint, accountScopeHash: job.accountScopeHash,
+          objectPath: cachedPath, rowCount: cachedRowCount, payloadBytes,
+        });
+        if (ack === "adopted") {
+          progress.succeeded += 1;
+          return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
+        }
+        if (ack === "not-adopted") {
+          // The cache matched but the job row was concurrently advanced (claimed/succeeded/failed). Do NOT
+          // record anything over the winner; a fresh invocation re-reads the true status and resumes/skips.
           progress.skipped += 1;
           return { requestKey, requestHash, status: "skipped", validated: false, reason: "adopt-not-won" };
         }
-        // Back-compat: a store without the atomic CAS (older injected test/canary store) keeps the prior
-        // record-success reuse. ZERO DataDoe calls, no fabricated export id (create_export_count stays 0).
-        await store.recordSourceSuccess({
-          cycleId, requestHash, exportId: null, rowCount: cachedRowCount,
-          payloadBytes, durationMs: clock() - started, cacheObjectPath: cachedPath,
-        });
-        progress.succeeded += 1;
-        return { requestKey, requestHash, status: "success", validated: true, rowCount: cachedRowCount, rows: cachedRows, reused: true };
+        if (ack === "cache-changed" || ack === "cache-expired") {
+          // The exact cache we validated is no longer current (replaced/pruned/expired between our read and
+          // the CAS). It is NOT reusable now: fall through to the normal path (reuseOnly -> MISSING_REUSABLE_
+          // SOURCE; else claim -> create). Nothing is recorded here.
+        } else {
+          // A MALFORMED acknowledgement (not one of the four typed values). Fail closed: never create, never
+          // claim success.
+          return fail("create-export", "ADOPT_ACK_MALFORMED", "The atomic adopt CAS returned a malformed acknowledgement; refusing to create or fabricate (fail closed).", false);
+        }
       }
     }
     // Blocker 3: reuseOnly REHEARSAL gate. No durable exact cache entry was adopted above, and a pending
