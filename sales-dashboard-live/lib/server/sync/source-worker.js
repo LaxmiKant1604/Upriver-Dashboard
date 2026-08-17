@@ -101,7 +101,7 @@ function mergeJob(meta, jobRow) {
  * derivation. Never throws for an expected source failure — it records a safe failure and
  * returns a non-success outcome so the cycle continues.
  */
-async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false }) {
+async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false, budget = null }) {
   const requestHash = job.requestHash;
   const requestKey = job.requestKey || "";
   const started = clock();
@@ -205,7 +205,29 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
       progress.missingReusable += 1;
       return { requestKey, requestHash, status: "missing-reusable-source", validated: false, code: "MISSING_REUSABLE_SOURCE" };
     }
-    const won = await store.claimExportAttempt(cycleId, requestHash);
+    // Blocker 4d: when a FROZEN tranche budget is active, the create-claim goes through the ATOMIC pre-POST
+    // reservation (reserve_source_export_create) instead of the plain claim -- it claims the still-pending job
+    // AND reserves the create + AI-token cost in one transaction, so only the reservation winner may POST and
+    // neither ceiling can be exceeded (even by concurrent workers). Cache adoption, a saved-export_id resume,
+    // and reuseOnly all return BEFORE this point, so they spend ZERO creates/tokens. A drifted plan or an
+    // exhausted ceiling ABORTS before the POST with a typed safe outcome and no retry/fallback.
+    let won;
+    if (budget && typeof store.reserveExportCreate === "function") {
+      const ack = await store.reserveExportCreate({ cycleId, trancheKey: budget.trancheKey, requestHash, planFingerprint: budget.planFingerprint });
+      if (ack === "reserved") {
+        won = true;
+      } else if (ack === "not-pending") {
+        won = false;
+      } else if (ack === "plan-mismatch") {
+        return fail("reserve", "PLAN_BUDGET_MISMATCH", "This source is not in the frozen tranche plan (plan/pricing drift); refusing to create (fail closed).", true);
+      } else if (ack === "budget-exceeded") {
+        return fail("reserve", "TOKEN_BUDGET_EXCEEDED", "The frozen tranche create/token ceiling is reached; refusing to create (fail closed).", true);
+      } else {
+        return fail("reserve", "RESERVE_ACK_MALFORMED", "The pre-POST reservation returned a malformed acknowledgement; refusing to create (fail closed).", true);
+      }
+    } else {
+      won = await store.claimExportAttempt(cycleId, requestHash);
+    }
     if (!won) { progress.skipped += 1; return { requestKey, requestHash, status: "skipped", validated: false, reason: "already-attempted" }; }
     progress.attemptsWon += 1;
     try {
@@ -351,6 +373,11 @@ export async function runSourceJobs({
   // durable cache adoption (or a saved export_id resume) creates ZERO exports and returns
   // MISSING_REUSABLE_SOURCE. NEVER a per-run/untrusted argument (see runtime-composition).
   reuseOnly = false,
+  // Blocker 4d: the FROZEN tranche budget context `{ trancheKey, planFingerprint }` (persisted before this
+  // invocation). When present, every create-export goes through the atomic pre-POST reservation
+  // (store.reserveExportCreate) so the create/AI-token ceilings can never be exceeded. null => the legacy
+  // one-attempt claim (behavior unchanged). NEVER a per-run/untrusted argument.
+  budget = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -492,7 +519,7 @@ export async function runSourceJobs({
       continue;
     }
     const job = mergeJob(meta, jobRow);
-    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly });
+    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly, budget });
     if (outcome) outcomes.push(outcome);
   }
 

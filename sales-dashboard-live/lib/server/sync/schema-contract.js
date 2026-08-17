@@ -234,6 +234,56 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["assignSourceAccountBatch", "listSourceBatchMembership"],
     note: "Stable <=5-account batch membership + transactional assign RPC (PREPARED, UNAPPLIED).",
   },
+  {
+    // Blocker 4d: FROZEN per-(cycle,tranche) create-export + AI-token budget (standard=2, premium=5 tokens per
+    // unique hash) + the ATOMIC pre-POST reservation RPC. Two tables + two RPCs; additive only.
+    migration: "20260818_source_tranche_budget.sql",
+    tables: [
+      {
+        name: "source_tranche_budget",
+        unique: [["cycle_id", "tranche_key"]],
+        namedConstraints: [
+          { name: "source_tranche_budget_pk", kind: "primary key", columns: ["cycle_id", "tranche_key"] },
+          { name: "source_tranche_budget_fingerprint_nonblank", kind: "check", canonical: "char_length(btrim(plan_fingerprint)) > 0" },
+          { name: "source_tranche_budget_max_creates_nonneg", kind: "check", canonical: "max_creates >= 0" },
+          { name: "source_tranche_budget_max_tokens_nonneg", kind: "check", canonical: "max_tokens >= 0" },
+          // The DB-level ceilings the token budget relies on: spent may never exceed max (AND-joined, so an
+          // AND->OR weakening or a dropped bound fails).
+          { name: "source_tranche_budget_spent_creates_bounded", kind: "check", canonical: "spent_creates >= 0 and spent_creates <= max_creates" },
+          { name: "source_tranche_budget_spent_tokens_bounded", kind: "check", canonical: "spent_tokens >= 0 and spent_tokens <= max_tokens" },
+        ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_tranche_budget_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["cycle_id", "tranche_key", "plan_fingerprint", "max_creates", "max_tokens", "spent_creates", "spent_tokens"],
+      },
+      {
+        name: "source_tranche_budget_hash",
+        unique: [["cycle_id", "tranche_key", "request_hash"]],
+        namedConstraints: [
+          { name: "source_tranche_budget_hash_pk", kind: "primary key", columns: ["cycle_id", "tranche_key", "request_hash"] },
+          // EXACTLY the two allowed per-hash token costs (standard 2, premium 5) -- no other value can slip in.
+          { name: "source_tranche_budget_hash_cost_check", kind: "check", canonical: "token_cost in (2, 5)" },
+          { name: "source_tranche_budget_hash_budget_fk", kind: "foreign key", columns: ["cycle_id", "tranche_key"], references: { table: "source_tranche_budget", columns: ["cycle_id", "tranche_key"] } },
+        ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredIndexes: [{ name: "source_tranche_budget_hash_budget_idx", columns: ["cycle_id", "tranche_key"] }],
+        rlsEnabled: true,
+        keyColumns: ["cycle_id", "tranche_key", "request_hash", "token_cost"],
+      },
+    ],
+    rpcs: [
+      { name: "persist_source_tranche_budget", params: ["p_cycle_id", "p_tranche_key", "p_plan_fingerprint", "p_max_creates", "p_max_tokens", "p_hashes"] },
+      { name: "reserve_source_export_create", params: ["p_cycle_id", "p_tranche_key", "p_request_hash", "p_plan_fingerprint"] },
+    ],
+    // STRUCTURAL body proof: the reservation RPC must take the per-(cycle,tranche) advisory lock, lock the
+    // budget row FOR UPDATE, reject a drifted plan fingerprint + a hash outside the frozen plan, refuse to
+    // exceed EITHER ceiling, CLAIM only a still pending/unattempted job (mutual exclusion with adoption), and
+    // reserve the create + token cost. Removing any is a blocker.
+    provenFunctions: [{ name: "reserve_source_export_create", proof: "reserve-create" }],
+    wrappers: ["persistSourceTrancheBudget", "reserveSourceExportCreate", "getSourceTrancheBudget", "getSourceTrancheBudgetHashes"],
+    note: "Frozen per-(cycle,tranche) create/token budget + atomic pre-POST reservation RPC (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -712,10 +762,54 @@ function auditAssignBatchFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Prove reserve_source_export_create's CRITICAL behavior (Blocker 4d): it (1) takes the per-(cycle,tranche)
+// advisory lock; (2) LOCKS the budget row FOR UPDATE (deadlock-safe order); (3) rejects a drifted plan
+// fingerprint; (4) reads the hash's cost from the frozen plan (rejecting a hash outside it); (5) refuses to
+// exceed EITHER the create ceiling OR the token ceiling; (6) CLAIMS only a still pending/unattempted/count=0
+// source job (mutual exclusion with adoption); and (7) reserves the create + token spend. Structure from the
+// function body's masked view (string literals blanked); the 'pending' literal from clean.
+function auditReserveCreateFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "RESERVE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(/i.test(M)) {
+    problems.push({ code: "RESERVE_ADVISORY_LOCK_MISSING", reason: "does not take a per-(cycle,tranche) pg_advisory_xact_lock(hashtext(...))" });
+  }
+  if (!/from\s+public\.source_tranche_budget\b[^;]*\bwhere\s+cycle_id\s*=\s*p_cycle_id\b[^;]*\btranche_key\s*=\s*p_tranche_key\b[^;]*\bfor\s+update\b/i.test(M)) {
+    problems.push({ code: "RESERVE_BUDGET_LOCK_MISSING", reason: "does not SELECT ... FROM public.source_tranche_budget ... FOR UPDATE" });
+  }
+  if (!/v_budget\.plan_fingerprint\s+is\s+distinct\s+from\s+p_plan_fingerprint/i.test(M)) {
+    problems.push({ code: "RESERVE_PLAN_FINGERPRINT_CHECK_MISSING", reason: "does not reject a drifted plan_fingerprint" });
+  }
+  if (!/from\s+public\.source_tranche_budget_hash\b[^;]*\brequest_hash\s*=\s*p_request_hash/i.test(M)) {
+    problems.push({ code: "RESERVE_HASH_MEMBERSHIP_MISSING", reason: "does not verify the request_hash belongs to the frozen plan (source_tranche_budget_hash)" });
+  }
+  const createsCeil = /spent_creates\s*\+\s*1\s*>\s*v_budget\.max_creates/i.test(M);
+  const tokensCeil = /spent_tokens\s*\+\s*v_cost\s*>\s*v_budget\.max_tokens/i.test(M);
+  if (!createsCeil || !tokensCeil) {
+    problems.push({ code: "RESERVE_CEILING_CHECK_MISSING", reason: "does not refuse to exceed BOTH spent_creates+1<=max_creates AND spent_tokens+cost<=max_tokens" });
+  }
+  const claim = /update\s+public\.sync_source_jobs\b/i.test(M)
+    && /\bfetch_status\s*=\s*'pending'/i.test(C)
+    && /\battempted_at\s+is\s+null\b/i.test(M)
+    && /\bcreate_export_count\s*=\s*0\b/i.test(M);
+  if (!claim) {
+    problems.push({ code: "RESERVE_JOB_CLAIM_MISSING", reason: "does not CLAIM a still pending/unattempted/count=0 sync_source_jobs row (mutual exclusion with adoption)" });
+  }
+  const spend = /spent_creates\s*=\s*spent_creates\s*\+\s*1/i.test(M) && /spent_tokens\s*=\s*spent_tokens\s*\+\s*v_cost/i.test(M);
+  if (!spend) {
+    problems.push({ code: "RESERVE_SPEND_MISSING", reason: "does not reserve the create + token cost (spent_creates+1, spent_tokens+cost)" });
+  }
+  return problems;
+}
+
 // Dispatch a declared RPC-body structural proof by its `proof` tag.
 function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
+  if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 
@@ -889,6 +983,8 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "getLatestSyncReportJob", "getReportSnapshot", "getReportSnapshotStoragePayload",
   // Blocker 2 + 4 (senior review): the atomic cache-adoption CAS and the stable <=5 batch assignment/read.
   "adoptSourceExportCache", "assignSourceAccountBatch", "listSourceBatchMembership",
+  // Blocker 4d: the frozen tranche budget persist + the atomic pre-POST reservation + the budget/hash readers.
+  "persistSourceTrancheBudget", "reserveSourceExportCreate", "getSourceTrancheBudget", "getSourceTrancheBudgetHashes",
 ]);
 
 /**

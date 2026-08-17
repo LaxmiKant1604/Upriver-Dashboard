@@ -16,6 +16,7 @@ import { auditSchemaContract } from "../lib/server/sync/schema-contract.js";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REUSE = "20260817_scheduler_v2_reuse_cas.sql";
 const BATCH = "20260817_source_batch_membership.sql";
+const BUDGET = "20260818_source_tranche_budget.sql";
 const WRAP = "supabase.js";
 
 let passed = 0;
@@ -151,6 +152,53 @@ test("assign-cap-6. a maximum widened to 6 => ASSIGN_BATCH_MAX_CAP_MISSING (gap 
 test("assign-no-scope-reject. a removed existing connection/organization scope rejection => ASSIGN_BATCH_SCOPE_MATCH_MISSING (gap 4d)", () => {
   const a = auditWith({ [BATCH]: (t) => t.replace("if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then", "if false then") });
   assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_SCOPE_MATCH_MISSING"), "ASSIGN_BATCH_SCOPE_MATCH_MISSING");
+});
+
+/* --- Blocker 4d: the frozen tranche budget + atomic pre-POST reservation RPC each fail closed when weakened --- */
+
+test("reserve-no-lock. a removed budget FOR UPDATE lock => RESERVE_BUDGET_LOCK_MISSING (atomic reservation)", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.split("for update").join("") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_BUDGET_LOCK_MISSING"), "RESERVE_BUDGET_LOCK_MISSING");
+});
+
+test("reserve-no-advisory. a removed per-(cycle,tranche) advisory lock => RESERVE_ADVISORY_LOCK_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.split("perform pg_advisory_xact_lock(hashtext(p_cycle_id::text || '|' || p_tranche_key));").join("perform 1;") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_ADVISORY_LOCK_MISSING"), "RESERVE_ADVISORY_LOCK_MISSING");
+});
+
+test("reserve-no-drift-check. a removed plan-fingerprint drift check => RESERVE_PLAN_FINGERPRINT_CHECK_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("v_budget.plan_fingerprint is distinct from p_plan_fingerprint", "false") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_PLAN_FINGERPRINT_CHECK_MISSING"), "RESERVE_PLAN_FINGERPRINT_CHECK_MISSING");
+});
+
+test("reserve-no-membership. a removed request_hash membership proof => RESERVE_HASH_MEMBERSHIP_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("and request_hash = p_request_hash;", ";") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_HASH_MEMBERSHIP_MISSING"), "RESERVE_HASH_MEMBERSHIP_MISSING");
+});
+
+test("reserve-no-ceiling. a removed token-ceiling check => RESERVE_CEILING_CHECK_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("v_budget.spent_tokens + v_cost > v_budget.max_tokens", "false") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_CEILING_CHECK_MISSING"), "RESERVE_CEILING_CHECK_MISSING");
+});
+
+test("reserve-weak-claim. a widened create-count claim guard => RESERVE_JOB_CLAIM_MISSING (mutual exclusion lost)", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("and create_export_count = 0", "and create_export_count >= 0") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_JOB_CLAIM_MISSING"), "RESERVE_JOB_CLAIM_MISSING");
+});
+
+test("reserve-no-spend. a removed token reservation => RESERVE_SPEND_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("spent_tokens = spent_tokens + v_cost", "spent_tokens = spent_tokens") });
+  assert.ok(!a.ok && hasBlocker(a, "RESERVE_SPEND_MISSING"), "RESERVE_SPEND_MISSING");
+});
+
+test("budget-cost-widened. a widened per-hash token cost (2,5 -> 2,5,9) => NAMED_CONSTRAINT_MISSING", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("token_cost in (2, 5)", "token_cost in (2, 5, 9)") });
+  assert.ok(!a.ok && hasBlocker(a, "NAMED_CONSTRAINT_MISSING"), "NAMED_CONSTRAINT_MISSING");
+});
+
+test("budget-index-columns. a wrong budget-hash index column set => INDEX_COLUMNS_MISMATCH", () => {
+  const a = auditWith({ [BUDGET]: (t) => t.replace("source_tranche_budget_hash_budget_idx\n  on public.source_tranche_budget_hash (cycle_id, tranche_key)", "source_tranche_budget_hash_budget_idx\n  on public.source_tranche_budget_hash (request_hash, tranche_key)") });
+  assert.ok(!a.ok && hasBlocker(a, "INDEX_COLUMNS_MISMATCH"), "INDEX_COLUMNS_MISMATCH");
 });
 
 let failures = 0;

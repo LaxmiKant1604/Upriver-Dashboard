@@ -1,5 +1,47 @@
 # Project Memory
 
+## Scheduler v2 Blocker 4d — frozen create-export + AI-token budget with atomic pre-POST reservation (2026-08-17)
+
+Implemented Blocker 4d on `main`. Offline/unwired SHADOW MODE; the migration is PREPARED but NOT applied;
+nothing pushed/merged/deployed/enabled. Full `npm run verify` green (46 steps across 26 suites incl.
+build:check); `git diff --check` clean. STOP for Codex review before the global source-family/fixpoint
+orchestrator.
+
+Official DataDoe cost rules encoded (NEVER a blanket "exports x 2"): an ExportRequest carries <=5 seller ids;
+a STANDARD source export costs 2 AI tokens, a PREMIUM one 5; discovery exposes isPremium.
+
+- **Frozen per-(cycle,tranche) budget** — `lib/server/sync/source-tranche-budget.js`:
+  `computeFrozenTrancheBudget` counts the UNIQUE canonical request_hashes the tranche selects (batching is
+  already reflected: seller = ceil(N/5) hashes/window, org-wide Product Catalog = one hash/org/window,
+  non-batchable = one hash/account/window), freezes `maxCreates` = unique hash count, `maxTokens` = sum of
+  per-hash costs (standard 2 / premium 5 via `sourceTokenCost`, which fails closed on missing/ambiguous
+  pricing), and a `planFingerprint` over the sorted (hash, cost) pairs. `assertFrozenBudgetMatches` rejects
+  plan/pricing drift (PLAN_BUDGET_MISMATCH). Pricing (isPremium) is INJECTED (from discovery in production).
+- **Migration `20260818_source_tranche_budget.sql`** (PREPARED, UNAPPLIED): tables `source_tranche_budget`
+  (cycle_id, tranche_key PK; frozen fingerprint + max/spent creates/tokens with DB-level `spent<=max` checks;
+  SELECT-only ACL; RLS; touch trigger) and `source_tranche_budget_hash` (per-hash token_cost in (2,5); FK to
+  the budget; SELECT-only). RPC `persist_source_tranche_budget` freezes ONCE and raises PLAN_BUDGET_MISMATCH
+  on a drifted re-freeze. RPC `reserve_source_export_create` is the ATOMIC pre-POST reservation: per-(cycle,
+  tranche) advisory lock, budget row FOR UPDATE (deadlock-safe: budget then job), plan-fingerprint match,
+  hash-in-frozen-plan + cost lookup, spent+1<=max_creates AND spent+cost<=max_tokens, then CLAIM the still
+  pending/unattempted/count=0 job (mutually exclusive with cache adoption) and reserve; returns
+  'reserved'|'not-pending'|'plan-mismatch'|'budget-exceeded'.
+- **Worker gate** — `source-worker.js` takes an optional frozen `budget { trancheKey, planFingerprint }`; when
+  present every create-export goes through `store.reserveExportCreate` (only 'reserved' POSTs). Cache adoption,
+  a saved-export_id resume, and reuseOnly all return BEFORE the reservation, so they spend ZERO. A drifted plan
+  or exhausted ceiling aborts before the POST with a typed TOKEN_BUDGET_EXCEEDED / PLAN_BUDGET_MISMATCH failure
+  and NO retry/fallback. Actual spend is the DURABLE reservation counters, never rollup.processed.
+- **Schema audit + regressions**: schema-contract adds the migration + a `reserve-create` structural body
+  proof; 9 new mutation regressions (removed budget lock / advisory lock / drift check / hash membership /
+  ceiling check / spend, a widened create-claim, a widened token cost, wrong index columns) each surface a
+  typed blocker. New `scripts/source-tranche-budget.test.js` (16 assertions) proves 30=>6 & 31=>7 stable,
+  standard x2 / premium x5 / mixed exact, catalog once, concurrent-can't-exceed, beyond-ceiling stopped,
+  no-reset continuation, drift fail-closed, new-account-next-cycle, cache/resume zero tokens, no
+  batch->single fallback, no duplicate create. Wrappers: persistSourceTrancheBudget, reserveSourceExportCreate,
+  getSourceTrancheBudget, getSourceTrancheBudgetHashes.
+
+Golden request_hash, five-ID batching, folds/LKG/source isolation, and Scheduler v1 unchanged.
+
 ## Scheduler v2 Blocker 4c correction — real owner binding + explicit scope + marketplace evidence (2026-08-17)
 
 Closed the Blocker-4c senior-review findings on `main`. Offline/unwired SHADOW MODE; nothing

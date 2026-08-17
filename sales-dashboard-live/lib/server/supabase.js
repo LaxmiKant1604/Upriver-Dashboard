@@ -818,6 +818,64 @@ export async function listSourceBatchMembership(batchFamily) {
   return Array.isArray(rows) ? rows : [];
 }
 
+// persist_source_tranche_budget (Blocker 4d): freeze the create/token budget for (cycle, tranche) ONCE.
+// Idempotent; a continuation with a drifted plan raises PLAN_BUDGET_MISMATCH. Returns 'created' | 'exists'.
+export async function persistSourceTrancheBudget({ cycleId, trancheKey, planFingerprint, maxCreates, maxTokens, hashes }) {
+  const body = await request("/rest/v1/rpc/persist_source_tranche_budget", {
+    method: "POST",
+    body: {
+      p_cycle_id: cycleId,
+      p_tranche_key: trancheKey,
+      p_plan_fingerprint: planFingerprint,
+      p_max_creates: maxCreates,
+      p_max_tokens: maxTokens,
+      p_hashes: (hashes || []).map((h) => ({ request_hash: h.requestHash ?? h.request_hash, token_cost: h.tokenCost ?? h.token_cost })),
+    },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : String(value);
+}
+
+// reserve_source_export_create (Blocker 4d): the ATOMIC pre-POST reservation. ONLY a 'reserved' result may
+// POST a create-export. Returns 'reserved' | 'not-pending' | 'plan-mismatch' | 'budget-exceeded'.
+export async function reserveSourceExportCreate({ cycleId, trancheKey, requestHash, planFingerprint }) {
+  const body = await request("/rest/v1/rpc/reserve_source_export_create", {
+    method: "POST",
+    body: {
+      p_cycle_id: cycleId,
+      p_tranche_key: trancheKey,
+      p_request_hash: requestHash,
+      p_plan_fingerprint: planFingerprint,
+    },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : String(value);
+}
+
+// Read the frozen tranche budget row (admin/service-role only): the plan fingerprint + create/token ceilings
+// and the durable spent counters for (cycle, tranche), or null.
+export async function getSourceTrancheBudget({ cycleId, trancheKey }) {
+  const query = new URLSearchParams({
+    select: "cycle_id,tranche_key,plan_fingerprint,max_creates,max_tokens,spent_creates,spent_tokens",
+    cycle_id: `eq.${cycleId}`,
+    tranche_key: `eq.${trancheKey}`,
+  });
+  const rows = await request(`/rest/v1/source_tranche_budget?${query}`);
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+// Read the frozen per-hash costs for (cycle, tranche): rows { request_hash, token_cost }.
+export async function getSourceTrancheBudgetHashes({ cycleId, trancheKey }) {
+  const query = new URLSearchParams({
+    select: "request_hash,token_cost",
+    cycle_id: `eq.${cycleId}`,
+    tranche_key: `eq.${trancheKey}`,
+    order: "request_hash.asc",
+  });
+  const rows = await request(`/rest/v1/source_tranche_budget_hash?${query}`);
+  return Array.isArray(rows) ? rows : [];
+}
+
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.
