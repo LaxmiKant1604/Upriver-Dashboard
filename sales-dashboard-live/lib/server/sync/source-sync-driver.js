@@ -62,7 +62,7 @@ export function normalizeDataDoeConnections(connections) {
 // FAIL CLOSED: connectionId is REQUIRED and explicit ('primary' or 'dd-secondary') — there
 // is no silent 'primary' default anywhere in Scheduler v2 — and the resolved job must carry
 // a non-empty organizationFingerprint. Both are what the adapter verifies before any call.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "") {
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerAccountScopeHash = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -74,10 +74,16 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
   // (report family, connection/org boundary, org fingerprint, account scope), plus the report request
   // key as this membership's alias and the SAFE public accountId for admin display. request_key is a
   // membership alias, NOT canonical ownership authority; the canonical job dedups on request_hash.
+  //
+  // Blocker 4b -- OWNER scope is the INDIVIDUAL account (one exact report/account). For a single-account job
+  // it equals the canonical job scope; for a BATCHED job it is the individual account's scope, NEVER the
+  // batch scope (which would collide all <=5 batch members onto one owner_id). It defaults to the resolved
+  // job scope, so single-account planning is byte-identical.
+  const ownerScope = ownerAccountScopeHash != null ? ownerAccountScopeHash : resolved.accountScopeHash;
   const ownerId = sourceJobOwnerId({
     reportKey, connectionId,
     organizationFingerprint: resolved.organizationFingerprint,
-    accountScopeHash: resolved.accountScopeHash,
+    accountScopeHash: ownerScope,
   });
   if (!ownerId) {
     throw new Error(`plannedSourceJob could not derive an owner_id for report "${reportKey}" (missing connection/organization/account scope).`);
@@ -89,12 +95,13 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     sourceKey: resolved.sourceKey,
     connectionId,
     organizationFingerprint: resolved.organizationFingerprint,
-    accountScopeHash: resolved.accountScopeHash,
+    accountScopeHash: resolved.accountScopeHash,   // CANONICAL job scope (the BATCH scope for a batched job)
     requestMeta: resolved.requestMeta,
     bucket: resolved.bucket || bucket,
     strict: resolved.strict === true,
     limit: resolved.limit,
-    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || "") },
+    // owner.accountScopeHash is the INDIVIDUAL account scope (never the batch scope) -- one exact report/account.
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), accountScopeHash: ownerScope },
     fetchParams: {
       columns: contract ? contract.columns : undefined,
       sellerOrVendorIds: resolved.sellerOrVendorIds,
@@ -104,6 +111,15 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
       options: resolved.options,
     },
   };
+}
+
+// Build the <=5 planned source jobs for ONE batched canonical source (Blocker 4b): the SAME canonical job
+// (one request_hash over the sorted batch seller ids) with ONE owner membership PER account, each carrying
+// that account's INDIVIDUAL owner scope + SAFE public accountId, so five accounts own the one shared export
+// without owner-id collisions. `resolvedBatch` is the batch's resolved source (batch request_hash + batch
+// account_scope_hash); `batchAccounts` is [{ accountId, ownerAccountScopeHash }] (the individual scopes).
+export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connectionId, batchAccounts) {
+  return (batchAccounts || []).map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.ownerAccountScopeHash));
 }
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.

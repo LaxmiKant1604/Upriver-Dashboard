@@ -366,15 +366,21 @@ export async function runSourceJobs({
       const o = j.owner || {};
       const ownerId = String(o.ownerId || "");
       const rk = j.requestKey || "";
-      if (!ownerId || !o.reportKey || !o.accountId || !o.requestKey || !j.connectionId || !j.organizationFingerprint || !j.accountScopeHash) {
-        throw new Error(`plannedJobs entry (request_key "${o.requestKey || rk}") is missing owner membership metadata (owner_id / report_key / account_id / request_key / connection_id / organization_fingerprint / account_scope_hash); fail closed.`);
+      // Blocker 4b: the OWNER scope is the INDIVIDUAL account (o.accountScopeHash), which for a batched job
+      // differs from the canonical job's BATCH scope (j.accountScopeHash). Legacy single-account callers do
+      // not set owner.accountScopeHash, so it falls back to the canonical scope (byte-identical behavior).
+      const ownerScope = o.accountScopeHash || j.accountScopeHash;
+      if (!ownerId || !o.reportKey || !o.accountId || !o.requestKey || !j.connectionId || !j.organizationFingerprint || !j.accountScopeHash || !ownerScope) {
+        throw new Error(`plannedJobs entry (request_key "${o.requestKey || rk}") is missing owner membership metadata (owner_id / report_key / account_id / request_key / connection_id / organization_fingerprint / account_scope_hash / owner scope); fail closed.`);
       }
       if (o.requestKey !== rk) {
         throw new Error(`plannedJobs entry owner.request_key "${o.requestKey}" does not match the canonical job request_key "${rk}"; fail closed.`);
       }
-      const expected = sourceJobOwnerId({ reportKey: o.reportKey, connectionId: j.connectionId, organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash });
+      // Recompute owner_id from the INDIVIDUAL owner scope (never the batch scope), so a batched job's five
+      // owners resolve to FIVE distinct owner_ids and a buggy caller can never place a cross-account owner.
+      const expected = sourceJobOwnerId({ reportKey: o.reportKey, connectionId: j.connectionId, organizationFingerprint: j.organizationFingerprint, accountScopeHash: ownerScope });
       if (!expected || expected !== ownerId) {
-        throw new Error(`plannedJobs entry (request_key "${rk}") owner_id does not match sourceJobOwnerId(report_key, connection_id, organization_fingerprint, account_scope_hash); refusing (fail closed).`);
+        throw new Error(`plannedJobs entry (request_key "${rk}") owner_id does not match sourceJobOwnerId(report_key, connection_id, organization_fingerprint, individual account_scope_hash); refusing (fail closed).`);
       }
       if (!ownerSet.has(ownerId)) {
         throw new Error(`plannedJobs entry (owner_id "${ownerId}") does not belong to the declared owner scope; refusing to upsert then skip it.`);
@@ -402,7 +408,10 @@ export async function runSourceJobs({
     await store.upsertSourceJobOwners(planned.map((j) => ({
       cycleId, requestHash: j.requestHash, ownerId: j.owner.ownerId, requestKey: j.owner.requestKey,
       reportKey: j.owner.reportKey, accountId: j.owner.accountId, connectionId: j.connectionId,
-      organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.accountScopeHash,
+      // The owner membership records the INDIVIDUAL account scope (Blocker 4b), never the canonical batch
+      // scope -- "owner scope remains one exact report/account". Falls back to the canonical scope for a
+      // legacy single-account job (where the two are identical).
+      organizationFingerprint: j.organizationFingerprint, accountScopeHash: j.owner.accountScopeHash || j.accountScopeHash,
     })));
   }
 

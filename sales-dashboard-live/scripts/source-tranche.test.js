@@ -41,7 +41,8 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 // Assigned in main() after the dummy env is set.
-let runSourceJobs, runStagedSourceCycle, plannedSourceJob, runReportJobs;
+let runSourceJobs, runStagedSourceCycle, plannedSourceJob, plannedBatchSourceJobs, runReportJobs;
+let accountScopeHash;
 let buildShadowReportPlan;
 let REPORT_SOURCE_CONTRACTS;
 let sourceRequestIdentity, sourceJobOwnerId, SOURCE_CONTRACTS;
@@ -333,6 +334,37 @@ test("3. different seller accounts do NOT share OLI hashes (OLI is seller-scoped
   assert.equal(idA.organizationFingerprint, idB.organizationFingerprint, "same api key => same organization fingerprint");
   assert.notEqual(idA.accountScopeHash, idB.accountScopeHash, "different seller ids => different account scope");
   assert.notEqual(idA.requestHash, idB.requestHash, "different accounts NEVER merge OLI request hashes");
+});
+
+test("4b. FIVE accounts BATCH into ONE canonical source row and retain FIVE separate account/report owners (Blocker 4b)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const sellers = ["S1", "S2", "S3", "S4", "S5"];
+  const accts = sellers.map((s, i) => ({ accountId: "ACC" + (i + 1), rawSellerId: s }));
+  const c = oliContract("returns-leakage", "returns-leakage:oli-sales");
+  const options = { groupBy: c.groupBy || undefined, aggregations: c.aggregations || undefined, orderByColumn: c.orderByColumn, orderByDirection: c.orderByDirection };
+  const id = sourceRequestIdentity({ apiKey: "k", sourceId: OLI_SOURCE_ID(), columns: c.columns, ids: sellers, from: "2025-07-14", to: "2025-07-20", limit: c.limit, options });
+  // The batch's resolved canonical source (one request_hash over the sorted batch seller ids).
+  const resolvedBatch = {
+    requestHash: id.requestHash, requestKey: "returns-leakage:oli-sales", sourceId: OLI_SOURCE_ID(), sourceKey: "order-line-items",
+    organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
+    bucket: "us", strict: true, limit: c.limit, from: "2025-07-14", to: "2025-07-20", options, sellerOrVendorIds: sellers,
+  };
+  const batchAccounts = accts.map((a) => ({ accountId: a.accountId, ownerAccountScopeHash: accountScopeHash([a.rawSellerId]) }));
+  const jobs = plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", batchAccounts);
+  assert.equal(jobs.length, 5, "five planned entries (one per account)");
+  assert.equal(new Set(jobs.map((j) => j.requestHash)).size, 1, "all five share ONE canonical request_hash (the batch)");
+  assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 5, "five DISTINCT owner ids (individual account scope, no collision)");
+  const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, ownerIds: [...new Set(jobs.map((j) => j.owner.ownerId))], bucket: "us", cycleDate: CYCLE_DATE });
+  const rows = store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === id.requestHash);
+  assert.equal(rows.length, 1, "exactly ONE canonical source row for the batch");
+  assert.equal(rows[0].account_scope_hash, id.accountScopeHash, "the canonical row carries the BATCH scope");
+  const owners = store._owners(r.cycleId).filter((m) => m.request_hash === id.requestHash);
+  assert.equal(owners.length, 5, "FIVE owner memberships on the one canonical row");
+  assert.equal(new Set(owners.map((m) => m.owner_id)).size, 5, "five distinct owner ids");
+  assert.equal(new Set(owners.map((m) => m.account_id)).size, 5, "five distinct account ids");
+  assert.equal(new Set(owners.map((m) => m.account_scope_hash)).size, 5, "five distinct INDIVIDUAL owner scopes");
+  assert.ok(owners.every((m) => m.account_scope_hash !== id.accountScopeHash), "no owner uses the BATCH scope as its owner scope (Blocker 4b)");
+  assert.equal(dd.createCount(id.requestHash), 1, "the shared batched OLI export is created EXACTLY once");
 });
 
 /* ============================= Part C: durable cache reuse ============================= */
@@ -644,11 +676,11 @@ test("13. NO ownerless, cross-account, or cross-organization source job is produ
 
 async function main() {
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
-  ({ runStagedSourceCycle, plannedSourceJob } = await import("../lib/server/sync/source-sync-driver.js"));
+  ({ runStagedSourceCycle, plannedSourceJob, plannedBatchSourceJobs } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ buildShadowReportPlan } = await import("../lib/server/sync/report-planner.js"));
   ({ REPORT_SOURCE_CONTRACTS } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ sourceRequestIdentity, sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
+  ({ sourceRequestIdentity, sourceJobOwnerId, accountScopeHash } = await import("../lib/server/source-identity.js"));
   ({ SOURCE_CONTRACTS } = await import("../lib/server/source-contracts.js"));
   ({ makeSourceTranche, SOURCE_TRANCHE_ORDER, isSourceTranche } = await import("../lib/server/sync/source-tranche.js"));
   ({ buildSchedulerV2SourceTrancheRuntime, buildSchedulerV2Runtime } = await import("../lib/server/sync/runtime-composition.js"));

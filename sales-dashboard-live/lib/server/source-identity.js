@@ -56,6 +56,19 @@ export function sourceJobOwnerId({ reportKey, connectionId, organizationFingerpr
   return sha256(JSON.stringify(["source-owner/v1", rk, conn, org, scope])).slice(0, 32);
 }
 
+// The unit-separator (U+001F) joining seller ids in the account-scope hash, matching the byte used inline in
+// sourceRequestIdentity below. Defined via fromCharCode so it is unambiguous in source.
+const SCOPE_ID_SEPARATOR = String.fromCharCode(0x1f);
+
+// The account-scope hash: sha256 of the sorted, unit-separator-joined seller ids. A single account's scope
+// and a batch's scope use the IDENTICAL formula, so an individual account's OWNER scope
+// (accountScopeHash([sellerId])) and a batch's CANONICAL scope (accountScopeHash(sortedBatchIds)) are
+// directly comparable and never collide unless the id SETS are identical. Byte-identical to the value
+// sourceRequestIdentity folds into request_hash, so existing identities are unchanged.
+export function accountScopeHash(ids) {
+  return sha256([...ids].map(String).sort().join(SCOPE_ID_SEPARATOR));
+}
+
 export function sourceRequestIdentity({ apiKey, sourceId, columns, ids, from, to, limit, options }) {
   const contract = sourceContractForId(sourceId);
   const organizationFingerprint = sha256(apiKey).slice(0, 24);
