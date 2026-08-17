@@ -1,5 +1,40 @@
 # Project Memory
 
+## Scheduler v2 Blocker 4c correction — real owner binding + explicit scope + marketplace evidence (2026-08-17)
+
+Closed the Blocker-4c senior-review findings on `main`. Offline/unwired SHADOW MODE; nothing
+pushed/merged/deployed/migrated/enabled. Full `npm run verify` green (45 steps across 25 suites incl.
+build:check); `git diff --check` clean.
+
+- **Finding 1 — real owner binding.** `plannedSourceJob`'s owner now carries the COMPLETE authoritative
+  metadata `{ accountId, rawSellerId, connectionId, organizationFingerprint, accountScopeHash }` (never from
+  run args). `runOneReport` FAILS CLOSED (`OWNER_BINDING_MISSING`) when a report depends on a BATCHED
+  seller-scoped source (`isBatchedSellerFragment`) but its `planned.owner` is missing/incomplete — it never
+  falls through to the legacy full-batch path; legacy no-owner assembly is allowed only for genuinely
+  single-account plans. Proven by a REAL `runReportJobs` regression: five brand-sales report jobs derive from
+  ONE cached batch, each seeing ONLY its own seller rows (S5 with no rows = validated-empty), zero
+  cross-account writes; missing/incomplete owner fails closed with LKG preserved.
+- **Finding 2 — explicit source scope.** Typed immutable PER-CONTRACT scope: `SELLER_SCOPED_REQUEST_KEYS`
+  (the 6 OLI-sales contracts that carry seller_or_vendor_id) → "seller"; everything else → "organization"
+  (the SAME order-line-items family is organization-scoped for `reconciliation:order-lines`, which carries no
+  seller id). `sourceScopeForContract` + `assertSourceScopeConsistency` cross-check BOTH ways (a declared
+  seller contract must carry seller_or_vendor_id; no other contract may). Scope is DECLARED, never inferred
+  solely from columns; the isolation/validation key off the explicit `sourceScope`, and an unknown/missing
+  scope fails closed (`SOURCE_SCOPE_UNKNOWN`). Product Catalog stays organization-wide, never seller-filtered.
+- **Finding 3 — marketplace evidence.** The batch's SINGLE canonical marketplace constraint is carried through
+  immutable planned metadata (`marketplaceConstraint`) into the source worker's batch validation. When a
+  seller-scoped contract fetched `marketplace_country_code`, every non-empty batch row must carry a nonblank
+  marketplace equal to the constraint (blank/missing/mismatch → `BATCH_ROW_NO_MARKETPLACE` /
+  `BATCH_MARKETPLACE_CONSTRAINT_MISSING` / `BATCH_CROSS_MARKETPLACE`, rejected before persistence). Every
+  payload member must be a plain object (`[]` is the only valid empty payload; a primitive/null/array member is
+  `MALFORMED_PAYLOAD`). A batch never mixes marketplaces (single `marketplaceCountry` arg, required when
+  marketplace-scoped).
+
+Files: `lib/server/sync/report-source-contracts.js`, `lib/server/sync/source-account-isolation.js`,
+`lib/server/sync/source-sync-driver.js`, `lib/server/sync/source-worker.js`, `lib/server/sync/report-worker.js`,
+`scripts/source-account-isolation.test.js`, `scripts/source-tranche.test.js`, `scripts/sync-source-jobs.test.js`.
+Golden request_hash + five-ID batching unchanged.
+
 ## Scheduler v2 Blocker 4c — per-account isolation of a shared <=5-account batch source (2026-08-17)
 
 Implemented Blocker 4c on `main`: derive-time per-account isolation of rows loaded from ONE shared batched

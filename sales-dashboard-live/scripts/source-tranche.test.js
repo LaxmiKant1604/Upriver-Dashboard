@@ -355,6 +355,7 @@ test("4b. FIVE accounts BATCH into ONE canonical source row and retain FIVE sepa
     requestHash: id.requestHash, requestKey: "returns-leakage:oli-sales", sourceId: OLI_SOURCE_ID(), sourceKey: "order-line-items",
     organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
     bucket: "us", strict: true, limit: c.limit, from: "2025-07-14", to: "2025-07-20", options, sellerOrVendorIds: sellers,
+    sourceScope: "seller", marketplaceScoped: false, // returns-leakage OLI is seller-scoped, no marketplace column
   };
   // Gap 1: pass AUTHORITATIVE account records { accountId, rawSellerId }; the owner scope is computed
   // INTERNALLY as accountScopeHash([rawSellerId]) -- never a caller-provided hash.
@@ -385,6 +386,7 @@ test("4c. plannedBatchSourceJobs computes owner scope from rawSellerId and FAILS
     requestHash: id.requestHash, requestKey: "returns-leakage:oli-sales", sourceId: OLI_SOURCE_ID(), sourceKey: "order-line-items",
     organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
     bucket: "us", strict: true, limit: c.limit, from: "2025-07-14", to: "2025-07-20", options, sellerOrVendorIds: sellers,
+    sourceScope: "seller", marketplaceScoped: false, // returns-leakage OLI is seller-scoped, no marketplace column
   };
   const ok = [{ accountId: "ACC1", rawSellerId: "S1" }, { accountId: "ACC2", rawSellerId: "S2" }, { accountId: "ACC3", rawSellerId: "S3" }];
   // Gap 1: the well-formed batch plans; each owner scope is accountScopeHash([rawSellerId]) (computed internally),

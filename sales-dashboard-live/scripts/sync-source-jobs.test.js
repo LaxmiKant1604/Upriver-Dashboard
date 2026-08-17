@@ -355,7 +355,9 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
   // fails closed for a >1-id source without an individual rawSellerId, so a batch is built via
   // plannedBatchSourceJobs -- one canonical job per source, one owner membership per account (each carrying its
   // individual rawSellerId scope). The fetch/dedup behavior proven here is unchanged.
-  const batchOf = (r) => plannedBatchSourceJobs("brand-sales", r, "us", "primary", r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })));
+  // brand-sales OLI is seller-scoped AND marketplace-scoped, so the batch carries a single canonical
+  // marketplace constraint and every batch row carries that marketplace.
+  const batchOf = (r) => plannedBatchSourceJobs("brand-sales", r, "us", "primary", r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })), "US");
   const planned = resolved.flatMap(batchOf);
   const oli = resolved.find((r) => r.requestKey === "brand-sales:order-lines");
   const seen = [];
@@ -363,9 +365,9 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
     createCount: () => 0, totalCreates: () => 0,
     create: async (job) => { seen.push(job); return { exportId: "e" }; },
     poll: async () => {},
-    // A batch download returns one row per canonical batch seller (Blocker 4c batch integrity); the catalog
-    // job is organization-wide (not seller-scoped) so its rows are never seller-validated.
-    download: async (job) => (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, ok: 1 })),
+    // A batch download returns one row per canonical batch seller carrying its marketplace (Blocker 4c batch
+    // integrity); the catalog job is organization-wide so its rows are never seller/marketplace-validated.
+    download: async (job) => (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, marketplace_country_code: "US", ok: 1 })),
   };
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: planned }));
   // Deduped by request_hash: the two distinct canonical sources (order-lines + catalog) each succeed once.
@@ -389,8 +391,9 @@ test("five-ID chunks remain separate jobs, each created once; primary/dd-seconda
     "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }],
   };
   // Each five-ID chunk is planned through the sanctioned batch path (senior review gaps 1-3): its accounts are
-  // the chunk's own seller ids, so one canonical job per chunk carries one owner membership per account.
-  const batchOf = (conn) => (r) => plannedBatchSourceJobs("brand-sales", r, "us", conn, r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })));
+  // the chunk's own seller ids, so one canonical job per chunk carries one owner membership per account. The
+  // marketplace-scoped OLI batch carries a single canonical marketplace constraint ("US").
+  const batchOf = (conn) => (r) => plannedBatchSourceJobs("brand-sales", r, "us", conn, r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })), "US");
   const primary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: PRIMARY_API_KEY, ids, windowsByRequestKey: win })
     .flatMap(batchOf("primary"));
   const secondary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: SECONDARY_API_KEY, ids: ["A1"], windowsByRequestKey: win })
@@ -399,8 +402,9 @@ test("five-ID chunks remain separate jobs, each created once; primary/dd-seconda
   assert.equal(new Set(oli.map((j) => j.requestHash)).size, 2); // two OLI chunks => two distinct canonical hashes
   const pHashes = new Set(primary.map((j) => j.requestHash));
   for (const j of secondary) assert.ok(!pHashes.has(j.requestHash));
-  // Each batch download returns one row per canonical batch seller so Blocker 4c batch integrity passes.
-  const dd = makeDataDoe((job) => ({ rows: (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, a: 1 })) }));
+  // Each batch download returns one row per canonical batch seller carrying its marketplace so Blocker 4c
+  // batch integrity passes.
+  const dd = makeDataDoe((job) => ({ rows: (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, marketplace_country_code: "US", a: 1 })) }));
   await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [...primary, ...secondary] }));
   for (const j of oli) assert.equal(dd.createCount(j.requestHash), 1);
 });

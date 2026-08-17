@@ -70,7 +70,7 @@ export function normalizeDataDoeConnections(connections) {
 // resolved.accountScopeHash is permitted ONLY for a single-account source (0 or 1 seller id, where the
 // canonical scope already IS the individual scope); a MULTI-id (batched) source with no authoritative
 // rawSellerId FAILS CLOSED rather than collapsing every batch member onto the one shared batch scope.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null) {
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null, marketplaceConstraint = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -123,10 +123,17 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     bucket: resolved.bucket || bucket,
     strict: resolved.strict === true,
     limit: resolved.limit,
+    // Finding 2/3: the DECLARED source scope + whether the contract fetched marketplace_country_code + the
+    // batch's canonical marketplace constraint, carried as immutable planned metadata into the source worker's
+    // batch validation and the report worker's per-account isolation (both key off the explicit scope).
+    sourceScope: resolved.sourceScope,
+    marketplaceScoped: resolved.marketplaceScoped === true,
+    marketplaceConstraint: marketplaceConstraint == null ? null : String(marketplaceConstraint),
     // owner.accountScopeHash is the INDIVIDUAL account scope (never the batch scope) -- one exact report/account.
-    // owner.rawSellerId is that account's authoritative individual seller id (Blocker 4c: the accountId ->
-    // rawSellerId mapping the derive-time per-account isolation uses; NON-secret, already in fetchParams).
-    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, accountScopeHash: ownerScope },
+    // owner.rawSellerId is that account's authoritative individual seller id; owner carries the COMPLETE
+    // metadata (Finding 1) the derive-time per-account isolation requires: accountId, rawSellerId, connectionId,
+    // organizationFingerprint, accountScopeHash (NON-secret; the raw id is already in fetchParams).
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope },
     fetchParams: {
       columns: contract ? contract.columns : undefined,
       sellerOrVendorIds: resolved.sellerOrVendorIds,
@@ -154,12 +161,19 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
 // exactly the canonical batch sellers (no missing, no extra), on a valid connection with a non-empty
 // organization fingerprint, and with the resolvedBatch's own canonical scope equal to
 // accountScopeHash(sellerOrVendorIds). Any mismatch THROWS, so no partial/mis-owned plan is ever returned.
-export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connectionId, batchAccounts) {
+//
+// Finding 3: `marketplaceCountry` is the batch's SINGLE canonical marketplace constraint (a batch never mixes
+// marketplaces). When the resolved batch fetched marketplace_country_code it is REQUIRED (fail closed) and is
+// carried into every job's immutable metadata for the source worker to validate every downloaded row against.
+export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connectionId, batchAccounts, marketplaceCountry = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedBatchSourceJobs requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
   if (!resolvedBatch || !resolvedBatch.organizationFingerprint) {
     throw new Error("plannedBatchSourceJobs requires a non-empty organizationFingerprint on the resolved batch (fail closed).");
+  }
+  if (resolvedBatch.marketplaceScoped === true && (marketplaceCountry == null || String(marketplaceCountry).trim() === "")) {
+    throw new Error("plannedBatchSourceJobs: a marketplace-scoped seller batch requires a single canonical marketplaceCountry constraint (fail closed).");
   }
   const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
   if (accounts.length === 0) {
@@ -209,7 +223,7 @@ export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connect
   if (accountScopeHash(canonicalIds) !== resolvedBatch.accountScopeHash) {
     throw new Error("plannedBatchSourceJobs: resolvedBatch.accountScopeHash does not equal accountScopeHash(sellerOrVendorIds); refusing (fail closed).");
   }
-  return accounts.map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.rawSellerId));
+  return accounts.map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.rawSellerId, marketplaceCountry));
 }
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.

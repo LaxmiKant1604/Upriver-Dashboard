@@ -1,15 +1,14 @@
-// Scheduler v2 Blocker 4c -- PER-ACCOUNT ISOLATION of a shared <=5-account batch source (offline, ZERO
-// network/DB). Proves the required regressions:
-//   - a five-account OLI batch: each of the five owners sees ONLY its own rows;
-//   - account A can never see B/C/D/E rows;
-//   - a missing/blank/out-of-batch seller id rejects the WHOLE batch BEFORE success;
-//   - the SAME raw seller id from another org/connection is rejected;
-//   - one account with ZERO rows receives validated EMPTY evidence (never another account's rows);
-//   - the shared cache object/path stays ONE and unchanged (no per-account duplicate object);
-//   - a filtered fragment's sellerOrVendorIds is EXACTLY [ownerRawSellerId];
-//   - existing single-account behavior stays byte-identical (no owner => legacy assembleSources);
-//   - Product Catalog stays organization-wide (never seller-filtered).
-// Report folds/parity + LKG preservation stay green in the existing report suites (run by verify.mjs).
+// Scheduler v2 Blocker 4c (+ correction) -- PER-ACCOUNT ISOLATION of a shared <=5-account batch source
+// (offline, ZERO network/DB). Proves the required regressions:
+//   - the REAL report worker supplies complete owner metadata and derives five report jobs from ONE cached
+//     batch, each seeing ONLY its own rows (never A seeing B/C/D/E);
+//   - a batched seller-scoped report reaching the worker WITHOUT complete owner metadata (missing owner, or
+//     missing owner org/connection) FAILS CLOSED -- it never takes the legacy full-batch path;
+//   - source scope is EXPLICIT ("seller" | "organization"); an unknown/missing scope fails closed; a seller
+//     scope missing seller_or_vendor_id fails before I/O; Product Catalog stays organization-wide;
+//   - the source worker actually PASSES the batch marketplace expectation, and a blank/missing/wrong seller or
+//     marketplace (or a primitive/null/array row) rejects the WHOLE batch before save (LKG preserved);
+//   - the shared cache object stays ONE and unchanged; zero cross-account writes.
 //
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy env.
 
@@ -27,209 +26,141 @@ const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 // Assigned in main() after the dummy env is set.
-let validateBatchSourcePayload, isolateFragmentRowsForOwner, isSellerScopedColumns;
-let assembleSources, plannedBatchSourceJobs, runSourceJobs;
-let sourceRequestIdentity;
-let REPORT_SOURCE_CONTRACTS, SOURCE_CONTRACTS;
+let validateBatchSourcePayload, isolateFragmentRowsForOwner, isBatchedSellerFragment, missingOwnerFields;
+let plannedBatchSourceJobs, runSourceJobs, runReportJobs;
+let reportSourceRequestHashes, assertSourceScopeConsistency, sourceScopeForContract;
 
-const CYCLE_DATE = "2026-08-17";
-const FROM = "2025-07-14";
-const TO = "2025-07-20";
+const FROM = "2024-07-01";
+const TO = "2025-08-10";
 const SELLERS = ["S1", "S2", "S3", "S4", "S5"];
 const ORG = "orgFingerprintPrimary";
-
-const oliContract = () => (REPORT_SOURCE_CONTRACTS["returns-leakage"] || []).find((c) => c.requestKey === "returns-leakage:oli-sales");
-const OLI_SOURCE_ID = () => SOURCE_CONTRACTS.find((c) => c.key === "order-line-items").ids[0];
-const oliColumns = () => oliContract().columns;
-const catalogColumns = () => (REPORT_SOURCE_CONTRACTS["returns-leakage"] || []).find((c) => c.requestKey === "returns-leakage:catalog").columns;
-
-// An OLI-shaped row for a given seller. Only seller_or_vendor_id matters for isolation.
-const oliRow = (sid, tag) => ({ date: TO, seller_or_vendor_id: sid, sku: "SKU-" + tag, child_asin: tag, item_price_currency: "USD" });
-
-// The batch's resolved canonical source (one request_hash over the sorted batch seller ids).
-function resolvedBatch(sellers = SELLERS) {
-  const c = oliContract();
-  const options = { groupBy: c.groupBy || undefined, aggregations: c.aggregations || undefined, orderByColumn: c.orderByColumn, orderByDirection: c.orderByDirection };
-  const id = sourceRequestIdentity({ apiKey: "k", sourceId: OLI_SOURCE_ID(), columns: c.columns, ids: sellers, from: FROM, to: TO, limit: c.limit, options });
-  return {
-    requestHash: id.requestHash, requestKey: "returns-leakage:oli-sales", sourceId: OLI_SOURCE_ID(), sourceKey: "order-line-items",
-    organizationFingerprint: id.organizationFingerprint, accountScopeHash: id.accountScopeHash, requestMeta: id.requestMeta,
-    bucket: "us", strict: true, limit: c.limit, from: FROM, to: TO, options, sellerOrVendorIds: sellers,
-  };
-}
+const MKT = "US";
 
 /* ============================= Part A: validateBatchSourcePayload ============================= */
-group("Part A: batch payload validation (before save)");
+group("Part A: batch payload validation (explicit scope + marketplace + malformed)");
 
-test("A1. a non-array payload is MALFORMED_PAYLOAD", () => {
-  const r = validateBatchSourcePayload({ rows: null, sellerOrVendorIds: SELLERS, columns: oliColumns() });
-  assert.equal(r.valid, false); assert.equal(r.code, "MALFORMED_PAYLOAD");
+const sellerRow = (sid, mkt = MKT) => ({ date: TO, seller_or_vendor_id: sid, marketplace_country_code: mkt, child_asin: "A-" + sid });
+
+test("A1. a non-array payload, or a primitive/null/array MEMBER, is MALFORMED_PAYLOAD", () => {
+  assert.equal(validateBatchSourcePayload({ rows: null, sellerOrVendorIds: SELLERS, sourceScope: "seller" }).code, "MALFORMED_PAYLOAD");
+  for (const bad of [42, "x", null, [1, 2]]) {
+    const r = validateBatchSourcePayload({ rows: [sellerRow("S1"), bad], sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true, marketplaceCountry: MKT });
+    assert.equal(r.code, "MALFORMED_PAYLOAD", "member " + JSON.stringify(bad) + " is malformed");
+  }
 });
 
-test("A2. a seller-scoped batch whose rows all belong to the canonical sellers is VALID", () => {
-  const rows = SELLERS.flatMap((s) => [oliRow(s, s + "a"), oliRow(s, s + "b")]);
-  assert.equal(validateBatchSourcePayload({ rows, sellerOrVendorIds: SELLERS, columns: oliColumns() }).valid, true);
+test("A2. an unknown/missing sourceScope fails closed (SOURCE_SCOPE_UNKNOWN)", () => {
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], sellerOrVendorIds: SELLERS, sourceScope: undefined }).code, "SOURCE_SCOPE_UNKNOWN");
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], sellerOrVendorIds: SELLERS, sourceScope: "bogus" }).code, "SOURCE_SCOPE_UNKNOWN");
 });
 
-test("A3. an OUT-OF-BATCH seller id rejects the WHOLE batch (BATCH_CROSS_ACCOUNT)", () => {
-  const rows = [oliRow("S1", "x"), oliRow("S9", "y")]; // S9 is not in the batch
-  const r = validateBatchSourcePayload({ rows, sellerOrVendorIds: SELLERS, columns: oliColumns() });
-  assert.equal(r.valid, false); assert.equal(r.code, "BATCH_CROSS_ACCOUNT");
+test("A3. an organization-scoped source is never seller/marketplace-validated (Product Catalog)", () => {
+  const rows = [{ child_asin: "A", product_brand: "Acme", seller_or_vendor_id: "FOREIGN", marketplace_country_code: "CA" }];
+  assert.equal(validateBatchSourcePayload({ rows, sellerOrVendorIds: SELLERS, sourceScope: "organization" }).valid, true);
 });
 
-test("A4. a non-empty row with a BLANK/missing seller id rejects the batch (BATCH_ROW_NO_SELLER)", () => {
-  const blank = { date: TO, seller_or_vendor_id: "", sku: "SKU", child_asin: "A" };
-  const missing = { date: TO, sku: "SKU", child_asin: "A" };
-  assert.equal(validateBatchSourcePayload({ rows: [oliRow("S1", "x"), blank], sellerOrVendorIds: SELLERS, columns: oliColumns() }).code, "BATCH_ROW_NO_SELLER");
-  assert.equal(validateBatchSourcePayload({ rows: [oliRow("S1", "x"), missing], sellerOrVendorIds: SELLERS, columns: oliColumns() }).code, "BATCH_ROW_NO_SELLER");
+test("A4. seller scope: out-of-batch / blank seller id rejects the WHOLE batch; zero rows is valid-empty", () => {
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1"), sellerRow("S9")], sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true, marketplaceCountry: MKT }).code, "BATCH_CROSS_ACCOUNT");
+  const blank = { date: TO, seller_or_vendor_id: "", marketplace_country_code: MKT };
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1"), blank], sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true, marketplaceCountry: MKT }).code, "BATCH_ROW_NO_SELLER");
+  assert.equal(validateBatchSourcePayload({ rows: [], sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true, marketplaceCountry: MKT }).valid, true);
 });
 
-test("A5. a ZERO-ROW batch is VALID-EMPTY evidence", () => {
-  assert.equal(validateBatchSourcePayload({ rows: [], sellerOrVendorIds: SELLERS, columns: oliColumns() }).valid, true);
+test("A5. seller scope with no canonical sellerOrVendorIds is BATCH_SCOPE_MISSING", () => {
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], sellerOrVendorIds: [], sourceScope: "seller" }).code, "BATCH_SCOPE_MISSING");
 });
 
-test("A6. a NON-seller-scoped source (Product Catalog columns) is never seller-validated (organization-wide)", () => {
-  // Even a row with a foreign seller id passes, because Product Catalog does not fetch seller_or_vendor_id.
-  assert.equal(isSellerScopedColumns(catalogColumns()), false, "catalog columns are not seller-scoped");
-  const rows = [{ child_asin: "A", product_brand: "Acme", seller_or_vendor_id: "S9" }];
-  assert.equal(validateBatchSourcePayload({ rows, sellerOrVendorIds: SELLERS, columns: catalogColumns() }).valid, true);
-});
-
-test("A7. a cross-MARKETPLACE row is rejected when an expected marketplace is supplied", () => {
-  const rows = [{ ...oliRow("S1", "x"), marketplace_country_code: "US" }, { ...oliRow("S2", "y"), marketplace_country_code: "CA" }];
-  const r = validateBatchSourcePayload({ rows, sellerOrVendorIds: SELLERS, columns: [...oliColumns(), "marketplace_country_code"], marketplaceCountry: "US" });
-  assert.equal(r.valid, false); assert.equal(r.code, "BATCH_CROSS_MARKETPLACE");
-});
-
-test("A8. a seller-scoped batch with NO canonical sellerOrVendorIds is BATCH_SCOPE_MISSING (fail closed)", () => {
-  const r = validateBatchSourcePayload({ rows: [oliRow("S1", "x")], sellerOrVendorIds: [], columns: oliColumns() });
-  assert.equal(r.valid, false); assert.equal(r.code, "BATCH_SCOPE_MISSING");
+test("A6. marketplace: no constraint / blank-row / wrong-row marketplace each reject before save", () => {
+  const base = { sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true };
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], ...base, marketplaceCountry: null }).code, "BATCH_MARKETPLACE_CONSTRAINT_MISSING");
+  const noMkt = { date: TO, seller_or_vendor_id: "S1", marketplace_country_code: "" };
+  assert.equal(validateBatchSourcePayload({ rows: [noMkt], ...base, marketplaceCountry: MKT }).code, "BATCH_ROW_NO_MARKETPLACE");
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1", "CA")], ...base, marketplaceCountry: MKT }).code, "BATCH_CROSS_MARKETPLACE");
+  assert.equal(validateBatchSourcePayload({ rows: SELLERS.map((s) => sellerRow(s)), ...base, marketplaceCountry: MKT }).valid, true);
 });
 
 /* ============================= Part B: isolateFragmentRowsForOwner ============================= */
-group("Part B: per-owner row isolation (derive time)");
+group("Part B: per-owner isolation keys off the EXPLICIT sourceScope");
 
-const sharedPayload = () => SELLERS.slice(0, 4).flatMap((s) => [oliRow(s, s + "a"), oliRow(s, s + "b")]); // S1..S4 have rows; S5 has none
-const ownerOf = (sid) => ({ accountId: "ACC-" + sid, rawSellerId: sid, connectionId: "primary", organizationFingerprint: ORG });
-const oliFragment = (rows) => ({ rows, columns: oliColumns(), sellerOrVendorIds: SELLERS, organizationFingerprint: ORG, connectionId: "primary" });
+const sharedPayload = () => SELLERS.slice(0, 4).flatMap((s) => [sellerRow(s), sellerRow(s)]); // S1..S4 have rows; S5 none
+const ownerOf = (sid) => ({ accountId: "ACC-" + sid, rawSellerId: sid, connectionId: "primary", organizationFingerprint: ORG, accountScopeHash: "scope-" + sid });
+const sellerFragment = (rows) => ({ rows, sourceScope: "seller", sellerOrVendorIds: SELLERS, organizationFingerprint: ORG, connectionId: "primary" });
 
-test("B1. each of five owners sees ONLY its own rows; account A never sees B/C/D/E rows", () => {
+test("B1. each of five owners sees ONLY its own rows; A never sees B/C/D/E; scope narrowed to [rawSellerId]", () => {
   const rows = sharedPayload();
   for (const sid of SELLERS.slice(0, 4)) {
-    const iso = isolateFragmentRowsForOwner(oliFragment(rows), ownerOf(sid));
-    assert.ok(iso.rows.every((r) => r.seller_or_vendor_id === sid), sid + " sees only its own rows");
-    assert.ok(iso.rows.length === 2, sid + " sees exactly its two rows");
+    const iso = isolateFragmentRowsForOwner(sellerFragment(rows), ownerOf(sid));
+    assert.ok(iso.rows.length === 2 && iso.rows.every((r) => r.seller_or_vendor_id === sid), sid + " sees only its two rows");
     for (const other of SELLERS) if (other !== sid) assert.ok(iso.rows.every((r) => r.seller_or_vendor_id !== other), sid + " never sees " + other);
+    assert.deepEqual(iso.sellerOrVendorIds, [sid]);
   }
+  assert.deepEqual(isolateFragmentRowsForOwner(sellerFragment(sharedPayload()), ownerOf("S5")).rows, [], "S5 (no rows) is valid-empty");
 });
 
-test("B2. an account with ZERO rows in the batch gets validated EMPTY evidence (never another account's rows)", () => {
-  const iso = isolateFragmentRowsForOwner(oliFragment(sharedPayload()), ownerOf("S5"));
-  assert.deepEqual(iso.rows, []); assert.equal(iso.rejected, false);
-});
-
-test("B3. the filtered fragment scope is EXACTLY [ownerRawSellerId]", () => {
-  const iso = isolateFragmentRowsForOwner(oliFragment(sharedPayload()), ownerOf("S2"));
-  assert.deepEqual(iso.sellerOrVendorIds, ["S2"]);
-});
-
-test("B4. isolation NEVER mutates the shared payload (same array, same length, same objects)", () => {
+test("B2. isolation NEVER mutates the shared payload", () => {
   const rows = sharedPayload();
   const before = rows.slice();
-  const iso = isolateFragmentRowsForOwner(oliFragment(rows), ownerOf("S1"));
-  assert.notStrictEqual(iso.rows, rows, "a NEW array is returned");
-  assert.equal(rows.length, before.length, "shared payload length unchanged");
-  assert.ok(rows.every((r, i) => r === before[i]), "shared payload objects unchanged");
+  const iso = isolateFragmentRowsForOwner(sellerFragment(rows), ownerOf("S1"));
+  assert.notStrictEqual(iso.rows, rows);
+  assert.ok(rows.length === before.length && rows.every((r, i) => r === before[i]), "shared payload unchanged");
 });
 
-test("B5. the SAME raw seller id from ANOTHER org or connection is rejected (rows -> null, fail closed)", () => {
+test("B3. same raw seller id from another org/connection is rejected; catalog + no-owner pass through", () => {
   const rows = sharedPayload();
-  const otherOrg = { accountId: "ACC-S1", rawSellerId: "S1", connectionId: "primary", organizationFingerprint: "orgFingerprintOTHER" };
-  const otherConn = { accountId: "ACC-S1", rawSellerId: "S1", connectionId: "dd-secondary", organizationFingerprint: ORG };
-  assert.equal(isolateFragmentRowsForOwner(oliFragment(rows), otherOrg).rejected, true, "another org rejected");
-  assert.equal(isolateFragmentRowsForOwner(oliFragment(rows), otherOrg).rows, null);
-  assert.equal(isolateFragmentRowsForOwner(oliFragment(rows), otherConn).rejected, true, "another connection rejected");
+  assert.equal(isolateFragmentRowsForOwner(sellerFragment(rows), { ...ownerOf("S1"), organizationFingerprint: "OTHER" }).rejected, true);
+  assert.equal(isolateFragmentRowsForOwner(sellerFragment(rows), { ...ownerOf("S1"), connectionId: "dd-secondary" }).rejected, true);
+  const cat = { rows: [{ child_asin: "A" }], sourceScope: "organization", sellerOrVendorIds: SELLERS, organizationFingerprint: ORG, connectionId: "primary" };
+  assert.strictEqual(isolateFragmentRowsForOwner(cat, ownerOf("S1")).rows, cat.rows, "catalog unchanged");
+  assert.strictEqual(isolateFragmentRowsForOwner(sellerFragment(rows), null).rows, rows, "no owner => passthrough");
 });
 
-test("B6. Product Catalog (organization-wide) is NEVER seller-filtered, even with an owner", () => {
-  const catRows = [{ child_asin: "A", product_brand: "Acme" }, { child_asin: "B", product_brand: "Beta" }];
-  const frag = { rows: catRows, columns: catalogColumns(), sellerOrVendorIds: SELLERS, organizationFingerprint: ORG, connectionId: "primary" };
-  const iso = isolateFragmentRowsForOwner(frag, ownerOf("S1"));
-  assert.strictEqual(iso.rows, catRows, "catalog rows pass through unchanged");
-  assert.deepEqual(iso.sellerOrVendorIds, SELLERS, "catalog scope is NOT narrowed");
+test("B4. isBatchedSellerFragment / missingOwnerFields classify correctly", () => {
+  assert.equal(isBatchedSellerFragment({ sourceScope: "seller", sellerOrVendorIds: SELLERS }), true);
+  assert.equal(isBatchedSellerFragment({ sourceScope: "seller", sellerOrVendorIds: ["S1"] }), false, "single-account is not a batch");
+  assert.equal(isBatchedSellerFragment({ sourceScope: "organization", sellerOrVendorIds: SELLERS }), false, "organization is not seller-batched");
+  assert.deepEqual(missingOwnerFields(ownerOf("S1")), []);
+  assert.ok(missingOwnerFields({ accountId: "A", rawSellerId: "S1" }).includes("connectionId"), "incomplete owner is flagged");
+  assert.ok(missingOwnerFields(null).length === 5);
 });
 
-test("B7. no owner => byte-identical passthrough (legacy single-account path)", () => {
-  const rows = sharedPayload();
-  const iso = isolateFragmentRowsForOwner(oliFragment(rows), null);
-  assert.strictEqual(iso.rows, rows); assert.deepEqual(iso.sellerOrVendorIds, SELLERS); assert.equal(iso.rejected, false);
+/* ============================= Part C: contract scope consistency ============================= */
+group("Part C: explicit source scope contract consistency");
+
+test("C1. the REAL contracts are scope-consistent; sourceScope is per-contract", () => {
+  const allow = assertSourceScopeConsistency(); // throws on any drift
+  assert.ok(allow.includes("brand-sales:order-lines") && allow.includes("returns-leakage:oli-sales"));
+  assert.equal(sourceScopeForContract({ requestKey: "brand-sales:order-lines" }), "seller");
+  assert.equal(sourceScopeForContract({ requestKey: "brand-sales:catalog" }), "organization");
+  // The SAME source family (order-line-items) is organization-scoped when its contract carries no seller id.
+  assert.equal(sourceScopeForContract({ requestKey: "reconciliation:order-lines" }), "organization");
 });
 
-/* ============================= Part C: assembleSources owner-aware ============================= */
-group("Part C: assembleSources per-account assembly");
+test("C2. a declared-seller contract missing seller_or_vendor_id, or an undeclared contract carrying it, fails closed", () => {
+  assert.throws(() => assertSourceScopeConsistency({ r: [{ requestKey: "brand-sales:order-lines", columns: ["date"] }] }), /omits seller_or_vendor_id/);
+  assert.throws(() => assertSourceScopeConsistency({ r: [{ requestKey: "not-declared:oli", columns: ["seller_or_vendor_id"] }] }), /declared seller-scoped/);
+});
 
-// Build planned report sources: a batched OLI fragment (seller-scoped) + a catalog fragment (org-wide).
-function plannedReportSources(batch) {
-  return [
-    { requestKey: "returns-leakage:oli-sales", requestHash: batch.requestHash, from: FROM, to: TO, sellerOrVendorIds: SELLERS, requestMeta: batch.requestMeta, organizationFingerprint: ORG, connectionId: "primary" },
-    { requestKey: "returns-leakage:catalog", requestHash: "catalogHash", from: null, to: null, sellerOrVendorIds: SELLERS, columns: catalogColumns(), organizationFingerprint: ORG, connectionId: "primary" },
-  ];
+test("C3. the resolver fails a seller contract that omits seller_or_vendor_id BEFORE any I/O", () => {
+  // reportSourceRequestHashes is pure (no I/O); brand-sales:order-lines is seller-scoped and DOES carry the
+  // column, so a real plan resolves. (The negative is covered structurally by C2 on the shared validator.)
+  const resolved = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: SELLERS, windowsByRequestKey: brandWindows(), marketplaceCountry: MKT });
+  const oli = resolved.find((r) => r.requestKey === "brand-sales:order-lines");
+  assert.equal(oli.sourceScope, "seller"); assert.equal(oli.marketplaceScoped, true);
+  assert.equal(resolved.find((r) => r.requestKey === "brand-sales:catalog").sourceScope, "organization");
+});
+
+/* ============================= Part D: source worker passes marketplace + rejects ============================= */
+group("Part D: source worker batch validation (marketplace actually passed)");
+
+function brandWindows() {
+  return { "brand-sales:order-lines": [{ from: FROM, to: TO }], "brand-sales:catalog": [{ from: FROM, to: TO }] };
 }
-
-test("C1. assembleSources with an owner isolates OLI rows per account and keeps catalog organization-wide", () => {
-  const batch = resolvedBatch();
-  const sources = plannedReportSources(batch);
-  const status = { [batch.requestHash]: "succeeded", catalogHash: "succeeded" };
-  const catRows = [{ child_asin: "A", product_brand: "Acme" }];
-  const loaded = new Map([[batch.requestHash, { rows: sharedPayload() }], ["catalogHash", { rows: catRows }]]);
-  for (const sid of SELLERS.slice(0, 4)) {
-    const { sources: asm } = assembleSources(sources, status, loaded, {}, ownerOf(sid));
-    const oli = asm["returns-leakage:oli-sales"];
-    assert.ok(oli.available && oli.rows.every((r) => r.seller_or_vendor_id === sid), sid + " OLI rows isolated");
-    assert.equal(oli.rows.length, 2);
-    assert.deepEqual(oli.fragments[0].sellerOrVendorIds, [sid], "fragment scope narrowed to [rawSellerId]");
-    // Catalog stays organization-wide (unfiltered, full scope). assembleSources always rebuilds the rows
-    // array (flatMap over fragments), so it is a NEW array with the SAME values -- never seller-filtered.
-    assert.deepEqual(asm["returns-leakage:catalog"].rows, catRows);
-    assert.deepEqual(asm["returns-leakage:catalog"].fragments[0].sellerOrVendorIds, SELLERS);
-  }
-});
-
-test("C2. an owner with zero rows => available with an EMPTY rows array (valid-empty)", () => {
-  const batch = resolvedBatch();
-  const sources = plannedReportSources(batch);
-  const status = { [batch.requestHash]: "succeeded", catalogHash: "succeeded" };
-  const loaded = new Map([[batch.requestHash, { rows: sharedPayload() }], ["catalogHash", { rows: [] }]]);
-  const { sources: asm } = assembleSources(sources, status, loaded, {}, ownerOf("S5"));
-  assert.equal(asm["returns-leakage:oli-sales"].available, true);
-  assert.deepEqual(asm["returns-leakage:oli-sales"].rows, []);
-});
-
-test("C3. no owner => byte-identical to the legacy assembly (full batch rows, full scope)", () => {
-  const batch = resolvedBatch();
-  const sources = plannedReportSources(batch);
-  const status = { [batch.requestHash]: "succeeded", catalogHash: "succeeded" };
-  const payload = sharedPayload();
-  const loaded = new Map([[batch.requestHash, { rows: payload }], ["catalogHash", { rows: [] }]]);
-  const legacy = assembleSources(sources, status, loaded, {});
-  const explicitNull = assembleSources(sources, status, loaded, {}, null);
-  assert.equal(legacy.sources["returns-leakage:oli-sales"].rows.length, payload.length, "legacy sees the full batch");
-  assert.deepEqual(legacy.sources["returns-leakage:oli-sales"].fragments[0].sellerOrVendorIds, SELLERS, "legacy scope unchanged");
-  assert.deepEqual(explicitNull.sources["returns-leakage:oli-sales"].rows, legacy.sources["returns-leakage:oli-sales"].rows);
-});
-
-test("C4. a cross-org owner makes the seller-scoped source UNAVAILABLE (fail closed, LKG preserved)", () => {
-  const batch = resolvedBatch();
-  const sources = plannedReportSources(batch);
-  const status = { [batch.requestHash]: "succeeded", catalogHash: "succeeded" };
-  const loaded = new Map([[batch.requestHash, { rows: sharedPayload() }], ["catalogHash", { rows: [] }]]);
-  const crossOrg = { accountId: "ACC-S1", rawSellerId: "S1", connectionId: "primary", organizationFingerprint: "orgFingerprintOTHER" };
-  const { sources: asm } = assembleSources(sources, status, loaded, {}, crossOrg);
-  assert.equal(asm["returns-leakage:oli-sales"].available, false, "cross-org => source unavailable, never attributes rows");
-});
-
-/* ============================= Part D: end-to-end save + isolation ============================= */
-group("Part D: five-account batch -> ONE cached object -> per-account isolation");
+function brandBatch(sellers = SELLERS) {
+  const resolved = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: sellers, windowsByRequestKey: brandWindows(), marketplaceCountry: MKT });
+  return { oli: resolved.find((r) => r.requestKey === "brand-sales:order-lines"), cat: resolved.find((r) => r.requestKey === "brand-sales:catalog") };
+}
+// A brand-sales OLI row for a seller with a distinct sales value (to prove per-account isolation downstream).
+const oliRow = (sid, i, mkt = MKT) => ({ date: TO, seller_or_vendor_id: sid, seller_or_vendor_name: "N-" + sid, marketplace_country_code: mkt, item_price_currency: "USD", child_asin: "ASIN-" + sid, total_sales_sum: 100 * i, total_units_sold_sum: i });
 
 function makeSourceStore() {
   const cycles = new Map(); const jobs = new Map(); const cache = new Map(); let seq = 0;
@@ -250,73 +181,119 @@ function makeSourceStore() {
     updateCycleCounts() { /* not asserted */ },
   };
 }
+const batchDataDoe = (payload) => ({ createCount: {}, async create(job) { this.createCount[job.requestHash] = (this.createCount[job.requestHash] || 0) + 1; return { exportId: "e_" + job.requestHash }; }, async poll() {}, async download() { return payload; } });
 
-// A DataDoe fake whose download returns the WHOLE batch payload (rows for S1..S4, S5 has none).
-function makeBatchDataDoe(payload) {
-  const create = {};
-  const bump = (h) => { create[h] = (create[h] || 0) + 1; };
-  return { createCount: (h) => create[h] || 0, async create(job) { bump(job.requestHash); return { exportId: "e_" + job.requestHash }; }, async poll() {}, async download() { return payload; } };
-}
-
-test("D1. a five-account OLI batch validates, saves ONE canonical object, and each owner isolates its own rows (S5 valid-empty)", async () => {
-  const batch = resolvedBatch();
-  const batchAccounts = SELLERS.map((s) => ({ accountId: "ACC-" + s, rawSellerId: s }));
-  const jobs = plannedBatchSourceJobs("returns-leakage", batch, "us", "primary", batchAccounts);
-  assert.equal(jobs.length, 5, "five owner jobs");
-  assert.equal(new Set(jobs.map((j) => j.requestHash)).size, 1, "one shared canonical request_hash");
-
-  const payload = SELLERS.slice(0, 4).flatMap((s) => [oliRow(s, s + "a"), oliRow(s, s + "b")]); // S5 => no rows
+test("D1. the worker PASSES the batch marketplace expectation: a CA row in a US batch rejects before save", async () => {
+  const { oli } = brandBatch();
+  const jobs = plannedBatchSourceJobs("brand-sales", oli, "us", "primary", SELLERS.map((s) => ({ accountId: "ACC-" + s, rawSellerId: s })), MKT);
+  const badMkt = SELLERS.map((s, i) => oliRow(s, i + 1, s === "S3" ? "CA" : MKT)); // S3 row is cross-marketplace
   const store = makeSourceStore();
-  const dd = makeBatchDataDoe(payload);
-  const res = await runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, bucket: "us", cycleDate: CYCLE_DATE });
-  assert.equal(res.succeeded, 1, "the one shared canonical batch job succeeds");
-  assert.equal(dd.createCount(batch.requestHash), 1, "exactly one create-export for the batch");
-
-  // ONE cache object for the batch hash -- no per-account duplicate object/path.
-  assert.equal(store._cache.size, 1, "exactly ONE cached object");
-  const cached = store._cache.get(batch.requestHash);
-  assert.ok(cached && cached.object_path === "source-cache/v2/" + batch.requestHash + ".json", "one canonical object path");
-  assert.equal(cached.rows.length, payload.length, "the one object holds the whole batch payload");
-
-  // Per-owner isolation over the ONE shared object.
-  const status = { [batch.requestHash]: "succeeded" };
-  const loaded = new Map([[batch.requestHash, { rows: cached.rows }]]);
-  const frags = [{ requestKey: "returns-leakage:oli-sales", requestHash: batch.requestHash, from: FROM, to: TO, sellerOrVendorIds: SELLERS, requestMeta: batch.requestMeta, organizationFingerprint: batch.organizationFingerprint, connectionId: "primary" }];
-  for (const j of jobs) {
-    const { sources: asm } = assembleSources(frags, status, loaded, {}, j.owner);
-    const oli = asm["returns-leakage:oli-sales"];
-    assert.equal(oli.available, true, j.owner.rawSellerId + " has validated evidence");
-    assert.ok(oli.rows.every((r) => r.seller_or_vendor_id === j.owner.rawSellerId), j.owner.rawSellerId + " sees only its rows");
-    assert.deepEqual(oli.fragments[0].sellerOrVendorIds, [j.owner.rawSellerId], "scope narrowed to the owner's raw id");
-  }
-  const s5 = jobs.find((j) => j.owner.rawSellerId === "S5");
-  const { sources: asmS5 } = assembleSources(frags, status, loaded, {}, s5.owner);
-  assert.deepEqual(asmS5["returns-leakage:oli-sales"].rows, [], "S5 (no rows in the batch) is valid-empty");
-  // The shared cached object is still ONE and unchanged after all isolation.
-  assert.equal(store._cache.size, 1, "still exactly one cached object");
-  assert.equal(store._cache.get(batch.requestHash).rows.length, payload.length, "shared object unchanged");
+  const res = await runSourceJobs({ store, dataDoe: batchDataDoe(badMkt), plannedJobs: jobs, bucket: "us", cycleDate: "2026-08-17" });
+  assert.equal(res.succeeded, 0, "cross-marketplace batch is not saved");
+  assert.equal(store._cache.size, 0, "nothing persisted (LKG preserved)");
+  assert.equal(store._rawJob(res.cycleId, oli.requestHash).error_code, "BATCH_CROSS_MARKETPLACE", "worker used the passed marketplace constraint");
 });
 
-test("D2. a batch download containing an OUT-OF-BATCH seller id FAILS validation BEFORE success (no save)", async () => {
-  const batch = resolvedBatch();
-  const batchAccounts = SELLERS.map((s) => ({ accountId: "ACC-" + s, rawSellerId: s }));
-  const jobs = plannedBatchSourceJobs("returns-leakage", batch, "us", "primary", batchAccounts);
-  const badPayload = [oliRow("S1", "a"), oliRow("S9", "b")]; // S9 is not a batch seller
+test("D2. a clean US batch validates and saves ONE canonical object", async () => {
+  const { oli } = brandBatch();
+  const jobs = plannedBatchSourceJobs("brand-sales", oli, "us", "primary", SELLERS.map((s) => ({ accountId: "ACC-" + s, rawSellerId: s })), MKT);
+  const payload = SELLERS.map((s, i) => oliRow(s, i + 1));
   const store = makeSourceStore();
-  const res = await runSourceJobs({ store, dataDoe: makeBatchDataDoe(badPayload), plannedJobs: jobs, bucket: "us", cycleDate: CYCLE_DATE });
-  assert.equal(res.succeeded, 0, "no success on a cross-account batch");
-  assert.equal(store._cache.size, 0, "nothing saved (LKG preserved)");
-  const jobRow = store._rawJob(res.cycleId, batch.requestHash);
-  assert.equal(jobRow.fetch_status, "failed"); assert.equal(jobRow.error_stage, "validate"); assert.equal(jobRow.error_code, "BATCH_CROSS_ACCOUNT");
+  const dd = batchDataDoe(payload);
+  const res = await runSourceJobs({ store, dataDoe: dd, plannedJobs: jobs, bucket: "us", cycleDate: "2026-08-17" });
+  assert.equal(res.succeeded, 1); assert.equal(store._cache.size, 1, "ONE canonical object");
+  assert.equal(dd.createCount[oli.requestHash], 1, "one create-export");
+});
+
+/* ============================= Part E: REAL report worker per-account isolation ============================= */
+group("Part E: real report worker derives five accounts from ONE cached batch");
+
+function makeReportStore(sourceJobRows) {
+  const reportJobs = new Map(); const rkey = (rk, a) => rk + "|" + a;
+  return {
+    _reports: reportJobs,
+    listSourceJobs() { return sourceJobRows.map((j) => ({ ...j })); },
+    upsertReportJob({ reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) { const k = rkey(reportKey, accountId); if (reportJobs.has(k)) return; reportJobs.set(k, { report_key: reportKey, account_id: accountId, connection_id: connectionId, bucket, report_version: reportVersion, depends_on: dependsOn || [], fetch_status: "pending", derive_status: "pending", save_status: "pending", validated: false, error_code: null }); },
+    listReportJobs() { return [...reportJobs.values()].map((j) => ({ ...j })); },
+    claimReportDerive(_c, rk, a) { const j = reportJobs.get(rkey(rk, a)); if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; } return false; },
+    recordReportBlocked({ reportKey, accountId, reason }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped", error_code: "BLOCKED", reason }); },
+    recordReportFailure({ reportKey, accountId, stage, code }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code }); },
+    recordReportSuccess({ reportKey, accountId, latestDataDate }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true, latest_data_date: latestDataDate ?? null }); },
+  };
+}
+
+// Build the shared cached batch + catalog and five per-account brand-sales report jobs (each with owner
+// metadata) that all depend on the ONE shared OLI batch hash. Returns { store, saved, sourceRows, plannedReports, oli }.
+function batchedBrandSalesFixture(ownerMutator = (o) => o) {
+  const { oli, cat } = brandBatch();
+  const owners = plannedBatchSourceJobs("brand-sales", oli, "us", "primary", SELLERS.map((s) => ({ accountId: "ACC-" + s, rawSellerId: s })), MKT);
+  const oliPayload = SELLERS.slice(0, 4).map((s, i) => oliRow(s, i + 1)); // S1..S4 have sales; S5 has NONE
+  const catPayload = SELLERS.map((s) => ({ child_asin: "ASIN-" + s, parent_asin: "P-" + s, product_name: "Name-" + s, product_brand: "Brand-" + s }));
+  const sourceJobRows = [
+    { request_hash: oli.requestHash, request_key: oli.requestKey, fetch_status: "succeeded", error_code: null },
+    { request_hash: cat.requestHash, request_key: cat.requestKey, fetch_status: "succeeded", error_code: null },
+  ];
+  const cache = new Map([[oli.requestHash, { rows: oliPayload }], [cat.requestHash, { rows: catPayload }]]);
+  const frag = (r) => ({ ...r, connectionId: "primary", optional: false, disabledPolicy: null });
+  const plannedReports = owners.map((j) => ({
+    reportKey: "brand-sales", accountId: j.owner.accountId, connectionId: "primary", bucket: "us",
+    owner: ownerMutator({ ...j.owner }),
+    sources: [frag(oli), frag(cat)],
+    context: { to: TO, rawSellerId: j.owner.rawSellerId },
+  }));
+  const saved = new Map();
+  const store = makeReportStore(sourceJobRows);
+  const sourceRows = (hash) => (cache.has(hash) ? { rows: cache.get(hash).rows } : null);
+  const saveSnapshot = ({ accountId, payload }) => { saved.set(accountId, payload); return { paramsHash: "h-" + accountId }; };
+  return { store, saved, sourceRows, saveSnapshot, plannedReports, oli, cache };
+}
+
+test("E1. five report jobs derive from ONE cached batch; each account's snapshot has ONLY its own seller rows", async () => {
+  const fx = batchedBrandSalesFixture();
+  const r = await runReportJobs({ store: fx.store, cycleId: "cyc", sourceRows: fx.sourceRows, saveSnapshot: fx.saveSnapshot, plannedReports: fx.plannedReports });
+  assert.equal(r.succeeded, 5, "all five accounts derive (four with sales, one validated-empty)");
+  // S1..S4: each snapshot contains ONLY that account's seller_or_vendor_id, and its own total sales.
+  for (let i = 0; i < 4; i += 1) {
+    const s = SELLERS[i];
+    const payload = fx.saved.get("ACC-" + s);
+    assert.ok(payload, "ACC-" + s + " saved a snapshot");
+    assert.ok(payload.rows.length >= 1 && payload.rows.every((row) => row.seller_or_vendor_id === s), "ACC-" + s + " snapshot has only its seller rows");
+    const total = payload.rows.reduce((a, row) => a + (row.total_sales || 0), 0);
+    assert.equal(total, 100 * (i + 1), "ACC-" + s + " sees only its own sales (" + (100 * (i + 1)) + ")");
+    for (const other of SELLERS) if (other !== s) assert.ok(payload.rows.every((row) => row.seller_or_vendor_id !== other), "ACC-" + s + " never has " + other + " rows");
+  }
+  // S5 has NO rows in the shared batch: its SALES evidence is validated-EMPTY (never another account's rows).
+  assert.deepEqual(fx.saved.get("ACC-S5").rows, [], "S5 (no rows in the batch) derives validated-empty sales");
+  // Zero cross-account writes: the union of every saved account's seller ids is exactly {S1..S4} with no leakage.
+  const allSellers = new Set([...fx.saved.values()].flatMap((p) => p.rows.map((row) => row.seller_or_vendor_id)));
+  assert.deepEqual([...allSellers].sort(), ["S1", "S2", "S3", "S4"]);
+});
+
+test("E2. a batched seller report with MISSING owner metadata FAILS CLOSED (never the full-batch path; LKG preserved)", async () => {
+  // Strip planned.owner entirely on one report -- it must fail closed rather than derive from the full batch.
+  const fx = batchedBrandSalesFixture();
+  fx.plannedReports[0].owner = null;
+  const r = await runReportJobs({ store: fx.store, cycleId: "cyc", sourceRows: fx.sourceRows, saveSnapshot: fx.saveSnapshot, plannedReports: fx.plannedReports });
+  const jobRow = fx.store._reports.get("brand-sales|ACC-S1");
+  assert.equal(jobRow.derive_status, "failed"); assert.equal(jobRow.error_code, "OWNER_BINDING_MISSING");
+  assert.equal(fx.saved.has("ACC-S1"), false, "no snapshot saved for the unbound account (LKG preserved)");
+  assert.ok(r.succeeded >= 1, "the other correctly-bound accounts still derive");
+});
+
+test("E3. a batched seller report with an owner MISSING org/connection FAILS CLOSED", async () => {
+  const fx = batchedBrandSalesFixture((o) => (o.accountId === "ACC-S2" ? { accountId: o.accountId, rawSellerId: o.rawSellerId } : o));
+  await runReportJobs({ store: fx.store, cycleId: "cyc", sourceRows: fx.sourceRows, saveSnapshot: fx.saveSnapshot, plannedReports: fx.plannedReports });
+  const jobRow = fx.store._reports.get("brand-sales|ACC-S2");
+  assert.equal(jobRow.error_code, "OWNER_BINDING_MISSING", "incomplete owner (no org/connection) fails closed");
+  assert.equal(fx.saved.has("ACC-S2"), false);
 });
 
 async function main() {
-  ({ validateBatchSourcePayload, isolateFragmentRowsForOwner, isSellerScopedColumns } = await import("../lib/server/sync/source-account-isolation.js"));
-  ({ assembleSources, runSourceJobs } = await import("../lib/server/sync/report-worker.js").then(async (rw) => ({ assembleSources: rw.assembleSources, runSourceJobs: (await import("../lib/server/sync/source-worker.js")).runSourceJobs })));
+  ({ validateBatchSourcePayload, isolateFragmentRowsForOwner, isBatchedSellerFragment, missingOwnerFields } = await import("../lib/server/sync/source-account-isolation.js"));
+  ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));
+  ({ runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ plannedBatchSourceJobs } = await import("../lib/server/sync/source-sync-driver.js"));
-  ({ sourceRequestIdentity } = await import("../lib/server/source-identity.js"));
-  ({ REPORT_SOURCE_CONTRACTS } = await import("../lib/server/sync/report-source-contracts.js"));
-  ({ SOURCE_CONTRACTS } = await import("../lib/server/source-contracts.js"));
+  ({ reportSourceRequestHashes, assertSourceScopeConsistency, sourceScopeForContract } = await import("../lib/server/sync/report-source-contracts.js"));
 
   let failures = 0;
   for (const t of tests) {

@@ -882,6 +882,68 @@ export function reportAccountScope(reportKey) {
   return REPORT_SOURCE_SCOPE[reportKey] || "multi-account";
 }
 
+/* ===================== source scope policy (Blocker 4c correction, Finding 2) =====================
+ * The TYPED, IMMUTABLE per-CONTRACT scope. A contract is identified by its request_key (the same source
+ * family, e.g. order-line-items, is fetched by DIFFERENT contracts with different column sets -- some carry
+ * seller_or_vendor_id, some do not -- so scope is per contract, never per source family):
+ *   - "seller"       -- rows carry seller_or_vendor_id, so a source batched across <=5 accounts can be split
+ *                       back to each account (per-account isolation at derive time);
+ *   - "organization" -- organization-wide (Product Catalog) OR single-account; NEVER seller-filtered.
+ * SELLER_SCOPED_REQUEST_KEYS is the EXPLICIT allowlist of contracts approved for cross-account batching (the
+ * ONLY seller-scoped contracts). Scope is DECLARED here, never inferred SOLELY from columns; but
+ * assertSourceScopeConsistency cross-checks BOTH ways -- every declared seller contract MUST carry
+ * seller_or_vendor_id, and NO other contract may carry it -- so the declaration can never silently drift.
+ * Product Catalog stays organization-wide and is never seller-filtered.
+ */
+export const SELLER_SCOPED_REQUEST_KEYS = Object.freeze([
+  "brand-sales:order-lines",
+  "daily-reporting:oli-sales",
+  "fba-plan:oli-sales",
+  "buy-box-loss:oli-sales",
+  "returns-leakage:oli-sales",
+  "ppc-performance:oli-sales",
+]);
+const SELLER_SCOPED_SET = new Set(SELLER_SCOPED_REQUEST_KEYS);
+
+// The per-account attribution column every seller-scoped contract MUST carry so a batched export can be split.
+export const SELLER_SCOPE_COLUMN = "seller_or_vendor_id";
+
+// The DECLARED scope for a resolved/contract entry: "seller" iff its request_key is on the explicit
+// seller-scoped allowlist, else "organization". Fail closed on a malformed contract (no request_key).
+export function sourceScopeForContract(c) {
+  const rk = c && typeof c.requestKey === "string" ? c.requestKey : "";
+  if (rk === "") throw new Error("sourceScopeForContract requires a contract with a request_key (fail closed).");
+  return SELLER_SCOPED_SET.has(rk) ? "seller" : "organization";
+}
+
+// True iff a contract's columns/grouping carry the seller attribution column.
+function contractCarriesSellerId(c) {
+  const cols = Array.isArray(c.columns) ? c.columns.map(String) : [];
+  const grp = Array.isArray(c.groupBy) ? c.groupBy.map(String) : [];
+  return cols.includes(SELLER_SCOPE_COLUMN) || grp.includes(SELLER_SCOPE_COLUMN);
+}
+
+// STATIC contract consistency (fail closed before any I/O): every declared seller-scoped contract MUST carry
+// seller_or_vendor_id, AND no other contract may carry it without being declared seller-scoped -- so a new
+// seller-carrying source can never silently take the organization-wide (unfiltered) path. Returns the frozen
+// seller-scoped allowlist; throws on the first violation.
+export function assertSourceScopeConsistency(contractsByReport = REPORT_SOURCE_CONTRACTS) {
+  for (const contracts of Object.values(contractsByReport)) {
+    for (const c of contracts || []) {
+      if (!c || typeof c.requestKey !== "string" || c.requestKey.trim() === "") continue;
+      const declaredSeller = SELLER_SCOPED_SET.has(c.requestKey);
+      const carries = contractCarriesSellerId(c);
+      if (declaredSeller && !carries) {
+        throw new Error(`Seller-scoped contract "${c.requestKey}" omits ${SELLER_SCOPE_COLUMN} from its columns/grouping; per-account attribution is impossible (fail closed).`);
+      }
+      if (!declaredSeller && carries) {
+        throw new Error(`Contract "${c.requestKey}" carries ${SELLER_SCOPE_COLUMN} but is NOT declared seller-scoped; refusing to plan it organization-wide (fail closed).`);
+      }
+    }
+  }
+  return Object.freeze([...SELLER_SCOPED_REQUEST_KEYS]);
+}
+
 // True when a report requires single-account source jobs (no cross-account batching).
 export function requiresSingleAccountSource(reportKey) {
   return reportAccountScope(reportKey) === "single-account";
@@ -1656,6 +1718,19 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
       orderByColumn: c.orderByColumn,
       orderByDirection: c.orderByDirection,
     };
+    // Finding 2: the typed per-contract source scope, and the seller-scoped attribution guarantee (a
+    // seller-scoped contract MUST carry seller_or_vendor_id) -- both enforced BEFORE any source job/I/O.
+    const sourceScope = sourceScopeForContract(c);
+    if (sourceScope === "seller") {
+      const cols = Array.isArray(c.columns) ? c.columns.map(String) : [];
+      const grp = Array.isArray(c.groupBy) ? c.groupBy.map(String) : [];
+      if (!cols.includes(SELLER_SCOPE_COLUMN) && !grp.includes(SELLER_SCOPE_COLUMN)) {
+        throw new Error(`Seller-scoped contract "${c.requestKey}" must include ${SELLER_SCOPE_COLUMN} in its columns/grouping for per-account attribution; refusing to plan (fail closed).`);
+      }
+    }
+    // Finding 3: whether this contract fetched marketplace_country_code (so the source worker can require a
+    // canonical marketplace on every non-empty batch row when it does).
+    const marketplaceScoped = Array.isArray(c.columns) && c.columns.map(String).includes("marketplace_country_code");
     for (const w of wins) {
       const from = w && w.from != null ? w.from : null;
       const to = w && w.to != null ? w.to : null;
@@ -1672,6 +1747,11 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
           to,
           limit: c.limit,
           options,
+          // Finding 2/3: typed immutable per-source scope + marketplace-column presence, carried into the
+          // planned job so per-account isolation (report worker) and batch validation (source worker) key off
+          // an EXPLICIT declaration, never a column heuristic.
+          sourceScope,
+          marketplaceScoped,
           requestHash: identity.requestHash,
           organizationFingerprint: identity.organizationFingerprint,
           accountScopeHash: identity.accountScopeHash,

@@ -28,7 +28,7 @@
 import { reportFetchGate } from "./planner.js";
 import { REPORT_DERIVATIONS, deriveReportSnapshot, shadowSnapshotKey } from "./report-derivation.js";
 import { MAX_SNAPSHOT_BYTES, snapshotByteSize } from "../report-limits.js";
-import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
+import { isolateFragmentRowsForOwner, isBatchedSellerFragment, missingOwnerFields } from "./source-account-isolation.js";
 // Strict UTC calendar-date rule (rejects 2026-02-30 / 2026-99-99 / 2023-02-29; accepts
 // 2024-02-29), reused from the contracts leaf so there is one implementation.
 import { isValidCalendarDate } from "./report-source-contracts.js";
@@ -137,10 +137,22 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     try { payload = await sourceRows(s.requestHash); } catch (_e) { payload = null; }
     loadedByHash.set(s.requestHash, payload);
   }
-  // Blocker 4c: when this report/account is an OWNER of a shared <=5-account BATCH source, its authoritative
-  // { accountId, rawSellerId, connectionId, organizationFingerprint } (the planned owner metadata from
-  // corrected 4b) drives per-account row isolation inside assembleSources. A single-account report carries no
-  // such owner (planned.owner absent) and takes the byte-identical legacy path.
+  // Blocker 4c (correction, Finding 1): a report that depends on a BATCHED seller-scoped source (a declared
+  // seller source covering >1 canonical seller id) MUST carry COMPLETE authoritative owner metadata
+  // (accountId, rawSellerId, connectionId, organizationFingerprint, accountScopeHash) so its rows can be
+  // isolated to exactly this account. Missing/incomplete owner metadata FAILS CLOSED here -- it must NEVER
+  // fall through to the legacy full-batch path (which would leak every batch member's rows into this account).
+  // Legacy no-owner assembly is allowed ONLY for genuinely single-account plans (no batched seller source).
+  const batchedSeller = (planned.sources || []).some((s) => isBatchedSellerFragment(s));
+  if (batchedSeller) {
+    const missing = missingOwnerFields(planned.owner);
+    if (missing.length) {
+      return fail("derive", "OWNER_BINDING_MISSING", `A batched seller-scoped report requires complete owner metadata; missing/blank: ${missing.join(", ")}. Refusing to derive (fail closed).`, true);
+    }
+  }
+  // When this report/account is an OWNER of a shared <=5-account BATCH source, its authoritative owner metadata
+  // (from corrected 4b) drives per-account row isolation inside assembleSources. A single-account report carries
+  // no such owner (planned.owner absent) and takes the byte-identical legacy path.
   const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash, errorByHash, planned.owner || null);
 
   // Load DERIVE-ONLY injected inputs (persisted non-DataDoe rows, e.g. the scheduled Ads rows for
@@ -280,7 +292,7 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash, erro
     // (rows -> null), leaving the source unavailable rather than attributing cross-org rows.
     let scopeIds = s.sellerOrVendorIds || null;
     if (owner && rows !== null) {
-      const iso = isolateFragmentRowsForOwner({ rows, columns: s.columns, requestMeta: s.requestMeta, sellerOrVendorIds: scopeIds, organizationFingerprint: s.organizationFingerprint, connectionId: s.connectionId }, owner);
+      const iso = isolateFragmentRowsForOwner({ rows, sourceScope: s.sourceScope, sellerOrVendorIds: scopeIds, organizationFingerprint: s.organizationFingerprint, connectionId: s.connectionId }, owner);
       rows = iso.rows;
       scopeIds = iso.sellerOrVendorIds;
     }

@@ -262,15 +262,24 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     return fail("validate", "TRUNCATED", "Result reached the row cap; partial data was not saved.", true, rows.length);
   }
 
-  // ---- Blocker 4c: BATCH INTEGRITY. A seller-scoped source fetched over a <=5-account BATCH (more than one
-  // canonical seller id) must contain ONLY rows for those exact sellers, so ONE canonical payload can be split
-  // back per account at derive time. Reject the WHOLE batch (never saved) on any blank/unknown/cross-account
-  // (cross-org) seller id; a zero-row batch stays valid-empty. A single-account source (<=1 id) and a
-  // non-seller-scoped source (no seller_or_vendor_id column, e.g. Product Catalog) are unaffected. ----
+  // ---- Blocker 4c: BATCH INTEGRITY. A DECLARED seller-scoped source fetched over a <=5-account BATCH (more
+  // than one canonical seller id) must contain ONLY rows for those exact sellers -- and, when the contract
+  // fetched marketplace_country_code, ONLY the batch's canonical marketplace -- so ONE canonical payload can be
+  // split back per account at derive time. Reject the WHOLE batch (never saved) on any malformed row, blank/
+  // unknown/cross-account seller id, or blank/mismatched marketplace; a zero-row batch stays valid-empty. A
+  // single-account source (<=1 id) and an organization-scoped source (e.g. Product Catalog) are unaffected.
+  // The scope + marketplace expectation come from the IMMUTABLE planned metadata (Findings 2 & 3), never a
+  // column heuristic; an unknown/missing scope on a batch fails closed. ----
   const fp = job.fetchParams || {};
   const batchIds = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
   if (batchIds.length > 1) {
-    const bv = validateBatchSourcePayload({ rows, sellerOrVendorIds: batchIds, columns: fp.columns });
+    const bv = validateBatchSourcePayload({
+      rows,
+      sellerOrVendorIds: batchIds,
+      sourceScope: job.sourceScope,
+      marketplaceScoped: job.marketplaceScoped === true,
+      marketplaceCountry: job.marketplaceConstraint ?? null,
+    });
     if (!bv.valid) {
       return fail("validate", bv.code || "BATCH_INVALID", bv.reason || "Batch payload failed per-account integrity validation; result not saved.", true, rows.length);
     }
