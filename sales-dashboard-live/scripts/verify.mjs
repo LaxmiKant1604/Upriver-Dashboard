@@ -41,6 +41,7 @@ const SUITES = [
   "test:oli-source-correction",
   "test:source-tranche",
   "test:source-batching",
+  "test:source-account-isolation",
   "test:schema-contract-mutation",
   "test:report-sync-controls",
   "test:gate5-canary-package",

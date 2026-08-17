@@ -363,7 +363,9 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
     createCount: () => 0, totalCreates: () => 0,
     create: async (job) => { seen.push(job); return { exportId: "e" }; },
     poll: async () => {},
-    download: async () => [{ ok: 1 }],
+    // A batch download returns one row per canonical batch seller (Blocker 4c batch integrity); the catalog
+    // job is organization-wide (not seller-scoped) so its rows are never seller-validated.
+    download: async (job) => (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, ok: 1 })),
   };
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: planned }));
   // Deduped by request_hash: the two distinct canonical sources (order-lines + catalog) each succeed once.
@@ -397,7 +399,8 @@ test("five-ID chunks remain separate jobs, each created once; primary/dd-seconda
   assert.equal(new Set(oli.map((j) => j.requestHash)).size, 2); // two OLI chunks => two distinct canonical hashes
   const pHashes = new Set(primary.map((j) => j.requestHash));
   for (const j of secondary) assert.ok(!pHashes.has(j.requestHash));
-  const dd = makeDataDoe(() => ({ rows: [{ a: 1 }] }));
+  // Each batch download returns one row per canonical batch seller so Blocker 4c batch integrity passes.
+  const dd = makeDataDoe((job) => ({ rows: (job.fetchParams.sellerOrVendorIds || []).map((sid) => ({ seller_or_vendor_id: sid, a: 1 })) }));
   await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [...primary, ...secondary] }));
   for (const j of oli) assert.equal(dd.createCount(j.requestHash), 1);
 });

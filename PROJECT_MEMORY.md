@@ -1,5 +1,45 @@
 # Project Memory
 
+## Scheduler v2 Blocker 4c — per-account isolation of a shared <=5-account batch source (2026-08-17)
+
+Implemented Blocker 4c on `main`: derive-time per-account isolation of rows loaded from ONE shared batched
+source (NOT the global fixpoint orchestrator; still offline/unwired). SHADOW MODE; nothing
+pushed/merged/deployed/migrated/enabled; no DataDoe/Supabase/controls/publishing/scheduling. Full
+`npm run verify` green (45 steps across 25 suites incl. build:check, 2,395 modules).
+
+New pure module `lib/server/sync/source-account-isolation.js`:
+- **`validateBatchSourcePayload`** — validates a COMPLETE downloaded batch BEFORE save: payload must be an
+  array; a seller-scoped batch's every non-empty row must carry a nonblank `seller_or_vendor_id` that is one
+  of the EXACT canonical `sellerOrVendorIds` (rejects unknown/blank/cross-org, and cross-marketplace when an
+  expected marketplace is supplied); a zero-row batch is VALID-EMPTY; a non-seller-scoped source (no
+  `seller_or_vendor_id` column, e.g. Product Catalog) is never seller-validated. Wired into the source worker's
+  validate stage (STEP 6), gated on seller-scoped + `sellerOrVendorIds.length > 1`, so a single-account source
+  is byte-identical and only genuine batches are checked.
+- **`isolateFragmentRowsForOwner`** — at derive time, filters a shared seller-scoped fragment to ONLY the
+  owner's authoritative `rawSellerId` (a NEW array; the shared cached payload is never mutated), narrows the
+  fragment `sellerOrVendorIds` to exactly `[rawSellerId]`, and REJECTS (rows→null, fail closed) an owner whose
+  organization/connection does not match the batch (the same raw id from another org/connection can never
+  attribute these rows). A Product Catalog fragment and the no-owner legacy path pass through unchanged.
+
+`assembleSources` gained an optional 5th `owner` arg (from `planned.owner`); with no owner it is byte-identical
+to before. `plannedSourceJob`'s owner metadata now also carries the individual `rawSellerId` (the authoritative
+accountId→rawSellerId mapping from corrected 4b) — used ONLY in the in-memory plan, never written to
+`sync_source_job_owners`. ONE canonical batch payload stays in `source_export_cache` (no per-account duplicate
+object). Three batch-fetch test fakes now download one row per canonical batch seller (a real batch export
+carries `seller_or_vendor_id`).
+
+New suite `scripts/source-account-isolation.test.js` (21 assertions): five-account batch → each of five owners
+sees only its own rows; A never sees B/C/D/E; missing/blank/out-of-batch seller rejects the whole batch before
+success; same raw id from another org/connection rejected; zero-row account is valid-empty; shared cache
+object stays ONE and unchanged; fragment scope is exactly `[rawSellerId]`; single-account byte-identical;
+Product Catalog stays organization-wide. Report folds/parity + LKG stay green in the existing report suites.
+
+Files: `lib/server/sync/source-account-isolation.js` (new), `lib/server/sync/source-worker.js`,
+`lib/server/sync/report-worker.js`, `lib/server/sync/source-sync-driver.js`,
+`scripts/source-account-isolation.test.js` (new), `scripts/source-tranche.test.js`,
+`scripts/sync-source-jobs.test.js`, `package.json`, `scripts/verify.mjs`. Golden `request_hash`, five-ID
+batching, and the UNAPPLIED migrations' SQL unchanged. Next: Blocker 4d.
+
 ## Scheduler v2 Blocker 4c prep — senior-review gaps closed (source-batch owner identity + schema audit, 2026-08-17)
 
 Closed the five remaining senior-review gaps on `main` BEFORE starting Blocker 4c. SHADOW MODE unchanged;

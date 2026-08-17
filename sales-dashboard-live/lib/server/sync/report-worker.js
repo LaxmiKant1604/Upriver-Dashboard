@@ -28,6 +28,7 @@
 import { reportFetchGate } from "./planner.js";
 import { REPORT_DERIVATIONS, deriveReportSnapshot, shadowSnapshotKey } from "./report-derivation.js";
 import { MAX_SNAPSHOT_BYTES, snapshotByteSize } from "../report-limits.js";
+import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
 // Strict UTC calendar-date rule (rejects 2026-02-30 / 2026-99-99 / 2023-02-29; accepts
 // 2024-02-29), reused from the contracts leaf so there is one implementation.
 import { isValidCalendarDate } from "./report-source-contracts.js";
@@ -136,7 +137,11 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     try { payload = await sourceRows(s.requestHash); } catch (_e) { payload = null; }
     loadedByHash.set(s.requestHash, payload);
   }
-  const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash, errorByHash);
+  // Blocker 4c: when this report/account is an OWNER of a shared <=5-account BATCH source, its authoritative
+  // { accountId, rawSellerId, connectionId, organizationFingerprint } (the planned owner metadata from
+  // corrected 4b) drives per-account row isolation inside assembleSources. A single-account report carries no
+  // such owner (planned.owner absent) and takes the byte-identical legacy path.
+  const { sources, latestFetchedAt } = assembleSources(planned.sources, statusByHash, loadedByHash, errorByHash, planned.owner || null);
 
   // Load DERIVE-ONLY injected inputs (persisted non-DataDoe rows, e.g. the scheduled Ads rows for
   // Daily Reporting) through an injected callback. These reach the pure adapter via the derive
@@ -254,7 +259,7 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
  *   rows        -- safe concatenation of all fragment rows in that sequence when available
  *                  (identical to sequential fetchExportRows concatenation), else null.
  */
-export function assembleSources(plannedSources, statusByHash, loadedByHash, errorByHash = {}) {
+export function assembleSources(plannedSources, statusByHash, loadedByHash, errorByHash = {}, owner = null) {
   const get = (h) => (loadedByHash instanceof Map ? loadedByHash.get(h) : loadedByHash[h]);
   const errorOf = (h) => (errorByHash instanceof Map ? errorByHash.get(h) : (errorByHash ? errorByHash[h] : null)) || null;
   const byKey = new Map();
@@ -267,13 +272,25 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash, erro
       const payload = get(s.requestHash);
       if (payload && Array.isArray(payload.rows)) { rows = payload.rows; fetchedAt = payload.fetched_at ?? payload.fetchedAt ?? null; }
     }
+    // Blocker 4c: when an OWNER is supplied and THIS fragment is a seller-scoped shared batch, isolate ONLY
+    // this owner's rows (matched by its authoritative rawSellerId) into a NEW array -- the shared cached
+    // payload is never mutated -- and narrow the fragment scope to exactly [rawSellerId] so downstream
+    // single-account validators still fail closed. A Product Catalog (organization-wide) fragment and the
+    // legacy no-owner path are byte-identical. A rawSellerId from another org/connection is rejected
+    // (rows -> null), leaving the source unavailable rather than attributing cross-org rows.
+    let scopeIds = s.sellerOrVendorIds || null;
+    if (owner && rows !== null) {
+      const iso = isolateFragmentRowsForOwner({ rows, columns: s.columns, requestMeta: s.requestMeta, sellerOrVendorIds: scopeIds, organizationFingerprint: s.organizationFingerprint, connectionId: s.connectionId }, owner);
+      rows = iso.rows;
+      scopeIds = iso.sellerOrVendorIds;
+    }
     if (fetchedAt && (!latestFetchedAt || String(fetchedAt) > String(latestFetchedAt))) latestFetchedAt = fetchedAt;
     byKey.get(s.requestKey).push({
       // fragmentIndex is the IMMUTABLE canonical sequence key (the resolver/plan emission
       // order == the account/chunk/window fetch order); the request_hash is NEVER a sort key.
       fragmentIndex,
       requestHash: s.requestHash, requestKey: s.requestKey, from: s.from ?? null, to: s.to ?? null,
-      sellerOrVendorIds: s.sellerOrVendorIds || null, rows, fetchedAt,
+      sellerOrVendorIds: scopeIds || null, rows, fetchedAt,
       jobStatus: jobStatus || "missing",
       // `disabled` is a source-DISABLED setup state, proven ONLY by the durable outcome: the canonical job
       // failed with the safe error_code SOURCE_DISABLED AND a planned disabled/availability policy exists.

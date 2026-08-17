@@ -204,7 +204,14 @@ function makeDataDoe(opts = {}) {
     const rk = job.requestKey || ""; const fp = job.fetchParams || {};
     if (rk.includes("returns-leakage:returns")) return [ret(fp.to || ASOF, "R1", "SKU-R1", "DEFECTIVE", "FBA", "Approved", -5)];
     if (rk.includes("settlements")) return [refund("R1", "SKU-R1", "USD", { amount: -9, commission: -1, unitFee: -1, cogs: -2, qty: -1 })];
-    if (rk.includes("oli-sales")) return [ord("R1", "Widget R1", 100, 10, "USD", fp.to || ASOF)];
+    if (rk.includes("oli-sales")) {
+      // A BATCH (>1 seller id) must download one row per canonical batch seller, each carrying its own
+      // seller_or_vendor_id, so Blocker 4c's batch integrity validation passes. A single-account job keeps the
+      // exact legacy single row (byte-identical).
+      const ids = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
+      if (ids.length > 1) return ids.map((sid) => ({ ...ord("R1", "Widget R1", 100, 10, "USD", fp.to || ASOF), seller_or_vendor_id: sid }));
+      return [ord("R1", "Widget R1", 100, 10, "USD", fp.to || ASOF)];
+    }
     if (rk.includes("catalog")) return [cat("R1", "P1", "Catalog R1", "Acme")];
     return [{ child_asin: "R1" }];
   };

@@ -88,14 +88,18 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
   // single-account source (<=1 seller id) -- a batched source (>1) fails closed.
   const sellerIds = Array.isArray(resolved.sellerOrVendorIds) ? resolved.sellerOrVendorIds : [];
   let ownerScope;
+  let ownerRaw; // the INDIVIDUAL raw seller id this owner represents (Blocker 4c: the authoritative
+                // accountId -> rawSellerId mapping the derive-time per-account isolation relies on).
   if (ownerRawSellerId != null) {
     const raw = String(ownerRawSellerId);
     if (raw.trim() === "") {
       throw new Error("plannedSourceJob: ownerRawSellerId, when supplied, must be a nonblank individual seller id (fail closed).");
     }
     ownerScope = accountScopeHash([raw]);
+    ownerRaw = raw;
   } else if (sellerIds.length <= 1) {
     ownerScope = resolved.accountScopeHash; // single-account source: the canonical scope IS the individual scope
+    ownerRaw = sellerIds.length === 1 ? String(sellerIds[0]) : ""; // the one account's seller id (or none)
   } else {
     throw new Error(`plannedSourceJob: a batched source with ${sellerIds.length} seller ids requires an authoritative individual rawSellerId for its owner scope; refusing to fall back to the canonical batch scope (fail closed).`);
   }
@@ -120,7 +124,9 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     strict: resolved.strict === true,
     limit: resolved.limit,
     // owner.accountScopeHash is the INDIVIDUAL account scope (never the batch scope) -- one exact report/account.
-    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), accountScopeHash: ownerScope },
+    // owner.rawSellerId is that account's authoritative individual seller id (Blocker 4c: the accountId ->
+    // rawSellerId mapping the derive-time per-account isolation uses; NON-secret, already in fetchParams).
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, accountScopeHash: ownerScope },
     fetchParams: {
       columns: contract ? contract.columns : undefined,
       sellerOrVendorIds: resolved.sellerOrVendorIds,

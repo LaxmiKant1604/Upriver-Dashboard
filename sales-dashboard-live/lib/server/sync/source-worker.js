@@ -35,6 +35,7 @@
 
 import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
 import { sourceJobOwnerId } from "../source-identity.js";
+import { validateBatchSourcePayload } from "./source-account-isolation.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -259,6 +260,20 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   }
   if (job.strict === true && rows.length >= Number(job.limit)) {
     return fail("validate", "TRUNCATED", "Result reached the row cap; partial data was not saved.", true, rows.length);
+  }
+
+  // ---- Blocker 4c: BATCH INTEGRITY. A seller-scoped source fetched over a <=5-account BATCH (more than one
+  // canonical seller id) must contain ONLY rows for those exact sellers, so ONE canonical payload can be split
+  // back per account at derive time. Reject the WHOLE batch (never saved) on any blank/unknown/cross-account
+  // (cross-org) seller id; a zero-row batch stays valid-empty. A single-account source (<=1 id) and a
+  // non-seller-scoped source (no seller_or_vendor_id column, e.g. Product Catalog) are unaffected. ----
+  const fp = job.fetchParams || {};
+  const batchIds = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
+  if (batchIds.length > 1) {
+    const bv = validateBatchSourcePayload({ rows, sellerOrVendorIds: batchIds, columns: fp.columns });
+    if (!bv.valid) {
+      return fail("validate", bv.code || "BATCH_INVALID", bv.reason || "Batch payload failed per-account integrity validation; result not saved.", true, rows.length);
+    }
   }
 
   // ---- STEP 7: persist (atomic last-known-good). A save error / empty object path is a
