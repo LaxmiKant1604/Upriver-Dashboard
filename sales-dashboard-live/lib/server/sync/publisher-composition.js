@@ -17,7 +17,7 @@ import { makeProductionDiscoverAccounts } from "./runtime-composition.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import {
-  getReportSyncSettings, getSchedulerAccountRollout, getSchedulerPublishApproval,
+  getReportSyncSettings, getSourcePromotedPublishSettings, getSchedulerAccountRollout, getSchedulerPublishApproval,
   getLatestSyncReportJob, getReportSnapshot, getReportSnapshotStoragePayload, publishLiveSnapshotIfNewer,
 } from "../supabase.js";
 
@@ -33,6 +33,9 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     fetchAccounts = fetchDataDoeAccounts,
     getAccountRollout = getSchedulerAccountRollout,
     getSettings = getReportSyncSettings,
+    // Round-6 blocker 2: the SEPARATE durable control for source-promoted publication (brand-inventory),
+    // fail-closed default-OFF -- distinct from the dispatch report_sync_settings.
+    getPromotedSettings = getSourcePromotedPublishSettings,
     getApproval = getSchedulerPublishApproval,
     getJob = getLatestSyncReportJob,
     getSnapshot = getReportSnapshot,
@@ -66,6 +69,7 @@ export function buildSchedulerV2Publisher(overrides = {}) {
   const deps = Object.freeze({
     codeReadyKeys,
     getReportSyncSettings: getSettings,
+    getPromotedPublishSettings: async () => getPromotedSettings(),
     loadAccountRollout: async () => getAccountRollout(),
     discoverPrimaryAccounts,
     getPublishApproval: (reportKey, accountId) => getApproval(reportKey, accountId),

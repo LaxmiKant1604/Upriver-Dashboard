@@ -53,14 +53,17 @@ export function makeSourceRowLoader() {
 // (the worker calls shadowSnapshotKey). Computes the params hash and upserts through the
 // existing report_snapshots path; returns { paramsHash } so the job can record it.
 export function makeShadowSnapshotSaver({ save = saveReportSnapshot } = {}) {
-  return async ({ reportKey, accountId, params, payload, payloadBytes, sourceRefreshedAt }) => {
+  // Round-6 blocker 1: an OPTIONAL route-owned AbortSignal reaches the real report_snapshots write, so a
+  // bounded route genuinely aborts an in-flight shadow save. No signal (every existing caller) => the write
+  // runs exactly as before.
+  return async ({ reportKey, accountId, params, payload, payloadBytes, sourceRefreshedAt }, { signal = null } = {}) => {
     // Impossible-to-bypass guard at the final storage boundary: ALWAYS recompute the actual
     // UTF-8 byte size from JSON.stringify(payload) and validate against THAT. A caller-supplied
     // payloadBytes is NEVER trusted for the check (it may be stale/forged); it is telemetry
     // only. An oversized payload throws (SNAPSHOT_TOO_LARGE) BEFORE any Supabase write.
     const actualBytes = assertSnapshotWithinLimit(payload);
     const paramsHash = paramsHashFor(params.reportVersion, params);
-    await save({ reportKey, accountId, paramsHash, params, payload, payloadBytes: actualBytes, sourceRefreshedAt });
+    await save({ reportKey, accountId, paramsHash, params, payload, payloadBytes: actualBytes, sourceRefreshedAt }, { signal });
     return { paramsHash };
   };
 }

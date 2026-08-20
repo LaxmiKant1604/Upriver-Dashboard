@@ -1363,12 +1363,17 @@ test("U3. fix 3: brand-inventory promotes through the REAL publisher composition
   h.store.finalizeCycle({ cycleId: rollup.cycleId }); // the dispatcher-owned reviewed complete-scope close
   const pubMod = await import("../lib/server/sync/publisher-composition.js");
   const liveRows = new Map(); // the LIVE report_snapshots natural-key model: report_key|account_id
-  const publisher = pubMod.buildSchedulerV2Publisher({
+  // Round-6 blocker 2: brand-inventory's durable enable comes from its OWN control
+  // (getPromotedSettings -> source_promoted_publish_settings), NOT report_sync_settings. getSettings here
+  // enables ONLY brand-sales (the dispatch control); it deliberately does NOT contain brand-inventory, so a
+  // publish of brand-inventory that (wrongly) consulted report_sync_settings would be report-disabled.
+  const makePublisher = (promotedRows) => pubMod.buildSchedulerV2Publisher({
     // NO codeReadyKeys override: the PRODUCTION default must include brand-inventory -- this test FAILS if
     // the key is unknown, code-locked, or unpublishable.
     connections: CONNS,
     fetchAccounts: async (apiKey) => (apiKey === PRIM_KEY ? [dirAccount("A01"), dirAccount("A02")] : [dirAccount("B01")]),
-    getSettings: async () => [{ report_key: "brand-inventory", schedule_enabled: true }, { report_key: "brand-sales", schedule_enabled: true }],
+    getSettings: async () => [{ report_key: "brand-sales", schedule_enabled: true }],
+    getPromotedSettings: async () => promotedRows,
     getAccountRollout: async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] }),
     getApproval: async () => ({ read: "ok", approved: true }), // the explicit audited per-(report, account) approval
     getJob: async (rk, a) => {
@@ -1388,6 +1393,12 @@ test("U3. fix 3: brand-inventory promotes through the REAL publisher composition
       return { outcome: "inserted" };
     },
   });
+  // DEFAULT-OFF (the real seeded state: publish_enabled false / no row): brand-inventory is report-disabled,
+  // even though its code readiness, rollout, approval, job and snapshot are all satisfied.
+  assert.equal((await makePublisher([{ report_key: "brand-inventory", publish_enabled: false }]).publish("brand-inventory", "A01")).disposition, "report-disabled", "default-off promoted control => report-disabled");
+  assert.equal((await makePublisher([]).publish("brand-inventory", "A01")).disposition, "report-disabled", "absent promoted row => report-disabled (fail closed)");
+  // The operator ENABLES the promoted control (setSourcePromotedPublishControl writes publish_enabled=true).
+  const publisher = makePublisher([{ report_key: "brand-inventory", publish_enabled: true }]);
   const resInv = await publisher.publish("brand-inventory", "A01");
   assert.equal(resInv.disposition, "published", JSON.stringify(resInv) + " -- brand-inventory must not be unknown/code-locked/unpublishable");
   assert.equal(resInv.liveReportKey, "brand-inventory", "the EXACT live report key");
@@ -1565,6 +1576,228 @@ test("U6. fix 6: the ACL model includes PostgreSQL 17 MAINTAIN -- GRANT ALL leav
     + "\ngrant select on table public.source_controls to authenticated;\n");
   assert.equal(revokeAllClears.ok, true, JSON.stringify(revokeAllClears.blockers));
 });
+
+/* ================================= V. round-6 blocker 1: deadline genuinely end-to-end ================================= */
+group("V. round-6 blocker 1: the route deadline reaches the REAL store + shadow-saver writes (mocked global fetch, not injected collaborators)");
+
+const OK_JSON = () => ({ ok: true, status: 200, json: async () => [], text: async () => "[]" });
+const validJob = { cycleId: "c1", requestHash: "h1", sourceId: "s1", sourceKey: "order-line-items", connectionId: "primary", organizationFingerprint: "orgfp", accountScopeHash: "scope1", bucket: "us" };
+
+test("V1. the REAL makeSupabaseSourceStore(deadline) threads the SAME AbortSignal into global fetch for every read+write; no deadline => no signal (byte-identical)", async () => {
+  const driver = await import("../lib/server/sync/source-sync-driver.js");
+  const realFetch = globalThis.fetch;
+  try {
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 1_000_000, budgetMs: 60_000, reserveMs: 1_000 });
+    const store = driver.makeSupabaseSourceStore({ deadline: dl });
+    const seen = [];
+    globalThis.fetch = async (url, init) => { seen.push({ url: String(url), signal: init && init.signal, method: (init && init.method) || "GET" }); return OK_JSON(); };
+    for (const op of [
+      () => store.openCycle({ bucket: "us", cycleDate: TODAY }),
+      () => store.upsertSourceJob(validJob),
+      () => store.listSourceJobs("c1"),
+      () => store.updateCycleCounts("c1", { sourceTotal: 1 }),
+      () => store.loadSourceRows("h1"),
+      () => store.claimExportAttempt("c1", "h1"),
+      () => store.recordSourceSuccess({ cycleId: "c1", requestHash: "h1", rowCount: 1, payloadBytes: 2, durationMs: 1, cacheObjectPath: "p" }),
+      () => store.upsertSourceJobOwners([]),
+      () => store.persistBudget({ cycleId: "c1", trancheKey: "t", planFingerprint: "pf", maxCreates: 1, maxTokens: 2, hashes: [] }),
+    ]) { try { await op(); } catch (_e) { /* shape mismatch is fine; only the fetch+signal matters */ } }
+    assert.ok(seen.length >= 8, "the real store made real fetches: " + seen.length);
+    assert.ok(seen.every((c) => c.signal === dl.signal), "the SAME route signal reached the real fetch for EVERY store op");
+    // saveSourceRows goes through the storage + metadata adapters, which are constructed with the deadline's
+    // signal: prove a STORAGE PUT carries the same signal.
+    seen.length = 0;
+    try { await store.saveSourceRows({ job: { ...validJob, request_hash: "h1" }, rows: [{ a: 1 }], payloadBytes: 4, version: "v1" }); } catch (_e) { /* multi-step; only the fetch+signal matters */ }
+    assert.ok(seen.some((c) => c.method === "POST" && c.url.includes("/storage/") && c.signal === dl.signal), "the immutable-object STORAGE PUT carried the route signal");
+    // (b) no deadline => byte-identical: NO signal on the real fetch.
+    const plain = driver.makeSupabaseSourceStore();
+    seen.length = 0;
+    try { await plain.openCycle({ bucket: "us", cycleDate: TODAY }); await plain.upsertSourceJob(validJob); } catch (_e) { /* ignore */ }
+    assert.ok(seen.length >= 2 && seen.every((c) => c.signal == null), "no deadline => the wrapper passes no signal (byte-identical to pre-round-6)");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V2. a HUNG store write is genuinely aborted within the route budget -> typed ROUTE_DEADLINE_EXCEEDED (in-flight WRITE => commitUnknown, never claimed uncommitted)", async () => {
+  const driver = await import("../lib/server/sync/source-sync-driver.js");
+  const realFetch = globalThis.fetch;
+  const timers = [];
+  try {
+    // setTimer records the remaining-budget delay AND fires immediately so the hung fetch is aborted at once.
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 5_000_000, budgetMs: 60_000, reserveMs: 1_000, setTimer: (fn, ms) => { timers.push(ms); return setTimeout(fn, 0); }, clearTimer: (id) => clearTimeout(id) });
+    const store = driver.makeSupabaseSourceStore({ deadline: dl });
+    let fetchAborted = false;
+    globalThis.fetch = (url, init) => new Promise((_resolve, reject) => {
+      const sig = init && init.signal;
+      if (sig) sig.addEventListener("abort", () => { fetchAborted = true; reject(Object.assign(new Error("aborted"), { name: "AbortError" })); });
+    });
+    await assert.rejects(
+      () => store.openCycle({ bucket: "us", cycleDate: TODAY }),
+      (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.inFlight === true && e.beforeRequest === false && e.commitUnknown === true,
+      "a hung in-flight write is a commit-unknown route-deadline expiry",
+    );
+    assert.ok(fetchAborted, "the in-flight fetch was GENUINELY aborted through its AbortSignal");
+    assert.ok(timers.length >= 1 && timers.every((ms) => Number.isFinite(ms) && ms >= 1), "the op was bounded by a finite remaining-budget timer");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V3. a store op reached AFTER the budget already expired makes ZERO fetches (before-request expiry; proven zero effect)", async () => {
+  const driver = await import("../lib/server/sync/source-sync-driver.js");
+  const realFetch = globalThis.fetch;
+  try {
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 9_000_000, budgetMs: 1_000, reserveMs: 5_000 }); // already out of time
+    const store = driver.makeSupabaseSourceStore({ deadline: dl });
+    let fetches = 0;
+    globalThis.fetch = async () => { fetches += 1; return OK_JSON(); };
+    await assert.rejects(
+      () => store.upsertSourceJob(validJob),
+      (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.beforeRequest === true && e.inFlight === false && e.commitUnknown === false,
+      "before-request expiry is typed and NOT commit-unknown",
+    );
+    assert.equal(fetches, 0, "a request that has not started makes ZERO fetches");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V4. a store write that COMPLETES before expiry is reported committed (its result), never uncommitted/resumable; the one-attempt guard passes through faithfully", async () => {
+  const driver = await import("../lib/server/sync/source-sync-driver.js");
+  const realFetch = globalThis.fetch;
+  try {
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 2_000_000, budgetMs: 60_000, reserveMs: 1_000 });
+    const store = driver.makeSupabaseSourceStore({ deadline: dl });
+    globalThis.fetch = async (url) => (String(url).includes("open_sync_cycle") ? { ok: true, status: 200, json: async () => "cyc-committed", text: async () => '"cyc-committed"' } : OK_JSON());
+    const id = await store.openCycle({ bucket: "us", cycleDate: TODAY });
+    assert.equal(id, "cyc-committed", "a confirmed committed write returns its result honestly");
+    // one-create-per-hash guard is unchanged by threading: the RPC boolean passes straight through.
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => true, text: async () => "true" });
+    assert.equal(await store.claimExportAttempt("c1", "h1"), true, "claimExportAttempt passes the RPC acknowledgement through unchanged (idempotent one-attempt guard intact)");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V5. the REAL shadow saver (makeShadowSnapshotSaver -> saveReportSnapshot) carries the route signal into the report_snapshots write; a HUNG save aborts commit-unknown", async () => {
+  const rss = await import("../lib/server/sync/report-snapshot-store.js");
+  const realFetch = globalThis.fetch;
+  const saver = rss.makeShadowSnapshotSaver();
+  const snap = () => ({
+    reportKey: "scheduler-v2/brand-inventory", accountId: "A01",
+    params: { reportVersion: "brand-inventory-shared-v1", accountId: "A01", to: ASOF },
+    payload: { accountId: "A01", inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false },
+    sourceRefreshedAt: TODAY + "T00:00:00Z",
+  });
+  try {
+    // (a) the signal reaches the real report_snapshots fetch.
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 3_000_000, budgetMs: 60_000, reserveMs: 1_000 });
+    let seenSig = "unset";
+    globalThis.fetch = async (url, init) => { seenSig = init && init.signal; return { ok: true, status: 200, json: async () => [{ report_key: "scheduler-v2/brand-inventory" }], text: async () => "[]" }; };
+    const out = await dl.bound("shadow-save", (signal) => saver(snap(), { signal }), { write: true });
+    assert.ok(out && out.paramsHash, "the shadow save completed and returned its params hash");
+    assert.equal(seenSig, dl.signal, "the route signal reached the report_snapshots write");
+    // (b) a hung report_snapshots save is aborted commit-unknown.
+    const dl2 = runtimeMod.makeRouteDeadline({ clock: () => 3_000_000, budgetMs: 60_000, reserveMs: 1_000, setTimer: (fn) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id) });
+    let aborted = false;
+    globalThis.fetch = (url, init) => new Promise((_r, reject) => { const sig = init && init.signal; if (sig) sig.addEventListener("abort", () => { aborted = true; reject(Object.assign(new Error("aborted"), { name: "AbortError" })); }); });
+    await assert.rejects(
+      () => dl2.bound("shadow-save", (signal) => saver(snap(), { signal }), { write: true }),
+      (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.inFlight === true && e.commitUnknown === true,
+    );
+    assert.ok(aborted, "the hung report_snapshots write was genuinely aborted");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V6. no GHOST write after abort: once the deadline aborted a hung save, NO later POINTER-write fetch (source_export_cache POST) is emitted by the abandoned op", async () => {
+  const driver = await import("../lib/server/sync/source-sync-driver.js");
+  const realFetch = globalThis.fetch;
+  try {
+    const dl = runtimeMod.makeRouteDeadline({ clock: () => 4_000_000, budgetMs: 60_000, reserveMs: 1_000, setTimer: (fn) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id) });
+    const store = driver.makeSupabaseSourceStore({ deadline: dl });
+    let pointerWrites = 0;
+    let aborted = false;
+    // Model REAL fetch faithfully: a fetch whose AbortSignal is ALREADY aborted rejects immediately (no
+    // network), and the first in-flight GET (metadata.read of the previous pointer) hangs until the signal
+    // aborts. Count any pointer WRITE (POST source_export_cache) the abandoned atomicSave chain emits.
+    globalThis.fetch = (url, init) => {
+      const u = String(url);
+      const sig = init && init.signal;
+      if (sig && sig.aborted) return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      if (init && init.method === "POST" && u.includes("source_export_cache")) { pointerWrites += 1; return Promise.resolve(OK_JSON()); }
+      if (init && init.method === "POST" && u.includes("/storage/")) return Promise.resolve(OK_JSON());
+      return new Promise((_r, reject) => { if (sig) sig.addEventListener("abort", () => { aborted = true; reject(Object.assign(new Error("aborted"), { name: "AbortError" })); }); });
+    };
+    await assert.rejects(() => store.saveSourceRows({ job: { ...validJob, request_hash: "h1" }, rows: [{ a: 1 }], payloadBytes: 4, version: "v1" }), (e) => e.code === "ROUTE_DEADLINE_EXCEEDED");
+    assert.ok(aborted, "the hung save was aborted");
+    // Let any abandoned microtasks/continuations settle, then assert NO pointer write ever happened.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(pointerWrites, 0, "the abandoned atomic-save chain emitted ZERO source_export_cache POINTER writes after abort (LKG preserved; commit-unknown-safe by construction)");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+/* ================================= U7. round-6 blocker 2: the real durable promoted-publish control ================================= */
+group("U7. round-6 blocker 2: brand-inventory has a REAL fail-closed durable enable path, separate from dispatch, and can never be dispatched");
+
+test("U7. the promoted-publish control wrappers are fail-closed default-off (mocked fetch); the admin sync surface enables via the SEPARATE control and REFUSES to dispatch a promoted key; the migration is registered + audits clean", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const controls = await import("../lib/server/sync/report-controls.js");
+  const realFetch = globalThis.fetch;
+  try {
+    // (a) READ wrapper is fail-closed: a schema-missing / read error reads as [] (=> publisher gate2 disabled).
+    globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({ code: "PGRST205", message: "not found" }), text: async () => "" });
+    assert.deepEqual(await sb.getSourcePromotedPublishSettings(), [], "a schema-missing/failed read => [] (fail closed, default disabled)");
+    // (b) READ passes the route signal into the real fetch; a healthy read returns the rows.
+    let seenSig = "unset";
+    globalThis.fetch = async (url, init) => { seenSig = init && init.signal; return { ok: true, status: 200, json: async () => [{ report_key: "brand-inventory", publish_enabled: false }], text: async () => "[]" }; };
+    const ctrl = new AbortController();
+    const rows = await sb.getSourcePromotedPublishSettings({ signal: ctrl.signal });
+    assert.equal(seenSig, ctrl.signal, "the read carries the route signal to the real fetch");
+    assert.deepEqual(rows, [{ report_key: "brand-inventory", publish_enabled: false }], "the seeded default-off row");
+    // (c) SET wrapper writes to source_promoted_publish_settings (NOT report_sync_settings) with the signal.
+    const writes = [];
+    globalThis.fetch = async (url, init) => { writes.push({ url: String(url), signal: init && init.signal, body: init && init.body }); return { ok: true, status: 200, json: async () => [{ report_key: "brand-inventory", publish_enabled: true }], text: async () => "[]" }; };
+    await sb.setSourcePromotedPublishControl({ reportKey: "brand-inventory", publishEnabled: true, updatedBy: "admin-1", signal: ctrl.signal });
+    assert.equal(writes.length, 1);
+    assert.ok(writes[0].url.includes("source_promoted_publish_settings"), "the set writes the SEPARATE control table");
+    assert.ok(!writes[0].url.includes("report_sync_settings"), "the set NEVER touches the dispatch control");
+    assert.ok(String(writes[0].body).includes('"publish_enabled":true'), "the write carries publish_enabled=true");
+    assert.equal(writes[0].signal, ctrl.signal, "the write carries the route signal");
+  } finally { globalThis.fetch = realFetch; }
+
+  // (d) the ADMIN sync surface ROUTES a promoted key to the SEPARATE control and CANNOT dispatch it (proven
+  // structurally over the committed handler source, as R8 pins the sources.js ordering). The promoted branch
+  // must (1) sit BEFORE the dispatchable-report resolution (controlledReport), (2) write ONLY the promoted
+  // control (setSourcePromotedPublishControl), NEVER setReportSyncSetting, and (3) REFUSE a POST manual run.
+  const src = readFileSync(path.join(process.cwd(), "api", "admin", "sync.js"), "utf8");
+  const promotedBranch = src.indexOf("SOURCE_PROMOTED_REPORT_KEYS.includes(requestedKey)");
+  const controlledResolve = src.indexOf("controlledReport(requestedKey)");
+  const dispatchRun = src.indexOf("runScheduledSync(");
+  assert.ok(promotedBranch > 0 && controlledResolve > promotedBranch, "the promoted branch is handled BEFORE the dispatchable-report resolution");
+  assert.ok(dispatchRun > controlledResolve, "runScheduledSync stays on the dispatchable path only (after controlledReport)");
+  const branchText = src.slice(promotedBranch, controlledResolve);
+  assert.ok(branchText.includes("setSourcePromotedPublishControl"), "the promoted PATCH writes the SEPARATE promoted control");
+  assert.ok(!branchText.includes("setReportSyncSetting"), "the promoted branch NEVER writes the dispatch control");
+  assert.ok(!branchText.includes("runScheduledSync"), "the promoted branch NEVER dispatches a sync run");
+  assert.match(branchText, /req\.method === "POST"[\s\S]*?status\(409\)/, "a POST (manual dispatch) on a promoted key is refused 409 (never a dispatch)");
+
+  // (e) STRUCTURAL: the promoted key is undispatchable and the new migration is registered + audits clean.
+  assert.ok(controls.SOURCE_PROMOTED_REPORT_KEYS.includes("brand-inventory"));
+  assert.ok(!controls.CONTROLLED_REPORT_KEYS.includes("brand-inventory"), "NOT a dispatchable controlled report");
+  assert.equal(controls.controlledReport("brand-inventory"), null, "controlledReport() rejects the promoted key (admin dispatch path can never resolve it)");
+  const clean = auditWith(null);
+  assert.equal(clean.ok, true, "the full schema contract (incl. the new promoted-publish migration) audits clean");
+  const row = clean.matrix.find((m) => m.migration === "20260821_source_promoted_publish_controls.sql");
+  assert.ok(row && row.present && row.tables.some((t) => t.name === "source_promoted_publish_settings"), "the new migration is registered in the audit matrix");
+  // A dropped admin-read policy / widened ACL on the new table is a typed audit blocker (it is a real
+  // audited least-privilege surface, default-off).
+  const MIG821 = "20260821_source_promoted_publish_controls.sql";
+  const auditWith821 = (mutate) => schema.auditSchemaContract({ readFile: (rel) => {
+    if (rel === "supabase.js") return readFileSync(path.join(process.cwd(), "lib", "server", "supabase.js"), "utf8");
+    const t = readFileSync(path.join(process.cwd(), "supabase", "migrations", rel), "utf8");
+    return (rel === MIG821 && mutate) ? mutate(t) : t;
+  } });
+  assert.equal(auditWith821(null).ok, true, "baseline (real 20260821) audits clean");
+  const droppedPolicy = auditWith821((sql) => sql.split("create policy source_promoted_publish_settings_admin_read on public.source_promoted_publish_settings\n  for select to authenticated using (public.is_dashboard_admin());").join(""));
+  assert.ok(droppedPolicy.blockers.some((b) => b.code === "POLICY_MISSING" && b.table === "source_promoted_publish_settings"), JSON.stringify(droppedPolicy.blockers.filter((b) => b.table === "source_promoted_publish_settings").map((b) => b.code)));
+  const widenedAcl = auditWith821((sql) => sql.split("grant select, insert, update on table public.source_promoted_publish_settings to service_role;").join("grant all on table public.source_promoted_publish_settings to service_role;"));
+  assert.ok(widenedAcl.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH" && b.table === "source_promoted_publish_settings"), JSON.stringify(widenedAcl.blockers.filter((b) => b.table === "source_promoted_publish_settings").map((b) => b.code)));
+});
+
 
 async function main() {
   out("source production-hardening proof suite");

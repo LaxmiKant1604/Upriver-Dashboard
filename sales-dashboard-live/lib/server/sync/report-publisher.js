@@ -170,7 +170,7 @@ const CAS_OUTCOME_DISPOSITION = Object.freeze({
 export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId }) {
   const {
     codeReadyKeys = SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS,
-    getReportSyncSettings, loadAccountRollout, discoverPrimaryAccounts, getPublishApproval,
+    getReportSyncSettings, getPromotedPublishSettings, loadAccountRollout, discoverPrimaryAccounts, getPublishApproval,
     getLatestReportJob, getShadowSnapshot, loadStoragePayload, publishLive,
   } = deps || {};
   const key = norm(reportKey);
@@ -183,10 +183,21 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId })
     // GATE 1 -- code readiness (frozen empty today => disabled by default).
     if (!Array.isArray(codeReadyKeys) || !codeReadyKeys.includes(key)) return { disposition: "code-locked", ...base };
 
-    // GATE 2 -- durable report enable (report_sync_settings.schedule_enabled).
-    const settings = (await getReportSyncSettings()) || [];
-    const row = settings.find((s) => s && String(s.report_key ?? s.reportKey) === key);
-    if (!row || row.schedule_enabled !== true) return { disposition: "report-disabled", ...base };
+    // GATE 2 -- durable report enable. Round-6 blocker 2: a SOURCE-PROMOTED report (brand-inventory) is
+    // gated by its OWN durable control (source_promoted_publish_settings.publish_enabled), NOT by
+    // report_sync_settings -- which production only seeds/manages for the 13 DISPATCH reports and whose
+    // admin surface rejects a promoted key. A dispatch report stays gated by schedule_enabled. Both default
+    // OFF and fail closed (absent row / non-"ok" read => report-disabled), and the two controls are
+    // independent (enabling a dispatch report can never enable a promoted one, and vice versa).
+    if (SOURCE_PROMOTED_REPORT_KEYS.includes(key)) {
+      const promoted = (typeof getPromotedPublishSettings === "function" ? await getPromotedPublishSettings() : null) || [];
+      const prow = Array.isArray(promoted) ? promoted.find((s) => s && String(s.report_key ?? s.reportKey) === key) : null;
+      if (!prow || prow.publish_enabled !== true) return { disposition: "report-disabled", ...base };
+    } else {
+      const settings = (await getReportSyncSettings()) || [];
+      const row = settings.find((s) => s && String(s.report_key ?? s.reportKey) === key);
+      if (!row || row.schedule_enabled !== true) return { disposition: "report-disabled", ...base };
+    }
 
     // GATE 3 -- durable account enable, resolved against REAL fresh primary discovery (never a synthetic
     // record): the requested id must be a CURRENTLY DISCOVERED active primary account that the durable

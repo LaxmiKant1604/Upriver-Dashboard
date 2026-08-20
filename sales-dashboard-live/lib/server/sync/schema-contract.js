@@ -402,6 +402,32 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       "replaceOliHistoryWindow", "saveSourceSnapshotPayload", "getSourceSnapshotPayload"],
     note: "Durable source model: OLI history + coverage + controls + run status + validated snapshots (PREPARED, UNAPPLIED).",
   },
+  {
+    // Round-6 blocker 2: the SEPARATE durable control for SOURCE-PROMOTED publication (brand-inventory). An
+    // additive operator-surface table (mirrors source_controls): admin-read RLS + least-privilege
+    // service_role ACL (select,insert,update; REVOKE ALL strips PG17 MAINTAIN). NEVER feeds dispatcher
+    // selection -- the promoted key is not in CONTROLLED_REPORT_KEYS -- so enabling publish_enabled can
+    // never dispatch a DataDoe export.
+    migration: "20260821_source_promoted_publish_controls.sql",
+    tables: [
+      {
+        name: "source_promoted_publish_settings",
+        unique: [["report_key"]],
+        namedConstraints: [
+          { name: "source_promoted_publish_settings_report_key_nonblank", kind: "check", canonical: "char_length(btrim(report_key)) > 0" },
+        ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
+        rlsEnabled: true,
+        requiredPolicies: [{ name: "source_promoted_publish_settings_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
+        requiredTriggers: [{ name: "source_promoted_publish_settings_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["report_key", "publish_enabled", "updated_at"],
+      },
+    ],
+    rpcs: [],
+    wrappers: ["getSourcePromotedPublishSettings", "setSourcePromotedPublishControl"],
+    note: "Source-promoted publication control (brand-inventory); default OFF; PREPARED, UNAPPLIED.",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------

@@ -104,10 +104,11 @@ async function getPrivateStorageJson(bucket, objectPath, { signal = null } = {})
   return response.json();
 }
 
-async function deletePrivateStorageObjects(bucket, objectPaths) {
+async function deletePrivateStorageObjects(bucket, objectPaths, { signal = null } = {}) {
   if (!objectPaths.length) return;
   await request(`/storage/v1/object/${encodeURIComponent(bucket)}`, {
     method: "DELETE",
+    signal,
     body: { prefixes: objectPaths },
   });
 }
@@ -305,9 +306,10 @@ export async function getLatestReportSnapshot({ reportKey, accountId }) {
   return rows[0] || null;
 }
 
-export async function saveReportSnapshot(snapshot) {
+export async function saveReportSnapshot(snapshot, { signal = null } = {}) {
   const rows = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
     body: {
       report_key: snapshot.reportKey,
@@ -353,7 +355,7 @@ export async function insertReportSnapshotIfAbsent(snapshot) {
 
 const SOURCE_CACHE_BUCKET = "dashboard-snapshots";
 
-export async function getSourceExportCache(requestHash) {
+export async function getSourceExportCache(requestHash, { signal = null } = {}) {
   const query = new URLSearchParams({
     // organization_fingerprint + account_scope_hash are returned so a confirmed-exact-match cache reuse
     // can belt-and-suspenders assert scope identity (request_hash already folds them in; kept strict).
@@ -362,10 +364,10 @@ export async function getSourceExportCache(requestHash) {
     expires_at: `gt.${new Date().toISOString()}`,
     limit: "1",
   });
-  const rows = await request(`/rest/v1/source_export_cache?${query}`);
+  const rows = await request(`/rest/v1/source_export_cache?${query}`, { signal });
   const entry = rows[0];
   if (!entry) return null;
-  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, entry.object_path);
+  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, entry.object_path, { signal });
   if (!payload || !Array.isArray(payload.rows)) return null;
   return { ...entry, rows: payload.rows };
 }
@@ -639,22 +641,55 @@ export async function setReportSyncSetting({ reportKey, scheduleEnabled, updated
   return rows[0] || null;
 }
 
+/* Round-6 blocker 2 -- SOURCE-PROMOTED publication controls (20260821_source_promoted_publish_controls.sql,
+ * PREPARED-UNAPPLIED). A source-promoted report (brand-inventory) is PRODUCED by the source-first durable
+ * runtime and PROMOTED to live ONLY through the reviewed publisher, gated by its OWN durable enable flag --
+ * SEPARATE from report_sync_settings (the 13-report DISPATCH control). Default OFF (seeded publish_enabled
+ * = false), fail-closed: a schema-missing (unapplied migration) or read failure reads as [] so the publisher
+ * gate resolves to report-disabled. This control NEVER feeds dispatcher selection (brand-inventory is not in
+ * CONTROLLED_REPORT_KEYS), so enabling publication can never dispatch a DataDoe export. */
+export async function getSourcePromotedPublishSettings({ signal = null } = {}) {
+  try {
+    const rows = await request("/rest/v1/source_promoted_publish_settings?select=report_key,publish_enabled,updated_at&order=report_key.asc", { signal });
+    return Array.isArray(rows) ? rows : [];
+  } catch (readError) {
+    // schema-missing (migration unapplied) OR any read failure => zero enabled rows (fail closed).
+    return [];
+  }
+}
+
+export async function setSourcePromotedPublishControl({ reportKey, publishEnabled, updatedBy, signal = null }) {
+  const rows = await request("/rest/v1/source_promoted_publish_settings?on_conflict=report_key", {
+    method: "POST",
+    signal,
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      report_key: reportKey,
+      publish_enabled: publishEnabled === true,
+      updated_by: updatedBy || null,
+      updated_at: new Date().toISOString(),
+    },
+  });
+  return rows[0] || null;
+}
+
 /* ===================== Scheduler v2 (Phase 1c) — source-first cycle =====================
    Thin wrappers over the three additive tables + three RPCs in
    20260807_scheduler_v2.sql. Service-role only (RLS bypassed for writes). These power
    the SHADOW-MODE source worker; they never store an API key or a raw DataDoe error. */
 
 // open_sync_cycle: idempotent kickoff. Returns the single cycle id for (bucket, date).
-export async function openSyncCycle({ bucket, cycleDate, scheduledAt = null, trigger = "manual" }) {
+export async function openSyncCycle({ bucket, cycleDate, scheduledAt = null, trigger = "manual" }, { signal = null } = {}) {
   return request("/rest/v1/rpc/open_sync_cycle", {
     method: "POST",
+    signal,
     body: { p_bucket: bucket, p_cycle_date: cycleDate, p_scheduled_at: scheduledAt, p_trigger: trigger },
   });
 }
 
 // claim_sync_cycle: pending -> running; true only for the worker that won the start.
-export async function claimSyncCycle(cycleId) {
-  return request("/rest/v1/rpc/claim_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
+export async function claimSyncCycle(cycleId, { signal = null } = {}) {
+  return request("/rest/v1/rpc/claim_sync_cycle", { method: "POST", signal, body: { p_cycle_id: cycleId } });
 }
 
 export async function getSyncCycle(cycleId, { signal = null } = {}) {
@@ -667,7 +702,7 @@ export async function getSyncCycle(cycleId, { signal = null } = {}) {
   return rows[0] || null;
 }
 
-export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, reportTotal, reportSucceeded, reportFailed, status } = {}) {
+export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, reportTotal, reportSucceeded, reportFailed, status } = {}, { signal = null } = {}) {
   const body = {};
   if (sourceTotal != null) body.source_total = sourceTotal;
   if (sourceSucceeded != null) body.source_succeeded = sourceSucceeded;
@@ -680,6 +715,7 @@ export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSuccee
   if (!Object.keys(body).length) return;
   await request(`/rest/v1/sync_cycles?id=eq.${cycleId}`, {
     method: "PATCH",
+    signal,
     headers: { Prefer: "return=minimal" },
     body,
   });
@@ -756,17 +792,18 @@ function validateFinalizeResponse(result, cycleId) {
   throw new Error("finalizeSyncCycle: unknown finalize disposition; failing closed.");
 }
 
-export async function finalizeSyncCycle(cycleId) {
-  const body = await request("/rest/v1/rpc/finalize_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
+export async function finalizeSyncCycle(cycleId, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/finalize_sync_cycle", { method: "POST", signal, body: { p_cycle_id: cycleId } });
   const result = Array.isArray(body) ? body[0] : body;
   return validateFinalizeResponse(result, cycleId);
 }
 
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller
 // that made the first (and only) create-export POST for this (cycle, request_hash).
-export async function claimSourceExportAttempt(cycleId, requestHash) {
+export async function claimSourceExportAttempt(cycleId, requestHash, { signal = null } = {}) {
   return request("/rest/v1/rpc/claim_source_export_attempt", {
     method: "POST",
+    signal,
     body: { p_cycle_id: cycleId, p_request_hash: requestHash },
   });
 }
@@ -778,9 +815,10 @@ export async function claimSourceExportAttempt(cycleId, requestHash) {
 // acknowledgement string — 'adopted' | 'not-adopted' | 'cache-changed' | 'cache-expired'
 // — or null if the response is not a string (the worker treats a null/unknown value
 // as a malformed acknowledgement and fails closed with zero create POSTs).
-export async function adoptSourceExportCache({ cycleId, requestHash, sourceId, organizationFingerprint, accountScopeHash, objectPath, rowCount, payloadBytes }) {
+export async function adoptSourceExportCache({ cycleId, requestHash, sourceId, organizationFingerprint, accountScopeHash, objectPath, rowCount, payloadBytes }, { signal = null } = {}) {
   const body = await request("/rest/v1/rpc/adopt_source_export_cache", {
     method: "POST",
+    signal,
     body: {
       p_cycle_id: cycleId,
       p_request_hash: requestHash,
@@ -829,9 +867,10 @@ export async function listSourceBatchMembership(batchFamily, { signal = null } =
 
 // persist_source_tranche_budget (Blocker 4d): freeze the create/token budget for (cycle, tranche) ONCE.
 // Idempotent; a continuation with a drifted plan raises PLAN_BUDGET_MISMATCH. Returns 'created' | 'exists'.
-export async function persistSourceTrancheBudget({ cycleId, trancheKey, planFingerprint, maxCreates, maxTokens, hashes }) {
+export async function persistSourceTrancheBudget({ cycleId, trancheKey, planFingerprint, maxCreates, maxTokens, hashes }, { signal = null } = {}) {
   const body = await request("/rest/v1/rpc/persist_source_tranche_budget", {
     method: "POST",
+    signal,
     body: {
       p_cycle_id: cycleId,
       p_tranche_key: trancheKey,
@@ -847,9 +886,10 @@ export async function persistSourceTrancheBudget({ cycleId, trancheKey, planFing
 
 // reserve_source_export_create (Blocker 4d): the ATOMIC pre-POST reservation. ONLY a 'reserved' result may
 // POST a create-export. Returns 'reserved' | 'not-pending' | 'plan-mismatch' | 'budget-exceeded'.
-export async function reserveSourceExportCreate({ cycleId, trancheKey, requestHash, planFingerprint }) {
+export async function reserveSourceExportCreate({ cycleId, trancheKey, requestHash, planFingerprint }, { signal = null } = {}) {
   const body = await request("/rest/v1/rpc/reserve_source_export_create", {
     method: "POST",
+    signal,
     body: {
       p_cycle_id: cycleId,
       p_tranche_key: trancheKey,
@@ -863,25 +903,25 @@ export async function reserveSourceExportCreate({ cycleId, trancheKey, requestHa
 
 // Read the frozen tranche budget row (admin/service-role only): the plan fingerprint + create/token ceilings
 // and the durable spent counters for (cycle, tranche), or null.
-export async function getSourceTrancheBudget({ cycleId, trancheKey }) {
+export async function getSourceTrancheBudget({ cycleId, trancheKey }, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "cycle_id,tranche_key,plan_fingerprint,max_creates,max_tokens,spent_creates,spent_tokens",
     cycle_id: `eq.${cycleId}`,
     tranche_key: `eq.${trancheKey}`,
   });
-  const rows = await request(`/rest/v1/source_tranche_budget?${query}`);
+  const rows = await request(`/rest/v1/source_tranche_budget?${query}`, { signal });
   return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
 // Read the frozen per-hash costs for (cycle, tranche): rows { request_hash, token_cost }.
-export async function getSourceTrancheBudgetHashes({ cycleId, trancheKey }) {
+export async function getSourceTrancheBudgetHashes({ cycleId, trancheKey }, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "request_hash,token_cost",
     cycle_id: `eq.${cycleId}`,
     tranche_key: `eq.${trancheKey}`,
     order: "request_hash.asc",
   });
-  const rows = await request(`/rest/v1/source_tranche_budget_hash?${query}`);
+  const rows = await request(`/rest/v1/source_tranche_budget_hash?${query}`, { signal });
   return Array.isArray(rows) ? rows : [];
 }
 
@@ -1286,7 +1326,7 @@ export async function recordSourceSnapshot({ organizationFingerprint, connection
 // key organization routing off. We REQUIRE a non-empty organizationFingerprint and reject
 // BEFORE any PostgREST request, so a fingerprint-less job is never written (never as an
 // empty string) and never reaches the one-attempt claim.
-export async function upsertSyncSourceJob(job) {
+export async function upsertSyncSourceJob(job, { signal = null } = {}) {
   if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
     throw new Error(`upsertSyncSourceJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
   }
@@ -1295,6 +1335,7 @@ export async function upsertSyncSourceJob(job) {
   }
   await request("/rest/v1/sync_source_jobs?on_conflict=cycle_id,request_hash", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
     body: {
       cycle_id: job.cycleId,
@@ -1314,13 +1355,13 @@ export async function upsertSyncSourceJob(job) {
 // ownership lives in sync_source_job_owners); the SELECT lists only real sync_source_jobs columns.
 const SOURCE_JOB_COLUMNS = "id,request_hash,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count";
 
-export async function getSyncSourceJobs(cycleId) {
+export async function getSyncSourceJobs(cycleId, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: SOURCE_JOB_COLUMNS,
     cycle_id: `eq.${cycleId}`,
     order: "created_at.asc",
   });
-  return request(`/rest/v1/sync_source_jobs?${query}`);
+  return request(`/rest/v1/sync_source_jobs?${query}`, { signal });
 }
 
 /* ===== Scheduler v2: normalized source-job OWNERSHIP (sync_source_job_owners) wrappers =====
@@ -1336,7 +1377,7 @@ const OWNER_CONNECTION_IDS = new Set(["primary", "dd-secondary"]);
 // resets owner_status back to 'active' and clears any prior stale error (an owner that needs the hash
 // again this cycle owns it again). Fails closed BEFORE any request on an incomplete membership so an
 // ambiguous/secretless-but-empty owner identity is never written.
-export async function upsertSyncSourceJobOwners(memberships) {
+export async function upsertSyncSourceJobOwners(memberships, { signal = null } = {}) {
   const rows = (memberships || []).map((m) => {
     const ownerId = String(m.ownerId || m.owner_id || "").trim();
     const requestHash = String(m.requestHash || m.request_hash || "").trim();
@@ -1378,13 +1419,14 @@ export async function upsertSyncSourceJobOwners(memberships) {
   if (!rows.length) return;
   await request("/rest/v1/sync_source_job_owners?on_conflict=cycle_id,request_hash,owner_id", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: rows,
   });
 }
 
 // List memberships for a set of declared owner ids in one cycle (empty owner set => no rows).
-export async function getSyncSourceJobOwners(cycleId, ownerIds) {
+export async function getSyncSourceJobOwners(cycleId, ownerIds, { signal = null } = {}) {
   const owners = [...new Set((ownerIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
   if (!owners.length) return [];
   const query = new URLSearchParams({
@@ -1393,7 +1435,7 @@ export async function getSyncSourceJobOwners(cycleId, ownerIds) {
     owner_id: `in.(${owners.join(",")})`,
     order: "created_at.asc",
   });
-  return request(`/rest/v1/sync_source_job_owners?${query}`);
+  return request(`/rest/v1/sync_source_job_owners?${query}`, { signal });
 }
 
 // Round-6 fix 5: EVERY owner membership of one cycle (no owner-id filter). This is the AUTHORITATIVE
@@ -1414,8 +1456,8 @@ export async function getSyncSourceJobOwnersForCycle(cycleId, { signal = null } 
 
 // List the CANONICAL source jobs the declared owners depend on: their ACTIVE memberships' request_hashes,
 // deduplicated, then the canonical rows for those hashes. (Powers admin report-wise / owner-scoped sync.)
-export async function getSyncSourceJobsForOwners(cycleId, ownerIds) {
-  const memberships = await getSyncSourceJobOwners(cycleId, ownerIds);
+export async function getSyncSourceJobsForOwners(cycleId, ownerIds, { signal = null } = {}) {
+  const memberships = await getSyncSourceJobOwners(cycleId, ownerIds, { signal });
   const hashes = [...new Set(memberships.filter((m) => m.owner_status !== "stale").map((m) => m.request_hash))];
   if (!hashes.length) return [];
   const query = new URLSearchParams({
@@ -1424,13 +1466,13 @@ export async function getSyncSourceJobsForOwners(cycleId, ownerIds) {
     request_hash: `in.(${hashes.join(",")})`,
     order: "created_at.asc",
   });
-  return request(`/rest/v1/sync_source_jobs?${query}`);
+  return request(`/rest/v1/sync_source_jobs?${query}`, { signal });
 }
 
 // Mark ONE owner's membership stale (its plan no longer needs this hash). This is owner-scoped only: it
 // NEVER touches the canonical sync_source_jobs row or any other owner's membership, so a hash still owned
 // by another owner remains executable/resumable/readable, and no DataDoe call is made for a stale owner.
-export async function recordSyncSourceJobOwnerStale({ cycleId, requestHash, ownerId, code = "STALE_PLAN", message = null }) {
+export async function recordSyncSourceJobOwnerStale({ cycleId, requestHash, ownerId, code = "STALE_PLAN", message = null }, { signal = null } = {}) {
   const query = new URLSearchParams({
     cycle_id: `eq.${cycleId}`,
     request_hash: `eq.${requestHash}`,
@@ -1438,21 +1480,23 @@ export async function recordSyncSourceJobOwnerStale({ cycleId, requestHash, owne
   });
   await request(`/rest/v1/sync_source_job_owners?${query}`, {
     method: "PATCH",
+    signal,
     headers: { Prefer: "return=minimal" },
     body: { owner_status: "stale", error_code: code, error_message: message },
   });
 }
 
-async function patchSyncSourceJob(cycleId, requestHash, body) {
+async function patchSyncSourceJob(cycleId, requestHash, body, { signal = null } = {}) {
   const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, request_hash: `eq.${requestHash}` });
   await request(`/rest/v1/sync_source_jobs?${query}`, {
     method: "PATCH",
+    signal,
     headers: { Prefer: "return=minimal" },
     body,
   });
 }
 
-export async function recordSyncSourceSuccess({ cycleId, requestHash, exportId = null, rowCount, payloadBytes, durationMs, cacheObjectPath }) {
+export async function recordSyncSourceSuccess({ cycleId, requestHash, exportId = null, rowCount, payloadBytes, durationMs, cacheObjectPath }, { signal = null } = {}) {
   await patchSyncSourceJob(cycleId, requestHash, {
     fetch_status: "succeeded",
     succeeded_at: new Date().toISOString(),
@@ -1465,19 +1509,19 @@ export async function recordSyncSourceSuccess({ cycleId, requestHash, exportId =
     error_stage: null,
     error_code: null,
     error_message: null,
-  });
+  }, { signal });
 }
 
 // Persist the DataDoe export id IMMEDIATELY after create-export, keeping fetch_status
 // 'attempted' (set by the claim RPC), so a crash after the POST resumes poll/download
 // WITHOUT a second create-export.
-export async function recordSyncSourceExportCreated({ cycleId, requestHash, exportId }) {
-  await patchSyncSourceJob(cycleId, requestHash, { export_id: exportId });
+export async function recordSyncSourceExportCreated({ cycleId, requestHash, exportId }, { signal = null } = {}) {
+  await patchSyncSourceJob(cycleId, requestHash, { export_id: exportId }, { signal });
 }
 
 // Failure NEVER clears cache_object_path / last_good_fetched_at, so last-known-good
 // source data survives. error_message is the SAFE operator string only.
-export async function recordSyncSourceFailure({ cycleId, requestHash, stage, code, message, terminal = false, durationMs, rowCount = null, exportId = null }) {
+export async function recordSyncSourceFailure({ cycleId, requestHash, stage, code, message, terminal = false, durationMs, rowCount = null, exportId = null }, { signal = null } = {}) {
   await patchSyncSourceJob(cycleId, requestHash, {
     fetch_status: "failed",
     failed_at: new Date().toISOString(),
@@ -1488,7 +1532,7 @@ export async function recordSyncSourceFailure({ cycleId, requestHash, stage, cod
     duration_ms: durationMs,
     row_count: rowCount,
     export_id: exportId,
-  });
+  }, { signal });
 }
 
 /* ===== Scheduler v2 Phase 1d: sync_report_jobs (report-derivation) wrappers =====
@@ -1628,24 +1672,25 @@ export async function getReportSnapshotStoragePayload(objectPath) {
 // Injected adapters for the ATOMIC source-cache save (lib/server/sync/source-cache.js):
 // Storage put/get/delete on the private source-cache bucket, and the source_export_cache
 // pointer read/write. Kept as adapters so the atomic algorithm stays offline-testable.
-export function sourceCacheStorageAdapter() {
+export function sourceCacheStorageAdapter({ signal = null } = {}) {
   return {
-    put: (objectPath, contents) => putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, contents),
-    get: (objectPath) => getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath),
-    delete: (objectPath) => deletePrivateStorageObjects(SOURCE_CACHE_BUCKET, [objectPath]),
+    put: (objectPath, contents) => putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, contents, "application/json", { signal }),
+    get: (objectPath) => getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath, { signal }),
+    delete: (objectPath) => deletePrivateStorageObjects(SOURCE_CACHE_BUCKET, [objectPath], { signal }),
   };
 }
 
-export function sourceCacheMetadataAdapter() {
+export function sourceCacheMetadataAdapter({ signal = null } = {}) {
   return {
     read: async (requestHash) => {
       const query = new URLSearchParams({ select: "request_hash,object_path", request_hash: `eq.${requestHash}`, limit: "1" });
-      const rows = await request(`/rest/v1/source_export_cache?${query}`);
+      const rows = await request(`/rest/v1/source_export_cache?${query}`, { signal });
       return rows[0] || null;
     },
     write: async (entry) => {
       const saved = await request("/rest/v1/source_export_cache?on_conflict=request_hash", {
         method: "POST",
+        signal,
         headers: { Prefer: "resolution=merge-duplicates,return=representation" },
         body: {
           request_hash: entry.requestHash,

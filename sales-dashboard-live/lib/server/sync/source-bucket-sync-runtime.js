@@ -599,7 +599,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
 
     const todayStr = today || (preflight && preflight.today) || new Date(clock()).toISOString().slice(0, 10);
     const asOfStr = asOf || addDaysStr(todayStr, -1); // the latest COMPLETED day (conservative for manual runs)
-    const store = makeSourceStore();
+    const store = makeSourceStore({ deadline: dl });
     const dataDoe = makeAdapter(connections);
 
     // Round-5 blocker 3 + round-6 fixes 2/4: when running on a memoized preflight, the sync's OWN durable
@@ -796,7 +796,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
     const saveWithLineage = async (snap, save) => {
       if (!reportLineage || !rollup.cycleId) {
-        return { saved: await dl.bound("shadow-save", () => save(), { write: true }), lineage: "unavailable" };
+        return { saved: await dl.bound("shadow-save", (signal) => save(signal), { write: true }), lineage: "unavailable" };
       }
       await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
@@ -808,7 +808,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "claim-lost" });
         return { saved: null, lineage: "claim-lost" };
       }
-      const saved = await dl.bound("shadow-save", () => save(), { write: true });
+      const saved = await dl.bound("shadow-save", (signal) => save(signal), { write: true });
       await dl.bound("report-lineage-success", (signal) => reportLineage.recordReportSuccess({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, accountId: snap.accountId,
         latestDataDate: snap.latestDataDate ?? null, snapshotParamsHash: saved.paramsHash,
@@ -819,20 +819,20 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     try {
       for (const snap of derived.daily.snapshots) {
         await ensureTime("snapshot-save");
-        const r = await saveWithLineage(snap, () => saver({
+        const r = await saveWithLineage(snap, (signal) => saver({
           reportKey: snap.reportKey, accountId: snap.accountId,
           params: { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" },
           payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }));
+        }, { signal }));
         if (r.saved) dailySaved += 1;
       }
       for (const snap of derived.brandView.snapshots) {
         await ensureTime("snapshot-save");
-        const r = await saveWithLineage(snap, () => saver({
+        const r = await saveWithLineage(snap, (signal) => saver({
           reportKey: snap.reportKey, accountId: snap.accountId,
           params: { reportVersion: snap.version, accountId: snap.accountId, from: brandViewWindow.from, to: brandViewWindow.to },
           payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }));
+        }, { signal }));
         if (r.saved) brandViewSaved += 1;
       }
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
@@ -872,11 +872,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           accountId: account.accountId, version: BRAND_INVENTORY_REPORT_VERSION,
           payload: built.payload, latestDataDate: built.payload.inventoryDate || null,
         };
-        const r = await saveWithLineage(snap, () => saver({
+        const r = await saveWithLineage(snap, (signal) => saver({
           reportKey: snap.reportKey, accountId: snap.accountId,
           params: { reportVersion: snap.version, accountId: snap.accountId, to: invWindow.to },
           payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }));
+        }, { signal }));
         if (r.saved) brandInventory.saved += 1;
       }
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
@@ -1045,7 +1045,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const todayStr = new Date(dl.startMs).toISOString().slice(0, 10);
     const asOfStr = addDaysStr(todayStr, -1);
     const runtime = composeTrancheRuntime({ name: sourceKey, sourceKeys: [sourceKey] }, { reuseOnly: reuseOnly === true });
-    const store = makeSourceStore();
+    const store = makeSourceStore({ deadline: dl });
     const keySet = new Set([sourceKey]);
     const familyState = async (cycleId) => {
       const state = { total: 0, open: 0, succeeded: 0, failed: 0 };

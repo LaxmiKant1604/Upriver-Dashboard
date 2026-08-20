@@ -233,30 +233,45 @@ export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connect
 }
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.
-export function makeSupabaseSourceStore() {
-  const storage = sourceCacheStorageAdapter();
-  const metadata = sourceCacheMetadataAdapter();
+// Round-6 blocker 1: an OPTIONAL route-owned deadline binds EVERY production Supabase/Storage read+write
+// this store performs. When present, each method is checked-before-request and raced against the remaining
+// budget (deadline.bound), and the deadline's AbortSignal reaches the real HTTP wrapper so an in-flight
+// fetch genuinely aborts; a timed-out WRITE surfaces the typed ROUTE_DEADLINE_EXCEEDED with commitUnknown
+// (never claimed uncommitted). When `deadline` is null (the dispatcher, Scheduler v1, every non-route
+// caller) each method calls its wrapper EXACTLY as before -- no signal, no timer, byte-identical behaviour.
+export function makeSupabaseSourceStore({ deadline = null } = {}) {
+  const sig = deadline ? deadline.signal : null;
+  const storage = sourceCacheStorageAdapter({ signal: sig });
+  const metadata = sourceCacheMetadataAdapter({ signal: sig });
+  // Bind one store operation. `write` chooses the typed in-flight expiry semantics (commitUnknown for a
+  // write). With no deadline the op is invoked with a null signal -> identical to the pre-round-6 call.
+  const w = (phase, write, fn) => (deadline ? deadline.bound(`store:${phase}`, (signal) => fn(signal), { write }) : fn(null));
+  const r = (phase, fn) => w(phase, false, fn);
   return {
-    openCycle: (args) => openSyncCycle(args),
-    claimCycle: (cycleId) => claimSyncCycle(cycleId),
-    getCycle: (cycleId) => getSyncCycle(cycleId),
-    upsertSourceJob: (job) => upsertSyncSourceJob(job),
-    listSourceJobs: (cycleId) => getSyncSourceJobs(cycleId),
+    openCycle: (args) => w("open-cycle", true, (signal) => openSyncCycle(args, { signal })),
+    claimCycle: (cycleId) => w("claim-cycle", true, (signal) => claimSyncCycle(cycleId, { signal })),
+    getCycle: (cycleId, opts) => r("get-cycle", (signal) => getSyncCycle(cycleId, { signal, ...(opts || {}) })),
+    upsertSourceJob: (job) => w("upsert-source-job", true, (signal) => upsertSyncSourceJob(job, { signal })),
+    listSourceJobs: (cycleId) => r("list-source-jobs", (signal) => getSyncSourceJobs(cycleId, { signal })),
     // Many-to-many owner memberships (sync_source_job_owners) -- canonical jobs stay one row/export.
-    upsertSourceJobOwners: (memberships) => upsertSyncSourceJobOwners(memberships),
-    listSourceJobOwners: (cycleId, ownerIds) => getSyncSourceJobOwners(cycleId, ownerIds),
+    upsertSourceJobOwners: (memberships) => w("upsert-owners", true, (signal) => upsertSyncSourceJobOwners(memberships, { signal })),
+    listSourceJobOwners: (cycleId, ownerIds) => r("list-owners", (signal) => getSyncSourceJobOwners(cycleId, ownerIds, { signal })),
     // Round-6 fix 5: EVERY owner membership of the cycle -- the authoritative account<->hash ownership the
     // source-first report lineage builds ACCOUNT-EXACT depends_on from.
-    listCycleOwners: (cycleId, opts) => getSyncSourceJobOwnersForCycle(cycleId, opts),
-    listSourceJobsForOwners: (cycleId, ownerIds) => getSyncSourceJobsForOwners(cycleId, ownerIds),
-    recordSourceOwnerStale: (args) => recordSyncSourceJobOwnerStale(args),
-    claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),
+    listCycleOwners: (cycleId, opts) => r("list-cycle-owners", (signal) => getSyncSourceJobOwnersForCycle(cycleId, { signal, ...(opts || {}) })),
+    listSourceJobsForOwners: (cycleId, ownerIds) => r("list-jobs-for-owners", (signal) => getSyncSourceJobsForOwners(cycleId, ownerIds, { signal })),
+    recordSourceOwnerStale: (args) => w("owner-stale", true, (signal) => recordSyncSourceJobOwnerStale(args, { signal })),
+    claimExportAttempt: (cycleId, requestHash) => w("claim-export", true, (signal) => claimSourceExportAttempt(cycleId, requestHash, { signal })),
     // Blocker 2: the atomic cache-adoption CAS (adopt_source_export_cache), returning a typed
     // 'adopted' | 'not-adopted' acknowledgement. Mutually exclusive with claimExportAttempt.
-    adoptSourceCache: (args) => adoptSourceExportCache(args),
-    recordExportCreated: (args) => recordSyncSourceExportCreated(args),
-    loadSourceRows: (requestHash) => getSourceExportCache(requestHash),
-    saveSourceRows: ({ job, rows, payloadBytes, version }) => atomicSaveSourcePayload({
+    adoptSourceCache: (args) => w("adopt-cache", true, (signal) => adoptSourceExportCache(args, { signal })),
+    recordExportCreated: (args) => w("export-created", true, (signal) => recordSyncSourceExportCreated(args, { signal })),
+    loadSourceRows: (requestHash) => r("load-source-rows", (signal) => getSourceExportCache(requestHash, { signal })),
+    // The immutable-object storage save + pointer switch is already commit-unknown-safe by construction (a
+    // dropped/aborted pointer write NEVER deletes the new object; LKG is preserved). The deadline binds the
+    // whole save so an aborted in-flight save surfaces the typed WRITE expiry (commitUnknown) too. The
+    // adapters carry the deadline's signal, so their fetches abort genuinely.
+    saveSourceRows: ({ job, rows, payloadBytes, version }) => w("save-source-rows", true, () => atomicSaveSourcePayload({
       storage, metadata,
       requestHash: job.request_hash ?? job.requestHash,
       sourceId: job.source_id ?? job.sourceId,
@@ -266,23 +281,23 @@ export function makeSupabaseSourceStore() {
       rows, payloadBytes,
       expiresAt: new Date(Date.now() + SOURCE_CACHE_TTL_MS).toISOString(),
       version,
-    }),
-    recordSourceSuccess: (args) => recordSyncSourceSuccess(args),
-    recordSourceFailure: (args) => recordSyncSourceFailure(args),
-    updateCycleCounts: (cycleId, counts) => updateSyncCycleCounts(cycleId, counts),
+    })),
+    recordSourceSuccess: (args) => w("source-success", true, (signal) => recordSyncSourceSuccess(args, { signal })),
+    recordSourceFailure: (args) => w("source-failure", true, (signal) => recordSyncSourceFailure(args, { signal })),
+    updateCycleCounts: (cycleId, counts) => w("cycle-counts", true, (signal) => updateSyncCycleCounts(cycleId, counts, { signal })),
     // Blocker 4d wiring: the FROZEN per-(cycle, tranche) create/AI-token budget. persistBudget freezes the
     // reviewed plan ceilings once ('created' | 'exists'; drift RAISES PLAN_BUDGET_MISMATCH with no mutation);
     // reserveExportCreate is the ATOMIC pre-POST reservation the source worker uses whenever a budget context
     // is active -- only a 'reserved' acknowledgement may POST a create-export. The read pair feeds the
     // source-status surface (spent vs ceiling). All four are inert unless a budget-aware composition calls them.
-    persistBudget: (args) => persistSourceTrancheBudget(args),
-    reserveExportCreate: (args) => reserveSourceExportCreate(args),
-    getBudget: (args) => getSourceTrancheBudget(args),
-    getBudgetHashes: (args) => getSourceTrancheBudgetHashes(args),
+    persistBudget: (args) => w("persist-budget", true, (signal) => persistSourceTrancheBudget(args, { signal })),
+    reserveExportCreate: (args) => w("reserve-export", true, (signal) => reserveSourceExportCreate(args, { signal })),
+    getBudget: (args) => r("get-budget", (signal) => getSourceTrancheBudget(args, { signal })),
+    getBudgetHashes: (args) => r("get-budget-hashes", (signal) => getSourceTrancheBudgetHashes(args, { signal })),
     // Dispatcher-owned cycle finalization (Blocker 1): the guarded finalize_sync_cycle RPC, returning a typed
     // disposition. The canonical dispatcher calls this on a complete drained SCHEDULED scope; a source-family
     // driver never calls it.
-    finalizeCycle: ({ cycleId }) => finalizeSyncCycle(cycleId),
+    finalizeCycle: ({ cycleId }) => w("finalize-cycle", true, (signal) => finalizeSyncCycle(cycleId, { signal })),
   };
 }
 
