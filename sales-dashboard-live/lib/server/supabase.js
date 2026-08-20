@@ -659,18 +659,41 @@ export async function getSourcePromotedPublishSettings({ signal = null } = {}) {
 }
 
 export async function setSourcePromotedPublishControl({ reportKey, publishEnabled, updatedBy, signal = null }) {
+  // Round-7 finding 2: the command requires a STRICT boolean and a VALIDATED single-row durable
+  // acknowledgement -- exact canonical report_key, publish_enabled EXACTLY equal to the requested boolean,
+  // and a valid updated_at. A null/empty/multi-row/malformed/wrong-key/wrong-state acknowledgement throws a
+  // typed safe error so the caller NEVER records a success audit or returns 200 on an unproven write.
+  const key = String(reportKey || "").trim();
+  if (!key) {
+    const err = new Error("PROMOTED_PUBLISH_CONTROL_INVALID: a nonblank canonical reportKey is required (fail closed).");
+    err.code = "PROMOTED_PUBLISH_CONTROL_INVALID"; err.status = 400; throw err;
+  }
+  if (typeof publishEnabled !== "boolean") {
+    const err = new Error("PROMOTED_PUBLISH_CONTROL_INVALID: publishEnabled must be a boolean (fail closed).");
+    err.code = "PROMOTED_PUBLISH_CONTROL_INVALID"; err.status = 400; throw err;
+  }
   const rows = await request("/rest/v1/source_promoted_publish_settings?on_conflict=report_key", {
     method: "POST",
     signal,
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
     body: {
-      report_key: reportKey,
-      publish_enabled: publishEnabled === true,
+      report_key: key,
+      publish_enabled: publishEnabled,
       updated_by: updatedBy || null,
       updated_at: new Date().toISOString(),
     },
   });
-  return rows[0] || null;
+  const bad = (reason) => {
+    const err = new Error(`PROMOTED_PUBLISH_CONTROL_ACK_INVALID: ${reason}; the control write is unacknowledged (fail closed).`);
+    err.code = "PROMOTED_PUBLISH_CONTROL_ACK_INVALID"; err.status = 502; throw err;
+  };
+  if (!Array.isArray(rows) || rows.length !== 1) bad(`expected exactly one returned row (got ${Array.isArray(rows) ? rows.length : typeof rows})`);
+  const row = rows[0];
+  if (!row || typeof row !== "object") bad("the acknowledgement row is not an object");
+  if (String(row.report_key) !== key) bad(`the acknowledgement report_key ${JSON.stringify(row.report_key)} does not equal the requested ${JSON.stringify(key)}`);
+  if (row.publish_enabled !== publishEnabled) bad(`the acknowledgement publish_enabled ${JSON.stringify(row.publish_enabled)} does not equal the requested ${publishEnabled}`);
+  if (typeof row.updated_at !== "string" || Number.isNaN(Date.parse(row.updated_at))) bad("the acknowledgement has no valid updated_at");
+  return { reportKey: key, publishEnabled, updatedAt: row.updated_at };
 }
 
 /* ===================== Scheduler v2 (Phase 1c) — source-first cycle =====================
@@ -1629,6 +1652,57 @@ export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, l
     snapshot_params_hash: snapshotParamsHash, last_good_snapshot_at: new Date().toISOString(),
     succeeded_at: new Date().toISOString(), error_stage: null, error_code: null, error_message: null,
   }, { signal });
+}
+
+/* Round-7 finding 1 -- DURABLE report-derive LEASE + guarded recovery (20260822_report_derive_lease.sql,
+ * PREPARED-UNAPPLIED). The source-first report lineage uses these instead of the bare pending->running PATCH
+ * so a commitUnknown mid-derive is RECOVERABLE (a fresh invocation safely tells pending / running-held /
+ * running-stale / complete apart, reclaims an abandoned lease without stealing a live one, and reconciles to
+ * success from the EXACT durable snapshot -- zero DataDoe, no fabricated success). Both validate the RPC's
+ * jsonb disposition strictly; an unknown/malformed acknowledgement throws typed (fail closed). */
+const CLAIM_LEASE_DISPOSITIONS = new Set(["claimed", "reclaimed", "held", "already-complete", "terminal", "not-found", "invalid-lease"]);
+const RECONCILE_DISPOSITIONS = new Set(["reconciled", "already-complete", "snapshot-absent", "lease-lost", "not-running", "not-found", "invalid-hash", "invalid-lease"]);
+
+export async function claimReportDeriveLease(cycleId, reportKey, accountId, { now, leaseSeconds, signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/claim_report_derive_lease", {
+    method: "POST",
+    signal,
+    body: { p_cycle_id: cycleId, p_report_key: reportKey, p_account_id: accountId, p_now: now, p_lease_seconds: leaseSeconds },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  const disposition = value && typeof value === "object" ? value.disposition : null;
+  if (typeof disposition !== "string" || !CLAIM_LEASE_DISPOSITIONS.has(disposition)) {
+    const err = new Error(`REPORT_LEASE_ACK_INVALID: claim_report_derive_lease returned ${JSON.stringify(value)} (disposition not in the known set); refusing (fail closed).`);
+    err.code = "REPORT_LEASE_ACK_INVALID";
+    err.status = 503;
+    throw err;
+  }
+  return {
+    disposition,
+    leaseToken: typeof value.lease_token === "string" ? value.lease_token : null,
+    snapshotParamsHash: typeof value.snapshot_params_hash === "string" ? value.snapshot_params_hash : null,
+    deriveStatus: typeof value.derive_status === "string" ? value.derive_status : null,
+  };
+}
+
+export async function reconcileReportDeriveSuccess({ cycleId, reportKey, accountId, snapshotParamsHash, leaseToken, latestDataDate = null }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/reconcile_report_derive_success", {
+    method: "POST",
+    signal,
+    body: {
+      p_cycle_id: cycleId, p_report_key: reportKey, p_account_id: accountId,
+      p_snapshot_params_hash: snapshotParamsHash, p_lease_token: leaseToken, p_latest_data_date: latestDataDate,
+    },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  const disposition = value && typeof value === "object" ? value.disposition : null;
+  if (typeof disposition !== "string" || !RECONCILE_DISPOSITIONS.has(disposition)) {
+    const err = new Error(`REPORT_RECONCILE_ACK_INVALID: reconcile_report_derive_success returned ${JSON.stringify(value)} (disposition not in the known set); refusing (fail closed).`);
+    err.code = "REPORT_RECONCILE_ACK_INVALID";
+    err.status = 503;
+    throw err;
+  }
+  return { disposition };
 }
 
 /**

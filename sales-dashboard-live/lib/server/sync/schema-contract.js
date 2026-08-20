@@ -428,6 +428,28 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["getSourcePromotedPublishSettings", "setSourcePromotedPublishControl"],
     note: "Source-promoted publication control (brand-inventory); default OFF; PREPARED, UNAPPLIED.",
   },
+  {
+    // Round-7 finding 1: durable report-derive LEASE + guarded recovery. Adds only additive lease columns to
+    // the (20260807-frozen) sync_report_jobs + two guarded RPCs; NO table/RLS/policy of its own. The RPCs are
+    // structurally proven (FOR UPDATE lock, no-steal-unexpired-lease, exact durable-snapshot-bound reconcile).
+    migration: "20260822_report_derive_lease.sql",
+    tables: [],
+    requiredStatements: [
+      { label: "sync_report_jobs.derive_lease_token column (additive)", pattern: String.raw`alter\s+table\s+public\.sync_report_jobs[\s\S]{0,200}?add\s+column\s+if\s+not\s+exists\s+derive_lease_token\s+uuid` },
+      { label: "sync_report_jobs.derive_lease_expires_at column (additive)", pattern: String.raw`add\s+column\s+if\s+not\s+exists\s+derive_lease_expires_at\s+timestamptz` },
+      { label: "sync_report_jobs.derive_attempt_count column (additive)", pattern: String.raw`add\s+column\s+if\s+not\s+exists\s+derive_attempt_count\s+integer\s+not\s+null\s+default\s+0` },
+    ],
+    rpcs: [
+      { name: "claim_report_derive_lease", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_now", "p_lease_seconds"] },
+      { name: "reconcile_report_derive_success", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_snapshot_params_hash", "p_lease_token", "p_latest_data_date"] },
+    ],
+    provenFunctions: [
+      { name: "claim_report_derive_lease", proof: "claim-report-lease" },
+      { name: "reconcile_report_derive_success", proof: "reconcile-report-success" },
+    ],
+    wrappers: ["claimReportDeriveLease", "reconcileReportDeriveSuccess"],
+    note: "Report-derive lease + guarded recovery (claim/reconcile RPCs); additive to sync_report_jobs; PREPARED, UNAPPLIED.",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -1062,12 +1084,85 @@ function auditSnapshotCasFunction(clean, masked, fnName) {
 }
 
 // Dispatch a declared RPC-body structural proof by its `proof` tag.
+// Round-7 finding 1 structural proof: the guarded report-derive LEASE claim. The body must LOCK the row FOR
+// UPDATE, OBSERVE an already-complete job (never redo), CLAIM a pending row with a FRESH lease token +
+// expiry, NEVER steal an UNEXPIRED lease (the 'held' branch guarded by derive_lease_expires_at > p_now), and
+// re-claim only a STALE/expired running lease. Removing any guard is a typed blocker.
+function auditClaimReportLeaseFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "CLAIM_LEASE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked; const C = body.clean;
+  if (!/from\s+public\.sync_report_jobs\b[\s\S]*?for\s+update/i.test(M)) {
+    problems.push({ code: "CLAIM_LEASE_LOCK_MISSING", reason: "does not lock the exact report job row FOR UPDATE" });
+  }
+  if (!/'already-complete'/i.test(C) || !/validated\s*=\s*true/i.test(M)) {
+    problems.push({ code: "CLAIM_LEASE_COMPLETE_GUARD_MISSING", reason: "does not observe an already-complete (validated) job instead of re-claiming" });
+  }
+  // A FRESH lease token from gen_random_uuid() (inline, or via a v_* variable) written to the row, plus the
+  // expiry from p_now, on the 'claimed' path.
+  const claimsFresh = /gen_random_uuid\(\)/i.test(M)
+    && /derive_lease_token\s*=\s*(gen_random_uuid\(\)|v_\w+)/i.test(M)
+    && /derive_lease_expires_at\s*=\s*p_now\s*\+/i.test(M)
+    && /'claimed'/i.test(C);
+  if (!claimsFresh) {
+    problems.push({ code: "CLAIM_LEASE_CLAIM_MISSING", reason: "does not claim a pending row with a fresh lease token + expiry" });
+  }
+  // The 'held' branch MUST be guarded by an UNEXPIRED lease so a LIVE worker is never stolen.
+  if (!/derive_lease_expires_at\s*>\s*p_now/i.test(M) || !/'held'/i.test(C)) {
+    problems.push({ code: "CLAIM_LEASE_STEAL_GUARD_MISSING", reason: "does not refuse to steal an UNEXPIRED lease (the 'held' branch guarded by derive_lease_expires_at > p_now)" });
+  }
+  if (!/'reclaimed'/i.test(C)) {
+    problems.push({ code: "CLAIM_LEASE_RECLAIM_MISSING", reason: "does not re-claim a stale/expired running lease ('reclaimed')" });
+  }
+  return problems;
+}
+
+// Round-7 finding 1 structural proof: the guarded report-derive RECONCILE. The body must LOCK the row FOR
+// UPDATE, be idempotent on an already-complete identical identity, BIND reconciliation to the EXACT durable
+// shadow snapshot (an EXISTS over report_snapshots for scheduler-v2/<report_key> + this account +
+// p_snapshot_params_hash, else 'snapshot-absent'), require the CURRENT lease token ('lease-lost' when it
+// differs), and only then flip the running row to succeeded/validated bound to that hash.
+function auditReconcileReportSuccessFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "RECONCILE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked; const C = body.clean;
+  if (!/from\s+public\.sync_report_jobs\b[\s\S]*?for\s+update/i.test(M)) {
+    problems.push({ code: "RECONCILE_LOCK_MISSING", reason: "does not lock the exact report job row FOR UPDATE" });
+  }
+  // Bind to the EXACT durable snapshot: EXISTS over report_snapshots keyed by the shadow report_key
+  // ('scheduler-v2/' in `clean`), the account, and p_snapshot_params_hash, refusing 'snapshot-absent'.
+  const snapshotBound = /exists\s*\([\s\S]*?from\s+public\.report_snapshots\b[\s\S]*?params_hash\s*=\s*p_snapshot_params_hash/i.test(M)
+    && /'scheduler-v2\/'/i.test(C)
+    && /account_id\s*=\s*p_account_id/i.test(M)
+    && /'snapshot-absent'/i.test(C);
+  if (!snapshotBound) {
+    problems.push({ code: "RECONCILE_SNAPSHOT_BINDING_MISSING", reason: "does not bind reconciliation to the EXACT durable shadow snapshot (report_snapshots for scheduler-v2/<report_key> + account + params_hash; 'snapshot-absent' otherwise)" });
+  }
+  if (!/derive_lease_token\s*(<>|!=)\s*p_lease_token/i.test(M) || !/'lease-lost'/i.test(C)) {
+    problems.push({ code: "RECONCILE_LEASE_GUARD_MISSING", reason: "does not require the CURRENT lease token ('lease-lost' when it differs)" });
+  }
+  const flips = /update\s+public\.sync_report_jobs\b[\s\S]*?validated\s*=\s*true/i.test(M)
+    && /snapshot_params_hash\s*=\s*p_snapshot_params_hash/i.test(M)
+    && /'reconciled'/i.test(C);
+  if (!flips) {
+    problems.push({ code: "RECONCILE_SUCCESS_MISSING", reason: "does not flip the running row to succeeded/validated bound to p_snapshot_params_hash ('reconciled')" });
+  }
+  if (!/'already-complete'/i.test(C)) {
+    problems.push({ code: "RECONCILE_IDEMPOTENT_MISSING", reason: "is not idempotent on an already-complete identical snapshot identity" });
+  }
+  return problems;
+}
+
 function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
   if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
   if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
+  if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
+  if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 

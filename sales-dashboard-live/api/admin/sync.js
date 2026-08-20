@@ -84,7 +84,16 @@ export default async function handler(req, res) {
     // accidentally spend a DataDoe export. The dispatchable-report path below is left completely unchanged.
     if (SOURCE_PROMOTED_REPORT_KEYS.includes(requestedKey)) {
       if (req.method === "PATCH") {
-        const publishEnabled = body.publishEnabled === true;
+        // Round-7 finding 2: require an ACTUAL boolean BEFORE any write. A missing/malformed value must never
+        // coerce into a silent revoke (false) -- it is a 400 with ZERO control writes and ZERO audit rows.
+        if (typeof body.publishEnabled !== "boolean") {
+          res.status(400).json({ error: "body.publishEnabled must be a boolean." });
+          return;
+        }
+        const publishEnabled = body.publishEnabled;
+        // The control write returns a STRICTLY VALIDATED durable acknowledgement or throws typed; the audit
+        // event is recorded ONLY AFTER that acknowledgement validates, so a malformed ack never produces a
+        // success audit or a 200.
         await setSourcePromotedPublishControl({ reportKey: requestedKey, publishEnabled, updatedBy: access.userId });
         await insertAuditLog({
           actorUserId: access.userId,

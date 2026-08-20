@@ -54,8 +54,9 @@ import {
   getSourceOliHistoryRows, getDailyAdsCoverage, getAdDailyMetrics,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
-  upsertSyncReportJob, claimReportDeriveAttempt, recordSyncReportSuccess,
+  upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
 } from "../supabase.js";
+import { paramsHashFor } from "../report-store.js";
 
 export { SOURCE_SYNC_OWNER_REPORT_KEY };
 
@@ -247,10 +248,14 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     assignBatchMembership = assignSourceAccountBatch,
     readSettings = getReportSyncSettings,
     readRollout = getSchedulerAccountRollout,
-    // Round-4 finding 3: the GENUINE publication lineage -- every durable shadow save records a real
-    // sync_report_jobs row (validated derive/save success + the exact snapshot_params_hash), so the
-    // approved publisher path can accept the snapshot with zero new mechanisms.
-    reportLineage = { upsertReportJob: upsertSyncReportJob, claimReportDerive: claimReportDeriveAttempt, recordReportSuccess: recordSyncReportSuccess },
+    // Round-4 finding 3 + round-7 finding 1: the GENUINE, RECOVERABLE publication lineage. Every durable
+    // shadow save records a real sync_report_jobs row via a DURABLE LEASE (claimLease) and a guarded
+    // RECONCILE bound to the exact durable snapshot identity (reconcileSuccess), so a commitUnknown mid-derive
+    // is recoverable without stealing a live worker's claim, re-exporting from DataDoe, or fabricating success.
+    reportLineage = { upsertReportJob: upsertSyncReportJob, claimLease: claimReportDeriveLease, reconcileSuccess: reconcileReportDeriveSuccess },
+    // The EXACT-identity durable shadow-snapshot read used to adopt an already-saved snapshot on recovery
+    // (a shadow-save commit-unknown left it durable) so recovery re-saves ONLY when it is genuinely absent.
+    readShadowSnapshot = getReportSnapshot,
     composeTrancheRuntime = buildSchedulerV2SourceTrancheRuntime,
     replaceHistory = replaceOliHistoryWindow,
     saveSnapshotPayload = saveSourceSnapshotPayload,
@@ -262,6 +267,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     clock = () => Date.now(),
     budgetMs = DEFAULT_ROUTE_BUDGET_MS,
     reserveMs = DEFAULT_ROUTE_RESERVE_MS,
+    // Round-7 finding 1: the derive-lease duration. Long enough that a live worker (bounded by the ~50s
+    // route budget) always holds a non-expired lease within its invocation, short enough that a genuinely
+    // abandoned claim recovers on a later invocation. NEVER derived from updated_at.
+    reportDeriveLeaseSeconds = 300,
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = (id) => clearTimeout(id),
   } = overrides;
@@ -671,10 +680,14 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     // FINDING 2: the derive half shares the SAME deadline (evidence, hydration, history, derivation, saves);
     // expiry is a typed resumable skip -- a fresh invocation finds the sources complete and derives directly.
-    const deriveResumable = () => {
+    // Round-7 finding 1: PRESERVE the deadline error's commitUnknown flag onto the rollup -- an in-flight
+    // lineage/shadow WRITE that timed out may already have committed, so the resumable rollup must report it
+    // (never claim the write did not happen).
+    const deriveResumable = (cause = null) => {
       rollup.derived.skipped = "deadline";
       rollup.deadlineReached = true;
       rollup.continuationRequired = true;
+      rollup.commitUnknown = !!rollup.commitUnknown || !!(cause && cause.commitUnknown);
       return rollup;
     };
     const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
@@ -692,7 +705,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     } else {
       try {
         evidence = await gatherEvidence({ orgFingerprint, accounts, today: todayStr, ensureTime, bound: dl.bound });
-      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
     }
     if (!evidence.catalogRows) {
       rollup.derived.skipped = evidence.catalogSnapshot ? "catalog-hydration-failed" : "catalog-snapshot-missing";
@@ -720,7 +733,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
             adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed" };
           }
         }
-      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); historyRows = null; }
+      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); historyRows = null; }
       if (!Array.isArray(historyRows)) {
         rollup.derived.skipped = "history-read-failed";
         return rollup;
@@ -739,7 +752,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         campaignCoverageStateByAccountId: evidence.campaignCoverageStateByAccountId,
         dailyWindow, brandViewWindow,
       });
-    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
     const saver = makeShadowSaver();
     const nowIso = () => new Date(clock()).toISOString();
     let dailySaved = 0;
@@ -794,48 +807,77 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       "brand-sales": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
       [BRAND_INVENTORY_SNAPSHOT_KEY]: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY],
     };
-    const saveWithLineage = async (snap, save) => {
+    // Round-7 finding 1: CLAIM-LEASE -> save-if-absent -> RECONCILE. The lease makes a commitUnknown
+    // mid-derive recoverable: a fresh invocation observes 'already-complete' (nothing to do), 'held' (a live
+    // worker owns it -- never stolen), 'terminal' (failed/skipped for this cycle), 'claimed' (first-time) or
+    // 'reclaimed' (a stale/abandoned lease safely recovered). On claimed/reclaimed the payload is re-derived
+    // from DURABLE evidence (ZERO DataDoe), the EXACT durable snapshot is ADOPTED when it already exists (a
+    // shadow-save commit-unknown left it), else saved once, then reconcile (guarded by the held lease token
+    // AND the exact durable snapshot identity) flips the job to success. Nothing here fabricates success.
+    const saveShadow = (snap, params, signal) => saver({
+      reportKey: snap.reportKey, accountId: snap.accountId, params, payload: snap.payload, sourceRefreshedAt: nowIso(),
+    }, { signal });
+    const saveWithLineage = async (snap, params) => {
+      const paramsHash = paramsHashFor(params.reportVersion, params);
       if (!reportLineage || !rollup.cycleId) {
-        return { saved: await dl.bound("shadow-save", (signal) => save(signal), { write: true }), lineage: "unavailable" };
+        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
+        return { complete: true, newlySaved: true, saved, lineage: "unavailable" };
       }
+      const note = (outcome, detail) => rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome, ...(detail ? { detail } : {}) });
       await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
         dependsOn: succeededHashesFor(snap.accountId, LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
       }, { signal }), { write: true });
-      const claim = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimReportDerive(rollup.cycleId, snap.productionReportKey, snap.accountId, { signal }), { write: true });
-      if (claim !== true) {
-        rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "claim-lost" });
-        return { saved: null, lineage: "claim-lost" };
+      const lease = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimLease(
+        rollup.cycleId, snap.productionReportKey, snap.accountId, { now: nowIso(), leaseSeconds: reportDeriveLeaseSeconds, signal },
+      ), { write: true });
+      const disp = lease && lease.disposition;
+      if (disp === "already-complete") { note("already-complete"); return { complete: true, newlySaved: false, saved: null, lineage: "already-complete" }; }
+      if (disp === "held") { note("claim-held"); return { complete: false, newlySaved: false, saved: null, lineage: "claim-held" }; }
+      if (disp === "terminal") { note("terminal", lease.deriveStatus); return { complete: false, newlySaved: false, saved: null, lineage: "terminal" }; }
+      if ((disp !== "claimed" && disp !== "reclaimed") || !lease.leaseToken) {
+        note("claim-failed", disp || "malformed");
+        return { complete: false, newlySaved: false, saved: null, lineage: "claim-failed" };
       }
-      const saved = await dl.bound("shadow-save", (signal) => save(signal), { write: true });
-      await dl.bound("report-lineage-success", (signal) => reportLineage.recordReportSuccess({
+      const leaseToken = lease.leaseToken;
+      const recovered = disp === "reclaimed";
+      // Adopt the EXACT durable snapshot if it already exists; else save it once. Zero DataDoe either way.
+      const existing = await dl.bound("shadow-read", (signal) => readShadowSnapshot({ reportKey: snap.reportKey, accountId: snap.accountId, paramsHash }, { signal }));
+      let newlySaved = false;
+      if (!existing || String(existing.params_hash ?? existing.paramsHash) !== paramsHash) {
+        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
+        if (saved && saved.paramsHash && saved.paramsHash !== paramsHash) {
+          throw new Error("SNAPSHOT_PARAMS_HASH_DRIFT: the saver-computed hash disagrees with the reconcile hash; refusing (fail closed).");
+        }
+        newlySaved = true;
+      }
+      const rec = await dl.bound("report-lineage-reconcile", (signal) => reportLineage.reconcileSuccess({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, accountId: snap.accountId,
-        latestDataDate: snap.latestDataDate ?? null, snapshotParamsHash: saved.paramsHash,
+        snapshotParamsHash: paramsHash, leaseToken, latestDataDate: snap.latestDataDate ?? null,
       }, { signal }), { write: true });
-      rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "recorded" });
-      return { saved, lineage: "recorded" };
+      const rdisp = rec && rec.disposition;
+      if (rdisp === "reconciled" || rdisp === "already-complete") {
+        note(recovered ? "recovered" : "recorded");
+        return { complete: true, newlySaved, saved: newlySaved ? { paramsHash } : null, lineage: recovered ? "recovered" : "recorded" };
+      }
+      // lease-lost / snapshot-absent / not-running / not-found: a concurrent worker took over or the snapshot
+      // vanished. NEVER fabricate success.
+      note("reconcile-failed", rdisp || "malformed");
+      return { complete: false, newlySaved, saved: null, lineage: "reconcile-failed" };
     };
     try {
       for (const snap of derived.daily.snapshots) {
         await ensureTime("snapshot-save");
-        const r = await saveWithLineage(snap, (signal) => saver({
-          reportKey: snap.reportKey, accountId: snap.accountId,
-          params: { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" },
-          payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }, { signal }));
-        if (r.saved) dailySaved += 1;
+        const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" });
+        if (r.complete) dailySaved += 1;
       }
       for (const snap of derived.brandView.snapshots) {
         await ensureTime("snapshot-save");
-        const r = await saveWithLineage(snap, (signal) => saver({
-          reportKey: snap.reportKey, accountId: snap.accountId,
-          params: { reportVersion: snap.version, accountId: snap.accountId, from: brandViewWindow.from, to: brandViewWindow.to },
-          payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }, { signal }));
-        if (r.saved) brandViewSaved += 1;
+        const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, from: brandViewWindow.from, to: brandViewWindow.to });
+        if (r.complete) brandViewSaved += 1;
       }
-    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
 
     // Round-5 blocker 2: wire the DURABLE FBA evidence into Brand View's REAL production read path -- build
     // the validated compact brand-inventory snapshot via the EXISTING buildBrandInventorySnapshot contract
@@ -872,14 +914,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           accountId: account.accountId, version: BRAND_INVENTORY_REPORT_VERSION,
           payload: built.payload, latestDataDate: built.payload.inventoryDate || null,
         };
-        const r = await saveWithLineage(snap, (signal) => saver({
-          reportKey: snap.reportKey, accountId: snap.accountId,
-          params: { reportVersion: snap.version, accountId: snap.accountId, to: invWindow.to },
-          payload: snap.payload, sourceRefreshedAt: nowIso(),
-        }, { signal }));
-        if (r.saved) brandInventory.saved += 1;
+        const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, to: invWindow.to });
+        if (r.complete) brandInventory.saved += 1;
       }
-    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
     rollup.derived.skipped = null;
     rollup.derived.daily = { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped };
     rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped };

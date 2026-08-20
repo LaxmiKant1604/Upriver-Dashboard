@@ -56,6 +56,10 @@ const dirAccount = (id) => ({ id, name: "Acct " + id, country: "US", currency: "
 function makeStore() {
   const cycles = new Map(); const jobsByCycle = new Map(); const ownersByCycle = new Map();
   const cache = new Map(); const budgets = new Map(); const reportJobs = new Map(); let seq = 0;
+  // Round-7 finding 1: the durable report_snapshots model (keyed by shadow report_key|account|params_hash)
+  // the lease reconcile + the runtime's adopt-if-exists read consult; plus a lease-token counter.
+  const reportSnapshots = new Map(); let leaseSeq = 0;
+  const rsKey = (rk, a, h) => rk + "|" + a + "|" + h;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
   const rjKey = (c, rk, a) => c + "|" + rk + "|" + a;
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
@@ -172,6 +176,7 @@ function makeStore() {
         cycle_id: j.cycleId, report_key: j.reportKey, report_version: j.reportVersion || "", account_id: j.accountId,
         connection_id: j.connectionId, bucket: j.bucket, depends_on: [...(j.dependsOn || [])],
         derive_status: "pending", save_status: "pending", validated: false, snapshot_params_hash: null, latest_data_date: null,
+        derive_lease_token: null, derive_lease_expires_at: null, derive_attempt_count: 0,
       });
     },
     claimReportDerive(cycleId, reportKey, accountId) {
@@ -187,6 +192,56 @@ function makeStore() {
         derive_status: "succeeded", save_status: "succeeded", validated: true,
         snapshot_params_hash: j.snapshotParamsHash, latest_data_date: j.latestDataDate ?? null,
       });
+    },
+    // Round-7 finding 1: FAITHFUL model of claim_report_derive_lease -- guarded pending|stale-running ->
+    // running(token); NEVER steals an unexpired lease; observes already-complete; terminal for failed/skipped.
+    claimLease(cycleId, reportKey, accountId, { now, leaseSeconds } = {}) {
+      guardAppend(cycleId); // Migration-5 append guard applies to running-cycle updates
+      const nowMs = Date.parse(now);
+      if (!(leaseSeconds > 0) || Number.isNaN(nowMs)) return { disposition: "invalid-lease" };
+      const r = reportJobs.get(rjKey(cycleId, reportKey, accountId));
+      if (!r) return { disposition: "not-found" };
+      if (r.validated === true && r.derive_status === "succeeded" && r.save_status === "succeeded") {
+        return { disposition: "already-complete", snapshot_params_hash: r.snapshot_params_hash };
+      }
+      if (r.derive_status === "failed" || r.derive_status === "skipped") return { disposition: "terminal", derive_status: r.derive_status };
+      const token = "lease_" + (leaseSeq += 1);
+      if (r.derive_status === "pending") {
+        Object.assign(r, { derive_status: "running", derive_lease_token: token, derive_lease_expires_at: nowMs + leaseSeconds * 1000, derive_attempt_count: (r.derive_attempt_count || 0) + 1 });
+        return { disposition: "claimed", lease_token: token };
+      }
+      // running: an UNEXPIRED lease is a LIVE worker -- do not steal.
+      if (r.derive_lease_expires_at != null && r.derive_lease_expires_at > nowMs) return { disposition: "held", lease_expires_at: r.derive_lease_expires_at };
+      Object.assign(r, { derive_lease_token: token, derive_lease_expires_at: nowMs + leaseSeconds * 1000, derive_attempt_count: (r.derive_attempt_count || 0) + 1 });
+      return { disposition: "reclaimed", lease_token: token, attempt: r.derive_attempt_count };
+    },
+    // Round-7 finding 1: FAITHFUL model of reconcile_report_derive_success -- requires the EXACT durable
+    // shadow snapshot to exist AND the CURRENT lease token; only then running -> succeeded bound to the hash.
+    reconcileSuccess({ cycleId, reportKey, accountId, snapshotParamsHash, leaseToken, latestDataDate } = {}) {
+      guardAppend(cycleId);
+      if (!snapshotParamsHash) return { disposition: "invalid-hash" };
+      if (!leaseToken) return { disposition: "invalid-lease" };
+      const r = reportJobs.get(rjKey(cycleId, reportKey, accountId));
+      if (!r) return { disposition: "not-found" };
+      if (r.validated === true && r.derive_status === "succeeded" && r.save_status === "succeeded" && r.snapshot_params_hash === snapshotParamsHash) {
+        return { disposition: "already-complete" };
+      }
+      const exists = reportSnapshots.has(rsKey("scheduler-v2/" + reportKey, accountId, snapshotParamsHash));
+      if (!exists) return { disposition: "snapshot-absent" };
+      if (r.derive_lease_token == null || r.derive_lease_token !== leaseToken) return { disposition: "lease-lost" };
+      if (r.derive_status !== "running") return { disposition: "not-running", derive_status: r.derive_status };
+      Object.assign(r, {
+        fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true,
+        snapshot_params_hash: snapshotParamsHash, latest_data_date: latestDataDate ?? r.latest_data_date,
+        derive_lease_token: null, derive_lease_expires_at: null,
+      });
+      return { disposition: "reconciled", snapshot_params_hash: snapshotParamsHash };
+    },
+    recordShadowSnapshot({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt }) {
+      reportSnapshots.set(rsKey(reportKey, accountId, paramsHash), { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, source_refreshed_at: sourceRefreshedAt });
+    },
+    getShadowSnapshot({ reportKey, accountId, paramsHash }) {
+      return reportSnapshots.get(rsKey(reportKey, accountId, paramsHash)) || null;
     },
     getReportJob(reportKey, accountId) {
       const rows = [...reportJobs.values()].filter((r) => r.report_key === reportKey && r.account_id === accountId);
@@ -301,21 +356,30 @@ function makeHarness(over = {}) {
     updateRunStatus: async () => ({ write: "ok" }),
     // Round-5: the REAL paramsHashFor hash (so the genuine publisher hash-provenance gate can accept these
     // saves) + a "save" lineage event so claim-BEFORE-save ordering is provable from one recorder.
-    makeShadowSaver: () => async (args) => {
+    makeShadowSaver: over.makeShadowSaver || (() => async (args) => {
       const paramsHash = reportStore.paramsHashFor(args.params.reportVersion, args.params);
       recorded.lineage.push({ op: "save", reportKey: args.reportKey, accountId: args.accountId });
       recorded.shadowSaves.push({ ...args, paramsHash });
+      // Round-7: the durable report_snapshots row the reconcile RPC + the adopt-if-exists read consult.
+      store.recordShadowSnapshot({ reportKey: args.reportKey, accountId: args.accountId, paramsHash, params: args.params, payload: args.payload, sourceRefreshedAt: args.sourceRefreshedAt });
       return { paramsHash };
-    },
+    }),
     readSettings: over.readSettings || (async () => []),
     readRollout: over.readRollout || (async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [] })),
     readAdMetrics: over.readAdMetrics || (async () => []),
-    // Round-5: the default lineage DELEGATES to the store's sync_report_jobs model (real one-attempt claim
-    // semantics + rows the finalize/publisher read) while still recording every op for ordering assertions.
+    // Round-7: the EXACT-identity durable shadow read the runtime uses to adopt an already-saved snapshot.
+    readShadowSnapshot: over.readShadowSnapshot || (async ({ reportKey, accountId, paramsHash }) => store.getShadowSnapshot({ reportKey, accountId, paramsHash })),
+    // Round-7 finding 1: the default lineage DELEGATES to the store's LEASE model (guarded claim + reconcile
+    // bound to the exact durable snapshot) while recording every op + disposition for assertions.
     reportLineage: over.reportLineage || {
       upsertReportJob: async (j) => { recorded.lineage.push({ op: "upsert", ...j }); store.upsertReportJob(j); },
-      claimReportDerive: async (c, rk, a) => { const claim = store.claimReportDerive(c, rk, a); recorded.lineage.push({ op: "claim", reportKey: rk, accountId: a, claim }); return claim; },
-      recordReportSuccess: async (j) => { recorded.lineage.push({ op: "success", ...j }); store.recordReportSuccess(j); },
+      // Mirror the REAL wrapper's camelCase shape (claimReportDeriveLease maps lease_token -> leaseToken).
+      claimLease: async (c, rk, a, opts) => {
+        const res = store.claimLease(c, rk, a, opts);
+        recorded.lineage.push({ op: "claim", reportKey: rk, accountId: a, disposition: res.disposition });
+        return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+      },
+      reconcileSuccess: async (j) => { const res = store.reconcileSuccess(j); recorded.lineage.push({ op: "reconcile", reportKey: j.reportKey, accountId: j.accountId, disposition: res.disposition }); return { disposition: res.disposition }; },
     },
     composeTrancheRuntime: over.composeTrancheRuntime,
     clock: () => clockRef.now,
@@ -850,13 +914,16 @@ test("S2. genuine sync_report_jobs lineage: every durable save records upsert ->
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.ok(rollup.derived.daily.saved >= 1, "daily saved");
   const upserts = h.recorded.lineage.filter((l) => l.op === "upsert");
-  const successes = h.recorded.lineage.filter((l) => l.op === "success");
+  const reconciled = h.recorded.lineage.filter((l) => l.op === "reconcile" && l.disposition === "reconciled");
   assert.ok(upserts.some((l) => l.reportKey === "daily-reporting"), "a REAL sync_report_jobs row under the PRODUCTION key");
   assert.ok(upserts.some((l) => l.reportKey === "brand-sales"), "brand-sales lineage too");
-  for (const sSucc of successes) {
-    const save = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/" + sSucc.reportKey && x.accountId === sSucc.accountId);
-    assert.ok(save, "each success maps to a real shadow save");
-    assert.equal(sSucc.snapshotParamsHash, reportStore.paramsHashFor(save.params.reportVersion, save.params), "the EXACT saver-computed snapshot_params_hash is recorded");
+  assert.ok(reconciled.length >= 1, "at least one report reconciled to validated success");
+  for (const rec of reconciled) {
+    const save = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/" + rec.reportKey && x.accountId === rec.accountId);
+    assert.ok(save, "each reconcile maps to a real shadow save");
+    const job = h.store.getReportJob(rec.reportKey, rec.accountId);
+    assert.ok(job && job.validated === true && job.derive_status === "succeeded" && job.save_status === "succeeded", "the durable job is a validated success");
+    assert.equal(job.snapshot_params_hash, reportStore.paramsHashFor(save.params.reportVersion, save.params), "the durable job records the EXACT saver-computed snapshot_params_hash");
   }
 });
 
@@ -968,15 +1035,17 @@ test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.derived.skipped, null);
   assert.ok(rollup.derived.daily.saved >= 1 && rollup.derived.brandView.saved >= 1, "durable saves happened");
-  // (a) ORDER per (report, account): upsert -> claim(true) -> save -> success, from ONE recorder.
-  const successes = h.recorded.lineage.filter((l) => l.op === "success");
-  assert.ok(successes.length >= 3, "daily + brand-sales + brand-inventory lineage recorded");
-  for (const s of successes) {
+  // (a) ORDER per (report, account): upsert -> claim(claimed) -> save -> reconcile(reconciled), from ONE
+  // recorder. Round-7: success is now a GUARDED RECONCILE bound to the durable snapshot, held under a lease.
+  const reconciles = h.recorded.lineage.filter((l) => l.op === "reconcile" && l.disposition === "reconciled");
+  assert.ok(reconciles.length >= 3, "daily + brand-sales + brand-inventory lineage reconciled");
+  for (const s of reconciles) {
     const seq = h.recorded.lineage.filter((l) =>
       (l.reportKey === s.reportKey || l.reportKey === "scheduler-v2/" + s.reportKey) && l.accountId === s.accountId);
     const ops = seq.map((l) => l.op);
-    assert.deepEqual(ops, ["upsert", "claim", "save", "success"], s.reportKey + "/" + s.accountId + ": the claim is held BEFORE the save, success only after it");
-    assert.equal(seq[1].claim, true, "claim === true STRICTLY before any save");
+    assert.deepEqual(ops, ["upsert", "claim", "save", "reconcile"], s.reportKey + "/" + s.accountId + ": the lease is claimed BEFORE the save, reconcile only after a durable save");
+    assert.equal(seq[1].disposition, "claimed", "the lease is CLAIMED (not stolen) before any save");
+    assert.equal(seq[3].disposition, "reconciled", "success is a guarded RECONCILE bound to the exact durable snapshot");
   }
   // (b) depends_on binds each job to the EXACT authoritative source request hashes ITS OWN ACCOUNT owns
   // (round-6 fix 5): the account's batch OLI hashes + its own FBA hash + the shared organization catalog.
@@ -1034,50 +1103,29 @@ test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the
   assert.equal(published.length, 1, "the live CAS primitive received exactly one publish");
 });
 
-test("T2. blocker 1: idempotent RESUME (a fresh invocation loses the claim and changes nothing) and CONCURRENCY (a lost claim never records success; the cycle honestly stays open)", async () => {
-  // (a) idempotent resume over the SAME still-running cycle (round-6 fix 1: the source runtime never
-  // terminalizes it, so the resume appends/replays WITHOUT tripping the Migration-5 append guard).
+test("T2. round-7: idempotent RESUME re-observes already-complete (zero new work); finalization terminalizes ONLY after every report is truly complete", async () => {
+  // Run 1 over the SAME store reconciles every report to success (claimed -> save -> reconciled).
   const h = fullFixture();
   const r1 = await h.runtime.run({ bucket: "us", today: TODAY });
-  assert.equal(r1.finalized, false, "run 1 did not terminalize the shared cycle");
+  assert.equal(r1.stopped, false, JSON.stringify(r1.stopReason));
+  assert.equal(r1.finalized, false, "the source runtime never finalizes the shared cycle");
   assert.equal(r1.cycleStatus, "running");
+  assert.ok(r1.derived.lineage.length >= 3 && r1.derived.lineage.every((l) => l.outcome === "recorded"), "run 1 reconciled EVERY report");
   const saves1 = h.recorded.shadowSaves.length;
-  const successes1 = h.recorded.lineage.filter((l) => l.op === "success").length;
   const creates1 = h.dd.totalCreates();
+  const reconciles1 = h.recorded.lineage.filter((l) => l.op === "reconcile" && l.disposition === "reconciled").length;
+  // Resume: run 2 over the SAME store re-observes already-complete and does ZERO new work.
   const r2 = await h.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(h.dd.totalCreates(), creates1, "no duplicate export on resume");
-  assert.equal(h.recorded.shadowSaves.length, saves1, "no duplicate shadow save: the resume LOSES every claim");
-  assert.equal(h.recorded.lineage.filter((l) => l.op === "success").length, successes1, "no duplicate success");
-  assert.ok(r2.derived.lineage.length >= 1 && r2.derived.lineage.every((l) => l.outcome === "claim-lost"), "every resume claim is typed claim-lost");
+  assert.equal(h.recorded.shadowSaves.length, saves1, "no duplicate shadow save on resume (already-complete short-circuits before any save)");
+  assert.equal(h.recorded.lineage.filter((l) => l.op === "reconcile" && l.disposition === "reconciled").length, reconciles1, "no duplicate reconcile");
+  assert.ok(r2.derived.lineage.length >= 3 && r2.derived.lineage.every((l) => l.outcome === "already-complete"), "every resume report is already-complete (never claim-lost, never re-saved)");
   assert.equal(r2.cycleStatus, "running", "the shared cycle STILL is not terminalized by any source-only run");
-  // (b) concurrency: a racer wins the daily/A01 claim (and never completes it).
-  const store2 = makeStore();
-  let raced = false;
-  const h2 = fullFixture({
-    store: store2,
-    reportLineage: {
-      upsertReportJob: async (j) => store2.upsertReportJob(j),
-      claimReportDerive: async (c, rk, a) => {
-        if (rk === "daily-reporting" && a === "A01" && !raced) { raced = true; store2.claimReportDerive(c, rk, a); } // a concurrent worker claims FIRST
-        return store2.claimReportDerive(c, rk, a);
-      },
-      recordReportSuccess: async (j) => store2.recordReportSuccess(j),
-    },
-  });
-  const r3 = await h2.runtime.run({ bucket: "us", today: TODAY });
-  assert.equal(r3.stopped, false);
-  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "the claim loser NEVER saves");
-  const lost = store2.getReportJob("daily-reporting", "A01");
-  assert.equal(lost.validated, false, "success is NEVER recorded after a lost claim");
-  assert.equal(lost.derive_status, "running", "the job stays with its claim winner");
-  assert.ok(r3.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "claim-lost"), "typed claim-lost outcome");
-  assert.equal(r3.cycleStatus, "running", "the cycle honestly stays NON-terminal");
-  assert.equal(r3.finalized, false);
-  // Even the dispatcher-owned close refuses while the raced job is still open: the guarded primitive
-  // returns open-work -- the cycle can NEVER be claimed terminal around an in-flight claim.
-  const attempt = store2.finalizeCycle({ cycleId: r3.cycleId });
-  assert.equal(attempt.disposition, "open-work", "finalize refuses while a claimed report job is open");
-  assert.equal(store2.getCycle(r3.cycleId).status, "running");
+  // FINDING 1: after recovery/completion the dispatcher can finalize HONESTLY -- open-work -> terminal only
+  // because every report is truly complete.
+  const closed = h.store.finalizeCycle({ cycleId: r1.cycleId });
+  assert.equal(closed.disposition, "finalized", "the complete drained scope finalizes atomically");
+  assert.ok(["succeeded", "partial"].includes(closed.cycle.status), "the cycle terminalizes honestly once every report is complete");
 });
 
 test("T3. blocker 2: the durable FBA evidence reaches Brand View through its REAL read path (buildAccountBrandSlice -> compact snapshot gate), not a direct builder call", async () => {
@@ -1748,15 +1796,35 @@ test("U7. the promoted-publish control wrappers are fail-closed default-off (moc
     const rows = await sb.getSourcePromotedPublishSettings({ signal: ctrl.signal });
     assert.equal(seenSig, ctrl.signal, "the read carries the route signal to the real fetch");
     assert.deepEqual(rows, [{ report_key: "brand-inventory", publish_enabled: false }], "the seeded default-off row");
-    // (c) SET wrapper writes to source_promoted_publish_settings (NOT report_sync_settings) with the signal.
+    // (c) SET wrapper writes to source_promoted_publish_settings (NOT report_sync_settings) with the signal,
+    // and returns only after a STRICTLY VALIDATED single-row acknowledgement (exact key, exact boolean, valid
+    // updated_at).
     const writes = [];
-    globalThis.fetch = async (url, init) => { writes.push({ url: String(url), signal: init && init.signal, body: init && init.body }); return { ok: true, status: 200, json: async () => [{ report_key: "brand-inventory", publish_enabled: true }], text: async () => "[]" }; };
-    await sb.setSourcePromotedPublishControl({ reportKey: "brand-inventory", publishEnabled: true, updatedBy: "admin-1", signal: ctrl.signal });
+    const okAck = () => ({ ok: true, status: 200, json: async () => [{ report_key: "brand-inventory", publish_enabled: true, updated_at: "2026-08-21T00:00:00Z" }], text: async () => "[]" });
+    globalThis.fetch = async (url, init) => { writes.push({ url: String(url), signal: init && init.signal, body: init && init.body }); return okAck(); };
+    const setRes = await sb.setSourcePromotedPublishControl({ reportKey: "brand-inventory", publishEnabled: true, updatedBy: "admin-1", signal: ctrl.signal });
+    assert.deepEqual({ reportKey: setRes.reportKey, publishEnabled: setRes.publishEnabled }, { reportKey: "brand-inventory", publishEnabled: true }, "the validated ack echoes the exact key + boolean");
     assert.equal(writes.length, 1);
     assert.ok(writes[0].url.includes("source_promoted_publish_settings"), "the set writes the SEPARATE control table");
     assert.ok(!writes[0].url.includes("report_sync_settings"), "the set NEVER touches the dispatch control");
     assert.ok(String(writes[0].body).includes('"publish_enabled":true'), "the write carries publish_enabled=true");
     assert.equal(writes[0].signal, ctrl.signal, "the write carries the route signal");
+    // Round-7 finding 2: a non-boolean input performs ZERO control writes (throws BEFORE the request).
+    writes.length = 0;
+    await assert.rejects(() => sb.setSourcePromotedPublishControl({ reportKey: "brand-inventory", publishEnabled: "yes", updatedBy: "admin-1" }), (e) => e.code === "PROMOTED_PUBLISH_CONTROL_INVALID" && e.status === 400);
+    assert.equal(writes.length, 0, "a malformed (non-boolean) input performs ZERO control writes");
+    // Round-7 finding 2: null / multi-row / wrong-key / wrong-state / no-updated_at acknowledgements throw typed.
+    for (const [ack, label] of [
+      [async () => [], "empty"],
+      [async () => [{ report_key: "brand-inventory", publish_enabled: true, updated_at: "2026-08-21T00:00:00Z" }, { report_key: "brand-inventory", publish_enabled: true, updated_at: "2026-08-21T00:00:00Z" }], "multi-row"],
+      [async () => [{ report_key: "daily-reporting", publish_enabled: true, updated_at: "2026-08-21T00:00:00Z" }], "wrong-key"],
+      [async () => [{ report_key: "brand-inventory", publish_enabled: false, updated_at: "2026-08-21T00:00:00Z" }], "wrong-state"],
+      [async () => [{ report_key: "brand-inventory", publish_enabled: true }], "no-updated_at"],
+      [async () => null, "null"],
+    ]) {
+      globalThis.fetch = async () => ({ ok: true, status: 200, json: ack, text: async () => "[]" });
+      await assert.rejects(() => sb.setSourcePromotedPublishControl({ reportKey: "brand-inventory", publishEnabled: true, updatedBy: "admin-1" }), (e) => e.code === "PROMOTED_PUBLISH_CONTROL_ACK_INVALID" && e.status === 502, "malformed ack: " + label);
+    }
   } finally { globalThis.fetch = realFetch; }
 
   // (d) the ADMIN sync surface ROUTES a promoted key to the SEPARATE control and CANNOT dispatch it (proven
@@ -1796,6 +1864,251 @@ test("U7. the promoted-publish control wrappers are fail-closed default-off (moc
   assert.ok(droppedPolicy.blockers.some((b) => b.code === "POLICY_MISSING" && b.table === "source_promoted_publish_settings"), JSON.stringify(droppedPolicy.blockers.filter((b) => b.table === "source_promoted_publish_settings").map((b) => b.code)));
   const widenedAcl = auditWith821((sql) => sql.split("grant select, insert, update on table public.source_promoted_publish_settings to service_role;").join("grant all on table public.source_promoted_publish_settings to service_role;"));
   assert.ok(widenedAcl.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH" && b.table === "source_promoted_publish_settings"), JSON.stringify(widenedAcl.blockers.filter((b) => b.table === "source_promoted_publish_settings").map((b) => b.code)));
+});
+
+
+/* ================================= X. round-7 finding 1: durable recovery after commit-unknown ================================= */
+group("X. round-7 finding 1: durable, concurrency-safe report-derive recovery (lease + guarded reconcile)");
+
+// The route-deadline marker the runtime reads via Symbol.for -- constructing an error with it lets a test
+// inject a "committed then response-timed-out" (commitUnknown) failure that the runtime treats as resumable.
+const ROUTE_DEADLINE_SYM = Symbol.for("scheduler-v2/route-deadline");
+const routeDeadlineError = (phase) => {
+  const e = new Error("route deadline (commit-unknown) at " + phase);
+  e.code = "ROUTE_DEADLINE_EXCEEDED"; e.status = 503;
+  e[ROUTE_DEADLINE_SYM] = phase; e.beforeRequest = false; e.inFlight = true; e.commitUnknown = true;
+  return e;
+};
+const LEASE_S = 300;                 // matches the runtime default reportDeriveLeaseSeconds
+const BASE_MS = 8_000_000;           // the harness clock start
+const PAST_LEASE_MS = BASE_MS + LEASE_S * 1000 + 60_000; // safely past the lease expiry
+
+// A fullFixture whose lineage/saver DELEGATE to the store but can inject a commit-unknown timeout at a
+// precise stage (claim after commit / save before commit / reconcile before or after commit) for one target.
+function recoveryFixture(store, inject = {}) {
+  const savedShadow = [];
+  const hit = (fn, rk, a) => typeof fn === "function" && fn(rk, a);
+  const over = {
+    store,
+    makeShadowSaver: () => async (args) => {
+      const paramsHash = reportStore.paramsHashFor(args.params.reportVersion, args.params);
+      const prodKey = String(args.reportKey).replace(/^scheduler-v2\//, ""); // the saver receives the SHADOW key
+      // A save that does NOT commit: throw BEFORE recording the durable snapshot.
+      if (hit(inject.timeoutSaveAt, prodKey, args.accountId)) throw routeDeadlineError("shadow-save");
+      store.recordShadowSnapshot({ reportKey: args.reportKey, accountId: args.accountId, paramsHash, params: args.params, payload: args.payload, sourceRefreshedAt: args.sourceRefreshedAt });
+      savedShadow.push({ reportKey: args.reportKey, accountId: args.accountId, paramsHash });
+      return { paramsHash };
+    },
+    reportLineage: {
+      upsertReportJob: async (j) => store.upsertReportJob(j),
+      claimLease: async (c, rk, a, opts) => {
+        const res = store.claimLease(c, rk, a, opts); // COMMITS the lease
+        if (hit(inject.timeoutClaimAfterCommit, rk, a)) throw routeDeadlineError("report-lineage-claim"); // response timed out
+        return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+      },
+      reconcileSuccess: async (j) => {
+        if (hit(inject.timeoutReconcileBeforeCommit, j.reportKey, j.accountId)) throw routeDeadlineError("report-lineage-reconcile"); // did NOT commit
+        const res = store.reconcileSuccess(j); // COMMITS success
+        if (hit(inject.timeoutReconcileAfterCommit, j.reportKey, j.accountId)) throw routeDeadlineError("report-lineage-reconcile"); // response timed out
+        return { disposition: res.disposition };
+      },
+    },
+  };
+  const h = fullFixture(over);
+  h.savedShadow = savedShadow;
+  return h;
+}
+const onceFor = (rk0, a0) => { let done = false; return (rk, a) => (!done && rk === rk0 && a === a0) ? (done = true, true) : false; };
+const daily = (rk, a) => rk === "daily-reporting" && a === "A01";
+
+test("X1. a claim COMMITS but the response TIMES OUT (commitUnknown) -> a fresh invocation past the lease RECLAIMS and recovers; commitUnknown is preserved on the first rollup", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutClaimAfterCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.deadlineReached, true, "the first invocation returned typed-resumable at the claim timeout");
+  assert.equal(r1.continuationRequired, true);
+  assert.equal(r1.commitUnknown, true, "X10: commitUnknown is PRESERVED on the first invocation's rollup");
+  const j1 = store.getReportJob("daily-reporting", "A01");
+  assert.equal(j1.derive_status, "running", "the claim COMMITTED: the row is running with a lease");
+  assert.ok(j1.derive_lease_token, "a lease token was durably set");
+  assert.equal(j1.validated, false, "no fabricated success");
+  // Fresh invocation AFTER the lease expires -> reclaim + recover.
+  const h2 = fullFixture({ store });
+  h2.clockRef.now = PAST_LEASE_MS;
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r2.stopped, false, JSON.stringify(r2.stopReason));
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "the fresh invocation RECOVERED the abandoned claim to success");
+  assert.equal(h2.dd.totalCreates(), 0, "X8: recovery performs ZERO new DataDoe exports");
+  assert.ok(r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "recovered"), "typed 'recovered' outcome");
+});
+
+test("X2. a shadow save COMMITS but the reconcile does NOT commit -> a fresh invocation ADOPTS the exact durable snapshot (no re-save, no DataDoe) and reconciles", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutReconcileBeforeCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.commitUnknown, true);
+  assert.ok(h1.savedShadow.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "the shadow save COMMITTED once");
+  const j1 = store.getReportJob("daily-reporting", "A01");
+  assert.equal(j1.derive_status, "running", "the reconcile did NOT commit: the job is still running");
+  assert.equal(j1.validated, false);
+  const h2 = fullFixture({ store });
+  h2.clockRef.now = PAST_LEASE_MS;
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "recovery ADOPTED the exact durable snapshot -- ZERO re-save");
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "reconciled to success on adoption");
+  assert.equal(h2.dd.totalCreates(), 0, "zero DataDoe on recovery");
+  assert.ok(r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "recovered"));
+});
+
+test("X3. a shadow save DEFINITELY did not commit -> after the lease guard, a fresh invocation RETRIES the save exactly once and reconciles", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutSaveAt: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.commitUnknown, true);
+  assert.ok(!h1.savedShadow.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "the save did NOT commit (no durable snapshot)");
+  const j1 = store.getReportJob("daily-reporting", "A01");
+  assert.equal(j1.derive_status, "running");
+  assert.equal(j1.derive_attempt_count, 1, "one claim attempt so far");
+  const h2 = recoveryFixture(store, {}); // fresh, no injection
+  h2.clockRef.now = PAST_LEASE_MS;
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(h2.savedShadow.filter((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01").length, 1, "the fresh invocation RETRIED the save exactly ONCE");
+  const j2 = store.getReportJob("daily-reporting", "A01");
+  assert.equal(j2.validated, true, "reconciled to success after the guarded retry");
+  assert.equal(j2.derive_attempt_count, 2, "exactly one guarded RE-claim (attempt 2); never a runaway retry");
+  assert.equal(h2.dd.totalCreates(), 0, "zero DataDoe");
+});
+
+test("X4. the success/reconcile PATCH COMMITS but the response TIMES OUT -> a fresh invocation OBSERVES already-complete (no re-save, no re-reconcile)", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutReconcileAfterCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.commitUnknown, true);
+  const j1 = store.getReportJob("daily-reporting", "A01");
+  assert.equal(j1.validated, true, "the reconcile COMMITTED: the job is already a validated success");
+  const h2 = fullFixture({ store });
+  h2.clockRef.now = PAST_LEASE_MS;
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "no re-save for an already-complete job");
+  assert.ok(r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "already-complete"), "the fresh invocation OBSERVES already-complete");
+  assert.equal(h2.dd.totalCreates(), 0, "zero DataDoe");
+});
+
+test("X5. a LIVE (unexpired-lease) claimant is NEVER stolen -- a concurrent invocation sees 'held' and does not save/reconcile", async () => {
+  const store = makeStore();
+  // A live worker claims daily/A01 within the current clock (lease unexpired).
+  const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
+  const live = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  assert.equal(live.disposition, "claimed");
+  // A concurrent worker at the SAME time (lease unexpired) is refused.
+  const concurrent = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS + 1000).toISOString(), leaseSeconds: LEASE_S });
+  assert.equal(concurrent.disposition, "held", "an UNEXPIRED lease is never stolen");
+  assert.equal(concurrent.lease_token, undefined, "no token is handed to the non-holder");
+  // The live holder's token still reconciles (once its snapshot exists); the non-holder's would be lease-lost.
+  store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: {}, payload: {}, sourceRefreshedAt: TODAY });
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: "lease_wrong" }).disposition, "lease-lost", "a non-holder token can never reconcile");
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: live.lease_token }).disposition, "reconciled", "only the current lease holder reconciles");
+});
+
+test("X6. a STALE/abandoned claimant is recovered ONLY through the guarded transition (reclaim requires lease expiry)", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
+  const first = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  assert.equal(first.disposition, "claimed");
+  // Before expiry: a would-be recoverer is refused (held), so a stale claim cannot be recovered early.
+  assert.equal(store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS + LEASE_S * 1000 - 1).toISOString(), leaseSeconds: LEASE_S }).disposition, "held");
+  // After expiry: a guarded RE-claim issues a NEW token; the OLD token can no longer reconcile.
+  const reclaim = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(PAST_LEASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  assert.equal(reclaim.disposition, "reclaimed");
+  assert.notEqual(reclaim.lease_token, first.lease_token, "a FRESH token is issued on reclaim");
+  store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: {}, payload: {}, sourceRefreshedAt: TODAY });
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: first.lease_token }).disposition, "lease-lost", "the SUPERSEDED (old) token can never reconcile");
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: reclaim.lease_token }).disposition, "reconciled");
+});
+
+test("X7. a malformed / wrong-account / wrong-hash snapshot NEVER authorizes reconciliation", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
+  const claim = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  // Only the EXACT durable snapshot (scheduler-v2/daily-reporting, A01, HASH) authorizes reconcile.
+  store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "HASH", params: {}, payload: {}, sourceRefreshedAt: TODAY });
+  // wrong hash:
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "OTHER", leaseToken: claim.lease_token }).disposition, "snapshot-absent", "a wrong hash finds no durable snapshot");
+  // wrong account (A02 has no snapshot / no job):
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A02", connectionId: "primary", bucket: "us", dependsOn: [] });
+  const claim2 = store.claimLease(cid, "daily-reporting", "A02", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A02", snapshotParamsHash: "HASH", leaseToken: claim2.lease_token }).disposition, "snapshot-absent", "A01's snapshot can never authorize A02");
+  // malformed (blank hash):
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "", leaseToken: claim.lease_token }).disposition, "invalid-hash");
+  // exact identity + current token -> reconciled.
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "HASH", leaseToken: claim.lease_token }).disposition, "reconciled");
+});
+
+test("X8. recovery performs ZERO new DataDoe exports (the source phase is already drained; recovery is pure re-derive+save+reconcile)", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutClaimAfterCommit: onceFor("daily-reporting", "A01") });
+  await h1.runtime.run({ bucket: "us", today: TODAY });
+  const creates1 = h1.dd.totalCreates();
+  assert.ok(creates1 >= 1, "the first run made the source exports");
+  const h2 = fullFixture({ store });
+  h2.clockRef.now = PAST_LEASE_MS;
+  await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(h2.dd.totalCreates(), 0, "the RECOVERY invocation created ZERO DataDoe exports");
+});
+
+test("X9. finalization changes open-work -> terminal ONLY after every report is truly complete", async () => {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutClaimAfterCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  // daily/A01 is running (abandoned) -> the cycle still has open report work -> finalize returns open-work.
+  const attempt = store.finalizeCycle({ cycleId: r1.cycleId });
+  assert.equal(attempt.disposition, "open-work", "finalize refuses while a report job is still running/abandoned");
+  assert.equal(store.getCycle(r1.cycleId).status, "running");
+  // Recover, then finalize honestly terminalizes.
+  const h2 = fullFixture({ store });
+  h2.clockRef.now = PAST_LEASE_MS;
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r2.stopped, false);
+  const closed = store.finalizeCycle({ cycleId: r1.cycleId });
+  assert.equal(closed.disposition, "finalized", "AFTER recovery, finalize terminalizes");
+  assert.ok(["succeeded", "partial"].includes(closed.cycle.status));
+});
+
+test("X10. commitUnknown is preserved in the first invocation's rollup for EACH commit-unknown stage", async () => {
+  for (const inject of [
+    { timeoutClaimAfterCommit: onceFor("daily-reporting", "A01") },
+    { timeoutSaveAt: onceFor("daily-reporting", "A01") },
+    { timeoutReconcileBeforeCommit: onceFor("daily-reporting", "A01") },
+    { timeoutReconcileAfterCommit: onceFor("daily-reporting", "A01") },
+  ]) {
+    const store = makeStore();
+    const h = recoveryFixture(store, inject);
+    const r = await h.runtime.run({ bucket: "us", today: TODAY });
+    assert.equal(r.deadlineReached, true, "resumable at the commit-unknown stage");
+    assert.equal(r.continuationRequired, true);
+    assert.equal(r.commitUnknown, true, "commitUnknown preserved for " + Object.keys(inject)[0]);
+  }
+});
+
+test("X11. round-7 finding 2: the admin PATCH requires a strict boolean BEFORE any write (400, zero control/audit writes)", async () => {
+  // Structural proof over the committed handler: a non-boolean publishEnabled is a 400 that returns BEFORE
+  // the control write, so a malformed input performs zero control/audit writes (matching PATCH boolean-strict
+  // for the source controls). The strict boolean gate must precede setSourcePromotedPublishControl.
+  const src = readFileSync(path.join(process.cwd(), "api", "admin", "sync.js"), "utf8");
+  const branch = src.indexOf("SOURCE_PROMOTED_REPORT_KEYS.includes(requestedKey)");
+  const boolGate = src.indexOf('typeof body.publishEnabled !== "boolean"', branch);
+  const setWrite = src.indexOf("setSourcePromotedPublishControl", branch);
+  const auditWrite = src.indexOf('action: publishEnabled ? "report.promoted-publish.enabled"', branch);
+  assert.ok(boolGate > branch, "the promoted PATCH validates a strict boolean");
+  assert.ok(setWrite > boolGate, "the boolean gate precedes the control write (400 before any write)");
+  assert.ok(auditWrite > setWrite, "the audit event is recorded ONLY AFTER the validated control write");
+  // The strict gate returns 400 in-branch before the write.
+  const gateText = src.slice(boolGate, setWrite);
+  assert.match(gateText, /status\(400\)/, "a non-boolean publishEnabled is a 400");
+  assert.match(gateText, /return;/, "the 400 RETURNS before the write");
 });
 
 
