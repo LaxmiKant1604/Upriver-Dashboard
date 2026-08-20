@@ -308,6 +308,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         // Finding 9 + 5: history is written ONLY through the atomic replace_oli_history_window RPC --
         // service_role keeps SELECT alone, so no direct write can bypass the replacement + coverage ack.
         serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        noPoliciesAllowed: true,
         requiredTriggers: [{ name: "source_oli_daily_history_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
           "sku", "child_asin", "currency", "sales_amount", "units", "source_request_hash"],
@@ -324,6 +325,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         requiredIndexes: [{ name: "source_coverage_lookup_idx", columns: ["account_id", "source_key", "covered_from"] }],
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
+                requiredPolicies: [{ name: "source_coverage_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
         requiredTriggers: [{ name: "source_coverage_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to", "status", "source_refreshed_at"],
       },
@@ -335,6 +337,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         ],
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
+                requiredPolicies: [{ name: "source_controls_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
         requiredTriggers: [{ name: "source_controls_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "paused", "schedule_enabled", "updated_at"],
       },
@@ -348,6 +351,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         ],
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
+                requiredPolicies: [{ name: "source_run_status_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
         requiredTriggers: [{ name: "source_run_status_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "bucket", "last_status", "last_attempt_at", "last_success_at", "safe_error_code", "safe_error_stage",
           "covered_from", "covered_to", "accounts_completed", "accounts_failed", "accounts_total", "batch_count",
@@ -355,16 +359,19 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       },
       {
         name: "source_snapshots",
-        unique: [["source_key", "scope_key"]],
+        unique: [["organization_fingerprint", "connection_id", "source_key", "scope_key"]],
         namedConstraints: [
-          { name: "source_snapshots_pk", kind: "primary key", columns: ["source_key", "scope_key"] },
+          { name: "source_snapshots_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "source_key", "scope_key"] },
+          { name: "source_snapshots_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_snapshots_payload_sha_nonblank", kind: "check", canonical: "char_length(btrim(payload_sha)) > 0" },
           { name: "source_snapshots_object_path_nonblank", kind: "check", canonical: "char_length(btrim(object_path)) > 0" },
           { name: "source_snapshots_row_count_nonneg", kind: "check", canonical: "row_count >= 0" },
         ],
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
+        noPoliciesAllowed: true,
         requiredTriggers: [{ name: "source_snapshots_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
-        keyColumns: ["source_key", "scope_key", "object_path", "row_count", "payload_bytes", "source_request_hash", "validated_at"],
+        keyColumns: ["organization_fingerprint", "connection_id", "source_key", "scope_key", "object_path", "payload_sha", "row_count", "payload_bytes", "source_request_hash", "validated_at"],
       },
     ],
     rpcs: [
@@ -1211,6 +1218,31 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
         if (spec.timing || spec.events || spec.level || spec.function) {
           const v = genericTriggerValid(masked, t.name, spec);
           if (!v.valid) blockers.push({ code: "TABLE_TRIGGER_INVALID", migration: entry.migration, table: t.name, trigger: spec.name, message: `trigger ${spec.name} on public.${t.name} is not the required trigger (${v.reason})` });
+        }
+      }
+      // Finding 9: EXACT public-scoped POLICY audit. A required policy is proven by name AND full shape
+      // (FOR <command> TO <role> USING (<predicate>)) -- a dropped policy is POLICY_MISSING, a weakened /
+      // re-scoped / wrong-predicate one is POLICY_MISMATCH. A service-role-only surface declares
+      // noPoliciesAllowed and ANY policy on it is POLICY_UNEXPECTED (the policy/ACL reconciliation:
+      // admin-read tables carry policy + authenticated SELECT grant TOGETHER; locked tables carry NEITHER).
+      for (const polSpec of (t.requiredPolicies || [])) {
+        const present = new RegExp(String.raw`create\s+policy\s+${polSpec.name}\s+on\s+public\.${t.name}\b`, "i").test(masked);
+        if (!present) {
+          blockers.push({ code: "POLICY_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing required policy ${polSpec.name}` });
+          continue;
+        }
+        const usingEscaped = String(polSpec.using).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const shape = new RegExp(
+          String.raw`create\s+policy\s+${polSpec.name}\s+on\s+public\.${t.name}\s+for\s+${polSpec.command}\s+to\s+${polSpec.role}\s+using\s*\(\s*${usingEscaped}\s*\)`,
+          "i",
+        );
+        if (!shape.test(masked)) {
+          blockers.push({ code: "POLICY_MISMATCH", migration: entry.migration, table: t.name, message: `policy ${polSpec.name} on public.${t.name} does not match the required FOR ${polSpec.command} TO ${polSpec.role} USING (${polSpec.using}) shape` });
+        }
+      }
+      if (t.noPoliciesAllowed === true) {
+        if (new RegExp(String.raw`create\s+policy\s+\w+\s+on\s+public\.${t.name}\b`, "i").test(masked)) {
+          blockers.push({ code: "POLICY_UNEXPECTED", migration: entry.migration, table: t.name, message: `table public.${t.name} is a service-role-only surface and must carry NO policy` });
         }
       }
       row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper, serviceRoleAcl: t.serviceRoleAcl ? { ok: aclProblems.length === 0, problems: aclProblems.map((p) => p.code) } : null });

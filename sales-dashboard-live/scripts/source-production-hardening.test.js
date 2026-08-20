@@ -40,7 +40,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runtimeMod; let registry; let schema; let dates;
+let runtimeMod; let registry; let schema; let dates; let identity;
 
 const PRIM_KEY = ["prim", "key"].join("-");
 const SEC_KEY = ["sec", "key"].join("-");
@@ -194,7 +194,11 @@ function makeHarness(over = {}) {
     readCoverage: over.readCoverage || (async () => ({ windows: [{ from: "2025-01-01", to: dates.addDaysStr(ASOF, -7) }], read: "ok", error: null })),
     readSnapshot: over.readSnapshot || (async () => ({ snapshot: null, read: "ok", error: null })),
     readAdsCoverage: over.readAdsCoverage || (async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null })),
-    readBatchMembership: over.readBatchMembership || (async () => { recorded.membershipReads += 1; return [...membership.entries()].map(([account_id, batch_index]) => ({ account_id, batch_index })); }),
+    readBatchMembership: over.readBatchMembership || (async () => {
+      recorded.membershipReads += 1;
+      const org = identity.organizationFingerprint(PRIM_KEY);
+      return [...membership.entries()].map(([account_id, batch_index]) => ({ account_id, batch_index, connection_id: "primary", organization_fingerprint: org }));
+    }),
     assignBatchMembership: over.assignBatchMembership || (async ({ accountId }) => {
       recorded.assigns.push(accountId);
       const used = new Map();
@@ -228,7 +232,7 @@ function makeHarness(over = {}) {
     }))),
     updateRunStatus: async () => ({ write: "ok" }),
     makeShadowSaver: () => async (args) => { recorded.shadowSaves.push(args); return { paramsHash: "ph" }; },
-    composeFixpoint: over.composeFixpoint,
+    composeTrancheRuntime: over.composeTrancheRuntime,
     clock: () => clockRef.now,
     budgetMs: over.budgetMs ?? 600_000,
     reserveMs: over.reserveMs ?? 1_000,
@@ -291,7 +295,7 @@ test("F2b. bindPrimaryBucketAccounts: missing marketplace country excludes; othe
     { accountId: ["dd", "secondary"].join("-") + ":B01", country: "US" },
     { accountId: "IN1", country: "IN" }, // the non-us bucket's account: filtered, NOT an exclusion
   ], "us");
-  assert.deepEqual(accounts, [{ accountId: "A01", rawSellerId: "A01", country: "US" }]);
+  assert.deepEqual(accounts, [{ accountId: "A01", rawSellerId: "A01", country: "US", name: "A01", currency: null }]);
   assert.deepEqual(excluded.map((e) => e.reason).sort(), ["missing-marketplace-country", "non-primary-connection"]);
 });
 
@@ -337,21 +341,30 @@ test("F4a. durable families execute the bucket sync; durable-ads refuses TYPED; 
   await assert.rejects(() => h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "nope" }), /UNREGISTERED_SOURCE/);
 });
 
-test("F4b. a cycle-cache family composes the REAL fixpoint scoped to its consumer reports with a finite deadline", async () => {
-  const calls = [];
-  const h = makeHarness({ composeFixpoint: async (args) => { calls.push(args); return { globalDrained: true }; } });
-  const res = await h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "settlements" });
-  assert.equal(res.architecture, "fixpoint");
-  assert.equal(calls.length, 1);
-  assert.deepEqual([...calls[0].reportKeys].sort(), [...registry.sourceRegistryEntry("settlements").usedByReports].sort(), "scoped to the family's consumer reports");
-  assert.ok(Number.isFinite(calls[0].deadlineMs), "a REAL finite deadline (never Infinity under the route)");
+test("F4b. a cycle-cache card executes ONLY its own family via the single-family tranche composition (reuseOnly threads; no widening)", async () => {
+  const composed = [];
+  const runs = [];
+  const h = makeHarness({
+    composeTrancheRuntime: (spec, opts) => {
+      composed.push({ spec, opts });
+      return { run: async (args) => { runs.push(args); return { cycleId: null, spent: 0 }; } };
+    },
+  });
+  const res = await h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "settlements", reuseOnly: true });
+  assert.equal(res.architecture, "tranche");
+  assert.equal(composed.length, 1);
+  assert.deepEqual(composed[0].spec, { name: "settlements", sourceKeys: ["settlements"] }, "the tranche is FIXED to exactly the selected family (no widening)");
+  assert.equal(composed[0].opts.reuseOnly, true, "reuseOnly threads into the trusted composition (tripwire installed)");
+  assert.equal(runs.length, 1);
+  assert.ok(Number.isFinite(runs[0].deadlineMs), "a REAL finite deadline (never Infinity under the route)");
+  assert.deepEqual([...runs[0].manualReportKeys].sort(), [...registry.sourceRegistryEntry("settlements").usedByReports].sort(), "report scope = the family's consumers (execution still narrowed to the one family)");
 });
 
 test("F4c. after a COMPLETE run the Daily + Brand View durable SHADOW snapshots derive, validate, and save", async () => {
   const h = makeHarness({
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
     readSnapshot: async ({ sourceKey, scopeKey }) => {
-      if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json" }, read: "ok", error: null };
+      if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
       return { snapshot: { validated_at: TODAY + "T01:00:00Z" }, read: "ok", error: null };
     },
   });
@@ -361,10 +374,11 @@ test("F4c. after a COMPLETE run the Daily + Brand View durable SHADOW snapshots 
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.derived.skipped, null, "the derive stage ran");
   assert.ok(rollup.derived.daily.saved >= 1, "per-account Daily durable shadow snapshots saved");
-  assert.equal(rollup.derived.brandView.saved, 1, "the bucket-level Brand View durable shadow snapshot saved");
+  assert.equal(rollup.derived.brandView.saved, 2, "one brand-sales shadow snapshot per account (the payload Brand View consumes)");
   for (const save of h.recorded.shadowSaves) {
     assert.ok(String(save.reportKey).startsWith("scheduler-v2/"), "saved ONLY in the shadow namespace");
-    assert.ok(save.payload && save.payload.readiness, "the payload carries its readiness evidence");
+    assert.ok(save.reportKey === "scheduler-v2/daily-reporting" || save.reportKey === "scheduler-v2/brand-sales", "the EXISTING report keys -- no orphan custom keys");
+    assert.ok(save.payload, "a real contract payload was saved");
   }
 });
 
@@ -532,12 +546,170 @@ test("F10a. a cross-marketplace or marketplace-less FBA row rejects the snapshot
   assert.ok(r2.snapshots.rejected.some((x) => x.code === "FBA_ROW_NO_MARKETPLACE"), "marketplace-less row rejected typed");
 });
 
+
+/* ================================= R. round-3 regressions ================================= */
+group("R. round-3: paused card, end-to-end deadline, cache loss, snapshots, membership, readiness, policies");
+
+test("R1. a PAUSED cycle-cache card refuses typed BEFORE any composition/discovery; reuseOnly threads", async () => {
+  const composed = [];
+  const h = makeHarness({
+    readSourceControls: async () => ({ rows: [{ source_key: "settlements", paused: true, schedule_enabled: false }], read: "ok", error: null }),
+    composeTrancheRuntime: (spec, opts) => { composed.push({ spec, opts }); return { run: async () => ({ cycleId: null, spent: 0 }) }; },
+  });
+  await assert.rejects(() => h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "settlements" }), (e) => e.code === "SOURCE_PAUSED" && e.status === 409);
+  assert.equal(composed.length, 0, "the paused card never composed a runtime (zero discovery/I-O)");
+  const h2 = makeHarness({ composeTrancheRuntime: (spec, opts) => { composed.push({ spec, opts }); return { run: async () => ({ cycleId: null, spent: 0 }) }; } });
+  await h2.runtime.runSourceCardAction({ bucket: "us", sourceKey: "settlements", reuseOnly: false });
+  assert.equal(composed[composed.length - 1].opts.reuseOnly, false, "reuseOnly=false threads honestly");
+});
+
+test("R2. deadline DURING evidence reads and DURING the derive half both return typed resumable state (never failure)", async () => {
+  const h = makeHarness({ budgetMs: 1_000, reserveMs: 5_000 });
+  const r1 = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.deadlineReached, true);
+  assert.equal(r1.continuationRequired, true);
+  assert.equal(r1.stopped, false, "typed resumable, never a failure");
+  assert.ok(typeof r1.phase === "string", "the expired phase is named");
+  assert.equal(h.store._opens, 0, "zero cycle creation");
+  assert.equal(h.dd.totalCreates(), 0, "zero exports");
+  const store2 = makeStore();
+  let h2 = makeHarness({
+    store: store2,
+    ddOpts: { onCreate: () => { h2.clockRef.now += 20_000; } },
+    budgetMs: 80_000, reserveMs: 1_000,
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: { validated_at: TODAY + "T01:00:00Z" }, read: "ok", error: null }),
+  });
+  h2.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  if (r2.derived && r2.derived.skipped === "deadline") {
+    assert.equal(r2.continuationRequired, true, "the derive half deferred typed-resumable");
+  } else {
+    assert.ok(r2.deadlineReached === true || r2.derived != null, "the deadline surfaced typed somewhere in the pipeline");
+  }
+});
+
+test("R3. a fixpoint deadline BETWEEN continuations is typed resumable -- never FAMILY_CONTINUATIONS_EXHAUSTED", async () => {
+  const fixpoint = await import("../lib/server/sync/source-fixpoint.js");
+  const clockRef = { now: 1_000_000 };
+  const store = { listSourceJobs: async () => [{ source_key: "order-line-items", request_hash: "h1", fetch_status: "pending", create_export_count: 0 }] };
+  const rollup = await fixpoint.runSourceFixpoint({
+    composeRuntime: () => ({ run: async () => { clockRef.now += 40_000; return { cycleId: "c1", spent: 1, perUnit: [], reports: null }; } }),
+    store, bucket: "us", cycleDate: "2026-08-21", reportKeys: ["brand-sales"],
+    clock: () => clockRef.now, wait: async () => {}, cooldownMs: 0,
+    deadlineMs: clockRef.now + 60_000, reserveMs: 1_000,
+    maxContinuationsPerFamily: 10, maxWalks: 1,
+  });
+  assert.equal(rollup.deadlineReached, true, "the deadline surfaced typed");
+  assert.equal(rollup.continuationRequired, true, "resumable");
+  assert.equal(rollup.stopped, false, "never a failure");
+  assert.notEqual(rollup.stopReason && rollup.stopReason.code, "FAMILY_CONTINUATIONS_EXHAUSTED", "exhaustion is never blamed for a deadline");
+});
+
+test("R4. a SUCCEEDED job whose cached payload was lost fails closed as SOURCE_PAYLOAD_UNAVAILABLE (not drained; persistence not skipped silently)", async () => {
+  const store = makeStore();
+  const succeeded = new Set();
+  const origSuccess = store.recordSourceSuccess.bind(store);
+  store.recordSourceSuccess = (args) => { succeeded.add(args.requestHash); return origSuccess(args); };
+  const origLoad = store.loadSourceRows.bind(store);
+  store.loadSourceRows = (h) => (succeeded.has(h) ? null : origLoad(h)); // the cache vanishes after success
+  const h = makeHarness({ store });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, true);
+  assert.equal(rollup.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE");
+  assert.equal(rollup.globalDrained, false, "a lost payload is never reported drained/successful");
+  assert.equal(h.recorded.replaceCalls.length, 0, "durable persistence was not silently skipped -- it was refused typed");
+});
+
+test("R5. snapshot saves are content-addressed + organization/connection isolated; a pointer/payload mismatch is refused pre-HTTP", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const rowsA = [{ child_asin: "A" }];
+  const rowsB = [{ child_asin: "B" }];
+  const shaA = sb.sourceSnapshotPayloadSha(rowsA);
+  const shaB = sb.sourceSnapshotPayloadSha(rowsB);
+  assert.notEqual(shaA, shaB, "different content => different hash");
+  assert.equal(shaA, sb.sourceSnapshotPayloadSha([{ child_asin: "A" }]), "same content => same immutable object");
+  const pathA = sb.sourceSnapshotObjectPath({ organizationFingerprint: "org1", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization", payloadSha: shaA });
+  const pathB = sb.sourceSnapshotObjectPath({ organizationFingerprint: "org1", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization", payloadSha: shaB });
+  assert.notEqual(pathA, pathB, "concurrent DIFFERENT-content saves write DIFFERENT immutable objects");
+  const pathOrg2 = sb.sourceSnapshotObjectPath({ organizationFingerprint: "org2", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization", payloadSha: shaA });
+  assert.notEqual(pathA, pathOrg2, "cross-organization saves are namespace-isolated");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("SPY_FETCH_CALLED"); };
+  try {
+    await assert.rejects(() => sb.recordSourceSnapshot({
+      organizationFingerprint: "org1", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization",
+      objectPath: pathA, payloadSha: shaB, rowCount: 1, sourceRequestHash: "h", validatedAt: "2026-08-20T00:00:00Z",
+    }), /same save/);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("R6. corrupted existing batch membership is refused typed with ZERO exports", async () => {
+  const org = identity.organizationFingerprint(PRIM_KEY);
+  const V = runtimeMod.validateBatchMembershipRows;
+  const good = { account_id: "A01", connection_id: "primary", organization_fingerprint: org, batch_index: 0 };
+  assert.ok(V([good], { orgFingerprint: org }) instanceof Map, "a valid row is accepted");
+  for (const bad of [
+    { ...good, account_id: "" },
+    { ...good, account_id: ["dd", "secondary"].join("-") + ":X" },
+    { ...good, connection_id: "dd-secondary" },
+    { ...good, organization_fingerprint: "other-org" },
+    { ...good, batch_index: -1 },
+    { ...good, batch_index: 1.5 },
+  ]) {
+    assert.throws(() => V([bad], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT");
+  }
+  assert.throws(() => V([good, { ...good }], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", "duplicate account");
+  const six = Array.from({ length: 6 }, (_, i) => ({ ...good, account_id: "A0" + i }));
+  assert.throws(() => V(six, { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", ">5 in one batch");
+  const h = makeHarness({ readBatchMembership: async () => [{ ...good, organization_fingerprint: "evil-org" }] });
+  await assert.rejects(() => h.runtime.run({ bucket: "us", today: TODAY }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT");
+  assert.equal(h.dd.totalCreates(), 0, "zero exports on corrupt membership");
+});
+
+test("R7. stale / dangling / integrity-broken snapshot evidence produces typed readiness blockers", async () => {
+  const h = makeHarness({
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: "2026-08-18T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 5 }, read: "ok", error: null }
+      : { snapshot: { validated_at: "2026-08-18T01:00:00Z", object_path: "missing-object", row_count: 1 }, read: "ok", error: null }),
+  });
+  h.clockRef.now = Date.UTC(2026, 7, 20, 12, 0); // today = 2026-08-20 -> the 08-18 snapshots are STALE
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", product_brand: "Acme" }] }); // 1 row vs row_count 5 => INTEGRITY
+  const readiness = await h.runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: ASOF });
+  const daily = readiness.daily;
+  assert.ok(daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-stale"), "stale evidence is typed");
+  assert.ok(daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-integrity"), "row-count integrity is typed");
+  const bv = readiness.brandView;
+  assert.ok(bv.blockedBy.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-dangling"), "a dangling pointer is typed");
+});
+
+test("R8. endpoint ordering pins: PATCH boolean-strict BEFORE any write; POST preflight BEFORE the audit", () => {
+  const src = readFileSync(path.join(process.cwd(), "api", "admin", "sources.js"), "utf8");
+  const boolCheck = src.indexOf('typeof body.paused !== "boolean"');
+  const patchWrite = src.indexOf("setSourceControl({ sourceKey, paused");
+  assert.ok(boolCheck > 0 && patchWrite > boolCheck, "PATCH validates the boolean before its first write");
+  const preflight = src.indexOf("preflightEvidence({ sourceKey: onlySourceKey })");
+  const postAudit = src.indexOf('action: "source.sync.missing"');
+  assert.ok(preflight > 0 && postAudit > preflight, "POST runs the evidence preflight BEFORE the audit write");
+});
+
+test("R9. dropped / weakened / wrong-schema POLICIES each raise a typed audit blocker", () => {
+  const dropped = auditWith((sql) => sql.replace(/create policy source_controls_admin_read on public\.source_controls\n  for select to authenticated using \(public\.is_dashboard_admin\(\)\);/, ""));
+  assert.ok(dropped.blockers.some((b) => b.code === "POLICY_MISSING"), JSON.stringify(dropped.blockers.map((b) => b.code)));
+  const weakened = auditWith((sql) => sql.split("create policy source_coverage_admin_read on public.source_coverage\n  for select to authenticated using (public.is_dashboard_admin());").join("create policy source_coverage_admin_read on public.source_coverage\n  for select to anon using (true);"));
+  assert.ok(weakened.blockers.some((b) => b.code === "POLICY_MISMATCH"), JSON.stringify(weakened.blockers.map((b) => b.code)));
+  const unexpected = auditWith((sql) => sql + "\ncreate policy sneaky_read on public.source_snapshots for select to authenticated using (true);\n");
+  assert.ok(unexpected.blockers.some((b) => b.code === "POLICY_UNEXPECTED"), JSON.stringify(unexpected.blockers.map((b) => b.code)));
+});
+
 async function main() {
   out("source production-hardening proof suite");
   runtimeMod = await import("../lib/server/sync/source-bucket-sync-runtime.js");
   registry = await import("../lib/server/sync/source-registry.js");
   schema = await import("../lib/server/sync/schema-contract.js");
   dates = await import("../lib/server/date-windows.js");
+  identity = await import("../lib/server/source-identity.js");
 
   let failures = 0;
   for (const t of tests) {

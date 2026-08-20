@@ -440,7 +440,14 @@ export async function runBucketSourceSync({
         const row = byHash.get(unit.requestHash);
         if (!row || stat(row) !== "succeeded") continue;
         const payload = store.loadSourceRows ? await store.loadSourceRows(unit.requestHash) : null;
-        if (!payload || !Array.isArray(payload.rows)) continue;
+        // Finding 4: a SUCCEEDED job whose cached payload is missing/unreadable/malformed is a typed
+        // fail-closed stop -- the family is NOT treated as drained/successful, durable persistence is NOT
+        // silently skipped, and LKG (previous history + coverage) stays untouched.
+        if (!payload || !Array.isArray(payload.rows)) {
+          rollup.stopped = true;
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: OLI_SOURCE_KEY, requestHash: unit.requestHash });
+          break;
+        }
         const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId }]));
         const historyRows = oliHistoryRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
@@ -476,10 +483,14 @@ export async function runBucketSourceSync({
       const row = rows.find((r) => (r.request_hash ?? r.requestHash) === job.requestHash);
       if (row && stat(row) === "succeeded") {
         const payload = store.loadSourceRows ? await store.loadSourceRows(job.requestHash) : null;
-        let validated = false;
-        if (payload && Array.isArray(payload.rows)) {
-          try { buildBrandMaps(payload.rows); validated = true; } catch (_e) { validated = false; }
+        // Finding 4: a succeeded catalog job with a lost/unreadable cached payload fails closed typed.
+        if (!payload || !Array.isArray(payload.rows)) {
+          rollup.stopped = true;
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: CATALOG_SOURCE_KEY, requestHash: job.requestHash });
+          break;
         }
+        let validated = false;
+        try { buildBrandMaps(payload.rows); validated = true; } catch (_e) { validated = false; }
         if (validated && persistSnapshot) {
           // Finding 6: the collaborator receives the ROWS -- production COPIES them into the durable
           // source-snapshots/* namespace (never pruned with the 24h cache) and records THAT pointer.
@@ -501,7 +512,12 @@ export async function runBucketSourceSync({
         const row = byHash.get(job.requestHash);
         if (!row || stat(row) !== "succeeded") continue;
         const payload = store.loadSourceRows ? await store.loadSourceRows(job.requestHash) : null;
-        if (!payload || !Array.isArray(payload.rows)) continue;
+        // Finding 4: a succeeded FBA job with a lost/unreadable cached payload fails closed typed.
+        if (!payload || !Array.isArray(payload.rows)) {
+          rollup.stopped = true;
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash });
+          break;
+        }
         // Finding 10: validate EVERY returned row against the account's exact marketplace BEFORE any
         // snapshot is recorded; a blank/mismatched/malformed row rejects the whole payload (typed;
         // latest-good preserved).
@@ -519,6 +535,7 @@ export async function runBucketSourceSync({
           rollup.snapshots.recorded.push(`${FBA_INVENTORY_SOURCE_KEY}:${job.owner.accountId}`);
         }
       }
+      if (rollup.stopped) break; // finding 4: a lost payload stops the bucket typed
     }
 
     if (updateRunStatus) {

@@ -3,6 +3,7 @@
 // secret key in the Vite bundle. The one import below is the shared, server-only owner-identity helper,
 // used to RECOMPUTE and validate sync_source_job_owners.owner_id before any write (never a secret).
 
+import { createHash } from "node:crypto";
 import { sourceJobOwnerId } from "./source-identity.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
@@ -977,33 +978,60 @@ export async function replaceOliHistoryWindow({ organizationFingerprint, connect
   }
 }
 
-// GENUINELY DURABLE snapshot payload storage (senior-review finding 6): the latest-validated catalog / FBA
-// payloads are COPIED to the source-snapshots/* namespace, which prune_source_export_cache can never touch
-// (the prune RPC deletes only object paths recorded in source_export_cache rows) -- so a snapshot pointer
-// survives ordinary cache pruning and hydrates from its own object.
-export const SOURCE_SNAPSHOT_OBJECT_PREFIX = "source-snapshots/v1";
+// GENUINELY DURABLE snapshot payload storage (senior-review findings 5 + 6): the latest-validated catalog /
+// FBA payloads are COPIED to the source-snapshots/* namespace, which prune_source_export_cache can never
+// touch (the prune RPC deletes only object paths recorded in source_export_cache rows) -- so a snapshot
+// pointer survives ordinary cache pruning. The object path is ORGANIZATION/CONNECTION-scoped and
+// CONTENT-ADDRESSED (the name embeds payload_sha = sha256 of the canonical {rows} JSON), so objects are
+// IMMUTABLE: a concurrent save with different content writes a DIFFERENT object, and hydration proves the
+// metadata and the payload belong to the same save by re-deriving the content hash from the bytes.
+export const SOURCE_SNAPSHOT_OBJECT_PREFIX = "source-snapshots/v2";
 
-export function sourceSnapshotObjectPath(sourceKey, scopeKey) {
+export function sourceSnapshotPayloadSha(rows) {
+  if (!Array.isArray(rows)) throw new Error("sourceSnapshotPayloadSha requires a rows array (fail closed).");
+  return createHash("sha256").update(JSON.stringify({ rows })).digest("hex").slice(0, 32);
+}
+
+export function sourceSnapshotObjectPath({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, payloadSha }) {
   const clean = (v) => String(v || "").trim().replaceAll("/", "_");
-  if (!clean(sourceKey) || !clean(scopeKey)) {
-    throw new Error("sourceSnapshotObjectPath requires nonblank sourceKey + scopeKey (fail closed).");
+  if (!clean(organizationFingerprint) || !clean(sourceKey) || !clean(scopeKey) || !clean(payloadSha)) {
+    throw new Error("sourceSnapshotObjectPath requires nonblank organizationFingerprint/sourceKey/scopeKey/payloadSha (fail closed).");
   }
-  return `${SOURCE_SNAPSHOT_OBJECT_PREFIX}/${clean(sourceKey)}/${clean(scopeKey)}.json`;
+  if (connectionId !== "primary" && connectionId !== "dd-secondary") {
+    throw new Error("sourceSnapshotObjectPath requires a valid connectionId (fail closed).");
+  }
+  return `${SOURCE_SNAPSHOT_OBJECT_PREFIX}/${clean(organizationFingerprint)}/${connectionId}/${clean(sourceKey)}/${clean(scopeKey)}/${clean(payloadSha)}.json`;
 }
 
-export async function saveSourceSnapshotPayload({ sourceKey, scopeKey, rows }) {
+export async function saveSourceSnapshotPayload({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, rows }) {
   if (!Array.isArray(rows)) throw new Error("saveSourceSnapshotPayload requires a rows array (fail closed).");
-  const objectPath = sourceSnapshotObjectPath(sourceKey, scopeKey);
-  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, JSON.stringify({ rows }));
-  return { objectPath, payloadBytes: Buffer.byteLength(JSON.stringify({ rows })) };
+  const payloadSha = sourceSnapshotPayloadSha(rows);
+  const objectPath = sourceSnapshotObjectPath({ organizationFingerprint, connectionId, sourceKey, scopeKey, payloadSha });
+  const body = JSON.stringify({ rows });
+  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, body);
+  return { objectPath, payloadSha, payloadBytes: Buffer.byteLength(body) };
 }
 
+// Hydrate + PROVE: the payload must be a rows array whose content hash matches the hash embedded in the
+// object name -- a truncated/foreign/mutated object can never masquerade as the recorded save.
 export async function getSourceSnapshotPayload(objectPath) {
   const path = String(objectPath || "");
   if (!path.startsWith(`${SOURCE_SNAPSHOT_OBJECT_PREFIX}/`)) {
     throw new Error("getSourceSnapshotPayload only hydrates durable source-snapshot objects (fail closed).");
   }
-  return getPrivateStorageJson(SOURCE_CACHE_BUCKET, path);
+  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, path);
+  if (!payload || !Array.isArray(payload.rows)) {
+    const err = new Error("SOURCE_SNAPSHOT_PAYLOAD_MALFORMED: the hydrated snapshot payload has no rows array (fail closed).");
+    err.code = "SOURCE_SNAPSHOT_PAYLOAD_MALFORMED";
+    throw err;
+  }
+  const embedded = path.slice(path.lastIndexOf("/") + 1).replace(/\.json$/, "");
+  if (sourceSnapshotPayloadSha(payload.rows) !== embedded) {
+    const err = new Error("SOURCE_SNAPSHOT_PAYLOAD_MISMATCH: the hydrated payload does not match its content-addressed object name (fail closed).");
+    err.code = "SOURCE_SNAPSHOT_PAYLOAD_MISMATCH";
+    throw err;
+  }
+  return payload;
 }
 
 export const SOURCE_OLI_HISTORY_MAX_ROWS = 200000;
@@ -1158,10 +1186,13 @@ export async function upsertSourceRunStatus(entry) {
   return { write: "ok" };
 }
 
-export async function getSourceSnapshot({ sourceKey, scopeKey }) {
+export async function getSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey }) {
+  if (!organizationFingerprint) throw new Error("getSourceSnapshot requires the organizationFingerprint (isolated durable identity; fail closed).");
   try {
     const query = new URLSearchParams({
-      select: "source_key,scope_key,object_path,row_count,payload_bytes,source_request_hash,validated_at",
+      select: "organization_fingerprint,connection_id,source_key,scope_key,object_path,payload_sha,row_count,payload_bytes,source_request_hash,validated_at",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
       source_key: `eq.${sourceKey}`,
       scope_key: `eq.${scopeKey}`,
       limit: "1",
@@ -1174,23 +1205,33 @@ export async function getSourceSnapshot({ sourceKey, scopeKey }) {
   }
 }
 
-// Replace the latest-good snapshot pointer ONLY with a fully VALIDATED one. Every evidence field is
-// REQUIRED; anything missing is rejected before any HTTP, so a failed/partial refresh can never replace a
-// validated snapshot through this wrapper (latest-good preserved by construction).
-export async function recordSourceSnapshot({ sourceKey, scopeKey, objectPath, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt }) {
+// Replace the latest-good snapshot pointer ONLY with a fully VALIDATED one. Every evidence field --
+// including the ISOLATED organization/connection identity and the CONTENT hash the object path embeds --
+// is REQUIRED; anything missing is rejected before any HTTP, so a failed/partial refresh can never replace
+// a validated snapshot through this wrapper (latest-good preserved by construction). The pointer upsert is
+// the atomic protocol's second half: the immutable content-addressed object was uploaded FIRST, so whatever
+// save wins the pointer CAS, its metadata always references a complete object of ITS OWN content.
+export async function recordSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, objectPath, payloadSha, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt }) {
+  const org = String(organizationFingerprint || "").trim();
   const key = String(sourceKey || "").trim();
   const scope = String(scopeKey || "").trim();
   const path = String(objectPath || "").trim();
+  const sha = String(payloadSha || "").trim();
   const hash = String(sourceRequestHash || "").trim();
-  if (!key || !scope || !path || !hash || !validatedAt
+  if (!org || !key || !scope || !path || !sha || !hash || !validatedAt
+    || (connectionId !== "primary" && connectionId !== "dd-secondary")
     || typeof rowCount !== "number" || !Number.isInteger(rowCount) || rowCount < 0) {
-    throw new Error("recordSourceSnapshot requires complete VALIDATED snapshot evidence (sourceKey/scopeKey/objectPath/rowCount/sourceRequestHash/validatedAt); refusing to replace the latest-good snapshot (fail closed).");
+    throw new Error("recordSourceSnapshot requires complete VALIDATED snapshot evidence (organizationFingerprint/connectionId/sourceKey/scopeKey/objectPath/payloadSha/rowCount/sourceRequestHash/validatedAt); refusing to replace the latest-good snapshot (fail closed).");
   }
-  await request("/rest/v1/source_snapshots?on_conflict=source_key,scope_key", {
+  if (!path.endsWith(`/${sha}.json`)) {
+    throw new Error("recordSourceSnapshot: the object path does not embed the declared payloadSha; metadata and payload must belong to the same save (fail closed).");
+  }
+  await request("/rest/v1/source_snapshots?on_conflict=organization_fingerprint,connection_id,source_key,scope_key", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: [{
-      source_key: key, scope_key: scope, object_path: path,
+      organization_fingerprint: org, connection_id: connectionId,
+      source_key: key, scope_key: scope, object_path: path, payload_sha: sha,
       row_count: rowCount, payload_bytes: payloadBytes, source_request_hash: hash, validated_at: validatedAt,
     }],
   });

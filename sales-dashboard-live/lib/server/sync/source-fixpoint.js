@@ -202,17 +202,26 @@ export async function runSourceFixpoint({
   const rollup = {
     bucket, cycleId: null, walks: 0, runs: 0, families: [],
     stopped: false, stopReason: null, globalDrained: false,
+    deadlineReached: false, continuationRequired: false,
     reports: null, finalized: false, cycleStatus: null,
   };
   const runArgs = { bucket, cycleDate, asOf, asOfFor, manualReportKeys: selection, clock, deadlineMs, reserveMs, maxJobs, scheduledAt, trigger };
+  // ONE end-to-end deadline across the whole orchestration: family launches, continuations, and cooldown
+  // waits all check it. Expiry is a TYPED RESUMABLE state (deadlineReached + continuationRequired), never a
+  // failure -- a fresh invocation re-enters the same cycle.
+  const outOfTime = () => deadlineMs !== Infinity && clock() >= deadlineMs - reserveMs;
 
   let lastFamilyCompletedAt = null;
   const enforceCooldown = async () => {
-    if (cooldown === 0 || lastFamilyCompletedAt == null) return;
+    if (cooldown === 0 || lastFamilyCompletedAt == null) return true;
     // Completion-anchored: at least `cooldown` ms after the previous family COMPLETED (never a blind fixed
     // offset). Loop-guarded so a waiter that under-advances the injected clock cannot break the floor.
+    // A cooldown that cannot finish inside the deadline defers to the NEXT invocation (resumable) instead
+    // of waiting past the budget.
     const target = lastFamilyCompletedAt + cooldown;
+    if (deadlineMs !== Infinity && target >= deadlineMs - reserveMs) return false;
     while (clock() < target) await wait(Math.max(1, target - clock()));
+    return true;
   };
 
   outer:
@@ -236,7 +245,13 @@ export async function runSourceFixpoint({
         if (before.open === 0) continue;
       }
 
-      await enforceCooldown();
+      // Finding 2: check the shared deadline BEFORE launching a family and BEFORE/DURING the cooldown; an
+      // expired budget returns typed-resumable state, never a failure.
+      if (outOfTime() || !(await enforceCooldown())) {
+        rollup.deadlineReached = true;
+        rollup.continuationRequired = true;
+        break outer;
+      }
       const runtime = composeRuntime({ name: t.name, sourceKeys: [...t.sourceKeys] });
       if (!runtime || typeof runtime.run !== "function") {
         throw new Error(`runSourceFixpoint: composeRuntime returned no runnable runtime for tranche "${t.name}" (fail closed).`);
@@ -246,7 +261,9 @@ export async function runSourceFixpoint({
       let state = await readFamilyState(store, rollup.cycleId, keySet);
       let stalls = 0;
       let prevSignature = null;
+      let familyDeadline = false;
       while (continuations < maxContinuationsPerFamily) {
+        if (outOfTime()) { familyDeadline = true; break; } // finding 2: check before every continuation
         const res = await runtime.run(runArgs);
         rollup.runs += 1;
         continuations += 1;
@@ -258,6 +275,9 @@ export async function runSourceFixpoint({
 
         state = await readFamilyState(store, rollup.cycleId, keySet);
         if (state.open === 0) break; // family complete (every stable batch terminal)
+        // Finding 2: a deadline observed INSIDE the pass ends this invocation typed-resumable -- it must
+        // never be misread as a stall or count toward continuation exhaustion.
+        if (res.deadlineReached || outOfTime()) { familyDeadline = true; break; }
 
         // Stall guard: a SECOND consecutive continuation with an identical durable family state, identical
         // spend, and NO resumable deferral means re-running cannot progress this family (e.g. a rehearsal
@@ -280,6 +300,13 @@ export async function runSourceFixpoint({
       rollup.families.push(Object.freeze({ name: t.name, walk: walk + 1, continuations, state: Object.freeze({ ...state }), requiredByReports: t.requiredByReports, budgetMode: t.budgetMode, skipped: null }));
 
       if (state.open > 0) {
+        // Finding 2: an open family caused ONLY by the deadline is TYPED RESUMABLE work, never a failure
+        // and never FAMILY_CONTINUATIONS_EXHAUSTED -- a fresh invocation re-enters the same cycle.
+        if (familyDeadline) {
+          rollup.deadlineReached = true;
+          rollup.continuationRequired = true;
+          break outer;
+        }
         // Bounded continuations exhausted with work still open: stop this bucket typed. Everything durable
         // stays resumable (export ids persisted; no hash recreated); a fresh reviewed invocation resumes.
         rollup.stopped = true;

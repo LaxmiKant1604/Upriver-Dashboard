@@ -13,8 +13,11 @@
 // blank stays UNMAPPED -- never a fabricated "Unassigned" catalog brand). Unmapped sales are reported under
 // `unmapped`, distinctly from any real brand.
 
-import { resolveBrand, buildBrandMaps } from "./brand-resolution.js";
+import { resolveBrand } from "./brand-resolution.js";
 import { windowsProve } from "./source-durable-model.js";
+import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
+import { buildDailyAdsCoverage } from "./daily-ads-loader.js";
+import { canonicalOliSlices } from "../date-windows.js";
 
 export const DAILY_ADS_GRAIN = "campaign-performance-v1";
 export const BRAND_VIEW_ADS_GRAIN = "asin-performance-v1";
@@ -227,87 +230,146 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
   return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-asin-date"), blockedBy };
 }
 
-/* ------------------------------ durable shadow snapshot derivation (pure) ------------------------------ */
+/* --------------- durable shadow snapshot derivation through the EXISTING contracts --------------- */
+//
+// Finding 3: NO orphan custom report keys. The durable outputs ARE the existing report contracts:
+//   - Daily Reporting: the REAL REPORT_DERIVATIONS["daily-reporting"] adapter (snapshotVersion
+//     "daily-reporting/v2d-3", the exact live-parity payload the API/frontend consume), fed with
+//     canonical-fragment rows reconstructed from durable history + the REAL campaign Ads metric rows and
+//     the REAL buildDailyAdsCoverage/resolveDailyAdsAvailability contract -- so the payload carries actual
+//     campaign ad metrics with honest availability;
+//   - Brand View: the REAL REPORT_DERIVATIONS["brand-sales"] adapter (snapshotVersion "brand-sales/v2d-2",
+//     { rows, catalogBrands, asinBrand }) -- EXACTLY the saved payload the live Brand View assembles from
+//     (aggregateBrandSales + asinBrand for FBA inventory attribution). ASIN Ads + FBA inventory reach Brand
+//     View through their existing durable stores (asin-performance-v1 rows + the validated FBA snapshot),
+//     proven by the consumption tests.
+// Snapshots save ONLY under the existing scheduler-v2/* shadow keys with the existing versions and are
+// validated by the existing validatePayload contracts. A derive failure (typed unavailable/invalid) skips
+// that account typed -- nothing fabricated, LKG preserved.
 
-export const DAILY_DURABLE_SNAPSHOT_KEY = "scheduler-v2/daily-reporting-durable";
-export const BRAND_VIEW_DURABLE_SNAPSHOT_KEY = "scheduler-v2/brand-view-durable";
-export const DAILY_DURABLE_SNAPSHOT_VERSION = "daily-reporting-durable/v1";
-export const BRAND_VIEW_DURABLE_SNAPSHOT_VERSION = "brand-view-durable/v1";
-
-// Structural validators for the durable shadow payloads -- a snapshot is saved ONLY when its payload
-// validates (the same fail-closed posture as the report registry's validatePayload contracts).
-export function validateDailyDurablePayload(p) {
-  return !!p && Array.isArray(p.rows) && p.unmapped && typeof p.unmapped.sales === "number"
-    && typeof p.brandFiltered === "boolean" && typeof p.accountId === "string" && p.accountId.trim() !== ""
-    && !!p.window && typeof p.window.from === "string" && typeof p.window.to === "string"
-    && !!p.readiness && typeof p.readiness.adsReady === "boolean";
+// Durable history rows -> the canonical OLI fragment shape the existing derivations consume.
+export function fragmentRowsFromHistory(historyRows, accountId) {
+  return (historyRows || [])
+    .filter((r) => String(r.account_id ?? r.accountId) === String(accountId))
+    .map((r) => ({
+      date: String(r.sale_date ?? r.saleDate),
+      seller_or_vendor_id: String(r.seller_or_vendor_id ?? r.sellerOrVendorId ?? ""),
+      sku: String(r.sku ?? ""),
+      child_asin: String(r.child_asin ?? r.childAsin ?? ""),
+      item_price_currency: String(r.currency ?? ""),
+      total_sales_sum: Number(r.sales_amount ?? r.salesAmount ?? 0),
+      total_units_sum: Number(r.units ?? 0),
+    }))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
-export function validateBrandViewDurablePayload(p) {
-  return !!p && Array.isArray(p.brands) && Array.isArray(p.unmapped)
-    && typeof p.bucket === "string" && (p.bucket === "us" || p.bucket === "non-us")
-    && !!p.window && typeof p.window.from === "string" && typeof p.window.to === "string"
-    && !!p.readiness && typeof p.readiness.adsReady === "boolean";
+// Durable history rows -> the brand-sales order-lines shape (seller name + marketplace from the account
+// directory record -- an account is one marketplace; unpriced units are not tracked durably => 0).
+export function orderRowsFromHistory(historyRows, account) {
+  if (!account || !String(account.name || "").trim() || !String(account.country || "").trim()) {
+    throw new Error("orderRowsFromHistory requires the account's directory name + marketplace country (fail closed).");
+  }
+  return fragmentRowsFromHistory(historyRows, account.accountId).map((r) => ({
+    date: r.date,
+    seller_or_vendor_id: r.seller_or_vendor_id,
+    seller_or_vendor_name: String(account.name),
+    marketplace_country_code: String(account.country),
+    item_price_currency: r.item_price_currency,
+    child_asin: r.child_asin,
+    total_sales_sum: r.total_sales_sum,
+    total_units_sold_sum: r.total_units_sum,
+    unpriced_units_sum: 0,
+  }));
+}
+
+// The sliced single-account source structure the daily derive validates (exact ordered canonical slices,
+// every fragment window-bound).
+export function slicedOliSourceFromHistory({ historyRows, accountId, rawSellerId, from, to }) {
+  const rows = fragmentRowsFromHistory(historyRows, accountId).filter((r) => r.date >= from && r.date <= to);
+  const fragments = canonicalOliSlices(from, to).map((slice) => ({
+    from: slice.from, to: slice.to,
+    sellerOrVendorIds: [String(rawSellerId)],
+    rows: rows.filter((r) => r.date >= slice.from && r.date <= slice.to),
+  }));
+  return { rows: fragments.flatMap((f) => f.rows), fragments };
 }
 
 /**
- * Derive + VALIDATE the two durable shadow snapshots from durable evidence (pure; finding 4). Readiness is
- * computed FIRST from the authoritative per-account evidence; when a dashboard's sales-blocking sources are
- * not ready, its snapshot is NOT derived (typed skip -- the caller saves nothing and LKG stays). Ads gaps
- * never block: they surface inside the payload's readiness (adsReady=false) so a consumer can withhold the
- * ads half honestly. Returns:
- *   { daily: { readiness, snapshots: [{reportKey, accountId, version, payload}] | null },
- *     brandView: { readiness, snapshot: {reportKey, accountId, version, payload} | null } }
+ * Derive + VALIDATE the durable dashboard snapshots THROUGH THE EXISTING REPORT CONTRACTS. Readiness is
+ * computed FIRST from the authoritative per-account evidence; a non-ready dashboard derives nothing (typed
+ * skip; LKG stays). Per-account derive failures are typed skips, never fabrications. Returns:
+ *   { daily:     { readiness, snapshots: [{reportKey, accountId, version, payload}], skipped: [...] },
+ *     brandView: { readiness, snapshots: [...brand-sales per account...],           skipped: [...] } }
  */
 export function deriveDurableDashboardSnapshots({
-  bucket, accounts = [], historyRows = [], catalogRows = null, brandMaps = null,
+  bucket, accounts = [], historyRows = [], catalogRows = null,
   oliCoverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   campaignAds = null, asinAds = null,
+  adRowsByAccountId = {}, campaignCoverageStateByAccountId = {},
   dailyWindow, brandViewWindow,
 } = {}) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("deriveDurableDashboardSnapshots requires bucket 'us'|'non-us' (fail closed).");
-  if (!brandMaps && !Array.isArray(catalogRows)) {
-    throw new Error("deriveDurableDashboardSnapshots requires brandMaps or catalogRows (fail closed).");
-  }
-  const resolvedMaps = brandMaps || buildBrandMaps(catalogRows); // buildBrandMaps throws on a malformed catalog (fail closed)
+  if (!Array.isArray(catalogRows)) throw new Error("deriveDurableDashboardSnapshots requires the hydrated catalog rows (fail closed).");
+  const accountIds = accounts.map((a) => String(a.accountId));
+
+  const dailyEntry = REPORT_DERIVATIONS["daily-reporting"];
+  const brandSalesEntry = REPORT_DERIVATIONS["brand-sales"];
 
   const dailyReadiness = dailyReportingReadiness({
-    accounts, oliCoverageByAccountId, catalogSnapshot, campaignAds,
+    accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, campaignAds,
     from: dailyWindow.from, to: dailyWindow.to,
   });
-  let dailySnapshots = null;
+  const daily = { readiness: dailyReadiness, snapshots: [], skipped: [] };
   if (dailyReadiness.ready) {
-    dailySnapshots = accounts.map((accountId) => {
-      const accountRows = historyRows.filter((r) => String(r.account_id ?? r.accountId) === accountId);
-      const fold = dailyRowsFromHistory({ historyRows: accountRows, brandMaps: resolvedMaps, brand: "ALL", from: dailyWindow.from, to: dailyWindow.to });
-      const payload = {
-        accountId, bucket, window: { ...dailyWindow },
-        rows: fold.rows, unmapped: fold.unmapped, brandFiltered: false,
-        readiness: { adsReady: dailyReadiness.adsReady, blockedBy: dailyReadiness.blockedBy },
-      };
-      if (!validateDailyDurablePayload(payload)) throw new Error("deriveDurableDashboardSnapshots: the Daily durable payload failed validation (fail closed).");
-      return { reportKey: DAILY_DURABLE_SNAPSHOT_KEY, accountId, version: DAILY_DURABLE_SNAPSHOT_VERSION, payload };
-    });
+    for (const account of accounts) {
+      try {
+        const source = slicedOliSourceFromHistory({
+          historyRows, accountId: account.accountId, rawSellerId: account.rawSellerId,
+          from: dailyWindow.from, to: dailyWindow.to,
+        });
+        const adsCoverage = buildDailyAdsCoverage({
+          accountId: account.accountId, rawSellerId: account.rawSellerId, currency: account.currency ?? null,
+          from: dailyWindow.from, to: dailyWindow.to,
+          metricRows: adRowsByAccountId[account.accountId] || [],
+          metricsRead: "ok",
+          coverageState: campaignCoverageStateByAccountId[account.accountId] || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed", error: "COVERAGE_READ_FAILED" },
+        });
+        const payload = dailyEntry.derive({
+          sources: { "daily-reporting:oli-sales": source, "daily-reporting:catalog": { rows: catalogRows } },
+          context: {
+            from: dailyWindow.from, to: dailyWindow.to, brand: "ALL",
+            accountId: account.accountId, rawSellerId: account.rawSellerId, currency: account.currency ?? null,
+            adsCoverage,
+          },
+        });
+        if (!dailyEntry.validatePayload(payload)) throw new Error("daily durable payload failed the EXISTING contract validator");
+        daily.snapshots.push({ reportKey: shadowSnapshotKey("daily-reporting"), accountId: account.accountId, version: dailyEntry.snapshotVersion, payload });
+      } catch (e) {
+        daily.skipped.push({ accountId: account.accountId, reason: e && e.deriveStatus ? `derive-${e.deriveStatus}` : "derive-invalid" });
+      }
+    }
   }
 
   const brandViewReadinessResult = brandViewReadiness({
-    accounts, oliCoverageByAccountId, catalogSnapshot, asinAds, fbaSnapshotsByAccount,
+    accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, asinAds, fbaSnapshotsByAccount,
     from: brandViewWindow.from, to: brandViewWindow.to,
   });
-  let brandViewSnapshot = null;
+  const brandView = { readiness: brandViewReadinessResult, snapshots: [], skipped: [] };
   if (brandViewReadinessResult.ready) {
-    const fold = brandViewRowsFromHistory({ historyRows, brandMaps: resolvedMaps, from: brandViewWindow.from, to: brandViewWindow.to });
-    const payload = {
-      bucket, window: { ...brandViewWindow },
-      brands: fold.brands, unmapped: fold.unmapped,
-      readiness: { adsReady: brandViewReadinessResult.adsReady, blockedBy: brandViewReadinessResult.blockedBy },
-    };
-    if (!validateBrandViewDurablePayload(payload)) throw new Error("deriveDurableDashboardSnapshots: the Brand View durable payload failed validation (fail closed).");
-    brandViewSnapshot = { reportKey: BRAND_VIEW_DURABLE_SNAPSHOT_KEY, accountId: `__bucket:${bucket}`, version: BRAND_VIEW_DURABLE_SNAPSHOT_VERSION, payload };
+    for (const account of accounts) {
+      try {
+        const orderRows = orderRowsFromHistory(historyRows, account)
+          .filter((r) => r.date >= brandViewWindow.from && r.date <= brandViewWindow.to);
+        const payload = brandSalesEntry.derive({
+          sources: { "brand-sales:order-lines": { rows: orderRows }, "brand-sales:catalog": { rows: catalogRows } },
+        });
+        if (!brandSalesEntry.validatePayload(payload)) throw new Error("brand-sales durable payload failed the EXISTING contract validator");
+        brandView.snapshots.push({ reportKey: shadowSnapshotKey("brand-sales"), accountId: account.accountId, version: brandSalesEntry.snapshotVersion, payload });
+      } catch (e) {
+        brandView.skipped.push({ accountId: account.accountId, reason: e && e.deriveStatus ? `derive-${e.deriveStatus}` : "derive-invalid" });
+      }
+    }
   }
 
-  return {
-    daily: { readiness: dailyReadiness, snapshots: dailySnapshots },
-    brandView: { readiness: brandViewReadinessResult, snapshot: brandViewSnapshot },
-  };
+  return { daily, brandView };
 }

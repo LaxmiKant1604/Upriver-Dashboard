@@ -146,13 +146,24 @@ create table if not exists public.source_run_status (
 -- ---------------------------------------------------------------------------
 -- 5. source_snapshots — latest VALIDATED current-state payload pointer.
 -- ---------------------------------------------------------------------------
+-- Organization/connection ISOLATED durable identity (senior-review finding 5): two organizations (or the
+-- primary vs dd-secondary connection) can never share/overwrite a snapshot pointer. The payload lives at an
+-- IMMUTABLE CONTENT-ADDRESSED object path (the object name embeds payload_sha = sha256 of the canonical
+-- rows JSON), so the metadata row and the hydrated payload provably belong to the SAME save: hydration
+-- re-derives the content hash from the object name and a pointer can never reference another save's bytes.
 create table if not exists public.source_snapshots (
+  organization_fingerprint text not null
+    constraint source_snapshots_org_nonblank check (char_length(btrim(organization_fingerprint)) > 0),
+  connection_id text not null default 'primary'
+    constraint source_snapshots_connection_id_check check (connection_id in ('primary', 'dd-secondary')),
   source_key text not null
     constraint source_snapshots_source_key_nonblank check (char_length(btrim(source_key)) > 0),
   scope_key text not null
     constraint source_snapshots_scope_key_nonblank check (char_length(btrim(scope_key)) > 0),
   object_path text not null
     constraint source_snapshots_object_path_nonblank check (char_length(btrim(object_path)) > 0),
+  payload_sha text not null
+    constraint source_snapshots_payload_sha_nonblank check (char_length(btrim(payload_sha)) > 0),
   row_count integer not null
     constraint source_snapshots_row_count_nonneg check (row_count >= 0),
   payload_bytes bigint not null default 0
@@ -162,7 +173,7 @@ create table if not exists public.source_snapshots (
   validated_at timestamptz not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint source_snapshots_pk primary key (source_key, scope_key)
+  constraint source_snapshots_pk primary key (organization_fingerprint, connection_id, source_key, scope_key)
 );
 
 -- ---------------------------------------------------------------------------
@@ -319,8 +330,19 @@ create policy source_run_status_admin_read on public.source_run_status
   for select to authenticated using (public.is_dashboard_admin());
 
 -- ---------------------------------------------------------------------------
--- EXACT LEAST-PRIVILEGE ACLs (senior-review finding 9). Supabase default
--- privileges would otherwise leave service_role with ALL on every table.
+-- EXACT LEAST-PRIVILEGE ACLs, RECONCILED WITH THE POLICY INTENT (finding 9).
+-- Supabase default privileges would otherwise leave service_role with ALL.
+--
+-- POLICY <-> ACL RECONCILIATION (explicit):
+--   - source_coverage / source_controls / source_run_status: dashboard ADMINS may
+--     READ these operator surfaces through PostgREST. That requires BOTH the
+--     table-level GRANT SELECT to authenticated AND the RLS admin-read policy
+--     (the policy alone is INERT without the grant; the grant alone would expose
+--     rows to every authenticated user without the policy). anon/public stay
+--     fully revoked.
+--   - source_oli_daily_history / source_snapshots: service-role-only surfaces.
+--     NO policy exists and NO authenticated grant exists -- both must stay
+--     absent together (the audit enforces policy absence AND the revoke).
 --   - source_oli_daily_history is written ONLY through replace_oli_history_window
 --     (SECURITY DEFINER): service_role keeps SELECT alone, so no direct write can
 --     bypass the atomic replacement + coverage acknowledgement.
@@ -333,12 +355,15 @@ grant select on table public.source_oli_daily_history to service_role;
 
 revoke all on table public.source_coverage from public, anon, authenticated, service_role;
 grant select, insert, update on table public.source_coverage to service_role;
+grant select on table public.source_coverage to authenticated;
 
 revoke all on table public.source_controls from public, anon, authenticated, service_role;
 grant select, insert, update on table public.source_controls to service_role;
+grant select on table public.source_controls to authenticated;
 
 revoke all on table public.source_run_status from public, anon, authenticated, service_role;
 grant select, insert, update on table public.source_run_status to service_role;
+grant select on table public.source_run_status to authenticated;
 
 revoke all on table public.source_snapshots from public, anon, authenticated, service_role;
 grant select, insert, update on table public.source_snapshots to service_role;

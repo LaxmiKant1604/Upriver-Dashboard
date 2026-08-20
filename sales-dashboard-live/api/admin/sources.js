@@ -85,7 +85,13 @@ export default async function handler(req, res) {
         res.status(400).json({ error: "Unknown source." });
         return;
       }
-      const paused = body.paused === true;
+      // Finding 8: `paused` must be an ACTUAL boolean. A missing/malformed value must never coerce into a
+      // silent resume (false) -- it is a 400 with ZERO writes (no control write, no audit row).
+      if (typeof body.paused !== "boolean") {
+        res.status(400).json({ error: "body.paused must be a boolean." });
+        return;
+      }
+      const paused = body.paused;
       await setSourceControl({ sourceKey, paused, updatedBy: access.userId });
       await insertAuditLog({
         actorUserId: access.userId,
@@ -113,15 +119,19 @@ export default async function handler(req, res) {
           return;
         }
       }
+      // Finding 8: the FAIL-CLOSED EVIDENCE PREFLIGHT runs BEFORE the endpoint's FIRST write -- including
+      // the audit row. A migration-unapplied/failed controls read (503) or a paused source (409) refuses
+      // here with ZERO writes; only a passing preflight is audited and executed.
+      const runtime = buildBucketSourceSyncRuntime();
+      await runtime.preflightEvidence({ sourceKey: onlySourceKey });
       await insertAuditLog({
         actorUserId: access.userId,
         action: "source.sync.missing",
         target: { bucket, sourceKey: onlySourceKey },
       });
       // Finding 4: every registered source card action routes to its REAL architecture (bucket sync /
-      // fixpoint composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces a real
-      // serverless deadline with reserve headroom and returns a typed-resumable rollup.
-      const runtime = buildBucketSourceSyncRuntime();
+      // single-family tranche composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces
+      // a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
       const result = onlySourceKey
         ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey })
         : await runtime.run({ bucket });
