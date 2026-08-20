@@ -43,6 +43,7 @@ const SUITES = [
   "test:source-batching",
   "test:source-account-isolation",
   "test:source-tranche-budget",
+  "test:source-registry",
   "test:schema-contract-mutation",
   "test:report-sync-controls",
   "test:gate5-canary-package",

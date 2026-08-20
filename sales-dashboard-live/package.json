@@ -22,6 +22,7 @@
     "test:source-batching": "node scripts/source-batching.test.js",
     "test:source-account-isolation": "node scripts/source-account-isolation.test.js",
     "test:source-tranche-budget": "node scripts/source-tranche-budget.test.js",
+    "test:source-registry": "node scripts/source-registry.test.js",
     "test:schema-contract-mutation": "node scripts/schema-contract-mutation.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
     "test:gate5-canary-package": "node scripts/gate5-canary-package.test.js",
