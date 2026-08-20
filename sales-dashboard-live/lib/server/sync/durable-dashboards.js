@@ -305,7 +305,11 @@ export function deriveDurableDashboardSnapshots({
   bucket, accounts = [], historyRows = [], catalogRows = null,
   oliCoverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   campaignAds = null, asinAds = null,
-  adRowsByAccountId = {}, campaignCoverageStateByAccountId = {},
+  // Finding 1 (round 4): per-account campaign Ads METRIC evidence carries its TYPED read state --
+  // { rows, metricsRead: "ok" | "limit-exceeded" | "read-failed" }. A failed/limited/malformed read must
+  // never masquerade as a clean zero-ad result: metricsRead threads into buildDailyAdsCoverage, whose
+  // availability resolver fails the Ads half typed (sales survive; no false zero Ads).
+  adMetricsByAccountId = {}, campaignCoverageStateByAccountId = {},
   dailyWindow, brandViewWindow,
 } = {}) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("deriveDurableDashboardSnapshots requires bucket 'us'|'non-us' (fail closed).");
@@ -327,11 +331,13 @@ export function deriveDurableDashboardSnapshots({
           historyRows, accountId: account.accountId, rawSellerId: account.rawSellerId,
           from: dailyWindow.from, to: dailyWindow.to,
         });
+        const adMetrics = adMetricsByAccountId[account.accountId] || { rows: [], metricsRead: "read-failed" };
+        const metricsRead = adMetrics.metricsRead === "ok" && Array.isArray(adMetrics.rows) ? "ok" : (adMetrics.metricsRead === "limit-exceeded" ? "limit-exceeded" : "read-failed");
         const adsCoverage = buildDailyAdsCoverage({
           accountId: account.accountId, rawSellerId: account.rawSellerId, currency: account.currency ?? null,
           from: dailyWindow.from, to: dailyWindow.to,
-          metricRows: adRowsByAccountId[account.accountId] || [],
-          metricsRead: "ok",
+          metricRows: metricsRead === "ok" ? adMetrics.rows : [],
+          metricsRead,
           coverageState: campaignCoverageStateByAccountId[account.accountId] || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed", error: "COVERAGE_READ_FAILED" },
         });
         const payload = dailyEntry.derive({
@@ -343,7 +349,7 @@ export function deriveDurableDashboardSnapshots({
           },
         });
         if (!dailyEntry.validatePayload(payload)) throw new Error("daily durable payload failed the EXISTING contract validator");
-        daily.snapshots.push({ reportKey: shadowSnapshotKey("daily-reporting"), accountId: account.accountId, version: dailyEntry.snapshotVersion, payload });
+        daily.snapshots.push({ reportKey: shadowSnapshotKey("daily-reporting"), productionReportKey: "daily-reporting", accountId: account.accountId, version: dailyEntry.snapshotVersion, payload, latestDataDate: dailyEntry.latestDataDate(payload) });
       } catch (e) {
         daily.skipped.push({ accountId: account.accountId, reason: e && e.deriveStatus ? `derive-${e.deriveStatus}` : "derive-invalid" });
       }
@@ -364,7 +370,7 @@ export function deriveDurableDashboardSnapshots({
           sources: { "brand-sales:order-lines": { rows: orderRows }, "brand-sales:catalog": { rows: catalogRows } },
         });
         if (!brandSalesEntry.validatePayload(payload)) throw new Error("brand-sales durable payload failed the EXISTING contract validator");
-        brandView.snapshots.push({ reportKey: shadowSnapshotKey("brand-sales"), accountId: account.accountId, version: brandSalesEntry.snapshotVersion, payload });
+        brandView.snapshots.push({ reportKey: shadowSnapshotKey("brand-sales"), productionReportKey: "brand-sales", accountId: account.accountId, version: brandSalesEntry.snapshotVersion, payload, latestDataDate: brandSalesEntry.latestDataDate(payload) });
       } catch (e) {
         brandView.skipped.push({ accountId: account.accountId, reason: e && e.deriveStatus ? `derive-${e.deriveStatus}` : "derive-invalid" });
       }

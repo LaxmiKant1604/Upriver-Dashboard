@@ -177,6 +177,91 @@ create table if not exists public.source_snapshots (
 );
 
 -- ---------------------------------------------------------------------------
+-- 7. record_source_snapshot — ATOMIC NEWER-OR-EQUAL-IDENTICAL pointer CAS
+--    (senior-review round-4 finding 8). The pointer row is locked FOR UPDATE and
+--    replaced ONLY when the incoming save is STRICTLY NEWER (validated_at). An
+--    OLDER concurrent save can never replace newer evidence ('stale-save', no
+--    write); an EQUAL-validated_at save is accepted only when it is IDENTICAL
+--    (same payload_sha + object_path => 'unchanged', no write) -- equal but
+--    CONFLICTING evidence fails closed ('conflict', no write).
+-- ---------------------------------------------------------------------------
+create or replace function public.record_source_snapshot(
+  p_organization_fingerprint text,
+  p_connection_id text,
+  p_source_key text,
+  p_scope_key text,
+  p_object_path text,
+  p_payload_sha text,
+  p_row_count integer,
+  p_payload_bytes bigint,
+  p_source_request_hash text,
+  p_validated_at timestamptz
+) returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_existing public.source_snapshots%rowtype;
+begin
+  if p_organization_fingerprint is null or char_length(btrim(p_organization_fingerprint)) = 0
+    or p_connection_id not in ('primary', 'dd-secondary')
+    or coalesce(btrim(p_source_key), '') = '' or coalesce(btrim(p_scope_key), '') = ''
+    or coalesce(btrim(p_object_path), '') = '' or coalesce(btrim(p_payload_sha), '') = ''
+    or coalesce(btrim(p_source_request_hash), '') = ''
+    or p_row_count is null or p_row_count < 0 or p_validated_at is null then
+    raise exception 'record_source_snapshot: incomplete validated snapshot evidence';
+  end if;
+  select * into v_existing from public.source_snapshots
+    where organization_fingerprint = p_organization_fingerprint
+      and connection_id = p_connection_id
+      and source_key = p_source_key
+      and scope_key = p_scope_key
+    for update;
+  if not found then
+    insert into public.source_snapshots (
+      organization_fingerprint, connection_id, source_key, scope_key,
+      object_path, payload_sha, row_count, payload_bytes, source_request_hash, validated_at
+    ) values (
+      p_organization_fingerprint, p_connection_id, p_source_key, p_scope_key,
+      p_object_path, p_payload_sha, p_row_count, p_payload_bytes, p_source_request_hash, p_validated_at
+    );
+    return 'replaced';
+  end if;
+  if p_validated_at < v_existing.validated_at then
+    return 'stale-save';
+  end if;
+  if p_validated_at = v_existing.validated_at then
+    if v_existing.payload_sha = p_payload_sha and v_existing.object_path = p_object_path then
+      return 'unchanged';
+    end if;
+    return 'conflict';
+  end if;
+  update public.source_snapshots set
+    object_path = p_object_path, payload_sha = p_payload_sha, row_count = p_row_count,
+    payload_bytes = p_payload_bytes, source_request_hash = p_source_request_hash,
+    validated_at = p_validated_at, updated_at = now()
+    where organization_fingerprint = p_organization_fingerprint
+      and connection_id = p_connection_id
+      and source_key = p_source_key
+      and scope_key = p_scope_key;
+  return 'replaced';
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 8. CANONICAL-IDENTITY constraints on source_batch_membership (round-4
+--    finding 9): a blank, whitespace-noncanonical, or connection-prefixed
+--    account id can never enter the durable membership. Added here (idempotent)
+--    so the FROZEN 20260817 migration stays byte-identical.
+-- ---------------------------------------------------------------------------
+alter table public.source_batch_membership
+  drop constraint if exists source_batch_membership_account_canonical;
+alter table public.source_batch_membership
+  add constraint source_batch_membership_account_canonical
+  check (account_id = btrim(account_id) and char_length(account_id) > 0 and position(':' in account_id) = 0);
+
+-- ---------------------------------------------------------------------------
 -- Touch triggers (reuse public.touch_updated_at from 20260728).
 -- ---------------------------------------------------------------------------
 drop trigger if exists source_oli_daily_history_touch on public.source_oli_daily_history;
@@ -365,8 +450,13 @@ revoke all on table public.source_run_status from public, anon, authenticated, s
 grant select, insert, update on table public.source_run_status to service_role;
 grant select on table public.source_run_status to authenticated;
 
+-- source_snapshots is written ONLY through the record_source_snapshot CAS (finding 8): service_role keeps
+-- SELECT alone, so no direct write can bypass the newer-or-equal-identical pointer protocol.
 revoke all on table public.source_snapshots from public, anon, authenticated, service_role;
-grant select, insert, update on table public.source_snapshots to service_role;
+grant select on table public.source_snapshots to service_role;
 
 revoke all on function public.replace_oli_history_window(text, text, text, date, date, jsonb, timestamptz) from public, anon, authenticated;
 grant execute on function public.replace_oli_history_window(text, text, text, date, date, jsonb, timestamptz) to service_role;
+
+revoke all on function public.record_source_snapshot(text, text, text, text, text, text, integer, bigint, text, timestamptz) from public, anon, authenticated;
+grant execute on function public.record_source_snapshot(text, text, text, text, text, text, integer, bigint, text, timestamptz) to service_role;

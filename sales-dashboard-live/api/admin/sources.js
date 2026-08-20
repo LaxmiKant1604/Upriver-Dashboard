@@ -123,7 +123,7 @@ export default async function handler(req, res) {
       // the audit row. A migration-unapplied/failed controls read (503) or a paused source (409) refuses
       // here with ZERO writes; only a passing preflight is audited and executed.
       const runtime = buildBucketSourceSyncRuntime();
-      await runtime.preflightEvidence({ sourceKey: onlySourceKey });
+      await runtime.preflightEvidence({ bucket, sourceKey: onlySourceKey });
       await insertAuditLog({
         actorUserId: access.userId,
         action: "source.sync.missing",

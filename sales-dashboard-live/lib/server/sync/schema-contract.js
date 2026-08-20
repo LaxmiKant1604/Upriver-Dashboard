@@ -308,7 +308,8 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         // Finding 9 + 5: history is written ONLY through the atomic replace_oli_history_window RPC --
         // service_role keeps SELECT alone, so no direct write can bypass the replacement + coverage ack.
         serviceRoleAcl: { revokeAll: true, grants: ["select"] },
-        noPoliciesAllowed: true,
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
         requiredTriggers: [{ name: "source_oli_daily_history_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
           "sku", "child_asin", "currency", "sales_amount", "units", "source_request_hash"],
@@ -326,6 +327,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
                 requiredPolicies: [{ name: "source_coverage_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
         requiredTriggers: [{ name: "source_coverage_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to", "status", "source_refreshed_at"],
       },
@@ -338,6 +340,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
                 requiredPolicies: [{ name: "source_controls_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
         requiredTriggers: [{ name: "source_controls_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "paused", "schedule_enabled", "updated_at"],
       },
@@ -352,6 +355,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
                 requiredPolicies: [{ name: "source_run_status_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
         requiredTriggers: [{ name: "source_run_status_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "bucket", "last_status", "last_attempt_at", "last_success_at", "safe_error_code", "safe_error_stage",
           "covered_from", "covered_to", "accounts_completed", "accounts_failed", "accounts_total", "batch_count",
@@ -367,9 +371,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "source_snapshots_object_path_nonblank", kind: "check", canonical: "char_length(btrim(object_path)) > 0" },
           { name: "source_snapshots_row_count_nonneg", kind: "check", canonical: "row_count >= 0" },
         ],
-        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
         rlsEnabled: true,
-        noPoliciesAllowed: true,
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
         requiredTriggers: [{ name: "source_snapshots_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "source_key", "scope_key", "object_path", "payload_sha", "row_count", "payload_bytes", "source_request_hash", "validated_at"],
       },
@@ -377,11 +382,20 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     rpcs: [
       // Finding 5: the ATOMIC rolling-window replacement + coverage acknowledgement (one transaction).
       { name: "replace_oli_history_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at"] },
+      // Round-4 finding 8: the ATOMIC newer-or-equal-identical snapshot pointer CAS.
+      { name: "record_source_snapshot", params: ["p_organization_fingerprint", "p_connection_id", "p_source_key", "p_scope_key", "p_object_path", "p_payload_sha", "p_row_count", "p_payload_bytes", "p_source_request_hash", "p_validated_at"] },
+    ],
+    // Round-4 finding 9: the canonical-identity constraint added to the (frozen-elsewhere) membership table.
+    requiredStatements: [
+      { label: "source_batch_membership_account_canonical CHECK (canonical, nonblank, unprefixed account ids)", pattern: String.raw`add\s+constraint\s+source_batch_membership_account_canonical\s+check\s*\(account_id\s*=\s*btrim\(account_id\)\s+and\s+char_length\(account_id\)\s*>\s*0\s+and\s+position\([\s\S]{1,8}?\s+in\s+account_id\)\s*=\s*0\)` },
     ],
     // STRUCTURAL body proof: the RPC must validate every row fail-closed BEFORE mutating, DELETE the
     // account's window rows, INSERT the corrected rows, and UPSERT the coverage acknowledgement in the SAME
     // function body (one transaction). Removing any is a blocker.
-    provenFunctions: [{ name: "replace_oli_history_window", proof: "replace-oli" }],
+    provenFunctions: [
+      { name: "replace_oli_history_window", proof: "replace-oli" },
+      { name: "record_source_snapshot", proof: "snapshot-cas" },
+    ],
     wrappers: ["upsertSourceOliHistoryRows", "getSourceOliHistoryRows", "getSourceCoverageWindows", "recordSourceCoverageWindows",
       "getSourceControls", "setSourceControl", "getSourceRunStatuses", "upsertSourceRunStatus",
       "getSourceSnapshot", "recordSourceSnapshot",
@@ -938,12 +952,37 @@ function auditReplaceOliFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Round-4 finding 8 structural proof: the snapshot pointer CAS must LOCK the existing row FOR UPDATE,
+// refuse an OLDER save ('stale-save'), accept an equal-identical save as 'unchanged', refuse equal but
+// CONFLICTING evidence ('conflict'), and replace only on a STRICTLY NEWER validated_at.
+function auditSnapshotCasFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "SNAPSHOT_CAS_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  if (!/from\s+public\.source_snapshots\b[\s\S]*?for\s+update/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_CAS_LOCK_MISSING", reason: "does not lock the existing pointer row FOR UPDATE" });
+  }
+  if (!/p_validated_at\s*<\s*v_existing\.validated_at/i.test(M) || !/'stale-save'/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_CAS_STALE_GUARD_MISSING", reason: "does not refuse an OLDER concurrent save (stale-save)" });
+  }
+  if (!/'conflict'/i.test(C) || !/'unchanged'/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_CAS_CONFLICT_GUARD_MISSING", reason: "does not distinguish equal-identical (unchanged) from equal-conflicting (conflict) evidence" });
+  }
+  if (!/update\s+public\.source_snapshots\b/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_CAS_REPLACE_MISSING", reason: "does not replace the pointer on a strictly newer save" });
+  }
+  return problems;
+}
+
 // Dispatch a declared RPC-body structural proof by its `proof` tag.
 function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
   if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
+  if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 
@@ -1220,32 +1259,81 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
           if (!v.valid) blockers.push({ code: "TABLE_TRIGGER_INVALID", migration: entry.migration, table: t.name, trigger: spec.name, message: `trigger ${spec.name} on public.${t.name} is not the required trigger (${v.reason})` });
         }
       }
-      // Finding 9: EXACT public-scoped POLICY audit. A required policy is proven by name AND full shape
-      // (FOR <command> TO <role> USING (<predicate>)) -- a dropped policy is POLICY_MISSING, a weakened /
-      // re-scoped / wrong-predicate one is POLICY_MISMATCH. A service-role-only surface declares
-      // noPoliciesAllowed and ANY policy on it is POLICY_UNEXPECTED (the policy/ACL reconciliation:
-      // admin-read tables carry policy + authenticated SELECT grant TOGETHER; locked tables carry NEITHER).
-      for (const polSpec of (t.requiredPolicies || [])) {
-        const present = new RegExp(String.raw`create\s+policy\s+${polSpec.name}\s+on\s+public\.${t.name}\b`, "i").test(masked);
-        if (!present) {
-          blockers.push({ code: "POLICY_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing required policy ${polSpec.name}` });
-          continue;
+      // Round-4 finding 2: EXACT + TERMINAL public-scoped POLICY audit. When a table declares
+      // `requiredPolicies` (an array, possibly []), the audit ENUMERATES the FINAL declared policy set for
+      // that table -- every `create policy` minus any policy DROPPED AFTER its creation (a create-then-drop
+      // is its own typed blocker) -- and requires it to EQUAL the declared set exactly: a missing policy is
+      // POLICY_MISSING, a weakened/re-scoped/wrong-predicate one is POLICY_MISMATCH, an undeclared final
+      // policy is POLICY_UNEXPECTED, and a required policy created then dropped is POLICY_DROPPED.
+      if (t.requiredPolicies !== undefined || t.noPoliciesAllowed === true) {
+        const createdPolicies = [...masked.matchAll(new RegExp(String.raw`create\s+policy\s+(\w+)\s+on\s+public\.${t.name}\b`, "gi"))]
+          .map((m) => ({ name: m[1].toLowerCase(), at: m.index }));
+        const droppedPolicies = [...masked.matchAll(new RegExp(String.raw`drop\s+policy\s+(?:if\s+exists\s+)?(\w+)\s+on\s+public\.${t.name}\b`, "gi"))]
+          .map((m) => ({ name: m[1].toLowerCase(), at: m.index }));
+        const finalPolicies = new Set();
+        for (const c of createdPolicies) {
+          if (droppedPolicies.some((d) => d.name === c.name && d.at > c.at)) {
+            blockers.push({ code: "POLICY_DROPPED", migration: entry.migration, table: t.name, message: `policy ${c.name} on public.${t.name} is CREATED and then DROPPED in the same migration (create-then-drop is refused)` });
+          } else {
+            finalPolicies.add(c.name);
+          }
         }
-        const usingEscaped = String(polSpec.using).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const shape = new RegExp(
-          String.raw`create\s+policy\s+${polSpec.name}\s+on\s+public\.${t.name}\s+for\s+${polSpec.command}\s+to\s+${polSpec.role}\s+using\s*\(\s*${usingEscaped}\s*\)`,
-          "i",
-        );
-        if (!shape.test(masked)) {
-          blockers.push({ code: "POLICY_MISMATCH", migration: entry.migration, table: t.name, message: `policy ${polSpec.name} on public.${t.name} does not match the required FOR ${polSpec.command} TO ${polSpec.role} USING (${polSpec.using}) shape` });
+        const requiredNames = (t.requiredPolicies || []).map((p) => String(p.name).toLowerCase());
+        for (const polSpec of (t.requiredPolicies || [])) {
+          if (!finalPolicies.has(String(polSpec.name).toLowerCase())) {
+            blockers.push({ code: "POLICY_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing required policy ${polSpec.name} in its FINAL policy set` });
+            continue;
+          }
+          const usingEscaped = String(polSpec.using).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const shape = new RegExp(
+            String.raw`create\s+policy\s+${polSpec.name}\s+on\s+public\.${t.name}\s+for\s+${polSpec.command}\s+to\s+${polSpec.role}\s+using\s*\(\s*${usingEscaped}\s*\)`,
+            "i",
+          );
+          if (!shape.test(masked)) {
+            blockers.push({ code: "POLICY_MISMATCH", migration: entry.migration, table: t.name, message: `policy ${polSpec.name} on public.${t.name} does not match the required FOR ${polSpec.command} TO ${polSpec.role} USING (${polSpec.using}) shape` });
+          }
+        }
+        for (const name of finalPolicies) {
+          if (!requiredNames.includes(name)) {
+            blockers.push({ code: "POLICY_UNEXPECTED", migration: entry.migration, table: t.name, message: `table public.${t.name} carries UNDECLARED policy ${name} (the final policy set must equal the declared set exactly)` });
+          }
         }
       }
-      if (t.noPoliciesAllowed === true) {
-        if (new RegExp(String.raw`create\s+policy\s+\w+\s+on\s+public\.${t.name}\b`, "i").test(masked)) {
-          blockers.push({ code: "POLICY_UNEXPECTED", migration: entry.migration, table: t.name, message: `table public.${t.name} is a service-role-only surface and must carry NO policy` });
+      // Round-4 finding 2: REQUIRED authenticated grants + FORBIDDEN grants. `authenticatedAcl.grants` is
+      // the EXACT verb set authenticated may hold on the table; any extra authenticated verb, or ANY grant
+      // to anon/public, is forbidden. (Reconciliation: an admin-read policy without its SELECT grant is
+      // inert; a grant without the policy over-exposes -- both audited together.)
+      if (t.authenticatedAcl) {
+        const roleGrants = new Map(); // role -> Set(verbs)
+        for (const m of masked.matchAll(new RegExp(String.raw`grant\s+([a-z,\s]+?)\s+on\s+table\s+public\.${t.name}\s+to\s+([a-z_,\s]+?);`, "gi"))) {
+          const verbs = m[1].split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+          for (const role of m[2].split(",").map((r) => r.trim().toLowerCase()).filter(Boolean)) {
+            if (!roleGrants.has(role)) roleGrants.set(role, new Set());
+            for (const v of verbs) roleGrants.get(role).add(v);
+          }
+        }
+        const authGrants = [...(roleGrants.get("authenticated") || new Set())].sort();
+        const want = [...(t.authenticatedAcl.grants || [])].map((g) => g.toLowerCase()).sort();
+        for (const g of want) {
+          if (!authGrants.includes(g)) blockers.push({ code: "AUTH_GRANT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing the required GRANT ${g} TO authenticated` });
+        }
+        for (const g of authGrants) {
+          if (!want.includes(g)) blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name} grants FORBIDDEN ${g} to authenticated` });
+        }
+        for (const role of ["anon", "public"]) {
+          if ((roleGrants.get(role) || new Set()).size > 0) {
+            blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name} grants privileges to ${role} (forbidden)` });
+          }
         }
       }
       row.tables.push({ name: t.name, declared, backedUniques: backedUniques.map((c) => c.join(",")), namedConstraints: namedResults.map((r) => ({ name: r.name, proven: r.proven, reason: r.reason })), missingColumns, referencedByWrapper, serviceRoleAcl: t.serviceRoleAcl ? { ok: aclProblems.length === 0, problems: aclProblems.map((p) => p.code) } : null });
+    }
+    // Round-4 finding 9: REQUIRED raw statements (e.g. the canonical-identity ALTER on a table another
+    // (frozen) migration created). Proven by regex over the masked SQL; absence is a typed blocker.
+    for (const st of entry.requiredStatements || []) {
+      if (!new RegExp(st.pattern, "i").test(masked)) {
+        blockers.push({ code: "STATEMENT_MISSING", migration: entry.migration, message: `required statement missing: ${st.label}` });
+      }
     }
     for (const r of entry.rpcs) {
       const actualParams = rpcParamNames(masked, r.name);

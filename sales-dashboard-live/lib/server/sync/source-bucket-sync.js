@@ -273,6 +273,15 @@ export function planBucketSourceSync({
   return { batches, membership, families, skippedPaused, summary };
 }
 
+// Round-4 finding 5: EVERY persistence-time payload problem -- an UNREADABLE loader (throws), a MISSING
+// entry, a MALFORMED (non-array) payload, or a DOMAIN-INVALID one (catalog with no usable brands; FBA rows
+// failing marketplace validation) -- is the SAME typed fail-closed stop: the bucket stops non-drained,
+// durable persistence is never silently skipped, and LKG stays intact.
+async function loadPayloadOrNull(store, requestHash) {
+  if (!store.loadSourceRows) return null;
+  try { return await store.loadSourceRows(requestHash); } catch (_e) { return null; }
+}
+
 const OPEN = new Set(["pending", "attempted"]);
 const stat = (r) => r.fetch_status ?? r.fetchStatus ?? "pending";
 const skey = (r) => r.source_key ?? r.sourceKey ?? "";
@@ -439,10 +448,11 @@ export async function runBucketSourceSync({
       for (const unit of family.units) {
         const row = byHash.get(unit.requestHash);
         if (!row || stat(row) !== "succeeded") continue;
-        const payload = store.loadSourceRows ? await store.loadSourceRows(unit.requestHash) : null;
-        // Finding 4: a SUCCEEDED job whose cached payload is missing/unreadable/malformed is a typed
-        // fail-closed stop -- the family is NOT treated as drained/successful, durable persistence is NOT
-        // silently skipped, and LKG (previous history + coverage) stays untouched.
+        if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
+        const payload = await loadPayloadOrNull(store, unit.requestHash);
+        // Finding 4/round-4 finding 5: a SUCCEEDED job whose cached payload is missing/UNREADABLE/malformed
+        // is a typed fail-closed stop -- the family is NOT treated as drained/successful, durable
+        // persistence is NOT silently skipped, and LKG (previous history + coverage) stays untouched.
         if (!payload || !Array.isArray(payload.rows)) {
           rollup.stopped = true;
           rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: OLI_SOURCE_KEY, requestHash: unit.requestHash });
@@ -457,6 +467,7 @@ export async function runBucketSourceSync({
         const byAccount = new Map(unit.accounts.map((a) => [a.accountId, []]));
         for (const hr of historyRows) byAccount.get(hr.accountId).push(hr);
         for (const a of unit.accounts) {
+          if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
           const outcome = await replaceHistoryWindow({
             organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
             connectionId: "primary", accountId: a.accountId,
@@ -471,9 +482,9 @@ export async function runBucketSourceSync({
           rollup.history.rowsPersisted += byAccount.get(a.accountId).length;
           coveredAccounts.add(a.accountId);
         }
-        if (rollup.stopped) break;
+        if (rollup.stopped || rollup.deadlineReached) break;
       }
-      if (rollup.stopped) break;
+      if (rollup.stopped || rollup.deadlineReached) break;
       rollup.history.accountsCovered += coveredAccounts.size;
     }
 
@@ -482,16 +493,23 @@ export async function runBucketSourceSync({
       const rows = await store.listSourceJobs(rollup.cycleId);
       const row = rows.find((r) => (r.request_hash ?? r.requestHash) === job.requestHash);
       if (row && stat(row) === "succeeded") {
-        const payload = store.loadSourceRows ? await store.loadSourceRows(job.requestHash) : null;
+        const payload = await loadPayloadOrNull(store, job.requestHash);
         // Finding 4: a succeeded catalog job with a lost/unreadable cached payload fails closed typed.
         if (!payload || !Array.isArray(payload.rows)) {
           rollup.stopped = true;
-          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: CATALOG_SOURCE_KEY, requestHash: job.requestHash });
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: CATALOG_SOURCE_KEY, requestHash: job.requestHash, detail: "missing-or-malformed" });
           break;
         }
+        // Round-4 finding 5: a DOMAIN-INVALID catalog (unbuildable brand maps) is the SAME typed stop --
+        // never a silent skip; the previous validated snapshot stays latest-good.
         let validated = false;
         try { buildBrandMaps(payload.rows); validated = true; } catch (_e) { validated = false; }
-        if (validated && persistSnapshot) {
+        if (!validated) {
+          rollup.stopped = true;
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: CATALOG_SOURCE_KEY, requestHash: job.requestHash, detail: "domain-invalid" });
+          break;
+        }
+        if (persistSnapshot) {
           // Finding 6: the collaborator receives the ROWS -- production COPIES them into the durable
           // source-snapshots/* namespace (never pruned with the 24h cache) and records THAT pointer.
           await persistSnapshot({
@@ -501,7 +519,6 @@ export async function runBucketSourceSync({
           });
           rollup.snapshots.recorded.push(CATALOG_SOURCE_KEY);
         }
-        // An invalid catalog payload records NOTHING: the previous validated snapshot stays latest-good.
       }
     }
 
@@ -511,20 +528,22 @@ export async function runBucketSourceSync({
       for (const job of family.plannedJobs) {
         const row = byHash.get(job.requestHash);
         if (!row || stat(row) !== "succeeded") continue;
-        const payload = store.loadSourceRows ? await store.loadSourceRows(job.requestHash) : null;
+        if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
+        const payload = await loadPayloadOrNull(store, job.requestHash);
         // Finding 4: a succeeded FBA job with a lost/unreadable cached payload fails closed typed.
         if (!payload || !Array.isArray(payload.rows)) {
           rollup.stopped = true;
-          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash });
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash, detail: "missing-or-malformed" });
           break;
         }
-        // Finding 10: validate EVERY returned row against the account's exact marketplace BEFORE any
-        // snapshot is recorded; a blank/mismatched/malformed row rejects the whole payload (typed;
-        // latest-good preserved).
+        // Finding 10 + round-4 finding 5: a DOMAIN-INVALID payload (blank/mismatched marketplace rows) is
+        // the SAME typed fail-closed stop -- recorded for the account, bucket non-drained, latest-good kept.
         const fv = validateFbaSnapshotRows(payload.rows, job.marketplaceConstraint);
         if (!fv.valid) {
           rollup.snapshots.rejected.push({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: job.owner.accountId, code: fv.code });
-          continue;
+          rollup.stopped = true;
+          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash, detail: fv.code });
+          break;
         }
         if (persistSnapshot) {
           await persistSnapshot({

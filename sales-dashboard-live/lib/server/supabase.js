@@ -1226,16 +1226,26 @@ export async function recordSourceSnapshot({ organizationFingerprint, connection
   if (!path.endsWith(`/${sha}.json`)) {
     throw new Error("recordSourceSnapshot: the object path does not embed the declared payloadSha; metadata and payload must belong to the same save (fail closed).");
   }
-  await request("/rest/v1/source_snapshots?on_conflict=organization_fingerprint,connection_id,source_key,scope_key", {
+  // Round-4 finding 8: the pointer replacement is the ATOMIC record_source_snapshot CAS -- replaced only
+  // when strictly NEWER; an older concurrent save is 'stale-save' (no write; the newer evidence stands);
+  // an equal-validated_at identical save is 'unchanged'; equal but CONFLICTING evidence is 'conflict'
+  // (fail closed, no write).
+  const body = await request("/rest/v1/rpc/record_source_snapshot", {
     method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: [{
-      organization_fingerprint: org, connection_id: connectionId,
-      source_key: key, scope_key: scope, object_path: path, payload_sha: sha,
-      row_count: rowCount, payload_bytes: payloadBytes, source_request_hash: hash, validated_at: validatedAt,
-    }],
+    body: {
+      p_organization_fingerprint: org, p_connection_id: connectionId,
+      p_source_key: key, p_scope_key: scope, p_object_path: path, p_payload_sha: sha,
+      p_row_count: rowCount, p_payload_bytes: payloadBytes, p_source_request_hash: hash, p_validated_at: validatedAt,
+    },
   });
-  return { write: "ok" };
+  const value = Array.isArray(body) ? body[0] : body;
+  const ack = typeof value === "string" ? value : String(value);
+  if (ack === "conflict") {
+    const err = new Error("SOURCE_SNAPSHOT_CONFLICT: an equal-validated_at snapshot with DIFFERENT content already exists; refusing to replace (fail closed).");
+    err.code = "SOURCE_SNAPSHOT_CONFLICT";
+    throw err;
+  }
+  return { write: "ok", ack };
 }
 
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an

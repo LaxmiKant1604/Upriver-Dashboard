@@ -26,7 +26,7 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let dash; let derivation; let core; let contracts; let publisher; let brandView; let loader;
+let dash; let derivation; let core; let contracts; let publisher; let brandView; let loader; let snapshotStore;
 
 const BUCKET = "us";
 const ASOF = "2026-08-15";
@@ -57,7 +57,7 @@ function derive() {
   return dash.deriveDurableDashboardSnapshots({
     bucket: BUCKET, accounts: [ACCOUNT], historyRows: HISTORY, catalogRows: CATALOG,
     ...fullEvidence(),
-    adRowsByAccountId: { A01: AD_ROWS },
+    adMetricsByAccountId: { A01: { rows: AD_ROWS, metricsRead: "ok" } },
     campaignCoverageStateByAccountId: { A01: COVERAGE_STATE },
     dailyWindow: { from: DAILY_FROM, to: ASOF },
     brandViewWindow: { from: "2025-06-26", to: ASOF },
@@ -116,14 +116,66 @@ test("P2. the durable Brand View sales payload IS the brand-sales contract and t
   assert.equal(asinBrand.get("B0A"), "Acme", "durable FBA inventory rows attribute to a brand through the same map");
 });
 
-test("P3. the derived params satisfy the EXISTING live snapshot contract mapping (publisher-compatible identity)", () => {
+test("P3. contract.liveParams maps the durable params AND the REAL publisher accepts the durable lineage end to end", async () => {
+  // liveParams: the EXACT existing live identity mapping.
   const daily = publisher.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["daily-reporting"];
-  assert.ok(daily, "daily-reporting has a pinned live snapshot contract");
-  const params = { reportVersion: "daily-reporting/v2d-3", accountId: "A01", from: DAILY_FROM, to: ASOF, brand: "ALL" };
-  const mapped = typeof daily.params === "function" ? daily.params(params) : daily;
-  assert.ok(mapped && typeof mapped === "object", "the live contract maps the durable params without throwing");
-  const brandSales = publisher.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["brand-sales"];
-  assert.ok(brandSales, "brand-sales has a pinned live snapshot contract");
+  const mapped = daily.liveParams({ from: DAILY_FROM, to: ASOF, brand: "ALL" });
+  assert.deepEqual(mapped, { from: DAILY_FROM, to: ASOF, brand: "ALL" }, "liveParams maps the durable params onto the live identity");
+  assert.equal(publisher.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["brand-sales"].liveParams({ from: "2025-06-26", to: ASOF }).to, ASOF);
+  // REAL publisher acceptance: the durable-produced brand-sales snapshot + its genuine job row flow through
+  // publishSchedulerV2Snapshot with injected control-plane fakes and PUBLISH.
+  const derived = derive();
+  const snap = derived.brandView.snapshots[0];
+  const params = { reportVersion: snap.version, accountId: snap.accountId, from: "2025-06-26", to: ASOF };
+  const paramsHash = snapshotStore.paramsHashFor(params.reportVersion, params);
+  const deps = {
+    codeReadyKeys: ["brand-sales"],
+    getReportSyncSettings: async () => [{ report_key: "brand-sales", schedule_enabled: true }],
+    loadAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: ["A01"] }),
+    discoverPrimaryAccounts: async () => [{ accountId: "A01", country: "US", currency: "USD", name: "Acct One" }],
+    getPublishApproval: async () => ({ read: "ok", approved: true }),
+    getLatestReportJob: async () => ({
+      cycle_id: "cyc-1", validated: true, snapshot_params_hash: paramsHash,
+      derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded",
+    }),
+    getShadowSnapshot: async () => ({ params_hash: paramsHash, params: { ...params }, payload: snap.payload, source_refreshed_at: "2026-08-15T02:00:00Z" }),
+    loadStoragePayload: async () => null,
+    publishLive: async (args) => ({ outcome: "inserted", liveRefreshedAt: args.sourceRefreshedAt }),
+  };
+  const res = await publisher.publishSchedulerV2Snapshot(deps, { reportKey: "brand-sales", accountId: "A01" });
+  assert.equal(res.disposition, "published", "the REAL publisher accepts the durable lineage: " + JSON.stringify(res));
+});
+
+test("P4. Brand View's ACTUAL inventory read path consumes the durable FBA evidence (real buildBrandInventoryPayload)", () => {
+  const derived = derive();
+  const asinBrand = new Map(Object.entries(derived.brandView.snapshots[0].payload.asinBrand));
+  const durableFbaRows = [
+    { date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 7 },
+  ];
+  const inv = brandView.buildBrandInventoryPayload({
+    accountId: "A01", invRows: durableFbaRows, brandByAsin: asinBrand, accountCountry: "US",
+    from: "2026-08-05", to: ASOF, rowLimit: 15000,
+  });
+  assert.equal(inv.inventoryAvailable, true, "the REAL live inventory builder consumed the durable FBA rows");
+  const flat = JSON.stringify(inv);
+  assert.ok(flat.includes("Acme"), "inventory attributed through the durable asinBrand map");
+});
+
+test("P5. a failed Ads metrics read can never present as a clean zero-Ads Daily payload", () => {
+  const broken = dash.deriveDurableDashboardSnapshots({
+    bucket: BUCKET, accounts: [ACCOUNT], historyRows: HISTORY, catalogRows: CATALOG,
+    ...fullEvidence(),
+    adMetricsByAccountId: { A01: { rows: [], metricsRead: "read-failed" } },
+    campaignCoverageStateByAccountId: { A01: COVERAGE_STATE },
+    dailyWindow: { from: DAILY_FROM, to: ASOF },
+    brandViewWindow: { from: "2025-06-26", to: ASOF },
+  });
+  const payload = broken.daily.snapshots[0].payload;
+  assert.equal(payload.adsAvailability.status, "failed", "typed FAILED availability");
+  assert.match(String(payload.adsAvailability.reason), /ads-read-failed/);
+  // A GENUINE zero-ad success looks different: validated-empty, not failed.
+  const zero = derive();
+  assert.notEqual(zero.daily.snapshots[0].payload.adsAvailability.reason, payload.adsAvailability.reason);
 });
 
 async function main() {
@@ -135,6 +187,7 @@ async function main() {
   publisher = await import("../lib/server/sync/report-publisher.js");
   brandView = await import("../lib/server/reports/brand-view.js");
   loader = await import("../lib/server/sync/daily-ads-loader.js");
+  snapshotStore = await import("../lib/server/report-store.js");
 
   let failures = 0;
   for (const t of tests) {

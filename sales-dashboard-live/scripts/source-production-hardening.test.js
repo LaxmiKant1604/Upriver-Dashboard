@@ -177,7 +177,7 @@ function makeHarness(over = {}) {
   const store = over.store || makeStore();
   const dd = over.dd || makeDataDoe(over.ddOpts);
   const snapStore = over.snapStore || new Map(); // the durable source-snapshots/* namespace model
-  const recorded = { snapshots: [], shadowSaves: [], assigns: [], membershipReads: 0, replaceCalls: [] };
+  const recorded = { snapshots: [], shadowSaves: [], assigns: [], membershipReads: 0, replaceCalls: [], lineage: [] };
   const durableHistory = over.durableHistory || new Map(); // grain -> row (the durable table model)
   const durableCoverage = over.durableCoverage || [];
   const membership = over.membership || new Map(); // accountId -> index (the durable membership model)
@@ -231,7 +231,15 @@ function makeHarness(over = {}) {
       currency: r.currency, sales_amount: r.salesAmount, units: r.units,
     }))),
     updateRunStatus: async () => ({ write: "ok" }),
-    makeShadowSaver: () => async (args) => { recorded.shadowSaves.push(args); return { paramsHash: "ph" }; },
+    makeShadowSaver: () => async (args) => { recorded.shadowSaves.push(args); return { paramsHash: "ph_" + args.reportKey + "_" + args.accountId }; },
+    readSettings: over.readSettings || (async () => []),
+    readRollout: over.readRollout || (async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [] })),
+    readAdMetrics: over.readAdMetrics || (async () => []),
+    reportLineage: over.reportLineage || {
+      upsertReportJob: async (j) => { recorded.lineage.push({ op: "upsert", ...j }); },
+      claimReportDerive: async (c, rk, a) => { recorded.lineage.push({ op: "claim", reportKey: rk, accountId: a }); return true; },
+      recordReportSuccess: async (j) => { recorded.lineage.push({ op: "success", ...j }); },
+    },
     composeTrancheRuntime: over.composeTrancheRuntime,
     clock: () => clockRef.now,
     budgetMs: over.budgetMs ?? 600_000,
@@ -535,15 +543,19 @@ test("F9c. a dropped replace RPC => RPC_MISSING; a gutted body (no DELETE / no c
 /* ================================= F10. FBA seller-scoping + marketplace validation ================================= */
 group("F10. FBA rows validated per account marketplace before any snapshot");
 
-test("F10a. a cross-marketplace or marketplace-less FBA row rejects the snapshot typed (latest-good preserved)", async () => {
+test("F10a. a cross-marketplace or marketplace-less FBA row STOPS the bucket typed (round-4 finding 5; latest-good preserved)", async () => {
   const wrong = makeHarness({ ddOpts: { fbaRows: [{ date: ASOF, sku: "K", child_asin: "B", marketplace_country_code: "DE", available: 3 }] } });
   const r1 = await wrong.runtime.run({ bucket: "us", today: TODAY });
-  assert.equal(r1.stopped, false);
-  assert.ok(r1.snapshots.rejected.some((x) => x.code === "FBA_CROSS_MARKETPLACE"), "cross-marketplace rejected typed");
+  assert.equal(r1.stopped, true, "domain-invalid payload stops the bucket");
+  assert.equal(r1.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE");
+  assert.equal(r1.stopReason.detail, "FBA_CROSS_MARKETPLACE");
+  assert.equal(r1.globalDrained, false, "never reported drained");
+  assert.ok(r1.snapshots.rejected.some((x) => x.code === "FBA_CROSS_MARKETPLACE"), "cross-marketplace recorded typed");
   assert.ok(!r1.snapshots.recorded.some((k) => String(k).startsWith("fba-inventory-health:")), "no FBA snapshot recorded");
   const blank = makeHarness({ ddOpts: { fbaRows: [{ date: ASOF, sku: "K", child_asin: "B", available: 3 }] } });
   const r2 = await blank.runtime.run({ bucket: "us", today: TODAY });
-  assert.ok(r2.snapshots.rejected.some((x) => x.code === "FBA_ROW_NO_MARKETPLACE"), "marketplace-less row rejected typed");
+  assert.equal(r2.stopped, true);
+  assert.equal(r2.stopReason.detail, "FBA_ROW_NO_MARKETPLACE");
 });
 
 
@@ -669,19 +681,31 @@ test("R6. corrupted existing batch membership is refused typed with ZERO exports
 });
 
 test("R7. stale / dangling / integrity-broken snapshot evidence produces typed readiness blockers", async () => {
-  const h = makeHarness({
+  // (a) STALE required catalog evidence: typed, BLOCKING (ready:false), and never usable for derivation.
+  const stale = makeHarness({
     readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
-      ? { snapshot: { validated_at: "2026-08-18T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 5 }, read: "ok", error: null }
-      : { snapshot: { validated_at: "2026-08-18T01:00:00Z", object_path: "missing-object", row_count: 1 }, read: "ok", error: null }),
+      ? { snapshot: { validated_at: "2026-08-18T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: { validated_at: "2026-08-20T01:00:00Z", object_path: "missing-object", row_count: 1 }, read: "ok", error: null }),
   });
-  h.clockRef.now = Date.UTC(2026, 7, 20, 12, 0); // today = 2026-08-20 -> the 08-18 snapshots are STALE
-  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", product_brand: "Acme" }] }); // 1 row vs row_count 5 => INTEGRITY
-  const readiness = await h.runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: ASOF });
-  const daily = readiness.daily;
-  assert.ok(daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-stale"), "stale evidence is typed");
-  assert.ok(daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-integrity"), "row-count integrity is typed");
-  const bv = readiness.brandView;
-  assert.ok(bv.blockedBy.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-dangling"), "a dangling pointer is typed");
+  stale.clockRef.now = Date.UTC(2026, 7, 20, 12, 0); // today = 2026-08-20 -> the 08-18 catalog is STALE
+  stale.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", product_brand: "Acme" }] });
+  const readiness = await stale.runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: ASOF });
+  assert.ok(readiness.daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-stale"), "stale evidence is typed");
+  assert.equal(readiness.daily.ready, false, "round-4 finding 7: REQUIRED stale catalog evidence makes the dashboard NOT ready");
+  assert.equal(readiness.brandView.ready, false, "Brand View is not ready on stale required evidence either");
+  // (b) a FRESH pointer whose object is GONE: typed dangling.
+  assert.ok(readiness.brandView.blockedBy.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-dangling"), "a dangling pointer is typed");
+  // (c) a FRESH catalog whose row_count disagrees with the hydrated rows: typed integrity, BLOCKING.
+  const broken = makeHarness({
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: "2026-08-20T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 5 }, read: "ok", error: null }
+      : { snapshot: null, read: "ok", error: null }),
+  });
+  broken.clockRef.now = Date.UTC(2026, 7, 20, 12, 0);
+  broken.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", product_brand: "Acme" }] });
+  const integ = await broken.runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: ASOF });
+  assert.ok(integ.daily.blockedBy.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-integrity"), "row-count integrity is typed");
+  assert.equal(integ.daily.ready, false, "integrity-broken required evidence blocks readiness");
 });
 
 test("R8. endpoint ordering pins: PATCH boolean-strict BEFORE any write; POST preflight BEFORE the audit", () => {
@@ -689,7 +713,7 @@ test("R8. endpoint ordering pins: PATCH boolean-strict BEFORE any write; POST pr
   const boolCheck = src.indexOf('typeof body.paused !== "boolean"');
   const patchWrite = src.indexOf("setSourceControl({ sourceKey, paused");
   assert.ok(boolCheck > 0 && patchWrite > boolCheck, "PATCH validates the boolean before its first write");
-  const preflight = src.indexOf("preflightEvidence({ sourceKey: onlySourceKey })");
+  const preflight = src.indexOf("preflightEvidence({ bucket, sourceKey: onlySourceKey })");
   const postAudit = src.indexOf('action: "source.sync.missing"');
   assert.ok(preflight > 0 && postAudit > preflight, "POST runs the evidence preflight BEFORE the audit write");
 });
@@ -701,6 +725,137 @@ test("R9. dropped / weakened / wrong-schema POLICIES each raise a typed audit bl
   assert.ok(weakened.blockers.some((b) => b.code === "POLICY_MISMATCH"), JSON.stringify(weakened.blockers.map((b) => b.code)));
   const unexpected = auditWith((sql) => sql + "\ncreate policy sneaky_read on public.source_snapshots for select to authenticated using (true);\n");
   assert.ok(unexpected.blockers.some((b) => b.code === "POLICY_UNEXPECTED"), JSON.stringify(unexpected.blockers.map((b) => b.code)));
+});
+
+
+/* ================================= S. round-4 regressions ================================= */
+group("S. round-4: ads read state, terminal policies, lineage, full preflight, unreadable loaders, CAS, canonical ids");
+
+test("S1. a failed/limited readAdMetrics is NEVER flattened into ok-zero ads (typed metricsRead; no false zero)", async () => {
+  const mk = (reader) => makeHarness({
+    readAdMetrics: reader,
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: { validated_at: TODAY + "T01:00:00Z" }, read: "ok", error: null }),
+  });
+  for (const [reader, label] of [
+    [async () => { throw new Error("boom"); }, "read-failed"],
+    [async () => { const e = new Error("cap"); e.code = "ADS_ROW_LIMIT_EXCEEDED"; throw e; }, "limit-exceeded"],
+    [async () => "not-an-array", "read-failed"],
+  ]) {
+    const h = mk(reader);
+    h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+    h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+    const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+    assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+    const dailySave = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/daily-reporting");
+    assert.ok(dailySave, "the sales snapshot still saves (ads never block sales)");
+    assert.equal(dailySave.payload.adsAvailability.status, "failed", label + ": the Ads half is typed FAILED, never a clean zero");
+    assert.match(String(dailySave.payload.adsAvailability.reason), /ads-read/, "the typed read reason travels with the payload");
+  }
+});
+
+test("S2. genuine sync_report_jobs lineage: every durable save records upsert -> claim -> validated success with the EXACT snapshot_params_hash", async () => {
+  const h = makeHarness({
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: { validated_at: TODAY + "T01:00:00Z" }, read: "ok", error: null }),
+  });
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.derived.daily.saved >= 1, "daily saved");
+  const upserts = h.recorded.lineage.filter((l) => l.op === "upsert");
+  const successes = h.recorded.lineage.filter((l) => l.op === "success");
+  assert.ok(upserts.some((l) => l.reportKey === "daily-reporting"), "a REAL sync_report_jobs row under the PRODUCTION key");
+  assert.ok(upserts.some((l) => l.reportKey === "brand-sales"), "brand-sales lineage too");
+  for (const sSucc of successes) {
+    const save = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/" + sSucc.reportKey && x.accountId === sSucc.accountId);
+    assert.ok(save, "each success maps to a real shadow save");
+    assert.equal(sSucc.snapshotParamsHash, "ph_" + save.reportKey + "_" + save.accountId, "the EXACT saver-computed snapshot_params_hash is recorded");
+  }
+});
+
+test("S3. FULL endpoint preflight: EVERY later read failure (coverage/snapshot/membership/settings/rollout) refuses typed BEFORE any write", async () => {
+  const cases = [
+    [{ readCoverage: async () => ({ windows: [], read: "read-failed", error: "X" }) }, "SOURCE_EVIDENCE_READ_FAILED"],
+    [{ readSnapshot: async () => ({ snapshot: null, read: "schema-missing", error: "X" }) }, "DURABLE_MODEL_UNAVAILABLE"],
+    [{ readBatchMembership: async () => { throw new Error("boom"); } }, "BATCH_MEMBERSHIP_READ_FAILED"],
+    [{ readSettings: async () => { throw new Error("boom"); } }, "SETTINGS_READ_FAILED"],
+    [{ readRollout: async () => ({ read: "read-failed" }) }, "ROLLOUT_READ_FAILED"],
+  ];
+  for (const [over, code] of cases) {
+    const h = makeHarness(over);
+    await assert.rejects(() => h.runtime.preflightEvidence({ bucket: "us", sourceKey: "product-catalog" }), (e) => e.code === code, code);
+    assert.equal(h.store._opens, 0, code + ": zero cycle/store writes");
+    assert.equal(h.dd.totalCreates(), 0, code + ": zero exports");
+  }
+  const ok = makeHarness({});
+  const res = await ok.runtime.preflightEvidence({ bucket: "us", sourceKey: "product-catalog" });
+  assert.ok(res.pausedSources instanceof Set, "a healthy sweep passes");
+});
+
+test("S4. an UNREADABLE cache loader (throws) at persistence is the SAME typed SOURCE_PAYLOAD_UNAVAILABLE stop", async () => {
+  const store = makeStore();
+  const succeeded = new Set();
+  const origSuccess = store.recordSourceSuccess.bind(store);
+  store.recordSourceSuccess = (args) => { succeeded.add(args.requestHash); return origSuccess(args); };
+  const origLoad = store.loadSourceRows.bind(store);
+  store.loadSourceRows = (h) => { if (succeeded.has(h)) throw new Error("storage transport boom"); return origLoad(h); };
+  const h = makeHarness({ store });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, true);
+  assert.equal(rollup.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE");
+  assert.equal(rollup.globalDrained, false);
+});
+
+test("S5. the snapshot pointer CAS: an OLDER save never replaces newer evidence; equal-conflicting fails closed; audit mutations typed", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const args = (validatedAt, sha) => ({
+    organizationFingerprint: "org1", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization",
+    objectPath: "source-snapshots/v2/org1/primary/product-catalog/__organization/" + sha + ".json", payloadSha: sha,
+    rowCount: 1, sourceRequestHash: "h", validatedAt,
+  });
+  const sha = sb.sourceSnapshotPayloadSha([{ a: 1 }]);
+  const stub = (ack) => { globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => JSON.stringify(ack), text: async () => JSON.stringify(ack), headers: new Map() }); };
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '"stale-save"', json: async () => "stale-save" });
+    const stale = await sb.recordSourceSnapshot(args("2026-08-19T00:00:00Z", sha));
+    assert.deepEqual({ write: stale.write, ack: stale.ack }, { write: "ok", ack: "stale-save" }, "an OLDER save is a no-write no-op (the newer evidence stands)");
+    globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '"conflict"', json: async () => "conflict" });
+    await assert.rejects(() => sb.recordSourceSnapshot(args("2026-08-20T00:00:00Z", sha)), (e) => e.code === "SOURCE_SNAPSHOT_CONFLICT", "equal-conflicting evidence fails closed");
+  } finally { globalThis.fetch = realFetch; }
+  // Audit mutations: gutting the CAS guards raises typed blockers; the real SQL audits clean.
+  assert.equal(auditWith(null).ok, true);
+  const noStale = auditWith((sql) => sql.replace(/if p_validated_at < v_existing\.validated_at then\s*return 'stale-save';\s*end if;/, ""));
+  assert.ok(noStale.blockers.some((b) => b.code === "SNAPSHOT_CAS_STALE_GUARD_MISSING"), JSON.stringify(noStale.blockers.map((b) => b.code)));
+  const noConflict = auditWith((sql) => sql.split("return 'conflict';").join("return 'unchanged';"));
+  assert.ok(noConflict.blockers.some((b) => b.code === "SNAPSHOT_CAS_CONFLICT_GUARD_MISSING"), JSON.stringify(noConflict.blockers.map((b) => b.code)));
+});
+
+test("S6. TERMINAL policy enumeration: create-then-drop refused; undeclared policies refused; authenticated grants exact", () => {
+  const createThenDrop = auditWith((sql) => sql + "\ndrop policy source_controls_admin_read on public.source_controls;\n");
+  assert.ok(createThenDrop.blockers.some((b) => b.code === "POLICY_DROPPED" || b.code === "POLICY_MISSING"), JSON.stringify(createThenDrop.blockers.map((b) => b.code)));
+  const missingAuthGrant = auditWith((sql) => sql.replace("grant select on table public.source_controls to authenticated;", ""));
+  assert.ok(missingAuthGrant.blockers.some((b) => b.code === "AUTH_GRANT_MISSING"), JSON.stringify(missingAuthGrant.blockers.map((b) => b.code)));
+  const widenedAuthGrant = auditWith((sql) => sql.replace("grant select on table public.source_coverage to authenticated;", "grant select, insert on table public.source_coverage to authenticated;"));
+  assert.ok(widenedAuthGrant.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN"), JSON.stringify(widenedAuthGrant.blockers.map((b) => b.code)));
+  const anonGrant = auditWith((sql) => sql + "\ngrant select on table public.source_snapshots to anon;\n");
+  assert.ok(anonGrant.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN"), JSON.stringify(anonGrant.blockers.map((b) => b.code)));
+});
+
+test("S7. NONCANONICAL membership ids are REJECTED (never trimmed); the DB constraint is audited (STATEMENT_MISSING on removal)", async () => {
+  const org = identity.organizationFingerprint(PRIM_KEY);
+  const V = runtimeMod.validateBatchMembershipRows;
+  const good = { account_id: "A01", connection_id: "primary", organization_fingerprint: org, batch_index: 0 };
+  assert.throws(() => V([{ ...good, account_id: " A01" }], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", "leading whitespace rejected, not trimmed");
+  assert.throws(() => V([{ ...good, account_id: "A01 " }], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", "trailing whitespace rejected, not trimmed");
+  const stripped = auditWith((sql) => sql.replace(/alter table public\.source_batch_membership\n  add constraint source_batch_membership_account_canonical[\s\S]*?position\(':' in account_id\) = 0\);/, ""));
+  assert.ok(stripped.blockers.some((b) => b.code === "STATEMENT_MISSING"), JSON.stringify(stripped.blockers.map((b) => b.code)));
 });
 
 async function main() {
