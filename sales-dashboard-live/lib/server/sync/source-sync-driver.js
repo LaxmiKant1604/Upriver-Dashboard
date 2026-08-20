@@ -136,7 +136,12 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     // organizationFingerprint, accountScopeHash (NON-secret; the raw id is already in fetchParams).
     owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope },
     fetchParams: {
-      columns: contract ? contract.columns : undefined,
+      // Report-contract columns when the reportKey names a declared report; otherwise the RESOLVED request's
+      // own columns (the source-first bucket sync plans canonical source requests under a synthetic
+      // "source-sync" owner family, whose specs are built directly from the same canonical constants --
+      // request_hash equality with the report contracts is proven by test). Report paths are byte-identical
+      // (their contract always exists).
+      columns: contract ? contract.columns : resolved.columns,
       sellerOrVendorIds: resolved.sellerOrVendorIds,
       from: resolved.from,
       to: resolved.to,
