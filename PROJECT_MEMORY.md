@@ -10323,3 +10323,39 @@ constraint + STATEMENT_MISSING audit. Hardening suite 36, parity 5; verify 55 st
 
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob d51a0c3f...) still
 PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
+
+## Round-5 senior-review corrections — OFFLINE on main 2026-08-20 (code+tests b1715d2, docs separate); verify green 55/35; NOT deployed
+
+Codex round-5 raised the six remaining round-4 blockers; all fixed offline (Appendix AO). Highlights:
+CLAIM-BEFORE-SAVE lineage (upsert with depends_on = the EXACT succeeded source request hashes of the cycle
+per consumed family -> claim strictly === true -> save under the held claim -> validated success with the
+saver-computed snapshot_params_hash; lost claims are typed claim-lost skips that never save/succeed) plus
+the reviewed terminal cycle lifecycle (full-scope runs call store.finalizeCycle; open-work stays running;
+narrowed onlySourceKey subsets never terminalize the shared cycle) — T1 passes the ACTUAL runtime-produced
+job/cycle through the REAL buildSchedulerV2Publisher with nothing fabricated, T2 proves idempotent resume +
+concurrency. Durable FBA now feeds Brand View's REAL read path: the runtime builds the compact
+brand-inventory snapshot per account via the EXISTING buildBrandInventorySnapshot contract (asinBrand only
+from the just-derived brand-sales payload; hydrated durable FBA rows; live 10d window + 15k cap) saved as
+scheduler-v2/brand-inventory (brand-inventory-shared-v1); T3 drives the real buildAccountBrandSlice compact
+gate. preflightEvidence sweeps EVERY execution-stopping read (controls/discovery/coverage/snapshot
+hydration+integrity/Ads coverage/Ads metrics/OLI history/membership/settings/rollout) BEFORE the audit
+write and returns ONE memoized bundle run() consumes (zero repeated reads; the sync's own products fold
+into the in-memory evidence so derivation stays fresh) — T4 injects every failure class (typed
+SNAPSHOT_HYDRATION_FAILED / SNAPSHOT_INTEGRITY_FAILED / ADS_COVERAGE_READ_FAILED / ADS_METRICS_READ_FAILED
+/ HISTORY_READ_FAILED; zero writes/exports) and counts readers across preflight+run. ONE route-owned
+deadline (exported makeRouteDeadline; created by the POST route BEFORE preflight; threaded through
+preflight + execution; dl.bound races every in-flight read/write against the remaining budget with an
+AbortSignal; catalog persistence deadline-checked) — T5 proves total elapsed incl. preflight stays below
+the route budget and a hung read becomes a typed ROUTE_DEADLINE_EXCEEDED refusal. Sequential FINAL-state
+ACL auditing (finalRoleGrants replays GRANT/REVOKE in source order per exact table/role; authenticated +
+service_role assert the final verb set; anon/public/arbitrary roles with any final verbs are forbidden) —
+T6 covers grant-then-revoke, revoke-then-grant, forbidden-later-revoked, arbitrary roles. Hardened
+record_source_snapshot CAS: deterministic racing insert (typed unique_violation handler re-locks the winner
+FOR UPDATE and falls through to the SAME guard ladder; no WHEN OTHERS), strict scalar ack validation
+(replaced|unchanged|stale-save|conflict; anything else = typed SOURCE_SNAPSHOT_ACK_INVALID), and structural
+guard binding in the schema audit (bounded stale/equal branches; the single replacing UPDATE strictly after
+both guards; typed race handler required) — T7 runs the exact Codex mutations (IF true, early UPDATE, wrong
+comparison, swallowed exception, malformed acks). Hardening suite 43, parity 5; verify 55 steps / 35 suites.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b...) still
+PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
