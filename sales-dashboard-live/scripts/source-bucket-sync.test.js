@@ -51,7 +51,7 @@ const ASOF = "2026-08-15";
 const TODAY = "2026-08-15";
 const CYCLE_DATE = "2026-08-20";
 const BUCKET = "us";
-const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0") });
+const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0"), country: "US" });
 const FIVE = [1, 2, 3, 4, 5].map(acct);
 const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-06-01", to: upTo }]]));
 
@@ -199,7 +199,7 @@ function makeDataDoe(opts = {}) {
         ]);
       }
       if (rk.includes("source-catalog")) return opts.badCatalog ? [{ child_asin: "B0A" }, null] : CATALOG_ROWS.map((r) => ({ ...r }));
-      if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", available: 5 }];
+      if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }];
       return [];
     },
   };
@@ -208,11 +208,16 @@ function makeDataDoe(opts = {}) {
 function makeClock(start = 5_000_000) { const c = { now: start }; c.fn = () => c.now; c.advance = (ms) => { c.now += ms; }; return c; }
 
 function makeSinks() {
-  const history = []; const coverage = []; const snapshots = []; const statuses = [];
+  // The ATOMIC replaceHistoryWindow model: one call = delete-the-window + insert rows + coverage ack.
+  const history = []; const coverage = []; const snapshots = []; const statuses = []; const replaceCalls = [];
   return {
-    history, coverage, snapshots, statuses,
-    persistHistory: async (rows) => { history.push(...rows); return { write: "ok", recorded: rows.length }; },
-    recordCoverage: async (rows) => { coverage.push(...rows); return { write: "ok", recorded: rows.length }; },
+    history, coverage, snapshots, statuses, replaceCalls,
+    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows }) => {
+      replaceCalls.push({ accountId, coveredFrom, coveredTo, rowCount: rows.length });
+      history.push(...rows);
+      coverage.push({ accountId, sourceKey: "order-line-items", coveredFrom, coveredTo });
+      return { write: "ok", replaced: 0, inserted: rows.length };
+    },
     persistSnapshot: async (s) => { snapshots.push(s); return { write: "ok" }; },
     updateRunStatus: async (s) => { statuses.push(s); return { write: "ok" }; },
   };

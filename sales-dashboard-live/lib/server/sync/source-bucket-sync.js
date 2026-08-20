@@ -34,7 +34,7 @@ import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryIsPremiumOf, sourceRegistryEntry } from "./source-registry.js";
 import {
-  oliBackfillWindow, oliRollingRefreshWindow, planOliSliceExports, coverageWindowsFromSlices,
+  oliBackfillWindow, oliRollingRefreshWindow, planOliSliceExports,
   oliHistoryRowsFromFragment, snapshotRefreshDecision, catalogSnapshotScope, ORGANIZATION_SCOPE_KEY,
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY,
 } from "./source-durable-model.js";
@@ -119,9 +119,15 @@ export function resolvedDurableCatalog({ apiKey, asOf, bucket }) {
 }
 
 // The per-account FBA inventory snapshot request (same canonical spec as fba-plan:inventory-health, so the
-// hash is SHARED with the fba-plan report when both cover the same account/asOf).
+// hash is SHARED with the fba-plan report when both cover the same account/asOf). Finding 10: the data IS
+// seller-scoped (the rows belong to this one seller) and the contract fetches marketplace_country_code, so
+// the resolved job carries the honest scope + the account's marketplace constraint; every downloaded row is
+// additionally validated against that marketplace before any snapshot is recorded (validateFbaSnapshotRows).
 export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
   if (!isDateStr(asOf)) throw new Error("resolvedFbaSnapshot requires a YYYY-MM-DD asOf (fail closed).");
+  if (!String(account.country || "").trim()) {
+    throw new Error("resolvedFbaSnapshot requires the account's marketplace country for row validation (fail closed).");
+  }
   const c = contractOf("fba-plan", "fba-plan:inventory-health");
   const sourceId = sourceContractForKey(FBA_INVENTORY_SOURCE_KEY).ids[0];
   const options = optionsOf(c);
@@ -134,12 +140,33 @@ export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
     requestKey: FBA_SNAPSHOT_REQUEST_KEY,
     sourceId, sourceKey: FBA_INVENTORY_SOURCE_KEY,
     bucket, strict: true, limit: c.limit,
-    sourceScope: "organization", // single-account request; per-account rows need no batch splitting
-    marketplaceScoped: false,
+    sourceScope: "seller",
+    marketplaceScoped: true,
+    marketplaceCountry: String(account.country),
     sellerOrVendorIds: [String(account.rawSellerId)],
     columns: c.columns,
     from: addDaysStr(asOf, -FBA_SNAPSHOT_LOOKBACK_DAYS), to: asOf, options,
   };
+}
+
+// Finding 10: validate EVERY returned FBA row against the account's marketplace BEFORE any snapshot is
+// recorded. The single-account fetch bypasses the worker's >1-id batch validation, so this is the
+// persistence-side gate: every non-empty row must be a plain object carrying the account's exact
+// marketplace_country_code (blank/mismatched/malformed rows reject the WHOLE payload -- latest-good
+// preserved). A zero-row payload is valid empty evidence.
+export function validateFbaSnapshotRows(rows, marketplaceCountry) {
+  if (!Array.isArray(rows)) return { valid: false, code: "MALFORMED_PAYLOAD" };
+  const want = String(marketplaceCountry || "").trim();
+  if (!want) return { valid: false, code: "MARKETPLACE_CONSTRAINT_MISSING" };
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return { valid: false, code: "MALFORMED_PAYLOAD" };
+    const nonEmpty = Object.values(row).some((v) => v != null && String(v).trim() !== "");
+    if (!nonEmpty) continue;
+    const got = String(row.marketplace_country_code ?? "").trim();
+    if (!got) return { valid: false, code: "FBA_ROW_NO_MARKETPLACE" };
+    if (got !== want) return { valid: false, code: "FBA_CROSS_MARKETPLACE" };
+  }
+  return { valid: true, code: null };
 }
 
 // Clip proven coverage so the rolling refresh window is ALWAYS re-exported (its slices upsert idempotently;
@@ -221,7 +248,9 @@ export function planBucketSourceSync({
     families.push({ sourceKey: CATALOG_SOURCE_KEY, plannedJobs: catalogJobs, decision });
   }
 
-  // 4) FBA INVENTORY: once daily per account; historical inventory is never repeatedly backfilled.
+  // 4) FBA INVENTORY: once daily per account; historical inventory is never repeatedly backfilled. The
+  //    planned job carries the account's marketplace constraint (finding 10) so persistence can validate
+  //    every returned row against it.
   if (pausedSources.has(FBA_INVENTORY_SOURCE_KEY)) {
     skippedPaused.push(FBA_INVENTORY_SOURCE_KEY);
   } else {
@@ -231,7 +260,7 @@ export function planBucketSourceSync({
       const decision = snapshotRefreshDecision({ sourceKey: FBA_INVENTORY_SOURCE_KEY, lastValidatedAt: snap && snap.validated_at, today });
       if (!decision.refresh) continue;
       const resolved = resolvedFbaSnapshot({ apiKey, account, asOf, bucket });
-      fbaJobs.push(plannedSourceJob(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", account.accountId, account.rawSellerId));
+      fbaJobs.push(plannedSourceJob(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", account.accountId, account.rawSellerId, resolved.marketplaceCountry));
     }
     families.push({ sourceKey: FBA_INVENTORY_SOURCE_KEY, plannedJobs: fbaJobs });
   }
@@ -277,15 +306,21 @@ export async function runBucketSourceSync({
   coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   pausedSources = new Set(), asOf, today,
   store, dataDoe,
-  persistHistory = null, recordCoverage = null, persistSnapshot = null, updateRunStatus = null,
+  replaceHistoryWindow = null, persistSnapshot = null, updateRunStatus = null,
   cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), wait = null, cooldownMs = 60_000,
+  // Finding 3: the serverless execution budget. deadlineMs/reserveMs thread into every runSourceJobs pass
+  // AND gate the family loop itself, so one bounded invocation stops with a RESUMABLE typed rollup
+  // (continuationRequired) instead of being killed mid-flight; a fresh invocation re-enters the same
+  // (bucket, cycle_date) cycle with no duplicate create.
+  deadlineMs = Infinity, reserveMs = 3_000,
   maxContinuationsPerFamily = 6, reuseOnly = false, budgets = true,
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
     throw new Error("runBucketSourceSync: a positive cooldown requires an injected wait(ms) collaborator (fail closed).");
   }
+  const outOfTime = () => deadlineMs !== Infinity && clock() >= deadlineMs - reserveMs;
 
   const plan = planBucketSourceSync({
     apiKey, bucket, accounts, existingMembership, coverageByAccountId,
@@ -298,7 +333,8 @@ export async function runBucketSourceSync({
   const rollup = {
     bucket, cycleId: null, plan: plan.summary, skippedPaused: plan.skippedPaused,
     families: [], stopped: false, stopReason: null, globalDrained: false,
-    history: { rowsPersisted: 0, accountsCovered: 0 }, snapshots: { recorded: [] },
+    deadlineReached: false, continuationRequired: false,
+    history: { rowsPersisted: 0, accountsCovered: 0 }, snapshots: { recorded: [], rejected: [] },
   };
 
   let lastFamilyCompletedAt = null;
@@ -312,6 +348,13 @@ export async function runBucketSourceSync({
     if (!family.plannedJobs.length) {
       rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: "nothing-to-do" });
       continue;
+    }
+    // Finding 3: stop BEFORE launching a family the budget cannot fit; the rollup is typed-resumable.
+    if (outOfTime()) {
+      rollup.deadlineReached = true;
+      rollup.continuationRequired = true;
+      rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: "deadline" });
+      break;
     }
     await enforceCooldown();
     if (updateRunStatus) {
@@ -349,13 +392,14 @@ export async function runBucketSourceSync({
     while (continuations < maxContinuationsPerFamily) {
       const res = await runSourceJobs({
         store, dataDoe, plannedJobs: allPlannedJobs, ownerIds,
-        bucket, cycleDate, scheduledAt, trigger, clock,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs,
         sourceTranche: tranche, reuseOnly, budget,
       });
       continuations += 1;
       rollup.cycleId = res.cycleId || rollup.cycleId;
       state = await familyState(store, rollup.cycleId, family.sourceKey);
       if (state.open === 0) break;
+      if (res.deadlineReached || outOfTime()) { rollup.deadlineReached = true; break; }
       const signature = JSON.stringify(state);
       if ((res.deferred || 0) > 0) stalls = 0;
       else if (signature === prevSignature) stalls += 1;
@@ -367,6 +411,14 @@ export async function runBucketSourceSync({
     rollup.families.push({ sourceKey: family.sourceKey, continuations, state });
 
     if (state && state.open > 0) {
+      // Finding 3: an out-of-time family is RESUMABLE work, never a failure -- a fresh invocation re-enters
+      // the same cycle (persisted export ids resume; no hash is ever recreated). Only genuinely blocked work
+      // (failed jobs, or a no-progress stall) stops the bucket typed.
+      if (rollup.deadlineReached) {
+        rollup.continuationRequired = true;
+        if (updateRunStatus) await updateRunStatus({ sourceKey: family.sourceKey, bucket, lastStatus: "running" });
+        break;
+      }
       rollup.stopped = true;
       rollup.stopReason = Object.freeze({ code: state.failed > 0 ? "REQUIRED_SOURCE_FAILED" : "FAMILY_INCOMPLETE", family: family.sourceKey, state });
       if (updateRunStatus) await updateRunStatus({ sourceKey: family.sourceKey, bucket, lastStatus: "failed", safeErrorCode: rollup.stopReason.code, safeErrorStage: "source" });
@@ -375,10 +427,15 @@ export async function runBucketSourceSync({
     lastFamilyCompletedAt = clock();
 
     // ---- durable persistence for the completed family (successful jobs only; failures preserve LKG) ----
-    if (family.sourceKey === OLI_SOURCE_KEY) {
+    if (family.sourceKey === OLI_SOURCE_KEY && replaceHistoryWindow) {
+      // Finding 5: PER (account, slice) the data replacement and its coverage acknowledgement are ONE
+      // atomic operation (the replace_oli_history_window RPC in production; the injected model in tests):
+      // the account's rows inside the slice window are deleted and re-inserted from the corrected export,
+      // so a grain that DISAPPEARED cannot survive, and coverage acknowledges the window in the SAME
+      // transaction -- an empty per-account slice is valid zero-sales evidence (delete + ack only).
       const rows = await store.listSourceJobs(rollup.cycleId);
       const byHash = new Map(rows.map((r) => [r.request_hash ?? r.requestHash, r]));
-      const succeededSlicesByAccount = new Map();
+      const coveredAccounts = new Set();
       for (const unit of family.units) {
         const row = byHash.get(unit.requestHash);
         if (!row || stat(row) !== "succeeded") continue;
@@ -390,38 +447,27 @@ export async function runBucketSourceSync({
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
         });
-        if (persistHistory && historyRows.length) {
-          const outcome = await persistHistory(historyRows);
-          if (!outcome || outcome.write !== "ok") {
-            rollup.stopped = true;
-            rollup.stopReason = Object.freeze({ code: "HISTORY_PERSIST_FAILED", family: OLI_SOURCE_KEY });
-            break;
-          }
-          rollup.history.rowsPersisted += historyRows.length;
-        }
+        const byAccount = new Map(unit.accounts.map((a) => [a.accountId, []]));
+        for (const hr of historyRows) byAccount.get(hr.accountId).push(hr);
         for (const a of unit.accounts) {
-          if (!succeededSlicesByAccount.has(a.accountId)) succeededSlicesByAccount.set(a.accountId, []);
-          succeededSlicesByAccount.get(a.accountId).push(unit.slice);
-        }
-      }
-      if (rollup.stopped) break;
-      if (recordCoverage) {
-        for (const [accountId, slices] of succeededSlicesByAccount) {
-          const windows = coverageWindowsFromSlices(slices).map((w) => ({
+          const outcome = await replaceHistoryWindow({
             organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
-            connectionId: "primary", accountId, sourceKey: OLI_SOURCE_KEY,
-            coveredFrom: w.from, coveredTo: w.to, sourceRefreshedAt: nowIso(),
-          }));
-          const outcome = await recordCoverage(windows);
+            connectionId: "primary", accountId: a.accountId,
+            coveredFrom: unit.slice.from, coveredTo: unit.slice.to,
+            rows: byAccount.get(a.accountId), sourceRefreshedAt: nowIso(),
+          });
           if (!outcome || outcome.write !== "ok") {
             rollup.stopped = true;
-            rollup.stopReason = Object.freeze({ code: "COVERAGE_RECORD_FAILED", family: OLI_SOURCE_KEY });
+            rollup.stopReason = Object.freeze({ code: "HISTORY_REPLACE_FAILED", family: OLI_SOURCE_KEY, accountId: a.accountId });
             break;
           }
-          rollup.history.accountsCovered += 1;
+          rollup.history.rowsPersisted += byAccount.get(a.accountId).length;
+          coveredAccounts.add(a.accountId);
         }
         if (rollup.stopped) break;
       }
+      if (rollup.stopped) break;
+      rollup.history.accountsCovered += coveredAccounts.size;
     }
 
     if (family.sourceKey === CATALOG_SOURCE_KEY && family.plannedJobs.length) {
@@ -435,10 +481,12 @@ export async function runBucketSourceSync({
           try { buildBrandMaps(payload.rows); validated = true; } catch (_e) { validated = false; }
         }
         if (validated && persistSnapshot) {
+          // Finding 6: the collaborator receives the ROWS -- production COPIES them into the durable
+          // source-snapshots/* namespace (never pruned with the 24h cache) and records THAT pointer.
           await persistSnapshot({
             sourceKey: CATALOG_SOURCE_KEY, scopeKey: catalogSnapshotScope(),
-            objectPath: row.cache_object_path ?? "", rowCount: payload.rows.length,
-            payloadBytes: payload.payload_bytes ?? 0, sourceRequestHash: job.requestHash, validatedAt: nowIso(),
+            rows: payload.rows, rowCount: payload.rows.length,
+            sourceRequestHash: job.requestHash, validatedAt: nowIso(),
           });
           rollup.snapshots.recorded.push(CATALOG_SOURCE_KEY);
         }
@@ -454,11 +502,19 @@ export async function runBucketSourceSync({
         if (!row || stat(row) !== "succeeded") continue;
         const payload = store.loadSourceRows ? await store.loadSourceRows(job.requestHash) : null;
         if (!payload || !Array.isArray(payload.rows)) continue;
+        // Finding 10: validate EVERY returned row against the account's exact marketplace BEFORE any
+        // snapshot is recorded; a blank/mismatched/malformed row rejects the whole payload (typed;
+        // latest-good preserved).
+        const fv = validateFbaSnapshotRows(payload.rows, job.marketplaceConstraint);
+        if (!fv.valid) {
+          rollup.snapshots.rejected.push({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: job.owner.accountId, code: fv.code });
+          continue;
+        }
         if (persistSnapshot) {
           await persistSnapshot({
             sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: job.owner.accountId,
-            objectPath: row.cache_object_path ?? "", rowCount: payload.rows.length,
-            payloadBytes: payload.payload_bytes ?? 0, sourceRequestHash: job.requestHash, validatedAt: nowIso(),
+            rows: payload.rows, rowCount: payload.rows.length,
+            sourceRequestHash: job.requestHash, validatedAt: nowIso(),
           });
           rollup.snapshots.recorded.push(`${FBA_INVENTORY_SOURCE_KEY}:${job.owner.accountId}`);
         }

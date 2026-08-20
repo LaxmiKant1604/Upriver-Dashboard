@@ -50,6 +50,7 @@ const SUITES = [
   "test:source-status",
   "test:source-schedule",
   "test:zero-export-rehearsal",
+  "test:source-production-hardening",
   "test:schema-contract-mutation",
   "test:report-sync-controls",
   "test:gate5-canary-package",

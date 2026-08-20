@@ -13,7 +13,7 @@
 // blank stays UNMAPPED -- never a fabricated "Unassigned" catalog brand). Unmapped sales are reported under
 // `unmapped`, distinctly from any real brand.
 
-import { resolveBrand } from "./brand-resolution.js";
+import { resolveBrand, buildBrandMaps } from "./brand-resolution.js";
 import { windowsProve } from "./source-durable-model.js";
 
 export const DAILY_ADS_GRAIN = "campaign-performance-v1";
@@ -127,16 +127,34 @@ function requireGrain(adsEvidence, expectedGrain, label) {
   return null;
 }
 
-// Durable Ads coverage proof for a dashboard window: the successful-window evidence must span [from, to].
-function adsCoverageProof(adsEvidence, from, to) {
-  if (adsEvidence.read !== "ok") return { proven: false, reason: "ads-coverage-read-not-ok" };
-  if (!Array.isArray(adsEvidence.windows)) return { proven: false, reason: "ads-coverage-windows-not-array" };
+// Durable Ads coverage proof for a dashboard window. AUTHORITATIVE per-account evidence (finding 8): when
+// `windowsByAccountId` is present, EVERY listed account's own successful windows must span [from, to] --
+// a per-account gap is reported with its accountId. The org-level `windows` shape stays supported for
+// callers with genuinely account-free evidence. Never proven on a non-ok read or malformed window.
+function adsCoverageProof(adsEvidence, from, to, accounts = null) {
+  if (adsEvidence.read !== "ok") return { proven: false, gaps: [{ accountId: null, reason: "ads-coverage-read-not-ok" }] };
+  if (adsEvidence.windowsByAccountId && typeof adsEvidence.windowsByAccountId === "object") {
+    const list = Array.isArray(accounts) && accounts.length ? accounts : Object.keys(adsEvidence.windowsByAccountId);
+    if (!list.length) return { proven: false, gaps: [{ accountId: null, reason: "ads-coverage-no-accounts" }] };
+    const gaps = [];
+    for (const accountId of list) {
+      const windows = adsEvidence.windowsByAccountId[accountId];
+      if (!Array.isArray(windows)) { gaps.push({ accountId, reason: "ads-coverage-windows-not-array" }); continue; }
+      try {
+        if (!windowsProve(windows, from, to)) gaps.push({ accountId, reason: "ads-coverage-incomplete" });
+      } catch (_e) {
+        gaps.push({ accountId, reason: "ads-coverage-window-malformed" });
+      }
+    }
+    return { proven: gaps.length === 0, gaps };
+  }
+  if (!Array.isArray(adsEvidence.windows)) return { proven: false, gaps: [{ accountId: null, reason: "ads-coverage-windows-not-array" }] };
   try {
     return windowsProve(adsEvidence.windows, from, to)
-      ? { proven: true, reason: null }
-      : { proven: false, reason: "ads-coverage-incomplete" };
+      ? { proven: true, gaps: [] }
+      : { proven: false, gaps: [{ accountId: null, reason: "ads-coverage-incomplete" }] };
   } catch (_e) {
-    return { proven: false, reason: "ads-coverage-window-malformed" };
+    return { proven: false, gaps: [{ accountId: null, reason: "ads-coverage-window-malformed" }] };
   }
 }
 
@@ -166,8 +184,8 @@ export function dailyReportingReadiness({ oliCoverageByAccountId = {}, accounts 
   if (grainError) {
     blockedBy.push({ sourceKey: "ads-campaign-date", reason: grainError.reason, blocksSales: false });
   } else {
-    const proof = adsCoverageProof(campaignAds, from, to);
-    if (!proof.proven) blockedBy.push({ sourceKey: "ads-campaign-date", reason: proof.reason, blocksSales: false });
+    const proof = adsCoverageProof(campaignAds, from, to, accounts);
+    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-campaign-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
   }
   return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-campaign-date"), blockedBy };
 }
@@ -197,8 +215,8 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
   if (grainError) {
     blockedBy.push({ sourceKey: "ads-asin-date", reason: grainError.reason, blocksSales: false });
   } else {
-    const proof = adsCoverageProof(asinAds, from, to);
-    if (!proof.proven) blockedBy.push({ sourceKey: "ads-asin-date", reason: proof.reason, blocksSales: false });
+    const proof = adsCoverageProof(asinAds, from, to, accounts);
+    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-asin-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
   }
   for (const accountId of accounts) {
     const snap = fbaSnapshotsByAccount[accountId];
@@ -207,4 +225,89 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
     }
   }
   return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-asin-date"), blockedBy };
+}
+
+/* ------------------------------ durable shadow snapshot derivation (pure) ------------------------------ */
+
+export const DAILY_DURABLE_SNAPSHOT_KEY = "scheduler-v2/daily-reporting-durable";
+export const BRAND_VIEW_DURABLE_SNAPSHOT_KEY = "scheduler-v2/brand-view-durable";
+export const DAILY_DURABLE_SNAPSHOT_VERSION = "daily-reporting-durable/v1";
+export const BRAND_VIEW_DURABLE_SNAPSHOT_VERSION = "brand-view-durable/v1";
+
+// Structural validators for the durable shadow payloads -- a snapshot is saved ONLY when its payload
+// validates (the same fail-closed posture as the report registry's validatePayload contracts).
+export function validateDailyDurablePayload(p) {
+  return !!p && Array.isArray(p.rows) && p.unmapped && typeof p.unmapped.sales === "number"
+    && typeof p.brandFiltered === "boolean" && typeof p.accountId === "string" && p.accountId.trim() !== ""
+    && !!p.window && typeof p.window.from === "string" && typeof p.window.to === "string"
+    && !!p.readiness && typeof p.readiness.adsReady === "boolean";
+}
+
+export function validateBrandViewDurablePayload(p) {
+  return !!p && Array.isArray(p.brands) && Array.isArray(p.unmapped)
+    && typeof p.bucket === "string" && (p.bucket === "us" || p.bucket === "non-us")
+    && !!p.window && typeof p.window.from === "string" && typeof p.window.to === "string"
+    && !!p.readiness && typeof p.readiness.adsReady === "boolean";
+}
+
+/**
+ * Derive + VALIDATE the two durable shadow snapshots from durable evidence (pure; finding 4). Readiness is
+ * computed FIRST from the authoritative per-account evidence; when a dashboard's sales-blocking sources are
+ * not ready, its snapshot is NOT derived (typed skip -- the caller saves nothing and LKG stays). Ads gaps
+ * never block: they surface inside the payload's readiness (adsReady=false) so a consumer can withhold the
+ * ads half honestly. Returns:
+ *   { daily: { readiness, snapshots: [{reportKey, accountId, version, payload}] | null },
+ *     brandView: { readiness, snapshot: {reportKey, accountId, version, payload} | null } }
+ */
+export function deriveDurableDashboardSnapshots({
+  bucket, accounts = [], historyRows = [], catalogRows = null, brandMaps = null,
+  oliCoverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
+  campaignAds = null, asinAds = null,
+  dailyWindow, brandViewWindow,
+} = {}) {
+  if (bucket !== "us" && bucket !== "non-us") throw new Error("deriveDurableDashboardSnapshots requires bucket 'us'|'non-us' (fail closed).");
+  if (!brandMaps && !Array.isArray(catalogRows)) {
+    throw new Error("deriveDurableDashboardSnapshots requires brandMaps or catalogRows (fail closed).");
+  }
+  const resolvedMaps = brandMaps || buildBrandMaps(catalogRows); // buildBrandMaps throws on a malformed catalog (fail closed)
+
+  const dailyReadiness = dailyReportingReadiness({
+    accounts, oliCoverageByAccountId, catalogSnapshot, campaignAds,
+    from: dailyWindow.from, to: dailyWindow.to,
+  });
+  let dailySnapshots = null;
+  if (dailyReadiness.ready) {
+    dailySnapshots = accounts.map((accountId) => {
+      const accountRows = historyRows.filter((r) => String(r.account_id ?? r.accountId) === accountId);
+      const fold = dailyRowsFromHistory({ historyRows: accountRows, brandMaps: resolvedMaps, brand: "ALL", from: dailyWindow.from, to: dailyWindow.to });
+      const payload = {
+        accountId, bucket, window: { ...dailyWindow },
+        rows: fold.rows, unmapped: fold.unmapped, brandFiltered: false,
+        readiness: { adsReady: dailyReadiness.adsReady, blockedBy: dailyReadiness.blockedBy },
+      };
+      if (!validateDailyDurablePayload(payload)) throw new Error("deriveDurableDashboardSnapshots: the Daily durable payload failed validation (fail closed).");
+      return { reportKey: DAILY_DURABLE_SNAPSHOT_KEY, accountId, version: DAILY_DURABLE_SNAPSHOT_VERSION, payload };
+    });
+  }
+
+  const brandViewReadinessResult = brandViewReadiness({
+    accounts, oliCoverageByAccountId, catalogSnapshot, asinAds, fbaSnapshotsByAccount,
+    from: brandViewWindow.from, to: brandViewWindow.to,
+  });
+  let brandViewSnapshot = null;
+  if (brandViewReadinessResult.ready) {
+    const fold = brandViewRowsFromHistory({ historyRows, brandMaps: resolvedMaps, from: brandViewWindow.from, to: brandViewWindow.to });
+    const payload = {
+      bucket, window: { ...brandViewWindow },
+      brands: fold.brands, unmapped: fold.unmapped,
+      readiness: { adsReady: brandViewReadinessResult.adsReady, blockedBy: brandViewReadinessResult.blockedBy },
+    };
+    if (!validateBrandViewDurablePayload(payload)) throw new Error("deriveDurableDashboardSnapshots: the Brand View durable payload failed validation (fail closed).");
+    brandViewSnapshot = { reportKey: BRAND_VIEW_DURABLE_SNAPSHOT_KEY, accountId: `__bucket:${bucket}`, version: BRAND_VIEW_DURABLE_SNAPSHOT_VERSION, payload };
+  }
+
+  return {
+    daily: { readiness: dailyReadiness, snapshots: dailySnapshots },
+    brandView: { readiness: brandViewReadinessResult, snapshot: brandViewSnapshot },
+  };
 }

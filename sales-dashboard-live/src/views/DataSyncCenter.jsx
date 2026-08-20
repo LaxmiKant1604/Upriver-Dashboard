@@ -152,11 +152,26 @@ export default function DataSyncCenter({ accessToken }) {
       {bucketData && (
         <div className="panel sync-scope-panel">
           <strong>Dashboard readiness ({bucket})</strong>
-          {bucketData.readiness.map((r) => (
+          {bucketData.readiness?.unavailable ? (
+            <div className="sync-token-note">Readiness evidence unavailable: {bucketData.readiness.unavailable}</div>
+          ) : (
+            ["daily", "brandView"].map((key) => {
+              const r = bucketData.readiness?.[key];
+              if (!r) return null;
+              const label = DASHBOARD_LABELS[key === "daily" ? "daily-reporting" : "brand-view"];
+              const blockers = (r.blockedBy || []).map((b) => `${b.sourceKey}${b.accountId ? ` [${b.accountId}]` : ""} · ${b.reason}`);
+              return (
+                <div key={key} className="sync-token-note">
+                  {r.ready
+                    ? `${label}: durable evidence proven${r.adsReady ? "" : " (ads coverage incomplete — ads half withheld)"}`
+                    : `${label}: blocked by ${blockers.join(", ")}`}
+                </div>
+              );
+            })
+          )}
+          {(bucketData.cardSummary || []).map((r) => (
             <div key={r.dashboard} className="sync-token-note">
-              {r.ready
-                ? `${DASHBOARD_LABELS[r.dashboard] || r.dashboard}: sources healthy${r.degradedBy.length ? ` (degraded: ${r.degradedBy.map((d) => `${d.sourceKey} · ${d.reason}`).join(", ")})` : ""}`
-                : `${DASHBOARD_LABELS[r.dashboard] || r.dashboard}: blocked by ${r.blockedBy.map((b) => `${b.sourceKey} · ${b.reason}`).join(", ")}`}
+              Card summary — {DASHBOARD_LABELS[r.dashboard] || r.dashboard}: {r.ready ? "sources healthy" : `blocked by ${r.blockedBy.map((b) => `${b.sourceKey} · ${b.reason}`).join(", ")}`}
             </div>
           ))}
         </div>

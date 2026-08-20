@@ -45,7 +45,7 @@ const ASOF = "2026-08-15";
 const TODAY = "2026-08-15";
 const CYCLE_DATE = "2026-08-21";
 const BUCKET = "us";
-const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0") });
+const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0"), country: "US" });
 const FIVE = [1, 2, 3, 4, 5].map(acct);
 const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-06-01", to: upTo }]]));
 
@@ -182,7 +182,7 @@ function makeDataDoe(opts = {}) {
         return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 }));
       }
       if (rk.includes("source-catalog")) return CATALOG_ROWS.map((r) => ({ ...r }));
-      if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", available: 5 }];
+      if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }];
       return [];
     },
   };
@@ -199,11 +199,15 @@ function tripwired(dd) {
 function makeClock(start = 9_000_000) { const c = { now: start }; c.fn = () => c.now; c.advance = (ms) => { c.now += ms; }; return c; }
 
 function makeSinks() {
+  // The ATOMIC replaceHistoryWindow model: one call = delete-the-window + insert rows + coverage ack.
   const history = []; const coverage = []; const snapshots = [];
   return {
     history, coverage, snapshots,
-    persistHistory: async (rows) => { history.push(...rows); return { write: "ok", recorded: rows.length }; },
-    recordCoverage: async (rows) => { coverage.push(...rows); return { write: "ok", recorded: rows.length }; },
+    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows }) => {
+      history.push(...rows);
+      coverage.push({ accountId, sourceKey: "order-line-items", coveredFrom, coveredTo });
+      return { write: "ok", replaced: 0, inserted: rows.length };
+    },
     persistSnapshot: async (s) => { snapshots.push(s); return { write: "ok" }; },
     updateRunStatus: async () => ({ write: "ok" }),
   };

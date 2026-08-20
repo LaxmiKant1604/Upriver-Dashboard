@@ -305,6 +305,9 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "source_oli_daily_history_org_date_idx", columns: ["organization_fingerprint", "sale_date"] },
         ],
         rlsEnabled: true,
+        // Finding 9 + 5: history is written ONLY through the atomic replace_oli_history_window RPC --
+        // service_role keeps SELECT alone, so no direct write can bypass the replacement + coverage ack.
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
         requiredTriggers: [{ name: "source_oli_daily_history_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
           "sku", "child_asin", "currency", "sales_amount", "units", "source_request_hash"],
@@ -319,6 +322,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "source_coverage_window_check", kind: "check", canonical: "covered_from <= covered_to" },
         ],
         requiredIndexes: [{ name: "source_coverage_lookup_idx", columns: ["account_id", "source_key", "covered_from"] }],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
         requiredTriggers: [{ name: "source_coverage_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to", "status", "source_refreshed_at"],
@@ -329,6 +333,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         namedConstraints: [
           { name: "source_controls_source_key_nonblank", kind: "check", canonical: "char_length(btrim(source_key)) > 0" },
         ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
         requiredTriggers: [{ name: "source_controls_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "paused", "schedule_enabled", "updated_at"],
@@ -341,6 +346,7 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "source_run_status_bucket_check", kind: "check", canonical: "bucket in ('us', 'non-us')" },
           { name: "source_run_status_last_status_check", kind: "check", canonical: "last_status in ('never', 'running', 'succeeded', 'partial', 'failed', 'paused')" },
         ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
         requiredTriggers: [{ name: "source_run_status_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "bucket", "last_status", "last_attempt_at", "last_success_at", "safe_error_code", "safe_error_stage",
@@ -355,15 +361,24 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
           { name: "source_snapshots_object_path_nonblank", kind: "check", canonical: "char_length(btrim(object_path)) > 0" },
           { name: "source_snapshots_row_count_nonneg", kind: "check", canonical: "row_count >= 0" },
         ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select", "insert", "update"] },
         rlsEnabled: true,
         requiredTriggers: [{ name: "source_snapshots_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
         keyColumns: ["source_key", "scope_key", "object_path", "row_count", "payload_bytes", "source_request_hash", "validated_at"],
       },
     ],
-    rpcs: [],
+    rpcs: [
+      // Finding 5: the ATOMIC rolling-window replacement + coverage acknowledgement (one transaction).
+      { name: "replace_oli_history_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at"] },
+    ],
+    // STRUCTURAL body proof: the RPC must validate every row fail-closed BEFORE mutating, DELETE the
+    // account's window rows, INSERT the corrected rows, and UPSERT the coverage acknowledgement in the SAME
+    // function body (one transaction). Removing any is a blocker.
+    provenFunctions: [{ name: "replace_oli_history_window", proof: "replace-oli" }],
     wrappers: ["upsertSourceOliHistoryRows", "getSourceOliHistoryRows", "getSourceCoverageWindows", "recordSourceCoverageWindows",
       "getSourceControls", "setSourceControl", "getSourceRunStatuses", "upsertSourceRunStatus",
-      "getSourceSnapshot", "recordSourceSnapshot"],
+      "getSourceSnapshot", "recordSourceSnapshot",
+      "replaceOliHistoryWindow", "saveSourceSnapshotPayload", "getSourceSnapshotPayload"],
     note: "Durable source model: OLI history + coverage + controls + run status + validated snapshots (PREPARED, UNAPPLIED).",
   },
 ]);
@@ -887,11 +902,41 @@ function auditReserveCreateFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Finding 5 structural proof: the atomic OLI window replacement + coverage acknowledgement. The function
+// body must (a) validate every supplied row FAIL-CLOSED before any mutation, (b) DELETE the account's
+// history rows inside the window, (c) INSERT the corrected rows, and (d) UPSERT the source_coverage
+// acknowledgement -- all in the SAME body (one transaction), so data replacement and coverage can never
+// diverge and a grain that disappeared from a corrected export can never survive.
+function auditReplaceOliFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "REPLACE_OLI_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  if (!/raise\s+exception[\s\S]*jsonb_array_elements\s*\(\s*p_rows\s*\)|jsonb_array_elements\s*\(\s*p_rows\s*\)[\s\S]*raise\s+exception/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_VALIDATION_MISSING", reason: "does not validate the supplied rows fail-closed before mutating" });
+  }
+  if (!/delete\s+from\s+public\.source_oli_daily_history\b[^;]*\baccount_id\s*=\s*p_account_id\b[^;]*\bsale_date\s+between\s+p_covered_from\s+and\s+p_covered_to/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_DELETE_MISSING", reason: "does not DELETE the account's history rows inside the replaced window (a removed grain would survive)" });
+  }
+  if (!/insert\s+into\s+public\.source_oli_daily_history\b/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_INSERT_MISSING", reason: "does not INSERT the corrected rows" });
+  }
+  const coverageAck = /insert\s+into\s+public\.source_coverage\b/i.test(M)
+    && /on\s+conflict\b[\s\S]*do\s+update\b/i.test(M)
+    && /'succeeded'/i.test(C);
+  if (!coverageAck) {
+    problems.push({ code: "REPLACE_OLI_COVERAGE_ACK_MISSING", reason: "does not UPSERT the succeeded coverage acknowledgement in the same transaction" });
+  }
+  return problems;
+}
+
 // Dispatch a declared RPC-body structural proof by its `proof` tag.
 function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
+  if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 

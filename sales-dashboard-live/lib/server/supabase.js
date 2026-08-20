@@ -935,6 +935,77 @@ export async function upsertSourceOliHistoryRows(rows) {
   }
 }
 
+/**
+ * ATOMIC rolling-window replacement + coverage acknowledgement (replace_oli_history_window RPC,
+ * senior-review finding 5): deletes the account's history rows inside the window, inserts the corrected
+ * rows, and upserts the proven coverage window in ONE transaction -- a grain that disappeared from the
+ * corrected export cannot survive, and coverage can never acknowledge a window whose rows were not
+ * written. An empty rows array is valid zero-sales evidence. Returns a typed outcome (never throws for a
+ * schema-missing/unapplied migration -- the caller fails closed on write !== "ok").
+ */
+export async function replaceOliHistoryWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, sourceRefreshedAt = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(rows)) {
+    throw new Error("replaceOliHistoryWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a rows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_oli_history_window", {
+      method: "POST",
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_rows: rows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          sale_date: r.saleDate ?? r.sale_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          sales_amount: r.salesAmount ?? r.sales_amount,
+          units: r.units,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+        })),
+        p_source_refreshed_at: sourceRefreshedAt || new Date().toISOString(),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", replaced: value?.replaced ?? 0, inserted: value?.inserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "OLI_HISTORY_SCHEMA_MISSING" };
+    return { write: "write-failed", replaced: 0, inserted: 0, error: "OLI_HISTORY_REPLACE_FAILED" };
+  }
+}
+
+// GENUINELY DURABLE snapshot payload storage (senior-review finding 6): the latest-validated catalog / FBA
+// payloads are COPIED to the source-snapshots/* namespace, which prune_source_export_cache can never touch
+// (the prune RPC deletes only object paths recorded in source_export_cache rows) -- so a snapshot pointer
+// survives ordinary cache pruning and hydrates from its own object.
+export const SOURCE_SNAPSHOT_OBJECT_PREFIX = "source-snapshots/v1";
+
+export function sourceSnapshotObjectPath(sourceKey, scopeKey) {
+  const clean = (v) => String(v || "").trim().replaceAll("/", "_");
+  if (!clean(sourceKey) || !clean(scopeKey)) {
+    throw new Error("sourceSnapshotObjectPath requires nonblank sourceKey + scopeKey (fail closed).");
+  }
+  return `${SOURCE_SNAPSHOT_OBJECT_PREFIX}/${clean(sourceKey)}/${clean(scopeKey)}.json`;
+}
+
+export async function saveSourceSnapshotPayload({ sourceKey, scopeKey, rows }) {
+  if (!Array.isArray(rows)) throw new Error("saveSourceSnapshotPayload requires a rows array (fail closed).");
+  const objectPath = sourceSnapshotObjectPath(sourceKey, scopeKey);
+  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, JSON.stringify({ rows }));
+  return { objectPath, payloadBytes: Buffer.byteLength(JSON.stringify({ rows })) };
+}
+
+export async function getSourceSnapshotPayload(objectPath) {
+  const path = String(objectPath || "");
+  if (!path.startsWith(`${SOURCE_SNAPSHOT_OBJECT_PREFIX}/`)) {
+    throw new Error("getSourceSnapshotPayload only hydrates durable source-snapshot objects (fail closed).");
+  }
+  return getPrivateStorageJson(SOURCE_CACHE_BUCKET, path);
+}
+
 export const SOURCE_OLI_HISTORY_MAX_ROWS = 200000;
 
 // Bounded canonical-history read. STRICT cap: at/over the limit the read is refused with a typed error

@@ -194,6 +194,108 @@ create trigger source_snapshots_touch
   for each row execute function public.touch_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- 6. replace_oli_history_window — ATOMIC rolling-window replacement + coverage
+--    acknowledgement in ONE transaction (senior-review finding 5).
+--
+-- The rolling 7-day refresh must REPLACE the whole (account, window) slice of
+-- history: a grain row that DISAPPEARED from the corrected export (cancelled
+-- order, re-attributed SKU) must not survive a merge-duplicates upsert. This
+-- RPC deletes the account's rows inside [p_covered_from, p_covered_to], inserts
+-- the corrected rows, and upserts the proven coverage window ATOMICALLY -- the
+-- data replacement and the coverage acknowledgement either both commit or both
+-- roll back, so coverage can never claim a window whose rows were not written.
+-- An EMPTY p_rows is valid evidence (a zero-sales window): delete + ack only.
+-- Every row is validated fail-closed BEFORE any mutation; the table CHECK
+-- constraints re-validate at insert.
+-- ---------------------------------------------------------------------------
+create or replace function public.replace_oli_history_window(
+  p_organization_fingerprint text,
+  p_connection_id text,
+  p_account_id text,
+  p_covered_from date,
+  p_covered_to date,
+  p_rows jsonb,
+  p_source_refreshed_at timestamptz default now()
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_row jsonb;
+  v_deleted integer := 0;
+  v_inserted integer := 0;
+begin
+  if p_organization_fingerprint is null or char_length(btrim(p_organization_fingerprint)) = 0 then
+    raise exception 'replace_oli_history_window: blank organization fingerprint';
+  end if;
+  if p_connection_id is null or p_connection_id not in ('primary', 'dd-secondary') then
+    raise exception 'replace_oli_history_window: invalid connection id';
+  end if;
+  if p_account_id is null or char_length(btrim(p_account_id)) = 0 then
+    raise exception 'replace_oli_history_window: blank account id';
+  end if;
+  if p_covered_from is null or p_covered_to is null or p_covered_from > p_covered_to then
+    raise exception 'replace_oli_history_window: invalid coverage window';
+  end if;
+  if p_rows is null or jsonb_typeof(p_rows) <> 'array' then
+    raise exception 'replace_oli_history_window: p_rows must be a jsonb array';
+  end if;
+
+  -- Validate EVERY row fail-closed BEFORE any mutation (grain completeness + window membership).
+  for v_row in select * from jsonb_array_elements(p_rows) loop
+    if coalesce(btrim(v_row->>'seller_or_vendor_id'), '') = ''
+      or coalesce(v_row->>'sale_date', '') = ''
+      or (v_row->>'sale_date')::date < p_covered_from
+      or (v_row->>'sale_date')::date > p_covered_to
+      or coalesce(v_row->>'currency', '') !~ '^[A-Z]{3}$'
+      or coalesce(btrim(v_row->>'source_request_hash'), '') = ''
+      or (v_row->>'sales_amount') is null
+      or (v_row->>'units') is null then
+      raise exception 'replace_oli_history_window: malformed history row; refusing the whole window';
+    end if;
+  end loop;
+
+  delete from public.source_oli_daily_history
+    where organization_fingerprint = p_organization_fingerprint
+      and connection_id = p_connection_id
+      and account_id = p_account_id
+      and sale_date between p_covered_from and p_covered_to;
+  get diagnostics v_deleted = row_count;
+
+  insert into public.source_oli_daily_history (
+    organization_fingerprint, connection_id, account_id, seller_or_vendor_id,
+    sale_date, sku, child_asin, currency, sales_amount, units, source_request_hash
+  )
+  select
+    p_organization_fingerprint, p_connection_id, p_account_id,
+    btrim(r->>'seller_or_vendor_id'),
+    (r->>'sale_date')::date,
+    coalesce(r->>'sku', ''),
+    coalesce(r->>'child_asin', ''),
+    r->>'currency',
+    (r->>'sales_amount')::numeric,
+    (r->>'units')::numeric,
+    btrim(r->>'source_request_hash')
+  from jsonb_array_elements(p_rows) as r;
+  get diagnostics v_inserted = row_count;
+
+  -- The coverage ACKNOWLEDGEMENT commits in the SAME transaction as the replacement above.
+  insert into public.source_coverage (
+    organization_fingerprint, connection_id, account_id, source_key,
+    covered_from, covered_to, status, source_refreshed_at
+  ) values (
+    p_organization_fingerprint, p_connection_id, p_account_id, 'order-line-items',
+    p_covered_from, p_covered_to, 'succeeded', coalesce(p_source_refreshed_at, now())
+  )
+  on conflict (organization_fingerprint, connection_id, account_id, source_key, covered_from, covered_to)
+  do update set source_refreshed_at = excluded.source_refreshed_at, updated_at = now();
+
+  return jsonb_build_object('replaced', v_deleted, 'inserted', v_inserted);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- RLS: enabled everywhere; dashboard admins may READ the operator surfaces
 -- (controls / run status / coverage); history + snapshots are service-role only
 -- (no policy). All writes go through the service-role wrappers.
@@ -215,3 +317,31 @@ create policy source_controls_admin_read on public.source_controls
 drop policy if exists source_run_status_admin_read on public.source_run_status;
 create policy source_run_status_admin_read on public.source_run_status
   for select to authenticated using (public.is_dashboard_admin());
+
+-- ---------------------------------------------------------------------------
+-- EXACT LEAST-PRIVILEGE ACLs (senior-review finding 9). Supabase default
+-- privileges would otherwise leave service_role with ALL on every table.
+--   - source_oli_daily_history is written ONLY through replace_oli_history_window
+--     (SECURITY DEFINER): service_role keeps SELECT alone, so no direct write can
+--     bypass the atomic replacement + coverage acknowledgement.
+--   - the other four tables are written by their reviewed service-role wrappers:
+--     service_role keeps exactly SELECT, INSERT, UPDATE (no DELETE anywhere --
+--     durable evidence is never deleted by the application role).
+-- ---------------------------------------------------------------------------
+revoke all on table public.source_oli_daily_history from public, anon, authenticated, service_role;
+grant select on table public.source_oli_daily_history to service_role;
+
+revoke all on table public.source_coverage from public, anon, authenticated, service_role;
+grant select, insert, update on table public.source_coverage to service_role;
+
+revoke all on table public.source_controls from public, anon, authenticated, service_role;
+grant select, insert, update on table public.source_controls to service_role;
+
+revoke all on table public.source_run_status from public, anon, authenticated, service_role;
+grant select, insert, update on table public.source_run_status to service_role;
+
+revoke all on table public.source_snapshots from public, anon, authenticated, service_role;
+grant select, insert, update on table public.source_snapshots to service_role;
+
+revoke all on function public.replace_oli_history_window(text, text, text, date, date, jsonb, timestamptz) from public, anon, authenticated;
+grant execute on function public.replace_oli_history_window(text, text, text, date, date, jsonb, timestamptz) to service_role;

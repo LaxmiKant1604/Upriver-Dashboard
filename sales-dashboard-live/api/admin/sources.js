@@ -9,7 +9,7 @@
 //         it is applied the GET reads report schema-missing markers and POST fails closed on the first
 //         durable write -- this endpoint enables nothing by itself and creates no schedule.
 
-import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, getSourceRunStatuses, setSourceControl } from "../../lib/server/supabase.js";
+import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, getSourceRunStatuses, setSourceControl, getAccountDirectoryRows } from "../../lib/server/supabase.js";
 import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../../lib/server/sync/source-status.js";
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
@@ -35,10 +35,29 @@ function bodyFor(req) {
 
 async function statusPayload() {
   const [controls, statuses] = await Promise.all([getSourceControls(), getSourceRunStatuses()]);
-  const cards = Object.fromEntries(CARD_BUCKETS.map((bucket) => {
+  // Finding 8: dashboard readiness comes from AUTHORITATIVE per-account durable evidence (coverage /
+  // snapshot freshness / per-account Ads windows), gathered per bucket from the account directory --
+  // last_status cards remain the quick health summary but never decide readiness. A gathering failure is a
+  // TYPED unavailable readiness, never a fabricated "ready" and never a 500 for the whole surface.
+  let directoryRows = [];
+  try { directoryRows = (await getAccountDirectoryRows()) || []; } catch { directoryRows = []; }
+  const runtime = buildBucketSourceSyncRuntime();
+  const cards = {};
+  for (const bucket of CARD_BUCKETS) {
     const bucketCards = shapeSourceCards({ bucket, controls: controls.rows, runStatuses: statuses.rows });
-    return [bucket, { cards: bucketCards, readiness: dashboardReadinessSummary(bucketCards) }];
-  }));
+    const accounts = directoryRows
+      .filter((r) => (r.sync_bucket || "") === bucket && r.account_id && !String(r.account_id).includes(":"))
+      .map((r) => ({ accountId: String(r.account_id) }));
+    let readiness;
+    try {
+      readiness = accounts.length
+        ? await runtime.gatherDurableReadiness({ bucket, accounts })
+        : { unavailable: "no-bucket-accounts" };
+    } catch (error) {
+      readiness = { unavailable: error?.code || "READINESS_GATHER_FAILED" };
+    }
+    cards[bucket] = { cards: bucketCards, cardSummary: dashboardReadinessSummary(bucketCards), readiness };
+  }
   return {
     buckets: cards,
     reads: { controls: controls.read, runStatuses: statuses.read },
@@ -99,8 +118,17 @@ export default async function handler(req, res) {
         action: "source.sync.missing",
         target: { bucket, sourceKey: onlySourceKey },
       });
+      // Finding 4: every registered source card action routes to its REAL architecture (bucket sync /
+      // fixpoint composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces a real
+      // serverless deadline with reserve headroom and returns a typed-resumable rollup.
       const runtime = buildBucketSourceSyncRuntime();
-      const result = await runtime.run({ bucket, onlySourceKey });
+      const result = onlySourceKey
+        ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey })
+        : await runtime.run({ bucket });
+      if (result && result.refused === true) {
+        res.status(409).json({ refusal: result, status: await statusPayload() });
+        return;
+      }
       res.status(200).json({ result, status: await statusPayload() });
       return;
     }

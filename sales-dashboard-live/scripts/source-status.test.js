@@ -179,9 +179,15 @@ function makeComposition({ paused = [], calls } = {}) {
     readSourceControls: async () => ({ rows: paused.map((k) => ({ source_key: k, paused: true, schedule_enabled: false })), read: "ok", error: null }),
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: "2026-08-19" }], read: "ok", error: null }),
     readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
-    persistHistory: async (rows) => ({ write: "ok", recorded: rows.length }),
-    recordCoverage: async (rows) => ({ write: "ok", recorded: rows.length }),
-    persistSnapshot: async () => ({ write: "ok" }),
+    readAdsCoverage: async () => ({ windows: [], read: "ok", error: null }),
+    readBatchMembership: async () => [],
+    assignBatchMembership: async () => { record.assigns = (record.assigns || 0) + 1; return record.assigns - 1 >= 0 ? 0 : 0; },
+    replaceHistory: async ({ rows }) => ({ write: "ok", replaced: 0, inserted: rows.length }),
+    saveSnapshotPayload: async ({ sourceKey, scopeKey }) => ({ objectPath: "source-snapshots/v1/" + sourceKey + "/" + scopeKey + ".json", payloadBytes: 2 }),
+    recordSnapshot: async () => ({ write: "ok" }),
+    loadSnapshotPayload: async () => ({ rows: [] }),
+    loadHistoryRows: async () => [],
+    makeShadowSaver: () => async () => ({ paramsHash: "ph" }),
     updateRunStatus: async () => ({ write: "ok" }),
     clock: () => 1_700_000_000_000,
   });
@@ -210,11 +216,12 @@ test("C2. a durably PAUSED source cannot be force-synced (typed 409); unknown so
   await assert.rejects(() => r2.run({ bucket: "eu" }), /'us'\|'non-us'/);
 });
 
-test("C3. a missing primary connection fails closed BEFORE any discovery", async () => {
+test("C3. a missing primary connection fails closed BEFORE any discovery (controls are read first, fail-closed)", async () => {
   let discoveries = 0;
   const runtime = runtimeMod.buildBucketSourceSyncRuntime({
     getConnections: () => [],
     fetchAccounts: async () => { discoveries += 1; return []; },
+    readSourceControls: async () => ({ rows: [], read: "ok", error: null }),
   });
   await assert.rejects(() => runtime.run({ bucket: "us" }), /primary DataDoe connection/);
   assert.equal(discoveries, 0);
