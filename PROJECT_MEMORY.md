@@ -10431,3 +10431,25 @@ before any write) and audits ONLY after the validated ack (X11 + U7). Hardening 
 STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, new
 20260822 (blob aa4f6e82) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing
 deployed/enabled/scheduled/published; cycle dfca8f75 untouched.
+
+## Round-8 -- OFFLINE on main 2026-08-21 (code+tests f1b79af, docs separate); verify green 55/35; NOT deployed
+
+Codex's review of the round-7 lease work raised five findings; all fixed offline (Appendix AS in
+SCHEDULER_V2_ROLLOUT.md). Migration 20260822 CHANGES this round (new frozen sha256
+4e1eda2a145143333db5da4390a9830cc56082d8d1090148adccba1e9295f900, blob 0cd0f526, PREPARED-UNAPPLIED);
+migrations 1-6/20260820/20260821 byte-UNCHANGED. (1) DB-authoritative lease time: claim_report_derive_lease
+drops caller p_now and uses now() (v_now), lease bounded [120,1800]; a caller clock skew cannot steal/distort
+a lease (X12). (2) Validate a recovered snapshot before adoption: params provenance + exact version/account +
+trusted-loader hydration + the exact payload contract + byte-identical content vs the fresh candidate, else a
+typed conflict/integrity outcome that never validates (Y1-Y7: mutated params, malformed payload, dangling
+storage, wrong version, unavailable payload, equal-hash conflict). (3) Honest incomplete rollups: skipped is
+null ONLY when every report completed; held/reconcile-lost/claim-failed are typed-resumable
+(continuationRequired), conflict/terminal are typed non-resumable; finalize stays open-work (Z1/Z2). (4) Total
+lease state machine (reclaim only EXACTLY-running expired; invalid-state for incoherent combos; explicit
+non-running reconcile) + strict ack validators (multi-row/malformed/disposition-dependent-field fail closed)
+(Z3/Z4 + ZM1 SQL mutations). (5) Abortable recovery read: getReportSnapshot forwards {signal}; a hung read is
+aborted within budget -> typed-resumable, no later write (Z5). Hardening 81; verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
+(blob 0cd0f526) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
+published; cycle dfca8f75 untouched.

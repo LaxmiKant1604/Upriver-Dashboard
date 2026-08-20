@@ -5004,3 +5004,21 @@ NEW migration 20260822 PREPARED-UNAPPLIED (`aa4f6e82`, sha256
 
 **STOP for Codex re-review.** Code+tests `66b38bc`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AS — Round-8: harden the report-derive lease/recovery (5 findings) (OFFLINE, 2026-08-21; code+tests `f1b79af`; docs `<this commit>`; NOT deployed)
+
+Codex's review of the round-7 lease work raised five findings; all fixed offline. `npm run verify` green --
+**55 steps / 35 suites** (incl. `build:check`); `git diff --check` clean; migrations 1-6, 20260820, 20260821
+byte-UNCHANGED. Migration **20260822 CHANGES** this round; new frozen SHA-256
+`4e1eda2a145143333db5da4390a9830cc56082d8d1090148adccba1e9295f900` (blob `0cd0f526`), still PREPARED-UNAPPLIED.
+
+| # | Finding -> fix (proofs: hardening X12, Y1-Y7, Z1-Z5, ZM1) |
+|---|---|
+| 1 | **Database-authoritative lease time.** `claim_report_derive_lease` drops the caller `p_now` param and uses `now()` (captured once as v_now) for every lease comparison/creation, so a future/past caller clock skew can neither steal nor distort a lease. The requested lease duration is bounded to the reviewed safe range **[120s, 1800s]**. Signature, wrapper (no p_now sent), schema-contract rpc params + proof (CLAIM_LEASE_DB_TIME_MISSING / CLAIM_LEASE_CALLER_TIME / CLAIM_LEASE_UNBOUNDED) and SQL mutation tests updated. X12 |
+| 2 | **Validate a recovered snapshot before adoption.** The runtime no longer adopts a durable snapshot merely because its identity row exists: it proves params provenance (stored params recompute to the hash), exact derivation version + account, hydrates a storage-backed payload through the trusted loader (dangling/unavailable fail closed), runs the exact REPORT_DERIVATIONS payload contract, and proves byte-identical content (canonical JSON) vs the freshly derived candidate -- else a TYPED conflict/integrity outcome that NEVER reconciles or sets validated=true. Y1-Y7 (mutated params, malformed payload, dangling storage, wrong version, unavailable payload, equal-hash conflicting content -> all keep the cycle at open-work; + the identical-adopt path) |
+| 3 | **Honest incomplete rollups.** `derived.skipped` stays null ONLY when every report genuinely completed; any incomplete lineage item makes it a typed non-null and enumerates the items. claim-held / reconcile-lost / transient claim-failure are typed-resumable (continuationRequired=true; a later invocation recovers with ZERO DataDoe); a snapshot conflict / terminal report is a typed non-resumable incompleteness (finalize returns open-work). Z1/Z2 |
+| 4 | **Total lease state machine + strict acks.** claim reclaims ONLY an EXACTLY-running expired lease (the reclaim UPDATE re-asserts `derive_status = 'running'`); succeeded+save-failed and every other incoherent combination return 'invalid-state' and never fall through; reconcile handles a non-running row explicitly (terminal / invalid-state). Both wrapper ack validators reject multi-row / non-object / unknown disposition and enforce disposition-dependent field exactness. Z3/Z4 + ZM1 |
+| 5 | **Abortable snapshot recovery read.** `getReportSnapshot` accepts `{signal}` and forwards it to `request()`; the runtime's shadow-read is bounded by the route deadline. Z5 proves the signal reaches the real fetch and a hung recovery read is aborted within budget -> typed-resumable with NO later save/reconcile |
+
+**STOP for Codex re-review.** Code+tests `f1b79af`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
