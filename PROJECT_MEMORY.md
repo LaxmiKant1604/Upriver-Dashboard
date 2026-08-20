@@ -10359,3 +10359,26 @@ comparison, swallowed exception, malformed acks). Hardening suite 43, parity 5; 
 
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b...) still
 PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
+
+## Round-6 corrections — OFFLINE on main 2026-08-20 (code+tests e6165a6, docs separate); verify green 55/35; NOT deployed
+
+Codex round-5 review raised six findings; all fixed offline (Appendix AP in SCHEDULER_V2_ROLLOUT.md).
+Highlights: the source-first runtime NEVER finalizes the shared (bucket, cycle_date) cycle (Migration 5's
+append guard is now modeled faithfully in the harness; finalization belongs to the scheduled dispatcher's
+complete-scope close; U1 proves later report runs append + same-day replays pass + the guard rejects only
+after the reviewed close). makePersistSnapshot acts on the CAS acknowledgement (stale-save hydrates and
+folds the WINNER only; unreadable winner = typed stop, LKG intact; U2 proves a losing candidate never
+reaches a report payload). brand-inventory gains a reviewed, gated promotion path (SOURCE_PROMOTED_REPORT_
+KEYS disjoint from the dispatchable catalog; publisher code readiness = the 13 + promoted union; exact live
+contract brand-inventory-shared-v1 {to}; U3 drives the REAL publisher composition under PRODUCTION defaults
+to "published" and the REAL buildAccountBrandSlice reads the promoted row by its plain live key). The route
+deadline is now real end-to-end (AbortSignal through the REAL Supabase REST/Storage wrappers; typed
+beforeRequest / in-flight commitUnknown / confirmed-committed outcomes; ghost-write guards; audit write +
+response-status reads share the route budget; U4). depends_on is ACCOUNT-EXACT from the durable owner
+memberships (new getSyncSourceJobOwnersForCycle; U5 proves 30 accounts / 6 batches with zero cross-batch
+leakage). The ACL audit models PostgreSQL 17 (ALL includes MAINTAIN; U6 mutations). Hardening suite 49,
+parity 5, gate7 45 (F1 now pins 14 contracts); verify 55 steps / 35 suites.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b...) byte-UNCHANGED
+and still PREPARED-UNAPPLIED; migrations 1-6 frozen; no DataDoe/Supabase/production call; nothing
+deployed/enabled/scheduled/published; cycle dfca8f75 untouched.
