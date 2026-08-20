@@ -158,7 +158,17 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     // durable cache adoption or a saved export_id, and the DataDoe adapter is wrapped with a create-export
     // TRIPWIRE so any create POST throws. Fixed HERE (trusted), NEVER on RUN_OPERATIONAL_ARGS.
     reuseOnly = false,
+    // BUILD-TIME budget planner (Blocker 4d wiring): { isPremiumOf(job), trancheBudgetMode(spec) }. When
+    // fixed here together with a statically-plannable sourceKeys tranche, the dispatcher freezes + threads
+    // the GENERIC unit's create/AI-token ceilings (see runSchedulerV2Shadow). Fixed HERE (trusted), NEVER on
+    // RUN_OPERATIONAL_ARGS; a malformed planner fails closed at compose time. null => byte-identical.
+    budgetPlanner = null,
   } = overrides;
+
+  if (budgetPlanner != null && (typeof budgetPlanner !== "object"
+    || typeof budgetPlanner.isPremiumOf !== "function" || typeof budgetPlanner.trancheBudgetMode !== "function")) {
+    throw new Error("buildSchedulerV2Runtime: budgetPlanner, when supplied, must be { isPremiumOf(job), trancheBudgetMode(spec) } (fail closed).");
+  }
 
   const normalizedSourceTranche = sourceTranche == null
     ? null
@@ -193,7 +203,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const loadAccountRollout = async () => getAccountRollout();
 
   // TRUSTED collaborators -- fixed by the composition; a per-run caller can NEVER override any of them.
-  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout, sourceTranche: normalizedSourceTranche, reuseOnly: reuseOnlyMode };
+  const collaborators = { connections, store, dataDoe, saveSnapshot, ppcAdsProviders, loadDerivedContext, discoverAccounts, controlCatalog, loadAccountRollout, sourceTranche: normalizedSourceTranche, reuseOnly: reuseOnlyMode, budgetPlanner };
 
   // Load the DURABLE report scheduling controls (report_sync_settings) -- the ONLY production control source
   // for the scheduled path. A read failure THROWS here, so it fails closed BEFORE runSchedulerV2Shadow does

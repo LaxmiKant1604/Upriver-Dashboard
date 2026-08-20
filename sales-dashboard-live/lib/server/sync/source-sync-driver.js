@@ -17,6 +17,7 @@ import {
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
   upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
+  persistSourceTrancheBudget, reserveSourceExportCreate, getSourceTrancheBudget, getSourceTrancheBudgetHashes,
 } from "../supabase.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import { runSourceJobs } from "./source-worker.js";
@@ -261,6 +262,15 @@ export function makeSupabaseSourceStore() {
     recordSourceSuccess: (args) => recordSyncSourceSuccess(args),
     recordSourceFailure: (args) => recordSyncSourceFailure(args),
     updateCycleCounts: (cycleId, counts) => updateSyncCycleCounts(cycleId, counts),
+    // Blocker 4d wiring: the FROZEN per-(cycle, tranche) create/AI-token budget. persistBudget freezes the
+    // reviewed plan ceilings once ('created' | 'exists'; drift RAISES PLAN_BUDGET_MISMATCH with no mutation);
+    // reserveExportCreate is the ATOMIC pre-POST reservation the source worker uses whenever a budget context
+    // is active -- only a 'reserved' acknowledgement may POST a create-export. The read pair feeds the
+    // source-status surface (spent vs ceiling). All four are inert unless a budget-aware composition calls them.
+    persistBudget: (args) => persistSourceTrancheBudget(args),
+    reserveExportCreate: (args) => reserveSourceExportCreate(args),
+    getBudget: (args) => getSourceTrancheBudget(args),
+    getBudgetHashes: (args) => getSourceTrancheBudgetHashes(args),
     // Dispatcher-owned cycle finalization (Blocker 1): the guarded finalize_sync_cycle RPC, returning a typed
     // disposition. The canonical dispatcher calls this on a complete drained SCHEDULED scope; a source-family
     // driver never calls it.
@@ -376,6 +386,10 @@ export async function runStagedSourceCycle({
   sourceTranche = null,
   // BUILD-TIME reuseOnly rehearsal flag (Blocker 3); passed straight to runSourceJobs.
   reuseOnly = false,
+  // Blocker 4d: the FROZEN tranche budget context { trancheKey, planFingerprint } (persisted BEFORE this
+  // invocation); passed straight to runSourceJobs so every create goes through the atomic pre-POST
+  // reservation. null => the legacy one-attempt claim (behavior byte-identical). NEVER a per-run caller arg.
+  budget = null,
 }) {
   const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
   let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
@@ -410,7 +424,7 @@ export async function runStagedSourceCycle({
 
     const res = await runSourceJobs({
       store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
-      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
+      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
     });
     rollup.cycleId = res.cycleId;
     rollup.rounds = round + 1;

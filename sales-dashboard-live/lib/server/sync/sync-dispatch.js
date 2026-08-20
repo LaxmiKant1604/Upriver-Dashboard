@@ -16,6 +16,7 @@
 // It creates NO cron, route, migration, deployment or frontend wiring, and unlocks no report.
 
 import { buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS, STAGED_CYCLE_REPORT_KEYS } from "./report-planner.js";
+import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { resolveRolloutAccounts } from "./account-rollout.js";
 import { runStagedSourceCycle, plannedSourceJob } from "./source-sync-driver.js";
 import { runReportJobs } from "./report-worker.js";
@@ -162,6 +163,14 @@ export async function runSchedulerV2Shadow({
   // per-run operational arg. When true, every source unit creates ZERO exports -- a pending job that cannot
   // be satisfied by a durable cache adoption or a saved export_id resume returns MISSING_REUSABLE_SOURCE.
   reuseOnly = false,
+  // BUILD-TIME budget planner (Blocker 4d wiring). Supplied ONLY by the trusted composition; NEVER a per-run
+  // operational arg. Shape { isPremiumOf(job), trancheBudgetMode(spec) }. When present TOGETHER WITH a
+  // sourceKeys-mode tranche whose member families are all statically plannable ("frozen"), the GENERIC unit's
+  // create/AI-token ceilings are computed from its static plan, persisted per (cycle, `${tranche}#generic`)
+  // BEFORE any execution, and threaded as the worker's reservation context -- so every generic create goes
+  // through the atomic pre-POST reservation. Staged units run unbudgeted (their plans are signal-dependent);
+  // the one-attempt-per-hash claim still bounds every one of their creates. null => byte-identical behavior.
+  budgetPlanner = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") {
     throw new Error(`runSchedulerV2Shadow requires an explicit cycle bucket of 'us' or 'non-us' (got "${bucket}").`);
@@ -201,7 +210,7 @@ export async function runSchedulerV2Shadow({
     bucket, cycleId: null, manual,
     selected: dispatchable.map((r) => r.reportKey), lockedOut, derivedOnly,
     unavailableAccounts: [], accountsDispatched: [],
-    spent: 0, maxJobs, stoppedForBudget: false, drained: true, continuationRequired: false, perUnit: [], reports: null,
+    spent: 0, maxJobs, stoppedForBudget: false, drained: true, trancheDrained: true, continuationRequired: false, perUnit: [], reports: null,
     finalized: false, cycleStatus: null, // no cycle was opened -> nothing to finalize
     ...extra,
   });
@@ -295,15 +304,57 @@ export async function runSchedulerV2Shadow({
   if (genericKeys.length) units.push({ kind: "generic", label: `generic:${genericKeys.join("+")}`, keys: genericKeys });
   for (const key of stagedKeys) units.push({ kind: "staged", label: key, reportKey: key });
 
+  // Tranche-scoped OPEN-WORK probe (source-first orchestration). Under a narrowed tranche a unit's
+  // owner-scoped `drained` is false BY DESIGN (its un-selected families stay pending), so it can never gate
+  // unit-to-unit continuation. What CAN: whether the shared cycle still holds any pending/attempted job the
+  // tranche SELECTS. Reading the durable rows (never a unit's rollup) keeps this honest across units --
+  // a maxJobs-truncated unit leaves selected work open and stops the pass exactly like before.
+  const trancheOpenWork = async () => {
+    if (!sourceTranche || !rollup.cycleId) return false;
+    const rows = await store.listSourceJobs(rollup.cycleId);
+    return rows.some((r) => ["pending", "attempted"].includes(r.fetch_status ?? r.fetchStatus ?? "pending")
+      && sourceTranche.selects({ sourceKey: r.source_key ?? r.sourceKey ?? "", requestHash: r.request_hash ?? r.requestHash ?? "" }));
+  };
+
   for (const unit of units) {
     if (budgetLeft() === 0 || outOfTime()) { rollup.stoppedForBudget = true; break; }
     const remaining = budgetLeft();
     let res;
     if (unit.kind === "generic") {
       const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor });
+      // Blocker 4d wiring: freeze + thread the GENERIC unit's create/AI-token ceilings when the trusted
+      // composition supplied a budget planner and the tranche is statically plannable. The budget is
+      // persisted BEFORE any execution (the cycle open is the same idempotent (bucket, cycle_date) upsert
+      // runStagedSourceCycle performs); 'created'/'exists' proceed, plan drift RAISES from the store
+      // (PLAN_BUDGET_MISMATCH -- fail closed, zero creates), any other acknowledgement fails closed here.
+      let budget = null;
+      if (sourceTranche && budgetPlanner && sourceTranche.mode === "sourceKeys"
+        && budgetPlanner.trancheBudgetMode({ name: sourceTranche.name, sourceKeys: sourceTranche.sourceKeys }) === "frozen") {
+        const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
+        const frozen = computeFrozenTrancheBudget({
+          plannedJobs, sourceTranche, isPremiumOf: budgetPlanner.isPremiumOf,
+          trancheKey: `${sourceTranche.name}#generic`,
+        });
+        if (frozen.maxCreates > 0) {
+          if (typeof store.persistBudget !== "function") {
+            throw new Error("runSchedulerV2Shadow: a frozen tranche budget is required but store.persistBudget is unavailable; refusing to execute (fail closed).");
+          }
+          const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+          rollup.cycleId = rollup.cycleId || cycleId;
+          const ack = await store.persistBudget({
+            cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
+            maxCreates: frozen.maxCreates, maxTokens: frozen.maxTokens,
+            hashes: frozen.hashes.map((h) => ({ requestHash: h.requestHash, tokenCost: h.tokenCost })),
+          });
+          if (ack !== "created" && ack !== "exists") {
+            throw new Error(`runSchedulerV2Shadow: persisting the frozen tranche budget returned a malformed acknowledgement ("${ack}"); refusing to execute (fail closed).`);
+          }
+          budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
+        }
+      }
       res = await runStagedSourceCycle({
         store, dataDoe, resolvePlan: resolveFromGenericPlan(plan),
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
+        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
       });
       collectedReports.push(...plan.reportRequests);
     } else {
@@ -328,7 +379,18 @@ export async function runSchedulerV2Shadow({
     // the dispatcher STOPS here -- it neither opens the next unit nor later declares itself drained while a
     // prior unit still has pending/resumable state. A fresh idempotent invocation resumes from persisted
     // state with no duplicate create-export (blocker 6).
-    if (res.deadlineReached || (res.deferred || 0) > 0 || res.drained !== true) { rollup.stoppedForBudget = true; break; }
+    //
+    // SOURCE-FIRST refinement: under a narrowed tranche a unit's owner-scoped `drained` is false BY DESIGN
+    // (its un-selected families stay pending), so it cannot gate continuation -- if it did, unit 1 would
+    // stop every tranche pass and the staged units would never execute their selected family. The honest
+    // per-pass signal is the DURABLE tranche-scoped open-work probe: proceed to the next unit ONLY when the
+    // shared cycle holds no pending/attempted job the tranche selects (a deferral/deadline still stops
+    // first, and a maxJobs truncation leaves selected work open, which stops exactly as before). The
+    // full-cycle `drained` below keeps its meaning: a filtered tranche is NEVER globally drained.
+    if (res.deadlineReached || (res.deferred || 0) > 0) { rollup.stoppedForBudget = true; break; }
+    if (sourceTranche) {
+      if (await trancheOpenWork()) { rollup.stoppedForBudget = true; break; }
+    } else if (res.drained !== true) { rollup.stoppedForBudget = true; break; }
   }
 
   // 5) DERIVE the ready reports from the SAVED source rows (PURE: zero DataDoe/network). runReportJobs gates
@@ -361,6 +423,10 @@ export async function runSchedulerV2Shadow({
   const reportsDrained = !rollup.reports || rollup.reports.drained === true;
   rollup.drained = allUnitsDrained && reportsDrained && !rollup.stoppedForBudget;
   rollup.continuationRequired = !rollup.drained;
+  // Source-first telemetry: whether the SELECTED tranche families hold no open work in the shared cycle.
+  // Distinct from `drained` on purpose -- a filtered pass can be tranche-complete while other families are
+  // still pending, and MUST NOT be treated as globally drained (drained stays false in that case).
+  rollup.trancheDrained = sourceTranche ? !(await trancheOpenWork()) : rollup.drained;
 
   // 6) FINALIZE the shared cycle -- the CANONICAL DISPATCHER owns this; a source-family driver must NEVER
   //    finalize the shared (bucket, cycle_date) cycle early. SCOPE SEMANTICS (fixes the manual-subset hole):
