@@ -4913,3 +4913,24 @@ matrices against the hardened interfaces.
 
 **STOP for Codex re-review.** Code+tests `545735b`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migration 20260820 remains PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AM — Round-3 senior-review corrections (OFFLINE, 2026-08-20; code+tests `545735b`-successor `64a0cc3`; docs `<this commit>`; NOT deployed)
+
+Codex round-3 review raised nine findings on Appendix AL; all fixed offline. `npm run verify` green — **55
+steps / 35 suites** (incl. `build:check`); `git diff --check` clean; migration blob `26e63bc...` (still
+PREPARED-UNAPPLIED).
+
+| # | Fix (proofs: `source-production-hardening.test.js` R1-R9 + `durable-live-parity.test.js` P1-P3) |
+|---|---|
+| 1 | Card actions read controls FIRST for every storage class (paused => typed `SOURCE_PAUSED` 409 before ANY discovery/I-O); cycle-cache cards execute ONLY their own family via the trusted composition FIXED to `[sourceKey]` (no widening), honoring `reuseOnly` (tripwire in rehearsal) (R1, F4b) |
+| 2 | ONE end-to-end deadline: `ensureTime` before every costly step (discovery, each evidence read, membership, sync, hydration, history/ads loads, derivation, each save); fixpoint checks before family launches/continuations/cooldowns; expiry is ALWAYS typed resumable (`deadlineReached`+`continuationRequired`+phase), never a failure or deadline-caused `FAMILY_CONTINUATIONS_EXHAUSTED` (R2, R3) |
+| 3 | Durable Daily/Brand View outputs produced BY the existing contracts: the REAL `daily-reporting` adapter (v2d-3) with ACTUAL campaign ad metrics via the REAL ads-coverage contract (account currency threaded), and the REAL `brand-sales` adapter (v2d-2 — the exact payload live Brand View aggregates, incl. `asinBrand`); orphan custom keys deleted; parity vs an independent pure-twin + executable consumption by the REAL live aggregators + `SCHEDULER_LIVE_SNAPSHOT_CONTRACTS` params (P1-P3) |
+| 4 | A succeeded job with missing/unreadable/malformed cached rows => typed `SOURCE_PAYLOAD_UNAVAILABLE` stop at every persistence site; never drained/successful; persistence never silently skipped; LKG intact (R4) |
+| 5 | `source_snapshots` identity now (org, connection, source, scope) + `payload_sha`; IMMUTABLE CONTENT-ADDRESSED objects (`source-snapshots/v2/<org>/<conn>/.../<sha>.json`); pointer refuses a non-matching path; hydrator re-derives the hash — metadata and payload provably one save; concurrent/cross-org saves isolated (R5) |
+| 6 | Every loaded `source_batch_membership` row validated (canonical primary account, connection, org fingerprint, integer index, uniqueness, <=5) => typed `BATCH_MEMBERSHIP_CORRUPT`, zero exports (R6) |
+| 7 | Readiness evidence validates freshness policy (`snapshot-stale`), isolated identity, hydration (`snapshot-dangling`), row-count integrity (`snapshot-integrity`), content provenance — all typed blockers (R7) |
+| 8 | POST runs the evidence preflight BEFORE its first write INCLUDING the audit row; PATCH requires an actual boolean `paused` (400, zero writes — no silent resume) (R8) |
+| 9 | Exact public-scoped POLICY auditing (`POLICY_MISSING`/`POLICY_MISMATCH`/`POLICY_UNEXPECTED`; full FOR/TO/USING shape; no-policy tables enforced); ACLs reconciled EXPLICITLY with policy intent (admin-read tables: policy + authenticated SELECT grant together; history/snapshots: neither) (R9) |
+
+**STOP for Codex re-review.** Code+tests `64a0cc3`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migration 20260820 PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.

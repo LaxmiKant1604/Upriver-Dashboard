@@ -10290,3 +10290,20 @@ reconciled to the hardened interfaces. npm run verify 54 steps / 34 suites green
 
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 still PREPARED-UNAPPLIED; no
 DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
+
+## Round-3 senior-review corrections — OFFLINE on main 2026-08-20 (code+tests 64a0cc3, docs separate); verify green 55/35; NOT deployed
+
+Codex round-3 raised 9 findings on Appendix AL; all fixed offline (Appendix AM). Highlights: controls-first
+card actions (paused = typed 409 pre-I/O; cycle-cache cards execute ONLY their own family via a
+single-family tranche composition honoring reuseOnly); ONE end-to-end serverless deadline across every
+costly step incl. fixpoint loops/cooldowns (expiry always typed resumable, never exhaustion-by-deadline);
+durable Daily/Brand View outputs now produced BY the EXISTING report contracts (real daily-reporting v2d-3
+adapter with actual campaign ad metrics; real brand-sales v2d-2 adapter feeding live Brand View; orphan keys
+deleted; parity + consumption proven in durable-live-parity.test.js); SOURCE_PAYLOAD_UNAVAILABLE fail-closed
+for succeeded-job cache loss; org/connection-isolated CONTENT-ADDRESSED snapshots (payload_sha in identity;
+hydrator proves same-save); membership row validation (BATCH_MEMBERSHIP_CORRUPT); readiness evidence
+freshness/hydration/integrity/provenance blockers; POST preflight before audit + boolean-strict PATCH; exact
+policy auditing + ACL/policy reconciliation. Hardening suite 29, parity suite 3; verify 55 steps / 35 suites.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 26e63bc...) still
+PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
