@@ -28,6 +28,7 @@
     "test:source-bucket-sync": "node scripts/source-bucket-sync.test.js",
     "test:source-status": "node scripts/source-status.test.js",
     "test:source-schedule": "node scripts/source-schedule.test.js",
+    "test:zero-export-rehearsal": "node scripts/zero-export-rehearsal.test.js",
     "test:schema-contract-mutation": "node scripts/schema-contract-mutation.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
     "test:gate5-canary-package": "node scripts/gate5-canary-package.test.js",

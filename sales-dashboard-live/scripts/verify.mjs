@@ -49,6 +49,7 @@ const SUITES = [
   "test:source-bucket-sync",
   "test:source-status",
   "test:source-schedule",
+  "test:zero-export-rehearsal",
   "test:schema-contract-mutation",
   "test:report-sync-controls",
   "test:gate5-canary-package",
