@@ -10409,3 +10409,25 @@ verify 55/35.
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b) byte-UNCHANGED and
 20260821 (blob b3c0bc86) both PREPARED-UNAPPLIED; migrations 1-6 frozen; no DataDoe/Supabase/production call;
 nothing deployed/enabled/scheduled/published; cycle dfca8f75 untouched.
+
+## Round-7 — OFFLINE on main 2026-08-21 (code+tests 66b38bc, docs separate); verify green 55/35; NOT deployed
+
+Codex's final review raised two findings; both fixed offline (Appendix AR in SCHEDULER_V2_ROLLOUT.md).
+(1) Durable, concurrency-safe recovery after report-lineage commit-unknown: a commitUnknown mid-derive used
+to leave sync_report_jobs 'running' forever. NEW additive migration 20260822_report_derive_lease.sql
+(PREPARED-UNAPPLIED, blob aa4f6e82) adds lease columns + two guarded RPCs -- claim_report_derive_lease
+(claimed/held/reclaimed/already-complete/terminal; never steals an unexpired lease; updated_at is never an
+ownership token) and reconcile_report_derive_success (running->succeeded requiring the CURRENT lease token
+AND the EXACT durable shadow snapshot: report_snapshots scheduler-v2/<key>+account+params_hash). The runtime
+saveWithLineage now upsert -> claimLease -> adopt-or-save -> reconcile; deriveResumable preserves
+commitUnknown. Recovery is pure re-derive+save+reconcile (ZERO DataDoe, no duplicate save, no fabricated
+success, live worker never stolen). Proved by X1-X10 (claim/save/reconcile/success commit-unknown recovery,
+steal protection, stale recovery, wrong-hash, zero-DataDoe, honest finalize, commitUnknown preservation);
+the RPCs are wrapper-validated + structurally proven in schema-contract. (2) Strict promoted-control ack:
+setSourcePromotedPublishControl requires a strict boolean + validates a single exact-row acknowledgement
+(exact key, exact boolean, valid updated_at) else throws typed; the admin PATCH requires a boolean (400
+before any write) and audits ONLY after the validated ack (X11 + U7). Hardening 67, verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, new
+20260822 (blob aa4f6e82) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing
+deployed/enabled/scheduled/published; cycle dfca8f75 untouched.

@@ -4989,3 +4989,18 @@ migration 20260820 byte-UNCHANGED (`2053597b`); NEW migration 20260821 PREPARED-
 **STOP for Codex re-review.** Code+tests `f6fd11c`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migration 20260820 byte-unchanged + 20260821 both PREPARED-UNAPPLIED; nothing deployed,
 scheduled, or published.
+
+## Appendix AR — Round-7: durable report-derive recovery + strict promoted-control ack (OFFLINE, 2026-08-21; code+tests `66b38bc`; docs `<this commit>`; NOT deployed)
+
+Codex's final review raised two findings; both fixed offline. `npm run verify` green — **55 steps / 35
+suites** (incl. `build:check`); `git diff --check` clean; migrations 1-6, 20260820, 20260821 byte-UNCHANGED;
+NEW migration 20260822 PREPARED-UNAPPLIED (`aa4f6e82`, sha256
+`3f63fa43ed36cfb347a43ec6b7dfbbb63298e5dd5cbe08a6e7087a70ba28cf77`).
+
+| # | Finding -> fix (proofs: hardening X1-X11; T2/S2 reworked; U7 extended) |
+|---|---|
+| 1 | **Durable, concurrency-safe recovery after report-lineage commit-unknown.** A commitUnknown mid-derive used to leave `sync_report_jobs` 'running' forever (the one-time claim could never re-acquire; finalize returned open-work permanently). NEW additive `20260822_report_derive_lease.sql` adds lease columns to the (20260807-frozen) table + two guarded RPCs: `claim_report_derive_lease` (pending->running with a fresh token+expiry = 'claimed'; an UNEXPIRED lease is NEVER stolen = 'held'; a stale/expired running lease is re-claimed = 'reclaimed'; an already-validated job is 'already-complete'; failed/skipped terminal-for-cycle; updated_at is never an ownership token) and `reconcile_report_derive_success` (running->succeeded requiring BOTH the CURRENT lease token AND the EXACT durable shadow snapshot — report_snapshots for scheduler-v2/<report_key>+account+params_hash — so wrong-account/wrong-hash/malformed never authorizes success). The runtime's saveWithLineage becomes upsert -> claimLease -> (already-complete: observe; held/terminal: skip) -> for claimed/reclaimed: adopt the exact durable snapshot if present (a shadow-save commit-unknown left it) else save once -> reconcile; `deriveResumable` PRESERVES the deadline error's commitUnknown onto the rollup. Recovery is pure re-derive+save+reconcile off durable evidence — ZERO new DataDoe, no duplicate save, no fabricated success, a live worker never stolen. X1-X10 cover every mandated scenario; the two RPCs are wrapper-validated (strict jsonb disposition) + structurally proven in schema-contract |
+| 2 | **Strict promoted-control command acknowledgement.** `setSourcePromotedPublishControl` requires a strict boolean and validates a SINGLE returned row (exact canonical report_key, publish_enabled EXACTLY the requested boolean, valid updated_at); null/empty/multi-row/wrong-key/wrong-state/no-updated_at throw a typed safe error. The admin PATCH requires `typeof body.publishEnabled === "boolean"` and returns 400 BEFORE any write, recording the audit event ONLY after the validated durable acknowledgement. U7 extended + X11 prove malformed input performs zero control/audit writes, a malformed ack never returns 200, and promoted reports stay non-dispatchable |
+
+**STOP for Codex re-review.** Code+tests `66b38bc`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
