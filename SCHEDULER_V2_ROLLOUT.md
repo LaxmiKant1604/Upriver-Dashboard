@@ -4934,3 +4934,24 @@ PREPARED-UNAPPLIED).
 
 **STOP for Codex re-review.** Code+tests `64a0cc3`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migration 20260820 PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AN — Round-4 senior-review corrections (OFFLINE, 2026-08-20; code+tests `0c0ed70`; docs `<this commit>`; NOT deployed)
+
+Codex round-4 raised nine findings on Appendix AM; all fixed offline. `npm run verify` green — **55 steps /
+35 suites** (incl. `build:check`); `git diff --check` clean; migration 20260820 blob `d51a0c3f...`
+(PREPARED-UNAPPLIED).
+
+| # | Fix (proofs: hardening S1-S7 + strengthened R7/F10a; parity P3-P5) |
+|---|---|
+| 1 | Ads read state PRESERVED: typed `{rows, metricsRead}` per account (a thrown/limited/non-array read is `read-failed`/`limit-exceeded`, never `[]`+ok); metricsRead threads into `buildDailyAdsCoverage` so Daily's availability fails typed — no false zero Ads (S1, P5) |
+| 2 | EXACT TERMINAL policy auditing: final-policy-set enumeration per declared table (creates minus later drops); create-then-drop => `POLICY_DROPPED`; undeclared final policy => `POLICY_UNEXPECTED`; NEW `authenticatedAcl` audit — exact authenticated verb set (`AUTH_GRANT_MISSING`/`AUTH_GRANT_FORBIDDEN`, anon/public grants forbidden) (S6) |
+| 3 | GENUINE publication lineage: every durable shadow save records a REAL `sync_report_jobs` row (upsert → claim → validated success with the EXACT saver-computed `snapshot_params_hash`, production report key). Parity calls `contract.liveParams` and drives the REAL `publishSchedulerV2Snapshot` to `disposition:"published"` over the durable lineage; Brand View's ACTUAL inventory path (`buildBrandInventoryPayload`) consumes durable FBA rows (S2, P3, P4) |
+| 4 | COMPLETE preflight BEFORE the audit write: controls+paused, discovery, per-account coverage, catalog+FBA snapshots, validated membership, `report_sync_settings`, durable rollout — every later read failure is a typed refusal with ZERO writes (S3) |
+| 5 | UNIFORM `SOURCE_PAYLOAD_UNAVAILABLE`: unreadable loaders caught; missing/malformed/domain-invalid (unbuildable catalog brand maps; marketplace-invalid FBA rows) all STOP the bucket typed with a detail code, non-drained, LKG intact (S4; F10a strengthened to assert the stop) |
+| 6 | Deadline through EVERY persistence operation (per-account replace loop, FBA loop); mid-persistence expiry typed resumable; `deadlineReached` preserved with zero opened jobs (R2) |
+| 7 | STALE required catalog/FBA evidence BLOCKS readiness (`ready:false` asserted) AND its rows are DROPPED — never derivable (R7 strengthened) |
+| 8 | ATOMIC newer-or-equal-identical pointer CAS: new `record_source_snapshot` RPC (older ⇒ `stale-save` no-write; equal-identical ⇒ `unchanged`; equal-conflicting ⇒ `conflict` fail-closed; newer ⇒ replace); `source_snapshots` ACL tightened to SELECT-only; `snapshot-cas` structural proof + mutation regressions (S5) |
+| 9 | NONCANONICAL membership ids REJECTED (never trimmed) + DB constraint `source_batch_membership_account_canonical` in 20260820 (frozen 20260817 untouched) + `requiredStatements` audit (`STATEMENT_MISSING` on removal) (S7) |
+
+**STOP for Codex re-review.** Code+tests `0c0ed70`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migration 20260820 PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.

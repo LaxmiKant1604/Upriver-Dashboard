@@ -10307,3 +10307,19 @@ policy auditing + ACL/policy reconciliation. Hardening suite 29, parity suite 3;
 
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 26e63bc...) still
 PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
+
+## Round-4 senior-review corrections — OFFLINE on main 2026-08-20 (code+tests 0c0ed70, docs separate); verify green 55/35; NOT deployed
+
+Codex round-4 raised 9 findings on Appendix AM; all fixed offline (Appendix AN). Highlights: typed Ads
+metricsRead preserved end-to-end (no false zero Ads); exact TERMINAL policy enumeration + authenticated-
+grant auditing (create-then-drop/undeclared/widened all typed); GENUINE sync_report_jobs lineage per durable
+save (exact snapshot_params_hash; REAL publisher accepts to "published"; real buildBrandInventoryPayload
+consumes durable FBA rows); complete pre-audit endpoint preflight (controls/coverage/snapshots/membership/
+settings/rollout); uniform SOURCE_PAYLOAD_UNAVAILABLE incl. unreadable loaders + domain-invalid payloads
+(typed stop, non-drained, LKG intact); deadline through every persistence loop; stale required evidence
+BLOCKS readiness (ready:false) and is never derivable; atomic newer-or-equal-identical record_source_
+snapshot CAS (snapshots table SELECT-only); noncanonical membership ids rejected (never trimmed) + DB
+constraint + STATEMENT_MISSING audit. Hardening suite 36, parity 5; verify 55 steps / 35 suites.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob d51a0c3f...) still
+PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.
