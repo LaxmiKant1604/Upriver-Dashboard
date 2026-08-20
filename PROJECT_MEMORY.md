@@ -10217,3 +10217,55 @@ approval; dfca8f75 not resumed).
   tests proves its requirement), then committed code/tests (1c61c7c) then docs separately.
 
 STOP for Codex senior review. Offline only; not pushed; origin/main + the deployed production remain at 02c2ef5 (these commits are local-only); nothing deployed, scheduled, or resumed.
+
+## Source-first foundation + Daily/Brand View priority tranche — OFFLINE on main 2026-08-20 (7 code commits 83a088d..2227f16, docs separate); verify green 53/33; NOT deployed
+
+Authorized continuation from 65f5612 (Blockers 4a-4d were committed with their evidence in the COMMIT
+MESSAGES of 9fe7816/d56a38f/259d9f4/1fd0dfe/d086555/12a9a4c/d80ca0c/65f5612 — this log's prior entry ended at
+1c61c7c). Completed the offline source-level synchronization foundation + the first high-priority dashboard
+tranche (Daily Reporting, Brand View). Full evidence: SCHEDULER_V2_ROLLOUT.md Appendix AK.
+
+- 83a088d Phase 2: typed immutable SOURCE REGISTRY (16 families; ids/scope/grain/batching/downstream
+  dashboards/backfill+refresh policy/token class [premium = profit-by-sku-date, listings,
+  fba-inventory-health]/plan staticism/storage). Module-load cross-checks vs contracts/tranche order;
+  unregistered or contradictory dependency THROWS.
+- cbe33cf Phase 1: GLOBAL SOURCE-FAMILY FIXPOINT ORCHESTRATOR (source-fixpoint.js): graph planned FIRST;
+  one family at a time in SOURCE_TRANCHE_ORDER; per-family completion read DURABLY (a filtered tranche is
+  never globally drained); same-cycle bounded continuations + re-walks reach late-staged deps; >=60s
+  completion-anchored cooldown on an INJECTED clock/waiter (tests never sleep); REQUIRED-source failure
+  stops the bucket (other bucket independent). Engine: dispatcher tranche open-work probe + trancheDrained
+  (fixes staged units never executing under a tranche); Blocker-4d budget wiring live for statically
+  plannable tranches (frozen generic-unit ceilings; registry-priced; reserve-only creates).
+- b1fc163 Phase 3: DURABLE MODEL migration 20260820 (PREPARED, UNAPPLIED; schema-contract registered, audit
+  green): OLI full-grain history (corrections REPLACE), succeeded-only coverage, source_controls
+  (schedule_enabled DEFAULT FALSE), source_run_status, validated-only snapshots + wrappers (snapshot write
+  refuses non-validated evidence pre-HTTP). Pure policy: 420d backfill / 7d rolling, gap-only slices,
+  member-subset batch exports, once-daily snapshots. brand-resolution.js: ASIN wins; unique-SKU fallback;
+  conflicting/blank UNMAPPED; "Unassigned" never a real brand.
+- e96613c Phases 3-4: BUCKET SOURCE SYNC (one operator action per bucket; 30=>6/31=>7 stable batches, no
+  reshuffle; slice exports scoped to exactly the missing members — new accounts backfill SOLO; slice hashes
+  BYTE-IDENTICAL to the five OLI reports' canonical fragment => one export many owners; durable org-wide
+  catalog = NEW versioned source-catalog:durable-v1, the only catalog spec fetching sku — golden hashes
+  untouched; FBA premium snapshots; success-only durable persistence) + DURABLE DASHBOARDS (Daily+Brand View
+  fold ONE OLI/catalog evidence set; Daily=campaign Ads grain, Brand View=ASIN grain; wrong grain THROWS;
+  Ads gaps degrade, never block sales).
+- 0b24a39 Phase 5: DATA SYNC CENTER SOURCE CARDS (exact reviewed field set incl. creates/tokens vs ceiling +
+  Used-by beneath Last success; Pause/Resume preserves durable data + LKG; per-card Sync-missing-data scoped
+  via onlySourceKey, paused unforceable, coverage-driven so proven history never re-exports) + READ-ONLY
+  Daily/Brand View readiness summary; api/admin/sources.js (admin+audit+rate-limit); report toggles retained.
+- 5a37451 Phase 6: INERT SCHEDULE (non-US 07:30 IST/02:00 UTC; US 16:00 IST/10:30 UTC; marketplace-local
+  latest COMPLETED day, conservative standard offsets, bucket minimum; typed chain schedule-disabled-by-
+  DEFAULT/not-due/overlap/already-ran-today=completion/completion-anchored cooldown/launch; NO cron, NO
+  timer, 5s poll policy pinned).
+- 2227f16 Phase 7: ZERO-EXPORT REHEARSAL — full priority workflow with reuseOnly + throwing tripwire proves
+  ALL 18 reviewed requirements (zero create/poll/download; atomic adoption; MISSING_REUSABLE_SOURCE;
+  6/7-batch stability; 1-canonical-job/5-owners; shared evidence; seller isolation; org catalog unfiltered;
+  brand rules; missing/rolling-only day 2; correction upsert; grain separation; pause preserves data; fake-
+  clock cooldown; failure blocks publication + preserves LKG; nothing published/scheduled).
+- Verification loop per commit + final: focused suites, node --check on every changed JS/MJS, npm run verify
+  (final: 53 steps / 33 suites incl build:check), git diff --check clean, senior diff review each commit.
+- Migration 20260820 is PREPARED and explicitly UNAPPLIED (single-file Gate after approval). Org token
+  balance is still 0 (BLOCKED_NO_TOKENS) — irrelevant offline, must be fixed before any live confirmation.
+
+STOP for Codex senior review. Offline only; NOT pushed (origin/main + production remain at 02c2ef5); no
+migration applied; no DataDoe/Supabase/production call; dfca8f75 untouched; nothing published or scheduled.

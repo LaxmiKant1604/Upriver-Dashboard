@@ -4850,3 +4850,39 @@ ONLY by `export_id IS NULL AND cache_object_path IS NOT NULL`. Proven by test 4 
 
 **STOP for Codex senior review.** Code+tests `1c61c7c`, docs `<this commit>`; **not pushed** — `origin/main` and the
 deployed production remain at `02c2ef5`; nothing deployed, scheduled, or resumed.
+
+## Appendix AK — Source-first foundation + Daily/Brand View priority tranche (OFFLINE, 2026-08-20; 7 code commits `83a088d`..`2227f16`; docs `<this commit>`; NOT deployed)
+
+### AK.1 Scope + authorization
+Authorized continuation from `65f5612` (Blockers 4a-4d complete): finish the offline source-level
+synchronization foundation and the first high-priority dashboard tranche (Daily Reporting + Brand View),
+WITHOUT touching production, DataDoe, Supabase, deploys, controls, crons, or the halted cycle `dfca8f75`.
+Everything below is offline (injected fakes, reuseOnly + create-export tripwire), committed locally, unpushed.
+`npm run verify` green — **53 steps / 33 suites** (incl. `build:check`); `git diff --check` clean.
+
+### AK.2 The seven commits
+| Commit | Phase | What |
+|---|---|---|
+| `83a088d` | 2 | **Source dependency registry** (`source-registry.js`): 16 typed immutable records (12 fetched + 4 durable-Ads families) — DataDoe id, seller/org scope, grain, batching rules, downstream reports+dashboards, backfill/refresh policy, token class (premium EXACTLY profit-by-sku-date/listings/fba-inventory-health), plan staticism, storage strategy. Module-load cross-checks vs SOURCE_CONTRACTS / REPORT_SOURCE_REQUIREMENTS / SELLER_SCOPED_REQUEST_KEYS / SOURCE_TRANCHE_ORDER; ANY unregistered or contradictory dependency THROWS. |
+| `cbe33cf` | 1 | **Global source-family fixpoint orchestrator** (`source-fixpoint.js`): plans the complete graph FIRST, walks SOURCE_TRANCHE_ORDER one family at a time (durable per-family completion, never a narrowed pass's `drained`), re-enters the SAME (bucket, cycle_date) cycle across bounded continuations + bounded re-walks (staged deps that surface late), completion-anchored >=60s cooldown on an injected clock/waiter, REQUIRED-source failure stops the bucket, typed stall/exhaustion stops. Engine wiring (additive, null byte-identical): dispatcher tranche-scoped open-work continuation probe + `trancheDrained`; Blocker-4d budget wiring (generic-unit ceilings frozen per (cycle, tranche#generic) via `budgetPlanner`; `makeSupabaseSourceStore` gains the budget wrappers). |
+| `b1fc163` | 3 | **Durable model**: migration `20260820_source_durable_model.sql` (PREPARED, UNAPPLIED; registered in schema-contract; audit green) — OLI history at full-grain PK (corrections REPLACE), succeeded-only coverage, source_controls (pause + `schedule_enabled default false`), source_run_status, validated-only source_snapshots. Wrappers (typed schema-missing vs failed; snapshot wrapper REFUSES non-validated evidence pre-HTTP). Pure policy: 420d backfill / 7d rolling windows, gap-only slice planning, per-slice member-subset batching, fragment->history attribution, once-daily snapshot decisions. `brand-resolution.js`: ASIN wins; unique-SKU fallback; conflicting/blank UNMAPPED; "Unassigned" never a real brand. |
+| `e96613c` | 3-4 | **Bucket source sync + durable dashboards**: `source-bucket-sync.js` — ONE operator action per bucket; stable <=5-account batches (30=>6, 31=>7, no reshuffle); OLI slice exports scoped to exactly the members missing each slice (new account backfills SOLO); slice hashes BYTE-IDENTICAL to the five OLI reports' canonical fragment (one export, many owners; synthetic `source-sync` owner family); durable org-wide catalog = NEW versioned request `source-catalog:durable-v1` (the only catalog spec fetching `sku`; golden hashes untouched); FBA per-account premium-priced snapshots; families one at a time with frozen ceilings + cooldown + required-failure stop; durable persistence success-only. `durable-dashboards.js` — Daily + Brand View fold ONE OLI/catalog evidence set; Daily reads the CAMPAIGN Ads grain, Brand View the ASIN grain; the wrong grain THROWS; Ads gaps degrade, never block sales. |
+| `0b24a39` | 5 | **Data Sync Center source cards** (`source-status.js`, `api/admin/sources.js`, rewritten `DataSyncCenter.jsx`): one card per family with the exact reviewed field set + Pause/Resume + per-card "Sync missing data" (`source-bucket-sync-runtime.js`, zero-I/O composition, `onlySourceKey` scoping, paused sources unforceable); READ-ONLY readiness summary (blocking vs degrading per Ads grain); report-level schedule toggles retained in a legacy section. |
+| `5a37451` | 6 | **Inert schedule** (`source-schedule.js`): Non-US 07:30 IST / 02:00 UTC, US 16:00 IST / 10:30 UTC; marketplace-local latest COMPLETED day (conservative standard-time offsets; bucket = minimum); typed decision chain (schedule-disabled DEFAULT / not-due / overlap / already-ran-today=COMPLETION / completion-anchored cooldown / launch). No cron, no timer, no transport import; 5s poll policy pinned unchanged. |
+| `2227f16` | 7 | **Zero-export rehearsal** (`zero-export-rehearsal.test.js`): the full priority workflow with reuseOnly + a THROWING tripwire, proving all 18 reviewed requirements (see the commit message / suite header for the enumerated list). |
+
+### AK.3 Invariants preserved (NOT weakened)
+Golden request hashes byte-identical (the durable catalog is a NEW versioned request; the OLI slice/FBA
+requests reuse the existing canonical specs exactly — hash equality proven by test). One-create-per-hash,
+export-id resume, cache-adoption CAS, owner-identity isolation, marketplace evidence, LKG preservation,
+Scheduler v1, live snapshots, HANDOFF.md/.worktrees untouched. sourceTranche=null paths byte-identical
+(entire pre-existing suite green under the engine edits).
+
+### AK.4 Residual items for Codex senior review
+1. **Unapplied migration**: `20260820_source_durable_model.sql` needs its reviewed single-file Gate before any durable write path can function (until then the endpoint reads typed schema-missing and POST fails closed).
+2. **DataDoe contract question (open from AJ.7)**: no endpoint is known that returns an export's full original request parameters, so manual/UI-export adoption stays UNSUPPORTED.
+3. **Brand View country/name dimension**: the durable model records the mission's canonical account/date/SKU/ASIN/currency grain; per-country display derives from the account directory (an account is one marketplace). If a seller id ever spans marketplaces inside one account, a reviewed grain extension (new versioned request) would be needed.
+4. **US/CA timezone floor**: the schedule pins US/CA to Pacific standard time (conservative). Confirm against DataDoe's per-seller local fetch clocks before enablement.
+5. **Org token balance is 0** (BLOCKED_NO_TOKENS): nothing here spends tokens, but any live confirmation after review requires the balance fixed at app.datadoe.com/organization.
+
+**STOP for Codex senior review.** 7 local commits + this docs commit; NOT pushed; production stays on `02c2ef5`; no migration applied; nothing scheduled, published, or resumed.
