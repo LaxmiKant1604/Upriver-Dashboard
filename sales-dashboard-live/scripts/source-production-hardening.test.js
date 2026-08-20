@@ -60,6 +60,17 @@ function makeStore() {
   const rjKey = (c, rk, a) => c + "|" + rk + "|" + a;
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
   const bkey = (cid, tk) => cid + "|" + tk;
+  // Round-6 fix 1: model Migration 5 reject_append_to_terminal_cycle FAITHFULLY -- EVERY child
+  // insert/update (source jobs, owner memberships, report jobs) on a terminal parent cycle RAISES,
+  // exactly as the production trigger does. A fake that permitted terminal appends would hide the very
+  // defect the shared-cycle finalization fix exists to prevent.
+  const guardAppend = (cycleId) => {
+    const c = findCycle(cycleId);
+    if (!c) throw new Error("parent sync cycle " + cycleId + " not found; refusing to append/alter child work");
+    if (["succeeded", "partial", "failed"].includes(c.status)) {
+      throw new Error("sync cycle " + cycleId + " is terminal (" + c.status + "); refusing to append/alter child work");
+    }
+  };
   const store = {
     _cache: cache,
     _opens: 0,
@@ -72,6 +83,7 @@ function makeStore() {
     claimCycle(id) { const c = findCycle(id); if (c && c.status === "pending") { c.status = "running"; return true; } return false; },
     getCycle(id) { return findCycle(id); },
     upsertSourceJob(job) {
+      guardAppend(job.cycleId);
       const m = jobsByCycle.get(job.cycleId);
       if (m.has(job.requestHash)) return;
       m.set(job.requestHash, {
@@ -83,6 +95,7 @@ function makeStore() {
     listSourceJobs(id) { return [...((jobsByCycle.get(id) && jobsByCycle.get(id).values()) || [])].map((j) => ({ ...j })); },
     upsertSourceJobOwners(ms) {
       for (const m of ms || []) {
+        guardAppend(m.cycleId);
         if (!ownersByCycle.has(m.cycleId)) ownersByCycle.set(m.cycleId, new Map());
         ownersByCycle.get(m.cycleId).set(m.ownerId + "|" + m.requestHash, {
           cycle_id: m.cycleId, request_hash: m.requestHash, owner_id: m.ownerId, request_key: m.requestKey,
@@ -92,14 +105,18 @@ function makeStore() {
       }
     },
     listSourceJobOwners(cid, ids) { const s = new Set(ids || []); return ownerRows(cid).filter((m) => s.has(m.owner_id)).map((m) => ({ ...m })); },
+    // Round-6 fix 5: EVERY owner membership of the cycle -- the authoritative account<->hash ownership
+    // the account-exact depends_on is built from.
+    listCycleOwners(cid) { return ownerRows(cid).map((m) => ({ ...m })); },
     recordSourceOwnerStale() {},
     claimExportAttempt(id, h) {
+      guardAppend(id);
       const j = jobsByCycle.get(id) && jobsByCycle.get(id).get(h);
       if (j && j.fetch_status === "pending" && j.attempted_at === null) { j.attempted_at = "t"; j.create_export_count += 1; j.fetch_status = "attempted"; return true; }
       return false;
     },
     adoptSourceCache() { return "cache-changed"; },
-    recordExportCreated({ cycleId, requestHash, exportId }) { jobsByCycle.get(cycleId).get(requestHash).export_id = exportId; },
+    recordExportCreated({ cycleId, requestHash, exportId }) { guardAppend(cycleId); jobsByCycle.get(cycleId).get(requestHash).export_id = exportId; },
     loadSourceRows(h) { const e = cache.get(h); return e ? { ...e } : null; },
     saveSourceRows({ job, rows, payloadBytes }) {
       const h = job.request_hash != null ? job.request_hash : job.requestHash;
@@ -112,9 +129,11 @@ function makeStore() {
       return objectPath;
     },
     recordSourceSuccess({ cycleId, requestHash, exportId, rowCount, cacheObjectPath }) {
+      guardAppend(cycleId);
       Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "succeeded", export_id: exportId, row_count: rowCount, cache_object_path: cacheObjectPath });
     },
     recordSourceFailure({ cycleId, requestHash, stage, code, terminal }) {
+      guardAppend(cycleId);
       Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "failed", error_stage: stage, error_code: code, terminal: !!terminal });
     },
     updateCycleCounts() {},
@@ -146,6 +165,7 @@ function makeStore() {
        validated success) + the reviewed finalize_sync_cycle terminal lifecycle. */
     _reportJobs: reportJobs,
     upsertReportJob(j) {
+      guardAppend(j.cycleId);
       const k = rjKey(j.cycleId, j.reportKey, j.accountId);
       if (reportJobs.has(k)) return;
       reportJobs.set(k, {
@@ -155,11 +175,13 @@ function makeStore() {
       });
     },
     claimReportDerive(cycleId, reportKey, accountId) {
+      guardAppend(cycleId);
       const r = reportJobs.get(rjKey(cycleId, reportKey, accountId));
       if (r && r.derive_status === "pending") { r.derive_status = "running"; return true; }
       return false;
     },
     recordReportSuccess(j) {
+      guardAppend(j.cycleId);
       const r = reportJobs.get(rjKey(j.cycleId, j.reportKey, j.accountId));
       Object.assign(r, {
         derive_status: "succeeded", save_status: "succeeded", validated: true,
@@ -265,13 +287,13 @@ function makeHarness(over = {}) {
       durableCoverage.push({ accountId, from: coveredFrom, to: coveredTo });
       return { write: "ok", replaced: 0, inserted: rows.length };
     }),
-    saveSnapshotPayload: async ({ sourceKey, scopeKey, rows }) => {
+    saveSnapshotPayload: over.saveSnapshotPayload || (async ({ sourceKey, scopeKey, rows }) => {
       const objectPath = `source-snapshots/v1/${sourceKey}/${scopeKey}.json`;
       snapStore.set(objectPath, { rows: [...rows] });
       return { objectPath, payloadBytes: JSON.stringify({ rows }).length };
-    },
+    }),
     loadSnapshotPayload: async (objectPath) => snapStore.get(objectPath) || null,
-    recordSnapshot: async (s) => { recorded.snapshots.push(s); return { write: "ok" }; },
+    recordSnapshot: over.recordSnapshot || (async (s) => { recorded.snapshots.push(s); return { write: "ok", ack: "replaced" }; }),
     loadHistoryRows: over.loadHistoryRows || (async () => [...durableHistory.values()].map((r) => ({
       account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin,
       currency: r.currency, sales_amount: r.salesAmount, units: r.units,
@@ -956,22 +978,34 @@ test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the
     assert.deepEqual(ops, ["upsert", "claim", "save", "success"], s.reportKey + "/" + s.accountId + ": the claim is held BEFORE the save, success only after it");
     assert.equal(seq[1].claim, true, "claim === true STRICTLY before any save");
   }
-  // (b) depends_on binds each job to the EXACT authoritative source request hashes of THIS cycle.
+  // (b) depends_on binds each job to the EXACT authoritative source request hashes ITS OWN ACCOUNT owns
+  // (round-6 fix 5): the account's batch OLI hashes + its own FBA hash + the shared organization catalog.
   const jobRows = h.store.listSourceJobs(rollup.cycleId);
-  const hashesOf = (families) => jobRows.filter((r) => r.fetch_status === "succeeded" && families.includes(r.source_key)).map((r) => r.request_hash).sort();
-  const oliCatalog = hashesOf(["order-line-items", "product-catalog"]);
-  const withFba = hashesOf(["order-line-items", "product-catalog", "fba-inventory-health"]);
-  assert.ok(oliCatalog.length >= 1, "authoritative succeeded source hashes exist");
-  for (const u of h.recorded.lineage.filter((l) => l.op === "upsert")) {
-    const want = u.reportKey === "brand-inventory" ? withFba : oliCatalog;
-    assert.deepEqual([...u.dependsOn].sort(), want, u.reportKey + ": depends_on is the EXACT succeeded source request hash set");
+  const owners = h.store.listCycleOwners(rollup.cycleId);
+  const succeededByHash = new Map(jobRows.filter((r) => r.fetch_status === "succeeded").map((r) => [r.request_hash, r.source_key]));
+  const ownedBy = (aid) => new Set(owners.filter((o) => o.account_id === aid || o.account_id === "__organization").map((o) => o.request_hash));
+  const expectFor = (aid, families) => [...succeededByHash].filter(([hash, sk]) => families.includes(sk) && ownedBy(aid).has(hash)).map(([hash]) => hash).sort();
+  const upserts = h.recorded.lineage.filter((l) => l.op === "upsert");
+  assert.ok(upserts.length >= 3, "lineage rows upserted");
+  for (const u of upserts) {
+    const fams = u.reportKey === "brand-inventory"
+      ? ["order-line-items", "product-catalog", "fba-inventory-health"]
+      : ["order-line-items", "product-catalog"];
+    const want = expectFor(u.accountId, fams);
+    assert.ok(want.length >= 1, u.reportKey + "/" + u.accountId + ": authoritative owned hashes exist");
+    assert.deepEqual([...u.dependsOn].sort(), want, u.reportKey + "/" + u.accountId + ": depends_on is the EXACT account-owned succeeded hash set");
   }
-  // (c) the REVIEWED terminal lifecycle: the runtime finalized its full-scope cycle -- the STORE's cycle
-  // row carries the terminal status; nothing here fabricates it.
-  assert.equal(rollup.finalized, true);
-  assert.equal(rollup.cycleStatus, "succeeded");
-  assert.equal(h.store.getCycle(rollup.cycleId).status, "succeeded", "the terminal status lives in the durable cycle row");
+  // (c) round-6 fix 1: the SOURCE runtime never terminalizes the SHARED cycle -- the cycle stays running
+  // after a full source-card run (an honest READ, no write). The reviewed terminal lifecycle belongs to the
+  // CANONICAL SCHEDULED dispatcher's complete-scope close (the guarded finalize primitive) -- invoked here
+  // exactly as the dispatcher invokes it once the whole scope is drained. Nothing fabricates a status.
+  assert.equal(rollup.finalized, false, "the source runtime did NOT finalize the shared cycle");
+  assert.equal(rollup.cycleStatus, "running", "the shared cycle honestly stays running after a source-only run");
+  assert.equal(h.store.getCycle(rollup.cycleId).status, "running");
   assert.ok(rollup.derived.lineage.every((l) => l.outcome === "recorded"), "no lost claims in a single-worker run");
+  const closed = h.store.finalizeCycle({ cycleId: rollup.cycleId }); // the dispatcher-owned reviewed close
+  assert.equal(closed.disposition, "finalized", "the complete drained scope finalizes atomically");
+  assert.equal(closed.cycle.status, "succeeded", "the terminal status comes from the guarded primitive's own counters");
   // (d) the ACTUAL runtime-produced job + cycle pass the REAL composed publisher. Every value the publisher
   // validates (validated/derive/save/cycle_status/snapshot_params_hash/params/payload) is read from the
   // harness rows the RUNTIME wrote -- the test fabricates NOTHING.
@@ -1001,9 +1035,12 @@ test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the
 });
 
 test("T2. blocker 1: idempotent RESUME (a fresh invocation loses the claim and changes nothing) and CONCURRENCY (a lost claim never records success; the cycle honestly stays open)", async () => {
-  // (a) idempotent resume over the SAME completed cycle.
+  // (a) idempotent resume over the SAME still-running cycle (round-6 fix 1: the source runtime never
+  // terminalizes it, so the resume appends/replays WITHOUT tripping the Migration-5 append guard).
   const h = fullFixture();
-  await h.runtime.run({ bucket: "us", today: TODAY });
+  const r1 = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.finalized, false, "run 1 did not terminalize the shared cycle");
+  assert.equal(r1.cycleStatus, "running");
   const saves1 = h.recorded.shadowSaves.length;
   const successes1 = h.recorded.lineage.filter((l) => l.op === "success").length;
   const creates1 = h.dd.totalCreates();
@@ -1012,7 +1049,7 @@ test("T2. blocker 1: idempotent RESUME (a fresh invocation loses the claim and c
   assert.equal(h.recorded.shadowSaves.length, saves1, "no duplicate shadow save: the resume LOSES every claim");
   assert.equal(h.recorded.lineage.filter((l) => l.op === "success").length, successes1, "no duplicate success");
   assert.ok(r2.derived.lineage.length >= 1 && r2.derived.lineage.every((l) => l.outcome === "claim-lost"), "every resume claim is typed claim-lost");
-  assert.equal(r2.cycleStatus, "succeeded", "already-terminal cycle status is REPORTED, not re-fabricated");
+  assert.equal(r2.cycleStatus, "running", "the shared cycle STILL is not terminalized by any source-only run");
   // (b) concurrency: a racer wins the daily/A01 claim (and never completes it).
   const store2 = makeStore();
   let raced = false;
@@ -1034,8 +1071,13 @@ test("T2. blocker 1: idempotent RESUME (a fresh invocation loses the claim and c
   assert.equal(lost.validated, false, "success is NEVER recorded after a lost claim");
   assert.equal(lost.derive_status, "running", "the job stays with its claim winner");
   assert.ok(r3.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "claim-lost"), "typed claim-lost outcome");
-  assert.equal(r3.cycleStatus, "running", "an open (claimed elsewhere) report job keeps the cycle honestly NON-terminal (open-work)");
+  assert.equal(r3.cycleStatus, "running", "the cycle honestly stays NON-terminal");
   assert.equal(r3.finalized, false);
+  // Even the dispatcher-owned close refuses while the raced job is still open: the guarded primitive
+  // returns open-work -- the cycle can NEVER be claimed terminal around an in-flight claim.
+  const attempt = store2.finalizeCycle({ cycleId: r3.cycleId });
+  assert.equal(attempt.disposition, "open-work", "finalize refuses while a claimed report job is open");
+  assert.equal(store2.getCycle(r3.cycleId).status, "running");
 });
 
 test("T3. blocker 2: the durable FBA evidence reaches Brand View through its REAL read path (buildAccountBrandSlice -> compact snapshot gate), not a direct builder call", async () => {
@@ -1216,6 +1258,312 @@ test("T7. blocker 6: strict CAS acknowledgements (exactly replaced|unchanged|sta
   assert.ok(swallowed.blockers.some((b) => b.code === "SNAPSHOT_CAS_EXCEPTION_SWALLOWED"), JSON.stringify(swallowed.blockers.map((b) => b.code)));
   const noRaceHandler = auditWith((sql) => sql.replace("exception when unique_violation then", "exception when foreign_key_violation then"));
   assert.ok(noRaceHandler.blockers.some((b) => b.code === "SNAPSHOT_CAS_CONCURRENT_INSERT_UNPROVEN"), JSON.stringify(noRaceHandler.blockers.map((b) => b.code)));
+});
+
+/* ================================= U. round-6 regressions ================================= */
+group("U. round-6: shared-cycle finalization, stale CAS winners, brand-inventory promotion, real route deadline, account-exact lineage, PG17 ACLs");
+
+test("U1. fix 1: no source run terminalizes the SHARED cycle; later report runs append; same-day replay works; the DISPATCHER close is atomic and the Migration-5 guard then holds", async () => {
+  // (a) a FULL source run leaves the shared (bucket, cycle_date) cycle RUNNING; a narrowed source-card
+  // action never finalizes either.
+  const h = fullFixture();
+  const full = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(full.stopped, false, JSON.stringify(full.stopReason));
+  assert.equal(full.finalized, false, "a full source run never finalizes the shared cycle");
+  assert.equal(full.cycleStatus, "running");
+  const card = await h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "product-catalog" });
+  assert.equal(card.finalized, false, "a source-card run never finalizes");
+  assert.notEqual(card.cycleStatus, "succeeded");
+  // (b) a LATER report run on the SAME bucket/date can append + complete (Migration-5 guard passes on the
+  // running cycle): model the tranche appending its own source + report work to the same cycle.
+  const cycleId = full.cycleId;
+  assert.ok(cycleId, "the shared cycle exists");
+  h.store.upsertSourceJob({ cycleId, requestHash: "later_report_source_h1", requestKey: "keyword-rank:serp", sourceId: 9, sourceKey: "keyword-rank-serp", connectionId: "primary", organizationFingerprint: identity.organizationFingerprint(PRIM_KEY), accountScopeHash: "scope1" });
+  h.store.recordSourceSuccess({ cycleId, requestHash: "later_report_source_h1", exportId: "e9", rowCount: 1, cacheObjectPath: "p" });
+  h.store.upsertReportJob({ cycleId, reportKey: "keyword-rank", reportVersion: "kr/v1", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: ["later_report_source_h1"] });
+  assert.equal(h.store.claimReportDerive(cycleId, "keyword-rank", "A01"), true, "the later report run claims on the RUNNING cycle");
+  h.store.recordReportSuccess({ cycleId, reportKey: "keyword-rank", accountId: "A01", snapshotParamsHash: "kr_hash" });
+  // (c) a SAME-DAY source-card replay succeeds -- the append guard never fires because nothing terminalized.
+  const replay = await h.runtime.runSourceCardAction({ bucket: "us", sourceKey: "product-catalog" });
+  assert.equal(replay.stopped === true, false, "the same-day replay ran without violating reject_append_to_terminal_cycle");
+  // (d) the SCHEDULED complete-scope close stays correct + atomic: finalize -> terminal; a second close is
+  // idempotent already-terminal; and ONLY THEN does the Migration-5 guard reject appends.
+  const closed = h.store.finalizeCycle({ cycleId });
+  assert.equal(closed.disposition, "finalized");
+  assert.ok(["succeeded", "partial"].includes(closed.cycle.status));
+  assert.equal(h.store.finalizeCycle({ cycleId }).disposition, "already-terminal", "idempotent");
+  assert.throws(() => h.store.upsertSourceJob({ cycleId, requestHash: "post_terminal_h", requestKey: "x", sourceId: 1, sourceKey: "order-line-items", connectionId: "primary", organizationFingerprint: "o", accountScopeHash: "s" }), /terminal/, "the modeled Migration-5 guard rejects post-terminal appends");
+  assert.throws(() => h.store.claimReportDerive(cycleId, "keyword-rank", "A01"), /terminal/, "post-terminal child UPDATES are rejected too");
+  // (e) no fabricated status / trigger bypass: the runtime only ever REPORTED the store's own status.
+  assert.equal(h.store.getCycle(cycleId).status, closed.cycle.status);
+});
+
+test("U2. fix 2: a CAS-losing candidate NEVER feeds derivation -- stale-save adopts the hydrated WINNER; an unreadable winner stops typed with LKG intact; unchanged accepts proven-identical content", async () => {
+  // (a) stale-save: a NEWER concurrent catalog save won the pointer. The candidate (dd-fetched, brand
+  // "Acme") loses; the WINNER (brand "WinnerBrand") must be what derivation consumes.
+  const winnerPath = "source-snapshots/v1/product-catalog/winner.json";
+  let staleServed = false;
+  const h = makeHarness({
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey, scopeKey }) => {
+      if (sourceKey === "product-catalog") {
+        // BEFORE the sync's save: absent (so the sync plans the catalog fetch). AFTER the CAS returned
+        // stale-save: the WINNING pointer.
+        return staleServed
+          ? { snapshot: { validated_at: TODAY + "T09:00:00Z", object_path: winnerPath, row_count: 1 }, read: "ok", error: null }
+          : { snapshot: null, read: "ok", error: null };
+      }
+      return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null };
+    },
+    recordSnapshot: async (s) => {
+      if (s.sourceKey === "product-catalog") { staleServed = true; return { write: "ok", ack: "stale-save" }; }
+      return { write: "ok", ack: "replaced" };
+    },
+  });
+  h.snapStore.set(winnerPath, { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "WinnerBrand" }] });
+  for (const a of ["A01", "A02"]) {
+    h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + a + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
+  }
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.derived.skipped, null, "the derive ran on the WINNER evidence");
+  const sales = h.recorded.shadowSaves.find((s) => s.reportKey === "scheduler-v2/brand-sales" && s.accountId === "A01");
+  assert.ok(sales, "brand-sales derived");
+  assert.equal(sales.payload.asinBrand.B0A, "WinnerBrand", "derivation consumed the CAS WINNER's catalog");
+  for (const save of h.recorded.shadowSaves) {
+    assert.ok(!JSON.stringify(save.payload).includes("Acme"), "the LOSING candidate rows never reach any report payload");
+  }
+  // (b) an UNREADABLE winner: stale-save whose winning pointer cannot be hydrated -> typed stop, ZERO
+  // report saves (LKG preserved), never a silent fold of the loser.
+  const h2 = makeHarness({
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: null, read: "ok", error: null } // pointer read after stale-save ALSO returns null => winner vanished
+      : { snapshot: null, read: "ok", error: null }),
+    recordSnapshot: async (s) => (s.sourceKey === "product-catalog" ? { write: "ok", ack: "stale-save" } : { write: "ok", ack: "replaced" }),
+  });
+  await assert.rejects(() => h2.runtime.run({ bucket: "us", today: TODAY }), (e) => e.code === "SOURCE_SNAPSHOT_STALE_WINNER_UNREADABLE", "unreadable winner fails closed typed");
+  assert.equal(h2.recorded.shadowSaves.length, 0, "no report was saved from the losing candidate");
+  // (c) unchanged: the CAS PROVED the existing pointer identical (same content sha + path) -- the candidate
+  // content is authoritative and derivation proceeds.
+  const h3 = fullFixture({
+    recordSnapshot: async () => ({ write: "ok", ack: "unchanged" }),
+  });
+  const r3 = await h3.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r3.stopped, false);
+  assert.equal(r3.derived.skipped, null, "proven-identical content derives normally");
+});
+
+test("U3. fix 3: brand-inventory promotes through the REAL publisher composition to its EXACT live identity; live buildAccountBrandSlice reads the PROMOTED row with NO key remapping", async () => {
+  const h = fullFixture();
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.derived.brandInventory.saved >= 1, true, JSON.stringify(rollup.derived.brandInventory));
+  h.store.finalizeCycle({ cycleId: rollup.cycleId }); // the dispatcher-owned reviewed complete-scope close
+  const pubMod = await import("../lib/server/sync/publisher-composition.js");
+  const liveRows = new Map(); // the LIVE report_snapshots natural-key model: report_key|account_id
+  const publisher = pubMod.buildSchedulerV2Publisher({
+    // NO codeReadyKeys override: the PRODUCTION default must include brand-inventory -- this test FAILS if
+    // the key is unknown, code-locked, or unpublishable.
+    connections: CONNS,
+    fetchAccounts: async (apiKey) => (apiKey === PRIM_KEY ? [dirAccount("A01"), dirAccount("A02")] : [dirAccount("B01")]),
+    getSettings: async () => [{ report_key: "brand-inventory", schedule_enabled: true }, { report_key: "brand-sales", schedule_enabled: true }],
+    getAccountRollout: async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] }),
+    getApproval: async () => ({ read: "ok", approved: true }), // the explicit audited per-(report, account) approval
+    getJob: async (rk, a) => {
+      const j = h.store.getReportJob(rk, a);
+      return j ? { ...j, cycle_status: h.store.getCycle(j.cycle_id).status } : null;
+    },
+    getSnapshot: async ({ reportKey, accountId, paramsHash }) => {
+      const sv = h.recorded.shadowSaves.find((x) => x.reportKey === reportKey && x.accountId === accountId && x.paramsHash === paramsHash);
+      return sv ? { params_hash: sv.paramsHash, params: sv.params, payload: sv.payload, payload_storage_path: null, source_refreshed_at: sv.sourceRefreshedAt } : null;
+    },
+    loadStoragePayload: async () => null,
+    publishLive: async (args) => {
+      liveRows.set(args.reportKey + "|" + args.accountId, {
+        report_key: args.reportKey, params: args.params, params_hash: args.paramsHash,
+        payload: args.payload, source_refreshed_at: args.sourceRefreshedAt,
+      });
+      return { outcome: "inserted" };
+    },
+  });
+  const resInv = await publisher.publish("brand-inventory", "A01");
+  assert.equal(resInv.disposition, "published", JSON.stringify(resInv) + " -- brand-inventory must not be unknown/code-locked/unpublishable");
+  assert.equal(resInv.liveReportKey, "brand-inventory", "the EXACT live report key");
+  assert.equal((await publisher.publish("brand-sales", "A01")).disposition, "published");
+  const liveInv = liveRows.get("brand-inventory|A01");
+  assert.equal(liveInv.params.reportVersion, "brand-inventory-shared-v1", "the EXACT live shared version");
+  assert.deepEqual(Object.keys(liveInv.params).sort(), ["reportVersion", "to"], "the EXACT live params contract ({ to })");
+  assert.equal(liveInv.params.to, ASOF);
+  // LIVE read path: buildAccountBrandSlice reads the PROMOTED PRODUCTION rows by their PLAIN live report
+  // keys (getLatestReportSnapshot semantics) -- no scheduler-v2/ remapping anywhere in the reader.
+  const bv = await import("../lib/server/reports/brand-view.js");
+  const liveReader = async ({ reportKey, accountId }) => liveRows.get(reportKey + "|" + accountId) || null;
+  const slice = await bv.buildAccountBrandSlice({ accountId: "A01", brand: "Acme", asOf: ASOF, account: { name: "Acct A01", country: "US" }, getSnapshot: liveReader, getAdsRows: async () => [] });
+  assert.equal(slice.inventory.scope, "country", "the compact gate accepted the PROMOTED live row");
+  assert.equal(slice.inventory.accountTotal, 5, "the durable FBA quantity arrived via the LIVE row");
+  assert.equal(slice.inventoryDate, ASOF);
+  // Structural: the promoted key is NOT dispatchable -- even a durable enable row selects nothing, and no
+  // dispatcher/source-runtime path publishes automatically.
+  const controls = await import("../lib/server/sync/report-controls.js");
+  const dispatch = await import("../lib/server/sync/sync-dispatch.js");
+  assert.ok(!controls.CONTROLLED_REPORT_KEYS.includes("brand-inventory"), "brand-inventory is NOT a controlled (dispatchable) report");
+  assert.ok(controls.SOURCE_PROMOTED_REPORT_KEYS.includes("brand-inventory"), "brand-inventory is an explicit source-promoted key");
+  const sel = dispatch.selectSchedulerV2ReportKeys({ settings: [{ report_key: "brand-inventory", schedule_enabled: true }] });
+  assert.ok(!sel.requested.includes("brand-inventory") && !sel.readySet.has("brand-inventory"), "a durable enable row alone can never schedule the promoted key");
+});
+
+test("U4. fix 4: AbortSignal reaches the REAL HTTP wrapper; before-request expiry runs nothing; in-flight write expiry is commit-unknown; no ghost write after the handler returns", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  // (a) the route signal object reaches globalThis.fetch for REST and Storage wrappers.
+  const realFetch = globalThis.fetch;
+  const seenSignals = [];
+  const ctrl = new AbortController();
+  try {
+    globalThis.fetch = async (url, init) => { seenSignals.push(init && init.signal); return { ok: true, status: 200, json: async () => [], text: async () => "[]" }; };
+    await sb.getSourceControls({ signal: ctrl.signal });
+    await sb.saveSourceSnapshotPayload({ organizationFingerprint: "org1", sourceKey: "product-catalog", scopeKey: "__organization", rows: [], signal: ctrl.signal });
+    assert.ok(seenSignals.length >= 2 && seenSignals.every((s) => s === ctrl.signal), "the SAME AbortSignal reached the real fetch for REST + Storage");
+  } finally { globalThis.fetch = realFetch; }
+  // (b) before-request expiry: the operation is NEVER invoked -- zero fetches, zero writes.
+  const clockRef = { now: 1_000_000 };
+  const dlExpired = runtimeMod.makeRouteDeadline({ clock: () => clockRef.now, budgetMs: 1_000, reserveMs: 5_000 });
+  let invoked = 0;
+  await assert.rejects(() => dlExpired.bound("some-write", () => { invoked += 1; return Promise.resolve("x"); }, { write: true }),
+    (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.beforeRequest === true && e.inFlight === false && e.commitUnknown === false);
+  assert.equal(invoked, 0, "a request that has not started makes zero writes");
+  // (c) an in-flight WRITE expiry aborts the signal and is typed COMMIT-UNKNOWN -- never claimed uncommitted.
+  const dlHang = runtimeMod.makeRouteDeadline({
+    clock: () => clockRef.now, budgetMs: 60_000, reserveMs: 1_000,
+    setTimer: (fn, ms) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id),
+  });
+  let opSignal = null;
+  await assert.rejects(() => dlHang.bound("hung-write", (signal) => { opSignal = signal; return new Promise(() => {}); }, { write: true }),
+    (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.inFlight === true && e.commitUnknown === true);
+  assert.ok(opSignal && opSignal.aborted, "the in-flight operation's AbortSignal was genuinely aborted");
+  // (c2) a write that COMPLETED before expiry is reported as a confirmed success, never resumable.
+  const dlOk = runtimeMod.makeRouteDeadline({ clock: () => clockRef.now, budgetMs: 60_000, reserveMs: 1_000, setTimer: (fn, ms) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id) });
+  assert.equal(await dlOk.bound("fast-write", async () => "committed", { write: true }), "committed");
+  // (d) a hung durable WRITE inside the sync surfaces commitUnknown on the typed-resumable rollup.
+  const hHang = fullFixture({
+    readCoverage: async () => ({ windows: [], read: "ok", error: null }), // work to do => a replace will run
+    replaceHistory: () => new Promise(() => {}),                          // hangs; ignores the abort
+    setTimer: (fn, ms) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id),
+  });
+  const rHang = await hHang.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rHang.deadlineReached, true);
+  assert.equal(rHang.continuationRequired, true);
+  assert.equal(rHang.commitUnknown, true, "an aborted in-flight durable write is reported COMMIT-UNKNOWN, not silently uncommitted");
+  // (e) GHOST-WRITE prevention: the abandoned first persistence step resolving AFTER the route aborted must
+  // NOT trigger the subsequent pointer write or mutate evidence.
+  let releaseSave = null;
+  const pendingSave = new Promise((resolve) => { releaseSave = resolve; });
+  const hGhost = fullFixture({
+    // ABSENT catalog/FBA snapshots => the sync genuinely fetches + persists; step 1 of the persistence
+    // (the immutable object upload) hangs until AFTER the handler returned.
+    readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
+    saveSnapshotPayload: () => pendingSave,
+    setTimer: (fn, ms) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id),
+  });
+  const pfGhost = await hGhost.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const snapshotFolds = () => JSON.stringify(pfGhost.evidence.catalogRows || null);
+  const foldsBefore = snapshotFolds();
+  const rGhost = await hGhost.runtime.run({ bucket: "us", today: TODAY, preflight: pfGhost });
+  assert.equal(rGhost.deadlineReached, true, "the hung persistence expired typed-resumable");
+  const recordedBefore = hGhost.recorded.snapshots.length;
+  releaseSave({ objectPath: "source-snapshots/v1/product-catalog/__organization.json", payloadBytes: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(hGhost.recorded.snapshots.length, recordedBefore, "NO ghost pointer write after the handler returned");
+  assert.equal(snapshotFolds(), foldsBefore, "NO ghost in-memory evidence mutation after the handler returned");
+});
+
+test("U5. fix 5: 30 accounts / 6 batches -- every report's depends_on is ACCOUNT-EXACT (own batch OLI + own FBA + shared catalog scope); zero cross-batch leakage", async () => {
+  const ids = Array.from({ length: 30 }, (_, i) => "A" + String(i + 1).padStart(2, "0"));
+  const h = makeHarness({
+    primaryAccounts: ids.map((id) => dirAccount(id)),
+    secondaryAccounts: [],
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey, scopeKey }) => {
+      if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
+      return { snapshot: null, read: "ok", error: null }; // FBA absent => the sync FETCHES one export per account
+    },
+  });
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  for (const id of ids) {
+    h.durableHistory.set(id + "|x", { accountId: id, saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+  }
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.derived.skipped, null);
+  assert.equal(new Set(h.membership.values()).size, 6, "30 accounts assigned into exactly 6 batches of <=5");
+  const owners = h.store.listCycleOwners(rollup.cycleId);
+  const jobs = h.store.listSourceJobs(rollup.cycleId);
+  const jobByHash = new Map(jobs.map((j) => [j.request_hash, j]));
+  const oliOwned = (aid) => new Set(owners.filter((o) => o.account_id === aid && jobByHash.get(o.request_hash) && jobByHash.get(o.request_hash).source_key === "order-line-items").map((o) => o.request_hash));
+  const fbaOwned = (aid) => new Set(owners.filter((o) => o.account_id === aid && jobByHash.get(o.request_hash) && jobByHash.get(o.request_hash).source_key === "fba-inventory-health").map((o) => o.request_hash));
+  const upserts = h.recorded.lineage.filter((l) => l.op === "upsert");
+  assert.ok(upserts.length >= 60, "daily + brand-sales (+ inventory) lineage for the fleet: " + upserts.length);
+  for (const u of upserts) {
+    const myOli = oliOwned(u.accountId);
+    const myFba = fbaOwned(u.accountId);
+    for (const hash of u.dependsOn) {
+      const job = jobByHash.get(hash);
+      assert.ok(job, "every dependency is a real cycle job");
+      if (job.source_key === "order-line-items") assert.ok(myOli.has(hash), u.reportKey + "/" + u.accountId + " depends only on ITS OWN batch's OLI export");
+      else if (job.source_key === "fba-inventory-health") assert.ok(myFba.has(hash) && u.reportKey === "brand-inventory", u.accountId + " depends only on ITS OWN FBA export (brand-inventory only)");
+    }
+    if (u.reportKey !== "brand-inventory") assert.ok(u.dependsOn.every((hash) => (jobByHash.get(hash) || {}).source_key !== "fba-inventory-health"), "daily/brand-sales never depend on FBA");
+    assert.ok(u.dependsOn.length >= 1, u.reportKey + "/" + u.accountId + ": nonempty account-owned dependency set");
+  }
+  // Cross-batch DISJOINTNESS: accounts in different batches share ZERO OLI dependencies.
+  const dailyOf = (aid) => upserts.find((u) => u.reportKey === "daily-reporting" && u.accountId === aid);
+  const batchOf = (aid) => h.membership.get(aid);
+  const a = dailyOf("A01"); const bAcct = ids.find((id) => batchOf(id) !== batchOf("A01"));
+  const b = dailyOf(bAcct);
+  assert.ok(a && b, "two accounts in different batches derived");
+  const shared = a.dependsOn.filter((hash) => b.dependsOn.includes(hash));
+  assert.ok(shared.every((hash) => (jobByHash.get(hash) || {}).source_key === "product-catalog"), "cross-batch shared dependencies can ONLY be the organization-wide catalog scope: " + JSON.stringify(shared.map((x) => (jobByHash.get(x) || {}).source_key)));
+  const sameBatchPeer = ids.find((id) => id !== "A01" && batchOf(id) === batchOf("A01"));
+  assert.deepEqual(dailyOf(sameBatchPeer).dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "order-line-items").sort(), a.dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "order-line-items").sort(), "batch members genuinely SHARE their batch's OLI export hashes");
+  // FBA: each brand-inventory row depends on exactly ITS account's FBA hash.
+  const invA01 = upserts.find((u) => u.reportKey === "brand-inventory" && u.accountId === "A01");
+  const invPeer = upserts.find((u) => u.reportKey === "brand-inventory" && u.accountId === bAcct);
+  assert.ok(invA01 && invPeer, "brand-inventory lineage for both probes");
+  const fbaDeps = (u) => u.dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "fba-inventory-health");
+  assert.equal(fbaDeps(invA01).length, 1);
+  assert.equal(fbaDeps(invPeer).length, 1);
+  assert.notEqual(fbaDeps(invA01)[0], fbaDeps(invPeer)[0], "one account NEVER depends on another account's FBA export");
+});
+
+test("U6. fix 6: the ACL model includes PostgreSQL 17 MAINTAIN -- GRANT ALL leaves MAINTAIN behind the legacy-seven revoke; explicit MAINTAIN is forbidden; REVOKE ALL clears it; the real migration stays clean", () => {
+  assert.equal(auditWith(null).ok, true, "the real Migration 20260820 audits clean under the PG17 model");
+  // (a) GRANT ALL then revoking only the LEGACY SEVEN privileges still leaves MAINTAIN held -> typed blocker.
+  const maintainSurvives = auditWith((sql) => sql.replace(
+    "grant select, insert, update on table public.source_coverage to service_role;",
+    "grant all on table public.source_coverage to service_role;\n"
+    + "revoke select, insert, update, delete, truncate, references, trigger on table public.source_coverage from service_role;\n"
+    + "grant select, insert, update on table public.source_coverage to service_role;",
+  ));
+  assert.ok(maintainSurvives.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH" && /maintain/.test(b.message)), JSON.stringify(maintainSurvives.blockers.map((b) => b.code)) + " -- a pre-PG17 seven-privilege model would have passed this");
+  // (b) explicit MAINTAIN is forbidden for every role unless expressly expected.
+  const maintainAuth = auditWith((sql) => sql + "\ngrant maintain on table public.source_controls to authenticated;\n");
+  assert.ok(maintainAuth.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN" && /maintain/.test(b.message)), JSON.stringify(maintainAuth.blockers.map((b) => b.code)));
+  const maintainSrv = auditWith((sql) => sql + "\ngrant maintain on table public.source_snapshots to service_role;\n");
+  assert.ok(maintainSrv.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH"), JSON.stringify(maintainSrv.blockers.map((b) => b.code)));
+  const maintainAnon = auditWith((sql) => sql + "\ngrant maintain on table public.source_coverage to anon;\n");
+  assert.ok(maintainAnon.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN"), JSON.stringify(maintainAnon.blockers.map((b) => b.code)));
+  const maintainBot = auditWith((sql) => sql + "\ngrant maintain on table public.source_run_status to maintenance_bot;\n");
+  assert.ok(maintainBot.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN" && /maintenance_bot/.test(b.message)), JSON.stringify(maintainBot.blockers.map((b) => b.code)));
+  // (c) REVOKE ALL clears MAINTAIN in the modeled final state (the re-granted select keeps the table's
+  // expected authenticated ACL intact -- so a clean audit PROVES maintain was cleared).
+  const revokeAllClears = auditWith((sql) => sql
+    + "\ngrant maintain on table public.source_controls to authenticated;"
+    + "\nrevoke all on table public.source_controls from authenticated;"
+    + "\ngrant select on table public.source_controls to authenticated;\n");
+  assert.equal(revokeAllClears.ok, true, JSON.stringify(revokeAllClears.blockers));
 });
 
 async function main() {

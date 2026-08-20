@@ -92,16 +92,28 @@ export function makeRouteDeadline({
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const abort = () => { if (controller && !controller.signal.aborted) controller.abort(); };
   const outOfTime = () => clock() >= deadlineMs - reserveMs;
-  const expiry = (phase) => {
-    const e = new Error(`ROUTE_DEADLINE_EXCEEDED: the route budget expired during ${phase}; the work is typed-resumable on a fresh invocation.`);
+  // Round-6 fix 4: THREE typed expiry outcomes, never conflated:
+  //   beforeRequest -- the budget expired BEFORE the operation was invoked: PROVEN zero effect;
+  //   inFlight      -- the operation's HTTP was aborted (or its promise abandoned) MID-FLIGHT. For a READ
+  //                    this is safe; for a WRITE the database may ALREADY HAVE COMMITTED, so the error
+  //                    carries commitUnknown:true and no caller may claim the write did not happen --
+  //                    resumption relies on the idempotent replay design (upserts, one-create-per-hash,
+  //                    CAS), never on an uncommitted assumption;
+  //   (a write that RETURNED before expiry is a confirmed durable completion and is reported as success.)
+  const expiry = (phase, { beforeRequest = false, inFlight = false, write = false } = {}) => {
+    const e = new Error(`ROUTE_DEADLINE_EXCEEDED: the route budget expired ${beforeRequest ? "before" : "during"} ${phase}; the work is typed-resumable on a fresh invocation${write && inFlight ? " (in-flight write: commit UNKNOWN; the replay design is idempotent)" : ""}.`);
     e.code = "ROUTE_DEADLINE_EXCEEDED";
     e.status = 503;
     e[ROUTE_DEADLINE] = phase;
+    e.beforeRequest = beforeRequest;
+    e.inFlight = inFlight;
+    e.commitUnknown = !!(write && inFlight);
     return e;
   };
-  const ensureTime = async (phase) => { if (outOfTime()) { abort(); throw expiry(phase); } };
-  const bound = async (phase, op) => {
-    if (outOfTime()) { abort(); throw expiry(phase); }
+  const ensureTime = async (phase) => { if (outOfTime()) { abort(); throw expiry(phase, { beforeRequest: true }); } };
+  const bound = async (phase, op, { write = false } = {}) => {
+    // Before-request expiry: the op is NEVER invoked -- zero HTTP, zero writes.
+    if (outOfTime()) { abort(); throw expiry(phase, { beforeRequest: true, write }); }
     const signal = controller ? controller.signal : null;
     if (typeof setTimer !== "function") return op(signal);
     const remaining = Math.max(1, deadlineMs - reserveMs - clock());
@@ -113,7 +125,7 @@ export function makeRouteDeadline({
       const winner = await Promise.race([opPromise, timeout]);
       if (winner == null || timedOut) {
         opPromise.catch(() => {}); // the abandoned in-flight op may still reject later; never unhandled
-        throw expiry(phase);
+        throw expiry(phase, { inFlight: true, write });
       }
       return winner.v;
     } finally {
@@ -123,6 +135,7 @@ export function makeRouteDeadline({
   return {
     startMs, deadlineMs, reserveMs,
     signal: controller ? controller.signal : null,
+    aborted: () => !!(controller && controller.signal.aborted),
     outOfTime, ensureTime, bound,
     elapsed: () => clock() - startMs,
     isDeadlineError: (e) => !!(e && e[ROUTE_DEADLINE]),
@@ -259,18 +272,78 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   const makeDeadline = (opts = {}) => makeRouteDeadline({ clock, budgetMs, reserveMs, setTimer, clearTimer, ...opts });
   const resolveDeadline = (deadline) => (deadline && typeof deadline.ensureTime === "function" && typeof deadline.bound === "function" ? deadline : makeDeadline());
 
-  // FINDINGS 5 + 6: the collaborator the bucket sync calls with ROWS -- production copies them into the
-  // ORGANIZATION/CONNECTION-scoped, CONTENT-ADDRESSED source-snapshots/* namespace (immutable objects the
-  // cache prune can never touch), then records the pointer WITH the content hash: whatever save wins the
-  // pointer, its metadata provably references a complete object of its own content.
-  const makePersistSnapshot = (orgFingerprint) => async ({ sourceKey, scopeKey, rows, rowCount, sourceRequestHash, validatedAt }) => {
-    const saved = await saveSnapshotPayload({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey, scopeKey, rows });
-    await recordSnapshot({
+  // FINDINGS 5 + 6 + round-6 fix 2: the collaborator the bucket sync calls with ROWS -- production copies
+  // them into the ORGANIZATION/CONNECTION-scoped, CONTENT-ADDRESSED source-snapshots/* namespace (immutable
+  // objects the cache prune can never touch), then records the pointer WITH the content hash. The CAS
+  // acknowledgement DECIDES what evidence is AUTHORITATIVE afterwards:
+  //   replaced   -- the candidate won the pointer: the candidate IS the authoritative evidence;
+  //   unchanged  -- the CAS proved the existing pointer holds the IDENTICAL content (same content-addressed
+  //                 payload_sha AND object path): the candidate content is byte-identical to the winner;
+  //   stale-save -- a NEWER concurrent save won: the candidate is a CAS LOSER and must NEVER feed
+  //                 derivation. The WINNING pointer is re-read and its payload hydrated through the
+  //                 hash-proving loader; an unreadable/invalid winner fails CLOSED typed (LKG preserved);
+  //   conflict / malformed acknowledgements -- the wrapper throws typed before this returns (fail closed).
+  // Returns { write:"ok", ack, objectPath, authoritativeRows, authoritativeSnapshot } -- callers fold ONLY
+  // the authoritative side into evidence, never the losing candidate.
+  const makePersistSnapshot = (orgFingerprint, dl = null) => async ({ sourceKey, scopeKey, rows, rowCount, sourceRequestHash, validatedAt, signal = null }) => {
+    const sig = signal || (dl ? dl.signal : null);
+    const ghostGuard = (phase) => {
+      // Round-6 fix 4: an aborted/expired route may never trigger the SUBSEQUENT durable write from an
+      // abandoned promise chain. The step that has not started is PROVEN not to have happened.
+      if (sig && sig.aborted) {
+        const e = new Error(`ROUTE_DEADLINE_EXCEEDED: the route budget expired before ${phase}; the remaining persistence steps did not run (fail closed; typed-resumable).`);
+        e.code = "ROUTE_DEADLINE_EXCEEDED";
+        e.status = 503;
+        e[ROUTE_DEADLINE] = phase;
+        e.beforeRequest = true;
+        e.inFlight = false;
+        e.commitUnknown = false;
+        throw e;
+      }
+    };
+    const saved = await saveSnapshotPayload({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey, scopeKey, rows, signal: sig });
+    ghostGuard("snapshot-pointer-write");
+    const outcome = await recordSnapshot({
       organizationFingerprint: orgFingerprint, connectionId: "primary",
       sourceKey, scopeKey, objectPath: saved.objectPath, payloadSha: saved.payloadSha, rowCount,
-      payloadBytes: saved.payloadBytes, sourceRequestHash, validatedAt,
+      payloadBytes: saved.payloadBytes, sourceRequestHash, validatedAt, signal: sig,
     });
-    return { write: "ok", objectPath: saved.objectPath };
+    const ack = outcome && outcome.write === "ok" ? outcome.ack : null;
+    if (ack !== "replaced" && ack !== "unchanged" && ack !== "stale-save") {
+      const err = new Error(`SOURCE_SNAPSHOT_ACK_INVALID: persistSnapshot requires a typed CAS acknowledgement (got ${JSON.stringify(ack)}); the save is unacknowledged (fail closed).`);
+      err.code = "SOURCE_SNAPSHOT_ACK_INVALID";
+      err.status = 503;
+      throw err;
+    }
+    if (ack === "replaced" || ack === "unchanged") {
+      return {
+        write: "ok", ack, objectPath: saved.objectPath,
+        authoritativeRows: rows,
+        authoritativeSnapshot: { validated_at: validatedAt, object_path: saved.objectPath, row_count: rowCount },
+      };
+    }
+    // stale-save: a NEWER save owns the pointer. Hydrate + validate the WINNER; the losing candidate is
+    // dropped here and can never reach derivation or a report save.
+    ghostGuard("stale-winner-hydration");
+    const winRead = await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey, scopeKey, signal: sig });
+    const winner = winRead && winRead.read === "ok" ? winRead.snapshot : null;
+    let winnerRows = null;
+    if (winner && winner.object_path) {
+      try {
+        const payload = await loadSnapshotPayload(winner.object_path, { signal: sig });
+        winnerRows = payload && Array.isArray(payload.rows) && payload.rows.length === Number(winner.row_count) ? payload.rows : null;
+      } catch (e) {
+        if (e && e[ROUTE_DEADLINE]) throw e;
+        winnerRows = null;
+      }
+    }
+    if (!winnerRows) {
+      const err = new Error("SOURCE_SNAPSHOT_STALE_WINNER_UNREADABLE: a newer concurrent save won the pointer CAS but its durable evidence could not be hydrated/validated; stopping typed (latest-good preserved; nothing derives from the losing candidate).");
+      err.code = "SOURCE_SNAPSHOT_STALE_WINNER_UNREADABLE";
+      err.status = 503;
+      throw err;
+    }
+    return { write: "ok", ack: "stale-save", objectPath: winner.object_path, authoritativeRows: winnerRows, authoritativeSnapshot: winner };
   };
 
   // Deep-enough copy of a memoized preflight bundle's evidence: the run folds the sync's own products into
@@ -320,7 +393,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const readBlockers = [];
     const oliCoverageByAccountId = {};
     for (const a of accounts) {
-      const cov = await call("coverage-read", () => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY }));
+      const cov = await call("coverage-read", (signal) => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY, signal }));
       if (cov.read !== "ok") {
         readBlockers.push({ sourceKey: OLI_SOURCE_KEY, accountId: a.accountId, reason: "coverage-" + cov.read, blocksSales: true });
         oliCoverageByAccountId[a.accountId] = [];
@@ -347,7 +420,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       let rows = null;
       try {
-        const payload = await call("snapshot-hydration", () => loadSnapshotPayload(snapshot.object_path));
+        const payload = await call("snapshot-hydration", (signal) => loadSnapshotPayload(snapshot.object_path, { signal }));
         rows = payload.rows;
       } catch (e) {
         if (e && e[ROUTE_DEADLINE]) throw e; // a deadline expiry is resumable, never "dangling" evidence
@@ -360,12 +433,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       return { snapshot, rows };
     };
-    const catalogRead = await call("catalog-snapshot-read", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY }));
+    const catalogRead = await call("catalog-snapshot-read", (signal) => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, signal }));
     const catalog = await validateSnapshot({ snapRead: catalogRead, sourceKey: CATALOG_SOURCE_KEY, blocksSales: true });
     const fbaSnapshotsByAccount = {};
     const fbaRowsByAccount = {}; // Round-5 blocker 2: the HYDRATED durable FBA rows feed the compact Brand View inventory
     for (const a of accounts) {
-      const snapRead = await call("fba-snapshot-read", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId }));
+      const snapRead = await call("fba-snapshot-read", (signal) => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId, signal }));
       const fba = await validateSnapshot({ snapRead, sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: a.accountId, blocksSales: false });
       if (fba.snapshot) {
         fbaSnapshotsByAccount[a.accountId] = fba.snapshot;
@@ -376,11 +449,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const asinWindows = {};
     const campaignCoverageStateByAccountId = {};
     for (const a of accounts) {
-      const camp = await call("ads-coverage-read", () => readAdsCoverage(a.accountId, "campaign-performance-v1"));
+      const camp = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "campaign-performance-v1", { signal }));
       campaignCoverageStateByAccountId[a.accountId] = camp;
       campaignWindows[a.accountId] = camp.read === "ok" ? camp.windows : null;
       if (camp.read !== "ok") readBlockers.push({ sourceKey: "ads-campaign-date", accountId: a.accountId, reason: "ads-coverage-" + camp.read, blocksSales: false });
-      const asin = await call("ads-coverage-read", () => readAdsCoverage(a.accountId, "asin-performance-v1"));
+      const asin = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "asin-performance-v1", { signal }));
       asinWindows[a.accountId] = asin.read === "ok" ? asin.windows : null;
       if (asin.read !== "ok") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
     }
@@ -411,8 +484,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const dl = resolveDeadline(deadline);
     const outOfTime = dl.outOfTime;
     const ensureTime = dl.ensureTime;
-    const resumable = (phase) => ({ bucket, deadlineReached: true, continuationRequired: true, stopped: false, phase, skipped: "deadline" });
-    const catchDeadline = (e) => { if (dl.isDeadlineError(e)) return resumable(dl.phaseOf(e)); throw e; };
+    // Round-6 fix 4: an in-flight WRITE expiry carries commitUnknown -- the resumable rollup reports it
+    // honestly (the write may have committed; the replay design is idempotent) instead of implying nothing
+    // happened.
+    const resumable = (phase, cause = null) => ({ bucket, deadlineReached: true, continuationRequired: true, stopped: false, phase, skipped: "deadline", commitUnknown: !!(cause && cause.commitUnknown) });
+    const catchDeadline = (e) => { if (dl.isDeadlineError(e)) return resumable(dl.phaseOf(e), e); throw e; };
 
     // FINDING 1: controls FIRST -- an unapplied migration or failed read refuses BEFORE discovery. Round-5
     // blocker 3: with a memoized preflight, the controls ALREADY read there are consumed -- never re-read.
@@ -421,7 +497,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       if (preflight) {
         pausedSources = new Set(preflight.pausedSources);
       } else {
-        const controls = requireOkRead(await dl.bound("controls-read", () => readSourceControls()), "source_controls");
+        const controls = requireOkRead(await dl.bound("controls-read", (signal) => readSourceControls({ signal })), "source_controls");
         pausedSources = new Set((controls.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
       }
     } catch (e) { return catchDeadline(e); }
@@ -473,15 +549,15 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       try {
         for (const a of accounts) {
           const cov = requireOkRead(
-            await dl.bound("evidence-coverage", () => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY })),
+            await dl.bound("evidence-coverage", (signal) => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY, signal })),
             `source_coverage(${a.accountId})`,
           );
           coverageByAccountId[a.accountId] = cov.windows;
         }
-        const catalogSnap = requireOkRead(await dl.bound("evidence-snapshots", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY })), "source_snapshots(catalog)");
+        const catalogSnap = requireOkRead(await dl.bound("evidence-snapshots", (signal) => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, signal })), "source_snapshots(catalog)");
         catalogSnapForSync = catalogSnap.snapshot;
         for (const a of accounts) {
-          const snap = requireOkRead(await dl.bound("evidence-snapshots", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId })), `source_snapshots(fba:${a.accountId})`);
+          const snap = requireOkRead(await dl.bound("evidence-snapshots", (signal) => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId, signal })), `source_snapshots(fba:${a.accountId})`);
           if (snap.snapshot) fbaSnapshotsForSync[a.accountId] = snap.snapshot;
         }
       } catch (e) { return catchDeadline(e); }
@@ -498,7 +574,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     } else {
       let membershipRows;
       try {
-        membershipRows = await dl.bound("membership-read", () => readBatchMembership(batchFamily));
+        membershipRows = await dl.bound("membership-read", (signal) => readBatchMembership(batchFamily, { signal }));
       } catch (e) {
         if (dl.isDeadlineError(e)) return resumable(dl.phaseOf(e));
         const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any export (fail closed).");
@@ -511,7 +587,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     try {
       for (const a of accounts) {
         if (existingMembership.has(a.accountId)) continue;
-        const idx = await dl.bound("membership-assign", () => assignBatchMembership({ batchFamily, accountId: a.accountId, connectionId: "primary", organizationFingerprint: orgFingerprint }));
+        const idx = await dl.bound("membership-assign", (signal) => assignBatchMembership({ batchFamily, accountId: a.accountId, connectionId: "primary", organizationFingerprint: orgFingerprint, signal }), { write: true });
         if (!Number.isInteger(idx) || idx < 0) {
           const err = new Error("BATCH_MEMBERSHIP_ASSIGN_FAILED: transactional batch assignment returned a malformed index; refusing (fail closed).");
           err.code = "BATCH_MEMBERSHIP_ASSIGN_FAILED";
@@ -526,13 +602,15 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const store = makeSourceStore();
     const dataDoe = makeAdapter(connections);
 
-    // Round-5 blocker 3: when running on a memoized preflight, the sync's OWN durable products (replaced
-    // OLI windows + persisted catalog/FBA snapshots) are folded into the in-memory evidence, so the derive
-    // stage below reflects THIS invocation's fetches with ZERO repeated discovery/reads.
-    const persistSnapshotBase = makePersistSnapshot(orgFingerprint);
-    const trackedReplaceHistory = liveEvidence == null ? replaceHistory : async (args) => {
-      const outcome = await replaceHistory(args);
-      if (outcome && outcome.write === "ok") {
+    // Round-5 blocker 3 + round-6 fixes 2/4: when running on a memoized preflight, the sync's OWN durable
+    // products are folded into the in-memory evidence -- but ONLY the CAS-AUTHORITATIVE side (the winner on
+    // stale-save, the candidate only when it replaced or was proven identical), ONLY after a CONFIRMED
+    // durable completion, and NEVER after the route aborted (an abandoned promise can never mutate
+    // evidence later). Every durable write is bounded in-flight through the ONE route deadline.
+    const persistSnapshotBase = makePersistSnapshot(orgFingerprint, dl);
+    const trackedReplaceHistory = async (args) => {
+      const outcome = await dl.bound("history-replace", (signal) => replaceHistory({ ...args, signal }), { write: true });
+      if (liveEvidence && outcome && outcome.write === "ok" && !dl.aborted()) {
         const keep = liveEvidence.historyRows.filter((r) => !(r.account_id === args.accountId && r.sale_date >= args.coveredFrom && r.sale_date <= args.coveredTo));
         for (const r of args.rows || []) {
           keep.push({ account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin, currency: r.currency, sales_amount: r.salesAmount, units: r.units });
@@ -542,35 +620,46 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       return outcome;
     };
-    const trackedPersistSnapshot = liveEvidence == null ? persistSnapshotBase : async (args) => {
-      const res = await persistSnapshotBase(args);
-      const snap = { validated_at: args.validatedAt, object_path: res.objectPath, row_count: args.rowCount };
-      if (args.sourceKey === CATALOG_SOURCE_KEY) {
-        liveEvidence.catalogSnapshot = snap;
-        liveEvidence.catalogRows = [...args.rows];
-      } else if (args.sourceKey === FBA_INVENTORY_SOURCE_KEY) {
-        liveEvidence.fbaSnapshotsByAccount[args.scopeKey] = snap;
-        liveEvidence.fbaRowsByAccount[args.scopeKey] = [...args.rows];
+    const trackedPersistSnapshot = async (args) => {
+      const res = await dl.bound("snapshot-persist", (signal) => persistSnapshotBase({ ...args, signal }), { write: true });
+      if (liveEvidence && !dl.aborted()) {
+        // Round-6 fix 2: fold the AUTHORITATIVE evidence the CAS acknowledged -- never a losing candidate.
+        if (args.sourceKey === CATALOG_SOURCE_KEY) {
+          liveEvidence.catalogSnapshot = res.authoritativeSnapshot;
+          liveEvidence.catalogRows = [...res.authoritativeRows];
+        } else if (args.sourceKey === FBA_INVENTORY_SOURCE_KEY) {
+          liveEvidence.fbaSnapshotsByAccount[args.scopeKey] = res.authoritativeSnapshot;
+          liveEvidence.fbaRowsByAccount[args.scopeKey] = [...res.authoritativeRows];
+        }
       }
       return res;
     };
+    const boundedUpdateRunStatus = updateRunStatus == null ? null
+      : (entry) => dl.bound("run-status-write", (signal) => updateRunStatus(entry, { signal }), { write: true });
 
-    const rollup = await runBucketSourceSync({
-      apiKey: primary.apiKey, bucket, accounts,
-      existingMembership,
-      coverageByAccountId,
-      catalogSnapshot: catalogSnapForSync,
-      fbaSnapshotsByAccount: fbaSnapshotsForSync,
-      pausedSources,
-      asOf: asOfStr, today: todayStr,
-      store, dataDoe,
-      replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus,
-      cycleDate: cycleDate || todayStr, trigger: "manual",
-      clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
-      deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
-      reuseOnly,
-    });
+    let rollup;
+    try {
+      rollup = await runBucketSourceSync({
+        apiKey: primary.apiKey, bucket, accounts,
+        existingMembership,
+        coverageByAccountId,
+        catalogSnapshot: catalogSnapForSync,
+        fbaSnapshotsByAccount: fbaSnapshotsForSync,
+        pausedSources,
+        asOf: asOfStr, today: todayStr,
+        store, dataDoe,
+        replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,
+        cycleDate: cycleDate || todayStr, trigger: "manual",
+        clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
+        deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
+        reuseOnly,
+      });
+    } catch (e) { return catchDeadline(e); }
     rollup.excludedAccounts = excluded;
+    // Round-6 fix 1: EVERY rollup shape reports honestly that this runtime never finalized anything; the
+    // cycle-status READ at the end refines cycleStatus for completed runs only.
+    rollup.finalized = false;
+    rollup.cycleStatus = null;
 
     // FINDING 4: after a COMPLETE bucket sync (not stopped/resumable), derive/validate/save the Daily +
     // Brand View + compact brand-inventory durable SHADOW snapshots. A read failure or non-ready readiness
@@ -611,17 +700,18 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     if (!liveEvidence) {
       try {
-        historyRows = await dl.bound("history-load", () => loadHistoryRows({
+        historyRows = await dl.bound("history-load", (signal) => loadHistoryRows({
           organizationFingerprint: orgFingerprint, connectionId: "primary",
           accountIds: accounts.map((a) => a.accountId),
           from: brandViewWindow.from, to: brandViewWindow.to,
+          signal,
         }));
         // FINDING 3 + round-4 finding 1: ACTUAL campaign Ads metric rows WITH their typed read state. A
         // failed/limited/malformed read is NEVER flattened into [] + "ok" -- the typed metricsRead travels
         // into the ads-coverage contract so Daily can never report a false zero-Ads result.
         for (const a of accounts) {
           try {
-            const rows = await dl.bound("ads-metrics-load", () => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to));
+            const rows = await dl.bound("ads-metrics-load", (signal) => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to, { signal }));
             adMetricsByAccountId[a.accountId] = Array.isArray(rows)
               ? { rows, metricsRead: "ok" }
               : { rows: [], metricsRead: "read-failed" };
@@ -662,11 +752,43 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     //   4. record validated success with the EXACT saver-computed snapshot_params_hash.
     // A lost/false/malformed claim is a TYPED skip: the save does not happen and success is NEVER recorded
     // (idempotent resume: a fresh invocation over a completed job loses the claim and changes nothing).
-    const sourceJobRows = rollup.cycleId ? await store.listSourceJobs(rollup.cycleId) : [];
-    const succeededHashesFor = (families) => sourceJobRows
-      .filter((r) => (r.fetch_status ?? r.fetchStatus) === "succeeded" && families.includes(r.source_key ?? r.sourceKey))
-      .map((r) => r.request_hash ?? r.requestHash)
-      .sort();
+    //
+    // Round-6 fix 5: depends_on is ACCOUNT-EXACT, built from the AUTHORITATIVE durable ownership
+    // (sync_source_job_owners of THIS cycle): an account's report depends ONLY on source hashes that
+    // account genuinely owns -- its own batch's OLI export (one owner row per member), its OWN FBA export
+    // -- plus the shared ORGANIZATION-scope evidence (canonical Product Catalog, owner "__organization").
+    // One account can NEVER depend on another batch's OLI/FBA hash; bucket-wide family membership is not
+    // ownership.
+    const sourceJobRows = rollup.cycleId ? await dl.bound("source-jobs-read", () => store.listSourceJobs(rollup.cycleId)) : [];
+    if (rollup.cycleId && typeof store.listCycleOwners !== "function") {
+      const err = new Error("LINEAGE_OWNERSHIP_UNAVAILABLE: the store cannot list this cycle's owner memberships; refusing to record report lineage with unproven depends_on (fail closed).");
+      err.code = "LINEAGE_OWNERSHIP_UNAVAILABLE";
+      err.status = 503;
+      throw err;
+    }
+    const ownerRows = rollup.cycleId ? await dl.bound("cycle-owners-read", (signal) => store.listCycleOwners(rollup.cycleId, { signal })) : [];
+    const orgOwnedHashes = new Set();
+    const accountOwnedHashes = new Map(); // accountId -> Set(request_hash)
+    for (const o of ownerRows || []) {
+      if ((o.owner_status ?? o.ownerStatus) === "stale") continue;
+      const aid = String(o.account_id ?? o.accountId ?? "");
+      const h = o.request_hash ?? o.requestHash;
+      if (!h) continue;
+      if (aid === ORGANIZATION_SCOPE_KEY || aid === "") { orgOwnedHashes.add(h); continue; }
+      if (!accountOwnedHashes.has(aid)) accountOwnedHashes.set(aid, new Set());
+      accountOwnedHashes.get(aid).add(h);
+    }
+    const jobByHash = new Map(sourceJobRows.map((r) => [r.request_hash ?? r.requestHash, r]));
+    const succeededHashesFor = (accountId, families) => {
+      const owned = accountOwnedHashes.get(String(accountId)) || new Set();
+      const out = [];
+      for (const [h, r] of jobByHash) {
+        if ((r.fetch_status ?? r.fetchStatus) !== "succeeded") continue;
+        if (!families.includes(r.source_key ?? r.sourceKey)) continue;
+        if (owned.has(h) || orgOwnedHashes.has(h)) out.push(h);
+      }
+      return out.sort();
+    };
     const LINEAGE_DEPENDS_ON = {
       "daily-reporting": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
       "brand-sales": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
@@ -674,23 +796,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
     const saveWithLineage = async (snap, save) => {
       if (!reportLineage || !rollup.cycleId) {
-        return { saved: await save(), lineage: "unavailable" };
+        return { saved: await dl.bound("shadow-save", () => save(), { write: true }), lineage: "unavailable" };
       }
-      await reportLineage.upsertReportJob({
+      await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
-        dependsOn: succeededHashesFor(LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
-      });
-      const claim = await reportLineage.claimReportDerive(rollup.cycleId, snap.productionReportKey, snap.accountId);
+        dependsOn: succeededHashesFor(snap.accountId, LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
+      }, { signal }), { write: true });
+      const claim = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimReportDerive(rollup.cycleId, snap.productionReportKey, snap.accountId, { signal }), { write: true });
       if (claim !== true) {
         rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "claim-lost" });
         return { saved: null, lineage: "claim-lost" };
       }
-      const saved = await save();
-      await reportLineage.recordReportSuccess({
+      const saved = await dl.bound("shadow-save", () => save(), { write: true });
+      await dl.bound("report-lineage-success", (signal) => reportLineage.recordReportSuccess({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, accountId: snap.accountId,
         latestDataDate: snap.latestDataDate ?? null, snapshotParamsHash: saved.paramsHash,
-      });
+      }, { signal }), { write: true });
       rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "recorded" });
       return { saved, lineage: "recorded" };
     };
@@ -763,37 +885,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped };
     rollup.derived.brandInventory = brandInventory;
 
-    // Round-5 blocker 1 (terminal lifecycle): ONLY a FULL bucket scope may complete the shared cycle -- it
-    // planned its ENTIRE registered durable scope before draining (the reviewed complete-scope rule), so
-    // "no open work" is a genuine complete-cycle signal; a narrowed onlySourceKey subset must NEVER
-    // terminalize the shared (bucket, cycle_date) cycle. The finalize primitive stays the AUTHORITY:
-    // concurrent open source/report work returns 'open-work' and the cycle honestly stays running --
-    // cycle_status is NEVER fabricated here or anywhere else.
-    rollup.finalized = false;
-    rollup.cycleStatus = null;
-    if (onlySourceKey == null && rollup.cycleId) {
-      if (typeof store.finalizeCycle !== "function") {
-        throw new Error("bucket source sync: cycle finalization is unavailable (store.finalizeCycle missing); refusing to report a completed full-scope cycle (fail closed).");
-      }
-      let disp;
+    // Round-6 fix 1: the source-first runtime NEVER finalizes the SHARED (bucket, cycle_date) cycle -- not
+    // for a full bucket run, not for a narrowed subset. sync_cycles is ONE idempotent row per
+    // (bucket, cycle_date) shared by EVERY Scheduler-v2 driver, and Migration 5's
+    // reject_append_to_terminal_cycle trigger blocks ALL later child inserts/updates on a terminal cycle --
+    // so a source-only run that terminalized the day's cycle would break every later same-day report run,
+    // owner upsert, and source-card replay (the manual-subset hole at cycle level). "All Scheduler-v2 work
+    // for this identity" is not knowable from inside a source-only run, so finalization stays where the
+    // reviewed design put it: the CANONICAL SCHEDULED dispatcher finalizes ONLY a complete drained
+    // SCHEDULED scope (sync-dispatch.js), and an explicit reviewed operation may close a cycle -- this
+    // runtime does neither. The cycle's CURRENT status is reported from an honest READ (never written,
+    // never fabricated); the publisher's terminal-cycle gate is satisfied only once the reviewed
+    // finalization has genuinely happened.
+    if (rollup.cycleId && typeof store.getCycle === "function") {
       try {
-        disp = await dl.bound("cycle-finalize", () => store.finalizeCycle({ cycleId: rollup.cycleId }));
-      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
-      const d = disp && disp.disposition;
-      if (d === "finalized" || d === "already-terminal") {
-        const terminalStatus = disp.cycle && typeof disp.cycle === "object" ? disp.cycle.status : null;
-        if (!["succeeded", "partial", "failed"].includes(terminalStatus)) {
-          throw new Error(`bucket source sync: malformed positive finalize acknowledgement (disposition "${d}" without a terminal cycle) for cycle ${rollup.cycleId}; failing closed.`);
-        }
-        rollup.finalized = d === "finalized";
-        rollup.cycleStatus = terminalStatus;
-      } else if (d === "open-work") {
-        // Another scope's source/report work is still open (e.g. a concurrently claimed report job): the
-        // cycle honestly stays running; nothing here may claim a terminal status for it.
-        rollup.cycleStatus = "running";
-      } else {
-        throw new Error(`bucket source sync: unexpected finalize disposition "${String(d)}" for cycle ${rollup.cycleId}; failing closed.`);
-      }
+        const cycleRow = await dl.bound("cycle-status-read", (signal) => store.getCycle(rollup.cycleId, { signal }));
+        rollup.cycleStatus = cycleRow && cycleRow.status ? cycleRow.status : null;
+      } catch (e) { if (!dl.isDeadlineError(e)) throw e; /* status telemetry only; expiry never fails the run */ }
     }
     return rollup;
   };
@@ -808,7 +916,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   // bounded in-flight through it.
   const preflightEvidence = async ({ bucket = null, sourceKey = null, deadline = null, today = null } = {}) => {
     const dl = resolveDeadline(deadline);
-    const controls = requireOkRead(await dl.bound("controls-read", () => readSourceControls()), "source_controls");
+    const controls = requireOkRead(await dl.bound("controls-read", (signal) => readSourceControls({ signal })), "source_controls");
     const pausedSources = new Set((controls.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
     if (sourceKey != null && pausedSources.has(sourceKey)) {
       const err = new Error(`SOURCE_PAUSED: "${sourceKey}" is paused; resume it before syncing missing data (fail closed).`);
@@ -845,7 +953,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const adMetricsByAccountId = {};
     for (const a of accounts) {
       try {
-        const rows = await dl.bound("ads-metrics-load", () => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to));
+        const rows = await dl.bound("ads-metrics-load", (signal) => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to, { signal }));
         if (!Array.isArray(rows)) refuse("ADS_METRICS_READ_FAILED", "ads-metrics-malformed", { accountId: a.accountId });
         adMetricsByAccountId[a.accountId] = { rows, metricsRead: "ok" };
       } catch (e) {
@@ -861,10 +969,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const brandViewWindow = oliBackfillWindow(asOfStr);
     let historyRows = null;
     try {
-      historyRows = await dl.bound("history-load", () => loadHistoryRows({
+      historyRows = await dl.bound("history-load", (signal) => loadHistoryRows({
         organizationFingerprint: orgFingerprint, connectionId: "primary",
         accountIds: accounts.map((a) => a.accountId),
         from: brandViewWindow.from, to: brandViewWindow.to,
+        signal,
       }));
     } catch (e) {
       if (dl.isDeadlineError(e)) throw e;
@@ -872,7 +981,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     if (!Array.isArray(historyRows)) refuse("HISTORY_READ_FAILED", "oli-history", null);
     let membershipRows;
-    try { membershipRows = await dl.bound("membership-read", () => readBatchMembership(oliBatchFamily({ orgFingerprint, bucket }))); }
+    try { membershipRows = await dl.bound("membership-read", (signal) => readBatchMembership(oliBatchFamily({ orgFingerprint, bucket }), { signal })); }
     catch (e) {
       if (dl.isDeadlineError(e)) throw e;
       const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any write (fail closed).");
@@ -880,12 +989,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     const membership = validateBatchMembershipRows(membershipRows, { orgFingerprint });
     let settings;
-    try { settings = await dl.bound("settings-read", () => readSettings()); } catch (e) { if (dl.isDeadlineError(e)) throw e; settings = null; }
+    try { settings = await dl.bound("settings-read", (signal) => readSettings({ signal })); } catch (e) { if (dl.isDeadlineError(e)) throw e; settings = null; }
     if (!Array.isArray(settings)) {
       const err = new Error("SETTINGS_READ_FAILED: report_sync_settings could not be read; refusing before any write (fail closed).");
       err.code = "SETTINGS_READ_FAILED"; err.status = 503; throw err;
     }
-    const rollout = await (async () => { try { return await dl.bound("rollout-read", () => readRollout()); } catch (e) { if (dl.isDeadlineError(e)) throw e; return null; } })();
+    const rollout = await (async () => { try { return await dl.bound("rollout-read", (signal) => readRollout({ signal })); } catch (e) { if (dl.isDeadlineError(e)) throw e; return null; } })();
     if (!rollout || rollout.read !== "ok") {
       const err = new Error("ROLLOUT_READ_FAILED: the durable account rollout could not be read; refusing before any write (fail closed).");
       err.code = "ROLLOUT_READ_FAILED"; err.status = 503; throw err;

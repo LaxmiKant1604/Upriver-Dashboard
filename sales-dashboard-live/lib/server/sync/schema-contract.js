@@ -628,7 +628,11 @@ function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-const ALL_TABLE_PRIVS = ["select", "insert", "update", "delete", "truncate", "references", "trigger"];
+// Round-6 fix 6: the COMPLETE PostgreSQL 17 table-privilege set. PG17 added MAINTAIN (VACUUM/ANALYZE/
+// REINDEX/CLUSTER/REFRESH MATERIALIZED VIEW) to ALL, so a GRANT ALL now confers EIGHT privileges -- a
+// replay that expanded ALL to only the legacy seven would model "GRANT ALL then REVOKE the seven" as an
+// empty final state while the real database still holds MAINTAIN.
+const ALL_TABLE_PRIVS = ["select", "insert", "update", "delete", "truncate", "references", "trigger", "maintain"];
 
 // Round-5 blocker 5: the FINAL ACL state for one exact `public.<table>`, computed by replaying EVERY GRANT
 // and REVOKE naming that table in SOURCE ORDER (match offset in `masked`), per role. A union of historical

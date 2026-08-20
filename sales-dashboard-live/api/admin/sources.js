@@ -129,22 +129,37 @@ export default async function handler(req, res) {
       const runtime = buildBucketSourceSyncRuntime();
       const deadline = runtime.makeDeadline();
       const preflight = await runtime.preflightEvidence({ bucket, sourceKey: onlySourceKey, deadline });
-      await insertAuditLog({
+      // Round-6 fix 4: the AUDIT WRITE is bounded by the SAME route budget and carries the route's
+      // AbortSignal into the real HTTP wrapper. A before-request expiry proves zero audit rows; an
+      // IN-FLIGHT expiry means the audit row MAY have committed (commitUnknown) -- in both cases the
+      // action is refused typed BEFORE any execution write (a duplicate audit row on retry is harmless;
+      // an unaudited execution is not).
+      await deadline.bound("audit-write", (signal) => insertAuditLog({
         actorUserId: access.userId,
         action: "source.sync.missing",
         target: { bucket, sourceKey: onlySourceKey },
-      });
+      }, { signal }), { write: true });
       // Finding 4: every registered source card action routes to its REAL architecture (bucket sync /
       // single-family tranche composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces
       // a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
       const result = onlySourceKey
         ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight })
         : await runtime.run({ bucket, deadline, preflight });
+      // Round-6 fix 4: the response-status reads share the SAME route budget. An expired budget degrades
+      // the refresh to a TYPED unavailable marker -- the action result itself is still reported honestly.
+      const boundedStatus = async () => {
+        try {
+          return await deadline.bound("status-reads", () => statusPayload());
+        } catch (error) {
+          if (error && error.code === "ROUTE_DEADLINE_EXCEEDED") return { unavailable: "ROUTE_DEADLINE_EXCEEDED" };
+          throw error;
+        }
+      };
       if (result && result.refused === true) {
-        res.status(409).json({ refusal: result, status: await statusPayload() });
+        res.status(409).json({ refusal: result, status: await boundedStatus() });
         return;
       }
-      res.status(200).json({ result, status: await statusPayload() });
+      res.status(200).json({ result, status: await boundedStatus() });
       return;
     }
 

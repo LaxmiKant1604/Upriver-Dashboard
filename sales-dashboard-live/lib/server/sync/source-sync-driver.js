@@ -16,7 +16,7 @@ import {
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt, adoptSourceExportCache,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
-  upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
+  upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobOwnersForCycle, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
   persistSourceTrancheBudget, reserveSourceExportCreate, getSourceTrancheBudget, getSourceTrancheBudgetHashes,
 } from "../supabase.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
@@ -245,6 +245,9 @@ export function makeSupabaseSourceStore() {
     // Many-to-many owner memberships (sync_source_job_owners) -- canonical jobs stay one row/export.
     upsertSourceJobOwners: (memberships) => upsertSyncSourceJobOwners(memberships),
     listSourceJobOwners: (cycleId, ownerIds) => getSyncSourceJobOwners(cycleId, ownerIds),
+    // Round-6 fix 5: EVERY owner membership of the cycle -- the authoritative account<->hash ownership the
+    // source-first report lineage builds ACCOUNT-EXACT depends_on from.
+    listCycleOwners: (cycleId, opts) => getSyncSourceJobOwnersForCycle(cycleId, opts),
     listSourceJobsForOwners: (cycleId, ownerIds) => getSyncSourceJobsForOwners(cycleId, ownerIds),
     recordSourceOwnerStale: (args) => recordSyncSourceJobOwnerStale(args),
     claimExportAttempt: (cycleId, requestHash) => claimSourceExportAttempt(cycleId, requestHash),

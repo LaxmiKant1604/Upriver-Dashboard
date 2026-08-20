@@ -12,7 +12,7 @@
 // stays a deliberate, operator-driven act behind the four durable gates the core enforces.
 
 import { publishSchedulerV2Snapshot } from "./report-publisher.js";
-import { SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
+import { SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS } from "./report-publisher.js";
 import { makeProductionDiscoverAccounts } from "./runtime-composition.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
@@ -41,7 +41,7 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     // BUILD-TIME test seam only (like every override above): production callers pass nothing and get the
     // frozen production readiness set (post-Gate-7b: the 13 approved keys) -- the composed publish() surface
     // has no way to supply or widen this, and gates 2-4 (durable enable + approval) still gate every publish.
-    codeReadyKeys = SCHEDULER_V2_READY_REPORT_KEYS,
+    codeReadyKeys = SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS,
   } = overrides;
 
   const connections = connectionsOverride != null ? connectionsOverride : getConnections();

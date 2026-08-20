@@ -1115,7 +1115,7 @@ test("(EM4) least-privilege service_role ACL: proven for all 3 tables; missing-r
 // =================================================================================================
 group("F. all 13 scheduler->live mappings statically pinned against the REAL live route truths");
 
-test("(F1) exactly 13 contracts; key/version/params pinned; insight versions equal the live modules' constants", () => {
+test("(F1) exactly 14 contracts (13 dispatch + the source-promoted brand-inventory); key/version/params pinned; insight versions equal the live modules' constants", () => {
   const EXPECTED_VERSIONS = {
     "brand-sales": "brand-sales-shared-v1",
     "daily-reporting": "daily-reporting-shared-v1",
@@ -1130,9 +1130,12 @@ test("(F1) exactly 13 contracts; key/version/params pinned; insight versions equ
     "returns-leakage": "returns-leakage-v2",
     "ppc-performance": "ppc-performance-v1",
     "listing-optimizer": "listing-optimizer-v1",
+    // Round-6 fix 3: the source-promoted compact Brand View inventory -- publishable through the same
+    // four gates, NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below).
+    "brand-inventory": "brand-inventory-shared-v1",
   };
   assert.ok(Object.isFrozen(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS), "the contract table is frozen");
-  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 scheduler reports");
+  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 dispatch reports + the 1 source-promoted report");
   for (const [key, version] of Object.entries(EXPECTED_VERSIONS)) {
     const c = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key];
     assert.equal(c.liveReportKey, key, key + ": live key === scheduler key");

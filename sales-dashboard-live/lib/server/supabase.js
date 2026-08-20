@@ -33,8 +33,11 @@ function requireConfiguration() {
   }
 }
 
-async function request(path, { method = "GET", body, headers = {} } = {}) {
+async function request(path, { method = "GET", body, headers = {}, signal = null } = {}) {
   requireConfiguration();
+  // Round-6 fix 4: an optional route-owned AbortSignal reaches the REAL HTTP layer, so a bounded route can
+  // genuinely abort an in-flight PostgREST request instead of merely abandoning its promise. Callers that
+  // pass no signal are byte-identical to before.
   const response = await fetch(`${SUPABASE_URL}${path}`, {
     method,
     headers: {
@@ -44,6 +47,7 @@ async function request(path, { method = "GET", body, headers = {} } = {}) {
       ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
@@ -67,7 +71,7 @@ function storageObjectUrl(bucket, objectPath) {
   return `${SUPABASE_URL}/storage/v1/object/${safeBucket}/${safePath}`;
 }
 
-async function putPrivateStorageObject(bucket, objectPath, contents, contentType = "application/json") {
+async function putPrivateStorageObject(bucket, objectPath, contents, contentType = "application/json", { signal = null } = {}) {
   requireConfiguration();
   const response = await fetch(storageObjectUrl(bucket, objectPath), {
     method: "POST",
@@ -78,6 +82,7 @@ async function putPrivateStorageObject(bucket, objectPath, contents, contentType
       "x-upsert": "true",
     },
     body: contents,
+    ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
     const result = await response.json().catch(() => null);
@@ -85,13 +90,14 @@ async function putPrivateStorageObject(bucket, objectPath, contents, contentType
   }
 }
 
-async function getPrivateStorageJson(bucket, objectPath) {
+async function getPrivateStorageJson(bucket, objectPath, { signal = null } = {}) {
   requireConfiguration();
   const response = await fetch(storageObjectUrl(bucket, objectPath), {
     headers: {
       apikey: SUPABASE_SECRET_KEY,
       Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
     },
+    ...(signal ? { signal } : {}),
   });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Supabase Storage download failed (${response.status}).`);
@@ -606,16 +612,17 @@ export async function insertSyncError({ runId, reportKey = "", accountId = "", p
   }).catch(() => {});
 }
 
-export async function insertAuditLog({ actorUserId = null, action, target = {} }) {
+export async function insertAuditLog({ actorUserId = null, action, target = {} }, { signal = null } = {}) {
   await request("/rest/v1/audit_log", {
     method: "POST",
+    signal,
     headers: { Prefer: "return=minimal" },
     body: { actor_user_id: actorUserId, action, target },
   }).catch(() => {});
 }
 
-export async function getReportSyncSettings() {
-  return request("/rest/v1/report_sync_settings?select=report_key,schedule_enabled,updated_at&order=report_key.asc");
+export async function getReportSyncSettings({ signal = null } = {}) {
+  return request("/rest/v1/report_sync_settings?select=report_key,schedule_enabled,updated_at&order=report_key.asc", { signal });
 }
 
 export async function setReportSyncSetting({ reportKey, scheduleEnabled, updatedBy }) {
@@ -650,13 +657,13 @@ export async function claimSyncCycle(cycleId) {
   return request("/rest/v1/rpc/claim_sync_cycle", { method: "POST", body: { p_cycle_id: cycleId } });
 }
 
-export async function getSyncCycle(cycleId) {
+export async function getSyncCycle(cycleId, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "id,bucket,cycle_date,status,started_at,finished_at,source_total,source_succeeded,source_failed",
     id: `eq.${cycleId}`,
     limit: "1",
   });
-  const rows = await request(`/rest/v1/sync_cycles?${query}`);
+  const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });
   return rows[0] || null;
 }
 
@@ -792,9 +799,10 @@ export async function adoptSourceExportCache({ cycleId, requestHash, sourceId, o
 // assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the
 // (existing or newly assigned) batch_index for (family, account). An already-assigned account keeps its
 // index (never reshuffled); a new account is placed into a non-full or fresh batch under the 5-cap.
-export async function assignSourceAccountBatch({ batchFamily, accountId, connectionId, organizationFingerprint, max = 5 }) {
+export async function assignSourceAccountBatch({ batchFamily, accountId, connectionId, organizationFingerprint, max = 5, signal = null }) {
   const body = await request("/rest/v1/rpc/assign_source_account_batch", {
     method: "POST",
+    signal,
     body: {
       p_batch_family: batchFamily,
       p_account_id: accountId,
@@ -809,13 +817,13 @@ export async function assignSourceAccountBatch({ batchFamily, accountId, connect
 
 // Read the durable batch membership for one family (admin/service-role only). Returns rows
 // { account_id, batch_index, connection_id, organization_fingerprint }.
-export async function listSourceBatchMembership(batchFamily) {
+export async function listSourceBatchMembership(batchFamily, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "account_id,batch_index,connection_id,organization_fingerprint",
     batch_family: `eq.${batchFamily}`,
     order: "batch_index.asc,account_id.asc",
   });
-  const rows = await request(`/rest/v1/source_batch_membership?${query}`);
+  const rows = await request(`/rest/v1/source_batch_membership?${query}`, { signal });
   return Array.isArray(rows) ? rows : [];
 }
 
@@ -944,13 +952,14 @@ export async function upsertSourceOliHistoryRows(rows) {
  * written. An empty rows array is valid zero-sales evidence. Returns a typed outcome (never throws for a
  * schema-missing/unapplied migration -- the caller fails closed on write !== "ok").
  */
-export async function replaceOliHistoryWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, sourceRefreshedAt = null }) {
+export async function replaceOliHistoryWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, sourceRefreshedAt = null, signal = null }) {
   if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(rows)) {
     throw new Error("replaceOliHistoryWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a rows array (fail closed).");
   }
   try {
     const body = await request("/rest/v1/rpc/replace_oli_history_window", {
       method: "POST",
+      signal,
       body: {
         p_organization_fingerprint: organizationFingerprint,
         p_connection_id: connectionId,
@@ -1003,23 +1012,23 @@ export function sourceSnapshotObjectPath({ organizationFingerprint, connectionId
   return `${SOURCE_SNAPSHOT_OBJECT_PREFIX}/${clean(organizationFingerprint)}/${connectionId}/${clean(sourceKey)}/${clean(scopeKey)}/${clean(payloadSha)}.json`;
 }
 
-export async function saveSourceSnapshotPayload({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, rows }) {
+export async function saveSourceSnapshotPayload({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, rows, signal = null }) {
   if (!Array.isArray(rows)) throw new Error("saveSourceSnapshotPayload requires a rows array (fail closed).");
   const payloadSha = sourceSnapshotPayloadSha(rows);
   const objectPath = sourceSnapshotObjectPath({ organizationFingerprint, connectionId, sourceKey, scopeKey, payloadSha });
   const body = JSON.stringify({ rows });
-  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, body);
+  await putPrivateStorageObject(SOURCE_CACHE_BUCKET, objectPath, body, "application/json", { signal });
   return { objectPath, payloadSha, payloadBytes: Buffer.byteLength(body) };
 }
 
 // Hydrate + PROVE: the payload must be a rows array whose content hash matches the hash embedded in the
 // object name -- a truncated/foreign/mutated object can never masquerade as the recorded save.
-export async function getSourceSnapshotPayload(objectPath) {
+export async function getSourceSnapshotPayload(objectPath, { signal = null } = {}) {
   const path = String(objectPath || "");
   if (!path.startsWith(`${SOURCE_SNAPSHOT_OBJECT_PREFIX}/`)) {
     throw new Error("getSourceSnapshotPayload only hydrates durable source-snapshot objects (fail closed).");
   }
-  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, path);
+  const payload = await getPrivateStorageJson(SOURCE_CACHE_BUCKET, path, { signal });
   if (!payload || !Array.isArray(payload.rows)) {
     const err = new Error("SOURCE_SNAPSHOT_PAYLOAD_MALFORMED: the hydrated snapshot payload has no rows array (fail closed).");
     err.code = "SOURCE_SNAPSHOT_PAYLOAD_MALFORMED";
@@ -1038,7 +1047,7 @@ export const SOURCE_OLI_HISTORY_MAX_ROWS = 200000;
 
 // Bounded canonical-history read. STRICT cap: at/over the limit the read is refused with a typed error
 // rather than silently truncated (a truncated series would understate sales).
-export async function getSourceOliHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS } = {}) {
+export async function getSourceOliHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, signal = null } = {}) {
   if (!organizationFingerprint || !from || !to) {
     throw new Error("getSourceOliHistoryRows requires organizationFingerprint + from + to (fail closed).");
   }
@@ -1054,7 +1063,7 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
   if (Array.isArray(accountIds) && accountIds.length) {
     query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
   }
-  const rows = await request(`/rest/v1/source_oli_daily_history?${query}`);
+  const rows = await request(`/rest/v1/source_oli_daily_history?${query}`, { signal });
   const list = Array.isArray(rows) ? rows : [];
   if (list.length >= maxRows) {
     const err = new Error("OLI_HISTORY_ROW_LIMIT_EXCEEDED: durable OLI history read reached its row cap; refusing a truncated series (fail closed).");
@@ -1065,7 +1074,7 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
 }
 
 // Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.
-export async function getSourceCoverageWindows({ organizationFingerprint, connectionId = "primary", accountId, sourceKey }) {
+export async function getSourceCoverageWindows({ organizationFingerprint, connectionId = "primary", accountId, sourceKey, signal = null }) {
   try {
     const query = new URLSearchParams({
       select: "covered_from,covered_to",
@@ -1076,7 +1085,7 @@ export async function getSourceCoverageWindows({ organizationFingerprint, connec
       status: "eq.succeeded",
       order: "covered_from.asc",
     });
-    const rows = await request(`/rest/v1/source_coverage?${query}`);
+    const rows = await request(`/rest/v1/source_coverage?${query}`, { signal });
     return { windows: (rows || []).map((r) => ({ from: r.covered_from, to: r.covered_to })), read: "ok", error: null };
   } catch (readError) {
     if (isSchemaMissingError(readError)) return { windows: [], read: "schema-missing", error: "SOURCE_COVERAGE_SCHEMA_MISSING" };
@@ -1116,9 +1125,9 @@ export async function recordSourceCoverageWindows(rows) {
 
 // SOURCE-level controls (Data Sync Center). Reads return every row; a missing schema reads as [] with a
 // typed marker so the UI can say "not migrated" rather than "everything running".
-export async function getSourceControls() {
+export async function getSourceControls({ signal = null } = {}) {
   try {
-    const rows = await request("/rest/v1/source_controls?select=source_key,paused,schedule_enabled,updated_at&order=source_key.asc");
+    const rows = await request("/rest/v1/source_controls?select=source_key,paused,schedule_enabled,updated_at&order=source_key.asc", { signal });
     return { rows: Array.isArray(rows) ? rows : [], read: "ok", error: null };
   } catch (readError) {
     if (isSchemaMissingError(readError)) return { rows: [], read: "schema-missing", error: "SOURCE_CONTROLS_SCHEMA_MISSING" };
@@ -1155,7 +1164,7 @@ export async function getSourceRunStatuses() {
 
 const SAFE_ERROR_MAX = 200;
 
-export async function upsertSourceRunStatus(entry) {
+export async function upsertSourceRunStatus(entry, { signal = null } = {}) {
   const key = String(entry && entry.sourceKey || "").trim();
   const bucket = entry && entry.bucket;
   if (!key || (bucket !== "us" && bucket !== "non-us")) {
@@ -1180,13 +1189,14 @@ export async function upsertSourceRunStatus(entry) {
   setIf("tokens_ceiling", entry.tokensCeiling);
   await request("/rest/v1/source_run_status?on_conflict=source_key,bucket", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: [body],
   });
   return { write: "ok" };
 }
 
-export async function getSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey }) {
+export async function getSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, signal = null }) {
   if (!organizationFingerprint) throw new Error("getSourceSnapshot requires the organizationFingerprint (isolated durable identity; fail closed).");
   try {
     const query = new URLSearchParams({
@@ -1197,7 +1207,7 @@ export async function getSourceSnapshot({ organizationFingerprint, connectionId 
       scope_key: `eq.${scopeKey}`,
       limit: "1",
     });
-    const rows = await request(`/rest/v1/source_snapshots?${query}`);
+    const rows = await request(`/rest/v1/source_snapshots?${query}`, { signal });
     return { snapshot: rows && rows[0] ? rows[0] : null, read: "ok", error: null };
   } catch (readError) {
     if (isSchemaMissingError(readError)) return { snapshot: null, read: "schema-missing", error: "SOURCE_SNAPSHOT_SCHEMA_MISSING" };
@@ -1211,7 +1221,7 @@ export async function getSourceSnapshot({ organizationFingerprint, connectionId 
 // a validated snapshot through this wrapper (latest-good preserved by construction). The pointer upsert is
 // the atomic protocol's second half: the immutable content-addressed object was uploaded FIRST, so whatever
 // save wins the pointer CAS, its metadata always references a complete object of ITS OWN content.
-export async function recordSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, objectPath, payloadSha, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt }) {
+export async function recordSourceSnapshot({ organizationFingerprint, connectionId = "primary", sourceKey, scopeKey, objectPath, payloadSha, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt, signal = null }) {
   const org = String(organizationFingerprint || "").trim();
   const key = String(sourceKey || "").trim();
   const scope = String(scopeKey || "").trim();
@@ -1232,6 +1242,7 @@ export async function recordSourceSnapshot({ organizationFingerprint, connection
   // (fail closed, no write).
   const body = await request("/rest/v1/rpc/record_source_snapshot", {
     method: "POST",
+    signal,
     body: {
       p_organization_fingerprint: org, p_connection_id: connectionId,
       p_source_key: key, p_scope_key: scope, p_object_path: path, p_payload_sha: sha,
@@ -1385,6 +1396,22 @@ export async function getSyncSourceJobOwners(cycleId, ownerIds) {
   return request(`/rest/v1/sync_source_job_owners?${query}`);
 }
 
+// Round-6 fix 5: EVERY owner membership of one cycle (no owner-id filter). This is the AUTHORITATIVE
+// account<->request_hash ownership the source-first lineage builds depends_on from: a batched OLI hash has
+// one row per member account, an FBA hash exactly its account's row, and the organization-wide catalog its
+// "__organization" row -- so a report job can depend ONLY on hashes its account genuinely owns (or the
+// shared organization scope), never on another batch's export. Bounded: a cycle holds at most
+// jobs x <=5 memberships.
+export async function getSyncSourceJobOwnersForCycle(cycleId, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: SOURCE_JOB_OWNER_COLUMNS,
+    cycle_id: `eq.${cycleId}`,
+    order: "created_at.asc",
+  });
+  const rows = await request(`/rest/v1/sync_source_job_owners?${query}`, { signal });
+  return Array.isArray(rows) ? rows : [];
+}
+
 // List the CANONICAL source jobs the declared owners depend on: their ACTIVE memberships' request_hashes,
 // deduplicated, then the canonical rows for those hashes. (Powers admin report-wise / owner-scoped sync.)
 export async function getSyncSourceJobsForOwners(cycleId, ownerIds) {
@@ -1481,12 +1508,13 @@ export async function getSyncReportJobs(cycleId) {
 
 // Insert-if-absent so a resumed invocation never resets an in-progress/completed report job.
 // connection_id must be explicit (fail-closed, like the source jobs); no silent 'primary'.
-export async function upsertSyncReportJob(job) {
+export async function upsertSyncReportJob(job, { signal = null } = {}) {
   if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
     throw new Error(`upsertSyncReportJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
   }
   await request("/rest/v1/sync_report_jobs?on_conflict=cycle_id,report_key,account_id", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
     body: {
       cycle_id: job.cycleId,
@@ -1503,19 +1531,20 @@ export async function upsertSyncReportJob(job) {
 // Atomic single-derive guard: transition pending -> running for exactly this (cycle, report,
 // account). return=representation returns the row(s) actually updated; a concurrent worker
 // that already moved it off 'pending' updates zero rows and loses the claim.
-export async function claimReportDeriveAttempt(cycleId, reportKey, accountId) {
+export async function claimReportDeriveAttempt(cycleId, reportKey, accountId, { signal = null } = {}) {
   const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, report_key: `eq.${reportKey}`, account_id: `eq.${accountId}`, derive_status: "eq.pending" });
   const rows = await request(`/rest/v1/sync_report_jobs?${query}`, {
     method: "PATCH",
+    signal,
     headers: { Prefer: "return=representation" },
     body: { derive_status: "running" },
   });
   return Array.isArray(rows) && rows.length === 1;
 }
 
-async function patchSyncReportJob(cycleId, reportKey, accountId, body) {
+async function patchSyncReportJob(cycleId, reportKey, accountId, body, { signal = null } = {}) {
   const query = new URLSearchParams({ cycle_id: `eq.${cycleId}`, report_key: `eq.${reportKey}`, account_id: `eq.${accountId}` });
-  await request(`/rest/v1/sync_report_jobs?${query}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body });
+  await request(`/rest/v1/sync_report_jobs?${query}`, { method: "PATCH", signal, headers: { Prefer: "return=minimal" }, body });
 }
 
 // A required source failed/was skipped: block THIS report TERMINALLY for the cycle so it is
@@ -1549,13 +1578,13 @@ export async function recordSyncReportFailure({ cycleId, reportKey, accountId, s
 
 // SUCCESS requires fetch + derive + validate + save all passing. Sets validated=true, records
 // the snapshot key + latest data date, and stamps last_good_snapshot_at.
-export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, latestDataDate = null, rowCount = null, payloadBytes = null, snapshotParamsHash = null, durationMs = null }) {
+export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, latestDataDate = null, rowCount = null, payloadBytes = null, snapshotParamsHash = null, durationMs = null }, { signal = null } = {}) {
   await patchSyncReportJob(cycleId, reportKey, accountId, {
     fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true,
     latest_data_date: latestDataDate, row_count: rowCount, payload_bytes: payloadBytes,
     snapshot_params_hash: snapshotParamsHash, last_good_snapshot_at: new Date().toISOString(),
     succeeded_at: new Date().toISOString(), error_stage: null, error_code: null, error_message: null,
-  });
+  }, { signal });
 }
 
 /**
@@ -1808,7 +1837,7 @@ export async function casUpdateReportSnapshotByRev({ reportKey, accountId, param
   return Array.isArray(rows) && rows.length > 0;
 }
 
-export async function getAdDailyMetrics(accountId, from, to) {
+export async function getAdDailyMetrics(accountId, from, to, { signal = null } = {}) {
   const fetchPage = (cursor) => {
     const query = new URLSearchParams({
       select: "metric_date,campaign_id,campaign_type,currency,ad_sales,ad_spend,ad_clicks",
@@ -1825,7 +1854,7 @@ export async function getAdDailyMetrics(accountId, from, to) {
       // Strictly-after (d,ci,ct,cu) in the composite order, ANDed with the account/window filters.
       query.set("or", `(metric_date.gt.${d},and(metric_date.eq.${d},campaign_id.gt.${ci}),and(metric_date.eq.${d},campaign_id.eq.${ci},campaign_type.gt.${ct}),and(metric_date.eq.${d},campaign_id.eq.${ci},campaign_type.eq.${ct},currency.gt.${cu}))`);
     }
-    return request(`/rest/v1/ad_daily_metrics?${query}`);
+    return request(`/rest/v1/ad_daily_metrics?${query}`, { signal });
   };
   return paginateAdDailyMetrics({ fetchPage });
 }
@@ -1838,7 +1867,7 @@ export async function getAdDailyMetrics(accountId, from, to) {
  * the payload metadata (future Data Sync Center). Only SAFE codes are returned -- never a raw DB
  * response or secret. Coverage is proven from SUCCESSFUL sync windows, not from the first/last
  * returned metric row (a successfully-covered day can have zero ads and thus no row). */
-export async function getDailyAdsCoverage(accountId, sourceKey) {
+export async function getDailyAdsCoverage(accountId, sourceKey, { signal = null } = {}) {
   let windows = [];
   let read = "ok";
   let error = null;
@@ -1850,7 +1879,7 @@ export async function getDailyAdsCoverage(accountId, sourceKey) {
       status: "eq.succeeded",
       order: "covered_from.asc",
     });
-    const rows = await request(`/rest/v1/ads_sync_coverage?${query}`);
+    const rows = await request(`/rest/v1/ads_sync_coverage?${query}`, { signal });
     windows = (rows || []).map((row) => ({ from: row.covered_from, to: row.covered_to }));
   } catch (readError) {
     read = isSchemaMissingError(readError) ? "schema-missing" : "read-failed";
@@ -1915,10 +1944,10 @@ export async function recordAdsCoverageWindows(rows) {
  * bypassed. Rather than silently trim it into a DIFFERENT account, the whole read fails closed
  * ("noncanonical-id" => zero accounts). Never throws; never returns a partial/guessed state as "ok".
  */
-export async function getSchedulerAccountRollout() {
+export async function getSchedulerAccountRollout({ signal = null } = {}) {
   try {
-    const modeRows = await request("/rest/v1/scheduler_rollout_mode?select=all_primary&id=eq.1");
-    const allowRows = await request("/rest/v1/scheduler_account_rollout?select=account_id&enabled=eq.true&order=account_id.asc");
+    const modeRows = await request("/rest/v1/scheduler_rollout_mode?select=all_primary&id=eq.1", { signal });
+    const allowRows = await request("/rest/v1/scheduler_account_rollout?select=account_id&enabled=eq.true&order=account_id.asc", { signal });
     const allPrimary = !!(modeRows && modeRows[0] && modeRows[0].all_primary === true);
     const rawIds = (allowRows || []).map((r) => (r && typeof r.account_id === "string" ? r.account_id : ""));
     // Fail closed on a NONCANONICAL durable id (never silently trim it into another account).

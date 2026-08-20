@@ -1156,6 +1156,28 @@ const REGISTRY = {
     // empty Ads window. Never asOf / fetched_at / saved_at / Date.now().
     latestDataDate: (p) => (p && isValidCalendarDate(p.latestMetricDate) ? p.latestMetricDate : null),
   },
+  // Round-6 fix 3: the compact Brand View inventory. PRODUCED by the SOURCE-FIRST durable runtime
+  // (buildBrandInventorySnapshot over hydrated durable FBA evidence -- lib/server/sync/
+  // source-bucket-sync-runtime.js), NEVER by the tranche derive pipeline: `derive` stays null ("not wired"),
+  // it declares NO source contract (declaredRequestKeys => []), and it is NOT in CONTROLLED_REPORT_KEYS, so
+  // no dispatcher can plan it. This entry exists so the REVIEWED publisher can validate its shadow
+  // snapshots exactly like every other report: snapshotVersion EQUALS the live shared version (the compact
+  // contract IS the live contract -- BRAND_INVENTORY_REPORT_VERSION in lib/server/reports/brand-view.js;
+  // equality is pinned by test), and validatePayload proves the exact compact shape Brand View's
+  // isCompactInventorySnapshot gate consumes.
+  "brand-inventory": {
+    snapshotVersion: "brand-inventory-shared-v1",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: null,
+    validatePayload: (p) => !!p && typeof p === "object" && !Array.isArray(p)
+      && Array.isArray(p.inventoryByBrandCountry)
+      && ("inventoryDate" in p) && (p.inventoryDate === null || isValidCalendarDate(p.inventoryDate))
+      && ("inventoryAvailable" in p),
+    // Latest real data date = the latest VALIDATED in-window FBA snapshot date the fold selected; null for
+    // a validated empty snapshot. Never asOf / fetched_at / saved_at.
+    latestDataDate: (p) => (p && isValidCalendarDate(p.inventoryDate) ? p.inventoryDate : null),
+  },
 };
 
 // Freeze each entry with computed requiredRequestKeys (declared keys minus optional).

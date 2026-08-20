@@ -30,10 +30,20 @@
 // natural-key row). NO browser route imports this module (structurally tested).
 
 import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
-import { SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
+import { SCHEDULER_V2_READY_REPORT_KEYS, SOURCE_PROMOTED_REPORT_KEYS } from "./report-controls.js";
 import { resolveRolloutAccounts } from "./account-rollout.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { paramsHashFor } from "../report-store.js";
+
+// Round-6 fix 3: the publisher's CODE-readiness set = the 13 approved DISPATCH keys plus the
+// source-promoted keys (compact brand-inventory). Source-promoted keys are publishable through the SAME
+// four gates (code readiness + durable enable + rollout + audited approval) and the SAME CAS/LKG live
+// write, but stay OUTSIDE CONTROLLED_REPORT_KEYS so no dispatcher can ever select them (see
+// report-controls.js SOURCE_PROMOTED_REPORT_KEYS).
+export const SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS = Object.freeze([
+  ...SCHEDULER_V2_READY_REPORT_KEYS,
+  ...SOURCE_PROMOTED_REPORT_KEYS,
+]);
 
 const norm = (s) => String(s ?? "").trim();
 // STRICT calendar-date gate (shared validator): the value must be a REAL YYYY-MM-DD day -- an impossible
@@ -103,6 +113,16 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     liveReportKey: "listing-optimizer", liveReportVersion: "listing-optimizer-v1",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
+  // Round-6 fix 3: the compact Brand View inventory, PRODUCED by the source-first durable runtime and
+  // PROMOTED (never dispatched) -- transcribed from the EXECUTABLE live route (api/datadoe.js
+  // sharedSnapshotSpec case "brand-inventory": reportKey brand-inventory, reportVersion
+  // brand-inventory-shared-v1, params { to }). The live shared version EQUALS the shadow snapshotVersion:
+  // the compact contract IS the live contract (lib/server/reports/brand-view.js
+  // BRAND_INVENTORY_REPORT_VERSION), so isCompactInventorySnapshot accepts the promoted row unchanged.
+  "brand-inventory": Object.freeze({
+    liveReportKey: "brand-inventory", liveReportVersion: "brand-inventory-shared-v1",
+    liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
+  }),
 });
 
 // Typed safe dispositions (the ONLY values publishSchedulerV2Snapshot returns in `disposition`).
@@ -149,7 +169,7 @@ const CAS_OUTCOME_DISPOSITION = Object.freeze({
  */
 export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId }) {
   const {
-    codeReadyKeys = SCHEDULER_V2_READY_REPORT_KEYS,
+    codeReadyKeys = SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS,
     getReportSyncSettings, loadAccountRollout, discoverPrimaryAccounts, getPublishApproval,
     getLatestReportJob, getShadowSnapshot, loadStoragePayload, publishLive,
   } = deps || {};

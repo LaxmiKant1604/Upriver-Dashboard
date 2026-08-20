@@ -75,6 +75,22 @@ export const SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([
   "listing-optimizer",
 ]);
 
+// Round-6 fix 3: reports PRODUCED by the source-first durable runtime (compact Brand View inventory) and
+// PROMOTED to their live identity ONLY through the reviewed publisher composition. DELIBERATELY DISJOINT
+// from CONTROLLED_REPORT_KEYS and SCHEDULER_V2_READY_REPORT_KEYS:
+//   - NOT in CONTROLLED_REPORT_KEYS => neither Scheduler v1's catalog nor the v2 dispatcher's control plane
+//     ever lists it, so NO scheduled/manual tranche dispatch can ever select it (structurally, not by
+//     configuration) and Scheduler v1 is byte-identical;
+//   - publisher CODE readiness (SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS in report-publisher.js) is the union
+//     of the 13 approved dispatch keys and this literal, so the publisher can promote it through the SAME
+//     four gates every other report passes (code readiness + durable report enable + account rollout +
+//     explicit audited per-(report, account) approval) with the SAME CAS/LKG live write;
+//   - nothing publishes automatically: no dispatcher/source-runtime path invokes the publisher for these
+//     keys (or any key); promotion is an explicit reviewed publish() call.
+export const SOURCE_PROMOTED_REPORT_KEYS = Object.freeze([
+  "brand-inventory",
+]);
+
 // The Scheduler-v2 control catalog: SAME row shape as reportControlCatalog, but `ready` is the explicit
 // fail-closed v2 readiness (NOT v1 `enabled`). Consumed by the Scheduler-v2 dispatcher as its default control
 // plane so a v1-live report can never be v2-dispatched until its own v2 cutover is reviewed. Scheduler v1's

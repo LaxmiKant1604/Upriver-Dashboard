@@ -184,7 +184,7 @@ function makeComposition({ paused = [], calls } = {}) {
     assignBatchMembership: async () => { record.assigns = (record.assigns || 0) + 1; return record.assigns - 1 >= 0 ? 0 : 0; },
     replaceHistory: async ({ rows }) => ({ write: "ok", replaced: 0, inserted: rows.length }),
     saveSnapshotPayload: async ({ sourceKey, scopeKey }) => ({ objectPath: "source-snapshots/v1/" + sourceKey + "/" + scopeKey + ".json", payloadBytes: 2 }),
-    recordSnapshot: async () => ({ write: "ok" }),
+    recordSnapshot: async () => ({ write: "ok", ack: "replaced" }), // round-6 fix 2: the typed CAS acknowledgement is REQUIRED
     loadSnapshotPayload: async () => ({ rows: [] }),
     loadHistoryRows: async () => [],
     makeShadowSaver: () => async () => ({ paramsHash: "ph" }),
