@@ -45,7 +45,7 @@ import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
 } from "./durable-dashboards.js";
-import { shadowSnapshotKey } from "./report-derivation.js";
+import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
@@ -55,8 +55,19 @@ import {
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
+  getReportSnapshotStoragePayload,
 } from "../supabase.js";
 import { paramsHashFor } from "../report-store.js";
+
+// Round-8 finding 2: a stable canonical JSON so a durable snapshot's content can be proven byte-identical to
+// the freshly derived candidate regardless of key insertion order (arrays keep order; objects sort keys).
+function canonicalJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
 
 export { SOURCE_SYNC_OWNER_REPORT_KEY };
 
@@ -256,6 +267,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // The EXACT-identity durable shadow-snapshot read used to adopt an already-saved snapshot on recovery
     // (a shadow-save commit-unknown left it durable) so recovery re-saves ONLY when it is genuinely absent.
     readShadowSnapshot = getReportSnapshot,
+    // Round-8 finding 2: the trusted storage hydrator for a storage-backed durable snapshot payload, used to
+    // validate a recovered snapshot's CONTENT before adoption (a dangling/unreadable object fails closed).
+    loadShadowStoragePayload = getReportSnapshotStoragePayload,
     composeTrancheRuntime = buildSchedulerV2SourceTrancheRuntime,
     replaceHistory = replaceOliHistoryWindow,
     saveSnapshotPayload = saveSourceSnapshotPayload,
@@ -829,8 +843,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         accountId: snap.accountId, connectionId: "primary", bucket,
         dependsOn: succeededHashesFor(snap.accountId, LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
       }, { signal }), { write: true });
+      // Round-8 finding 1: the claim uses DATABASE-authoritative time -- NO caller clock is passed.
       const lease = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimLease(
-        rollup.cycleId, snap.productionReportKey, snap.accountId, { now: nowIso(), leaseSeconds: reportDeriveLeaseSeconds, signal },
+        rollup.cycleId, snap.productionReportKey, snap.accountId, { leaseSeconds: reportDeriveLeaseSeconds, signal },
       ), { write: true });
       const disp = lease && lease.disposition;
       if (disp === "already-complete") { note("already-complete"); return { complete: true, newlySaved: false, saved: null, lineage: "already-complete" }; }
@@ -842,10 +857,41 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       const leaseToken = lease.leaseToken;
       const recovered = disp === "reclaimed";
-      // Adopt the EXACT durable snapshot if it already exists; else save it once. Zero DataDoe either way.
+      const entry = REPORT_DERIVATIONS[snap.productionReportKey] || null;
+      // Round-8 finding 2: NEVER adopt a durable snapshot merely because its identity row exists. If a row is
+      // present at our EXACT identity, VALIDATE it fully -- params provenance (stored params recompute to the
+      // hash), exact derivation version + account, storage-backed payload hydrated through the trusted loader
+      // (dangling/unavailable => fail closed), the exact report payload contract, and byte-identical content
+      // vs the freshly derived candidate -- else fail closed with a TYPED conflict/integrity outcome (never
+      // reconcile, never set validated=true). When no row exists, save the fresh candidate once.
+      const validateDurableSnapshot = async (row) => {
+        const p = row && row.params && typeof row.params === "object" && !Array.isArray(row.params) ? row.params : null;
+        if (!p || typeof p.reportVersion !== "string") return { ok: false, reason: "params-missing" };
+        if (String(row.params_hash ?? row.paramsHash) !== paramsHash) return { ok: false, reason: "hash-mismatch" };
+        if (!entry || p.reportVersion !== entry.snapshotVersion) return { ok: false, reason: "wrong-version" };
+        if (String(p.accountId) !== String(snap.accountId)) return { ok: false, reason: "wrong-account" };
+        if (paramsHashFor(p.reportVersion, p) !== paramsHash) return { ok: false, reason: "params-provenance" };
+        let payload = row.payload;
+        if (payload == null) {
+          const path = String(row.payload_storage_path ?? row.payloadStoragePath ?? "").trim();
+          if (!path) return { ok: false, reason: "payload-unavailable" };
+          try { payload = await dl.bound("shadow-hydrate", (signal) => loadShadowStoragePayload(path, { signal })); }
+          catch (e) { if (dl.isDeadlineError(e)) throw e; payload = null; }
+          if (payload == null) return { ok: false, reason: "payload-dangling" };
+        }
+        if (!(entry && typeof entry.validatePayload === "function" && entry.validatePayload(payload) === true)) return { ok: false, reason: "payload-invalid" };
+        if (canonicalJson(payload) !== canonicalJson(snap.payload)) return { ok: false, reason: "content-conflict" };
+        return { ok: true };
+      };
       const existing = await dl.bound("shadow-read", (signal) => readShadowSnapshot({ reportKey: snap.reportKey, accountId: snap.accountId, paramsHash }, { signal }));
       let newlySaved = false;
-      if (!existing || String(existing.params_hash ?? existing.paramsHash) !== paramsHash) {
+      if (existing) {
+        const verdict = await validateDurableSnapshot(existing);
+        if (!verdict.ok) {
+          note("snapshot-conflict", verdict.reason);
+          return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: verdict.reason };
+        }
+      } else {
         const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
         if (saved && saved.paramsHash && saved.paramsHash !== paramsHash) {
           throw new Error("SNAPSHOT_PARAMS_HASH_DRIFT: the saver-computed hash disagrees with the reconcile hash; refusing (fail closed).");
@@ -918,7 +964,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         if (r.complete) brandInventory.saved += 1;
       }
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
-    rollup.derived.skipped = null;
+    // Round-8 finding 3: an HONEST rollup. derived.skipped stays null ONLY when EVERY report reached a
+    // genuine completion (recorded / recovered / already-complete). If any required lineage item is
+    // incomplete, skipped is a typed non-null and the incomplete items are enumerated; held / reconcile-lost
+    // / transient-claim-failure are RESUMABLE (continuationRequired=true so a later invocation recovers them
+    // WITHOUT any DataDoe export), while a snapshot conflict/integrity failure or a terminal report is a
+    // typed non-resumable incompleteness (the shared cycle honestly stays open -- finalize returns open-work
+    // -- until it is genuinely resolved). A source-only run never fabricates a completed rollup.
+    const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete"]);
+    const RESUMABLE_OUTCOMES = new Set(["claim-held", "reconcile-failed", "claim-failed"]);
+    const incompleteLineage = (rollup.derived.lineage || []).filter((l) => !COMPLETE_OUTCOMES.has(l.outcome));
+    if (incompleteLineage.length > 0) {
+      rollup.derived.skipped = "lineage-incomplete";
+      rollup.derived.incomplete = incompleteLineage.map((l) => ({ reportKey: l.reportKey, accountId: l.accountId, outcome: l.outcome, detail: l.detail ?? null }));
+      if (incompleteLineage.some((l) => RESUMABLE_OUTCOMES.has(l.outcome))) rollup.continuationRequired = true;
+    } else {
+      rollup.derived.skipped = null;
+    }
     rollup.derived.daily = { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped };
     rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped };
     rollup.derived.brandInventory = brandInventory;

@@ -60,6 +60,11 @@ function makeStore() {
   // the lease reconcile + the runtime's adopt-if-exists read consult; plus a lease-token counter.
   const reportSnapshots = new Map(); let leaseSeq = 0;
   const rsKey = (rk, a, h) => rk + "|" + a + "|" + h;
+  // Round-8 finding 1: DATABASE-AUTHORITATIVE time. The lease RPC model reads THIS clock (never a caller-
+  // supplied time), so a runtime/caller clock skew cannot steal or distort a lease. Tests advance it via
+  // store._dbClock.now to model real time passing between invocations.
+  const dbClock = { now: 8_000_000 };
+  const LEASE_MIN = 120; const LEASE_MAX = 1800;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
   const rjKey = (c, rk, a) => c + "|" + rk + "|" + a;
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
@@ -193,30 +198,35 @@ function makeStore() {
         snapshot_params_hash: j.snapshotParamsHash, latest_data_date: j.latestDataDate ?? null,
       });
     },
-    // Round-7 finding 1: FAITHFUL model of claim_report_derive_lease -- guarded pending|stale-running ->
-    // running(token); NEVER steals an unexpired lease; observes already-complete; terminal for failed/skipped.
-    claimLease(cycleId, reportKey, accountId, { now, leaseSeconds } = {}) {
+    // Round-8 finding 1+4: FAITHFUL model of claim_report_derive_lease -- DATABASE-authoritative time (reads
+    // dbClock, NOT a caller clock), a bounded lease [120,1800], and a TOTAL state machine ('invalid-state'
+    // for incoherent combinations; reclaim only an EXACTLY-running expired lease).
+    claimLease(cycleId, reportKey, accountId, { leaseSeconds } = {}) {
       guardAppend(cycleId); // Migration-5 append guard applies to running-cycle updates
-      const nowMs = Date.parse(now);
-      if (!(leaseSeconds > 0) || Number.isNaN(nowMs)) return { disposition: "invalid-lease" };
+      if (!(leaseSeconds >= LEASE_MIN && leaseSeconds <= LEASE_MAX)) return { disposition: "invalid-lease" };
+      const nowMs = dbClock.now; // DB-authoritative -- the caller cannot pass time.
       const r = reportJobs.get(rjKey(cycleId, reportKey, accountId));
       if (!r) return { disposition: "not-found" };
-      if (r.validated === true && r.derive_status === "succeeded" && r.save_status === "succeeded") {
-        return { disposition: "already-complete", snapshot_params_hash: r.snapshot_params_hash };
+      const token = "lease_" + (leaseSeq += 1);
+      if (r.derive_status === "succeeded") {
+        if (r.validated === true && r.save_status === "succeeded") return { disposition: "already-complete", snapshot_params_hash: r.snapshot_params_hash };
+        return { disposition: "invalid-state", derive_status: "succeeded", save_status: r.save_status, validated: r.validated };
       }
       if (r.derive_status === "failed" || r.derive_status === "skipped") return { disposition: "terminal", derive_status: r.derive_status };
-      const token = "lease_" + (leaseSeq += 1);
       if (r.derive_status === "pending") {
         Object.assign(r, { derive_status: "running", derive_lease_token: token, derive_lease_expires_at: nowMs + leaseSeconds * 1000, derive_attempt_count: (r.derive_attempt_count || 0) + 1 });
         return { disposition: "claimed", lease_token: token };
       }
-      // running: an UNEXPIRED lease is a LIVE worker -- do not steal.
-      if (r.derive_lease_expires_at != null && r.derive_lease_expires_at > nowMs) return { disposition: "held", lease_expires_at: r.derive_lease_expires_at };
-      Object.assign(r, { derive_lease_token: token, derive_lease_expires_at: nowMs + leaseSeconds * 1000, derive_attempt_count: (r.derive_attempt_count || 0) + 1 });
-      return { disposition: "reclaimed", lease_token: token, attempt: r.derive_attempt_count };
+      if (r.derive_status === "running") {
+        // an UNEXPIRED lease (vs DB time) is a LIVE worker -- do not steal.
+        if (r.derive_lease_expires_at != null && r.derive_lease_expires_at > nowMs) return { disposition: "held", lease_expires_at: r.derive_lease_expires_at };
+        Object.assign(r, { derive_lease_token: token, derive_lease_expires_at: nowMs + leaseSeconds * 1000, derive_attempt_count: (r.derive_attempt_count || 0) + 1 });
+        return { disposition: "reclaimed", lease_token: token, attempt: r.derive_attempt_count };
+      }
+      return { disposition: "invalid-state", derive_status: r.derive_status };
     },
-    // Round-7 finding 1: FAITHFUL model of reconcile_report_derive_success -- requires the EXACT durable
-    // shadow snapshot to exist AND the CURRENT lease token; only then running -> succeeded bound to the hash.
+    // Round-7/8: FAITHFUL model of reconcile_report_derive_success -- requires the EXACT durable snapshot AND
+    // the CURRENT lease token; a non-running row is handled explicitly (terminal / invalid-state).
     reconcileSuccess({ cycleId, reportKey, accountId, snapshotParamsHash, leaseToken, latestDataDate } = {}) {
       guardAppend(cycleId);
       if (!snapshotParamsHash) return { disposition: "invalid-hash" };
@@ -226,10 +236,13 @@ function makeStore() {
       if (r.validated === true && r.derive_status === "succeeded" && r.save_status === "succeeded" && r.snapshot_params_hash === snapshotParamsHash) {
         return { disposition: "already-complete" };
       }
+      if (r.derive_status !== "running") {
+        if (r.derive_status === "failed" || r.derive_status === "skipped") return { disposition: "terminal", derive_status: r.derive_status };
+        return { disposition: "invalid-state", derive_status: r.derive_status, save_status: r.save_status, validated: r.validated };
+      }
       const exists = reportSnapshots.has(rsKey("scheduler-v2/" + reportKey, accountId, snapshotParamsHash));
       if (!exists) return { disposition: "snapshot-absent" };
       if (r.derive_lease_token == null || r.derive_lease_token !== leaseToken) return { disposition: "lease-lost" };
-      if (r.derive_status !== "running") return { disposition: "not-running", derive_status: r.derive_status };
       Object.assign(r, {
         fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true,
         snapshot_params_hash: snapshotParamsHash, latest_data_date: latestDataDate ?? r.latest_data_date,
@@ -262,6 +275,7 @@ function makeStore() {
       return { disposition: "finalized", cycle: { id: c.id, status: c.status } };
     },
   };
+  store._dbClock = dbClock; // Round-8: tests advance DB-authoritative time here (never via the caller clock).
   return store;
 }
 
@@ -369,6 +383,9 @@ function makeHarness(over = {}) {
     readAdMetrics: over.readAdMetrics || (async () => []),
     // Round-7: the EXACT-identity durable shadow read the runtime uses to adopt an already-saved snapshot.
     readShadowSnapshot: over.readShadowSnapshot || (async ({ reportKey, accountId, paramsHash }) => store.getShadowSnapshot({ reportKey, accountId, paramsHash })),
+    // Round-8 finding 2: the trusted storage hydrator for a storage-backed durable snapshot payload (inline
+    // payloads never call it; a storage-backed one that returns null is a dangling object).
+    loadShadowStoragePayload: over.loadShadowStoragePayload || (async () => null),
     // Round-7 finding 1: the default lineage DELEGATES to the store's LEASE model (guarded claim + reconcile
     // bound to the exact durable snapshot) while recording every op + disposition for assertions.
     reportLineage: over.reportLineage || {
@@ -1934,7 +1951,7 @@ test("X1. a claim COMMITS but the response TIMES OUT (commitUnknown) -> a fresh 
   assert.equal(j1.validated, false, "no fabricated success");
   // Fresh invocation AFTER the lease expires -> reclaim + recover.
   const h2 = fullFixture({ store });
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(r2.stopped, false, JSON.stringify(r2.stopReason));
   assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "the fresh invocation RECOVERED the abandoned claim to success");
@@ -1952,7 +1969,7 @@ test("X2. a shadow save COMMITS but the reconcile does NOT commit -> a fresh inv
   assert.equal(j1.derive_status, "running", "the reconcile did NOT commit: the job is still running");
   assert.equal(j1.validated, false);
   const h2 = fullFixture({ store });
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "recovery ADOPTED the exact durable snapshot -- ZERO re-save");
   assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "reconciled to success on adoption");
@@ -1970,7 +1987,7 @@ test("X3. a shadow save DEFINITELY did not commit -> after the lease guard, a fr
   assert.equal(j1.derive_status, "running");
   assert.equal(j1.derive_attempt_count, 1, "one claim attempt so far");
   const h2 = recoveryFixture(store, {}); // fresh, no injection
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(h2.savedShadow.filter((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01").length, 1, "the fresh invocation RETRIED the save exactly ONCE");
   const j2 = store.getReportJob("daily-reporting", "A01");
@@ -1987,7 +2004,7 @@ test("X4. the success/reconcile PATCH COMMITS but the response TIMES OUT -> a fr
   const j1 = store.getReportJob("daily-reporting", "A01");
   assert.equal(j1.validated, true, "the reconcile COMMITTED: the job is already a validated success");
   const h2 = fullFixture({ store });
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "no re-save for an already-complete job");
   assert.ok(r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "already-complete"), "the fresh invocation OBSERVES already-complete");
@@ -1996,13 +2013,15 @@ test("X4. the success/reconcile PATCH COMMITS but the response TIMES OUT -> a fr
 
 test("X5. a LIVE (unexpired-lease) claimant is NEVER stolen -- a concurrent invocation sees 'held' and does not save/reconcile", async () => {
   const store = makeStore();
-  // A live worker claims daily/A01 within the current clock (lease unexpired).
+  store._dbClock.now = BASE_MS;
+  // A live worker claims daily/A01 at the current DB time (lease unexpired).
   const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
   store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
-  const live = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  const live = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
   assert.equal(live.disposition, "claimed");
-  // A concurrent worker at the SAME time (lease unexpired) is refused.
-  const concurrent = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS + 1000).toISOString(), leaseSeconds: LEASE_S });
+  // A concurrent worker at the SAME DB time (lease unexpired) is refused -- and there is NO caller clock to
+  // pass, so it cannot pretend the lease expired.
+  const concurrent = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
   assert.equal(concurrent.disposition, "held", "an UNEXPIRED lease is never stolen");
   assert.equal(concurrent.lease_token, undefined, "no token is handed to the non-holder");
   // The live holder's token still reconciles (once its snapshot exists); the non-holder's would be lease-lost.
@@ -2011,16 +2030,19 @@ test("X5. a LIVE (unexpired-lease) claimant is NEVER stolen -- a concurrent invo
   assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: live.lease_token }).disposition, "reconciled", "only the current lease holder reconciles");
 });
 
-test("X6. a STALE/abandoned claimant is recovered ONLY through the guarded transition (reclaim requires lease expiry)", async () => {
+test("X6. a STALE/abandoned claimant is recovered ONLY through the guarded transition (reclaim requires DB-time lease expiry)", async () => {
   const store = makeStore();
+  store._dbClock.now = BASE_MS;
   const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
   store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
-  const first = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  const first = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
   assert.equal(first.disposition, "claimed");
-  // Before expiry: a would-be recoverer is refused (held), so a stale claim cannot be recovered early.
-  assert.equal(store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS + LEASE_S * 1000 - 1).toISOString(), leaseSeconds: LEASE_S }).disposition, "held");
-  // After expiry: a guarded RE-claim issues a NEW token; the OLD token can no longer reconcile.
-  const reclaim = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(PAST_LEASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  // Before DB-time expiry: a would-be recoverer is refused (held), so a stale claim cannot be recovered early.
+  store._dbClock.now = BASE_MS + LEASE_S * 1000 - 1;
+  assert.equal(store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S }).disposition, "held");
+  // After DB-time expiry: a guarded RE-claim issues a NEW token; the OLD token can no longer reconcile.
+  store._dbClock.now = PAST_LEASE_MS;
+  const reclaim = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
   assert.equal(reclaim.disposition, "reclaimed");
   assert.notEqual(reclaim.lease_token, first.lease_token, "a FRESH token is issued on reclaim");
   store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: {}, payload: {}, sourceRefreshedAt: TODAY });
@@ -2030,16 +2052,17 @@ test("X6. a STALE/abandoned claimant is recovered ONLY through the guarded trans
 
 test("X7. a malformed / wrong-account / wrong-hash snapshot NEVER authorizes reconciliation", async () => {
   const store = makeStore();
+  store._dbClock.now = BASE_MS;
   const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
   store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
-  const claim = store.claimLease(cid, "daily-reporting", "A01", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  const claim = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
   // Only the EXACT durable snapshot (scheduler-v2/daily-reporting, A01, HASH) authorizes reconcile.
   store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "HASH", params: {}, payload: {}, sourceRefreshedAt: TODAY });
   // wrong hash:
   assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "OTHER", leaseToken: claim.lease_token }).disposition, "snapshot-absent", "a wrong hash finds no durable snapshot");
   // wrong account (A02 has no snapshot / no job):
   store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A02", connectionId: "primary", bucket: "us", dependsOn: [] });
-  const claim2 = store.claimLease(cid, "daily-reporting", "A02", { now: new Date(BASE_MS).toISOString(), leaseSeconds: LEASE_S });
+  const claim2 = store.claimLease(cid, "daily-reporting", "A02", { leaseSeconds: LEASE_S });
   assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A02", snapshotParamsHash: "HASH", leaseToken: claim2.lease_token }).disposition, "snapshot-absent", "A01's snapshot can never authorize A02");
   // malformed (blank hash):
   assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "", leaseToken: claim.lease_token }).disposition, "invalid-hash");
@@ -2054,7 +2077,7 @@ test("X8. recovery performs ZERO new DataDoe exports (the source phase is alread
   const creates1 = h1.dd.totalCreates();
   assert.ok(creates1 >= 1, "the first run made the source exports");
   const h2 = fullFixture({ store });
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(h2.dd.totalCreates(), 0, "the RECOVERY invocation created ZERO DataDoe exports");
 });
@@ -2069,7 +2092,7 @@ test("X9. finalization changes open-work -> terminal ONLY after every report is 
   assert.equal(store.getCycle(r1.cycleId).status, "running");
   // Recover, then finalize honestly terminalizes.
   const h2 = fullFixture({ store });
-  h2.clockRef.now = PAST_LEASE_MS;
+  store._dbClock.now = PAST_LEASE_MS; // DB-authoritative time advances; h2's runtime clock is irrelevant to the lease
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(r2.stopped, false);
   const closed = store.finalizeCycle({ cycleId: r1.cycleId });
@@ -2109,6 +2132,301 @@ test("X11. round-7 finding 2: the admin PATCH requires a strict boolean BEFORE a
   const gateText = src.slice(boolGate, setWrite);
   assert.match(gateText, /status\(400\)/, "a non-boolean publishEnabled is a 400");
   assert.match(gateText, /return;/, "the 400 RETURNS before the write");
+});
+
+
+/* ================================= X12 / Y / Z: round-8 findings ================================= */
+group("X12. round-8 finding 1: DATABASE-authoritative lease time (no caller clock; bounded duration)");
+
+test("X12. a future/past CALLER clock cannot steal or distort a lease; the duration is bounded; the wrapper sends NO caller time", async () => {
+  const store = makeStore();
+  store._dbClock.now = BASE_MS;
+  const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
+  // claimLease takes NO caller time -- only { leaseSeconds }. A live claim's expiry is DB(now)+lease.
+  const live = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
+  assert.equal(live.disposition, "claimed");
+  assert.equal(store.getReportJob("daily-reporting", "A01").derive_lease_expires_at, BASE_MS + LEASE_S * 1000, "the expiry is DB-time based, not caller-time");
+  // A concurrent caller cannot advance/rewind time: DB time is unchanged, so the lease is still HELD.
+  assert.equal(store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S }).disposition, "held", "a skewed caller cannot pretend the lease expired");
+  // The lease duration is bounded to the reviewed safe range [120, 1800]: out-of-range => invalid-lease.
+  const cid2 = store.openCycle({ bucket: "non-us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid2, reportKey: "daily-reporting", accountId: "Z01", connectionId: "primary", bucket: "non-us", dependsOn: [] });
+  assert.equal(store.claimLease(cid2, "daily-reporting", "Z01", { leaseSeconds: 30 }).disposition, "invalid-lease", "a too-short lease is refused");
+  assert.equal(store.claimLease(cid2, "daily-reporting", "Z01", { leaseSeconds: 100000 }).disposition, "invalid-lease", "a too-long lease is refused");
+  // The REAL wrapper sends NO p_now field (current time is database-authoritative in the RPC).
+  const sb = await import("../lib/server/supabase.js");
+  const realFetch = globalThis.fetch;
+  try {
+    let sentBody = null;
+    globalThis.fetch = async (url, init) => { sentBody = JSON.parse(init.body); return { ok: true, status: 200, json: async () => ({ disposition: "claimed", lease_token: "11111111-1111-1111-1111-111111111111" }), text: async () => "" }; };
+    const res = await sb.claimReportDeriveLease("c1", "daily-reporting", "A01", { leaseSeconds: 300 });
+    assert.equal(res.disposition, "claimed");
+    assert.ok(!("p_now" in sentBody), "the claim RPC body carries NO caller-time (p_now) field");
+    assert.equal(sentBody.p_lease_seconds, 300, "only the (bounded) lease duration is sent");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+group("Y. round-8 finding 2: a recovered snapshot is VALIDATED (provenance + hydration + contract + content-identity) before adoption");
+
+// A recovery fixture whose daily/A01 reconcile does NOT commit -> the snapshot is durably SAVED but the job
+// stays 'running' with an expired lease after we advance DB time. A fresh run then RECLAIMS and must validate
+// the (possibly tampered) durable snapshot before adopting it.
+async function savedButRunning() {
+  const store = makeStore();
+  const h1 = recoveryFixture(store, { timeoutReconcileBeforeCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.commitUnknown, true);
+  const rec = h1.savedShadow.find((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01");
+  const snapshot = store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: rec.paramsHash });
+  return { store, hash: rec.paramsHash, snapshot };
+}
+async function recoverWith(store, over = {}) {
+  store._dbClock.now = PAST_LEASE_MS; // the abandoned lease has expired -> a fresh run reclaims.
+  const h2 = fullFixture({ store, ...over });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  return { h2, r2, job: store.getReportJob("daily-reporting", "A01") };
+}
+const conflictOutcome = (r2, reason) => r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "snapshot-conflict" && l.detail === reason);
+
+test("Y1. MUTATED params (recomputed hash != stored hash) => typed params-provenance conflict; NEVER validated; finalize stays open-work", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.params = { ...snapshot.params, brand: "TAMPERED" }; // same version/account -> provenance breaks
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false, "a mutated-params snapshot is NEVER adopted/validated");
+  assert.equal(job.derive_status, "running", "the job stays running");
+  assert.ok(conflictOutcome(r2, "params-provenance"), "typed params-provenance conflict");
+  assert.ok(r2.derived.skipped != null, "the rollup is honestly incomplete");
+  assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "open-work", "finalize can NEVER terminalize around the conflict");
+});
+
+test("Y2. a MALFORMED payload fails the exact report contract => payload-invalid; NEVER validated", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.payload = { garbage: true }; // params intact -> provenance ok; validatePayload rejects it
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false);
+  assert.ok(conflictOutcome(r2, "payload-invalid"), "typed payload-invalid conflict");
+  assert.ok(r2.derived.skipped != null);
+});
+
+test("Y3. a DANGLING storage-backed payload (loader returns null) => payload-dangling; NEVER validated", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.payload = null; snapshot.payload_storage_path = "report-snapshots/v2/orphan.json";
+  const { r2, job } = await recoverWith(store, { loadShadowStoragePayload: async () => null });
+  assert.equal(job.validated, false);
+  assert.ok(conflictOutcome(r2, "payload-dangling"), "typed payload-dangling conflict");
+});
+
+test("Y4. a WRONG derivation version => wrong-version conflict; NEVER validated", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.params = { ...snapshot.params, reportVersion: "daily-reporting/WRONG" };
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false);
+  assert.ok(conflictOutcome(r2, "wrong-version"), "typed wrong-version conflict");
+});
+
+test("Y5. an UNAVAILABLE payload (no inline payload, no storage path) => payload-unavailable; NEVER validated", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.payload = null; snapshot.payload_storage_path = null;
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false);
+  assert.ok(conflictOutcome(r2, "payload-unavailable"), "typed payload-unavailable conflict");
+});
+
+test("Y6. an EQUAL-HASH but CONTENT-CONFLICTING snapshot (valid contract, different content) => content-conflict; NEVER validated", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.payload = { ...snapshot.payload, __conflict: "different-content" }; // still contract-valid, but != candidate
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false, "an equal-hash conflicting-content snapshot is NEVER adopted");
+  assert.ok(conflictOutcome(r2, "content-conflict"), "typed content-conflict");
+  assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "open-work");
+});
+
+test("Y7. an IDENTICAL, fully-valid durable snapshot IS adopted (recovered) without a re-save", async () => {
+  // No tamper: the durable snapshot is byte-identical to the fresh candidate -> adopt + reconcile.
+  const { store } = await savedButRunning();
+  const { r2, job, h2 } = await recoverWith(store);
+  assert.equal(job.validated, true, "an identical valid snapshot is adopted to success");
+  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "adoption re-saves NOTHING");
+  assert.ok(r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "recovered"));
+});
+
+group("Z. round-8 findings 3/4/5: honest incomplete rollups; total lease state machine + strict acks; abortable recovery read");
+
+test("Z1. finding 3: a HELD report yields a TYPED-RESUMABLE incomplete rollup (never looks completed); a later invocation recovers with ZERO DataDoe", async () => {
+  const store = makeStore();
+  store._dbClock.now = BASE_MS;
+  // A LIVE concurrent worker holds daily/A01 (running + unexpired lease) while our run processes the bucket.
+  const heldLineage = {
+    upsertReportJob: async (j) => store.upsertReportJob(j),
+    claimLease: async (c, rk, a, opts) => {
+      if (rk === "daily-reporting" && a === "A01") { store.claimLease(c, rk, a, opts); return { disposition: "held" }; }
+      const res = store.claimLease(c, rk, a, opts);
+      return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+    },
+    reconcileSuccess: async (j) => { const res = store.reconcileSuccess(j); return { disposition: res.disposition }; },
+  };
+  const h1 = fullFixture({ store, reportLineage: heldLineage });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.stopped, false);
+  assert.ok(r1.derived.skipped != null, "a HELD report makes the rollup honestly INCOMPLETE (never skipped:null)");
+  assert.equal(r1.continuationRequired, true, "finding 3: a held report is typed-resumable (continuationRequired)");
+  assert.ok((r1.derived.incomplete || []).some((x) => x.reportKey === "daily-reporting" && x.accountId === "A01" && x.outcome === "claim-held"), "the held report is enumerated in the incomplete set");
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "held work is NEVER a success");
+  assert.equal(store.finalizeCycle({ cycleId: r1.cycleId }).disposition, "open-work", "finalize cannot terminalize while a report is held");
+  // A later invocation past the lease reclaims + recovers -- ZERO DataDoe.
+  store._dbClock.now = PAST_LEASE_MS;
+  const h2 = fullFixture({ store });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "the later invocation RECOVERED the held report");
+  assert.equal(r2.derived.skipped, null, "the recovery run is fully complete");
+  assert.equal(h2.dd.totalCreates(), 0, "recovery performs ZERO DataDoe exports");
+  assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "finalized", "now finalize terminalizes honestly");
+});
+
+test("Z2. finding 3: a reconcile LEASE-LOST (concurrent takeover) is NEVER success-like; the rollup is typed-resumable incomplete", async () => {
+  const store = makeStore();
+  const lostLineage = {
+    upsertReportJob: async (j) => store.upsertReportJob(j),
+    claimLease: async (c, rk, a, opts) => {
+      const res = store.claimLease(c, rk, a, opts);
+      return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+    },
+    reconcileSuccess: async (j) => {
+      if (j.reportKey === "daily-reporting" && j.accountId === "A01") return { disposition: "lease-lost" }; // a concurrent worker took over
+      const res = store.reconcileSuccess(j); return { disposition: res.disposition };
+    },
+  };
+  const h1 = fullFixture({ store, reportLineage: lostLineage });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "a lease-lost reconcile NEVER records success");
+  assert.ok((r1.derived.incomplete || []).some((x) => x.reportKey === "daily-reporting" && x.accountId === "A01" && x.outcome === "reconcile-failed"), "typed reconcile-failed");
+  assert.ok(r1.derived.skipped != null && r1.continuationRequired === true, "typed-resumable incomplete rollup");
+  assert.notEqual(r1.derived.daily.saved, undefined);
+});
+
+test("Z3. finding 4: TOTAL lease state machine -- succeeded+save-failed and other incoherent combos are 'invalid-state'; a non-running reconcile is typed", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: "us", cycleDate: TODAY });
+  store.upsertReportJob({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", connectionId: "primary", bucket: "us", dependsOn: [] });
+  const j = store._reportJobs.get(cid + "|daily-reporting|A01");
+  // succeeded derive but save FAILED (not a validated success): claim => invalid-state (never a lease write).
+  Object.assign(j, { derive_status: "succeeded", save_status: "failed", validated: false });
+  const r = store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S });
+  assert.equal(r.disposition, "invalid-state", "succeeded+save-failed is invalid-state, not a claim");
+  assert.equal(j.derive_lease_token, null, "no lease token is written for an incoherent state");
+  // reconcile on a non-running (succeeded-here) row is handled explicitly (invalid-state), never a fall-through.
+  store.recordShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: {}, payload: {}, sourceRefreshedAt: TODAY });
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: "x" }).disposition, "invalid-state");
+  // a failed/skipped derive is 'terminal' for both claim and reconcile.
+  Object.assign(j, { derive_status: "failed", save_status: "skipped", validated: false });
+  assert.equal(store.claimLease(cid, "daily-reporting", "A01", { leaseSeconds: LEASE_S }).disposition, "terminal");
+  assert.equal(store.reconcileSuccess({ cycleId: cid, reportKey: "daily-reporting", accountId: "A01", snapshotParamsHash: "H", leaseToken: "x" }).disposition, "terminal");
+});
+
+test("Z4. finding 4: STRICT acknowledgement validators -- multi-row / malformed / disposition-dependent-field-incoherent acks fail closed", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const realFetch = globalThis.fetch;
+  const stub = (body) => { globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => body, text: async () => "" }); };
+  try {
+    // CLAIM: multi-row, non-object, unknown disposition, claimed-without-token, non-claim-with-token all throw.
+    stub([{ disposition: "claimed", lease_token: "t" }, { disposition: "claimed", lease_token: "t" }]);
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "multi-row");
+    stub("not-an-object");
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "non-object");
+    stub({ disposition: "weird" });
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "unknown disposition");
+    stub({ disposition: "claimed" }); // claimed WITHOUT a lease token
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "claimed without token");
+    stub({ disposition: "reclaimed", lease_token: "   " }); // blank token
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "reclaimed with blank token");
+    stub({ disposition: "held", lease_token: "t" }); // a NON-claiming disposition must NOT carry a token
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "held with a contradictory token");
+    // valid claim ack passes.
+    stub({ disposition: "claimed", lease_token: "11111111-1111-1111-1111-111111111111" });
+    assert.equal((await sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 })).disposition, "claimed");
+    // RECONCILE: multi-row, unknown disposition, and a 'reconciled' NOT echoing the exact hash all throw.
+    stub([{ disposition: "reconciled" }, { disposition: "reconciled" }]);
+    await assert.rejects(() => sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" }), (e) => e.code === "REPORT_RECONCILE_ACK_INVALID", "multi-row");
+    stub({ disposition: "reconciled", snapshot_params_hash: "OTHER" });
+    await assert.rejects(() => sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" }), (e) => e.code === "REPORT_RECONCILE_ACK_INVALID", "reconciled not echoing the hash");
+    stub({ disposition: "reconciled", snapshot_params_hash: "H" });
+    assert.equal((await sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" })).disposition, "reconciled");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("Z5. finding 5: getReportSnapshot forwards the route signal to the real fetch; a HUNG recovery read is aborted within budget => typed-resumable, NO later save/reconcile", async () => {
+  // (a) the wrapper forwards { signal } to request()/fetch.
+  const sb = await import("../lib/server/supabase.js");
+  const realFetch = globalThis.fetch;
+  try {
+    let seenSig = "unset";
+    const ctrl = new AbortController();
+    globalThis.fetch = async (url, init) => { seenSig = init && init.signal; return { ok: true, status: 200, json: async () => [], text: async () => "[]" }; };
+    await sb.getReportSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" }, { signal: ctrl.signal });
+    assert.equal(seenSig, ctrl.signal, "getReportSnapshot forwards the route signal to the real fetch");
+  } finally { globalThis.fetch = realFetch; }
+  // (b) a HUNG recovery read (readShadowSnapshot never resolves) is aborted within the route budget: the run
+  // returns typed-resumable and performs NO shadow save / reconcile for that report.
+  const store = makeStore();
+  let reconciles = 0;
+  const trackedLineage = {
+    upsertReportJob: async (j) => store.upsertReportJob(j),
+    claimLease: async (c, rk, a, opts) => { const res = store.claimLease(c, rk, a, opts); return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null }; },
+    reconcileSuccess: async (j) => { reconciles += 1; const res = store.reconcileSuccess(j); return { disposition: res.disposition }; },
+  };
+  const h = fullFixture({
+    store,
+    reportLineage: trackedLineage,
+    readShadowSnapshot: () => new Promise(() => {}), // hangs forever; the bound read must abort it
+    setTimer: (fn) => setTimeout(fn, 0), clearTimer: (id) => clearTimeout(id),
+    budgetMs: 60_000, reserveMs: 1_000,
+  });
+  const r = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r.deadlineReached, true, "the hung recovery read was aborted at the route budget");
+  assert.equal(r.continuationRequired, true, "the run is typed-resumable");
+  assert.equal(h.recorded.shadowSaves.length, 0, "NO shadow save after a hung recovery read");
+  assert.equal(reconciles, 0, "NO reconcile after a hung recovery read");
+});
+
+group("ZM. round-8: SQL mutation regressions -- weakening any lease/reconcile condition fails the audit");
+
+const MIG822 = "20260822_report_derive_lease.sql";
+function auditWith822(mutate) {
+  return schema.auditSchemaContract({ readFile: (rel) => {
+    if (rel === "supabase.js") return readFileSync(path.join(process.cwd(), "lib", "server", "supabase.js"), "utf8");
+    const t = readFileSync(path.join(process.cwd(), "supabase", "migrations", rel), "utf8");
+    return (rel === MIG822 && mutate) ? mutate(t) : t;
+  } });
+}
+
+test("ZM1. the REAL 20260822 audits clean; mutating any lease/reconcile guard raises a typed blocker", () => {
+  assert.equal(auditWith822(null).ok, true, "baseline clean");
+  const has = (res, code) => res.blockers.some((b) => b.code === code);
+  // DB-authoritative time: reintroducing a caller-time param (p_now) fails.
+  const callerTime = auditWith822((s) => s.replace("p_cycle_id uuid, p_report_key text, p_account_id text, p_lease_seconds integer", "p_cycle_id uuid, p_report_key text, p_account_id text, p_now timestamptz, p_lease_seconds integer").replace("v_now timestamptz := now();", "v_now timestamptz := p_now;"));
+  assert.ok(has(callerTime, "CLAIM_LEASE_CALLER_TIME") || callerTime.blockers.some((b) => b.code === "RPC_PARAM_MISMATCH" || String(b.code).includes("PARAM")), JSON.stringify(callerTime.blockers.map((b) => b.code)));
+  // Lease bound: removing the upper/lower bound check fails.
+  const unbounded = auditWith822((s) => s.replace("if p_lease_seconds is null or p_lease_seconds < 120 or p_lease_seconds > 1800 then", "if p_lease_seconds is null or p_lease_seconds <= 0 then"));
+  assert.ok(has(unbounded, "CLAIM_LEASE_UNBOUNDED"), JSON.stringify(unbounded.blockers.map((b) => b.code)));
+  // Steal guard: weakening 'held' to always reclaim fails.
+  const steal = auditWith822((s) => s.replace("if v_job.derive_lease_expires_at is not null and v_job.derive_lease_expires_at > v_now then", "if false then"));
+  assert.ok(has(steal, "CLAIM_LEASE_STEAL_GUARD_MISSING"), JSON.stringify(steal.blockers.map((b) => b.code)));
+  // Reclaim running-guard: dropping "and derive_status = 'running'" from the reclaim UPDATE fails.
+  const reclaimUnguarded = auditWith822((s) => s.replace("      where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id\n        and derive_status = 'running';\n    return jsonb_build_object('disposition', 'reclaimed'", "      where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id;\n    return jsonb_build_object('disposition', 'reclaimed'"));
+  assert.ok(has(reclaimUnguarded, "CLAIM_LEASE_RECLAIM_MISSING"), JSON.stringify(reclaimUnguarded.blockers.map((b) => b.code)));
+  // Total state machine: removing 'invalid-state' fails.
+  const notTotal = auditWith822((s) => s.split("'invalid-state'").join("'not-found'"));
+  assert.ok(has(notTotal, "CLAIM_LEASE_STATE_INCOMPLETE") || has(notTotal, "RECONCILE_NONRUNNING_UNHANDLED"), JSON.stringify(notTotal.blockers.map((b) => b.code)));
+  // Reconcile snapshot binding: dropping the report_snapshots EXISTS fails.
+  const noBind = auditWith822((s) => s.replace(/select exists \([\s\S]*?\) into v_snapshot_exists;/, "v_snapshot_exists := true;"));
+  assert.ok(has(noBind, "RECONCILE_SNAPSHOT_BINDING_MISSING"), JSON.stringify(noBind.blockers.map((b) => b.code)));
+  // Reconcile lease guard: dropping the token check fails.
+  const noToken = auditWith822((s) => s.replace("if v_job.derive_lease_token is null or v_job.derive_lease_token <> p_lease_token then", "if false then"));
+  assert.ok(has(noToken, "RECONCILE_LEASE_GUARD_MISSING"), JSON.stringify(noToken.blockers.map((b) => b.code)));
+  // Reconcile non-running handling: removing the explicit non-running branch fails.
+  const noNonRunning = auditWith822((s) => s.replace(/  if v_job\.derive_status <> 'running' then\n    if v_job\.derive_status in \('failed', 'skipped'\) then\n      return jsonb_build_object\('disposition', 'terminal', 'derive_status', v_job\.derive_status\);\n    end if;\n    return jsonb_build_object\('disposition', 'invalid-state', 'derive_status', v_job\.derive_status,\n                              'save_status', v_job\.save_status, 'validated', v_job\.validated\);\n  end if;\n/, ""));
+  assert.ok(has(noNonRunning, "RECONCILE_NONRUNNING_UNHANDLED"), JSON.stringify(noNonRunning.blockers.map((b) => b.code)));
 });
 
 

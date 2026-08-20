@@ -273,7 +273,7 @@ export async function inviteDashboardUser({ email, displayName, accountIds }) {
   return { userId, email: normalizedEmail, accountIds: assignedAccountIds };
 }
 
-export async function getReportSnapshot({ reportKey, accountId, paramsHash }) {
+export async function getReportSnapshot({ reportKey, accountId, paramsHash }, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "id,report_key,account_id,params_hash,params,payload,payload_storage_path,payload_bytes,source_refreshed_at,updated_at",
     report_key: `eq.${reportKey}`,
@@ -281,7 +281,7 @@ export async function getReportSnapshot({ reportKey, accountId, paramsHash }) {
     params_hash: `eq.${paramsHash}`,
     limit: "1",
   });
-  const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  const rows = await request(`/rest/v1/report_snapshots?${query}`, { signal });
   return rows[0] || null;
 }
 
@@ -1660,29 +1660,44 @@ export async function recordSyncReportSuccess({ cycleId, reportKey, accountId, l
  * running-stale / complete apart, reclaims an abandoned lease without stealing a live one, and reconciles to
  * success from the EXACT durable snapshot -- zero DataDoe, no fabricated success). Both validate the RPC's
  * jsonb disposition strictly; an unknown/malformed acknowledgement throws typed (fail closed). */
-const CLAIM_LEASE_DISPOSITIONS = new Set(["claimed", "reclaimed", "held", "already-complete", "terminal", "not-found", "invalid-lease"]);
-const RECONCILE_DISPOSITIONS = new Set(["reconciled", "already-complete", "snapshot-absent", "lease-lost", "not-running", "not-found", "invalid-hash", "invalid-lease"]);
+const CLAIM_LEASE_DISPOSITIONS = new Set(["claimed", "reclaimed", "held", "already-complete", "terminal", "invalid-state", "not-found", "invalid-lease"]);
+const RECONCILE_DISPOSITIONS = new Set(["reconciled", "already-complete", "snapshot-absent", "lease-lost", "terminal", "invalid-state", "not-running", "not-found", "invalid-hash", "invalid-lease"]);
+// A lease token is a Postgres uuid text (gen_random_uuid); the harness models it as "lease_<n>".
+const isNonblankString = (v) => typeof v === "string" && v.trim().length > 0;
 
-export async function claimReportDeriveLease(cycleId, reportKey, accountId, { now, leaseSeconds, signal = null } = {}) {
+// Round-8 finding 4: a STRICT, disposition-dependent acknowledgement validator. The RPC returns exactly one
+// jsonb object; a null / multi-row / non-object / unknown-disposition / field-incoherent acknowledgement
+// fails closed (never coerced into a usable lease). Returns the typed result only on a coherent ack.
+function throwAckInvalid(fn, code, value, reason) {
+  const err = new Error(`${code}: ${fn} returned ${JSON.stringify(value)} -- ${reason} (fail closed).`);
+  err.code = code; err.status = 503; throw err;
+}
+
+export async function claimReportDeriveLease(cycleId, reportKey, accountId, { leaseSeconds, signal = null } = {}) {
   const body = await request("/rest/v1/rpc/claim_report_derive_lease", {
     method: "POST",
     signal,
-    body: { p_cycle_id: cycleId, p_report_key: reportKey, p_account_id: accountId, p_now: now, p_lease_seconds: leaseSeconds },
+    body: { p_cycle_id: cycleId, p_report_key: reportKey, p_account_id: accountId, p_lease_seconds: leaseSeconds },
   });
-  const value = Array.isArray(body) ? body[0] : body;
-  const disposition = value && typeof value === "object" ? value.disposition : null;
-  if (typeof disposition !== "string" || !CLAIM_LEASE_DISPOSITIONS.has(disposition)) {
-    const err = new Error(`REPORT_LEASE_ACK_INVALID: claim_report_derive_lease returned ${JSON.stringify(value)} (disposition not in the known set); refusing (fail closed).`);
-    err.code = "REPORT_LEASE_ACK_INVALID";
-    err.status = 503;
-    throw err;
+  if (Array.isArray(body) && body.length !== 1) {
+    throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", body, `expected exactly one row (got ${body.length})`);
   }
-  return {
-    disposition,
-    leaseToken: typeof value.lease_token === "string" ? value.lease_token : null,
-    snapshotParamsHash: typeof value.snapshot_params_hash === "string" ? value.snapshot_params_hash : null,
-    deriveStatus: typeof value.derive_status === "string" ? value.derive_status : null,
-  };
+  const value = Array.isArray(body) ? body[0] : body;
+  const disposition = value && typeof value === "object" && !Array.isArray(value) ? value.disposition : null;
+  if (typeof disposition !== "string" || !CLAIM_LEASE_DISPOSITIONS.has(disposition)) {
+    throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", value, "disposition not in the known set");
+  }
+  const leaseToken = typeof value.lease_token === "string" ? value.lease_token : null;
+  const snapshotParamsHash = typeof value.snapshot_params_hash === "string" ? value.snapshot_params_hash : null;
+  // Disposition-dependent field exactness: claimed/reclaimed MUST carry a nonblank lease token.
+  if ((disposition === "claimed" || disposition === "reclaimed") && !isNonblankString(leaseToken)) {
+    throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", value, `disposition '${disposition}' without a nonblank lease_token`);
+  }
+  // A non-claiming disposition must NEVER carry a lease token (a token there would be contradictory).
+  if (disposition !== "claimed" && disposition !== "reclaimed" && leaseToken != null) {
+    throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", value, `disposition '${disposition}' unexpectedly carries a lease_token`);
+  }
+  return { disposition, leaseToken, snapshotParamsHash, deriveStatus: typeof value.derive_status === "string" ? value.derive_status : null };
 }
 
 export async function reconcileReportDeriveSuccess({ cycleId, reportKey, accountId, snapshotParamsHash, leaseToken, latestDataDate = null }, { signal = null } = {}) {
@@ -1694,13 +1709,17 @@ export async function reconcileReportDeriveSuccess({ cycleId, reportKey, account
       p_snapshot_params_hash: snapshotParamsHash, p_lease_token: leaseToken, p_latest_data_date: latestDataDate,
     },
   });
+  if (Array.isArray(body) && body.length !== 1) {
+    throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", body, `expected exactly one row (got ${body.length})`);
+  }
   const value = Array.isArray(body) ? body[0] : body;
-  const disposition = value && typeof value === "object" ? value.disposition : null;
+  const disposition = value && typeof value === "object" && !Array.isArray(value) ? value.disposition : null;
   if (typeof disposition !== "string" || !RECONCILE_DISPOSITIONS.has(disposition)) {
-    const err = new Error(`REPORT_RECONCILE_ACK_INVALID: reconcile_report_derive_success returned ${JSON.stringify(value)} (disposition not in the known set); refusing (fail closed).`);
-    err.code = "REPORT_RECONCILE_ACK_INVALID";
-    err.status = 503;
-    throw err;
+    throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", value, "disposition not in the known set");
+  }
+  // Disposition-dependent field exactness: 'reconciled' MUST echo the exact snapshot_params_hash it committed.
+  if (disposition === "reconciled" && value.snapshot_params_hash !== snapshotParamsHash) {
+    throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", value, "'reconciled' did not echo the exact snapshot_params_hash");
   }
   return { disposition };
 }
@@ -1739,8 +1758,8 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
 // this ONE trusted loader (same private bucket as every dashboard snapshot object). Returns the parsed JSON
 // payload, or null when the object is absent; throws on a transport failure -- the publisher fails closed on
 // BOTH (live last-known-good is preserved).
-export async function getReportSnapshotStoragePayload(objectPath) {
-  return getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath);
+export async function getReportSnapshotStoragePayload(objectPath, { signal = null } = {}) {
+  return getPrivateStorageJson(SOURCE_CACHE_BUCKET, objectPath, { signal });
 }
 
 // Injected adapters for the ATOMIC source-cache save (lib/server/sync/source-cache.js):

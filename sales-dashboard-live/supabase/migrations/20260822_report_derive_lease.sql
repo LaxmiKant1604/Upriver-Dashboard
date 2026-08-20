@@ -16,12 +16,17 @@
 --     20260807-frozen sync_report_jobs is only ALTERed here, never recreated).
 --   * claim_report_derive_lease -- a GUARDED, atomic pending|stale-running -> running(with a fresh token)
 --     transition under FOR UPDATE. It NEVER steals an unexpired lease ('held'), reports an already-complete
---     job ('already-complete'), and treats failed/skipped as terminal-for-cycle. updated_at is NEVER used as
---     an ownership token -- the lease token + expiry are the sole ownership proof.
+--     job ('already-complete'), and treats failed/skipped as terminal-for-cycle. Round-8: current time is
+--     DATABASE-AUTHORITATIVE (now(), evaluated once as v_now) -- the caller has NO authority over the clock,
+--     so a future/past caller skew can neither steal nor distort a lease. The requested lease duration is
+--     bounded to the reviewed safe range [120s, 1800s]. A TOTAL state machine handles every derive_status
+--     explicitly and returns 'invalid-state' for incoherent combinations; nothing falls through. updated_at
+--     is NEVER used as an ownership token -- the lease token + DB-time expiry are the sole ownership proof.
 --   * reconcile_report_derive_success -- a GUARDED running -> succeeded transition that (a) requires the
 --     caller to hold the CURRENT lease token, and (b) requires the EXACT durable shadow snapshot
 --     (report_snapshots row for scheduler-v2/<report_key>, this account, this params_hash) to already exist,
---     so a malformed / wrong-account / wrong-hash reconciliation can NEVER authorize success.
+--     so a malformed / wrong-account / wrong-hash reconciliation can NEVER authorize success. Round-8: a
+--     non-running row is handled explicitly (terminal for failed/skipped; 'invalid-state' otherwise).
 -- Adds NO table/RLS/policy (sync_report_jobs is service-role-only from 20260807) and no schedule/cron;
 -- SECURITY DEFINER + service_role only, matching the existing Scheduler-v2 RPCs. Applying it enables nothing.
 
@@ -37,7 +42,7 @@ alter table public.sync_report_jobs
 -- 2. claim_report_derive_lease -- guarded pending|stale-running -> running(token); never steals a live lease.
 -- ---------------------------------------------------------------------------
 create or replace function public.claim_report_derive_lease(
-  p_cycle_id uuid, p_report_key text, p_account_id text, p_now timestamptz, p_lease_seconds integer
+  p_cycle_id uuid, p_report_key text, p_account_id text, p_lease_seconds integer
 ) returns jsonb
 language plpgsql
 security definer
@@ -45,9 +50,14 @@ set search_path = public
 as $$
 declare
   v_job public.sync_report_jobs;
+  v_now timestamptz := now();   -- DATABASE-AUTHORITATIVE time, evaluated ONCE; the caller has NO clock authority.
   v_token uuid;
 begin
-  if p_now is null or p_lease_seconds is null or p_lease_seconds <= 0 then
+  -- Round-8: the requested lease duration is bounded to the reviewed safe range [120s, 1800s]. A lease
+  -- shorter than the ~50s route budget could expire mid-invocation and let a concurrent worker steal a LIVE
+  -- claim; a lease longer than 30 minutes needlessly strands an abandoned claim. The caller may request a
+  -- duration inside the band but can never move time itself.
+  if p_lease_seconds is null or p_lease_seconds < 120 or p_lease_seconds > 1800 then
     return jsonb_build_object('disposition', 'invalid-lease');
   end if;
   -- Lock the exact (cycle, report, account) row so a concurrent claim/reconcile serializes on it.
@@ -57,36 +67,47 @@ begin
   if not found then
     return jsonb_build_object('disposition', 'not-found');
   end if;
-  -- Already durably complete: a success/reconcile commit-unknown or an earlier success is OBSERVED, never redone.
-  if v_job.validated = true and v_job.derive_status = 'succeeded' and v_job.save_status = 'succeeded' then
-    return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);
-  end if;
-  -- Terminal-for-cycle failures/skips are NOT re-claimed within this cycle (a NEW cycle re-derives).
-  if v_job.derive_status in ('failed', 'skipped') then
+  -- TOTAL state machine on derive_status: EVERY legal status is handled explicitly and an incoherent
+  -- combination returns 'invalid-state' -- nothing falls through to an unintended lease write.
+  if v_job.derive_status = 'succeeded' then
+    -- Already durably complete: OBSERVE it (a success/reconcile commit-unknown, or an earlier success).
+    if v_job.validated = true and v_job.save_status = 'succeeded' then
+      return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);
+    end if;
+    -- succeeded derive but not a validated+saved success (e.g. save-failed): incoherent for a lease.
+    return jsonb_build_object('disposition', 'invalid-state', 'derive_status', v_job.derive_status,
+                              'save_status', v_job.save_status, 'validated', v_job.validated);
+  elsif v_job.derive_status in ('failed', 'skipped') then
+    -- Terminal-for-cycle: NOT re-claimed within this cycle (a NEW cycle re-derives).
     return jsonb_build_object('disposition', 'terminal', 'derive_status', v_job.derive_status);
-  end if;
-  if v_job.derive_status = 'pending' then
+  elsif v_job.derive_status = 'pending' then
     v_token := gen_random_uuid();
     update public.sync_report_jobs
       set derive_status = 'running',
           derive_lease_token = v_token,
-          derive_lease_expires_at = p_now + make_interval(secs => p_lease_seconds),
+          derive_lease_expires_at = v_now + make_interval(secs => p_lease_seconds),
           derive_attempt_count = derive_attempt_count + 1
       where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id;
     return jsonb_build_object('disposition', 'claimed', 'lease_token', v_token);
+  elsif v_job.derive_status = 'running' then
+    -- An UNEXPIRED lease (compared against DB-authoritative v_now) is a LIVE worker -- DO NOT STEAL it.
+    if v_job.derive_lease_expires_at is not null and v_job.derive_lease_expires_at > v_now then
+      return jsonb_build_object('disposition', 'held', 'lease_expires_at', v_job.derive_lease_expires_at);
+    end if;
+    -- RECLAIM ONLY when derive_status is EXACTLY 'running' AND the DB-time lease has expired: a GUARDED
+    -- re-claim with a fresh token (the WHERE re-asserts derive_status = 'running').
+    v_token := gen_random_uuid();
+    update public.sync_report_jobs
+      set derive_lease_token = v_token,
+          derive_lease_expires_at = v_now + make_interval(secs => p_lease_seconds),
+          derive_attempt_count = derive_attempt_count + 1
+      where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id
+        and derive_status = 'running';
+    return jsonb_build_object('disposition', 'reclaimed', 'lease_token', v_token, 'attempt', v_job.derive_attempt_count + 1);
+  else
+    -- Any other (unknown/incoherent) derive_status: fail closed, never a silent fall-through.
+    return jsonb_build_object('disposition', 'invalid-state', 'derive_status', v_job.derive_status);
   end if;
-  -- derive_status = 'running': an UNEXPIRED lease is a LIVE worker -- DO NOT STEAL it.
-  if v_job.derive_lease_expires_at is not null and v_job.derive_lease_expires_at > p_now then
-    return jsonb_build_object('disposition', 'held', 'lease_expires_at', v_job.derive_lease_expires_at);
-  end if;
-  -- A STALE/expired (or never-set) lease on a running row: GUARDED re-claim with a fresh token.
-  v_token := gen_random_uuid();
-  update public.sync_report_jobs
-    set derive_lease_token = v_token,
-        derive_lease_expires_at = p_now + make_interval(secs => p_lease_seconds),
-        derive_attempt_count = derive_attempt_count + 1
-    where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id;
-  return jsonb_build_object('disposition', 'reclaimed', 'lease_token', v_token, 'attempt', v_job.derive_attempt_count + 1);
 end;
 $$;
 
@@ -122,6 +143,16 @@ begin
      and v_job.snapshot_params_hash = p_snapshot_params_hash then
     return jsonb_build_object('disposition', 'already-complete');
   end if;
+  -- Round-8: reconcile is meaningful ONLY for a 'running' row. Handle every non-running status explicitly
+  -- (never fall through to a success write): failed/skipped are terminal-for-cycle; any other non-running
+  -- combination (including a succeeded derive that is not the idempotent case above) is 'invalid-state'.
+  if v_job.derive_status <> 'running' then
+    if v_job.derive_status in ('failed', 'skipped') then
+      return jsonb_build_object('disposition', 'terminal', 'derive_status', v_job.derive_status);
+    end if;
+    return jsonb_build_object('disposition', 'invalid-state', 'derive_status', v_job.derive_status,
+                              'save_status', v_job.save_status, 'validated', v_job.validated);
+  end if;
   -- BIND reconciliation to the EXACT durable shadow snapshot identity: the report_snapshots row for
   -- scheduler-v2/<report_key>, this account, this params_hash MUST already exist. A malformed /
   -- wrong-account / wrong-hash reconciliation finds no snapshot and can NEVER authorize success.
@@ -138,9 +169,7 @@ begin
   if v_job.derive_lease_token is null or v_job.derive_lease_token <> p_lease_token then
     return jsonb_build_object('disposition', 'lease-lost');
   end if;
-  if v_job.derive_status <> 'running' then
-    return jsonb_build_object('disposition', 'not-running', 'derive_status', v_job.derive_status);
-  end if;
+  -- derive_status is proven 'running' above; the WHERE re-asserts it (belt-and-suspenders under FOR UPDATE).
   update public.sync_report_jobs
     set fetch_status = 'ready', derive_status = 'succeeded', save_status = 'succeeded', validated = true,
         snapshot_params_hash = p_snapshot_params_hash,
@@ -148,7 +177,8 @@ begin
         last_good_snapshot_at = now(), succeeded_at = now(),
         derive_lease_token = null, derive_lease_expires_at = null,
         error_stage = null, error_code = null, error_message = null
-    where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id;
+    where cycle_id = p_cycle_id and report_key = p_report_key and account_id = p_account_id
+      and derive_status = 'running';
   return jsonb_build_object('disposition', 'reconciled', 'snapshot_params_hash', p_snapshot_params_hash);
 end;
 $$;
@@ -156,8 +186,8 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Grants -- service_role only, matching the existing Scheduler-v2 RPCs.
 -- ---------------------------------------------------------------------------
-revoke all on function public.claim_report_derive_lease(uuid, text, text, timestamptz, integer) from public, anon, authenticated;
-grant execute on function public.claim_report_derive_lease(uuid, text, text, timestamptz, integer) to service_role;
+revoke all on function public.claim_report_derive_lease(uuid, text, text, integer) from public, anon, authenticated;
+grant execute on function public.claim_report_derive_lease(uuid, text, text, integer) to service_role;
 
 revoke all on function public.reconcile_report_derive_success(uuid, text, text, text, uuid, date) from public, anon, authenticated;
 grant execute on function public.reconcile_report_derive_success(uuid, text, text, text, uuid, date) to service_role;

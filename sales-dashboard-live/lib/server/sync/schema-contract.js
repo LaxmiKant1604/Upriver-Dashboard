@@ -440,7 +440,8 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       { label: "sync_report_jobs.derive_attempt_count column (additive)", pattern: String.raw`add\s+column\s+if\s+not\s+exists\s+derive_attempt_count\s+integer\s+not\s+null\s+default\s+0` },
     ],
     rpcs: [
-      { name: "claim_report_derive_lease", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_now", "p_lease_seconds"] },
+      // Round-8: NO caller-time parameter -- the claim RPC uses DATABASE-authoritative time (now()).
+      { name: "claim_report_derive_lease", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_lease_seconds"] },
       { name: "reconcile_report_derive_success", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_snapshot_params_hash", "p_lease_token", "p_latest_data_date"] },
     ],
     provenFunctions: [
@@ -1099,21 +1100,45 @@ function auditClaimReportLeaseFunction(clean, masked, fnName) {
   if (!/'already-complete'/i.test(C) || !/validated\s*=\s*true/i.test(M)) {
     problems.push({ code: "CLAIM_LEASE_COMPLETE_GUARD_MISSING", reason: "does not observe an already-complete (validated) job instead of re-claiming" });
   }
-  // A FRESH lease token from gen_random_uuid() (inline, or via a v_* variable) written to the row, plus the
-  // expiry from p_now, on the 'claimed' path.
+  // Round-8: current time must be DATABASE-authoritative. The body must use now()/clock_timestamp() (captured
+  // once as v_now), the lease expiry must derive from that DB time, and NO caller-time parameter (p_now) may
+  // exist -- a caller clock skew could otherwise steal or distort a lease.
+  const dbTime = /:=\s*(now\(\)|clock_timestamp\(\))/i.test(M) || /derive_lease_expires_at\s*=\s*(now\(\)|clock_timestamp\(\)|v_now)\s*\+/i.test(M);
+  if (!dbTime) {
+    problems.push({ code: "CLAIM_LEASE_DB_TIME_MISSING", reason: "does not use DATABASE-authoritative time (now()/clock_timestamp()) for the lease" });
+  }
+  if (/\bp_now\b/i.test(M)) {
+    problems.push({ code: "CLAIM_LEASE_CALLER_TIME", reason: "references a caller-supplied time parameter (p_now); current time must be database-authoritative" });
+  }
+  // The requested lease duration must be bounded to a reviewed safe range (lower AND upper) -> 'invalid-lease'.
+  const bounded = /p_lease_seconds\s*<\s*\d+/i.test(M) && /p_lease_seconds\s*>\s*\d+/i.test(M) && /'invalid-lease'/i.test(C);
+  if (!bounded) {
+    problems.push({ code: "CLAIM_LEASE_UNBOUNDED", reason: "does not bound p_lease_seconds to a reviewed range (lower AND upper) with 'invalid-lease'" });
+  }
+  // A FRESH lease token (gen_random_uuid, inline or via a v_* variable) written to the row, plus the DB-time
+  // expiry, on the 'claimed' path.
   const claimsFresh = /gen_random_uuid\(\)/i.test(M)
     && /derive_lease_token\s*=\s*(gen_random_uuid\(\)|v_\w+)/i.test(M)
-    && /derive_lease_expires_at\s*=\s*p_now\s*\+/i.test(M)
+    && /derive_lease_expires_at\s*=\s*(now\(\)|clock_timestamp\(\)|v_now)\s*\+/i.test(M)
     && /'claimed'/i.test(C);
   if (!claimsFresh) {
-    problems.push({ code: "CLAIM_LEASE_CLAIM_MISSING", reason: "does not claim a pending row with a fresh lease token + expiry" });
+    problems.push({ code: "CLAIM_LEASE_CLAIM_MISSING", reason: "does not claim a pending row with a fresh lease token + DB-time expiry" });
   }
-  // The 'held' branch MUST be guarded by an UNEXPIRED lease so a LIVE worker is never stolen.
-  if (!/derive_lease_expires_at\s*>\s*p_now/i.test(M) || !/'held'/i.test(C)) {
-    problems.push({ code: "CLAIM_LEASE_STEAL_GUARD_MISSING", reason: "does not refuse to steal an UNEXPIRED lease (the 'held' branch guarded by derive_lease_expires_at > p_now)" });
+  // The 'held' branch MUST be guarded by an UNEXPIRED lease (compared to DB time) so a LIVE worker is never stolen.
+  if (!/derive_lease_expires_at\s*>\s*(now\(\)|clock_timestamp\(\)|v_now)/i.test(M) || !/'held'/i.test(C)) {
+    problems.push({ code: "CLAIM_LEASE_STEAL_GUARD_MISSING", reason: "does not refuse to steal an UNEXPIRED lease (the 'held' branch guarded by derive_lease_expires_at > DB-time)" });
   }
-  if (!/'reclaimed'/i.test(C)) {
-    problems.push({ code: "CLAIM_LEASE_RECLAIM_MISSING", reason: "does not re-claim a stale/expired running lease ('reclaimed')" });
+  // RECLAIM only when derive_status is EXACTLY 'running': the reclaim UPDATE's WHERE must re-assert
+  // derive_status = 'running' IMMEDIATELY before the 'reclaimed' return (so the guard belongs to the reclaim
+  // UPDATE specifically, not the reconcile flip or the claim SET).
+  const reclaimGuarded = /'reclaimed'/i.test(C)
+    && /derive_status\s*=\s*'running'\s*;\s*return\s+jsonb_build_object\(\s*'disposition',\s*'reclaimed'/i.test(C);
+  if (!reclaimGuarded) {
+    problems.push({ code: "CLAIM_LEASE_RECLAIM_MISSING", reason: "does not re-claim ONLY an EXACTLY-running expired lease ('reclaimed' with a derive_status = 'running' WHERE guard on the reclaim UPDATE)" });
+  }
+  // TOTAL state machine: an incoherent/unknown status must return 'invalid-state', never fall through.
+  if (!/'invalid-state'/i.test(C)) {
+    problems.push({ code: "CLAIM_LEASE_STATE_INCOMPLETE", reason: "is not a total state machine (no 'invalid-state' for incoherent/unknown derive_status)" });
   }
   return problems;
 }
@@ -1143,14 +1168,23 @@ function auditReconcileReportSuccessFunction(clean, masked, fnName) {
   if (!/derive_lease_token\s*(<>|!=)\s*p_lease_token/i.test(M) || !/'lease-lost'/i.test(C)) {
     problems.push({ code: "RECONCILE_LEASE_GUARD_MISSING", reason: "does not require the CURRENT lease token ('lease-lost' when it differs)" });
   }
+  // Round-8: the flip must be GUARDED to a running row (the UPDATE re-asserts derive_status = 'running').
   const flips = /update\s+public\.sync_report_jobs\b[\s\S]*?validated\s*=\s*true/i.test(M)
     && /snapshot_params_hash\s*=\s*p_snapshot_params_hash/i.test(M)
+    && /update\s+public\.sync_report_jobs\b[\s\S]*?where[\s\S]*?derive_status\s*=\s*'running'/i.test(C)
     && /'reconciled'/i.test(C);
   if (!flips) {
-    problems.push({ code: "RECONCILE_SUCCESS_MISSING", reason: "does not flip the running row to succeeded/validated bound to p_snapshot_params_hash ('reconciled')" });
+    problems.push({ code: "RECONCILE_SUCCESS_MISSING", reason: "does not flip an EXACTLY-running row to succeeded/validated bound to p_snapshot_params_hash ('reconciled')" });
   }
   if (!/'already-complete'/i.test(C)) {
     problems.push({ code: "RECONCILE_IDEMPOTENT_MISSING", reason: "is not idempotent on an already-complete identical snapshot identity" });
+  }
+  // Round-8: a non-running row must be handled explicitly (terminal for failed/skipped; 'invalid-state'
+  // otherwise) -- never fall through to a success write.
+  const nonRunningHandled = /derive_status\s*(<>|!=)\s*'running'/i.test(C)
+    && /'invalid-state'/i.test(C) && /'terminal'/i.test(C);
+  if (!nonRunningHandled) {
+    problems.push({ code: "RECONCILE_NONRUNNING_UNHANDLED", reason: "does not explicitly handle a non-running row (terminal / 'invalid-state'); could fall through" });
   }
   return problems;
 }
