@@ -40,7 +40,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runtimeMod; let registry; let schema; let dates; let identity;
+let runtimeMod; let registry; let schema; let dates; let identity; let reportStore;
 
 const PRIM_KEY = ["prim", "key"].join("-");
 const SEC_KEY = ["sec", "key"].join("-");
@@ -55,8 +55,9 @@ const dirAccount = (id) => ({ id, name: "Acct " + id, country: "US", currency: "
 /* ---------------- full in-memory worker store (owner + budget models) ---------------- */
 function makeStore() {
   const cycles = new Map(); const jobsByCycle = new Map(); const ownersByCycle = new Map();
-  const cache = new Map(); const budgets = new Map(); let seq = 0;
+  const cache = new Map(); const budgets = new Map(); const reportJobs = new Map(); let seq = 0;
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
+  const rjKey = (c, rk, a) => c + "|" + rk + "|" + a;
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
   const bkey = (cid, tk) => cid + "|" + tk;
   const store = {
@@ -141,6 +142,48 @@ function makeStore() {
       b.spentCreates += 1; b.spentTokens += cost;
       return "reserved";
     },
+    /* round-5: the sync_report_jobs model (insert-ignore upsert, pending->running one-attempt claim,
+       validated success) + the reviewed finalize_sync_cycle terminal lifecycle. */
+    _reportJobs: reportJobs,
+    upsertReportJob(j) {
+      const k = rjKey(j.cycleId, j.reportKey, j.accountId);
+      if (reportJobs.has(k)) return;
+      reportJobs.set(k, {
+        cycle_id: j.cycleId, report_key: j.reportKey, report_version: j.reportVersion || "", account_id: j.accountId,
+        connection_id: j.connectionId, bucket: j.bucket, depends_on: [...(j.dependsOn || [])],
+        derive_status: "pending", save_status: "pending", validated: false, snapshot_params_hash: null, latest_data_date: null,
+      });
+    },
+    claimReportDerive(cycleId, reportKey, accountId) {
+      const r = reportJobs.get(rjKey(cycleId, reportKey, accountId));
+      if (r && r.derive_status === "pending") { r.derive_status = "running"; return true; }
+      return false;
+    },
+    recordReportSuccess(j) {
+      const r = reportJobs.get(rjKey(j.cycleId, j.reportKey, j.accountId));
+      Object.assign(r, {
+        derive_status: "succeeded", save_status: "succeeded", validated: true,
+        snapshot_params_hash: j.snapshotParamsHash, latest_data_date: j.latestDataDate ?? null,
+      });
+    },
+    getReportJob(reportKey, accountId) {
+      const rows = [...reportJobs.values()].filter((r) => r.report_key === reportKey && r.account_id === accountId);
+      return rows.length ? { ...rows[rows.length - 1] } : null;
+    },
+    finalizeCycle({ cycleId }) {
+      const c = findCycle(cycleId);
+      if (!c) return { disposition: "not-found" };
+      if (["succeeded", "partial", "failed"].includes(c.status)) return { disposition: "already-terminal", cycle: { id: c.id, status: c.status } };
+      const src = [...((jobsByCycle.get(cycleId) || new Map()).values())];
+      const rep = [...reportJobs.values()].filter((r) => r.cycle_id === cycleId);
+      const open = src.some((j) => j.fetch_status === "pending" || j.fetch_status === "attempted")
+        || rep.some((r) => r.derive_status === "pending" || r.derive_status === "running");
+      if (open) return { disposition: "open-work", cycle: { id: c.id, status: c.status } };
+      const failed = src.some((j) => j.fetch_status === "failed") || rep.some((r) => r.save_status === "failed");
+      const succeeded = src.some((j) => j.fetch_status === "succeeded") || rep.some((r) => r.validated === true);
+      c.status = failed ? (succeeded ? "partial" : "failed") : "succeeded";
+      return { disposition: "finalized", cycle: { id: c.id, status: c.status } };
+    },
   };
   return store;
 }
@@ -185,9 +228,12 @@ function makeHarness(over = {}) {
   const runtime = runtimeMod.buildBucketSourceSyncRuntime({
     getConnections: () => over.connections || CONNS,
     fetchAccounts: async (apiKey) => {
+      if (over.onFetchAccounts) over.onFetchAccounts(apiKey);
       if (apiKey === PRIM_KEY) return over.primaryAccounts || [dirAccount("A01"), dirAccount("A02")];
       return over.secondaryAccounts || [dirAccount("B01")];
     },
+    setTimer: over.setTimer,
+    clearTimer: over.clearTimer,
     makeSourceStore: () => store,
     makeAdapter: () => dd,
     readSourceControls: over.readSourceControls || (async () => ({ rows: [], read: "ok", error: null })),
@@ -231,14 +277,23 @@ function makeHarness(over = {}) {
       currency: r.currency, sales_amount: r.salesAmount, units: r.units,
     }))),
     updateRunStatus: async () => ({ write: "ok" }),
-    makeShadowSaver: () => async (args) => { recorded.shadowSaves.push(args); return { paramsHash: "ph_" + args.reportKey + "_" + args.accountId }; },
+    // Round-5: the REAL paramsHashFor hash (so the genuine publisher hash-provenance gate can accept these
+    // saves) + a "save" lineage event so claim-BEFORE-save ordering is provable from one recorder.
+    makeShadowSaver: () => async (args) => {
+      const paramsHash = reportStore.paramsHashFor(args.params.reportVersion, args.params);
+      recorded.lineage.push({ op: "save", reportKey: args.reportKey, accountId: args.accountId });
+      recorded.shadowSaves.push({ ...args, paramsHash });
+      return { paramsHash };
+    },
     readSettings: over.readSettings || (async () => []),
     readRollout: over.readRollout || (async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [] })),
     readAdMetrics: over.readAdMetrics || (async () => []),
+    // Round-5: the default lineage DELEGATES to the store's sync_report_jobs model (real one-attempt claim
+    // semantics + rows the finalize/publisher read) while still recording every op for ordering assertions.
     reportLineage: over.reportLineage || {
-      upsertReportJob: async (j) => { recorded.lineage.push({ op: "upsert", ...j }); },
-      claimReportDerive: async (c, rk, a) => { recorded.lineage.push({ op: "claim", reportKey: rk, accountId: a }); return true; },
-      recordReportSuccess: async (j) => { recorded.lineage.push({ op: "success", ...j }); },
+      upsertReportJob: async (j) => { recorded.lineage.push({ op: "upsert", ...j }); store.upsertReportJob(j); },
+      claimReportDerive: async (c, rk, a) => { const claim = store.claimReportDerive(c, rk, a); recorded.lineage.push({ op: "claim", reportKey: rk, accountId: a, claim }); return claim; },
+      recordReportSuccess: async (j) => { recorded.lineage.push({ op: "success", ...j }); store.recordReportSuccess(j); },
     },
     composeTrancheRuntime: over.composeTrancheRuntime,
     clock: () => clockRef.now,
@@ -713,9 +768,13 @@ test("R8. endpoint ordering pins: PATCH boolean-strict BEFORE any write; POST pr
   const boolCheck = src.indexOf('typeof body.paused !== "boolean"');
   const patchWrite = src.indexOf("setSourceControl({ sourceKey, paused");
   assert.ok(boolCheck > 0 && patchWrite > boolCheck, "PATCH validates the boolean before its first write");
-  const preflight = src.indexOf("preflightEvidence({ bucket, sourceKey: onlySourceKey })");
+  const mkDeadline = src.indexOf("runtime.makeDeadline()");
+  const preflight = src.indexOf("preflightEvidence({ bucket, sourceKey: onlySourceKey, deadline })");
   const postAudit = src.indexOf('action: "source.sync.missing"');
+  assert.ok(mkDeadline > 0 && preflight > mkDeadline, "round-5: the ONE route-owned deadline is created BEFORE preflight");
   assert.ok(preflight > 0 && postAudit > preflight, "POST runs the evidence preflight BEFORE the audit write");
+  const exec = src.indexOf("deadline, preflight });");
+  assert.ok(exec > postAudit, "execution consumes the SAME route deadline + memoized preflight bundle");
 });
 
 test("R9. dropped / weakened / wrong-schema POLICIES each raise a typed audit blocker", () => {
@@ -775,7 +834,7 @@ test("S2. genuine sync_report_jobs lineage: every durable save records upsert ->
   for (const sSucc of successes) {
     const save = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/" + sSucc.reportKey && x.accountId === sSucc.accountId);
     assert.ok(save, "each success maps to a real shadow save");
-    assert.equal(sSucc.snapshotParamsHash, "ph_" + save.reportKey + "_" + save.accountId, "the EXACT saver-computed snapshot_params_hash is recorded");
+    assert.equal(sSucc.snapshotParamsHash, reportStore.paramsHashFor(save.params.reportVersion, save.params), "the EXACT saver-computed snapshot_params_hash is recorded");
   }
 });
 
@@ -858,6 +917,307 @@ test("S7. NONCANONICAL membership ids are REJECTED (never trimmed); the DB const
   assert.ok(stripped.blockers.some((b) => b.code === "STATEMENT_MISSING"), JSON.stringify(stripped.blockers.map((b) => b.code)));
 });
 
+/* ================================= T. round-5 regressions ================================= */
+group("T. round-5: claim-before-save lineage + real publisher acceptance, Brand View read path, memoized preflight, route deadline, sequential ACLs, CAS binding");
+
+// A COMPLETE durable fixture: full OLI coverage, fresh hydratable catalog + per-account FBA snapshots and
+// seeded history, so a full bucket run drains, derives Daily + Brand View + compact brand-inventory, records
+// lineage and finalizes its cycle. `over` wins over every fixture default.
+function fullFixture(over = {}) {
+  const h = makeHarness({
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async ({ sourceKey, scopeKey }) => {
+      if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
+      return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null };
+    },
+    ...over,
+  });
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  for (const a of ["A01", "A02"]) {
+    h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + a + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
+  }
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+  return h;
+}
+
+test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the runtime-produced cycle/job passes the REAL buildSchedulerV2Publisher (no fabricated cycle_status)", async () => {
+  const h = fullFixture();
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.derived.skipped, null);
+  assert.ok(rollup.derived.daily.saved >= 1 && rollup.derived.brandView.saved >= 1, "durable saves happened");
+  // (a) ORDER per (report, account): upsert -> claim(true) -> save -> success, from ONE recorder.
+  const successes = h.recorded.lineage.filter((l) => l.op === "success");
+  assert.ok(successes.length >= 3, "daily + brand-sales + brand-inventory lineage recorded");
+  for (const s of successes) {
+    const seq = h.recorded.lineage.filter((l) =>
+      (l.reportKey === s.reportKey || l.reportKey === "scheduler-v2/" + s.reportKey) && l.accountId === s.accountId);
+    const ops = seq.map((l) => l.op);
+    assert.deepEqual(ops, ["upsert", "claim", "save", "success"], s.reportKey + "/" + s.accountId + ": the claim is held BEFORE the save, success only after it");
+    assert.equal(seq[1].claim, true, "claim === true STRICTLY before any save");
+  }
+  // (b) depends_on binds each job to the EXACT authoritative source request hashes of THIS cycle.
+  const jobRows = h.store.listSourceJobs(rollup.cycleId);
+  const hashesOf = (families) => jobRows.filter((r) => r.fetch_status === "succeeded" && families.includes(r.source_key)).map((r) => r.request_hash).sort();
+  const oliCatalog = hashesOf(["order-line-items", "product-catalog"]);
+  const withFba = hashesOf(["order-line-items", "product-catalog", "fba-inventory-health"]);
+  assert.ok(oliCatalog.length >= 1, "authoritative succeeded source hashes exist");
+  for (const u of h.recorded.lineage.filter((l) => l.op === "upsert")) {
+    const want = u.reportKey === "brand-inventory" ? withFba : oliCatalog;
+    assert.deepEqual([...u.dependsOn].sort(), want, u.reportKey + ": depends_on is the EXACT succeeded source request hash set");
+  }
+  // (c) the REVIEWED terminal lifecycle: the runtime finalized its full-scope cycle -- the STORE's cycle
+  // row carries the terminal status; nothing here fabricates it.
+  assert.equal(rollup.finalized, true);
+  assert.equal(rollup.cycleStatus, "succeeded");
+  assert.equal(h.store.getCycle(rollup.cycleId).status, "succeeded", "the terminal status lives in the durable cycle row");
+  assert.ok(rollup.derived.lineage.every((l) => l.outcome === "recorded"), "no lost claims in a single-worker run");
+  // (d) the ACTUAL runtime-produced job + cycle pass the REAL composed publisher. Every value the publisher
+  // validates (validated/derive/save/cycle_status/snapshot_params_hash/params/payload) is read from the
+  // harness rows the RUNTIME wrote -- the test fabricates NOTHING.
+  const pubMod = await import("../lib/server/sync/publisher-composition.js");
+  const published = [];
+  const publisher = pubMod.buildSchedulerV2Publisher({
+    codeReadyKeys: ["brand-sales"],
+    connections: CONNS,
+    fetchAccounts: async (apiKey) => (apiKey === PRIM_KEY ? [dirAccount("A01"), dirAccount("A02")] : [dirAccount("B01")]),
+    getSettings: async () => [{ report_key: "brand-sales", schedule_enabled: true }],
+    getAccountRollout: async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] }),
+    getApproval: async () => ({ read: "ok", approved: true }),
+    getJob: async (rk, a) => {
+      const j = h.store.getReportJob(rk, a);
+      return j ? { ...j, cycle_status: h.store.getCycle(j.cycle_id).status } : null;
+    },
+    getSnapshot: async ({ reportKey, accountId, paramsHash }) => {
+      const s = h.recorded.shadowSaves.find((x) => x.reportKey === reportKey && x.accountId === accountId && x.paramsHash === paramsHash);
+      return s ? { params_hash: s.paramsHash, params: s.params, payload: s.payload, payload_storage_path: null, source_refreshed_at: s.sourceRefreshedAt } : null;
+    },
+    loadStoragePayload: async () => null,
+    publishLive: async (args) => { published.push(args); return { outcome: "inserted" }; },
+  });
+  const res = await publisher.publish("brand-sales", "A01");
+  assert.equal(res.disposition, "published", JSON.stringify(res));
+  assert.equal(published.length, 1, "the live CAS primitive received exactly one publish");
+});
+
+test("T2. blocker 1: idempotent RESUME (a fresh invocation loses the claim and changes nothing) and CONCURRENCY (a lost claim never records success; the cycle honestly stays open)", async () => {
+  // (a) idempotent resume over the SAME completed cycle.
+  const h = fullFixture();
+  await h.runtime.run({ bucket: "us", today: TODAY });
+  const saves1 = h.recorded.shadowSaves.length;
+  const successes1 = h.recorded.lineage.filter((l) => l.op === "success").length;
+  const creates1 = h.dd.totalCreates();
+  const r2 = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(h.dd.totalCreates(), creates1, "no duplicate export on resume");
+  assert.equal(h.recorded.shadowSaves.length, saves1, "no duplicate shadow save: the resume LOSES every claim");
+  assert.equal(h.recorded.lineage.filter((l) => l.op === "success").length, successes1, "no duplicate success");
+  assert.ok(r2.derived.lineage.length >= 1 && r2.derived.lineage.every((l) => l.outcome === "claim-lost"), "every resume claim is typed claim-lost");
+  assert.equal(r2.cycleStatus, "succeeded", "already-terminal cycle status is REPORTED, not re-fabricated");
+  // (b) concurrency: a racer wins the daily/A01 claim (and never completes it).
+  const store2 = makeStore();
+  let raced = false;
+  const h2 = fullFixture({
+    store: store2,
+    reportLineage: {
+      upsertReportJob: async (j) => store2.upsertReportJob(j),
+      claimReportDerive: async (c, rk, a) => {
+        if (rk === "daily-reporting" && a === "A01" && !raced) { raced = true; store2.claimReportDerive(c, rk, a); } // a concurrent worker claims FIRST
+        return store2.claimReportDerive(c, rk, a);
+      },
+      recordReportSuccess: async (j) => store2.recordReportSuccess(j),
+    },
+  });
+  const r3 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r3.stopped, false);
+  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "the claim loser NEVER saves");
+  const lost = store2.getReportJob("daily-reporting", "A01");
+  assert.equal(lost.validated, false, "success is NEVER recorded after a lost claim");
+  assert.equal(lost.derive_status, "running", "the job stays with its claim winner");
+  assert.ok(r3.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "claim-lost"), "typed claim-lost outcome");
+  assert.equal(r3.cycleStatus, "running", "an open (claimed elsewhere) report job keeps the cycle honestly NON-terminal (open-work)");
+  assert.equal(r3.finalized, false);
+});
+
+test("T3. blocker 2: the durable FBA evidence reaches Brand View through its REAL read path (buildAccountBrandSlice -> compact snapshot gate), not a direct builder call", async () => {
+  const h = fullFixture();
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.derived.brandInventory.saved >= 1, "the compact brand-inventory shadow snapshot saved: " + JSON.stringify(rollup.derived.brandInventory));
+  const invSave = h.recorded.shadowSaves.find((s) => s.reportKey === "scheduler-v2/brand-inventory" && s.accountId === "A01");
+  assert.ok(invSave, "saved under the EXISTING shadow key");
+  assert.equal(invSave.params.reportVersion, "brand-inventory-shared-v1", "the EXISTING compact report version");
+  assert.ok(Array.isArray(invSave.payload.inventoryByBrandCountry), "the EXISTING compact payload contract");
+  // THE REAL production orchestration: buildAccountBrandSlice reads brand-sales + the compact inventory
+  // through its own snapshot gate (isCompactInventorySnapshot) -- the ONLY injected seam is readSnapshot.
+  const bv = await import("../lib/server/reports/brand-view.js");
+  const getSnapshot = async ({ reportKey, accountId }) => {
+    const s = [...h.recorded.shadowSaves].reverse().find((x) => x.reportKey === "scheduler-v2/" + reportKey && x.accountId === accountId);
+    return s ? { params: s.params, params_hash: s.paramsHash, payload: s.payload, source_refreshed_at: s.sourceRefreshedAt } : null;
+  };
+  const slice = await bv.buildAccountBrandSlice({
+    accountId: "A01", brand: "Acme", asOf: ASOF, account: { name: "Acct A01", country: "US" },
+    getSnapshot, getAdsRows: async () => [],
+  });
+  assert.equal(slice.inventory.scope, "country", "the compact snapshot is AUTHORITATIVE through the real gate (never the legacy fallback)");
+  assert.equal(slice.inventory.accountTotal, 5, "the durable FBA quantity arrived via the real read path");
+  assert.equal(slice.inventoryDate, ASOF, "the inventory date travels from the durable evidence");
+  assert.ok(slice.sales, "the brand-sales half of the REAL slice consumed the durable-derived snapshot");
+});
+
+test("T4. blocker 3: preflight sweeps hydration/integrity/ads-coverage/ads-metrics/history typed BEFORE any write; execution consumes ONE memoized bundle with ZERO repeated reads", async () => {
+  // (a) every NEW read-failure class refuses typed with ZERO writes and ZERO exports.
+  const catalogPointer = { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
+  const cases = [
+    ["SNAPSHOT_HYDRATION_FAILED", { readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog" ? catalogPointer : { snapshot: null, read: "ok", error: null }) }, (h) => { /* no snapStore object => dangling */ }],
+    ["SNAPSHOT_INTEGRITY_FAILED", { readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog" ? { ...catalogPointer, snapshot: { ...catalogPointer.snapshot, row_count: 5 } } : { snapshot: null, read: "ok", error: null }) }, (h) => { h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A" }] }); }],
+    ["ADS_COVERAGE_READ_FAILED", { readAdsCoverage: async () => ({ windows: [], read: "read-failed", error: "X" }) }, null],
+    ["ADS_METRICS_READ_FAILED", { readAdMetrics: async () => { throw new Error("boom"); } }, null],
+    ["ADS_METRICS_READ_FAILED", { readAdMetrics: async () => "not-an-array" }, null],
+    ["HISTORY_READ_FAILED", { loadHistoryRows: async () => { throw new Error("boom"); } }, null],
+  ];
+  for (const [code, over, prep] of cases) {
+    const h = makeHarness(over);
+    if (prep) prep(h);
+    await assert.rejects(() => h.runtime.preflightEvidence({ bucket: "us", today: TODAY }), (e) => e.code === code && e.status === 503, code);
+    assert.equal(h.store._opens, 0, code + ": zero cycle writes");
+    assert.equal(h.dd.totalCreates(), 0, code + ": zero exports");
+    assert.equal(h.recorded.snapshots.length + h.recorded.shadowSaves.length + h.recorded.replaceCalls.length + h.recorded.lineage.length, 0, code + ": zero snapshot/report/history writes");
+  }
+  // limit-exceeded is a VALID authoritative Ads answer: memoized typed, NOT a refusal.
+  const lim = fullFixture({ readAdMetrics: async () => { const e = new Error("cap"); e.code = "ADS_ROW_LIMIT_EXCEEDED"; throw e; } });
+  const pfLim = await lim.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  assert.equal(pfLim.adMetricsByAccountId.A01.metricsRead, "limit-exceeded", "typed degrade memoized in the bundle");
+  // (b) execution consumes the ONE memoized bundle: ZERO repeated discovery/controls/coverage/snapshot/
+  // hydration/ads/history reads -- and STILL derives fresh (the sync's own products fold in-memory).
+  const counts = { controls: 0, discovery: 0, coverage: 0, snapshot: 0, adsCov: 0, metrics: 0, history: 0 };
+  const h2 = fullFixture({
+    onFetchAccounts: () => { counts.discovery += 1; },
+    readSourceControls: async () => { counts.controls += 1; return { rows: [], read: "ok", error: null }; },
+    readCoverage: async () => { counts.coverage += 1; return { windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }; },
+    readSnapshot: async ({ sourceKey, scopeKey }) => {
+      counts.snapshot += 1;
+      if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
+      return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null };
+    },
+    readAdsCoverage: async () => { counts.adsCov += 1; return { windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }; },
+    readAdMetrics: async () => { counts.metrics += 1; return []; },
+    loadHistoryRows: async () => { counts.history += 1; return [{ account_id: "A01", sale_date: ASOF, sku: "SKU-A", child_asin: "B0A", currency: "USD", sales_amount: 10, units: 1 }]; },
+  });
+  const pf = await h2.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const membershipReadsAfterPreflight = h2.recorded.membershipReads;
+  const snapCounts = { ...counts };
+  const rollup = await h2.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.derived.skipped, null, "the memoized bundle carried the WHOLE derive stage");
+  assert.deepEqual(counts, snapCounts, "execution repeated ZERO discovery/controls/coverage/snapshot/ads/history reads");
+  assert.equal(h2.recorded.membershipReads, membershipReadsAfterPreflight, "membership was read ONCE, in preflight");
+  assert.ok(rollup.derived.daily.saved >= 1, "fresh derivation from the memoized evidence + this invocation's own persisted products");
+});
+
+test("T5. blocker 4: ONE route-owned deadline created BEFORE preflight bounds preflight + execution; total elapsed stays BELOW the route budget; a hung in-flight read is raced+aborted", async () => {
+  assert.equal(typeof runtimeMod.makeRouteDeadline, "function", "the reviewed deadline wrapper is exported");
+  // (a) total-elapsed proof: preflight + execution burn the SAME budget; expiry is typed-resumable and the
+  // elapsed clock (INCLUDING preflight) stays under the route budget (reserve sized above the op cost).
+  const store = makeStore();
+  let h;
+  h = fullFixture({
+    store,
+    ddOpts: { onCreate: () => { h.clockRef.now += 30_000; } },
+    budgetMs: 100_000, reserveMs: 40_000,
+    readCoverage: async () => ({ windows: [], read: "ok", error: null }), // full backfill => plenty of work
+  });
+  const t0 = h.clockRef.now;
+  const dl = h.runtime.makeDeadline();
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", deadline: dl, today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, deadline: dl, preflight: pf });
+  assert.equal(rollup.deadlineReached, true, "the shared budget expired mid-execution");
+  assert.equal(rollup.continuationRequired, true, "typed resumable");
+  assert.equal(dl.startMs, t0, "the ONE deadline was created before preflight and owned the whole route");
+  assert.ok(h.clockRef.now - t0 < 100_000, "TOTAL elapsed (preflight + execution) stays below the route budget: " + (h.clockRef.now - t0));
+  // (b) an in-flight read that NEVER resolves is bounded by the reviewed wrapper (race + abort): typed
+  // ROUTE_DEADLINE_EXCEEDED refusal, zero writes, never a hung route.
+  const delays = [];
+  const hang = makeHarness({
+    readCoverage: () => new Promise(() => {}), // hangs forever; ignores the abort signal
+    setTimer: (fn, ms) => { delays.push(ms); return setTimeout(fn, 0); },
+    clearTimer: (id) => clearTimeout(id),
+  });
+  await assert.rejects(
+    () => hang.runtime.preflightEvidence({ bucket: "us", today: TODAY }),
+    (e) => e.code === "ROUTE_DEADLINE_EXCEEDED" && e.status === 503,
+    "the hung read is raced against the remaining budget",
+  );
+  assert.ok(delays.length >= 1 && delays.every((ms) => Number.isFinite(ms) && ms >= 1), "every in-flight op was bounded by a finite remaining-budget timer");
+  assert.equal(hang.store._opens, 0, "zero writes after the bounded refusal");
+  assert.equal(hang.dd.totalCreates(), 0, "zero exports");
+});
+
+test("T6. blocker 5: FINAL ACL state is audited SEQUENTIALLY (source-order GRANT/REVOKE replay), never a union of historical grants", () => {
+  // grant-then-revoke: a LATER revoke removes the verb from the final state (a union would still count it).
+  const grantThenRevoke = auditWith((sql) => sql + "\nrevoke select on table public.source_controls from authenticated;\n");
+  assert.ok(grantThenRevoke.blockers.some((b) => b.code === "AUTH_GRANT_MISSING"), JSON.stringify(grantThenRevoke.blockers.map((b) => b.code)));
+  // revoke-then-grant: the re-granted verb IS held afterwards -- the replay audits clean.
+  const revokeThenGrant = auditWith((sql) => sql.replace(
+    "grant select on table public.source_controls to authenticated;",
+    "revoke select on table public.source_controls from authenticated;\ngrant select on table public.source_controls to authenticated;",
+  ));
+  assert.equal(revokeThenGrant.ok, true, JSON.stringify(revokeThenGrant.blockers));
+  // a FORBIDDEN grant that a later revoke removed is cured in the final state.
+  const curedForbidden = auditWith((sql) => sql + "\ngrant insert on table public.source_coverage to authenticated;\nrevoke insert on table public.source_coverage from authenticated;\n");
+  assert.equal(curedForbidden.ok, true, JSON.stringify(curedForbidden.blockers));
+  // an ARBITRARY role holding a non-empty FINAL set is forbidden; revoked-away it is clean again.
+  const arbitraryRole = auditWith((sql) => sql + "\ngrant all on table public.source_snapshots to reporting_bot;\n");
+  assert.ok(arbitraryRole.blockers.some((b) => b.code === "AUTH_GRANT_FORBIDDEN" && /reporting_bot/.test(b.message)), JSON.stringify(arbitraryRole.blockers.map((b) => b.code)));
+  const arbitraryCured = auditWith((sql) => sql + "\ngrant all on table public.source_snapshots to reporting_bot;\nrevoke all on table public.source_snapshots from reporting_bot;\n");
+  assert.equal(arbitraryCured.ok, true, JSON.stringify(arbitraryCured.blockers));
+  // service_role is replayed sequentially too: a later revoke breaks the exact expected FINAL set.
+  const srvRevoked = auditWith((sql) => sql + "\nrevoke update on table public.source_coverage from service_role;\n");
+  assert.ok(srvRevoked.blockers.some((b) => b.code === "SERVICE_ROLE_GRANT_MISMATCH"), JSON.stringify(srvRevoked.blockers.map((b) => b.code)));
+});
+
+test("T7. blocker 6: strict CAS acknowledgements (exactly replaced|unchanged|stale-save|conflict) + structural guard binding, deterministic racing insert, and the exact Codex mutations", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const sha = sb.sourceSnapshotPayloadSha([{ a: 1 }]);
+  const args = {
+    organizationFingerprint: "org1", connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization",
+    objectPath: "source-snapshots/v2/org1/primary/product-catalog/__organization/" + sha + ".json", payloadSha: sha,
+    rowCount: 1, sourceRequestHash: "h", validatedAt: "2026-08-20T00:00:00Z",
+  };
+  const realFetch = globalThis.fetch;
+  const stub = (body) => { globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body }); };
+  try {
+    // MALFORMED acknowledgements are TYPED failures -- never coerced into an "ok" write.
+    for (const bad of [null, "weird", { ack: "replaced" }, ["replaced", "replaced"], 42]) {
+      stub(bad);
+      await assert.rejects(() => sb.recordSourceSnapshot(args), (e) => e.code === "SOURCE_SNAPSHOT_ACK_INVALID", "malformed ack " + JSON.stringify(bad));
+    }
+    // The four EXACT acknowledgements (scalar or single-row) validate; conflict stays a typed refusal.
+    stub("replaced");
+    assert.deepEqual((await sb.recordSourceSnapshot(args)).ack, "replaced");
+    stub(["unchanged"]);
+    assert.deepEqual((await sb.recordSourceSnapshot(args)).ack, "unchanged");
+    stub("stale-save");
+    assert.deepEqual((await sb.recordSourceSnapshot(args)).ack, "stale-save");
+    stub("conflict");
+    await assert.rejects(() => sb.recordSourceSnapshot(args), (e) => e.code === "SOURCE_SNAPSHOT_CONFLICT");
+  } finally { globalThis.fetch = realFetch; }
+  // Structural mutations on the RPC body -- each of the Codex reproductions is a TYPED blocker.
+  assert.equal(auditWith(null).ok, true, "the real migration audits clean");
+  const ifTrue = auditWith((sql) => sql.replace("if p_validated_at < v_existing.validated_at then", "if true then"));
+  assert.ok(ifTrue.blockers.some((b) => b.code === "SNAPSHOT_CAS_STALE_GUARD_MISSING" || b.code === "SNAPSHOT_CAS_STALE_BRANCH_UNBOUND"), JSON.stringify(ifTrue.blockers.map((b) => b.code)));
+  const earlyUpdate = auditWith((sql) => sql.replace(
+    "  if p_validated_at < v_existing.validated_at then",
+    "  update public.source_snapshots set validated_at = p_validated_at where organization_fingerprint = p_organization_fingerprint;\n  if p_validated_at < v_existing.validated_at then",
+  ));
+  assert.ok(earlyUpdate.blockers.some((b) => b.code === "SNAPSHOT_CAS_WRITE_BEFORE_GUARDS"), JSON.stringify(earlyUpdate.blockers.map((b) => b.code)));
+  const wrongCmp = auditWith((sql) => sql.replace("if p_validated_at = v_existing.validated_at then", "if p_validated_at <> v_existing.validated_at then"));
+  assert.ok(wrongCmp.blockers.some((b) => b.code === "SNAPSHOT_CAS_EQUAL_BRANCH_UNBOUND"), JSON.stringify(wrongCmp.blockers.map((b) => b.code)));
+  const swallowed = auditWith((sql) => sql.replace("exception when unique_violation then", "exception when others then"));
+  assert.ok(swallowed.blockers.some((b) => b.code === "SNAPSHOT_CAS_EXCEPTION_SWALLOWED"), JSON.stringify(swallowed.blockers.map((b) => b.code)));
+  const noRaceHandler = auditWith((sql) => sql.replace("exception when unique_violation then", "exception when foreign_key_violation then"));
+  assert.ok(noRaceHandler.blockers.some((b) => b.code === "SNAPSHOT_CAS_CONCURRENT_INSERT_UNPROVEN"), JSON.stringify(noRaceHandler.blockers.map((b) => b.code)));
+});
+
 async function main() {
   out("source production-hardening proof suite");
   runtimeMod = await import("../lib/server/sync/source-bucket-sync-runtime.js");
@@ -865,6 +1225,7 @@ async function main() {
   schema = await import("../lib/server/sync/schema-contract.js");
   dates = await import("../lib/server/date-windows.js");
   identity = await import("../lib/server/source-identity.js");
+  reportStore = await import("../lib/server/report-store.js");
 
   let failures = 0;
   for (const t of tests) {

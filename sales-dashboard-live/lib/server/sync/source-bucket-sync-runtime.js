@@ -45,6 +45,8 @@ import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
 } from "./durable-dashboards.js";
+import { shadowSnapshotKey } from "./report-derivation.js";
+import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
@@ -59,6 +61,74 @@ export { SOURCE_SYNC_OWNER_REPORT_KEY };
 
 export const DEFAULT_ROUTE_BUDGET_MS = 50_000; // under config.maxDuration = 60 with reserve headroom
 export const DEFAULT_ROUTE_RESERVE_MS = 5_000;
+
+// Mirrors the LIVE compact Brand View inventory contract (api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS /
+// PLAN_INVENTORY_ROW_LIMIT): the exact [asOf-10d .. asOf] fold window and the truncation-refusal cap.
+const BRAND_INVENTORY_LOOKBACK_DAYS = 10;
+const BRAND_INVENTORY_ROW_LIMIT = 15000;
+
+// Round-5 blocker 4: ONE route-owned deadline. Symbol.for so a deadline created by the route and checked by
+// the runtime share the SAME marker even across module instances.
+const ROUTE_DEADLINE = Symbol.for("scheduler-v2/route-deadline");
+
+/**
+ * Round-5 blocker 4: the reviewed route-owned deadline wrapper. Created by the ROUTE **before** preflight and
+ * threaded (as `deadline`) through preflight + execution, so preflight time genuinely counts against the one
+ * route budget. Beyond checkpoint expiry (`ensureTime`), `bound(phase, op)` bounds an IN-FLIGHT operation:
+ * the op receives an AbortSignal (aborted on expiry) and is raced against the remaining budget via the
+ * injectable timer, so even a collaborator that ignores the signal returns control before the route dies.
+ * Expiry errors are TYPED (code ROUTE_DEADLINE_EXCEEDED, status 503) and carry the phase under the shared
+ * ROUTE_DEADLINE marker so the runtime converts them into typed-resumable rollups.
+ */
+export function makeRouteDeadline({
+  clock = () => Date.now(),
+  budgetMs = DEFAULT_ROUTE_BUDGET_MS,
+  reserveMs = DEFAULT_ROUTE_RESERVE_MS,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (id) => clearTimeout(id),
+} = {}) {
+  const startMs = clock();
+  const deadlineMs = startMs + Number(budgetMs);
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const abort = () => { if (controller && !controller.signal.aborted) controller.abort(); };
+  const outOfTime = () => clock() >= deadlineMs - reserveMs;
+  const expiry = (phase) => {
+    const e = new Error(`ROUTE_DEADLINE_EXCEEDED: the route budget expired during ${phase}; the work is typed-resumable on a fresh invocation.`);
+    e.code = "ROUTE_DEADLINE_EXCEEDED";
+    e.status = 503;
+    e[ROUTE_DEADLINE] = phase;
+    return e;
+  };
+  const ensureTime = async (phase) => { if (outOfTime()) { abort(); throw expiry(phase); } };
+  const bound = async (phase, op) => {
+    if (outOfTime()) { abort(); throw expiry(phase); }
+    const signal = controller ? controller.signal : null;
+    if (typeof setTimer !== "function") return op(signal);
+    const remaining = Math.max(1, deadlineMs - reserveMs - clock());
+    let timerId = null;
+    let timedOut = false;
+    const timeout = new Promise((resolve) => { timerId = setTimer(() => { timedOut = true; abort(); resolve(null); }, remaining); });
+    const opPromise = Promise.resolve().then(() => op(signal)).then((v) => ({ v }));
+    try {
+      const winner = await Promise.race([opPromise, timeout]);
+      if (winner == null || timedOut) {
+        opPromise.catch(() => {}); // the abandoned in-flight op may still reject later; never unhandled
+        throw expiry(phase);
+      }
+      return winner.v;
+    } finally {
+      if (timerId != null && typeof clearTimer === "function") clearTimer(timerId);
+    }
+  };
+  return {
+    startMs, deadlineMs, reserveMs,
+    signal: controller ? controller.signal : null,
+    outOfTime, ensureTime, bound,
+    elapsed: () => clock() - startMs,
+    isDeadlineError: (e) => !!(e && e[ROUTE_DEADLINE]),
+    phaseOf: (e) => (e && e[ROUTE_DEADLINE]) || null,
+  };
+}
 
 // FINDING 1: a durable evidence read that is not read:"ok" is a TYPED zero-export refusal.
 function requireOkRead(result, label) {
@@ -179,7 +249,15 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     clock = () => Date.now(),
     budgetMs = DEFAULT_ROUTE_BUDGET_MS,
     reserveMs = DEFAULT_ROUTE_RESERVE_MS,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
   } = overrides;
+
+  // Round-5 blocker 4: ONE route-owned deadline threads through preflight + execution. A route creates it
+  // BEFORE preflight via makeDeadline(); when none is provided (direct run() callers, the scheduler), the
+  // runtime creates its own with the same clock/budget so nothing ever runs unbounded.
+  const makeDeadline = (opts = {}) => makeRouteDeadline({ clock, budgetMs, reserveMs, setTimer, clearTimer, ...opts });
+  const resolveDeadline = (deadline) => (deadline && typeof deadline.ensureTime === "function" && typeof deadline.bound === "function" ? deadline : makeDeadline());
 
   // FINDINGS 5 + 6: the collaborator the bucket sync calls with ROWS -- production copies them into the
   // ORGANIZATION/CONNECTION-scoped, CONTENT-ADDRESSED source-snapshots/* namespace (immutable objects the
@@ -194,6 +272,21 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     });
     return { write: "ok", objectPath: saved.objectPath };
   };
+
+  // Deep-enough copy of a memoized preflight bundle's evidence: the run folds the sync's own products into
+  // these containers in-memory and must never corrupt the caller's bundle.
+  const cloneEvidence = (pf) => ({
+    readBlockers: [...(pf.evidence.readBlockers || [])],
+    oliCoverageByAccountId: Object.fromEntries(Object.entries(pf.evidence.oliCoverageByAccountId || {}).map(([k, v]) => [k, [...(v || [])]])),
+    catalogSnapshot: pf.evidence.catalogSnapshot,
+    catalogRows: pf.evidence.catalogRows,
+    fbaSnapshotsByAccount: { ...(pf.evidence.fbaSnapshotsByAccount || {}) },
+    fbaRowsByAccount: { ...(pf.evidence.fbaRowsByAccount || {}) },
+    campaignCoverageStateByAccountId: pf.evidence.campaignCoverageStateByAccountId,
+    campaignAds: pf.evidence.campaignAds,
+    asinAds: pf.evidence.asinAds,
+    historyRows: [...(pf.historyRows || [])],
+  });
 
   const resolvePrimary = () => {
     const connections = getConnections() || [];
@@ -219,13 +312,15 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   // (stale => typed degrade), exact ISOLATED identity (the read itself is org/connection-keyed), storage
   // HYDRATION (a dangling pointer blocks), row-count INTEGRITY, and content-hash provenance (the hydrator
   // proves payload<->metadata). Hydrated catalog rows are returned for the derive stage.
-  const gatherEvidence = async ({ orgFingerprint, accounts, today = null, ensureTime = null }) => {
+  const gatherEvidence = async ({ orgFingerprint, accounts, today = null, ensureTime = null, bound = null }) => {
     const tick = async (label) => { if (ensureTime) await ensureTime(label); };
+    // Round-5 blocker 4: when a route deadline is threaded in, every read is BOUNDED in-flight (raced
+    // against the remaining budget + abortable), not merely checkpointed between reads.
+    const call = async (label, fn) => { if (bound) return bound(label, fn); await tick(label); return fn(); };
     const readBlockers = [];
     const oliCoverageByAccountId = {};
     for (const a of accounts) {
-      await tick("coverage-read");
-      const cov = await readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY });
+      const cov = await call("coverage-read", () => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY }));
       if (cov.read !== "ok") {
         readBlockers.push({ sourceKey: OLI_SOURCE_KEY, accountId: a.accountId, reason: "coverage-" + cov.read, blocksSales: true });
         oliCoverageByAccountId[a.accountId] = [];
@@ -250,12 +345,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           }
         } catch (_e) { /* non-daily-snapshot source: no freshness policy */ }
       }
-      await tick("snapshot-hydration");
       let rows = null;
       try {
-        const payload = await loadSnapshotPayload(snapshot.object_path);
+        const payload = await call("snapshot-hydration", () => loadSnapshotPayload(snapshot.object_path));
         rows = payload.rows;
-      } catch (_e) {
+      } catch (e) {
+        if (e && e[ROUTE_DEADLINE]) throw e; // a deadline expiry is resumable, never "dangling" evidence
         readBlockers.push({ sourceKey, accountId, reason: "snapshot-dangling", blocksSales });
         return { snapshot: null, rows: null };
       }
@@ -265,25 +360,27 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       return { snapshot, rows };
     };
-    const catalogRead = await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY });
+    const catalogRead = await call("catalog-snapshot-read", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY }));
     const catalog = await validateSnapshot({ snapRead: catalogRead, sourceKey: CATALOG_SOURCE_KEY, blocksSales: true });
     const fbaSnapshotsByAccount = {};
+    const fbaRowsByAccount = {}; // Round-5 blocker 2: the HYDRATED durable FBA rows feed the compact Brand View inventory
     for (const a of accounts) {
-      await tick("fba-snapshot-read");
-      const snapRead = await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId });
+      const snapRead = await call("fba-snapshot-read", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId }));
       const fba = await validateSnapshot({ snapRead, sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: a.accountId, blocksSales: false });
-      if (fba.snapshot) fbaSnapshotsByAccount[a.accountId] = fba.snapshot;
+      if (fba.snapshot) {
+        fbaSnapshotsByAccount[a.accountId] = fba.snapshot;
+        fbaRowsByAccount[a.accountId] = fba.rows;
+      }
     }
     const campaignWindows = {};
     const asinWindows = {};
     const campaignCoverageStateByAccountId = {};
     for (const a of accounts) {
-      await tick("ads-coverage-read");
-      const camp = await readAdsCoverage(a.accountId, "campaign-performance-v1");
+      const camp = await call("ads-coverage-read", () => readAdsCoverage(a.accountId, "campaign-performance-v1"));
       campaignCoverageStateByAccountId[a.accountId] = camp;
       campaignWindows[a.accountId] = camp.read === "ok" ? camp.windows : null;
       if (camp.read !== "ok") readBlockers.push({ sourceKey: "ads-campaign-date", accountId: a.accountId, reason: "ads-coverage-" + camp.read, blocksSales: false });
-      const asin = await readAdsCoverage(a.accountId, "asin-performance-v1");
+      const asin = await call("ads-coverage-read", () => readAdsCoverage(a.accountId, "asin-performance-v1"));
       asinWindows[a.accountId] = asin.read === "ok" ? asin.windows : null;
       if (asin.read !== "ok") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
     }
@@ -292,36 +389,42 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       catalogSnapshot: catalog.snapshot,
       catalogRows: catalog.rows,
       fbaSnapshotsByAccount,
+      fbaRowsByAccount,
       campaignCoverageStateByAccountId,
       campaignAds: { grain: DAILY_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(campaignWindows).map(([k, v]) => [k, v || []])) },
       asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(asinWindows).map(([k, v]) => [k, v || []])) },
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null } = {}) => {
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`buildBucketSourceSyncRuntime.run requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
     if (onlySourceKey != null) sourceRegistryEntry(onlySourceKey); // typed UNREGISTERED_SOURCE (fail closed)
-    const startMs = clock();
-    const deadlineMs = startMs + Number(budgetMs); // FINDING 3: never Infinity under the bounded route
-    // FINDING 2: ONE deadline across evidence reads, discovery, membership, the sync itself, hydration,
-    // history loading, derivation, and saves. Expiry BEFORE/DURING a phase returns typed RESUMABLE state.
-    const DEADLINE = Symbol("deadline");
-    const outOfTime = () => clock() >= deadlineMs - reserveMs;
-    const ensureTime = async (phase) => {
-      if (outOfTime()) {
-        const e = new Error(`deadline reached during ${phase}`);
-        e[DEADLINE] = phase;
-        throw e;
-      }
-    };
+    if (preflight && preflight.bucket !== bucket) {
+      throw new Error(`PREFLIGHT_SCOPE_MISMATCH: the memoized preflight was gathered for bucket "${preflight && preflight.bucket}", not "${bucket}" (fail closed).`);
+    }
+    // FINDING 3 + round-5 blocker 4: ONE ROUTE-OWNED deadline. The route creates it BEFORE preflight and
+    // threads the SAME object here, so preflight time counts against the one budget; a direct caller gets a
+    // fresh bounded one (never Infinity under the route). Expiry BEFORE/DURING a phase returns typed
+    // RESUMABLE state; in-flight reads/writes are additionally bounded via dl.bound (abort + race).
+    const dl = resolveDeadline(deadline);
+    const outOfTime = dl.outOfTime;
+    const ensureTime = dl.ensureTime;
     const resumable = (phase) => ({ bucket, deadlineReached: true, continuationRequired: true, stopped: false, phase, skipped: "deadline" });
-    const catchDeadline = (e) => { if (e && e[DEADLINE]) return resumable(e[DEADLINE]); throw e; };
+    const catchDeadline = (e) => { if (dl.isDeadlineError(e)) return resumable(dl.phaseOf(e)); throw e; };
 
-    // FINDING 1: controls FIRST -- an unapplied migration or failed read refuses BEFORE discovery.
-    const controls = requireOkRead(await readSourceControls(), "source_controls");
-    const pausedSources = new Set((controls.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
+    // FINDING 1: controls FIRST -- an unapplied migration or failed read refuses BEFORE discovery. Round-5
+    // blocker 3: with a memoized preflight, the controls ALREADY read there are consumed -- never re-read.
+    let pausedSources;
+    try {
+      if (preflight) {
+        pausedSources = new Set(preflight.pausedSources);
+      } else {
+        const controls = requireOkRead(await dl.bound("controls-read", () => readSourceControls()), "source_controls");
+        pausedSources = new Set((controls.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
+      }
+    } catch (e) { return catchDeadline(e); }
     if (onlySourceKey != null) {
       if (pausedSources.has(onlySourceKey)) {
         const err = new Error(`SOURCE_PAUSED: "${onlySourceKey}" is paused; resume it before syncing missing data (fail closed).`);
@@ -334,91 +437,145 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
     }
 
-    const { connections, primary, orgFingerprint } = resolvePrimary();
-    try { await ensureTime("discovery"); } catch (e) { return catchDeadline(e); }
-    const { accounts, excluded } = await discoverBucketAccounts({ connections, bucket });
+    let connections; let primary; let orgFingerprint; let accounts; let excluded;
+    if (preflight) {
+      // Round-5 blocker 3: the memoized preflight discovery IS the discovery -- never repeated in execution.
+      ({ connections, primary, orgFingerprint, accounts, excluded } = preflight);
+    } else {
+      ({ connections, primary, orgFingerprint } = resolvePrimary());
+      try {
+        const discovered = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
+        accounts = discovered.accounts;
+        excluded = discovered.excluded;
+      } catch (e) { return catchDeadline(e); }
+    }
     if (!accounts.length) {
       return { bucket, skipped: "no-bucket-accounts", accounts: 0, excludedAccounts: excluded };
     }
 
     // FINDING 1: evidence reads fail closed BEFORE any cycle/store/DataDoe work. FINDING 2: each read is
-    // deadline-checked; expiry returns typed resumable state.
+    // deadline-checked AND bounded in-flight; expiry returns typed resumable state. Round-5 blocker 3: with
+    // a memoized preflight the HYDRATED, staleness-validated evidence gathered there is consumed directly --
+    // no coverage/snapshot read is repeated -- and the sync's own persisted products are folded back into it
+    // below so the derive stage reflects THIS invocation's fetches with zero repeated reads.
     const coverageByAccountId = {};
-    try {
-      for (const a of accounts) {
-        await ensureTime("evidence-coverage");
-        const cov = requireOkRead(
-          await readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY }),
-          `source_coverage(${a.accountId})`,
-        );
-        coverageByAccountId[a.accountId] = cov.windows;
-      }
-    } catch (e) { return catchDeadline(e); }
-    let catalogSnap;
-    const fbaSnapshotsByAccount = {};
-    try {
-      await ensureTime("evidence-snapshots");
-      catalogSnap = requireOkRead(await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY }), "source_snapshots(catalog)");
-      for (const a of accounts) {
-        await ensureTime("evidence-snapshots");
-        const snap = requireOkRead(await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId }), `source_snapshots(fba:${a.accountId})`);
-        if (snap.snapshot) fbaSnapshotsByAccount[a.accountId] = snap.snapshot;
-      }
-    } catch (e) { return catchDeadline(e); }
+    let catalogSnapForSync = null;
+    const fbaSnapshotsForSync = {};
+    let liveEvidence = null;
+    if (preflight) {
+      liveEvidence = cloneEvidence(preflight);
+      for (const a of accounts) coverageByAccountId[a.accountId] = [...(liveEvidence.oliCoverageByAccountId[a.accountId] || [])];
+      // Stale/dangling evidence was DROPPED by the preflight validator, so a stale catalog/FBA snapshot
+      // correctly presents as absent here and the sync plans its refresh.
+      catalogSnapForSync = liveEvidence.catalogSnapshot;
+      Object.assign(fbaSnapshotsForSync, liveEvidence.fbaSnapshotsByAccount);
+    } else {
+      try {
+        for (const a of accounts) {
+          const cov = requireOkRead(
+            await dl.bound("evidence-coverage", () => readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY })),
+            `source_coverage(${a.accountId})`,
+          );
+          coverageByAccountId[a.accountId] = cov.windows;
+        }
+        const catalogSnap = requireOkRead(await dl.bound("evidence-snapshots", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY })), "source_snapshots(catalog)");
+        catalogSnapForSync = catalogSnap.snapshot;
+        for (const a of accounts) {
+          const snap = requireOkRead(await dl.bound("evidence-snapshots", () => readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId })), `source_snapshots(fba:${a.accountId})`);
+          if (snap.snapshot) fbaSnapshotsForSync[a.accountId] = snap.snapshot;
+        }
+      } catch (e) { return catchDeadline(e); }
+    }
 
     // FINDING 7: durable, transactionally-assigned stable batch membership (never recomputed ad hoc);
     // FINDING 6: every loaded row is validated (canonical account / connection / organization / index /
-    // uniqueness / <=5) before it may seed a plan.
+    // uniqueness / <=5) before it may seed a plan. With a memoized preflight the VALIDATED membership from
+    // the preflight read is consumed (copied); only the ASSIGNMENT (a write) still runs here.
     const batchFamily = oliBatchFamily({ orgFingerprint, bucket });
-    let membershipRows;
-    try {
-      await ensureTime("membership-read");
-      membershipRows = await readBatchMembership(batchFamily);
-    } catch (e) {
-      if (e && e[DEADLINE]) return resumable(e[DEADLINE]);
-      const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any export (fail closed).");
-      err.code = "BATCH_MEMBERSHIP_READ_FAILED";
-      err.status = 503;
-      throw err;
-    }
-    const existingMembership = validateBatchMembershipRows(membershipRows, { orgFingerprint });
-    for (const a of accounts) {
-      if (existingMembership.has(a.accountId)) continue;
-      const idx = await assignBatchMembership({ batchFamily, accountId: a.accountId, connectionId: "primary", organizationFingerprint: orgFingerprint });
-      if (!Number.isInteger(idx) || idx < 0) {
-        const err = new Error("BATCH_MEMBERSHIP_ASSIGN_FAILED: transactional batch assignment returned a malformed index; refusing (fail closed).");
-        err.code = "BATCH_MEMBERSHIP_ASSIGN_FAILED";
+    let existingMembership;
+    if (preflight) {
+      existingMembership = new Map(preflight.membership);
+    } else {
+      let membershipRows;
+      try {
+        membershipRows = await dl.bound("membership-read", () => readBatchMembership(batchFamily));
+      } catch (e) {
+        if (dl.isDeadlineError(e)) return resumable(dl.phaseOf(e));
+        const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any export (fail closed).");
+        err.code = "BATCH_MEMBERSHIP_READ_FAILED";
+        err.status = 503;
         throw err;
       }
-      existingMembership.set(a.accountId, idx);
+      existingMembership = validateBatchMembershipRows(membershipRows, { orgFingerprint });
     }
+    try {
+      for (const a of accounts) {
+        if (existingMembership.has(a.accountId)) continue;
+        const idx = await dl.bound("membership-assign", () => assignBatchMembership({ batchFamily, accountId: a.accountId, connectionId: "primary", organizationFingerprint: orgFingerprint }));
+        if (!Number.isInteger(idx) || idx < 0) {
+          const err = new Error("BATCH_MEMBERSHIP_ASSIGN_FAILED: transactional batch assignment returned a malformed index; refusing (fail closed).");
+          err.code = "BATCH_MEMBERSHIP_ASSIGN_FAILED";
+          throw err;
+        }
+        existingMembership.set(a.accountId, idx);
+      }
+    } catch (e) { return catchDeadline(e); }
 
-    const todayStr = today || new Date(clock()).toISOString().slice(0, 10);
+    const todayStr = today || (preflight && preflight.today) || new Date(clock()).toISOString().slice(0, 10);
     const asOfStr = asOf || addDaysStr(todayStr, -1); // the latest COMPLETED day (conservative for manual runs)
     const store = makeSourceStore();
     const dataDoe = makeAdapter(connections);
+
+    // Round-5 blocker 3: when running on a memoized preflight, the sync's OWN durable products (replaced
+    // OLI windows + persisted catalog/FBA snapshots) are folded into the in-memory evidence, so the derive
+    // stage below reflects THIS invocation's fetches with ZERO repeated discovery/reads.
+    const persistSnapshotBase = makePersistSnapshot(orgFingerprint);
+    const trackedReplaceHistory = liveEvidence == null ? replaceHistory : async (args) => {
+      const outcome = await replaceHistory(args);
+      if (outcome && outcome.write === "ok") {
+        const keep = liveEvidence.historyRows.filter((r) => !(r.account_id === args.accountId && r.sale_date >= args.coveredFrom && r.sale_date <= args.coveredTo));
+        for (const r of args.rows || []) {
+          keep.push({ account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin, currency: r.currency, sales_amount: r.salesAmount, units: r.units });
+        }
+        liveEvidence.historyRows = keep;
+        (liveEvidence.oliCoverageByAccountId[args.accountId] = liveEvidence.oliCoverageByAccountId[args.accountId] || []).push({ from: args.coveredFrom, to: args.coveredTo });
+      }
+      return outcome;
+    };
+    const trackedPersistSnapshot = liveEvidence == null ? persistSnapshotBase : async (args) => {
+      const res = await persistSnapshotBase(args);
+      const snap = { validated_at: args.validatedAt, object_path: res.objectPath, row_count: args.rowCount };
+      if (args.sourceKey === CATALOG_SOURCE_KEY) {
+        liveEvidence.catalogSnapshot = snap;
+        liveEvidence.catalogRows = [...args.rows];
+      } else if (args.sourceKey === FBA_INVENTORY_SOURCE_KEY) {
+        liveEvidence.fbaSnapshotsByAccount[args.scopeKey] = snap;
+        liveEvidence.fbaRowsByAccount[args.scopeKey] = [...args.rows];
+      }
+      return res;
+    };
 
     const rollup = await runBucketSourceSync({
       apiKey: primary.apiKey, bucket, accounts,
       existingMembership,
       coverageByAccountId,
-      catalogSnapshot: catalogSnap.snapshot,
-      fbaSnapshotsByAccount,
+      catalogSnapshot: catalogSnapForSync,
+      fbaSnapshotsByAccount: fbaSnapshotsForSync,
       pausedSources,
       asOf: asOfStr, today: todayStr,
       store, dataDoe,
-      replaceHistoryWindow: replaceHistory, persistSnapshot: makePersistSnapshot(orgFingerprint), updateRunStatus,
+      replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus,
       cycleDate: cycleDate || todayStr, trigger: "manual",
       clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
-      deadlineMs, reserveMs,
+      deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
       reuseOnly,
     });
     rollup.excludedAccounts = excluded;
 
-    // FINDING 4: after a COMPLETE bucket sync (not stopped/resumable), load the durable Ads evidence and
-    // derive/validate/save the Daily + Brand View durable SHADOW snapshots. A read failure or non-ready
-    // readiness is a TYPED skip -- nothing is fabricated, nothing live is touched.
-    rollup.derived = { skipped: null, daily: null, brandView: null };
+    // FINDING 4: after a COMPLETE bucket sync (not stopped/resumable), derive/validate/save the Daily +
+    // Brand View + compact brand-inventory durable SHADOW snapshots. A read failure or non-ready readiness
+    // is a TYPED skip -- nothing is fabricated, nothing live is touched.
+    rollup.derived = { skipped: null, daily: null, brandView: null, brandInventory: null, lineage: [] };
     if (rollup.stopped || rollup.continuationRequired || !rollup.globalDrained) {
       rollup.derived.skipped = rollup.stopped ? "bucket-stopped" : (rollup.continuationRequired ? "continuation-required" : "not-drained");
       return rollup;
@@ -431,43 +588,53 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       rollup.continuationRequired = true;
       return rollup;
     };
+    const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
+    const brandViewWindow = oliBackfillWindow(asOfStr);
     let evidence;
-    try {
-      evidence = await gatherEvidence({ orgFingerprint, accounts, today: todayStr, ensureTime });
-    } catch (e) { if (e && e[DEADLINE]) return deriveResumable(); throw e; }
+    let historyRows = null;
+    const adMetricsByAccountId = {};
+    if (liveEvidence) {
+      // Round-5 blocker 3: the ONE memoized preflight result IS the evidence -- already hydrated and
+      // staleness-validated, refreshed in-memory with the sync's own persisted products above. NO
+      // discovery, coverage, snapshot, hydration, Ads or history read is repeated here.
+      evidence = liveEvidence;
+      historyRows = liveEvidence.historyRows;
+      Object.assign(adMetricsByAccountId, preflight.adMetricsByAccountId || {});
+    } else {
+      try {
+        evidence = await gatherEvidence({ orgFingerprint, accounts, today: todayStr, ensureTime, bound: dl.bound });
+      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+    }
     if (!evidence.catalogRows) {
       rollup.derived.skipped = evidence.catalogSnapshot ? "catalog-hydration-failed" : "catalog-snapshot-missing";
       return rollup;
     }
-    const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
-    const brandViewWindow = oliBackfillWindow(asOfStr);
-    let historyRows = null;
-    const adMetricsByAccountId = {};
-    try {
-      await ensureTime("history-load");
-      historyRows = await loadHistoryRows({
-        organizationFingerprint: orgFingerprint, connectionId: "primary",
-        accountIds: accounts.map((a) => a.accountId),
-        from: brandViewWindow.from, to: brandViewWindow.to,
-      });
-      // FINDING 3 + round-4 finding 1: ACTUAL campaign Ads metric rows WITH their typed read state. A
-      // failed/limited/malformed read is NEVER flattened into [] + "ok" -- the typed metricsRead travels
-      // into the ads-coverage contract so Daily can never report a false zero-Ads result.
-      for (const a of accounts) {
-        await ensureTime("ads-metrics-load");
-        try {
-          const rows = await readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to);
-          adMetricsByAccountId[a.accountId] = Array.isArray(rows)
-            ? { rows, metricsRead: "ok" }
-            : { rows: [], metricsRead: "read-failed" };
-        } catch (e) {
-          adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed" };
+    if (!liveEvidence) {
+      try {
+        historyRows = await dl.bound("history-load", () => loadHistoryRows({
+          organizationFingerprint: orgFingerprint, connectionId: "primary",
+          accountIds: accounts.map((a) => a.accountId),
+          from: brandViewWindow.from, to: brandViewWindow.to,
+        }));
+        // FINDING 3 + round-4 finding 1: ACTUAL campaign Ads metric rows WITH their typed read state. A
+        // failed/limited/malformed read is NEVER flattened into [] + "ok" -- the typed metricsRead travels
+        // into the ads-coverage contract so Daily can never report a false zero-Ads result.
+        for (const a of accounts) {
+          try {
+            const rows = await dl.bound("ads-metrics-load", () => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to));
+            adMetricsByAccountId[a.accountId] = Array.isArray(rows)
+              ? { rows, metricsRead: "ok" }
+              : { rows: [], metricsRead: "read-failed" };
+          } catch (e) {
+            if (dl.isDeadlineError(e)) throw e;
+            adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed" };
+          }
         }
+      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); historyRows = null; }
+      if (!Array.isArray(historyRows)) {
+        rollup.derived.skipped = "history-read-failed";
+        return rollup;
       }
-    } catch (e) { if (e && e[DEADLINE]) return deriveResumable(); historyRows = null; }
-    if (!Array.isArray(historyRows)) {
-      rollup.derived.skipped = "history-read-failed";
-      return rollup;
     }
     let derived;
     try {
@@ -482,62 +649,166 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         campaignCoverageStateByAccountId: evidence.campaignCoverageStateByAccountId,
         dailyWindow, brandViewWindow,
       });
-    } catch (e) { if (e && e[DEADLINE]) return deriveResumable(); throw e; }
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
     const saver = makeShadowSaver();
     const nowIso = () => new Date(clock()).toISOString();
     let dailySaved = 0;
     let brandViewSaved = 0;
-    // Round-4 finding 3: after each shadow save, record the GENUINE sync_report_jobs lineage -- a real job
-    // row claimed and completed with validated derive/save success and the EXACT snapshot_params_hash the
-    // saver computed, under the PRODUCTION report key. The approved publisher validates this exact row
-    // (job hash === row hash === recomputed hash) with no new mechanism.
-    const recordLineage = async (snap, saved, windowUsed, extraParams) => {
-      if (!reportLineage || !rollup.cycleId) return;
+    // Round-5 blocker 1: GENUINE publishable lineage, CLAIM-BEFORE-SAVE. For each report job:
+    //   1. upsert the sync_report_jobs row with depends_on bound to the EXACT authoritative source request
+    //      hashes -- THIS cycle's SUCCEEDED rows for the source families the report consumed;
+    //   2. CLAIM the derive attempt and require claim === true STRICTLY -- only the claim winner may save;
+    //   3. save the shadow snapshot UNDER the held claim;
+    //   4. record validated success with the EXACT saver-computed snapshot_params_hash.
+    // A lost/false/malformed claim is a TYPED skip: the save does not happen and success is NEVER recorded
+    // (idempotent resume: a fresh invocation over a completed job loses the claim and changes nothing).
+    const sourceJobRows = rollup.cycleId ? await store.listSourceJobs(rollup.cycleId) : [];
+    const succeededHashesFor = (families) => sourceJobRows
+      .filter((r) => (r.fetch_status ?? r.fetchStatus) === "succeeded" && families.includes(r.source_key ?? r.sourceKey))
+      .map((r) => r.request_hash ?? r.requestHash)
+      .sort();
+    const LINEAGE_DEPENDS_ON = {
+      "daily-reporting": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
+      "brand-sales": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
+      [BRAND_INVENTORY_SNAPSHOT_KEY]: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY],
+    };
+    const saveWithLineage = async (snap, save) => {
+      if (!reportLineage || !rollup.cycleId) {
+        return { saved: await save(), lineage: "unavailable" };
+      }
       await reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
-        accountId: snap.accountId, connectionId: "primary", bucket, dependsOn: [],
+        accountId: snap.accountId, connectionId: "primary", bucket,
+        dependsOn: succeededHashesFor(LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
       });
-      await reportLineage.claimReportDerive(rollup.cycleId, snap.productionReportKey, snap.accountId);
+      const claim = await reportLineage.claimReportDerive(rollup.cycleId, snap.productionReportKey, snap.accountId);
+      if (claim !== true) {
+        rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "claim-lost" });
+        return { saved: null, lineage: "claim-lost" };
+      }
+      const saved = await save();
       await reportLineage.recordReportSuccess({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, accountId: snap.accountId,
         latestDataDate: snap.latestDataDate ?? null, snapshotParamsHash: saved.paramsHash,
       });
+      rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome: "recorded" });
+      return { saved, lineage: "recorded" };
     };
     try {
       for (const snap of derived.daily.snapshots) {
         await ensureTime("snapshot-save");
-        const saved = await saver({
+        const r = await saveWithLineage(snap, () => saver({
           reportKey: snap.reportKey, accountId: snap.accountId,
           params: { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" },
           payload: snap.payload, sourceRefreshedAt: nowIso(),
-        });
-        await recordLineage(snap, saved, dailyWindow);
-        dailySaved += 1;
+        }));
+        if (r.saved) dailySaved += 1;
       }
       for (const snap of derived.brandView.snapshots) {
         await ensureTime("snapshot-save");
-        const saved = await saver({
+        const r = await saveWithLineage(snap, () => saver({
           reportKey: snap.reportKey, accountId: snap.accountId,
           params: { reportVersion: snap.version, accountId: snap.accountId, from: brandViewWindow.from, to: brandViewWindow.to },
           payload: snap.payload, sourceRefreshedAt: nowIso(),
-        });
-        await recordLineage(snap, saved, brandViewWindow);
-        brandViewSaved += 1;
+        }));
+        if (r.saved) brandViewSaved += 1;
       }
-    } catch (e) { if (e && e[DEADLINE]) return deriveResumable(); throw e; }
-    rollup.derived = {
-      skipped: null,
-      daily: { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped },
-      brandView: { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped },
-    };
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+
+    // Round-5 blocker 2: wire the DURABLE FBA evidence into Brand View's REAL production read path -- build
+    // the validated compact brand-inventory snapshot via the EXISTING buildBrandInventorySnapshot contract
+    // (asinBrand ONLY from the just-derived brand-sales payload; fetchInventoryRows returns the HYDRATED
+    // durable FBA rows -- ZERO DataDoe) and save it under the EXISTING shadow key/version, so
+    // buildAccountBrandSlice consumes it through its normal compact-snapshot gate with no new mechanism.
+    // A contract refusal (missing brand map, truncation, invalid row) preserves the previous compact
+    // snapshot and is recorded TYPED per account.
+    const brandInventory = { saved: 0, skipped: [] };
+    const invWindow = { from: addDaysStr(asOfStr, -BRAND_INVENTORY_LOOKBACK_DAYS), to: asOfStr };
+    const brandSalesByAccount = new Map(derived.brandView.snapshots.map((s) => [s.accountId, s]));
+    try {
+      for (const account of accounts) {
+        const invRows = evidence.fbaRowsByAccount ? evidence.fbaRowsByAccount[account.accountId] : undefined;
+        const sales = brandSalesByAccount.get(account.accountId);
+        if (!Array.isArray(invRows)) { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-validated-fba-snapshot" }); continue; }
+        if (!sales) { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-brand-sales-snapshot" }); continue; }
+        await ensureTime("brand-inventory-derive");
+        let built;
+        try {
+          built = await buildBrandInventorySnapshot({
+            accountId: account.accountId, accountCountry: account.country,
+            from: invWindow.from, to: invWindow.to, rowLimit: BRAND_INVENTORY_ROW_LIMIT,
+            getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales" ? { payload: sales.payload } : null),
+            fetchInventoryRows: async () => invRows,
+          });
+        } catch (e) {
+          if (dl.isDeadlineError(e)) throw e;
+          brandInventory.skipped.push({ accountId: account.accountId, reason: "contract-refused" });
+          continue;
+        }
+        const snap = {
+          reportKey: shadowSnapshotKey(BRAND_INVENTORY_SNAPSHOT_KEY), productionReportKey: BRAND_INVENTORY_SNAPSHOT_KEY,
+          accountId: account.accountId, version: BRAND_INVENTORY_REPORT_VERSION,
+          payload: built.payload, latestDataDate: built.payload.inventoryDate || null,
+        };
+        const r = await saveWithLineage(snap, () => saver({
+          reportKey: snap.reportKey, accountId: snap.accountId,
+          params: { reportVersion: snap.version, accountId: snap.accountId, to: invWindow.to },
+          payload: snap.payload, sourceRefreshedAt: nowIso(),
+        }));
+        if (r.saved) brandInventory.saved += 1;
+      }
+    } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+    rollup.derived.skipped = null;
+    rollup.derived.daily = { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped };
+    rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped };
+    rollup.derived.brandInventory = brandInventory;
+
+    // Round-5 blocker 1 (terminal lifecycle): ONLY a FULL bucket scope may complete the shared cycle -- it
+    // planned its ENTIRE registered durable scope before draining (the reviewed complete-scope rule), so
+    // "no open work" is a genuine complete-cycle signal; a narrowed onlySourceKey subset must NEVER
+    // terminalize the shared (bucket, cycle_date) cycle. The finalize primitive stays the AUTHORITY:
+    // concurrent open source/report work returns 'open-work' and the cycle honestly stays running --
+    // cycle_status is NEVER fabricated here or anywhere else.
+    rollup.finalized = false;
+    rollup.cycleStatus = null;
+    if (onlySourceKey == null && rollup.cycleId) {
+      if (typeof store.finalizeCycle !== "function") {
+        throw new Error("bucket source sync: cycle finalization is unavailable (store.finalizeCycle missing); refusing to report a completed full-scope cycle (fail closed).");
+      }
+      let disp;
+      try {
+        disp = await dl.bound("cycle-finalize", () => store.finalizeCycle({ cycleId: rollup.cycleId }));
+      } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(); throw e; }
+      const d = disp && disp.disposition;
+      if (d === "finalized" || d === "already-terminal") {
+        const terminalStatus = disp.cycle && typeof disp.cycle === "object" ? disp.cycle.status : null;
+        if (!["succeeded", "partial", "failed"].includes(terminalStatus)) {
+          throw new Error(`bucket source sync: malformed positive finalize acknowledgement (disposition "${d}" without a terminal cycle) for cycle ${rollup.cycleId}; failing closed.`);
+        }
+        rollup.finalized = d === "finalized";
+        rollup.cycleStatus = terminalStatus;
+      } else if (d === "open-work") {
+        // Another scope's source/report work is still open (e.g. a concurrently claimed report job): the
+        // cycle honestly stays running; nothing here may claim a terminal status for it.
+        rollup.cycleStatus = "running";
+      } else {
+        throw new Error(`bucket source sync: unexpected finalize disposition "${String(d)}" for cycle ${rollup.cycleId}; failing closed.`);
+      }
+    }
     return rollup;
   };
 
-  // FINDING 8: the fail-closed evidence PREFLIGHT an endpoint runs BEFORE its first write (including the
-  // audit row): controls must read ok (migration-unapplied refuses typed) and a paused source refuses
-  // BEFORE any discovery/I/O. Returns the paused set for reuse; throws typed on any refusal.
-  const preflightEvidence = async ({ bucket = null, sourceKey = null } = {}) => {
-    const controls = requireOkRead(await readSourceControls(), "source_controls");
+  // FINDING 8 + round-5 blocker 3: the fail-closed evidence PREFLIGHT an endpoint runs BEFORE its first
+  // write (including the audit row). EVERY read that can stop execution happens HERE -- controls, discovery,
+  // coverage, snapshot pointers AND their hydration/integrity, Ads coverage, Ads metrics, the required
+  // OLI-history evidence, membership, settings and rollout -- so an injected failure in ANY of them refuses
+  // typed with ZERO audit/control/cycle/source/report/snapshot writes and ZERO exports. The returned bundle
+  // is the ONE MEMOIZED preflight result: run({ preflight }) consumes it and repeats no discovery/read.
+  // Round-5 blocker 4: `deadline` is the route-owned deadline created BEFORE this call; every read below is
+  // bounded in-flight through it.
+  const preflightEvidence = async ({ bucket = null, sourceKey = null, deadline = null, today = null } = {}) => {
+    const dl = resolveDeadline(deadline);
+    const controls = requireOkRead(await dl.bound("controls-read", () => readSourceControls()), "source_controls");
     const pausedSources = new Set((controls.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
     if (sourceKey != null && pausedSources.has(sourceKey)) {
       const err = new Error(`SOURCE_PAUSED: "${sourceKey}" is paused; resume it before syncing missing data (fail closed).`);
@@ -545,49 +816,103 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       err.status = 409;
       throw err;
     }
-    // Round-4 finding 4: the COMPLETE evidence sweep -- coverage, snapshots, membership, settings/rollout
-    // and schema availability -- so an endpoint can prove EVERY read healthy BEFORE its first write
-    // (including the audit row). Any failure below is a typed refusal.
-    if (bucket != null) {
-      const { connections, orgFingerprint } = resolvePrimary();
-      const { accounts } = await discoverBucketAccounts({ connections, bucket });
-      for (const a of accounts) {
-        requireOkRead(await readCoverage({ organizationFingerprint: orgFingerprint, accountId: a.accountId, sourceKey: OLI_SOURCE_KEY }), `source_coverage(${a.accountId})`);
-      }
-      requireOkRead(await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY }), "source_snapshots(catalog)");
-      for (const a of accounts) {
-        requireOkRead(await readSnapshot({ organizationFingerprint: orgFingerprint, connectionId: "primary", sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: a.accountId }), `source_snapshots(fba:${a.accountId})`);
-      }
-      let membershipRows;
-      try { membershipRows = await readBatchMembership(oliBatchFamily({ orgFingerprint, bucket })); }
-      catch (_e) {
-        const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any write (fail closed).");
-        err.code = "BATCH_MEMBERSHIP_READ_FAILED"; err.status = 503; throw err;
-      }
-      validateBatchMembershipRows(membershipRows, { orgFingerprint });
-      let settings;
-      try { settings = await readSettings(); } catch (_e) { settings = null; }
-      if (!Array.isArray(settings)) {
-        const err = new Error("SETTINGS_READ_FAILED: report_sync_settings could not be read; refusing before any write (fail closed).");
-        err.code = "SETTINGS_READ_FAILED"; err.status = 503; throw err;
-      }
-      const rollout = await (async () => { try { return await readRollout(); } catch (_e) { return null; } })();
-      if (!rollout || rollout.read !== "ok") {
-        const err = new Error("ROLLOUT_READ_FAILED: the durable account rollout could not be read; refusing before any write (fail closed).");
-        err.code = "ROLLOUT_READ_FAILED"; err.status = 503; throw err;
+    if (bucket == null) return { pausedSources };
+    const { connections, primary, orgFingerprint } = resolvePrimary();
+    const { accounts, excluded } = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
+    const todayStr = today || new Date(clock()).toISOString().slice(0, 10);
+    const asOfStr = addDaysStr(todayStr, -1);
+    // ONE hydrating evidence sweep (coverage + catalog/FBA pointers + hydration + integrity + staleness +
+    // Ads coverage). Read failures surface as typed readBlockers; each read-failure class below is a HARD
+    // typed refusal -- stale evidence is NOT one (it is the reviewed typed degrade that plans a refresh).
+    const evidence = await gatherEvidence({ orgFingerprint, accounts, today: todayStr, bound: dl.bound });
+    const refuse = (code, reason, blocker) => {
+      const err = new Error(`${code}: preflight read "${reason}"${blocker && blocker.accountId ? ` (account ${blocker.accountId})` : ""} failed; refusing before any write (fail closed; zero-export).`);
+      err.code = code;
+      err.status = 503;
+      throw err;
+    };
+    for (const b of evidence.readBlockers) {
+      const reason = String(b.reason || "");
+      if (reason.endsWith("schema-missing")) refuse("DURABLE_MODEL_UNAVAILABLE", reason, b);
+      if (reason === "snapshot-dangling") refuse("SNAPSHOT_HYDRATION_FAILED", reason, b);
+      if (reason === "snapshot-integrity") refuse("SNAPSHOT_INTEGRITY_FAILED", reason, b);
+      if (reason.startsWith("ads-coverage-")) refuse("ADS_COVERAGE_READ_FAILED", reason, b);
+      if (reason.startsWith("coverage-") || reason.startsWith("snapshot-")) refuse("SOURCE_EVIDENCE_READ_FAILED", reason, b);
+    }
+    // Ads metrics: the typed read state is CAPTURED here (memoized). An infrastructure read failure refuses
+    // BEFORE any write; limit-exceeded is a VALID authoritative answer and stays a typed degrade.
+    const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
+    const adMetricsByAccountId = {};
+    for (const a of accounts) {
+      try {
+        const rows = await dl.bound("ads-metrics-load", () => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to));
+        if (!Array.isArray(rows)) refuse("ADS_METRICS_READ_FAILED", "ads-metrics-malformed", { accountId: a.accountId });
+        adMetricsByAccountId[a.accountId] = { rows, metricsRead: "ok" };
+      } catch (e) {
+        if (dl.isDeadlineError(e) || (e && e.code === "ADS_METRICS_READ_FAILED")) throw e;
+        if (e && e.code === "ADS_ROW_LIMIT_EXCEEDED") {
+          adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: "limit-exceeded" };
+        } else {
+          refuse("ADS_METRICS_READ_FAILED", "ads-metrics-read", { accountId: a.accountId });
+        }
       }
     }
-    return { pausedSources };
+    // The required OLI-history evidence (the derive stage's input): unreadable history refuses here.
+    const brandViewWindow = oliBackfillWindow(asOfStr);
+    let historyRows = null;
+    try {
+      historyRows = await dl.bound("history-load", () => loadHistoryRows({
+        organizationFingerprint: orgFingerprint, connectionId: "primary",
+        accountIds: accounts.map((a) => a.accountId),
+        from: brandViewWindow.from, to: brandViewWindow.to,
+      }));
+    } catch (e) {
+      if (dl.isDeadlineError(e)) throw e;
+      historyRows = null;
+    }
+    if (!Array.isArray(historyRows)) refuse("HISTORY_READ_FAILED", "oli-history", null);
+    let membershipRows;
+    try { membershipRows = await dl.bound("membership-read", () => readBatchMembership(oliBatchFamily({ orgFingerprint, bucket }))); }
+    catch (e) {
+      if (dl.isDeadlineError(e)) throw e;
+      const err = new Error("BATCH_MEMBERSHIP_READ_FAILED: durable source_batch_membership could not be read; refusing before any write (fail closed).");
+      err.code = "BATCH_MEMBERSHIP_READ_FAILED"; err.status = 503; throw err;
+    }
+    const membership = validateBatchMembershipRows(membershipRows, { orgFingerprint });
+    let settings;
+    try { settings = await dl.bound("settings-read", () => readSettings()); } catch (e) { if (dl.isDeadlineError(e)) throw e; settings = null; }
+    if (!Array.isArray(settings)) {
+      const err = new Error("SETTINGS_READ_FAILED: report_sync_settings could not be read; refusing before any write (fail closed).");
+      err.code = "SETTINGS_READ_FAILED"; err.status = 503; throw err;
+    }
+    const rollout = await (async () => { try { return await dl.bound("rollout-read", () => readRollout()); } catch (e) { if (dl.isDeadlineError(e)) throw e; return null; } })();
+    if (!rollout || rollout.read !== "ok") {
+      const err = new Error("ROLLOUT_READ_FAILED: the durable account rollout could not be read; refusing before any write (fail closed).");
+      err.code = "ROLLOUT_READ_FAILED"; err.status = 503; throw err;
+    }
+    return {
+      pausedSources, bucket, sourceKey,
+      connections, primary, orgFingerprint,
+      accounts, excluded,
+      membership,
+      evidence,
+      historyRows,
+      adMetricsByAccountId,
+      settings, rollout,
+      today: todayStr, asOf: asOfStr,
+    };
   };
 
-  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false } = {}) => {
+  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null } = {}) => {
     const entry = sourceRegistryEntry(sourceKey); // typed UNREGISTERED_SOURCE (fail closed)
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`runSourceCardAction requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
-    // FINDING 1: controls FIRST for EVERY storage class -- a paused source refuses typed BEFORE any
-    // discovery/composition/I-O (run() re-verifies for the durable path; this makes the guarantee uniform).
-    await preflightEvidence({ bucket, sourceKey });
+    // Round-5 blockers 3+4: ONE route-owned deadline (created by the route BEFORE preflight when this is
+    // endpoint-driven) and ONE memoized preflight. A caller that already preflighted passes the bundle
+    // through; a direct caller still gets the uniform controls-first guarantee here.
+    const dl = resolveDeadline(deadline);
+    const pf = preflight && preflight.bucket === bucket ? preflight : await preflightEvidence({ bucket, sourceKey, deadline: dl });
     if (entry.storage === "durable-ads") {
       // The REAL architecture for the four Ads families is the existing durable Ads sync (its own bounded
       // cron scopes + coverage model). Executing it from a source card is a separate reviewed wiring, so
@@ -599,17 +924,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       };
     }
     if (entry.storage === "durable-history" || entry.storage === "durable-snapshot") {
-      return run({ bucket, onlySourceKey: sourceKey, reuseOnly });
+      return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf });
     }
     // FINDING 1: a cycle-cache family executes ONLY its own canonical source family -- the trusted
     // per-tranche composition FIXED to exactly this family (the full plan is still upserted; execution
     // narrows to the family, so the action can never widen into unrelated dependencies), honoring
     // reuseOnly (the composition installs the create-export tripwire in rehearsal). Bounded continuations
     // under the shared deadline; an expired budget is typed resumable.
-    const startMs = clock();
-    const deadlineMs = startMs + Number(budgetMs);
-    const outOfTime = () => clock() >= deadlineMs - reserveMs;
-    const todayStr = new Date(startMs).toISOString().slice(0, 10);
+    const deadlineMs = dl.deadlineMs; // the ONE route-owned deadline (created before preflight)
+    const outOfTime = dl.outOfTime;
+    const todayStr = new Date(dl.startMs).toISOString().slice(0, 10);
     const asOfStr = addDaysStr(todayStr, -1);
     const runtime = composeTrancheRuntime({ name: sourceKey, sourceKeys: [sourceKey] }, { reuseOnly: reuseOnly === true });
     const store = makeSourceStore();
@@ -636,7 +960,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       const res = await runtime.run({
         bucket, cycleDate: todayStr, asOf: asOfStr, asOfFor: () => asOfStr,
         manualReportKeys: [...entry.usedByReports],
-        clock, deadlineMs, reserveMs, trigger: "manual",
+        clock, deadlineMs, reserveMs: dl.reserveMs, trigger: "manual",
       });
       continuations += 1;
       cycleId = res.cycleId || cycleId;
@@ -687,5 +1011,5 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  return { run, runSourceCardAction, gatherDurableReadiness, preflightEvidence };
+  return { run, runSourceCardAction, gatherDurableReadiness, preflightEvidence, makeDeadline };
 }

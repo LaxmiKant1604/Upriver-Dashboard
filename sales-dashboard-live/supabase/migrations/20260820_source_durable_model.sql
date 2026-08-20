@@ -219,15 +219,33 @@ begin
       and scope_key = p_scope_key
     for update;
   if not found then
-    insert into public.source_snapshots (
-      organization_fingerprint, connection_id, source_key, scope_key,
-      object_path, payload_sha, row_count, payload_bytes, source_request_hash, validated_at
-    ) values (
-      p_organization_fingerprint, p_connection_id, p_source_key, p_scope_key,
-      p_object_path, p_payload_sha, p_row_count, p_payload_bytes, p_source_request_hash, p_validated_at
-    );
-    return 'replaced';
+    -- Round-5 blocker 6: DETERMINISTIC concurrent absent-row inserts. Two racers may both see "not found";
+    -- exactly one insert wins the PK, and the loser's unique_violation is caught TYPED: it re-locks the
+    -- winner's row and falls through to the SAME guard ladder below -- never an unhandled exception, never
+    -- a swallowed generic handler.
+    begin
+      insert into public.source_snapshots (
+        organization_fingerprint, connection_id, source_key, scope_key,
+        object_path, payload_sha, row_count, payload_bytes, source_request_hash, validated_at
+      ) values (
+        p_organization_fingerprint, p_connection_id, p_source_key, p_scope_key,
+        p_object_path, p_payload_sha, p_row_count, p_payload_bytes, p_source_request_hash, p_validated_at
+      );
+      return 'replaced';
+    exception when unique_violation then
+      select * into v_existing from public.source_snapshots
+        where organization_fingerprint = p_organization_fingerprint
+          and connection_id = p_connection_id
+          and source_key = p_source_key
+          and scope_key = p_scope_key
+        for update;
+      if not found then
+        raise exception 'record_source_snapshot: concurrent insert vanished; refusing';
+      end if;
+    end;
   end if;
+  -- Guard ladder: each terminal outcome sits in its OWN bounded branch, and NO write happens before the
+  -- guards have run -- the replacing UPDATE is reachable only through the strictly-newer fall-through.
   if p_validated_at < v_existing.validated_at then
     return 'stale-save';
   end if;

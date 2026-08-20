@@ -628,6 +628,37 @@ function arraysEqual(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
+const ALL_TABLE_PRIVS = ["select", "insert", "update", "delete", "truncate", "references", "trigger"];
+
+// Round-5 blocker 5: the FINAL ACL state for one exact `public.<table>`, computed by replaying EVERY GRANT
+// and REVOKE naming that table in SOURCE ORDER (match offset in `masked`), per role. A union of historical
+// grants would (a) accept a verb that a later REVOKE removed (grant-then-revoke), (b) miss that a REVOKE
+// followed by a re-GRANT leaves the verb held (revoke-then-grant), and (c) flag a forbidden grant that a
+// later REVOKE cured -- the replay yields the verb set that actually holds after the migration runs.
+// ALL [PRIVILEGES] expands to the full PostgreSQL table-privilege set on GRANT and removes it on REVOKE.
+// Both statement regexes are pinned to the exact `public.<table>\b` object and bounded to one statement
+// (`[^;]`), so a different table's statements can neither satisfy nor pollute this table's replay.
+function finalRoleGrants(masked, table) {
+  const events = [];
+  let m;
+  const reGrant = new RegExp(`\\bgrant\\s+([^;]*?)\\s+on\\s+(?:table\\s+)?public\\.${table}\\b\\s+to\\s+([^;]*)`, "ig");
+  while ((m = reGrant.exec(masked))) events.push({ at: m.index, kind: "grant", verbs: m[1], roles: m[2] });
+  const reRevoke = new RegExp(`\\brevoke\\s+(?:grant\\s+option\\s+for\\s+)?([^;]*?)\\s+on\\s+(?:table\\s+)?public\\.${table}\\b\\s+from\\s+([^;]*)`, "ig");
+  while ((m = reRevoke.exec(masked))) events.push({ at: m.index, kind: "revoke", verbs: m[1], roles: m[2] });
+  events.sort((a, b) => a.at - b.at);
+  const state = new Map(); // role -> Set(FINAL verbs)
+  for (const ev of events) {
+    const verbs = ev.verbs.split(",").map((v) => v.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean)
+      .flatMap((v) => (v === "all" || v === "all privileges") ? [...ALL_TABLE_PRIVS] : [v]);
+    for (const role of ev.roles.split(",").map((r) => r.trim().toLowerCase()).filter(Boolean)) {
+      if (!state.has(role)) state.set(role, new Set());
+      const set = state.get(role);
+      for (const v of verbs) { if (ev.kind === "grant") set.add(v); else set.delete(v); }
+    }
+  }
+  return state;
+}
+
 // BOUNDED STRUCTURAL proof of the least-privilege `service_role` ACL for ONE table, on `masked` (comments AND
 // string CONTENTS blanked, so a comment-only or string-only REVOKE/GRANT can never satisfy it). Because
 // Supabase applies project-level DEFAULT PRIVILEGES that grant `service_role` ALL on every new public table,
@@ -651,25 +682,24 @@ function auditServiceRoleAcl(masked, table, expected) {
     problems.push({ code: "SERVICE_ROLE_REVOKE_MISSING", reason: `no REVOKE ALL ... ON public.${table} FROM ... service_role (Supabase default privileges would otherwise leave service_role with ALL)` });
   }
 
-  // (2) UNION of every GRANT ... ON public.<table> TO ... service_role privilege list must equal exactly the
-  //     expected set. `[^;]` bounds each privilege list to its own statement (no cross-statement bleed).
-  const granted = new Set();
+  // (2) FINAL verb set (Round-5 blocker 5): replay every GRANT/REVOKE on this exact table in source order
+  //     (finalRoleGrants) and require service_role's FINAL set to equal exactly the expected set -- a union
+  //     of historical grants would accept a verb a later REVOKE removed. The REVOKE ALL presence check in
+  //     (1) stays separate: it strips Supabase's project-level DEFAULT privileges, which exist OUTSIDE this
+  //     migration's text, so the replay alone cannot prove those are gone.
   let sawGrant = false;
   const reGrant = new RegExp(`\\bgrant\\s+([^;]*?)\\s+on\\s+(?:table\\s+)?public\\.${table}\\b\\s+to\\s+([^;]*)`, "ig");
   let gm;
-  while ((gm = reGrant.exec(masked))) {
-    if (!namesServiceRole(gm[2])) continue;
-    sawGrant = true;
-    for (const p of gm[1].split(",").map((x) => x.trim().toLowerCase().replace(/\s+/g, " ")).filter(Boolean)) {
-      granted.add(p === "all privileges" ? "all" : p);
-    }
-  }
+  while ((gm = reGrant.exec(masked))) { if (namesServiceRole(gm[2])) { sawGrant = true; break; } }
   const want = [...(expected.grants || [])].map((p) => p.toLowerCase()).sort();
-  const got = [...granted].sort();
+  const got = [...(finalRoleGrants(masked, table).get("service_role") || new Set())].sort();
+  // Display only: a final set that IS the complete table-privilege set reads as [all] (the comparison above
+  // always runs on the expanded verbs, so a GRANT ALL can never sneak past by matching the label).
+  const gotLabel = arraysEqual(got, [...ALL_TABLE_PRIVS].sort()) ? ["all"] : got;
   if (!sawGrant) {
     problems.push({ code: "SERVICE_ROLE_GRANT_MISSING", reason: `no GRANT ... ON public.${table} TO service_role` });
   } else if (!arraysEqual(got, want)) {
-    problems.push({ code: "SERVICE_ROLE_GRANT_MISMATCH", reason: `service_role grants on public.${table} are [${got.join(", ")}] (expected exactly [${want.join(", ")}])` });
+    problems.push({ code: "SERVICE_ROLE_GRANT_MISMATCH", reason: `service_role grants on public.${table} are [${gotLabel.join(", ")}] (expected exactly [${want.join(", ")}])` });
   }
   return problems;
 }
@@ -972,6 +1002,31 @@ function auditSnapshotCasFunction(clean, masked, fnName) {
   }
   if (!/update\s+public\.source_snapshots\b/i.test(M)) {
     problems.push({ code: "SNAPSHOT_CAS_REPLACE_MISSING", reason: "does not replace the pointer on a strictly newer save" });
+  }
+  // Round-5 blocker 6: STRUCTURAL BINDING of the guard ladder. Each guard must sit in its OWN bounded
+  // branch (guard -> immediate typed return and nothing else), the replacing UPDATE must be the ONLY
+  // pointer write and reachable only AFTER both guards, the racing-insert path must be deterministic (a
+  // typed unique_violation handler that re-locks the winner's row and falls through to the SAME guards),
+  // and no generic exception handler may swallow a failure into a success acknowledgement. An `IF true`
+  // guard, a moved/early UPDATE, a wrong comparison operator, or a `when others` swallow each surfaces as
+  // its own typed blocker below (the comparison itself is already pinned by the guard regexes above).
+  if (!/if\s+p_validated_at\s*<\s*v_existing\.validated_at\s+then\s+return\s+'stale-save'\s*;\s*end\s+if/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_CAS_STALE_BRANCH_UNBOUND", reason: "the stale guard is not bound to its own bounded branch (if p_validated_at < v_existing.validated_at then return 'stale-save'; end if)" });
+  }
+  if (!/if\s+p_validated_at\s*=\s*v_existing\.validated_at\s+then\s+if\s+v_existing\.payload_sha\s*=\s*p_payload_sha\s+and\s+v_existing\.object_path\s*=\s*p_object_path\s+then\s+return\s+'unchanged'\s*;\s*end\s+if\s*;\s*return\s+'conflict'\s*;\s*end\s+if/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_CAS_EQUAL_BRANCH_UNBOUND", reason: "the equal-validated_at guard is not bound to its own bounded branch (equal + identical sha/path -> 'unchanged', equal otherwise -> 'conflict', nothing else)" });
+  }
+  const updates = [...M.matchAll(/update\s+public\.source_snapshots\b/ig)];
+  const staleIdx = M.search(/p_validated_at\s*<\s*v_existing\.validated_at/i);
+  const equalIdx = M.search(/if\s+p_validated_at\s*=\s*v_existing\.validated_at/i);
+  if (updates.length !== 1 || staleIdx < 0 || equalIdx < 0 || !(staleIdx < equalIdx && equalIdx < updates[0].index)) {
+    problems.push({ code: "SNAPSHOT_CAS_WRITE_BEFORE_GUARDS", reason: "the replacing UPDATE must be the single pointer write, placed strictly AFTER the stale guard and the equal-validated_at guard (no write may occur before the guards run)" });
+  }
+  if (!/exception\s+when\s+unique_violation\s+then[\s\S]*?from\s+public\.source_snapshots\b[\s\S]*?for\s+update/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_CAS_CONCURRENT_INSERT_UNPROVEN", reason: "the absent-row insert race is not deterministic: no typed unique_violation handler that re-locks the winning row FOR UPDATE and falls through to the guards" });
+  }
+  if (/when\s+others\b/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_CAS_EXCEPTION_SWALLOWED", reason: "a generic WHEN OTHERS handler could swallow a failed save into a success acknowledgement; only the typed unique_violation handler is reviewed" });
   }
   return problems;
 }
@@ -1304,25 +1359,24 @@ export function auditSchemaContract({ readFile, wrapperSourceName = "supabase.js
       // to anon/public, is forbidden. (Reconciliation: an admin-read policy without its SELECT grant is
       // inert; a grant without the policy over-exposes -- both audited together.)
       if (t.authenticatedAcl) {
-        const roleGrants = new Map(); // role -> Set(verbs)
-        for (const m of masked.matchAll(new RegExp(String.raw`grant\s+([a-z,\s]+?)\s+on\s+table\s+public\.${t.name}\s+to\s+([a-z_,\s]+?);`, "gi"))) {
-          const verbs = m[1].split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
-          for (const role of m[2].split(",").map((r) => r.trim().toLowerCase()).filter(Boolean)) {
-            if (!roleGrants.has(role)) roleGrants.set(role, new Set());
-            for (const v of verbs) roleGrants.get(role).add(v);
-          }
-        }
-        const authGrants = [...(roleGrants.get("authenticated") || new Set())].sort();
+        // Round-5 blocker 5: assert the FINAL verb set from a SOURCE-ORDER replay of every GRANT/REVOKE on
+        // this exact table (finalRoleGrants), never the union of historical grants: a verb granted then
+        // revoked is NOT held, a verb revoked then re-granted IS, and a forbidden grant that a later
+        // REVOKE removed is cured. Any role beyond {authenticated, service_role} whose FINAL set is
+        // non-empty -- anon, public, or an arbitrary role -- is forbidden outright.
+        const finalGrants = finalRoleGrants(masked, t.name);
+        const authGrants = [...(finalGrants.get("authenticated") || new Set())].sort();
         const want = [...(t.authenticatedAcl.grants || [])].map((g) => g.toLowerCase()).sort();
         for (const g of want) {
-          if (!authGrants.includes(g)) blockers.push({ code: "AUTH_GRANT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing the required GRANT ${g} TO authenticated` });
+          if (!authGrants.includes(g)) blockers.push({ code: "AUTH_GRANT_MISSING", migration: entry.migration, table: t.name, message: `table public.${t.name} is missing the required GRANT ${g} TO authenticated in its FINAL ACL state` });
         }
         for (const g of authGrants) {
-          if (!want.includes(g)) blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name} grants FORBIDDEN ${g} to authenticated` });
+          if (!want.includes(g)) blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name}'s FINAL ACL state grants FORBIDDEN ${g} to authenticated` });
         }
-        for (const role of ["anon", "public"]) {
-          if ((roleGrants.get(role) || new Set()).size > 0) {
-            blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name} grants privileges to ${role} (forbidden)` });
+        for (const [role, set] of finalGrants) {
+          if (role === "authenticated" || role === "service_role") continue;
+          if (set.size > 0) {
+            blockers.push({ code: "AUTH_GRANT_FORBIDDEN", migration: entry.migration, table: t.name, message: `table public.${t.name}'s FINAL ACL state grants privileges to ${role} (forbidden)` });
           }
         }
       }

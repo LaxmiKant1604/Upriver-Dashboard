@@ -1238,8 +1238,26 @@ export async function recordSourceSnapshot({ organizationFingerprint, connection
       p_row_count: rowCount, p_payload_bytes: payloadBytes, p_source_request_hash: hash, p_validated_at: validatedAt,
     },
   });
-  const value = Array.isArray(body) ? body[0] : body;
-  const ack = typeof value === "string" ? value : String(value);
+  // Round-5 blocker 6: validate the EXACT RPC acknowledgement. The CAS returns exactly one scalar from
+  // {replaced, unchanged, stale-save, conflict}; anything else (null, unknown string, object, multi-row
+  // array) means the guard we rely on did not run as reviewed, so the save is NOT acknowledged -- typed
+  // failure, never a coerced "ok".
+  let value = body;
+  if (Array.isArray(body)) {
+    if (body.length !== 1) {
+      const err = new Error(`SOURCE_SNAPSHOT_ACK_INVALID: record_source_snapshot returned ${body.length} rows; exactly one scalar acknowledgement is required (fail closed).`);
+      err.code = "SOURCE_SNAPSHOT_ACK_INVALID";
+      throw err;
+    }
+    value = body[0];
+  }
+  const KNOWN_ACKS = ["replaced", "unchanged", "stale-save", "conflict"];
+  if (typeof value !== "string" || !KNOWN_ACKS.includes(value)) {
+    const err = new Error(`SOURCE_SNAPSHOT_ACK_INVALID: record_source_snapshot acknowledgement ${JSON.stringify(value)} is not one of ${KNOWN_ACKS.join("|")}; the save is unacknowledged (fail closed).`);
+    err.code = "SOURCE_SNAPSHOT_ACK_INVALID";
+    throw err;
+  }
+  const ack = value;
   if (ack === "conflict") {
     const err = new Error("SOURCE_SNAPSHOT_CONFLICT: an equal-validated_at snapshot with DIFFERENT content already exists; refusing to replace (fail closed).");
     err.code = "SOURCE_SNAPSHOT_CONFLICT";

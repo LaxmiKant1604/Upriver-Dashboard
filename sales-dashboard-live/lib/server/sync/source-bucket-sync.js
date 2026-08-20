@@ -489,6 +489,9 @@ export async function runBucketSourceSync({
     }
 
     if (family.sourceKey === CATALOG_SOURCE_KEY && family.plannedJobs.length) {
+      // Round-5 blocker 4: the CATALOG persistence is deadline-checked like every other persistence path --
+      // an expired budget defers it typed-resumable (a fresh invocation persists from the intact cache).
+      if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
       const job = family.plannedJobs[0];
       const rows = await store.listSourceJobs(rollup.cycleId);
       const row = rows.find((r) => (r.request_hash ?? r.requestHash) === job.requestHash);

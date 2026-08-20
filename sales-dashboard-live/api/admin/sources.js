@@ -119,11 +119,16 @@ export default async function handler(req, res) {
           return;
         }
       }
-      // Finding 8: the FAIL-CLOSED EVIDENCE PREFLIGHT runs BEFORE the endpoint's FIRST write -- including
-      // the audit row. A migration-unapplied/failed controls read (503) or a paused source (409) refuses
-      // here with ZERO writes; only a passing preflight is audited and executed.
+      // Finding 8 + round-5 blocker 3: the FAIL-CLOSED EVIDENCE PREFLIGHT runs BEFORE the endpoint's FIRST
+      // write -- including the audit row -- and now sweeps EVERY read execution needs (controls, discovery,
+      // coverage, snapshot hydration/integrity, Ads coverage, Ads metrics, OLI history, membership,
+      // settings, rollout). Any failure refuses typed with ZERO writes; only a passing preflight is audited
+      // and executed, and execution consumes the ONE memoized bundle (no repeated discovery/reads).
+      // Round-5 blocker 4: the ONE route-owned deadline is created BEFORE preflight, so preflight time
+      // counts against the same route budget that bounds execution.
       const runtime = buildBucketSourceSyncRuntime();
-      await runtime.preflightEvidence({ bucket, sourceKey: onlySourceKey });
+      const deadline = runtime.makeDeadline();
+      const preflight = await runtime.preflightEvidence({ bucket, sourceKey: onlySourceKey, deadline });
       await insertAuditLog({
         actorUserId: access.userId,
         action: "source.sync.missing",
@@ -133,8 +138,8 @@ export default async function handler(req, res) {
       // single-family tranche composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces
       // a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
       const result = onlySourceKey
-        ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey })
-        : await runtime.run({ bucket });
+        ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight })
+        : await runtime.run({ bucket, deadline, preflight });
       if (result && result.refused === true) {
         res.status(409).json({ refusal: result, status: await statusPayload() });
         return;
