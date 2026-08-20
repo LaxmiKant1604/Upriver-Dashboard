@@ -10269,3 +10269,24 @@ tranche (Daily Reporting, Brand View). Full evidence: SCHEDULER_V2_ROLLOUT.md Ap
 
 STOP for Codex senior review. Offline only; NOT pushed (origin/main + production remain at 02c2ef5); no
 migration applied; no DataDoe/Supabase/production call; dfca8f75 untouched; nothing published or scheduled.
+
+## Production-path hardening (Codex findings 1-10) — OFFLINE on main 2026-08-20 (code+tests 545735b, docs separate); verify green 54/34; NOT deployed
+
+Codex senior review of Appendix AK raised 10 production-path blockers; all fixed offline. Full evidence:
+SCHEDULER_V2_ROLLOUT.md Appendix AL. Highlights: (1) every durable evidence read fails CLOSED (typed
+zero-export refusal; migration-unapplied = DURABLE_MODEL_UNAVAILABLE) before any create/write/cycle; (2)
+primary-only account binding (prefixed dd-secondary ids excluded typed, never routed via the primary key);
+(3) real 50s serverless deadline + reserve, typed-RESUMABLE continuation, <=1 create/hash across
+invocations; (4) source-card actions route to their REAL architecture or refuse typed (bucket sync /
+fixpoint composition / ads refusal) + Daily/Brand View durable SHADOW snapshots derive+validate+save from
+durable OLI/catalog/Ads evidence; (5) NEW replace_oli_history_window RPC: atomic delete-window + insert +
+coverage-ack in ONE transaction (removed grains cannot survive); (6) snapshot payloads copied to the
+never-pruned source-snapshots/v1/* namespace (hydration after cache prune proven); (7) durable
+source_batch_membership loaded + transactionally assigned; (8) readiness from authoritative per-account
+coverage/freshness/snapshot/per-account Ads windows (never last_status); (9) exact least-privilege ACL SQL
++ replace-oli structural proof + audit mutation tests; (10) FBA seller/marketplace scoping with every
+returned row validated. New scripts/source-production-hardening.test.js (20 assertions); three suites
+reconciled to the hardened interfaces. npm run verify 54 steps / 34 suites green; git diff --check clean.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 still PREPARED-UNAPPLIED; no
+DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/published.

@@ -4886,3 +4886,30 @@ Scheduler v1, live snapshots, HANDOFF.md/.worktrees untouched. sourceTranche=nul
 5. **Org token balance is 0** (BLOCKED_NO_TOKENS): nothing here spends tokens, but any live confirmation after review requires the balance fixed at app.datadoe.com/organization.
 
 **STOP for Codex senior review.** 7 local commits + this docs commit; NOT pushed; production stays on `02c2ef5`; no migration applied; nothing scheduled, published, or resumed.
+
+## Appendix AL — Production-path hardening for the source workflow (OFFLINE, 2026-08-20; code+tests `545735b`; docs `<this commit>`; NOT deployed)
+
+Codex senior review of Appendix AK raised ten production-path blockers; all fixed offline on main (no
+production/DataDoe/Supabase call; migration NOT applied; nothing pushed/deployed/enabled/scheduled).
+`npm run verify` green — **54 steps / 34 suites** (incl. `build:check`); `git diff --check` clean.
+
+| # | Finding | Fix (proof: `source-production-hardening.test.js` F-groups) |
+|---|---|---|
+| 1 | Non-ok evidence reads proceeded (schema-missing read as "nothing paused"/"no coverage" => full-backfill spend) | Every controls/coverage/snapshot/membership read must be `read:"ok"` BEFORE any create/write/cycle; schema-missing => typed `DURABLE_MODEL_UNAVAILABLE` 503 ZERO-export; failures => `SOURCE_EVIDENCE_READ_FAILED` / `BATCH_MEMBERSHIP_READ_FAILED` (F1a-c: zero openCycle + zero creates per class) |
+| 2 | dd-secondary/prefixed ids could enter with rawSellerId=accountId through the primary key | `bindPrimaryBucketAccounts`: only clean primary ids with a marketplace country; prefixed/country-less EXCLUDED typed+recorded (F2a-b through the REAL merge/classify path with a configured secondary) |
+| 3 | Infinity deadline under the 60s route; unbounded work per invocation | `deadlineMs = clock()+budgetMs` (50s default) + reserve headroom threaded into the family loop AND every `runSourceJobs` pass; expiry => typed-RESUMABLE rollup (`deadlineReached`+`continuationRequired`, never a failure); continuation completes the same cycle, <=1 create/hash (F3a) |
+| 4 | Card actions only knew 3 families; no fixpoint composition; no Ads evidence; no dashboard snapshots | `runSourceCardAction` routes: durable families => bucket sync; cycle-cache => REAL fixpoint composition (`buildSchedulerV2SourceTrancheRuntime`, consumer-report scope, finite deadline); durable-ads => typed `SOURCE_ACTION_ADS_ARCHITECTURE` refusal. Post-complete-run: durable Ads evidence loaded, Daily (per account) + Brand View (per bucket) durable SHADOW snapshots derived+validated+saved (`deriveDurableDashboardSnapshots`, scheduler-v2/* only; non-ready => typed skip) (F4a-d) |
+| 5 | merge-duplicates upsert let removed/changed grains survive; data+coverage were two writes | NEW `replace_oli_history_window` RPC (migration 20260820, PREPARED-UNAPPLIED): validate fail-closed -> DELETE window rows -> INSERT corrected -> UPSERT succeeded-coverage — ONE transaction; wrapper `replaceOliHistoryWindow`; per-(account, slice) persistence exclusively through it; failure leaves data AND coverage untouched (F5a-b) |
+| 6 | Snapshot pointers referenced the prunable 24h cache objects | Payloads COPIED to `source-snapshots/v1/*` (`saveSourceSnapshotPayload`/`getSourceSnapshotPayload`) — a namespace `prune_source_export_cache` never touches; hydration after a full cache prune proven (F6a) |
+| 7 | Durable batch membership never loaded/assigned in production | Runtime loads `source_batch_membership` (`oliBatchFamily`) and transactionally assigns ONLY new accounts via the RPC wrapper; stable across invocations; malformed acks fail closed (F7a-b) |
+| 8 | Readiness derived from last_status cards | `gatherDurableReadiness`: per-account durable coverage + snapshot freshness + PER-ACCOUNT Ads windows (`windowsByAccountId`; gaps carry accountId); read failures merge as typed blockers; served by GET (typed unavailable on gather failure); card summary demoted to a labeled hint (F8a) |
+| 9 | No explicit ACL SQL; no audit mutations for 20260820 | Exact least-privilege ACLs (history: REVOKE ALL + GRANT SELECT — RPC-only writes; other four: SELECT,INSERT,UPDATE; RPC EXECUTE service_role only) + schema-contract registration + NEW `replace-oli` structural body proof; mutations (dropped REVOKE / widened GRANT / dropped RPC / gutted body) each raise typed blockers; real SQL audits clean (F9a-c) |
+| 10 | FBA resolved "organization"-scoped; returned rows never validated | Honest seller+marketplace scoping with the account country as the planned constraint; `validateFbaSnapshotRows` validates EVERY row's marketplace pre-snapshot (cross-marketplace / marketplace-less reject typed; latest-good preserved) (F10a) |
+
+Guardrails preserved: golden request hashes byte-identical; one-create-per-hash; cache-adoption CAS;
+owner isolation; LKG; Scheduler v1; reuseOnly + tripwire; schedule defaults OFF; no cron. The three
+reconciled suites (bucket-sync 16, source-status 9, zero-export rehearsal 12) still prove their full
+matrices against the hardened interfaces.
+
+**STOP for Codex re-review.** Code+tests `545735b`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migration 20260820 remains PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
