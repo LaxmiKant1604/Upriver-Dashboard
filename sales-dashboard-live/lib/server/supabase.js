@@ -876,6 +876,256 @@ export async function getSourceTrancheBudgetHashes({ cycleId, trancheKey }) {
   return Array.isArray(rows) ? rows : [];
 }
 
+/* ---- DURABLE SOURCE MODEL wrappers (20260820_source_durable_model.sql -- PREPARED, UNAPPLIED) ----------
+ * The 24h source_export_cache is a per-cycle reuse cache, NOT history. These wrappers are the ONLY write
+ * path to the durable model: canonical OLI history (idempotent PK upsert so late Amazon corrections REPLACE
+ * matching rows), proven coverage windows (succeeded-only; completed coverage is never exported again),
+ * source-level controls (pause stops NEW exports only; schedule defaults OFF), the per-(source, bucket)
+ * operator status card, and the latest-VALIDATED snapshot pointer (a failed refresh never replaces a
+ * validated one). Typed outcomes distinguish schema-missing (unapplied migration) from operational
+ * failures; only SAFE codes are returned -- never a raw DB response or a secret. */
+
+// The scope_key / account_id sentinel for organization-wide sources (Product Catalog).
+export const SOURCE_SCOPE_ORGANIZATION = "__organization";
+
+const OLI_HISTORY_CONFLICT = "organization_fingerprint,connection_id,account_id,sale_date,sku,child_asin,currency";
+
+// Idempotent canonical-grain upsert: merge-duplicates on the FULL grain PK, so a re-export of an already
+// covered window (rolling refresh) or a late Amazon correction REPLACES the matching row -- never a
+// duplicate. Every row must carry the complete grain; a malformed row rejects the whole batch BEFORE any
+// HTTP so a partial batch can never be half-written by this wrapper.
+export async function upsertSourceOliHistoryRows(rows) {
+  const payload = [];
+  for (const r of rows || []) {
+    const rec = {
+      organization_fingerprint: r.organizationFingerprint,
+      connection_id: r.connectionId || "primary",
+      account_id: r.accountId,
+      seller_or_vendor_id: r.sellerOrVendorId,
+      sale_date: r.saleDate,
+      sku: String(r.sku ?? ""),
+      child_asin: String(r.childAsin ?? ""),
+      currency: r.currency,
+      sales_amount: r.salesAmount,
+      units: r.units,
+      source_request_hash: r.sourceRequestHash,
+    };
+    if (!rec.organization_fingerprint || !rec.account_id || !rec.seller_or_vendor_id || !rec.sale_date
+      || !rec.currency || !rec.source_request_hash
+      || typeof rec.sales_amount !== "number" || !Number.isFinite(rec.sales_amount)
+      || typeof rec.units !== "number" || !Number.isFinite(rec.units)) {
+      throw new Error("upsertSourceOliHistoryRows: a row is missing its canonical grain/values; rejecting the whole batch (fail closed).");
+    }
+    if (rec.connection_id !== "primary" && rec.connection_id !== "dd-secondary") {
+      throw new Error("upsertSourceOliHistoryRows: invalid connection_id; rejecting the whole batch (fail closed).");
+    }
+    payload.push(rec);
+  }
+  if (!payload.length) return { write: "ok", recorded: 0, error: null };
+  try {
+    await request(`/rest/v1/source_oli_daily_history?on_conflict=${OLI_HISTORY_CONFLICT}`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: payload,
+    });
+    return { write: "ok", recorded: payload.length, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", recorded: 0, error: "OLI_HISTORY_SCHEMA_MISSING" };
+    return { write: "write-failed", recorded: 0, error: "OLI_HISTORY_WRITE_FAILED" };
+  }
+}
+
+export const SOURCE_OLI_HISTORY_MAX_ROWS = 200000;
+
+// Bounded canonical-history read. STRICT cap: at/over the limit the read is refused with a typed error
+// rather than silently truncated (a truncated series would understate sales).
+export async function getSourceOliHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getSourceOliHistoryRows requires organizationFingerprint + from + to (fail closed).");
+  }
+  const query = new URLSearchParams({
+    select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,sales_amount,units",
+    organization_fingerprint: `eq.${organizationFingerprint}`,
+    connection_id: `eq.${connectionId}`,
+    sale_date: `gte.${from}`,
+    order: "sale_date.asc,account_id.asc,sku.asc,child_asin.asc",
+    limit: String(maxRows),
+  });
+  query.append("sale_date", `lte.${to}`);
+  if (Array.isArray(accountIds) && accountIds.length) {
+    query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+  }
+  const rows = await request(`/rest/v1/source_oli_daily_history?${query}`);
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length >= maxRows) {
+    const err = new Error("OLI_HISTORY_ROW_LIMIT_EXCEEDED: durable OLI history read reached its row cap; refusing a truncated series (fail closed).");
+    err.code = "OLI_HISTORY_ROW_LIMIT_EXCEEDED";
+    throw err;
+  }
+  return list;
+}
+
+// Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.
+export async function getSourceCoverageWindows({ organizationFingerprint, connectionId = "primary", accountId, sourceKey }) {
+  try {
+    const query = new URLSearchParams({
+      select: "covered_from,covered_to",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      source_key: `eq.${sourceKey}`,
+      status: "eq.succeeded",
+      order: "covered_from.asc",
+    });
+    const rows = await request(`/rest/v1/source_coverage?${query}`);
+    return { windows: (rows || []).map((r) => ({ from: r.covered_from, to: r.covered_to })), read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { windows: [], read: "schema-missing", error: "SOURCE_COVERAGE_SCHEMA_MISSING" };
+    return { windows: [], read: "read-failed", error: "SOURCE_COVERAGE_READ_FAILED" };
+  }
+}
+
+export async function recordSourceCoverageWindows(rows) {
+  const payload = (rows || [])
+    .filter((r) => r && r.organizationFingerprint && r.accountId && r.sourceKey && r.coveredFrom && r.coveredTo)
+    .map((r) => ({
+      organization_fingerprint: r.organizationFingerprint,
+      connection_id: r.connectionId || "primary",
+      account_id: r.accountId,
+      source_key: r.sourceKey,
+      covered_from: r.coveredFrom,
+      covered_to: r.coveredTo,
+      status: "succeeded",
+      source_refreshed_at: r.sourceRefreshedAt || new Date().toISOString(),
+    }));
+  if (payload.length !== (rows || []).length) {
+    throw new Error("recordSourceCoverageWindows: a window is missing its identity; rejecting the whole batch (fail closed).");
+  }
+  if (!payload.length) return { write: "ok", recorded: 0, error: null };
+  try {
+    await request("/rest/v1/source_coverage?on_conflict=organization_fingerprint,connection_id,account_id,source_key,covered_from,covered_to", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: payload,
+    });
+    return { write: "ok", recorded: payload.length, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", recorded: 0, error: "SOURCE_COVERAGE_SCHEMA_MISSING" };
+    return { write: "write-failed", recorded: 0, error: "SOURCE_COVERAGE_WRITE_FAILED" };
+  }
+}
+
+// SOURCE-level controls (Data Sync Center). Reads return every row; a missing schema reads as [] with a
+// typed marker so the UI can say "not migrated" rather than "everything running".
+export async function getSourceControls() {
+  try {
+    const rows = await request("/rest/v1/source_controls?select=source_key,paused,schedule_enabled,updated_at&order=source_key.asc");
+    return { rows: Array.isArray(rows) ? rows : [], read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { rows: [], read: "schema-missing", error: "SOURCE_CONTROLS_SCHEMA_MISSING" };
+    return { rows: [], read: "read-failed", error: "SOURCE_CONTROLS_READ_FAILED" };
+  }
+}
+
+// Sets ONLY the supplied control fields. Pause stops NEW source exports; it never deletes durable
+// history/coverage/snapshots (nothing here can -- this wrapper only writes the control row).
+export async function setSourceControl({ sourceKey, paused, scheduleEnabled, updatedBy = null }) {
+  const key = String(sourceKey || "").trim();
+  if (!key) throw new Error("setSourceControl requires a nonblank sourceKey (fail closed).");
+  const body = { source_key: key };
+  if (paused !== undefined) body.paused = paused === true;
+  if (scheduleEnabled !== undefined) body.schedule_enabled = scheduleEnabled === true;
+  if (updatedBy) body.updated_by = updatedBy;
+  await request("/rest/v1/source_controls?on_conflict=source_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: [body],
+  });
+  return { write: "ok" };
+}
+
+export async function getSourceRunStatuses() {
+  try {
+    const rows = await request("/rest/v1/source_run_status?select=source_key,bucket,last_status,last_attempt_at,last_success_at,safe_error_code,safe_error_stage,covered_from,covered_to,accounts_completed,accounts_failed,accounts_total,batch_count,creates_spent,tokens_spent,creates_ceiling,tokens_ceiling,updated_at&order=source_key.asc,bucket.asc");
+    return { rows: Array.isArray(rows) ? rows : [], read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { rows: [], read: "schema-missing", error: "SOURCE_RUN_STATUS_SCHEMA_MISSING" };
+    return { rows: [], read: "read-failed", error: "SOURCE_RUN_STATUS_READ_FAILED" };
+  }
+}
+
+const SAFE_ERROR_MAX = 200;
+
+export async function upsertSourceRunStatus(entry) {
+  const key = String(entry && entry.sourceKey || "").trim();
+  const bucket = entry && entry.bucket;
+  if (!key || (bucket !== "us" && bucket !== "non-us")) {
+    throw new Error("upsertSourceRunStatus requires a nonblank sourceKey and a bucket of 'us'|'non-us' (fail closed).");
+  }
+  const body = { source_key: key, bucket };
+  const setIf = (name, value) => { if (value !== undefined) body[name] = value; };
+  setIf("last_status", entry.lastStatus);
+  setIf("last_attempt_at", entry.lastAttemptAt);
+  setIf("last_success_at", entry.lastSuccessAt);
+  setIf("safe_error_code", entry.safeErrorCode == null ? entry.safeErrorCode : String(entry.safeErrorCode).slice(0, SAFE_ERROR_MAX));
+  setIf("safe_error_stage", entry.safeErrorStage == null ? entry.safeErrorStage : String(entry.safeErrorStage).slice(0, SAFE_ERROR_MAX));
+  setIf("covered_from", entry.coveredFrom);
+  setIf("covered_to", entry.coveredTo);
+  setIf("accounts_completed", entry.accountsCompleted);
+  setIf("accounts_failed", entry.accountsFailed);
+  setIf("accounts_total", entry.accountsTotal);
+  setIf("batch_count", entry.batchCount);
+  setIf("creates_spent", entry.createsSpent);
+  setIf("tokens_spent", entry.tokensSpent);
+  setIf("creates_ceiling", entry.createsCeiling);
+  setIf("tokens_ceiling", entry.tokensCeiling);
+  await request("/rest/v1/source_run_status?on_conflict=source_key,bucket", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: [body],
+  });
+  return { write: "ok" };
+}
+
+export async function getSourceSnapshot({ sourceKey, scopeKey }) {
+  try {
+    const query = new URLSearchParams({
+      select: "source_key,scope_key,object_path,row_count,payload_bytes,source_request_hash,validated_at",
+      source_key: `eq.${sourceKey}`,
+      scope_key: `eq.${scopeKey}`,
+      limit: "1",
+    });
+    const rows = await request(`/rest/v1/source_snapshots?${query}`);
+    return { snapshot: rows && rows[0] ? rows[0] : null, read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { snapshot: null, read: "schema-missing", error: "SOURCE_SNAPSHOT_SCHEMA_MISSING" };
+    return { snapshot: null, read: "read-failed", error: "SOURCE_SNAPSHOT_READ_FAILED" };
+  }
+}
+
+// Replace the latest-good snapshot pointer ONLY with a fully VALIDATED one. Every evidence field is
+// REQUIRED; anything missing is rejected before any HTTP, so a failed/partial refresh can never replace a
+// validated snapshot through this wrapper (latest-good preserved by construction).
+export async function recordSourceSnapshot({ sourceKey, scopeKey, objectPath, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt }) {
+  const key = String(sourceKey || "").trim();
+  const scope = String(scopeKey || "").trim();
+  const path = String(objectPath || "").trim();
+  const hash = String(sourceRequestHash || "").trim();
+  if (!key || !scope || !path || !hash || !validatedAt
+    || typeof rowCount !== "number" || !Number.isInteger(rowCount) || rowCount < 0) {
+    throw new Error("recordSourceSnapshot requires complete VALIDATED snapshot evidence (sourceKey/scopeKey/objectPath/rowCount/sourceRequestHash/validatedAt); refusing to replace the latest-good snapshot (fail closed).");
+  }
+  await request("/rest/v1/source_snapshots?on_conflict=source_key,scope_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: [{
+      source_key: key, scope_key: scope, object_path: path,
+      row_count: rowCount, payload_bytes: payloadBytes, source_request_hash: hash, validated_at: validatedAt,
+    }],
+  });
+  return { write: "ok" };
+}
+
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.

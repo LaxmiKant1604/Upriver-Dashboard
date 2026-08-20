@@ -284,6 +284,88 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["persistSourceTrancheBudget", "reserveSourceExportCreate", "getSourceTrancheBudget", "getSourceTrancheBudgetHashes"],
     note: "Frozen per-(cycle,tranche) create/token budget + atomic pre-POST reservation RPC (PREPARED, UNAPPLIED).",
   },
+  {
+    // DURABLE SOURCE MODEL: canonical OLI history (idempotent full-grain PK so corrections REPLACE), proven
+    // coverage windows (succeeded-only; completed coverage is never re-exported), source-level controls
+    // (pause + schedule_enabled default FALSE), the per-(source, bucket) operator status card, and the
+    // latest-VALIDATED snapshot pointer. ADDITIVE only; five new tables; no RPC; all writes via wrappers.
+    migration: "20260820_source_durable_model.sql",
+    tables: [
+      {
+        name: "source_oli_daily_history",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "sale_date", "sku", "child_asin", "currency"]],
+        namedConstraints: [
+          { name: "source_oli_daily_history_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "sale_date", "sku", "child_asin", "currency"] },
+          { name: "source_oli_daily_history_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_oli_daily_history_currency_check", kind: "check", canonical: "currency ~ '^[A-Z]{3}$'" },
+          { name: "source_oli_daily_history_hash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+        ],
+        requiredIndexes: [
+          { name: "source_oli_daily_history_account_date_idx", columns: ["account_id", "sale_date"] },
+          { name: "source_oli_daily_history_org_date_idx", columns: ["organization_fingerprint", "sale_date"] },
+        ],
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_oli_daily_history_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
+          "sku", "child_asin", "currency", "sales_amount", "units", "source_request_hash"],
+      },
+      {
+        name: "source_coverage",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to"]],
+        namedConstraints: [
+          { name: "source_coverage_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to"] },
+          // ONLY proven successes exist (mirrors ads_sync_coverage) -- coverage can never record a failure.
+          { name: "source_coverage_status_check", kind: "check", canonical: "status in ('succeeded')" },
+          { name: "source_coverage_window_check", kind: "check", canonical: "covered_from <= covered_to" },
+        ],
+        requiredIndexes: [{ name: "source_coverage_lookup_idx", columns: ["account_id", "source_key", "covered_from"] }],
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_coverage_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "source_key", "covered_from", "covered_to", "status", "source_refreshed_at"],
+      },
+      {
+        name: "source_controls",
+        unique: [["source_key"]],
+        namedConstraints: [
+          { name: "source_controls_source_key_nonblank", kind: "check", canonical: "char_length(btrim(source_key)) > 0" },
+        ],
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_controls_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["source_key", "paused", "schedule_enabled", "updated_at"],
+      },
+      {
+        name: "source_run_status",
+        unique: [["source_key", "bucket"]],
+        namedConstraints: [
+          { name: "source_run_status_pk", kind: "primary key", columns: ["source_key", "bucket"] },
+          { name: "source_run_status_bucket_check", kind: "check", canonical: "bucket in ('us', 'non-us')" },
+          { name: "source_run_status_last_status_check", kind: "check", canonical: "last_status in ('never', 'running', 'succeeded', 'partial', 'failed', 'paused')" },
+        ],
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_run_status_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["source_key", "bucket", "last_status", "last_attempt_at", "last_success_at", "safe_error_code", "safe_error_stage",
+          "covered_from", "covered_to", "accounts_completed", "accounts_failed", "accounts_total", "batch_count",
+          "creates_spent", "tokens_spent", "creates_ceiling", "tokens_ceiling"],
+      },
+      {
+        name: "source_snapshots",
+        unique: [["source_key", "scope_key"]],
+        namedConstraints: [
+          { name: "source_snapshots_pk", kind: "primary key", columns: ["source_key", "scope_key"] },
+          { name: "source_snapshots_object_path_nonblank", kind: "check", canonical: "char_length(btrim(object_path)) > 0" },
+          { name: "source_snapshots_row_count_nonneg", kind: "check", canonical: "row_count >= 0" },
+        ],
+        rlsEnabled: true,
+        requiredTriggers: [{ name: "source_snapshots_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["source_key", "scope_key", "object_path", "row_count", "payload_bytes", "source_request_hash", "validated_at"],
+      },
+    ],
+    rpcs: [],
+    wrappers: ["upsertSourceOliHistoryRows", "getSourceOliHistoryRows", "getSourceCoverageWindows", "recordSourceCoverageWindows",
+      "getSourceControls", "setSourceControl", "getSourceRunStatuses", "upsertSourceRunStatus",
+      "getSourceSnapshot", "recordSourceSnapshot"],
+    note: "Durable source model: OLI history + coverage + controls + run status + validated snapshots (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
