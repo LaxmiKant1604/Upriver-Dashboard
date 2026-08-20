@@ -4973,3 +4973,19 @@ Codex round-4 raised nine findings on Appendix AM; all fixed offline. `npm run v
 
 **STOP for Codex re-review.** Code+tests `e6165a6`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migration 20260820 PREPARED-UNAPPLIED (blob `2053597b...`); nothing deployed, scheduled, or published.
+
+## Appendix AQ — Round-6 RELEASE blockers (two): deadline end-to-end + brand-inventory durable enable (OFFLINE, 2026-08-20; code+tests `f6fd11c`; docs `<this commit>`; NOT deployed)
+
+Codex's round-6 review approved the six fixes (Appendix AP) but flagged two RELEASE blockers; both fixed
+offline. `npm run verify` green — **55 steps / 35 suites** (incl. `build:check`); `git diff --check` clean;
+migration 20260820 byte-UNCHANGED (`2053597b`); NEW migration 20260821 PREPARED-UNAPPLIED
+(`b3c0bc86`, sha256 `381a41ff607a7566b6fbeacb9598d629fe5d8defd4cec0bc8d0123ececbc4b3a`); migrations 1-6 frozen.
+
+| # | Blocker → fix (proofs: hardening V1-V6 + U7; reworked U3) |
+|---|---|
+| 1 | **The one route deadline is now genuinely end-to-end.** Every production Supabase/Storage read+write the source-first route invokes carries the route AbortSignal to the REAL `fetch`: ~21 source-store wrappers + the cache storage/metadata adapters + `saveReportSnapshot` accept & forward an optional `{ signal }` (no signal ⇒ byte-identical; fixed `updateSyncCycleCounts`, which accepted but discarded it); `makeSupabaseSourceStore({ deadline })` binds EVERY method through `deadline.bound` (checked-before-request, remaining-budget race, signal→fetch, typed `ROUTE_DEADLINE_EXCEEDED` + commitUnknown for a timed-out write); `runBucketSourceSync`/`runSourceJobs` need no signature change (their `store.*` calls are bound via the store closure); the runtime builds its store with the deadline and the shadow-save closures forward the bound signal into `makeShadowSnapshotSaver`→`saveReportSnapshot`. V1-V6 drive the REAL store + real shadow saver with MOCKED global fetch: signal reaches fetch for every op; hung open/source-job/owner/budget/report_snapshots writes abort within budget (commitUnknown); before-request expiry = zero fetches; confirmed completion stays confirmed; one-attempt guard unchanged; no ghost `source_export_cache` pointer write after abort |
+| 2 | **brand-inventory gets a REAL fail-closed durable enable path.** New additive `20260821_source_promoted_publish_controls.sql` (PREPARED-UNAPPLIED) adds `source_promoted_publish_settings(report_key, publish_enabled)` seeded `brand-inventory=false` (default OFF) with admin-read RLS + least-privilege ACL (REVOKE ALL strips PG17 MAINTAIN; grant select,insert,update), registered + audited in schema-contract.js. New wrappers `getSourcePromotedPublishSettings` (fail-closed `[]` on schema-missing/read error) / `setSourcePromotedPublishControl`. Publisher gate 2 consults this SEPARATE control for source-promoted keys (report_sync_settings for the 13 dispatch keys) — independent, both default OFF. The admin sync surface gains a reviewed enable/revoke path that writes ONLY the promoted control and REFUSES (409) to dispatch a promoted key; brand-inventory stays out of CONTROLLED_REPORT_KEYS (structurally undispatchable). U3 no longer fabricates a report_sync_settings row (real promoted control: default-off ⇒ report-disabled, enabled ⇒ published); U7 proves the fail-closed wrappers, the admin routing/refusal, and the migration ACL/policy audit |
+
+**STOP for Codex re-review.** Code+tests `f6fd11c`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migration 20260820 byte-unchanged + 20260821 both PREPARED-UNAPPLIED; nothing deployed,
+scheduled, or published.

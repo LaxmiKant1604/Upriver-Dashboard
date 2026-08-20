@@ -10382,3 +10382,30 @@ parity 5, gate7 45 (F1 now pins 14 contracts); verify 55 steps / 35 suites.
 STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b...) byte-UNCHANGED
 and still PREPARED-UNAPPLIED; migrations 1-6 frozen; no DataDoe/Supabase/production call; nothing
 deployed/enabled/scheduled/published; cycle dfca8f75 untouched.
+
+## Round-6 RELEASE blockers (two) — OFFLINE on main 2026-08-20 (code+tests f6fd11c, docs separate); verify green 55/35; NOT deployed
+
+Codex approved the six round-6 fixes but flagged two release blockers; both fixed offline (Appendix AQ in
+SCHEDULER_V2_ROLLOUT.md). (1) The one route-owned deadline is now genuinely end-to-end: every production
+Supabase/Storage read+write the source route invokes carries the route AbortSignal to the REAL fetch --
+~21 source-store wrappers + cache storage/metadata adapters + saveReportSnapshot forward an optional
+{ signal } (no signal => byte-identical; fixed updateSyncCycleCounts which accepted but discarded it);
+makeSupabaseSourceStore({ deadline }) binds every method through deadline.bound (before-request check +
+remaining-budget race + signal->fetch + typed ROUTE_DEADLINE_EXCEEDED/commitUnknown for writes); the runtime
+builds its store with the deadline and the shadow-save closures thread the bound signal into
+makeShadowSnapshotSaver->saveReportSnapshot. Proved by V1-V6 (REAL store + real saver, MOCKED global fetch):
+signal reaches fetch; hung writes abort within budget (commitUnknown); before-request expiry = zero fetch;
+confirmed stays confirmed; no ghost pointer write after abort. (2) brand-inventory now has a real fail-closed
+durable enable path: NEW additive migration 20260821_source_promoted_publish_controls.sql (PREPARED-UNAPPLIED,
+blob b3c0bc86) adds source_promoted_publish_settings (seeded brand-inventory=false, default OFF; admin-read
+RLS + least-privilege ACL), registered/audited in schema-contract; new wrappers get/setSourcePromotedPublish*
+(fail-closed); publisher gate 2 consults this SEPARATE control for promoted keys (report_sync_settings for the
+13 dispatch keys), independent + default OFF; the admin sync surface enables/revokes via the SEPARATE control
+and REFUSES (409) to dispatch a promoted key; brand-inventory stays out of CONTROLLED_REPORT_KEYS
+(undispatchable). U3 exercises the real control (no fabricated row); U7 proves the fail-closed wrappers +
+admin routing/refusal + migration ACL/policy audit. Hardening 56, source-status 9, parity 5, gate7 45;
+verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migration 20260820 (blob 2053597b) byte-UNCHANGED and
+20260821 (blob b3c0bc86) both PREPARED-UNAPPLIED; migrations 1-6 frozen; no DataDoe/Supabase/production call;
+nothing deployed/enabled/scheduled/published; cycle dfca8f75 untouched.
