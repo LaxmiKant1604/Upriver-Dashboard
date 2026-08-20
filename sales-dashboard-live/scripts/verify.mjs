@@ -47,6 +47,7 @@ const SUITES = [
   "test:source-fixpoint",
   "test:source-durable-model",
   "test:source-bucket-sync",
+  "test:source-status",
   "test:schema-contract-mutation",
   "test:report-sync-controls",
   "test:gate5-canary-package",
