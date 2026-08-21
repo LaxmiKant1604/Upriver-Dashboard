@@ -10580,3 +10580,28 @@ pending/pending); dfca8f75 CYCLE 1 FAIL -- cycle-column report_total=0 in prod v
 running cycle pre-rollup) -- pin report_total=8 is a likely mis-encoding. Pin left UNCHANGED per decision gate;
 escalated for runbook confirmation. Additional STOP reason alongside contract-invalid brand-sales (Appendix AX).
 Offline read-only only; no pins changed; not pushed; migrations UNAPPLIED; zero writes.
+
+## Production release stage 3 + forward-only recovery -- 2026-08-21 (code 20e7059, c3b6e27; docs separate)
+
+Reconciliation RECONCILED PASS -> pinned all 8 protected digests (live 183, shadow 48, rollout 1, mode 1,
+approvals 4, settings 13, sync_cycles 17, report_jobs 191); ro-prod-check 0 matched 8/8 + created
+.release-baseline.json (HEAD 20e7059). APPLIED migrations 1-3 (advisory-locked, ro-prod-check each; prod at
+STAGE 3; protected data unchanged live=183 shadow=48). Migration 4 (20260820) ROLLED BACK CLEANLY (exit 1,
+phase executed, NOT commit-unknown) on a MANIFEST catalog defect: the added CHECK
+source_batch_membership_account_canonical `position(':' in account_id)=0` serializes as POSITION(':' IN
+account_id)=0, but the manifest pinned the strpos-style position(account_id, ':') form (semantically identical).
+
+Codex authorized FORWARD-ONLY recovery (no rollback/repair/db:migrate/DROP of 1-3). Phase A: pinned the exact
+POSITION(':' IN account_id) canonical form (no reversed-operand normalizer); audited migrations 4-6 constraints
+(m4 others empirically confirmed by the failed apply; m5 PK+char_length(btrim())+auth.users FK; m6 no
+constraints); added mutation regressions. Phase B: dedicated HARD-CODED stage-3 re-anchor -- re-anchor-stage3.mjs
++ buildStage3Baseline/validateStage3Baseline/shouldCreateStage3Baseline: SEPARATE .release-baseline-stage3.json
+(stage-0 baseline preserved for audit), exclusive, bound to final HEAD + corrected fingerprint + 6 frozen hashes
++ anchorStage=3, digests==pins; read-only REPEATABLE READ, exact ledger (1-3 once, 4-6 absent) + complete 1-3
+catalog + 4-6 absent + 8 digests==pins + invariants, ALWAYS ROLLBACK before write. Applier + ro-prod-check use
+the stage-3 baseline ONLY for migrations 4-6; COMMIT_UNKNOWN unchanged. Committed code c3b6e27.
+
+Verify: node --check 9 OK; self-tests 111; verify 55/35; diff clean. NEXT: re-anchor-stage3 -> ro-prod-check 3
+-> apply 4->5->6 (ro-prod-check each, Manual mode, one command per approval, no COMMIT_UNKNOWN retry). Migrations
+4-6 UNAPPLIED; nothing pushed/deployed. Tokens=0 gate go-live [[datadoe-token-block]]: no create-export;
+missing-data reports/schedules paused until funded.

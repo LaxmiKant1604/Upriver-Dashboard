@@ -5196,3 +5196,45 @@ than crashing. Regression added (M4 `source_batch_membership`, M6 `sync_report_j
 to be a mis-encoding of the child count. **Pin left UNCHANGED** per the decision gate ("do not change pins to
 match current state"); escalated to the runbook owner to confirm the correct cycle-column value (0) before
 re-pinning. This is an additional STOP reason alongside the contract-invalid `brand-sales` rows (Appendix AX).
+
+## Appendix AZ — Production release: migrations 1-3 applied; migration-4 catalog defect + clean rollback; forward-only stage-3 re-anchor (2026-08-21)
+
+**Reconciliation PASS + pinning + stage-0 baseline (code `20e7059`).** The corrected read-only reconciliation
+returned RECONCILED PASS (contract 40/40, lineage 40/40, promo-audit byte-identical for the 4 approved reports,
+invariants all pass; 8 accepted legacy `v2d-1` shadow rows). All eight protected datasets were pinned from the
+read-only capture (live 183, shadow 48, rollout 1, mode 1, approvals 4, settings 13, sync_cycles 17,
+report_jobs 191); `ro-prod-check 0` re-verified an exact 8/8 match and created `.release-baseline.json`.
+
+**Migrations 1-3 APPLIED + verified (production now at stage 3).** One advisory-locked transaction each, with a
+`ro-prod-check` after each; protected data unchanged (live=183, shadow=48) throughout:
+- 1 `20260817_scheduler_v2_reuse_cas.sql` (stage 0->1)
+- 2 `20260817_source_batch_membership.sql` (1->2)
+- 3 `20260818_source_tranche_budget.sql` (2->3)
+
+**Migration 4 `20260820_source_durable_model.sql`: manifest catalog defect, CLEAN ROLLBACK.** The applier
+executed the DDL, ran the pre-COMMIT catalog verification, found ONE mismatch, and rolled the transaction back
+atomically (exit 1, phase `executed` — NOT a COMMIT_UNKNOWN; a re-run `ro-prod-check 3` confirmed zero trace).
+The defect was in the release *manifest's expected value*, not the migration SQL or production: the added CHECK
+`source_batch_membership_account_canonical` is `position(':' in account_id) = 0`, which PostgreSQL serializes as
+the SQL-standard operator form `POSITION(':' IN account_id) = 0`; the manifest had pinned the strpos-style
+`position(account_id, ':')` form. Semantically identical (reject any `account_id` containing `':'`), but the
+canonicalized bodies differed, so the fail-closed check correctly refused to commit.
+
+**Forward-only recovery (Codex-authorized; code `c3b6e27`).** Migrations 1-3 are left applied and verified (no
+rollback/repair/`db:migrate`/DROP). Two offline corrections:
+- **Phase A** — pinned the exact PostgreSQL `POSITION(':' IN account_id)` canonical form (no reversed-operand
+  normalizer). Audited every migration-4/5/6 constraint: migration 4's others were empirically confirmed exact
+  by the rolled-back apply (the run reported only the one mismatch); migration 5 = PK + `char_length(btrim())` +
+  `auth.users` FK (standard, proven); migration 6 adds no constraints. Added mutation regressions.
+- **Phase B** — a dedicated, hard-coded **stage-3 re-anchor** (`re-anchor-stage3.mjs` +
+  build/validate/shouldCreate in `release-state.mjs`): a SEPARATE `.release-baseline-stage3.json` (the stage-0
+  baseline is preserved untouched for audit), exclusive/no-overwrite, bound to final HEAD + the corrected
+  manifest fingerprint + all six frozen hashes + approved identity + `anchorStage=3`, digests equal to the
+  manifest pins. It reads under REPEATABLE READ READ ONLY, requires the exact stage-3 ledger (1-3 once each; 4-6
+  absent), the complete 1-3 catalog, 4-6 objects absent, all eight digests == pins, and the control invariants,
+  then ALWAYS ROLLBACK before writing the local baseline. The applier + `ro-prod-check` accept the stage-3
+  baseline ONLY for migrations 4-6; migrations 1-3 stay under the stage-0 baseline; COMMIT_UNKNOWN unchanged.
+
+Verification: node --check (9) OK; release self-tests 111; npm run verify 55/35; git diff --check clean. Next:
+create the stage-3 baseline at final HEAD, `ro-prod-check 3`, then apply 4->5->6 with a check after each.
+DataDoe balance = 0: no create-export; missing-data reports/schedules stay paused until tokens are funded.
