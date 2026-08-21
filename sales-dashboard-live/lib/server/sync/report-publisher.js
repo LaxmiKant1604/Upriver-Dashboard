@@ -244,18 +244,23 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId })
     const refreshedOk = !!shadow && norm(shadow.source_refreshed_at) !== "";
     if (!shadow || !hashOk || !versionOk || !accountOk || !refreshedOk) return { disposition: "invalid-snapshot", ...base };
 
-    // PAYLOAD -- inline, or HYDRATED from the trusted storage pointer. A snapshot with neither an inline
-    // payload nor a readable storage payload is unpublishable (missing/unreadable storage fails CLOSED and
-    // the live LKG stays untouched).
-    let payload = shadow.payload;
-    if (payload == null) {
-      const storagePath = norm(shadow.payload_storage_path);
-      if (!storagePath || typeof loadStoragePayload !== "function") return { disposition: "invalid-snapshot", ...base };
+    // PAYLOAD -- STORAGE-FIRST precedence (round-9 finding 3): a nonblank payload_storage_path is
+    // AUTHORITATIVE and is always hydrated through the trusted loader, EVEN IF an inline payload is also
+    // present (a stale inline can never win over the authoritative storage object). The inline payload is
+    // used ONLY when the storage path is blank. A snapshot with neither a readable storage payload nor (when
+    // the path is blank) an inline payload is unpublishable -- fail CLOSED, the live LKG stays untouched.
+    const storagePath = norm(shadow.payload_storage_path);
+    let payload;
+    if (storagePath) {
+      if (typeof loadStoragePayload !== "function") return { disposition: "invalid-snapshot", ...base };
       try {
         payload = await loadStoragePayload(storagePath);
       } catch (_e) {
         payload = null;
       }
+      if (payload == null) return { disposition: "invalid-snapshot", ...base };
+    } else {
+      payload = shadow.payload;
       if (payload == null) return { disposition: "invalid-snapshot", ...base };
     }
     const payloadOk = !!entry && typeof entry.validatePayload === "function" && entry.validatePayload(payload) === true;

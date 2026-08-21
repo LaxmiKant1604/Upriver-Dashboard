@@ -72,6 +72,12 @@ begin
   if v_job.derive_status = 'succeeded' then
     -- Already durably complete: OBSERVE it (a success/reconcile commit-unknown, or an earlier success).
     if v_job.validated = true and v_job.save_status = 'succeeded' then
+      -- Round-9 finding 1: an already-complete acknowledgement MUST carry the current nonblank
+      -- snapshot_params_hash. A validated success with no hash is incoherent (never a valid completion).
+      if v_job.snapshot_params_hash is null or char_length(btrim(v_job.snapshot_params_hash)) = 0 then
+        return jsonb_build_object('disposition', 'invalid-state', 'derive_status', 'succeeded',
+                                  'save_status', v_job.save_status, 'validated', v_job.validated, 'reason', 'missing-hash');
+      end if;
       return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);
     end if;
     -- succeeded derive but not a validated+saved success (e.g. save-failed): incoherent for a lease.
@@ -138,10 +144,11 @@ begin
   if not found then
     return jsonb_build_object('disposition', 'not-found');
   end if;
-  -- Idempotent: already reconciled to the EXACT same snapshot identity.
+  -- Idempotent: already reconciled to the EXACT same snapshot identity. Round-9 finding 1: ECHO the exact
+  -- snapshot_params_hash so the caller can bind the observed completion to its current derivation.
   if v_job.validated = true and v_job.derive_status = 'succeeded' and v_job.save_status = 'succeeded'
      and v_job.snapshot_params_hash = p_snapshot_params_hash then
-    return jsonb_build_object('disposition', 'already-complete');
+    return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);
   end if;
   -- Round-8: reconcile is meaningful ONLY for a 'running' row. Handle every non-running status explicitly
   -- (never fall through to a success write): failed/skipped are terminal-for-cycle; any other non-running

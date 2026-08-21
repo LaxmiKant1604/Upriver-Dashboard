@@ -55,9 +55,10 @@ import {
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
-  getReportSnapshotStoragePayload,
+  getReportSnapshotStoragePayload, saveShadowSnapshotIfNewer,
 } from "../supabase.js";
 import { paramsHashFor } from "../report-store.js";
+import { assertSnapshotWithinLimit } from "../report-limits.js";
 
 // Round-8 finding 2: a stable canonical JSON so a durable snapshot's content can be proven byte-identical to
 // the freshly derived candidate regardless of key insertion order (arrays keep order; objects sort keys).
@@ -270,6 +271,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // Round-8 finding 2: the trusted storage hydrator for a storage-backed durable snapshot payload, used to
     // validate a recovered snapshot's CONTENT before adoption (a dangling/unreadable object fails closed).
     loadShadowStoragePayload = getReportSnapshotStoragePayload,
+    // Round-9 finding 4: the reviewed atomic freshness/CAS save for a shadow snapshot (a legitimate same-
+    // params refresh replaces older evidence atomically; older/equal-conflicting preserves LKG).
+    saveShadowIfNewer = saveShadowSnapshotIfNewer,
     composeTrancheRuntime = buildSchedulerV2SourceTrancheRuntime,
     replaceHistory = replaceOliHistoryWindow,
     saveSnapshotPayload = saveSourceSnapshotPayload,
@@ -848,48 +852,91 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         rollup.cycleId, snap.productionReportKey, snap.accountId, { leaseSeconds: reportDeriveLeaseSeconds, signal },
       ), { write: true });
       const disp = lease && lease.disposition;
-      if (disp === "already-complete") { note("already-complete"); return { complete: true, newlySaved: false, saved: null, lineage: "already-complete" }; }
+      // Round-9 finding 1: an 'already-complete' observation is a valid completion ONLY when its bound
+      // snapshot hash IS this derivation's current hash; a hash-less or DIFFERENT-hash completion is an
+      // integrity failure for THIS derivation, never a success.
+      if (disp === "already-complete") {
+        if (lease.snapshotParamsHash !== paramsHash) {
+          note("already-complete-hash-mismatch", lease.snapshotParamsHash || "missing");
+          return { complete: false, newlySaved: false, saved: null, lineage: "already-complete-hash-mismatch" };
+        }
+        note("already-complete");
+        return { complete: true, newlySaved: false, saved: null, lineage: "already-complete" };
+      }
+      // Round-9 finding 2: a TOTAL, accurately-resumable classification. held is resumable; terminal,
+      // invalid-state, not-found, invalid-lease and any malformed claim are NON-resumable typed failures.
       if (disp === "held") { note("claim-held"); return { complete: false, newlySaved: false, saved: null, lineage: "claim-held" }; }
       if (disp === "terminal") { note("terminal", lease.deriveStatus); return { complete: false, newlySaved: false, saved: null, lineage: "terminal" }; }
       if ((disp !== "claimed" && disp !== "reclaimed") || !lease.leaseToken) {
-        note("claim-failed", disp || "malformed");
-        return { complete: false, newlySaved: false, saved: null, lineage: "claim-failed" };
+        note("claim-invalid", disp || "malformed");
+        return { complete: false, newlySaved: false, saved: null, lineage: "claim-invalid" };
       }
       const leaseToken = lease.leaseToken;
       const recovered = disp === "reclaimed";
       const entry = REPORT_DERIVATIONS[snap.productionReportKey] || null;
-      // Round-8 finding 2: NEVER adopt a durable snapshot merely because its identity row exists. If a row is
-      // present at our EXACT identity, VALIDATE it fully -- params provenance (stored params recompute to the
-      // hash), exact derivation version + account, storage-backed payload hydrated through the trusted loader
-      // (dangling/unavailable => fail closed), the exact report payload contract, and byte-identical content
-      // vs the freshly derived candidate -- else fail closed with a TYPED conflict/integrity outcome (never
-      // reconcile, never set validated=true). When no row exists, save the fresh candidate once.
+      // Round-8 finding 2 + round-9 finding 3: NEVER adopt a durable snapshot merely because its identity row
+      // exists. Validate the EXACT identity (report_key / account_id / params_hash), params provenance, exact
+      // derivation version + account, hydrate the payload with STORAGE-FIRST precedence (a nonblank
+      // payload_storage_path is authoritative and is always hydrated + validated, even if an inline payload is
+      // also present; inline is used ONLY when the path is blank; dangling/unavailable fail closed), and the
+      // exact report payload contract. Returns { ok, payload } (the authoritative payload) or a typed reason.
+      const shadowKey = snap.reportKey;
       const validateDurableSnapshot = async (row) => {
         const p = row && row.params && typeof row.params === "object" && !Array.isArray(row.params) ? row.params : null;
         if (!p || typeof p.reportVersion !== "string") return { ok: false, reason: "params-missing" };
-        if (String(row.params_hash ?? row.paramsHash) !== paramsHash) return { ok: false, reason: "hash-mismatch" };
+        // Exact returned identity (finding 3): report_key / account_id / params_hash must be THIS identity.
+        if (String(row.report_key ?? row.reportKey) !== shadowKey) return { ok: false, reason: "identity-report-key" };
+        if (String(row.account_id ?? row.accountId) !== String(snap.accountId)) return { ok: false, reason: "identity-account" };
+        if (String(row.params_hash ?? row.paramsHash) !== paramsHash) return { ok: false, reason: "identity-hash" };
         if (!entry || p.reportVersion !== entry.snapshotVersion) return { ok: false, reason: "wrong-version" };
         if (String(p.accountId) !== String(snap.accountId)) return { ok: false, reason: "wrong-account" };
         if (paramsHashFor(p.reportVersion, p) !== paramsHash) return { ok: false, reason: "params-provenance" };
-        let payload = row.payload;
-        if (payload == null) {
-          const path = String(row.payload_storage_path ?? row.payloadStoragePath ?? "").trim();
-          if (!path) return { ok: false, reason: "payload-unavailable" };
+        // STORAGE-FIRST payload precedence (finding 3): the pointer is authoritative when nonblank.
+        const path = String(row.payload_storage_path ?? row.payloadStoragePath ?? "").trim();
+        let payload;
+        if (path) {
           try { payload = await dl.bound("shadow-hydrate", (signal) => loadShadowStoragePayload(path, { signal })); }
           catch (e) { if (dl.isDeadlineError(e)) throw e; payload = null; }
           if (payload == null) return { ok: false, reason: "payload-dangling" };
+        } else {
+          payload = row.payload;
+          if (payload == null) return { ok: false, reason: "payload-unavailable" };
         }
         if (!(entry && typeof entry.validatePayload === "function" && entry.validatePayload(payload) === true)) return { ok: false, reason: "payload-invalid" };
-        if (canonicalJson(payload) !== canonicalJson(snap.payload)) return { ok: false, reason: "content-conflict" };
-        return { ok: true };
+        return { ok: true, payload };
       };
-      const existing = await dl.bound("shadow-read", (signal) => readShadowSnapshot({ reportKey: snap.reportKey, accountId: snap.accountId, paramsHash }, { signal }));
+      const existing = await dl.bound("shadow-read", (signal) => readShadowSnapshot({ reportKey: shadowKey, accountId: snap.accountId, paramsHash }, { signal }));
       let newlySaved = false;
       if (existing) {
         const verdict = await validateDurableSnapshot(existing);
         if (!verdict.ok) {
+          // Integrity/identity failure -> typed NON-resumable conflict (never reconcile, never validated).
           note("snapshot-conflict", verdict.reason);
           return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: verdict.reason };
+        }
+        if (canonicalJson(verdict.payload) !== canonicalJson(snap.payload)) {
+          // Round-9 finding 4: a valid DIFFERENT durable payload for the same identity is not a permanent
+          // block -- route through the reviewed atomic freshness CAS. Our STRICTLY-NEWER validated candidate
+          // atomically replaces older shadow evidence; an OLDER (newer-live) candidate is typed-resumable (a
+          // later invocation reads + validates the newer durable); an EQUAL-but-conflicting candidate
+          // preserves LKG and fails closed non-resumable.
+          const bytes = assertSnapshotWithinLimit(snap.payload);
+          const cas = await dl.bound("shadow-refresh-cas", (signal) => saveShadowIfNewer({
+            reportKey: shadowKey, accountId: snap.accountId, paramsHash, params, payload: snap.payload,
+            payloadBytes: bytes, sourceRefreshedAt: nowIso(),
+          }, { signal }), { write: true });
+          const outcome = cas && cas.outcome;
+          if (outcome === "replaced" || outcome === "inserted") {
+            newlySaved = true; // our newer candidate is now the durable snapshot -> reconcile below.
+          } else if (outcome === "already-current") {
+            // A concurrent identical write landed between our read and CAS -> adopt (no re-save).
+          } else if (outcome === "newer-live") {
+            note("snapshot-newer", "newer-live");
+            return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-newer" };
+          } else {
+            note("snapshot-conflict", outcome || "cas-conflict");
+            return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: outcome || "cas-conflict" };
+          }
         }
       } else {
         const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
@@ -907,10 +954,18 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         note(recovered ? "recovered" : "recorded");
         return { complete: true, newlySaved, saved: newlySaved ? { paramsHash } : null, lineage: recovered ? "recovered" : "recorded" };
       }
-      // lease-lost / snapshot-absent / not-running / not-found: a concurrent worker took over or the snapshot
-      // vanished. NEVER fabricate success.
-      note("reconcile-failed", rdisp || "malformed");
-      return { complete: false, newlySaved, saved: null, lineage: "reconcile-failed" };
+      // Round-9 finding 2: reconcile failures are classified by their ACTUAL state, never blanket-transient.
+      if (rdisp === "lease-lost") { note("reconcile-lease-lost"); return { complete: false, newlySaved, saved: null, lineage: "reconcile-lease-lost" }; }
+      if (rdisp === "snapshot-absent") {
+        // Classify: a snapshot-absent AFTER a clean (known-committed) save this round is an INTEGRITY failure
+        // (the save did not land) -> non-resumable; on the ADOPT path (no save this round) the previously
+        // validated durable snapshot vanished concurrently -> resumable (re-derive + re-save next invocation).
+        if (newlySaved) { note("snapshot-integrity", "absent-after-save"); return { complete: false, newlySaved, saved: null, lineage: "snapshot-integrity" }; }
+        note("reconcile-snapshot-absent", "vanished"); return { complete: false, newlySaved, saved: null, lineage: "reconcile-snapshot-absent" };
+      }
+      // not-found / invalid-state / terminal / malformed reconcile ack -> NON-resumable typed failure.
+      note("reconcile-invalid", rdisp || "malformed");
+      return { complete: false, newlySaved, saved: null, lineage: "reconcile-invalid" };
     };
     try {
       for (const snap of derived.daily.snapshots) {
@@ -964,20 +1019,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         if (r.complete) brandInventory.saved += 1;
       }
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
-    // Round-8 finding 3: an HONEST rollup. derived.skipped stays null ONLY when EVERY report reached a
-    // genuine completion (recorded / recovered / already-complete). If any required lineage item is
-    // incomplete, skipped is a typed non-null and the incomplete items are enumerated; held / reconcile-lost
-    // / transient-claim-failure are RESUMABLE (continuationRequired=true so a later invocation recovers them
-    // WITHOUT any DataDoe export), while a snapshot conflict/integrity failure or a terminal report is a
-    // typed non-resumable incompleteness (the shared cycle honestly stays open -- finalize returns open-work
-    // -- until it is genuinely resolved). A source-only run never fabricates a completed rollup.
+    // Round-8 finding 3 + round-9 finding 2: an HONEST, ACCURATELY-RESUMABLE rollup. derived.skipped stays
+    // null ONLY when EVERY report genuinely completed (recorded / recovered / already-complete). Otherwise
+    // skipped is a typed non-null and the incomplete items are enumerated. ONLY genuinely-recoverable
+    // outcomes set continuationRequired -- a live worker's hold (claim-held), a concurrent takeover
+    // (reconcile-lease-lost), a concurrently-vanished durable snapshot (reconcile-snapshot-absent), and a
+    // newer-durable refresh (snapshot-newer). A terminal report, a claim/reconcile invalid-state, a hash
+    // mismatch, a snapshot integrity/conflict -- all TERMINAL/CONFIGURATION failures -- are NON-resumable
+    // (continuationRequired is NOT set), so they can never create an endless continuation loop. The shared
+    // cycle honestly stays open (finalize returns open-work) until a genuine resolution.
     const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete"]);
-    const RESUMABLE_OUTCOMES = new Set(["claim-held", "reconcile-failed", "claim-failed"]);
+    const RESUMABLE_OUTCOMES = new Set(["claim-held", "reconcile-lease-lost", "reconcile-snapshot-absent", "snapshot-newer"]);
     const incompleteLineage = (rollup.derived.lineage || []).filter((l) => !COMPLETE_OUTCOMES.has(l.outcome));
     if (incompleteLineage.length > 0) {
       rollup.derived.skipped = "lineage-incomplete";
       rollup.derived.incomplete = incompleteLineage.map((l) => ({ reportKey: l.reportKey, accountId: l.accountId, outcome: l.outcome, detail: l.detail ?? null }));
-      if (incompleteLineage.some((l) => RESUMABLE_OUTCOMES.has(l.outcome))) rollup.continuationRequired = true;
+      rollup.derived.resumable = incompleteLineage.some((l) => RESUMABLE_OUTCOMES.has(l.outcome));
+      if (rollup.derived.resumable) rollup.continuationRequired = true;
     } else {
       rollup.derived.skipped = null;
     }

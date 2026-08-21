@@ -42,6 +42,14 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 
 let runtimeMod; let registry; let schema; let dates; let identity; let reportStore;
 
+// Round-9: canonical JSON (sorted object keys, array order preserved) mirroring the runtime's canonicalJson,
+// so the harness freshness-CAS proves content identity the same way the production CAS does.
+function canonJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonJson).join(",") + "]";
+  if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + canonJson(value[k])).join(",") + "}";
+  return JSON.stringify(value === undefined ? null : value);
+}
+
 const PRIM_KEY = ["prim", "key"].join("-");
 const SEC_KEY = ["sec", "key"].join("-");
 const CONNS = [
@@ -250,11 +258,28 @@ function makeStore() {
       });
       return { disposition: "reconciled", snapshot_params_hash: snapshotParamsHash };
     },
-    recordShadowSnapshot({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt }) {
-      reportSnapshots.set(rsKey(reportKey, accountId, paramsHash), { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, source_refreshed_at: sourceRefreshedAt });
+    recordShadowSnapshot({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt, payloadStoragePath = null }) {
+      reportSnapshots.set(rsKey(reportKey, accountId, paramsHash), { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, payload_storage_path: payloadStoragePath, source_refreshed_at: sourceRefreshedAt });
     },
     getShadowSnapshot({ reportKey, accountId, paramsHash }) {
       return reportSnapshots.get(rsKey(reportKey, accountId, paramsHash)) || null;
+    },
+    // Round-9 finding 4: FAITHFUL model of the atomic freshness/CAS shadow save (publishLiveSnapshotIfNewer
+    // on the shadow report_snapshots row): insert-if-absent; a STRICTLY-NEWER candidate replaces older
+    // evidence atomically; an EQUAL-freshness canonically-IDENTICAL candidate is already-current (no write);
+    // an OLDER (newer-live) or EQUAL-but-DIFFERENT candidate preserves LKG (no write).
+    shadowCasIfNewer({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt }) {
+      const k = rsKey(reportKey, accountId, paramsHash);
+      const existing = reportSnapshots.get(k);
+      const put = () => reportSnapshots.set(k, { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, payload_storage_path: null, source_refreshed_at: sourceRefreshedAt });
+      if (!existing) { put(); return { outcome: "inserted" }; }
+      const liveTs = String(existing.source_refreshed_at ?? ""); const candTs = String(sourceRefreshedAt ?? "");
+      if (liveTs === "" || candTs === "") return { outcome: "conflict" };
+      if (liveTs > candTs) return { outcome: "newer-live" };
+      if (liveTs < candTs) { put(); return { outcome: "replaced" }; }
+      // equal freshness: proven-identical content adopts; anything else is a conflict (LKG preserved).
+      if (canonJson(existing.params) === canonJson(params) && canonJson(existing.payload) === canonJson(payload)) return { outcome: "already-current" };
+      return { outcome: "conflict" };
     },
     getReportJob(reportKey, accountId) {
       const rows = [...reportJobs.values()].filter((r) => r.report_key === reportKey && r.account_id === accountId);
@@ -386,6 +411,8 @@ function makeHarness(over = {}) {
     // Round-8 finding 2: the trusted storage hydrator for a storage-backed durable snapshot payload (inline
     // payloads never call it; a storage-backed one that returns null is a dangling object).
     loadShadowStoragePayload: over.loadShadowStoragePayload || (async () => null),
+    // Round-9 finding 4: the atomic freshness CAS shadow save (models publishLiveSnapshotIfNewer).
+    saveShadowIfNewer: over.saveShadowIfNewer || (async (cand) => store.shadowCasIfNewer(cand)),
     // Round-7 finding 1: the default lineage DELEGATES to the store's LEASE model (guarded claim + reconcile
     // bound to the exact durable snapshot) while recording every op + disposition for assertions.
     reportLineage: over.reportLineage || {
@@ -2181,13 +2208,17 @@ async function savedButRunning() {
   const snapshot = store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: rec.paramsHash });
   return { store, hash: rec.paramsHash, snapshot };
 }
-async function recoverWith(store, over = {}) {
-  store._dbClock.now = PAST_LEASE_MS; // the abandoned lease has expired -> a fresh run reclaims.
+async function recoverWith(store, { runtimeNow, ...over } = {}) {
+  store._dbClock.now = PAST_LEASE_MS; // the abandoned lease has expired -> a fresh run reclaims (DB time).
   const h2 = fullFixture({ store, ...over });
+  // The candidate's source_refreshed_at (nowIso) uses the RUNTIME clock, which is SEPARATE from DB lease
+  // time -- so a test can make the fresh candidate newer/older than the durable evidence for the CAS.
+  if (runtimeNow != null) h2.clockRef.now = runtimeNow;
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   return { h2, r2, job: store.getReportJob("daily-reporting", "A01") };
 }
 const conflictOutcome = (r2, reason) => r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "snapshot-conflict" && l.detail === reason);
+const outcomeOf = (r2, rk, a) => (r2.derived.lineage.find((l) => l.reportKey === rk && l.accountId === a) || {}).outcome;
 
 test("Y1. MUTATED params (recomputed hash != stored hash) => typed params-provenance conflict; NEVER validated; finalize stays open-work", async () => {
   const { store, snapshot } = await savedButRunning();
@@ -2233,13 +2264,56 @@ test("Y5. an UNAVAILABLE payload (no inline payload, no storage path) => payload
   assert.ok(conflictOutcome(r2, "payload-unavailable"), "typed payload-unavailable conflict");
 });
 
-test("Y6. an EQUAL-HASH but CONTENT-CONFLICTING snapshot (valid contract, different content) => content-conflict; NEVER validated", async () => {
+test("Y6. round-9 finding 4: an EQUAL-freshness but CONTENT-CONFLICTING durable snapshot preserves LKG (never overwritten, never adopted) => non-resumable typed conflict", async () => {
   const { store, snapshot } = await savedButRunning();
+  const lkg = snapshot.payload;
   snapshot.payload = { ...snapshot.payload, __conflict: "different-content" }; // still contract-valid, but != candidate
+  // recoverWith default: h2's runtime clock == the durable's source_refreshed_at -> EQUAL freshness.
   const { r2, job } = await recoverWith(store);
-  assert.equal(job.validated, false, "an equal-hash conflicting-content snapshot is NEVER adopted");
-  assert.ok(conflictOutcome(r2, "content-conflict"), "typed content-conflict");
+  assert.equal(job.validated, false, "an equal-freshness conflicting-content snapshot is NEVER adopted");
+  assert.ok(conflictOutcome(r2, "conflict"), "typed CAS conflict (equal freshness, different content)");
+  assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: snapshot.params_hash }).payload.__conflict, "different-content", "LKG is PRESERVED (the durable evidence is not overwritten)");
+  assert.equal(r2.derived.resumable, false, "an equal-conflict is NON-resumable (finalize stays open until reviewed)");
   assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "open-work");
+});
+
+test("Y6b. round-9 finding 4: a legitimate NEWER freshly-derived candidate (correction/rerun) atomically REPLACES older shadow evidence and validates", async () => {
+  const { store, snapshot, hash } = await savedButRunning();
+  // The durable snapshot is stale/wrong content; our fresh candidate is the correct derivation.
+  snapshot.payload = { ...snapshot.payload, __stale: "old-evidence" };
+  // Make the fresh candidate strictly NEWER than the durable's source_refreshed_at.
+  const { r2, job } = await recoverWith(store, { runtimeNow: BASE_MS + 10_000_000 });
+  assert.equal(job.validated, true, "a newer validated candidate replaces older evidence and completes");
+  const durable = store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash });
+  assert.ok(!("__stale" in durable.payload), "the stale content was atomically REPLACED by the fresh candidate");
+  assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "recovered", "typed recovered (refreshed) outcome");
+  assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "finalized", "finalize can now terminalize");
+});
+
+test("Y6c. round-9 finding 4: an OLDER candidate never overwrites a newer durable refresh (newer-live) => typed RESUMABLE, LKG preserved", async () => {
+  const { store, snapshot, hash } = await savedButRunning();
+  snapshot.payload = { ...snapshot.payload, __newer: "durable-refresh" };
+  // Make the fresh candidate strictly OLDER than the durable's source_refreshed_at.
+  const { r2, job } = await recoverWith(store, { runtimeNow: BASE_MS - 5_000_000 });
+  assert.equal(job.validated, false, "an older candidate never overwrites/adopts the newer durable");
+  assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "snapshot-newer", "typed snapshot-newer");
+  assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash }).payload.__newer, "durable-refresh", "LKG (the newer durable) is preserved");
+  assert.equal(r2.derived.resumable, true, "newer-live is RESUMABLE (a later invocation reads+validates the newer durable)");
+});
+
+test("Y6d. round-9 finding 4: the atomic freshness CAS converges concurrent writers on the newest timestamp; the older loser preserves LKG", () => {
+  const store = makeStore();
+  const cand = (ts, payload) => ({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: { reportVersion: "v", accountId: "A01" }, payload, sourceRefreshedAt: ts });
+  // Writer A inserts.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:01Z", { v: "A" })).outcome, "inserted");
+  // Writer B (newer) replaces atomically.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:02Z", { v: "B" })).outcome, "replaced");
+  // Writer C (OLDER than the current) is refused; LKG (B) preserved.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:01Z", { v: "C" })).outcome, "newer-live");
+  assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" }).payload.v, "B", "the newest timestamp wins; the older loser never clobbers LKG");
+  // An EQUAL-freshness identical candidate is already-current (no write); a different one is a conflict.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:02Z", { v: "B" })).outcome, "already-current");
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:02Z", { v: "X" })).outcome, "conflict");
 });
 
 test("Y7. an IDENTICAL, fully-valid durable snapshot IS adopted (recovered) without a re-save", async () => {
@@ -2300,8 +2374,9 @@ test("Z2. finding 3: a reconcile LEASE-LOST (concurrent takeover) is NEVER succe
   const h1 = fullFixture({ store, reportLineage: lostLineage });
   const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
   assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "a lease-lost reconcile NEVER records success");
-  assert.ok((r1.derived.incomplete || []).some((x) => x.reportKey === "daily-reporting" && x.accountId === "A01" && x.outcome === "reconcile-failed"), "typed reconcile-failed");
-  assert.ok(r1.derived.skipped != null && r1.continuationRequired === true, "typed-resumable incomplete rollup");
+  assert.ok((r1.derived.incomplete || []).some((x) => x.reportKey === "daily-reporting" && x.accountId === "A01" && x.outcome === "reconcile-lease-lost"), "typed reconcile-lease-lost");
+  assert.ok(r1.derived.skipped != null && r1.continuationRequired === true, "lease-lost is a typed-resumable incomplete rollup");
+  assert.equal(r1.derived.resumable, true);
   assert.notEqual(r1.derived.daily.saved, undefined);
 });
 
@@ -2427,6 +2502,127 @@ test("ZM1. the REAL 20260822 audits clean; mutating any lease/reconcile guard ra
   // Reconcile non-running handling: removing the explicit non-running branch fails.
   const noNonRunning = auditWith822((s) => s.replace(/  if v_job\.derive_status <> 'running' then\n    if v_job\.derive_status in \('failed', 'skipped'\) then\n      return jsonb_build_object\('disposition', 'terminal', 'derive_status', v_job\.derive_status\);\n    end if;\n    return jsonb_build_object\('disposition', 'invalid-state', 'derive_status', v_job\.derive_status,\n                              'save_status', v_job\.save_status, 'validated', v_job\.validated\);\n  end if;\n/, ""));
   assert.ok(has(noNonRunning, "RECONCILE_NONRUNNING_UNHANDLED"), JSON.stringify(noNonRunning.blockers.map((b) => b.code)));
+  // Round-9 finding 1: claim 'already-complete' MUST be hash-bound -- dropping the nonblank-hash guard fails.
+  const noHashGuard = auditWith822((s) => s.replace("      if v_job.snapshot_params_hash is null or char_length(btrim(v_job.snapshot_params_hash)) = 0 then\n        return jsonb_build_object('disposition', 'invalid-state', 'derive_status', 'succeeded',\n                                  'save_status', v_job.save_status, 'validated', v_job.validated, 'reason', 'missing-hash');\n      end if;\n", ""));
+  assert.ok(has(noHashGuard, "CLAIM_LEASE_COMPLETE_HASH_UNBOUND"), JSON.stringify(noHashGuard.blockers.map((b) => b.code)));
+  // Round-9 finding 1: reconcile 'already-complete' MUST echo the hash -- dropping the echo fails.
+  const noEcho = auditWith822((s) => s.replace("    return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);\n  end if;\n  -- Round-8: reconcile is meaningful", "    return jsonb_build_object('disposition', 'already-complete');\n  end if;\n  -- Round-8: reconcile is meaningful"));
+  assert.ok(has(noEcho, "RECONCILE_IDEMPOTENT_MISSING"), JSON.stringify(noEcho.blockers.map((b) => b.code)));
+});
+
+
+group("W. round-9 findings 1/2/3: hash-bound already-complete; accurate resumability; storage-first precedence");
+
+test("W1. finding 1: an 'already-complete' job whose bound hash != this derivation's hash is a typed hash-mismatch, NEVER counted as our completion", async () => {
+  const h1 = fullFixture();
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  const store = h1.store;
+  // Tamper the durable job's snapshot_params_hash so claimLease returns already-complete with a WRONG hash.
+  const j = store._reportJobs.get(r1.cycleId + "|daily-reporting|A01");
+  assert.ok(j && j.validated === true);
+  const realHash = j.snapshot_params_hash;
+  j.snapshot_params_hash = "WRONGHASH_deadbeef";
+  const h2 = fullFixture({ store });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "already-complete-hash-mismatch", "a different-hash completion is a typed mismatch");
+  assert.ok(r2.derived.skipped != null, "the run is honestly incomplete (the mismatch is not counted as complete)");
+  assert.equal(r2.derived.resumable, false, "a hash mismatch is NON-resumable (an integrity failure, not a retry)");
+  assert.notEqual(realHash, "WRONGHASH_deadbeef");
+});
+
+test("W2. finding 1: the wrappers require exact hash binding on already-complete (claim + reconcile) and reject missing/wrong-hash acks", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const realFetch = globalThis.fetch;
+  const stub = (b) => { globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => b, text: async () => "" }); };
+  try {
+    // CLAIM already-complete MUST carry a nonblank snapshot_params_hash.
+    stub({ disposition: "already-complete" });
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "already-complete without hash");
+    stub({ disposition: "already-complete", snapshot_params_hash: "   " });
+    await assert.rejects(() => sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 }), (e) => e.code === "REPORT_LEASE_ACK_INVALID", "already-complete blank hash");
+    stub({ disposition: "already-complete", snapshot_params_hash: "H" });
+    assert.equal((await sb.claimReportDeriveLease("c", "r", "a", { leaseSeconds: 300 })).snapshotParamsHash, "H");
+    // RECONCILE already-complete MUST echo the exact requested hash.
+    stub({ disposition: "already-complete" });
+    await assert.rejects(() => sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" }), (e) => e.code === "REPORT_RECONCILE_ACK_INVALID", "reconcile already-complete missing hash");
+    stub({ disposition: "already-complete", snapshot_params_hash: "OTHER" });
+    await assert.rejects(() => sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" }), (e) => e.code === "REPORT_RECONCILE_ACK_INVALID", "reconcile already-complete wrong hash");
+    stub({ disposition: "already-complete", snapshot_params_hash: "H" });
+    assert.equal((await sb.reconcileReportDeriveSuccess({ cycleId: "c", reportKey: "r", accountId: "a", snapshotParamsHash: "H", leaseToken: "t" })).disposition, "already-complete");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("W3. finding 2: TERMINAL / invalid-state failures are NON-resumable and cannot create an endless continuation loop", async () => {
+  const store = makeStore();
+  // Seed daily/A01 TERMINAL (derive failed) BEFORE our run reaches it: a lineage override returns 'terminal'.
+  const terminalLineage = {
+    upsertReportJob: async (jj) => store.upsertReportJob(jj),
+    claimLease: async (c, rk, a, opts) => {
+      if (rk === "daily-reporting" && a === "A01") return { disposition: "terminal", deriveStatus: "failed" };
+      const res = store.claimLease(c, rk, a, opts);
+      return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+    },
+    reconcileSuccess: async (jj) => { const res = store.reconcileSuccess(jj); return { disposition: res.disposition }; },
+  };
+  const h1 = fullFixture({ store, reportLineage: terminalLineage });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(outcomeOf(r1, "daily-reporting", "A01"), "terminal");
+  assert.ok(r1.derived.skipped != null, "a terminal report makes the rollup incomplete");
+  assert.equal(r1.derived.resumable, false, "a terminal report is NON-resumable");
+  assert.notEqual(r1.continuationRequired, true, "a terminal report does NOT request a continuation (no endless loop)");
+  // A second invocation over the SAME terminal state is ALSO non-resumable -> the caller can never loop forever.
+  const h2 = fullFixture({ store, reportLineage: terminalLineage });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r2.derived.resumable, false);
+  assert.notEqual(r2.continuationRequired, true, "a terminal/configuration failure never becomes resumable on retry");
+});
+
+test("W3b. finding 2: a claim invalid-state (e.g. succeeded+save-failed) is a NON-resumable typed failure", async () => {
+  const store = makeStore();
+  const invalidLineage = {
+    upsertReportJob: async (jj) => store.upsertReportJob(jj),
+    claimLease: async (c, rk, a, opts) => {
+      if (rk === "daily-reporting" && a === "A01") return { disposition: "invalid-state", deriveStatus: "succeeded" };
+      const res = store.claimLease(c, rk, a, opts);
+      return { disposition: res.disposition, leaseToken: res.lease_token || null, snapshotParamsHash: res.snapshot_params_hash || null, deriveStatus: res.derive_status || null };
+    },
+    reconcileSuccess: async (jj) => { const res = store.reconcileSuccess(jj); return { disposition: res.disposition }; },
+  };
+  const h1 = fullFixture({ store, reportLineage: invalidLineage });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(outcomeOf(r1, "daily-reporting", "A01"), "claim-invalid", "invalid-state -> claim-invalid (never a claim)");
+  assert.equal(r1.derived.resumable, false, "a claim invalid-state is NON-resumable");
+});
+
+test("W4. finding 3: STORAGE-FIRST precedence -- a nonblank pointer is authoritative even when inline is present; a stale inline can never win", async () => {
+  const { store, snapshot, hash } = await savedButRunning();
+  const good = JSON.parse(JSON.stringify(snapshot.payload)); // the correct content the candidate will re-derive
+  // Tamper the INLINE payload but point payload_storage_path at the GOOD content: storage-first must ignore
+  // the stale inline and hydrate + validate + adopt the authoritative storage object.
+  snapshot.payload = { ...snapshot.payload, __stale_inline: "ignored" };
+  snapshot.payload_storage_path = "report-snapshots/v2/good.json";
+  const { r2, job } = await recoverWith(store, { loadShadowStoragePayload: async () => good });
+  assert.equal(job.validated, true, "the AUTHORITATIVE storage object (not the stale inline) was adopted -> validated");
+  assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "recovered");
+});
+
+test("W4b. finding 3: a DANGLING pointer fails closed even when an inline payload is also present", async () => {
+  const { store, snapshot } = await savedButRunning();
+  snapshot.payload = { ...snapshot.payload }; // a present (valid) inline...
+  snapshot.payload_storage_path = "report-snapshots/v2/orphan.json"; // ...but the pointer is authoritative
+  const { r2, job } = await recoverWith(store, { loadShadowStoragePayload: async () => null });
+  assert.equal(job.validated, false, "a dangling authoritative pointer fails closed (the inline can NOT stand in)");
+  assert.ok(conflictOutcome(r2, "payload-dangling"), "typed payload-dangling");
+});
+
+test("W4c. finding 3: a WRONG-ROW identity (report_key/account_id/params_hash mismatch) is a typed identity conflict", async () => {
+  const { store } = await savedButRunning();
+  store._dbClock.now = PAST_LEASE_MS;
+  // readShadowSnapshot returns a row whose report_key is a DIFFERENT identity.
+  const h2 = fullFixture({ store, readShadowSnapshot: async ({ accountId, paramsHash }) => ({ report_key: "scheduler-v2/OTHER-REPORT", account_id: accountId, params_hash: paramsHash, params: { reportVersion: "daily-reporting/v2d-3", accountId }, payload: { rows: [], brandFiltered: false, adsAvailability: { status: "ok" } }, source_refreshed_at: "2026-08-22T00:00:00Z" }) });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "a wrong-row snapshot never validates");
+  assert.ok(conflictOutcome(r2, "identity-report-key"), "typed identity-report-key conflict");
 });
 
 

@@ -1100,6 +1100,13 @@ function auditClaimReportLeaseFunction(clean, masked, fnName) {
   if (!/'already-complete'/i.test(C) || !/validated\s*=\s*true/i.test(M)) {
     problems.push({ code: "CLAIM_LEASE_COMPLETE_GUARD_MISSING", reason: "does not observe an already-complete (validated) job instead of re-claiming" });
   }
+  // Round-9 finding 1: an 'already-complete' acknowledgement MUST carry the current snapshot_params_hash, and
+  // a validated success with a null/blank hash must be refused (never a hash-less completion).
+  const completeHashBound = /'already-complete'\s*,\s*'snapshot_params_hash'/i.test(C)
+    && /char_length\(btrim\(v_job\.snapshot_params_hash\)\)\s*=\s*0/i.test(M);
+  if (!completeHashBound) {
+    problems.push({ code: "CLAIM_LEASE_COMPLETE_HASH_UNBOUND", reason: "does not bind 'already-complete' to a nonblank snapshot_params_hash (a hash-less validated success is refused)" });
+  }
   // Round-8: current time must be DATABASE-authoritative. The body must use now()/clock_timestamp() (captured
   // once as v_now), the lease expiry must derive from that DB time, and NO caller-time parameter (p_now) may
   // exist -- a caller clock skew could otherwise steal or distort a lease.
@@ -1176,8 +1183,9 @@ function auditReconcileReportSuccessFunction(clean, masked, fnName) {
   if (!flips) {
     problems.push({ code: "RECONCILE_SUCCESS_MISSING", reason: "does not flip an EXACTLY-running row to succeeded/validated bound to p_snapshot_params_hash ('reconciled')" });
   }
-  if (!/'already-complete'/i.test(C)) {
-    problems.push({ code: "RECONCILE_IDEMPOTENT_MISSING", reason: "is not idempotent on an already-complete identical snapshot identity" });
+  // Round-9 finding 1: the idempotent 'already-complete' MUST echo the snapshot_params_hash it observed.
+  if (!/'already-complete'\s*,\s*'snapshot_params_hash'/i.test(C)) {
+    problems.push({ code: "RECONCILE_IDEMPOTENT_MISSING", reason: "is not idempotent (or does not echo snapshot_params_hash) on an already-complete identical snapshot identity" });
   }
   // Round-8: a non-running row must be handled explicitly (terminal for failed/skipped; 'invalid-state'
   // otherwise) -- never fall through to a success write.

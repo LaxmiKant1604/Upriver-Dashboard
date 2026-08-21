@@ -1697,6 +1697,11 @@ export async function claimReportDeriveLease(cycleId, reportKey, accountId, { le
   if (disposition !== "claimed" && disposition !== "reclaimed" && leaseToken != null) {
     throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", value, `disposition '${disposition}' unexpectedly carries a lease_token`);
   }
+  // Round-9 finding 1: an 'already-complete' acknowledgement MUST carry a nonblank snapshot_params_hash so the
+  // runtime can bind the observed completion to its CURRENT derivation (never a hash-less false completion).
+  if (disposition === "already-complete" && !isNonblankString(snapshotParamsHash)) {
+    throwAckInvalid("claim_report_derive_lease", "REPORT_LEASE_ACK_INVALID", value, "'already-complete' without a nonblank snapshot_params_hash");
+  }
   return { disposition, leaseToken, snapshotParamsHash, deriveStatus: typeof value.derive_status === "string" ? value.derive_status : null };
 }
 
@@ -1717,9 +1722,11 @@ export async function reconcileReportDeriveSuccess({ cycleId, reportKey, account
   if (typeof disposition !== "string" || !RECONCILE_DISPOSITIONS.has(disposition)) {
     throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", value, "disposition not in the known set");
   }
-  // Disposition-dependent field exactness: 'reconciled' MUST echo the exact snapshot_params_hash it committed.
-  if (disposition === "reconciled" && value.snapshot_params_hash !== snapshotParamsHash) {
-    throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", value, "'reconciled' did not echo the exact snapshot_params_hash");
+  // Round-9 finding 1: disposition-dependent field exactness -- BOTH 'reconciled' AND 'already-complete' MUST
+  // echo the exact snapshot_params_hash the caller committed/observed (an idempotent already-complete binds
+  // the observed success to THIS derivation's hash; anything else is a false completion).
+  if ((disposition === "reconciled" || disposition === "already-complete") && value.snapshot_params_hash !== snapshotParamsHash) {
+    throwAckInvalid("reconcile_report_derive_success", "REPORT_RECONCILE_ACK_INVALID", value, `'${disposition}' did not echo the exact snapshot_params_hash`);
   }
   return { disposition };
 }
@@ -2156,7 +2163,7 @@ function canonicalJsonString(value) {
  * Touches ONLY the one (report_key, account_id, params_hash) row -- never another account/report. Throws on
  * transport failure (the caller maps it to a typed safe disposition).
  */
-export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt }) {
+export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt }, { signal = null } = {}) {
   const candTs = String(sourceRefreshedAt ?? "").trim();
   const candParams = params || {};
   const candPayload = payload == null ? null : payload;
@@ -2173,6 +2180,7 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
   // 1) INSERT-IF-ABSENT. Only inserts when the natural-key row does not yet exist.
   const inserted = await request("/rest/v1/report_snapshots?on_conflict=report_key,account_id,params_hash", {
     method: "POST",
+    signal,
     headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
     body,
   });
@@ -2187,7 +2195,7 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
       params_hash: `eq.${paramsHash}`,
       limit: "1",
     });
-    const rows = await request(`/rest/v1/report_snapshots?${q}`);
+    const rows = await request(`/rest/v1/report_snapshots?${q}`, { signal });
     return Array.isArray(rows) && rows[0] ? rows[0] : null;
   };
   const live = await readLive();
@@ -2205,7 +2213,7 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
     let livePayload = row.payload;
     if (livePayload == null && String(row.payload_storage_path ?? "").trim() !== "") {
       try {
-        livePayload = await getReportSnapshotStoragePayload(String(row.payload_storage_path).trim());
+        livePayload = await getReportSnapshotStoragePayload(String(row.payload_storage_path).trim(), { signal });
       } catch (_e) {
         return { outcome: "conflict" }; // unreadable live storage -> cannot prove identity -> no write
       }
@@ -2228,6 +2236,7 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
     });
     const replaced = await request(`/rest/v1/report_snapshots?${filter}`, {
       method: "PATCH",
+      signal,
       headers: { Prefer: "return=representation" },
       body: { params: candParams, payload: candPayload, payload_storage_path: null, payload_bytes: body.payload_bytes, source_refreshed_at: sourceRefreshedAt },
     });
@@ -2237,6 +2246,18 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
     return classifyNonOlder(live2);
   }
   return classifyNonOlder(live);
+}
+
+// Round-9 finding 4: the SAME reviewed atomic freshness/CAS primitive applied to a SHADOW report_snapshots
+// row (scheduler-v2/<reportKey>). A shadow snapshot lives in the same report_snapshots table, so the source
+// runtime uses this to save/refresh a durable shadow snapshot safely: insert-if-absent, an EQUAL-freshness
+// canonically-IDENTICAL candidate is 'already-current' (adopt, zero write), a STRICTLY-NEWER validated
+// candidate atomically REPLACES older shadow evidence ('replaced'/'inserted'), and an OLDER or
+// equal-but-CONFLICTING candidate preserves the last-known-good ('newer-live'/'conflict', zero write). It
+// never permanently blocks a legitimate same-params refresh, and concurrent writers converge on the newest
+// timestamp with no blind overwrite.
+export async function saveShadowSnapshotIfNewer(candidate, opts = {}) {
+  return publishLiveSnapshotIfNewer(candidate, opts);
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per
