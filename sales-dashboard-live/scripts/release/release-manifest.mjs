@@ -214,8 +214,10 @@ async function rows(q, text, params) { const r = await q(text, params || []); re
 async function one(q, text, params) { const r = await rows(q, text, params); return r[0] || null; }
 async function tableExists(q, name) { const r = await one(q, "select to_regclass($1) r", [`public.${name}`]); return !!(r && r.r); }
 async function funcExists(q, sig) { const r = await one(q, "select to_regprocedure($1) r", [sig]); return !!(r && r.r); }
-async function columnExists(q, table, col) { return !!(await one(q, "select 1 from pg_attribute where attrelid=$1::regclass and attname=$2 and attnum>0 and not attisdropped", [`public.${table}`, col])); }
-async function constraintExists(q, table, name) { return !!(await one(q, "select 1 from pg_constraint where conrelid=$1::regclass and conname=$2", [`public.${table}`, name])); }
+// NOTE: `$1::regclass` throws 42P01 when the table is absent, so guard with to_regclass first (a not-yet-
+// created altered table -- e.g. source_batch_membership before M2 -- must resolve to "absent", not crash).
+async function columnExists(q, table, col) { if (!(await tableExists(q, table))) return false; return !!(await one(q, "select 1 from pg_attribute where attrelid=$1::regclass and attname=$2 and attnum>0 and not attisdropped", [`public.${table}`, col])); }
+async function constraintExists(q, table, name) { if (!(await tableExists(q, table))) return false; return !!(await one(q, "select 1 from pg_constraint where conrelid=$1::regclass and conname=$2", [`public.${table}`, name])); }
 
 function checkConstraint(P, table, name, kind, def, spec) {
   if (spec.enum) { const s = enumSet(canonTight(def), spec.enum.col); if (!s) P.push(`${table} ${name}: no value set for ${spec.enum.col}`); else if (!setEq([...s], spec.enum.values)) P.push(`${table} ${name} values {${[...s]}} != {${spec.enum.values}}`); return; }

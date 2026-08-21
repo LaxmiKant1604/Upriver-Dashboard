@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   validateIdentity, verifyTable, verifyFunction, verifyTriggers, verifyTableAcl, verifyPolicies, verifyIndexes,
-  APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
+  verifyMigrationAbsent, APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
 } from "./release-manifest.mjs";
 import {
   verifyLedgerForStage, verifyApprovedInvariants, compareProtectedDigest, requirePinnedStage0Digest,
@@ -223,6 +223,15 @@ test("runApply: valid pre-checks -> client IS constructed", async () => {
   let made = 0;
   await runApply({ filename: NEW6[0], sqlText: "X", actualSha: MIGRATIONS[0].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(good), _validate: () => [], makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS });
   assert.equal(made, 1, "client is constructed once when every pre-connect check passes");
+});
+
+// ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
+test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {
+  // M4 (index 3) ALTERs source_batch_membership; at stage 0 that table does not exist yet. to_regclass/
+  // to_regprocedure resolve to null (absent) so columnExists/constraintExists must short-circuit, not throw.
+  const q = fakeQ([["to_regclass($1)", () => [{ r: null }]], ["to_regprocedure($1) r", () => [{ r: null }]]]);
+  assert.deepEqual(await verifyMigrationAbsent(q, MIGRATIONS[3]), []);
+  assert.deepEqual(await verifyMigrationAbsent(q, MIGRATIONS[5]), []); // M6 ALTERs sync_report_jobs columns
 });
 
 // ---------- read consistency -----------------------------------------------------------------------------
