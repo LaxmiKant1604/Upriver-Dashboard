@@ -10565,3 +10565,18 @@ on the brand-sales skew + reconciled 8-dataset count/hash before pinning + Migra
 STOP for Codex review. Offline read-only only; pins UNCHANGED; NOT pushed; migrations 20260817-20260822
 UNAPPLIED; the reconciliation runner was the ONLY production read (zero writes); nothing deployed/enabled/
 scheduled/published; dfca8f75 untouched.
+
+## Invariants-only read-only pass + 42P01 checker fix -- OFFLINE 2026-08-21 (code 4bf2718)
+
+Reconciliation runner's single pass 57014-timed-out before its invariants section, so ran a lightweight
+invariants-only read-only pass (ledger + new-6-absent + control/dfca/children; no payload fetch/digest).
+FIX (4bf2718): columnExists/constraintExists used $1::regclass which throws 42P01 when the table is absent =>
+verifyMigrationAbsent crashed at stage 0 (source_batch_membership, made by M2, doesn't exist yet). Guarded with
+to_regclass first; regression added (M4/M6); self-tests 80; verify 55/35. INVARIANTS: LEDGER(stage0) PASS;
+OBJECTS(new6 absent) PASS; control PASS (rollout enabled IN account, all_primary=false, 4 approvals, 13 settings
+4en/9dis, cron 0); dfca8f75 CHILD PASS (source 122=8/9/4/101, max create_export=1 zero>1, 8 report jobs all
+pending/pending); dfca8f75 CYCLE 1 FAIL -- cycle-column report_total=0 in prod vs pinned 8 (rest of cycle matches).
+"reports 8" in Appendix AB is the CHILD report-job count (passes), NOT the cycle report_total column (0 for a
+running cycle pre-rollup) -- pin report_total=8 is a likely mis-encoding. Pin left UNCHANGED per decision gate;
+escalated for runbook confirmation. Additional STOP reason alongside contract-invalid brand-sales (Appendix AX).
+Offline read-only only; no pins changed; not pushed; migrations UNAPPLIED; zero writes.

@@ -5167,3 +5167,32 @@ fetch.
 
 **STOP for Codex review.** Code `806a498`, docs `<this commit>`; pins UNCHANGED; NOT pushed; migrations
 20260817–20260822 UNAPPLIED; the read-only reconciliation was the ONLY production read (zero writes).
+
+## Appendix AY — Invariants-only read-only pass + 42P01 checker fix (OFFLINE, 2026-08-21; code `4bf2718`)
+
+The reconciliation runner's single pass timed out (SQLSTATE 57014) on the heavy per-row payload fetch before
+its invariants section completed, so a lightweight **invariants-only** read-only pass (ledger + new-6-absent +
+control/dfca/children; no payload fetch, no digest string_agg) was run to capture the invariant results.
+
+**Checker fix (committed `4bf2718`):** `columnExists`/`constraintExists` used `$1::regclass`, which throws
+SQLSTATE **42P01** when the table does not exist yet — so `verifyMigrationAbsent` **crashed at stage 0** in
+production the moment it checked an ALTER against a not-yet-created table (`source_batch_membership`, created by
+Migration 2). Now both guard with `to_regclass` first, so an absent altered table resolves to "absent" rather
+than crashing. Regression added (M4 `source_batch_membership`, M6 `sync_report_jobs`); self-tests **80**.
+
+**Invariant results (read-only, in-snapshot):**
+- `LEDGER(stage0)`: **PASS** (12 baseline recorded; the six new migrations not present).
+- `OBJECTS(new-6 absent)`: **PASS** (none of the six new migrations' objects exist).
+- Control invariants: **PASS** — rollout row enabled IN account, `all_primary=false`, 4 IN approvals, 13 settings
+  (4 enabled / 9 disabled), `cron.job` count 0.
+- dfca8f75 **child** state: **PASS** — source jobs 122 = 8 succeeded / 9 failed / 4 attempted / 101 pending,
+  `max(create_export_count)=1` with zero rows > 1; 8 report jobs all pending/pending.
+- dfca8f75 **cycle** counters: **1 FAIL** — the cycle-column `report_total` is **0** in production, but the pin
+  is **8**. Everything else on the cycle matches (`status=running`, `source_total=122`, `source_succeeded=8`,
+  `source_failed=9`, `report_succeeded=0`, `report_failed=0`, `finished_at=null`).
+
+**Interpretation:** Appendix AB's "reports 8" is the **child report-job count** (which PASSES), not the cycle's
+`report_total` counter column, which a running cycle leaves at 0 until roll-up. The pin `report_total=8` appears
+to be a mis-encoding of the child count. **Pin left UNCHANGED** per the decision gate ("do not change pins to
+match current state"); escalated to the runbook owner to confirm the correct cycle-column value (0) before
+re-pinning. This is an additional STOP reason alongside the contract-invalid `brand-sales` rows (Appendix AX).
