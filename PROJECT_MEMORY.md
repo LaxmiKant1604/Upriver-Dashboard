@@ -10526,3 +10526,24 @@ resumability. Hardening 104; verify 55/35.
 STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
 (blob 7c987c17) byte-UNCHANGED + PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/
 enabled/scheduled/published; cycle dfca8f75 untouched.
+
+## Release package (manifest-pinned baseline + read-only digest diagnostic) -- OFFLINE on main 2026-08-21 (code+tests 02289d8, docs separate); verify green 55/35; NOT deployed
+
+Tracked single-file migration release tooling under scripts/release/ (Appendix AW). Pinned identity
+(ref+host+port+db) validated before connecting; applier validates everything (allowlist, frozen SHA-256,
+identity, manifest-pinned baseline) BEFORE constructing pg.Client; phase-tracked txn + distinct COMMIT_UNKNOWN
+(exit 3, never rollback/retry). Semantically-exact catalog checks (canonical constraint bodies AND/OR preserved;
+PK/FK ordered cols+ref+action; exact index sets; USING/WITH CHECK policies; tgfoid-by-OID; aclexplode incl PG17
+MAINTAIN). Control state pinned exactly (rollout d658442d.../enabled, all_primary=false, 4 approvals, 13
+settings) + dfca8f75 cycle (running; source 122=8/9/4/101, max create_export=1; 8 report jobs all
+pending/pending). Protected digests use runbook algo md5(string_agg(md5(row::text), ',' ORDER BY natural_key)),
+manifest-pinned for ALL 8 (buildBaseline uses pins only; validateBaseline/requirePinnedStage0Digest require the
+exact key set + count/hash). Self-tests 79.
+
+CRITICAL BLOCKER: the authorized read-only digest diagnostic (REPEATABLE READ READ ONLY) shows NEITHER algorithm
+reproduces the pinned Appendix-AI pairs AND the counts differ -- observed live=183 (pinned 176), shadow=48
+(pinned 26). Pinned values NOT changed; the 6 control-table digests stay null/fail-closed. Awaits Codex/runbook
+reconciliation (stale Appendix AI vs grown production, or different scope) before stage-0 baseline + apply.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 20260817-20260822 UNAPPLIED; the read-only digest
+diagnostic was the ONLY production read (zero writes); nothing deployed/enabled/scheduled/published.

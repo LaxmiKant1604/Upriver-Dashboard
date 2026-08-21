@@ -5106,3 +5106,34 @@ proof that durable lineage never merge-upserts (regression 5).
 
 **STOP for Codex re-review.** Code+tests `21d30d3`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AW — Release package: manifest-pinned baseline + read-only digest diagnostic (OFFLINE, 2026-08-21; code+tests `02289d8`; docs `<this commit>`; NOT deployed)
+
+Tracked single-file migration release tooling under `scripts/release/` (applier, stage-aware checker,
+manifest+engine, fs helper, read-only digest diagnostic, 79-test offline self-test). All OFFLINE-safe; no
+secrets/machine-specific paths; `npm run verify` 55/35 green; `git diff --check` clean. Migrations 20260817–
+20260822 remain UNAPPLIED.
+
+Hardening: pinned identity (project ref + exact host/port/db) validated before connecting; the applier completes
+ALL validation (allowlist, frozen SHA-256, identity, manifest-pinned baseline) BEFORE constructing a
+`pg.Client`, with phase-tracked transactions and a distinct `COMMIT_UNKNOWN` (exit 3, never rollback/retry).
+Catalog verification is semantically exact (ordered column vectors; complete canonical constraint bodies with
+AND/OR preserved; PK/FK ordered columns + referenced table/columns + on-delete; exact index sets incl ordered
+columns/uniqueness/access-method/predicate; permissive/USING/WITH CHECK policies; `tgfoid`-by-OID triggers;
+`aclexplode` ACLs incl PG17 MAINTAIN). Control state is pinned exactly (rollout, `all_primary`, four approvals,
+13 report_sync_settings) plus the `dfca8f75` cycle AND its durable child state (122 source jobs = 8/9/4/101,
+`max(create_export_count)=1`, 8 report jobs all `derive_status=pending` + `save_status=pending`). Protected
+digests use the runbook algorithm `md5(string_agg(md5(row::text), ',' ORDER BY natural_key))` and are
+manifest-pinned for ALL eight datasets; `buildBaseline` uses manifest pins only; `validateBaseline` /
+`requirePinnedStage0Digest` require the exact key set and every count/hash, rejecting missing/extra/edited/
+observed-different.
+
+**BLOCKER escalated (do not proceed):** the one authorized read-only diagnostic (`BEGIN ISOLATION LEVEL
+REPEATABLE READ READ ONLY`; `ROLLBACK` in finally) shows NEITHER the old nor the runbook algorithm reproduces
+the pinned Appendix-AI pairs, and the **counts themselves differ** — observed live=183 (pinned 176), shadow=48
+(pinned 26). The pinned values were **NOT changed**; the six control-table digests remain `null`/fail-closed
+(never pinned to arbitrary current state). This must be reconciled by Codex/the runbook owner (stale Appendix AI
+vs. grown production, or a different scope/algorithm) before stage-0 baseline creation and migration application.
+
+**STOP for Codex re-review.** Code+tests `02289d8`, docs `<this commit>`; NOT pushed; migrations UNAPPLIED;
+nothing deployed/scheduled/published; the read-only digest diagnostic was the only production read.
