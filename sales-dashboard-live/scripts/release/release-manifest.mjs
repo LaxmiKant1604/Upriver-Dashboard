@@ -201,6 +201,22 @@ export const MIGRATIONS = [
 ];
 
 export const NEW6 = MIGRATIONS.map((m) => m.file);
+
+// Stage-aware CUMULATIVE constraint model: a constraint that a LATER migration's ALTER adds to a table an
+// EARLIER migration created (here: source_batch_membership_account_canonical, owned by 20260820, on
+// source_batch_membership which 20260817 created). verifyTable(the earlier table) must EXPECT that constraint
+// once its OWNING migration is applied (ownerIndex < stage) and REJECT it before (premature). The owning
+// migration's ALTER check still validates the constraint's exact kind + complete body. This is NOT a blanket
+// "allow any extra": only these explicitly-owned constraints are permitted, and only at/after their owner stage.
+export const ALTER_ADDED_CONSTRAINTS = Object.freeze(
+  MIGRATIONS.flatMap((mig, i) => (mig.alters || []).flatMap((alt) => (alt.addConstraints || []).map(([name]) => Object.freeze({ table: alt.table, name, ownerIndex: i })))),
+);
+// The exact extra-constraint names per table that MUST be present at `stage` (i.e. the owning migration applied).
+export function cumulativeAlterConstraints(stage) {
+  const byTable = {};
+  for (const c of ALTER_ADDED_CONSTRAINTS) if (c.ownerIndex < stage) (byTable[c.table] = byTable[c.table] || []).push(c.name);
+  return byTable;
+}
 // Pre-existing tables ALTERED by these migrations (blocker 3): digest a projection EXCLUDING the added columns.
 export const ALTERED_TABLE_PROJECTIONS = Object.freeze({ sync_report_jobs: ["derive_lease_token", "derive_lease_expires_at", "derive_attempt_count"] });
 export const BASELINE = Object.freeze(["20260728_shared_dashboard.sql", "20260729_automated_ads_sync.sql", "20260729_dashboard_auth_and_access.sql", "20260803_fx_rate_cache.sql", "20260805_scheduled_sync.sql", "20260806_shared_source_export_cache.sql", "20260807_scheduler_v2.sql", "20260810_ads_sync_coverage.sql", "20260810_report_sync_controls.sql", "20260811_sync_source_job_owners.sql", "20260815_sync_cycle_finalize.sql", "20260816_account_rollout.sql"]);
@@ -240,7 +256,7 @@ function checkConstraint(P, table, name, kind, def, spec) {
   if (bodyCanon(def) !== want) P.push(`${table} ${name} body "${bodyCanon(def)}" != "${want}"`);
 }
 
-export async function verifyTable(q, t) {
+export async function verifyTable(q, t, extraConstraints = []) {
   const P = [];
   if (!(await tableExists(q, t.name))) return [`table public.${t.name} absent`];
   const cols = await rows(q, `select a.attname, format_type(a.atttypid,a.atttypmod) typ, a.attnotnull nn, pg_get_expr(ad.adbin, ad.adrelid) def from pg_attribute a left join pg_attrdef ad on ad.adrelid=a.attrelid and ad.adnum=a.attnum where a.attrelid=$1::regclass and a.attnum>0 and not a.attisdropped order by a.attnum`, [`public.${t.name}`]);
@@ -255,7 +271,10 @@ export async function verifyTable(q, t) {
     else if (canonTight(c.def) !== canonTight(def)) P.push(`${t.name}.${name} default ${c.def} != ${def}`);
   }
   const cons = await rows(q, "select conname, contype, pg_get_constraintdef(oid) def from pg_constraint where conrelid=$1::regclass", [`public.${t.name}`]);
-  if (!setEq(cons.map((c) => c.conname), t.constraints.map((x) => x[0]))) P.push(`${t.name} constraint set {${cons.map((c) => c.conname).sort()}} != {${t.constraints.map((x) => x[0]).sort()}}`);
+  // Exact CUMULATIVE set: the table's own constraints PLUS the stage-due ALTER-added constraints (extraConstraints).
+  // A missing base OR missing due-extra fails; any unknown extra (incl. a premature ALTER-added one) fails.
+  const expectConstraintNames = [...t.constraints.map((x) => x[0]), ...extraConstraints];
+  if (!setEq(cons.map((c) => c.conname), expectConstraintNames)) P.push(`${t.name} constraint set {${cons.map((c) => c.conname).sort()}} != {${expectConstraintNames.slice().sort()}}`);
   const conByName = new Map(cons.map((c) => [c.conname, c]));
   for (const [name, kind, spec] of t.constraints) {
     const c = conByName.get(name); if (!c) { P.push(`${t.name} constraint ${name} missing`); continue; }
@@ -367,9 +386,9 @@ async function verifySeed(q, table, seed) {
   return P;
 }
 
-export async function verifyMigrationPresent(q, mig) {
+export async function verifyMigrationPresent(q, mig, extraConstraintsByTable = {}) {
   const P = [];
-  for (const t of mig.tables) P.push(...await verifyTable(q, t));
+  for (const t of mig.tables) P.push(...await verifyTable(q, t, extraConstraintsByTable[t.name] || []));
   for (const fn of mig.functions) P.push(...await verifyFunction(q, fn));
   for (const alt of mig.alters || []) {
     for (const [name, type, notnull, def] of alt.addColumns || []) {

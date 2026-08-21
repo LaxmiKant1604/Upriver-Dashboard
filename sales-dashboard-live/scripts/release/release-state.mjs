@@ -1,7 +1,7 @@
 // Ledger/stage + pinned control-state invariants + protected digests (runbook algorithm) + manifest-pinned
 // baseline + phase-tracked applier + validate-before-connect runner. Pure over injected q/client; testable.
 
-import { MIGRATIONS, NEW6, BASELINE, BASELINE_VERSION, APPROVED_IDENTITY, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, ALTERED_TABLE_PROJECTIONS, validateIdentity, verifyMigrationPresent, verifyMigrationAbsent } from "./release-manifest.mjs";
+import { MIGRATIONS, NEW6, BASELINE, BASELINE_VERSION, APPROVED_IDENTITY, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, ALTERED_TABLE_PROJECTIONS, cumulativeAlterConstraints, validateIdentity, verifyMigrationPresent, verifyMigrationAbsent } from "./release-manifest.mjs";
 
 async function rows(q, text, params) { const r = await q(text, params || []); return r && r.rows ? r.rows : []; }
 async function one(q, text, params) { const r = await rows(q, text, params); return r[0] || null; }
@@ -30,8 +30,11 @@ export async function verifyLedgerForStage(q, stage) {
 
 export async function verifyStageObjects(q, stage) {
   const P = [];
+  // The exact cumulative extra-constraint set for this stage: an ALTER-added constraint is REQUIRED on its base
+  // table once its owning migration is applied (ownerIndex < stage), and REJECTED as premature before that.
+  const extrasByTable = cumulativeAlterConstraints(stage);
   for (let i = 0; i < MIGRATIONS.length; i++) {
-    if (i < stage) P.push(...(await verifyMigrationPresent(q, MIGRATIONS[i])).map((m) => `[applied ${NEW6[i]}] ${m}`));
+    if (i < stage) P.push(...(await verifyMigrationPresent(q, MIGRATIONS[i], extrasByTable)).map((m) => `[applied ${NEW6[i]}] ${m}`));
     else P.push(...(await verifyMigrationAbsent(q, MIGRATIONS[i])).map((m) => `[unapplied ${NEW6[i]}] ${m}`));
   }
   return P;
@@ -204,6 +207,43 @@ export function validateStage3Baseline(baseline, { currentHead, currentFingerpri
 }
 export function shouldCreateStage3Baseline({ problemCount, rolledBack }) { return problemCount === 0 && rolledBack === true; }
 
+// ---- DEDICATED stage-4 re-anchor baseline (forward-only recovery from an APPLIED stage 4) -----------------
+// A SEPARATE hard-coded artifact (anchorStage=4) governing ONLY migrations 5-6. The stage-0 and stage-3
+// baselines are preserved untouched for audit. NOT generalized to arbitrary stages. buildStage4Baseline uses
+// manifest-pinned values ONLY (never arbitrary current state).
+export function buildStage4Baseline({ head, fingerprint, pins = PROTECTED_DIGESTS }) {
+  return {
+    version: BASELINE_VERSION, projectRef: APPROVED_IDENTITY.projectRef, head, manifestFingerprint: fingerprint,
+    migrationHashes: Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])), anchorStage: 4,
+    protectedDigest: Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k) => [k, pins[k]])), // manifest-pinned values ONLY
+  };
+}
+// Validate the reviewed stage-4 baseline. Rejects: anchorStage != exactly 4; wrong project/head/fingerprint;
+// migration-hash drift; edited/missing/extra/unpinned protected digest; and (on an APPLY) a migration whose
+// stage precedes the anchor (stageIdx < 4 -- migrations 1-4 are NOT governed here).
+export function validateStage4Baseline(baseline, { currentHead, currentFingerprint, envRef, stageIdx, pins = PROTECTED_DIGESTS } = {}) {
+  const P = [];
+  if (!baseline || typeof baseline !== "object") return ["stage-4 baseline malformed (not an object)"];
+  if (baseline.version !== BASELINE_VERSION) P.push(`stage-4 baseline version ${baseline.version} != ${BASELINE_VERSION}`);
+  if (baseline.anchorStage !== 4) P.push(`stage-4 baseline anchorStage ${baseline.anchorStage} != 4`);
+  if (baseline.projectRef !== APPROVED_IDENTITY.projectRef) P.push(`stage-4 baseline projectRef ${baseline.projectRef} != approved`);
+  if (envRef != null && baseline.projectRef !== envRef) P.push(`stage-4 baseline projectRef != current env ref ${envRef} (environment switched)`);
+  if (baseline.head !== currentHead) P.push(`stage-4 baseline HEAD ${baseline.head} != current HEAD ${currentHead}`);
+  if (baseline.manifestFingerprint !== currentFingerprint) P.push("stage-4 baseline manifest fingerprint stale");
+  if (JSON.stringify(baseline.migrationHashes) !== JSON.stringify(Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])))) P.push("stage-4 baseline migration hashes differ from the manifest");
+  if (stageIdx != null && stageIdx < 4) P.push(`stage-4 baseline cannot govern a migration at stage ${stageIdx} (precedes anchor 4)`);
+  const pd = baseline.protectedDigest;
+  if (!pd || typeof pd !== "object") { P.push("stage-4 baseline protectedDigest malformed"); return P; }
+  if (!setEq(Object.keys(pd), PROTECTED_DIGEST_KEYS)) P.push(`stage-4 baseline digest key set {${Object.keys(pd).sort()}} != required {${[...PROTECTED_DIGEST_KEYS].sort()}}`);
+  for (const k of PROTECTED_DIGEST_KEYS) {
+    const pin = pins[k], b = pd[k];
+    if (!pin) { P.push(`stage-4 baseline pin ${k} not set in manifest (fail-closed)`); continue; }
+    if (!b || b.c !== pin.c || b.h !== pin.h) P.push(`stage-4 baseline digest ${k} {c:${b && b.c},h:${b && b.h}} != manifest pin {c:${pin.c},h:${pin.h}}`);
+  }
+  return P;
+}
+export function shouldCreateStage4Baseline({ problemCount, rolledBack }) { return problemCount === 0 && rolledBack === true; }
+
 // ---- phase-tracked applier core (COMMIT_UNKNOWN unchanged) ----------------------------------------------
 export async function applyInTransaction(ctx) {
   const {
@@ -259,10 +299,15 @@ export async function runApply(deps) {
   if (actualSha !== mig.sha) return { code: 1, connected: false, message: `sha256 mismatch for ${filename}` };
   const id = validateIdentity(env);
   if (!id.ok) return { code: 1, connected: false, message: "identity: " + id.problems.join("; ") };
-  // Migrations 4-6 (stageIdx>=3) are governed by the reviewed STAGE-3 re-anchor baseline; migrations 1-3 by the
-  // stage-0 baseline. A test may override _validate. stageIdx is bound so the stage-3 validator rejects a
-  // migration that precedes its anchor.
-  const validate = _validate || (stageIdx >= 3 ? (b, ctx) => validateStage3Baseline(b, { ...ctx, stageIdx }) : validateBaseline);
+  // Baseline governance by the migration's stage (a test may override _validate; stageIdx is bound so each
+  // stage-N validator rejects a migration that precedes its anchor):
+  //   migrations 5-6 (stageIdx>=4) -> STAGE-4 re-anchor baseline;
+  //   migration 4   (stageIdx==3)  -> STAGE-3 re-anchor baseline;
+  //   migrations 1-3 (stageIdx<3)  -> stage-0 baseline.
+  const validate = _validate || (
+    stageIdx >= 4 ? (b, ctx) => validateStage4Baseline(b, { ...ctx, stageIdx })
+      : stageIdx === 3 ? (b, ctx) => validateStage3Baseline(b, { ...ctx, stageIdx })
+        : validateBaseline);
   let baseline;
   try { baseline = JSON.parse(baselineText); } catch { return { code: 1, connected: false, message: "baseline malformed JSON" }; }
   const bp = validate(baseline, { currentHead, currentFingerprint, envRef });

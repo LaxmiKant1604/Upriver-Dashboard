@@ -7,12 +7,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   validateIdentity, verifyTable, verifyFunction, verifyTriggers, verifyTableAcl, verifyPolicies, verifyIndexes,
-  verifyMigrationAbsent, bodyCanon, APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
+  verifyMigrationPresent, verifyMigrationAbsent, bodyCanon, ALTER_ADDED_CONSTRAINTS, cumulativeAlterConstraints,
+  APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
 } from "./release-manifest.mjs";
 import {
   verifyLedgerForStage, verifyApprovedInvariants, compareProtectedDigest, requirePinnedStage0Digest,
   buildBaseline, validateBaseline, shouldCreateBaseline, beginReadOnlySnapshot, applyInTransaction, runApply,
   buildStage3Baseline, validateStage3Baseline, shouldCreateStage3Baseline,
+  buildStage4Baseline, validateStage4Baseline, shouldCreateStage4Baseline,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -120,6 +122,36 @@ test("table: EXTRA index fails", async () => { const a = actualFromTable(T); a.i
 test("table: RLS disabled fails", async () => { const a = actualFromTable(T); a.rls = false; assert.ok((await verifyTable(tq(a), T)).length); });
 test("table: policy OR-true fails", async () => { const a = actualFromTable(T); a.policies[0].qual = "(is_dashboard_admin() OR true)"; assert.ok((await verifyTable(tq(a), T)).length); });
 test("table: EXTRA seed row fails", async () => { const a = actualFromTable(T); a.seedKeys.push("s3"); assert.ok((await verifyTable(tq(a), T)).length); });
+
+// ---------- stage-aware CUMULATIVE constraint model (a later migration ALTERs an earlier migration's table) -
+const withExtraCon = (name = "t_ck_added") => { const a = actualFromTable(T); a.constraints.push({ conname: name, contype: "c", def: "CHECK ((true))" }); return a; };
+test("cumulative: verifyTable ACCEPTS a stage-DUE ALTER-added extra constraint", async () => { assert.deepEqual(await verifyTable(tq(withExtraCon()), T, ["t_ck_added"]), []); });
+test("cumulative: verifyTable REJECTS the ALTER-added extra when NOT yet due (premature)", async () => { assert.ok((await verifyTable(tq(withExtraCon()), T, [])).length); });
+test("cumulative: verifyTable FAILS when a due ALTER-added constraint is missing", async () => { assert.ok((await verifyTable(tq(actualFromTable(T)), T, ["t_ck_added"])).length); });
+test("cumulative: verifyTable FAILS on an unknown extra even with the due extra present", async () => { const a = withExtraCon(); a.constraints.push({ conname: "rogue", contype: "c", def: "CHECK ((true))" }); assert.ok((await verifyTable(tq(a), T, ["t_ck_added"])).length); });
+test("cumulative: verifyTable still FAILS when a BASE constraint is missing (with the due extra present)", async () => { const a = withExtraCon(); a.constraints = a.constraints.filter((c) => c.conname !== T.constraints[1][0]); assert.ok((await verifyTable(tq(a), T, ["t_ck_added"])).length); });
+test("cumulative: ALTER_ADDED_CONSTRAINTS maps account_canonical -> migration 20260820 / source_batch_membership", () => { const e = ALTER_ADDED_CONSTRAINTS.find((c) => c.name === "source_batch_membership_account_canonical"); assert.ok(e); assert.equal(e.table, "source_batch_membership"); assert.equal(e.ownerIndex, NEW6.indexOf("20260820_source_durable_model.sql")); });
+test("cumulative: stages 2-3 do NOT require account_canonical (premature); stages 4-6 DO (exact set preserved)", () => {
+  assert.deepEqual(cumulativeAlterConstraints(2), {});
+  assert.deepEqual(cumulativeAlterConstraints(3), {});
+  assert.deepEqual(cumulativeAlterConstraints(4), { source_batch_membership: ["source_batch_membership_account_canonical"] });
+  assert.deepEqual(cumulativeAlterConstraints(5), { source_batch_membership: ["source_batch_membership_account_canonical"] });
+  assert.deepEqual(cumulativeAlterConstraints(6), { source_batch_membership: ["source_batch_membership_account_canonical"] });
+});
+// Migration-6 sync_report_jobs add-columns are modeled cumulatively (absent before stage 6; exact at stage 6).
+const M6mig = MIGRATIONS.find((m) => m.file === "20260822_report_derive_lease.sql");
+test("m6 columns: verifyMigrationAbsent PASSES when the derive-lease columns are absent (pre stage 6)", async () => {
+  const q = fakeQ([["to_regclass($1)", () => [{ r: "present" }]], ["select 1 from pg_attribute", () => []], ["to_regprocedure($1) r", () => [{ r: null }]]]);
+  assert.deepEqual(await verifyMigrationAbsent(q, M6mig), []);
+});
+test("m6 columns: verifyMigrationAbsent FLAGS a premature derive-lease column", async () => {
+  const q = fakeQ([["to_regclass($1)", () => [{ r: "present" }]], ["select 1 from pg_attribute", () => [{}]], ["to_regprocedure($1) r", () => [{ r: null }]]]);
+  assert.ok((await verifyMigrationAbsent(q, M6mig)).some((p) => p.includes("derive_lease_token")));
+});
+test("m6 columns: verifyMigrationPresent FLAGS derive-lease columns when absent (must be exact at stage 6)", async () => {
+  const q = fakeQ([["to_regclass($1)", () => [{ r: "present" }]], ["select 1 from pg_attribute", () => []], ["p.prosecdef sd", () => []]]);
+  assert.ok((await verifyMigrationPresent(q, M6mig)).some((p) => p.includes("derive_lease_token")));
+});
 
 // ---------- policies (isolated) --------------------------------------------------------------------------
 const polQ = (rows) => fakeQ([["from pg_policies", () => rows]]);
@@ -275,6 +307,28 @@ test("stage3: shouldCreate requires zero problems AND a clean rollback", () => {
 test("stage3 applier: migration 4 (stageIdx 3) + VALID stage-3 baseline constructs the client", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
 test("stage3 applier: migration 4 REJECTS a stage-0-shaped baseline (no anchorStage) -> zero connect", async () => { let made = 0; const b = buildBaseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 test("stage3 applier: migration 1 (stageIdx 0) REJECTS a stage-3 baseline -> zero connect", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[0], sqlText: "X", actualSha: MIGRATIONS[0].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+
+// ---------- DEDICATED stage-4 re-anchor baseline (governs ONLY migrations 5-6) ---------------------------
+const s4 = buildStage4Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
+const vs4 = (b, over = {}) => validateStage4Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
+test("stage4: build binds anchorStage=4, all 6 migration hashes, manifest-pinned digests", () => { assert.equal(s4.anchorStage, 4); assert.equal(Object.keys(s4.migrationHashes).length, 6); assert.deepEqual(Object.keys(s4.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage4: valid passes for a migration 5-6 (stageIdx>=4) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs4(s4, { stageIdx: 4 }), []); assert.deepEqual(vs4(s4, { stageIdx: 5 }), []); assert.deepEqual(vs4(s4), []); });
+test("stage4: anchorStage != exactly 4 fails", () => { const b = clone(s4); b.anchorStage = 3; assert.ok(vs4(b).length); b.anchorStage = 5; assert.ok(vs4(b).length); });
+test("stage4: use for a migration below the anchor (stageIdx<4) fails", () => { assert.ok(vs4(s4, { stageIdx: 3 }).length); assert.ok(vs4(s4, { stageIdx: 0 }).length); });
+test("stage4: wrong HEAD fails", () => { assert.ok(vs4(s4, { currentHead: "b".repeat(40) }).length); });
+test("stage4: stale manifest fingerprint fails", () => { assert.ok(vs4(s4, { currentFingerprint: "x" }).length); });
+test("stage4: environment switched (envRef mismatch) fails", () => { assert.ok(vs4(s4, { envRef: "otherproject" }).length); });
+test("stage4: wrong project ref fails", () => { const b = clone(s4); b.projectRef = "someoneelse"; assert.ok(vs4(b, { stageIdx: 4, envRef: null }).length); });
+test("stage4: EDIT a digest hash fails", () => { const b = clone(s4); b.protectedDigest.approvals.h = "tampered"; assert.ok(vs4(b, { stageIdx: 4 }).length); });
+test("stage4: EDIT a digest count fails", () => { const b = clone(s4); b.protectedDigest.settings.c = 999; assert.ok(vs4(b, { stageIdx: 4 }).length); });
+test("stage4: ADD an extra digest key fails", () => { const b = clone(s4); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vs4(b, { stageIdx: 4 }).length); });
+test("stage4: REMOVE a digest key fails", () => { const b = clone(s4); delete b.protectedDigest.report_jobs; assert.ok(vs4(b, { stageIdx: 4 }).length); });
+test("stage4: migration-hash drift fails", () => { const b = clone(s4); b.migrationHashes[NEW6[0]] = "deadbeef"; assert.ok(vs4(b, { stageIdx: 4 }).length); });
+test("stage4: real manifest pins reject a foreign-pins stage-4 baseline", () => { assert.ok(validateStage4Baseline(s4, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, stageIdx: 4 }).length); });
+test("stage4: shouldCreate requires zero problems AND a clean rollback", () => { assert.equal(shouldCreateStage4Baseline({ problemCount: 0, rolledBack: true }), true); assert.equal(shouldCreateStage4Baseline({ problemCount: 1, rolledBack: true }), false); assert.equal(shouldCreateStage4Baseline({ problemCount: 0, rolledBack: false }), false); });
+test("stage4 applier: migration 5 (stageIdx 4) + VALID stage-4 baseline constructs the client", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[4], sqlText: "X", actualSha: MIGRATIONS[4].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
+test("stage4 applier: migration 5 REJECTS the stage-3 baseline (anchor 3) -> zero connect", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[4], sqlText: "X", actualSha: MIGRATIONS[4].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+test("stage4 applier: migration 4 (stageIdx 3) REJECTS the stage-4 baseline (anchor 4) -> zero connect", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {

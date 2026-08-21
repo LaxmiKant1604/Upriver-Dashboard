@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { validateIdentity } from "./release-manifest.mjs";
 import { APPROVED_INVARIANTS } from "./release-manifest.mjs";
-import { verifyLedgerForStage, verifyStageObjects, verifyApprovedInvariants, captureProtectedDigest, compareProtectedDigest, requirePinnedStage0Digest, beginReadOnlySnapshot, buildBaseline, validateBaseline, validateStage3Baseline, shouldCreateBaseline } from "./release-state.mjs";
+import { verifyLedgerForStage, verifyStageObjects, verifyApprovedInvariants, captureProtectedDigest, compareProtectedDigest, requirePinnedStage0Digest, beginReadOnlySnapshot, buildBaseline, validateBaseline, validateStage3Baseline, validateStage4Baseline, shouldCreateBaseline } from "./release-state.mjs";
 import { parseEnv, readGitHead, manifestFingerprint, envProjectRef } from "./release-fs.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +20,7 @@ const repoRoot = path.resolve(appRoot, "..");
 const envPath = path.resolve(repoRoot, ".env.local");
 const baselineStage0Path = path.join(here, ".release-baseline.json");
 const baselineStage3Path = path.join(here, ".release-baseline-stage3.json");
+const baselineStage4Path = path.join(here, ".release-baseline-stage4.json");
 
 const args = process.argv.slice(2);
 if (args.length !== 1 || !/^[0-6]$/.test(args[0])) { console.error("STOP usage: node scripts/release/ro-prod-check.mjs <stage 0..6>"); process.exit(2); }
@@ -52,8 +53,16 @@ try {
   if (STAGE === 0) {
     // Blocker 2: the observed customer-data digest MUST equal the pinned manifest value before a baseline exists.
     problems.push(...requirePinnedStage0Digest(digest));
-  } else if (STAGE >= 3) {
-    // Stages 3-6 are governed by the reviewed STAGE-3 re-anchor baseline (forward-only recovery).
+  } else if (STAGE >= 4) {
+    // Stages 4-6 are governed by the reviewed STAGE-4 re-anchor baseline (forward-only recovery).
+    let baseline = null;
+    try { baseline = JSON.parse(readFileSync(baselineStage4Path, "utf8")); } catch { problems.push("stage-4 baseline file missing/malformed (run `node scripts/release/re-anchor-stage4.mjs` first)"); }
+    if (baseline) {
+      problems.push(...validateStage4Baseline(baseline, { currentHead, currentFingerprint, envRef }));
+      problems.push(...compareProtectedDigest(baseline.protectedDigest, digest));
+    }
+  } else if (STAGE === 3) {
+    // Stage 3 remains governed by the STAGE-3 re-anchor baseline (historical audit; unchanged).
     let baseline = null;
     try { baseline = JSON.parse(readFileSync(baselineStage3Path, "utf8")); } catch { problems.push("stage-3 baseline file missing/malformed (run `node scripts/release/re-anchor-stage3.mjs` first)"); }
     if (baseline) {
