@@ -173,7 +173,10 @@ export const MIGRATIONS = [
       { sig: "public.record_source_snapshot(text, text, text, text, text, text, integer, bigint, text, timestamp with time zone)", ret: "text", secdef: true, searchPath: "public", acl: FN_SR, createdNew: true },
       { sig: "public.replace_oli_history_window(text, text, text, date, date, jsonb, timestamp with time zone)", ret: "jsonb", secdef: true, searchPath: "public", acl: FN_SR, createdNew: true },
     ],
-    alters: [{ table: "source_batch_membership", addColumns: [], addConstraints: [CK("source_batch_membership_account_canonical", "account_id=btrimaccount_idANDchar_lengthaccount_id>0ANDpositionaccount_id,':'=0")] }],
+    // PostgreSQL serializes `position(':' in account_id)` as the SQL-standard operator form
+    // `POSITION(':' IN account_id)` (operand order preserved: needle ':' IN haystack account_id) -- NOT the
+    // strpos-style `position(account_id, ':')`. Pin that exact canonical representation (bodyCanon output).
+    alters: [{ table: "source_batch_membership", addColumns: [], addConstraints: [CK("source_batch_membership_account_canonical", "account_id=btrimaccount_idANDchar_lengthaccount_id>0ANDPOSITION':'INaccount_id=0")] }],
   },
   {
     file: "20260821_source_promoted_publish_controls.sql", sha: "381a41ff607a7566b6fbeacb9598d629fe5d8defd4cec0bc8d0123ececbc4b3a", adv: [20260821, 1],

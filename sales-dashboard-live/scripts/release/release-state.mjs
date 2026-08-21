@@ -167,6 +167,43 @@ export function validateBaseline(baseline, { currentHead, currentFingerprint, en
 
 export function shouldCreateBaseline({ stage, problemCount, rolledBack }) { return stage === 0 && problemCount === 0 && rolledBack === true; }
 
+// ---- DEDICATED stage-3 re-anchor baseline (forward-only recovery from an applied stage-3 production) -------
+// A SEPARATE artifact from the stage-0 baseline (which is preserved untouched for audit). It is NOT a generic
+// "baseline at any stage": anchorStage is HARD-CODED to 3, it governs ONLY migrations 4-6, and it binds the
+// exact manifest pins (never arbitrary current state). buildStage3Baseline uses manifest-pinned values ONLY.
+export function buildStage3Baseline({ head, fingerprint, pins = PROTECTED_DIGESTS }) {
+  return {
+    version: BASELINE_VERSION, projectRef: APPROVED_IDENTITY.projectRef, head, manifestFingerprint: fingerprint,
+    migrationHashes: Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])), anchorStage: 3,
+    protectedDigest: Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k) => [k, pins[k]])), // manifest-pinned values ONLY
+  };
+}
+// Validate the reviewed stage-3 baseline. Rejects: anchorStage != exactly 3; wrong project/head/fingerprint;
+// migration-hash drift; edited/missing/extra/unpinned protected digest; and (when a stageIdx is supplied, i.e.
+// an APPLY) a migration whose stage precedes the anchor (stageIdx < 3 -- migrations 1-3 are NOT governed here).
+export function validateStage3Baseline(baseline, { currentHead, currentFingerprint, envRef, stageIdx, pins = PROTECTED_DIGESTS } = {}) {
+  const P = [];
+  if (!baseline || typeof baseline !== "object") return ["stage-3 baseline malformed (not an object)"];
+  if (baseline.version !== BASELINE_VERSION) P.push(`stage-3 baseline version ${baseline.version} != ${BASELINE_VERSION}`);
+  if (baseline.anchorStage !== 3) P.push(`stage-3 baseline anchorStage ${baseline.anchorStage} != 3`);
+  if (baseline.projectRef !== APPROVED_IDENTITY.projectRef) P.push(`stage-3 baseline projectRef ${baseline.projectRef} != approved`);
+  if (envRef != null && baseline.projectRef !== envRef) P.push(`stage-3 baseline projectRef != current env ref ${envRef} (environment switched)`);
+  if (baseline.head !== currentHead) P.push(`stage-3 baseline HEAD ${baseline.head} != current HEAD ${currentHead}`);
+  if (baseline.manifestFingerprint !== currentFingerprint) P.push("stage-3 baseline manifest fingerprint stale");
+  if (JSON.stringify(baseline.migrationHashes) !== JSON.stringify(Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])))) P.push("stage-3 baseline migration hashes differ from the manifest");
+  if (stageIdx != null && stageIdx < 3) P.push(`stage-3 baseline cannot govern a migration at stage ${stageIdx} (precedes anchor 3)`);
+  const pd = baseline.protectedDigest;
+  if (!pd || typeof pd !== "object") { P.push("stage-3 baseline protectedDigest malformed"); return P; }
+  if (!setEq(Object.keys(pd), PROTECTED_DIGEST_KEYS)) P.push(`stage-3 baseline digest key set {${Object.keys(pd).sort()}} != required {${[...PROTECTED_DIGEST_KEYS].sort()}}`);
+  for (const k of PROTECTED_DIGEST_KEYS) {
+    const pin = pins[k], b = pd[k];
+    if (!pin) { P.push(`stage-3 baseline pin ${k} not set in manifest (fail-closed)`); continue; }
+    if (!b || b.c !== pin.c || b.h !== pin.h) P.push(`stage-3 baseline digest ${k} {c:${b && b.c},h:${b && b.h}} != manifest pin {c:${pin.c},h:${pin.h}}`);
+  }
+  return P;
+}
+export function shouldCreateStage3Baseline({ problemCount, rolledBack }) { return problemCount === 0 && rolledBack === true; }
+
 // ---- phase-tracked applier core (COMMIT_UNKNOWN unchanged) ----------------------------------------------
 export async function applyInTransaction(ctx) {
   const {
@@ -214,7 +251,7 @@ export async function applyInTransaction(ctx) {
 
 // Blocker 1: every validation completes BEFORE makeClient() -- a malformed/edited baseline yields ZERO connect.
 export async function runApply(deps) {
-  const { filename, sqlText, actualSha, env, currentHead, currentFingerprint, envRef, baselineText, makeClient, approved, _validate = validateBaseline } = deps;
+  const { filename, sqlText, actualSha, env, currentHead, currentFingerprint, envRef, baselineText, makeClient, approved, _validate } = deps;
   if (filename.includes("/") || filename.includes("\\") || filename.includes("..")) return { code: 1, connected: false, message: `rejected path/filename: ${filename}` };
   const stageIdx = NEW6.indexOf(filename);
   if (stageIdx < 0) return { code: 1, connected: false, message: `${filename} is not one of the six frozen migrations` };
@@ -222,15 +259,19 @@ export async function runApply(deps) {
   if (actualSha !== mig.sha) return { code: 1, connected: false, message: `sha256 mismatch for ${filename}` };
   const id = validateIdentity(env);
   if (!id.ok) return { code: 1, connected: false, message: "identity: " + id.problems.join("; ") };
+  // Migrations 4-6 (stageIdx>=3) are governed by the reviewed STAGE-3 re-anchor baseline; migrations 1-3 by the
+  // stage-0 baseline. A test may override _validate. stageIdx is bound so the stage-3 validator rejects a
+  // migration that precedes its anchor.
+  const validate = _validate || (stageIdx >= 3 ? (b, ctx) => validateStage3Baseline(b, { ...ctx, stageIdx }) : validateBaseline);
   let baseline;
   try { baseline = JSON.parse(baselineText); } catch { return { code: 1, connected: false, message: "baseline malformed JSON" }; }
-  const bp = _validate(baseline, { currentHead, currentFingerprint, envRef });
+  const bp = validate(baseline, { currentHead, currentFingerprint, envRef });
   if (bp.length) return { code: 1, connected: false, message: "baseline invalid: " + bp.join("; ") };
   const client = makeClient();
   let connected = false;
   try {
     await client.connect(); connected = true;
-    const r = await applyInTransaction({ client, mig, stageIdx, sql: sqlText, baseline, currentHead, currentFingerprint, envRef, approved });
+    const r = await applyInTransaction({ client, mig, stageIdx, sql: sqlText, baseline, currentHead, currentFingerprint, envRef, approved, _validate: validate });
     return { ...r, connected };
   } catch (e) { return { code: 1, connected, message: "connect/apply error: " + e.message }; }
   finally { try { await client.end(); } catch {} }

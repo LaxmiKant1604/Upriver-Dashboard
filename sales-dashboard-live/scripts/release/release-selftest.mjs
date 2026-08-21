@@ -7,11 +7,12 @@ import os from "node:os";
 import path from "node:path";
 import {
   validateIdentity, verifyTable, verifyFunction, verifyTriggers, verifyTableAcl, verifyPolicies, verifyIndexes,
-  verifyMigrationAbsent, APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
+  verifyMigrationAbsent, bodyCanon, APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
 } from "./release-manifest.mjs";
 import {
   verifyLedgerForStage, verifyApprovedInvariants, compareProtectedDigest, requirePinnedStage0Digest,
   buildBaseline, validateBaseline, shouldCreateBaseline, beginReadOnlySnapshot, applyInTransaction, runApply,
+  buildStage3Baseline, validateStage3Baseline, shouldCreateStage3Baseline,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -180,6 +181,31 @@ test("digest: EXTRA observed key fails", () => { const o = fullObs(); o.rogue = 
 test("digest: MISSING observed key fails", () => { const o = fullObs(); delete o.mode; assert.ok(requirePinnedStage0Digest(o, TESTPINS).length); });
 test("digest: compareProtectedDigest drift fails", () => { const b = { live_snapshots: { h: "a", c: 1 } }; assert.deepEqual(compareProtectedDigest(b, clone(b)), []); assert.ok(compareProtectedDigest(b, { live_snapshots: { h: "z", c: 1 } }).length); });
 
+// ---------- Migration-4 POSITION serialization: constraint mutation regressions (recovery from stage 3) ---
+// `position(':' in account_id) = 0` serializes in PostgreSQL as the SQL-standard operator form
+// POSITION(':' IN account_id) -- NOT the strpos-style position(account_id, ':'). The pin is that exact form.
+const M4 = MIGRATIONS.find((m) => m.file === "20260820_source_durable_model.sql");
+const M4_CANON = M4.alters[0].addConstraints.find((c) => c[0] === "source_batch_membership_account_canonical")[2].canon;
+const M4_PG = "CHECK ((account_id = btrim(account_id)) AND (char_length(account_id) > 0) AND (POSITION((':'::text) IN account_id) = 0))";
+test("m4 POSITION: exact PostgreSQL POSITION(':' IN account_id) serialization matches the pin", () => { assert.equal(bodyCanon(M4_PG), M4_CANON); });
+test("m4 POSITION: reversed operands POSITION(account_id IN ':') fails", () => { assert.notEqual(bodyCanon("CHECK ((account_id = btrim(account_id)) AND (char_length(account_id) > 0) AND (POSITION(account_id IN (':'::text)) = 0))"), M4_CANON); });
+test("m4 POSITION: strpos-style position(account_id, ':') (the old wrong pin) fails", () => { assert.notEqual("account_id=btrimaccount_idANDchar_lengthaccount_id>0ANDpositionaccount_id,':'=0", M4_CANON); });
+test("m4 POSITION: changed needle POSITION(';' IN account_id) fails", () => { assert.notEqual(bodyCanon("CHECK ((account_id = btrim(account_id)) AND (char_length(account_id) > 0) AND (POSITION((';'::text) IN account_id) = 0))"), M4_CANON); });
+test("m4 POSITION: changed haystack POSITION(':' IN seller_or_vendor_id) fails", () => { assert.notEqual(bodyCanon("CHECK ((account_id = btrim(account_id)) AND (char_length(account_id) > 0) AND (POSITION((':'::text) IN seller_or_vendor_id) = 0))"), M4_CANON); });
+test("m4 POSITION: removed canonical-account (position) condition fails", () => { assert.notEqual(bodyCanon("CHECK ((account_id = btrim(account_id)) AND (char_length(account_id) > 0))"), M4_CANON); });
+
+// ---------- Migrations 5 & 6 catalog expectations remain exact (unchanged by the migration-4 fix) ---------
+const M5 = MIGRATIONS.find((m) => m.file === "20260821_source_promoted_publish_controls.sql");
+const M5T = M5.tables.find((t) => t.name === "source_promoted_publish_settings");
+const M5_CK = M5T.constraints.find((c) => c[0] === "source_promoted_publish_settings_report_key_nonblank")[2].canon;
+const M5_FK = M5T.constraints.find((c) => c[0] === "source_promoted_publish_settings_updated_by_fkey")[2].canon;
+test("m5 CK: char_length(btrim(report_key)) > 0 serialization matches the pin", () => { assert.equal(bodyCanon("CHECK ((char_length(btrim(report_key)) > 0))"), M5_CK); });
+test("m5 CK: a different column btrim(account_id) fails", () => { assert.notEqual(bodyCanon("CHECK ((char_length(btrim(account_id)) > 0))"), M5_CK); });
+test("m5 FK: updated_by REFERENCES auth.users(id) ON DELETE SET NULL matches the pin", () => { assert.equal(bodyCanon("FOREIGN KEY (updated_by) REFERENCES auth.users(id) ON DELETE SET NULL"), M5_FK); });
+test("m5 FK: a different action ON DELETE CASCADE fails", () => { assert.notEqual(bodyCanon("FOREIGN KEY (updated_by) REFERENCES auth.users(id) ON DELETE CASCADE"), M5_FK); });
+const M6 = MIGRATIONS.find((m) => m.file === "20260822_report_derive_lease.sql");
+test("m6 catalog: adds NO new tables and NO new constraints (add-columns only)", () => { assert.equal((M6.tables || []).length, 0); assert.deepEqual(M6.alters[0].addConstraints, []); });
+
 // ---------- manifest-pinned baseline ---------------------------------------------------------------------
 const FP = "fp".repeat(20), HEAD = "a".repeat(40);
 const good = buildBaseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
@@ -190,7 +216,7 @@ test("baseline: EDIT any digest hash fails", () => { const b = clone(good); b.pr
 test("baseline: EDIT any digest count fails", () => { const b = clone(good); b.protectedDigest.sync_cycles.c = 777; assert.ok(vb(b).length); });
 test("baseline: ADD a digest key fails", () => { const b = clone(good); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vb(b).length); });
 test("baseline: REMOVE a digest key fails", () => { const b = clone(good); delete b.protectedDigest.report_jobs; assert.ok(vb(b).length); });
-test("baseline: real manifest pins (6 null) reject any baseline", () => { assert.ok(validateBaseline(good, { currentHead: HEAD, currentFingerprint: FP, envRef: REF }).length); });
+test("baseline: real manifest pins reject a baseline built from foreign (test) pins", () => { assert.ok(validateBaseline(good, { currentHead: HEAD, currentFingerprint: FP, envRef: REF }).length); });
 test("baseline: malformed fails", () => { assert.ok(vb("nope").length); });
 test("baseline: wrong-HEAD fails", () => { assert.ok(vb(good, { currentHead: "b".repeat(40) }).length); });
 test("baseline: stale fingerprint fails", () => { assert.ok(vb(good, { currentFingerprint: "x" }).length); });
@@ -226,6 +252,29 @@ test("runApply: valid pre-checks -> client IS constructed", async () => {
   await runApply({ filename: NEW6[0], sqlText: "X", actualSha: MIGRATIONS[0].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(good), _validate: () => [], makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS });
   assert.equal(made, 1, "client is constructed once when every pre-connect check passes");
 });
+
+// ---------- DEDICATED stage-3 re-anchor baseline (forward-only recovery; governs ONLY migrations 4-6) -----
+const s3 = buildStage3Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
+const vs3 = (b, over = {}) => validateStage3Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
+test("stage3: build binds anchorStage=3, all 6 migration hashes, manifest-pinned digests", () => { assert.equal(s3.anchorStage, 3); assert.equal(Object.keys(s3.migrationHashes).length, 6); assert.deepEqual(Object.keys(s3.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage3: valid passes for a migration 4-6 (stageIdx>=3) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs3(s3, { stageIdx: 3 }), []); assert.deepEqual(vs3(s3, { stageIdx: 5 }), []); assert.deepEqual(vs3(s3), []); });
+test("stage3: anchorStage != exactly 3 fails", () => { const b = clone(s3); b.anchorStage = 0; assert.ok(vs3(b).length); b.anchorStage = 4; assert.ok(vs3(b).length); });
+test("stage3: applying a migration whose stage PRECEDES the anchor (stageIdx<3) fails", () => { assert.ok(vs3(s3, { stageIdx: 2 }).length); assert.ok(vs3(s3, { stageIdx: 0 }).length); });
+test("stage3: wrong HEAD fails", () => { assert.ok(vs3(s3, { currentHead: "b".repeat(40) }).length); });
+test("stage3: stale manifest fingerprint fails", () => { assert.ok(vs3(s3, { currentFingerprint: "x" }).length); });
+test("stage3: environment switched (envRef mismatch) fails", () => { assert.ok(vs3(s3, { envRef: "otherproject" }).length); });
+test("stage3: wrong project ref fails", () => { const b = clone(s3); b.projectRef = "someoneelse"; assert.ok(vs3(b, { stageIdx: 3, envRef: null }).length); });
+test("stage3: EDIT a digest hash fails", () => { const b = clone(s3); b.protectedDigest.approvals.h = "tampered"; assert.ok(vs3(b, { stageIdx: 3 }).length); });
+test("stage3: EDIT a digest count fails", () => { const b = clone(s3); b.protectedDigest.settings.c = 999; assert.ok(vs3(b, { stageIdx: 3 }).length); });
+test("stage3: ADD an extra digest key fails", () => { const b = clone(s3); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vs3(b, { stageIdx: 3 }).length); });
+test("stage3: REMOVE a digest key fails", () => { const b = clone(s3); delete b.protectedDigest.report_jobs; assert.ok(vs3(b, { stageIdx: 3 }).length); });
+test("stage3: migration-hash drift fails", () => { const b = clone(s3); b.migrationHashes[NEW6[0]] = "deadbeef"; assert.ok(vs3(b, { stageIdx: 3 }).length); });
+test("stage3: real manifest pins reject a foreign-pins stage-3 baseline", () => { assert.ok(validateStage3Baseline(s3, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, stageIdx: 3 }).length); });
+test("stage3: shouldCreate requires zero problems AND a clean rollback", () => { assert.equal(shouldCreateStage3Baseline({ problemCount: 0, rolledBack: true }), true); assert.equal(shouldCreateStage3Baseline({ problemCount: 1, rolledBack: true }), false); assert.equal(shouldCreateStage3Baseline({ problemCount: 0, rolledBack: false }), false); });
+// applier: the stage-3 baseline governs ONLY migrations 4-6.
+test("stage3 applier: migration 4 (stageIdx 3) + VALID stage-3 baseline constructs the client", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
+test("stage3 applier: migration 4 REJECTS a stage-0-shaped baseline (no anchorStage) -> zero connect", async () => { let made = 0; const b = buildBaseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+test("stage3 applier: migration 1 (stageIdx 0) REJECTS a stage-3 baseline -> zero connect", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[0], sqlText: "X", actualSha: MIGRATIONS[0].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {
