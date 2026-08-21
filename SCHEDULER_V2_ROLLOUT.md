@@ -5022,3 +5022,20 @@ byte-UNCHANGED. Migration **20260822 CHANGES** this round; new frozen SHA-256
 
 **STOP for Codex re-review.** Code+tests `f1b79af`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AT — Round-9: hash-bound completions, total resumability, storage-first, refresh CAS (4 findings) (OFFLINE, 2026-08-21; code+tests `89d9139`; docs `<this commit>`; NOT deployed)
+
+Codex's review of the round-8 recovery work raised four findings; all fixed offline. `npm run verify` green
+-- **55 steps / 35 suites** (incl. `build:check`); `git diff --check` clean; migrations 1-6, 20260820,
+20260821 byte-UNCHANGED. Migration **20260822 CHANGES** this round; new frozen SHA-256
+`3a0a2116e816269cc4987e8ca98bff1d1bedb38dc02a5e744e1b61f0f4432896` (blob `96bf3be3`), still PREPARED-UNAPPLIED.
+
+| # | Finding -> fix (proofs: hardening W1-W4c, Y6-Y6d, Z2, ZM1) |
+|---|---|
+| 1 | **Bind every already-complete acknowledgement to the current snapshot hash.** claim RPC: 'already-complete' requires a nonblank `snapshot_params_hash` (a hash-less validated success is 'invalid-state'); the claim wrapper requires that field. The runtime requires `lease.snapshotParamsHash === the current paramsHash` (a different-hash completion is a typed 'already-complete-hash-mismatch', never this derivation's success). reconcile RPC echoes `snapshot_params_hash` for 'already-complete'; the reconcile wrapper requires an exact echo for BOTH 'reconciled' AND 'already-complete'. Schema proofs + SQL mutations updated. W1/W2 |
+| 2 | **Total, accurately-resumable lineage.** Granular outcomes replace the coarse claim-failed/reconcile-failed: held + reconcile-lease-lost are resumable; not-found, invalid-lease, invalid-state, terminal, malformed acks, hash mismatch, snapshot integrity/conflict are NON-resumable. snapshot-absent is classified by whether a preceding save committed cleanly (absent-after-clean-save => integrity/non-resumable; a concurrently-vanished adopted snapshot => resumable). `continuationRequired` is set ONLY for genuinely-recoverable outcomes, so terminal/configuration failures can never create an endless continuation loop. W3/W3b |
+| 3 | **Storage-first precedence (mirrors the publisher).** A nonblank `payload_storage_path` is AUTHORITATIVE and is always hydrated + validated even when an inline payload is present; inline is used ONLY when the path is blank. The recovered row's `report_key`/`account_id`/`params_hash` identity is validated exactly. The publisher's payload precedence is made storage-first to match. W4/W4b/W4c (inline+pointer mismatch -> storage wins; dangling pointer fails closed; wrong-row identity rejected) |
+| 4 | **Safe same-scope refreshed evidence.** Identical valid content is adopted; a different-but-valid durable payload is no longer a permanent block -- it routes through a reviewed atomic freshness/CAS (`saveShadowSnapshotIfNewer`, the `publishLiveSnapshotIfNewer` primitive on the shadow row, now signal-aware): a STRICTLY-NEWER validated candidate atomically REPLACES older shadow evidence and completes; an OLDER (newer-live) candidate is typed-resumable and preserves LKG; an EQUAL-but-conflicting candidate preserves LKG and fails closed non-resumable; concurrent writers converge on the newest timestamp with no blind overwrite. Y6/Y6b/Y6c/Y6d |
+
+**STOP for Codex re-review.** Code+tests `89d9139`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.

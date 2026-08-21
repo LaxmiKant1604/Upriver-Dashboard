@@ -10453,3 +10453,25 @@ aborted within budget -> typed-resumable, no later write (Z5). Hardening 81; ver
 STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
 (blob 0cd0f526) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
 published; cycle dfca8f75 untouched.
+
+## Round-9 -- OFFLINE on main 2026-08-21 (code+tests 89d9139, docs separate); verify green 55/35; NOT deployed
+
+Codex's review of the round-8 recovery work raised four findings; all fixed offline (Appendix AT in
+SCHEDULER_V2_ROLLOUT.md). Migration 20260822 CHANGES this round (new frozen sha256
+3a0a2116e816269cc4987e8ca98bff1d1bedb38dc02a5e744e1b61f0f4432896, blob 96bf3be3, PREPARED-UNAPPLIED);
+migrations 1-6/20260820/20260821 byte-UNCHANGED. (1) Every already-complete ack is bound to the current
+snapshot hash: claim RPC/wrapper require a nonblank hash; the runtime requires lease.snapshotParamsHash ===
+paramsHash (else typed already-complete-hash-mismatch); reconcile RPC echoes the hash and the wrapper requires
+an exact echo for reconciled AND already-complete (W1/W2). (2) Total, accurately-resumable lineage: granular
+outcomes -- held + reconcile-lease-lost resumable; not-found/invalid-lease/invalid-state/terminal/malformed/
+hash-mismatch/snapshot-conflict NON-resumable; snapshot-absent classified by whether a preceding save
+committed cleanly; continuationRequired set ONLY for recoverable outcomes so terminal/config failures never
+loop (W3/W3b). (3) Storage-first precedence: a nonblank payload_storage_path is authoritative + always
+hydrated/validated even when inline present; exact row identity; publisher made storage-first too (W4/W4b/W4c).
+(4) Safe refreshed evidence: different-but-valid content routes through an atomic freshness CAS
+(saveShadowSnapshotIfNewer) -- newer replaces atomically, older/equal-conflict preserves LKG, concurrent
+writers converge on newest (Y6/Y6b/Y6c/Y6d). Hardening 91; verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
+(blob 96bf3be3) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
+published; cycle dfca8f75 untouched.
