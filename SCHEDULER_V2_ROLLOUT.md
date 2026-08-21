@@ -5039,3 +5039,31 @@ Codex's review of the round-8 recovery work raised four findings; all fixed offl
 
 **STOP for Codex re-review.** Code+tests `89d9139`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AU — Round-10: DB-authoritative evidence freshness + storage-first freshness CAS (2 blockers) (OFFLINE, 2026-08-21; code+tests `86b8530`; docs `<this commit>`; NOT deployed)
+
+Codex's review of the round-9 refresh CAS raised two release blockers; both fixed offline. `npm run verify`
+green -- **55 steps / 35 suites** (incl. `build:check`); `git diff --check` clean; migrations 1-6, 20260820,
+20260821 byte-UNCHANGED. Migration **20260822 CHANGES** this round; new frozen SHA-256
+`6e315413ba8fc0cf33216fd546b124c97dc3c497be150b949a34eb23be3bbaa0` (blob `7c987c17`), still PREPARED-UNAPPLIED.
+
+| # | Blocker -> fix (proofs: hardening V1-V7, Y6b/Y6c, ZM2) |
+|---|---|
+| 1 | **Durable evidence freshness.** The source runtime no longer stamps shadow snapshots with `nowIso()` (worker completion/retry wall time). Freshness is now the OWNING CYCLE's database-created timestamp (`sync_cycles.created_at`, read once via `getSyncCycle` before the save loop): identical across retries of the same derivation, orders an older cycle strictly below a newer one even when the older worker finishes later, never advances because a retry happened later, and is never the caller/route `Date.now()`. A durable-lineage run whose cycle has no readable `created_at` fails closed (`LINEAGE_FRESHNESS_UNAVAILABLE`). The degenerate no-cycle/no-lineage path (a plain, non-CAS save with no ordering) is the only remaining wall-clock user. Comparison is chronological + database-safe: freshness compares as `timestamptz` inside the new RPC (Z == +00:00 == any offset == fractional precision), never a lexicographic RFC3339 string; the JS `publishLiveSnapshotIfNewer` classifier and the harness/test model parse to epoch instants (`instantMs`) for the same reason. V1/V2/V3 |
+| 2 | **Storage-first CAS.** `publishLiveSnapshotIfNewer`/`classifyNonOlder` (and the shadow CAS wrapper) now treat a nonblank `payload_storage_path` as AUTHORITATIVE and ALWAYS hydrate + compare it at EQUAL freshness, even when an inline payload is also present -- a stale inline that matches the candidate can never stand in for authoritative storage. A storage-different, dangling, or unreadable object is a conflict/newer-live (never `already-current`, never a reconciled success). If authoritative content cannot be proven after a race, it fails closed without reconciling. V4/V5 |
+
+New RPC **`cas_report_snapshot_if_newer`** (migration 20260822): an atomic, row-locked (`FOR UPDATE`) freshness
+CAS on the `report_snapshots` natural key -- insert-if-absent (`inserted`) / guarded strictly-newer replace
+(`WHERE source_refreshed_at < candidate` -> `replaced`) / strictly-older `newer-live` / EQUAL returns the durable
+content (params + payload + storage pointer) for the caller's storage-first identity proof / null-freshness
+`invalid-freshness`. `saveShadowSnapshotIfNewer` routes through it and performs the storage-first equal-case
+proof in JS (the authoritative payload can live in object storage, unreachable from SQL). `schema-contract` adds
+the `cas-report-snapshot` structural proof (lock, insert-if-absent, null guard, guarded replace, older/equal
+branches, equal-returns-content) + a `timestamptz` required-statement; `ZM2` mutates each guard and proves a
+typed blocker. The V-series covers all 8 mandatory regressions (older-cycle-cannot-overwrite; wall-time-advanced
+retry stays non-winning; Z/+00:00/offset/fractional equal instants; inline=candidate+storage=different ->
+conflict; inline=different+storage=candidate -> adopt; concurrent-writer convergence; LKG byte-identical on
+every conflict; existing hash-binding/lease/deadline/publisher tests green). Hardening **99**.
+
+**STOP for Codex re-review.** Code+tests `86b8530`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.

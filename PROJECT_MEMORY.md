@@ -10475,3 +10475,29 @@ writers converge on newest (Y6/Y6b/Y6c/Y6d). Hardening 91; verify 55/35.
 STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
 (blob 96bf3be3) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
 published; cycle dfca8f75 untouched.
+
+## Round-10 RELEASE blockers (two) -- OFFLINE on main 2026-08-21 (code+tests 86b8530, docs separate); verify green 55/35; NOT deployed
+
+Codex's review of the round-9 refresh CAS raised two release blockers; both fixed offline (Appendix AU in
+SCHEDULER_V2_ROLLOUT.md). Migration 20260822 CHANGES this round (new frozen sha256
+6e315413ba8fc0cf33216fd546b124c97dc3c497be150b949a34eb23be3bbaa0, blob 7c987c17, PREPARED-UNAPPLIED);
+migrations 1-6/20260820/20260821 byte-UNCHANGED. (1) DURABLE EVIDENCE FRESHNESS: the runtime no longer stamps
+shadow snapshots with nowIso() (worker completion/retry wall time). Freshness is now the OWNING CYCLE's
+database-created timestamp (sync_cycles.created_at, read via getSyncCycle before the save loop): identical
+across retries, orders an older cycle strictly below a newer one even when the older worker finishes later,
+never advances on a later retry, never the caller/route Date.now(); a durable run with no readable created_at
+fails closed (LINEAGE_FRESHNESS_UNAVAILABLE). Comparison is chronological + DB-safe: timestamptz inside the new
+RPC (Z == +00:00 == offset == fractional), never a lexicographic RFC3339 string (publishLiveSnapshotIfNewer +
+the test model parse to epoch via instantMs). (2) STORAGE-FIRST CAS: publishLiveSnapshotIfNewer/classifyNonOlder
+and the shadow CAS treat a nonblank payload_storage_path as authoritative and ALWAYS hydrate + compare it at
+EQUAL freshness even when inline is present -- a stale inline that matches the candidate can never stand in; a
+storage-different/dangling/unreadable object is conflict/newer-live, never already-current, never a reconciled
+success; unprovable after a race fails closed. New RPC cas_report_snapshot_if_newer (migration 20260822): atomic
+FOR UPDATE freshness CAS (insert-if-absent / guarded strictly-newer replace / strictly-older newer-live / equal
+returns durable content for the storage-first proof / invalid-freshness); schema-contract adds the
+cas-report-snapshot proof + a timestamptz required-statement; ZM2 mutates each guard; the V-series covers all 8
+mandatory regressions; Y6b/Y6c reworked to the DB-authoritative model. Hardening 99; verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
+(blob 7c987c17) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
+published; cycle dfca8f75 untouched.
