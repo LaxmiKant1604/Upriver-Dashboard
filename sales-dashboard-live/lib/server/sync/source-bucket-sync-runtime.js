@@ -772,7 +772,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       });
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
     const saver = makeShadowSaver();
+    // Round-10 blocker 1: the caller/route wall clock is NEVER the freshness authority for durable shadow
+    // evidence. `nowIso` survives ONLY for the degenerate no-cycle / no-lineage fallback below (a plain,
+    // non-CAS save with no freshness ordering); the durable path uses `durableRefreshedAt` (the owning cycle's
+    // database-created timestamp), assigned once from store.getCycle before the save loop.
     const nowIso = () => new Date(clock()).toISOString();
+    let durableRefreshedAt = null;
     let dailySaved = 0;
     let brandViewSaved = 0;
     // Round-5 blocker 1: GENUINE publishable lineage, CLAIM-BEFORE-SAVE. For each report job:
@@ -832,13 +837,15 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // from DURABLE evidence (ZERO DataDoe), the EXACT durable snapshot is ADOPTED when it already exists (a
     // shadow-save commit-unknown left it), else saved once, then reconcile (guarded by the held lease token
     // AND the exact durable snapshot identity) flips the job to success. Nothing here fabricates success.
-    const saveShadow = (snap, params, signal) => saver({
-      reportKey: snap.reportKey, accountId: snap.accountId, params, payload: snap.payload, sourceRefreshedAt: nowIso(),
+    const saveShadow = (snap, params, signal, refreshedAt) => saver({
+      reportKey: snap.reportKey, accountId: snap.accountId, params, payload: snap.payload, sourceRefreshedAt: refreshedAt,
     }, { signal });
     const saveWithLineage = async (snap, params) => {
       const paramsHash = paramsHashFor(params.reportVersion, params);
       if (!reportLineage || !rollup.cycleId) {
-        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
+        // Degenerate non-durable path (no lineage / no cycle): a plain save with no freshness ordering. There
+        // is no owning-cycle evidence timestamp, so this path (and ONLY this path) uses the wall clock.
+        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal, nowIso()), { write: true });
         return { complete: true, newlySaved: true, saved, lineage: "unavailable" };
       }
       const note = (outcome, detail) => rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome, ...(detail ? { detail } : {}) });
@@ -923,7 +930,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           const bytes = assertSnapshotWithinLimit(snap.payload);
           const cas = await dl.bound("shadow-refresh-cas", (signal) => saveShadowIfNewer({
             reportKey: shadowKey, accountId: snap.accountId, paramsHash, params, payload: snap.payload,
-            payloadBytes: bytes, sourceRefreshedAt: nowIso(),
+            payloadBytes: bytes, sourceRefreshedAt: durableRefreshedAt,
           }, { signal }), { write: true });
           const outcome = cas && cas.outcome;
           if (outcome === "replaced" || outcome === "inserted") {
@@ -939,7 +946,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           }
         }
       } else {
-        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal), { write: true });
+        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal, durableRefreshedAt), { write: true });
         if (saved && saved.paramsHash && saved.paramsHash !== paramsHash) {
           throw new Error("SNAPSHOT_PARAMS_HASH_DRIFT: the saver-computed hash disagrees with the reconcile hash; refusing (fail closed).");
         }
@@ -968,6 +975,27 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       return { complete: false, newlySaved, saved: null, lineage: "reconcile-invalid" };
     };
     try {
+      // Round-10 blocker 1: resolve the DB-authoritative durable freshness ONCE, before any shadow save. It is
+      // the OWNING CYCLE's database-created timestamp -- stable across retries, ordering an older cycle strictly
+      // below a newer one regardless of which worker finishes later. A durable-lineage run whose cycle has no
+      // readable created_at fails closed (never a fabricated / wall-clock freshness on durable evidence).
+      if (rollup.cycleId) {
+        if (reportLineage && typeof store.getCycle !== "function") {
+          const err = new Error("LINEAGE_FRESHNESS_UNAVAILABLE: the store cannot read this cycle's database-created timestamp; refusing to save durable shadow evidence with a fabricated freshness (fail closed).");
+          err.code = "LINEAGE_FRESHNESS_UNAVAILABLE"; err.status = 503;
+          throw err;
+        }
+        if (typeof store.getCycle === "function") {
+          const cycleRow = await dl.bound("cycle-created-read", (signal) => store.getCycle(rollup.cycleId, { signal }));
+          const created = cycleRow && (cycleRow.created_at ?? cycleRow.createdAt);
+          durableRefreshedAt = created != null && String(created).trim() !== "" ? String(created) : null;
+        }
+        if (reportLineage && durableRefreshedAt == null) {
+          const err = new Error("LINEAGE_FRESHNESS_UNAVAILABLE: the owning cycle has no database-created timestamp; refusing to save durable shadow evidence with a fabricated freshness (fail closed).");
+          err.code = "LINEAGE_FRESHNESS_UNAVAILABLE"; err.status = 503;
+          throw err;
+        }
+      }
       for (const snap of derived.daily.snapshots) {
         await ensureTime("snapshot-save");
         const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" });

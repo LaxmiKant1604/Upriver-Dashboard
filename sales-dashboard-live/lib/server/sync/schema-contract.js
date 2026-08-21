@@ -438,18 +438,25 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       { label: "sync_report_jobs.derive_lease_token column (additive)", pattern: String.raw`alter\s+table\s+public\.sync_report_jobs[\s\S]{0,200}?add\s+column\s+if\s+not\s+exists\s+derive_lease_token\s+uuid` },
       { label: "sync_report_jobs.derive_lease_expires_at column (additive)", pattern: String.raw`add\s+column\s+if\s+not\s+exists\s+derive_lease_expires_at\s+timestamptz` },
       { label: "sync_report_jobs.derive_attempt_count column (additive)", pattern: String.raw`add\s+column\s+if\s+not\s+exists\s+derive_attempt_count\s+integer\s+not\s+null\s+default\s+0` },
+      // Round-10 blocker 1: the freshness-CAS candidate freshness is timestamptz so the comparison is
+      // chronological/DB-safe (Z == +00:00 == fractional), never a lexicographic RFC3339 string compare.
+      { label: "cas_report_snapshot_if_newer.p_source_refreshed_at is timestamptz", pattern: String.raw`p_source_refreshed_at\s+timestamptz` },
     ],
     rpcs: [
       // Round-8: NO caller-time parameter -- the claim RPC uses DATABASE-authoritative time (now()).
       { name: "claim_report_derive_lease", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_lease_seconds"] },
       { name: "reconcile_report_derive_success", params: ["p_cycle_id", "p_report_key", "p_account_id", "p_snapshot_params_hash", "p_lease_token", "p_latest_data_date"] },
+      // Round-10 blockers 1/2: an atomic, row-locked freshness CAS on report_snapshots; freshness is a
+      // timestamptz (chronological, DB-safe) -- never a lexicographic RFC3339 string or a caller wall clock.
+      { name: "cas_report_snapshot_if_newer", params: ["p_report_key", "p_account_id", "p_params_hash", "p_params", "p_payload", "p_payload_storage_path", "p_payload_bytes", "p_source_refreshed_at"] },
     ],
     provenFunctions: [
       { name: "claim_report_derive_lease", proof: "claim-report-lease" },
       { name: "reconcile_report_derive_success", proof: "reconcile-report-success" },
+      { name: "cas_report_snapshot_if_newer", proof: "cas-report-snapshot" },
     ],
-    wrappers: ["claimReportDeriveLease", "reconcileReportDeriveSuccess"],
-    note: "Report-derive lease + guarded recovery (claim/reconcile RPCs); additive to sync_report_jobs; PREPARED, UNAPPLIED.",
+    wrappers: ["claimReportDeriveLease", "reconcileReportDeriveSuccess", "saveShadowSnapshotIfNewer"],
+    note: "Report-derive lease + guarded recovery (claim/reconcile RPCs) + atomic report_snapshots freshness CAS; additive to sync_report_jobs; PREPARED, UNAPPLIED.",
   },
 ]);
 
@@ -1197,6 +1204,63 @@ function auditReconcileReportSuccessFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Round-10 blockers 1/2 structural proof: the ATOMIC report_snapshots freshness CAS. The body must LOCK the
+// existing natural-key row FOR UPDATE, INSERT-IF-ABSENT (on conflict do nothing), refuse a null candidate
+// freshness ('invalid-freshness'), compare freshness CHRONOLOGICALLY as timestamptz (a strictly-NEWER GUARDED
+// replace whose WHERE re-asserts source_refreshed_at < the candidate; a strictly-OLDER 'newer-live'; an EQUAL
+// branch that returns 'equal' WITH the durable content for the caller's storage-first proof), and it must
+// declare p_source_refreshed_at as timestamptz (so the comparison is instant-correct, never a lexical string
+// compare). Removing any guard -- the lock, the insert-if-absent, the null guard, the guarded replace filter,
+// the older/equal branches, or the timestamptz type -- is a typed blocker.
+function auditCasReportSnapshotFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "SNAPSHOT_FRESH_CAS_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked; const C = body.clean;
+  // (The candidate freshness parameter type -- p_source_refreshed_at timestamptz, so the comparison is
+  // chronological/DB-safe, never a lexicographic RFC3339 string -- is pinned by a requiredStatement on the
+  // signature, which functionBodyViews (dollar-body only) cannot see.)
+  // A null candidate freshness is refused -- an absent instant can never win a CAS.
+  if (!/p_source_refreshed_at\s+is\s+null/i.test(M) || !/'invalid-freshness'/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_NULL_GUARD_MISSING", reason: "does not refuse a null candidate freshness ('invalid-freshness')" });
+  }
+  // INSERT-IF-ABSENT on the natural key (on conflict do nothing) then observe 'inserted'.
+  if (!/insert\s+into\s+public\.report_snapshots\b[\s\S]*?on\s+conflict[\s\S]*?do\s+nothing/i.test(M) || !/'inserted'/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_INSERT_MISSING", reason: "does not INSERT-IF-ABSENT on the natural key (on conflict do nothing -> 'inserted')" });
+  }
+  // LOCK the existing row FOR UPDATE so concurrent writers serialize on the exact row.
+  if (!/from\s+public\.report_snapshots\b[\s\S]*?for\s+update/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_LOCK_MISSING", reason: "does not lock the existing natural-key row FOR UPDATE" });
+  }
+  // STRICTLY-NEWER: a GUARDED replace. The UPDATE's WHERE must re-assert source_refreshed_at < the candidate
+  // (so a concurrent advance matches zero rows and never blind-writes) and return 'replaced'.
+  const guardedReplace = /p_source_refreshed_at\s*>\s*v_row\.source_refreshed_at/i.test(M)
+    && /update\s+public\.report_snapshots\b[\s\S]*?where[\s\S]*?source_refreshed_at\s*<\s*p_source_refreshed_at/i.test(M)
+    && /'replaced'/i.test(C);
+  if (!guardedReplace) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_REPLACE_UNGUARDED", reason: "a strictly-newer candidate is not a GUARDED replace (WHERE source_refreshed_at < p_source_refreshed_at -> 'replaced')" });
+  }
+  // STRICTLY-OLDER durable evidence wins with zero write ('newer-live').
+  if (!/p_source_refreshed_at\s*<\s*v_row\.source_refreshed_at/i.test(M) || !/'newer-live'/i.test(C)) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_OLDER_MISSING", reason: "does not preserve strictly-older durable evidence ('newer-live', zero write)" });
+  }
+  // EQUAL freshness returns 'equal' WITH the durable content (params + payload + storage pointer) so the caller
+  // proves identity storage-first; it must NOT overwrite here. The jsonb KEYS are string literals (checked in
+  // `clean`, where strings are preserved); the returned VALUE expressions are code (checked in `masked`).
+  const equalReturnsContent = /'equal'/i.test(C)
+    && /'payload_storage_path'/i.test(C)
+    && /v_row\.payload_storage_path/i.test(M)
+    && /v_row\.payload\b/i.test(M);
+  if (!equalReturnsContent) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_EQUAL_UNPROVEN", reason: "the EQUAL-freshness branch does not return the durable content ('equal' + payload + payload_storage_path) for a storage-first identity proof" });
+  }
+  // No generic WHEN OTHERS handler may swallow a failed write into a success acknowledgement.
+  if (/when\s+others\b/i.test(M)) {
+    problems.push({ code: "SNAPSHOT_FRESH_CAS_EXCEPTION_SWALLOWED", reason: "a generic WHEN OTHERS handler could swallow a failed write into a success acknowledgement" });
+  }
+  return problems;
+}
+
 function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
@@ -1205,6 +1269,7 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
   if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);
+  if (proof === "cas-report-snapshot") return auditCasReportSnapshotFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 

@@ -50,6 +50,17 @@ function canonJson(value) {
   return JSON.stringify(value === undefined ? null : value);
 }
 
+// Round-10 blocker 1: CHRONOLOGICAL instant comparison (epoch ms) mirroring supabase.js instantMs / the RPC's
+// timestamptz comparison -- so the harness CAS orders freshness by real time (Z == +00:00 == fractional),
+// never by lexicographic RFC3339 string order. Returns null for a blank/unparseable value (fail closed).
+function instantMsT(value) {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  if (s === "") return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 const PRIM_KEY = ["prim", "key"].join("-");
 const SEC_KEY = ["sec", "key"].join("-");
 const CONNS = [
@@ -67,6 +78,10 @@ function makeStore() {
   // Round-7 finding 1: the durable report_snapshots model (keyed by shadow report_key|account|params_hash)
   // the lease reconcile + the runtime's adopt-if-exists read consult; plus a lease-token counter.
   const reportSnapshots = new Map(); let leaseSeq = 0;
+  // Round-10 blocker 2: object-storage-backed shadow payloads (path -> payload). A storage-backed durable row
+  // carries a payload_storage_path; the freshness CAS proves EQUAL-freshness identity STORAGE-FIRST by
+  // hydrating this map (a missing entry models a dangling/unreadable object -> fail closed).
+  const shadowStorage = new Map();
   const rsKey = (rk, a, h) => rk + "|" + a + "|" + h;
   // Round-8 finding 1: DATABASE-AUTHORITATIVE time. The lease RPC model reads THIS clock (never a caller-
   // supplied time), so a runtime/caller clock skew cannot steal or distort a lease. Tests advance it via
@@ -94,7 +109,9 @@ function makeStore() {
     openCycle({ bucket, cycleDate }) {
       store._opens += 1;
       const k = bucket + "|" + cycleDate;
-      if (!cycles.has(k)) { const id = "cyc_" + (seq += 1); cycles.set(k, { id, bucket, status: "pending" }); jobsByCycle.set(id, new Map()); }
+      // Round-10 blocker 1: created_at is DATABASE-authoritative (stamped from dbClock at creation) and STABLE
+      // -- reopening the same (bucket, cycleDate) returns the SAME row/created_at, so a retry never advances it.
+      if (!cycles.has(k)) { const id = "cyc_" + (seq += 1); cycles.set(k, { id, bucket, status: "pending", created_at: new Date(dbClock.now).toISOString() }); jobsByCycle.set(id, new Map()); }
       return cycles.get(k).id;
     },
     claimCycle(id) { const c = findCycle(id); if (c && c.status === "pending") { c.status = "running"; return true; } return false; },
@@ -264,22 +281,38 @@ function makeStore() {
     getShadowSnapshot({ reportKey, accountId, paramsHash }) {
       return reportSnapshots.get(rsKey(reportKey, accountId, paramsHash)) || null;
     },
-    // Round-9 finding 4: FAITHFUL model of the atomic freshness/CAS shadow save (publishLiveSnapshotIfNewer
-    // on the shadow report_snapshots row): insert-if-absent; a STRICTLY-NEWER candidate replaces older
-    // evidence atomically; an EQUAL-freshness canonically-IDENTICAL candidate is already-current (no write);
-    // an OLDER (newer-live) or EQUAL-but-DIFFERENT candidate preserves LKG (no write).
-    shadowCasIfNewer({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt }) {
+    putShadowStorage(path, payload) { shadowStorage.set(path, payload); },
+    // Round-9 finding 4 + round-10 blockers 1/2: FAITHFUL model of the atomic freshness/CAS shadow save
+    // (cas_report_snapshot_if_newer + the wrapper's storage-first equal-case proof). Freshness is compared
+    // CHRONOLOGICALLY (epoch ms; Z == +00:00 == fractional), NEVER as a lexicographic RFC3339 string. A null
+    // candidate freshness never wins. Insert-if-absent; a STRICTLY-NEWER candidate replaces older evidence
+    // atomically; a STRICTLY-OLDER candidate preserves LKG ('newer-live'); at EQUAL freshness the content
+    // identity is proven STORAGE-FIRST (a nonblank payload_storage_path is authoritative and is hydrated even
+    // when an inline payload exists; a dangling/unreadable object or any mismatch fails closed -> 'conflict').
+    shadowCasIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadStoragePath = null, sourceRefreshedAt }) {
       const k = rsKey(reportKey, accountId, paramsHash);
       const existing = reportSnapshots.get(k);
-      const put = () => reportSnapshots.set(k, { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, payload_storage_path: null, source_refreshed_at: sourceRefreshedAt });
+      const put = () => reportSnapshots.set(k, { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params, payload, payload_storage_path: payloadStoragePath, source_refreshed_at: sourceRefreshedAt });
+      const candMs = instantMsT(sourceRefreshedAt);
+      if (candMs === null) return { outcome: "conflict" }; // blocker 1: a null/blank freshness is never authoritative
       if (!existing) { put(); return { outcome: "inserted" }; }
-      const liveTs = String(existing.source_refreshed_at ?? ""); const candTs = String(sourceRefreshedAt ?? "");
-      if (liveTs === "" || candTs === "") return { outcome: "conflict" };
-      if (liveTs > candTs) return { outcome: "newer-live" };
-      if (liveTs < candTs) { put(); return { outcome: "replaced" }; }
-      // equal freshness: proven-identical content adopts; anything else is a conflict (LKG preserved).
-      if (canonJson(existing.params) === canonJson(params) && canonJson(existing.payload) === canonJson(payload)) return { outcome: "already-current" };
-      return { outcome: "conflict" };
+      const liveMs = instantMsT(existing.source_refreshed_at);
+      if (liveMs === null) return { outcome: "conflict" };
+      if (candMs > liveMs) { put(); return { outcome: "replaced" }; }
+      if (candMs < liveMs) return { outcome: "newer-live" };
+      // EQUAL freshness: prove params, then the AUTHORITATIVE payload STORAGE-FIRST.
+      if (canonJson(existing.params) !== canonJson(params)) return { outcome: "conflict" };
+      const path = typeof existing.payload_storage_path === "string" ? existing.payload_storage_path.trim() : "";
+      let livePayload;
+      if (path !== "") {
+        if (!shadowStorage.has(path)) return { outcome: "conflict" }; // dangling/unreadable authoritative object
+        livePayload = shadowStorage.get(path);
+      } else {
+        livePayload = existing.payload;
+      }
+      if (livePayload == null || payload == null) return { outcome: "conflict" };
+      if (canonJson(livePayload) !== canonJson(payload)) return { outcome: "conflict" };
+      return { outcome: "already-current" };
     },
     getReportJob(reportKey, accountId) {
       const rows = [...reportJobs.values()].filter((r) => r.report_key === reportKey && r.account_id === accountId);
@@ -301,6 +334,7 @@ function makeStore() {
     },
   };
   store._dbClock = dbClock; // Round-8: tests advance DB-authoritative time here (never via the caller clock).
+  store._shadowStorage = shadowStorage; // Round-10: tests seed storage-backed shadow payloads for the CAS proof.
   return store;
 }
 
@@ -2211,12 +2245,18 @@ async function savedButRunning() {
 async function recoverWith(store, { runtimeNow, ...over } = {}) {
   store._dbClock.now = PAST_LEASE_MS; // the abandoned lease has expired -> a fresh run reclaims (DB time).
   const h2 = fullFixture({ store, ...over });
-  // The candidate's source_refreshed_at (nowIso) uses the RUNTIME clock, which is SEPARATE from DB lease
-  // time -- so a test can make the fresh candidate newer/older than the durable evidence for the CAS.
+  // Round-10 blocker 1: the recovery candidate's freshness is the OWNING CYCLE's database-created timestamp
+  // (created when h1 opened the cycle; STABLE across retries and independent of the runtime/wall clock). To
+  // make the durable evidence older/newer than the candidate, a test sets the durable row's source_refreshed_at
+  // directly (that models evidence derived by a different, older/newer cycle). `runtimeNow` advances the RUNTIME
+  // wall clock to PROVE it no longer drives durable freshness (under the old design it did, via nowIso()).
   if (runtimeNow != null) h2.clockRef.now = runtimeNow;
   const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
   return { h2, r2, job: store.getReportJob("daily-reporting", "A01") };
 }
+// The owning cycle's database-created timestamp: h1 opened the cycle at BASE_MS, so every recovery candidate's
+// freshness is exactly this instant regardless of how far the DB/wall clock later advances.
+const CYCLE_CREATED_ISO = new Date(BASE_MS).toISOString();
 const conflictOutcome = (r2, reason) => r2.derived.lineage.some((l) => l.reportKey === "daily-reporting" && l.accountId === "A01" && l.outcome === "snapshot-conflict" && l.detail === reason);
 const outcomeOf = (r2, rk, a) => (r2.derived.lineage.find((l) => l.reportKey === rk && l.accountId === a) || {}).outcome;
 
@@ -2268,7 +2308,7 @@ test("Y6. round-9 finding 4: an EQUAL-freshness but CONTENT-CONFLICTING durable 
   const { store, snapshot } = await savedButRunning();
   const lkg = snapshot.payload;
   snapshot.payload = { ...snapshot.payload, __conflict: "different-content" }; // still contract-valid, but != candidate
-  // recoverWith default: h2's runtime clock == the durable's source_refreshed_at -> EQUAL freshness.
+  // The durable evidence and the recovery candidate share the SAME owning-cycle created_at -> EQUAL freshness.
   const { r2, job } = await recoverWith(store);
   assert.equal(job.validated, false, "an equal-freshness conflicting-content snapshot is NEVER adopted");
   assert.ok(conflictOutcome(r2, "conflict"), "typed CAS conflict (equal freshness, different content)");
@@ -2277,25 +2317,30 @@ test("Y6. round-9 finding 4: an EQUAL-freshness but CONTENT-CONFLICTING durable 
   assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "open-work");
 });
 
-test("Y6b. round-9 finding 4: a legitimate NEWER freshly-derived candidate (correction/rerun) atomically REPLACES older shadow evidence and validates", async () => {
+test("Y6b. round-9 finding 4 + round-10 blocker 1: a candidate from a NEWER cycle (correction/rerun) atomically REPLACES older-cycle shadow evidence and validates", async () => {
   const { store, snapshot, hash } = await savedButRunning();
-  // The durable snapshot is stale/wrong content; our fresh candidate is the correct derivation.
+  // The durable snapshot is stale/wrong content derived by an OLDER cycle; our fresh candidate is the correct
+  // derivation. Round-10: freshness is DB-authoritative -- make the DURABLE evidence older by stamping its
+  // source_refreshed_at before the owning cycle's created_at (the candidate's stable freshness).
   snapshot.payload = { ...snapshot.payload, __stale: "old-evidence" };
-  // Make the fresh candidate strictly NEWER than the durable's source_refreshed_at.
-  const { r2, job } = await recoverWith(store, { runtimeNow: BASE_MS + 10_000_000 });
-  assert.equal(job.validated, true, "a newer validated candidate replaces older evidence and completes");
+  snapshot.source_refreshed_at = new Date(BASE_MS - 10_000_000).toISOString();
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, true, "a newer-cycle validated candidate replaces older evidence and completes");
   const durable = store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash });
   assert.ok(!("__stale" in durable.payload), "the stale content was atomically REPLACED by the fresh candidate");
+  assert.equal(durable.source_refreshed_at, CYCLE_CREATED_ISO, "the durable freshness advanced to the owning cycle's created_at");
   assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "recovered", "typed recovered (refreshed) outcome");
   assert.equal(store.finalizeCycle({ cycleId: r2.cycleId }).disposition, "finalized", "finalize can now terminalize");
 });
 
-test("Y6c. round-9 finding 4: an OLDER candidate never overwrites a newer durable refresh (newer-live) => typed RESUMABLE, LKG preserved", async () => {
+test("Y6c. round-9 finding 4 + round-10 blocker 1: a candidate from an OLDER cycle never overwrites newer-cycle durable evidence (newer-live) => typed RESUMABLE, LKG preserved", async () => {
   const { store, snapshot, hash } = await savedButRunning();
+  // The durable evidence was derived by a NEWER cycle -> its source_refreshed_at is after the candidate's
+  // owning-cycle created_at. An older-cycle candidate can never overwrite it.
   snapshot.payload = { ...snapshot.payload, __newer: "durable-refresh" };
-  // Make the fresh candidate strictly OLDER than the durable's source_refreshed_at.
-  const { r2, job } = await recoverWith(store, { runtimeNow: BASE_MS - 5_000_000 });
-  assert.equal(job.validated, false, "an older candidate never overwrites/adopts the newer durable");
+  snapshot.source_refreshed_at = new Date(BASE_MS + 10_000_000).toISOString();
+  const { r2, job } = await recoverWith(store);
+  assert.equal(job.validated, false, "an older-cycle candidate never overwrites/adopts the newer durable");
   assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "snapshot-newer", "typed snapshot-newer");
   assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash }).payload.__newer, "durable-refresh", "LKG (the newer durable) is preserved");
   assert.equal(r2.derived.resumable, true, "newer-live is RESUMABLE (a later invocation reads+validates the newer durable)");
@@ -2508,6 +2553,191 @@ test("ZM1. the REAL 20260822 audits clean; mutating any lease/reconcile guard ra
   // Round-9 finding 1: reconcile 'already-complete' MUST echo the hash -- dropping the echo fails.
   const noEcho = auditWith822((s) => s.replace("    return jsonb_build_object('disposition', 'already-complete', 'snapshot_params_hash', v_job.snapshot_params_hash);\n  end if;\n  -- Round-8: reconcile is meaningful", "    return jsonb_build_object('disposition', 'already-complete');\n  end if;\n  -- Round-8: reconcile is meaningful"));
   assert.ok(has(noEcho, "RECONCILE_IDEMPOTENT_MISSING"), JSON.stringify(noEcho.blockers.map((b) => b.code)));
+});
+
+test("ZM2. round-10 blockers 1/2: mutating any freshness-CAS guard in cas_report_snapshot_if_newer raises a typed blocker", () => {
+  assert.equal(auditWith822(null).ok, true, "baseline clean");
+  const has = (res, code) => res.blockers.some((b) => b.code === code);
+  // Blocker 1: the candidate freshness must be timestamptz (chronological). Changing it to text (lexicographic-
+  // prone) drops the required-statement proof.
+  const asText = auditWith822((s) => s.replace("  p_payload_bytes bigint, p_source_refreshed_at timestamptz\n)", "  p_payload_bytes bigint, p_source_refreshed_at text\n)"));
+  assert.ok(has(asText, "STATEMENT_MISSING"), JSON.stringify(asText.blockers.map((b) => b.code)));
+  // Null-freshness guard dropped -> a null instant could win a CAS.
+  const noNull = auditWith822((s) => s.replace("  if p_source_refreshed_at is null then\n    return jsonb_build_object('disposition', 'invalid-freshness');\n  end if;\n", ""));
+  assert.ok(has(noNull, "SNAPSHOT_FRESH_CAS_NULL_GUARD_MISSING"), JSON.stringify(noNull.blockers.map((b) => b.code)));
+  // Insert-if-absent dropped.
+  const noInsert = auditWith822((s) => s.replace("  on conflict (report_key, account_id, params_hash) do nothing;", "  ;"));
+  assert.ok(has(noInsert, "SNAPSHOT_FRESH_CAS_INSERT_MISSING"), JSON.stringify(noInsert.blockers.map((b) => b.code)));
+  // FOR UPDATE lock dropped on the CAS select.
+  const noLock = auditWith822((s) => s.replace("    where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash\n    for update;", "    where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash;"));
+  assert.ok(has(noLock, "SNAPSHOT_FRESH_CAS_LOCK_MISSING"), JSON.stringify(noLock.blockers.map((b) => b.code)));
+  // Guarded replace: dropping "and source_refreshed_at < p_source_refreshed_at" makes it a blind overwrite.
+  const blindReplace = auditWith822((s) => s.replace("      where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash\n        and source_refreshed_at < p_source_refreshed_at;", "      where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash;"));
+  assert.ok(has(blindReplace, "SNAPSHOT_FRESH_CAS_REPLACE_UNGUARDED"), JSON.stringify(blindReplace.blockers.map((b) => b.code)));
+  // Strictly-older branch removed -> 'newer-live' path broken.
+  const noOlder = auditWith822((s) => s.replace("  elsif p_source_refreshed_at < v_row.source_refreshed_at then", "  elsif false then"));
+  assert.ok(has(noOlder, "SNAPSHOT_FRESH_CAS_OLDER_MISSING"), JSON.stringify(noOlder.blockers.map((b) => b.code)));
+  // Equal branch must return the durable content for a storage-first identity proof.
+  const noEqualContent = auditWith822((s) => s.replace("    return jsonb_build_object(\n      'disposition', 'equal',\n      'params', v_row.params,\n      'payload', v_row.payload,\n      'payload_storage_path', v_row.payload_storage_path\n    );", "    return jsonb_build_object('disposition', 'equal');"));
+  assert.ok(has(noEqualContent, "SNAPSHOT_FRESH_CAS_EQUAL_UNPROVEN"), JSON.stringify(noEqualContent.blockers.map((b) => b.code)));
+});
+
+
+group("V. round-10 blockers 1/2: DATABASE-authoritative evidence freshness + storage-first freshness CAS");
+
+test("V1. blocker 1: the runtime stamps durable shadow freshness with the OWNING CYCLE's created_at (never the caller/route wall clock)", async () => {
+  const store = makeStore();
+  store._dbClock.now = 5_000_000; // DB-authoritative cycle-creation time, DISTINCT from the runtime wall clock (8_000_000).
+  const h = fullFixture({ store });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.derived.skipped, null, "the happy path completes (regression 8: existing behavior intact)");
+  const created = h.store.getCycle(rollup.cycleId).created_at;
+  assert.equal(created, new Date(5_000_000).toISOString(), "the owning cycle's created_at is the DB-authoritative instant");
+  const saves = h.recorded.shadowSaves;
+  assert.ok(saves.length >= 1, "durable shadow saves happened");
+  for (const s of saves) {
+    assert.equal(s.sourceRefreshedAt, created, s.reportKey + "/" + s.accountId + ": durable freshness == owning cycle created_at (DB-authoritative)");
+  }
+  // A wall-clock freshness would be the RUNTIME clock instant (8_000_000), which the durable saves must NOT use.
+  assert.notEqual(saves[0].sourceRefreshedAt, new Date(8_000_000).toISOString(), "freshness is the cycle created_at, NOT the runtime wall clock");
+});
+
+test("V2. regression 1+2+7: an older-cycle candidate never overwrites newer-cycle evidence; advancing the wall clock does NOT help; LKG byte-identical", async () => {
+  const { store, snapshot, hash } = await savedButRunning();
+  // Durable evidence was produced by a NEWER cycle -> its freshness is after the recovery candidate's cycle created_at.
+  snapshot.payload = { ...snapshot.payload, __newer_cycle: "durable" };
+  snapshot.source_refreshed_at = new Date(BASE_MS + 20_000_000).toISOString();
+  const lkg = JSON.parse(JSON.stringify(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash })));
+  // Advance the RUNTIME wall clock FAR into the future: under the old design nowIso() would make the candidate
+  // "newest" and overwrite; under the DB-authoritative design freshness is the stable cycle created_at.
+  const { r2, job } = await recoverWith(store, { runtimeNow: BASE_MS + 999_000_000 });
+  assert.equal(outcomeOf(r2, "daily-reporting", "A01"), "snapshot-newer", "the older-cycle candidate never overwrites the newer durable, even with a future wall clock");
+  assert.equal(job.validated, false);
+  assert.equal(r2.derived.resumable, true, "newer-live is resumable");
+  assert.deepEqual(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: hash }), lkg, "LKG is byte-identical (never overwritten)");
+});
+
+test("V3. regression 3: EQUAL instants written as Z / +00:00 / a non-UTC offset / fractional precision compare CHRONOLOGICALLY (never lexicographically)", () => {
+  const store = makeStore();
+  const cand = (ts, payload, sp) => ({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: { reportVersion: "v", accountId: "A01" }, payload, sourceRefreshedAt: ts, payloadStoragePath: sp || null });
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:00Z", { v: 1 })).outcome, "inserted");
+  // '+00:00' is lexicographically BEFORE 'Z' but the SAME instant -> already-current (identical content), not newer-live.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:00+00:00", { v: 1 })).outcome, "already-current", "Z == +00:00 (identical content adopts)");
+  // A non-UTC offset naming the same instant (05:30+05:30 == 00:00Z).
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T05:30:00+05:30", { v: 1 })).outcome, "already-current", "offset instant equals the UTC instant");
+  // Added fractional precision, same instant, DIFFERENT content -> equal-freshness conflict (LKG preserved), NOT replaced.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:00.000Z", { v: 2 })).outcome, "conflict", "equal fractional instant + different content is a conflict, never a blind replace");
+  // A genuinely newer instant (+1ms) with different content DOES replace.
+  assert.equal(store.shadowCasIfNewer(cand("2026-08-22T00:00:00.001Z", { v: 3 })).outcome, "replaced");
+  assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" }).payload.v, 3);
+});
+
+test("V4. blocker 2 (live publish): publishLiveSnapshotIfNewer compares instants chronologically and proves EQUAL identity STORAGE-FIRST (a stale inline can never stand in)", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const CAND = { ok: true, rows: [1, 2, 3] };
+  const args = { reportKey: "daily-reporting", accountId: "A01", paramsHash: "h".repeat(40), params: { reportVersion: "v", to: "2026-08-14" }, payload: CAND, payloadBytes: 20, sourceRefreshedAt: "2026-08-14T00:00:00Z" };
+  const realFetch = globalThis.fetch;
+  // Dispatch by request kind: insert POST / readLive GET / storage GET (identity/different/unreadable).
+  const stub = ({ live, storagePayload, storageStatus = 200 }) => { globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url); const method = (opts.method || "GET").toUpperCase();
+    if (u.includes("/storage/v1/object/")) {
+      if (storageStatus !== 200) return { ok: false, status: storageStatus, json: async () => null, text: async () => "" };
+      return { ok: true, status: 200, json: async () => storagePayload, text: async () => JSON.stringify(storagePayload) };
+    }
+    if (u.includes("/rest/v1/report_snapshots") && method === "POST") return { ok: true, status: 201, json: async () => [], text: async () => "" }; // insert conflicts (row exists)
+    return { ok: true, status: 200, json: async () => (live == null ? [] : [live]), text: async () => "" }; // readLive GET
+  }; };
+  try {
+    // '+00:00' live at the SAME instant as the 'Z' candidate + identical inline -> already-current (chronological).
+    stub({ live: { params: args.params, payload: CAND, payload_storage_path: null, source_refreshed_at: "2026-08-14T00:00:00+00:00" } });
+    assert.deepEqual(await sb.publishLiveSnapshotIfNewer(args), { outcome: "already-current" }, "Z vs +00:00 compare EQUAL (not newer-live)");
+    // STORAGE-FIRST: a stale INLINE that matches the candidate but an AUTHORITATIVE storage object that DIFFERS
+    // must be a conflict (the inline can never stand in) -> never already-current, never a reconcilable success.
+    stub({ live: { params: args.params, payload: CAND, payload_storage_path: "live/obj.json", source_refreshed_at: "2026-08-14T00:00:00Z" }, storagePayload: { ok: true, rows: [9, 9, 9] } });
+    assert.deepEqual(await sb.publishLiveSnapshotIfNewer(args), { outcome: "conflict" }, "authoritative storage differs -> conflict even though inline matches");
+    // STORAGE-FIRST adopt: a DIFFERENT inline but the AUTHORITATIVE storage object equals the candidate -> already-current.
+    stub({ live: { params: args.params, payload: { ok: true, rows: [7, 7, 7] }, payload_storage_path: "live/obj.json", source_refreshed_at: "2026-08-14T00:00:00Z" }, storagePayload: CAND });
+    assert.deepEqual(await sb.publishLiveSnapshotIfNewer(args), { outcome: "already-current" }, "authoritative storage matches -> adopt (inline is ignored)");
+    // STORAGE unreadable at equal freshness -> cannot prove identity -> conflict (fail closed).
+    stub({ live: { params: args.params, payload: CAND, payload_storage_path: "live/obj.json", source_refreshed_at: "2026-08-14T00:00:00Z" }, storageStatus: 500 });
+    assert.deepEqual(await sb.publishLiveSnapshotIfNewer(args), { outcome: "conflict" }, "unreadable authoritative storage -> fail closed");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V5. blocker 1+2 (shadow CAS): saveShadowSnapshotIfNewer routes through the atomic RPC and proves EQUAL identity STORAGE-FIRST + fails closed", async () => {
+  const sb = await import("../lib/server/supabase.js");
+  const CAND = { ok: true, rows: [1, 2, 3] };
+  const base = { reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "h".repeat(40), params: { reportVersion: "v", accountId: "A01" }, payload: CAND, payloadBytes: 20, sourceRefreshedAt: "2026-08-20T00:00:00Z" };
+  const realFetch = globalThis.fetch;
+  const stub = ({ rpc, storagePayload, storageStatus = 200 }) => { globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.includes("/rest/v1/rpc/cas_report_snapshot_if_newer")) return { ok: true, status: 200, json: async () => rpc, text: async () => "" };
+    if (u.includes("/storage/v1/object/")) {
+      if (storageStatus !== 200) return { ok: false, status: storageStatus, json: async () => null, text: async () => "" };
+      return { ok: true, status: 200, json: async () => storagePayload, text: async () => JSON.stringify(storagePayload) };
+    }
+    return { ok: true, status: 200, json: async () => null, text: async () => "" };
+  }; };
+  try {
+    // The RPC owns freshness ordering: inserted / replaced / newer-live pass straight through.
+    stub({ rpc: { disposition: "inserted" } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "inserted" });
+    stub({ rpc: { disposition: "replaced" } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "replaced" });
+    stub({ rpc: { disposition: "newer-live" } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "newer-live" });
+    // A refused (null-freshness) or unknown ack fails closed as a conflict.
+    stub({ rpc: { disposition: "invalid-freshness" } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "conflict" });
+    // EQUAL + inline identical (no storage pointer) -> already-current.
+    stub({ rpc: { disposition: "equal", params: base.params, payload: CAND, payload_storage_path: null } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "already-current" });
+    // regression 4: EQUAL + inline == candidate BUT authoritative storage DIFFERS -> conflict (storage-first).
+    stub({ rpc: { disposition: "equal", params: base.params, payload: CAND, payload_storage_path: "shadow/obj.json" }, storagePayload: { ok: true, rows: [9, 9, 9] } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "conflict" }, "authoritative storage differs -> never already-current");
+    // regression 5: EQUAL + inline DIFFERENT but authoritative storage == candidate -> already-current after hydration.
+    stub({ rpc: { disposition: "equal", params: base.params, payload: { ok: true, rows: [7, 7, 7] }, payload_storage_path: "shadow/obj.json" }, storagePayload: CAND });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "already-current" }, "authoritative storage matches -> adopt");
+    // EQUAL + storage unreadable -> cannot prove identity after the race -> conflict (fail closed, never reconcile).
+    stub({ rpc: { disposition: "equal", params: base.params, payload: CAND, payload_storage_path: "shadow/obj.json" }, storageStatus: 500 });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "conflict" }, "unreadable authoritative storage -> fail closed");
+    // EQUAL + different params -> conflict.
+    stub({ rpc: { disposition: "equal", params: { reportVersion: "v", accountId: "A01", extra: 1 }, payload: CAND, payload_storage_path: null } });
+    assert.deepEqual(await sb.saveShadowSnapshotIfNewer(base), { outcome: "conflict" });
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("V6. regression 6: concurrent writers from cycles created c1<c2<c3 converge on the NEWEST evidence regardless of finish order; equal-freshness identical adopts", () => {
+  const store = makeStore();
+  const c1 = new Date(BASE_MS + 1000).toISOString();
+  const c2 = new Date(BASE_MS + 2000).toISOString();
+  const c3 = new Date(BASE_MS + 3000).toISOString();
+  const cand = (ts, v) => ({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: { reportVersion: "v", accountId: "A01" }, payload: { v }, sourceRefreshedAt: ts });
+  // Finish order is scrambled (c2, then c1 late, then c3): the newest cycle's evidence must win.
+  assert.equal(store.shadowCasIfNewer(cand(c2, "c2")).outcome, "inserted");
+  assert.equal(store.shadowCasIfNewer(cand(c1, "c1")).outcome, "newer-live", "an older cycle finishing later cannot overwrite");
+  assert.equal(store.shadowCasIfNewer(cand(c3, "c3")).outcome, "replaced", "the newest cycle wins");
+  assert.equal(store.shadowCasIfNewer(cand(c1, "c1")).outcome, "newer-live", "a straggler older cycle still cannot overwrite");
+  assert.equal(store.getShadowSnapshot({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" }).payload.v, "c3", "all writers converged on the newest evidence (c3)");
+  // A re-run of the SAME (newest) cycle with identical content adopts (idempotent), never a spurious rewrite.
+  assert.equal(store.shadowCasIfNewer(cand(c3, "c3")).outcome, "already-current");
+});
+
+test("V7. regression 7: LKG stays byte-identical on EVERY conflict / unprovable freshness-CAS path", () => {
+  const store = makeStore();
+  const key = { reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" };
+  store.shadowCasIfNewer({ ...key, params: { reportVersion: "v", accountId: "A01" }, payload: { v: "lkg" }, sourceRefreshedAt: "2026-08-20T00:00:00Z" });
+  const snap = () => JSON.parse(JSON.stringify(store.getShadowSnapshot(key)));
+  const lkg = snap();
+  // (a) null/blank candidate freshness -> conflict, no write.
+  assert.equal(store.shadowCasIfNewer({ ...key, params: { reportVersion: "v", accountId: "A01" }, payload: { v: "x" }, sourceRefreshedAt: "" }).outcome, "conflict");
+  assert.deepEqual(snap(), lkg);
+  // (b) equal freshness, different content -> conflict, no write.
+  assert.equal(store.shadowCasIfNewer({ ...key, params: { reportVersion: "v", accountId: "A01" }, payload: { v: "different" }, sourceRefreshedAt: "2026-08-20T00:00:00Z" }).outcome, "conflict");
+  assert.deepEqual(snap(), lkg);
+  // (c) older candidate -> newer-live, no write.
+  assert.equal(store.shadowCasIfNewer({ ...key, params: { reportVersion: "v", accountId: "A01" }, payload: { v: "older" }, sourceRefreshedAt: "2026-08-19T00:00:00Z" }).outcome, "newer-live");
+  assert.deepEqual(snap(), lkg);
 });
 
 

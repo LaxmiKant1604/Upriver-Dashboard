@@ -717,7 +717,9 @@ export async function claimSyncCycle(cycleId, { signal = null } = {}) {
 
 export async function getSyncCycle(cycleId, { signal = null } = {}) {
   const query = new URLSearchParams({
-    select: "id,bucket,cycle_date,status,started_at,finished_at,source_total,source_succeeded,source_failed",
+    // Round-10 blocker 1: created_at is the DATABASE-authoritative, retry-stable freshness authority for this
+    // cycle's derived shadow snapshots (never the caller/route wall clock).
+    select: "id,bucket,cycle_date,status,created_at,started_at,finished_at,source_total,source_succeeded,source_failed",
     id: `eq.${cycleId}`,
     limit: "1",
   });
@@ -2145,6 +2147,18 @@ function canonicalJsonString(value) {
   return JSON.stringify(sortDeep(value));
 }
 
+// Round-10 blocker 1: a CHRONOLOGICAL instant comparison. Parse an RFC3339 timestamp to epoch milliseconds so
+// two EQUIVALENT instants that are written differently ('Z' vs '+00:00', a non-UTC offset, differing fractional
+// precision) compare EQUAL, and ordering is by real time -- never a lexicographic string compare. Returns null
+// for a blank/unparseable value so the caller can fail closed (an uncomparable freshness is never a win).
+function instantMs(value) {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  if (s === "") return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 /**
  * Gate-7 shadow-to-live CAS publish primitive on the natural key (report_key, account_id, params_hash).
  * Returns ONLY a typed outcome -- never a payload, storage path, digest, or raw DB response:
@@ -2164,7 +2178,6 @@ function canonicalJsonString(value) {
  * transport failure (the caller maps it to a typed safe disposition).
  */
 export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt }, { signal = null } = {}) {
-  const candTs = String(sourceRefreshedAt ?? "").trim();
   const candParams = params || {};
   const candPayload = payload == null ? null : payload;
   const body = {
@@ -2202,29 +2215,38 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
   if (!live) return { outcome: "conflict" }; // vanished between insert and read -> fail closed, no write
 
   // EQUAL-or-NEWER classifier: EQUAL freshness demands PROVEN content identity (params AND payload, the live
-  // payload hydrated from storage when needed); anything unprovable is a conflict, never an overwrite.
+  // payload hydrated STORAGE-FIRST); anything unprovable is a conflict, never an overwrite. Round-10 blocker 1:
+  // freshness is compared CHRONOLOGICALLY (epoch instants), never as a lexicographic RFC3339 string.
+  const candMs = instantMs(sourceRefreshedAt);
   const classifyNonOlder = async (row) => {
-    const liveTs = String(row.source_refreshed_at ?? "").trim();
-    if (liveTs === "" || candTs === "") return { outcome: "conflict" }; // uncomparable freshness -> fail closed
-    if (liveTs > candTs) return { outcome: "newer-live" };
-    if (liveTs !== candTs) return { outcome: "conflict" }; // strictly older reached here only via a race -> no blind write
+    const liveMs = instantMs(row.source_refreshed_at);
+    if (liveMs === null || candMs === null) return { outcome: "conflict" }; // uncomparable freshness -> fail closed
+    if (liveMs > candMs) return { outcome: "newer-live" };
+    if (liveMs !== candMs) return { outcome: "conflict" }; // strictly older reached here only via a race -> no blind write
     // EQUAL freshness: prove params AND payload are canonically identical.
     if (canonicalJsonString(row.params) !== canonicalJsonString(candParams)) return { outcome: "conflict" };
-    let livePayload = row.payload;
-    if (livePayload == null && String(row.payload_storage_path ?? "").trim() !== "") {
+    // Round-10 blocker 2: STORAGE-FIRST identity. A nonblank payload_storage_path is AUTHORITATIVE and is
+    // ALWAYS hydrated + compared -- even when an inline payload is also present (a stale inline that happens to
+    // match the candidate can NEVER stand in for authoritative storage). Inline is used ONLY when the pointer
+    // is blank. An unreadable/absent object -> cannot prove identity after the race -> conflict (fail closed).
+    const storagePath = String(row.payload_storage_path ?? "").trim();
+    let livePayload;
+    if (storagePath !== "") {
       try {
-        livePayload = await getReportSnapshotStoragePayload(String(row.payload_storage_path).trim(), { signal });
+        livePayload = await getReportSnapshotStoragePayload(storagePath, { signal });
       } catch (_e) {
-        return { outcome: "conflict" }; // unreadable live storage -> cannot prove identity -> no write
+        return { outcome: "conflict" }; // unreadable authoritative storage -> cannot prove identity -> no write
       }
+    } else {
+      livePayload = row.payload;
     }
     if (livePayload == null || candPayload == null) return { outcome: "conflict" };
     if (canonicalJsonString(livePayload) !== canonicalJsonString(candPayload)) return { outcome: "conflict" };
     return { outcome: "already-current" };
   };
 
-  const liveTs = String(live.source_refreshed_at ?? "").trim();
-  if (liveTs !== "" && candTs !== "" && liveTs < candTs) {
+  const liveMs = instantMs(live.source_refreshed_at);
+  if (liveMs !== null && candMs !== null && liveMs < candMs) {
     // STRICTLY OLDER: guarded replacement. The `lt` filter keeps this a CAS -- if a concurrent write advanced
     // the row to >= candidate between our read and this PATCH, it matches ZERO rows and we re-classify (never
     // a blind overwrite). The inline payload wins, so payload_storage_path is cleared explicitly.
@@ -2248,16 +2270,52 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
   return classifyNonOlder(live);
 }
 
-// Round-9 finding 4: the SAME reviewed atomic freshness/CAS primitive applied to a SHADOW report_snapshots
-// row (scheduler-v2/<reportKey>). A shadow snapshot lives in the same report_snapshots table, so the source
-// runtime uses this to save/refresh a durable shadow snapshot safely: insert-if-absent, an EQUAL-freshness
-// canonically-IDENTICAL candidate is 'already-current' (adopt, zero write), a STRICTLY-NEWER validated
-// candidate atomically REPLACES older shadow evidence ('replaced'/'inserted'), and an OLDER or
-// equal-but-CONFLICTING candidate preserves the last-known-good ('newer-live'/'conflict', zero write). It
-// never permanently blocks a legitimate same-params refresh, and concurrent writers converge on the newest
-// timestamp with no blind overwrite.
-export async function saveShadowSnapshotIfNewer(candidate, opts = {}) {
-  return publishLiveSnapshotIfNewer(candidate, opts);
+// Round-9 finding 4 + round-10 blockers 1/2: the reviewed atomic freshness/CAS for a SHADOW report_snapshots
+// row (scheduler-v2/<reportKey>). Round-10 routes the freshness decision + guarded write through the atomic,
+// row-locked cas_report_snapshot_if_newer RPC so the comparison is CHRONOLOGICAL and DATABASE-safe (timestamptz;
+// Z == +00:00 == fractional) rather than a lexicographic RFC3339 string compare, and so concurrent writers
+// serialize on the exact row under FOR UPDATE. The RPC owns insert-if-absent / strictly-newer replace /
+// strictly-older 'newer-live'. On EQUAL freshness the RPC returns the durable content and THIS wrapper proves
+// content identity STORAGE-FIRST: a nonblank payload_storage_path is AUTHORITATIVE and is always hydrated (even
+// when an inline payload is also present); if the authoritative content cannot be proven byte-identical (a race
+// swapped it, a dangling/unreadable object, a params/payload mismatch) it fails closed as 'conflict' -- the
+// durable last-known-good is never overwritten and success is never reconciled off an unprovable adoption.
+// Returns ONLY a typed { outcome } (inserted | replaced | newer-live | already-current | conflict).
+export async function saveShadowSnapshotIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, payloadStoragePath = null, sourceRefreshedAt }, { signal = null } = {}) {
+  const rpc = await request("/rest/v1/rpc/cas_report_snapshot_if_newer", {
+    method: "POST",
+    signal,
+    body: {
+      p_report_key: reportKey, p_account_id: accountId, p_params_hash: paramsHash,
+      p_params: params || {}, p_payload: payload == null ? null : payload,
+      p_payload_storage_path: payloadStoragePath || null,
+      p_payload_bytes: payloadBytes || 0, p_source_refreshed_at: sourceRefreshedAt ?? null,
+    },
+  });
+  const value = Array.isArray(rpc) ? rpc[0] : rpc;
+  const disposition = value && typeof value === "object" && !Array.isArray(value) ? value.disposition : null;
+  if (disposition === "inserted" || disposition === "replaced" || disposition === "newer-live") {
+    return { outcome: disposition };
+  }
+  // A refused / vanished / unknown acknowledgement is a fail-closed conflict (the durable LKG is untouched).
+  if (disposition !== "equal") return { outcome: "conflict" };
+  // EQUAL freshness: STORAGE-FIRST content-identity proof. Prove params first, then the AUTHORITATIVE payload.
+  if (canonicalJsonString(value.params) !== canonicalJsonString(params || {})) return { outcome: "conflict" };
+  const storagePath = typeof value.payload_storage_path === "string" ? value.payload_storage_path.trim() : "";
+  let livePayload;
+  if (storagePath !== "") {
+    try {
+      livePayload = await getReportSnapshotStoragePayload(storagePath, { signal });
+    } catch (_e) {
+      return { outcome: "conflict" }; // authoritative storage unreadable after the race -> fail closed
+    }
+  } else {
+    livePayload = value.payload;
+  }
+  const candPayload = payload == null ? null : payload;
+  if (livePayload == null || candPayload == null) return { outcome: "conflict" };
+  if (canonicalJsonString(livePayload) !== canonicalJsonString(candPayload)) return { outcome: "conflict" };
+  return { outcome: "already-current" };
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per

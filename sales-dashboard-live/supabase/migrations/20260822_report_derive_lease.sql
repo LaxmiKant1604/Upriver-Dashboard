@@ -27,8 +27,15 @@
 --     (report_snapshots row for scheduler-v2/<report_key>, this account, this params_hash) to already exist,
 --     so a malformed / wrong-account / wrong-hash reconciliation can NEVER authorize success. Round-8: a
 --     non-running row is handled explicitly (terminal for failed/skipped; 'invalid-state' otherwise).
--- Adds NO table/RLS/policy (sync_report_jobs is service-role-only from 20260807) and no schedule/cron;
--- SECURITY DEFINER + service_role only, matching the existing Scheduler-v2 RPCs. Applying it enables nothing.
+--   * cas_report_snapshot_if_newer (Round-10) -- an ATOMIC, row-locked (FOR UPDATE) freshness CAS on the
+--     report_snapshots natural key. Freshness is the OWNING CYCLE's database-created timestamp compared as
+--     timestamptz (CHRONOLOGICAL, database-safe: Z == +00:00 == fractional; NEVER a lexicographic RFC3339
+--     string compare, and NEVER a caller wall clock), so an older-cycle worker finishing later can never
+--     overwrite newer-cycle evidence. Dispositions inserted / replaced / newer-live / equal (equal returns
+--     the durable content for the caller's STORAGE-FIRST identity proof) / invalid-freshness.
+-- Adds NO table/RLS/policy (sync_report_jobs is service-role-only from 20260807; report_snapshots from
+-- 20260728 is read/written but never altered) and no schedule/cron; SECURITY DEFINER + service_role only,
+-- matching the existing Scheduler-v2 RPCs. Applying it enables nothing.
 
 -- ---------------------------------------------------------------------------
 -- 1. Additive lease columns on the (frozen-elsewhere) sync_report_jobs table.
@@ -191,6 +198,95 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 4. cas_report_snapshot_if_newer -- Round-10 blockers 1+2: an ATOMIC, row-locked freshness CAS on the
+--    report_snapshots natural key (report_key, account_id, params_hash). Freshness is the OWNING CYCLE's
+--    database-created timestamp the caller passes as timestamptz -- so the comparison is CHRONOLOGICAL and
+--    DATABASE-SAFE ('Z' and '+00:00' and any offset/fractional precision compare EQUAL; there is NO
+--    lexicographic RFC3339 string compare), and every decision is taken under FOR UPDATE so concurrent
+--    writers serialize on the exact row:
+--      * absent row                          => INSERT-IF-ABSENT, 'inserted';
+--      * candidate STRICTLY NEWER            => a GUARDED replace (WHERE source_refreshed_at < p_ts, so a
+--                                               concurrent advance matches zero rows and never blind-writes),
+--                                               'replaced';
+--      * candidate STRICTLY OLDER            => zero write, 'newer-live' (an older-cycle worker finishing
+--                                               later can NEVER overwrite newer-cycle evidence);
+--      * EQUAL freshness                     => zero write, 'equal' PLUS the existing row's params + inline
+--                                               payload + payload_storage_path, so the caller performs the
+--                                               STORAGE-FIRST content-identity proof (the authoritative
+--                                               payload can live in object storage, not in Postgres) and
+--                                               fails closed if it cannot prove byte-identity.
+--    A null candidate freshness is refused ('invalid-freshness') -- freshness must be authoritative, never a
+--    caller wall clock. Touches ONLY the one natural-key row. SECURITY DEFINER + service_role, matching every
+--    other Scheduler-v2 RPC; report_snapshots (20260728) is only read/written here, never altered.
+create or replace function public.cas_report_snapshot_if_newer(
+  p_report_key text, p_account_id text, p_params_hash text,
+  p_params jsonb, p_payload jsonb, p_payload_storage_path text,
+  p_payload_bytes bigint, p_source_refreshed_at timestamptz
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_row public.report_snapshots;
+  v_updated integer;
+begin
+  -- Freshness must be an authoritative instant -- a null/absent value is never allowed to win a CAS.
+  if p_source_refreshed_at is null then
+    return jsonb_build_object('disposition', 'invalid-freshness');
+  end if;
+  -- INSERT-IF-ABSENT on the natural key. A concurrent inserter makes this a no-op (do nothing) and we fall
+  -- through to the locked read + classify -- never a blind overwrite of a row we did not create.
+  insert into public.report_snapshots
+    (report_key, account_id, params_hash, params, payload, payload_storage_path, payload_bytes, source_refreshed_at)
+  values
+    (p_report_key, p_account_id, p_params_hash, p_params, p_payload, p_payload_storage_path,
+     coalesce(p_payload_bytes, 0), p_source_refreshed_at)
+  on conflict (report_key, account_id, params_hash) do nothing;
+  if found then
+    return jsonb_build_object('disposition', 'inserted');
+  end if;
+  -- The row exists: LOCK it so a concurrent claim/replace serializes on this exact natural-key row.
+  select * into v_row from public.report_snapshots
+    where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash
+    for update;
+  if not found then
+    -- Vanished between the failed insert and the lock (a concurrent delete) -> fail closed, no write.
+    return jsonb_build_object('disposition', 'conflict', 'reason', 'vanished');
+  end if;
+  -- CHRONOLOGICAL timestamptz comparison (NOT a lexicographic RFC3339 string compare): equivalent instants
+  -- (Z vs +00:00, differing fractional precision, non-UTC offsets) compare EQUAL under the timestamptz type.
+  if p_source_refreshed_at > v_row.source_refreshed_at then
+    -- STRICTLY NEWER: a GUARDED replace. The WHERE re-asserts strictly-older under the lock so a concurrent
+    -- advance (already >= our candidate) matches ZERO rows and we report a conflict instead of blind-writing.
+    update public.report_snapshots
+      set params = p_params, payload = p_payload, payload_storage_path = p_payload_storage_path,
+          payload_bytes = coalesce(p_payload_bytes, 0), source_refreshed_at = p_source_refreshed_at
+      where report_key = p_report_key and account_id = p_account_id and params_hash = p_params_hash
+        and source_refreshed_at < p_source_refreshed_at;
+    get diagnostics v_updated = row_count;
+    if v_updated = 1 then
+      return jsonb_build_object('disposition', 'replaced');
+    end if;
+    return jsonb_build_object('disposition', 'conflict', 'reason', 'cas-miss');
+  elsif p_source_refreshed_at < v_row.source_refreshed_at then
+    -- STRICTLY OLDER durable evidence wins: zero write, last-known-good preserved byte-identical.
+    return jsonb_build_object('disposition', 'newer-live');
+  else
+    -- EQUAL freshness: the caller proves content identity STORAGE-FIRST (the authoritative payload can be in
+    -- object storage, unreachable from SQL). Return the existing identity content; the caller adopts ONLY on a
+    -- proven byte-identical match and otherwise fails closed -- the durable row is never overwritten here.
+    return jsonb_build_object(
+      'disposition', 'equal',
+      'params', v_row.params,
+      'payload', v_row.payload,
+      'payload_storage_path', v_row.payload_storage_path
+    );
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Grants -- service_role only, matching the existing Scheduler-v2 RPCs.
 -- ---------------------------------------------------------------------------
 revoke all on function public.claim_report_derive_lease(uuid, text, text, integer) from public, anon, authenticated;
@@ -198,3 +294,6 @@ grant execute on function public.claim_report_derive_lease(uuid, text, text, int
 
 revoke all on function public.reconcile_report_derive_success(uuid, text, text, text, uuid, date) from public, anon, authenticated;
 grant execute on function public.reconcile_report_derive_success(uuid, text, text, text, uuid, date) to service_role;
+
+revoke all on function public.cas_report_snapshot_if_newer(text, text, text, jsonb, jsonb, text, bigint, timestamptz) from public, anon, authenticated;
+grant execute on function public.cas_report_snapshot_if_newer(text, text, text, jsonb, jsonb, text, bigint, timestamptz) to service_role;
