@@ -145,7 +145,7 @@ const invQ = (o = {}) => fakeQ([
   ["account_id, report_key, approved from public.scheduler_publish_approvals", () => o.approvals || A.approvalRows],
   ["report_key, schedule_enabled from public.report_sync_settings", () => o.settings || A.reportSyncSettings],
   ["select id from public.sync_cycles where id::text like", () => Array.from({ length: o.dfcaCount === undefined ? 1 : o.dfcaCount }, (_, i) => ({ id: "dfca8f75-000" + i }))],
-  ["status, source_total::int st", () => [o.dfca || { status: "running", st: 122, ss: 8, sf: 9, rt: 8, rs: 0, rf: 0, finished_at: null }]],
+  ["status, source_total::int st", () => [o.dfca || { status: "running", st: 122, ss: 8, sf: 9, rt: 0, rs: 0, rf: 0, finished_at: null }]],
   ["fetch_status, count(*)::int c from public.sync_source_jobs", () => o.srcStatus || [{ fetch_status: "succeeded", c: 8 }, { fetch_status: "failed", c: 9 }, { fetch_status: "attempted", c: 4 }, { fetch_status: "pending", c: 101 }]],
   ["max(create_export_count)", () => [o.createExport || { mx: 1, over1: 0 }]],
   ["count(*)::int total, count(*) filter", () => [o.reportJobs || { total: 8, pp: 8 }]],
@@ -159,8 +159,9 @@ test("invariants: FALSE approval row fails", async () => { assert.ok((await veri
 test("invariants: extra approval row fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ approvals: [...A.approvalRows, { account_id: A.rolloutRows[0].account_id, report_key: "daily-reporting", approved: true }] }), A)).length); });
 test("invariants: missing settings row fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ settings: A.reportSyncSettings.slice(1) }), A)).length); });
 test("invariants: MULTIPLE dfca prefix matches fail", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfcaCount: 2 }), A)).length); });
-test("invariants: dfca source counter drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfca: { status: "running", st: 122, ss: 9, sf: 9, rt: 8, rs: 0, rf: 0, finished_at: null } }), A)).length); });
-test("invariants: dfca report_succeeded drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfca: { status: "running", st: 122, ss: 8, sf: 9, rt: 8, rs: 1, rf: 0, finished_at: null } }), A)).length); });
+test("invariants: dfca source counter drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfca: { status: "running", st: 122, ss: 9, sf: 9, rt: 0, rs: 0, rf: 0, finished_at: null } }), A)).length); });
+test("invariants: dfca report_succeeded drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfca: { status: "running", st: 122, ss: 8, sf: 9, rt: 0, rs: 1, rf: 0, finished_at: null } }), A)).length); });
+test("invariants: dfca cycle report_total non-zero (old 8 mis-encoding) fails vs corrected 0 pin", async () => { assert.ok((await verifyApprovedInvariants(invQ({ dfca: { status: "running", st: 122, ss: 8, sf: 9, rt: 8, rs: 0, rf: 0, finished_at: null } }), A)).length); });
 test("invariants: dfca CHILD source status drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ srcStatus: [{ fetch_status: "succeeded", c: 9 }, { fetch_status: "failed", c: 9 }, { fetch_status: "attempted", c: 4 }, { fetch_status: "pending", c: 100 }] }), A)).length); });
 test("invariants: dfca CHILD create_export_count > 1 fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ createExport: { mx: 2, over1: 1 } }), A)).length); });
 test("invariants: dfca CHILD report jobs total drift fails", async () => { assert.ok((await verifyApprovedInvariants(invQ({ reportJobs: { total: 7, pp: 7 } }), A)).length); });
@@ -171,7 +172,8 @@ test("invariants: NULL sentinel fails-closed", async () => { assert.ok((await ve
 const TESTPINS = Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k, i) => [k, { c: 10 + i, h: "hash" + i }]));
 const fullObs = () => Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k, i) => [k, { present: true, c: 10 + i, h: "hash" + i }]));
 test("digest: all-8 pinned exact-match passes", () => { assert.deepEqual(requirePinnedStage0Digest(fullObs(), TESTPINS), []); });
-test("digest: real manifest (6 unpinned) is fail-closed", () => { assert.ok(requirePinnedStage0Digest(fullObs()).length >= 6); });
+test("digest: real manifest now pins ALL 8 (no null fail-open remains)", () => { assert.ok(PROTECTED_DIGEST_KEYS.every((k) => PROTECTED_DIGESTS[k] && typeof PROTECTED_DIGESTS[k].h === "string" && Number.isInteger(PROTECTED_DIGESTS[k].c))); });
+test("digest: real manifest fails closed on any drift from its 8 pins", () => { assert.equal(requirePinnedStage0Digest(fullObs()).length, 8); });
 test("digest: EDIT any observed hash fails", () => { const o = fullObs(); o.rollout.h = "x"; assert.ok(requirePinnedStage0Digest(o, TESTPINS).length); });
 test("digest: EDIT any observed count fails", () => { const o = fullObs(); o.settings.c = 999; assert.ok(requirePinnedStage0Digest(o, TESTPINS).length); });
 test("digest: EXTRA observed key fails", () => { const o = fullObs(); o.rogue = { c: 1, h: "z" }; assert.ok(requirePinnedStage0Digest(o, TESTPINS).length); });

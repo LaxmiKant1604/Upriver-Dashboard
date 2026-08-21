@@ -24,8 +24,12 @@ export const APPROVED_INVARIANTS = Object.freeze({
   rolloutRows: [{ account_id: APPROVED_ACCOUNT, enabled: true }], // exactly one enabled row; nothing else.
   approvalRows: ENABLED_REPORTS.map((k) => ({ account_id: APPROVED_ACCOUNT, report_key: k, approved: true })), // exactly four approved rows.
   reportSyncSettings: ALL_REPORTS.map((k) => ({ report_key: k, schedule_enabled: ENABLED_REPORTS.includes(k) })), // exactly 13; 4 enabled, 9 disabled.
-  // Blocker 3: the uniquely-matched dfca8f75 cycle row (status=running => report_succeeded/failed 0, finished_at NULL).
-  dfca8f75: { status: "running", source_total: 122, source_succeeded: 8, source_failed: 9, report_total: 8, report_succeeded: 0, report_failed: 0, finished_at: null },
+  // Blocker 3 / Phase 1D: the uniquely-matched dfca8f75 cycle row. The cycle-COLUMN report_total is 0 -- a
+  // running cycle does not roll the report counter up until terminal, so its report_total column stays 0 even
+  // though 8 child report jobs exist (that child count lives in dfca8f75Children.report.total below). The
+  // earlier pin of 8 was a mis-encoding of the child count against the cycle column; corrected to 0 after the
+  // read-only invariants pass proved the column is 0 (status=running => report_succeeded/failed 0, finished_at NULL).
+  dfca8f75: { status: "running", source_total: 122, source_succeeded: 8, source_failed: 9, report_total: 0, report_succeeded: 0, report_failed: 0, finished_at: null },
   // Blocker 3: dfca8f75 durable CHILD state (queried by the uniquely-matched cycle id; Appendix AB).
   dfca8f75Children: {
     source: { total: 122, byStatus: { succeeded: 8, failed: 9, attempted: 4, pending: 101 }, maxCreateExport: 1, overCreateCount: 0 },
@@ -35,14 +39,22 @@ export const APPROVED_INVARIANTS = Object.freeze({
 
 // Blocker 1/2: manifest-pinned protected digests, computed by the ESTABLISHED RUNBOOK algorithm (Appendix W):
 //   md5( string_agg( md5(row::text), ',' ORDER BY natural_key ) )
-// where, for report_snapshots, natural_key = report_key || '/' || account_id || '/' || params_hash. The
-// live/shadow values are the PINNED Appendix-AI values (NOT changed here). The remaining six AWAIT the one
-// authorized read-only stage-0 diagnostic and stay null (fail-closed; never guessed).
+// where, for report_snapshots, natural_key = report_key || '/' || account_id || '/' || params_hash.
+// ALL EIGHT are pinned from the RECONCILED PASS read-only capture (2026-08-21; reconciliation-runner verdict
+// RECONCILED PASS: contract 40/40, lineage 40/40, promo-audit byte-identical, invariants all pass; the earlier
+// live/shadow Appendix-AI values 176/26 were superseded -- they predated legitimate growth and a runner
+// mis-classification, both corrected). Stage 0 (ro-prod-check.mjs 0) re-captures these live and REQUIRES an
+// exact 8/8 match; any drift => STOP (never a silent repin).
 export const PROTECTED_DIGEST_KEYS = Object.freeze(["live_snapshots", "shadow_snapshots", "rollout", "mode", "approvals", "settings", "sync_cycles", "report_jobs"]);
 export const PROTECTED_DIGESTS = Object.freeze({
-  live_snapshots: { c: 176, h: "4058535b9a3944b8ab774c927d88329a" },
-  shadow_snapshots: { c: 26, h: "47ac4c6f963a1216342822e4f9ad3f9d" },
-  rollout: null, mode: null, approvals: null, settings: null, sync_cycles: null, report_jobs: null,
+  live_snapshots: { c: 183, h: "cf52240eac046339cc71878e3e6d1247" },
+  shadow_snapshots: { c: 48, h: "1ff7d823030f021d6389603f673add84" },
+  rollout: { c: 1, h: "1c85fedad9fde794305619c771a547bf" },
+  mode: { c: 1, h: "b4ebf7ef96a797225eda8ff692d2c308" },
+  approvals: { c: 4, h: "853ad5c6a619dab3f0ba41d43a62686d" },
+  settings: { c: 13, h: "0638bc18cc428442b7b9e28a4a9d0aff" },
+  sync_cycles: { c: 17, h: "29ad627c7fa6132edba061c5431f74dd" },
+  report_jobs: { c: 191, h: "b63d32ae3ed2e5f75ab5ecff2150fe7a" },
 });
 
 export const BASELINE_VERSION = 3;
