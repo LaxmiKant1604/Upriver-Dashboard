@@ -5238,3 +5238,39 @@ rollback/repair/`db:migrate`/DROP). Two offline corrections:
 Verification: node --check (9) OK; release self-tests 111; npm run verify 55/35; git diff --check clean. Next:
 create the stage-3 baseline at final HEAD, `ro-prod-check 3`, then apply 4->5->6 with a check after each.
 DataDoe balance = 0: no create-export; missing-data reports/schedules stay paused until tokens are funded.
+
+## Appendix BA — Stage-4 recovery: migration 4 applied; cumulative-verifier gap fixed; dedicated stage-4 re-anchor (2026-08-22)
+
+**Migration 4 committed successfully.** `20260820_source_durable_model.sql` was applied and committed (stage
+3->4). Its first apply attempt crashed on a TRANSIENT pooler disconnect *before* COMMIT; that attempt was
+proven NOT committed read-only (ro-prod-check 4 reported all migration-4 objects absent, ro-prod-check 3 OK =
+clean stage 3) before a single fresh re-attempt committed it. This was never a COMMIT_UNKNOWN. Protected
+customer data remained unchanged throughout (live=183, shadow=48).
+
+**The stage-4 stop was a CUMULATIVE-VERIFIER modeling gap, not a production defect.** `ro-prod-check 4` then
+stopped because migration 4 correctly ADDs `source_batch_membership_account_canonical` (via ALTER) to the table
+migration 2 created, but `verifyMigrationPresent(migration 2)` did an *exact* constraint-set match and saw that
+constraint as an unexpected extra. The production catalog is correct; the tooling could not model a table whose
+constraint set evolves across migrations.
+
+**Forward-only recovery (Codex-authorized; code `64abf5b`).** Migrations 1-4 kept applied (no rollback/repair/
+`db:migrate`/DROP):
+- **Part 1 — stage-aware cumulative catalog.** `ALTER_ADDED_CONSTRAINTS` (explicitly: `account_canonical`,
+  owner `20260820`, table `source_batch_membership`) + `cumulativeAlterConstraints(stage)`.
+  `verifyStageObjects(stage)` computes the exact cumulative set: an ALTER-added constraint is REQUIRED once its
+  owner is applied (ownerIndex < stage) and REJECTED as premature before. `verifyTable`/`verifyMigrationPresent`
+  enforce it. Stages 2-3 keep only migration-2's constraints; stages 4-6 add `account_canonical` exactly. Missing
+  base or ALTER-added constraints fail; unknown extras always fail; `verifyTable` is not weakened globally; the
+  migration-4 ALTER check still validates the exact kind + complete `POSITION(':' IN account_id)` body.
+  Migration 6's `sync_report_jobs` add-columns stay stage-aware (present/absent). Regressions added for each case.
+- **Part 2 — dedicated stage-4 re-anchor.** `re-anchor-stage4.mjs` +
+  `build/validate/shouldCreateStage4Baseline`: a SEPARATE `.release-baseline-stage4.json` (stage-0 and stage-3
+  baselines preserved untouched for audit), exclusive, `anchorStage=4`, bound to final HEAD + corrected
+  fingerprint + all six frozen hashes + approved identity + the eight manifest pins. Read-only REPEATABLE READ:
+  exact ledger (1-4 once each, 5-6 absent), complete cumulative 1-4 catalog, 5-6 absent, 8 digests == pins,
+  controls/cron/dfca8f75 invariants; ALWAYS ROLLBACK before the write. Migrations 5-6 and `ro-prod-check 4-6` use
+  only the stage-4 baseline; migration 4 / `ro-prod-check 3` keep stage-3; migrations 1-3 keep stage-0.
+
+Verification: node --check (10) OK; release self-tests 139; npm run verify 55/35; git diff --check clean. Next:
+stage-4 re-anchor -> `ro-prod-check 4` -> apply 5 -> 6 (ro-prod-check each). DataDoe balance = 0: no
+create-export; missing-data reports/schedules stay paused until tokens are funded.

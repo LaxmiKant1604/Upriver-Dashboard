@@ -10605,3 +10605,30 @@ Verify: node --check 9 OK; self-tests 111; verify 55/35; diff clean. NEXT: re-an
 -> apply 4->5->6 (ro-prod-check each, Manual mode, one command per approval, no COMMIT_UNKNOWN retry). Migrations
 4-6 UNAPPLIED; nothing pushed/deployed. Tokens=0 gate go-live [[datadoe-token-block]]: no create-export;
 missing-data reports/schedules paused until funded.
+
+## Stage-4 recovery -- 2026-08-22 (code 64abf5b; docs separate)
+
+Migration 4 (20260820_source_durable_model) COMMITTED (stage 3->4). Its first attempt crashed on a TRANSIENT
+pooler disconnect BEFORE commit -> proven NOT committed read-only (ro-prod-check 4 objects-absent + ro-prod-check
+3 OK) -> single fresh re-attempt committed (never a COMMIT_UNKNOWN). Protected data unchanged (live=183
+shadow=48). ro-prod-check 4 then STOPPED on a CUMULATIVE-VERIFIER modeling gap (NOT a production defect): m4 ADDs
+source_batch_membership_account_canonical to m2's table, so verifyMigrationPresent(m2)'s exact constraint-set
+match saw an "extra".
+
+Codex authorized forward-only stage-4 recovery (1-4 kept applied). Part 1: stage-aware cumulative catalog --
+ALTER_ADDED_CONSTRAINTS + cumulativeAlterConstraints(stage); verifyStageObjects computes the exact cumulative
+constraint set (ALTER-added constraint required once its owner applied ownerIndex<stage, rejected premature
+before); verifyTable(t, extraConstraints) + verifyMigrationPresent(mig, extrasByTable). Stages 2-3 = m2 only;
+4-6 = m2 + account_canonical exact; missing base/extra fails, unknown extra fails, not weakened globally; m4
+ALTER still checks exact kind + full POSITION(':' IN account_id) body; m6 add-columns stay present/absent.
+Regressions added. Part 2: dedicated hard-coded STAGE-4 re-anchor -- re-anchor-stage4.mjs +
+build/validate/shouldCreateStage4Baseline; SEPARATE .release-baseline-stage4.json (stage-0/3 preserved for
+audit), exclusive, anchorStage=4, bound to final HEAD + corrected fingerprint + 6 hashes + 8 pins; read-only
+REPEATABLE READ (ledger 1-4 once + 5-6 absent, cumulative 1-4 catalog, 5-6 absent, 8 digests==pins, invariants),
+ALWAYS ROLLBACK before write. Baseline selection: migrations 5-6 + ro-prod-check 4-6 = stage-4 ONLY; migration 4
++ ro-prod-check 3 = stage-3; migrations 1-3 + ro-prod-check 0-2 = stage-0.
+
+Verify: node --check 10 OK; self-tests 139; verify 55/35; diff clean. NEXT: re-anchor-stage4 -> ro-prod-check 4
+-> apply 5->6 (ro-prod-check each, Manual mode, one command per approval, no COMMIT_UNKNOWN retry). Then the
+authorized push + single Git-triggered deploy + reuseOnly=true (zero create-export while tokens=0). Migrations
+5-6 UNAPPLIED; nothing pushed/deployed. Tokens=0 gate go-live [[datadoe-token-block]].
