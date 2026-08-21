@@ -10547,3 +10547,21 @@ reconciliation (stale Appendix AI vs grown production, or different scope) befor
 
 STOP for Codex re-review. Offline only; NOT pushed; migrations 20260817-20260822 UNAPPLIED; the read-only digest
 diagnostic was the ONLY production read (zero writes); nothing deployed/enabled/scheduled/published.
+
+## Production-state reconciliation -- OFFLINE read-only on main 2026-08-21 (code 806a498, docs separate); VERDICT STOP; pins UNCHANGED; NOT deployed
+
+Ran the narrowly-scoped read-only reconciliation runner (scripts/release/reconciliation-runner.mjs; REPEATABLE
+READ READ ONLY; SELECT-only; ROLLBACK; identity-validated; reuses REPORT_DERIVATIONS.validatePayload +
+paramsHashFor + trusted storage loader; safe metadata + typed pass/fail only) against production. VERDICT STOP
+(Appendix AX) => manifest pins NOT changed (live/shadow keep stale Appendix-AI values; 6 control digests stay
+null/fail-closed); NO baseline created; NO stage 0. Findings: live 183 (AI 176, +7 = manual-source-attempt/
+brand-view-portfolio), shadow 48 (26, +22 = known SV2 derivations); 0 duplicate natural identities; all shadow
+keys known. BUT 42 contract-invalid rows, ALL brand-sales (~38 live + >=2 shadow): version skew -- brand-sales/
+v2d-2 requires a non-empty asinBrand map that older snapshots predate. Neither digest algo reproduces the pinned
+hashes (data grew). Infra: SQLSTATE 57014 statement timeout on heavy per-row/big-fetch over the pooler prevented
+a clean single pass through lineage/invariants (runner limit, not a data verdict). Awaits Codex/runbook decision
+on the brand-sales skew + reconciled 8-dataset count/hash before pinning + Migration 1.
+
+STOP for Codex review. Offline read-only only; pins UNCHANGED; NOT pushed; migrations 20260817-20260822
+UNAPPLIED; the reconciliation runner was the ONLY production read (zero writes); nothing deployed/enabled/
+scheduled/published; dfca8f75 untouched.

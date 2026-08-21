@@ -5137,3 +5137,33 @@ vs. grown production, or a different scope/algorithm) before stage-0 baseline cr
 
 **STOP for Codex re-review.** Code+tests `02289d8`, docs `<this commit>`; NOT pushed; migrations UNAPPLIED;
 nothing deployed/scheduled/published; the read-only digest diagnostic was the only production read.
+
+## Appendix AX — Production-state reconciliation: VERDICT STOP, pins unchanged (OFFLINE read-only, 2026-08-21; code `806a498`; docs `<this commit>`; NOT deployed)
+
+The narrowly-scoped read-only reconciliation runner (`scripts/release/reconciliation-runner.mjs`; `BEGIN
+ISOLATION LEVEL REPEATABLE READ READ ONLY`; SELECT-only; `ROLLBACK` in finally; identity validated before
+connecting; safe-metadata + typed pass/fail only; SQLSTATE-only on error) executed against production and
+returned **STOP** — so the manifest pins were **NOT changed** (live/shadow keep the stale Appendix-AI values;
+the six control digests remain `null`/fail-closed). No baseline was created; no migration applied.
+
+**Findings (read-only):**
+- Growth is genuine: **live 183** (Appendix AI 176, +7), **shadow 48** (26, +22); **0** duplicate natural
+  identities; all 48 shadow rows use **known Scheduler-v2 report keys**. The +7 live are `manual-source-attempt`
+  (5) and `brand-view-portfolio` (2); the +22 shadow are `brand-sales`/`content-changes`/`listing-optimizer`/
+  `keyword-rank`/`sku-pl`/`ppc-performance` derivations.
+- **42 contract-invalid rows, all `brand-sales`** (≈38 live + ≥2 shadow) under the EXACT registered contract
+  (`REPORT_DERIVATIONS["brand-sales"].validatePayload`): version skew — `brand-sales/v2d-2` now requires a
+  non-empty `asinBrand` map that these older snapshots predate.
+- Neither the old nor the runbook digest algorithm reproduces the pinned Appendix-AI hashes — expected, because
+  the underlying data grew.
+- Infra note: SQLSTATE **57014** (statement timeout) on the heavy per-row/big-fetch queries over the pooler
+  prevented one clean pass through lineage/invariants; this is a runner-robustness limit, not a data verdict.
+
+**Escalation for Codex / runbook owner:** decide whether the `brand-sales` version skew is acceptable historical
+state (and, if so, whether the contract should apply to pre-`v2d-2` rows) and re-issue a reconciled
+count/hash for all eight datasets, OR remediate the snapshots — before stage-0 baseline creation and Migration 1.
+The `57014` timeout also argues for pinning via a lighter server-side digest pass rather than per-row payload
+fetch.
+
+**STOP for Codex review.** Code `806a498`, docs `<this commit>`; pins UNCHANGED; NOT pushed; migrations
+20260817–20260822 UNAPPLIED; the read-only reconciliation was the ONLY production read (zero writes).
