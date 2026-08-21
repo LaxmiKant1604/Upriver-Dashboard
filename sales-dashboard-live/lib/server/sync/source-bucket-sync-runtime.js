@@ -914,6 +914,28 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       };
       const existing = await dl.bound("shadow-read", (signal) => readShadowSnapshot({ reportKey: shadowKey, accountId: snap.accountId, paramsHash }, { signal }));
       let newlySaved = false;
+      // Round-11 blocker: EVERY durable-lineage shadow write -- the initially-absent branch INCLUDED -- goes
+      // through the ATOMIC freshness CAS (cas_report_snapshot_if_newer). A merge-duplicates upsert on the
+      // absent branch would let two cycles both read the row as absent and then let an older cycle's DELAYED
+      // write clobber a newer cycle's row without consulting freshness. The CAS owns insert-if-absent AND
+      // freshness ordering under a row lock, so concurrent writers converge on the newer evidence and a losing
+      // (older) candidate is a typed-resumable 'newer-live', never a merge-upsert and never a false success.
+      // The merge-upsert saver (`saveShadow`) is reachable ONLY on the degenerate no-lineage path above.
+      // Returns a typed disposition: 'saved' (inserted/replaced -> reconcile), 'adopted' (already-current, the
+      // wrapper PROVED storage-first content identity -> reconcile without re-writing), 'newer-live' (a newer
+      // durable exists -> resumable, no reconcile for this losing candidate), or 'conflict' (fail closed).
+      const persistViaCas = async () => {
+        const bytes = assertSnapshotWithinLimit(snap.payload);
+        const cas = await dl.bound("shadow-cas-save", (signal) => saveShadowIfNewer({
+          reportKey: shadowKey, accountId: snap.accountId, paramsHash, params, payload: snap.payload,
+          payloadBytes: bytes, sourceRefreshedAt: durableRefreshedAt,
+        }, { signal }), { write: true });
+        const outcome = cas && cas.outcome;
+        if (outcome === "inserted" || outcome === "replaced") return { disp: "saved" };
+        if (outcome === "already-current") return { disp: "adopted" };
+        if (outcome === "newer-live") return { disp: "newer-live" };
+        return { disp: "conflict", conflict: outcome || "cas-conflict" };
+      };
       if (existing) {
         const verdict = await validateDurableSnapshot(existing);
         if (!verdict.ok) {
@@ -923,34 +945,25 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         }
         if (canonicalJson(verdict.payload) !== canonicalJson(snap.payload)) {
           // Round-9 finding 4: a valid DIFFERENT durable payload for the same identity is not a permanent
-          // block -- route through the reviewed atomic freshness CAS. Our STRICTLY-NEWER validated candidate
-          // atomically replaces older shadow evidence; an OLDER (newer-live) candidate is typed-resumable (a
-          // later invocation reads + validates the newer durable); an EQUAL-but-conflicting candidate
-          // preserves LKG and fails closed non-resumable.
-          const bytes = assertSnapshotWithinLimit(snap.payload);
-          const cas = await dl.bound("shadow-refresh-cas", (signal) => saveShadowIfNewer({
-            reportKey: shadowKey, accountId: snap.accountId, paramsHash, params, payload: snap.payload,
-            payloadBytes: bytes, sourceRefreshedAt: durableRefreshedAt,
-          }, { signal }), { write: true });
-          const outcome = cas && cas.outcome;
-          if (outcome === "replaced" || outcome === "inserted") {
-            newlySaved = true; // our newer candidate is now the durable snapshot -> reconcile below.
-          } else if (outcome === "already-current") {
-            // A concurrent identical write landed between our read and CAS -> adopt (no re-save).
-          } else if (outcome === "newer-live") {
-            note("snapshot-newer", "newer-live");
-            return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-newer" };
-          } else {
-            note("snapshot-conflict", outcome || "cas-conflict");
-            return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: outcome || "cas-conflict" };
-          }
+          // block -- route through the reviewed atomic freshness CAS (a STRICTLY-NEWER candidate replaces older
+          // shadow evidence; an OLDER 'newer-live' candidate is typed-resumable; an EQUAL-but-conflicting
+          // candidate preserves LKG and fails closed non-resumable).
+          const r = await persistViaCas();
+          if (r.disp === "saved") { newlySaved = true; }
+          else if (r.disp === "adopted") { /* a concurrent identical write landed between our read and CAS -> adopt */ }
+          else if (r.disp === "newer-live") { note("snapshot-newer", "newer-live"); return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-newer" }; }
+          else { note("snapshot-conflict", r.conflict); return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: r.conflict }; }
         }
+        // else: the validated durable content already EQUALS our candidate -> adopt (no write) -> reconcile.
       } else {
-        const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal, durableRefreshedAt), { write: true });
-        if (saved && saved.paramsHash && saved.paramsHash !== paramsHash) {
-          throw new Error("SNAPSHOT_PARAMS_HASH_DRIFT: the saver-computed hash disagrees with the reconcile hash; refusing (fail closed).");
-        }
-        newlySaved = true;
+        // Round-11: the initially-absent branch ALSO goes through the CAS (insert-if-absent), never a
+        // merge-upsert. If a concurrent (newer) cycle inserted between our read and this CAS, our older
+        // candidate loses with 'newer-live' and is never reconciled -- the newer row is preserved.
+        const r = await persistViaCas();
+        if (r.disp === "saved") { newlySaved = true; }
+        else if (r.disp === "adopted") { /* a concurrent identical write already landed -> adopt */ }
+        else if (r.disp === "newer-live") { note("snapshot-newer", "newer-live"); return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-newer" }; }
+        else { note("snapshot-conflict", r.conflict); return { complete: false, newlySaved: false, saved: null, lineage: "snapshot-conflict", conflict: r.conflict }; }
       }
       const rec = await dl.bound("report-lineage-reconcile", (signal) => reportLineage.reconcileSuccess({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, accountId: snap.accountId,

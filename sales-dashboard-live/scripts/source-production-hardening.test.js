@@ -445,8 +445,17 @@ function makeHarness(over = {}) {
     // Round-8 finding 2: the trusted storage hydrator for a storage-backed durable snapshot payload (inline
     // payloads never call it; a storage-backed one that returns null is a dangling object).
     loadShadowStoragePayload: over.loadShadowStoragePayload || (async () => null),
-    // Round-9 finding 4: the atomic freshness CAS shadow save (models publishLiveSnapshotIfNewer).
-    saveShadowIfNewer: over.saveShadowIfNewer || (async (cand) => store.shadowCasIfNewer(cand)),
+    // Round-9 finding 4 + round-11: the atomic freshness CAS shadow save (models cas_report_snapshot_if_newer).
+    // Round-11: the durable-lineage write now goes through the CAS (never the merge-upsert saver), so this is
+    // where a durable write + its "save" lineage event are recorded -- ONLY on an actual write (inserted/replaced).
+    saveShadowIfNewer: over.saveShadowIfNewer || (async (cand) => {
+      const res = store.shadowCasIfNewer(cand);
+      if (res.outcome === "inserted" || res.outcome === "replaced") {
+        recorded.lineage.push({ op: "save", reportKey: cand.reportKey, accountId: cand.accountId });
+        recorded.shadowSaves.push({ ...cand, paramsHash: cand.paramsHash });
+      }
+      return res;
+    }),
     // Round-7 finding 1: the default lineage DELEGATES to the store's LEASE model (guarded claim + reconcile
     // bound to the exact durable snapshot) while recording every op + disposition for assertions.
     reportLineage: over.reportLineage || {
@@ -1968,14 +1977,21 @@ function recoveryFixture(store, inject = {}) {
   const hit = (fn, rk, a) => typeof fn === "function" && fn(rk, a);
   const over = {
     store,
-    makeShadowSaver: () => async (args) => {
-      const paramsHash = reportStore.paramsHashFor(args.params.reportVersion, args.params);
-      const prodKey = String(args.reportKey).replace(/^scheduler-v2\//, ""); // the saver receives the SHADOW key
-      // A save that does NOT commit: throw BEFORE recording the durable snapshot.
-      if (hit(inject.timeoutSaveAt, prodKey, args.accountId)) throw routeDeadlineError("shadow-save");
-      store.recordShadowSnapshot({ reportKey: args.reportKey, accountId: args.accountId, paramsHash, params: args.params, payload: args.payload, sourceRefreshedAt: args.sourceRefreshedAt });
-      savedShadow.push({ reportKey: args.reportKey, accountId: args.accountId, paramsHash });
-      return { paramsHash };
+    // Round-11: the durable-lineage path must NEVER use the merge-upsert saver. If it ever does, fail loudly
+    // (this is the regression-5 guard: exactly the atomic CAS handles durable writes, zero merge-upserts).
+    makeShadowSaver: () => async (args) => { throw new Error("REGRESSION: durable lineage reached the merge-upsert saver for " + args.reportKey + "/" + args.accountId); },
+    // Round-11: the durable shadow write goes through the ATOMIC CAS. Inject a commit-unknown deadline BEFORE
+    // the commit (timeoutSaveAt -> the CAS did not land) or AFTER it (timeoutSaveAfterCommit -> committed but
+    // the response timed out); a committed write (inserted/replaced) is recorded for the recovery assertions.
+    saveShadowIfNewer: async (cand) => {
+      const prodKey = String(cand.reportKey).replace(/^scheduler-v2\//, ""); // the CAS receives the SHADOW key
+      if (hit(inject.timeoutSaveAt, prodKey, cand.accountId)) throw routeDeadlineError("shadow-cas-save"); // did NOT commit
+      const res = store.shadowCasIfNewer(cand); // COMMITS atomically (insert-if-absent / freshness CAS)
+      if (res.outcome === "inserted" || res.outcome === "replaced") {
+        savedShadow.push({ reportKey: cand.reportKey, accountId: cand.accountId, paramsHash: cand.paramsHash, outcome: res.outcome });
+      }
+      if (hit(inject.timeoutSaveAfterCommit, prodKey, cand.accountId)) throw routeDeadlineError("shadow-cas-save"); // committed, response timed out
+      return res;
     },
     reportLineage: {
       upsertReportJob: async (j) => store.upsertReportJob(j),
@@ -2738,6 +2754,93 @@ test("V7. regression 7: LKG stays byte-identical on EVERY conflict / unprovable 
   // (c) older candidate -> newer-live, no write.
   assert.equal(store.shadowCasIfNewer({ ...key, params: { reportVersion: "v", accountId: "A01" }, payload: { v: "older" }, sourceRefreshedAt: "2026-08-19T00:00:00Z" }).outcome, "newer-live");
   assert.deepEqual(snap(), lkg);
+});
+
+
+group("VV. round-11 blocker: EVERY durable-lineage shadow write goes through the atomic CAS (never a merge-upsert)");
+
+const throwingSaver = () => async (a) => { throw new Error("REGRESSION: durable lineage reached the merge-upsert saver for " + a.reportKey + "/" + a.accountId); };
+
+test("VV1. reg 1-5: an instance that reads the natural key as ABSENT loses to a concurrently-written NEWER durable row (CAS newer-live) -- no overwrite, no false reconcile, zero merge-upserts", async () => {
+  const store = makeStore();
+  store._dbClock.now = BASE_MS;
+  // Probe: one normal run establishes the EXACT natural key + a valid derived payload for daily/A01, written
+  // through the CAS. `makeShadowSaver` throws if the durable path EVER uses the merge-upsert saver (reg 5).
+  const hProbe = fullFixture({ store, makeShadowSaver: throwingSaver });
+  const rProbe = await hProbe.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rProbe.derived.skipped, null, "the probe run completed -- every durable write went through the CAS, not the saver");
+  const probe = hProbe.recorded.shadowSaves.find((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01");
+  assert.ok(probe, "the probe wrote daily/A01 through the CAS injectable");
+  const key = { reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: probe.paramsHash };
+  const row0 = store.getShadowSnapshot(key);
+  // Simulate the NEWER cycle having written FIRST: different content at strictly-newer freshness. This is the
+  // row the older instance's delayed write must never clobber (regs 2/3).
+  store.recordShadowSnapshot({ reportKey: key.reportKey, accountId: key.accountId, paramsHash: key.paramsHash, params: row0.params, payload: { ...row0.payload, __newer_cycle: "won" }, sourceRefreshedAt: new Date(BASE_MS + 100_000_000).toISOString() });
+  const lkg = JSON.parse(JSON.stringify(store.getShadowSnapshot(key)));
+  // Reset the older instance's daily/A01 job so it re-derives (as if its earlier attempt was commit-unknown).
+  Object.assign(store._reportJobs.get(rProbe.cycleId + "|daily-reporting|A01"), { derive_status: "pending", derive_lease_token: null, derive_lease_expires_at: null, validated: false, save_status: "pending", snapshot_params_hash: null });
+  // The older instance runs but STILL reads the natural key as ABSENT (it read before the newer write landed),
+  // forcing the initially-absent path. Its owning-cycle created_at (BASE_MS) is OLDER than the durable freshness.
+  const hB = fullFixture({ store, makeShadowSaver: throwingSaver, readShadowSnapshot: async () => null });
+  const rB = await hB.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(outcomeOf(rB, "daily-reporting", "A01"), "snapshot-newer", "reg 1/2: the older instance's absent-path write met the newer durable via the CAS (newer-live)");
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "reg 4: the losing (older) candidate is NEVER reconciled as successful");
+  assert.deepEqual(store.getShadowSnapshot(key), lkg, "reg 3: the newer cycle's payload survives byte-identical (the older write never clobbered it)");
+  assert.equal(rB.derived.resumable, true, "the losing candidate is typed-resumable");
+  // reg 5: neither the probe nor the older instance ever reached the merge-upsert saver (it throws) -- the CAS
+  // handled every durable write. Proven by both runs completing without the saver throwing.
+});
+
+test("VV2. reg 6: reverse completion order still converges on the newest cycle's evidence", () => {
+  const store = makeStore();
+  const cOld = new Date(BASE_MS + 1000).toISOString();
+  const cNew = new Date(BASE_MS + 2000).toISOString();
+  const rk = { reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" };
+  const cand = (ts, v) => ({ ...rk, params: { reportVersion: "v", accountId: "A01" }, payload: { v }, sourceRefreshedAt: ts });
+  // Reverse order: the OLDER cycle's write lands FIRST, then the NEWER cycle's delayed write.
+  assert.equal(store.shadowCasIfNewer(cand(cOld, "old")).outcome, "inserted");
+  assert.equal(store.shadowCasIfNewer(cand(cNew, "new")).outcome, "replaced", "the newer cycle replaces the older even arriving later");
+  assert.equal(store.getShadowSnapshot(rk).payload.v, "new");
+  // An even-later OLDER straggler cannot undo it.
+  assert.equal(store.shadowCasIfNewer(cand(cOld, "old2")).outcome, "newer-live");
+  assert.equal(store.getShadowSnapshot(rk).payload.v, "new", "the newest evidence is durable regardless of arrival order");
+});
+
+test("VV3. reg 7: equal-cycle equal-content replay is idempotent (insert then already-current, exactly one durable row)", () => {
+  const store = makeStore();
+  const ts = new Date(BASE_MS + 5000).toISOString();
+  const cand = () => ({ reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H", params: { reportVersion: "v", accountId: "A01" }, payload: { v: "same" }, sourceRefreshedAt: ts });
+  assert.equal(store.shadowCasIfNewer(cand()).outcome, "inserted");
+  assert.equal(store.shadowCasIfNewer(cand()).outcome, "already-current", "a same-cycle same-content replay adopts (idempotent)");
+  assert.equal(store.shadowCasIfNewer(cand()).outcome, "already-current", "still idempotent on a third replay");
+});
+
+test("VV4. reg 8: equal-freshness conflicting content fails closed (conflict) and preserves LKG byte-identical", () => {
+  const store = makeStore();
+  const ts = new Date(BASE_MS + 5000).toISOString();
+  const rk = { reportKey: "scheduler-v2/daily-reporting", accountId: "A01", paramsHash: "H" };
+  const c = (v) => ({ ...rk, params: { reportVersion: "v", accountId: "A01" }, payload: { v }, sourceRefreshedAt: ts });
+  assert.equal(store.shadowCasIfNewer(c("lkg")).outcome, "inserted");
+  const lkg = JSON.parse(JSON.stringify(store.getShadowSnapshot(rk)));
+  assert.equal(store.shadowCasIfNewer(c("different")).outcome, "conflict", "equal freshness + different content is a conflict, never a merge-overwrite");
+  assert.deepEqual(store.getShadowSnapshot(rk), lkg, "LKG preserved byte-identical");
+});
+
+test("VV5. reg 9: a commit-unknown deadline at the CAS write is typed-resumable; recovery ADOPTS the committed durable row with zero re-save", async () => {
+  const store = makeStore();
+  // timeoutSaveAfterCommit: the CAS COMMITS the insert but the response times out (commitUnknown).
+  const h1 = recoveryFixture(store, { timeoutSaveAfterCommit: onceFor("daily-reporting", "A01") });
+  const r1 = await h1.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r1.commitUnknown, true, "a CAS write response-timeout is typed commit-unknown/resumable");
+  assert.equal(r1.continuationRequired, true);
+  assert.ok(h1.savedShadow.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "the CAS DID commit the durable row");
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, false, "no fabricated success -- the reconcile never ran");
+  // Recovery: the durable row is present -> adopt (no re-save) -> reconcile. A re-save through the saver throws.
+  const h2 = fullFixture({ store, makeShadowSaver: throwingSaver });
+  store._dbClock.now = PAST_LEASE_MS;
+  await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(store.getReportJob("daily-reporting", "A01").validated, true, "recovery ADOPTED the committed durable row and reconciled");
+  assert.ok(!h2.recorded.shadowSaves.some((s) => s.reportKey === "scheduler-v2/daily-reporting" && s.accountId === "A01"), "reg 10: ZERO re-save on adoption (existing behavior intact)");
 });
 
 
