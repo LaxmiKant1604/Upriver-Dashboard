@@ -5067,3 +5067,42 @@ every conflict; existing hash-binding/lease/deadline/publisher tests green). Har
 
 **STOP for Codex re-review.** Code+tests `86b8530`, docs `<this commit>`; NOT pushed; production stays on
 `02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.
+
+## Appendix AV — Round-11: route the initially-absent shadow write through the atomic CAS (P1 blocker) (OFFLINE, 2026-08-21; code+tests `21d30d3`; docs `<this commit>`; NOT deployed)
+
+Codex's review of the round-10 CAS raised one P1 release blocker; fixed offline. `npm run verify` green -- **55
+steps / 35 suites** (incl. `build:check`); `git diff --check` clean. **No migration change** this round
+(20260822 byte-unchanged, blob `7c987c17`; 20260820/20260821 byte-unchanged) -- `cas_report_snapshot_if_newer`
+already existed; the fix is that the runtime now USES it on the absent branch.
+
+**Blocker.** `source-bucket-sync-runtime.js` still handled an ABSENT shadow snapshot through
+`saveShadow()`/`makeShadowSnapshotSaver()`/`saveReportSnapshot` -- a merge-duplicates upsert that never
+consults `cas_report_snapshot_if_newer`. Two cycles could both read the row as absent; if the newer cycle wrote
+first and the older cycle's delayed merge-upsert arrived later, the older evidence overwrote the newer row
+without a freshness check.
+
+**Fix.** Every durable-lineage shadow write -- the initially-absent branch INCLUDED -- now routes through
+`saveShadowSnapshotIfNewer`/`cas_report_snapshot_if_newer` via a single `persistViaCas()` helper. The CAS owns
+insert-if-absent AND freshness ordering under a row lock, so two writers that both read the row as absent
+converge on the newer evidence. Every CAS outcome is handled explicitly: `inserted`/`replaced` -> reconcile;
+`already-current` -> reconcile only after the wrapper's storage-first equality proof; `newer-live` -> typed
+resumable, no reconcile for the losing candidate; `conflict`/invalid/malformed -> fail closed, no reconcile;
+deadline/`commitUnknown` -> honest resumable. The merge-upsert saver (`saveShadow`) is now reachable ONLY on
+the degenerate no-lineage path. The recovery harness injects commit-unknown at the CAS write and makes the
+merge-upsert saver THROW if the durable path ever reaches it -- so every X-series recovery test now doubles as a
+proof that durable lineage never merge-upserts (regression 5).
+
+| Mandatory regression | Proof |
+|---|---|
+| 1 Two instances both read the natural key as absent | VV1 (injected absent read + a pre-seeded newer durable row) |
+| 2/3 Newer-first, older-delayed; final payload is the newer cycle's | VV1 (older instance -> newer-live; durable byte-identical) |
+| 4 Older cycle not reconciled for its losing candidate | VV1 (`validated === false`) |
+| 5 Exactly the CAS handles both writes; zero merge-upserts | VV1 + X-series (the merge-upsert saver throws if the durable path uses it) |
+| 6 Reverse completion order converges | VV2 |
+| 7 Equal-cycle equal-content replay is idempotent | VV3 (insert -> already-current) |
+| 8 Equal-freshness conflicting content fails closed, LKG preserved | VV4 |
+| 9 CAS commitUnknown/deadline stays typed-resumable | VV5 (timeoutSaveAfterCommit -> resumable; recovery adopts, zero re-save) |
+| 10 Existing storage-first/lease/hash/publisher/schema-audit tests green | full verify 55/35; hardening **104** |
+
+**STOP for Codex re-review.** Code+tests `21d30d3`, docs `<this commit>`; NOT pushed; production stays on
+`02c2ef5`; migrations 20260820/20260821/20260822 all PREPARED-UNAPPLIED; nothing deployed, scheduled, or published.

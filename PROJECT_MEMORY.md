@@ -10501,3 +10501,28 @@ mandatory regressions; Y6b/Y6c reworked to the DB-authoritative model. Hardening
 STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
 (blob 7c987c17) PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/enabled/scheduled/
 published; cycle dfca8f75 untouched.
+
+## Round-11 P1 RELEASE blocker -- OFFLINE on main 2026-08-21 (code+tests 21d30d3, docs separate); verify green 55/35; NOT deployed
+
+Codex's review of the round-10 CAS raised one P1 blocker; fixed offline (Appendix AV in SCHEDULER_V2_ROLLOUT.md).
+NO migration change this round (20260822 byte-UNCHANGED, blob 7c987c17; 20260820/20260821 byte-UNCHANGED) --
+cas_report_snapshot_if_newer already existed; the fix is that the runtime now USES it on the absent branch.
+BLOCKER: source-bucket-sync-runtime.js still saved an ABSENT shadow snapshot through
+saveShadow()/makeShadowSnapshotSaver()/saveReportSnapshot -- a merge-duplicates upsert that never consulted the
+CAS. Two cycles could both read the row as absent; if the newer cycle wrote first and the older cycle's delayed
+merge-upsert arrived later, the older evidence overwrote the newer row. FIX: every durable-lineage shadow write
+(the initially-absent branch INCLUDED) now routes through saveShadowSnapshotIfNewer/cas_report_snapshot_if_newer
+via one persistViaCas() helper. The CAS owns insert-if-absent + freshness ordering under a row lock, so two
+writers that both read absent converge on the newer evidence. Outcomes handled explicitly: inserted/replaced ->
+reconcile; already-current -> reconcile after the wrapper's storage-first equality proof; newer-live -> typed
+resumable, no reconcile for the losing candidate; conflict/invalid -> fail closed; deadline/commitUnknown ->
+resumable. The merge-upsert saver is reachable ONLY on the degenerate no-lineage path; the recovery harness now
+injects commit-unknown at the CAS and makes the merge-upsert saver THROW if the durable path ever reaches it
+(so every X-series recovery test doubles as a zero-merge-upsert proof). Regressions VV1-VV5 cover the two-instance
+absent race (older loses via newer-live, newer payload survives, loser never reconciled, zero merge-upserts),
+reverse-order convergence, equal-content idempotent replay, equal-freshness conflict LKG, and CAS commitUnknown
+resumability. Hardening 104; verify 55/35.
+
+STOP for Codex re-review. Offline only; NOT pushed; migrations 1-6/20260820/20260821 byte-UNCHANGED, 20260822
+(blob 7c987c17) byte-UNCHANGED + PREPARED-UNAPPLIED; no DataDoe/Supabase/production call; nothing deployed/
+enabled/scheduled/published; cycle dfca8f75 untouched.
