@@ -10632,3 +10632,57 @@ Verify: node --check 10 OK; self-tests 139; verify 55/35; diff clean. NEXT: re-a
 -> apply 5->6 (ro-prod-check each, Manual mode, one command per approval, no COMMIT_UNKNOWN retry). Then the
 authorized push + single Git-triggered deploy + reuseOnly=true (zero create-export while tokens=0). Migrations
 5-6 UNAPPLIED; nothing pushed/deployed. Tokens=0 gate go-live [[datadoe-token-block]].
+
+## DataDoe model correction + Phase-1 priority release GREEN -- 2026-08-22 (code f6f135f; docs separate)
+
+DataDoe confirmed IN WRITING: ANY number of sellerOrVendorIds per export; multiple marketplaces safe in one
+export; EVERY export = exactly 2 AI tokens (NO premium tier); 5,000,000-row cap; fetch everything once daily;
+Product Catalog + Brand Analytics Search Terms are seller-independent. The obsolete <=5-account batching,
+ceil(N/5) chunking, six-batch model, and standard=2/premium=5 pricing are REPLACED everywhere.
+
+Model (lib): id-batching/ads-sync/source-registry/source-batching = ONE export over all sorted seller ids
+(MAX_SAFE_INTEGER cap); FIXED campaign-performance-v1 batchSize 5 -> unlimited (an oversight; now == 
+asin-performance-v1). source-tranche-budget = flat 2-token cost decoupled from pricing class. source-durable-model
+= complete-window OLI planning (missingCoverageWindows; ONE export per contiguous missing window; NO fixed 7-day
+canonicalOliSlices for fetch) -- a 420-day initial backfill = one US + one Non-US export = 2 exports / 4 tokens.
+BATCHING_POLICY_VERSION versions the family namespace so old <=5 memberships never combine (historical byte-
+identical). EXACT-TUPLE isolation: source-account-isolation validates the exact (rawSellerId,
+marketplaceCountryCode) PAIR (never two independent sets); AMBIGUOUS_ACCOUNT_EVIDENCE fail-closed; 
+oliHistoryRowsFromFragment now fails closed when a rawSellerId maps to >1 marketplace account (marketplace-blind
+OLI cannot split) instead of silently collapsing. source-sync-driver carries accountTuples +
+owner.marketplaceCountryCode; source-worker (save) + report-worker (derive) validate/isolate against the exact
+tuples; Non-US family keeps ONE batch across mixed marketplaces (no marketplace split).
+
+Migration 20260823_source_batch_flat_token (sha 310d4b17..., adv [20260823,1], stageIdx 6, PREPARED-UNAPPLIED):
+Sec1 REPLACES assign_source_account_batch with the one-batch body (p_max IGNORED; insert single canonical
+batch_index 0; keeps advisory lock + scope-match rejection). Sec2 fail-closed guard (FLAT_TOKEN_MIGRATION_BLOCKED
+if any existing token_cost is distinct from 2) then ADD CONSTRAINT source_tranche_budget_hash_cost_flat2 CHECK
+(token_cost = 2) -- ADDITIVE (the permissive (2,5) constraint is NOT altered; intersection requires 2). Sec3
+REPLACES persist_source_tranche_budget with a FLAT_TOKEN_COST_REQUIRED guard rejecting any token_cost != 2 before
+mutation. schema-contract audits both bodies (auditAssignBatchFunction: ASSIGN_BATCH_STALE_CAP /
+ASSIGN_BATCH_NOT_SINGLE_BATCH / advisory-lock / scope-match; auditPersistFlat2Function). release-manifest 7th
+entry (functions createdNew:false; ALTER-added flat2 constraint = stage-7-due extra). flat2 in
+cumulativeAlterConstraints(7).
+
+Release engine: dedicated STAGE-6 re-anchor tooling mirroring stage-3/4 -- buildStage6Baseline/
+validateStage6Baseline/shouldCreateStage6Baseline (anchorStage=6, governs ONLY migration 7 / stageIdx>=6),
+re-anchor-stage6.mjs (.release-baseline-stage6.json; read-only REPEATABLE READ; ledger 1-6 once + 7 absent;
+cumulative 1-6 catalog; 8 digests==pins; ALWAYS ROLLBACK before write), applier dispatch (stageIdx>=6 ->
+stage-6; 4-5 -> stage-4; 3 -> stage-3; else stage-0), ro-prod-check accepts 0..7 (stage 6-7 -> stage-6 baseline).
+release-selftest 158 (added 18 stage-6 tests). stage-0/3/4 baselines preserved untouched.
+
+Priority integration proof (zero-export-rehearsal): the REAL composed runtime proves missing coverage drives
+EXACTLY one OLI export per bucket (2 total / 4 tokens), durable history is persisted + per-account isolated, and
+Daily Reporting + Brand View derive from it THROUGH the REAL report adapters (validatePayload = frontend
+contract) with ZERO additional OLI exports on reuse. durable-live-parity (P1-P5) already proves the full adapter
+path. Only Daily Reporting + Brand View are in scope; every other report stays PAUSED and its suite proven intact.
+All obsolete <=5 / premium-5-token / ceil(N/5) / six-batch test assertions corrected to the new model;
+DataSyncCenter copy updated (flat 2 tokens, unlimited batch).
+
+Verify: node --check ALL changed OK; release-selftest 158; npm run verify 55/55 across 35 suites INCL build:check
+(38s); git diff --check clean. Phase 1 GREEN. NEXT (no routine pause): stage-6 re-anchor -> ro-prod-check 6 ->
+guarded Migration-7 apply (single command; no COMMIT_UNKNOWN retry) -> ro-prod-check 7 -> push once -> ONE
+deploy -> VERIFY FUNDED DataDoe balance (user confirms tokens now funded; verify LIVE before first create) ->
+sync ONLY OLI/Product Catalog/Campaign Ads/ASIN Ads/FBA Inventory -> publish/verify ONLY Daily Reporting + Brand
+View -> enable/observe ONLY their approved scheduler workflow. Migration 20260823 UNAPPLIED; nothing pushed/
+deployed. Each production write = one narrowly-scoped command; stop only for a genuine fail-closed condition.
