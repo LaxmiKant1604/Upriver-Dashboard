@@ -25,7 +25,7 @@ const { shapeSyncStatus } = await import("../lib/server/sync/status.js");
 const { runReportAdapter } = await import("../lib/server/sync/adapters/report-adapter.js");
 const { expandSyncWork, targetDisposition, MAX_TARGET_ATTEMPTS } = await import("../lib/server/sync/planner.js");
 const { publicAccountId, resolveDataDoeAccountIds } = await import("../lib/server/datadoe-connections.js");
-const { ADS_SOURCES } = await import("../lib/server/ads-sync.js");
+const { ADS_SOURCES, MAX_IDS_PER_EXPORT } = await import("../lib/server/ads-sync.js");
 const { isDataDoeDeadlineError, sleep, withDataDoeDeadline } = await import("../lib/server/datadoe.js");
 const { claimRefreshLock, releaseRefreshLock } = await import("../lib/server/supabase.js");
 
@@ -133,15 +133,19 @@ test("resolveDataDoeAccountIds routes to the right connection and blocks cross-o
   assert.throws(() => resolveDataDoeAccountIds(["123", "dd-secondary:123"], CONNS), /one DataDoe connection|Cross-organisation/i);
 });
 
-/* 5. countriesForBucket + the DataDoe batch-size <= 5 rule. */
+/* 5. countriesForBucket + the DataDoe unlimited batch-size rule (any number of ids in one export). */
 test("countriesForBucket maps us to ['US'] and non-us to the managed set + OTHER", () => {
   assert.deepEqual(countriesForBucket("us"), { groups: [["US"]] });
   const nonUs = countriesForBucket("non-us");
   assert.deepEqual(nonUs.groups[0], ["IN", "CA", "AU"]);
   assert.equal(nonUs.groups[1], "OTHER");
 });
-test("every ads source batches seller/vendor ids in groups of <= 5", () => {
-  for (const s of ADS_SOURCES) assert.ok(s.batchSize <= 5, `${s.key} batchSize ${s.batchSize} > 5`);
+test("every ads source puts any number of seller/vendor ids in one export (no <= 5 cap)", () => {
+  // NEW model: DataDoe accepts ANY number of seller/vendor ids in ONE export, so EVERY source's batchSize is the
+  // unlimited MAX_IDS_PER_EXPORT rather than the former <= 5 chunk (campaign-performance-v1 included).
+  for (const s of ADS_SOURCES) {
+    assert.equal(s.batchSize, MAX_IDS_PER_EXPORT, `${s.key} must batch any number of ids in one export (no <= 5 cap)`);
+  }
 });
 test("non-US Ads work is split into separately bounded managed and OTHER targets", () => {
   const adsEntry = SYNC_REGISTRY.find((entry) => entry.reportKey === "ads:campaign-performance-v1");

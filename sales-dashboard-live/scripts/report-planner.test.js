@@ -559,10 +559,10 @@ test("planner: request identities are deterministic 64-char hashes (request_hash
   assert.equal(new Set(s1).size, 6, "six distinct monthly source identities");
 });
 
-test("planner: five-ID batching unchanged for multi-account reports; daily/sku reject multi-account", async () => {
+test("planner: any number of ids batch into ONE chunk for multi-account reports; daily/sku reject multi-account", async () => {
   const ids = Array.from({ length: 6 }, (_, i) => "id" + i);
   const jobs = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids, windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] } });
-  assert.equal(jobs.filter((j) => j.requestKey === "brand-sales:order-lines").length, 2, "6 ids -> two five-ID chunks");
+  assert.equal(jobs.filter((j) => j.requestKey === "brand-sales:order-lines").length, 1, "6 ids -> one chunk (any number in one export)");
   assert.throws(() => reportSourceRequestHashes({ reportKey: "daily-reporting", apiKey: "k", ids: ["A1", "A2"], windowsByRequestKey: { "daily-reporting:oli-sales": [{ from: "2026-03-01", to: "2026-03-31" }], "daily-reporting:catalog": [{ from: "2026-03-01", to: "2026-03-31" }] } }), /single account/);
 });
 

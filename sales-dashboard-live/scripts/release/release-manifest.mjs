@@ -198,6 +198,20 @@ export const MIGRATIONS = [
     ],
     alters: [{ table: "sync_report_jobs", addColumns: [["derive_lease_token", TYPE.uuid, false, null], ["derive_lease_expires_at", TYPE.tstz, false, null], ["derive_attempt_count", TYPE.int, true, "0"]], addConstraints: [] }],
   },
+  {
+    // Forward correction: one-batch-per-family assignment (REPLACES the 20260817 <=5 assign RPC) + DB-enforced
+    // flat 2-token cost (an ADDITIVE named constraint on the 20260818 source_tranche_budget_hash table + a
+    // hardened persist RPC). Both functions are createdNew:false (replaced, not created); the flat-2 constraint
+    // is a later ALTER-added constraint (auto-registered in ALTER_ADDED_CONSTRAINTS -> a stage-7-due extra on
+    // source_tranche_budget_hash, so migration 3's recorded catalog is NOT weakened). Function BODIES are proven
+    // by schema-contract; the manifest proves signatures/ACL + the added constraint.
+    file: "20260823_source_batch_flat_token.sql", sha: "310d4b1750c91224567abb0daf0d4ed2c7c7493c3028300ca944e7b7a7bac4c7", adv: [20260823, 1], tables: [],
+    functions: [
+      { sig: "public.assign_source_account_batch(text, text, text, text, integer)", ret: "integer", secdef: true, searchPath: "public", acl: FN_SR, createdNew: false },
+      { sig: "public.persist_source_tranche_budget(uuid, text, text, integer, integer, jsonb)", ret: "text", secdef: true, searchPath: "public", acl: FN_SR, createdNew: false },
+    ],
+    alters: [{ table: "source_tranche_budget_hash", addColumns: [], addConstraints: [CK("source_tranche_budget_hash_cost_flat2", "token_cost=2")] }],
+  },
 ];
 
 export const NEW6 = MIGRATIONS.map((m) => m.file);

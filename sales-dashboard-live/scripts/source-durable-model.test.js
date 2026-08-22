@@ -94,37 +94,53 @@ test("B2. missingOliSlices: full coverage => nothing to export; no coverage => e
   assert.deepEqual(partial.missing, [{ from: "2026-08-08", to: "2026-08-14" }, { from: "2026-08-15", to: "2026-08-15" }]);
 });
 
-group("C. slice-subset batching");
+group("C. complete-window OLI planning (Blocker A: no fixed 7-day slicing for a normal initial backfill)");
 
-test("C1. steady state: all 5 members missing the rolling slices => ONE batch export per slice (sorted 5-id scope)", () => {
-  const w = model.oliRollingRefreshWindow(ASOF); // 2026-08-09..2026-08-15
+test("C1. steady rolling refresh: all members missing the rolling window => ONE complete-window export (sorted scope)", () => {
+  const w = model.oliRollingRefreshWindow(ASOF);
   const coverage = Object.fromEntries(ACCTS.map((a) => [a.accountId, fullCoverage("2025-06-01", "2026-08-08")]));
   const units = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: coverage, from: w.from, to: w.to });
-  assert.ok(units.length >= 1);
-  for (const u of units) {
-    assert.equal(u.accounts.length, 5, "every member joins the rolling slice");
-    assert.deepEqual(u.sellerOrVendorIds, ["S1", "S2", "S3", "S4", "S5"], "sorted stable seller scope");
-  }
+  assert.equal(units.length, 1, "ONE unit over the missing window (never one-per-7-day-slice)");
+  assert.deepEqual(units[0].slice, { from: w.from, to: w.to }, "the unit IS the complete missing window");
+  assert.deepEqual(units[0].sellerOrVendorIds, ["S1", "S2", "S3", "S4", "S5"], "sorted stable seller scope");
 });
 
-test("C2. a newly discovered account backfills SOLO; completed members are never re-exported", () => {
+test("C2. a newly discovered account backfills SOLO over ONE complete window; completed members never re-export", () => {
   const from = "2026-07-01"; const to = "2026-07-31";
   const coverage = Object.fromEntries(ACCTS.slice(0, 4).map((a) => [a.accountId, fullCoverage(from, to)]));
-  // A5 is new: no coverage at all.
   const units = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: coverage, from, to });
-  assert.equal(units.length, dates.canonicalOliSlices(from, to).length, "one unit per historical slice");
-  for (const u of units) {
-    assert.deepEqual(u.sellerOrVendorIds, ["S5"], "ONLY the new account's missing backfill is processed");
-  }
+  assert.equal(units.length, 1, "ONE complete-window unit (not one per canonical 7-day slice)");
+  assert.deepEqual(units[0].slice, { from, to });
+  assert.deepEqual(units[0].sellerOrVendorIds, ["S5"], "ONLY the new account's backfill");
 });
 
-test("C3. fully proven window => ZERO units; malformed batches fail closed", () => {
+test("C3. fully proven window => ZERO units; empty/blank batches fail closed", () => {
   const from = "2026-07-01"; const to = "2026-07-31";
   const coverage = Object.fromEntries(ACCTS.map((a) => [a.accountId, fullCoverage(from, to)]));
   assert.deepEqual(model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: coverage, from, to }), []);
-  assert.throws(() => model.planOliSliceExports({ batchAccounts: [], coverageByAccountId: {}, from, to }), /1\.\.5 account/);
-  assert.throws(() => model.planOliSliceExports({ batchAccounts: [...ACCTS, { accountId: "A6", rawSellerId: "S6" }], coverageByAccountId: {}, from, to }), /1\.\.5 account/);
+  assert.throws(() => model.planOliSliceExports({ batchAccounts: [], coverageByAccountId: {}, from, to }), /non-empty stable batch/);
   assert.throws(() => model.planOliSliceExports({ batchAccounts: [{ accountId: "A1", rawSellerId: " " }], coverageByAccountId: {}, from, to }), /rawSellerId/);
+});
+
+test("BA1. 420-day initial backfill (no coverage) => exactly ONE complete-history export per bucket (2 exports total for US + Non-US)", () => {
+  const to = "2026-08-15"; const from = dates.addDaysStr(to, -419); // 420-day inclusive window
+  const usUnits = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: {}, from, to });
+  const nonUsUnits = model.planOliSliceExports({ batchAccounts: ACCTS.map((a, i) => ({ accountId: "EU" + i, rawSellerId: "E" + i })), coverageByAccountId: {}, from, to });
+  assert.equal(usUnits.length, 1, "ONE US export over the complete 420-day window (no 7-day slicing)");
+  assert.deepEqual(usUnits[0].slice, { from, to }, "complete-history window, unsliced");
+  assert.equal(nonUsUnits.length, 1, "ONE Non-US export over the complete 420-day window");
+  assert.equal(usUnits.length + nonUsUnits.length, 2, "TWO exports total (US + Non-US); at a flat 2 tokens/export = 4 tokens");
+});
+
+test("BA2. successful full-window OLI creates ZERO child slices; no initial-backfill unit is a 7-day canonical slice", () => {
+  const to = "2026-08-15"; const from = dates.addDaysStr(to, -419);
+  const slices = dates.canonicalOliSlices(from, to);
+  assert.ok(slices.length > 1, "the window WOULD produce many 7-day slices under the old model");
+  const units = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: {}, from, to });
+  assert.equal(units.length, 1, "the new planner emits exactly ONE complete-window unit");
+  assert.notDeepEqual(units[0].slice, slices[0], "the unit is NOT a 7-day canonical slice");
+  const full = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: Object.fromEntries(ACCTS.map((a) => [a.accountId, fullCoverage(from, to)])), from, to });
+  assert.deepEqual(full, [], "a fully-covered window creates zero child slices/exports");
 });
 
 test("C4. successful slices roll up into minimal coverage windows", () => {
@@ -187,6 +203,31 @@ test("D3. the canonical PK grain upserts idempotently: a late Amazon correction 
   upsert(corrected);
   assert.equal(table.size, 1, "replaced, not duplicated");
   assert.equal([...table.values()][0].salesAmount, 90, "the correction won");
+});
+
+test("D4. EXACT-TUPLE: a rawSellerId shared by two marketplace accounts fails closed (AMBIGUOUS), never silently collapses", () => {
+  // The authoritative `accounts` list carries the same seller id under TWO accounts (a single European seller
+  // operating across two marketplaces). The marketplace-blind OLI payload cannot split its rows per account.
+  const accounts = [
+    { rawSellerId: "SEU", accountId: "A-GB", country: "GB" },
+    { rawSellerId: "SEU", accountId: "A-DE", country: "DE" },
+  ];
+  assert.throws(
+    () => model.oliHistoryRowsFromFragment({ ...FRAG_META, accounts, rows: [fragRow("SEU", "2026-08-10", "K", "B", "USD", 100, 10)] }),
+    (e) => e.code === "AMBIGUOUS_ACCOUNT_EVIDENCE" && /multiple marketplace accounts/.test(e.message),
+    "a shared seller id must reject the whole payload rather than attribute every row to one account",
+  );
+  // A DISTINCT seller id per account isolates cleanly (the common, unambiguous case).
+  const distinct = [
+    { rawSellerId: "SGB", accountId: "A-GB", country: "GB" },
+    { rawSellerId: "SDE", accountId: "A-DE", country: "DE" },
+  ];
+  const rows = model.oliHistoryRowsFromFragment({
+    ...FRAG_META, accounts: distinct,
+    rows: [fragRow("SGB", "2026-08-10", "K", "B", "USD", 100, 10), fragRow("SDE", "2026-08-10", "K", "B", "USD", 50, 5)],
+  });
+  assert.equal(rows.length, 2, "distinct seller ids isolate to their own accounts");
+  assert.deepEqual(rows.map((r) => r.accountId).sort(), ["A-DE", "A-GB"]);
 });
 
 group("E. snapshots");

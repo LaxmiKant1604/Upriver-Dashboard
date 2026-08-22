@@ -33,14 +33,14 @@ export const SOURCE_STORAGE_STRATEGIES = Object.freeze([
 ]);
 export const SOURCE_PLANNING_MODES = Object.freeze(["static", "signal-derived"]);
 export const SOURCE_BATCHING_MODES = Object.freeze([
-  "stable-batch",   // approved for <=5-account stable batching (requires a SELLER_SCOPED_REQUEST_KEYS contract)
-  "per-account",    // seller-scoped but fetched one account per export by its current approved contracts
+  "stable-batch",   // ONE batched export per US/Non-US family/window (any number of sellers; SELLER_SCOPED_REQUEST_KEYS contract)
+  "per-account",    // seller-scoped but fetched one account per export (signal-derived per-account windows can't batch)
   "organization",   // organization-wide: ONE export per organization/window, never per seller
 ]);
 
-// The DataDoe premium tables among the registered families (from source discovery `isPremium` / the
-// data-scheme): Profit by SKU & Date, Listings (COGS-enriched), FBA Inventory Health. The raw Listings twin
-// (listings-raw) is standard. Everything else registered here is standard (2 tokens).
+// tokenClass is now INFORMATIONAL only: DataDoe confirmed EVERY export costs exactly 2 AI tokens (no premium
+// tier). The historical premium tables (Profit by SKU & Date, Listings COGS-enriched, FBA Inventory Health)
+// still carry tokenClass:"premium" as a data-scheme label, but it no longer affects the token budget (flat 2).
 const rec = (r) => Object.freeze({
   ...r,
   usedByReports: Object.freeze([...r.usedByReports].sort()),
@@ -62,7 +62,7 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778",
     scope: "seller",
     grain: "dated",
-    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
+    batching: { mode: "stable-batch", maxAccountsPerExport: Number.MAX_SAFE_INTEGER, marketplaceSafe: true },
     usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"],
     usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "priority-feed"],
     // Initial backfill = the LONGEST window any Daily Reporting / Brand View (brand-sales) contract requires:
@@ -438,7 +438,7 @@ export function assertSourceRegistryConsistency(overrides = {}) {
     if (hasBatchedContract && r.batching.mode !== "stable-batch") die(`"${r.sourceKey}" has a seller-batched contract but batching mode "${r.batching.mode}"`);
     if (!hasBatchedContract && r.batching.mode === "stable-batch") die(`"${r.sourceKey}" is stable-batch but has NO approved SELLER_SCOPED_REQUEST_KEYS contract`);
     if (r.scope === "organization" && r.batching.mode !== "organization") die(`"${r.sourceKey}" is organization-wide but not organization-batched`);
-    if (r.batching.mode === "stable-batch" && r.batching.maxAccountsPerExport !== 5) die(`"${r.sourceKey}" stable-batch must cap at exactly 5 accounts per export`);
+    if (r.batching.mode === "stable-batch" && r.batching.maxAccountsPerExport !== Number.MAX_SAFE_INTEGER) die(`"${r.sourceKey}" stable-batch must be uncapped (DataDoe allows any number of sellers per export; one batch per US/Non-US family)`);
 
     // 7) STORAGE vs fetch path: a durable-ads family must NOT be a fetched Scheduler-v2 family (it is
     //    fetched by the durable Ads architecture), and vice versa every fetched family must not be durable-ads.

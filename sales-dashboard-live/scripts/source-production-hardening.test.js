@@ -901,8 +901,10 @@ test("R6. corrupted existing batch membership is refused typed with ZERO exports
     assert.throws(() => V([bad], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT");
   }
   assert.throws(() => V([good, { ...good }], { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", "duplicate account");
-  const six = Array.from({ length: 6 }, (_, i) => ({ ...good, account_id: "A0" + i }));
-  assert.throws(() => V(six, { orgFingerprint: org }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT", ">5 in one batch");
+  // The former "<=5 per batch" cap is SUPERSEDED: DataDoe permits any number of sellers per export, so a single
+  // batch of many accounts (all batch_index 0, distinct account ids) is now VALID -- never a corruption.
+  const many = Array.from({ length: 30 }, (_, i) => ({ ...good, account_id: "A" + String(i).padStart(2, "0") }));
+  assert.ok(V(many, { orgFingerprint: org }) instanceof Map, "any number of accounts in one unlimited batch is accepted (no <=5 cap)");
   const h = makeHarness({ readBatchMembership: async () => [{ ...good, organization_fingerprint: "evil-org" }] });
   await assert.rejects(() => h.runtime.run({ bucket: "us", today: TODAY }), (e) => e.code === "BATCH_MEMBERSHIP_CORRUPT");
   assert.equal(h.dd.totalCreates(), 0, "zero exports on corrupt membership");
@@ -1301,7 +1303,12 @@ test("T5. blocker 4: ONE route-owned deadline created BEFORE preflight bounds pr
     store,
     ddOpts: { onCreate: () => { h.clockRef.now += 30_000; } },
     budgetMs: 100_000, reserveMs: 40_000,
-    readCoverage: async () => ({ windows: [], read: "ok", error: null }), // full backfill => plenty of work
+    // Plenty of work under the one-batch/one-window model: coverage with a HOLE in the middle of the backfill
+    // window leaves TWO missing windows, so the complete-window planner emits TWO OLI exports (one per gap).
+    // Each 30s create burns the shared budget; after ~2 creates the reserve boundary (start+60s) is crossed
+    // mid-route -> typed-resumable, with total elapsed still under the 100s route budget. (Snapshots stay
+    // fresh so the preflight -- which fail-closes on stale required evidence -- passes.)
+    readCoverage: async () => ({ windows: [{ from: "2025-10-01", to: "2025-10-31" }], read: "ok", error: null }),
   });
   const t0 = h.clockRef.now;
   const dl = h.runtime.makeDeadline();

@@ -1,6 +1,7 @@
 // Phase 1b: prove the per-report source-contract declarations are transcribed
 // accurately from the EXECUTABLE builders in api/datadoe.js, and that the resolver
-// reproduces the live transport's exact 5-ID chunking and applies windows per
+// reproduces the live transport's exact ID chunking (now ONE chunk over ALL ids per
+// source -- any number of seller/vendor ids in one export) and applies windows per
 // requestKey (no Cartesian product). Static imports only.
 //
 // Run with: npm run test:report-contracts
@@ -188,10 +189,12 @@ test("a derived-only report (no owned source jobs) resolves to null", () => {
   assert.equal(reportSourceRequestHashes({ reportKey: "priority-feed", apiKey: "k", ids: ids(3), windowsByRequestKey: {} }), null);
 });
 
-/* ----------------- exact 5-ID chunking vs the live transport ----------------- */
+/* -------- single-chunk (any number of ids) chunking vs the live transport -------- */
 
-test("MAX chunk size is 5, matching the live transport", () => {
-  assert.equal(MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, 5);
+test("MAX chunk size is unlimited (any number of ids in one export), matching the live transport", () => {
+  // NEW model: DataDoe accepts ANY number of seller/vendor ids in ONE export, so the per-export id cap is
+  // effectively unlimited (Number.MAX_SAFE_INTEGER), not the former 5.
+  assert.equal(MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT, Number.MAX_SAFE_INTEGER);
 });
 
 for (const n of [0, 1, 5, 6, 11]) {
@@ -214,18 +217,18 @@ test("empty ID scope returns [] BEFORE window validation (missing/empty window m
   assert.deepEqual(reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: null, windowsByRequestKey: {} }), []);
 });
 
-test("six IDs create two chunks per source, not one (2 sources x 1 window x 2 chunks = 4)", () => {
+test("six IDs create ONE chunk per source (2 sources x 1 window x 1 chunk = 2)", () => {
   const got = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ids(6), windowsByRequestKey: bsWin });
-  assert.equal(got.length, 4);
+  assert.equal(got.length, 2);
   const oli = got.filter((r) => r.requestKey === "brand-sales:order-lines");
-  assert.deepEqual(oli.map((r) => r.sellerOrVendorIds), [["id0", "id1", "id2", "id3", "id4"], ["id5"]]);
+  assert.deepEqual(oli.map((r) => r.sellerOrVendorIds), [["id0", "id1", "id2", "id3", "id4", "id5"]]);
 });
 
-test("eleven IDs create three chunks per source (2 x 1 x 3 = 6)", () => {
+test("eleven IDs still create ONE chunk per source (2 x 1 x 1 = 2)", () => {
   const got = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ids(11), windowsByRequestKey: bsWin });
-  assert.equal(got.length, 6);
+  assert.equal(got.length, 2);
   const oli = got.filter((r) => r.requestKey === "brand-sales:order-lines");
-  assert.deepEqual(oli.map((r) => r.sellerOrVendorIds), [["id0", "id1", "id2", "id3", "id4"], ["id5", "id6", "id7", "id8", "id9"], ["id10"]]);
+  assert.deepEqual(oli.map((r) => r.sellerOrVendorIds), [["id0", "id1", "id2", "id3", "id4", "id5", "id6", "id7", "id8", "id9", "id10"]]);
 });
 
 test("each result carries its exact ID chunk and the fields the worker needs", () => {
@@ -233,16 +236,19 @@ test("each result carries its exact ID chunk and the fields the worker needs", (
   for (const f of ["requestKey", "sourceKey", "sourceId", "sellerOrVendorIds", "from", "to", "limit", "options", "requestHash", "organizationFingerprint", "accountScopeHash", "requestMeta"]) {
     assert.ok(f in first, "missing field " + f);
   }
-  assert.deepEqual(first.sellerOrVendorIds, ["id0", "id1", "id2", "id3", "id4"]);
+  assert.deepEqual(first.sellerOrVendorIds, ["id0", "id1", "id2", "id3", "id4", "id5"]);
 });
 
-test("chunk boundaries follow input order; reordering across a boundary changes membership", () => {
+test("all ids land in ONE chunk in input order; reordering keeps the same membership", () => {
   const a = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ["a", "b", "c", "d", "e", "f"], windowsByRequestKey: bsWin })
     .filter((r) => r.requestKey === "brand-sales:order-lines").map((r) => r.sellerOrVendorIds);
   const b = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ["f", "a", "b", "c", "d", "e"], windowsByRequestKey: bsWin })
     .filter((r) => r.requestKey === "brand-sales:order-lines").map((r) => r.sellerOrVendorIds);
-  assert.deepEqual(a, [["a", "b", "c", "d", "e"], ["f"]]);
-  assert.deepEqual(b, [["f", "a", "b", "c", "d"], ["e"]]);
+  // NEW model: every id goes into ONE chunk (no <=5 boundary). The chunk preserves input order, but the
+  // membership set is identical across orderings (and the request hash sorts internally -- see next test).
+  assert.deepEqual(a, [["a", "b", "c", "d", "e", "f"]]);
+  assert.deepEqual(b, [["f", "a", "b", "c", "d", "e"]]);
+  assert.deepEqual([...a[0]].sort(), [...b[0]].sort());
 });
 
 test("reordering IDs WITHIN one chunk does not change the request hash (identity sorts)", () => {
@@ -275,7 +281,7 @@ test("source-scope policy: daily-reporting and sku-pl are single-account; others
   assert.equal(reportAccountScope("sku-pl"), "single-account");
   assert.equal(requiresSingleAccountSource("sku-pl"), true);
   assert.equal(requiresSingleAccountSource("daily-reporting"), true);
-  // Every other report keeps safe five-ID batching.
+  // Every other report keeps multi-account batching (any number of ids in one export).
   assert.equal(reportAccountScope("brand-sales"), "multi-account");
   assert.equal(requiresSingleAccountSource("brand-sales"), false);
   assert.equal(requiresSingleAccountSource("keyword-rank"), false);
@@ -307,11 +313,11 @@ test("daily-reporting rejects a multi-account scope; single account resolves", (
   );
 });
 
-test("single-account rejection does NOT disable five-ID batching for other reports", () => {
-  // brand-sales still batches 6 ids into two chunks (unchanged).
+test("single-account rejection does NOT disable multi-account batching for other reports", () => {
+  // brand-sales still batches all 6 ids into ONE chunk (any number of ids in one export).
   const got = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ids(6), windowsByRequestKey: bsWin });
   const ol = got.filter((r) => r.requestKey === "brand-sales:order-lines");
-  assert.equal(ol.length, 2, "6 ids -> two five-ID chunks preserved for multi-account reports");
+  assert.equal(ol.length, 1, "6 ids -> one chunk preserved for multi-account reports");
 });
 
 test("different request keys receive ONLY their own windows", () => {

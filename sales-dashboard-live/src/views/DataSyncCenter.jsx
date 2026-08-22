@@ -27,7 +27,7 @@ function SourceCard({ card, busyKey, onPause, onSyncMissing }) {
   return (
     <section className={`panel sync-report-card${card.paused ? " locked" : ""}`}>
       <div className="sync-report-title">
-        <div><strong>{card.label}</strong><span>{card.tokenClass === "premium" ? "premium · 5 tokens/export" : "standard · 2 tokens/export"}</span></div>
+        <div><strong>{card.label}</strong><span>{`${card.tokenClass === "premium" ? "premium" : "standard"} · 2 tokens/export`}</span></div>
         <span className={`status-badge ${statusTone}`}>{card.paused ? "Paused" : s.lastStatus}</span>
       </div>
       <div className="sync-report-meta">
@@ -143,7 +143,7 @@ export default function DataSyncCenter({ accessToken }) {
 
       <div className="panel sync-scope-panel">
         <label><span>Marketplace bucket</span><select value={bucket} onChange={(event) => setBucket(event.target.value)}><option value="non-us">Non-US · 07:30 IST</option><option value="us">US · 16:00 IST</option></select></label>
-        <div className="sync-token-note">"Sync missing data" runs one bounded, coverage-driven pass for this bucket: at most five compatible accounts per export, and already-proven historical coverage is never re-exported.</div>
+        <div className="sync-token-note">"Sync missing data" runs one bounded, coverage-driven pass for this bucket: all compatible accounts share ONE export (any number of sellers per export, 2 tokens each), and already-proven historical coverage is never re-exported.</div>
       </div>
 
       {error && <div className="data-alert error"><strong>Source control failed</strong><div>{error}</div></div>}

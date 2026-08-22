@@ -292,7 +292,11 @@ export function assembleSources(plannedSources, statusByHash, loadedByHash, erro
     // (rows -> null), leaving the source unavailable rather than attributing cross-org rows.
     let scopeIds = s.sellerOrVendorIds || null;
     if (owner && rows !== null) {
-      const iso = isolateFragmentRowsForOwner({ rows, sourceScope: s.sourceScope, sellerOrVendorIds: scopeIds, organizationFingerprint: s.organizationFingerprint, connectionId: s.connectionId }, owner);
+      // EXACT-TUPLE isolation: pass whether the source fetched marketplace_country_code + the batch's authoritative
+      // account tuples so a marketplace-scoped source routes each row by the exact (seller, marketplace) pair, and a
+      // marketplace-blind source refuses a rawSellerId that maps to >1 marketplace account (AMBIGUOUS). The owner
+      // carries its own marketplaceCountryCode (from the planned metadata).
+      const iso = isolateFragmentRowsForOwner({ rows, sourceScope: s.sourceScope, sellerOrVendorIds: scopeIds, marketplaceScoped: s.marketplaceScoped === true, accountTuples: s.accountTuples || null, organizationFingerprint: s.organizationFingerprint, connectionId: s.connectionId }, owner);
       rows = iso.rows;
       scopeIds = iso.sellerOrVendorIds;
     }

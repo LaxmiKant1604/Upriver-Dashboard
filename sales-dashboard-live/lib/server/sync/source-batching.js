@@ -1,28 +1,29 @@
-// Scheduler v2 -- STABLE, automatic <=5-account SOURCE batching (SHADOW MODE, pure core).
+// Scheduler v2 -- STABLE, automatic ONE-BATCH-PER-FAMILY SOURCE batching (SHADOW MODE, pure core).
 //
-// A "batch" groups up to FIVE compatible primary accounts so their shared canonical source (Order Line
-// Items, order-lines) is fetched as ONE DataDoe export over the sorted batch seller ids instead of one
-// export per account. The canonical source scope is the BATCH (its request_hash folds the sorted batch
-// seller ids); OWNER scope stays one exact (report, account) so five accounts can own one source job
-// without colliding (see source-identity.sourceJobOwnerId, which folds the INDIVIDUAL account).
+// DataDoe confirmed IN WRITING that ANY number of sellerOrVendorIds may be combined in one export (multiple
+// marketplaces safely; the only cap is 5,000,000 rows, a separate per-source concern). So a "batch" groups
+// ALL compatible accounts of a family into ONE DataDoe export over the sorted batch seller ids -- one US
+// export and one Non-US export per seller-scoped source/window (the family key folds the bucket, so US and
+// Non-US resolve to different families and never share an export). [Superseded: the former <=5-account cap.]
+// The canonical source scope is the BATCH (its request_hash folds the sorted batch seller ids); OWNER scope
+// stays one exact (report, account) so many accounts can own one source job without colliding (see
+// source-identity.sourceJobOwnerId, which folds the INDIVIDUAL account). Per-account isolation of the
+// downloaded rows is enforced separately (source-account-isolation.js), independent of batch size.
 //
-// STABILITY is the core requirement: adding one newly discovered/approved account must NOT reshuffle the
-// existing accounts (which would invalidate every existing request_hash / cached export). This module keeps
-// every existing assignment and only PLACES new accounts, into the smallest non-full batch (or a fresh
-// batch when all are full). Durable membership (source_batch_membership + assign_source_account_batch RPC)
-// makes the assignment stable across processes and enforces the five-account maximum transactionally; this
-// pure engine is the model the durable RPC mirrors and the in-memory test double.
+// STABILITY: adding a newly discovered/approved compatible account simply JOINS the family's single batch
+// (no new batch, no reshuffle). Durable membership (source_batch_membership + assign_source_account_batch
+// RPC) records the assignment; this pure engine is the model the durable RPC mirrors and the test double.
 //
 // COMPATIBILITY (two accounts may share one export) requires identical organization, connection, bucket,
 // source id, columns, grouping, aggregations, ordering, limit, window SHAPE and marketplace constraint --
 // everything the export request identity depends on EXCEPT the per-account seller ids and the concrete
-// date window (a batch serves every window of a cycle uniformly, and all accounts of a bucket/cycle share
-// the same asOf-derived windows). Primary and dd-secondary (or different organizations) NEVER mix: the
-// connection id + organization fingerprint are part of the family key.
+// date window. Primary and dd-secondary (or different organizations) NEVER mix: the connection id +
+// organization fingerprint are part of the family key.
 
 import { createHash } from "node:crypto";
 
-export const MAX_ACCOUNTS_PER_BATCH = 5;
+// One batch per family: no per-batch account cap (DataDoe allows any number of sellers per export).
+export const MAX_ACCOUNTS_PER_BATCH = Number.MAX_SAFE_INTEGER;
 
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
@@ -37,12 +38,20 @@ function stableJson(value) {
  * folded so incompatible window shapes never merge. connection_id + organization_fingerprint are folded, so
  * primary/dd-secondary and different organizations can never batch together. Returns a 32-hex string.
  */
+// The batching-policy version folded into EVERY family key. Bumping it (here: to the unlimited one-batch-per
+// US/Non-US-family policy) moves ALL new cycles into a FRESH canonical membership namespace, so historical
+// source_batch_membership rows created under the old <=5 policy live under a DIFFERENT family key and can never
+// combine with -- or be reinterpreted by -- a new plan. Historical cycles keep their own request hashes,
+// owners, scopes, budgets and evidence unchanged (they folded the old policy version / no version).
+export const BATCHING_POLICY_VERSION = "us-nonus-unlimited/v2";
+
 export function batchFamilyKey({
   organizationFingerprint, connectionId, bucket, sourceId,
   columns, groupBy, aggregations, orderByColumn, orderByDirection, limit,
-  windowKind, marketplaceConstraint,
+  windowKind, marketplaceConstraint, batchingPolicyVersion = BATCHING_POLICY_VERSION,
 }) {
   const norm = stableJson({
+    policy: String(batchingPolicyVersion || ""), // explicit batching-policy version -> fresh namespace on bump
     org: String(organizationFingerprint || ""),
     conn: String(connectionId || ""),
     bucket: String(bucket || ""),

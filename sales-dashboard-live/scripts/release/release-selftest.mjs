@@ -15,6 +15,7 @@ import {
   buildBaseline, validateBaseline, shouldCreateBaseline, beginReadOnlySnapshot, applyInTransaction, runApply,
   buildStage3Baseline, validateStage3Baseline, shouldCreateStage3Baseline,
   buildStage4Baseline, validateStage4Baseline, shouldCreateStage4Baseline,
+  buildStage6Baseline, validateStage6Baseline, shouldCreateStage6Baseline,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -137,7 +138,11 @@ test("cumulative: stages 2-3 do NOT require account_canonical (premature); stage
   assert.deepEqual(cumulativeAlterConstraints(4), { source_batch_membership: ["source_batch_membership_account_canonical"] });
   assert.deepEqual(cumulativeAlterConstraints(5), { source_batch_membership: ["source_batch_membership_account_canonical"] });
   assert.deepEqual(cumulativeAlterConstraints(6), { source_batch_membership: ["source_batch_membership_account_canonical"] });
+  // Migration 7 (20260823) ADDs the flat-2 token_cost constraint to migration-3's source_tranche_budget_hash:
+  // due only at stage >= 7, so migration 3's recorded catalog is not weakened at stages <= 6.
+  assert.deepEqual(cumulativeAlterConstraints(7), { source_batch_membership: ["source_batch_membership_account_canonical"], source_tranche_budget_hash: ["source_tranche_budget_hash_cost_flat2"] });
 });
+test("cumulative: ALTER_ADDED_CONSTRAINTS maps flat2 -> migration 20260823 / source_tranche_budget_hash", () => { const e = ALTER_ADDED_CONSTRAINTS.find((c) => c.name === "source_tranche_budget_hash_cost_flat2"); assert.ok(e); assert.equal(e.table, "source_tranche_budget_hash"); assert.equal(e.ownerIndex, NEW6.indexOf("20260823_source_batch_flat_token.sql")); });
 // Migration-6 sync_report_jobs add-columns are modeled cumulatively (absent before stage 6; exact at stage 6).
 const M6mig = MIGRATIONS.find((m) => m.file === "20260822_report_derive_lease.sql");
 test("m6 columns: verifyMigrationAbsent PASSES when the derive-lease columns are absent (pre stage 6)", async () => {
@@ -288,7 +293,7 @@ test("runApply: valid pre-checks -> client IS constructed", async () => {
 // ---------- DEDICATED stage-3 re-anchor baseline (forward-only recovery; governs ONLY migrations 4-6) -----
 const s3 = buildStage3Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
 const vs3 = (b, over = {}) => validateStage3Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
-test("stage3: build binds anchorStage=3, all 6 migration hashes, manifest-pinned digests", () => { assert.equal(s3.anchorStage, 3); assert.equal(Object.keys(s3.migrationHashes).length, 6); assert.deepEqual(Object.keys(s3.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage3: build binds anchorStage=3, all migration hashes, manifest-pinned digests", () => { assert.equal(s3.anchorStage, 3); assert.equal(Object.keys(s3.migrationHashes).length, NEW6.length); assert.deepEqual(Object.keys(s3.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
 test("stage3: valid passes for a migration 4-6 (stageIdx>=3) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs3(s3, { stageIdx: 3 }), []); assert.deepEqual(vs3(s3, { stageIdx: 5 }), []); assert.deepEqual(vs3(s3), []); });
 test("stage3: anchorStage != exactly 3 fails", () => { const b = clone(s3); b.anchorStage = 0; assert.ok(vs3(b).length); b.anchorStage = 4; assert.ok(vs3(b).length); });
 test("stage3: applying a migration whose stage PRECEDES the anchor (stageIdx<3) fails", () => { assert.ok(vs3(s3, { stageIdx: 2 }).length); assert.ok(vs3(s3, { stageIdx: 0 }).length); });
@@ -311,7 +316,7 @@ test("stage3 applier: migration 1 (stageIdx 0) REJECTS a stage-3 baseline -> zer
 // ---------- DEDICATED stage-4 re-anchor baseline (governs ONLY migrations 5-6) ---------------------------
 const s4 = buildStage4Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
 const vs4 = (b, over = {}) => validateStage4Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
-test("stage4: build binds anchorStage=4, all 6 migration hashes, manifest-pinned digests", () => { assert.equal(s4.anchorStage, 4); assert.equal(Object.keys(s4.migrationHashes).length, 6); assert.deepEqual(Object.keys(s4.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage4: build binds anchorStage=4, all migration hashes, manifest-pinned digests", () => { assert.equal(s4.anchorStage, 4); assert.equal(Object.keys(s4.migrationHashes).length, NEW6.length); assert.deepEqual(Object.keys(s4.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
 test("stage4: valid passes for a migration 5-6 (stageIdx>=4) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs4(s4, { stageIdx: 4 }), []); assert.deepEqual(vs4(s4, { stageIdx: 5 }), []); assert.deepEqual(vs4(s4), []); });
 test("stage4: anchorStage != exactly 4 fails", () => { const b = clone(s4); b.anchorStage = 3; assert.ok(vs4(b).length); b.anchorStage = 5; assert.ok(vs4(b).length); });
 test("stage4: use for a migration below the anchor (stageIdx<4) fails", () => { assert.ok(vs4(s4, { stageIdx: 3 }).length); assert.ok(vs4(s4, { stageIdx: 0 }).length); });
@@ -329,6 +334,30 @@ test("stage4: shouldCreate requires zero problems AND a clean rollback", () => {
 test("stage4 applier: migration 5 (stageIdx 4) + VALID stage-4 baseline constructs the client", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[4], sqlText: "X", actualSha: MIGRATIONS[4].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
 test("stage4 applier: migration 5 REJECTS the stage-3 baseline (anchor 3) -> zero connect", async () => { let made = 0; const b = buildStage3Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[4], sqlText: "X", actualSha: MIGRATIONS[4].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 test("stage4 applier: migration 4 (stageIdx 3) REJECTS the stage-4 baseline (anchor 4) -> zero connect", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[3], sqlText: "X", actualSha: MIGRATIONS[3].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+
+// ---------- DEDICATED stage-6 re-anchor baseline (governs ONLY migration 7, stageIdx 6) ------------------
+const s6 = buildStage6Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
+const vs6 = (b, over = {}) => validateStage6Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
+test("stage6: build binds anchorStage=6, all migration hashes, manifest-pinned digests", () => { assert.equal(s6.anchorStage, 6); assert.equal(Object.keys(s6.migrationHashes).length, NEW6.length); assert.deepEqual(Object.keys(s6.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage6: valid passes for migration 7 (stageIdx>=6) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs6(s6, { stageIdx: 6 }), []); assert.deepEqual(vs6(s6), []); });
+test("stage6: anchorStage != exactly 6 fails", () => { const b = clone(s6); b.anchorStage = 4; assert.ok(vs6(b).length); b.anchorStage = 7; assert.ok(vs6(b).length); });
+test("stage6: use for a migration below the anchor (stageIdx<6) fails", () => { assert.ok(vs6(s6, { stageIdx: 5 }).length); assert.ok(vs6(s6, { stageIdx: 3 }).length); assert.ok(vs6(s6, { stageIdx: 0 }).length); });
+test("stage6: wrong HEAD fails", () => { assert.ok(vs6(s6, { currentHead: "b".repeat(40) }).length); });
+test("stage6: stale manifest fingerprint fails", () => { assert.ok(vs6(s6, { currentFingerprint: "x" }).length); });
+test("stage6: environment switched (envRef mismatch) fails", () => { assert.ok(vs6(s6, { envRef: "otherproject" }).length); });
+test("stage6: wrong project ref fails", () => { const b = clone(s6); b.projectRef = "someoneelse"; assert.ok(vs6(b, { stageIdx: 6, envRef: null }).length); });
+test("stage6: EDIT a digest hash fails", () => { const b = clone(s6); b.protectedDigest.approvals.h = "tampered"; assert.ok(vs6(b, { stageIdx: 6 }).length); });
+test("stage6: EDIT a digest count fails", () => { const b = clone(s6); b.protectedDigest.settings.c = 999; assert.ok(vs6(b, { stageIdx: 6 }).length); });
+test("stage6: ADD an extra digest key fails", () => { const b = clone(s6); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vs6(b, { stageIdx: 6 }).length); });
+test("stage6: REMOVE a digest key fails", () => { const b = clone(s6); delete b.protectedDigest.report_jobs; assert.ok(vs6(b, { stageIdx: 6 }).length); });
+test("stage6: migration-hash drift fails", () => { const b = clone(s6); b.migrationHashes[NEW6[0]] = "deadbeef"; assert.ok(vs6(b, { stageIdx: 6 }).length); });
+test("stage6: real manifest pins reject a foreign-pins stage-6 baseline", () => { assert.ok(validateStage6Baseline(s6, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, stageIdx: 6 }).length); });
+test("stage6: shouldCreate requires zero problems AND a clean rollback", () => { assert.equal(shouldCreateStage6Baseline({ problemCount: 0, rolledBack: true }), true); assert.equal(shouldCreateStage6Baseline({ problemCount: 1, rolledBack: true }), false); assert.equal(shouldCreateStage6Baseline({ problemCount: 0, rolledBack: false }), false); });
+// applier: the stage-6 baseline governs ONLY migration 7 (stageIdx 6); it never governs an earlier migration,
+// and an earlier re-anchor baseline never governs migration 7.
+test("stage6 applier: migration 7 (stageIdx 6) + VALID stage-6 baseline constructs the client", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
+test("stage6 applier: migration 7 REJECTS the stage-4 baseline (anchor 4) -> zero connect", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+test("stage6 applier: migration 6 (stageIdx 5) REJECTS the stage-6 baseline (anchor 6) -> zero connect", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[5], sqlText: "X", actualSha: MIGRATIONS[5].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {

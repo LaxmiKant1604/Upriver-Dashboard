@@ -70,13 +70,61 @@ test("A5. seller scope with no canonical sellerOrVendorIds is BATCH_SCOPE_MISSIN
   assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], sellerOrVendorIds: [], sourceScope: "seller" }).code, "BATCH_SCOPE_MISSING");
 });
 
-test("A6. marketplace: no constraint / blank-row / wrong-row marketplace each reject before save", () => {
+test("A6. marketplace: blank-row marketplace / wrong (seller,marketplace) pair reject before save", () => {
   const base = { sellerOrVendorIds: SELLERS, sourceScope: "seller", marketplaceScoped: true };
-  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1")], ...base, marketplaceCountry: null }).code, "BATCH_MARKETPLACE_CONSTRAINT_MISSING");
   const noMkt = { date: TO, seller_or_vendor_id: "S1", marketplace_country_code: "" };
   assert.equal(validateBatchSourcePayload({ rows: [noMkt], ...base, marketplaceCountry: MKT }).code, "BATCH_ROW_NO_MARKETPLACE");
-  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1", "CA")], ...base, marketplaceCountry: MKT }).code, "BATCH_CROSS_MARKETPLACE");
+  // a batch seller carrying a marketplace that is not its tuple is a cross-account PAIR (not two independent sets)
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1", "CA")], ...base, marketplaceCountry: MKT }).code, "BATCH_CROSS_ACCOUNT");
   assert.equal(validateBatchSourcePayload({ rows: SELLERS.map((s) => sellerRow(s)), ...base, marketplaceCountry: MKT }).valid, true);
+});
+
+/* ===== Isolation correction: exact (rawSellerId, marketplaceCountryCode) TUPLE, never two independent sets ===== */
+group("Isolation correction: exact seller+marketplace tuple routing");
+const tupleFragment = (rows, accountTuples, marketplaceScoped = true) => ({ rows, sourceScope: "seller", accountTuples, marketplaceScoped, organizationFingerprint: ORG, connectionId: "primary" });
+const mktOwner = (rawSellerId, marketplaceCountryCode) => ({ accountId: "ACC-" + rawSellerId + "-" + marketplaceCountryCode, rawSellerId, marketplaceCountryCode, connectionId: "primary", organizationFingerprint: ORG, accountScopeHash: "sc" });
+
+test("IC1. same seller id across DE + IT routes each row ONLY to its exact marketplace account", () => {
+  const TUP = [{ rawSellerId: "S1", marketplaceCountryCode: "DE" }, { rawSellerId: "S1", marketplaceCountryCode: "IT" }];
+  const rows = [sellerRow("S1", "DE"), sellerRow("S1", "DE"), sellerRow("S1", "IT")];
+  assert.equal(validateBatchSourcePayload({ rows, accountTuples: TUP, sourceScope: "seller", marketplaceScoped: true }).valid, true);
+  const de = isolateFragmentRowsForOwner(tupleFragment(rows, TUP), mktOwner("S1", "DE"));
+  const it = isolateFragmentRowsForOwner(tupleFragment(rows, TUP), mktOwner("S1", "IT"));
+  assert.ok(de.rows.length === 2 && de.rows.every((r) => r.marketplace_country_code === "DE"), "DE account gets only its 2 DE rows");
+  assert.ok(it.rows.length === 1 && it.rows.every((r) => r.marketplace_country_code === "IT"), "IT account gets only its 1 IT row");
+});
+
+test("IC2. seller A + marketplace B cross-pair is rejected (both values exist independently)", () => {
+  const TUP = [{ rawSellerId: "S1", marketplaceCountryCode: "DE" }, { rawSellerId: "S2", marketplaceCountryCode: "IT" }];
+  // (S1, IT): S1 and IT each exist, but the PAIR does not -> BATCH_CROSS_ACCOUNT
+  assert.equal(validateBatchSourcePayload({ rows: [sellerRow("S1", "IT")], accountTuples: TUP, sourceScope: "seller", marketplaceScoped: true }).code, "BATCH_CROSS_ACCOUNT");
+});
+
+test("IC3. duplicate seller id with NO marketplace column fails closed (AMBIGUOUS_ACCOUNT_EVIDENCE)", () => {
+  const TUP = [{ rawSellerId: "S1", marketplaceCountryCode: "DE" }, { rawSellerId: "S1", marketplaceCountryCode: "IT" }];
+  const noMktRows = [{ date: TO, seller_or_vendor_id: "S1", child_asin: "A" }];
+  assert.equal(validateBatchSourcePayload({ rows: noMktRows, accountTuples: TUP, sourceScope: "seller", marketplaceScoped: false }).code, "AMBIGUOUS_ACCOUNT_EVIDENCE");
+  const iso = isolateFragmentRowsForOwner(tupleFragment(noMktRows, TUP, false), { rawSellerId: "S1", connectionId: "primary", organizationFingerprint: ORG });
+  assert.equal(iso.rejected, true, "seller-only isolation of an ambiguous seller is rejected");
+  assert.equal(iso.code, "AMBIGUOUS_ACCOUNT_EVIDENCE");
+});
+
+test("IC4. different seller ids across mixed marketplaces stay correctly isolated", () => {
+  const TUP = [{ rawSellerId: "S1", marketplaceCountryCode: "DE" }, { rawSellerId: "S2", marketplaceCountryCode: "IT" }, { rawSellerId: "S3", marketplaceCountryCode: "FR" }];
+  const rows = [sellerRow("S1", "DE"), sellerRow("S2", "IT"), sellerRow("S3", "FR")];
+  assert.equal(validateBatchSourcePayload({ rows, accountTuples: TUP, sourceScope: "seller", marketplaceScoped: true }).valid, true);
+  for (const [s, m] of [["S1", "DE"], ["S2", "IT"], ["S3", "FR"]]) {
+    const iso = isolateFragmentRowsForOwner(tupleFragment(rows, TUP), mktOwner(s, m));
+    assert.ok(iso.rows.length === 1 && iso.rows[0].seller_or_vendor_id === s && iso.rows[0].marketplace_country_code === m, s + "/" + m + " isolated");
+  }
+});
+
+test("IC5. organization-wide sources remain exempt from seller-account isolation", () => {
+  const TUP = [{ rawSellerId: "S1", marketplaceCountryCode: "DE" }];
+  const rows = [{ child_asin: "A", product_brand: "Acme", seller_or_vendor_id: "FOREIGN", marketplace_country_code: "ZZ" }];
+  assert.equal(validateBatchSourcePayload({ rows, accountTuples: TUP, sourceScope: "organization", marketplaceScoped: true }).valid, true);
+  const cat = { rows, sourceScope: "organization", accountTuples: TUP, marketplaceScoped: true, organizationFingerprint: ORG, connectionId: "primary" };
+  assert.strictEqual(isolateFragmentRowsForOwner(cat, mktOwner("S1", "DE")).rows, rows, "organization fragment passes through unchanged");
 });
 
 /* ============================= Part B: isolateFragmentRowsForOwner ============================= */
@@ -191,7 +239,7 @@ test("D1. the worker PASSES the batch marketplace expectation: a CA row in a US 
   const res = await runSourceJobs({ store, dataDoe: batchDataDoe(badMkt), plannedJobs: jobs, bucket: "us", cycleDate: "2026-08-17" });
   assert.equal(res.succeeded, 0, "cross-marketplace batch is not saved");
   assert.equal(store._cache.size, 0, "nothing persisted (LKG preserved)");
-  assert.equal(store._rawJob(res.cycleId, oli.requestHash).error_code, "BATCH_CROSS_MARKETPLACE", "worker used the passed marketplace constraint");
+  assert.equal(store._rawJob(res.cycleId, oli.requestHash).error_code, "BATCH_CROSS_ACCOUNT", "worker used the passed (seller,marketplace) tuple: a CA row for a US-tuple seller is a cross-account pair");
 });
 
 test("D2. a clean US batch validates and saves ONE canonical object", async () => {

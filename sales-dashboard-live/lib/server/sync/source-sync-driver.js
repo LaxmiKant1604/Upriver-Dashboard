@@ -71,7 +71,7 @@ export function normalizeDataDoeConnections(connections) {
 // resolved.accountScopeHash is permitted ONLY for a single-account source (0 or 1 seller id, where the
 // canonical scope already IS the individual scope); a MULTI-id (batched) source with no authoritative
 // rawSellerId FAILS CLOSED rather than collapsing every batch member onto the one shared batch scope.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null, marketplaceConstraint = null) {
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null, marketplaceConstraint = null, accountTuples = null, ownerMarketplaceCountryCode = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -130,11 +130,18 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     sourceScope: resolved.sourceScope,
     marketplaceScoped: resolved.marketplaceScoped === true,
     marketplaceConstraint: marketplaceConstraint == null ? null : String(marketplaceConstraint),
+    // EXACT-TUPLE isolation metadata: the batch's authoritative discovered account tuples
+    // (rawSellerId, marketplaceCountryCode) -- carried immutably so the source worker validates every downloaded
+    // batch row against the exact (seller, marketplace) PAIRS (never two independent sets), and so a marketplace-
+    // blind source can still detect a rawSellerId that maps to >1 marketplace account (AMBIGUOUS_ACCOUNT_EVIDENCE).
+    // null for a single-account (non-batched) source. A non-US family carries mixed marketplaces here WITHOUT
+    // splitting the batch (one export over all non-US marketplaces).
+    accountTuples: Array.isArray(accountTuples) && accountTuples.length ? accountTuples.map((t) => ({ rawSellerId: String(t.rawSellerId ?? ""), marketplaceCountryCode: t.marketplaceCountryCode == null ? null : String(t.marketplaceCountryCode) })) : null,
     // owner.accountScopeHash is the INDIVIDUAL account scope (never the batch scope) -- one exact report/account.
-    // owner.rawSellerId is that account's authoritative individual seller id; owner carries the COMPLETE
-    // metadata (Finding 1) the derive-time per-account isolation requires: accountId, rawSellerId, connectionId,
-    // organizationFingerprint, accountScopeHash (NON-secret; the raw id is already in fetchParams).
-    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope },
+    // owner.rawSellerId is that account's authoritative individual seller id; owner.marketplaceCountryCode is that
+    // account's exact marketplace (the derive-time per-account isolation of a marketplace-scoped source keys off
+    // it). owner carries the COMPLETE metadata (Finding 1) the derive-time per-account isolation requires.
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, marketplaceCountryCode: ownerMarketplaceCountryCode == null ? null : String(ownerMarketplaceCountryCode), connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope },
     fetchParams: {
       // Report-contract columns when the reportKey names a declared report; otherwise the RESOLVED request's
       // own columns (the source-first bucket sync plans canonical source requests under a synthetic
@@ -151,19 +158,20 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
   };
 }
 
-// Build the <=5 planned source jobs for ONE batched canonical source (Blocker 4b + senior review gaps 1 & 2):
+// Build the planned source jobs for ONE batched canonical source (Blocker 4b + senior review gaps 1 & 2):
 // the SAME canonical job (one request_hash over the sorted batch seller ids) with ONE owner membership PER
-// account, each carrying that account's INDIVIDUAL owner scope + SAFE public accountId, so the <=5 accounts own
-// the single shared export without owner-id collisions. `resolvedBatch` is the batch's resolved source (batch
-// request_hash + batch account_scope_hash over sellerOrVendorIds).
+// account, each carrying that account's INDIVIDUAL owner scope + SAFE public accountId, so all accounts own
+// the single shared export without owner-id collisions. DataDoe permits ANY number of seller ids in one export,
+// so there is NO per-batch account cap. `resolvedBatch` is the batch's resolved source (batch request_hash +
+// batch account_scope_hash over sellerOrVendorIds).
 //
-// `batchAccounts` is the AUTHORITATIVE account-record list `[{ accountId, rawSellerId }]` -- a SAFE public
-// accountId plus that account's INDIVIDUAL raw seller id. The individual owner scope is computed INTERNALLY
-// (accountScopeHash([rawSellerId]) inside plannedSourceJob); a caller-provided owner HASH is NEVER accepted
-// (gap 1).
+// `batchAccounts` is the AUTHORITATIVE account-record list `[{ accountId, rawSellerId, country? }]` -- a SAFE
+// public accountId, that account's INDIVIDUAL raw seller id, and (when known) its marketplace country. The
+// individual owner scope is computed INTERNALLY (accountScopeHash([rawSellerId]) inside plannedSourceJob); a
+// caller-provided owner HASH is NEVER accepted (gap 1).
 //
 // FAIL CLOSED before ANY source/owner upsert (gap 2): the batch account set must EXACTLY equal
-// resolvedBatch.sellerOrVendorIds -- every rawSellerId nonblank, the accounts unique, at most 5, covering
+// resolvedBatch.sellerOrVendorIds -- every rawSellerId nonblank, the accounts unique (any number), covering
 // exactly the canonical batch sellers (no missing, no extra), on a valid connection with a non-empty
 // organization fingerprint, and with the resolvedBatch's own canonical scope equal to
 // accountScopeHash(sellerOrVendorIds). Any mismatch THROWS, so no partial/mis-owned plan is ever returned.
@@ -185,9 +193,8 @@ export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connect
   if (accounts.length === 0) {
     throw new Error("plannedBatchSourceJobs requires a non-empty batchAccounts list (fail closed).");
   }
-  if (accounts.length > 5) {
-    throw new Error(`plannedBatchSourceJobs: a source batch covers at most 5 accounts (got ${accounts.length}); refusing (fail closed).`);
-  }
+  // No per-batch account cap: DataDoe permits any number of sellerOrVendorIds in one export. [Superseded: the
+  // former <=5-account reject.] The account set must still EXACTLY equal resolvedBatch.sellerOrVendorIds below.
   // Each authoritative record must carry a nonblank public accountId AND a nonblank individual rawSellerId.
   const accountIds = [];
   const rawSellerIds = [];
@@ -229,7 +236,18 @@ export function plannedBatchSourceJobs(reportKey, resolvedBatch, bucket, connect
   if (accountScopeHash(canonicalIds) !== resolvedBatch.accountScopeHash) {
     throw new Error("plannedBatchSourceJobs: resolvedBatch.accountScopeHash does not equal accountScopeHash(sellerOrVendorIds); refusing (fail closed).");
   }
-  return accounts.map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.rawSellerId, marketplaceCountry));
+  // The batch's authoritative EXACT account tuples (rawSellerId, marketplaceCountryCode). An account's
+  // marketplace is its directory `country` (a batch account IS one marketplace); absent evidence stays null
+  // (seller-only isolation, allowed only when the seller maps to exactly one account). A non-US family mixes
+  // marketplaces here WITHOUT splitting the single batch. Carried onto every job + its owner for exact-tuple
+  // save-time validation and derive-time per-account isolation.
+  const tupleMkt = (a) => {
+    const m = a.marketplaceCountryCode ?? a.country ?? marketplaceCountry;
+    return m == null ? null : String(m);
+  };
+  const accountTuples = accounts.map((a) => ({ rawSellerId: String(a.rawSellerId), marketplaceCountryCode: tupleMkt(a) }));
+  const marketplaceOf = new Map(accountTuples.map((t) => [t.rawSellerId, t.marketplaceCountryCode]));
+  return accounts.map((a) => plannedSourceJob(reportKey, resolvedBatch, bucket, connectionId, a.accountId, a.rawSellerId, marketplaceCountry, accountTuples, marketplaceOf.get(String(a.rawSellerId))));
 }
 
 // Production store: maps the worker's injected interface to lib/server/supabase.js.

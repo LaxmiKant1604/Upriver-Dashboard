@@ -17,6 +17,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REUSE = "20260817_scheduler_v2_reuse_cas.sql";
 const BATCH = "20260817_source_batch_membership.sql";
 const BUDGET = "20260818_source_tranche_budget.sql";
+// Forward migration 20260823 REPLACES the original <=5 assign RPC with the one-batch (unlimited-sellers) body,
+// so the assign-batch BODY invariants are proven against THIS file (not the original 20260817 definition).
+const FLAT2 = "20260823_source_batch_flat_token.sql";
 const WRAP = "supabase.js";
 
 let passed = 0;
@@ -139,18 +142,25 @@ test("adopt-no-identity. a removed identity/integrity comparison => ADOPT_CACHE_
   assert.ok(!a.ok && hasBlocker(a, "ADOPT_CACHE_IDENTITY_CHECK_MISSING"), "ADOPT_CACHE_IDENTITY_CHECK_MISSING");
 });
 
-test("assign-no-lock. a removed advisory lock => ASSIGN_BATCH_ADVISORY_LOCK_MISSING (gap 4d)", () => {
-  const a = auditWith({ [BATCH]: (t) => t.replace("perform pg_advisory_xact_lock(hashtext(p_batch_family));", "perform 1;") });
+test("assign-no-lock. a removed advisory lock in the one-batch RPC => ASSIGN_BATCH_ADVISORY_LOCK_MISSING", () => {
+  const a = auditWith({ [FLAT2]: (t) => t.replace("perform pg_advisory_xact_lock(hashtext(p_batch_family));", "perform 1;") });
   assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_ADVISORY_LOCK_MISSING"), "ASSIGN_BATCH_ADVISORY_LOCK_MISSING");
 });
 
-test("assign-cap-6. a maximum widened to 6 => ASSIGN_BATCH_MAX_CAP_MISSING (gap 4d)", () => {
-  const a = auditWith({ [BATCH]: (t) => t.replace("least(greatest(coalesce(p_max, 5), 1), 5)", "least(greatest(coalesce(p_max, 5), 1), 6)") });
-  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_MAX_CAP_MISSING"), "ASSIGN_BATCH_MAX_CAP_MISSING");
+test("assign-stale-cap. RE-INTRODUCING the obsolete <=5 per-family cap => ASSIGN_BATCH_STALE_CAP", () => {
+  // The forward migration DROPPED the least(greatest(coalesce(p_max,...))) cap; smuggling it back into the insert
+  // (which would split one bucket into many exports) is caught by the body auditor.
+  const a = auditWith({ [FLAT2]: (t) => t.replace("(p_batch_family, p_account_id, 0, p_connection_id, p_organization_fingerprint)", "(p_batch_family, p_account_id, least(greatest(coalesce(p_max, 5), 1), 5), p_connection_id, p_organization_fingerprint)") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_STALE_CAP"), "ASSIGN_BATCH_STALE_CAP");
 });
 
-test("assign-no-scope-reject. a removed existing connection/organization scope rejection => ASSIGN_BATCH_SCOPE_MATCH_MISSING (gap 4d)", () => {
-  const a = auditWith({ [BATCH]: (t) => t.replace("if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then", "if false then") });
+test("assign-not-single-batch. an insert that does NOT place the single canonical batch index 0 => ASSIGN_BATCH_NOT_SINGLE_BATCH", () => {
+  const a = auditWith({ [FLAT2]: (t) => t.replace("(p_batch_family, p_account_id, 0, p_connection_id, p_organization_fingerprint)", "(p_batch_family, p_account_id, 1, p_connection_id, p_organization_fingerprint)") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_NOT_SINGLE_BATCH"), "ASSIGN_BATCH_NOT_SINGLE_BATCH");
+});
+
+test("assign-no-scope-reject. a removed existing connection/organization scope rejection => ASSIGN_BATCH_SCOPE_MATCH_MISSING", () => {
+  const a = auditWith({ [FLAT2]: (t) => t.replace("if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then", "if false then") });
   assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_SCOPE_MATCH_MISSING"), "ASSIGN_BATCH_SCOPE_MATCH_MISSING");
 });
 

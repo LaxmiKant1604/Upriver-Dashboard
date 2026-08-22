@@ -38,7 +38,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let bucketSync; let model; let dash; let brands; let worker; let dates;
+let bucketSync; let model; let dash; let brands; let worker; let dates; let derivation;
 
 const API_KEY = ["prim", "key"].join("-");
 const ASOF = "2026-08-15";
@@ -162,15 +162,17 @@ const CATALOG_ROWS = [
 ];
 
 function makeDataDoe(opts = {}) {
-  const create = {}; let polls = 0; let downloads = 0;
+  const create = {}; const createsByKey = {}; let polls = 0; let downloads = 0;
   const bump = (m, h) => { m[h] = (m[h] || 0) + 1; };
   return {
     totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
+    createsWhereKey: (needle) => Object.entries(createsByKey).reduce((a, [k, n]) => a + (k.includes(needle) ? n : 0), 0),
     totalPolls: () => polls,
     totalDownloads: () => downloads,
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
       bump(create, job.requestHash);
+      bump(createsByKey, job.requestKey || "");
       return { exportId: "e_" + job.requestHash };
     },
     async poll() { polls += 1; },
@@ -182,7 +184,13 @@ function makeDataDoe(opts = {}) {
         return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 }));
       }
       if (rk.includes("source-catalog")) return CATALOG_ROWS.map((r) => ({ ...r }));
-      if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }];
+      if (rk.includes("source-fba")) {
+        // FBA is per-account + marketplace-scoped: echo the account's TRUE marketplace (mapped from its seller
+        // id) so a GB account never receives a US-marketplace row (which would fail closed FBA_CROSS_MARKETPLACE).
+        const sid = Array.isArray(fp.sellerOrVendorIds) ? String(fp.sellerOrVendorIds[0] || "") : "";
+        const mkt = (opts.marketplaceBySeller && opts.marketplaceBySeller[sid]) || "US";
+        return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: mkt, available: 5 }];
+      }
       return [];
     },
   };
@@ -213,13 +221,13 @@ function makeSinks() {
   };
 }
 
-function runFlow({ store, dd, cycleDate = CYCLE_DATE, coverage = null, accounts = FIVE, pausedSources, reuseOnly = false, catalogSnapshot = null, fbaSnapshotsByAccount = {} } = {}) {
+function runFlow({ store, dd, cycleDate = CYCLE_DATE, coverage = null, accounts = FIVE, bucket = BUCKET, pausedSources, reuseOnly = false, catalogSnapshot = null, fbaSnapshotsByAccount = {} } = {}) {
   const clock = makeClock();
   const waits = [];
   const wait = async (ms) => { waits.push(ms); clock.advance(ms); };
   const sinks = makeSinks();
   const promise = bucketSync.runBucketSourceSync({
-    apiKey: API_KEY, bucket: BUCKET, accounts,
+    apiKey: API_KEY, bucket, accounts,
     coverageByAccountId: coverage || steadyCoverage(accounts, dates.addDaysStr(ASOF, -7)),
     catalogSnapshot, fbaSnapshotsByAccount,
     pausedSources: pausedSources || new Set(),
@@ -296,7 +304,7 @@ test("(3) missing durable evidence returns MISSING_REUSABLE_SOURCE and leaves th
   }
 });
 
-test("(5) 30 accounts => six stable batches; 31 => seven with nothing reshuffled", () => {
+test("(5) 30 accounts => ONE stable batch; adding a 31st adds NO batch and reshuffles nothing", () => {
   const thirty = Array.from({ length: 30 }, (_, i) => acct(i + 1));
   const p30 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: thirty,
@@ -305,14 +313,14 @@ test("(5) 30 accounts => six stable batches; 31 => seven with nothing reshuffled
     fbaSnapshotsByAccount: Object.fromEntries(thirty.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])),
     asOf: ASOF, today: TODAY,
   });
-  assert.equal(p30.batches.length, 6);
+  assert.equal(p30.batches.length, 1, "ONE batch (any number of sellers per export)");
   const p31 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: [...thirty, acct(31)], existingMembership: p30.membership,
     coverageByAccountId: steadyCoverage(thirty, dates.addDaysStr(ASOF, -7)),
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
     fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY,
   });
-  assert.equal(p31.batches.length, 7);
+  assert.equal(p31.batches.length, 1, "still ONE batch (the 31st joins it; no new batch)");
   for (const a of thirty) assert.equal(p31.membership.get(a.accountId), p30.membership.get(a.accountId));
 });
 
@@ -367,18 +375,18 @@ test("(11) initial backfill then the NEXT daily run requests ONLY missing/rollin
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY,
   });
   const day1Units = day1.families.find((f) => f.sourceKey === "order-line-items").units;
-  assert.equal(day1Units.length, dates.canonicalOliSlices(backfill.from, backfill.to).length, "day 1: the FULL initial backfill");
-  // Record day-1 coverage, advance one day: the next run plans ONLY the rolling slices.
+  assert.equal(day1Units.length, 1, "day 1: ONE complete-history backfill export (no fixed 7-day slicing)");
+  assert.deepEqual(day1Units[0].slice, { from: backfill.from, to: backfill.to }, "the full backfill window, unsliced");
+  // Record day-1 coverage, advance one day: the next run requests ONLY the rolling/missing window.
   const nextAsOf = dates.addDaysStr(ASOF, 1);
   const covered = steadyCoverage(FIVE, ASOF);
   const day2 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: FIVE, coverageByAccountId: covered,
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: nextAsOf, today: nextAsOf,
   });
-  const refresh = model.oliRollingRefreshWindow(nextAsOf);
   const day2Units = day2.families.find((f) => f.sourceKey === "order-line-items").units;
-  assert.equal(day2Units.length, dates.canonicalOliSlices(refresh.from, refresh.to).length, "day 2: ONLY the rolling-window slices");
-  assert.ok(day2Units.length < day1Units.length / 5, "a fraction of the backfill -- proven history never re-requested");
+  assert.equal(day2Units.length, 1, "day 2: ONE export over ONLY the missing/rolling window");
+  assert.ok(day2Units[0].slice.from > day1Units[0].slice.from, "day 2 requests only NEW dates -- proven history is never re-requested");
 });
 
 test("(12) a late corrected row REPLACES its canonical grain without duplication", () => {
@@ -436,6 +444,88 @@ test("(18) NOTHING is published or scheduled by this task (defaults OFF, no cron
   }
 });
 
+group("PRIORITY INTEGRATION PROOF (real composed runtime: missing coverage -> 2 OLI exports -> durable reuse)");
+
+test("INTEG: missing coverage => EXACTLY one OLI export per bucket (2 total / 4 tokens); Daily + Brand View then reuse the durable full-window OLI through the REAL adapters with ZERO new OLI exports", async () => {
+  const usAccts = [1, 2].map((i) => ({ accountId: "IU" + i, rawSellerId: "ISU" + i, country: "US", name: "US Seller " + i, currency: "USD" }));
+  const euAccts = [1, 2].map((i) => ({ accountId: "IE" + i, rawSellerId: "ISE" + i, country: "GB", name: "EU Seller " + i, currency: "USD" }));
+
+  // (1) MISSING coverage: a fresh org with NO durable OLI history at all, in both regional buckets.
+  const usStore = makeStore(); const usDd = makeDataDoe({ marketplaceBySeller: Object.fromEntries(usAccts.map((a) => [a.rawSellerId, a.country])) });
+  const euStore = makeStore(); const euDd = makeDataDoe({ marketplaceBySeller: Object.fromEntries(euAccts.map((a) => [a.rawSellerId, a.country])) });
+  const usFlow = runFlow({ store: usStore, dd: usDd, bucket: "us", accounts: usAccts, coverage: {}, cycleDate: "2026-08-26" });
+  const euFlow = runFlow({ store: euStore, dd: euDd, bucket: "non-us", accounts: euAccts, coverage: {}, cycleDate: "2026-08-26" });
+  const usRollup = await usFlow.promise;
+  const euRollup = await euFlow.promise;
+  assert.equal(usRollup.stopped, false, "US bucket completed: " + JSON.stringify(usRollup.stopReason));
+  assert.equal(euRollup.stopped, false, "Non-US bucket completed: " + JSON.stringify(euRollup.stopReason));
+
+  // (2) EXACTLY one complete-window OLI export per bucket -> two exports total -> four AI tokens (flat 2 each).
+  assert.equal(usDd.createsWhereKey("source-oli"), 1, "US bucket: ONE complete-window OLI export for the whole batch");
+  assert.equal(euDd.createsWhereKey("source-oli"), 1, "Non-US bucket: ONE complete-window OLI export for the whole batch");
+  const oliExports = usDd.createsWhereKey("source-oli") + euDd.createsWhereKey("source-oli");
+  assert.equal(oliExports, 2, "two OLI exports across the two regional buckets");
+  assert.equal(oliExports * 2, 4, "four AI tokens at the flat 2-token-per-export cost");
+
+  // (3) Durable history persisted AND per-account isolated (a seller's rows land ONLY under its own account).
+  for (const [flow, accts] of [[usFlow, usAccts], [euFlow, euAccts]]) {
+    assert.ok(flow.sinks.history.length >= accts.length, "durable OLI history persisted for the batch");
+    for (const r of flow.sinks.history) {
+      const owner = accts.find((a) => a.rawSellerId === r.sellerOrVendorId);
+      assert.ok(owner, "every persisted row belongs to a batch account");
+      assert.equal(r.accountId, owner.accountId, "a seller's rows land ONLY under its own account (isolation)");
+    }
+  }
+
+  // (4)(6)(7) Daily Reporting + Brand View derive from the SAME persisted durable OLI through the REAL report
+  //     adapters -- validatePayload IS the exact contract the API/frontend consume. No DataDoe is involved.
+  const dailyEntry = derivation.REPORT_DERIVATIONS["daily-reporting"];
+  const brandSalesEntry = derivation.REPORT_DERIVATIONS["brand-sales"];
+  const backfill = model.oliBackfillWindow(ASOF);
+  const wide = { from: backfill.from, to: backfill.to };
+  const dailyWindow = { from: dates.addDaysStr(backfill.to, -7), to: backfill.to };
+  const brandViewWindow = { from: dates.addDaysStr(backfill.to, -30), to: backfill.to };
+
+  for (const [flow, accts, bucket] of [[usFlow, usAccts, "us"], [euFlow, euAccts, "non-us"]]) {
+    const coverageByAccountId = {};
+    for (const c of flow.sinks.coverage) (coverageByAccountId[c.accountId] = coverageByAccountId[c.accountId] || []).push({ from: c.coveredFrom, to: c.coveredTo });
+    const derived = dash.deriveDurableDashboardSnapshots({
+      bucket, accounts: accts, historyRows: flow.sinks.history, catalogRows: CATALOG_ROWS,
+      oliCoverageByAccountId: coverageByAccountId,
+      catalogSnapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "x", row_count: CATALOG_ROWS.length },
+      fbaSnapshotsByAccount: Object.fromEntries(accts.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])),
+      campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: Object.fromEntries(accts.map((a) => [a.accountId, [wide]])) },
+      asinAds: { grain: "asin-performance-v1", read: "ok", windowsByAccountId: Object.fromEntries(accts.map((a) => [a.accountId, [wide]])) },
+      adMetricsByAccountId: Object.fromEntries(accts.map((a) => [a.accountId, { rows: [{ metric_date: backfill.to, currency: "USD", ad_sales: 40, ad_spend: 12, ad_clicks: 8 }], metricsRead: "ok" }])),
+      campaignCoverageStateByAccountId: Object.fromEntries(accts.map((a) => [a.accountId, { windows: [wide], status: "succeeded", latestMetricDate: backfill.to, read: "ok", error: null }])),
+      dailyWindow, brandViewWindow,
+    });
+    assert.deepEqual(derived.daily.skipped, [], bucket + " daily: no account skipped -- the durable OLI satisfies readiness");
+    assert.deepEqual(derived.brandView.skipped, [], bucket + " brand view: no account skipped");
+    assert.equal(derived.daily.snapshots.length, accts.length, bucket + " daily: one validated snapshot per account");
+    assert.equal(derived.brandView.snapshots.length, accts.length, bucket + " brand view: one validated snapshot per account");
+    for (const s of derived.daily.snapshots) {
+      assert.equal(s.version, dailyEntry.snapshotVersion, "daily payload carries the live contract version (frontend adapter)");
+      assert.equal(dailyEntry.validatePayload(s.payload), true, "the REAL daily-reporting validator accepts the durable payload");
+    }
+    for (const s of derived.brandView.snapshots) {
+      assert.equal(s.version, brandSalesEntry.snapshotVersion, "brand-sales payload carries the live contract version (frontend adapter)");
+      assert.equal(brandSalesEntry.validatePayload(s.payload), true, "the REAL brand-sales validator accepts the durable payload");
+    }
+  }
+
+  // (5) A SUBSEQUENT run over the SAME durable evidence requests ZERO additional OLI exports: the full-window
+  //     OLI is reused (a THROWING create tripwire proves no create-export of ANY source can slip through).
+  for (const [store, accts, bucket] of [[usStore, usAccts, "us"], [euStore, euAccts, "non-us"]]) {
+    const reuseDd = tripwired(makeDataDoe());
+    const reuse = runFlow({ store, dd: reuseDd, bucket, accounts: accts, coverage: {}, cycleDate: "2026-08-27", reuseOnly: true });
+    const rollup = await reuse.promise;
+    assert.equal(rollup.stopped, false, bucket + " reuse pass completed: " + JSON.stringify(rollup.stopReason));
+    assert.equal(reuseDd.createsWhereKey("source-oli"), 0, bucket + ": ZERO additional OLI exports -- durable full-window history reused");
+    assert.equal(reuseDd.totalCreates(), 0, bucket + ": ZERO create-exports of ANY source on the reuse pass");
+  }
+});
+
 async function main() {
   out("zero-export rehearsal proof suite");
   bucketSync = await import("../lib/server/sync/source-bucket-sync.js");
@@ -444,6 +534,7 @@ async function main() {
   brands = await import("../lib/server/sync/brand-resolution.js");
   worker = await import("../lib/server/sync/source-worker.js");
   dates = await import("../lib/server/date-windows.js");
+  derivation = await import("../lib/server/sync/report-derivation.js");
 
   let failures = 0;
   for (const t of tests) {

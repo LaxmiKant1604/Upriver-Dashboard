@@ -227,12 +227,12 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     rpcs: [
       { name: "assign_source_account_batch", params: ["p_batch_family", "p_account_id", "p_connection_id", "p_organization_fingerprint", "p_max"] },
     ],
-    // STRUCTURAL body proof (senior review gap 4d): the assignment RPC must take the per-family advisory xact
-    // lock, hard-cap the maximum to 5, and REJECT an existing membership whose connection/organization scope
-    // differs (no silent re-home). The direct-write ban is proven separately by the SELECT-only service_role ACL.
-    provenFunctions: [{ name: "assign_source_account_batch", proof: "assign-batch" }],
+    // The assignment RPC's BODY is proven at 20260823 (which REPLACES this original <=5 definition with the
+    // one-batch-per-family assignment). Here only the signature + the SELECT-only service_role ACL (direct-write
+    // ban) are proven; the historical <=5 body is superseded and no longer audited against the one-batch shape.
+    provenFunctions: [],
     wrappers: ["assignSourceAccountBatch", "listSourceBatchMembership"],
-    note: "Stable <=5-account batch membership + transactional assign RPC (PREPARED, UNAPPLIED).",
+    note: "Stable batch membership table + transactional assign RPC (body reshaped to one-batch by 20260823).",
   },
   {
     // Blocker 4d: FROZEN per-(cycle,tranche) create-export + AI-token budget (standard=2, premium=5 tokens per
@@ -262,7 +262,9 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         unique: [["cycle_id", "tranche_key", "request_hash"]],
         namedConstraints: [
           { name: "source_tranche_budget_hash_pk", kind: "primary key", columns: ["cycle_id", "tranche_key", "request_hash"] },
-          // EXACTLY the two allowed per-hash token costs (standard 2, premium 5) -- no other value can slip in.
+          // The durable check stays permissive at (2, 5) (migration 20260818, unchanged). Every export now
+          // costs a FLAT 2 AI tokens: the app reserves exactly 2 (sourceTokenCost) and never persists 5, so the
+          // premium 5-token RESERVATION is gone from the active path; 2 remains inside this permissive check.
           { name: "source_tranche_budget_hash_cost_check", kind: "check", canonical: "token_cost in (2, 5)" },
           { name: "source_tranche_budget_hash_budget_fk", kind: "foreign key", columns: ["cycle_id", "tranche_key"], references: { table: "source_tranche_budget", columns: ["cycle_id", "tranche_key"] } },
         ],
@@ -457,6 +459,29 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     ],
     wrappers: ["claimReportDeriveLease", "reconcileReportDeriveSuccess", "saveShadowSnapshotIfNewer"],
     note: "Report-derive lease + guarded recovery (claim/reconcile RPCs) + atomic report_snapshots freshness CAS; additive to sync_report_jobs; PREPARED, UNAPPLIED.",
+  },
+  {
+    // UNLIMITED one-batch-per-US/Non-US-family assignment (REPLACES the 20260817 <=5 RPC) + DATABASE-enforced
+    // flat 2-token cost: an ADDITIVE named constraint (the 20260818 permissive (2,5) check is left intact) and a
+    // hardened persist RPC. DataDoe confirmed any number of sellers per export, flat 2 tokens each.
+    migration: "20260823_source_batch_flat_token.sql",
+    tables: [],
+    requiredStatements: [
+      // The additive flat-2 token_cost constraint on the (earlier) source_tranche_budget_hash table (code only).
+      { label: "additive flat-2 token_cost constraint (token_cost = 2)", pattern: String.raw`add\s+constraint\s+source_tranche_budget_hash_cost_flat2\s+check\s*\(\s*token_cost\s*=\s*2\s*\)` },
+      // The pre-constraint fail-closed guard against an existing token_cost <> 2 (a real DO block, kept in masked).
+      { label: "fail-closed guard on any existing token_cost <> 2", pattern: String.raw`token_cost\s+is\s+distinct\s+from\s+2` },
+    ],
+    rpcs: [
+      { name: "assign_source_account_batch", params: ["p_batch_family", "p_account_id", "p_connection_id", "p_organization_fingerprint", "p_max"] },
+      { name: "persist_source_tranche_budget", params: ["p_cycle_id", "p_tranche_key", "p_plan_fingerprint", "p_max_creates", "p_max_tokens", "p_hashes"] },
+    ],
+    provenFunctions: [
+      { name: "assign_source_account_batch", proof: "assign-batch" },       // one-batch (index 0), no <=5 cap
+      { name: "persist_source_tranche_budget", proof: "persist-flat2" },    // rejects any per-hash cost <> 2
+    ],
+    wrappers: ["persistSourceTrancheBudget"],
+    note: "One-batch-per-family assignment + DB-enforced flat 2-token cost (additive constraint + hardened persist RPC); PREPARED, UNAPPLIED.",
   },
 ]);
 
@@ -958,10 +983,14 @@ function auditAssignBatchFunction(clean, masked, fnName) {
   if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_batch_family\s*\)\s*\)/i.test(M)) {
     problems.push({ code: "ASSIGN_BATCH_ADVISORY_LOCK_MISSING", reason: "does not take pg_advisory_xact_lock(hashtext(p_batch_family))" });
   }
-  // (2) hard <=5 cap: the effective max is least(greatest(coalesce(p_max, 5), 1), 5). Pins the ceiling to
-  //     EXACTLY 5, so widening the outer bound (e.g. ...,6)) fails.
-  if (!compact.includes("least(greatest(coalesce(p_max,5),1),5)")) {
-    problems.push({ code: "ASSIGN_BATCH_MAX_CAP_MISSING", reason: "the per-family maximum is not hard-capped to 5 via least(greatest(coalesce(p_max,5),1),5)" });
+  // (2) ONE batch per family (unlimited sellers per export; forward migration 20260823): every compatible
+  //     account is assigned the single canonical batch index 0. The obsolete <=5 cap
+  //     (least(greatest(coalesce(p_max,...),1),5)) must be GONE, and the insert must place batch_index 0.
+  if (compact.includes("least(greatest(coalesce(p_max")) {
+    problems.push({ code: "ASSIGN_BATCH_STALE_CAP", reason: "still carries the obsolete <=5 per-family cap least(greatest(coalesce(p_max,...)))" });
+  }
+  if (!compact.includes("values(p_batch_family,p_account_id,0,p_connection_id,p_organization_fingerprint)")) {
+    problems.push({ code: "ASSIGN_BATCH_NOT_SINGLE_BATCH", reason: "does not assign every account to the single canonical batch index 0" });
   }
   // (3) an existing membership with a DIFFERENT connection/organization scope is REJECTED with RAISE EXCEPTION.
   if (!ifBlockRaises(body, { headerRe: /\bif\s+v_conn\s+is\s+distinct\s+from\s+p_connection_id\s+or\s+v_org\s+is\s+distinct\s+from\s+p_organization_fingerprint\s+then/i })) {
@@ -1270,7 +1299,31 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);
   if (proof === "cas-report-snapshot") return auditCasReportSnapshotFunction(clean, masked, fnName);
+  if (proof === "persist-flat2") return auditPersistFlat2Function(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
+}
+
+// Prove persist_source_tranche_budget's DB-enforced flat 2-token guard (Blocker B): it must REJECT any
+// per-hash token_cost that is not 2 BEFORE any mutation (the token_cost string literals are read from `clean`,
+// which preserves strings), raising the typed FLAT_TOKEN_COST_REQUIRED refusal ahead of the first INSERT.
+function auditPersistFlat2Function(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "PERSIST_FLAT2_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const C = body.clean;
+  const compact = C.replace(/\s+/g, "").toLowerCase();
+  if (!compact.includes("isdistinctfrom'2'")) {
+    problems.push({ code: "PERSIST_FLAT2_GUARD_MISSING", reason: "does not reject a per-hash token_cost that is not 2 (is distinct from '2')" });
+  }
+  if (!/flat_token_cost_required/i.test(C)) {
+    problems.push({ code: "PERSIST_FLAT2_RAISE_MISSING", reason: "does not RAISE the typed FLAT_TOKEN_COST_REQUIRED refusal" });
+  }
+  const guardIdx = compact.indexOf("isdistinctfrom'2'");
+  const insertIdx = compact.indexOf("insertintopublic.source_tranche_budget");
+  if (guardIdx >= 0 && insertIdx >= 0 && guardIdx > insertIdx) {
+    problems.push({ code: "PERSIST_FLAT2_GUARD_AFTER_MUTATION", reason: "the token_cost guard runs AFTER a mutation (must precede any INSERT)" });
+  }
+  return problems;
 }
 
 // ---- JavaScript-aware lexical layer (wrapper source) -----------------------------------------------------

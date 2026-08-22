@@ -297,6 +297,10 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   if (batchIds.length > 1) {
     const bv = validateBatchSourcePayload({
       rows,
+      // Prefer the batch's EXACT discovered account tuples (rawSellerId, marketplaceCountryCode): every row is
+      // validated against the exact (seller, marketplace) PAIRS, never two independent sets. Falls back to the
+      // legacy (sellerOrVendorIds, single marketplaceConstraint) shape when tuples are absent.
+      accountTuples: Array.isArray(job.accountTuples) && job.accountTuples.length ? job.accountTuples : null,
       sellerOrVendorIds: batchIds,
       sourceScope: job.sourceScope,
       marketplaceScoped: job.marketplaceScoped === true,

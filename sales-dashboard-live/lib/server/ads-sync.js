@@ -16,9 +16,9 @@ import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
 export const EXPORT_LIMIT = 50000;
-// The DataDoe five-seller-id chunk. Also the requiredCoverage allowlist ceiling: a bounded canary must fit in
-// ONE export batch per source (so it can never become an accidental organization-wide run).
-export const MAX_IDS_PER_EXPORT = 5;
+// DataDoe permits ANY number of seller/vendor ids in one export (the only cap is 5,000,000 rows). One export
+// batch per source/window covers all of a bucket's ids. [Superseded: the former 5-id chunk.]
+export const MAX_IDS_PER_EXPORT = Number.MAX_SAFE_INTEGER;
 const POLL_DELAY_MS = 5000;
 const POLL_ATTEMPTS = 9;
 const WORK_BUDGET_MS = 45000;
@@ -33,7 +33,7 @@ export const ADS_SOURCES = [
     initialDays: 56,
     dailyDays: 21,
     monthlyDays: 49,
-    batchSize: 5,
+    batchSize: MAX_IDS_PER_EXPORT, // any number of seller ids in one export (was 5; consistent with asin-performance-v1)
     dimensions: [
       "marketplace_id", "marketplace_country_code", "marketplace_country_name",
       "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_seller_id",

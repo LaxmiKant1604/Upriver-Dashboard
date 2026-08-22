@@ -383,23 +383,23 @@ test("production PostgREST row reaches the fetcher with exact source/columns/ids
   assert.deepEqual(j.fetchParams.options, oli.options);
 });
 
-test("five-ID chunks remain separate jobs, each created once; primary/dd-secondary never mix", async () => {
+test("all ids batch into ONE job per source, each created once; primary/dd-secondary never mix", async () => {
   const store = makeMemoryStore();
   const ids = Array.from({ length: 6 }, (_, i) => `A${i}`);
   const win = {
     "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }],
     "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }],
   };
-  // Each five-ID chunk is planned through the sanctioned batch path (senior review gaps 1-3): its accounts are
-  // the chunk's own seller ids, so one canonical job per chunk carries one owner membership per account. The
-  // marketplace-scoped OLI batch carries a single canonical marketplace constraint ("US").
+  // All ids are planned as ONE chunk through the sanctioned batch path (senior review gaps 1-3): its accounts
+  // are the chunk's own seller ids, so one canonical job per source carries one owner membership per account.
+  // The marketplace-scoped OLI batch carries a single canonical marketplace constraint ("US").
   const batchOf = (conn) => (r) => plannedBatchSourceJobs("brand-sales", r, "us", conn, r.sellerOrVendorIds.map((sid) => ({ accountId: sid, rawSellerId: sid })), "US");
   const primary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: PRIMARY_API_KEY, ids, windowsByRequestKey: win })
     .flatMap(batchOf("primary"));
   const secondary = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: SECONDARY_API_KEY, ids: ["A1"], windowsByRequestKey: win })
     .flatMap(batchOf("dd-secondary"));
   const oli = primary.filter((j) => j.requestKey === "brand-sales:order-lines");
-  assert.equal(new Set(oli.map((j) => j.requestHash)).size, 2); // two OLI chunks => two distinct canonical hashes
+  assert.equal(new Set(oli.map((j) => j.requestHash)).size, 1); // one OLI chunk over all ids => one canonical hash
   const pHashes = new Set(primary.map((j) => j.requestHash));
   for (const j of secondary) assert.ok(!pHashes.has(j.requestHash));
   // Each batch download returns one row per canonical batch seller carrying its marketplace so Blocker 4c

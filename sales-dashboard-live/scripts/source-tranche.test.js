@@ -403,9 +403,16 @@ test("4c. plannedBatchSourceJobs computes owner scope from rawSellerId and FAILS
   assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", [{ accountId: "ACC1", rawSellerId: "S1" }, { accountId: "ACC2", rawSellerId: "S1" }, { accountId: "ACC3", rawSellerId: "S3" }]), /duplicate rawSellerId/);
   // Gap 1: a blank rawSellerId is rejected (the raw id is authoritative; no caller hash is accepted).
   assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", [{ accountId: "ACC1", rawSellerId: "" }, { accountId: "ACC2", rawSellerId: "S2" }, { accountId: "ACC3", rawSellerId: "S3" }]), /nonblank rawSellerId/);
-  // Gap 2: more than 5 accounts is a hard-capped rejection.
-  const six = ["S1", "S2", "S3", "S4", "S5", "S6"].map((s, i) => ({ accountId: "ACC" + (i + 1), rawSellerId: s }));
-  assert.throws(() => plannedBatchSourceJobs("returns-leakage", resolvedBatch, "us", "primary", six), /at most 5 accounts/);
+  // The former "<=5 accounts per batch" cap is SUPERSEDED: DataDoe permits any number of sellers per export, so
+  // a 6-account batch whose set EXACTLY equals its resolved sellers is ACCEPTED as ONE export with 6 owners
+  // (never a hard-capped rejection). The set-equality / scope / duplicate / blank fail-closed guards above stay.
+  const sixSellers = ["S1", "S2", "S3", "S4", "S5", "S6"];
+  const sixId = sourceRequestIdentity({ apiKey: "k", sourceId: OLI_SOURCE_ID(), columns: c.columns, ids: sixSellers, from: "2025-07-14", to: "2025-07-20", limit: c.limit, options });
+  const sixBatch = { ...resolvedBatch, requestHash: sixId.requestHash, accountScopeHash: sixId.accountScopeHash, requestMeta: sixId.requestMeta, sellerOrVendorIds: sixSellers };
+  const six = sixSellers.map((s, i) => ({ accountId: "ACC" + (i + 1), rawSellerId: s }));
+  const sixJobs = plannedBatchSourceJobs("returns-leakage", sixBatch, "us", "primary", six);
+  assert.equal(sixJobs.length, 6, "a 6-account batch is accepted as ONE export with 6 owners (no <=5 cap)");
+  assert.equal(new Set(sixJobs.map((j) => j.owner.accountScopeHash)).size, 6, "six distinct INDIVIDUAL owner scopes on the shared export");
   // Gap 2: a resolvedBatch whose scope is inconsistent with its own sellerOrVendorIds is rejected.
   assert.throws(() => plannedBatchSourceJobs("returns-leakage", { ...resolvedBatch, accountScopeHash: "WRONG-BATCH-SCOPE" }, "us", "primary", ok), /does not equal accountScopeHash\(sellerOrVendorIds\)/);
   // Gap 3: plannedSourceJob itself fails closed for a multi-id (batched) resolved with no individual rawSellerId.

@@ -151,10 +151,12 @@ test("bad option shape is rejected BEFORE the lock is claimed (no lock held on a
 
 /* ============================= canonical requiredCoverage budget bounds ============================= */
 
-test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initialDays) and MAX_IDS_PER_EXPORT===5", () => {
+test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initialDays) and MAX_IDS_PER_EXPORT is unlimited", () => {
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, Math.max(...ADS_SOURCES.map((s) => s.initialDays)), "derived from the source contracts");
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, 60, "currently 60 (asin/search-terms initialDays)");
-  assert.equal(MAX_IDS_PER_EXPORT, 5);
+  // NEW model: DataDoe accepts ANY number of seller/vendor ids in ONE export, so the per-export id cap is
+  // effectively unlimited (Number.MAX_SAFE_INTEGER), not the former 5.
+  assert.equal(MAX_IDS_PER_EXPORT, Number.MAX_SAFE_INTEGER);
 });
 
 test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year boundary", () => {
@@ -170,7 +172,7 @@ test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year bo
   assert.equal(inclusiveDaySpan("2025-12-15", "2026-01-13"), 30);
 });
 
-test("validateAdsSyncOptions budget bounds: <=60 inclusive days + <=5 accounts accepted; 61 days / 6 accounts rejected", () => {
+test("validateAdsSyncOptions budget bounds: <=60 inclusive days accepted; 61 days rejected; any number of accounts accepted", () => {
   const ids2 = [G6_US, G6_IN];
   // exactly 60 inclusive days ending TODAY.
   assert.deepEqual(validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-06-16", to: TODAY } }, TODAY).requiredCoverage, { from: "2026-06-16", to: TODAY });
@@ -178,22 +180,25 @@ test("validateAdsSyncOptions budget bounds: <=60 inclusive days + <=5 accounts a
   assert.deepEqual(validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: REQ }, TODAY).requiredCoverage, REQ);
   // 61 inclusive days => rejected.
   assert.throws(() => validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-06-15", to: TODAY } }, TODAY), /61 inclusive days; the maximum is 60/);
-  // exactly 5 accounts accepted at SHAPE validation (resolution against discovery is a later, separate gate).
+  // NEW model: any number of accounts is accepted at SHAPE validation -- they all go into ONE export batch per
+  // source (resolution against discovery is a later, separate gate). Five accounts accepted...
   const five = ["a", "b", "c", "d", "e"];
   assert.deepEqual(validateAdsSyncOptions({ accountIds: five, requiredCoverage: REQ }, TODAY).accountIds, five);
-  // 6 accounts => rejected (would exceed one export batch per source).
-  assert.throws(() => validateAdsSyncOptions({ accountIds: ["a", "b", "c", "d", "e", "f"], requiredCoverage: REQ }, TODAY), /at most 5 accountIds/);
+  // ...and six accounts are ALSO accepted (no <= 5 cap): all ids fit in one export.
+  const six = ["a", "b", "c", "d", "e", "f"];
+  assert.deepEqual(validateAdsSyncOptions({ accountIds: six, requiredCoverage: REQ }, TODAY).accountIds, six);
   // malformed still rejected (from>to / non-real date / future).
   assert.throws(() => validateAdsSyncOptions({ accountIds: ids2, requiredCoverage: { from: "2026-02-30", to: TODAY } }, TODAY), /strict real YYYY-MM-DD/);
 });
 
-test("overlong window / excessive accounts are rejected BEFORE the lock: zero lock/discovery/export/write", async () => {
+test("an overlong window is rejected BEFORE the lock: zero lock/discovery/export/write", async () => {
+  // NEW model: an excessive ACCOUNT COUNT is no longer a pre-lock rejection (any number of ids fits in ONE
+  // export batch per source). Only an overlong coverage WINDOW is still rejected up front.
   for (const opts of [
     { accountIds: [G6_US], requiredCoverage: { from: "2026-06-15", to: TODAY } },   // 61 days
-    { accountIds: [G6_US, "b", "c", "d", "e", "f"], requiredCoverage: REQ },         // 6 accounts
   ]) {
     const { deps, calls } = makeDeps();
-    await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], opts), /the maximum is 60|at most 5 accountIds/);
+    await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], opts), /the maximum is 60/);
     assert.equal(calls.claim, 0, "zero lock calls");
     assert.equal(calls.fetchAccounts.length, 0, "zero discovery");
     assert.equal(calls.fetchRange.length, 0, "zero DataDoe exports");
