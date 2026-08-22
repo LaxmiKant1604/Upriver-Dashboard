@@ -10686,3 +10686,42 @@ deploy -> VERIFY FUNDED DataDoe balance (user confirms tokens now funded; verify
 sync ONLY OLI/Product Catalog/Campaign Ads/ASIN Ads/FBA Inventory -> publish/verify ONLY Daily Reporting + Brand
 View -> enable/observe ONLY their approved scheduler workflow. Migration 20260823 UNAPPLIED; nothing pushed/
 deployed. Each production write = one narrowly-scoped command; stop only for a genuine fail-closed condition.
+
+## The DataDoe "correction" was WRONG -- reverted to the original model -- 2026-08-22 (code e3636f4+9ba6ed9+f634890; docs separate)
+
+The above unlimited-batch/flat-2 "correction" (and Migration-7 apply) shipped on FALSE premises. Empirically
+disproven 2026-08-22 against the live DataDoe API: (1) sellerOrVendorIds are HARD-CAPPED at 5/export -- a real
+8-seller create returned HTTP 400 "sellerOrVendorIds must contain no more than 5 elements" (1-seller create,
+same 441-day window/cols/limit/agg, succeeded); (2) pricing is standard=2/premium=5, NOT flat 2 -- GET
+/usage-logs shows the OLI export cost 2, specificUsageType EXPORTS_API_STANDARD, and FBA Inventory Health (a
+priority source) is premium=5 per the live data-scheme. Both were unvalidated "Raffy says" claims; the repo
+memory [[datadoe-rest-api-facts]] had WARNED to validate before changing batching. The ORIGINAL <=5 /
+standard-2-premium-5 model (commit 241b685) was correct. Balance IS funded (a real export succeeded). See
+[[datadoe-model-correction-was-wrong]].
+
+Timeline this session: applied Migration 7 (20260823) to prod (stage 6->7, verified) + pushed + deployed the
+WRONG model BEFORE the empirical test. Then reverted: R1 (e3636f4) restored the model lib+tests to 241b685
+(chunk-by-5, MAX=5, ads batchSize per-source, sourceTokenCost 2/5, multi-batch assign, 7-day OLI slices);
+R2 (9ba6ed9) added FORWARD-CORRECTION migration 20260824_revert_flat_token_batch (sha da17dd1f) that DROPS the
+flat-2 constraint (the 20260818 permissive (2,5) check remains) + restores the <=5 assign RPC (20260817 body) +
+variable-cost persist RPC (20260818 body), plus a drop-aware release engine (ALTER_DROPPED_CONSTRAINTS +
+cumulativeDroppedConstraints; verifyMigrationPresent skips dropped add-constraints + asserts dropConstraints
+absent; stage-7 re-anchor tooling; ro-prod-check 0..8); f634890 registered 20260824 in schema-contract as the
+AUTHORITATIVE final proof (auditAssignBatchLegacyFunction <=5 multi-batch, auditPersistVariableFunction variable
+2|5 no flat-2 guard, DROP requiredStatement) -- Migration 7 kept ONLY as historical applied evidence, marked
+SUPERSEDED. 5 migration-8 mutation regressions. release-selftest 170; verify 55/55; node --check + diff --check
+clean. Code committed, docs separate. NOT pushed (correct code + wrong stage-7 DB must land together).
+
+BLOCKER (user inspecting; DO NOT re-pin): my diagnostic `run-bucket.mjs us` created a failed "running" cycle in
+prod (ee1b5e36: 10 jobs/17 owners/1 budget/1 budget_hash + 8 one-batch membership rows family 7e9259f3), pushing
+sync_cycles 17->18 -> the stage-7 re-anchor fail-closed on the protected-digest pin. Also 1 orphaned DataDoe
+export b24c44f6 (2 tokens, balance probe). Codex proved the footprint isolated; user chose to inspect before any
+cleanup. PENDING (per user's latest directive, in order): reviewed ATOMIC diagnostic-cleanup txn (delete only
+that cycle's budget_hash+budget+8 membership rows+cycle [jobs/owners cascade]; re-prove identity/counts/zero
+external refs/zero snapshots; assert digests==pins incl sync_cycles=17; COMMIT once or ROLLBACK; never delete
+b24c44f6) -> ro-prod-check 7 -> stage-7 re-anchor (new HEAD) -> ro-prod-check 7 -> apply Migration 8 once ->
+ro-prod-check 8 -> push corrected main once -> verify one Vercel deploy + HTTP 200 -> then Daily Reporting +
+Brand View go-live with the CORRECT model (<=5 sellers/export, standard=2/premium=5, verify balance before
+creates, exact seller/account isolation, publish only validated snapshots, verify frontend identities/LKG,
+enable scheduling only after a full observed run). Stop on mismatch/COMMIT_UNKNOWN/permission/DataDoe failure/
+insufficient tokens/incomplete or cross-account evidence. Report exact exports + tokens spent.
