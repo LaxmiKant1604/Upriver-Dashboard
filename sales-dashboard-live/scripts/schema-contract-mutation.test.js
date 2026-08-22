@@ -20,6 +20,9 @@ const BUDGET = "20260818_source_tranche_budget.sql";
 // Forward migration 20260823 REPLACES the original <=5 assign RPC with the one-batch (unlimited-sellers) body,
 // so the assign-batch BODY invariants are proven against THIS file (not the original 20260817 definition).
 const FLAT2 = "20260823_source_batch_flat_token.sql";
+// The AUTHORITATIVE final correction (undoes 20260823): restores the <=5 multi-batch assign + variable-cost
+// persist RPCs and DROPS the flat-2 constraint. Its proofs describe the runtime state.
+const FLAT2REVERT = "20260824_revert_flat_token_batch.sql";
 const WRAP = "supabase.js";
 
 let passed = 0;
@@ -162,6 +165,34 @@ test("assign-not-single-batch. an insert that does NOT place the single canonica
 test("assign-no-scope-reject. a removed existing connection/organization scope rejection => ASSIGN_BATCH_SCOPE_MATCH_MISSING", () => {
   const a = auditWith({ [FLAT2]: (t) => t.replace("if v_conn is distinct from p_connection_id or v_org is distinct from p_organization_fingerprint then", "if false then") });
   assert.ok(!a.ok && hasBlocker(a, "ASSIGN_BATCH_SCOPE_MATCH_MISSING"), "ASSIGN_BATCH_SCOPE_MATCH_MISSING");
+});
+
+/* --- AUTHORITATIVE FINAL correction (20260824): the restored <=5 multi-batch assign + variable-cost persist +
+      the dropped flat-2 constraint each fail closed when weakened (Codex req 5). --- */
+
+test("final-cap-widened. weakening the restored hard <=5 cap in 20260824 => ASSIGN_LEGACY_CAP_MISSING", () => {
+  const a = auditWith({ [FLAT2REVERT]: (t) => t.replace("least(greatest(coalesce(p_max, 5), 1), 5)", "least(greatest(coalesce(p_max, 5), 1), 6)") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_LEGACY_CAP_MISSING"), "ASSIGN_LEGACY_CAP_MISSING");
+});
+
+test("final-wrong-batch. a one-batch (hardcoded index 0) insert in 20260824 => ASSIGN_LEGACY_MULTIBATCH_MISSING", () => {
+  const a = auditWith({ [FLAT2REVERT]: (t) => t.replace("(p_batch_family, p_account_id, v_index, p_connection_id, p_organization_fingerprint)", "(p_batch_family, p_account_id, 0, p_connection_id, p_organization_fingerprint)") });
+  assert.ok(!a.ok && hasBlocker(a, "ASSIGN_LEGACY_MULTIBATCH_MISSING"), "ASSIGN_LEGACY_MULTIBATCH_MISSING");
+});
+
+test("final-flat2-not-dropped. failing to DROP the flat-2 constraint in 20260824 => STATEMENT_MISSING", () => {
+  const a = auditWith({ [FLAT2REVERT]: (t) => t.replace("drop constraint if exists source_tranche_budget_hash_cost_flat2", "-- constraint left in place") });
+  assert.ok(!a.ok && hasBlocker(a, "STATEMENT_MISSING"), "STATEMENT_MISSING (the flat-2 constraint must be dropped)");
+});
+
+test("final-flat2-guard-retained. re-introducing the flat-2 persist guard in 20260824 => PERSIST_VARIABLE_FLAT2_RETAINED", () => {
+  const a = auditWith({ [FLAT2REVERT]: (t) => t.replace("return 'created';", "if (h->>'token_cost') is distinct from '2' then raise exception 'FLAT_TOKEN_COST_REQUIRED'; end if;\n  return 'created';") });
+  assert.ok(!a.ok && hasBlocker(a, "PERSIST_VARIABLE_FLAT2_RETAINED"), "PERSIST_VARIABLE_FLAT2_RETAINED");
+});
+
+test("final-cost-hardcoded. hardcoding the per-hash token_cost (ignoring the variable 2|5) in 20260824 => PERSIST_VARIABLE_COST_PASSTHROUGH_MISSING", () => {
+  const a = auditWith({ [FLAT2REVERT]: (t) => t.replace("(h->>'token_cost')::integer", "2::integer") });
+  assert.ok(!a.ok && hasBlocker(a, "PERSIST_VARIABLE_COST_PASSTHROUGH_MISSING"), "PERSIST_VARIABLE_COST_PASSTHROUGH_MISSING");
 });
 
 /* --- Blocker 4d: the frozen tranche budget + atomic pre-POST reservation RPC each fail closed when weakened --- */

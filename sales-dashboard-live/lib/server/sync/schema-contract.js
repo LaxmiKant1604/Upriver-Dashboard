@@ -461,9 +461,11 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     note: "Report-derive lease + guarded recovery (claim/reconcile RPCs) + atomic report_snapshots freshness CAS; additive to sync_report_jobs; PREPARED, UNAPPLIED.",
   },
   {
-    // UNLIMITED one-batch-per-US/Non-US-family assignment (REPLACES the 20260817 <=5 RPC) + DATABASE-enforced
-    // flat 2-token cost: an ADDITIVE named constraint (the 20260818 permissive (2,5) check is left intact) and a
-    // hardened persist RPC. DataDoe confirmed any number of sellers per export, flat 2 tokens each.
+    // HISTORICAL, SUPERSEDED (applied production evidence only -- see 20260824 below for the final state).
+    // 20260823 introduced a one-batch-per-family assignment + a DB flat-2 token constraint on the false premise
+    // that DataDoe allows unlimited sellers per export at a flat 2 tokens each. BOTH claims were empirically
+    // disproven 2026-08-22 (sellers hard-capped at 5; standard=2/premium=5). Its proofs still audit THIS file so
+    // the applied history + its mutation regressions stay green, but they DO NOT describe the runtime state.
     migration: "20260823_source_batch_flat_token.sql",
     tables: [],
     requiredStatements: [
@@ -477,11 +479,34 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
       { name: "persist_source_tranche_budget", params: ["p_cycle_id", "p_tranche_key", "p_plan_fingerprint", "p_max_creates", "p_max_tokens", "p_hashes"] },
     ],
     provenFunctions: [
-      { name: "assign_source_account_batch", proof: "assign-batch" },       // one-batch (index 0), no <=5 cap
-      { name: "persist_source_tranche_budget", proof: "persist-flat2" },    // rejects any per-hash cost <> 2
+      { name: "assign_source_account_batch", proof: "assign-batch" },       // HISTORICAL one-batch (index 0)
+      { name: "persist_source_tranche_budget", proof: "persist-flat2" },    // HISTORICAL flat-2 guard
     ],
     wrappers: ["persistSourceTrancheBudget"],
-    note: "One-batch-per-family assignment + DB-enforced flat 2-token cost (additive constraint + hardened persist RPC); PREPARED, UNAPPLIED.",
+    note: "HISTORICAL/SUPERSEDED: one-batch + flat-2 (false premise); undone by 20260824. Applied production evidence only, NOT the runtime state.",
+  },
+  {
+    // AUTHORITATIVE FINAL CORRECTION (undoes 20260823). DataDoe hard-caps sellerOrVendorIds at 5/export and
+    // prices standard=2/premium=5 (both empirically confirmed 2026-08-22). This migration DROPS the flat-2
+    // constraint (the 20260818 permissive (2,5) check remains, so premium 5-token exports validate) and RESTORES
+    // the <=5 multi-batch assign RPC (20260817 body) + the variable-cost persist RPC (20260818 body). These
+    // proofs describe the FINAL runtime state.
+    migration: "20260824_revert_flat_token_batch.sql",
+    tables: [],
+    requiredStatements: [
+      // The flat-2 token_cost constraint is DROPPED (premium exports cost 5).
+      { label: "drops the flat-2 token constraint source_tranche_budget_hash_cost_flat2", pattern: String.raw`drop\s+constraint\s+if\s+exists\s+source_tranche_budget_hash_cost_flat2` },
+    ],
+    rpcs: [
+      { name: "assign_source_account_batch", params: ["p_batch_family", "p_account_id", "p_connection_id", "p_organization_fingerprint", "p_max"] },
+      { name: "persist_source_tranche_budget", params: ["p_cycle_id", "p_tranche_key", "p_plan_fingerprint", "p_max_creates", "p_max_tokens", "p_hashes"] },
+    ],
+    provenFunctions: [
+      { name: "assign_source_account_batch", proof: "assign-batch-legacy" },  // hard <=5 cap + stable multi-batch
+      { name: "persist_source_tranche_budget", proof: "persist-variable" },   // variable 2|5 cost, no flat-2 guard
+    ],
+    wrappers: [],
+    note: "AUTHORITATIVE FINAL correction: drops the flat-2 constraint; restores the <=5 multi-batch assign RPC + variable-cost persist RPC. Describes the runtime state.",
   },
 ]);
 
@@ -968,11 +993,11 @@ function auditAdoptCacheFunction(clean, masked, fnName) {
   return problems;
 }
 
-// Prove assign_source_account_batch's CRITICAL behavior (senior review gap 4d): it (1) serialises assignments
-// within a family via a per-family advisory xact lock; (2) hard-caps the per-family maximum to EXACTLY 5 (a
-// widened cap fails); and (3) REJECTS an existing membership whose stored connection/organization scope differs
-// from the caller's (RAISE EXCEPTION, no silent re-home). The direct-write ban is enforced by the SELECT-only
-// service_role ACL, audited separately.
+// HISTORICAL (migration 20260823 only). Proves the one-batch body 20260823 introduced (single canonical
+// batch_index 0, p_max ignored). This migration is applied production HISTORY, but it is NOT the authoritative
+// final runtime state: migration 20260824 REVERTS it to the <=5 multi-batch body (proven by
+// auditAssignBatchLegacyFunction), because DataDoe actually hard-caps sellerOrVendorIds at 5/export. Kept so the
+// 20260823 file (and its mutation regressions) still audit; the final-state proof lives at 20260824.
 function auditAssignBatchFunction(clean, masked, fnName) {
   const body = functionBodyViews(clean, masked, fnName);
   if (!body) return [{ code: "ASSIGN_BATCH_FUNCTION_MISSING", reason: "function body not found" }];
@@ -983,11 +1008,11 @@ function auditAssignBatchFunction(clean, masked, fnName) {
   if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_batch_family\s*\)\s*\)/i.test(M)) {
     problems.push({ code: "ASSIGN_BATCH_ADVISORY_LOCK_MISSING", reason: "does not take pg_advisory_xact_lock(hashtext(p_batch_family))" });
   }
-  // (2) ONE batch per family (unlimited sellers per export; forward migration 20260823): every compatible
-  //     account is assigned the single canonical batch index 0. The obsolete <=5 cap
-  //     (least(greatest(coalesce(p_max,...),1),5)) must be GONE, and the insert must place batch_index 0.
+  // (2) HISTORICAL only: 20260823's one-batch body assigned every account the single batch index 0 with no cap.
+  //     This audits the applied-history file; it is NOT the runtime state (20260824 restores the <=5 multi-batch
+  //     body -- DataDoe actually caps sellers at 5/export). For THIS file the <=5 cap must be absent (index 0).
   if (compact.includes("least(greatest(coalesce(p_max")) {
-    problems.push({ code: "ASSIGN_BATCH_STALE_CAP", reason: "still carries the obsolete <=5 per-family cap least(greatest(coalesce(p_max,...)))" });
+    problems.push({ code: "ASSIGN_BATCH_STALE_CAP", reason: "the historical 20260823 one-batch body must not carry the <=5 cap least(greatest(coalesce(p_max,...)))" });
   }
   if (!compact.includes("values(p_batch_family,p_account_id,0,p_connection_id,p_organization_fingerprint)")) {
     problems.push({ code: "ASSIGN_BATCH_NOT_SINGLE_BATCH", reason: "does not assign every account to the single canonical batch index 0" });
@@ -1300,12 +1325,15 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);
   if (proof === "cas-report-snapshot") return auditCasReportSnapshotFunction(clean, masked, fnName);
   if (proof === "persist-flat2") return auditPersistFlat2Function(clean, masked, fnName);
+  if (proof === "assign-batch-legacy") return auditAssignBatchLegacyFunction(clean, masked, fnName);
+  if (proof === "persist-variable") return auditPersistVariableFunction(clean, masked, fnName);
   return [{ code: "FUNCTION_PROOF_UNKNOWN", reason: `unknown function proof "${proof}"` }];
 }
 
-// Prove persist_source_tranche_budget's DB-enforced flat 2-token guard (Blocker B): it must REJECT any
-// per-hash token_cost that is not 2 BEFORE any mutation (the token_cost string literals are read from `clean`,
-// which preserves strings), raising the typed FLAT_TOKEN_COST_REQUIRED refusal ahead of the first INSERT.
+// HISTORICAL (migration 20260823 only). Proves the flat-2 token guard 20260823 introduced (REJECT any per-hash
+// token_cost <> 2 before mutation, RAISE FLAT_TOKEN_COST_REQUIRED). This audits applied history; it is NOT the
+// runtime state -- 20260824 restores the variable-cost persist (proven by auditPersistVariableFunction), because
+// DataDoe prices standard=2/premium=5 (a flat-2 guard would refuse legitimate premium 5-token exports).
 function auditPersistFlat2Function(clean, masked, fnName) {
   const body = functionBodyViews(clean, masked, fnName);
   if (!body) return [{ code: "PERSIST_FLAT2_FUNCTION_MISSING", reason: "function body not found" }];
@@ -1322,6 +1350,67 @@ function auditPersistFlat2Function(clean, masked, fnName) {
   const insertIdx = compact.indexOf("insertintopublic.source_tranche_budget");
   if (guardIdx >= 0 && insertIdx >= 0 && guardIdx > insertIdx) {
     problems.push({ code: "PERSIST_FLAT2_GUARD_AFTER_MUTATION", reason: "the token_cost guard runs AFTER a mutation (must precede any INSERT)" });
+  }
+  return problems;
+}
+
+// ---- AUTHORITATIVE FINAL correction proofs (migration 20260824) ------------------------------------------
+// DataDoe hard-caps sellerOrVendorIds at 5/export and prices standard=2/premium=5 (both empirically confirmed
+// 2026-08-22). These proofs describe the FINAL runtime state (the 20260823 one-batch/flat-2 proofs above are
+// kept ONLY as historical applied evidence).
+
+// Prove the RESTORED assign RPC: a HARD <=5 per-family cap AND stable multi-batch assignment (place a new
+// account in the smallest-index batch with < v_max members, else a fresh max(batch_index)+1 batch, insert at
+// the computed v_index -- NEVER a hardcoded batch 0), under the per-family advisory lock, with an existing
+// membership reused ONLY when its stored connection/organization scope matches (else RAISE without mutating).
+function auditAssignBatchLegacyFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "ASSIGN_LEGACY_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const compact = M.replace(/\s+/g, "").toLowerCase();
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_batch_family\s*\)\s*\)/i.test(M)) {
+    problems.push({ code: "ASSIGN_LEGACY_ADVISORY_LOCK_MISSING", reason: "does not take pg_advisory_xact_lock(hashtext(p_batch_family))" });
+  }
+  // HARD <=5 cap.
+  if (!compact.includes("least(greatest(coalesce(p_max,5),1),5)")) {
+    problems.push({ code: "ASSIGN_LEGACY_CAP_MISSING", reason: "does not enforce the hard <=5 per-family cap least(greatest(coalesce(p_max,5),1),5)" });
+  }
+  // Stable multi-batch assignment (smallest batch under v_max, else a fresh batch, insert at the computed index).
+  const smallestUnderMax = compact.includes("wherec<v_max");
+  const freshBatch = compact.includes("coalesce(max(batch_index)+1,0)");
+  const insertVindex = compact.includes("values(p_batch_family,p_account_id,v_index,p_connection_id,p_organization_fingerprint)");
+  if (!smallestUnderMax || !freshBatch || !insertVindex) {
+    problems.push({ code: "ASSIGN_LEGACY_MULTIBATCH_MISSING", reason: "does not perform stable multi-batch assignment (smallest batch with count < v_max, else max(batch_index)+1, insert at v_index)" });
+  }
+  // An existing membership with a DIFFERENT connection/organization scope is REJECTED with RAISE EXCEPTION.
+  if (!ifBlockRaises(body, { headerRe: /\bif\s+v_conn\s+is\s+distinct\s+from\s+p_connection_id\s+or\s+v_org\s+is\s+distinct\s+from\s+p_organization_fingerprint\s+then/i })) {
+    problems.push({ code: "ASSIGN_LEGACY_SCOPE_MATCH_MISSING", reason: "an existing membership with a different connection/organization scope is not rejected with RAISE EXCEPTION" });
+  }
+  return problems;
+}
+
+// Prove the RESTORED persist RPC: variable per-hash token_cost (2 for standard, 5 for premium) inserted VERBATIM
+// and validated ONLY by the pre-existing permissive (2,5) DB constraint -- with NO retained flat-2 guard (which
+// would refuse premium 5-token exports). Keeps the per-(cycle,tranche) advisory lock + PLAN_BUDGET_MISMATCH guard.
+function auditPersistVariableFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "PERSIST_VARIABLE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const C = body.clean;
+  const M = body.masked;
+  const compact = C.replace(/\s+/g, "").toLowerCase();
+  if (compact.includes("isdistinctfrom'2'") || /flat_token_cost_required/i.test(C)) {
+    problems.push({ code: "PERSIST_VARIABLE_FLAT2_RETAINED", reason: "still retains the flat-2 token_cost guard; premium (5-token) exports would be refused" });
+  }
+  if (!compact.includes("(h->>'token_cost')::integer")) {
+    problems.push({ code: "PERSIST_VARIABLE_COST_PASSTHROUGH_MISSING", reason: "does not insert the per-hash token_cost verbatim ((h->>'token_cost')::integer, validated by the (2,5) DB constraint)" });
+  }
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(/i.test(M)) {
+    problems.push({ code: "PERSIST_VARIABLE_ADVISORY_LOCK_MISSING", reason: "does not take the per-(cycle,tranche) advisory lock" });
+  }
+  if (!/plan_budget_mismatch/i.test(C)) {
+    problems.push({ code: "PERSIST_VARIABLE_MISMATCH_GUARD_MISSING", reason: "does not RAISE PLAN_BUDGET_MISMATCH on a drifted frozen budget" });
   }
   return problems;
 }
