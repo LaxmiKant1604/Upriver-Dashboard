@@ -1,12 +1,13 @@
 // Scheduler v2 Blocker 4d -- FROZEN per-(cycle, tranche) create-export + AI-token budget (pure, ZERO I/O).
 //
-// Official DataDoe cost rule this module encodes (confirmed by DataDoe in writing):
-//   - EVERY export costs EXACTLY 2 AI tokens -- regardless of seller count, marketplace mix, or rows;
-//   - any number of sellerOrVendorIds may be combined in one export (the only cap is 5,000,000 rows/export).
-// So the token ceiling is simply 2 x (the number of UNIQUE canonical request_hashes). The batching (one US +
-// one Non-US export per seller-scoped source/window; organization-wide Product Catalog = one export per
-// org/window) is ALREADY reflected in the plan's unique hashes, so the budget just counts them x 2.
-// [Superseded: the former standard=2/premium=5 pricing and the <=5-seller-per-export cap.]
+// Official DataDoe cost rules this module encodes (NEVER a blanket "exports x 2"):
+//   - an ExportRequest carries at most 5 sellerOrVendorIds;
+//   - a STANDARD source export costs 2 AI tokens; a PREMIUM source export costs 5;
+//   - source discovery exposes isPremium per source.
+// So the token ceiling is sum over the UNIQUE canonical request_hashes of (isPremium ? 5 : 2) -- the batching
+// (seller = ceil(N/5) hashes per window; organization-wide Product Catalog = one hash per org/window;
+// non-batchable = one hash per account/window) is ALREADY reflected in the plan's unique hashes, so the budget
+// just counts them. Missing/ambiguous pricing FAILS CLOSED before any create-export POST.
 //
 // The frozen budget (plan fingerprint + max creates + max tokens + the per-hash costs) is persisted per
 // (cycle, tranche). A continuation recomputes it and MUST match the frozen fingerprint (plan/pricing drift is
@@ -15,17 +16,17 @@
 
 import { sha256 } from "../source-identity.js";
 
-// EVERY DataDoe export costs exactly 2 AI tokens (flat). The former standard/premium split and the <=5-seller
-// cap are SUPERSEDED; these aliases are retained (flat 2 / unlimited) so importers keep resolving.
-export const EXPORT_TOKEN_COST = 2;
 export const STANDARD_SOURCE_TOKENS = 2;
-export const PREMIUM_SOURCE_TOKENS = 2; // superseded: no premium tier -- every export is 2 tokens
-export const MAX_SELLER_IDS_PER_EXPORT = Number.MAX_SAFE_INTEGER; // superseded: no per-export seller cap
+export const PREMIUM_SOURCE_TOKENS = 5;
+export const MAX_SELLER_IDS_PER_EXPORT = 5;
 
-// The AI-token cost of ONE source export: a flat 2 tokens (DataDoe confirmed every export is exactly 2). The
-// isPremium argument is retained for call-site back-compat but is IGNORED -- there is no premium tier.
-export function sourceTokenCost(_isPremium) {
-  return EXPORT_TOKEN_COST;
+// The AI-token cost of ONE source export, from its discovery isPremium. isPremium MUST be a definite boolean
+// (from source discovery); anything else is missing/ambiguous pricing and throws (fail closed) -- there is no
+// default cost.
+export function sourceTokenCost(isPremium) {
+  if (isPremium === true) return PREMIUM_SOURCE_TOKENS;
+  if (isPremium === false) return STANDARD_SOURCE_TOKENS;
+  throw new Error("sourceTokenCost: missing/ambiguous source pricing (isPremium must be a definite boolean); refusing (fail closed).");
 }
 
 // A deterministic tranche key for a built tranche descriptor (or "all" for the full plan). Stable across
@@ -46,10 +47,10 @@ export function trancheKeyOf(sourceTranche) {
  * and planFingerprint = a sha256 over the sorted (request_hash, token_cost) pairs -- so ANY added/removed hash
  * OR changed price yields a different fingerprint (drift is detectable). Deterministic; performs no I/O.
  */
-export function computeFrozenTrancheBudget({ plannedJobs, sourceTranche = null, isPremiumOf = null, trancheKey = null } = {}) {
-  // Every export is a FLAT 2 tokens (DataDoe confirmed). No per-source pricing reader is required; isPremiumOf
-  // is accepted for call-site back-compat but IGNORED (there is no premium tier).
-  void isPremiumOf;
+export function computeFrozenTrancheBudget({ plannedJobs, sourceTranche = null, isPremiumOf, trancheKey = null } = {}) {
+  if (typeof isPremiumOf !== "function") {
+    throw new Error("computeFrozenTrancheBudget requires an isPremiumOf(job) pricing reader (fail closed).");
+  }
   const selects = sourceTranche && typeof sourceTranche.selects === "function" ? (j) => sourceTranche.selects(j) : () => true;
   const byHash = new Map();
   for (const job of plannedJobs || []) {
@@ -57,7 +58,7 @@ export function computeFrozenTrancheBudget({ plannedJobs, sourceTranche = null, 
     const requestHash = job.requestHash ?? job.request_hash;
     if (!requestHash) throw new Error("computeFrozenTrancheBudget: a planned job is missing its request_hash (fail closed).");
     if (byHash.has(requestHash)) continue; // UNIQUE canonical hashes only (batching already reflected)
-    const tokenCost = sourceTokenCost(); // flat EXPORT_TOKEN_COST (2) per export
+    const tokenCost = sourceTokenCost(isPremiumOf(job)); // throws on missing/ambiguous pricing
     byHash.set(requestHash, { requestHash, sourceKey: job.sourceKey ?? job.source_key ?? "", tokenCost });
   }
   // Deterministic order (by request_hash) for a stable fingerprint independent of plan emission order.

@@ -1,7 +1,7 @@
 // Scheduler v2 Blocker 4d -- FROZEN create-export + AI-token budget with an ATOMIC pre-POST reservation
 // (offline, ZERO network/DB). Proves the required behaviours:
-//   - any number of compatible accounts => ONE batch/window; adding accounts adds no batch, membership unchanged;
-//   - every source ceiling = unique hashes x 2 (flat cost; premium x5 tier superseded); Product Catalog counts once;
+//   - 30 compatible accounts => 6 batches/window; 31 => 7, prior membership unchanged;
+//   - standard ceiling = unique hashes x 2; premium = x 5; mixed sums exactly; Product Catalog counts once;
 //   - a cache hit / saved-export_id resume spends ZERO additional creates/tokens; reuseOnly spends zero;
 //   - concurrent workers cannot exceed EITHER ceiling; an attempt beyond a ceiling is stopped BEFORE the POST;
 //   - a continuation cannot reset the counters; plan/pricing drift fails closed;
@@ -52,12 +52,10 @@ const fakeJobs = (n, sourceKey = "order-line-items", prefix = "h") => Array.from
 /* ============================= Part A: frozen budget arithmetic ============================= */
 group("Part A: token ceiling arithmetic (never exports x 2)");
 
-test("A1. sourceTokenCost is a FLAT 2 tokens per export (the premium x5 tier is superseded)", () => {
-  // DataDoe confirmed IN WRITING that every export costs exactly 2 AI tokens; the (now-vestigial) premium flag
-  // no longer changes the cost, so both classes -- and any argument -- resolve to 2.
-  assert.equal(sourceTokenCost(false), 2); assert.equal(sourceTokenCost(true), 2);
-  assert.equal(STANDARD_SOURCE_TOKENS, 2); assert.equal(PREMIUM_SOURCE_TOKENS, 2);
-  for (const any of [undefined, null, 0, 1, "true", false, true]) assert.equal(sourceTokenCost(any), 2);
+test("A1. sourceTokenCost: standard=2, premium=5; missing/ambiguous pricing fails closed", () => {
+  assert.equal(sourceTokenCost(false), 2); assert.equal(sourceTokenCost(true), 5);
+  assert.equal(STANDARD_SOURCE_TOKENS, 2); assert.equal(PREMIUM_SOURCE_TOKENS, 5);
+  for (const bad of [undefined, null, 0, 1, "true"]) assert.throws(() => sourceTokenCost(bad), /missing\/ambiguous/);
 });
 
 test("A2. a STANDARD source ceiling = unique hashes x 2", () => {
@@ -65,16 +63,16 @@ test("A2. a STANDARD source ceiling = unique hashes x 2", () => {
   assert.equal(b.maxCreates, 6); assert.equal(b.maxTokens, 12);
 });
 
-test("A3. a formerly-PREMIUM source ceiling is now also unique hashes x 2 (flat)", () => {
+test("A3. a PREMIUM source ceiling = unique hashes x 5", () => {
   const b = computeFrozenTrancheBudget({ plannedJobs: fakeJobs(6), isPremiumOf: () => true });
-  assert.equal(b.maxCreates, 6); assert.equal(b.maxTokens, 12); // 6 x 2 -- no x5 premium tier
+  assert.equal(b.maxCreates, 6); assert.equal(b.maxTokens, 30);
 });
 
-test("A4. MIXED source keys sum at the FLAT 2 tokens each (never a premium x5)", () => {
+test("A4. MIXED standard/premium sums EXACTLY (never a blanket x2)", () => {
   const jobs = [...fakeJobs(4, "order-line-items", "s"), ...fakeJobs(3, "listings", "p")];
   const b = computeFrozenTrancheBudget({ plannedJobs: jobs, isPremiumOf: (j) => j.sourceKey === "listings" });
   assert.equal(b.maxCreates, 7);
-  assert.equal(b.maxTokens, 7 * 2); // 14 -- flat 2 per unique hash, premium flag ignored
+  assert.equal(b.maxTokens, 4 * 2 + 3 * 5); // 8 + 15 = 23
 });
 
 test("A5. Product Catalog counts ONCE per organization/window (shared hash deduped)", () => {
@@ -85,33 +83,29 @@ test("A5. Product Catalog counts ONCE per organization/window (shared hash dedup
   assert.equal(b.hashes.filter((h) => h.sourceKey === "product-catalog").length, 1);
 });
 
-test("A6. the flat 2-token cost applies to EVERY selected hash (no per-hash pricing to fail closed on)", () => {
-  // The former premium/standard classification (and its missing-pricing fail-closed) is superseded: the budget
-  // is decoupled from pricing and charges a flat 2 per unique hash, so a null premium classifier is harmless.
-  const b = computeFrozenTrancheBudget({ plannedJobs: fakeJobs(3), isPremiumOf: () => undefined });
-  assert.equal(b.maxCreates, 3); assert.equal(b.maxTokens, 6);
+test("A6. missing pricing on any selected hash fails the WHOLE budget closed", () => {
+  assert.throws(() => computeFrozenTrancheBudget({ plannedJobs: fakeJobs(3), isPremiumOf: () => undefined }), /missing\/ambiguous/);
 });
 
 /* ============================= Part B: stable batching -> hash count ============================= */
 group("Part B: batching derived from unique hashes (stable)");
 
-test("B1. any number of compatible accounts => ONE batch/window; adding the 31st adds NO batch, membership UNCHANGED", () => {
+test("B1. 30 compatible accounts => 6 batches/window; 31 => 7 with prior membership UNCHANGED", () => {
   const p30 = planForAccounts(30);
-  assert.equal(p30.batches.length, 1, "30 => ONE batch (any number of sellers per export)");
-  assert.equal(p30.jobs.length, 1, "ONE canonical hash");
+  assert.equal(p30.batches.length, 6, "30 => 6 batches");
+  assert.equal(p30.jobs.length, 6, "6 canonical hashes");
   const p31 = planForAccounts(31, p30.membership); // continue from the 30-account membership
-  assert.equal(p31.batches.length, 1, "31 => still ONE batch (the 31st joins it; no 7th batch)");
-  // Every one of the first 30 accounts keeps its batch index (all index 0; adding the 31st moved no one).
+  assert.equal(p31.batches.length, 7, "31 => 7 batches");
+  // Every one of the first 30 accounts keeps its batch index (adding the 31st moved no one).
   for (const [id, idx] of p30.membership) assert.equal(p31.membership.get(id), idx, id + " unchanged");
-  assert.ok([...p30.membership.values()].every((idx) => idx === 0), "all accounts share the single batch index 0");
-  // The single batch's canonical hash reflects its CURRENT seller set: adding the 31st changes that set, so the
-  // 31-account export is a NEW canonical hash (the batch composition changed) -- never a reshuffle of accounts.
-  assert.notEqual(p31.jobs[0].requestHash, p30.jobs[0].requestHash, "the one batch's hash tracks its seller set");
-  // The budget stays at ONE create/window regardless of account count (one export over all sellers).
+  // The 6 original canonical hashes are all still present among the 7.
+  const before = new Set(p30.jobs.map((j) => j.requestHash));
+  const after = new Set(p31.jobs.map((j) => j.requestHash));
+  for (const h of before) assert.ok(after.has(h), "original batch hash preserved");
+  // The budget grows by exactly one create (the 7th batch), never a reshuffle.
   const bud30 = computeFrozenTrancheBudget({ plannedJobs: p30.jobs, isPremiumOf: () => false });
   const bud31 = computeFrozenTrancheBudget({ plannedJobs: p31.jobs, isPremiumOf: () => false });
-  assert.equal(bud30.maxCreates, 1); assert.equal(bud31.maxCreates, 1);
-  assert.equal(bud30.maxTokens, 2); assert.equal(bud31.maxTokens, 2);
+  assert.equal(bud30.maxCreates, 6); assert.equal(bud31.maxCreates, 7);
 });
 
 /* ============================= Part C: reservation semantics (in-memory RPC model) ============================= */
@@ -213,17 +207,15 @@ test("C5. a NEW account discovered mid-cycle joins the NEXT cycle; it never wide
   const bud = computeFrozenTrancheBudget({ plannedJobs: p30.jobs, isPremiumOf: () => false, trancheKey: "oli" });
   freeze(s, "cyc1", bud); p30.jobs.forEach((j) => s.seedJob(j.requestHash));
   // A 31st account creates a NEW batch hash; against cycle1's FROZEN budget it is out-of-plan (refused).
-  // The 31st account changes the single batch's seller set => a NEW canonical batch hash; against cycle1's
-  // FROZEN budget (which pinned the 30-account hash) it is out-of-plan (refused).
   const p31 = planForAccounts(31, p30.membership);
   const newHash = p31.jobs.map((j) => j.requestHash).find((h) => !p30.jobs.some((j) => j.requestHash === h));
   assert.ok(newHash, "the 31st account produced a new batch hash");
   s.seedJob(newHash);
   assert.equal(s.reserveExportCreate({ cycleId: "cyc1", trancheKey: "oli", planFingerprint: bud.planFingerprint, requestHash: newHash }), "plan-mismatch", "does not widen cycle1");
-  // The NEXT cycle freezes a fresh ONE-hash budget (one batch/export over all 31 accounts).
+  // The NEXT cycle freezes a fresh 7-hash budget that includes the new account.
   const bud2 = computeFrozenTrancheBudget({ plannedJobs: p31.jobs, isPremiumOf: () => false, trancheKey: "oli" });
   assert.equal(freeze(s, "cyc2", bud2), "created"); s.seedJob(newHash);
-  assert.equal(bud2.maxCreates, 1);
+  assert.equal(bud2.maxCreates, 7);
 });
 
 /* ============================= Part D: worker integration (real runSourceJobs) ============================= */

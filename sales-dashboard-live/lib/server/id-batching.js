@@ -5,12 +5,13 @@
 // chunk account IDs with EXACTLY the same implementation, without the resolver
 // importing the DataDoe/report module graph.
 //
-// DataDoe confirmed IN WRITING that ANY number of sellerOrVendorIds may be included in one export, and that
-// sellers from multiple marketplaces may be combined safely. The only hard limit is 5,000,000 ROWS per export
-// (a separate per-source truncation concern, enforced by each source's row cap -- NOT a seller-count limit). So
-// a source request over N accounts becomes ONE canonical export over all N sorted seller ids (the identity
-// sorts the ids, so input order never changes the request hash). [Superseded: the former 5-seller cap.]
-export const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = Number.MAX_SAFE_INTEGER; // effectively unlimited (no seller cap)
+// DataDoe accepts at most 5 seller/vendor IDs per export, so a source request over
+// N accounts becomes one export per 5-ID chunk. Chunks follow the GIVEN input order
+// (chunk boundaries depend on input order); the canonical identity sorts the IDs
+// WITHIN a chunk, so reordering IDs inside one chunk does not change its request
+// hash, but moving an ID across a chunk boundary does.
+
+export const MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT = 5;
 
 export function chunkArray(items, size) {
   const chunks = [];
@@ -20,12 +21,12 @@ export function chunkArray(items, size) {
   return chunks;
 }
 
-// The canonical account-ID chunking every source export uses: ONE chunk over all sellers (any number allowed).
+// The canonical account-ID chunking every source export uses.
 export function chunkAccountIds(sellerOrVendorIds) {
   const scope = Array.isArray(sellerOrVendorIds)
     ? sellerOrVendorIds
     : sellerOrVendorIds == null
       ? []
       : [sellerOrVendorIds];
-  return scope.length ? [scope] : [];
+  return chunkArray(scope, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
 }

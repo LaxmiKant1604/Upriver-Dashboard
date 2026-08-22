@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { assignAccountBatches, batchFamilyKey, batchSellerIds, MAX_ACCOUNTS_PER_BATCH, BATCHING_POLICY_VERSION } from "../lib/server/sync/source-batching.js";
+import { assignAccountBatches, batchFamilyKey, batchSellerIds, MAX_ACCOUNTS_PER_BATCH } from "../lib/server/sync/source-batching.js";
 import { sourceRequestIdentity } from "../lib/server/source-identity.js";
 
 let passed = 0;
@@ -39,68 +39,55 @@ const batchHash = (batch) => sourceRequestIdentity({
   ids: batchSellerIds(batch), from: WINDOW.from, to: WINDOW.to, limit: 50000, options: OLI_OPTIONS,
 }).requestHash;
 
-test("1. 30 compatible accounts (one family) => exactly ONE batch/export (any number of sellers per export)", () => {
+test("1. 30 compatible accounts => exactly SIX batch request_hashes per source/window", () => {
   const { batches } = assignAccountBatches(mkAccounts(30));
-  assert.equal(batches.length, 1, "ONE batch (no <=5 split)");
-  assert.equal(batches[0].accounts.length, 30, "the single batch covers all 30 accounts");
-  assert.equal(batches[0].batchIndex, 0, "canonical batch index 0");
-  assert.equal(new Set([batchHash(batches[0])]).size, 1, "ONE canonical request_hash over all 30 sorted sellers");
+  assert.equal(batches.length, 6, "six batches");
+  assert.ok(batches.every((b) => b.accounts.length === 5), "every batch holds exactly five accounts");
+  const hashes = batches.map(batchHash);
+  assert.equal(new Set(hashes).size, 6, "six DISTINCT canonical request_hashes (one shared export per batch)");
 });
 
-test("mandatory. 30 accounts split 15 US + 15 Non-US => exactly TWO exports: one US + one Non-US", () => {
-  // The planner separates by family (US vs Non-US) then batches each family; here each bucket is one family.
-  const us = assignAccountBatches(mkAccounts(15, "us"));
-  const nonus = assignAccountBatches(mkAccounts(15, "eu"));
-  assert.equal(us.batches.length, 1, "one US export");
-  assert.equal(nonus.batches.length, 1, "one Non-US export");
-  assert.equal(us.batches[0].accounts.length, 15);
-  assert.equal(nonus.batches[0].accounts.length, 15);
+test("2. 31 accounts => SEVEN batches, no batch larger than five", () => {
+  const { batches } = assignAccountBatches(mkAccounts(31));
+  assert.equal(batches.length, 7, "seven batches");
+  assert.ok(batches.every((b) => b.accounts.length <= MAX_ACCOUNTS_PER_BATCH), "no batch larger than five");
+  assert.deepEqual(batches.map((b) => b.accounts.length), [5, 5, 5, 5, 5, 5, 1], "fill-first: six full batches + one singleton");
+  assert.equal(new Set(batches.map(batchHash)).size, 7, "seven distinct batch hashes");
 });
 
-test("2. adding a 31st compatible account creates NO additional batch (still exactly one)", () => {
-  const a31 = assignAccountBatches(mkAccounts(31), assignAccountBatches(mkAccounts(30)).membership);
-  assert.equal(a31.batches.length, 1, "still one batch (no new batch)");
-  assert.equal(a31.batches[0].accounts.length, 31, "the one batch now covers all 31");
-  assert.ok(a31.batches.every((b) => b.accounts.length <= MAX_ACCOUNTS_PER_BATCH), "no cap (MAX is unlimited)");
+test("3. adding account 31 does NOT reshuffle any existing batch (only its batch changes); the six original hashes are unchanged", () => {
+  const first30 = mkAccounts(30);
+  const a30 = assignAccountBatches(first30);
+  const originalHashes = a30.batches.map(batchHash);
+  assert.equal(originalHashes.length, 6);
+
+  // Add the 31st account, carrying the EXISTING durable membership forward.
+  const all31 = mkAccounts(31);
+  const a31 = assignAccountBatches(all31, a30.membership);
+
+  // Every one of the original 30 accounts kept its exact batch index (no reshuffle).
+  for (const a of first30) {
+    assert.equal(a31.membership.get(a.accountId), a30.membership.get(a.accountId), `account ${a.accountId} did not move`);
+  }
+  // The new account went into its OWN new batch (index 6); batches 0..5 are byte-identical.
+  assert.equal(a31.membership.get("acct-031"), 6, "the 31st account is placed in a fresh batch");
+  const newHashes = a31.batches.map(batchHash);
+  assert.equal(newHashes.length, 7, "now seven batches");
+  assert.deepEqual(newHashes.slice(0, 6), originalHashes, "the six original batch request_hashes are UNCHANGED (no cache invalidation)");
 });
 
-test("6. adding an account changes the NEXT cycle's combined seller set + request hash; existing members keep index 0", () => {
-  const a30 = assignAccountBatches(mkAccounts(30));
-  const before = batchHash(a30.batches[0]);
-  const a31 = assignAccountBatches(mkAccounts(31), a30.membership);
-  for (const a of mkAccounts(30)) assert.equal(a31.membership.get(a.accountId), 0, "existing member stays in batch 0 (no reshuffle)");
-  assert.notEqual(batchHash(a31.batches[0]), before, "the next cycle's combined request_hash reflects the new 31-seller set");
-});
-
-test("13. newly discovered/approved accounts automatically join the SAME single batch", () => {
+test("13. newly discovered/approved accounts automatically enter a compatible batch via the SAME engine", () => {
+  // Start with a durable membership for 3 accounts (one non-full batch).
   const seed = assignAccountBatches(mkAccounts(3));
+  assert.equal(seed.batches.length, 1);
+  assert.equal(seed.batches[0].accounts.length, 3);
+
+  // Four MORE accounts are discovered later; they auto-join via the same engine with the seed membership.
   const grown = assignAccountBatches(mkAccounts(7), seed.membership);
-  assert.equal(grown.batches.length, 1, "one batch");
-  assert.equal(grown.batches[0].accounts.length, 7, "all seven join the one batch");
-  for (const a of mkAccounts(3)) assert.equal(grown.membership.get(a.accountId), 0, "seed accounts stay in batch 0");
-});
-
-test("TRANSITION. old <=5 memberships live in a VERSIONED family namespace; the new cycle plans ONE US export; historical byte-identical", () => {
-  const us30 = mkAccounts(30);
-  const dims = { organizationFingerprint: "org-a", connectionId: "primary", bucket: "us", sourceId: SOURCE_ID, columns: OLI_COLUMNS, groupBy: OLI_OPTIONS.groupBy, aggregations: OLI_OPTIONS.aggregations, orderByColumn: "date", orderByDirection: "ASC", limit: 50000, windowKind: "canonicalOliSlices", marketplaceConstraint: "" };
-  const oldKey = batchFamilyKey({ ...dims, batchingPolicyVersion: "le5-v1" }); // old <=5 policy namespace
-  const newKey = batchFamilyKey({ ...dims }); // default = BATCHING_POLICY_VERSION (unlimited)
-  assert.notEqual(newKey, oldKey, "the bumped batching-policy version yields a FRESH family namespace");
-  assert.equal(newKey, batchFamilyKey({ ...dims, batchingPolicyVersion: BATCHING_POLICY_VERSION }), "the default folds BATCHING_POLICY_VERSION");
-
-  // Durable membership store keyed by family. Pre-load the OLD <=5 policy: six batches of five for the 30 accounts.
-  const store = new Map();
-  const oldMembership = new Map();
-  us30.forEach((a, i) => oldMembership.set(a.accountId, Math.floor(i / 5))); // batch_index 0..5
-  store.set(oldKey, oldMembership);
-  const oldSnapshot = JSON.stringify([...oldMembership.entries()].sort());
-
-  // The NEW plan reads membership under the NEW family key -> nothing there -> fresh single-batch assignment.
-  const { batches } = assignAccountBatches(us30, store.get(newKey) || new Map());
-  assert.equal(batches.length, 1, "the new cycle plans EXACTLY ONE US export for all 30 accounts");
-  assert.equal(batches[0].accounts.length, 30, "the single US batch covers all 30 accounts");
-  // The historical <=5 membership is never reinterpreted or mutated.
-  assert.equal(JSON.stringify([...store.get(oldKey).entries()].sort()), oldSnapshot, "historical <=5 membership byte-identical");
+  // The first 3 keep their batch; the batch fills to 5 then a second batch starts -> [5,2], nothing reshuffled.
+  for (const a of mkAccounts(3)) assert.equal(grown.membership.get(a.accountId), seed.membership.get(a.accountId), "seed account unchanged");
+  assert.deepEqual(grown.batches.map((b) => b.accounts.length), [5, 2], "new accounts fill the non-full batch then open a second, <=5 throughout");
+  assert.ok(grown.batches.every((b) => b.accounts.length <= MAX_ACCOUNTS_PER_BATCH));
 });
 
 test("family. batchFamilyKey never mixes different organization / connection / source / columns", () => {

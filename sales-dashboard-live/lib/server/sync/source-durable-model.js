@@ -98,27 +98,6 @@ export function missingOliSlices({ coverageWindows, from, to }) {
   return { missing, covered };
 }
 
-// The contiguous MISSING sub-windows (gaps) of [from, to] NOT proven by the coverage windows -- NO fixed
-// 7-day pre-slicing. An initial backfill (no coverage) returns a SINGLE gap [from, to] -> ONE complete-window
-// export. A fully-proven window returns []. This is the normal (non-adaptive) OLI planner input; adaptive
-// date splitting into slices is a SEPARATE path invoked ONLY after a confirmed row-cap truncation or a typed
-// terminal DataDoe processing failure (never for a normal initial backfill).
-export function missingCoverageWindows(coverageWindows, from, to) {
-  if (!isDateStr(from) || !isDateStr(to) || from > to) {
-    throw new Error("missingCoverageWindows requires a valid from <= to window (fail closed).");
-  }
-  const merged = mergeCoverageWindows(coverageWindows).filter((w) => w.to >= from && w.from <= to);
-  const gaps = [];
-  let cursor = from;
-  for (const w of merged) {
-    if (w.from > cursor) gaps.push({ from: cursor, to: addDaysStr(w.from, -1) });
-    if (addDaysStr(w.to, 1) > cursor) cursor = addDaysStr(w.to, 1);
-    if (cursor > to) break;
-  }
-  if (cursor <= to) gaps.push({ from: cursor, to });
-  return gaps.filter((g) => g.from <= g.to && g.to <= to);
-}
-
 /**
  * Plan the per-slice EXPORT UNITS for one stable <=5-account batch: for every canonical slice of
  * [from, to], the batch members whose own coverage does NOT prove that slice form ONE export unit scoped to
@@ -127,43 +106,34 @@ export function missingCoverageWindows(coverageWindows, from, to) {
  *   - a newly discovered account joining the batch                => SOLO exports for ONLY its missing
  *     historical slices -- completed members are never re-exported;
  *   - fully proven slices                                          => NO unit at all.
- * `batchAccounts`: [{ accountId, rawSellerId }] (any number -- one batch per US/Non-US family; the membership
- * order is irrelevant, members are sorted per unit). `coverageByAccountId`: accountId -> proven windows.
+ * `batchAccounts`: [{ accountId, rawSellerId }] (<=5, the stable batch membership order is irrelevant --
+ * members are sorted per unit). `coverageByAccountId`: accountId -> proven windows.
  * Returns [{ slice:{from,to}, accounts:[{accountId,rawSellerId}], sellerOrVendorIds:[sorted] }].
  */
 export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, to }) {
   const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
-  if (accounts.length === 0) {
-    throw new Error("planOliSliceExports requires a non-empty stable batch (fail closed).");
-  } // no upper cap: DataDoe allows any number of sellers per export
+  if (accounts.length === 0 || accounts.length > 5) {
+    throw new Error("planOliSliceExports requires a 1..5 account stable batch (fail closed).");
+  }
   for (const a of accounts) {
     if (!a || !String(a.accountId || "").trim() || !String(a.rawSellerId || "").trim()) {
       throw new Error("planOliSliceExports: every batch account requires accountId + rawSellerId (fail closed).");
     }
   }
   const coverage = coverageByAccountId || {};
-  // COMPLETE-WINDOW planning (Blocker A): plan ONE export per contiguous MISSING window, grouping accounts that
-  // share the EXACT same missing-window set. There is NO fixed 7-day pre-slicing: a normal initial 420-day
-  // backfill with no coverage yields ONE unit over [from, to] per bucket (-> one US + one Non-US export = 4
-  // tokens). A fully-covered account contributes no unit; completed historical coverage is never re-exported.
-  const groups = new Map(); // JSON(missing windows) -> { windows, accounts }
-  for (const a of accounts) {
-    const missing = missingCoverageWindows(coverage[a.accountId] || [], from, to);
-    if (!missing.length) continue; // fully proven -- never exported again
-    const sig = JSON.stringify(missing);
-    if (!groups.has(sig)) groups.set(sig, { windows: missing, accounts: [] });
-    groups.get(sig).accounts.push(a);
-  }
   const units = [];
-  for (const { windows, accounts: grp } of groups.values()) {
-    const sorted = [...grp].sort((x, y) => (x.rawSellerId < y.rawSellerId ? -1 : 1));
-    for (const w of windows) {
-      units.push({
-        slice: { from: w.from, to: w.to }, // a COMPLETE missing window (not a fixed 7-day slice)
-        accounts: sorted,
-        sellerOrVendorIds: sorted.map((a) => String(a.rawSellerId)),
-      });
-    }
+  for (const slice of canonicalOliSlices(from, to)) {
+    const missingMembers = accounts.filter((a) => {
+      const windows = coverage[a.accountId] || [];
+      return !windowsProve(windows, slice.from, slice.to);
+    });
+    if (!missingMembers.length) continue; // completed historical coverage is never exported again
+    const sorted = [...missingMembers].sort((x, y) => (x.rawSellerId < y.rawSellerId ? -1 : 1));
+    units.push({
+      slice,
+      accounts: sorted,
+      sellerOrVendorIds: sorted.map((a) => String(a.rawSellerId)),
+    });
   }
   return units;
 }
@@ -175,42 +145,17 @@ export function coverageWindowsFromSlices(slices) {
 
 /**
  * Map ONE downloaded canonical OLI fragment (the shared batch payload) onto durable history rows at the
- * canonical grain. Row attribution is by seller_or_vendor_id against the batch's AUTHORITATIVE account
- * records. Supply EITHER the exact-tuple `accounts: [{ rawSellerId, accountId, ... }]` list (preferred) OR
- * the legacy `accountsBySellerId` map ({ rawSellerId -> { accountId } }).
- *
- * EXACT-TUPLE ISOLATION (isolation correction): the OLI contract is marketplace-BLIND (no
- * marketplace_country_code column), so a rawSellerId that maps to MORE THAN ONE account in the batch (e.g. a
- * single European seller id operating across GB/DE/FR marketplace accounts) cannot be split per account and
- * REJECTS the whole payload (AMBIGUOUS_ACCOUNT_EVIDENCE) rather than silently attributing every row to one
- * account. Seller-only attribution is allowed ONLY when the rawSellerId maps to exactly one account. An
- * unknown/blank seller REJECTS the whole payload (fail closed -- mirrors validateBatchSourcePayload).
- * currency must be a canonical AAA code; sku/child_asin may be blank (kept as '' grain components). Two
- * fragment rows on the same grain SUM (partial aggregates of one grain cell); the durable upsert then
- * REPLACES the whole matching row, so re-exported corrected slices never duplicate.
+ * canonical grain. Row attribution is by seller_or_vendor_id against the AUTHORITATIVE accountsBySellerId
+ * map ({ rawSellerId -> { accountId } }); an unknown/blank seller REJECTS the whole payload (fail closed --
+ * mirrors validateBatchSourcePayload). currency must be a canonical AAA code; sku/child_asin may be blank
+ * (kept as '' grain components). Two fragment rows on the same grain SUM (they are partial aggregates of
+ * one grain cell); the durable upsert then REPLACES the whole matching row, so re-exported corrected slices
+ * never duplicate.
  */
-export function oliHistoryRowsFromFragment({ rows, accounts = null, accountsBySellerId = null, organizationFingerprint, connectionId, sourceRequestHash }) {
+export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint, connectionId, sourceRequestHash }) {
   if (!Array.isArray(rows)) throw new Error("oliHistoryRowsFromFragment requires an array payload (fail closed).");
   if (!organizationFingerprint || !connectionId || !sourceRequestHash) {
     throw new Error("oliHistoryRowsFromFragment requires organizationFingerprint + connectionId + sourceRequestHash (fail closed).");
-  }
-  // Build the authoritative rawSellerId -> Set(accountId) map. `accounts` (the batch's exact records) is the
-  // canonical source of truth and preserves multiplicity so a seller shared across marketplace accounts is
-  // detected as AMBIGUOUS; the legacy `accountsBySellerId` map is a pre-resolved single-account fallback.
-  const sellerAccounts = new Map();
-  if (Array.isArray(accounts)) {
-    for (const a of accounts) {
-      const sid = String((a && a.rawSellerId) ?? "").trim();
-      const aid = String((a && a.accountId) ?? "").trim();
-      if (!sid || !aid) throw new Error("oliHistoryRowsFromFragment: a batch account record is missing rawSellerId/accountId (fail closed).");
-      if (!sellerAccounts.has(sid)) sellerAccounts.set(sid, new Set());
-      sellerAccounts.get(sid).add(aid);
-    }
-  } else if (accountsBySellerId) {
-    for (const [sid, v] of Object.entries(accountsBySellerId)) {
-      const aid = String((v && v.accountId) ?? "").trim();
-      if (aid) { if (!sellerAccounts.has(sid)) sellerAccounts.set(sid, new Set()); sellerAccounts.get(sid).add(aid); }
-    }
   }
   const byGrain = new Map();
   for (const row of rows) {
@@ -221,16 +166,10 @@ export function oliHistoryRowsFromFragment({ rows, accounts = null, accountsBySe
     const nonEmpty = values.some((v) => v != null && String(v).trim() !== "");
     if (!nonEmpty) continue; // an all-blank row carries nothing
     const seller = String(row.seller_or_vendor_id ?? "").trim();
-    const accts = seller ? sellerAccounts.get(seller) : null;
-    if (!seller || !accts || accts.size === 0) {
+    const account = accountsBySellerId ? accountsBySellerId[seller] : null;
+    if (!seller || !account || !String(account.accountId || "").trim()) {
       throw new Error("oliHistoryRowsFromFragment: a row's seller_or_vendor_id is blank/unknown to the batch; rejecting the whole payload (fail closed).");
     }
-    if (accts.size > 1) {
-      const e = new Error("oliHistoryRowsFromFragment: a rawSellerId maps to multiple marketplace accounts but the marketplace-blind OLI payload cannot disambiguate; rejecting the whole payload (fail closed).");
-      e.code = "AMBIGUOUS_ACCOUNT_EVIDENCE";
-      throw e;
-    }
-    const account = { accountId: [...accts][0] };
     const date = String(row.date ?? "").trim();
     if (!isDateStr(date)) {
       throw new Error("oliHistoryRowsFromFragment: a row carries no valid date; rejecting the whole payload (fail closed).");

@@ -185,7 +185,7 @@ function makeDataDoe(opts = {}) {
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
       bump(create, job.requestHash);
-      createSeq.push({ sourceKey: job.sourceKey || "", requestKey: job.requestKey || "", ids: [...(job.fetchParams.sellerOrVendorIds || [])], from: job.fetchParams.from ?? null, to: job.fetchParams.to ?? null });
+      createSeq.push({ sourceKey: job.sourceKey || "", requestKey: job.requestKey || "", ids: [...(job.fetchParams.sellerOrVendorIds || [])] });
       return { exportId: "e_" + job.requestHash };
     },
     async poll() {},
@@ -280,7 +280,7 @@ test("A2. the durable catalog is a NEW versioned ORG-WIDE request (sku fetched; 
 /* ================================= B. stable batching ================================= */
 group("B. stable batching + coverage-driven exports");
 
-test("B1. any number of accounts => ONE stable batch; the 31st joins it with NOTHING reshuffled", () => {
+test("B1. 30 accounts => 6 stable batches; the 31st joins a 7th with NOTHING reshuffled", () => {
   const thirty = Array.from({ length: 30 }, (_, i) => acct(i + 1));
   const p30 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: thirty,
@@ -288,7 +288,7 @@ test("B1. any number of accounts => ONE stable batch; the 31st joins it with NOT
     asOf: ASOF, today: TODAY, catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
     fbaSnapshotsByAccount: Object.fromEntries(thirty.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])),
   });
-  assert.equal(p30.batches.length, 1, "30 accounts => ONE unlimited batch (any number of sellers per export)");
+  assert.equal(p30.batches.length, 6, "30 accounts => six stable <=5-account batches");
   const thirtyOne = [...thirty, acct(31)];
   const p31 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: thirtyOne,
@@ -297,25 +297,24 @@ test("B1. any number of accounts => ONE stable batch; the 31st joins it with NOT
     asOf: ASOF, today: TODAY, catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
     fbaSnapshotsByAccount: Object.fromEntries(thirtyOne.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])),
   });
-  assert.equal(p31.batches.length, 1, "31 accounts => still ONE batch (the 31st joins it; no new batch)");
+  assert.equal(p31.batches.length, 7, "31 accounts => seven batches");
   for (const a of thirty) {
     assert.equal(p31.membership.get(a.accountId), p30.membership.get(a.accountId), a.accountId + " kept its batch (no reshuffle)");
   }
-  assert.ok([...p30.membership.values()].every((idx) => idx === 0), "all 30 accounts share the single batch index 0");
 });
 
-test("B2. steady state exports the missing rolling window as ONE batch export; covered history is never re-exported", async () => {
+test("B2. steady state exports ONLY the rolling slices as batch exports; covered history is never re-exported", async () => {
   const h = runHarness({ catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: Object.fromEntries(FIVE.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])) });
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.globalDrained, true);
+  const refresh = model.oliRollingRefreshWindow(ASOF);
+  const rollingSlices = dates.canonicalOliSlices(refresh.from, refresh.to);
   const oliCreates = h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items");
-  // The complete-window planner emits ONE export over the single contiguous missing window (no fixed 7-day
-  // slicing); all five accounts share the same missing window, so it is ONE batch over the full 5-account scope.
-  assert.equal(oliCreates.length, 1, "ONE complete-window batch export over the missing rolling window (no per-slice fan-out)");
-  assert.deepEqual(oliCreates[0].ids, FIVE.map((a) => a.rawSellerId), "the full 5-account batch scope");
-  // Covered history is never re-exported: the export begins AFTER the already-covered region (to ASOF-7).
-  assert.ok(oliCreates[0].from > dates.addDaysStr(ASOF, -7), "the export starts past the covered window -- proven history is not re-fetched: " + oliCreates[0].from);
+  assert.equal(oliCreates.length, rollingSlices.length, "exactly one batch export per rolling slice");
+  for (const c of oliCreates) {
+    assert.deepEqual(c.ids, FIVE.map((a) => a.rawSellerId), "the full 5-account batch scope on every rolling slice");
+  }
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog").length, 0, "fresh catalog => no export today");
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "fresh FBA snapshots => no export today");
 });
@@ -343,25 +342,21 @@ test("B4. a NEW account in a non-full batch backfills SOLO; completed members ne
   });
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  const refresh = model.oliRollingRefreshWindow(ASOF);
   const oliCreates = h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items");
-  // The complete-window planner groups accounts by their EXACT missing window: the four covered accounts share
-  // one rolling-window export; the newly discovered A05 (no coverage) is its own FULL-backfill export. Two
-  // distinct missing-window groups => exactly two batch exports (never a per-slice fan-out, never a re-export of
-  // the four completed members' history).
-  assert.equal(oliCreates.length, 2, "two missing-window groups => two batch exports");
-  const solo = oliCreates.find((c) => c.ids.length === 1);
-  const grouped = oliCreates.find((c) => c.ids.length === 4);
-  assert.ok(solo && grouped, "one solo new-account export + one four-account rolling export");
-  assert.deepEqual(solo.ids, ["S05"], "ONLY the new account gets the full missing backfill");
-  assert.deepEqual(grouped.ids, ["S01", "S02", "S03", "S04"], "the four covered accounts share ONE rolling-window export");
-  // The new account backfills from further back than the covered members' rolling window (history not re-fetched).
-  assert.ok(solo.from < grouped.from, "A05 backfills from further back; completed members only refresh the rolling window");
+  const solo = oliCreates.filter((c) => c.ids.length === 1);
+  const full = oliCreates.filter((c) => c.ids.length === 5);
+  assert.ok(solo.length > 0, "historical backfill slices exist");
+  for (const c of solo) assert.deepEqual(c.ids, ["S05"], "ONLY the new account's missing backfill is processed");
+  const rollingSlices = dates.canonicalOliSlices(refresh.from, refresh.to);
+  assert.equal(full.length, rollingSlices.length, "the rolling slices still run as full-batch exports");
+  assert.equal(oliCreates.length, solo.length + full.length, "no other export shape exists (completed members untouched)");
 });
 
 /* ================================= C. catalog + FBA ================================= */
-group("C. catalog once-daily per organization; FBA per account (flat 2-token ceiling)");
+group("C. catalog once-daily per organization; FBA per account (premium ceiling)");
 
-test("C1. a stale catalog refreshes ONCE org-wide; FBA refreshes per account at the FLAT 2-token frozen ceiling", async () => {
+test("C1. a stale catalog refreshes ONCE org-wide; FBA refreshes per account with a PREMIUM (5-token) frozen ceiling", async () => {
   const h = runHarness({}); // no catalog snapshot, no fba snapshots => both refresh
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
@@ -372,9 +367,9 @@ test("C1. a stale catalog refreshes ONCE org-wide; FBA refreshes per account at 
   assert.equal(fbaCreates.length, 5, "one FBA snapshot per account");
   const fbaBudget = h.store._budget(rollup.cycleId, "source-sync:fba-inventory-health");
   assert.ok(fbaBudget, "FBA family froze its ceiling");
-  assert.equal(fbaBudget.spentTokens, 5 * 2, "flat 2 tokens per create (the premium 5-token tier is superseded)");
+  assert.equal(fbaBudget.spentTokens, 5 * 5, "FBA is PREMIUM: 5 tokens per create");
   const oliBudget = h.store._budget(rollup.cycleId, "source-sync:order-line-items");
-  assert.equal(oliBudget.spentTokens, oliBudget.spentCreates * 2, "OLI likewise 2 tokens per create (flat)");
+  assert.equal(oliBudget.spentTokens, oliBudget.spentCreates * 2, "OLI is standard: 2 tokens per create");
   assert.ok(rollup.snapshots.recorded.includes("product-catalog"), "the validated catalog snapshot was recorded");
   assert.equal(rollup.snapshots.recorded.filter((s) => s.startsWith("fba-inventory-health:")).length, 5, "five per-account FBA snapshots recorded");
 });

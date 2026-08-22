@@ -458,11 +458,9 @@ export async function runBucketSourceSync({
           rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: OLI_SOURCE_KEY, requestHash: unit.requestHash });
           break;
         }
-        // Pass the batch's EXACT account records (not a collapsed seller->account map) so a rawSellerId shared
-        // by two marketplace accounts is detected as AMBIGUOUS_ACCOUNT_EVIDENCE and fails closed, never
-        // silently attributed to whichever account happened to win a map collision (exact-tuple isolation).
+        const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId }]));
         const historyRows = oliHistoryRowsFromFragment({
-          rows: payload.rows, accounts: unit.accounts,
+          rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
         });

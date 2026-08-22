@@ -187,8 +187,8 @@ export function bindPrimaryBucketAccounts(activeAccounts, bucket) {
 
 // Finding 6: validate EVERY loaded durable membership row before accepting it -- canonical nonblank
 // primary account (never a prefixed id), the exact primary connection, THIS organization's fingerprint, an
-// integer batch index >= 0, and no duplicate account. [Superseded: the <=5-per-batch invariant -- one batch per
-// US/Non-US family now holds any number of accounts.] ANY violation is a typed fail-closed refusal.
+// integer batch index >= 0, no duplicate account, and the <=5-per-batch invariant. ANY violation is a typed
+// fail-closed refusal (corrupt durable state must never seed a plan).
 export function validateBatchMembershipRows(rows, { orgFingerprint }) {
   const membership = new Map();
   const perIndex = new Map();
@@ -219,7 +219,8 @@ export function validateBatchMembershipRows(rows, { orgFingerprint }) {
     if (!Number.isInteger(idx) || idx < 0) bad("batch_index is not a non-negative integer");
     if (membership.has(accountId)) bad("duplicate account membership");
     membership.set(accountId, idx);
-    perIndex.set(idx, (perIndex.get(idx) || 0) + 1); // no per-batch cap (any number of sellers per export)
+    perIndex.set(idx, (perIndex.get(idx) || 0) + 1);
+    if (perIndex.get(idx) > 5) bad("a batch exceeds the five-account maximum");
   }
   return membership;
 }
