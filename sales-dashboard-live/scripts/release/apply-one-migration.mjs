@@ -24,15 +24,16 @@ const baselineStage0Path = path.join(here, ".release-baseline.json");
 const baselineStage3Path = path.join(here, ".release-baseline-stage3.json");
 const baselineStage4Path = path.join(here, ".release-baseline-stage4.json");
 const baselineStage6Path = path.join(here, ".release-baseline-stage6.json");
+const baselineStage7Path = path.join(here, ".release-baseline-stage7.json");
 
 const args = process.argv.slice(2);
 if (args.length !== 1) { console.error("STOP usage: node scripts/release/apply-one-migration.mjs <one-frozen-filename.sql>"); process.exit(2); }
 const FILENAME = args[0];
 if (!NEW6.includes(FILENAME) || path.basename(FILENAME) !== FILENAME) { console.error(`STOP ${FILENAME} is not one of the frozen migrations`); process.exit(1); }
-// Baseline by stage (matches runApply's internal dispatch): migration 7 -> STAGE-6 re-anchor; migrations 5-6 ->
-// STAGE-4 re-anchor; migration 4 -> STAGE-3 re-anchor; migrations 1-3 -> stage-0.
+// Baseline by stage (matches runApply's internal dispatch): migration 8 -> STAGE-7 re-anchor; migration 7 ->
+// STAGE-6 re-anchor; migrations 5-6 -> STAGE-4 re-anchor; migration 4 -> STAGE-3 re-anchor; migrations 1-3 -> stage-0.
 const stageIdx = NEW6.indexOf(FILENAME);
-const baselinePath = stageIdx >= 6 ? baselineStage6Path : stageIdx >= 4 ? baselineStage4Path : stageIdx === 3 ? baselineStage3Path : baselineStage0Path;
+const baselinePath = stageIdx >= 7 ? baselineStage7Path : stageIdx >= 6 ? baselineStage6Path : stageIdx >= 4 ? baselineStage4Path : stageIdx === 3 ? baselineStage3Path : baselineStage0Path;
 
 const env = parseEnv(readFileSync(envPath, "utf8"));
 const sqlText = readFileSync(path.join(migDir, FILENAME), "utf8");
@@ -42,7 +43,7 @@ const currentFingerprint = manifestFingerprint(here);
 const envRef = envProjectRef(env);
 let baselineText;
 try { baselineText = readFileSync(baselinePath, "utf8"); }
-catch { console.error(`STOP baseline missing (${path.basename(baselinePath)}) — run ${stageIdx >= 6 ? "`node scripts/release/re-anchor-stage6.mjs`" : stageIdx >= 4 ? "`node scripts/release/re-anchor-stage4.mjs`" : stageIdx === 3 ? "`node scripts/release/re-anchor-stage3.mjs`" : "`node scripts/release/ro-prod-check.mjs 0`"} first`); process.exit(1); }
+catch { console.error(`STOP baseline missing (${path.basename(baselinePath)}) — run ${stageIdx >= 7 ? "`node scripts/release/re-anchor-stage7.mjs`" : stageIdx >= 6 ? "`node scripts/release/re-anchor-stage6.mjs`" : stageIdx >= 4 ? "`node scripts/release/re-anchor-stage4.mjs`" : stageIdx === 3 ? "`node scripts/release/re-anchor-stage3.mjs`" : "`node scripts/release/ro-prod-check.mjs 0`"} first`); process.exit(1); }
 
 const result = await runApply({
   filename: FILENAME, sqlText, actualSha, env, currentHead, currentFingerprint, envRef, baselineText,

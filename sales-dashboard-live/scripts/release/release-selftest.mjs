@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   validateIdentity, verifyTable, verifyFunction, verifyTriggers, verifyTableAcl, verifyPolicies, verifyIndexes,
-  verifyMigrationPresent, verifyMigrationAbsent, bodyCanon, ALTER_ADDED_CONSTRAINTS, cumulativeAlterConstraints,
+  verifyMigrationPresent, verifyMigrationAbsent, bodyCanon, ALTER_ADDED_CONSTRAINTS, cumulativeAlterConstraints, cumulativeDroppedConstraints,
   APPROVED_IDENTITY, APPROVED_INVARIANTS, PROTECTED_DIGESTS, PROTECTED_DIGEST_KEYS, MIGRATIONS, NEW6,
 } from "./release-manifest.mjs";
 import {
@@ -16,6 +16,7 @@ import {
   buildStage3Baseline, validateStage3Baseline, shouldCreateStage3Baseline,
   buildStage4Baseline, validateStage4Baseline, shouldCreateStage4Baseline,
   buildStage6Baseline, validateStage6Baseline, shouldCreateStage6Baseline,
+  buildStage7Baseline, validateStage7Baseline, shouldCreateStage7Baseline,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -141,8 +142,16 @@ test("cumulative: stages 2-3 do NOT require account_canonical (premature); stage
   // Migration 7 (20260823) ADDs the flat-2 token_cost constraint to migration-3's source_tranche_budget_hash:
   // due only at stage >= 7, so migration 3's recorded catalog is not weakened at stages <= 6.
   assert.deepEqual(cumulativeAlterConstraints(7), { source_batch_membership: ["source_batch_membership_account_canonical"], source_tranche_budget_hash: ["source_tranche_budget_hash_cost_flat2"] });
+  // Migration 8 (20260824) DROPS the flat-2 constraint: at stage 8 it is REMOVED from the cumulative set again
+  // (account_canonical stays). This proves the drop-aware modeling matches the forward correction.
+  assert.deepEqual(cumulativeAlterConstraints(8), { source_batch_membership: ["source_batch_membership_account_canonical"] });
 });
 test("cumulative: ALTER_ADDED_CONSTRAINTS maps flat2 -> migration 20260823 / source_tranche_budget_hash", () => { const e = ALTER_ADDED_CONSTRAINTS.find((c) => c.name === "source_tranche_budget_hash_cost_flat2"); assert.ok(e); assert.equal(e.table, "source_tranche_budget_hash"); assert.equal(e.ownerIndex, NEW6.indexOf("20260823_source_batch_flat_token.sql")); });
+test("cumulative: flat2 is DROPPED by migration 20260824; cumulativeDroppedConstraints excludes it only from stage 8", () => {
+  const d = cumulativeDroppedConstraints(8).find((x) => x.name === "source_tranche_budget_hash_cost_flat2");
+  assert.ok(d && d.table === "source_tranche_budget_hash", "flat2 is a dropped constraint at stage 8");
+  assert.equal(cumulativeDroppedConstraints(7).length, 0, "nothing dropped yet at stage 7");
+});
 // Migration-6 sync_report_jobs add-columns are modeled cumulatively (absent before stage 6; exact at stage 6).
 const M6mig = MIGRATIONS.find((m) => m.file === "20260822_report_derive_lease.sql");
 test("m6 columns: verifyMigrationAbsent PASSES when the derive-lease columns are absent (pre stage 6)", async () => {
@@ -358,6 +367,28 @@ test("stage6: shouldCreate requires zero problems AND a clean rollback", () => {
 test("stage6 applier: migration 7 (stageIdx 6) + VALID stage-6 baseline constructs the client", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
 test("stage6 applier: migration 7 REJECTS the stage-4 baseline (anchor 4) -> zero connect", async () => { let made = 0; const b = buildStage4Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 test("stage6 applier: migration 6 (stageIdx 5) REJECTS the stage-6 baseline (anchor 6) -> zero connect", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[5], sqlText: "X", actualSha: MIGRATIONS[5].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+
+// ---------- DEDICATED stage-7 re-anchor baseline (governs ONLY migration 8, stageIdx 7) ------------------
+const s7 = buildStage7Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
+const vs7 = (b, over = {}) => validateStage7Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
+test("stage7: build binds anchorStage=7, all migration hashes, manifest-pinned digests", () => { assert.equal(s7.anchorStage, 7); assert.equal(Object.keys(s7.migrationHashes).length, NEW6.length); assert.deepEqual(Object.keys(s7.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage7: valid passes for migration 8 (stageIdx>=7) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs7(s7, { stageIdx: 7 }), []); assert.deepEqual(vs7(s7), []); });
+test("stage7: anchorStage != exactly 7 fails", () => { const b = clone(s7); b.anchorStage = 6; assert.ok(vs7(b).length); b.anchorStage = 8; assert.ok(vs7(b).length); });
+test("stage7: use for a migration below the anchor (stageIdx<7) fails", () => { assert.ok(vs7(s7, { stageIdx: 6 }).length); assert.ok(vs7(s7, { stageIdx: 0 }).length); });
+test("stage7: wrong HEAD / stale fingerprint / env switch fail", () => { assert.ok(vs7(s7, { currentHead: "b".repeat(40) }).length); assert.ok(vs7(s7, { currentFingerprint: "x" }).length); assert.ok(vs7(s7, { envRef: "otherproject" }).length); });
+test("stage7: EDIT a digest hash / count fails; ADD/REMOVE a digest key fails; hash drift fails", () => {
+  let b = clone(s7); b.protectedDigest.approvals.h = "tampered"; assert.ok(vs7(b, { stageIdx: 7 }).length);
+  b = clone(s7); b.protectedDigest.settings.c = 999; assert.ok(vs7(b, { stageIdx: 7 }).length);
+  b = clone(s7); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vs7(b, { stageIdx: 7 }).length);
+  b = clone(s7); delete b.protectedDigest.report_jobs; assert.ok(vs7(b, { stageIdx: 7 }).length);
+  b = clone(s7); b.migrationHashes[NEW6[0]] = "deadbeef"; assert.ok(vs7(b, { stageIdx: 7 }).length);
+});
+test("stage7: real manifest pins reject a foreign-pins stage-7 baseline", () => { assert.ok(validateStage7Baseline(s7, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, stageIdx: 7 }).length); });
+test("stage7: shouldCreate requires zero problems AND a clean rollback", () => { assert.equal(shouldCreateStage7Baseline({ problemCount: 0, rolledBack: true }), true); assert.equal(shouldCreateStage7Baseline({ problemCount: 1, rolledBack: true }), false); assert.equal(shouldCreateStage7Baseline({ problemCount: 0, rolledBack: false }), false); });
+// applier: the stage-7 baseline governs ONLY migration 8 (stageIdx 7).
+test("stage7 applier: migration 8 (stageIdx 7) + VALID stage-7 baseline constructs the client", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
+test("stage7 applier: migration 8 REJECTS the stage-6 baseline (anchor 6) -> zero connect", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+test("stage7 applier: migration 7 (stageIdx 6) REJECTS the stage-7 baseline (anchor 7) -> zero connect", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {

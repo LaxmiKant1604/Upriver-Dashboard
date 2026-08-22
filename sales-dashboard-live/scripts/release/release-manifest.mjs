@@ -212,6 +212,20 @@ export const MIGRATIONS = [
     ],
     alters: [{ table: "source_tranche_budget_hash", addColumns: [], addConstraints: [CK("source_tranche_budget_hash_cost_flat2", "token_cost=2")] }],
   },
+  {
+    // FORWARD CORRECTION of 20260823. DataDoe hard-caps sellerOrVendorIds at 5/export and prices standard=2/
+    // premium=5 (both empirically confirmed 2026-08-22); the unlimited-batch/flat-2 model was false. This
+    // migration DROPS the flat-2 token constraint (the permissive (2,5) constraint from 20260818 remains) and
+    // restores the <=5 multi-batch assign RPC (20260817 body) + the variable-cost persist RPC (20260818 body).
+    // Both functions predate 20260823 (createdNew:false); function BODIES are proven by schema-contract, the
+    // manifest proves signatures/ACL + that the flat-2 constraint is DROPPED (a later ALTER-removed constraint).
+    file: "20260824_revert_flat_token_batch.sql", sha: "da17dd1ff7e586b90a0467b33f5f374e93669e6f233f2c55721349ddf68e03ef", adv: [20260824, 1], tables: [],
+    functions: [
+      { sig: "public.assign_source_account_batch(text, text, text, text, integer)", ret: "integer", secdef: true, searchPath: "public", acl: FN_SR, createdNew: false },
+      { sig: "public.persist_source_tranche_budget(uuid, text, text, integer, integer, jsonb)", ret: "text", secdef: true, searchPath: "public", acl: FN_SR, createdNew: false },
+    ],
+    alters: [{ table: "source_tranche_budget_hash", addColumns: [], addConstraints: [], dropConstraints: ["source_tranche_budget_hash_cost_flat2"] }],
+  },
 ];
 
 export const NEW6 = MIGRATIONS.map((m) => m.file);
@@ -225,10 +239,26 @@ export const NEW6 = MIGRATIONS.map((m) => m.file);
 export const ALTER_ADDED_CONSTRAINTS = Object.freeze(
   MIGRATIONS.flatMap((mig, i) => (mig.alters || []).flatMap((alt) => (alt.addConstraints || []).map(([name]) => Object.freeze({ table: alt.table, name, ownerIndex: i })))),
 );
-// The exact extra-constraint names per table that MUST be present at `stage` (i.e. the owning migration applied).
+// A LATER migration may DROP an ALTER-added constraint (here: 20260824 drops source_tranche_budget_hash_cost_flat2
+// that 20260823 added). Such a constraint is present ONLY for stages in [ownerIndex+1 .. dropIndex]; once the
+// dropping migration is applied (dropIndex < stage) it must be ABSENT again.
+export const ALTER_DROPPED_CONSTRAINTS = Object.freeze(
+  MIGRATIONS.flatMap((mig, i) => (mig.alters || []).flatMap((alt) => (alt.dropConstraints || []).map((name) => Object.freeze({ table: alt.table, name, dropIndex: i })))),
+);
+// The set of (table, constraint) an APPLIED prefix through `stage` has DROPPED (dropIndex < stage).
+export function cumulativeDroppedConstraints(stage) {
+  return ALTER_DROPPED_CONSTRAINTS.filter((d) => d.dropIndex < stage).map((d) => ({ table: d.table, name: d.name }));
+}
+// The exact extra-constraint names per table that MUST be present at `stage` (owning migration applied AND not
+// yet dropped by a later applied migration).
 export function cumulativeAlterConstraints(stage) {
   const byTable = {};
-  for (const c of ALTER_ADDED_CONSTRAINTS) if (c.ownerIndex < stage) (byTable[c.table] = byTable[c.table] || []).push(c.name);
+  const dropped = cumulativeDroppedConstraints(stage);
+  for (const c of ALTER_ADDED_CONSTRAINTS) {
+    if (c.ownerIndex >= stage) continue;
+    if (dropped.some((d) => d.table === c.table && d.name === c.name)) continue;
+    (byTable[c.table] = byTable[c.table] || []).push(c.name);
+  }
   return byTable;
 }
 // Pre-existing tables ALTERED by these migrations (blocker 3): digest a projection EXCLUDING the added columns.
@@ -400,8 +430,9 @@ async function verifySeed(q, table, seed) {
   return P;
 }
 
-export async function verifyMigrationPresent(q, mig, extraConstraintsByTable = {}) {
+export async function verifyMigrationPresent(q, mig, extraConstraintsByTable = {}, droppedConstraints = []) {
   const P = [];
+  const isDropped = (table, name) => droppedConstraints.some((d) => d.table === table && d.name === name);
   for (const t of mig.tables) P.push(...await verifyTable(q, t, extraConstraintsByTable[t.name] || []));
   for (const fn of mig.functions) P.push(...await verifyFunction(q, fn));
   for (const alt of mig.alters || []) {
@@ -414,10 +445,16 @@ export async function verifyMigrationPresent(q, mig, extraConstraintsByTable = {
       else if (c && canonTight(c.def) !== canonTight(def)) P.push(`${alt.table}.${name} default ${c.def} != ${def}`);
     }
     for (const [cname, kind, spec] of alt.addConstraints || []) {
+      // A constraint this migration added but a LATER applied migration DROPPED is legitimately absent now.
+      if (isDropped(alt.table, cname)) continue;
       const c = await one(q, "select contype, pg_get_constraintdef(oid) def from pg_constraint where conrelid=$1::regclass and conname=$2", [`public.${alt.table}`, cname]);
       if (!c) { P.push(`${alt.table} constraint ${cname} absent`); continue; }
       if (c.contype !== kind) P.push(`${alt.table} constraint ${cname} kind ${c.contype} != ${kind}`);
       checkConstraint(P, alt.table, cname, kind, c.def, spec);
+    }
+    // A DROPPING migration, once applied, must have REMOVED the named constraint.
+    for (const cname of alt.dropConstraints || []) {
+      if (await constraintExists(q, alt.table, cname)) P.push(`${alt.table} constraint ${cname} still present but ${mig.file} should have DROPPED it`);
     }
   }
   return P;
@@ -430,6 +467,8 @@ export async function verifyMigrationAbsent(q, mig) {
   for (const alt of mig.alters || []) {
     for (const [name] of alt.addColumns || []) if (await columnExists(q, alt.table, name)) P.push(`${alt.table}.${name} present but ${mig.file} unapplied`);
     for (const [cname] of alt.addConstraints || []) if (await constraintExists(q, alt.table, cname)) P.push(`${alt.table} constraint ${cname} present but ${mig.file} unapplied`);
+    // A DROPPING migration is unapplied => the constraint it will drop must STILL be present.
+    for (const cname of alt.dropConstraints || []) if (!(await constraintExists(q, alt.table, cname))) P.push(`${alt.table} constraint ${cname} already dropped but ${mig.file} unapplied`);
   }
   return P;
 }

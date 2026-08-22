@@ -1,5 +1,5 @@
 // THROWAWAY STAGE-AWARE read-only production check (Scheduler-v2 release).
-// Usage:  node scripts/release/ro-prod-check.mjs <stage 0..7>   (run from sales-dashboard-live/)
+// Usage:  node scripts/release/ro-prod-check.mjs <stage 0..8>   (run from sales-dashboard-live/)
 // Validates the PINNED approved identity before connecting; reads under BEGIN ISOLATION LEVEL REPEATABLE READ
 // READ ONLY (snapshot-consistent); verifies the exact ledger prefix, the exact catalog for the applied prefix,
 // the approved control invariants, and the protected customer-data digest. Stage 0 creates the manifest-pinned baseline
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { validateIdentity } from "./release-manifest.mjs";
 import { APPROVED_INVARIANTS } from "./release-manifest.mjs";
-import { verifyLedgerForStage, verifyStageObjects, verifyApprovedInvariants, captureProtectedDigest, compareProtectedDigest, requirePinnedStage0Digest, beginReadOnlySnapshot, buildBaseline, validateBaseline, validateStage3Baseline, validateStage4Baseline, validateStage6Baseline, shouldCreateBaseline } from "./release-state.mjs";
+import { verifyLedgerForStage, verifyStageObjects, verifyApprovedInvariants, captureProtectedDigest, compareProtectedDigest, requirePinnedStage0Digest, beginReadOnlySnapshot, buildBaseline, validateBaseline, validateStage3Baseline, validateStage4Baseline, validateStage6Baseline, validateStage7Baseline, shouldCreateBaseline } from "./release-state.mjs";
 import { parseEnv, readGitHead, manifestFingerprint, envProjectRef } from "./release-fs.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -22,9 +22,10 @@ const baselineStage0Path = path.join(here, ".release-baseline.json");
 const baselineStage3Path = path.join(here, ".release-baseline-stage3.json");
 const baselineStage4Path = path.join(here, ".release-baseline-stage4.json");
 const baselineStage6Path = path.join(here, ".release-baseline-stage6.json");
+const baselineStage7Path = path.join(here, ".release-baseline-stage7.json");
 
 const args = process.argv.slice(2);
-if (args.length !== 1 || !/^[0-7]$/.test(args[0])) { console.error("STOP usage: node scripts/release/ro-prod-check.mjs <stage 0..7>"); process.exit(2); }
+if (args.length !== 1 || !/^[0-8]$/.test(args[0])) { console.error("STOP usage: node scripts/release/ro-prod-check.mjs <stage 0..8>"); process.exit(2); }
 const STAGE = Number(args[0]);
 
 const env = parseEnv(readFileSync(envPath, "utf8"));
@@ -54,8 +55,16 @@ try {
   if (STAGE === 0) {
     // Blocker 2: the observed customer-data digest MUST equal the pinned manifest value before a baseline exists.
     problems.push(...requirePinnedStage0Digest(digest));
-  } else if (STAGE >= 6) {
-    // Stages 6-7 are governed by the reviewed STAGE-6 re-anchor baseline (forward-only recovery for migration 7).
+  } else if (STAGE >= 7) {
+    // Stages 7-8 are governed by the reviewed STAGE-7 re-anchor baseline (forward-only recovery for migration 8).
+    let baseline = null;
+    try { baseline = JSON.parse(readFileSync(baselineStage7Path, "utf8")); } catch { problems.push("stage-7 baseline file missing/malformed (run `node scripts/release/re-anchor-stage7.mjs` first)"); }
+    if (baseline) {
+      problems.push(...validateStage7Baseline(baseline, { currentHead, currentFingerprint, envRef }));
+      problems.push(...compareProtectedDigest(baseline.protectedDigest, digest));
+    }
+  } else if (STAGE === 6) {
+    // Stage 6 remains governed by the STAGE-6 re-anchor baseline (forward-only recovery for migration 7).
     let baseline = null;
     try { baseline = JSON.parse(readFileSync(baselineStage6Path, "utf8")); } catch { problems.push("stage-6 baseline file missing/malformed (run `node scripts/release/re-anchor-stage6.mjs` first)"); }
     if (baseline) {
