@@ -198,7 +198,7 @@ function makeDataDoe(opts = {}) {
         const ids = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
         return ids.flatMap((sid) => [
           { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 },
-          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-ONLY", child_asin: "B0X", item_price_currency: "USD", total_sales_sum: 20, total_units_sum: 2 },
+          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-ONLY", child_asin: "B0X", item_price_currency: opts.blankOliCurrency ? "" : "USD", total_sales_sum: opts.blankOliCurrency ? 0 : 20, total_units_sum: 2 },
         ]);
       }
       if (rk.includes("source-catalog")) return opts.badCatalog ? [{ child_asin: "B0A" }, null] : CATALOG_ROWS.map((r) => ({ ...r }));
@@ -487,6 +487,20 @@ test("D1. history rows attribute each account ONLY its own seller rows; coverage
   const covered = new Set(h.sinks.coverage.map((c) => c.accountId));
   assert.equal(covered.size, 5, "coverage recorded for every batch member");
   for (const c of h.sinks.coverage) assert.equal(c.sourceKey, "order-line-items");
+});
+
+test("D1b. the real bucket persistence path binds a blank OLI currency to that seller/account's authoritative currency", async () => {
+  const accounts = FIVE.map((account) => ({ ...account, currency: "USD" }));
+  const h = runHarness({
+    accounts,
+    dd: makeDataDoe({ blankOliCurrency: true }),
+    catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
+    fbaSnapshotsByAccount: Object.fromEntries(accounts.map((account) => [account.accountId, { validated_at: TODAY + "T01:00:00Z" }])),
+  });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, false);
+  assert.ok(h.sinks.history.some((row) => row.sku === "SKU-ONLY" && row.units === 2), "blank-currency unit rows survive");
+  assert.ok(h.sinks.history.every((row) => row.currency === "USD"), "every persisted row uses the exact account's canonical currency");
 });
 
 test("D2. an INVALID catalog payload records NO snapshot (latest-good preserved); history/coverage unaffected", async () => {

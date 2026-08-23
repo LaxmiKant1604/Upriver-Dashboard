@@ -470,7 +470,7 @@ export async function runBucketSourceSync({
           rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: OLI_SOURCE_KEY, requestHash: unit.requestHash });
           break;
         }
-        const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId }]));
+        const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId, currency: a.currency }]));
         const historyRows = oliHistoryRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,

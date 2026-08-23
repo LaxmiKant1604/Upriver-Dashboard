@@ -14,6 +14,7 @@
 // backfill export for a slice carries the exact canonical request_hash those reports reuse.
 
 import { addDaysStr, monthStartStr, canonicalOliSlices } from "../date-windows.js";
+import { canonicalCurrency } from "../currency.js";
 import { sourceRegistryEntry } from "./source-registry.js";
 
 export const OLI_SOURCE_KEY = "order-line-items";
@@ -222,11 +223,12 @@ export function coverageWindowsFromSlices(slices) {
 /**
  * Map ONE downloaded canonical OLI fragment (the shared batch payload) onto durable history rows at the
  * canonical grain. Row attribution is by seller_or_vendor_id against the AUTHORITATIVE accountsBySellerId
- * map ({ rawSellerId -> { accountId } }); an unknown/blank seller REJECTS the whole payload (fail closed --
- * mirrors validateBatchSourcePayload). currency must be a canonical AAA code; sku/child_asin may be blank
- * (kept as '' grain components). Two fragment rows on the same grain SUM (they are partial aggregates of
- * one grain cell); the durable upsert then REPLACES the whole matching row, so re-exported corrected slices
- * never duplicate.
+ * map ({ rawSellerId -> { accountId, currency } }); an unknown/blank seller REJECTS the whole payload
+ * (fail closed -- mirrors validateBatchSourcePayload). A nonblank row currency must be canonical. When
+ * DataDoe leaves it blank, the exact seller/account's canonical discovery currency is authoritative; a
+ * missing/malformed fallback still rejects the whole payload. sku/child_asin may be blank (kept as '' grain
+ * components). Two fragment rows on the same grain SUM (they are partial aggregates of one grain cell); the
+ * durable upsert then REPLACES the whole matching row, so re-exported corrected slices never duplicate.
  */
 export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint, connectionId, sourceRequestHash }) {
   if (!Array.isArray(rows)) throw new Error("oliHistoryRowsFromFragment requires an array payload (fail closed).");
@@ -250,9 +252,10 @@ export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizat
     if (!isDateStr(date)) {
       throw new Error("oliHistoryRowsFromFragment: a row carries no valid date; rejecting the whole payload (fail closed).");
     }
-    const currency = String(row.item_price_currency ?? "").trim().toUpperCase();
-    if (!/^[A-Z]{3}$/.test(currency)) {
-      throw new Error("oliHistoryRowsFromFragment: a row carries no canonical currency; rejecting the whole payload (fail closed).");
+    const rawCurrency = String(row.item_price_currency ?? "").trim();
+    const currency = rawCurrency ? canonicalCurrency(rawCurrency) : canonicalCurrency(account.currency);
+    if (!currency) {
+      throw new Error("oliHistoryRowsFromFragment: a row carries no canonical currency and its exact account has no canonical fallback currency; rejecting the whole payload (fail closed).");
     }
     const sales = Number(row.total_sales_sum ?? 0);
     const units = Number(row.total_units_sum ?? 0);

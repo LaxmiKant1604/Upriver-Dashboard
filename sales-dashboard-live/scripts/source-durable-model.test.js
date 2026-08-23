@@ -216,6 +216,28 @@ test("D2. unknown seller / invalid date / non-canonical currency / malformed row
   assert.equal(rows.length, 1);
 });
 
+test("D2b. a blank DataDoe currency uses only the exact account's canonical discovery currency", () => {
+  const fallbackMap = { S1: { accountId: "A1", currency: "usd" } };
+  const rows = model.oliHistoryRowsFromFragment({
+    ...FRAG_META,
+    accountsBySellerId: fallbackMap,
+    rows: [fragRow("S1", "2026-08-10", "K", "B", "", 0, 2)],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].currency, "USD", "the seller/account's canonical currency fills a blank source value");
+  assert.equal(rows[0].units, 2, "unit evidence is preserved");
+  assert.throws(
+    () => model.oliHistoryRowsFromFragment({ ...FRAG_META, accountsBySellerId: sellerMap, rows: [fragRow("S1", "2026-08-10", "K", "B", "", 0, 2)] }),
+    /no canonical fallback currency/,
+    "blank source currency without an authoritative account fallback remains fail closed",
+  );
+  assert.throws(
+    () => model.oliHistoryRowsFromFragment({ ...FRAG_META, accountsBySellerId: fallbackMap, rows: [fragRow("S1", "2026-08-10", "K", "B", "US D", 0, 2)] }),
+    /no canonical currency/,
+    "a malformed nonblank source currency is never replaced by the fallback",
+  );
+});
+
 test("D3. the canonical PK grain upserts idempotently: a late Amazon correction REPLACES its row (no duplication)", () => {
   // Model the durable table as a Map keyed by the exact PK grain (what merge-duplicates does).
   const table = new Map();
