@@ -13,7 +13,7 @@ import { createExport, pollExport, downloadExport } from "../datadoe.js";
 import { organizationFingerprint, sourceJobOwnerId, accountScopeHash } from "../source-identity.js";
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
-  upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt, adoptSourceExportCache,
+  upsertSyncSourceJob, getSyncSourceJobs, getSyncSourceJobsWithMeta, claimSourceExportAttempt, adoptSourceExportCache,
   claimSourceExportRecovery,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
@@ -254,6 +254,8 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     getCycle: (cycleId, opts) => r("get-cycle", (signal) => getSyncCycle(cycleId, { signal, ...(opts || {}) })),
     upsertSourceJob: (job) => w("upsert-source-job", true, (signal) => upsertSyncSourceJob(job, { signal })),
     listSourceJobs: (cycleId) => r("list-source-jobs", (signal) => getSyncSourceJobs(cycleId, { signal })),
+    // Trusted OLI recovery operator only: the source jobs WITH request_meta (window) for exact target verification.
+    listSourceJobsWithMeta: (cycleId) => r("list-source-jobs-meta", (signal) => getSyncSourceJobsWithMeta(cycleId, { signal })),
     // Many-to-many owner memberships (sync_source_job_owners) -- canonical jobs stay one row/export.
     upsertSourceJobOwners: (memberships) => w("upsert-owners", true, (signal) => upsertSyncSourceJobOwners(memberships, { signal })),
     listSourceJobOwners: (cycleId, ownerIds) => r("list-owners", (signal) => getSyncSourceJobOwners(cycleId, ownerIds, { signal })),
@@ -263,8 +265,9 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     listSourceJobsForOwners: (cycleId, ownerIds) => r("list-jobs-for-owners", (signal) => getSyncSourceJobsForOwners(cycleId, ownerIds, { signal })),
     recordSourceOwnerStale: (args) => w("owner-stale", true, (signal) => recordSyncSourceJobOwnerStale(args, { signal })),
     claimExportAttempt: (cycleId, requestHash) => w("claim-export", true, (signal) => claimSourceExportAttempt(cycleId, requestHash, { signal })),
-    // Phase 2 download-only recovery: atomic failed -> attempted CAS (conditional PATCH); NEVER creates.
-    claimSourceExportRecovery: ({ cycleId, requestHash }) => w("claim-recovery", true, (signal) => claimSourceExportRecovery(cycleId, requestHash, { signal })),
+    // Phase 2 download-only recovery: atomic failed -> attempted CAS (conditional PATCH), BOUND to the exact
+    // expected export id; NEVER creates. Returns 'claimed' | 'not-eligible' | null (fail closed).
+    claimSourceExportRecovery: ({ cycleId, requestHash, expectedExportId }) => w("claim-recovery", true, (signal) => claimSourceExportRecovery(cycleId, requestHash, expectedExportId, { signal })),
     // Blocker 2: the atomic cache-adoption CAS (adopt_source_export_cache), returning a typed
     // 'adopted' | 'not-adopted' acknowledgement. Mutually exclusive with claimExportAttempt.
     adoptSourceCache: (args) => w("adopt-cache", true, (signal) => adoptSourceExportCache(args, { signal })),

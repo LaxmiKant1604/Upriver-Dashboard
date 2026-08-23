@@ -1389,6 +1389,17 @@ export async function getSyncSourceJobs(cycleId, { signal = null } = {}) {
   return request(`/rest/v1/sync_source_jobs?${query}`, { signal });
 }
 
+// The same read plus request_meta (which carries the canonical window from/to). Used ONLY by the trusted OLI
+// download-recovery operator to VERIFY a target job's exact window before recovering it -- never by the worker.
+export async function getSyncSourceJobsWithMeta(cycleId, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: SOURCE_JOB_COLUMNS + ",request_meta",
+    cycle_id: `eq.${cycleId}`,
+    order: "created_at.asc",
+  });
+  return request(`/rest/v1/sync_source_jobs?${query}`, { signal });
+}
+
 /* ===== Scheduler v2: normalized source-job OWNERSHIP (sync_source_job_owners) wrappers =====
    Many memberships per canonical (cycle_id, request_hash); unique(cycle_id, request_hash, owner_id).
    sync_source_jobs stays one row/export per canonical hash with NO report-specific ownership authority.
@@ -1545,14 +1556,20 @@ export async function recordSyncSourceExportCreated({ cycleId, requestHash, expo
 }
 
 // DOWNLOAD-ONLY recovery claim (Phase 2): atomically transition a FAILED, non-terminal, poll/download-stage job
-// that already created EXACTLY ONE export back to 'attempted', so a fresh invocation resumes poll/download of the
-// SAME saved export_id WITHOUT a second create-export. A conditional PATCH (UPDATE ... WHERE fetch_status='failed'
-// AND terminal is not true AND error_stage in (poll,download) AND create_export_count=1 AND export_id not null),
-// which PostgreSQL serializes so EXACTLY ONE worker wins; a concurrent claim updates zero rows and loses. It sets
-// ONLY fetch_status (create_export_count + export_id are preserved -> the one-create-per-hash invariant holds).
-// Returns 'claimed' | 'not-eligible'; a non-array / multi-row response is null so the caller fails closed. There
-// is no recovery RPC (mirrors claimReportDeriveAttempt) -- no migration is added.
-export async function claimSourceExportRecovery(cycleId, requestHash, { signal = null } = {}) {
+// that already created EXACTLY ONE export -- and whose saved export id EXACTLY equals `expectedExportId` -- back
+// to 'attempted', so a fresh invocation resumes poll/download of the SAME export_id WITHOUT a second create.
+// A conditional PATCH (UPDATE ... WHERE fetch_status='failed' AND terminal is not true AND error_stage in
+// (poll,download) AND create_export_count=1 AND export_id = expectedExportId), which PostgreSQL serializes so
+// EXACTLY ONE worker wins; a concurrent claim updates zero rows and loses. The filter carries the exact expected
+// export id, so a CHANGED export id can never be claimed. It sets ONLY fetch_status (create_export_count +
+// export_id preserved -> the one-create-per-hash invariant holds). Then the RETURNED representation is validated
+// EXACTLY (cycle_id, request_hash, fetch_status='attempted', terminal=false, error_stage in (poll,download),
+// create_export_count=1, export_id === expectedExportId, byte-for-byte -- never trimmed). Returns 'claimed'
+// only on a single exactly-matching row; 0 rows => 'not-eligible'; any zero/multi/wrong-row/missing-field/
+// wrong-id/malformed response => null so the caller fails closed. No recovery RPC (mirrors claimReportDeriveAttempt).
+export async function claimSourceExportRecovery(cycleId, requestHash, expectedExportId, { signal = null } = {}) {
+  // A non-canonical expected id can never be claimed (fail closed BEFORE any write).
+  if (typeof expectedExportId !== "string" || expectedExportId === "" || expectedExportId !== expectedExportId.trim()) return null;
   const query = new URLSearchParams({
     cycle_id: `eq.${cycleId}`,
     request_hash: `eq.${requestHash}`,
@@ -1560,7 +1577,8 @@ export async function claimSourceExportRecovery(cycleId, requestHash, { signal =
     terminal: "not.is.true",
     error_stage: "in.(poll,download)",
     create_export_count: "eq.1",
-    export_id: "not.is.null",
+    export_id: `eq.${expectedExportId}`,
+    select: "cycle_id,request_hash,fetch_status,terminal,error_stage,create_export_count,export_id",
   });
   const rows = await request(`/rest/v1/sync_source_jobs?${query}`, {
     method: "PATCH",
@@ -1569,9 +1587,17 @@ export async function claimSourceExportRecovery(cycleId, requestHash, { signal =
     body: { fetch_status: "attempted" },
   });
   if (!Array.isArray(rows)) return null; // malformed -> caller fails closed
-  if (rows.length === 1) return "claimed";
   if (rows.length === 0) return "not-eligible"; // never matched, OR a concurrent winner already claimed it
-  return null; // >1 impossible for a (cycle, request_hash); fail closed
+  if (rows.length !== 1) return null; // >1 impossible for a (cycle, request_hash); fail closed
+  const r = rows[0];
+  const ok = String(r.cycle_id) === String(cycleId)
+    && String(r.request_hash) === String(requestHash)
+    && r.fetch_status === "attempted"
+    && (r.terminal ?? false) === false
+    && (r.error_stage === "poll" || r.error_stage === "download")
+    && Number(r.create_export_count) === 1
+    && typeof r.export_id === "string" && r.export_id === expectedExportId; // EXACT, never trimmed
+  return ok ? "claimed" : null; // wrong-row / missing-field / wrong-id / malformed => fail closed
 }
 
 // Failure NEVER clears cache_object_path / last_good_fetched_at, so last-known-good

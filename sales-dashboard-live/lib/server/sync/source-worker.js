@@ -108,13 +108,15 @@ export function recoveryEligibility(jobRow) {
   const terminal = (jobRow.terminal ?? false) === true;
   const stage = jobRow.error_stage ?? jobRow.errorStage ?? "";
   const createCount = Number(jobRow.create_export_count ?? jobRow.createExportCount ?? 0);
-  const exportIdRaw = jobRow.export_id ?? jobRow.exportId ?? null;
-  const exportId = typeof exportIdRaw === "string" ? exportIdRaw.trim() : "";
+  const exportId = jobRow.export_id ?? jobRow.exportId ?? null;
   if (status !== "failed") return { eligible: false, reason: "not-failed" };
   if (terminal) return { eligible: false, reason: "terminal" };
   if (stage !== "poll" && stage !== "download") return { eligible: false, reason: "stage-not-recoverable" };
   if (createCount !== 1) return { eligible: false, reason: "create-count-not-one" };
-  if (!exportId) return { eligible: false, reason: "missing-export-id" };
+  if (typeof exportId !== "string" || exportId.trim() === "") return { eligible: false, reason: "missing-export-id" };
+  // The saved export id must be CANONICAL: a whitespace-padded / noncanonical id is REJECTED (never trimmed),
+  // so a recovery can only ever bind to the exact stored id (the claim PATCH filters on it verbatim).
+  if (exportId !== exportId.trim()) return { eligible: false, reason: "noncanonical-export-id" };
   return { eligible: true, exportId };
 }
 
@@ -389,11 +391,14 @@ export async function recoverFailedDownloadJob({ store, dataDoe, clock = () => D
   if (!elig.eligible) return skip(elig.reason);
   if (typeof store.claimSourceExportRecovery !== "function") return skip("recovery-cas-unavailable");
 
-  // Atomic recovery claim (failed -> attempted). NEVER a create-export.
+  // Atomic recovery claim (failed -> attempted), BOUND to the exact saved export id. NEVER a create-export.
   let ack;
   try {
-    ack = await store.claimSourceExportRecovery({ cycleId, requestHash });
+    ack = await store.claimSourceExportRecovery({ cycleId, requestHash, expectedExportId: elig.exportId });
   } catch (_e) {
+    // A commit-unknown / errored claim is NEVER reported as committed or success: a fresh invocation re-reads
+    // the authoritative row (which, if the claim DID commit, is now 'attempted' and resumes via the normal
+    // path) -- this recovery attempt records nothing and fabricates nothing.
     return skip("recovery-claim-error"); // fail closed: no download, no fabrication
   }
   if (ack === "not-eligible" || ack === "not-won") return skip(ack);
