@@ -121,45 +121,80 @@ creates. The Catalog is organization-scoped, so US and Non-US resolve the **same
   applies a migration, enables the scheduler/cron, or touches unrelated reports, and **exits nonzero on every
   non-success disposition**.
 
-## 5. Complete-surface publish (`publishAccount`)
+## 4c. Warm-cache-first finalize (`finalizeBucket` token/reservation coherence)
 
-Publishes `daily-reporting`, `brand-sales`, `brand-inventory` for one account — **brand-sales before
-brand-inventory** so Brand View can never combine stale sales with fresh inventory. Every publish goes through the
-real publisher's four durable gates (code readiness → exact report / promoted control → primary rollout →
-audited per-(report, account) approval), then the validated-job + terminal-cycle + exact-shadow-identity +
-payload-contract + CAS write. This module **never** enables a control or an approval, never sets `all_primary`,
-and never enables the scheduler.
+`finalizeBucket` reconciles the Catalog source job's `create_export_count` with the durable reservation, so a
+**first** release that reuses a valid Catalog cache spends **zero** tokens and makes **no** reservation:
+
+- `create_export_count = 0` → warm reuse / adoption: **no** reservation, but a proven durable cache pointer
+  (`cache_object_path`); a stray reservation is rejected as ambiguous;
+- `create_export_count = 1` → the **exact** created reservation for this hash (status `created`, matching hash,
+  nonblank export id, `tokens_spent = 2`);
+- every other combination (missing/`reserved`-only reservation, hash mismatch, blank export, wrong tokens,
+  impossible count) is refused.
+
+## 5. Complete-surface publish + shared preflight + exact read-back (`preflightAccount` / `publishAccount`)
+
+The **real** publisher gains a read-only **preflight** mode (`publishSchedulerV2Snapshot({ preflight: true })`,
+exposed as `buildSchedulerV2Publisher().preflight`): it runs the SAME collaborators + gates + validations up to
+(not including) the CAS and returns `ready` with the exact live identity. `preflightAccount(accountId)` runs it
+for all three keys. The runner proves **every** account × three keys are publishable **before the first live
+write** — so a predictable missing approval/control causes **zero** partial publish — with **no** gate logic
+duplicated in the CLI.
+
+`publishAccount` publishes `daily-reporting`, `brand-sales`, `brand-inventory` — **brand-sales before
+brand-inventory** — through the real publisher's four durable gates + validated-job + terminal-cycle +
+exact-shadow-identity + payload-contract + CAS write, carrying each result's exact live identity
+(`liveReportKey` + `paramsHash`). The runner then reads each live snapshot back by that **exact** identity
+(`buildLiveReadback`): identity echoes, live version + params, params-hash **provenance** (a mutated-after-save
+row fails), nonblank refresh, storage-first payload, and the real frontend payload contract. This module never
+enables a control or an approval, never sets `all_primary`, and never enables the scheduler.
+
+## 6. Prepared publication control package (`buildPriorityControlPackage`)
+
+`lib/server/sync/source-priority-control-package.js` computes the EXACT control writes + their reversal for the
+freshly discovered primary accounts; `scripts/release/priority-control-package.mjs` applies it (dry-run default;
+`--apply` / `--rollback`) as **one guarded, advisory-locked transaction** with exact PRE (`all_primary=false`, no
+cron) and POST assertions: an exact rollout row per primary account; **only** `daily-reporting` + `brand-sales`
+dispatch controls enabled (every other controlled report paused); the `brand-inventory` promoted control enabled;
+an audited approval for all three keys × every primary account; `all_primary` stays false; no cron. An explicit
+rollback package reverses exactly those writes.
 
 ## Regressions
 
-- `scripts/source-priority-dashboards.test.js` (P1–P7): the durable Catalog guard (catalog-only; at most one
-  across buckets/retries/restart; commit-unknown and concurrency are AMBIGUOUS, never a second create; exact
-  export-id adoption spends zero); the allowlist + publish order; the 30-account (8 US + 22 non-US) plan proving
-  zero OLI/FBA jobs and one Catalog job per bucket; the composition wiring (build-time priority, no run-arg,
-  catalog-only guard installed) + the `verifyAndFinalize` accept/refuse matrix; the Brand View inventory
-  contract; the **real** publisher returning `not-successful` for all three before finalization and publishing
-  all three after a terminal cycle; and the **real** `buildAccountBrandSlice` rendering fresh sales with
-  inventory unavailable.
-- `scripts/source-production-hardening.test.js` (F11a–f, F12a–c): the **real-runtime** derive off durable OLI +
-  Catalog (30 accounts, one Catalog export, zero OLI/Ads/FBA); missing FBA → unavailable; force-catalog fixes
-  the fresh-snapshot skip; fail-closed on missing provenance; ordinary callers cannot activate priority mode
-  (the run-arg is inert); and the **durable reservation** with the real runtime + worker — cold US (one Catalog
-  / two tokens / zero others), warm re-run (zero), and US + Non-US sharing ONE reservation both warm (cache
-  reuse) and cold (export-id adoption).
+- `scripts/source-priority-dashboards.test.js` (P1–P11): the operation-wide durable Catalog guard
+  (hash-mismatch / commit-unknown / concurrency / adoption); the allowlist + publish order; the 30-account plan
+  (zero OLI/FBA jobs, one Catalog job/bucket); the composition wiring (build-time priority) + `finalizeBucket`
+  cold/warm-first/retry accept + the full refuse matrix incl. every token/reservation ambiguity; the Brand View
+  inventory contract; the **real** publisher's `not-successful`→`published` and the **shared preflight**'s
+  `not-successful`→`ready` (zero writes on any non-ready pair); `buildAccountBrandSlice`; the mocked-real
+  reservation wrappers (strict validation); the strict runner (exits nonzero on every non-success, warm-cache
+  zero tokens, missing live identity); the exact-identity `buildLiveReadback` (omitted/wrong hash fails,
+  provenance/dangling/contract fail, exact passes); and the exact control package + its rollback + fail-closed.
+- `scripts/source-production-hardening.test.js` (F11a–f, F12a–d): the real-runtime derive off durable OLI +
+  Catalog; missing FBA → unavailable; fail-closed on missing provenance; ordinary callers cannot activate
+  priority mode; and the durable reservation with the real runtime + worker (cold/warm/cross-bucket/midnight).
+- `scripts/schema-contract-mutation.test.js` (Migration-9 contract + 14 weakening regressions);
+  `scripts/release/release-selftest.mjs` (stage-8 baseline + the protected-drift reconciliation classifier).
 
 `npm run verify` (57 steps / 37 suites, incl. `build:check`) is green.
 
 ## Operator run (deferred — do NOT run in production before Codex sign-off)
 
-1. Apply Migration 9 through the **guarded release step** only: `ro-prod-check.mjs 8` → `re-anchor-stage8.mjs`
-   (regenerate the stage-8 baseline) → `apply-one-migration.mjs 20260825_priority_catalog_reservation.sql`.
-   Confirm ≥2 DataDoe tokens (read-only). Verify the `created_coherent` canon against the live catalog first.
-2. Open the publisher gates for `daily-reporting` + `brand-sales` + `brand-inventory` only (durable report/
-   promoted controls, account rollout, per-(report, account) approvals).
-3. Run the strict runner `node scripts/release/priority-dashboards-release.mjs` (exits nonzero on any
-   non-success): read-only reconciliation → derive US then Non-US → re-prove ≤2 tokens → `finalizeBucket` each
-   bucket → read-prove all three gates for every account → publish (brand-sales before brand-inventory) →
-   live-identity read-back with the frontend payload contract (`GET /api/datadoe?action=daily|brand-sales|
-   brand-inventory`).
-4. Close the temporary gates. Keep every other report paused; keep the scheduler disabled (`all_primary=false`,
-   no cron). Stop for Codex review before any scheduler enablement.
+1. **Reconcile** the protected data: `node scripts/release/stage8-reconcile.mjs` (read-only). It STOPs on any
+   drift from the manifest pins — review each drift, record intentional-state evidence, then (separately) update
+   the pins/invariants and re-run.
+2. Apply Migration 9 through the **guarded release step** only: verify the `created_coherent` canon against the
+   live catalog → `ro-prod-check.mjs 8` → `re-anchor-stage8.mjs` (regenerate the stage-8 baseline at the final
+   reviewed HEAD) → `apply-one-migration.mjs 20260825_priority_catalog_reservation.sql`. Confirm ≥2 DataDoe
+   tokens (read-only).
+3. Apply the control package: review `node scripts/release/priority-control-package.mjs` (dry-run), then
+   `--apply` (one guarded transaction; exact pre/post assertions).
+4. Run the strict runner `node scripts/release/priority-dashboards-release.mjs` (exits nonzero on any
+   non-success): read-only reconciliation → derive US then Non-US → re-prove ≤2 tokens (warm-cache-first spends
+   zero) → `finalizeBucket` each bucket → **shared publisher preflight for every account × 3** → publish
+   (brand-sales before brand-inventory) → **exact-identity** live read-back with the frontend payload contract
+   (`GET /api/datadoe?action=daily|brand-sales|brand-inventory`).
+5. Close the temporary gates (`priority-control-package.mjs --rollback` if aborting). Keep every other report
+   paused; keep the scheduler disabled (`all_primary=false`, no cron). Stop for Codex review before any scheduler
+   enablement.

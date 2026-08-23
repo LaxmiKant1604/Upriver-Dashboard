@@ -11105,3 +11105,40 @@ schema-contract-mutation (50, incl 14 m9) + release-selftest (181, incl stage-8)
 (57 steps/37 suites) + git diff --check GREEN. Commit 3776873 (code/tests/migration/release-engine) + docs
 separate. Migration + baselines UNAPPLIED. STOPPED for Codex re-review; no production action.
 See [[scheduler-v2-golive-status]].
+
+## Priority release HARDENED for Codex round 4 -- 2026-08-24 (code 35ad575 + docs separate; NOT pushed; NO migration change)
+
+Codex round-4 blockers fixed offline from HEAD de8b8a5 (no push/deploy/prod/publish/scheduler/migration-apply).
+Four blockers + a prepared control package:
+1. EXACT live read-back: publishAccount now carries each result's liveReportKey+paramsHash; the runner threads
+   them into read-back. New buildLiveReadback (in source-priority-release-runner.js, offline-tested P10) loads the
+   live snapshot by the EXACT natural identity (liveReportKey, account, paramsHash) and proves identity echoes +
+   live version/params + params-hash PROVENANCE (mutated-after-save fails) + nonblank refresh + storage-first
+   payload + real frontend payload contract (REPORT_DERIVATIONS.validatePayload). P10 proves omitted/wrong hash
+   fails, exact passes.
+2. COMPLETE pre-publish proof: added a read-only PREFLIGHT to the REAL publisher (publishSchedulerV2Snapshot
+   preflight mode = all gates + source-of-truth job + terminal cycle + exact shadow identity + payload + live
+   params, returns 'ready' WITHOUT the CAS). buildSchedulerV2Publisher exposes preflight(); composition's
+   preflightAccount runs it for all 3 keys; runner proves EVERY account x 3 BEFORE first live write; no gate logic
+   duplicated in the CLI. Zero partial publish on any non-ready pair (P6c/P9f). (gate7 EC1 surface test updated to
+   [publish, preflight].)
+3. WARM-CACHE-FIRST finalize: finalizeBucket reconciles the Catalog job's create_export_count with the
+   reservation: cec=0 => zero tokens + NO reservation + cache_object_path evidence; cec=1 => EXACT created
+   reservation (hash/export/2 tokens); every ambiguous combo rejected (P4b/b2/b3/c: cold/warm-first/retry +
+   mismatch matrix). Runner token-ceiling handles reservation absence (warm => 0 tokens).
+4. STAGE-8 reconciliation: new read-only scripts/release/stage8-reconcile.mjs captures all 8 protected digests +
+   classifyProtectedDrift (in release-state.mjs, offline-tested in release-selftest) classifies each vs manifest
+   pins (matched/drifted/missing/unpinned + extras); STOPS on any drift. PINS NOT CHANGED offline -- operator
+   reviews drift + records intentional-state evidence, then separately updates pins + regenerates stage-8 baseline
+   at final reviewed HEAD.
+PREPARED (not executed) control package: lib/server/sync/source-priority-control-package.js
+(buildPriorityControlPackage) + scripts/release/priority-control-package.mjs (dry-run default; --apply/--rollback).
+ONE guarded advisory-locked transaction, exact PRE (all_primary=false, no cron) + POST assertions: exact primary
+rollout rows; ONLY daily-reporting+brand-sales dispatch enabled (all other controlled reports paused);
+brand-inventory promoted enabled; audited approvals for 3 keys x every primary account; all_primary stays false;
+no cron. Explicit rollback package reverses it. (P11.)
+
+Tests: source-priority-dashboards.test.js P1-P11 (46) + gate7 publisher surface + release-selftest reconcile
+(184) + schema-mutation (50) + F11/F12 (117) + npm run verify (57/37) + git diff --check GREEN. NO migration
+change this round (migration SHA unchanged daf1997a...). Commit 35ad575 (code/tests) + docs separate. STOPPED for
+Codex re-review; no production action. See [[scheduler-v2-golive-status]].
