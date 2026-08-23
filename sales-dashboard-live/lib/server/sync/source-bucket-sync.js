@@ -5,9 +5,11 @@
 //   - every export covers AT MOST five compatible accounts (the stable batch engine; assignAccountBatches
 //     preserves existing membership, so a newly discovered account joins a non-full batch or a fresh one and
 //     NOTHING reshuffles);
-//   - per canonical OLI slice, the export is scoped to EXACTLY the batch members whose durable coverage does
-//     not prove that slice (planOliSliceExports): the steady-state rolling refresh is one batch export per
-//     slice, a new account backfills SOLO, and completed accounts are never re-exported;
+//   - each export is scoped to EXACTLY the batch members sharing a contiguous MISSING window (planOliSliceExports,
+//     complete-window -- no 7-day pre-slicing) and to at most MAX_OLI_EXPORT_WINDOW_DAYS (441) inclusive days,
+//     splitting a longer missing window into contiguous <=cap chunks: the steady-state RESTORED rolling refresh
+//     is one small batch export over the trailing 7-day window, the initial backfill is the complete window in
+//     <=cap chunks, a new account backfills SOLO, and completed accounts are never re-exported;
 //   - the organization-wide durable catalog refreshes ONCE per organization per day (its request identity is
 //     bucket-free, so the second bucket adopts the first bucket's durable cache with zero DataDoe);
 //   - the FBA inventory snapshot refreshes once daily per account (latest-VALIDATED preserved on failure);
@@ -211,8 +213,8 @@ export function planBucketSourceSync({
   const families = [];
   const skippedPaused = [];
 
-  // 2) OLI: per batch, per canonical slice, the member subset whose coverage does not prove it. The rolling
-  //    refresh window is always re-exported (idempotent replace); completed history is never re-exported.
+  // 2) OLI: complete-window exports scoped to the batch members sharing a contiguous MISSING window. The
+  //    trailing rolling-refresh window is always re-exported (idempotent replace); completed history is not.
   if (pausedSources.has(OLI_SOURCE_KEY)) {
     skippedPaused.push(OLI_SOURCE_KEY);
   } else {
@@ -220,14 +222,14 @@ export function planBucketSourceSync({
     const refresh = oliRollingRefreshWindow(asOf);
     const oliJobs = [];
     const allUnits = [];
-    // COMPLETE-WINDOW authorized backfill: ONE export over the full contiguous MISSING window per <=5-seller
-    // batch (no 7-day pre-slicing). Each member's coverage is first CLIPPED to exclude the trailing rolling-
-    // refresh window (registry incrementalRefresh, 7 days), so DataDoe's restatement of the last few days is
-    // always re-pulled (idempotent replace-matching-rows) while genuinely proven older history is NEVER
-    // re-exported. The clipped complement therefore merges any older gap with the always-missing trailing
-    // window into ONE contiguous [gap-start .. asOf] export per batch: initial runs fetch the whole window
-    // once; steady-state runs re-fetch only the trailing refresh window (a cache-hit-stable request identity).
-    // An empty authorized window (asOf before the fixed start) skips OLI.
+    // COMPLETE-WINDOW authorized backfill (no 7-day pre-slicing). Each member's coverage is first CLIPPED to
+    // exclude the trailing rolling-refresh window (registry incrementalRefresh, 7 days -- RESTORED, not removed),
+    // so DataDoe's restatement of the last few days is always re-pulled (idempotent replace-matching-rows) while
+    // genuinely proven older history is NEVER re-exported. planOliSliceExports then emits ONE export per
+    // contiguous missing window (SEPARATED coverage gaps => SEPARATE exports, never merged into one), each split
+    // into contiguous chunks of at most MAX_OLI_EXPORT_WINDOW_DAYS: steady state re-fetches only the trailing
+    // 7-day window (one cache-hit-stable export/batch); an initial backfill fetches the whole window in <=cap
+    // chunks. An empty authorized window (asOf before the fixed start) skips OLI.
     if (backfill.from <= backfill.to) {
       for (const batch of batches) {
         const members = batch.accounts;

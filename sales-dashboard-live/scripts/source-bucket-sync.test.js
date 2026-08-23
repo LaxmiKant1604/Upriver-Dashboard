@@ -387,6 +387,70 @@ test("B5. go-live frozen budget: 7 batches over the FIXED [2025-01-01, 2026-08-2
   assert.equal(budget.maxTokens, 28, "EXACTLY 28 authorized tokens (standard OLI = 2 each; NOT 7 exports / 14 tokens)");
 });
 
+test("B6. production shape: 8 US (2 batches) + 22 non-US (5 batches) => 14 exports / 28 tokens; sellers unique per chunk; buckets never mix", () => {
+  const GO_LIVE = "2026-08-21";
+  const CHUNKS = ["2025-01-01..2026-03-17", "2026-03-18..2026-08-21"]; // 441 + 157 inclusive days
+  const mk = (prefix, country, n) => Array.from({ length: n }, (_, i) => ({
+    accountId: prefix + String(i + 1).padStart(2, "0"),
+    rawSellerId: prefix + "S" + String(i + 1).padStart(2, "0"),
+    country,
+  }));
+  const usAccounts = mk("US", "US", 8);
+  const nonUsAccounts = mk("NU", "GB", 22);
+  const planFor = (bucket, accounts) => bucketSync.planBucketSourceSync({
+    apiKey: API_KEY, bucket, accounts, coverageByAccountId: {},
+    catalogSnapshot: { validated_at: GO_LIVE + "T01:00:00Z" }, fbaSnapshotsByAccount: {},
+    asOf: GO_LIVE, today: GO_LIVE,
+  });
+  const us = planFor("us", usAccounts);
+  const nonUs = planFor("non-us", nonUsAccounts);
+  // <=5 sellers per batch; the exact batch counts.
+  assert.equal(us.batches.length, 2, "8 US accounts => 2 batches (5 + 3)");
+  assert.equal(nonUs.batches.length, 5, "22 non-US accounts => 5 batches (5+5+5+5+2)");
+  for (const b of [...us.batches, ...nonUs.batches]) assert.ok(b.accounts.length >= 1 && b.accounts.length <= 5, "each batch has 1..5 sellers");
+  const oliUnits = (plan) => plan.families.find((f) => f.sourceKey === "order-line-items").units;
+  const usUnits = oliUnits(us);
+  const nonUsUnits = oliUnits(nonUs);
+  assert.equal(usUnits.length, 4, "US: 2 batches x 2 date chunks = 4 exports");
+  assert.equal(nonUsUnits.length, 10, "non-US: 5 batches x 2 date chunks = 10 exports");
+  const allUnits = [...usUnits, ...nonUsUnits];
+  assert.equal(allUnits.length, 14, "combined: EXACTLY 14 exports");
+  // The ONLY windows are the two exact date chunks.
+  assert.deepEqual([...new Set(allUnits.map((u) => u.slice.from + ".." + u.slice.to))].sort(), CHUNKS,
+    "the exact windows remain 2025-01-01..2026-03-17 and 2026-03-18..2026-08-21");
+  // Every seller appears EXACTLY ONCE per date chunk, and each chunk covers exactly that bucket's sellers.
+  for (const [label, units, accounts] of [["US", usUnits, usAccounts], ["non-US", nonUsUnits, nonUsAccounts]]) {
+    for (const chunk of CHUNKS) {
+      const sellers = units.filter((u) => u.slice.from + ".." + u.slice.to === chunk).flatMap((u) => u.sellerOrVendorIds);
+      assert.equal(sellers.length, accounts.length, label + " " + chunk + ": every seller exported once (no gaps)");
+      assert.equal(new Set(sellers).size, accounts.length, label + " " + chunk + ": no seller duplicated in a chunk");
+      assert.deepEqual([...new Set(sellers)].sort(), accounts.map((a) => a.rawSellerId).sort(), label + " " + chunk + ": exactly this bucket's sellers");
+    }
+  }
+  // US and non-US NEVER mix: disjoint sellers, and every export is wholly one bucket.
+  const usSellers = new Set(usUnits.flatMap((u) => u.sellerOrVendorIds));
+  const nonUsSellers = new Set(nonUsUnits.flatMap((u) => u.sellerOrVendorIds));
+  assert.equal([...usSellers].filter((s) => nonUsSellers.has(s)).length, 0, "no seller appears in both buckets");
+  for (const u of allUnits) {
+    const allUs = u.sellerOrVendorIds.every((s) => usSellers.has(s));
+    const allNonUs = u.sellerOrVendorIds.every((s) => nonUsSellers.has(s));
+    assert.ok(allUs !== allNonUs, "each export's sellers are ALL one bucket -- never a US/non-US mix");
+  }
+  // All 14 request hashes are unique.
+  assert.equal(new Set(allUnits.map((u) => u.requestHash)).size, 14, "all 14 export request hashes are unique");
+  // Per-bucket + combined frozen ceilings (standard OLI = 2 tokens/export).
+  const oliBudget = (plan) => tbudget.computeFrozenTrancheBudget({
+    plannedJobs: plan.families.find((f) => f.sourceKey === "order-line-items").plannedJobs,
+    isPremiumOf: () => false, trancheKey: "source-sync:order-line-items",
+  });
+  const usB = oliBudget(us);
+  const nonUsB = oliBudget(nonUs);
+  assert.deepEqual([usB.maxCreates, usB.maxTokens], [4, 8], "US ceiling: 4 exports / 8 tokens");
+  assert.deepEqual([nonUsB.maxCreates, nonUsB.maxTokens], [10, 20], "non-US ceiling: 10 exports / 20 tokens");
+  assert.equal(usB.maxCreates + nonUsB.maxCreates, 14, "combined: 14 exports");
+  assert.equal(usB.maxTokens + nonUsB.maxTokens, 28, "combined: 28 tokens");
+});
+
 /* ================================= C. catalog + FBA ================================= */
 group("C. catalog once-daily per organization; FBA per account (premium ceiling)");
 
