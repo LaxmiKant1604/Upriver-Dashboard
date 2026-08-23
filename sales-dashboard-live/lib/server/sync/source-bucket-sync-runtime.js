@@ -496,7 +496,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, priority = false, deadline = null, preflight = null } = {}) => {
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`buildBucketSourceSyncRuntime.run requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
@@ -537,6 +537,24 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       for (const entry of SOURCE_REGISTRY) {
         if (entry.sourceKey !== onlySourceKey) pausedSources.add(entry.sourceKey);
+      }
+    }
+    // PRIORITY DASHBOARDS PATH (Daily Reporting + Brand View): derive ONLY from the PROVEN durable OLI history
+    // + the organization Catalog. Pause every non-catalog source so this run plans ZERO OLI/Ads/FBA/other
+    // exports (structurally, not by configuration); the catalog family is force-planned (below, via
+    // forceCatalogRefresh) so the cycle drains and the durable-evidence derive/save runs even when the durable
+    // OLI needs no new fetch. Missing Ads/FBA are represented as UNAVAILABLE downstream (daily runs sales-only;
+    // brand-inventory yields inventoryAvailable:false). The trusted operator additionally guards the adapter so
+    // at most ONE Catalog export (<=2 tokens) can ever be created across the whole go-live.
+    if (priority) {
+      if (pausedSources.has(CATALOG_SOURCE_KEY)) {
+        const err = new Error(`SOURCE_PAUSED: "${CATALOG_SOURCE_KEY}" is paused; the priority dashboards path needs the Catalog source enabled (fail closed).`);
+        err.code = "SOURCE_PAUSED";
+        err.status = 409;
+        throw err;
+      }
+      for (const entry of SOURCE_REGISTRY) {
+        if (entry.sourceKey !== CATALOG_SOURCE_KEY) pausedSources.add(entry.sourceKey);
       }
     }
 
@@ -680,6 +698,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
         deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
         reuseOnly,
+        forceCatalogRefresh: priority,
       });
     } catch (e) { return catchDeadline(e); }
     rollup.excludedAccounts = excluded;
@@ -1076,9 +1095,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const brandSalesByAccount = new Map(derived.brandView.snapshots.map((s) => [s.accountId, s]));
     try {
       for (const account of accounts) {
-        const invRows = evidence.fbaRowsByAccount ? evidence.fbaRowsByAccount[account.accountId] : undefined;
+        let invRows = evidence.fbaRowsByAccount ? evidence.fbaRowsByAccount[account.accountId] : undefined;
         const sales = brandSalesByAccount.get(account.accountId);
-        if (!Array.isArray(invRows)) { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-validated-fba-snapshot" }); continue; }
+        if (!Array.isArray(invRows)) {
+          // PRIORITY DASHBOARDS PATH: no durable FBA snapshot for this account -> represent inventory as
+          // UNAVAILABLE (empty rows => buildBrandInventoryPayload yields inventoryAvailable:false) rather than
+          // skipping, so Brand View publishes for every covered account with zero FBA export. The normal
+          // (non-priority) path still preserves the previous compact snapshot and records the typed skip.
+          if (priority) { invRows = []; }
+          else { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-validated-fba-snapshot" }); continue; }
+        }
         if (!sales) { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-brand-sales-snapshot" }); continue; }
         await ensureTime("brand-inventory-derive");
         let built;

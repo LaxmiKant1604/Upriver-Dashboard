@@ -197,6 +197,11 @@ export function planBucketSourceSync({
   apiKey, bucket, accounts, existingMembership = new Map(),
   coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   pausedSources = new Set(), asOf, today,
+  // PRIORITY DASHBOARDS PATH: force the organization Catalog family to plan a job even when its snapshot is
+  // already fresh-today. The Daily Reporting + Brand View priority derive runs ONLY after a drained cycle
+  // (globalDrained), and its lineage binds to a cycle Catalog hash; forcing the (cache-reusing, zero-token
+  // when warm) Catalog job gives that path a drainable cycle without any OLI/Ads/FBA fetch.
+  forceCatalogRefresh = false,
 } = {}) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error(`planBucketSourceSync requires bucket 'us'|'non-us' (got "${bucket}").`);
   if (!Array.isArray(accounts) || accounts.length === 0) throw new Error("planBucketSourceSync requires this bucket's non-empty account list (fail closed).");
@@ -253,11 +258,11 @@ export function planBucketSourceSync({
   } else {
     const decision = snapshotRefreshDecision({ sourceKey: CATALOG_SOURCE_KEY, lastValidatedAt: catalogSnapshot && catalogSnapshot.validated_at, today });
     const catalogJobs = [];
-    if (decision.refresh) {
+    if (decision.refresh || forceCatalogRefresh) {
       const resolved = resolvedDurableCatalog({ apiKey, asOf: today, bucket });
       catalogJobs.push(plannedSourceJob(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", ORGANIZATION_SCOPE_KEY));
     }
-    families.push({ sourceKey: CATALOG_SOURCE_KEY, plannedJobs: catalogJobs, decision });
+    families.push({ sourceKey: CATALOG_SOURCE_KEY, plannedJobs: catalogJobs, decision, forcedRefresh: !decision.refresh && forceCatalogRefresh });
   }
 
   // 4) FBA INVENTORY: once daily per account; historical inventory is never repeatedly backfilled. The
@@ -336,6 +341,9 @@ export async function runBucketSourceSync({
   // (bucket, cycle_date) cycle with no duplicate create.
   deadlineMs = Infinity, reserveMs = 3_000,
   maxContinuationsPerFamily = 6, reuseOnly = false, budgets = true,
+  // PRIORITY DASHBOARDS PATH: force a Catalog job so a catalog-only (OLI/Ads/FBA-paused) run still drains a
+  // cycle for the durable-evidence Daily Reporting + Brand View derive. See planBucketSourceSync.
+  forceCatalogRefresh = false,
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
@@ -346,6 +354,7 @@ export async function runBucketSourceSync({
   const plan = planBucketSourceSync({
     apiKey, bucket, accounts, existingMembership, coverageByAccountId,
     catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
+    forceCatalogRefresh,
   });
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
   const ownerIds = [...new Set(allPlannedJobs.map((j) => j.owner.ownerId))];

@@ -3088,6 +3088,93 @@ test("W4c. finding 3: a WRONG-ROW identity (report_key/account_id/params_hash mi
 });
 
 
+/* ===== F11. Daily Reporting + Brand View PRIORITY PATH (durable OLI + Catalog ONLY; zero OLI/Ads/FBA) ===== */
+group("F11. priority dashboards path: derive Daily + Brand View from durable OLI + Catalog, zero OLI/Ads/FBA");
+
+function priorityHarness(accounts, over = {}) {
+  const h = makeHarness({
+    primaryAccounts: accounts,
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    // Catalog + FBA snapshots ABSENT by default: the Catalog is fetched this cycle; FBA is UNAVAILABLE.
+    readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
+    ...over,
+  });
+  for (const a of accounts) {
+    h.durableHistory.set(a.id + "|x", { accountId: a.id, saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1, sourceRequestHash: "oli-prov-" + a.id });
+  }
+  return h;
+}
+
+test("F11a. 30 covered accounts derive Daily + Brand View off durable OLI + Catalog; EXACTLY one Catalog export; ZERO OLI/Ads/FBA creates", async () => {
+  const accounts = Array.from({ length: 30 }, (_, i) => dirAccount("A" + String(i + 1).padStart(2, "0")));
+  const h = priorityHarness(accounts);
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.cycleId, "the forced Catalog job opened the owning cycle");
+  assert.equal(rollup.derived.skipped, null, "the derive/save stage ran (priority does not require a full drain)");
+  assert.equal(rollup.derived.daily.saved, 30, "every covered account derived Daily Reporting");
+  assert.equal(rollup.derived.brandView.saved, 30, "every covered account derived Brand View sales");
+  assert.equal(rollup.derived.brandInventory.saved, 30, "every covered account derived Brand View inventory (FBA unavailable)");
+  const nonCatalog = h.dd.createSeq.filter((c) => c.sourceKey !== "product-catalog");
+  assert.equal(nonCatalog.length, 0, "ZERO OLI/Ads/FBA/other creates: " + JSON.stringify(nonCatalog));
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog").length, 1, "exactly ONE org-scoped Catalog export");
+  assert.equal(rollup.derived.brandInventory.skipped.filter((s) => s.reason === "no-validated-fba-snapshot").length, 0, "no account skipped for missing FBA");
+});
+
+test("F11b. missing FBA is represented as UNAVAILABLE (inventoryAvailable:false), never fabricated, never skipped", async () => {
+  const accounts = [dirAccount("A01"), dirAccount("A02")];
+  const h = priorityHarness(accounts);
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  assert.equal(rollup.derived.brandInventory.saved, 2, "brand-inventory saved for both accounts");
+  const invSaves = h.recorded.shadowSaves.filter((s) => s.reportKey === "scheduler-v2/brand-inventory");
+  assert.equal(invSaves.length, 2, "two brand-inventory shadow snapshots");
+  for (const s of invSaves) {
+    assert.equal(s.payload.inventoryAvailable, false, "inventory marked UNAVAILABLE (no FBA)");
+    assert.equal(s.payload.inventoryDate, null, "no fabricated inventory date");
+    assert.deepEqual(s.payload.inventoryByBrandCountry, [], "empty inventory table");
+  }
+});
+
+test("F11c. priority FORCES a Catalog job even when the snapshot is fresh-today, so the derive runs (vs F4e's cycle-less skip)", async () => {
+  const accounts = [dirAccount("A01"), dirAccount("A02")];
+  const h = priorityHarness(accounts, {
+    readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: null, read: "ok", error: null }),
+  });
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.cycleId, "priority forced a Catalog job -> owning cycle opened even though the snapshot was fresh");
+  assert.equal(rollup.derived.skipped, null, "the derive ran (the fresh-catalog cycle-less skip is bypassed)");
+  assert.ok(rollup.derived.daily.saved >= 1, "Daily derived");
+  assert.ok(rollup.derived.brandInventory.saved >= 1, "Brand View inventory derived");
+});
+
+test("F11d. priority still fails CLOSED: an account whose durable OLI row lacks its source_request_hash is not published with unproven lineage", async () => {
+  const accounts = [dirAccount("A01")];
+  const h = priorityHarness(accounts);
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 }); // NO sourceRequestHash
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey !== "product-catalog").length, 0, "still ZERO non-catalog creates");
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed with the typed provenance-missing skip");
+});
+
+test("F11e. priority plans ZERO non-catalog source JOBS in the owning cycle (OLI/Ads/FBA/settlements never fetched)", async () => {
+  const accounts = [dirAccount("A01"), dirAccount("A02")];
+  const h = priorityHarness(accounts);
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const jobs = h.store.listSourceJobs(rollup.cycleId);
+  assert.ok(jobs.length > 0, "the cycle has the Catalog job");
+  assert.ok(jobs.every((j) => j.source_key === "product-catalog"), "ONLY product-catalog jobs exist in the cycle: " + JSON.stringify(jobs.map((j) => j.source_key)));
+});
+
 async function main() {
   out("source production-hardening proof suite");
   runtimeMod = await import("../lib/server/sync/source-bucket-sync-runtime.js");
