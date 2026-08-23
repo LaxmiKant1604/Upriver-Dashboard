@@ -11062,3 +11062,46 @@ runtime+worker durable reservation: cold US 1 Catalog/2 tokens/0 others; warm re
 reservation warm + cold-adopt). `npm run verify` 57 steps/37 suites GREEN; node --check + git diff --check clean.
 Commit ff1bc51 (code/tests/migration) + docs separate. STOPPED for Codex re-review; no production action.
 See [[scheduler-v2-golive-status]].
+
+## Priority release HARDENED for Codex round 3 -- 2026-08-24 (code 3776873 + docs separate; NOT pushed)
+
+Codex round-3 blockers fixed offline from HEAD 04dac78 (no push/deploy/prod/publish/scheduler/migration-apply).
+Five items:
+1. OPERATION-WIDE durable ceiling: Migration 9 reservation PK is now operation_key ALONE (was (operation_key,
+   catalog_request_hash)); the first canonical Catalog hash is IMMUTABLE evidence, a DIFFERENT hash for the same
+   operation (midnight/asOf drift) is a typed hash-mismatch = zero creates. One operation -> at most one Catalog
+   create / two tokens across US+Non-US/retries/restart/concurrency/commit-unknown/date-drift. Migration rewritten
+   (coherent admin-read ACL: authenticated SELECT + admin policy); FROZEN SHA-256
+   daf1997a173fbf9c9447a61883a32f8b129e9b666eb2e0d2ee3d4a78da045a7f (10615 bytes).
+2. STRICT wrapper validation (supabase.js): reserve/record/get validate exactly one plain-object ack, known
+   disposition, exact operation_key + catalog_request_hash echoes, disposition-dependent fields (created/
+   already-recorded => exact export_id + tokens=2; reserved => none; hash-mismatch/conflict => no create), status/
+   state coherence; fail closed BEFORE any POST. RPCs now echo operation_key + catalog_request_hash. Mocked-real-
+   wrapper tests (P8) via global.fetch stub.
+3. NO caller-forgeable evidence/scope: deriveBucket(bucket) + finalizeBucket(bucket) take ONLY the bucket
+   (removed cycleId/expectedAccountIds/preflight/deadline args). deriveBucket runs its OWN deadline+preflight.
+   finalizeBucket INDEPENDENTLY reconstructs: fresh primary-only discovery (expected accounts), cycle row (exact
+   bucket/running/manual trigger via new getSyncCycleByBucketDate), reserved catalog hash, EXACTLY ONE org-scoped
+   (__organization owner) succeeded catalog source job, accounts x 3 validated report jobs no-dupes, then
+   finalize_sync_cycle. Restart re-proves from durable state.
+4. Release contracts (Migration 9) -- BOTH systems: schema-contract.js (System B, in verify) table+RPC contract +
+   function-body proofs (auditPriorityReserve/RecordFunction: operation-wide one-create, immutable hash, hash-
+   mismatch, record conflict, no reset/delete) + REQUIRED_WRAPPER_EXPORTS + 14 m9 mutation tests; release-
+   manifest.mjs entry (sha+adv [20260825,1]); release-state.mjs buildStage8/validateStage8/shouldCreateStage8 +
+   runApply dispatch; NEW re-anchor-stage8.mjs (hard-coded ANCHOR=8, only migration 9); ro-prod-check.mjs +
+   apply-one-migration.mjs extended to stage 8 (regex 0..9); release-selftest.mjs stage-8 block. NOTE: the
+   created_coherent canon in release-manifest is BEST-EFFORT -- verify vs live bodyCanon(pg_get_constraintdef)
+   before applying; ro-prod-check fails closed on mismatch. Baselines must be regenerated vs prod (fingerprint
+   changed).
+5. STRICT operator runner: lib/server/sync/source-priority-release-runner.js (runPriorityDashboardsRelease, pure
+   orchestration, offline-tested P9) + scripts/release/priority-dashboards-release.mjs (deferred CLI). Read-only
+   reconcile -> derive US+Non-US -> re-prove <=2 tokens -> finalizeBucket -> read-prove all 3 gates for every
+   account BEFORE first write (no partial publish) -> publish 3 reports (brand-sales first) accept only published/
+   already-current -> live read-back + frontend payload contract. Exits nonzero on every non-success; never
+   applies migration/enables cron/touches unrelated reports.
+
+Tests: source-priority-dashboards.test.js P1-P9 (33) + source-production-hardening F11a-f/F12a-d (117) +
+schema-contract-mutation (50, incl 14 m9) + release-selftest (181, incl stage-8). node --check + npm run verify
+(57 steps/37 suites) + git diff --check GREEN. Commit 3776873 (code/tests/migration/release-engine) + docs
+separate. Migration + baselines UNAPPLIED. STOPPED for Codex re-review; no production action.
+See [[scheduler-v2-golive-status]].

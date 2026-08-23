@@ -54,40 +54,72 @@ controls, approvals, scope, or publish behaviour, and an unknown report key can 
 brand-inventory), `catalogSourceKey`, `buckets`, `maxCatalogCreates=1`, `maxTokens=2`, and the `operationKey` the
 durable reservation is keyed to.
 
-## 3. Reviewed cycle-close (`verifyAndFinalize`)
+## 3. Reviewed cycle-close + no caller-forgeable scope (`deriveBucket` / `finalizeBucket`)
 
-The priority **source** runtime still never finalizes the shared cycle. After a bucket derive, the release
-operation verifies the **exact** cycle before calling the guarded `finalize_sync_cycle` RPC:
+Both operations take **only the bucket identifier** — a caller cannot inject a preflight, an account list,
+collaborators, dates, readiness, or scope. `deriveBucket(bucket)` creates its own deadline and runs its own
+production preflight. The priority **source** runtime still never finalizes the shared cycle.
 
-- source jobs: **only** `product-catalog`, **all** terminal-successful;
-- report jobs: **only** `daily-reporting` / `brand-sales` / `brand-inventory`, with **exact** account scope,
-  `derive_status`/`save_status` = succeeded, `validated=true`, nonblank `snapshot_params_hash`; every expected
-  (account × report) present;
-- refuses unrelated / open / malformed work;
-- accepts **only** a strict `finalized` / `already-terminal` acknowledgement with a terminal cycle; `open-work`
-  or a malformed ack stops publication.
+`finalizeBucket(bucket)` **independently reconstructs and re-proves** the durable scope (a restart re-proves from
+durable state, never an in-memory attestation), then calls the guarded `finalize_sync_cycle` RPC:
+
+- expected accounts = **fresh, primary-only discovery** for the bucket (not caller-supplied);
+- the **cycle row itself**: exact bucket, `running` status, reviewed `manual` trigger;
+- source jobs: **exactly one** `product-catalog` job with the **reserved** canonical hash, `succeeded`, and
+  **organization** scope (its owner is `__organization`);
+- report jobs: **exactly** accounts × 3 (`daily-reporting` / `brand-sales` / `brand-inventory`), each
+  `derive_status`/`save_status` = succeeded + `validated=true` + nonblank `snapshot_params_hash`, with **no
+  duplicate** natural identities and no unrelated/unexpected account;
+- refuses unrelated / open / malformed / mis-scoped work;
+- accepts **only** a strict `finalized` / `already-terminal` acknowledgement with a terminal cycle.
 
 Because the publisher's source-of-truth gate requires a terminal cycle (`cycle_status ∈ {succeeded, partial}`),
 the real publisher returns `not-successful` for all three reports **before** finalization and publishes only
 **after** the genuine terminal cycle exists.
 
-## 4. The durable one-Catalog-export / two-token ceiling
+## 4. The durable OPERATION-WIDE one-Catalog-export / two-token ceiling
 
-The ceiling is **durable**, not a process-local counter (which could not survive a restart or two concurrent
-processes). An atomic reservation is keyed to the frozen operation + the **exact canonical Catalog request
-hash**. The Catalog is organization-scoped, so US and Non-US resolve the **same** hash and thus the same
-reservation row — one create total.
+The ceiling is **durable and operation-wide**, not a process-local counter (which could not survive a restart or
+two concurrent processes) and not per-hash (which a changed hash could slip past). The reservation identity is
+the **operation alone** (`operation_key` is the primary key), so one operation authorizes at most ONE Catalog
+create ever. The first canonical Catalog request hash is stored as **immutable evidence**; a **different** hash
+for the same operation (e.g. midnight / `asOf` date drift) is a typed **hash-mismatch** authorizing **zero**
+creates. The Catalog is organization-scoped, so US and Non-US resolve the **same** hash and share the one row.
 
-- New additive, **UNAPPLIED** migration `supabase/migrations/20260825_priority_catalog_reservation.sql`: the
-  `source_priority_catalog_reservation` table + `reserve_priority_catalog_create` /
-  `record_priority_catalog_export` SECURITY DEFINER RPCs (advisory-locked, atomic) + RLS + least-privilege ACL
-  (service_role SELECT only; all writes via the RPCs). supabase.js wrappers wire them; `makeDurableCatalogGuard`
-  enforces them.
+- New additive, **UNAPPLIED** migration `supabase/migrations/20260825_priority_catalog_reservation.sql`
+  (Migration 9): the `source_priority_catalog_reservation` table (PK `operation_key`) +
+  `reserve_priority_catalog_create` / `record_priority_catalog_export` SECURITY DEFINER RPCs (advisory-locked on
+  the operation key, atomic; the RPCs never DELETE, never mutate the immutable hash, and only advance status
+  `reserved`→`created`) + RLS + coherent admin-read ACL (authenticated SELECT reachable only via the admin-only
+  policy; service_role SELECT). The supabase.js wrappers validate **every** acknowledgement strictly (exactly
+  one plain object, a known disposition, the exact `operation_key` + `catalog_request_hash` echoes, and
+  disposition-dependent fields) and fail closed before any POST; `makeDurableCatalogGuard` enforces the flow.
 - Flow: the reservation **winner** performs the ONE create (2 tokens) then records its export id; a later attempt
   whose reservation already carries an export id **adopts** it (poll/download only, zero create/tokens); a
   reservation without a recorded export id (a create in flight / commit-unknown) is **AMBIGUOUS** and never falls
-  back to a second create. Any OLI/Ads/FBA/other create throws. This holds across US + Non-US, retries,
-  restarts, concurrent invocations, and commit-unknown outcomes.
+  back to a second create; a **hash-mismatch** is refused (no second create). Any OLI/Ads/FBA/other create
+  throws. This holds across US + Non-US, retries, restarts, concurrency, commit-unknown, and date drift.
+
+## 4b. Release registration (Migration 9) + the strict operator runner
+
+- **Both** release contracts register Migration 9: `lib/server/sync/schema-contract.js` (System B, in
+  `npm run verify`) — the table + RPC contract, **structural function-body proofs** (operation-wide one-create,
+  immutable hash, hash-mismatch, record conflict, no reset/delete route), wrapper registration, and 14 mutation
+  regressions; and `scripts/release/release-manifest.mjs` (System A) — the Migration 9 entry (frozen SHA-256
+  `daf1997a173fbf9c9447a61883a32f8b129e9b666eb2e0d2ee3d4a78da045a7f`, advisory locks `[20260825, 1]`).
+  `release-state.mjs` gains the stage-8 baseline trio + `runApply` dispatch; a **dedicated** `re-anchor-stage8.mjs`
+  (hard-coded `ANCHOR=8`) governs ONLY Migration 9; `ro-prod-check.mjs` / `apply-one-migration.mjs` extend to
+  stage 8; `release-selftest.mjs` gains a stage-8 block. (The `created_coherent` canon in System A is a
+  best-effort pending live `bodyCanon(pg_get_constraintdef)` verification; ro-prod-check fails closed on a
+  mismatch. Regenerate the `.release-baseline*.json` against production as the guarded release step.)
+- **Strict operator runner** `lib/server/sync/source-priority-release-runner.js` (offline-tested) +
+  `scripts/release/priority-dashboards-release.mjs` (deferred CLI): read-only reconciliation before any write;
+  derive US then Non-US; re-prove the durable ≤2-token reservation; finalize each cycle via the corrected
+  verifier; **read-prove all three publication gates for every account BEFORE the first live write** (no partial
+  publish); publish the three reports (brand-sales before brand-inventory) accepting **only**
+  `published`/`already-current`; read back the live identities and prove the frontend payload contract. It never
+  applies a migration, enables the scheduler/cron, or touches unrelated reports, and **exits nonzero on every
+  non-success disposition**.
 
 ## 5. Complete-surface publish (`publishAccount`)
 
@@ -119,12 +151,15 @@ and never enables the scheduler.
 
 ## Operator run (deferred — do NOT run in production before Codex sign-off)
 
-1. Apply migration `20260825_priority_catalog_reservation.sql`; confirm ≥2 DataDoe tokens (read-only).
-2. On ONE `buildPriorityDashboardsRelease` instance: for each bucket, `preflightEvidence` → `deriveBucket`; then
-   `verifyAndFinalize({ cycleId, expectedAccountIds })`. Assert the durable reservation shows ≤1 create / 2
-   tokens and zero non-catalog creates throughout.
-3. Open the publisher gates for `daily-reporting` + `brand-sales` + `brand-inventory` only, `publishAccount` each
-   eligible account (brand-sales before brand-inventory), verify each live snapshot, then close the gates.
-4. Frontend-verify `GET /api/datadoe?action=daily&…`, `…?action=brand-sales&…`, `…?action=brand-inventory&…`.
-5. Keep every other report paused; keep the scheduler disabled (`all_primary=false`, no cron). Stop for Codex
-   review before any scheduler enablement.
+1. Apply Migration 9 through the **guarded release step** only: `ro-prod-check.mjs 8` → `re-anchor-stage8.mjs`
+   (regenerate the stage-8 baseline) → `apply-one-migration.mjs 20260825_priority_catalog_reservation.sql`.
+   Confirm ≥2 DataDoe tokens (read-only). Verify the `created_coherent` canon against the live catalog first.
+2. Open the publisher gates for `daily-reporting` + `brand-sales` + `brand-inventory` only (durable report/
+   promoted controls, account rollout, per-(report, account) approvals).
+3. Run the strict runner `node scripts/release/priority-dashboards-release.mjs` (exits nonzero on any
+   non-success): read-only reconciliation → derive US then Non-US → re-prove ≤2 tokens → `finalizeBucket` each
+   bucket → read-prove all three gates for every account → publish (brand-sales before brand-inventory) →
+   live-identity read-back with the frontend payload contract (`GET /api/datadoe?action=daily|brand-sales|
+   brand-inventory`).
+4. Close the temporary gates. Keep every other report paused; keep the scheduler disabled (`all_primary=false`,
+   no cron). Stop for Codex review before any scheduler enablement.
