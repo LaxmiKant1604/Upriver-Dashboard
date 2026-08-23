@@ -20,9 +20,10 @@ for (const line of readFileSync(repoRoot + "/.env.local", "utf8").split(/\r?\n/)
 }
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 
-const { buildBucketSourceSyncRuntime, makeSupabaseSourceStore, makeDataDoeAdapter } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
+const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
+const { makeSupabaseSourceStore, makeDataDoeAdapter } = await import("../../lib/server/sync/source-sync-driver.js");
 const bucketSync = await import("../../lib/server/sync/source-bucket-sync.js");
-const { getDataDoeConnections } = await import("../../lib/server/datadoe.js");
+const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 const { buildNonUsOliDownloadRecovery, NONUS_OLI_DOWNLOAD_RECOVERY, recoveryExitDecision } = await import("../../lib/server/sync/source-oli-recovery-operation.js");
 
 const C = NONUS_OLI_DOWNLOAD_RECOVERY;
