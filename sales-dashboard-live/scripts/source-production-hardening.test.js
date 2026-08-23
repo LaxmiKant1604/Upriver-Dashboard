@@ -425,6 +425,7 @@ function makeHarness(over = {}) {
     loadHistoryRows: over.loadHistoryRows || (async () => [...durableHistory.values()].map((r) => ({
       account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin,
       currency: r.currency, sales_amount: r.salesAmount, units: r.units,
+      source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? null, // durable OLI provenance
     }))),
     updateRunStatus: async () => ({ write: "ok" }),
     // Round-5: the REAL paramsHashFor hash (so the genuine publisher hash-provenance gate can accept these
@@ -660,6 +661,59 @@ test("F4e. NO opened cycle (OLI paused, catalog/FBA fresh, full coverage) is NOT
   assert.equal(h.recorded.shadowSaves.length, 0, "ZERO durable snapshot saves (no plain wall-clock save either)");
   assert.equal(h.recorded.lineage.length, 0, "ZERO publishable report lineage (no upsert/claim/save/reconcile)");
   assert.equal(h.dd.totalCreates(), 0, "ZERO DataDoe exports");
+});
+
+// The durable-evidence lineage (provenance binding): OLI is PAUSED (zero OLI creates) but its history is already
+// fully proven, and the catalog fetch opens the owning cycle. A covered account must derive off the durable OLI
+// and its report OLI depends_on must bind the DURABLE provenance (the persisted source_request_hash), not the
+// empty current cycle. A history row lacking its provenance fails that account closed.
+function durableOliProvenanceHarness(over = {}) {
+  const h = makeHarness({
+    // OLI PAUSED => zero OLI export this cycle. Catalog ABSENT => the catalog fetch opens the owning cycle. FBA
+    // fresh => no FBA fetch, so the cycle holds ONLY the catalog job (no OLI).
+    readSourceControls: async () => ({ rows: [{ source_key: "order-line-items", paused: true }], read: "ok", error: null }),
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }), // FULL OLI coverage
+    readSnapshot: async ({ sourceKey, scopeKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: null, read: "ok", error: null } // catalog absent => fetched this cycle
+      : { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null }),
+    ...over,
+  });
+  for (const a of ["A01", "A02"]) h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + a + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
+  return h;
+}
+
+test("F4f. durable provenance: OLI paused (zero OLI creates) + catalog fetched => a covered account derives; its OLI depends_on binds the DURABLE source_request_hash (not the current cycle)", async () => {
+  const h = durableOliProvenanceHarness();
+  // Durable OLI history WITH provenance (the already-persisted exports); NO OLI job in this cycle.
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1, sourceRequestHash: "oli-prov-A01" });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items").length, 0, "ZERO OLI create-exports");
+  assert.ok(rollup.derived.daily.saved >= 1, "the covered account derived Daily off durable OLI");
+  assert.ok(rollup.derived.brandView.saved >= 1, "and Brand View off the SAME durable OLI");
+  // The report lineage's OLI depends_on is the DURABLE provenance -- no OLI job exists in this cycle.
+  const jobs = h.store.listSourceJobs(rollup.cycleId);
+  assert.equal(jobs.filter((j) => j.source_key === "order-line-items").length, 0, "no OLI job in the owning (catalog) cycle");
+  const catalogHash = (jobs.find((j) => j.source_key === "product-catalog") || {}).request_hash;
+  for (const rk of ["daily-reporting", "brand-sales"]) {
+    const up = h.recorded.lineage.find((l) => l.op === "upsert" && l.reportKey === rk && l.accountId === "A01");
+    assert.ok(up, rk + " lineage upserted");
+    assert.ok(up.dependsOn.includes("oli-prov-A01"), rk + ": OLI depends_on binds the durable provenance hash");
+    assert.ok(catalogHash && up.dependsOn.includes(catalogHash), rk + ": catalog depends_on from THIS cycle");
+    assert.ok(up.dependsOn.every((x) => x === "oli-prov-A01" || x === catalogHash), rk + ": no unproven/foreign hash in depends_on");
+  }
+});
+
+test("F4g. fail closed: a covered account whose durable OLI history row LACKS its source_request_hash is skipped (durable-oli-provenance-missing), never published with unproven lineage", async () => {
+  const h = durableOliProvenanceHarness();
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 }); // NO sourceRequestHash
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items").length, 0, "still ZERO OLI creates");
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed with the typed provenance-missing skip");
+  assert.ok(h.recorded.shadowSaves.every((s) => s.accountId !== "A01"), "no A01 snapshot was saved without proven OLI provenance");
 });
 
 /* ================================= F5. atomic OLI replacement ================================= */

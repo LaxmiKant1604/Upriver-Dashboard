@@ -1117,7 +1117,7 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
     throw new Error("getSourceOliHistoryRows requires organizationFingerprint + from + to (fail closed).");
   }
   const query = new URLSearchParams({
-    select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,sales_amount,units",
+    select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,sales_amount,units,source_request_hash",
     organization_fingerprint: `eq.${organizationFingerprint}`,
     connection_id: `eq.${connectionId}`,
     sale_date: `gte.${from}`,

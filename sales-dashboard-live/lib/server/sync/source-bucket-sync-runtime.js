@@ -640,7 +640,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       if (liveEvidence && outcome && outcome.write === "ok" && !dl.aborted()) {
         const keep = liveEvidence.historyRows.filter((r) => !(r.account_id === args.accountId && r.sale_date >= args.coveredFrom && r.sale_date <= args.coveredTo));
         for (const r of args.rows || []) {
-          keep.push({ account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin, currency: r.currency, sales_amount: r.salesAmount, units: r.units });
+          keep.push({ account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin, currency: r.currency, sales_amount: r.salesAmount, units: r.units, source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? null });
         }
         liveEvidence.historyRows = keep;
         (liveEvidence.oliCoverageByAccountId[args.accountId] = liveEvidence.oliCoverageByAccountId[args.accountId] || []).push({ from: args.coveredFrom, to: args.coveredTo });
@@ -830,6 +830,42 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       "brand-sales": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
       [BRAND_INVENTORY_SNAPSHOT_KEY]: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY],
     };
+    // Durable-evidence lineage (provenance binding): the DURABLE OLI history each account's rows came from
+    // carries their originating source_request_hash. When THIS cycle planned no new OLI export for an account
+    // (its OLI is already fully proven -- the zero-OLI-create covered-account derivation), the report's OLI
+    // depends_on binds to that PERSISTED provenance instead of the (empty) current cycle. It is account-EXACT
+    // (keyed by the account's own rows; a batch export legitimately serves its <=5 owner accounts) and fails
+    // closed: a ready account with NO durable OLI provenance, or a row missing its source_request_hash, is a
+    // typed skip -- never a snapshot with unproven lineage. When this cycle DID fetch OLI, the behaviour is
+    // byte-identical (the cycle's own succeeded OLI hash is used, exactly as before).
+    const oliProvenanceByAccount = new Map(); // accountId -> Set(source_request_hash | null-for-malformed)
+    for (const r of historyRows || []) {
+      const aid = String(r.account_id ?? r.accountId ?? "");
+      if (!aid) continue;
+      if (!oliProvenanceByAccount.has(aid)) oliProvenanceByAccount.set(aid, new Set());
+      const h = r.source_request_hash ?? r.sourceRequestHash;
+      oliProvenanceByAccount.get(aid).add(typeof h === "string" && h.trim() !== "" ? h : null);
+    }
+    // Returns { deps: sorted hashes, oliMissing }. Non-OLI families always come from THIS cycle's succeeded
+    // jobs (catalog/FBA are fetched/refreshed per cycle). OLI comes from this cycle when present, else from the
+    // durable provenance (fail-closed when a ready OLI-dependent account has no/malformed durable provenance).
+    const dependsOnFor = (accountId, reportKey) => {
+      const families = LINEAGE_DEPENDS_ON[reportKey] || [];
+      if (!families.includes(OLI_SOURCE_KEY)) return { deps: succeededHashesFor(accountId, families), oliMissing: false };
+      const nonOli = families.filter((f) => f !== OLI_SOURCE_KEY);
+      const otherHashes = succeededHashesFor(accountId, nonOli);
+      const oliCycleHashes = succeededHashesFor(accountId, [OLI_SOURCE_KEY]);
+      let oliDeps;
+      let oliMissing = false;
+      if (oliCycleHashes.length > 0) {
+        oliDeps = oliCycleHashes; // OLI fetched THIS cycle -> unchanged behaviour
+      } else {
+        oliDeps = [...(oliProvenanceByAccount.get(String(accountId)) || [])]; // persisted earlier -> durable provenance
+        oliMissing = oliDeps.length === 0 || oliDeps.some((h) => !h); // no rows / a row lacked its provenance
+      }
+      const deps = [...new Set([...otherHashes, ...oliDeps.filter(Boolean)])].sort();
+      return { deps, oliMissing };
+    };
     // Round-7 finding 1: CLAIM-LEASE -> save-if-absent -> RECONCILE. The lease makes a commitUnknown
     // mid-derive recoverable: a fresh invocation observes 'already-complete' (nothing to do), 'held' (a live
     // worker owns it -- never stolen), 'terminal' (failed/skipped for this cycle), 'claimed' (first-time) or
@@ -849,10 +885,17 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         return { complete: true, newlySaved: true, saved, lineage: "unavailable" };
       }
       const note = (outcome, detail) => rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome, ...(detail ? { detail } : {}) });
+      // Provenance binding + fail-closed: a ready OLI-dependent account whose durable OLI provenance is
+      // missing/malformed is NEVER saved/published with unproven lineage.
+      const dep = dependsOnFor(snap.accountId, snap.productionReportKey);
+      if (dep.oliMissing) {
+        note("durable-oli-provenance-missing");
+        return { complete: false, newlySaved: false, saved: null, lineage: "durable-oli-provenance-missing" };
+      }
       await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
-        dependsOn: succeededHashesFor(snap.accountId, LINEAGE_DEPENDS_ON[snap.productionReportKey] || []),
+        dependsOn: dep.deps,
       }, { signal }), { write: true });
       // Round-8 finding 1: the claim uses DATABASE-authoritative time -- NO caller clock is passed.
       const lease = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimLease(
