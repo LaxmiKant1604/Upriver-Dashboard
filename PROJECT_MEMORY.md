@@ -10827,3 +10827,27 @@ change intentionally does not implement the separate durable-evidence lineage re
 node --check + focused planner/bucket suites + `npm run verify` GREEN; `git diff --check` clean. Code/tests
 committed first, docs separately; then STOP for Codex review. No push/deploy/production/DataDoe export.
 See [[scheduler-v2-complete-window-wip]].
+
+## Priority OLI go-live: blank-currency evidence correction -- 2026-08-23
+
+The reviewed complete-window commits were pushed and deployed (`029b3c2`; Vercel deployment
+`dpl_A8iHXcXUarZkSQodGy2AqYtU3oTS`, production alias Ready). A read-only DataDoe usage-log check proved exactly
+28 usable extra-pool tokens. Live planning proved US 8 accounts => 4 creates/8 tokens and non-US 22 accounts =>
+10 creates/20 tokens, OLI-only, every window <=441 days.
+
+The authorized US pass created exactly four OLI exports once and spent exactly eight tokens. All four source
+jobs succeeded, with 16 owner rows across exactly eight primary US accounts; no report job, shadow snapshot, or
+live publication was written. Durable history persistence then failed closed because DataDoe returned blank
+`item_price_currency` on some grouped OLI rows. Aggregate read-only inspection of the cached payloads proved:
+34,289 rows total; 3,054 blank-currency rows; zero malformed nonblank currencies; zero blank-currency rows with
+nonzero sales; 35 with nonzero units; every blank row's exact seller/account has a canonical discovery currency;
+zero unknown sellers; and zero explicit-currency/account-currency mismatches.
+
+Correction (`b681bf6`): `oliHistoryRowsFromFragment` now uses the exact seller/account's canonical discovery
+currency ONLY when DataDoe leaves `item_price_currency` blank. A malformed nonblank source currency, unknown
+seller, or missing/malformed account fallback still rejects the whole payload. The real bucket persistence map
+now carries `{accountId,currency}`. Pure D2b and end-to-end D1b prove blank zero-sales/unit evidence persists in
+the authoritative currency while all prior fail-closed currency checks remain. Focused suites pass; the full
+verify passed all 54 test stages and the production build passed separately outside the sandbox (sandboxed
+esbuild spawn was EPERM). The same US cycle can resume entirely from its four exact cached exports with zero
+new DataDoe creates; non-US has not started and retains its 20-token ceiling.
