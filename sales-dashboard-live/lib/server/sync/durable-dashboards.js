@@ -356,10 +356,16 @@ export function deriveDurableDashboardSnapshots({
     }
   }
 
-  const brandViewReadinessResult = brandViewReadiness({
-    accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, asinAds, fbaSnapshotsByAccount,
-    from: brandViewWindow.from, to: brandViewWindow.to,
-  });
+  // The fixed-start OLI backfill yields an EMPTY authorized window when asOf precedes the start (from > to);
+  // Brand View then has no window to prove and is simply NOT-READY (a typed skip, never a hard error) -- the
+  // same empty-window contract the OLI planner already honours. In production asOf is always well past the start.
+  const brandViewWindowValid = brandViewWindow && brandViewWindow.from <= brandViewWindow.to;
+  const brandViewReadinessResult = brandViewWindowValid
+    ? brandViewReadiness({
+      accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, asinAds, fbaSnapshotsByAccount,
+      from: brandViewWindow.from, to: brandViewWindow.to,
+    })
+    : { ready: false, adsReady: false, blockedBy: [{ sourceKey: "order-line-items", reason: "backfill-start-not-reached", accountId: null, blocksSales: true }] };
   const brandView = { readiness: brandViewReadinessResult, snapshots: [], skipped: [] };
   if (brandViewReadinessResult.ready) {
     for (const account of accounts) {

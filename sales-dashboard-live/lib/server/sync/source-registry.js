@@ -65,10 +65,17 @@ export const SOURCE_REGISTRY = Object.freeze([
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
     usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"],
     usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "priority-feed"],
-    // Initial backfill = the LONGEST window any Daily Reporting / Brand View (brand-sales) contract requires:
-    // brand-sales:order-lines spans monthStart(asOf)-420..asOf, Daily spans monthBack(asOf,5)..asOf, so 420
-    // days from the month start covers both (asserted in the registry test against the executable contracts).
-    initialBackfill: { kind: "window-days", days: 420 },
+    // Authorized durable OLI backfill: the complete missing window per <=5-seller batch (no 7-day pre-slicing),
+    // SPLIT into contiguous chunks no larger than the proven application safety cap (MAX_OLI_EXPORT_WINDOW_DAYS).
+    // A GENUINELY FIXED calendar start (2025-01-01), so the authorized window is [2025-01-01, asOf] for ANY asOf
+    // and the start NEVER drifts as the month rolls over (a window-days-from-month-start policy would move the
+    // start forward every month). [2025-01-01, asOf] is a SUPERSET of the longest executable Daily/Brand View
+    // contract window (brand-sales monthStart(asOf)-420, Daily monthBack(asOf,5)), so it fully covers both.
+    // Proven HISTORY before the rolling refresh window is never re-exported; the trailing incrementalRefresh
+    // window (below) IS re-pulled every run so recent-day corrections are captured.
+    initialBackfill: { kind: "fixed-start", start: "2025-01-01" },
+    // The trailing window DataDoe still restates: re-exported every run (replace-matching-rows) via the bucket
+    // planner's coverage clip, so late corrections to recent days are always captured.
     incrementalRefresh: { kind: "rolling-window-days", days: 7, upsert: "replace-matching-rows" },
     tokenClass: "standard",
     planning: "static",

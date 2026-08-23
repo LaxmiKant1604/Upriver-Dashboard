@@ -54,12 +54,25 @@ const fullCoverage = (from, to) => [{ from, to }];
 
 group("A. windows");
 
-test("A1. the OLI initial backfill is 420 days from the month start and covers Daily's 5-month window", () => {
+test("A1. the OLI initial backfill window starts at the FIXED 2025-01-01 (=[2025-01-01, asOf]) and covers Daily's 5-month window", () => {
   const w = model.oliBackfillWindow(ASOF);
   assert.equal(w.to, ASOF);
-  assert.equal(w.from, dates.addDaysStr(dates.monthStartStr(ASOF), -420));
-  assert.ok(w.from <= dates.monthBackStr(ASOF, 5), "the Daily window is a strict subset of the backfill");
+  assert.equal(w.from, "2025-01-01", "the authorized durable OLI backfill starts at the FIXED 2025-01-01");
+  assert.ok(w.from <= dates.monthBackStr(ASOF, 5), "the Daily 5-month window is a strict subset of the backfill");
   assert.throws(() => model.oliBackfillWindow("2026-8-1"), /fail closed/);
+});
+
+test("A1b. the fixed start NEVER drifts as the month rolls over (Aug, Sep, and future months all keep 2025-01-01)", () => {
+  // A window-days-from-month-start policy would move the start forward every month; a genuinely fixed start does
+  // not. Prove the start stays 2025-01-01 across a month rollover and far into the future.
+  for (const asOf of ["2026-08-01", "2026-08-21", "2026-08-31", "2026-09-01", "2026-09-15", "2026-12-31", "2027-06-08", "2028-02-29"]) {
+    assert.deepEqual(model.oliBackfillWindow(asOf), { from: "2025-01-01", to: asOf }, "fixed start 2025-01-01 for asOf " + asOf);
+  }
+  // Same calendar month, different day, and consecutive months -> identical start (no month-boundary drift).
+  assert.equal(model.oliBackfillWindow("2026-08-31").from, model.oliBackfillWindow("2026-09-01").from, "Aug 31 and Sep 1 share the fixed start");
+  // asOf BEFORE the fixed start => an EMPTY authorized window (from > to), never a throw.
+  const early = model.oliBackfillWindow("2024-12-31");
+  assert.ok(early.from > early.to, "an asOf before the fixed start yields an empty (from > to) window, not a config error");
 });
 
 test("A2. the rolling refresh window is exactly 7 days ending at asOf", () => {
@@ -107,15 +120,14 @@ test("C1. steady state: all 5 members missing the rolling slices => ONE batch ex
   }
 });
 
-test("C2. a newly discovered account backfills SOLO; completed members are never re-exported", () => {
+test("C2. a newly discovered account backfills SOLO over ONE complete window; completed members are never re-exported", () => {
   const from = "2026-07-01"; const to = "2026-07-31";
   const coverage = Object.fromEntries(ACCTS.slice(0, 4).map((a) => [a.accountId, fullCoverage(from, to)]));
-  // A5 is new: no coverage at all.
+  // A5 is new: no coverage at all => ONE complete-window export over [from, to] for ONLY S5 (no 7-day slicing).
   const units = model.planOliSliceExports({ batchAccounts: ACCTS, coverageByAccountId: coverage, from, to });
-  assert.equal(units.length, dates.canonicalOliSlices(from, to).length, "one unit per historical slice");
-  for (const u of units) {
-    assert.deepEqual(u.sellerOrVendorIds, ["S5"], "ONLY the new account's missing backfill is processed");
-  }
+  assert.equal(units.length, 1, "ONE complete-window unit (the 4 completed members are never re-exported)");
+  assert.deepEqual(units[0].slice, { from, to }, "the full missing window, unsliced");
+  assert.deepEqual(units[0].sellerOrVendorIds, ["S5"], "ONLY the new account's missing backfill is processed");
 });
 
 test("C3. fully proven window => ZERO units; malformed batches fail closed", () => {
@@ -125,6 +137,35 @@ test("C3. fully proven window => ZERO units; malformed batches fail closed", () 
   assert.throws(() => model.planOliSliceExports({ batchAccounts: [], coverageByAccountId: {}, from, to }), /1\.\.5 account/);
   assert.throws(() => model.planOliSliceExports({ batchAccounts: [...ACCTS, { accountId: "A6", rawSellerId: "S6" }], coverageByAccountId: {}, from, to }), /1\.\.5 account/);
   assert.throws(() => model.planOliSliceExports({ batchAccounts: [{ accountId: "A1", rawSellerId: " " }], coverageByAccountId: {}, from, to }), /rawSellerId/);
+});
+
+test("C5. a missing window longer than the proven single-export cap SPLITS into contiguous <=cap chunks", () => {
+  const CAP = model.MAX_OLI_EXPORT_WINDOW_DAYS;
+  assert.equal(CAP, 441, "the proven single-export cap is 441 days");
+  // splitWindowToMaxSpan: within-cap window stays ONE; an over-cap window splits contiguously; the chunks
+  // reconstruct the exact window and none exceeds the cap.
+  const within = { from: "2026-01-01", to: dates.addDaysStr("2026-01-01", CAP - 1) }; // exactly CAP days
+  assert.deepEqual(model.splitWindowToMaxSpan(within), [within], "a window of exactly CAP days is ONE export");
+  // The EXACT go-live window [2025-01-01, 2026-08-21] (598 inclusive days) => exactly two chunks with these
+  // boundaries (441 + 157 days). Codex-pinned.
+  assert.deepEqual(model.splitWindowToMaxSpan({ from: "2025-01-01", to: "2026-08-21" }), [
+    { from: "2025-01-01", to: "2026-03-17" }, // 441 inclusive days
+    { from: "2026-03-18", to: "2026-08-21" }, // 157 inclusive days
+  ], "the go-live window splits at exactly [2025-01-01..2026-03-17] and [2026-03-18..2026-08-21]");
+  const over = { from: "2025-01-01", to: "2026-08-15" }; // ~592 days > CAP
+  const chunks = model.splitWindowToMaxSpan(over);
+  assert.ok(chunks.length >= 2, "an over-cap window splits into multiple chunks");
+  assert.equal(chunks[0].from, over.from, "the first chunk starts at the window start");
+  assert.equal(chunks[chunks.length - 1].to, over.to, "the last chunk ends at the window end");
+  for (const c of chunks) assert.ok(dates.addDaysStr(c.from, CAP - 1) >= c.to, "every chunk is within the cap");
+  for (let i = 1; i < chunks.length; i += 1) assert.equal(chunks[i].from, dates.addDaysStr(chunks[i - 1].to, 1), "chunks are contiguous (no gap/overlap)");
+  assert.throws(() => model.splitWindowToMaxSpan({ from: "2026-02-01", to: "2026-01-01" }), /fail closed/);
+  // planOliSliceExports applies the cap: a new account's full >cap window becomes multiple <=cap exports, all
+  // carrying the SAME single-seller batch scope, together covering the whole window.
+  const units = model.planOliSliceExports({ batchAccounts: [{ accountId: "A1", rawSellerId: "S1" }], coverageByAccountId: {}, from: over.from, to: over.to });
+  assert.equal(units.length, chunks.length, "one export per capped chunk");
+  for (const u of units) assert.deepEqual(u.sellerOrVendorIds, ["S1"], "every chunk carries the same batch scope");
+  assert.deepEqual(units.map((u) => u.slice), chunks, "the exports reconstruct the full missing window as contiguous <=cap chunks");
 });
 
 test("C4. successful slices roll up into minimal coverage windows", () => {

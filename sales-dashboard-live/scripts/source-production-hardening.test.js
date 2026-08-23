@@ -40,7 +40,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runtimeMod; let registry; let schema; let dates; let identity; let reportStore;
+let runtimeMod; let registry; let schema; let dates; let identity; let reportStore; let durableModel;
 
 // Round-9: canonical JSON (sorted object keys, array order preserved) mirroring the runtime's canonicalJson,
 // so the harness freshness-CAS proves content identity the same way the production CAS does.
@@ -634,6 +634,34 @@ test("F4d. non-ready readiness => TYPED derive skip, nothing saved, nothing fabr
   assert.ok(h.recorded.shadowSaves.every((s) => s.reportKey !== "scheduler-v2/daily-reporting-durable"), "nothing fabricated");
 });
 
+test("F4e. NO opened cycle (OLI paused, catalog/FBA fresh, full coverage) is NOT drained => ZERO snapshot saves + ZERO publishable lineage", async () => {
+  // Initial-backfill-only scope: deriving/saving report snapshots off durable evidence WITHOUT an owning cycle
+  // (and thus without claim-before-save lineage) is the SEPARATE durable-evidence-lineage rework. A run that
+  // opens no cycle must therefore stay NOT-drained and publish/schedule nothing.
+  const h = makeHarness({
+    // OLI paused => no OLI export; fresh catalog + per-account FBA snapshots => no catalog/FBA export => NO cycle.
+    readSourceControls: async () => ({ rows: [{ source_key: "order-line-items", paused: true }], read: "ok", error: null }),
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }), // FULL coverage
+    readSnapshot: async ({ sourceKey, scopeKey }) => (sourceKey === "product-catalog"
+      ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
+      : { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null }),
+  });
+  h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
+  for (const a of ["A01", "A02"]) h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + a + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.cycleId, null, "no owning cycle was opened (nothing needed fetching)");
+  assert.equal(rollup.globalDrained, false, "a run without an owning cycle is NOT drained");
+  assert.equal(rollup.derived.skipped, "not-drained", "the derive/save stage is skipped -- never run off a durable-evidence-only, cycle-less run");
+  assert.equal(rollup.derived.daily, null, "ZERO Daily snapshot derivation/save");
+  assert.equal(rollup.derived.brandView, null, "ZERO Brand View snapshot derivation/save");
+  assert.equal(rollup.derived.brandInventory, null, "ZERO brand-inventory derivation/save");
+  assert.equal(h.recorded.shadowSaves.length, 0, "ZERO durable snapshot saves (no plain wall-clock save either)");
+  assert.equal(h.recorded.lineage.length, 0, "ZERO publishable report lineage (no upsert/claim/save/reconcile)");
+  assert.equal(h.dd.totalCreates(), 0, "ZERO DataDoe exports");
+});
+
 /* ================================= F5. atomic OLI replacement ================================= */
 group("F5. atomic rolling-window replacement: removed grains cannot survive; replacement+ack one transaction");
 
@@ -989,8 +1017,14 @@ test("S1. a failed/limited readAdMetrics is NEVER flattened into ok-zero ads (ty
 });
 
 test("S2. genuine sync_report_jobs lineage: every durable save records upsert -> claim -> validated success with the EXACT snapshot_params_hash", async () => {
+  // Dynamic partial-tail coverage => ONE complete-window OLI export opens the cycle so claim-before-save
+  // lineage (upsert -> claim -> reconcile) is genuinely recorded; after replaceHistory acks the fetched tail
+  // the derive re-read sees full coverage and derives (a fully-covered fixture would open no cycle and record
+  // no lineage under the complete-window planner).
+  const durableCoverage = [];
   const h = makeHarness({
-    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    durableCoverage,
+    readCoverage: dynamicTailCoverage(durableCoverage),
     readSnapshot: async ({ sourceKey }) => (sourceKey === "product-catalog"
       ? { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null }
       : { snapshot: { validated_at: TODAY + "T01:00:00Z" }, read: "ok", error: null }),
@@ -1096,12 +1130,43 @@ test("S7. NONCANONICAL membership ids are REJECTED (never trimmed); the DB const
 /* ================================= T. round-5 regressions ================================= */
 group("T. round-5: claim-before-save lineage + real publisher acceptance, Brand View read path, memoized preflight, route deadline, sequential ACLs, CAS binding");
 
-// A COMPLETE durable fixture: full OLI coverage, fresh hydratable catalog + per-account FBA snapshots and
-// seeded history, so a full bucket run drains, derives Daily + Brand View + compact brand-inventory, records
-// lineage and finalizes its cycle. `over` wins over every fixture default.
+// COMPLETE-WINDOW OLI model: the authorized backfill window is [2025-01-01, asOf]. A realistic durable fixture
+// always has the most-recent tail [ASOF-6, ASOF] still MISSING (the latest completed days are never proven
+// until today's fetch), so the complete-window planner emits EXACTLY ONE OLI export per <=5-seller batch. That
+// one export opens the cycle, records claim-before-save lineage + account-exact depends_on, and -- once its
+// fetched window is ack'd into liveEvidence (runtime line ~646) -- makes the derive stage ready.
+//
+// The reader is STATIC (never grows to full on purpose): a resume re-plans the SAME missing window, REUSES the
+// cached export (zero NEW creates), idempotently re-acks the same window, and observes every report
+// already-complete -- so cycle continuity + lineage survive the resume. A fixture whose durable coverage grew
+// to FULL would leave a resume with zero OLI work, hence no rollup.cycleId and no lineage/depends_on; that
+// 0-work durable-evidence continuation is deliberately OUT of this planner-scoped change (deferred rework). The
+// "a persisted full window plans zero child exports" property is proven separately (zero-export-rehearsal).
+// DYNAMIC durable coverage, bound to the harness's `durableCoverage` log. The INITIAL persisted history proves
+// only [2025-01-01, ASOF-7] (the most-recent tail is not yet fetched), so the complete-window planner emits
+// EXACTLY ONE OLI export for the missing tail. Once that export's atomic replaceHistory acks the fetched window
+// into `durableCoverage`, a SUBSEQUENT read returns the now-extended (adjacent-merged => full) coverage --
+// exactly as a real DB re-read after the replace transaction would -- so the derive stage sees full coverage and
+// becomes ready. A resume reuses the cached export, re-acks the same window idempotently, and reaches the SAME
+// full coverage. `mergeCoverageWindows` merges the adjacent seed + tail into one proving window.
+const OLI_SEED_TO = () => dates.addDaysStr(ASOF, -7);
+function dynamicTailCoverage(durableCoverage) {
+  return async ({ accountId }) => {
+    const acked = durableCoverage.filter((c) => c.accountId === accountId).map((c) => ({ from: c.from, to: c.to }));
+    const windows = durableModel.mergeCoverageWindows([{ from: "2025-01-01", to: OLI_SEED_TO() }, ...acked]);
+    return { windows, read: "ok", error: null };
+  };
+}
+
+// A COMPLETE durable fixture: STATIC partial-tail OLI coverage (one complete-window export per batch per run),
+// fresh hydratable catalog + per-account FBA snapshots and seeded history, so a full bucket run fetches the
+// missing OLI window, drains, derives Daily + Brand View + compact brand-inventory, records lineage and
+// finalizes its cycle. `over` wins over every fixture default.
 function fullFixture(over = {}) {
+  const durableCoverage = over.durableCoverage || [];
   const h = makeHarness({
-    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    durableCoverage,
+    readCoverage: dynamicTailCoverage(durableCoverage),
     readSnapshot: async ({ sourceKey, scopeKey }) => {
       if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
       return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1 }, read: "ok", error: null };
@@ -1299,7 +1364,11 @@ test("T5. blocker 4: ONE route-owned deadline created BEFORE preflight bounds pr
   let h;
   h = fullFixture({
     store,
-    ddOpts: { onCreate: () => { h.clockRef.now += 30_000; } },
+    // Complete-window model: empty coverage => ONE full-window OLI export per batch (no 7-day slices), so a
+    // SINGLE create must burn past the reserve threshold (deadlineMs - reserveMs = t0 + 60_000) to prove the
+    // shared budget expires mid-execution. 65_000 trips it on the first create's next bounded op; total elapsed
+    // still stays under the 100_000 route budget.
+    ddOpts: { onCreate: () => { h.clockRef.now += 65_000; } },
     budgetMs: 100_000, reserveMs: 40_000,
     readCoverage: async () => ({ windows: [], read: "ok", error: null }), // full backfill => plenty of work
   });
@@ -1627,10 +1696,16 @@ test("U4. fix 4: AbortSignal reaches the REAL HTTP wrapper; before-request expir
 
 test("U5. fix 5: 30 accounts / 6 batches -- every report's depends_on is ACCOUNT-EXACT (own batch OLI + own FBA + shared catalog scope); zero cross-batch leakage", async () => {
   const ids = Array.from({ length: 30 }, (_, i) => "A" + String(i + 1).padStart(2, "0"));
+  // Partial-tail coverage => the complete-window planner emits EXACTLY ONE OLI export per <=5-seller batch (6
+  // batches => 6 OLI exports for the missing tail), so each account's depends_on carries its OWN batch's single
+  // OLI hash. (A fully-covered fixture would emit zero OLI exports under the complete-window model -- the old
+  // rolling-refresh re-fetch of the trailing window is gone.)
+  const durableCoverage = [];
   const h = makeHarness({
     primaryAccounts: ids.map((id) => dirAccount(id)),
     secondaryAccounts: [],
-    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    durableCoverage,
+    readCoverage: dynamicTailCoverage(durableCoverage),
     readSnapshot: async ({ sourceKey, scopeKey }) => {
       if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
       return { snapshot: null, read: "ok", error: null }; // FBA absent => the sync FETCHES one export per account
@@ -2967,6 +3042,7 @@ async function main() {
   dates = await import("../lib/server/date-windows.js");
   identity = await import("../lib/server/source-identity.js");
   reportStore = await import("../lib/server/report-store.js");
+  durableModel = await import("../lib/server/sync/source-durable-model.js");
 
   let failures = 0;
   for (const t of tests) {

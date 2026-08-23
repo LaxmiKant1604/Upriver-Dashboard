@@ -23,18 +23,54 @@ export const ORGANIZATION_SCOPE_KEY = "__organization";
 
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
+// APPLICATION safety cap on a SINGLE OLI export's date range. This is NOT a documented DataDoe date-range limit
+// -- it is the largest OLI window we have EMPIRICALLY proven to succeed against the live API (441 inclusive days,
+// 2026-08-22). A larger single-export range is simply UNVALIDATED; we cap here to FAIL SAFE and only raise the
+// cap after an empirical probe proves a larger range works. The brand-sales:order-lines contract window
+// (monthStart(asOf)-420 .. asOf) can reach ~450 days at month end and the initial backfill is longer still, so a
+// complete missing window that exceeds this cap is SPLIT into contiguous <=cap chunks (each its own export;
+// their coverage merges back to one window) -- no single export ever exceeds the proven-safe range.
+export const MAX_OLI_EXPORT_WINDOW_DAYS = 441;
+
+// Split an inclusive [from, to] window into contiguous chunks of at most `maxDays` inclusive days each (the
+// last chunk holds the remainder). from/to must be valid YYYY-MM-DD with from <= to.
+export function splitWindowToMaxSpan({ from, to }, maxDays = MAX_OLI_EXPORT_WINDOW_DAYS) {
+  if (!isDateStr(from) || !isDateStr(to) || from > to) {
+    throw new Error("splitWindowToMaxSpan requires a valid from <= to window (fail closed).");
+  }
+  if (!Number.isInteger(maxDays) || maxDays < 1) throw new Error("splitWindowToMaxSpan requires maxDays >= 1 (fail closed).");
+  const chunks = [];
+  let start = from;
+  for (;;) {
+    const end = addDaysStr(start, maxDays - 1); // inclusive => this chunk spans <= maxDays days
+    if (end >= to) { chunks.push({ from: start, to }); break; }
+    chunks.push({ from: start, to: end });
+    start = addDaysStr(end, 1);
+  }
+  return chunks;
+}
+
 /**
- * The INITIAL OLI backfill window as of `asOf`: the longest period any Daily Reporting / Brand View
- * (brand-sales) contract requires -- 420 days back from the month start (the Brand Sales span; Daily's
- * 5-month window is a strict subset). The day count is READ from the registry's reviewed policy and
- * cross-checked against the executable contracts by the registry test, so this window can never silently
- * drift from what the dashboards actually need.
+ * The INITIAL OLI backfill window as of `asOf`: [fixed-start, asOf]. The registry pins a GENUINELY FIXED
+ * calendar start (2025-01-01) -- a SUPERSET of the longest period any Daily Reporting / Brand View (brand-sales)
+ * contract requires (brand-sales monthStart(asOf)-420; Daily's 5-month window is a strict subset), cross-checked
+ * against the executable contracts by the registry test. Because the start is fixed (not "N days from the month
+ * start"), it does NOT drift forward as the month rolls over -- August, September and every later month keep the
+ * exact same 2025-01-01 start. (The legacy window-days branch is retained for any non-OLI caller.)
  */
 export function oliBackfillWindow(asOf) {
   if (!isDateStr(asOf)) throw new Error("oliBackfillWindow requires a YYYY-MM-DD asOf (fail closed).");
   const policy = sourceRegistryEntry(OLI_SOURCE_KEY).initialBackfill;
-  if (policy.kind !== "window-days") throw new Error("oliBackfillWindow: the registry OLI backfill policy is not window-days (fail closed).");
-  return { from: addDaysStr(monthStartStr(asOf), -policy.days), to: asOf };
+  // fixed-start: the authorized durable OLI backfill runs one COMPLETE window [start, asOf] per <=5-seller batch
+  // (no 7-day pre-slicing). window-days (the legacy rolling policy) is kept for any non-OLI caller.
+  if (policy.kind === "fixed-start") {
+    if (!isDateStr(policy.start)) throw new Error("oliBackfillWindow: fixed-start policy requires a YYYY-MM-DD start (fail closed).");
+    // asOf before the fixed start => an EMPTY authorized window (from > to): the planner site skips OLI (nothing
+    // to backfill from a not-yet-reached start). Never throws -- an out-of-range asOf is not a config error.
+    return { from: policy.start, to: asOf };
+  }
+  if (policy.kind === "window-days") return { from: addDaysStr(monthStartStr(asOf), -policy.days), to: asOf };
+  throw new Error("oliBackfillWindow: unsupported OLI backfill policy kind (fail closed).");
 }
 
 /**
@@ -99,16 +135,48 @@ export function missingOliSlices({ coverageWindows, from, to }) {
 }
 
 /**
- * Plan the per-slice EXPORT UNITS for one stable <=5-account batch: for every canonical slice of
- * [from, to], the batch members whose own coverage does NOT prove that slice form ONE export unit scoped to
- * exactly those members (sorted; a stable subset => a stable request identity).
- *   - steady state (all members missing the new rolling slices)   => ONE batch export per slice;
- *   - a newly discovered account joining the batch                => SOLO exports for ONLY its missing
- *     historical slices -- completed members are never re-exported;
- *   - fully proven slices                                          => NO unit at all.
- * `batchAccounts`: [{ accountId, rawSellerId }] (<=5, the stable batch membership order is irrelevant --
- * members are sorted per unit). `coverageByAccountId`: accountId -> proven windows.
- * Returns [{ slice:{from,to}, accounts:[{accountId,rawSellerId}], sellerOrVendorIds:[sorted] }].
+ * The CONTIGUOUS missing windows of [from, to] NOT proven by `coverageWindows` (the complement of the merged
+ * coverage inside [from, to]). Empty coverage => the single window [from, to]; full coverage => []. A gap
+ * boundary is inclusive on both ends. Malformed coverage fails the WHOLE computation closed (via mergeCoverage
+ * Windows) -- partial evidence never reads as proven.
+ */
+export function missingCoverageWindows(coverageWindows, from, to) {
+  if (!isDateStr(from) || !isDateStr(to) || from > to) {
+    throw new Error("missingCoverageWindows requires a valid from <= to window (fail closed).");
+  }
+  const merged = mergeCoverageWindows(coverageWindows);
+  const gaps = [];
+  let cursor = from; // the next uncovered date
+  for (const w of merged) {
+    const wf = w.from < from ? from : w.from;
+    const wt = w.to > to ? to : w.to;
+    if (wt < from || wf > to) continue; // window entirely outside [from, to]
+    if (wf > cursor) gaps.push({ from: cursor, to: addDaysStr(wf, -1) });
+    const next = addDaysStr(wt, 1);
+    if (next > cursor) cursor = next;
+  }
+  if (cursor <= to) gaps.push({ from: cursor, to });
+  return gaps;
+}
+
+/**
+ * Plan the COMPLETE-WINDOW export units for one stable <=5-account batch: DataDoe caps sellerOrVendorIds at 5,
+ * so a batch is <=5 accounts, and the AUTHORIZED durable OLI backfill fetches the complete missing window per
+ * batch -- NO seven-day canonical pre-slicing. Members with the SAME missing-window signature share the exports
+ * for their contiguous missing window(s) (a stable member subset over a stable window => a stable request
+ * identity). A missing window longer than DataDoe's proven single-export range (MAX_OLI_EXPORT_WINDOW_DAYS) is
+ * SPLIT into contiguous <=cap chunks (fail-safe: no export ever exceeds the proven range); a within-cap window
+ * stays ONE export:
+ *   - initial backfill (all members missing the full window)  => the full window as one-or-more <=cap exports;
+ *   - continuation over a persisted window                    => the NEW missing dates (typically the trailing
+ *                                                                rolling-refresh window the caller left missing),
+ *                                                                or NONE when the window is fully proven;
+ *   - a newly discovered account joining the batch            => its own <=cap export(s) for ONLY its missing
+ *                                                                window -- completed members are never re-exported.
+ * `batchAccounts`: [{ accountId, rawSellerId }] (<=5). `coverageByAccountId`: accountId -> proven windows.
+ * Returns [{ slice:{from,to}, accounts:[{accountId,rawSellerId}], sellerOrVendorIds:[sorted] }] -- each `slice`
+ * is a COMPLETE window (not a 7-day bin) capped at MAX_OLI_EXPORT_WINDOW_DAYS. NO adaptive slicing beyond the
+ * cap: a truncated/row-capped export fails closed upstream.
  */
 export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, to }) {
   const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
@@ -121,19 +189,27 @@ export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, 
     }
   }
   const coverage = coverageByAccountId || {};
+  // Group members by their EXACT contiguous missing-window signature; each group emits ONE complete-window
+  // export per missing window over exactly those members (sorted => a stable request identity).
+  const groups = new Map();
+  for (const a of accounts) {
+    const missing = missingCoverageWindows(coverage[a.accountId] || [], from, to);
+    if (!missing.length) continue; // completed coverage is never exported again
+    const sig = missing.map((w) => w.from + ":" + w.to).join("|");
+    if (!groups.has(sig)) groups.set(sig, { windows: missing, accounts: [] });
+    groups.get(sig).accounts.push(a);
+  }
   const units = [];
-  for (const slice of canonicalOliSlices(from, to)) {
-    const missingMembers = accounts.filter((a) => {
-      const windows = coverage[a.accountId] || [];
-      return !windowsProve(windows, slice.from, slice.to);
-    });
-    if (!missingMembers.length) continue; // completed historical coverage is never exported again
-    const sorted = [...missingMembers].sort((x, y) => (x.rawSellerId < y.rawSellerId ? -1 : 1));
-    units.push({
-      slice,
-      accounts: sorted,
-      sellerOrVendorIds: sorted.map((a) => String(a.rawSellerId)),
-    });
+  for (const g of groups.values()) {
+    const sorted = [...g.accounts].sort((x, y) => (x.rawSellerId < y.rawSellerId ? -1 : 1));
+    const ids = sorted.map((a) => String(a.rawSellerId));
+    for (const w of g.windows) {
+      // A missing window longer than DataDoe's proven single-export range is SPLIT into contiguous <=cap chunks;
+      // a within-range window stays ONE export. The chunks' coverage merges back into the one contiguous window.
+      for (const chunk of splitWindowToMaxSpan(w)) {
+        units.push({ slice: { from: chunk.from, to: chunk.to }, accounts: sorted, sellerOrVendorIds: ids });
+      }
+    }
   }
   return units;
 }

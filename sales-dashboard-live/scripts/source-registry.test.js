@@ -39,6 +39,8 @@ let reg; // source-registry module
 let contracts; // report-source-contracts module
 let sourceContracts; // canonical source-contracts module
 let tranche; // source-tranche module
+let durable; // source-durable-model module
+let dates; // date-windows module
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
@@ -238,8 +240,14 @@ test("OLI initial backfill covers the LONGEST Daily/Brand window the real contra
   const longest = Math.max(...windows);
   assert.equal(longest, 420, "the longest executable window is the 420-day Brand Sales span");
   const oli = reg.sourceRegistryEntry("order-line-items");
-  assert.equal(oli.initialBackfill.kind, "window-days");
-  assert.equal(oli.initialBackfill.days, longest, "registry initial backfill == the longest executable window");
+  // A GENUINELY FIXED calendar start (2025-01-01), not "N days from the month start": [2025-01-01, asOf] is a
+  // SUPERSET of the longest executable contract window (monthStart(asOf)-420) for the authorized go-live asOf.
+  assert.equal(oli.initialBackfill.kind, "fixed-start");
+  assert.equal(oli.initialBackfill.start, "2025-01-01", "authorized durable backfill starts at the fixed 2025-01-01");
+  const goLiveAsOf = "2026-08-21";
+  const longestStart = dates.addDaysStr(dates.monthStartStr(goLiveAsOf), -longest);
+  assert.ok(oli.initialBackfill.start <= longestStart, "the fixed start COVERS the longest executable Daily/Brand window at go-live");
+  assert.deepEqual(durable.oliBackfillWindow(goLiveAsOf), { from: "2025-01-01", to: goLiveAsOf }, "oliBackfillWindow honours the fixed start");
   assert.deepEqual(oli.incrementalRefresh, { kind: "rolling-window-days", days: 7, upsert: "replace-matching-rows" });
 });
 
@@ -260,6 +268,8 @@ async function main() {
   contracts = await import("../lib/server/sync/report-source-contracts.js");
   sourceContracts = await import("../lib/server/source-contracts.js");
   tranche = await import("../lib/server/sync/source-tranche.js");
+  durable = await import("../lib/server/sync/source-durable-model.js");
+  dates = await import("../lib/server/date-windows.js");
 
   let failures = 0;
   for (const t of tests) {

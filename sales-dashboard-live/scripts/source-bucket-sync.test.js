@@ -45,6 +45,7 @@ let contracts; // report-source-contracts
 let identity; // source-identity
 let sourceContracts; // source-contracts
 let dates; // date-windows
+let tbudget; // source-tranche-budget
 
 const API_KEY = ["prim", "key"].join("-");
 const ASOF = "2026-08-15";
@@ -53,7 +54,9 @@ const CYCLE_DATE = "2026-08-20";
 const BUCKET = "us";
 const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0"), country: "US" });
 const FIVE = [1, 2, 3, 4, 5].map(acct);
-const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-06-01", to: upTo }]]));
+// Coverage from the authorized backfill start (2025-01-01) up to `upTo`, so a steady-state account has ONLY the
+// recent [upTo+1, asOf] window missing (no early gap under the [2025-01-01, asOf] complete-window backfill).
+const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-01-01", to: upTo }]]));
 
 /* ------------------------- in-memory store (worker + budget models) ------------------------- */
 function makeStore() {
@@ -185,7 +188,7 @@ function makeDataDoe(opts = {}) {
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
       bump(create, job.requestHash);
-      createSeq.push({ sourceKey: job.sourceKey || "", requestKey: job.requestKey || "", ids: [...(job.fetchParams.sellerOrVendorIds || [])] });
+      createSeq.push({ sourceKey: job.sourceKey || "", requestKey: job.requestKey || "", ids: [...(job.fetchParams.sellerOrVendorIds || [])], from: job.fetchParams.from ?? null, to: job.fetchParams.to ?? null });
       return { exportId: "e_" + job.requestHash };
     },
     async poll() {},
@@ -303,18 +306,17 @@ test("B1. 30 accounts => 6 stable batches; the 31st joins a 7th with NOTHING res
   }
 });
 
-test("B2. steady state exports ONLY the rolling slices as batch exports; covered history is never re-exported", async () => {
+test("B2. steady state exports ONE complete-window batch export over the missing recent window; covered history is never re-exported", async () => {
   const h = runHarness({ catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: Object.fromEntries(FIVE.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])) });
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.globalDrained, true);
-  const refresh = model.oliRollingRefreshWindow(ASOF);
-  const rollingSlices = dates.canonicalOliSlices(refresh.from, refresh.to);
   const oliCreates = h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items");
-  assert.equal(oliCreates.length, rollingSlices.length, "exactly one batch export per rolling slice");
-  for (const c of oliCreates) {
-    assert.deepEqual(c.ids, FIVE.map((a) => a.rawSellerId), "the full 5-account batch scope on every rolling slice");
-  }
+  // Coverage is [2025-01-01, ASOF-7] for all 5, so ONE complete-window export over the single missing window
+  // [ASOF-6, ASOF] for the whole batch -- NOT a per-7-day-slice fan-out.
+  assert.equal(oliCreates.length, 1, "ONE complete-window batch export over the missing recent window (no per-slice fan-out)");
+  assert.deepEqual(oliCreates[0].ids, FIVE.map((a) => a.rawSellerId), "the full 5-account batch scope");
+  assert.ok(oliCreates[0].from > dates.addDaysStr(ASOF, -7), "the export begins AFTER the covered window (2025-01-01..ASOF-7) -- proven history is not re-fetched: " + oliCreates[0].from);
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog").length, 0, "fresh catalog => no export today");
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "fresh FBA snapshots => no export today");
 });
@@ -342,15 +344,47 @@ test("B4. a NEW account in a non-full batch backfills SOLO; completed members ne
   });
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
-  const refresh = model.oliRollingRefreshWindow(ASOF);
   const oliCreates = h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items");
-  const solo = oliCreates.filter((c) => c.ids.length === 1);
-  const full = oliCreates.filter((c) => c.ids.length === 5);
-  assert.ok(solo.length > 0, "historical backfill slices exist");
-  for (const c of solo) assert.deepEqual(c.ids, ["S05"], "ONLY the new account's missing backfill is processed");
-  const rollingSlices = dates.canonicalOliSlices(refresh.from, refresh.to);
-  assert.equal(full.length, rollingSlices.length, "the rolling slices still run as full-batch exports");
-  assert.equal(oliCreates.length, solo.length + full.length, "no other export shape exists (completed members untouched)");
+  // Two distinct missing-window groups: the new A05 (no coverage) over its FULL window [2025-01-01, ASOF], and the
+  // four covered members over ONLY the recent rolling-refresh window [ASOF-6, ASOF]. A05's full window exceeds
+  // DataDoe's proven single-export cap, so it SPLITS into contiguous <=cap chunks; the four-member window is small.
+  const cap = model.MAX_OLI_EXPORT_WINDOW_DAYS;
+  const solo = oliCreates.filter((c) => c.ids.length === 1).sort((a, b) => (a.from < b.from ? -1 : 1));
+  const grouped = oliCreates.filter((c) => c.ids.length === 4);
+  assert.ok(solo.length >= 1 && grouped.length === 1, "solo new-account backfill export(s) + ONE four-account recent-window export");
+  assert.equal(oliCreates.length, solo.length + grouped.length, "no other export shape (completed members untouched)");
+  for (const c of solo) assert.deepEqual(c.ids, ["S05"], "ONLY the new account gets the full missing backfill");
+  assert.deepEqual(grouped[0].ids, ["S01", "S02", "S03", "S04"], "the four covered members share ONE recent-window export");
+  assert.equal(solo[0].from, "2025-01-01", "A05 backfills from the authorized start");
+  for (const c of solo) assert.ok(dates.addDaysStr(c.from, cap - 1) >= c.to, "each solo backfill export is within the proven " + cap + "-day cap");
+  for (let i = 1; i < solo.length; i += 1) assert.equal(solo[i].from, dates.addDaysStr(solo[i - 1].to, 1), "the solo chunks are contiguous (no gap/overlap)");
+  assert.ok(solo[0].from < grouped[0].from, "A05 backfills from 2025-01-01; completed members only refresh the recent window");
+});
+
+test("B5. go-live frozen budget: 7 batches over the FIXED [2025-01-01, 2026-08-21] window => EXACTLY 14 exports / 28 tokens", () => {
+  // 35 accounts => 7 stable batches of 5. The initial complete-history backfill (empty coverage) over the FIXED
+  // window [2025-01-01, 2026-08-21] (598 inclusive days) splits at the 441-day application cap into EXACTLY two
+  // contiguous chunks per batch: [2025-01-01, 2026-03-17] (441d) and [2026-03-18, 2026-08-21] (157d).
+  const GO_LIVE = "2026-08-21";
+  const thirtyFive = Array.from({ length: 35 }, (_, i) => acct(i + 1));
+  const plan = bucketSync.planBucketSourceSync({
+    apiKey: API_KEY, bucket: BUCKET, accounts: thirtyFive, coverageByAccountId: {},
+    catalogSnapshot: { validated_at: GO_LIVE + "T01:00:00Z" }, fbaSnapshotsByAccount: {},
+    asOf: GO_LIVE, today: GO_LIVE,
+  });
+  assert.equal(plan.batches.length, 7, "35 accounts => 7 stable batches of 5");
+  const oli = plan.families.find((f) => f.sourceKey === "order-line-items");
+  // exact per-batch chunk boundaries (deduped across batches -> exactly the two chunk windows)
+  const windows = [...new Set(oli.units.map((u) => u.slice.from + ".." + u.slice.to))].sort();
+  assert.deepEqual(windows, ["2025-01-01..2026-03-17", "2026-03-18..2026-08-21"], "each batch splits into the two exact 441-capped chunks");
+  assert.equal(oli.units.length, 14, "7 batches x 2 chunks = 14 complete-window OLI exports");
+  // FROZEN budget: 14 UNIQUE OLI request hashes, standard=2 tokens each => the 28-token ceiling (NOT 7/14).
+  const budget = tbudget.computeFrozenTrancheBudget({
+    plannedJobs: oli.plannedJobs, isPremiumOf: () => false, trancheKey: "source-sync:order-line-items",
+  });
+  assert.equal(budget.hashes.length, 14, "14 distinct frozen OLI request hashes");
+  assert.equal(budget.maxCreates, 14, "EXACTLY 14 authorized OLI creates (7 batches x 2 chunks)");
+  assert.equal(budget.maxTokens, 28, "EXACTLY 28 authorized tokens (standard OLI = 2 each; NOT 7 exports / 14 tokens)");
 });
 
 /* ================================= C. catalog + FBA ================================= */
@@ -535,6 +569,7 @@ async function main() {
   identity = await import("../lib/server/source-identity.js");
   sourceContracts = await import("../lib/server/source-contracts.js");
   dates = await import("../lib/server/date-windows.js");
+  tbudget = await import("../lib/server/sync/source-tranche-budget.js");
 
   let failures = 0;
   for (const t of tests) {

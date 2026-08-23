@@ -220,16 +220,26 @@ export function planBucketSourceSync({
     const refresh = oliRollingRefreshWindow(asOf);
     const oliJobs = [];
     const allUnits = [];
-    for (const batch of batches) {
-      const members = batch.accounts;
-      const clippedCoverage = Object.fromEntries(members.map((a) => [
-        a.accountId, clipCoverageForRefresh(coverageByAccountId[a.accountId] || [], refresh.from),
-      ]));
-      const units = planOliSliceExports({ batchAccounts: members, coverageByAccountId: clippedCoverage, from: backfill.from, to: backfill.to });
-      for (const unit of units) {
-        const resolved = resolvedOliSliceBatch({ apiKey, unit, bucket });
-        oliJobs.push(...plannedBatchSourceJobs(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", unit.accounts, null));
-        allUnits.push({ ...unit, requestHash: resolved.requestHash });
+    // COMPLETE-WINDOW authorized backfill: ONE export over the full contiguous MISSING window per <=5-seller
+    // batch (no 7-day pre-slicing). Each member's coverage is first CLIPPED to exclude the trailing rolling-
+    // refresh window (registry incrementalRefresh, 7 days), so DataDoe's restatement of the last few days is
+    // always re-pulled (idempotent replace-matching-rows) while genuinely proven older history is NEVER
+    // re-exported. The clipped complement therefore merges any older gap with the always-missing trailing
+    // window into ONE contiguous [gap-start .. asOf] export per batch: initial runs fetch the whole window
+    // once; steady-state runs re-fetch only the trailing refresh window (a cache-hit-stable request identity).
+    // An empty authorized window (asOf before the fixed start) skips OLI.
+    if (backfill.from <= backfill.to) {
+      for (const batch of batches) {
+        const members = batch.accounts;
+        const clippedCoverage = Object.fromEntries(members.map((a) => [
+          a.accountId, clipCoverageForRefresh(coverageByAccountId[a.accountId] || [], refresh.from),
+        ]));
+        const units = planOliSliceExports({ batchAccounts: members, coverageByAccountId: clippedCoverage, from: backfill.from, to: backfill.to });
+        for (const unit of units) {
+          const resolved = resolvedOliSliceBatch({ apiKey, unit, bucket });
+          oliJobs.push(...plannedBatchSourceJobs(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", unit.accounts, null));
+          allUnits.push({ ...unit, requestHash: resolved.requestHash });
+        }
       }
     }
     families.push({ sourceKey: OLI_SOURCE_KEY, plannedJobs: oliJobs, units: allUnits });
@@ -581,6 +591,11 @@ export async function runBucketSourceSync({
     }
   }
 
+  // The derive is authorized ONLY off a genuine, DRAINED owning cycle. A run that opened NO cycle (no family had
+  // anything to fetch) is NOT "drained" -- it stays globalDrained=false so the derive/save stage is skipped
+  // (not-drained). Deriving + saving report snapshots from durable evidence WITHOUT an owning cycle (and thus
+  // without claim-before-save lineage) is the SEPARATE durable-evidence-lineage rework, deliberately out of this
+  // initial-backfill-only scope; until then a zero-work run publishes/schedules nothing.
   if (rollup.cycleId) {
     const rows = await store.listSourceJobs(rollup.cycleId);
     rollup.globalDrained = !rollup.stopped && rows.length > 0 && rows.every((r) => !OPEN.has(stat(r)));

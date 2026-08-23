@@ -47,7 +47,9 @@ const CYCLE_DATE = "2026-08-21";
 const BUCKET = "us";
 const acct = (i) => ({ accountId: "A" + String(i).padStart(2, "0"), rawSellerId: "S" + String(i).padStart(2, "0"), country: "US" });
 const FIVE = [1, 2, 3, 4, 5].map(acct);
-const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-06-01", to: upTo }]]));
+// Coverage from the authorized backfill start (2025-01-01) up to `upTo`, so a steady-state account has ONLY the
+// recent [upTo+1, asOf] tail missing (no early gap under the [2025-01-01, asOf] complete-window backfill).
+const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) => [a.accountId, [{ from: "2025-01-01", to: upTo }]]));
 
 /* ---------------- in-memory store (same proven model as the bucket-sync suite) ---------------- */
 function makeStore() {
@@ -367,18 +369,29 @@ test("(11) initial backfill then the NEXT daily run requests ONLY missing/rollin
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY,
   });
   const day1Units = day1.families.find((f) => f.sourceKey === "order-line-items").units;
-  assert.equal(day1Units.length, dates.canonicalOliSlices(backfill.from, backfill.to).length, "day 1: the FULL initial backfill");
-  // Record day-1 coverage, advance one day: the next run plans ONLY the rolling slices.
+  // Complete-window model: the whole missing backfill for the <=5-seller batch (no 7-day pre-slicing), but a
+  // window longer than DataDoe's proven single-export cap is SPLIT into contiguous <=cap chunks that reconstruct
+  // the full [backfill.from, backfill.to] window -- so no single export exceeds the proven range.
+  const cap = model.MAX_OLI_EXPORT_WINDOW_DAYS;
+  assert.ok(day1Units.length >= 1, "day 1: one or more capped complete-window exports for the whole 5-seller batch");
+  assert.equal(day1Units[0].slice.from, backfill.from, "day 1: the first chunk starts at the backfill start");
+  assert.equal(day1Units[day1Units.length - 1].slice.to, backfill.to, "day 1: the last chunk ends at asOf");
+  for (const u of day1Units) assert.ok(dates.addDaysStr(u.slice.from, cap - 1) >= u.slice.to, "each day-1 export is within the proven " + cap + "-day cap");
+  for (let i = 1; i < day1Units.length; i += 1) assert.equal(day1Units[i].slice.from, dates.addDaysStr(day1Units[i - 1].slice.to, 1), "day 1: the chunks are contiguous (no gap/overlap)");
+  // Record day-1 coverage, advance one day: the next run re-pulls ONLY the rolling refresh window (the last 7
+  // days, where DataDoe still restates sales) as ONE complete-window export -- proven history before it is never
+  // re-requested. This is the incremental-refresh invariant: recent-day corrections are captured every run.
   const nextAsOf = dates.addDaysStr(ASOF, 1);
+  const refresh = model.oliRollingRefreshWindow(nextAsOf);
   const covered = steadyCoverage(FIVE, ASOF);
   const day2 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: FIVE, coverageByAccountId: covered,
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: nextAsOf, today: nextAsOf,
   });
-  const refresh = model.oliRollingRefreshWindow(nextAsOf);
   const day2Units = day2.families.find((f) => f.sourceKey === "order-line-items").units;
-  assert.equal(day2Units.length, dates.canonicalOliSlices(refresh.from, refresh.to).length, "day 2: ONLY the rolling-window slices");
-  assert.ok(day2Units.length < day1Units.length / 5, "a fraction of the backfill -- proven history never re-requested");
+  assert.equal(day2Units.length, 1, "day 2: ONE complete-window export over the rolling refresh window");
+  assert.deepEqual(day2Units[0].slice, { from: refresh.from, to: nextAsOf }, "day 2: the export re-pulls exactly the rolling 7-day refresh window");
+  assert.ok(day2Units[0].slice.from > backfill.from, "proven history before the rolling window (2025-01-01..) is never re-requested");
 });
 
 test("(12) a late corrected row REPLACES its canonical grain without duplication", () => {
