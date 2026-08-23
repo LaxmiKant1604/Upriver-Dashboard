@@ -10754,8 +10754,9 @@ Diagnosed + completed the change (offline SHADOW MODE; nothing pushed/merged/dep
   (monthStart(asOf)-420..asOf) alone reaches ~450 days at month end, so a single export CAN'T stay within the
   proven range. **User decision: CAP/split.** Added `MAX_OLI_EXPORT_WINDOW_DAYS=441` + `splitWindowToMaxSpan`;
   `planOliSliceExports` now SPLITS any missing window > cap into contiguous <=cap chunks (each its own export;
-  coverage merges back). Fail-safe: no export ever exceeds the proven range. Raise ONLY after an empirical probe
-  -- **an empirical DataDoe window probe is still REQUIRED before the first real export at go-live.**
+  the chunks of one window reconstruct that window). Fail-safe: no export ever exceeds the proven range. Because
+  every planned window is <=441 inclusive days (already empirically validated 2026-08-22), **NO new probe is
+  required before the first real export**; a probe is required ONLY before raising the cap above 441.
 - Also fixed T5 (one complete-window create now, not many 7-day creates: bumped the per-create clock burn so a
   single create trips the deadline) and U5 (partial-tail coverage => 6 batches => 6 OLI exports). Updated
   zero-export (11) + bucket-sync B4 for the restored refresh + cap; added durable-model C5 (direct cap/split
@@ -10769,8 +10770,9 @@ Change is UNCOMMITTED and awaits review. See [[scheduler-v2-complete-window-wip]
 
 STATUS CORRECTION (supersedes the stale "PENDING" list in the 2026-08-22 migration-8 entry above): **Migration 8
 is already APPLIED and production is DEPLOYED at 4390253.** Do NOT treat migration-8 apply / push / Vercel deploy
-as pending -- they are DONE. What remains before go-live is operational (verify live DataDoe balance + an
-empirical window probe), not a code/migration/deploy step.
+as pending -- they are DONE. What remains before go-live is operational: confirm >=28 usable DataDoe tokens
+before the first create. NO empirical window probe is required (every planned window is <=441 inclusive days,
+already validated); a probe is needed only before raising the cap above 441. This is not a code/migration/deploy step.
 
 Applied six Codex findings to the (still-UNCOMMITTED) complete-window change:
 1. **Genuinely fixed OLI start.** Registry `initialBackfill` is now `{ kind: "fixed-start", start: "2025-01-01" }`
@@ -10799,4 +10801,29 @@ Applied six Codex findings to the (still-UNCOMMITTED) complete-window change:
 
 node --check + the focused suites + `npm run verify` GREEN; `git diff --check` clean. Still UNCOMMITTED at the
 time of writing; code/tests committed first, docs separately, then STOP for Codex review. No production OLI run.
+See [[scheduler-v2-complete-window-wip]].
+
+## Final Codex review corrections (production-shape regression + probe/comment fixes) -- 2026-08-23 (from HEAD 0d5ff5e)
+
+Three targeted corrections for the Daily Reporting + Brand View OLI release (no scope expansion):
+1. **Production-shape regression B6** (source-bucket-sync.test.js): SEPARATE bucket plans -- US = exactly 8
+   accounts => 2 batches x 2 date chunks = 4 exports = 8 tokens; non-US = exactly 22 accounts => 5 batches x 2
+   chunks = 10 exports = 20 tokens; combined EXACTLY 14 exports / 28 tokens. Asserts every seller appears once
+   per date chunk, US/non-US never mix (disjoint sellers; no export mixes buckets), each batch has 1..5 sellers,
+   all 14 request hashes unique, and the only windows are 2025-01-01..2026-03-17 and 2026-03-18..2026-08-21.
+2. **No further empirical probe required.** Every planned window is <=441 inclusive days, which is already
+   empirically validated -- so NO probe before the first real export. A probe is needed ONLY before raising the
+   cap above 441. (No diagnostic probe run; no tokens spent.)
+3. **Stale comments corrected** in source-bucket-sync.js: do NOT claim separated coverage gaps always merge into
+   ONE export (separated gaps => SEPARATE exports; a long contiguous window splits into <=441-day chunks); and
+   the rolling refresh is NOT removed -- it is RESTORED as a trailing 7-day refresh.
+
+Go-live invariants restated (unchanged): Daily Reporting + Brand View ONLY; OLI only, 2025-01-01..authorized
+asOf; <=5 sellers/export; <=441 inclusive days/export; hard ceiling 14 creates / 28 tokens for 8-US + 22-non-US;
+reuse only exact provable identities; do NOT adopt 316729fd; no diagnostic export, no auto-retry; refuse before
+the first create unless >=28 usable DataDoe tokens are confirmed; publishing + scheduling stay PAUSED (this
+change intentionally does not implement the separate durable-evidence lineage release).
+
+node --check + focused planner/bucket suites + `npm run verify` GREEN; `git diff --check` clean. Code/tests
+committed first, docs separately; then STOP for Codex review. No push/deploy/production/DataDoe export.
 See [[scheduler-v2-complete-window-wip]].
