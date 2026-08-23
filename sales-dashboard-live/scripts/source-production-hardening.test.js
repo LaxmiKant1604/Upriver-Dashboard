@@ -3198,23 +3198,28 @@ test("F11f. ordinary callers CANNOT activate priority mode: a normally-built run
 /* ===== F12. priority release with the REAL runtime + REAL worker + the DURABLE Catalog reservation ===== */
 group("F12. priority release: durable one-Catalog-export ceiling across US + Non-US, cold + warm, zero OLI/Ads/FBA");
 
-// A FAITHFUL fake of the durable reservation table (atomic insert-if-absent + record-if-absent).
+// A FAITHFUL fake of the OPERATION-WIDE durable reservation table (PK = operation_key alone; hash immutable).
 function fakeReservation() {
-  const rows = new Map(); const k = (op, h) => op + "|" + h;
+  const rows = new Map(); // operationKey -> { catalog_request_hash, export_id, status, tokens_spent }
   return {
     _rows: rows,
     reserve: async ({ operationKey, catalogRequestHash }) => {
-      const key = k(operationKey, catalogRequestHash);
-      if (rows.has(key)) { const r = rows.get(key); return { disposition: "exists", exportId: r.export_id, status: r.status, tokensSpent: r.tokens_spent }; }
-      rows.set(key, { export_id: null, status: "reserved", tokens_spent: 0 }); return { disposition: "reserved" };
+      const r = rows.get(operationKey);
+      if (r) {
+        if (r.catalog_request_hash !== catalogRequestHash) return { disposition: "hash-mismatch", reservedHash: r.catalog_request_hash, requestedHash: catalogRequestHash, exportId: null, tokensSpent: 0 };
+        return { disposition: "exists", exportId: r.export_id, status: r.status, tokensSpent: r.tokens_spent, catalogRequestHash };
+      }
+      rows.set(operationKey, { catalog_request_hash: catalogRequestHash, export_id: null, status: "reserved", tokens_spent: 0 });
+      return { disposition: "reserved", exportId: null, status: "reserved", tokensSpent: 0, catalogRequestHash };
     },
     recordExport: async ({ operationKey, catalogRequestHash, exportId, tokens }) => {
-      const r = rows.get(k(operationKey, catalogRequestHash));
+      const r = rows.get(operationKey);
       if (!r) return { disposition: "not-reserved" };
+      if (r.catalog_request_hash !== catalogRequestHash) return { disposition: "hash-mismatch", reservedHash: r.catalog_request_hash };
       if (r.export_id != null) return r.export_id === exportId ? { disposition: "already-recorded", exportId: r.export_id } : { disposition: "conflict", exportId: r.export_id };
       r.export_id = exportId; r.status = "created"; r.tokens_spent = tokens; return { disposition: "recorded", exportId };
     },
-    get: async ({ operationKey, catalogRequestHash }) => rows.get(k(operationKey, catalogRequestHash)) || null,
+    get: async ({ operationKey }) => { const r = rows.get(operationKey); return r ? { operationKey, catalogRequestHash: r.catalog_request_hash, exportId: r.export_id, tokensSpent: r.tokens_spent, status: r.status } : null; },
   };
 }
 const euAccount = (id) => ({ id, name: "Acct " + id, country: "DE", currency: "EUR", status: "active" });
@@ -3267,6 +3272,23 @@ test("F12c. REAL US + Non-US with a COLD Non-US cache: the durable reservation m
   assert.equal(catCreates(dd), 1, "STILL one Catalog create -- Non-US ADOPTED the reserved export, never re-created");
   assert.equal(nonCatCreates(dd), 0, "zero OLI/Ads/FBA creates");
   assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still two tokens total");
+});
+
+test("F12d. MIDNIGHT/date drift: US on day 1 + Non-US on day 2 (a DIFFERENT canonical Catalog hash) cannot spend a second Catalog export / four tokens", async () => {
+  const DAY2 = dates.addDaysStr(TODAY, 1);
+  const dd = makeDataDoe(); const reservation = fakeReservation();
+  const h = guardedPriorityHarness([dirAccount("U01"), dirAccount("U02"), euAccount("E01"), euAccount("E02")], dd, reservation);
+  await h.runtime.run({ bucket: "us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "us", today: TODAY }) });
+  assert.equal(catCreates(dd), 1, "US made the one create on day 1");
+  h.store._cache.clear(); // a fresh day: the day-1 Catalog cache is gone, so Non-US must try to fetch.
+  let blocked = false;
+  try {
+    const rEu = await h.runtime.run({ bucket: "non-us", today: DAY2, preflight: await h.runtime.preflightEvidence({ bucket: "non-us", today: DAY2 }) });
+    blocked = rEu.stopped === true || (rEu.derived && rEu.derived.skipped != null);
+  } catch (e) { blocked = /HASH_MISMATCH|PRIORITY_CATALOG/.test(String(e && e.message)); }
+  assert.equal(catCreates(dd), 1, "the day-2 different-hash Catalog create is REFUSED by the operation-wide reservation (never a fourth token)");
+  assert.ok(blocked, "the day-2 Non-US derive did NOT complete a second Catalog export");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still exactly two tokens for the whole operation");
 });
 
 async function main() {

@@ -508,6 +508,50 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: [],
     note: "AUTHORITATIVE FINAL correction: drops the flat-2 constraint; restores the <=5 multi-batch assign RPC + variable-cost persist RPC. Describes the runtime state.",
   },
+  {
+    // Migration 9: DURABLE operation-wide one-Catalog-export / two-token reservation for the Daily Reporting +
+    // Brand View priority release. ONE table + TWO SECURITY DEFINER RPCs; additive only. The reservation
+    // identity is the OPERATION alone (PK operation_key), so one operation authorizes at most ONE Catalog create
+    // ever; the first canonical Catalog request hash is IMMUTABLE evidence and a DIFFERENT hash is a typed
+    // hash-mismatch (zero creates). Coherent admin-read ACL: authenticated SELECT reachable only via the
+    // admin-only RLS policy; service_role SELECT; every write via the two RPCs (no direct write / delete / reset).
+    migration: "20260825_priority_catalog_reservation.sql",
+    tables: [
+      {
+        name: "source_priority_catalog_reservation",
+        unique: [["operation_key"]],
+        namedConstraints: [
+          { name: "source_priority_catalog_reservation_pk", kind: "primary key", columns: ["operation_key"] },
+          { name: "source_priority_catalog_reservation_op_nonblank", kind: "check", canonical: "char_length(btrim(operation_key)) > 0" },
+          { name: "source_priority_catalog_reservation_hash_nonblank", kind: "check", canonical: "char_length(btrim(catalog_request_hash)) > 0" },
+          { name: "source_priority_catalog_reservation_tokens_check", kind: "check", canonical: "tokens_spent in (0, 2)" },
+          { name: "source_priority_catalog_reservation_status_check", kind: "check", canonical: "status in ('reserved', 'created')" },
+          // Reserved carries no export/tokens; created carries a nonblank export id + 2 tokens (AND-joined, so an
+          // AND->OR weakening or a dropped bound fails).
+          { name: "source_priority_catalog_reservation_created_coherent", kind: "check", canonical: "(status = 'reserved' and export_id is null and tokens_spent = 0) or (status = 'created' and export_id is not null and char_length(btrim(export_id)) > 0 and tokens_spent = 2)" },
+        ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        rlsEnabled: true,
+        requiredPolicies: [{ name: "source_priority_catalog_reservation_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
+        requiredTriggers: [{ name: "source_priority_catalog_reservation_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["operation_key", "catalog_request_hash", "export_id", "tokens_spent", "status"],
+      },
+    ],
+    rpcs: [
+      { name: "reserve_priority_catalog_create", params: ["p_operation_key", "p_catalog_request_hash"] },
+      { name: "record_priority_catalog_export", params: ["p_operation_key", "p_catalog_request_hash", "p_export_id", "p_tokens"] },
+    ],
+    // STRUCTURAL body proofs: operation-wide one create (advisory lock on operation_key + select-for-update +
+    // insert), immutable hash + typed hash-mismatch, record conflict, status advances reserved->created ONLY,
+    // and NO reset/delete route. Removing any is a typed blocker.
+    provenFunctions: [
+      { name: "reserve_priority_catalog_create", proof: "priority-reserve" },
+      { name: "record_priority_catalog_export", proof: "priority-record" },
+    ],
+    wrappers: ["reservePriorityCatalogCreate", "recordPriorityCatalogExport", "getPriorityCatalogReservation"],
+    note: "Migration 9: durable operation-wide one-Catalog-export / two-token reservation (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -1315,7 +1359,45 @@ function auditCasReportSnapshotFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Migration 9 structural proof: reserve_priority_catalog_create must serialize on the OPERATION alone
+// (advisory lock on p_operation_key), lock the row by operation_key FOR UPDATE, return a typed hash-mismatch for
+// a DIFFERENT canonical hash, INSERT-and-return 'reserved' for the winner, and have NO delete/reset route.
+function auditPriorityReserveFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "PRIORITY_RESERVE_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked; const C = body.clean;
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_operation_key\s*\)\s*\)/i.test(M)) problems.push({ code: "PRIORITY_RESERVE_ADVISORY_LOCK_MISSING", reason: "does not pg_advisory_xact_lock(hashtext(p_operation_key)) (operation-wide serialization)" });
+  if (!/from\s+public\.source_priority_catalog_reservation\b[^;]*\bwhere\s+operation_key\s*=\s*p_operation_key\b[^;]*\bfor\s+update\b/i.test(M)) problems.push({ code: "PRIORITY_RESERVE_ROW_LOCK_MISSING", reason: "does not SELECT ... WHERE operation_key = p_operation_key ... FOR UPDATE (operation-wide identity)" });
+  if (!(/v_row\.catalog_request_hash\s+is\s+distinct\s+from\s+p_catalog_request_hash/i.test(M) && /'hash-mismatch'/i.test(C))) problems.push({ code: "PRIORITY_RESERVE_HASH_MISMATCH_MISSING", reason: "does not return a typed hash-mismatch for a DIFFERENT canonical hash on the same operation" });
+  if (!(/insert\s+into\s+public\.source_priority_catalog_reservation\b/i.test(M) && /'reserved'/i.test(C))) problems.push({ code: "PRIORITY_RESERVE_INSERT_MISSING", reason: "does not INSERT-and-return 'reserved' for the winner" });
+  if (/\bdelete\s+from\s+public\.source_priority_catalog_reservation/i.test(M)) problems.push({ code: "PRIORITY_RESERVE_HAS_DELETE", reason: "must have NO delete/reset route" });
+  return problems;
+}
+
+// Migration 9 structural proof: record_priority_catalog_export must serialize on the operation, reject a
+// DIFFERENT canonical hash (immutable hash), return 'conflict' for an already-recorded different export id,
+// advance status reserved->created (export_id + 2 tokens) ONLY, NEVER assign catalog_request_hash, and have no
+// delete/reset route.
+function auditPriorityRecordFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "PRIORITY_RECORD_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked; const C = body.clean;
+  if (!/pg_advisory_xact_lock\s*\(\s*hashtext\s*\(\s*p_operation_key\s*\)\s*\)/i.test(M)) problems.push({ code: "PRIORITY_RECORD_ADVISORY_LOCK_MISSING", reason: "does not pg_advisory_xact_lock(hashtext(p_operation_key))" });
+  if (!/from\s+public\.source_priority_catalog_reservation\b[^;]*\bwhere\s+operation_key\s*=\s*p_operation_key\b[^;]*\bfor\s+update\b/i.test(M)) problems.push({ code: "PRIORITY_RECORD_ROW_LOCK_MISSING", reason: "does not SELECT ... WHERE operation_key = p_operation_key ... FOR UPDATE" });
+  if (!(/v_row\.catalog_request_hash\s+is\s+distinct\s+from\s+p_catalog_request_hash/i.test(M) && /'hash-mismatch'/i.test(C))) problems.push({ code: "PRIORITY_RECORD_HASH_MISMATCH_MISSING", reason: "does not reject a DIFFERENT canonical hash (immutable-hash proof)" });
+  if (!(/v_row\.export_id\s+is\s+not\s+null/i.test(M) && /'conflict'/i.test(C))) problems.push({ code: "PRIORITY_RECORD_CONFLICT_MISSING", reason: "does not return 'conflict' for an already-recorded different export id" });
+  const advance = /update\s+public\.source_priority_catalog_reservation\b[^;]*\bset\b[^;]*export_id\s*=\s*p_export_id/i.test(M) && /'created'/i.test(C) && /tokens_spent\s*=\s*2/i.test(M);
+  if (!advance) problems.push({ code: "PRIORITY_RECORD_ADVANCE_MISSING", reason: "does not UPDATE ... set export_id=p_export_id, status='created', tokens_spent=2" });
+  if (/\bset\b[^;]*\bcatalog_request_hash\s*=/i.test(M)) problems.push({ code: "PRIORITY_RECORD_HASH_MUTABLE", reason: "must NEVER assign catalog_request_hash (immutable evidence)" });
+  if (/\bdelete\s+from\s+public\.source_priority_catalog_reservation/i.test(M)) problems.push({ code: "PRIORITY_RECORD_HAS_DELETE", reason: "must have NO delete/reset route" });
+  return problems;
+}
+
 function auditProvenFunction(clean, masked, proof, fnName) {
+  if (proof === "priority-reserve") return auditPriorityReserveFunction(clean, masked, fnName);
+  if (proof === "priority-record") return auditPriorityRecordFunction(clean, masked, fnName);
   if (proof === "adopt-cache") return auditAdoptCacheFunction(clean, masked, fnName);
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
@@ -1587,6 +1669,8 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "adoptSourceExportCache", "assignSourceAccountBatch", "listSourceBatchMembership",
   // Blocker 4d: the frozen tranche budget persist + the atomic pre-POST reservation + the budget/hash readers.
   "persistSourceTrancheBudget", "reserveSourceExportCreate", "getSourceTrancheBudget", "getSourceTrancheBudgetHashes",
+  // Migration 9: the operation-wide durable Catalog reservation (reserve/record RPCs + the reservation reader).
+  "reservePriorityCatalogCreate", "recordPriorityCatalogExport", "getPriorityCatalogReservation",
 ]);
 
 /**

@@ -727,6 +727,23 @@ export async function getSyncCycle(cycleId, { signal = null } = {}) {
   return rows[0] || null;
 }
 
+// Read-only lookup of the ONE cycle for (bucket, cycle_date) -- the sync_cycles_bucket_date_unique constraint
+// guarantees at most one. Used by the priority release's restart-safe finalize to reconstruct the cycle it must
+// verify WITHOUT creating one and WITHOUT trusting an in-memory cycle id. Selects `trigger` so the finalize can
+// prove the cycle was a reviewed MANUAL run. Returns the row or null.
+export async function getSyncCycleByBucketDate(bucket, cycleDate, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "id,bucket,cycle_date,status,trigger,created_at,started_at,finished_at",
+    bucket: `eq.${bucket}`,
+    cycle_date: `eq.${cycleDate}`,
+    limit: "2",
+  });
+  const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  if (rows.length > 1) throw new Error("getSyncCycleByBucketDate: more than one cycle for (bucket, cycle_date); failing closed.");
+  return rows[0];
+}
+
 export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, reportTotal, reportSucceeded, reportFailed, status } = {}, { signal = null } = {}) {
   const body = {};
   if (sourceTotal != null) body.source_total = sourceTotal;
@@ -823,36 +840,98 @@ export async function finalizeSyncCycle(cycleId, { signal = null } = {}) {
   return validateFinalizeResponse(result, cycleId);
 }
 
-// DURABLE one-Catalog-export / two-token reservation for the Daily Reporting + Brand View priority release
-// (20260825_priority_catalog_reservation.sql -- PREPARED, UNAPPLIED). The two SECURITY DEFINER RPCs are the
-// ONLY write path; service_role may only SELECT. reserve_priority_catalog_create returns
-// { disposition:'reserved' } | { disposition:'exists', export_id, status, tokens_spent }; a caller adopts on
-// 'exists' with an export_id and FAILS CLOSED on 'exists' without one (never a second create).
+// DURABLE operation-wide one-Catalog-export / two-token reservation for the Daily Reporting + Brand View
+// priority release (Migration 9 -- 20260825_priority_catalog_reservation.sql -- PREPARED, UNAPPLIED). The two
+// SECURITY DEFINER RPCs are the ONLY write path; service_role may only SELECT. EVERY acknowledgement is
+// validated STRICTLY here (fail closed BEFORE any DataDoe POST or later write): exactly one plain object, a
+// known disposition, the exact operation_key + catalog_request_hash echoes, and the disposition-dependent
+// fields (created/already-recorded => the exact export_id + tokens_spent=2; reserved => no export_id + 0 tokens;
+// hash-mismatch/conflict authorize no create/adoption). A loosely-accepted response can never authorize a POST.
+const PRIORITY_RESERVE_DISPOSITIONS = new Set(["reserved", "exists", "hash-mismatch"]);
+const PRIORITY_RECORD_DISPOSITIONS = new Set(["recorded", "already-recorded", "conflict", "hash-mismatch", "not-reserved"]);
+const isPlainObj = (v) => v != null && typeof v === "object" && !Array.isArray(v);
+const nbStr = (v) => typeof v === "string" && v.trim() !== "";
+// Exactly ONE plain-object acknowledgement: a scalar-jsonb RPC returns the object; a set-returning shape a
+// 1-element array. Reject null, arrays with 0 or >1 rows, and primitives.
+function priorityOneAck(body, label) {
+  let ack = body;
+  if (Array.isArray(body)) {
+    if (body.length !== 1) throw new Error(`${label}: expected exactly one acknowledgement row (got ${body.length}); failing closed.`);
+    ack = body[0];
+  }
+  if (!isPlainObj(ack)) throw new Error(`${label}: malformed (non-object) acknowledgement; failing closed.`);
+  return ack;
+}
+
 export async function reservePriorityCatalogCreate(operationKey, catalogRequestHash, { signal = null } = {}) {
   const body = await request("/rest/v1/rpc/reserve_priority_catalog_create", {
-    method: "POST", signal,
-    body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash },
+    method: "POST", signal, body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash },
   });
-  return Array.isArray(body) ? body[0] : body;
+  const ack = priorityOneAck(body, "priority reserve");
+  const d = ack.disposition;
+  if (!PRIORITY_RESERVE_DISPOSITIONS.has(d)) throw new Error(`priority reserve: unknown disposition "${d}"; failing closed.`);
+  if (ack.operation_key !== operationKey) throw new Error("priority reserve: operation_key echo mismatch; failing closed.");
+  if (d === "hash-mismatch") {
+    if (!nbStr(ack.catalog_request_hash) || ack.catalog_request_hash === catalogRequestHash) throw new Error("priority reserve: malformed hash-mismatch (reserved hash); failing closed.");
+    if (ack.requested_hash !== catalogRequestHash) throw new Error("priority reserve: hash-mismatch requested_hash echo mismatch; failing closed.");
+    return { disposition: "hash-mismatch", reservedHash: ack.catalog_request_hash, requestedHash: catalogRequestHash, exportId: null, tokensSpent: 0 };
+  }
+  if (ack.catalog_request_hash !== catalogRequestHash) throw new Error("priority reserve: catalog_request_hash echo mismatch; failing closed.");
+  if (d === "reserved") {
+    if (ack.export_id != null || Number(ack.tokens_spent) !== 0 || ack.status !== "reserved") throw new Error("priority reserve: malformed 'reserved' ack; failing closed.");
+    return { disposition: "reserved", exportId: null, status: "reserved", tokensSpent: 0, catalogRequestHash };
+  }
+  if (ack.status !== "reserved" && ack.status !== "created") throw new Error("priority reserve: malformed 'exists' status; failing closed.");
+  if (ack.status === "created") {
+    if (!nbStr(ack.export_id) || Number(ack.tokens_spent) !== 2) throw new Error("priority reserve: 'exists'+created requires export_id + 2 tokens; failing closed.");
+    return { disposition: "exists", exportId: ack.export_id, status: "created", tokensSpent: 2, catalogRequestHash };
+  }
+  if (ack.export_id != null || Number(ack.tokens_spent) !== 0) throw new Error("priority reserve: 'exists'+reserved requires no export_id + 0 tokens; failing closed.");
+  return { disposition: "exists", exportId: null, status: "reserved", tokensSpent: 0, catalogRequestHash };
 }
 
 export async function recordPriorityCatalogExport(operationKey, catalogRequestHash, exportId, tokens, { signal = null } = {}) {
   const body = await request("/rest/v1/rpc/record_priority_catalog_export", {
-    method: "POST", signal,
-    body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash, p_export_id: exportId, p_tokens: tokens },
+    method: "POST", signal, body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash, p_export_id: exportId, p_tokens: tokens },
   });
-  return Array.isArray(body) ? body[0] : body;
+  const ack = priorityOneAck(body, "priority record");
+  const d = ack.disposition;
+  if (!PRIORITY_RECORD_DISPOSITIONS.has(d)) throw new Error(`priority record: unknown disposition "${d}"; failing closed.`);
+  if (ack.operation_key !== operationKey) throw new Error("priority record: operation_key echo mismatch; failing closed.");
+  if (d === "not-reserved") return { disposition: "not-reserved", exportId: null, tokensSpent: 0 };
+  if (d === "hash-mismatch") {
+    if (!nbStr(ack.catalog_request_hash) || ack.catalog_request_hash === catalogRequestHash) throw new Error("priority record: malformed hash-mismatch; failing closed.");
+    if (ack.requested_hash !== catalogRequestHash) throw new Error("priority record: hash-mismatch requested_hash echo mismatch; failing closed.");
+    return { disposition: "hash-mismatch", reservedHash: ack.catalog_request_hash, exportId: null, tokensSpent: 0 };
+  }
+  if (ack.catalog_request_hash !== catalogRequestHash) throw new Error("priority record: catalog_request_hash echo mismatch; failing closed.");
+  if (d === "recorded" || d === "already-recorded") {
+    if (ack.export_id !== exportId || Number(ack.tokens_spent) !== 2 || ack.status !== "created") throw new Error(`priority record: '${d}' requires the exact export_id + 2 tokens + created; failing closed.`);
+    return { disposition: d, exportId, tokensSpent: 2, status: "created" };
+  }
+  if (!nbStr(ack.export_id) || ack.export_id === exportId) throw new Error("priority record: 'conflict' requires a DIFFERENT existing export_id; failing closed.");
+  return { disposition: "conflict", exportId: ack.export_id, tokensSpent: Number(ack.tokens_spent) || 0, status: ack.status };
 }
 
 export async function getPriorityCatalogReservation(operationKey, catalogRequestHash, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "operation_key,catalog_request_hash,export_id,tokens_spent,status,created_at,updated_at",
-    operation_key: `eq.${operationKey}`,
-    catalog_request_hash: `eq.${catalogRequestHash}`,
-    limit: "1",
+    operation_key: `eq.${operationKey}`, limit: "1",
   });
   const rows = await request(`/rest/v1/source_priority_catalog_reservation?${query}`, { signal });
-  return Array.isArray(rows) && rows.length ? rows[0] : null;
+  if (!Array.isArray(rows)) throw new Error("priority reservation read: malformed (non-array) response; failing closed.");
+  if (rows.length === 0) return null;
+  if (rows.length !== 1) throw new Error("priority reservation read: expected at most one row; failing closed.");
+  const r = rows[0];
+  if (!isPlainObj(r)) throw new Error("priority reservation read: malformed row; failing closed.");
+  if (r.operation_key !== operationKey) throw new Error("priority reservation read: operation_key mismatch; failing closed.");
+  if (!nbStr(r.catalog_request_hash)) throw new Error("priority reservation read: blank catalog_request_hash; failing closed.");
+  if (catalogRequestHash != null && r.catalog_request_hash !== catalogRequestHash) throw new Error("priority reservation read: catalog_request_hash mismatch; failing closed.");
+  if (r.status !== "reserved" && r.status !== "created") throw new Error("priority reservation read: bad status; failing closed.");
+  const coherent = (r.status === "reserved" && r.export_id == null && Number(r.tokens_spent) === 0)
+    || (r.status === "created" && nbStr(r.export_id) && Number(r.tokens_spent) === 2);
+  if (!coherent) throw new Error("priority reservation read: status/state incoherent; failing closed.");
+  return { operationKey, catalogRequestHash: r.catalog_request_hash, exportId: r.export_id ?? null, tokensSpent: Number(r.tokens_spent), status: r.status };
 }
 
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller

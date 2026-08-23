@@ -322,6 +322,43 @@ export function validateStage7Baseline(baseline, { currentHead, currentFingerpri
 }
 export function shouldCreateStage7Baseline({ problemCount, rolledBack }) { return problemCount === 0 && rolledBack === true; }
 
+// ---- DEDICATED stage-8 re-anchor baseline (forward-only recovery from an APPLIED stage 8) -----------------
+// A SEPARATE hard-coded artifact (anchorStage=8) governing ONLY the 9th migration (20260825, stageIdx 8) -- the
+// operation-wide durable Catalog reservation. The stage-0/3/4/6/7 baselines are preserved untouched for audit.
+// NOT generalized to arbitrary stages. buildStage8Baseline uses manifest-pinned values ONLY.
+export function buildStage8Baseline({ head, fingerprint, pins = PROTECTED_DIGESTS }) {
+  return {
+    version: BASELINE_VERSION, projectRef: APPROVED_IDENTITY.projectRef, head, manifestFingerprint: fingerprint,
+    migrationHashes: Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])), anchorStage: 8,
+    protectedDigest: Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k) => [k, pins[k]])), // manifest-pinned values ONLY
+  };
+}
+// Validate the reviewed stage-8 baseline. Rejects: anchorStage != exactly 8; wrong project/head/fingerprint;
+// migration-hash drift; edited/missing/extra/unpinned protected digest; and (on an APPLY) a migration whose
+// stage precedes the anchor (stageIdx < 8 -- migrations 1-8 are NOT governed here).
+export function validateStage8Baseline(baseline, { currentHead, currentFingerprint, envRef, stageIdx, pins = PROTECTED_DIGESTS } = {}) {
+  const P = [];
+  if (!baseline || typeof baseline !== "object") return ["stage-8 baseline malformed (not an object)"];
+  if (baseline.version !== BASELINE_VERSION) P.push(`stage-8 baseline version ${baseline.version} != ${BASELINE_VERSION}`);
+  if (baseline.anchorStage !== 8) P.push(`stage-8 baseline anchorStage ${baseline.anchorStage} != 8`);
+  if (baseline.projectRef !== APPROVED_IDENTITY.projectRef) P.push(`stage-8 baseline projectRef ${baseline.projectRef} != approved`);
+  if (envRef != null && baseline.projectRef !== envRef) P.push(`stage-8 baseline projectRef != current env ref ${envRef} (environment switched)`);
+  if (baseline.head !== currentHead) P.push(`stage-8 baseline HEAD ${baseline.head} != current HEAD ${currentHead}`);
+  if (baseline.manifestFingerprint !== currentFingerprint) P.push("stage-8 baseline manifest fingerprint stale");
+  if (JSON.stringify(baseline.migrationHashes) !== JSON.stringify(Object.fromEntries(MIGRATIONS.map((m) => [m.file, m.sha])))) P.push("stage-8 baseline migration hashes differ from the manifest");
+  if (stageIdx != null && stageIdx < 8) P.push(`stage-8 baseline cannot govern a migration at stage ${stageIdx} (precedes anchor 8)`);
+  const pd = baseline.protectedDigest;
+  if (!pd || typeof pd !== "object") { P.push("stage-8 baseline protectedDigest malformed"); return P; }
+  if (!setEq(Object.keys(pd), PROTECTED_DIGEST_KEYS)) P.push(`stage-8 baseline digest key set {${Object.keys(pd).sort()}} != required {${[...PROTECTED_DIGEST_KEYS].sort()}}`);
+  for (const k of PROTECTED_DIGEST_KEYS) {
+    const pin = pins[k], b = pd[k];
+    if (!pin) { P.push(`stage-8 baseline pin ${k} not set in manifest (fail-closed)`); continue; }
+    if (!b || b.c !== pin.c || b.h !== pin.h) P.push(`stage-8 baseline digest ${k} {c:${b && b.c},h:${b && b.h}} != manifest pin {c:${pin.c},h:${pin.h}}`);
+  }
+  return P;
+}
+export function shouldCreateStage8Baseline({ problemCount, rolledBack }) { return problemCount === 0 && rolledBack === true; }
+
 // ---- phase-tracked applier core (COMMIT_UNKNOWN unchanged) ----------------------------------------------
 export async function applyInTransaction(ctx) {
   const {
@@ -379,14 +416,16 @@ export async function runApply(deps) {
   if (!id.ok) return { code: 1, connected: false, message: "identity: " + id.problems.join("; ") };
   // Baseline governance by the migration's stage (a test may override _validate; stageIdx is bound so each
   // stage-N validator rejects a migration that precedes its anchor):
-  //   migration 8   (stageIdx>=7) -> STAGE-7 re-anchor baseline;
+  //   migration 9   (stageIdx>=8) -> STAGE-8 re-anchor baseline;
+  //   migration 8   (stageIdx==7) -> STAGE-7 re-anchor baseline;
   //   migration 7   (stageIdx==6) -> STAGE-6 re-anchor baseline;
   //   migrations 5-6 (stageIdx 4-5) -> STAGE-4 re-anchor baseline;
   //   migration 4   (stageIdx==3)  -> STAGE-3 re-anchor baseline;
   //   migrations 1-3 (stageIdx<3)  -> stage-0 baseline.
   const validate = _validate || (
-    stageIdx >= 7 ? (b, ctx) => validateStage7Baseline(b, { ...ctx, stageIdx })
-      : stageIdx >= 6 ? (b, ctx) => validateStage6Baseline(b, { ...ctx, stageIdx })
+    stageIdx >= 8 ? (b, ctx) => validateStage8Baseline(b, { ...ctx, stageIdx })
+      : stageIdx >= 7 ? (b, ctx) => validateStage7Baseline(b, { ...ctx, stageIdx })
+        : stageIdx >= 6 ? (b, ctx) => validateStage6Baseline(b, { ...ctx, stageIdx })
         : stageIdx >= 4 ? (b, ctx) => validateStage4Baseline(b, { ...ctx, stageIdx })
           : stageIdx === 3 ? (b, ctx) => validateStage3Baseline(b, { ...ctx, stageIdx })
             : validateBaseline);

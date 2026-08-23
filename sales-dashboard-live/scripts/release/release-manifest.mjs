@@ -226,6 +226,44 @@ export const MIGRATIONS = [
     ],
     alters: [{ table: "source_tranche_budget_hash", addColumns: [], addConstraints: [], dropConstraints: ["source_tranche_budget_hash_cost_flat2"] }],
   },
+  {
+    // Migration 9 (stageIdx 8): DURABLE operation-wide one-Catalog-export / two-token reservation for the
+    // priority release. ONE table (PK = operation_key alone -> one Catalog create per operation ever; the first
+    // canonical hash is immutable) + TWO SECURITY DEFINER RPCs. Additive; no ALTER of an existing table.
+    file: "20260825_priority_catalog_reservation.sql", sha: "daf1997a173fbf9c9447a61883a32f8b129e9b666eb2e0d2ee3d4a78da045a7f", adv: [20260825, 1],
+    tables: [{
+      name: "source_priority_catalog_reservation",
+      columns: [
+        ["operation_key", TYPE.text, true, null],
+        ["catalog_request_hash", TYPE.text, true, null],
+        ["export_id", TYPE.text, false, null],
+        ["tokens_spent", TYPE.int, true, "0"],
+        ["status", TYPE.text, true, "'reserved'::text"],
+        ["created_at", TYPE.tstz, true, "now()"],
+        ["updated_at", TYPE.tstz, true, "now()"],
+      ],
+      constraints: [
+        PK("source_priority_catalog_reservation_pk", "operation_key"),
+        CK("source_priority_catalog_reservation_op_nonblank", "char_lengthbtrimoperation_key>0"),
+        CK("source_priority_catalog_reservation_hash_nonblank", "char_lengthbtrimcatalog_request_hash>0"),
+        EN("source_priority_catalog_reservation_tokens_check", "tokens_spent", ["0", "2"]),
+        EN("source_priority_catalog_reservation_status_check", "status", ["reserved", "created"]),
+        // BEST-EFFORT canon of the created-coherent check. Like the M4 POSITION note, verify this against the
+        // LIVE bodyCanon(pg_get_constraintdef(oid)) before applying to production (ro-prod-check fails closed on
+        // a mismatch; it is never verified against a real catalog offline).
+        CK("source_priority_catalog_reservation_created_coherent", "status=reservedANDexport_idISNULLANDtokens_spent=0ORstatus=createdANDexport_idISNOTNULLANDchar_lengthbtrimexport_id>0ANDtokens_spent=2"),
+      ],
+      indexes: [], rls: true,
+      policies: [ADMIN_READ("source_priority_catalog_reservation_admin_read", "source_priority_catalog_reservation")],
+      triggers: [TOUCH("source_priority_catalog_reservation")],
+      acl: { service_role: ["SELECT"], authenticated: ["SELECT"] },
+    }],
+    functions: [
+      { sig: "public.reserve_priority_catalog_create(text, text)", ret: "jsonb", secdef: true, searchPath: "public", acl: FN_SR, createdNew: true },
+      { sig: "public.record_priority_catalog_export(text, text, text, integer)", ret: "jsonb", secdef: true, searchPath: "public", acl: FN_SR, createdNew: true },
+    ],
+    alters: [],
+  },
 ];
 
 export const NEW6 = MIGRATIONS.map((m) => m.file);

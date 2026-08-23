@@ -17,6 +17,7 @@ import {
   buildStage4Baseline, validateStage4Baseline, shouldCreateStage4Baseline,
   buildStage6Baseline, validateStage6Baseline, shouldCreateStage6Baseline,
   buildStage7Baseline, validateStage7Baseline, shouldCreateStage7Baseline,
+  buildStage8Baseline, validateStage8Baseline, shouldCreateStage8Baseline,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -389,6 +390,28 @@ test("stage7: shouldCreate requires zero problems AND a clean rollback", () => {
 test("stage7 applier: migration 8 (stageIdx 7) + VALID stage-7 baseline constructs the client", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
 test("stage7 applier: migration 8 REJECTS the stage-6 baseline (anchor 6) -> zero connect", async () => { let made = 0; const b = buildStage6Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 test("stage7 applier: migration 7 (stageIdx 6) REJECTS the stage-7 baseline (anchor 7) -> zero connect", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[6], sqlText: "X", actualSha: MIGRATIONS[6].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+
+// ---------- DEDICATED stage-8 re-anchor baseline (governs ONLY migration 9, stageIdx 8) ------------------
+const s8 = buildStage8Baseline({ head: HEAD, fingerprint: FP, pins: TESTPINS });
+const vs8 = (b, over = {}) => validateStage8Baseline(b, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, pins: TESTPINS, ...over });
+test("stage8: build binds anchorStage=8, all migration hashes, manifest-pinned digests", () => { assert.equal(s8.anchorStage, 8); assert.equal(Object.keys(s8.migrationHashes).length, NEW6.length); assert.deepEqual(Object.keys(s8.protectedDigest).sort(), [...PROTECTED_DIGEST_KEYS].sort()); });
+test("stage8: valid passes for migration 9 (stageIdx>=8) and for a read-only check (no stageIdx)", () => { assert.deepEqual(vs8(s8, { stageIdx: 8 }), []); assert.deepEqual(vs8(s8), []); });
+test("stage8: anchorStage != exactly 8 fails", () => { const b = clone(s8); b.anchorStage = 7; assert.ok(vs8(b).length); b.anchorStage = 9; assert.ok(vs8(b).length); });
+test("stage8: use for a migration below the anchor (stageIdx<8) fails", () => { assert.ok(vs8(s8, { stageIdx: 7 }).length); assert.ok(vs8(s8, { stageIdx: 0 }).length); });
+test("stage8: wrong HEAD / stale fingerprint / env switch fail", () => { assert.ok(vs8(s8, { currentHead: "b".repeat(40) }).length); assert.ok(vs8(s8, { currentFingerprint: "x" }).length); assert.ok(vs8(s8, { envRef: "otherproject" }).length); });
+test("stage8: EDIT a digest hash / count fails; ADD/REMOVE a digest key fails; hash drift fails", () => {
+  let b = clone(s8); b.protectedDigest.approvals.h = "tampered"; assert.ok(vs8(b, { stageIdx: 8 }).length);
+  b = clone(s8); b.protectedDigest.settings.c = 999; assert.ok(vs8(b, { stageIdx: 8 }).length);
+  b = clone(s8); b.protectedDigest.rogue = { c: 1, h: "z" }; assert.ok(vs8(b, { stageIdx: 8 }).length);
+  b = clone(s8); delete b.protectedDigest.report_jobs; assert.ok(vs8(b, { stageIdx: 8 }).length);
+  b = clone(s8); b.migrationHashes[NEW6[0]] = "deadbeef"; assert.ok(vs8(b, { stageIdx: 8 }).length);
+});
+test("stage8: real manifest pins reject a foreign-pins stage-8 baseline", () => { assert.ok(validateStage8Baseline(s8, { currentHead: HEAD, currentFingerprint: FP, envRef: REF, stageIdx: 8 }).length); });
+test("stage8: shouldCreate requires zero problems AND a clean rollback", () => { assert.equal(shouldCreateStage8Baseline({ problemCount: 0, rolledBack: true }), true); assert.equal(shouldCreateStage8Baseline({ problemCount: 1, rolledBack: true }), false); assert.equal(shouldCreateStage8Baseline({ problemCount: 0, rolledBack: false }), false); });
+// applier: the stage-8 baseline governs ONLY migration 9 (stageIdx 8).
+test("stage8 applier: migration 9 (stageIdx 8) + VALID stage-8 baseline constructs the client", async () => { let made = 0; const b = buildStage8Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[8], sqlText: "X", actualSha: MIGRATIONS[8].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
+test("stage8 applier: migration 9 REJECTS the stage-7 baseline (anchor 7) -> zero connect", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[8], sqlText: "X", actualSha: MIGRATIONS[8].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+test("stage8 applier: migration 8 (stageIdx 7) REJECTS the stage-8 baseline (anchor 8) -> zero connect", async () => { let made = 0; const b = buildStage8Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {

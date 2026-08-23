@@ -242,6 +242,25 @@ test("budget-index-columns. a wrong budget-hash index column set => INDEX_COLUMN
   assert.ok(!a.ok && hasBlocker(a, "INDEX_COLUMNS_MISMATCH"), "INDEX_COLUMNS_MISMATCH");
 });
 
+// ---- Migration 9: operation-wide durable Catalog reservation -- weakening any guard is a typed blocker ----
+const PRIORITY = "20260825_priority_catalog_reservation.sql";
+const m9 = (mut, code, msg) => { const a = auditWith({ [PRIORITY]: mut }); assert.ok(!a.ok && hasBlocker(a, code), msg || code); };
+
+test("m9-tokens-widened. widening tokens_check (0,2 -> 0,2,9) => NAMED_CONSTRAINT_MISSING", () => m9((t) => t.replace("tokens_spent in (0, 2)", "tokens_spent in (0, 2, 9)"), "NAMED_CONSTRAINT_MISSING"));
+test("m9-status-widened. widening status_check => NAMED_CONSTRAINT_MISSING", () => m9((t) => t.replace("status in ('reserved', 'created')", "status in ('reserved', 'created', 'open')"), "NAMED_CONSTRAINT_MISSING"));
+test("m9-coherent-weakened. AND->OR in the created-coherent check => NAMED_CONSTRAINT_MISSING", () => m9((t) => t.replace("export_id is null and tokens_spent = 0", "export_id is null or tokens_spent = 0"), "NAMED_CONSTRAINT_MISSING"));
+test("m9-pk-renamed. renaming the operation-wide PK => NAMED_CONSTRAINT_MISSING", () => m9((t) => t.replace("source_priority_catalog_reservation_pk primary key", "source_priority_catalog_reservation_pk_renamed primary key"), "NAMED_CONSTRAINT_MISSING"));
+test("m9-acl-widened. GRANT ALL to service_role => SERVICE_ROLE_GRANT_MISMATCH", () => m9((t) => t.replace("grant select on table public.source_priority_catalog_reservation to service_role", "grant all on table public.source_priority_catalog_reservation to service_role"), "SERVICE_ROLE_GRANT_MISMATCH"));
+test("m9-authed-grant-missing. dropping authenticated SELECT (unreachable policy) => AUTH_GRANT_MISSING", () => m9((t) => t.replace("grant select on table public.source_priority_catalog_reservation to authenticated;\n", ""), "AUTH_GRANT_MISSING"));
+test("m9-rls-off. RLS not enabled => RLS_NOT_ENABLED", () => m9((t) => t.replace("alter table public.source_priority_catalog_reservation enable row level security;", ""), "RLS_NOT_ENABLED"));
+test("m9-policy-dropped. removing the admin-read policy => POLICY_MISSING", () => m9((t) => t.replace(/create policy source_priority_catalog_reservation_admin_read[\s\S]*?is_dashboard_admin\(\)\);/, ""), "POLICY_MISSING"));
+test("m9-rpc-param-drift. a drifted reserve RPC param => RPC_PARAM_MISMATCH", () => m9((t) => t.replace("  p_operation_key text,\n  p_catalog_request_hash text\n)", "  p_operation_key text,\n  p_catalog_request_hash text,\n  p_extra text\n)"), "RPC_PARAM_MISMATCH"));
+test("m9-reserve-no-advisory. removing the operation advisory lock in reserve => PRIORITY_RESERVE_ADVISORY_LOCK_MISSING", () => m9((t) => t.replace("  perform pg_advisory_xact_lock(hashtext(p_operation_key));\n", ""), "PRIORITY_RESERVE_ADVISORY_LOCK_MISSING"));
+test("m9-reserve-no-hash-mismatch. breaking reserve's hash-mismatch detection => PRIORITY_RESERVE_HASH_MISMATCH_MISSING", () => m9((t) => t.replace("v_row.catalog_request_hash is distinct from p_catalog_request_hash", "false"), "PRIORITY_RESERVE_HASH_MISMATCH_MISSING"));
+test("m9-reserve-delete. adding a delete/reset route in reserve => PRIORITY_RESERVE_HAS_DELETE", () => m9((t) => t.replace("  insert into public.source_priority_catalog_reservation (operation_key, catalog_request_hash)", "  delete from public.source_priority_catalog_reservation where operation_key = p_operation_key;\n  insert into public.source_priority_catalog_reservation (operation_key, catalog_request_hash)"), "PRIORITY_RESERVE_HAS_DELETE"));
+test("m9-record-hash-mutable. making catalog_request_hash mutable in record => PRIORITY_RECORD_HASH_MUTABLE", () => m9((t) => t.replace("set export_id = p_export_id, status = 'created', tokens_spent = 2, updated_at = now()", "set export_id = p_export_id, status = 'created', tokens_spent = 2, catalog_request_hash = p_catalog_request_hash, updated_at = now()"), "PRIORITY_RECORD_HASH_MUTABLE"));
+test("m9-wrapper-missing. removing the reservePriorityCatalogCreate wrapper => REQUIRED_WRAPPER_MISSING", () => { const a = auditWith({ [WRAP]: (t) => t.replace("export async function reservePriorityCatalogCreate", "async function reservePriorityCatalogCreate_removed") }); assert.ok(!a.ok && hasBlocker(a, "REQUIRED_WRAPPER_MISSING")); });
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

@@ -21,7 +21,8 @@
 import { buildBucketSourceSyncRuntime } from "./source-bucket-sync-runtime.js";
 import { makeDataDoeAdapter, makeSupabaseSourceStore } from "./source-sync-driver.js";
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
-import { getSyncReportJobs, reservePriorityCatalogCreate, recordPriorityCatalogExport, getPriorityCatalogReservation } from "../supabase.js";
+import { ORGANIZATION_SCOPE_KEY } from "./source-durable-model.js";
+import { getSyncReportJobs, getSyncCycleByBucketDate, reservePriorityCatalogCreate, recordPriorityCatalogExport, getPriorityCatalogReservation } from "../supabase.js";
 
 // FROZEN scope. Never overridable from an HTTP body / card action / scheduler.
 export const PRIORITY_DASHBOARDS = Object.freeze({
@@ -62,16 +63,12 @@ export function assertPriorityPublishReportKey(reportKey) {
  * reserve/record RPCs, 20260825_priority_catalog_reservation.sql -- PREPARED, UNAPPLIED). Injectable for tests.
  */
 export function makeSupabaseCatalogReservation() {
+  // The supabase.js wrappers already validate every acknowledgement STRICTLY and return normalized
+  // { disposition, exportId, tokensSpent, ... } objects, so this collaborator is a thin pass-through.
   return {
-    reserve: async ({ operationKey, catalogRequestHash }) => {
-      const r = (await reservePriorityCatalogCreate(operationKey, catalogRequestHash)) || {};
-      return { disposition: S(r.disposition), exportId: r.export_id ?? null, status: r.status ?? null, tokensSpent: Number(r.tokens_spent ?? 0) };
-    },
-    recordExport: async ({ operationKey, catalogRequestHash, exportId, tokens }) => {
-      const r = (await recordPriorityCatalogExport(operationKey, catalogRequestHash, exportId, tokens)) || {};
-      return { disposition: S(r.disposition), exportId: r.export_id ?? null };
-    },
-    get: async ({ operationKey, catalogRequestHash }) => getPriorityCatalogReservation(operationKey, catalogRequestHash),
+    reserve: ({ operationKey, catalogRequestHash }) => reservePriorityCatalogCreate(operationKey, catalogRequestHash),
+    recordExport: ({ operationKey, catalogRequestHash, exportId, tokens }) => recordPriorityCatalogExport(operationKey, catalogRequestHash, exportId, tokens),
+    get: ({ operationKey, catalogRequestHash }) => getPriorityCatalogReservation(operationKey, catalogRequestHash),
   };
 }
 
@@ -120,6 +117,11 @@ export function makeDurableCatalogGuard({ inner, reservation, operationKey }) {
         // Reserved but no recorded export id yet -> a create is in flight / its commit is unknown. AMBIGUOUS.
         throw new Error("PRIORITY_CATALOG_RESERVATION_AMBIGUOUS: a Catalog create is reserved but its export id is unrecorded (in-flight or commit-unknown); refusing a second create (fail closed).");
       }
+      if (res.disposition === "hash-mismatch") {
+        // The operation already reserved a DIFFERENT canonical Catalog hash (e.g. midnight / asOf date drift).
+        // One operation authorizes at most one Catalog create ever -> refuse; never a second create.
+        throw new Error("PRIORITY_CATALOG_HASH_MISMATCH: this operation reserved a different canonical Catalog request hash; refusing a second create (fail closed).");
+      }
       throw new Error(`PRIORITY_CATALOG_RESERVE_UNEXPECTED: durable reservation returned "${res.disposition}"; failing closed.`);
     },
     poll: (...a) => inner.poll(...a),
@@ -145,12 +147,14 @@ export function buildPriorityDashboardsRelease({
   reservation = makeSupabaseCatalogReservation(),
   makeStore = makeSupabaseSourceStore,
   listReportJobs = getSyncReportJobs,
+  getCycleByBucketDate = getSyncCycleByBucketDate,
   budgetMs = 550_000,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
   if (typeof makeInnerAdapter !== "function") throw new Error("buildPriorityDashboardsRelease requires makeInnerAdapter (fail closed).");
   if (typeof buildPublisher !== "function") throw new Error("buildPriorityDashboardsRelease requires buildPublisher (fail closed).");
   if (typeof listReportJobs !== "function") throw new Error("buildPriorityDashboardsRelease requires listReportJobs (fail closed).");
+  if (typeof getCycleByBucketDate !== "function") throw new Error("buildPriorityDashboardsRelease requires getCycleByBucketDate (fail closed).");
   const operationKey = PRIORITY_DASHBOARDS.operationKey;
   const REPORT_SET = new Set(PRIORITY_DASHBOARDS.reportKeys);
 
@@ -162,63 +166,96 @@ export function buildPriorityDashboardsRelease({
   });
   const publisher = buildPublisher(); // frozen production publisher; the composed surface is publish(rk, acct)
   const store = makeStore({ deadline: null });
+  const refuse = (reason, detail) => (detail === undefined ? { disposition: "refused", reason } : { disposition: "refused", reason, detail });
 
-  async function deriveBucket(bucket, { deadline = null, preflight = null } = {}) {
+  // deriveBucket takes ONLY the bucket identifier. It creates its OWN deadline and runs its OWN production
+  // preflight (fresh discovery/coverage/snapshot evidence); no caller-supplied preflight, account list,
+  // collaborators, dates, readiness, or scope is accepted. priorityMode is build-time; the run never finalizes.
+  async function deriveBucket(bucket) {
     if (!PRIORITY_DASHBOARDS.buckets.includes(bucket)) {
       throw new Error(`deriveBucket requires bucket in ${PRIORITY_DASHBOARDS.buckets.join("|")} (got "${bucket}") (fail closed).`);
     }
-    // The priority SOURCE runtime never finalizes the shared cycle -- verifyAndFinalize is the only finalize.
+    const deadline = runtime.makeDeadline();
+    const preflight = await runtime.preflightEvidence({ bucket, deadline });
     const rollup = await runtime.run({ bucket, deadline, preflight });
     return { rollup };
   }
 
-  // Verify the EXACT cycle + its children, then finalize via the reviewed RPC. Refuses unrelated/open/malformed
-  // work; accepts only a strict finalized/already-terminal acknowledgement with a terminal cycle.
-  async function verifyAndFinalize({ cycleId, expectedAccountIds }) {
-    if (!nb(cycleId)) return { disposition: "refused", reason: "blank-cycle-id" };
-    const accounts = [...new Set((Array.isArray(expectedAccountIds) ? expectedAccountIds : []).map(S).filter(nb))];
-    if (!accounts.length) return { disposition: "refused", reason: "no-expected-accounts" };
+  // finalizeBucket takes ONLY the bucket. It INDEPENDENTLY reconstructs and re-proves the durable scope from
+  // fresh, primary-only discovery + the durable cycle/jobs/owners + the durable reservation -- never an
+  // in-memory attestation or a caller-supplied cycle id / account scope -- then finalizes via the reviewed RPC.
+  async function finalizeBucket(bucket) {
+    if (!PRIORITY_DASHBOARDS.buckets.includes(bucket)) return refuse("bad-bucket");
+    const deadline = runtime.makeDeadline();
+    const sig = deadline && deadline.signal ? { signal: deadline.signal } : {};
 
-    // (1) source jobs: ONLY product-catalog, ALL terminal-successful.
+    // (1) EXPECTED account scope = fresh, primary-only discovery for THIS bucket (never caller-supplied).
+    const preflight = await runtime.preflightEvidence({ bucket, deadline });
+    const expected = [...new Set((preflight.accounts || []).map((a) => S(a.accountId)).filter(nb))].sort();
+    if (!expected.length) return refuse("no-discovered-accounts");
+    const cycleDate = S(preflight.today);
+    if (!nb(cycleDate)) return refuse("no-cycle-date");
+
+    // (2) reconstruct + verify the CYCLE ROW itself: exact bucket, running status, reviewed manual trigger.
+    const cycle = await getCycleByBucketDate(bucket, cycleDate, sig);
+    if (!cycle || !nb(S(cycle.id))) return refuse("cycle-not-found");
+    if (S(cycle.bucket) !== bucket) return refuse("cycle-bucket-mismatch");
+    if (S(cycle.status) !== "running") return refuse("cycle-not-running", S(cycle.status));
+    if (S(cycle.trigger) !== "manual") return refuse("cycle-not-manual", S(cycle.trigger));
+    const cycleId = S(cycle.id);
+
+    // (3) the reserved canonical Catalog hash (durable evidence) -- reconstructed independently.
+    const reservationRow = await reservation.get({ operationKey, catalogRequestHash: null });
+    if (!reservationRow || !nb(S(reservationRow.catalogRequestHash))) return refuse("no-reservation");
+    const reservedHash = S(reservationRow.catalogRequestHash);
+
+    // (4) source jobs: EXACTLY ONE product-catalog job, the reserved hash, succeeded, ORGANIZATION scope.
     const srcJobs = await store.listSourceJobs(cycleId);
-    if (!Array.isArray(srcJobs) || srcJobs.length === 0) return { disposition: "refused", reason: "no-source-jobs" };
-    for (const j of srcJobs) {
-      if (S(j.source_key ?? j.sourceKey) !== PRIORITY_DASHBOARDS.catalogSourceKey) return { disposition: "refused", reason: "unrelated-source-job" };
-      if (S(j.fetch_status ?? j.fetchStatus) !== "succeeded") return { disposition: "refused", reason: "source-job-not-terminal-successful" };
-    }
+    if (!Array.isArray(srcJobs) || srcJobs.length !== 1) return refuse("source-job-count", String(Array.isArray(srcJobs) ? srcJobs.length : "na"));
+    const cj = srcJobs[0];
+    if (S(cj.source_key ?? cj.sourceKey) !== PRIORITY_DASHBOARDS.catalogSourceKey) return refuse("source-job-not-catalog");
+    if (S(cj.request_hash ?? cj.requestHash) !== reservedHash) return refuse("source-hash-not-reserved");
+    if (S(cj.fetch_status ?? cj.fetchStatus) !== "succeeded") return refuse("source-job-not-succeeded");
+    const owners = await store.listCycleOwners(cycleId);
+    const catOwners = (Array.isArray(owners) ? owners : []).filter((o) => S(o.request_hash ?? o.requestHash) === reservedHash);
+    if (catOwners.length !== 1 || S(catOwners[0].account_id ?? catOwners[0].accountId) !== ORGANIZATION_SCOPE_KEY) return refuse("catalog-not-org-scope");
 
-    // (2) report jobs: ONLY the 3 keys, EXACT account scope, each derive/save succeeded + validated + nonblank hash.
+    // (5) report jobs: EXACTLY expected x 3, ONLY the 3 keys, NO duplicate natural identities, each validated.
     const repJobs = await listReportJobs(cycleId);
-    if (!Array.isArray(repJobs)) return { disposition: "refused", reason: "report-jobs-unavailable" };
+    if (!Array.isArray(repJobs)) return refuse("report-jobs-unavailable");
+    const seen = new Set();
+    const expectedSet = new Set(expected);
     for (const j of repJobs) {
       const rk = S(j.report_key ?? j.reportKey);
-      if (!REPORT_SET.has(rk)) return { disposition: "refused", reason: "unrelated-report-job", detail: rk };
+      if (!REPORT_SET.has(rk)) return refuse("unrelated-report-job", rk);
       const aid = S(j.account_id ?? j.accountId);
-      if (!accounts.includes(aid)) return { disposition: "refused", reason: "unexpected-account-report-job" };
+      if (!expectedSet.has(aid)) return refuse("unexpected-account-report-job");
+      const key = rk + "|" + aid;
+      if (seen.has(key)) return refuse("duplicate-report-job", key);
+      seen.add(key);
       const ok = j.validated === true
         && S(j.derive_status ?? j.deriveStatus) === "succeeded"
         && S(j.save_status ?? j.saveStatus) === "succeeded"
         && nb(j.snapshot_params_hash ?? j.snapshotParamsHash);
-      if (!ok) return { disposition: "refused", reason: "report-job-not-validated", detail: rk };
+      if (!ok) return refuse("report-job-not-validated", key);
     }
-    // EXACT scope: every (account x reportKey) present (no missing).
-    const present = new Set(repJobs.map((j) => S(j.report_key ?? j.reportKey) + "|" + S(j.account_id ?? j.accountId)));
-    for (const a of accounts) {
+    if (seen.size !== expected.length * PRIORITY_DASHBOARDS.reportKeys.length) return refuse("report-job-count", String(seen.size));
+    for (const a of expected) {
       for (const rk of PRIORITY_DASHBOARDS.reportKeys) {
-        if (!present.has(rk + "|" + a)) return { disposition: "refused", reason: "missing-report-job", detail: rk + "|" + a };
+        if (!seen.has(rk + "|" + a)) return refuse("missing-report-job", rk + "|" + a);
       }
     }
 
-    // (3) finalize -- accept ONLY a strict finalized/already-terminal acknowledgement with a terminal cycle.
+    // (6) finalize -- accept ONLY a strict finalized/already-terminal ack with a terminal (succeeded/partial) cycle.
     const disp = await store.finalizeCycle({ cycleId });
     const d = disp && disp.disposition;
     if (d === "finalized" || d === "already-terminal") {
       const status = disp.cycle && typeof disp.cycle === "object" ? disp.cycle.status : null;
-      if (status !== "succeeded" && status !== "partial") return { disposition: "refused", reason: "finalize-status-" + S(status || "malformed") };
-      return { disposition: d, cycleStatus: status };
+      if (status !== "succeeded" && status !== "partial") return refuse("finalize-status-" + S(status || "malformed"));
+      return { disposition: d, cycleStatus: status, cycleId, accounts: expected };
     }
-    if (d === "open-work") return { disposition: "refused", reason: "open-work" };
-    return { disposition: "refused", reason: "finalize-" + S(d || "malformed") };
+    if (d === "open-work") return refuse("open-work");
+    return refuse("finalize-" + S(d || "malformed"));
   }
 
   // Publish the COMPLETE surface for one account: daily-reporting, brand-sales, brand-inventory -- brand-sales
@@ -240,11 +277,9 @@ export function buildPriorityDashboardsRelease({
     operationKey,
     reportKeys: PRIORITY_DASHBOARDS.reportKeys,
     publishOrder: PRIORITY_DASHBOARDS.publishOrder,
-    makeDeadline: runtime.makeDeadline,
-    preflightEvidence: runtime.preflightEvidence,
     catalogReservation: (catalogRequestHash) => reservation.get({ operationKey, catalogRequestHash }),
     deriveBucket,
-    verifyAndFinalize,
+    finalizeBucket,
     publishAccount,
   });
 }
