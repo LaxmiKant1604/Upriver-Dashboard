@@ -361,10 +361,11 @@ test("B4. a NEW account in a non-full batch backfills SOLO; completed members ne
   assert.ok(solo[0].from < grouped[0].from, "A05 backfills from 2025-01-01; completed members only refresh the recent window");
 });
 
-test("B5. go-live frozen budget: 7 batches over the FIXED [2025-01-01, 2026-08-21] window => EXACTLY 14 exports / 28 tokens", () => {
+test("B5. multi-seller row-cap safety: 7 batches over the fixed window => exactly 21 exports / 42 tokens", () => {
   // 35 accounts => 7 stable batches of 5. The initial complete-history backfill (empty coverage) over the FIXED
-  // window [2025-01-01, 2026-08-21] (598 inclusive days) splits at the 441-day application cap into EXACTLY two
-  // contiguous chunks per batch: [2025-01-01, 2026-03-17] (441d) and [2026-03-18, 2026-08-21] (157d).
+  // window [2025-01-01, 2026-08-21] first splits at the 441-day outer cap. The 441-day multi-seller chunk is
+  // then split at 221 days after live evidence proved five sellers can hit the 50,000-row response limit;
+  // the successful 157-day remainder identity stays unchanged.
   const GO_LIVE = "2026-08-21";
   const thirtyFive = Array.from({ length: 35 }, (_, i) => acct(i + 1));
   const plan = bucketSync.planBucketSourceSync({
@@ -374,22 +375,22 @@ test("B5. go-live frozen budget: 7 batches over the FIXED [2025-01-01, 2026-08-2
   });
   assert.equal(plan.batches.length, 7, "35 accounts => 7 stable batches of 5");
   const oli = plan.families.find((f) => f.sourceKey === "order-line-items");
-  // exact per-batch chunk boundaries (deduped across batches -> exactly the two chunk windows)
+  // Exact per-batch boundaries (deduped across batches -> exactly three windows).
   const windows = [...new Set(oli.units.map((u) => u.slice.from + ".." + u.slice.to))].sort();
-  assert.deepEqual(windows, ["2025-01-01..2026-03-17", "2026-03-18..2026-08-21"], "each batch splits into the two exact 441-capped chunks");
-  assert.equal(oli.units.length, 14, "7 batches x 2 chunks = 14 complete-window OLI exports");
-  // FROZEN budget: 14 UNIQUE OLI request hashes, standard=2 tokens each => the 28-token ceiling (NOT 7/14).
+  assert.deepEqual(windows, ["2025-01-01..2025-08-09", "2025-08-10..2026-03-17", "2026-03-18..2026-08-21"]);
+  assert.equal(oli.units.length, 21, "7 batches x 3 chunks = 21 complete-window OLI exports");
+  // FROZEN budget: 21 unique hashes, standard=2 tokens each => the 42-token worst-case ceiling.
   const budget = tbudget.computeFrozenTrancheBudget({
     plannedJobs: oli.plannedJobs, isPremiumOf: () => false, trancheKey: "source-sync:order-line-items",
   });
-  assert.equal(budget.hashes.length, 14, "14 distinct frozen OLI request hashes");
-  assert.equal(budget.maxCreates, 14, "EXACTLY 14 authorized OLI creates (7 batches x 2 chunks)");
-  assert.equal(budget.maxTokens, 28, "EXACTLY 28 authorized tokens (standard OLI = 2 each; NOT 7 exports / 14 tokens)");
+  assert.equal(budget.hashes.length, 21, "21 distinct frozen OLI request hashes");
+  assert.equal(budget.maxCreates, 21, "EXACTLY 21 authorized OLI creates (7 batches x 3 chunks)");
+  assert.equal(budget.maxTokens, 42, "EXACTLY 42 authorized tokens (standard OLI = 2 each)");
 });
 
-test("B6. production shape: 8 US (2 batches) + 22 non-US (5 batches) => 14 exports / 28 tokens; sellers unique per chunk; buckets never mix", () => {
+test("B6. production shape: 8 US + 22 non-US => 21 exports / 42-token worst case; sellers stay isolated", () => {
   const GO_LIVE = "2026-08-21";
-  const CHUNKS = ["2025-01-01..2026-03-17", "2026-03-18..2026-08-21"]; // 441 + 157 inclusive days
+  const CHUNKS = ["2025-01-01..2025-08-09", "2025-08-10..2026-03-17", "2026-03-18..2026-08-21"];
   const mk = (prefix, country, n) => Array.from({ length: n }, (_, i) => ({
     accountId: prefix + String(i + 1).padStart(2, "0"),
     rawSellerId: prefix + "S" + String(i + 1).padStart(2, "0"),
@@ -411,13 +412,13 @@ test("B6. production shape: 8 US (2 batches) + 22 non-US (5 batches) => 14 expor
   const oliUnits = (plan) => plan.families.find((f) => f.sourceKey === "order-line-items").units;
   const usUnits = oliUnits(us);
   const nonUsUnits = oliUnits(nonUs);
-  assert.equal(usUnits.length, 4, "US: 2 batches x 2 date chunks = 4 exports");
-  assert.equal(nonUsUnits.length, 10, "non-US: 5 batches x 2 date chunks = 10 exports");
+  assert.equal(usUnits.length, 6, "US: 2 batches x 3 date chunks = 6 exports");
+  assert.equal(nonUsUnits.length, 15, "non-US: 5 batches x 3 date chunks = 15 exports");
   const allUnits = [...usUnits, ...nonUsUnits];
-  assert.equal(allUnits.length, 14, "combined: EXACTLY 14 exports");
-  // The ONLY windows are the two exact date chunks.
+  assert.equal(allUnits.length, 21, "combined: EXACTLY 21 exports");
+  // The only windows are the three exact date chunks.
   assert.deepEqual([...new Set(allUnits.map((u) => u.slice.from + ".." + u.slice.to))].sort(), CHUNKS,
-    "the exact windows remain 2025-01-01..2026-03-17 and 2026-03-18..2026-08-21");
+    "the 441-day multi-seller chunk splits while the 157-day remainder identity is preserved");
   // Every seller appears EXACTLY ONCE per date chunk, and each chunk covers exactly that bucket's sellers.
   for (const [label, units, accounts] of [["US", usUnits, usAccounts], ["non-US", nonUsUnits, nonUsAccounts]]) {
     for (const chunk of CHUNKS) {
@@ -436,8 +437,8 @@ test("B6. production shape: 8 US (2 batches) + 22 non-US (5 batches) => 14 expor
     const allNonUs = u.sellerOrVendorIds.every((s) => nonUsSellers.has(s));
     assert.ok(allUs !== allNonUs, "each export's sellers are ALL one bucket -- never a US/non-US mix");
   }
-  // All 14 request hashes are unique.
-  assert.equal(new Set(allUnits.map((u) => u.requestHash)).size, 14, "all 14 export request hashes are unique");
+  // All 21 request hashes are unique.
+  assert.equal(new Set(allUnits.map((u) => u.requestHash)).size, 21, "all 21 export request hashes are unique");
   // Per-bucket + combined frozen ceilings (standard OLI = 2 tokens/export).
   const oliBudget = (plan) => tbudget.computeFrozenTrancheBudget({
     plannedJobs: plan.families.find((f) => f.sourceKey === "order-line-items").plannedJobs,
@@ -445,10 +446,10 @@ test("B6. production shape: 8 US (2 batches) + 22 non-US (5 batches) => 14 expor
   });
   const usB = oliBudget(us);
   const nonUsB = oliBudget(nonUs);
-  assert.deepEqual([usB.maxCreates, usB.maxTokens], [4, 8], "US ceiling: 4 exports / 8 tokens");
-  assert.deepEqual([nonUsB.maxCreates, nonUsB.maxTokens], [10, 20], "non-US ceiling: 10 exports / 20 tokens");
-  assert.equal(usB.maxCreates + nonUsB.maxCreates, 14, "combined: 14 exports");
-  assert.equal(usB.maxTokens + nonUsB.maxTokens, 28, "combined: 28 tokens");
+  assert.deepEqual([usB.maxCreates, usB.maxTokens], [6, 12], "US ceiling: 6 exports / 12 tokens");
+  assert.deepEqual([nonUsB.maxCreates, nonUsB.maxTokens], [15, 30], "non-US ceiling: 15 exports / 30 tokens");
+  assert.equal(usB.maxCreates + nonUsB.maxCreates, 21, "combined: 21 exports");
+  assert.equal(usB.maxTokens + nonUsB.maxTokens, 42, "combined: 42 tokens");
 });
 
 /* ================================= C. catalog + FBA ================================= */

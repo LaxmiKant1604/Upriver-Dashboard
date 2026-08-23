@@ -166,6 +166,15 @@ test("C5. a missing window longer than the proven single-export cap SPLITS into 
   assert.equal(units.length, chunks.length, "one export per capped chunk");
   for (const u of units) assert.deepEqual(u.sellerOrVendorIds, ["S1"], "every chunk carries the same batch scope");
   assert.deepEqual(units.map((u) => u.slice), chunks, "the exports reconstruct the full missing window as contiguous <=cap chunks");
+  const multi = model.planOliSliceExports({
+    batchAccounts: [{ accountId: "A1", rawSellerId: "S1" }, { accountId: "A2", rawSellerId: "S2" }],
+    coverageByAccountId: {}, from: "2025-01-01", to: "2026-08-21",
+  });
+  assert.deepEqual(multi.map((u) => u.slice), [
+    { from: "2025-01-01", to: "2025-08-09" },
+    { from: "2025-08-10", to: "2026-03-17" },
+    { from: "2026-03-18", to: "2026-08-21" },
+  ], "multi-seller 441-day chunks split at 221 days while the short remainder identity stays stable");
 });
 
 test("C4. successful slices roll up into minimal coverage windows", () => {

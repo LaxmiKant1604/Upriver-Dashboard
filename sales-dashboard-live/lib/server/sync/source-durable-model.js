@@ -33,6 +33,13 @@ const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 // their coverage merges back to one window) -- no single export ever exceeds the proven-safe range.
 export const MAX_OLI_EXPORT_WINDOW_DAYS = 441;
 
+// A live five-seller OLI export over the full 441-day cap returned exactly the 50,000-row response limit and
+// was rejected as TRUNCATED. Keep 441 as the proven outer request boundary, but split only multi-seller chunks
+// to at most 221 inclusive days. Applying this AFTER the outer split preserves the existing short remainder
+// identity (for example the 157-day 2026 remainder), so successful exact-cache evidence remains reusable while
+// the truncated 441-day identity is never retried.
+export const MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS = 221;
+
 // Split an inclusive [from, to] window into contiguous chunks of at most `maxDays` inclusive days each (the
 // last chunk holds the remainder). from/to must be valid YYYY-MM-DD with from <= to.
 export function splitWindowToMaxSpan({ from, to }, maxDays = MAX_OLI_EXPORT_WINDOW_DAYS) {
@@ -176,8 +183,9 @@ export function missingCoverageWindows(coverageWindows, from, to) {
  *                                                                window -- completed members are never re-exported.
  * `batchAccounts`: [{ accountId, rawSellerId }] (<=5). `coverageByAccountId`: accountId -> proven windows.
  * Returns [{ slice:{from,to}, accounts:[{accountId,rawSellerId}], sellerOrVendorIds:[sorted] }] -- each `slice`
- * is a COMPLETE window (not a 7-day bin) capped at MAX_OLI_EXPORT_WINDOW_DAYS. NO adaptive slicing beyond the
- * cap: a truncated/row-capped export fails closed upstream.
+ * is a COMPLETE window (not a 7-day bin) capped at MAX_OLI_EXPORT_WINDOW_DAYS. Multi-seller chunks are further
+ * bounded by MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS after live row-cap evidence proved 441 days can truncate;
+ * single-seller chunks retain the empirically proven 441-day cap and short remainder identities stay stable.
  */
 export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, to }) {
   const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
@@ -208,7 +216,12 @@ export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, 
       // A missing window longer than DataDoe's proven single-export range is SPLIT into contiguous <=cap chunks;
       // a within-range window stays ONE export. The chunks' coverage merges back into the one contiguous window.
       for (const chunk of splitWindowToMaxSpan(w)) {
-        units.push({ slice: { from: chunk.from, to: chunk.to }, accounts: sorted, sellerOrVendorIds: ids });
+        const safeChunks = ids.length > 1
+          ? splitWindowToMaxSpan(chunk, MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS)
+          : [chunk];
+        for (const safeChunk of safeChunks) {
+          units.push({ slice: { from: safeChunk.from, to: safeChunk.to }, accounts: sorted, sellerOrVendorIds: ids });
+        }
       }
     }
   }
