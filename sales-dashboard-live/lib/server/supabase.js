@@ -823,6 +823,38 @@ export async function finalizeSyncCycle(cycleId, { signal = null } = {}) {
   return validateFinalizeResponse(result, cycleId);
 }
 
+// DURABLE one-Catalog-export / two-token reservation for the Daily Reporting + Brand View priority release
+// (20260825_priority_catalog_reservation.sql -- PREPARED, UNAPPLIED). The two SECURITY DEFINER RPCs are the
+// ONLY write path; service_role may only SELECT. reserve_priority_catalog_create returns
+// { disposition:'reserved' } | { disposition:'exists', export_id, status, tokens_spent }; a caller adopts on
+// 'exists' with an export_id and FAILS CLOSED on 'exists' without one (never a second create).
+export async function reservePriorityCatalogCreate(operationKey, catalogRequestHash, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/reserve_priority_catalog_create", {
+    method: "POST", signal,
+    body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+export async function recordPriorityCatalogExport(operationKey, catalogRequestHash, exportId, tokens, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/record_priority_catalog_export", {
+    method: "POST", signal,
+    body: { p_operation_key: operationKey, p_catalog_request_hash: catalogRequestHash, p_export_id: exportId, p_tokens: tokens },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+export async function getPriorityCatalogReservation(operationKey, catalogRequestHash, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "operation_key,catalog_request_hash,export_id,tokens_spent,status,created_at,updated_at",
+    operation_key: `eq.${operationKey}`,
+    catalog_request_hash: `eq.${catalogRequestHash}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/source_priority_catalog_reservation?${query}`, { signal });
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller
 // that made the first (and only) create-export POST for this (cycle, request_hash).
 export async function claimSourceExportAttempt(cycleId, requestHash, { signal = null } = {}) {

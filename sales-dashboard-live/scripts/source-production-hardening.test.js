@@ -40,7 +40,7 @@ const test = (name, fn) => tests.push({ name, fn });
 const group = (label) => tests.push({ marker: label });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runtimeMod; let registry; let schema; let dates; let identity; let reportStore; let durableModel;
+let runtimeMod; let registry; let schema; let dates; let identity; let reportStore; let durableModel; let priorityDash;
 
 // Round-9: canonical JSON (sorted object keys, array order preserved) mirroring the runtime's canonicalJson,
 // so the harness freshness-CAS proves content identity the same way the production CAS does.
@@ -385,7 +385,7 @@ function makeHarness(over = {}) {
     setTimer: over.setTimer,
     clearTimer: over.clearTimer,
     makeSourceStore: () => store,
-    makeAdapter: () => dd,
+    makeAdapter: over.makeAdapter || (() => dd),
     readSourceControls: over.readSourceControls || (async () => ({ rows: [], read: "ok", error: null })),
     readCoverage: over.readCoverage || (async () => ({ windows: [{ from: "2025-01-01", to: dates.addDaysStr(ASOF, -7) }], read: "ok", error: null })),
     readSnapshot: over.readSnapshot || (async () => ({ snapshot: null, read: "ok", error: null })),
@@ -473,6 +473,7 @@ function makeHarness(over = {}) {
     clock: () => clockRef.now,
     budgetMs: over.budgetMs ?? 600_000,
     reserveMs: over.reserveMs ?? 1_000,
+    priorityMode: over.priorityMode === true,
   });
   return { runtime, store, dd, snapStore, recorded, clockRef, membership, durableHistory, durableCoverage };
 }
@@ -3094,6 +3095,9 @@ group("F11. priority dashboards path: derive Daily + Brand View from durable OLI
 function priorityHarness(accounts, over = {}) {
   const h = makeHarness({
     primaryAccounts: accounts,
+    // Priority mode is bound at BUILD time (never a run() argument), exactly as the trusted release composition
+    // binds it. Ordinary harnesses omit priorityMode and get a normal runtime.
+    priorityMode: true,
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
     // Catalog + FBA snapshots ABSENT by default: the Catalog is fetched this cycle; FBA is UNAVAILABLE.
     readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
@@ -3109,7 +3113,7 @@ test("F11a. 30 covered accounts derive Daily + Brand View off durable OLI + Cata
   const accounts = Array.from({ length: 30 }, (_, i) => dirAccount("A" + String(i + 1).padStart(2, "0")));
   const h = priorityHarness(accounts);
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
-  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.ok(rollup.cycleId, "the forced Catalog job opened the owning cycle");
   assert.equal(rollup.derived.skipped, null, "the derive/save stage ran (priority does not require a full drain)");
@@ -3126,7 +3130,7 @@ test("F11b. missing FBA is represented as UNAVAILABLE (inventoryAvailable:false)
   const accounts = [dirAccount("A01"), dirAccount("A02")];
   const h = priorityHarness(accounts);
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
-  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   assert.equal(rollup.derived.brandInventory.saved, 2, "brand-inventory saved for both accounts");
   const invSaves = h.recorded.shadowSaves.filter((s) => s.reportKey === "scheduler-v2/brand-inventory");
   assert.equal(invSaves.length, 2, "two brand-inventory shadow snapshots");
@@ -3146,7 +3150,7 @@ test("F11c. priority FORCES a Catalog job even when the snapshot is fresh-today,
   });
   h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
-  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.ok(rollup.cycleId, "priority forced a Catalog job -> owning cycle opened even though the snapshot was fresh");
   assert.equal(rollup.derived.skipped, null, "the derive ran (the fresh-catalog cycle-less skip is bypassed)");
@@ -3159,7 +3163,7 @@ test("F11d. priority still fails CLOSED: an account whose durable OLI row lacks 
   const h = priorityHarness(accounts);
   h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 }); // NO sourceRequestHash
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
-  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey !== "product-catalog").length, 0, "still ZERO non-catalog creates");
   assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed with the typed provenance-missing skip");
@@ -3169,10 +3173,100 @@ test("F11e. priority plans ZERO non-catalog source JOBS in the owning cycle (OLI
   const accounts = [dirAccount("A01"), dirAccount("A02")];
   const h = priorityHarness(accounts);
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
-  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   const jobs = h.store.listSourceJobs(rollup.cycleId);
   assert.ok(jobs.length > 0, "the cycle has the Catalog job");
   assert.ok(jobs.every((j) => j.source_key === "product-catalog"), "ONLY product-catalog jobs exist in the cycle: " + JSON.stringify(jobs.map((j) => j.source_key)));
+});
+
+test("F11f. ordinary callers CANNOT activate priority mode: a normally-built runtime ignores a run({priority:true}) arg and still fetches FBA (non-priority)", async () => {
+  const accounts = [dirAccount("A01"), dirAccount("A02")];
+  // NORMAL runtime (NO priorityMode). Absent catalog + FBA, full coverage => a normal run fetches catalog AND
+  // per-account FBA (the very cost the priority path avoids). Passing priority:true as a run arg must be INERT.
+  const h = makeHarness({
+    primaryAccounts: accounts,
+    readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
+    readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
+  });
+  for (const a of accounts) h.durableHistory.set(a.id + "|x", { accountId: a.id, saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1, sourceRequestHash: "oli-prov-" + a.id });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf }); // the arg is INERT
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(h.dd.createSeq.some((c) => c.sourceKey === "fba-inventory-health"), "a normal runtime fetches FBA -> the priority run arg had NO effect");
+});
+
+/* ===== F12. priority release with the REAL runtime + REAL worker + the DURABLE Catalog reservation ===== */
+group("F12. priority release: durable one-Catalog-export ceiling across US + Non-US, cold + warm, zero OLI/Ads/FBA");
+
+// A FAITHFUL fake of the durable reservation table (atomic insert-if-absent + record-if-absent).
+function fakeReservation() {
+  const rows = new Map(); const k = (op, h) => op + "|" + h;
+  return {
+    _rows: rows,
+    reserve: async ({ operationKey, catalogRequestHash }) => {
+      const key = k(operationKey, catalogRequestHash);
+      if (rows.has(key)) { const r = rows.get(key); return { disposition: "exists", exportId: r.export_id, status: r.status, tokensSpent: r.tokens_spent }; }
+      rows.set(key, { export_id: null, status: "reserved", tokens_spent: 0 }); return { disposition: "reserved" };
+    },
+    recordExport: async ({ operationKey, catalogRequestHash, exportId, tokens }) => {
+      const r = rows.get(k(operationKey, catalogRequestHash));
+      if (!r) return { disposition: "not-reserved" };
+      if (r.export_id != null) return r.export_id === exportId ? { disposition: "already-recorded", exportId: r.export_id } : { disposition: "conflict", exportId: r.export_id };
+      r.export_id = exportId; r.status = "created"; r.tokens_spent = tokens; return { disposition: "recorded", exportId };
+    },
+    get: async ({ operationKey, catalogRequestHash }) => rows.get(k(operationKey, catalogRequestHash)) || null,
+  };
+}
+const euAccount = (id) => ({ id, name: "Acct " + id, country: "DE", currency: "EUR", status: "active" });
+function guardedPriorityHarness(accounts, dd, reservation) {
+  return priorityHarness(accounts, {
+    dd,
+    makeAdapter: () => priorityDash.makeDurableCatalogGuard({ inner: dd, reservation, operationKey: priorityDash.PRIORITY_DASHBOARDS.operationKey }),
+  });
+}
+const catCreates = (dd) => dd.createSeq.filter((c) => c.sourceKey === "product-catalog").length;
+const nonCatCreates = (dd) => dd.createSeq.filter((c) => c.sourceKey !== "product-catalog").length;
+
+test("F12a. REAL cold-cache derive: EXACTLY one Catalog create / 2 durable tokens, ZERO OLI/Ads/FBA; a warm re-run creates nothing", async () => {
+  const dd = makeDataDoe(); const reservation = fakeReservation();
+  const h = guardedPriorityHarness([dirAccount("A01"), dirAccount("A02")], dd, reservation);
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const r1 = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(r1.derived.skipped, null, JSON.stringify(r1.stopReason || r1.derived));
+  assert.equal(catCreates(dd), 1, "one Catalog create");
+  assert.equal(nonCatCreates(dd), 0, "zero OLI/Ads/FBA creates");
+  assert.equal(reservation._rows.size, 1, "one durable reservation row");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "exactly two durable tokens");
+  const before = dd.totalCreates();
+  await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(dd.totalCreates() - before, 0, "warm-cache re-run created nothing");
+});
+
+test("F12b. REAL US + Non-US on ONE runtime + ONE reservation: exactly ONE Catalog create total (Non-US reuses the org-scoped cache), ZERO OLI/Ads/FBA", async () => {
+  const dd = makeDataDoe(); const reservation = fakeReservation();
+  const h = guardedPriorityHarness([dirAccount("U01"), dirAccount("U02"), euAccount("E01"), euAccount("E02")], dd, reservation);
+  const rUs = await h.runtime.run({ bucket: "us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "us", today: TODAY }) });
+  const rEu = await h.runtime.run({ bucket: "non-us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "non-us", today: TODAY }) });
+  assert.equal(rUs.derived.skipped, null, JSON.stringify(rUs.stopReason || rUs.derived));
+  assert.equal(rEu.derived.skipped, null, JSON.stringify(rEu.stopReason || rEu.derived));
+  assert.equal(catCreates(dd), 1, "ONE Catalog create across BOTH buckets");
+  assert.equal(nonCatCreates(dd), 0, "zero OLI/Ads/FBA creates");
+  assert.equal(reservation._rows.size, 1, "one shared reservation across buckets");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "two tokens total");
+});
+
+test("F12c. REAL US + Non-US with a COLD Non-US cache: the durable reservation makes Non-US ADOPT the export (zero create), never a second Catalog create", async () => {
+  const dd = makeDataDoe(); const reservation = fakeReservation();
+  const h = guardedPriorityHarness([dirAccount("U01"), dirAccount("U02"), euAccount("E01"), euAccount("E02")], dd, reservation);
+  await h.runtime.run({ bucket: "us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "us", today: TODAY }) });
+  assert.equal(catCreates(dd), 1, "US made the one create");
+  // Simulate a restart / the 24h Catalog cache expiring before the Non-US bucket runs.
+  h.store._cache.clear();
+  const rEu = await h.runtime.run({ bucket: "non-us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "non-us", today: TODAY }) });
+  assert.equal(rEu.derived.skipped, null, JSON.stringify(rEu.stopReason || rEu.derived));
+  assert.equal(catCreates(dd), 1, "STILL one Catalog create -- Non-US ADOPTED the reserved export, never re-created");
+  assert.equal(nonCatCreates(dd), 0, "zero OLI/Ads/FBA creates");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still two tokens total");
 });
 
 async function main() {
@@ -3184,6 +3278,7 @@ async function main() {
   identity = await import("../lib/server/source-identity.js");
   reportStore = await import("../lib/server/report-store.js");
   durableModel = await import("../lib/server/sync/source-durable-model.js");
+  priorityDash = await import("../lib/server/sync/source-priority-dashboards.js");
 
   let failures = 0;
   for (const t of tests) {

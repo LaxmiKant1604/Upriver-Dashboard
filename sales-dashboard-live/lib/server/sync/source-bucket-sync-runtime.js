@@ -285,6 +285,14 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     clock = () => Date.now(),
     budgetMs = DEFAULT_ROUTE_BUDGET_MS,
     reserveMs = DEFAULT_ROUTE_RESERVE_MS,
+    // TRUSTED, BUILD-TIME-ONLY priority-dashboards binding (mirrors recoverFailedDownloads): when true, EVERY
+    // run() on this runtime is a Daily Reporting + Brand View priority derive (pause every non-catalog source,
+    // force the Catalog job, derive off durable OLI + Catalog, represent missing Ads/FBA as unavailable).
+    // Ordinary runtime callers -- HTTP routes, card actions, the scheduler -- build the runtime with no
+    // arguments and get priorityMode=false; there is NO run() argument to flip it. Only the reviewed
+    // source-priority-dashboards release composition sets it true, alongside its catalog-only durable create
+    // guard. run() therefore has no freely-selectable priority switch.
+    priorityMode = false,
     // Round-7 finding 1: the derive-lease duration. Long enough that a live worker (bounded by the ~50s
     // route budget) always holds a non-expired lease within its invocation, short enough that a genuinely
     // abandoned claim recovers on a later invocation. NEVER derived from updated_at.
@@ -496,10 +504,13 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, priority = false, deadline = null, preflight = null } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null } = {}) => {
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`buildBucketSourceSyncRuntime.run requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
+    // Priority mode is BOUND AT BUILD TIME only (see priorityMode above) -- never a run() argument, so no
+    // ordinary caller can activate the derive-off-durable + non-catalog-pause behaviour by passing a flag.
+    const priority = priorityMode === true;
     if (onlySourceKey != null) sourceRegistryEntry(onlySourceKey); // typed UNREGISTERED_SOURCE (fail closed)
     if (preflight && preflight.bucket !== bucket) {
       throw new Error(`PREFLIGHT_SCOPE_MISMATCH: the memoized preflight was gathered for bucket "${preflight && preflight.bucket}", not "${bucket}" (fail closed).`);
