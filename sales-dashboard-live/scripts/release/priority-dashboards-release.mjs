@@ -20,10 +20,11 @@ for (const line of readFileSync(repoRoot + "/.env.local", "utf8").split(/\r?\n/)
 }
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
 
-const { buildPriorityDashboardsRelease, PRIORITY_DASHBOARDS, assertPriorityPublishReportKey } = await import("../../lib/server/sync/source-priority-dashboards.js");
-const { runPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-release-runner.js");
+const { buildPriorityDashboardsRelease, PRIORITY_DASHBOARDS } = await import("../../lib/server/sync/source-priority-dashboards.js");
+const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
 const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
+const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const sb = await import("../../lib/server/supabase.js");
 
 const release = buildPriorityDashboardsRelease();
@@ -55,36 +56,19 @@ async function reconcile() {
   } catch (e) { return { ok: false, problems: ["reconcile read failed: " + (e && e.message)] }; }
 }
 
-// Read-prove the four durable publication gates for one (report, account) -- NO write.
-async function readPublishGate(reportKey, accountId) {
-  assertPriorityPublishReportKey(reportKey);
-  if (reportKey === "brand-inventory") {
-    const promoted = (await sb.getSourcePromotedPublishSettings()) || [];
-    const row = promoted.find((r) => String(r.report_key ?? r.reportKey) === reportKey);
-    if (!row || row.publish_enabled !== true) return { ready: false, reason: "promoted-publish-disabled" };
-  } else {
-    const settings = (await sb.getReportSyncSettings()) || [];
-    const row = settings.find((r) => String(r.report_key ?? r.reportKey) === reportKey);
-    if (!row || row.schedule_enabled !== true) return { ready: false, reason: "report-disabled" };
-  }
-  const approval = await sb.getSchedulerPublishApproval(reportKey, accountId);
-  if (!approval || approval.read !== "ok" || approval.approved !== true) return { ready: false, reason: "not-approved" };
-  return { ready: true };
-}
-
-// Read back the exact LIVE identity and prove the frontend payload contract (REPORT_DERIVATIONS.validatePayload).
-async function readbackLive(reportKey, accountId) {
-  const contract = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[reportKey];
-  if (!contract) return { ok: false, reason: "no live contract" };
-  const snap = await sb.getReportSnapshot({ reportKey: contract.liveReportKey, accountId });
-  if (!snap || snap.payload == null || String(snap.source_refreshed_at || "").trim() === "") return { ok: false, reason: "no live snapshot" };
-  const entry = REPORT_DERIVATIONS[reportKey];
-  if (!entry || entry.validatePayload(snap.payload) !== true) return { ok: false, reason: "payload contract failed" };
-  return { ok: true };
-}
+// The publication gates are read-proven by the composition's SHARED publisher preflight (release.preflightAccount)
+// -- the SAME collaborators + logic as the real publish -- so the CLI duplicates NO gate logic here. The
+// EXACT-identity live read-back is the reviewed buildLiveReadback wired to the production readers.
+const readbackLive = buildLiveReadback({
+  getReportSnapshot: sb.getReportSnapshot,
+  loadStoragePayload: sb.getReportSnapshotStoragePayload,
+  liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+  reportDerivations: REPORT_DERIVATIONS,
+  computeHash: paramsHashFor,
+});
 
 const result = await runPriorityDashboardsRelease({
-  release, reconcile, readPublishGate, readbackLive, assertNoCron,
+  release, reconcile, readbackLive, assertNoCron,
   log: (m) => console.log("priority-release: " + m),
 });
 console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));

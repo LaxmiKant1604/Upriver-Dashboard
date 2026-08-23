@@ -140,6 +140,26 @@ export function requirePinnedStage0Digest(observed, pins = PROTECTED_DIGESTS) {
   return P;
 }
 
+// Stage-8 reconciliation classifier: for EVERY protected key, classify the observed live digest against the
+// manifest pin as matched | drifted | missing | unpinned, and flag any unexpected extra key. driftCount counts
+// every non-matched key (so a caller STOPs for review on any drift and NEVER assumes/updates pins offline).
+export function classifyProtectedDrift(pins = PROTECTED_DIGESTS, observed = {}) {
+  const perKey = [];
+  let driftCount = 0;
+  for (const k of PROTECTED_DIGEST_KEYS) {
+    const pin = pins[k], o = observed[k];
+    let status;
+    if (pin == null) { status = "unpinned"; driftCount += 1; }
+    else if (!o) { status = "missing"; driftCount += 1; }
+    else if (o.c === pin.c && o.h === pin.h) { status = "matched"; }
+    else { status = "drifted"; driftCount += 1; }
+    perKey.push({ key: k, status, pin: pin ? { c: pin.c, h: String(pin.h).slice(0, 12) } : null, observed: o ? { c: o.c, h: String(o.h).slice(0, 12) } : null });
+  }
+  const extra = Object.keys(observed || {}).filter((k) => !PROTECTED_DIGEST_KEYS.includes(k));
+  driftCount += extra.length;
+  return { perKey, extra, driftCount, ok: driftCount === 0 };
+}
+
 export async function beginReadOnlySnapshot(client) { await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); }
 
 // ---- manifest-pinned baseline (blocker 2; not a cryptographic signature) --------------------------------

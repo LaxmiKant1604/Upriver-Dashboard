@@ -204,21 +204,36 @@ export function buildPriorityDashboardsRelease({
     if (S(cycle.trigger) !== "manual") return refuse("cycle-not-manual", S(cycle.trigger));
     const cycleId = S(cycle.id);
 
-    // (3) the reserved canonical Catalog hash (durable evidence) -- reconstructed independently.
-    const reservationRow = await reservation.get({ operationKey, catalogRequestHash: null });
-    if (!reservationRow || !nb(S(reservationRow.catalogRequestHash))) return refuse("no-reservation");
-    const reservedHash = S(reservationRow.catalogRequestHash);
-
-    // (4) source jobs: EXACTLY ONE product-catalog job, the reserved hash, succeeded, ORGANIZATION scope.
+    // (3) source jobs: EXACTLY ONE product-catalog job, succeeded, ORGANIZATION scope.
     const srcJobs = await store.listSourceJobs(cycleId);
     if (!Array.isArray(srcJobs) || srcJobs.length !== 1) return refuse("source-job-count", String(Array.isArray(srcJobs) ? srcJobs.length : "na"));
     const cj = srcJobs[0];
     if (S(cj.source_key ?? cj.sourceKey) !== PRIORITY_DASHBOARDS.catalogSourceKey) return refuse("source-job-not-catalog");
-    if (S(cj.request_hash ?? cj.requestHash) !== reservedHash) return refuse("source-hash-not-reserved");
     if (S(cj.fetch_status ?? cj.fetchStatus) !== "succeeded") return refuse("source-job-not-succeeded");
+    const catalogHash = S(cj.request_hash ?? cj.requestHash);
+    if (!nb(catalogHash)) return refuse("catalog-hash-blank");
     const owners = await store.listCycleOwners(cycleId);
-    const catOwners = (Array.isArray(owners) ? owners : []).filter((o) => S(o.request_hash ?? o.requestHash) === reservedHash);
+    const catOwners = (Array.isArray(owners) ? owners : []).filter((o) => S(o.request_hash ?? o.requestHash) === catalogHash);
     if (catOwners.length !== 1 || S(catOwners[0].account_id ?? catOwners[0].accountId) !== ORGANIZATION_SCOPE_KEY) return refuse("catalog-not-org-scope");
+
+    // (4) TOKEN/RESERVATION coherence with the Catalog job's create_export_count. Support a WARM-CACHE-FIRST /
+    // adoption release (create_export_count=0 => zero tokens, NO reservation, but proven durable cache evidence)
+    // AND a cold create (create_export_count=1 => the EXACT created reservation for this hash). Reject every
+    // ambiguous combination.
+    const cec = Number(cj.create_export_count ?? cj.createExportCount);
+    const reservationRow = await reservation.get({ operationKey, catalogRequestHash: null });
+    if (cec === 0) {
+      if (reservationRow) return refuse("reservation-present-without-create");
+      if (!nb(S(cj.cache_object_path ?? cj.cacheObjectPath))) return refuse("no-cache-evidence");
+    } else if (cec === 1) {
+      if (!reservationRow) return refuse("no-reservation-for-create");
+      if (S(reservationRow.status) !== "created") return refuse("reservation-not-created");
+      if (S(reservationRow.catalogRequestHash) !== catalogHash) return refuse("reservation-hash-mismatch");
+      if (!nb(S(reservationRow.exportId))) return refuse("reservation-no-export");
+      if (Number(reservationRow.tokensSpent) !== 2) return refuse("reservation-tokens");
+    } else {
+      return refuse("bad-create-count", String(cec));
+    }
 
     // (5) report jobs: EXACTLY expected x 3, ONLY the 3 keys, NO duplicate natural identities, each validated.
     const repJobs = await listReportJobs(cycleId);
@@ -258,9 +273,27 @@ export function buildPriorityDashboardsRelease({
     return refuse("finalize-" + S(d || "malformed"));
   }
 
+  // READ-ONLY pre-publish proof: run the REAL publisher's shared preflight (same collaborators + gates) for all
+  // three keys, carrying each pair's exact live identity (liveReportKey + paramsHash). The operator proves EVERY
+  // (account, report) pair is publishable BEFORE any live write; a non-'ready' disposition blocks all writes.
+  async function preflightAccount(accountId) {
+    const acct = S(accountId).trim();
+    if (!nb(acct)) throw new Error("preflightAccount requires a non-blank accountId (fail closed).");
+    if (typeof publisher.preflight !== "function") throw new Error("the composed publisher exposes no preflight (fail closed).");
+    const results = [];
+    for (const reportKey of PRIORITY_DASHBOARDS.reportKeys) {
+      assertPriorityPublishReportKey(reportKey);
+      const res = await publisher.preflight(reportKey, acct);
+      results.push({ reportKey, disposition: res && res.disposition, liveReportKey: res && res.liveReportKey, paramsHash: res && res.paramsHash });
+    }
+    return { accountId: acct, results };
+  }
+
   // Publish the COMPLETE surface for one account: daily-reporting, brand-sales, brand-inventory -- brand-sales
   // BEFORE brand-inventory. Every publish goes through the real publisher's four durable gates; an unknown key
-  // can never reach it (assertPriorityPublishReportKey). This never enables a control or an approval.
+  // can never reach it (assertPriorityPublishReportKey). Each result carries the EXACT live identity
+  // (liveReportKey + paramsHash) so the read-back can query the live row by its exact natural key. This never
+  // enables a control or an approval.
   async function publishAccount(accountId) {
     const acct = S(accountId).trim();
     if (!nb(acct)) throw new Error("publishAccount requires a non-blank accountId (fail closed).");
@@ -268,7 +301,7 @@ export function buildPriorityDashboardsRelease({
     for (const reportKey of PRIORITY_DASHBOARDS.publishOrder) {
       assertPriorityPublishReportKey(reportKey);
       const res = await publisher.publish(reportKey, acct);
-      results.push({ reportKey, disposition: res && res.disposition });
+      results.push({ reportKey, disposition: res && res.disposition, liveReportKey: res && res.liveReportKey, paramsHash: res && res.paramsHash });
     }
     return { accountId: acct, results };
   }
@@ -278,6 +311,7 @@ export function buildPriorityDashboardsRelease({
     reportKeys: PRIORITY_DASHBOARDS.reportKeys,
     publishOrder: PRIORITY_DASHBOARDS.publishOrder,
     catalogReservation: (catalogRequestHash) => reservation.get({ operationKey, catalogRequestHash }),
+    preflightAccount,
     deriveBucket,
     finalizeBucket,
     publishAccount,

@@ -86,5 +86,13 @@ export function buildSchedulerV2Publisher(overrides = {}) {
       reportKey: typeof reportKey === "string" ? reportKey : "",
       accountId: typeof accountId === "string" ? accountId : "",
     }),
+    // READ-ONLY PREFLIGHT: runs the SAME collaborators + gates + validations as publish() up to (not including)
+    // the CAS write, and returns disposition 'ready' with the exact live identity when the pair IS publishable.
+    // The operator proves every (account, report) pair before ANY live write, with zero duplicated gate logic.
+    preflight: async (reportKey, accountId) => publishSchedulerV2Snapshot(deps, {
+      reportKey: typeof reportKey === "string" ? reportKey : "",
+      accountId: typeof accountId === "string" ? accountId : "",
+      preflight: true,
+    }),
   });
 }

@@ -167,7 +167,7 @@ const CAS_OUTCOME_DISPOSITION = Object.freeze({
  *                        "conflict"; it never returns a payload/path/digest).
  * Returns { disposition, reportKey, accountId, liveReportKey?, paramsHash? } -- typed safe fields ONLY.
  */
-export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId }) {
+export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, preflight = false }) {
   const {
     codeReadyKeys = SCHEDULER_V2_PUBLISHABLE_REPORT_KEYS,
     getReportSyncSettings, getPromotedPublishSettings, loadAccountRollout, discoverPrimaryAccounts, getPublishApproval,
@@ -273,6 +273,14 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId })
     const liveParams = contract.liveParams(params);
     if (!liveParams) return { disposition: "invalid-snapshot", ...base };
     const paramsHash = paramsHashFor(contract.liveReportVersion, liveParams);
+
+    // READ-ONLY PREFLIGHT: every gate (code readiness, dispatch/promoted control, primary rollout resolved
+    // against fresh discovery, audited approval), the source-of-truth validated job inside a terminal cycle, the
+    // exact shadow identity + hash provenance, storage-first payload hydration + the payload contract, and the
+    // live-params mapping have ALL passed -- so this (report, account) IS publishable. Return 'ready' WITHOUT the
+    // CAS write, carrying the exact live identity (liveReportKey + paramsHash) the eventual publish + read-back
+    // will use. Same collaborators + logic as the real publish; the CLI never duplicates any gate.
+    if (preflight === true) return { disposition: "ready", ...base, liveReportKey: contract.liveReportKey, paramsHash };
 
     // CAS publish -- the primitive decides fail-closed against the REAL live row: inserted/replaced =>
     // published; strictly-newer live => newer-live; EQUAL freshness proven identical => already-current;

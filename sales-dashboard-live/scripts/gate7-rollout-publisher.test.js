@@ -932,11 +932,14 @@ test("(EC1) the composition exposes ONLY publish(reportKey, accountId), is froze
     connections: CONNS,
     fetchAccounts: async () => { throw new Error("discovery must not run for a code-locked publish"); },
   });
-  assert.deepEqual(Object.keys(rt), ["publish"], "no other surface");
+  assert.deepEqual(Object.keys(rt), ["publish", "preflight"], "only publish + the read-only preflight are exposed");
   assert.ok(Object.isFrozen(rt), "the composition is frozen");
   const res = await rt.publish(SM, "IN1");
   observedDispositions.add(res.disposition);
   assert.equal(res.disposition, "code-locked", "the code-lock gate is bound; a non-ready key is refused before discovery runs");
+  // The read-only preflight is bound to the SAME gates -- a code-locked key is refused there too (no discovery).
+  const pf = await rt.preflight(SM, "IN1");
+  assert.equal(pf.disposition, "code-locked", "the preflight shares the code-lock gate");
 });
 
 test("(EC2) a publish() caller cannot inject code readiness or any trusted collaborator", async () => {

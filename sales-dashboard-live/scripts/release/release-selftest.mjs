@@ -18,6 +18,7 @@ import {
   buildStage6Baseline, validateStage6Baseline, shouldCreateStage6Baseline,
   buildStage7Baseline, validateStage7Baseline, shouldCreateStage7Baseline,
   buildStage8Baseline, validateStage8Baseline, shouldCreateStage8Baseline,
+  classifyProtectedDrift,
 } from "./release-state.mjs";
 
 let passed = 0, failed = 0;
@@ -412,6 +413,33 @@ test("stage8: shouldCreate requires zero problems AND a clean rollback", () => {
 test("stage8 applier: migration 9 (stageIdx 8) + VALID stage-8 baseline constructs the client", async () => { let made = 0; const b = buildStage8Baseline({ head: HEAD, fingerprint: FP }); await runApply({ filename: NEW6[8], sqlText: "X", actualSha: MIGRATIONS[8].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 1); });
 test("stage8 applier: migration 9 REJECTS the stage-7 baseline (anchor 7) -> zero connect", async () => { let made = 0; const b = buildStage7Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[8], sqlText: "X", actualSha: MIGRATIONS[8].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
 test("stage8 applier: migration 8 (stageIdx 7) REJECTS the stage-8 baseline (anchor 8) -> zero connect", async () => { let made = 0; const b = buildStage8Baseline({ head: HEAD, fingerprint: FP }); const r = await runApply({ filename: NEW6[7], sqlText: "X", actualSha: MIGRATIONS[7].sha, env: goodEnv, currentHead: HEAD, currentFingerprint: FP, envRef: REF, baselineText: JSON.stringify(b), makeClient: () => { made += 1; return recClient({}); }, approved: APPROVED_INVARIANTS }); assert.equal(made, 0); assert.equal(r.code, 1); });
+
+// ---------- stage-8 protected-data RECONCILIATION classifier (read-only; never changes pins) ---------------
+const pinObserved = () => Object.fromEntries(PROTECTED_DIGEST_KEYS.map((k) => [k, { c: TESTPINS[k].c, h: TESTPINS[k].h }]));
+test("reconcile: every observed digest matching the pins => ok, zero drift, all 'matched'", () => {
+  const cls = classifyProtectedDrift(TESTPINS, pinObserved());
+  assert.equal(cls.ok, true); assert.equal(cls.driftCount, 0);
+  assert.equal(cls.perKey.length, PROTECTED_DIGEST_KEYS.length);
+  assert.ok(cls.perKey.every((r) => r.status === "matched"));
+});
+test("reconcile: a drifted hash, a missing key, and an extra key are each classified + counted (STOP)", () => {
+  const observed = pinObserved();
+  const k0 = PROTECTED_DIGEST_KEYS[0]; observed[k0] = { c: observed[k0].c + 1, h: observed[k0].h };
+  const k1 = PROTECTED_DIGEST_KEYS[1]; delete observed[k1];
+  observed.rogue = { c: 1, h: "z" };
+  const cls = classifyProtectedDrift(TESTPINS, observed);
+  assert.equal(cls.ok, false);
+  assert.equal(cls.perKey.find((r) => r.key === k0).status, "drifted");
+  assert.equal(cls.perKey.find((r) => r.key === k1).status, "missing");
+  assert.deepEqual(cls.extra, ["rogue"]);
+  assert.ok(cls.driftCount >= 3);
+});
+test("reconcile: an UNPINNED key is drift too (never silently assumed)", () => {
+  const pins = { ...TESTPINS }; delete pins[PROTECTED_DIGEST_KEYS[0]];
+  const cls = classifyProtectedDrift(pins, pinObserved());
+  assert.equal(cls.perKey.find((r) => r.key === PROTECTED_DIGEST_KEYS[0]).status, "unpinned");
+  assert.equal(cls.ok, false);
+});
 
 // ---------- absent-check must not crash when an altered table is absent (42P01 guard) --------------------
 test("absent: altered-table absent -> 'absent', never a 42P01 crash", async () => {
