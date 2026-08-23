@@ -10986,3 +10986,44 @@ STATUS: Phases 2-9 (read-only prod reconciliation, push+deploy, recovery run, pe
 derive, publish, frontend) remain BLOCKED by the harness production-access denial (confirmed across prior turns);
 the go-live cannot execute in this environment. Nothing pushed/deployed/migrated; no DataDoe call; zero tokens.
 Scheduler remains OFF. See [[scheduler-v2-complete-window-wip]].
+
+## Durable OLI gap CLOSED + Daily/Brand View "priority path" implemented -- 2026-08-23 (prod persist done; code/tests + docs separate; NOT pushed)
+
+Production access WAS available this session. Two things happened.
+
+(A) DURABLE OLI GAP CLOSED (authorized recovery + persist). The failed non-US OLI download (cycle
+15d1f749, window 2025-08-10..2026-03-17, one 5-seller batch, rc=9181) was recovered download-only (zero tokens,
+zero creates) then persisted to durable history via the trusted primitives (oliHistoryRowsFromFragment +
+replace_oli_history_window), scoped to EXACTLY the 5 gap accounts + that window. 9181 cache rows -> 7892 durable
+grain rows INSERTED (replacedTotal=0); per-account [0,71,834,3428,3559] (4 accounts got rows, 1 legit zero-sales
+seller covered by ack). Complete durable OLI proof PASSES all 30 accounts: rows 135,281 -> 143,173 (delta =
+exactly +7892); recovered-window coverage ack 30/30; interior gaps 0; coverage endpoints 30/30 (start
+<=2025-01-01, end >=2026-08-14); integrity 0 null-currency/0 null-hash/0 non-finite; the 25 untouched accounts
+byte-identical. Scratch scripts removed; no seller/account/export ids printed.
+
+(B) DERIVE+PUBLISH BLOCKER + FIX. A read-only drain-cost rehearsal showed the normal derive is gated on a full
+bucket drain (globalDrained) needing ~37 creates (6 OLI rolling-refresh + 1 catalog + 30 FBA) ~= 74-185 tokens,
+vs the authorized 2-token ceiling -> STOPPED, reported. User direction: do NOT run the full bucket / raise the
+ceiling; implement OFFLINE a trusted Daily Reporting + Brand View "priority path" that derives from the proven
+durable OLI + Catalog (reuse Catalog, or <=1 Catalog export = 2 tokens), plans ZERO OLI/Ads/FBA/other exports,
+does not require unrelated families to drain, represents missing Ads/FBA as unavailable, derives+publishes ONLY
+the two reports, keeps everything else paused + scheduler off.
+
+IMPLEMENTED (offline): runtime `priority` mode in source-bucket-sync-runtime.js run() (pauses every non-catalog
+source; force-plans Catalog via forceCatalogRefresh threaded through runBucketSourceSync -> planBucketSourceSync
+in source-bucket-sync.js; brand-inventory renders missing FBA as inventoryAvailable:false instead of skipping).
+New trusted operator lib/server/sync/source-priority-dashboards.js (PRIORITY_DASHBOARDS frozen scope;
+makePriorityCreateGuard = catalog-only + <=1 create / <=2 tokens shared across both buckets;
+buildPriorityDashboardsOperation threads priority=true + one shared budget; assertPriorityPublishReportKey =
+publish allowlist of exactly daily-reporting + brand-inventory). Regressions: source-priority-dashboards.test.js
+(P1-P5: guard, allowlist, 30-account plan proves zero OLI/FBA jobs + one Catalog job/bucket, operation wiring,
+inventory-unavailable contract) + source-production-hardening.test.js F11a-F11e (REAL-runtime: 30 accounts derive
+off durable OLI + Catalog, exactly one Catalog export, ZERO OLI/Ads/FBA creates; FBA unavailable; force-catalog
+fixes the fresh-snapshot cycle-less skip; fail-closed on missing provenance). Registered in package.json +
+verify.mjs. `npm run verify` = 57 steps / 37 suites (incl build:check) GREEN. Docs:
+SCHEDULER_V2_PRIORITY_DASHBOARDS.md.
+
+STATUS: durable evidence complete; priority path CODE+TESTS+DOCS done offline. NO production derive/publish run
+(stopped for Codex review per direction); NO tokens spent on the priority work; scheduler OFF; the 3
+unrelated-report controls (content-changes/keyword-rank/listing-optimizer) still schedule_enabled=TRUE in prod
+(their pause is a later go-live step, not yet done). See [[scheduler-v2-golive-status]].
