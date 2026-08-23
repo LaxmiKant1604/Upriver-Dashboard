@@ -10851,3 +10851,25 @@ the authoritative currency while all prior fail-closed currency checks remain. F
 verify passed all 54 test stages and the production build passed separately outside the sandbox (sandboxed
 esbuild spawn was EPERM). The same US cycle can resume entirely from its four exact cached exports with zero
 new DataDoe creates; non-US has not started and retains its 20-token ceiling.
+
+## Priority OLI go-live: live row-cap correction -- 2026-08-23
+
+The blank-currency correction was deployed (`1c1b29c`; production deployment
+`dpl_BSezvoDMJgidwv1m5b9pKrr2kzMR`, Ready). The US cycle resumed from its four exact successful caches with
+zero new creates and durably persisted 32,041 OLI history rows across all eight US accounts. US sales readiness
+is now blocked only by the missing organization Catalog snapshot; Ads and FBA are honest non-blocking
+enrichments and remain unavailable.
+
+Two apparent Non-US attempts on cycle dates 2026-08-23/24 were read-only collisions with historical terminal
+Gate-6 cycles; both new tranche budgets stayed 0/20 and DataDoe was untouched. The first actual Non-US cycle
+(fresh date 2026-08-29) created exactly 10 exports / reserved 20 tokens: nine succeeded and one five-seller
+request for 2025-01-01..2026-03-17 returned exactly 50,000 rows and failed terminal validation as TRUNCATED.
+All 22 accounts were primary-only and exactly scoped; no history/report/live publication occurred.
+
+This supersedes the earlier 14-export/28-token fresh-plan claim: 441 days is proven for a single seller but is
+not safe for a multi-seller response under the 50,000-row cap. Correction `960ef57` preserves the 441-day outer
+boundary, then splits a multi-seller 441-day chunk into 221 + 220 days while retaining the successful 157-day
+remainder identity. A fresh full plan is therefore US 6/12 + Non-US 15/30 = 21 exports / 42-token worst case.
+For the current Non-US recovery, the five exact 157-day caches remain reusable, so the expected NEW work is
+10 exports / 20 tokens; the failed 441-day hash is never retried. Full `npm run verify` passed 55/55 across 35
+suites including build:check. No Catalog/Ads/FBA export, report publication, or schedule enablement has yet run.
