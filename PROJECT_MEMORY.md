@@ -10967,3 +10967,22 @@ every required returned field.
 Recovery suite 42 -> **49 assertions**; node --check + `npm run verify` (56 steps / 36 suites) green;
 `git diff --check` clean. Still UNPUSHED; go-live remains stalled on the production-access block.
 See [[scheduler-v2-complete-window-wip]].
+
+## Phase-1 offline gate: durable-evidence OLI provenance binding (go-live prep) -- 2026-08-23 (code d6e1af3; docs separate; NOT pushed)
+
+Go-live continuation from b58e81d. Phase 1 (offline) closed the PROVENANCE half of the deferred durable-evidence
+lineage gap (user chose "provenance binding only"; the no-cycle-derive half stays deferred -- the first go-live's
+derive is carried by the catalog cycle). When a covered account derives off already-proven durable OLI and THIS
+cycle planned no new OLI export (e.g. OLI paused, catalog fetch opens the owning cycle), the report-job OLI
+depends_on now binds the DURABLE source_request_hash the account's rows came from (getSourceOliHistoryRows now
+selects it; the in-memory fold carries it), instead of the empty current cycle. Account-EXACT; FAILS CLOSED on a
+ready account with no/malformed durable provenance ("durable-oli-provenance-missing" -- never an unproven
+snapshot). SURGICAL: when OLI IS fetched this cycle the cycle's own OLI hash is used, byte-identical to before
+(all existing lineage assertions unchanged). Regressions F4f (zero-OLI-create covered derive; OLI depends_on ==
+durable provenance) + F4g (fail-closed). Recovery code re-confirmed (49-assertion suite). npm run verify 56/36
+green; git diff --check clean.
+
+STATUS: Phases 2-9 (read-only prod reconciliation, push+deploy, recovery run, persistence, catalog, in-prod
+derive, publish, frontend) remain BLOCKED by the harness production-access denial (confirmed across prior turns);
+the go-live cannot execute in this environment. Nothing pushed/deployed/migrated; no DataDoe call; zero tokens.
+Scheduler remains OFF. See [[scheduler-v2-complete-window-wip]].
