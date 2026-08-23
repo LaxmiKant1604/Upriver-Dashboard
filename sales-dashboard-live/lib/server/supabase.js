@@ -1544,6 +1544,36 @@ export async function recordSyncSourceExportCreated({ cycleId, requestHash, expo
   await patchSyncSourceJob(cycleId, requestHash, { export_id: exportId }, { signal });
 }
 
+// DOWNLOAD-ONLY recovery claim (Phase 2): atomically transition a FAILED, non-terminal, poll/download-stage job
+// that already created EXACTLY ONE export back to 'attempted', so a fresh invocation resumes poll/download of the
+// SAME saved export_id WITHOUT a second create-export. A conditional PATCH (UPDATE ... WHERE fetch_status='failed'
+// AND terminal is not true AND error_stage in (poll,download) AND create_export_count=1 AND export_id not null),
+// which PostgreSQL serializes so EXACTLY ONE worker wins; a concurrent claim updates zero rows and loses. It sets
+// ONLY fetch_status (create_export_count + export_id are preserved -> the one-create-per-hash invariant holds).
+// Returns 'claimed' | 'not-eligible'; a non-array / multi-row response is null so the caller fails closed. There
+// is no recovery RPC (mirrors claimReportDeriveAttempt) -- no migration is added.
+export async function claimSourceExportRecovery(cycleId, requestHash, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    cycle_id: `eq.${cycleId}`,
+    request_hash: `eq.${requestHash}`,
+    fetch_status: "eq.failed",
+    terminal: "not.is.true",
+    error_stage: "in.(poll,download)",
+    create_export_count: "eq.1",
+    export_id: "not.is.null",
+  });
+  const rows = await request(`/rest/v1/sync_source_jobs?${query}`, {
+    method: "PATCH",
+    signal,
+    headers: { Prefer: "return=representation" },
+    body: { fetch_status: "attempted" },
+  });
+  if (!Array.isArray(rows)) return null; // malformed -> caller fails closed
+  if (rows.length === 1) return "claimed";
+  if (rows.length === 0) return "not-eligible"; // never matched, OR a concurrent winner already claimed it
+  return null; // >1 impossible for a (cycle, request_hash); fail closed
+}
+
 // Failure NEVER clears cache_object_path / last_good_fetched_at, so last-known-good
 // source data survives. error_message is the SAFE operator string only.
 export async function recordSyncSourceFailure({ cycleId, requestHash, stage, code, message, terminal = false, durationMs, rowCount = null, exportId = null }, { signal = null } = {}) {

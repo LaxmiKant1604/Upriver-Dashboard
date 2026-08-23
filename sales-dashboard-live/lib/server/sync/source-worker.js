@@ -97,6 +97,28 @@ function mergeJob(meta, jobRow) {
 }
 
 /**
+ * Is a RECORDED source failure the exact, narrow shape a DOWNLOAD-ONLY recovery may resume? Eligible ONLY when
+ * the job already CREATED its one export and failed at a TRANSIENT poll/download stage -- so the recovery can
+ * re-poll/re-download the SAME saved export_id and NEVER issue a second create-export. A terminal failure, a
+ * TRUNCATED/validate/persist failure, a create-export-stage failure, a job with no created export (count!=1),
+ * or a missing/blank export_id is NOT eligible (never retried, never re-created). Pure; reads only the row.
+ */
+export function recoveryEligibility(jobRow) {
+  const status = fetchStatusOf(jobRow);
+  const terminal = (jobRow.terminal ?? false) === true;
+  const stage = jobRow.error_stage ?? jobRow.errorStage ?? "";
+  const createCount = Number(jobRow.create_export_count ?? jobRow.createExportCount ?? 0);
+  const exportIdRaw = jobRow.export_id ?? jobRow.exportId ?? null;
+  const exportId = typeof exportIdRaw === "string" ? exportIdRaw.trim() : "";
+  if (status !== "failed") return { eligible: false, reason: "not-failed" };
+  if (terminal) return { eligible: false, reason: "terminal" };
+  if (stage !== "poll" && stage !== "download") return { eligible: false, reason: "stage-not-recoverable" };
+  if (createCount !== 1) return { eligible: false, reason: "create-count-not-one" };
+  if (!exportId) return { eligible: false, reason: "missing-export-id" };
+  return { eligible: true, exportId };
+}
+
+/**
  * Run ONE source job through the resumable lifecycle. Returns an outcome for signal
  * derivation. Never throws for an expected source failure — it records a safe failure and
  * returns a non-success outcome so the cycle continues.
@@ -342,6 +364,49 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
 }
 
 /**
+ * DOWNLOAD-ONLY recovery of ONE already-created export whose recorded failure is the exact recoverable shape
+ * (recoveryEligibility). It NEVER creates an export. The smallest production-safe step:
+ *   1. gate on recoveryEligibility (in-memory) -- an ineligible job is a no-op skip, never re-created;
+ *   2. ATOMICALLY claim the recovery via store.claimSourceExportRecovery -- a compare-and-set that flips the
+ *      still-'failed' row to 'attempted' (preserving export_id AND create_export_count, so the one-create-per-
+ *      hash invariant holds). Exactly ONE concurrent caller wins ('claimed'); a loser sees 'not-eligible' and
+ *      skips (no duplicate download/write). ANY non-'claimed'/malformed acknowledgement FAILS CLOSED (skip);
+ *   3. resume the SAME export_id through the EXISTING poll -> download -> validate -> save(CAS) -> success path
+ *      (runJobLifecycle on an 'attempted' job never creates), so the exact seller/account/marketplace tuple
+ *      validator, the truncation + row-integrity + currency checks, the source-cache CAS, and the guarded
+ *      success path all apply unchanged. A poll/download at most once per invocation. A validation/persist
+ *      failure records a safe (possibly terminal) failure and preserves last-known-good -- never fabricates.
+ * Returns the resume outcome, or a typed { status: "recovery-skipped", reason } when not eligible / not won /
+ * ambiguous. `meta` is the canonical plan entry; `jobRow` the authoritative DB row.
+ */
+export async function recoverFailedDownloadJob({ store, dataDoe, clock = () => Date.now(), cycleId, meta, jobRow, runWithDeadline, progress = null }) {
+  const requestHash = jobRow.request_hash ?? jobRow.requestHash;
+  const requestKey = (meta && meta.requestKey) || jobRow.request_key || "";
+  const prog = progress || { succeeded: 0, failed: 0, skipped: 0, deferred: 0, attemptsWon: 0, missingReusable: 0, processed: 0 };
+  const skip = (reason) => ({ requestKey, requestHash, status: "recovery-skipped", validated: false, reason });
+
+  const elig = recoveryEligibility(jobRow);
+  if (!elig.eligible) return skip(elig.reason);
+  if (typeof store.claimSourceExportRecovery !== "function") return skip("recovery-cas-unavailable");
+
+  // Atomic recovery claim (failed -> attempted). NEVER a create-export.
+  let ack;
+  try {
+    ack = await store.claimSourceExportRecovery({ cycleId, requestHash });
+  } catch (_e) {
+    return skip("recovery-claim-error"); // fail closed: no download, no fabrication
+  }
+  if (ack === "not-eligible" || ack === "not-won") return skip(ack);
+  if (ack !== "claimed") return skip("recovery-ack-ambiguous"); // fail closed on any malformed/unknown ack
+
+  // Claimed: the row is now 'attempted' with its saved export_id. Resume download-only via the exact existing
+  // lifecycle (create is unreachable for an 'attempted' job with a saved export_id).
+  const resumeJob = { ...mergeJob(meta || {}, jobRow), fetch_status: "attempted", export_id: elig.exportId };
+  const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job: resumeJob, progress: prog, runWithDeadline, reuseOnly: false, budget: null });
+  return outcome || skip("recovery-noop");
+}
+
+/**
  * Run (or resume) the source half of ONE cycle for a fixed set of planned source jobs.
  *
  * Ownership (Scheduler v2 many-to-many model): a shared (bucket, cycle_date) cycle can hold canonical
@@ -378,6 +443,13 @@ export async function runSourceJobs({
   // (store.reserveExportCreate) so the create/AI-token ceilings can never be exceeded. null => the legacy
   // one-attempt claim (behavior unchanged). NEVER a per-run/untrusted argument.
   budget = null,
+  // DOWNLOAD-ONLY recovery flag (opt-in). false (default) => a recorded failure is durable LKG and is left
+  // untouched (byte-identical to before). true => an owned+planned job whose failure is the exact recoverable
+  // shape (recoveryEligibility: non-terminal poll/download failure of an already-created export) is resumed
+  // download-only (recoverFailedDownloadJob) -- claim failed -> attempted, then poll/download the SAME export_id
+  // once and validate/save/success through the existing paths. NEVER re-creates; a terminal/TRUNCATED/create-
+  // stage failure is never eligible. NEVER a per-run/untrusted argument (a build-time composition flag).
+  recoverFailedDownloads = false,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -504,7 +576,22 @@ export async function runSourceJobs({
     const jobRow = rowByHash.get(hash);
     if (!jobRow) continue;
     const st = fetchStatusOf(jobRow);
-    if (st === "succeeded" || st === "failed" || st === "skipped") continue; // done (a shared hash B already fetched is read, not re-run)
+    if (st === "succeeded" || st === "skipped") continue; // done (a shared hash already fetched is read, not re-run)
+    if (st === "failed") {
+      // A recorded failure is durable last-known-good and is left untouched -- UNLESS download-only recovery is
+      // enabled AND this is the exact recoverable shape (non-terminal poll/download failure of an already-created
+      // export). Then resume the SAME export_id download-only; NEVER re-create. A terminal / TRUNCATED / validate
+      // / persist / create-stage failure is never eligible and stays failed (LKG preserved).
+      const failedMeta = metaByHash.get(hash);
+      if (recoverFailedDownloads && failedMeta && recoveryEligibility(jobRow).eligible) {
+        if (progress.processed >= maxJobs) break;
+        if (clock() >= deadlineMs - reserveMs) { progress.deadlineReached = true; break; }
+        progress.processed += 1;
+        const outcome = await recoverFailedDownloadJob({ store, dataDoe, clock, cycleId, meta: failedMeta, jobRow, runWithDeadline, progress });
+        if (outcome) outcomes.push(outcome);
+      }
+      continue;
+    }
     if (progress.processed >= maxJobs) { progress.deadlineReached = false; break; }
     if (clock() >= deadlineMs - reserveMs) { progress.deadlineReached = true; break; }
 

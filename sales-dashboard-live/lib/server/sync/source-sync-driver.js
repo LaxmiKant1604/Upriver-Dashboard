@@ -14,6 +14,7 @@ import { organizationFingerprint, sourceJobOwnerId, accountScopeHash } from "../
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, claimSourceExportAttempt, adoptSourceExportCache,
+  claimSourceExportRecovery,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
   upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobOwnersForCycle, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
@@ -262,6 +263,8 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     listSourceJobsForOwners: (cycleId, ownerIds) => r("list-jobs-for-owners", (signal) => getSyncSourceJobsForOwners(cycleId, ownerIds, { signal })),
     recordSourceOwnerStale: (args) => w("owner-stale", true, (signal) => recordSyncSourceJobOwnerStale(args, { signal })),
     claimExportAttempt: (cycleId, requestHash) => w("claim-export", true, (signal) => claimSourceExportAttempt(cycleId, requestHash, { signal })),
+    // Phase 2 download-only recovery: atomic failed -> attempted CAS (conditional PATCH); NEVER creates.
+    claimSourceExportRecovery: ({ cycleId, requestHash }) => w("claim-recovery", true, (signal) => claimSourceExportRecovery(cycleId, requestHash, { signal })),
     // Blocker 2: the atomic cache-adoption CAS (adopt_source_export_cache), returning a typed
     // 'adopted' | 'not-adopted' acknowledgement. Mutually exclusive with claimExportAttempt.
     adoptSourceCache: (args) => w("adopt-cache", true, (signal) => adoptSourceExportCache(args, { signal })),

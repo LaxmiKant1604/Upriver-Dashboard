@@ -56,6 +56,7 @@ const SUITES = [
   "test:report-sync-controls",
   "test:gate5-canary-package",
   "test:datadoe-poll-export",
+  "test:source-download-recovery",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",
