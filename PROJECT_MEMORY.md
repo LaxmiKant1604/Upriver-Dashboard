@@ -10940,3 +10940,30 @@ Codex reviewed b88d962+6ef93b0 and raised three Phase-2 blockers; all fixed OFFL
 
 `node --check` + the 42-assertion suite + `npm run verify` (56 steps / 36 suites) green; `git diff --check` clean.
 STILL UNPUSHED; go-live remains stalled on the production-access block. See [[scheduler-v2-complete-window-wip]].
+
+## Phase-2 recovery operator: real-planner + real deadline + honest exit (Codex re-review 2) -- 2026-08-23 (code 22a412c; docs separate; still offline)
+
+Codex re-reviewed 1a707f1 and raised four production blockers; all fixed OFFLINE (no push/deploy/prod/DataDoe):
+1. **Real-planner compatibility.** The canonical resolvedOliSliceBatch emits sourceScope="seller",
+   marketplaceScoped=FALSE (OLI has NO marketplace column) -- the earlier operator wrongly required
+   marketplaceScoped=true. The operator now validates EXACTLY the emitted scope (seller, marketplaceScoped=false;
+   no invented marketplace), and the tests drive it off the REAL planBucketSourceSync output for the fixed
+   target 2025-08-10..2026-03-17 (the 2nd 221-day multi-seller chunk). F1 proves the real plan reaches
+   recoverFailedDownloadJob (zero creates); E proves five-SELLER validation on the real OLI meta.
+2. **Exact five-owner binding.** plannedBatchSourceJobs returns five owner-specific entries sharing ONE
+   request_hash. The operator filters all planned entries for the hash, requires exactly five, asserts identical
+   canonical source/fetch identity, five unique canonical (accountId, rawSellerId) == the batch sellers, durable
+   memberships exactly five/active/primary/unique/canonical, and the durable owner-account set EXACTLY equals the
+   planned owner-account set (F2 rejects missing/extra/duplicate/stale/blank/mismatched/divergent-identity).
+3. **Honest operator exit.** recoveryExitDecision exits 0 ONLY for ran+success+validated; every non-success class
+   exits nonzero with typed/redacted evidence. The release script calls it + process.exit; I1 (unit) + I2
+   (subprocess entrypoint) prove release automation halts on refusal/deferral/failure/missing outcome.
+4. **Real bounded deadline.** Removed runWithDeadline:(fn)=>fn(); the operator threads the 550s budget through
+   poll+download via withDataDoeDeadline. H1/H2 prove a hung poll and hung download are bounded typed-resumable,
+   zero creates, no ghost cache/success write.
+Plus (5) claimSourceExportRecovery now requires r.terminal === false EXACTLY (missing field fails); D4 covers
+every required returned field.
+
+Recovery suite 42 -> **49 assertions**; node --check + `npm run verify` (56 steps / 36 suites) green;
+`git diff --check` clean. Still UNPUSHED; go-live remains stalled on the production-access block.
+See [[scheduler-v2-complete-window-wip]].
