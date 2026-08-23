@@ -15,6 +15,7 @@
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 // Set BEFORE importing supabase.js (module reads these at load) so the wrapper's request() builds a URL.
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
@@ -31,6 +32,8 @@ let worker; // source-worker.js
 let sb; // supabase.js
 let opmod; // source-oli-recovery-operation.js
 let C; // the frozen operator target constants
+let bucketSync; // source-bucket-sync.js (the REAL planner)
+let datadoe; // datadoe.js (the real deadline/sleep mechanism)
 
 const HASH = "hash_oli_batch_1";
 const OTHER = "hash_oli_batch_2";
@@ -56,21 +59,30 @@ const failedRow = (over = {}) => ({
   ...over,
 });
 
-// The REAL production shape: a five-seller, seller-scoped, marketplace-scoped OLI batch (so the recovery download
-// runs the exact validateBatchSourcePayload five-account seller/marketplace tuple validator).
-const MKT = "GB"; // the batch's single canonical Non-US marketplace
-const FIVE_SELLERS = ["S1", "S2", "S3", "S4", "S5"];
-const meta5 = (hash = HASH) => ({
-  requestKey: "source-oli:slice-v1", requestHash: hash,
-  sourceId: "src-oli", sourceKey: "order-line-items", connectionId: "primary",
-  organizationFingerprint: "org1", accountScopeHash: "batchScope",
-  strict: true, limit: 50000,
-  sourceScope: "seller", marketplaceScoped: true, marketplaceConstraint: MKT,
-  fetchParams: { sellerOrVendorIds: [...FIVE_SELLERS], from: "2025-08-10", to: "2026-03-17", columns: ["date", "seller_or_vendor_id", "marketplace_country_code"], options: {} },
-});
-const okRow = (sid, mkt = MKT) => ({ date: "2026-01-01", seller_or_vendor_id: sid, marketplace_country_code: mkt, total_sales_sum: 10 });
-const okPayload = () => FIVE_SELLERS.map((s) => okRow(s));
-const primaryOwners = (hash = HASH) => FIVE_SELLERS.map((_s, i) => ({ request_hash: hash, account_id: "A" + i, connection_id: "primary", owner_status: "active" }));
+// The REAL production shape, built by the canonical planBucketSourceSync: a five-seller, seller-scoped OLI batch
+// with marketplaceScoped=FALSE (OLI carries no marketplace column). Computed once (at run time, after imports)
+// for the EXACT fixed target window 2025-08-10..2026-03-17 (the 2nd 221-day multi-seller chunk of the go-live
+// backfill). NO synthetic meta: the operator + validation tests drive off this real plan.
+const NU_ACCOUNTS = ["S1", "S2", "S3", "S4", "S5"].map((s, i) => ({ accountId: "NU-ACC-" + i, rawSellerId: s, country: "GB" }));
+let REAL = null;
+function realPlan() {
+  if (REAL) return REAL;
+  const plan = bucketSync.planBucketSourceSync({
+    apiKey: "op-test-key", bucket: "non-us", accounts: NU_ACCOUNTS, coverageByAccountId: {},
+    catalogSnapshot: { validated_at: "2026-08-21T01:00:00Z" }, fbaSnapshotsByAccount: {},
+    asOf: "2026-08-21", today: "2026-08-21",
+  });
+  const oli = plan.families.find((f) => f.sourceKey === "order-line-items");
+  const unit = oli.units.find((u) => u.slice.from === "2025-08-10" && u.slice.to === "2026-03-17");
+  if (!unit) throw new Error("real-plan fixture: expected an OLI unit over 2025-08-10..2026-03-17");
+  const plannedForHash = oli.plannedJobs.filter((p) => p.requestHash === unit.requestHash);
+  REAL = { plan, oli, unit, targetHash: unit.requestHash, plannedForHash, meta: plannedForHash[0], sellers: [...unit.sellerOrVendorIds] };
+  return REAL;
+}
+// One canonical OLI row (validated columns: seller_or_vendor_id; no marketplace column exists for OLI).
+const okRow = (sid) => ({ date: "2026-01-01", seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 10, total_units_sum: 1 });
+const okPayload5 = () => realPlan().sellers.map(okRow);
+const durableOwnersFromPlan = (hash = realPlan().targetHash) => realPlan().plannedForHash.map((p, i) => ({ request_hash: hash, owner_id: p.owner.ownerId || ("owner-" + i), account_id: p.owner.accountId, connection_id: "primary", owner_status: "active" }));
 
 // ---- in-memory source store (models the atomic recovery CAS + the save/success/failure + LKG cache) ----
 function makeStore() {
@@ -435,115 +447,136 @@ test("D3. the returned representation is validated EXACTLY: wrong-row / wrong-id
   assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a terminal returned row fails closed");
   nextResponse = { status: 200, body: [matchRow({ create_export_count: 2 })] };
   assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "create_export_count != 1 fails closed");
-  const { export_id, ...noId } = matchRow(); void export_id;
-  nextResponse = { status: 200, body: [noId] };
-  assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a missing export_id field fails closed");
   nextResponse = { status: 200, body: [matchRow(), matchRow()] };
   assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a multi-row response fails closed");
 });
 
+test("D4. a MISSING required returned field (each) fails closed -- terminal is STRICT (===false; missing/undefined fails)", async () => {
+  installFetch();
+  // terminal must be EXACTLY false: undefined (missing) is NOT coerced to false.
+  nextResponse = { status: 200, body: [matchRow({ terminal: undefined })] };
+  assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a MISSING terminal field fails closed (strict === false)");
+  nextResponse = { status: 200, body: [matchRow({ terminal: null })] };
+  assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a null terminal fails closed");
+  nextResponse = { status: 200, body: [matchRow({ error_stage: "validate" })] };
+  assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a non-poll/download error_stage fails closed");
+  // Every OTHER required field: omitting it must fail closed.
+  for (const field of ["cycle_id", "request_hash", "fetch_status", "error_stage", "create_export_count", "export_id", "terminal"]) {
+    const row = matchRow();
+    delete row[field];
+    nextResponse = { status: 200, body: [row] };
+    assert.equal(await sb.claimSourceExportRecovery("cid-1", HASH, EXPORT_ID), null, "a missing " + field + " field fails closed");
+  }
+});
+
 /* ================================= E. real five-seller batch validation ================================= */
-group("E. real five-seller batch validation on the recovered download");
+group("E. real five-seller batch validation on the recovered download (real OLI plan: seller-scoped, no marketplace)");
 
 async function recoverWithPayload(payload, { seedLkg = [{ good: 1 }] } = {}) {
+  const R = realPlan();
   const store = makeStore();
   const cid = seededCycle(store);
-  store._seedCache(HASH, seedLkg);
-  store._seedJob(cid, HASH, failedRow());
+  store._seedCache(R.targetHash, seedLkg);
+  store._seedJob(cid, R.targetHash, failedRow({ request_hash: R.targetHash }));
   const dd = makeDataDoe(() => payload);
-  const outcome = await worker.recoverFailedDownloadJob({ store, dataDoe: dd, clock: () => 1, cycleId: cid, meta: meta5(HASH), jobRow: store._snapshot(cid, HASH), runWithDeadline: noDeadline });
-  return { store, cid, dd, outcome };
+  const outcome = await worker.recoverFailedDownloadJob({ store, dataDoe: dd, clock: () => 1, cycleId: cid, meta: R.meta, jobRow: store._snapshot(cid, R.targetHash), runWithDeadline: noDeadline });
+  return { store, cid, dd, outcome, hash: R.targetHash };
 }
 
-test("E1. a valid five-account payload recovers to success (real seller/marketplace validation passes); zero creates", async () => {
-  const { store, cid, dd, outcome } = await recoverWithPayload(okPayload());
+test("E1. a valid five-seller payload recovers to success (real seller validation passes); zero creates", async () => {
+  const { store, cid, dd, outcome, hash } = await recoverWithPayload(okPayload5());
   assert.equal(outcome.status, "success", JSON.stringify(outcome).slice(0, 120));
   assert.equal(outcome.validated, true);
   assert.equal(dd.counts.create, 0);
   assert.equal(dd.counts.download, 1);
-  assert.equal(store._raw(cid, HASH).fetch_status, "succeeded");
-  assert.equal(store._cache.get(HASH).rows.length, 5, "the validated five-account payload was saved");
+  assert.equal(store._raw(cid, hash).fetch_status, "succeeded");
+  assert.equal(store._cache.get(hash).rows.length, 5, "the validated five-seller payload was saved");
 });
 
 const LKG = [{ good: 1 }];
-for (const [name, payload, code] of [
-  ["E2 unknown seller", [...okPayload(), okRow("S9")], "BATCH_CROSS_ACCOUNT"],
-  ["E3 seller paired with another account's marketplace", [okRow("S1", "US"), ...okPayload().slice(1)], "BATCH_CROSS_MARKETPLACE"],
-  ["E4 blank seller", [okRow(""), ...okPayload().slice(1)], "BATCH_ROW_NO_SELLER"],
-  ["E5 blank marketplace", [okRow("S1", ""), ...okPayload().slice(1)], "BATCH_ROW_NO_MARKETPLACE"],
-  ["E6 wrong marketplace", [okRow("S1", "DE"), ...okPayload().slice(1)], "BATCH_CROSS_MARKETPLACE"],
+for (const [name, payloadFn, code] of [
+  ["E2 unknown/cross-account seller", () => [...okPayload5(), okRow("S99")], "BATCH_CROSS_ACCOUNT"],
+  ["E3 blank seller", () => [okRow(""), ...okPayload5().slice(1)], "BATCH_ROW_NO_SELLER"],
+  ["E4 a malformed (non-object) payload member", () => [...okPayload5(), 42], "MALFORMED_PAYLOAD"],
 ]) {
   test(name + " rejects the WHOLE recovered payload; LKG byte-identical; zero creates", async () => {
-    const { store, cid, dd, outcome } = await recoverWithPayload(payload, { seedLkg: LKG });
+    const { store, cid, dd, outcome, hash } = await recoverWithPayload(payloadFn(), { seedLkg: LKG });
     assert.equal(outcome.validated, false, name + " must not validate");
-    assert.equal(outcome.code, code, name + " code");
+    assert.equal(outcome.code, code, name + " code (got " + outcome.code + ")");
     assert.equal(dd.counts.create, 0, "zero creates on rejection");
-    assert.deepEqual(store._cache.get(HASH).rows, LKG, "LKG cache byte-identical after rejection");
-    const j = store._raw(cid, HASH);
-    assert.equal(j.fetch_status, "failed");
-    assert.equal(j.terminal, true, "a batch-invalid recovery is terminal");
+    assert.deepEqual(store._cache.get(hash).rows, LKG, "LKG cache byte-identical after rejection");
+    assert.equal(store._raw(cid, hash).fetch_status, "failed");
+    assert.equal(store._raw(cid, hash).terminal, true, "a batch-invalid recovery is terminal");
   });
 }
 
-test("E7. a TRUNCATED five-seller payload rejects; LKG byte-identical; zero creates", async () => {
-  const truncated = Array.from({ length: meta5().limit }, (_v, i) => okRow(FIVE_SELLERS[i % 5]));
-  const { store, dd, outcome } = await recoverWithPayload(truncated, { seedLkg: LKG });
+test("E5. a TRUNCATED five-seller payload rejects; LKG byte-identical; zero creates", async () => {
+  const R = realPlan();
+  const truncated = Array.from({ length: R.meta.limit }, (_v, i) => okRow(R.sellers[i % 5]));
+  const { store, dd, outcome, hash } = await recoverWithPayload(truncated, { seedLkg: LKG });
   assert.equal(outcome.code, "TRUNCATED");
   assert.equal(dd.counts.create, 0);
-  assert.deepEqual(store._cache.get(HASH).rows, LKG, "LKG preserved on truncation");
+  assert.deepEqual(store._cache.get(hash).rows, LKG, "LKG preserved on truncation");
 });
 
 /* ================================= F. trusted operator composition ================================= */
-group("F. buildNonUsOliDownloadRecovery -- trusted, build-time-fixed operator");
+group("F. buildNonUsOliDownloadRecovery -- trusted operator over the REAL plan + exact five-owner binding");
 
 function operatorFixture(over = {}) {
+  const R = realPlan();
+  const hash = over.hash || R.targetHash;
   const store = makeStore();
-  const hash = over.hash || HASH;
   store._seedCache(hash, over.lkg || [{ good: 1 }]);
-  store._seedJob(C.cycleId, hash, failedRow({ request_hash: hash, ...(over.rowOver || {}) }));
-  store._seedOwners(C.cycleId, over.owners || primaryOwners(hash));
-  const dd = makeDataDoe(over.download || (() => okPayload()));
-  const plannedOliJobs = over.plannedOliJobs || [meta5(hash)];
+  store._seedJob(C.cycleId, hash, failedRow({ request_hash: hash, request_meta: { from: C.windowFrom, to: C.windowTo }, ...(over.rowOver || {}) }));
+  store._seedOwners(C.cycleId, over.owners || durableOwnersFromPlan(hash));
+  const dd = makeDataDoe(over.download || okPayload5);
+  const plannedOliJobs = over.plannedOliJobs !== undefined ? over.plannedOliJobs : R.oli.plannedJobs;
   const op = opmod.buildNonUsOliDownloadRecovery({ store, dataDoe: dd, plannedOliJobs, clock: () => 1 });
-  return { store, dd, op };
+  return { store, dd, op, hash };
 }
 
-test("F1. the operator verifies the exact target then reaches the REAL recovery code: success, zero creates", async () => {
-  const { store, dd, op } = operatorFixture();
+test("F1. the operator verifies the REAL target then reaches the real recovery code: success, zero creates", async () => {
+  const { store, dd, op, hash } = operatorFixture();
   const res = await op.run();
-  assert.equal(res.status, "ran", JSON.stringify(res).slice(0, 180));
-  assert.equal(res.outcome.status, "success", "the operator path recovered via recoverFailedDownloadJob + validateBatchSourcePayload");
+  assert.equal(res.status, "ran", JSON.stringify(res).slice(0, 200));
+  assert.equal(res.outcome.status, "success", "recovered via recoverFailedDownloadJob + validateBatchSourcePayload over the real plan");
   assert.equal(res.outcome.validated, true);
   assert.equal(dd.counts.create, 0, "the operator NEVER creates an export");
   assert.equal(dd.counts.download, 1, "exactly one download");
-  assert.equal(store._raw(C.cycleId, HASH).fetch_status, "succeeded");
+  assert.equal(store._raw(C.cycleId, hash).fetch_status, "succeeded");
 });
 
-for (const [name, over, expectReason] of [
-  ["F2a two eligible failed jobs", { setup: (f) => { f.store._seedJob(C.cycleId, OTHER, failedRow({ request_hash: OTHER })); }, plannedOliJobs: null }, "expected-exactly-one-eligible"],
-  ["F2b terminal target (zero eligible)", { rowOver: { terminal: true } }, "expected-exactly-one-eligible"],
-  ["F2c wrong error_stage", { rowOver: { error_stage: "poll" } }, "row-field-mismatch:error_stage"],
-  ["F2d wrong error_code", { rowOver: { error_code: "OTHER" } }, "row-field-mismatch:error_code"],
-  ["F2e wrong window", { rowOver: { request_meta: { from: "2025-01-01", to: "2026-03-17" } } }, "row-field-mismatch:window"],
-  ["F2f no planned match", { plannedOliJobs: [] }, "no-planned-match"],
-  ["F2g planned window mismatch", { plannedOliJobs: [(() => { const m = meta5(HASH); m.fetchParams = { ...m.fetchParams, from: "2025-01-01" }; return m; })()] }, "planned-window"],
-  ["F2h fewer than five sellers", { plannedOliJobs: [(() => { const m = meta5(HASH); m.fetchParams = { ...m.fetchParams, sellerOrVendorIds: ["S1", "S2", "S3", "S4"] }; return m; })()] }, "planned-seller-count"],
-  ["F2i not seller-scoped", { plannedOliJobs: [{ ...meta5(HASH), sourceScope: "organization" }] }, "planned-source-scope"],
-  ["F2j not marketplace-scoped", { plannedOliJobs: [{ ...meta5(HASH), marketplaceScoped: false }] }, "planned-marketplace-scoped"],
-  ["F2k blank marketplace constraint", { plannedOliJobs: [{ ...meta5(HASH), marketplaceConstraint: "" }] }, "planned-marketplace-constraint"],
-  ["F2l owner count != 5", { owners: primaryOwners().slice(0, 4) }, "owner-count"],
-  ["F2m an owner is not primary", { owners: [...primaryOwners().slice(0, 4), { request_hash: HASH, account_id: "A4", connection_id: "dd-secondary", owner_status: "active" }] }, "owner-not-primary"],
+const planMap = (fn) => realPlan().plannedForHash.map(fn);
+// The `over` is a THUNK (built lazily inside the test) so the real planner is only called after imports.
+for (const [name, overFn, expectReason] of [
+  ["F2a two eligible failed jobs", () => ({ setup: (f) => { f.store._seedJob(C.cycleId, "OTHER-HASH", failedRow({ request_hash: "OTHER-HASH" })); } }), "expected-exactly-one-eligible"],
+  ["F2b terminal target (zero eligible)", () => ({ rowOver: { terminal: true } }), "expected-exactly-one-eligible"],
+  ["F2c wrong error_stage", () => ({ rowOver: { error_stage: "poll" } }), "row-field-mismatch:error_stage"],
+  ["F2d wrong error_code", () => ({ rowOver: { error_code: "OTHER" } }), "row-field-mismatch:error_code"],
+  ["F2e wrong window", () => ({ rowOver: { request_meta: { from: "2025-01-01", to: "2026-03-17" } } }), "row-field-mismatch:window"],
+  ["F2f planned owner count != 5", () => ({ plannedOliJobs: realPlan().plannedForHash.slice(0, 4) }), "planned-owner-count"],
+  ["F2g planned identity divergent", () => ({ plannedOliJobs: planMap((p, i) => (i === 0 ? { ...p, fetchParams: { ...p.fetchParams, columns: ["date"] } } : p)) }), "planned-identity-divergent"],
+  ["F2h planned window mismatch", () => ({ plannedOliJobs: planMap((p) => ({ ...p, fetchParams: { ...p.fetchParams, from: "2025-01-01", to: "2026-03-17" } })) }), "planned-window"],
+  ["F2i planned seller count != 5", () => ({ plannedOliJobs: planMap((p) => ({ ...p, fetchParams: { ...p.fetchParams, sellerOrVendorIds: p.fetchParams.sellerOrVendorIds.slice(0, 4) } })) }), "planned-seller-count"],
+  ["F2j planned not seller-scoped", () => ({ plannedOliJobs: planMap((p) => ({ ...p, sourceScope: "organization" })) }), "planned-source-scope"],
+  ["F2k planned marketplaceScoped=true (invented)", () => ({ plannedOliJobs: planMap((p) => ({ ...p, marketplaceScoped: true })) }), "planned-marketplace-scoped"],
+  ["F2l planned owner seller mismatch", () => ({ plannedOliJobs: planMap((p, i) => (i === 0 ? { ...p, owner: { ...p.owner, rawSellerId: "ZZZ" } } : p)) }), "planned-owner-seller-mismatch"],
+  ["F2m durable owner count != 5", () => ({ owners: durableOwnersFromPlan().slice(0, 4) }), "owner-count"],
+  ["F2n durable owner stale", () => ({ owners: durableOwnersFromPlan().map((o, i) => (i === 0 ? { ...o, owner_status: "stale" } : o)) }), "owner-not-active"],
+  ["F2o durable owner not primary", () => ({ owners: durableOwnersFromPlan().map((o, i) => (i === 0 ? { ...o, connection_id: "dd-secondary" } : o)) }), "owner-not-primary"],
+  ["F2p durable owner_id not unique", () => ({ owners: durableOwnersFromPlan().map((o) => ({ ...o, owner_id: "dup" })) }), "owner-id-not-unique"],
+  ["F2q durable owner account mismatch", () => ({ owners: durableOwnersFromPlan().map((o, i) => (i === 0 ? { ...o, account_id: "WRONG-ACC" } : o)) }), "owner-account-mismatch"],
 ]) {
-  test("F2. refuses (" + name + ") without downloading or creating; job left failed", async () => {
+  test("F2. refuses (" + name + ") without downloading/creating; job left failed", async () => {
+    const over = overFn();
     const f = operatorFixture(over);
     if (over.setup) over.setup(f);
     const res = await f.op.run();
-    assert.equal(res.status, "refused", name + " => refused (got " + JSON.stringify(res).slice(0, 120) + ")");
-    assert.ok(String(res.reason).startsWith(expectReason), name + " reason " + res.reason + " ~ " + expectReason);
+    assert.equal(res.status, "refused", name + " => refused (got " + JSON.stringify(res).slice(0, 140) + ")");
+    assert.ok(String(res.reason).startsWith(expectReason), name + ": reason '" + res.reason + "' ~ '" + expectReason + "'");
     assert.equal(f.dd.counts.download, 0, name + ": no download on refusal");
     assert.equal(f.dd.counts.create, 0, name + ": no create on refusal");
-    const j = f.store._raw(C.cycleId, HASH);
-    if (j) assert.equal(j.fetch_status, "failed", name + ": the target is left failed (untouched)");
+    assert.equal(f.store._raw(C.cycleId, f.hash).fetch_status, "failed", name + ": the target is left failed (untouched)");
   });
 }
 
@@ -555,8 +588,8 @@ test("G1. a commit-unknown claim is NOT reported as committed or success (fail c
   const cid = seededCycle(store);
   store._seedJob(cid, HASH, failedRow());
   store.claimSourceExportRecovery = async () => { const e = new Error("route budget expired mid-write"); e.commitUnknown = true; throw e; };
-  const dd = makeDataDoe(() => okPayload());
-  const outcome = await worker.recoverFailedDownloadJob({ store, dataDoe: dd, clock: () => 1, cycleId: cid, meta: meta5(HASH), jobRow: store._snapshot(cid, HASH), runWithDeadline: noDeadline });
+  const dd = makeDataDoe(() => [{ v: 1 }]);
+  const outcome = await worker.recoverFailedDownloadJob({ store, dataDoe: dd, clock: () => 1, cycleId: cid, meta: metaFor(HASH), jobRow: store._snapshot(cid, HASH), runWithDeadline: noDeadline });
   assert.equal(outcome.status, "recovery-skipped", "a commit-unknown claim is never reported as success");
   assert.notEqual(outcome.status, "success");
   assert.equal(outcome.validated, false, "never validated on claim uncertainty");
@@ -567,8 +600,8 @@ test("G2. an 'attempted' row with a saved export_id resumes normally after claim
   const store = makeStore();
   const cid = store.openCycle({ bucket: "non-us", cycleDate: "2026-08-30" });
   store._seedJob(cid, HASH, failedRow({ fetch_status: "attempted", error_stage: null, error_code: null }));
-  const dd = makeDataDoe(() => okPayload());
-  await worker.runSourceJobs({ store, dataDoe: dd, bucket: "non-us", cycleDate: "2026-08-30", plannedJobs: [meta5(HASH)] });
+  const dd = makeDataDoe(() => [{ v: 1 }]);
+  await worker.runSourceJobs({ store, dataDoe: dd, bucket: "non-us", cycleDate: "2026-08-30", plannedJobs: [metaFor(HASH)] });
   assert.equal(store._raw(cid, HASH).fetch_status, "succeeded", "the attempted row resumed download-only to success");
   assert.equal(dd.counts.create, 0, "resume never creates");
   assert.equal(dd.counts.download, 1);
@@ -595,11 +628,94 @@ test("G4. recovery DISABLED (default) is byte-identical: a pending job creates+d
   assert.equal(res.succeeded, 1);
 });
 
+/* ================================= H. real bounded DataDoe deadline ================================= */
+group("H. the operator threads a REAL bounded DataDoe deadline through poll + download");
+
+// Build the operator with an ALREADY-EXPIRED deadline (clock far in the past => deadlineAt < real now), so the
+// production sleep()/deadline mechanism inside a hung poll/download aborts typed-resumable. If the operator did
+// NOT thread withDataDoeDeadline, sleep() would see no deadline and resolve (the assertion would then fail).
+function expiredOperator(hangStage) {
+  const R = realPlan();
+  const store = makeStore();
+  store._seedCache(R.targetHash, [{ good: 1 }]);
+  store._seedJob(C.cycleId, R.targetHash, failedRow({ request_hash: R.targetHash, request_meta: { from: C.windowFrom, to: C.windowTo } }));
+  store._seedOwners(C.cycleId, durableOwnersFromPlan(R.targetHash));
+  const dd = makeDataDoe(okPayload5);
+  if (hangStage === "poll") dd.poll = async () => { dd.counts.poll += 1; await datadoe.sleep(60_000); };
+  if (hangStage === "download") dd.download = async () => { dd.counts.download += 1; await datadoe.sleep(60_000); };
+  const op = opmod.buildNonUsOliDownloadRecovery({ store, dataDoe: dd, plannedOliJobs: R.oli.plannedJobs, clock: () => Date.now() - C.budgetMs });
+  return { store, dd, op, hash: R.targetHash };
+}
+
+test("H1. a HUNG poll is bounded typed-resumable; zero creates; download never runs; no ghost cache/success write", async () => {
+  const { store, dd, op, hash } = expiredOperator("poll");
+  const res = await op.run();
+  assert.equal(res.status, "ran");
+  assert.equal(res.outcome.status, "deferred", "a hung poll returns bounded typed-resumable (not success/failed)");
+  assert.equal(res.outcome.resumable, true);
+  assert.equal(dd.counts.create, 0, "zero creates");
+  assert.equal(dd.counts.download, 0, "download never reached after a bounded poll");
+  assert.equal(store._cache.get(hash).rows.length, 1, "no ghost cache write (LKG intact)");
+  assert.equal(store._raw(C.cycleId, hash).fetch_status, "attempted", "left resumable (claimed); no success/failure recorded");
+});
+
+test("H2. a HUNG download is bounded typed-resumable; zero creates; no ghost cache/success write", async () => {
+  const { store, dd, op, hash } = expiredOperator("download");
+  const res = await op.run();
+  assert.equal(res.status, "ran");
+  assert.equal(res.outcome.status, "deferred", "a hung download returns bounded typed-resumable");
+  assert.equal(res.outcome.resumable, true);
+  assert.equal(dd.counts.create, 0, "zero creates");
+  assert.equal(store._cache.get(hash).rows.length, 1, "no ghost cache write (LKG intact)");
+  assert.equal(store._raw(C.cycleId, hash).fetch_status, "attempted", "left resumable; no success recorded");
+});
+
+/* ================================= I. honest operator exit ================================= */
+group("I. recoveryExitDecision -- release automation cannot continue past a non-success");
+
+test("I1. exit 0 ONLY for ran+success+validated; every other class exits nonzero with redacted evidence", () => {
+  assert.equal(opmod.recoveryExitDecision({ status: "ran", requestHash: "h", outcome: { status: "success", validated: true, rowCount: 5 } }).code, 0, "genuine success => 0");
+  const nonSuccess = [
+    { status: "refused", reason: "owner-account-mismatch" },
+    { status: "ran", outcome: { status: "success", validated: false } },
+    { status: "ran", outcome: { status: "deferred", validated: false, resumable: true } },
+    { status: "ran", outcome: { status: "failed", validated: false, code: "SAVE_FAILED" } },
+    { status: "ran", outcome: { status: "terminal", validated: false, code: "TRUNCATED" } },
+    { status: "ran", outcome: { status: "recovery-skipped", validated: false, reason: "not-eligible" } },
+    { status: "ran", outcome: null },
+    { status: "ran" },
+    {},
+    null,
+  ];
+  for (const r of nonSuccess) {
+    const d = opmod.recoveryExitDecision(r);
+    assert.equal(d.code, 1, "non-success => nonzero: " + JSON.stringify(r).slice(0, 70));
+    assert.equal(d.ok, false);
+    assert.ok(!Object.keys(d.evidence).some((k) => /seller|export_?id|payload|apikey|secret|token/i.test(k)), "evidence carries no sensitive keys");
+  }
+});
+
+test("I2. a subprocess entrypoint exits 0 on success and NONZERO on every non-success class", () => {
+  const opUrl = new URL("../lib/server/sync/source-oli-recovery-operation.js", import.meta.url).href;
+  const runExit = (res) => {
+    const code = "import(process.env.OP).then(m=>{const d=m.recoveryExitDecision(JSON.parse(process.env.RES));process.stdout.write(JSON.stringify({ok:d.ok}));process.exit(d.code);}).catch(()=>process.exit(2));";
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { env: { ...process.env, OP: opUrl, RES: JSON.stringify(res) }, encoding: "utf8" });
+    return r.status;
+  };
+  assert.equal(runExit({ status: "ran", requestHash: "h", outcome: { status: "success", validated: true } }), 0, "success entrypoint exits 0");
+  assert.notEqual(runExit({ status: "refused", reason: "owner-count" }), 0, "refusal entrypoint exits nonzero");
+  assert.notEqual(runExit({ status: "ran", outcome: { status: "deferred", validated: false } }), 0, "deferred entrypoint exits nonzero");
+  assert.notEqual(runExit({ status: "ran", outcome: { status: "terminal", validated: false } }), 0, "terminal entrypoint exits nonzero");
+  assert.notEqual(runExit({ status: "ran", outcome: null }), 0, "missing-outcome entrypoint exits nonzero");
+});
+
 async function main() {
   out("source download-only recovery proof suite");
   worker = await import("../lib/server/sync/source-worker.js");
   sb = await import("../lib/server/supabase.js");
   opmod = await import("../lib/server/sync/source-oli-recovery-operation.js");
+  bucketSync = await import("../lib/server/sync/source-bucket-sync.js");
+  datadoe = await import("../lib/server/datadoe.js");
   C = opmod.NONUS_OLI_DOWNLOAD_RECOVERY;
   let failures = 0;
   for (const t of tests) {

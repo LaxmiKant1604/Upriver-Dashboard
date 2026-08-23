@@ -23,7 +23,7 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE
 const { buildBucketSourceSyncRuntime, makeSupabaseSourceStore, makeDataDoeAdapter } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const bucketSync = await import("../../lib/server/sync/source-bucket-sync.js");
 const { getDataDoeConnections } = await import("../../lib/server/datadoe.js");
-const { buildNonUsOliDownloadRecovery, NONUS_OLI_DOWNLOAD_RECOVERY } = await import("../../lib/server/sync/source-oli-recovery-operation.js");
+const { buildNonUsOliDownloadRecovery, NONUS_OLI_DOWNLOAD_RECOVERY, recoveryExitDecision } = await import("../../lib/server/sync/source-oli-recovery-operation.js");
 
 const C = NONUS_OLI_DOWNLOAD_RECOVERY;
 const runtime = buildBucketSourceSyncRuntime({ budgetMs: 550_000 });
@@ -48,16 +48,8 @@ const dataDoe = makeDataDoeAdapter(getDataDoeConnections());
 const op = buildNonUsOliDownloadRecovery({ store, dataDoe, plannedOliJobs });
 
 const res = await op.run();
-// Redacted, typed evidence only.
-const safe = {
-  status: res.status,
-  reason: res.reason || null,
-  eligibleCount: res.eligibleCount,
-  ownerCount: res.ownerCount,
-  outcomeStatus: res.outcome ? res.outcome.status : null,
-  outcomeValidated: res.outcome ? res.outcome.validated === true : null,
-  outcomeCode: res.outcome ? res.outcome.code || null : null,
-  rowCount: res.outcome ? res.outcome.rowCount ?? null : null,
-  requestHashPresent: Boolean(res.requestHash),
-};
-console.log("nonus-oli-download-recovery:", JSON.stringify(safe));
+// Honest exit: 0 ONLY for a genuine recovered success; every non-success class prints typed/redacted evidence
+// and exits NONZERO so release automation cannot continue past a refusal/failure.
+const { code, ok, evidence } = recoveryExitDecision(res);
+console.log("nonus-oli-download-recovery:", JSON.stringify({ ok, ...evidence }));
+process.exit(code);

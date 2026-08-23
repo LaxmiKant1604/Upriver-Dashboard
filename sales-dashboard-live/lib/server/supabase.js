@@ -1593,7 +1593,7 @@ export async function claimSourceExportRecovery(cycleId, requestHash, expectedEx
   const ok = String(r.cycle_id) === String(cycleId)
     && String(r.request_hash) === String(requestHash)
     && r.fetch_status === "attempted"
-    && (r.terminal ?? false) === false
+    && r.terminal === false // STRICT: a missing/true/non-false terminal fails closed (never coerced)
     && (r.error_stage === "poll" || r.error_stage === "download")
     && Number(r.create_export_count) === 1
     && typeof r.export_id === "string" && r.export_id === expectedExportId; // EXACT, never trimmed
