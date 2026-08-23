@@ -10910,3 +10910,33 @@ publishing + scheduling stay PAUSED (this change does NOT implement the separate
 release). The Non-US recovery expects 10 new exports / 20 tokens (five exact 157-day caches reusable; the failed
 441-day hash never retried) -- NOTE the recovered job itself is a download-only resume that spends ZERO new
 tokens. See [[scheduler-v2-complete-window-wip]].
+
+## Phase-2 recovery hardened for Codex re-review: trusted operator + export-id-bound claim + five-seller proofs -- 2026-08-23 (code 1a707f1; docs separate; still offline)
+
+Codex reviewed b88d962+6ef93b0 and raised three Phase-2 blockers; all fixed OFFLINE (no push/deploy/prod/DataDoe):
+1. **Trusted operator wiring.** New `lib/server/sync/source-oli-recovery-operation.js`:
+   `buildNonUsOliDownloadRecovery` is the ONLY composition that runs recovery, with `NONUS_OLI_DOWNLOAD_RECOVERY`
+   FROZEN constants (cycle 15d1f749..., order-line-items, error_stage=download, error_code=EXPORT_ERROR,
+   terminal=false, create_export_count=1, window 2025-08-10..2026-03-17, five owners all primary, five sellers).
+   run() requires exactly one eligible failed job, verifies the row shape + durable request_meta window, matches
+   the RE-PLANNED canonical OLI job (5 sellers, seller scope, marketplaceScoped, nonblank marketplace), verifies
+   5 primary owners, then recovers ONLY that hash via a create-GUARDED adapter (any create throws). Thin operator
+   script `scripts/release/recover-nonus-oli-download.mjs`. Ordinary API/card/scheduler keep
+   recoverFailedDownloads=false (verified: NO api/runtime/scheduler reference enables it; the operator calls
+   recoverFailedDownloadJob directly).
+2. **Strict atomic claim.** `claimSourceExportRecovery(cycleId, requestHash, expectedExportId)` filters
+   `export_id=eq.<expected>` (a changed id can never be claimed) and validates the returned representation EXACTLY
+   (cycle_id, request_hash, fetch_status='attempted', terminal=false, error_stage in (poll,download),
+   create_export_count=1, export_id === expected, never trimmed); zero/multi/wrong-row/missing-field/wrong-id/
+   malformed => null (fail closed). `recoveryEligibility` rejects noncanonical (whitespace-padded) export ids
+   rather than trimming. Added `getSyncSourceJobsWithMeta` (request_meta window) for operator verification only.
+3. **Five-seller validation proof + more.** `source-download-recovery.test.js` 16 -> **42 assertions**: real
+   five-seller seller/marketplace payloads (valid succeeds; unknown seller / cross-account marketplace / blank
+   seller / blank / wrong marketplace / truncated each reject the WHOLE payload, LKG byte-identical, zero
+   creates); the strict claim (export-id filter + exact-row validation, noncanonical rejected pre-write); the
+   operator (reaches the real recovery code on the valid target; refuses on every verification without
+   download/create); one-winner concurrency; commit-unknown claim never reported committed/success; attempted-row
+   resume; no repeated download loop; recovery-disabled byte-identical to the normal worker.
+
+`node --check` + the 42-assertion suite + `npm run verify` (56 steps / 36 suites) green; `git diff --check` clean.
+STILL UNPUSHED; go-live remains stalled on the production-access block. See [[scheduler-v2-complete-window-wip]].
