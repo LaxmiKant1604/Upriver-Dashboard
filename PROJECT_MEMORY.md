@@ -10725,3 +10725,78 @@ Brand View go-live with the CORRECT model (<=5 sellers/export, standard=2/premiu
 creates, exact seller/account isolation, publish only validated snapshots, verify frontend identities/LKG,
 enable scheduling only after a full observed run). Stop on mismatch/COMMIT_UNKNOWN/permission/DataDoe failure/
 insufficient tokens/incomplete or cross-account evidence. Report exact exports + tokens spent.
+
+> **CORRECTION (2026-08-23):** the apply-Migration-8 / push / Vercel-deploy items above are DONE, not pending --
+> **Migration 8 is APPLIED and production is deployed at 4390253.** See the 2026-08-23 Codex-finding entry below.
+
+## OLI complete-window model: rolling refresh RESTORED + export window CAPPED -- 2026-08-23 (code UNCOMMITTED; offline)
+
+Resumed an **uncommitted, in-flight** working-tree change on `main` (HEAD 4390253): the OLI source model had
+been changed from 7-day pre-sliced exports to ONE complete-window export per <=5-seller batch (new
+`missingCoverageWindows` complement + missing-window-signature grouping in `planOliSliceExports`; registry
+`initialBackfill` 420->577 days; `oliBackfillWindow` gained a `fixed-start` policy kind). It had left **35
+failing assertions** in `source-production-hardening.test.js` and two undocumented semantic changes.
+
+Diagnosed + completed the change (offline SHADOW MODE; nothing pushed/merged/deployed/migrated; no DataDoe call):
+
+- **Root cause of ~32 failures**: fixtures were switched to static partial-tail coverage to force a cycle, but
+  the non-preflight derive RE-READS the coverage mock, which never reflected the freshly-persisted tail =>
+  readiness=false => zero saves. Fix: `dynamicTailCoverage(durableCoverage)` -- the mock now returns the durable
+  coverage `replaceHistory` accumulates (a faithful DB re-read; adjacent seed+tail merge to one proving window).
+- **Rolling 7-day refresh had been DROPPED** (helpers `oliRollingRefreshWindow`/`clipCoverageForRefresh`
+  orphaned; registry still declared `rolling-window-days/7`), so trailing-day corrections would no longer be
+  re-pulled. **User decision: RESTORE it.** Re-applied the coverage clip inside the complete-window planner: each
+  member's coverage is clipped to exclude the trailing refresh window, so the complement always includes it =>
+  the planner emits ONE export covering [gap-start..asOf] per batch (proven older history never re-exported; the
+  trailing window re-pulled every run, cache-hit-stable). This ALSO fixed **T2** naturally (a same-day resume
+  always re-plans the trailing window => cache hit => cycle reused => observes already-complete).
+- **Single export ~597 days vs DataDoe's only-proven 441-day window.** The brand-sales:order-lines contract
+  (monthStart(asOf)-420..asOf) alone reaches ~450 days at month end, so a single export CAN'T stay within the
+  proven range. **User decision: CAP/split.** Added `MAX_OLI_EXPORT_WINDOW_DAYS=441` + `splitWindowToMaxSpan`;
+  `planOliSliceExports` now SPLITS any missing window > cap into contiguous <=cap chunks (each its own export;
+  coverage merges back). Fail-safe: no export ever exceeds the proven range. Raise ONLY after an empirical probe
+  -- **an empirical DataDoe window probe is still REQUIRED before the first real export at go-live.**
+- Also fixed T5 (one complete-window create now, not many 7-day creates: bumped the per-create clock burn so a
+  single create trips the deadline) and U5 (partial-tail coverage => 6 batches => 6 OLI exports). Updated
+  zero-export (11) + bucket-sync B4 for the restored refresh + cap; added durable-model C5 (direct cap/split
+  proof).
+
+`npm run verify` GREEN: **all 55 steps across 35 suites** (incl. build:check) in 68s; `git diff --check` clean;
+node --check clean. Golden request_hash, five-ID batching, Scheduler v1, and all migrations' SQL unchanged.
+Change is UNCOMMITTED and awaits review. See [[scheduler-v2-complete-window-wip]], [[datadoe-model-correction-was-wrong]].
+
+## Codex-finding corrections to the complete-window model -- 2026-08-23 (offline; code/tests + docs)
+
+STATUS CORRECTION (supersedes the stale "PENDING" list in the 2026-08-22 migration-8 entry above): **Migration 8
+is already APPLIED and production is DEPLOYED at 4390253.** Do NOT treat migration-8 apply / push / Vercel deploy
+as pending -- they are DONE. What remains before go-live is operational (verify live DataDoe balance + an
+empirical window probe), not a code/migration/deploy step.
+
+Applied six Codex findings to the (still-UNCOMMITTED) complete-window change:
+1. **Genuinely fixed OLI start.** Registry `initialBackfill` is now `{ kind: "fixed-start", start: "2025-01-01" }`
+   (was window-days:577, which DRIFTS the start forward every month). `oliBackfillWindow` uses its fixed-start
+   branch => [2025-01-01, asOf] for ANY asOf; the start never moves at a month rollover. Regression A1b proves
+   Aug/Sep/future months all keep 2025-01-01. (Also made the derive honour oliBackfillWindow's empty-window
+   contract: asOf before the fixed start => Brand View not-ready skip, never a throw.)
+2. **Frozen budget corrected to 14 exports / 28 tokens.** [2025-01-01, 2026-08-21] = 598 inclusive days; the
+   441-day cap splits EACH batch into exactly [2025-01-01..2026-03-17] (441d) + [2026-03-18..2026-08-21] (157d).
+   Seven batches => 14 OLI exports => 28 standard tokens (2 each). Regression B5 (real planner +
+   computeFrozenTrancheBudget) + C5 pin the exact boundaries and the 28-token ceiling. (Any earlier
+   "7 exports / 14 tokens" figure was WRONG -- the cap doubles each batch's export count.)
+3. **Initial-backfill-only scope honoured.** Reverted the no-cycle `globalDrained=true` behaviour: a run that
+   opens NO owning cycle stays NOT-drained, so it never derives/saves report snapshots and never uses the plain
+   unlineaged wall-clock save (in production `reportLineage` is always wired and the derive only runs off a
+   drained cycle, so that path is unreachable there). Zero-work publication/scheduling stays paused until the
+   SEPARATE durable-evidence-lineage rework. Regression F4e proves full coverage + no cycle => zero saves + zero
+   lineage.
+4. **441 is an APPLICATION safety cap, NOT a documented DataDoe date-range limit** -- the largest window we have
+   empirically proven (2026-08-22); raise it only after a probe validates a larger range.
+5. **Export 316729fd is NOT a provable adoption.** No local record of its request fields or payload integrity
+   exists; every diagnostic probe used a different window (oliBackfillWindow full span / the monthStart-420
+   empirical window) and/or seller count (the 8-seller create FAILED 400; a 1-seller create succeeded) than any
+   authorized 5-seller/441-capped chunk, and identity was never proven field-by-field. Adopting by export id
+   alone is refused. => count 0 adopted tokens; **the full 28 new tokens are still required before reuse.**
+
+node --check + the focused suites + `npm run verify` GREEN; `git diff --check` clean. Still UNCOMMITTED at the
+time of writing; code/tests committed first, docs separately, then STOP for Codex review. No production OLI run.
+See [[scheduler-v2-complete-window-wip]].
