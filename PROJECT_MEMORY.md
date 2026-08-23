@@ -11027,3 +11027,38 @@ STATUS: durable evidence complete; priority path CODE+TESTS+DOCS done offline. N
 (stopped for Codex review per direction); NO tokens spent on the priority work; scheduler OFF; the 3
 unrelated-report controls (content-changes/keyword-rank/listing-optimizer) still schedule_enabled=TRUE in prod
 (their pause is a later go-live step, not yet done). See [[scheduler-v2-golive-status]].
+
+## Priority release HARDENED for Codex round 2 -- 2026-08-23 (code ff1bc51 + docs separate; NOT pushed)
+
+Codex round-2 blockers fixed offline from HEAD 9959f4e (no push/deploy/prod/publish/scheduler). Frozen
+publication set is now EXACTLY ["daily-reporting","brand-sales","brand-inventory"] -- Brand View needs BOTH
+brand-sales (the sales + ASIN-brand evidence buildAccountBrandSlice reads) and brand-inventory (compact
+inventory). Four changes:
+1. TRUSTED BUILD-TIME priority binding: removed the run() `priority` argument; added build-time `priorityMode` on
+   buildBucketSourceSyncRuntime (mirrors recoverFailedDownloads). Ordinary routes/cards/scheduler build with no
+   args -> priorityMode=false; only buildPriorityDashboardsRelease sets it. The composition freezes report keys +
+   collaborators (real buildSchedulerV2Publisher composed internally) + scope + publish order; unknown keys never
+   reach the publisher.
+2. REVIEWED CYCLE-CLOSE: the priority source runtime still never finalizes; verifyAndFinalize verifies the exact
+   cycle (ONLY product-catalog source jobs all terminal-successful; report jobs ONLY the 3 keys, exact account
+   scope, derive/save succeeded + validated + nonblank hash; refuse unrelated/open/malformed) THEN the guarded
+   finalize_sync_cycle RPC, accepting ONLY strict finalized/already-terminal + terminal cycle. Proven: real
+   publisher not-successful for all 3 before finalization, publishes all 3 after.
+3. DURABLE one-Catalog-export/2-token ceiling (replaced the process-local counter): atomic reservation keyed to
+   the frozen operation + the exact canonical Catalog request hash (bucket-INDEPENDENT -- resolvedDurableCatalog
+   omits bucket from the hash -- so US+Non-US share it). New ADDITIVE, UNAPPLIED migration
+   20260825_priority_catalog_reservation.sql (table + reserve/record SECURITY DEFINER RPCs + least-privilege ACL)
+   + supabase.js wrappers + makeDurableCatalogGuard. Winner creates once (2 tokens) + records export_id; later
+   attempt adopts export_id (zero); unrecorded reservation (in-flight/commit-unknown) = AMBIGUOUS, never a 2nd
+   create. Durable across US+Non-US/retries/restarts/concurrency/commit-unknown.
+4. COMPLETE PUBLISH SURFACE: publishAccount publishes daily-reporting, brand-sales, brand-inventory -- brand-sales
+   BEFORE brand-inventory -- each through the real publisher's four durable gates; no control/approval auto-enabled.
+
+Regressions: source-priority-dashboards.test.js P1-P7 (durable guard incl commit-unknown/concurrency/adoption;
+allowlist+order; 30-acct zero-OLI/FBA plan; composition wiring + verifyAndFinalize accept/refuse matrix; real
+publisher before/after finalization for all 3; real buildAccountBrandSlice fresh sales + inventory unavailable) +
+source-production-hardening.test.js F11a-f (build-time priority; ordinary callers cannot activate) + F12a-c (REAL
+runtime+worker durable reservation: cold US 1 Catalog/2 tokens/0 others; warm re-run 0; US+Non-US share ONE
+reservation warm + cold-adopt). `npm run verify` 57 steps/37 suites GREEN; node --check + git diff --check clean.
+Commit ff1bc51 (code/tests/migration) + docs separate. STOPPED for Codex re-review; no production action.
+See [[scheduler-v2-golive-status]].
