@@ -10873,3 +10873,40 @@ remainder identity. A fresh full plan is therefore US 6/12 + Non-US 15/30 = 21 e
 For the current Non-US recovery, the five exact 157-day caches remain reusable, so the expected NEW work is
 10 exports / 20 tokens; the failed 441-day hash is never retried. Full `npm run verify` passed 55/55 across 35
 suites including build:check. No Catalog/Ads/FBA export, report publication, or schedule enablement has yet run.
+
+## Phase 2 download-only export recovery IMPLEMENTED (offline); live go-live STALLED on production access -- 2026-08-23 (code b88d962; docs separate)
+
+Continuing the Daily Reporting + Brand View OLI go-live from HEAD 106e383 (= origin/main, deployed
+dpl_GC8yucfz8Py5ddeBBUiCxC591wHz, Ready; 82 usable DataDoe tokens; migrations at stage 8). Verified the LOCAL
+git state matches (HEAD = origin/main = 106e383, tree clean). Then attempted Phase 1's READ-ONLY production
+reconciliation (a REPEATABLE READ READ ONLY Postgres query, aggregates only) -- the harness safety classifier
+DENIED the production DB connection. Every phase depends on live prod + DataDoe, so Phases 1 and 3-7 could NOT
+run here. Nothing was pushed/deployed/migrated and NO DataDoe export was created. The go-live is STALLED pending
+the user granting production access (settings permission / running the reads themselves) -- NOT a review pause,
+a hard capability block.
+
+The one phase runnable offline -- Phase 2 -- is DONE and committed (code/tests b88d962; NOT pushed):
+- `recoveryEligibility(jobRow)` (pure): a recorded failure is recoverable ONLY when non-terminal, error_stage in
+  (poll,download), create_export_count=1 and export_id nonblank. Terminal / TRUNCATED / validate / persist /
+  create-stage / count!=1 / missing-export_id => never eligible.
+- `recoverFailedDownloadJob(...)`: gate -> ATOMIC claim (`store.claimSourceExportRecovery`: failed->attempted,
+  preserving export_id + create_export_count) -> resume via the EXISTING poll->download->validate->save(CAS)->
+  success path (an 'attempted' job never creates). One poll/download per invocation; any non-'claimed'/
+  malformed/errored ack fails closed (no download, no fabrication); validation failure preserves LKG.
+- `runSourceJobs` opt-in flag `recoverFailedDownloads` (default false = byte-identical). Phase 3 sets it to
+  resume the SAME Non-US cycle download-only.
+- `claimSourceExportRecovery` (supabase.js): a conditional PATCH on sync_source_jobs (mirrors
+  claimReportDeriveAttempt) -- NO RPC/migration added; PostgreSQL serializes it so exactly one worker wins.
+- New suite `scripts/source-download-recovery.test.js` (16 assertions): eligibility + every disqualifier,
+  terminal refusal, missing export_id, zero create POSTs, success, validation failure + LKG, fail-closed acks,
+  one-winner concurrency, the flag on/off, and the production PATCH shape. `npm run verify` = 56 steps / 36
+  suites green; node --check + git diff --check clean.
+
+REMAINING go-live invariants (for whoever runs Phases 1,3-7 with prod access): Daily Reporting + Brand View
+ONLY; OLI only 2025-01-01..authorized asOf; <=5 sellers/export; <=441 inclusive days/export; hard ceiling 14
+creates / 28 tokens for 8-US + 22-non-US; reuse only exact provable identities; do NOT adopt export 316729fd;
+no diagnostic export, no auto-retry; refuse before the first create unless >=28 usable tokens confirmed;
+publishing + scheduling stay PAUSED (this change does NOT implement the separate durable-evidence lineage
+release). The Non-US recovery expects 10 new exports / 20 tokens (five exact 157-day caches reusable; the failed
+441-day hash never retried) -- NOTE the recovered job itself is a download-only resume that spends ZERO new
+tokens. See [[scheduler-v2-complete-window-wip]].
