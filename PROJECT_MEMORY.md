@@ -11429,3 +11429,54 @@ cron. The workflow's scheduled runs auto-enable on push to the default branch; a
 the secrets guard (no tokens, no writes). Scheduled next times once enabled: non-us 02:00 UTC / us 10:30 UTC.
 State: main @ 7ce79aa (code) + docs (unpushed); go-live dashboards still LIVE + safe-closed. See
 [[scheduler-v2-golive-status]].
+
+## Brand View country-coverage fix + ASIN Ads scheduler -- 2026-08-24 (code 6b1f1ba + docs; PUSHED to origin/main; enablement pending)
+
+Completed the latest scheduler requirements. verify 58/58; DataDoe balance confirmed 84 usable tokens (>= the
+30/day ceiling). Scope = Daily Reporting + Brand View ONLY (daily-reporting, brand-sales, brand-inventory, OLI,
+Product Catalog, ASIN Ads); Campaign Ads + FBA + unrelated reports stay paused.
+
+A. BRAND VIEW COVERAGE (Supabase-only, zero tokens, PROD-VERIFIED). Root cause: sharedSnapshotBrandAccounts
+(api/datadoe.js) treated a "complete" brand-catalog snapshot as the authoritative account map and never read
+brand-sales -- so it dropped accounts selling a brand only in brand-sales (IT/ES/UK) AND pinned catalog-only
+accounts with no sales (US). Fix: portfolio MEMBERSHIP now = the latest validated brand-sales snapshot ONLY (the
+figures' evidence -- account view + Brand View now share it); the SELECTOR list still unions a complete catalog's
+brands (zero-sale brands stay selectable). New pure lib/server/reports/brand-membership.js (membershipBrandsForAccount
+= sales only; selectorBrandsForAccount = catalog-complete UNION sales; buildBrandAccountMembership). serialiseBrandAccountMap
+takes the selector set separately (a selector-only brand lists with an EMPTY account set). Portfolio identity
+(brand-view-portfolio) already encodes accountIds in account_id + params_hash, so a changed account set makes a
+NEW snapshot and never overwrites unrelated LKG. PROOF: read-only prod probe + rebuild-brand-membership.mjs both
+resolve Bebi Born to EXACTLY [BE,DE,ES,FR,IT,NL,PL,UK] (8) -- US EXCLUDED (its complete catalog lists Bebi Born
+but it has no Bebi Born sales). No frontend change (App.jsx filters through the corrected server map).
+
+B. ASIN ADS SCHEDULER. ASIN Ads does NOT use the source-job engine -- it is fetched by the durable Ads
+architecture (ads-sync.js runAdsSync). New operator scripts/release/scheduled-asin-ads-refresh.mjs +
+lib/server/sync/source-scheduled-asin-ads.js run ONLY the ASIN grain "asin-performance-v1" in COVERAGE mode:
+discover the bucket's primary accounts (bucketForCountry; US/Non-US never mix), batch <=5 (assignAccountBatches),
+per batch runAdsSyncWithDeps(distinct-batch-countries, ["asin-performance-v1"], { accountIds, requiredCoverage:
+21-day window }) with a GUARDED counting createExport that aborts before a create exceeding the per-bucket ceiling
+(US 2 exports/4 tokens, Non-US 5/10; combined 7/14). Coverage mode SKIPS already-proven coverage (a skipped pair
+counts as successful -> a warm run = 0 creates; no refetch of historical Ads), one create per batch, re-invokes a
+work-budget deferral (idempotent; 600s lock), NEVER retries a failed/ambiguous batch (LKG preserved by the durable
+worker's failedStateRecord). assessScheduledAsinAdsCycle proves: every batch status=completed + coverageComplete +
+pairs match + only the ASIN source + zero failed/coverage-failed + covered union == discovered + creates<=ceiling.
+Prod has ads_sync_coverage applied (40 windows) + 52 ASIN-Ads state rows, so coverage mode works. source_controls
+durable status now enables ads-asin-date too (Campaign Ads ads-campaign-date stays disabled).
+
+C+D. WORKFLOW + SAFETY. Token gate scripts/release/confirm-token-budget.mjs reads the REAL balance from
+/usage-logs (latest row balanceAfter+extraTokensAfter+bundleTokensAfter; read-only, zero tokens) and REFUSES
+before the first create if < 30 usable / unconfirmable (fail-closed). scheduler-v2.yml now: token gate -> OLI ->
+ASIN Ads for BOTH buckets; Non-US (02:00 UTC) stops there (no publish); US (10:30 UTC) then opens controls ->
+priority release (Catalog + derive/preflight + publish the 3 keys under priority-dashboards/scheduled/YYYY-MM-DD)
+-> rebuild-brand-membership.mjs (Supabase-only verify) -> ALWAYS safe-close. Retained: one-workflow concurrency,
+fail-fast secret check, single-scheduler rule, no pg_cron/Vercel cron, no unrelated source/report selected.
+
+HANDOFF -- unchanged blocker: "live" is NOT claimable until BOTH controlled workflow runs (non-us + us) finish
+green on GitHub Actions, which needs the repo secrets set (POSTGRES_URL, SUPABASE_URL|VITE_SUPABASE_URL,
+SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY) and a dispatch -- not doable here (no gh CLI / no GitHub token). What
+IS proven now: code+tests (verify 58/58), Brand View fix VERIFIED against prod (Bebi Born -> 8), tokens confirmed
+(84 >= 30), pushed to origin/main, Vercel 200. Next: set secrets -> dispatch non-us (observe OLI+ASIN Ads,
+persisted, no publish) -> dispatch us (observe OLI+ASIN Ads+Catalog+publish 30x3+readback+membership rebuild+
+safe-close) -> confirm 30x3 live snapshots, Bebi Born 8 countries live, ASIN Ads populated, Campaign Ads/FBA
+paused, <=30 tokens, schedules at 07:30/16:00 IST. State: main @ 6b1f1ba (code) + docs. See
+[[scheduler-v2-golive-status]].
