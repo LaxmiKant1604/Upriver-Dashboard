@@ -7,7 +7,7 @@ import { writeSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
-import { oliBucketPlan, assessScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
+import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
 import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING } from "../lib/server/datadoe-usage.js";
 import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
 
@@ -306,6 +306,70 @@ test("F5. assessment rejects every violation: not-completed, coverage-incomplete
     assert.equal(a.ok, false, name + " must be rejected");
     assert.ok(a.problems.some((p) => re.test(p)), name + " -> expected " + re + " in " + JSON.stringify(a.problems));
   }
+});
+
+group("G. scheduled OLI cycle-identity classification (fix: a same-date terminal priority cycle must never be reused)");
+
+// A complete scheduled OLI cycle for n accounts: ceil(n/5) OLI batch jobs (create=1) with per-account owners.
+const oliCompleteCycle = (n) => {
+  const ids = Array.from({ length: n }, (_, i) => acct(i + 1));
+  const sourceJobs = []; const owners = [];
+  for (let b = 0; b * 5 < n; b += 1) {
+    const members = ids.slice(b * 5, b * 5 + 5); const h = "oli-" + b;
+    sourceJobs.push({ source_key: "order-line-items", request_hash: h, fetch_status: "succeeded", create_export_count: 1 });
+    for (const m of members) owners.push({ request_hash: h, account_id: m });
+  }
+  return { sourceJobs, owners };
+};
+
+test("G1. a same-date TERMINAL catalog/priority cycle (0 OLI jobs) + missing coverage -> terminal-refuse; zero jobs cannot pass merely because open=0", () => {
+  const cls = classifyScheduledOliCycle({
+    bucket: "non-us",
+    cycle: { id: "e8d5521f-91fa-446e-bfa0-97e52796024e", bucket: "non-us", status: "succeeded" },
+    discoveredAccounts: accountsN(22),
+    sourceJobs: [{ source_key: "product-catalog", request_hash: "cat", fetch_status: "succeeded", create_export_count: 1 }],
+    owners: [{ request_hash: "cat", account_id: "__organization" }],
+  });
+  assert.equal(cls.disposition, "terminal-refuse", "the terminal catalog cycle is NOT adopted as an OLI cycle");
+  assert.ok(cls.assessment.problems.includes("no-oli-jobs"), "the strict assessment (open=0) still refuses zero OLI jobs");
+  assert.ok(cls.assessment.problems.some((p) => p.startsWith("owner-coverage-missing")) || cls.assessment.problems.includes("owner-coverage-missing"), "no owner coverage is fabricated");
+});
+
+test("G2. a TERMINAL cycle that IS a complete scheduled OLI run (22 accts -> 5 batches, exact owner union) -> idempotent-complete (same-day replay, zero re-fetch)", () => {
+  const { sourceJobs, owners } = oliCompleteCycle(22);
+  const cls = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "cyc", status: "succeeded" }, discoveredAccounts: accountsN(22), sourceJobs, owners });
+  assert.equal(cls.disposition, "idempotent-complete");
+  assert.equal(cls.assessment.ok, true, JSON.stringify(cls.assessment.problems));
+  assert.equal(cls.assessment.batches, 5, "22 accounts -> exactly 5 OLI batches");
+  assert.equal(cls.assessment.creates, 5); assert.equal(cls.assessment.tokens, 10);
+});
+
+test("G3. an ABSENT or RUNNING cycle -> run (create/continue OLI); an unexpected status fails closed", () => {
+  assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: null }).disposition, "run");
+  assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "running" } }).disposition, "run");
+  const bad = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "pending" }, discoveredAccounts: accountsN(22), sourceJobs: [], owners: [] });
+  assert.equal(bad.disposition, "refuse");
+  assert.match(bad.reason, /unexpected-cycle-status/);
+});
+
+test("G4. a terminal cycle with OLI jobs but a MISSING owner (incomplete coverage) -> terminal-refuse (never fabricates owner coverage)", () => {
+  const { sourceJobs, owners } = oliCompleteCycle(22);
+  const cls = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), sourceJobs, owners: owners.slice(1) });
+  assert.equal(cls.disposition, "terminal-refuse");
+  assert.ok(cls.assessment.problems.includes("owner-coverage-missing"));
+});
+
+test("G5. a terminal cycle whose only jobs are UNRELATED (Ads/FBA) can never satisfy the OLI assessment -> terminal-refuse; the classifier only ever looks at order-line-items", () => {
+  const cls = classifyScheduledOliCycle({
+    bucket: "us", cycle: { id: "c", status: "partial" }, discoveredAccounts: accountsN(8),
+    sourceJobs: [
+      { source_key: "ads-asin-date", request_hash: "a", fetch_status: "succeeded", create_export_count: 1 },
+      { source_key: "fba-inventory-health", request_hash: "f", fetch_status: "succeeded", create_export_count: 1 },
+    ],
+    owners: [{ request_hash: "a", account_id: acct(1) }],
+  });
+  assert.equal(cls.disposition, "terminal-refuse");
+  assert.ok(cls.assessment.problems.includes("no-oli-jobs"), "Ads/FBA jobs are not OLI and never adopt the cycle");
 });
 
 // ---- run ----

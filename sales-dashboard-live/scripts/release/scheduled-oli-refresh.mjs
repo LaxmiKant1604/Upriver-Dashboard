@@ -25,9 +25,9 @@ if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must 
 if (asOf != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
 
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
-const { getSyncSourceJobs, getSyncSourceJobOwnersForCycle } = await import("../../lib/server/supabase.js");
+const { getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSyncCycleByBucketDate } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY } = await import("../../lib/server/sync/source-durable-model.js");
-const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { assessScheduledOliCycle, classifyScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
 
 const OLI = OLI_SOURCE_KEY;
 // A LONG operator deadline for the CI job (the workflow allots >=90 min); overridable for tests/ops. MAX_ITERS is
@@ -47,6 +47,39 @@ const discovered = (preflight.accounts || [])
   .filter((a) => a.accountId && !a.accountId.includes(":"));
 if (!discovered.length) { console.error("STOP no discovered primary accounts for bucket " + bucket); process.exit(1); }
 log("preflight ok: " + discovered.length + " primary accounts; running order-line-items only");
+
+// CYCLE-IDENTITY PRE-CHECK (before any create): the scheduled OLI run uses the (bucket, today) cycle. If a cycle
+// already exists for today, classify it -- a running/absent cycle runs OLI; an ALREADY-COMPLETE scheduled OLI
+// cycle is an idempotent same-day replay (zero re-fetch); a TERMINAL cycle that is NOT a completed OLI run (e.g.
+// a same-date catalog / priority-release cycle) is a typed refusal, so the run never appends OLI to a terminal
+// cycle nor assesses an unrelated cycle as its own. getSyncCycleByBucketDate fails closed on >1 cycle for the
+// (bucket, date) -- a typed ambiguous-cycle refusal.
+const today = String(preflight.today || "");
+if (!today) { console.error("STOP SCHEDULED_OLI_NO_CYCLE_DATE: preflight returned no cycle date"); process.exit(1); }
+let existingCycle = null;
+try {
+  existingCycle = await getSyncCycleByBucketDate(bucket, today);
+} catch (e) {
+  console.error("STOP SCHEDULED_OLI_AMBIGUOUS_CYCLE: more than one " + bucket + " cycle for " + today + " (cycle identity is ambiguous; refusing before any create): " + (e && e.message ? e.message : e));
+  process.exit(1);
+}
+if (existingCycle && existingCycle.id) {
+  const existingJobs = await getSyncSourceJobs(existingCycle.id);
+  const existingOwners = await getSyncSourceJobOwnersForCycle(existingCycle.id);
+  const cls = classifyScheduledOliCycle({ bucket, cycle: existingCycle, discoveredAccounts: discovered, sourceJobs: existingJobs, owners: existingOwners });
+  const cid8 = String(existingCycle.id).slice(0, 8);
+  if (cls.disposition === "terminal-refuse" || cls.disposition === "refuse") {
+    const why = cls.assessment ? [...new Set(cls.assessment.problems.map((p) => String(p).split(":")[0]))].join(",") : cls.reason;
+    console.error("STOP SCHEDULED_OLI_TERMINAL_CYCLE: the " + today + " " + bucket + " cycle " + cid8 + " is terminal (" + String(existingCycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "). Refusing to append OLI to a terminal cycle / assess an unrelated cycle as its own -- ZERO creates. A fresh cycle date (a later day) is required; the rolling window recovers any missed dates.");
+    process.exit(1);
+  }
+  if (cls.disposition === "idempotent-complete") {
+    log("idempotent: the " + today + " " + bucket + " cycle " + cid8 + " already holds a COMPLETE scheduled OLI run (" + cls.assessment.batches + " batches, " + cls.assessment.creates + " creates, " + cls.assessment.tokens + " tokens); no re-fetch, ZERO new creates.");
+    process.exit(0);
+  }
+  // disposition "run": a RUNNING cycle -> continue OLI below.
+  log("cycle " + cid8 + " is running; continuing OLI on it.");
+}
 
 let cycleId = null;
 let iter = 0;

@@ -116,3 +116,30 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
     ceilingTokens: plan.maxTokens,
   };
 }
+
+/**
+ * Classify the EXISTING (bucket, today) cycle BEFORE a scheduled OLI run touches it, so the run never assesses an
+ * unrelated cycle as its own, never appends work to a terminal cycle, and never fabricates owner coverage. Given
+ * the cycle row (or null) plus its source jobs + owners, returns one of:
+ *   - { disposition: "run" }               -- no cycle OR a running cycle: run OLI normally (create/continue).
+ *   - { disposition: "idempotent-complete", assessment }
+ *                                          -- a TERMINAL cycle that is ALREADY a COMPLETE scheduled OLI run for the
+ *                                             discovered accounts (a genuine same-day replay): accept, ZERO creates.
+ *   - { disposition: "terminal-refuse", assessment }
+ *                                          -- a TERMINAL cycle that is NOT a completed OLI run (e.g. a same-date
+ *                                             catalog/priority-release cycle): a typed refusal BEFORE any create.
+ *   - { disposition: "refuse", reason }    -- an unexpected cycle status: fail closed.
+ * It NEVER weakens assessScheduledOliCycle -- the terminal cycle is adopted ONLY when that strict assessment
+ * (over the cycle's OLI jobs, open=0) passes.
+ */
+export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, sourceJobs, owners } = {}) {
+  if (!cycle || !nb(cycle.id)) return { disposition: "run", reason: "no-cycle" };
+  const status = S(cycle.status ?? cycle.cycleStatus);
+  if (status === "running") return { disposition: "run", reason: "running-cycle" };
+  if (status !== "succeeded" && status !== "partial") return { disposition: "refuse", reason: "unexpected-cycle-status:" + status };
+  // TERMINAL cycle: adopt it ONLY if it is a COMPLETE scheduled OLI run (its OLI jobs pass the strict assessment).
+  const oliJobs = (Array.isArray(sourceJobs) ? sourceJobs : []).filter((j) => S(j.source_key ?? j.sourceKey) === OLI_SOURCE_KEY);
+  const assessment = assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs: oliJobs, owners, open: 0 });
+  if (assessment.ok) return { disposition: "idempotent-complete", assessment, cycleStatus: status };
+  return { disposition: "terminal-refuse", reason: "terminal-cycle-not-a-completed-oli-run", assessment, cycleStatus: status };
+}
