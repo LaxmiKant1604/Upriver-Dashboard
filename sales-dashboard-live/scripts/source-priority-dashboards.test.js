@@ -37,7 +37,7 @@ const TODAY = "2026-08-20";
 const ASOF = "2026-08-19";
 const TS = "2026-08-19T10:00:00.000Z";
 
-let priorityMod; let planMod; let brandView; let pubComposition; let reportStore; let supabaseMod; let releaseRunner; let publisherCore; let reportDerivation; let controlPkg; let cleanupMod;
+let priorityMod; let planMod; let brandView; let pubComposition; let reportStore; let supabaseMod; let releaseRunner; let publisherCore; let reportDerivation; let controlPkg; let cleanupMod; let redateMod;
 
 /* ---- a FAITHFUL fake of the OPERATION-WIDE durable reservation table (PK = operation_key alone) ---- */
 function makeFakeReservation() {
@@ -1077,12 +1077,158 @@ test("P13f. fails closed on a bad mode / missing store / blank cycleId", async (
   await assert.rejects(() => cleanupMod.runFailedCycleCleanupTransaction({ store: makeCleanupStore(benignCycle()), cycleId: "", mode: "dry-run" }), /exact cycleId/);
 });
 
+/* ===================== P14. the reviewed cycle-date re-date (collision unblock; DATE-exact) ===================== */
+group("P14. re-date collision: DATE-string exact PRE/POST; dry-run; only cycle_date changes; every mismatch refuses");
+function redateBundle(over = {}) {
+  const base = {
+    cycle: { id: "481fe35c-ce65-455f-b317-cc267977e185", bucket: "non-us", cycleDateText: "2026-08-24", status: "partial", trigger: "manual", finishedAtNonNull: true, createdUtcDate: "2026-08-16", counters: { sourceTotal: 130, sourceSucceeded: 90, sourceFailed: 40, reportTotal: 13, reportSucceeded: 3, reportFailed: 10 } },
+    counts: { sourceJobs: 130, owners: 170, reportJobs: 13, validatedReportJobs: 3 },
+    v2LineageCount: 0, targetSlotCount: 0, nonUsAtCurrentCount: 1,
+    controls: { allPrimary: false, cron: false, enabledRollout: 0, enabledDispatch: 0, enabledPromoted: 0, approvedCount: 0 },
+    reservations: { v1: { status: "reserved", tokens: 0, hasExport: false }, v2: { status: "created", tokens: 2, hasExport: true } },
+    digests: { live_snapshots: { c: 183, h: "a" }, shadow_snapshots: { c: 48, h: "b" }, rollout: { c: 30, h: "c" }, mode: { c: 1, h: "d" }, approvals: { c: 90, h: "e" }, settings: { c: 13, h: "f" }, sync_cycles: { c: 25, h: "g1" }, report_jobs: { c: 191, h: "hh" } },
+  };
+  return { ...base, ...over };
+}
+function makeRedateStore(bundle, opts = {}) {
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  let state = clone(bundle);
+  let snapshot = null;
+  const calls = { begin: 0, commit: 0, rollback: 0, update: 0 };
+  return {
+    _calls: calls, _state: () => state,
+    begin: async () => { calls.begin += 1; snapshot = clone(state); if (opts.mutateOnLock) opts.mutateOnLock(state); },
+    commit: async () => { calls.commit += 1; if (opts.failCommit) throw new Error("commit ack lost"); snapshot = null; },
+    rollback: async () => { calls.rollback += 1; if (opts.failRollback) throw new Error("rollback failed"); if (snapshot) state = clone(snapshot); },
+    readEvidence: async () => clone(state),
+    update: async () => {
+      calls.update += 1;
+      if (opts.updateRowCount !== undefined) return opts.updateRowCount; // simulate wrong rowCount (state unchanged)
+      // the REAL guarded UPDATE moves only cycle_date; the current slot empties; ONLY the sync_cycles digest hash
+      // changes (its row COUNT stays identical).
+      state.cycle.cycleDateText = "2026-08-16";
+      state.nonUsAtCurrentCount = 0;
+      state.digests = { ...state.digests, sync_cycles: { c: state.digests.sync_cycles.c, h: state.digests.sync_cycles.h + "!" } };
+      if (opts.mutateChildOnUpdate) opts.mutateChildOnUpdate(state); // simulate an over-broad update
+      return 1;
+    },
+  };
+}
+const runRedate = (store, mode) => redateMod.runRedateCollisionTransaction({ store, mode });
+
+test("P14a. dry-run performs ZERO writes and confirms the exact collision", async () => {
+  const store = makeRedateStore(redateBundle());
+  const r = await runRedate(store, "dry-run");
+  assert.equal(r.dryRun, true); assert.equal(r.code, 0); assert.deepEqual(r.problems, []);
+  assert.deepEqual(store._calls, { begin: 0, commit: 0, rollback: 0, update: 0 }, "dry-run writes nothing");
+});
+test("P14b. --apply moves ONLY cycle_date to the target and COMMITS; records the new sync_cycles digest", async () => {
+  const store = makeRedateStore(redateBundle());
+  const r = await runRedate(store, "apply");
+  assert.equal(r.committed, true); assert.equal(r.code, 0);
+  assert.equal(store._state().cycle.cycleDateText, "2026-08-16");
+  assert.equal(store._state().nonUsAtCurrentCount, 0);
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0, update: 1 });
+  assert.ok(r.syncCyclesDigest && r.syncCyclesDigest.c === 25, "the new sync_cycles digest is recorded (row count identical)");
+});
+test("P14c. DATE is compared as YYYY-MM-DD; a timestamp / Date serialization is REJECTED (never new Date().toISOString())", async () => {
+  assert.equal(redateMod.isPlainIsoDate("2026-08-24"), true);
+  for (const bad of ["2026-08-23T18:30:00.000Z", "2026-08-24T00:00:00", "2026-8-4", "20260824", "", null, new Date().toISOString()]) assert.equal(redateMod.isPlainIsoDate(bad), false, "rejects " + bad);
+  const store = makeRedateStore(redateBundle({ cycle: { ...redateBundle().cycle, cycleDateText: "2026-08-23T18:30:00.000Z" } }));
+  const r = await runRedate(store, "dry-run");
+  assert.equal(r.code, 1); assert.ok(r.problems.some((p) => /cycle-date-not-plain-iso/.test(p)), JSON.stringify(r.problems));
+});
+test("P14d. a missing / wrong cycle refuses (id / bucket / status / trigger / finished_at / created_at)", async () => {
+  const cases = [
+    [{ cycle: null }, /cycle-not-found/],
+    [{ cycle: { ...redateBundle().cycle, id: "00000000-0000-0000-0000-000000000000" } }, /wrong-cycle-id/],
+    [{ cycle: { ...redateBundle().cycle, bucket: "us" } }, /wrong-bucket/],
+    [{ cycle: { ...redateBundle().cycle, cycleDateText: "2026-08-16" } }, /cycle-date-not-current-slot/],
+    [{ cycle: { ...redateBundle().cycle, status: "succeeded" } }, /status-not-expected/],
+    [{ cycle: { ...redateBundle().cycle, trigger: "scheduled" } }, /trigger-not-manual/],
+    [{ cycle: { ...redateBundle().cycle, finishedAtNonNull: false } }, /finished_at-null/],
+    [{ cycle: { ...redateBundle().cycle, createdUtcDate: "2026-08-24" } }, /created_at-not-historical/],
+  ];
+  for (const [over, re] of cases) {
+    const r = await runRedate(makeRedateStore(redateBundle(over)), "dry-run");
+    assert.equal(r.code, 1); assert.ok(r.problems.some((p) => re.test(p)), re + " -> " + JSON.stringify(r.problems));
+  }
+});
+test("P14e. wrong child counts refuse", async () => {
+  for (const [k, re] of [["sourceJobs", /source-jobs-count/], ["owners", /owners-count/], ["reportJobs", /report-jobs-count/], ["validatedReportJobs", /validated-report-jobs-count/]]) {
+    const b = redateBundle(); b.counts[k] = b.counts[k] - 1;
+    const r = await runRedate(makeRedateStore(b), "dry-run");
+    assert.equal(r.code, 1); assert.ok(r.problems.some((p) => re.test(p)), k);
+  }
+});
+test("P14f. an OCCUPIED target date refuses (no other non-us cycle may already sit on the target)", async () => {
+  const r = await runRedate(makeRedateStore(redateBundle({ targetSlotCount: 1 })), "dry-run");
+  assert.equal(r.code, 1); assert.ok(r.problems.some((p) => /target-slot-occupied/.test(p)));
+});
+test("P14g. UNEXPECTED v2 lineage in the cycle refuses", async () => {
+  const r = await runRedate(makeRedateStore(redateBundle({ v2LineageCount: 1 })), "dry-run");
+  assert.equal(r.code, 1); assert.ok(r.problems.some((p) => /v2-lineage-present/.test(p)));
+});
+test("P14h. rowCount != 1 refuses and rolls back (never partial)", async () => {
+  for (const rc of [0, 2]) {
+    const store = makeRedateStore(redateBundle(), { updateRowCount: rc });
+    const r = await runRedate(store, "apply");
+    assert.equal(r.code, 1); assert.ok(/row-count-not-1/.test(r.problem), JSON.stringify(r));
+    assert.deepEqual(store._calls, { begin: 1, commit: 0, rollback: 1, update: 1 });
+  }
+});
+test("P14i. a POST-state mismatch (the update did not land) rolls back", async () => {
+  const store = makeRedateStore(redateBundle(), { updateRowCount: 1, /* but state unchanged -> post cycle_date still current */ });
+  const r = await runRedate(store, "apply");
+  assert.equal(r.code, 1); assert.ok(/post-cycle-date-not-target|current-slot-still-has-nonus/.test(r.problem), JSON.stringify(r));
+  assert.equal(store._calls.rollback, 1);
+});
+test("P14j. an over-broad update that changes a CHILD count rolls back once (only cycle_date may change)", async () => {
+  const store = makeRedateStore(redateBundle(), { mutateChildOnUpdate: (s) => { s.counts.owners = 169; } });
+  const r = await runRedate(store, "apply");
+  assert.equal(r.code, 1); assert.ok(/child-count-changed/.test(r.problem), JSON.stringify(r));
+  assert.deepEqual(store._calls, { begin: 1, commit: 0, rollback: 1, update: 1 });
+});
+test("P14k. an over-broad update that changes an UNRELATED protected digest rolls back", async () => {
+  const store = makeRedateStore(redateBundle(), { mutateChildOnUpdate: (s) => { s.digests = { ...s.digests, live_snapshots: { c: 183, h: "MUTATED" } }; } });
+  const r = await runRedate(store, "apply");
+  assert.equal(r.code, 1); assert.ok(/protected-digest-changed:live_snapshots/.test(r.problem), JSON.stringify(r));
+});
+test("P14l. COMMIT_UNKNOWN: a lost commit ack returns code 3, does NOT rollback, demands read-only reconciliation", async () => {
+  const store = makeRedateStore(redateBundle(), { failCommit: true });
+  const r = await runRedate(store, "apply");
+  assert.equal(r.code, 3); assert.equal(r.commitUnknown, true); assert.match(r.instruction, /READ-ONLY reconciliation/i);
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0, update: 1 }, "attempted commit; NO rollback");
+});
+test("P14m. success changes ONLY cycle_date + the sync_cycles digest hash; ALL child/reservation/control state is byte-identical", async () => {
+  const before = redateBundle();
+  const store = makeRedateStore(before);
+  const r = await runRedate(store, "apply");
+  assert.equal(r.committed, true);
+  const after = store._state();
+  assert.deepEqual(after.counts, before.counts, "child counts unchanged");
+  assert.deepEqual(after.cycle.counters, before.cycle.counters, "counters unchanged");
+  assert.deepEqual(after.reservations, before.reservations, "reservations unchanged");
+  assert.deepEqual(after.controls, before.controls, "controls unchanged");
+  for (const k of ["live_snapshots", "shadow_snapshots", "rollout", "mode", "approvals", "settings", "report_jobs"]) assert.deepEqual(after.digests[k], before.digests[k], k + " digest unchanged");
+  assert.equal(after.digests.sync_cycles.c, before.digests.sync_cycles.c, "sync_cycles row count unchanged");
+  assert.notEqual(after.digests.sync_cycles.h, before.digests.sync_cycles.h, "sync_cycles digest hash changed");
+});
+test("P14n. controls-not-safe-closed and wrong v1/v2 reservation refuse; bad mode / missing store fail closed", async () => {
+  assert.equal((await runRedate(makeRedateStore(redateBundle({ controls: { allPrimary: false, cron: false, enabledRollout: 1, enabledDispatch: 0, enabledPromoted: 0, approvedCount: 0 } })), "dry-run")).problems.some((p) => /controls-not-safe-closed/.test(p)), true);
+  assert.equal((await runRedate(makeRedateStore(redateBundle({ reservations: { v1: { status: "created", tokens: 2, hasExport: true }, v2: { status: "created", tokens: 2, hasExport: true } } })), "dry-run")).problems.some((p) => /v1-reservation-not-exact/.test(p)), true);
+  assert.equal((await runRedate(makeRedateStore(redateBundle({ reservations: { v1: { status: "reserved", tokens: 0, hasExport: false }, v2: { status: "reserved", tokens: 0, hasExport: false } } })), "dry-run")).problems.some((p) => /v2-reservation-not-exact/.test(p)), true);
+  await assert.rejects(() => redateMod.runRedateCollisionTransaction({ store: makeRedateStore(redateBundle()), mode: "delete" }), /apply.*dry-run/);
+  await assert.rejects(() => redateMod.runRedateCollisionTransaction({ store: null, mode: "dry-run" }), /store/);
+});
+
 async function main() {
   out("priority dashboards release proof suite");
   priorityMod = await import("../lib/server/sync/source-priority-dashboards.js");
   releaseRunner = await import("../lib/server/sync/source-priority-release-runner.js");
   controlPkg = await import("../lib/server/sync/source-priority-control-package.js");
   cleanupMod = await import("../lib/server/sync/source-failed-cycle-cleanup.js");
+  redateMod = await import("../lib/server/sync/source-redate-cycle-collision.js");
   planMod = await import("../lib/server/sync/source-bucket-sync.js");
   brandView = await import("../lib/server/reports/brand-view.js");
   pubComposition = await import("../lib/server/sync/publisher-composition.js");
