@@ -11512,3 +11512,59 @@ Dispatching/observing the GitHub run still needs the user (no gh CLI / GitHub to
 FUTURE-dated running non-us recovery cycles exist at 2026-08-29 (768eb243, 10 OLI jobs) + 2026-08-30 (15d1f749,
 17 OLI jobs) -- a scheduler run landing on those exact dates would CONTINUE them (may not owner-cover all 22);
 left untouched per the no-mutation rule. Code+docs pushed to origin/main.
+
+## Scheduler-v2 end-to-end hardening (10 phases) -- 2026-08-24 (code 5835ae7 + docs; verify 58/58)
+
+PHASE 1 read-only reconciliation FOUND MORE than expected: SIX future-dated Non-US cycles occupy scheduler slots
+2026-08-25..30 (not 2). 08-25 d8c83cf6 / 08-26 09f7f742 / 08-27 f061aa95 / 08-28 87819e6b = partial full-drain
+TEST cycles (created 08-16, mixed source keys, ~130 src jobs each); 08-29 768eb243 / 08-30 15d1f749 = running
+OLI-recovery cycles (created 08-23). With the terminal-cycle fix the 4 partial cycles make a scheduled run
+SAFELY REFUSE on those dates and the 2 running cycles take the run path -> all 6 are deterministic failures on
+08-25..30; first unoccupied Non-US slot = 2026-08-31. Reconciliation otherwise clean (30/8/22 accounts; no
+pg_cron/Vercel cron; all_primary=false; controls safe-closed; source_controls enables only OLI+Catalog+ASIN Ads;
+Campaign Ads/FBA off). USER DECISION (AskUserQuestion): "Archive all 6". US 08-24 = the terminal go-live catalog
+cycles (untouched).
+
+PHASE 2 fixed-identity archival tool (source-archive-collision-cycles.js + scripts/release/archive-collision-cycles.mjs,
+dry-run default; advisory lock [20260831,6]): moves ONLY sync_cycles.cycle_date for the 6 FROZEN ids to 6 FROZEN
+free Jan-2026 dates (08-25->01-02, 08-26->01-03, 08-27->01-04, 08-28->01-05, 08-29->01-06, 08-30->01-07) after
+proving each EXACT PRE (bucket/date/status/trigger + exact source-job/owner/report-job counts + target free +
+controls closed) and EXACT POST (each at target, originals free, child rows byte-identical, sync_cycles row count
+unchanged, protected tables report_snapshots/rollout/mode/approvals/settings/source_controls/promoted/OLI-history/
+Ads-history/ads_sync_coverage byte-identical). No delete/reset; COMMIT_UNKNOWN never rolls back. DRY-RUN CONFIRMED
+the exact 6-cycle set in prod. APPLY is Phase 10 (after push).
+
+PHASE 3 US<-Non-US gate (source-scheduled-prerequisites.js + verify-scheduled-prerequisites.mjs): read-only proof
+that a SAME-asOf Non-US run left all 22 accounts ready (gapless OLI through asOf, nonblank provenance, complete
+21-day ASIN-Ads coverage, no failed/open work, exact owner isolation, a completed (non-us, asOf+1) OLI cycle).
+Runs FIRST in the US job before token gate/creates/controls; incomplete Non-US stops US before any create/control.
+Read-only run for asOf=2026-08-23 correctly reported NOT ready (OLI 0/22 through 08-23; the 08-24 cycle has no OLI).
+
+PHASE 4 token gate (datadoe-usage.tokenGateDecision + confirm-token-budget.mjs): exact per-run ceilings Non-US 20
+/ US 10; unreadable balance HARD-fails; readable-but-insufficient = TYPED SAFE SKIP SKIPPED_INSUFFICIENT_TOKENS
+(proceed=false -> no creates, no controls, LKG unchanged, visibly reported); never a diagnostic export / top-up
+inference; GitHub summary+output; low-balance warning (<90; balance 84 funds < 3 worst-case days).
+
+PHASE 5/6 identity/replay + recovery: existing classifyScheduledOliCycle/assessScheduledOliCycle/coverage-mode
+already enforce the invariants (terminal never appended; replay only on a proven-complete cycle; zero-jobs never
+pass; >1 cycle fails before DataDoe; create<=1/hash via one-attempt claim + makeDurableCatalogGuard + coverage
+budget; export_id resume; no-retry; LKG-on-failure; failed source blocks publish + always safe-close). New
+read-only scheduled-cycle-preflight.mjs fails a same-date terminal collision EARLY. assessScheduledOliCycle
+UNCHANGED. Residual: invariant #9 (bind to exact planned request hashes per asOf) is satisfied for normal
+operation by the deterministic workflow asOf + owner-coverage binding + today's-cycle binding + the archival that
+removes the observed cross-asOf recovery cycles; a request-hash binding is a documented future enhancement for
+manual multi-asOf same-date runs.
+
+PHASE 7 workflow: secrets -> resolve(+per-run min) -> npm ci -> cycle preflight -> (US) prove Non-US completion ->
+token gate -> OLI -> ASIN Ads -> (Non-US) post-run proof / (US) open controls -> release -> membership -> ALWAYS
+safe-close. All create/control steps gated on the token-gate proceed output; timeout 180m; one concurrency group,
+cancel-in-progress=false, single schedule; Campaign Ads/FBA structurally absent; missing secrets fail before I/O.
+
+PHASE 8 regressions (scheduler-v2-automation.test.js E4/H0-5/I1-2 + D2 rewrite): archival dry-run/apply + wrong-PRE
+refusal + idempotency; Non-US-incomplete->US-blocked / complete->ready; exact 20/10 gates; low/unreadable balance
+-> zero creates; missing-owner/extra-account refusal; workflow exact order + single schedule. verify 58/58 across
+38 suites; git diff --check clean.
+
+PENDING (unchanged external constraint): the two fresh-date GitHub runs still need the user (secrets configured,
+but no gh CLI/token here to dispatch/observe). First fresh Non-US slot after archival = 2026-08-25. State: main @
+5835ae7 (code) + docs.
