@@ -998,7 +998,7 @@ function benignCycle() {
     sourceJobs: [{ source_key: "product-catalog", fetch_status: "failed", terminal: true, export_id: null, error_stage: "create-export", create_export_count: 1 }],
     owners: [{ request_hash: "h", account_id: ORG_SCOPE }],
     reportJobs: [],
-    budgets: [{ tranche_key: "source-sync:product-catalog", spent_creates: 1, spent_tokens: 0 }],
+    budgets: [{ tranche_key: "source-sync:product-catalog", spent_creates: 1, spent_tokens: 2 }], // reserved the one (failed) create's cost -- no REAL token spent (export_id null)
     snapshotCount: 0,
   };
 }
@@ -1038,7 +1038,7 @@ test("P13b. EVERY footprint mismatch is refused with ZERO writes (dry-run AND ap
     ["report jobs present", (c) => { c.reportJobs.push({ report_key: "daily-reporting", validated: false }); }, /has-report-jobs/],
     ["a non-org owner", (c) => { c.owners[0].account_id = "A01"; }, /owner-not-org-scope/],
     ["a stray snapshot", (c) => { c.snapshotCount = 3; }, /has-snapshots/],
-    ["a recorded token spend", (c) => { c.budgets[0].spent_tokens = 2; }, /budget-recorded-token-spend/],
+    ["more than one recorded create", (c) => { c.budgets[0].spent_creates = 2; }, /budget-multiple-creates/],
     ["wrong error stage", (c) => { c.sourceJobs[0].error_stage = "poll"; }, /error-stage-not-create-export/],
   ];
   for (const [name, mut, re] of mutations) {

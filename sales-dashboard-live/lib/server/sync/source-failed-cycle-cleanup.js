@@ -57,9 +57,10 @@ export function assessFailedCatalogCycle(cycleId, snap, { organizationScopeKey }
 
   const budgets = Array.isArray(snap.budgets) ? snap.budgets : [];
   for (const b of budgets) {
-    // A budget row for THIS cycle's Catalog family is part of the footprint; but it must never record a REAL
-    // spent create/token beyond the single attempted (and failed) create.
-    if (Number(b.spent_tokens ?? b.spentTokens ?? 0) > 0) P.push("budget-recorded-token-spend");
+    // A budget row for THIS cycle's Catalog family is part of the footprint. It legitimately RESERVED the one
+    // attempted create's cost BEFORE the create ran, so spent_creates/spent_tokens reflect that single reserved
+    // attempt (>1 create would be suspicious). The AUTHORITATIVE zero-REAL-token-spend proof is the absent
+    // export id above (no export => no DataDoe token) plus the operation reservation staying at tokens_spent=0.
     if (Number(b.spent_creates ?? b.spentCreates ?? 0) > 1) P.push("budget-multiple-creates");
   }
   return P;
