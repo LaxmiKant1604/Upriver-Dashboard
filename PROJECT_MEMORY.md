@@ -11248,3 +11248,40 @@ paused, promoted disabled, all approvals revoked, all_primary false, no cron). T
 design, so a deliberate manual DELETE of the single source_priority_catalog_reservation row (plus, ideally, a
 code fix distinguishing a clean HTTP-400 failure from a commit-unknown) is required first. Scheduler stays OFF.
 See [[scheduler-v2-golive-status]].
+
+## Catalog request FIXED + versioned priority-dashboards/v2 -- 2026-08-24 (code 70f218c + e459ceb + docs separate; NOT pushed)
+
+Root-caused + fixed the live Product Catalog HTTP 400 that blocked the go-live. DataDoe confirmed Product Catalog
+68d2de238e is organization-wide, REQUIRES a nonblank sellerOrVendorIds (one carrier seller does NOT filter the
+org-wide result), REJECTS an empty array / from-to / an unsupported `sku` column. Offline green; NOT pushed yet.
+
+- resolvedDurableCatalog (source-bucket-sync.js): now sends ONE deterministic carrier seller (ids:[carrier]),
+  NO from/to, and only the four supported columns [child_asin,parent_asin,product_name,product_brand] (DROPPED
+  sku from DURABLE_CATALOG_COLUMNS). selectCatalogCarrierSeller picks the carrier from the FULL fresh primary
+  directory (sorted-first, primary-only, canonical nonblank), identical for US + Non-US => ONE canonical request
+  hash / owner / reservation / create; missing/secondary/noncanonical carrier fails closed BEFORE reservation/
+  create. Threaded catalogCarrierSeller through planBucketSourceSync + runBucketSourceSync + the runtime
+  (discoverBucketAccounts/preflightEvidence/run). Omitting from/to makes the hash DATE-INDEPENDENT (midnight
+  drift ADOPTS the one reservation, still one create/two tokens; F12d updated).
+- Operation key PRIORITY_DASHBOARDS.operationKey = "priority-dashboards/v2" (its own immutable hash + one-create/
+  two-token reservation). The failed v1 reservation is a DISTINCT key, never touched; Migration 9 already keys by
+  operation_key (no migration change; SHA daf1997a UNCHANGED).
+- SKU fallback reworked off durable OLI: buildBrandMaps(catalogRows, oliRows) -> byAsin from catalog + skuToAsin
+  from OLI (unique) + bySku = compose (unique SKU->child_asin->one-brand); ASIN first priority; ambiguous/
+  conflicting unmapped; never fabricates "Unassigned". (The ACTIVE priority derive uses orderSalesByBrand,
+  ASIN-only, so dropping catalog sku does not change it.)
+- DataDoe error classification (source-worker.js classifyFetchError + sanitizeErrorDetail): DEFINITIVE HTTP 4xx
+  (except 408/429) terminal, never an ambiguous/successful create; 408/429/5xx/timeout/network ambiguity
+  transient/resumable (reservation governs resume, never a 2nd create); a bounded SANITIZED body snippet captured
+  for operator evidence (URLs/keys/ids/emails/secrets redacted; the fixed message never carries the raw body).
+- Failed-cycle cleanup (source-failed-cycle-cleanup.js + scripts/release/cleanup-failed-priority-cycle.mjs):
+  dry-run default; --apply deletes ONLY the exact benign failed-Catalog cycle footprint (advisory-locked, exact
+  PRE/POST, COMMIT_UNKNOWN exit 3), NEVER the v1 reservation/snapshots/OLI/controls. PRIORITY_CLEANUP_CYCLE_ID
+  = the exact failed v1 US cycle uuid.
+
+Tests: P2c(v2) + P3d-h(carrier) + P13(cleanup) in source-priority-dashboards.test.js (88); F12d (date-independent);
+brand F1-F5 (OLI SKU fallback + multi-account/conflicting); classifyFetchError + redaction (sync-signals); verify
+57/37 GREEN; git diff --check clean. Commits 70f218c (catalog/carrier/SKU/errors) + e459ceb (cleanup). NEXT:
+production -- stage-9 reconcile -> prove v1 reservation + failed cycle -> cleanup (dry-run then apply) -> push
+once -> deploy -> apply controls -> run v2 release (US then Non-US, <=2 tokens) -> verify live/frontend ->
+safe-close. See [[scheduler-v2-golive-status]].
