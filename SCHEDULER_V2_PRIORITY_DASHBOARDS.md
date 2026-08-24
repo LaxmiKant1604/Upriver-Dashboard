@@ -155,18 +155,24 @@ duplicated in the CLI.
 `publishAccount` publishes `daily-reporting`, `brand-sales`, `brand-inventory` — **brand-sales before
 brand-inventory** — through the real publisher's four durable gates + validated-job + terminal-cycle +
 exact-shadow-identity + payload-contract + CAS write, carrying each result's exact live identity
-(`liveReportKey` + `paramsHash`). The runner then reads each live snapshot back by that **exact** identity
+(`liveReportKey` + `paramsHash`). The runner validates the publish acknowledgement with the **same strictness**
+as the preflight (a shared `threeResultProblems`): the account echoes, EXACTLY the frozen three keys (unique — no
+missing/extra/duplicate/unknown/malformed/non-array), each with an accepted disposition (`published` /
+`already-current`) AND a nonblank live identity. Success additionally **requires**
+`published.length === provenAccountCount × 3`, so a `results=[]` (or any short/malformed) acknowledgement can
+**never** return code 0. The runner then reads each live snapshot back by that **exact** identity
 (`buildLiveReadback`). Identity is proven from the **row columns** `report_key` + `account_id` (the published
 live params carry **no** `accountId`); the stored params carry the exact live version + contract-derived live
 params and **re-derive** `paramsHash` (a mutated-after-save row fails provenance); nonblank refresh, storage-first
 payload, and the real frontend payload contract. This module never enables a control or an approval, never sets
 `all_primary`, and never enables the scheduler.
 
-## 6. Prepared publication control package (`buildPriorityControlPackage` + `runControlPackageTransaction`)
+## 6. Publication control package (`buildPriorityControlPackage` + `runControlPackageTransaction` + `runControlPackageCli`)
 
 `lib/server/sync/source-priority-control-package.js` computes the EXACT global target control state (builder) and
 runs it as **one guarded, advisory-locked transaction** (`runControlPackageTransaction`, all gate logic here —
-never duplicated in the CLI); `scripts/release/priority-control-package.mjs` drives it through a pg-backed store
+never duplicated in the CLI); `runControlPackageCli` orchestrates one operation with every side effect injected,
+and `scripts/release/priority-control-package.mjs` is a thin wrapper wiring a pg-backed store + DataDoe discovery
 (dry-run default; `--apply` / `--rollback`).
 
 - **Apply** actively **produces exactly** the target — enabling the rollout/dispatch/promoted/approval rows and
@@ -174,27 +180,39 @@ never duplicated in the CLI); `scripts/release/priority-control-package.mjs` dri
   filtering unexpected rows away): the enabled rollout set = exactly the primary accounts; enabled dispatch =
   exactly `daily-reporting` + `brand-sales` (every other controlled report paused); enabled promoted = exactly
   `brand-inventory`; approved = exactly the three keys × every account; `all_primary` false; no cron.
-- **Rollback** is a documented **safe-close** (not a rediscovered blind restoration): it disables **every**
-  rollout row, pauses **all 13** controlled settings, disables **every** promoted control, and revokes **every**
-  approval — complete and correct regardless of what discovery returns at rollback time — and verifies that
-  end state before COMMIT.
-- Any PRE/POST mismatch rolls the **whole** transaction back (no partial write survives). `P12` drives the
-  transaction through a fake store (extra rollout/approval reconciled or rolled back, changed discovery between
-  apply/rollback, PRE violations, rollback completeness, transaction rollback on every mismatch).
+- **Rollback** is a documented **safe-close** (not a rediscovered blind restoration) that is **discovery-
+  independent**: it needs **no** account list and makes **zero** DataDoe calls (it works even if DataDoe is
+  down — `buildPrioritySafeClosePackage`), disabling **every** rollout row, pausing **all 13** controlled
+  settings, disabling **every** promoted control, and revoking **every** approval, then verifying that closed
+  global state before COMMIT. Discovery is mandatory only for `--apply` / dry-run.
+- **Audited revocation:** every approval write — approving the target, reconciling away an extra approval on
+  apply, and the safe-close revocation — writes `approved=false/true`, `approved_by=<validated operator>`,
+  `approved_at=now()`. A blank/noncanonical operator is rejected **before BEGIN**.
+- **Honest COMMIT_UNKNOWN:** the transaction tracks its phase. A failure **before** the commit is attempted
+  performs exactly **one** rollback and returns an ordinary failure (exit 1). A lost/failed acknowledgement of
+  the commit **itself** returns typed **COMMIT_UNKNOWN** (exit **3**) with **no** rollback and **no** retry, and
+  demands a read-only reconciliation before any further apply/rollback/publish/retry. A rollback failure is
+  reported separately and never hides the original pre-commit error.
+- `P12` drives the transaction + CLI through a fake store: exact-global apply, safe-close, PRE/POST mismatch
+  rollback, successful-commit vs pre-commit-rollback vs COMMIT_UNKNOWN, audited apply/safe-close revocation +
+  audit-value restoration on failure, and the discovery-throws-but-`--rollback`-completes real-wiring case.
 
 ## Regressions
 
-- `scripts/source-priority-dashboards.test.js` (P1–P12, 59 assertions): the operation-wide durable Catalog guard
+- `scripts/source-priority-dashboards.test.js` (P1–P12, 76 assertions): the operation-wide durable Catalog guard
   (hash-mismatch / commit-unknown / concurrency / adoption); the allowlist + publish order; the 30-account plan
   (zero OLI/FBA jobs, one Catalog job/bucket); the composition wiring (build-time priority) + `finalizeBucket`
   cold/warm-first/**cross-bucket**/retry accept + the full refuse matrix incl. every token/reservation ambiguity;
   the Brand View inventory contract; the **real** publisher's `not-successful`→`published` and the **shared
   preflight**'s `not-successful`→`ready` (zero writes on any non-ready pair); `buildAccountBrandSlice`; the
   mocked-real reservation wrappers (strict validation); the strict runner (exits nonzero on every non-success,
-  warm-cache zero tokens, missing live identity, **strict preflight shape** P9m/n/o); the exact-identity
+  warm-cache zero tokens, missing live identity, **strict preflight AND publish shape** P9m–u incl. the pinned
+  `results=[]`-never-code-0 defect + the `published.length === accounts×3` requirement); the exact-identity
   `buildLiveReadback` (row report/account echoes, no fabricated `accountId`, omitted/wrong hash + provenance +
   dangling + contract fail, exact passes); the control-package builder (P11); and the guarded control
-  **transaction** (P12: exact-global apply, safe-close rollback, fail-closed rollback on every mismatch).
+  **transaction + CLI** (P12: exact-global apply, discovery-independent safe-close, PRE/POST mismatch rollback,
+  honest COMMIT_UNKNOWN exit 3, audited apply/safe-close revocation + restore-on-failure, discovery-throws-but-
+  `--rollback`-completes).
 - `scripts/source-production-hardening.test.js` (F11a–f, F12a–d, F13; 118 assertions): the real-runtime derive
   off durable OLI + Catalog; missing FBA → unavailable; fail-closed on missing provenance; ordinary callers
   cannot activate priority mode; the durable reservation with the real runtime + worker (cold/warm/cross-bucket/

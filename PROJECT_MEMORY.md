@@ -11183,3 +11183,35 @@ post-review production order: stage8 read-only reconcile -> review drift -> stag
 ro-prod-check 8 -> guarded Migration 9 apply -> ro-prod-check 9 -> push once -> verify exact Vercel deployment ->
 confirm >=2 tokens -> dry-run + apply controls -> run priority release -> verify live identities/API/frontend ->
 safe-close controls -> confirm no cron. Scheduler stays a separate later gate.
+
+## Priority release round 6 -- strict publish ack + honest COMMIT_UNKNOWN + discovery-independent safe-close + audited revocation -- 2026-08-24 (code 3bbda36 + docs separate; NOT pushed; NO migration change)
+
+Fixed the four FINAL code blockers before making Daily Reporting + Brand View live. Continues from HEAD 5b0bf47.
+Migration-9 SQL + SHA UNCHANGED (daf1997a...). See [[scheduler-v2-golive-status]].
+
+1. STRICT publication acknowledgement (runPriorityDashboardsRelease): publishAccount output validated as strictly
+   as preflight via a shared threeResultProblems() -- account id echo; results = array of EXACTLY the frozen 3
+   keys (unique, no missing/extra/duplicate/unknown/malformed/non-array); each with accepted disposition
+   (published/already-current) + exact reportKey + nonblank liveReportKey+paramsHash. Explicit pin: success needs
+   published.length === provenAccountCount*3, so results=[] (or any short/malformed) can NEVER return code 0
+   (P9p-u; P9p pins the results=[] defect).
+2. HONEST COMMIT_UNKNOWN (runControlPackageTransaction + CLI): explicit phase. Failure BEFORE commit -> exactly
+   ONE rollback -> ordinary failure code 1. Lost/failed commit ACK -> typed COMMIT_UNKNOWN code 3, NO rollback,
+   NO retry, prints "run read-only reconciliation before any further apply/rollback/publish/retry". Rollback
+   failure reported separately, never hides the original pre-commit error (P12j-m). CLI exits 3 on COMMIT_UNKNOWN.
+3. DISCOVERY-INDEPENDENT safe-close: new buildPrioritySafeClosePackage + runControlPackageCli. --rollback needs NO
+   account discovery + ZERO DataDoe calls (works if DataDoe is down); discovery mandatory only for apply/dry-run.
+   Safe-close disables every rollout, pauses all 13 controlled settings, disables every promoted, revokes every
+   approval, asserts the complete closed global sets. Real-wiring regression: discovery throws but --rollback
+   completes (P12r-t).
+4. AUDITED approval revocation: operator flows through revokeAllApprovals(operator); apply-time extra-approval
+   removal AND safe-close revocation both write approved=false, approved_by=<validated operator>, approved_at=now().
+   Blank/noncanonical operator rejected BEFORE begin. A later txn failure restores previous approved/audit values
+   (P12n-q).
+
+Tests: source-priority-dashboards.test.js P1-P12 (76) + source-production-hardening.test.js F11/F12/F13 (118) +
+schema-mutation (50) + release-selftest (184) + npm run verify (57/37) + git diff --check GREEN. Migration SHA
+UNCHANGED (daf1997a...). Commit 3bbda36 (code/tests) + docs separate. NEXT: production go-live phases C-J
+(read-only stage-8 reconcile -> apply Migration 9 -> push+deploy -> token/cache gate -> apply controls -> run
+priority release -> live+frontend verify -> safe-close). Requires production DB/DataDoe access from the run
+environment.
