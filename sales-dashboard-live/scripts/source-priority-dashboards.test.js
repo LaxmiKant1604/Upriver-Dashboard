@@ -532,6 +532,55 @@ test("P9o. a preflight result that is ready but carries a BLANK live identity st
   assert.equal(r.code, 1); assert.equal(r.stage, "publish-gates");
 });
 
+/* ---- P9 (cont). The PUBLISH acknowledgement is validated as strictly as the preflight (blocker 1) ---- */
+test("P9p. PINNED DEFECT: a publishAccount response with results=[] returns NONZERO (never code 0)", async () => {
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { publishAccount: async (a) => ({ accountId: a, results: [] }) } }));
+  assert.equal(r.code, 1, "results=[] must be code 1, NEVER a false success"); assert.equal(r.stage, "publish");
+});
+test("P9q. a publish result set that is not EXACTLY the frozen 3 (missing / extra / duplicate) stops => code 1 (publish)", async () => {
+  const P = (rk, disp) => ({ reportKey: rk, disposition: disp || "published", liveReportKey: rk, paramsHash: "ph" });
+  const variants = [
+    [P("daily-reporting"), P("brand-sales")],                                          // missing brand-inventory
+    [P("daily-reporting"), P("brand-sales"), P("brand-inventory"), P("reconciliation")], // extra key
+    [P("daily-reporting"), P("daily-reporting"), P("brand-inventory")],                // duplicate + missing brand-sales
+    [P("daily-reporting"), P("brand-sales"), P("unknown-report")],                     // unknown key
+  ];
+  for (const results of variants) {
+    const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { publishAccount: async (a) => ({ accountId: a, results }) } }));
+    assert.equal(r.code, 1, JSON.stringify(results)); assert.equal(r.stage, "publish");
+  }
+});
+test("P9r. a publish whose accountId does not echo the requested account stops => code 1 (publish)", async () => {
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { publishAccount: async () => ({ accountId: "WRONG", results: idResults("WRONG", "published") }) } }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "publish");
+});
+test("P9s. a malformed publish envelope (non-array / missing results) stops => code 1 (publish)", async () => {
+  for (const bad of [{ accountId: "A01" }, { accountId: "A01", results: null }, { accountId: "A01", results: "nope" }, null]) {
+    const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: {
+      finalizeBucket: async () => ({ disposition: "finalized", cycleStatus: "succeeded", accounts: ["A01"] }),
+      publishAccount: async () => bad,
+    } }));
+    assert.equal(r.code, 1, JSON.stringify(bad)); assert.equal(r.stage, "publish");
+  }
+});
+test("P9t. a publish result with a non-accepted disposition or a blank live identity stops => code 1 (publish)", async () => {
+  const bad1 = THREE.map((rk) => ({ reportKey: rk, disposition: "not-successful", liveReportKey: rk, paramsHash: "ph" }));
+  const r1 = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { publishAccount: async (a) => ({ accountId: a, results: bad1 }) } }));
+  assert.equal(r1.code, 1); assert.equal(r1.stage, "publish");
+  const bad2 = THREE.map((rk) => ({ reportKey: rk, disposition: "published", liveReportKey: "", paramsHash: "" }));
+  const r2 = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { publishAccount: async (a) => ({ accountId: a, results: bad2 }) } }));
+  assert.equal(r2.code, 1); assert.equal(r2.stage, "publish");
+});
+test("P9u. success REQUIRES published.length === provenAccountCount * 3 (a short account count can never return code 0)", async () => {
+  // finalize proves TWO accounts (A01 + B01) but one account publishes only 2 of 3 -> short total -> code 1.
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: {
+    publishAccount: async (a) => a === "A01"
+      ? ({ accountId: a, results: [{ reportKey: "daily-reporting", disposition: "published", liveReportKey: "daily-reporting", paramsHash: "ph" }, { reportKey: "brand-sales", disposition: "published", liveReportKey: "brand-sales", paramsHash: "ph" }] })
+      : ({ accountId: a, results: idResults(a, "published") }),
+  } }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "publish");
+});
+
 /* ===================== P10. the EXACT-identity live read-back (buildLiveReadback) ===================== */
 group("P10. exact-identity read-back: omitted/wrong params hash fails; exact identity passes");
 function readbackFor(rowsByHash, over = {}) {
@@ -633,26 +682,34 @@ group("P12. control transaction: exact-global apply, safe-close rollback, fail-c
 
 // A faithful in-memory model of the four durable control tables + all_primary + a scheduler cron flag, exposing
 // the exact store contract runControlPackageTransaction drives. `begin/commit/rollback` snapshot + restore so a
-// FAILED transaction leaves NO write behind (proving the guard truly rolls back). `opts.freezeWritesFor` lets a
-// test model a broken/racing reconcile (a write that leaves a stray row) to force a POST mismatch + rollback.
+// FAILED transaction leaves NO write behind (proving the guard truly rolls back) -- INCLUDING the approval audit
+// columns (approved_by + approved_at). Approvals are AUDITED: every approve/revoke stamps operator + a logical
+// clock tick (modelling now()), so a test can prove the revoked rows received the operator + a new timestamp.
+// Knobs: `opts.freezeWritesFor` models a broken/racing reconcile (a write that leaves a stray row) to force a
+// POST mismatch + rollback; `opts.failCommit` / `opts.failRollback` model a lost/failed commit or rollback ack.
 function makeControlStore(initial = {}, opts = {}) {
   const clone = (o) => JSON.parse(JSON.stringify(o));
+  const asAppr = (e) => (typeof e === "string" ? { approved: true, approved_by: null, approved_at: 0 } : { approved: e.approved !== false, approved_by: e.approved_by ?? null, approved_at: e.approved_at ?? 0 });
+  const keyOf = (e) => (typeof e === "string" ? e : e.pair);
   const st = {
     allPrimary: initial.allPrimary === true,
     cron: initial.cron === true,
     rollout: new Map((initial.rollout || []).map((r) => [r.account_id, !!r.enabled])),          // acct -> enabled
     dispatch: new Map((initial.dispatch || []).map((r) => [r.report_key, !!r.schedule_enabled])), // rk -> enabled
     promoted: new Map((initial.promoted || []).map((r) => [r.report_key, !!r.publish_enabled])),   // rk -> enabled
-    approvals: new Map((initial.approvals || []).map((p) => [p, true])),                            // "rk|acct" -> approved
+    approvals: new Map((initial.approvals || []).map((e) => [keyOf(e), asAppr(e)])),               // "rk|acct" -> {approved, approved_by, approved_at}
   };
   let snapshot = null;
+  let clk = 100; const tick = () => (clk += 1); // logical PostgreSQL now(); monotonic so a new stamp is provable
   const frozen = new Set(opts.freezeWritesFor || []); // e.g. "rollout" -> reconcile leaves the stray row
+  const calls = { begin: 0, commit: 0, rollback: 0 };
   const S2 = (v) => String(v);
+  const stamp = (p, approved, operator) => st.approvals.set(S2(p), { approved, approved_by: S2(operator), approved_at: tick() });
   return {
-    _state: st,
-    begin: async () => { snapshot = { allPrimary: st.allPrimary, cron: st.cron, rollout: clone([...st.rollout]), dispatch: clone([...st.dispatch]), promoted: clone([...st.promoted]), approvals: clone([...st.approvals]) }; },
-    commit: async () => { snapshot = null; },
-    rollback: async () => { if (snapshot) { st.allPrimary = snapshot.allPrimary; st.cron = snapshot.cron; st.rollout = new Map(snapshot.rollout); st.dispatch = new Map(snapshot.dispatch); st.promoted = new Map(snapshot.promoted); st.approvals = new Map(snapshot.approvals); } },
+    _state: st, _calls: calls, _clock: () => clk,
+    begin: async () => { calls.begin += 1; snapshot = { allPrimary: st.allPrimary, cron: st.cron, rollout: clone([...st.rollout]), dispatch: clone([...st.dispatch]), promoted: clone([...st.promoted]), approvals: clone([...st.approvals]) }; },
+    commit: async () => { calls.commit += 1; if (opts.failCommit) throw new Error("commit ack lost (network)"); snapshot = null; },
+    rollback: async () => { calls.rollback += 1; if (opts.failRollback) throw new Error("rollback failed (connection dropped)"); if (snapshot) { st.allPrimary = snapshot.allPrimary; st.cron = snapshot.cron; st.rollout = new Map(snapshot.rollout); st.dispatch = new Map(snapshot.dispatch); st.promoted = new Map(snapshot.promoted); st.approvals = new Map(snapshot.approvals.map(([k, v]) => [k, { ...v }])); } },
     readAllPrimary: async () => st.allPrimary,
     hasCron: async () => st.cron,
     setRolloutEnabled: async (ids) => { for (const a of ids) st.rollout.set(S2(a), true); if (!frozen.has("rollout")) for (const a of [...st.rollout.keys()]) if (!ids.map(S2).includes(a)) st.rollout.set(a, false); },
@@ -661,12 +718,12 @@ function makeControlStore(initial = {}, opts = {}) {
     pauseAllDispatch: async (controlled) => { for (const rk of controlled) st.dispatch.set(S2(rk), false); },
     setPromotedEnabled: async (keys) => { for (const rk of keys) st.promoted.set(S2(rk), true); for (const rk of [...st.promoted.keys()]) if (!keys.map(S2).includes(rk)) st.promoted.set(rk, false); },
     disableAllPromoted: async () => { for (const rk of [...st.promoted.keys()]) st.promoted.set(rk, false); },
-    setApprovalsApproved: async (pairs) => { for (const p of pairs) st.approvals.set(S2(p), true); if (!frozen.has("approvals")) for (const p of [...st.approvals.keys()]) if (!pairs.map(S2).includes(p)) st.approvals.set(p, false); },
-    revokeAllApprovals: async () => { for (const p of [...st.approvals.keys()]) st.approvals.set(p, false); },
+    setApprovalsApproved: async (pairs, operator) => { for (const p of pairs) stamp(p, true, operator); if (!frozen.has("approvals")) for (const p of [...st.approvals.keys()]) if (!pairs.map(S2).includes(p)) stamp(p, false, operator); },
+    revokeAllApprovals: async (operator) => { for (const p of [...st.approvals.keys()]) stamp(p, false, operator); },
     rolloutRows: async () => [...st.rollout].map(([account_id, enabled]) => ({ account_id, enabled })),
     dispatchRows: async () => [...st.dispatch].map(([report_key, schedule_enabled]) => ({ report_key, schedule_enabled })),
     promotedRows: async () => [...st.promoted].map(([report_key, publish_enabled]) => ({ report_key, publish_enabled })),
-    approvalRows: async () => [...st.approvals].map(([p, approved]) => { const [report_key, account_id] = p.split("|"); return { report_key, account_id, approved }; }),
+    approvalRows: async () => [...st.approvals].map(([p, v]) => { const [report_key, account_id] = p.split("|"); return { report_key, account_id, approved: v.approved, approved_by: v.approved_by, approved_at: v.approved_at }; }),
   };
 }
 const CONTROLLED = ["daily-reporting", "brand-sales", "reconciliation", "fba-plan", "sku-pl", "keyword-rank", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"];
@@ -770,6 +827,115 @@ test("P12i. runControlPackageTransaction fails closed on a bad mode / missing st
   await assert.rejects(() => controlPkg.runControlPackageTransaction({ store: makeControlStore(baseline()), pkg, mode: "sideways" }), /apply.*rollback/);
   await assert.rejects(() => controlPkg.runControlPackageTransaction({ store: null, pkg, mode: "apply" }), /store/);
   await assert.rejects(() => controlPkg.runControlPackageTransaction({ store: makeControlStore(baseline()), pkg: null, mode: "apply" }), /package/);
+});
+
+/* ---- P12 (cont). Honest COMMIT_UNKNOWN: phase-aware failure handling ---- */
+test("P12j. a SUCCESSFUL commit returns code 0 committed, with exactly one begin + one commit + zero rollback", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline());
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, true); assert.equal(r.code, 0);
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0 });
+});
+test("P12k. a PRE-COMMIT failure performs EXACTLY ONE rollback and returns ordinary failure (code 1, never COMMIT_UNKNOWN)", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline({ rollout: [{ account_id: "STRAY", enabled: true }] }), { freezeWritesFor: ["rollout"] });
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, false); assert.equal(r.code, 1); assert.notEqual(r.commitUnknown, true);
+  assert.deepEqual(store._calls, { begin: 1, commit: 0, rollback: 1 }, "exactly one rollback, commit never attempted");
+});
+test("P12l. COMMIT_UNKNOWN: a lost commit ack returns code 3, does NOT rollback, does NOT retry, and demands read-only reconciliation", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline(), { failCommit: true });
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, false); assert.equal(r.code, 3); assert.equal(r.commitUnknown, true);
+  assert.match(r.problem, /COMMIT_UNKNOWN/);
+  assert.match(r.instruction, /READ-ONLY reconciliation/i);
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0 }, "the commit was attempted; NO rollback, NO retry");
+});
+test("P12m. a rollback FAILURE on a pre-commit error does NOT hide the ORIGINAL pre-commit error", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline({ rollout: [{ account_id: "STRAY", enabled: true }] }), { freezeWritesFor: ["rollout"], failRollback: true });
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, false); assert.equal(r.code, 1);
+  assert.ok(r.problems.some((p) => /rollout-enabled/.test(p)), "the ORIGINAL pre-commit POST error is preserved");
+  assert.match(r.rollbackError, /rollback failed/, "the rollback failure is reported SEPARATELY, not hiding the original");
+});
+
+/* ---- P12 (cont). Audited approval revocation (operator + PostgreSQL now() on every revoke) ---- */
+test("P12n. APPLY-time removal of an EXTRA approval is AUDITED: the revoked row gets the operator + a NEW timestamp", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "auditor@x", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline({ approvals: [{ pair: "keyword-rank|A01", approved_by: "old-op", approved_at: 5 }] }));
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, true, JSON.stringify(r));
+  const revoked = (await store.approvalRows()).find((x) => x.report_key === "keyword-rank" && x.account_id === "A01");
+  assert.equal(revoked.approved, false); assert.equal(revoked.approved_by, "auditor@x", "revocation audited with the operator");
+  assert.ok(revoked.approved_at > 5, "revocation stamped a NEW timestamp (" + revoked.approved_at + " > 5)");
+});
+test("P12o. SAFE-CLOSE revocation is AUDITED: every approval gets the operator + a NEW timestamp", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "closer@x", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline({ approvals: [{ pair: "daily-reporting|A01", approved_by: "old", approved_at: 3 }, { pair: "brand-sales|A01", approved_by: "old", approved_at: 3 }] }));
+  const r = await runTxn(store, pkg, "rollback");
+  assert.equal(r.committed, true, JSON.stringify(r));
+  for (const row of await store.approvalRows()) {
+    assert.equal(row.approved, false);
+    assert.equal(row.approved_by, "closer@x", row.report_key + " revocation audited");
+    assert.ok(row.approved_at > 3, row.report_key + " revocation stamped a new timestamp");
+  }
+});
+test("P12p. a later transaction FAILURE restores the PREVIOUS approved + audit values (rollback of audited writes)", async () => {
+  const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
+  // seed a prior audited approval; a POST mismatch (frozen rollout stray) rolls the whole txn back.
+  const store = makeControlStore(baseline({ rollout: [{ account_id: "STRAY", enabled: true }], approvals: [{ pair: "keyword-rank|A01", approved_by: "prev-op", approved_at: 7 }] }), { freezeWritesFor: ["rollout"] });
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, false);
+  const row = (await store.approvalRows()).find((x) => x.report_key === "keyword-rank" && x.account_id === "A01");
+  assert.equal(row.approved, true, "the previous approval is restored"); assert.equal(row.approved_by, "prev-op"); assert.equal(row.approved_at, 7, "the previous audit timestamp is restored");
+});
+test("P12q. runControlPackageTransaction rejects a blank / noncanonical operator BEFORE begin (zero begin calls)", async () => {
+  const store = makeControlStore(baseline());
+  const blankPkg = { mode: "safe-close", operator: "", controlled: CONTROLLED, post: {} };
+  await assert.rejects(() => controlPkg.runControlPackageTransaction({ store, pkg: blankPkg, mode: "rollback", controlledReportKeys: CONTROLLED }), /canonical operator/);
+  const spacePkg = { mode: "safe-close", operator: "has space", controlled: CONTROLLED, post: {} };
+  await assert.rejects(() => controlPkg.runControlPackageTransaction({ store, pkg: spacePkg, mode: "rollback", controlledReportKeys: CONTROLLED }), /canonical operator/);
+  assert.equal(store._calls.begin, 0, "no transaction was opened for a bad operator");
+});
+
+/* ---- P12 (cont). Discovery-independent safe-close via runControlPackageCli ---- */
+test("P12r. runControlPackageCli --rollback executes the safe-close EVEN WHEN DataDoe discovery throws (zero discovery calls)", async () => {
+  let discoveryCalls = 0;
+  const applied = { allPrimary: false, cron: false,
+    rollout: [{ account_id: "A01", enabled: true }, { account_id: "A02", enabled: true }],
+    dispatch: CONTROLLED.map((rk) => ({ report_key: rk, schedule_enabled: ["daily-reporting", "brand-sales"].includes(rk) })),
+    promoted: [{ report_key: "brand-inventory", publish_enabled: true }],
+    approvals: [{ pair: "daily-reporting|A01", approved_by: "x", approved_at: 1 }, { pair: "brand-sales|A02", approved_by: "x", approved_at: 1 }] };
+  const store = makeControlStore(applied);
+  const r = await controlPkg.runControlPackageCli({
+    mode: "rollback", operator: "closer@x", controlledReportKeys: CONTROLLED,
+    discoverAccounts: async () => { discoveryCalls += 1; throw new Error("DataDoe unavailable"); },
+    connectStore: async () => store,
+  });
+  assert.equal(r.committed, true, "safe-close committed even though DataDoe was down: " + JSON.stringify(r));
+  assert.equal(discoveryCalls, 0, "the safe-close made ZERO DataDoe discovery calls");
+  assert.equal((await store.rolloutRows()).filter((x) => x.enabled).length, 0, "every rollout disabled");
+  assert.equal((await store.dispatchRows()).filter((x) => x.schedule_enabled).length, 0, "all dispatch paused");
+  assert.equal((await store.promotedRows()).filter((x) => x.publish_enabled).length, 0, "promoted disabled");
+  const appr = await store.approvalRows();
+  assert.equal(appr.filter((x) => x.approved).length, 0, "every approval revoked");
+  assert.ok(appr.every((x) => x.approved_by === "closer@x"), "every revocation audited with the operator");
+});
+test("P12s. runControlPackageCli --apply DOES discover (and propagates a discovery failure); dry-run discovers but never writes", async () => {
+  await assert.rejects(() => controlPkg.runControlPackageCli({ mode: "apply", operator: "op@x", controlledReportKeys: CONTROLLED, discoverAccounts: async () => { throw new Error("DataDoe unavailable"); }, connectStore: async () => makeControlStore(baseline()) }), /DataDoe unavailable/);
+  let connected = 0;
+  const dry = await controlPkg.runControlPackageCli({ mode: "dry-run", operator: "op@x", controlledReportKeys: CONTROLLED, discoverAccounts: async () => ["A01", "A02"], connectStore: async () => { connected += 1; return makeControlStore(baseline()); } });
+  assert.equal(dry.dryRun, true); assert.deepEqual(dry.pkg.accounts, ["A01", "A02"]);
+  assert.equal(connected, 0, "dry-run never connects the store / writes");
+});
+test("P12t. buildPrioritySafeClosePackage needs NO accounts and fails closed on a blank/noncanonical operator", () => {
+  const pkg = controlPkg.buildPrioritySafeClosePackage({ operator: "op@x" });
+  assert.equal(pkg.mode, "safe-close"); assert.equal(pkg.operator, "op@x"); assert.ok(!("accounts" in pkg) || pkg.accounts === undefined);
+  assert.throws(() => controlPkg.buildPrioritySafeClosePackage({ operator: "" }), /canonical operator/);
+  assert.throws(() => controlPkg.buildPrioritySafeClosePackage({ operator: "bad op" }), /canonical operator/);
 });
 
 async function main() {

@@ -26,6 +26,10 @@ const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 const uniqSort = (xs) => [...new Set((Array.isArray(xs) ? xs : []).map(S).filter(nb))].sort();
 const setEq = (a, b) => { const x = uniqSort(a); const y = uniqSort(b); return x.length === y.length && x.every((v, i) => v === y[i]); };
+// A canonical operator id: a nonblank, trimmed, whitespace-free audit principal (e.g. an email). Every audited
+// approval write (approve OR revoke) must carry it; the transaction rejects a blank/noncanonical operator BEFORE
+// BEGIN so no write ever happens without an attributable principal.
+const isCanonicalOperator = (op) => { const s = S(op); return s.length > 0 && s === s.trim() && !/\s/.test(s) && s.length <= 200; };
 
 // The two Scheduler-v2 DISPATCH controls the priority go-live enables (report_sync_settings.schedule_enabled).
 // brand-inventory is NOT here: it is source-promoted and gated by source_promoted_publish_settings.publish_enabled.
@@ -81,6 +85,16 @@ export function buildPriorityControlPackage({ accounts, operator = "", controlle
 }
 
 /**
+ * Build the DISCOVERY-INDEPENDENT safe-close package for --rollback. It needs NO account discovery and NO
+ * DataDoe call -- the safe-close disables EVERY priority control globally -- only a validated `operator` for the
+ * audited approval revocation. Fails closed on a blank/noncanonical operator. Carries no `accounts`.
+ */
+export function buildPrioritySafeClosePackage({ operator = "", controlledReportKeys = CONTROLLED_REPORT_KEYS } = {}) {
+  if (!isCanonicalOperator(operator)) throw new Error("buildPrioritySafeClosePackage requires a canonical operator id (fail closed).");
+  return { mode: "safe-close", operator: S(operator), controlled: uniqSort(controlledReportKeys), post: { allPrimaryFalse: true, noCron: true, safeClose: true } };
+}
+
+/**
  * Run the guarded control-package transaction against an injected `store`, in `mode` "apply" or "rollback".
  * ALL pre/post gate logic lives here (the CLI never duplicates it): open a transaction; PRE-assert all_primary
  * is false + no scheduler cron; WRITE (apply: reconcile to the EXACT target, disabling any extra; rollback:
@@ -96,15 +110,24 @@ export function buildPriorityControlPackage({ accounts, operator = "", controlle
  *   pauseAllDispatch(controlled)                  -- schedule_enabled = false for ALL controlled
  *   setPromotedEnabled(enabledKeys)               -- enable EXACTLY these promoted controls, disable others
  *   disableAllPromoted()                          -- disable EVERY promoted control
- *   setApprovalsApproved(pairs, operator)         -- approve EXACTLY these "reportKey|accountId", revoke others
- *   revokeAllApprovals()                          -- approved=false for EVERY approval
+ *   setApprovalsApproved(pairs, operator)         -- approve EXACTLY these "reportKey|accountId", revoke others;
+ *                                                    EVERY write (approve AND revoke) is audited (operator + now())
+ *   revokeAllApprovals(operator)                  -- approved=false for EVERY approval, audited (operator + now())
  *   rolloutRows()/dispatchRows()/promotedRows()/approvalRows() -- the COMPLETE current rows for global assertions
  *   begin()/commit()/rollback()                   -- transaction control
+ *
+ * COMMIT phase is explicit: any failure BEFORE the commit is attempted performs exactly ONE rollback and returns
+ * an ordinary failure (code 1); a lost/failed acknowledgement of the commit ITSELF returns typed COMMIT_UNKNOWN
+ * (code 3) WITHOUT a rollback or retry, and demands a read-only reconciliation before any further action.
  */
 export async function runControlPackageTransaction({ store, pkg, mode, controlledReportKeys = CONTROLLED_REPORT_KEYS } = {}) {
   if (!store || typeof store.begin !== "function") throw new Error("runControlPackageTransaction requires a transactional store (fail closed).");
-  if (!pkg || !pkg.post || !Array.isArray(pkg.accounts)) throw new Error("runControlPackageTransaction requires a built package (fail closed).");
+  if (!pkg) throw new Error("runControlPackageTransaction requires a built package (fail closed).");
   if (mode !== "apply" && mode !== "rollback") throw new Error("runControlPackageTransaction mode must be 'apply' | 'rollback' (fail closed).");
+  // Reject a blank/noncanonical operator BEFORE BEGIN -- every audited revocation must carry a real principal.
+  if (!isCanonicalOperator(pkg.operator)) throw new Error("runControlPackageTransaction requires a canonical operator id (fail closed, before BEGIN).");
+  if (mode === "apply" && (!pkg.post || !Array.isArray(pkg.accounts) || !pkg.accounts.length)) throw new Error("runControlPackageTransaction apply requires a discovered account package (fail closed).");
+  const operator = S(pkg.operator);
   const controlled = uniqSort(controlledReportKeys);
 
   const controlledSet = new Set(controlled);
@@ -120,6 +143,7 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
   const need = (cond, msg) => { if (!cond) problems.push(msg); };
   const needSet = (actual, expected, label) => need(setEq(actual, expected), label + ": {" + uniqSort(actual).join(",") + "} != {" + uniqSort(expected).join(",") + "}");
 
+  let phase = "pre-commit";
   await store.begin();
   try {
     // ---- PRE assertions (both modes) ----
@@ -132,7 +156,8 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
       await store.setRolloutEnabled(pkg.post.rolloutEnabled);
       await store.setDispatchEnabled(pkg.post.dispatchEnabled, controlled);
       await store.setPromotedEnabled([pkg.post.promotedEnabled]);
-      await store.setApprovalsApproved(pkg.post.approvals, pkg.operator);
+      // Revoking an EXTRA approval here is an audited write (operator + now()), same as approving the target.
+      await store.setApprovalsApproved(pkg.post.approvals, operator);
       // ---- POST: COMPLETE global sets (NEVER filtered) ----
       needSet(await enabledRollout(), pkg.post.rolloutEnabled, "rollout-enabled");
       needSet(await enabledDispatch(), pkg.post.dispatchEnabled, "dispatch-enabled");
@@ -140,11 +165,12 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
       needSet(await enabledPromoted(), [pkg.post.promotedEnabled], "promoted-enabled");
       needSet(await approvedPairs(), pkg.post.approvals, "approved");
     } else {
-      // ---- WRITES: SAFE-CLOSE every priority control (documented; NOT a restoration) ----
+      // ---- WRITES: SAFE-CLOSE every priority control (documented; NOT a restoration). The approval revocation
+      //      is audited with the validated operator + now(); no discovery / account list is needed. ----
       await store.disableAllRollout();
       await store.pauseAllDispatch(controlled);
       await store.disableAllPromoted();
-      await store.revokeAllApprovals();
+      await store.revokeAllApprovals(operator);
       // ---- POST: full completeness -- every rollout disabled, ALL controlled paused, promoted/approvals empty ----
       needSet(await enabledRollout(), [], "rollback-rollout-still-enabled");
       needSet(await enabledDispatch(), [], "rollback-dispatch-still-enabled");
@@ -158,10 +184,55 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
     if ((await store.hasCron()) === true) throw new Error("POST: a scheduler cron appeared");
     if (problems.length) throw new Error("POST: " + problems.join("; "));
 
+    // ---- COMMIT: once ATTEMPTED, a lost/failed ack is COMMIT_UNKNOWN (never rollback, never retry) ----
+    phase = "commit";
     await store.commit();
-    return { committed: true, mode, problems: [] };
+    return { committed: true, mode, code: 0, problems: [] };
   } catch (e) {
-    try { await store.rollback(); } catch { /* ignore */ }
-    return { committed: false, mode, problems, problem: (e && e.message) || String(e) };
+    const msg = (e && e.message) || String(e);
+    if (phase === "commit") {
+      // The commit was ATTEMPTED and its acknowledgement was lost/failed: the control state is UNKNOWN (the
+      // write may or may not have landed). Do NOT rollback, do NOT retry -- return typed COMMIT_UNKNOWN.
+      return {
+        committed: false, commitUnknown: true, mode, code: 3, problem: "COMMIT_UNKNOWN: " + msg,
+        instruction: "The COMMIT acknowledgement was lost; the control state is UNKNOWN. Run a READ-ONLY reconciliation BEFORE any further apply / rollback / publish / retry. Do NOT retry or rollback blindly.",
+      };
+    }
+    // Pre-commit failure: exactly ONE rollback. A rollback failure is reported SEPARATELY and never hides the
+    // original pre-commit error (which stays in `problem`).
+    let rollbackError = null;
+    try { await store.rollback(); } catch (re) { rollbackError = (re && re.message) || String(re); }
+    return { committed: false, mode, code: 1, problems, problem: msg, ...(rollbackError ? { rollbackError } : {}) };
+  }
+}
+
+/**
+ * Orchestrate ONE control-package operation with every side effect injected, so the .mjs is a thin wrapper and
+ * the discovery-independence of --rollback is offline-testable. For "apply"/"dry-run" it discovers primary
+ * accounts (discoverAccounts) and builds the exact target; for "rollback" it builds the SAFE-CLOSE package and
+ * NEVER calls discoverAccounts (it works even if DataDoe is down -- zero DataDoe calls, no account list).
+ * "dry-run" returns the plan with no writes. Returns the transaction result (or { dryRun:true, pkg }).
+ */
+export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, log = () => {} } = {}) {
+  if (mode !== "apply" && mode !== "rollback" && mode !== "dry-run") throw new Error("runControlPackageCli mode must be apply|rollback|dry-run (fail closed).");
+  if (!isCanonicalOperator(operator)) throw new Error("runControlPackageCli requires a canonical operator id (fail closed).");
+  let pkg;
+  if (mode === "rollback") {
+    // DISCOVERY-INDEPENDENT: no DataDoe call, no account list -- the safe-close is global.
+    pkg = buildPrioritySafeClosePackage({ operator, controlledReportKeys });
+    log("SAFE-CLOSE (--rollback): no DataDoe discovery required; disabling every priority control globally.");
+  } else {
+    if (typeof discoverAccounts !== "function") throw new Error("runControlPackageCli apply/dry-run requires discoverAccounts (fail closed).");
+    const accounts = await discoverAccounts();
+    pkg = buildPriorityControlPackage({ accounts, operator, controlledReportKeys });
+    log("discovered " + pkg.accounts.length + " primary accounts");
+  }
+  if (mode === "dry-run") return { dryRun: true, mode: "dry-run", committed: false, code: 0, pkg };
+  if (typeof connectStore !== "function") throw new Error("runControlPackageCli requires connectStore for a live apply/rollback (fail closed).");
+  const store = await connectStore();
+  try {
+    return await runControlPackageTransaction({ store, pkg, mode, controlledReportKeys });
+  } finally {
+    if (store && typeof store.end === "function") { try { await store.end(); } catch { /* ignore */ } }
   }
 }

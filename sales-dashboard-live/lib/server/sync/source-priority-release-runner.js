@@ -21,8 +21,37 @@ import { PRIORITY_DASHBOARDS } from "./source-priority-dashboards.js";
 
 const OK_PUBLISH = new Set(["published", "already-current"]);
 const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
+const READY = new Set(["ready"]);
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
+
+/**
+ * Strictly validate a per-account result envelope ({ accountId, results }) from preflightAccount OR publishAccount
+ * against the frozen three keys. Returns an array of typed problems (empty === valid). The SAME strictness is
+ * applied to preflight and publish so a malformed / short / duplicated / extra / mis-echoed acknowledgement can
+ * never be read as success: the account id must echo the request; results must be an array of EXACTLY the frozen
+ * keys (unique -- no missing/extra/duplicate/unknown); each result must carry an accepted disposition, the exact
+ * expected reportKey, and a nonblank live identity (liveReportKey + paramsHash).
+ */
+function threeResultProblems(frozenKeys, envelope, accountId, okDispositions) {
+  if (!envelope || S(envelope.accountId) !== S(accountId)) return [accountId + " -> account echo mismatch (" + S(envelope && envelope.accountId) + ")"];
+  const results = Array.isArray(envelope.results) ? envelope.results : null;
+  if (!results) return [accountId + " -> results is not an array"];
+  const frozenSet = new Set(frozenKeys);
+  const keys = results.map((r) => S(r && r.reportKey));
+  const uniq = new Set(keys);
+  if (results.length !== frozenKeys.length || uniq.size !== frozenKeys.length || !frozenKeys.every((k) => uniq.has(k))) {
+    return [accountId + " -> result set [" + keys.join(",") + "] != the frozen [" + frozenKeys.join(",") + "]"];
+  }
+  const problems = [];
+  for (const r of results) {
+    const rk = S(r && r.reportKey);
+    if (!frozenSet.has(rk)) { problems.push(accountId + " -> unknown report key " + rk); continue; }
+    if (!okDispositions.has(S(r.disposition))) { problems.push(rk + "/" + accountId + " -> " + S(r.disposition)); continue; }
+    if (!nb(r && r.liveReportKey) || !nb(r && r.paramsHash)) problems.push(rk + "/" + accountId + " -> missing live identity");
+  }
+  return problems;
+}
 
 /**
  * Run the strict priority release. Returns { code, ok, stage, evidence, problems }: code 0 ONLY on a proven
@@ -91,33 +120,26 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const gateProblems = [];
   for (const accountId of accountList) {
     const pf = await release.preflightAccount(accountId);
-    if (!pf || S(pf.accountId) !== S(accountId)) { gateProblems.push(accountId + " -> preflight-account-mismatch (" + S(pf && pf.accountId) + ")"); continue; }
-    const results = Array.isArray(pf.results) ? pf.results : [];
-    const keys = results.map((r) => S(r && r.reportKey));
-    const uniq = new Set(keys);
-    if (results.length !== FROZEN.length || uniq.size !== FROZEN.length || !FROZEN.every((k) => uniq.has(k))) {
-      gateProblems.push(accountId + " -> preflight-result-set [" + keys.join(",") + "] != the frozen " + FROZEN.length);
-      continue;
-    }
-    for (const r of results) {
-      if (S(r.disposition) !== "ready") { gateProblems.push(S(r.reportKey) + "/" + accountId + " -> " + S(r.disposition)); continue; }
-      if (!nb(r.liveReportKey) || !nb(r.paramsHash)) gateProblems.push(S(r.reportKey) + "/" + accountId + " -> ready without a live identity");
-    }
+    gateProblems.push(...threeResultProblems(FROZEN, pf, accountId, READY));
   }
   if (gateProblems.length) return fail("publish-gates", gateProblems);
-  log("publisher preflight proven ready for " + accountList.length + " accounts x " + PRIORITY_DASHBOARDS.reportKeys.length + " reports");
+  log("publisher preflight proven ready for " + accountList.length + " accounts x " + FROZEN.length + " reports");
 
-  // (5) publish daily-reporting, brand-sales, brand-inventory (order enforced by the composition); accept ONLY
-  //     'published' / 'already-current'. Carry each pair's EXACT live identity for the read-back.
+  // (5) publish daily-reporting, brand-sales, brand-inventory (order enforced by the composition). The publish
+  //     acknowledgement is validated with the SAME strictness as the preflight: the account echoes, EXACTLY the
+  //     frozen three keys (unique -- no missing/extra/duplicate/unknown/malformed/non-array), each with an
+  //     accepted disposition ('published' / 'already-current') AND a nonblank live identity. Any violation stops
+  //     BEFORE the read-back (never a partial / false success -- e.g. results=[] can NEVER return code 0).
   const published = [];
   for (const accountId of accountList) {
     const res = await release.publishAccount(accountId);
-    for (const r of (res && res.results) || []) {
-      if (!OK_PUBLISH.has(S(r.disposition))) return fail("publish", r.reportKey + "/" + accountId + " -> " + S(r.disposition));
-      if (!nb(r.liveReportKey) || !nb(r.paramsHash)) return fail("publish", r.reportKey + "/" + accountId + " missing live identity");
-      published.push({ reportKey: r.reportKey, accountId, liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash), disposition: r.disposition });
-    }
+    const probs = threeResultProblems(FROZEN, res, accountId, OK_PUBLISH);
+    if (probs.length) return fail("publish", probs);
+    for (const r of res.results) published.push({ reportKey: S(r.reportKey), accountId, liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash), disposition: r.disposition });
   }
+  // The explicit count pin: EXACTLY three proven publications per proven account, never fewer.
+  const expectedPublications = accountList.length * FROZEN.length;
+  if (published.length !== expectedPublications) return fail("publish", "published " + published.length + " != expected " + expectedPublications + " (accounts " + accountList.length + " x " + FROZEN.length + ")");
   log("published " + published.length + " (report, account) pairs");
 
   // (6) read back the exact live identity for every published pair + prove the frontend payload contract.
