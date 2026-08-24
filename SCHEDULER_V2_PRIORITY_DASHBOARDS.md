@@ -121,80 +121,115 @@ creates. The Catalog is organization-scoped, so US and Non-US resolve the **same
   applies a migration, enables the scheduler/cron, or touches unrelated reports, and **exits nonzero on every
   non-success disposition**.
 
-## 4c. Warm-cache-first finalize (`finalizeBucket` token/reservation coherence)
+## 4c. Cross-bucket-coherent finalize (`finalizeBucket` token/reservation coherence)
 
-`finalizeBucket` reconciles the Catalog source job's `create_export_count` with the durable reservation, so a
-**first** release that reuses a valid Catalog cache spends **zero** tokens and makes **no** reservation:
+`finalizeBucket` reconciles the Catalog source job's `create_export_count` with the operation-wide reservation.
+Because the one org-scoped Catalog export is **shared** by both buckets against **one** reservation, a bucket
+finalizes in either role:
 
-- `create_export_count = 0` → warm reuse / adoption: **no** reservation, but a proven durable cache pointer
-  (`cache_object_path`); a stray reservation is rejected as ambiguous;
-- `create_export_count = 1` → the **exact** created reservation for this hash (status `created`, matching hash,
-  nonblank export id, `tokens_spent = 2`);
+- `create_export_count = 1` → THIS bucket attempted the create: the **exact** created reservation (status
+  `created`, matching hash, `tokens_spent = 2`) whose **export id is the one this job created/adopted**. In the
+  priority path (which force-plans Catalog) the second bucket also shows `= 1` but **adopts the same export id**,
+  so only one real DataDoe create / two tokens ever occur across the operation;
+- `create_export_count = 0` → zero tokens here, but a proven durable cache pointer (`cache_object_path`) is
+  **required**, and the reservation is **either** absent (true warm-cache-first, zero tokens, no reservation)
+  **or** the **other bucket's** exact created reservation (same hash/export/`tokens_spent = 2`);
 - every other combination (missing/`reserved`-only reservation, hash mismatch, blank export, wrong tokens,
-  impossible count) is refused.
+  export id ≠ the reservation's export, impossible count) is refused.
+
+Proven by the real two-bucket **F13** (cold US creates once, warm Non-US adopts the same org export, **both**
+finalize, total creates = 1 / tokens = 2) plus the deterministic `P4b2`/`P4b4` warm-first + cross-bucket accepts
+and the full `P4c` refuse matrix.
 
 ## 5. Complete-surface publish + shared preflight + exact read-back (`preflightAccount` / `publishAccount`)
 
 The **real** publisher gains a read-only **preflight** mode (`publishSchedulerV2Snapshot({ preflight: true })`,
 exposed as `buildSchedulerV2Publisher().preflight`): it runs the SAME collaborators + gates + validations up to
 (not including) the CAS and returns `ready` with the exact live identity. `preflightAccount(accountId)` runs it
-for all three keys. The runner proves **every** account × three keys are publishable **before the first live
-write** — so a predictable missing approval/control causes **zero** partial publish — with **no** gate logic
+for all three keys. The runner verifies the preflight **shape strictly** — the account id echoes the request,
+and the results are **exactly** the frozen three keys (unique, no missing/extra/duplicate), each `ready` with a
+nonblank live identity — and proves **every** account × three keys are publishable **before the first live
+write**, so a malformed or non-ready preflight causes **zero** partial publish, with **no** gate logic
 duplicated in the CLI.
 
 `publishAccount` publishes `daily-reporting`, `brand-sales`, `brand-inventory` — **brand-sales before
 brand-inventory** — through the real publisher's four durable gates + validated-job + terminal-cycle +
 exact-shadow-identity + payload-contract + CAS write, carrying each result's exact live identity
 (`liveReportKey` + `paramsHash`). The runner then reads each live snapshot back by that **exact** identity
-(`buildLiveReadback`): identity echoes, live version + params, params-hash **provenance** (a mutated-after-save
-row fails), nonblank refresh, storage-first payload, and the real frontend payload contract. This module never
-enables a control or an approval, never sets `all_primary`, and never enables the scheduler.
+(`buildLiveReadback`). Identity is proven from the **row columns** `report_key` + `account_id` (the published
+live params carry **no** `accountId`); the stored params carry the exact live version + contract-derived live
+params and **re-derive** `paramsHash` (a mutated-after-save row fails provenance); nonblank refresh, storage-first
+payload, and the real frontend payload contract. This module never enables a control or an approval, never sets
+`all_primary`, and never enables the scheduler.
 
-## 6. Prepared publication control package (`buildPriorityControlPackage`)
+## 6. Prepared publication control package (`buildPriorityControlPackage` + `runControlPackageTransaction`)
 
-`lib/server/sync/source-priority-control-package.js` computes the EXACT control writes + their reversal for the
-freshly discovered primary accounts; `scripts/release/priority-control-package.mjs` applies it (dry-run default;
-`--apply` / `--rollback`) as **one guarded, advisory-locked transaction** with exact PRE (`all_primary=false`, no
-cron) and POST assertions: an exact rollout row per primary account; **only** `daily-reporting` + `brand-sales`
-dispatch controls enabled (every other controlled report paused); the `brand-inventory` promoted control enabled;
-an audited approval for all three keys × every primary account; `all_primary` stays false; no cron. An explicit
-rollback package reverses exactly those writes.
+`lib/server/sync/source-priority-control-package.js` computes the EXACT global target control state (builder) and
+runs it as **one guarded, advisory-locked transaction** (`runControlPackageTransaction`, all gate logic here —
+never duplicated in the CLI); `scripts/release/priority-control-package.mjs` drives it through a pg-backed store
+(dry-run default; `--apply` / `--rollback`).
+
+- **Apply** actively **produces exactly** the target — enabling the rollout/dispatch/promoted/approval rows and
+  **reconciling away** any pre-existing extra — then asserts the **complete global sets** before COMMIT (never
+  filtering unexpected rows away): the enabled rollout set = exactly the primary accounts; enabled dispatch =
+  exactly `daily-reporting` + `brand-sales` (every other controlled report paused); enabled promoted = exactly
+  `brand-inventory`; approved = exactly the three keys × every account; `all_primary` false; no cron.
+- **Rollback** is a documented **safe-close** (not a rediscovered blind restoration): it disables **every**
+  rollout row, pauses **all 13** controlled settings, disables **every** promoted control, and revokes **every**
+  approval — complete and correct regardless of what discovery returns at rollback time — and verifies that
+  end state before COMMIT.
+- Any PRE/POST mismatch rolls the **whole** transaction back (no partial write survives). `P12` drives the
+  transaction through a fake store (extra rollout/approval reconciled or rolled back, changed discovery between
+  apply/rollback, PRE violations, rollback completeness, transaction rollback on every mismatch).
 
 ## Regressions
 
-- `scripts/source-priority-dashboards.test.js` (P1–P11): the operation-wide durable Catalog guard
+- `scripts/source-priority-dashboards.test.js` (P1–P12, 59 assertions): the operation-wide durable Catalog guard
   (hash-mismatch / commit-unknown / concurrency / adoption); the allowlist + publish order; the 30-account plan
   (zero OLI/FBA jobs, one Catalog job/bucket); the composition wiring (build-time priority) + `finalizeBucket`
-  cold/warm-first/retry accept + the full refuse matrix incl. every token/reservation ambiguity; the Brand View
-  inventory contract; the **real** publisher's `not-successful`→`published` and the **shared preflight**'s
-  `not-successful`→`ready` (zero writes on any non-ready pair); `buildAccountBrandSlice`; the mocked-real
-  reservation wrappers (strict validation); the strict runner (exits nonzero on every non-success, warm-cache
-  zero tokens, missing live identity); the exact-identity `buildLiveReadback` (omitted/wrong hash fails,
-  provenance/dangling/contract fail, exact passes); and the exact control package + its rollback + fail-closed.
-- `scripts/source-production-hardening.test.js` (F11a–f, F12a–d): the real-runtime derive off durable OLI +
-  Catalog; missing FBA → unavailable; fail-closed on missing provenance; ordinary callers cannot activate
-  priority mode; and the durable reservation with the real runtime + worker (cold/warm/cross-bucket/midnight).
-- `scripts/schema-contract-mutation.test.js` (Migration-9 contract + 14 weakening regressions);
-  `scripts/release/release-selftest.mjs` (stage-8 baseline + the protected-drift reconciliation classifier).
+  cold/warm-first/**cross-bucket**/retry accept + the full refuse matrix incl. every token/reservation ambiguity;
+  the Brand View inventory contract; the **real** publisher's `not-successful`→`published` and the **shared
+  preflight**'s `not-successful`→`ready` (zero writes on any non-ready pair); `buildAccountBrandSlice`; the
+  mocked-real reservation wrappers (strict validation); the strict runner (exits nonzero on every non-success,
+  warm-cache zero tokens, missing live identity, **strict preflight shape** P9m/n/o); the exact-identity
+  `buildLiveReadback` (row report/account echoes, no fabricated `accountId`, omitted/wrong hash + provenance +
+  dangling + contract fail, exact passes); the control-package builder (P11); and the guarded control
+  **transaction** (P12: exact-global apply, safe-close rollback, fail-closed rollback on every mismatch).
+- `scripts/source-production-hardening.test.js` (F11a–f, F12a–d, F13; 118 assertions): the real-runtime derive
+  off durable OLI + Catalog; missing FBA → unavailable; fail-closed on missing provenance; ordinary callers
+  cannot activate priority mode; the durable reservation with the real runtime + worker (cold/warm/cross-bucket/
+  midnight); and **F13** — a real two-bucket derive + the cross-bucket-coherent finalize (cold US creates once,
+  warm Non-US adopts the same export, both finalize, total creates = 1 / tokens = 2).
+- `scripts/schema-contract-mutation.test.js` (Migration-9 contract + 14 weakening regressions; 50 assertions);
+  `scripts/release/release-selftest.mjs` (stage-8 baseline + the protected-drift reconciliation classifier; 184).
 
-`npm run verify` (57 steps / 37 suites, incl. `build:check`) is green.
+`npm run verify` (57 steps / 37 suites, incl. `build:check`) is green. Migration-9 SQL + SHA are **unchanged**
+this round (`daf1997a…`).
 
 ## Operator run (deferred — do NOT run in production before Codex sign-off)
 
-1. **Reconcile** the protected data: `node scripts/release/stage8-reconcile.mjs` (read-only). It STOPs on any
-   drift from the manifest pins — review each drift, record intentional-state evidence, then (separately) update
-   the pins/invariants and re-run.
-2. Apply Migration 9 through the **guarded release step** only: verify the `created_coherent` canon against the
-   live catalog → `ro-prod-check.mjs 8` → `re-anchor-stage8.mjs` (regenerate the stage-8 baseline at the final
-   reviewed HEAD) → `apply-one-migration.mjs 20260825_priority_catalog_reservation.sql`. Confirm ≥2 DataDoe
-   tokens (read-only).
-3. Apply the control package: review `node scripts/release/priority-control-package.mjs` (dry-run), then
-   `--apply` (one guarded transaction; exact pre/post assertions).
-4. Run the strict runner `node scripts/release/priority-dashboards-release.mjs` (exits nonzero on any
+Approved production order (each step gates the next; STOP on any anomaly):
+
+1. **Stage-8 read-only reconciliation:** `node scripts/release/stage8-reconcile.mjs`. It captures the eight
+   protected digests and classifies every difference from the manifest pins. **Review any drift** — record
+   intentional-state evidence — before touching a pin.
+2. **Stage-8 re-anchor at the final reviewed HEAD:** after the review, update the pins/invariants (code/tests
+   commit, then docs), then `node scripts/release/re-anchor-stage8.mjs` to regenerate the stage-8 baseline at the
+   **final** HEAD.
+3. **`ro-prod-check.mjs 8`** (read-only): confirm the stage-8 protected state matches.
+4. **Guarded Migration 9 apply:** verify the `created_coherent` canon against the live catalog, then
+   `apply-one-migration.mjs 20260825_priority_catalog_reservation.sql`.
+5. **`ro-prod-check.mjs 9`** (read-only): confirm the applied migration matches.
+6. **Push once**, then **verify the exact Vercel deployment** is the pushed HEAD.
+7. **Confirm ≥2 DataDoe tokens** (read-only).
+8. **Controls:** review `node scripts/release/priority-control-package.mjs` (dry-run), then `--apply` (one
+   guarded transaction: exact-global apply + PRE/POST assertions).
+9. **Run the priority release** `node scripts/release/priority-dashboards-release.mjs` (exits nonzero on any
    non-success): read-only reconciliation → derive US then Non-US → re-prove ≤2 tokens (warm-cache-first spends
-   zero) → `finalizeBucket` each bucket → **shared publisher preflight for every account × 3** → publish
-   (brand-sales before brand-inventory) → **exact-identity** live read-back with the frontend payload contract
-   (`GET /api/datadoe?action=daily|brand-sales|brand-inventory`).
-5. Close the temporary gates (`priority-control-package.mjs --rollback` if aborting). Keep every other report
-   paused; keep the scheduler disabled (`all_primary=false`, no cron). Stop for Codex review before any scheduler
-   enablement.
+   zero) → `finalizeBucket` each bucket → **shared publisher preflight (strict shape) for every account × 3** →
+   publish (brand-sales before brand-inventory) → **exact-identity** live read-back.
+10. **Verify all exact live identities + API + frontend** (`GET /api/datadoe?action=daily|brand-sales|
+    brand-inventory`).
+11. **Safe-close the controls** (`priority-control-package.mjs --rollback`) and **confirm no cron**. Keep every
+    other report paused; keep `all_primary=false`. **The scheduler is a separate, later gate** — STOP for Codex
+    review before any scheduler enablement.

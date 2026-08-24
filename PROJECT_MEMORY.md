@@ -11142,3 +11142,44 @@ Tests: source-priority-dashboards.test.js P1-P11 (46) + gate7 publisher surface 
 (184) + schema-mutation (50) + F11/F12 (117) + npm run verify (57/37) + git diff --check GREEN. NO migration
 change this round (migration SHA unchanged daf1997a...). Commit 35ad575 (code/tests) + docs separate. STOPPED for
 Codex re-review; no production action. See [[scheduler-v2-golive-status]].
+
+## Priority release HARDENED for Codex round 5 -- 2026-08-24 (code e0af20c + docs separate; NOT pushed; NO migration change)
+
+Fixed the four FINAL Daily Reporting + Brand View priority-release blockers. Offline only; no
+prod/migration-apply/push/deploy/control-write/DataDoe/publish/schedule. Migration-9 SQL + SHA UNCHANGED
+(daf1997a...). Continues from HEAD fb4c231. See [[scheduler-v2-golive-status]].
+
+1. EXACT live read-back (buildLiveReadback, source-priority-release-runner.js): identity is proven from the ROW
+   columns report_key + account_id (the published live params carry NO accountId -- report-publisher.js writes
+   params={reportVersion, ...liveParams}); dropped the wrong params.accountId check; paramsHash re-derived from
+   contract.liveReportVersion + contract.liveParams(params) (provenance). P10 rewritten to use the EXACT object
+   the real publisher writes (no accountId) + proves wrong row report/account echoes fail (identity-report-key /
+   identity-account).
+2. CROSS-BUCKET reservation coherence (finalizeBucket): the one org-scoped Catalog export is shared by both
+   buckets against ONE operation-wide reservation. cec=1 -> exact created reservation (hash, tokens=2) whose
+   export id is the one THIS job created/adopted (in the force-planned priority path the 2nd bucket also shows
+   cec=1 but ADOPTS the same export id); cec=0 -> cache evidence required + reservation EITHER absent (true
+   warm-first) OR the other bucket's exact created reservation (same hash/export/2 tokens); reserved-not-created /
+   hash mismatch / blank/mismatched export / wrong tokens / bad count refused. NEW real two-bucket F13 (cold US
+   creates once, warm Non-US adopts the SAME export, BOTH finalize, total creates=1/tokens=2) + P4b4 cross-bucket
+   accept + expanded P4c refuse matrix. Added getCycleByBucketDate accessor to the hardening harness store.
+3. HONEST control transaction (runControlPackageTransaction, source-priority-control-package.js): apply ACTIVELY
+   reconciles to the exact global target (disabling any pre-existing extra) + asserts the COMPLETE enabled
+   rollout/dispatch/promoted/approved sets GLOBALLY (never filtered); rollback is a documented SAFE-CLOSE (disable
+   EVERY rollout, pause ALL 13 settings, disable EVERY promoted control, revoke EVERY approval) -- NOT a
+   rediscovered blind restoration; any PRE/POST mismatch rolls the whole txn back. CLI (priority-control-
+   package.mjs) drives it via a pg-backed store; P12 (a-i) drives it via a fake store: extra rollout/approval
+   reconciled-or-rolled-back, changed discovery between apply/rollback, PRE violations, rollback completeness,
+   transaction rollback on every mismatch. buildPriorityControlPackage now returns operator + the safe-close
+   rollback descriptor + global post sets.
+4. STRICT preflight shape (runner step 4): require preflightAccount.accountId to echo the request + EXACTLY the
+   frozen 3 keys (unique, no missing/extra/duplicate), each disposition=ready with a nonblank live identity; any
+   violation stops before the first live write (P9m/n/o).
+
+Tests: source-priority-dashboards.test.js P1-P12 (59) + source-production-hardening.test.js F11/F12/F13 (118) +
+schema-mutation (50) + release-selftest (184) + npm run verify (57/37, incl. build:check) + git diff --check
+GREEN. Commit e0af20c (code/tests) + docs separate. STOPPED for Codex re-review; no production action. Approved
+post-review production order: stage8 read-only reconcile -> review drift -> stage8 re-anchor at final HEAD ->
+ro-prod-check 8 -> guarded Migration 9 apply -> ro-prod-check 9 -> push once -> verify exact Vercel deployment ->
+confirm >=2 tokens -> dry-run + apply controls -> run priority release -> verify live identities/API/frontend ->
+safe-close controls -> confirm no cron. Scheduler stays a separate later gate.
