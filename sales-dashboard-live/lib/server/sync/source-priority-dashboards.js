@@ -187,6 +187,17 @@ export function buildPriorityDashboardsRelease({
     }
     const deadline = runtime.makeDeadline();
     const preflight = await runtime.preflightEvidence({ bucket, deadline });
+    // RESUMABLE re-run: if THIS bucket's cycle for today is ALREADY terminal (a prior release pass derived AND
+    // finalized it), the derive is done and re-running would be REFUSED by the durable "cycle is terminal;
+    // refusing to append/alter child work" guard. Skip the re-derive and return a clean already-complete rollup;
+    // finalizeBucket still INDEPENDENTLY re-proves the durable scope before accepting it. A running/absent cycle
+    // derives normally. getCycleByBucketDate fails closed (throws) on >1 cycle for the (bucket, date).
+    const sig = deadline && deadline.signal ? { signal: deadline.signal } : {};
+    const existingCycle = await getCycleByBucketDate(bucket, S(preflight.today), sig);
+    const existingStatus = existingCycle ? S(existingCycle.status) : null;
+    if (existingStatus === "succeeded" || existingStatus === "partial") {
+      return { rollup: { stopped: false, continuationRequired: false, globalDrained: true, alreadyComplete: true, cycleId: S(existingCycle.id), cycleStatus: existingStatus, derived: { skipped: null, lineage: [] } } };
+    }
     const rollup = await runtime.run({ bucket, deadline, preflight });
     return { rollup };
   }
@@ -210,7 +221,11 @@ export function buildPriorityDashboardsRelease({
     const cycle = await getCycleByBucketDate(bucket, cycleDate, sig);
     if (!cycle || !nb(S(cycle.id))) return refuse("cycle-not-found");
     if (S(cycle.bucket) !== bucket) return refuse("cycle-bucket-mismatch");
-    if (S(cycle.status) !== "running") return refuse("cycle-not-running", S(cycle.status));
+    // RESUMABLE: 'running' finalizes here; an ALREADY-terminal 'succeeded'/'partial' cycle (a prior release pass
+    // finalized it) is accepted IDEMPOTENTLY -- but only AFTER the SAME strict durable-scope proofs below; any
+    // other status is refused.
+    const priorStatus = S(cycle.status);
+    if (priorStatus !== "running" && priorStatus !== "succeeded" && priorStatus !== "partial") return refuse("cycle-not-running", priorStatus);
     if (S(cycle.trigger) !== "manual") return refuse("cycle-not-manual", S(cycle.trigger));
     const cycleId = S(cycle.id);
 
@@ -290,7 +305,12 @@ export function buildPriorityDashboardsRelease({
       }
     }
 
-    // (6) finalize -- accept ONLY a strict finalized/already-terminal ack with a terminal (succeeded/partial) cycle.
+    // (6) finalize. An ALREADY-terminal cycle (scope re-proven above) is accepted idempotently WITHOUT re-issuing
+    // the finalize RPC (the durable row is already terminal; re-finalizing is unnecessary and the RPC may reject
+    // appending to a terminal cycle). A 'running' cycle is finalized via the reviewed RPC as before.
+    if (priorStatus === "succeeded" || priorStatus === "partial") {
+      return { disposition: "already-terminal", cycleStatus: priorStatus, cycleId, accounts: expected };
+    }
     const disp = await store.finalizeCycle({ cycleId });
     const d = disp && disp.disposition;
     if (d === "finalized" || d === "already-terminal") {

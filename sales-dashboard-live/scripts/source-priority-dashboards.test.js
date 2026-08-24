@@ -262,6 +262,31 @@ test("P4a. deriveBucket accepts ONLY the bucket, runs its OWN deadline+preflight
   await assert.rejects(() => rel.deriveBucket("europe"), (e) => /bucket in us\|non-us/.test(e.message));
 });
 
+test("P4a2. deriveBucket is RESUMABLE: an ALREADY-terminal cycle SKIPS the re-derive (run() never called; clean already-complete rollup)", async () => {
+  // A prior release pass finalized THIS bucket's cycle; the durable engine now refuses to append child work to a
+  // terminal cycle, so re-deriving would throw. deriveBucket must detect the terminal cycle and short-circuit.
+  for (const status of ["succeeded", "partial"]) {
+    let ran = 0;
+    const rel = makeRelease({
+      cycle: { id: "cyc9", bucket: "us", status, trigger: "manual" },
+      buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [], today: TODAY }), run: async () => { ran += 1; return {}; } }),
+    });
+    const { rollup } = await rel.deriveBucket("us");
+    assert.equal(ran, 0, status + ": run() was NOT called (no re-derive of a terminal cycle)");
+    assert.equal(rollup.stopped, false, status + ": not stopped");
+    assert.equal(rollup.derived.skipped, null, status + ": clean rollup -> the runner proceeds to finalize");
+    assert.equal(rollup.alreadyComplete, true, status + ": marked already-complete");
+    assert.equal(rollup.cycleId, "cyc9");
+  }
+  // A RUNNING (or absent) cycle still derives normally -- run() IS called.
+  let ran2 = 0;
+  await makeRelease({
+    cycle: { id: "cycR", bucket: "us", status: "running", trigger: "manual" },
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [], today: TODAY }), run: async () => { ran2 += 1; return { derived: { skipped: null } }; } }),
+  }).deriveBucket("us");
+  assert.equal(ran2, 1, "a running cycle derives normally");
+});
+
 const finBase = { accounts: [{ accountId: "A01" }], today: TODAY, cycle: { id: "cyc", bucket: "us", status: "running", trigger: "manual" }, owners: CAT_OWNERS_OK, repJobs: repJobsFor(["A01"]), finalizeResp: { disposition: "finalized", cycle: { status: "succeeded" } } };
 
 test("P4b. COLD finalize ACCEPTS: create_export_count=1 + the EXACT created reservation (hash/export/2 tokens)", async () => {
@@ -279,6 +304,28 @@ test("P4b3. RETRY: create_export_count=1 with an already-created reservation sti
 test("P4b4. CROSS-BUCKET WARM finalize ACCEPTS: create_export_count=0 + cache evidence + the OTHER bucket's EXACT created reservation (zero new tokens)", async () => {
   const res = await makeRelease({ ...finBase, srcJobs: CAT_JOB_WARM, reservationRow: XBUCKET_RESV }).finalizeBucket("us");
   assert.equal(res.disposition, "finalized");
+});
+test("P4b5. RESUMABLE finalize: an ALREADY-terminal cycle (scope re-proven) is ACCEPTED as 'already-terminal' WITHOUT re-issuing the finalize RPC", async () => {
+  for (const status of ["succeeded", "partial"]) {
+    let finCalls = 0;
+    const rel = makeRelease({
+      ...finBase, cycle: { id: "cyc", bucket: "us", status, trigger: "manual" }, srcJobs: CAT_JOB_WARM, reservationRow: XBUCKET_RESV,
+      makeStore: () => ({ listSourceJobs: async () => CAT_JOB_WARM, listCycleOwners: async () => CAT_OWNERS_OK, finalizeCycle: async () => { finCalls += 1; return { disposition: "finalized", cycle: { status: "succeeded" } }; } }),
+    });
+    const res = await rel.finalizeBucket("us");
+    assert.equal(res.disposition, "already-terminal", status + " -> accepted idempotently");
+    assert.equal(res.cycleStatus, status, status + " -> echoes the terminal status");
+    assert.deepEqual(res.accounts, ["A01"], status + " -> proven account scope");
+    assert.equal(finCalls, 0, status + " -> finalize RPC NOT re-issued on a terminal cycle");
+  }
+});
+test("P4b6. a terminal cycle with a BAD durable scope is STILL refused (idempotent accept requires the SAME strict proofs, not a free pass)", async () => {
+  const res = await makeRelease({
+    ...finBase, cycle: { id: "cyc", bucket: "us", status: "succeeded", trigger: "manual" }, srcJobs: CAT_JOB_WARM, reservationRow: XBUCKET_RESV,
+    repJobs: repJobsFor(["A01"]).filter((j) => j.report_key !== "brand-sales"),
+  }).finalizeBucket("us");
+  assert.equal(res.disposition, "refused");
+  assert.equal(res.reason, "report-job-count", "a terminal-but-incomplete cycle is refused, never rubber-stamped");
 });
 
 test("P4c. finalizeBucket REFUSES every unrelated / open / malformed / mis-scoped / ambiguous-token condition", async () => {
