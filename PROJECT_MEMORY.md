@@ -11568,3 +11568,16 @@ refusal + idempotency; Non-US-incomplete->US-blocked / complete->ready; exact 20
 PENDING (unchanged external constraint): the two fresh-date GitHub runs still need the user (secrets configured,
 but no gh CLI/token here to dispatch/observe). First fresh Non-US slot after archival = 2026-08-25. State: main @
 5835ae7 (code) + docs.
+
+PHASE 10 done (code 6a21b19): committed code -> docs -> pushed -> Vercel 200 -> archival dry-run (exact PRE) ->
+--apply. The first --apply REFUSED + rolled back (fail-closed, ZERO mutation) on a CLI bug: targetSlotCount
+excluded the archival ids so POST read 0 not 1; fixed to count ALL cycles at the target (6a21b19), re-ran dry-run
+(exact PRE), --apply COMMITTED. POST-ARCHIVAL RECONCILIATION (read-only): all 6 cycles now at 2026-01-02..07
+(statuses preserved partial/partial/partial/partial/running/running); non-us 2026-08-25..30 = NONE (all freed);
+sync_cycles total 23 unchanged (no add/delete); 30/8/22 accounts; all_primary=false; controls safe-closed;
+source_controls = OLI+Catalog+ASIN Ads only; Campaign Ads/FBA off; the 08-24 go-live cycles untouched. The
+scheduler's Non-US path is now clear from 2026-08-25. REMAINING (user, no gh/token here): dispatch Non-US on the
+first fresh UTC date (2026-08-25) -> require green -> dispatch US -> require green + safe-close -> verify 30x3
+live, Bebi Born 8 countries, ASIN Ads populated, Campaign Ads/FBA paused, no cron, controls closed, creates/tokens
+within 15 exports/30 tokens. NOT "scheduler live" until both fresh-date runs pass + a scheduled trigger is
+observed. State: main @ 6a21b19.
