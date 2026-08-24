@@ -609,7 +609,7 @@ function SnapshotGate({ icon, label, error, loading, notice, onRefresh, busy }) 
           message={error}
           onRetry={onRefresh}
           busy={busy}
-          retryLabel="Refresh from DataDoe"
+          retryLabel="Reload latest data"
         />
       </div>
     );
@@ -621,11 +621,11 @@ function SnapshotGate({ icon, label, error, loading, notice, onRefresh, busy }) 
     <div className="panel">
       <EmptyState
         icon={icon}
-        title={notice ? "Nothing saved for this account yet" : `Reading the saved ${label}…`}
+        title={notice ? "Waiting for the scheduled data refresh" : `Reading the saved ${label}…`}
         actions={onRefresh ? (
           <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={busy}>
             <RefreshCw size={14} className={busy ? "spin" : ""} aria-hidden="true" />
-            Refresh from DataDoe
+            Reload latest data
           </button>
         ) : null}
       >
@@ -979,6 +979,37 @@ function readSharedReportCache(params) {
   return readLargeApiCache(params);
 }
 
+/* ===== Generic automatic report loading (stale-while-revalidate) =====
+   ONE shared mechanism every report page uses so the dashboard behaves like a real app: opening a page, or
+   changing account / brand / date / report, immediately shows any local cache and then reads the authoritative
+   saved Supabase snapshot -- always READ-ONLY (loadSharedReport), so a page visit NEVER spends a DataDoe token.
+   It revalidates when the window regains focus and on a restrained interval, keeps the last-known-good visible
+   while updating, and guards every response so a slow answer for account A can never land under account B. */
+const AUTO_REVALIDATE_MS = 60000;
+
+// Re-run `reload` on window focus / tab-visible and on a restrained interval, but only while `active` and never
+// while the tab is hidden. Read-only by contract (callers pass a snapshot READ, never a DataDoe refresh).
+function useAutoRevalidate(reload, { active, intervalMs = AUTO_REVALIDATE_MS } = {}) {
+  const reloadRef = React.useRef(reload);
+  useEffect(() => { reloadRef.current = reload; }, [reload]);
+  useEffect(() => {
+    if (!active || typeof window === "undefined") return undefined;
+    const run = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (reloadRef.current) reloadRef.current();
+    };
+    const onVisible = () => { if (typeof document === "undefined" || document.visibilityState === "visible") run(); };
+    window.addEventListener("focus", run);
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisible);
+    const id = window.setInterval(run, intervalMs);
+    return () => {
+      window.removeEventListener("focus", run);
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisible);
+      window.clearInterval(id);
+    };
+  }, [active, intervalMs]);
+}
+
 /**
  * State for one shared insight report.
  *
@@ -990,32 +1021,41 @@ function readSharedReportCache(params) {
  */
 function useSharedReport({ params, active }) {
   const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(false);   // first paint (no cache yet)
+  const [updating, setUpdating] = useState(false);  // revalidating while a last-known-good is shown
   const [error, setError] = useState(null);
   const [cachedAt, setCachedAt] = useState(null);
   const refreshing = React.useRef(false);
+  // Monotonic request id: only the newest scope's response is allowed to land, so a slow answer for a previous
+  // account/brand/date can never overwrite the current one (no cross-account leak, no stale flash).
+  const reqId = React.useRef(0);
 
   const load = useCallback(async () => {
-    if (!params) { setData(null); setCachedAt(null); setError(null); return; }
+    if (!params) { setData(null); setCachedAt(null); setError(null); setLoading(false); setUpdating(false); return; }
+    const myId = ++reqId.current;
     setError(null);
     let cached = null;
     try { cached = await readSharedReportCache(params); } catch (e) { cached = null; }
-    if (cached) { setData(cached.body); setCachedAt(new Date(cached.cachedAt)); }
-    setLoading(true);
+    if (myId !== reqId.current) return; // scope changed while reading the browser cache
+    if (cached) { setData(cached.body); setCachedAt(new Date(cached.cachedAt)); setUpdating(true); }
+    else setLoading(true);
     try {
       const result = await loadSharedReport(params);
+      if (myId !== reqId.current) return; // a newer scope superseded this read -> ignore its response
       setData(result.body);
       setCachedAt(new Date(result.cachedAt));
     } catch (loadError) {
+      if (myId !== reqId.current) return;
       setError(cached
         ? `Showing the last copy saved in this browser. The shared snapshot could not be read: ${loadError.message}`
         : loadError.message);
     } finally {
-      setLoading(false);
+      if (myId === reqId.current) { setLoading(false); setUpdating(false); }
     }
   }, [params]);
 
   useEffect(() => { if (active) load(); }, [active, load]);
+  useAutoRevalidate(load, { active });
 
   const refresh = useCallback(async () => {
     if (!params || refreshing.current) return;
@@ -1034,7 +1074,7 @@ function useSharedReport({ params, active }) {
     }
   }, [params]);
 
-  return { data, loading, error, cachedAt, refresh, reload: load };
+  return { data, loading, updating, error, cachedAt, refresh, reload: load };
 }
 
 /**
@@ -1492,12 +1532,24 @@ function DashboardApp({ session, access, onSignOut }) {
     }
   }, [accounts.length, allowedAccountIds.size, applyAccounts, brandDirectoryCacheParams, brandDirectoryLoading]);
 
+  // Per-report request guard: a slow response for a previous account/brand/date scope must never overwrite the
+  // current one (no cross-account leak, no stale flash). Each loader bumps its id on entry and applies a response
+  // only while that id is still the newest for its report. One ref keyed by report avoids seven separate refs.
+  const reqIds = React.useRef({});
+  const bumpReq = useCallback((k) => { reqIds.current[k] = (reqIds.current[k] || 0) + 1; return reqIds.current[k]; }, []);
+  const isCurrentReq = useCallback((k, id) => reqIds.current[k] === id, []);
+
   const loadCachedRows = useCallback(async () => {
     if (!dashboardParams) {
+      bumpReq("dashboard");
       setRows([]);
+      setRowsLoading(false);
       return;
     }
+    const myId = bumpReq("dashboard");
+    setRowsLoading(true);
     const cached = await readLargeApiCache(dashboardParams);
+    if (!isCurrentReq("dashboard", myId)) return;
     if (cached) {
       setRows(cached.body.rows || []);
       setCatalogBrands(cached.body.catalogBrands || []);
@@ -1515,6 +1567,7 @@ function DashboardApp({ session, access, onSignOut }) {
     }
     try {
       const { body, cachedAt } = await loadSharedReport(dashboardParams);
+      if (!isCurrentReq("dashboard", myId)) return;
       setRows(body.rows || []);
       setCatalogBrands(body.catalogBrands || []);
       setCatalogBrandsAccountId(selectedAccountId);
@@ -1522,9 +1575,12 @@ function DashboardApp({ session, access, onSignOut }) {
       setRowsError(null);
       setRowsCacheMissing(Boolean(body.snapshotMissing));
     } catch (error) {
+      if (!isCurrentReq("dashboard", myId)) return;
       if (!cached) setRowsError(error.message);
+    } finally {
+      if (isCurrentReq("dashboard", myId)) setRowsLoading(false);
     }
-  }, [dashboardParams]);
+  }, [dashboardParams, bumpReq, isCurrentReq, selectedAccountId]);
 
   const fetchRows = useCallback(() => {
     if (!dashboardParams) {
@@ -1552,6 +1608,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     loadCachedRows();
   }, [loadCachedRows]);
+  useAutoRevalidate(loadCachedRows, { active: view === "dashboard" && dashboardMode === "account" });
 
   useEffect(() => { setSelectedBrand("ALL"); }, [selectedAccountId]);
 
@@ -1565,10 +1622,17 @@ function DashboardApp({ session, access, onSignOut }) {
 
   const loadCachedDaily = useCallback(async () => {
     if (!dailyParams) {
+      bumpReq("daily");
       setDailyRows([]);
+      setDailyLoading(false);
       return;
     }
+    const myId = bumpReq("daily");
+    // No cached copy yet => first paint shows a skeleton (dailyLoading); a revalidation with rows already shown
+    // keeps them visible and flips the header to a compact "Updating…" instead of clearing the report.
+    setDailyLoading(true);
     const cached = await readLargeApiCache(dailyParams);
+    if (!isCurrentReq("daily", myId)) return;
     if (cached) {
       setDailyRows(cached.body.rows || []);
       setLastFetchedAt(new Date(cached.cachedAt));
@@ -1579,13 +1643,17 @@ function DashboardApp({ session, access, onSignOut }) {
     }
     try {
       const { body, cachedAt } = await loadSharedReport(dailyParams);
+      if (!isCurrentReq("daily", myId)) return;
       setDailyRows(body.rows || []);
       setLastFetchedAt(new Date(cachedAt));
       setDailyError(body.snapshotMissing ? body.message : null);
     } catch (error) {
+      if (!isCurrentReq("daily", myId)) return;
       if (!cached) setDailyError(error.message);
+    } finally {
+      if (isCurrentReq("daily", myId)) setDailyLoading(false);
     }
-  }, [dailyParams]);
+  }, [dailyParams, bumpReq, isCurrentReq]);
 
   const fetchDaily = useCallback(() => {
     if (!dailyParams || dailyLoading) return;
@@ -1603,6 +1671,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "daily") loadCachedDaily();
   }, [view, loadCachedDaily]);
+  useAutoRevalidate(loadCachedDaily, { active: view === "daily" });
 
   // FBA Shipment Plan: cache-first, single selected account, manual refresh only.
   const planParams = useMemo(() => {
@@ -1616,10 +1685,13 @@ function DashboardApp({ session, access, onSignOut }) {
 
   const loadCachedPlan = useCallback(async () => {
     if (!planParams) {
+      bumpReq("fbaplan");
       setPlanData(null);
       return;
     }
+    const myId = bumpReq("fbaplan");
     const cached = await readLargeApiCache(planParams);
+    if (!isCurrentReq("fbaplan", myId)) return;
     if (cached) {
       setPlanData(cached.body);
       setPlanCachedAt(new Date(cached.cachedAt));
@@ -1629,10 +1701,11 @@ function DashboardApp({ session, access, onSignOut }) {
       setPlanData(null);
       setPlanCachedAt(null);
       setPlanError(null);
-      setSnapshotNotice("No saved FBA Shipment Plan for this account yet. Refresh to fetch it from DataDoe.");
+      setSnapshotNotice("No saved FBA Shipment Plan for this account yet — waiting for the scheduled data refresh.");
     }
     try {
       const { body, cachedAt } = await loadSharedReport(planParams);
+      if (!isCurrentReq("fbaplan", myId)) return;
       if (body.snapshotMissing) {
         setPlanData(null);
         setPlanCachedAt(null);
@@ -1644,9 +1717,10 @@ function DashboardApp({ session, access, onSignOut }) {
         setSnapshotNotice(null);
       }
     } catch (error) {
+      if (!isCurrentReq("fbaplan", myId)) return;
       if (!cached) setPlanError(error.message);
     }
-  }, [planParams]);
+  }, [planParams, bumpReq, isCurrentReq]);
 
   const fetchPlan = useCallback(() => {
     if (!planParams || planLoading) return;
@@ -1664,6 +1738,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "fbaplan") loadCachedPlan();
   }, [view, loadCachedPlan]);
+  useAutoRevalidate(loadCachedPlan, { active: view === "fbaplan" });
 
   const reconciliationWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
   const reconciliationParams = useMemo(() => {
@@ -1683,19 +1758,23 @@ function DashboardApp({ session, access, onSignOut }) {
 
   const loadCachedReconciliation = useCallback(async () => {
     if (!reconciliationParams) {
+      bumpReq("reconciliation");
       setReconciliationData(null);
       return;
     }
+    const myId = bumpReq("reconciliation");
     const cached = await readLargeApiCache(reconciliationParams);
+    if (!isCurrentReq("reconciliation", myId)) return;
     if (cached) { setSnapshotNotice(null); applyReconciliationData(cached.body, cached.cachedAt); }
     else {
       setReconciliationData(null);
       setReconciliationCachedAt(null);
       setReconciliationError(null);
-      setSnapshotNotice("No saved reconciliation for this account yet. Refresh to fetch six completed months from DataDoe.");
+      setSnapshotNotice("No saved reconciliation for this account yet — waiting for the scheduled data refresh.");
     }
     try {
       const { body, cachedAt } = await loadSharedReport(reconciliationParams);
+      if (!isCurrentReq("reconciliation", myId)) return;
       if (body.snapshotMissing) {
         setReconciliationData(null);
         setReconciliationCachedAt(null);
@@ -1705,9 +1784,10 @@ function DashboardApp({ session, access, onSignOut }) {
         applyReconciliationData(body, cachedAt);
       }
     } catch (error) {
+      if (!isCurrentReq("reconciliation", myId)) return;
       if (!cached) setReconciliationError(error.message);
     }
-  }, [applyReconciliationData, reconciliationParams]);
+  }, [applyReconciliationData, reconciliationParams, bumpReq, isCurrentReq]);
 
   const fetchReconciliation = useCallback(() => {
     if (!reconciliationParams || reconciliationLoading) return;
@@ -1722,6 +1802,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "reconciliation") loadCachedReconciliation();
   }, [view, loadCachedReconciliation]);
+  useAutoRevalidate(loadCachedReconciliation, { active: view === "reconciliation" });
 
   // SKU P&L Analyzer: six full calendar months, cache-first, shared header scope.
   const skuPlWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
@@ -1753,17 +1834,20 @@ function DashboardApp({ session, access, onSignOut }) {
   }, []);
 
   const loadCachedSkuPl = useCallback(async () => {
-    if (!skuPlParams) { setSkuPlData(null); return; }
+    if (!skuPlParams) { bumpReq("skupl"); setSkuPlData(null); return; }
+    const myId = bumpReq("skupl");
     const cached = await readLargeApiCache(skuPlParams);
+    if (!isCurrentReq("skupl", myId)) return;
     if (cached) { setSnapshotNotice(null); applySkuPlData(cached.body, cached.cachedAt, accountById[selectedAccountId]?.currency); }
     else {
       setSkuPlData(null);
       setSkuPlCachedAt(null);
       setSkuPlError(null);
-      setSnapshotNotice("No saved SKU P&L for this account yet. Refresh to fetch six completed months from DataDoe.");
+      setSnapshotNotice("No saved SKU P&L for this account yet — waiting for the scheduled data refresh.");
     }
     try {
       const { body, cachedAt } = await loadSharedReport(skuPlParams);
+      if (!isCurrentReq("skupl", myId)) return;
       if (body.snapshotMissing) {
         setSkuPlData(null);
         setSkuPlCachedAt(null);
@@ -1773,9 +1857,10 @@ function DashboardApp({ session, access, onSignOut }) {
         applySkuPlData(body, cachedAt, accountById[selectedAccountId]?.currency);
       }
     } catch (error) {
+      if (!isCurrentReq("skupl", myId)) return;
       if (!cached) setSkuPlError(error.message);
     }
-  }, [applySkuPlData, skuPlParams, accountById, selectedAccountId]);
+  }, [applySkuPlData, skuPlParams, accountById, selectedAccountId, bumpReq, isCurrentReq]);
 
   const fetchSkuPl = useCallback(() => {
     if (!skuPlParams || skuPlLoading) return;
@@ -1790,6 +1875,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "skupl") loadCachedSkuPl();
   }, [view, loadCachedSkuPl]);
+  useAutoRevalidate(loadCachedSkuPl, { active: view === "skupl" });
 
   // Reset paging when any SKU P&L filter/scope changes (all local, no refetch).
   useEffect(() => { setSkuPlPage(1); }, [skuPlMonth, skuPlCurrency, skuPlSearch, skuPlStatusFilter, selectedBrand]);
@@ -1812,17 +1898,20 @@ function DashboardApp({ session, access, onSignOut }) {
   }, []);
 
   const loadCachedContentChanges = useCallback(async () => {
-    if (!contentChangesParams) { setContentChangesData(null); return; }
+    if (!contentChangesParams) { bumpReq("contentchanges"); setContentChangesData(null); return; }
+    const myId = bumpReq("contentchanges");
     const cached = await readLargeApiCache(contentChangesParams);
+    if (!isCurrentReq("contentchanges", myId)) return;
     if (cached) { setSnapshotNotice(null); applyContentChangesData(cached.body, cached.cachedAt); }
     else {
       setContentChangesData(null);
       setContentChangesCachedAt(null);
       setContentChangesError(null);
-      setSnapshotNotice("No saved content alerts for this account yet. Refresh to fetch notifications from DataDoe.");
+      setSnapshotNotice("No saved content alerts for this account yet — waiting for the scheduled data refresh.");
     }
     try {
       const { body, cachedAt } = await loadSharedReport(contentChangesParams);
+      if (!isCurrentReq("contentchanges", myId)) return;
       if (body.snapshotMissing) {
         setContentChangesData(null);
         setContentChangesCachedAt(null);
@@ -1832,9 +1921,10 @@ function DashboardApp({ session, access, onSignOut }) {
         applyContentChangesData(body, cachedAt);
       }
     } catch (error) {
+      if (!isCurrentReq("contentchanges", myId)) return;
       if (!cached) setContentChangesError(error.message);
     }
-  }, [applyContentChangesData, contentChangesParams]);
+  }, [applyContentChangesData, contentChangesParams, bumpReq, isCurrentReq]);
 
   const fetchContentChanges = useCallback(() => {
     if (!contentChangesParams || contentChangesLoading) return;
@@ -1849,6 +1939,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "contentchanges") loadCachedContentChanges();
   }, [view, loadCachedContentChanges]);
+  useAutoRevalidate(loadCachedContentChanges, { active: view === "contentchanges" });
 
   // Keyword Rank & Share Tracker: SQP data is large enough to use IndexedDB
   // when available. Loading a cached account snapshot, changing brand, or
@@ -1872,17 +1963,20 @@ function DashboardApp({ session, access, onSignOut }) {
   }, []);
 
   const loadCachedKeywordRank = useCallback(async () => {
-    if (!keywordRankParams) { setKeywordRankData(null); return; }
+    if (!keywordRankParams) { bumpReq("keywordrank"); setKeywordRankData(null); return; }
+    const myId = bumpReq("keywordrank");
     const cached = await readLargeApiCache(keywordRankParams);
+    if (!isCurrentReq("keywordrank", myId)) return;
     if (cached) { setSnapshotNotice(null); applyKeywordRankData(cached.body, cached.cachedAt); }
     else {
       setKeywordRankData(null);
       setKeywordRankCachedAt(null);
       setKeywordRankError(null);
-      setSnapshotNotice("No saved Keyword Rank data for this account yet. Refresh to fetch Search Query Performance from DataDoe.");
+      setSnapshotNotice("No saved Keyword Rank data for this account yet — waiting for the scheduled data refresh.");
     }
     try {
       const { body, cachedAt } = await loadSharedReport(keywordRankParams);
+      if (!isCurrentReq("keywordrank", myId)) return;
       if (body.snapshotMissing) {
         setKeywordRankData(null);
         setKeywordRankCachedAt(null);
@@ -1892,9 +1986,10 @@ function DashboardApp({ session, access, onSignOut }) {
         applyKeywordRankData(body, cachedAt);
       }
     } catch (error) {
+      if (!isCurrentReq("keywordrank", myId)) return;
       if (!cached) setKeywordRankError(error.message);
     }
-  }, [applyKeywordRankData, keywordRankParams]);
+  }, [applyKeywordRankData, keywordRankParams, bumpReq, isCurrentReq]);
 
   const fetchKeywordRank = useCallback(() => {
     if (!keywordRankParams || keywordRankLoading) return;
@@ -1909,6 +2004,7 @@ function DashboardApp({ session, access, onSignOut }) {
   useEffect(() => {
     if (view === "keywordrank") loadCachedKeywordRank();
   }, [view, loadCachedKeywordRank]);
+  useAutoRevalidate(loadCachedKeywordRank, { active: view === "keywordrank" });
 
   /* ===== The six insight reports =====
      Each one is single-account, read from the shared Supabase snapshot on
@@ -2623,23 +2719,23 @@ function DashboardApp({ session, access, onSignOut }) {
           <AlertTriangle size={20} style={{ marginBottom: 8 }} />
           <div>{accountsError}</div>
           <div style={{ fontSize: 12.5, color: "var(--ink-soft)", marginTop: 8 }}>
-            The dashboard now uses cached data on open. Use refresh only when you want to call DataDoe.
+            The dashboard loads the latest saved data automatically. Reports never call DataDoe on open.
           </div>
           <button className="cache-refresh-btn" onClick={fetchAccounts} disabled={accountsLoading}>
             <RefreshCw size={14} className={accountsLoading ? "spin" : ""} />
-            Refresh accounts
+            Retry loading accounts
           </button>
         </div>
       </div>
     );
   }
 
-  /* ===== The header Refresh control =====
-     One button drives every view, and it is still the ONLY thing in the app
-     that may call DataDoe. This descriptor keeps that routing in one place:
-     which report the click refreshes, whether a request is already in flight,
-     and what the status line should say. The Priority Feed owns no data of its
-     own, so it is deliberately not refreshable from here. */
+  /* ===== The header Reload control =====
+     One button drives every view. It now RELOADS the latest saved data (read-only)
+     and never calls DataDoe -- DataDoe refreshes are owned by Scheduler-v2 and by
+     explicit admin syncs in the Data Sync Center. This descriptor keeps the routing
+     in one place. The Priority Feed owns no data of its own and updates from the six
+     saved reports, so it is deliberately not reloadable from here. */
   const showingBrandPortfolio = view === "dashboard" && dashboardMode === "brand";
   const activeStamp = onFeed ? null
     : showingBrandPortfolio ? brandDirectoryFetchedAt
@@ -2665,38 +2761,35 @@ function DashboardApp({ session, access, onSignOut }) {
     // In portfolio mode this button refreshes the BRAND LIST only. Rebuilding
     // the report itself is the Refresh inside the Brand View page, so the two
     // actions stay distinct instead of one button meaning two things.
-    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? "Brand directory" : "Last refreshed",
+    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? "Brand directory" : "Last updated",
     value: onFeed
       ? accountLabel
       : activeBusy
-        ? "Fetching…"
+        ? "Updating…"
         : activeStamp
           ? `${activeStamp.toLocaleTimeString()} · ${refreshScopeLabel}`
-          : showingBrandPortfolio ? "Not yet loaded" : selectedAccountId ? "Not yet refreshed" : "Select an account",
+          : showingBrandPortfolio ? "Not yet loaded" : selectedAccountId ? "Not yet loaded" : "Select an account",
     live: Boolean(activeStamp) || onFeed,
     busy: activeBusy,
+    // READ-ONLY reload: re-reads the latest saved snapshot (self-healing for Daily). It NEVER calls DataDoe or
+    // spends a token -- scheduled refreshes are owned by Scheduler-v2 and explicit admin syncs in the Data Sync
+    // Center. Every report page routes to its cache-first loader; the brand directory reloads the brand list.
     onRefresh: onFeed ? undefined
       : showingBrandPortfolio ? fetchBrandDirectory
-      : activeInsightReport ? activeInsightReport.refresh
-      : view === "daily" ? fetchDaily
-      : view === "fbaplan" ? fetchPlan
-      : view === "reconciliation" ? fetchReconciliation
-      : view === "skupl" ? fetchSkuPl
-      : view === "keywordrank" ? fetchKeywordRank
-      : view === "contentchanges" ? fetchContentChanges
-      : fetchRows,
-    // Disabled for every report while its own request is in flight. This closes
-    // the documented duplicate-refresh gap: repeated clicks could previously
-    // launch concurrent 25-45 s DataDoe exports for the dashboard, Daily
-    // Reporting and the FBA plan.
-    disabled: onFeed || activeBusy || (showingBrandPortfolio && !accounts.length && !isAdmin && !allowedAccountIds.size),
+      : activeInsightReport ? activeInsightReport.reload
+      : view === "daily" ? loadCachedDaily
+      : view === "fbaplan" ? loadCachedPlan
+      : view === "reconciliation" ? loadCachedReconciliation
+      : view === "skupl" ? loadCachedSkuPl
+      : view === "keywordrank" ? loadCachedKeywordRank
+      : view === "contentchanges" ? loadCachedContentChanges
+      : loadCachedRows,
+    disabled: onFeed || (showingBrandPortfolio && !accounts.length && !isAdmin && !allowedAccountIds.size),
     hint: onFeed
-      ? "The Priority Feed combines the six saved reports. Refresh from the individual report that owns the data."
+      ? "The Priority Feed combines the six saved reports. Each updates automatically from its saved data."
       : showingBrandPortfolio
-        ? "Reload the portfolio brand list from the accounts you may access. Use the Refresh inside the report to rebuild the report itself."
-        : activeInsightReport
-        ? "Refresh this report from DataDoe for the selected account and save it for everyone with access"
-        : `Refresh ${accountLabel} from DataDoe`,
+        ? "Reload the portfolio brand list from the accounts you may access."
+        : "Reload the latest saved data. This never calls DataDoe — refreshes run automatically on schedule or from the Data Sync Center.",
   };
 
   // Brand View owns its own account/brand/date/currency control bar, so the
@@ -2845,11 +2938,11 @@ function DashboardApp({ session, access, onSignOut }) {
           <div className="panel">
             <EmptyState
               icon={<DatabaseZap size={19} aria-hidden="true" />}
-              title="Nothing saved for this account yet"
+              title="Waiting for the scheduled data refresh"
               actions={(
-                <button className="plan-export-btn" type="button" onClick={fetchRows} disabled={rowsLoading}>
+                <button className="plan-export-btn" type="button" onClick={loadCachedRows} disabled={rowsLoading}>
                   <RefreshCw size={14} className={rowsLoading ? "spin" : ""} aria-hidden="true" />
-                  Refresh from DataDoe
+                  Reload latest data
                 </button>
               )}
             >
@@ -3001,7 +3094,7 @@ function DashboardApp({ session, access, onSignOut }) {
         )}
 
         <div className="footer-note">
-          Total Sales is DataDoe Order Line Items <code>item_price_value</code>, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (<code>product_brand</code>) for the selected account. Money is shown in the selected marketplace's currency and is never converted or combined with another currency. Changing account, brand, date range or granularity reads saved data only; <strong>Refresh is the only action that calls DataDoe</strong>. Comparisons and sparklines are computed from the same saved rows and are withheld — shown as an em dash or omitted — whenever this account lacks the earlier period they would need. If the warning above appears, DataDoe returned units without an order value, so refresh again after its upstream order data is completed.
+          Total Sales is DataDoe Order Line Items <code>item_price_value</code>, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (<code>product_brand</code>) for the selected account. Money is shown in the selected marketplace's currency and is never converted or combined with another currency. Changing account, brand, date range or granularity reads saved data only; <strong>opening or reloading this report never calls DataDoe</strong> — refreshes run automatically on schedule or from the Data Sync Center. Comparisons and sparklines are computed from the same saved rows and are withheld — shown as an em dash or omitted — whenever this account lacks the earlier period they would need. If the warning above appears, DataDoe returned units without an order value; the next scheduled refresh corrects it once its upstream order data is complete.
         </div>
       </div>
       ))}
@@ -3027,7 +3120,7 @@ function DashboardApp({ session, access, onSignOut }) {
                   : `Reported in ${dailyCurrency}`}
               </div>
             </div>
-            <button className="refresh-btn" onClick={fetchDaily} disabled={dailyLoading} title="Refresh this report from DataDoe" aria-label="Refresh Daily Reporting">
+            <button className="refresh-btn" onClick={loadCachedDaily} disabled={dailyLoading} title="Reload the latest saved data (no DataDoe export)" aria-label="Reload Daily Reporting">
               <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
             </button>
           </div>
@@ -3040,16 +3133,16 @@ function DashboardApp({ session, access, onSignOut }) {
           ) : !dailyRows.length ? (
             <EmptyState
               icon={<DatabaseZap size={19} aria-hidden="true" />}
-              title={selectedAccountId ? "Nothing saved for this account yet" : "No account selected"}
+              title={selectedAccountId ? "Waiting for the scheduled data refresh" : "No account selected"}
               actions={selectedAccountId ? (
-                <button className="plan-export-btn" type="button" onClick={fetchDaily} disabled={dailyLoading}>
+                <button className="plan-export-btn" type="button" onClick={loadCachedDaily} disabled={dailyLoading}>
                   <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
-                  Refresh from DataDoe
+                  Reload latest data
                 </button>
               ) : null}
             >
               {selectedAccountId
-                ? "Refresh to fetch this account's daily sales and advertising history. Navigating between reports and changing filters never calls DataDoe."
+                ? "This account's daily sales and advertising are prepared automatically from saved data. Navigating between reports and changing filters never calls DataDoe."
                 : "Choose an Amazon account in the command bar above."}
             </EmptyState>
           ) : (
@@ -3114,7 +3207,7 @@ function DashboardApp({ session, access, onSignOut }) {
             error={reconciliationError}
             loading={reconciliationLoading}
             notice={snapshotNotice}
-            onRefresh={fetchReconciliation}
+            onRefresh={loadCachedReconciliation}
             busy={reconciliationLoading}
           />
         )}
@@ -3372,7 +3465,7 @@ function DashboardApp({ session, access, onSignOut }) {
             error={planError}
             loading={planLoading}
             notice={snapshotNotice}
-            onRefresh={fetchPlan}
+            onRefresh={loadCachedPlan}
             busy={planLoading}
           />
         )}
@@ -3421,7 +3514,7 @@ function DashboardApp({ session, access, onSignOut }) {
             error={skuPlError}
             loading={skuPlLoading}
             notice={snapshotNotice}
-            onRefresh={fetchSkuPl}
+            onRefresh={loadCachedSkuPl}
             busy={skuPlLoading}
           />
         )}
@@ -3577,7 +3670,7 @@ function DashboardApp({ session, access, onSignOut }) {
             error={keywordRankError}
             loading={keywordRankLoading}
             notice={snapshotNotice}
-            onRefresh={fetchKeywordRank}
+            onRefresh={loadCachedKeywordRank}
             busy={keywordRankLoading}
           />
         )}
@@ -3717,7 +3810,7 @@ function DashboardApp({ session, access, onSignOut }) {
             error={contentChangesError}
             loading={contentChangesLoading}
             notice={snapshotNotice}
-            onRefresh={fetchContentChanges}
+            onRefresh={loadCachedContentChanges}
             busy={contentChangesLoading}
           />
         )}

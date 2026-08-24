@@ -152,6 +152,11 @@ export async function beginSharedRefresh({
 export async function serveSharedReport({
   res, refresh, reportKey, reportVersion, accountId, params, userId, label, build,
   lockSeconds = DEFAULT_LOCK_SECONDS, present = (payload) => payload,
+  // Optional TRUSTED ZERO-EXPORT durable re-derivation. When provided (Daily Reporting) and no compatible saved
+  // snapshot exists on a READ, recompute the current-version payload from already-durable evidence and publish
+  // it so the page auto-populates on this very visit -- still ZERO DataDoe. () => ({ payload, sourceRefreshedAt }
+  // | { notReady, blockedBy? }). NEVER passed a DataDoe adapter, so it cannot create an export.
+  deriveDurable = null,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
 
@@ -204,10 +209,31 @@ export async function serveSharedReport({
       return;
     }
 
+    // No exact + no compatible stale snapshot. If a trusted zero-export durable re-derivation exists for this
+    // report, recompute the current-version payload from durable evidence and publish it NOW (still zero DataDoe),
+    // so a normal page visit auto-populates instead of showing "Nothing saved" while durable evidence is present.
+    if (deriveDurable) {
+      const healed = await selfHealFromDurable({
+        deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds,
+      });
+      if (healed.served) return;
+      if (healed.notReady) {
+        res.status(200).json({
+          snapshotMissing: true, reportKey, reportVersion, accountId, paramsHash,
+          waitingForScheduledData: true,
+          missingSources: healed.missingSources || [],
+          message: healed.message,
+        });
+        return;
+      }
+      // Concurrent re-derivation in flight (lock held elsewhere) and not yet landed: fall through to the honest
+      // "not saved yet" state; the in-flight derivation will publish it for the next read.
+    }
+
     res.status(200).json({
       snapshotMissing: true,
       reportKey, reportVersion, accountId, paramsHash,
-      message: `No saved ${label} for this account yet. Click Refresh once to fetch it from DataDoe — everyone with access to this account will then read the same saved data.`,
+      message: `No saved ${label} for this account yet — waiting for the scheduled data refresh.`,
     });
     return;
   }
@@ -253,5 +279,98 @@ export async function serveSharedReport({
     });
   } finally {
     await releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {});
+  }
+}
+
+// Friendly names for the durable sources a re-derivation can be blocked on (for the "waiting" message).
+const SOURCE_LABELS = {
+  "order-line-items": "Order Line Items sales history",
+  "product-catalog": "Product Catalog",
+  "ads-asin-date": "Amazon Ads (ASIN)",
+};
+function describeMissingSources(blockedBy) {
+  const keys = [...new Set((Array.isArray(blockedBy) ? blockedBy : [])
+    // Only sources that actually block the report (sales) matter for the "waiting" state; an Ads-only gap
+    // never blocks -- the report still shows sales with Ads typed unavailable.
+    .filter((b) => b && b.blocksSales)
+    .map((b) => b.sourceKey))];
+  return keys.map((k) => SOURCE_LABELS[k] || k);
+}
+
+function serveSnapshotJson(res, snapshot, { reportKey, reportVersion, paramsHash, present, extra = {} }) {
+  res.status(200).json({
+    ...present(snapshot.payload),
+    reportKey, reportVersion, paramsHash,
+    snapshot: { ...snapshotMeta(snapshot), ...extra },
+  });
+}
+
+// The default durable store the self-heal writes through (injectable for offline tests).
+const DEFAULT_STORE = { claimRefreshLock, releaseRefreshLock, getReportSnapshot, saveReportSnapshot, publishSnapshotUpdate };
+
+// Persist a payload produced by a trusted zero-export re-derivation under the EXACT live identity, and broadcast
+// the compact update event. Mirrors beginSharedRefresh.finish's write, minus any DataDoe involvement.
+async function persistDerivedSnapshot({ reportKey, reportVersion, accountId, paramsHash, params, payload, sourceRefreshedAt, label }, store = DEFAULT_STORE) {
+  const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+  if (payloadBytes > MAX_SNAPSHOT_BYTES) {
+    throw new Error(`${label} re-derived ${(payloadBytes / (1024 * 1024)).toFixed(1)} MB, above the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB shared-snapshot limit; it was not saved.`);
+  }
+  const saved = await store.saveReportSnapshot({
+    reportKey, accountId, paramsHash,
+    params: { reportVersion, ...params },
+    payload, payloadBytes,
+    sourceRefreshedAt: sourceRefreshedAt || new Date().toISOString(),
+  });
+  if (saved?.id) await store.publishSnapshotUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
+  return {
+    savedAt: saved?.source_refreshed_at || sourceRefreshedAt || new Date().toISOString(),
+    updatedAt: saved?.updated_at || null,
+    payload_bytes: payloadBytes,
+  };
+}
+
+/**
+ * Trusted ZERO-EXPORT self-heal for a read whose snapshot is missing. Serializes on the SAME refresh lock so a
+ * burst of concurrent page loads produces exactly ONE re-derivation/save; the losers re-read (and serve if it has
+ * landed). Returns { served } | { served:false, notReady, missingSources, message } | { served:false } (a
+ * concurrent derivation is in flight but not yet saved -> caller shows the honest "not saved yet" state).
+ * `store` is injectable so the concurrency + zero-export contract is provable offline.
+ */
+export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds }, store = DEFAULT_STORE) {
+  const locked = await store.claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds });
+  if (!locked) {
+    // Another request already holds the lock and is re-deriving this exact snapshot. Never derive twice; re-read
+    // once and serve it if it has already landed, otherwise report missing for this read.
+    const snap = await store.getReportSnapshot({ reportKey, accountId, paramsHash });
+    if (snap && snap.payload) { serveSnapshotJson(res, snap, { reportKey, reportVersion, paramsHash, present, extra: { rederived: true } }); return { served: true }; }
+    return { served: false };
+  }
+  try {
+    // Double-check inside the lock: the race winner may have just published it.
+    const existing = await store.getReportSnapshot({ reportKey, accountId, paramsHash });
+    if (existing && existing.payload) { serveSnapshotJson(res, existing, { reportKey, reportVersion, paramsHash, present, extra: { rederived: true } }); return { served: true }; }
+
+    // A re-derivation FAILURE (e.g. an unreadable durable source or a row-limit) must degrade to the honest
+    // "waiting" state on a READ -- never a 500 and never a fabricated value.
+    let derived = null;
+    try { derived = await deriveDurable(); }
+    catch (e) { return { served: false, notReady: true, missingSources: [], message: `Waiting for the scheduled data refresh before ${label} can be shown. No fabricated values are displayed and no export is created.` }; }
+    if (!derived || !derived.payload) {
+      const missingSources = describeMissingSources(derived && derived.blockedBy);
+      const named = missingSources.length ? ` (waiting for: ${missingSources.join(", ")})` : "";
+      return {
+        served: false, notReady: true, missingSources,
+        message: `Waiting for the scheduled data refresh before ${label} can be shown${named}. No fabricated values are displayed and no export is created.`,
+      };
+    }
+    const saved = await persistDerivedSnapshot({ reportKey, reportVersion, accountId, paramsHash, params, payload: derived.payload, sourceRefreshedAt: derived.sourceRefreshedAt, label }, store);
+    res.status(200).json({
+      ...present(derived.payload),
+      reportKey, reportVersion, paramsHash,
+      snapshot: { savedAt: saved.savedAt, updatedAt: saved.updatedAt, bytes: saved.payload_bytes, shared: true, rederived: true },
+    });
+    return { served: true };
+  } finally {
+    await store.releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {});
   }
 }

@@ -46,9 +46,9 @@ function SourceCard({ card, busyKey, onPause, onSyncMissing }) {
           {card.paused ? <PlayCircle size={14} /> : <PauseCircle size={14} />}
           {pauseBusy ? "Saving…" : card.paused ? "Resume" : "Pause"}
         </button>
-        <button type="button" className="cache-refresh-btn" disabled={!!busyKey || card.paused} onClick={() => onSyncMissing(card)}>
+        <button type="button" className="cache-refresh-btn" disabled={!!busyKey || card.paused} onClick={() => onSyncMissing(card)} title="Admin only: spend DataDoe tokens to sync this source">
           <RefreshCw size={14} className={syncBusy ? "spin" : ""} />
-          {syncBusy ? "Syncing…" : "Sync missing data"}
+          {syncBusy ? "Syncing…" : "Sync source"}
         </button>
       </div>
     </section>

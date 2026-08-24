@@ -30,9 +30,14 @@ import {
   deleteReportSnapshotByKey,
   getAsinAdsDailyRows,
   getDashboardAccess,
+  getDailyAdsCoverage,
   getLatestReportSnapshot,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
+  getSourceCoverageWindows,
+  getSourceOliHistoryRows,
+  getSourceSnapshot,
+  getSourceSnapshotPayload,
   insertReportSnapshotIfAbsent,
   isSafeSnapshotRev,
   isSupabaseConfigured,
@@ -108,6 +113,8 @@ import {
 } from "../lib/server/reports/brand-view.js";
 import { membershipBrandsForAccount, selectorBrandsForAccount } from "../lib/server/reports/brand-membership.js";
 import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
+import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
+import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
 // Keep the rest of this legacy route's report builders connection-agnostic.
@@ -2450,6 +2457,34 @@ async function handleDataDoe(req, res) {
         ...legacyShared,
         userId: access.userId,
       };
+      // Daily Reporting self-heals on a READ: if no daily-reporting-shared-v2 snapshot exists yet, recompute it
+      // from durable evidence (OLI history + ASIN Ads + the reusable Product Catalog snapshot) through the REAL
+      // derivation contract and publish it -- ZERO DataDoe. This closes the rollout-order gap where the frontend
+      // requests v2 before any v2 snapshot was published, WITHOUT ever spending a token on a page visit.
+      if (action === "daily" && accountScope && accountScope.accountIds.length === 1) {
+        const dailyPrimary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+        if (dailyPrimary) {
+          const dailyOrgFingerprint = dailyPrimary.organizationFingerprint || organizationFingerprint(dailyPrimary.apiKey);
+          const dailyAccountId = accountScope.accountIds[0];
+          const dailyRawSellerId = (accountScope.rawAccountIds && accountScope.rawAccountIds[0]) || dailyAccountId;
+          const dailyDurableReaders = {
+            readOliHistory: getSourceOliHistoryRows,
+            readOliCoverage: getSourceCoverageWindows,
+            readAsinAds: getAsinAdsDailyRows,
+            readAdsCoverage: getDailyAdsCoverage,
+            readCatalogSnapshot: getSourceSnapshot,
+            loadCatalogPayload: getSourceSnapshotPayload,
+          };
+          sharedOptions.deriveDurable = async () => {
+            const meta = await accountDirectoryMeta(dailyAccountId).catch(() => null);
+            return rederiveDailyV2({
+              accountId: dailyAccountId, rawSellerId: dailyRawSellerId, currency: meta ? meta.currency : null,
+              from: legacyShared.params.from, to: legacyShared.params.to, brand: legacyShared.params.brand || "ALL",
+              organizationFingerprint: dailyOrgFingerprint,
+            }, dailyDurableReaders);
+          };
+        }
+      }
       if (!wantsRefresh(req)) {
         // Brand Directory v1 contained a usable brand list but not the newer
         // brand-to-account map. Keep serving it instantly while a v2 map is

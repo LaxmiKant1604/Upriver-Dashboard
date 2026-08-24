@@ -157,9 +157,9 @@ export function SnapshotState({ data, loading, error, label, icon }) {
   if (data.snapshotMissing) {
     return (
       <EmptyPanel icon={icon}>
-        {data.message || `No saved ${label} for this account yet.`}
+        {data.message || `No saved ${label} for this account yet — waiting for the scheduled data refresh.`}
         <div className="page-sub" style={{ marginTop: 8 }}>
-          Refresh is the only action that calls DataDoe. Once one person refreshes, everyone with access to this account reads the same saved result.
+          This report updates automatically from saved data. DataDoe refreshes run on schedule or from the Data Sync Center — opening this page never calls DataDoe.
         </div>
       </EmptyPanel>
     );
