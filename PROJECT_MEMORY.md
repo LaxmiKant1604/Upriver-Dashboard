@@ -11480,3 +11480,35 @@ persisted, no publish) -> dispatch us (observe OLI+ASIN Ads+Catalog+publish 30x3
 safe-close) -> confirm 30x3 live snapshots, Bebi Born 8 countries live, ASIN Ads populated, Campaign Ads/FBA
 paused, <=30 tokens, schedules at 07:30/16:00 IST. State: main @ 6b1f1ba (code) + docs. See
 [[scheduler-v2-golive-status]].
+
+## Scheduler-v2 Non-US run #1 FAILED -> fixed (terminal same-date priority cycle reuse) -- 2026-08-24 (code bc1b98c + docs)
+
+The first controlled scheduler-v2 Non-US run (workflow_dispatch, bucket=non-us, asOf=2026-08-23) passed the
+secret/asOf/npm/token gates then FAILED at "Refresh canonical OLI": preflight ok 22 accounts; cycle 8d5521f;
+oli_open=0; assessment batches=0 creates=0/5; no-oli-jobs; owner-coverage-missing for all 22. Zero creates/tokens
+spent. READ-ONLY RECON: the (non-us, 2026-08-24) cycle is uniquely e8d5521f-91fa-446e-bfa0-97e52796024e --
+status=succeeded (TERMINAL), trigger=manual, created 06:46 during the go-live, holding {product-catalog:1} + 66
+report jobs + ZERO OLI jobs/owners. Durable OLI coverage was NOT complete through 2026-08-23 (0/30 accounts;
+22 at 2026-08-22), so the fetch need was real. ROOT CAUSE = cycle identity: the scheduled OLI run shares the
+(bucket, today) cycle with the priority release, and the go-live had already finalized 2026-08-24 as a
+catalog-only priority cycle, so the OLI run reused a terminal cycle it could not append to and assessed an
+unrelated cycle as its own. NOT a planner defect (the rolling plan would emit 5 batches on a fresh cycle); NOT
+weakenable (open=0 with zero jobs must fail).
+
+FIX (bc1b98c): pure classifyScheduledOliCycle (source-scheduled-oli.js) + a pre-check in scheduled-oli-refresh.mjs
+BEFORE any create, using the SAME strict assessScheduledOliCycle (unchanged): absent/running -> run OLI;
+TERMINAL + a COMPLETE scheduled OLI run (assessed open=0) -> idempotent same-day replay (zero re-fetch); TERMINAL
++ not-a-completed-OLI-run (catalog/priority/unrelated) -> typed SCHEDULED_OLI_TERMINAL_CYCLE refusal (exit 1,
+zero creates); unexpected status -> fail closed; >1 (bucket,date) cycle -> SCHEDULED_OLI_AMBIGUOUS_CYCLE. Never
+appends to a terminal cycle, never fabricates owners, never assesses an unrelated cycle as its own; no
+delete/re-date/reset of historical cycles; <=5 sellers/export, Non-US 5 creates/10 tokens, one create/hash, LKG +
+durable history preserved. Regressions G1-G5. verify 58/58. PROD-VERIFIED: running the fixed operator for the
+failing 2026-08-24 scenario emits the typed terminal-cycle refusal with ZERO creates (balance unchanged, 84).
+
+IMPORTANT RE-RUN CONSTRAINT: clock today is STILL 2026-08-24, and e8d5521f permanently occupies that non-us slot
+(cannot re-date/delete per mission), so a Non-US re-run TODAY correctly REFUSES (not "green"). It goes GREEN on
+the next UTC day (2026-08-25+, a fresh cycle date); the rolling 7-day window then fetches the missed 2026-08-23.
+Dispatching/observing the GitHub run still needs the user (no gh CLI / GitHub token here). Residual: leftover
+FUTURE-dated running non-us recovery cycles exist at 2026-08-29 (768eb243, 10 OLI jobs) + 2026-08-30 (15d1f749,
+17 OLI jobs) -- a scheduler run landing on those exact dates would CONTINUE them (may not owner-cover all 22);
+left untouched per the no-mutation rule. Code+docs pushed to origin/main.
