@@ -12,7 +12,8 @@
 
 import { readFileSync } from "node:fs";
 import pg from "pg";
-import { buildPriorityControlPackage, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } from "../../lib/server/sync/source-priority-control-package.js";
+import { buildPriorityControlPackage, runControlPackageTransaction, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } from "../../lib/server/sync/source-priority-control-package.js";
+import { CONTROLLED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../../lib/server/datadoe-connections.js";
 import { fetchAccounts as fetchDataDoeAccounts } from "../../lib/server/datadoe.js";
 
@@ -35,11 +36,11 @@ const rows = (await fetchDataDoeAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const accounts = active.map((a) => String((a && (a.accountId ?? a.id)) || "").trim()).filter((a) => a && !a.startsWith("dd-secondary:"));
 const pkg = buildPriorityControlPackage({ accounts, operator: OPERATOR });
-const plan = MODE === "rollback" ? pkg.rollback : pkg.apply;
 
 console.log("CONTROL-PACKAGE mode=" + MODE + " accounts=" + pkg.accounts.length + " operator=" + OPERATOR);
 console.log("  dispatch enabled: " + PRIORITY_DISPATCH_ENABLED.join(", ") + "; promoted enabled: " + PRIORITY_PROMOTED_ENABLED + "; all_primary=false; unrelated reports paused; no cron.");
-console.log("  rollout rows: " + plan.rollout.length + "; report_sync_settings: " + plan.reportSyncSettings.length + "; promoted: " + plan.promoted.length + "; approvals: " + plan.approvals.length);
+console.log("  APPLY target: rollout enabled=" + pkg.post.rolloutEnabled.length + "; dispatch enabled=" + pkg.post.dispatchEnabled.length + " (paused=" + pkg.post.dispatchPaused.length + "); promoted enabled=1; approvals=" + pkg.post.approvals.length + ".");
+console.log("  ROLLBACK is a SAFE-CLOSE: disables EVERY rollout row, pauses ALL " + CONTROLLED_REPORT_KEYS.length + " controlled settings, disables EVERY promoted control, revokes EVERY approval (NOT a restoration).");
 if (MODE === "dry-run") { console.log("DRY RUN -- no writes. Re-run with --apply (or --rollback) to execute the guarded transaction."); process.exit(0); }
 
 const base = String(process.env.POSTGRES_URL).split("?")[0];
@@ -47,65 +48,58 @@ const client = new pg.Client({ connectionString: base, ssl: { rejectUnauthorized
 const q = (t, p) => client.query(t, p);
 await client.connect();
 
-async function assertNoCron() {
+async function hasSchedulerCron() {
   const t = await q("select to_regclass('cron.job')::text cron_table");
-  if (!t.rows[0].cron_table) return true;
+  if (!t.rows[0].cron_table) return false;
   const n = await q("select count(*)::int n from cron.job where command ilike '%scheduler%' or command ilike '%sync%' or command ilike '%priority%'");
-  return n.rows[0].n === 0;
+  return n.rows[0].n > 0;
 }
 
-let committed = false;
+// The pg-backed store implementing the runControlPackageTransaction contract. Every WRITE reconciles to an
+// EXACT target (apply) or safe-closes (rollback); every READ returns the COMPLETE current rows for the global
+// POST assertions. begin() opens the transaction under a dedicated advisory lock so two operators cannot race.
+const store = {
+  begin: async () => { await q("begin"); await q("select pg_advisory_xact_lock($1::int, $2::int)", ADV); },
+  commit: async () => { await q("commit"); },
+  rollback: async () => { await q("rollback"); },
+  readAllPrimary: async () => { const r = await q("select all_primary from public.scheduler_rollout_mode where id=1"); return r.rows.length === 1 ? r.rows[0].all_primary : null; },
+  hasCron: hasSchedulerCron,
+  setRolloutEnabled: async (accountIds) => {
+    for (const a of accountIds) await q("insert into public.scheduler_account_rollout(account_id,enabled,note) values($1,true,$2) on conflict(account_id) do update set enabled=true,note=excluded.note", [a, "priority dashboards go-live"]);
+    await q("update public.scheduler_account_rollout set enabled=false where enabled=true and not (account_id = any($1::text[]))", [accountIds]);
+  },
+  disableAllRollout: async () => { await q("update public.scheduler_account_rollout set enabled=false where enabled=true"); },
+  setDispatchEnabled: async (enabledKeys, controlled) => {
+    for (const rk of controlled) await q("insert into public.report_sync_settings(report_key,schedule_enabled) values($1,$2) on conflict(report_key) do update set schedule_enabled=excluded.schedule_enabled", [rk, enabledKeys.includes(rk)]);
+  },
+  pauseAllDispatch: async (controlled) => {
+    for (const rk of controlled) await q("insert into public.report_sync_settings(report_key,schedule_enabled) values($1,false) on conflict(report_key) do update set schedule_enabled=false", [rk]);
+  },
+  setPromotedEnabled: async (enabledKeys) => {
+    for (const rk of enabledKeys) await q("insert into public.source_promoted_publish_settings(report_key,publish_enabled) values($1,true) on conflict(report_key) do update set publish_enabled=true", [rk]);
+    await q("update public.source_promoted_publish_settings set publish_enabled=false where publish_enabled=true and not (report_key = any($1::text[]))", [enabledKeys]);
+  },
+  disableAllPromoted: async () => { await q("update public.source_promoted_publish_settings set publish_enabled=false where publish_enabled=true"); },
+  setApprovalsApproved: async (pairs, operator) => {
+    for (const p of pairs) { const [rk, aid] = p.split("|"); await q("insert into public.scheduler_publish_approvals(report_key,account_id,approved,approved_by,approved_at) values($1,$2,true,$3,now()) on conflict(report_key,account_id) do update set approved=true,approved_by=excluded.approved_by,approved_at=now()", [rk, aid, operator]); }
+    await q("update public.scheduler_publish_approvals set approved=false where approved=true and not ((report_key||'|'||account_id) = any($1::text[]))", [pairs]);
+  },
+  revokeAllApprovals: async () => { await q("update public.scheduler_publish_approvals set approved=false where approved=true"); },
+  rolloutRows: async () => (await q("select account_id, enabled from public.scheduler_account_rollout")).rows,
+  dispatchRows: async () => (await q("select report_key, schedule_enabled from public.report_sync_settings")).rows,
+  promotedRows: async () => (await q("select report_key, publish_enabled from public.source_promoted_publish_settings")).rows,
+  approvalRows: async () => (await q("select report_key, account_id, approved from public.scheduler_publish_approvals")).rows,
+};
+
+let result = { committed: false };
 try {
-  await q("begin");
-  await q("select pg_advisory_xact_lock($1::int, $2::int)", ADV);
-
-  // ---- PRE assertions ----
-  const mode = await q("select all_primary from public.scheduler_rollout_mode where id=1");
-  if (mode.rows.length !== 1 || mode.rows[0].all_primary !== false) throw new Error("PRE: all_primary must be false");
-  if (!(await assertNoCron())) throw new Error("PRE: a scheduler cron exists");
-  if (!pkg.accounts.length) throw new Error("PRE: zero discovered primary accounts");
-
-  // ---- WRITES ----
-  for (const r of plan.rollout) {
-    await q("insert into public.scheduler_account_rollout(account_id,enabled,note) values($1,$2,$3) on conflict(account_id) do update set enabled=excluded.enabled,note=excluded.note", [r.account_id, r.enabled, r.note]);
-  }
-  for (const s of plan.reportSyncSettings) {
-    await q("insert into public.report_sync_settings(report_key,schedule_enabled) values($1,$2) on conflict(report_key) do update set schedule_enabled=excluded.schedule_enabled", [s.report_key, s.schedule_enabled]);
-  }
-  for (const p of plan.promoted) {
-    await q("insert into public.source_promoted_publish_settings(report_key,publish_enabled) values($1,$2) on conflict(report_key) do update set publish_enabled=excluded.publish_enabled", [p.report_key, p.publish_enabled]);
-  }
-  for (const a of plan.approvals) {
-    await q("insert into public.scheduler_publish_approvals(report_key,account_id,approved,approved_by,approved_at) values($1,$2,$3,$4,now()) on conflict(report_key,account_id) do update set approved=excluded.approved,approved_by=excluded.approved_by,approved_at=now()", [a.report_key, a.account_id, a.approved, a.approved_by]);
-  }
-
-  // ---- POST assertions (apply mode proves the EXACT target state; rollback proves the reversal) ----
-  const post = pkg.post;
-  const mode2 = await q("select all_primary from public.scheduler_rollout_mode where id=1");
-  if (mode2.rows[0].all_primary !== false) throw new Error("POST: all_primary changed");
-  if (!(await assertNoCron())) throw new Error("POST: a scheduler cron appeared");
-  if (MODE === "apply") {
-    const enabled = (await q("select account_id from public.scheduler_account_rollout where enabled=true order by account_id")).rows.map((r) => r.account_id).filter((a) => post.rolloutEnabled.includes(a));
-    if (JSON.stringify(enabled.sort()) !== JSON.stringify([...post.rolloutEnabled].sort())) throw new Error("POST: rollout-enabled set != package accounts");
-    const dispatchOn = (await q("select report_key from public.report_sync_settings where schedule_enabled=true order by report_key")).rows.map((r) => r.report_key);
-    if (JSON.stringify(dispatchOn.sort()) !== JSON.stringify([...post.dispatchEnabled].sort())) throw new Error("POST: dispatch-enabled set != [daily-reporting, brand-sales] -> " + dispatchOn.join(","));
-    const promo = (await q("select publish_enabled from public.source_promoted_publish_settings where report_key=$1", [post.promotedEnabled])).rows[0];
-    if (!promo || promo.publish_enabled !== true) throw new Error("POST: brand-inventory promoted control not enabled");
-    const appr = (await q("select report_key||'|'||account_id k from public.scheduler_publish_approvals where approved=true and account_id = any($1::text[]) order by k", [post.rolloutEnabled])).rows.map((r) => r.k);
-    if (JSON.stringify(appr.sort()) !== JSON.stringify([...post.approvals].sort())) throw new Error("POST: approved set != 3 keys x every account");
-  } else {
-    const enabled = (await q("select count(*)::int n from public.scheduler_account_rollout where enabled=true and account_id = any($1::text[])", [pkg.accounts])).rows[0].n;
-    if (enabled !== 0) throw new Error("POST(rollback): some package rollout row still enabled");
-    const promo = (await q("select publish_enabled from public.source_promoted_publish_settings where report_key=$1", [PRIORITY_PROMOTED_ENABLED])).rows[0];
-    if (promo && promo.publish_enabled === true) throw new Error("POST(rollback): brand-inventory promoted control still enabled");
-  }
-
-  await q("commit"); committed = true;
-  console.log("COMMITTED control package (" + MODE + ") for " + pkg.accounts.length + " accounts");
+  result = await runControlPackageTransaction({ store, pkg, mode: MODE, controlledReportKeys: CONTROLLED_REPORT_KEYS });
+  if (result.committed) console.log("COMMITTED control package (" + MODE + ") for " + pkg.accounts.length + " accounts");
+  else console.error("ROLLBACK control package (" + MODE + "): " + (result.problem || (result.problems || []).join("; ")));
 } catch (e) {
   try { await q("rollback"); } catch { /* ignore */ }
   console.error("ROLLBACK control package (" + MODE + "): " + (e && e.message));
 } finally {
   try { await client.end(); } catch { /* ignore */ }
 }
-process.exit(committed ? 0 : 1);
+process.exit(result.committed ? 0 : 1);

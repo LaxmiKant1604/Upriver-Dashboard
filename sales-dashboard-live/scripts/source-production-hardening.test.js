@@ -116,6 +116,7 @@ function makeStore() {
     },
     claimCycle(id) { const c = findCycle(id); if (c && c.status === "pending") { c.status = "running"; return true; } return false; },
     getCycle(id) { return findCycle(id); },
+    getCycleByBucketDate(bucket, cycleDate) { return cycles.get(bucket + "|" + cycleDate) || null; },
     upsertSourceJob(job) {
       guardAppend(job.cycleId);
       const m = jobsByCycle.get(job.cycleId);
@@ -3288,6 +3289,56 @@ test("F12d. MIDNIGHT/date drift: US on day 1 + Non-US on day 2 (a DIFFERENT cano
   } catch (e) { blocked = /HASH_MISMATCH|PRIORITY_CATALOG/.test(String(e && e.message)); }
   assert.equal(catCreates(dd), 1, "the day-2 different-hash Catalog create is REFUSED by the operation-wide reservation (never a fourth token)");
   assert.ok(blocked, "the day-2 Non-US derive did NOT complete a second Catalog export");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still exactly two tokens for the whole operation");
+});
+
+/* ===== F13. REAL two-bucket derive + the CROSS-BUCKET reservation-coherent finalize (one shared reservation) ===== */
+group("F13. priority release: cold US creates once, warm Non-US reuses, BOTH finalize; total creates=1/tokens=2");
+
+test("F13. REAL US(cold)+Non-US(warm) on ONE reservation: one Catalog create / two tokens, and BOTH buckets finalize through the real composition (cross-bucket coherence)", async () => {
+  const dd = makeDataDoe(); const reservation = fakeReservation();
+  const h = guardedPriorityHarness([dirAccount("U01"), dirAccount("U02"), euAccount("E01"), euAccount("E02")], dd, reservation);
+  const pfUs = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const pfEu = await h.runtime.preflightEvidence({ bucket: "non-us", today: TODAY });
+  // The REAL two-bucket derive: US creates the one org-scoped Catalog export; Non-US reuses the org cache.
+  const rUs = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pfUs });
+  const rEu = await h.runtime.run({ bucket: "non-us", today: TODAY, preflight: pfEu });
+  assert.equal(rUs.derived.skipped, null, JSON.stringify(rUs.stopReason || rUs.derived));
+  assert.equal(rEu.derived.skipped, null, JSON.stringify(rEu.stopReason || rEu.derived));
+  assert.equal(catCreates(dd), 1, "exactly ONE real Catalog create across both buckets (US)");
+  assert.equal(nonCatCreates(dd), 0, "zero OLI/Ads/FBA creates");
+  assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "two durable tokens for the whole operation");
+  // The one org-scoped Catalog export is SHARED: the priority path force-plans Catalog in BOTH cycles, so both
+  // jobs are attempted (create_export_count=1), but the durable operation-wide reservation makes Non-US ADOPT
+  // the SAME export id US created (never a second DataDoe create / second pair of tokens). That shared export id
+  // is the durable "reuse" proof; catCreates(dd)=1 above proves only ONE bucket truly created.
+  const usCat = h.store.listSourceJobs(rUs.cycleId).find((j) => j.source_key === "product-catalog");
+  const euCat = h.store.listSourceJobs(rEu.cycleId).find((j) => j.source_key === "product-catalog");
+  assert.equal(usCat.create_export_count, 1, "US Catalog job attempted the create");
+  assert.equal(euCat.create_export_count, 1, "Non-US Catalog job was force-planned + attempted (then adopted)");
+  assert.equal(usCat.request_hash, euCat.request_hash, "same org-scoped canonical Catalog hash across buckets");
+  assert.ok(String(usCat.export_id || "").length > 0 && usCat.export_id === euCat.export_id, "Non-US ADOPTED the SAME export id US created (no second export)");
+
+  // Now FINALIZE BOTH buckets through the REAL composition, wired to the harness store + the SAME shared
+  // reservation. US finalizes in the cec=1 (created-here) role; Non-US in the cec=0 CROSS-BUCKET role (the
+  // reservation was created by US). The harness models no `trigger` column; the priority operator opens
+  // MANUAL cycles, so the adapter supplies that reviewed trigger.
+  const pfByBucket = { us: pfUs, "non-us": pfEu };
+  const rel = priorityDash.buildPriorityDashboardsRelease({
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async ({ bucket }) => ({ accounts: pfByBucket[bucket].accounts, today: TODAY }), run: async () => ({}) }),
+    makeInnerAdapter: () => dd,
+    buildPublisher: () => ({ publish: async () => ({ disposition: "published" }), preflight: async () => ({ disposition: "ready" }) }),
+    reservation,
+    makeStore: () => h.store,
+    listReportJobs: async (cycleId) => [...h.store._reportJobs.values()].filter((j) => j.cycle_id === cycleId),
+    getCycleByBucketDate: async (bucket, cycleDate) => { const c = h.store.getCycleByBucketDate(bucket, cycleDate); return c ? { id: c.id, bucket: c.bucket, status: c.status, trigger: "manual" } : null; },
+  });
+  const finUs = await rel.finalizeBucket("us");
+  assert.equal(finUs.disposition, "finalized", "US finalizes (created-here reservation): " + JSON.stringify(finUs));
+  const finEu = await rel.finalizeBucket("non-us");
+  assert.equal(finEu.disposition, "finalized", "Non-US finalizes (CROSS-BUCKET warm reservation): " + JSON.stringify(finEu));
+  // The finalize path spent nothing: still one create / two tokens for the whole operation.
+  assert.equal(catCreates(dd), 1, "still exactly one Catalog create after both finalize");
   assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still exactly two tokens for the whole operation");
 });
 

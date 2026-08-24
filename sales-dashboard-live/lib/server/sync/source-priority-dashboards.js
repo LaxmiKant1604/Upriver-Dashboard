@@ -216,21 +216,40 @@ export function buildPriorityDashboardsRelease({
     const catOwners = (Array.isArray(owners) ? owners : []).filter((o) => S(o.request_hash ?? o.requestHash) === catalogHash);
     if (catOwners.length !== 1 || S(catOwners[0].account_id ?? catOwners[0].accountId) !== ORGANIZATION_SCOPE_KEY) return refuse("catalog-not-org-scope");
 
-    // (4) TOKEN/RESERVATION coherence with the Catalog job's create_export_count. Support a WARM-CACHE-FIRST /
-    // adoption release (create_export_count=0 => zero tokens, NO reservation, but proven durable cache evidence)
-    // AND a cold create (create_export_count=1 => the EXACT created reservation for this hash). Reject every
-    // ambiguous combination.
+    // (4) TOKEN/RESERVATION coherence with the Catalog job's create_export_count -- CROSS-BUCKET aware. The one
+    // org-scoped Catalog export is shared by BOTH buckets against ONE operation-wide reservation, so a bucket
+    // legitimately finalizes in either role:
+    //   create_export_count=1 -> THIS bucket made the create: the EXACT created reservation (same hash, tokens=2)
+    //                            whose export id is the one THIS job created.
+    //   create_export_count=0 -> zero tokens here, but durable cache evidence is REQUIRED, and the reservation is
+    //                            EITHER absent (true warm-cache-first) OR the OTHER bucket's EXACT created
+    //                            reservation (same hash/export/tokens=2). Any reserved-not-created / different
+    //                            hash / malformed export / wrong tokens / unrelated reservation is refused.
     const cec = Number(cj.create_export_count ?? cj.createExportCount);
+    const jobExportId = S(cj.export_id ?? cj.exportId);
     const reservationRow = await reservation.get({ operationKey, catalogRequestHash: null });
-    if (cec === 0) {
-      if (reservationRow) return refuse("reservation-present-without-create");
-      if (!nb(S(cj.cache_object_path ?? cj.cacheObjectPath))) return refuse("no-cache-evidence");
-    } else if (cec === 1) {
+    // An EXACT created reservation for THIS operation's one Catalog export: created status, THIS catalog hash,
+    // a nonblank export id, exactly two tokens. Returns a typed refusal reason, or null when coherent.
+    const provenCreatedReservation = () => {
+      if (S(reservationRow.status) !== "created") return "reservation-not-created";
+      if (S(reservationRow.catalogRequestHash) !== catalogHash) return "reservation-hash-mismatch";
+      if (!nb(S(reservationRow.exportId))) return "reservation-no-export";
+      if (Number(reservationRow.tokensSpent) !== 2) return "reservation-tokens";
+      return null;
+    };
+    if (cec === 1) {
       if (!reservationRow) return refuse("no-reservation-for-create");
-      if (S(reservationRow.status) !== "created") return refuse("reservation-not-created");
-      if (S(reservationRow.catalogRequestHash) !== catalogHash) return refuse("reservation-hash-mismatch");
-      if (!nb(S(reservationRow.exportId))) return refuse("reservation-no-export");
-      if (Number(reservationRow.tokensSpent) !== 2) return refuse("reservation-tokens");
+      const bad = provenCreatedReservation();
+      if (bad) return refuse(bad);
+      if (!nb(jobExportId) || jobExportId !== S(reservationRow.exportId)) return refuse("reservation-export-mismatch");
+    } else if (cec === 0) {
+      if (!nb(S(cj.cache_object_path ?? cj.cacheObjectPath))) return refuse("no-cache-evidence");
+      if (reservationRow) {
+        const bad = provenCreatedReservation();
+        if (bad) return refuse(bad);
+        // If THIS warm job recorded an adopted export id, it must be the SAME org export the reservation created.
+        if (nb(jobExportId) && jobExportId !== S(reservationRow.exportId)) return refuse("reservation-export-mismatch");
+      }
     } else {
       return refuse("bad-create-count", String(cec));
     }

@@ -83,13 +83,25 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const accountList = [...accounts].sort();
   if (!accountList.length) return fail("scope", "no proven accounts to publish");
 
-  // (4) BEFORE any live write: the SHARED publisher preflight for EVERY account x 3 keys. ANY non-'ready' pair
-  //     stops before publishing anything (no partial publish). Same collaborators + logic as the real publish.
+  // (4) BEFORE any live write: the SHARED publisher preflight for EVERY account x 3 keys. The result SHAPE is
+  //     verified strictly (the account id echoes; EXACTLY the frozen three keys, unique, no missing/extra/dup;
+  //     each disposition=ready with a nonblank live identity). ANY violation stops before publishing anything
+  //     (no partial publish). Same collaborators + logic as the real publish.
+  const FROZEN = PRIORITY_DASHBOARDS.reportKeys;
   const gateProblems = [];
   for (const accountId of accountList) {
     const pf = await release.preflightAccount(accountId);
-    for (const r of (pf && pf.results) || []) {
-      if (S(r.disposition) !== "ready") gateProblems.push(r.reportKey + "/" + accountId + " -> " + S(r.disposition));
+    if (!pf || S(pf.accountId) !== S(accountId)) { gateProblems.push(accountId + " -> preflight-account-mismatch (" + S(pf && pf.accountId) + ")"); continue; }
+    const results = Array.isArray(pf.results) ? pf.results : [];
+    const keys = results.map((r) => S(r && r.reportKey));
+    const uniq = new Set(keys);
+    if (results.length !== FROZEN.length || uniq.size !== FROZEN.length || !FROZEN.every((k) => uniq.has(k))) {
+      gateProblems.push(accountId + " -> preflight-result-set [" + keys.join(",") + "] != the frozen " + FROZEN.length);
+      continue;
+    }
+    for (const r of results) {
+      if (S(r.disposition) !== "ready") { gateProblems.push(S(r.reportKey) + "/" + accountId + " -> " + S(r.disposition)); continue; }
+      if (!nb(r.liveReportKey) || !nb(r.paramsHash)) gateProblems.push(S(r.reportKey) + "/" + accountId + " -> ready without a live identity");
     }
   }
   if (gateProblems.length) return fail("publish-gates", gateProblems);
@@ -125,10 +137,12 @@ export async function runPriorityDashboardsRelease(deps = {}) {
  * Build the EXACT-identity live read-back used by the runner (step 6). Every collaborator is injected so it is
  * offline-testable; the CLI wires the production readers. Given { reportKey, liveReportKey, accountId, paramsHash }
  * -- the exact live identity the publish produced -- it loads the live snapshot by that EXACT natural key and
- * proves: the live-report-key matches the contract; the row's params_hash echoes paramsHash; the stored params
- * carry the expected live version + account and RE-derive paramsHash (provenance -- a mutated-after-save row
- * fails); a nonblank refresh time; STORAGE-FIRST payload hydration; and the REAL frontend payload contract
- * (validatePayload true + not dataUnavailable). Returns { ok, reason? }.
+ * proves: the live-report-key matches the contract; the ROW's report_key + account_id echo the requested
+ * identity (the published live params do NOT carry accountId -- identity comes from the row columns); the row's
+ * params_hash echoes paramsHash; the stored params carry the expected live version + contract-derived live
+ * params and RE-derive paramsHash (provenance -- a mutated-after-save row fails); a nonblank refresh time;
+ * STORAGE-FIRST payload hydration; and the REAL frontend payload contract (validatePayload true + not
+ * dataUnavailable). Returns { ok, reason? }.
  */
 export function buildLiveReadback({ getReportSnapshot, loadStoragePayload, liveContracts, reportDerivations, computeHash } = {}) {
   for (const [name, fn] of [["getReportSnapshot", getReportSnapshot], ["loadStoragePayload", loadStoragePayload], ["computeHash", computeHash]]) {
@@ -142,10 +156,15 @@ export function buildLiveReadback({ getReportSnapshot, loadStoragePayload, liveC
     if (!nb(paramsHash)) return { ok: false, reason: "blank-params-hash" };
     const snap = await getReportSnapshot({ reportKey: liveReportKey, accountId, paramsHash });
     if (!snap) return { ok: false, reason: "no-live-snapshot" };
+    // The ROW's own identity echoes -- the live snapshot is keyed by (report_key, account_id, params_hash); the
+    // published live params do NOT carry accountId, so identity is proven from the ROW columns, never from params.
+    if (S(snap.report_key) !== S(liveReportKey)) return { ok: false, reason: "identity-report-key" };
+    if (S(snap.account_id) !== S(accountId)) return { ok: false, reason: "identity-account" };
     if (S(snap.params_hash) !== S(paramsHash)) return { ok: false, reason: "identity-hash" };
     const params = snap.params && typeof snap.params === "object" && !Array.isArray(snap.params) ? snap.params : null;
+    // The stored params carry the EXACT live report version + the contract-derived live params, and RE-derive
+    // paramsHash (provenance -- a mutated-after-save row fails). accountId is NOT expected in the live params.
     if (!params || params.reportVersion !== contract.liveReportVersion) return { ok: false, reason: "live-version" };
-    if (S(params.accountId) !== S(accountId)) return { ok: false, reason: "identity-account" };
     const liveParams = contract.liveParams(params);
     if (!liveParams || computeHash(contract.liveReportVersion, liveParams) !== paramsHash) return { ok: false, reason: "params-provenance" };
     if (!nb(snap.source_refreshed_at)) return { ok: false, reason: "blank-refresh" };
