@@ -1106,7 +1106,7 @@ function makeRedateStore(bundle, opts = {}) {
       if (opts.updateRowCount !== undefined) return opts.updateRowCount; // simulate wrong rowCount (state unchanged)
       // the REAL guarded UPDATE moves only cycle_date; the current slot empties; ONLY the sync_cycles digest hash
       // changes (its row COUNT stays identical).
-      state.cycle.cycleDateText = "2026-08-16";
+      state.cycle.cycleDateText = redateMod.REDATE.targetDate;
       state.nonUsAtCurrentCount = 0;
       state.digests = { ...state.digests, sync_cycles: { c: state.digests.sync_cycles.c, h: state.digests.sync_cycles.h + "!" } };
       if (opts.mutateChildOnUpdate) opts.mutateChildOnUpdate(state); // simulate an over-broad update
@@ -1126,7 +1126,7 @@ test("P14b. --apply moves ONLY cycle_date to the target and COMMITS; records the
   const store = makeRedateStore(redateBundle());
   const r = await runRedate(store, "apply");
   assert.equal(r.committed, true); assert.equal(r.code, 0);
-  assert.equal(store._state().cycle.cycleDateText, "2026-08-16");
+  assert.equal(store._state().cycle.cycleDateText, redateMod.REDATE.targetDate);
   assert.equal(store._state().nonUsAtCurrentCount, 0);
   assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0, update: 1 });
   assert.ok(r.syncCyclesDigest && r.syncCyclesDigest.c === 25, "the new sync_cycles digest is recorded (row count identical)");

@@ -53,8 +53,8 @@ const readEvidence = async () => {
     validatedReportJobs: await one("select count(*)::int n from public.sync_report_jobs where cycle_id=$1::uuid and validated=true", [CID]),
   };
   const v2LineageCount = await one("select count(*)::int n from public.sync_source_jobs where cycle_id=$1::uuid and request_hash = (select catalog_request_hash from public.source_priority_catalog_reservation where operation_key='priority-dashboards/v2')", [CID]);
-  const targetSlotCount = await one("select count(*)::int n from public.sync_cycles where bucket='non-us' and cycle_date = DATE '2026-08-16' and id <> $1::uuid", [CID]);
-  const nonUsAtCurrentCount = await one("select count(*)::int n from public.sync_cycles where bucket='non-us' and cycle_date = DATE '2026-08-24'");
+  const targetSlotCount = await one("select count(*)::int n from public.sync_cycles where bucket='non-us' and cycle_date = $2::date and id <> $1::uuid", [CID, REDATE.targetDate]);
+  const nonUsAtCurrentCount = await one("select count(*)::int n from public.sync_cycles where bucket='non-us' and cycle_date = $1::date", [REDATE.currentDate]);
   const controls = {
     allPrimary: (await q("select all_primary from public.scheduler_rollout_mode where id=1")).rows[0]?.all_primary,
     cron: await hasCron(),
@@ -76,7 +76,8 @@ const store = {
   commit: async () => { await q("commit"); },
   rollback: async () => { await q("rollback"); },
   update: async () => {
-    const r = await q("update public.sync_cycles set cycle_date = DATE '2026-08-16' where id = $1::uuid and bucket = 'non-us' and cycle_date = DATE '2026-08-24' and status = 'partial'", [CID]);
+    // The ONLY write: move ONLY cycle_date, guarded by the exact frozen (id, bucket, current DATE, status).
+    const r = await q("update public.sync_cycles set cycle_date = $2::date where id = $1::uuid and bucket = 'non-us' and cycle_date = $3::date and status = 'partial'", [CID, REDATE.targetDate, REDATE.currentDate]);
     return r.rowCount;
   },
 };

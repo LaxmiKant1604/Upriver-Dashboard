@@ -11,7 +11,9 @@ export const REDATE = Object.freeze({
   cycleId: "481fe35c-ce65-455f-b317-cc267977e185",
   bucket: "non-us",
   currentDate: "2026-08-24",   // the colliding slot (DATE, as YYYY-MM-DD)
-  targetDate: "2026-08-16",    // the historical execution date (DATE, as YYYY-MM-DD)
+  // The archival target date (DATE, as YYYY-MM-DD). The natural Aug-16 slot is occupied by the real succeeded
+  // Aug-16 Non-US cycle (and Aug 14-30 are all taken), so this reviewed value is a FREE, clearly-archival date.
+  targetDate: "2026-01-16",
   expectedStatus: "partial",
   expectedTrigger: "manual",
   createdUtcDate: "2026-08-16",
