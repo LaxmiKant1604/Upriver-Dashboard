@@ -69,7 +69,9 @@ const readEvidence = async () => {
   const currentSlotNonUsCount = {}; const targetSlotCount = {};
   for (const a of ARCHIVE_CYCLES) {
     currentSlotNonUsCount[a.currentDate] = await one("select count(*)::int n from public.sync_cycles where bucket='non-us' and cycle_date=$1::date", [a.currentDate]);
-    targetSlotCount[a.targetDate] = await one("select count(*)::int n from public.sync_cycles where cycle_date=$1::date and id <> all($2::uuid[])", [a.targetDate, ARCHIVE_CYCLES.map((x) => x.cycleId)]);
+    // ALL cycles at the target date (NOT excluding the archival ids): PRE proves the slot is free (0), POST proves
+    // the moved cycle is now there (1). Excluding the archival ids would wrongly read 0 in POST and fail the proof.
+    targetSlotCount[a.targetDate] = await one("select count(*)::int n from public.sync_cycles where cycle_date=$1::date", [a.targetDate]);
   }
   const controls = {
     allPrimary: (await q("select all_primary from public.scheduler_rollout_mode where id=1")).rows[0]?.all_primary,
