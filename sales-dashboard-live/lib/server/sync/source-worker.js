@@ -43,35 +43,66 @@ function approxPayloadBytes(rows) {
   try { return Buffer.byteLength(JSON.stringify(rows ?? [])); } catch { return 0; }
 }
 
-// Map any DataDoe error to a SAFE {code, message, terminal} for the given stage. The
-// stored message is a fixed operator string — never the raw error, a URL, an id, or a
-// key — so no secret can leak. 4xx client errors are terminal; 5xx / timeouts transient.
+// Capture a BOUNDED, SANITIZED snippet of a DataDoe error body for operator evidence. It redacts URLs,
+// authorization/bearer/api-key/token/secret phrases, emails, UUIDs, and any long id/key-like token (export ids,
+// seller ids, API keys), collapses whitespace, and truncates to `max` chars -- so a captured body carries a
+// human-useful reason (e.g. "sellerOrVendorIds is required") but NEVER a secret, id, url, or key.
+export function sanitizeErrorDetail(raw, max = 200) {
+  let s = String(raw ?? "");
+  s = s.replace(/^DataDoe[^:]*\(\d{3}\):\s*/i, ""); // drop our own "DataDoe ... (NNN): " prefix; keep the body
+  s = s.replace(/\bhttps?:\/\/[^\s"']+/gi, "[redacted-url]");
+  s = s.replace(/\b(authorization|bearer|api[_-]?key|token|secret|password)\b\s*[:=]?\s*\S+/gi, "$1 [redacted]");
+  s = s.replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[redacted-email]");
+  s = s.replace(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, "[redacted-id]"); // uuid
+  // long id/key/export tokens (16+ chars) but ONLY those that look like an identifier -- containing a digit,
+  // underscore, or hyphen -- so a plain long word (e.g. "sellerOrVendorIds") survives as useful evidence.
+  s = s.replace(/\b[A-Za-z0-9_-]{16,}\b/g, (m) => (/[0-9_-]/.test(m) ? "[redacted-id]" : m));
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > max) s = s.slice(0, max) + "...";
+  return s;
+}
+
+// Map any DataDoe error to a SAFE classification for the given stage. The stored `message` is a fixed operator
+// string — never the raw error, a URL, an id, or a key — and `detail` is a separately SANITIZED bounded body
+// snippet for operator evidence. Classification distinguishes a DEFINITIVE client-side request rejection
+// (HTTP 4xx except 408/429 -- terminal; a retry with the SAME request fails again) from the TRANSIENT /
+// AMBIGUOUS classes (408 request-timeout, 429 rate-limit, 5xx, timeouts, and network ambiguity where a create
+// POST may or may not have landed -- NEVER a definitive success). A definitive HTTP 400 is therefore never
+// reported as an ambiguous or successful create; the durable reservation governs any resume (never a 2nd create).
 export function classifyFetchError(error, stage = "create-export") {
   if (isDataDoeDeadlineError(error)) {
-    return { stage, code: "TIMEOUT", message: "DataDoe work deferred at the execution deadline.", terminal: false };
+    return { stage, code: "TIMEOUT", message: "DataDoe work deferred at the execution deadline.", terminal: false, transient: true };
   }
   // Defensive: the typed poll-window-exhausted signal is normally intercepted as a resumable
   // deferral BEFORE classification (an export_id always exists at the poll stage). If it ever
   // reaches classification anyway it must stay non-terminal so the export can still be resumed.
   if (isDataDoePollPendingError(error)) {
-    return { stage, code: "POLL_PENDING", message: "DataDoe export still processing at the end of the bounded poll window; resumable.", terminal: false };
+    return { stage, code: "POLL_PENDING", message: "DataDoe export still processing at the end of the bounded poll window; resumable.", terminal: false, transient: true };
   }
   if (isSourceDisabledError(error)) {
-    return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true };
+    return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true, transient: false };
   }
   const raw = error instanceof Error ? error.message : String(error);
+  const detail = sanitizeErrorDetail(raw);
   const matched = raw.match(/\((\d{3})\)/);
   if (matched) {
     const status = Number(matched[1]);
     if (status >= 400 && status <= 599) {
-      const terminal = status >= 400 && status < 500;
-      return { stage, code: `HTTP_${status}`, message: `DataDoe returned HTTP ${status} for this source.`, terminal };
+      // 408 Request Timeout + 429 Too Many Requests + every 5xx are TRANSIENT (resumable); every OTHER 4xx is a
+      // DEFINITIVE client-side request rejection (terminal -- the SAME request will be rejected again).
+      const transient = status === 408 || status === 429 || status >= 500;
+      return { stage, code: `HTTP_${status}`, message: `DataDoe returned HTTP ${status} for this source.`, terminal: !transient, httpStatus: status, transient, detail };
     }
   }
   if (/timed out/i.test(raw)) {
-    return { stage, code: "TIMEOUT", message: "DataDoe export timed out while processing.", terminal: false };
+    return { stage, code: "TIMEOUT", message: "DataDoe export timed out while processing.", terminal: false, transient: true, detail };
   }
-  return { stage, code: "EXPORT_ERROR", message: "DataDoe export failed for this source.", terminal: false };
+  // A network-layer failure with NO HTTP status is AMBIGUOUS (the create POST may or may not have landed): it is
+  // NEVER a definitive success and stays non-terminal so the durable reservation governs any resume.
+  if (/\bnetwork\b|fetch failed|ECONNRESET|socket hang ?up|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|aborted/i.test(raw)) {
+    return { stage, code: "NETWORK_AMBIGUOUS", message: "DataDoe request failed at the network layer; the create outcome is ambiguous (resumable via the durable reservation, never a second create).", terminal: false, transient: true, detail };
+  }
+  return { stage, code: "EXPORT_ERROR", message: "DataDoe export failed for this source.", terminal: false, transient: true, detail };
 }
 
 function fetchStatusOf(job) {

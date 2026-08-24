@@ -147,6 +147,17 @@ test("P2b. frozen scope constants are exactly the reviewed values; brand-sales p
   assert.ok(typeof C.operationKey === "string" && C.operationKey.length > 0);
   assert.ok(Object.isFrozen(C));
 });
+test("P2c. the operation is versioned to priority-dashboards/v2 (a DISTINCT reservation key -- the failed v1 reservation is never touched); the guard + composition key on it", async () => {
+  assert.equal(priorityMod.PRIORITY_DASHBOARDS.operationKey, "priority-dashboards/v2");
+  assert.notEqual(priorityMod.PRIORITY_DASHBOARDS.operationKey, "priority-dashboards/v1", "v2 is a different operation key than the rejected v1");
+  // The durable guard reserves/records/gets against THIS (v2) operation key ONLY: a fresh reservation table has
+  // no v2 row until v2 creates one, and the v1 row (a different key) is a separate, untouched record.
+  const reservation = makeFakeReservation();
+  const created = []; const g = priorityMod.makeDurableCatalogGuard({ inner: makeInner(created), reservation, operationKey: OP() });
+  await g.create(catJob());
+  assert.ok(reservation._rows.has("priority-dashboards/v2"), "the guard keyed the reservation on v2");
+  assert.ok(!reservation._rows.has("priority-dashboards/v1"), "the guard NEVER touches the v1 reservation");
+});
 
 /* ===================== P3. the bucket PLAN emits zero OLI/FBA jobs, one Catalog job ===================== */
 group("P3. plan for all 30 covered accounts: zero OLI/FBA exports, one org-scoped Catalog export per bucket");
@@ -155,19 +166,59 @@ function accountsFor(bucket, n) {
   const cc = bucket === "us" ? "US" : "DE";
   return Array.from({ length: n }, (_, i) => ({ accountId: bucket + "-A" + String(i + 1).padStart(2, "0"), rawSellerId: bucket + "-S" + String(i + 1).padStart(2, "0"), country: cc, currency: "USD" }));
 }
+const CARRIER = "carrier-seller-01"; // a canonical primary seller id (identical across buckets)
 function planPriorityBucket(bucket, n) {
   const pausedSources = new Set([OLI, FBA, "ads-campaign-date", "ads-asin-date", "settlements", "returns", "listings"]);
   const accounts = accountsFor(bucket, n); const coverageByAccountId = {};
   for (const a of accounts) coverageByAccountId[a.accountId] = [{ from: "2025-01-01", to: TODAY }];
-  return planMod.planBucketSourceSync({ apiKey: "prim-key", bucket, accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources, asOf: ASOF, today: TODAY, forceCatalogRefresh: true });
+  return planMod.planBucketSourceSync({ apiKey: "prim-key", bucket, accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources, asOf: ASOF, today: TODAY, catalogCarrierSeller: CARRIER, forceCatalogRefresh: true });
 }
 test("P3a. US bucket (8): ZERO OLI + ZERO FBA jobs, EXACTLY one Catalog job", () => { const jf = planPriorityBucket("us", 8).summary.plannedJobsByFamily; assert.equal(jf[OLI] || 0, 0); assert.equal(jf[FBA] || 0, 0); assert.equal(jf[CATALOG], 1); });
 test("P3b. Non-US bucket (22): ZERO OLI + ZERO FBA jobs, EXACTLY one Catalog job", () => { const jf = planPriorityBucket("non-us", 22).summary.plannedJobsByFamily; assert.equal(jf[OLI] || 0, 0); assert.equal(jf[FBA] || 0, 0); assert.equal(jf[CATALOG], 1); });
 test("P3c. WITHOUT the priority pauses a normal plan WOULD create OLI + FBA (the cost the path avoids)", () => {
   const accounts = accountsFor("us", 8); const coverageByAccountId = {};
   for (const a of accounts) coverageByAccountId[a.accountId] = [];
-  const jf = planMod.planBucketSourceSync({ apiKey: "prim-key", bucket: "us", accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: new Set(), asOf: ASOF, today: TODAY }).summary.plannedJobsByFamily;
+  const jf = planMod.planBucketSourceSync({ apiKey: "prim-key", bucket: "us", accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: new Set(), asOf: ASOF, today: TODAY, catalogCarrierSeller: CARRIER }).summary.plannedJobsByFamily;
   assert.ok((jf[OLI] || 0) > 0); assert.ok((jf[FBA] || 0) > 0);
+});
+// The corrected org-wide Catalog request (mission items 1-4, 6-7, 10).
+function catalogJobOf(bucket, n) {
+  const fam = planPriorityBucket(bucket, n).families.find((f) => f.sourceKey === CATALOG);
+  return fam.plannedJobs[0];
+}
+test("P3d. the Catalog request sends EXACTLY one carrier seller, OMITS from/to, and requests ONLY the four supported columns (no sku)", () => {
+  const req = planMod.resolvedDurableCatalog({ apiKey: "prim-key", carrierSellerId: CARRIER, bucket: "us" });
+  assert.deepEqual(req.sellerOrVendorIds, [CARRIER], "exactly one carrier seller");
+  assert.equal(req.from, null); assert.equal(req.to, null);
+  assert.deepEqual([...req.columns], ["child_asin", "parent_asin", "product_name", "product_brand"]);
+  assert.ok(!req.columns.includes("sku"), "no unproven sku column");
+  assert.equal(req.options.orderByColumn, "child_asin"); assert.equal(req.options.orderByDirection, "ASC");
+  assert.equal(req.sourceScope, "organization"); assert.equal(req.limit, 20000);
+  assert.equal(req.sourceId, "68d2de238e");
+});
+test("P3e. US and Non-US produce the SAME carrier + the SAME canonical Catalog request hash (organization-scoped)", () => {
+  const us = planMod.resolvedDurableCatalog({ apiKey: "prim-key", carrierSellerId: CARRIER, bucket: "us" });
+  const nonus = planMod.resolvedDurableCatalog({ apiKey: "prim-key", carrierSellerId: CARRIER, bucket: "non-us" });
+  assert.equal(us.requestHash, nonus.requestHash, "one canonical hash across both buckets");
+  assert.equal(catalogJobOf("us", 8).requestHash, catalogJobOf("non-us", 22).requestHash, "the planned catalog job hash matches across buckets");
+});
+test("P3f. adding accounts does NOT change the Catalog request identity (still ONE org-scoped request)", () => {
+  assert.equal(catalogJobOf("us", 3).requestHash, catalogJobOf("us", 8).requestHash, "more accounts => same one catalog hash");
+  assert.equal(planPriorityBucket("us", 20).families.find((f) => f.sourceKey === CATALOG).plannedJobs.length, 1, "exactly one catalog job regardless of account count");
+});
+test("P3g. selectCatalogCarrierSeller is deterministic, primary-only, and null when no canonical primary exists", () => {
+  const dir = [{ accountId: "S-03" }, { accountId: "S-01" }, { accountId: "dd-secondary:X" }, { accountId: "S-02" }, { accountId: "" }];
+  assert.equal(planMod.selectCatalogCarrierSeller(dir), "S-01", "deterministic sorted-first primary");
+  assert.equal(planMod.selectCatalogCarrierSeller([{ accountId: "dd-secondary:A" }, { accountId: "" }]), null, "no canonical primary => null");
+  // US + Non-US directories are the SAME full primary set, so the carrier is identical.
+  assert.equal(planMod.selectCatalogCarrierSeller(dir), planMod.selectCatalogCarrierSeller([...dir].reverse()), "order-independent");
+});
+test("P3h. a missing / secondary / noncanonical carrier FAILS CLOSED before any reservation/create", () => {
+  for (const bad of [undefined, null, "", "  ", "dd-secondary:S1"]) {
+    assert.throws(() => planMod.resolvedDurableCatalog({ apiKey: "prim-key", carrierSellerId: bad, bucket: "us" }), /canonical primary carrier/);
+  }
+  // and the planner refuses to plan a Catalog without a carrier (fail closed at plan time).
+  assert.throws(() => planMod.planBucketSourceSync({ apiKey: "prim-key", bucket: "us", accounts: accountsFor("us", 2), existingMembership: new Map(), coverageByAccountId: {}, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: new Set([OLI, FBA, "ads-campaign-date", "ads-asin-date", "settlements", "returns", "listings"]), asOf: ASOF, today: TODAY, forceCatalogRefresh: true }), /canonical primary carrier/);
 });
 
 /* ===================== P4. the release composition (no caller-forgeable scope) ===================== */

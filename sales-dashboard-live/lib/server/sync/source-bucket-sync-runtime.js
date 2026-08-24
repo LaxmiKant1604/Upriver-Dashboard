@@ -34,7 +34,7 @@ import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-drive
 import { makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { buildSchedulerV2SourceTrancheRuntime } from "./runtime-composition.js";
 import { batchFamilyKey } from "./source-batching.js";
-import { runBucketSourceSync, SOURCE_SYNC_OWNER_REPORT_KEY } from "./source-bucket-sync.js";
+import { runBucketSourceSync, SOURCE_SYNC_OWNER_REPORT_KEY, selectCatalogCarrierSeller } from "./source-bucket-sync.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import {
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
@@ -412,7 +412,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     const directoryRows = mergeDiscoveredDataDoeAccounts(byConnection);
     const { active } = classifyDirectoryAccounts(directoryRows, connections);
-    return bindPrimaryBucketAccounts(active, bucket);
+    // The Catalog carrier seller is chosen from the FULL primary directory (not this bucket), so US + Non-US
+    // deterministically pick the SAME carrier => one canonical Catalog request hash across both buckets.
+    return { ...bindPrimaryBucketAccounts(active, bucket), catalogCarrierSeller: selectCatalogCarrierSeller(active) };
   };
 
   // FINDINGS 7 + 8: authoritative per-account evidence gathering. Read failures become TYPED blocked
@@ -569,16 +571,17 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
     }
 
-    let connections; let primary; let orgFingerprint; let accounts; let excluded;
+    let connections; let primary; let orgFingerprint; let accounts; let excluded; let catalogCarrierSeller;
     if (preflight) {
       // Round-5 blocker 3: the memoized preflight discovery IS the discovery -- never repeated in execution.
-      ({ connections, primary, orgFingerprint, accounts, excluded } = preflight);
+      ({ connections, primary, orgFingerprint, accounts, excluded, catalogCarrierSeller } = preflight);
     } else {
       ({ connections, primary, orgFingerprint } = resolvePrimary());
       try {
         const discovered = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
         accounts = discovered.accounts;
         excluded = discovered.excluded;
+        catalogCarrierSeller = discovered.catalogCarrierSeller;
       } catch (e) { return catchDeadline(e); }
     }
     if (!accounts.length) {
@@ -709,6 +712,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
         deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
         reuseOnly,
+        catalogCarrierSeller,
         forceCatalogRefresh: priority,
       });
     } catch (e) { return catchDeadline(e); }
@@ -1205,7 +1209,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     }
     if (bucket == null) return { pausedSources };
     const { connections, primary, orgFingerprint } = resolvePrimary();
-    const { accounts, excluded } = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
+    const { accounts, excluded, catalogCarrierSeller } = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
     const todayStr = today || new Date(clock()).toISOString().slice(0, 10);
     const asOfStr = addDaysStr(todayStr, -1);
     // ONE hydrating evidence sweep (coverage + catalog/FBA pointers + hydration + integrity + staleness +
@@ -1281,7 +1285,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     return {
       pausedSources, bucket, sourceKey,
       connections, primary, orgFingerprint,
-      accounts, excluded,
+      accounts, excluded, catalogCarrierSeller,
       membership,
       evidence,
       historyRows,

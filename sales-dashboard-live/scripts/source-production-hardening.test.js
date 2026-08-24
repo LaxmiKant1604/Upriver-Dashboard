@@ -3275,20 +3275,21 @@ test("F12c. REAL US + Non-US with a COLD Non-US cache: the durable reservation m
   assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still two tokens total");
 });
 
-test("F12d. MIDNIGHT/date drift: US on day 1 + Non-US on day 2 (a DIFFERENT canonical Catalog hash) cannot spend a second Catalog export / four tokens", async () => {
+test("F12d. MIDNIGHT/date drift: the org Catalog request is DATE-INDEPENDENT (no from/to), so day-1 US + day-2 Non-US share ONE hash and ADOPT the same reservation -- never a second create / four tokens", async () => {
   const DAY2 = dates.addDaysStr(TODAY, 1);
   const dd = makeDataDoe(); const reservation = fakeReservation();
   const h = guardedPriorityHarness([dirAccount("U01"), dirAccount("U02"), euAccount("E01"), euAccount("E02")], dd, reservation);
-  await h.runtime.run({ bucket: "us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "us", today: TODAY }) });
+  const rUs = await h.runtime.run({ bucket: "us", today: TODAY, preflight: await h.runtime.preflightEvidence({ bucket: "us", today: TODAY }) });
   assert.equal(catCreates(dd), 1, "US made the one create on day 1");
-  h.store._cache.clear(); // a fresh day: the day-1 Catalog cache is gone, so Non-US must try to fetch.
-  let blocked = false;
-  try {
-    const rEu = await h.runtime.run({ bucket: "non-us", today: DAY2, preflight: await h.runtime.preflightEvidence({ bucket: "non-us", today: DAY2 }) });
-    blocked = rEu.stopped === true || (rEu.derived && rEu.derived.skipped != null);
-  } catch (e) { blocked = /HASH_MISMATCH|PRIORITY_CATALOG/.test(String(e && e.message)); }
-  assert.equal(catCreates(dd), 1, "the day-2 different-hash Catalog create is REFUSED by the operation-wide reservation (never a fourth token)");
-  assert.ok(blocked, "the day-2 Non-US derive did NOT complete a second Catalog export");
+  h.store._cache.clear(); // a fresh day: the day-1 Catalog cache is gone, so Non-US must resolve the request again.
+  const rEu = await h.runtime.run({ bucket: "non-us", today: DAY2, preflight: await h.runtime.preflightEvidence({ bucket: "non-us", today: DAY2 }) });
+  // The corrected Catalog request OMITS from/to, so the day-2 hash EQUALS the day-1 hash: Non-US ADOPTS the
+  // reserved export (no HASH_MISMATCH, no second create) and its derive completes.
+  assert.equal(rEu.derived.skipped, null, JSON.stringify(rEu.stopReason || rEu.derived));
+  const usCat = h.store.listSourceJobs(rUs.cycleId).find((j) => j.source_key === "product-catalog");
+  const euCat = h.store.listSourceJobs(rEu.cycleId).find((j) => j.source_key === "product-catalog");
+  assert.equal(usCat.request_hash, euCat.request_hash, "day-1 and day-2 share ONE date-independent catalog hash");
+  assert.equal(catCreates(dd), 1, "still exactly ONE Catalog create across both days (Non-US adopted)");
   assert.equal([...reservation._rows.values()][0].tokens_spent, 2, "still exactly two tokens for the whole operation");
 });
 

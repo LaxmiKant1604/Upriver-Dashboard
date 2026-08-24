@@ -21,7 +21,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
 const MIG_DIR = join(ROOT, "supabase", "migrations");
 const v2 = readFileSync(join(MIG_DIR, "20260807_scheduler_v2.sql"), "utf8");
-let runSourceJobs, classifyFetchError, salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes;
+let runSourceJobs, classifyFetchError, sanitizeErrorDetail, salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes;
 let runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter, reportSourceRequestHashes, salesMoversWindows, validateSourcePayload, upsertSyncSourceJob;
 let validateAdsCurrencySignal, evaluateAdsCurrencyGate;
 
@@ -482,11 +482,37 @@ test("Keyword monthly fallback follows the distinct-period policy; PPC total-sal
 });
 
 test("classifyFetchError maps to SAFE codes/terminality and never echoes the raw error", async () => {
-  assert.deepEqual(classifyFetchError(new Error("source is disabled for this organization"), "create-export"), { stage: "create-export", code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true });
+  const disabled = classifyFetchError(new Error("source is disabled for this organization"), "create-export");
+  assert.equal(disabled.code, "SOURCE_DISABLED"); assert.equal(disabled.terminal, true); assert.equal(disabled.message, "Source is disabled for this organization.");
   assert.equal(classifyFetchError(new Error("DataDoe export creation failed (402): tokens")).code, "HTTP_402");
   assert.equal(classifyFetchError(new Error("DataDoe export creation failed (402): tokens")).terminal, true);
   assert.equal(classifyFetchError(new Error("DataDoe export creation failed (503): busy")).terminal, false);
   assert.equal(classifyFetchError(new Error("DataDoe export timed out while processing.")).code, "TIMEOUT");
+});
+test("classifyFetchError: a DEFINITIVE HTTP 400 is TERMINAL (never an ambiguous success); 408/429/5xx are TRANSIENT; network failure is AMBIGUOUS", () => {
+  const c400 = classifyFetchError(new Error('DataDoe export creation failed (400): {"error":"sellerOrVendorIds is required"}'), "create-export");
+  assert.equal(c400.code, "HTTP_400"); assert.equal(c400.httpStatus, 400); assert.equal(c400.terminal, true); assert.equal(c400.transient, false);
+  for (const s of [408, 429, 500, 503]) {
+    const c = classifyFetchError(new Error(`DataDoe export creation failed (${s}): busy`));
+    assert.equal(c.code, `HTTP_${s}`); assert.equal(c.terminal, false, `HTTP ${s} is transient`); assert.equal(c.transient, true);
+  }
+  for (const s of [401, 403, 404, 422]) {
+    assert.equal(classifyFetchError(new Error(`DataDoe export creation failed (${s}): nope`)).terminal, true, `HTTP ${s} is a definitive rejection`);
+  }
+  const net = classifyFetchError(new Error("fetch failed: ECONNRESET"));
+  assert.equal(net.code, "NETWORK_AMBIGUOUS"); assert.equal(net.terminal, false); assert.equal(net.transient, true);
+});
+test("classifyFetchError.detail + sanitizeErrorDetail: a bounded body is captured but URLs / keys / ids / emails / secrets are REDACTED", () => {
+  const body = 'DataDoe export creation failed (400): {"error":"bad sellerOrVendorIds","seller":"A1B2C3D4E5F6G7H8","export":"e_0011223344556677","url":"https://api.datadoe.com/exports/9c8b7a6d-1234-5678-9abc-def012345678","authorization":"Bearer sk_live_ABCDEFGHIJKLMNOP","contact":"ops@example.com"}';
+  const c = classifyFetchError(new Error(body), "create-export");
+  assert.ok(c.detail && c.detail.length > 0, "a sanitized detail is captured for operator evidence");
+  assert.ok(c.detail.includes("sellerOrVendorIds"), "the human-useful reason survives");
+  for (const secret of ["A1B2C3D4E5F6G7H8", "e_0011223344556677", "9c8b7a6d-1234-5678-9abc-def012345678", "sk_live_ABCDEFGHIJKLMNOP", "api.datadoe.com", "ops@example.com", "https://"]) {
+    assert.ok(!c.detail.includes(secret), `redacted: ${secret}`);
+  }
+  assert.ok(sanitizeErrorDetail("x".repeat(500)).length <= 203, "the detail is bounded");
+  // the fixed `message` NEVER carries the raw body (no secret can leak through it either).
+  for (const secret of ["A1B2C3D4E5F6G7H8", "sk_live_ABCDEFGHIJKLMNOP", "sellerOrVendorIds"]) assert.ok(!c.message.includes(secret), `message stays fixed: ${secret}`);
 });
 
 /* ============================================================================================
@@ -513,7 +539,7 @@ async function main() {
     return mod;
   };
 
-  ({ runSourceJobs, classifyFetchError } = await step("source-worker.js", "../lib/server/sync/source-worker.js"));
+  ({ runSourceJobs, classifyFetchError, sanitizeErrorDetail } = await step("source-worker.js", "../lib/server/sync/source-worker.js"));
   ({ salesMoversProbeSignal, keywordWeeklySignal, optimizerSqpSignal, adsCurrencySignal, deriveSignalsFromOutcomes } = await step("source-signals.js", "../lib/server/sync/source-signals.js"));
   ({ runStagedSourceCycle, reconstructSignals, plannedSourceJob, makeDataDoeAdapter } = await step("source-sync-driver.js", "../lib/server/sync/source-sync-driver.js"));
   ({ reportSourceRequestHashes, salesMoversWindows, validateAdsCurrencySignal, evaluateAdsCurrencyGate } = await step("report-source-contracts.js", "../lib/server/sync/report-source-contracts.js"));

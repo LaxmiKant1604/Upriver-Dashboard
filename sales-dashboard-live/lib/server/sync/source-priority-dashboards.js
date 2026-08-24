@@ -38,8 +38,12 @@ export const PRIORITY_DASHBOARDS = Object.freeze({
   maxTokens: 2,
   catalogTokenCost: 2, // one STANDARD Catalog export
   // The frozen operation id the DURABLE Catalog reservation is keyed to (with the exact canonical Catalog
-  // request hash). One reservation => one Catalog create / two tokens for the WHOLE go-live.
-  operationKey: "priority-dashboards/v1",
+  // request hash). One reservation => one Catalog create / two tokens for the WHOLE go-live. Versioned to v2
+  // after the v1 Catalog request (empty sellerOrVendorIds + from/to + unproven `sku`) was rejected HTTP 400:
+  // the v1 reservation stays untouched as historical fail-closed evidence; v2 carries the corrected request +
+  // its own immutable hash + its own one-create/two-token reservation (Migration 9 already keys by operation_key,
+  // so no migration change is needed to run a second operation key).
+  operationKey: "priority-dashboards/v2",
 });
 
 const S = (v) => (v == null ? "" : String(v));

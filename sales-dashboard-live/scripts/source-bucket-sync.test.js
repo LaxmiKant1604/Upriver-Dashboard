@@ -173,10 +173,11 @@ function makeStore() {
 }
 
 /* ------------------------- DataDoe spy ------------------------- */
+// Product Catalog fetches child_asin -> brand ONLY (no sku). The SKU->child_asin evidence comes from OLI.
 const CATALOG_ROWS = [
-  { child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
-  { child_asin: "B0B", sku: "SKU-B", parent_asin: "P", product_name: "B", product_brand: "Bolt" },
-  { child_asin: "", sku: "SKU-ONLY", parent_asin: "P", product_name: "S", product_brand: "Delta" },
+  { child_asin: "B0A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
+  { child_asin: "B0B", parent_asin: "P", product_name: "B", product_brand: "Bolt" },
+  { child_asin: "B0D", parent_asin: "P", product_name: "D", product_brand: "Delta" },
 ];
 function makeDataDoe(opts = {}) {
   const create = {}; const createSeq = [];
@@ -226,7 +227,8 @@ function makeSinks() {
   };
 }
 
-function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership } = {}) {
+const CATALOG_CARRIER = "carrier-seller-01"; // a canonical primary seller id (org-wide catalog requires one)
+function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER } = {}) {
   const st = store || makeStore();
   const d = dd || makeDataDoe();
   const clock = makeClock();
@@ -243,7 +245,7 @@ function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null,
     store: st, dataDoe: d,
     ...sinks,
     cycleDate: CYCLE_DATE, clock: clock.fn, wait, cooldownMs,
-    reuseOnly,
+    reuseOnly, catalogCarrierSeller,
   });
   return { store: st, dd: d, clock, waits, sinks, run };
 }
@@ -267,17 +269,17 @@ test("A1. a bucket-sync OLI slice request carries the EXACT canonical hash the O
   assert.equal(resolved.sourceScope, "seller");
 });
 
-test("A2. the durable catalog is a NEW versioned ORG-WIDE request (sku fetched; existing catalog hashes untouched)", () => {
-  const resolved = bucketSync.resolvedDurableCatalog({ apiKey: API_KEY, asOf: TODAY, bucket: BUCKET });
-  assert.ok(resolved.columns.includes("sku"), "the durable catalog fetches sku (the SKU brand fallback needs it)");
-  assert.equal(resolved.accountScopeHash, identity.accountScopeHash([]), "organization-wide scope (no seller ids)");
-  // Distinct from EVERY existing per-report catalog contract identity (new key/columns => new hash space).
-  for (const [rk, list] of Object.entries(contracts.REPORT_SOURCE_CONTRACTS)) {
-    for (const c of list) {
-      if (c.sourceKey !== "product-catalog") continue;
-      assert.notDeepEqual([...c.columns].sort(), [...resolved.columns].sort(), `${rk}:${c.requestKey} columns differ from the durable catalog`);
-    }
-  }
+test("A2. the durable catalog is the CORRECTED org-wide request: ONE carrier seller, NO from/to, NO sku, four supported columns", () => {
+  const resolved = bucketSync.resolvedDurableCatalog({ apiKey: API_KEY, carrierSellerId: CATALOG_CARRIER, bucket: BUCKET });
+  assert.deepEqual([...resolved.columns], ["child_asin", "parent_asin", "product_name", "product_brand"], "only the four supported columns");
+  assert.ok(!resolved.columns.includes("sku"), "no unproven sku column (DataDoe rejects it HTTP 400)");
+  assert.deepEqual(resolved.sellerOrVendorIds, [CATALOG_CARRIER], "exactly one carrier seller (an org-wide request still requires a nonblank seller)");
+  assert.equal(resolved.from, null); assert.equal(resolved.to, null);
+  assert.equal(resolved.sourceScope, "organization");
+  assert.equal(resolved.accountScopeHash, identity.accountScopeHash([CATALOG_CARRIER]), "the scope hash binds the carrier seller");
+  // The carrier seller is bound into the canonical request hash: a DIFFERENT carrier => a DIFFERENT hash.
+  const other = bucketSync.resolvedDurableCatalog({ apiKey: API_KEY, carrierSellerId: "other-carrier-seller", bucket: BUCKET });
+  assert.notEqual(resolved.requestHash, other.requestHash, "the carrier seller is bound into the request hash");
 });
 
 /* ================================= B. stable batching ================================= */
@@ -461,7 +463,7 @@ test("C1. a stale catalog refreshes ONCE org-wide; FBA refreshes per account wit
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   const catCreates = h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog");
   assert.equal(catCreates.length, 1, "ONE catalog export for the whole organization");
-  assert.deepEqual(catCreates[0].ids, [], "org-wide: no seller ids");
+  assert.deepEqual(catCreates[0].ids, [CATALOG_CARRIER], "org-wide request carries exactly the one carrier seller (empty => DataDoe HTTP 400)");
   const fbaCreates = h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health");
   assert.equal(fbaCreates.length, 5, "one FBA snapshot per account");
   const fbaBudget = h.store._budget(rollup.cycleId, "source-sync:fba-inventory-health");
@@ -569,29 +571,32 @@ test("E4. reuseOnly adopts seeded exact caches with ZERO creates; a missing reus
 group("F. Daily + Brand View over the durable model");
 
 const HISTORY = [
-  { account_id: "A01", sale_date: "2026-08-10", sku: "SKU-A", child_asin: "B0A", currency: "USD", sales_amount: 100, units: 10 },
-  { account_id: "A01", sale_date: "2026-08-10", sku: "SKU-ONLY", child_asin: "B0X", currency: "USD", sales_amount: 20, units: 2 }, // ASIN unknown -> SKU fallback (Delta)
-  { account_id: "A02", sale_date: "2026-08-10", sku: "SKU-B", child_asin: "B0B", currency: "EUR", sales_amount: 50, units: 5 },
+  { account_id: "A01", sale_date: "2026-08-10", sku: "SKU-A", child_asin: "B0A", currency: "USD", sales_amount: 100, units: 10 }, // ASIN -> Acme
+  { account_id: "A01", sale_date: "2026-08-10", sku: "SKU-D", child_asin: "B0D", currency: "USD", sales_amount: 30, units: 3 },  // ASIN -> Delta (also SKU-D->B0D evidence)
+  { account_id: "A01", sale_date: "2026-08-10", sku: "SKU-D", child_asin: "", currency: "USD", sales_amount: 20, units: 2 },     // BLANK asin -> SKU fallback (SKU-D -> B0D -> Delta)
+  { account_id: "A02", sale_date: "2026-08-10", sku: "SKU-B", child_asin: "B0B", currency: "EUR", sales_amount: 50, units: 5 },  // ASIN -> Bolt
   { account_id: "A02", sale_date: "2026-08-11", sku: "ZZZ", child_asin: "ZZZ", currency: "EUR", sales_amount: 7, units: 1 },     // unmapped
 ];
-const MAPS = () => brands.buildBrandMaps(CATALOG_ROWS);
+// The SKU->child_asin evidence is derived from the SAME durable OLI history the reports fold.
+const MAPS = () => brands.buildBrandMaps(CATALOG_ROWS, HISTORY);
 
-test("F1. Daily + Brand View fold the SAME OLI history through the SAME brand maps (ASIN wins; SKU fallback; unmapped reported)", () => {
+test("F1. Daily + Brand View fold the SAME OLI history through the SAME brand maps (ASIN wins; OLI SKU fallback; unmapped reported)", () => {
   const maps = MAPS();
+  assert.equal(maps.bySku.get("SKU-D"), "Delta", "the OLI SKU fallback resolves SKU-D -> B0D -> Delta");
   const daily = dash.dailyRowsFromHistory({ historyRows: HISTORY, brandMaps: maps, brand: "ALL", from: "2026-08-10", to: "2026-08-11" });
   assert.deepEqual(daily.rows, [
     { date: "2026-08-10", currency: "EUR", sales: 50, units: 5 },
-    { date: "2026-08-10", currency: "USD", sales: 120, units: 12 },
+    { date: "2026-08-10", currency: "USD", sales: 150, units: 15 },
     { date: "2026-08-11", currency: "EUR", sales: 7, units: 1 },
   ], "currency never crosses; the ALL fold includes unmapped rows and reports them");
   assert.deepEqual(daily.unmapped, { sales: 7, units: 1 });
   const named = dash.dailyRowsFromHistory({ historyRows: HISTORY, brandMaps: maps, brand: "Delta", from: "2026-08-10", to: "2026-08-11" });
-  assert.deepEqual(named.rows, [{ date: "2026-08-10", currency: "USD", sales: 20, units: 2 }], "the SKU fallback attributed B0X to Delta");
+  assert.deepEqual(named.rows, [{ date: "2026-08-10", currency: "USD", sales: 50, units: 5 }], "Delta = the ASIN row (30) + the blank-asin SKU-fallback row (20)");
   const bv = dash.brandViewRowsFromHistory({ historyRows: HISTORY, brandMaps: maps, from: "2026-08-10", to: "2026-08-11" });
   assert.deepEqual(bv.brands, [
     { brand: "Acme", accountId: "A01", currency: "USD", sales: 100, units: 10 },
     { brand: "Bolt", accountId: "A02", currency: "EUR", sales: 50, units: 5 },
-    { brand: "Delta", accountId: "A01", currency: "USD", sales: 20, units: 2 },
+    { brand: "Delta", accountId: "A01", currency: "USD", sales: 50, units: 5 },
   ]);
   assert.deepEqual(bv.unmapped, [{ accountId: "A02", currency: "EUR", sales: 7, units: 1 }], "unmapped is reported, never fabricated as a brand");
 });

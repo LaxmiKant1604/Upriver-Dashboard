@@ -156,11 +156,12 @@ function makeStore() {
   };
 }
 
+// Product Catalog fetches child_asin -> brand ONLY (no sku); the SKU->child_asin evidence comes from OLI.
 const CATALOG_ROWS = [
-  { child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
-  { child_asin: "", sku: "SKU-ONLY", parent_asin: "P", product_name: "S", product_brand: "Delta" },
-  { child_asin: "B0C", sku: "SKU-C", parent_asin: "P", product_name: "C1", product_brand: "Cruz" },
-  { child_asin: "B0C", sku: "SKU-C", parent_asin: "P", product_name: "C2", product_brand: "Crux" },
+  { child_asin: "B0A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
+  { child_asin: "B0D", parent_asin: "P", product_name: "D", product_brand: "Delta" },
+  { child_asin: "B0C", parent_asin: "P", product_name: "C1", product_brand: "Cruz" },
+  { child_asin: "B0C", parent_asin: "P", product_name: "C2", product_brand: "Crux" }, // conflicting asin => unmapped
 ];
 
 function makeDataDoe(opts = {}) {
@@ -215,6 +216,7 @@ function makeSinks() {
   };
 }
 
+const CATALOG_CARRIER = "carrier-seller-01"; // a canonical primary seller id (org-wide catalog requires one)
 function runFlow({ store, dd, cycleDate = CYCLE_DATE, coverage = null, accounts = FIVE, pausedSources, reuseOnly = false, catalogSnapshot = null, fbaSnapshotsByAccount = {} } = {}) {
   const clock = makeClock();
   const waits = [];
@@ -228,7 +230,7 @@ function runFlow({ store, dd, cycleDate = CYCLE_DATE, coverage = null, accounts 
     asOf: ASOF, today: TODAY,
     store, dataDoe: dd, ...sinks,
     cycleDate, clock: clock.fn, wait, cooldownMs: 60_000,
-    reuseOnly,
+    reuseOnly, catalogCarrierSeller: CATALOG_CARRIER,
   });
   return { promise, waits, sinks, clock };
 }
@@ -282,7 +284,7 @@ test("(3) missing durable evidence returns MISSING_REUSABLE_SOURCE and leaves th
   const plan = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: FIVE,
     coverageByAccountId: steadyCoverage(FIVE, dates.addDaysStr(ASOF, -7)),
-    catalogSnapshot: null, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY,
+    catalogSnapshot: null, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY, catalogCarrierSeller: CATALOG_CARRIER,
   });
   const oli = plan.families.find((f) => f.sourceKey === "order-line-items");
   const res = await worker.runSourceJobs({
@@ -339,16 +341,21 @@ test("(6)(8)(9) one OLI batch = one canonical job + 5 ISOLATED owners; history i
 });
 
 test("(7)(10)(13) Daily + Brand View reuse the SAME evidence; brand rules hold; Ads grains never mix", () => {
-  const maps = brands.buildBrandMaps(CATALOG_ROWS);
-  // (10) ASIN wins; unique SKU fallback; ambiguous SKU (B0C twice with different brands via SKU-C) fails closed.
-  assert.equal(brands.resolveBrand({ childAsin: "B0A", sku: "SKU-ONLY" }, maps).via, "asin");
-  assert.deepEqual(brands.resolveBrand({ childAsin: "ZZZ", sku: "SKU-ONLY" }, maps), { brand: "Delta", via: "sku" });
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0C", sku: "SKU-C" }, maps), { brand: null, via: null }, "conflicting/ambiguous fails closed");
-  // (7): both dashboards fold the SAME durable history through the SAME maps.
+  // (10) brand rules on dedicated OLI evidence: ASIN wins; unique OLI SKU->child_asin->brand fallback fires only
+  // when the ASIN does not resolve; a SKU whose unique child_asin is CONFLICTED fails closed.
+  const ruleMaps = brands.buildBrandMaps(CATALOG_ROWS, [
+    { sku: "SKU-D", childAsin: "B0D" }, // unique => Delta
+    { sku: "SKU-C", childAsin: "B0C" }, // unique child_asin but B0C is conflicted => unmapped
+  ]);
+  assert.equal(brands.resolveBrand({ childAsin: "B0A", sku: "SKU-D" }, ruleMaps).via, "asin");
+  assert.deepEqual(brands.resolveBrand({ childAsin: "ZZZ", sku: "SKU-D" }, ruleMaps), { brand: "Delta", via: "sku" });
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0C", sku: "SKU-C" }, ruleMaps), { brand: null, via: null }, "conflicting/ambiguous fails closed");
+  // (7): both dashboards fold the SAME durable history through the SAME maps (catalog + the OLI history evidence).
   const historyRows = rehearsalSinks.history.map((r) => ({
     account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin,
     currency: r.currency, sales_amount: r.salesAmount, units: r.units,
   }));
+  const maps = brands.buildBrandMaps(CATALOG_ROWS, historyRows);
   const win = model.oliRollingRefreshWindow(ASOF);
   const daily = dash.dailyRowsFromHistory({ historyRows, brandMaps: maps, brand: "ALL", from: win.from, to: win.to });
   const bv = dash.brandViewRowsFromHistory({ historyRows, brandMaps: maps, from: win.from, to: win.to });
@@ -366,7 +373,7 @@ test("(11) initial backfill then the NEXT daily run requests ONLY missing/rollin
   const backfill = model.oliBackfillWindow(ASOF);
   const day1 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: FIVE, coverageByAccountId: {},
-    catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY,
+    catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY, catalogCarrierSeller: CATALOG_CARRIER,
   });
   const day1Units = day1.families.find((f) => f.sourceKey === "order-line-items").units;
   // Complete-window model: the whole missing backfill for the <=5-seller batch (no 7-day pre-slicing), but a
@@ -386,7 +393,7 @@ test("(11) initial backfill then the NEXT daily run requests ONLY missing/rollin
   const covered = steadyCoverage(FIVE, ASOF);
   const day2 = bucketSync.planBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts: FIVE, coverageByAccountId: covered,
-    catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: nextAsOf, today: nextAsOf,
+    catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: {}, asOf: nextAsOf, today: nextAsOf, catalogCarrierSeller: CATALOG_CARRIER,
   });
   const day2Units = day2.families.find((f) => f.sourceKey === "order-line-items").units;
   assert.equal(day2Units.length, 1, "day 2: ONE complete-window export over the rolling refresh window");

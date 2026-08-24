@@ -293,50 +293,75 @@ test("E2. recordSourceSnapshot REFUSES incomplete (non-validated) evidence BEFOR
 
 group("F. brand resolution");
 
+// Catalog rows carry child_asin -> brand ONLY (Product Catalog no longer fetches sku -- DataDoe HTTP 400).
 const CAT = [
-  { child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" },
-  { child_asin: "B0B", sku: "SKU-B", product_brand: "Bolt" },
-  { child_asin: "B0B", sku: "SKU-B2", product_brand: "Bolt" },      // same asin, same brand: fine
-  { child_asin: "B0C", sku: "SKU-C", product_brand: "Cruz" },
-  { child_asin: "B0C", sku: "SKU-C", product_brand: "Crux" },       // conflicting asin AND ambiguous sku
-  { child_asin: "", sku: "SKU-ONLY", product_brand: "Delta" },      // sku-only mapping
-  { child_asin: "B0E", sku: "SKU-E", product_brand: "" },           // blank brand: maps nothing
-  { child_asin: "B0F", sku: "SKU-F", product_brand: "Unassigned" }, // fabricated label: NEVER a real brand
-  { child_asin: "B0G", sku: "SKU-G", product_brand: "unassigned" }, // case-insensitive
+  { child_asin: "B0A", product_brand: "Acme" },
+  { child_asin: "B0B", product_brand: "Bolt" },
+  { child_asin: "B0B", product_brand: "Bolt" },      // same asin, same brand: fine
+  { child_asin: "B0C", product_brand: "Cruz" },
+  { child_asin: "B0C", product_brand: "Crux" },      // conflicting asin => unmapped (conflictedAsins)
+  { child_asin: "B0D", product_brand: "Delta" },
+  { child_asin: "B0E", product_brand: "" },          // blank brand: maps nothing
+  { child_asin: "B0F", product_brand: "Unassigned" },// fabricated label: NEVER a real brand
+  { child_asin: "B0G", product_brand: "unassigned" },// case-insensitive
+];
+// Durable OLI history rows carry sku + child_asin -- the SKU->child_asin evidence for the fallback.
+const OLI = [
+  { sku: "SKU-A", childAsin: "B0A" },                // unique => B0A (Acme)
+  { sku: "SKU-D", childAsin: "B0D" },                // unique => B0D (Delta) -- the SKU-fallback case
+  { sku: "SKU-AMB", childAsin: "B0A" },              // ambiguous sku (two child_asins)
+  { sku: "SKU-AMB", childAsin: "B0B" },
+  { sku: "SKU-C", childAsin: "B0C" },                // unique sku but B0C is conflicted => unmapped
 ];
 
-test("F1. ASIN mapping wins; the unique-SKU fallback fires only when the ASIN does not resolve", () => {
-  const maps = brands.buildBrandMaps(CAT);
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0A", sku: "SKU-ONLY" }, maps), { brand: "Acme", via: "asin" }, "ASIN wins even when the SKU maps elsewhere");
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0Z", sku: "SKU-ONLY" }, maps), { brand: "Delta", via: "sku" }, "unique SKU fallback for an unresolved ASIN");
+test("F1. ASIN mapping wins; the unique-SKU fallback (OLI SKU->child_asin->catalog brand) fires only when the ASIN does not resolve", () => {
+  const maps = brands.buildBrandMaps(CAT, OLI);
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0A", sku: "SKU-D" }, maps), { brand: "Acme", via: "asin" }, "ASIN wins even when the SKU maps elsewhere");
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0Z", sku: "SKU-D" }, maps), { brand: "Delta", via: "sku" }, "unique SKU fallback (SKU-D -> B0D -> Delta) for an unresolved ASIN");
   assert.deepEqual(brands.resolveBrand({ childAsin: "b0a", sku: "" }, maps), { brand: "Acme", via: "asin" }, "ASIN lookup is case-insensitive");
+  assert.equal(maps.skuToAsin.get("SKU-D"), "B0D", "the SKU->child_asin evidence is exposed");
 });
 
 test("F2. ambiguous SKU and conflicting ASIN both fail closed (unmapped, recorded)", () => {
-  const maps = brands.buildBrandMaps(CAT);
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0C", sku: "SKU-C" }, maps), { brand: null, via: null }, "conflicting ASIN + ambiguous SKU stays unmapped");
+  const maps = brands.buildBrandMaps(CAT, OLI);
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0C", sku: "SKU-C" }, maps), { brand: null, via: null }, "conflicting ASIN B0C: SKU-C -> B0C is unmapped => null");
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0Z", sku: "SKU-AMB" }, maps), { brand: null, via: null }, "ambiguous SKU (two child_asins) stays unmapped");
   assert.ok(maps.conflictedAsins.includes("B0C"));
-  assert.ok(maps.ambiguousSkus.includes("SKU-C"));
+  assert.ok(maps.ambiguousSkus.includes("SKU-AMB"));
+  assert.ok(!maps.bySku.has("SKU-C"), "a SKU whose unique ASIN is conflicted never resolves");
 });
 
 test("F3. blank / 'Unassigned' catalog brands are NEVER real brands and are never returned", () => {
-  const maps = brands.buildBrandMaps(CAT);
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0E", sku: "SKU-E" }, maps), { brand: null, via: null });
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0F", sku: "SKU-F" }, maps), { brand: null, via: null });
-  assert.deepEqual(brands.resolveBrand({ childAsin: "B0G", sku: "SKU-G" }, maps), { brand: null, via: null });
+  const maps = brands.buildBrandMaps(CAT, OLI);
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0E", sku: "" }, maps), { brand: null, via: null });
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0F", sku: "" }, maps), { brand: null, via: null });
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0G", sku: "" }, maps), { brand: null, via: null });
   for (const b of [...maps.byAsin.values(), ...maps.bySku.values()]) {
     assert.notEqual(String(b).toLowerCase(), "unassigned", "no map value is ever the fabricated label");
   }
 });
 
-test("F4. malformed catalog rows reject the whole build; maps are frozen; a sku-less catalog has an empty SKU index", () => {
+test("F4. malformed CATALOG rows reject the whole build; malformed OLI rows are skipped; maps frozen; no OLI => empty SKU index", () => {
   assert.throws(() => brands.buildBrandMaps([{ child_asin: "A" }, null]), /rejecting the whole catalog/);
   assert.throws(() => brands.buildBrandMaps("not-an-array"), /requires an array/);
-  const maps = brands.buildBrandMaps(CAT);
+  const maps = brands.buildBrandMaps(CAT, OLI);
   assert.ok(Object.isFrozen(maps));
-  const skuless = brands.buildBrandMaps([{ child_asin: "B0A", product_brand: "Acme" }]);
-  assert.equal(skuless.bySku.size, 0, "no sku column => rule 2 never fires (correct, never wrong)");
-  assert.equal(skuless.byAsin.get("B0A"), "Acme");
+  const noOli = brands.buildBrandMaps(CAT); // no OLI rows
+  assert.equal(noOli.bySku.size, 0, "no OLI rows => rule 2 never fires (correct, never wrong)");
+  assert.equal(noOli.byAsin.get("B0A"), "Acme");
+  const tolerant = brands.buildBrandMaps(CAT, [null, "x", 7, { sku: "SKU-A", childAsin: "B0A" }]);
+  assert.equal(tolerant.bySku.get("SKU-A"), "Acme", "malformed OLI rows are skipped, valid ones still resolve");
+});
+
+test("F5. SKU->ASIN evidence spans MULTIPLE accounts: consistent rows resolve; the SAME SKU with a DIFFERENT ASIN across accounts is ambiguous (unmapped)", () => {
+  // two accounts, SAME sku -> SAME asin: still a unique mapping, resolves via the SKU fallback.
+  const consistent = brands.buildBrandMaps(CAT, [{ sku: "SKU-D", childAsin: "B0D" }, { sku: "SKU-D", childAsin: "B0D" }]);
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0Z", sku: "SKU-D" }, consistent), { brand: "Delta", via: "sku" });
+  // two accounts, SAME sku -> DIFFERENT asin (a real conflicting-SKU case): ambiguous, unmapped, recorded.
+  const conflicting = brands.buildBrandMaps(CAT, [{ sku: "SKU-X", childAsin: "B0A" }, { sku: "SKU-X", childAsin: "B0D" }]);
+  assert.deepEqual(brands.resolveBrand({ childAsin: "B0Z", sku: "SKU-X" }, conflicting), { brand: null, via: null });
+  assert.ok(conflicting.ambiguousSkus.includes("SKU-X"));
+  assert.ok(!conflicting.bySku.has("SKU-X"));
 });
 
 group("G. migration (PREPARED, UNAPPLIED)");

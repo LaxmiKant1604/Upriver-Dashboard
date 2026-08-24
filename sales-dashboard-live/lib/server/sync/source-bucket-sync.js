@@ -51,11 +51,30 @@ export const DURABLE_CATALOG_REQUEST_KEY = "source-catalog:durable-v1";
 export const OLI_SLICE_REQUEST_KEY = "source-oli:slice-v1";
 export const FBA_SNAPSHOT_REQUEST_KEY = "source-fba:snapshot-v1";
 
-// The durable organization-wide catalog request: the ONLY catalog spec that fetches `sku` (the brand
-// resolution SKU fallback needs it). A NEW VERSIONED request key/columns => a NEW request_hash by design --
-// every existing per-report catalog contract (and its golden hash) stays byte-identical.
-export const DURABLE_CATALOG_COLUMNS = Object.freeze(["child_asin", "parent_asin", "product_name", "product_brand", "sku"]);
+// The durable organization-wide catalog request. Product Catalog 68d2de238e is organization-wide and does NOT
+// support a `sku` column (DataDoe rejects it with HTTP 400), so the durable catalog fetches ONLY the four
+// supported columns; the SKU->brand fallback is derived from durable OLI history (SKU->child_asin) joined to
+// this catalog's child_asin->brand map, never from an unproven catalog `sku` field.
+export const DURABLE_CATALOG_COLUMNS = Object.freeze(["child_asin", "parent_asin", "product_name", "product_brand"]);
 export const DURABLE_CATALOG_ROW_LIMIT = 20000;
+
+// Deterministically select ONE Catalog carrier seller from the FULL fresh primary directory (the full `active`
+// classification, NOT one bucket). Product Catalog is organization-wide -- one syntactically-required seller id
+// does not filter the org-wide result -- but the id must be a canonical, nonblank PRIMARY seller (never a
+// dd-secondary / prefixed id), and it MUST be identical for US and Non-US so both buckets produce ONE canonical
+// request hash / one reservation / one create. The choice is internal + deterministic (sorted, first); it is
+// NEVER taken from HTTP/CLI/runtime input. Returns the carrier id, or null when no canonical primary exists
+// (the catalog planner then fails closed BEFORE any reservation/create).
+export function selectCatalogCarrierSeller(activeAccounts) {
+  const ids = [];
+  for (const a of Array.isArray(activeAccounts) ? activeAccounts : []) {
+    const accountId = String((a && (a.accountId ?? a.id)) || "").trim();
+    if (!accountId || accountId.includes(":")) continue; // primary only; a prefixed dd-secondary id is excluded
+    ids.push(accountId); // for primary accounts rawSellerId === accountId (a canonical DataDoe seller id)
+  }
+  const canonical = [...new Set(ids)].sort();
+  return canonical.length ? canonical[0] : null;
+}
 
 const FBA_SNAPSHOT_LOOKBACK_DAYS = 10; // mirrors fba-plan:inventory-health "range:asOf-10d..asOf"
 
@@ -99,14 +118,21 @@ export function resolvedOliSliceBatch({ apiKey, unit, bucket }) {
   };
 }
 
-// The durable org-wide catalog request (once per organization per day; bucket-free identity).
-export function resolvedDurableCatalog({ apiKey, asOf, bucket }) {
-  if (!isDateStr(asOf)) throw new Error("resolvedDurableCatalog requires a YYYY-MM-DD asOf (fail closed).");
+// The durable org-wide catalog request (once per organization; bucket-free identity). Product Catalog
+// 68d2de238e is organization-wide: DataDoe REQUIRES a nonblank sellerOrVendorIds (one carrier seller does NOT
+// filter the org-wide result) but REJECTS an empty array, a from/to date range, or an unsupported `sku` column
+// with HTTP 400. So the request carries exactly ONE deterministic carrier seller (identical for both buckets),
+// NO from/to (the catalog is a current snapshot), and only the four supported columns. The carrier seller id is
+// bound into the canonical request hash (via accountScopeHash), so US + Non-US share ONE hash / owner /
+// reservation / create. A missing/blank/noncanonical carrier fails closed BEFORE any reservation or create.
+export function resolvedDurableCatalog({ apiKey, carrierSellerId, bucket }) {
+  const carrier = String(carrierSellerId == null ? "" : carrierSellerId).trim();
+  if (!carrier || carrier.includes(":")) throw new Error("resolvedDurableCatalog requires a canonical primary carrier seller id (fail closed).");
   const sourceId = sourceContractForKey(CATALOG_SOURCE_KEY).ids[0];
   const options = { orderByColumn: "child_asin", orderByDirection: "ASC" };
   const identity = sourceRequestIdentity({
-    apiKey, sourceId, columns: [...DURABLE_CATALOG_COLUMNS], ids: [],
-    from: asOf, to: asOf, limit: DURABLE_CATALOG_ROW_LIMIT, options,
+    apiKey, sourceId, columns: [...DURABLE_CATALOG_COLUMNS], ids: [carrier],
+    from: null, to: null, limit: DURABLE_CATALOG_ROW_LIMIT, options,
   });
   return {
     ...identity,
@@ -114,9 +140,9 @@ export function resolvedDurableCatalog({ apiKey, asOf, bucket }) {
     sourceId, sourceKey: CATALOG_SOURCE_KEY,
     bucket, strict: true, limit: DURABLE_CATALOG_ROW_LIMIT,
     sourceScope: "organization", marketplaceScoped: false,
-    sellerOrVendorIds: [],
+    sellerOrVendorIds: [carrier],
     columns: [...DURABLE_CATALOG_COLUMNS],
-    from: asOf, to: asOf, options,
+    from: null, to: null, options,
   };
 }
 
@@ -197,6 +223,10 @@ export function planBucketSourceSync({
   apiKey, bucket, accounts, existingMembership = new Map(),
   coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   pausedSources = new Set(), asOf, today,
+  // The deterministic organization Catalog carrier seller (selectCatalogCarrierSeller over the FULL fresh
+  // primary directory; identical for both buckets). REQUIRED whenever a Catalog job is planned -- the org-wide
+  // Product Catalog request must carry exactly one canonical primary seller id (empty => DataDoe HTTP 400).
+  catalogCarrierSeller = null,
   // PRIORITY DASHBOARDS PATH: force the organization Catalog family to plan a job even when its snapshot is
   // already fresh-today. The Daily Reporting + Brand View priority derive runs ONLY after a drained cycle
   // (globalDrained), and its lineage binds to a cycle Catalog hash; forcing the (cache-reusing, zero-token
@@ -259,7 +289,9 @@ export function planBucketSourceSync({
     const decision = snapshotRefreshDecision({ sourceKey: CATALOG_SOURCE_KEY, lastValidatedAt: catalogSnapshot && catalogSnapshot.validated_at, today });
     const catalogJobs = [];
     if (decision.refresh || forceCatalogRefresh) {
-      const resolved = resolvedDurableCatalog({ apiKey, asOf: today, bucket });
+      // resolvedDurableCatalog fails closed on a missing/blank/noncanonical carrier -- BEFORE any reservation
+      // or create -- so a Catalog can never be planned without its one canonical primary carrier seller.
+      const resolved = resolvedDurableCatalog({ apiKey, carrierSellerId: catalogCarrierSeller, bucket });
       catalogJobs.push(plannedSourceJob(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", ORGANIZATION_SCOPE_KEY));
     }
     families.push({ sourceKey: CATALOG_SOURCE_KEY, plannedJobs: catalogJobs, decision, forcedRefresh: !decision.refresh && forceCatalogRefresh });
@@ -341,6 +373,9 @@ export async function runBucketSourceSync({
   // (bucket, cycle_date) cycle with no duplicate create.
   deadlineMs = Infinity, reserveMs = 3_000,
   maxContinuationsPerFamily = 6, reuseOnly = false, budgets = true,
+  // The deterministic organization Catalog carrier seller (threaded into planBucketSourceSync -> the org-wide
+  // Catalog request). REQUIRED whenever a Catalog job is planned.
+  catalogCarrierSeller = null,
   // PRIORITY DASHBOARDS PATH: force a Catalog job so a catalog-only (OLI/Ads/FBA-paused) run still drains a
   // cycle for the durable-evidence Daily Reporting + Brand View derive. See planBucketSourceSync.
   forceCatalogRefresh = false,
@@ -354,6 +389,7 @@ export async function runBucketSourceSync({
   const plan = planBucketSourceSync({
     apiKey, bucket, accounts, existingMembership, coverageByAccountId,
     catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
+    catalogCarrierSeller,
     forceCatalogRefresh,
   });
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
