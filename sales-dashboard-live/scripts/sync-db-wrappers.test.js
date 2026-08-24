@@ -15,7 +15,7 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 // role-credential-shaped literal exists in the bytes; the code reads the assembled name unchanged.
 const SRK_ENV = frag("SUPABASE", "_SERVICE", "_ROLE", "_KEY");
 process.env[SRK_ENV] = process.env[SRK_ENV] || dash("test", "svc", "role", "key");
-let upsertSyncSourceJob, prodClaimSourceExportAttempt, organizationFingerprint, getSourceOliHistoryRows;
+let upsertSyncSourceJob, prodClaimSourceExportAttempt, organizationFingerprint, getSourceOliHistoryRows, getSyncSourceJobs;
 
 let passed = 0;
 const tests = [];
@@ -167,6 +167,22 @@ test("still fails closed on a missing organization fingerprint BEFORE any PostgR
   });
 });
 
+group("source-job read selects the columns the finalize verifier depends on");
+
+test("getSyncSourceJobs SELECTS cache_object_path (adopting-bucket finalize proves warm-cache evidence from it)", async () => {
+  // Regression: SOURCE_JOB_COLUMNS once omitted cache_object_path, so an ADOPTING bucket (create_export_count=0)
+  // always finalized as 'no-cache-evidence' -- the verifier read a column the store never fetched. The read MUST
+  // request it (and the other fields the finalize coherence checks read off the catalog job).
+  await withPagedFetch([], async (calls) => {
+    await getSyncSourceJobs("cyc_1");
+    assert.equal(calls.length, 1, "one PostgREST read");
+    const select = new URL(calls[0].url).searchParams.get("select") || "";
+    for (const col of ["cache_object_path", "create_export_count", "export_id", "request_hash", "fetch_status", "source_key"]) {
+      assert.ok(select.split(",").includes(col), "select includes " + col);
+    }
+  });
+});
+
 /* ---- load env-dependent modules AFTER env is set, then run the async suite (no TLA) ----
    Each dynamic import is bracketed by a synchronous progress marker so a blocking import is
    pinpointed immediately (see the `mark`/`out` note above). The modules below transitively
@@ -184,7 +200,7 @@ async function main() {
     return mod;
   };
 
-  const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob; prodClaimSourceExportAttempt = sb.claimSourceExportAttempt; getSourceOliHistoryRows = sb.getSourceOliHistoryRows;
+  const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob; prodClaimSourceExportAttempt = sb.claimSourceExportAttempt; getSourceOliHistoryRows = sb.getSourceOliHistoryRows; getSyncSourceJobs = sb.getSyncSourceJobs;
   ({ organizationFingerprint } = await step("source-identity.js", "../lib/server/source-identity.js"));
   const total = tests.filter((t) => !t.marker).length;
   mark("all imports resolved; running " + total + " tests");

@@ -1503,7 +1503,10 @@ export async function upsertSyncSourceJob(job, { signal = null } = {}) {
 
 // Canonical source jobs only. request_key is NOT a column here and is NOT ownership authority (report
 // ownership lives in sync_source_job_owners); the SELECT lists only real sync_source_jobs columns.
-const SOURCE_JOB_COLUMNS = "id,request_hash,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,terminal,error_stage,error_code,row_count";
+// cache_object_path is REQUIRED: the priority-release finalize proves an ADOPTING bucket's warm-cache evidence
+// (create_export_count=0) by reading it off the catalog source job. Omitting it made every adopting-bucket
+// finalize fail closed as "no-cache-evidence" even though the durable row carries the path.
+const SOURCE_JOB_COLUMNS = "id,request_hash,source_id,source_key,connection_id,organization_fingerprint,account_scope_hash,fetch_status,attempted_at,create_export_count,export_id,cache_object_path,terminal,error_stage,error_code,row_count";
 
 export async function getSyncSourceJobs(cycleId, { signal = null } = {}) {
   const query = new URLSearchParams({
