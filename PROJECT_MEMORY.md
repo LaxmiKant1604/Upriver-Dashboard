@@ -11581,3 +11581,99 @@ first fresh UTC date (2026-08-25) -> require green -> dispatch US -> require gre
 live, Bebi Born 8 countries, ASIN Ads populated, Campaign Ads/FBA paused, no cron, controls closed, creates/tokens
 within 15 exports/30 tokens. NOT "scheduler live" until both fresh-date runs pass + a scheduled trigger is
 observed. State: main @ 6a21b19.
+
+================================================================================
+DURABLE ASIN ADS = THE SINGLE REUSABLE ADVERTISING SOURCE (Daily Reporting switched
+campaign-grain -> ASIN-grain) -- 2026-08-24
+================================================================================
+
+MISSION: make the durable ASIN Ads grain (asin-performance-v1, in ads_daily_source_rows)
+the ONE reusable advertising source wherever account-level or brand-level Ads metrics are
+produced -- Daily Reporting (account-level) + Brand View (brand-level) + PPC all read the
+SAME saved dataset; NO export per dashboard/report/brand; the overlapping campaign grain is
+NEVER summed with it and stays PPC-only + PAUSED (never exported).
+
+STATE VERIFIED FIRST (mission requirement): the scheduler already FETCHES asin-performance-v1
+(built in the prior ASIN-Ads-scheduler mission), Brand View already reads it, and the ASIN
+rows already exist in ads_daily_source_rows -- so the Daily switch is a CONSUMPTION change,
+ZERO new exports. The registry contradiction (ads-asin-date declared per-account/
+maxAccountsPerExport:1 while the scheduler budget assumes <=5-seller batches) was proven
+DOCUMENTARY: maxAccountsPerExport has ZERO runtime/budget consumers; the real ads batching is
+ads-sync.js source.batchSize = MAX_IDS_PER_EXPORT = 5 (chunks(entries,5)) with per-seller
+isolation proven by validateExportBatchRows. So the fix = correct the stale DECLARATION.
+
+KEY SEMANTIC CONSEQUENCE (flagged): the ASIN contract's ONLY attributed-sales field is
+ad_sales_same_sku (same-SKU; NO campaign halo/other-SKU). So Daily "Ad Sales" now = same-SKU
+attributed sales (mapped ad_sales_same_sku -> ad_sales), a lower number than the former
+campaign ad_sales. This is inherent to the mission (ASIN Ads as the single grain; "preserve
+only contract-supplied fields... attributed sales") -- there is no other attributed-sales
+value in the ASIN contract. Version bumps invalidate old campaign-grain snapshots.
+
+MINIMAL-RISK STRATEGY = boundary projection: a new shared module folds ASIN rows to the
+EXISTING canonical daily-ads shape {date, seller_or_vendor_id, currency, ad_sales, ad_spend,
+ad_clicks} at the reader boundary, so ALL downstream coverage/availability/merge machinery
+(buildDailyAdsCoverage, resolveDailyAdsAvailability, mergeSalesAndAds, the frontend) is
+UNCHANGED. The pure derivation + frontend need NO change -> live<->scheduler parity by
+construction (durable-live-parity P1 green).
+
+NEW canonical module lib/server/reports/asin-ads-aggregation.js (+ test, registered in
+package.json + verify.mjs): ASIN_ADS_METRIC_FIELDS (impressions/clicks/spend/attributedSales=
+ad_sales_same_sku/attributedOrders=ad_orders_same_sku/attributedUnits=ad_units_sold_same_sku);
+never-invent extraction (absent metric omitted, never 0); currency isolation (blank->typed
+UNKNOWN for account/brand helpers); dedup by natural grain (account,marketplace,date,
+dimension_key); aggregateAccountAsinAds (account-level, per-currency); aggregateBrandAsinAds
+(brand-level via child_asin->brand map + a SEPARATE typed unmapped bucket, strict two-brand
+separation); aggregateAsinAdsDailyRows (the DAILY per-(date,currency) projection: blank
+currency stays blank->null NOT UNKNOWN to preserve the single-account-currency coverage
+contract; absent metric contributes 0 additive identity; a PRESENT-but-non-finite metric
+poisons the group total to NaN so resolveDailyAdsAvailability BLOCKS the account's Ads fail-
+closed -- preserving the campaign path's corruption guarantee).
+
+CONTRACT/REGISTRY changes: REPORT_SOURCE_REQUIREMENTS["daily-reporting"] ads-campaign-date ->
+ads-asin-date; REPORT_DERIVED_SOURCE_KEYS + source-contracts consumers both directions
+(ads-campaign-date now ["ppc-performance"], ads-asin-date +daily-reporting); source-registry
+usedByReports/usedByDashboards both directions; ads-asin-date batching per-account/1 ->
+stable-batch/5 (matches order-line-items + the real <=5 runtime) with a NEW validator-6
+exemption: a durable-ads family MAY be stable-batch without a source-job SELLER_SCOPED_REQUEST_KEYS
+contract because it batches via the durable Ads architecture with validateExportBatchRows
+isolation (a stronger guarantee); still MUST be seller-scoped + cap at 5.
+
+DAILY grain switch wiring: durable-dashboards DAILY_ADS_GRAIN -> asin-performance-v1;
+dailyReportingReadiness consumes asinAds (was campaignAds), sourceKey ads-asin-date;
+deriveDurableDashboardSnapshots renamed coverage param -> adsCoverageStateByAccountId (fed the
+ASIN coverage state); daily-ads-loader DAILY_ADS_SOURCE_KEY -> asin-performance-v1 +
+canonicalizeAdRows delegates to aggregateAsinAdsDailyRows; NEW supabase.getAsinAdsDailyRows
+(reads ads_daily_source_rows asin, hard row ceiling -> ADS_ROW_LIMIT_EXCEEDED) + getAdsDailySourceRows
+now selects dimension_key + updated_at + accepts signal; runtime readAdMetrics bindings
+(source-bucket-sync-runtime + runtime-composition) -> getAsinAdsDailyRows; gatherEvidence
+captures asinCoverageStateByAccountId; readiness blocker-merge key ads-campaign-date ->
+ads-asin-date; schema-contract REQUIRED_WRAPPER_EXPORTS += getAsinAdsDailyRows.
+
+api/datadoe.js daily route: Supabase branch reads getAsinAdsDailyRows + aggregateAsinAdsDailyRows
+(SAME seller stamping accountScope.accountIds[0] as the campaign path -> mergeSalesAndAds
+identical); REST fallback ADS_SOURCE_ID -> ASIN source, ad_sales_same_sku summed -> ad_sales_sum.
+Live route computes on cache-miss so the version bump does NOT outage live Daily.
+
+VERSION BUMPS (payload semantics changed): snapshotVersion daily-reporting/v2d-3 ->
+daily-reporting/v2e-1 (report-derivation.js); live daily-reporting-shared-v1 -> -v2 across the
+4 sites that must move together (registry.js, report-publisher.js, api/datadoe.js, src/App.jsx).
+
+Brand View reuse: aggregateBrandAds now routes ASIN extraction + spend through the shared
+canonical primitives (asinOf + asinAdsMetricsFromRow) -- behavior-preserving (present ad_spend
+identical; absent never invented), output shape (spendByKey/adCountries/coverageByCountry)
+UNCHANGED so live Brand View is untouched (test:brand-view 80 green).
+
+VERIFICATION: npm run verify = ALL 59 steps across 39 suites incl. build:check green; git diff
+--check clean. Updated the daily<->campaign-grain fixtures/assertions in durable-live-parity,
+source-bucket-sync, report-planner, source-registry(.test), report-source-contracts,
+source-priority-dashboards, gate7-rollout-publisher, zero-export-rehearsal. New regressions:
+daily fold per-(date,currency) + currency isolation + absent->0 + corrupt->NaN + Daily==account-
+level agreement; ads-asin-date stable-batch/5 declaration + durable-ads-specific exemption.
+
+PENDING (NOT complete -- mission gate: report complete ONLY after prod runs + validated
+publication + read-backs): production runs are BLOCKED here (harness blocks prod DB/DataDoe;
+no gh CLI/token to dispatch). Per the established pattern the USER dispatches: fresh-date Non-US
+first (green) -> US after the Non-US read-only prerequisite passes -> publish validated v2/v2e-1
+snapshots -> rebuild Brand View membership (US) -> verify live/API/frontend read-backs (Daily Ad
+Sales now same-SKU) -> always safe-close -> confirm Campaign Ads creates ZERO + FBA untouched.
+Code committed locally; push deploys the same-SKU Daily change live (compute-on-demand).
