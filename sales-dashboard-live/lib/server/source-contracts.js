@@ -124,7 +124,9 @@ export const SOURCE_CONTRACTS = [
     label: "Ad Performance by Campaign & Date",
     grain: "campaign-day",
     fields: ["date", "ad_campaign_id", "ad_campaign_type", "ad_campaign_budget_currency", "ad_sales", "ad_spend", "ad_clicks", "ad_impressions", "ad_orders", "ad_units_sold"],
-    consumers: ["daily-reporting", "ppc-performance", "brand-view"],
+    // Campaign grain is now PPC-only: Daily Reporting reads the ASIN grain (ads-asin-date) as the single
+    // reusable Ads source, and Brand View never read this family. Campaign Ads stays paused (never exported).
+    consumers: ["ppc-performance"],
     cacheHours: 6,
   }),
   contract({
@@ -133,7 +135,10 @@ export const SOURCE_CONTRACTS = [
     label: "Ad Performance by ASIN & Date",
     grain: "asin-campaign-ad-day",
     fields: ["date", "child_asin", "sku", "ad_campaign_id", "ad_group_id", "ad_id", "ad_campaign_type", "ad_campaign_budget_currency", "ad_sales_same_sku", "ad_spend", "ad_clicks", "ad_impressions", "ad_orders_same_sku", "ad_units_sold_same_sku"],
-    consumers: ["ppc-performance", "brand-view"],
+    // The SINGLE reusable Ads source: Daily Reporting (account-level) + Brand View (brand-level) + PPC all
+    // read this ASIN grain. Attributed sales is ad_sales_same_sku (same-SKU only -- the only attributed-sales
+    // field this contract supplies; no campaign halo). ONE saved dataset feeds every consumer.
+    consumers: ["daily-reporting", "ppc-performance", "brand-view"],
     cacheHours: 6,
   }),
   contract({
@@ -177,7 +182,7 @@ export const SOURCE_CONTRACTS = [
 // the upstream report/source they read instead of inventing another export.
 export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "brand-sales": ["order-line-items", "product-catalog"],
-  "daily-reporting": ["order-line-items", "product-catalog", "ads-campaign-date"],
+  "daily-reporting": ["order-line-items", "product-catalog", "ads-asin-date"],
   reconciliation: ["order-line-items", "settlements", "product-catalog"],
   "fba-plan": ["order-line-items", "product-catalog", "fba-inventory-health", "listings"],
   "sku-pl": ["profit-by-sku-date"],

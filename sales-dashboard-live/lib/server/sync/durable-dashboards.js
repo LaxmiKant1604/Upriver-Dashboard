@@ -19,7 +19,9 @@ import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
 import { buildDailyAdsCoverage } from "./daily-ads-loader.js";
 import { canonicalOliSlices } from "../date-windows.js";
 
-export const DAILY_ADS_GRAIN = "campaign-performance-v1";
+// Daily Reporting and Brand View now BOTH read the durable ASIN grain (asin-performance-v1) -- the SINGLE
+// reusable advertising source. The campaign grain (campaign-performance-v1) is PPC-only and never fed here.
+export const DAILY_ADS_GRAIN = "asin-performance-v1";
 export const BRAND_VIEW_ADS_GRAIN = "asin-performance-v1";
 
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
@@ -165,11 +167,12 @@ function adsCoverageProof(adsEvidence, from, to, accounts = null) {
  * READINESS of Daily Reporting over the durable model for [from, to]:
  *   - order-line-items: every account's durable coverage proves the window;
  *   - product-catalog : a validated durable catalog snapshot exists;
- *   - ads (CAMPAIGN grain ONLY): durable coverage proves the window (ads never block sales -- their gap is
- *     reported as a blocking source for the ADS half, with blocksSales:false).
+ *   - ads (ASIN grain ONLY -- the single reusable Ads source, shared with Brand View): durable coverage proves
+ *     the window (ads never block sales -- their gap is reported as a blocking source for the ADS half, with
+ *     blocksSales:false).
  * Returns { ready, blockedBy: [{sourceKey, reason, accountId?, blocksSales}] }.
  */
-export function dailyReportingReadiness({ oliCoverageByAccountId = {}, accounts = [], catalogSnapshot = null, campaignAds = null, from, to } = {}) {
+export function dailyReportingReadiness({ oliCoverageByAccountId = {}, accounts = [], catalogSnapshot = null, asinAds = null, from, to } = {}) {
   requireWindow(from, to, "dailyReportingReadiness");
   const blockedBy = [];
   if (!Array.isArray(accounts) || accounts.length === 0) {
@@ -183,14 +186,14 @@ export function dailyReportingReadiness({ oliCoverageByAccountId = {}, accounts 
   if (!catalogSnapshot || !catalogSnapshot.validated_at) {
     blockedBy.push({ sourceKey: "product-catalog", reason: "no-validated-snapshot", blocksSales: true });
   }
-  const grainError = requireGrain(campaignAds, DAILY_ADS_GRAIN, "dailyReportingReadiness");
+  const grainError = requireGrain(asinAds, DAILY_ADS_GRAIN, "dailyReportingReadiness");
   if (grainError) {
-    blockedBy.push({ sourceKey: "ads-campaign-date", reason: grainError.reason, blocksSales: false });
+    blockedBy.push({ sourceKey: "ads-asin-date", reason: grainError.reason, blocksSales: false });
   } else {
-    const proof = adsCoverageProof(campaignAds, from, to, accounts);
-    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-campaign-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
+    const proof = adsCoverageProof(asinAds, from, to, accounts);
+    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-asin-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
   }
-  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-campaign-date"), blockedBy };
+  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-asin-date"), blockedBy };
 }
 
 /**
@@ -234,10 +237,10 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
 //
 // Finding 3: NO orphan custom report keys. The durable outputs ARE the existing report contracts:
 //   - Daily Reporting: the REAL REPORT_DERIVATIONS["daily-reporting"] adapter (snapshotVersion
-//     "daily-reporting/v2d-3", the exact live-parity payload the API/frontend consume), fed with
-//     canonical-fragment rows reconstructed from durable history + the REAL campaign Ads metric rows and
-//     the REAL buildDailyAdsCoverage/resolveDailyAdsAvailability contract -- so the payload carries actual
-//     campaign ad metrics with honest availability;
+//     "daily-reporting/v2e-1", the exact live-parity payload the API/frontend consume), fed with
+//     canonical-fragment rows reconstructed from durable history + the REAL durable ASIN Ads rows (the single
+//     reusable Ads source) and the REAL buildDailyAdsCoverage/resolveDailyAdsAvailability contract -- so the
+//     payload carries actual same-SKU ASIN ad metrics with honest availability;
 //   - Brand View: the REAL REPORT_DERIVATIONS["brand-sales"] adapter (snapshotVersion "brand-sales/v2d-2",
 //     { rows, catalogBrands, asinBrand }) -- EXACTLY the saved payload the live Brand View assembles from
 //     (aggregateBrandSales + asinBrand for FBA inventory attribution). ASIN Ads + FBA inventory reach Brand
@@ -304,12 +307,14 @@ export function slicedOliSourceFromHistory({ historyRows, accountId, rawSellerId
 export function deriveDurableDashboardSnapshots({
   bucket, accounts = [], historyRows = [], catalogRows = null,
   oliCoverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
+  // `campaignAds` is accepted for evidence-shape compatibility but no longer consumed here: Daily Reporting
+  // now derives its Ads from the ASIN grain (asinAds), the SINGLE reusable Ads source it shares with Brand View.
   campaignAds = null, asinAds = null,
-  // Finding 1 (round 4): per-account campaign Ads METRIC evidence carries its TYPED read state --
+  // Finding 1 (round 4): per-account ASIN Ads METRIC evidence carries its TYPED read state --
   // { rows, metricsRead: "ok" | "limit-exceeded" | "read-failed" }. A failed/limited/malformed read must
   // never masquerade as a clean zero-ad result: metricsRead threads into buildDailyAdsCoverage, whose
   // availability resolver fails the Ads half typed (sales survive; no false zero Ads).
-  adMetricsByAccountId = {}, campaignCoverageStateByAccountId = {},
+  adMetricsByAccountId = {}, adsCoverageStateByAccountId = {},
   dailyWindow, brandViewWindow,
 } = {}) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("deriveDurableDashboardSnapshots requires bucket 'us'|'non-us' (fail closed).");
@@ -320,7 +325,7 @@ export function deriveDurableDashboardSnapshots({
   const brandSalesEntry = REPORT_DERIVATIONS["brand-sales"];
 
   const dailyReadiness = dailyReportingReadiness({
-    accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, campaignAds,
+    accounts: accountIds, oliCoverageByAccountId, catalogSnapshot, asinAds,
     from: dailyWindow.from, to: dailyWindow.to,
   });
   const daily = { readiness: dailyReadiness, snapshots: [], skipped: [] };
@@ -338,7 +343,7 @@ export function deriveDurableDashboardSnapshots({
           from: dailyWindow.from, to: dailyWindow.to,
           metricRows: metricsRead === "ok" ? adMetrics.rows : [],
           metricsRead,
-          coverageState: campaignCoverageStateByAccountId[account.accountId] || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed", error: "COVERAGE_READ_FAILED" },
+          coverageState: adsCoverageStateByAccountId[account.accountId] || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed", error: "COVERAGE_READ_FAILED" },
         });
         const payload = dailyEntry.derive({
           sources: { "daily-reporting:oli-sales": source, "daily-reporting:catalog": { rows: catalogRows } },

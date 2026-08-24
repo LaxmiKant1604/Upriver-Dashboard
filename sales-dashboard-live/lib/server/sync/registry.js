@@ -145,7 +145,7 @@ export const SYNC_REGISTRY = [
   report({ reportKey: "fba-plan", reportVersion: "fba-plan-shared-v1", label: "FBA Shipment Plan",
     windowFor: ({ asOf }) => ({ to: asOf }), adapter: "fba-plan",
     validate: (v) => (v && Array.isArray(v.rows) ? true : "fba-plan payload has no rows[]"), enabled: false }),
-  report({ reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v1", label: "Daily Reporting",
+  report({ reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v2", label: "Daily Reporting",
     windowFor: ({ asOf }) => ({ from: addDaysStr(monthStartStr(asOf), -150), to: asOf, brand: "ALL" }), adapter: "daily-reporting", enabled: false }),
   report({ reportKey: "reconciliation", reportVersion: "reconciliation-shared-v1", label: "Reconciliation",
     windowFor: ({ asOf }) => ({ from: addDaysStr(monthStartStr(asOf), -180), to: asOf }), adapter: "reconciliation", retentionDays: 60, enabled: false }),

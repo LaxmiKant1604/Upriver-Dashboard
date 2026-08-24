@@ -182,6 +182,19 @@ const PL_SUPERSET = [
 ];
 const PL_CATALOG = [{ child_asin: "ASIN000001", product_brand: "Acme" }, { child_asin: "ASIN000002", product_brand: "Beta" }];
 const plMetric = (d, over = {}) => ({ metric_date: d, campaign_id: "c1", campaign_type: "SP", currency: "USD", ad_sales: 10, ad_spend: 5, ad_clicks: 3, ...over });
+// A durable ASIN-Ads row (ads_daily_source_rows, asin-performance-v1) -- Daily now reads THIS grain. Its metrics
+// live in a JSONB; the loader folds every ASIN per (date, currency): ad_sales_same_sku -> ad_sales. Each row
+// carries a UNIQUE dimension_key so two ASINs on one day are not deduplicated away before the fold.
+let plAsinSeq = 0;
+const asinAdRow = (d, over = {}) => ({
+  metric_date: d,
+  marketplace_country_code: over.country || "US",
+  dimension_key: over.dim || ("dk-" + (plAsinSeq += 1)),
+  currency: over.currency === undefined ? "USD" : over.currency,
+  child_asin: over.child_asin ?? "B0A",
+  updated_at: over.updated_at || "2026-03-06T00:00:00Z",
+  metrics: over.metrics || { ad_sales_same_sku: over.ad_sales ?? 10, ad_spend: over.ad_spend ?? 5, ad_clicks: over.ad_clicks ?? 3 },
+});
 const plDailyRequest = (accountId, country, currency) => planDailyReporting({ accountId, country, currency, connections: PL_CONN, asOf: PL_AS_OF });
 
 function plSeedCache(request) {
@@ -200,7 +213,7 @@ async function plDeriveDaily({ getAdMetrics, coverageState }) {
   for (const s of request.sources) store.seedSourceStatus(s.requestHash, "succeeded");
   const loader = makeDailyAdsContextLoader({
     connections: PL_CONN,
-    getAdMetrics: getAdMetrics || (async () => [plMetric("2026-03-05")]),
+    getAdMetrics: getAdMetrics || (async () => [asinAdRow("2026-03-05")]),
     getCoverageState: async () => coverageState || { windows: [{ from: PL_FROM, to: PL_TO }], status: "succeeded", latestMetricDate: "2026-03-05", read: "ok" },
   });
   const res = await runReportJobs({ store, cycleId: "c", sourceRows: makeCacheLoader(plSeedCache(request)), saveSnapshot: plMakeSaver(store), plannedReports: [request], loadDerivedContext: loader });
@@ -376,27 +389,28 @@ test("planner: exceeding the safety row limit BLOCKS (throws), never returns a p
 
 group("planner: Daily Ads availability model + currency");
 
-test("planner: loader reads ad_daily_metrics ONLY (not overlapping raw Ads tables), by public id + window", async () => {
+test("planner: loader reads the ASIN grain ONLY (not overlapping raw Ads tables), by public id + window", async () => {
   const req = plDailyRequest("A1", "US", "USD");
   const adCalls = [];
   const coverageKeys = [];
   const loader = makeDailyAdsContextLoader({
     connections: PL_CONN,
-    getAdMetrics: async (accountId, from, to) => { adCalls.push({ accountId, from, to }); return [plMetric("2026-03-05")]; },
+    getAdMetrics: async (accountId, from, to) => { adCalls.push({ accountId, from, to }); return [asinAdRow("2026-03-05")]; },
     getCoverageState: async (_id, sk) => { coverageKeys.push(sk); return { windows: [{ from: PL_FROM, to: PL_TO }], status: "succeeded", latestMetricDate: "2026-03-05", read: "ok" }; },
   });
   const ctx = await loader({ reportKey: "daily-reporting", accountId: "A1", planned: req });
-  assert.deepEqual(adCalls, [{ accountId: "A1", from: PL_FROM, to: PL_TO }], "ad_daily_metrics read once by public id + exact window");
-  assert.deepEqual(coverageKeys, [DAILY_ADS_SOURCE_KEY], "coverage checked only for the campaign source that feeds ad_daily_metrics");
+  assert.deepEqual(adCalls, [{ accountId: "A1", from: PL_FROM, to: PL_TO }], "ASIN Ads read once by public id + exact window");
+  assert.deepEqual(coverageKeys, [DAILY_ADS_SOURCE_KEY], "coverage checked only for the ASIN source (asin-performance-v1)");
   assert.ok(ctx.adsCoverage && Array.isArray(ctx.adsCoverage.adRows));
 });
 
-test("planner: canonical rows stamp the raw seller id + finite metrics (per-campaign preserved)", async () => {
-  const rows = canonicalizeAdRows([plMetric("2026-03-05"), plMetric("2026-03-05", { campaign_id: "c2", ad_sales: 4 })], "A1");
-  assert.equal(rows.length, 2);
-  assert.deepEqual(rows[0], { date: "2026-03-05", seller_or_vendor_id: "A1", currency: "USD", ad_sales: 10, ad_spend: 5, ad_clicks: 3 });
+test("planner: canonical rows stamp the raw seller id + fold every ASIN per (date, currency)", async () => {
+  const rows = canonicalizeAdRows([asinAdRow("2026-03-05"), asinAdRow("2026-03-05", { child_asin: "B0B", ad_sales: 4 })], "A1");
+  assert.equal(rows.length, 1, "two ASINs on one date+currency fold to ONE canonical row (ad_sales_same_sku -> ad_sales)");
+  assert.deepEqual(rows[0], { date: "2026-03-05", seller_or_vendor_id: "A1", currency: "USD", ad_sales: 14, ad_spend: 10, ad_clicks: 6 });
   assert.ok(rows.every((r) => r.seller_or_vendor_id === "A1"));
-  assert.ok(Number.isNaN(canonicalizeAdRows([plMetric("2026-03-05", { ad_sales: "oops" })], "A1")[0].ad_sales));
+  // A present-but-corrupt metric poisons the total to NaN so the coverage validator BLOCKS it (never coerced to 0).
+  assert.ok(Number.isNaN(canonicalizeAdRows([asinAdRow("2026-03-05", { metrics: { ad_sales_same_sku: "oops" } })], "A1")[0].ad_sales));
 });
 
 test("planner: availability -- validated / new-account partial / stale / unavailable / failed", async () => {
@@ -424,7 +438,7 @@ test("planner: currency -- null / blank / mismatched / mixed row currency all fa
 
 test("planner e2e: a new account SAVES validated sales with Ads PARTIAL (never zero the uncovered period)", async () => {
   const { res, snap } = await plDeriveDaily({
-    getAdMetrics: async () => [plMetric("2026-07-10")],
+    getAdMetrics: async () => [asinAdRow("2026-07-10")],
     coverageState: { windows: [{ from: "2026-06-15", to: PL_TO }], status: "succeeded", latestMetricDate: "2026-07-10", read: "ok" },
   });
   assert.equal(res.succeeded, 1, "sales snapshot saved");

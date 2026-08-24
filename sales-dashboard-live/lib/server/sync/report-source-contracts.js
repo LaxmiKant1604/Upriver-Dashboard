@@ -842,7 +842,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
 // owned DataDoe export. Keeping this explicit lets coverage tests distinguish an
 // intentional derived dependency from an accidentally omitted source.
 export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
-  "daily-reporting": ["ads-campaign-date"],
+  // Daily Reporting now derives its Ads from the ASIN grain (ads-asin-date / asin-performance-v1) -- the SINGLE
+  // reusable advertising source it shares with Brand View. The campaign grain (ads-campaign-date) is PPC-only.
+  "daily-reporting": ["ads-asin-date"],
   // PPC Performance reads ALL advertising figures from the persisted Ads history the
   // scheduled worker maintains (ads_daily_source_rows). Opening/refreshing PPC never
   // runs an Amazon Ads export, so these four Ads sources are derived, not owned.

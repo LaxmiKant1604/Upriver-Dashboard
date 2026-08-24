@@ -253,9 +253,10 @@ export const SOURCE_REGISTRY = Object.freeze([
     scope: "seller",
     grain: "dated",
     batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
-    usedByReports: ["daily-reporting", "ppc-performance"],
-    // Daily Reporting reads the CAMPAIGN grain (ad_daily_metrics). Brand View does NOT read this family.
-    usedByDashboards: ["daily-reporting", "ppc-performance", "priority-feed"],
+    usedByReports: ["ppc-performance"],
+    // PPC-only now. Daily Reporting moved to the ASIN grain (ads-asin-date); Brand View never read this family.
+    // The campaign grain stays PAUSED (never exported) -- it and the ASIN grain OVERLAP and are never summed.
+    usedByDashboards: ["ppc-performance", "priority-feed"],
     initialBackfill: { kind: "window-days", days: 56 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
     tokenClass: "standard",
@@ -267,11 +268,19 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "d0017e92fb089c2c8c3fe65f81d08666ecb4fe937ffbce9969ce2fc7d28c805c",
     scope: "seller",
     grain: "dated",
-    batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
-    usedByReports: ["ppc-performance", "brand-view"],
-    // Brand View reads the ASIN grain (asin-performance-v1) -- the ONLY Ads grain it reads; the campaign and
-    // ASIN grains OVERLAP and are never summed together.
-    usedByDashboards: ["ppc-performance", "brand-view", "priority-feed"],
+    // The REAL runtime for this durable-ads family is a STABLE <=5-seller batch: ads-sync.js fetches it in
+    // chunks of source.batchSize = MAX_IDS_PER_EXPORT (5) and validateExportBatchRows PROVES per-seller
+    // isolation (every non-empty row must carry a seller_or_vendor_id belonging to the batch; unknown/blank/
+    // cross-account rejects the whole payload). The former per-account/maxAccountsPerExport:1 declaration
+    // contradicted that runtime and the scheduler token budget (US <=2 / Non-US <=5 exports assume 5-seller
+    // batches). Corrected to stable-batch/5 to match reality. Durable-ads families batch via that architecture,
+    // not a source-job SELLER_SCOPED_REQUEST_KEYS contract (validator 6 exempts durable-ads accordingly).
+    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
+    usedByReports: ["brand-view", "daily-reporting", "ppc-performance"],
+    // The SINGLE reusable Ads grain (asin-performance-v1): Daily Reporting (account-level) + Brand View
+    // (brand-level) + PPC all read it. ONE saved dataset feeds every consumer. The campaign and ASIN grains
+    // OVERLAP and are never summed together.
+    usedByDashboards: ["brand-view", "daily-reporting", "ppc-performance", "priority-feed"],
     initialBackfill: { kind: "window-days", days: 60 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
     tokenClass: "standard",
@@ -441,9 +450,16 @@ export function assertSourceRegistryConsistency(overrides = {}) {
     //    contract MUST be seller-scoped, and only a stable-batch family may have one. Organization-wide
     //    means exactly that -- it can never be batchable by seller.
     const hasBatchedContract = sellerScopedRequestKeys.some((rk) => familiesByRequestKey.get(rk) === r.sourceKey);
+    // A durable-ads family is fetched by the durable Ads architecture (ads-sync.js), never by a Scheduler-v2
+    // source job, so it has no SELLER_SCOPED_REQUEST_KEYS source-job contract. It may still be stable-batch:
+    // ads-sync batches <=5 sellers per export (source.batchSize = MAX_IDS_PER_EXPORT) and validateExportBatchRows
+    // proves per-seller isolation -- a STRONGER, executable guarantee than a declared source-job contract. Such a
+    // family MUST be seller-scoped and cap at 5 (checked below), just like a source-job stable batch.
+    const durableAdsBatched = r.storage === "durable-ads" && r.batching.mode === "stable-batch";
     if (hasBatchedContract && r.scope !== "seller") die(`"${r.sourceKey}" has a seller-batched contract but is not seller-scoped`);
     if (hasBatchedContract && r.batching.mode !== "stable-batch") die(`"${r.sourceKey}" has a seller-batched contract but batching mode "${r.batching.mode}"`);
-    if (!hasBatchedContract && r.batching.mode === "stable-batch") die(`"${r.sourceKey}" is stable-batch but has NO approved SELLER_SCOPED_REQUEST_KEYS contract`);
+    if (!hasBatchedContract && !durableAdsBatched && r.batching.mode === "stable-batch") die(`"${r.sourceKey}" is stable-batch but has NO approved SELLER_SCOPED_REQUEST_KEYS contract`);
+    if (durableAdsBatched && r.scope !== "seller") die(`"${r.sourceKey}" is durable-ads stable-batch but is not seller-scoped`);
     if (r.scope === "organization" && r.batching.mode !== "organization") die(`"${r.sourceKey}" is organization-wide but not organization-batched`);
     if (r.batching.mode === "stable-batch" && r.batching.maxAccountsPerExport !== 5) die(`"${r.sourceKey}" stable-batch must cap at exactly 5 accounts per export`);
 

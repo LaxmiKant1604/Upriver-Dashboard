@@ -28,7 +28,7 @@ import {
   casUpdateReportSnapshotByRev,
   claimRefreshLock,
   deleteReportSnapshotByKey,
-  getAdDailyMetrics,
+  getAsinAdsDailyRows,
   getDashboardAccess,
   getLatestReportSnapshot,
   getReportSnapshot,
@@ -107,6 +107,7 @@ import {
   buildBrandInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
 import { membershipBrandsForAccount, selectorBrandsForAccount } from "../lib/server/reports/brand-membership.js";
+import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
 // Keep the rest of this legacy route's report builders connection-agnostic.
@@ -1377,7 +1378,7 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
     case "daily":
       if (!accountId || !from || !to) return null;
       return {
-        reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v1", accountId,
+        reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v2", accountId,
         params: { from, to, brand: String(req.query.brand || "ALL") }, label: "Daily Reporting",
       };
     case "reconciliation":
@@ -1530,7 +1531,10 @@ const OLI_SALES_ROW_LIMIT = 50000;
 // ad_campaign_budget_currency is carried + normalized to `currency` (Blocker 4) so the currency-keyed
 // mergeSalesAndAds only merges an Ads row into the OLI sales row of the SAME currency; a blank/unprovable
 // Ads currency becomes null and never merges (fail-closed: the sales row simply shows no ads).
-const ADS_SOURCE_ID = "08cdc77d3d";
+// The DataDoe ASIN Ads source (asin-performance-v1) -- the SINGLE reusable Ads grain. Server-side aggregated
+// to per-(date, seller, currency) totals so the REST fallback matches the Supabase/scheduler path exactly:
+// attributed sales is ad_sales_same_sku (same-SKU only; no campaign halo), aliased to ad_sales_sum.
+const ADS_SOURCE_ID = "d0017e92fb089c2c8c3fe65f81d08666ecb4fe937ffbce9969ce2fc7d28c805c";
 const ADS_COLUMNS = [
   "date",
   "seller_or_vendor_id",
@@ -1538,7 +1542,7 @@ const ADS_COLUMNS = [
 ];
 const ADS_GROUP_BY = ["date", "seller_or_vendor_id", "ad_campaign_budget_currency"];
 const ADS_AGGREGATIONS = [
-  { column: "ad_sales", aggregation: "sum", alias: "ad_sales_sum" },
+  { column: "ad_sales_same_sku", aggregation: "sum", alias: "ad_sales_sum" },
   { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
   { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
 ];
@@ -2746,21 +2750,16 @@ async function handleDataDoe(req, res) {
       const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
       const rows = normalizeDailySalesRows(rollupSupersetToDaily(salesRaw));
       for (const r of rows) r.total_units_sold = r.total_units;
-      // The scheduled Ads worker owns campaign data. Reading its saved
-      // upserts avoids another DataDoe export whenever a user opens or
-      // refreshes Daily Reporting. Keep a REST fallback until the first
+      // The scheduled Ads worker owns the durable ASIN Ads dataset (asin-performance-v1, the SINGLE reusable
+      // advertising source Daily shares with Brand View). Reading its saved rows avoids another DataDoe export
+      // whenever a user opens or refreshes Daily Reporting. The shared aggregation folds every ASIN into per-
+      // (date, currency) totals (ad_sales_same_sku -> ad_sales; no campaign halo), stamped with the same seller
+      // key the campaign path used so mergeSalesAndAds behaves identically. Keep a REST fallback until the first
       // scheduled seed has completed for an existing deployment.
       let ads;
       if (isSupabaseConfigured()) {
-        const savedAds = await getAdDailyMetrics(accountScope.accountIds[0], from, to);
-        ads = normalizeAdRows(savedAds.map((row) => ({
-          date: row.metric_date,
-          seller_or_vendor_id: accountScope.accountIds[0],
-          currency: row.currency,
-          ad_sales: row.ad_sales,
-          ad_spend: row.ad_spend,
-          ad_clicks: row.ad_clicks,
-        })));
+        const asinRows = await getAsinAdsDailyRows(accountScope.accountIds[0], from, to);
+        ads = normalizeAdRows(aggregateAsinAdsDailyRows(asinRows, { rawSellerId: accountScope.accountIds[0] }));
       } else {
         const adRaw = await fetchExportRows(
           apiKey,

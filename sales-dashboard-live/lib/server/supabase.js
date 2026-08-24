@@ -2514,15 +2514,16 @@ const ADS_ROW_PAGE_SIZE = 1000;
  * This is the PPC report's only Ads source: the scheduled worker owns the
  * DataDoe exports, so opening or refreshing PPC never spends an Ads export.
  */
-export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, maxRows }) {
+export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, maxRows, signal = null }) {
   const rows = [];
   for (let offset = 0; ; offset += ADS_ROW_PAGE_SIZE) {
     const query = new URLSearchParams({
       // account_id is SELECTed (not just filtered) so the PPC loader can prove row-level account
       // isolation fail-closed -- an injected/mis-scoped reader that leaks another account's rows is
       // rejected by validatePpcAdsRows before any currency gating or folding, never trusted from the
-      // PostgREST filter alone.
-      select: "account_id,source_key,metric_date,marketplace_country_code,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at",
+      // PostgREST filter alone. dimension_key + updated_at are SELECTed so a consumer can deduplicate by
+      // the natural grain (account, marketplace, date, dimension_key), last-write-wins on updated_at.
+      select: "account_id,source_key,metric_date,marketplace_country_code,dimension_key,campaign_id,campaign_type,child_asin,targeting_id,currency,dimensions,metrics,source_refreshed_at,updated_at",
       account_id: `eq.${accountId}`,
       source_key: `in.(${sourceKeys.join(",")})`,
       and: `(metric_date.gte.${from},metric_date.lte.${to})`,
@@ -2534,14 +2535,27 @@ export async function getAdsDailySourceRows({ accountId, sourceKeys, from, to, m
       limit: String(ADS_ROW_PAGE_SIZE),
       offset: String(offset),
     });
-    const page = await request(`/rest/v1/ads_daily_source_rows?${query}`);
+    const page = await request(`/rest/v1/ads_daily_source_rows?${query}`, signal ? { signal } : undefined);
     rows.push(...page);
     if (page.length < ADS_ROW_PAGE_SIZE) break;
     if (maxRows && rows.length >= maxRows) {
-      throw new Error(`This account has more than ${maxRows.toLocaleString("en-US")} saved Amazon Ads rows in the selected window. The PPC report was not built because aggregating a partial window would understate spend and wasted spend. Use a shorter window.`);
+      const err = new Error(`This account has more than ${maxRows.toLocaleString("en-US")} saved Amazon Ads rows in the selected window. The report was not built because aggregating a partial window would understate spend and wasted spend. Use a shorter window.`);
+      err.code = "ADS_ROW_LIMIT_EXCEEDED";
+      throw err;
     }
   }
   return rows;
+}
+
+// Daily Reporting's durable ASIN-Ads reader: the raw asin-performance-v1 rows for one account/window, read
+// straight from ads_daily_source_rows (the SINGLE reusable Ads dataset Daily shares with Brand View + PPC).
+// Signature mirrors getAdDailyMetrics (accountId, from, to, {signal}) so it drops into the same readAdMetrics
+// binding; a window that overflows the hard row ceiling throws ADS_ROW_LIMIT_EXCEEDED (a typed degrade, never a
+// partial total). The per-ASIN metrics live in each row's `metrics` JSONB (aggregated by the shared helper).
+export async function getAsinAdsDailyRows(accountId, from, to, { signal = null } = {}) {
+  return getAdsDailySourceRows({
+    accountId, sourceKeys: ["asin-performance-v1"], from, to, maxRows: AD_DAILY_METRICS_MAX_ROWS, signal,
+  });
 }
 
 /* ============================== EXCHANGE RATES ==============================

@@ -53,6 +53,7 @@ const SUITES = [
   "test:source-production-hardening",
   "test:source-priority-dashboards",
   "test:scheduler-automation",
+  "test:asin-ads-aggregation",
   "test:durable-live-parity",
   "test:schema-contract-mutation",
   "test:report-sync-controls",

@@ -64,7 +64,7 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     liveParams: (p) => (orderedRange(p.from, p.to) ? { from: p.from, to: p.to } : null),
   }),
   "daily-reporting": Object.freeze({
-    liveReportKey: "daily-reporting", liveReportVersion: "daily-reporting-shared-v1",
+    liveReportKey: "daily-reporting", liveReportVersion: "daily-reporting-shared-v2",
     liveParams: (p) => (orderedRange(p.from, p.to) ? { from: p.from, to: p.to, brand: norm(p.brand) || "ALL" } : null),
   }),
   reconciliation: Object.freeze({

@@ -1560,7 +1560,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const dailyParams = useMemo(() => {
     if (!selectedAccountId) return null;
     const mb = monthBack(TODAY, 5);
-    return { action: "daily", reportVersion: "daily-reporting-shared-v1", ids: selectedAccountId, brand: selectedBrand, from: mb.from, to: TODAY };
+    return { action: "daily", reportVersion: "daily-reporting-shared-v2", ids: selectedAccountId, brand: selectedBrand, from: mb.from, to: TODAY };
   }, [selectedAccountId, selectedBrand, TODAY]);
 
   const loadCachedDaily = useCallback(async () => {

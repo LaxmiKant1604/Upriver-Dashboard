@@ -490,7 +490,7 @@ test("P5a. buildBrandInventoryPayload with empty rows yields inventoryAvailable:
 /* ===================== P6. the REAL publisher: not-successful before finalization, published after ===================== */
 group("P6. real publisher terminal-cycle gate: all 3 refused before finalization, all 3 pass after");
 const SPECS = {
-  "daily-reporting": { version: "daily-reporting/v2d-3", params: { reportVersion: "daily-reporting/v2d-3", accountId: "A01", from: "2026-03-19", to: ASOF, brand: "ALL" }, payload: { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } } },
+  "daily-reporting": { version: "daily-reporting/v2e-1", params: { reportVersion: "daily-reporting/v2e-1", accountId: "A01", from: "2026-03-19", to: ASOF, brand: "ALL" }, payload: { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } } },
   "brand-sales": { version: "brand-sales/v2d-2", params: { reportVersion: "brand-sales/v2d-2", accountId: "A01", from: "2025-01-01", to: ASOF }, payload: { rows: [], catalogBrands: [], asinBrand: { B0A: "Acme" } } },
   "brand-inventory": { version: "brand-inventory-shared-v1", params: { reportVersion: "brand-inventory-shared-v1", accountId: "A01", to: ASOF }, payload: { inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false } },
 };

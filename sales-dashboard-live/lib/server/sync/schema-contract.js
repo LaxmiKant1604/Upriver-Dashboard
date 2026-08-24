@@ -1660,7 +1660,7 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "recordSyncReportBlocked", "recordSyncReportFailure", "recordSyncReportSuccess",
   "upsertSyncSourceJobOwners", "getSyncSourceJobOwners", "getSyncSourceJobsForOwners", "recordSyncSourceJobOwnerStale",
   "getSourceExportCache", "getDailyAdsCoverage", "recordAdsCoverageWindows", "getReportSyncSettings",
-  "getAdDailyMetrics", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
+  "getAdDailyMetrics", "getAsinAdsDailyRows", "getAdsDailySourceRows", "getAdsSyncStates", "saveReportSnapshot",
   "getSchedulerAccountRollout", "getSchedulerPublishApproval", "publishLiveSnapshotIfNewer",
   // Gate-7 publisher reads: the exact-identity job row (+ its cycle status), the exact-identity shadow
   // snapshot, and the trusted storage hydration for a storage-backed snapshot payload.

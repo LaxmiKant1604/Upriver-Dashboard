@@ -1,10 +1,10 @@
 // Scheduler v2 -- Daily Reporting Ads derived-context loader (SHADOW MODE).
 //
 // The report worker's `loadDerivedContext` for daily-reporting. Preserves production-route parity:
-// the live Daily route reads ALREADY-AGGREGATED advertising from `ad_daily_metrics` via
-// getAdDailyMetrics(accountId, from, to) -- it does NOT sum the overlapping raw campaign / ASIN /
-// targeting / search-term source tables together (those grains overlap and would double-count). So
-// this loader reads the same aggregated table and canonicalizes each row.
+// the live Daily route reads the durable ASIN grain (ads_daily_source_rows, asin-performance-v1) via
+// getAsinAdsDailyRows(accountId, from, to) -- the SINGLE reusable Ads source it shares with Brand View. It
+// reads ONLY that grain (never summing the overlapping campaign / targeting / search-term grains, which would
+// double-count) and folds every ASIN into per-(date, currency) canonical rows (ad_sales_same_sku -> ad_sales).
 //
 // Two corrections over a naive reader (from the prior review):
 //   1. The authoritative raw seller/vendor id is resolved from account metadata
@@ -18,33 +18,24 @@
 // makes ZERO DataDoe calls.
 
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
+import { aggregateAsinAdsDailyRows } from "../reports/asin-ads-aggregation.js";
 
-// The ONE Ads source that feeds ad_daily_metrics (campaign-level daily); ads-sync.js only upserts
-// ad_daily_metrics for this source. Daily Reporting's TACoS/ad columns come from here.
-export const DAILY_ADS_SOURCE_KEY = "campaign-performance-v1";
-
-// Coerce a metric to a finite number, or NaN when it is missing/non-numeric so the coverage
-// validator BLOCKS it rather than silently coercing corruption to zero.
-function finiteMetric(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : NaN;
-}
+// The ONE Ads source Daily Reporting reads: the durable ASIN grain (asin-performance-v1, in
+// ads_daily_source_rows) -- the SINGLE reusable advertising source it shares with Brand View. Its attributed
+// sales is ad_sales_same_sku (same-SKU only; no campaign halo). The overlapping campaign grain is NEVER summed
+// with it. (Historically Daily read the aggregated campaign table ad_daily_metrics; that grain is now PPC-only.)
+export const DAILY_ADS_SOURCE_KEY = "asin-performance-v1";
 
 /**
- * Canonicalize `ad_daily_metrics` rows into merge-ready Ads rows. Mirrors the production Daily route
- * mapping (metric_date -> date; per-campaign row preserved so mergeSalesAndAds sums them per
- * seller/day) EXCEPT the seller id is the AUTHORITATIVE raw seller/vendor id (so rows match the
- * sales rows' seller_or_vendor_id and can be validated per account). Pure.
+ * Canonicalize durable ASIN-Ads rows (ads_daily_source_rows, source asin-performance-v1) into merge-ready Daily
+ * Ads rows { date, seller_or_vendor_id, currency, ad_sales, ad_spend, ad_clicks }, folded per (date, currency)
+ * via the SHARED canonical aggregation (aggregateAsinAdsDailyRows): metrics are read from the row's `metrics`
+ * JSONB, deduped by the natural grain, currencies never combined, absent metrics never invented, and
+ * ad_sales_same_sku -> ad_sales. The seller id is the AUTHORITATIVE raw seller/vendor id (never a row's) so rows
+ * match the sales rows and can be validated per account. Pure.
  */
-export function canonicalizeAdRows(metricRows, rawSellerId) {
-  return (metricRows || []).map((row) => ({
-    date: row.metric_date,
-    seller_or_vendor_id: rawSellerId,
-    currency: row.currency ?? null,
-    ad_sales: finiteMetric(row.ad_sales),
-    ad_spend: finiteMetric(row.ad_spend),
-    ad_clicks: finiteMetric(row.ad_clicks),
-  }));
+export function canonicalizeAdRows(asinRows, rawSellerId) {
+  return aggregateAsinAdsDailyRows(asinRows, { rawSellerId });
 }
 
 /**
@@ -72,13 +63,13 @@ export function buildDailyAdsCoverage({ accountId, rawSellerId, currency, from, 
 
 /**
  * Make the report-worker `loadDerivedContext` callback for Daily Reporting. For daily-reporting ALL,
- * it resolves the authoritative raw seller id, reads ad_daily_metrics (paginated, truncation-guarded)
- * + durable coverage, and returns { adsCoverage }. A metrics read that throws (e.g. the row-limit
- * guard) or an unresolvable account is captured as a typed read/scope state so the derive marks Ads
- * failed/unavailable WITHOUT blocking the sales snapshot. For the named-brand path and every other
- * report it returns {}. Injected:
+ * it resolves the authoritative raw seller id, reads durable ASIN-Ads rows (ads_daily_source_rows,
+ * paginated + truncation-guarded) + durable coverage, and returns { adsCoverage }. A metrics read that
+ * throws (e.g. the row-limit guard) or an unresolvable account is captured as a typed read/scope state so
+ * the derive marks Ads failed/unavailable WITHOUT blocking the sales snapshot. For the named-brand path and
+ * every other report it returns {}. Injected:
  *   connections     -- DataDoe connections (for resolveDataDoeAccountIds); default is production.
- *   getAdMetrics    -- (accountId, from, to) -> ad_daily_metrics rows (getAdDailyMetrics; may throw).
+ *   getAdMetrics    -- (accountId, from, to) -> durable ASIN-Ads rows (getAsinAdsDailyRows; may throw).
  *   getCoverageState-- (accountId, sourceKey) -> { windows, status, latestMetricDate, read }.
  */
 export function makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState }) {

@@ -385,7 +385,7 @@ const REGISTRY = {
   // core imports no Supabase. All-brand rows/units re-aggregate additively; there are no ratio
   // fields to sum (daily ratios are recomputed in the browser from these base sums).
   "daily-reporting": {
-    snapshotVersion: "daily-reporting/v2d-3", optionalRequestKeys: [], derivedSourceKeys: ["ads-campaign-date"],
+    snapshotVersion: "daily-reporting/v2e-1", optionalRequestKeys: [], derivedSourceKeys: ["ads-asin-date"],
     // Blocker 1: ONLY `adsCoverage` may be injected through the derive context. The worker's
     // per-report allowlist drops any other derived field and never lets a derived input override
     // the planned account/brand/from/to scope (the snapshot identity stays in the planned scope).

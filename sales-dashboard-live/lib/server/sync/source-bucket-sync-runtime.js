@@ -51,7 +51,7 @@ import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, saveSourceSnapshotPayload, getSourceSnapshotPayload,
-  getSourceOliHistoryRows, getDailyAdsCoverage, getAdDailyMetrics,
+  getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
@@ -255,7 +255,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     readCoverage = getSourceCoverageWindows,
     readSnapshot = getSourceSnapshot,
     readAdsCoverage = getDailyAdsCoverage,
-    readAdMetrics = getAdDailyMetrics,
+    // Daily Reporting reads the durable ASIN grain (asin-performance-v1) -- the SINGLE reusable Ads source,
+    // shared with Brand View. (Was getAdDailyMetrics / the campaign grain, now PPC-only.)
+    readAdMetrics = getAsinAdsDailyRows,
     readBatchMembership = listSourceBatchMembership,
     assignBatchMembership = assignSourceAccountBatch,
     readSettings = getReportSyncSettings,
@@ -397,6 +399,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     fbaSnapshotsByAccount: { ...(pf.evidence.fbaSnapshotsByAccount || {}) },
     fbaRowsByAccount: { ...(pf.evidence.fbaRowsByAccount || {}) },
     campaignCoverageStateByAccountId: pf.evidence.campaignCoverageStateByAccountId,
+    asinCoverageStateByAccountId: pf.evidence.asinCoverageStateByAccountId,
     campaignAds: pf.evidence.campaignAds,
     asinAds: pf.evidence.asinAds,
     historyRows: [...(pf.historyRows || [])],
@@ -491,12 +494,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const campaignWindows = {};
     const asinWindows = {};
     const campaignCoverageStateByAccountId = {};
+    const asinCoverageStateByAccountId = {};
     for (const a of accounts) {
+      // Campaign-grain coverage is still read for PPC diagnostics/read-blockers (PPC reads both grains).
       const camp = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "campaign-performance-v1", { signal }));
       campaignCoverageStateByAccountId[a.accountId] = camp;
       campaignWindows[a.accountId] = camp.read === "ok" ? camp.windows : null;
       if (camp.read !== "ok") readBlockers.push({ sourceKey: "ads-campaign-date", accountId: a.accountId, reason: "ads-coverage-" + camp.read, blocksSales: false });
+      // ASIN-grain coverage is the AUTHORITATIVE Daily + Brand View Ads coverage (the single reusable source).
       const asin = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "asin-performance-v1", { signal }));
+      asinCoverageStateByAccountId[a.accountId] = asin;
       asinWindows[a.accountId] = asin.read === "ok" ? asin.windows : null;
       if (asin.read !== "ok") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
     }
@@ -507,7 +514,8 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       fbaSnapshotsByAccount,
       fbaRowsByAccount,
       campaignCoverageStateByAccountId,
-      campaignAds: { grain: DAILY_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(campaignWindows).map(([k, v]) => [k, v || []])) },
+      asinCoverageStateByAccountId,
+      campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(campaignWindows).map(([k, v]) => [k, v || []])) },
       asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(asinWindows).map(([k, v]) => [k, v || []])) },
     };
   };
@@ -809,7 +817,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         fbaSnapshotsByAccount: evidence.fbaSnapshotsByAccount,
         campaignAds: evidence.campaignAds, asinAds: evidence.asinAds,
         adMetricsByAccountId,
-        campaignCoverageStateByAccountId: evidence.campaignCoverageStateByAccountId,
+        adsCoverageStateByAccountId: evidence.asinCoverageStateByAccountId,
         dailyWindow, brandViewWindow,
       });
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
@@ -1389,7 +1397,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const brandViewWindow = oliBackfillWindow(asOfStr);
     const daily = dailyReportingReadiness({
       accounts: ids, oliCoverageByAccountId: evidence.oliCoverageByAccountId,
-      catalogSnapshot: evidence.catalogSnapshot, campaignAds: evidence.campaignAds,
+      catalogSnapshot: evidence.catalogSnapshot, asinAds: evidence.asinAds,
       from: dailyWindow.from, to: dailyWindow.to,
     });
     const brandView = brandViewReadiness({
@@ -1406,7 +1414,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
     return {
       asOf: asOfStr,
-      daily: merge(daily, ["order-line-items", "product-catalog", "ads-campaign-date"]),
+      daily: merge(daily, ["order-line-items", "product-catalog", "ads-asin-date"]),
       brandView: merge(brandView, ["order-line-items", "product-catalog", "ads-asin-date", "fba-inventory-health"]),
     };
   };

@@ -608,16 +608,17 @@ test("F2. readiness blocks on missing OLI coverage / catalog; an Ads gap degrade
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
     from: "2026-08-10", to: "2026-08-14",
   };
-  const readyAds = { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] };
-  const r1 = dash.dailyReportingReadiness({ ...base, campaignAds: readyAds });
+  // Daily now reads the ASIN grain (the single reusable Ads source, shared with Brand View).
+  const readyAds = { grain: "asin-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] };
+  const r1 = dash.dailyReportingReadiness({ ...base, asinAds: readyAds });
   assert.equal(r1.ready, true); assert.equal(r1.adsReady, true);
-  const r2 = dash.dailyReportingReadiness({ ...base, oliCoverageByAccountId: { A01: base.oliCoverageByAccountId.A01, A02: [] }, campaignAds: readyAds });
+  const r2 = dash.dailyReportingReadiness({ ...base, oliCoverageByAccountId: { A01: base.oliCoverageByAccountId.A01, A02: [] }, asinAds: readyAds });
   assert.equal(r2.ready, false, "an account's missing OLI coverage blocks Daily");
   assert.ok(r2.blockedBy.some((b) => b.sourceKey === "order-line-items" && b.accountId === "A02"));
-  const r3 = dash.dailyReportingReadiness({ ...base, catalogSnapshot: null, campaignAds: readyAds });
+  const r3 = dash.dailyReportingReadiness({ ...base, catalogSnapshot: null, asinAds: readyAds });
   assert.equal(r3.ready, false, "a missing validated catalog blocks Daily");
-  const gapAds = { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-12" }] };
-  const r4 = dash.dailyReportingReadiness({ ...base, campaignAds: gapAds });
+  const gapAds = { grain: "asin-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-12" }] };
+  const r4 = dash.dailyReportingReadiness({ ...base, asinAds: gapAds });
   assert.equal(r4.ready, true, "an ads gap never blocks sales");
   assert.equal(r4.adsReady, false, "but the ads half is not ready");
 });
@@ -630,8 +631,9 @@ test("F3. the WRONG Ads grain THROWS (overlapping grains are never mixed); Brand
     fbaSnapshotsByAccount: { A01: { validated_at: TODAY + "T01:00:00Z" } },
     from: "2026-08-10", to: "2026-08-14",
   };
+  // Daily now requires the ASIN grain, so feeding it the CAMPAIGN grain is the wrong-grain hard failure.
   assert.throws(
-    () => dash.dailyReportingReadiness({ ...base, campaignAds: { grain: "asin-performance-v1", read: "ok", windows: [] } }),
+    () => dash.dailyReportingReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] } }),
     /never mix overlapping Ads grains/,
   );
   assert.throws(

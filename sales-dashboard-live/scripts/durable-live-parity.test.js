@@ -40,9 +40,10 @@ const CATALOG = [
   { child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
   { child_asin: "B0B", sku: "SKU-B", parent_asin: "P", product_name: "B", product_brand: "Bolt" },
 ];
-// The EXACT ad_daily_metrics reader row shape (canonicalizeAdRows maps metric_date + ad_* + currency).
+// The EXACT durable ASIN-Ads reader row shape (ads_daily_source_rows, asin-performance-v1): metrics live in a
+// JSONB and canonicalizeAdRows folds them per (date, currency) -- ad_sales_same_sku -> ad_sales (same-SKU only).
 const AD_ROWS = [
-  { metric_date: "2026-08-10", currency: "USD", ad_sales: 40, ad_spend: 12, ad_clicks: 8 },
+  { metric_date: "2026-08-10", marketplace_country_code: "US", dimension_key: "d1", currency: "USD", child_asin: "B0A", updated_at: "2026-08-11T00:00:00Z", metrics: { ad_sales_same_sku: 40, ad_spend: 12, ad_clicks: 8 } },
 ];
 const COVERAGE_STATE = { windows: [{ from: "2026-08-01", to: ASOF }], status: "succeeded", latestMetricDate: "2026-08-10", read: "ok", error: null };
 const fullEvidence = () => ({
@@ -58,13 +59,13 @@ function derive() {
     bucket: BUCKET, accounts: [ACCOUNT], historyRows: HISTORY, catalogRows: CATALOG,
     ...fullEvidence(),
     adMetricsByAccountId: { A01: { rows: AD_ROWS, metricsRead: "ok" } },
-    campaignCoverageStateByAccountId: { A01: COVERAGE_STATE },
+    adsCoverageStateByAccountId: { A01: COVERAGE_STATE },
     dailyWindow: { from: DAILY_FROM, to: ASOF },
     brandViewWindow: { from: "2025-06-26", to: ASOF },
   });
 }
 
-test("P1. the durable Daily payload IS the existing contract and equals the independent pure-twin (real campaign ad metrics merged)", () => {
+test("P1. the durable Daily payload IS the existing contract and equals the independent pure-twin (real ASIN same-SKU ad metrics merged)", () => {
   const derived = derive();
   assert.deepEqual(derived.daily.skipped, [], "no account skipped");
   assert.equal(derived.daily.snapshots.length, 1);
@@ -82,7 +83,7 @@ test("P1. the durable Daily payload IS the existing contract and equals the inde
   const resolved = contracts.resolveDailyAdsAvailability(adsCoverage, { accountId: "A01", rawSellerId: "A01", currency: "USD", from: DAILY_FROM, to: ASOF });
   const twin = core.dailyReportingPayload({ supersetRows, catalogRows: CATALOG, adRows: resolved.adRows, brand: "ALL", adsAvailability: resolved.availability });
   assert.deepEqual(snap.payload, twin, "adapter path === independent pure-twin path (live parity by construction)");
-  // The ACTUAL campaign ad metrics are IN the payload: an ads-free twin differs.
+  // The ACTUAL ASIN same-SKU ad metrics are IN the payload: an ads-free twin differs.
   const noAds = core.dailyReportingPayload({ supersetRows, catalogRows: CATALOG, adRows: [], brand: "ALL", adsAvailability: resolved.availability });
   assert.notDeepEqual(snap.payload.rows, noAds.rows, "the merged rows carry real ad metrics (not an ads-free fold)");
   assert.equal(typeof snap.payload.adsAvailability.status, "string", "honest availability travels with the payload");

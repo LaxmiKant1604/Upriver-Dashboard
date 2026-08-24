@@ -91,17 +91,18 @@ test("Product Catalog feeds Daily Reporting, Brand Sales/Brand View and the cata
   assert.equal(expected.length, 12, "catalog has 12 direct consumers");
 });
 
-test("campaign-performance-v1 (ads-campaign-date) feeds Daily Reporting and NEVER Brand View", () => {
+test("campaign-performance-v1 (ads-campaign-date) is PPC-only -- NEVER Daily Reporting or Brand View", () => {
   const d = reg.dashboardsUsingSource("ads-campaign-date");
-  assert.ok(d.includes("daily-reporting"), "Daily Reporting reads the campaign grain");
+  assert.ok(d.includes("ppc-performance"), "PPC reads the campaign grain");
+  assert.ok(!d.includes("daily-reporting"), "Daily Reporting moved to the ASIN grain (no longer the campaign grain)");
   assert.ok(!d.includes("brand-view"), "Brand View NEVER reads the campaign grain (overlapping Ads grains are never mixed)");
 });
 
-test("asin-performance-v1 (ads-asin-date) feeds Brand View and PPC Performance", () => {
+test("asin-performance-v1 (ads-asin-date) is the SINGLE reusable Ads grain -- Daily Reporting + Brand View + PPC", () => {
   const d = reg.dashboardsUsingSource("ads-asin-date");
-  assert.ok(d.includes("brand-view"), "Brand View reads the ASIN grain");
+  assert.ok(d.includes("daily-reporting"), "Daily Reporting reads the ASIN grain (account-level)");
+  assert.ok(d.includes("brand-view"), "Brand View reads the ASIN grain (brand-level)");
   assert.ok(d.includes("ppc-performance"), "PPC reads the ASIN grain");
-  assert.ok(!d.includes("daily-reporting"), "Daily Reporting does not read the ASIN grain");
 });
 
 test("FBA Inventory Health feeds Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers", () => {
@@ -221,6 +222,25 @@ test("scope/batching contradictions fail closed (org-wide cannot be seller-batch
   assert.throws(
     () => reg.assertSourceRegistryConsistency({ registry: withMode("order-line-items", { scope: "organization" }) }),
     /seller-batched contract but is not seller-scoped/,
+  );
+});
+
+test("ads-asin-date declares the REAL <=5 stable batch (contradiction resolved); the exemption is durable-ads-specific", () => {
+  const asin = reg.SOURCE_REGISTRY.find((r) => r.sourceKey === "ads-asin-date");
+  // Was per-account/maxAccountsPerExport:1 -- contradicted the ads-sync runtime (chunks of 5) and the scheduler
+  // token budget (US <=2 / Non-US <=5 exports). Now declares the real stable <=5-seller batch.
+  assert.equal(asin.batching.mode, "stable-batch");
+  assert.equal(asin.batching.maxAccountsPerExport, 5);
+  assert.equal(asin.scope, "seller");
+  assert.equal(asin.storage, "durable-ads");
+  // The registry as shipped is consistent: durable-ads batches via the durable Ads architecture (per-seller
+  // isolation proven by validateExportBatchRows), so it may be stable-batch without a source-job contract.
+  assert.doesNotThrow(() => reg.assertSourceRegistryConsistency());
+  // The exemption is SPECIFIC to durable-ads: flip the SAME entry off durable-ads and stable-batch fails closed.
+  const withMode = (key, patch) => reg.SOURCE_REGISTRY.map((r) => (r.sourceKey === key ? { ...clone(r), ...patch } : r));
+  assert.throws(
+    () => reg.assertSourceRegistryConsistency({ registry: withMode("ads-asin-date", { storage: "durable-history" }) }),
+    /has NO approved SELLER_SCOPED_REQUEST_KEYS contract/,
   );
 });
 

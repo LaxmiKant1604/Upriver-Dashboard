@@ -27,6 +27,11 @@
 //   aggregated away, so payload size is bounded by (countries x days) and is
 //   independent of how many thousands of SKUs an account has.
 
+// The canonical ASIN-Ads primitives (the SINGLE reusable advertising source, shared with Daily Reporting):
+// asinOf canonicalizes child_asin; asinAdsMetricsFromRow extracts ONLY the metrics the contract supplied
+// (a present ad_spend counts, an absent one is never invented as 0). Both reports derive ASIN Ads identically.
+import { asinOf, asinAdsMetricsFromRow } from "./asin-ads-aggregation.js";
+
 // ---------------------------------------------------------------- identifiers
 
 export const BRAND_VIEW_REPORT_KEY = "brand-view";
@@ -307,11 +312,14 @@ export function aggregateBrandAds(adRows, asinBrand, brand) {
     if (date < coverage.from) coverage.from = date;
     if (date > coverage.to) coverage.to = date;
     coverageByCountry.set(country, coverage);
-    const asin = trimmed(row?.child_asin).toUpperCase();
+    const asin = asinOf(row);
     if (!asin || asinBrand.get(asin) !== brand) continue;
     matchedRows += 1;
     const key = seriesKey(country, date);
-    spendByKey.set(key, (spendByKey.get(key) || 0) + (Number(row?.metrics?.ad_spend) || 0));
+    // Spend via the shared canonical extractor: a present ad_spend (0 included) counts; an absent metric is
+    // omitted (never invented as 0), then treated as no contribution in this additive (country,date) fold.
+    const spend = asinAdsMetricsFromRow(row).spend;
+    spendByKey.set(key, (spendByKey.get(key) || 0) + (spend || 0));
   }
 
   return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows };

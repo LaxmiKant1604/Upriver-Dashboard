@@ -1121,7 +1121,7 @@ group("F. all 13 scheduler->live mappings statically pinned against the REAL liv
 test("(F1) exactly 14 contracts (13 dispatch + the source-promoted brand-inventory); key/version/params pinned; insight versions equal the live modules' constants", () => {
   const EXPECTED_VERSIONS = {
     "brand-sales": "brand-sales-shared-v1",
-    "daily-reporting": "daily-reporting-shared-v1",
+    "daily-reporting": "daily-reporting-shared-v2",
     reconciliation: "reconciliation-shared-v1",
     "sku-pl": "sku-pl-shared-v1",
     "keyword-rank": "keyword-rank-shared-v1",
@@ -1196,7 +1196,7 @@ test("(F2b) STRICT calendar-date validation: impossible dates and reversed from/
 test("(F3) the pinned shared mappings appear VERBATIM in the live api/datadoe.js route", () => {
   const src = readFileSync(path.join(ROOT, "api", "datadoe.js"), "utf8");
   for (const [key, version] of [
-    ["brand-sales", "brand-sales-shared-v1"], ["daily-reporting", "daily-reporting-shared-v1"],
+    ["brand-sales", "brand-sales-shared-v1"], ["daily-reporting", "daily-reporting-shared-v2"],
     ["reconciliation", "reconciliation-shared-v1"], ["sku-pl", "sku-pl-shared-v1"],
     ["keyword-rank", "keyword-rank-shared-v1"], ["content-changes", "content-changes-shared-v1"],
     ["fba-plan", "fba-plan-shared-v1"],
