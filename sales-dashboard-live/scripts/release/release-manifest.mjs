@@ -253,10 +253,10 @@ export const MIGRATIONS = [
         CK("source_priority_catalog_reservation_hash_nonblank", "char_lengthbtrimcatalog_request_hash>0"),
         EN("source_priority_catalog_reservation_tokens_check", "tokens_spent", ["0", "2"]),
         EN("source_priority_catalog_reservation_status_check", "status", ["reserved", "created"]),
-        // BEST-EFFORT canon of the created-coherent check. Like the M4 POSITION note, verify this against the
-        // LIVE bodyCanon(pg_get_constraintdef(oid)) before applying to production (ro-prod-check fails closed on
-        // a mismatch; it is never verified against a real catalog offline).
-        CK("source_priority_catalog_reservation_created_coherent", "status=reservedANDexport_idISNULLANDtokens_spent=0ORstatus=createdANDexport_idISNOTNULLANDchar_lengthbtrimexport_id>0ANDtokens_spent=2"),
+        // Canon of the created-coherent check, CONFIRMED against the LIVE bodyCanon(pg_get_constraintdef(oid))
+        // during the 2026-08-24 stage-8 apply (the previous best-effort value stripped the string-literal quotes
+        // that Postgres preserves -- `status='reserved'`/`status='created'`; ::text casts are dropped by canon).
+        CK("source_priority_catalog_reservation_created_coherent", "status='reserved'ANDexport_idISNULLANDtokens_spent=0ORstatus='created'ANDexport_idISNOTNULLANDchar_lengthbtrimexport_id>0ANDtokens_spent=2"),
       ],
       indexes: [], rls: true,
       policies: [ADMIN_READ("source_priority_catalog_reservation_admin_read", "source_priority_catalog_reservation")],
