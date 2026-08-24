@@ -15,7 +15,7 @@ process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 // role-credential-shaped literal exists in the bytes; the code reads the assembled name unchanged.
 const SRK_ENV = frag("SUPABASE", "_SERVICE", "_ROLE", "_KEY");
 process.env[SRK_ENV] = process.env[SRK_ENV] || dash("test", "svc", "role", "key");
-let upsertSyncSourceJob, prodClaimSourceExportAttempt, organizationFingerprint;
+let upsertSyncSourceJob, prodClaimSourceExportAttempt, organizationFingerprint, getSourceOliHistoryRows;
 
 let passed = 0;
 const tests = [];
@@ -96,6 +96,77 @@ test("the fingerprint guard runs before the one-attempt claim: a rejected upsert
   });
 });
 
+group("durable OLI history read PAGINATES past the PostgREST page cap (no silent truncation)");
+
+// A fetch stand-in that serves ONE page per request, honouring the ?offset= / ?limit= the reader sends,
+// out of a caller-provided full series. This is exactly how PostgREST behaves under its `max-rows` cap:
+// a single request returns at most `limit` rows, and the client must page to read the whole series.
+function withPagedFetch(fullRows, run) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url));
+    const offset = Number(u.searchParams.get("offset") || 0);
+    const limit = Number(u.searchParams.get("limit") || fullRows.length);
+    calls.push({ url: String(url), offset, limit });
+    const slice = fullRows.slice(offset, offset + limit);
+    return { ok: true, json: async () => slice };
+  };
+  return Promise.resolve(run(calls)).finally(() => { globalThis.fetch = original; });
+}
+
+const mkOli = (acct, i) => ({
+  account_id: acct, sale_date: "2026-01-" + String((i % 28) + 1).padStart(2, "0"),
+  sku: "SKU-" + acct + "-" + i, child_asin: "ASIN" + i, currency: "USD",
+  sales_amount: 1, units: 1, source_request_hash: "h",
+});
+
+test("PAGINATES: a series longer than one page returns EVERY row (regression: single-request read silently truncated to the page cap)", async () => {
+  const full = Array.from({ length: 5 }, (_, i) => mkOli("A", i)); // page 2 -> [2,2,1]
+  await withPagedFetch(full, async (calls) => {
+    const rows = await getSourceOliHistoryRows({ organizationFingerprint: "org", from: "2026-01-01", to: "2026-12-31", pageRows: 2 });
+    assert.equal(rows.length, 5, "all 5 rows returned across pages");
+    assert.deepEqual(calls.map((c) => c.offset), [0, 2, 4], "offset advanced by the page size each request");
+    assert.equal(calls.length, 3, "stopped at the first short page (no extra request)");
+  });
+});
+
+test("an account whose rows fall ENTIRELY past the first page is still present (the exact production bug that dropped accounts)", async () => {
+  const full = [...Array.from({ length: 2 }, (_, i) => mkOli("A", i)), ...Array.from({ length: 2 }, (_, i) => mkOli("B", i))];
+  await withPagedFetch(full, async () => {
+    const rows = await getSourceOliHistoryRows({ organizationFingerprint: "org", from: "2026-01-01", to: "2026-12-31", pageRows: 2 });
+    const accts = new Set(rows.map((r) => r.account_id));
+    assert.ok(accts.has("B"), "account B (present only on page 2) is NOT dropped");
+    assert.equal(rows.length, 4, "both accounts' rows returned");
+  });
+});
+
+test("an EXACT page-multiple series makes one final empty request, then stops (no over/under-count, no duplicates)", async () => {
+  const full = Array.from({ length: 4 }, (_, i) => mkOli("A", i)); // page 2 -> [2,2,0]
+  await withPagedFetch(full, async (calls) => {
+    const rows = await getSourceOliHistoryRows({ organizationFingerprint: "org", from: "2026-01-01", to: "2026-12-31", pageRows: 2 });
+    assert.equal(rows.length, 4, "exactly the 4 rows");
+    assert.deepEqual(calls.map((c) => c.offset), [0, 2, 4], "a final offset=4 request confirms the series ended");
+  });
+});
+
+test("FAILS CLOSED over the TOTAL row cap (refuses a truncated series rather than understating sales)", async () => {
+  const full = Array.from({ length: 10 }, (_, i) => mkOli("A", i));
+  await withPagedFetch(full, async () => {
+    await assert.rejects(
+      getSourceOliHistoryRows({ organizationFingerprint: "org", from: "2026-01-01", to: "2026-12-31", pageRows: 2, maxRows: 5 }),
+      (e) => e && e.code === "OLI_HISTORY_ROW_LIMIT_EXCEEDED",
+    );
+  });
+});
+
+test("still fails closed on a missing organization fingerprint BEFORE any PostgREST request", async () => {
+  await withPagedFetch([], async (calls) => {
+    await assert.rejects(getSourceOliHistoryRows({ from: "2026-01-01", to: "2026-12-31" }), /organizationFingerprint|fail closed/i);
+    assert.equal(calls.length, 0, "no PostgREST request for a fingerprint-less read");
+  });
+});
+
 /* ---- load env-dependent modules AFTER env is set, then run the async suite (no TLA) ----
    Each dynamic import is bracketed by a synchronous progress marker so a blocking import is
    pinpointed immediately (see the `mark`/`out` note above). The modules below transitively
@@ -113,7 +184,7 @@ async function main() {
     return mod;
   };
 
-  const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob; prodClaimSourceExportAttempt = sb.claimSourceExportAttempt;
+  const sb = await step("supabase.js", "../lib/server/supabase.js"); upsertSyncSourceJob = sb.upsertSyncSourceJob; prodClaimSourceExportAttempt = sb.claimSourceExportAttempt; getSourceOliHistoryRows = sb.getSourceOliHistoryRows;
   ({ organizationFingerprint } = await step("source-identity.js", "../lib/server/source-identity.js"));
   const total = tests.filter((t) => !t.marker).length;
   mark("all imports resolved; running " + total + " tests");

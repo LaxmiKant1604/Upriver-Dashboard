@@ -1220,33 +1220,47 @@ export async function getSourceSnapshotPayload(objectPath, { signal = null } = {
 }
 
 export const SOURCE_OLI_HISTORY_MAX_ROWS = 200000;
+// PostgREST caps a single response at its `max-rows` setting (Supabase default 1000) REGARDLESS of a larger
+// `?limit`, so a single-request read is silently truncated. The canonical-history read PAGINATES at this size
+// (offset pages, a TOTAL order) to return the COMPLETE series, then hard-caps the accumulated total.
+export const SOURCE_OLI_HISTORY_PAGE_ROWS = 1000;
 
-// Bounded canonical-history read. STRICT cap: at/over the limit the read is refused with a typed error
-// rather than silently truncated (a truncated series would understate sales).
-export async function getSourceOliHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, signal = null } = {}) {
+// Bounded canonical-history read. PAGINATED so the FULL series is returned (never silently truncated to the
+// PostgREST page cap, which would understate sales and drop whole accounts). STRICT total cap: over the limit
+// the read is refused with a typed error rather than truncated.
+export async function getSourceOliHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
   if (!organizationFingerprint || !from || !to) {
     throw new Error("getSourceOliHistoryRows requires organizationFingerprint + from + to (fail closed).");
   }
-  const query = new URLSearchParams({
-    select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,sales_amount,units,source_request_hash",
-    organization_fingerprint: `eq.${organizationFingerprint}`,
-    connection_id: `eq.${connectionId}`,
-    sale_date: `gte.${from}`,
-    order: "sale_date.asc,account_id.asc,sku.asc,child_asin.asc",
-    limit: String(maxRows),
-  });
-  query.append("sale_date", `lte.${to}`);
-  if (Array.isArray(accountIds) && accountIds.length) {
-    query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const out = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const query = new URLSearchParams({
+      select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,sales_amount,units,source_request_hash",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      sale_date: `gte.${from}`,
+      // a TOTAL order over the durable grain (account, date, sku, child_asin, currency) so offset pagination
+      // never skips or duplicates a row at a page boundary.
+      order: "sale_date.asc,account_id.asc,sku.asc,child_asin.asc,currency.asc",
+      limit: String(PAGE),
+      offset: String(offset),
+    });
+    query.append("sale_date", `lte.${to}`);
+    if (Array.isArray(accountIds) && accountIds.length) {
+      query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+    }
+    const rows = await request(`/rest/v1/source_oli_daily_history?${query}`, { signal });
+    const list = Array.isArray(rows) ? rows : [];
+    out.push(...list);
+    if (out.length > maxRows) {
+      const err = new Error("OLI_HISTORY_ROW_LIMIT_EXCEEDED: durable OLI history read exceeded its row cap; refusing a truncated series (fail closed).");
+      err.code = "OLI_HISTORY_ROW_LIMIT_EXCEEDED";
+      throw err;
+    }
+    if (list.length < PAGE) break; // a short page is the last page
   }
-  const rows = await request(`/rest/v1/source_oli_daily_history?${query}`, { signal });
-  const list = Array.isArray(rows) ? rows : [];
-  if (list.length >= maxRows) {
-    const err = new Error("OLI_HISTORY_ROW_LIMIT_EXCEEDED: durable OLI history read reached its row cap; refusing a truncated series (fail closed).");
-    err.code = "OLI_HISTORY_ROW_LIMIT_EXCEEDED";
-    throw err;
-  }
-  return list;
+  return out;
 }
 
 // Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.
