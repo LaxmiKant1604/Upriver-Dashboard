@@ -11337,3 +11337,47 @@ the mission's hard 'publications=90' impossible. The frontend reads published sn
 (latest by report+account, not exact params_hash), so the asOf pin stays visible. Controls safe-closed; nothing
 published; 2 tokens; no cron. SCOPE DECISION needed: exclude zero-sales accounts (publish the derivable subset,
 <90) vs publish empty snapshots for them (both are code changes). See [[scheduler-v2-golive-status]].
+
+## GO-LIVE COMPLETE: Daily Reporting + Brand View LIVE for all 30 accounts -- 2026-08-24 (code bd385d1 + 19c1117 + a5b9c61 + docs; NOT pushed)
+
+The release published EXACTLY 90 live pairs (30 accounts x [daily-reporting, brand-sales, brand-inventory]),
+readback 90 by exact identity + frontend payload contract, tokensSpent=2 (ZERO new creates), no cron, scheduler
+OFF, then AUDITED SAFE-CLOSE. RESULT {ok:true, stage:complete, accounts:30, published:90, tokensSpent:2}.
+Independently verified: 90 fresh report_snapshots (30x3, created 2026-08-24 09:0x UTC); getLatestReportSnapshot
+returns the fresh rows for US + Non-US samples; after safe-close all_primary=false, rollout 0/30, dispatch 0/13,
+promoted 0/1, approvals 0/93, cron table absent, and the 90 live dashboards SURVIVE (control tables never touch
+report_snapshots). Go-live cost was the SAME 2 tokens already spent on the v2 catalog export (US created, Non-US
+adopted).
+
+THE PRIOR "zero-sales b60cf168" DIAGNOSIS (b5ec83d) WAS WRONG. b60cf168, 51bec5e7 and 6ee83cb9 were NOT
+zero-sales -- they were DROPPED by a silent PostgREST truncation. Three genuine bugs, each found+fixed+tested
+while completing the release (all offline verify 57/57 green at each step):
+
+1. PAGINATION (bd385d1): getSourceOliHistoryRows requested ?limit=200000 but PostgREST caps a single response at
+   max-rows=1000 REGARDLESS, and the guard `list.length >= maxRows` (1000>=200000) never fired -> the durable OLI
+   history read was silently truncated to the first 1000 of ~143k rows, so accounts whose rows sort past page 1
+   loaded ZERO history and failed the derive as durable-oli-provenance-missing (misread as "zero sales"). Fix:
+   offset-paginate at the page cap over a TOTAL order (account/date/sku/child_asin/currency), accumulate the full
+   series, hard-cap the ACCUMULATED total (fail closed OLI_HISTORY_ROW_LIMIT_EXCEEDED). Proof: the all-accounts
+   brand-view-window load went from 1,000 rows/22 accounts to 143,173 rows/30 accounts. All 30 then derive.
+
+2. cache_object_path (19c1117): SOURCE_JOB_COLUMNS (the getSyncSourceJobs select list) omitted cache_object_path,
+   so the finalize warm-cache-evidence check read undefined and EVERY adopting bucket (create_export_count=0)
+   finalized as "no-cache-evidence" -- while the creating bucket (US, cec=1, never reads it) passed. Exactly the
+   live asymmetry: US finalized, Non-US refused, though the Non-US catalog job plainly carried the path. Fix: add
+   cache_object_path to the select. (Passed offline because the P4b* WARM fixtures always supplied it.)
+
+3. RESUMABILITY (a5b9c61): after fix 2, re-running couldn't complete because the prior pass had ALREADY finalized
+   US -- deriveBucket re-entered the terminal cycle (durable engine: "cycle is terminal; refusing to append child
+   work") and finalizeBucket refused it "cycle-not-running". Fix (non-destructive; no un-finalizing, no re-derive,
+   no token risk): deriveBucket SKIPS an already-terminal cycle (clean already-complete rollup); finalizeBucket
+   ACCEPTS a terminal cycle idempotently ('already-terminal') but only AFTER the SAME strict durable-scope proofs
+   (a terminal-but-incomplete cycle is still refused). Tests P4a2/P4b5/P4b6.
+
+Operational note: each derive/finalize now runs a full preflight sweep that includes the 143-page paginated OLI
+load, so the end-to-end release took ~20 min wall-clock (>the 10-min foreground tool cap); it was run detached
+(nohup) to completion. A future optimization: a lightweight preflight (discovery + today only) for the
+finalize/derive-skip paths, or parallel/keyset OLI paging.
+
+State: main @ a5b9c61 (unpushed); LIVE + safe-closed; nothing pushed/deployed; scheduler OFF. See
+[[scheduler-v2-golive-status]].
