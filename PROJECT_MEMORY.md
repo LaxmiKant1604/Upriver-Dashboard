@@ -11285,3 +11285,30 @@ brand F1-F5 (OLI SKU fallback + multi-account/conflicting); classifyFetchError +
 production -- stage-9 reconcile -> prove v1 reservation + failed cycle -> cleanup (dry-run then apply) -> push
 once -> deploy -> apply controls -> run v2 release (US then Non-US, <=2 tokens) -> verify live/frontend ->
 safe-close. See [[scheduler-v2-golive-status]].
+
+## Go-live attempt 2: Catalog fix PROVEN on US; Non-US blocked by a test-cycle collision -- 2026-08-24 (pushed c5b0c39 + deployed; controls safe-closed; 2 tokens spent)
+
+The corrected Catalog request WORKS: the US v2 derive fetched the org-wide catalog (3472 rows), created the
+priority-dashboards/v2 reservation, and spent exactly the ONE authorized create (2 tokens). Sequence: stage-9
+reconcile OK -> cleaned up the failed v1 US cycle 7413650e (v1 reservation untouched) -> pushed main once
+(110a99a -> c5b0c39) -> Vercel alias HTTP 200 -> applied controls -> ran the v2 release -> US derived OK ->
+FAILED at derive:non-us REQUIRED_SOURCE_FAILED.
+
+Root cause (NOT a code/logic defect): openCycle(non-us, today) REUSES an old Aug-16 FULL-DRAIN TEST cycle
+481fe35c (status=partial; 130 source jobs across all families; 170 owners; 13 report jobs / 3 validated) whose
+anomalous FUTURE cycle_date (2026-08-23T18:30:00Z = Aug-24 IST midnight) collides with today's non-us slot; its
+5 historical failed product-catalog jobs make the catalog family failed>0. 481fe35c is NOT a benign
+failed-catalog footprint (it has succeeded jobs + validated snapshots), so the reviewed cleanup tool correctly
+refuses it.
+
+Unblock = re-date ONLY that one test cycle out of today's slot (non-destructive; it is the ONLY colliding non-us
+cycle; snapshots are not cycle_date-keyed): UPDATE public.sync_cycles SET cycle_date='2026-08-15T18:30:00.000Z'
+WHERE id='481fe35c-ce65-455f-b317-cc267977e185' AND cycle_date='2026-08-23T18:30:00.000Z' AND bucket='non-us'
+AND status='partial'. A guarded script exists at sales-dashboard-live/scratchpad/redate-481.mjs, but the harness
+classifier blocks ad-hoc production-mutation scripts (needs a user Bash-permission grant or a reviewed tool).
+
+Recovery: safe-closed the controls (clean control plane, audited). The v2 reservation stays (2 tokens; catalog
+cached, expires ~Aug-25 07:06 IST); nothing published; LKG intact; no cron. Next: re-date 481fe35c (approved),
+then re-run priority-dashboards-release.mjs (US adopts the catalog for 0 extra tokens; non-us opens a fresh
+cycle) -> finalize -> preflight -> publish 30x3 -> live/frontend verify -> safe-close. See
+[[scheduler-v2-golive-status]].
