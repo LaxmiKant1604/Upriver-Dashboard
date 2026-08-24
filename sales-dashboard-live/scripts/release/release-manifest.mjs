@@ -53,7 +53,12 @@ export const PROTECTED_DIGESTS = Object.freeze({
   mode: { c: 1, h: "b4ebf7ef96a797225eda8ff692d2c308" },
   approvals: { c: 4, h: "853ad5c6a619dab3f0ba41d43a62686d" },
   settings: { c: 13, h: "0638bc18cc428442b7b9e28a4a9d0aff" },
-  sync_cycles: { c: 17, h: "29ad627c7fa6132edba061c5431f74dd" },
+  // Re-anchored 2026-08-24 after reviewed stage-8 reconciliation: 17 -> 21. The 4 additional cycles are ALL
+  // trigger=manual (ZERO scheduled/cron), dated 2026-08-13..22, from the authorized OLI gap-closure recovery
+  // (incl. the documented non-us recovery cycle 15d1f749) + priority-path proof runs. The other 7 protected
+  // digests (incl. live_snapshots=183, rollout/mode/approvals/settings, report_jobs=191) are UNCHANGED, so no
+  // customer data / control-plane drift; Migration 9 does not touch sync_cycles. Intentional-state, benign.
+  sync_cycles: { c: 21, h: "cbf48a2f586891ba199e4d8ea5a72af2" },
   report_jobs: { c: 191, h: "b63d32ae3ed2e5f75ab5ecff2150fe7a" },
 });
 
