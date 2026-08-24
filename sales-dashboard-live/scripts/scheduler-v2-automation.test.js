@@ -8,8 +8,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
 import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
-import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING } from "../lib/server/datadoe-usage.js";
+import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING, tokenGateDecision, NON_US_RUN_TOKEN_CEILING, US_RUN_TOKEN_CEILING, LOW_BALANCE_WARN_TOKENS } from "../lib/server/datadoe-usage.js";
 import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
+import { ARCHIVE_CYCLES, PROTECTED_TABLES, assessArchivePre, assessArchivePost, runArchiveTransaction, assessFrozenSetCoherent } from "../lib/server/sync/source-archive-collision-cycles.js";
+import { assessNonUsPrerequisites } from "../lib/server/sync/source-scheduled-prerequisites.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));            // <repo>/sales-dashboard-live/scripts
 const WORKFLOWS_DIR = resolve(HERE, "..", "..", ".github", "workflows");
@@ -182,22 +184,36 @@ test("D1. scheduler-v2.yml pins BOTH daily crons, workflow_dispatch, concurrency
   assert.ok(tm && Number(tm[1]) >= 90, "timeout >= 90 minutes");
 });
 
-test("D2. workflow shape: token gate BEFORE creates; OLI + ASIN Ads (both buckets); US opens controls, publishes date-scoped, rebuilds membership, and ALWAYS safe-closes", () => {
+test("D2. workflow shape: exact ordered pipeline with per-run token ceilings, cycle preflight, US-depends-on-Non-US, token-gate skip conditionals, and always-safe-close", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
-  // Token gate runs before the source refreshes (fail-closed >= 30).
-  assert.match(yml, /confirm-token-budget\.mjs --min=30/, "confirms >= 30 usable tokens before any create");
-  const gateIdx = yml.indexOf("confirm-token-budget.mjs");
-  const oliIdx = yml.indexOf("scheduled-oli-refresh.mjs");
-  const adsIdx = yml.indexOf("scheduled-asin-ads-refresh.mjs");
-  assert.ok(gateIdx > 0 && gateIdx < oliIdx && oliIdx < adsIdx, "order: token gate -> OLI -> ASIN Ads");
-  assert.match(yml, /scheduled-oli-refresh\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --as-of=/, "OLI refresh runs for the resolved bucket");
-  assert.match(yml, /scheduled-asin-ads-refresh\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --as-of=/, "ASIN Ads refresh runs for the resolved bucket (both buckets)");
-  assert.match(yml, /priority-control-package\.mjs --apply/, "US run opens publication controls");
-  assert.match(yml, /priority-dashboards-release\.mjs --as-of=[^\n]*--operation-key=priority-dashboards\/scheduled\//, "release uses the date-scoped operation key");
-  assert.match(yml, /rebuild-brand-membership\.mjs/, "US run rebuilds Brand View membership from the fresh brand-sales");
-  assert.match(yml, /if:\s*always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS runs on the US path");
-  // No unrelated source/report is ever run: no Campaign Ads, no FBA, no deprecated Vercel cron endpoint.
-  assert.doesNotMatch(yml, /campaign|fba-|api\/cron\/sync/i, "never runs Campaign Ads / FBA / the deprecated Vercel cron endpoint");
+  const idx = (s) => yml.indexOf(s);
+  // per-run token ceiling (20 Non-US / 10 US) resolved + passed as --min.
+  assert.match(yml, /if \[ "\$bucket" = "non-us" \]; then tokenmin=20; else tokenmin=10; fi/, "per-run ceilings 20/10");
+  assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\} --bucket=/, "token gate uses the per-run min");
+  // exact order: secrets -> resolve -> npm ci -> cycle preflight -> (US: prereq) -> token gate -> OLI -> ASIN Ads.
+  assert.ok(idx("Verify required secrets") < idx("Resolve bucket"), "secrets before resolve");
+  assert.ok(idx("npm ci") < idx("scheduled-cycle-preflight.mjs"), "npm ci before cycle preflight");
+  assert.ok(idx("scheduled-cycle-preflight.mjs") < idx("confirm-token-budget.mjs"), "cycle preflight before token gate");
+  assert.ok(idx("verify-scheduled-prerequisites.mjs") < idx("confirm-token-budget.mjs"), "US Non-US-completion proof before the token gate");
+  assert.ok(idx("confirm-token-budget.mjs") < idx("scheduled-oli-refresh.mjs"), "token gate before OLI");
+  assert.ok(idx("scheduled-oli-refresh.mjs") < idx("scheduled-asin-ads-refresh.mjs"), "OLI before ASIN Ads");
+  assert.ok(idx("scheduled-asin-ads-refresh.mjs") < idx("priority-control-package.mjs --apply"), "Ads before controls");
+  assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
+  assert.ok(idx("priority-dashboards-release.mjs") < idx("rebuild-brand-membership.mjs"), "release before membership rebuild");
+  // every create/control step is gated on the token-gate proceed output (typed skip => no creates/controls).
+  for (const step of ["scheduled-oli-refresh.mjs", "scheduled-asin-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+    const at = idx(step); const before = yml.slice(Math.max(0, at - 240), at);
+    assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
+  }
+  assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
+  // safe-close ALWAYS on the US path (idempotent), even on failure.
+  assert.match(yml, /if:\s*always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS on US");
+  // date-scoped operation key; timeout >= the summed bounded deadlines.
+  assert.match(yml, /priority-dashboards-release\.mjs --as-of=[^\n]*--operation-key=priority-dashboards\/scheduled\//, "date-scoped operation key");
+  assert.match(yml, /timeout-minutes:\s*(1[0-9][0-9]|[2-9][0-9])/, "job timeout covers OLI+Ads+publication");
+  // Campaign Ads / FBA / unrelated reports structurally ABSENT: no run command invokes a campaign/fba/cron script.
+  assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no run step invokes a Campaign Ads / FBA script");
+  assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
 test("D3. single-scheduler rule: EXACTLY ONE workflow file declares a schedule: trigger", () => {
@@ -232,6 +248,25 @@ test("E2. confirmUsableTokens: >= required confirms; below refuses; a failed/emp
   assert.equal(confirmUsableTokens({ read: "empty", usable: null }, 30).confirmed, false, "empty log is not a confirmation");
   assert.equal(confirmUsableTokens(null, 30).confirmed, false, "null balance is not a confirmation");
   assert.equal(COMBINED_DAILY_TOKEN_CEILING, 30, "default required = the combined daily ceiling");
+});
+
+test("E4. tokenGateDecision: exact per-run ceilings (Non-US 20 / US 10); proceed / typed skip / fail-closed; low-balance warning", () => {
+  assert.equal(NON_US_RUN_TOKEN_CEILING, 20);
+  assert.equal(US_RUN_TOKEN_CEILING, 10);
+  // proceed at or above required
+  assert.equal(tokenGateDecision({ read: "ok", usable: 84 }, 20).decision, "proceed");
+  assert.equal(tokenGateDecision({ read: "ok", usable: 20 }, 20).decision, "proceed");
+  assert.equal(tokenGateDecision({ read: "ok", usable: 10 }, 10).decision, "proceed");
+  // readable-but-insufficient -> typed SAFE SKIP (not a crash)
+  const skip = tokenGateDecision({ read: "ok", usable: 12 }, 20);
+  assert.equal(skip.decision, "skip"); assert.equal(skip.reason, "insufficient-tokens");
+  // unreadable/malformed -> fail closed
+  assert.equal(tokenGateDecision({ read: "error", usable: null }, 20).decision, "fail");
+  assert.equal(tokenGateDecision(null, 20).decision, "fail");
+  // low-balance warning fires below the threshold (84 tokens < 90 = fewer than 3 worst-case days), but still proceeds
+  assert.equal(LOW_BALANCE_WARN_TOKENS, 90);
+  assert.equal(tokenGateDecision({ read: "ok", usable: 84 }, 20).lowBalance, true);
+  assert.equal(tokenGateDecision({ read: "ok", usable: 120 }, 20).lowBalance, false);
 });
 
 test("E3. getDataDoeTokenBalance FAILS CLOSED on non-200 / empty / missing key (usable=null, never a bogus number)", async () => {
@@ -370,6 +405,120 @@ test("G5. a terminal cycle whose only jobs are UNRELATED (Ads/FBA) can never sat
   });
   assert.equal(cls.disposition, "terminal-refuse");
   assert.ok(cls.assessment.problems.includes("no-oli-jobs"), "Ads/FBA jobs are not OLI and never adopt the cycle");
+});
+
+group("H. fixed-identity archival of the 6 future-dated collision cycles (dry-run/apply, exact PRE/POST, idempotent)");
+
+const archiveBundlePre = (over = {}) => {
+  const cyclesById = {};
+  for (const a of ARCHIVE_CYCLES) cyclesById[a.cycleId] = { id: a.cycleId, bucket: a.expectedBucket, cycleDateText: a.currentDate, status: a.expectedStatus, trigger: a.expectedTrigger, counts: { sourceJobs: a.sourceJobCount, owners: a.ownerCount, reportJobs: a.reportJobCount } };
+  const currentSlotNonUsCount = {}; const targetSlotCount = {};
+  for (const a of ARCHIVE_CYCLES) { currentSlotNonUsCount[a.currentDate] = 1; targetSlotCount[a.targetDate] = 0; }
+  const digests = {}; for (const t of PROTECTED_TABLES) digests[t] = { c: 1, h: "h-" + t };
+  return { cyclesById, currentSlotNonUsCount, targetSlotCount, controls: { allPrimary: false, cron: false, enabledRollout: 0, enabledDispatch: 0, enabledPromoted: 0, approvedCount: 0 }, syncCyclesRowCount: 23, digests, ...over };
+};
+const archiveBundlePost = (pre) => {
+  const cyclesById = {}; const currentSlotNonUsCount = {}; const targetSlotCount = {};
+  for (const a of ARCHIVE_CYCLES) { cyclesById[a.cycleId] = { ...pre.cyclesById[a.cycleId], cycleDateText: a.targetDate }; currentSlotNonUsCount[a.currentDate] = 0; targetSlotCount[a.targetDate] = 1; }
+  return { ...pre, cyclesById, currentSlotNonUsCount, targetSlotCount };
+};
+
+test("H0. the frozen archival set is coherent: 6 cycles, distinct ids + distinct current/target dates, all plain ISO, target != current", () => {
+  assert.equal(ARCHIVE_CYCLES.length, 6);
+  assert.deepEqual(assessFrozenSetCoherent(), []);
+  assert.equal(new Set(ARCHIVE_CYCLES.map((a) => a.targetDate)).size, 6);
+  assert.ok(ARCHIVE_CYCLES.every((a) => /^2026-01-0[2-7]$/.test(a.targetDate)), "targets are free Jan-2026 dates");
+});
+
+test("H1. assessArchivePre: the exact frozen collision set has ZERO problems", () => {
+  assert.deepEqual(assessArchivePre(archiveBundlePre()), []);
+});
+
+test("H2. assessArchivePre refuses EVERY footprint mismatch (wrong date/status/counts, occupied target, double current slot, open controls, missing cycle)", () => {
+  const cases = [
+    ["wrong current date", (b) => { b.cyclesById[ARCHIVE_CYCLES[0].cycleId].cycleDateText = "2026-08-24"; }, /cycle-date-not-current-slot/],
+    ["wrong status", (b) => { b.cyclesById[ARCHIVE_CYCLES[0].cycleId].status = "succeeded"; }, /status-not-expected/],
+    ["wrong source-job count", (b) => { b.cyclesById[ARCHIVE_CYCLES[0].cycleId].counts.sourceJobs = 999; }, /source-jobs-count/],
+    ["wrong owner count", (b) => { b.cyclesById[ARCHIVE_CYCLES[4].cycleId].counts.owners = 1; }, /owners-count/],
+    ["target occupied", (b) => { b.targetSlotCount[ARCHIVE_CYCLES[0].targetDate] = 1; }, /target-slot-occupied/],
+    ["current slot has 2", (b) => { b.currentSlotNonUsCount[ARCHIVE_CYCLES[0].currentDate] = 2; }, /current-slot-not-exactly-one/],
+    ["controls open", (b) => { b.controls.approvedCount = 1; }, /controls-not-safe-closed/],
+    ["cycle missing", (b) => { delete b.cyclesById[ARCHIVE_CYCLES[5].cycleId]; }, /cycle-not-found/],
+  ];
+  for (const [name, mut, re] of cases) {
+    const b = archiveBundlePre(); mut(b);
+    assert.ok(assessArchivePre(b).some((x) => re.test(x)), name + " -> " + re);
+  }
+});
+
+test("H3. assessArchivePost: a correct move has ZERO problems; a changed protected digest / unmoved cycle / bad row count / changed sync_cycles count refuses", () => {
+  const pre = archiveBundlePre();
+  const rc = ARCHIVE_CYCLES.map(() => 1);
+  assert.deepEqual(assessArchivePost(pre, archiveBundlePost(pre), rc), []);
+  const post2 = archiveBundlePost(pre); post2.digests = { ...pre.digests, source_oli_daily_history: { c: 99, h: "count-only" } };
+  assert.ok(assessArchivePost(pre, post2, rc).some((x) => /protected-digest-changed:source_oli_daily_history/.test(x)), "OLI history change caught");
+  const post3 = archiveBundlePost(pre); post3.cyclesById[ARCHIVE_CYCLES[0].cycleId].cycleDateText = ARCHIVE_CYCLES[0].currentDate;
+  assert.ok(assessArchivePost(pre, post3, rc).some((x) => /post-cycle-date-not-target/.test(x)));
+  assert.ok(assessArchivePost(pre, archiveBundlePost(pre), rc.map((v, i) => (i === 0 ? 0 : v))).some((x) => /row-count-not-1/.test(x)));
+  assert.ok(assessArchivePost(pre, { ...archiveBundlePost(pre), syncCyclesRowCount: 22 }, rc).some((x) => /sync_cycles-row-count-changed/.test(x)));
+});
+
+test("H4. runArchiveTransaction: dry-run writes nothing; apply commits on exact PRE/POST; PRE/POST mismatch rolls back (code 1); COMMIT_UNKNOWN never rolls back (code 3)", async () => {
+  const dry = await runArchiveTransaction({ store: { readEvidence: async () => archiveBundlePre(), begin: async () => {} }, mode: "dry-run" });
+  assert.equal(dry.dryRun, true); assert.equal(dry.code, 0);
+  const okStore = () => ({ _s: 0, begin: async () => {}, commit: async () => {}, rollback: async () => {}, readEvidence: async function () { this._s += 1; const pre = archiveBundlePre(); return this._s === 1 ? pre : archiveBundlePost(pre); }, update: async () => ARCHIVE_CYCLES.map(() => 1) });
+  const okr = await runArchiveTransaction({ store: okStore(), mode: "apply" });
+  assert.equal(okr.committed, true); assert.equal(okr.code, 0);
+  const badPre = { begin: async () => {}, commit: async () => {}, rollback: async () => {}, readEvidence: async () => { const b = archiveBundlePre(); b.controls.approvedCount = 1; return b; }, update: async () => ARCHIVE_CYCLES.map(() => 1) };
+  const pr = await runArchiveTransaction({ store: badPre, mode: "apply" });
+  assert.equal(pr.committed, false); assert.equal(pr.code, 1); assert.match(pr.problem, /PRE:/);
+  const badPost = { _s: 0, begin: async () => {}, commit: async () => {}, rollback: async () => {}, readEvidence: async function () { this._s += 1; const pre = archiveBundlePre(); if (this._s === 1) return pre; const post = archiveBundlePost(pre); post.cyclesById[ARCHIVE_CYCLES[0].cycleId].cycleDateText = ARCHIVE_CYCLES[0].currentDate; return post; }, update: async () => ARCHIVE_CYCLES.map(() => 1) };
+  const por = await runArchiveTransaction({ store: badPost, mode: "apply" });
+  assert.equal(por.committed, false); assert.equal(por.code, 1); assert.match(por.problem, /POST:/);
+  let rolled = 0;
+  const cuStore = { _s: 0, begin: async () => {}, commit: async () => { throw new Error("lost ack"); }, rollback: async () => { rolled += 1; }, readEvidence: async function () { this._s += 1; const pre = archiveBundlePre(); return this._s === 1 ? pre : archiveBundlePost(pre); }, update: async () => ARCHIVE_CYCLES.map(() => 1) };
+  const cur = await runArchiveTransaction({ store: cuStore, mode: "apply" });
+  assert.equal(cur.commitUnknown, true); assert.equal(cur.code, 3); assert.equal(rolled, 0, "COMMIT_UNKNOWN never rolls back");
+});
+
+test("H5. idempotency: after the move the PRE no longer matches (cycles at target dates) so a re-apply REFUSES", () => {
+  const b = archiveBundlePre();
+  for (const a of ARCHIVE_CYCLES) { b.cyclesById[a.cycleId].cycleDateText = a.targetDate; b.currentSlotNonUsCount[a.currentDate] = 0; b.targetSlotCount[a.targetDate] = 1; }
+  const p = assessArchivePre(b);
+  assert.ok(p.length > 0 && p.some((x) => /cycle-date-not-current-slot/.test(x)), "a second apply is refused");
+});
+
+group("I. US-depends-on-Non-US prerequisite gate (fail-closed before any US create/control)");
+
+const readyPerAccount = (n, over = () => ({})) => Array.from({ length: n }, (_, i) => ({ accountId: acct(i + 1), oliCoveredTo: "2026-08-23", oliGapless: true, oliProvenanceOk: true, oliFailedOrOpen: false, adsWindowCovered: true, adsFailed: false, ...over(i) }));
+const completeCycleAssess = () => ({ ok: true, problems: [] });
+
+test("I1. all 22 Non-US accounts covered + a complete Non-US OLI cycle -> ready (US may proceed)", () => {
+  const r = assessNonUsPrerequisites({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: readyPerAccount(22), cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  assert.equal(r.ok, true, JSON.stringify(r.problems));
+  assert.equal(r.accounts, 22);
+});
+
+test("I2. rejects EVERY incompleteness: short coverage, interior gap, blank provenance, ads gap, failed OLI/Ads, missing/incomplete Non-US cycle, isolation breach", () => {
+  const base = () => ({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: readyPerAccount(22), cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  const cases = [
+    ["OLI coverage short", (i) => { i.perAccount[0].oliCoveredTo = "2026-08-22"; }, /oli-coverage-short/],
+    ["OLI interior gap", (i) => { i.perAccount[1].oliGapless = false; }, /oli-coverage-gap/],
+    ["blank OLI provenance", (i) => { i.perAccount[2].oliProvenanceOk = false; }, /oli-provenance-blank/],
+    ["ASIN-Ads window incomplete", (i) => { i.perAccount[3].adsWindowCovered = false; }, /ads-coverage-incomplete/],
+    ["failed/open OLI work", (i) => { i.perAccount[4].oliFailedOrOpen = true; }, /oli-failed-or-open/],
+    ["failed ASIN-Ads", (i) => { i.perAccount[5].adsFailed = true; }, /ads-failed/],
+    ["an account has NO evidence", (i) => { i.perAccount = i.perAccount.slice(0, 21); }, /account-missing-evidence/],
+    ["no Non-US cycle for asOf", (i) => { i.cyclePresent = false; }, /nonus-cycle-missing/],
+    ["Non-US cycle OLI incomplete", (i) => { i.cycleOliAssessment = { ok: false, problems: ["no-oli-jobs", "owner-coverage-missing"] }; }, /nonus-cycle-oli-incomplete/],
+    ["evidence account outside discovery", (i) => { i.perAccount.push({ accountId: "STRANGER", oliCoveredTo: "2026-08-23", oliGapless: true, oliProvenanceOk: true, adsWindowCovered: true }); }, /evidence-account-outside-discovery/],
+  ];
+  for (const [name, mut, re] of cases) {
+    const input = base(); mut(input);
+    const r = assessNonUsPrerequisites(input);
+    assert.equal(r.ok, false, name + " must block US");
+    assert.ok(r.problems.some((p) => re.test(p)), name + " -> " + re + " in " + JSON.stringify(r.problems.slice(0, 4)));
+  }
 });
 
 // ---- run ----

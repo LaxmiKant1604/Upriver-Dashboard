@@ -1,20 +1,22 @@
 name: scheduler-v2
 
-# THE ONE authoritative automatic scheduler for Daily Reporting + Brand View (Scheduler v2).
+# THE ONE authoritative automatic scheduler for Daily Reporting + Brand View (Scheduler v2). GitHub Actions is
+# the SOLE timing authority (the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap);
+# NO pg_cron, NO Vercel cron. Daily Reporting + Brand View only -- Campaign Ads, FBA and every unrelated report
+# are structurally absent from this workflow.
 #
-# Why GitHub Actions (and NOT pg_cron / Vercel cron): the full source-refresh + derive + publish workflow far
-# exceeds Vercel's 60s function limit, so it runs here as a long CI job against production Postgres / Supabase /
-# DataDoe using repository secrets. GitHub Actions is the SOLE timing authority for this pipeline.
+#   - non-us @ 02:00 UTC (07:30 IST): cycle preflight -> confirm >=20 tokens -> Non-US OLI -> Non-US ASIN Ads ->
+#     read-only post-run proof. NO publication.
+#   - us     @ 10:30 UTC (16:00 IST): prove the SAME-asOf Non-US run completed -> confirm >=10 tokens -> US OLI ->
+#     US ASIN Ads -> open controls -> Catalog + derive + preflight + publish all 30x3 -> rebuild Brand View
+#     membership -> live read-back -> ALWAYS safe-close controls.
 #
-# Two daily runs (one bucket each), plus a manual dispatch for controlled operator runs:
-#   - non-us @ 02:00 UTC (07:30 IST): refresh canonical OLI for Non-US ONLY.
-#   - us     @ 10:30 UTC (16:00 IST): refresh canonical OLI for US, THEN derive + publish Daily Reporting +
-#     Brand View for ALL 30 accounts (both buckets) behind the reviewed publication controls, ALWAYS safe-closing
-#     the controls afterward (including on failure).
+# Insufficient tokens is a TYPED SAFE SKIP (SKIPPED_INSUFFICIENT_TOKENS): the token gate sets proceed=false, every
+# create/control step is skipped, and the run reports the skip -- no creates, no controls, LKG unchanged. An
+# UNREADABLE balance hard-fails. A same-date terminal cycle collision fails at the preflight before any token read.
 #
-# Required repository secrets (never printed):
-#   POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY
-#   DATADOE_API_KEY_SECONDARY (optional -- only if a secondary connection is configured)
+# Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
+# SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
   schedule:
@@ -27,7 +29,6 @@ on:
         required: true
         default: "non-us"
 
-# One scheduler at a time: scheduled and manual runs serialize and never overlap.
 concurrency:
   group: scheduler-v2
   cancel-in-progress: false
@@ -38,7 +39,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 95
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -56,6 +57,7 @@ jobs:
         with:
           node-version: "24"
 
+      # Secret validation MUST fail before any production I/O.
       - name: Verify required secrets are present (fail fast, never print values)
         run: |
           set -uo pipefail
@@ -67,7 +69,7 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve bucket + asOf (previous UTC date)
+      - name: Resolve bucket + asOf (previous UTC date) + per-run token ceiling
         id: cfg
         run: |
           set -euo pipefail
@@ -78,49 +80,66 @@ jobs:
           elif [ "${{ github.event.schedule }}" = "30 10 * * *" ]; then
             bucket="us"
           else
-            echo "Unrecognized trigger (event=${{ github.event_name }} schedule=${{ github.event.schedule }})." >&2
-            exit 1
+            echo "Unrecognized trigger (event=${{ github.event_name }} schedule=${{ github.event.schedule }})." >&2; exit 1
           fi
-          if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then
-            echo "Invalid bucket '$bucket'." >&2; exit 1
-          fi
+          if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then echo "Invalid bucket '$bucket'." >&2; exit 1; fi
+          if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
-          echo "Resolved bucket=$bucket asOf=$asof (UTC previous date)"
+          echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
+          { echo "### scheduler-v2 run"; echo "- bucket: $bucket"; echo "- asOf: $asof"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Resolved bucket=$bucket asOf=$asof tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
 
-      # Refuse BEFORE the first create if the combined daily ceiling cannot be afforded. Read-only /usage-logs
-      # (spends zero tokens); fail-closed if the balance is below 30 or cannot be confirmed.
-      - name: Confirm >= 30 usable DataDoe tokens (before any create)
-        run: node scripts/release/confirm-token-budget.mjs --min=30
+      # (Non-US step 4) cycle-identity preflight: a same-date terminal collision fails EARLY, before any token read.
+      - name: Cycle-identity preflight (this bucket)
+        run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.bucket }}
 
-      # One source family at a time: canonical OLI first, then ASIN Ads (coverage mode). Both buckets refresh
-      # their own evidence; only the US run publishes.
+      # (US step 4) prove the SAME-asOf Non-US run completed BEFORE the US token gate / creates / controls.
+      - name: Prove same-asOf Non-US completion (us run only, before creates/controls)
+        if: steps.cfg.outputs.bucket == 'us'
+        run: node scripts/release/verify-scheduled-prerequisites.mjs --as-of=${{ steps.cfg.outputs.asof }}
+
+      # Token gate: exact per-run ceiling. Unreadable balance hard-fails; insufficient tokens is a typed safe skip
+      # (proceed=false) so every create/control step below is skipped.
+      - name: Confirm token budget (>=20 Non-US / >=10 US, before any create)
+        id: tokengate
+        run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.bucket }}
+
       - name: Refresh canonical OLI (this bucket only)
+        if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-oli-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
       - name: Refresh ASIN Ads (this bucket only; coverage mode, 21-day rolling window)
+        if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-asin-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
-      # The US run alone derives + publishes all 30 accounts (Non-US OLI+Ads were refreshed by the 02:00 run). It
-      # opens the reviewed publication controls, reuses/refreshes the one org-wide Product Catalog and derives +
-      # publishes under the date-scoped operation key, rebuilds Brand View membership from the fresh brand-sales,
-      # and ALWAYS safe-closes the controls afterward.
+      # (Non-US step 8) exact read-only post-run proof: the Non-US OLI + ASIN-Ads evidence is now complete.
+      - name: Non-US post-run proof (non-us run only; no publication)
+        if: steps.cfg.outputs.bucket == 'non-us' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/verify-scheduled-prerequisites.mjs --as-of=${{ steps.cfg.outputs.asof }}
+
+      # US publication: open controls -> release (Catalog + derive/preflight + publish + read-back) -> rebuild
+      # membership -> ALWAYS safe-close.
       - name: Open publication controls (us run only)
-        if: steps.cfg.outputs.bucket == 'us'
+        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/priority-control-package.mjs --apply
 
-      - name: Refresh Catalog + derive/preflight + publish Daily Reporting + Brand View for all 30 accounts (us run only)
-        if: steps.cfg.outputs.bucket == 'us'
+      - name: Refresh Catalog + derive/preflight + publish all 30x3 + live read-back (us run only)
+        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/priority-dashboards-release.mjs --as-of=${{ steps.cfg.outputs.asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }}
 
-      - name: Rebuild + verify Brand View membership from the fresh brand-sales (us run only; Supabase-only, zero tokens)
-        if: steps.cfg.outputs.bucket == 'us'
+      - name: Rebuild + verify Brand View membership from the fresh brand-sales (us run only; Supabase-only)
+        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
-      - name: Safe-close publication controls (ALWAYS, us run only)
+      - name: Safe-close publication controls (ALWAYS, us run only, idempotent)
         if: always() && steps.cfg.outputs.bucket == 'us'
         run: node scripts/release/priority-control-package.mjs --rollback
+
+      - name: Report insufficient-tokens skip
+        if: always() && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
+        run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (bucket=${{ steps.cfg.outputs.bucket }} asOf=${{ steps.cfg.outputs.asof }})."
