@@ -37,7 +37,7 @@ const TODAY = "2026-08-20";
 const ASOF = "2026-08-19";
 const TS = "2026-08-19T10:00:00.000Z";
 
-let priorityMod; let planMod; let brandView; let pubComposition; let reportStore; let supabaseMod; let releaseRunner; let publisherCore; let reportDerivation; let controlPkg;
+let priorityMod; let planMod; let brandView; let pubComposition; let reportStore; let supabaseMod; let releaseRunner; let publisherCore; let reportDerivation; let controlPkg; let cleanupMod;
 
 /* ---- a FAITHFUL fake of the OPERATION-WIDE durable reservation table (PK = operation_key alone) ---- */
 function makeFakeReservation() {
@@ -989,11 +989,100 @@ test("P12t. buildPrioritySafeClosePackage needs NO accounts and fails closed on 
   assert.throws(() => controlPkg.buildPrioritySafeClosePackage({ operator: "bad op" }), /canonical operator/);
 });
 
+/* ===================== P13. the failed-v1-cycle cleanup (exact benign footprint only) ===================== */
+group("P13. failed-cycle cleanup: exact footprint proof; dry-run; guarded delete; every mismatch => zero writes");
+const ORG_SCOPE = "__organization";
+function benignCycle() {
+  return {
+    cycle: { id: "cyc-v1-us", bucket: "us", status: "running", trigger: "manual" },
+    sourceJobs: [{ source_key: "product-catalog", fetch_status: "failed", terminal: true, export_id: null, error_stage: "create-export", create_export_count: 1 }],
+    owners: [{ request_hash: "h", account_id: ORG_SCOPE }],
+    reportJobs: [],
+    budgets: [{ tranche_key: "source-sync:product-catalog", spent_creates: 1, spent_tokens: 0 }],
+    snapshotCount: 0,
+  };
+}
+function makeCleanupStore(initial, opts = {}) {
+  const clone = (o) => (o == null ? null : JSON.parse(JSON.stringify(o)));
+  let state = clone(initial);
+  let snapshot = null;
+  const calls = { begin: 0, commit: 0, rollback: 0, del: 0 };
+  return {
+    _calls: calls, _state: () => state,
+    begin: async () => { calls.begin += 1; snapshot = clone(state); if (opts.mutateOnLock) opts.mutateOnLock(state); },
+    commit: async () => { calls.commit += 1; if (opts.failCommit) throw new Error("commit ack lost"); snapshot = null; },
+    rollback: async () => { calls.rollback += 1; if (opts.failRollback) throw new Error("rollback failed"); if (snapshot) state = snapshot; },
+    read: async () => clone(state),
+    deleteFootprint: async () => { calls.del += 1; if (opts.brokenDelete) return; state = { cycle: null, sourceJobs: [], owners: [], reportJobs: [], budgets: [], snapshotCount: 0 }; },
+  };
+}
+const runCleanup = (store, mode) => cleanupMod.runFailedCycleCleanupTransaction({ store, cycleId: "cyc-v1-us", mode, organizationScopeKey: ORG_SCOPE });
+
+test("P13a. the EXACT benign failed-Catalog footprint: dry-run writes nothing; apply deletes the cycle footprint and COMMITS", async () => {
+  const dryStore = makeCleanupStore(benignCycle());
+  const dry = await runCleanup(dryStore, "dry-run");
+  assert.equal(dry.dryRun, true); assert.equal(dry.code, 0); assert.deepEqual(dryStore._calls, { begin: 0, commit: 0, rollback: 0, del: 0 }, "dry-run writes nothing");
+  const store = makeCleanupStore(benignCycle());
+  const r = await runCleanup(store, "apply");
+  assert.equal(r.committed, true); assert.equal(r.code, 0);
+  assert.equal(store._state().cycle, null, "the cycle row is gone");
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0, del: 1 });
+});
+test("P13b. EVERY footprint mismatch is refused with ZERO writes (dry-run AND apply)", async () => {
+  const mutations = [
+    ["terminal cycle", (c) => { c.cycle.status = "succeeded"; }, /cycle-not-running/],
+    ["two source jobs", (c) => { c.sourceJobs.push({ ...c.sourceJobs[0] }); }, /source-job-count/],
+    ["a non-catalog source job", (c) => { c.sourceJobs[0].source_key = "order-line-items"; }, /non-catalog-source-job/],
+    ["a succeeded source job", (c) => { c.sourceJobs[0].fetch_status = "succeeded"; }, /has-succeeded-source-job|source-job-not-failed/],
+    ["a real export id", (c) => { c.sourceJobs[0].export_id = "e_1"; }, /has-datadoe-export-id/],
+    ["report jobs present", (c) => { c.reportJobs.push({ report_key: "daily-reporting", validated: false }); }, /has-report-jobs/],
+    ["a non-org owner", (c) => { c.owners[0].account_id = "A01"; }, /owner-not-org-scope/],
+    ["a stray snapshot", (c) => { c.snapshotCount = 3; }, /has-snapshots/],
+    ["a recorded token spend", (c) => { c.budgets[0].spent_tokens = 2; }, /budget-recorded-token-spend/],
+    ["wrong error stage", (c) => { c.sourceJobs[0].error_stage = "poll"; }, /error-stage-not-create-export/],
+  ];
+  for (const [name, mut, re] of mutations) {
+    const fixture = benignCycle(); mut(fixture);
+    const dryStore = makeCleanupStore(fixture);
+    const dry = await runCleanup(dryStore, "dry-run");
+    assert.equal(dry.code, 1, name + " (dry)"); assert.ok(dry.problems.some((p) => re.test(p)), name + " -> " + JSON.stringify(dry.problems));
+    assert.deepEqual(dryStore._calls, { begin: 0, commit: 0, rollback: 0, del: 0 }, name + " dry writes nothing");
+    const store = makeCleanupStore(fixture);
+    const r = await runCleanup(store, "apply");
+    assert.equal(r.code, 1, name + " (apply)"); assert.equal(store._calls.del, 0, name + " apply deletes nothing");
+    assert.ok(store._state().cycle, name + " cycle preserved");
+  }
+});
+test("P13c. COMMIT_UNKNOWN: a lost commit ack returns code 3, does NOT rollback, demands read-only reconciliation", async () => {
+  const store = makeCleanupStore(benignCycle(), { failCommit: true });
+  const r = await runCleanup(store, "apply");
+  assert.equal(r.code, 3); assert.equal(r.commitUnknown, true); assert.match(r.instruction, /READ-ONLY reconciliation/i);
+  assert.deepEqual(store._calls, { begin: 1, commit: 1, rollback: 0, del: 1 }, "attempted commit; NO rollback");
+});
+test("P13d. a footprint that CHANGES under the advisory lock is refused inside the transaction (rollback, cycle preserved)", async () => {
+  // the locked re-read observes a second source job that appeared after the dry assessment.
+  const store = makeCleanupStore(benignCycle(), { mutateOnLock: (s) => { s.sourceJobs.push({ source_key: "product-catalog", fetch_status: "failed", terminal: true, export_id: null, error_stage: "create-export" }); } });
+  const r = await runCleanup(store, "apply");
+  assert.equal(r.code, 1); assert.match(r.problem, /PRE \(locked\)/); assert.equal(store._calls.del, 0, "nothing deleted");
+  assert.deepEqual(store._calls, { begin: 1, commit: 0, rollback: 1, del: 0 });
+});
+test("P13e. a broken delete that leaves the cycle fails the POST and rolls back (code 1)", async () => {
+  const store = makeCleanupStore(benignCycle(), { brokenDelete: true });
+  const r = await runCleanup(store, "apply");
+  assert.equal(r.code, 1); assert.match(r.problem, /POST/); assert.equal(store._calls.rollback, 1);
+});
+test("P13f. fails closed on a bad mode / missing store / blank cycleId", async () => {
+  await assert.rejects(() => cleanupMod.runFailedCycleCleanupTransaction({ store: makeCleanupStore(benignCycle()), cycleId: "c", mode: "delete" }), /apply.*dry-run/);
+  await assert.rejects(() => cleanupMod.runFailedCycleCleanupTransaction({ store: null, cycleId: "c", mode: "dry-run" }), /store/);
+  await assert.rejects(() => cleanupMod.runFailedCycleCleanupTransaction({ store: makeCleanupStore(benignCycle()), cycleId: "", mode: "dry-run" }), /exact cycleId/);
+});
+
 async function main() {
   out("priority dashboards release proof suite");
   priorityMod = await import("../lib/server/sync/source-priority-dashboards.js");
   releaseRunner = await import("../lib/server/sync/source-priority-release-runner.js");
   controlPkg = await import("../lib/server/sync/source-priority-control-package.js");
+  cleanupMod = await import("../lib/server/sync/source-failed-cycle-cleanup.js");
   planMod = await import("../lib/server/sync/source-bucket-sync.js");
   brandView = await import("../lib/server/reports/brand-view.js");
   pubComposition = await import("../lib/server/sync/publisher-composition.js");
