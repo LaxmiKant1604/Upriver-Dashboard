@@ -10,15 +10,9 @@
 // This is an OPERATOR action requiring production access. It is NOT wired to any API route, card action or
 // scheduler (those keep recoverFailedDownloads=false). Run manually only, after Codex sign-off:
 //   node scripts/release/recover-nonus-oli-download.mjs
-import { readFileSync } from "node:fs";
+import { loadReleaseEnv } from "./env-bootstrap.mjs";
 
-const repoRoot = "C:/Users/laxmi/Documents/Codex/2026-07-01/can/Upriver-Dashboard";
-for (const line of readFileSync(repoRoot + "/.env.local", "utf8").split(/\r?\n/)) {
-  const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line); if (!m) continue;
-  let v = m[2].trim(); if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-  if (process.env[m[1]] === undefined) process.env[m[1]] = v;
-}
-process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
 
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { makeSupabaseSourceStore, makeDataDoeAdapter } = await import("../../lib/server/sync/source-sync-driver.js");

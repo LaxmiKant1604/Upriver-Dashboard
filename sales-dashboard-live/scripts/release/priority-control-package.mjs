@@ -10,20 +10,14 @@
 // advisory-locked transaction with exact PRE and POST assertions -- any failure ROLLS BACK the whole package.
 // The default (no flag) is a DRY RUN that writes nothing.
 
-import { readFileSync } from "node:fs";
 import pg from "pg";
+import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { runControlPackageCli, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } from "../../lib/server/sync/source-priority-control-package.js";
 import { CONTROLLED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../../lib/server/datadoe-connections.js";
 import { fetchAccounts as fetchDataDoeAccounts } from "../../lib/server/datadoe.js";
 
-const repoRoot = "C:/Users/laxmi/Documents/Codex/2026-07-01/can/Upriver-Dashboard";
-for (const line of readFileSync(repoRoot + "/.env.local", "utf8").split(/\r?\n/)) {
-  const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line); if (!m) continue;
-  let v = m[2].trim(); if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-  if (process.env[m[1]] === undefined) process.env[m[1]] = v;
-}
-process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
 
 const MODE = process.argv.includes("--apply") ? "apply" : process.argv.includes("--rollback") ? "rollback" : "dry-run";
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";

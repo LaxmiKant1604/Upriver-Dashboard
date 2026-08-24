@@ -159,6 +159,29 @@ test("P2c. the operation is versioned to priority-dashboards/v2 (a DISTINCT rese
   assert.ok(!reservation._rows.has("priority-dashboards/v1"), "the guard NEVER touches the v1 reservation");
 });
 
+test("P2d. the Catalog operation key is validated STRICTLY: default v2 OR scheduled/YYYY-MM-DD (real date); every other shape fails closed", () => {
+  const { assertPriorityOperationKey, PRIORITY_DASHBOARDS } = priorityMod;
+  // ACCEPTED
+  assert.equal(assertPriorityOperationKey("priority-dashboards/v2"), "priority-dashboards/v2");
+  assert.equal(assertPriorityOperationKey(PRIORITY_DASHBOARDS.operationKey), PRIORITY_DASHBOARDS.operationKey);
+  assert.equal(assertPriorityOperationKey("priority-dashboards/scheduled/2026-08-24"), "priority-dashboards/scheduled/2026-08-24");
+  assert.equal(assertPriorityOperationKey("priority-dashboards/scheduled/2024-02-29"), "priority-dashboards/scheduled/2024-02-29"); // real leap day
+  // REJECTED: unknown versions, wrong prefix, impossible / malformed dates, trailing junk, whitespace
+  for (const bad of [
+    "", "priority-dashboards/v1", "priority-dashboards/v3", "priority-dashboards", "priority-dashboards/scheduled",
+    "priority-dashboards/scheduled/", "priority-dashboards/scheduled/2026-8-4", "priority-dashboards/scheduled/2026-13-01",
+    "priority-dashboards/scheduled/2026-02-30", "priority-dashboards/scheduled/2026-00-10", "priority-dashboards/scheduled/2023-02-29",
+    "priority-dashboards/scheduled/2026-08-24/x", "priority-dashboards/scheduled/2026-08-24 ", " priority-dashboards/v2",
+    "PRIORITY-DASHBOARDS/SCHEDULED/2026-08-24", "priority-dashboards/scheduled/26-08-24",
+  ]) {
+    assert.throws(() => assertPriorityOperationKey(bad), /PRIORITY_OPERATION_KEY_INVALID/, "must reject " + JSON.stringify(bad));
+  }
+  // the release builder validates the key at BUILD: default + scheduled build; junk throws before any run.
+  makeRelease({ operationKey: "priority-dashboards/scheduled/2026-08-24" });
+  makeRelease({}); // default v2
+  assert.throws(() => makeRelease({ operationKey: "priority-dashboards/scheduled/nope" }), /PRIORITY_OPERATION_KEY_INVALID/);
+});
+
 /* ===================== P3. the bucket PLAN emits zero OLI/FBA jobs, one Catalog job ===================== */
 group("P3. plan for all 30 covered accounts: zero OLI/FBA exports, one org-scoped Catalog export per bucket");
 
@@ -246,6 +269,7 @@ function makeRelease(over = {}) {
     listReportJobs: over.listReportJobs || (async () => over.repJobs || []),
     getCycleByBucketDate: over.getCycleByBucketDate || (async () => over.cycle || null),
     asOfOverride: over.asOfOverride,
+    operationKey: over.operationKey,
   });
 }
 
@@ -328,6 +352,58 @@ test("P4b6. a terminal cycle with a BAD durable scope is STILL refused (idempote
   assert.equal(res.reason, "report-job-count", "a terminal-but-incomplete cycle is refused, never rubber-stamped");
 });
 
+// A SCHEDULED cycle: ONE org-scoped WARM catalog + OLI batch job(s) whose per-account owners EXACTLY cover the
+// discovered accounts. schedBase has two discovered accounts so a batch of 2 is meaningful.
+const schedBase = {
+  accounts: [{ accountId: "A01" }, { accountId: "A02" }], today: TODAY,
+  cycle: { id: "cyc", bucket: "us", status: "running", trigger: "manual" },
+  repJobs: repJobsFor(["A01", "A02"]),
+  finalizeResp: { disposition: "finalized", cycle: { status: "succeeded" } },
+  reservationRow: XBUCKET_RESV,
+};
+const SCHED_SRC = [
+  { source_key: CATALOG, request_hash: "cat-hash", fetch_status: "succeeded", create_export_count: 0, cache_object_path: "source-cache/v2/cat-hash.json" },
+  { source_key: OLI, request_hash: "oli-hash", fetch_status: "succeeded", create_export_count: 1 },
+];
+const SCHED_OWNERS = [
+  { request_hash: "cat-hash", account_id: ORG },
+  { request_hash: "oli-hash", account_id: "A01" },
+  { request_hash: "oli-hash", account_id: "A02" },
+];
+
+test("P4b7. SCHEDULED finalize ACCEPTS an OLI+Catalog cycle: succeeded OLI batch(es) whose owners EXACTLY cover the discovered accounts + the ONE org Catalog job", async () => {
+  const res = await makeRelease({ ...schedBase, srcJobs: SCHED_SRC, owners: SCHED_OWNERS }).finalizeBucket("us");
+  assert.equal(res.disposition, "finalized", "OLI+Catalog scheduled cycle finalizes");
+  assert.deepEqual(res.accounts, ["A01", "A02"]);
+  // catalog-only cycle still ACCEPTS (initial go-live behavior preserved -- no OLI jobs).
+  const res2 = await makeRelease({ ...finBase, srcJobs: CAT_JOB_WARM, reservationRow: XBUCKET_RESV }).finalizeBucket("us");
+  assert.equal(res2.disposition, "finalized", "catalog-only cycle still finalizes (go-live behavior preserved)");
+});
+
+test("P4c1. SCHEDULED finalize REJECTS every OLI-scope violation (batch>5, unexpected account, coverage gap, create>1, missing owners, org-scoped owner, blank hash)", async () => {
+  const oli = (over) => ({ source_key: OLI, request_hash: "oli-hash", fetch_status: "succeeded", create_export_count: 1, ...over });
+  const six = ["A01", "A02", "A03", "A04", "A05", "A06"];
+  const cases = [
+    ["OLI batch > 5 sellers", {
+      accounts: six.map((a) => ({ accountId: a })), repJobs: repJobsFor(six),
+      srcJobs: [SCHED_SRC[0], oli({})],
+      owners: [{ request_hash: "cat-hash", account_id: ORG }, ...six.map((a) => ({ request_hash: "oli-hash", account_id: a }))],
+    }, "oli-batch-oversized"],
+    ["OLI owner not a discovered account", { srcJobs: SCHED_SRC, owners: [{ request_hash: "cat-hash", account_id: ORG }, { request_hash: "oli-hash", account_id: "A01" }, { request_hash: "oli-hash", account_id: "A99" }] }, "oli-owner-unexpected"],
+    ["OLI coverage misses a discovered account", { srcJobs: SCHED_SRC, owners: [{ request_hash: "cat-hash", account_id: ORG }, { request_hash: "oli-hash", account_id: "A01" }] }, "oli-owner-coverage-missing"],
+    ["OLI create_export_count > 1", { srcJobs: [SCHED_SRC[0], oli({ create_export_count: 2 })], owners: SCHED_OWNERS }, "oli-create-count"],
+    ["OLI job whose hash has NO owners", { srcJobs: [SCHED_SRC[0], oli({ request_hash: "orphan-hash" })], owners: SCHED_OWNERS }, "oli-owners-missing"],
+    ["OLI owner is the ORG scope key (must be per-account)", { srcJobs: SCHED_SRC, owners: [{ request_hash: "cat-hash", account_id: ORG }, { request_hash: "oli-hash", account_id: ORG }, { request_hash: "oli-hash", account_id: "A02" }] }, "oli-owner-org-scope"],
+    ["OLI job with a blank request hash", { srcJobs: [SCHED_SRC[0], oli({ request_hash: "" })], owners: SCHED_OWNERS }, "oli-hash-blank"],
+    ["an OLI job that is NOT succeeded", { srcJobs: [SCHED_SRC[0], oli({ fetch_status: "pending" })], owners: SCHED_OWNERS }, "source-job-not-succeeded"],
+  ];
+  for (const [name, over, reason] of cases) {
+    const res = await makeRelease({ ...schedBase, ...over }).finalizeBucket("us");
+    assert.equal(res.disposition, "refused", name + " must refuse (got " + JSON.stringify(res) + ")");
+    assert.equal(res.reason, reason, name + " reason");
+  }
+});
+
 test("P4c. finalizeBucket REFUSES every unrelated / open / malformed / mis-scoped / ambiguous-token condition", async () => {
   const base = { ...finBase, srcJobs: CAT_JOB_COLD, reservedHash: "cat-hash" };
   const cases = [
@@ -336,8 +412,10 @@ test("P4c. finalizeBucket REFUSES every unrelated / open / malformed / mis-scope
     ["cycle bucket mismatch", { cycle: { id: "cyc", bucket: "non-us", status: "running", trigger: "manual" } }, "cycle-bucket-mismatch"],
     ["cycle not running", { cycle: { id: "cyc", bucket: "us", status: "pending", trigger: "manual" } }, "cycle-not-running"],
     ["cycle not manual", { cycle: { id: "cyc", bucket: "us", status: "running", trigger: "scheduled" } }, "cycle-not-manual"],
-    ["source job count != 1", { srcJobs: CAT_JOB_COLD.concat(CAT_JOB_COLD) }, "source-job-count"],
-    ["source not catalog", { srcJobs: [{ source_key: OLI, request_hash: "cat-hash", fetch_status: "succeeded", create_export_count: 1 }] }, "source-job-not-catalog"],
+    ["zero source jobs", { srcJobs: [] }, "source-job-count"],
+    ["two catalog jobs", { srcJobs: CAT_JOB_COLD.concat(CAT_JOB_COLD) }, "catalog-job-count"],
+    ["no catalog job (only OLI)", { srcJobs: [{ source_key: OLI, request_hash: "oli-hash", fetch_status: "succeeded", create_export_count: 1 }] }, "catalog-job-count"],
+    ["an UNRELATED source key (ads) beside the catalog", { srcJobs: CAT_JOB_COLD.concat([{ source_key: "ads-campaign-date", request_hash: "ads-hash", fetch_status: "succeeded", create_export_count: 0 }]) }, "unrelated-source-job"],
     ["source not succeeded", { srcJobs: [{ source_key: CATALOG, request_hash: "cat-hash", fetch_status: "pending", create_export_count: 1 }] }, "source-job-not-succeeded"],
     ["catalog not org scope", { owners: [{ request_hash: "cat-hash", account_id: "A01" }] }, "catalog-not-org-scope"],
     // COLD (create_export_count=1) token/reservation coherence:

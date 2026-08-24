@@ -1,0 +1,111 @@
+name: scheduler-v2
+
+# THE ONE authoritative automatic scheduler for Daily Reporting + Brand View (Scheduler v2).
+#
+# Why GitHub Actions (and NOT pg_cron / Vercel cron): the full source-refresh + derive + publish workflow far
+# exceeds Vercel's 60s function limit, so it runs here as a long CI job against production Postgres / Supabase /
+# DataDoe using repository secrets. GitHub Actions is the SOLE timing authority for this pipeline.
+#
+# Two daily runs (one bucket each), plus a manual dispatch for controlled operator runs:
+#   - non-us @ 02:00 UTC (07:30 IST): refresh canonical OLI for Non-US ONLY.
+#   - us     @ 10:30 UTC (16:00 IST): refresh canonical OLI for US, THEN derive + publish Daily Reporting +
+#     Brand View for ALL 30 accounts (both buckets) behind the reviewed publication controls, ALWAYS safe-closing
+#     the controls afterward (including on failure).
+#
+# Required repository secrets (never printed):
+#   POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY
+#   DATADOE_API_KEY_SECONDARY (optional -- only if a secondary connection is configured)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"    # non-us  02:00 UTC / 07:30 IST
+    - cron: "30 10 * * *"  # us      10:30 UTC / 16:00 IST
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Bucket to run (us | non-us). us also derives + publishes all 30 accounts."
+        required: true
+        default: "non-us"
+
+# One scheduler at a time: scheduled and manual runs serialize and never overlap.
+concurrency:
+  group: scheduler-v2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+
+      - name: Resolve bucket + asOf (previous UTC date)
+        id: cfg
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            bucket="${{ github.event.inputs.bucket }}"
+          elif [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
+            bucket="non-us"
+          elif [ "${{ github.event.schedule }}" = "30 10 * * *" ]; then
+            bucket="us"
+          else
+            echo "Unrecognized trigger (event=${{ github.event_name }} schedule=${{ github.event.schedule }})." >&2
+            exit 1
+          fi
+          if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then
+            echo "Invalid bucket '$bucket'." >&2; exit 1
+          fi
+          asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "asof=$asof" >> "$GITHUB_OUTPUT"
+          echo "Resolved bucket=$bucket asOf=$asof (UTC previous date)"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Refresh canonical OLI (this bucket only)
+        run: node scripts/release/scheduled-oli-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
+
+      # The US run alone derives + publishes all 30 accounts (Non-US OLI was refreshed by the 02:00 run). It opens
+      # the reviewed publication controls, runs the priority release under the date-scoped Catalog operation key,
+      # and ALWAYS safe-closes the controls afterward.
+      - name: Open publication controls (us run only)
+        if: steps.cfg.outputs.bucket == 'us'
+        run: node scripts/release/priority-control-package.mjs --apply
+
+      - name: Derive + publish Daily Reporting + Brand View for all 30 accounts (us run only)
+        if: steps.cfg.outputs.bucket == 'us'
+        run: node scripts/release/priority-dashboards-release.mjs --as-of=${{ steps.cfg.outputs.asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }}
+
+      - name: Safe-close publication controls (ALWAYS, us run only)
+        if: always() && steps.cfg.outputs.bucket == 'us'
+        run: node scripts/release/priority-control-package.mjs --rollback

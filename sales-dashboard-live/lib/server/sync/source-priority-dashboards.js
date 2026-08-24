@@ -21,7 +21,8 @@
 import { buildBucketSourceSyncRuntime } from "./source-bucket-sync-runtime.js";
 import { makeDataDoeAdapter, makeSupabaseSourceStore } from "./source-sync-driver.js";
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
-import { ORGANIZATION_SCOPE_KEY } from "./source-durable-model.js";
+import { ORGANIZATION_SCOPE_KEY, OLI_SOURCE_KEY } from "./source-durable-model.js";
+import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { getSyncReportJobs, getSyncCycleByBucketDate, reservePriorityCatalogCreate, recordPriorityCatalogExport, getPriorityCatalogReservation } from "../supabase.js";
 
 // FROZEN scope. Never overridable from an HTTP body / card action / scheduler.
@@ -60,6 +61,32 @@ export function assertPriorityPublishReportKey(reportKey) {
     throw new Error(`PRIORITY_PUBLISH_FORBIDDEN: the priority dashboards path publishes ONLY ${PRIORITY_DASHBOARDS.reportKeys.join(" + ")} (got "${rk}"); refusing (fail closed).`);
   }
   return rk;
+}
+
+// The date-scoped operation key for an AUTOMATIC scheduled run. Each scheduled DATE gets its own reservation, so
+// one calendar date authorizes at most ONE Catalog create across US + Non-US (the second bucket adopts the same
+// export for zero tokens; a different canonical Catalog hash for the same key fails closed in the guard).
+export const SCHEDULED_OPERATION_KEY_PREFIX = "priority-dashboards/scheduled/";
+const SCHEDULED_OPERATION_KEY_RE = /^priority-dashboards\/scheduled\/(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Validate a caller-supplied Catalog operation key. ONLY two shapes are ever accepted:
+ *   - the default historical key `priority-dashboards/v2` (the initial go-live reservation); OR
+ *   - the scheduled key `priority-dashboards/scheduled/YYYY-MM-DD` with a REAL calendar date.
+ * Every other shape (blank, unknown prefix, malformed / impossible date, trailing junk) fails closed. Returns the
+ * exact key on success.
+ */
+export function assertPriorityOperationKey(operationKey) {
+  const k = S(operationKey);
+  if (k === PRIORITY_DASHBOARDS.operationKey) return k;
+  const m = SCHEDULED_OPERATION_KEY_RE.exec(k);
+  if (m) {
+    const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
+    const dt = new Date(Date.UTC(y, mo - 1, d));
+    if (dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d) return k;
+    throw new Error(`PRIORITY_OPERATION_KEY_INVALID: "${k}" is not a real calendar date (fail closed).`);
+  }
+  throw new Error(`PRIORITY_OPERATION_KEY_INVALID: operationKey must be "${PRIORITY_DASHBOARDS.operationKey}" or "${SCHEDULED_OPERATION_KEY_PREFIX}YYYY-MM-DD" (got "${k}"); refusing (fail closed).`);
 }
 
 /**
@@ -157,6 +184,10 @@ export function buildPriorityDashboardsRelease({
   // day, derive up to that day (no new OLI fetch). null => clock today-1. Validated (fail closed on a malformed
   // value); bound at BUILD time onto the priority runtime, so the cycle date stays clock-today.
   asOfOverride = null,
+  // The Catalog reservation operation key. Default = the historical v2 key (initial go-live). An AUTOMATIC
+  // scheduled run passes "priority-dashboards/scheduled/YYYY-MM-DD" so each date owns its one-Catalog-create
+  // reservation. Validated STRICTLY (any other shape fails closed).
+  operationKey = PRIORITY_DASHBOARDS.operationKey,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
   if (asOfOverride != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(asOfOverride))) throw new Error("buildPriorityDashboardsRelease asOfOverride must be a YYYY-MM-DD date (fail closed).");
@@ -164,7 +195,7 @@ export function buildPriorityDashboardsRelease({
   if (typeof buildPublisher !== "function") throw new Error("buildPriorityDashboardsRelease requires buildPublisher (fail closed).");
   if (typeof listReportJobs !== "function") throw new Error("buildPriorityDashboardsRelease requires listReportJobs (fail closed).");
   if (typeof getCycleByBucketDate !== "function") throw new Error("buildPriorityDashboardsRelease requires getCycleByBucketDate (fail closed).");
-  const operationKey = PRIORITY_DASHBOARDS.operationKey;
+  assertPriorityOperationKey(operationKey); // validate the reservation operation key (default v2 | scheduled/YYYY-MM-DD)
   const REPORT_SET = new Set(PRIORITY_DASHBOARDS.reportKeys);
 
   // priorityMode is bound at BUILD time; the guarded adapter enforces the durable one-Catalog-export ceiling.
@@ -214,6 +245,7 @@ export function buildPriorityDashboardsRelease({
     const preflight = await runtime.preflightEvidence({ bucket, deadline });
     const expected = [...new Set((preflight.accounts || []).map((a) => S(a.accountId)).filter(nb))].sort();
     if (!expected.length) return refuse("no-discovered-accounts");
+    const expectedSet = new Set(expected);
     const cycleDate = S(preflight.today);
     if (!nb(cycleDate)) return refuse("no-cycle-date");
 
@@ -229,17 +261,55 @@ export function buildPriorityDashboardsRelease({
     if (S(cycle.trigger) !== "manual") return refuse("cycle-not-manual", S(cycle.trigger));
     const cycleId = S(cycle.id);
 
-    // (3) source jobs: EXACTLY ONE product-catalog job, succeeded, ORGANIZATION scope.
+    // (3) source jobs: EXACTLY ONE org-scoped succeeded product-catalog job, PLUS zero-or-more succeeded
+    // order-line-items jobs (a SCHEDULED cycle refreshes OLI first; the initial catalog-only go-live has none).
+    // NO other source key may appear -- Ads/FBA/any unrelated family is refused. Every job must be succeeded.
     const srcJobs = await store.listSourceJobs(cycleId);
-    if (!Array.isArray(srcJobs) || srcJobs.length !== 1) return refuse("source-job-count", String(Array.isArray(srcJobs) ? srcJobs.length : "na"));
-    const cj = srcJobs[0];
-    if (S(cj.source_key ?? cj.sourceKey) !== PRIORITY_DASHBOARDS.catalogSourceKey) return refuse("source-job-not-catalog");
-    if (S(cj.fetch_status ?? cj.fetchStatus) !== "succeeded") return refuse("source-job-not-succeeded");
+    if (!Array.isArray(srcJobs) || srcJobs.length < 1) return refuse("source-job-count", String(Array.isArray(srcJobs) ? srcJobs.length : "na"));
+    const CATALOG_KEY = PRIORITY_DASHBOARDS.catalogSourceKey;
+    for (const j of srcJobs) {
+      const sk = S(j.source_key ?? j.sourceKey);
+      if (sk !== CATALOG_KEY && sk !== OLI_SOURCE_KEY) return refuse("unrelated-source-job", sk);
+      if (S(j.fetch_status ?? j.fetchStatus) !== "succeeded") return refuse("source-job-not-succeeded");
+    }
+    const catalogJobs = srcJobs.filter((j) => S(j.source_key ?? j.sourceKey) === CATALOG_KEY);
+    const oliJobs = srcJobs.filter((j) => S(j.source_key ?? j.sourceKey) === OLI_SOURCE_KEY);
+    if (catalogJobs.length !== 1) return refuse("catalog-job-count", String(catalogJobs.length));
+    const cj = catalogJobs[0];
     const catalogHash = S(cj.request_hash ?? cj.requestHash);
     if (!nb(catalogHash)) return refuse("catalog-hash-blank");
-    const owners = await store.listCycleOwners(cycleId);
-    const catOwners = (Array.isArray(owners) ? owners : []).filter((o) => S(o.request_hash ?? o.requestHash) === catalogHash);
+    const ownersRaw = await store.listCycleOwners(cycleId);
+    const owners = Array.isArray(ownersRaw) ? ownersRaw : [];
+    const catOwners = owners.filter((o) => S(o.request_hash ?? o.requestHash) === catalogHash);
     if (catOwners.length !== 1 || S(catOwners[0].account_id ?? catOwners[0].accountId) !== ORGANIZATION_SCOPE_KEY) return refuse("catalog-not-org-scope");
+
+    // (3b) OLI jobs (scheduled cycle only): each create<=1, batch<=5 (owner count), owners are per-ACCOUNT (never
+    // org scope), every OLI owner is a DISCOVERED account, and the OLI owner union EXACTLY covers the discovered
+    // bucket accounts (no missing/extra). This proves the scheduled OLI refresh stayed inside the bucket's scope
+    // and its token/create ceiling, without weakening any Catalog proof above.
+    if (oliJobs.length) {
+      const ownersByHash = new Map();
+      for (const o of owners) {
+        const h = S(o.request_hash ?? o.requestHash);
+        if (!ownersByHash.has(h)) ownersByHash.set(h, []);
+        ownersByHash.get(h).push(S(o.account_id ?? o.accountId));
+      }
+      const oliOwnerUnion = new Set();
+      for (const j of oliJobs) {
+        if (Number(j.create_export_count ?? j.createExportCount) > 1) return refuse("oli-create-count", S(j.create_export_count ?? j.createExportCount));
+        const h = S(j.request_hash ?? j.requestHash);
+        if (!nb(h)) return refuse("oli-hash-blank");
+        const jobOwners = ownersByHash.get(h) || [];
+        if (!jobOwners.length) return refuse("oli-owners-missing");
+        if (jobOwners.length > MAX_ACCOUNTS_PER_BATCH) return refuse("oli-batch-oversized", String(jobOwners.length));
+        for (const a of jobOwners) {
+          if (a === ORGANIZATION_SCOPE_KEY) return refuse("oli-owner-org-scope");
+          if (!expectedSet.has(a)) return refuse("oli-owner-unexpected", a);
+          oliOwnerUnion.add(a);
+        }
+      }
+      for (const a of expected) if (!oliOwnerUnion.has(a)) return refuse("oli-owner-coverage-missing", a);
+    }
 
     // (4) TOKEN/RESERVATION coherence with the Catalog job's create_export_count -- CROSS-BUCKET aware. The one
     // org-scoped Catalog export is shared by BOTH buckets against ONE operation-wide reservation, so a bucket
@@ -283,7 +353,6 @@ export function buildPriorityDashboardsRelease({
     const repJobs = await listReportJobs(cycleId);
     if (!Array.isArray(repJobs)) return refuse("report-jobs-unavailable");
     const seen = new Set();
-    const expectedSet = new Set(expected);
     for (const j of repJobs) {
       const rk = S(j.report_key ?? j.reportKey);
       if (!REPORT_SET.has(rk)) return refuse("unrelated-report-job", rk);

@@ -10,14 +10,19 @@
 // the drift, records intentional-state evidence, and only THEN (separately) updates pins/invariants + regenerates
 // the stage-8 baseline at the final reviewed HEAD.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import pg from "pg";
+import { REPO_ROOT } from "./env-bootstrap.mjs";
 import { validateIdentity, PROTECTED_DIGESTS } from "./release-manifest.mjs";
 import { beginReadOnlySnapshot, captureProtectedDigest, classifyProtectedDrift } from "./release-state.mjs";
 import { parseEnv } from "./release-fs.mjs";
 
-const repoRoot = "C:/Users/laxmi/Documents/Codex/2026-07-01/can/Upriver-Dashboard";
-const env = parseEnv(readFileSync(repoRoot + "/.env.local", "utf8"));
+// Portable: resolve <repoRoot>/.env.local from the module location; load it only when present; CI-supplied
+// process.env wins over the file; fill SUPABASE_URL from VITE_SUPABASE_URL when absent.
+const envPath = resolve(REPO_ROOT, ".env.local");
+const env = { ...(existsSync(envPath) ? parseEnv(readFileSync(envPath, "utf8")) : {}), ...process.env };
+if (!env.SUPABASE_URL && env.VITE_SUPABASE_URL) env.SUPABASE_URL = env.VITE_SUPABASE_URL;
 const id = validateIdentity(env);
 console.log(`IDENTITY  approved_ref=${id.projectRef} supabase_host=${id.supaHost} postgres_host=${id.pgHost} ok=${id.ok}`);
 if (!id.ok) { console.error("STOP identity: " + id.problems.join("; ")); process.exit(1); }

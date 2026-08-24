@@ -1,0 +1,79 @@
+// TRUSTED, DEFERRED scheduled OLI (order-line-items) refresh operator for ONE bucket.
+// Usage (run from sales-dashboard-live/, in the reviewed GitHub Actions scheduler):
+//   node scripts/release/scheduled-oli-refresh.mjs --bucket=us|non-us [--as-of=YYYY-MM-DD]
+//
+// It refreshes the durable canonical OLI history for exactly ONE bucket and NOTHING else:
+//   - builds the REAL production source runtime with a LONG operator deadline (this is a 90-min CI job, not a
+//     60s Vercel route), runs its preflight ONCE and reuses the memoized evidence;
+//   - executes ONLY the order-line-items family through runSourceCardAction (one family at a time), resuming
+//     bounded on the SAME cycle until the family is drained (open === 0);
+//   - then PROVES (assessScheduledOliCycle) the outcome: every job is OLI + succeeded, owner-scoped to the exact
+//     discovered primary accounts, create_export_count <= 1, batch <= 5 sellers, and creates/tokens within the
+//     per-bucket ceiling (US 2 batches/4 tokens, Non-US 5 batches/10 tokens);
+//   - exits NONZERO on any failed / open / ambiguous / deadline-exhausted outcome.
+// It NEVER runs Catalog/Ads/FBA/any other family, NEVER derives or publishes a report, NEVER touches controls,
+// and NEVER prints a seller/account/export id (only counts + an 8-char cycle prefix).
+
+import { loadReleaseEnv } from "./env-bootstrap.mjs";
+
+loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
+
+const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
+const bucket = argOf("bucket");
+const asOf = argOf("as-of");
+if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
+if (asOf != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
+
+const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
+const { getSyncSourceJobs, getSyncSourceJobOwnersForCycle } = await import("../../lib/server/supabase.js");
+const { OLI_SOURCE_KEY } = await import("../../lib/server/sync/source-durable-model.js");
+const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
+
+const OLI = OLI_SOURCE_KEY;
+// A LONG operator deadline for the CI job (the workflow allots >=90 min); overridable for tests/ops. MAX_ITERS is
+// a hard backstop so a stuck family can never loop forever -- the assessment still fails closed on open>0.
+const BUDGET_MS = Number(process.env.SCHEDULED_OLI_BUDGET_MS || 80 * 60 * 1000);
+const MAX_ITERS = Number(process.env.SCHEDULED_OLI_MAX_ITERS || 200);
+const log = (m) => console.log("scheduled-oli[" + bucket + (asOf ? "@" + asOf : "") + "]: " + m);
+const isOpen = (j) => { const st = j.fetch_status ?? j.fetchStatus; return st === "pending" || st === "attempted"; };
+const oliOpenCount = (jobs) => jobs.filter((j) => (j.source_key ?? j.sourceKey) === OLI && isOpen(j)).length;
+
+const runtime = buildBucketSourceSyncRuntime({ budgetMs: BUDGET_MS, asOfOverride: asOf });
+const deadline = runtime.makeDeadline();
+const outOfTime = () => (deadline && typeof deadline.outOfTime === "function" ? deadline.outOfTime() : false);
+const preflight = await runtime.preflightEvidence({ bucket, sourceKey: OLI, deadline });
+const discovered = (preflight.accounts || [])
+  .map((a) => ({ accountId: String(a.accountId) }))
+  .filter((a) => a.accountId && !a.accountId.includes(":"));
+if (!discovered.length) { console.error("STOP no discovered primary accounts for bucket " + bucket); process.exit(1); }
+log("preflight ok: " + discovered.length + " primary accounts; running order-line-items only");
+
+let cycleId = null;
+let iter = 0;
+let prevOpen = Infinity;
+let stall = 0;
+while (iter < MAX_ITERS) {
+  iter += 1;
+  const res = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, deadline, preflight });
+  if (res && res.refused === true) { console.error("STOP runSourceCardAction refused: " + (res.code || "unknown")); process.exit(1); }
+  cycleId = (res && res.cycleId) || cycleId;
+  if (!cycleId) { console.error("STOP no cycle id after runSourceCardAction (nothing planned)"); process.exit(1); }
+  const jobs = await getSyncSourceJobs(cycleId);
+  const open = oliOpenCount(jobs);
+  log("iter " + iter + ": cycle=" + String(cycleId).slice(0, 8) + " oli_open=" + open);
+  if (open === 0) break;
+  if (outOfTime()) { log("operator deadline reached with open=" + open); break; }
+  stall = open >= prevOpen ? stall + 1 : 0;
+  prevOpen = open;
+  if (stall >= 2) { log("no progress for 2 consecutive resumptions; stopping"); break; }
+}
+
+const jobs = await getSyncSourceJobs(cycleId);
+const oliJobs = jobs.filter((j) => (j.source_key ?? j.sourceKey) === OLI);
+const owners = await getSyncSourceJobOwnersForCycle(cycleId);
+const open = oliOpenCount(jobs);
+const a = assessScheduledOliCycle({ bucket, discoveredAccounts: discovered, sourceJobs: oliJobs, owners, open });
+log("assessment: drained_open=" + open + " batches=" + a.batches + " creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok);
+if (!a.ok) { console.error("STOP scheduled OLI assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
+log("DRAINED + PROVEN: " + discovered.length + " accounts across " + a.batches + " OLI batches; " + a.creates + " creates / " + a.tokens + " tokens (ceiling " + a.ceilingCreates + "/" + a.ceilingTokens + ").");
+process.exit(0);

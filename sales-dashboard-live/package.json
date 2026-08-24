@@ -31,6 +31,7 @@
     "test:zero-export-rehearsal": "node scripts/zero-export-rehearsal.test.js",
     "test:source-production-hardening": "node scripts/source-production-hardening.test.js",
     "test:source-priority-dashboards": "node scripts/source-priority-dashboards.test.js",
+    "test:scheduler-automation": "node scripts/scheduler-v2-automation.test.js",
     "test:durable-live-parity": "node scripts/durable-live-parity.test.js",
     "test:schema-contract-mutation": "node scripts/schema-contract-mutation.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",

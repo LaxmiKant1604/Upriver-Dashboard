@@ -149,11 +149,12 @@ test("C6. completion-anchored >=60s cooldown -- never a blind offset", () => {
 
 group("D. inertness (nothing wired, nothing enabled, no timers)");
 
-test("D1. NO cron anywhere: vercel.json has no crons; the GitHub workflow has no schedule; api/cron never imports the schedule", () => {
+test("D1. the APP stays inert: vercel.json has no crons and NO api/cron route wires the schedule or the bucket sync (timing is EXTERNAL -- GitHub Actions only)", () => {
   const vercel = JSON.parse(readFileSync(path.join(process.cwd(), "vercel.json"), "utf8"));
   assert.equal((vercel.crons || []).length, 0, "vercel.json registers no cron");
-  const workflow = readFileSync(path.join(process.cwd(), "..", ".github", "workflows", "scheduled-sync.yml"), "utf8");
-  assert.doesNotMatch(workflow, /^\s*schedule\s*:/m, "the GitHub workflow stays manual-only");
+  // The ONLY scheduler is the external GitHub Actions workflow (scheduler-v2.yml), which runs the reviewed CLI
+  // operators directly -- NEVER an in-app timer or a Vercel/api route. So the app itself must stay inert: no
+  // api/cron route wires the durable schedule or the bucket sync.
   const cronDir = path.join(process.cwd(), "api", "cron");
   for (const file of readdirSync(cronDir)) {
     const src = readFileSync(path.join(cronDir, file), "utf8");

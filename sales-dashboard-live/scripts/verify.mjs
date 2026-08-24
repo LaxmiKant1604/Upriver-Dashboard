@@ -52,6 +52,7 @@ const SUITES = [
   "test:zero-export-rehearsal",
   "test:source-production-hardening",
   "test:source-priority-dashboards",
+  "test:scheduler-automation",
   "test:durable-live-parity",
   "test:schema-contract-mutation",
   "test:report-sync-controls",

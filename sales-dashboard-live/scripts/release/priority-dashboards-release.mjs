@@ -9,16 +9,10 @@
 // ordered publish (brand-sales before brand-inventory), and a live-identity read-back with the frontend payload
 // contract. It exits NONZERO on every derive/finalize/publish disposition except a proven success.
 
-import { readFileSync } from "node:fs";
 import pg from "pg";
+import { loadReleaseEnv } from "./env-bootstrap.mjs";
 
-const repoRoot = "C:/Users/laxmi/Documents/Codex/2026-07-01/can/Upriver-Dashboard";
-for (const line of readFileSync(repoRoot + "/.env.local", "utf8").split(/\r?\n/)) {
-  const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line); if (!m) continue;
-  let v = m[2].trim(); if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-  if (process.env[m[1]] === undefined) process.env[m[1]] = v;
-}
-process.env.SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
 
 const { buildPriorityDashboardsRelease, PRIORITY_DASHBOARDS } = await import("../../lib/server/sync/source-priority-dashboards.js");
 const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
@@ -32,7 +26,15 @@ const sb = await import("../../lib/server/supabase.js");
 const asOfArg = (process.argv.find((a) => a.startsWith("--as-of=")) || "").split("=")[1] || null;
 if (asOfArg != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOfArg)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOfArg + ")"); process.exit(2); }
 if (asOfArg) console.log("priority-release: asOf pinned to " + asOfArg + " (derive window; cycle date stays clock-today).");
-const release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg });
+// Optional --operation-key: the Catalog reservation key. Default = the historical v2 go-live key; an AUTOMATIC
+// scheduled run passes "priority-dashboards/scheduled/YYYY-MM-DD" so each date owns its one-Catalog-create
+// reservation. buildPriorityDashboardsRelease validates it STRICTLY (any other shape fails closed).
+const opKeyArg = (process.argv.find((a) => a.startsWith("--operation-key=")) || "").split("=").slice(1).join("=") || null;
+if (opKeyArg) console.log("priority-release: catalog operation key = " + opKeyArg);
+let release;
+try {
+  release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg, ...(opKeyArg ? { operationKey: opKeyArg } : {}) });
+} catch (e) { console.error("STOP " + (e && e.message ? e.message : e)); process.exit(2); }
 
 // A dedicated read-only pg client for the cron proof (never mutates).
 const pgBase = String(process.env.POSTGRES_URL).split("?")[0];
