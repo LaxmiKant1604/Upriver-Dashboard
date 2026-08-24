@@ -11215,3 +11215,36 @@ UNCHANGED (daf1997a...). Commit 3bbda36 (code/tests) + docs separate. NEXT: prod
 (read-only stage-8 reconcile -> apply Migration 9 -> push+deploy -> token/cache gate -> apply controls -> run
 priority release -> live+frontend verify -> safe-close). Requires production DB/DataDoe access from the run
 environment.
+
+## GO-LIVE ATTEMPT -- Migration 9 APPLIED + deployed; release BLOCKED by live-DataDoe Catalog HTTP 400 -- 2026-08-24 (production now STAGE 9; NO tokens spent; NO data published; LKG intact; controls safe-closed)
+
+Executed the production go-live sequence after the round-6 offline green. Landed permanently:
+- Read-only stage-8 reconcile: identity approved_ref cfmfunptwuwhcayajsrj OK; 7/8 protected digests EXACT; the
+  one drift (sync_cycles 17->21) classified benign (all trigger=manual, zero cron; authorized recovery/proof
+  cycles) and the manifest pin re-anchored (commit 23999ef).
+- Migration 9 (20260825_priority_catalog_reservation, frozen SHA daf1997a...): the FIRST apply EXECUTED then
+  correctly fail-closed ROLLBACK on a created_coherent CHECK constraint canon mismatch (the manifest's best-effort
+  canon stripped the string-literal quotes pg preserves). Corrected the canon (commit 110a99a; SQL + SHA
+  UNCHANGED). Re-apply COMMITTED (stage 8 -> 9). ro-prod-check 9 OK: the reservation table + reserve/record RPCs +
+  constraints (operation-wide PK, immutable hash, tokens in {0,2}, created_coherent) + ACLs/RLS/policies/ownership
+  all present; the 8 protected digests UNCHANGED (no customer data altered).
+- Pushed main once (54aa4a7 -> 110a99a); Vercel production alias upriverdashboard.vercel.app returns HTTP 200
+  (git-integration deploys the pushed commit; /api/datadoe 401 = auth enforced, app initialized).
+- Controls: dry-run discovered 30 primary accounts (8 US + 22 non-US; dd-secondary excluded); applied the guarded
+  transaction (rollout=30, dispatch=daily-reporting+brand-sales, promoted=brand-inventory, 90 audited approvals;
+  all_primary stays false; no cron).
+
+BLOCKED at Phase H: priority-dashboards-release.mjs reconcile ok -> FAILED at derive:us REQUIRED_SOURCE_FAILED.
+The org-scoped Catalog create-export returns HTTP 400 from the LIVE DataDoe API (older attempts TIMEOUT) -- a
+real integration issue the offline fake (F11/F12) never exercised. Catalog request: columns
+[child_asin,parent_asin,product_brand,product_name], org-scoped (no seller ids), from/to date-range-or-null,
+limit 10k-20k, source_id 68d2de238e. NO tokens spent (reservation stuck at status='reserved', tokens_spent=0, no
+export); NO snapshots published; LKG intact.
+
+Recovery: safe-closed the controls (--rollback COMMITTED, audited -- every rollout disabled, all 13 settings
+paused, promoted disabled, all approvals revoked, all_primary false, no cron). TWO blockers remain for a retry:
+(1) fix the live Catalog export HTTP 400/TIMEOUT (capture the 400 body; not reproducible offline); (2) the stuck
+'reserved' operation reservation makes retries AMBIGUOUS and must be reset -- Migration 9 has NO reset RPC by
+design, so a deliberate manual DELETE of the single source_priority_catalog_reservation row (plus, ideally, a
+code fix distinguishing a clean HTTP-400 failure from a commit-unknown) is required first. Scheduler stays OFF.
+See [[scheduler-v2-golive-status]].
