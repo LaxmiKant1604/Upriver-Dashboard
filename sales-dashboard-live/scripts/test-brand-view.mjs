@@ -1457,4 +1457,48 @@ test("an export filename records the account, brand, currency mode and as-of dat
   );
 });
 
+// ---- Portfolio MEMBERSHIP follows brand-sales only; the catalog supplies the selector list (Bebi Born fix) ----
+const { buildBrandAccountMembership, membershipBrandsForAccount, selectorBrandsForAccount, accountsForBrand, normalizeBrandName } = await import("../lib/server/reports/brand-membership.js");
+
+test("membership is brand-sales ONLY (a catalog-only brand pins no account); the SELECTOR unions a complete catalog + brand-sales", () => {
+  // MEMBERSHIP: only brand-sales counts. A complete catalog listing 'Catalog Only' does NOT make the account a member.
+  assert.deepEqual(membershipBrandsForAccount(["Bebi Born", "Sibling Brand"]), ["Bebi Born", "Sibling Brand"]);
+  assert.deepEqual(membershipBrandsForAccount([]), [], "no brand-sales -> no membership (a catalog-only US-style account is excluded)");
+  // SELECTOR: a complete catalog contributes its zero-sale brands, unioned with brand-sales; never replaces.
+  const sel = selectorBrandsForAccount({ catalogStatus: "complete", catalogBrands: ["Catalog Only", "Bebi Born"], salesBrands: ["Bebi Born"] });
+  assert.ok(sel.includes("Catalog Only") && sel.includes("Bebi Born"), "selector = catalog UNION sales");
+  // A non-complete catalog contributes nothing to the selector beyond brand-sales.
+  assert.deepEqual(selectorBrandsForAccount({ catalogStatus: "unavailable", catalogBrands: ["Ignore"], salesBrands: ["Bebi Born"] }), ["Bebi Born"]);
+  // Normalization is a trim (genuinely different brands never merge; casing/spacing preserved).
+  assert.equal(normalizeBrandName("  Bebi Born "), "Bebi Born");
+  assert.equal(normalizeBrandName("   "), null);
+  assert.notEqual(normalizeBrandName("Bebi Born"), normalizeBrandName("Bebi Bornn"));
+});
+
+test("REGRESSION: Bebi Born resolves to EXACTLY the 8 expected countries from brand-sales -- includes IT/ES/UK (sales, stale/absent catalog), EXCLUDES US (catalog-only, no sales)", () => {
+  const EXPECTED = ["BE", "DE", "ES", "FR", "IT", "NL", "PL", "UK"];
+  // Production-shaped: every expected country has Bebi Born in its latest brand-sales. IT/ES have an UNAVAILABLE
+  // catalog; UK a COMPLETE catalog that omits Bebi Born; the rest complete-with-it -- all still members via sales.
+  const perAccount = [
+    { accountId: "acct-BE", salesBrands: ["Bebi Born", "Sibling Brand"] },
+    { accountId: "acct-DE", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-ES", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-FR", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-IT", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-NL", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-PL", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-UK", salesBrands: ["Bebi Born"] },
+    // US: its (org-wide, complete) catalog lists Bebi Born but it has NO Bebi Born SALES -> NOT a member.
+    { accountId: "acct-US", salesBrands: ["Sibling Brand"] },
+    // A never-sells-Bebi-Born account -> no leakage.
+    { accountId: "acct-ZZ", salesBrands: ["Sibling Brand"] },
+  ];
+  const membership = buildBrandAccountMembership(perAccount);
+  const bebiAccounts = accountsForBrand(membership, "Bebi Born");
+  const countries = bebiAccounts.map((a) => a.replace(/^acct-/, "")).sort();
+  assert.deepEqual(countries, EXPECTED, "Bebi Born resolves to EXACTLY BE,DE,ES,FR,IT,NL,PL,UK");
+  assert.ok(!bebiAccounts.includes("acct-US"), "US (catalog-only, no Bebi Born sales) is EXCLUDED");
+  assert.ok(!bebiAccounts.includes("acct-ZZ"), "an account that never sold Bebi Born is not a member (no leakage)");
+});
+
 console.log(`\n${passed} assertions passed${process.exitCode ? " (with failures above)" : ""}`);

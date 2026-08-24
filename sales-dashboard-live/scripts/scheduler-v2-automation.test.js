@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
 import { oliBucketPlan, assessScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
+import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING } from "../lib/server/datadoe-usage.js";
+import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));            // <repo>/sales-dashboard-live/scripts
 const WORKFLOWS_DIR = resolve(HERE, "..", "..", ".github", "workflows");
@@ -103,18 +105,19 @@ test("B4. dd-secondary / colon-scoped accounts are excluded from the primary OLI
   assert.equal(plan.expectedBatches, 1, "only the 3 primary accounts are batched");
 });
 
-test("B5. durable source_controls target: ONLY order-line-items + product-catalog are schedule-enabled + unpaused; every other source is schedule-disabled", () => {
-  const allKeys = ["order-line-items", "product-catalog", "settlements", "returns", "fba-inventory-health", "ads-campaign-date", "listings", "content-changes"];
+test("B5. durable source_controls target: ONLY order-line-items + product-catalog + ads-asin-date are schedule-enabled + unpaused; Campaign Ads / FBA / every other source stays schedule-disabled", () => {
+  const allKeys = ["order-line-items", "product-catalog", "ads-asin-date", "ads-campaign-date", "settlements", "returns", "fba-inventory-health", "listings", "content-changes"];
   const plan = scheduledSourceControlPlan(allKeys);
   const enabled = plan.filter((p) => p.scheduleEnabled === true).map((p) => p.sourceKey).sort();
-  assert.deepEqual(enabled, [...SCHEDULED_ENABLED_SOURCE_KEYS].sort(), "exactly OLI + catalog enabled");
+  assert.deepEqual(enabled, [...SCHEDULED_ENABLED_SOURCE_KEYS].sort(), "exactly OLI + catalog + ASIN Ads enabled");
+  assert.ok(enabled.includes("ads-asin-date"), "ASIN Ads is scheduled");
   for (const p of plan) {
     if (SCHEDULED_ENABLED_SOURCE_KEYS.includes(p.sourceKey)) { assert.equal(p.scheduleEnabled, true); assert.equal(p.paused, false, p.sourceKey + " unpaused"); }
     else { assert.equal(p.scheduleEnabled, false, p.sourceKey + " schedule-disabled"); assert.equal(p.paused, undefined, p.sourceKey + " paused state left untouched"); }
   }
-  // Ads/FBA/settlements/returns are NEVER schedule-enabled by this scheduler.
+  // Campaign Ads / FBA / settlements / returns are NEVER schedule-enabled by this scheduler.
   for (const forbidden of ["ads-campaign-date", "fba-inventory-health", "settlements", "returns"]) {
-    assert.ok(!enabled.includes(forbidden), forbidden + " must never be scheduled");
+    assert.ok(!enabled.includes(forbidden), forbidden + " must never be scheduled (Campaign Ads stays paused)");
   }
 });
 
@@ -179,14 +182,22 @@ test("D1. scheduler-v2.yml pins BOTH daily crons, workflow_dispatch, concurrency
   assert.ok(tm && Number(tm[1]) >= 90, "timeout >= 90 minutes");
 });
 
-test("D2. the US path refreshes OLI, opens controls, publishes under the DATE-SCOPED key, and ALWAYS safe-closes", () => {
+test("D2. workflow shape: token gate BEFORE creates; OLI + ASIN Ads (both buckets); US opens controls, publishes date-scoped, rebuilds membership, and ALWAYS safe-closes", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
+  // Token gate runs before the source refreshes (fail-closed >= 30).
+  assert.match(yml, /confirm-token-budget\.mjs --min=30/, "confirms >= 30 usable tokens before any create");
+  const gateIdx = yml.indexOf("confirm-token-budget.mjs");
+  const oliIdx = yml.indexOf("scheduled-oli-refresh.mjs");
+  const adsIdx = yml.indexOf("scheduled-asin-ads-refresh.mjs");
+  assert.ok(gateIdx > 0 && gateIdx < oliIdx && oliIdx < adsIdx, "order: token gate -> OLI -> ASIN Ads");
   assert.match(yml, /scheduled-oli-refresh\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --as-of=/, "OLI refresh runs for the resolved bucket");
+  assert.match(yml, /scheduled-asin-ads-refresh\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --as-of=/, "ASIN Ads refresh runs for the resolved bucket (both buckets)");
   assert.match(yml, /priority-control-package\.mjs --apply/, "US run opens publication controls");
   assert.match(yml, /priority-dashboards-release\.mjs --as-of=[^\n]*--operation-key=priority-dashboards\/scheduled\//, "release uses the date-scoped operation key");
+  assert.match(yml, /rebuild-brand-membership\.mjs/, "US run rebuilds Brand View membership from the fresh brand-sales");
   assert.match(yml, /if:\s*always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS runs on the US path");
-  // The workflow is the sole timing authority: it never invokes the deprecated Vercel cron sync endpoint.
-  assert.doesNotMatch(yml, /api\/cron\/sync/, "does not drive the deprecated Vercel cron endpoint");
+  // No unrelated source/report is ever run: no Campaign Ads, no FBA, no deprecated Vercel cron endpoint.
+  assert.doesNotMatch(yml, /campaign|fba-|api\/cron\/sync/i, "never runs Campaign Ads / FBA / the deprecated Vercel cron endpoint");
 });
 
 test("D3. single-scheduler rule: EXACTLY ONE workflow file declares a schedule: trigger", () => {
@@ -195,11 +206,113 @@ test("D3. single-scheduler rule: EXACTLY ONE workflow file declares a schedule: 
   assert.deepEqual(scheduled, ["scheduler-v2.yml"], "only scheduler-v2.yml schedules; got " + JSON.stringify(scheduled));
 });
 
+group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");
+
+const usageResp = (rows) => ({ ok: true, json: async () => ({ data: rows, meta: {} }) });
+const mkFetch = (resp) => async () => resp;
+
+test("E1. getDataDoeTokenBalance reads the LATEST usage-log row's pool balances (balance + extra + bundle)", async () => {
+  const rows = [
+    { usedAt: "2026-08-20T00:00:00Z", balanceAfter: 100, extraTokensAfter: 0, bundleTokensAfter: 0 },
+    { usedAt: "2026-08-24T09:42:00Z", balanceAfter: 0, extraTokensAfter: 84, bundleTokensAfter: null },
+    { usedAt: "2026-08-22T00:00:00Z", balanceAfter: 10, extraTokensAfter: 84, bundleTokensAfter: 0 },
+  ];
+  const bal = await getDataDoeTokenBalance({ apiKey: "k", fetchImpl: mkFetch(usageResp(rows)) });
+  assert.equal(bal.read, "ok");
+  assert.equal(bal.usable, 84, "latest row (2026-08-24) -> 0 + 84 + 0");
+  assert.equal(bal.asOf, "2026-08-24T09:42:00Z");
+});
+
+test("E2. confirmUsableTokens: >= required confirms; below refuses; a failed/empty/null read is NEVER a confirmation (fail-closed)", () => {
+  assert.equal(confirmUsableTokens({ read: "ok", usable: 84 }, 30).confirmed, true);
+  assert.equal(confirmUsableTokens({ read: "ok", usable: 30 }, 30).confirmed, true);
+  const low = confirmUsableTokens({ read: "ok", usable: 12 }, 30);
+  assert.equal(low.confirmed, false); assert.equal(low.reason, "insufficient-tokens");
+  assert.equal(confirmUsableTokens({ read: "error", usable: null }, 30).confirmed, false, "read error is not a confirmation");
+  assert.equal(confirmUsableTokens({ read: "empty", usable: null }, 30).confirmed, false, "empty log is not a confirmation");
+  assert.equal(confirmUsableTokens(null, 30).confirmed, false, "null balance is not a confirmation");
+  assert.equal(COMBINED_DAILY_TOKEN_CEILING, 30, "default required = the combined daily ceiling");
+});
+
+test("E3. getDataDoeTokenBalance FAILS CLOSED on non-200 / empty / missing key (usable=null, never a bogus number)", async () => {
+  const bad = await getDataDoeTokenBalance({ apiKey: "k", fetchImpl: mkFetch({ ok: false, status: 500, json: async () => ({}) }) });
+  assert.equal(bad.read, "error"); assert.equal(bad.usable, null);
+  const empty = await getDataDoeTokenBalance({ apiKey: "k", fetchImpl: mkFetch(usageResp([])) });
+  assert.equal(empty.read, "empty"); assert.equal(empty.usable, null);
+  await assert.rejects(() => getDataDoeTokenBalance({ fetchImpl: mkFetch(usageResp([])) }), /apiKey/);
+});
+
+group("F. scheduled ASIN Ads: <=5-seller plan, 21-day rolling window, coverage assessment + per-bucket ceiling");
+
+const adsSummary = (n, over = {}) => ({
+  status: "completed", coverageMode: true, coverageComplete: true,
+  expectedCoveragePairs: n, successfulCoveragePairs: n, deferred: false,
+  sources: { "asin-performance-v1": { coverage: n, skipped: 0, rows: 10, failedAccounts: [], coverageFailedAccounts: [] } },
+  ...over,
+});
+const adsBatchesFor = (n) => {
+  const ids = Array.from({ length: n }, (_, i) => acct(i + 1));
+  const out = [];
+  for (let b = 0; b * 5 < n; b += 1) { const batchIds = ids.slice(b * 5, b * 5 + 5); out.push({ accountIds: batchIds, summary: adsSummary(batchIds.length) }); }
+  return out;
+};
+
+test("F1. ASIN Ads plan: Non-US 22 -> 5 batches/10 tokens; US 8 -> 2 batches/4 tokens (standard export = 2 tokens)", () => {
+  const nonus = asinAdsBucketPlan(accountsN(22));
+  assert.equal(nonus.expectedBatches, 5); assert.equal(nonus.maxCreates, 5); assert.equal(nonus.maxTokens, 10);
+  const us = asinAdsBucketPlan(accountsN(8));
+  assert.equal(us.expectedBatches, 2); assert.equal(us.maxCreates, 2); assert.equal(us.maxTokens, 4);
+  assert.equal(ASIN_ADS_TOKENS_PER_CREATE, 2);
+});
+
+test("F2. ASIN Ads rolling window is EXACTLY 21 inclusive days ending at asOf", () => {
+  assert.equal(ASIN_ADS_ROLLING_WINDOW_DAYS, 21);
+  const w = asinAdsRefreshWindow("2026-08-24");
+  assert.equal(w.to, "2026-08-24");
+  assert.equal(w.from, "2026-08-04", "asOf-20 days = 21-day inclusive window");
+});
+
+test("F3. combined full Ads refresh ceiling = 7 exports / 14 tokens (US 2/4 + Non-US 5/10)", () => {
+  const total = asinAdsBucketPlan(accountsN(8)).maxCreates + asinAdsBucketPlan(accountsN(22)).maxCreates;
+  const tokens = asinAdsBucketPlan(accountsN(8)).maxTokens + asinAdsBucketPlan(accountsN(22)).maxTokens;
+  assert.equal(total, 7); assert.equal(tokens, 14);
+});
+
+test("F4. assessment happy path: every batch completed + full coverage; a WARM run (0 creates, all skipped) is ok", () => {
+  const fresh = assessScheduledAsinAdsCycle({ bucket: "us", discoveredAccounts: accountsN(8), batchResults: adsBatchesFor(8), creates: 2 });
+  assert.equal(fresh.ok, true, JSON.stringify(fresh.problems));
+  assert.equal(fresh.creates, 2); assert.equal(fresh.tokens, 4); assert.equal(fresh.ceilingCreates, 2);
+  // WARM: skipped==covered, zero creates -> still ok.
+  const warmBatches = adsBatchesFor(8).map((b) => ({ ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: b.accountIds.length, rows: 0, failedAccounts: [], coverageFailedAccounts: [] } } }) }));
+  const warm = assessScheduledAsinAdsCycle({ bucket: "us", discoveredAccounts: accountsN(8), batchResults: warmBatches, creates: 0 });
+  assert.equal(warm.ok, true, JSON.stringify(warm.problems));
+  assert.equal(warm.creates, 0); assert.equal(warm.tokens, 0);
+});
+
+test("F5. assessment rejects every violation: not-completed, coverage-incomplete, non-ASIN source, failed accounts, coverage-failed, over-ceiling, coverage gap, oversized batch", () => {
+  const base = () => adsBatchesFor(8);
+  const cases = [
+    ["a batch not 'completed'", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { status: "partial" }) } : b), creates: 2 }, /batch-not-completed:partial/],
+    ["coverage incomplete", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { coverageComplete: false }) } : b), creates: 2 }, /batch-coverage-incomplete/],
+    ["a non-ASIN source leaked into a batch", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [], coverageFailedAccounts: [] }, "campaign-performance-v1": { coverage: 1 } } }) } : b), creates: 2 }, /non-asin-source:campaign-performance-v1/],
+    ["a failed account", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [b.accountIds[0]], coverageFailedAccounts: [] } } }) } : b), creates: 2 }, /failed-accounts:1/],
+    ["a coverage-failed account", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [], coverageFailedAccounts: [b.accountIds[0]] } } }) } : b), creates: 2 }, /coverage-failed-accounts:1/],
+    ["more creates than the ceiling", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base(), creates: 3 }, /creates-over-ceiling:3>2/],
+    ["a discovered account not covered by any batch", { bucket: "us", discoveredAccounts: accountsN(9), batchResults: adsBatchesFor(8), creates: 2 }, /account-coverage-missing/],
+    ["an oversized (>5) batch", { bucket: "us", discoveredAccounts: accountsN(6), batchResults: [{ accountIds: ["A01", "A02", "A03", "A04", "A05", "A06"], summary: adsSummary(6) }], creates: 1 }, /batch-oversized:6/],
+  ];
+  for (const [name, input, re] of cases) {
+    const a = assessScheduledAsinAdsCycle(input);
+    assert.equal(a.ok, false, name + " must be rejected");
+    assert.ok(a.problems.some((p) => re.test(p)), name + " -> expected " + re + " in " + JSON.stringify(a.problems));
+  }
+});
+
 // ---- run ----
 let failures = 0;
 for (const t of tests) {
   if (t.marker) { out("== " + t.marker); continue; }
-  try { t.fn(); passed += 1; out("  ok  " + t.name); }
+  try { await t.fn(); passed += 1; out("  ok  " + t.name); }
   catch (err) { failures += 1; out("FAIL  " + t.name); out(String(err && err.stack ? err.stack : err)); }
 }
 out("\n" + passed + " assertions passed" + (failures ? (", " + failures + " FAILED") : ""));

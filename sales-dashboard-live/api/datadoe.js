@@ -106,6 +106,7 @@ import {
   buildBrandViewSnapshot,
   buildBrandInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
+import { membershipBrandsForAccount, selectorBrandsForAccount } from "../lib/server/reports/brand-membership.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
 // Keep the rest of this legacy route's report builders connection-agnostic.
@@ -244,6 +245,8 @@ const BRAND_DIRECTORY_SNAPSHOT_KEYS = [
 
 const BRAND_CATALOG_REPORT_KEY = "brand-catalog";
 const BRAND_CATALOG_REPORT_VERSION = "brand-catalog-shared-v1";
+// The live brand-sales snapshot key -- the authoritative portfolio-MEMBERSHIP evidence (figures already read it).
+const BRAND_SALES_REPORT_KEY = "brand-sales";
 // EXACTLY ONE Product Catalog export per invocation. A single export can poll for
 // close to 45s (pollExport: 9 x 5s) plus create + download, which already approaches
 // Vercel's 60-second limit; running a second export in the same request could exceed
@@ -624,11 +627,16 @@ function addBrandAccount(brandAccountIds, brand, accountId) {
   brandAccountIds.set(name, accountIds);
 }
 
-function serialiseBrandAccountMap(brandAccountIds) {
-  const brands = [...brandAccountIds.keys()].sort((a, b) => a.localeCompare(b));
+function serialiseBrandAccountMap(brandAccountIds, selectorBrands = null) {
+  // The SELECTOR list = every membership brand UNION the selector-only brands (a complete catalog's zero-sale
+  // brands + fallback-report brands). MEMBERSHIP (brandAccounts) stays brand-sales only: a selector-only brand
+  // appears in `brands` with an EMPTY account list, so it is selectable but pins no account.
+  const brandSet = new Set([...brandAccountIds.keys()].map((b) => String(b || "").trim()).filter(Boolean));
+  if (selectorBrands) for (const b of selectorBrands) { const n = String(b || "").trim(); if (n) brandSet.add(n); }
+  const brands = [...brandSet].sort((a, b) => a.localeCompare(b));
   return {
     brands,
-    brandAccounts: Object.fromEntries(brands.map((brand) => [brand, [...brandAccountIds.get(brand)].sort()])),
+    brandAccounts: Object.fromEntries(brands.map((brand) => [brand, [...(brandAccountIds.get(brand) || [])].sort()])),
   };
 }
 
@@ -749,7 +757,8 @@ function snapshotBrandNames(payload) {
 }
 
 async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAttemptState = defaultGetCatalogAttemptState } = {}) {
-  const brandAccountIds = new Map();
+  const brandAccountIds = new Map();  // MEMBERSHIP: brand -> accounts, from the latest validated brand-sales ONLY
+  const selectorBrands = new Set();   // SELECTOR list: catalog (complete) UNION brand-sales (+ fallbacks); never pins membership
   const coveredAccountIds = new Set();
   const catalogPendingAccountIds = new Set();
   const catalogUnavailable = new Map();
@@ -759,12 +768,12 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
   // from the SEPARATE per-(action,account) attempt row so overlapping actions never clobber
   // each other's summaries.
   const catalogActionFailures = new Map();
-  if (!isSupabaseConfigured()) return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
+  if (!isSupabaseConfigured()) return { brandAccountIds, selectorBrands, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
 
-  // The explicit catalog snapshot is authoritative for a complete selector.
-  // Other reports are still useful fallback data while an account waits for its
-  // one-time catalog sync, but recent sales must never be mistaken for a full
-  // catalog because zero-sale brands would disappear.
+  // MEMBERSHIP follows the CURRENT sales evidence (latest validated brand-sales), so it matches the figures and
+  // never drops a selling account (nor pins a catalog-only, zero-sale account). The complete catalog still
+  // supplies the SELECTOR list (zero-sale brands), and other reports keep the selector recoverable while an
+  // account waits for its one-time catalog sync -- but only brand-sales pins membership.
   await Promise.all(accountIds.map(async (accountId) => {
     const id = String(accountId);
     const catalogSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
@@ -783,32 +792,41 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
           : (attempt.status === "attempting" ? CATALOG_ATTEMPT_PENDING : CATALOG_SOURCE_UNAVAILABLE));
       }
     }
-    if (catalogStatus === "complete") {
-      catalogBrands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
-      coveredAccountIds.add(id);
-      return;
-    }
+
+    // (1) MEMBERSHIP: the latest validated brand-sales snapshot ONLY. An account is a portfolio member of a brand
+    // iff its current brand-sales contains it (the same trimmed evidence the figures use).
+    const salesSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_SALES_REPORT_KEY, accountId });
+    const salesBrands = snapshotBrandNames(salesSnapshot?.payload);
+    membershipBrandsForAccount(salesBrands).forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+
+    // (2) SELECTOR list only: a complete catalog contributes its (zero-sale-inclusive) brands, unioned with
+    // brand-sales. Selector brands NEVER pin membership.
+    selectorBrandsForAccount({ catalogStatus, catalogBrands, salesBrands }).forEach((brand) => selectorBrands.add(brand));
+
+    if (catalogStatus === "complete") { coveredAccountIds.add(id); return; }
     if (catalogStatus === "unavailable") {
-      // Only a typed, admin-safe code is carried forward. Any legacy raw
-      // `catalogSyncError` on an older snapshot is IGNORED (never surfaced): unknown
-      // codes normalise to the generic source-unavailable code.
+      // Only a typed, admin-safe code is carried forward. Any legacy raw `catalogSyncError` on an older snapshot
+      // is IGNORED (never surfaced): unknown codes normalise to the generic source-unavailable code.
       const rawCode = String(payload?.catalogSyncCode || "");
       catalogUnavailable.set(id, SAFE_CATALOG_CODES.has(rawCode) ? rawCode : CATALOG_SOURCE_UNAVAILABLE);
     } else {
       catalogPendingAccountIds.add(id);
     }
+    if (salesBrands.length) { coveredAccountIds.add(id); return; }
 
-    for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS.slice(1)) {
+    // No complete catalog and no brand-sales: recover the SELECTOR list from other report snapshots (fba-plan,
+    // sku-pl, ...). This never pins membership -- brand-sales is the only membership authority.
+    for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS.slice(2)) {
       const snapshot = await getLatestReportSnapshot({ reportKey, accountId });
       const brands = snapshotBrandNames(snapshot?.payload);
       if (brands.length) {
-        brands.forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+        brands.forEach((brand) => { const n = String(brand || "").trim(); if (n) selectorBrands.add(n); });
         coveredAccountIds.add(id);
         break;
       }
     }
   }));
-  return { brandAccountIds, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
+  return { brandAccountIds, selectorBrands, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
 }
 
 async function saveBrandCatalogSnapshot(accountId, payload) {
@@ -2546,7 +2564,7 @@ async function handleDataDoe(req, res) {
       // Read the directory for the response over the authorized scope (brand map + typed
       // cumulative summary). This is Supabase-only and never calls DataDoe.
       const directory = await sharedSnapshotBrandAccounts(publicAccountIds, { actionId });
-      const saved = serialiseBrandAccountMap(directory.brandAccountIds);
+      const saved = serialiseBrandAccountMap(directory.brandAccountIds, directory.selectorBrands);
       // Typed, admin-safe cumulative summary, derived from the persisted snapshots so no
       // failure is lost across continuation batches. It unions: accounts with no usable
       // saved catalog (catalogUnavailable) AND accounts whose complete brand map is a
