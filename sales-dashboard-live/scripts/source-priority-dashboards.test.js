@@ -245,6 +245,7 @@ function makeRelease(over = {}) {
     makeStore: over.makeStore || (() => ({ listSourceJobs: async () => over.srcJobs || [], listCycleOwners: async () => over.owners || [], finalizeCycle: async () => over.finalizeResp || {} })),
     listReportJobs: over.listReportJobs || (async () => over.repJobs || []),
     getCycleByBucketDate: over.getCycleByBucketDate || (async () => over.cycle || null),
+    asOfOverride: over.asOfOverride,
   });
 }
 
@@ -334,6 +335,17 @@ test("P4d. publishAccount publishes daily-reporting, brand-sales, brand-inventor
   for (const r of outp.results) { assert.equal(r.liveReportKey, r.reportKey); assert.equal(r.paramsHash, "ph_" + r.reportKey + "_A01"); }
 });
 
+test("P4f. asOfOverride is validated + BOUND AT BUILD TIME onto the runtime (pins the derive window; cycle date stays clock-today)", () => {
+  let captured = null;
+  makeRelease({ asOfOverride: "2026-08-22", buildRuntime: (o) => { captured = o; return { makeDeadline: () => ({}), preflightEvidence: async () => ({ accounts: [], today: TODAY }), run: async () => ({}) }; } });
+  assert.equal(captured.asOfOverride, "2026-08-22", "asOfOverride bound at build (never a run() argument)");
+  assert.equal(captured.priorityMode, true, "still priority mode");
+  // a null override is the default (clock today-1); a malformed value fails closed BEFORE any build.
+  let cap2 = null; makeRelease({ buildRuntime: (o) => { cap2 = o; return { makeDeadline: () => ({}), preflightEvidence: async () => ({}), run: async () => ({}) }; } });
+  assert.equal(cap2.asOfOverride, null, "default: no asOf pin (clock today-1)");
+  assert.throws(() => makeRelease({ asOfOverride: "2026/08/22" }), /YYYY-MM-DD/);
+  assert.throws(() => makeRelease({ asOfOverride: "not-a-date" }), /YYYY-MM-DD/);
+});
 test("P4e. preflightAccount runs the SHARED publisher preflight for all 3 keys, carrying the live identity; a non-ready pair surfaces", async () => {
   const pfCalls = [];
   const rel = makeRelease({ buildPublisher: () => ({ publish: async () => ({ disposition: "published" }), preflight: async (rk, a) => { pfCalls.push(rk); return { disposition: rk === "brand-inventory" ? "report-disabled" : "ready", liveReportKey: rk, paramsHash: "ph_" + rk + "_" + a }; } }) });

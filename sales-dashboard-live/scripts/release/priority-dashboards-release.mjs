@@ -27,7 +27,12 @@ const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-deriva
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const sb = await import("../../lib/server/supabase.js");
 
-const release = buildPriorityDashboardsRelease();
+// Optional --as-of=YYYY-MM-DD: pin the derive window's asOf to the last proven durable-OLI covered_to day when
+// the wall clock has drifted past it (NO new OLI fetch; the cycle date stays clock-today). Validated here too.
+const asOfArg = (process.argv.find((a) => a.startsWith("--as-of=")) || "").split("=")[1] || null;
+if (asOfArg != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOfArg)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOfArg + ")"); process.exit(2); }
+if (asOfArg) console.log("priority-release: asOf pinned to " + asOfArg + " (derive window; cycle date stays clock-today).");
+const release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg });
 
 // A dedicated read-only pg client for the cron proof (never mutates).
 const pgBase = String(process.env.POSTGRES_URL).split("?")[0];

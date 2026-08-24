@@ -293,6 +293,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // source-priority-dashboards release composition sets it true, alongside its catalog-only durable create
     // guard. run() therefore has no freely-selectable priority switch.
     priorityMode = false,
+    // TRUSTED, BUILD-TIME-ONLY asOf pin (YYYY-MM-DD). When set, the derive window's `to` (asOf) is this exact
+    // date instead of clock today-1. The priority go-live uses it to derive up to the LAST PROVEN durable-OLI
+    // covered_to day when the wall clock has drifted past it (no new OLI fetch). Ordinary callers leave it null
+    // and get clock today-1. Bound at BUILD time (never a run() arg); only the reviewed release composition sets
+    // it, and the cycle date stays clock-today, so ONLY the derive window narrows.
+    asOfOverride = null,
     // Round-7 finding 1: the derive-lease duration. Long enough that a live worker (bounded by the ~50s
     // route budget) always holds a non-expired lease within its invocation, short enough that a genuinely
     // abandoned claim recovers on a later invocation. NEVER derived from updated_at.
@@ -657,7 +663,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     } catch (e) { return catchDeadline(e); }
 
     const todayStr = today || (preflight && preflight.today) || new Date(clock()).toISOString().slice(0, 10);
-    const asOfStr = asOf || addDaysStr(todayStr, -1); // the latest COMPLETED day (conservative for manual runs)
+    // the latest COMPLETED day (conservative for manual runs); a build-time asOfOverride pins it to the last
+    // proven durable-OLI covered_to day when the wall clock has drifted past it (cycle date stays clock-today).
+    const asOfStr = asOf || asOfOverride || addDaysStr(todayStr, -1);
     const store = makeSourceStore({ deadline: dl });
     const dataDoe = makeAdapter(connections);
 
@@ -1211,7 +1219,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const { connections, primary, orgFingerprint } = resolvePrimary();
     const { accounts, excluded, catalogCarrierSeller } = await dl.bound("discovery", () => discoverBucketAccounts({ connections, bucket }));
     const todayStr = today || new Date(clock()).toISOString().slice(0, 10);
-    const asOfStr = addDaysStr(todayStr, -1);
+    const asOfStr = asOfOverride || addDaysStr(todayStr, -1);
     // ONE hydrating evidence sweep (coverage + catalog/FBA pointers + hydration + integrity + staleness +
     // Ads coverage). Read failures surface as typed readBlockers; each read-failure class below is a HARD
     // typed refusal -- stale evidence is NOT one (it is the reviewed typed degrade that plans a refresh).

@@ -153,8 +153,13 @@ export function buildPriorityDashboardsRelease({
   listReportJobs = getSyncReportJobs,
   getCycleByBucketDate = getSyncCycleByBucketDate,
   budgetMs = 550_000,
+  // Optional YYYY-MM-DD asOf pin: when the wall clock has drifted past the last proven durable-OLI covered_to
+  // day, derive up to that day (no new OLI fetch). null => clock today-1. Validated (fail closed on a malformed
+  // value); bound at BUILD time onto the priority runtime, so the cycle date stays clock-today.
+  asOfOverride = null,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
+  if (asOfOverride != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(asOfOverride))) throw new Error("buildPriorityDashboardsRelease asOfOverride must be a YYYY-MM-DD date (fail closed).");
   if (typeof makeInnerAdapter !== "function") throw new Error("buildPriorityDashboardsRelease requires makeInnerAdapter (fail closed).");
   if (typeof buildPublisher !== "function") throw new Error("buildPriorityDashboardsRelease requires buildPublisher (fail closed).");
   if (typeof listReportJobs !== "function") throw new Error("buildPriorityDashboardsRelease requires listReportJobs (fail closed).");
@@ -166,6 +171,7 @@ export function buildPriorityDashboardsRelease({
   const runtime = buildRuntime({
     priorityMode: true,
     budgetMs,
+    asOfOverride,
     makeAdapter: (connections) => makeDurableCatalogGuard({ inner: makeInnerAdapter(connections), reservation, operationKey }),
   });
   const publisher = buildPublisher(); // frozen production publisher; the composed surface is publish(rk, acct)
