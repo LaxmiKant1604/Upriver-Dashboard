@@ -11312,3 +11312,15 @@ cached, expires ~Aug-25 07:06 IST); nothing published; LKG intact; no cron. Next
 then re-run priority-dashboards-release.mjs (US adopts the catalog for 0 extra tokens; non-us opens a fresh
 cycle) -> finalize -> preflight -> publish 30x3 -> live/frontend verify -> safe-close. See
 [[scheduler-v2-golive-status]].
+
+## Reviewed re-date tool for the Non-US cycle-date collision -- 2026-08-24 (code 6a9d1d0 + docs; NOT pushed)
+
+Built scripts/release/redate-priority-cycle-collision.mjs + lib/server/sync/source-redate-cycle-collision.js to
+move ONLY the historical test cycle 481fe35c's cycle_date out of today's Non-US slot (DATE '2026-08-24' ->
+'2026-08-16'), so a fresh Non-US v2 cycle can open. cycle_date is a PostgreSQL DATE compared as a 'YYYY-MM-DD'
+string (cycle_date::text) -- NEVER via new Date().toISOString(). Dry-run default (READ ONLY); --apply is one
+advisory-locked guarded UPDATE (rowCount===1) with exact PRE (130 source jobs/170 owners/13 report jobs/3
+validated; no v2 lineage; target slot free; controls safe-closed; v1 reserved/0/null; v2 created/2/export) and
+exact POST (only cycle_date + the sync_cycles digest change; the other 7 protected digests byte-identical;
+sync_cycles row count unchanged; child counts/counters/reservations/controls unchanged); COMMIT_UNKNOWN exit 3.
+Tests P14a-n. verify 57/37 + release-selftest 184 green. NEXT: dry-run -> --apply -> re-run the v2 release.
