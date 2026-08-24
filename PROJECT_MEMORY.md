@@ -11677,3 +11677,66 @@ first (green) -> US after the Non-US read-only prerequisite passes -> publish va
 snapshots -> rebuild Brand View membership (US) -> verify live/API/frontend read-backs (Daily Ad
 Sales now same-SKU) -> always safe-close -> confirm Campaign Ads creates ZERO + FBA untouched.
 Code committed locally; push deploys the same-SKU Daily change live (compute-on-demand).
+
+================================================================================
+DAILY REPORTING RESTORED (zero-export v2 self-heal) + GENERIC AUTOMATIC REPORT
+LOADING -- 2026-08-25
+================================================================================
+
+DEFECT: the frontend was bumped to request daily-reporting-shared-v2 (the ASIN-grain switch)
+before any v2 snapshot was published, so serveSharedReport's exact-key read missed and the
+stale gate correctly refused the v1 payload (v1 = campaign grain, never served as v2) -> every
+one of the 30 accounts showed "Nothing saved for this account yet" despite durable OLI history
+being present. A rollout-order/read-path defect, not missing history.
+
+PRIORITY 1 -- trusted ZERO-EXPORT re-derivation (lib/server/reports/daily-durable-rederive.js):
+recompute daily-reporting/v2e-1 from durable evidence ONLY -- source_oli_daily_history (getSource
+OliHistoryRows) + asin-performance-v1 (getAsinAdsDailyRows) + ads coverage (getDailyAdsCoverage)
++ the reusable Product Catalog snapshot (getSourceSnapshot/getSourceSnapshotPayload) -- through
+the REAL contract (slicedOliSourceFromHistory + buildDailyAdsCoverage + REPORT_DERIVATIONS
+["daily-reporting"].derive + validatePayload). NEVER copies/relabels a v1 snapshot. No DataDoe
+adapter is wired, so a create-export is structurally impossible. dailyReportingReadiness gates on
+OLI coverage + validated Catalog (blocks sales) but Ads never block: a failed/absent Ads read
+publishes proven OLI sales/units with adsAvailability typed unavailable/partial -- never a zero.
+Currency isolation inherited from the contract. Named-brand -> brand-filtered payload (no ads).
+
+WIRING (self-heal on a READ): serveSharedReport gained an optional deriveDurable callback; when
+the v2 snapshot is missing it claims the refresh lock, re-derives, and publishes under the exact
+live identity (report_key=daily-reporting, params_hash=paramsHashFor(daily-reporting-shared-v2,
+{from,to,brand}), params.reportVersion=v2), then serves it -- still ZERO DataDoe. Concurrent page
+loads -> exactly ONE derivation/save (the lock serializes; losers re-read). A re-derivation
+FAILURE degrades to an honest "waiting for the scheduled data refresh" state (missing source
+named), never a 500, never a fabricated zero, no save. ONLY the daily action wires deriveDurable
+(api/datadoe.js) -- every other report is untouched. source_refreshed_at is bound to the durable
+evidence (durableRefreshedAt), never wall-clock. This runs on Vercel with prod access, so the
+DEPLOY ITSELF fixes the blank page automatically on each account's first visit -- no manual run.
+
+PRIORITY 2 -- ONE shared automatic report-loading mechanism (src/App.jsx): useSharedReport (the 6
+insight reports) + all 7 hand-rolled loaders (Dashboard, Daily, FBA, Reconciliation, SKU P&L,
+Content, Keyword Rank) now: request-guard every response (a keyed reqId) so a slow answer for a
+previous account/brand/date can NEVER land under the current scope (no cross-account leak); paint
+cache-first; revalidate on window focus + a 60s interval (useAutoRevalidate) while active + tab-
+visible; keep the last-known-good visible while updating (Daily/Dashboard show a first-paint
+skeleton then a compact "Updating"). Read-only by contract -- loadSharedReport only, never a
+token. Report-page refresh controls are now READ-ONLY "Reload latest data"; the token-spend path
+is admin-only in the Data Sync Center ("Sync source"). Removed all "Refresh from DataDoe" copy;
+empty states say "Waiting for the scheduled data refresh". Brand View already auto-loads read-
+only (loadReport) + has stale guards; its token path is the admin-only "Fetch latest data".
+
+TESTS (scripts/daily-durable-rederive.test.js, 16 assertions; registered in verify.mjs): v2-
+missing+durable-OLI -> derives+saves zero-export; 30 accounts -> 30 valid ISOLATED v2 snapshots
+(distinct evidence -> distinct totals), ZERO create; missing Ads never hides OLI + is unavailable-
+not-zero; recompute-never-copy (v2e-1 version, this-account sales only); OLI-coverage-unproven /
+missing-Catalog -> not-ready (no save); self-heal SAVES v2 + serves; concurrent -> ONE derivation/
+save; double-check-in-lock serves an already-saved snapshot without re-deriving; not-ready +
+re-derivation-failure -> honest waiting, no save. verify: 60 steps / 40 suites (incl build:check)
+green; git diff --check clean.
+
+COMMITTED 2026-08-25: code 9c1efad (9 files) on main, on top of 8fe7c63 (the ASIN Ads docs). The
+frontend regressions (no cross-account leak, focus/interval revalidation, LKG-visible) are design-
++build-verified (the repo has no frontend test framework); the server-side re-derivation invariants
+have executable tests. PENDING PROD VERIFICATION (not runnable here -- authenticated per-account
+prod read-backs are blocked): after push+Vercel, confirm representative US/India/Germany/Italy/
+France/Spain/UK accounts open automatically (self-heal populates on first visit), 30/30 v2
+snapshots exist, account/brand switching needs no manual refresh, DataDoe creates=0 + tokens=0 for
+this repair, Campaign Ads/FBA/unrelated + cron unchanged, publication controls safe-closed.
