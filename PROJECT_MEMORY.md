@@ -11381,3 +11381,51 @@ finalize/derive-skip paths, or parallel/keyset OLI paging.
 
 State: main @ a5b9c61 (unpushed); LIVE + safe-closed; nothing pushed/deployed; scheduler OFF. See
 [[scheduler-v2-golive-status]].
+
+## AUTOMATIC scheduler built (GitHub Actions, ONE authoritative) -- 2026-08-24 (code 7ce79aa + docs; NOT pushed; NOT yet enabled)
+
+Implemented + offline-verified (verify 58/58 across 38 suites) the one authoritative automatic scheduler for
+Daily Reporting + Brand View. GitHub Actions is the SOLE timing authority (the full source/derive/publish flow
+exceeds Vercel's 60s route cap); NO pg_cron, NO Vercel cron. Deployment/enablement is PENDING (see the handoff
+at the end).
+
+WHAT LANDED (all fail-closed, offline-tested; no production run yet):
+- Workflow .github/workflows/scheduler-v2.yml (Node 24, npm ci, 95-min timeout, single-run concurrency,
+  workflow_dispatch kept, a fail-fast secrets guard that never prints values): non-us @ 02:00 UTC/07:30 IST runs
+  OLI-only; us @ 10:30 UTC/16:00 IST runs US OLI -> opens publication controls -> priority release for BOTH
+  buckets under the DATE-SCOPED Catalog key -> ALWAYS safe-closes controls (if: always()). Removed the deprecated
+  v1 Vercel-loop scheduled-sync.yml (single-scheduler rule; only scheduler-v2.yml declares a schedule:).
+- Portable operators: scripts/release/env-bootstrap.mjs (roots from import.meta.url; loads .env.local only when
+  present; NEVER overrides CI env; maps SUPABASE_URL from VITE_SUPABASE_URL; no secret printed). All 6 release
+  scripts refactored off the hardcoded C:/Users/... path.
+- Scheduled OLI operator: scripts/release/scheduled-oli-refresh.mjs + lib/server/sync/source-scheduled-oli.js.
+  Args --bucket + --as-of only; long operator deadline; preflight once; runs ONLY order-line-items via
+  runSourceCardAction, resuming until drained; PROVES OLI-only + succeeded + owner-scoped to the exact discovered
+  primary accounts + create<=1 + batch<=5 + per-bucket ceiling (US 2 batches/4 tokens, Non-US 5/10; combined w/
+  Catalog = 8 creates/16 tokens max). Exits nonzero on failed/open/ambiguous/deadline. NEVER runs Ads/FBA/other.
+- Priority release finalize EXTENDED (source-priority-dashboards.js): a scheduled cycle may now hold succeeded OLI
+  batch jobs beside the ONE org-scoped catalog job; refuses any other source key; proves the OLI owner union
+  EXACTLY covers the discovered bucket accounts (batch<=5, create<=1, per-account owners). All existing Catalog
+  reservation/cache/create-count + 3-report lineage proofs preserved. New STRICT date-scoped operation key
+  priority-dashboards/scheduled/YYYY-MM-DD (assertPriorityOperationKey; default stays priority-dashboards/v2) so
+  one date authorizes at most one Catalog create across US+Non-US; release CLI gains --operation-key.
+- Durable status tool: scripts/release/scheduled-source-controls.mjs (dry-run default; --apply) sets only
+  order-line-items + product-catalog schedule_enabled=true + paused=false; every other source schedule-disabled.
+- Tests: scheduler-v2-automation.test.js (env portability, OLI plan/ceilings, combined 8/16 max, strict post-drain
+  assessment, workflow cron + single-scheduler pinning, source_controls target) + P2d (op-key matrix) + P4b7/P4c1
+  (OLI+Catalog finalize accept/reject). Updated the two v1 workflow guardrails (test-sync.mjs, source-schedule.js
+  test) to the completed-v2 reality (app stays inert; GitHub Actions is the sole scheduler).
+
+TOKEN MODEL (normal daily): US OLI 2 batches (<=4 tokens) + Non-US OLI 5 batches (<=10) + 1 org Catalog (2) = at
+most 8 creates / 16 standard tokens. Warm-cache/adoption/export-id resume spends 0. 5 sellers/export preserved.
+
+HANDOFF -- PENDING before "automatic scheduling enabled" is TRUE (needs the user's GitHub repo admin; no gh CLI
+and no GitHub token available in this environment): (1) push main once + verify the single Vercel deploy Ready +
+HTTP 200; (2) set repository secrets (values NEVER via me): POSTGRES_URL, SUPABASE_URL or VITE_SUPABASE_URL,
+SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if used); (3) confirm >=16 DataDoe tokens;
+(4) manually dispatch one full controlled run (us) and observe: US OLI -> derive/finalize -> preflight 30x3 ->
+publish/readback -> safe-close; (5) verify live identities + controls safe-closed + <=8 creates/<=16 tokens + no
+cron. The workflow's scheduled runs auto-enable on push to the default branch; a run before secrets fails fast at
+the secrets guard (no tokens, no writes). Scheduled next times once enabled: non-us 02:00 UTC / us 10:30 UTC.
+State: main @ 7ce79aa (code) + docs (unpushed); go-live dashboards still LIVE + safe-closed. See
+[[scheduler-v2-golive-status]].
