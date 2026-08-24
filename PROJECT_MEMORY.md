@@ -11324,3 +11324,16 @@ validated; no v2 lineage; target slot free; controls safe-closed; v1 reserved/0/
 exact POST (only cycle_date + the sync_cycles digest change; the other 7 protected digests byte-identical;
 sync_cycles row count unchanged; child counts/counters/reservations/controls unchanged); COMMIT_UNKNOWN exit 3.
 Tests P14a-n. verify 57/37 + release-selftest 184 green. NEXT: dry-run -> --apply -> re-run the v2 release.
+
+## --as-of pin works (6/8 US derive); blocked by a zero-sales account -- 2026-08-24 (code b5ec83d + docs; NOT pushed)
+
+The reviewed --as-of override (build-time asOfOverride) makes derive readiness pass by pinning the derive window
+to the last proven durable-OLI covered_to day (2026-08-22) with NO new OLI fetch. Ran the release with
+--as-of=2026-08-22: derive:us readiness passes, 6/8 US accounts derive cleanly (18 validated report jobs), but 2
+fail durable-oli-provenance-missing and finalize refuses (needs all 8x3). Root cause: >=1 US account (b60cf168,
+last sale 2025-08-11) is a legitimately inactive/zero-sales seller with NO OLI rows in the derive window, so the
+provenance fail-close blocks it; finalizeBucket requires ALL discovered accounts, so a zero-sales account makes
+the mission's hard 'publications=90' impossible. The frontend reads published snapshots via getLatestReportSnapshot
+(latest by report+account, not exact params_hash), so the asOf pin stays visible. Controls safe-closed; nothing
+published; 2 tokens; no cron. SCOPE DECISION needed: exclude zero-sales accounts (publish the derivable subset,
+<90) vs publish empty snapshots for them (both are code changes). See [[scheduler-v2-golive-status]].
