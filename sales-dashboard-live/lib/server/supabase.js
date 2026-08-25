@@ -581,6 +581,23 @@ export async function upsertAdsDailyRows(rows) {
   }
 }
 
+// Delete ONE account's durable rows for a source over [from,to] so a fresh export cleanly REPLACES that window.
+// Needed when the export's natural grain changes (e.g. asin-performance-v1 moving from campaign grain to the
+// aggregated ASIN grain): stale rows of the old grain have different dimension_keys, so an upsert would leave them
+// in place and the per-date fold would DOUBLE COUNT. Scoped to exactly (source_key, account_id, metric_date range)
+// -- other windows and accounts are untouched. Returns a typed ack; a schema-missing table is a safe no-op.
+export async function deleteAdsDailySourceRows({ accountId, sourceKey, from, to, signal = null }) {
+  const query = new URLSearchParams({ source_key: `eq.${sourceKey}`, account_id: `eq.${accountId}`, metric_date: `gte.${from}` });
+  query.append("metric_date", `lte.${to}`);
+  try {
+    await request(`/rest/v1/ads_daily_source_rows?${query}`, { method: "DELETE", headers: { Prefer: "return=minimal" }, signal });
+    return { write: "ok", error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", error: "ADS_ROWS_SCHEMA_MISSING" };
+    return { write: "write-failed", error: "ADS_ROWS_DELETE_FAILED" };
+  }
+}
+
 export async function upsertAdDailyMetrics(rows) {
   if (!rows.length) return;
   await request("/rest/v1/ad_daily_metrics?on_conflict=account_id,metric_date,campaign_id,campaign_type,currency", {

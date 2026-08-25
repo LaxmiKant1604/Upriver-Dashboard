@@ -30,7 +30,7 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES;
+let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, buildAdsExportRequestBody;
 let MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan;
 let evaluateSourceCoverage;
 
@@ -56,7 +56,7 @@ const SECONDARY_ACCOUNTS = [{ id: G6_US, country: "US" }]; // same raw id, diffe
 // persistence acknowledgement; `rowsByCall` returns Ads rows for a fetchRange; `states` seeds ads_sync_state;
 // `fetchAccountsThrows` / `lockResult` exercise the failure + skip paths.
 function makeDeps(opts = {}) {
-  const calls = { fetchAccounts: [], fetchRange: [], download: [], getCoverage: [], upsertRows: [], upsertMetrics: [], upsertStates: [], coverage: [], claim: 0, release: 0 };
+  const calls = { fetchAccounts: [], fetchRange: [], download: [], getCoverage: [], upsertRows: [], upsertMetrics: [], upsertStates: [], coverage: [], deletes: [], claim: 0, release: 0 };
   const rowsFor = opts.rowsFor || (() => [
     { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" },
   ]);
@@ -101,6 +101,7 @@ function makeDeps(opts = {}) {
       return { windows: [], status: "missing", latestMetricDate: null, read: "ok", error: null };
     },
     upsertAdsDailyRows: async (rows) => { calls.upsertRows.push(rows.length); calls.upsertRowsData = (calls.upsertRowsData || []).concat(rows); },
+    deleteAdsDailyRows: async (o) => { calls.deletes.push(o); return { write: "ok" }; },
     upsertAdDailyMetrics: async (rows) => { calls.upsertMetrics.push(rows.length); },
     upsertAdsSyncStates: async (states) => { calls.upsertStates.push(states); },
     recordAdsCoverageWindows: async (rows) => {
@@ -162,6 +163,56 @@ test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initial
   // DataDoe rejects an export whose `limit` exceeds 5000 (HTTP 400 "limit must not be greater than 5000"), so the
   // create-export limit must stay within the proven maximum -- otherwise EVERY ASIN Ads create fails at the POST.
   assert.ok(EXPORT_LIMIT <= 5000, "EXPORT_LIMIT must not exceed DataDoe's proven 5000 maximum (got " + EXPORT_LIMIT + ")");
+});
+
+test("ASIN Ads request is the REDUCED account/date/ASIN grain aggregated server-side (never > 5000 limit, no campaign columns)", () => {
+  const asin = ADS_SOURCES.find((s) => s.key === "asin-performance-v1");
+  const body = buildAdsExportRequestBody(asin, ["s1", "s2"], "2026-08-04", "2026-08-24", 0);
+  assert.deepEqual(body.columns, ["marketplace_country_code", "seller_or_vendor_id", "date", "child_asin"], "columns are ONLY the grain dims (no campaign/ad-group/ad, no metrics)");
+  assert.ok(!body.columns.some((c) => /campaign|group|ad_id|portfolio|budget/.test(c)), "no campaign-grain columns requested");
+  assert.deepEqual(body.groupBy, ["marketplace_country_code", "seller_or_vendor_id", "date", "child_asin"], "groupBy = the ASIN grain");
+  assert.equal(body.aggregations.length, 6, "all six same-SKU metrics summed server-side");
+  assert.ok(body.aggregations.every((a) => a.aggregation === "sum" && a.alias === a.column + "_sum"), "distinct _sum aliases (avoids ALIAS_COLLISION)");
+  assert.deepEqual(body.aggregations.map((a) => a.column).sort(), ["ad_clicks", "ad_impressions", "ad_orders_same_sku", "ad_sales_same_sku", "ad_spend", "ad_units_sold_same_sku"], "the exact metrics Daily/Brand consume");
+  assert.equal(body.limit, EXPORT_LIMIT); assert.ok(body.limit <= 5000, "limit never exceeds 5000");
+  assert.equal(body.skip, 0);
+  assert.equal(buildAdsExportRequestBody(asin, ["s1"], "2026-08-04", "2026-08-24", 5000).skip, 5000, "only skip changes between pages");
+});
+
+test("the Campaign/PPC source contract is UNCHANGED: raw dimensions+metrics columns, no groupBy/aggregations", () => {
+  const camp = ADS_SOURCES.find((s) => s.key === "campaign-performance-v1");
+  const body = buildAdsExportRequestBody(camp, ["s1"], "2026-08-04", "2026-08-24", 0);
+  assert.equal(body.groupBy, undefined, "campaign source is not aggregated");
+  assert.equal(body.aggregations, undefined);
+  assert.deepEqual(body.columns, [...camp.dimensions, ...camp.metrics], "campaign columns unchanged (dims + metrics)");
+});
+
+test("persist maps the aggregated _sum aliases back to canonical metric names (downstream readers unchanged)", async () => {
+  // A single aggregated ASIN row (grain dims + _sum aliases) persists metrics under the CANONICAL names.
+  const aggRow = { seller_or_vendor_id: G6_US, marketplace_country_code: "US", date: REQ.to, child_asin: "B0AGG", ad_sales_same_sku_sum: 275.1, ad_clicks_sum: 64, ad_impressions_sum: 7837, ad_spend_sum: 29.38, ad_units_sold_same_sku_sum: 7, ad_orders_same_sku_sum: 6 };
+  const { deps, calls } = makeDeps({ rowsFor: () => [aggRow] });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  const saved = (calls.upsertRowsData || [])[0];
+  assert.equal(saved.child_asin, "B0AGG");
+  assert.equal(saved.metrics.ad_sales_same_sku, 275.1, "ad_sales_same_sku_sum -> ad_sales_same_sku");
+  assert.equal(saved.metrics.ad_spend, 29.38, "ad_spend_sum -> ad_spend");
+  assert.equal(saved.metrics.ad_clicks, 64);
+  assert.equal(saved.currency, "USD", "currency is marketplace-derived (grain has no currency column)");
+  assert.equal(saved.dimension_key, JSON.stringify(["B0AGG"]), "dimension_key is the ASIN grain (child_asin only)");
+});
+
+test("aggregated ASIN source CLEAN-REPLACES the window (delete per account before insert); Campaign does NOT delete", async () => {
+  const aggRows = ({ ids }) => ids.map((id) => ({ seller_or_vendor_id: id, marketplace_country_code: id === G6_IN ? "IN" : "US", date: REQ.to, child_asin: "B0X", ad_sales_same_sku_sum: 5 }));
+  const a = makeDeps({ rowsFor: aggRows });
+  await runAdsSyncWithDeps(a.deps, ["US", "IN"], [ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(a.calls.deletes.length, 2, "one delete per account being persisted (clean window replace)");
+  assert.ok(a.calls.deletes.every((d) => d.sourceKey === ASIN && d.from === REQ.from && d.to === REQ.to), "delete scoped to the exact source + window");
+  assert.deepEqual(a.calls.deletes.map((d) => d.accountId).sort(), [G6_US, G6_IN].sort());
+  // Campaign source (no aggregations) must NOT delete -- its upsert-only contract is unchanged.
+  const b = makeDeps({ rowsFor: () => [row(G6_US, "US")] });
+  await runAdsSyncWithDeps(b.deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(b.calls.deletes.length, 0, "campaign-grain source never delete-replaces (contract unchanged)");
 });
 
 test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year boundary", () => {
@@ -747,7 +798,7 @@ test("resolveAdsAccountAllowlist: targets exactly the two Gate-6 accounts; fail-
 /* ============================= run ============================= */
 
 async function main() {
-  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT } = await import("../lib/server/ads-sync.js"));
+  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT, buildAdsExportRequestBody } = await import("../lib/server/ads-sync.js"));
   ({ evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
   // A single cap-sized result (>= EXPORT_LIMIT rows) reused to force a row-cap split in the ceiling tests.
   CAP = Array.from({ length: EXPORT_LIMIT }, () => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" }));

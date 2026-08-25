@@ -4,6 +4,7 @@ import {
   getAdsSyncStates,
   upsertAdDailyMetrics,
   upsertAdsDailyRows,
+  deleteAdsDailySourceRows,
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
   getDailyAdsCoverage,
@@ -63,6 +64,13 @@ export const ADS_SOURCES = [
     keyFields: ["ad_campaign_id", "ad_campaign_type"],
   },
   {
+    // REDUCED to the ACCOUNT / DATE / ASIN grain Daily Reporting + Brand View actually consume. The campaign /
+    // ad-group / ad-level dimensions are dropped and the six same-SKU metrics are SUMMED SERVER-SIDE (groupBy +
+    // aggregations), so an export stays far under the 5000-row page cap instead of exploding to campaign grain
+    // (e.g. 90 aggregated rows vs 376 campaign rows for one 21-day seller). DataDoe forbids an aggregation alias
+    // equal to a source column (ALIAS_COLLISION), so each metric is summed into a distinct "<metric>_sum" alias
+    // and mapped back to its canonical name on persist (rowRecord). This is ONLY the reusable ASIN Ads source for
+    // Daily/Brand -- the Campaign/PPC (campaign-performance-v1) + targeting/search-term contracts are unchanged.
     key: "asin-performance-v1",
     sourceId: "d0017e92fb089c2c8c3fe65f81d08666ecb4fe937ffbce9969ce2fc7d28c805c",
     initialDays: 60,
@@ -70,18 +78,22 @@ export const ADS_SOURCES = [
     monthlyDays: 49,
     batchSize: MAX_IDS_PER_EXPORT,
     dimensions: [
-      "marketplace_id", "marketplace_country_code", "marketplace_country_name",
-      "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_seller_id",
-      "amazon_ads_profile_id", "child_asin", "sku", "date", "product_name",
-      "ad_campaign_type", "ad_portfolio_id", "ad_portfolio_name", "ad_id",
-      "ad_group_id", "ad_campaign_id", "ad_campaign_name", "ad_campaign_status",
-      "ad_campaign_budget_amount", "ad_campaign_budget_type", "ad_campaign_budget_currency",
+      "marketplace_country_code", "seller_or_vendor_id", "date", "child_asin",
     ],
     metrics: [
       "ad_sales_same_sku", "ad_clicks", "ad_impressions", "ad_spend",
       "ad_units_sold_same_sku", "ad_orders_same_sku",
     ],
-    keyFields: ["child_asin", "sku", "ad_campaign_id", "ad_group_id", "ad_id", "ad_campaign_type"],
+    keyFields: ["child_asin"],
+    groupBy: ["marketplace_country_code", "seller_or_vendor_id", "date", "child_asin"],
+    aggregations: [
+      { column: "ad_sales_same_sku", aggregation: "sum", alias: "ad_sales_same_sku_sum" },
+      { column: "ad_clicks", aggregation: "sum", alias: "ad_clicks_sum" },
+      { column: "ad_impressions", aggregation: "sum", alias: "ad_impressions_sum" },
+      { column: "ad_spend", aggregation: "sum", alias: "ad_spend_sum" },
+      { column: "ad_units_sold_same_sku", aggregation: "sum", alias: "ad_units_sold_same_sku_sum" },
+      { column: "ad_orders_same_sku", aggregation: "sum", alias: "ad_orders_same_sku_sum" },
+    ],
   },
   {
     key: "keyword-targeting-performance-v1",
@@ -192,22 +204,34 @@ async function fetchAccounts(apiKey) {
   })).filter((account) => account.id);
 }
 
+// PURE: the exact create-export request body for one page. When the source declares server-side aggregations,
+// only the grain DIMENSIONS are requested as columns (the metrics arrive as the aggregation aliases) and groupBy +
+// aggregations are attached; otherwise the raw dimensions + metrics are requested as before. `skip` is the ONLY
+// field that changes between pages of the same window. Exported so the grain/limit/pagination contract is a
+// regression, not a source-text claim.
+export function buildAdsExportRequestBody(source, ids, from, to, skip = 0) {
+  const aggregating = Array.isArray(source.aggregations) && source.aggregations.length > 0;
+  const columns = aggregating ? [...source.dimensions] : [...source.dimensions, ...source.metrics];
+  return {
+    sourceId: source.sourceId,
+    sellerOrVendorIds: ids,
+    columns,
+    from,
+    to,
+    limit: EXPORT_LIMIT,
+    skip,
+    outputType: "JSON",
+    orderByColumn: "date",
+    orderByDirection: "ASC",
+    ...(aggregating ? { groupBy: source.groupBy, aggregations: source.aggregations } : {}),
+  };
+}
+
 async function createExport(apiKey, source, ids, from, to, skip = 0) {
   const response = await datadoeFetch(`${BASE}/exports`, {
     method: "POST",
     headers: authHeaders(apiKey),
-    body: JSON.stringify({
-      sourceId: source.sourceId,
-      sellerOrVendorIds: ids,
-      columns: [...source.dimensions, ...source.metrics],
-      from,
-      to,
-      limit: EXPORT_LIMIT,
-      skip, // pagination offset -- the ONLY field that changes between pages of the same window
-      outputType: "JSON",
-      orderByColumn: "date",
-      orderByDirection: "ASC",
-    }),
+    body: JSON.stringify(buildAdsExportRequestBody(source, ids, from, to, skip)),
   });
   if (!response.ok) {
     throw new Error(`DataDoe ${source.key} export creation failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
@@ -321,7 +345,10 @@ function rowRecord(source, row, refreshedAt, connection) {
   }
   const accountId = publicAccountId(connection, rawAccountId);
   const dimensions = Object.fromEntries(source.dimensions.map((key) => [key, row[key] ?? null]));
-  const metrics = Object.fromEntries(source.metrics.map((key) => [key, row[key] ?? null]));
+  // When the source aggregates server-side, each metric arrives under its distinct "<metric>_sum" alias; map it
+  // back to the CANONICAL metric name so the persisted `metrics` JSONB (and every downstream reader) is unchanged.
+  const aliasFor = Array.isArray(source.aggregations) ? Object.fromEntries(source.aggregations.map((a) => [a.column, a.alias])) : {};
+  const metrics = Object.fromEntries(source.metrics.map((key) => [key, (aliasFor[key] ? row[aliasFor[key]] : row[key]) ?? row[key] ?? null]));
   // JSON preserves empty fields and delimiters, so natural dimensions cannot
   // collide merely because an Amazon value itself contains a pipe character.
   const dimensionKey = JSON.stringify(source.keyFields.map((key) => row[key] ?? null));
@@ -614,6 +641,7 @@ export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
   getAdsSyncStates,
   getCoverage: getDailyAdsCoverage, // durable coverage/state reader (for the idempotent skip)
   upsertAdsDailyRows,
+  deleteAdsDailyRows: deleteAdsDailySourceRows, // clean-replace a window when the export grain changed
   upsertAdDailyMetrics,
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
@@ -635,6 +663,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
     upsertAdsSyncStates: upsertStates, recordAdsCoverageWindows: recordCoverage, now: nowFn,
   } = deps;
   const clock = typeof deps.clock === "function" ? deps.clock : () => Date.now();
+  const deleteRows = typeof deps.deleteAdsDailyRows === "function" ? deps.deleteAdsDailyRows : async () => ({ write: "ok" });
 
   const now = nowFn();
   const to = now.slice(0, 10);
@@ -764,6 +793,16 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
               continue; // zero row/metric/coverage/success writes for this batch
             }
             const normalized = rows.map((row) => rowRecord(source, row, now, connection));
+            // A reduced-grain (aggregated) source must cleanly REPLACE the window per account: any stale rows of a
+            // different natural grain (e.g. the old campaign-grain ASIN rows) have different dimension_keys, so an
+            // upsert alone would leave them in place and the per-date fold would DOUBLE COUNT. Delete this exact
+            // window for each account being persisted, then insert -- only for a source that declares aggregations,
+            // so the Campaign/PPC contract (no aggregations) keeps its unchanged upsert-only behavior.
+            if (Array.isArray(source.aggregations) && source.aggregations.length) {
+              for (const { account } of workingBatch) {
+                await deleteRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to });
+              }
+            }
             // DURABLE Ads-row persistence FIRST -- latest_metric_date + successful state are written only after.
             await upsertRows(normalized);
             if (source.key === "campaign-performance-v1") {
