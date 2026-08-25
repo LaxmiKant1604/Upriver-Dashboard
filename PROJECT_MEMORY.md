@@ -11810,3 +11810,19 @@ their account-level brand-sales, portfolio account set == account-level validate
 account set for every production brand, coverage updates on brand switch, exports=0/tokens=0 for the
 repair, Campaign Ads/FBA/controls/scheduler unchanged. The DEPLOY self-heals each scope on first
 Brand View load, so no manual rebuild is required.
+
+## 2026-08-25 - Scheduler v2 stale-snapshot preflight correction
+
+The scheduled Non-US run passed cycle identity and its token gate (84 usable, 20 required), then
+failed before any export with SOURCE_EVIDENCE_READ_FAILED / snapshot-stale. The stale evidence was
+the saved Catalog/FBA snapshot context, not an OLI read failure. gatherEvidence already treats stale
+snapshots as unavailable refresh evidence and drops their rows, but preflightEvidence accidentally
+classified every snapshot-* blocker as a hard read failure. This made a narrowed OLI-only run depend
+on paused, out-of-scope sources.
+
+Fix 75d0b69 lets snapshot-stale continue through preflight while retaining the typed blocker and
+discarded rows. Schema/read/dangling/integrity failures remain fail-closed. A production-shape
+regression proves stale Catalog/FBA cannot block narrowed OLI, Catalog/FBA are not planned, and the
+preflight itself performs zero cycle writes and zero DataDoe creates. The failed GitHub run spent
+zero tokens. Verification: npm run verify green, 60 steps / 40 suites including build:check;
+git diff --check clean.
