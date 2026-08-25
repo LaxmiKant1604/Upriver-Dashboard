@@ -12050,3 +12050,34 @@ insert to avoid double-counting the old campaign-grain rows; Campaign/PPC contra
 budget: 18 additional tokens from start balance 118. Spent 2 on the aggregation-syntax validation (learned
 ALIAS_COLLISION via a free 400, then a 202 confirming 90 rows). 25 accounts Ads-connected (live recheck),
 5 still not (external). verify 63/63.
+
+
+-- 2026-08-25 (session 2, DataDoe REST clarification applied): DataDoe confirmed in writing the REST Export
+API has NO row cap (the transient HTTP 400 "limit must not exceed 5000" was a resolved DataDoe incident;
+5000 is MCP-only, unused here). Applied to unfinished work: EXPORT_LIMIT 5000->50000 (single REST export
+returns the whole <=5-seller window; skip-pagination is now a FAIL-SAFE firing only at the FULL limit, never
+at 5000). KEPT the reduced-grain server-side aggregation (groupBy account/date/child_asin + SUM the 6
+same-SKU metrics via distinct _sum aliases, mapped back on persist): semantically correct (identical
+Daily/Brand totals, no metric dropped), independently beneficial (small/clean exports), and already persisted
+for completed accounts -- not a 5000 workaround. Also fixed: (a) sameMarketplace UK<->GB alias (Amazon
+returns GB, directory says UK) in batch validation; (b) resolveDailyAdsAvailability treats a well-formed
+OUT-OF-WINDOW ad row as a dropped SUPERSET (ads window can end after the OLI-clamped sales window), not a
+failure -- malformed/cross-account/currency rows still fail closed; (c) Brand View ASIN->brand map now reads
+the reusable Product Catalog (child_asin->product_brand) as a fallback source so ads attribute even for
+accounts with no fba-plan/sku-pl snapshot (getCatalogRows wired org-scoped, zero export).
+
+OUTCOME: 25 accounts Ads-connected (8 US + 17 Non-US; live recheck), 5 disconnected (EXTERNAL: 126918b3,
+59f12ccc, 81146c04, 858977f0 IN + 8aa74e96 IT). 7 accounts populated with ASIN Ads in Daily (fresh
+ASIN-grain: 70642927 AU, 9aa10836 ES, ab545c58 FR, b1a80d6c DE, b60cf168 PL from one clean batch-2 export;
+128bf8ad IT from a targeted export; 26f7a1a6 US pre-existing). Daily read-backs show real ACoS/TACoS
+(128bf8ad 22%/3.70%, 70642927 38.8%/2.16%, b1a80d6c 20.8%/0.62%, 26f7a1a6 33.7%/0.78%). Brand View: 5
+portfolios rebuilt zero-export with ad spend -- Bebi Born (BE/DE/ES/FR/IT/NL, 198), DREAM HAVEN (IT, 6523),
+Caruso Italy (AU/US, 6498), SHAFI (DE, 68); owlKraft 0 (honest). TOKENS: 9 charged creates = 18 = the FULL
+18-token ceiling (mission-2 start balance 118; balance now 136 -- the extra pool replenishes). 0 exports
+adopted (none reusable). The remaining ~18 connected accounts are UNfinished: the ceiling was exhausted
+largely on DataDoe's transient 5000/500/503 incidents before the REST clarification -- a future session with
+fresh budget can finish them in ~4 exports/8 tokens with the corrected code. Did NOT run a fresh >5000 REST
+proof: it is a new create that would exceed the exhausted 18-token ceiling (code uses limit=50000, matching
+the working OLI/brand-sales REST sources). Campaign Ads creates=0, FBA creates=0, controls safe-closed
+(all_primary=false, rollout=0, rss=0, approvals=0), no pg_cron, Brand Sales(37)/Inventory(30) unchanged.
+Code c9d6fd5 (+ 973d135 superset, 4b4e6ab UK/GB, 96dd302 aggregation, de9c0a3 max-creates) pushed; verify 63/63.
