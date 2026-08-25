@@ -18,7 +18,7 @@
 import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 import { dailyReportingReadiness, slicedOliSourceFromHistory, BRAND_VIEW_ADS_GRAIN } from "../sync/durable-dashboards.js";
 import { buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } from "../sync/daily-ads-loader.js";
-import { ORGANIZATION_SCOPE_KEY } from "../sync/source-durable-model.js";
+import { ORGANIZATION_SCOPE_KEY, mergeCoverageWindows } from "../sync/source-durable-model.js";
 
 // The CURRENT Daily Reporting identities (kept in lockstep with report-publisher / registry / api / App.jsx).
 export const DAILY_V2_LIVE_VERSION = "daily-reporting-shared-v2";
@@ -27,6 +27,26 @@ export const CATALOG_SOURCE_KEY = "product-catalog";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+/**
+ * The latest date <= `ceiling` that the account's proven OLI coverage contiguously covers starting at `from`.
+ *
+ * WHY: the frontend always requests Daily with to=TODAY, but durable OLI is only proven through the last
+ * exported date (per account -- some accounts are a few days behind others, and no new export is authorized).
+ * Deriving to the EXACT requested date fails readiness (coverage-incomplete) and blanks the page. Instead we
+ * honestly serve the report ENDING at each account's own latest proven date. Returns null when `from` itself
+ * is not covered (a genuine gap at the window start -> the report cannot be produced; never a fabricated zero).
+ * Malformed coverage evidence fails closed (via mergeCoverageWindows) -> null, never a false "proven".
+ */
+export function latestProvenDailyTo({ oliWindows, from, ceiling }) {
+  if (!isDate(from) || !isDate(ceiling) || from > ceiling) return null;
+  let merged;
+  try { merged = mergeCoverageWindows(oliWindows || []); } catch (_e) { return null; }
+  const containing = merged.find((w) => w.from <= from && w.to >= from);
+  if (!containing) return null;
+  const effectiveTo = containing.to < ceiling ? containing.to : ceiling;
+  return effectiveTo >= from ? effectiveTo : null;
+}
 
 /**
  * PURE: derive the daily-reporting/v2e-1 payload for ONE account from already-read durable evidence, through the
@@ -101,9 +121,14 @@ export async function gatherDailyDurableEvidence({ accountId, from, to, brand = 
 
   const historyRows = await readOliHistory({ organizationFingerprint, connectionId, accountIds: [accountId], from, to });
   const oliCov = await readOliCoverage({ organizationFingerprint, connectionId, accountId, sourceKey: DAILY_OLI_SOURCE_KEY });
-  const catalogSnapshot = await readCatalogSnapshot({ organizationFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY });
+  // getSourceSnapshot returns { snapshot: <pointer>, read, error }; a plain pointer (tests / other readers) is
+  // used as-is. The pointer carries object_path (payload storage) + validated_at (readiness). Reading the wrapper
+  // directly (the previous bug) left catalogRows null -> every account failed "catalog-rows-unavailable".
+  const catalogRead = await readCatalogSnapshot({ organizationFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY });
+  const catalogSnapshot = catalogRead && typeof catalogRead === "object" && "snapshot" in catalogRead ? catalogRead.snapshot : catalogRead;
+  const catalogReadOk = !catalogRead || typeof catalogRead !== "object" || !("read" in catalogRead) || catalogRead.read === "ok";
   let catalogRows = null;
-  if (catalogSnapshot && catalogSnapshot.object_path) {
+  if (catalogReadOk && catalogSnapshot && catalogSnapshot.object_path) {
     const payload = await loadCatalogPayload(catalogSnapshot.object_path);
     catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
   }
@@ -140,15 +165,41 @@ export function durableRefreshedAt(evidence, latestDataDate) {
   return candidates.length ? candidates[candidates.length - 1] : null;
 }
 
+// Gather durable evidence, optionally CLAMP the requested `to` down to the account's latest proven OLI date, then
+// re-derive through the pure contract. Returns { evidence, effectiveTo, result } where result is the pure
+// rederiveDailyV2Payload output. When clampToProven and `from` is not covered, result is a typed OLI not-ready.
+async function gatherClampAndDerive({ accountId, rawSellerId, currency, from, to, brand, organizationFingerprint, connectionId, clampToProven }, readers) {
+  const evidence = await gatherDailyDurableEvidence({ accountId, from, to, brand, organizationFingerprint, connectionId }, readers);
+  let effectiveTo = to;
+  if (clampToProven) {
+    effectiveTo = latestProvenDailyTo({ oliWindows: evidence.oliWindows, from, ceiling: to });
+    if (!effectiveTo) {
+      return {
+        evidence, effectiveTo: null,
+        result: { notReady: "not-ready", blockedBy: [{ sourceKey: DAILY_OLI_SOURCE_KEY, reason: "coverage-incomplete", accountId: S(accountId), blocksSales: true }] },
+      };
+    }
+  }
+  const result = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to: effectiveTo, brand }, evidence);
+  return { evidence, effectiveTo, result };
+}
+
 /**
  * Gather + re-derive WITHOUT saving. For the read-path self-heal (serveSharedReport performs the save under the
- * refresh lock). Returns { payload, sourceRefreshedAt, latestDataDate } or { notReady, blockedBy? }. ZERO DataDoe.
+ * refresh lock). Returns { payload, sourceRefreshedAt, latestDataDate, latestCompletedDate, effectiveParams } or
+ * { notReady, blockedBy? }. ZERO DataDoe. When `clampToProven` is true, the payload ENDS at the account's latest
+ * proven OLI date (<= the requested `to`), and effectiveParams carries the honest { from, to, brand } it covers.
  */
-export async function rederiveDailyV2({ accountId, rawSellerId, currency, from, to, brand = "ALL", organizationFingerprint, connectionId = "primary" }, readers) {
-  const evidence = await gatherDailyDurableEvidence({ accountId, from, to, brand, organizationFingerprint, connectionId }, readers);
-  const result = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to, brand }, evidence);
+export async function rederiveDailyV2({ accountId, rawSellerId, currency, from, to, brand = "ALL", organizationFingerprint, connectionId = "primary", clampToProven = false }, readers) {
+  const { evidence, effectiveTo, result } = await gatherClampAndDerive({ accountId, rawSellerId, currency, from, to, brand, organizationFingerprint, connectionId, clampToProven }, readers);
   if (!result.payload) return result; // { notReady, blockedBy? }
-  return { payload: result.payload, latestDataDate: result.latestDataDate, sourceRefreshedAt: durableRefreshedAt(evidence, result.latestDataDate) || null };
+  return {
+    payload: result.payload,
+    latestDataDate: result.latestDataDate,
+    latestCompletedDate: effectiveTo,
+    effectiveParams: { from, to: effectiveTo, brand: S(brand).trim() || "ALL" },
+    sourceRefreshedAt: durableRefreshedAt(evidence, result.latestDataDate) || null,
+  };
 }
 
 /**
@@ -157,11 +208,11 @@ export async function rederiveDailyV2({ accountId, rawSellerId, currency, from, 
  * saver bound to the exact live identity report_key=daily-reporting / params_hash for v2 + the exact params).
  * There is NO DataDoe adapter here, so a create-export cannot occur.
  */
-export async function rederiveAndSaveDailyV2({ accountId, rawSellerId, currency, from, to, brand = "ALL", organizationFingerprint, connectionId = "primary" }, { readers, save }) {
-  const evidence = await gatherDailyDurableEvidence({ accountId, from, to, brand, organizationFingerprint, connectionId }, readers);
-  const result = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to, brand }, evidence);
+export async function rederiveAndSaveDailyV2({ accountId, rawSellerId, currency, from, to, brand = "ALL", organizationFingerprint, connectionId = "primary", clampToProven = false }, { readers, save }) {
+  const { evidence, effectiveTo, result } = await gatherClampAndDerive({ accountId, rawSellerId, currency, from, to, brand, organizationFingerprint, connectionId, clampToProven }, readers);
   if (!result.payload) return { published: false, ...result };
   const sourceRefreshedAt = durableRefreshedAt(evidence, result.latestDataDate) || null;
-  const saved = await save({ payload: result.payload, sourceRefreshedAt });
-  return { published: true, payload: result.payload, latestDataDate: result.latestDataDate, sourceRefreshedAt, saved };
+  const effectiveParams = { from, to: effectiveTo, brand: S(brand).trim() || "ALL" };
+  const saved = await save({ payload: result.payload, sourceRefreshedAt, effectiveParams, latestCompletedDate: effectiveTo });
+  return { published: true, payload: result.payload, latestDataDate: result.latestDataDate, latestCompletedDate: effectiveTo, effectiveParams, sourceRefreshedAt, saved };
 }

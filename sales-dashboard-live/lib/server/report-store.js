@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import {
   claimRefreshLock,
   getLatestReportSnapshot,
+  getLatestReportSnapshotForScope,
   getReportSnapshot,
   isSupabaseConfigured,
   publishSnapshotUpdate,
@@ -59,6 +60,27 @@ export function wantsRefresh(req) {
 // as the new report.
 export function staleSnapshotMatchesReportVersion(snapshot, reportVersion) {
   return snapshot?.params?.reportVersion === reportVersion;
+}
+
+// A stale snapshot may only be served across a date rollover when it belongs to the SAME scope as the request --
+// not just the same report version. Daily Reporting is scoped by brand: an ALL-brand snapshot must never be
+// served to a named-brand request (that would show the whole account under one brand's heading), nor the reverse.
+// The as-of date (`to`) is deliberately NOT part of the scope -- rolling past it is the whole point of the stale
+// path. Keys not listed impose no constraint, so reports that pass no staleScopeKeys keep the prior behaviour.
+const BRAND_SCOPE_DEFAULT = "ALL";
+function scopeValue(key, value) {
+  if (key === "brand") { const b = value == null ? "" : String(value).trim(); return b || BRAND_SCOPE_DEFAULT; }
+  return value == null ? "" : String(value);
+}
+export function pickStaleScope(params, keys) {
+  const scope = {};
+  for (const k of keys || []) scope[k] = scopeValue(k, params ? params[k] : undefined);
+  return scope;
+}
+export function staleSnapshotMatchesScope(snapshot, params, keys) {
+  if (!keys || !keys.length) return true;
+  const sp = snapshot && snapshot.params ? snapshot.params : {};
+  return keys.every((k) => scopeValue(k, sp[k]) === scopeValue(k, params ? params[k] : undefined));
 }
 
 function snapshotMeta(snapshot) {
@@ -157,8 +179,17 @@ export async function serveSharedReport({
   // it so the page auto-populates on this very visit -- still ZERO DataDoe. () => ({ payload, sourceRefreshedAt }
   // | { notReady, blockedBy? }). NEVER passed a DataDoe adapter, so it cannot create an export.
   deriveDurable = null,
+  // Param keys that a stale (date-rolled) snapshot MUST match to be served -- e.g. ["brand"] for Daily, so a
+  // named-brand read never falls back to the ALL-brand snapshot. Empty keeps the original report-version-only match.
+  staleScopeKeys = [],
+  // Injectable Supabase readers + self-heal store, so the full read path (including the brand-scoped stale fallback
+  // and the durable self-heal) is provable offline. Production passes nothing and uses the module wrappers.
+  readers = {}, store = undefined,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
+  const readSnapshot = readers.getReportSnapshot || getReportSnapshot;
+  const readLatest = readers.getLatestReportSnapshot || getLatestReportSnapshot;
+  const readLatestForScope = readers.getLatestReportSnapshotForScope || getLatestReportSnapshotForScope;
 
   // Without Supabase there is no shared store. Refresh still works so the app
   // remains usable in a local environment, but it is reported as unshared
@@ -178,7 +209,7 @@ export async function serveSharedReport({
   }
 
   if (!refresh) {
-    const snapshot = await getReportSnapshot({ reportKey, accountId, paramsHash });
+    const snapshot = await readSnapshot({ reportKey, accountId, paramsHash });
     if (snapshot && snapshot.payload) {
       res.status(200).json({
         ...present(snapshot.payload),
@@ -193,9 +224,15 @@ export async function serveSharedReport({
     // every morning, serve the most recent saved snapshot for this report and
     // account and label it with the scope it was actually saved for. The stale
     // flag is what lets the UI say "this is yesterday's report" instead of
-    // implying it is current.
-    const latest = await getLatestReportSnapshot({ reportKey, accountId });
-    if (latest && latest.payload && staleSnapshotMatchesReportVersion(latest, reportVersion)) {
+    // implying it is current. When staleScopeKeys is set the fallback is
+    // narrowed to the SAME scope (e.g. brand), so a named-brand read cannot be
+    // answered with the ALL-brand snapshot.
+    const latest = staleScopeKeys.length
+      ? await readLatestForScope({ reportKey, accountId, reportVersion, scope: pickStaleScope(params, staleScopeKeys) })
+      : await readLatest({ reportKey, accountId });
+    if (latest && latest.payload
+        && staleSnapshotMatchesReportVersion(latest, reportVersion)
+        && staleSnapshotMatchesScope(latest, params, staleScopeKeys)) {
       res.status(200).json({
         ...present(latest.payload),
         reportKey, reportVersion, paramsHash,
@@ -215,7 +252,7 @@ export async function serveSharedReport({
     if (deriveDurable) {
       const healed = await selfHealFromDurable({
         deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds,
-      });
+      }, store);
       if (healed.served) return;
       if (healed.notReady) {
         res.status(200).json({
@@ -363,11 +400,22 @@ export async function selfHealFromDurable({ deriveDurable, reportKey, reportVers
         message: `Waiting for the scheduled data refresh before ${label} can be shown${named}. No fabricated values are displayed and no export is created.`,
       };
     }
-    const saved = await persistDerivedSnapshot({ reportKey, reportVersion, accountId, paramsHash, params, payload: derived.payload, sourceRefreshedAt: derived.sourceRefreshedAt, label }, store);
+    // If the re-derivation CLAMPED the requested as-of down to the account's latest proven date, the honest
+    // identity is the effective window (from, to=latest-proven, brand), NOT the requested one. Persist under that
+    // identity so the row's params_hash matches its params (provenance stays exact) and serve it clearly labelled
+    // as an earlier as-of -- exactly like the stale path -- rather than pretending it covers the requested date.
+    const effectiveParams = derived.effectiveParams || null;
+    const effectiveHash = effectiveParams ? paramsHashFor(reportVersion, effectiveParams) : paramsHash;
+    const clamped = effectiveParams && effectiveHash !== paramsHash;
+    const persistParams = clamped ? effectiveParams : params;
+    const saved = await persistDerivedSnapshot({ reportKey, reportVersion, accountId, paramsHash: effectiveHash, params: persistParams, payload: derived.payload, sourceRefreshedAt: derived.sourceRefreshedAt, label }, store);
     res.status(200).json({
       ...present(derived.payload),
-      reportKey, reportVersion, paramsHash,
-      snapshot: { savedAt: saved.savedAt, updatedAt: saved.updatedAt, bytes: saved.payload_bytes, shared: true, rederived: true },
+      reportKey, reportVersion, paramsHash: effectiveHash,
+      snapshot: {
+        savedAt: saved.savedAt, updatedAt: saved.updatedAt, bytes: saved.payload_bytes, shared: true, rederived: true,
+        ...(clamped ? { staleScope: true, savedForParams: { reportVersion, ...effectiveParams }, requestedParams: { reportVersion, ...params } } : {}),
+      },
     });
     return { served: true };
   } finally {

@@ -2559,6 +2559,9 @@ async function handleDataDoe(req, res) {
       // derivation contract and publish it -- ZERO DataDoe. This closes the rollout-order gap where the frontend
       // requests v2 before any v2 snapshot was published, WITHOUT ever spending a token on a page visit.
       if (action === "daily" && accountScope && accountScope.accountIds.length === 1) {
+        // A named-brand Daily read must never fall back to the ALL-brand snapshot across a date rollover (or vice
+        // versa), so the stale-serve is narrowed to the requested brand scope.
+        sharedOptions.staleScopeKeys = ["brand"];
         const dailyPrimary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
         if (dailyPrimary) {
           const dailyOrgFingerprint = dailyPrimary.organizationFingerprint || organizationFingerprint(dailyPrimary.apiKey);
@@ -2574,10 +2577,13 @@ async function handleDataDoe(req, res) {
           };
           sharedOptions.deriveDurable = async () => {
             const meta = await accountDirectoryMeta(dailyAccountId).catch(() => null);
+            // clampToProven: the browser always asks for to=TODAY, but durable OLI is only proven through each
+            // account's last exported date and NO new export is authorized. Derive/serve the report ENDING at the
+            // latest proven date instead of failing the whole page -- honestly labelled as that earlier as-of.
             return rederiveDailyV2({
               accountId: dailyAccountId, rawSellerId: dailyRawSellerId, currency: meta ? meta.currency : null,
               from: legacyShared.params.from, to: legacyShared.params.to, brand: legacyShared.params.brand || "ALL",
-              organizationFingerprint: dailyOrgFingerprint,
+              organizationFingerprint: dailyOrgFingerprint, clampToProven: true,
             }, dailyDurableReaders);
           };
         }

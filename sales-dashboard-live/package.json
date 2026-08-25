@@ -34,6 +34,8 @@
     "test:scheduler-automation": "node scripts/scheduler-v2-automation.test.js",
     "test:asin-ads-aggregation": "node scripts/asin-ads-aggregation.test.js",
     "test:daily-durable-rederive": "node scripts/daily-durable-rederive.test.js",
+    "test:daily-v2-backfill": "node scripts/daily-v2-backfill.test.js",
+    "test:daily-v2-serving": "node scripts/daily-v2-serving.test.js",
     "test:durable-live-parity": "node scripts/durable-live-parity.test.js",
     "test:schema-contract-mutation": "node scripts/schema-contract-mutation.test.js",
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",

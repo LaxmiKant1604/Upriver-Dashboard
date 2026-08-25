@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { REPORT_DERIVATIONS } from "../lib/server/sync/report-derivation.js";
 import {
-  rederiveDailyV2Payload, gatherDailyDurableEvidence, rederiveAndSaveDailyV2, durableRefreshedAt,
+  rederiveDailyV2Payload, gatherDailyDurableEvidence, rederiveAndSaveDailyV2, rederiveDailyV2, durableRefreshedAt,
+  latestProvenDailyTo,
 } from "../lib/server/reports/daily-durable-rederive.js";
 import { selfHealFromDurable } from "../lib/server/report-store.js";
 
@@ -86,6 +87,22 @@ test("named-brand request derives the brand-FILTERED payload (no ads), exactly l
   assert.ok(r.payload);
   assert.equal(r.payload.brandFiltered, true, "brand-filtered");
   assert.ok(!("adsAvailability" in r.payload), "named-brand carries no ads");
+});
+
+// ---- latestProvenDailyTo: honestly clamp the requested as-of to each account's proven OLI coverage ----
+test("latestProvenDailyTo clamps to the contiguous proven end containing `from`, capped at the ceiling", () => {
+  // Proven [2025-01-01 .. 2026-08-22]; request ceiling 2026-08-24 -> clamp to 2026-08-22 (the real coverage end).
+  assert.equal(latestProvenDailyTo({ oliWindows: [{ from: "2025-01-01", to: "2026-08-22" }], from: "2026-03-01", ceiling: "2026-08-24" }), "2026-08-22");
+  // Proven through the ceiling and beyond -> capped AT the ceiling (never past what was reviewed).
+  assert.equal(latestProvenDailyTo({ oliWindows: [{ from: "2025-01-01", to: "2026-09-30" }], from: "2026-03-01", ceiling: "2026-08-24" }), "2026-08-24");
+  // Adjacent windows merge into one contiguous span -> the merged end is used.
+  assert.equal(latestProvenDailyTo({ oliWindows: [{ from: "2025-01-01", to: "2026-08-09" }, { from: "2026-08-10", to: "2026-08-24" }], from: "2026-03-01", ceiling: "2026-08-24" }), "2026-08-24");
+});
+test("latestProvenDailyTo returns null when `from` itself is in a gap (report cannot be produced; never a fake zero)", () => {
+  assert.equal(latestProvenDailyTo({ oliWindows: [{ from: "2026-03-15", to: "2026-08-24" }], from: "2026-03-01", ceiling: "2026-08-24" }), null);
+  assert.equal(latestProvenDailyTo({ oliWindows: [], from: "2026-03-01", ceiling: "2026-08-24" }), null);
+  // Malformed coverage evidence fails closed (never a false "proven").
+  assert.equal(latestProvenDailyTo({ oliWindows: [{ from: "2026-08-21T18:30:00Z", to: "2026-08-24" }], from: "2026-03-01", ceiling: "2026-08-24" }), null);
 });
 
 test("durableRefreshedAt binds to the evidence (never wall-clock): latest of catalog / ads / data date", () => {
@@ -226,6 +243,68 @@ await testAsync("(2) THIRTY primary accounts each produce a valid v2 payload fro
   const s1 = saves.get("A01").rows.reduce((a, r) => a + (Number(r.total_sales) || 0), 0);
   const s2 = saves.get("A02").rows.reduce((a, r) => a + (Number(r.total_sales) || 0), 0);
   assert.notEqual(s1, s2, "per-account isolation: distinct durable evidence -> distinct totals");
+});
+
+// ---- the getSourceSnapshot {snapshot,read,error} wrapper shape (the catalog bug that blanked all 30) ----
+await testAsync("gather HYDRATES the catalog from the getSourceSnapshot { snapshot, read } wrapper (not a flat pointer)", async () => {
+  const { readers } = makeReaders({
+    readCatalogSnapshot: async () => ({ snapshot: CATALOG_SNAP, read: "ok", error: null }), // production shape
+    loadCatalogPayload: async (objPath) => { assert.equal(objPath, "cat/obj", "reads the NESTED pointer's object_path"); return CATALOG; },
+  });
+  const ev = await gatherDailyDurableEvidence({ accountId: ACCOUNT, from: FROM, to: TO, brand: "ALL", organizationFingerprint: "org" }, readers);
+  assert.equal(Array.isArray(ev.catalogRows), true);
+  assert.equal(ev.catalogRows.length, 2, "catalog rows hydrated from the wrapped snapshot");
+  assert.equal(ev.catalogSnapshot.validated_at, CATALOG_SNAP.validated_at, "the nested pointer (validated_at) drives readiness");
+});
+await testAsync("gather treats a non-ok wrapped catalog read as unavailable (fail closed, no hydration)", async () => {
+  const { readers } = makeReaders({ readCatalogSnapshot: async () => ({ snapshot: null, read: "read-failed", error: "x" }) });
+  const ev = await gatherDailyDurableEvidence({ accountId: ACCOUNT, from: FROM, to: TO, brand: "ALL", organizationFingerprint: "org" }, readers);
+  assert.equal(ev.catalogRows, null, "no catalog rows when the read failed");
+});
+
+// ---- clampToProven: derive/serve ENDING at the account's latest proven date, never the exact requested date ----
+await testAsync("rederiveDailyV2 clampToProven derives to the latest proven date (< requested) + returns effectiveParams", async () => {
+  const { readers } = makeReaders({ readOliCoverage: async () => ({ windows: [{ from: "2025-06-01", to: "2026-03-15" }], read: "ok" }) });
+  const res = await rederiveDailyV2({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "ALL", organizationFingerprint: "org", clampToProven: true }, readers);
+  assert.ok(res.payload, "derives despite requested to=2026-03-20 exceeding proven 2026-03-15");
+  assert.equal(res.latestCompletedDate, "2026-03-15", "clamped to the proven end");
+  assert.deepEqual(res.effectiveParams, { from: FROM, to: "2026-03-15", brand: "ALL" }, "effectiveParams carries the honest window");
+});
+await testAsync("rederiveDailyV2 clampToProven returns typed not-ready when `from` is in a coverage gap (no fabricated report)", async () => {
+  const { readers } = makeReaders({ readOliCoverage: async () => ({ windows: [{ from: "2026-03-15", to: TO }], read: "ok" }) });
+  const res = await rederiveDailyV2({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "ALL", organizationFingerprint: "org", clampToProven: true }, readers);
+  assert.ok(!res.payload && res.notReady === "not-ready");
+  assert.ok(res.blockedBy.some((b) => b.sourceKey === "order-line-items"), "blocked on OLI coverage at the window start");
+});
+await testAsync("rederiveAndSaveDailyV2 clampToProven hands the effective window to `save` (honest params for the row)", async () => {
+  const { readers } = makeReaders({ readOliCoverage: async () => ({ windows: [{ from: "2025-06-01", to: "2026-03-15" }], read: "ok" }) });
+  const saves = [];
+  const res = await rederiveAndSaveDailyV2({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "ALL", organizationFingerprint: "org", clampToProven: true },
+    { readers, save: async (x) => { saves.push(x); return { id: "s", payload_bytes: 10 }; } });
+  assert.equal(res.published, true);
+  assert.equal(saves.length, 1);
+  assert.deepEqual(saves[0].effectiveParams, { from: FROM, to: "2026-03-15", brand: "ALL" }, "save receives the clamped window");
+  assert.equal(saves[0].latestCompletedDate, "2026-03-15");
+});
+
+// ---- the read-path self-heal persists the CLAMPED identity honestly (params_hash matches params) ----
+await testAsync("self-heal on a clamped derive persists under the EFFECTIVE hash + serves it as an earlier as-of (staleScope)", async () => {
+  const store = makeStore(); const { res, cap } = fakeRes();
+  const derived = {
+    payload: { rows: [{ date: "2026-03-15", total_sales: 160 }], brandFiltered: false, adsAvailability: { status: "validated" } },
+    sourceRefreshedAt: "2026-03-16T00:00:00Z",
+    effectiveParams: { from: FROM, to: "2026-03-15", brand: "ALL" }, latestCompletedDate: "2026-03-15",
+  };
+  const out2 = await selfHealFromDurable({ ...HEAL_ARGS, res, deriveDurable: async () => derived }, store);
+  assert.equal(out2.served, true);
+  assert.equal(cap.body.snapshot.staleScope, true, "served as an earlier as-of (not pretending it covers the requested to)");
+  assert.equal(cap.body.snapshot.savedForParams.to, "2026-03-15", "labelled with the real coverage date");
+  assert.equal(cap.body.snapshot.requestedParams.to, TO, "and the requested date it was NOT able to cover");
+  // The row is stored under the EFFECTIVE identity (its params_hash matches its params), NOT the requested ph1.
+  assert.equal(store.snaps.has("daily-reporting|A01|ph1"), false, "not stored under the requested (mismatched) hash");
+  const stored = [...store.snaps.values()][0];
+  assert.equal(stored.params.to, "2026-03-15", "stored params carry the honest effective window");
+  assert.equal(stored.params.reportVersion, "daily-reporting-shared-v2", "saved as v2 (never a v1 copy)");
 });
 }
 

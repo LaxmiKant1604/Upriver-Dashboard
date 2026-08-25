@@ -341,6 +341,29 @@ export async function getLatestReportSnapshot({ reportKey, accountId }) {
   return rows[0] || null;
 }
 
+/**
+ * The most recent saved snapshot for a report+account whose params match a SCOPE (e.g. { reportVersion, brand }),
+ * WHATEVER as-of date it was saved under. This is the stale-across-midnight read narrowed to one scope so a
+ * named-brand Daily request can never fall back to (and leak) the ALL-brand snapshot, and vice versa. Scope keys
+ * are matched against the JSONB params via `params->>key=eq.value`; the newest matching row (by updated_at) wins.
+ */
+export async function getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion = null, scope = {} }) {
+  const query = new URLSearchParams({
+    select: "id,report_key,account_id,params_hash,params,payload,payload_storage_path,payload_bytes,source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  if (reportVersion != null) query.append("params->>reportVersion", `eq.${reportVersion}`);
+  for (const [k, v] of Object.entries(scope || {})) {
+    if (v == null) continue;
+    query.append(`params->>${k}`, `eq.${v}`);
+  }
+  const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  return rows[0] || null;
+}
+
 // The most recent saved snapshot for a report+account, with its payload hydrated STORAGE-FIRST: when the row's
 // inline payload is out-of-line (stored in the source-cache bucket -> inline null/partial), the full payload is
 // fetched via its payload_storage_path. WITHOUT this, a large brand-sales snapshot (inline null) is invisible to

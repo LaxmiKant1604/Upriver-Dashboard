@@ -1,0 +1,155 @@
+// TRUSTED ZERO-EXPORT backfill of the CURRENT live Daily Reporting version (daily-reporting-shared-v2) for a set
+// of primary accounts, from ALREADY-DURABLE evidence only. This is the deterministic, verifiable publisher the
+// mission needs: it does NOT depend on a browser page visit (the read-path self-heal), it discovers nothing on
+// its own beyond the accounts it is handed, and it is structurally incapable of creating a DataDoe export -- it
+// is never given an adapter, only durable Supabase readers (OLI history + coverage, ASIN Ads + coverage, the
+// reusable Product Catalog snapshot).
+//
+// HONESTY: each account is published ENDING at its OWN latest proven OLI date (<= the reviewed asOf ceiling), via
+// latestProvenDailyTo. No new export is authorized, so an account whose durable OLI is a few days behind is
+// published for the window it can actually prove -- never padded to the ceiling, never a fabricated zero. The
+// saved snapshot's params carry the effective { from, to, brand } and its params_hash is provenance-checked to
+// equal paramsHashFor(reportVersion, effectiveParams) (a mismatch is refused). The derivation is the REAL
+// contract (rederiveDailyV2Payload), so a v1 (campaign-grain) payload is never copied or relabelled.
+//
+// IDEMPOTENT: a valid v2 snapshot already saved at the effective identity is left untouched (skipped as
+// "existing") -- a replay performs ZERO writes. A single account's failure is isolated (typed) and never
+// overwrites that account's last-known-good snapshot. Each identity is serialized through the shared refresh
+// lock so two concurrent runs never double-derive the same account.
+
+import {
+  DAILY_V2_LIVE_VERSION, DAILY_OLI_SOURCE_KEY,
+  gatherDailyDurableEvidence, latestProvenDailyTo, rederiveDailyV2Payload, durableRefreshedAt,
+} from "./daily-durable-rederive.js";
+import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
+
+export const DAILY_V2_REPORT_KEY = "daily-reporting";
+const DAILY = REPORT_DERIVATIONS["daily-reporting"];
+
+const S = (v) => (v == null ? "" : String(v));
+const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+/**
+ * Wrap a raw snapshot saver with a PROVENANCE guard: the row is written ONLY when its params_hash equals
+ * paramsHashFor(reportVersion, { from, to, brand }) recomputed from the params being written. A mismatch is
+ * refused (thrown) so a snapshot can never be persisted under a forged or stale identity -- the exact-key read
+ * that later serves it is keyed by that hash, so an inconsistent hash would silently serve the wrong scope.
+ */
+export function makeProvenanceGuardedSave({ paramsHashFor, saveSnapshot }) {
+  if (typeof paramsHashFor !== "function" || typeof saveSnapshot !== "function") {
+    throw new Error("makeProvenanceGuardedSave requires paramsHashFor + saveSnapshot (fail closed).");
+  }
+  return async ({ reportKey, reportVersion, accountId, paramsHash, params, payload, sourceRefreshedAt }) => {
+    const expected = paramsHashFor(reportVersion, { from: params.from, to: params.to, brand: params.brand });
+    if (paramsHash !== expected) {
+      throw new Error(`daily-v2-backfill: refusing to save ${accountId} under params_hash ${paramsHash} != provenance ${expected} (wrong-hash refused).`);
+    }
+    if (params.reportVersion && params.reportVersion !== reportVersion) {
+      throw new Error(`daily-v2-backfill: refusing to save ${accountId} with params.reportVersion ${params.reportVersion} != ${reportVersion} (wrong-version refused).`);
+    }
+    return saveSnapshot({ reportKey, accountId, paramsHash, params, payload, sourceRefreshedAt });
+  };
+}
+
+/**
+ * Backfill v2 Daily snapshots for `accounts` from durable evidence only. ZERO DataDoe.
+ *
+ * @param {object} opts
+ * @param {Array<{accountId:string, rawSellerId?:string, currency?:any}>} opts.accounts  the exact accounts to publish
+ * @param {string} opts.from          canonical 5-month window start (e.g. "2026-03-01")
+ * @param {string} opts.asOfCeiling   reviewed, FROZEN latest date (never exceeded; e.g. "2026-08-24")
+ * @param {string} opts.organizationFingerprint
+ * @param {string} [opts.connectionId="primary"]
+ * @param {string} [opts.brand="ALL"]
+ * @param {object} opts.readers       durable readers (getSourceOliHistoryRows, getSourceCoverageWindows, ...). NO adapter.
+ * @param {object} opts.store         { paramsHashFor, claimLock, releaseLock, getExisting, save, validatePayload? }
+ * @param {(r:object)=>void} [opts.onAccount]  progress callback per account
+ * @returns {Promise<{results:object[], summary:object}>}
+ */
+export async function backfillDailyV2({
+  accounts, from, asOfCeiling, organizationFingerprint, connectionId = "primary", brand = "ALL",
+  readers, store, onAccount = () => {},
+}) {
+  if (!isDate(from) || !isDate(asOfCeiling) || from > asOfCeiling) {
+    throw new Error(`backfillDailyV2: invalid window from=${from} asOfCeiling=${asOfCeiling} (fail closed).`);
+  }
+  if (!Array.isArray(accounts) || !accounts.length) throw new Error("backfillDailyV2: no accounts (fail closed).");
+  if (!store || typeof store.paramsHashFor !== "function" || typeof store.save !== "function") {
+    throw new Error("backfillDailyV2: store must supply paramsHashFor + save (fail closed).");
+  }
+  const wantBrand = S(brand).trim() || "ALL";
+  const validate = typeof store.validatePayload === "function" ? store.validatePayload : (p) => DAILY.validatePayload(p);
+  const claimLock = typeof store.claimLock === "function" ? store.claimLock : async () => true;
+  const releaseLock = typeof store.releaseLock === "function" ? store.releaseLock : async () => {};
+  const getExisting = typeof store.getExisting === "function" ? store.getExisting : async () => null;
+
+  const results = [];
+  // A stable per-account serialize key (the canonical ceiling identity) -- NOT the effective identity, which is
+  // only known after reading coverage. This makes two concurrent backfill runs mutually exclusive per account.
+  for (const acct of accounts) {
+    const accountId = S(acct && acct.accountId);
+    const rawSellerId = S(acct && (acct.rawSellerId ?? acct.accountId)) || accountId;
+    const currency = acct && acct.currency != null ? acct.currency : null;
+    if (!accountId) { const r = { accountId: "", status: "failed", reason: "missing-account-id", creates: 0 }; results.push(r); onAccount(r); continue; }
+
+    const lockHash = store.paramsHashFor(DAILY_V2_LIVE_VERSION, { from, to: asOfCeiling, brand: wantBrand });
+    const locked = await claimLock({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash: lockHash });
+    if (!locked) { const r = { accountId, status: "skipped-locked", reason: "another-backfill-in-flight", creates: 0 }; results.push(r); onAccount(r); continue; }
+
+    let result;
+    try {
+      const evidence = await gatherDailyDurableEvidence({ accountId, from, to: asOfCeiling, brand: wantBrand, organizationFingerprint, connectionId }, readers);
+      const effectiveTo = latestProvenDailyTo({ oliWindows: evidence.oliWindows, from, ceiling: asOfCeiling });
+      if (!effectiveTo) {
+        result = { accountId, status: "failed", reason: "oli-coverage-incomplete", blockedBy: [{ sourceKey: DAILY_OLI_SOURCE_KEY, reason: "coverage-incomplete" }], creates: 0 };
+      } else {
+        const effectiveParams = { from, to: effectiveTo, brand: wantBrand };
+        const paramsHash = store.paramsHashFor(DAILY_V2_LIVE_VERSION, effectiveParams);
+
+        // Idempotent skip: a VALID v2 snapshot already at this exact identity is left untouched (zero write).
+        const existing = await getExisting({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash });
+        if (existing && existing.payload && existing.params && existing.params.reportVersion === DAILY_V2_LIVE_VERSION && validate(existing.payload)) {
+          result = { accountId, status: "existing", to: effectiveTo, paramsHash, creates: 0 };
+        } else {
+          const derived = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to: effectiveTo, brand: wantBrand }, evidence);
+          if (!derived.payload) {
+            // Fail this account exactly, WITHOUT overwriting its last-known-good snapshot.
+            result = { accountId, status: "failed", reason: derived.notReady || "derive-failed", blockedBy: derived.blockedBy || [], creates: 0 };
+          } else {
+            const sourceRefreshedAt = durableRefreshedAt(evidence, derived.latestDataDate) || null;
+            // Provenance guard: the row is written under paramsHashFor(reportVersion, effectiveParams). `save` MUST
+            // recompute + refuse a mismatch (wrong-hash refused). We pass both so the guard has something to check.
+            const saved = await store.save({
+              reportKey: DAILY_V2_REPORT_KEY, reportVersion: DAILY_V2_LIVE_VERSION, accountId,
+              paramsHash, params: { reportVersion: DAILY_V2_LIVE_VERSION, ...effectiveParams },
+              payload: derived.payload, sourceRefreshedAt,
+            });
+            result = {
+              accountId, status: "published", to: effectiveTo, paramsHash,
+              latestDataDate: derived.latestDataDate, bytes: saved && saved.payload_bytes ? saved.payload_bytes : null,
+              adsAvailability: derived.payload && derived.payload.adsAvailability ? derived.payload.adsAvailability.status : null,
+              creates: 0,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      result = { accountId, status: "failed", reason: "exception", error: e && e.message ? e.message : String(e), creates: 0 };
+    } finally {
+      await releaseLock({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash: lockHash }).catch(() => {});
+    }
+    results.push(result);
+    onAccount(result);
+  }
+
+  const summary = {
+    attempted: results.length,
+    published: results.filter((r) => r.status === "published").length,
+    existing: results.filter((r) => r.status === "existing").length,
+    failed: results.filter((r) => r.status === "failed").length,
+    skippedLocked: results.filter((r) => r.status === "skipped-locked").length,
+    creates: 0, tokens: 0, // structurally: no adapter, so no DataDoe export is possible here.
+  };
+  summary.successfulOrExisting = summary.published + summary.existing;
+  return { results, summary };
+}
