@@ -11889,3 +11889,68 @@ REMAINING (user decision): to publish the UPDATED daily-reporting-shared-v2 for 
 (rather than lazily via the self-heal on first read), run the zero-export Daily v2 re-derivation
 per account (the deployed self-heal logic) -- NOT the priority-release cycle runbook (the cycles are
 already terminal). Brand Sales + Brand Inventory need no republish (already current + live).
+
+
+================================================================================
+2026-08-25 -- Daily v2 honest zero-export backfill + date-scope serving (code 863f216)
+================================================================================
+
+OBJECTIVE: publish + verify daily-reporting-shared-v2 / daily-reporting/v2e-1 for all 30 primary
+accounts (8 US + 22 Non-US) using EXISTING durable evidence only -- NO new DataDoe export or token
+spend authorized (0/0). Prod IS reachable this session (repo-root .env.local; pg needs
+sslmode=no-verify; REST needs NODE_TLS_REJECT_UNAUTHORIZED=0 + env set before importing supabase.js).
+
+READ-ONLY RECONCILIATION found the ACTUAL blocker, and it is TWO real deployed bugs plus a data
+reality the mission's premise got wrong:
+
+(1) CATALOG WRAPPER BUG (deployed, HEAD 649eadb): gatherDailyDurableEvidence read the
+    getSourceSnapshot return `{ snapshot, read, error }` as if it were a flat pointer
+    (catalogSnapshot.object_path), so catalogRows was ALWAYS null -> every account failed
+    "catalog-rows-unavailable". This silently broke the deployed Daily self-heal too (all 30 reads
+    -> "waiting"). Fixed: extract the nested .snapshot (handles both the wrapper and a plain pointer
+    used by tests/other readers) and honor read === "ok".
+
+(2) DATE-MISMATCH BUG: the frontend (App.jsx) always requests Daily with to=TODAY, but the self-heal
+    derived to that EXACT date. Durable OLI is proven only through each account's last exported date
+    -- and NO new export is authorized -- so deriving to TODAY fails readiness (coverage-incomplete)
+    for ALL 30 -> blank page + zero v2 snapshots. This is exactly the "do not assume page-visit
+    self-heal succeeds; prove and correct honestly" case.
+
+DURABLE OLI REALITY (proven read-only via getSourceCoverageWindows + windowsProve): the mission's
+"OLI complete through 2026-08-24 for all 30" is FALSE for 17 accounts. ALL 30 prove
+[2026-03-01 .. 2026-08-22]; only 13 reach 2026-08-24 (the 8 US + IT 128bf8ad, IN 126918b3 / 12f3a683
+/ 59f12ccc, NL 5d507e3b); the other 17 stop at 2026-08-22. (getSourceCoverageWindows uses PostgREST,
+which returns DATE columns as clean YYYY-MM-DD; a raw pg probe instead renders them IST-shifted,
+"...T18:30:00Z" = IST midnight of the NEXT date -- use the reader, not pg, for coverage dates.)
+
+HONEST CORRECTION (no export authorized -> cannot extend the 17): publish/serve each account ENDING
+at its OWN latest contiguously-proven OLI date, capped at the reviewed ceiling asOfCeiling=2026-08-24.
+latestProvenDailyTo computes it; rederiveDailyV2 / rederiveAndSaveDailyV2 gained clampToProven and
+return the effective { from, to, brand } + latestCompletedDate. from = monthBack(anything, 5) =
+2026-03-01 for all, so only `to` varies (13 -> 08-24, 17 -> 08-22).
+
+NEW ZERO-EXPORT BACKFILL OPERATOR (lib/server/reports/daily-v2-backfill.js + the release runner
+scripts/release/backfill-daily-v2.mjs): the deterministic, verifiable publisher (does NOT depend on
+a browser page visit). For a HANDED set of accounts it: gathers durable evidence, clamps to the
+per-account proven date, derives through the REAL contract (v2 -- never copies/relabels a v1
+snapshot), and saves. Structurally ZERO DataDoe (no adapter is ever wired -> a create-export is
+impossible). Idempotent (a valid v2 snapshot at the effective identity is skipped -> replay writes
+NOTHING). Per-account failure isolation (a failed account never overwrites its last-known-good).
+params_hash PROVENANCE guard (makeProvenanceGuardedSave refuses a save whose hash != paramsHashFor
+of its params -- "wrong hash refused"). Each identity serialized through the shared refresh lock. It
+NEVER touches sync_cycles, source controls, Brand Sales, or Brand Inventory.
+
+DATE-SCOPE SERVING (serveSharedReport): the stale (date-rolled) fallback is now BRAND-SCOPED
+(staleScopeKeys=["brand"], getLatestReportSnapshotForScope) so a named-brand read can never fall
+back to (leak) the ALL-brand snapshot, and vice versa. A clamped self-heal persists under the
+EFFECTIVE identity (params_hash matches params -> provenance stays exact) and is served as that
+earlier as-of. The existing frontend stale banner (shared.jsx StaleScopeNotice / snapshotFreshness
+Label) then honestly shows "covers data as of <proven date>" -- never claiming today is covered, and
+never "Nothing saved" when a valid proven v2 exists. The Daily table already anchors its columns to
+the latest date IN THE ROWS (capped at yesterday), so it is honest by construction.
+
+verify 63/63 (43 suites), build:check green; git diff --check clean. New suites daily-v2-backfill
+(operator: per-account latest date, idempotent replay=0 writes, LKG-preserving failure, no adapter,
+provenance refuse, 30-account isolation) + daily-v2-serving (brand isolation, beyond-coverage ->
+latest proven, exact hit, no-regression). DRY-RUN of the backfill against prod: 30/30 would-publish,
+0 failed, creates=0 tokens=0 (13 @ 08-24, 17 @ 08-22, Ads typed failed/stale/unavailable -- never 0).
