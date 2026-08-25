@@ -33,6 +33,8 @@ const { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } = await import("../../lib
 const { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_GRAIN } = await import("../../lib/server/sync/source-scheduled-asin-ads.js");
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
+const { getDailyAdsCoverage } = await import("../../lib/server/supabase.js");
+const { evaluateSourceCoverage } = await import("../../lib/server/sync/ppc-ads-loader.js");
 
 // The ASIN Ads export source only appears in an account's compatible-sources list when an Amazon Ads connection
 // exists for it. An account WITHOUT it can never produce ASIN Ads and, if batched, poisons the whole export (400).
@@ -65,21 +67,47 @@ if (!bucketAccounts.length) { console.error("STOP no discovered primary accounts
 // an external account-setup gap, never a fabricated zero). A read failure fails that account closed (excluded).
 const compatible = []; const incompatible = []; const unreadable = [];
 for (const a of bucketAccounts) {
-  try {
-    const names = await fetchCompatibleSourceNames(primaryConn.apiKey, a.accountId);
-    (names.has(ASIN_ADS_SOURCE_NAME) ? compatible : incompatible).push(a);
-  } catch (_e) { unreadable.push(a); }
+  // Up to 3 attempts: a transient fetch failure must not silently exclude a CONNECTED account (observed in
+  // production -- one flaky read misclassified three connected accounts). Only a consistent failure excludes.
+  let outcome = null;
+  for (let attempt = 0; attempt < 3 && outcome === null; attempt += 1) {
+    try {
+      const names = await fetchCompatibleSourceNames(primaryConn.apiKey, a.accountId);
+      outcome = names.has(ASIN_ADS_SOURCE_NAME) ? "compatible" : "incompatible";
+    } catch (_e) { if (attempt < 2) await new Promise((r) => setTimeout(r, 2000)); }
+  }
+  if (outcome === "compatible") compatible.push(a);
+  else if (outcome === "incompatible") incompatible.push(a);
+  else unreadable.push(a);
 }
 log("pre-flight Amazon-Ads connection: " + compatible.length + " compatible, " + incompatible.length + " missing-connection, " + unreadable.length + " unreadable (excluded)");
 if (incompatible.length) log("  no Amazon Ads connection (excluded; ads stay unavailable): " + incompatible.map((a) => a.accountId.slice(0, 8) + "(" + a.country + ")").join(" "));
 if (unreadable.length) log("  compatible-sources unreadable (excluded this run): " + unreadable.map((a) => a.accountId.slice(0, 8)).join(" "));
 if (!compatible.length) { log("PROVEN: no Amazon-Ads-compatible accounts in bucket " + bucket + "; nothing to sync (0 creates / 0 tokens)."); process.exit(0); }
 
-const syncAccounts = compatible;
+// ZERO-TOKEN COVERAGE PRE-FILTER (the OLI missing-complement model at PLAN level): an account whose durable
+// coverage already PROVES the whole window needs zero creates, so it is excluded BEFORE batching -- batches then
+// pack ONLY pending accounts (fewer batches -> fewer creates). The worker's own idempotent skip remains as the
+// second, authoritative guard. A coverage read failure keeps the account IN (the worker re-checks; never a
+// wasted create because the worker skips a covered account it can prove).
+const win = asinAdsRefreshWindow(asOfStr);
+const alreadyCovered = []; const pending = [];
+for (const a of compatible) {
+  let covered = false;
+  try {
+    const cov = await getDailyAdsCoverage(a.accountId, ASIN_ADS_GRAIN);
+    covered = !!cov && cov.read === "ok" && cov.status === "succeeded" && evaluateSourceCoverage(cov, win.from, win.to).proven === true;
+  } catch (_e) { covered = false; }
+  (covered ? alreadyCovered : pending).push(a);
+}
+log("coverage pre-filter: " + alreadyCovered.length + " already fully covered (zero creates), " + pending.length + " pending");
+if (alreadyCovered.length) log("  covered (skipped from batching): " + alreadyCovered.map((a) => a.accountId.slice(0, 8) + "(" + a.country + ")").join(" "));
+if (!pending.length) { log("PROVEN: every Amazon-Ads-compatible account in bucket " + bucket + " is already covered [" + win.from + ".." + win.to + "]; nothing to sync (0 creates / 0 tokens)."); process.exit(0); }
+
+const syncAccounts = pending;
 const plan = asinAdsBucketPlan(syncAccounts, new Map(), { pageAllowance });
 const { batches } = assignAccountBatches(syncAccounts, new Map(), MAX_ACCOUNTS_PER_BATCH);
-const win = asinAdsRefreshWindow(asOfStr);
-log(syncAccounts.length + " Ads-compatible accounts -> " + batches.length + " batches; window [" + win.from + ".." + win.to + "] (21d); create ceiling " + plan.maxCreates + " (=" + plan.expectedBatches + " batches + " + plan.pageAllowance + " pagination) / " + plan.maxTokens + " tokens");
+log(syncAccounts.length + " pending Ads-compatible accounts -> " + batches.length + " batches; window [" + win.from + ".." + win.to + "] (21d); create ceiling " + plan.maxCreates + " (=" + plan.expectedBatches + " batches + " + plan.pageAllowance + " pagination) / " + plan.maxTokens + " tokens");
 
 // (2) A guarded, counting createExport: enforce the per-BUCKET create ceiling BEFORE any create; count real POSTs.
 // --max-creates HARD-CAPS the creates this run (never above the plan ceiling) so a fixed operation-wide token
