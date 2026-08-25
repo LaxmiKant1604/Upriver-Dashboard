@@ -77,7 +77,9 @@ const { results, summary } = await backfillDailyV2({
   accounts, from: FROM, asOfCeiling: ASOF_CEILING, organizationFingerprint: orgFp, readers, store,
   onAccount: (r) => {
     const tag = r.status === "published" ? `${APPLY ? "PUBLISHED" : "would-publish"} to=${r.to} ads=${r.adsAvailability || "-"}`
-      : r.status === "existing" ? `existing to=${r.to}`
+      : r.status === "republished" ? `${APPLY ? "REPUBLISHED(ads-changed)" : "would-republish(ads-changed)"} to=${r.to} ads=${r.adsAvailability || "-"}`
+      : r.status === "existing" ? `existing to=${r.to} ads=${r.adsAvailability || "-"}`
+      : r.status === "newer-live" ? `newer-live (kept; not overwritten) to=${r.to}`
       : r.status === "failed" ? `FAILED ${r.reason}`
       : r.status;
     console.log(`  ${r.accountId.slice(0, 8)}  ${tag}`);

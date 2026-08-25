@@ -29,6 +29,26 @@ const DAILY = REPORT_DERIVATIONS["daily-reporting"];
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
+const freshAdsStatus = (payload) => (payload && payload.adsAvailability ? payload.adsAvailability.status : null);
+
+// A stable fingerprint of the ADS state a derived Daily v2 payload carries: the availability status, the proven
+// covered window, the latest metric date, and how many rows actually carry ad metrics. Two derivations with the
+// same fingerprint have IDENTICAL Ads evidence, so the live snapshot need not be rewritten; a change (e.g. Ads
+// went from "failed" with no ad rows to "partial" with N ad rows) flips the fingerprint and triggers a republish.
+export function adsProvenanceOf(payload) {
+  const a = payload && payload.adsAvailability ? payload.adsAvailability : null;
+  const adRows = (payload && Array.isArray(payload.rows) ? payload.rows : []).filter(
+    (r) => r && (("ad_sales" in r) || ("ad_spend" in r) || ("ad_clicks" in r)),
+  ).length;
+  return JSON.stringify({
+    status: a ? a.status ?? null : null,
+    coveredFrom: a ? a.coveredFrom ?? null : null,
+    coveredTo: a ? a.coveredTo ?? null : null,
+    latestMetricDate: a ? a.latestMetricDate ?? null : null,
+    adRows,
+  });
+}
+
 /**
  * Wrap a raw snapshot saver with a PROVENANCE guard: the row is written ONLY when its params_hash equals
  * paramsHashFor(reportVersion, { from, to, brand }) recomputed from the params being written. A mismatch is
@@ -106,28 +126,39 @@ export async function backfillDailyV2({
         const effectiveParams = { from, to: effectiveTo, brand: wantBrand };
         const paramsHash = store.paramsHashFor(DAILY_V2_LIVE_VERSION, effectiveParams);
 
-        // Idempotent skip: a VALID v2 snapshot already at this exact identity is left untouched (zero write).
-        const existing = await getExisting({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash });
-        if (existing && existing.payload && existing.params && existing.params.reportVersion === DAILY_V2_LIVE_VERSION && validate(existing.payload)) {
-          result = { accountId, status: "existing", to: effectiveTo, paramsHash, creates: 0 };
+        // Always re-derive (read-only, ZERO export) so a change in the durable ADS evidence is detected -- an
+        // existing v2 snapshot published while Ads were unavailable must NOT be skipped just because its identity
+        // exists. The idempotency key is the derived ADS PROVENANCE (availability + covered window + ad-row count),
+        // NOT merely the snapshot's presence, because source_refreshed_at is dominated by the catalog timestamp and
+        // would not move when only Ads change.
+        const derived = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to: effectiveTo, brand: wantBrand }, evidence);
+        if (!derived.payload) {
+          // Fail this account exactly, WITHOUT overwriting its last-known-good snapshot.
+          result = { accountId, status: "failed", reason: derived.notReady || "derive-failed", blockedBy: derived.blockedBy || [], creates: 0 };
         } else {
-          const derived = rederiveDailyV2Payload({ accountId, rawSellerId, currency, from, to: effectiveTo, brand: wantBrand }, evidence);
-          if (!derived.payload) {
-            // Fail this account exactly, WITHOUT overwriting its last-known-good snapshot.
-            result = { accountId, status: "failed", reason: derived.notReady || "derive-failed", blockedBy: derived.blockedBy || [], creates: 0 };
+          const sourceRefreshedAt = durableRefreshedAt(evidence, derived.latestDataDate) || null;
+          const freshProv = adsProvenanceOf(derived.payload);
+          const existing = await getExisting({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash });
+          const existingValid = existing && existing.payload && existing.params && existing.params.reportVersion === DAILY_V2_LIVE_VERSION && validate(existing.payload);
+          if (existingValid && adsProvenanceOf(existing.payload) === freshProv && S(existing.params.to) === effectiveTo) {
+            // No Ads (or other payload) change vs the live snapshot -> leave it untouched (idempotent, ZERO write).
+            result = { accountId, status: "existing", to: effectiveTo, paramsHash, adsAvailability: freshAdsStatus(derived.payload), creates: 0 };
+          } else if (existingValid && S(existing.source_refreshed_at) > S(sourceRefreshedAt) && S(sourceRefreshedAt) !== "") {
+            // Freshness CAS: the live snapshot is STRICTLY NEWER than this re-derivation's evidence -> never
+            // overwrite it (a concurrent newer publish wins). Report, do not write.
+            result = { accountId, status: "newer-live", to: effectiveTo, paramsHash, creates: 0 };
           } else {
-            const sourceRefreshedAt = durableRefreshedAt(evidence, derived.latestDataDate) || null;
-            // Provenance guard: the row is written under paramsHashFor(reportVersion, effectiveParams). `save` MUST
-            // recompute + refuse a mismatch (wrong-hash refused). We pass both so the guard has something to check.
+            // New publish, or a republish because the Ads evidence changed (and we are not staler than the live row).
+            const republish = !!existingValid;
             const saved = await store.save({
               reportKey: DAILY_V2_REPORT_KEY, reportVersion: DAILY_V2_LIVE_VERSION, accountId,
               paramsHash, params: { reportVersion: DAILY_V2_LIVE_VERSION, ...effectiveParams },
               payload: derived.payload, sourceRefreshedAt,
             });
             result = {
-              accountId, status: "published", to: effectiveTo, paramsHash,
+              accountId, status: republish ? "republished" : "published", to: effectiveTo, paramsHash,
               latestDataDate: derived.latestDataDate, bytes: saved && saved.payload_bytes ? saved.payload_bytes : null,
-              adsAvailability: derived.payload && derived.payload.adsAvailability ? derived.payload.adsAvailability.status : null,
+              adsAvailability: freshAdsStatus(derived.payload),
               creates: 0,
             };
           }
@@ -145,11 +176,15 @@ export async function backfillDailyV2({
   const summary = {
     attempted: results.length,
     published: results.filter((r) => r.status === "published").length,
+    republished: results.filter((r) => r.status === "republished").length,
     existing: results.filter((r) => r.status === "existing").length,
+    newerLive: results.filter((r) => r.status === "newer-live").length,
     failed: results.filter((r) => r.status === "failed").length,
     skippedLocked: results.filter((r) => r.status === "skipped-locked").length,
     creates: 0, tokens: 0, // structurally: no adapter, so no DataDoe export is possible here.
   };
-  summary.successfulOrExisting = summary.published + summary.existing;
+  // A successful outcome = a live v2 snapshot exists for the account (freshly published, republished with newer
+  // Ads, already-current, or a strictly-newer live snapshot we correctly refused to overwrite).
+  summary.successfulOrExisting = summary.published + summary.republished + summary.existing + summary.newerLive;
   return { results, summary };
 }

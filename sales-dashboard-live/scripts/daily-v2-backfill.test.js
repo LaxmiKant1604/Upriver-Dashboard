@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { REPORT_DERIVATIONS } from "../lib/server/sync/report-derivation.js";
 import { paramsHashFor } from "../lib/server/report-store.js";
-import { backfillDailyV2, makeProvenanceGuardedSave, DAILY_V2_REPORT_KEY } from "../lib/server/reports/daily-v2-backfill.js";
+import { backfillDailyV2, makeProvenanceGuardedSave, adsProvenanceOf, DAILY_V2_REPORT_KEY } from "../lib/server/reports/daily-v2-backfill.js";
 
 let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
@@ -90,6 +90,52 @@ await testAsync("publishes each account ENDING at its OWN latest proven date (13
   assert.equal(saveCalls.find((s) => s.accountId === "acctBehind").paramsHash, paramsHashFor(V2, { from: FROM, to: "2026-08-22", brand: "ALL" }));
   // No adapter anywhere -> structurally zero exports.
   assert.equal("create" in readers, false);
+});
+
+await testAsync("adsProvenanceOf fingerprints the Ads state (status/covered window/latest date/ad-row count)", () => {
+  const base = { rows: [{ date: "2026-08-20", total_sales: 5, ad_sales: 3 }], adsAvailability: { status: "partial", coveredFrom: "2026-08-04", coveredTo: "2026-08-20", latestMetricDate: "2026-08-20" } };
+  const same = { rows: [{ date: "2026-08-20", total_sales: 9, ad_sales: 3 }], adsAvailability: { status: "partial", coveredFrom: "2026-08-04", coveredTo: "2026-08-20", latestMetricDate: "2026-08-20" } };
+  const adsChanged = { rows: [{ date: "2026-08-20", total_sales: 5 }], adsAvailability: { status: "unavailable", coveredFrom: null, coveredTo: null, latestMetricDate: null } };
+  assert.equal(adsProvenanceOf(base), adsProvenanceOf(same), "same Ads state (sales differences do not flip it)");
+  assert.notEqual(adsProvenanceOf(base), adsProvenanceOf(adsChanged), "Ads went from partial+adRows to unavailable -> different fingerprint");
+});
+
+await testAsync("REPUBLISHES an existing v2 snapshot when the Ads evidence changed (not skipped just because it exists)", async () => {
+  const historyByAcct = { a1: [histRow("a1", "2026-03-05", 100)] };
+  const windowsByAcct = { a1: [{ from: "2025-01-01", to: "2026-08-24" }] };
+  // A live snapshot from when Ads were unavailable, saved earlier (older source_refreshed_at). Its Ads fingerprint
+  // (validated + an ad row) differs from what the CURRENT durable evidence derives (unavailable, no ad rows).
+  const seed = new Map();
+  const key = [DAILY_V2_REPORT_KEY, "a1", paramsHashFor(V2, { from: FROM, to: "2026-08-24", brand: "ALL" })].join("|");
+  seed.set(key, {
+    payload: { rows: [{ date: "2026-08-24", total_sales: 100, ad_sales: 7 }], brandFiltered: false, adsAvailability: { status: "validated", coveredFrom: "2026-08-04", coveredTo: "2026-08-24", latestMetricDate: "2026-08-24" } },
+    params: { reportVersion: V2, from: FROM, to: "2026-08-24", brand: "ALL" }, source_refreshed_at: "2026-08-01T00:00:00.000Z",
+  });
+  const calls = { oliHistory: 0, oliCov: 0, ads: 0 }; const saveCalls = []; const lockLog = [];
+  const readers = makeReaders({ historyByAcct, windowsByAcct, calls }); // default readers -> Ads unavailable
+  const store = makeStore({ saveCalls, lockLog, seed });
+  const { results, summary } = await backfillDailyV2({ accounts: [{ accountId: "a1", currency: "USD" }], from: FROM, asOfCeiling: CEIL, organizationFingerprint: "org", readers, store });
+  assert.equal(results[0].status, "republished", "the changed-Ads snapshot is republished, not skipped");
+  assert.equal(summary.republished, 1); assert.equal(summary.existing, 0);
+  assert.equal(saveCalls.length, 1, "exactly one republish write");
+});
+
+await testAsync("freshness CAS: a STRICTLY-NEWER live snapshot is NEVER overwritten (newer-live, zero write)", async () => {
+  const historyByAcct = { a1: [histRow("a1", "2026-03-05", 100)] };
+  const windowsByAcct = { a1: [{ from: "2025-01-01", to: "2026-08-24" }] };
+  const seed = new Map();
+  const key = [DAILY_V2_REPORT_KEY, "a1", paramsHashFor(V2, { from: FROM, to: "2026-08-24", brand: "ALL" })].join("|");
+  seed.set(key, {
+    payload: { rows: [{ date: "2026-08-24", total_sales: 100, ad_sales: 7 }], brandFiltered: false, adsAvailability: { status: "validated", coveredFrom: "2026-08-04", coveredTo: "2026-08-24", latestMetricDate: "2026-08-24" } },
+    params: { reportVersion: V2, from: FROM, to: "2026-08-24", brand: "ALL" }, source_refreshed_at: "2999-01-01T00:00:00.000Z", // FAR in the future -> strictly newer than any re-derivation
+  });
+  const calls = { oliHistory: 0, oliCov: 0, ads: 0 }; const saveCalls = []; const lockLog = [];
+  const readers = makeReaders({ historyByAcct, windowsByAcct, calls });
+  const store = makeStore({ saveCalls, lockLog, seed });
+  const { results, summary } = await backfillDailyV2({ accounts: [{ accountId: "a1", currency: "USD" }], from: FROM, asOfCeiling: CEIL, organizationFingerprint: "org", readers, store });
+  assert.equal(results[0].status, "newer-live", "a strictly-newer live snapshot is preserved");
+  assert.equal(summary.newerLive, 1);
+  assert.equal(saveCalls.length, 0, "ZERO writes -- the newer live snapshot is never clobbered");
 });
 
 await testAsync("idempotent replay performs ZERO writes (existing valid v2 snapshots are skipped)", async () => {
