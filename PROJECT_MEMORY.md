@@ -12005,3 +12005,16 @@ verify 63/63. PLAN for Phase 5 (controlled sync, <=7 creates / <=14 tokens; bala
 ASIN Ads sync for the canonical [2026-08-04 .. 2026-08-24] window per bucket (Non-US <=5/10, US <=2/4),
 which lands clean currency rows + coverage + succeeded state. Then Phase 6 republish Daily v2 + rebuild
 Brand View. No zero-token ads resume exists, so all coverage requires new (2-token) creates.
+
+
+-- 2026-08-25 Phase-5 blocker + fix (code 0bf8ed2): the first Non-US ASIN Ads sync run FAILED all 5 batches
+with DataDoe HTTP 400 "limit must not be greater than 5000" -- ads-sync EXPORT_LIMIT was 50000. NO tokens
+spent (a 400-rejected create charges nothing; balance stayed 100). Per-create cost is 2 tokens (standard);
+there is NO zero-token export resume for ASIN Ads. FIX: EXPORT_LIMIT=5000 + SKIP-PAGINATION replacing the
+date-split -- each page is a create with limit=5000 + advancing skip (only skip changes); a full 5000-row
+page means "maybe more" (skip+=5000), a shorter/empty page proves completion (never inferred from the first
+full page). Each page validated with BOTH metadata rowCount AND raw-array length (validateExportPage: status
+COMPLETED, rowCount nonneg int <= limit, raw array, raw.length===rowCount -> else fail closed, persist
+nothing); after all pages concatenate + validate identity + dedup by natural grain + persist + record
+coverage only after the final short page. Non-US density is low (~a few hundred rows/seller/21d) so batches
+are single-page (1 create/batch). verify 63/63.
