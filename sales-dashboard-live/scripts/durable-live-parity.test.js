@@ -65,6 +65,34 @@ function derive() {
   });
 }
 
+test("Non-US shape: complete OLI + Catalog + FAILED ASIN Ads -> daily + brand-sales READY, OLI sales derive, Ads typed unavailable (never zero)", () => {
+  // The exact production Non-US condition: OLI durable coverage complete, validated Catalog, ASIN Ads FAILED (no
+  // durable Ads evidence), no FBA. Complete OLI + Catalog MUST make daily + brand-sales READY -- Ads never blocks
+  // OLI sales derivation -- and the missing Ads must be a typed unavailable/failed availability, never a zero.
+  const ev = fullEvidence();
+  const derived = dash.deriveDurableDashboardSnapshots({
+    bucket: BUCKET, accounts: [ACCOUNT], historyRows: HISTORY, catalogRows: CATALOG,
+    oliCoverageByAccountId: ev.oliCoverageByAccountId,
+    catalogSnapshot: ev.catalogSnapshot,
+    fbaSnapshotsByAccount: {}, // no FBA
+    campaignAds: ev.campaignAds,
+    asinAds: { grain: "asin-performance-v1", read: "read-failed", windowsByAccountId: { A01: [] } }, // FAILED Ads
+    adMetricsByAccountId: { A01: { rows: [], metricsRead: "read-failed" } },
+    adsCoverageStateByAccountId: { A01: { windows: [], status: "failed", latestMetricDate: null, read: "read-failed" } },
+    dailyWindow: { from: DAILY_FROM, to: ASOF },
+    brandViewWindow: { from: "2025-06-26", to: ASOF },
+  });
+  assert.equal(derived.daily.readiness.ready, true, "complete OLI + Catalog => Daily READY even with FAILED Ads");
+  assert.deepEqual(derived.daily.skipped, []);
+  assert.equal(derived.daily.snapshots.length, 1, "a Daily snapshot is produced from durable OLI");
+  const p = derived.daily.snapshots[0].payload;
+  assert.ok(p.rows.some((r) => Number(r.total_sales) > 0 || Number(r.total_units_sold) > 0), "OLI sales/units are present");
+  assert.equal(p.adsAvailability.status, "failed", "Ads is typed unavailable/failed");
+  assert.ok(!p.rows.some((r) => "ad_sales" in r || "ad_spend" in r || "ad_clicks" in r), "no ad_* fields materialized (Ads unavailable, NOT a fabricated zero)");
+  assert.equal(derived.brandView.readiness.ready, true, "brand-sales READY with FAILED Ads (Ads/FBA never block sales)");
+  assert.equal(derived.brandView.snapshots.length, 1, "a brand-sales snapshot is produced from durable OLI + Catalog");
+});
+
 test("P1. the durable Daily payload IS the existing contract and equals the independent pure-twin (real ASIN same-SKU ad metrics merged)", () => {
   const derived = derive();
   assert.deepEqual(derived.daily.skipped, [], "no account skipped");

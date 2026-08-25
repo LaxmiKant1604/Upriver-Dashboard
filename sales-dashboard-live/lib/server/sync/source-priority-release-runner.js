@@ -93,7 +93,32 @@ export async function runPriorityDashboardsRelease(deps = {}) {
     if (!rollup || rollup.stopped === true || (rollup.derived && rollup.derived.skipped != null)) {
       return fail("derive:" + bucket, "derive did not complete: " + S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))));
     }
-    log("derive ok: " + bucket);
+    // A derive that GATED on readiness (daily/brandView ready=false) produces NO snapshots -> NO lineage -> a
+    // clean-looking rollup (skipped=null, stopped=false) with saved=0 and lineageCount=0. `!stopped && skipped==null`
+    // is therefore NOT proof that report jobs were produced. Require the derive to have genuinely produced a
+    // consistent, complete, LINEAGE-BACKED set BEFORE finalize/publication: both dashboards ready; every
+    // dashboard saved > 0; the three per-account counts EQUAL (one daily + one brand-sales + one brand-inventory
+    // per account -- no missing or duplicate job); and lineage matching that total. This fails the exact
+    // ready=false / saved=0 / lineageCount=0 false-positive the runner used to log as "derive ok". The finalizer's
+    // strict report-job-count assertion (against the discovered cycle scope, e.g. Non-US 22x3 / US 8x3) stays the
+    // authoritative exact count and is left unchanged. An already-complete (short-circuited) cycle has no fresh
+    // derive to re-verify -- its jobs already exist -- so it passes to the (unchanged) finalizer.
+    if (rollup.alreadyComplete !== true) {
+      const d = rollup.derived || {};
+      const daily = d.daily || {}, bv = d.brandView || {}, inv = d.brandInventory || {};
+      const ds = Number(daily.saved || 0), bs = Number(bv.saved || 0), is = Number(inv.saved || 0);
+      const lineageCount = Array.isArray(d.lineage) ? d.lineage.length : 0;
+      const problems = [];
+      if (daily.ready !== true) problems.push("daily-reporting not ready (ready=" + S(daily.ready) + ")");
+      if (bv.ready !== true) problems.push("brand-sales not ready (ready=" + S(bv.ready) + ")");
+      if (ds <= 0 || bs <= 0 || is <= 0) problems.push("saved report jobs = 0 (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ")");
+      else if (ds !== bs || bs !== is) problems.push("inconsistent per-account counts (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ") -- a missing or duplicate report job");
+      if (lineageCount !== ds + bs + is) problems.push("lineage " + lineageCount + " != saved " + (ds + bs + is));
+      if (problems.length) return fail("derive:" + bucket, ["derive produced no validated report jobs for " + bucket + " (a ready=false/saved=0 derive is NOT 'derive ok'): " + problems.join("; ")]);
+      log("derive ok: " + bucket + " (" + ds + " x 3 = " + (ds * 3) + " report jobs, lineage " + lineageCount + ")");
+    } else {
+      log("derive ok: " + bucket + " (already-complete cycle; jobs pre-exist -- finalizer re-verifies the exact count)");
+    }
   }
 
   // (2b) the durable reservation, WHEN PRESENT, shows at most TWO tokens (a warm-cache-first release makes none).

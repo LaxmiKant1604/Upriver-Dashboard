@@ -611,10 +611,13 @@ group("P9. production runner: exits nonzero on every non-success; no partial pub
 
 const THREE = ["daily-reporting", "brand-sales", "brand-inventory"];
 const idResults = (a, disp) => THREE.map((rk) => ({ reportKey: rk, disposition: disp, liveReportKey: rk, paramsHash: "ph_" + rk + "_" + a }));
+// A COMPLETE derive rollup for n accounts: both dashboards ready, n saved each, lineage = 3n. The fake finalize
+// returns exactly one account per bucket, so the default derive produces the matching consistent 1x3 set.
+const completeRollup = (n = 1) => ({ rollup: { stopped: false, derived: { skipped: null, daily: { ready: true, saved: n }, brandView: { ready: true, saved: n }, brandInventory: { saved: n }, lineage: Array.from({ length: 3 * n }, (_, i) => i) } } });
 function fakeRelease(over = {}) {
   return {
     publishOrder: THREE, reportKeys: THREE,
-    deriveBucket: over.deriveBucket || (async () => ({ rollup: { stopped: false, derived: { skipped: null } } })),
+    deriveBucket: over.deriveBucket || (async () => completeRollup(1)),
     finalizeBucket: over.finalizeBucket || (async (b) => ({ disposition: "finalized", cycleStatus: "succeeded", accounts: b === "us" ? ["A01"] : ["B01"] })),
     preflightAccount: over.preflightAccount || (async (a) => ({ accountId: a, results: idResults(a, "ready") })),
     publishAccount: over.publishAccount || (async (a) => ({ accountId: a, results: idResults(a, "published") })),
@@ -643,6 +646,25 @@ test("P9b. a failed READ-ONLY reconciliation stops BEFORE deriving => code 1 (re
 test("P9c. a skipped/stopped derive stops => code 1 (derive)", async () => {
   const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { deriveBucket: async () => ({ rollup: { stopped: false, derived: { skipped: "not-drained" } } }) } }));
   assert.equal(r.code, 1); assert.equal(r.stage, "derive:us");
+});
+test("P9c2. the ready=false/saved=0/lineageCount=0 FALSE-POSITIVE is REFUSED (never 'derive ok') BEFORE finalize", async () => {
+  // The exact Non-US failure shape: stopped=false, skipped=null, but daily/brandView ready=false, saved=0, no
+  // lineage. The old runner logged "derive ok" and proceeded; it must now fail at the derive stage.
+  const falsePositive = { rollup: { stopped: false, continuationRequired: false, globalDrained: true, derived: { skipped: null, daily: { ready: false, saved: 0 }, brandView: { ready: false, saved: 0 }, brandInventory: { saved: 0 }, lineage: [] } } };
+  let finalized = 0;
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { deriveBucket: async () => falsePositive, finalizeBucket: async () => { finalized += 1; return { disposition: "finalized", accounts: ["A01"] }; } } }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "derive:us");
+  assert.ok(String(r.problems.join(" ")).includes("no validated report jobs"), "the refusal names the missing report jobs");
+  assert.equal(finalized, 0, "never reached finalize/publication on a ready=false/saved=0 derive");
+});
+test("P9c3. an INCONSISTENT derive (missing/duplicate: daily=8, brand-sales=8, brand-inventory=7) is refused before finalize", async () => {
+  const inconsistent = { rollup: { stopped: false, derived: { skipped: null, daily: { ready: true, saved: 8 }, brandView: { ready: true, saved: 8 }, brandInventory: { saved: 7 }, lineage: Array.from({ length: 23 }, (_, i) => i) } } };
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { deriveBucket: async () => inconsistent } }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "derive:us");
+});
+test("P9c4. an already-complete (short-circuited) cycle passes the derive gate (jobs pre-exist; finalizer re-verifies)", async () => {
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { deriveBucket: async () => ({ rollup: { stopped: false, alreadyComplete: true, derived: { skipped: null, lineage: [] } } }) } }));
+  assert.equal(r.code, 0); assert.equal(r.ok, true);
 });
 test("P9d. the durable reservation exceeding two tokens stops => code 1 (token-ceiling)", async () => {
   const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({ releaseOver: { catalogReservation: async () => ({ tokensSpent: 4 }) } }));
