@@ -12113,3 +12113,17 @@ Continuation (10-token ceiling) finished the ASIN Ads sync via the OLI source-fi
 - Safety: Campaign Ads creates=0 (0 new campaign rows), FBA creates=0, controls safe-closed (ap=false,
   rollout=0, rss=0, approvals=0), no pg_cron, Brand Sales(37)/Inventory(30) unchanged. verify 63/63,
   HEAD=f204545 deployed, prod 200.
+
+
+-- 2026-08-26 Named-brand Daily fix (code 9b83cb1): selecting a brand showed "The last refresh failed" /
+"Waiting for the scheduled data refresh" although durable evidence existed. ROOT CAUSE: the daily
+deriveDurable wiring called accountDirectoryMeta() -- DEFINED NOWHERE -- so every self-heal derive threw a
+ReferenceError and degraded to the waiting state (ALL-brand never hit it: its snapshots already exist and
+serve before the self-heal). Fixed to the same-module sharedAccountMetadata(). PLUS: named-brand Daily now
+carries BRAND-SCOPED ASIN Ads (filterAdRowsToBrand: raw ASIN ad rows attributed via catalog child_asin ->
+product_brand, canonical brandKey matching -- case/whitespace variants same brand, punctuation distinct,
+unmapped ASINs never attributed; availability model identical to ALL; covered-no-activity = honest zero,
+missing coverage = typed unavailable). Scheduler shadow derives (no adsCoverage) keep the historic no-ads
+payload byte-for-byte. Frontend: waiting state renders info (not error), empty state no longer says "wait
+for the scheduled refresh", footer copy updated (the "ads cannot be assigned to a brand" premise is gone).
+verify 63/63.
