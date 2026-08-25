@@ -199,7 +199,21 @@ async function datadoeFetch(url, options, attempt = 0) {
   const waitFor = Math.max(0, MIN_REQUEST_INTERVAL_MS - (Date.now() - lastDataDoeRequestAt));
   if (waitFor) await sleep(waitFor);
   lastDataDoeRequestAt = Date.now();
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (networkError) {
+    // A thrown fetch (connection reset / dropped transfer -- observed repeatedly on large raw downloads) is
+    // retried ONLY for safe idempotent GETs (status poll + raw download: both free, the export already exists).
+    // A create POST is NEVER retried here: an ambiguous in-flight POST may have landed server-side, and an
+    // automatic retry could create (and charge) a duplicate export.
+    const method = (options && options.method ? String(options.method) : "GET").toUpperCase();
+    if (method === "GET" && attempt < 3) {
+      await sleep(2000 * (attempt + 1));
+      return datadoeFetch(url, options, attempt + 1);
+    }
+    throw networkError;
+  }
   if (response.status === 429 && attempt < 4) {
     const retryAfter = Number(response.headers.get("retry-after")) || 1;
     await sleep(retryAfter * 1000 + 250);
@@ -270,9 +284,20 @@ async function downloadExport(apiKey, exportId) {
     if (attempt === POLL_ATTEMPTS - 1) throw new Error("DataDoe Ads export timed out.");
     await sleep(POLL_DELAY_MS);
   }
-  const response = await datadoeFetch(`${BASE}/exports/${exportId}/raw`, { headers: authHeaders(apiKey) });
-  if (!response.ok) throw new Error(`DataDoe export download failed (${response.status}).`);
-  const body = await response.json();
+  // The raw download of a large export can die MID-BODY (connection reset after headers) -- the GET is free and
+  // the export already COMPLETED, so the whole fetch+parse is retried up to 3 times before failing the batch.
+  let body = null;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const response = await datadoeFetch(`${BASE}/exports/${exportId}/raw`, { headers: authHeaders(apiKey) });
+      if (!response.ok) throw new Error(`DataDoe export download failed (${response.status}).`);
+      body = await response.json();
+      break;
+    } catch (downloadError) {
+      if (attempt >= 2) throw downloadError;
+      await sleep(3000 * (attempt + 1));
+    }
+  }
   const rows = typeof body.rawContent === "string" ? JSON.parse(body.rawContent) : (Array.isArray(body) ? body : (Array.isArray(body.rows) ? body.rows : null));
   // rowCount from the COMPLETED export metadata (accept a top-level or a metadata-nested field; anything else
   // stays null so validateExportPage fails closed on a missing count).
