@@ -56,7 +56,9 @@ export const FBA_SNAPSHOT_REQUEST_KEY = "source-fba:snapshot-v1";
 // supported columns; the SKU->brand fallback is derived from durable OLI history (SKU->child_asin) joined to
 // this catalog's child_asin->brand map, never from an unproven catalog `sku` field.
 export const DURABLE_CATALOG_COLUMNS = Object.freeze(["child_asin", "parent_asin", "product_name", "product_brand"]);
-export const DURABLE_CATALOG_ROW_LIMIT = 20000;
+// DataDoe rejects create-export limits above 5,000. The catalog currently returns fewer rows, so this
+// preserves the complete organization-wide payload while keeping the request inside the live API contract.
+export const DURABLE_CATALOG_ROW_LIMIT = 5000;
 
 // Deterministically select ONE Catalog carrier seller from the FULL fresh primary directory (the full `active`
 // classification, NOT one bucket). Product Catalog is organization-wide -- one syntactically-required seller id

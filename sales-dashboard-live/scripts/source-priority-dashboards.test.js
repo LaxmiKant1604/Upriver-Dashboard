@@ -216,7 +216,7 @@ test("P3d. the Catalog request sends EXACTLY one carrier seller, OMITS from/to, 
   assert.deepEqual([...req.columns], ["child_asin", "parent_asin", "product_name", "product_brand"]);
   assert.ok(!req.columns.includes("sku"), "no unproven sku column");
   assert.equal(req.options.orderByColumn, "child_asin"); assert.equal(req.options.orderByDirection, "ASC");
-  assert.equal(req.sourceScope, "organization"); assert.equal(req.limit, 20000);
+  assert.equal(req.sourceScope, "organization"); assert.equal(req.limit, 5000);
   assert.equal(req.sourceId, "68d2de238e");
 });
 test("P3e. US and Non-US produce the SAME carrier + the SAME canonical Catalog request hash (organization-scoped)", () => {
