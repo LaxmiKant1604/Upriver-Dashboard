@@ -76,16 +76,12 @@ test("schedule constants are 02:00 (non-us) and 10:30 (us) UTC", () => {
   assert.equal(SCHEDULE_CRON["non-us"], "0 2 * * *");
   assert.equal(SCHEDULE_CRON.us, "30 10 * * *");
 });
-test("GitHub Actions is the SOLE timing authority: Vercel runs no cron; the ONE scheduler-v2 workflow owns the daily schedule", () => {
+test("automatic timing is paused: Vercel and GitHub Actions run no cron; scheduler-v2 remains manually dispatchable", () => {
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
-  assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically -- GitHub Actions is the sole timing authority");
-  // Scheduler v2 is LIVE: the authoritative GitHub Actions workflow declares the two daily bucket crons at the
-  // same times the durable SCHEDULE_CRON pins, plus a manual dispatch. (The deprecated v1 Vercel-loop
-  // scheduled-sync.yml was removed -- see scheduler-v2-automation.test.js D3 for the single-scheduler rule.)
+  assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
-  assert.match(workflow, /^\s*schedule\s*:/m, "the authoritative GitHub Actions scheduler declares the daily schedule");
-  assert.match(workflow, new RegExp('cron:\\s*"' + SCHEDULE_CRON["non-us"].replace(/\*/g, "\\*") + '"'), "non-us cron matches SCHEDULE_CRON");
-  assert.match(workflow, new RegExp('cron:\\s*"' + SCHEDULE_CRON.us.replace(/\*/g, "\\*") + '"'), "us cron matches SCHEDULE_CRON");
+  assert.doesNotMatch(workflow, /^\s*schedule\s*:/m, "GitHub automatic scheduling is paused");
+  assert.doesNotMatch(workflow, /cron:/, "no GitHub cron remains");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
 });
 

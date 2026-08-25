@@ -22,7 +22,7 @@ import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
 import { addDaysStr, num, canonicalOliSlices } from "../datadoe.js";
 import { getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
-import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
+import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, OLI_ROW_LIMIT, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
 
 export const PPC_REPORT_KEY = "ppc-performance";
 export const PPC_VERSION = "ppc-performance-v1";
@@ -260,7 +260,7 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
       const salesRows = [];
       for (const slice of canonicalOliSlices(from, to)) {
         const sliceRows = await fetchExportRowsStrictFn(
-          apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
+          apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, OLI_ROW_LIMIT,
           {
             groupBy: OLI_SALES_GROUP_BY,
             aggregations: OLI_SALES_AGGREGATIONS,

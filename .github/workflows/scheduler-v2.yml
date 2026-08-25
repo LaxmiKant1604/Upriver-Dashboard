@@ -1,9 +1,9 @@
 name: scheduler-v2
 
-# THE ONE authoritative automatic scheduler for Daily Reporting + Brand View (Scheduler v2). GitHub Actions is
-# the SOLE timing authority (the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap);
-# NO pg_cron, NO Vercel cron. Daily Reporting + Brand View only -- Campaign Ads, FBA and every unrelated report
-# are structurally absent from this workflow.
+# TRUSTED MANUAL refresh workflow for Daily Reporting + Brand View (Scheduler v2). Automatic cron triggers are
+# PAUSED while the production OLI HTTP-400 request rejection is corrected and manually verified. The full
+# source-refresh + derive + publish flow exceeds Vercel's 60s route cap; NO pg_cron and NO Vercel cron exist.
+# Daily Reporting + Brand View only -- Campaign Ads, FBA and every unrelated report are structurally absent.
 #
 #   - non-us @ 02:00 UTC (07:30 IST): cycle preflight -> confirm >=20 tokens -> Non-US OLI -> Non-US ASIN Ads ->
 #     read-only post-run proof. NO publication.
@@ -19,9 +19,6 @@ name: scheduler-v2
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
-  schedule:
-    - cron: "0 2 * * *"    # non-us  02:00 UTC / 07:30 IST
-    - cron: "30 10 * * *"  # us      10:30 UTC / 16:00 IST
   workflow_dispatch:
     inputs:
       bucket:
@@ -73,15 +70,10 @@ jobs:
         id: cfg
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            bucket="${{ github.event.inputs.bucket }}"
-          elif [ "${{ github.event.schedule }}" = "0 2 * * *" ]; then
-            bucket="non-us"
-          elif [ "${{ github.event.schedule }}" = "30 10 * * *" ]; then
-            bucket="us"
-          else
-            echo "Unrecognized trigger (event=${{ github.event_name }} schedule=${{ github.event.schedule }})." >&2; exit 1
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Automatic scheduling is paused; only workflow_dispatch is accepted." >&2; exit 1
           fi
+          bucket="${{ github.event.inputs.bucket }}"
           if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then echo "Invalid bucket '$bucket'." >&2; exit 1; fi
           if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"

@@ -193,3 +193,7 @@ export const ROW_LIMITS = {
   inventory: 15000,
   dateRollup: 500,
 };
+
+// Source-specific API ceiling confirmed by the live DataDoe create endpoint. This is deliberately separate
+// from the larger limits accepted by other sources.
+export const OLI_ROW_LIMIT = 5000;

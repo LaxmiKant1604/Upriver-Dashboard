@@ -1621,7 +1621,7 @@ const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
-const OLI_SALES_ROW_LIMIT = 50000;
+const OLI_SALES_ROW_LIMIT = 5000;
 
 // Advertising source (ad sales / spend / clicks), merged into the daily report by (account, date, currency).
 // ad_campaign_budget_currency is carried + normalized to `currency` (Blocker 4) so the currency-keyed
@@ -1757,12 +1757,13 @@ const PLAN_INVENTORY_ROW_LIMIT = 15000;
 const DASHBOARD_ROW_LIMIT = 5000;
 // Order rows are grouped by day and ASIN before download. A year of data can
 // still contain more than 5,000 ASIN/day groups, so use a higher export cap.
-const ORDER_SALES_ROW_LIMIT = 50000;
+// DataDoe's current Order Line Items create contract rejects a limit above 5,000.
+const ORDER_SALES_ROW_LIMIT = 5000;
 const CATALOG_ROW_LIMIT = 10000;
 // Daily sources are aggregated by account/date before download, so a compact
 // limit safely covers years of history without raw ASIN row truncation.
 const DAILY_ROW_LIMIT = 5000;
-const DAILY_BRAND_ROW_LIMIT = 50000;
+const DAILY_BRAND_ROW_LIMIT = 5000;
 const RECONCILIATION_ROW_LIMIT = 50000;
 const CONTENT_CHANGE_ROW_LIMIT = 1000;
 

@@ -46,7 +46,7 @@ function checkPlanSources(plan, selectedAccountId, asOf) {
   // BOTH windows must be exactly [addDaysStr(monthStartStr(asOf), -420), asOf] -- the live route window.
   const expFrom = addDaysStr(monthStartStr(asOf), -420);
   const EXPECT = {
-    "brand-sales:order-lines": { sourceKey: "order-line-items", sourceId: OLI_SOURCE_ID, limit: 50000 },
+    "brand-sales:order-lines": { sourceKey: "order-line-items", sourceId: OLI_SOURCE_ID, limit: 5000 },
     "brand-sales:catalog": { sourceKey: "product-catalog", sourceId: CATALOG_SOURCE_ID, limit: 10000 },
   };
   for (const [rk, exp] of Object.entries(EXPECT)) {

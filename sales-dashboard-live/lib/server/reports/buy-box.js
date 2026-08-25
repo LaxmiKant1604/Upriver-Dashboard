@@ -27,7 +27,7 @@ import {
   fetchInventorySnapshot,
   sumField,
 } from "./common.js";
-import { ORDER_LINE_ITEMS, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
+import { OLI_ROW_LIMIT, ORDER_LINE_ITEMS, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
 
 export const BUY_BOX_REPORT_KEY = "buy-box-loss";
 export const BUY_BOX_VERSION = "buy-box-loss-v1";
@@ -136,7 +136,7 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
   // away into the currency|sku join key.
   for (const slice of canonicalOliSlices(from, to)) {
     const orderedRows = await fetchExportRowsStrict(
-      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.rawGrain,
+      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, OLI_ROW_LIMIT,
       { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" },
       `Buy Box ordered export (${slice.from} to ${slice.to})`
     );

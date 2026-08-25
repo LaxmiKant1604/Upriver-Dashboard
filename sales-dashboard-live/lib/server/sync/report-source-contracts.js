@@ -107,7 +107,9 @@ const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
-const OLI_SALES_ROW_LIMIT = 50000; // DAILY_BRAND_ROW_LIMIT / ROW_LIMITS.aggregated (strict per-slice cap)
+// DataDoe's live Order Line Items create contract rejects limit > 5000 (HTTP 400). Keep one canonical cap
+// across every OLI consumer; strict callers reject a cap-sized response rather than save partial evidence.
+const OLI_SALES_ROW_LIMIT = 5000;
 
 // Daily Reporting's ASIN/day superset IS the canonical fragment (byte-identical to OLI_SALES_*).
 const DAILY_BRAND_SALES_COLUMNS = OLI_SALES_COLUMNS;
@@ -222,7 +224,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
       sourceKey: "order-line-items",
       columns: ORDER_SALES_COLUMNS,
-      limit: 50000, // ORDER_SALES_ROW_LIMIT
+      limit: OLI_SALES_ROW_LIMIT,
       groupBy: ORDER_SALES_GROUP_BY,
       aggregations: ORDER_SALES_AGGREGATIONS,
       orderByColumn: "date",

@@ -25,7 +25,7 @@
 
 import { num, canonicalOliSlices } from "../datadoe.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
-import { ORDER_LINE_ITEMS, RETURNS, ROW_LIMITS, SETTLEMENTS } from "./sources.js";
+import { OLI_ROW_LIMIT, ORDER_LINE_ITEMS, RETURNS, ROW_LIMITS, SETTLEMENTS } from "./sources.js";
 import { addDaysStr } from "../datadoe.js";
 
 export const RETURNS_REPORT_KEY = "returns-leakage";
@@ -125,7 +125,7 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
   const orderedRows = [];
   for (const slice of canonicalOliSlices(from, to)) {
     const sliceRows = await fetchExportRowsStrict(
-      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, ROW_LIMITS.aggregated,
+      apiKey, ORDER_LINE_ITEMS.id, OLI_SALES_GROUP_BY, ids, slice.from, slice.to, OLI_ROW_LIMIT,
       {
         groupBy: OLI_SALES_GROUP_BY,
         aggregations: OLI_SALES_AGGREGATIONS,

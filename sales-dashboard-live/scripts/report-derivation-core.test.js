@@ -191,13 +191,13 @@ test("PPC declares Ads as DERIVED source keys and owns no Ads export", async () 
   assert.deepEqual(adsRequired, [], "PPC required keys must not include an owned Ads export");
 });
 
-test("golden request_hash is unchanged by Phase 1d (pinned brand-sales identities)", async () => {
+test("golden request_hash pins the corrected DataDoe OLI limit and unchanged Catalog identity", async () => {
   const jobs = reportSourceRequestHashes({
     reportKey: "brand-sales", apiKey: ["PIN", "KEY"].join("_"), ids: ["A1"],
     windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] },
   });
   const byKey = Object.fromEntries(jobs.map((j) => [j.requestKey, j.requestHash]));
-  assert.equal(byKey["brand-sales:order-lines"], "e498a48016d990b9835d177064d25256c63dff40f8cdf69ddbcd221035247456");
+  assert.equal(byKey["brand-sales:order-lines"], "b69ab7e4c46fa48d366237bd7e0fb4c3381f29ea22af538d396c6e6c393f3f74");
   assert.equal(byKey["brand-sales:catalog"], "936e6d1ba2eb377c503b0fda56263a5274dc63943d08e360e35f0ac7f9ec7014");
 });
 

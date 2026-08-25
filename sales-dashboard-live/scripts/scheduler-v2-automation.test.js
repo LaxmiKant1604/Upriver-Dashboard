@@ -170,13 +170,13 @@ test("C3. rejects every violation: not-drained, non-OLI source, failed job, batc
   }
 });
 
-group("D. GitHub Actions workflow: cron times + single-scheduler rule + US publish/safe-close shape");
+group("D. GitHub Actions workflow: automatic schedule paused + manual publish/safe-close shape");
 
-test("D1. scheduler-v2.yml pins BOTH daily crons, workflow_dispatch, concurrency, Node 24, and a >=90-min timeout", () => {
+test("D1. scheduler-v2.yml is manual-only while OLI is under correction, with concurrency, Node 24, and a >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
-  assert.match(yml, /cron:\s*"0 2 \* \* \*"/, "non-us 02:00 UTC cron");
-  assert.match(yml, /cron:\s*"30 10 \* \* \*"/, "us 10:30 UTC cron");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
+  assert.doesNotMatch(yml, /\n\s*schedule:\s*\n/, "automatic schedule is paused");
+  assert.doesNotMatch(yml, /cron:/, "no hidden cron remains");
   assert.match(yml, /concurrency:\s*\n\s*group:\s*scheduler-v2/, "single-run concurrency group");
   assert.match(yml, /cancel-in-progress:\s*false/, "runs serialize, never overlap");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
@@ -216,10 +216,10 @@ test("D2. workflow shape: exact ordered pipeline with per-run token ceilings, cy
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. single-scheduler rule: EXACTLY ONE workflow file declares a schedule: trigger", () => {
+test("D3. automatic scheduling is globally paused: ZERO workflow files declare a schedule trigger", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8")));
-  assert.deepEqual(scheduled, ["scheduler-v2.yml"], "only scheduler-v2.yml schedules; got " + JSON.stringify(scheduled));
+  assert.deepEqual(scheduled, [], "no workflow schedules while the production OLI correction is pending; got " + JSON.stringify(scheduled));
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");
