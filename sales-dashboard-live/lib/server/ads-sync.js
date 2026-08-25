@@ -13,6 +13,10 @@ import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js
 // requiredCoverage pair. Reused from the PPC loader so the "complete window proven" rule is IDENTICAL to the
 // gate the PPC report itself applies. No import cycle (ppc-ads-loader imports no transport/ads-sync).
 import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
+// The AUTHORITATIVE per-row currency (marketplace-derived when the ASIN payload omits it). Shared with the read
+// aggregations so persist + read agree, and a blank ASIN currency is never stored as "" (which downstream would
+// fail closed as ads-currency-missing).
+import { resolveAdRowCurrency } from "./reports/asin-ads-aggregation.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
 export const EXPORT_LIMIT = 50000;
@@ -282,7 +286,10 @@ function rowRecord(source, row, refreshedAt, connection) {
     campaign_type: String(row.ad_campaign_type || ""),
     child_asin: String(row.child_asin || ""),
     targeting_id: String(row.ad_targeting_id || row.ad_keyword_id || ""),
-    currency: String(row.currency || row.ad_campaign_budget_currency || ""),
+    // AUTHORITATIVE currency: explicit row currency wins; otherwise the row's marketplace fixes it (the ASIN grain
+    // supplies no currency). Persisting the resolved currency keeps the durable row usable by the per-account
+    // isolation check instead of a "" that would be blocked as ads-currency-missing.
+    currency: resolveAdRowCurrency(row),
     dimensions,
     metrics,
     source_refreshed_at: refreshedAt,

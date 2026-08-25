@@ -4,6 +4,8 @@
 // not supply; deduplicate by the canonical natural grain before summing; keep UNMAPPED ASINs as a typed separate
 // amount (never silently assigned or dropped). Campaign Ads (campaign-performance-v1) is NEVER summed here.
 
+import { marketplaceProfile } from "../../marketplaces.js";
+
 // The ONLY metrics the ASIN Ads contract supplies (confirmed against the live rows). A field ABSENT from a row's
 // metrics stays absent -- it is never materialized as 0.
 export const ASIN_ADS_METRIC_FIELDS = Object.freeze({
@@ -26,6 +28,24 @@ const S = (v) => (v == null ? "" : String(v));
 const numOrNull = (v) => { if (v == null || v === "") return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
 export function normalizeAdsCurrency(v) { const t = S(v).trim().toUpperCase(); return t || UNKNOWN_CURRENCY; }
 export function asinOf(row) { return S(row && row.child_asin).trim().toUpperCase(); }
+
+/**
+ * The AUTHORITATIVE currency of an ASIN-Ads row. The ASIN grain frequently supplies NO currency on the row
+ * (asin-performance metrics carry neither `currency` nor a populated `ad_campaign_budget_currency`), so a blank
+ * was persisted -- which then fails the per-account currency isolation check as `ads-currency-missing`. Currency
+ * is deterministically fixed by the MARKETPLACE, so we derive it from `marketplace_country_code` when the row
+ * carries no explicit currency. This mirrors how the seller id is taken authoritatively from metadata, never a
+ * raw row. IMPORTANT for isolation: a row from a FOREIGN marketplace resolves to that marketplace's (foreign)
+ * currency, so the per-account currency check still catches cross-marketplace/cross-account contamination -- a
+ * blank currency is filled, never blindly coerced to the account's currency. Returns "" only when neither an
+ * explicit currency nor a known marketplace is present (a genuinely ambiguous row -> caller fails it closed).
+ */
+export function resolveAdRowCurrency(row) {
+  const explicit = S(row && row.currency).trim().toUpperCase() || S(row && row.ad_campaign_budget_currency).trim().toUpperCase();
+  if (explicit) return explicit;
+  const mkt = marketplaceProfile(S(row && row.marketplace_country_code)).currency;
+  return mkt ? S(mkt).trim().toUpperCase() : "";
+}
 
 // The canonical dedup grain: one row per (account, marketplace, date, dimension_key). Rows are already unique by
 // the table PK, but overlapping reads are deduped here so a metric is counted exactly once.
@@ -74,7 +94,7 @@ export function aggregateAccountAsinAds(rows) {
   const deduped = dedupeRows(rows);
   const byCurrency = {};
   for (const row of deduped) {
-    const cur = normalizeAdsCurrency(row.currency);
+    const cur = resolveAdRowCurrency(row) || UNKNOWN_CURRENCY;
     (byCurrency[cur] = byCurrency[cur] || {});
     addMetrics(byCurrency[cur], asinAdsMetricsFromRow(row));
   }
@@ -101,7 +121,10 @@ export function aggregateAsinAdsDailyRows(rows, { rawSellerId = null } = {}) {
   for (const row of deduped) {
     const date = S(row.metric_date);
     if (!date) continue;
-    const cur = S(row.currency).trim().toUpperCase(); // blank stays "" (NOT the UNKNOWN group)
+    // Authoritative currency: an ASIN row with no explicit currency is fixed to its MARKETPLACE currency (a blank
+    // was a persist gap, not a real ambiguity). A row whose marketplace is unknown AND has no currency stays ""
+    // -> null -> the per-account contract fails it closed on a nonzero value (never a silent misattribution).
+    const cur = resolveAdRowCurrency(row);
     const k = date + "|" + cur;
     let g = byKey.get(k);
     if (!g) { g = { date, currency: cur, sales: undefined, spend: undefined, clicks: undefined }; byKey.set(k, g); }
@@ -152,7 +175,7 @@ export function aggregateBrandAsinAds(rows, asinBrandMap, brand) {
   for (const row of deduped) {
     const asin = asinOf(row);
     const mapped = asin ? map.get(asin) : undefined;
-    const cur = normalizeAdsCurrency(row.currency);
+    const cur = resolveAdRowCurrency(row) || UNKNOWN_CURRENCY;
     const metrics = asinAdsMetricsFromRow(row);
     if (mapped != null && S(mapped).trim() === wanted) {
       (byCurrency[cur] = byCurrency[cur] || {}); addMetrics(byCurrency[cur], metrics); matchedRows += 1;

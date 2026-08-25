@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import {
   aggregateAccountAsinAds, aggregateBrandAsinAds, aggregateAsinAdsDailyRows, asinAdsMetricsFromRow,
-  normalizeAdsCurrency, asinAdsNaturalKey, UNKNOWN_CURRENCY, UNMAPPED_BRAND, ASIN_ADS_METRIC_KEYS,
+  normalizeAdsCurrency, resolveAdRowCurrency, asinAdsNaturalKey, UNKNOWN_CURRENCY, UNMAPPED_BRAND, ASIN_ADS_METRIC_KEYS,
 } from "../lib/server/reports/asin-ads-aggregation.js";
 
 let passed = 0;
@@ -40,12 +40,46 @@ test("currency normalization: lowercase/canonical fold to ONE identity; blank ->
   assert.equal(normalizeAdsCurrency(null), UNKNOWN_CURRENCY);
 });
 
+test("resolveAdRowCurrency: explicit wins; blank ASIN currency is fixed AUTHORITATIVELY from the marketplace; unknown market -> ''", () => {
+  assert.equal(resolveAdRowCurrency({ currency: "eur", marketplace_country_code: "US" }), "EUR", "an explicit row currency wins");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "US" }), "USD", "blank + US marketplace -> USD");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "DE" }), "EUR", "blank + DE -> EUR");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "GB" }), "GBP", "blank + GB -> GBP");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "UK" }), "GBP", "blank + UK alias -> GBP");
+  assert.equal(resolveAdRowCurrency({ ad_campaign_budget_currency: "inr", marketplace_country_code: "US" }), "INR", "budget currency is the second-choice explicit value");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "ZZ" }), "", "no explicit currency AND unknown marketplace -> '' (caller fails it closed)");
+  assert.equal(resolveAdRowCurrency({ currency: "", marketplace_country_code: "" }), "", "no marketplace either -> ''");
+});
+
+test("daily fold: a blank ASIN currency in a KNOWN marketplace folds into that marketplace currency (the persist-gap fix)", () => {
+  // Two US rows, one WITH an explicit USD and one BLANK -> both are USD, folded into ONE USD group (not USD + null).
+  const rows = [
+    row({ asin: "ASIN1", date: "2026-08-20", currency: "USD", country: "US", metrics: { ad_sales_same_sku: 5, ad_spend: 2, ad_clicks: 3 } }),
+    row({ asin: "ASIN2", date: "2026-08-20", currency: "", country: "US", metrics: { ad_sales_same_sku: 4, ad_spend: 1, ad_clicks: 2 } }),
+  ];
+  const out2 = aggregateAsinAdsDailyRows(rows, { rawSellerId: "R" });
+  assert.equal(out2.length, 1, "the blank-currency US row is NOT a separate null group -- it is USD");
+  assert.deepEqual(out2[0], { date: "2026-08-20", seller_or_vendor_id: "R", currency: "USD", ad_sales: 9, ad_spend: 3, ad_clicks: 5 });
+});
+
+test("isolation preserved: a FOREIGN-marketplace blank row resolves to its FOREIGN currency (separable, never coerced to the account's)", () => {
+  // A DE-marketplace row with a blank currency resolves to EUR, NOT the US account's USD -> a separate group the
+  // per-account currency check will still block as cross-marketplace, so the fix never masks contamination.
+  const rows = [
+    row({ asin: "ASIN1", date: "2026-08-20", currency: "", country: "US", metrics: { ad_spend: 2 } }),
+    row({ asin: "ASIN2", date: "2026-08-20", currency: "", country: "DE", metrics: { ad_spend: 3 } }),
+  ];
+  const out2 = aggregateAsinAdsDailyRows(rows, { rawSellerId: "R" });
+  const curs = out2.map((r) => r.currency).sort();
+  assert.deepEqual(curs, ["EUR", "USD"], "US->USD, DE->EUR: two distinct currency groups (contamination stays separable)");
+});
+
 test("account-level: folds EVERY ASIN (mapped + unmapped) into per-currency totals; currencies never combine", () => {
   const rows = [
     row({ asin: "ASIN1", metrics: { ad_spend: 5, ad_impressions: 100 } }),
     row({ asin: "ASIN2", metrics: { ad_spend: 3, ad_impressions: 50 } }),
     row({ asin: "ASIN9", currency: "EUR", metrics: { ad_spend: 7, ad_impressions: 70 } }), // different currency
-    row({ asin: "ASINX", currency: "", metrics: { ad_spend: 2, ad_impressions: 20 } }),     // blank currency
+    row({ asin: "ASINX", currency: "", country: "ZZ", metrics: { ad_spend: 2, ad_impressions: 20 } }), // blank currency + unknown marketplace -> UNKNOWN
   ];
   const a = aggregateAccountAsinAds(rows);
   assert.deepEqual(a.currencies, ["EUR", "UNKNOWN", "USD"]);
@@ -116,7 +150,7 @@ test("daily fold: every ASIN folds per (date, currency); currencies never combin
     row({ asin: "ASIN1", date: "2026-08-20", metrics: { ad_sales_same_sku: 5, ad_spend: 2, ad_clicks: 3 } }),
     row({ asin: "ASIN2", date: "2026-08-20", metrics: { ad_sales_same_sku: 4, ad_spend: 1, ad_clicks: 2 } }),
     row({ asin: "ASIN9", date: "2026-08-20", currency: "EUR", metrics: { ad_sales_same_sku: 7, ad_spend: 3, ad_clicks: 1 } }),
-    row({ asin: "ASINX", date: "2026-08-21", currency: "", metrics: { ad_sales_same_sku: 9, ad_spend: 4, ad_clicks: 6 } }),
+    row({ asin: "ASINX", date: "2026-08-21", currency: "", country: "ZZ", metrics: { ad_sales_same_sku: 9, ad_spend: 4, ad_clicks: 6 } }), // blank currency + unknown marketplace -> null
   ];
   const out2 = aggregateAsinAdsDailyRows(rows, { rawSellerId: "RAW-1" });
   // 2026-08-20 USD (ASIN1+ASIN2 folded), 2026-08-20 EUR (separate), 2026-08-21 blank->null

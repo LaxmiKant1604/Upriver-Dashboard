@@ -96,7 +96,7 @@ function makeDeps(opts = {}) {
       // default: nothing covered (read ok, no windows, missing state) => never authorizes a skip.
       return { windows: [], status: "missing", latestMetricDate: null, read: "ok", error: null };
     },
-    upsertAdsDailyRows: async (rows) => { calls.upsertRows.push(rows.length); },
+    upsertAdsDailyRows: async (rows) => { calls.upsertRows.push(rows.length); calls.upsertRowsData = (calls.upsertRowsData || []).concat(rows); },
     upsertAdDailyMetrics: async (rows) => { calls.upsertMetrics.push(rows.length); },
     upsertAdsSyncStates: async (states) => { calls.upsertStates.push(states); },
     recordAdsCoverageWindows: async (rows) => {
@@ -411,6 +411,26 @@ test("rows for BOTH selected accounts in one batch succeed (per-row marketplace 
   const cov = calls.coverage.flat();
   assert.deepEqual([...new Set(cov.map((c) => c.accountId))].sort(), [G6_US, G6_IN].sort(), "both accounts covered");
   assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, []);
+});
+
+test("persist stamps the AUTHORITATIVE marketplace currency when the ASIN payload omits it (no '' stored -> not blocked downstream)", async () => {
+  // Raw ASIN rows carry a marketplace but NO currency field (the real asin-performance shape). rowRecord must
+  // persist the marketplace currency (US->USD, IN->INR), NOT "" -- otherwise adRowBlockStatus blocks them.
+  const { deps, calls } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  const persisted = calls.upsertRowsData || [];
+  assert.ok(persisted.length >= 2, "rows persisted");
+  assert.ok(persisted.every((r) => r.currency && r.currency !== ""), "NO blank currency is ever persisted");
+  assert.equal(persisted.find((r) => r.marketplace_country_code === "US").currency, "USD", "US marketplace -> USD");
+  assert.equal(persisted.find((r) => r.marketplace_country_code === "IN").currency, "INR", "IN marketplace -> INR");
+});
+
+test("persist keeps an EXPLICIT payload currency over the marketplace default (explicit wins)", async () => {
+  const { deps, calls } = makeDeps({ rowsFor: () => [{ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", currency: "CAD" }] });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  assert.equal((calls.upsertRowsData || [])[0].currency, "CAD", "an explicit row currency is preserved, not overwritten by the marketplace");
 });
 
 test("a genuine ZERO-row export is valid covered-empty evidence (rows called with [], coverage recorded, state succeeded)", async () => {
