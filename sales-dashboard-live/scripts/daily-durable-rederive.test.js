@@ -82,11 +82,47 @@ test("(5-invariant) a missing validated Catalog snapshot -> not-ready (never a f
   assert.ok(r.blockedBy.some((b) => b.sourceKey === "product-catalog"));
 });
 
-test("named-brand request derives the brand-FILTERED payload (no ads), exactly like the live route", () => {
-  const r = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Acme" }, fullEvidence());
-  assert.ok(r.payload);
-  assert.equal(r.payload.brandFiltered, true, "brand-filtered");
-  assert.ok(!("adsAvailability" in r.payload), "named-brand carries no ads");
+test("named-brand request derives the brand-FILTERED payload WITH brand-scoped ASIN Ads (catalog-attributed)", () => {
+  // CATALOG maps B0A->Acme, B0B->Bolt; AD_ROWS carries ONE B0A (Acme) ad row (40/12/8). Selecting Acme must
+  // attribute that ad row; Bolt must not receive it; ads resolve through the SAME availability model as ALL.
+  const acme = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Acme" }, fullEvidence());
+  assert.ok(acme.payload);
+  assert.equal(acme.payload.brandFiltered, true, "brand-filtered");
+  assert.equal(acme.payload.adsAvailability.status, "validated", "named-brand ads resolve through the availability model");
+  const acmeAd = acme.payload.rows.find((row) => Number(row.ad_sales) > 0);
+  assert.ok(acmeAd, "the Acme ASIN's ad row is attributed to Acme");
+  assert.equal(acmeAd.ad_sales, 40); assert.equal(acmeAd.ad_spend, 12); assert.equal(acmeAd.ad_clicks, 8);
+  // Brand isolation: Bolt gets NO ad metrics (the only ad row belongs to Acme's ASIN) -- honest zeros under
+  // validated coverage, never Acme's values.
+  const bolt = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Bolt" }, fullEvidence());
+  assert.ok(bolt.payload);
+  assert.equal(bolt.payload.adsAvailability.status, "validated", "coverage is account-level: Bolt's window is covered");
+  assert.ok(!bolt.payload.rows.some((row) => Number(row.ad_sales) > 0 || Number(row.ad_spend) > 0), "no Acme ad leaks into Bolt");
+});
+
+test("named-brand: canonical brandKey matching (case/whitespace variants same brand; punctuation distinct; unmapped excluded)", () => {
+  // "  acme " (case+whitespace variant) selects the SAME brand as "Acme".
+  const variant = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "  acme " }, fullEvidence());
+  assert.ok(variant.payload);
+  assert.equal(salesOf(variant.payload), 100, "the case/whitespace variant selects Acme's sales (SKU-A = 100)");
+  assert.ok(variant.payload.rows.some((row) => Number(row.ad_sales) === 40), "and Acme's attributed ads");
+  // Punctuation-distinct brand ("Ac-me") is a DIFFERENT brand -> no rows (valid empty, not Acme's data).
+  const punct = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Ac-me" }, fullEvidence());
+  assert.ok(punct.payload, "a brand with no rows still derives a VALID payload");
+  assert.equal(punct.payload.rows.filter((row) => Number(row.total_sales) > 0).length, 0, "no sales rows leak into the punctuation-distinct brand");
+  // An ad row on an ASIN with NO catalog brand mapping is never attributed to a named brand.
+  const evidenceUnmapped = fullEvidence({ asinAdRows: [{ ...AD_ROWS[0], child_asin: "B0UNMAPPED" }] });
+  const acme = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Acme" }, evidenceUnmapped);
+  assert.ok(!acme.payload.rows.some((row) => Number(row.ad_sales) > 0), "an unmapped-ASIN ad row is excluded from the named brand");
+});
+
+test("named-brand: missing Ads coverage -> adsAvailability unavailable (never fabricated zeros); sales still derive", () => {
+  const r = rederiveDailyV2Payload({ accountId: ACCOUNT, rawSellerId: RAW, currency: CUR, from: FROM, to: TO, brand: "Acme" },
+    fullEvidence({ asinCoverageState: { windows: [], status: "missing", latestMetricDate: null, read: "ok" }, asinWindows: [] }));
+  assert.ok(r.payload, "sales derive regardless of Ads");
+  assert.equal(r.payload.adsAvailability.status, "unavailable", "no coverage -> typed unavailable");
+  assert.ok(!r.payload.rows.some((row) => ("ad_sales" in row)), "no ad fields materialized (unavailable is never zero)");
+  assert.equal(salesOf(r.payload), 100, "Acme sales intact");
 });
 
 // ---- latestProvenDailyTo: honestly clamp the requested as-of to each account's proven OLI coverage ----
@@ -148,12 +184,13 @@ await testAsync("the operation returns typed not-ready (no save) when durable OL
   assert.equal(saves.length, 0, "nothing saved when not ready (LKG preserved; no fabricated report)");
 });
 
-await testAsync("named-brand gather skips the Ads reads entirely (ads are ALL-brand only)", async () => {
+await testAsync("named-brand gather READS the durable Ads evidence (one reusable source: same reads as ALL, no adapter)", async () => {
   let adsReads = 0;
   const { readers } = makeReaders({ readAsinAds: async () => { adsReads += 1; return AD_ROWS; }, readAdsCoverage: async () => { adsReads += 1; return ASIN_COV; } });
   const ev = await gatherDailyDurableEvidence({ accountId: ACCOUNT, from: FROM, to: TO, brand: "Acme", organizationFingerprint: "org" }, readers);
-  assert.equal(adsReads, 0, "no ASIN Ads reads for a named-brand payload");
-  assert.deepEqual(ev.asinAdRows, []);
+  assert.equal(adsReads, 2, "the named-brand gather reads the SAME durable ads rows + coverage as ALL");
+  assert.deepEqual(ev.asinAdRows, AD_ROWS, "raw ASIN rows are gathered (brand filtering happens in the pure derive)");
+  assert.ok(!("create" in readers), "still no create/adapter -- a DataDoe export stays structurally impossible");
 });
 
 // ---- the read-path self-heal in serveSharedReport (concurrency + zero-export + honest waiting) ----

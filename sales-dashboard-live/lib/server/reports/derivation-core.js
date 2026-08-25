@@ -15,6 +15,11 @@
 // records a conflict); FX lives only in the display layer.
 
 import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
+// The ONE canonical brand-key (trim + collapse interior whitespace + lowercase; punctuation preserved) --
+// brand-membership.js is a zero-import pure leaf, so this stays a transport-free graph. Every brand MATCH in the
+// daily folds goes through it so a case/whitespace variant selects the same brand while punctuation-distinct
+// brands stay separate.
+import { brandKey } from "./brand-membership.js";
 
 // Numeric coercion identical to lib/server/datadoe.js `num` (Number(v) || 0), kept local so
 // this leaf pulls in no transport module.
@@ -178,17 +183,28 @@ export function normalizeAdRows(rows) {
   }));
 }
 
-// Verbatim copy of api/datadoe.js dailyRowsForBrand (first catalog brand per ASIN wins).
-export function dailyRowsForBrand(rows, catalogRows, brand) {
+// The catalog ASIN -> CANONICAL brand-key map (first catalog brand per ASIN wins, matching the historical route
+// behavior). Keys are UPPERCASED ASINs; values are brandKey() forms so matching is canonical (case/whitespace
+// variants same brand, punctuation distinct). An ASIN with no catalog brand is ABSENT (never attributed).
+function catalogBrandKeyByAsin(catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
-    const asin = String(catalogRow.child_asin || "").trim();
-    const productBrand = String(catalogRow.product_brand || "").trim();
-    if (asin && productBrand && !brandByAsin.has(asin)) brandByAsin.set(asin, productBrand);
+    const asin = String(catalogRow.child_asin || "").trim().toUpperCase();
+    const key = brandKey(catalogRow.product_brand);
+    if (asin && key && !brandByAsin.has(asin)) brandByAsin.set(asin, key);
   }
+  return brandByAsin;
+}
+
+// api/datadoe.js dailyRowsForBrand, with CANONICAL brand matching (brandKey: case/whitespace variants of the
+// selected brand match; punctuation-distinct brands never merge). An OLI row is attributed ONLY through a proven
+// catalog child_asin -> product_brand mapping -- an unmapped ASIN never contributes to a named brand.
+export function dailyRowsForBrand(rows, catalogRows, brand) {
+  const brandByAsin = catalogBrandKeyByAsin(catalogRows);
+  const wantKey = brandKey(brand);
   const totals = new Map();
   for (const row of rows) {
-    if (brandByAsin.get(String(row.child_asin || "").trim()) !== brand) continue;
+    if (!wantKey || brandByAsin.get(String(row.child_asin || "").trim().toUpperCase()) !== wantKey) continue;
     // Currency isolation: a (seller, date) pair is folded per currency, never across.
     const currency = row.currency ?? row.item_price_currency ?? null;
     const key = `${row.seller_or_vendor_id}|${row.date}|${currency ?? ""}`;
@@ -206,6 +222,20 @@ export function dailyRowsForBrand(rows, catalogRows, brand) {
     totals.set(key, current);
   }
   return [...totals.values()];
+}
+
+// BRAND-scoped ASIN Ads: keep ONLY the raw ASIN ad rows whose child_asin maps -- through the PROVEN catalog
+// child_asin -> product_brand join (canonical brandKey matching, first catalog brand per ASIN wins, the SAME map
+// the sales fold uses) -- to the selected brand. An ad row with an unmapped ASIN, a blank ASIN, or a
+// different-brand ASIN is EXCLUDED (never attributed to the brand, exactly like the sales side). Pure.
+export function filterAdRowsToBrand(adRows, catalogRows, brand) {
+  const brandByAsin = catalogBrandKeyByAsin(catalogRows);
+  const wantKey = brandKey(brand);
+  if (!wantKey) return [];
+  return (Array.isArray(adRows) ? adRows : []).filter((row) => {
+    const asin = String((row && row.child_asin) || "").trim().toUpperCase();
+    return !!asin && brandByAsin.get(asin) === wantKey;
+  });
 }
 
 // Verbatim copy of api/datadoe.js mergeSalesAndAds. Operates on a FRESH array (never mutates the
@@ -282,7 +312,16 @@ export function rollupSupersetToDaily(supersetRows) {
 // scheduled Ads rows); a missing/non-array adRows throws rather than silently understating.
 export function dailyReportingPayload({ supersetRows, catalogRows, adRows, brand = "ALL", adsAvailability = null }) {
   if (brand && brand !== "ALL") {
-    return { rows: dailyRowsForBrand(supersetRows, catalogRows, brand), brandFiltered: true };
+    // Named brand: catalog ASIN->brand joined sales, folded to one row/day. When the caller supplies
+    // BRAND-SCOPED ad rows (already filtered through the catalog mapping -- see filterAdRowsToBrand) they merge
+    // exactly like the ALL path, with the explicit adsAvailability state attached. When NO adRows are supplied
+    // (legacy callers, the scheduler's named-brand shadow derive) the payload keeps the historic no-ads shape
+    // byte-for-byte, so existing parity is untouched.
+    const brandRows = dailyRowsForBrand(supersetRows, catalogRows, brand);
+    if (!Array.isArray(adRows)) return { rows: brandRows, brandFiltered: true };
+    const payload = { rows: mergeSalesAndAds(brandRows, normalizeAdRows(adRows)), brandFiltered: true };
+    if (adsAvailability) payload.adsAvailability = adsAvailability;
+    return payload;
   }
   if (!Array.isArray(adRows)) {
     throw new Error("daily-reporting ALL derivation requires injected adRows (an array; [] when there is no ad activity).");

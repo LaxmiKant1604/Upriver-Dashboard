@@ -78,6 +78,40 @@ await testAsync("a NAMED-brand request is ISOLATED: it never falls back to the A
   assert.equal(cap.body.rows, undefined, "the ALL-brand rows are NOT leaked to the named-brand request");
 });
 
+await testAsync("a MISSING named-brand snapshot SELF-HEALS: derives from durable evidence, SAVES under the named-brand identity, serves in the same request (zero exports)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN, brand: "ALL", payload: { rows: [{ date: PROVEN, total_sales: 999 }], brandFiltered: false } }); // ALL exists; Acme does not
+  // Injectable self-heal store (the same shape production wires): lock + snapshot persistence.
+  const snaps = new Map(); const locks = new Set();
+  const key = (o) => [o.reportKey, o.accountId, o.paramsHash].join("|");
+  const store = {
+    claimRefreshLock: async (o) => { const k = key(o); if (locks.has(k)) return false; locks.add(k); return true; },
+    releaseRefreshLock: async (o) => { locks.delete(key(o)); },
+    getReportSnapshot: async (o) => snaps.get(key(o)) || null,
+    saveReportSnapshot: async (o) => { const row = { id: "s", updated_at: "u", source_refreshed_at: o.sourceRefreshedAt, payload: o.payload, params: o.params }; snaps.set(key(o), row); return row; },
+    publishSnapshotUpdate: async () => {},
+  };
+  let derives = 0;
+  const deriveDurable = async () => {
+    derives += 1; // simulates rederiveDailyV2 clampToProven for brand=Acme: brand-scoped sales + catalog-attributed ads
+    return {
+      payload: { rows: [{ date: PROVEN, total_sales: 42, ad_sales: 7, ad_spend: 2, ad_clicks: 1 }], brandFiltered: true, adsAvailability: { status: "validated", coveredFrom: FROM, coveredTo: PROVEN, latestMetricDate: PROVEN } },
+      sourceRefreshedAt: "2026-08-22T01:00:00.000Z",
+      effectiveParams: { from: FROM, to: PROVEN, brand: "Acme" }, latestCompletedDate: PROVEN,
+    };
+  };
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Acme" }, staleScopeKeys: ["brand"], readers, store, deriveDurable }));
+  assert.equal(derives, 1, "the self-heal derived exactly once");
+  assert.equal(cap.body.snapshotMissing, undefined, "NOT a waiting state -- served in the same request");
+  assert.equal(cap.body.rows[0].total_sales, 42, "the BRAND payload is served (never the ALL-brand 999)");
+  assert.equal(cap.body.rows[0].ad_sales, 7, "brand-scoped ads are present");
+  assert.equal(cap.body.snapshot.rederived, true, "flagged as re-derived");
+  const stored = [...snaps.values()][0];
+  assert.equal(stored.params.brand, "Acme", "SAVED under the named-brand identity (clamped effective params)");
+  assert.equal(stored.params.to, PROVEN, "honest clamped as-of");
+});
+
 await testAsync("a named-brand request serves ITS OWN snapshot (not the ALL-brand one, even if ALL is newer)", async () => {
   const { readers, seed } = makeReaders();
   seed({ to: PROVEN, brand: "Acme", payload: { rows: [{ date: PROVEN, total_sales: 42 }], brandFiltered: true } });

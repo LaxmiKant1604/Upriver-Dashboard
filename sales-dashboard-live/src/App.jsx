@@ -1206,6 +1206,9 @@ function DashboardApp({ session, access, onSignOut }) {
   const [dailyRows, setDailyRows] = useState([]);
   const [dailyLoading, setDailyLoading] = useState(false);
   const [dailyError, setDailyError] = useState(null);
+  // true when dailyError is the server's honest "no snapshot yet" state (a typed waiting/unavailable message),
+  // false when it is a genuine request failure. The waiting state renders as info, never as a failed refresh.
+  const [dailyMissing, setDailyMissing] = useState(false);
 
   // FBA Shipment Plan is cache-first and uses the shared header scope.
   const [planData, setPlanData] = useState(null);
@@ -1666,9 +1669,10 @@ function DashboardApp({ session, access, onSignOut }) {
       setDailyRows(body.rows || []);
       setLastFetchedAt(new Date(cachedAt));
       setDailyError(body.snapshotMissing ? body.message : null);
+      setDailyMissing(Boolean(body.snapshotMissing));
     } catch (error) {
       if (!isCurrentReq("daily", myId)) return;
-      if (!cached) setDailyError(error.message);
+      if (!cached) { setDailyError(error.message); setDailyMissing(false); }
     } finally {
       if (isCurrentReq("daily", myId)) setDailyLoading(false);
     }
@@ -1678,12 +1682,13 @@ function DashboardApp({ session, access, onSignOut }) {
     if (!dailyParams || dailyLoading) return;
     setDailyLoading(true);
     setDailyError(null);
+    setDailyMissing(false);
     refreshSharedReport(dailyParams)
       .then(({ body, cachedAt }) => {
         setDailyRows(body.rows || []);
         setLastFetchedAt(new Date(cachedAt));
       })
-      .catch((err) => setDailyError(err.message))
+      .catch((err) => { setDailyError(err.message); setDailyMissing(false); })
       .finally(() => setDailyLoading(false));
   }, [dailyParams, dailyLoading]);
 
@@ -3127,7 +3132,11 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
-        {dailyError && <DataQualityAlert tone="error" title="The last refresh failed" detail={dailyError} />}
+        {dailyError && (dailyMissing
+          // The server's honest "no snapshot yet" state (typed waiting/unavailable) is NOT a failed refresh:
+          // the report self-heals from saved evidence on read, so this is informational, never an error.
+          ? <DataQualityAlert tone="info" title="This report is not available yet" detail={dailyError} />
+          : <DataQualityAlert tone="error" title="The last refresh failed" detail={dailyError} />)}
 
         <div className="panel panel-flush">
           <div className="panel-head" style={{ padding: "15px 18px 12px", marginBottom: 0, borderBottom: "1px solid var(--border-default)" }}>
@@ -3152,7 +3161,7 @@ function DashboardApp({ session, access, onSignOut }) {
           ) : !dailyRows.length ? (
             <EmptyState
               icon={<DatabaseZap size={19} aria-hidden="true" />}
-              title={selectedAccountId ? "Waiting for the scheduled data refresh" : "No account selected"}
+              title={selectedAccountId ? "No data for this selection yet" : "No account selected"}
               actions={selectedAccountId ? (
                 <button className="plan-export-btn" type="button" onClick={loadCachedDaily} disabled={dailyLoading}>
                   <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
@@ -3161,7 +3170,7 @@ function DashboardApp({ session, access, onSignOut }) {
               ) : null}
             >
               {selectedAccountId
-                ? "This account's daily sales and advertising are prepared automatically from saved data. Navigating between reports and changing filters never calls DataDoe."
+                ? "This report is derived automatically from saved data the first time it is opened — selecting a brand never waits for a schedule and never calls DataDoe. If this stays empty, the account has no rows for this selection or a required saved source is still missing."
                 : "Choose an Amazon account in the command bar above."}
             </EmptyState>
           ) : (
@@ -3194,7 +3203,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className="footer-note">
           ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
-          Sales and ordered units are sourced from DataDoe Order Line Items (item_price_value / quantity). {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the connected DataDoe advertising export." : "Advertising metrics show — for a named brand because the connected advertising export is account-level and cannot be assigned accurately to a product brand."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
+          Sales and ordered units are sourced from DataDoe Order Line Items (item_price_value / quantity). {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the saved ASIN advertising data (same-SKU attributed sales)." : "Advertising metrics for this brand are the saved ASIN advertising rows whose ASIN maps to the brand through the Product Catalog (same-SKU attributed sales); ads on ASINs without a catalog brand mapping are not attributed. An em dash means advertising coverage is unavailable for that period, never a measured zero."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
       </div>
       )}

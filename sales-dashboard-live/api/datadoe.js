@@ -2590,7 +2590,12 @@ async function handleDataDoe(req, res) {
             loadCatalogPayload: getSourceSnapshotPayload,
           };
           sharedOptions.deriveDurable = async () => {
-            const meta = await accountDirectoryMeta(dailyAccountId).catch(() => null);
+            // sharedAccountMetadata (defined in THIS module) reads the account's currency from the shared
+            // account-directory snapshot. The previous call referenced an UNDEFINED helper (accountDirectoryMeta),
+            // so every self-heal derive threw a ReferenceError and degraded to the "waiting for the scheduled
+            // data refresh" state -- the exact named-brand blank-page bug (ALL-brand never hit it because its
+            // snapshots already exist and are served before the self-heal runs).
+            const meta = await sharedAccountMetadata(dailyAccountId).catch(() => null);
             // clampToProven: the browser always asks for to=TODAY, but durable OLI is only proven through each
             // account's last exported date and NO new export is authorized. Derive/serve the report ENDING at the
             // latest proven date instead of failing the whole page -- honestly labelled as that earlier as-of.

@@ -407,9 +407,30 @@ const REGISTRY = {
       );
       const catalogRows = sources["daily-reporting:catalog"].rows;
       const brand = context.brand ?? "ALL";
-      // Named-brand path: catalog ASIN->brand join, folded to one row/day, NO ads (like the route).
+      // Named-brand path: catalog ASIN->brand joined sales, folded to one row/day. When the caller supplies an
+      // adsCoverage contract (the zero-export self-heal builds it with BRAND-SCOPED ad rows -- child_asin mapped
+      // to the selected brand through the catalog), the ads resolve through the SAME availability model as ALL
+      // and merge onto the brand's sales rows. Without adsCoverage (legacy/scheduler callers) the payload keeps
+      // the historic no-ads shape byte-for-byte. Ads never block the brand's sales snapshot.
       if (brand && brand !== "ALL") {
-        return dailyReportingPayload({ supersetRows, catalogRows, brand });
+        if (context.adsCoverage == null) return dailyReportingPayload({ supersetRows, catalogRows, brand });
+        let brandAvailability;
+        let brandAdRows;
+        try {
+          const resolved = resolveDailyAdsAvailability(context.adsCoverage, {
+            accountId: context.accountId ?? null,
+            rawSellerId: context.rawSellerId ?? null,
+            currency: context.currency ?? null,
+            from: context.from ?? null,
+            to: context.to ?? null,
+          });
+          brandAvailability = resolved.availability;
+          brandAdRows = resolved.adRows;
+        } catch (_e) {
+          brandAvailability = { status: "failed", coveredFrom: null, coveredTo: null, requestedFrom: context.from ?? null, requestedTo: context.to ?? null, currency: context.currency ?? null, latestMetricDate: null, reason: "ads-availability-error" };
+          brandAdRows = [];
+        }
+        return dailyReportingPayload({ supersetRows, catalogRows, brand, adRows: brandAdRows, adsAvailability: brandAvailability });
       }
       // ALL path (blocker 3): SALES validity is INDEPENDENT of Ads. Always derive + save the sales
       // snapshot; layer Ads on ONLY for proven-covered dates, and record an explicit availability

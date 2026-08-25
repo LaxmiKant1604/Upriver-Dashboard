@@ -18,6 +18,7 @@
 import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 import { dailyReportingReadiness, slicedOliSourceFromHistory, BRAND_VIEW_ADS_GRAIN } from "../sync/durable-dashboards.js";
 import { buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } from "../sync/daily-ads-loader.js";
+import { filterAdRowsToBrand } from "./derivation-core.js";
 import { ORGANIZATION_SCOPE_KEY, mergeCoverageWindows } from "../sync/source-durable-model.js";
 
 // The CURRENT Daily Reporting identities (kept in lockstep with report-publisher / registry / api / App.jsx).
@@ -88,16 +89,19 @@ export function rederiveDailyV2Payload({ accountId, rawSellerId, currency, from,
 
   const source = slicedOliSourceFromHistory({ historyRows, accountId, rawSellerId, from, to });
   const context = { from, to, brand: wantBrand, accountId, rawSellerId, currency: currency ?? null };
-  if (wantBrand === "ALL") {
-    // Only the ALL-brand payload carries ads. buildDailyAdsCoverage + resolveDailyAdsAvailability decide
-    // validated/partial/stale/unavailable/failed; a failed/absent read shows sales with Ads typed unavailable.
-    context.adsCoverage = buildDailyAdsCoverage({
-      accountId, rawSellerId, currency: currency ?? null, from, to,
-      metricRows: asinMetricsRead === "ok" ? asinAdRows : [],
-      metricsRead: asinMetricsRead,
-      coverageState: asinCoverageState || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed" },
-    });
-  }
+  // BOTH payload modes carry ads. buildDailyAdsCoverage + resolveDailyAdsAvailability decide
+  // validated/partial/stale/unavailable/failed; a failed/absent read shows sales with Ads typed unavailable.
+  // A NAMED brand gets BRAND-SCOPED ad rows: each raw ASIN ad row attributes ONLY through the proven catalog
+  // child_asin -> product_brand mapping (canonical brandKey; unmapped/other-brand ASINs excluded). Account-level
+  // coverage windows apply unchanged: a covered window with no ad rows for this brand is an HONEST zero, while
+  // missing coverage stays typed unavailable (never zero).
+  const usableAdRows = asinMetricsRead === "ok" ? asinAdRows : [];
+  context.adsCoverage = buildDailyAdsCoverage({
+    accountId, rawSellerId, currency: currency ?? null, from, to,
+    metricRows: wantBrand === "ALL" ? usableAdRows : filterAdRowsToBrand(usableAdRows, catalogRows, wantBrand),
+    metricsRead: asinMetricsRead,
+    coverageState: asinCoverageState || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed" },
+  });
   let payload;
   try {
     payload = daily.derive({
@@ -133,13 +137,15 @@ export async function gatherDailyDurableEvidence({ accountId, from, to, brand = 
     catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
   }
 
-  // Ads are ALL-brand only; a named-brand payload carries none, so skip the reads entirely for it.
-  let asinAdRows = []; let asinMetricsRead = "ok"; let asinCov = { windows: [], read: "ok", status: "missing", latestMetricDate: null };
-  if (wantBrand === "ALL") {
-    try { asinAdRows = await readAsinAds(accountId, from, to); }
-    catch (e) { asinMetricsRead = e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed"; asinAdRows = []; }
-    asinCov = await readAdsCoverage(accountId, BRAND_VIEW_ADS_GRAIN);
-  }
+  // BOTH payload modes carry ads: a named brand attributes the SAME durable ASIN rows through the catalog
+  // child_asin -> product_brand mapping (rederiveDailyV2Payload brand-filters them), so the reads run for every
+  // brand. `wantBrand` stays part of the gather signature/identity (the caller's scope) even though the reads
+  // themselves are account-level.
+  void wantBrand;
+  let asinAdRows = []; let asinMetricsRead = "ok"; let asinCov;
+  try { asinAdRows = await readAsinAds(accountId, from, to); }
+  catch (e) { asinMetricsRead = e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed"; asinAdRows = []; }
+  asinCov = await readAdsCoverage(accountId, BRAND_VIEW_ADS_GRAIN);
 
   return {
     historyRows: Array.isArray(historyRows) ? historyRows : [],
