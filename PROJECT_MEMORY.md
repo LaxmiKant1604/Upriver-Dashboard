@@ -11740,3 +11740,73 @@ prod read-backs are blocked): after push+Vercel, confirm representative US/India
 France/Spain/UK accounts open automatically (self-heal populates on first visit), 30/30 v2
 snapshots exist, account/brand switching needs no manual refresh, DataDoe creates=0 + tokens=0 for
 this repair, Campaign Ads/FBA/unrelated + cron unchanged, publication controls safe-closed.
+
+================================================================================
+BRAND VIEW PORTFOLIO MEMBERSHIP -- generic ZERO-EXPORT self-heal (fingerprint +
+storage-first + canonical brand-key) -- 2026-08-25
+================================================================================
+
+GOAL: selecting any brand in the portfolio Brand View must AUTOMATICALLY include every authorized
+primary account + country where that brand appears in the latest validated account-level brand-
+sales, with no manual rebuild / page refresh / DataDoe export, and update automatically after the
+scheduler publishes new brand-sales.
+
+ROOT CAUSES (code + two agent maps; authenticated prod diagnosis was NOT runnable here):
+1. STORAGE DROPOUT -- the live directory (sharedSnapshotBrandAccounts) + portfolio builders read
+   via getLatestReportSnapshot, whose select OMITS payload_storage_path (supabase.js:299). A large
+   (out-of-line) brand-sales payload has a null/stub inline payload -> snapshotBrandNames returns []
+   -> that account is silently dropped from membership. The offline rebuild script hydrated storage;
+   the live path did not. This is the biggest concrete dropout vector.
+2. STALE DIRECTORY -- brand-directory READ served a STORED snapshot; the membership map was only
+   recomputed on an ADMIN refresh (assertAdmin + a Catalog sync). A new scheduler brand-sales
+   publication left the directory stale until an admin refreshed.
+3. No provenance fingerprint to detect that brand-sales evidence changed.
+4. Frontend matched brands case-sensitively and read the stale stored map (portfolioAccountIds
+   preferred the stored map whenever it had an entry, bypassing brand-sales discovery).
+
+FIX (committed 3c546b6, 6 files):
+- getLatestReportSnapshotHydrated + inlinePayloadUsable (supabase.js): storage-first hydration.
+  A null/partial/EMPTY inline stub hydrates the full payload from its payload_storage_path; a
+  NON-EMPTY inline is authoritative (no wasted fetch). Wired into the directory build AND every
+  brand-view/portfolio getSnapshot. getLatestReportSnapshotMeta = cheap metadata (no payload) for
+  the fingerprint.
+- serveSelfHealingBrandDirectory (api/datadoe.js): the brand-directory READ now self-heals ZERO-
+  export. It compares the stored directory's membershipFingerprint against the LIVE fingerprint
+  (brandSalesFingerprint = membershipFingerprint over each account's latest brand-sales updated_at,
+  cheap metadata). Unchanged -> serve the saved map instantly. Changed/missing -> claimRefreshLock
+  (one rebuild for concurrent readers) -> rebuild via sharedSnapshotBrandAccounts (storage-first) ->
+  saveReportSnapshot atomically -> serve. A held lock or a failed rebuild preserves + serves the LKG
+  with a typed stale flag. Never DataDoe.
+- Portfolio self-heal: buildBrandViewPortfolioSnapshot wired as serveSharedReport deriveDurable, so
+  a read for a NEW brand account set (directory just freshened) re-derives from durable evidence
+  (brand-sales storage-first + durable ASIN Ads + saved inventory) ZERO-export; the account set is
+  baked into brandViewPortfolioScopeId + params_hash, so a snapshot for a different set is never
+  served.
+- ONE canonical brandKey (brand-membership.js): trim + collapse interior whitespace + lowercase;
+  punctuation PRESERVED. Case/whitespace variants aggregate to one brand; punctuation-distinct stay
+  separate; a stable display is preserved (lexicographically-smallest variant). buildBrandAccount
+  Membership -> Map<brandKey,{display,accounts}>; serialiseBrandAccountMembership emits brands
+  (display list) + brandAccounts (keyed by brandKey) + brandDisplay (key->display) + brandKeys.
+  membershipFingerprint(perAccountMeta) = deterministic, order-independent, flips iff a brand-sales
+  identity changes. normalizeBrandName is now brandDisplay (trim+collapse; back-compat alias).
+- Frontend (App.jsx + BrandPortfolio.jsx): a mirrored brandKey; portfolio lookups use
+  brandDirectoryAccounts[brandKey(selected)]; the directory is a revalidating read (useAutoRevalidate
+  focus+60s while in brand mode) with a request guard, so a new brand-sales publication updates
+  coverage automatically; legacy v1 upgrade is a plain re-READ (zero-export, was refreshSharedReport);
+  compact "Updating brand coverage" indicator; the empty state says "Updating brand coverage" /
+  "will appear once the scheduled refresh saves sales" instead of a misleading "Nothing saved".
+
+TESTS (test-brand-view.mjs, 84 assertions): membership brand-sales-only; Bebi Born -> EXACTLY BE,DE,
+ES,FR,IT,NL,PL,UK (US catalog-only EXCLUDED, no leakage); canonical brandKey merge/separate + stable
+display; keyed serialisation + display map; fingerprint order-independent + flips on change/added
+account; storage-first recovers an out-of-line payload (never dropped), an empty stub hydrates, a
+usable inline is served without a wasted fetch. verify: 60 steps / 40 suites (incl build:check)
+green; git diff --check clean.
+
+PENDING PROD VERIFICATION (blocked here -- authenticated read-only prod access is not available):
+run the prod diagnosis (Bebi Born country set before/after) + after push+Vercel confirm selecting
+Bebi Born and representative US/India/Europe brands automatically shows every country proven by
+their account-level brand-sales, portfolio account set == account-level validated brand-sales
+account set for every production brand, coverage updates on brand switch, exports=0/tokens=0 for the
+repair, Campaign Ads/FBA/controls/scheduler unchanged. The DEPLOY self-heals each scope on first
+Brand View load, so no manual rebuild is required.
