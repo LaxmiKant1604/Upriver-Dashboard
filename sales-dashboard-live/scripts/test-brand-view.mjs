@@ -569,6 +569,24 @@ await asyncTest("10. with NO compact snapshot the temporary legacy fba-plan fall
   assert.equal(slice2.inventory.byCountry.get("IT"), 883, "a wrong-version compact snapshot is not authoritative; legacy fallback applies");
 });
 
+await asyncTest("Catalog drives ASIN->brand: an account with NO fba-plan/sku-pl snapshot still attributes Ads via the Catalog", async () => {
+  // brand-sales exists (required for the slice) but NONE of the ASIN_BRAND_SNAPSHOT_KEYS reports do, so the only
+  // ASIN->brand source is the reusable Product Catalog (child_asin -> product_brand).
+  const salesOnly = ({ reportKey, accountId }) => Promise.resolve(reportKey === "brand-sales" ? (SNAPSHOTS[`brand-sales|${accountId}`] || null) : null);
+  const catalogRows = [
+    { child_asin: "B00BEBI001", product_brand: "Bebi Born" },
+    { child_asin: "B00BEBI002", product_brand: "Bebi Born" },
+    { child_asin: "B00NORD001", product_brand: "Nordfell" }, // another brand -> its spend must be excluded
+  ];
+  const common = { accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28", account: { name: "Bebi EU", country: "IT" }, getSnapshot: salesOnly, getAdsRows: fakeGetAdsRows, required: false };
+  const noCat = await buildAccountBrandSlice(common);
+  assert.equal(noCat.ads.matchedRows, 0, "with no ASIN->brand source at all, Ads cannot attribute (matchedRows 0)");
+  const withCat = await buildAccountBrandSlice({ ...common, catalogRows });
+  assert.equal(withCat.ads.matchedRows, 2, "the Catalog maps the two Bebi Born ASINs -> Ads attributed");
+  let spend = 0; for (const v of withCat.ads.spendByKey.values()) spend += v;
+  assert.ok(Math.abs(spend - 3.72) < 1e-9, "only Bebi Born ad spend (0.54+3.18); Nordfell's 500 is excluded (brand isolation via Catalog)");
+});
+
 await asyncTest("14. a Brand View portfolio rebuild reads only saved snapshots (zero DataDoe exports)", async () => {
   let snapshotReads = 0;
   const getSnapshot = getSnapshotWithInventory(compactSnap([{ country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 }]));

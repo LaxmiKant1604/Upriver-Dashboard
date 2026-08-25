@@ -160,12 +160,12 @@ test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initial
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, Math.max(...ADS_SOURCES.map((s) => s.initialDays)), "derived from the source contracts");
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, 60, "currently 60 (asin/search-terms initialDays)");
   assert.equal(MAX_IDS_PER_EXPORT, 5);
-  // DataDoe rejects an export whose `limit` exceeds 5000 (HTTP 400 "limit must not be greater than 5000"), so the
-  // create-export limit must stay within the proven maximum -- otherwise EVERY ASIN Ads create fails at the POST.
-  assert.ok(EXPORT_LIMIT <= 5000, "EXPORT_LIMIT must not exceed DataDoe's proven 5000 maximum (got " + EXPORT_LIMIT + ")");
+  // The REST Export API has NO row cap (the 5000 limit is MCP-only), so EXPORT_LIMIT is a HIGH safety ceiling --
+  // a single export returns the whole window -- and pagination fires ONLY at the full limit, never merely at 5000.
+  assert.ok(EXPORT_LIMIT > 5000, "REST has no row cap; EXPORT_LIMIT is a high ceiling above 5000, not a per-5000 trigger (got " + EXPORT_LIMIT + ")");
 });
 
-test("ASIN Ads request is the REDUCED account/date/ASIN grain aggregated server-side (never > 5000 limit, no campaign columns)", () => {
+test("ASIN Ads request is the REDUCED account/date/ASIN grain aggregated server-side (single high-limit REST page, no campaign columns)", () => {
   const asin = ADS_SOURCES.find((s) => s.key === "asin-performance-v1");
   const body = buildAdsExportRequestBody(asin, ["s1", "s2"], "2026-08-04", "2026-08-24", 0);
   assert.deepEqual(body.columns, ["marketplace_country_code", "seller_or_vendor_id", "date", "child_asin"], "columns are ONLY the grain dims (no campaign/ad-group/ad, no metrics)");
@@ -174,7 +174,7 @@ test("ASIN Ads request is the REDUCED account/date/ASIN grain aggregated server-
   assert.equal(body.aggregations.length, 6, "all six same-SKU metrics summed server-side");
   assert.ok(body.aggregations.every((a) => a.aggregation === "sum" && a.alias === a.column + "_sum"), "distinct _sum aliases (avoids ALIAS_COLLISION)");
   assert.deepEqual(body.aggregations.map((a) => a.column).sort(), ["ad_clicks", "ad_impressions", "ad_orders_same_sku", "ad_sales_same_sku", "ad_spend", "ad_units_sold_same_sku"], "the exact metrics Daily/Brand consume");
-  assert.equal(body.limit, EXPORT_LIMIT); assert.ok(body.limit <= 5000, "limit never exceeds 5000");
+  assert.equal(body.limit, EXPORT_LIMIT); assert.ok(body.limit > 5000, "REST has no 5000 cap -> a single export returns the whole window");
   assert.equal(body.skip, 0);
   assert.equal(buildAdsExportRequestBody(asin, ["s1"], "2026-08-04", "2026-08-24", 5000).skip, 5000, "only skip changes between pages");
 });
@@ -613,7 +613,7 @@ test("SKIP-PAGINATION: a full first page (5000) is followed by the next page; tw
   const { deps, calls } = makeDeps({ rowsFor: ({ ids, skip }) => (skip === 0 ? CAP : [row(ids[0], "US", REQ.to)]) });
   const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(calls.fetchRange.length, 2, "one create per page: full page (skip 0) + short page (skip 5000)");
-  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, 5000], "only skip advances (by 5000); window unchanged");
+  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, EXPORT_LIMIT], "only skip advances (by the full limit); window unchanged");
   assert.ok(calls.fetchRange.every((c) => c.from === REQ.from && c.to === REQ.to), "same date range on every page");
   assert.equal(res.status, "completed");
   assert.equal(res.coverageComplete, true);
@@ -628,7 +628,7 @@ test("SKIP-PAGINATION budget: unrelenting full pages are stopped BEFORE create #
   const { deps, calls } = makeDeps({ rowsFor: () => CAP });
   const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(calls.fetchRange.length, 3, "exactly three page create-exports before the 4th is blocked");
-  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, 5000, 10000], "skip advanced by 5000 each page");
+  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, EXPORT_LIMIT, 2 * EXPORT_LIMIT], "skip advanced by the full limit each page");
   assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes on budget exhaustion (nothing persisted)");
   assert.equal(calls.coverage.length, 0, "zero coverage writes");
   assert.ok(!flatStates(calls).some((s) => s.last_status === "succeeded"), "zero successful states");
@@ -665,7 +665,7 @@ test("SKIP-PAGINATION dedups rows repeated across pages by the complete natural 
   // page 0 fills to 5000 with a repeated row; page 1 (short) repeats one of them -> the duplicate is collapsed.
   const dup = { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0DUP", sku: "S1", ad_campaign_id: "C1", ad_group_id: "G1", ad_id: "A1", ad_campaign_type: "SP" };
   const filler = (i) => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0F" + i, sku: "S", ad_campaign_id: "C", ad_group_id: "G", ad_id: "A", ad_campaign_type: "SP" });
-  const page0 = [dup, ...Array.from({ length: 4999 }, (_, i) => filler(i))]; // 5000 -> full
+  const page0 = [dup, ...Array.from({ length: EXPORT_LIMIT - 1 }, (_, i) => filler(i))]; // a FULL page -> triggers page 1
   const { deps, calls } = makeDeps({ rowsFor: ({ skip }) => (skip === 0 ? page0 : [dup]) }); // page1 repeats dup
   const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(res.status, "completed");

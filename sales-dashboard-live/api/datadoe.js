@@ -2512,6 +2512,19 @@ async function handleDataDoe(req, res) {
       // freshened), the new-identity snapshot is missing, so it is re-derived from durable evidence (brand-sales +
       // durable ASIN Ads + saved inventory) ZERO-export -- no manual Refresh, and never a snapshot for a different
       // account set (the set is baked into the report identity).
+      // The reusable org Product Catalog (child_asin -> product_brand) is the authoritative ASIN->brand source and
+      // the only one many accounts have, so it is what maps each account's durable ASIN Ads rows to this brand.
+      // Read ZERO-export from the durable catalog snapshot; a failure yields null (the report-snapshot ASIN maps
+      // still apply, ads just may not attribute for an account that has no other mapping source).
+      const bvPrimaryConn = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+      const bvOrgFingerprint = bvPrimaryConn ? (bvPrimaryConn.organizationFingerprint || organizationFingerprint(bvPrimaryConn.apiKey)) : null;
+      const getBrandViewCatalogRows = bvOrgFingerprint ? async () => {
+        const read = await getSourceSnapshot({ organizationFingerprint: bvOrgFingerprint, connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization" });
+        const ptr = read && typeof read === "object" && "snapshot" in read ? read.snapshot : read;
+        if (!ptr || !ptr.object_path) return null;
+        const payload = await getSourceSnapshotPayload(ptr.object_path);
+        return Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
+      } : null;
       const buildPortfolio = () => buildBrandViewPortfolioSnapshot({
         accountIds,
         brand,
@@ -2519,6 +2532,7 @@ async function handleDataDoe(req, res) {
         accountsById,
         getSnapshot: getLatestReportSnapshotHydrated,
         getAdsRows: getAdsDailySourceRows,
+        getCatalogRows: getBrandViewCatalogRows,
       });
       await serveSharedReport({
         res,

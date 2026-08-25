@@ -35,14 +35,14 @@ export function sameMarketplace(rowMarketplace, accountCountry) {
 }
 
 const BASE = "https://api.datadoe.com/api/v1";
-// DataDoe's PROVEN maximum export `limit` is 5000 -- a create-export with a larger limit is rejected outright
-// (HTTP 400 "limit must not be greater than 5000"), which spends no token but fails the whole batch. The full
-// window is fetched by SKIP-PAGINATION (fetchAllPages): each page is a create-export with limit=5000 and an
-// advancing `skip`; a page returning EXACTLY 5000 rows means "there may be more" (fetch skip+=5000), a page
-// returning FEWER than 5000 proves completion. Completeness is never inferred from the first full page alone.
-// ASIN Ads row density is low (~a few hundred rows per seller per 21-day window), so a <=5-seller window is almost
-// always a single short page (one create per batch).
-export const EXPORT_LIMIT = 5000;
+// The DataDoe REST Export API has NO row-data cap (DataDoe confirmed in writing; the transient HTTP 400 that
+// briefly limited some REST callers to 5000 rows was a DataDoe-side incident, since resolved -- the 5000 cap
+// applies only to MCP, which this dashboard does NOT use). A single REST export therefore returns the WHOLE
+// <=5-seller window in one page; `limit` is set to a high ceiling (matching the other REST sources) purely as a
+// safety bound, never as a per-5000 pagination trigger. SKIP-PAGINATION (fetchAllPages) is now only a FAIL-SAFE:
+// a page is fetched again ONLY when it returns the FULL limit (the sole explicit truncation signal), NEVER merely
+// because it crossed 5000. With the reduced ASIN/date grain an export is far below this ceiling -> a single page.
+export const EXPORT_LIMIT = 50000;
 // The DataDoe five-seller-id chunk. Also the requiredCoverage allowlist ceiling: a bounded canary must fit in
 // ONE export batch per source (so it can never become an accidental organization-wide run).
 export const MAX_IDS_PER_EXPORT = 5;

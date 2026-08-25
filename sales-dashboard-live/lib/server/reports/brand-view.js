@@ -583,7 +583,7 @@ export async function buildBrandViewBrandDirectory({ accountId, getSnapshot }) {
  * Returns null when this account has nothing for the brand, so the portfolio
  * build can skip it without treating it as an error.
  */
-export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, required = true }) {
+export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows = null, required = true }) {
   const salesSnapshot = await getSnapshot({ reportKey: "brand-sales", accountId });
   const salesPayload = salesSnapshot?.payload;
   if (!salesPayload?.rows?.length) {
@@ -620,6 +620,13 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
     if (!payload?.rows?.length && !payload?.products?.length) continue;
     asinBrandPayloads.push(payload);
     asinBrandSources.push(reportKey);
+  }
+  // The reusable Product Catalog (child_asin -> product_brand) is the authoritative ASIN->brand source and the
+  // ONLY one many accounts have, so without it their ad ASINs never map and Ads look like zero in Brand View.
+  // Appended LAST so any account-specific report snapshot mapping still wins; the Catalog fills the gaps.
+  if (Array.isArray(catalogRows) && catalogRows.length) {
+    asinBrandPayloads.push({ rows: catalogRows });
+    asinBrandSources.push("product-catalog");
   }
   const asinBrand = asinBrandMapFromPayloads(asinBrandPayloads);
 
@@ -968,8 +975,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
 /**
  * The account-scoped Brand View report snapshot: exactly one account.
  */
-export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows }) {
-  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, required: true });
+export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows, getCatalogRows = null }) {
+  const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
+  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows, required: true });
   return assembleBrandViewPayload({ slices: [slice], brand, asOf, scope: "account" });
 }
 
@@ -981,7 +989,10 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
  * can return a multi-megabyte saved Dashboard payload, and a serverless function
  * holding a dozen of those at once is how this route would run out of memory.
  */
-export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows }) {
+export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null }) {
+  // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
+  // -> product_brand is what maps each account's ad ASINs to this brand).
+  const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
   const slices = [];
   for (const accountId of accountIds) {
     slices.push(await buildAccountBrandSlice({
@@ -991,6 +1002,7 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
       account: accountsById?.[String(accountId)] || null,
       getSnapshot,
       getAdsRows,
+      catalogRows,
       required: false,
     }));
   }
