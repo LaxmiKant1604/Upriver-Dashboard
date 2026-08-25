@@ -49,7 +49,21 @@ export const ENDPOINTS = {
   exportsCreate: `${DATADOE_BASE}/exports`,
   exportStatus: (id) => `${DATADOE_BASE}/exports/${id}`,
   exportRaw: (id) => `${DATADOE_BASE}/exports/${id}/raw`,
+  exportsSources: (sellerId) => `${DATADOE_BASE}/exports/sources?sellerOrVendorIds=${encodeURIComponent(sellerId)}`,
 };
+
+// The compatible export-source NAMES for ONE seller/vendor (DataDoe GET /exports/sources). A source only appears
+// when its required connection (e.g. an Amazon Ads connection) exists for that account, so this is a ZERO-TOKEN
+// (GET) pre-flight: it decides whether an ASIN Ads export is even POSSIBLE for an account before batching it.
+// Without it, one connection-less seller poisons its whole multi-seller export with a 400 (rejecting the batch).
+// Returns a lowercased Set of the account's compatible source names; throws on a failed read (caller fails closed).
+export async function fetchCompatibleSourceNames(apiKey, sellerId, fetchImpl = fetch) {
+  const res = await fetchImpl(ENDPOINTS.exportsSources(sellerId), { headers: authHeaders(apiKey) });
+  if (!res || !res.ok) throw new Error(`DataDoe compatible-sources read failed (${res ? res.status : "no-response"}).`);
+  const body = await res.json();
+  const list = Array.isArray(body && body.sources) ? body.sources : [];
+  return new Set(list.map((s) => String((s && s.name) || "").trim().toLowerCase()).filter(Boolean));
+}
 
 // MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT now lives in ./id-batching.js (imported +
 // re-exported above).

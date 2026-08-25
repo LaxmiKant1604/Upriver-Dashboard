@@ -23,6 +23,7 @@ loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SU
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
 const asOf = argOf("as-of");
+const pageAllowance = Math.max(0, Math.trunc(Number(argOf("page-allowance") ?? 1))); // extra create-exports for pagination
 if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
 if (asOf != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
 
@@ -31,7 +32,11 @@ const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } = await import("../../lib/server/sync/source-batching.js");
 const { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_GRAIN } = await import("../../lib/server/sync/source-scheduled-asin-ads.js");
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
+
+// The ASIN Ads export source only appears in an account's compatible-sources list when an Amazon Ads connection
+// exists for it. An account WITHOUT it can never produce ASIN Ads and, if batched, poisons the whole export (400).
+const ASIN_ADS_SOURCE_NAME = "ad performance by asin & date";
 
 const MAX_ITERS = Number(process.env.SCHEDULED_ASIN_ADS_MAX_ITERS || 40);
 const asOfStr = asOf || (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
@@ -54,10 +59,27 @@ for (const a of active) {
 }
 if (!bucketAccounts.length) { console.error("STOP no discovered primary accounts for bucket " + bucket); process.exit(1); }
 
-const plan = asinAdsBucketPlan(bucketAccounts);
-const { batches } = assignAccountBatches(bucketAccounts, new Map(), MAX_ACCOUNTS_PER_BATCH);
+// ZERO-TOKEN PRE-FLIGHT: keep only accounts whose DataDoe compatible-sources list includes the ASIN Ads source
+// (i.e. an Amazon Ads connection exists). A connection-less account cannot produce ASIN Ads and would poison its
+// whole multi-seller export with a 400, so it is EXCLUDED here and reported (its Ads stay honestly unavailable --
+// an external account-setup gap, never a fabricated zero). A read failure fails that account closed (excluded).
+const compatible = []; const incompatible = []; const unreadable = [];
+for (const a of bucketAccounts) {
+  try {
+    const names = await fetchCompatibleSourceNames(primaryConn.apiKey, a.accountId);
+    (names.has(ASIN_ADS_SOURCE_NAME) ? compatible : incompatible).push(a);
+  } catch (_e) { unreadable.push(a); }
+}
+log("pre-flight Amazon-Ads connection: " + compatible.length + " compatible, " + incompatible.length + " missing-connection, " + unreadable.length + " unreadable (excluded)");
+if (incompatible.length) log("  no Amazon Ads connection (excluded; ads stay unavailable): " + incompatible.map((a) => a.accountId.slice(0, 8) + "(" + a.country + ")").join(" "));
+if (unreadable.length) log("  compatible-sources unreadable (excluded this run): " + unreadable.map((a) => a.accountId.slice(0, 8)).join(" "));
+if (!compatible.length) { log("PROVEN: no Amazon-Ads-compatible accounts in bucket " + bucket + "; nothing to sync (0 creates / 0 tokens)."); process.exit(0); }
+
+const syncAccounts = compatible;
+const plan = asinAdsBucketPlan(syncAccounts, new Map(), { pageAllowance });
+const { batches } = assignAccountBatches(syncAccounts, new Map(), MAX_ACCOUNTS_PER_BATCH);
 const win = asinAdsRefreshWindow(asOfStr);
-log(bucketAccounts.length + " primary accounts -> " + batches.length + " batches; window [" + win.from + ".." + win.to + "] (21d); create ceiling " + plan.maxCreates + " / " + plan.maxTokens + " tokens");
+log(syncAccounts.length + " Ads-compatible accounts -> " + batches.length + " batches; window [" + win.from + ".." + win.to + "] (21d); create ceiling " + plan.maxCreates + " (=" + plan.expectedBatches + " batches + " + plan.pageAllowance + " pagination) / " + plan.maxTokens + " tokens");
 
 // (2) A guarded, counting createExport: enforce the per-BUCKET create ceiling BEFORE any create; count real POSTs.
 let creates = 0;
@@ -89,9 +111,11 @@ for (const batch of batches) {
   log("batch [" + batchCountries.join(",") + "] " + batchIds.length + " accts: status=" + (summary && summary.status) + " coverageComplete=" + (summary && summary.coverageComplete) + " pairs=" + (summary && summary.successfulCoveragePairs) + "/" + (summary && summary.expectedCoveragePairs));
 }
 
-// (4) Prove the whole bucket refresh stayed in scope + inside the ceiling.
-const a = assessScheduledAsinAdsCycle({ bucket, discoveredAccounts: bucketAccounts, batchResults, creates });
+// (4) Prove the whole bucket refresh stayed in scope + inside the ceiling (over the Ads-COMPATIBLE accounts only;
+// connection-missing accounts were excluded up front and reported, never a failure).
+const a = assessScheduledAsinAdsCycle({ bucket, discoveredAccounts: syncAccounts, batchResults, creates, pageAllowance });
 log("assessment: batches=" + a.batches + " creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok);
+if (incompatible.length) log("EXTERNAL BLOCKER (report): " + incompatible.length + " account(s) have no Amazon Ads connection and were excluded: " + incompatible.map((x) => x.accountId.slice(0, 8) + "(" + x.country + ")").join(" "));
 if (!a.ok) { console.error("STOP scheduled ASIN Ads assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
-log("PROVEN: " + bucketAccounts.length + " accounts across " + a.batches + " ASIN-Ads batches; " + a.creates + " creates / " + a.tokens + " tokens (ceiling " + a.ceilingCreates + "/" + a.ceilingTokens + "); already-covered dates were skipped.");
+log("PROVEN: " + syncAccounts.length + " Ads-compatible accounts across " + a.batches + " ASIN-Ads batches; " + a.creates + " creates / " + a.tokens + " tokens (ceiling " + a.ceilingCreates + "/" + a.ceilingTokens + "); already-covered dates were skipped.");
 process.exit(0);

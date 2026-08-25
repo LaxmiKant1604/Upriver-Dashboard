@@ -10,6 +10,7 @@ import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
 import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
 import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING, tokenGateDecision, NON_US_RUN_TOKEN_CEILING, US_RUN_TOKEN_CEILING, LOW_BALANCE_WARN_TOKENS } from "../lib/server/datadoe-usage.js";
 import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
+import { fetchCompatibleSourceNames } from "../lib/server/datadoe.js";
 import { ARCHIVE_CYCLES, PROTECTED_TABLES, assessArchivePre, assessArchivePost, runArchiveTransaction, assessFrozenSetCoherent } from "../lib/server/sync/source-archive-collision-cycles.js";
 import { assessNonUsPrerequisites } from "../lib/server/sync/source-scheduled-prerequisites.js";
 
@@ -311,6 +312,31 @@ test("F3. combined full Ads refresh ceiling = 7 exports / 14 tokens (US 2/4 + No
   const total = asinAdsBucketPlan(accountsN(8)).maxCreates + asinAdsBucketPlan(accountsN(22)).maxCreates;
   const tokens = asinAdsBucketPlan(accountsN(8)).maxTokens + asinAdsBucketPlan(accountsN(22)).maxTokens;
   assert.equal(total, 7); assert.equal(tokens, 14);
+});
+
+test("F3c. fetchCompatibleSourceNames: ZERO-TOKEN pre-flight lists an account's compatible source names (fail-closed on a bad read)", async () => {
+  const resp = (sources) => ({ ok: true, json: async () => ({ sources }) });
+  const has = await fetchCompatibleSourceNames("k", "acc-1", async () => resp([{ name: "Ad Performance by ASIN & Date" }, { name: "Product Catalog by ASIN" }]));
+  assert.equal(has.has("ad performance by asin & date"), true, "ASIN Ads source present -> compatible (lowercased)");
+  assert.equal(has.has("product catalog by asin"), true);
+  const none = await fetchCompatibleSourceNames("k", "acc-2", async () => resp([{ name: "Product Catalog by ASIN" }]));
+  assert.equal(none.has("ad performance by asin & date"), false, "no ASIN Ads source -> not compatible (connection missing)");
+  let threw = false;
+  try { await fetchCompatibleSourceNames("k", "acc-3", async () => ({ ok: false, status: 500 })); } catch { threw = true; }
+  assert.equal(threw, true, "a non-ok read throws (caller fails that account closed)");
+});
+
+test("F3b. pageAllowance adds create/token headroom for skip-pagination (a high-volume batch needs >1 page)", () => {
+  const base = asinAdsBucketPlan(accountsN(17)); // 17 Ads-compatible Non-US accounts -> 4 batches
+  assert.equal(base.expectedBatches, 4); assert.equal(base.maxCreates, 4); assert.equal(base.pageAllowance, 0);
+  const withPage = asinAdsBucketPlan(accountsN(17), new Map(), { pageAllowance: 1 });
+  assert.equal(withPage.expectedBatches, 4); assert.equal(withPage.maxCreates, 5); assert.equal(withPage.maxTokens, 10);
+  // A run that paginated ONE batch (5 creates for 4 batches) is within the pageAllowance:1 ceiling, over the base.
+  const paged = assessScheduledAsinAdsCycle({ bucket: "non-us", discoveredAccounts: accountsN(17), batchResults: adsBatchesFor(17), creates: 5, pageAllowance: 1 });
+  assert.equal(paged.ceilingCreates, 5, "ceiling includes the pagination allowance");
+  assert.ok(!paged.problems.includes("creates-over-ceiling:5>5"), "5 creates within the 4-batch + 1-page ceiling");
+  const overBase = assessScheduledAsinAdsCycle({ bucket: "non-us", discoveredAccounts: accountsN(17), batchResults: adsBatchesFor(17), creates: 5, pageAllowance: 0 });
+  assert.ok(overBase.problems.some((p) => p.startsWith("creates-over-ceiling")), "without the allowance, 5 > 4 is over the ceiling");
 });
 
 test("F4. assessment happy path: every batch completed + full coverage; a WARM run (0 creates, all skipped) is ok", () => {

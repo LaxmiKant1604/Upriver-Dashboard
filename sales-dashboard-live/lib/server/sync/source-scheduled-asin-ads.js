@@ -24,11 +24,16 @@ const nb = (v) => S(v).trim() !== "";
  * tokens, so US 8 -> 2 batches / 4 tokens and Non-US 22 -> 5 batches / 10 tokens (combined <= 7 exports / 14
  * tokens for a full Ads refresh).
  */
-export function asinAdsBucketPlan(accounts, existingMembership = new Map()) {
+export function asinAdsBucketPlan(accounts, existingMembership = new Map(), { pageAllowance = 0 } = {}) {
   const primary = (accounts || []).filter((a) => a && nb(a.accountId) && !S(a.accountId).includes(":"));
   const { batches } = assignAccountBatches(primary, existingMembership, MAX_ACCOUNTS_PER_BATCH);
   const expectedBatches = batches.length;
-  return { batches, expectedBatches, maxCreates: expectedBatches, maxTokens: expectedBatches * ASIN_ADS_TOKENS_PER_CREATE };
+  // A high-volume batch (> 5000 rows in the window) is fetched in more than one skip-page, i.e. more than one
+  // create-export. `pageAllowance` (>=0) is the extra create-exports permitted across the bucket for such
+  // pagination -- the ceiling is expectedBatches (one page per batch) PLUS the allowance. Tokens track creates.
+  const extra = Math.max(0, Math.trunc(pageAllowance));
+  const maxCreates = expectedBatches + extra;
+  return { batches, expectedBatches, pageAllowance: extra, maxCreates, maxTokens: maxCreates * ASIN_ADS_TOKENS_PER_CREATE };
 }
 
 /**
@@ -54,14 +59,14 @@ export function asinAdsRefreshWindow(asOf) {
  *   - total creates <= the plan ceiling and tokens (creates*2) <= the token ceiling.
  * ok === true ONLY when problems is empty (a warm run with 0 creates is ok: skipped == covered).
  */
-export function assessScheduledAsinAdsCycle({ bucket, discoveredAccounts, batchResults, creates } = {}) {
+export function assessScheduledAsinAdsCycle({ bucket, discoveredAccounts, batchResults, creates, pageAllowance = 0 } = {}) {
   const problems = [];
   const push = (p) => problems.push(p);
   if (bucket !== "us" && bucket !== "non-us") return { ok: false, problems: ["bad-bucket"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
   const discovered = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a)).trim()).filter(Boolean))].sort();
   if (!discovered.length) return { ok: false, problems: ["no-discovered-accounts"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
   const discoveredSet = new Set(discovered);
-  const plan = asinAdsBucketPlan(discovered.map((accountId) => ({ accountId })));
+  const plan = asinAdsBucketPlan(discovered.map((accountId) => ({ accountId })), new Map(), { pageAllowance });
 
   const results = Array.isArray(batchResults) ? batchResults : [];
   if (!results.length) push("no-batches");

@@ -31,8 +31,10 @@ export const EXPORT_LIMIT = 5000;
 // ONE export batch per source (so it can never become an accidental organization-wide run).
 export const MAX_IDS_PER_EXPORT = 5;
 const POLL_DELAY_MS = 5000;
-const POLL_ATTEMPTS = 9;
-const WORK_BUDGET_MS = 45000;
+// A larger export can take well over a minute to complete server-side; 9 attempts (45s) timed out real ASIN Ads
+// exports. 24 attempts (~120s) gives a slow export room to finish (a timeout wastes the create + returns nothing).
+const POLL_ATTEMPTS = 24;
+const WORK_BUDGET_MS = 300000; // one invocation processes more batches before deferring (slow exports poll longer now)
 const MANAGED_COUNTRIES = new Set(["IN", "US", "CA", "AU"]);
 const MIN_REQUEST_INTERVAL_MS = 550;
 let lastDataDoeRequestAt = 0;
