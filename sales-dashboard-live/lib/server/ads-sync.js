@@ -19,7 +19,14 @@ import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 import { resolveAdRowCurrency } from "./reports/asin-ads-aggregation.js";
 
 const BASE = "https://api.datadoe.com/api/v1";
-export const EXPORT_LIMIT = 50000;
+// DataDoe's PROVEN maximum export `limit` is 5000 -- a create-export with a larger limit is rejected outright
+// (HTTP 400 "limit must not be greater than 5000"), which spends no token but fails the whole batch. The full
+// window is fetched by SKIP-PAGINATION (fetchAllPages): each page is a create-export with limit=5000 and an
+// advancing `skip`; a page returning EXACTLY 5000 rows means "there may be more" (fetch skip+=5000), a page
+// returning FEWER than 5000 proves completion. Completeness is never inferred from the first full page alone.
+// ASIN Ads row density is low (~a few hundred rows per seller per 21-day window), so a <=5-seller window is almost
+// always a single short page (one create per batch).
+export const EXPORT_LIMIT = 5000;
 // The DataDoe five-seller-id chunk. Also the requiredCoverage allowlist ceiling: a bounded canary must fit in
 // ONE export batch per source (so it can never become an accidental organization-wide run).
 export const MAX_IDS_PER_EXPORT = 5;
@@ -183,7 +190,7 @@ async function fetchAccounts(apiKey) {
   })).filter((account) => account.id);
 }
 
-async function createExport(apiKey, source, ids, from, to) {
+async function createExport(apiKey, source, ids, from, to, skip = 0) {
   const response = await datadoeFetch(`${BASE}/exports`, {
     method: "POST",
     headers: authHeaders(apiKey),
@@ -194,6 +201,7 @@ async function createExport(apiKey, source, ids, from, to) {
       from,
       to,
       limit: EXPORT_LIMIT,
+      skip, // pagination offset -- the ONLY field that changes between pages of the same window
       outputType: "JSON",
       orderByColumn: "date",
       orderByDirection: "ASC",
@@ -205,12 +213,16 @@ async function createExport(apiKey, source, ids, from, to) {
   return response.json();
 }
 
+// Poll one export to COMPLETED, then return BOTH the completed-export metadata `rowCount` AND the downloaded raw
+// array. The caller (validateExportPage) fails closed on any status/rowCount/array/length mismatch so a torn or
+// partial page is never persisted.
 async function downloadExport(apiKey, exportId) {
+  let completed = null;
   for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
     const status = await datadoeFetch(`${BASE}/exports/${exportId}`, { headers: authHeaders(apiKey) });
     if (!status.ok) throw new Error(`DataDoe export status failed (${status.status}).`);
     const body = await status.json();
-    if (body.status === "COMPLETED") break;
+    if (body.status === "COMPLETED") { completed = body; break; }
     if (["FAILED", "ERROR", "BLOCKED_NO_TOKENS"].includes(body.status)) {
       throw new Error(`DataDoe ${body.status} while exporting Ads data.`);
     }
@@ -220,33 +232,68 @@ async function downloadExport(apiKey, exportId) {
   const response = await datadoeFetch(`${BASE}/exports/${exportId}/raw`, { headers: authHeaders(apiKey) });
   if (!response.ok) throw new Error(`DataDoe export download failed (${response.status}).`);
   const body = await response.json();
-  return typeof body.rawContent === "string" ? JSON.parse(body.rawContent) : (Array.isArray(body) ? body : []);
+  const rows = typeof body.rawContent === "string" ? JSON.parse(body.rawContent) : (Array.isArray(body) ? body : (Array.isArray(body.rows) ? body.rows : null));
+  // rowCount from the COMPLETED export metadata (accept a top-level or a metadata-nested field; anything else
+  // stays null so validateExportPage fails closed on a missing count).
+  const rc = completed ? (completed.rowCount ?? (completed.metadata && completed.metadata.rowCount)) : null;
+  return { status: completed ? completed.status : null, rowCount: rc == null ? null : Number(rc), rows };
 }
 
-// Recursively fetch [from,to], splitting on the row cap. `create`/`download` are INJECTED (network in
-// production; deterministic doubles in tests), so the ceiling below is exercised by the executable harness --
-// not a source-text proof. `budget` (when present) is an invocation-scoped { count, max } enforced BEFORE every
-// create-export POST: a bounded coverage canary can never create more than `max` exports. A cap-sized single
-// day, or an exhausted budget, throws a typed/admin-safe error (no raw row / id / secret).
-async function fetchRangeWith(create, download, apiKey, source, ids, from, to, budget) {
-  if (budget) {
-    if (budget.count >= budget.max) {
-      const error = new Error(`ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED (max ${budget.max} create-exports per requiredCoverage invocation)`);
-      error.code = "ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED";
-      throw error;
+// Validate one export page using BOTH the metadata rowCount AND the raw array length. Fails closed (throws) on:
+// status != COMPLETED, a non-nonnegative-integer / missing rowCount, a non-array raw payload, a raw length that
+// disagrees with rowCount, or a rowCount above the page limit. Returns the validated rows on success. Pure.
+export function validateExportPage({ status, rowCount, rows }) {
+  if (status !== "COMPLETED") throw new Error(`ADS_EXPORT_PAGE_INVALID: status ${status} != COMPLETED (fail closed).`);
+  if (!Number.isInteger(rowCount) || rowCount < 0) throw new Error(`ADS_EXPORT_PAGE_INVALID: rowCount ${rowCount} is not a nonnegative integer (fail closed).`);
+  if (!Array.isArray(rows)) throw new Error("ADS_EXPORT_PAGE_INVALID: raw payload is not an array (fail closed).");
+  if (rows.length !== rowCount) throw new Error(`ADS_EXPORT_PAGE_INVALID: raw length ${rows.length} != metadata rowCount ${rowCount} (fail closed).`);
+  if (rowCount > EXPORT_LIMIT) throw new Error(`ADS_EXPORT_PAGE_INVALID: rowCount ${rowCount} > page limit ${EXPORT_LIMIT} (fail closed).`);
+  return rows;
+}
+
+// The raw-row natural grain (the persist PK before public-account mapping): the same keyFields the durable
+// dimension_key is built from, plus seller/marketplace/date. Used to deduplicate rows concatenated across pages.
+function adsRawNaturalKey(source, row) {
+  return JSON.stringify([
+    String(row.seller_or_vendor_id || ""),
+    String(row.marketplace_country_code || "").toUpperCase(),
+    String(row.date || ""),
+    source.keyFields.map((key) => row[key] ?? null),
+  ]);
+}
+function dedupeAdsRawRows(source, rows) {
+  const byKey = new Map();
+  for (const row of rows) byKey.set(adsRawNaturalKey(source, row), row); // later page wins on the natural grain
+  return [...byKey.values()];
+}
+
+// Fetch the COMPLETE [from,to] window by SKIP-PAGINATION. `create`/`download` are INJECTED (network in production;
+// deterministic doubles in tests). page 0 uses skip=0; while a page returns EXACTLY EXPORT_LIMIT rows the next
+// page is fetched (skip += EXPORT_LIMIT); a page returning FEWER than EXPORT_LIMIT rows (including empty) proves
+// completion. Every page keeps the SAME seller set / columns / filters / date range / grouping / ordering -- ONLY
+// skip changes -- and is validated (validateExportPage) before it is accepted; the concatenated rows are then
+// deduplicated by the complete natural grain. `budget` (when present) is an invocation-scoped { count, max }
+// enforced BEFORE every create-export POST, so a bounded coverage canary can never create more than `max` pages.
+async function fetchAllPages(create, download, apiKey, source, ids, from, to, budget) {
+  const all = [];
+  let skip = 0;
+  for (;;) {
+    if (budget) {
+      if (budget.count >= budget.max) {
+        const error = new Error(`ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED (max ${budget.max} create-exports per requiredCoverage invocation)`);
+        error.code = "ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED";
+        throw error;
+      }
+      budget.count += 1;
     }
-    budget.count += 1;
+    const created = await create(apiKey, source, ids, from, to, skip);
+    const page = await download(apiKey, created.exportId || created.id);
+    const rows = validateExportPage(page); // fails closed on any status/rowCount/length mismatch (persists nothing)
+    for (const row of rows) all.push(row);
+    if (page.rowCount < EXPORT_LIMIT) break; // a short/empty page proves completion -- NEVER inferred from a full page
+    skip += EXPORT_LIMIT;                     // a full page => there may be more; fetch the next page
   }
-  const created = await create(apiKey, source, ids, from, to);
-  const rows = await download(apiKey, created.exportId || created.id);
-  if (rows.length < EXPORT_LIMIT) return rows;
-  if (from === to) {
-    throw new Error(`${source.key} reached the ${EXPORT_LIMIT.toLocaleString("en-US")} row cap for ${from}; the source must be partitioned further before it can be saved safely.`);
-  }
-  const middle = addDays(from, Math.floor(daysBetween(from, to) / 2));
-  const left = await fetchRangeWith(create, download, apiKey, source, ids, from, middle, budget);
-  const right = await fetchRangeWith(create, download, apiKey, source, ids, addDays(middle, 1), to, budget);
-  return [...left, ...right];
+  return dedupeAdsRawRows(source, all);
 }
 
 function chunks(items, size) {
@@ -703,7 +750,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
           const ids = workingBatch.map((entry) => entry.account.rawAccountId);
           try {
             // FIX 2: the recursive fetch honors the invocation create-export budget (checked before every POST).
-            const rows = await fetchRangeWith(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget);
+            const rows = await fetchAllPages(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget);
             // FIX 1: validate the export against the EXACT working batch BEFORE any row/metric/coverage/state
             // write. Any malformed/cross-account/missing-id/wrong-marketplace evidence rejects the WHOLE batch
             // (typed safe failed state only). A genuine zero-row export ([]) is valid covered-empty evidence.

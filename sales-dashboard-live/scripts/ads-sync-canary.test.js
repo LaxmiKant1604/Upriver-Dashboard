@@ -75,17 +75,21 @@ function makeDeps(opts = {}) {
       if (opts.fetchAccountsThrows) throw new Error(`DataDoe accounts request failed (500): secret-token-${apiKey}`);
       return apiKey === PRIMARY_KEY ? PRIMARY_ACCOUNTS : apiKey === SECONDARY_KEY ? SECONDARY_ACCOUNTS : [];
     },
-    createExport: async (apiKey, source, ids, from, to) => {
-      calls.fetchRange.push({ apiKey, sourceKey: source.key, ids: [...ids], from, to });
+    createExport: async (apiKey, source, ids, from, to, skip = 0) => {
+      calls.fetchRange.push({ apiKey, sourceKey: source.key, ids: [...ids], from, to, skip });
       if (opts.fetchRangeThrows) throw new Error(`DataDoe ${source.key} export creation failed (500): raw-secret-body ${apiKey}`);
       const exportId = "exp-" + (++exportSeq);
-      exportMeta.set(exportId, { source, ids: [...ids], from, to });
+      exportMeta.set(exportId, { source, ids: [...ids], from, to, skip });
       return { exportId };
     },
     downloadExport: async (apiKey, exportId) => {
       calls.download.push(exportId);
       const meta = exportMeta.get(exportId);
-      return rowsFor({ source: meta.source, ids: meta.ids, from: meta.from, to: meta.to });
+      const page = rowsFor({ source: meta.source, ids: meta.ids, from: meta.from, to: meta.to, skip: meta.skip });
+      // rowsFor may return a raw ARRAY (a healthy page: rowCount == length) OR an explicit { status, rowCount, rows }
+      // page shape to exercise validateExportPage's fail-closed paths (torn/short-count/non-array/bad-status pages).
+      if (page && typeof page === "object" && !Array.isArray(page) && (("rowCount" in page) || ("status" in page) || ("rows" in page))) return page;
+      return { status: "COMPLETED", rowCount: Array.isArray(page) ? page.length : null, rows: page };
     },
     claimRefreshLock: async () => { calls.claim += 1; return opts.lockResult == null ? true : opts.lockResult; },
     releaseRefreshLock: async () => { calls.release += 1; },
@@ -155,6 +159,9 @@ test("canonical bounds: MAX_REQUIRED_COVERAGE_DAYS===60 (max ADS_SOURCES.initial
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, Math.max(...ADS_SOURCES.map((s) => s.initialDays)), "derived from the source contracts");
   assert.equal(MAX_REQUIRED_COVERAGE_DAYS, 60, "currently 60 (asin/search-terms initialDays)");
   assert.equal(MAX_IDS_PER_EXPORT, 5);
+  // DataDoe rejects an export whose `limit` exceeds 5000 (HTTP 400 "limit must not be greater than 5000"), so the
+  // create-export limit must stay within the proven maximum -- otherwise EVERY ASIN Ads create fails at the POST.
+  assert.ok(EXPORT_LIMIT <= 5000, "EXPORT_LIMIT must not exceed DataDoe's proven 5000 maximum (got " + EXPORT_LIMIT + ")");
 });
 
 test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year boundary", () => {
@@ -538,31 +545,71 @@ test("ordinary non-cap requiredCoverage export uses EXACTLY one create-export", 
   assert.equal(calls.download.length, 1, "one download for the single export");
 });
 
-test("parent cap + two successful children uses EXACTLY three create-exports (budget allows the split)", async () => {
-  // cap when span > 20 days: the 30-day parent caps and splits into two ~15-day children (each < cap).
-  const { deps, calls } = makeDeps({ rowsFor: ({ ids, from, to }) => (spanDays(from, to) > 20 ? CAP : [row(ids[0], "US", to)]) });
+test("SKIP-PAGINATION: a full first page (5000) is followed by the next page; two pages = EXACTLY two create-exports", async () => {
+  // page 0 (skip=0) returns a FULL 5000-row page -> "there may be more"; page 1 (skip=5000) returns a short page
+  // -> completion. Completeness is NEVER inferred from the first full page alone.
+  const { deps, calls } = makeDeps({ rowsFor: ({ ids, skip }) => (skip === 0 ? CAP : [row(ids[0], "US", REQ.to)]) });
   const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
-  assert.equal(calls.fetchRange.length, 3, "parent (1) + two children (2) = 3 create-exports");
+  assert.equal(calls.fetchRange.length, 2, "one create per page: full page (skip 0) + short page (skip 5000)");
+  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, 5000], "only skip advances (by 5000); window unchanged");
+  assert.ok(calls.fetchRange.every((c) => c.from === REQ.from && c.to === REQ.to), "same date range on every page");
   assert.equal(res.status, "completed");
   assert.equal(res.coverageComplete, true);
+  // Both pages were fetched + concatenated, then persisted (CAP's identical-grain rows dedup to one; the dedup
+  // grain is proven separately). What matters here is the two-page control flow + a persist after the SHORT page.
+  assert.ok(calls.upsertRows.length >= 1, "rows persisted after the completing short page");
 });
 
-test("a deeper split is stopped BEFORE create #4 with a typed budget error (zero rows/metric/coverage/success)", async () => {
-  // cap when span > 7 days: 30d -> 15d -> 8d all cap; the 4th create is blocked at the budget.
-  const { deps, calls } = makeDeps({ rowsFor: ({ from, to }) => (spanDays(from, to) > 7 ? CAP : []) });
+test("SKIP-PAGINATION budget: unrelenting full pages are stopped BEFORE create #4 (typed budget error, zero writes)", async () => {
+  // Every page is FULL (5000) so pagination never terminates on its own; the invocation create budget (max 3)
+  // stops it before the 4th create-export.
+  const { deps, calls } = makeDeps({ rowsFor: () => CAP });
   const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
-  assert.equal(calls.fetchRange.length, 3, "exactly three create-exports before the 4th is blocked");
-  assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes on budget exhaustion");
-  assert.equal(calls.upsertMetrics.length, 0, "zero metric writes");
+  assert.equal(calls.fetchRange.length, 3, "exactly three page create-exports before the 4th is blocked");
+  assert.deepEqual(calls.fetchRange.map((c) => c.skip), [0, 5000, 10000], "skip advanced by 5000 each page");
+  assert.equal(calls.upsertRows.length, 0, "zero Ads-row writes on budget exhaustion (nothing persisted)");
   assert.equal(calls.coverage.length, 0, "zero coverage writes");
   assert.ok(!flatStates(calls).some((s) => s.last_status === "succeeded"), "zero successful states");
   assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US], "the account is marked failed");
-  const saved = flatStates(calls).find((s) => s.account_id === G6_US);
-  assert.equal(saved.last_status, "failed");
-  assert.match(saved.last_error, /ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED/, "typed safe budget code in the failed state");
+  assert.match(flatStates(calls).find((s) => s.account_id === G6_US).last_error, /ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED/, "typed safe budget code in the failed state");
   assert.ok(!JSON.stringify(res).includes("ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED"), "typed code NOT in the returned summary (ids/counts only)");
   assert.notEqual(res.status, "completed");
   assert.equal(calls.release, 1, "lock released once");
+});
+
+test("validateExportPage fails closed on every torn/partial page shape (persists nothing)", async () => {
+  const { validateExportPage, EXPORT_LIMIT: LIMIT } = await import("../lib/server/ads-sync.js");
+  const ok = [{ a: 1 }, { a: 2 }];
+  assert.deepEqual(validateExportPage({ status: "COMPLETED", rowCount: 2, rows: ok }), ok, "a healthy page returns its rows");
+  assert.throws(() => validateExportPage({ status: "RUNNING", rowCount: 2, rows: ok }), /status RUNNING != COMPLETED/, "status must be COMPLETED");
+  assert.throws(() => validateExportPage({ status: "COMPLETED", rowCount: null, rows: ok }), /rowCount .* nonnegative integer/, "missing rowCount fails closed");
+  assert.throws(() => validateExportPage({ status: "COMPLETED", rowCount: -1, rows: [] }), /nonnegative integer/, "negative rowCount fails closed");
+  assert.throws(() => validateExportPage({ status: "COMPLETED", rowCount: 2, rows: { not: "array" } }), /not an array/, "non-array raw fails closed");
+  assert.throws(() => validateExportPage({ status: "COMPLETED", rowCount: 3, rows: ok }), /raw length 2 != metadata rowCount 3/, "length != rowCount fails closed (never persist a torn page)");
+  assert.throws(() => validateExportPage({ status: "COMPLETED", rowCount: LIMIT + 1, rows: Array.from({ length: LIMIT + 1 }, () => ({})) }), /> page limit/, "rowCount above the page limit fails closed");
+});
+
+test("SKIP-PAGINATION fails closed when a page's rowCount disagrees with its raw length (no writes)", async () => {
+  // A torn page: metadata says 5000 but only 3 rows arrive -> validateExportPage throws -> batch fails, nothing saved.
+  const { deps, calls } = makeDeps({ rowsFor: () => ({ status: "COMPLETED", rowCount: 5000, rows: [row(G6_US, "US"), row(G6_US, "US", "2026-08-13"), row(G6_US, "US", "2026-08-12")] }) });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(calls.upsertRows.length, 0, "a torn page persists NOTHING");
+  assert.equal(calls.coverage.length, 0, "no coverage recorded for a torn page");
+  assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US], "the account is marked failed");
+  assert.notEqual(res.status, "completed");
+});
+
+test("SKIP-PAGINATION dedups rows repeated across pages by the complete natural grain (persist once)", async () => {
+  // page 0 fills to 5000 with a repeated row; page 1 (short) repeats one of them -> the duplicate is collapsed.
+  const dup = { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0DUP", sku: "S1", ad_campaign_id: "C1", ad_group_id: "G1", ad_id: "A1", ad_campaign_type: "SP" };
+  const filler = (i) => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0F" + i, sku: "S", ad_campaign_id: "C", ad_group_id: "G", ad_id: "A", ad_campaign_type: "SP" });
+  const page0 = [dup, ...Array.from({ length: 4999 }, (_, i) => filler(i))]; // 5000 -> full
+  const { deps, calls } = makeDeps({ rowsFor: ({ skip }) => (skip === 0 ? page0 : [dup]) }); // page1 repeats dup
+  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  assert.equal(res.status, "completed");
+  const persisted = calls.upsertRowsData || [];
+  const dupCount = persisted.filter((r) => r.child_asin === "B0DUP").length;
+  assert.equal(dupCount, 1, "the row repeated across pages is deduped to a single persisted row (natural grain)");
 });
 
 /* ============================= FIX (this round): durable idempotent completion ============================= */
