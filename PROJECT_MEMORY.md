@@ -12038,3 +12038,15 @@ refunded), only 128bf8ad persisted. STOPPED at the cap per mission rule. Control
 (all_primary=false, rollout=0, rss=0), no pg_cron, Daily v2 30/30 intact, Brand Sales(37)/Inventory(30)
 unchanged. Code af110f6 + 0bf8ed2 + 71e8732 + fdb161a pushed. TO FINISH: connect Amazon Ads for the 5
 accounts + authorize more tokens (per-account syncs for the high-volume accounts) -- the pipeline is proven.
+
+
+-- 2026-08-25 (session 2) ASIN Ads reduced-grain aggregation (code 96dd302): the row-explosion root cause
+was the campaign/ad-group/ad-level dimensions in the asin-performance-v1 export. Reduced to grain
+[marketplace_country_code, seller_or_vendor_id, date, child_asin] + SUM the 6 same-SKU metrics SERVER-SIDE
+(groupBy + aggregations, distinct "_sum" aliases because DataDoe rejects alias==column ALIAS_COLLISION;
+rowRecord maps _sum back to canonical names). Verified live: 128bf8ad 21-day window = 90 aggregated rows
+(was 376). Aggregated source now CLEAN-REPLACES each account's window (deleteAdsDailySourceRows) before
+insert to avoid double-counting the old campaign-grain rows; Campaign/PPC contract untouched. Mission-2
+budget: 18 additional tokens from start balance 118. Spent 2 on the aggregation-syntax validation (learned
+ALIAS_COLLISION via a free 400, then a 202 confirming 90 rows). 25 accounts Ads-connected (live recheck),
+5 still not (external). verify 63/63.
