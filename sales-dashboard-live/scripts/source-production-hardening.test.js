@@ -1123,6 +1123,38 @@ test("S3. FULL endpoint preflight: EVERY later read failure (coverage/snapshot/m
   assert.ok(res.pausedSources instanceof Set, "a healthy sweep passes");
 });
 
+test("S3b. stale Catalog/FBA evidence is a refresh signal and cannot block a narrowed OLI preflight", async () => {
+  const stalePath = "source-snapshots/v1/product-catalog/__organization/stale.json";
+  const h = makeHarness({
+    readSnapshot: async ({ sourceKey, scopeKey }) => ({
+      snapshot: {
+        validated_at: "2026-08-19T01:00:00Z",
+        object_path: sourceKey === "product-catalog" ? stalePath : `source-snapshots/v1/fba/${scopeKey}/stale.json`,
+        row_count: 1,
+      },
+      read: "ok",
+      error: null,
+    }),
+  });
+  h.clockRef.now = Date.UTC(2026, 7, 20, 12, 0);
+  h.snapStore.set(stalePath, { rows: [{ child_asin: "B0A", product_brand: "Acme" }] });
+  h.snapStore.set("source-snapshots/v1/fba/A01/stale.json", { rows: [{ seller_or_vendor_id: "A01", marketplace_country_code: "US" }] });
+
+  const preflight = await h.runtime.preflightEvidence({ bucket: "us", sourceKey: "order-line-items" });
+  assert.ok(preflight.evidence.readBlockers.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-stale"), "stale Catalog remains typed");
+  assert.ok(preflight.evidence.readBlockers.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-stale"), "stale FBA remains typed");
+  assert.equal(preflight.evidence.catalogSnapshot, null, "stale Catalog rows are never used");
+  assert.deepEqual(preflight.evidence.fbaSnapshotsByAccount, {}, "stale FBA rows are never used");
+  assert.equal(h.store._opens, 0, "preflight performs zero cycle writes");
+  assert.equal(h.dd.totalCreates(), 0, "preflight performs zero DataDoe creates");
+
+  const rollup = await h.runtime.run({ bucket: "us", onlySourceKey: "order-line-items", preflight });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.plan.plannedJobsByFamily["order-line-items"] >= 1, "OLI remains runnable");
+  assert.equal(rollup.plan.plannedJobsByFamily["product-catalog"], undefined, "Catalog is outside the narrowed plan");
+  assert.equal(rollup.plan.plannedJobsByFamily["fba-inventory-health"], undefined, "FBA is outside the narrowed plan");
+});
+
 test("S4. an UNREADABLE cache loader (throws) at persistence is the SAME typed SOURCE_PAYLOAD_UNAVAILABLE stop", async () => {
   const store = makeStore();
   const succeeded = new Set();

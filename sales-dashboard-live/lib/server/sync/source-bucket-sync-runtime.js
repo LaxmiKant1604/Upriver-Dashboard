@@ -1243,6 +1243,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       if (reason.endsWith("schema-missing")) refuse("DURABLE_MODEL_UNAVAILABLE", reason, b);
       if (reason === "snapshot-dangling") refuse("SNAPSHOT_HYDRATION_FAILED", reason, b);
       if (reason === "snapshot-integrity") refuse("SNAPSHOT_INTEGRITY_FAILED", reason, b);
+      // A stale daily snapshot is valid evidence that its source needs a refresh, not a failed read. The
+      // validator deliberately drops its rows so the planner sees the source as absent and schedules that
+      // source when it is in scope. In a narrowed OLI-only run Catalog/FBA are paused, so their staleness must
+      // not block OLI before the first create. Genuine snapshot transport/schema/integrity failures still
+      // refuse above/below.
+      if (reason === "snapshot-stale") continue;
       if (reason.startsWith("ads-coverage-")) refuse("ADS_COVERAGE_READ_FAILED", reason, b);
       if (reason.startsWith("coverage-") || reason.startsWith("snapshot-")) refuse("SOURCE_EVIDENCE_READ_FAILED", reason, b);
     }
