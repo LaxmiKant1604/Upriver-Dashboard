@@ -11954,3 +11954,54 @@ verify 63/63 (43 suites), build:check green; git diff --check clean. New suites 
 provenance refuse, 30-account isolation) + daily-v2-serving (brand isolation, beyond-coverage ->
 latest proven, exact hit, no-regression). DRY-RUN of the backfill against prod: 30/30 would-publish,
 0 failed, creates=0 tokens=0 (13 @ 08-24, 17 @ 08-22, Ads typed failed/stale/unavailable -- never 0).
+
+
+================================================================================
+2026-08-25 -- Durable ASIN Ads into Daily + Brand View: diagnosis + fixes (code 71e8732 + fdb161a)
+================================================================================
+
+OBJECTIVE: make durable ASIN Ads (asin-performance-v1 / ads-asin-date) visible + validated in Daily
+Reporting (account level) and Brand View (brand + country/account level) for all 30 primary accounts.
+Same-SKU attributed sales only (ad_sales_same_sku; no campaign halo). Campaign Ads + FBA stay paused.
+
+PHASE-1 READ-ONLY DIAGNOSIS (prod). Token balance = 100 usable (extra:100). Per-create cost verified
+from /usage-logs = 2 tokens (EXPORTS_API_STANDARD; poll LIST + download GET = 0). No premium tier in
+play. ASIN Ads does NOT use sync_source_jobs (that is sales-traffic-asin-date, a different source) --
+it flows through lib/server/ads-sync.js runAdsSync -> ads_daily_source_rows / ads_sync_coverage /
+ads_sync_state; there is NO export_id persistence, so NO zero-token export resume for ASIN Ads (only
+the coverage-mode idempotent skip, which needs state=succeeded + proven coverage). Availability today:
+1 usable (26f7a1a6, stale USD ads through 08-14), 26 failed(ads-sync-failed), 3 US unavailable(ads-
+not-synced). ~13 accounts HAVE durable rows but are gated off.
+
+THREE ROOT CAUSES:
+1. State poisoning: ads_sync_state.last_status="failed" (a LATER create/poll failure) blocks accounts
+   even where valid durable rows + coverage exist. resolveDailyAdsAvailability hard-blocks on
+   syncStatus==="failed" (report-source-contracts.js:1208). Fix = a clean re-sync sets succeeded.
+2. BLANK CURRENCY: the ASIN grain supplies no currency on a row (neither `currency` nor a populated
+   ad_campaign_budget_currency), so ads-sync rowRecord stored currency="" -> adRowBlockStatus blocks
+   the nonzero row (ads-currency-missing) -> Daily marks the whole account's Ads failed. Real prod:
+   fbd72f10 all rows currency="" mkt=DE; d658442d empty:3949 + INR:2197 (no CROSS-currency contamination
+   -- every non-empty currency already matches its account; the "ambiguity" is purely the persist gap).
+3. Coverage stale (ends ~Aug15, not the canonical 21-day window ending 2026-08-24).
+
+PHASE-2 FIX (code 71e8732): resolveAdRowCurrency (asin-ads-aggregation.js) derives the AUTHORITATIVE
+currency from marketplace_country_code when the row has no explicit currency (explicit wins), via
+marketplaceProfile. Wired IDENTICALLY into persist (ads-sync.js rowRecord) + all read aggregations
+(aggregateAsinAdsDailyRows / aggregateAccountAsinAds / aggregateBrandAsinAds), so existing blank rows
+AND future rows validate. Isolation preserved: a FOREIGN-marketplace row resolves to its foreign
+currency, so the per-account currency check still catches cross-marketplace/cross-account
+contamination -- a blank is filled, never blindly coerced to the account currency. Verified on real
+rows: fbd72f10 blank/DE -> EUR (was null->blocked); d658442d -> INR.
+
+PHASE-3 FIX (code fdb161a): the Daily v2 backfill now republishes when the durable Ads evidence
+changed. It always re-derives (zero export) and keys idempotency on the derived ADS PROVENANCE
+(status + covered window + latest metric date + ad-row count), NOT snapshot presence (source_refreshed
+_at is catalog-dominated and would not move when only Ads change). Freshness CAS: a strictly-newer
+live snapshot is never overwritten (newer-live). Each account's honest OLI end date is preserved
+(13 @ 08-24, 17 @ 08-22); Ads may be a superset but sales dates are never padded. Brand View portfolio
+reads Ads LIVE in buildPortfolio, so a Phase-6 rebuild (zero export) picks up Ads with no serving change.
+
+verify 63/63. PLAN for Phase 5 (controlled sync, <=7 creates / <=14 tokens; balance 100): re-run the
+ASIN Ads sync for the canonical [2026-08-04 .. 2026-08-24] window per bucket (Non-US <=5/10, US <=2/4),
+which lands clean currency rows + coverage + succeeded state. Then Phase 6 republish Daily v2 + rebuild
+Brand View. No zero-token ads resume exists, so all coverage requires new (2-token) creates.
