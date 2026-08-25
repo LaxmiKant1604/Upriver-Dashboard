@@ -125,7 +125,7 @@ const statusGets = (id) => fetches().filter((e) => e.method === "GET" && e.url.e
 const cadenceSleeps = () => events.filter((e) => e.type === "sleep" && e.ms === 5000);
 const firstIndex = (pred) => events.findIndex(pred);
 
-let pollExport, createExport, fetchExportRows, withDataDoeDeadline, ddFetch;
+let pollExport, createExport, fetchExportRows, fetchAccounts, withDataDoeDeadline, ddFetch;
 let DataDoeDeadlineError, isDataDoeDeadlineError, isDataDoePollPendingError;
 let classifyFetchError, runSourceJobs;
 
@@ -364,6 +364,26 @@ test("(deadline vs 429 retry sleep) the retry-after sleep consumes budget and ca
   });
 });
 
+test("(account discovery) retries only transient read-only 5xx responses; never creates an export", async () => {
+  resetLog();
+  fetchQueue = [
+    { status: 503, body: { message: "temporary" } },
+    { status: 502, body: { message: "temporary" } },
+    { status: 200, body: { data: [{ id: "A1", name: "Account", marketplaceCountryCode: "US", currency: "USD" }] } },
+  ];
+  const rows = await fetchAccounts("key");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, "A1");
+  assert.equal(fetches().length, 3);
+  assert.equal(posts().length, 0, "directory retries are GET-only and can never duplicate create-export");
+
+  resetLog();
+  fetchQueue = [{ status: 400, body: { message: "bad request" } }];
+  await assert.rejects(() => fetchAccounts("key"), /accounts request failed \(400\)/);
+  assert.equal(fetches().length, 1, "a definitive 4xx is never retried");
+  assert.equal(posts().length, 0);
+});
+
 // ================= worker-level regression (Scheduler v2 two-invocation resume) =================
 
 for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) {
@@ -414,7 +434,7 @@ for (const cause of ["repeated-404", "repeated-PENDING", "execution-deadline"]) 
 
 async function main() {
   ({
-    pollExport, createExport, fetchExportRows, withDataDoeDeadline, ddFetch,
+    pollExport, createExport, fetchExportRows, fetchAccounts, withDataDoeDeadline, ddFetch,
     DataDoeDeadlineError, isDataDoeDeadlineError, isDataDoePollPendingError,
   } = await import("../lib/server/datadoe.js"));
   ({ classifyFetchError, runSourceJobs } = await import("../lib/server/sync/source-worker.js"));

@@ -180,9 +180,15 @@ export async function ddFetch(url, options, attempt = 0) {
   return r;
 }
 
-export async function fetchAccounts(apiKey) {
+export async function fetchAccounts(apiKey, attempt = 0) {
   const r = await ddFetch(ENDPOINTS.sellers, { headers: authHeaders(apiKey) });
   if (!r.ok) {
+    // Account discovery is an idempotent GET and DataDoe occasionally returns a brief 5xx while exports remain
+    // healthy. Retry only this read-only directory call; create-export POSTs retain their strict no-retry rule.
+    if ([500, 502, 503, 504].includes(r.status) && attempt < 3) {
+      await sleep((attempt + 1) * 1000);
+      return fetchAccounts(apiKey, attempt + 1);
+    }
     throw new Error(`DataDoe accounts request failed (${r.status}). Check the endpoint path in lib/server/datadoe.js against https://api.datadoe.com/api/v1/docs`);
   }
   const body = await r.json();
