@@ -12081,3 +12081,35 @@ proof: it is a new create that would exceed the exhausted 18-token ceiling (code
 the working OLI/brand-sales REST sources). Campaign Ads creates=0, FBA creates=0, controls safe-closed
 (all_primary=false, rollout=0, rss=0, approvals=0), no pg_cron, Brand Sales(37)/Inventory(30) unchanged.
 Code c9d6fd5 (+ 973d135 superset, 4b4e6ab UK/GB, 96dd302 aggregation, de9c0a3 max-creates) pushed; verify 63/63.
+
+
+================================================================================
+2026-08-26 -- ASIN Ads COMPLETE for all 25 connected accounts (5 creates / 10 tokens; code c689a55+f204545)
+================================================================================
+
+Continuation (10-token ceiling) finished the ASIN Ads sync via the OLI source-first model:
+- Operator gains a zero-token COVERAGE PRE-FILTER (missing-complement batching: covered accounts excluded
+  BEFORE batching -> batches pack only pending accounts) + a 3-attempt retry on the compatible-sources probe
+  (one transient fetch error had misclassified three CONNECTED accounts) (c689a55).
+- datadoeFetch retries thrown network errors for idempotent GETs only (status poll + raw download; a create
+  POST is NEVER auto-retried -- ambiguous in-flight POSTs could double-create); downloadExport retries the
+  whole raw fetch+parse (large exports 302-redirect to a storage URL; multi-MB bodies died on the flaky
+  connection) (f204545).
+- ADOPTION path proven: Non-US batch-2 export (34720 rows -- REST >5000 confirmed live) was created but its
+  download died; the completed export was ADOPTED by injecting a createExport that returns the existing
+  exportId after verifying exact identity (source/sellers/window/skip) -- zero new tokens, full validation +
+  persistence through the real worker.
+- Sync result: Non-US 17/17 covered (3 charged creates: [IN,NL,UK,BE]x5 + [CA]x1 + the batch-2 create whose
+  download failed, later adopted free for [IN,UK,DE]x5), US 8/8 covered (2 charged creates; one 503-rejected
+  attempt charged nothing). TOTAL: 5 charged creates = 10/10 tokens. Balance 146.
+- Daily v2: 19 accounts REPUBLISHED(ads-changed) zero-export -> 25/30 partial ads, 5 failed (the
+  disconnected). 18 accounts show REAL ad metrics with ACoS/TACoS (e.g. 128bf8ad 22%/3.7%, d658442d
+  21.8%/1.95%, 916be46e 67.3%/1.49%); 7 covered accounts have proven-zero ad activity (honest).
+- Brand View: 34 portfolios rebuilt zero-export; 28 show brand+country ads (JustHuman IN 274k spend,
+  SASHAA WORLD IN+US 158k, Caruso Italy AU/CA/US 8.9k, Bebi Born 6 countries).
+- Disconnected (5, EXTERNAL -- connect/re-authorize Amazon Ads in DataDoe; the generic path picks them up
+  automatically once connected): 126918b3, 59f12ccc, 81146c04, 858977f0 (IN) + 8aa74e96 (IT). Their Daily
+  shows ads=failed (old pre-preflight attempts poisoned last_status); still a typed non-zero state.
+- Safety: Campaign Ads creates=0 (0 new campaign rows), FBA creates=0, controls safe-closed (ap=false,
+  rollout=0, rss=0, approvals=0), no pg_cron, Brand Sales(37)/Inventory(30) unchanged. verify 63/63,
+  HEAD=f204545 deployed, prod 200.
