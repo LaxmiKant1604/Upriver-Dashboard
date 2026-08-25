@@ -32,6 +32,8 @@ import {
   getDashboardAccess,
   getDailyAdsCoverage,
   getLatestReportSnapshot,
+  getLatestReportSnapshotHydrated,
+  getLatestReportSnapshotMeta,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
   getSourceCoverageWindows,
@@ -111,7 +113,10 @@ import {
   buildBrandViewSnapshot,
   buildBrandInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
-import { membershipBrandsForAccount, selectorBrandsForAccount } from "../lib/server/reports/brand-membership.js";
+import {
+  selectorBrandsForAccount, buildBrandAccountMembership, brandKey, brandDisplay,
+  serialiseBrandAccountMembership, membershipFingerprint,
+} from "../lib/server/reports/brand-membership.js";
 import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
 import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
@@ -627,27 +632,6 @@ export function usableCatalogBrands(rows) {
   return [...brands].sort((a, b) => a.localeCompare(b));
 }
 
-function addBrandAccount(brandAccountIds, brand, accountId) {
-  const name = String(brand || "").trim();
-  if (!name) return;
-  const accountIds = brandAccountIds.get(name) || new Set();
-  accountIds.add(String(accountId));
-  brandAccountIds.set(name, accountIds);
-}
-
-function serialiseBrandAccountMap(brandAccountIds, selectorBrands = null) {
-  // The SELECTOR list = every membership brand UNION the selector-only brands (a complete catalog's zero-sale
-  // brands + fallback-report brands). MEMBERSHIP (brandAccounts) stays brand-sales only: a selector-only brand
-  // appears in `brands` with an EMPTY account list, so it is selectable but pins no account.
-  const brandSet = new Set([...brandAccountIds.keys()].map((b) => String(b || "").trim()).filter(Boolean));
-  if (selectorBrands) for (const b of selectorBrands) { const n = String(b || "").trim(); if (n) brandSet.add(n); }
-  const brands = [...brandSet].sort((a, b) => a.localeCompare(b));
-  return {
-    brands,
-    brandAccounts: Object.fromEntries(brands.map((brand) => [brand, [...(brandAccountIds.get(brand) || [])].sort()])),
-  };
-}
-
 const BRAND_PORTFOLIO_REPORT_KEY = "brand-portfolio";
 const BRAND_PORTFOLIO_VERSION = "brand-portfolio-shared-v3";
 const BRAND_ADS_SOURCE_KEY = "asin-performance-v1";
@@ -765,8 +749,9 @@ function snapshotBrandNames(payload) {
 }
 
 async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAttemptState = defaultGetCatalogAttemptState } = {}) {
-  const brandAccountIds = new Map();  // MEMBERSHIP: brand -> accounts, from the latest validated brand-sales ONLY
-  const selectorBrands = new Set();   // SELECTOR list: catalog (complete) UNION brand-sales (+ fallbacks); never pins membership
+  const selectorByKey = new Map();    // SELECTOR list (canonical key -> display): catalog(complete) UNION sales (+ fallbacks); never pins
+  const perAccountSales = [];         // MEMBERSHIP evidence: [{accountId, salesBrands}] -> buildBrandAccountMembership (canonical-key based)
+  const salesMeta = [];               // fingerprint parts: [{accountId, updatedAt, paramsHash}] over the latest brand-sales identity per account
   const coveredAccountIds = new Set();
   const catalogPendingAccountIds = new Set();
   const catalogUnavailable = new Map();
@@ -776,7 +761,14 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
   // from the SEPARATE per-(action,account) attempt row so overlapping actions never clobber
   // each other's summaries.
   const catalogActionFailures = new Map();
-  if (!isSupabaseConfigured()) return { brandAccountIds, selectorBrands, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
+  const addSelector = (entries) => { for (const e of (entries || [])) if (e && e.key && !selectorByKey.has(e.key)) selectorByKey.set(e.key, e.display); };
+  const finalise = () => ({
+    membership: buildBrandAccountMembership(perAccountSales),
+    selectorEntries: [...selectorByKey.entries()].map(([key, display]) => ({ key, display })),
+    fingerprint: membershipFingerprint(salesMeta),
+    coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures,
+  });
+  if (!isSupabaseConfigured()) return finalise();
 
   // MEMBERSHIP follows the CURRENT sales evidence (latest validated brand-sales), so it matches the figures and
   // never drops a selling account (nor pins a catalog-only, zero-sale account). The complete catalog still
@@ -784,7 +776,7 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
   // account waits for its one-time catalog sync -- but only brand-sales pins membership.
   await Promise.all(accountIds.map(async (accountId) => {
     const id = String(accountId);
-    const catalogSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
+    const catalogSnapshot = await getLatestReportSnapshotHydrated({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
     const payload = catalogSnapshot?.payload;
     const catalogStatus = payload?.catalogSyncStatus;
     const catalogBrands = snapshotBrandNames(payload);
@@ -801,15 +793,17 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
       }
     }
 
-    // (1) MEMBERSHIP: the latest validated brand-sales snapshot ONLY. An account is a portfolio member of a brand
-    // iff its current brand-sales contains it (the same trimmed evidence the figures use).
-    const salesSnapshot = await getLatestReportSnapshot({ reportKey: BRAND_SALES_REPORT_KEY, accountId });
+    // (1) MEMBERSHIP: the latest validated brand-sales snapshot ONLY, hydrated STORAGE-FIRST so a large out-of-line
+    // payload never silently drops its account. An account is a member of a brand iff its current brand-sales
+    // contains it (canonical-key matched). Its snapshot identity feeds the self-heal fingerprint.
+    const salesSnapshot = await getLatestReportSnapshotHydrated({ reportKey: BRAND_SALES_REPORT_KEY, accountId });
     const salesBrands = snapshotBrandNames(salesSnapshot?.payload);
-    membershipBrandsForAccount(salesBrands).forEach((brand) => addBrandAccount(brandAccountIds, brand, accountId));
+    perAccountSales.push({ accountId: id, salesBrands });
+    if (salesSnapshot) salesMeta.push({ accountId: id, updatedAt: String(salesSnapshot.updated_at || salesSnapshot.source_refreshed_at || ""), paramsHash: String(salesSnapshot.params_hash || "") });
 
     // (2) SELECTOR list only: a complete catalog contributes its (zero-sale-inclusive) brands, unioned with
     // brand-sales. Selector brands NEVER pin membership.
-    selectorBrandsForAccount({ catalogStatus, catalogBrands, salesBrands }).forEach((brand) => selectorBrands.add(brand));
+    addSelector(selectorBrandsForAccount({ catalogStatus, catalogBrands, salesBrands }));
 
     if (catalogStatus === "complete") { coveredAccountIds.add(id); return; }
     if (catalogStatus === "unavailable") {
@@ -825,16 +819,111 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
     // No complete catalog and no brand-sales: recover the SELECTOR list from other report snapshots (fba-plan,
     // sku-pl, ...). This never pins membership -- brand-sales is the only membership authority.
     for (const reportKey of BRAND_DIRECTORY_SNAPSHOT_KEYS.slice(2)) {
-      const snapshot = await getLatestReportSnapshot({ reportKey, accountId });
+      const snapshot = await getLatestReportSnapshotHydrated({ reportKey, accountId });
       const brands = snapshotBrandNames(snapshot?.payload);
       if (brands.length) {
-        brands.forEach((brand) => { const n = String(brand || "").trim(); if (n) selectorBrands.add(n); });
+        addSelector(brands.map((b) => ({ key: brandKey(b), display: brandDisplay(b) })).filter((e) => e.key));
         coveredAccountIds.add(id);
         break;
       }
     }
   }));
-  return { brandAccountIds, selectorBrands, coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures };
+  return finalise();
+}
+
+// The LIVE membership fingerprint from CHEAP metadata reads only (no payload hydration): the fingerprint of the
+// latest brand-sales snapshot identity for each authorized account. The directory read compares it against the
+// stored directory's saved fingerprint to decide whether to self-heal -- so an unchanged directory is served
+// immediately and a changed one is rebuilt exactly once. ZERO DataDoe.
+async function brandSalesFingerprint(accountIds) {
+  if (!isSupabaseConfigured()) return "";
+  const meta = await Promise.all((accountIds || []).map(async (accountId) => {
+    const m = await getLatestReportSnapshotMeta({ reportKey: BRAND_SALES_REPORT_KEY, accountId }).catch(() => null);
+    return { accountId: String(accountId), updatedAt: String(m?.updated_at || m?.source_refreshed_at || ""), paramsHash: String(m?.params_hash || "") };
+  }));
+  return membershipFingerprint(meta);
+}
+
+// Assemble the directory READ payload from a rebuilt membership map (+ the typed catalog-availability summary).
+function buildBrandDirectoryReadPayload(directory, brandDirectoryAccounts) {
+  const saved = serialiseBrandAccountMembership(directory.membership, directory.selectorEntries);
+  const unavailableByAccount = new Map();
+  for (const [id, code] of directory.catalogUnavailable) unavailableByAccount.set(id, { code, preservedLkg: false });
+  for (const [id, code] of directory.catalogActionFailures) if (!unavailableByAccount.has(id)) unavailableByAccount.set(id, { code, preservedLkg: true });
+  const catalogUnavailableAccounts = [...unavailableByAccount.entries()].map(([accountId, { code, preservedLkg }]) => {
+    const account = (brandDirectoryAccounts || []).find((entry) => String(entry.id) === String(accountId));
+    return { accountId, name: account?.name || accountId, code, preservedLkg };
+  });
+  const unavailableByCode = {};
+  for (const { code } of catalogUnavailableAccounts) unavailableByCode[code] = (unavailableByCode[code] || 0) + 1;
+  return {
+    ...saved,
+    membershipFingerprint: directory.fingerprint,
+    accounts: brandDirectoryAccounts || [],
+    source: "shared-snapshots",
+    catalogUnavailableAccounts,
+    catalogUnavailable: { total: catalogUnavailableAccounts.length, byCode: unavailableByCode, preservedLkg: catalogUnavailableAccounts.filter((e) => e.preservedLkg).length },
+  };
+}
+
+/**
+ * Serve the brand directory on a READ with a generic ZERO-EXPORT self-heal: compare the stored directory's saved
+ * membership fingerprint against the live brand-sales fingerprint; serve the stored map when unchanged, else
+ * rebuild it from the latest validated brand-sales (storage-first) under the shared refresh lock -- so a burst of
+ * concurrent readers triggers exactly ONE rebuild -- save it atomically, and serve it. A rebuild FAILURE (or a
+ * lock held by another reader) preserves and serves the previous LKG with a typed stale warning; nothing calls
+ * DataDoe. This closes the rollout gap where a new scheduler brand-sales publication left the directory stale.
+ */
+async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, brandDirectoryAccounts }) {
+  const { reportKey, reportVersion, accountId, params } = legacyShared;
+  const paramsHash = params ? paramsHashFor(reportVersion, params) : null;
+  const stored = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
+  const storedPayload = stored?.payload || null;
+  const storedHasBrands = Array.isArray(storedPayload?.brands) && storedPayload.brands.length > 0;
+  const storedFp = storedPayload?.membershipFingerprint;
+  const liveFp = await brandSalesFingerprint(accountIds).catch(() => null);
+
+  const serveStored = (extra = {}) => res.status(200).json({
+    ...storedPayload, reportKey, reportVersion, paramsHash,
+    snapshot: {
+      savedAt: stored?.source_refreshed_at || stored?.updated_at || null, updatedAt: stored?.updated_at || null,
+      shared: true, legacyDirectory: storedPayload?.membershipFingerprint == null, ...extra,
+    },
+  });
+
+  // Unchanged evidence -> serve the saved directory immediately.
+  if (storedHasBrands && storedFp != null && liveFp != null && storedFp === liveFp) { serveStored(); return; }
+
+  // Changed or missing -> rebuild under the shared lock (one rebuild for concurrent readers).
+  const locked = paramsHash ? await claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds: 300 }).catch(() => false) : false;
+  if (!locked) {
+    if (storedHasBrands) { serveStored({ staleRebuilding: true }); return; }
+    res.status(200).json({ reportKey, reportVersion, paramsHash, brands: [], brandAccounts: {}, rebuilding: true, message: "Brand coverage is updating from the latest saved sales." });
+    return;
+  }
+  try {
+    // Double-check inside the lock -- the race winner may have just rebuilt it.
+    const fresh = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
+    if (Array.isArray(fresh?.payload?.brands) && fresh.payload.brands.length && liveFp != null && fresh.payload.membershipFingerprint === liveFp) {
+      res.status(200).json({ ...fresh.payload, reportKey, reportVersion, paramsHash, snapshot: { savedAt: fresh.source_refreshed_at || fresh.updated_at || null, updatedAt: fresh.updated_at || null, shared: true } });
+      return;
+    }
+    let payload;
+    try {
+      const directory = await sharedSnapshotBrandAccounts(accountIds);
+      payload = buildBrandDirectoryReadPayload(directory, brandDirectoryAccounts);
+    } catch (e) {
+      if (storedHasBrands) { serveStored({ staleRebuildFailed: true }); return; }
+      throw e;
+    }
+    if (paramsHash) {
+      const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+      await saveReportSnapshot({ reportKey, accountId, paramsHash, params: { reportVersion, ...params }, payload, payloadBytes, sourceRefreshedAt: new Date().toISOString() }).catch(() => {});
+    }
+    res.status(200).json({ ...payload, reportKey, reportVersion, paramsHash, snapshot: { savedAt: new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true } });
+  } finally {
+    if (locked && paramsHash) await releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {});
+  }
 }
 
 async function saveBrandCatalogSnapshot(accountId, payload) {
@@ -2384,7 +2473,7 @@ async function handleDataDoe(req, res) {
           brand,
           asOf,
           account: accountMeta,
-          getSnapshot: getLatestReportSnapshot,
+          getSnapshot: getLatestReportSnapshotHydrated,
           getAdsRows: getAdsDailySourceRows,
         }),
       });
@@ -2417,6 +2506,19 @@ async function handleDataDoe(req, res) {
           .map((entry) => [String(entry.id), { name: entry.name || null, country: entry.country || null }])
       );
 
+      // Brand-sales is read STORAGE-FIRST so a large (out-of-line) payload never drops its country, and the same
+      // build is the read-path self-heal: when the selected brand's account set changes (the directory just
+      // freshened), the new-identity snapshot is missing, so it is re-derived from durable evidence (brand-sales +
+      // durable ASIN Ads + saved inventory) ZERO-export -- no manual Refresh, and never a snapshot for a different
+      // account set (the set is baked into the report identity).
+      const buildPortfolio = () => buildBrandViewPortfolioSnapshot({
+        accountIds,
+        brand,
+        asOf,
+        accountsById,
+        getSnapshot: getLatestReportSnapshotHydrated,
+        getAdsRows: getAdsDailySourceRows,
+      });
       await serveSharedReport({
         res,
         refresh: wantsRefresh(req),
@@ -2429,14 +2531,8 @@ async function handleDataDoe(req, res) {
         // Reading a dozen saved Dashboard payloads sequentially takes longer
         // than a single-account build, so the lock is held for longer.
         lockSeconds: 300,
-        build: () => buildBrandViewPortfolioSnapshot({
-          accountIds,
-          brand,
-          asOf,
-          accountsById,
-          getSnapshot: getLatestReportSnapshot,
-          getAdsRows: getAdsDailySourceRows,
-        }),
+        build: buildPortfolio,
+        deriveDurable: async () => ({ payload: await buildPortfolio() }),
       });
       return;
     }
@@ -2486,30 +2582,13 @@ async function handleDataDoe(req, res) {
         }
       }
       if (!wantsRefresh(req)) {
-        // Brand Directory v1 contained a usable brand list but not the newer
-        // brand-to-account map. Keep serving it instantly while a v2 map is
-        // being rebuilt from saved reports; the browser safely falls back to
-        // its permitted account set for that older payload.
+        // Brand Directory READ: a generic ZERO-EXPORT self-heal. The stored map is served immediately when its
+        // membership fingerprint still matches the live brand-sales evidence; otherwise it is rebuilt from the
+        // latest validated brand-sales (storage-first) under the shared lock -- so a new scheduler brand-sales
+        // publication is picked up automatically without a manual refresh, page reload, or DataDoe export.
         if (action === "brand-directory") {
-          const previous = await getLatestReportSnapshot({
-            reportKey: legacyShared.reportKey,
-            accountId: legacyShared.accountId,
-          });
-          if (previous?.payload?.brands?.length) {
-            res.status(200).json({
-              ...previous.payload,
-              reportKey: legacyShared.reportKey,
-              reportVersion: legacyShared.reportVersion,
-              paramsHash: legacyShared.params ? paramsHashFor(legacyShared.reportVersion, legacyShared.params) : null,
-              snapshot: {
-                savedAt: previous.source_refreshed_at || previous.updated_at || null,
-                updatedAt: previous.updated_at || null,
-                shared: true,
-                legacyDirectory: previous.params?.reportVersion !== legacyShared.reportVersion,
-              },
-            });
-            return;
-          }
+          await serveSelfHealingBrandDirectory({ res, accountIds: publicAccountIds, legacyShared, brandDirectoryAccounts });
+          return;
         }
         // Reading a report is always server-side and shared. It never reaches
         // DataDoe, even on a new browser or under a different user account.
@@ -2603,7 +2682,7 @@ async function handleDataDoe(req, res) {
       // Read the directory for the response over the authorized scope (brand map + typed
       // cumulative summary). This is Supabase-only and never calls DataDoe.
       const directory = await sharedSnapshotBrandAccounts(publicAccountIds, { actionId });
-      const saved = serialiseBrandAccountMap(directory.brandAccountIds, directory.selectorBrands);
+      const saved = serialiseBrandAccountMembership(directory.membership, directory.selectorEntries);
       // Typed, admin-safe cumulative summary, derived from the persisted snapshots so no
       // failure is lost across continuation batches. It unions: accounts with no usable
       // saved catalog (catalogUnavailable) AND accounts whose complete brand map is a
@@ -2622,6 +2701,9 @@ async function handleDataDoe(req, res) {
       const operationalFailure = catalogSyncStatus === "operational-failure";
       await sendLegacyPayload({
         ...saved,
+        // The membership PROVENANCE fingerprint of the brand-sales evidence this map was built from. The read
+        // path compares it against the live fingerprint to self-heal the directory with ZERO DataDoe.
+        membershipFingerprint: directory.fingerprint,
         accounts: brandDirectoryAccounts || [],
         source: attempted ? "shared-snapshots-and-catalog-sync" : "shared-snapshots",
         // A stopped action is not "more work to poll" -- the browser should stop, not spin.
@@ -2726,7 +2808,7 @@ async function handleDataDoe(req, res) {
           from: inventoryFrom,
           to,
           rowLimit: PLAN_INVENTORY_ROW_LIMIT,
-          getSnapshot: getLatestReportSnapshot,
+          getSnapshot: getLatestReportSnapshotHydrated,
           fetchInventoryRows: () => fetchExportRows(
             apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
             inventoryFrom, to, PLAN_INVENTORY_ROW_LIMIT,

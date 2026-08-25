@@ -345,6 +345,14 @@ export default function BrandPortfolio({
         </div>
       )}
 
+      {/* Compact, non-blocking "Updating brand coverage" indicator: the account set is being re-checked against
+          the latest saved brand-sales (self-healing, Supabase-only). Previous content stays on screen. */}
+      {directoryLoading && (
+        <div className="plan-fresh" style={{ opacity: 0.85 }}>
+          <RefreshCw size={13} className="spin" aria-hidden="true" />
+          <span>Updating brand coverage…</span>
+        </div>
+      )}
       {directoryError && <DataQualityAlert tone="warning" title="Some portfolio brands could not be loaded" detail={directoryError} />}
       {sourceProgress && (
         <DataQualityAlert
@@ -381,10 +389,13 @@ export default function BrandPortfolio({
         </div>
       ) : !idsKey ? (
         <div className="panel">
-          <EmptyState icon={<DatabaseZap size={19} aria-hidden="true" />} title="No saved account records this brand yet">
-            {accountsKnown
-              ? `No saved Dashboard snapshot identifies "${brand}" in any account you can access. Open Account View for the relevant account and refresh its Dashboard once; every authorised user then reads that same saved data.`
-              : "Loading the accounts mapped to this brand…"}
+          <EmptyState
+            icon={<DatabaseZap size={19} aria-hidden="true" />}
+            title={(!accountsKnown || directoryLoading) ? "Updating brand coverage…" : "No saved account records this brand yet"}
+          >
+            {(!accountsKnown || directoryLoading)
+              ? "Checking every account you can access against the latest saved brand sales. This reads saved data only and never runs a DataDoe export."
+              : `No saved brand-sales snapshot records "${brand}" in any account you can access yet. It will appear automatically once the scheduled data refresh saves sales for it.`}
           </EmptyState>
         </div>
       ) : error ? (

@@ -1106,6 +1106,14 @@ function usePrefersReducedMotion() {
 // The account dashboard and Brand View both read this same cache shape.  It
 // intentionally considers only brand-sales rows, never broad catalog metadata,
 // so a brand cannot appear under an account where it has not been observed.
+// The CANONICAL brand-key for MATCHING -- MUST mirror lib/server/reports/brand-membership.js#brandKey so the
+// frontend selects the same brand the server keyed its directory/membership map by: trim, collapse repeated
+// interior whitespace to one space, lowercase. Punctuation preserved (punctuation-distinct brands stay separate).
+function brandKey(value) {
+  const t = String(value == null ? "" : value).trim().replace(/\s+/g, " ").toLowerCase();
+  return t || null;
+}
+
 function cachedBrandsForAccount(accountId) {
   if (!accountId) return [];
   try {
@@ -1334,18 +1342,21 @@ function DashboardApp({ session, access, onSignOut }) {
     const ids = discoveredIds.length ? discoveredIds : (isAdmin ? [] : [...allowedAccountIds]);
     return [...new Set(ids)].sort().join(",");
   }, [accounts, allowedAccountIds, isAdmin]);
+  // The self-healed server directory keys brandAccounts by the CANONICAL brand-key, so look it up by that key --
+  // a case/whitespace variant of the selected brand resolves to the same (fresh) account set.
+  const selectedBrandKey = selectedPortfolioBrand ? brandKey(selectedPortfolioBrand) : null;
   const portfolioMappingKnown = Boolean(
-    selectedPortfolioBrand && Array.isArray(brandDirectoryAccounts[selectedPortfolioBrand])
+    selectedBrandKey && Array.isArray(brandDirectoryAccounts[selectedBrandKey])
   );
   const portfolioAccounts = useMemo(() => {
-    if (!selectedPortfolioBrand) return [];
-    const mappedIds = brandDirectoryAccounts[selectedPortfolioBrand];
+    if (!selectedBrandKey) return [];
+    const mappedIds = brandDirectoryAccounts[selectedBrandKey];
     // A v1 directory has no account map. Discover the saved scope first;
     // never refresh every account merely because an older directory was read.
     if (!Array.isArray(mappedIds)) return [];
-    const allowedIds = new Set(mappedIds);
+    const allowedIds = new Set(mappedIds.map(String));
     return accounts.filter((account) => allowedIds.has(String(account.id)));
-  }, [accounts, brandDirectoryAccounts, selectedPortfolioBrand]);
+  }, [accounts, brandDirectoryAccounts, selectedBrandKey]);
   const brandDirectoryCacheParams = useMemo(() => {
     if (portfolioAccountSignature) {
       return { action: "brand-directory", reportVersion: "brand-directory-shared-v2", ids: portfolioAccountSignature };
@@ -1368,7 +1379,7 @@ function DashboardApp({ session, access, onSignOut }) {
       try {
         const { body } = await loadSharedReport(params);
         (body.rows || []).forEach((row) => {
-          if (productBrand(row) !== selectedPortfolioBrand) return;
+          if (brandKey(productBrand(row)) !== brandKey(selectedPortfolioBrand)) return;
           matchedIds.add(String(account.id));
           rows.push({ ...row, accountId: account.id, accountName: account.name, accountCountry: account.country, accountCurrency: account.currency });
         });
@@ -1379,9 +1390,10 @@ function DashboardApp({ session, access, onSignOut }) {
     }));
     const matchedAccounts = accounts.filter((account) => matchedIds.has(String(account.id)));
     if (matchedAccounts.length) {
+      // Seed the map under the CANONICAL key (matching the server directory), so the lookup finds it.
       setBrandDirectoryAccounts((current) => ({
         ...current,
-        [selectedPortfolioBrand]: matchedAccounts.map((account) => String(account.id)),
+        [brandKey(selectedPortfolioBrand)]: matchedAccounts.map((account) => String(account.id)),
       }));
     }
     return { accounts: matchedAccounts, rows };
@@ -1424,41 +1436,48 @@ function DashboardApp({ session, access, onSignOut }) {
   ), [accountById, portfolioAccountIds]);
   const portfolioScopeResolved = portfolioMappingKnown || discoveredBrandAccountIds !== null;
 
-  useEffect(() => {
+  // The brand directory is READ-ONLY and self-healing: the server rebuilds it from the latest validated
+  // brand-sales when the evidence changes, so re-reading it (on mount, focus, and the 60s interval) automatically
+  // picks up a new scheduler brand-sales publication -- the selected brand's coverage updates with no manual
+  // refresh and no DataDoe export. A request guard stops a slow read for a previous account scope from landing.
+  const brandDirReqId = React.useRef(0);
+  const reloadBrandDirectory = useCallback(async () => {
     if (dashboardMode !== "brand" || !brandDirectoryCacheParams || !portfolioAccountSignature) return;
-    let active = true;
-    loadSharedReport(brandDirectoryCacheParams)
-      .then(({ body, cachedAt }) => {
-        if (!active) return;
-        if (body.snapshotMissing) {
-          setBrandDirectoryBrands([]);
-          setBrandDirectoryAccounts({});
-          setBrandDirectoryFetchedAt(null);
-          return;
-        }
-        setBrandDirectoryBrands(body.brands || []);
-        setBrandDirectoryAccounts(body.brandAccounts || {});
-        if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
-        setBrandDirectoryFetchedAt(new Date(cachedAt));
-        setBrandDirectoryError(body.message || (body.partial ? "Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots." : null));
-        // Older shared directories only contain a brand list. Upgrade them
-        // once in the background to a shared brand-to-account map. This is
-        // Supabase-only and never creates a DataDoe Product Catalog export.
-        if (body.snapshot?.legacyDirectory) {
-          refreshSharedReport(brandDirectoryCacheParams)
-            .then(({ body: upgraded }) => {
-              if (!active || !upgraded.brands?.length) return;
-              setBrandDirectoryBrands(upgraded.brands);
-              setBrandDirectoryAccounts(upgraded.brandAccounts || {});
-              if (Array.isArray(upgraded.accounts) && upgraded.accounts.length) applyAccounts(upgraded);
-              setBrandDirectoryFetchedAt(new Date());
-            })
-            .catch(() => {});
-        }
-      })
-      .catch((error) => { if (active) setBrandDirectoryError(error.message); });
-    return () => { active = false; };
+    const myId = ++brandDirReqId.current;
+    setBrandDirectoryLoading(true);
+    try {
+      const { body, cachedAt } = await loadSharedReport(brandDirectoryCacheParams);
+      if (myId !== brandDirReqId.current) return;
+      if (body.snapshotMissing && !(body.brands && body.brands.length)) {
+        setBrandDirectoryBrands([]);
+        setBrandDirectoryAccounts({});
+        setBrandDirectoryFetchedAt(null);
+        return;
+      }
+      setBrandDirectoryBrands(body.brands || []);
+      setBrandDirectoryAccounts(body.brandAccounts || {});
+      if (Array.isArray(body.accounts) && body.accounts.length) applyAccounts(body);
+      setBrandDirectoryFetchedAt(new Date(cachedAt));
+      setBrandDirectoryError(body.message || (body.partial ? "Some accounts have no saved catalog data yet. The available brands are loaded from shared report snapshots." : null));
+      // A legacy v1 directory (no account map / no fingerprint) is upgraded by a plain re-READ: the server
+      // self-heals it into the v2 map. This is Supabase-only and never creates a DataDoe export.
+      if (body.snapshot?.legacyDirectory) {
+        const { body: upgraded } = await loadSharedReport(brandDirectoryCacheParams);
+        if (myId !== brandDirReqId.current || !upgraded.brands?.length) return;
+        setBrandDirectoryBrands(upgraded.brands);
+        setBrandDirectoryAccounts(upgraded.brandAccounts || {});
+        if (Array.isArray(upgraded.accounts) && upgraded.accounts.length) applyAccounts(upgraded);
+        setBrandDirectoryFetchedAt(new Date());
+      }
+    } catch (error) {
+      if (myId === brandDirReqId.current) setBrandDirectoryError(error.message);
+    } finally {
+      if (myId === brandDirReqId.current) setBrandDirectoryLoading(false);
+    }
   }, [applyAccounts, dashboardMode, brandDirectoryCacheParams, portfolioAccountSignature]);
+
+  useEffect(() => { reloadBrandDirectory(); }, [reloadBrandDirectory]);
+  useAutoRevalidate(reloadBrandDirectory, { active: dashboardMode === "brand" });
 
   const fetchBrandDirectory = useCallback(async () => {
     if (!brandDirectoryCacheParams || brandDirectoryLoading) return;

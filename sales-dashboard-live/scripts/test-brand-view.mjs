@@ -1458,21 +1458,67 @@ test("an export filename records the account, brand, currency mode and as-of dat
 });
 
 // ---- Portfolio MEMBERSHIP follows brand-sales only; the catalog supplies the selector list (Bebi Born fix) ----
-const { buildBrandAccountMembership, membershipBrandsForAccount, selectorBrandsForAccount, accountsForBrand, normalizeBrandName } = await import("../lib/server/reports/brand-membership.js");
+const {
+  buildBrandAccountMembership, membershipBrandsForAccount, selectorBrandsForAccount, accountsForBrand,
+  normalizeBrandName, brandKey, brandDisplay, serialiseBrandAccountMembership, membershipFingerprint,
+} = await import("../lib/server/reports/brand-membership.js");
+
+const keysOf = (entries) => entries.map((e) => e.key).sort();
+const displaysOf = (entries) => entries.map((e) => e.display).sort();
 
 test("membership is brand-sales ONLY (a catalog-only brand pins no account); the SELECTOR unions a complete catalog + brand-sales", () => {
   // MEMBERSHIP: only brand-sales counts. A complete catalog listing 'Catalog Only' does NOT make the account a member.
-  assert.deepEqual(membershipBrandsForAccount(["Bebi Born", "Sibling Brand"]), ["Bebi Born", "Sibling Brand"]);
+  assert.deepEqual(keysOf(membershipBrandsForAccount(["Bebi Born", "Sibling Brand"])), ["bebi born", "sibling brand"]);
+  assert.deepEqual(displaysOf(membershipBrandsForAccount(["Bebi Born", "Sibling Brand"])), ["Bebi Born", "Sibling Brand"]);
   assert.deepEqual(membershipBrandsForAccount([]), [], "no brand-sales -> no membership (a catalog-only US-style account is excluded)");
   // SELECTOR: a complete catalog contributes its zero-sale brands, unioned with brand-sales; never replaces.
-  const sel = selectorBrandsForAccount({ catalogStatus: "complete", catalogBrands: ["Catalog Only", "Bebi Born"], salesBrands: ["Bebi Born"] });
-  assert.ok(sel.includes("Catalog Only") && sel.includes("Bebi Born"), "selector = catalog UNION sales");
+  const sel = keysOf(selectorBrandsForAccount({ catalogStatus: "complete", catalogBrands: ["Catalog Only", "Bebi Born"], salesBrands: ["Bebi Born"] }));
+  assert.ok(sel.includes("catalog only") && sel.includes("bebi born"), "selector = catalog UNION sales");
   // A non-complete catalog contributes nothing to the selector beyond brand-sales.
-  assert.deepEqual(selectorBrandsForAccount({ catalogStatus: "unavailable", catalogBrands: ["Ignore"], salesBrands: ["Bebi Born"] }), ["Bebi Born"]);
-  // Normalization is a trim (genuinely different brands never merge; casing/spacing preserved).
-  assert.equal(normalizeBrandName("  Bebi Born "), "Bebi Born");
+  assert.deepEqual(displaysOf(selectorBrandsForAccount({ catalogStatus: "unavailable", catalogBrands: ["Ignore"], salesBrands: ["Bebi Born"] })), ["Bebi Born"]);
+  // Display normalization trims + collapses interior whitespace, ORIGINAL case preserved.
+  assert.equal(normalizeBrandName("  Bebi   Born "), "Bebi Born");
   assert.equal(normalizeBrandName("   "), null);
-  assert.notEqual(normalizeBrandName("Bebi Born"), normalizeBrandName("Bebi Bornn"));
+});
+
+test("(regression 11) canonical brandKey merges case/whitespace variants but keeps punctuation-distinct brands separate", () => {
+  // Case + interior-whitespace variants map to ONE canonical key (same brand).
+  assert.equal(brandKey("Bebi Born"), "bebi born");
+  assert.equal(brandKey("  bebi   BORN "), "bebi born");
+  assert.equal(brandKey("BEBI BORN"), brandKey("Bebi Born"));
+  // Punctuation is PRESERVED -> punctuation-distinct brands are DIFFERENT (no fuzzy merge).
+  assert.notEqual(brandKey("Bebi-Born"), brandKey("Bebi Born"));
+  assert.notEqual(brandKey("Bebi Born"), brandKey("Bebi Bornn"));
+  // A stable human-readable display is preserved and is deterministic (lexicographically-smallest variant).
+  const merged = buildBrandAccountMembership([
+    { accountId: "a1", salesBrands: ["Bebi Born"] },
+    { accountId: "a2", salesBrands: ["bebi born"] },   // same brand, different case
+    { accountId: "a3", salesBrands: ["Bebi-Born"] },   // DIFFERENT brand (punctuation)
+  ]);
+  assert.deepEqual(accountsForBrand(merged, "BEBI  BORN"), ["a1", "a2"], "case/whitespace variants aggregate to ONE brand");
+  assert.deepEqual(accountsForBrand(merged, "Bebi-Born"), ["a3"], "the punctuation-distinct brand stays separate");
+  assert.equal(merged.get("bebi born").display, "Bebi Born", "stable display preserved (not lowercased)");
+});
+
+test("(regression 8) storage-authoritative + directory serialisation: brandAccounts is keyed by canonical key with a display map", () => {
+  const membership = buildBrandAccountMembership([
+    { accountId: "acct-DE", salesBrands: ["Bebi Born"] },
+    { accountId: "acct-IT", salesBrands: ["bebi born", "Nordfell"] },
+  ]);
+  const dir = serialiseBrandAccountMembership(membership, [{ key: "catalog only", display: "Catalog Only" }]);
+  assert.deepEqual(dir.brandAccounts["bebi born"], ["acct-DE", "acct-IT"], "canonical-key membership aggregates the case variant");
+  assert.deepEqual(dir.brandAccounts["catalog only"], [], "selector-only brand is selectable with an EMPTY account set");
+  assert.equal(dir.brandDisplay["bebi born"], "Bebi Born");
+  assert.ok(dir.brands.includes("Bebi Born") && dir.brands.includes("Catalog Only"), "the dropdown list carries display labels");
+});
+
+test("(regression 5/6) membership fingerprint flips iff the latest brand-sales identity changes", () => {
+  const base = [{ accountId: "a1", updatedAt: "2026-08-24T00:00:00Z" }, { accountId: "a2", updatedAt: "2026-08-24T00:00:00Z" }];
+  assert.equal(membershipFingerprint(base), membershipFingerprint([...base].reverse()), "order-independent (deterministic)");
+  const changed = [{ accountId: "a1", updatedAt: "2026-08-25T00:00:00Z" }, { accountId: "a2", updatedAt: "2026-08-24T00:00:00Z" }];
+  assert.notEqual(membershipFingerprint(base), membershipFingerprint(changed), "a new brand-sales publication flips the fingerprint");
+  const added = [...base, { accountId: "a3", updatedAt: "2026-08-24T00:00:00Z" }];
+  assert.notEqual(membershipFingerprint(base), membershipFingerprint(added), "an account gaining brand-sales flips the fingerprint");
 });
 
 test("REGRESSION: Bebi Born resolves to EXACTLY the 8 expected countries from brand-sales -- includes IT/ES/UK (sales, stale/absent catalog), EXCLUDES US (catalog-only, no sales)", () => {
@@ -1499,6 +1545,32 @@ test("REGRESSION: Bebi Born resolves to EXACTLY the 8 expected countries from br
   assert.deepEqual(countries, EXPECTED, "Bebi Born resolves to EXACTLY BE,DE,ES,FR,IT,NL,PL,UK");
   assert.ok(!bebiAccounts.includes("acct-US"), "US (catalog-only, no Bebi Born sales) is EXCLUDED");
   assert.ok(!bebiAccounts.includes("acct-ZZ"), "an account that never sold Bebi Born is not a member (no leakage)");
+});
+
+await asyncTest("(regression 8) storage-first hydration recovers an out-of-line brand-sales payload; usable inline is served without a wasted fetch", async () => {
+  const { getLatestReportSnapshotHydrated, inlinePayloadUsable } = await import("../lib/server/supabase.js");
+  // (a) inline null + a storage path -> hydrate; the recovered payload is usable so the account is NOT dropped.
+  let reads1 = 0;
+  const recovered = await getLatestReportSnapshotHydrated({ reportKey: "brand-sales", accountId: "acct-IT" }, {
+    readLatest: async () => ({ payload: null, payload_storage_path: "cache/it.json", updated_at: "t" }),
+    readStorage: async () => { reads1 += 1; return { catalogBrands: ["Bebi Born"], rows: [{ product_brand: "Bebi Born" }] }; },
+  });
+  assert.equal(reads1, 1, "out-of-line payload hydrated from storage");
+  assert.ok(inlinePayloadUsable(recovered.payload), "recovered payload is usable -> account NOT dropped");
+  // (b) an EMPTY inline stub also hydrates (never served as a dropout).
+  let reads2 = 0;
+  await getLatestReportSnapshotHydrated({ reportKey: "brand-sales", accountId: "acct-ES" }, {
+    readLatest: async () => ({ payload: { catalogBrands: [], rows: [] }, payload_storage_path: "cache/es.json" }),
+    readStorage: async () => { reads2 += 1; return { rows: [{ product_brand: "Bebi Born" }] }; },
+  });
+  assert.equal(reads2, 1, "an empty inline stub hydrates from storage");
+  // (c) a USABLE inline payload is authoritative -> NO storage read.
+  let reads3 = 0;
+  await getLatestReportSnapshotHydrated({ reportKey: "brand-sales", accountId: "acct-DE" }, {
+    readLatest: async () => ({ payload: { rows: [{ product_brand: "Bebi Born" }] }, payload_storage_path: "cache/de.json" }),
+    readStorage: async () => { reads3 += 1; return { rows: [] }; },
+  });
+  assert.equal(reads3, 0, "a usable inline payload is served without hydrating storage");
 });
 
 console.log(`\n${passed} assertions passed${process.exitCode ? " (with failures above)" : ""}`);

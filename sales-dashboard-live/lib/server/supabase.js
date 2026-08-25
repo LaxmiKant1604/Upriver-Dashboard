@@ -296,13 +296,53 @@ export async function getReportSnapshot({ reportKey, accountId, paramsHash }, { 
  */
 export async function getLatestReportSnapshot({ reportKey, accountId }) {
   const query = new URLSearchParams({
-    select: "id,report_key,account_id,params_hash,params,payload,payload_bytes,source_refreshed_at,updated_at",
+    select: "id,report_key,account_id,params_hash,params,payload,payload_storage_path,payload_bytes,source_refreshed_at,updated_at",
     report_key: `eq.${reportKey}`,
     account_id: `eq.${accountId}`,
     order: "updated_at.desc",
     limit: "1",
   });
   const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  return rows[0] || null;
+}
+
+// The most recent saved snapshot for a report+account, with its payload hydrated STORAGE-FIRST: when the row's
+// inline payload is out-of-line (stored in the source-cache bucket -> inline null/partial), the full payload is
+// fetched via its payload_storage_path. WITHOUT this, a large brand-sales snapshot (inline null) is invisible to
+// the live membership/portfolio path and its account is silently dropped -- the exact reason the offline rebuild
+// hydrates storage but the live read did not. `hasPayload` decides whether the inline payload is already usable.
+// An inline payload is "usable" for the membership/portfolio read only when it carries actual content -- a
+// NON-EMPTY rows or catalogBrands array. A null/partial stub (the shape a stored out-of-line snapshot leaves
+// inline) is NOT usable, so the full payload is hydrated from storage instead of the account being dropped.
+export function inlinePayloadUsable(p) {
+  return !!(p && ((Array.isArray(p.rows) && p.rows.length > 0) || (Array.isArray(p.catalogBrands) && p.catalogBrands.length > 0)));
+}
+export async function getLatestReportSnapshotHydrated(
+  { reportKey, accountId },
+  { hasPayload = inlinePayloadUsable, signal = null, readLatest = getLatestReportSnapshot, readStorage = getReportSnapshotStoragePayload } = {},
+) {
+  const row = await readLatest({ reportKey, accountId });
+  if (!row) return null;
+  if (hasPayload(row.payload) || !row.payload_storage_path) return row;
+  try {
+    const hydrated = await readStorage(row.payload_storage_path, { signal });
+    if (hydrated) return { ...row, payload: hydrated };
+  } catch (_e) { /* fall through to the inline (possibly partial) payload -- never throw a read into a dropout */ }
+  return row;
+}
+
+// Lightweight metadata (NO payload) for the most recent snapshot of a report+account: used to compute the
+// membership PROVENANCE fingerprint cheaply, so the directory self-heal decides whether to rebuild WITHOUT
+// hydrating every account's full brand-sales payload. Returns { updated_at, source_refreshed_at, params_hash } or null.
+export async function getLatestReportSnapshotMeta({ reportKey, accountId }, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "params_hash,source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`, { signal });
   return rows[0] || null;
 }
 
