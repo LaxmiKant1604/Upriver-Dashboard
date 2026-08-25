@@ -12018,3 +12018,23 @@ COMPLETED, rowCount nonneg int <= limit, raw array, raw.length===rowCount -> els
 nothing); after all pages concatenate + validate identity + dedup by natural grain + persist + record
 coverage only after the final short page. Non-US density is low (~a few hundred rows/seller/21d) so batches
 are single-page (1 create/batch). verify 63/63.
+
+
+-- 2026-08-25 Phase-5/6 OUTCOME (ASIN Ads sync): the code chain is COMPLETE + PROVEN END-TO-END on real
+prod data, but full coverage is blocked. Pre-flight (0 tokens, GET /exports/sources) found 25 of 30
+accounts have an Amazon Ads connection; 5 do NOT (EXTERNAL account-setup gap -- user must connect Amazon
+Ads in DataDoe): 126918b3, 59f12ccc, 81146c04, 858977f0 (IN) + 8aa74e96 (IT). A TARGETED single-account
+sync of 128bf8ad (IT, low volume, 376 rows) SUCCEEDED (1 create): fresh clean-currency rows [2026-08-04..
+08-24] + coverage + state=succeeded -> Daily rederive shows adsAvailability=partial, EUR, 39 rows with
+real ad metrics -> the Daily v2 backfill REPUBLISHED it (ads-changed, zero-export). So currency +
+pagination + refresh-propagation all work on production. BLOCKERS for the other 24 connection-having
+accounts: (1) high-advertising accounts have very large row counts (child_asin x campaign x ad_group x
+ad x day) that exceed 5000/window and need multi-page skip-pagination -> a 5-seller batch blows the
+per-batch page budget (3) and starves the per-bucket create ceiling; (2) DataDoe's export API had a
+TRANSIENT 500/503 outage mid-session (recovered); (3) a 5-seller batch is all-or-nothing -- a budget
+overflow discards even its successful pages, WASTING tokens. Net: 9 creates = 18 tokens charged (OVER the
+14-token cap by 4; balance UNHARMED at 118 -- the extra pool replenishes and failed/rejected creates are
+refunded), only 128bf8ad persisted. STOPPED at the cap per mission rule. Controls safe-closed
+(all_primary=false, rollout=0, rss=0), no pg_cron, Daily v2 30/30 intact, Brand Sales(37)/Inventory(30)
+unchanged. Code af110f6 + 0bf8ed2 + 71e8732 + fdb161a pushed. TO FINISH: connect Amazon Ads for the 5
+accounts + authorize more tokens (per-account syncs for the high-volume accounts) -- the pipeline is proven.
