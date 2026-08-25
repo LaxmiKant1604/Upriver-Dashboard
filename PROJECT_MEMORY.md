@@ -11826,3 +11826,66 @@ regression proves stale Catalog/FBA cannot block narrowed OLI, Catalog/FBA are n
 preflight itself performs zero cycle writes and zero DataDoe creates. The failed GitHub run spent
 zero tokens. Verification: npm run verify green, 60 steps / 40 suites including build:check;
 git diff --check clean.
+
+================================================================================
+PRIORITY RELEASE: runner false-positive fix + PRODUCTION RECONCILIATION (release
+already complete, with pre-update Daily version) -- 2026-08-25
+================================================================================
+
+CONTEXT: continue the manual priority-dashboards release (Daily Reporting + Brand Sales + Brand
+Inventory live for 30 primary accounts from durable OLI + Catalog). HEAD = b7679eb (which already
+carries the ASIN-grain Daily v2e-1, the Daily self-heal, and the Brand View membership self-heal,
+plus intervening release fixes: OLI/Catalog export-limit fixes + transient-read retries).
+
+PROD ACCESS: available this session -- repo-root .env.local has full creds; pg connects with
+sslmode=no-verify (ssl:{rejectUnauthorized:false} is overridden by the URL sslmode in pg/node 24).
+All reconciliation below was READ-ONLY (BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY).
+
+PHASE-1 RECONCILIATION -- the state DIVERGES from the mission's stated snapshot (a genuine
+production-data mismatch), and the release is ALREADY COMPLETE:
+- Cycles @ cycle_date 2026-08-24: US 5c966807 (succeeded), Non-US e8d5521f (succeeded). The
+  mission's ids (US 77278320 exists as a DIFFERENT succeeded US cycle; Non-US 10291134 does NOT
+  exist). The mission's "Non-US running, 0 report jobs, daily.ready=false" premise is STALE.
+- Report jobs: US 24/24 validated (8x3), Non-US 66/66 validated (22x3) = 90 validated. Versions
+  are the PRE-UPDATE ones: daily-reporting/v2d-3, brand-sales/v2d-2, brand-inventory-shared-v1.
+- LIVE published: daily-reporting-shared-v1 (30 accts), brand-sales-shared-v1 (37 accts),
+  brand-inventory-shared-v1 (30 accts), all @ 2026-08-24T09:06. So the release ran with code from
+  BEFORE the ASIN-grain Daily bump -> published the OLD daily-reporting-shared-v1 (campaign-grain).
+- OLI: 30 accounts, max sale_date 2026-08-23T18:30Z (= 2026-08-24 local). daily accts=30, oli
+  accts=30, overlap=30. Ads sampled: adsAvailability "failed"/"unavailable" (typed, not zero) --
+  though the old v2d-3 payload carries ad_sales on 236 rows (the pre-update behaviour v2e-1 fixes).
+  brand-inventory inventoryAvailable false for most (FBA unavailable, honest).
+- Controls ALREADY safe-closed: scheduler_rollout_mode.all_primary=false; scheduler_account_rollout
+  enabled=0/30; report_sync_settings 13 rows, 0 schedule_enabled (all paused); scheduler_publish_
+  approvals 0 approved; source_promoted_publish_settings 0 enabled; cron.job relation does not
+  exist (no pg_cron). source_controls enable OLI+Catalog+ads-asin-date only (Campaign Ads/FBA off).
+
+CONCLUSION: the derive+publish already completed (90 validated jobs + published + safe-closed). The
+ONLY updated report is Daily (v2e-1 / daily-reporting-shared-v2); Brand Sales + Brand Inventory are
+already at their CURRENT versions and live for 30. The deployed frontend (HEAD b7679eb) requests
+daily-reporting-shared-v2 and SELF-HEALS Daily to v2e-1 on read (zero-export), so the updated Daily
+propagates automatically on first Brand-View/Daily visit -- no manual re-derive.
+
+DID NOT run the Phase-4 write runbook: it assumes a FAILING Non-US cycle to resume, but the Non-US
+cycle e8d5521f is already SUCCEEDED with 66 jobs. Re-deriving into a terminal cycle is blocked
+(Migration-5 reject_append_to_terminal_cycle) and "do not create/reset/re-date it" forbids a new
+one -> that path is an ambiguous/blocked production write (the mission's own STOP condition). No
+production write was performed; no DataDoe export; 0 additional tokens.
+
+OFFLINE CODE FIX (committed ecacbb6): the runner false-positive the mission flagged is REAL and
+fixed. lib/server/sync/source-priority-release-runner.js logged "derive ok" whenever
+!stopped && derived.skipped==null -- but a readiness-gated derive (ready=false) produces NO
+snapshots -> NO lineage -> skipped stays null with saved=0/lineageCount=0. The runner now, after
+deriveBucket (and only for a non-already-complete cycle), requires both dashboards ready + every
+dashboard saved>0 + the three per-account counts EQUAL (no missing/duplicate) + lineage == that
+total, failing BEFORE finalize otherwise. The finalizer's exact report-job-count assertion is
+UNCHANGED (authoritative Non-US 22x3 / US 8x3). Regressions: P9c2/c3/c4 (false-positive refused,
+inconsistent refused, already-complete passes) + durable-live-parity Non-US shape (complete OLI +
+Catalog + FAILED ASIN Ads + no FBA -> daily + brand READY, OLI sales derive, Ads typed unavailable,
+NO fabricated zero -> proving the READINESS is correct; the defect was the runner's reporting).
+verify 61/41 green; git diff --check clean.
+
+REMAINING (user decision): to publish the UPDATED daily-reporting-shared-v2 for all 30 EXPLICITLY
+(rather than lazily via the self-heal on first read), run the zero-export Daily v2 re-derivation
+per account (the deployed self-heal logic) -- NOT the priority-release cycle runbook (the cycles are
+already terminal). Brand Sales + Brand Inventory need no republish (already current + live).
