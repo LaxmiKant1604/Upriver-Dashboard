@@ -12,6 +12,38 @@ const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // it is accepted by every REST/Storage endpoint used by the server snapshot
 // layer, while keeping the newer key as a compatible fallback.
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
+const READ_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500]);
+const READ_RETRY_STATUSES = new Set([500, 502, 503, 504]);
+
+function waitForReadRetry(ms, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason || new Error("Supabase read aborted."));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason || new Error("Supabase read aborted."));
+    }, { once: true });
+  });
+}
+
+// PostgREST occasionally resets a long paginated read or returns a brief 5xx. Retrying an idempotent GET at
+// the failed page is safe and avoids restarting a 143-page OLI history proof. Mutating requests never use this
+// helper and therefore retain strict single-attempt / commit-unknown semantics.
+async function fetchReadOnly(url, options = {}, attempt = 0) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    if (options.signal?.aborted || attempt >= READ_RETRY_DELAYS_MS.length) throw error;
+    await waitForReadRetry(READ_RETRY_DELAYS_MS[attempt], options.signal);
+    return fetchReadOnly(url, options, attempt + 1);
+  }
+  if (READ_RETRY_STATUSES.has(response.status) && attempt < READ_RETRY_DELAYS_MS.length) {
+    await waitForReadRetry(READ_RETRY_DELAYS_MS[attempt], options.signal);
+    return fetchReadOnly(url, options, attempt + 1);
+  }
+  return response;
+}
 
 export function isSupabaseConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
@@ -38,7 +70,7 @@ async function request(path, { method = "GET", body, headers = {}, signal = null
   // Round-6 fix 4: an optional route-owned AbortSignal reaches the REAL HTTP layer, so a bounded route can
   // genuinely abort an in-flight PostgREST request instead of merely abandoning its promise. Callers that
   // pass no signal are byte-identical to before.
-  const response = await fetch(`${SUPABASE_URL}${path}`, {
+  const fetchOptions = {
     method,
     headers: {
       apikey: SUPABASE_SECRET_KEY,
@@ -48,7 +80,10 @@ async function request(path, { method = "GET", body, headers = {}, signal = null
     },
     body: body === undefined ? undefined : JSON.stringify(body),
     ...(signal ? { signal } : {}),
-  });
+  };
+  const response = method === "GET"
+    ? await fetchReadOnly(`${SUPABASE_URL}${path}`, fetchOptions)
+    : await fetch(`${SUPABASE_URL}${path}`, fetchOptions);
   const result = await response.json().catch(() => null);
   if (!response.ok) {
     // Attach SAFE structured error info: the HTTP status and the PostgREST/Postgres error code only
@@ -73,7 +108,7 @@ function storageObjectUrl(bucket, objectPath) {
 
 async function putPrivateStorageObject(bucket, objectPath, contents, contentType = "application/json", { signal = null } = {}) {
   requireConfiguration();
-  const response = await fetch(storageObjectUrl(bucket, objectPath), {
+  const response = await fetchReadOnly(storageObjectUrl(bucket, objectPath), {
     method: "POST",
     headers: {
       apikey: SUPABASE_SECRET_KEY,

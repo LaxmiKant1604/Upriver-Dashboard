@@ -39,6 +39,7 @@
     "test:report-sync-controls": "node scripts/report-sync-controls.test.mjs",
     "test:gate5-canary-package": "node scripts/gate5-canary-package.test.js",
     "test:datadoe-poll-export": "node scripts/datadoe-poll-export.test.js",
+    "test:supabase-read-retry": "node scripts/supabase-read-retry.test.js",
     "test:source-download-recovery": "node scripts/source-download-recovery.test.js",
     "test:manual-source-continuation": "node scripts/manual-source-continuation.test.js",
     "test:cycle-lifecycle": "node scripts/cycle-lifecycle.test.js",
