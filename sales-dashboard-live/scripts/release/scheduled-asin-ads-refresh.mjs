@@ -82,9 +82,14 @@ const win = asinAdsRefreshWindow(asOfStr);
 log(syncAccounts.length + " Ads-compatible accounts -> " + batches.length + " batches; window [" + win.from + ".." + win.to + "] (21d); create ceiling " + plan.maxCreates + " (=" + plan.expectedBatches + " batches + " + plan.pageAllowance + " pagination) / " + plan.maxTokens + " tokens");
 
 // (2) A guarded, counting createExport: enforce the per-BUCKET create ceiling BEFORE any create; count real POSTs.
+// --max-creates HARD-CAPS the creates this run (never above the plan ceiling) so a fixed operation-wide token
+// budget spanning multiple bucket runs cannot be exceeded.
+const maxCreatesArg = argOf("max-creates");
+const hardCeiling = maxCreatesArg != null ? Math.min(plan.maxCreates, Math.max(0, Math.trunc(Number(maxCreatesArg)))) : plan.maxCreates;
+if (maxCreatesArg != null) log("hard create cap this run: " + hardCeiling + " (--max-creates)");
 let creates = 0;
 const guardedCreate = async (...args) => {
-  if (creates >= plan.maxCreates) { const e = new Error("ASIN_ADS_CREATE_CEILING_EXCEEDED: refusing create " + (creates + 1) + " > ceiling " + plan.maxCreates); e.code = "ASIN_ADS_CEILING"; throw e; }
+  if (creates >= hardCeiling) { const e = new Error("ASIN_ADS_CREATE_CEILING_EXCEEDED: refusing create " + (creates + 1) + " > ceiling " + hardCeiling); e.code = "ASIN_ADS_CEILING"; throw e; }
   creates += 1;
   return PRODUCTION_ADS_SYNC_DEPS.createExport(...args);
 };
