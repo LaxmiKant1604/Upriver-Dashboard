@@ -1209,8 +1209,13 @@ export function resolveDailyAdsAvailability(coverage, planned) {
   if (syncStatus !== "succeeded") return fail("unavailable", "ads-not-synced");
 
   // Every returned row must be in scope + one authoritative currency. One bad row means the Ads DATA
-  // is untrustworthy => Ads failed (not merged), but sales still save.
+  // is untrustworthy => Ads failed (not merged), but sales still save. EXCEPTION: Ads coverage may be a
+  // SUPERSET of the sales window (the durable Ads window can end later than an account's proven OLI date), so a
+  // WELL-FORMED ad row dated OUTSIDE [requestedFrom, requestedTo] is legitimately IGNORED (it is never merged onto
+  // a non-existent sales date) -- NOT a contamination failure. Malformed dates + cross-account/currency rows
+  // still fail closed.
   for (const row of adRows) {
+    if (isValidCalendarDate(row.date) && (row.date < requestedFrom || row.date > requestedTo)) continue;
     const blocked = adRowBlockStatus(row, { from: requestedFrom, to: requestedTo, rawSellerId: plannedRawSellerId, currency: accountCurrency });
     if (blocked) return fail("failed", blocked);
   }

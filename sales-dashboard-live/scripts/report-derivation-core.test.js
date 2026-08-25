@@ -1228,6 +1228,19 @@ test("B2 unit: operational failures (sync-failed / read-failed / limit / scope /
   assert.deepEqual(avail({ syncStatus: "failed" }).adRows, [], "failed Ads merges no rows");
 });
 
+test("B2 unit: Ads may be a SUPERSET -- a well-formed row dated OUTSIDE the sales window is ignored, not a failure", async () => {
+  // The durable Ads window can end LATER than an account's proven sales window (e.g. OLI proven to 08-22 but Ads
+  // fetched through 08-24). A well-formed ad row past the requested `to` is DROPPED (never merged onto a
+  // non-existent sales date), NOT a wrong-window failure. In-window rows still merge and the status stays usable.
+  const superset = resolveDailyAdsAvailability(adsCoverage({ adRows: [...DR_ADS, { date: "2025-07-01", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 9, ad_spend: 3, ad_clicks: 2 }] }), planCov);
+  assert.equal(superset.availability.status, "validated", "an out-of-window superset row does NOT fail the account");
+  assert.equal(superset.adRows.length, DR_ADS.length, "the out-of-window row is dropped, not merged");
+  assert.ok(!superset.adRows.some((r) => r.date > DR_TO), "no row past the sales window is merged");
+  // Superset tolerance NEVER masks corrupt/contaminated data: a malformed-date or cross-account IN-window row fails.
+  assert.equal(resolveDailyAdsAvailability(adsCoverage({ adRows: [{ date: "not-a-date", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 1 }] }), planCov).availability.status, "failed", "malformed-date row still fails closed");
+  assert.equal(resolveDailyAdsAvailability(adsCoverage({ adRows: [{ date: "2025-05-02", seller_or_vendor_id: "OTHER", currency: "USD", ad_sales: 1 }] }), planCov).availability.reason, "ads-row-cross-account", "an in-window cross-account row still fails closed");
+});
+
 test("B2 e2e: an unavailable/stale Ads state still SAVES the sales snapshot with explicit availability", async () => {
   for (const c of [
     { over: { syncStatus: "missing" }, status: "unavailable" },
@@ -1396,12 +1409,14 @@ test("F1 e2e: a duplicated-January source set BLOCKS the sku-pl snapshot (zero w
 
 group("blocker 3/4: Daily Ads rows validated against account + window + currency");
 
-test("F2 unit: cross-account / out-of-window / bad-date / missing-seller / non-finite / bad-currency rows => failed", async () => {
+test("F2 unit: cross-account / bad-date / missing-seller / non-finite / bad-currency rows => failed (out-of-window is a dropped superset)", async () => {
   const row = (over) => ({ date: "2025-05-10", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 1, ad_spend: 1, ad_clicks: 1, ...over });
   const status = (rows) => resolveDailyAdsAvailability(adsCoverage({ adRows: rows }), planCov).availability;
   assert.equal(status([row({ seller_or_vendor_id: "S2" })]).reason, "ads-row-cross-account", "account B row inside A blocks");
-  assert.equal(status([row({ date: "2025-04-30" })]).reason, "ads-row-out-of-window", "row before planned.from blocks");
-  assert.equal(status([row({ date: "2025-07-01" })]).reason, "ads-row-out-of-window", "row after planned.to blocks");
+  // A WELL-FORMED out-of-window row (before planned.from or after planned.to) is a legitimate Ads SUPERSET -> it is
+  // DROPPED (never merged), NOT a failure. Only IN-window rows are scope/currency-validated.
+  assert.equal(status([row({ date: "2025-04-30" })]).status, "validated", "a row before planned.from is dropped (superset), not a failure");
+  assert.equal(status([row({ date: "2025-07-01" })]).status, "validated", "a row after planned.to is dropped (superset), not a failure");
   assert.equal(status([row({ date: "2025-02-30" })]).reason, "ads-row-bad-date", "impossible date blocks");
   assert.equal(status([row({ seller_or_vendor_id: undefined })]).reason, "ads-row-cross-account", "missing seller id blocks");
   assert.equal(status([row({ ad_spend: NaN })]).reason, "ads-row-non-finite-metric", "NaN metric blocks");
@@ -1437,10 +1452,10 @@ test("F2 unit: a missing planned rawSellerId or account currency degrades to fai
   assert.equal(resolveDailyAdsAvailability(adsCoverage({ rawSellerId: "OTHER" }), planCov).availability.reason, "ads-raw-seller-mismatch");
 });
 
-test("F2 e2e: a cross-account / out-of-window Ads row => Ads FAILED but sales still save (never zero)", async () => {
+test("F2 e2e: a cross-account (contaminated) Ads row => Ads FAILED but sales still save (never zero)", async () => {
   const badSets = [
-    [{ date: "2025-05-01", seller_or_vendor_id: "S2", currency: "USD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // account B leaked into A
-    [{ date: "2025-04-01", seller_or_vendor_id: "S1", currency: "USD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // before the planned window
+    [{ date: "2025-05-01", seller_or_vendor_id: "S2", currency: "USD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // account B leaked into A (genuine contamination)
+    [{ date: "2025-05-01", seller_or_vendor_id: "S1", currency: "CAD", ad_sales: 5, ad_spend: 5, ad_clicks: 5 }], // wrong currency in-window (genuine contamination)
   ];
   for (const badRows of badSets) {
     const { store, loader, plannedReports } = seedDailyCycle();
