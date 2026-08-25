@@ -18,6 +18,21 @@ import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 // aggregations so persist + read agree, and a blank ASIN currency is never stored as "" (which downstream would
 // fail closed as ads-currency-missing).
 import { resolveAdRowCurrency } from "./reports/asin-ads-aggregation.js";
+import { marketplaceProfile } from "../marketplaces.js";
+
+// Two marketplace codes identify the SAME marketplace when they are equal, or when both are CONFIGURED
+// marketplaces resolving to the same country -- Amazon returns the ISO "GB" for the UK while the account
+// directory carries "UK", so an exact-match on the raw codes would wrongly reject every UK account's rows. Two
+// UNKNOWN codes never match (both fall back to the generic profile), so cross-marketplace contamination is still
+// caught. Pure.
+export function sameMarketplace(rowMarketplace, accountCountry) {
+  const a = String(rowMarketplace || "").trim().toUpperCase();
+  const b = String(accountCountry || "").trim().toUpperCase();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const pa = marketplaceProfile(a), pb = marketplaceProfile(b);
+  return pa.countryName !== "Marketplace" && pa.countryName === pb.countryName;
+}
 
 const BASE = "https://api.datadoe.com/api/v1";
 // DataDoe's PROVEN maximum export `limit` is 5000 -- a create-export with a larger limit is rejected outright
@@ -463,8 +478,9 @@ function validateExportBatchRows(source, rows, batch, connection) {
     if (!account.connection || account.connection.id !== connection.id) return { ok: false, reason: "connection-mismatch" };
     if (publicAccountId(account.connection, sellerId) !== account.id) return { ok: false, reason: "public-account-mismatch" };
     if (hasMarketplace) {
-      const marketplace = String(row.marketplace_country_code || "").trim().toUpperCase();
-      if (marketplace !== String(account.country || "").trim().toUpperCase()) return { ok: false, reason: "wrong-marketplace" };
+      // A row's marketplace must identify the SAME marketplace as the discovered account's country (UK<->GB
+      // aliasing included). An unrelated marketplace is still rejected as cross-account contamination.
+      if (!sameMarketplace(row.marketplace_country_code, account.country)) return { ok: false, reason: "wrong-marketplace" };
     }
   }
   return { ok: true, reason: null };

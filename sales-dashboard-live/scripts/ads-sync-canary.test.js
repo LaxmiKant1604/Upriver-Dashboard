@@ -30,7 +30,7 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, buildAdsExportRequestBody;
+let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, buildAdsExportRequestBody, sameMarketplace;
 let MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan;
 let evaluateSourceCoverage;
 
@@ -177,6 +177,17 @@ test("ASIN Ads request is the REDUCED account/date/ASIN grain aggregated server-
   assert.equal(body.limit, EXPORT_LIMIT); assert.ok(body.limit <= 5000, "limit never exceeds 5000");
   assert.equal(body.skip, 0);
   assert.equal(buildAdsExportRequestBody(asin, ["s1"], "2026-08-04", "2026-08-24", 5000).skip, 5000, "only skip changes between pages");
+});
+
+test("sameMarketplace: UK<->GB alias accepted; unrelated marketplaces + two unknowns rejected (contamination safe)", () => {
+  assert.equal(sameMarketplace("IT", "IT"), true, "exact match");
+  assert.equal(sameMarketplace("GB", "UK"), true, "Amazon GB == directory UK");
+  assert.equal(sameMarketplace("UK", "GB"), true, "symmetric");
+  assert.equal(sameMarketplace("us", "US"), true, "case-insensitive");
+  assert.equal(sameMarketplace("IN", "US"), false, "India != United States (cross-account contamination rejected)");
+  assert.equal(sameMarketplace("GB", "DE"), false, "GB != DE");
+  assert.equal(sameMarketplace("ZZ", "YY"), false, "two UNKNOWN codes never match");
+  assert.equal(sameMarketplace("", "US"), false, "blank never matches");
 });
 
 test("the Campaign/PPC source contract is UNCHANGED: raw dimensions+metrics columns, no groupBy/aggregations", () => {
@@ -798,7 +809,7 @@ test("resolveAdsAccountAllowlist: targets exactly the two Gate-6 accounts; fail-
 /* ============================= run ============================= */
 
 async function main() {
-  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT, buildAdsExportRequestBody } = await import("../lib/server/ads-sync.js"));
+  ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT, buildAdsExportRequestBody, sameMarketplace } = await import("../lib/server/ads-sync.js"));
   ({ evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
   // A single cap-sized result (>= EXPORT_LIMIT rows) reused to force a row-cap split in the ceiling tests.
   CAP = Array.from({ length: EXPORT_LIMIT }, () => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" }));
