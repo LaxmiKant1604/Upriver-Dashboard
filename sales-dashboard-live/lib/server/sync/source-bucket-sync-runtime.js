@@ -677,6 +677,26 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const store = makeSourceStore({ deadline: dl });
     const dataDoe = makeAdapter(connections);
 
+    // TERMINAL-CYCLE IDEMPOTENCE (ordinary path only): the day's cycle being terminal means the day's operation
+    // already completed -- the reviewed RPCs refuse to append/alter child work on it, so re-running the sync
+    // MUST short-circuit typed (refused:false, no continuation => the caller proceeds to its release/read-back
+    // phase) instead of crashing mid-derive on the RPC refusal. The priority release engine keeps its own
+    // already-terminal handling (deriveBucket short-circuit + finalize re-proof) and never takes this branch.
+    // The by-date read is an OPTIONAL store capability (the production store provides it; a double without it
+    // skips the pre-check and keeps its legacy behavior byte-identical).
+    if (!priority && typeof store.getCycleByBucketDate === "function") {
+      try {
+        const existing = await dl.bound("cycle-terminal-precheck", (signal) => store.getCycleByBucketDate(bucket, cycleDate || todayStr, { signal }));
+        if (existing && existing.id && existing.status && existing.status !== "running") {
+          return {
+            bucket, cycleId: existing.id, cycleStatus: existing.status,
+            alreadyTerminal: true, skipped: "cycle-terminal",
+            globalDrained: true, continuationRequired: false, accounts: accounts.length,
+          };
+        }
+      } catch (e) { return catchDeadline(e); }
+    }
+
     // Round-5 blocker 3 + round-6 fixes 2/4: when running on a memoized preflight, the sync's OWN durable
     // products are folded into the in-memory evidence -- but ONLY the CAS-AUTHORITATIVE side (the winner on
     // stale-save, the candidate only when it replaced or was proven identical), ONLY after a CONFIRMED

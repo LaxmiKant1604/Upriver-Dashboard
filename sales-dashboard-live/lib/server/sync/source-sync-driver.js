@@ -12,7 +12,7 @@
 import { createExport, pollExport, downloadExport } from "../datadoe.js";
 import { organizationFingerprint, sourceJobOwnerId, accountScopeHash } from "../source-identity.js";
 import {
-  openSyncCycle, claimSyncCycle, getSyncCycle, updateSyncCycleCounts, finalizeSyncCycle,
+  openSyncCycle, claimSyncCycle, getSyncCycle, getSyncCycleByBucketDate, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, getSyncSourceJobsWithMeta, claimSourceExportAttempt, adoptSourceExportCache,
   claimSourceExportRecovery,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
@@ -252,6 +252,9 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     openCycle: (args) => w("open-cycle", true, (signal) => openSyncCycle(args, { signal })),
     claimCycle: (cycleId) => w("claim-cycle", true, (signal) => claimSyncCycle(cycleId, { signal })),
     getCycle: (cycleId, opts) => r("get-cycle", (signal) => getSyncCycle(cycleId, { signal, ...(opts || {}) })),
+    // OPTIONAL capability (terminal-cycle idempotence pre-check): the (bucket, cycle_date) cycle WITHOUT opening
+    // one -- fails closed (throws) on an ambiguous multi-row day. Doubles without it skip the pre-check.
+    getCycleByBucketDate: (bucket, cycleDate) => r("get-cycle-by-date", (signal) => getSyncCycleByBucketDate(bucket, cycleDate, { signal })),
     upsertSourceJob: (job) => w("upsert-source-job", true, (signal) => upsertSyncSourceJob(job, { signal })),
     listSourceJobs: (cycleId) => r("list-source-jobs", (signal) => getSyncSourceJobs(cycleId, { signal })),
     // Trusted OLI recovery operator only: the source jobs WITH request_meta (window) for exact target verification.

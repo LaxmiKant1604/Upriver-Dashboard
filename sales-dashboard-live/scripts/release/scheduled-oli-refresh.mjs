@@ -31,6 +31,7 @@ const { assessScheduledOliCycle, classifyScheduledOliCycle, assessDurableOliCove
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
+const { runCycleCreateReconcile } = await import("../../lib/server/sync/source-create-reconcile-driver.js");
 
 const OLI = OLI_SOURCE_KEY;
 // A LONG operator deadline for the CI job (the workflow allots >=90 min); overridable for tests/ops. MAX_ITERS is
@@ -119,6 +120,23 @@ while (iter < MAX_ITERS) {
   stall = open >= prevOpen ? stall + 1 : 0;
   prevOpen = open;
   if (stall >= 2) { log("no progress for 2 consecutive resumptions; stopping"); break; }
+}
+
+// Network failure class 4 (ambiguous create): a typed create-stage failure whose create may have LANDED at
+// DataDoe is NEVER blindly re-created by the engine -- reconcile ONCE against the real exports list and adopt
+// only an exactly-one exact-identity COMPLETED export (download-only recovery, ZERO new creates). A recovered
+// job becomes a plain succeeded job; anything unrecovered still fails the assessment honestly below.
+try {
+  const rr = await runCycleCreateReconcile({ preflight, bucket, deadline, log });
+  if (rr.ran === true && rr.recovered > 0) {
+    // The recovery may have been the LAST outstanding work -- resume the family once more (bounded) so any
+    // remaining open jobs drain before the final proof.
+    if (oliOpenCount(await getSyncSourceJobs(cycleId)) > 0 && !outOfTime()) {
+      await runtime.runSourceCardAction({ bucket, sourceKey: OLI, deadline, preflight });
+    }
+  }
+} catch (e) {
+  log("create-reconcile skipped on error (the assessment below stays authoritative): " + (e && e.message ? e.message : e));
 }
 
 const jobs = await getSyncSourceJobs(cycleId);

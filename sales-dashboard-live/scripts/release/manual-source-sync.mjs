@@ -55,15 +55,22 @@ if (request.sourceKey === "ads-asin-date") {
   }
 } else {
   // OLI / Catalog through the bucket source runtime (single-family drain; other families untouched).
+  const { runCycleCreateReconcile } = await import("../../lib/server/sync/source-create-reconcile-driver.js");
   const runtime = buildBucketSourceSyncRuntime({ budgetMs: BUDGET_MS, asOfOverride: request.asOf });
   const deadline = runtime.makeDeadline();
   const preflight = await runtime.preflightEvidence({ bucket: request.bucket, sourceKey: request.sourceKey, deadline });
   const isOpen = (j) => { const st = j.fetch_status ?? j.fetchStatus; return st === "pending" || st === "attempted"; };
   const isFailedResumable = (j) => (j.fetch_status ?? j.fetchStatus) === "failed" && j.terminal !== true;
-  let cycleId = null; let prevOutstanding = Infinity; let stall = 0;
+  let cycleId = null; let prevOutstanding = Infinity; let stall = 0; let reconcileTried = false;
   for (let iter = 1; iter <= 200; iter += 1) {
     const res = await runtime.runSourceCardAction({ bucket: request.bucket, sourceKey: request.sourceKey, deadline, preflight });
     if (res && res.refused === true) { console.error("STOP source action refused: " + (res.code || "unknown")); process.exit(1); }
+    if (res && res.alreadyTerminal === true) {
+      // The day's cycle already completed (terminal) -- nothing may be appended to it. The release stage below
+      // independently re-proves the durable evidence and publishes/reads back idempotently.
+      log("cycle " + String(res.cycleId).slice(0, 8) + " is already terminal (" + res.cycleStatus + ") -> the day's source sync is complete; proceeding to release");
+      break;
+    }
     cycleId = (res && res.cycleId) || cycleId;
     if (!cycleId) { log("nothing to sync (no cycle opened: zero missing work)"); break; }
     const jobs = await getSyncSourceJobs(cycleId);
@@ -78,7 +85,17 @@ if (request.sourceKey === "ads-asin-date") {
     if (outstanding === 0) break;
     if (outOfTime()) { console.error("STOP operator budget exhausted with open=" + open + " failed=" + failed); process.exit(1); }
     stall = outstanding >= prevOutstanding ? stall + 1 : 0; prevOutstanding = outstanding;
-    if (stall >= 2) { console.error("STOP no progress for 2 consecutive resumptions (open=" + open + " failed=" + failed + ") -- transient source failures persisted; LKG intact, re-run later."); process.exit(1); }
+    if (stall >= 2) {
+      // Network failure class 4: an AMBIGUOUS create (typed create-stage failure whose create may have LANDED)
+      // is never blindly retried by the engine -- reconcile ONCE against the real exports list and adopt only an
+      // exact identity (zero new creates), then keep draining. Anything else is an honest stop.
+      if (!reconcileTried && failed > 0) {
+        reconcileTried = true;
+        const rr = await runCycleCreateReconcile({ preflight, bucket: request.bucket, deadline, log });
+        if (rr.ran === true && rr.recovered > 0) { stall = 0; prevOutstanding = Infinity; continue; }
+      }
+      console.error("STOP no progress for 2 consecutive resumptions (open=" + open + " failed=" + failed + ") -- transient source failures persisted; LKG intact, re-run later."); process.exit(1);
+    }
   }
   log("source sync drained (every family job succeeded)");
 }
