@@ -33,7 +33,7 @@ const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/sou
 const { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } = await import("../../lib/server/sync/source-batching.js");
 const { oliDimensionalRowsFromFragment, oliBackfillWindow } = await import("../../lib/server/sync/source-durable-model.js");
 const { fetchExportRows } = await import("../../lib/server/datadoe.js");
-const { replaceOliDimensionalWindow, getDataDoeTokenBalance } = await import("../../lib/server/supabase.js").then(async (sb) => ({ replaceOliDimensionalWindow: sb.replaceOliDimensionalWindow, getDataDoeTokenBalance: (await import("../../lib/server/datadoe-usage.js")).getDataDoeTokenBalance }));
+const { getDataDoeTokenBalance } = await import("../../lib/server/datadoe-usage.js");
 const { addDaysStr } = await import("../../lib/server/date-windows.js");
 const { OLI_SALES_COLUMNS } = await import("../../lib/server/sync/report-source-contracts.js");
 const pgMod = (await import("pg")).default;
@@ -110,15 +110,25 @@ for (const batch of batches) {
     created += 1;
     if (rows.length >= ROW_CAP) { console.error("STOP TRUNCATED: [" + w.from + ".." + w.to + "] returned " + rows.length + " rows at the cap -- narrow --window-days and re-run (never a partial save)."); process.exit(1); }
     const hash = "oli-dim-replace:" + w.from + ".." + w.to; // a stable provenance hash for these direct rows
-    const { byAccount, rollupByAccount, blocked } = oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint: orgFp, connectionId: "primary", sourceRequestHash: hash });
+    const { byAccount, blocked } = oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint: orgFp, connectionId: "primary", sourceRequestHash: hash });
     for (const b of blocked) blockedAll.push({ ...b, from: w.from, to: w.to });
     const blockedSet = new Set(blocked.map((b) => b.accountId));
     for (const a of batch.accounts) {
       if (blockedSet.has(a.accountId)) continue;
-      const out = await replaceOliDimensionalWindow({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, coveredFrom: w.from, coveredTo: w.to, rows: byAccount.get(a.accountId) || [], rollupRows: rollupByAccount.get(a.accountId) || [], sourceRefreshedAt: new Date().toISOString() });
-      if (out && (out.write === "value-missing" || out.write === "status-missing")) { blockedAll.push({ accountId: a.accountId, code: out.error, from: w.from, to: w.to }); continue; }
-      if (!out || out.write !== "ok") { console.error("STOP persist failed for account " + a.accountId.slice(0, 8) + " [" + w.from + ".." + w.to + "]: " + (out && out.error)); process.exit(1); }
-      persisted += 1;
+      // Persist via DIRECT pg (the RPC), not the PostgREST wrapper: a busy account's dimensional window is
+      // multi-MB of rows and exceeds PostgREST's request-body limit; direct pg handles it (the RPC itself is
+      // identical). The RPC folds the non-cancelled rollup internally, so no rollupRows are threaded here.
+      const dimRows = byAccount.get(a.accountId) || [];
+      const pRows = dimRows.map((r) => ({ seller_or_vendor_id: r.seller_or_vendor_id, sale_date: r.sale_date, sku: r.sku, child_asin: r.child_asin, currency: r.currency, amazon_order_status: r.amazon_order_status, fulfillment_channel: r.fulfillment_channel, address_state: r.address_state, address_city: r.address_city, total_sales_sum: r.total_sales_sum, total_units_sum: r.total_units_sum, source_request_hash: r.source_request_hash }));
+      try {
+        await skipClient.query("select public.replace_oli_dimensional_window($1,$2,$3,$4,$5,$6::jsonb,now())", [orgFp, "primary", a.accountId, w.from, w.to, JSON.stringify(pRows)]);
+        persisted += 1;
+      } catch (e) {
+        const msg = String(e && e.message ? e.message : e);
+        if (msg.includes("OLI_NON_CANCELLED_VALUE_MISSING")) { blockedAll.push({ accountId: a.accountId, code: "OLI_NON_CANCELLED_VALUE_MISSING", from: w.from, to: w.to }); continue; }
+        if (msg.includes("OLI_ORDER_STATUS_MISSING")) { blockedAll.push({ accountId: a.accountId, code: "OLI_ORDER_STATUS_MISSING", from: w.from, to: w.to }); continue; }
+        console.error("STOP persist failed for account " + a.accountId.slice(0, 8) + " [" + w.from + ".." + w.to + "]: " + msg.slice(0, 160)); await skipClient.end().catch(() => {}); process.exit(1);
+      }
     }
   }
   log("batch [" + sellerIds.length + " sellers] done: " + windows.length + " windows");
