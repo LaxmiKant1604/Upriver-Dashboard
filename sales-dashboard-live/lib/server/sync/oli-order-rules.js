@@ -5,8 +5,11 @@
 //   - a missing order status is INVALID (cancellation cannot be classified) -> OLI_ORDER_STATUS_MISSING;
 //   - status is normalized ONLY for comparison (trim + lower-case); 'canceled' == 'cancelled';
 //   - cancelled rows are kept for audit but contribute ZERO to the dashboard rollup (sales/units/orders);
-//   - every NON-cancelled row with units > 0 must carry an order value PRESENT and strictly > 0, else the whole
-//     window is refused with OLI_NON_CANCELLED_VALUE_MISSING (a missing value is NEVER coerced to 0 first);
+//   - a NON-cancelled row with units > 0 must carry an order value PRESENT (never null/blank), else the whole
+//     window is refused with OLI_NON_CANCELLED_VALUE_MISSING (a missing value is NEVER coerced to 0 first). A
+//     PRESENT-but-zero value is a REAL zero-priced unit (promotional / replacement / free): it is kept for audit
+//     and treated LIKE a cancelled row -- contributing ZERO sales AND units to the rollup -- and NEVER blocks the
+//     window (`contributesToRollup` is true only when not-cancelled AND value present AND value > 0);
 //   - blank state/city is allowed (stored '') and never blocks an otherwise-valid sale.
 
 export class OliOrderRuleError extends Error {
@@ -62,17 +65,19 @@ export function classifyOliDimensionalRow(row) {
   if (valuePresent && !Number.isFinite(value)) {
     throw new OliOrderRuleError("OLI_MALFORMED_ROW", "a row carries a non-finite order value", { date: S(row.date ?? row.sale_date) });
   }
-  if (!cancelled && units > 0) {
-    // Rules 4-7: a non-cancelled positive-unit row MUST have a value present and strictly > 0. A missing/null/
-    // zero value is incorrect source evidence -> refuse (never a fabricated zero).
-    if (!valuePresent || value == null || !(value > 0)) {
-      throw new OliOrderRuleError(
-        "OLI_NON_CANCELLED_VALUE_MISSING",
-        "non-cancelled row with units>0 has a missing/zero order value",
-        { date: S(row.date ?? row.sale_date), status },
-      );
-    }
+  if (!cancelled && units > 0 && !valuePresent) {
+    // A non-cancelled positive-unit row with a MISSING (null/blank) value is incorrect source evidence -> refuse
+    // the whole window (never a fabricated zero). A PRESENT-but-zero value is NOT refused (handled below).
+    throw new OliOrderRuleError(
+      "OLI_NON_CANCELLED_VALUE_MISSING",
+      "non-cancelled row with units>0 has a missing order value",
+      { date: S(row.date ?? row.sale_date), status },
+    );
   }
+  // A row contributes real sales/units to the dashboard rollup ONLY when it is not cancelled AND carries a
+  // present, strictly-positive value. A cancelled row OR a present-but-zero-value non-cancelled unit (a real
+  // zero-priced / promotional / replacement unit) contributes ZERO -- it stays in the dimensional table for audit.
+  const contributesToRollup = !cancelled && valuePresent && value > 0;
   return {
     status,
     statusNormalized: normalizeOrderStatus(status),
@@ -80,6 +85,7 @@ export function classifyOliDimensionalRow(row) {
     units,
     valuePresent,
     value, // null when absent -- NOT coerced to 0
+    contributesToRollup,
     fulfillmentChannel: S(row.fulfillment_channel).trim(), // blank allowed
     addressState: S(row.address_state).trim(),             // blank allowed (unavailable)
     addressCity: S(row.address_city).trim(),               // blank allowed (unavailable)
@@ -97,10 +103,12 @@ export function classifyOliDimensionalRow(row) {
 export function nonCancelledDailyRollup(dimRows) {
   const byGrain = new Map();
   for (const r of Array.isArray(dimRows) ? dimRows : []) {
-    if (r && r.isCancelled) continue; // cancelled contributes zero to the dashboard rollup
+    // Contribute ONLY not-cancelled rows carrying a present, strictly-positive value. A cancelled row OR a
+    // present-but-zero-value non-cancelled unit contributes ZERO sales AND units (kept only in the dimensional table).
+    if (!(r && !r.isCancelled && orderValuePresent(r.value) && Number(r.value) > 0)) continue;
     const key = [S(r.accountId), S(r.saleDate), S(r.sku), S(r.childAsin), S(r.currency)].join("");
     const prev = byGrain.get(key);
-    const addValue = orderValuePresent(r.value) ? Number(r.value) : 0; // a non-cancelled units=0 row may have no value
+    const addValue = Number(r.value);
     const addUnits = Number(r.units ?? 0);
     if (prev) {
       prev.salesAmount += addValue;

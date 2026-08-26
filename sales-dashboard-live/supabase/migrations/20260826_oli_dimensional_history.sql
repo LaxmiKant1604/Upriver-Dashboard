@@ -86,8 +86,10 @@ create trigger source_oli_dim_history_touch
 --   - missing amazon_order_status => invalid (cancellation cannot be classified);
 --   - status normalized by trim + lower-case; 'canceled' == 'cancelled';
 --   - a NON-cancelled row with total_units_sum > 0 MUST carry total_sales_sum
---     present and strictly > 0, else OLI_NON_CANCELLED_VALUE_MISSING (the whole
---     window is refused; the previous LKG is preserved by the rollback);
+--     PRESENT (not null/blank), else OLI_NON_CANCELLED_VALUE_MISSING (the whole
+--     window is refused; the previous LKG is preserved by the rollback). A
+--     PRESENT-but-zero value is a REAL zero-priced unit: it is kept for audit and
+--     contributes ZERO to the rollup (like a cancelled row), never refusing;
 --   - a missing order value is NEVER coerced to 0 before this check;
 --   - blank state/city is allowed (stored '') and never blocks a valid sale.
 -- An EMPTY p_rows is valid evidence (a zero-sales window): delete + ack only.
@@ -154,10 +156,10 @@ begin
     -- The order value is checked WITHOUT coercing a missing value to zero first.
     v_sales_present := (v_row ? 'total_sales_sum') and (v_row->>'total_sales_sum') is not null and btrim(v_row->>'total_sales_sum') <> '';
     v_sales := case when v_sales_present then (v_row->>'total_sales_sum')::numeric else null end;
-    if (not v_is_cancelled) and v_units > 0 then
-      if (not v_sales_present) or v_sales is null or v_sales <= 0 then
-        raise exception 'OLI_NON_CANCELLED_VALUE_MISSING: non-cancelled row with units>0 has missing/zero order value (account=%, date=%, status=%)', p_account_id, v_row->>'sale_date', v_row->>'amazon_order_status';
-      end if;
+    -- A non-cancelled positive-unit row with a MISSING (null/blank) value is refused. A PRESENT-but-zero value
+    -- is a REAL zero-priced unit -- kept for audit, excluded from the rollup below -- and NEVER refuses.
+    if (not v_is_cancelled) and v_units > 0 and (not v_sales_present) then
+      raise exception 'OLI_NON_CANCELLED_VALUE_MISSING: non-cancelled row with units>0 has a MISSING order value (account=%, date=%, status=%)', p_account_id, v_row->>'sale_date', v_row->>'amazon_order_status';
     end if;
   end loop;
 
@@ -196,11 +198,10 @@ begin
   from jsonb_array_elements(p_rows) as r;
   get diagnostics v_dim_inserted = row_count;
 
-  -- (b) Replace the account's NON-CANCELLED daily rollup in source_oli_daily_history
-  --     (the grain every dashboard reads). Cancelled rows are excluded entirely, so
-  --     they contribute zero to sales/units. The rollup re-aggregates the dimensional
-  --     rows to (date, sku, child_asin, currency); the account's single seller id is
-  --     carried through.
+  -- (b) Replace the account's daily rollup in source_oli_daily_history (the grain every dashboard reads). A row
+  --     contributes ONLY when it is not cancelled AND carries a present, strictly-positive value. Cancelled rows
+  --     AND real zero-priced non-cancelled units are excluded entirely (zero sales AND units) -- they live only in
+  --     the dimensional table for audit. The rollup re-aggregates to (date, sku, child_asin, currency).
   delete from public.source_oli_daily_history
     where organization_fingerprint = p_organization_fingerprint
       and connection_id = p_connection_id
@@ -219,12 +220,13 @@ begin
     coalesce(r->>'sku', ''),
     coalesce(r->>'child_asin', ''),
     r->>'currency',
-    sum(case when (r ? 'total_sales_sum') and (r->>'total_sales_sum') is not null and btrim(r->>'total_sales_sum') <> ''
-             then (r->>'total_sales_sum')::numeric else 0 end),
+    sum((r->>'total_sales_sum')::numeric),
     sum((r->>'total_units_sum')::numeric),
     max(btrim(r->>'source_request_hash'))
   from jsonb_array_elements(p_rows) as r
   where lower(btrim(r->>'amazon_order_status')) not in ('cancelled', 'canceled')
+    and (r ? 'total_sales_sum') and (r->>'total_sales_sum') is not null and btrim(r->>'total_sales_sum') <> ''
+    and (r->>'total_sales_sum')::numeric > 0
   group by (r->>'sale_date')::date, coalesce(r->>'sku', ''), coalesce(r->>'child_asin', ''), r->>'currency';
   get diagnostics v_roll_inserted = row_count;
 

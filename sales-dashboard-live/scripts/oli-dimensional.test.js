@@ -72,8 +72,26 @@ test("C1. a NON-cancelled row with units>0 and a NULL value fails OLI_NON_CANCEL
   assert.ok(!byAccount.has("ACC-1"), "no rows written for a refused account");
 });
 
-test("C2. a NON-cancelled row with units>0 and a ZERO value also fails (a fabricated zero is invalid)", () => {
-  assert.throws(() => classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: 0, total_units_sum: 1 })), (e) => e instanceof OliOrderRuleError && e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
+test("C2. a NON-cancelled row with units>0 and a PRESENT ZERO value is treated LIKE cancelled: kept, contributes ZERO, NOT refused", () => {
+  const c = classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: 0, total_units_sum: 1 }));
+  assert.equal(c.isCancelled, false);
+  assert.equal(c.value, 0, "the real zero is kept (never fabricated / dropped)");
+  assert.equal(c.contributesToRollup, false, "a real zero-priced unit contributes ZERO to the dashboard rollup");
+  // A whole window with a zero-value unit is NOT blocked (the account persists).
+  const { blocked, byAccount, rollupByAccount } = build([
+    frag({ amazon_order_status: "Shipped", total_sales_sum: 0, total_units_sum: 1, sku: "FREE" }),
+    frag({ amazon_order_status: "Shipped", total_sales_sum: 100, total_units_sum: 2, sku: "PAID" }),
+  ]);
+  assert.equal(blocked.length, 0, "a real zero-value unit never blocks the window");
+  assert.equal(byAccount.get("ACC-1").length, 2, "both rows are stored (audit)");
+  const roll = rollupByAccount.get("ACC-1");
+  assert.equal(roll.length, 1, "only the PAID sku contributes to the rollup");
+  assert.equal(roll[0].salesAmount, 100);
+  assert.equal(roll[0].units, 2, "the zero-value unit's units are excluded too (like cancelled)");
+});
+
+test("C2b. a MISSING (null/blank) value on a non-cancelled positive-unit row STILL refuses the window", () => {
+  assert.throws(() => classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: null, total_units_sum: 1 })), (e) => e instanceof OliOrderRuleError && e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
   assert.throws(() => classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: "", total_units_sum: 1 })), (e) => e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
 });
 

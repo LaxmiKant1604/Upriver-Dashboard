@@ -382,18 +382,19 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
         });
       }
       // The NON-cancelled rollup mirrors what the RPC persists into source_oli_daily_history (dashboards read it).
-      if (!c.isCancelled) {
+      // A row contributes ONLY when not cancelled AND its value is present and > 0; a cancelled row or a real
+      // zero-priced non-cancelled unit contributes ZERO (it still lives in the dimensional table for audit).
+      if (c.contributesToRollup) {
         const rgrain = [accountId, date, sku, childAsin, currency].join(US);
         const rexisting = rollupByGrain.get(rgrain);
-        const addValue = c.valuePresent ? c.value : 0; // a non-cancelled units=0 row may legitimately have no value
         if (rexisting) {
-          rexisting.salesAmount += addValue;
+          rexisting.salesAmount += c.value;
           rexisting.units += c.units;
         } else {
           rollupByGrain.set(rgrain, {
             organizationFingerprint, connectionId,
             accountId, sellerOrVendorId: seller, saleDate: date, sku, childAsin, currency,
-            salesAmount: addValue, units: c.units, sourceRequestHash,
+            salesAmount: c.value, units: c.units, sourceRequestHash,
           });
         }
       }
