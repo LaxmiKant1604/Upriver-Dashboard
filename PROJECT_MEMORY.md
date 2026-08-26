@@ -12432,3 +12432,22 @@ OLI "NO ORDER VALUE" WARNING -- PERMANENT FIX (2026-08-26, code 28f928d + 6f399c
   screenshot-118/true-missing); updated report-derivation-core.test.js. verify 73/73 + build.
 - PENDING (this session): push + Vercel; republish daily+brand-sales+brand-view for all 30 (zero export) off the
   filtered rollup; read-back parity; DataDoe escalation decision (genuine-NULL count after cleanup).
+
+OLI "NO ORDER VALUE" -- ZERO-EXPORT PRODUCTION REPAIR COMPLETE (2026-08-26/27):
+- Code pushed origin/main @ 14661c2 (28f928d fold fix + 6f399c7 rollup read-filter + docs); Vercel 200.
+- Republished from durable evidence only (0 DataDoe creates / 0 tokens): daily-reporting 19 republished + 11
+  existing (asOfCeiling=2026-08-25 so per-account dates preserved: US 08-24, non-us 08-25); brand-sales 19
+  republished + 11 existing. Membership rebuilt OK (42 brands / 30 accounts / 111 pairs -- 3 fewer than before
+  because brands whose only units were present-zero correctly drop).
+- READ-BACK PROOF (all 30 primary): 0 snapshots carry unpriced_units (retired); 0 carry
+  missing_order_value_units>0 (no genuine NULL in the value>0 rollup). 59f12ccc (the screenshot "119"): brand-sales
+  units 40128->40010 (-118 present-zero removed), sales unchanged, = corrected rollup EXACTLY; the payload rows no
+  longer have an 'unpriced_units' key. Daily==corrected-rollup exact for 59f12ccc (6,918,406.03/14,330) and US
+  51bec5e7 (86,111.03/628, -2). Daily<->Brand reconcile (both == the same value>0 rollup).
+- Controls safe-closed (rollout=0/dispatch=0/promoted=0); cron ABSENT. Unrelated reports untouched.
+- DATADOE ESCALATION DECISION: NOT required for business data. The dimensional table PROVES 1,621 non-cancelled
+  present-zero units (promotional/replacement/free) -- legitimate, never a defect. The 589 excluded legacy rollup
+  units (19 accounts, 2025-08-06..2026-08-25) were ambiguous present-zero/NULL-coerced original-backfill remnants,
+  now excluded from all business totals. No genuine NULL units are counted or displayed (missing_order_value_units
+  =0). A precise upstream genuine-NULL count would need a fresh OLI re-fetch (NOT authorized); the fail-closed
+  dimensional refusals already keep any such NULL out of Sales/Units via LKG.
