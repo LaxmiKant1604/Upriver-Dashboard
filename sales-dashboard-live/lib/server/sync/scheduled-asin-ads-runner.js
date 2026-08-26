@@ -26,10 +26,16 @@ const S = (v) => (v == null ? "" : String(v));
  * { compatible, incompatible, unreadable, covered, pending, window } -- all arrays of { accountId, country }.
  * Every read failure fails that account CLOSED (excluded from this run, reported), never a fabricated success.
  */
-export async function planAsinAdsBucketRun({ bucket, asOf, deps = {} } = {}) {
+export async function planAsinAdsBucketRun({ bucket, asOf, windowOverride = null, deps = {} } = {}) {
   const b = S(bucket);
   if (b !== "us" && b !== "non-us") { const e = new Error("ASIN_ADS_BAD_BUCKET"); e.code = "ASIN_ADS_BAD_BUCKET"; throw e; }
-  const win = asinAdsRefreshWindow(S(asOf));
+  // Default: the reviewed 21-day rolling refresh window. A windowOverride (BACKFILL mode) targets a wider
+  // historical window -- the Daily contract window -- so every connected account ends up with CONSISTENT
+  // canonical ASIN Ads coverage. It only ever WIDENS what "covered" means; the coverage pre-filter + adoption +
+  // token ceiling below are unchanged, so a batch already covering the override window creates zero exports.
+  const ov = windowOverride && /^\d{4}-\d{2}-\d{2}$/.test(S(windowOverride.from)) && /^\d{4}-\d{2}-\d{2}$/.test(S(windowOverride.to)) ? { from: S(windowOverride.from), to: S(windowOverride.to) } : null;
+  if (ov && ov.from > ov.to) { const e = new Error("ASIN_ADS_BAD_WINDOW: from > to"); e.code = "ASIN_ADS_BAD_WINDOW"; throw e; }
+  const win = ov || asinAdsRefreshWindow(S(asOf));
   const getConnections = deps.getConnections || getDataDoeConnections;
   const fetchAccts = deps.fetchAccounts || fetchAccounts;
   const fetchSources = deps.fetchCompatibleSourceNames || fetchCompatibleSourceNames;
@@ -84,8 +90,8 @@ export async function planAsinAdsBucketRun({ bucket, asOf, deps = {} } = {}) {
  * `maxCreates` HARD-CAPS this invocation's creates (checked BEFORE every POST). One pass never auto-retries a
  * failed create. `pageAllowance` adds skip-pagination headroom to the plan ceiling.
  */
-export async function runAsinAdsBucketSlice({ bucket, asOf, maxCreates = null, pageAllowance = 1, plan = null, deps = {}, log = () => {} } = {}) {
-  const p = plan || await planAsinAdsBucketRun({ bucket, asOf, deps });
+export async function runAsinAdsBucketSlice({ bucket, asOf, windowOverride = null, maxCreates = null, pageAllowance = 1, plan = null, deps = {}, log = () => {} } = {}) {
+  const p = plan || await planAsinAdsBucketRun({ bucket, asOf, windowOverride, deps });
   if (!p.compatible.length) {
     return { phase: "complete", creates: 0, tokens: 0, batches: 0, covered: 0, incompatible: p.incompatible.length, note: "no Amazon-Ads-compatible accounts" };
   }

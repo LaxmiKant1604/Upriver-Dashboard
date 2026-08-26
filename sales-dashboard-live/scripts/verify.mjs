@@ -68,6 +68,7 @@ const SUITES = [
   "test:source-create-reconcile",
   "test:daily-roi-format",
   "test:brand-view-freshness",
+  "test:asin-ads-backfill-window",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",
