@@ -12451,3 +12451,23 @@ OLI "NO ORDER VALUE" -- ZERO-EXPORT PRODUCTION REPAIR COMPLETE (2026-08-26/27):
   now excluded from all business totals. No genuine NULL units are counted or displayed (missing_order_value_units
   =0). A precise upstream genuine-NULL count would need a fresh OLI re-fetch (NOT authorized); the fail-closed
   dimensional refusals already keep any such NULL out of Sales/Units via LKG.
+
+OLI EXPLICIT-ZERO DATA-QUALITY INDICATOR (2026-08-27, code d2b39f0, push pending):
+- ADDITIVE feature (does NOT change the corrected business rules d8f15d6): a separate, read-only, ZERO-DataDoe
+  indicator that surfaces non-cancelled EXPLICIT-zero units (value present, numerically 0 -- promotional/
+  replacement/free/incomplete) so users see a potential gap without treating them as sales. Three OLI classes
+  stay strictly separate (cancelled / explicit-zero / NULL-missing).
+- Server: lib/server/reports/oli-quality.js (summarizeExplicitZeroOli -- brand via Catalog child_asin->brand ONLY,
+  unmapped never leaks, currency isolated, no double-count, safe breakdown; never order_id/country);
+  supabase.js getExplicitZeroOliUnits (is_cancelled=false, total_sales_sum=eq.0, units>0) + getAccountOliQuality
+  Counts; api/datadoe.js actions oli-quality + oli-quality-summary (account-scoped, Supabase-only, available:false
+  on failure = non-destructive LKG); api/admin/sources.js attaches per-account quality (parallel, best-effort, via
+  primaryOrganizationFingerprint so no apiKey named in the endpoint -- source-status D1 pin).
+- Frontend: App.jsx amber informational notice + expandable breakdown, scoped to account/date-range (client filter
+  over the wide fetch, like scopedRows) + brand; shares dashboard revalidate triggers, read-only (no token), LKG on
+  failure. DataSyncCenter.jsx collapsible per-account quality table.
+- PROBE (59f12ccc): explicit-zero ALL=135 units/129 rows (INR); brand Priya=25 (Catalog-attributed subset),
+  unmapped brand=0 (never leaks); cancelled 2174 rows/0 units (export records 0 units on cancelled); latest dim
+  date 2026-08-25. Tests: oli-quality.test.js (11). verify 74/74 + build.
+- PENDING: push + Vercel 200; production read-back (business unchanged, explicit-zero matches dimensional, no
+  unpriced, controls safe-closed).
