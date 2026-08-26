@@ -171,10 +171,10 @@ export function brandViewModel(payload) {
 
   for (const row of payload?.series || []) {
     const entry = ensure(row.c, row.cur);
-    const day = entry.byDate.get(row.d) || { sales: 0, units: 0, adSpend: null, unpricedUnits: 0 };
+    const day = entry.byDate.get(row.d) || { sales: 0, units: 0, adSpend: null, missingOrderValueUnits: 0 };
     day.sales += Number(row.s) || 0;
     day.units += Number(row.u) || 0;
-    day.unpricedUnits += Number(row.x) || 0;
+    day.missingOrderValueUnits += Number(row.x) || 0;
     // `a` is absent when the saved Ads history has nothing for that country/day.
     if (row.a !== undefined && row.a !== null) day.adSpend = (day.adSpend === null ? 0 : day.adSpend) + Number(row.a);
     entry.byDate.set(row.d, day);
@@ -205,14 +205,14 @@ export function brandViewModel(payload) {
 export function rangeSales(country, from, to) {
   let sales = 0;
   let units = 0;
-  let unpricedUnits = 0;
+  let missingOrderValueUnits = 0;
   for (const [date, day] of country.byDate) {
     if (date < from || date > to) continue;
     sales += day.sales;
     units += day.units;
-    unpricedUnits += day.unpricedUnits;
+    missingOrderValueUnits += day.missingOrderValueUnits;
   }
-  return { sales, units, unpricedUnits };
+  return { sales, units, missingOrderValueUnits };
 }
 
 /**
@@ -387,7 +387,7 @@ export function dailySnapshotRows(model, { from, to }) {
       currencyConflict: country.currencyConflict,
       sales: current.sales,
       units: current.units,
-      unpricedUnits: current.unpricedUnits,
+      missingOrderValueUnits: current.missingOrderValueUnits,
       adSpend,
       lySales,
       fbaAvailable: country.fbaAvailable,

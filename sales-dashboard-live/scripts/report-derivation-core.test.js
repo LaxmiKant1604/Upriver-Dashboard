@@ -234,9 +234,13 @@ test("brand-sales derives from saved rows (matches orderSalesByBrand); latest-da
   assert.deepEqual(r.payload.rows, orderSalesByBrand(ORDER_ROWS, CATALOG_ROWS));
   assert.deepEqual(r.payload.catalogBrands, ["Acme", "Beta"]);
   assert.equal(r.latestDataDate, "2025-06-02");
-  // unpriced_units preserved (the 0-sales/3-units group), never dropped.
+  // PRESENT-zero (the 0-sales/3-units group): a real zero-priced unit contributes ZERO sales AND ZERO units and is
+  // NOT a missing-value defect. The ambiguous legacy `unpriced_units` inference is retired.
   const acme = r.payload.rows.find((x) => x.product_brand === "Acme" && x.date === "2025-06-02");
-  assert.equal(acme.unpriced_units, 3);
+  assert.equal(acme.total_sales, 0);
+  assert.equal(acme.total_units_sold, 0, "a present-zero unit contributes zero business units");
+  assert.equal(acme.missing_order_value_units, 0, "a present (zero) value is never flagged as missing order value");
+  assert.equal(acme.unpriced_units, undefined, "the ambiguous legacy unpriced_units field is retired");
   // PARITY (Gate 6 Cycle-1 finding): the payload must carry the ADDITIVE first-wins ASIN->brand map the live
   // route saves ({ rows, catalogBrands, asinBrand }) -- Brand View reads it from the saved brand-sales
   // payload for FBA inventory brand attribution.

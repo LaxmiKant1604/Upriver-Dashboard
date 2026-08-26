@@ -26,6 +26,7 @@
     "test:source-fixpoint": "node scripts/source-fixpoint.test.js",
     "test:source-durable-model": "node scripts/source-durable-model.test.js",
     "test:oli-dimensional": "node scripts/oli-dimensional.test.js",
+    "test:oli-value-policy": "node scripts/oli-value-policy.test.js",
     "test:effective-asof": "node scripts/effective-asof.test.js",
     "test:source-bucket-sync": "node scripts/source-bucket-sync.test.js",
     "test:source-status": "node scripts/source-status.test.js",

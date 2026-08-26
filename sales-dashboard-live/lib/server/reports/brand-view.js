@@ -282,7 +282,9 @@ export function aggregateBrandSales(rows, brand) {
     const entry = series.get(key) || { c: country, cur: countries.get(country), d: date, s: 0, u: 0, x: 0 };
     entry.s += Number(row?.total_sales) || 0;
     entry.u += Number(row?.total_units_sold) || 0;
-    entry.x += Number(row?.unpriced_units) || 0;
+    // Typed missing-order-value evidence (dormant in Brand View -- carried, never rendered as a warning). A legacy
+    // payload's `unpriced_units` is intentionally NOT read, so a stale snapshot contributes 0 here.
+    entry.x += Number(row?.missing_order_value_units) || 0;
     series.set(key, entry);
 
     if (!minDate || date < minDate) minDate = date;

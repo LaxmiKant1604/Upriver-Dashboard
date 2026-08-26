@@ -25,10 +25,17 @@ import { brandKey } from "./brand-membership.js";
 // this leaf pulls in no transport module.
 export const num = (v) => Number(v) || 0;
 
-// Dashboard / brand-sales: join catalog brand onto the compact date/ASIN Order-Line-Items
-// export and fold to date/brand totals. A zero-priced group with units is preserved as
-// `unpriced_units` (an upstream completeness signal), never silently dropped. total_orders
-// stays null because a compact ASIN export cannot dedupe order ids across ASINs.
+// Dashboard / brand-sales: join catalog brand onto the compact date/ASIN Order-Line-Items export and fold to
+// date/brand totals under the AUTHORITATIVE OLI order-value policy (oli-order-rules.js). The ambiguous legacy
+// inference `sales === 0 && units > 0 => unpriced_units` is REMOVED -- it conflated three distinct cases. Instead:
+//   - order value PRESENT and > 0            -> contributes Total Sales AND Units Sold;
+//   - order value PRESENT and == 0 (a real   -> contributes ZERO sales AND ZERO units (present-zero: a shipped
+//     zero-priced promotional/replacement/       promotional/replacement/free unit), never a warning;
+//     free unit)
+//   - order value genuinely MISSING (null/    -> is NEVER coerced to 0; its units NEVER enter Units Sold; it is
+//     blank)                                     surfaced ONLY as the typed `missing_order_value_units` evidence.
+// Cancelled rows never reach this fold (the durable rollup excludes them). total_orders stays null (a compact ASIN
+// export cannot dedupe order ids across ASINs).
 export function orderSalesByBrand(rows, catalogRows) {
   const brandByAsin = new Map();
   for (const catalogRow of catalogRows) {
@@ -58,14 +65,23 @@ export function orderSalesByBrand(rows, catalogRows) {
       product_brand: productBrand,
       total_sales: 0,
       total_units_sold: 0,
-      unpriced_units: 0,
+      missing_order_value_units: 0,
       total_orders: null,
     };
-    const sales = num(row.total_sales_sum ?? row.item_price_value);
+    // A value is PRESENT only when it is neither null/undefined nor a blank string -- a MISSING value is NEVER
+    // silently coerced to 0 first (mirrors oli-order-rules.orderValuePresent).
+    const rawValue = row.total_sales_sum ?? row.item_price_value;
+    const valuePresent = rawValue != null && String(rawValue).trim() !== "";
     const units = num(row.total_units_sold_sum ?? row.quantity);
-    current.total_sales += sales;
-    current.total_units_sold += units;
-    if (sales === 0 && units > 0) current.unpriced_units += units;
+    if (!valuePresent) {
+      // Genuinely missing order value: typed evidence ONLY; never fabricate sales, never count units.
+      current.missing_order_value_units += units;
+    } else {
+      const sales = num(rawValue);
+      current.total_sales += sales;
+      // Only a strictly-positive value's units are business Units Sold; a present-zero unit contributes zero.
+      if (sales > 0) current.total_units_sold += units;
+    }
     totals.set(key, current);
   }
   return [...totals.values()];

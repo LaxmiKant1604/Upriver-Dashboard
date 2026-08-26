@@ -1829,19 +1829,26 @@ export function orderSalesByBrand(rows, catalogRows) {
       product_brand: productBrand,
       total_sales: 0,
       total_units_sold: 0,
-      unpriced_units: 0,
+      missing_order_value_units: 0,
       // A compact ASIN-level export cannot deduplicate order IDs across ASINs.
       // Leave Orders/AOV unavailable rather than showing a misleading value.
       total_orders: null,
     };
-    const sales = num(row.total_sales_sum ?? row.item_price_value);
+    // AUTHORITATIVE OLI value policy (kept byte-identical to lib/server/reports/derivation-core.js): the ambiguous
+    // `sales === 0 && units > 0 => unpriced_units` inference is REMOVED. A PRESENT value contributes sales, and
+    // only a strictly-positive value's units are Units Sold (a present-zero promotional/replacement unit adds
+    // zero of both); a genuinely MISSING value is never coerced to 0 and its units are surfaced ONLY as the typed
+    // missing_order_value_units, never as Units Sold.
+    const rawValue = row.total_sales_sum ?? row.item_price_value;
+    const valuePresent = rawValue != null && String(rawValue).trim() !== "";
     const units = num(row.total_units_sold_sum ?? row.quantity);
-    current.total_sales += sales;
-    current.total_units_sold += units;
-    // A zero-valued group with units is an upstream order-data completeness
-    // signal. Preserve it so the UI can warn instead of silently understating
-    // sales when Amazon/DataDoe has not populated an item price yet.
-    if (sales === 0 && units > 0) current.unpriced_units += units;
+    if (!valuePresent) {
+      current.missing_order_value_units += units;
+    } else {
+      const sales = num(rawValue);
+      current.total_sales += sales;
+      if (sales > 0) current.total_units_sold += units;
+    }
     totals.set(key, current);
   }
   return [...totals.values()];

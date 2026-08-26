@@ -2513,14 +2513,18 @@ function DashboardApp({ session, access, onSignOut }) {
   }
 
   function aggregate(rowSet) {
-    let sales = 0, units = 0, orders = 0, unpricedUnits = 0;
+    let sales = 0, units = 0, orders = 0, missingOrderValueUnits = 0;
     rowSet.forEach((r) => {
       units += r.total_units_sold || 0;
       orders += r.total_orders || 0;
       sales += salesInDisplay(r);
-      unpricedUnits += r.unpriced_units || 0;
+      // TYPED missing-order-value evidence only (non-cancelled units whose order value is genuinely NULL/missing).
+      // The ambiguous legacy `unpriced_units` (sales===0 && units>0, which also caught cancelled + present-zero
+      // promotional units) is retired: a legacy payload carrying only `unpriced_units` reads as 0 here, so a stale
+      // snapshot can never resurrect the old banner.
+      missingOrderValueUnits += r.missing_order_value_units || 0;
     });
-    return { sales, units, orders, unpricedUnits };
+    return { sales, units, orders, missingOrderValueUnits };
   }
 
   const brandRows = useMemo(
@@ -2928,14 +2932,16 @@ function DashboardApp({ session, access, onSignOut }) {
             detail={rowsError}
           />
         )}
-        {/* Real data-quality warning: DataDoe returned units carrying no order
-            value, so the sales total is understated. Compact, and never allowed
-            to outweigh the KPIs it qualifies. */}
-        {!rowsLoading && selectedBrand === "ALL" && kpi.unpricedUnits > 0 && (
+        {/* TYPED data-quality warning: shown ONLY for non-cancelled units whose order value is genuinely
+            NULL/missing upstream (missing_order_value_units) -- NOT for cancelled orders and NOT for present-zero
+            promotional/replacement/free units, which are excluded from Total Sales and Units Sold by policy and
+            are never a defect. A legacy snapshot carrying only `unpriced_units` yields 0 here, so the old banner
+            can never resurface. */}
+        {!rowsLoading && selectedBrand === "ALL" && kpi.missingOrderValueUnits > 0 && (
           <DataQualityAlert
             tone="warning"
-            title={`${kpi.unpricedUnits.toLocaleString("en-US")} unit${kpi.unpricedUnits === 1 ? "" : "s"} in this range have no order value`}
-            detail="Total Sales may be understated. Refresh again once DataDoe completes its upstream order data — no value is estimated or filled in here."
+            title={`${kpi.missingOrderValueUnits.toLocaleString("en-US")} unit${kpi.missingOrderValueUnits === 1 ? "" : "s"} in this range have no order value`}
+            detail="These units are excluded from Total Sales and Units Sold. Refresh again once DataDoe completes its upstream order data — no value is estimated or filled in here."
           />
         )}
 
