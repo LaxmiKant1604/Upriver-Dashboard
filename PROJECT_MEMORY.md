@@ -12127,3 +12127,29 @@ missing coverage = typed unavailable). Scheduler shadow derives (no adsCoverage)
 payload byte-for-byte. Frontend: waiting state renders info (not error), empty state no longer says "wait
 for the scheduled refresh", footer copy updated (the "ads cannot be assigned to a brand" premise is gone).
 verify 63/63.
+
+
+================================================================================
+2026-08-26 -- ONE trusted orchestration for scheduler + Data Sync Center; scheduler failure classes fixed; cron re-enabled (code ec99ba0 + a3df6cb)
+================================================================================
+
+SCHEDULER FIXES (ec99ba0): (1) terminal-cycle collision resolved by DURABLE-COVERAGE idempotence --
+classifyScheduledOliCycle accepts a terminal non-OLI same-date cycle as a zero-create idempotent success when
+source_coverage proves [2025-01-01..asOf] for EVERY discovered account (assessDurableOliCoverageComplete);
+incomplete/unreadable coverage keeps the strict refusal; never appends to a terminal cycle. (2) US prerequisite
+gate is EVIDENCE-FIRST: per-account durable checks are authoritative; a missing/manual-shape Non-US cycle with
+green evidence is a NOTE, not a blocker. (3) SOURCE-SCOPED preflight: a single-source action no longer fails on
+an UNRELATED source's broken evidence read (only the selected source + derive-required OLI/Catalog refuse; ads
+read failures degrade typed for non-ads actions). (4) cron RE-ENABLED: exactly 02:00 UTC (non-us) + 10:30 UTC
+(us), bucket resolved from github.event.schedule, dispatch kept, single scheduled workflow. (The user had paused
+cron in bae32e1 pending these fixes.)
+
+SHARED ORCHESTRATION (a3df6cb): lib/server/sync/source-sync-operation.js = frozen orchestrated sources
+(OLI/ads-asin-date/product-catalog), immutable source->dashboard dependency registry, enum-only request
+validation, and runReleaseSlice (derive->consistency->finalize->preflight-all->open/publish-CAS/ALWAYS-safe-
+close-per-slice->live read-back; stateless-resumable). scheduled-asin-ads-runner.js + priority-control-pg-store
+extracted so scheduler scripts, the manual operator (scripts/release/manual-source-sync.mjs), and the admin
+route consume ONE implementation. POST /api/admin/sources now runs sync->release slices with typed continuation;
+DataSyncCenter auto-polls to terminal (double-click guarded), claims "dashboards updated" only after live
+read-back. gate7 G1 amended: api/admin/sources.js is the one reviewed exception reaching the publisher, only
+through the shared release engine. verify 64/64 (44 suites).
