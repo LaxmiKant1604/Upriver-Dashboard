@@ -12264,3 +12264,39 @@ FOUR faults fixed (ROI, ads-history split, Brand View staleness, Brand View 504)
    now have full July (31 ads-days) + late-June coverage -- consistent across accounts.
 
 verify: all steps green (49 suites). Balance ~3970 -> after backfill.
+
+================================================================================
+2026-08-26 -- OLI DIMENSIONAL history: order status / fulfillment / state / city + cancellation semantics (code b71ab4a, migration 20260826 APPLIED)
+================================================================================
+
+Extended the canonical Order Line Items export ONCE to also carry amazon_order_status,
+fulfillment_channel, address_state, address_city (proven present via GET /exports/sources -- the
+OLI source object's `columns` array IS the read-only schema; address_country + amazon_order_id
+deliberately NOT requested). All OLI consumers moved to the same 9-column contract + request_hash.
+
+- Migration 20260826_oli_dimensional_history.sql (APPLIED to prod in a guarded single-file txn;
+  recorded in app_schema_migrations): additive source_oli_dimensional_history (full grain incl.
+  cancelled, PK adds status/fulfillment/state/city; status_normalized + is_cancelled derived) +
+  the SECURITY DEFINER replace_oli_dimensional_window RPC that in ONE txn replaces the dimensional
+  rows, replaces the NON-cancelled daily rollup in source_oli_daily_history (what dashboards read),
+  and upserts coverage. Service-role SELECT only; RPC-only writes; registered in schema-contract.js
+  with a structural body proof (mutation baseline audits clean).
+- lib/server/sync/oli-order-rules.js (pure): normalizeOrderStatus (trim+lower; CANCELED==CANCELLED),
+  classifyOliDimensionalRow (missing status -> OLI_ORDER_STATUS_MISSING; non-cancelled units>0 with
+  missing/zero value -> OLI_NON_CANCELLED_VALUE_MISSING, value never coerced to 0; blank state/city
+  = unavailable, never invented), nonCancelledDailyRollup.
+- oliDimensionalRowsFromFragment validates PER ACCOUNT (a bad account is BLOCKED, LKG preserved,
+  reported -- never fails the batch); returns dimensional rows + the non-cancelled rollup. Wired
+  through the scheduler persist path + the live-evidence fold; replaceOliDimensionalWindow +
+  getSourceOliDimensionalContribution wrappers.
+- Cancelled orders now contribute ZERO to Daily (durable rollup) + the live folds (Daily superset,
+  Buy Box, PPC TACoS, Returns). fetchDailyBrandSalesRows + the 3 insight builders exclude cancelled.
+- scripts/oli-dimensional.test.js (14 assertions) + updated OLI suites (fixtures carry dimensions;
+  golden request_hashes re-pinned intentionally). verify 69 steps/49 suites. Deployed b71ab4a, prod 200.
+- HISTORICAL REPLACEMENT operator scripts/release/oli-dimensional-replacement.mjs (DRY-first, frozen
+  ceiling, no-collision guard, forces full re-fetch via empty in-memory coverage, never adopts a
+  pre-dimensional export). DRY: non-us 15 exports/30 tokens, US 6/12. Non-us APPLY running; US staged
+  for AFTER the 10:30 UTC US cron (no collision). After: re-derive/publish Daily + Brand snapshots.
+- DataDoe schema proof: GET /exports/sources?sellerOrVendorIds=<seller> returns each source's full
+  `columns` array (name/type/nullable/description) -- the read-only schema endpoint (fetchCompatibleSourceNames
+  only reads .name). OLI source 89b27535d2, table amazon_order_items_with_cogs, 42 columns.
