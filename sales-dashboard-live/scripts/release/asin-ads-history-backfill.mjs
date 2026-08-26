@@ -28,12 +28,17 @@ if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must 
 if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
 
 const { planAsinAdsBucketRun, runAsinAdsBucketSlice } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
-const { monthBackStr } = await import("../../lib/server/date-windows.js");
+const { addDaysStr } = await import("../../lib/server/date-windows.js");
+const { MAX_REQUIRED_COVERAGE_DAYS } = await import("../../lib/server/ads-sync.js");
 
-// The DAILY CONTRACT window: exactly what report-planner plans Daily ASIN Ads for (DAILY_MONTHS_BACK = 5).
-const windowOverride = { from: monthBackStr(asOf, 5), to: asOf };
+// The ASIN Ads INITIAL coverage window = the source's own initialDays (MAX_REQUIRED_COVERAGE_DAYS, currently 60):
+// the deepest canonical history a single reviewed export may request, and the practical limit of Amazon Ads
+// reporting (data older than ~60 days is not obtainable). Backfilling every connected account to this SAME window
+// makes coverage CONSISTENT (all cover ~late-June..asOf), fixing "some accounts show July, others only August";
+// months before it are honestly em-dash (Amazon has no data), uniformly across accounts.
+const windowOverride = { from: addDaysStr(asOf, -(MAX_REQUIRED_COVERAGE_DAYS - 1)), to: asOf };
 const log = (m) => console.log("asin-ads-backfill[" + bucket + "@" + asOf + "]: " + m);
-log("contract backfill window [" + windowOverride.from + ".." + windowOverride.to + "] (Daily 5-months-back)");
+log("initial coverage backfill window [" + windowOverride.from + ".." + windowOverride.to + "] (" + MAX_REQUIRED_COVERAGE_DAYS + "-day ASIN Ads initial depth)");
 
 const plan = await planAsinAdsBucketRun({ bucket, asOf, windowOverride });
 log("connection pre-flight: " + plan.compatible.length + " compatible, " + plan.incompatible.length + " disconnected, " + plan.unreadable.length + " unreadable (excluded)");
