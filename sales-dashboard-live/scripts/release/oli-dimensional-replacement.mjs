@@ -34,8 +34,6 @@ const { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } = await import("../../lib
 const { oliDimensionalRowsFromFragment, oliBackfillWindow } = await import("../../lib/server/sync/source-durable-model.js");
 const { fetchExportRows } = await import("../../lib/server/datadoe.js");
 const { replaceOliDimensionalWindow, getDataDoeTokenBalance } = await import("../../lib/server/supabase.js").then(async (sb) => ({ replaceOliDimensionalWindow: sb.replaceOliDimensionalWindow, getDataDoeTokenBalance: (await import("../../lib/server/datadoe-usage.js")).getDataDoeTokenBalance }));
-const { getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
-const { windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
 const { addDaysStr } = await import("../../lib/server/date-windows.js");
 const { OLI_SALES_COLUMNS } = await import("../../lib/server/sync/report-source-contracts.js");
 const pgMod = (await import("pg")).default;
@@ -83,14 +81,19 @@ await gc.end();
 if (activeOpen > 0) { console.error("STOP a Scheduler-v2/manual OLI operation is ACTIVE for " + bucket + " (" + activeOpen + " open OLI jobs) -- not colliding."); process.exit(1); }
 log("no-collision proof: 0 active open OLI jobs on a current " + bucket + " cycle.");
 
-// A (batch, window) is ALREADY DONE when EVERY account in the batch proves coverage of [from, to] (a resumable
-// re-run then re-fetches ONLY the windows a blocked account left uncovered -- zero wasted tokens).
+// A (batch, window) is ALREADY DONE when EVERY account in the batch already has DIMENSIONAL rows inside
+// [from, to] -- i.e. this replacement previously persisted it. (source_coverage cannot be used: the ORIGINAL
+// pre-dimensional OLI backfill left coverage for every window, so it would falsely skip the blocked windows.)
+// A resumable re-run then re-fetches ONLY the windows a blocked account left without dimensional rows.
+const skipClient = new pgMod.Client({ connectionString: String(process.env.POSTGRES_URL).split("?")[0], ssl: { rejectUnauthorized: false } });
+await skipClient.connect();
 async function batchWindowCovered(batch, w) {
-  for (const a of batch.accounts) {
-    const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, sourceKey: "order-line-items" });
-    if (!cov || cov.read !== "ok" || !windowsProve(cov.windows || [], w.from, w.to)) return false;
-  }
-  return true;
+  const ids = batch.accounts.map((a) => a.accountId);
+  const r = await skipClient.query(
+    "select count(distinct account_id)::int n from public.source_oli_dimensional_history where organization_fingerprint=$1 and connection_id='primary' and account_id = any($2::text[]) and sale_date between $3 and $4",
+    [orgFp, ids, w.from, w.to],
+  );
+  return r.rows[0].n >= ids.length; // every account already has dimensional evidence for this window
 }
 
 let created = 0; let persisted = 0; let skipped = 0; const blockedAll = [];
@@ -120,6 +123,7 @@ for (const batch of batches) {
   }
   log("batch [" + sellerIds.length + " sellers] done: " + windows.length + " windows");
 }
+await skipClient.end().catch(() => {});
 log("REPLACEMENT COMPLETE: " + created + " exports created / " + (created * 2) + " tokens; " + skipped + " (batch,window) already-covered skipped (zero tokens); " + persisted + " (account,window) rollups persisted; " + blockedAll.length + " blocked (LKG preserved).");
 if (blockedAll.length) log("BLOCKED (invalid non-cancelled zero-value / missing status; LKG kept): " + blockedAll.slice(0, 12).map((b) => b.accountId.slice(0, 8) + ":" + b.code + "@" + b.from).join(" "));
 process.exit(0);
