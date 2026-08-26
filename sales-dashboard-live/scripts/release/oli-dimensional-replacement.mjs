@@ -34,7 +34,8 @@ const { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } = await import("../../lib
 const { oliDimensionalRowsFromFragment, oliBackfillWindow } = await import("../../lib/server/sync/source-durable-model.js");
 const { fetchExportRows } = await import("../../lib/server/datadoe.js");
 const { replaceOliDimensionalWindow, getDataDoeTokenBalance } = await import("../../lib/server/supabase.js").then(async (sb) => ({ replaceOliDimensionalWindow: sb.replaceOliDimensionalWindow, getDataDoeTokenBalance: (await import("../../lib/server/datadoe-usage.js")).getDataDoeTokenBalance }));
-const { getSyncSourceJobs } = await import("../../lib/server/supabase.js");
+const { getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
+const { windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
 const { addDaysStr } = await import("../../lib/server/date-windows.js");
 const { OLI_SALES_COLUMNS } = await import("../../lib/server/sync/report-source-contracts.js");
 const pgMod = (await import("pg")).default;
@@ -82,11 +83,22 @@ await gc.end();
 if (activeOpen > 0) { console.error("STOP a Scheduler-v2/manual OLI operation is ACTIVE for " + bucket + " (" + activeOpen + " open OLI jobs) -- not colliding."); process.exit(1); }
 log("no-collision proof: 0 active open OLI jobs on a current " + bucket + " cycle.");
 
-let created = 0; let persisted = 0; const blockedAll = [];
+// A (batch, window) is ALREADY DONE when EVERY account in the batch proves coverage of [from, to] (a resumable
+// re-run then re-fetches ONLY the windows a blocked account left uncovered -- zero wasted tokens).
+async function batchWindowCovered(batch, w) {
+  for (const a of batch.accounts) {
+    const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, sourceKey: "order-line-items" });
+    if (!cov || cov.read !== "ok" || !windowsProve(cov.windows || [], w.from, w.to)) return false;
+  }
+  return true;
+}
+
+let created = 0; let persisted = 0; let skipped = 0; const blockedAll = [];
 for (const batch of batches) {
   const sellerIds = [...new Set(batch.accounts.map((a) => a.rawSellerId))].sort();
   const accountsBySellerId = Object.fromEntries(batch.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId, currency: a.currency }]));
   for (const w of windows) {
+    if (await batchWindowCovered(batch, w)) { skipped += 1; continue; } // every account already covers this window
     if (created >= ceiling) { console.error("STOP frozen ceiling reached (" + ceiling + ") -- refusing further creates."); process.exit(1); }
     let rows;
     try {
@@ -108,6 +120,6 @@ for (const batch of batches) {
   }
   log("batch [" + sellerIds.length + " sellers] done: " + windows.length + " windows");
 }
-log("REPLACEMENT COMPLETE: " + created + " exports created / " + (created * 2) + " tokens; " + persisted + " (account,window) rollups persisted; " + blockedAll.length + " blocked (LKG preserved).");
+log("REPLACEMENT COMPLETE: " + created + " exports created / " + (created * 2) + " tokens; " + skipped + " (batch,window) already-covered skipped (zero tokens); " + persisted + " (account,window) rollups persisted; " + blockedAll.length + " blocked (LKG preserved).");
 if (blockedAll.length) log("BLOCKED (invalid non-cancelled zero-value / missing status; LKG kept): " + blockedAll.slice(0, 12).map((b) => b.accountId.slice(0, 8) + ":" + b.code + "@" + b.from).join(" "));
 process.exit(0);
