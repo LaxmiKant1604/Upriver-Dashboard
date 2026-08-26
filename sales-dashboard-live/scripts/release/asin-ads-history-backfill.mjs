@@ -45,11 +45,13 @@ log("connection pre-flight: " + plan.compatible.length + " compatible, " + plan.
 if (plan.incompatible.length) log("  disconnected (typed unavailable; not backfilled): " + plan.incompatible.map((a) => a.accountId.slice(0, 8) + "(" + a.country + ")").join(" "));
 log("coverage pre-filter vs contract window: " + plan.covered.length + " already covered (zero creates), " + plan.pending.length + " need backfill");
 
-// The frozen create ceiling: one wide export per <=5-account batch of the pending set (never per account, never
-// per month). --max-creates may only LOWER it. Refuse before a create would exceed it.
-const plannedBatches = Math.ceil(plan.pending.length / 5);
-const ceiling = maxCreatesArg != null ? Math.min(plannedBatches, Math.max(0, Math.trunc(Number(maxCreatesArg)))) : plannedBatches;
-log("FROZEN ceiling: <=" + ceiling + " creates / <=" + (ceiling * 2) + " tokens (adoption of an exact completed export spends zero).");
+// The frozen create ceiling. The runner groups <=5-account batches BY REGION, so the batch count can exceed
+// ceil(pending/5); the safe upper bound is one export per pending account (batching makes it fewer, and the
+// runner's own per-invocation bucketPlan.maxCreates is the tighter ceiling checked before every POST). A create
+// that would exceed it is refused. --max-creates may only LOWER it.
+const upperBound = plan.pending.length;
+const ceiling = maxCreatesArg != null ? Math.min(upperBound, Math.max(0, Math.trunc(Number(maxCreatesArg)))) : upperBound;
+log("FROZEN ceiling: <=" + ceiling + " creates / <=" + (ceiling * 2) + " tokens for " + plan.pending.length + " pending accounts (region-batched <=5; adoption of an exact completed export spends zero).");
 
 if (!APPLY) {
   log("DRY RUN complete (no writes). Re-run with --apply to fetch + persist the missing complements.");
