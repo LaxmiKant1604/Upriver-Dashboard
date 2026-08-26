@@ -1214,15 +1214,28 @@ test("(F3) the pinned shared mappings appear VERBATIM in the live api/datadoe.js
 // =================================================================================================
 group("G. structural isolation: no browser route can promote; the scheduler never auto-publishes");
 
-test("(G1) NO api/ route references the publisher or the rollout module (recursive)", () => {
+test("(G1) NO api/ route references the publisher or the rollout module (recursive), EXCEPT the admin Data Sync Center route through the reviewed release engine", () => {
   const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
     const p = path.join(dir, e.name);
     return e.isDirectory() ? walk(p) : (e.name.endsWith(".js") ? [p] : []);
   });
   const files = walk(path.join(ROOT, "api"));
   assert.ok(files.length >= 4, "the api/ surface was actually scanned");
+  // The ONE reviewed exception: api/admin/sources.js (admin-authenticated, audited, rate-limited, deadline-
+  // bounded) drives the SAME trusted release engine the operators/scheduler use -- buildPriorityDashboardsRelease
+  // + runReleaseSlice, whose publish envelope opens the reviewed control package and ALWAYS safe-closes per
+  // slice, publishes only via the four durable gates + freshness CAS, and claims success only after an exact
+  // live read-back. It still never touches the CAS primitive or the publisher internals directly.
+  const exempt = path.join(ROOT, "api", "admin", "sources.js");
   for (const f of files) {
     const src = readFileSync(f, "utf8");
+    if (f === exempt) {
+      assert.ok(src.includes("runReleaseSlice"), "the admin route publishes ONLY through the shared release slice");
+      assert.ok(src.includes("source-priority-dashboards"), "…built from the reviewed release engine");
+      assert.ok(!src.includes("publishLiveSnapshotIfNewer"), "even the admin route never reaches the CAS primitive directly");
+      assert.ok(!src.includes("publisher-composition"), "even the admin route never wires the publisher composition itself");
+      continue;
+    }
     assert.ok(!src.includes("report-publisher"), path.relative(ROOT, f) + " must not import the publisher");
     assert.ok(!src.includes("publisher-composition"), path.relative(ROOT, f) + " must not import the trusted publisher composition");
     assert.ok(!src.includes("account-rollout"), path.relative(ROOT, f) + " must not import the rollout module");

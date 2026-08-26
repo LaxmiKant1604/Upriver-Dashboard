@@ -783,7 +783,10 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
       for (const [workKey, entries] of work) {
         const [, mode] = workKey.split("|");
         for (const batch of chunks(entries, source.batchSize)) {
-          if (clock() - startedAt > WORK_BUDGET_MS) {
+          // The work budget is injectable (deps.workBudgetMs) so a serverless caller can bound one invocation to
+          // its route deadline; the default stays the long operator budget. Deferral is a typed continuation.
+          const workBudgetMs = Number(deps.workBudgetMs) > 0 ? Number(deps.workBudgetMs) : WORK_BUDGET_MS;
+          if (clock() - startedAt > workBudgetMs) {
             // Work-budget deferral -> partial (resumable). Coverage mode gets a TOTAL result via the finalizer.
             if (coverageMode) return finalizeCoverageSummary(summary, { accounts: accounts.length, sourceKeys: selectedSources.map((s) => s.key), deferred: true }); // finally releases the lock
             summary.status = "partial";

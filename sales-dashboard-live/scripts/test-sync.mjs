@@ -76,12 +76,14 @@ test("schedule constants are 02:00 (non-us) and 10:30 (us) UTC", () => {
   assert.equal(SCHEDULE_CRON["non-us"], "0 2 * * *");
   assert.equal(SCHEDULE_CRON.us, "30 10 * * *");
 });
-test("automatic timing is paused: Vercel and GitHub Actions run no cron; scheduler-v2 remains manually dispatchable", () => {
+test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exact reviewed crons); Vercel runs no cron", () => {
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
   assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
-  assert.doesNotMatch(workflow, /^\s*schedule\s*:/m, "GitHub automatic scheduling is paused");
-  assert.doesNotMatch(workflow, /cron:/, "no GitHub cron remains");
+  // Cron is ACTIVE again (the collision/prerequisite/preflight failure classes are corrected): exactly the two
+  // reviewed times -- 02:00 UTC (07:30 IST, non-us) and 10:30 UTC (16:00 IST, us) -- and nothing else.
+  const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "exactly the two reviewed cron times");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
 });
 

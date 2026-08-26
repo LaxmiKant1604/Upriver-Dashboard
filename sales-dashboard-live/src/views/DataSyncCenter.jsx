@@ -94,18 +94,46 @@ export default function DataSyncCenter({ accessToken }) {
     finally { setBusyKey(""); }
   };
 
+  // ONE trusted operation per click: the route runs bounded slices (sync the selected source, then derive +
+  // publish every affected dashboard from the same evidence, safe-closing controls per slice); the UI POLLS the
+  // typed continuation automatically until terminal -- the user never has to re-click, and busyKey guards a
+  // double click from starting a second operation. Success is claimed ONLY after the route's live read-back.
   const syncMissing = async (card) => {
+    if (busyKey) return; // double-click guard: one operation at a time
     setBusyKey(`sync:${card.sourceKey}`);
     setError(""); setNotice("");
+    const startedBucket = bucket;
     try {
-      const response = await adminFetch("/api/admin/sources", accessToken, {
-        method: "POST",
-        body: JSON.stringify({ bucket, sourceKey: card.sourceKey }),
-      });
-      setData(response.status);
-      const result = response.result || {};
-      const note = result.stopped ? `stopped: ${result.stopReason?.code || "unknown"}` : (result.globalDrained ? "complete." : "more work remains; run again.");
-      setNotice(`${card.label}: sync missing data ${note} Proven historical coverage is never re-exported.`);
+      const MAX_POLLS = 40;
+      let terminalNote = null;
+      for (let poll = 1; poll <= MAX_POLLS; poll += 1) {
+        const response = await adminFetch("/api/admin/sources", accessToken, {
+          method: "POST",
+          body: JSON.stringify({ bucket: startedBucket, sourceKey: card.sourceKey }),
+        });
+        if (response.status) setData(response.status);
+        const op = response.operation || null;
+        if (op) {
+          if (op.phase === "complete" && op.ok === true) {
+            terminalNote = `${card.label}: source synced, dashboards updated (${op.published} accounts published + read back live).`;
+            break;
+          }
+          if (op.continuationRequired === true) {
+            setNotice(`${card.label}: ${op.phase === "sync" ? "syncing the source" : "publishing dashboards"}… (step ${poll}, continuing automatically)`);
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+          terminalNote = `${card.label}: source synced, dashboard publication pending — ${op.phase} reported: ${(op.problems || []).join("; ") || "typed failure"}. Saved data is preserved.`;
+          break;
+        }
+        // Legacy (non-orchestrated) result shape.
+        const result = response.result || {};
+        terminalNote = result.stopped
+          ? `${card.label}: stopped: ${result.stopReason?.code || "unknown"}`
+          : (result.globalDrained ? `${card.label}: sync complete.` : `${card.label}: more work remains; run again.`);
+        break;
+      }
+      setNotice(terminalNote || `${card.label}: still running — reopen this page to continue the operation (no duplicate exports are possible).`);
     } catch (err) { setError(err.message); }
     finally { setBusyKey(""); }
   };

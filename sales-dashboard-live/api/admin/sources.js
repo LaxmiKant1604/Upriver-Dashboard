@@ -13,13 +13,17 @@ import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, get
 import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../../lib/server/sync/source-status.js";
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
+import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
 
 export const config = { maxDuration: 60 };
 
 const RATE = new Map();
+// A completed manual sync is a POLLED CONTINUATION flow (the UI re-POSTs the same operation until terminal), so
+// the per-user window must admit a full multi-slice run; 30/10min still bounds abuse hard (each slice is itself
+// deadline-bounded and audited).
 function allowManualRun(userId, now = Date.now()) {
   const hits = (RATE.get(userId) || []).filter((time) => now - time < 10 * 60_000);
-  if (hits.length >= 4) return false;
+  if (hits.length >= 30) return false;
   hits.push(now);
   RATE.set(userId, hits);
   return true;
@@ -140,26 +144,109 @@ export default async function handler(req, res) {
         target: { bucket, sourceKey: onlySourceKey },
       }, { signal }), { write: true });
       // Finding 4: every registered source card action routes to its REAL architecture (bucket sync /
-      // single-family tranche composition) or refuses TYPED (durable-ads); finding 3: the runtime enforces
-      // a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
-      const result = onlySourceKey
-        ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight })
-        : await runtime.run({ bucket, deadline, preflight });
+      // single-family tranche composition / the durable-Ads runner) or refuses TYPED; finding 3: the runtime
+      // enforces a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
+      //
+      // ORCHESTRATED sources (OLI / ads-asin-date / product-catalog) get the FULL trusted flow: sync the ONE
+      // selected source, then derive + publish every affected dashboard from the SAME persisted evidence via the
+      // shared release engine (open controls -> publish via freshness CAS -> ALWAYS safe-close per slice -> exact
+      // live read-back). One request runs ONE bounded slice; `operation.continuationRequired` tells the UI to
+      // re-POST the SAME body until `operation.phase === "complete"` -- no duplicate creates on continuation
+      // (one-create-per-hash + coverage skip + CAS make every replay idempotent).
       // Round-6 fix 4: the response-status reads share the SAME route budget. An expired budget degrades
       // the refresh to a TYPED unavailable marker -- the action result itself is still reported honestly.
-      const boundedStatus = async () => {
+      const boundedStatusFn = async (dl) => {
         try {
-          return await deadline.bound("status-reads", () => statusPayload());
+          return await dl.bound("status-reads", () => statusPayload());
         } catch (error) {
           if (error && error.code === "ROUTE_DEADLINE_EXCEEDED") return { unavailable: "ROUTE_DEADLINE_EXCEEDED" };
           throw error;
         }
       };
-      if (result && result.refused === true) {
-        res.status(409).json({ refusal: result, status: await boundedStatus() });
+      let operation = null;
+      let result = null;
+      if (onlySourceKey && ORCHESTRATED_SOURCE_KEYS.includes(onlySourceKey)) {
+        const remainingMs = () => Math.max(1000, deadline.deadlineMs - deadline.reserveMs - Date.now());
+        const requestedPhase = body.phase == null ? "sync" : String(body.phase);
+        if (requestedPhase !== "sync" && requestedPhase !== "release") {
+          res.status(400).json({ error: "body.phase must be sync or release." });
+          return;
+        }
+        const asOf = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // server-resolved; never from the body
+        const request = validateSourceSyncRequest({ bucket, sourceKey: onlySourceKey, origin: "admin-manual", asOf });
+        let syncDone = requestedPhase === "release";
+        if (!syncDone) {
+          if (onlySourceKey === "ads-asin-date") {
+            const { runAsinAdsBucketSlice } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
+            const ads = await runAsinAdsBucketSlice({
+              bucket, asOf,
+              deps: { workerDeps: { workBudgetMs: Math.min(remainingMs() - 4000, 35_000) } },
+            });
+            if (ads.phase !== "complete") {
+              operation = ads.continuationRequired === true
+                ? { phase: "sync", continuationRequired: true, creates: ads.creates || 0, tokens: ads.tokens || 0 }
+                : { phase: "sync", ok: false, problems: ads.problems || [] };
+            } else { syncDone = true; result = { adsSync: ads }; }
+          } else {
+            const rollup = await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight });
+            if (rollup && rollup.refused === true) { res.status(409).json({ refusal: rollup, status: await boundedStatusFn(deadline) }); return; }
+            if (rollup && rollup.stopped === true) {
+              operation = { phase: "sync", ok: false, problems: ["source sync stopped: " + String(rollup.stopReason && rollup.stopReason.code)] };
+            } else if (rollup && rollup.continuationRequired === true) {
+              operation = { phase: "sync", continuationRequired: true };
+            } else { syncDone = true; result = { sourceSync: { cycleId: rollup && rollup.cycleId ? String(rollup.cycleId).slice(0, 8) : null, globalDrained: rollup ? rollup.globalDrained : null } }; }
+          }
+        }
+        if (syncDone && !operation) {
+          // RELEASE slice: derive + finalize + preflight-all + open/publish/ALWAYS-safe-close + read-back. The
+          // controls store and release surface are the SAME reviewed implementations the operators use.
+          const { buildPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-dashboards.js");
+          const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
+          const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
+          const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
+          const { paramsHashFor } = await import("../../lib/server/report-store.js");
+          const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
+          const { CONTROLLED_REPORT_KEYS } = await import("../../lib/server/sync/report-controls.js");
+          const { connectPriorityControlStore, discoverPrimaryAccountIds } = await import("../../lib/server/sync/priority-control-pg-store.js");
+          const sbMod = await import("../../lib/server/supabase.js");
+          const release = buildPriorityDashboardsRelease({ budgetMs: remainingMs(), asOfOverride: request.asOf, operationKey: request.operationKey });
+          const readbackLive = buildLiveReadback({
+            getReportSnapshot: sbMod.getReportSnapshot,
+            loadStoragePayload: sbMod.getReportSnapshotStoragePayload,
+            liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+            reportDerivations: REPORT_DERIVATIONS,
+            computeHash: paramsHashFor,
+          });
+          const operator = access.userId ? "admin:" + String(access.userId) : "admin:data-sync-center";
+          const controls = {
+            apply: async () => {
+              const r = await runControlPackageCli({ mode: "apply", operator, discoverAccounts: discoverPrimaryAccountIds, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS });
+              if (!r || r.committed !== true) throw new Error("controls apply did not commit");
+            },
+            close: async () => {
+              const r = await runControlPackageCli({ mode: "rollback", operator, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS });
+              if (!r || r.committed !== true) throw new Error("SAFE-CLOSE did not commit -- verify controls");
+            },
+          };
+          const rel = await runReleaseSlice({ bucket, release, controls, readbackLive, outOfTime: deadline.outOfTime });
+          operation = rel.phase === "complete" && rel.ok === true
+            ? { phase: "complete", ok: true, published: rel.published, readback: rel.readback }
+            : rel.continuationRequired === true
+              ? { phase: "release", continuationRequired: true, detail: rel.phase, published: rel.published ?? null }
+              : { phase: rel.phase, ok: false, problems: rel.problems || [] };
+        }
+        const status = await boundedStatusFn(deadline);
+        res.status(200).json({ operation, result, status });
         return;
       }
-      res.status(200).json({ result, status: await boundedStatus() });
+      result = onlySourceKey
+        ? await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight })
+        : await runtime.run({ bucket, deadline, preflight });
+      if (result && result.refused === true) {
+        res.status(409).json({ refusal: result, status: await boundedStatusFn(deadline) });
+        return;
+      }
+      res.status(200).json({ result, status: await boundedStatusFn(deadline) });
       return;
     }
 

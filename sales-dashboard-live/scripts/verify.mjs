@@ -56,6 +56,7 @@ const SUITES = [
   "test:asin-ads-aggregation",
   "test:daily-durable-rederive",
   "test:daily-v2-backfill",
+  "test:source-sync-operation",
   "test:daily-v2-serving",
   "test:durable-live-parity",
   "test:schema-contract-mutation",
