@@ -7,7 +7,7 @@ import { writeSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
-import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
+import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, assessDurableOliCoverageComplete, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
 import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING, tokenGateDecision, NON_US_RUN_TOKEN_CEILING, US_RUN_TOKEN_CEILING, LOW_BALANCE_WARN_TOKENS } from "../lib/server/datadoe-usage.js";
 import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
 import { fetchCompatibleSourceNames } from "../lib/server/datadoe.js";
@@ -173,11 +173,17 @@ test("C3. rejects every violation: not-drained, non-OLI source, failed job, batc
 
 group("D. GitHub Actions workflow: automatic schedule paused + manual publish/safe-close shape");
 
-test("D1. scheduler-v2.yml is manual-only while OLI is under correction, with concurrency, Node 24, and a >=90-min timeout", () => {
+test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UTC (us), bucket resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
-  assert.doesNotMatch(yml, /\n\s*schedule:\s*\n/, "automatic schedule is paused");
-  assert.doesNotMatch(yml, /cron:/, "no hidden cron remains");
+  // EXACTLY the two reviewed crons: 02:00 UTC = 07:30 IST Non-US, 10:30 UTC = 16:00 IST US.
+  const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "exactly the two reviewed cron times");
+  // The bucket comes from WHICH cron fired -- deterministic mapping, never inferred from the clock.
+  assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/, "02:00 UTC maps to non-us");
+  assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/, "10:30 UTC maps to us");
+  assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
+  assert.doesNotMatch(yml, /only workflow_dispatch is accepted/, "the pause-era dispatch-only gate is gone");
   assert.match(yml, /concurrency:\s*\n\s*group:\s*scheduler-v2/, "single-run concurrency group");
   assert.match(yml, /cancel-in-progress:\s*false/, "runs serialize, never overlap");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
@@ -217,10 +223,10 @@ test("D2. workflow shape: exact ordered pipeline with per-run token ceilings, cy
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. automatic scheduling is globally paused: ZERO workflow files declare a schedule trigger", () => {
+test("D3. SINGLE active scheduler: scheduler-v2.yml is the ONLY workflow declaring a schedule trigger", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8")));
-  assert.deepEqual(scheduled, [], "no workflow schedules while the production OLI correction is pending; got " + JSON.stringify(scheduled));
+  assert.deepEqual(scheduled, ["scheduler-v2.yml"], "exactly one scheduled workflow; got " + JSON.stringify(scheduled));
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");
@@ -405,6 +411,24 @@ test("G2. a TERMINAL cycle that IS a complete scheduled OLI run (22 accts -> 5 b
   assert.equal(cls.assessment.creates, 5); assert.equal(cls.assessment.tokens, 10);
 });
 
+test("G1b. DURABLE-COVERAGE idempotence: terminal non-OLI cycle + COMPLETE per-account coverage -> idempotent-complete (manual/scheduled collision resolved, zero creates)", () => {
+  const cat = { sourceJobs: [{ source_key: "product-catalog", request_hash: "cat", fetch_status: "succeeded", create_export_count: 1 }], owners: [{ request_hash: "cat", account_id: "__organization" }] };
+  const coverageByAccountId = Object.fromEntries(accountsN(22).map((a) => [a.accountId, [{ from: "2025-01-01", to: "2026-08-25" }]]));
+  const cov = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId, start: "2025-01-01", asOf: "2026-08-25" });
+  assert.equal(cov.complete, true, "all 22 accounts prove [2025-01-01..asOf]");
+  const cls = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: cov });
+  assert.equal(cls.disposition, "idempotent-complete", "complete durable coverage turns the collision into a zero-create success");
+  assert.equal(cls.reason, "durable-coverage-complete");
+  // INCOMPLETE coverage keeps the strict refusal (fail closed).
+  const short = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId: { ...coverageByAccountId, [accountsN(22)[0].accountId]: [{ from: "2025-01-01", to: "2026-08-20" }] }, start: "2025-01-01", asOf: "2026-08-25" });
+  assert.equal(short.complete, false); assert.equal(short.missingAccounts.length, 1);
+  const refuse = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: short });
+  assert.equal(refuse.disposition, "terminal-refuse", "incomplete coverage never authorizes idempotence");
+  // ABSENT/unreadable coverage (null) keeps the strict refusal too.
+  const strict = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: null });
+  assert.equal(strict.disposition, "terminal-refuse");
+});
+
 test("G3. an ABSENT or RUNNING cycle -> run (create/continue OLI); an unexpected status fails closed", () => {
   assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: null }).disposition, "run");
   assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "running" } }).disposition, "run");
@@ -535,8 +559,6 @@ test("I2. rejects EVERY incompleteness: short coverage, interior gap, blank prov
     ["failed/open OLI work", (i) => { i.perAccount[4].oliFailedOrOpen = true; }, /oli-failed-or-open/],
     ["failed ASIN-Ads", (i) => { i.perAccount[5].adsFailed = true; }, /ads-failed/],
     ["an account has NO evidence", (i) => { i.perAccount = i.perAccount.slice(0, 21); }, /account-missing-evidence/],
-    ["no Non-US cycle for asOf", (i) => { i.cyclePresent = false; }, /nonus-cycle-missing/],
-    ["Non-US cycle OLI incomplete", (i) => { i.cycleOliAssessment = { ok: false, problems: ["no-oli-jobs", "owner-coverage-missing"] }; }, /nonus-cycle-oli-incomplete/],
     ["evidence account outside discovery", (i) => { i.perAccount.push({ accountId: "STRANGER", oliCoveredTo: "2026-08-23", oliGapless: true, oliProvenanceOk: true, adsWindowCovered: true }); }, /evidence-account-outside-discovery/],
   ];
   for (const [name, mut, re] of cases) {
@@ -545,6 +567,25 @@ test("I2. rejects EVERY incompleteness: short coverage, interior gap, blank prov
     assert.equal(r.ok, false, name + " must block US");
     assert.ok(r.problems.some((p) => re.test(p)), name + " -> " + re + " in " + JSON.stringify(r.problems.slice(0, 4)));
   }
+});
+
+test("I2b. EVIDENCE-FIRST cycle shape: green durable evidence + missing/manual-shape cycle -> ok WITH a note; broken evidence still reports the cycle problems", () => {
+  const base = () => ({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: readyPerAccount(22), cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  // A same-asOf MANUAL Non-US operation (no scheduled cycle / a non-OLI-shape cycle) with COMPLETE durable
+  // evidence must NOT strand the US run -- the US derive reads the durable evidence, which is green.
+  const noCycle = base(); noCycle.cyclePresent = false;
+  let r = assessNonUsPrerequisites(noCycle);
+  assert.equal(r.ok, true, "complete durable evidence w/o a cycle is ready: " + JSON.stringify(r.problems));
+  assert.ok((r.notes || []).some((n) => /nonus-cycle-missing/.test(n)), "the missing cycle is NOTED, not fatal");
+  const oddCycle = base(); oddCycle.cycleOliAssessment = { ok: false, problems: ["no-oli-jobs"] };
+  r = assessNonUsPrerequisites(oddCycle);
+  assert.equal(r.ok, true, "a non-scheduled-shape cycle with green evidence is ready");
+  assert.ok((r.notes || []).some((n) => /nonus-cycle-oli-incomplete/.test(n)));
+  // BROKEN durable evidence: the cycle problems are reported alongside (they locate the gap) and US stays blocked.
+  const broken = base(); broken.perAccount[0].oliCoveredTo = "2026-08-20"; broken.cyclePresent = false;
+  r = assessNonUsPrerequisites(broken);
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => /oli-coverage-short/.test(p)) && r.problems.some((p) => /nonus-cycle-missing/.test(p)), "evidence + cycle problems both reported when evidence is broken");
 });
 
 // ---- run ----

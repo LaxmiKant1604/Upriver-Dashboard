@@ -1238,7 +1238,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       err.status = 503;
       throw err;
     };
+    // SOURCE-SCOPED refusal set: a SINGLE-SOURCE action (sourceKey set) must not fail because an UNRELATED
+    // source's evidence read is broken -- only the selected source itself plus the derive-REQUIRED shared inputs
+    // (canonical OLI + the org Catalog: both block sales in the post-sync derive) may refuse. Ads/FBA/other
+    // blockers on a scoped non-matching action are recorded evidence with their own typed degrades downstream
+    // (the derive marks Ads failed / a snapshot absent) -- never a preflight hard-stop for a different source.
+    // A FULL bucket run (sourceKey null) keeps the original refuse-on-anything-broken posture unchanged.
+    const deriveRequiredKeys = new Set([OLI_SOURCE_KEY, CATALOG_SOURCE_KEY]);
+    const blockerInScope = (b) => sourceKey == null || !b || !b.sourceKey || b.sourceKey === sourceKey || deriveRequiredKeys.has(b.sourceKey);
     for (const b of evidence.readBlockers) {
+      if (!blockerInScope(b)) continue;
       const reason = String(b.reason || "");
       if (reason.endsWith("schema-missing")) refuse("DURABLE_MODEL_UNAVAILABLE", reason, b);
       if (reason === "snapshot-dangling") refuse("SNAPSHOT_HYDRATION_FAILED", reason, b);
@@ -1252,19 +1261,28 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       if (reason.startsWith("ads-coverage-")) refuse("ADS_COVERAGE_READ_FAILED", reason, b);
       if (reason.startsWith("coverage-") || reason.startsWith("snapshot-")) refuse("SOURCE_EVIDENCE_READ_FAILED", reason, b);
     }
-    // Ads metrics: the typed read state is CAPTURED here (memoized). An infrastructure read failure refuses
-    // BEFORE any write; limit-exceeded is a VALID authoritative answer and stays a typed degrade.
+    // Ads metrics: the typed read state is CAPTURED here (memoized). For a FULL run (or an ads-scoped action) an
+    // infrastructure read failure refuses BEFORE any write; for a SCOPED NON-ads action (OLI/Catalog card) it is
+    // recorded as the typed "read-failed" degrade instead -- the post-sync derive marks Ads failed while sales
+    // still save, so an unrelated ads read blip can never block the selected source's sync. limit-exceeded is a
+    // VALID authoritative answer and stays a typed degrade everywhere.
+    const adsReadMayDegrade = sourceKey != null && sourceKey !== "ads-asin-date" && sourceKey !== "ads-campaign-date";
     const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
     const adMetricsByAccountId = {};
     for (const a of accounts) {
       try {
         const rows = await dl.bound("ads-metrics-load", (signal) => readAdMetrics(a.accountId, dailyWindow.from, dailyWindow.to, { signal }));
-        if (!Array.isArray(rows)) refuse("ADS_METRICS_READ_FAILED", "ads-metrics-malformed", { accountId: a.accountId });
+        if (!Array.isArray(rows)) {
+          if (adsReadMayDegrade) { adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: "read-failed" }; continue; }
+          refuse("ADS_METRICS_READ_FAILED", "ads-metrics-malformed", { accountId: a.accountId });
+        }
         adMetricsByAccountId[a.accountId] = { rows, metricsRead: "ok" };
       } catch (e) {
         if (dl.isDeadlineError(e) || (e && e.code === "ADS_METRICS_READ_FAILED")) throw e;
         if (e && e.code === "ADS_ROW_LIMIT_EXCEEDED") {
           adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: "limit-exceeded" };
+        } else if (adsReadMayDegrade) {
+          adMetricsByAccountId[a.accountId] = { rows: [], metricsRead: "read-failed" };
         } else {
           refuse("ADS_METRICS_READ_FAILED", "ads-metrics-read", { accountId: a.accountId });
         }

@@ -7,7 +7,7 @@
 // the strict post-drain proof. It NEVER runs Ads/FBA/Catalog or any other family.
 
 import { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
-import { OLI_SOURCE_KEY, ORGANIZATION_SCOPE_KEY } from "./source-durable-model.js";
+import { OLI_SOURCE_KEY, ORGANIZATION_SCOPE_KEY, windowsProve } from "./source-durable-model.js";
 
 export const OLI_TOKENS_PER_CREATE = 2; // one STANDARD DataDoe export
 
@@ -130,9 +130,34 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
  *                                             catalog/priority-release cycle): a typed refusal BEFORE any create.
  *   - { disposition: "refuse", reason }    -- an unexpected cycle status: fail closed.
  * It NEVER weakens assessScheduledOliCycle -- the terminal cycle is adopted ONLY when that strict assessment
- * (over the cycle's OLI jobs, open=0) passes.
+ * (over the cycle's OLI jobs, open=0) passes, OR when the caller PROVES (durableCoverage.complete) that the
+ * DURABLE per-account OLI coverage already spans the full authorized window for EVERY discovered account. The
+ * durable-coverage branch is what stops a same-day MANUAL operation (e.g. a catalog/priority-release cycle, or a
+ * manual Data Sync Center OLI run that already recorded the coverage) from colliding with the scheduled run: the
+ * evidence is complete, so the scheduled replay is a zero-create idempotent success -- never an append to the
+ * terminal cycle, and never a false failure. An INCOMPLETE-coverage terminal collision still refuses (fail closed).
  */
-export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, sourceJobs, owners } = {}) {
+/**
+ * PURE: is the DURABLE per-account OLI coverage already complete for the authorized window? For every discovered
+ * account, its proven coverage windows must contiguously span [start .. asOf] (windowsProve; malformed evidence
+ * fails closed to incomplete). This is the evidence a terminal-cycle collision consults: complete coverage means
+ * the day's OLI work is already durably done (whoever did it), so a scheduled replay needs ZERO creates. The
+ * daily rolling-correction re-export is a REFRESH of already-covered dates, so skipping it on a collision day
+ * loses no coverage -- the next scheduled day corrects normally. Returns { complete, missingAccounts }.
+ */
+export function assessDurableOliCoverageComplete({ discoveredAccounts, coverageByAccountId, start, asOf } = {}) {
+  const accounts = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a))).filter(nb))];
+  if (!accounts.length || !nb(start) || !nb(asOf)) return { complete: false, missingAccounts: accounts };
+  const missingAccounts = [];
+  for (const accountId of accounts) {
+    let proven = false;
+    try { proven = windowsProve((coverageByAccountId || {})[accountId] || [], S(start), S(asOf)); } catch (_e) { proven = false; }
+    if (!proven) missingAccounts.push(accountId);
+  }
+  return { complete: missingAccounts.length === 0, missingAccounts };
+}
+
+export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, sourceJobs, owners, durableCoverage = null } = {}) {
   if (!cycle || !nb(cycle.id)) return { disposition: "run", reason: "no-cycle" };
   const status = S(cycle.status ?? cycle.cycleStatus);
   if (status === "running") return { disposition: "run", reason: "running-cycle" };
@@ -141,5 +166,12 @@ export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, s
   const oliJobs = (Array.isArray(sourceJobs) ? sourceJobs : []).filter((j) => S(j.source_key ?? j.sourceKey) === OLI_SOURCE_KEY);
   const assessment = assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs: oliJobs, owners, open: 0 });
   if (assessment.ok) return { disposition: "idempotent-complete", assessment, cycleStatus: status };
+  // DURABLE-COVERAGE idempotence: the cycle is not a scheduled OLI run, but the durable coverage already proves
+  // the authorized window for every discovered account -> nothing is missing -> zero-create success. The caller
+  // computes `complete` from source_coverage (windowsProve over [fixed-start .. asOf] per discovered account);
+  // absent/false keeps the strict refusal.
+  if (durableCoverage && durableCoverage.complete === true) {
+    return { disposition: "idempotent-complete", assessment, cycleStatus: status, reason: "durable-coverage-complete" };
+  }
   return { disposition: "terminal-refuse", reason: "terminal-cycle-not-a-completed-oli-run", assessment, cycleStatus: status };
 }

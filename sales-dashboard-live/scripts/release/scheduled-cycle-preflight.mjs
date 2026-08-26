@@ -15,10 +15,12 @@ const bucket = argOf("bucket");
 if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
+const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { fetchAccounts } = await import("../../lib/server/datadoe.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
-const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle } = await import("../../lib/server/supabase.js");
-const { classifyScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
+const { classifyScheduledOliCycle, assessDurableOliCoverageComplete } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 
 const today = new Date().toISOString().slice(0, 10);
 const log = (m) => console.log("cycle-preflight[" + bucket + "@" + today + "]: " + m);
@@ -39,12 +41,27 @@ catch (e) { console.error("STOP SCHEDULED_CYCLE_AMBIGUOUS: more than one " + buc
 if (!cycle || !cycle.id) { log("no cycle for today -> runnable (a fresh cycle will be created)."); process.exit(0); }
 const jobs = await getSyncSourceJobs(cycle.id);
 const owners = await getSyncSourceJobOwnersForCycle(cycle.id);
-const cls = classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts: discovered, sourceJobs: jobs, owners });
+// DURABLE-COVERAGE evidence for the terminal-collision branch: when a same-date manual operation already made the
+// cycle terminal, the day's OLI may nonetheless be durably complete -- prove it from source_coverage so the
+// collision becomes a zero-create idempotent success instead of a false failure. Read-only, zero tokens.
+let durableCoverage = null;
+try {
+  const oliStart = sourceRegistryEntry("order-line-items").initialBackfill.start;
+  const asOf = new Date(Date.parse(today + "T00:00:00.000Z") - 86400000).toISOString().slice(0, 10);
+  const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
+  const coverageByAccountId = {};
+  for (const a of discovered) {
+    const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, sourceKey: "order-line-items" });
+    coverageByAccountId[a.accountId] = cov && cov.read === "ok" ? (cov.windows || []) : [];
+  }
+  durableCoverage = assessDurableOliCoverageComplete({ discoveredAccounts: discovered, coverageByAccountId, start: oliStart, asOf });
+} catch (_e) { durableCoverage = null; } // unreadable coverage NEVER authorizes idempotence (fail closed to the strict path)
+const cls = classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts: discovered, sourceJobs: jobs, owners, durableCoverage });
 const cid8 = String(cycle.id).slice(0, 8);
 if (cls.disposition === "terminal-refuse" || cls.disposition === "refuse") {
   const why = cls.assessment ? [...new Set(cls.assessment.problems.map((p) => String(p).split(":")[0]))].join(",") : cls.reason;
-  console.error("STOP SCHEDULED_CYCLE_TERMINAL_COLLISION: today's " + bucket + " cycle " + cid8 + " is terminal (" + String(cycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "). The run must not proceed on this occupied slot; a fresh cycle date is required.");
+  console.error("STOP SCHEDULED_CYCLE_TERMINAL_COLLISION: today's " + bucket + " cycle " + cid8 + " is terminal (" + String(cycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "), and durable OLI coverage is INCOMPLETE" + (durableCoverage ? " (missing " + durableCoverage.missingAccounts.length + " accounts)" : " (coverage unreadable)") + ". The run must not proceed on this occupied slot.");
   process.exit(1);
 }
-if (cls.disposition === "idempotent-complete") { log("cycle " + cid8 + " already holds a complete scheduled OLI run -> runnable (the operator will replay idempotently)."); process.exit(0); }
+if (cls.disposition === "idempotent-complete") { log("cycle " + cid8 + " -> idempotent-complete (" + (cls.reason || "scheduled-oli-run-complete") + "): runnable, zero creates."); process.exit(0); }
 log("cycle " + cid8 + " is running -> runnable (OLI will continue on it)."); process.exit(0);

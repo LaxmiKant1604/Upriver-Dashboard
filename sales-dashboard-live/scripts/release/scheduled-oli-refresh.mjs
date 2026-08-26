@@ -25,9 +25,12 @@ if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must 
 if (asOf != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
 
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
-const { getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSyncCycleByBucketDate } = await import("../../lib/server/supabase.js");
+const { getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSyncCycleByBucketDate, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY } = await import("../../lib/server/sync/source-durable-model.js");
-const { assessScheduledOliCycle, classifyScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { assessScheduledOliCycle, classifyScheduledOliCycle, assessDurableOliCoverageComplete } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
+const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
+const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 
 const OLI = OLI_SOURCE_KEY;
 // A LONG operator deadline for the CI job (the workflow allots >=90 min); overridable for tests/ops. MAX_ITERS is
@@ -66,15 +69,32 @@ try {
 if (existingCycle && existingCycle.id) {
   const existingJobs = await getSyncSourceJobs(existingCycle.id);
   const existingOwners = await getSyncSourceJobOwnersForCycle(existingCycle.id);
-  const cls = classifyScheduledOliCycle({ bucket, cycle: existingCycle, discoveredAccounts: discovered, sourceJobs: existingJobs, owners: existingOwners });
+  // DURABLE-COVERAGE evidence for a terminal collision: a same-date MANUAL operation (catalog / priority release /
+  // a manual OLI run) may have made the cycle terminal while the day's OLI is durably complete. Prove it from
+  // source_coverage (read-only, zero tokens) so the collision is a zero-create idempotent success -- never an
+  // append to the terminal cycle, and never a false failure. Unreadable coverage stays null (strict path).
+  let durableCoverage = null;
+  try {
+    const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
+    const covAsOf = asOf || new Date(Date.parse(today + "T00:00:00.000Z") - 86400000).toISOString().slice(0, 10);
+    const covPrimary = getDataDoeConnections().find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+    const orgFp = covPrimary.organizationFingerprint || organizationFingerprint(covPrimary.apiKey);
+    const coverageByAccountId = {};
+    for (const acct of discovered) {
+      const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId: acct.accountId, sourceKey: OLI });
+      coverageByAccountId[acct.accountId] = cov && cov.read === "ok" ? (cov.windows || []) : [];
+    }
+    durableCoverage = assessDurableOliCoverageComplete({ discoveredAccounts: discovered, coverageByAccountId, start: oliStart, asOf: covAsOf });
+  } catch (_e) { durableCoverage = null; }
+  const cls = classifyScheduledOliCycle({ bucket, cycle: existingCycle, discoveredAccounts: discovered, sourceJobs: existingJobs, owners: existingOwners, durableCoverage });
   const cid8 = String(existingCycle.id).slice(0, 8);
   if (cls.disposition === "terminal-refuse" || cls.disposition === "refuse") {
     const why = cls.assessment ? [...new Set(cls.assessment.problems.map((p) => String(p).split(":")[0]))].join(",") : cls.reason;
-    console.error("STOP SCHEDULED_OLI_TERMINAL_CYCLE: the " + today + " " + bucket + " cycle " + cid8 + " is terminal (" + String(existingCycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "). Refusing to append OLI to a terminal cycle / assess an unrelated cycle as its own -- ZERO creates. A fresh cycle date (a later day) is required; the rolling window recovers any missed dates.");
+    console.error("STOP SCHEDULED_OLI_TERMINAL_CYCLE: the " + today + " " + bucket + " cycle " + cid8 + " is terminal (" + String(existingCycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "), and durable OLI coverage is INCOMPLETE" + (durableCoverage ? " (missing " + durableCoverage.missingAccounts.length + " accounts)" : " (coverage unreadable)") + ". Refusing to append OLI to a terminal cycle -- ZERO creates.");
     process.exit(1);
   }
   if (cls.disposition === "idempotent-complete") {
-    log("idempotent: the " + today + " " + bucket + " cycle " + cid8 + " already holds a COMPLETE scheduled OLI run (" + cls.assessment.batches + " batches, " + cls.assessment.creates + " creates, " + cls.assessment.tokens + " tokens); no re-fetch, ZERO new creates.");
+    log("idempotent (" + (cls.reason || "scheduled-oli-run-complete") + "): the " + today + " " + bucket + " cycle " + cid8 + " -> the day's OLI evidence is already complete; no re-fetch, ZERO new creates.");
     process.exit(0);
   }
   // disposition "run": a RUNNING cycle -> continue OLI below.

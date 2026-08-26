@@ -1,8 +1,9 @@
 name: scheduler-v2
 
-# TRUSTED MANUAL refresh workflow for Daily Reporting + Brand View (Scheduler v2). Automatic cron triggers are
-# PAUSED while the production OLI HTTP-400 request rejection is corrected and manually verified. The full
-# source-refresh + derive + publish flow exceeds Vercel's 60s route cap; NO pg_cron and NO Vercel cron exist.
+# TRUSTED refresh workflow for Daily Reporting + Brand View (Scheduler v2) -- the ONLY automatic scheduler
+# (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap).
+# Cron is ACTIVE again: the OLI HTTP-400 limit rejection, the terminal-cycle collision class (durable-coverage
+# idempotence), the evidence-first US prerequisite, and the source-scoped preflight are corrected and tested.
 # Daily Reporting + Brand View only -- Campaign Ads, FBA and every unrelated report are structurally absent.
 #
 #   - non-us @ 02:00 UTC (07:30 IST): cycle preflight -> confirm >=20 tokens -> Non-US OLI -> Non-US ASIN Ads ->
@@ -19,6 +20,12 @@ name: scheduler-v2
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
+  schedule:
+    # 02:00 UTC = 07:30 IST -> the Non-US source run; 10:30 UTC = 16:00 IST -> the US run (which also derives +
+    # publishes all 30 accounts after proving the same-asOf Non-US evidence). The bucket is resolved from WHICH
+    # cron fired (github.event.schedule) -- never guessed from the clock.
+    - cron: "0 2 * * *"
+    - cron: "30 10 * * *"
   workflow_dispatch:
     inputs:
       bucket:
@@ -70,10 +77,16 @@ jobs:
         id: cfg
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "Automatic scheduling is paused; only workflow_dispatch is accepted." >&2; exit 1
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Resolve the bucket from WHICH cron fired -- deterministic, never inferred from the wall clock.
+            case "${{ github.event.schedule }}" in
+              "0 2 * * *")   bucket="non-us" ;;
+              "30 10 * * *") bucket="us" ;;
+              *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
+            esac
+          else
+            bucket="${{ github.event.inputs.bucket }}"
           fi
-          bucket="${{ github.event.inputs.bucket }}"
           if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then echo "Invalid bucket '$bucket'." >&2; exit 1; fi
           if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"

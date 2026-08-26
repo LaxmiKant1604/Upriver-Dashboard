@@ -1,7 +1,8 @@
-// Scheduler v2 -- PURE assessment that the US scheduled run's prerequisite (a SUCCESSFUL same-asOf Non-US run)
+// Scheduler v2 -- PURE assessment that the US scheduled run's prerequisite (complete same-asOf Non-US EVIDENCE)
 // is satisfied, BEFORE any US DataDoe create or control write. The US derive reads durable Non-US OLI + ASIN Ads
-// evidence, so this gate proves that evidence is complete for ALL 22 Non-US primary accounts. Fail-closed: any
-// missing/short/gapped/unprovenanced/uncovered/failed account, or a missing/incomplete Non-US OLI cycle, blocks US.
+// evidence, so this gate proves that evidence is complete for ALL Non-US primary accounts. Fail-closed on any
+// missing/short/gapped/unprovenanced/uncovered/failed account. The cycle-shape check is SECONDARY provenance:
+// with fully green durable evidence, a missing/non-scheduled-shape cycle (manual run, adopted export) is a note.
 
 const S = (v) => (v == null ? "" : String(v));
 
@@ -41,12 +42,23 @@ export function assessNonUsPrerequisites({ asOf, discoveredAccounts, perAccount,
     if (p.adsFailed === true) problems.push("ads-failed:" + id.slice(0, 8));
   }
 
-  // 6. successful Non-US scheduled run/cycle evidence for the SAME asOf.
-  if (cyclePresent !== true) problems.push("nonus-cycle-missing");
-  else if (!cycleOliAssessment || cycleOliAssessment.ok !== true) problems.push("nonus-cycle-oli-incomplete:" + (cycleOliAssessment ? [...new Set((cycleOliAssessment.problems || []).map((x) => String(x).split(":")[0]))].join(",") : "na"));
-
   // 5. exact account/owner isolation: no evidence account outside the freshly discovered primary set.
   for (const p of perAccount || []) if (!discoveredSet.has(S(p && p.accountId))) problems.push("evidence-account-outside-discovery");
 
-  return { ok: problems.length === 0, problems: [...new Set(problems)], accounts: discovered.length };
+  // 6. Non-US run/cycle evidence for the SAME asOf -- EVIDENCE-FIRST: the per-account durable checks above (OLI
+  // gapless-through-asOf with provenance, exact ads-window coverage, nothing failed/open, no out-of-discovery
+  // evidence) are the AUTHORITATIVE prerequisite, because the US derive reads exactly that durable evidence. The
+  // cycle-shape check is secondary provenance: when every durable check is green, a missing or non-scheduled-shape
+  // cycle (e.g. the day's Non-US work arrived via a MANUAL Data Sync Center run or an adopted export) is a NOTE,
+  // not a blocker -- otherwise legitimate complete evidence would strand the US run. When any durable check
+  // FAILED, the cycle problems are reported too (they help locate the gap).
+  const durableComplete = problems.length === 0;
+  const cycleProblems = [];
+  if (cyclePresent !== true) cycleProblems.push("nonus-cycle-missing");
+  else if (!cycleOliAssessment || cycleOliAssessment.ok !== true) cycleProblems.push("nonus-cycle-oli-incomplete:" + (cycleOliAssessment ? [...new Set((cycleOliAssessment.problems || []).map((x) => String(x).split(":")[0]))].join(",") : "na"));
+  const notes = [];
+  if (durableComplete && cycleProblems.length) notes.push("cycle-shape-note:" + cycleProblems.join("|") + " (durable evidence complete; not blocking)");
+  if (!durableComplete) problems.push(...cycleProblems);
+
+  return { ok: problems.length === 0, problems: [...new Set(problems)], notes, accounts: discovered.length };
 }
