@@ -65,6 +65,7 @@ const SUITES = [
   "test:datadoe-poll-export",
   "test:supabase-read-retry",
   "test:source-download-recovery",
+  "test:source-create-reconcile",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",

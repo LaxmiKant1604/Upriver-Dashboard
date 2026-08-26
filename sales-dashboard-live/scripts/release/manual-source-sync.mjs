@@ -59,21 +59,28 @@ if (request.sourceKey === "ads-asin-date") {
   const deadline = runtime.makeDeadline();
   const preflight = await runtime.preflightEvidence({ bucket: request.bucket, sourceKey: request.sourceKey, deadline });
   const isOpen = (j) => { const st = j.fetch_status ?? j.fetchStatus; return st === "pending" || st === "attempted"; };
-  let cycleId = null; let prevOpen = Infinity; let stall = 0;
+  const isFailedResumable = (j) => (j.fetch_status ?? j.fetchStatus) === "failed" && j.terminal !== true;
+  let cycleId = null; let prevOutstanding = Infinity; let stall = 0;
   for (let iter = 1; iter <= 200; iter += 1) {
     const res = await runtime.runSourceCardAction({ bucket: request.bucket, sourceKey: request.sourceKey, deadline, preflight });
     if (res && res.refused === true) { console.error("STOP source action refused: " + (res.code || "unknown")); process.exit(1); }
     cycleId = (res && res.cycleId) || cycleId;
     if (!cycleId) { log("nothing to sync (no cycle opened: zero missing work)"); break; }
     const jobs = await getSyncSourceJobs(cycleId);
-    const open = jobs.filter((j) => (j.source_key ?? j.sourceKey) === request.sourceKey && isOpen(j)).length;
-    log("iter " + iter + ": cycle=" + String(cycleId).slice(0, 8) + " open=" + open);
-    if (open === 0) break;
-    if (outOfTime()) { console.error("STOP operator budget exhausted with open=" + open); process.exit(1); }
-    stall = open >= prevOpen ? stall + 1 : 0; prevOpen = open;
-    if (stall >= 2) { console.error("STOP no progress for 2 consecutive resumptions (open=" + open + ")"); process.exit(1); }
+    const family = jobs.filter((j) => (j.source_key ?? j.sourceKey) === request.sourceKey);
+    const open = family.filter(isOpen).length;
+    const failed = family.filter(isFailedResumable).length;
+    // DRAINED means every family job SUCCEEDED -- a typed-failed non-terminal job (transient 503 / interrupted
+    // create) is NOT drained: the engine re-attempts it on the next pass (its own reviewed resume semantics), so
+    // keep resuming while ANY outstanding work remains, with the stall guard as the honest stop.
+    const outstanding = open + failed;
+    log("iter " + iter + ": cycle=" + String(cycleId).slice(0, 8) + " open=" + open + " failed=" + failed);
+    if (outstanding === 0) break;
+    if (outOfTime()) { console.error("STOP operator budget exhausted with open=" + open + " failed=" + failed); process.exit(1); }
+    stall = outstanding >= prevOutstanding ? stall + 1 : 0; prevOutstanding = outstanding;
+    if (stall >= 2) { console.error("STOP no progress for 2 consecutive resumptions (open=" + open + " failed=" + failed + ") -- transient source failures persisted; LKG intact, re-run later."); process.exit(1); }
   }
-  log("source sync drained");
+  log("source sync drained (every family job succeeded)");
 }
 
 // ---------------- Stage 2: derive + publish EVERY affected dashboard (same evidence, zero new exports) ----------
