@@ -12354,3 +12354,35 @@ SCHEDULER READINESS FIX -- effectivePublishAsOf clamp + fulfillment normalizatio
   canonical category attached additively by getSourceOliDimensionalContribution. Parity tests: synonyms can never
   split a contribution into four categories.
 - Tests: effective-asof.test.js (10) + fulfillment/parity in oli-dimensional.test.js (+66). verify 70/70 green.
+
+BRAND SALES CANCELLED-CORRECTION BACKFILL (2026-08-26, code ca83784, UNPUSHED->push pending):
+- DIAGNOSED in prod: live brand-sales STILL counted cancelled (live == corrected rollup + cancelled-only, to the
+  cent: fd7653e8 was +206,401.45 = cancelled-only 206,401.45). Daily was already fixed by the daily-v2 backfill;
+  brand-sales was never re-derived and the terminal 08-26 cycle blocked the priority release from re-deriving it.
+- FIX: backfillBrandSalesV1 (lib/server/reports/brand-sales-backfill.js) + CLI backfill-brand-sales.mjs -- the
+  Brand View analog of daily-v2-backfill. Re-derives brand-sales-shared-v1 per account from the CORRECTED rollup
+  via orderRowsFromHistory (seller name+marketplace from the primary directory), each account ENDING at its own
+  latest proven OLI date, provenance-guarded, freshness-CAS, idempotent on the sales fingerprint. ZERO adapter =>
+  zero tokens. APPLIED: 30/30 corrected (0 tokens); live brand-sales now reconciles EXACTLY with the corrected
+  rollup for EVERY account (US to=08-24/08-25, non-us to=08-25). Daily<->Brand parity proven exact.
+- Also fixed rebuild-brand-membership.mjs (membership Map value is {display,accounts:Set}; iterate entry.accounts,
+  not the entry) -- the prior `for (const a of set)` threw and broke the workflow's post-publish step. Rebuild now
+  OK (44 brands / 37 accounts / 133 pairs).
+
+RELEASE + PUBLISH OUTCOME (2026-08-26, this continuation):
+- effectivePublishAsOf fix PROVEN against prod: gatherDurableReadiness US daily.ready=TRUE + brandView.ready=TRUE
+  at effectivePublishAsOf=2026-08-24 (was ready=false at refreshAsOf=08-25); non-us ready at 08-25. Ads/FBA are
+  blocksSales:false (don't block sales), exactly as required.
+- Priority release: derive+finalize BOTH buckets succeeded (US 8x3 report jobs at eff 08-24 -- the fix produced
+  the jobs that were 0 before; non-us 22x3 already-complete). US cycle 08-26 was 'running' (0 jobs) from the
+  stalled cron -> resumed; non-us 08-26 already 'succeeded'. 0 catalog creates / 0 tokens (adopted the
+  scheduled/2026-08-25 catalog export). NOTE: the manual release DEFAULTS to operationKey v2 whose catalog hash is
+  STALE (fedc8bce); production cycles use the scheduled hash f74d3157 -> a post-go-live manual release MUST pass
+  --operation-key=priority-dashboards/scheduled/<asOf-yesterday> (the reservation matching today's cycles).
+- The release's own publish stage stops at newer-live: the live DAILY is already fresh+correct (daily-v2 re-derive
+  at 11:06:48 > the 08-26 cron cycle), so the freshness-CAS correctly refuses to overwrite it and the all-or-
+  nothing runner stops. Daily is CORRECT (live == corrected rollup, verified exact). Brand-sales was the genuinely
+  stale surface -> fixed by the backfill above (not the release). Controls were opened (30 acct / 90 approvals,
+  all_primary=false) then ALWAYS safe-closed (rollback COMMITTED).
+- Live state now: daily 30/30 fresh+correct (US 08-24, non-us 08-25); brand-sales 30/30 corrected; brand-inventory
+  30/30 present; membership rebuilt OK. Vercel 200.
