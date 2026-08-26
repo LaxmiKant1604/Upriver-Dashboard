@@ -989,12 +989,17 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
  * can return a multi-megabyte saved Dashboard payload, and a serverless function
  * holding a dozen of those at once is how this route would run out of memory.
  */
-export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null }) {
+export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null }) {
   // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
   // -> product_brand is what maps each account's ad ASINs to this brand).
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
   const slices = [];
   for (const accountId of accountIds) {
+    // Bound the full-portfolio rebuild by the route deadline: a slow multi-account rebuild must return typed
+    // "updating" BEFORE the serverless timeout (the caller serves the last-known-good meanwhile), never a 504.
+    // Checking BETWEEN accounts (not inside the swallow-on-missing slice) means a deadline can never be
+    // misread as an unavailable account and published as an incomplete portfolio.
+    if (deadline && typeof deadline.ensureTime === "function") await deadline.ensureTime("brand-view-portfolio-slice");
     slices.push(await buildAccountBrandSlice({
       accountId,
       brand,

@@ -185,8 +185,27 @@ export async function serveSharedReport({
   // Injectable Supabase readers + self-heal store, so the full read path (including the brand-scoped stale fallback
   // and the durable self-heal) is provable offline. Production passes nothing and uses the module wrappers.
   readers = {}, store = undefined,
+  // FRESHNESS (Brand View): the newest contributing-source provenance (ISO). When set, a served snapshot older
+  // than it is flagged `updating:true` so the caller shows the last-known-good NOW and a zero-export rebuild is
+  // known to be due (default null = the field is never added, behaviour byte-identical for every other report).
+  contributingProvenanceAt = null,
+  // 504 GUARD (Brand View portfolio): when true, a READ never runs the potentially-slow `deriveDurable` inline
+  // (the serverless-timeout source); a missing snapshot returns a typed `updating` state instead. The bounded
+  // rebuild happens only on an explicit refresh (below). Default false keeps the inline self-heal for every
+  // other report.
+  deferRebuildOnRead = false,
+  // When set (a makeRouteDeadline handle), the REFRESH build is bounded: on ROUTE_DEADLINE_EXCEEDED the caller
+  // serves the last-known-good + `updating:true` (HTTP 200), never a 504. Default null = unbounded (unchanged).
+  routeDeadline = null,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
+  // Null-safe source-staleness probe: a served snapshot whose source provenance predates the newest contributing
+  // provenance is stale (a rebuild is due). Returns false whenever no provenance was supplied (never fabricates).
+  const isSourceStale = (snap) => {
+    if (!contributingProvenanceAt || !snap) return false;
+    const snapAt = String(snap.source_refreshed_at || snap.updated_at || "");
+    return !!snapAt && snapAt < String(contributingProvenanceAt);
+  };
   const readSnapshot = readers.getReportSnapshot || getReportSnapshot;
   const readLatest = readers.getLatestReportSnapshot || getLatestReportSnapshot;
   const readLatestForScope = readers.getLatestReportSnapshotForScope || getLatestReportSnapshotForScope;
@@ -211,9 +230,13 @@ export async function serveSharedReport({
   if (!refresh) {
     const snapshot = await readSnapshot({ reportKey, accountId, paramsHash });
     if (snapshot && snapshot.payload) {
+      // The EXACT snapshot exists. If the contributing sources have advanced past it (e.g. brand-sales rolled
+      // 21 -> 25 Aug under the same asOf), serve it NOW but flag `updating` so a zero-export rebuild is triggered.
+      const updating = isSourceStale(snapshot);
       res.status(200).json({
         ...present(snapshot.payload),
         reportKey, reportVersion, paramsHash,
+        ...(updating ? { updating: true } : {}),
         snapshot: snapshotMeta(snapshot),
       });
       return;
@@ -233,15 +256,32 @@ export async function serveSharedReport({
     if (latest && latest.payload
         && staleSnapshotMatchesReportVersion(latest, reportVersion)
         && staleSnapshotMatchesScope(latest, params, staleScopeKeys)) {
+      // A last-known-good for a DIFFERENT params hash (across-day / changed account set) is itself a stale
+      // scope; when a rebuild is deferred (Brand View portfolio) OR the sources advanced past it, flag updating
+      // so the caller shows this LKG NOW and polls until the rebuild republishes the exact-identity snapshot.
+      const updating = deferRebuildOnRead || isSourceStale(latest);
       res.status(200).json({
         ...present(latest.payload),
         reportKey, reportVersion, paramsHash,
+        ...(updating ? { updating: true } : {}),
         snapshot: {
           ...snapshotMeta(latest),
           staleScope: true,
           savedForParams: latest.params || null,
           requestedParams: { reportVersion, ...params },
         },
+      });
+      return;
+    }
+
+    // 504 GUARD: a slow full-portfolio rebuild must NOT run inline on a read. When deferRebuildOnRead is set and
+    // no snapshot exists at all, return a typed `updating` state (never a blank fatal error); the frontend shows
+    // the updating state and triggers the bounded rebuild via an explicit refresh.
+    if (deferRebuildOnRead) {
+      res.status(200).json({
+        snapshotMissing: true, updating: true,
+        reportKey, reportVersion, accountId, paramsHash,
+        message: `${label} is being prepared from saved data. It will appear here shortly — no export is created.`,
       });
       return;
     }
@@ -284,7 +324,32 @@ export async function serveSharedReport({
   }
 
   try {
-    const payload = await build();
+    let payload;
+    try {
+      payload = await build();
+    } catch (e) {
+      // BOUNDED rebuild: on a route-deadline expiry, serve the last-known-good + `updating` (HTTP 200) so the
+      // page never blanks with a 504. The frontend polls; a later pass republishes the exact-identity snapshot.
+      if (routeDeadline && routeDeadline.isDeadlineError && routeDeadline.isDeadlineError(e)) {
+        const lkg = staleScopeKeys.length
+          ? await readLatestForScope({ reportKey, accountId, reportVersion, scope: pickStaleScope(params, staleScopeKeys) })
+          : await readLatest({ reportKey, accountId });
+        if (lkg && lkg.payload) {
+          res.status(200).json({
+            ...present(lkg.payload),
+            reportKey, reportVersion, paramsHash, updating: true,
+            snapshot: { ...snapshotMeta(lkg), staleScope: lkg.params_hash !== paramsHash, rebuildDeferred: true },
+          });
+        } else {
+          res.status(200).json({
+            snapshotMissing: true, updating: true, reportKey, reportVersion, accountId, paramsHash,
+            message: `${label} is still being prepared from saved data. It will appear here shortly — no export is created.`,
+          });
+        }
+        return;
+      }
+      throw e;
+    }
     const serialised = JSON.stringify(payload);
     const payloadBytes = Buffer.byteLength(serialised, "utf8");
     if (payloadBytes > MAX_SNAPSHOT_BYTES) {

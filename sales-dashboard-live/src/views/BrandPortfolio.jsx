@@ -46,6 +46,11 @@ export default function BrandPortfolio({
   const [notice, setNotice] = useState(null);
   const [savedAt, setSavedAt] = useState(null);
   const [staleScope, setStaleScope] = useState(null);
+  // `updating` = the server served the last-known-good but the contributing sources have advanced (or no
+  // snapshot exists yet), so a bounded zero-export rebuild is due. The page keeps showing the LKG (never blanks
+  // on a 504) and auto-converges by triggering the rebuild + polling until the fresh snapshot lands.
+  const [updating, setUpdating] = useState(false);
+  const rebuildAttempts = useRef(0);
   const [tables, setTables] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [sourceRefreshing, setSourceRefreshing] = useState(false);
@@ -87,6 +92,9 @@ export default function BrandPortfolio({
   }, [asOf, brand, idsKey]);
 
   const applyReport = useCallback((body, cachedAt) => {
+    // `updating` means a rebuild is due; the page shows the LKG (if any) and converges. It is NOT an error and
+    // NOT "no data" -- a missing-but-updating response is a "preparing" state, never the blank empty state.
+    setUpdating(!!body.updating);
     if (body.snapshotMissing) {
       setData(null);
       setNotice(body.message);
@@ -100,6 +108,29 @@ export default function BrandPortfolio({
     setStaleScope(body.snapshot?.staleScope ? body.snapshot.savedForParams || {} : null);
   }, []);
 
+  // Auto-converge an `updating` Brand View: trigger the bounded zero-export rebuild (refresh), then re-apply.
+  // A rebuild that runs out of the route budget returns `updating` again -> this re-fires (bounded attempts) so
+  // the fresh snapshot eventually replaces the LKG with no user action. One rebuild at a time (server lock); a
+  // concurrent holder (409) falls back to a plain read poll.
+  useEffect(() => {
+    if (!updating || !reportParams || refreshGuard.current) return undefined;
+    if (rebuildAttempts.current >= 6) return undefined; // give up auto-rebuild; the Refresh button still works
+    let active = true;
+    const delay = rebuildAttempts.current === 0 ? 400 : 3500;
+    const timer = setTimeout(async () => {
+      rebuildAttempts.current += 1;
+      try {
+        const { body, cachedAt } = await refreshReport(reportParams);
+        if (active) applyReport(body, cachedAt);
+      } catch {
+        try { const { body, cachedAt } = await loadReport(reportParams); if (active) applyReport(body, cachedAt); }
+        catch { /* transient; the next attempt retries */ }
+      }
+    }, delay);
+    return () => { active = false; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updating, reportParams, applyReport, refreshReport, loadReport]);
+
   // Changing brand must clear the previous brand's numbers before the next
   // request lands, so two brands can never be on screen at once.
   const resetRange = range.reset;
@@ -109,6 +140,8 @@ export default function BrandPortfolio({
     setNotice(null);
     setSavedAt(null);
     setStaleScope(null);
+    setUpdating(false);
+    rebuildAttempts.current = 0;
     setTables(null);
     setSourceProgress(null);
     setSourceOutcome(null);
@@ -369,6 +402,13 @@ export default function BrandPortfolio({
           detail={`It was saved for ${staleScope.asOf || "an earlier date"}. Click Refresh to rebuild it from the newest saved account snapshots.`}
         />
       )}
+      {updating && model && (
+        <DataQualityAlert
+          tone="info"
+          title="Updating to the newest saved data…"
+          detail="The figures below are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and will refresh here automatically."
+        />
+      )}
 
       {!brand ? (
         <div className="panel">
@@ -407,8 +447,8 @@ export default function BrandPortfolio({
       ) : notice ? (
         <div className="panel">
           <EmptyState
-            icon={<Inbox size={19} aria-hidden="true" />}
-            title="No saved Brand View for this brand yet"
+            icon={updating ? <RefreshCw size={19} className="spin" aria-hidden="true" /> : <Inbox size={19} aria-hidden="true" />}
+            title={updating ? "Preparing Brand View from saved data…" : "No saved Brand View for this brand yet"}
             actions={(
               <>
                 {isAdmin && (

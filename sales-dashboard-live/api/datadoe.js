@@ -34,6 +34,7 @@ import {
   getLatestReportSnapshot,
   getLatestReportSnapshotHydrated,
   getLatestReportSnapshotMeta,
+  getLatestSourceProvenance,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
   getSourceCoverageWindows,
@@ -88,6 +89,7 @@ import {
   isManualSourceContinuationError,
 } from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
@@ -2457,6 +2459,9 @@ async function handleDataDoe(req, res) {
       }
 
       const accountMeta = await sharedAccountMetadata(accountId);
+      // Freshness: if this account's brand-sales advanced past the assembled single-account Brand View, the read
+      // serves it NOW and flags `updating` so the frontend triggers the (cheap, one-account) zero-export rebuild.
+      const singleProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds: [accountId] }).catch(() => null);
       await serveSharedReport({
         res,
         refresh: wantsRefresh(req),
@@ -2469,6 +2474,7 @@ async function handleDataDoe(req, res) {
         params: { accountId, brand, asOf },
         userId: access.userId,
         label: "Brand View",
+        contributingProvenanceAt: singleProvenanceAt,
         build: () => buildBrandViewSnapshot({
           accountId,
           brand,
@@ -2525,6 +2531,14 @@ async function handleDataDoe(req, res) {
         const payload = await getSourceSnapshotPayload(ptr.object_path);
         return Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
       } : null;
+      // Freshness: the newest brand-sales provenance across the contributing accounts. When the assembled Brand
+      // View is older than this (sources advanced 21 -> 25 Aug), the read serves the last-known-good NOW and
+      // flags `updating` so the frontend triggers the zero-export rebuild -- never a stale-forever cache.
+      const portfolioProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds }).catch(() => null);
+      // A refresh (rebuild) is bounded by the serverless budget: a slow multi-account rebuild returns typed
+      // "updating" before the deadline (LKG served meanwhile) instead of a 504. Reads never build (deferred).
+      const portfolioRefresh = wantsRefresh(req);
+      const portfolioDeadline = portfolioRefresh ? makeRouteDeadline({ budgetMs: 45_000, reserveMs: 6_000 }) : null;
       const buildPortfolio = () => buildBrandViewPortfolioSnapshot({
         accountIds,
         brand,
@@ -2533,10 +2547,11 @@ async function handleDataDoe(req, res) {
         getSnapshot: getLatestReportSnapshotHydrated,
         getAdsRows: getAdsDailySourceRows,
         getCatalogRows: getBrandViewCatalogRows,
+        deadline: portfolioDeadline,
       });
       await serveSharedReport({
         res,
-        refresh: wantsRefresh(req),
+        refresh: portfolioRefresh,
         reportKey: BRAND_VIEW_PORTFOLIO_REPORT_KEY,
         reportVersion: BRAND_VIEW_PORTFOLIO_VERSION,
         accountId: brandViewPortfolioScopeId(accountIds, brand),
@@ -2547,7 +2562,11 @@ async function handleDataDoe(req, res) {
         // than a single-account build, so the lock is held for longer.
         lockSeconds: 300,
         build: buildPortfolio,
-        deriveDurable: async () => ({ payload: await buildPortfolio() }),
+        // The read NEVER runs the full rebuild inline (the 504 source): it serves LKG + `updating`, and the
+        // bounded rebuild runs only on an explicit refresh.
+        deferRebuildOnRead: true,
+        contributingProvenanceAt: portfolioProvenanceAt,
+        routeDeadline: portfolioDeadline,
       });
       return;
     }

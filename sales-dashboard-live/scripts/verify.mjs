@@ -67,6 +67,7 @@ const SUITES = [
   "test:source-download-recovery",
   "test:source-create-reconcile",
   "test:daily-roi-format",
+  "test:brand-view-freshness",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",

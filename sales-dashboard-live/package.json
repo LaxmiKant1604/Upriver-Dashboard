@@ -46,6 +46,7 @@
     "test:source-download-recovery": "node scripts/source-download-recovery.test.js",
     "test:source-create-reconcile": "node scripts/source-create-reconcile.test.js",
     "test:daily-roi-format": "node scripts/daily-roi-format.test.js",
+    "test:brand-view-freshness": "node scripts/brand-view-freshness.test.js",
     "test:manual-source-continuation": "node scripts/manual-source-continuation.test.js",
     "test:cycle-lifecycle": "node scripts/cycle-lifecycle.test.js",
     "test:cycle-finalize-wiring": "node scripts/cycle-finalize-wiring.test.js",

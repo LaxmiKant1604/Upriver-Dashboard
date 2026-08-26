@@ -364,6 +364,27 @@ export async function getLatestReportSnapshotForScope({ reportKey, accountId, re
   return rows[0] || null;
 }
 
+/**
+ * The NEWEST source-provenance timestamp across a set of accounts for one report_key -- a single cheap indexed
+ * read used to decide Brand View freshness (is a contributing brand-sales snapshot newer than the assembled
+ * Brand View?). Returns the ISO string (source_refreshed_at, falling back to updated_at) or "" when none exist
+ * or the id set is empty. Reads only two tiny columns of the single newest row.
+ */
+export async function getLatestSourceProvenance({ reportKey, accountIds }, { signal = null } = {}) {
+  const ids = [...new Set((accountIds || []).map((v) => String(v).trim()).filter(Boolean))];
+  if (!ids.length) return "";
+  const query = new URLSearchParams({
+    select: "source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    order: "source_refreshed_at.desc.nullslast",
+    limit: "1",
+  });
+  query.append("account_id", `in.(${ids.join(",")})`);
+  const rows = await request(`/rest/v1/report_snapshots?${query}`, { signal });
+  const r = rows[0];
+  return r ? String(r.source_refreshed_at || r.updated_at || "") : "";
+}
+
 // The most recent saved snapshot for a report+account, with its payload hydrated STORAGE-FIRST: when the row's
 // inline payload is out-of-line (stored in the source-cache bucket -> inline null/partial), the full payload is
 // fetched via its payload_storage_path. WITHOUT this, a large brand-sales snapshot (inline null) is invisible to

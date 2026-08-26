@@ -53,6 +53,10 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
   const [notice, setNotice] = useState(null);
   const [savedAt, setSavedAt] = useState(null);
   const [staleScope, setStaleScope] = useState(null);
+  // A rebuild is due (the account's brand-sales advanced past this assembly, or no snapshot exists yet). The
+  // page shows the last-known-good and auto-converges by triggering the bounded zero-export rebuild.
+  const [updating, setUpdating] = useState(false);
+  const rebuildAttempts = useRef(0);
 
   const [tables, setTables] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -85,6 +89,8 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
     setNotice(null);
     setSavedAt(null);
     setStaleScope(null);
+    setUpdating(false);
+    rebuildAttempts.current = 0;
     setTables(null);
     range.reset();
   }, [range]);
@@ -132,6 +138,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
   }, [accountId, brand, asOf]);
 
   const applyReport = useCallback((body, cachedAt) => {
+    setUpdating(!!body.updating);
     if (body.snapshotMissing) {
       setData(null);
       setNotice(body.message);
@@ -156,6 +163,28 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [applyReport, loadReport, reportParams]);
+
+  // Auto-converge an `updating` single-account Brand View: trigger the (cheap) zero-export rebuild, re-apply,
+  // bounded attempts. The account's brand-sales advanced past the assembly, so the rebuild republishes the
+  // fresh exact-identity snapshot with no user action; the LKG stays on screen meanwhile.
+  useEffect(() => {
+    if (!updating || !reportParams || refreshGuard.current) return undefined;
+    if (rebuildAttempts.current >= 6) return undefined;
+    let active = true;
+    const delay = rebuildAttempts.current === 0 ? 400 : 3000;
+    const timer = setTimeout(async () => {
+      rebuildAttempts.current += 1;
+      try {
+        const { body, cachedAt } = await refreshReport(reportParams);
+        if (active) applyReport(body, cachedAt);
+      } catch {
+        try { const { body, cachedAt } = await loadReport(reportParams); if (active) applyReport(body, cachedAt); }
+        catch { /* transient; the next attempt retries */ }
+      }
+    }, delay);
+    return () => { active = false; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updating, reportParams, applyReport, refreshReport, loadReport]);
 
   /* ------------------------------- refresh ------------------------------ */
   const onRefresh = useCallback(async () => {
@@ -327,6 +356,13 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           tone="info"
           title="Showing the most recent saved Brand View for this account and brand"
           detail={`It was saved for ${staleScope.asOf || "an earlier date"}. Click Refresh to rebuild it from the newest saved account snapshots.`}
+        />
+      )}
+      {updating && model && (
+        <DataQualityAlert
+          tone="info"
+          title="Updating to the newest saved data…"
+          detail="The figures below are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and will refresh here automatically."
         />
       )}
 
