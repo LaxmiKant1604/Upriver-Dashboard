@@ -49,6 +49,16 @@ export function adsProvenanceOf(payload) {
   });
 }
 
+// A stable fingerprint of the SALES a derived Daily v2 payload carries: the row count + the summed total_sales /
+// total_units (rounded). A correction that removes cancelled or zero-priced units from the durable rollup shifts
+// these totals, so this flips even when the Ads evidence is unchanged -> the corrected Daily is republished.
+export function salesProvenanceOf(payload) {
+  const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
+  let sales = 0; let units = 0;
+  for (const r of rows) { sales += Number(r && r.total_sales != null ? r.total_sales : 0) || 0; units += Number(r && r.total_units != null ? r.total_units : 0) || 0; }
+  return JSON.stringify({ rows: rows.length, sales: Math.round(sales * 100), units: Math.round(units) });
+}
+
 /**
  * Wrap a raw snapshot saver with a PROVENANCE guard: the row is written ONLY when its params_hash equals
  * paramsHashFor(reportVersion, { from, to, brand }) recomputed from the params being written. A mismatch is
@@ -138,10 +148,12 @@ export async function backfillDailyV2({
         } else {
           const sourceRefreshedAt = durableRefreshedAt(evidence, derived.latestDataDate) || null;
           const freshProv = adsProvenanceOf(derived.payload);
+          const freshSalesProv = salesProvenanceOf(derived.payload);
           const existing = await getExisting({ reportKey: DAILY_V2_REPORT_KEY, accountId, paramsHash });
           const existingValid = existing && existing.payload && existing.params && existing.params.reportVersion === DAILY_V2_LIVE_VERSION && validate(existing.payload);
-          if (existingValid && adsProvenanceOf(existing.payload) === freshProv && S(existing.params.to) === effectiveTo) {
-            // No Ads (or other payload) change vs the live snapshot -> leave it untouched (idempotent, ZERO write).
+          if (existingValid && adsProvenanceOf(existing.payload) === freshProv && salesProvenanceOf(existing.payload) === freshSalesProv && S(existing.params.to) === effectiveTo) {
+            // No Ads AND no SALES change vs the live snapshot -> leave it untouched (idempotent, ZERO write). A
+            // cancelled/zero-value correction shifts the sales fingerprint and therefore DOES republish.
             result = { accountId, status: "existing", to: effectiveTo, paramsHash, adsAvailability: freshAdsStatus(derived.payload), creates: 0 };
           } else if (existingValid && S(existing.source_refreshed_at) > S(sourceRefreshedAt) && S(sourceRefreshedAt) !== "") {
             // Freshness CAS: the live snapshot is STRICTLY NEWER than this re-derivation's evidence -> never
