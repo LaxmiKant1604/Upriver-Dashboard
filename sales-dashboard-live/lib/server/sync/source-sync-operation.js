@@ -143,6 +143,10 @@ export async function runReleaseSlice({ bucket, release, controls, readbackLive,
   // failure exits through the finally (controls safe-closed) having published NOTHING.
   const published = [];
   let remaining = [...accounts];
+  // The proven live identities (liveReportKey + paramsHash per (account, report)) are CAPTURED from the
+  // preflight results while the envelope is open -- the read-back after safe-close verifies EXACTLY these
+  // identities and can never re-consult the (now safe-closed) publish gates.
+  const liveIdentities = new Map(); // accountId -> Map(reportKey -> { liveReportKey, paramsHash })
   await controls.apply();
   try {
     for (const accountId of accounts) {
@@ -152,6 +156,7 @@ export async function runReleaseSlice({ bucket, release, controls, readbackLive,
       if (rs.length !== PRIORITY_DASHBOARDS.reportKeys.length || bad.length) {
         return { phase: "preflight", ok: false, problems: ["publish gate not ready for an account (" + (bad[0] && bad[0].reportKey || "shape") + ": " + S(bad[0] && bad[0].disposition) + ")"] };
       }
+      liveIdentities.set(accountId, new Map(rs.map((r) => [S(r.reportKey), { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) }])));
     }
     log("preflight ok: " + accounts.length + " accounts x " + PRIORITY_DASHBOARDS.reportKeys.length + " gates");
 
@@ -176,13 +181,17 @@ export async function runReleaseSlice({ bucket, release, controls, readbackLive,
     return { phase: "publish", continuationRequired: true, published: published.length, total: accounts.length };
   }
 
-  // (6) EXACT live read-back for every (report, account) pair.
+  // (6) EXACT live read-back for every (report, account) pair -- against the CAPTURED proven identities
+  // (liveReportKey + paramsHash from the in-envelope preflight; the gates themselves are safe-closed again).
   const readback = [];
   for (const accountId of accounts) {
+    const ids = liveIdentities.get(accountId);
     for (const reportKey of PRIORITY_DASHBOARDS.publishOrder) {
-      const rb = await readbackLive(reportKey, accountId);
+      const identity = ids && ids.get(reportKey);
+      if (!identity) return { phase: "readback", ok: false, problems: ["no captured live identity (" + reportKey + ")"], published: published.length, total: accounts.length };
+      const rb = await readbackLive({ reportKey, liveReportKey: identity.liveReportKey, accountId, paramsHash: identity.paramsHash });
       if (!rb || rb.ok !== true) {
-        return { phase: "readback", ok: false, problems: ["live read-back failed (" + reportKey + "): " + S(rb && rb.problems && rb.problems[0])], published: published.length, total: accounts.length };
+        return { phase: "readback", ok: false, problems: ["live read-back failed (" + reportKey + "): " + S(rb && (rb.reason || (rb.problems && rb.problems[0])))], published: published.length, total: accounts.length };
       }
       readback.push({ reportKey, accountId });
     }

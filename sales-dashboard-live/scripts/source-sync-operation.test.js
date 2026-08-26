@@ -63,7 +63,17 @@ function makeDeps(over = {}) {
       ...(over.release || {}),
     },
     controls: { apply: async () => { calls.apply += 1; }, close: async () => { calls.close += 1; }, ...(over.controls || {}) },
-    readbackLive: over.readbackLive || (async () => { calls.readbacks += 1; return { ok: true }; }),
+    // The read-back contract: ONE object argument carrying the CAPTURED proven identity from the in-envelope
+    // preflight ({ reportKey, liveReportKey, accountId, paramsHash }) -- asserted here so a positional-call
+    // regression (which silently reads no-live-contract) can never come back.
+    readbackLive: over.readbackLive || (async (args) => {
+      calls.readbacks += 1;
+      assert.ok(args && typeof args === "object" && !Array.isArray(args), "readbackLive takes ONE object argument");
+      assert.ok(args.reportKey && args.accountId, "readback identity carries reportKey + accountId");
+      assert.equal(args.liveReportKey, "live-" + args.reportKey, "liveReportKey captured from the preflight result");
+      assert.equal(args.paramsHash, "h-" + args.reportKey, "paramsHash captured from the preflight result");
+      return { ok: true };
+    }),
     outOfTime: over.outOfTime || (() => false),
     log: () => {},
   };
@@ -136,9 +146,10 @@ await testAsync("a publish failure safe-closes and reports honestly (no read-bac
 });
 
 await testAsync("a failed live read-back fails the slice (never 'dashboards updated' without live proof)", async () => {
-  const { deps } = makeDeps({ readbackLive: async (rk) => (rk === "brand-inventory" ? { ok: false, problems: ["payload-dangling"] } : { ok: true }) });
+  const { deps } = makeDeps({ readbackLive: async ({ reportKey }) => (reportKey === "brand-inventory" ? { ok: false, reason: "payload-dangling" } : { ok: true }) });
   const r = await runReleaseSlice(deps);
   assert.equal(r.phase, "readback"); assert.equal(r.ok, false);
+  assert.ok(String(r.problems[0]).includes("payload-dangling"), "the typed read-back reason is SURFACED: " + r.problems[0]);
 });
 
 await testAsync("token ceiling from the durable reservation: > maxTokens fails before finalize/controls", async () => {
