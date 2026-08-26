@@ -22,6 +22,7 @@ import {
 } from "./lib/format.js";
 import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell } from "./lib/csv.js";
+import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
@@ -3202,7 +3203,7 @@ function DashboardApp({ session, access, onSignOut }) {
         </div>
 
         <div className="footer-note">
-          ROI = Ad Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
+          ROI = Total Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
           Sales and ordered units are sourced from DataDoe Order Line Items (item_price_value / quantity). {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the saved ASIN advertising data (same-SKU attributed sales)." : "Advertising metrics for this brand are the saved ASIN advertising rows whose ASIN maps to the brand through the Product Catalog (same-SKU attributed sales); ads on ASINs without a catalog brand mapping are not attributed. An em dash means advertising coverage is unavailable for that period, never a measured zero."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
         </div>
       </div>
@@ -4001,9 +4002,13 @@ const DAILY_METRICS = [
   { key: "adSpend", label: "Ad Spends", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
   { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : "—") },
   { key: "units", label: "Units", fmt: (c) => c.units.toLocaleString("en-US") },
-  { key: "roi", label: "ROI", highlight: true, fmt: (c) => (c.hasAd && c.adSpend > 0 ? (c.adSales / c.adSpend).toFixed(1) : "—") },
-  { key: "acos", label: "ACoS %", fmt: (c) => (c.hasAd && c.adSales > 0 ? (c.adSpend / c.adSales * 100).toFixed(1) + "%" : "—") },
-  { key: "tacos", label: "TACoS %", fmt: (c) => (c.hasAd && c.sales > 0 ? (c.adSpend / c.sales * 100).toFixed(1) + "%" : "—") },
+  // ROI is the BUSINESS return on ad spend: Total Sales / Ad Spend (NOT Ad Sales / Ad Spend). The cell already
+  // carries the column-SUMMED sales + adSpend (see dailyReport cells), so formatDailyRoi computes SUM(Total
+  // Sales) / SUM(Ad Spend) for the period -- never an average of row-level ratios. Zero/missing/unavailable Ad
+  // Spend -> em dash. Two decimals. ACoS/TACoS keep their existing business meaning (extracted unchanged).
+  { key: "roi", label: "ROI", highlight: true, fmt: (c) => formatDailyRoi(c.sales, c.adSpend, c.hasAd) },
+  { key: "acos", label: "ACoS %", fmt: (c) => formatDailyAcos(c.adSpend, c.adSales, c.hasAd) },
+  { key: "tacos", label: "TACoS %", fmt: (c) => formatDailyTacos(c.adSpend, c.sales, c.hasAd) },
 ];
 
 

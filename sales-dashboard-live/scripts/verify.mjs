@@ -66,6 +66,7 @@ const SUITES = [
   "test:supabase-read-retry",
   "test:source-download-recovery",
   "test:source-create-reconcile",
+  "test:daily-roi-format",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",
