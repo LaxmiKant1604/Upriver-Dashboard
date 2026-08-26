@@ -396,11 +396,13 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
 
   const byAccount = new Map();
   const rollupByAccount = new Map();
+  const orderAuditByAccount = new Map(); // ORDER-level audit (dimensional grain + amazon_order_id); folded OUT of byAccount
   const blocked = [];
   for (const [accountId, entries] of rawByAccount) {
     let violated = null;
-    const byGrain = new Map();      // dimensional grain (full evidence, cancelled included)
+    const byGrain = new Map();      // dimensional grain (full evidence, cancelled included) -- NO order_id (byte-identical)
     const rollupByGrain = new Map(); // NON-cancelled rollup at (date, sku, child_asin, currency)
+    const orderAuditByGrain = new Map(); // dimensional grain + amazon_order_id (a blank ID stays its own grain)
     for (const { row, seller, date, currency } of entries) {
       let c;
       try {
@@ -429,6 +431,25 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
           source_request_hash: sourceRequestHash,
         });
       }
+      // ORDER-AUDIT grain = dimensional grain PLUS the canonical Order ID. A blank ('') Order ID forms its OWN grain
+      // (never merged into a neighbour's real ID). A distinct ' ' join separator (absent from all text fields)
+      // keeps two distinct orders from ever colliding. The SQL RPC re-aggregates by the same natural identity.
+      const orderGrain = [accountId, date, seller, sku, childAsin, currency, c.status, c.fulfillmentChannel, c.addressState, c.addressCity, c.orderId].join(" ");
+      const oexisting = orderAuditByGrain.get(orderGrain);
+      if (oexisting) {
+        oexisting.total_units_sum += c.units;
+        if (c.valuePresent) oexisting.total_sales_sum = (oexisting.total_sales_sum ?? 0) + c.value;
+      } else {
+        orderAuditByGrain.set(orderGrain, {
+          seller_or_vendor_id: seller, sale_date: date, sku, child_asin: childAsin, currency,
+          amazon_order_status: c.status, fulfillment_channel: c.fulfillmentChannel,
+          address_state: c.addressState, address_city: c.addressCity,
+          amazon_order_id: c.orderId,
+          total_sales_sum: c.valuePresent ? c.value : null,
+          total_units_sum: c.units,
+          source_request_hash: sourceRequestHash,
+        });
+      }
       // The NON-cancelled rollup mirrors what the RPC persists into source_oli_daily_history (dashboards read it).
       // A row contributes ONLY when not cancelled AND its value is present and > 0; a cancelled row or a real
       // zero-priced non-cancelled unit contributes ZERO (it still lives in the dimensional table for audit).
@@ -450,8 +471,9 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
     if (violated) { blocked.push(violated); continue; }
     byAccount.set(accountId, [...byGrain.values()]);
     rollupByAccount.set(accountId, [...rollupByGrain.values()]);
+    orderAuditByAccount.set(accountId, [...orderAuditByGrain.values()]);
   }
-  return { byAccount, rollupByAccount, blocked };
+  return { byAccount, rollupByAccount, orderAuditByAccount, blocked };
 }
 
 /**

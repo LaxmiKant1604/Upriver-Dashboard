@@ -261,6 +261,24 @@ test("m9-reserve-delete. adding a delete/reset route in reserve => PRIORITY_RESE
 test("m9-record-hash-mutable. making catalog_request_hash mutable in record => PRIORITY_RECORD_HASH_MUTABLE", () => m9((t) => t.replace("set export_id = p_export_id, status = 'created', tokens_spent = 2, updated_at = now()", "set export_id = p_export_id, status = 'created', tokens_spent = 2, catalog_request_hash = p_catalog_request_hash, updated_at = now()"), "PRIORITY_RECORD_HASH_MUTABLE"));
 test("m9-wrapper-missing. removing the reservePriorityCatalogCreate wrapper => REQUIRED_WRAPPER_MISSING", () => { const a = auditWith({ [WRAP]: (t) => t.replace("export async function reservePriorityCatalogCreate", "async function reservePriorityCatalogCreate_removed") }); assert.ok(!a.ok && hasBlocker(a, "REQUIRED_WRAPPER_MISSING")); });
 
+// ---- Migration 11: FUTURE-ONLY order-audit (amazon_order_id) -- weakening any invariant is a typed blocker ----
+const ORDERAUDIT = "20260827_oli_order_audit.sql";
+const m11 = (mut, code, msg) => { const a = auditWith({ [ORDERAUDIT]: mut }); assert.ok(!a.ok && hasBlocker(a, code), msg || code); };
+
+test("m11-missing. a missing order-audit migration => MIGRATION_MISSING", () => { const a = auditWith({ [ORDERAUDIT]: null }); assert.ok(!a.ok && hasBlocker(a, "MIGRATION_MISSING")); });
+test("m11-param-dropped. dropping p_order_rows from the replace RPC => RPC_PARAM_MISMATCH", () => m11((t) => t.replace("  p_source_refreshed_at timestamptz default now(),\n  p_order_rows jsonb default '[]'::jsonb\n)", "  p_source_refreshed_at timestamptz default now()\n)"), "RPC_PARAM_MISMATCH"));
+test("m11-audit-insert-removed. removing the order-audit INSERT => REPLACE_OLI_AUDIT_INSERT_MISSING", () => m11((t) => t.replace("insert into public.source_oli_order_audit (", "insert into public.source_oli_order_audit_removed ("), "REPLACE_OLI_AUDIT_INSERT_MISSING"));
+test("m11-audit-delete-removed. removing the windowed order-audit DELETE => REPLACE_OLI_AUDIT_DELETE_MISSING", () => m11((t) => t.replace("delete from public.source_oli_order_audit\n", "delete from public.source_oli_order_audit_x\n"), "REPLACE_OLI_AUDIT_DELETE_MISSING"));
+test("m11-availability-forced. forcing order_id_available true (not derived) => REPLACE_OLI_AUDIT_AVAILABILITY_MISSING", () => m11((t) => t.replace("char_length(coalesce(btrim(o->>'amazon_order_id'), '')) > 0,", "true,"), "REPLACE_OLI_AUDIT_AVAILABILITY_MISSING"));
+test("m11-hash-removed. removing the md5 surrogate key => REPLACE_OLI_AUDIT_HASH_MISSING", () => m11((t) => t.replace("md5(concat_ws('|',", "(concat_ws('|',"), "REPLACE_OLI_AUDIT_HASH_MISSING"));
+test("m11-availability-check-weakened. weakening the order_id_available CHECK => NAMED_CONSTRAINT_MISSING", () => m11((t) => t.replace("order_id_available = (char_length(btrim(amazon_order_id)) > 0)", "order_id_available = order_id_available"), "NAMED_CONSTRAINT_MISSING"));
+test("m11-pk-renamed. renaming the order-audit PK => NAMED_CONSTRAINT_MISSING", () => m11((t) => t.replace("source_oli_order_audit_pk\n    primary key", "source_oli_order_audit_pk_x\n    primary key"), "NAMED_CONSTRAINT_MISSING"));
+test("m11-rls-off. RLS not enabled on the order-audit table => RLS_NOT_ENABLED", () => m11((t) => t.replace("alter table public.source_oli_order_audit enable row level security;", ""), "RLS_NOT_ENABLED"));
+test("m11-acl-widened. GRANT ALL to service_role => SERVICE_ROLE_GRANT_MISMATCH (direct-write bypass forbidden)", () => m11((t) => t.replace("grant select on table public.source_oli_order_audit to service_role;", "grant all on table public.source_oli_order_audit to service_role;"), "SERVICE_ROLE_GRANT_MISMATCH"));
+test("m11-revoke-missing. a missing REVOKE ALL on the order-audit table => SERVICE_ROLE_REVOKE_MISSING", () => m11((t) => t.replace("revoke all on table public.source_oli_order_audit from public, anon, authenticated, service_role;", ""), "SERVICE_ROLE_REVOKE_MISSING"));
+test("m11-index-missing. a renamed required index => INDEX_MISSING", () => m11((t) => t.replace("source_oli_order_audit_account_date_idx", "source_oli_order_audit_account_date_idx_x"), "INDEX_MISSING"));
+test("m11-wrapper-missing. removing the getExplicitZeroOliOrderAudit wrapper => REQUIRED_WRAPPER_MISSING", () => { const a = auditWith({ [WRAP]: (t) => t.replace("export async function getExplicitZeroOliOrderAudit", "async function getExplicitZeroOliOrderAudit_removed") }); assert.ok(!a.ok && hasBlocker(a, "REQUIRED_WRAPPER_MISSING")); });
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

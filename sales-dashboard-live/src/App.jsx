@@ -3017,6 +3017,7 @@ function DashboardApp({ session, access, onSignOut }) {
                 <tr style={{ textAlign: "left", opacity: 0.75 }}>
                   <th style={{ padding: "4px 8px" }}>Date</th><th style={{ padding: "4px 8px" }}>SKU</th><th style={{ padding: "4px 8px" }}>Child ASIN</th>
                   <th style={{ padding: "4px 8px" }}>Status</th><th style={{ padding: "4px 8px" }}>Fulfilment</th><th style={{ padding: "4px 8px" }}>State</th><th style={{ padding: "4px 8px" }}>City</th>
+                  <th style={{ padding: "4px 8px" }}>Order ID</th>
                   <th style={{ padding: "4px 8px", textAlign: "right" }}>Rows</th><th style={{ padding: "4px 8px", textAlign: "right" }}>Units</th>
                 </tr>
               </thead>
@@ -3025,6 +3026,23 @@ function DashboardApp({ session, access, onSignOut }) {
                   <tr key={i} style={{ borderTop: "1px solid var(--border, #eee)" }}>
                     <td style={{ padding: "4px 8px" }}>{b.date}</td><td style={{ padding: "4px 8px" }}>{b.sku || "—"}</td><td style={{ padding: "4px 8px" }}>{b.childAsin || "—"}</td>
                     <td style={{ padding: "4px 8px" }}>{b.status || "—"}</td><td style={{ padding: "4px 8px" }}>{b.fulfillment || "—"}</td><td style={{ padding: "4px 8px" }}>{b.state || "—"}</td><td style={{ padding: "4px 8px" }}>{b.city || "—"}</td>
+                    <td style={{ padding: "4px 8px", maxWidth: 230 }}>
+                      {!b.hasAudit ? (
+                        <span style={{ opacity: 0.55 }}>Not captured — before Order ID tracking</span>
+                      ) : (b.orderIds && b.orderIds.some((o) => o.orderIdAvailable)) ? (
+                        <span style={{ display: "inline-flex", flexWrap: "wrap", gap: 4 }}>
+                          {b.orderIds.filter((o) => o.orderIdAvailable).map((o, j) => (
+                            <button key={j} type="button" title="Copy Amazon Order ID"
+                              onClick={() => { try { navigator.clipboard && navigator.clipboard.writeText(o.orderId); } catch (_e) { /* clipboard unavailable */ } }}
+                              style={{ fontFamily: "monospace", fontSize: "0.78rem", border: "1px solid var(--border, #ddd)", borderRadius: 4, padding: "1px 5px", background: "transparent", cursor: "pointer" }}>
+                              {o.orderId}
+                            </button>
+                          ))}
+                        </span>
+                      ) : (
+                        <span style={{ opacity: 0.55 }}>Order ID unavailable from source</span>
+                      )}
+                    </td>
                     <td style={{ padding: "4px 8px", textAlign: "right" }}>{b.rows.toLocaleString("en-US")}</td><td style={{ padding: "4px 8px", textAlign: "right" }}>{b.units.toLocaleString("en-US")}</td>
                   </tr>
                 ))}

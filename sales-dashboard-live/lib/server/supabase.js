@@ -1306,9 +1306,12 @@ export async function replaceOliHistoryWindow({ organizationFingerprint, connect
 // A row that violates the authoritative order rules raises fail-closed inside the RPC (the whole window rolls
 // back, LKG preserved); this wrapper surfaces those as TYPED write outcomes so the caller can report the affected
 // account/window separately and never marks its coverage successful.
-export async function replaceOliDimensionalWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, sourceRefreshedAt = null, signal = null }) {
+export async function replaceOliDimensionalWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, orderRows = [], sourceRefreshedAt = null, signal = null }) {
   if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(rows)) {
     throw new Error("replaceOliDimensionalWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a rows array (fail closed).");
+  }
+  if (!Array.isArray(orderRows)) {
+    throw new Error("replaceOliDimensionalWindow orderRows must be an array (fail closed).");
   }
   try {
     const body = await request("/rest/v1/rpc/replace_oli_dimensional_window", {
@@ -1336,16 +1339,34 @@ export async function replaceOliDimensionalWindow({ organizationFingerprint, con
           source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
         })),
         p_source_refreshed_at: sourceRefreshedAt || new Date().toISOString(),
+        // The SAME validated export ALSO feeds the order-level audit (amazon_order_id folded IN here only). Persisted
+        // atomically with the dimensional/rollup replace, so an OLI window can never commit without its Order IDs.
+        p_order_rows: orderRows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          sale_date: r.saleDate ?? r.sale_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
+          fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
+          address_state: r.addressState ?? r.address_state ?? "",
+          address_city: r.addressCity ?? r.address_city ?? "",
+          // amazon_order_id is passed AS-IS (already canonicalized; '' when the source had none -- never fabricated).
+          amazon_order_id: r.amazonOrderId ?? r.amazon_order_id ?? "",
+          total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
+          total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+        })),
       },
     });
     const value = Array.isArray(body) ? body[0] : body;
-    return { write: "ok", dimensionalInserted: value?.dimensionalInserted ?? 0, rollupInserted: value?.rollupInserted ?? 0, error: null };
+    return { write: "ok", dimensionalInserted: value?.dimensionalInserted ?? 0, rollupInserted: value?.rollupInserted ?? 0, orderAuditInserted: value?.orderAuditInserted ?? 0, error: null };
   } catch (writeError) {
-    if (isSchemaMissingError(writeError)) return { write: "schema-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_DIM_SCHEMA_MISSING" };
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", dimensionalInserted: 0, rollupInserted: 0, orderAuditInserted: 0, error: "OLI_DIM_SCHEMA_MISSING" };
     const msg = String(writeError && writeError.message ? writeError.message : writeError);
-    if (msg.includes("OLI_NON_CANCELLED_VALUE_MISSING")) return { write: "value-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_NON_CANCELLED_VALUE_MISSING" };
-    if (msg.includes("OLI_ORDER_STATUS_MISSING")) return { write: "status-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_ORDER_STATUS_MISSING" };
-    return { write: "write-failed", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_DIM_REPLACE_FAILED" };
+    if (msg.includes("OLI_NON_CANCELLED_VALUE_MISSING")) return { write: "value-missing", dimensionalInserted: 0, rollupInserted: 0, orderAuditInserted: 0, error: "OLI_NON_CANCELLED_VALUE_MISSING" };
+    if (msg.includes("OLI_ORDER_STATUS_MISSING")) return { write: "status-missing", dimensionalInserted: 0, rollupInserted: 0, orderAuditInserted: 0, error: "OLI_ORDER_STATUS_MISSING" };
+    return { write: "write-failed", dimensionalInserted: 0, rollupInserted: 0, orderAuditInserted: 0, error: "OLI_DIM_REPLACE_FAILED" };
   }
 }
 
@@ -1538,6 +1559,46 @@ export async function getExplicitZeroOliUnits({ organizationFingerprint, connect
     if (raw.length > maxRows) {
       const err = new Error("OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED: explicit-zero OLI read exceeded its row cap; refusing a truncated series (fail closed).");
       err.code = "OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED";
+      throw err;
+    }
+    if (list.length < PAGE) break;
+  }
+  return raw;
+}
+
+// The ORDER-LEVEL explicit-zero audit for ONE account over a date range, from source_oli_order_audit: the SAME
+// present-zero class as getExplicitZeroOliUnits (NON-cancelled, value present == 0, positive units) but at order
+// grain WITH the captured amazon_order_id and its order_id_available flag. ZERO DataDoe (Supabase-only). Strictly
+// account-scoped (never crosses accounts). Rows captured BEFORE this feature simply do not exist here (the audit
+// table is future-only); rows whose source had no Order ID come back with amazon_order_id '' + order_id_available
+// false. Paginated + hard-capped like the dimensional reads (never a silently truncated series).
+export async function getExplicitZeroOliOrderAudit({ organizationFingerprint, connectionId = "primary", accountId, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId || !from || !to) {
+    throw new Error("getExplicitZeroOliOrderAudit requires organizationFingerprint + accountId + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const raw = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const query = new URLSearchParams({
+      select: "sale_date,sku,child_asin,currency,amazon_order_status,fulfillment_channel,address_state,address_city,amazon_order_id,order_id_available,total_units_sum",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      sale_date: `gte.${from}`,
+      is_cancelled: "eq.false",
+      total_sales_sum: "eq.0",       // PRESENT and exactly zero (NULL/missing is never stored here)
+      total_units_sum: "gt.0",       // positive units only
+      order: "sale_date.desc,sku.asc",
+      limit: String(PAGE),
+      offset: String(offset),
+    });
+    query.append("sale_date", `lte.${to}`);
+    const rows = await request(`/rest/v1/source_oli_order_audit?${query}`, { signal });
+    const list = Array.isArray(rows) ? rows : [];
+    raw.push(...list);
+    if (raw.length > maxRows) {
+      const err = new Error("OLI_ORDER_AUDIT_ROW_LIMIT_EXCEEDED: order-audit read exceeded its row cap; refusing a truncated series (fail closed).");
+      err.code = "OLI_ORDER_AUDIT_ROW_LIMIT_EXCEEDED";
       throw err;
     }
     if (list.length < PAGE) break;

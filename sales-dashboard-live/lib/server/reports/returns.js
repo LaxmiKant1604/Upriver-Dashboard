@@ -68,7 +68,7 @@ const SETTLEMENT_AGGREGATIONS = [
 // currencies and this export is byte-identical to the other OLI reports (shared request_hashes on
 // overlapping calendar-anchored slices => one export, many owners). The fold re-aggregates to
 // (currency, child_asin) so ordered evidence is bound per currency (Blocker 2) — never ASIN alone.
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },

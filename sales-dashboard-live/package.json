@@ -28,6 +28,7 @@
     "test:oli-dimensional": "node scripts/oli-dimensional.test.js",
     "test:oli-value-policy": "node scripts/oli-value-policy.test.js",
     "test:oli-quality": "node scripts/oli-quality.test.js",
+    "test:oli-order-audit": "node scripts/oli-order-audit.test.js",
     "test:effective-asof": "node scripts/effective-asof.test.js",
     "test:source-bucket-sync": "node scripts/source-bucket-sync.test.js",
     "test:source-status": "node scripts/source-status.test.js",

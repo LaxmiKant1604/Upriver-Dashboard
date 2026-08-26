@@ -28,13 +28,12 @@ const build = (rows) => oliDimensionalRowsFromFragment({ rows, accountsBySellerI
 
 /* ===== A. the exported contract carries the exact requested columns ===== */
 
-test("A1. OLI_SALES_COLUMNS includes the 4 new dimensions and EXCLUDES address_country + amazon_order_id", () => {
-  for (const c of ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"]) {
+test("A1. OLI_SALES_COLUMNS includes the 4 dimensions + amazon_order_id (future-only capture) and EXCLUDES address_country", () => {
+  for (const c of ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"]) {
     assert.ok(OLI_SALES_COLUMNS.includes(c), "missing requested column: " + c);
   }
   assert.ok(!OLI_SALES_COLUMNS.includes("address_country"), "address_country must NOT be requested");
-  assert.ok(!OLI_SALES_COLUMNS.includes("amazon_order_id"), "amazon_order_id must NOT be requested");
-  assert.equal(OLI_SALES_COLUMNS.length, 9, "exactly 5 kept + 4 added");
+  assert.equal(OLI_SALES_COLUMNS.length, 10, "exactly 5 kept + 4 dimensions + amazon_order_id");
 });
 
 /* ===== B. status normalization + cancellation ===== */

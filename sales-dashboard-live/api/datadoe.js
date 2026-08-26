@@ -42,6 +42,7 @@ import {
   getSourceSnapshot,
   getSourceSnapshotPayload,
   getExplicitZeroOliUnits,
+  getExplicitZeroOliOrderAudit,
   getAccountOliQualityCounts,
   insertReportSnapshotIfAbsent,
   isSafeSnapshotRev,
@@ -1618,8 +1619,8 @@ const DAILY_SALES_AGGREGATIONS = [
 // The named-brand superset IS the CANONICAL Order Line Items sales fragment (Blocker 1): grouped by
 // [date, seller, sku, child_asin, item_price_currency] so it is byte-identical to OLI_SALES_* and shares
 // request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance on overlapping slices.
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
-const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
 
 // ===== CANONICAL Order Line Items sales fragment (Blocker 1 — parity source of truth) =====
 // ONE fragment spec shared IDENTICALLY by daily-reporting (the superset above), fba-plan, buy-box-loss,
@@ -1630,8 +1631,8 @@ const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child
 // money across currencies; every downstream fold keys currency in and re-aggregates to its own grain.
 // Mirrors report-source-contracts.js OLI_SALES_* (parity-tested). The four order dimensions were added here too
 // so the live "fetch latest" export identity stays byte-identical to the scheduler's (one shared cached export).
-const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
+const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -2623,6 +2624,9 @@ async function handleDataDoe(req, res) {
         if (!qPrimary) throw new Error("no primary connection");
         const orgFp = qPrimary.organizationFingerprint || organizationFingerprint(qPrimary.apiKey);
         const rows = await getExplicitZeroOliUnits({ organizationFingerprint: orgFp, accountId: qAccountId, from: String(from), to: String(to) });
+        // The FUTURE-ONLY order-level audit for the SAME account/window (amazon_order_id + availability). Read-only,
+        // ZERO DataDoe, strictly account-scoped. Historical grains simply have no audit row -> displayed "Not captured".
+        const orderAuditRows = await getExplicitZeroOliOrderAudit({ organizationFingerprint: orgFp, accountId: qAccountId, from: String(from), to: String(to) }).catch(() => []);
         // Named-brand attribution via the SAVED Product Catalog snapshot ONLY (never invented). ALL needs no catalog.
         let brandByAsin = null;
         if (brand && brand.toUpperCase() !== "ALL") {
@@ -2632,7 +2636,7 @@ async function handleDataDoe(req, res) {
           if (snap && snap.object_path) { const p = await getSourceSnapshotPayload(snap.object_path).catch(() => null); catalogRows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : []); }
           brandByAsin = brandByAsinFromCatalog(catalogRows);
         }
-        const summary = summarizeExplicitZeroOli(rows, { brandByAsin, brand });
+        const summary = summarizeExplicitZeroOli(rows, { brandByAsin, brand, orderAuditRows });
         res.status(200).json({ available: true, accountId: qAccountId, from: String(from), to: String(to), ...summary });
       } catch (_e) {
         res.status(200).json({ available: false, accountId: qAccountId, reason: "quality-unavailable" });

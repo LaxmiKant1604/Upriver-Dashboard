@@ -10,7 +10,10 @@
 //     PRESENT-but-zero value is a REAL zero-priced unit (promotional / replacement / free): it is kept for audit
 //     and treated LIKE a cancelled row -- contributing ZERO sales AND units to the rollup -- and NEVER blocks the
 //     window (`contributesToRollup` is true only when not-cancelled AND value present AND value > 0);
-//   - blank state/city is allowed (stored '') and never blocks an otherwise-valid sale.
+//   - blank state/city is allowed (stored '') and never blocks an otherwise-valid sale;
+//   - amazon_order_id is AUDIT-ONLY: it is trimmed to a canonical form and NEVER blocks a window. A blank/missing
+//     Order ID is stored '' with orderIdAvailable=false (never fabricated, never copied from another row) so a
+//     distinct order can never masquerade under a neighbour's ID. It contributes NOTHING to sales/units/rollup.
 
 export class OliOrderRuleError extends Error {
   constructor(code, message, detail = {}) {
@@ -40,6 +43,21 @@ export function orderValuePresent(v) {
   return v != null && S(v).trim() !== "";
 }
 
+// The CANONICAL Amazon Order ID: trimmed only (Amazon Order IDs are case-sensitive, e.g. "123-4567890-1234567").
+// A blank/whitespace/null source value canonicalizes to '' -- an UNAVAILABLE Order ID, never a valid identity.
+export function canonicalizeOrderId(v) {
+  return S(v).trim();
+}
+
+// Redact a full Order ID for logs/errors: keep only the first segment prefix so distinct orders stay distinguishable
+// in diagnostics without ever leaking a complete, replayable identifier. '' (unavailable) redacts to '(none)'.
+export function redactOrderId(v) {
+  const id = canonicalizeOrderId(v);
+  if (id === "") return "(none)";
+  const head = id.split("-")[0] || id.slice(0, 3);
+  return `${head}…`;
+}
+
 // Canonical fulfillment categories. The raw fulfillment_channel is ALWAYS preserved (audit); this maps its
 // synonyms onto ONE presentation bucket so Amazon/AFN and Merchant/MFN can never split a contribution total into
 // four separate categories.
@@ -61,6 +79,23 @@ export function normalizeFulfillmentChannel(raw) {
   if (n === "amazon" || n === "afn" || n === "amazon fulfilled" || n === "fba") return FULFILLMENT_CATEGORY.AMAZON;
   if (n === "merchant" || n === "mfn" || n === "seller" || n === "merchant fulfilled" || n === "fbm") return FULFILLMENT_CATEGORY.MERCHANT;
   return FULFILLMENT_CATEGORY.UNAVAILABLE;
+}
+
+// The exact presentation state for an Amazon Order ID cell in the explicit-zero breakdown. PURE + shared by the
+// server reader shaping and the React UI so both agree. Three states, never a fabricated ID:
+//   - captured    : a future audit row with a real captured Order ID -> show it (copyable);
+//   - unavailable  : a future audit row whose SOURCE had no Order ID -> "Order ID unavailable from source";
+//   - not-captured : a row with NO audit evidence at all (historical, before tracking) -> "Not captured ...".
+// `row` carries { hasAudit (an order-audit row exists for this grain), orderIdAvailable, amazonOrderId|orderId }.
+export function orderIdDisplayState(row) {
+  const id = canonicalizeOrderId(row && (row.amazonOrderId ?? row.orderId ?? row.amazon_order_id));
+  if (!row || !row.hasAudit) {
+    return { kind: "not-captured", text: "Not captured — before Order ID tracking", orderId: "" };
+  }
+  if (row.orderIdAvailable && id !== "") {
+    return { kind: "captured", text: id, orderId: id };
+  }
+  return { kind: "unavailable", text: "Order ID unavailable from source", orderId: "" };
 }
 
 /**
@@ -113,6 +148,8 @@ export function classifyOliDimensionalRow(row) {
     fulfillmentCategory: normalizeFulfillmentChannel(row.fulfillment_channel), // ONE canonical presentation bucket
     addressState: S(row.address_state).trim(),             // blank allowed (unavailable)
     addressCity: S(row.address_city).trim(),               // blank allowed (unavailable)
+    orderId: canonicalizeOrderId(row.amazon_order_id),     // AUDIT-ONLY, canonical (blank '' = unavailable)
+    orderIdAvailable: canonicalizeOrderId(row.amazon_order_id) !== "", // true ONLY for a real captured ID
   };
 }
 

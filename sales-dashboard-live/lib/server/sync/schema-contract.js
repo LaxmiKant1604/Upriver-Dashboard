@@ -596,6 +596,58 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["replaceOliDimensionalWindow", "getSourceOliDimensionalContribution"],
     note: "Migration 10: dimensional OLI history (order status / fulfillment / state / city) + atomic replace RPC (PREPARED, UNAPPLIED).",
   },
+  {
+    // Migration 11: FUTURE-ONLY amazon_order_id capture. An ADDITIVE order-level audit table + a DROP/CREATE of the
+    // replace RPC that gains p_order_rows (8th param, default '[]') and writes the order-audit rows in the SAME
+    // transaction as the UNCHANGED dimensional + rollup + coverage. The business grain stays byte-identical (Order ID
+    // is folded away for both); Order IDs live ONLY in source_oli_order_audit. Service-role-only, written ONLY
+    // through the SECURITY DEFINER RPC; SELECT grant, NO policy, NO authenticated grant (PG17 MAINTAIN cleared).
+    migration: "20260827_oli_order_audit.sql",
+    tables: [
+      {
+        name: "source_oli_order_audit",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "order_grain_hash"]],
+        namedConstraints: [
+          { name: "source_oli_order_audit_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "order_grain_hash"] },
+          { name: "source_oli_order_audit_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_oli_order_audit_account_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "source_oli_order_audit_hash_len", kind: "check", canonical: "char_length(order_grain_hash) = 32" },
+          { name: "source_oli_order_audit_seller_nonblank", kind: "check", canonical: "char_length(btrim(seller_or_vendor_id)) > 0" },
+          { name: "source_oli_order_audit_currency_check", kind: "check", canonical: "currency ~ '^[A-Z]{3}$'" },
+          { name: "source_oli_order_audit_status_nonblank", kind: "check", canonical: "char_length(btrim(amazon_order_status)) > 0" },
+          { name: "source_oli_order_audit_reqhash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+          // order_id_available is DB-pinned to EXACTLY reflect a non-blank captured Order ID -- never fabricated.
+          { name: "source_oli_order_audit_orderid_available_ck", kind: "check", canonical: "order_id_available = (char_length(btrim(amazon_order_id)) > 0)" },
+        ],
+        requiredIndexes: [
+          { name: "source_oli_order_audit_account_date_idx", columns: ["account_id", "sale_date"] },
+          { name: "source_oli_order_audit_account_order_idx", columns: ["account_id", "amazon_order_id"] },
+          { name: "source_oli_order_audit_org_date_idx", columns: ["organization_fingerprint", "sale_date"] },
+        ],
+        rlsEnabled: true,
+        // Written ONLY through replace_oli_dimensional_window (SECURITY DEFINER): service_role keeps SELECT alone.
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
+        requiredTriggers: [{ name: "source_oli_order_audit_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "order_grain_hash", "seller_or_vendor_id",
+          "sale_date", "amazon_order_id", "order_id_available", "sku", "child_asin", "currency", "amazon_order_status",
+          "status_normalized", "is_cancelled", "fulfillment_channel", "address_state", "address_city",
+          "total_sales_sum", "total_units_sum", "source_request_hash"],
+      },
+    ],
+    rpcs: [
+      { name: "replace_oli_dimensional_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at", "p_order_rows"] },
+    ],
+    // The DIMENSIONAL/rollup/coverage behavior is PRESERVED byte-for-byte (replace-oli-dimensional) AND the new
+    // atomic order-audit block is proven (replace-oli-order-audit) on the SAME function body.
+    provenFunctions: [
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-dimensional" },
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-order-audit" },
+    ],
+    wrappers: ["replaceOliDimensionalWindow", "getExplicitZeroOliOrderAudit"],
+    note: "Migration 11: order-level audit (amazon_order_id) + p_order_rows on the replace RPC (FUTURE-ONLY; business grain byte-identical).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -1229,6 +1281,38 @@ function auditReplaceOliDimensionalFunction(clean, masked, fnName) {
   return problems;
 }
 
+// STRUCTURAL proof that the SAME replace RPC ALSO persists the order-level audit (amazon_order_id) atomically from a
+// SEPARATE p_order_rows array: it validates p_order_rows fail-closed, DELETEs the account's audit rows inside the
+// window, and INSERTs order-level rows whose order_id_available EXACTLY reflects a non-blank Order ID (never
+// fabricated) under a deterministic md5 surrogate key over the natural order identity (Order ID included, so a blank
+// ID stays its own grain). Proving this on the SAME function body guarantees the Order IDs commit in the SAME
+// transaction as the dimensional/rollup evidence (a commit-unknown can never leave them behind).
+function auditReplaceOliOrderAuditFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "REPLACE_OLI_AUDIT_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  if (!/jsonb_array_elements\s*\(\s*p_order_rows\s*\)[\s\S]*raise\s+exception|raise\s+exception[\s\S]*jsonb_array_elements\s*\(\s*p_order_rows\s*\)/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_AUDIT_VALIDATION_MISSING", reason: "does not validate p_order_rows fail-closed before mutating" });
+  }
+  if (!/delete\s+from\s+public\.source_oli_order_audit\b[^;]*\baccount_id\s*=\s*p_account_id\b[^;]*\bsale_date\s+between\s+p_covered_from\s+and\s+p_covered_to/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_AUDIT_DELETE_MISSING", reason: "does not DELETE the account's order-audit rows inside the replaced window" });
+  }
+  if (!/insert\s+into\s+public\.source_oli_order_audit\b/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_AUDIT_INSERT_MISSING", reason: "does not INSERT the order-audit rows" });
+  }
+  // order_id_available must be DERIVED from the presence of a non-blank Order ID (never a fabricated/forced true).
+  if (!/char_length\s*\(\s*coalesce\s*\(\s*btrim\s*\(\s*o->>'amazon_order_id'\s*\)\s*,\s*''\s*\)\s*\)\s*>\s*0/i.test(C)) {
+    problems.push({ code: "REPLACE_OLI_AUDIT_AVAILABILITY_MISSING", reason: "does not derive order_id_available from a non-blank captured Order ID" });
+  }
+  // The surrogate key must be a deterministic hash over the natural order identity INCLUDING the Order ID.
+  if (!/md5\s*\(\s*concat_ws\s*\(/i.test(M) || !/'amazon_order_id'/i.test(C)) {
+    problems.push({ code: "REPLACE_OLI_AUDIT_HASH_MISSING", reason: "does not build the order_grain_hash md5 surrogate over the order identity (Order ID included)" });
+  }
+  return problems;
+}
+
 // Round-4 finding 8 structural proof: the snapshot pointer CAS must LOCK the existing row FOR UPDATE,
 // refuse an OLDER save ('stale-save'), accept an equal-identical save as 'unchanged', refuse equal but
 // CONFLICTING evidence ('conflict'), and replace only on a STRICTLY NEWER validated_at.
@@ -1492,6 +1576,7 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
   if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
   if (proof === "replace-oli-dimensional") return auditReplaceOliDimensionalFunction(clean, masked, fnName);
+  if (proof === "replace-oli-order-audit") return auditReplaceOliOrderAuditFunction(clean, masked, fnName);
   if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
   if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);
@@ -1761,6 +1846,8 @@ export const REQUIRED_WRAPPER_EXPORTS = Object.freeze([
   "persistSourceTrancheBudget", "reserveSourceExportCreate", "getSourceTrancheBudget", "getSourceTrancheBudgetHashes",
   // Migration 9: the operation-wide durable Catalog reservation (reserve/record RPCs + the reservation reader).
   "reservePriorityCatalogCreate", "recordPriorityCatalogExport", "getPriorityCatalogReservation",
+  // Migration 11: the FUTURE-ONLY order-audit reader (amazon_order_id) for the explicit-zero breakdown.
+  "getExplicitZeroOliOrderAudit",
 ]);
 
 /**

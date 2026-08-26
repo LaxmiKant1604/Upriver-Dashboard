@@ -522,7 +522,7 @@ export async function runBucketSourceSync({
         // address_city. The builder validates the authoritative order rules PER ACCOUNT (a value-missing / missing-
         // status account is BLOCKED -- its window is never written, its coverage never advanced, LKG preserved --
         // and reported), and returns the dimensional rows + the non-cancelled daily rollup for each good account.
-        const { byAccount, rollupByAccount, blocked } = oliDimensionalRowsFromFragment({
+        const { byAccount, rollupByAccount, orderAuditByAccount, blocked } = oliDimensionalRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
@@ -537,11 +537,14 @@ export async function runBucketSourceSync({
           if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
           const dimRows = byAccount.get(a.accountId) || [];
           const rollupRows = rollupByAccount.get(a.accountId) || [];
+          // The order-level audit rows (dimensional grain + amazon_order_id) ride the SAME atomic replace as the
+          // dimensional/rollup evidence, from the SAME validated export -- no second export, no separate transaction.
+          const orderRows = (orderAuditByAccount && orderAuditByAccount.get(a.accountId)) || [];
           const outcome = await replaceHistoryWindow({
             organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
             connectionId: "primary", accountId: a.accountId,
             coveredFrom: unit.slice.from, coveredTo: unit.slice.to,
-            rows: dimRows, rollupRows, sourceRefreshedAt: nowIso(),
+            rows: dimRows, rollupRows, orderRows, sourceRefreshedAt: nowIso(),
           });
           if (outcome && (outcome.write === "value-missing" || outcome.write === "status-missing")) {
             // The RPC's last-line-of-defence validation refused this window (JS builder should have caught it, but
