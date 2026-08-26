@@ -46,6 +46,9 @@ export const BRAND_VIEW_BRANDS_VERSION = "brand-view-brands-v1";
 // and same exports as the single-account one — only the set of accounts differs.
 export const BRAND_VIEW_PORTFOLIO_REPORT_KEY = "brand-view-portfolio";
 export const BRAND_VIEW_PORTFOLIO_VERSION = "brand-view-portfolio-v1";
+// How many account slices the portfolio rebuild reads at once. Small enough to hold only a few saved payloads
+// in memory at a time, large enough to cut a dozen-account rebuild from ~37s to well under the route deadline.
+export const PORTFOLIO_SLICE_CONCURRENCY = 4;
 
 // The compact per-account FBA inventory snapshot Brand View prefers. It is a
 // minimal roll-up of the latest validated FBA Inventory Health export folded to
@@ -993,14 +996,16 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
   // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
   // -> product_brand is what maps each account's ad ASINs to this brand).
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
-  const slices = [];
-  for (const accountId of accountIds) {
-    // Bound the full-portfolio rebuild by the route deadline: a slow multi-account rebuild must return typed
-    // "updating" BEFORE the serverless timeout (the caller serves the last-known-good meanwhile), never a 504.
-    // Checking BETWEEN accounts (not inside the swallow-on-missing slice) means a deadline can never be
-    // misread as an unavailable account and published as an incomplete portfolio.
+  // Read the accounts in small bounded-concurrency chunks (not one at a time): a dozen sequential multi-hundred-KB
+  // reads is what pushed this build to ~37s and produced the intermittent 504. A cap of PORTFOLIO_SLICE_CONCURRENCY
+  // holds at most that many payloads at once (memory-safe) while cutting wall time several-fold; slice ORDER is
+  // preserved. The route deadline is checked BETWEEN chunks (never inside the swallow-on-missing slice) so a
+  // timeout can never be misread as an unavailable account and published as an incomplete portfolio.
+  const slices = new Array(accountIds.length);
+  for (let i = 0; i < accountIds.length; i += PORTFOLIO_SLICE_CONCURRENCY) {
     if (deadline && typeof deadline.ensureTime === "function") await deadline.ensureTime("brand-view-portfolio-slice");
-    slices.push(await buildAccountBrandSlice({
+    const chunk = accountIds.slice(i, i + PORTFOLIO_SLICE_CONCURRENCY);
+    const built = await Promise.all(chunk.map((accountId) => buildAccountBrandSlice({
       accountId,
       brand,
       asOf,
@@ -1009,7 +1014,8 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
       getAdsRows,
       catalogRows,
       required: false,
-    }));
+    })));
+    for (let j = 0; j < built.length; j += 1) slices[i + j] = built[j];
   }
   return assembleBrandViewPayload({ slices, brand, asOf, scope: "portfolio" });
 }

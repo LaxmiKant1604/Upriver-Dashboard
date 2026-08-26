@@ -2538,7 +2538,9 @@ async function handleDataDoe(req, res) {
       // A refresh (rebuild) is bounded by the serverless budget: a slow multi-account rebuild returns typed
       // "updating" before the deadline (LKG served meanwhile) instead of a 504. Reads never build (deferred).
       const portfolioRefresh = wantsRefresh(req);
-      const portfolioDeadline = portfolioRefresh ? makeRouteDeadline({ budgetMs: 45_000, reserveMs: 6_000 }) : null;
+      // The function's maxDuration is 60s; give the bounded rebuild 52s of build budget with 6s reserved for the
+      // response so a slow rebuild returns typed "updating" (LKG served) rather than a 504.
+      const portfolioDeadline = portfolioRefresh ? makeRouteDeadline({ budgetMs: 52_000, reserveMs: 6_000 }) : null;
       const buildPortfolio = () => buildBrandViewPortfolioSnapshot({
         accountIds,
         brand,
