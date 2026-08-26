@@ -274,6 +274,14 @@ test("S. the REAL 20260827 migration + schema-contract audit CLEAN (order-audit 
   assert.match(sql, /md5\s*\(\s*concat_ws/i);
   assert.match(sql, /order_id_available\s*=\s*\(char_length/i, "order_id_available is DB-pinned to a non-blank Order ID");
   assert.ok(!/insert\s+into\s+public\.source_oli_dimensional_history[\s\S]{0,400}amazon_order_id/i.test(sql), "the dimensional insert never carries amazon_order_id (business grain byte-identical)");
+  // The HASHFIX (20260828) is the authoritative runtime RPC: its md5 date argument must be grouped-aligned
+  // ((o->>'sale_date')::date), guarding against the SQLSTATE 42803 regression.
+  const fix = readFileSync("supabase/migrations/20260828_oli_order_audit_hashfix.sql", "utf8");
+  const md5arg = fix.slice(fix.indexOf("md5(concat_ws("));
+  assert.match(md5arg.slice(0, 260), /\(o->>'sale_date'\)::date/, "the md5 surrogate groups sale_date as ::date (matches the GROUP BY)");
+  assert.ok(!/md5\(concat_ws\([\s\S]{0,200}\(o->>'sale_date'\)\s*,/.test(fix), "the md5 never references the ungrouped TEXT sale_date");
+  const fixRow = res.matrix.find((m) => m.migration === "20260828_oli_order_audit_hashfix.sql");
+  assert.ok(fixRow && fixRow.provenFunctions.every((p) => p.ok), "the corrected RPC proofs pass: " + JSON.stringify(fixRow && fixRow.provenFunctions));
 });
 
 async function main() {

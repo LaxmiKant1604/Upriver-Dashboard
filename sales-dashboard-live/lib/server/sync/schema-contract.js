@@ -648,6 +648,24 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["replaceOliDimensionalWindow", "getExplicitZeroOliOrderAudit"],
     note: "Migration 11: order-level audit (amazon_order_id) + p_order_rows on the replace RPC (FUTURE-ONLY; business grain byte-identical).",
   },
+  {
+    // Migration 12: HASHFIX. The 20260827 order-audit md5 surrogate referenced (o->>'sale_date') as TEXT while the
+    // SELECT grouped on (o->>'sale_date')::date -- an ungrouped reference that raised SQLSTATE 42803 at RUNTIME on the
+    // first non-empty p_order_rows persist (caught by a rolled-back end-to-end check before any sync ran; the audit
+    // table was empty). This is a CREATE OR REPLACE of the 8-arg RPC ONLY -- no table/constraint/index change -- and
+    // is the AUTHORITATIVE runtime function (20260827 still proves the table + audit block on its own file).
+    migration: "20260828_oli_order_audit_hashfix.sql",
+    tables: [],
+    rpcs: [
+      { name: "replace_oli_dimensional_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at", "p_order_rows"] },
+    ],
+    provenFunctions: [
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-dimensional" },
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-order-audit" },
+    ],
+    wrappers: ["replaceOliDimensionalWindow"],
+    note: "Migration 12: order-audit RPC md5 hashfix (sale_date::date GROUP BY alignment); authoritative corrected RPC.",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------

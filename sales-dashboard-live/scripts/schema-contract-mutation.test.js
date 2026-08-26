@@ -279,6 +279,14 @@ test("m11-revoke-missing. a missing REVOKE ALL on the order-audit table => SERVI
 test("m11-index-missing. a renamed required index => INDEX_MISSING", () => m11((t) => t.replace("source_oli_order_audit_account_date_idx", "source_oli_order_audit_account_date_idx_x"), "INDEX_MISSING"));
 test("m11-wrapper-missing. removing the getExplicitZeroOliOrderAudit wrapper => REQUIRED_WRAPPER_MISSING", () => { const a = auditWith({ [WRAP]: (t) => t.replace("export async function getExplicitZeroOliOrderAudit", "async function getExplicitZeroOliOrderAudit_removed") }); assert.ok(!a.ok && hasBlocker(a, "REQUIRED_WRAPPER_MISSING")); });
 
+// ---- Migration 12: the order-audit RPC HASHFIX -- the corrected 8-arg replace is the authoritative runtime RPC ----
+const AUDITFIX = "20260828_oli_order_audit_hashfix.sql";
+const m12 = (mut, code, msg) => { const a = auditWith({ [AUDITFIX]: mut }); assert.ok(!a.ok && hasBlocker(a, code), msg || code); };
+test("m12-missing. a missing hashfix migration => MIGRATION_MISSING", () => { const a = auditWith({ [AUDITFIX]: null }); assert.ok(!a.ok && hasBlocker(a, "MIGRATION_MISSING")); });
+test("m12-param-drift. dropping p_order_rows from the corrected RPC => RPC_PARAM_MISMATCH", () => m12((t) => t.replace(",\n  p_order_rows jsonb default '[]'::jsonb\n)", "\n)"), "RPC_PARAM_MISMATCH"));
+test("m12-audit-block-gutted. removing the order-audit INSERT from the corrected RPC => REPLACE_OLI_AUDIT_INSERT_MISSING", () => m12((t) => t.replace("insert into public.source_oli_order_audit (", "insert into public.source_oli_order_audit_removed ("), "REPLACE_OLI_AUDIT_INSERT_MISSING"));
+test("m12-rpc-removed. renaming away the corrected RPC => RPC_MISSING", () => m12((t) => t.replace("create or replace function public.replace_oli_dimensional_window(", "create or replace function public.replace_oli_dimensional_window_x("), "RPC_MISSING"));
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }
