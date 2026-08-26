@@ -16,6 +16,7 @@
 import { addDaysStr, monthStartStr, canonicalOliSlices } from "../date-windows.js";
 import { canonicalCurrency } from "../currency.js";
 import { sourceRegistryEntry } from "./source-registry.js";
+import { classifyOliDimensionalRow, OliOrderRuleError } from "./oli-order-rules.js";
 
 export const OLI_SOURCE_KEY = "order-line-items";
 export const CATALOG_SOURCE_KEY = "product-catalog";
@@ -293,6 +294,115 @@ export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizat
     }
   }
   return [...byGrain.values()];
+}
+
+/**
+ * DIMENSIONAL variant of oliHistoryRowsFromFragment: maps the canonical OLI fragment -- now carrying
+ * amazon_order_status, fulfillment_channel, address_state and address_city -- onto durable DIMENSIONAL history
+ * rows (the p_rows shape replace_oli_dimensional_window persists), grouped PER ACCOUNT so one account's invalid
+ * evidence never poisons another's write.
+ *
+ * The authoritative order rules (oli-order-rules.js) are enforced fail-closed. Structural corruption (a non-object
+ * row, an unknown seller, a bad date/currency) rejects the WHOLE payload (matching the non-dimensional builder).
+ * But an account whose rows violate the ORDER rules -- a missing status (OLI_ORDER_STATUS_MISSING) or a
+ * non-cancelled positive-unit row with a missing/zero value (OLI_NON_CANCELLED_VALUE_MISSING) -- is BLOCKED: it is
+ * excluded from `byAccount` (so its window is never written and its coverage never advanced -> LKG preserved) and
+ * reported in `blocked`. Cancelled rows are kept (audit) and carry through to the dimensional table; the RPC folds
+ * the NON-cancelled rollup. Same-grain fragment rows SUM (value sums only present values; units always sum).
+ *
+ * Returns { byAccount: Map<accountId, dimRows[]>, blocked: [{ accountId, code, detail }] }.
+ */
+export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint, connectionId, sourceRequestHash }) {
+  if (!Array.isArray(rows)) throw new Error("oliDimensionalRowsFromFragment requires an array payload (fail closed).");
+  if (!organizationFingerprint || !connectionId || !sourceRequestHash) {
+    throw new Error("oliDimensionalRowsFromFragment requires organizationFingerprint + connectionId + sourceRequestHash (fail closed).");
+  }
+  const US = "";
+  // First resolve every row's account + canonical grain fields (structural fail-closed like the non-dim builder),
+  // grouping raw rows by account so ORDER-rule validation can be isolated per account.
+  const rawByAccount = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error("oliDimensionalRowsFromFragment: malformed fragment row; rejecting the whole payload (fail closed).");
+    }
+    const values = Object.values(row);
+    const nonEmpty = values.some((v) => v != null && String(v).trim() !== "");
+    if (!nonEmpty) continue;
+    const seller = String(row.seller_or_vendor_id ?? "").trim();
+    const account = accountsBySellerId ? accountsBySellerId[seller] : null;
+    if (!seller || !account || !String(account.accountId || "").trim()) {
+      throw new Error("oliDimensionalRowsFromFragment: a row's seller_or_vendor_id is blank/unknown to the batch; rejecting the whole payload (fail closed).");
+    }
+    const date = String(row.date ?? "").trim();
+    if (!isDateStr(date)) {
+      throw new Error("oliDimensionalRowsFromFragment: a row carries no valid date; rejecting the whole payload (fail closed).");
+    }
+    const rawCurrency = String(row.item_price_currency ?? "").trim();
+    const currency = rawCurrency ? canonicalCurrency(rawCurrency) : canonicalCurrency(account.currency);
+    if (!currency) {
+      throw new Error("oliDimensionalRowsFromFragment: a row carries no canonical currency and its exact account has no canonical fallback currency; rejecting the whole payload (fail closed).");
+    }
+    const accountId = String(account.accountId);
+    (rawByAccount.get(accountId) || rawByAccount.set(accountId, []).get(accountId)).push({ row, seller, date, currency });
+  }
+
+  const byAccount = new Map();
+  const rollupByAccount = new Map();
+  const blocked = [];
+  for (const [accountId, entries] of rawByAccount) {
+    let violated = null;
+    const byGrain = new Map();      // dimensional grain (full evidence, cancelled included)
+    const rollupByGrain = new Map(); // NON-cancelled rollup at (date, sku, child_asin, currency)
+    for (const { row, seller, date, currency } of entries) {
+      let c;
+      try {
+        c = classifyOliDimensionalRow(row); // throws typed OliOrderRuleError on an order-rule violation
+      } catch (e) {
+        if (e instanceof OliOrderRuleError && (e.code === "OLI_NON_CANCELLED_VALUE_MISSING" || e.code === "OLI_ORDER_STATUS_MISSING")) {
+          violated = { accountId, code: e.code, detail: { ...e.detail } };
+          break; // this account's window is refused; LKG preserved
+        }
+        throw e; // a malformed (non-finite) row is a hard payload failure
+      }
+      const sku = String(row.sku ?? "");
+      const childAsin = String(row.child_asin ?? "");
+      const grain = [accountId, date, seller, sku, childAsin, currency, c.status, c.fulfillmentChannel, c.addressState, c.addressCity].join(US);
+      const existing = byGrain.get(grain);
+      if (existing) {
+        existing.total_units_sum += c.units;
+        if (c.valuePresent) existing.total_sales_sum = (existing.total_sales_sum ?? 0) + c.value;
+      } else {
+        byGrain.set(grain, {
+          seller_or_vendor_id: seller, sale_date: date, sku, child_asin: childAsin, currency,
+          amazon_order_status: c.status, fulfillment_channel: c.fulfillmentChannel,
+          address_state: c.addressState, address_city: c.addressCity,
+          total_sales_sum: c.valuePresent ? c.value : null,
+          total_units_sum: c.units,
+          source_request_hash: sourceRequestHash,
+        });
+      }
+      // The NON-cancelled rollup mirrors what the RPC persists into source_oli_daily_history (dashboards read it).
+      if (!c.isCancelled) {
+        const rgrain = [accountId, date, sku, childAsin, currency].join(US);
+        const rexisting = rollupByGrain.get(rgrain);
+        const addValue = c.valuePresent ? c.value : 0; // a non-cancelled units=0 row may legitimately have no value
+        if (rexisting) {
+          rexisting.salesAmount += addValue;
+          rexisting.units += c.units;
+        } else {
+          rollupByGrain.set(rgrain, {
+            organizationFingerprint, connectionId,
+            accountId, sellerOrVendorId: seller, saleDate: date, sku, childAsin, currency,
+            salesAmount: addValue, units: c.units, sourceRequestHash,
+          });
+        }
+      }
+    }
+    if (violated) { blocked.push(violated); continue; }
+    byAccount.set(accountId, [...byGrain.values()]);
+    rollupByAccount.set(accountId, [...rollupByGrain.values()]);
+  }
+  return { byAccount, rollupByAccount, blocked };
 }
 
 /**

@@ -22,6 +22,7 @@ import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
 import { addDaysStr, num, canonicalOliSlices } from "../datadoe.js";
 import { getAdsDailySourceRows, getAdsSyncStates } from "../supabase.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
+import { isCancelledStatus } from "../sync/oli-order-rules.js";
 import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, OLI_ROW_LIMIT, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
 
 export const PPC_REPORT_KEY = "ppc-performance";
@@ -45,7 +46,7 @@ const SOURCE_KEYS = [
 // never sums money across currencies and this export is byte-identical to the other OLI reports (shared
 // request_hashes on overlapping calendar-anchored slices => one export, many owners). The fold sums
 // item_price_value per currency; TACoS validates that the single currency present equals the Ads currency.
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -269,7 +270,12 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
           },
           `PPC total-sales export (${slice.from} to ${slice.to})`
         );
-        for (const row of sliceRows) salesRows.push(row);
+        // The canonical OLI fragment now carries amazon_order_status: CANCELLED / CANCELED orders contribute ZERO
+        // to total sales (the TACoS denominator); the authoritative missing-status refusal is in the evidence layer.
+        for (const row of sliceRows) {
+          if (isCancelledStatus(row.amazon_order_status)) continue;
+          salesRows.push(row);
+        }
       }
       // The Ads currency is now a proven single valid canonical code: TACoS sums ONLY when every OLI
       // total-sales row's canonicalCurrency(item_price_currency) is non-null AND EQUAL to it. Any

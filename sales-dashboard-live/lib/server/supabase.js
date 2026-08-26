@@ -1299,6 +1299,55 @@ export async function replaceOliHistoryWindow({ organizationFingerprint, connect
   }
 }
 
+// The DIMENSIONAL OLI window replacement (order-status / fulfillment / state / city). Calls the atomic
+// replace_oli_dimensional_window RPC, which -- in ONE transaction -- replaces the account's dimensional rows,
+// replaces the NON-cancelled daily rollup in source_oli_daily_history, and upserts the coverage acknowledgement.
+// A row that violates the authoritative order rules raises fail-closed inside the RPC (the whole window rolls
+// back, LKG preserved); this wrapper surfaces those as TYPED write outcomes so the caller can report the affected
+// account/window separately and never marks its coverage successful.
+export async function replaceOliDimensionalWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, sourceRefreshedAt = null, signal = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(rows)) {
+    throw new Error("replaceOliDimensionalWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a rows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_oli_dimensional_window", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_rows: rows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          sale_date: r.saleDate ?? r.sale_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
+          fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
+          address_state: r.addressState ?? r.address_state ?? "",
+          address_city: r.addressCity ?? r.address_city ?? "",
+          // total_sales_sum is passed AS-IS (null when absent) -- never coerced to 0 before the RPC's validation.
+          total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
+          total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+        })),
+        p_source_refreshed_at: sourceRefreshedAt || new Date().toISOString(),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", dimensionalInserted: value?.dimensionalInserted ?? 0, rollupInserted: value?.rollupInserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_DIM_SCHEMA_MISSING" };
+    const msg = String(writeError && writeError.message ? writeError.message : writeError);
+    if (msg.includes("OLI_NON_CANCELLED_VALUE_MISSING")) return { write: "value-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_NON_CANCELLED_VALUE_MISSING" };
+    if (msg.includes("OLI_ORDER_STATUS_MISSING")) return { write: "status-missing", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_ORDER_STATUS_MISSING" };
+    return { write: "write-failed", dimensionalInserted: 0, rollupInserted: 0, error: "OLI_DIM_REPLACE_FAILED" };
+  }
+}
+
 // GENUINELY DURABLE snapshot payload storage (senior-review findings 5 + 6): the latest-validated catalog /
 // FBA payloads are COPIED to the source-snapshots/* namespace, which prune_source_export_cache can never
 // touch (the prune RPC deletes only object paths recorded in source_export_cache rows) -- so a snapshot
@@ -1397,6 +1446,49 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
     if (list.length < PAGE) break; // a short page is the last page
   }
   return out;
+}
+
+// Durable read helper for future fulfillment / state / city contribution slices WITHOUT another historical
+// DataDoe export: reads the NON-CANCELLED dimensional OLI rows over a window for a set of accounts, aggregated by
+// the requested dimension keys. `dimensions` is a subset of ['fulfillment_channel','address_state','address_city']
+// (a blank value is returned as '' -- unavailable, never invented). Cancelled rows are excluded (they contribute
+// zero to any dashboard contribution). Paginated + hard-capped like getSourceOliHistoryRows.
+export async function getSourceOliDimensionalContribution({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, dimensions = ["fulfillment_channel"], includeCancelled = false, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getSourceOliDimensionalContribution requires organizationFingerprint + from + to (fail closed).");
+  }
+  const ALLOWED = new Set(["fulfillment_channel", "address_state", "address_city", "amazon_order_status"]);
+  const dims = [...new Set((Array.isArray(dimensions) ? dimensions : []).map(String))].filter((d) => ALLOWED.has(d));
+  if (!dims.length) throw new Error("getSourceOliDimensionalContribution requires at least one supported dimension (fail closed).");
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const select = ["account_id", "sale_date", "currency", ...dims, "total_sales_sum", "total_units_sum", "is_cancelled"].join(",");
+  const raw = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const query = new URLSearchParams({
+      select,
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      sale_date: `gte.${from}`,
+      order: "sale_date.asc,account_id.asc",
+      limit: String(PAGE),
+      offset: String(offset),
+    });
+    query.append("sale_date", `lte.${to}`);
+    if (!includeCancelled) query.append("is_cancelled", "eq.false");
+    if (Array.isArray(accountIds) && accountIds.length) {
+      query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+    }
+    const rows = await request(`/rest/v1/source_oli_dimensional_history?${query}`, { signal });
+    const list = Array.isArray(rows) ? rows : [];
+    raw.push(...list);
+    if (raw.length > maxRows) {
+      const err = new Error("OLI_DIM_ROW_LIMIT_EXCEEDED: durable OLI dimensional read exceeded its row cap; refusing a truncated series (fail closed).");
+      err.code = "OLI_DIM_ROW_LIMIT_EXCEEDED";
+      throw err;
+    }
+    if (list.length < PAGE) break;
+  }
+  return raw;
 }
 
 // Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.

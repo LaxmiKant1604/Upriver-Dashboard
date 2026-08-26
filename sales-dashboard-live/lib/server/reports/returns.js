@@ -25,6 +25,7 @@
 
 import { num, canonicalOliSlices } from "../datadoe.js";
 import { brandLabel, fetchCatalog, fetchExportRowsStrict, sumField } from "./common.js";
+import { isCancelledStatus } from "../sync/oli-order-rules.js";
 import { OLI_ROW_LIMIT, ORDER_LINE_ITEMS, RETURNS, ROW_LIMITS, SETTLEMENTS } from "./sources.js";
 import { addDaysStr } from "../datadoe.js";
 
@@ -67,7 +68,7 @@ const SETTLEMENT_AGGREGATIONS = [
 // currencies and this export is byte-identical to the other OLI reports (shared request_hashes on
 // overlapping calendar-anchored slices => one export, many owners). The fold re-aggregates to
 // (currency, child_asin) so ordered evidence is bound per currency (Blocker 2) — never ASIN alone.
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -134,7 +135,12 @@ export async function buildReturnsLeakage({ apiKey, ids, to }) {
       },
       `Returns ordered-units export (${slice.from} to ${slice.to})`
     );
-    for (const row of sliceRows) orderedRows.push(row);
+    // The canonical OLI fragment now carries amazon_order_status: CANCELLED / CANCELED orders contribute ZERO
+    // ordered units (the authoritative missing-status refusal lives in the durable evidence layer).
+    for (const row of sliceRows) {
+      if (isCancelledStatus(row.amazon_order_status)) continue;
+      orderedRows.push(row);
+    }
   }
 
   const catalog = await fetchCatalog(apiKey, ids);

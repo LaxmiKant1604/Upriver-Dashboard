@@ -101,7 +101,13 @@ const RECON_SETTLEMENT_AGGREGATIONS = [
 // ppc-performance so overlapping calendar-anchored slices (canonicalOliSlices) produce EQUAL request_hashes
 // => one DataDoe export owned by MULTIPLE reports. item_price_currency is in the group-by so DataDoe never
 // sums money across currencies; each report's fold re-aggregates to its own grain (currency kept in key).
-const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+// The canonical OLI fragment now ALSO carries four order dimensions (proven present in the DataDoe source
+// schema): amazon_order_status, fulfillment_channel, address_state, address_city. address_country and
+// amazon_order_id are deliberately NOT requested. Adding them to the group-by widens the returned grain to the
+// dimensional grain; the persist path folds the NON-cancelled rollup back to (date,sku,child_asin,currency) so
+// every existing consumer of source_oli_daily_history is unchanged. Adding columns CHANGES every OLI
+// request_hash (source-identity folds columns + groupBy in), so a one-time historical re-export is required.
+export const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 const OLI_SALES_GROUP_BY = [...OLI_SALES_COLUMNS];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },

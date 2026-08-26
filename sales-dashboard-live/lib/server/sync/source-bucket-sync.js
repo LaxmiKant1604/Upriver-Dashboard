@@ -37,7 +37,7 @@ import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryIsPremiumOf, sourceRegistryEntry } from "./source-registry.js";
 import {
   oliBackfillWindow, oliRollingRefreshWindow, planOliSliceExports,
-  oliHistoryRowsFromFragment, snapshotRefreshDecision, catalogSnapshotScope, ORGANIZATION_SCOPE_KEY,
+  oliHistoryRowsFromFragment, oliDimensionalRowsFromFragment, snapshotRefreshDecision, catalogSnapshotScope, ORGANIZATION_SCOPE_KEY,
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY,
 } from "./source-durable-model.js";
 import { buildBrandMaps } from "./brand-resolution.js";
@@ -518,27 +518,44 @@ export async function runBucketSourceSync({
           break;
         }
         const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId, currency: a.currency }]));
-        const historyRows = oliHistoryRowsFromFragment({
+        // DIMENSIONAL persist: the fragment now carries amazon_order_status / fulfillment_channel / address_state /
+        // address_city. The builder validates the authoritative order rules PER ACCOUNT (a value-missing / missing-
+        // status account is BLOCKED -- its window is never written, its coverage never advanced, LKG preserved --
+        // and reported), and returns the dimensional rows + the non-cancelled daily rollup for each good account.
+        const { byAccount, rollupByAccount, blocked } = oliDimensionalRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
         });
-        const byAccount = new Map(unit.accounts.map((a) => [a.accountId, []]));
-        for (const hr of historyRows) byAccount.get(hr.accountId).push(hr);
+        if (blocked.length) {
+          rollup.blockedAccounts = rollup.blockedAccounts || [];
+          for (const b of blocked) rollup.blockedAccounts.push({ ...b, coveredFrom: unit.slice.from, coveredTo: unit.slice.to, family: OLI_SOURCE_KEY });
+        }
+        const blockedSet = new Set(blocked.map((b) => b.accountId));
         for (const a of unit.accounts) {
+          if (blockedSet.has(a.accountId)) continue; // refused account: LKG preserved, reported in blockedAccounts
           if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
+          const dimRows = byAccount.get(a.accountId) || [];
+          const rollupRows = rollupByAccount.get(a.accountId) || [];
           const outcome = await replaceHistoryWindow({
             organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
             connectionId: "primary", accountId: a.accountId,
             coveredFrom: unit.slice.from, coveredTo: unit.slice.to,
-            rows: byAccount.get(a.accountId), sourceRefreshedAt: nowIso(),
+            rows: dimRows, rollupRows, sourceRefreshedAt: nowIso(),
           });
+          if (outcome && (outcome.write === "value-missing" || outcome.write === "status-missing")) {
+            // The RPC's last-line-of-defence validation refused this window (JS builder should have caught it, but
+            // the DB is authoritative): treat exactly like a blocked account -- LKG preserved, reported, never fatal.
+            rollup.blockedAccounts = rollup.blockedAccounts || [];
+            rollup.blockedAccounts.push({ accountId: a.accountId, code: outcome.error, coveredFrom: unit.slice.from, coveredTo: unit.slice.to, family: OLI_SOURCE_KEY });
+            continue;
+          }
           if (!outcome || outcome.write !== "ok") {
             rollup.stopped = true;
             rollup.stopReason = Object.freeze({ code: "HISTORY_REPLACE_FAILED", family: OLI_SOURCE_KEY, accountId: a.accountId });
             break;
           }
-          rollup.history.rowsPersisted += byAccount.get(a.accountId).length;
+          rollup.history.rowsPersisted += dimRows.length;
           coveredAccounts.add(a.accountId);
         }
         if (rollup.stopped || rollup.deadlineReached) break;

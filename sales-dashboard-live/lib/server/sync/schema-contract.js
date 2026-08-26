@@ -552,6 +552,50 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["reservePriorityCatalogCreate", "recordPriorityCatalogExport", "getPriorityCatalogReservation"],
     note: "Migration 9: durable operation-wide one-Catalog-export / two-token reservation (PREPARED, UNAPPLIED).",
   },
+  {
+    // Migration 10: the ADDITIVE dimensional OLI history (amazon_order_status / fulfillment_channel /
+    // address_state / address_city) + its atomic replacement RPC. Full-grain evidence (cancelled included, for
+    // audit) written ONLY through the SECURITY DEFINER RPC that also folds the non-cancelled daily rollup into
+    // source_oli_daily_history. Service-role-only surface: SELECT grant, NO policy, NO authenticated grant.
+    migration: "20260826_oli_dimensional_history.sql",
+    tables: [
+      {
+        name: "source_oli_dimensional_history",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "sale_date", "seller_or_vendor_id", "sku", "child_asin", "currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"]],
+        namedConstraints: [
+          { name: "source_oli_dim_history_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "sale_date", "seller_or_vendor_id", "sku", "child_asin", "currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"] },
+          { name: "source_oli_dim_history_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_oli_dim_history_currency_check", kind: "check", canonical: "currency ~ '^[A-Z]{3}$'" },
+          { name: "source_oli_dim_history_status_nonblank", kind: "check", canonical: "char_length(btrim(amazon_order_status)) > 0" },
+          { name: "source_oli_dim_history_hash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+        ],
+        requiredIndexes: [
+          { name: "source_oli_dim_history_account_date_idx", columns: ["account_id", "sale_date"] },
+          { name: "source_oli_dim_history_org_date_idx", columns: ["organization_fingerprint", "sale_date"] },
+        ],
+        rlsEnabled: true,
+        // Written ONLY through replace_oli_dimensional_window (SECURITY DEFINER): service_role keeps SELECT alone.
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
+        requiredTriggers: [{ name: "source_oli_dim_history_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
+          "sku", "child_asin", "currency", "amazon_order_status", "status_normalized", "is_cancelled",
+          "fulfillment_channel", "address_state", "address_city", "total_sales_sum", "total_units_sum", "source_request_hash"],
+      },
+    ],
+    rpcs: [
+      { name: "replace_oli_dimensional_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at"] },
+    ],
+    // STRUCTURAL body proof: validate every row fail-closed BEFORE mutating (incl. the missing-status +
+    // non-cancelled-value refusals), REPLACE the dimensional rows, REPLACE the NON-cancelled rollup in
+    // source_oli_daily_history, and UPSERT the succeeded coverage acknowledgement -- all in one body.
+    provenFunctions: [
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-dimensional" },
+    ],
+    wrappers: ["replaceOliDimensionalWindow", "getSourceOliDimensionalContribution"],
+    note: "Migration 10: dimensional OLI history (order status / fulfillment / state / city) + atomic replace RPC (PREPARED, UNAPPLIED).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -1140,6 +1184,51 @@ function auditReplaceOliFunction(clean, masked, fnName) {
   return problems;
 }
 
+// Migration 10 structural proof: the ATOMIC dimensional OLI replacement. The body must (a) validate rows
+// FAIL-CLOSED before any mutation, INCLUDING the missing-status refusal (OLI_ORDER_STATUS_MISSING) and the
+// non-cancelled-value refusal (OLI_NON_CANCELLED_VALUE_MISSING); (b) DELETE the account's dimensional rows in
+// the window; (c) DELETE the account's rollup rows in source_oli_daily_history and INSERT the NON-cancelled
+// rollup (WHERE the normalized status is not cancelled); (d) UPSERT the succeeded coverage acknowledgement --
+// all in one body.
+function auditReplaceOliDimensionalFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "REPLACE_OLI_DIM_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  const C = body.clean;
+  if (!/raise\s+exception[\s\S]*jsonb_array_elements\s*\(\s*p_rows\s*\)|jsonb_array_elements\s*\(\s*p_rows\s*\)[\s\S]*raise\s+exception/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_DIM_VALIDATION_MISSING", reason: "does not validate the supplied rows fail-closed before mutating" });
+  }
+  if (!/OLI_ORDER_STATUS_MISSING/i.test(C)) {
+    problems.push({ code: "REPLACE_OLI_DIM_STATUS_GUARD_MISSING", reason: "does not fail-closed on a missing order status (cancellation unclassifiable)" });
+  }
+  if (!/OLI_NON_CANCELLED_VALUE_MISSING/i.test(C)) {
+    problems.push({ code: "REPLACE_OLI_DIM_VALUE_GUARD_MISSING", reason: "does not refuse a non-cancelled positive-unit row with a missing/zero value" });
+  }
+  if (!/delete\s+from\s+public\.source_oli_dimensional_history\b[^;]*\baccount_id\s*=\s*p_account_id\b[^;]*\bsale_date\s+between\s+p_covered_from\s+and\s+p_covered_to/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_DIM_DELETE_MISSING", reason: "does not DELETE the account's dimensional rows inside the replaced window" });
+  }
+  if (!/insert\s+into\s+public\.source_oli_dimensional_history\b/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_DIM_INSERT_MISSING", reason: "does not INSERT the dimensional rows" });
+  }
+  // The NON-cancelled rollup replacement into source_oli_daily_history.
+  if (!/delete\s+from\s+public\.source_oli_daily_history\b[^;]*\baccount_id\s*=\s*p_account_id\b/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_DIM_ROLLUP_DELETE_MISSING", reason: "does not DELETE the account's rollup rows in source_oli_daily_history" });
+  }
+  const rollupInsert = /insert\s+into\s+public\.source_oli_daily_history\b/i.test(M)
+    && /where\s+lower\s*\(\s*btrim\s*\(\s*r->>'amazon_order_status'\s*\)\s*\)\s+not\s+in\s*\(\s*'cancelled'\s*,\s*'canceled'\s*\)/i.test(C);
+  if (!rollupInsert) {
+    problems.push({ code: "REPLACE_OLI_DIM_ROLLUP_INSERT_MISSING", reason: "does not INSERT the NON-cancelled rollup (cancelled rows must be excluded)" });
+  }
+  const coverageAck = /insert\s+into\s+public\.source_coverage\b/i.test(M)
+    && /on\s+conflict\b[\s\S]*do\s+update\b/i.test(M)
+    && /'succeeded'/i.test(C);
+  if (!coverageAck) {
+    problems.push({ code: "REPLACE_OLI_DIM_COVERAGE_ACK_MISSING", reason: "does not UPSERT the succeeded coverage acknowledgement in the same transaction" });
+  }
+  return problems;
+}
+
 // Round-4 finding 8 structural proof: the snapshot pointer CAS must LOCK the existing row FOR UPDATE,
 // refuse an OLDER save ('stale-save'), accept an equal-identical save as 'unchanged', refuse equal but
 // CONFLICTING evidence ('conflict'), and replace only on a STRICTLY NEWER validated_at.
@@ -1402,6 +1491,7 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "assign-batch") return auditAssignBatchFunction(clean, masked, fnName);
   if (proof === "reserve-create") return auditReserveCreateFunction(clean, masked, fnName);
   if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
+  if (proof === "replace-oli-dimensional") return auditReplaceOliDimensionalFunction(clean, masked, fnName);
   if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
   if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);

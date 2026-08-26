@@ -27,6 +27,7 @@ import {
   fetchInventorySnapshot,
   sumField,
 } from "./common.js";
+import { isCancelledStatus } from "../sync/oli-order-rules.js";
 import { OLI_ROW_LIMIT, ORDER_LINE_ITEMS, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
 
 export const BUY_BOX_REPORT_KEY = "buy-box-loss";
@@ -56,7 +57,7 @@ const DAILY_COLUMNS = [
 // ppc-performance. The fold re-aggregates to (currency|sku), joining to the daily buy-box rows on
 // currency|sku. Fetched over the SAME 28-day window as :daily but sliced by canonicalOliSlices, so its
 // interior + asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -141,6 +142,9 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       `Buy Box ordered export (${slice.from} to ${slice.to})`
     );
     for (const row of orderedRows) {
+      // The canonical OLI fragment now carries amazon_order_status: CANCELLED / CANCELED orders contribute ZERO
+      // ordered sales/units (the authoritative missing-status refusal lives in the durable evidence layer).
+      if (isCancelledStatus(row.amazon_order_status)) continue;
       const sku = String(row.sku || "").trim();
       if (!sku) continue;
       const currency = String(row.item_price_currency || "").trim() || null;

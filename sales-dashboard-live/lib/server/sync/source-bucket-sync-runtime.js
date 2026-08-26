@@ -50,7 +50,7 @@ import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENT
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
-  replaceOliHistoryWindow, saveSourceSnapshotPayload, getSourceSnapshotPayload,
+  replaceOliHistoryWindow, replaceOliDimensionalWindow, saveSourceSnapshotPayload, getSourceSnapshotPayload,
   getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
@@ -277,7 +277,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // params refresh replaces older evidence atomically; older/equal-conflicting preserves LKG).
     saveShadowIfNewer = saveShadowSnapshotIfNewer,
     composeTrancheRuntime = buildSchedulerV2SourceTrancheRuntime,
-    replaceHistory = replaceOliHistoryWindow,
+    // OLI persistence now goes through the DIMENSIONAL RPC: it writes the full-grain evidence (cancelled
+    // included, for audit) AND the non-cancelled daily rollup into source_oli_daily_history (what dashboards
+    // read) atomically. The value-missing / status-missing refusals are surfaced typed so a bad account keeps
+    // its LKG.
+    replaceHistory = replaceOliDimensionalWindow,
     saveSnapshotPayload = saveSourceSnapshotPayload,
     loadSnapshotPayload = getSourceSnapshotPayload,
     recordSnapshot = recordSourceSnapshot,
@@ -707,7 +711,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       const outcome = await dl.bound("history-replace", (signal) => replaceHistory({ ...args, signal }), { write: true });
       if (liveEvidence && outcome && outcome.write === "ok" && !dl.aborted()) {
         const keep = liveEvidence.historyRows.filter((r) => !(r.account_id === args.accountId && r.sale_date >= args.coveredFrom && r.sale_date <= args.coveredTo));
-        for (const r of args.rows || []) {
+        // Fold the NON-cancelled daily rollup (args.rollupRows) -- exactly what the RPC wrote to
+        // source_oli_daily_history -- into the in-memory evidence, so the derive stage reflects this fetch with
+        // cancelled orders already excluded. (Falls back to args.rows for the legacy non-dimensional shape.)
+        const foldRows = Array.isArray(args.rollupRows) ? args.rollupRows : (args.rows || []);
+        for (const r of foldRows) {
           keep.push({ account_id: r.accountId, sale_date: r.saleDate, sku: r.sku, child_asin: r.childAsin, currency: r.currency, sales_amount: r.salesAmount, units: r.units, source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? null });
         }
         liveEvidence.historyRows = keep;

@@ -22,7 +22,7 @@ export const SOURCE_CONTRACTS = [
     ids: ["89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778"],
     label: "Order Line Items",
     grain: "order-item",
-    fields: ["date", "order_date", "amazon_order_id", "sku", "child_asin", "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_country_code", "quantity", "item_price_value", "item_price_currency", "item_tax_value", "amazon_order_status", "fulfillment_channel", "order_is_business"],
+    fields: ["date", "order_date", "amazon_order_id", "sku", "child_asin", "seller_or_vendor_id", "seller_or_vendor_name", "marketplace_country_code", "quantity", "item_price_value", "item_price_currency", "item_tax_value", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "order_is_business"],
     // Canonical sales/ordered-units source (item_price_value for sales, quantity for
     // ordered units). Daily Reporting, FBA Plan, Buy Box Loss, Returns Leakage and PPC
     // read sales/units here; Sales Movers keeps Sales & Traffic (it needs sessions/page views).

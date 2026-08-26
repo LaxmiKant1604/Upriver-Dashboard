@@ -197,9 +197,12 @@ function makeDataDoe(opts = {}) {
       const rk = job.requestKey || ""; const fp = job.fetchParams || {};
       if (rk.includes("source-oli")) {
         const ids = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
+        // The canonical OLI fragment now carries the four order dimensions. A non-cancelled positive-unit row
+        // MUST have a positive value (the value rule), so SKU-ONLY keeps a positive value even when its currency
+        // is blank (D1b tests the currency binding, not the value rule).
         return ids.flatMap((sid) => [
-          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 },
-          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-ONLY", child_asin: "B0X", item_price_currency: opts.blankOliCurrency ? "" : "USD", total_sales_sum: opts.blankOliCurrency ? 0 : 20, total_units_sum: 2 },
+          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", amazon_order_status: "Shipped", fulfillment_channel: "AFN", address_state: "CA", address_city: "LA", total_sales_sum: 100, total_units_sum: 10 },
+          { date: fp.to, seller_or_vendor_id: sid, sku: "SKU-ONLY", child_asin: "B0X", item_price_currency: opts.blankOliCurrency ? "" : "USD", amazon_order_status: "Shipped", fulfillment_channel: "MFN", address_state: "", address_city: "", total_sales_sum: 20, total_units_sum: 2 },
         ]);
       }
       if (rk.includes("source-catalog")) return opts.badCatalog ? [{ child_asin: "B0A" }, null] : CATALOG_ROWS.map((r) => ({ ...r }));
@@ -212,15 +215,18 @@ function makeDataDoe(opts = {}) {
 function makeClock(start = 5_000_000) { const c = { now: start }; c.fn = () => c.now; c.advance = (ms) => { c.now += ms; }; return c; }
 
 function makeSinks() {
-  // The ATOMIC replaceHistoryWindow model: one call = delete-the-window + insert rows + coverage ack.
-  const history = []; const coverage = []; const snapshots = []; const statuses = []; const replaceCalls = [];
+  // The ATOMIC DIMENSIONAL replace model: one call = replace the account's dimensional rows + replace the
+  // NON-cancelled daily rollup (source_oli_daily_history, what dashboards read) + coverage ack. `history`
+  // captures the ROLLUP rows (the dashboard grain); `dimensional` captures the full-grain evidence.
+  const history = []; const dimensional = []; const coverage = []; const snapshots = []; const statuses = []; const replaceCalls = [];
   return {
-    history, coverage, snapshots, statuses, replaceCalls,
-    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows }) => {
-      replaceCalls.push({ accountId, coveredFrom, coveredTo, rowCount: rows.length });
-      history.push(...rows);
+    history, dimensional, coverage, snapshots, statuses, replaceCalls,
+    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows, rollupRows }) => {
+      replaceCalls.push({ accountId, coveredFrom, coveredTo, rowCount: (rows || []).length });
+      dimensional.push(...(rows || []));
+      history.push(...(rollupRows || []));
       coverage.push({ accountId, sourceKey: "order-line-items", coveredFrom, coveredTo });
-      return { write: "ok", replaced: 0, inserted: rows.length };
+      return { write: "ok", dimensionalInserted: (rows || []).length, rollupInserted: (rollupRows || []).length };
     },
     persistSnapshot: async (s) => { snapshots.push(s); return { write: "ok" }; },
     updateRunStatus: async (s) => { statuses.push(s); return { write: "ok" }; },

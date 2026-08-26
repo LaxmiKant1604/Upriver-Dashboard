@@ -182,7 +182,7 @@ function makeDataDoe(opts = {}) {
       const rk = job.requestKey || ""; const fp = job.fetchParams || {};
       if (rk.includes("source-oli")) {
         const ids = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
-        return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 }));
+        return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", amazon_order_status: "Shipped", fulfillment_channel: "AFN", address_state: "CA", address_city: "LA", total_sales_sum: 100, total_units_sum: 10 }));
       }
       if (rk.includes("source-catalog")) return CATALOG_ROWS.map((r) => ({ ...r }));
       if (rk.includes("source-fba")) return [{ date: fp.to, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }];
@@ -202,14 +202,16 @@ function tripwired(dd) {
 function makeClock(start = 9_000_000) { const c = { now: start }; c.fn = () => c.now; c.advance = (ms) => { c.now += ms; }; return c; }
 
 function makeSinks() {
-  // The ATOMIC replaceHistoryWindow model: one call = delete-the-window + insert rows + coverage ack.
-  const history = []; const coverage = []; const snapshots = [];
+  // The ATOMIC DIMENSIONAL replace model: one call = replace the dimensional rows + replace the NON-cancelled
+  // daily rollup (source_oli_daily_history, what dashboards read) + coverage ack. `history` captures the ROLLUP.
+  const history = []; const dimensional = []; const coverage = []; const snapshots = [];
   return {
-    history, coverage, snapshots,
-    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows }) => {
-      history.push(...rows);
+    history, dimensional, coverage, snapshots,
+    replaceHistoryWindow: async ({ accountId, coveredFrom, coveredTo, rows, rollupRows }) => {
+      dimensional.push(...(rows || []));
+      history.push(...(rollupRows || []));
       coverage.push({ accountId, sourceKey: "order-line-items", coveredFrom, coveredTo });
-      return { write: "ok", replaced: 0, inserted: rows.length };
+      return { write: "ok", dimensionalInserted: (rows || []).length, rollupInserted: (rollupRows || []).length };
     },
     persistSnapshot: async (s) => { snapshots.push(s); return { write: "ok" }; },
     updateRunStatus: async () => ({ write: "ok" }),

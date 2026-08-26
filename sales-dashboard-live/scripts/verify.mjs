@@ -46,6 +46,7 @@ const SUITES = [
   "test:source-registry",
   "test:source-fixpoint",
   "test:source-durable-model",
+  "test:oli-dimensional",
   "test:source-bucket-sync",
   "test:source-status",
   "test:source-schedule",

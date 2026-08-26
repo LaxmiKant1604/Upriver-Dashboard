@@ -354,7 +354,7 @@ function makeDataDoe(opts = {}) {
       const rk = job.requestKey || ""; const fp = job.fetchParams || {};
       if (rk.includes("source-oli")) {
         const ids = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
-        return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", total_sales_sum: 100, total_units_sum: 10 }));
+        return ids.map((sid) => ({ date: fp.to, seller_or_vendor_id: sid, sku: "SKU-A", child_asin: "B0A", item_price_currency: "USD", amazon_order_status: "Shipped", fulfillment_channel: "AFN", address_state: "CA", address_city: "LA", total_sales_sum: 100, total_units_sum: 10 }));
       }
       if (rk.includes("source-catalog")) return [{ child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" }];
       if (rk.includes("source-fba")) {
@@ -406,15 +406,18 @@ function makeHarness(over = {}) {
       return idx;
     }),
     // The ATOMIC replacement model: delete-the-window + insert + coverage ack, or NOTHING on failure.
-    replaceHistory: over.replaceHistory || (async ({ accountId, coveredFrom, coveredTo, rows }) => {
-      recorded.replaceCalls.push({ accountId, coveredFrom, coveredTo, rowCount: rows.length });
-      if (over.failReplace) return { write: "write-failed", error: "OLI_HISTORY_REPLACE_FAILED" };
+    // The ATOMIC DIMENSIONAL replacement: the dimensional rows + the NON-cancelled daily rollup replace the
+    // window, or NOTHING on failure. durableHistory keeps the ROLLUP grain (what dashboards read).
+    replaceHistory: over.replaceHistory || (async ({ accountId, coveredFrom, coveredTo, rows, rollupRows }) => {
+      const roll = Array.isArray(rollupRows) ? rollupRows : (rows || []);
+      recorded.replaceCalls.push({ accountId, coveredFrom, coveredTo, rowCount: roll.length });
+      if (over.failReplace) return { write: "write-failed", error: "OLI_DIM_REPLACE_FAILED" };
       for (const [grain, row] of [...durableHistory.entries()]) {
         if (row.accountId === accountId && row.saleDate >= coveredFrom && row.saleDate <= coveredTo) durableHistory.delete(grain);
       }
-      for (const r of rows) durableHistory.set([r.accountId, r.saleDate, r.sku, r.childAsin, r.currency].join("|"), r);
+      for (const r of roll) durableHistory.set([r.accountId, r.saleDate, r.sku, r.childAsin, r.currency].join("|"), r);
       durableCoverage.push({ accountId, from: coveredFrom, to: coveredTo });
-      return { write: "ok", replaced: 0, inserted: rows.length };
+      return { write: "ok", dimensionalInserted: (rows || []).length, rollupInserted: roll.length };
     }),
     saveSnapshotPayload: over.saveSnapshotPayload || (async ({ sourceKey, scopeKey, rows }) => {
       const objectPath = `source-snapshots/v1/${sourceKey}/${scopeKey}.json`;

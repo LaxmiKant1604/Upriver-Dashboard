@@ -236,9 +236,10 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
 
 test("GOLDEN: the sliced request windows produce the pinned request_hashes for a fixed synthetic input", () => {
   // Fixed input (PIN_KEY / A1 / asOf 2025-08-10). These hashes CHANGED intentionally with the CANONICAL OLI
-  // fragment (Blocker 1: columns now [date, seller_or_vendor_id, sku, child_asin, item_price_currency],
-  // sliced by canonicalOliSlices with DataDoe's verified 5,000-row OLI ceiling) -- pinning the first+last slice
-  // locks the corrected identities against silent drift.
+  // fragment now carrying the four order dimensions (columns [date, seller_or_vendor_id, sku, child_asin,
+  // item_price_currency, amazon_order_status, fulfillment_channel, address_state, address_city], sliced by
+  // canonicalOliSlices with DataDoe's verified 5,000-row OLI ceiling) -- pinning the first+last slice locks the
+  // corrected identities against silent drift.
   const daily = reportSourceRequestHashes({
     reportKey: "daily-reporting", apiKey: ["PIN", "KEY"].join("_"), ids: ["A1"],
     windowsByRequestKey: {
@@ -249,8 +250,8 @@ test("GOLDEN: the sliced request windows produce the pinned request_hashes for a
   assert.equal(daily.length, 27, "6 calendar months (Mar..Aug-partial) -> 27 slices");
   assert.deepEqual([daily[0].from, daily[0].to], ["2025-03-01", "2025-03-07"]);
   assert.deepEqual([daily[daily.length - 1].from, daily[daily.length - 1].to], ["2025-08-08", "2025-08-10"]);
-  assert.equal(daily[0].requestHash, "12870b21dedb4f5b11f411508704494b123b8b8224dd90668f40be64bb1d03c7");
-  assert.equal(daily[daily.length - 1].requestHash, "1f0e6f536d65f7a768ff3c078a0fdd50265d8f3060137d287b5c624a9933c654");
+  assert.equal(daily[0].requestHash, "c04cc096a47e24b021b6f4fc7ebf0b6fbc2a4e371e42a82cb0617c168a05b045");
+  assert.equal(daily[daily.length - 1].requestHash, "37277942f1588f9a572b407206f8a221d07deb30beda164ae9e1c5d76aedf508");
 });
 
 /* ============================= 5: malformed-fragment fail-closed matrix ============================= */

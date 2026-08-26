@@ -90,6 +90,7 @@ import {
 } from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
+import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
@@ -1607,8 +1608,8 @@ const DAILY_SALES_AGGREGATIONS = [
 // The named-brand superset IS the CANONICAL Order Line Items sales fragment (Blocker 1): grouped by
 // [date, seller, sku, child_asin, item_price_currency] so it is byte-identical to OLI_SALES_* and shares
 // request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance on overlapping slices.
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
-const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 
 // ===== CANONICAL Order Line Items sales fragment (Blocker 1 — parity source of truth) =====
 // ONE fragment spec shared IDENTICALLY by daily-reporting (the superset above), fba-plan, buy-box-loss,
@@ -1617,8 +1618,10 @@ const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child
 // lib/server/sync/report-source-contracts.js (OLI_SALES_*) and referenced by the live builders in
 // lib/server/reports/{buy-box,returns,ppc}.js. item_price_currency is in the group-by so DataDoe never sums
 // money across currencies; every downstream fold keys currency in and re-aggregates to its own grain.
-const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency"];
+// Mirrors report-source-contracts.js OLI_SALES_* (parity-tested). The four order dimensions were added here too
+// so the live "fetch latest" export identity stays byte-identical to the scheduler's (one shared cached export).
+const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
@@ -2167,7 +2170,12 @@ async function fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to) {
     }
     allRows.push(...rows);
   }
-  return allRows;
+  // The canonical OLI fragment now carries amazon_order_status: CANCELLED / CANCELED orders contribute ZERO to
+  // dashboard sales/units, so they are dropped here BEFORE any fold (the scheduler path excludes them inside the
+  // dimensional RPC's rollup). The remaining non-cancelled dimensional rows re-aggregate to the same
+  // (date, seller, child_asin, currency) grain every downstream fold already uses. A row with no status is
+  // dropped fail-closed (cancellation cannot be classified) rather than counted.
+  return allRows.filter((r) => !isCancelledStatus(r && r.amazon_order_status));
 }
 
 // The 3 completed calendar months before the month containing `toStr`, plus the
