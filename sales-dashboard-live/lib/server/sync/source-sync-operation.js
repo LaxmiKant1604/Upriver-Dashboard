@@ -136,24 +136,25 @@ export async function runReleaseSlice({ bucket, release, controls, readbackLive,
   if (!accounts.length) return { phase: "finalize", ok: false, problems: ["finalize returned no accounts"] };
   log("finalize ok: " + bucket + " (" + accounts.length + " accounts, " + S(fin.cycleStatus) + ")");
 
-  // (4) PREFLIGHT every account BEFORE the first live write of THIS slice (all-or-nothing gate, re-proven on
-  // every slice so a resumed run can never publish past a account that stopped being ready).
-  for (const accountId of accounts) {
-    const pre = await release.preflightAccount(accountId);
-    const rs = (pre && pre.results) || [];
-    const bad = rs.filter((r) => !(r && r.disposition === "ready" && nb(r.liveReportKey) && nb(r.paramsHash)));
-    if (rs.length !== PRIORITY_DASHBOARDS.reportKeys.length || bad.length) {
-      return { phase: "preflight", ok: false, problems: ["publish gate not ready for an account (" + (bad[0] && bad[0].reportKey || "shape") + ": " + S(bad[0] && bad[0].disposition) + ")"] };
-    }
-  }
-  log("preflight ok: " + accounts.length + " accounts x " + PRIORITY_DASHBOARDS.reportKeys.length + " gates");
-
-  // (5) PUBLISH inside an open->publish->ALWAYS-safe-close envelope. The slice budget bounds how many accounts
-  // publish this pass; the CAS makes replays cheap (already-current) and never-regressing.
+  // (4)+(5) PREFLIGHT + PUBLISH inside ONE open->...->ALWAYS-safe-close envelope. The publish gate consults the
+  // temporary publication controls (publish_enabled / schedule_enabled, fail closed), which are safe-closed
+  // outside the envelope by design -- so the all-or-nothing preflight MUST run with the controls open. It is
+  // read-only and re-proven on every slice, and it still runs BEFORE the first publish write: a preflight
+  // failure exits through the finally (controls safe-closed) having published NOTHING.
   const published = [];
   let remaining = [...accounts];
   await controls.apply();
   try {
+    for (const accountId of accounts) {
+      const pre = await release.preflightAccount(accountId);
+      const rs = (pre && pre.results) || [];
+      const bad = rs.filter((r) => !(r && r.disposition === "ready" && nb(r.liveReportKey) && nb(r.paramsHash)));
+      if (rs.length !== PRIORITY_DASHBOARDS.reportKeys.length || bad.length) {
+        return { phase: "preflight", ok: false, problems: ["publish gate not ready for an account (" + (bad[0] && bad[0].reportKey || "shape") + ": " + S(bad[0] && bad[0].disposition) + ")"] };
+      }
+    }
+    log("preflight ok: " + accounts.length + " accounts x " + PRIORITY_DASHBOARDS.reportKeys.length + " gates");
+
     while (remaining.length && !outOfTime()) {
       const accountId = remaining[0];
       const res = await release.publishAccount(accountId);

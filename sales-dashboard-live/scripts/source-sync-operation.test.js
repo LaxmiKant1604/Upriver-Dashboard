@@ -102,11 +102,14 @@ await testAsync("a refused finalize is a typed failure BEFORE any control/publis
   assert.equal(calls.apply, 0);
 });
 
-await testAsync("ONE not-ready publish gate blocks BEFORE the first live write (all-or-nothing preflight)", async () => {
+await testAsync("ONE not-ready publish gate blocks BEFORE the first live write (all-or-nothing preflight INSIDE the envelope)", async () => {
+  // The publish gate consults the temporary publication controls (fail closed: report-disabled when safe-closed),
+  // so the preflight runs INSIDE the open->...->safe-close envelope -- but STILL before any publish write.
   const { deps, calls } = makeDeps({ release: { preflightAccount: async (a) => (a === "A2" ? { accountId: a, results: [{ reportKey: "brand-sales", disposition: "blocked" }] } : readyPre(a)) } });
   const r = await runReleaseSlice(deps);
   assert.equal(r.phase, "preflight"); assert.equal(r.ok, false);
-  assert.equal(calls.apply, 0, "controls never opened");
+  assert.equal(calls.apply, 1, "controls opened for the gate check");
+  assert.equal(calls.close, 1, "SAFE-CLOSE ran on the preflight-failure exit");
   assert.deepEqual(calls.publishes, [], "ZERO live writes");
 });
 
