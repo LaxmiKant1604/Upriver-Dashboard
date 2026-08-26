@@ -40,6 +40,29 @@ export function orderValuePresent(v) {
   return v != null && S(v).trim() !== "";
 }
 
+// Canonical fulfillment categories. The raw fulfillment_channel is ALWAYS preserved (audit); this maps its
+// synonyms onto ONE presentation bucket so Amazon/AFN and Merchant/MFN can never split a contribution total into
+// four separate categories.
+export const FULFILLMENT_CATEGORY = Object.freeze({
+  AMAZON: "Amazon/FBA",
+  MERCHANT: "Merchant/FBM",
+  UNAVAILABLE: "Unavailable",
+});
+
+/**
+ * Normalize a raw fulfillment_channel into exactly one canonical category:
+ *   Amazon | AFN                    -> "Amazon/FBA"    (Amazon-fulfilled / FBA)
+ *   Merchant | MFN | Seller         -> "Merchant/FBM"  (merchant-fulfilled / FBM)
+ *   blank / unknown / anything else -> "Unavailable"   (never a fabricated category, never dropped)
+ * Comparison is trim + lower-case; the raw value is never mutated by this function.
+ */
+export function normalizeFulfillmentChannel(raw) {
+  const n = S(raw).trim().toLowerCase();
+  if (n === "amazon" || n === "afn" || n === "amazon fulfilled" || n === "fba") return FULFILLMENT_CATEGORY.AMAZON;
+  if (n === "merchant" || n === "mfn" || n === "seller" || n === "merchant fulfilled" || n === "fbm") return FULFILLMENT_CATEGORY.MERCHANT;
+  return FULFILLMENT_CATEGORY.UNAVAILABLE;
+}
+
 /**
  * Validate ONE grain row of the dimensional OLI fragment and return the canonical shape. Throws OliOrderRuleError
  * on a rule violation (the caller refuses the whole account/window and preserves the last-known-good).
@@ -86,7 +109,8 @@ export function classifyOliDimensionalRow(row) {
     valuePresent,
     value, // null when absent -- NOT coerced to 0
     contributesToRollup,
-    fulfillmentChannel: S(row.fulfillment_channel).trim(), // blank allowed
+    fulfillmentChannel: S(row.fulfillment_channel).trim(),                    // RAW, preserved for audit (blank allowed)
+    fulfillmentCategory: normalizeFulfillmentChannel(row.fulfillment_channel), // ONE canonical presentation bucket
     addressState: S(row.address_state).trim(),             // blank allowed (unavailable)
     addressCity: S(row.address_city).trim(),               // blank allowed (unavailable)
   };
@@ -100,6 +124,27 @@ export function classifyOliDimensionalRow(row) {
  * `dimRows` carry { accountId, saleDate, sku, childAsin, currency, isCancelled, value, units, sellerOrVendorId,
  * sourceRequestHash }.
  */
+/**
+ * Aggregate dimensional contribution rows by CANONICAL fulfillment category. Each raw row carries a
+ * `fulfillment_channel` (raw), `total_sales_sum`, `total_units_sum`. Synonyms (Amazon/AFN, Merchant/MFN) collapse
+ * onto one category each, so the returned map has AT MOST three keys ("Amazon/FBA", "Merchant/FBM",
+ * "Unavailable") -- never four split by spelling. Returns { [category]: { sales, units } }. This is the parity
+ * reference: summing per-category totals equals summing the raw rows, and two synonyms land in ONE bucket.
+ */
+export function aggregateFulfillmentContribution(rows) {
+  const out = {};
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const category = normalizeFulfillmentChannel(r && (r.fulfillment_channel ?? r.fulfillmentChannel));
+    const sales = Number((r && (r.total_sales_sum ?? r.salesAmount ?? r.value)) ?? 0) || 0;
+    const units = Number((r && (r.total_units_sum ?? r.units)) ?? 0) || 0;
+    const cur = out[category] || { sales: 0, units: 0 };
+    cur.sales += sales;
+    cur.units += units;
+    out[category] = cur;
+  }
+  return out;
+}
+
 export function nonCancelledDailyRollup(dimRows) {
   const byGrain = new Map();
   for (const r of Array.isArray(dimRows) ? dimRows : []) {

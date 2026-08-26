@@ -38,7 +38,7 @@ import { runBucketSourceSync, SOURCE_SYNC_OWNER_REPORT_KEY, selectCatalogCarrier
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import {
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
-  oliBackfillWindow, snapshotRefreshDecision,
+  oliBackfillWindow, snapshotRefreshDecision, resolveEffectivePublishAsOf,
 } from "./source-durable-model.js";
 import { SOURCE_REGISTRY, sourceRegistryEntry } from "./source-registry.js";
 import {
@@ -786,8 +786,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       rollup.commitUnknown = !!rollup.commitUnknown || !!(cause && cause.commitUnknown);
       return rollup;
     };
-    const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
-    const brandViewWindow = oliBackfillWindow(asOfStr);
+    // The date the scheduler ATTEMPTED to reach (requested asOf). The durable evidence load below spans the full
+    // window ending here; the effective PUBLISH date is resolved from the coverage evidence AFTER the load and may
+    // clamp back to the latest date every account can prove (a recent unsettled tail is never fabricated forward).
+    const refreshAsOf = asOfStr;
+    let dailyWindow = { from: monthBackStr(refreshAsOf, 5), to: refreshAsOf };
+    let brandViewWindow = oliBackfillWindow(refreshAsOf);
     let evidence;
     let historyRows = null;
     const adMetricsByAccountId = {};
@@ -835,6 +839,24 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         return rollup;
       }
     }
+    // REQUESTED vs EFFECTIVE as-of. The evidence is now loaded, so resolve the latest date EVERY account in the
+    // publication scope can prove with gapless durable OLI coverage. A recent unsettled/NULL-price tail on some
+    // accounts clamps the publish date back to the latest COMMON proven completed date (never zero-padded, never
+    // pushed past refreshAsOf); an interior historical hole leaves the effective date null so the derive fails
+    // closed (windowsProve rejects the blocked account below). The cycle DATE stays clock-today; only the
+    // derive/save WINDOWS clamp, so Daily + Brand View publish the same honest coversAsOf.
+    const effResolution = resolveEffectivePublishAsOf({
+      coverageByAccountId: evidence.oliCoverageByAccountId,
+      accountIds: accounts.map((a) => a.accountId),
+      from: brandViewWindow.from, refreshAsOf,
+    });
+    const effectivePublishAsOf = effResolution.effectiveAsOf || refreshAsOf;
+    rollup.derived.refreshAsOf = refreshAsOf;
+    rollup.derived.effectivePublishAsOf = effectivePublishAsOf;
+    rollup.derived.asOfClamped = effectivePublishAsOf !== refreshAsOf;
+    rollup.derived.asOfBlockers = effResolution.blockers;
+    dailyWindow = { from: monthBackStr(effectivePublishAsOf, 5), to: effectivePublishAsOf };
+    brandViewWindow = { from: brandViewWindow.from, to: effectivePublishAsOf };
     let derived;
     try {
       await ensureTime("derivation");
@@ -1208,8 +1230,27 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     } else {
       rollup.derived.skipped = null;
     }
-    rollup.derived.daily = { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped };
-    rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped };
+    // Sanitized blocker evidence: WHY a half is not ready, as [{sourceKey, reason, affected-account count}] --
+    // never raw account/seller ids. asOf-clamp blockers (interior/leading historical gaps) fold in as
+    // order-line-items reasons so a fail-closed publish date is visible in the release result.
+    const sanitizeBlockers = (blockedBy) => {
+      const byKey = new Map();
+      for (const b of blockedBy || []) {
+        const key = String(b.sourceKey) + "|" + String(b.reason);
+        const cur = byKey.get(key) || { sourceKey: b.sourceKey, reason: b.reason, blocksSales: !!b.blocksSales, accounts: 0 };
+        if (b.accountId) cur.accounts += 1;
+        byKey.set(key, cur);
+      }
+      for (const b of effResolution.blockers || []) {
+        const key = "order-line-items|asof-" + String(b.reason);
+        const cur = byKey.get(key) || { sourceKey: "order-line-items", reason: "asof-" + String(b.reason), blocksSales: true, accounts: 0 };
+        if (b.accountId) cur.accounts += 1;
+        byKey.set(key, cur);
+      }
+      return [...byKey.values()];
+    };
+    rollup.derived.daily = { ready: derived.daily.readiness.ready, adsReady: derived.daily.readiness.adsReady, saved: dailySaved, skipped: derived.daily.skipped, blockedBy: sanitizeBlockers(derived.daily.readiness.blockedBy), effectivePublishAsOf, refreshAsOf };
+    rollup.derived.brandView = { ready: derived.brandView.readiness.ready, adsReady: derived.brandView.readiness.adsReady, saved: brandViewSaved, skipped: derived.brandView.skipped, blockedBy: sanitizeBlockers(derived.brandView.readiness.blockedBy), effectivePublishAsOf, refreshAsOf };
     rollup.derived.brandInventory = brandInventory;
 
     // Round-6 fix 1: the source-first runtime NEVER finalizes the SHARED (bucket, cycle_date) cycle -- not
@@ -1443,10 +1484,18 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const ids = bound.map((a) => String(a.accountId));
     const { orgFingerprint } = resolvePrimary();
     const todayStr = new Date(clock()).toISOString().slice(0, 10);
-    const asOfStr = asOf || addDaysStr(todayStr, -1);
+    const refreshAsOf = asOf || addDaysStr(todayStr, -1);
     const evidence = await gatherEvidence({ orgFingerprint, accounts: ids.map((accountId) => ({ accountId })), today: todayStr });
-    const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
-    const brandViewWindow = oliBackfillWindow(asOfStr);
+    // SAME requested-vs-effective as-of resolution the derive uses: clamp a recent unsettled tail back to the
+    // latest common proven completed date; an interior/leading historical gap leaves the effective date null so
+    // readiness fails closed at refreshAsOf. Manual + scheduled readiness therefore agree exactly.
+    const backfillFrom = oliBackfillWindow(refreshAsOf).from;
+    const effResolution = resolveEffectivePublishAsOf({
+      coverageByAccountId: evidence.oliCoverageByAccountId, accountIds: ids, from: backfillFrom, refreshAsOf,
+    });
+    const effectivePublishAsOf = effResolution.effectiveAsOf || refreshAsOf;
+    const dailyWindow = { from: monthBackStr(effectivePublishAsOf, 5), to: effectivePublishAsOf };
+    const brandViewWindow = { from: backfillFrom, to: effectivePublishAsOf };
     const daily = dailyReportingReadiness({
       accounts: ids, oliCoverageByAccountId: evidence.oliCoverageByAccountId,
       catalogSnapshot: evidence.catalogSnapshot, asinAds: evidence.asinAds,
@@ -1458,14 +1507,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       fbaSnapshotsByAccount: evidence.fbaSnapshotsByAccount,
       from: brandViewWindow.from, to: brandViewWindow.to,
     });
-    // Merge the typed read-failure blockers so a failed read can never present as healthy evidence.
+    // Merge the typed read-failure blockers AND the asOf-clamp blockers so neither a failed read nor an interior
+    // historical hole can ever present as healthy evidence.
+    const asOfBlocked = (effResolution.blockers || []).map((b) => ({ sourceKey: "order-line-items", reason: "asof-" + String(b.reason), accountId: b.accountId ?? undefined, blocksSales: true }));
     const merge = (r, keys) => {
       const readBlocked = evidence.readBlockers.filter((b) => keys.includes(b.sourceKey));
-      const blockedBy = [...readBlocked, ...r.blockedBy];
-      return { ...r, blockedBy, ready: r.ready && !readBlocked.some((b) => b.blocksSales) };
+      const blockedBy = [...readBlocked, ...asOfBlocked, ...r.blockedBy];
+      return { ...r, blockedBy, ready: r.ready && !readBlocked.some((b) => b.blocksSales) && asOfBlocked.length === 0 };
     };
     return {
-      asOf: asOfStr,
+      asOf: effectivePublishAsOf, refreshAsOf, effectivePublishAsOf, asOfClamped: effectivePublishAsOf !== refreshAsOf,
       daily: merge(daily, ["order-line-items", "product-catalog", "ads-asin-date"]),
       brandView: merge(brandView, ["order-line-items", "product-catalog", "ads-asin-date", "fba-inventory-health"]),
     };

@@ -5,6 +5,7 @@
 
 import { createHash } from "node:crypto";
 import { sourceJobOwnerId } from "./source-identity.js";
+import { normalizeFulfillmentChannel } from "./sync/oli-order-rules.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -1480,6 +1481,12 @@ export async function getSourceOliDimensionalContribution({ organizationFingerpr
     }
     const rows = await request(`/rest/v1/source_oli_dimensional_history?${query}`, { signal });
     const list = Array.isArray(rows) ? rows : [];
+    // Additive canonical fulfillment category (raw fulfillment_channel preserved): folds Amazon/AFN and
+    // Merchant/MFN synonyms into ONE bucket each so a contribution aggregation grouping on fulfillment_category can
+    // never split a total into four separate categories. Only attached when fulfillment_channel was selected.
+    if (dims.includes("fulfillment_channel")) {
+      for (const r of list) r.fulfillment_category = normalizeFulfillmentChannel(r.fulfillment_channel);
+    }
     raw.push(...list);
     if (raw.length > maxRows) {
       const err = new Error("OLI_DIM_ROW_LIMIT_EXCEEDED: durable OLI dimensional read exceeded its row cap; refusing a truncated series (fail closed).");

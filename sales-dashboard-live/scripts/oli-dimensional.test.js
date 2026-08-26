@@ -7,6 +7,7 @@ import { writeSync } from "node:fs";
 import {
   normalizeOrderStatus, isCancelledStatus, orderValuePresent, classifyOliDimensionalRow,
   nonCancelledDailyRollup, OliOrderRuleError,
+  normalizeFulfillmentChannel, aggregateFulfillmentContribution, FULFILLMENT_CATEGORY,
 } from "../lib/server/sync/oli-order-rules.js";
 import { oliDimensionalRowsFromFragment } from "../lib/server/sync/source-durable-model.js";
 import { OLI_SALES_COLUMNS } from "../lib/server/sync/report-source-contracts.js";
@@ -186,6 +187,71 @@ test("G2. one account's invalid evidence blocks ONLY that account; the other sti
   assert.equal(blocked[0].accountId, "ACC-1");
   assert.ok(!byAccount.has("ACC-1"), "bad account not written (LKG preserved)");
   assert.equal(byAccount.get("ACC-2").length, 1, "good account still persists");
+});
+
+/* ===== H. fulfillment channel synonym normalization (blocker 4) ===== */
+
+test("H1. Amazon and AFN both normalize to ONE canonical Amazon/FBA category", () => {
+  assert.equal(normalizeFulfillmentChannel("Amazon"), FULFILLMENT_CATEGORY.AMAZON);
+  assert.equal(normalizeFulfillmentChannel("AFN"), FULFILLMENT_CATEGORY.AMAZON);
+  assert.equal(normalizeFulfillmentChannel("  amazon  "), FULFILLMENT_CATEGORY.AMAZON);
+  assert.equal(normalizeFulfillmentChannel("afn"), FULFILLMENT_CATEGORY.AMAZON);
+});
+
+test("H2. Merchant and MFN both normalize to ONE canonical Merchant/FBM category", () => {
+  assert.equal(normalizeFulfillmentChannel("Merchant"), FULFILLMENT_CATEGORY.MERCHANT);
+  assert.equal(normalizeFulfillmentChannel("MFN"), FULFILLMENT_CATEGORY.MERCHANT);
+  assert.equal(normalizeFulfillmentChannel("seller"), FULFILLMENT_CATEGORY.MERCHANT);
+});
+
+test("H3. blank / unknown fulfillment maps to Unavailable (never invented, never a 4th category)", () => {
+  assert.equal(normalizeFulfillmentChannel(""), FULFILLMENT_CATEGORY.UNAVAILABLE);
+  assert.equal(normalizeFulfillmentChannel(null), FULFILLMENT_CATEGORY.UNAVAILABLE);
+  assert.equal(normalizeFulfillmentChannel("   "), FULFILLMENT_CATEGORY.UNAVAILABLE);
+  assert.equal(normalizeFulfillmentChannel("something-else"), FULFILLMENT_CATEGORY.UNAVAILABLE);
+});
+
+test("H4. classifyOliDimensionalRow preserves the RAW channel AND exposes the canonical category", () => {
+  const c = classifyOliDimensionalRow(frag({ fulfillment_channel: "AFN" }));
+  assert.equal(c.fulfillmentChannel, "AFN", "raw preserved for audit");
+  assert.equal(c.fulfillmentCategory, FULFILLMENT_CATEGORY.AMAZON, "canonical category attached");
+});
+
+test("H5. PARITY: Amazon+AFN+Merchant+MFN aggregate into AT MOST 3 buckets and totals never split by spelling", () => {
+  const rows = [
+    { fulfillment_channel: "Amazon", total_sales_sum: 100, total_units_sum: 1 },
+    { fulfillment_channel: "AFN", total_sales_sum: 40, total_units_sum: 2 },
+    { fulfillment_channel: "Merchant", total_sales_sum: 30, total_units_sum: 3 },
+    { fulfillment_channel: "MFN", total_sales_sum: 10, total_units_sum: 1 },
+    { fulfillment_channel: "", total_sales_sum: 5, total_units_sum: 1 },
+  ];
+  const agg = aggregateFulfillmentContribution(rows);
+  assert.deepEqual(Object.keys(agg).sort(), [FULFILLMENT_CATEGORY.AMAZON, FULFILLMENT_CATEGORY.MERCHANT, FULFILLMENT_CATEGORY.UNAVAILABLE].sort());
+  assert.equal(agg[FULFILLMENT_CATEGORY.AMAZON].sales, 140, "Amazon + AFN summed into ONE bucket (not split)");
+  assert.equal(agg[FULFILLMENT_CATEGORY.AMAZON].units, 3);
+  assert.equal(agg[FULFILLMENT_CATEGORY.MERCHANT].sales, 40, "Merchant + MFN summed into ONE bucket (not split)");
+  assert.equal(agg[FULFILLMENT_CATEGORY.UNAVAILABLE].sales, 5);
+  // conservation: per-category total equals the raw grand total (nothing dropped, nothing double-counted)
+  const grand = rows.reduce((s, r) => s + r.total_sales_sum, 0);
+  const summed = Object.values(agg).reduce((s, v) => s + v.sales, 0);
+  assert.equal(summed, grand, "sum of category totals equals the raw grand total");
+});
+
+/* ===== I. Daily <-> Brand parity: identical cancelled + zero-value exclusion ===== */
+
+test("I1. Daily and Brand share ONE non-cancelled rollup -> cancelled + zero-value excluded IDENTICALLY", () => {
+  // The rollup source_oli_daily_history feeds BOTH Daily (slicedOliSourceFromHistory) and Brand
+  // (orderRowsFromHistory). Proving the rollup excludes cancelled + present-zero once proves both agree.
+  const { rollupByAccount } = build([
+    frag({ amazon_order_status: "Shipped", total_sales_sum: 100, total_units_sum: 2, sku: "PAID" }),
+    frag({ amazon_order_status: "Cancelled", total_sales_sum: 999, total_units_sum: 9, sku: "CANC" }),
+    frag({ amazon_order_status: "Shipped", total_sales_sum: 0, total_units_sum: 4, sku: "FREE" }),
+  ]);
+  const roll = rollupByAccount.get("ACC-1");
+  const totalSales = roll.reduce((s, r) => s + r.salesAmount, 0);
+  const totalUnits = roll.reduce((s, r) => s + r.units, 0);
+  assert.equal(totalSales, 100, "only the paid shipped row contributes (cancelled + zero-value excluded)");
+  assert.equal(totalUnits, 2, "cancelled units AND zero-value units both excluded from the shared rollup");
 });
 
 let failures = 0;

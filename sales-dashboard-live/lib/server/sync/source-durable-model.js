@@ -169,6 +169,54 @@ export function missingCoverageWindows(coverageWindows, from, to) {
 }
 
 /**
+ * Resolve the EFFECTIVE publish as-of date across a publication scope, separating the date the scheduler tried
+ * to reach (`refreshAsOf`) from the latest date every account can actually PROVE with gapless durable OLI
+ * coverage. For each account over [from, refreshAsOf]:
+ *   - no gaps                          -> that account proves through refreshAsOf (coveredTo = refreshAsOf);
+ *   - a SINGLE TRAILING unsettled gap  -> [G..refreshAsOf] with nothing proven after it: the account proves
+ *     through the day before G (coveredTo = G-1); the recent unsettled tail is clamped, NOT fabricated;
+ *   - a LEADING gap (`from` itself uncovered) or an INTERIOR gap (coverage RESUMES after a hole) -> fail closed:
+ *     the account is a typed blocker and the whole scope's effective as-of is null (never clamp AROUND an
+ *     interior historical hole and silently drop the proven data after it).
+ * effectivePublishAsOf = min(coveredTo) across accounts and never exceeds refreshAsOf. When any account is
+ * blocked (interior/leading gap, malformed coverage, or an empty scope) effectiveAsOf is null and `blockers`
+ * enumerates the sanitized reasons; the caller then fails closed (a null effective date leaves the readiness
+ * window pinned at refreshAsOf, so windowsProve rejects the blocked account with coverage-incomplete).
+ * Returns { effectiveAsOf, perAccount: {accountId: coveredTo|null}, blockers: [{accountId, reason}] }.
+ */
+export function resolveEffectivePublishAsOf({ coverageByAccountId = {}, accountIds = [], from, refreshAsOf } = {}) {
+  if (!isDateStr(from) || !isDateStr(refreshAsOf)) {
+    throw new Error("resolveEffectivePublishAsOf requires from + refreshAsOf as YYYY-MM-DD dates (fail closed).");
+  }
+  // asOf BEFORE the fixed backfill start (from > refreshAsOf) is the SAME degenerate empty window the OLI planner
+  // already honours (a not-yet-reached start), NOT a config error: there is nothing to clamp, so the effective
+  // date is simply refreshAsOf and the downstream empty-window readiness (backfill-start-not-reached) takes over.
+  if (from > refreshAsOf) return { effectiveAsOf: refreshAsOf, perAccount: {}, blockers: [] };
+  const ids = [...new Set((accountIds || []).map((a) => String(a)).filter((s) => s && !s.includes(":")))].sort();
+  const perAccount = {};
+  const blockers = [];
+  if (!ids.length) return { effectiveAsOf: null, perAccount, blockers: [{ accountId: null, reason: "no-accounts" }] };
+  let eff = refreshAsOf;
+  for (const id of ids) {
+    let gaps;
+    try { gaps = missingCoverageWindows(coverageByAccountId[id] || [], from, refreshAsOf); }
+    catch (_e) { perAccount[id] = null; blockers.push({ accountId: id, reason: "coverage-malformed" }); continue; }
+    if (!gaps.length) { perAccount[id] = refreshAsOf; continue; }
+    const first = gaps[0];
+    if (first.from === from) { perAccount[id] = null; blockers.push({ accountId: id, reason: "leading-gap" }); continue; }
+    // The account proves the contiguous prefix [from .. first.from-1]. It is a pure TRAILING tail only when the
+    // one-and-only gap runs to refreshAsOf; anything else means proven data resumes after a hole (interior gap).
+    const trailingOnly = gaps.length === 1 && first.to === refreshAsOf;
+    if (!trailingOnly) { perAccount[id] = null; blockers.push({ accountId: id, reason: "interior-gap" }); continue; }
+    const coveredTo = addDaysStr(first.from, -1);
+    perAccount[id] = coveredTo;
+    if (coveredTo < eff) eff = coveredTo;
+  }
+  if (blockers.length) return { effectiveAsOf: null, perAccount, blockers };
+  return { effectiveAsOf: eff, perAccount, blockers: [] };
+}
+
+/**
  * Plan the COMPLETE-WINDOW export units for one stable <=5-account batch: DataDoe caps sellerOrVendorIds at 5,
  * so a batch is <=5 accounts, and the AUTHORIZED durable OLI backfill fetches the complete missing window per
  * batch -- NO seven-day canonical pre-slicing. Members with the SAME missing-window signature share the exports

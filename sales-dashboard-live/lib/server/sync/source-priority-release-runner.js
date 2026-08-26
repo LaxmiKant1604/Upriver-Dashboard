@@ -109,8 +109,10 @@ export async function runPriorityDashboardsRelease(deps = {}) {
       const ds = Number(daily.saved || 0), bs = Number(bv.saved || 0), is = Number(inv.saved || 0);
       const lineageCount = Array.isArray(d.lineage) ? d.lineage.length : 0;
       const problems = [];
-      if (daily.ready !== true) problems.push("daily-reporting not ready (ready=" + S(daily.ready) + ")");
-      if (bv.ready !== true) problems.push("brand-sales not ready (ready=" + S(bv.ready) + ")");
+      const blockerText = (arr) => (Array.isArray(arr) && arr.length ? " blockedBy=[" + arr.map((b) => S(b.sourceKey) + ":" + S(b.reason) + (b.accounts ? "x" + b.accounts : "")).join(", ") + "]" : "");
+      const asOfText = " (refreshAsOf=" + S(d.refreshAsOf) + ", effectivePublishAsOf=" + S(d.effectivePublishAsOf) + (d.asOfClamped ? ", clamped" : "") + ")";
+      if (daily.ready !== true) problems.push("daily-reporting not ready (ready=" + S(daily.ready) + ")" + blockerText(daily.blockedBy) + asOfText);
+      if (bv.ready !== true) problems.push("brand-sales not ready (ready=" + S(bv.ready) + ")" + blockerText(bv.blockedBy) + asOfText);
       if (ds <= 0 || bs <= 0 || is <= 0) problems.push("saved report jobs = 0 (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ")");
       else if (ds !== bs || bs !== is) problems.push("inconsistent per-account counts (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ") -- a missing or duplicate report job");
       if (lineageCount !== ds + bs + is) problems.push("lineage " + lineageCount + " != saved " + (ds + bs + is));

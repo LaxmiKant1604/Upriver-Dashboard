@@ -47,6 +47,7 @@ const SUITES = [
   "test:source-fixpoint",
   "test:source-durable-model",
   "test:oli-dimensional",
+  "test:effective-asof",
   "test:source-bucket-sync",
   "test:source-status",
   "test:source-schedule",
