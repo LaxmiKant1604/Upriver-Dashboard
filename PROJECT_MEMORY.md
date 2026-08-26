@@ -12300,3 +12300,26 @@ deliberately NOT requested). All OLI consumers moved to the same 9-column contra
 - DataDoe schema proof: GET /exports/sources?sellerOrVendorIds=<seller> returns each source's full
   `columns` array (name/type/nullable/description) -- the read-only schema endpoint (fetchCompatibleSourceNames
   only reads .name). OLI source 89b27535d2, table amazon_order_items_with_cogs, 42 columns.
+
+OLI DIMENSIONAL -- COMPLETION (2026-08-26, code b71ab4a..dfa887e, migration 20260826 APPLIED):
+- Historical replacement DONE for BOTH buckets via scripts/release/oli-dimensional-replacement.mjs (direct,
+  cycle-independent, 60-day-bounded exports, direct-pg persist to bypass PostgREST's ~5MB body limit,
+  resumable dimensional-table skip). Non-us 22 accts, US 8 accts. ~200 tokens.
+- source_oli_dimensional_history: 459,198 rows, 30 accounts, 2025-01-01..2026-08-25; 28,817 cancelled rows +
+  1,561 real zero-value non-cancelled rows kept for audit, EXCLUDED from the rollup. Geography: state present
+  405,925 / blank 53,273; city present 458,374 / blank 824. Fulfillment: Amazon 417,016 / Merchant 13,274.
+- REVISED RULE (user decision): a real 0 non-cancelled unit is treated LIKE cancelled (kept, contributes zero,
+  never blocks); only a MISSING/null value refuses the window. Migration RPC re-applied.
+- Only ~19 recent account-windows (2026-06-25 / 2026-08-24) refused -- genuinely NULL/unsettled recent prices
+  (the rolling refresh corrects them as prices settle). LKG preserved for those.
+- RECONCILIATION PROVEN EXACT: source_oli_daily_history rollup == the dimensional non-cancelled positive-value
+  sum (Indya window: 11,090,252 sales / 21,771 units).
+- Daily re-derived + republished (backfill-daily-v2): salesProvenanceOf added to the guard so a cancelled
+  correction republishes; 18 accounts republished; Indya Daily now == corrected rollup (cancelled excluded).
+- The US 10:30 UTC cron fired under the NEW dimensional contract (live going-forward validation: OLI persisted
+  dimensionally via the 7-day rolling window through PostgREST -- small payload, works) but STALLED after
+  OLI+catalog (published nothing; external GitHub Action issue). Controls safe-closed (0/0/0/0). Vercel 200.
+- KNOWN FOLLOW-UPS: (1) Brand Sales/Brand View still use the SEPARATE ORDER_SALES OLI projection (seller_name +
+  marketplace_country_code) which was NOT made cancellation-aware -- Brand View still counts cancelled until
+  that projection gets the same treatment. (2) The historical replacement re-fetched more windows than ideal
+  (batch-level skip granularity). (3) The US cron's stall (no publish) is external.
