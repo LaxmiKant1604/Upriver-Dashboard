@@ -12323,3 +12323,34 @@ OLI DIMENSIONAL -- COMPLETION (2026-08-26, code b71ab4a..dfa887e, migration 2026
   marketplace_country_code) which was NOT made cancellation-aware -- Brand View still counts cancelled until
   that projection gets the same treatment. (2) The historical replacement re-fetched more windows than ideal
   (batch-level skip granularity). (3) The US cron's stall (no publish) is external.
+
+SCHEDULER READINESS FIX -- effectivePublishAsOf clamp + fulfillment normalization (2026-08-26, code 9670a86, UNPUSHED->push pending):
+- ROOT CAUSE of the US ready=false / "saved report jobs=0" stall (was mislabeled "external GitHub issue"):
+  gatherDurableReadiness required EVERY account to prove OLI coverage through the FIXED refreshAsOf (today-1),
+  and windowsProve treated a recent unsettled trailing tail identically to an interior hole. PROVEN from prod:
+  live DataDoe discovery = 30 primary (8 US + 22 non-us), account_directory (22) is a STALE cache; source_coverage
+  distribution = 24 accounts @ covered_to 2026-08-25, 6 @ 2026-08-24. The 6 at 08-24 are US (their 08-25 is the
+  NULL/unsettled tail; single merged window 2025-01-01..08-24, a clean TRAILING gap, no interior hole). So the US
+  derive at refreshAsOf=08-25 failed readiness -> 0 jobs. Non-us all reach 08-25 (incl dormant b60cf168, coverage
+  to 08-25 with zero recent sales). effectivePublishAsOf: US=2026-08-24, non-us=2026-08-25.
+- FIX (blockers 1+3): resolveEffectivePublishAsOf(source-durable-model.js) separates refreshAsOf (attempted) from
+  effectivePublishAsOf (latest date EVERY account proves gaplessly). A single TRAILING unsettled gap clamps to the
+  latest common proven completed date (never zero-padded, never > refreshAsOf); an INTERIOR/LEADING historical
+  hole fails closed (effective=null -> readiness rejects at refreshAsOf). Threaded into run() (clamps derive/save
+  windows; cycle date stays clock-today) AND gatherDurableReadiness (manual+scheduled agree). rollup.derived.
+  {daily,brandView} now carry sanitized blockedBy [{sourceKey,reason,affected-account count}] + refreshAsOf +
+  effectivePublishAsOf; the release runner logs them on a not-ready derive.
+- Blocker 2 (Brand Sales): VERIFIED the scheduler already derives brand-sales from the NON-cancelled rollup
+  source_oli_daily_history (getSourceOliHistoryRows -> orderRowsFromHistory, seller_name+marketplace from the
+  primary directory), the SAME rollup Daily reads -> cancelled + zero-value excluded IDENTICALLY, Daily<->Brand
+  parity structural. Locked with a parity test. NOT bumping the live brand-sales-shared-v1 version: it is
+  transcribed from the executable live route, so a version bump WITHOUT a coordinated api/datadoe.js change would
+  desync publisher(v2)/reader(v1) and strand production Brand View (untestable here). The republish (same version,
+  CAS overwrite) already corrects the data. FOLLOW-UP unchanged: the LIVE on-demand action=brand-sales refresh
+  (buildBrandSalesPayload, ORDER_SALES projection, no status column) still counts cancelled -- manual admin path
+  only, overwritten by the next scheduled publish.
+- Blocker 4 (fulfillment): normalizeFulfillmentChannel + aggregateFulfillmentContribution (oli-order-rules.js):
+  Amazon/AFN->Amazon/FBA, Merchant/MFN->Merchant/FBM, blank/unknown->Unavailable. Raw preserved for audit; the
+  canonical category attached additively by getSourceOliDimensionalContribution. Parity tests: synonyms can never
+  split a contribution into four categories.
+- Tests: effective-asof.test.js (10) + fulfillment/parity in oli-dimensional.test.js (+66). verify 70/70 green.
