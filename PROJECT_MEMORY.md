@@ -12471,3 +12471,41 @@ OLI EXPLICIT-ZERO DATA-QUALITY INDICATOR (2026-08-27, code d2b39f0, push pending
   date 2026-08-25. Tests: oli-quality.test.js (11). verify 74/74 + build.
 - PENDING: push + Vercel 200; production read-back (business unchanged, explicit-zero matches dimensional, no
   unpriced, controls safe-closed).
+
+AMAZON ORDER ID CAPTURE -- FUTURE-ONLY ORDER-LEVEL AUDIT (2026-08-27, code 3b8f749 + hashfix 852ec68, docs this):
+- OBJECTIVE (DONE, deployed): capture amazon_order_id on every FUTURE OLI sync (scheduler + manual "Sync source"),
+  AUDIT-ONLY, business grain byte-identical, NO historical re-export / NO backfill, DataDoe exports/tokens = 0.
+- Migration 20260827: source_oli_order_audit (order-level natural identity incl. canonical amazon_order_id +
+  order_id_available; deterministic md5 surrogate PK so a blank ID stays its OWN grain, never merges distinct rows)
+  + DROP/CREATE replace_oli_dimensional_window gaining p_order_rows (8th param, default '[]'; 7-arg positional
+  callers bind 1-7 + default). Order IDs written in the SAME atomic txn as dimensional/rollup/coverage (commit-
+  unknown can't report success). Service-role-only: SELECT grant, NO policy, NO anon/authenticated, PG17 MAINTAIN
+  cleared via REVOKE ALL; 3 indexes (account/date, account/order partial, org/date) + touch trigger.
+- Migration 20260828 HASHFIX (essential): the 20260827 order-audit md5(concat_ws(...)) grouped sale_date as TEXT
+  while the SELECT GROUP BY used (o->>'sale_date')::date -> SQLSTATE 42803 at RUNTIME on the first non-empty
+  p_order_rows. PL/pgSQL defers name resolution so CREATE + the structural audit passed; a ROLLED-BACK end-to-end
+  RPC check caught it BEFORE any sync ran (audit table empty -> zero corruption). CREATE OR REPLACE of the md5 date
+  arg only; behaviour otherwise byte-identical. LESSON: always rolled-back end-to-end test a new SECURITY DEFINER
+  RPC body -- the schema-contract proof does not catch GROUP BY / name-resolution runtime errors.
+- OLI fragment (report-source-contracts OLI_SALES_COLUMNS + api/datadoe DAILY_BRAND_SALES/OLI_SALES + buy-box/ppc/
+  returns builders) now carries amazon_order_id so live == scheduler request identity (ONE shared export, token cost
+  unchanged); every derivation re-aggregates by its own grain, folding Order ID away -> Sales/Units/ROI/Ads/Brand
+  View/buy-box/ppc/returns UNCHANGED. canonicalOliSlices are FIXED <=7-day calendar bins, so order grain stays far
+  under the 5,000-row OLI ceiling (measured 7d peak 672 @ 9-col). oli-order-rules: canonicalizeOrderId (trim only),
+  redactOrderId (prefix-only for logs), orderIdDisplayState (captured/unavailable/not-captured); classify returns
+  orderId + orderIdAvailable (never fabricated). Fragment folds Order ID out of the dimensional grain + emits a
+  separate order-audit grain; wrapper POSTs p_order_rows on the SAME RPC; single persist path = scheduler + manual.
+- UI: explicit-zero breakdown adds an Order ID column -- captured ID (copyable, account/date/brand scoped) /
+  "Order ID unavailable from source" (source had none) / "Not captured -- before Order ID tracking" (historical).
+  summarizeExplicitZeroOli attaches per-grain orderIds from getExplicitZeroOliOrderAudit (account-scoped, Supabase-
+  only, ZERO DataDoe). Full IDs redacted in logs (never in the UI, which is owner-scoped).
+- PROD APPLY + VERIFY (2026-08-27): 20260827+20260828 applied via db:migrate; source_oli_dimensional_history 459198
+  UNCHANGED, source_oli_daily_history 139583 UNCHANGED, source_oli_order_audit 0 (no backfill), RPC 1 overload 8-arg.
+  Rolled-back live-RPC sanity: captured + whitespace-variant merge (units summed), blank stays unavailable own grain,
+  dimensional folds to 1, rollup excludes present-zero. Pushed origin/main (94bd743..852ec68); Vercel prod root 200.
+- Tests: oli-order-audit.test.js (22 -- the 20 mandatory + merge + structural), schema-contract-mutation m11 (13) +
+  m12 (3), refreshed OLI golden request-hashes (timeout-slicing + oli-source-correction + oli-dimensional). verify
+  75/75 + build (1152 kB, not tree-shaken).
+- EFFECTIVE TRACKING START: migration applied + code 852ec68 deployed 2026-08-27. FIRST CAPTURE = the next scheduled
+  OLI sync (Non-US 02:00 UTC / US 10:30 UTC via GitHub Actions), or a manual "Sync source". PENDING read-back after
+  the first post-deploy sync: new order-audit rows carry Order IDs, old dimensional rows unchanged, tokens still 0.
