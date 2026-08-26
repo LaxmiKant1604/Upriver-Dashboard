@@ -12386,3 +12386,27 @@ RELEASE + PUBLISH OUTCOME (2026-08-26, this continuation):
   all_primary=false) then ALWAYS safe-closed (rollback COMMITTED).
 - Live state now: daily 30/30 fresh+correct (US 08-24, non-us 08-25); brand-sales 30/30 corrected; brand-inventory
   30/30 present; membership rebuilt OK. Vercel 200.
+
+RAW BRAND-SALES REGRESSION CLOSED + MEMBERSHIP SCOPE RECONCILED (2026-08-26, code 219cc7b, push pending):
+- BLOCKER 1: two paths could publish cancelled-inclusive brand-sales from the RAW ORDER_SALES projection
+  (buildBrandSalesPayload -- folds item_price_value with no cancelled exclusion + creates a legacy OLI export):
+  the admin api/datadoe action=brand-sales refresh, and the Scheduler-v1 registry adapter (adapters/index.js).
+  BOTH rerouted to the SINGLE sanctioned deriveBrandSalesFromDurable (source_oli_daily_history via
+  orderRowsFromHistory; cancelled+zero excluded), ZERO export. New brand-sales-live.js
+  (deriveCorrectedBrandSalesForAccount + refreshCorrectedBrandSalesForAccount: name/country from the
+  current-primary directory, never invented; CAS-guarded backfill saver never overwrites a newer corrected LKG).
+  The action=brand-sales route releases the legacy lock WITHOUT a raw save and serves corrected/LKG. No publisher
+  references buildBrandSalesPayload now (inert export, legacy tests only). Fixed brandSalesProvenanceOf to
+  fingerprint OUTPUT total_sales/total_units_sold (was total_sales_sum -> row-count-only).
+- BLOCKER 2: rebuilt membership was 37 = 30 current primary + 1 stale/retired + 6 dd-secondary historical
+  brand-sales snapshots. Added scopePrimaryMembership/primaryAccountIdsOnly/isPrimaryAccountId
+  (brand-membership.js); membership built ONLY from canonical primary UUIDs intersected with the current-primary
+  directory set -> excludes stale/retired + dd-secondary + malformed. Applied at rebuild (rebuild-brand-membership
+  .mjs: typed drop counts + fail-closed if scoped>discovery) + defensively in the live directory
+  (sharedSnapshotBrandAccounts + brandSalesFingerprint). PROVEN read-only: 42 brands over EXACTLY 30 accounts
+  (dropped stale=1/secondary=6/malformed=0); Bebi Born -> 8 accounts / 8 EU countries (IT,NL,BE,ES,FR,PL,UK,DE);
+  Shrida Foods 6 (IN4/US2), Caruso Italy 8, Priya 4, owlKraft 5; EVERY brand allCurrentPrimary=true.
+- Tests: brand-membership-scope.test.js (5) + 3 in brand-sales-backfill.test.js; verify 72/72 + build.
+- BLOCKER 3 (observe scheduler): controls safe-closed; 08-26 cycles terminal (succeeded) -> next fresh UTC cycle
+  is 08-27 (02:00 non-us / 10:30 us). Dispatching/observing the actual GitHub Actions run needs gh credentials
+  not available in this environment -- the effectivePublishAsOf fix (9670a86) makes the next US run derive 8x3.
