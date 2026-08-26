@@ -12212,3 +12212,55 @@ DONE exit 0. This is the mission's "manual sync fixed" acceptance: evidence pers
 (daily-reporting, brand-sales, brand-inventory) published from the same evidence, live read-back proven,
 controls safe-closed. Remaining: the 10:30 UTC US scheduled run (cron, from origin AFTER this push) as the
 controlled US proof + its read-backs.
+
+================================================================================
+2026-08-26 -- ROI formula + Brand View freshness/504 + ASIN Ads history consistency (code 549ce9c..fd3d405)
+================================================================================
+
+FOUR faults fixed (ROI, ads-history split, Brand View staleness, Brand View 504):
+
+1. DAILY ROI (549ce9c, presentation-only): the ROI column computed Ad Sales / Ad Spend
+   (mislabeled too) -> showed the wrong number. Fixed to the BUSINESS formula Total Sales /
+   Ad Spend, SUM(Total Sales)/SUM(Ad Spend) (the cell already carries column sums), two dp,
+   em-dash on zero/missing/unavailable spend, ACoS/TACoS unchanged. Extracted to
+   src/lib/daily-metrics.js (pure, tested: scripts/daily-roi-format.test.js). Proven against the
+   live snapshot at the time: Indya IN Aug MTD 4,318,606 / 533,852 = 8.09 (old wrong = 3.60).
+   NOTE: after the Phase-2 ads backfill completed August (below), Indya Ad Spend became
+   635,814 (added the missing Aug 1-3 = 77,903 + Amazon's settled Aug 4-25 = +24,058), so the
+   live right-formula ROI is now 6.79 vs wrong-formula 3.56 -- same correct formula, more
+   complete data. 8.09 was the value when August was still missing its first 3 days.
+
+2. BRAND VIEW FRESHNESS (ec7d9af): the assembled Brand View is cached under a params hash and
+   serveSharedReport only matched the hash, so it stayed at 21 Aug after brand-sales reached 25
+   Aug. Added getLatestSourceProvenance (one cheap indexed read of the newest contributing
+   brand-sales source_refreshed_at) + an additive, default-off contributingProvenanceAt in
+   serveSharedReport: a served snapshot older than it is flagged updating:true. Pure decision
+   proven in lib/server/reports/brand-view-freshness.js. Frontend (BrandView + BrandPortfolio):
+   an updating response keeps the LKG on screen + auto-converges (triggers the bounded
+   zero-export rebuild, polls) with no user action.
+
+3. BRAND VIEW 504 (ec7d9af + e8e8d5d): the portfolio READ ran the entire multi-account rebuild
+   inline under the lock -- empirically ~37s for a 10-account brand vs the 60s function ceiling
+   (the intermittent 504). The read now defers (deferRebuildOnRead: serves LKG + updating, never
+   builds inline); the rebuild runs only on refresh, bounded by a route deadline (52s budget/6s
+   reserve, checked BETWEEN accounts) -> on timeout returns typed updating (200), never a 504.
+   Parallelized the account reads (bounded concurrency 4, order-preserved, memory-safe): 37s ->
+   18s, so rebuilds reliably complete. All serveSharedReport changes are additive + gated (every
+   other report byte-identical). Proven against prod (salesLatestDate 2026-08-25, 5 countries).
+
+4. ASIN ADS HISTORY (549ce9c..fd3d405): "some accounts show July, others only August" reconciled
+   -- 10 accounts covered from ~Jul 16-17, 15 only from Aug 04, none from earlier. Daily reads
+   ASIN-only (asin-performance-v1), so July is NEVER obsolete Campaign data (single-source switch
+   already in place). Root cause: the scheduled runner extends a 21-day rolling window; the ASIN
+   source's initialDays (MAX_REQUIRED_COVERAGE_DAYS=60) is the deepest a single export may reach
+   AND the practical Amazon Ads reporting limit (data older than ~60 days is unavailable). Added a
+   windowOverride to the shared runner (validated; tested) + a one-time operator
+   asin-ads-history-backfill.mjs (DRY default; adoption-first; frozen ceiling; disconnected
+   excluded typed-unavailable; Campaign/FBA never touched). APPLIED: all 25 connected accounts now
+   cover 2026-06-27..2026-08-25 CONSISTENTLY (non-us 17 + US 8; the 5 disconnected excluded).
+   Tokens: ~14 (non-us ~4 creates over two passes after a transient batch failure + a ceiling fix,
+   US 2 creates). Then re-derived Daily zero-export (backfill-daily-v2, provenance-guarded): 25
+   REPUBLISHED(ads-changed), 5 disconnected unchanged, 0 tokens. Verified: Indya/JustHuman/Sashaa
+   now have full July (31 ads-days) + late-June coverage -- consistent across accounts.
+
+verify: all steps green (49 suites). Balance ~3970 -> after backfill.
