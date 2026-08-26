@@ -17,7 +17,20 @@ const verifyBrand = argOf("verify-brand");
 const expectMin = Number(argOf("expect-min") || 0);
 
 const sb = await import("../../lib/server/supabase.js");
-const { buildBrandAccountMembership, accountsForBrand } = await import("../../lib/server/reports/brand-membership.js");
+const { buildBrandAccountMembership, accountsForBrand, scopePrimaryMembership } = await import("../../lib/server/reports/brand-membership.js");
+
+// The AUTHORITATIVE current-primary account-id set: the persisted account directory, restricted to active,
+// primary-connection, canonical-UUID entries. Membership is scoped to this set at rebuild time so a stale/retired,
+// dd-secondary, or malformed account that still has a historical brand-sales snapshot can never appear.
+async function currentPrimaryAccountIdSet() {
+  const dir = await sb.getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
+  const ids = new Set();
+  for (const a of dir?.payload?.accounts || []) {
+    const id = String(a?.id || "").trim();
+    if (id && a?.active !== false && !id.includes(":")) ids.add(id);
+  }
+  return ids;
+}
 
 // Extract brand names from a brand-sales payload the same way the live directory does (catalogBrands UNION each
 // row's product_brand/brand), trimmed.
@@ -50,7 +63,16 @@ try {
   process.exit(1);
 } finally { await client.end(); }
 
-const membership = buildBrandAccountMembership(perAccount);
+// Authoritatively scope to CURRENT PRIMARY accounts BEFORE building membership, and classify what is dropped
+// (counts + typed categories only -- never raw ids).
+const primarySet = await currentPrimaryAccountIdSet();
+const { scoped, dropped } = scopePrimaryMembership(perAccount, primarySet);
+console.log("brand-membership scope: " + perAccount.length + " brand-sales snapshot accounts -> " + scoped.length
+  + " current-primary (of " + primarySet.size + " discovered); dropped stale/retired=" + dropped.staleRetired
+  + " dd-secondary=" + dropped.ddSecondary + " malformed=" + dropped.malformed + ".");
+if (scoped.length > primarySet.size) { console.error("STOP scoped membership (" + scoped.length + ") exceeds current primary discovery (" + primarySet.size + ") -- fail closed."); process.exit(1); }
+
+const membership = buildBrandAccountMembership(scoped);
 const brandCount = membership.size;
 const accountsWithMembership = new Set();
 let pairs = 0;

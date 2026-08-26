@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { REPORT_DERIVATIONS } from "../lib/server/sync/report-derivation.js";
 import { paramsHashFor } from "../lib/server/report-store.js";
-import { backfillBrandSalesV1, brandSalesProvenanceOf, BRAND_SALES_REPORT_KEY, BRAND_SALES_LIVE_VERSION } from "../lib/server/reports/brand-sales-backfill.js";
+import { readFileSync } from "node:fs";
+import { backfillBrandSalesV1, brandSalesProvenanceOf, deriveBrandSalesFromDurable, BRAND_SALES_REPORT_KEY, BRAND_SALES_LIVE_VERSION } from "../lib/server/reports/brand-sales-backfill.js";
 
 let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
@@ -128,6 +129,44 @@ await testAsync("brandSalesProvenanceOf flips when totals change (a cancelled/ze
   assert.notEqual(a, b, "including cancelled shifts the fingerprint -> republish");
   const c = brandSalesProvenanceOf({ rows: [{ total_sales_sum: 100, total_units_sold_sum: 2 }] });
   assert.equal(a, c, "identical totals -> identical fingerprint (idempotent)");
+});
+
+await testAsync("deriveBrandSalesFromDurable derives ONLY from the corrected rollup (cancelled/zero already excluded); ZERO export", async () => {
+  // The rollup rows are the NON-cancelled evidence -> the derived business totals equal the rollup sum, with no
+  // cancelled inflation (a raw ORDER_SALES fold would be higher). No DataDoe adapter is present -> zero export.
+  const id = "acctFull";
+  const historyByAcct = { [id]: [rollupRow(id, "2026-03-05", 100, 2), rollupRow(id, "2026-08-25", 40, 1, "B0B", "SKU-B")] };
+  const windowsByAcct = { [id]: [{ from: FROM, to: "2026-08-25" }] };
+  const derived = await deriveBrandSalesFromDurable({
+    account: { accountId: id, name: "Full Co", country: "US" },
+    from: FROM, to: CEIL, organizationFingerprint: "org",
+    readers: makeReaders({ historyByAcct, windowsByAcct, calls: { oliHistory: 0, oliCov: 0 } }),
+  });
+  assert.equal(derived.notReady, undefined, "ready");
+  assert.equal(derived.to, "2026-08-25");
+  const total = (derived.payload.rows || []).reduce((s, r) => s + Number((r.total_sales != null ? r.total_sales : r.total_sales_sum) || 0), 0);
+  assert.equal(total, 140, "business total equals the non-cancelled rollup sum (100 + 40), never a cancelled-inflated raw total");
+});
+
+await testAsync("deriveBrandSalesFromDurable fails typed (never invents) when name/country or coverage is missing", async () => {
+  const id = "acctFull";
+  const readers = makeReaders({ historyByAcct: { [id]: [rollupRow(id, "2026-08-25", 10)] }, windowsByAcct: { [id]: [{ from: FROM, to: "2026-08-25" }] }, calls: { oliHistory: 0, oliCov: 0 } });
+  const noName = await deriveBrandSalesFromDurable({ account: { accountId: id, name: "", country: "US" }, from: FROM, to: CEIL, organizationFingerprint: "org", readers });
+  assert.ok(noName.notReady, "missing seller name -> notReady (orderRowsFromHistory refuses to invent)");
+  const noCov = await deriveBrandSalesFromDurable({ account: { accountId: id, name: "Full Co", country: "US" }, from: FROM, to: CEIL, organizationFingerprint: "org", readers: makeReaders({ historyByAcct: {}, windowsByAcct: {}, calls: { oliHistory: 0, oliCov: 0 } }) });
+  assert.equal(noCov.notReady, "oli-coverage-incomplete");
+});
+
+await testAsync("STRUCTURAL: no brand-sales PUBLISHER is wired to the raw ORDER_SALES buildBrandSalesPayload", () => {
+  const adapters = readFileSync(new URL("../lib/server/sync/adapters/index.js", import.meta.url), "utf8");
+  assert.ok(!/import\s+\{[^}]*buildBrandSalesPayload/.test(adapters), "the scheduler adapter must NOT import the raw buildBrandSalesPayload");
+  assert.ok(!/buildBrandSalesPayload\s*\(/.test(adapters), "the scheduler adapter must NOT call the raw buildBrandSalesPayload");
+  assert.ok(/deriveCorrectedBrandSalesForAccount/.test(adapters), "the scheduler adapter derives brand-sales from durable evidence");
+  const datadoe = readFileSync(new URL("../api/datadoe.js", import.meta.url), "utf8");
+  // buildBrandSalesPayload may still be DEFINED (an export used only by legacy tests), but NO caller may INVOKE it,
+  // and the action=brand-sales route must publish via the durable refresher.
+  assert.ok(!/await buildBrandSalesPayload\(/.test(datadoe), "no route may call (await) the raw buildBrandSalesPayload");
+  assert.ok(/refreshCorrectedBrandSalesForAccount/.test(datadoe), "the route publishes via the corrected durable refresher");
 });
 
 out("\n" + passed + " assertions passed");

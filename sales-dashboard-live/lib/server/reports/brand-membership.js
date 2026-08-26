@@ -44,6 +44,43 @@ function pickDisplay(existing, candidate) {
   return candidate < existing ? candidate : existing;
 }
 
+// A CANONICAL PRIMARY account id: a plain lower/upper-hex UUID with NO connection prefix. dd-secondary accounts
+// are "connectionId:uuid" (a ':' is present) and are never primary; a non-UUID id is malformed. Used so Brand View
+// membership can never be pinned by a dd-secondary, stale-alias, or malformed account id.
+const ACCOUNT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isPrimaryAccountId(id) {
+  const s = S(id).trim();
+  return !!s && !s.includes(":") && ACCOUNT_UUID_RE.test(s);
+}
+
+// The DEDUPED subset of `accountIds` that is NOT dd-secondary (no ':' prefix). Cheap live-read scope guard: it
+// excludes secondary-connection ids without a directory read. It does NOT require a UUID (so a caller's synthetic
+// ids survive), and it never reorders beyond dedup.
+export function primaryAccountIdsOnly(accountIds = []) {
+  return [...new Set((Array.isArray(accountIds) ? accountIds : []).map((x) => S(x).trim()).filter((id) => id && !id.includes(":")))];
+}
+
+/**
+ * Scope per-account membership evidence to CURRENT PRIMARY accounts and classify what is dropped. An account
+ * contributes membership ONLY when it is a canonical primary id (a plain UUID; a dd-secondary "conn:uuid" id is
+ * excluded) AND -- when `primaryIdSet` (the freshly discovered / persisted current-primary directory set) is
+ * supplied -- is in it, so a stale/retired account (a real UUID no longer discovered) drops too. Returns
+ * { scoped, dropped: { staleRetired, ddSecondary, malformed } } with COUNTS only (never raw ids).
+ */
+export function scopePrimaryMembership(perAccount = [], primaryIdSet = null) {
+  const set = primaryIdSet instanceof Set ? primaryIdSet : null;
+  const scoped = [];
+  const dropped = { staleRetired: 0, ddSecondary: 0, malformed: 0 };
+  for (const a of Array.isArray(perAccount) ? perAccount : []) {
+    const id = S(a && a.accountId).trim();
+    if (id.includes(":")) { dropped.ddSecondary += 1; continue; }
+    if (!isPrimaryAccountId(id)) { dropped.malformed += 1; continue; }
+    if (set && !set.has(id)) { dropped.staleRetired += 1; continue; }
+    scoped.push(a);
+  }
+  return { scoped, dropped };
+}
+
 /**
  * MEMBERSHIP brands for one account = the latest validated brand-sales brands ONLY, as {key, display} pairs
  * (canonical-key de-duplicated). A brand present only in the account's catalog (with no sales) is NOT a member.

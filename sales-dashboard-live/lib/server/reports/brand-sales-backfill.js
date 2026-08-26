@@ -19,7 +19,7 @@
 
 import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 import { orderRowsFromHistory } from "../sync/durable-dashboards.js";
-import { gatherDailyDurableEvidence, latestProvenDailyTo, durableRefreshedAt, DAILY_OLI_SOURCE_KEY } from "./daily-durable-rederive.js";
+import { gatherDailyDurableEvidence, latestProvenDailyTo, durableRefreshedAt } from "./daily-durable-rederive.js";
 
 export const BRAND_SALES_LIVE_VERSION = "brand-sales-shared-v1";
 export const BRAND_SALES_REPORT_KEY = "brand-sales";
@@ -36,10 +36,42 @@ export function brandSalesProvenanceOf(payload) {
   const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
   let sales = 0; let units = 0;
   for (const r of rows) {
-    sales += Number(r && r.total_sales_sum != null ? r.total_sales_sum : 0) || 0;
-    units += Number(r && r.total_units_sold_sum != null ? r.total_units_sold_sum : 0) || 0;
+    // The brand-sales derivation output rows carry total_sales / total_units_sold (orderSalesByBrand); the _sum
+    // suffix is the INPUT order-line shape. Fall back to it so a legacy/raw payload still fingerprints, but a
+    // cancelled/zero-value correction to the OUTPUT totals must flip this so the corrected brand-sales republishes.
+    sales += Number((r && (r.total_sales != null ? r.total_sales : r.total_sales_sum)) ?? 0) || 0;
+    units += Number((r && (r.total_units_sold != null ? r.total_units_sold : r.total_units_sold_sum)) ?? 0) || 0;
   }
   return JSON.stringify({ rows: rows.length, sales: Math.round(sales * 100), units: Math.round(units) });
+}
+
+/**
+ * Derive the CORRECTED brand-sales payload for ONE account from durable evidence only (ZERO DataDoe export) --
+ * the SINGLE sanctioned brand-sales derivation, reused by the backfill, the live admin refresh route, and the
+ * scheduler adapter so Brand Sales business totals ALWAYS come from the corrected rollup (cancelled + zero-value
+ * excluded via source_oli_daily_history), never the raw ORDER_SALES projection. `account` = { accountId, name,
+ * country } (orderRowsFromHistory refuses an account without its directory name + marketplace country -- never
+ * invented). Publishes at the account's OWN latest proven OLI date (<= `to`). Returns
+ * { payload, to, sourceRefreshedAt } on success or { notReady: <reason> } (never a fabricated zero).
+ */
+export async function deriveBrandSalesFromDurable({ account, from, to, organizationFingerprint, connectionId = "primary", readers }) {
+  if (!isDate(from) || !isDate(to) || from > to) return { notReady: "bad-window" };
+  const accountId = S(account && account.accountId);
+  if (!accountId) return { notReady: "missing-account-id" };
+  // Seller name + marketplace country are read from the directory, NEVER invented -- fail typed (never throw)
+  // when either is missing so a caller can serve the last-known-good instead.
+  if (!S(account && account.name).trim() || !S(account && account.country).trim()) return { notReady: "account-metadata-missing" };
+  const evidence = await gatherDailyDurableEvidence({ accountId, from, to, organizationFingerprint, connectionId }, readers);
+  if (!Array.isArray(evidence.catalogRows)) return { notReady: "catalog-rows-unavailable" };
+  const effectiveTo = latestProvenDailyTo({ oliWindows: evidence.oliWindows, from, ceiling: to });
+  if (!effectiveTo) return { notReady: "oli-coverage-incomplete" };
+  const orderRows = orderRowsFromHistory(evidence.historyRows, { accountId, name: account.name, country: account.country })
+    .filter((r) => r.date >= from && r.date <= effectiveTo);
+  const payload = BRAND_SALES.derive({
+    sources: { "brand-sales:order-lines": { rows: orderRows }, "brand-sales:catalog": { rows: evidence.catalogRows } },
+  });
+  if (!BRAND_SALES.validatePayload(payload)) return { notReady: "derive-invalid" };
+  return { payload, to: effectiveTo, sourceRefreshedAt: durableRefreshedAt(evidence, effectiveTo) || null };
 }
 
 /**
@@ -77,28 +109,21 @@ export async function backfillBrandSalesV1({
 
     let result;
     try {
-      const evidence = await gatherDailyDurableEvidence({ accountId, from, to: asOfCeiling, organizationFingerprint, connectionId }, readers);
-      if (!Array.isArray(evidence.catalogRows)) {
-        result = { accountId, status: "failed", reason: "catalog-rows-unavailable", creates: 0 };
+      // The SINGLE sanctioned derivation: corrected rollup only, zero export (shared with the live route + adapter).
+      const derived = await deriveBrandSalesFromDurable({
+        account: { accountId, name: acct.name, country: acct.country },
+        from, to: asOfCeiling, organizationFingerprint, connectionId, readers,
+      });
+      if (derived.notReady) {
+        result = { accountId, status: "failed", reason: derived.notReady, creates: 0 };
       } else {
-        const effectiveTo = latestProvenDailyTo({ oliWindows: evidence.oliWindows, from, ceiling: asOfCeiling });
-        if (!effectiveTo) {
-          result = { accountId, status: "failed", reason: "oli-coverage-incomplete", blockedBy: [{ sourceKey: DAILY_OLI_SOURCE_KEY, reason: "coverage-incomplete" }], creates: 0 };
-        } else {
-          // orderRowsFromHistory injects seller_or_vendor_name + marketplace_country_code from the directory record
-          // (fail closed if either is missing) and reads the CORRECTED non-cancelled rollup -> cancelled + zero-value
-          // are already excluded, exactly as Daily. Windowed to the account's proven range.
-          const account = { accountId, name: acct.name, country: acct.country };
-          const orderRows = orderRowsFromHistory(evidence.historyRows, account).filter((r) => r.date >= from && r.date <= effectiveTo);
-          const payload = BRAND_SALES.derive({
-            sources: { "brand-sales:order-lines": { rows: orderRows }, "brand-sales:catalog": { rows: evidence.catalogRows } },
-          });
-          if (!validate(payload)) {
-            result = { accountId, status: "failed", reason: "derive-invalid", creates: 0 };
-          } else {
+        {
+          const effectiveTo = derived.to;
+          const payload = derived.payload;
+          {
             const params = { from, to: effectiveTo };
             const paramsHash = store.paramsHashFor(BRAND_SALES_LIVE_VERSION, params);
-            const sourceRefreshedAt = durableRefreshedAt(evidence, effectiveTo) || null;
+            const sourceRefreshedAt = derived.sourceRefreshedAt;
             const freshSalesProv = brandSalesProvenanceOf(payload);
             const existing = await getExisting({ reportKey: BRAND_SALES_REPORT_KEY, accountId, paramsHash });
             const existingValid = existing && existing.payload && existing.params && existing.params.reportVersion === BRAND_SALES_LIVE_VERSION && validate(existing.payload);

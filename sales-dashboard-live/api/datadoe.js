@@ -118,9 +118,10 @@ import {
 } from "../lib/server/reports/brand-view.js";
 import {
   selectorBrandsForAccount, buildBrandAccountMembership, brandKey, brandDisplay,
-  serialiseBrandAccountMembership, membershipFingerprint,
+  serialiseBrandAccountMembership, membershipFingerprint, primaryAccountIdsOnly,
 } from "../lib/server/reports/brand-membership.js";
 import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
+import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
 import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
@@ -777,7 +778,8 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
   // never drops a selling account (nor pins a catalog-only, zero-sale account). The complete catalog still
   // supplies the SELECTOR list (zero-sale brands), and other reports keep the selector recoverable while an
   // account waits for its one-time catalog sync -- but only brand-sales pins membership.
-  await Promise.all(accountIds.map(async (accountId) => {
+  // MEMBERSHIP is CURRENT-PRIMARY only: a dd-secondary ("conn:uuid") id can never pin a brand's account set.
+  await Promise.all(primaryAccountIdsOnly(accountIds).map(async (accountId) => {
     const id = String(accountId);
     const catalogSnapshot = await getLatestReportSnapshotHydrated({ reportKey: BRAND_CATALOG_REPORT_KEY, accountId });
     const payload = catalogSnapshot?.payload;
@@ -840,7 +842,9 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
 // immediately and a changed one is rebuilt exactly once. ZERO DataDoe.
 async function brandSalesFingerprint(accountIds) {
   if (!isSupabaseConfigured()) return "";
-  const meta = await Promise.all((accountIds || []).map(async (accountId) => {
+  // Fingerprint the SAME current-primary scope the membership rebuild uses (dd-secondary excluded), so a
+  // secondary-account snapshot can never churn the self-heal fingerprint or the membership it guards.
+  const meta = await Promise.all(primaryAccountIdsOnly(accountIds).map(async (accountId) => {
     const m = await getLatestReportSnapshotMeta({ reportKey: BRAND_SALES_REPORT_KEY, accountId }).catch(() => null);
     return { accountId: String(accountId), updatedAt: String(m?.updated_at || m?.source_refreshed_at || ""), paramsHash: String(m?.params_hash || "") };
   }));
@@ -2803,19 +2807,24 @@ async function handleDataDoe(req, res) {
     // field server-side. This keeps headline sales aligned to Seller Central's
     // Order Report while retaining the existing brand filter.
     if (action === "brand-sales") {
-      const { ids, from, to } = req.query;
-      if (!ids || !from || !to) {
-        res.status(400).json({ error: "Missing required params: ids, from, to" });
+      const { from, to } = req.query;
+      if (!from || !to || !accountScope || accountScope.accountIds.length !== 1) {
+        res.status(400).json({ error: "Dashboard refresh requires exactly one selected account and a from/to window." });
         return;
       }
-      const sellerOrVendorIds = String(ids).split(",").filter(Boolean);
-      if (sellerOrVendorIds.length !== 1) {
-        res.status(400).json({ error: "Dashboard refresh requires exactly one selected account." });
+      // Brand Sales business totals ALWAYS derive from the CORRECTED durable rollup (source_oli_daily_history;
+      // cancelled + zero-value excluded) -- NEVER the raw ORDER_SALES projection. This spends ZERO DataDoe export,
+      // and a raw/legacy cancelled-inclusive payload can never be published. Release the legacy refresh lock WITHOUT
+      // a raw save; the corrected publish goes through the CAS-guarded durable saver (never overwrites a newer LKG).
+      const brandSalesAccountId = accountScope.accountIds[0];
+      if (legacySharedRefresh) await legacySharedRefresh.release();
+      const refreshed = await refreshCorrectedBrandSalesForAccount({ accountId: brandSalesAccountId, from, to });
+      if (refreshed.notReady || !refreshed.payload) {
+        // Never overwrite the corrected last-known-good with nothing: serve the saved snapshot as-is (zero export).
+        await serveSharedReport({ ...sharedOptions, refresh: false });
         return;
       }
-      // Single implementation, shared with the scheduled-sync adapter.
-      const payload = await buildBrandSalesPayload({ apiKey, ids: sellerOrVendorIds, from, to });
-      await sendLegacyPayload(payload);
+      res.status(200).json({ ...refreshed.payload, reportKey: "brand-sales", reportVersion: refreshed.reportVersion, shared: true, corrected: true });
       return;
     }
 
