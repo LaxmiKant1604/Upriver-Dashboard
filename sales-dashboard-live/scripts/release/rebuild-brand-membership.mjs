@@ -54,7 +54,9 @@ const membership = buildBrandAccountMembership(perAccount);
 const brandCount = membership.size;
 const accountsWithMembership = new Set();
 let pairs = 0;
-for (const set of membership.values()) { pairs += set.size; for (const a of set) accountsWithMembership.add(a); }
+// Each membership value is { display, accounts: Set<accountId> } (buildBrandAccountMembership), so the account
+// set is entry.accounts -- iterating the entry object itself is not iterable and undercounts the pairs.
+for (const entry of membership.values()) { pairs += entry.accounts.size; for (const a of entry.accounts) accountsWithMembership.add(a); }
 console.log("brand-membership: rebuilt from " + perAccount.length + " brand-sales snapshots -> " + brandCount + " brands, " + accountsWithMembership.size + " accounts, " + pairs + " (brand,account) pairs.");
 
 if (brandCount === 0 || pairs === 0) { console.error("STOP rebuilt membership is EMPTY -- brand-sales is missing or unreadable (fail closed)."); process.exit(1); }

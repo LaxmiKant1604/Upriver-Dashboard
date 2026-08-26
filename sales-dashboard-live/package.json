@@ -48,6 +48,7 @@
     "test:source-download-recovery": "node scripts/source-download-recovery.test.js",
     "test:source-create-reconcile": "node scripts/source-create-reconcile.test.js",
     "test:daily-roi-format": "node scripts/daily-roi-format.test.js",
+    "test:brand-sales-backfill": "node scripts/brand-sales-backfill.test.js",
     "test:brand-view-freshness": "node scripts/brand-view-freshness.test.js",
     "test:asin-ads-backfill-window": "node scripts/asin-ads-backfill-window.test.js",
     "test:manual-source-continuation": "node scripts/manual-source-continuation.test.js",
