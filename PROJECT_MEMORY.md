@@ -12153,3 +12153,62 @@ route consume ONE implementation. POST /api/admin/sources now runs sync->release
 DataSyncCenter auto-polls to terminal (double-click guarded), claims "dashboards updated" only after live
 read-back. gate7 G1 amended: api/admin/sources.js is the one reviewed exception reaching the publisher, only
 through the shared release engine. verify 64/64 (44 suites).
+
+================================================================================
+2026-08-26 -- Production hardening of BOTH paths: ambiguous-create reconcile-and-adopt, terminal-cycle idempotence, envelope preflight, window-proof US gate (code 22e1caf + 9321903 + ff2f272 + 970864f + ce1a1cd)
+================================================================================
+
+INCIDENT (the 02:00 UTC non-us cron run of 2026-08-26, cycle 069c50c5): two OLI batch creates died
+client-side on DataDoe 503s (HTTP_503 / CREATE_INTERRUPTED at error_stage=create-export, export_id NULL)
+while BOTH creates LANDED server-side (their exports COMPLETED: 69-row + 247-row, 5 sellers each, window
+2026-08-19..25). The engine (correctly) never blindly retries a create, so the cycle stranded with
+failed=2 and the workflow went red before ads/release.
+
+FIXES (each reproduced against production first):
+1. RECONCILE-AND-ADOPT (22e1caf lib/server/sync/source-create-reconcile.js + ff2f272 driver): matcher adopts
+   ONLY an exactly-one COMPLETED exact-identity export (OLI source id prefix-eq, date-only window eq,
+   order-independent <=5-seller set from the RE-PLANNED canonical job); eligibility = typed failed +
+   non-terminal + create-export stage + create_export_count=1 + export_id NULL; adoption is a
+   precondition-guarded conditional UPDATE flipping the job into the reviewed download-only recovery shape;
+   recovery runs through a create-GUARDED adapter (create throws) => ZERO new creates by construction.
+   APPLIED in production: attempted=2 adopted=2 recovered=2, 0 tokens. WIRED STRUCTURALLY (ff2f272):
+   scheduled-oli-refresh runs it between drain and assessment (the cron self-heals this class);
+   manual-source-sync runs it once on a drain stall; reconcile-failed-creates.mjs --apply = same driver.
+   17-assertion suite (source-create-reconcile.test.js) registered in verify.
+2. MANUAL DRAIN HONESTY (22e1caf): the drain loop counts failed non-terminal jobs as OUTSTANDING
+   (open + failed, 2-stall honest stop) -- a typed transient failure is never misread as drained.
+3. TERMINAL-CYCLE IDEMPOTENCE (ff2f272): re-running the ordinary sync after the day's cycle went terminal
+   crashed mid-derive (P0001 "cycle is terminal; refusing to append/alter child work"). run() now pre-checks
+   the (bucket, today) cycle via an OPTIONAL store capability (getCycleByBucketDate on the production store;
+   offline doubles keep legacy behavior) and short-circuits typed {alreadyTerminal, refused:false, no
+   continuation} -> the manual CLI and the admin route proceed straight to release/read-back.
+4. ENVELOPE PREFLIGHT (9321903): the publish gate reads publish_enabled/schedule_enabled FAIL-CLOSED, which
+   are safe-closed outside the envelope by design -- so runReleaseSlice's all-or-nothing preflight moved
+   INSIDE apply->...->ALWAYS-safe-close (still before the first publish write; a preflight failure exits
+   through the finally having published nothing).
+5. READ-BACK IDENTITIES (ce1a1cd): runReleaseSlice called readbackLive positionally; the contract is ONE
+   object {reportKey, liveReportKey, accountId, paramsHash}. The proven identities are CAPTURED from the
+   in-envelope preflight results and verified after safe-close (the read-back never re-consults the closed
+   gates); typed reasons surface. Test double now pins the object contract.
+6. US GATE WINDOW-PROOF + TYPED ADS-UNAVAILABLE (970864f): verify-scheduled-prerequisites computed
+   covered_to as max(sale_date) over history ROWS -- a sparse-sales account (last sale 2025-08-11) read
+   "short" forever although its fetched windows PROVE zero sales. Coverage now proven from source_coverage
+   windows via the classifier's own mergeCoverageWindows/windowsProve over [2025-01-01..asOf]; provenance
+   passes vacuously on zero rows. The 5 Amazon-Ads-DISCONNECTED accounts (126918b3, 59f12ccc, 81146c04,
+   858977f0, 8aa74e96) are typed UNAVAILABLE via the ads runner's own compatible-sources pre-flight --
+   a NOTE, never a blocker; they join automatically once connected. Production: OLI 22/22 ready.
+
+PRODUCTION STATE (this session): non-us cycle 069c50c5 (2026-08-26) terminal succeeded (5 OLI batches --
+3 fetched by the cron + 2 reconciled/adopted -- + 1 catalog); durable OLI coverage proven 22/22 through
+2026-08-25; non-us ASIN Ads refreshed 17/17 connected accounts through 2026-08-25 (4 creates / 8 tokens,
+ceiling 5/10); US prerequisite gate READY; controls safe-closed after every envelope; balance ~3980
+(large top-up landed; was 146). verify: all 65 steps / 45 suites green.
+
+MANUAL-SYNC PROOF (2026-08-26 ~11:45 IST, attempt 4 after fixes 3/4/5): manual-source-sync.mjs
+--bucket=non-us --source=order-line-items --as-of=2026-08-25 completed END-TO-END in production: terminal-
+cycle idempotent short-circuit -> derive(already-complete) -> finalize(22 accounts) -> controls apply ->
+preflight 22x3 -> publish (CAS already-current replay) -> ALWAYS-safe-close -> read-back 66 LIVE pairs ->
+DONE exit 0. This is the mission's "manual sync fixed" acceptance: evidence persisted, affected dashboards
+(daily-reporting, brand-sales, brand-inventory) published from the same evidence, live read-back proven,
+controls safe-closed. Remaining: the 10:30 UTC US scheduled run (cron, from origin AFTER this push) as the
+controlled US proof + its read-backs.
