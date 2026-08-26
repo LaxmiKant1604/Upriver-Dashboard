@@ -48,6 +48,7 @@ const SUITES = [
   "test:source-durable-model",
   "test:oli-dimensional",
   "test:oli-value-policy",
+  "test:oli-quality",
   "test:effective-asof",
   "test:source-bucket-sync",
   "test:source-status",

@@ -1505,6 +1505,79 @@ export async function getSourceOliDimensionalContribution({ organizationFingerpr
   return raw;
 }
 
+// Read the durable EXPLICIT-ZERO OLI grain rows for ONE account over a date range: NON-cancelled, order value
+// PRESENT and numerically == 0, positive units. These are the audit-only present-zero units (promotional /
+// replacement / free / incomplete) the data-quality indicator surfaces -- NEVER business Sales/Units, and NEVER
+// the NULL/missing class (the dimensional table cannot hold a NULL-value row; that window is refused + LKG-kept).
+// ZERO DataDoe. Paginated + hard-capped like getSourceOliDimensionalContribution. Only safe, already-stored fields
+// are selected (never amazon_order_id / address_country).
+export async function getExplicitZeroOliUnits({ organizationFingerprint, connectionId = "primary", accountId, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId || !from || !to) {
+    throw new Error("getExplicitZeroOliUnits requires organizationFingerprint + accountId + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const raw = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const query = new URLSearchParams({
+      select: "sale_date,sku,child_asin,currency,amazon_order_status,fulfillment_channel,address_state,address_city,total_units_sum",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      sale_date: `gte.${from}`,
+      is_cancelled: "eq.false",
+      total_sales_sum: "eq.0",       // PRESENT and exactly zero (a NULL/missing value is is.null -> never matched here)
+      total_units_sum: "gt.0",       // positive units only
+      order: "sale_date.desc,sku.asc",
+      limit: String(PAGE),
+      offset: String(offset),
+    });
+    query.append("sale_date", `lte.${to}`);
+    const rows = await request(`/rest/v1/source_oli_dimensional_history?${query}`, { signal });
+    const list = Array.isArray(rows) ? rows : [];
+    raw.push(...list);
+    if (raw.length > maxRows) {
+      const err = new Error("OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED: explicit-zero OLI read exceeded its row cap; refusing a truncated series (fail closed).");
+      err.code = "OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED";
+      throw err;
+    }
+    if (list.length < PAGE) break;
+  }
+  return raw;
+}
+
+// Compact per-account OLI data-quality counts for the Data Sync Center (read-only, ZERO DataDoe): explicit-zero
+// non-cancelled units, cancelled audit units, and the latest dimensional coverage date. The NULL/missing class is
+// not stored durably (refused windows preserve LKG), so it is surfaced as blocked-window evidence elsewhere.
+export async function getAccountOliQualityCounts({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getAccountOliQualityCounts requires organizationFingerprint + accountId (fail closed).");
+  const base = {
+    organization_fingerprint: `eq.${organizationFingerprint}`,
+    connection_id: `eq.${connectionId}`,
+    account_id: `eq.${accountId}`,
+  };
+  // Bounded reads that sum units in JS -- explicit-zero + cancelled rows are few per account, so a small paginated
+  // read is cheap and needs no aggregate RPC/view. ZERO DataDoe.
+  const readUnits = async (extra) => {
+    let units = 0; let rows = 0; const PAGE = 1000;
+    for (let offset = 0; ; offset += PAGE) {
+      const q = new URLSearchParams({ ...base, select: "total_units_sum", limit: String(PAGE), offset: String(offset), ...extra });
+      const list = await request(`/rest/v1/source_oli_dimensional_history?${q}`, { signal });
+      const arr = Array.isArray(list) ? list : [];
+      for (const r of arr) { units += Number(r.total_units_sum) || 0; rows += 1; }
+      if (arr.length < PAGE || rows > 200000) break;
+    }
+    return { units, rows };
+  };
+  const explicitZero = await readUnits({ is_cancelled: "eq.false", total_sales_sum: "eq.0", total_units_sum: "gt.0" });
+  const cancelled = await readUnits({ is_cancelled: "eq.true" });
+  const latest = await request(`/rest/v1/source_oli_dimensional_history?${new URLSearchParams({ ...base, select: "sale_date", order: "sale_date.desc", limit: "1" })}`, { signal }).catch(() => []);
+  return {
+    explicitZeroUnits: explicitZero.units, explicitZeroRows: explicitZero.rows,
+    cancelledUnits: cancelled.units, cancelledRows: cancelled.rows,
+    latestDimensionalDate: Array.isArray(latest) && latest[0] ? String(latest[0].sale_date) : null,
+  };
+}
+
 // Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.
 export async function getSourceCoverageWindows({ organizationFingerprint, connectionId = "primary", accountId, sourceKey, signal = null }) {
   try {

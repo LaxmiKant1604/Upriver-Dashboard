@@ -1338,6 +1338,14 @@ function DashboardApp({ session, access, onSignOut }) {
     return { action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY };
   }, [selectedAccountId, TODAY]);
 
+  // OLI data-quality (explicit-zero) params: the SAME wide account window + the selected brand (server-side Catalog
+  // attribution). It is a read-only, ZERO-DataDoe Supabase read; the displayed count is scoped to the selected date
+  // range CLIENT-side (mirrors scopedRows), so changing the date range never needs a re-fetch.
+  const oliQualityParams = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return { action: "oli-quality", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY, brand: selectedBrand || "ALL" };
+  }, [selectedAccountId, TODAY, selectedBrand]);
+
   const portfolioAccountSignature = useMemo(() => {
     const discoveredIds = accounts.map((account) => String(account.id)).filter(Boolean);
     // Account permissions are already enforced server-side. This fallback lets
@@ -1605,6 +1613,22 @@ function DashboardApp({ session, access, onSignOut }) {
     }
   }, [dashboardParams, bumpReq, isCurrentReq, selectedAccountId]);
 
+  // OLI data-quality (explicit-zero) -- read-only, ZERO-DataDoe. A failed read PRESERVES the previous quality state
+  // (last-known-good) and never disturbs the business rows; `available:false` renders a non-destructive
+  // "quality details unavailable" state.
+  const [oliQuality, setOliQuality] = useState(null);
+  const loadOliQuality = useCallback(async () => {
+    if (!oliQualityParams) { setOliQuality(null); return; }
+    const myId = bumpReq("oli-quality");
+    try {
+      const { body } = await loadSharedReport(oliQualityParams);
+      if (!isCurrentReq("oli-quality", myId)) return;
+      setOliQuality(body && typeof body === "object" ? body : { available: false });
+    } catch (_e) {
+      if (isCurrentReq("oli-quality", myId)) setOliQuality((prev) => (prev && prev.available ? prev : { available: false }));
+    }
+  }, [oliQualityParams, bumpReq, isCurrentReq]);
+
   const fetchRows = useCallback(() => {
     if (!dashboardParams) {
       setRows([]);
@@ -1632,6 +1656,11 @@ function DashboardApp({ session, access, onSignOut }) {
     loadCachedRows();
   }, [loadCachedRows]);
   useAutoRevalidate(loadCachedRows, { active: view === "dashboard" && dashboardMode === "account" });
+
+  // The quality indicator shares the dashboard's revalidation triggers (page load, account/brand change, focus,
+  // visibility, the 60s interval) so it stays in step with the business rows -- without ever spending a token.
+  useEffect(() => { loadOliQuality(); }, [loadOliQuality]);
+  useAutoRevalidate(loadOliQuality, { active: view === "dashboard" && dashboardMode === "account" });
 
   useEffect(() => { setSelectedBrand("ALL"); }, [selectedAccountId]);
 
@@ -2612,6 +2641,20 @@ function DashboardApp({ session, access, onSignOut }) {
   const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [brandRows, rangeFrom, rangeTo]);
   const kpi = useMemo(() => aggregate(scopedRows), [scopedRows]);
   const aov = kpi.orders > 0 ? kpi.sales / kpi.orders : 0;
+  // Explicit-zero units, SCOPED to the selected date range (the server returned the wide-window, brand-attributed
+  // breakdown; filtering to [rangeFrom, rangeTo] here keeps the count in step with the date filter without a
+  // re-fetch). This is a SEPARATE audit indicator -- it never feeds kpi/Sales/Units.
+  const [showExplicitZero, setShowExplicitZero] = useState(false);
+  const explicitZeroScoped = useMemo(() => {
+    const avail = oliQuality && oliQuality.available !== false;
+    const inRange = (avail ? (oliQuality.breakdown || []) : []).filter((b) => b && b.date >= rangeFrom && b.date <= rangeTo);
+    return {
+      unavailable: !!(oliQuality && oliQuality.available === false),
+      units: inRange.reduce((s, b) => s + (Number(b.units) || 0), 0),
+      rows: inRange.reduce((s, b) => s + (Number(b.rows) || 0), 0),
+      breakdown: inRange,
+    };
+  }, [oliQuality, rangeFrom, rangeTo]);
   // The Order Line Items sales source carries item_price_value (sales) + quantity (units) but no
   // order-count column, so Orders / AOV show "—" unless an orders figure is actually present on the rows.
   const hasOrders = useMemo(() => brandRows.some((r) => r.total_orders !== undefined && r.total_orders !== null), [brandRows]);
@@ -2943,6 +2986,57 @@ function DashboardApp({ session, access, onSignOut }) {
             title={`${kpi.missingOrderValueUnits.toLocaleString("en-US")} unit${kpi.missingOrderValueUnits === 1 ? "" : "s"} in this range have no order value`}
             detail="These units are excluded from Total Sales and Units Sold. Refresh again once DataDoe completes its upstream order data — no value is estimated or filled in here."
           />
+        )}
+
+        {/* SEPARATE, informational (amber) data-quality notice: non-cancelled units whose order value is EXPLICITLY
+            present and numerically 0 (may be promotional / replacement / free / incomplete). Excluded from Total
+            Sales and Units Sold; never labelled as definitely-missing sales. Scoped to the selected account, date
+            range, and brand (Catalog-attributed). A separate class from the "no order value" (NULL) warning above. */}
+        {!rowsLoading && !explicitZeroScoped.unavailable && explicitZeroScoped.units > 0 && (
+          <DataQualityAlert
+            tone="warning"
+            title={`${explicitZeroScoped.units.toLocaleString("en-US")} non-cancelled unit${explicitZeroScoped.units === 1 ? "" : "s"} have an explicit ${fmtMoney(0, displayCurrency)} order value`}
+            detail={(
+              <>
+                These units are excluded from Total Sales and Units Sold. They may be promotional, replacement, free, or incomplete upstream records. Review the breakdown before treating them as a sales gap.{" "}
+                <button
+                  type="button"
+                  onClick={() => setShowExplicitZero((v) => !v)}
+                  style={{ background: "none", border: "none", padding: 0, color: "inherit", textDecoration: "underline", cursor: "pointer", font: "inherit" }}
+                >
+                  {showExplicitZero ? "Hide breakdown" : `Show breakdown (${explicitZeroScoped.breakdown.length.toLocaleString("en-US")})`}
+                </button>
+              </>
+            )}
+          />
+        )}
+        {!rowsLoading && showExplicitZero && !explicitZeroScoped.unavailable && explicitZeroScoped.breakdown.length > 0 && (
+          <div className="panel" style={{ overflowX: "auto", marginTop: 6 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.82rem" }}>
+              <thead>
+                <tr style={{ textAlign: "left", opacity: 0.75 }}>
+                  <th style={{ padding: "4px 8px" }}>Date</th><th style={{ padding: "4px 8px" }}>SKU</th><th style={{ padding: "4px 8px" }}>Child ASIN</th>
+                  <th style={{ padding: "4px 8px" }}>Status</th><th style={{ padding: "4px 8px" }}>Fulfilment</th><th style={{ padding: "4px 8px" }}>State</th><th style={{ padding: "4px 8px" }}>City</th>
+                  <th style={{ padding: "4px 8px", textAlign: "right" }}>Rows</th><th style={{ padding: "4px 8px", textAlign: "right" }}>Units</th>
+                </tr>
+              </thead>
+              <tbody>
+                {explicitZeroScoped.breakdown.slice(0, 300).map((b, i) => (
+                  <tr key={i} style={{ borderTop: "1px solid var(--border, #eee)" }}>
+                    <td style={{ padding: "4px 8px" }}>{b.date}</td><td style={{ padding: "4px 8px" }}>{b.sku || "—"}</td><td style={{ padding: "4px 8px" }}>{b.childAsin || "—"}</td>
+                    <td style={{ padding: "4px 8px" }}>{b.status || "—"}</td><td style={{ padding: "4px 8px" }}>{b.fulfillment || "—"}</td><td style={{ padding: "4px 8px" }}>{b.state || "—"}</td><td style={{ padding: "4px 8px" }}>{b.city || "—"}</td>
+                    <td style={{ padding: "4px 8px", textAlign: "right" }}>{b.rows.toLocaleString("en-US")}</td><td style={{ padding: "4px 8px", textAlign: "right" }}>{b.units.toLocaleString("en-US")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {explicitZeroScoped.breakdown.length > 300 && (
+              <div style={{ padding: "6px 8px", opacity: 0.7 }}>Showing the first 300 of {explicitZeroScoped.breakdown.length.toLocaleString("en-US")} grains.</div>
+            )}
+          </div>
+        )}
+        {!rowsLoading && explicitZeroScoped.unavailable && (
+          <div className="alert-detail" style={{ opacity: 0.7, fontSize: "0.82rem", padding: "2px 4px" }}>OLI quality details are temporarily unavailable — business totals are unaffected.</div>
         )}
 
         {!selectedAccountId ? (

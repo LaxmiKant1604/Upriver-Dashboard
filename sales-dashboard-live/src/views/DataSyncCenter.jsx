@@ -63,6 +63,7 @@ export default function DataSyncCenter({ accessToken }) {
   const [bucket, setBucket] = useState("non-us");
   const [notice, setNotice] = useState("");
   const [showReports, setShowReports] = useState(false);
+  const [showQuality, setShowQuality] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -202,6 +203,43 @@ export default function DataSyncCenter({ accessToken }) {
               Card summary — {DASHBOARD_LABELS[r.dashboard] || r.dashboard}: {r.ready ? "sources healthy" : `blocked by ${r.blockedBy.map((b) => `${b.sourceKey} · ${b.reason}`).join(", ")}`}
             </div>
           ))}
+        </div>
+      )}
+
+      {bucketData && Array.isArray(bucketData.oliQuality) && bucketData.oliQuality.length > 0 && (
+        <div className="panel sync-scope-panel">
+          <button type="button" className="plan-export-btn" onClick={() => setShowQuality((v) => !v)}>
+            {showQuality ? "Hide" : "Show"} OLI data quality (per account)
+          </button>
+          {showQuality && (
+            <div style={{ overflowX: "auto", marginTop: 8 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.82rem" }}>
+                <thead>
+                  <tr style={{ textAlign: "left", opacity: 0.75 }}>
+                    <th style={{ padding: "4px 8px" }}>Account</th>
+                    <th style={{ padding: "4px 8px", textAlign: "right" }}>Explicit 0-value units</th>
+                    <th style={{ padding: "4px 8px", textAlign: "right" }}>Cancelled units</th>
+                    <th style={{ padding: "4px 8px", textAlign: "right" }}>Cancelled rows</th>
+                    <th style={{ padding: "4px 8px" }}>Latest dimensional date</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bucketData.oliQuality.map((q) => (
+                    <tr key={q.accountId} style={{ borderTop: "1px solid var(--border, #eee)" }}>
+                      <td style={{ padding: "4px 8px" }}>{String(q.accountId).slice(0, 8)}…</td>
+                      <td style={{ padding: "4px 8px", textAlign: "right" }}>{q.unavailable ? "—" : Number(q.explicitZeroUnits || 0).toLocaleString("en-US")}</td>
+                      <td style={{ padding: "4px 8px", textAlign: "right" }}>{q.unavailable ? "—" : Number(q.cancelledUnits || 0).toLocaleString("en-US")}</td>
+                      <td style={{ padding: "4px 8px", textAlign: "right" }}>{q.unavailable ? "—" : Number(q.cancelledRows || 0).toLocaleString("en-US")}</td>
+                      <td style={{ padding: "4px 8px" }}>{q.unavailable ? `unavailable (${q.unavailable})` : (q.latestDimensionalDate || "—")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="sync-token-note" style={{ marginTop: 6 }}>
+                Explicit 0-value units (non-cancelled, order value present and exactly zero) and cancelled units are audit-only — excluded from Sales and Units Sold, kept separate from genuinely missing/blocked windows. Read-only; this never triggers a sync.
+              </div>
+            </div>
+          )}
         </div>
       )}
 

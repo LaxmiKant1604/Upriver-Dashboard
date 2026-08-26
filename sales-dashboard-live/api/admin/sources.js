@@ -9,7 +9,8 @@
 //         it is applied the GET reads report schema-missing markers and POST fails closed on the first
 //         durable write -- this endpoint enables nothing by itself and creates no schedule.
 
-import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, getSourceRunStatuses, setSourceControl, getAccountDirectoryRows } from "../../lib/server/supabase.js";
+import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, getSourceRunStatuses, setSourceControl, getAccountDirectoryRows, getAccountOliQualityCounts } from "../../lib/server/supabase.js";
+import { primaryOrganizationFingerprint } from "../../lib/server/datadoe-connections.js";
 import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../../lib/server/sync/source-status.js";
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
@@ -46,6 +47,10 @@ async function statusPayload() {
   let directoryRows = [];
   try { directoryRows = (await getAccountDirectoryRows()) || []; } catch { directoryRows = []; }
   const runtime = buildBucketSourceSyncRuntime();
+  // Org fingerprint for the read-only OLI data-quality summary (never a data change, ZERO DataDoe). Best-effort:
+  // absence never breaks the source cards.
+  let qualityOrgFp = null;
+  try { qualityOrgFp = primaryOrganizationFingerprint(); } catch { qualityOrgFp = null; }
   const cards = {};
   for (const bucket of CARD_BUCKETS) {
     const bucketCards = shapeSourceCards({ bucket, controls: controls.rows, runStatuses: statuses.rows });
@@ -60,7 +65,21 @@ async function statusPayload() {
     } catch (error) {
       readiness = { unavailable: error?.code || "READINESS_GATHER_FAILED" };
     }
-    cards[bucket] = { cards: bucketCards, cardSummary: dashboardReadinessSummary(bucketCards), readiness };
+    // Per-account OLI DATA-QUALITY summary (read-only, ZERO DataDoe): explicit-zero non-cancelled units, cancelled
+    // audit units, and the latest dimensional coverage date. Computed in PARALLEL and best-effort -- a per-account
+    // failure yields an unavailable marker and never breaks or blocks the source cards.
+    let oliQuality = [];
+    if (qualityOrgFp && accounts.length) {
+      oliQuality = await Promise.all(accounts.map(async (a) => {
+        try {
+          const counts = await getAccountOliQualityCounts({ organizationFingerprint: qualityOrgFp, accountId: a.accountId });
+          return { accountId: a.accountId, ...counts };
+        } catch (e) {
+          return { accountId: a.accountId, unavailable: e?.code || "QUALITY_READ_FAILED" };
+        }
+      }));
+    }
+    cards[bucket] = { cards: bucketCards, cardSummary: dashboardReadinessSummary(bucketCards), readiness, oliQuality };
   }
   return {
     buckets: cards,

@@ -41,6 +41,8 @@ import {
   getSourceOliHistoryRows,
   getSourceSnapshot,
   getSourceSnapshotPayload,
+  getExplicitZeroOliUnits,
+  getAccountOliQualityCounts,
   insertReportSnapshotIfAbsent,
   isSafeSnapshotRev,
   isSupabaseConfigured,
@@ -122,6 +124,7 @@ import {
 } from "../lib/server/reports/brand-membership.js";
 import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
 import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
+import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
@@ -152,6 +155,9 @@ const ACCOUNT_SCOPED_ACTIONS = new Set([
   // in the browser, so there is nothing extra to authorise here.
   "sales-movers", "listing-health", "buy-box-loss",
   "returns-leakage", "ppc-performance", "listing-optimizer",
+  // OLI data-quality: a read-only, ZERO-DataDoe explicit-zero indicator (Sales Dashboard) + per-account quality
+  // counts (Data Sync Center). Both are single-account, authorised, and read only the durable dimensional table.
+  "oli-quality", "oli-quality-summary",
 ]);
 
 // Every insight report is strictly one selected account: the shared snapshot,
@@ -2598,6 +2604,56 @@ async function handleDataDoe(req, res) {
     if (action === "fx-rates") {
       const rates = await getFxRates();
       res.status(200).json({ ...rates, displayCurrencies: FX_DISPLAY_CURRENCIES });
+      return;
+    }
+
+    // OLI DATA-QUALITY: the read-only, ZERO-DataDoe explicit-zero indicator for ONE account over the SELECTED date
+    // range (and brand). It reads ONLY the durable dimensional table (+ the saved Product Catalog for named-brand
+    // attribution) -- never DataDoe, never the business rollup, so it can never change Sales/Units. A failure returns
+    // a typed `available:false` so the Sales Dashboard keeps its last-known-good data and renders a non-destructive
+    // "quality details unavailable" state instead of a fatal error.
+    if (action === "oli-quality") {
+      if (!accountScope || accountScope.accountIds.length !== 1) { res.status(400).json({ error: "OLI quality requires exactly one selected account." }); return; }
+      const { from, to } = req.query;
+      const brand = String(req.query.brand || "ALL");
+      if (!from || !to) { res.status(400).json({ error: "OLI quality requires from + to." }); return; }
+      const qAccountId = accountScope.accountIds[0];
+      const qPrimary = connections.find((cn) => cn && cn.id === "primary" && String(cn.apiKey || "").trim());
+      try {
+        if (!qPrimary) throw new Error("no primary connection");
+        const orgFp = qPrimary.organizationFingerprint || organizationFingerprint(qPrimary.apiKey);
+        const rows = await getExplicitZeroOliUnits({ organizationFingerprint: orgFp, accountId: qAccountId, from: String(from), to: String(to) });
+        // Named-brand attribution via the SAVED Product Catalog snapshot ONLY (never invented). ALL needs no catalog.
+        let brandByAsin = null;
+        if (brand && brand.toUpperCase() !== "ALL") {
+          const snapRead = await getSourceSnapshot({ organizationFingerprint: orgFp, connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization" }).catch(() => null);
+          const snap = snapRead && typeof snapRead === "object" && "snapshot" in snapRead ? snapRead.snapshot : snapRead;
+          let catalogRows = [];
+          if (snap && snap.object_path) { const p = await getSourceSnapshotPayload(snap.object_path).catch(() => null); catalogRows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : []); }
+          brandByAsin = brandByAsinFromCatalog(catalogRows);
+        }
+        const summary = summarizeExplicitZeroOli(rows, { brandByAsin, brand });
+        res.status(200).json({ available: true, accountId: qAccountId, from: String(from), to: String(to), ...summary });
+      } catch (_e) {
+        res.status(200).json({ available: false, accountId: qAccountId, reason: "quality-unavailable" });
+      }
+      return;
+    }
+
+    // OLI DATA-QUALITY SUMMARY (Data Sync Center): compact per-account counts -- explicit-zero non-cancelled units,
+    // cancelled audit units, and the latest dimensional coverage date. Read-only, ZERO DataDoe, never triggers a sync.
+    if (action === "oli-quality-summary") {
+      if (!accountScope || accountScope.accountIds.length !== 1) { res.status(400).json({ error: "OLI quality summary requires exactly one selected account." }); return; }
+      const sAccountId = accountScope.accountIds[0];
+      const sPrimary = connections.find((cn) => cn && cn.id === "primary" && String(cn.apiKey || "").trim());
+      try {
+        if (!sPrimary) throw new Error("no primary connection");
+        const orgFp = sPrimary.organizationFingerprint || organizationFingerprint(sPrimary.apiKey);
+        const counts = await getAccountOliQualityCounts({ organizationFingerprint: orgFp, accountId: sAccountId });
+        res.status(200).json({ available: true, accountId: sAccountId, ...counts });
+      } catch (_e) {
+        res.status(200).json({ available: false, accountId: sAccountId, reason: "quality-unavailable" });
+      }
       return;
     }
 

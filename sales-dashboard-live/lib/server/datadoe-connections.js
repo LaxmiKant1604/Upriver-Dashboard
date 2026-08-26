@@ -5,6 +5,8 @@
 // secondary organisation gets a stable prefix, preventing a same-looking raw
 // seller/vendor ID from crossing an organisation boundary.
 
+import { organizationFingerprint as organizationFingerprintImpl } from "./source-identity.js";
+
 const PRIMARY_ID = "primary";
 const SECONDARY_ID = "secondary";
 const SECONDARY_PREFIX = "dd-secondary:";
@@ -38,6 +40,15 @@ export function getDataDoeConnections() {
     });
   }
   return connections;
+}
+
+// The PRIMARY organisation's fingerprint, derived from the primary DataDoe key. Callers that must not name a
+// secret-shaped identifier (e.g. the admin source endpoints) import this instead of touching apiKey directly.
+// Returns null when the primary key is not configured.
+export function primaryOrganizationFingerprint() {
+  const primaryKey = String(process.env.DATADOE_API_KEY || "").trim();
+  if (!configured(primaryKey)) return null;
+  return organizationFingerprintImpl(primaryKey);
 }
 
 export function publicAccountId(connection, rawAccountId) {
