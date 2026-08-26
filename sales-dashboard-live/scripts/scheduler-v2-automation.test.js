@@ -588,6 +588,26 @@ test("I2b. EVIDENCE-FIRST cycle shape: green durable evidence + missing/manual-s
   assert.ok(r.problems.some((p) => /oli-coverage-short/.test(p)) && r.problems.some((p) => /nonus-cycle-missing/.test(p)), "evidence + cycle problems both reported when evidence is broken");
 });
 
+test("I2c. ads-DISCONNECTED accounts are TYPED UNAVAILABLE: never a blocker (noted), while a CONNECTED account's ads gap still blocks", () => {
+  // The five Amazon-Ads-disconnected accounts: no ASIN-Ads source on the connection -> adsUnavailable=true.
+  // Their missing coverage / poisoned failed state must NOT strand the US run; they join automatically once
+  // connected (adsUnavailable flips false and the ordinary checks resume).
+  const withDisconnected = readyPerAccount(22, (i) => (i < 5 ? { adsUnavailable: true, adsWindowCovered: false, adsFailed: true } : {}));
+  let r = assessNonUsPrerequisites({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: withDisconnected, cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  assert.equal(r.ok, true, "disconnected ads never block: " + JSON.stringify(r.problems.slice(0, 4)));
+  assert.ok((r.notes || []).some((n) => /ads-unavailable-note/.test(n)), "typed unavailable is NOTED");
+  // The same gaps on a CONNECTED account still block (adsUnavailable false/absent keeps every check).
+  const connectedGap = readyPerAccount(22, (i) => (i === 0 ? { adsUnavailable: false, adsWindowCovered: false, adsFailed: true } : {}));
+  r = assessNonUsPrerequisites({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: connectedGap, cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => /ads-coverage-incomplete/.test(p)) && r.problems.some((p) => /ads-failed/.test(p)), "connected gaps still fail closed");
+  // An OLI problem on a disconnected account still blocks (only the ads checks are downgraded).
+  const oliBroken = readyPerAccount(22, (i) => (i === 0 ? { adsUnavailable: true, adsWindowCovered: false, oliGapless: false } : {}));
+  r = assessNonUsPrerequisites({ asOf: "2026-08-23", discoveredAccounts: accountsN(22), perAccount: oliBroken, cyclePresent: true, cycleOliAssessment: completeCycleAssess() });
+  assert.equal(r.ok, false);
+  assert.ok(r.problems.some((p) => /oli-coverage-gap/.test(p)), "OLI checks apply to disconnected accounts unchanged");
+});
+
 // ---- run ----
 let failures = 0;
 for (const t of tests) {

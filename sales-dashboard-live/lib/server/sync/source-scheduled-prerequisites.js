@@ -12,7 +12,10 @@ const S = (v) => (v == null ? "" : String(v));
  *   adsWindowFrom/adsWindowTo -- the exact required rolling ASIN-Ads window.
  *   discoveredAccounts   -- freshly discovered Non-US primary accounts [{accountId}] (the ONLY allowed owner set).
  *   perAccount           -- per-account durable evidence [{ accountId, oliCoveredTo, oliGapless, oliProvenanceOk,
- *                            oliFailedOrOpen, adsWindowCovered, adsFailed }].
+ *                            oliFailedOrOpen, adsWindowCovered, adsFailed, adsUnavailable }]. adsUnavailable=true
+ *                            means the account's DataDoe connection has NO ASIN-Ads source (Amazon Ads not
+ *                            connected) -- a TYPED UNAVAILABLE state: its ads checks become a note, never a
+ *                            blocker (the account joins automatically once connected; OLI checks still apply).
  *   cyclePresent         -- a (non-us, cycleDate) scheduled OLI cycle exists for this asOf.
  *   cycleOliAssessment   -- assessScheduledOliCycle over that cycle's OLI jobs (open=0): its owner union proves
  *                            exact account/owner isolation + a completed scheduled run.
@@ -26,6 +29,7 @@ export function assessNonUsPrerequisites({ asOf, discoveredAccounts, perAccount,
   if (!discovered.length) return { ok: false, problems: ["no-discovered-accounts"], accounts: 0 };
   const discoveredSet = new Set(discovered);
   const byId = new Map((perAccount || []).map((p) => [S(p && p.accountId), p]));
+  const adsUnavailableNotes = [];
 
   for (const id of discovered) {
     const p = byId.get(id);
@@ -35,11 +39,16 @@ export function assessNonUsPrerequisites({ asOf, discoveredAccounts, perAccount,
     if (p.oliGapless !== true) problems.push("oli-coverage-gap:" + id.slice(0, 8));
     // 2. nonblank OLI provenance hashes -> succeeded canonical jobs.
     if (p.oliProvenanceOk !== true) problems.push("oli-provenance-blank:" + id.slice(0, 8));
-    // 3. complete ASIN-Ads coverage for the exact required rolling window.
-    if (p.adsWindowCovered !== true) problems.push("ads-coverage-incomplete:" + id.slice(0, 8));
+    // 3. complete ASIN-Ads coverage for the exact required rolling window. An ads-DISCONNECTED account (no
+    // ASIN-Ads source on its DataDoe connection) is TYPED UNAVAILABLE -- noted, never a blocker: the US derive
+    // represents it as ads-unavailable downstream, and it joins automatically once Amazon Ads is connected.
+    if (p.adsUnavailable === true) adsUnavailableNotes.push(id.slice(0, 8));
+    else {
+      if (p.adsWindowCovered !== true) problems.push("ads-coverage-incomplete:" + id.slice(0, 8));
+      if (p.adsFailed === true) problems.push("ads-failed:" + id.slice(0, 8));
+    }
     // 4. no failed/open scheduled source work for the required identities.
     if (p.oliFailedOrOpen === true) problems.push("oli-failed-or-open:" + id.slice(0, 8));
-    if (p.adsFailed === true) problems.push("ads-failed:" + id.slice(0, 8));
   }
 
   // 5. exact account/owner isolation: no evidence account outside the freshly discovered primary set.
@@ -57,6 +66,7 @@ export function assessNonUsPrerequisites({ asOf, discoveredAccounts, perAccount,
   if (cyclePresent !== true) cycleProblems.push("nonus-cycle-missing");
   else if (!cycleOliAssessment || cycleOliAssessment.ok !== true) cycleProblems.push("nonus-cycle-oli-incomplete:" + (cycleOliAssessment ? [...new Set((cycleOliAssessment.problems || []).map((x) => String(x).split(":")[0]))].join(",") : "na"));
   const notes = [];
+  if (adsUnavailableNotes.length) notes.push("ads-unavailable-note:" + adsUnavailableNotes.join(",") + " (Amazon Ads not connected in DataDoe; typed unavailable, not blocking)");
   if (durableComplete && cycleProblems.length) notes.push("cycle-shape-note:" + cycleProblems.join("|") + " (durable evidence complete; not blocking)");
   if (!durableComplete) problems.push(...cycleProblems);
 

@@ -18,7 +18,7 @@ import { fetchAccounts, fetchCompatibleSourceNames } from "../datadoe.js";
 import { getDailyAdsCoverage } from "../supabase.js";
 import { evaluateSourceCoverage } from "./ppc-ads-loader.js";
 
-const ASIN_ADS_SOURCE_NAME = "ad performance by asin & date";
+export const ASIN_ADS_SOURCE_NAME = "ad performance by asin & date";
 const S = (v) => (v == null ? "" : String(v));
 
 /**

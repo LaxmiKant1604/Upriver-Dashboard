@@ -21,11 +21,15 @@ const cycleDate = addDays(asOf, 1);
 const adsFrom = addDays(asOf, -20); const adsTo = asOf;
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
+const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
-const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle } = await import("../../lib/server/supabase.js");
+const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { assessNonUsPrerequisites } = await import("../../lib/server/sync/source-scheduled-prerequisites.js");
+const { windowsProve, mergeCoverageWindows } = await import("../../lib/server/sync/source-durable-model.js");
+const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
+const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 
 const log = (m) => console.log("verify-prereq[asOf=" + asOf + "]: " + m);
 
@@ -48,8 +52,11 @@ await c.connect();
 let perAccount = []; let cyclePresent = false; let cycleOliAssessment = null;
 try {
   await q("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
-  // OLI durable coverage + provenance per account
-  const oli = (await q("select account_id, max(sale_date)::text covered_to, min(sale_date)::text covered_from, count(*) filter(where source_request_hash is null or btrim(source_request_hash)='')::int blank_prov from public.source_oli_daily_history where account_id = any($1::text[]) group by 1", [ids])).rows;
+  // OLI history provenance per account. History ROWS are sales facts only -- a fetched window with zero rows is
+  // PROOF OF ZERO SALES, so coverage/gaplessness comes from source_coverage windows (below), NEVER max(sale_date)
+  // (a sparse-sales account would read "short" forever). Rows that DO exist must carry provenance hashes; an
+  // account with no rows passes provenance vacuously (its windows are the durable proof).
+  const oli = (await q("select account_id, count(*) filter(where source_request_hash is null or btrim(source_request_hash)='')::int blank_prov from public.source_oli_daily_history where account_id = any($1::text[]) group by 1", [ids])).rows;
   const oliMap = new Map(oli.map((r) => [String(r.account_id), r]));
   // ASIN-Ads coverage per account (does a succeeded window prove [adsFrom, adsTo]?)
   const ads = (await q("select account_id, min(covered_from)::text cf, max(covered_to)::text ct from public.ads_sync_coverage where source_key='asin-performance-v1' and status='succeeded' and account_id = any($1::text[]) group by 1", [ids])).rows;
@@ -58,18 +65,54 @@ try {
   const adsState = (await q("select account_id, last_status from public.ads_sync_state where source_key='asin-performance-v1' and account_id = any($1::text[])", [ids])).rows;
   const adsFailedSet = new Set(adsState.filter((r) => String(r.last_status) === "failed").map((r) => String(r.account_id)));
 
+  // Durable OLI coverage per account: the source_coverage WINDOWS proven by the same merge/containment model the
+  // scheduler classifier uses (windowsProve over [initialBackfill.start .. asOf]). Overlapping/adjacent windows
+  // merge; the CONTIGUOUS-from-start prefix end is the honest covered_to when the proof fails.
+  const oliStart = sourceRegistryEntry("order-line-items").initialBackfill.start;
+  const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
+  const coverageById = new Map();
+  for (const id of ids) {
+    const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId: id, sourceKey: "order-line-items" });
+    coverageById.set(id, cov && cov.read === "ok" ? (cov.windows || []) : null); // null = unreadable (fail closed)
+  }
+
+  // ASIN-Ads connection compatibility (the SAME zero-token pre-flight the ads runner uses: 3 attempts; a
+  // consistent miss = Amazon Ads not connected -> TYPED UNAVAILABLE, noted downstream, never a blocker;
+  // unreadable stays false so the ads checks fail closed).
+  const adsUnavailableById = new Map();
+  for (const id of ids) {
+    let outcome = null;
+    for (let attempt = 0; attempt < 3 && outcome === null; attempt += 1) {
+      try {
+        const names = await fetchCompatibleSourceNames(primaryConn.apiKey, id);
+        outcome = names.has(ASIN_ADS_SOURCE_NAME) ? "compatible" : "incompatible";
+      } catch (_e) { if (attempt < 2) await new Promise((r) => setTimeout(r, 2000)); }
+    }
+    adsUnavailableById.set(id, outcome === "incompatible");
+  }
+
   perAccount = ids.map((id) => {
     const o = oliMap.get(id);
     const ad = adsMap.get(id);
-    const oliCoveredTo = o ? o.covered_to : null;
+    const windows = coverageById.get(id);
+    let oliCoveredTo = null; let oliGapless = false;
+    if (Array.isArray(windows)) {
+      try {
+        const merged = mergeCoverageWindows(windows);
+        const fromStart = merged.find((w) => w.from <= oliStart);
+        oliCoveredTo = fromStart ? fromStart.to : null;
+        oliGapless = windowsProve(windows, oliStart, asOf) === true;
+      } catch { oliCoveredTo = null; oliGapless = false; } // malformed windows fail closed
+    }
     return {
       accountId: id,
       oliCoveredTo,
-      oliGapless: Boolean(o && o.covered_to >= asOf), // coverage reaches asOf (no trailing hole)
-      oliProvenanceOk: Boolean(o && Number(o.blank_prov) === 0),
+      oliGapless,
+      oliProvenanceOk: !o || Number(o.blank_prov) === 0, // rows that exist must carry hashes; zero rows = vacuous
       oliFailedOrOpen: false, // set below from the cycle
       adsWindowCovered: Boolean(ad && ad.cf && ad.ct && ad.cf <= adsFrom && ad.ct >= adsTo),
       adsFailed: adsFailedSet.has(id),
+      adsUnavailable: adsUnavailableById.get(id) === true,
     };
   });
 
@@ -94,6 +137,7 @@ const covAds = perAccount.filter((p) => p.adsWindowCovered).length;
 log("OLI ready (covered_to>=asOf + provenance): " + covOli + "/" + ids.length + " | ASIN-Ads window covered: " + covAds + "/" + ids.length + " | Non-US cycle present=" + cyclePresent + (cycleOliAssessment ? " oli-ok=" + cycleOliAssessment.ok : ""));
 
 const result = assessNonUsPrerequisites({ asOf, discoveredAccounts: nonus, perAccount, cyclePresent, cycleOliAssessment });
+for (const n of result.notes || []) log("note: " + n);
 if (!result.ok) {
   console.error("STOP NON_US_PREREQUISITES_INCOMPLETE (US must not create or open controls): " + result.problems.join(", "));
   process.exit(1);
