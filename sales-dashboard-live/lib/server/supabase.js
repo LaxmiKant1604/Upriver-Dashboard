@@ -1433,6 +1433,13 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
       offset: String(offset),
     });
     query.append("sale_date", `lte.${to}`);
+    // ENFORCE the rollup contract at the single read boundary: only a non-cancelled, present, strictly-POSITIVE
+    // order value is business Sales/Units. The dimensional RPC already writes only such rows, but LEGACY
+    // pre-dimensional backfill remnants (in windows the dimensional replacement could not take over) can carry
+    // sales_amount 0 -- present-zero promotional/replacement units OR NULL-coerced-to-0 -- whose units must NOT be
+    // counted (oli-order-rules policy). Excluding them here corrects Daily + Brand Sales + Brand View + scheduler
+    // uniformly; the present-zero/missing rows remain in source_oli_dimensional_history for audit.
+    query.append("sales_amount", "gt.0");
     if (Array.isArray(accountIds) && accountIds.length) {
       query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
     }
