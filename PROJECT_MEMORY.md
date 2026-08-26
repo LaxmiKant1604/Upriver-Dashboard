@@ -12410,3 +12410,25 @@ RAW BRAND-SALES REGRESSION CLOSED + MEMBERSHIP SCOPE RECONCILED (2026-08-26, cod
 - BLOCKER 3 (observe scheduler): controls safe-closed; 08-26 cycles terminal (succeeded) -> next fresh UTC cycle
   is 08-27 (02:00 non-us / 10:30 us). Dispatching/observing the actual GitHub Actions run needs gh credentials
   not available in this environment -- the effectivePublishAsOf fix (9670a86) makes the next US run derive 8x3.
+
+OLI "NO ORDER VALUE" WARNING -- PERMANENT FIX (2026-08-26, code 28f928d + 6f399c7, push pending):
+- ROOT CAUSE (split): (1) RAW evidence -- Amazon/DataDoe genuinely ships some non-cancelled units with a NULL
+  order value + some present-zero (promotional/replacement/free) units. (2) OUR legacy fold -- orderSalesByBrand
+  inferred unpriced_units from `sales===0 && units>0`, conflating cancelled + present-zero + genuine-NULL; App.jsx
+  warned on any unpriced_units>0; the brand-sales READ served stale snapshots verbatim.
+- PHASE 1 recon (read-only): the durable rollup source_oli_daily_history held 460 legacy present-zero rows (589
+  units, 19 accounts) -- pre-dimensional backfill remnants (child_asin='') in windows the dimensional replacement
+  refused (287 OLI_NON_CANCELLED_VALUE_MISSING failures); the RPC rollup itself correctly excludes value<=0. The
+  screenshot account 59f12ccc had 84 rows = 118 units = the "119" banner. So the 118 were legacy present-zero
+  audit rows wrongly flagged + counted, NOT a live DataDoe defect.
+- FIX: orderSalesByBrand (BOTH parity copies -- derivation-core.js + api/datadoe.js) drops the sales===0 inference:
+  a PRESENT value contributes sales and ONLY a strictly-positive value's units are Units Sold (present-zero => 0
+  sales + 0 units, no warning); a genuinely MISSING value is never coerced, never counted, surfaced ONLY as typed
+  missing_order_value_units. App.jsx warns on the typed field only (legacy unpriced_units reads 0 -> old banner
+  cannot resurface); Brand View propagation renamed (dormant). getSourceOliHistoryRows now filters sales_amount>0
+  so Daily+Brand+BrandView+scheduler uniformly exclude the legacy present-zero remnants (audit stays in the
+  dimensional table). Sales unchanged; Units Sold drops by exactly the non-contributing units.
+- Tests: oli-value-policy.test.js (9: cancelled/present-zero/missing/positive/mixed/isolation/legacy-payload/
+  screenshot-118/true-missing); updated report-derivation-core.test.js. verify 73/73 + build.
+- PENDING (this session): push + Vercel; republish daily+brand-sales+brand-view for all 30 (zero export) off the
+  filtered rollup; read-back parity; DataDoe escalation decision (genuine-NULL count after cleanup).
