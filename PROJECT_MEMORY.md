@@ -12509,3 +12509,63 @@ AMAZON ORDER ID CAPTURE -- FUTURE-ONLY ORDER-LEVEL AUDIT (2026-08-27, code 3b8f7
 - EFFECTIVE TRACKING START: migration applied + code 852ec68 deployed 2026-08-27. FIRST CAPTURE = the next scheduled
   OLI sync (Non-US 02:00 UTC / US 10:30 UTC via GitHub Actions), or a manual "Sync source". PENDING read-back after
   the first post-deploy sync: new order-audit rows carry Order IDs, old dimensional rows unchanged, tokens still 0.
+
+## Scheduler v2 -- INDEPENDENT per-bucket publish + honest bounded effectivePublishAsOf (2026-08-27, code e5c473e)
+
+Made the two buckets refresh/derive/validate/PUBLISH independently: Non-US publishes its 22 accounts at 02:00 UTC
+(visible ~08:00-09:00 IST) and US publishes its 8 at 10:30 UTC (visible ~16:30-17:30 IST). Neither waits for nor
+blocks the other; neither ever mutates the other bucket's snapshots. Publication stays all-or-nothing WITHIN a
+bucket (preflight every account before the first live write). Previously ONLY the US 10:30 run published, and it
+published ALL 30 accounts together after proving the same-asOf Non-US evidence.
+
+ROOT CAUSE of the failed Non-US run 33039807358 (requested asOf 2026-08-26), proven read-only from prod: the OLI
+source jobs SUCCEEDED (cycle c9e3d573: 5 batched exports / 5 creates / 22 owners across 22 accounts), but durable
+OLI coverage settled for only 5/22 accounts through 08-26 and 17/22 through 08-25 -- a normal 1-day trailing DataDoe
+settlement lag with ZERO interior gaps. The failure was in the standalone post-run proof
+(verify-scheduled-prerequisites.mjs / assessNonUsPrerequisites), which demanded per-account oliCoveredTo >= the
+EXACT requested asOf, so it fail-closed at "OLI ready 5/22". The runtime derive's own resolver
+(resolveEffectivePublishAsOf) already clamps honestly to the latest common gapless date -- the two readiness notions
+had diverged. (US shows the same shape: 6/8 through 08-24, common 08-24, a 2-day lag.)
+
+FIX -- one honest, BOUNDED policy for both:
+- `resolveEffectivePublishAsOf` (source-durable-model.js) now caps the trailing-settlement clamp at
+  `MAX_PUBLISH_TAIL_LAG_DAYS = 2`. Lag 0 -> status "exact"; lag 1-2 -> publish through the latest common gapless date
+  (status "UPSTREAM_TAIL_LAG"); interior/leading gap, malformed/unreadable coverage, or lag > 2 -> effectiveAsOf null
+  + a typed blocker (fail closed). Surfaces `tailLagDays` + `status`. The derive already consumes this, so the derive
+  itself now fails closed on a >2-day tail. Existing effective-asof.test.js B3 (5-day lag) updated to fail-closed +
+  new cap-boundary tests (lag 2 ok / lag 3 fail).
+- `assessBucketPublishReadiness` (source-scheduled-prerequisites.js): new bucket-agnostic honest readiness (reuses the
+  capped resolver). Ads coverage gaps + ads-disconnected accounts are NON-BLOCKING notes -- the OLI sales half still
+  publishes; the 5 Amazon-Ads-disconnected accounts stay typed unavailable. `assessNonUsPrerequisites` kept for its
+  existing tests but no longer used by the workflow. New CLI `verify-bucket-readiness.mjs --bucket --requested-as-of`
+  discovers exactly that bucket's accounts, computes effectivePublishAsOf, emits it to GITHUB_OUTPUT, and fails closed
+  BEFORE any control is opened. Prod read-back (2026-08-27): Non-US -> 08-25 (UPSTREAM_TAIL_LAG 1d, READY, 5 ads-
+  unavailable), US -> 08-24 (2d, READY).
+- `runPriorityDashboardsRelease` takes an optional single `bucket`: derive/finalize/publish EXACTLY that bucket's
+  accounts, preserving the other bucket byte-identically (legacy combined release kept when omitted).
+  `priority-dashboards-release.mjs --bucket --as-of=<effectivePublishAsOf>`.
+- Control apply bucket-scoped: `discoverPrimaryAccountIds(bucket)` (priority-control-pg-store.js) +
+  `priority-control-package.mjs --bucket`. The exact-set transaction reconciles the OTHER bucket's transient
+  rollout/approvals off (snapshots untouched). Safe-close stays the discovery-independent global close.
+- Shared org-wide Product Catalog: still ONE create/day reused across both buckets -- resolvedDurableCatalog is
+  from:null/to:null + one carrier seller identical for both buckets, so the request hash is bucket- AND asOf-
+  independent (the pre-existing combined release already proved cross-bucket sharing). Operation key = requestedAsOf
+  (calendar date) so both buckets share one date-scoped reservation even though their effective dates differ.
+- Brand View membership rebuild (rebuild-brand-membership.mjs) already reads ALL brand-sales snapshots, so it
+  combines the fresh bucket + the other bucket's LKG with no change.
+
+WORKFLOW (.github/workflows/scheduler-v2.yml): both buckets run the full independent pipeline -- cycle preflight ->
+token gate -> OLI -> ASIN Ads -> verify-bucket-readiness (compute effectivePublishAsOf) -> bucket-scoped control apply
+-> release (--bucket, --as-of=effectivePublishAsOf, --operation-key=.../scheduled/<requestedAsOf>) -> membership
+rebuild -> ALWAYS safe-close (BOTH buckets). The US-depends-on-Non-US step is GONE. Token ceilings (20 Non-US / 10 US),
+180-min timeout, `concurrency: scheduler-v2` (cancel-in-progress:false), secret guard, and the date-scoped operation
+key are unchanged. No pg_cron / Vercel cron; Campaign Ads + FBA structurally absent.
+
+TESTS: +18 mandatory bucket-independence regressions (scheduler-v2-bucket-independence.test.js) + updated
+effective-asof + scheduler-v2 workflow-shape (group D). `npm run verify` green: 76 steps / 56 suites incl. the
+production build. Order-ID capture (oli-order-rules.classifyOliDimensionalRow) and the shared manual OLI persistence
+path (manual-source-sync.mjs, same buildBucketSourceSyncRuntime + runSourceCardAction) are untouched.
+
+STATUS: code+tests e5c473e; docs separate. Push main + verify Vercel 200 next. Phase-10 production acceptance
+(dispatch the two workflow_dispatch runs, or run the bucket operators locally) is PENDING a run environment with
+GitHub/gh access -- no gh/token in this session; the readiness policy is already prod-validated read-only.
