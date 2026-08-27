@@ -12654,3 +12654,42 @@ UNSETTLED (unpriced) -- neither a code defect nor "raw lacks D-1".
 Tests: +11 superseding regressions + updated group G/D. npm run verify 78 steps / 58 suites incl. build. STATUS:
 code 9e1d282 + docs; migration applied; superseding model proven live; D-1 publish blocked ONLY by unsettled Amazon
 prices (external), which the next refresh resolves.
+
+## Scheduler v2 -- item_status state machine: expected D-1 itemization lag vs a real value defect (2026-08-27, code 6192c82)
+
+Answers the "false 17/22 not ready" challenge by PROVING the source semantics instead of asserting "settlement delay".
+
+PROOF (authoritative source metadata GET /exports/sources for OLI 89b27535d2 + raw per-order inspection):
+- item_price_value IS the correct + ONLY sales field. The source's 42 columns have NO total_sales; the other
+  monetary columns are tax/shipping/gift-wrap/COGS. So no wrong-field / alternate-field fix is needed.
+- The null price is GENUINE in the raw DataDoe response (not lost in our SUM/aggregation: ~1.03 rows/order, no grain
+  collapse). It is perfectly predicted by the per-line item_status: item_status present -> price present (44/44);
+  item_status null -> price null AND amazon_order_item_id null (411/411). On the D+1 run Amazon has itemized only
+  ~15% of D-1 orders (e.g. 13/90 for one seller); the rest are ORDER-LEVEL SHELLS (item_status / amazon_order_item_id
+  / item_price_value all null) that Amazon itemizes over ~1-2 days. So the D-1 gap is Amazon's ITEM-LEVEL detail
+  lagging order placement -- NOT a stale cycle, NOT our code, NOT a fabricatable value.
+
+FIX (item_status becomes the completion signal; migration-free -- classification input only, persisted grain stays
+byte-identical):
+- Contract: OLI_SALES_COLUMNS += item_status (auto group-by; CHANGES every OLI request_hash so a stale
+  pre-item_status export can't be adopted; forward-only). Kept in parity across api/datadoe.js + buy-box/ppc/returns
+  builders + the golden request-hash pins (timeout-slicing, oli-source-correction).
+- classifyOliDimensionalRow: a missing value no longer throws uniformly. non-cancelled units>0 + null value ->
+  item_status blank OR amazon_order_status Pending => PENDING (expected item-level lag; audited, contributes zero,
+  never fabricated); item_status present + not Pending => real DEFECT. Null is never coerced to 0.
+- oliDimensionalRowsFromFragment: per-account redacted itemization summary (resolved / pending [not-itemized +
+  pre-sale] / cancelled / zero / defect + itemized%); blocks OLI_ITEMIZED_VALUE_MISSING (defect, precedence) or
+  OLI_D1_PENDING_ITEMIZATION (honest wait, LKG preserved). A fully-resolved account persists + advances coverage even
+  with zero completed sales. Pending/defect rows never reach the RPC (no null non-cancelled value persisted).
+- oli-refresh-d1.mjs surfaces the PRECISE reason + itemization % (never "settlement delay"): "D-1 orders EXIST but
+  Amazon has itemized only ~X% so far (R itemized+priced vs P pending item-level sync [notItemized + preSale]);
+  honest wait, LKG retained, next refresh advances it".
+
+USER DECISION (asked, given the ~15%-on-D+1 reality): WAIT until substantially itemized -- do NOT publish a partial
+D-1 (which would show a low, growing number). D-1 stays honestly not-ready with a proven itemization % until Amazon
+finishes item-level sync; the LKG (last fully-itemized day) is shown; the next refresh advances D-1. Supersedes the
+"unpriced settlement" framing in [[d1-datadoe-has-it]] with the precise item-level mechanism.
+
+Tests: +14 oli-itemization regressions + updated oli-dimensional / oli-order-audit / oli-source-correction /
+timeout-slicing. npm run verify 79 steps / 59 suites (incl. build) green. Superseding-attempt model unchanged
+([[scheduler-v2-superseding-attempt]]).
