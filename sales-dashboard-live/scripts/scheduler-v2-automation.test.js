@@ -171,7 +171,7 @@ test("C3. rejects every violation: not-drained, non-OLI source, failed job, batc
   }
 });
 
-group("D. GitHub Actions workflow: automatic schedule paused + manual publish/safe-close shape");
+group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-close shape");
 
 test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UTC (us), bucket resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
@@ -191,32 +191,43 @@ test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UT
   assert.ok(tm && Number(tm[1]) >= 90, "timeout >= 90 minutes");
 });
 
-test("D2. workflow shape: exact ordered pipeline with per-run token ceilings, cycle preflight, US-depends-on-Non-US, token-gate skip conditionals, and always-safe-close", () => {
+test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceilings, cycle preflight, per-bucket readiness/effectivePublishAsOf, bucket-scoped controls+release, token-gate skip conditionals, and BOTH-bucket always-safe-close", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   const idx = (s) => yml.indexOf(s);
-  // per-run token ceiling (20 Non-US / 10 US) resolved + passed as --min.
+  // per-run token ceiling (20 Non-US / 10 US) resolved + passed as --min. NOT increased.
   assert.match(yml, /if \[ "\$bucket" = "non-us" \]; then tokenmin=20; else tokenmin=10; fi/, "per-run ceilings 20/10");
   assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\} --bucket=/, "token gate uses the per-run min");
-  // exact order: secrets -> resolve -> npm ci -> cycle preflight -> (US: prereq) -> token gate -> OLI -> ASIN Ads.
+  // exact order: secrets -> resolve -> npm ci -> cycle preflight -> token gate -> OLI -> ASIN Ads -> readiness ->
+  // control apply -> release -> membership rebuild.
   assert.ok(idx("Verify required secrets") < idx("Resolve bucket"), "secrets before resolve");
   assert.ok(idx("npm ci") < idx("scheduled-cycle-preflight.mjs"), "npm ci before cycle preflight");
   assert.ok(idx("scheduled-cycle-preflight.mjs") < idx("confirm-token-budget.mjs"), "cycle preflight before token gate");
-  assert.ok(idx("verify-scheduled-prerequisites.mjs") < idx("confirm-token-budget.mjs"), "US Non-US-completion proof before the token gate");
   assert.ok(idx("confirm-token-budget.mjs") < idx("scheduled-oli-refresh.mjs"), "token gate before OLI");
   assert.ok(idx("scheduled-oli-refresh.mjs") < idx("scheduled-asin-ads-refresh.mjs"), "OLI before ASIN Ads");
-  assert.ok(idx("scheduled-asin-ads-refresh.mjs") < idx("priority-control-package.mjs --apply"), "Ads before controls");
+  assert.ok(idx("scheduled-asin-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Ads before the readiness proof");
+  assert.ok(idx("verify-bucket-readiness.mjs") < idx("priority-control-package.mjs --apply"), "readiness/effectivePublishAsOf BEFORE opening controls");
   assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
   assert.ok(idx("priority-dashboards-release.mjs") < idx("rebuild-brand-membership.mjs"), "release before membership rebuild");
-  // every create/control step is gated on the token-gate proceed output (typed skip => no creates/controls).
-  for (const step of ["scheduled-oli-refresh.mjs", "scheduled-asin-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
-    const at = idx(step); const before = yml.slice(Math.max(0, at - 240), at);
+  // The US path NO LONGER depends on the same-day Non-US run -- the old prerequisite gate is gone entirely.
+  assert.doesNotMatch(yml, /verify-scheduled-prerequisites/, "US-depends-on-Non-US prerequisite gate removed");
+  // Controls + release are BUCKET-SCOPED (no cross-bucket publish): both carry --bucket=<the fired bucket>.
+  assert.match(yml, /priority-control-package\.mjs --apply --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/, "control apply is bucket-scoped");
+  assert.match(yml, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/, "release is bucket-scoped");
+  // Readiness has its own id and computes the honest effectivePublishAsOf, which the release consumes as --as-of.
+  assert.match(yml, /id:\s*readiness/, "readiness step exposes an id");
+  assert.match(yml, /verify-bucket-readiness\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness proves the bucket at the requestedAsOf");
+  assert.match(yml, /priority-dashboards-release\.mjs --bucket=[^\n]*--as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/, "release publishes at the HONEST effectivePublishAsOf, not the requestedAsOf");
+  // every create/control step (incl. readiness) is gated on the token-gate proceed output (typed skip => nothing).
+  for (const step of ["scheduled-oli-refresh.mjs", "scheduled-asin-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+    const at = idx(step); const before = yml.slice(Math.max(0, at - 260), at);
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
   assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
-  // safe-close ALWAYS on the US path (idempotent), even on failure.
-  assert.match(yml, /if:\s*always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS on US");
-  // date-scoped operation key; timeout >= the summed bounded deadlines.
-  assert.match(yml, /priority-dashboards-release\.mjs --as-of=[^\n]*--operation-key=priority-dashboards\/scheduled\//, "date-scoped operation key");
+  // safe-close ALWAYS for BOTH buckets (idempotent, discovery-independent), even on failure -- NOT US-only.
+  assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS for BOTH buckets");
+  assert.doesNotMatch(yml, /always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'/, "safe-close is no longer gated to the US bucket");
+  // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across both buckets on a date).
+  assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   assert.match(yml, /timeout-minutes:\s*(1[0-9][0-9]|[2-9][0-9])/, "job timeout covers OLI+Ads+publication");
   // Campaign Ads / FBA / unrelated reports structurally ABSENT: no run command invokes a campaign/fba/cron script.
   assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no run step invokes a Campaign Ads / FBA script");

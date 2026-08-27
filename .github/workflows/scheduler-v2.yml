@@ -1,35 +1,38 @@
 name: scheduler-v2
 
-# TRUSTED refresh workflow for Daily Reporting + Brand View (Scheduler v2) -- the ONLY automatic scheduler
+# TRUSTED refresh + publish workflow for Daily Reporting + Brand View (Scheduler v2) -- the ONLY automatic scheduler
 # (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap).
-# Cron is ACTIVE again: the OLI HTTP-400 limit rejection, the terminal-cycle collision class (durable-coverage
-# idempotence), the evidence-first US prerequisite, and the source-scoped preflight are corrected and tested.
-# Daily Reporting + Brand View only -- Campaign Ads, FBA and every unrelated report are structurally absent.
 #
-#   - non-us @ 02:00 UTC (07:30 IST): cycle preflight -> confirm >=20 tokens -> Non-US OLI -> Non-US ASIN Ads ->
-#     read-only post-run proof. NO publication.
-#   - us     @ 10:30 UTC (16:00 IST): prove the SAME-asOf Non-US run completed -> confirm >=10 tokens -> US OLI ->
-#     US ASIN Ads -> open controls -> Catalog + derive + preflight + publish all 30x3 -> rebuild Brand View
-#     membership -> live read-back -> ALWAYS safe-close controls.
+# The two buckets publish INDEPENDENTLY -- neither waits for nor blocks the other, and neither ever touches the
+# other's snapshots. Each run: cycle preflight -> token gate -> OLI refresh -> ASIN Ads refresh -> compute this
+# bucket's HONEST effectivePublishAsOf (bounded 2-day settlement tail; interior gap / lag>2 fail closed) -> open
+# controls for ONLY this bucket -> Catalog + derive + preflight + publish this bucket's accounts x3 + live read-back
+# -> rebuild Brand View membership (this bucket's fresh brand-sales + the other bucket's latest-known-good) -> ALWAYS
+# safe-close controls. Publication is all-or-nothing WITHIN a bucket (preflight every account before the first write).
+#
+#   - non-us @ 02:00 UTC (07:30 IST): publishes the 22 Non-US accounts; visible ~08:00-09:00 IST. Never touches US.
+#   - us     @ 10:30 UTC (16:00 IST): publishes the 8 US accounts; visible ~16:30-17:30 IST. Never touches Non-US,
+#     and does NOT require the same-day Non-US run to have completed.
 #
 # Insufficient tokens is a TYPED SAFE SKIP (SKIPPED_INSUFFICIENT_TOKENS): the token gate sets proceed=false, every
 # create/control step is skipped, and the run reports the skip -- no creates, no controls, LKG unchanged. An
 # UNREADABLE balance hard-fails. A same-date terminal cycle collision fails at the preflight before any token read.
+# A bucket that cannot publish honestly (interior OLI gap, blank provenance, tail lag > 2 days, unreadable coverage)
+# fails closed at the readiness proof BEFORE any control is opened -- the OTHER bucket's snapshots stay untouched.
 #
 # Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
   schedule:
-    # 02:00 UTC = 07:30 IST -> the Non-US source run; 10:30 UTC = 16:00 IST -> the US run (which also derives +
-    # publishes all 30 accounts after proving the same-asOf Non-US evidence). The bucket is resolved from WHICH
-    # cron fired (github.event.schedule) -- never guessed from the clock.
+    # 02:00 UTC = 07:30 IST -> the Non-US bucket publish; 10:30 UTC = 16:00 IST -> the US bucket publish. Each derives
+    # + publishes ONLY its own bucket's accounts. The bucket is resolved from WHICH cron fired -- never from the clock.
     - cron: "0 2 * * *"
     - cron: "30 10 * * *"
   workflow_dispatch:
     inputs:
       bucket:
-        description: "Bucket to run (us | non-us). us also derives + publishes all 30 accounts."
+        description: "Bucket to run + publish (us | non-us). Publishes ONLY that bucket's accounts."
         required: true
         default: "non-us"
 
@@ -73,7 +76,7 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve bucket + asOf (previous UTC date) + per-run token ceiling
+      - name: Resolve bucket + requestedAsOf (previous UTC date) + per-run token ceiling
         id: cfg
         run: |
           set -euo pipefail
@@ -93,58 +96,62 @@ jobs:
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
-          { echo "### scheduler-v2 run"; echo "- bucket: $bucket"; echo "- asOf: $asof"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
-          echo "Resolved bucket=$bucket asOf=$asof tokenmin=$tokenmin"
+          { echo "### scheduler-v2 run"; echo "- bucket: $bucket (publishes ONLY this bucket; the other bucket is untouched)"; echo "- requestedAsOf: $asof"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Resolved bucket=$bucket requestedAsOf=$asof tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
 
-      # (Non-US step 4) cycle-identity preflight: a same-date terminal collision fails EARLY, before any token read.
+      # (step 1) cycle-identity preflight: a same-date terminal collision fails EARLY, before any token read.
       - name: Cycle-identity preflight (this bucket)
         run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.bucket }}
 
-      # (US step 4) prove the SAME-asOf Non-US run completed BEFORE the US token gate / creates / controls.
-      - name: Prove same-asOf Non-US completion (us run only, before creates/controls)
-        if: steps.cfg.outputs.bucket == 'us'
-        run: node scripts/release/verify-scheduled-prerequisites.mjs --as-of=${{ steps.cfg.outputs.asof }}
-
-      # Token gate: exact per-run ceiling. Unreadable balance hard-fails; insufficient tokens is a typed safe skip
-      # (proceed=false) so every create/control step below is skipped.
+      # (step 2) Token gate: exact per-run ceiling. Unreadable balance hard-fails; insufficient tokens is a typed safe
+      # skip (proceed=false) so every create/control step below is skipped.
       - name: Confirm token budget (>=20 Non-US / >=10 US, before any create)
         id: tokengate
         run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.bucket }}
 
+      # (step 3) Refresh canonical OLI for THIS bucket only.
       - name: Refresh canonical OLI (this bucket only)
         if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-oli-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
+      # (step 4) Refresh ASIN Ads for THIS bucket only (coverage mode, 21-day rolling window).
       - name: Refresh ASIN Ads (this bucket only; coverage mode, 21-day rolling window)
         if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-asin-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
-      # (Non-US step 8) exact read-only post-run proof: the Non-US OLI + ASIN-Ads evidence is now complete.
-      - name: Non-US post-run proof (non-us run only; no publication)
-        if: steps.cfg.outputs.bucket == 'non-us' && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/verify-scheduled-prerequisites.mjs --as-of=${{ steps.cfg.outputs.asof }}
+      # (step 5) Bucket-specific evidence proof + HONEST effectivePublishAsOf (bounded 2-day settlement tail). Fails
+      # closed on interior gap / blank provenance / tail lag > 2 / unreadable coverage BEFORE any control is opened.
+      - name: Compute this bucket's effectivePublishAsOf (read-only readiness proof)
+        id: readiness
+        if: steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }}
 
-      # US publication: open controls -> release (Catalog + derive/preflight + publish + read-back) -> rebuild
-      # membership -> ALWAYS safe-close.
-      - name: Open publication controls (us run only)
-        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/priority-control-package.mjs --apply
+      # (step 7) Open publication controls for ONLY this bucket's accounts x 3 keys (all_primary stays false).
+      - name: Open publication controls (this bucket only)
+        if: steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.bucket }}
 
-      - name: Refresh Catalog + derive/preflight + publish all 30x3 + live read-back (us run only)
-        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/priority-dashboards-release.mjs --as-of=${{ steps.cfg.outputs.asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }}
+      # (steps 6/8/9/10) Catalog reuse/refresh (one create/day shared across buckets) + derive + preflight EVERY
+      # account in this bucket + publish this bucket x3 + live read-back. Publishes at the honest effectivePublishAsOf;
+      # the operation key is the requestedAsOf calendar date so BOTH buckets share one Catalog reservation.
+      - name: Refresh Catalog + derive/preflight/publish this bucket + live read-back
+        if: steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }}
 
-      - name: Rebuild + verify Brand View membership from the fresh brand-sales (us run only; Supabase-only)
-        if: steps.cfg.outputs.bucket == 'us' && steps.tokengate.outputs.proceed == 'true'
+      # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this bucket's fresh
+      # snapshots + the OTHER bucket's latest-known-good) -- Supabase-only, zero tokens.
+      - name: Rebuild + verify Brand View membership (this bucket's fresh + other bucket's LKG; Supabase-only)
+        if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
-      - name: Safe-close publication controls (ALWAYS, us run only, idempotent)
-        if: always() && steps.cfg.outputs.bucket == 'us'
+      # (step 12) Safe-close publication controls ALWAYS (both buckets), idempotent + discovery-independent.
+      - name: Safe-close publication controls (ALWAYS, idempotent)
+        if: always()
         run: node scripts/release/priority-control-package.mjs --rollback
 
       - name: Report insufficient-tokens skip
         if: always() && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
-        run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (bucket=${{ steps.cfg.outputs.bucket }} asOf=${{ steps.cfg.outputs.asof }})."
+        run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (bucket=${{ steps.cfg.outputs.bucket }} requestedAsOf=${{ steps.cfg.outputs.asof }})."

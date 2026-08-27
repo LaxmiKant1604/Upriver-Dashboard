@@ -23,9 +23,19 @@ const sb = await import("../../lib/server/supabase.js");
 
 // Optional --as-of=YYYY-MM-DD: pin the derive window's asOf to the last proven durable-OLI covered_to day when
 // the wall clock has drifted past it (NO new OLI fetch; the cycle date stays clock-today). Validated here too.
+// The SCHEDULER passes the bucket's honestly-proven effectivePublishAsOf here so the published snapshots carry
+// that exact coversAsOf; the derive independently re-clamps (belt + suspenders) and will agree.
 const asOfArg = (process.argv.find((a) => a.startsWith("--as-of=")) || "").split("=")[1] || null;
 if (asOfArg != null && !/^\d{4}-\d{2}-\d{2}$/.test(asOfArg)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOfArg + ")"); process.exit(2); }
 if (asOfArg) console.log("priority-release: asOf pinned to " + asOfArg + " (derive window; cycle date stays clock-today).");
+
+// Optional --bucket=us|non-us: publish EXACTLY that one bucket's accounts (Scheduler v2 independent buckets),
+// preserving the OTHER bucket's latest-known-good snapshots byte-identically. Omitted => the legacy combined
+// US+Non-US release (both buckets published together). The account scope is discovered + verified INTERNALLY by
+// the composition (deriveBucket/finalizeBucket) -- never accepted from this flag beyond the bucket name.
+const bucketArg = (process.argv.find((a) => a.startsWith("--bucket=")) || "").split("=")[1] || null;
+if (bucketArg != null && bucketArg !== "us" && bucketArg !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucketArg + ")"); process.exit(2); }
+if (bucketArg) console.log("priority-release: bucket scope = " + bucketArg + " ONLY (the other bucket's snapshots are preserved untouched).");
 // Optional --operation-key: the Catalog reservation key. Default = the historical v2 go-live key; an AUTOMATIC
 // scheduled run passes "priority-dashboards/scheduled/YYYY-MM-DD" so each date owns its one-Catalog-create
 // reservation. buildPriorityDashboardsRelease validates it STRICTLY (any other shape fails closed).
@@ -76,7 +86,8 @@ const readbackLive = buildLiveReadback({
 
 const result = await runPriorityDashboardsRelease({
   release, reconcile, readbackLive, assertNoCron,
+  ...(bucketArg ? { bucket: bucketArg } : {}),
   log: (m) => console.log("priority-release: " + m),
 });
-console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
+console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, bucket: bucketArg || "both", evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
 process.exit(result.code);

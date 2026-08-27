@@ -4,6 +4,8 @@
 // missing/short/gapped/unprovenanced/uncovered/failed account. The cycle-shape check is SECONDARY provenance:
 // with fully green durable evidence, a missing/non-scheduled-shape cycle (manual run, adopted export) is a note.
 
+import { resolveEffectivePublishAsOf, MAX_PUBLISH_TAIL_LAG_DAYS } from "./source-durable-model.js";
+
 const S = (v) => (v == null ? "" : String(v));
 
 /**
@@ -71,4 +73,86 @@ export function assessNonUsPrerequisites({ asOf, discoveredAccounts, perAccount,
   if (!durableComplete) problems.push(...cycleProblems);
 
   return { ok: problems.length === 0, problems: [...new Set(problems)], notes, accounts: discovered.length };
+}
+
+/**
+ * HONEST per-bucket publish readiness (Scheduler v2 independent buckets). Unlike assessNonUsPrerequisites (the
+ * legacy strict US-depends-on-Non-US gate that demanded coverage THROUGH the exact requested asOf), this proves a
+ * SINGLE bucket can publish honestly at its OWN effectivePublishAsOf:
+ *   - requestedAsOf   -- the date the scheduler tried to refresh (calendar "yesterday").
+ *   - effectivePublishAsOf = the latest COMMON gapless durable-OLI date across ONLY this bucket's discovered
+ *     accounts (resolveEffectivePublishAsOf), clamped back over at most `maxTailLagDays` (default 2) days of
+ *     trailing DataDoe settlement lag. A normal trailing tail publishes honestly through that date and reports
+ *     UPSTREAM_TAIL_LAG; an INTERIOR/LEADING historical hole, UNREADABLE coverage, BLANK provenance, or a tail lag
+ *     BEYOND the cap FAILS CLOSED (never a fabricated or silently very-old publish).
+ * Ads coverage is NEVER a blocker here (the derive publishes the OLI sales half regardless -- ads is blocksSales
+ * false; an ads-disconnected account is typed unavailable). Ads/cycle facts are surfaced as NOTES only.
+ *
+ * Inputs: { bucket, requestedAsOf, from (OLI fixed start), maxTailLagDays, discoveredAccounts:[{accountId}],
+ *   coverageByAccountId:{id: windows[]|null}, provenanceBlankByAccountId:{id:bool}, adsCoveredByAccountId,
+ *   adsFailedByAccountId, adsUnavailableByAccountId, cyclePresent, cycleOliAssessment }.
+ * Returns { ok, bucket, requestedAsOf, effectiveAsOf, tailLagDays, status, accounts, problems, notes }.
+ */
+export function assessBucketPublishReadiness({
+  bucket, requestedAsOf, from, maxTailLagDays = MAX_PUBLISH_TAIL_LAG_DAYS,
+  discoveredAccounts, coverageByAccountId = {}, provenanceBlankByAccountId = {},
+  adsCoveredByAccountId = {}, adsFailedByAccountId = {}, adsUnavailableByAccountId = {},
+  cyclePresent, cycleOliAssessment,
+} = {}) {
+  const problems = [];
+  const notes = [];
+  const fail = (p) => ({ ok: false, bucket, requestedAsOf, effectiveAsOf: null, tailLagDays: null, status: "blocked", accounts: 0, problems: [p], notes });
+  if (bucket !== "us" && bucket !== "non-us") return fail("bad-bucket:" + S(bucket));
+  const at = S(requestedAsOf);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(at)) return fail("bad-requested-asof:" + at);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(S(from))) return fail("bad-from:" + S(from));
+  const discovered = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a)).trim()).filter((s) => s && !s.includes(":")))].sort();
+  if (!discovered.length) return fail("no-discovered-accounts");
+
+  // Coverage windows per account: an UNREADABLE read (null) is a fail-closed problem AND is passed to the resolver
+  // as an empty window (so it also drives effectiveAsOf to null); blank provenance on existing rows fails closed.
+  const coverageForResolver = {};
+  for (const id of discovered) {
+    const cov = (coverageByAccountId || {})[id];
+    if (cov == null) { problems.push("oli-coverage-unreadable:" + id.slice(0, 8)); coverageForResolver[id] = []; }
+    else coverageForResolver[id] = cov;
+    if ((provenanceBlankByAccountId || {})[id] === true) problems.push("oli-provenance-blank:" + id.slice(0, 8));
+  }
+
+  // The HONEST effective publish as-of over ONLY this bucket's accounts (bounded 2-day settlement tail).
+  const eff = resolveEffectivePublishAsOf({ coverageByAccountId: coverageForResolver, accountIds: discovered, from: S(from), refreshAsOf: at, maxTailLagDays });
+  for (const b of eff.blockers || []) problems.push("oli-" + S(b.reason) + (b.accountId ? ":" + S(b.accountId).slice(0, 8) : ""));
+
+  // Ads is INFORMATIONAL only (never blocks the OLI sales publish). Surface unavailable / incomplete / failed as
+  // notes so the run summary is honest, but they never set ok=false.
+  const adsUnavailable = discovered.filter((id) => (adsUnavailableByAccountId || {})[id] === true);
+  const adsIncomplete = discovered.filter((id) => !(adsUnavailableByAccountId || {})[id] && (adsCoveredByAccountId || {})[id] !== true);
+  const adsFailed = discovered.filter((id) => !(adsUnavailableByAccountId || {})[id] && (adsFailedByAccountId || {})[id] === true);
+  if (adsUnavailable.length) notes.push("ads-unavailable-note:" + adsUnavailable.length + " (Amazon Ads not connected; typed unavailable, non-blocking; OLI sales still publish)");
+  if (adsIncomplete.length) notes.push("ads-incomplete-note:" + adsIncomplete.length + " (ASIN-Ads window not fully covered; non-blocking -- ads never blocks the sales half)");
+  if (adsFailed.length) notes.push("ads-failed-note:" + adsFailed.length + " (non-blocking)");
+
+  // The bucket's OWN scheduled OLI cycle is SECONDARY provenance: when the durable OLI evidence is complete, a
+  // missing / non-scheduled-shape cycle (a manual Data Sync Center OLI run, an adopted export) is a NOTE. When the
+  // durable evidence FAILED, the cycle problems are reported alongside (they help locate the gap).
+  const oliDurableComplete = problems.length === 0;
+  const cycleProblems = [];
+  if (cyclePresent !== true) cycleProblems.push("cycle-missing");
+  else if (!cycleOliAssessment || cycleOliAssessment.ok !== true) cycleProblems.push("cycle-oli-incomplete:" + (cycleOliAssessment ? [...new Set((cycleOliAssessment.problems || []).map((x) => String(x).split(":")[0]))].join(",") : "na"));
+  if (oliDurableComplete && cycleProblems.length) notes.push("cycle-shape-note:" + cycleProblems.join("|") + " (durable evidence complete; not blocking)");
+  if (!oliDurableComplete) problems.push(...cycleProblems);
+
+  const ok = problems.length === 0;
+  if (ok && eff.status === "UPSTREAM_TAIL_LAG") notes.push("UPSTREAM_TAIL_LAG: requested " + at + " but published through " + eff.effectiveAsOf + " (" + eff.tailLagDays + "d settlement tail; the next rolling refresh advances it once DataDoe settles).");
+  return {
+    ok,
+    bucket,
+    requestedAsOf: at,
+    effectiveAsOf: ok ? eff.effectiveAsOf : null,
+    tailLagDays: eff.tailLagDays,
+    status: ok ? eff.status : (eff.status === "TAIL_LAG_EXCEEDED" ? "TAIL_LAG_EXCEEDED" : "blocked"),
+    accounts: discovered.length,
+    problems: [...new Set(problems)],
+    notes,
+  };
 }

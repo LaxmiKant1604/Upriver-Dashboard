@@ -21,14 +21,19 @@ loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SU
 
 const MODE = process.argv.includes("--apply") ? "apply" : process.argv.includes("--rollback") ? "rollback" : "dry-run";
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
+// Optional --bucket=us|non-us: open controls for EXACTLY that bucket's primary accounts (Scheduler v2 independent
+// buckets). Omitted => ALL primary accounts (legacy combined). --rollback ignores it (the safe-close is global).
+const BUCKET = (process.argv.find((a) => a.startsWith("--bucket=")) || "").split("=")[1] || null;
+if (BUCKET != null && BUCKET !== "us" && BUCKET !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + BUCKET + ")"); process.exit(2); }
 
-console.log("CONTROL-PACKAGE mode=" + MODE + " operator=" + OPERATOR);
+console.log("CONTROL-PACKAGE mode=" + MODE + " operator=" + OPERATOR + (BUCKET ? " bucket=" + BUCKET : ""));
 console.log("  dispatch enabled: " + PRIORITY_DISPATCH_ENABLED.join(", ") + "; promoted enabled: " + PRIORITY_PROMOTED_ENABLED + "; all_primary=false; unrelated reports paused; no cron.");
 console.log("  --rollback is a DISCOVERY-INDEPENDENT SAFE-CLOSE: NO DataDoe call, disables EVERY rollout row, pauses ALL " + CONTROLLED_REPORT_KEYS.length + " controlled settings, disables EVERY promoted control, revokes EVERY approval (audited).");
 
 // Fresh PRIMARY discovery -- the exact account set the publisher's rollout resolves against. ONLY apply/dry-run
 // need it; --rollback never calls this (the safe-close is global and must work even if DataDoe is unavailable).
-const discoverAccounts = discoverPrimaryAccountIds;
+// When --bucket is set, discovery is restricted to that bucket so the apply opens controls for ONLY those accounts.
+const discoverAccounts = () => discoverPrimaryAccountIds(BUCKET);
 
 // The pg-backed store implementing the runControlPackageTransaction contract now lives VERBATIM in
 // lib/server/sync/priority-control-pg-store.js (shared with the manual source-sync operator -- one

@@ -68,7 +68,7 @@ function threeResultProblems(frozenKeys, envelope, accountId, okDispositions) {
  *   log(message)       -- optional progress line.
  */
 export async function runPriorityDashboardsRelease(deps = {}) {
-  const { release, reconcile, readbackLive, assertNoCron, log = () => {} } = deps;
+  const { release, reconcile, readbackLive, assertNoCron, log = () => {}, bucket = null } = deps;
   if (!release || typeof release.deriveBucket !== "function" || typeof release.finalizeBucket !== "function"
       || typeof release.preflightAccount !== "function" || typeof release.publishAccount !== "function") {
     throw new Error("runPriorityDashboardsRelease requires a release with deriveBucket/finalizeBucket/preflightAccount/publishAccount (fail closed).");
@@ -76,7 +76,16 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   for (const [name, fn] of [["reconcile", reconcile], ["readbackLive", readbackLive], ["assertNoCron", assertNoCron]]) {
     if (typeof fn !== "function") throw new Error(`runPriorityDashboardsRelease requires ${name} (fail closed).`);
   }
+  // INDEPENDENT per-bucket publish: when `bucket` is set, derive/finalize/publish EXACTLY that one bucket's
+  // accounts and preserve the other bucket's snapshots byte-identically (nothing outside this bucket's discovered
+  // scope is ever written). When `bucket` is null the runner publishes BOTH buckets together (the legacy combined
+  // release). A bad bucket fails closed BEFORE any read.
+  if (bucket != null && !PRIORITY_DASHBOARDS.buckets.includes(bucket)) {
+    throw new Error(`runPriorityDashboardsRelease bucket must be one of ${PRIORITY_DASHBOARDS.buckets.join("|")} (got "${S(bucket)}") (fail closed).`);
+  }
+  const targetBuckets = bucket ? [bucket] : [...PRIORITY_DASHBOARDS.buckets];
   const fail = (stage, problems) => ({ code: 1, ok: false, stage, problems: Array.isArray(problems) ? problems : [S(problems)] });
+  const effectiveByBucket = {};
 
   // (0) No scheduler cron may exist -- this runner never enables one.
   const cron0 = await assertNoCron();
@@ -87,12 +96,13 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   if (!rec || rec.ok !== true) return fail("reconcile", (rec && rec.problems) || "reconciliation mismatch");
   log("reconcile ok");
 
-  // (2) derive US then Non-US. A skipped/stopped derive is a hard stop.
-  for (const bucket of PRIORITY_DASHBOARDS.buckets) {
-    const { rollup } = await release.deriveBucket(bucket);
+  // (2) derive the target bucket(s). A skipped/stopped derive is a hard stop.
+  for (const b of targetBuckets) {
+    const { rollup } = await release.deriveBucket(b);
     if (!rollup || rollup.stopped === true || (rollup.derived && rollup.derived.skipped != null)) {
-      return fail("derive:" + bucket, "derive did not complete: " + S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))));
+      return fail("derive:" + b, "derive did not complete: " + S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))));
     }
+    if (rollup.derived && rollup.derived.effectivePublishAsOf) effectiveByBucket[b] = S(rollup.derived.effectivePublishAsOf);
     // A derive that GATED on readiness (daily/brandView ready=false) produces NO snapshots -> NO lineage -> a
     // clean-looking rollup (skipped=null, stopped=false) with saved=0 and lineageCount=0. `!stopped && skipped==null`
     // is therefore NOT proof that report jobs were produced. Require the derive to have genuinely produced a
@@ -116,10 +126,10 @@ export async function runPriorityDashboardsRelease(deps = {}) {
       if (ds <= 0 || bs <= 0 || is <= 0) problems.push("saved report jobs = 0 (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ")");
       else if (ds !== bs || bs !== is) problems.push("inconsistent per-account counts (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ") -- a missing or duplicate report job");
       if (lineageCount !== ds + bs + is) problems.push("lineage " + lineageCount + " != saved " + (ds + bs + is));
-      if (problems.length) return fail("derive:" + bucket, ["derive produced no validated report jobs for " + bucket + " (a ready=false/saved=0 derive is NOT 'derive ok'): " + problems.join("; ")]);
-      log("derive ok: " + bucket + " (" + ds + " x 3 = " + (ds * 3) + " report jobs, lineage " + lineageCount + ")");
+      if (problems.length) return fail("derive:" + b, ["derive produced no validated report jobs for " + b + " (a ready=false/saved=0 derive is NOT 'derive ok'): " + problems.join("; ")]);
+      log("derive ok: " + b + " (" + ds + " x 3 = " + (ds * 3) + " report jobs, lineage " + lineageCount + ", effectivePublishAsOf=" + S(d.effectivePublishAsOf) + (d.asOfClamped ? " CLAMPED from " + S(d.refreshAsOf) : "") + ")");
     } else {
-      log("derive ok: " + bucket + " (already-complete cycle; jobs pre-exist -- finalizer re-verifies the exact count)");
+      log("derive ok: " + b + " (already-complete cycle; jobs pre-exist -- finalizer re-verifies the exact count)");
     }
   }
 
@@ -128,13 +138,13 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const tokensSpent = reservation ? Number(reservation.tokensSpent) : 0;
   if (tokensSpent > PRIORITY_DASHBOARDS.maxTokens) return fail("token-ceiling", "reservation tokens_spent " + S(tokensSpent) + " > " + PRIORITY_DASHBOARDS.maxTokens);
 
-  // (3) finalize each exact priority cycle; collect the proven account scope.
+  // (3) finalize each targeted priority cycle; collect the proven account scope (this bucket's accounts only).
   const accounts = new Set();
-  for (const bucket of PRIORITY_DASHBOARDS.buckets) {
-    const fin = await release.finalizeBucket(bucket);
-    if (!fin || !OK_FINALIZE.has(S(fin.disposition))) return fail("finalize:" + bucket, "finalize refused: " + S(fin && (fin.reason || fin.disposition)));
+  for (const b of targetBuckets) {
+    const fin = await release.finalizeBucket(b);
+    if (!fin || !OK_FINALIZE.has(S(fin.disposition))) return fail("finalize:" + b, "finalize refused: " + S(fin && (fin.reason || fin.disposition)));
     for (const a of fin.accounts || []) accounts.add(S(a));
-    log("finalize ok: " + bucket + " (" + (fin.accounts ? fin.accounts.length : 0) + " accounts, " + S(fin.cycleStatus) + ")");
+    log("finalize ok: " + b + " (" + (fin.accounts ? fin.accounts.length : 0) + " accounts, " + S(fin.cycleStatus) + ")");
   }
   const accountList = [...accounts].sort();
   if (!accountList.length) return fail("scope", "no proven accounts to publish");
@@ -179,7 +189,7 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const cron1 = await assertNoCron();
   if (!cron1 || cron1.ok !== true) return fail("assert-no-cron-final", (cron1 && cron1.reason) || "cron appeared");
 
-  return { code: 0, ok: true, stage: "complete", evidence: { accounts: accountList.length, published: published.length, tokensSpent } };
+  return { code: 0, ok: true, stage: "complete", evidence: { bucket: bucket || "both", accounts: accountList.length, published: published.length, tokensSpent, effectivePublishAsOf: effectiveByBucket } };
 }
 
 /**

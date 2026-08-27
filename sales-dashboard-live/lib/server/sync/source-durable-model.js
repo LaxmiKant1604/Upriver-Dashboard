@@ -23,6 +23,19 @@ export const CATALOG_SOURCE_KEY = "product-catalog";
 export const FBA_INVENTORY_SOURCE_KEY = "fba-inventory-health";
 export const ORGANIZATION_SCOPE_KEY = "__organization";
 
+// The MAXIMUM trailing DataDoe settlement lag the publish may honestly clamp back over. A recent unsettled tail
+// on the newest one or two days is normal (DataDoe restates the last days), so the publish clamps back to the
+// latest COMMON gapless date. But a clamp of MORE than this many days behind the requested date is NOT a normal
+// settlement tail -- it is stale/stuck evidence, and it FAILS CLOSED (never a silently very-old publish). This is
+// the ONE tolerance; interior/leading historical holes always fail closed regardless of the lag.
+export const MAX_PUBLISH_TAIL_LAG_DAYS = 2;
+
+// Whole-day difference b - a for two YYYY-MM-DD strings (deterministic; UTC midnight anchored). Never negative
+// here because the caller only passes eff <= refreshAsOf.
+function inclusiveDayLag(a, b) {
+  return Math.round((Date.parse(b + "T00:00:00.000Z") - Date.parse(a + "T00:00:00.000Z")) / 86400000);
+}
+
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 // APPLICATION safety cap on a SINGLE OLI export's date range. This is NOT a documented DataDoe date-range limit
@@ -182,20 +195,27 @@ export function missingCoverageWindows(coverageWindows, from, to) {
  * blocked (interior/leading gap, malformed coverage, or an empty scope) effectiveAsOf is null and `blockers`
  * enumerates the sanitized reasons; the caller then fails closed (a null effective date leaves the readiness
  * window pinned at refreshAsOf, so windowsProve rejects the blocked account with coverage-incomplete).
- * Returns { effectiveAsOf, perAccount: {accountId: coveredTo|null}, blockers: [{accountId, reason}] }.
+ *
+ * BOUNDED trailing tolerance: the clamp may fall at most `maxTailLagDays` (default MAX_PUBLISH_TAIL_LAG_DAYS = 2)
+ * days behind refreshAsOf. A clamp of MORE than that is NOT a normal DataDoe settlement tail -- it is stale/stuck
+ * evidence -> effectiveAsOf is null with a `tail-lag-exceeded` blocker (fail closed; never a silently very-old
+ * publish). `status` is "exact" (lag 0), "UPSTREAM_TAIL_LAG" (0 < lag <= cap), or "TAIL_LAG_EXCEEDED"/blocked.
+ * Returns { effectiveAsOf, perAccount: {accountId: coveredTo|null}, blockers: [{accountId, reason}], tailLagDays,
+ * status }.
  */
-export function resolveEffectivePublishAsOf({ coverageByAccountId = {}, accountIds = [], from, refreshAsOf } = {}) {
+export function resolveEffectivePublishAsOf({ coverageByAccountId = {}, accountIds = [], from, refreshAsOf, maxTailLagDays = MAX_PUBLISH_TAIL_LAG_DAYS } = {}) {
   if (!isDateStr(from) || !isDateStr(refreshAsOf)) {
     throw new Error("resolveEffectivePublishAsOf requires from + refreshAsOf as YYYY-MM-DD dates (fail closed).");
   }
+  const cap = Number.isFinite(Number(maxTailLagDays)) && Number(maxTailLagDays) >= 0 ? Number(maxTailLagDays) : MAX_PUBLISH_TAIL_LAG_DAYS;
   // asOf BEFORE the fixed backfill start (from > refreshAsOf) is the SAME degenerate empty window the OLI planner
   // already honours (a not-yet-reached start), NOT a config error: there is nothing to clamp, so the effective
   // date is simply refreshAsOf and the downstream empty-window readiness (backfill-start-not-reached) takes over.
-  if (from > refreshAsOf) return { effectiveAsOf: refreshAsOf, perAccount: {}, blockers: [] };
+  if (from > refreshAsOf) return { effectiveAsOf: refreshAsOf, perAccount: {}, blockers: [], tailLagDays: 0, status: "exact" };
   const ids = [...new Set((accountIds || []).map((a) => String(a)).filter((s) => s && !s.includes(":")))].sort();
   const perAccount = {};
   const blockers = [];
-  if (!ids.length) return { effectiveAsOf: null, perAccount, blockers: [{ accountId: null, reason: "no-accounts" }] };
+  if (!ids.length) return { effectiveAsOf: null, perAccount, blockers: [{ accountId: null, reason: "no-accounts" }], tailLagDays: null, status: "blocked" };
   let eff = refreshAsOf;
   for (const id of ids) {
     let gaps;
@@ -212,8 +232,14 @@ export function resolveEffectivePublishAsOf({ coverageByAccountId = {}, accountI
     perAccount[id] = coveredTo;
     if (coveredTo < eff) eff = coveredTo;
   }
-  if (blockers.length) return { effectiveAsOf: null, perAccount, blockers };
-  return { effectiveAsOf: eff, perAccount, blockers: [] };
+  if (blockers.length) return { effectiveAsOf: null, perAccount, blockers, tailLagDays: null, status: "blocked" };
+  // BOUNDED tail: a clamp of more than `cap` days behind refreshAsOf is stale/stuck evidence, not a settlement
+  // tail -> fail closed. `addDaysStr(eff, cap) < refreshAsOf` is exactly "lag > cap" (string-safe, no Date math).
+  const tailLagDays = inclusiveDayLag(eff, refreshAsOf);
+  if (addDaysStr(eff, cap) < refreshAsOf) {
+    return { effectiveAsOf: null, perAccount, blockers: [{ accountId: null, reason: "tail-lag-exceeded" }], tailLagDays, status: "TAIL_LAG_EXCEEDED" };
+  }
+  return { effectiveAsOf: eff, perAccount, blockers: [], tailLagDays, status: tailLagDays === 0 ? "exact" : "UPSTREAM_TAIL_LAG" };
 }
 
 /**

@@ -57,13 +57,54 @@ test("B2. effectiveAsOf never exceeds refreshAsOf even when coverage runs past i
   assert.equal(r.effectiveAsOf, REFRESH, "clamped DOWN to refreshAsOf, never forward");
 });
 
-test("B3. NO zero-padding: the clamped date is a REAL proven date, not a fabricated forward fill", () => {
+test("B3. NO zero-padding: within the 2-day cap the clamped date is a REAL proven date, never invented forward", () => {
   const r = resolveEffectivePublishAsOf({
-    coverageByAccountId: { a: win(FROM, "2026-08-20"), b: win(FROM, "2026-08-25") },
+    coverageByAccountId: { a: win(FROM, "2026-08-23"), b: win(FROM, "2026-08-25") },
     accountIds: ["a", "b"], from: FROM, refreshAsOf: REFRESH,
   });
-  // min proven = 08-20 (account a); it is exactly a's covered_to, never invented past it.
-  assert.equal(r.effectiveAsOf, "2026-08-20");
+  // min proven = 08-23 (account a), lag 2 -- exactly the cap; it is a's covered_to, never invented past it.
+  assert.equal(r.effectiveAsOf, "2026-08-23");
+  assert.equal(r.status, "UPSTREAM_TAIL_LAG");
+  assert.equal(r.tailLagDays, 2);
+  assert.deepEqual(r.blockers, []);
+});
+
+/* ===== B'. the BOUNDED (<=2 day) settlement-lag cap ===== */
+
+test("B4. lag exactly 0 -> status 'exact', no clamp", () => {
+  const r = resolveEffectivePublishAsOf({ coverageByAccountId: { a: win(FROM, REFRESH) }, accountIds: ["a"], from: FROM, refreshAsOf: REFRESH });
+  assert.equal(r.effectiveAsOf, REFRESH);
+  assert.equal(r.status, "exact");
+  assert.equal(r.tailLagDays, 0);
+});
+
+test("B5. lag of 1 or 2 days publishes honestly (UPSTREAM_TAIL_LAG); lag of 3+ FAILS CLOSED (tail-lag-exceeded)", () => {
+  const at = (to) => resolveEffectivePublishAsOf({ coverageByAccountId: { a: win(FROM, to) }, accountIds: ["a"], from: FROM, refreshAsOf: REFRESH });
+  const lag1 = at("2026-08-24");
+  assert.equal(lag1.effectiveAsOf, "2026-08-24"); assert.equal(lag1.status, "UPSTREAM_TAIL_LAG"); assert.equal(lag1.tailLagDays, 1);
+  const lag2 = at("2026-08-23");
+  assert.equal(lag2.effectiveAsOf, "2026-08-23"); assert.equal(lag2.status, "UPSTREAM_TAIL_LAG"); assert.equal(lag2.tailLagDays, 2);
+  const lag3 = at("2026-08-22");
+  assert.equal(lag3.effectiveAsOf, null, "a 3-day lag is stale/stuck, not a settlement tail");
+  assert.equal(lag3.status, "TAIL_LAG_EXCEEDED");
+  assert.equal(lag3.tailLagDays, 3);
+  assert.ok(lag3.blockers.some((b) => b.reason === "tail-lag-exceeded"));
+});
+
+test("B6. the cap is honoured across the WHOLE scope: one very-stale account fails the whole bucket closed", () => {
+  const r = resolveEffectivePublishAsOf({
+    coverageByAccountId: { fresh: win(FROM, REFRESH), stale: win(FROM, "2026-08-10") }, // stale is 15 days behind
+    accountIds: ["fresh", "stale"], from: FROM, refreshAsOf: REFRESH,
+  });
+  assert.equal(r.effectiveAsOf, null);
+  assert.equal(r.status, "TAIL_LAG_EXCEEDED");
+  assert.ok(r.blockers.some((b) => b.reason === "tail-lag-exceeded"));
+});
+
+test("B7. an explicit maxTailLagDays override widens/narrows the tolerance", () => {
+  const cov = { a: win(FROM, "2026-08-20") }; // lag 5
+  assert.equal(resolveEffectivePublishAsOf({ coverageByAccountId: cov, accountIds: ["a"], from: FROM, refreshAsOf: REFRESH, maxTailLagDays: 5 }).effectiveAsOf, "2026-08-20", "cap 5 admits a 5-day lag");
+  assert.equal(resolveEffectivePublishAsOf({ coverageByAccountId: cov, accountIds: ["a"], from: FROM, refreshAsOf: REFRESH, maxTailLagDays: 4 }).effectiveAsOf, null, "cap 4 rejects a 5-day lag");
 });
 
 /* ===== C. interior + leading historical holes FAIL CLOSED (never clamp around them) ===== */
