@@ -12693,3 +12693,37 @@ finishes item-level sync; the LKG (last fully-itemized day) is shown; the next r
 Tests: +14 oli-itemization regressions + updated oli-dimensional / oli-order-audit / oli-source-correction /
 timeout-slicing. npm run verify 79 steps / 59 suites (incl. build) green. Superseding-attempt model unchanged
 ([[scheduler-v2-superseding-attempt]]).
+
+## Scheduler v2 -- PROVISIONAL/FINAL two-layer D-1: publish the real itemized D-1 now (2026-08-27, code 77d3d24)
+
+BUSINESS OVERRIDE (replaces "wait until substantially itemized" from [[scheduler-v2-item-status-itemization]]): DataDoe
+OLI is real-time, so whenever a run fetches the exact D-1 window the dashboard shows the REAL itemized D-1 data
+immediately -- labelled PROVISIONAL while some order shells are unitemized, promoted to FINAL when itemization
+completes -- never fabricating a missing value, never null->0, never hiding pending, preserving the finalized LKG.
+
+- SOURCE (migration-free reclassification): oliDimensionalRowsFromFragment no longer HOLDS a pending account. The
+  itemized window PUBLISHES (coverage advances to D-1); pending rows are excluded from the persisted sales grain and
+  counted only in a per-date completeness (oliDateCompleteness). Only a real DEFECT (itemized + null value,
+  OLI_ITEMIZED_VALUE_MISSING) still blocks that ONE account (LKG). OLI_D1_PENDING_ITEMIZATION is retired.
+- DURABLE two-layer store (migration 20260831 APPLIED): source_oli_completeness per (org,conn,account,sale_date) +
+  record_oli_completeness = provenance-checked CAS. LIVE-PROVEN invariants: inserted->updated(newer)->stale-ignored
+  (older refreshed_at)->promoted(final)->already-final (FINAL never regresses). Written by runBucketSourceSync
+  (recordCompleteness dep); source-defect recorded for escalation.
+- SERVE-time label (no snapshot rewrite): lib/server/reports/oli-completeness-serve.js summarises the latest date;
+  serveSharedReport + selfHealFromDurable attach `completeness` (status, itemized+pending order/unit counts,
+  itemization %, finalizedThrough, honest notice) LIVE from the table -> a provisional D-1 promotes to final the
+  instant the source updates. Daily (single account) + Brand View (portfolio aggregate) augments in api/datadoe.js.
+- FRONTEND: Daily Reporting (App.jsx) + Brand View (BrandView.jsx) show a Provisional D-1 / Final D-1 badge,
+  itemization %, pending order/unit counts, finalized-through date, and the notice "sales/ratio metrics may increase
+  automatically" -- never the provisional amount as a final zero.
+- SCHEDULER: oli-refresh-d1 + verify-bucket-readiness classify D1_PROVISIONAL / D1_FINAL / SOURCE_DEFECT; expected
+  pending itemization is a GREEN run that PUBLISHES now; a source-defect account is excluded from the D-1 gate so it
+  never blocks the others. oli-escalation-report.mjs = admin redacted DataDoe evidence.
+
+LIVE ACCEPTANCE (force-latest, both buckets): superseded prior terminal cycles; Non-US 5 creates/10 tokens -> all 22
+at D-1, 17 PROVISIONAL (10.2% itemized, 609 pending orders, 0 defects); US 2 creates/4 tokens -> all 8 at D-1, 6
+provisional + 1 final (1.9% itemized, 0 defects); both safe-closed. verify-bucket-readiness -> D1_PROVISIONAL,
+proceed=true, status exact through D-1. PROOF: account 126918 D-1 = real 6989 itemized sales (grows from Aug23-25
+fully-itemized ~45-51k) with 0 non-cancelled NULL rows persisted; serve augment -> Provisional D-1, 15.7% itemized,
+70 pending orders, finalized through Aug 25. Tests: verify 80 steps/60 suites (incl. build); +oli-completeness-serve,
+oli-itemization rewritten to provisional, CAS proven live. Deployed 1e9b600..77d3d24, Vercel 200.
