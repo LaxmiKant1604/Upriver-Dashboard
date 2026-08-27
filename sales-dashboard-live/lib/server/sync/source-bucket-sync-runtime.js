@@ -50,7 +50,7 @@ import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENT
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
-  replaceOliHistoryWindow, replaceOliDimensionalWindow, saveSourceSnapshotPayload, getSourceSnapshotPayload,
+  replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
   getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
@@ -757,6 +757,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         asOf: asOfStr, today: todayStr,
         store, dataDoe,
         replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,
+        recordCompleteness: recordOliCompleteness,
         cycleDate: cycleDate || todayStr, trigger: "manual",
         clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
         deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,

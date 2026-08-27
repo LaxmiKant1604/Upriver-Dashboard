@@ -1139,6 +1139,49 @@ export async function recordOliFreshnessExport(operationKey, requestHash, export
   return { disposition: "conflict", exportId: ack.export_id, tokensSpent: Number(ack.tokens_spent) || 0, status: ack.status };
 }
 
+// The provenance-checked CAS write of ONE (account, sale_date) completeness record (record_oli_completeness).
+// The RPC decides the disposition (inserted | updated | promoted | final-preserved | final-refreshed |
+// already-final | stale-ignored) and never regresses a FINAL nor clobbers newer evidence. Returns the disposition
+// + the resulting completeness_status; a malformed / unknown response fails closed.
+const OLI_COMPLETENESS_DISPOSITIONS = new Set(["inserted", "updated", "promoted", "final-preserved", "final-refreshed", "already-final", "stale-ignored"]);
+export async function recordOliCompleteness(rec, { signal = null } = {}) {
+  const r = rec || {};
+  const body = await request("/rest/v1/rpc/record_oli_completeness", {
+    method: "POST", signal, body: {
+      p_organization_fingerprint: r.organizationFingerprint, p_connection_id: r.connectionId, p_account_id: r.accountId,
+      p_bucket: r.bucket, p_sale_date: r.saleDate, p_status: r.status,
+      p_itemized_order_count: Math.trunc(Number(r.itemizedOrderCount) || 0), p_pending_order_count: Math.trunc(Number(r.pendingOrderCount) || 0),
+      p_itemized_unit_count: Number(r.itemizedUnitCount) || 0, p_pending_unit_count: Number(r.pendingUnitCount) || 0,
+      p_defect_count: Math.trunc(Number(r.defectCount) || 0), p_itemization_percent: Number(r.itemizationPercent) || 0,
+      p_requested_as_of: r.requestedAsOf || null, p_proven_export_through: r.provenExportThrough || null,
+      p_source_request_hashes: Array.isArray(r.sourceRequestHashes) ? r.sourceRequestHashes : [],
+      p_source_export_ids: Array.isArray(r.sourceExportIds) ? r.sourceExportIds : [],
+      p_refreshed_at: r.refreshedAt || new Date().toISOString(),
+    },
+  });
+  const ack = priorityOneAck(body, "oli-completeness record");
+  const d = ack.disposition;
+  if (!OLI_COMPLETENESS_DISPOSITIONS.has(d)) throw new Error(`oli-completeness record: unknown disposition "${d}"; failing closed.`);
+  return { disposition: d, completenessStatus: ack.completeness_status || null };
+}
+
+// Read completeness rows for a set of accounts over [from,to] (the report derivation + admin escalation read this).
+// SELECT-only; returns the rows verbatim (fail closed on a malformed response).
+export async function getOliCompleteness({ organizationFingerprint, connectionId, accountIds, from, to }, { signal = null } = {}) {
+  const ids = (Array.isArray(accountIds) ? accountIds : []).map((x) => String(x)).filter(Boolean);
+  if (!organizationFingerprint || !connectionId || ids.length === 0) return [];
+  const query = new URLSearchParams({
+    select: "account_id,bucket,sale_date,completeness_status,itemized_order_count,pending_order_count,itemized_unit_count,pending_unit_count,defect_count,itemization_percent,requested_as_of,proven_export_through,refreshed_at",
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`,
+    account_id: `in.(${ids.map((x) => `"${x.replace(/"/g, '""')}"`).join(",")})`,
+  });
+  if (from) query.set("sale_date", `gte.${from}`);
+  if (to) query.append("sale_date", `lte.${to}`);
+  const rows = await request(`/rest/v1/source_oli_completeness?${query}`, { signal });
+  if (!Array.isArray(rows)) throw new Error("oli-completeness read: malformed (non-array) response; failing closed.");
+  return rows;
+}
+
 export async function getOliFreshnessAttempt(operationKey, requestHash, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "operation_key,request_hash,export_id,tokens_spent,status,created_at,updated_at",

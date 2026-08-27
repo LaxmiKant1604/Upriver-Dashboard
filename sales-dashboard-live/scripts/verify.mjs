@@ -48,6 +48,7 @@ const SUITES = [
   "test:source-durable-model",
   "test:oli-dimensional",
   "test:oli-itemization",
+  "test:oli-completeness-serve",
   "test:oli-value-policy",
   "test:oli-quality",
   "test:oli-order-audit",

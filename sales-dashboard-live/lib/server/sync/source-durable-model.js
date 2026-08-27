@@ -418,6 +418,27 @@ export function oliItemizationDetail(summary) {
   };
 }
 
+// Per-date COMPLETENESS for the provisional/final two-layer model, from one date's tally (see the builder). An
+// order is FINAL-itemized when every one of its rows is itemized (priced); it is PENDING when it has >=1
+// not-yet-itemized row. completeness = FINAL when no non-cancelled order is pending, else PROVISIONAL. Cancelled
+// orders never count toward itemization. A date with no non-cancelled orders is trivially final (100%).
+export function oliDateCompleteness(ds) {
+  let itemizedOrders = 0, pendingOrders = 0;
+  for (const [, oe] of (ds && ds.orders instanceof Map ? ds.orders : new Map())) {
+    if (oe.pending > 0) pendingOrders += 1; else if (oe.itemized > 0) itemizedOrders += 1;
+  }
+  const totalOrders = itemizedOrders + pendingOrders;
+  const itemizationPercent = totalOrders > 0 ? Math.round((itemizedOrders / totalOrders) * 1000) / 10 : 100;
+  return {
+    completenessStatus: pendingOrders > 0 ? "provisional" : "final",
+    itemizedOrderCount: itemizedOrders,
+    pendingOrderCount: pendingOrders,
+    itemizedUnitCount: ds ? ds.itemizedUnits : 0,
+    pendingUnitCount: ds ? ds.pendingUnits : 0,
+    itemizationPercent,
+  };
+}
+
 export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint, connectionId, sourceRequestHash }) {
   if (!Array.isArray(rows)) throw new Error("oliDimensionalRowsFromFragment requires an array payload (fail closed).");
   if (!organizationFingerprint || !connectionId || !sourceRequestHash) {
@@ -455,6 +476,7 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
   const byAccount = new Map();
   const rollupByAccount = new Map();
   const orderAuditByAccount = new Map(); // ORDER-level audit (dimensional grain + amazon_order_id); folded OUT of byAccount
+  const completenessByAccount = new Map(); // per account -> { byDate: Map<date, dateCompleteness>, itemization }
   const blocked = [];
   for (const [accountId, entries] of rawByAccount) {
     let violated = null; // a hard order-rule violation (missing status) -> refuse the account immediately
@@ -474,16 +496,25 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
         }
         throw e; // a malformed (non-finite) row is a hard payload failure
       }
-      // Tally the itemization state (per account + per date) for the honest diagnostics and the block decision.
-      const ds = summary.byDate.get(date) || { resolved: 0, pending: 0 };
+      // Tally the itemization state (per account + per date) for the honest diagnostics, the COMPLETENESS metadata,
+      // and the defect block decision. Per-date we track distinct orders (itemized vs pending) + unit sums so the
+      // provisional/final report can show itemized-vs-pending counts + an itemization %.
+      const ds = summary.byDate.get(date) || { resolved: 0, pending: 0, itemizedUnits: 0, pendingUnits: 0, orders: new Map() };
       if (c.isCancelled) summary.cancelled += 1;
-      else if (c.pending) { summary.pending += 1; ds.pending += 1; if (c.pendingReason === "pre-sale-pending") summary.presale += 1; else summary.notItemized += 1; }
-      else if (c.defect) summary.defect += 1;
-      else if (c.valuePresent) { summary.resolved += 1; ds.resolved += 1; if (Number(c.value) === 0) summary.zero += 1; }
+      else if (c.pending) {
+        summary.pending += 1; ds.pending += 1; ds.pendingUnits += c.units;
+        if (c.pendingReason === "pre-sale-pending") summary.presale += 1; else summary.notItemized += 1;
+        const oid = c.orderId || ""; const oe = ds.orders.get(oid) || { itemized: 0, pending: 0 }; oe.pending += 1; ds.orders.set(oid, oe);
+      } else if (c.defect) summary.defect += 1;
+      else if (c.valuePresent) {
+        summary.resolved += 1; ds.resolved += 1; ds.itemizedUnits += c.units; if (Number(c.value) === 0) summary.zero += 1;
+        const oid = c.orderId || ""; const oe = ds.orders.get(oid) || { itemized: 0, pending: 0 }; oe.itemized += 1; ds.orders.set(oid, oe);
+      }
       summary.byDate.set(date, ds);
       // A PENDING (not-yet-itemized / pre-sale) or DEFECT (itemized-but-null) row carries a MISSING value: keep it
-      // out of the persisted dimensional/audit/rollup grains (never persist a null non-cancelled value) -- it is
-      // captured in the summary and the account is blocked below (LKG preserved). Cancelled + resolved rows persist.
+      // OUT of the persisted dimensional/audit/rollup grains (never persist a null non-cancelled value). PENDING rows
+      // are captured in the completeness metadata (the itemized window still PUBLISHES, labelled provisional); DEFECT
+      // rows block the account below (LKG preserved). Cancelled + itemized (value-present) rows persist normally.
       if (c.pending || c.defect) continue;
       const sku = String(row.sku ?? "");
       const childAsin = String(row.child_asin ?? "");
@@ -540,17 +571,20 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
       }
     }
     if (violated) { blocked.push(violated); continue; }
-    // A real DEFECT (an itemized recognized-sale with a genuinely null value) takes precedence: block the account
-    // and flag it as a source-data problem to investigate. Otherwise, if any row is PENDING (not-yet-itemized /
-    // pre-sale), HOLD the account window (honest wait until Amazon finishes item-level sync) with a precise,
-    // transient reason + the itemization %. Only a fully-resolved account (no pending, no defect) persists.
+    // A real DEFECT (an itemized recognized-sale with a genuinely null value) takes precedence: BLOCK the account
+    // (LKG preserved) + flag a source-data problem to escalate. PENDING (not-yet-itemized / pre-sale) NO LONGER
+    // blocks -- the itemized window PUBLISHES immediately and is labelled PROVISIONAL via the per-date completeness
+    // (a date with pending orders is provisional; a fully-itemized date is final). A missing value is never
+    // fabricated: pending rows are excluded from the persisted sales grain and counted only in the completeness.
     if (summary.defect > 0) { blocked.push({ accountId, code: "OLI_ITEMIZED_VALUE_MISSING", detail: oliItemizationDetail(summary) }); continue; }
-    if (summary.pending > 0) { blocked.push({ accountId, code: "OLI_D1_PENDING_ITEMIZATION", detail: oliItemizationDetail(summary) }); continue; }
     byAccount.set(accountId, [...byGrain.values()]);
     rollupByAccount.set(accountId, [...rollupByGrain.values()]);
     orderAuditByAccount.set(accountId, [...orderAuditByGrain.values()]);
+    const byDate = new Map();
+    for (const [d, ds] of summary.byDate) byDate.set(d, oliDateCompleteness(ds));
+    completenessByAccount.set(accountId, { byDate, itemization: oliItemizationDetail(summary) });
   }
-  return { byAccount, rollupByAccount, orderAuditByAccount, blocked };
+  return { byAccount, rollupByAccount, orderAuditByAccount, blocked, completenessByAccount };
 }
 
 /**

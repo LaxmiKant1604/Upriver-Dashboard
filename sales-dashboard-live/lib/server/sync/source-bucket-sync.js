@@ -366,7 +366,7 @@ export async function runBucketSourceSync({
   coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
   pausedSources = new Set(), asOf, today,
   store, dataDoe,
-  replaceHistoryWindow = null, persistSnapshot = null, updateRunStatus = null,
+  replaceHistoryWindow = null, persistSnapshot = null, updateRunStatus = null, recordCompleteness = null,
   cycleDate, scheduledAt = null, trigger = "manual",
   clock = () => Date.now(), wait = null, cooldownMs = 60_000,
   // Finding 3: the serverless execution budget. deadlineMs/reserveMs thread into every runSourceJobs pass
@@ -538,14 +538,32 @@ export async function runBucketSourceSync({
         // and a missing-status row is refused (OLI_ORDER_STATUS_MISSING). A blocked account's window is never written,
         // its coverage never advanced, LKG preserved, and it is reported with a redacted itemization summary. The
         // builder returns the dimensional rows + the non-cancelled daily rollup for each fully-resolved account.
-        const { byAccount, rollupByAccount, orderAuditByAccount, blocked } = oliDimensionalRowsFromFragment({
+        const { byAccount, rollupByAccount, orderAuditByAccount, blocked, completenessByAccount } = oliDimensionalRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
         });
         if (blocked.length) {
           rollup.blockedAccounts = rollup.blockedAccounts || [];
-          for (const b of blocked) rollup.blockedAccounts.push({ ...b, coveredFrom: unit.slice.from, coveredTo: unit.slice.to, family: OLI_SOURCE_KEY });
+          for (const b of blocked) {
+            rollup.blockedAccounts.push({ ...b, coveredFrom: unit.slice.from, coveredTo: unit.slice.to, family: OLI_SOURCE_KEY });
+            // A real DEFECT (itemized recognized-sale with a null value) keeps the account's LKG but records a
+            // 'source-defect' completeness row for the requested date so the admin escalation surfaces it.
+            if (recordCompleteness && b.code === "OLI_ITEMIZED_VALUE_MISSING") {
+              try {
+                await recordCompleteness({
+                  organizationFingerprint: family.plannedJobs[0].organizationFingerprint, connectionId: "primary",
+                  accountId: b.accountId, bucket, saleDate: unit.slice.to, status: "source-defect",
+                  itemizedOrderCount: (b.detail && b.detail.resolved) || 0, pendingOrderCount: (b.detail && b.detail.pending) || 0,
+                  itemizedUnitCount: 0, pendingUnitCount: 0, defectCount: (b.detail && b.detail.defect) || 1,
+                  itemizationPercent: (b.detail && b.detail.itemizedPct) || 0,
+                  requestedAsOf: unit.slice.to, provenExportThrough: unit.slice.to,
+                  sourceRequestHashes: [unit.requestHash], sourceExportIds: [],
+                  refreshedAt: nowIso(),
+                });
+              } catch (e) { (rollup.completenessErrors = rollup.completenessErrors || []).push({ accountId: b.accountId, saleDate: unit.slice.to, error: String(e && e.message ? e.message : e) }); }
+            }
+          }
         }
         const blockedSet = new Set(blocked.map((b) => b.accountId));
         for (const a of unit.accounts) {
@@ -576,6 +594,30 @@ export async function runBucketSourceSync({
           }
           rollup.history.rowsPersisted += dimRows.length;
           coveredAccounts.add(a.accountId);
+          // Two-layer COMPLETENESS: record each date's provisional/final state for this covered account (the itemized
+          // window is now PUBLISHED; a date with pending orders is provisional). Provenance-checked CAS -- final never
+          // regresses, a stale export never clobbers newer. Non-fatal: the sales already persisted; the next run
+          // re-records idempotently.
+          const comp = completenessByAccount && completenessByAccount.get(a.accountId);
+          if (recordCompleteness && comp && comp.byDate) {
+            for (const [saleDate, dc] of comp.byDate) {
+              try {
+                const res = await recordCompleteness({
+                  organizationFingerprint: family.plannedJobs[0].organizationFingerprint, connectionId: "primary",
+                  accountId: a.accountId, bucket, saleDate, status: dc.completenessStatus,
+                  itemizedOrderCount: dc.itemizedOrderCount, pendingOrderCount: dc.pendingOrderCount,
+                  itemizedUnitCount: dc.itemizedUnitCount, pendingUnitCount: dc.pendingUnitCount,
+                  defectCount: 0, itemizationPercent: dc.itemizationPercent,
+                  requestedAsOf: unit.slice.to, provenExportThrough: unit.slice.to,
+                  sourceRequestHashes: [unit.requestHash], sourceExportIds: row.export_id ? [String(row.export_id)] : [],
+                  refreshedAt: nowIso(),
+                });
+                (rollup.completeness = rollup.completeness || []).push({ accountId: a.accountId, saleDate, status: dc.completenessStatus, itemizationPercent: dc.itemizationPercent, disposition: res && res.disposition });
+              } catch (e) {
+                (rollup.completenessErrors = rollup.completenessErrors || []).push({ accountId: a.accountId, saleDate, error: String(e && e.message ? e.message : e) });
+              }
+            }
+          }
         }
         if (rollup.stopped || rollup.deadlineReached) break;
       }

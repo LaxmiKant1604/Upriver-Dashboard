@@ -194,11 +194,12 @@ async function main() {
     assert.match(wk, /forceFreshOli && job\.sourceKey === "order-line-items"/, "cache-adoption skip gated to OLI only");
   });
 
-  test("12./13. the readiness CLI writes a D-1 SUCCESS vs DATADOE_D1_NOT_READY summary; safe-close is always()", () => {
+  test("12./13. the readiness CLI writes D1_PROVISIONAL / D1_FINAL vs DATADOE_D1_NOT_READY summaries; safe-close is always()", () => {
     const cli = readFileSync(resolve(RELEASE_DIR, "verify-bucket-readiness.mjs"), "utf8");
-    assert.match(cli, /D-1 SUCCESS/, "a D-1 success summary");
-    assert.match(cli, /DATADOE_D1_NOT_READY/, "a distinct lagged-LKG summary");
-    assert.match(cli, /requireD1:\s*true/, "the CLI is strict D-1");
+    assert.match(cli, /D1_PROVISIONAL/, "a provisional D-1 success summary (published, not held)");
+    assert.match(cli, /D1_FINAL/, "a fully-itemized D-1 success summary");
+    assert.match(cli, /DATADOE_D1_NOT_READY/, "a distinct lagged/gapped-LKG summary still exists for interior gaps");
+    assert.match(cli, /requireD1:\s*true/, "the CLI still gates the NON-defect accounts strictly on the D-1 window");
     assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS");
   });
 

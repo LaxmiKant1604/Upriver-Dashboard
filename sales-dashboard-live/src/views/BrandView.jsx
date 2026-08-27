@@ -53,6 +53,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
   const [notice, setNotice] = useState(null);
   const [savedAt, setSavedAt] = useState(null);
   const [staleScope, setStaleScope] = useState(null);
+  const [completeness, setCompleteness] = useState(null); // two-layer provisional/final D-1 (portfolio aggregate)
   // A rebuild is due (the account's brand-sales advanced past this assembly, or no snapshot exists yet). The
   // page shows the last-known-good and auto-converges by triggering the bounded zero-export rebuild.
   const [updating, setUpdating] = useState(false);
@@ -144,12 +145,14 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
       setNotice(body.message);
       setSavedAt(null);
       setStaleScope(null);
+      setCompleteness(null);
       return;
     }
     setData(body);
     setNotice(null);
     setSavedAt(body.snapshot?.savedAt ? new Date(body.snapshot.savedAt) : (cachedAt ? new Date(cachedAt) : null));
     setStaleScope(body.snapshot?.staleScope ? body.snapshot.savedForParams || {} : null);
+    setCompleteness(body.completeness || null);
   }, []);
 
   useEffect(() => {
@@ -346,6 +349,17 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           <span className="plan-fresh-sep">·</span>
           <span>{freshnessSummaryLine(model)}</span>
           {converted && <><span className="plan-fresh-sep">·</span><span>{fxSummaryLine(fx, converted)}</span></>}
+          {completeness && (
+            <>
+              <span className="plan-fresh-sep">·</span>
+              <span style={{ padding: "0 8px", borderRadius: 10, fontSize: 11, fontWeight: 700,
+                background: completeness.provisional ? "rgba(210,140,0,0.14)" : (completeness.sourceDefect ? "rgba(200,50,50,0.14)" : "rgba(30,150,80,0.14)"),
+                color: completeness.provisional ? "#a86a00" : (completeness.sourceDefect ? "#b32424" : "#1a7f45") }}>
+                {completeness.provisional ? "Provisional D-1" : (completeness.sourceDefect ? "Source issue" : "Final D-1")}
+              </span>
+              {completeness.provisional && <span>{completeness.itemizationPercent}% itemized · {completeness.pendingOrderCount} orders pending</span>}
+            </>
+          )}
         </div>
       )}
 
@@ -364,6 +378,15 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           title="Updating to the newest saved data…"
           detail="The figures below are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and will refresh here automatically."
         />
+      )}
+      {/* Two-layer PROVISIONAL/FINAL D-1: real itemized brand sales are shown, honestly labelled while some order
+          shells are not yet itemized. Sales may increase automatically -- never a fabricated value. */}
+      {completeness && completeness.provisional && (
+        <DataQualityAlert tone="info" title={`Provisional D-1 — ${completeness.itemizationPercent}% of orders itemized`}
+          detail={`${completeness.notice} (${completeness.accountsProvisional} account(s) still itemizing; ${completeness.pendingOrderCount} order(s), ${completeness.pendingUnitCount} unit(s) pending item-level prices.)`} />
+      )}
+      {completeness && completeness.sourceDefect && (
+        <DataQualityAlert tone="error" title="Source-data issue for one or more accounts" detail={completeness.notice} />
       )}
 
       {!accountId ? (

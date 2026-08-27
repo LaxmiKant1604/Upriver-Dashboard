@@ -110,15 +110,16 @@ test("8. a positive-value order still contributes its exact sales/units to the r
 });
 
 // ---- 9. NULL price on a non-cancelled positive-unit row: fail-closed (LKG), NO audit written ----------------
-test("9. a non-cancelled units>0 row with a MISSING value HOLDS/BLOCKS the account (LKG) -- no audit row emitted", () => {
-  // not-yet-itemized (item_status blank) -> honest PENDING hold
-  const held = build([frag({ amazon_order_status: "Shipped", item_status: "", amazon_order_id: "NUL-1", total_sales_sum: null, total_units_sum: 2 })]);
-  assert.ok(held.blocked.some((b) => b.accountId === "ACC-1" && b.code === "OLI_D1_PENDING_ITEMIZATION"));
-  assert.equal(held.orderAuditByAccount.has("ACC-1"), false, "a held account writes NO audit rows (LKG preserved)");
-  // itemized recognized-sale with a null value -> real defect block
+test("9. a not-yet-itemized MISSING value PUBLISHES provisional (no fabricated audit row); an ITEMIZED null value is a defect (LKG)", () => {
+  // not-yet-itemized (item_status blank) -> published PROVISIONAL; the null-value row is NOT persisted as audit
+  const prov = build([frag({ amazon_order_status: "Shipped", item_status: "", amazon_order_id: "NUL-1", total_sales_sum: null, total_units_sum: 2 })]);
+  assert.equal(prov.blocked.length, 0, "pending never blocks");
+  assert.equal((prov.orderAuditByAccount.get("ACC-1") || []).length, 0, "a null-value pending row is never persisted (never fabricated)");
+  assert.equal(prov.completenessByAccount.get("ACC-1").byDate.get("2026-08-27").completenessStatus, "provisional");
+  // itemized recognized-sale with a null value -> real defect block, LKG preserved
   const def = build([frag({ amazon_order_status: "Shipped", item_status: "Shipped", amazon_order_id: "NUL-2", total_sales_sum: null, total_units_sum: 2 })]);
   assert.ok(def.blocked.some((b) => b.accountId === "ACC-1" && b.code === "OLI_ITEMIZED_VALUE_MISSING"));
-  assert.equal(def.orderAuditByAccount.has("ACC-1"), false, "a blocked account writes NO audit rows (LKG preserved)");
+  assert.equal(def.orderAuditByAccount.has("ACC-1"), false, "a defect account writes NO audit rows (LKG preserved)");
 });
 
 // ---- 10. blank Order ID: never invented, typed unavailable -------------------------------------------------

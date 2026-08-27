@@ -194,6 +194,11 @@ export async function serveSharedReport({
   // rebuild happens only on an explicit refresh (below). Default false keeps the inline self-heal for every
   // other report.
   deferRebuildOnRead = false,
+  // Optional serve-time augmentation (Daily Reporting + Brand View): async ({ accountId, params, payload }) =>
+  // extra response fields merged into a PAYLOAD-serving response only. Used to attach the current two-layer
+  // `completeness` (provisional/final + itemization) read live from source_oli_completeness -- always fresh, never
+  // stored in the snapshot, never on a snapshotMissing/updating-only response. Default null = never added.
+  augmentResponse = null,
   // When set (a makeRouteDeadline handle), the REFRESH build is bounded: on ROUTE_DEADLINE_EXCEEDED the caller
   // serves the last-known-good + `updating:true` (HTTP 200), never a 504. Default null = unbounded (unchanged).
   routeDeadline = null,
@@ -233,10 +238,12 @@ export async function serveSharedReport({
       // The EXACT snapshot exists. If the contributing sources have advanced past it (e.g. brand-sales rolled
       // 21 -> 25 Aug under the same asOf), serve it NOW but flag `updating` so a zero-export rebuild is triggered.
       const updating = isSourceStale(snapshot);
+      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: snapshot.payload }) : {};
       res.status(200).json({
         ...present(snapshot.payload),
         reportKey, reportVersion, paramsHash,
         ...(updating ? { updating: true } : {}),
+        ...(extra && typeof extra === "object" ? extra : {}),
         snapshot: snapshotMeta(snapshot),
       });
       return;
@@ -260,10 +267,12 @@ export async function serveSharedReport({
       // scope; when a rebuild is deferred (Brand View portfolio) OR the sources advanced past it, flag updating
       // so the caller shows this LKG NOW and polls until the rebuild republishes the exact-identity snapshot.
       const updating = deferRebuildOnRead || isSourceStale(latest);
+      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: latest.payload }) : {};
       res.status(200).json({
         ...present(latest.payload),
         reportKey, reportVersion, paramsHash,
         ...(updating ? { updating: true } : {}),
+        ...(extra && typeof extra === "object" ? extra : {}),
         snapshot: {
           ...snapshotMeta(latest),
           staleScope: true,
@@ -291,7 +300,7 @@ export async function serveSharedReport({
     // so a normal page visit auto-populates instead of showing "Nothing saved" while durable evidence is present.
     if (deriveDurable) {
       const healed = await selfHealFromDurable({
-        deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds,
+        deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse,
       }, store);
       if (healed.served) return;
       if (healed.notReady) {
@@ -438,19 +447,23 @@ async function persistDerivedSnapshot({ reportKey, reportVersion, accountId, par
  * concurrent derivation is in flight but not yet saved -> caller shows the honest "not saved yet" state).
  * `store` is injectable so the concurrency + zero-export contract is provable offline.
  */
-export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds }, store = DEFAULT_STORE) {
+export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds, augmentResponse = null }, store = DEFAULT_STORE) {
+  // Two-layer completeness for the self-heal serve (first visit before a scheduled publish). Advisory; the augment
+  // returns {} on any failure, so it never breaks the self-heal.
+  const augExtra = augmentResponse ? await augmentResponse({ accountId, params }) : {};
+  const withAug = (extra) => ({ ...extra, ...(augExtra && typeof augExtra === "object" ? augExtra : {}) });
   const locked = await store.claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds });
   if (!locked) {
     // Another request already holds the lock and is re-deriving this exact snapshot. Never derive twice; re-read
     // once and serve it if it has already landed, otherwise report missing for this read.
     const snap = await store.getReportSnapshot({ reportKey, accountId, paramsHash });
-    if (snap && snap.payload) { serveSnapshotJson(res, snap, { reportKey, reportVersion, paramsHash, present, extra: { rederived: true } }); return { served: true }; }
+    if (snap && snap.payload) { serveSnapshotJson(res, snap, { reportKey, reportVersion, paramsHash, present, extra: withAug({ rederived: true }) }); return { served: true }; }
     return { served: false };
   }
   try {
     // Double-check inside the lock: the race winner may have just published it.
     const existing = await store.getReportSnapshot({ reportKey, accountId, paramsHash });
-    if (existing && existing.payload) { serveSnapshotJson(res, existing, { reportKey, reportVersion, paramsHash, present, extra: { rederived: true } }); return { served: true }; }
+    if (existing && existing.payload) { serveSnapshotJson(res, existing, { reportKey, reportVersion, paramsHash, present, extra: withAug({ rederived: true }) }); return { served: true }; }
 
     // A re-derivation FAILURE (e.g. an unreadable durable source or a row-limit) must degrade to the honest
     // "waiting" state on a READ -- never a 500 and never a fabricated value.
@@ -477,6 +490,7 @@ export async function selfHealFromDurable({ deriveDurable, reportKey, reportVers
     res.status(200).json({
       ...present(derived.payload),
       reportKey, reportVersion, paramsHash: effectiveHash,
+      ...(augExtra && typeof augExtra === "object" ? augExtra : {}),
       snapshot: {
         savedAt: saved.savedAt, updatedAt: saved.updatedAt, bytes: saved.payload_bytes, shared: true, rederived: true,
         ...(clamped ? { staleScope: true, savedForParams: { reportVersion, ...effectiveParams }, requestedParams: { reportVersion, ...params } } : {}),

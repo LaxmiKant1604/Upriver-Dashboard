@@ -44,6 +44,7 @@ import {
   getExplicitZeroOliUnits,
   getExplicitZeroOliOrderAudit,
   getAccountOliQualityCounts,
+  getOliCompleteness,
   insertReportSnapshotIfAbsent,
   isSafeSnapshotRev,
   isSupabaseConfigured,
@@ -92,6 +93,7 @@ import {
   isManualSourceContinuationError,
 } from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import { makeCompletenessAugment, makePortfolioCompletenessAugment } from "../lib/server/reports/oli-completeness-serve.js";
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
@@ -2396,6 +2398,8 @@ async function handleDataDoe(req, res) {
         return;
       }
       const accountIds = [...new Set(publicAccountIds.map(String))].sort();
+      const bpPrimary = getDataDoeConnections().find((cn) => cn && cn.id === "primary" && String(cn.apiKey || "").trim());
+      const bpOrgFp = bpPrimary ? (bpPrimary.organizationFingerprint || organizationFingerprint(bpPrimary.apiKey)) : null;
       await serveSharedReport({
         res,
         refresh: wantsRefresh(req),
@@ -2410,6 +2414,8 @@ async function handleDataDoe(req, res) {
         // little longer than the default account report.
         lockSeconds: 300,
         build: () => buildBrandPortfolioSnapshot({ brand, accountIds, asOf }),
+        // Two-layer completeness aggregated across the portfolio's accounts (any provisional -> portfolio provisional).
+        augmentResponse: bpOrgFp ? makePortfolioCompletenessAugment({ organizationFingerprint: bpOrgFp, connectionId: "primary", accountIds, read: getOliCompleteness }) : null,
       });
       return;
     }
@@ -2689,6 +2695,9 @@ async function handleDataDoe(req, res) {
             readCatalogSnapshot: getSourceSnapshot,
             loadCatalogPayload: getSourceSnapshotPayload,
           };
+          // Two-layer PROVISIONAL/FINAL completeness: attach the current itemization state (read live from
+          // source_oli_completeness) so Daily Reporting labels D-1 provisional/final without a snapshot rewrite.
+          sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness });
           sharedOptions.deriveDurable = async () => {
             // sharedAccountMetadata (defined in THIS module) reads the account's currency from the shared
             // account-directory snapshot. The previous call referenced an UNDEFINED helper (accountDirectoryMeta),

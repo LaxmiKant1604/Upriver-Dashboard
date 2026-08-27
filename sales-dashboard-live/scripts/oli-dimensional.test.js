@@ -65,14 +65,15 @@ test("B2. cancelled positive-unit rows contribute ZERO business sales/units (kep
 
 /* ===== C. non-cancelled value rules ===== */
 
-test("C1. a NON-cancelled NULL-value row that is NOT yet itemized (item_status blank) HOLDS the account as OLI_D1_PENDING_ITEMIZATION (honest wait, LKG preserved)", () => {
-  const { blocked, byAccount } = build([frag({ amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 3 })]);
-  assert.equal(blocked.length, 1, "the account is held (LKG preserved)");
-  assert.equal(blocked[0].code, "OLI_D1_PENDING_ITEMIZATION", "not-yet-itemized is a PENDING hold, not a defect");
-  assert.equal(blocked[0].detail.pending, 1, "the pending row is surfaced in the itemization summary");
-  assert.equal(blocked[0].detail.notItemized, 1);
-  assert.equal(blocked[0].detail.resolved, 0);
-  assert.ok(!byAccount.has("ACC-1"), "no rows written for a held account");
+test("C1. a NON-cancelled NULL-value row that is NOT yet itemized (item_status blank) PUBLISHES provisional (never blocked)", () => {
+  const { blocked, byAccount, completenessByAccount } = build([frag({ amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 3 })]);
+  assert.equal(blocked.length, 0, "pending itemization never blocks -- it publishes provisionally");
+  assert.ok(byAccount.has("ACC-1"), "the account is published (its itemized window persists; here empty = zero itemized sales)");
+  const c = completenessByAccount.get("ACC-1").byDate.get("2026-08-10");
+  assert.equal(c.completenessStatus, "provisional");
+  assert.equal(c.pendingOrderCount, 1);
+  assert.equal(c.itemizedOrderCount, 0);
+  assert.equal(c.pendingUnitCount, 3, "the pending units are surfaced separately, never fabricated");
 });
 
 test("C1b. a NON-cancelled NULL-value row that IS itemized (item_status present) blocks as a real OLI_ITEMIZED_VALUE_MISSING defect", () => {
@@ -196,16 +197,17 @@ test("G1. rows are attributed to each account ONLY by its own seller id (no cros
   assert.equal(byAccount.get("ACC-2").length, 1);
 });
 
-test("G2. one account's held/blocked evidence affects ONLY that account; the other still persists", () => {
-  const { byAccount, blocked } = build([
-    frag({ seller_or_vendor_id: "S1", amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 3 }), // pending (not itemized)
-    frag({ seller_or_vendor_id: "S2", amazon_order_status: "Shipped", item_status: "Shipped", total_sales_sum: 200, total_units_sum: 2 }), // good
+test("G2. a DEFECT blocks ONLY that account; a pending account still PUBLISHES provisional; no leakage", () => {
+  const { byAccount, blocked, completenessByAccount } = build([
+    frag({ seller_or_vendor_id: "S1", amazon_order_status: "Shipped", item_status: "Shipped", total_sales_sum: null, total_units_sum: 3 }), // DEFECT (itemized + null)
+    frag({ seller_or_vendor_id: "S2", amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 1 }),         // pending -> provisional publish
   ]);
   assert.equal(blocked.length, 1);
   assert.equal(blocked[0].accountId, "ACC-1");
-  assert.equal(blocked[0].code, "OLI_D1_PENDING_ITEMIZATION");
-  assert.ok(!byAccount.has("ACC-1"), "held account not written (LKG preserved)");
-  assert.equal(byAccount.get("ACC-2").length, 1, "good account still persists");
+  assert.equal(blocked[0].code, "OLI_ITEMIZED_VALUE_MISSING");
+  assert.ok(!byAccount.has("ACC-1"), "defect account keeps LKG (not written)");
+  assert.ok(byAccount.has("ACC-2"), "the pending account still publishes (provisional)");
+  assert.equal(completenessByAccount.get("ACC-2").byDate.get("2026-08-10").completenessStatus, "provisional");
 });
 
 /* ===== H. fulfillment channel synonym normalization (blocker 4) ===== */

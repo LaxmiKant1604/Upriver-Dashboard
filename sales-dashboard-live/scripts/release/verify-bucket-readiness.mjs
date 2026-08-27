@@ -33,7 +33,7 @@ const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../..
 const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
 const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
-const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
+const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { assessBucketPublishReadiness } = await import("../../lib/server/sync/source-scheduled-prerequisites.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
@@ -109,12 +109,26 @@ for (const id of ids) {
   adsUnavailableByAccountId[id] = outcome === "incompatible";
 }
 
-// STRICT PREVIOUS-DAY (D-1) mode: publication requires EVERY account gapless through the EXACT requestedAsOf.
-// A settlement tail (proven only through D-2), an interior gap, blank provenance, or unreadable coverage is a typed
-// DATADOE_D1_NOT_READY -- the LKG is retained (the publish step below is skipped) and the honest provenThrough is
-// reported. Never publishes a lagged/blocked date as D-1.
+// TWO-LAYER COMPLETENESS: read the provisional/final state the sync recorded for D-1. Under the business override,
+// pending itemization PUBLISHES provisional (its coverage advanced to D-1) -- it is NOT a not-ready. Only a
+// source-defect account keeps its LKG; it is EXCLUDED from the all-or-nothing D-1 gate so it never blocks the others.
+let provisionalCount = 0, finalCount = 0; const defectIds = new Set();
+try {
+  const crows = await getOliCompleteness({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: ids, from: requestedAsOf, to: requestedAsOf });
+  for (const r of (Array.isArray(crows) ? crows : [])) {
+    if (r.completeness_status === "provisional") provisionalCount += 1;
+    else if (r.completeness_status === "final") finalCount += 1;
+    else if (r.completeness_status === "source-defect") defectIds.add(String(r.account_id));
+  }
+} catch (e) { log("completeness read failed (non-fatal): " + (e && e.message ? e.message : e)); }
+const gateAccounts = discovered.filter((a) => !defectIds.has(a.accountId));
+const runClass = defectIds.size > 0 ? "SOURCE_DEFECT" : (provisionalCount > 0 ? "D1_PROVISIONAL" : "D1_FINAL");
+
+// PREVIOUS-DAY (D-1) publish gate over the NON-defect accounts: each must have a successfully extracted D-1 window
+// (provisional or final -- both advanced coverage to requestedAsOf). An interior gap, blank provenance, or unreadable
+// coverage is still a typed DATADOE_D1_NOT_READY (LKG retained). Expected pending itemization is NOT a stop.
 const result = assessBucketPublishReadiness({
-  bucket, requestedAsOf, from: oliStart, discoveredAccounts: discovered,
+  bucket, requestedAsOf, from: oliStart, discoveredAccounts: gateAccounts.length ? gateAccounts : discovered,
   coverageByAccountId, provenanceBlankByAccountId,
   adsCoveredByAccountId, adsFailedByAccountId, adsUnavailableByAccountId,
   cyclePresent, cycleOliAssessment,
@@ -136,6 +150,10 @@ if (!result.ok) {
 }
 ghOut("effective_asof", result.effectiveAsOf); // === requestedAsOf (D-1 proven)
 ghOut("proceed", "true");
-ghSum("### D-1 readiness (" + bucket + ")\n- **D-1 SUCCESS** -- all " + result.accounts + " account(s) gapless through " + requestedAsOf + " (status " + result.status + ")");
-log("D-1 READY: " + result.accounts + " " + bucket + " accounts gapless through D-1 " + result.effectiveAsOf + ".");
+ghOut("run_class", runClass);
+const classLine = runClass === "D1_FINAL"
+  ? "**D1_FINAL** -- all " + result.accounts + " account(s) fully itemized through " + requestedAsOf
+  : "**D1_PROVISIONAL** -- " + finalCount + " final + " + provisionalCount + " provisional of " + result.accounts + " account(s) through " + requestedAsOf + " (the real itemized D-1 data publishes now; sales/ratios increase automatically as Amazon itemizes)";
+ghSum("### D-1 readiness (" + bucket + ")\n- " + classLine + (defectIds.size ? "\n- **" + defectIds.size + " source-defect account(s)** keep LKG and are excluded from the gate (escalate to DataDoe)" : ""));
+log("D-1 READY (" + runClass + "): " + result.accounts + " " + bucket + " accounts publishable through D-1 " + result.effectiveAsOf + "; provisional=" + provisionalCount + " final=" + finalCount + " defect=" + defectIds.size + ".");
 process.exit(0);

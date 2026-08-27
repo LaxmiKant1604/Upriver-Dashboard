@@ -1210,6 +1210,7 @@ function DashboardApp({ session, access, onSignOut }) {
   // true when dailyError is the server's honest "no snapshot yet" state (a typed waiting/unavailable message),
   // false when it is a genuine request failure. The waiting state renders as info, never as a failed refresh.
   const [dailyMissing, setDailyMissing] = useState(false);
+  const [dailyCompleteness, setDailyCompleteness] = useState(null); // two-layer provisional/final D-1 completeness (from the serve-time augment)
 
   // FBA Shipment Plan is cache-first and uses the shared header scope.
   const [planData, setPlanData] = useState(null);
@@ -1689,6 +1690,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setDailyRows(cached.body.rows || []);
       setLastFetchedAt(new Date(cached.cachedAt));
       setDailyError(null);
+      setDailyCompleteness(cached.body.completeness || null);
     } else {
       setDailyRows([]);
       setDailyError(null);
@@ -1700,6 +1702,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setLastFetchedAt(new Date(cachedAt));
       setDailyError(body.snapshotMissing ? body.message : null);
       setDailyMissing(Boolean(body.snapshotMissing));
+      setDailyCompleteness(body.completeness || null);
     } catch (error) {
       if (!isCurrentReq("daily", myId)) return;
       if (!cached) { setDailyError(error.message); setDailyMissing(false); }
@@ -3257,6 +3260,17 @@ function DashboardApp({ session, access, onSignOut }) {
           ? <DataQualityAlert tone="info" title="This report is not available yet" detail={dailyError} />
           : <DataQualityAlert tone="error" title="The last refresh failed" detail={dailyError} />)}
 
+        {/* Two-layer PROVISIONAL/FINAL D-1: the real itemized D-1 data is shown, honestly labelled while some order
+            shells are not yet itemized. Sales/ratio metrics may increase automatically -- never a fabricated value. */}
+        {dailyCompleteness && dailyCompleteness.provisional && (
+          <DataQualityAlert tone="info"
+            title={`Provisional D-1 — ${dailyCompleteness.itemizationPercent}% of orders itemized`}
+            detail={`${dailyCompleteness.notice} (${dailyCompleteness.pendingOrderCount} order(s)${dailyCompleteness.pendingUnitCount ? `, ${dailyCompleteness.pendingUnitCount} unit(s)` : ""} pending item-level prices${dailyCompleteness.finalizedThrough ? `; last fully finalized day: ${fmtDateHuman(dailyCompleteness.finalizedThrough)}` : ""}.)`} />
+        )}
+        {dailyCompleteness && dailyCompleteness.sourceDefect && (
+          <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={dailyCompleteness.notice} />
+        )}
+
         <div className="panel panel-flush">
           <div className="panel-head" style={{ padding: "15px 18px 12px", marginBottom: 0, borderBottom: "1px solid var(--border-default)" }}>
             <div>
@@ -3266,6 +3280,19 @@ function DashboardApp({ session, access, onSignOut }) {
                   ? `Latest completed sales: ${fmtDateHuman(dailyReport.latest)} · shown in ${dailyCurrency}`
                   : `Reported in ${dailyCurrency}`}
               </div>
+              {dailyCompleteness && (
+                <div className="page-sub" style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700, letterSpacing: 0.2,
+                    background: dailyCompleteness.provisional ? "rgba(210,140,0,0.14)" : (dailyCompleteness.sourceDefect ? "rgba(200,50,50,0.14)" : "rgba(30,150,80,0.14)"),
+                    color: dailyCompleteness.provisional ? "#a86a00" : (dailyCompleteness.sourceDefect ? "#b32424" : "#1a7f45") }}>
+                    {dailyCompleteness.provisional ? "Provisional D-1" : (dailyCompleteness.sourceDefect ? "Source issue" : "Final D-1")}
+                  </span>
+                  {dailyCompleteness.provisional && (
+                    <span>{dailyCompleteness.itemizationPercent}% itemized · {dailyCompleteness.pendingOrderCount} orders pending{dailyCompleteness.pendingUnitCount ? ` (${dailyCompleteness.pendingUnitCount} units)` : ""}</span>
+                  )}
+                  {dailyCompleteness.finalizedThrough && <span>· finalized through {fmtDateHuman(dailyCompleteness.finalizedThrough)}</span>}
+                </div>
+              )}
             </div>
             <button className="refresh-btn" onClick={loadCachedDaily} disabled={dailyLoading} title="Reload the latest saved data (no DataDoe export)" aria-label="Reload Daily Reporting">
               <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />

@@ -31,7 +31,7 @@ const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../..
 const { fetchAccounts } = await import("../../lib/server/datadoe.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
-const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport } = await import("../../lib/server/supabase.js");
+const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
 const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
@@ -184,18 +184,34 @@ const d1Complete = cov1.missing.length === 0;
 //     itemizes. NOT a stale-cycle block, NOT our code, NOT a fabricatable value.
 //   - OLI_ITEMIZED_VALUE_MISSING: an itemized recognized-sale with a genuinely null value -> a REAL source-data
 //     defect on that account (investigate; do not publish).
-const pendingItemization = Number(blockedCodes.OLI_D1_PENDING_ITEMIZATION || 0);
 const realDefect = Number(blockedCodes.OLI_ITEMIZED_VALUE_MISSING || 0);
-const denom = itemz.resolved + itemz.pending;
-const overallPct = denom > 0 ? Math.round((itemz.resolved / denom) * 1000) / 10 : null;
-const minPct = itemz.pctByAccount.length ? Math.min(...itemz.pctByAccount) : null;
-const itemizationNote = pendingItemization
-  ? " -- " + pendingItemization + " account(s) held: D-1 orders EXIST but Amazon has itemized only ~" + (overallPct == null ? "?" : overallPct) + "% so far ("
-    + itemz.resolved + " itemized+priced vs " + itemz.pending + " pending item-level sync [" + itemz.notItemized + " not-itemized + " + itemz.presale + " pre-sale]); honest wait, LKG retained, next refresh advances it as Amazon itemizes"
-  : "";
-if (Object.keys(blockedCodes).length) log("fresh-fetch block reasons: " + JSON.stringify(blockedCodes) + itemizationNote + (realDefect ? " -- WARNING " + realDefect + " account(s) have a REAL itemized-value defect (investigate)" : ""));
-log("assessment: creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok + " | STILL behind D-1: " + cov1.missing.length + "/" + ids.length);
-console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, d1Complete, stillBehindD1: cov1.missing.length, blockedCodes, itemization: { resolved: itemz.resolved, pending: itemz.pending, notItemized: itemz.notItemized, presale: itemz.presale, defect: itemz.defect, overallItemizedPct: overallPct, minAccountItemizedPct: minPct }, pendingItemization: pendingItemization > 0, realDefect: realDefect > 0 }));
+// BUSINESS MODEL: pending itemization NO LONGER holds. The real itemized D-1 data PUBLISHES immediately, labelled
+// PROVISIONAL while some order shells are not yet itemized; it promotes to FINAL as Amazon itemizes. Read the
+// two-layer completeness the sync just recorded for the requested D-1 date and classify the bucket run:
+//   D1_FINAL       every account's D-1 is fully itemized;
+//   D1_PROVISIONAL some account's D-1 has pending order shells (expected item-level lag) -- a SUCCESS, GREEN run;
+//   SOURCE_DEFECT  an itemized recognized-sale had a null value (that account keeps LKG; escalate).
+let provisional = 0, final = 0, sourceDefect = 0, itemizedOrders = 0, pendingOrders = 0, pendingUnits = 0;
+try {
+  const rows = await getOliCompleteness({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: ids, from: requestedAsOf, to: requestedAsOf });
+  for (const r of (Array.isArray(rows) ? rows : [])) {
+    if (r.completeness_status === "provisional") provisional += 1;
+    else if (r.completeness_status === "final") final += 1;
+    else if (r.completeness_status === "source-defect") sourceDefect += 1;
+    itemizedOrders += Number(r.itemized_order_count) || 0;
+    pendingOrders += Number(r.pending_order_count) || 0;
+    pendingUnits += Number(r.pending_unit_count) || 0;
+  }
+} catch (e) { log("completeness read failed: " + (e && e.message ? e.message : e)); }
+const totOrders = itemizedOrders + pendingOrders;
+const overallPct = totOrders > 0 ? Math.round((itemizedOrders / totOrders) * 1000) / 10 : 100;
+const classification = sourceDefect > 0 || realDefect > 0 ? "SOURCE_DEFECT" : (provisional > 0 ? "D1_PROVISIONAL" : "D1_FINAL");
+log("D-1 completeness: " + classification + " -- " + final + " final + " + provisional + " provisional + " + (sourceDefect || realDefect) + " source-defect of " + ids.length + " accounts; " + overallPct + "% orders itemized (" + itemizedOrders + " itemized / " + pendingOrders + " pending, " + pendingUnits + " pending units)"
+  + (provisional > 0 ? " -- provisional D-1 PUBLISHES now; sales/ratios increase automatically as Amazon itemizes (never a fabricated value)" : "")
+  + (realDefect ? " -- WARNING " + realDefect + " itemized-value defect account(s) keep LKG (escalate to DataDoe)" : ""));
+if (Object.keys(blockedCodes).length) log("fresh-fetch defect/status blocks: " + JSON.stringify(blockedCodes));
+log("assessment: creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok + " | coverage behind D-1: " + cov1.missing.length + "/" + ids.length);
+console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
 if (!a.ok) { console.error("STOP OLI assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
-// exit 0 whether or not D-1 fully settled: the strict D-1 readiness gate downstream decides publish vs not-ready.
+// GREEN exit for provisional: expected pending itemization is a SUCCESS (D1_PROVISIONAL publishes now), never a red run.
 process.exit(0);
