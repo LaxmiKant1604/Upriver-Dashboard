@@ -12727,3 +12727,29 @@ proceed=true, status exact through D-1. PROOF: account 126918 D-1 = real 6989 it
 fully-itemized ~45-51k) with 0 non-cancelled NULL rows persisted; serve augment -> Provisional D-1, 15.7% itemized,
 70 pending orders, finalized through Aug 25. Tests: verify 80 steps/60 suites (incl. build); +oli-completeness-serve,
 oli-itemization rewritten to provisional, CAS proven live. Deployed 1e9b600..77d3d24, Vercel 200.
+
+## Scheduler v2 -- HARDEN tomorrow's automatic runs (2026-08-27, code 9282254)
+
+Reconciles the observed scheduled failure: GitHub run summary bucket=non-us, DATADOE_D1_NOT_READY,
+provenThrough=2026-08-25 (D-2), 17/22 behind. PROVEN it ran PRE-provisional code (commit 1e9b600, "wait"): the D-2
+provenThrough is the OLD held-behavior signature -- the deployed provisional code [[scheduler-v2-provisional-final]]
+(77d3d24) advances coverage to D-1. bucket=non-us is correct (0 2 * * * -> non-us; a DELAYED execution keeps
+github.event.schedule). It was a delayed Non-US cron on old code -- NOT a US run, NOT a bucket-resolution bug. No gh
+CLI here -> immutable run metadata now printed in every summary; acceptance is current-head manual.
+
+- READINESS CONTRACT (verify-bucket-readiness): a GENUINE source-defect FAILS CLOSED (SOURCE_DEFECT, exit 1, LKG,
+  escalate) -- no longer excluded/masked. Expected pending itemization stays D1_PROVISIONAL/D1_FINAL, proceed, exit 0.
+  Release --strict-d1 clamp is coverage-based (bucket-wide effectivePublishAsOf at source-priority-release-runner.js
+  :109) -> provisional accounts at D-1 coverage publish; a defect drags coverage to D-2 and fails closed there too.
+- CRON->BUCKET: 0 2/0 3 -> non-us, 30 10/30 11 -> us; unknown cron fails BEFORE I/O; scheduled always normal. Every
+  summary prints event/cron/bucket/run_kind/SHA/run_id/asOf/mode/opkey/contract/ceiling (immutable version proof).
+- FALLBACK: a bounded ~1h fallback cron per bucket (non-us 03:00 UTC, us 11:30 UTC) survives a delayed/dropped GitHub
+  schedule. Primary+fallback share ONE operation identity scheduled-fresh/$bucket/$asof (never the cron) -> an
+  already-published D-1 is ZERO-create/ZERO-token ALREADY_PUBLISHED_D1; an interrupted primary is resumed. One
+  workflow, one concurrency group, one ceiling (non-us 20 / us 10).
+- BRAND completeness: single-account Brand View + brand-sales endpoints wired to the augment (resolve real account
+  from params.accountId). Daily + portfolio + single all consistent.
+
+Tests: +scheduler-v2-hardening (13 shape/contract assertions) + updated cron assertions across
+automation/d1-freshness/superseding/test-sync. npm run verify 81 steps / 61 suites (incl build) green. Deploy +
+current-head release acceptance next.
