@@ -12615,3 +12615,42 @@ guard unchanged. Campaign Ads/FBA never force-fetched (forceFreshOli OLI-only).
 TESTS: +15 D-1/force-latest regressions (scheduler-v2-d1-freshness.test.js) + workflow-shape D4 + schema contract.
 `npm run verify` green: 77 steps / 57 suites incl. production build. STATUS: code+tests 5a9a77c; migration APPLIED;
 docs separate; push + Vercel 200 + acceptance (force-latest runs) next.
+
+## Scheduler v2 -- durable SUPERSEDING-ATTEMPT model + the unpriced-D-1 truth (2026-08-27, code 9e1d282)
+
+Fixes the stale-terminal-cycle block: cycle-completion was wrongly COUPLED to source-freshness, so a cycle finalized
+(terminal) at D-2 blocked every new D-1 attempt (UNIQUE(bucket,cycle_date) + the terminal-append guard). force-latest
+hit CYCLE_NOT_REOPENABLE; the automatic preflight classified the terminal cycle idempotent-complete -> zero creates.
+
+FIX (forward-only; the historical terminal cycle stays IMMUTABLE):
+- Migration 20260830 (APPLIED): sync_cycles + operation_key/supersedes_cycle_id/attempt_kind; relaxed the (bucket,
+  cycle_date) unique to a PARTIAL unique on BASE cycles + unique operation_key; open_superseding_sync_cycle RPC
+  (idempotent by operation_key; target must be terminal + same slot; target only READ for-share, never mutated).
+- getSyncCycleByBucketDate resolves the ACTIVE non-superseded HEAD (resolveActiveCycleHead in source-cycle-attempts.js;
+  fork/headless fail closed). runBucketSourceSync resolves the head ONCE + threads it to BOTH the frozen budget persist
+  AND runSourceJobs (fixes a budget/cycle mismatch -> 0 creates). The runtime terminal-idempotence precheck
+  (source-bucket-sync-runtime.js ~694) now short-circuits ONLY for succeeded/partial/failed -- a PENDING superseding
+  attempt proceeds (the bug: `status !== "running"` wrongly skipped pending).
+- classifyScheduledOliCycle: durable COVERAGE through D-1 (not the OLI-job shape) decides terminal completion; below
+  D-1 -> "supersede"; unreadable -> fail closed. Preflight treats supersede as runnable.
+- oli-refresh-d1.mjs = the ONE D-1 OLI operator (replaces scheduled-oli-refresh + oli-force-latest in the workflow):
+  supersede stale terminal head -> re-fetch FRESH (forceFreshOli) -> auto-escalate missing <=5-seller batches within
+  the per-bucket ceiling. Workflow: one refresh-mode-aware D-1 OLI step carrying github.run_id.
+
+LIVE VALIDATION (Non-US, normal mode): superseded terminal c9e3d573 -> fresh attempt 5bfa720f -> 5 real OLI creates
+(10 tokens); coverage advanced to 08-26 for the 5 accounts whose D-1 fully settled. So the superseding model WORKS
+end-to-end (proven).
+
+DECISIVE RAW DIAGNOSIS (the real cause of the D-1 gap -- NOT stale cycles, NOT a code defect): a fresh raw export of
+5 D-1-missing Non-US sellers over [08-20..08-26] returned 500 D-1 (08-26) rows, but of the D-1 NON-CANCELLED rows only
+49 are PRICED and 451 are VALUE-MISSING (420 throw OLI_NON_CANCELLED_VALUE_MISSING); status dist Shipped 348 / Pending
+118 / Canceled 32 / Unshipped 2. So D-1 ORDERS exist (real-time), but Amazon has NOT settled their PRICES yet
+(item_price_value null for ~84% of D-1 non-cancelled rows). The value-missing policy (a prior deliberate fix) CORRECTLY
+refuses to persist unpriced non-cancelled units as sales -> coverage does not advance -> honest DATADOE_D1_NOT_READY.
+Publishing D-1 now would show units with zero/missing revenue. The next rolling refresh advances D-1 automatically as
+Amazon settles the prices. This is a THIRD case beyond the user's dichotomy: raw D-1 rows PRESENT but sales VALUES
+UNSETTLED (unpriced) -- neither a code defect nor "raw lacks D-1".
+
+Tests: +11 superseding regressions + updated group G/D. npm run verify 78 steps / 58 suites incl. build. STATUS:
+code 9e1d282 + docs; migration applied; superseding model proven live; D-1 publish blocked ONLY by unsettled Amazon
+prices (external), which the next refresh resolves.
