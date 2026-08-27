@@ -600,7 +600,7 @@ export async function runBucketSourceSync({
           // re-records idempotently.
           const comp = completenessByAccount && completenessByAccount.get(a.accountId);
           if (recordCompleteness && comp && comp.byDate) {
-            for (const [saleDate, dc] of comp.byDate) {
+            const writeOne = async (saleDate, dc) => {
               try {
                 const res = await recordCompleteness({
                   organizationFingerprint: family.plannedJobs[0].organizationFingerprint, connectionId: "primary",
@@ -616,6 +616,13 @@ export async function runBucketSourceSync({
               } catch (e) {
                 (rollup.completenessErrors = rollup.completenessErrors || []).push({ accountId: a.accountId, saleDate, error: String(e && e.message ? e.message : e) });
               }
+            };
+            for (const [saleDate, dc] of comp.byDate) await writeOne(saleDate, dc);
+            // A covered account with NO orders on the requested D-1 (an INACTIVE day) has no per-date entry -- record
+            // an explicit FINAL (zero orders, 100%) completeness for D-1 so EVERY covered account is labelled (never
+            // left unlabelled), and never a false provisional.
+            if (!comp.byDate.has(unit.slice.to)) {
+              await writeOne(unit.slice.to, { completenessStatus: "final", itemizedOrderCount: 0, pendingOrderCount: 0, itemizedUnitCount: 0, pendingUnitCount: 0, itemizationPercent: 100 });
             }
           }
         }
