@@ -401,6 +401,16 @@ export async function runBucketSourceSync({
   const ownerIds = [...new Set(allPlannedJobs.map((j) => j.owner.ownerId))];
   const nowIso = () => new Date(clock()).toISOString();
 
+  // Head-aware ACTIVE cycle resolution, ONCE for the whole run: when a running/pending head already exists for the
+  // slot -- a base cycle in progress OR a superseding attempt an operator created to take over a stale terminal slot
+  // -- every write in this run (the frozen budget persist AND the source jobs) MUST target THAT cycle, so the budget
+  // and the create-reservation share one cycle_id. Resolved to null when no active head exists (a fresh BASE cycle is
+  // opened on the first write). A missing getCycleByBucketDate capability (test doubles) keeps the old base path.
+  let activeCycleId = null;
+  if (typeof store.getCycleByBucketDate === "function") {
+    try { const h = await store.getCycleByBucketDate(bucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
+  }
+
   const rollup = {
     bucket, cycleId: null, plan: plan.summary, skippedPaused: plan.skippedPaused,
     families: [], stopped: false, stopReason: null, globalDrained: false,
@@ -442,7 +452,7 @@ export async function runBucketSourceSync({
         isPremiumOf: registryIsPremiumOf, trancheKey: `source-sync:${family.sourceKey}`,
       });
       if (frozen.maxCreates > 0) {
-        const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+        const cycleId = activeCycleId || await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
         rollup.cycleId = rollup.cycleId || cycleId;
         const ack = await store.persistBudget({
           cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
@@ -464,7 +474,7 @@ export async function runBucketSourceSync({
       const res = await runSourceJobs({
         store, dataDoe, plannedJobs: allPlannedJobs, ownerIds,
         bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs,
-        sourceTranche: tranche, reuseOnly, budget, forceFreshOli,
+        sourceTranche: tranche, reuseOnly, budget, forceFreshOli, cycleId: activeCycleId,
       });
       continuations += 1;
       rollup.cycleId = res.cycleId || rollup.cycleId;

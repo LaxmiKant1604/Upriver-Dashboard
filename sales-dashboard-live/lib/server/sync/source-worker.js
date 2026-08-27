@@ -498,6 +498,10 @@ export async function runSourceJobs({
   // run-scoped input); only the execution-time reuse decision is overridden. Idempotency across runs is the caller's
   // durable freshness reservation, not this flag. NEVER a per-run/untrusted argument (a build-time composition flag).
   forceFreshOli = false,
+  // The pre-resolved ACTIVE cycle id (the caller resolved the superseding/running head ONCE so the frozen budget
+  // and the create-reservation share one cycle). When provided it is used verbatim (still claimed); when null, this
+  // function resolves the head itself, falling back to opening a fresh BASE cycle.
+  cycleId: providedCycleId = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -508,7 +512,21 @@ export async function runSourceJobs({
   const outcomes = [];
   const runWithDeadline = (fn) => withDataDoeDeadline(deadlineMs === Infinity ? Infinity : deadlineMs - reserveMs, fn);
 
-  const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+  // Head-aware cycle resolution: prefer the caller's pre-resolved ACTIVE cycle id (so the budget + reservation share
+  // one cycle). Otherwise, when a running/pending head already exists for the slot -- a base cycle in progress OR a
+  // superseding attempt an operator created to take over a stale terminal slot -- resume THAT cycle instead of
+  // re-opening the base (which would re-select the immutable terminal cycle). Only when neither exists is a fresh
+  // BASE cycle created. The head read is a plain read (safe to abort); openCycle stays a pure write.
+  let cycleId = providedCycleId;
+  if (!cycleId) {
+    let head = null;
+    if (typeof store.getCycleByBucketDate === "function") {
+      try { head = await store.getCycleByBucketDate(bucket, cycleDate); } catch (_e) { head = null; }
+    }
+    cycleId = head && head.id && ["running", "pending"].includes(String(head.status))
+      ? head.id
+      : await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+  }
   progress.cycleId = cycleId;
   progress.claimedCycle = await store.claimCycle(cycleId);
 

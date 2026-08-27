@@ -60,8 +60,9 @@ const cls = classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts: disco
 const cid8 = String(cycle.id).slice(0, 8);
 if (cls.disposition === "terminal-refuse" || cls.disposition === "refuse") {
   const why = cls.assessment ? [...new Set(cls.assessment.problems.map((p) => String(p).split(":")[0]))].join(",") : cls.reason;
-  console.error("STOP SCHEDULED_CYCLE_TERMINAL_COLLISION: today's " + bucket + " cycle " + cid8 + " is terminal (" + String(cycle.status) + ") and is NOT a completed scheduled OLI run (" + why + "), and durable OLI coverage is INCOMPLETE" + (durableCoverage ? " (missing " + durableCoverage.missingAccounts.length + " accounts)" : " (coverage unreadable)") + ". The run must not proceed on this occupied slot.");
+  console.error("STOP SCHEDULED_CYCLE_UNREADABLE_COVERAGE: today's " + bucket + " cycle " + cid8 + " is terminal (" + String(cycle.status) + ") and its durable OLI coverage is UNREADABLE (" + why + "); refusing to classify freshness without evidence.");
   process.exit(1);
 }
-if (cls.disposition === "idempotent-complete") { log("cycle " + cid8 + " -> idempotent-complete (" + (cls.reason || "scheduled-oli-run-complete") + "): runnable, zero creates."); process.exit(0); }
-log("cycle " + cid8 + " is running -> runnable (OLI will continue on it)."); process.exit(0);
+if (cls.disposition === "idempotent-complete") { log("cycle " + cid8 + " -> idempotent-complete (" + (cls.reason || "durable-coverage-complete") + "): runnable, zero creates."); process.exit(0); }
+if (cls.disposition === "supersede") { log("cycle " + cid8 + " is terminal but durable coverage is BELOW D-1 (missing " + ((cls.missingAccounts || []).length) + " accounts) -> RUNNABLE via a durable superseding attempt (the terminal cycle stays immutable; never blocked)."); process.exit(0); }
+log("cycle " + cid8 + " is " + String(cycle.status) + " -> runnable (OLI continues on it)."); process.exit(0);

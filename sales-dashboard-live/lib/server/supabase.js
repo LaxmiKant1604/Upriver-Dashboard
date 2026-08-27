@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { sourceJobOwnerId } from "./source-identity.js";
 import { normalizeFulfillmentChannel } from "./sync/oli-order-rules.js";
+import { resolveActiveCycleHead } from "./sync/source-cycle-attempts.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -847,6 +848,16 @@ export async function openSyncCycle({ bucket, cycleDate, scheduledAt = null, tri
   });
 }
 
+// open_superseding_sync_cycle (20260830): create-or-resume a durable SUPERSEDING attempt on the same
+// (bucket, cycle_date) as a stale terminal cycle, WITHOUT mutating the terminal one. Idempotent by operation_key.
+export async function openSupersedingSyncCycle({ bucket, cycleDate, operationKey, supersedesCycleId, attemptKind, scheduledAt = null, trigger = "manual" }, { signal = null } = {}) {
+  return request("/rest/v1/rpc/open_superseding_sync_cycle", {
+    method: "POST",
+    signal,
+    body: { p_bucket: bucket, p_cycle_date: cycleDate, p_operation_key: operationKey, p_supersedes_cycle_id: supersedesCycleId, p_attempt_kind: attemptKind, p_scheduled_at: scheduledAt, p_trigger: trigger },
+  });
+}
+
 // claim_sync_cycle: pending -> running; true only for the worker that won the start.
 export async function claimSyncCycle(cycleId, { signal = null } = {}) {
   return request("/rest/v1/rpc/claim_sync_cycle", { method: "POST", signal, body: { p_cycle_id: cycleId } });
@@ -864,21 +875,30 @@ export async function getSyncCycle(cycleId, { signal = null } = {}) {
   return rows[0] || null;
 }
 
-// Read-only lookup of the ONE cycle for (bucket, cycle_date) -- the sync_cycles_bucket_date_unique constraint
-// guarantees at most one. Used by the priority release's restart-safe finalize to reconstruct the cycle it must
-// verify WITHOUT creating one and WITHOUT trusting an in-memory cycle id. Selects `trigger` so the finalize can
-// prove the cycle was a reviewed MANUAL run. Returns the row or null.
+// Read-only lookup of the ACTIVE cycle attempt for (bucket, cycle_date). With the superseding-attempt model
+// (20260830) a stale terminal cycle may be SUPERSEDED by a new running attempt on the same slot; this resolves the
+// ACTIVE, non-superseded HEAD of the supersession chain -- the cycle that no other cycle supersedes. Exactly one
+// head is expected; zero rows -> null; a fork (more than one head) or a headless chain FAILS CLOSED. Selects
+// operation_key/supersedes_cycle_id/attempt_kind + trigger so callers can prove identity + a reviewed manual run.
 export async function getSyncCycleByBucketDate(bucket, cycleDate, { signal = null } = {}) {
   const query = new URLSearchParams({
-    select: "id,bucket,cycle_date,status,trigger,created_at,started_at,finished_at",
+    select: "id,bucket,cycle_date,status,trigger,operation_key,supersedes_cycle_id,attempt_kind,created_at,started_at,finished_at",
     bucket: `eq.${bucket}`,
     cycle_date: `eq.${cycleDate}`,
-    limit: "2",
+    limit: "100",
   });
   const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });
   if (!Array.isArray(rows) || rows.length === 0) return null;
-  if (rows.length > 1) throw new Error("getSyncCycleByBucketDate: more than one cycle for (bucket, cycle_date); failing closed.");
-  return rows[0];
+  // The head is the cycle NOT referenced by any other cycle's supersedes_cycle_id (resolveActiveCycleHead): a
+  // well-formed slot has exactly one head; a fork or headless chain fails closed.
+  return resolveActiveCycleHead(rows);
+}
+
+// Read-only: the superseded target the ACTIVE head points at (or null). Used by the classifier/operators to prove
+// they are superseding the exact terminal cycle they observed.
+export async function getActiveSyncCycleChain(bucket, cycleDate, { signal = null } = {}) {
+  const head = await getSyncCycleByBucketDate(bucket, cycleDate, { signal });
+  return head ? { head, supersedesCycleId: head.supersedes_cycle_id ?? null } : null;
 }
 
 export async function updateSyncCycleCounts(cycleId, { sourceTotal, sourceSucceeded, sourceFailed, reportTotal, reportSucceeded, reportFailed, status } = {}, { signal = null } = {}) {

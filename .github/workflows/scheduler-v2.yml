@@ -126,19 +126,15 @@ jobs:
         id: tokengate
         run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.bucket }}
 
-      # (step 3) Refresh canonical OLI for THIS bucket only (normal fetch on the fresh daily cycle -- a genuine D-1
-      # attempt; pending jobs create real exports, so DataDoe is genuinely queried for the requested D-1 rows).
-      - name: Refresh canonical OLI (this bucket only)
+      # (step 3) Refresh OLI to D-1 for THIS bucket. Decouples cycle-completion from source-freshness: a running/fresh
+      # cycle drains normally; a TERMINAL cycle whose durable coverage is below D-1 is STALE evidence -> a durable
+      # SUPERSEDING running attempt is opened (the terminal cycle stays immutable) and OLI is re-fetched FRESH
+      # (forceFreshOli bypasses the 20h stale cache). After the drain it auto-escalates ONE bounded fresh re-fetch of
+      # only the still-missing <=5-seller batches, within the per-bucket create/token ceiling. normal mode uses the
+      # scheduled-fresh operation identity; force-latest uses manual-force/<bucket>/<D-1>/<github.run_id>.
+      - name: Refresh OLI to D-1 (supersede stale terminal cycle + auto-escalate fresh fetch)
         if: steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/scheduled-oli-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
-
-      # (step 3b) FORCE-LATEST ONLY: a BOUNDED fresh DataDoe re-fetch of the still-missing D-1 rolling window
-      # (forceFreshOli bypasses the 20h stale-cache adoption), under the durable freshness reservation (idempotent by
-      # github.run_id; one forced create per (operation, batch hash); never a COMMIT_UNKNOWN retry). Only missing
-      # <=5-seller batches are re-fetched. Scheduled runs are 'normal' and skip this entirely.
-      - name: Force-latest fresh D-1 re-fetch (workflow_dispatch force-latest only)
-        if: steps.tokengate.outputs.proceed == 'true' && steps.cfg.outputs.mode == 'force-latest'
-        run: node scripts/release/oli-force-latest.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }} --run-id=${{ github.run_id }}
+        run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
 
       # (step 4) Refresh ASIN Ads for THIS bucket only (coverage mode, 21-day rolling window).
       - name: Refresh ASIN Ads (this bucket only; coverage mode, 21-day rolling window)

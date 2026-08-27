@@ -29,6 +29,12 @@ export function assertRefreshMode(mode) {
   return m;
 }
 
+// The sync_cycles.attempt_kind for a superseding attempt in each mode: a normal (automatic/scheduled) run opens a
+// 'scheduled-fresh' superseding attempt; a manual force-latest opens a 'manual-force' one.
+export function attemptKindForMode(mode) {
+  return assertRefreshMode(mode) === "force-latest" ? "manual-force" : "scheduled-fresh";
+}
+
 // A real calendar date check (rejects impossible dates like 2026-02-30).
 function isRealDate(y, mo, d) {
   const dt = new Date(Date.UTC(y, mo - 1, d));

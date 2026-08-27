@@ -691,7 +691,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     if (!priority && typeof store.getCycleByBucketDate === "function") {
       try {
         const existing = await dl.bound("cycle-terminal-precheck", (signal) => store.getCycleByBucketDate(bucket, cycleDate || todayStr, { signal }));
-        if (existing && existing.id && existing.status && existing.status !== "running") {
+        // Short-circuit ONLY for a genuinely TERMINAL active head (succeeded/partial/failed) -- the day's operation
+        // completed and the RPCs refuse to append to it. A RUNNING or PENDING head must proceed: a pending head is a
+        // fresh base cycle OR a superseding attempt an operator just opened to take over a stale terminal slot; it
+        // still needs to be claimed + fetched. (Before this fix a pending superseding attempt was wrongly treated as
+        // terminal and skipped, so the fresh D-1 re-fetch never ran.)
+        if (existing && existing.id && ["succeeded", "partial", "failed"].includes(String(existing.status))) {
           return {
             bucket, cycleId: existing.id, cycleStatus: existing.status,
             alreadyTerminal: true, skipped: "cycle-terminal",

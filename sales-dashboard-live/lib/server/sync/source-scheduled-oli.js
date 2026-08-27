@@ -160,18 +160,21 @@ export function assessDurableOliCoverageComplete({ discoveredAccounts, coverageB
 export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, sourceJobs, owners, durableCoverage = null } = {}) {
   if (!cycle || !nb(cycle.id)) return { disposition: "run", reason: "no-cycle" };
   const status = S(cycle.status ?? cycle.cycleStatus);
-  if (status === "running") return { disposition: "run", reason: "running-cycle" };
-  if (status !== "succeeded" && status !== "partial") return { disposition: "refuse", reason: "unexpected-cycle-status:" + status };
-  // TERMINAL cycle: adopt it ONLY if it is a COMPLETE scheduled OLI run (its OLI jobs pass the strict assessment).
+  if (status === "running" || status === "pending") return { disposition: "run", reason: status + "-cycle" };
+  if (status !== "succeeded" && status !== "partial" && status !== "failed") return { disposition: "refuse", reason: "unexpected-cycle-status:" + status };
+  // TERMINAL cycle. Completion is decided by DURABLE OLI COVERAGE THROUGH the requested day (D-1), NOT by the
+  // OLI-job shape: a cycle whose OLI jobs all succeeded (a "complete scheduled OLI run") can STILL have durable
+  // coverage only through D-2, because its exports were fetched BEFORE DataDoe settled D-1 and then adopted from
+  // the cache on every re-run. Cycle-completion and source-freshness are decoupled here:
+  //   coverage complete through D-1 -> idempotent-complete (zero creates; the day is genuinely done).
+  //   coverage present but < D-1     -> SUPERSEDE: this terminal cycle is STALE evidence; the caller opens a fresh
+  //                                     RUNNING superseding attempt (new operation identity + its own child jobs)
+  //                                     and re-fetches -- the terminal cycle is NEVER treated as complete, and NEVER
+  //                                     reopened/reset/mutated.
+  //   coverage unreadable            -> fail closed (refuse) -- never silently classify freshness without evidence.
   const oliJobs = (Array.isArray(sourceJobs) ? sourceJobs : []).filter((j) => S(j.source_key ?? j.sourceKey) === OLI_SOURCE_KEY);
   const assessment = assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs: oliJobs, owners, open: 0 });
-  if (assessment.ok) return { disposition: "idempotent-complete", assessment, cycleStatus: status };
-  // DURABLE-COVERAGE idempotence: the cycle is not a scheduled OLI run, but the durable coverage already proves
-  // the authorized window for every discovered account -> nothing is missing -> zero-create success. The caller
-  // computes `complete` from source_coverage (windowsProve over [fixed-start .. asOf] per discovered account);
-  // absent/false keeps the strict refusal.
-  if (durableCoverage && durableCoverage.complete === true) {
-    return { disposition: "idempotent-complete", assessment, cycleStatus: status, reason: "durable-coverage-complete" };
-  }
-  return { disposition: "terminal-refuse", reason: "terminal-cycle-not-a-completed-oli-run", assessment, cycleStatus: status };
+  if (durableCoverage == null) return { disposition: "terminal-refuse", reason: "terminal-cycle-coverage-unreadable", assessment, cycleStatus: status };
+  if (durableCoverage.complete === true) return { disposition: "idempotent-complete", assessment, cycleStatus: status, reason: "durable-coverage-complete" };
+  return { disposition: "supersede", reason: "stale-terminal-below-d1", assessment, cycleStatus: status, missingAccounts: durableCoverage.missingAccounts || [] };
 }

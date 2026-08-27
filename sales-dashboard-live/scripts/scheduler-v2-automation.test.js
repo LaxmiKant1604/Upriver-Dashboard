@@ -202,8 +202,8 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.ok(idx("Verify required secrets") < idx("Resolve bucket"), "secrets before resolve");
   assert.ok(idx("npm ci") < idx("scheduled-cycle-preflight.mjs"), "npm ci before cycle preflight");
   assert.ok(idx("scheduled-cycle-preflight.mjs") < idx("confirm-token-budget.mjs"), "cycle preflight before token gate");
-  assert.ok(idx("confirm-token-budget.mjs") < idx("scheduled-oli-refresh.mjs"), "token gate before OLI");
-  assert.ok(idx("scheduled-oli-refresh.mjs") < idx("scheduled-asin-ads-refresh.mjs"), "OLI before ASIN Ads");
+  assert.ok(idx("confirm-token-budget.mjs") < idx("oli-refresh-d1.mjs"), "token gate before OLI");
+  assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-asin-ads-refresh.mjs"), "OLI before ASIN Ads");
   assert.ok(idx("scheduled-asin-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Ads before the readiness proof");
   assert.ok(idx("verify-bucket-readiness.mjs") < idx("priority-control-package.mjs --apply"), "readiness/effectivePublishAsOf BEFORE opening controls");
   assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
@@ -218,7 +218,7 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.match(yml, /verify-bucket-readiness\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness proves the bucket at the requestedAsOf");
   assert.match(yml, /priority-dashboards-release\.mjs --bucket=[^\n]*--as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/, "release publishes at the HONEST effectivePublishAsOf, not the requestedAsOf");
   // every create/control step (incl. readiness) is gated on the token-gate proceed output (typed skip => nothing).
-  for (const step of ["scheduled-oli-refresh.mjs", "scheduled-asin-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+  for (const step of ["oli-refresh-d1.mjs", "scheduled-asin-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = idx(step); const before = yml.slice(Math.max(0, at - 260), at);
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
@@ -251,13 +251,13 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.match(yml, /mode="normal"/, "scheduled resolves to normal");
   assert.match(yml, /A SCHEDULED event is ALWAYS normal/, "documented + enforced scheduled=normal");
   assert.match(yml, /mode="\$\{\{ github\.event\.inputs\.refresh_mode \}\}"/, "dispatch reads the refresh_mode input");
-  // the force-latest re-fetch step: gated on mode == force-latest, carries the github.run_id (durable idempotent
-  // identity), runs AFTER the normal OLI fetch and BEFORE the readiness proof.
-  assert.match(yml, /steps\.cfg\.outputs\.mode == 'force-latest'/, "force-latest step gated on mode");
-  assert.match(yml, /oli-force-latest\.mjs[^\n]*--run-id=\$\{\{ github\.run_id \}\}/, "force-latest carries github.run_id");
-  assert.ok(idx("scheduled-oli-refresh.mjs") < idx("oli-force-latest.mjs"), "normal OLI fetch before the force-latest re-fetch");
-  assert.ok(idx("oli-force-latest.mjs") < idx("verify-bucket-readiness.mjs"), "force-latest re-fetch before the D-1 proof");
-  assert.ok(idx("oli-force-latest.mjs") > 0 && idx("oli-force-latest.mjs") < idx("priority-dashboards-release.mjs"), "force-latest before publish");
+  // the ONE D-1 OLI step (oli-refresh-d1.mjs) carries the refresh_mode + github.run_id (the manual-force identity),
+  // supersedes a stale terminal cycle, and runs BEFORE the strict D-1 readiness proof.
+  assert.match(yml, /oli-refresh-d1\.mjs[^\n]*--refresh-mode=\$\{\{ steps\.cfg\.outputs\.mode \}\}[^\n]*--run-id=\$\{\{ github\.run_id \}\}/, "the D-1 OLI step carries refresh_mode + github.run_id");
+  assert.match(yml, /supersede stale terminal cycle/i, "the OLI step documents the superseding-attempt behavior");
+  assert.ok(idx("oli-refresh-d1.mjs") < idx("verify-bucket-readiness.mjs"), "OLI (supersede + fresh fetch) before the D-1 proof");
+  assert.ok(idx("oli-refresh-d1.mjs") > 0 && idx("oli-refresh-d1.mjs") < idx("priority-dashboards-release.mjs"), "OLI before publish");
+  assert.doesNotMatch(yml, /oli-force-latest\.mjs/, "the separate force-latest step is merged into the one D-1 OLI step");
   // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
   // schedules unchanged.
@@ -438,37 +438,43 @@ test("G1. a same-date TERMINAL catalog/priority cycle (0 OLI jobs) + missing cov
   assert.ok(cls.assessment.problems.some((p) => p.startsWith("owner-coverage-missing")) || cls.assessment.problems.includes("owner-coverage-missing"), "no owner coverage is fabricated");
 });
 
-test("G2. a TERMINAL cycle that IS a complete scheduled OLI run (22 accts -> 5 batches, exact owner union) -> idempotent-complete (same-day replay, zero re-fetch)", () => {
+test("G2. DURABLE COVERAGE decides terminal completion, NOT the OLI-job shape: a complete-OLI-run cycle with coverage BELOW D-1 is STALE -> supersede (never idempotent on job-shape alone); with coverage through D-1 -> idempotent", () => {
   const { sourceJobs, owners } = oliCompleteCycle(22);
-  const cls = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "cyc", status: "succeeded" }, discoveredAccounts: accountsN(22), sourceJobs, owners });
-  assert.equal(cls.disposition, "idempotent-complete");
-  assert.equal(cls.assessment.ok, true, JSON.stringify(cls.assessment.problems));
-  assert.equal(cls.assessment.batches, 5, "22 accounts -> exactly 5 OLI batches");
-  assert.equal(cls.assessment.creates, 5); assert.equal(cls.assessment.tokens, 10);
+  // Complete OLI jobs BUT durable coverage only through D-2 -> the cycle is stale evidence -> SUPERSEDE.
+  const belowD1 = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId: Object.fromEntries(accountsN(22).map((a) => [a.accountId, [{ from: "2025-01-01", to: "2026-08-25" }]])), start: "2025-01-01", asOf: "2026-08-26" });
+  const stale = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "cyc", status: "succeeded" }, discoveredAccounts: accountsN(22), sourceJobs, owners, durableCoverage: belowD1 });
+  assert.equal(stale.disposition, "supersede", "a complete OLI run whose coverage is below D-1 is NEVER idempotent -- it is stale");
+  assert.equal(stale.missingAccounts.length, 22, "every account is behind D-1");
+  // The SAME cycle once coverage proves through D-1 -> idempotent-complete (zero re-fetch).
+  const throughD1 = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId: Object.fromEntries(accountsN(22).map((a) => [a.accountId, [{ from: "2025-01-01", to: "2026-08-26" }]])), start: "2025-01-01", asOf: "2026-08-26" });
+  const done = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "cyc", status: "succeeded" }, discoveredAccounts: accountsN(22), sourceJobs, owners, durableCoverage: throughD1 });
+  assert.equal(done.disposition, "idempotent-complete"); assert.equal(done.reason, "durable-coverage-complete");
 });
 
-test("G1b. DURABLE-COVERAGE idempotence: terminal non-OLI cycle + COMPLETE per-account coverage -> idempotent-complete (manual/scheduled collision resolved, zero creates)", () => {
+test("G1b. DURABLE-COVERAGE authority: complete->idempotent-complete; below D-1->supersede (stale, never blocked); unreadable(null)->terminal-refuse (fail closed)", () => {
   const cat = { sourceJobs: [{ source_key: "product-catalog", request_hash: "cat", fetch_status: "succeeded", create_export_count: 1 }], owners: [{ request_hash: "cat", account_id: "__organization" }] };
   const coverageByAccountId = Object.fromEntries(accountsN(22).map((a) => [a.accountId, [{ from: "2025-01-01", to: "2026-08-25" }]]));
   const cov = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId, start: "2025-01-01", asOf: "2026-08-25" });
   assert.equal(cov.complete, true, "all 22 accounts prove [2025-01-01..asOf]");
   const cls = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: cov });
-  assert.equal(cls.disposition, "idempotent-complete", "complete durable coverage turns the collision into a zero-create success");
+  assert.equal(cls.disposition, "idempotent-complete", "complete durable coverage -> zero-create success");
   assert.equal(cls.reason, "durable-coverage-complete");
-  // INCOMPLETE coverage keeps the strict refusal (fail closed).
+  // INCOMPLETE coverage (below D-1) -> SUPERSEDE (stale terminal evidence; never refuse/block).
   const short = assessDurableOliCoverageComplete({ discoveredAccounts: accountsN(22), coverageByAccountId: { ...coverageByAccountId, [accountsN(22)[0].accountId]: [{ from: "2025-01-01", to: "2026-08-20" }] }, start: "2025-01-01", asOf: "2026-08-25" });
   assert.equal(short.complete, false); assert.equal(short.missingAccounts.length, 1);
-  const refuse = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: short });
-  assert.equal(refuse.disposition, "terminal-refuse", "incomplete coverage never authorizes idempotence");
-  // ABSENT/unreadable coverage (null) keeps the strict refusal too.
+  const sup = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: short });
+  assert.equal(sup.disposition, "supersede", "incomplete coverage supersedes the stale terminal cycle");
+  assert.equal(sup.missingAccounts.length, 1);
+  // UNREADABLE coverage (null) fails closed -- never classify freshness without evidence.
   const strict = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "succeeded" }, discoveredAccounts: accountsN(22), ...cat, durableCoverage: null });
   assert.equal(strict.disposition, "terminal-refuse");
 });
 
-test("G3. an ABSENT or RUNNING cycle -> run (create/continue OLI); an unexpected status fails closed", () => {
+test("G3. an ABSENT / RUNNING / PENDING cycle -> run (create/continue OLI); a truly unexpected status fails closed", () => {
   assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: null }).disposition, "run");
   assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "running" } }).disposition, "run");
-  const bad = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "pending" }, discoveredAccounts: accountsN(22), sourceJobs: [], owners: [] });
+  assert.equal(classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "pending" }, discoveredAccounts: accountsN(22), sourceJobs: [], owners: [] }).disposition, "run", "a pending base cycle runs");
+  const bad = classifyScheduledOliCycle({ bucket: "non-us", cycle: { id: "c", status: "archived" }, discoveredAccounts: accountsN(22), sourceJobs: [], owners: [] });
   assert.equal(bad.disposition, "refuse");
   assert.match(bad.reason, /unexpected-cycle-status/);
 });
