@@ -12753,3 +12753,20 @@ CLI here -> immutable run metadata now printed in every summary; acceptance is c
 Tests: +scheduler-v2-hardening (13 shape/contract assertions) + updated cron assertions across
 automation/d1-freshness/superseding/test-sync. npm run verify 81 steps / 61 suites (incl build) green. Deploy +
 current-head release acceptance next.
+
+## Scheduler v2 -- release BASE-cycle fix + full 66/24 acceptance (2026-08-27, code e1816f7)
+
+Deferred release acceptance completed on current head. FOUND + FIXED a superseding<->release interaction: the
+superseding-attempt model made getSyncCycleByBucketDate return the ACTIVE HEAD, which on a re-attempted day is an
+OLI-ONLY superseding cycle (0 catalog jobs) -> the priority-release finalize (needs exactly 1 catalog job) refused
+"catalog-job-count: 0". FIX: getBaseSyncCycleByBucketDate (supersedes_cycle_id IS NULL = the catalog owner) injected
+into the release CLI. A fresh day is unaffected (head == base); a re-attempted day now finalizes. NOTE for future:
+if a release ever fails "catalog-job-count", the cycle picked is a superseding OLI head -- use the base resolver.
+
+LIVE ACCEPTANCE (current head, both buckets): Non-US published 66 (report,account) pairs, US 24 (tokens=2/bucket = 1
+catalog create; 0 export tokens for the derive/publish); ALL 30 accounts labelled (Non-US 5 final + 17 provisional,
+US 2 final + 6 provisional -- inactive 0-order accounts backfilled + root-fixed to explicit Final D-1); Brand
+membership rebuilt (111 pairs); controls safe-closed. IDEMPOTENCE proven: re-run normal operator -> ALREADY_PUBLISHED_D1,
+creates=0/tokens=0. FAILED-RUN RECONCILIATION: GitHub run's DATADOE_D1_NOT_READY/provenThrough=2026-08-25(D-2)/17-behind
+is the OLD held-behavior signature -> it ran PRE-provisional 1e9b600; bucket=non-us correct (0 2 cron; delayed exec).
+verify 81 steps/61 suites green. See [[scheduler-v2-provisional-final]].
