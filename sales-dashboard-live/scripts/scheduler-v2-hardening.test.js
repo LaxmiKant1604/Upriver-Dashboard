@@ -96,4 +96,13 @@ test("token ceilings remain Non-US 20 / US 10 (shared operation-wide across prim
   assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\}/);
 });
 
+/* the release resolves the BASE cycle (owns the Catalog job), not the OLI-only superseding head */
+test("release finalize targets the BASE cycle (Catalog owner), not the OLI-only superseding head", () => {
+  const cli = readFileSync(resolve(ROOT, "scripts", "release", "priority-dashboards-release.mjs"), "utf8");
+  assert.match(cli, /getCycleByBucketDate:\s*sb\.getBaseSyncCycleByBucketDate/, "release uses the BASE-cycle resolver");
+  const supa = readFileSync(resolve(ROOT, "lib", "server", "supabase.js"), "utf8");
+  assert.match(supa, /getBaseSyncCycleByBucketDate/, "a base-cycle resolver exists");
+  assert.match(supa, /supersedes_cycle_id:\s*"is\.null"/, "the base resolver filters supersedes_cycle_id IS NULL");
+});
+
 out("\n" + passed + " assertions passed");

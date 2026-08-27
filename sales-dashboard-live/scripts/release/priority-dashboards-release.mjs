@@ -48,7 +48,9 @@ const opKeyArg = (process.argv.find((a) => a.startsWith("--operation-key=")) || 
 if (opKeyArg) console.log("priority-release: catalog operation key = " + opKeyArg);
 let release;
 try {
-  release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg, ...(opKeyArg ? { operationKey: opKeyArg } : {}) });
+  // Resolve the BASE cycle (the one that owns the shared Product Catalog job), not the OLI-only superseding HEAD --
+  // so the release's Catalog reservation + finalize verification target the cycle that actually carries the catalog.
+  release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg, ...(opKeyArg ? { operationKey: opKeyArg } : {}), getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate });
 } catch (e) { console.error("STOP " + (e && e.message ? e.message : e)); process.exit(2); }
 
 // A dedicated read-only pg client for the cron proof (never mutates).

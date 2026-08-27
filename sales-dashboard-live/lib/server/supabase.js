@@ -894,6 +894,25 @@ export async function getSyncCycleByBucketDate(bucket, cycleDate, { signal = nul
   return resolveActiveCycleHead(rows);
 }
 
+// The BASE cycle for a (bucket, cycle_date): the one with supersedes_cycle_id IS NULL. The OLI operator supersedes a
+// stale terminal cycle with an OLI-ONLY attempt (no Product Catalog job), so the ACTIVE HEAD can be an OLI-only
+// superseding attempt. The PRIORITY RELEASE finalize verifies a cycle carrying the shared Catalog job (+ OLI jobs) --
+// that job lives on the BASE cycle, so the release resolves the BASE, not the head. Exactly one base per slot (the
+// partial-unique index guarantees it); >1 base fails closed; none returns null.
+export async function getBaseSyncCycleByBucketDate(bucket, cycleDate, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "id,bucket,cycle_date,status,trigger,operation_key,supersedes_cycle_id,attempt_kind,created_at,started_at,finished_at",
+    bucket: `eq.${bucket}`,
+    cycle_date: `eq.${cycleDate}`,
+    supersedes_cycle_id: "is.null",
+    limit: "10",
+  });
+  const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  if (rows.length > 1) throw new Error(`getBaseSyncCycleByBucketDate: ${rows.length} BASE cycles for (${bucket}, ${cycleDate}); fail closed.`);
+  return rows[0];
+}
+
 // Read-only: the superseded target the ACTIVE head points at (or null). Used by the classifier/operators to prove
 // they are superseding the exact terminal cycle they observed.
 export async function getActiveSyncCycleChain(bucket, cycleDate, { signal = null } = {}) {
