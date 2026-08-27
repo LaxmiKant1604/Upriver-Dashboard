@@ -98,12 +98,15 @@ export function makePortfolioCompletenessAugment({ organizationFingerprint, conn
 // any failure returns {} so a completeness hiccup never breaks a report read.
 export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read }) {
   return async ({ accountId, params }) => {
-    if (!organizationFingerprint || !accountId || typeof read !== "function") return {};
+    // Daily uses the real accountId as the serve id; the Brand endpoints use a brand-SCOPED serve id but carry the
+    // real account in params.accountId -- prefer that so completeness always keys on the real account.
+    const acc = params && params.accountId ? String(params.accountId) : (accountId ? String(accountId) : "");
+    if (!organizationFingerprint || !acc || typeof read !== "function") return {};
     try {
       const rows = await read({
-        organizationFingerprint, connectionId, accountIds: [String(accountId)],
+        organizationFingerprint, connectionId, accountIds: [acc],
         from: params && params.from ? String(params.from) : null,
-        to: params && params.to ? String(params.to) : null,
+        to: params && (params.to || params.asOf) ? String(params.to || params.asOf) : null,
       });
       const c = summarizeCompleteness(rows);
       return c ? { completeness: c } : {};

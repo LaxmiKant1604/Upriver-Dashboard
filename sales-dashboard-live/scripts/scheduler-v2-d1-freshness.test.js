@@ -203,10 +203,13 @@ async function main() {
     assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS");
   });
 
-  test("14. automatic schedules remain EXACTLY 02:00 UTC (non-us) + 10:30 UTC (us)", () => {
+  test("14. schedules: primary + ~1h fallback per bucket, each mapping deterministically to its bucket", () => {
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"]);
-    assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/); assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/);
+    assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"]);
+    assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/); assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us"/);
+    assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/); assert.match(yml, /"30 11 \* \* \*"\)\s*bucket="us"/);
+    // run_kind is recorded (primary vs fallback) and the summary prints immutable metadata (SHA + event + cron).
+    assert.match(yml, /run_kind=/); assert.match(yml, /head\/workflow SHA/); assert.match(yml, /github\.sha/);
   });
 
   test("15. force-latest cannot be activated by a scheduled event or an ordinary read (dispatch-only + run_id required + typed key)", () => {

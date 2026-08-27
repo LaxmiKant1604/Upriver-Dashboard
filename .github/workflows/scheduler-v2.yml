@@ -25,10 +25,15 @@ name: scheduler-v2
 
 on:
   schedule:
-    # 02:00 UTC = 07:30 IST -> the Non-US bucket publish; 10:30 UTC = 16:00 IST -> the US bucket publish. Each derives
-    # + publishes ONLY its own bucket's accounts. The bucket is resolved from WHICH cron fired -- never from the clock.
-    - cron: "0 2 * * *"
-    - cron: "30 10 * * *"
+    # Each cron maps DETERMINISTICALLY to exactly one bucket (resolved from github.event.schedule, never the clock).
+    # PRIMARY + a bounded FALLBACK ~1h later per bucket: GitHub scheduled events can be delayed or dropped, so the
+    # fallback re-runs the SAME durable operation (shared operation identity keyed by bucket + requestedAsOf, NOT the
+    # cron string). If the primary already published D-1 the fallback is a zero-create/zero-token idempotent no-op
+    # (ALREADY_PUBLISHED_D1); if the primary failed before completing, the fallback resumes + completes it.
+    - cron: "0 2 * * *"    # Non-US PRIMARY  -- 02:00 UTC / 07:30 IST
+    - cron: "0 3 * * *"    # Non-US FALLBACK -- 03:00 UTC / 08:30 IST
+    - cron: "30 10 * * *"  # US PRIMARY      -- 10:30 UTC / 16:00 IST
+    - cron: "30 11 * * *"  # US FALLBACK     -- 11:30 UTC / 17:00 IST
   workflow_dispatch:
     inputs:
       bucket:
@@ -88,14 +93,19 @@ jobs:
         id: cfg
         run: |
           set -euo pipefail
+          run_kind="primary"
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Resolve the bucket from WHICH cron fired -- deterministic, never inferred from the wall clock.
+            # Resolve the bucket from WHICH cron fired -- deterministic, never inferred from the wall clock. Primary
+            # and fallback crons for a bucket map to the SAME bucket; an unknown cron fails closed BEFORE any I/O.
             case "${{ github.event.schedule }}" in
-              "0 2 * * *")   bucket="non-us" ;;
-              "30 10 * * *") bucket="us" ;;
+              "0 2 * * *")   bucket="non-us"; run_kind="primary"  ;;
+              "0 3 * * *")   bucket="non-us"; run_kind="fallback" ;;
+              "30 10 * * *") bucket="us";     run_kind="primary"  ;;
+              "30 11 * * *") bucket="us";     run_kind="fallback" ;;
               *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
             esac
-            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch.
+            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch (a
+            # scheduled event carries no inputs, so injection is impossible).
             mode="normal"
           else
             bucket="${{ github.event.inputs.bucket }}"
@@ -106,12 +116,28 @@ jobs:
           if [ "$mode" != "normal" ] && [ "$mode" != "force-latest" ]; then echo "Invalid refresh_mode '$mode'." >&2; exit 1; fi
           if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
+          # Durable operation identity is bucket + requestedAsOf (NOT the cron) so primary + fallback share ONE
+          # operation + one durable token/create budget.
+          opkey="scheduled-fresh/$bucket/$asof"
+          contract="oli-sales:item_status-v1"  # the canonical OLI fragment carries item_status (provisional/final)
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
-          { echo "### scheduler-v2 run"; echo "- bucket: $bucket (publishes ONLY this bucket; the other bucket is untouched)"; echo "- requestedAsOf (D-1): $asof"; echo "- refresh_mode: $mode"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
-          echo "Resolved bucket=$bucket requestedAsOf=$asof mode=$mode tokenmin=$tokenmin"
+          echo "run_kind=$run_kind" >> "$GITHUB_OUTPUT"
+          echo "opkey=$opkey" >> "$GITHUB_OUTPUT"
+          # IMMUTABLE run metadata in EVERY summary -- so any future run's version + bucket are provable from the
+          # summary alone (no gh CLI needed): event, cron, resolved bucket, run kind, head/workflow SHA, run id,
+          # requestedAsOf, refresh mode, operation key, source contract, token ceiling.
+          {
+            echo "### scheduler-v2 run";
+            echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · run kind: $run_kind";
+            echo "- resolved bucket: **$bucket** (publishes ONLY this bucket; the other bucket is untouched)";
+            echo "- head/workflow SHA: \`${{ github.sha }}\` · ref: \`${{ github.ref }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
+            echo "- requestedAsOf (D-1): $asof · refresh_mode: $mode · operation key: \`$opkey\`";
+            echo "- source contract: $contract · token ceiling: $tokenmin";
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' bucket=$bucket run_kind=$run_kind sha=${{ github.sha }} requestedAsOf=$asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci

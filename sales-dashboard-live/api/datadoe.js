@@ -94,6 +94,22 @@ import {
 } from "../lib/server/manual-source-continuation.js";
 import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
 import { makeCompletenessAugment, makePortfolioCompletenessAugment } from "../lib/server/reports/oli-completeness-serve.js";
+
+// The primary connection's org fingerprint (for the serve-time two-layer completeness augments). Null if no primary.
+function primaryOrgFingerprintOrNull() {
+  const p = getDataDoeConnections().find((cn) => cn && cn.id === "primary" && String(cn.apiKey || "").trim());
+  return p ? (p.organizationFingerprint || organizationFingerprint(p.apiKey)) : null;
+}
+// A single-account completeness augment (Daily + single-account Brand endpoints; resolves the real account from params).
+function oliCompletenessAugmentSingle() {
+  const fp = primaryOrgFingerprintOrNull();
+  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness }) : null;
+}
+// A portfolio (multi-account) completeness augment (Brand View portfolio surfaces; any provisional -> provisional).
+function oliCompletenessAugmentPortfolio(accountIds) {
+  const fp = primaryOrgFingerprintOrNull();
+  return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness }) : null;
+}
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
@@ -2507,6 +2523,7 @@ async function handleDataDoe(req, res) {
         userId: access.userId,
         label: "Brand View",
         contributingProvenanceAt: singleProvenanceAt,
+        augmentResponse: oliCompletenessAugmentSingle(),
         build: () => buildBrandViewSnapshot({
           accountId,
           brand,
@@ -2596,6 +2613,7 @@ async function handleDataDoe(req, res) {
         // than a single-account build, so the lock is held for longer.
         lockSeconds: 300,
         build: buildPortfolio,
+        augmentResponse: oliCompletenessAugmentPortfolio(accountIds),
         // The read NEVER runs the full rebuild inline (the 504 source): it serves LKG + `updating`, and the
         // bounded rebuild runs only on an explicit refresh.
         deferRebuildOnRead: true,
@@ -2674,6 +2692,11 @@ async function handleDataDoe(req, res) {
         ...legacyShared,
         userId: access.userId,
       };
+      // Brand Sales (single account) carries the SAME two-layer completeness label as Daily / Brand View, so its
+      // provisional/final D-1 state is consistent across every OLI surface.
+      if (action === "brand-sales" && accountScope && accountScope.accountIds.length === 1) {
+        sharedOptions.augmentResponse = oliCompletenessAugmentSingle();
+      }
       // Daily Reporting self-heals on a READ: if no daily-reporting-shared-v2 snapshot exists yet, recompute it
       // from durable evidence (OLI history + ASIN Ads + the reusable Product Catalog snapshot) through the REAL
       // derivation contract and publish it -- ZERO DataDoe. This closes the rollout-order gap where the frontend

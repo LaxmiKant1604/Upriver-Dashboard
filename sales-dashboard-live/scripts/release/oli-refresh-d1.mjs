@@ -74,7 +74,7 @@ async function coverageState() {
 
 let cov0 = await coverageState();
 log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + ")");
-if (cov0.durableComplete) { log("durable coverage ALREADY complete through D-1 -- ZERO creates."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true })); process.exit(0); }
+if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true })); process.exit(0); }
 if (cov0.anyUnreadable) { console.error("STOP OLI coverage unreadable -- fail closed (never classify freshness without evidence)."); process.exit(1); }
 
 // Classify the (bucket, today) ACTIVE head. A terminal head below D-1 => SUPERSEDE; a running/pending head => run.
@@ -98,7 +98,7 @@ if (head && head.id) {
   const cls = classifyScheduledOliCycle({ bucket, cycle: head, discoveredAccounts: discovered, sourceJobs: jobs, owners, durableCoverage });
   log("head " + workingCycleId.slice(0, 8) + " status=" + head.status + " -> classification=" + cls.disposition + (cls.reason ? " (" + cls.reason + ")" : ""));
   if (cls.disposition === "refuse" || cls.disposition === "terminal-refuse") { console.error("STOP CYCLE_REFUSED (" + cls.reason + ") -- fail closed."); process.exit(1); }
-  if (cls.disposition === "idempotent-complete") { log("idempotent D-1 complete; ZERO creates."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, creates: 0, tokens: 0, d1Complete: true })); process.exit(0); }
+  if (cls.disposition === "idempotent-complete") { log("ALREADY_PUBLISHED_D1: idempotent D-1 complete; ZERO creates, ZERO tokens."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true })); process.exit(0); }
   if (cls.disposition === "supersede") {
     // Open a durable SUPERSEDING running attempt on the same slot; the terminal cycle stays IMMUTABLE.
     let newId;

@@ -134,7 +134,7 @@ async function main() {
     assert.match(rt, /forceFreshOli === true && sourceKey === "order-line-items"/, "force-fresh is OLI-only");
     assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no campaign/fba workflow step");
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"]);
+    assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"]);
   });
 
   test("14. a successful workflow cannot report provenThrough below requestedAsOf: the strict D-1 gate publishes ONLY at status 'exact'", () => {

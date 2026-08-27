@@ -176,12 +176,15 @@ group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-
 test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UTC (us), bucket resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
-  // EXACTLY the two reviewed crons: 02:00 UTC = 07:30 IST Non-US, 10:30 UTC = 16:00 IST US.
+  // Four crons: a PRIMARY + a ~1h FALLBACK per bucket (Non-US 02:00/03:00 UTC, US 10:30/11:30 UTC).
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "exactly the two reviewed cron times");
-  // The bucket comes from WHICH cron fired -- deterministic mapping, never inferred from the clock.
-  assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/, "02:00 UTC maps to non-us");
-  assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/, "10:30 UTC maps to us");
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "primary + fallback crons per bucket");
+  // The bucket comes from WHICH cron fired -- deterministic mapping, never inferred from the clock. Primary AND
+  // fallback of a bucket map to the SAME bucket.
+  assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/, "02:00 UTC (primary) maps to non-us");
+  assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us"/, "03:00 UTC (fallback) maps to non-us");
+  assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/, "10:30 UTC (primary) maps to us");
+  assert.match(yml, /"30 11 \* \* \*"\)\s*bucket="us"/, "11:30 UTC (fallback) maps to us");
   assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
   assert.doesNotMatch(yml, /only workflow_dispatch is accepted/, "the pause-era dispatch-only gate is gone");
   assert.match(yml, /concurrency:\s*\n\s*group:\s*scheduler-v2/, "single-run concurrency group");
@@ -260,9 +263,9 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.doesNotMatch(yml, /oli-force-latest\.mjs/, "the separate force-latest step is merged into the one D-1 OLI step");
   // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
-  // schedules unchanged.
+  // schedules: primary + fallback per bucket.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "02:00 UTC non-us + 10:30 UTC us unchanged");
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "02:00/03:00 non-us + 10:30/11:30 us");
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");

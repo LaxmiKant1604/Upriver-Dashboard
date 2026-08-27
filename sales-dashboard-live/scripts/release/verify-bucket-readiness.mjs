@@ -110,8 +110,9 @@ for (const id of ids) {
 }
 
 // TWO-LAYER COMPLETENESS: read the provisional/final state the sync recorded for D-1. Under the business override,
-// pending itemization PUBLISHES provisional (its coverage advanced to D-1) -- it is NOT a not-ready. Only a
-// source-defect account keeps its LKG; it is EXCLUDED from the all-or-nothing D-1 gate so it never blocks the others.
+// expected pending itemization PUBLISHES provisional (its coverage advanced to D-1) -- it is NOT a not-ready. A
+// GENUINE source-defect (an itemized recognized-sale row with a null value) is a HARD STOP: it FAILS CLOSED with a
+// typed SOURCE_DEFECT (LKG retained, escalate) -- never masked as provisional, never published.
 let provisionalCount = 0, finalCount = 0; const defectIds = new Set();
 try {
   const crows = await getOliCompleteness({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: ids, from: requestedAsOf, to: requestedAsOf });
@@ -121,14 +122,19 @@ try {
     else if (r.completeness_status === "source-defect") defectIds.add(String(r.account_id));
   }
 } catch (e) { log("completeness read failed (non-fatal): " + (e && e.message ? e.message : e)); }
-const gateAccounts = discovered.filter((a) => !defectIds.has(a.accountId));
-const runClass = defectIds.size > 0 ? "SOURCE_DEFECT" : (provisionalCount > 0 ? "D1_PROVISIONAL" : "D1_FINAL");
+if (defectIds.size > 0) {
+  ghOut("status", "SOURCE_DEFECT"); ghOut("run_class", "SOURCE_DEFECT"); ghOut("proceed", "false"); ghOut("effective_asof", ""); ghOut("requested_asof", requestedAsOf);
+  ghSum("### D-1 readiness (" + bucket + ")\n- **SOURCE_DEFECT** -- " + defectIds.size + " account(s) have an itemized recognized-sale row with a NULL value at " + requestedAsOf + " (a genuine DataDoe source-data defect)\n- FAIL CLOSED: no publish, LKG retained. Run: node scripts/release/oli-escalation-report.mjs --bucket=" + bucket + " --requested-as-of=" + requestedAsOf);
+  console.error("STOP SOURCE_DEFECT (" + bucket + "): " + defectIds.size + " account(s) have a genuine itemized-value defect at " + requestedAsOf + " -- LKG retained, escalate to DataDoe.");
+  process.exit(1);
+}
+const runClass = provisionalCount > 0 ? "D1_PROVISIONAL" : "D1_FINAL";
 
-// PREVIOUS-DAY (D-1) publish gate over the NON-defect accounts: each must have a successfully extracted D-1 window
-// (provisional or final -- both advanced coverage to requestedAsOf). An interior gap, blank provenance, or unreadable
-// coverage is still a typed DATADOE_D1_NOT_READY (LKG retained). Expected pending itemization is NOT a stop.
+// PREVIOUS-DAY (D-1) publish gate over ALL accounts: each must have a successfully extracted D-1 window (provisional
+// or final -- both advanced coverage to requestedAsOf). An interior gap, blank provenance, or unreadable coverage is
+// still a typed DATADOE_D1_NOT_READY (LKG retained). Expected pending itemization is NOT a stop.
 const result = assessBucketPublishReadiness({
-  bucket, requestedAsOf, from: oliStart, discoveredAccounts: gateAccounts.length ? gateAccounts : discovered,
+  bucket, requestedAsOf, from: oliStart, discoveredAccounts: discovered,
   coverageByAccountId, provenanceBlankByAccountId,
   adsCoveredByAccountId, adsFailedByAccountId, adsUnavailableByAccountId,
   cyclePresent, cycleOliAssessment,

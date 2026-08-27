@@ -80,10 +80,10 @@ test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exa
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
   assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
-  // Cron is ACTIVE again (the collision/prerequisite/preflight failure classes are corrected): exactly the two
-  // reviewed times -- 02:00 UTC (07:30 IST, non-us) and 10:30 UTC (16:00 IST, us) -- and nothing else.
+  // Cron is ACTIVE: a PRIMARY + a ~1h FALLBACK per bucket -- 02:00/03:00 UTC (non-us) and 10:30/11:30 UTC (us) --
+  // and nothing else. The fallback survives a delayed/dropped GitHub scheduled event (idempotent, shared operation).
   const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "exactly the two reviewed cron times");
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "primary + fallback crons per bucket");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
 });
 

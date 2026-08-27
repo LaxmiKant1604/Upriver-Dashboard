@@ -42,6 +42,7 @@
     "test:scheduler-bucket-independence": "node scripts/scheduler-v2-bucket-independence.test.js",
     "test:scheduler-d1-freshness": "node scripts/scheduler-v2-d1-freshness.test.js",
     "test:scheduler-superseding": "node scripts/scheduler-v2-superseding.test.js",
+    "test:scheduler-hardening": "node scripts/scheduler-v2-hardening.test.js",
     "test:asin-ads-aggregation": "node scripts/asin-ads-aggregation.test.js",
     "test:daily-durable-rederive": "node scripts/daily-durable-rederive.test.js",
     "test:daily-v2-backfill": "node scripts/daily-v2-backfill.test.js",
