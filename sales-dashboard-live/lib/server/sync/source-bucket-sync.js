@@ -532,9 +532,12 @@ export async function runBucketSourceSync({
         }
         const accountsBySellerId = Object.fromEntries(unit.accounts.map((a) => [a.rawSellerId, { accountId: a.accountId, currency: a.currency }]));
         // DIMENSIONAL persist: the fragment now carries amazon_order_status / fulfillment_channel / address_state /
-        // address_city. The builder validates the authoritative order rules PER ACCOUNT (a value-missing / missing-
-        // status account is BLOCKED -- its window is never written, its coverage never advanced, LKG preserved --
-        // and reported), and returns the dimensional rows + the non-cancelled daily rollup for each good account.
+        // address_city / item_status. The builder validates the authoritative order rules PER ACCOUNT and classifies
+        // by the ITEM-LEVEL signal: an account with a not-yet-itemized / pre-sale row is HELD (OLI_D1_PENDING_ITEMIZATION
+        // -- expected Amazon item-level lag), an itemized-but-null row is a real defect (OLI_ITEMIZED_VALUE_MISSING),
+        // and a missing-status row is refused (OLI_ORDER_STATUS_MISSING). A blocked account's window is never written,
+        // its coverage never advanced, LKG preserved, and it is reported with a redacted itemization summary. The
+        // builder returns the dimensional rows + the non-cancelled daily rollup for each fully-resolved account.
         const { byAccount, rollupByAccount, orderAuditByAccount, blocked } = oliDimensionalRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,

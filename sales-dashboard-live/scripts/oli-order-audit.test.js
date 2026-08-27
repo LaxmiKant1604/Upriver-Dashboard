@@ -110,10 +110,15 @@ test("8. a positive-value order still contributes its exact sales/units to the r
 });
 
 // ---- 9. NULL price on a non-cancelled positive-unit row: fail-closed (LKG), NO audit written ----------------
-test("9. a non-cancelled units>0 row with a MISSING value BLOCKS the account (LKG) -- no audit row emitted", () => {
-  const res = build([frag({ amazon_order_status: "Shipped", amazon_order_id: "NUL-1", total_sales_sum: null, total_units_sum: 2 })]);
-  assert.ok(res.blocked.some((b) => b.accountId === "ACC-1" && b.code === "OLI_NON_CANCELLED_VALUE_MISSING"));
-  assert.equal(res.orderAuditByAccount.has("ACC-1"), false, "a blocked account writes NO audit rows (LKG preserved)");
+test("9. a non-cancelled units>0 row with a MISSING value HOLDS/BLOCKS the account (LKG) -- no audit row emitted", () => {
+  // not-yet-itemized (item_status blank) -> honest PENDING hold
+  const held = build([frag({ amazon_order_status: "Shipped", item_status: "", amazon_order_id: "NUL-1", total_sales_sum: null, total_units_sum: 2 })]);
+  assert.ok(held.blocked.some((b) => b.accountId === "ACC-1" && b.code === "OLI_D1_PENDING_ITEMIZATION"));
+  assert.equal(held.orderAuditByAccount.has("ACC-1"), false, "a held account writes NO audit rows (LKG preserved)");
+  // itemized recognized-sale with a null value -> real defect block
+  const def = build([frag({ amazon_order_status: "Shipped", item_status: "Shipped", amazon_order_id: "NUL-2", total_sales_sum: null, total_units_sum: 2 })]);
+  assert.ok(def.blocked.some((b) => b.accountId === "ACC-1" && b.code === "OLI_ITEMIZED_VALUE_MISSING"));
+  assert.equal(def.orderAuditByAccount.has("ACC-1"), false, "a blocked account writes NO audit rows (LKG preserved)");
 });
 
 // ---- 10. blank Order ID: never invented, typed unavailable -------------------------------------------------
@@ -228,7 +233,10 @@ test("20. cancellation / explicit-zero / missing-value classification is unchang
   const zero = classifyOliDimensionalRow(frag({ total_sales_sum: 0, total_units_sum: 2 }));
   assert.equal(zero.valuePresent, true);
   assert.equal(zero.contributesToRollup, false);
-  assert.throws(() => classifyOliDimensionalRow(frag({ total_sales_sum: null, total_units_sum: 2 })), (e) => e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
+  // a missing value no longer THROWS; it is typed pending (not-yet-itemized) vs defect (itemized) by item_status
+  const pend = classifyOliDimensionalRow(frag({ item_status: "", total_sales_sum: null, total_units_sum: 2 }));
+  assert.equal(pend.pending, true);
+  assert.equal(pend.contributesToRollup, false);
   const pos = classifyOliDimensionalRow(frag({ total_sales_sum: 10, total_units_sum: 1 }));
   assert.equal(pos.contributesToRollup, true);
 });

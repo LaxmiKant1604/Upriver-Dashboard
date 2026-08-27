@@ -47,6 +47,7 @@ const SUITES = [
   "test:source-fixpoint",
   "test:source-durable-model",
   "test:oli-dimensional",
+  "test:oli-itemization",
   "test:oli-value-policy",
   "test:oli-quality",
   "test:oli-order-audit",

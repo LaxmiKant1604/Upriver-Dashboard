@@ -102,16 +102,21 @@ const RECON_SETTLEMENT_AGGREGATIONS = [
 // => one DataDoe export owned by MULTIPLE reports. item_price_currency is in the group-by so DataDoe never
 // sums money across currencies; each report's fold re-aggregates to its own grain (currency kept in key).
 // The canonical OLI fragment carries four order dimensions (amazon_order_status, fulfillment_channel,
-// address_state, address_city) PLUS amazon_order_id (all proven present in the DataDoe source schema). address_country
-// stays deliberately EXCLUDED. amazon_order_id widens the returned grain to ORDER level, but the persist path FOLDS
-// it away for both the dimensional table AND the (date,sku,child_asin,currency) rollup, so every existing consumer of
-// source_oli_dimensional_history / source_oli_daily_history stays BYTE-IDENTICAL; the Order ID is written only to the
-// separate source_oli_order_audit table. Adding a column CHANGES every OLI request_hash, so capture begins with the
-// next FORWARD sync (rolling window / new-account backfill); already-covered historical windows are NEVER
-// re-exported. The 7-day rolling window stays well under OLI_SALES_ROW_LIMIT even at order grain (measured peak ~1k).
-export const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+// address_state, address_city) PLUS amazon_order_id AND item_status (all proven present in the DataDoe source
+// schema, source 89b27535d2). address_country stays deliberately EXCLUDED. amazon_order_id widens the returned grain
+// to ORDER level and item_status to ITEM level, but the persist path FOLDS both away for the dimensional table AND
+// the (date,sku,child_asin,currency) rollup, so every existing consumer of source_oli_dimensional_history /
+// source_oli_daily_history stays BYTE-IDENTICAL; item_status is a CLASSIFICATION input only (never a stored
+// dimension). item_status is the ITEM-LEVEL completion signal: PROVEN in the raw source, a null item_price_value
+// corresponds to a blank item_status (an order-level shell Amazon has not yet itemized ~1-2 days after placement),
+// which the classifier treats as expected PENDING itemization rather than a defect. Adding a column CHANGES every
+// OLI request_hash, so capture begins with the next FORWARD sync (rolling window / new-account backfill);
+// already-covered historical windows are NEVER re-exported. The 7-day rolling window stays well under
+// OLI_SALES_ROW_LIMIT even at order grain (measured peak ~1k; item_status is near-functionally-dependent on the
+// order-item, so it barely changes the row count).
+export const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 const OLI_SALES_GROUP_BY = [...OLI_SALES_COLUMNS];
-const OLI_SALES_AGGREGATIONS = [
+export const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];

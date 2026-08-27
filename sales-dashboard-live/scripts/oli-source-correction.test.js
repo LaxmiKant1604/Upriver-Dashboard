@@ -365,7 +365,7 @@ const fbaOli = () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: 
 // address_state, address_city) PLUS amazon_order_id (future-only capture); the live fetch and the scheduler
 // contract use the SAME 10-column spec, so a manual refresh still reuses the scheduled export (one request_hash,
 // many owners) -- adding the column keeps live == scheduler, it does not split them into two exports.
-const LIVE_OLI_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const LIVE_OLI_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 const liveOliRequestHash = (slice, ids = ["A1"], apiKey = "k") => sourceRequestIdentity({
   apiKey, sourceId: OLI_ID, columns: LIVE_OLI_COLUMNS,
   ids, from: slice.from, to: slice.to, limit: 5000,

@@ -236,10 +236,11 @@ test("returns-leakage: SLICED derive deep-equals the former UNSPLIT calculation 
 
 test("GOLDEN: the sliced request windows produce the pinned request_hashes for a fixed synthetic input", () => {
   // Fixed input (PIN_KEY / A1 / asOf 2025-08-10). These hashes CHANGED intentionally with the CANONICAL OLI
-  // fragment now carrying the four order dimensions PLUS amazon_order_id (future-only capture) (columns [date,
-  // seller_or_vendor_id, sku, child_asin, item_price_currency, amazon_order_status, fulfillment_channel,
-  // address_state, address_city, amazon_order_id], sliced by canonicalOliSlices with DataDoe's verified 5,000-row
-  // OLI ceiling) -- pinning the first+last slice locks the corrected identities against silent drift.
+  // fragment now carrying the four order dimensions PLUS amazon_order_id AND item_status (future-only, item-level
+  // completion signal) (columns [date, seller_or_vendor_id, sku, child_asin, item_price_currency,
+  // amazon_order_status, fulfillment_channel, address_state, address_city, amazon_order_id, item_status], sliced by
+  // canonicalOliSlices with DataDoe's verified 5,000-row OLI ceiling) -- pinning the first+last slice locks the
+  // corrected identities against silent drift.
   const daily = reportSourceRequestHashes({
     reportKey: "daily-reporting", apiKey: ["PIN", "KEY"].join("_"), ids: ["A1"],
     windowsByRequestKey: {
@@ -250,8 +251,8 @@ test("GOLDEN: the sliced request windows produce the pinned request_hashes for a
   assert.equal(daily.length, 27, "6 calendar months (Mar..Aug-partial) -> 27 slices");
   assert.deepEqual([daily[0].from, daily[0].to], ["2025-03-01", "2025-03-07"]);
   assert.deepEqual([daily[daily.length - 1].from, daily[daily.length - 1].to], ["2025-08-08", "2025-08-10"]);
-  assert.equal(daily[0].requestHash, "1cb88d33ff6ed3bc7f5a3dce0174d483f34a4cca7fcc6482be4da041ef1f14c6");
-  assert.equal(daily[daily.length - 1].requestHash, "cd380fd8ac209d28c81b60b72b2b03df7e1fb8780b8b84b5c81c3ee6d1c2beaf");
+  assert.equal(daily[0].requestHash, "5a6eb8e5fd1ae372e8caa8d2e6650c4f47f1af5c8fc292870bbea4ef37b051ab");
+  assert.equal(daily[daily.length - 1].requestHash, "0d8d2f94b0da15f30c5b14aff495df6ab7a0de804229d6aa9ef999571b46a343");
 });
 
 /* ============================= 5: malformed-fragment fail-closed matrix ============================= */

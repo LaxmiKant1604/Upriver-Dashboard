@@ -57,7 +57,7 @@ const DAILY_COLUMNS = [
 // ppc-performance. The fold re-aggregates to (currency|sku), joining to the daily buy-box rows on
 // currency|sku. Fetched over the SAME 28-day window as :daily but sliced by canonicalOliSlices, so its
 // interior + asOf-boundary slices share request_hashes with the other OLI reports (one export, many owners).
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },

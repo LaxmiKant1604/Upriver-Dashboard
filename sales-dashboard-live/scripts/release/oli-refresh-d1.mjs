@@ -113,12 +113,22 @@ if (head && head.id) {
 // FRESH FETCH: run the OLI family (forceFreshOli bypasses the stale cache) on the ACTIVE head (the superseding
 // attempt when we just created one, else the running/fresh base). Bounded resume until drained.
 let iter = 0; let prevOpen = Infinity; let stall = 0;
-const blockedCodes = {}; // account-blocking reasons from the fresh fetch (e.g. OLI_NON_CANCELLED_VALUE_MISSING = unpriced D-1 orders)
+const blockedCodes = {}; // account-block reasons: OLI_D1_PENDING_ITEMIZATION (Amazon item-level lag) | OLI_ITEMIZED_VALUE_MISSING (real defect) | OLI_ORDER_STATUS_MISSING
+const itemz = { resolved: 0, pending: 0, notItemized: 0, presale: 0, defect: 0, pctByAccount: [] }; // itemization diagnostics across held/blocked accounts
 while (iter < MAX_ITERS) {
   iter += 1;
   const res = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, forceFreshOli: true, deadline, preflight });
   if (res && res.refused === true) { console.error("STOP runSourceCardAction refused: " + (res.code || "unknown")); process.exit(1); }
-  for (const b of (res && Array.isArray(res.blockedAccounts) ? res.blockedAccounts : [])) { const code = String(b.code || "unknown"); blockedCodes[code] = (blockedCodes[code] || 0) + 1; }
+  for (const b of (res && Array.isArray(res.blockedAccounts) ? res.blockedAccounts : [])) {
+    const code = String(b.code || "unknown"); blockedCodes[code] = (blockedCodes[code] || 0) + 1;
+    const d = b && b.detail;
+    if (d && typeof d === "object") {
+      itemz.resolved += Number(d.resolved || 0); itemz.pending += Number(d.pending || 0);
+      itemz.notItemized += Number(d.notItemized || 0); itemz.presale += Number(d.presalePending || 0);
+      itemz.defect += Number(d.defect || 0);
+      if (d.latestItemizedPct != null) itemz.pctByAccount.push(Number(d.latestItemizedPct));
+    }
+  }
   const cid = (res && res.cycleId) || workingCycleId;
   workingCycleId = cid ? String(cid) : workingCycleId;
   if (!workingCycleId) { console.error("STOP no working cycle id after fetch"); process.exit(1); }
@@ -166,14 +176,26 @@ const jobsF = (await getSyncSourceJobs(workingCycleId)).filter((j) => (j.source_
 const ownersF = await getSyncSourceJobOwnersForCycle(workingCycleId);
 const a = assessScheduledOliCycle({ bucket, discoveredAccounts: discovered, sourceJobs: jobsF, owners: ownersF, open: await oliOpen(workingCycleId) });
 const d1Complete = cov1.missing.length === 0;
-// PRECISE not-ready reason: a genuinely fresh D-1 export was fetched (creates>0), but coverage did not advance for
-// some accounts. OLI_NON_CANCELLED_VALUE_MISSING means the D-1 orders EXIST but Amazon has not yet settled their
-// PRICES (unpriced non-cancelled units) -- the value-missing policy correctly refuses to persist them as sales;
-// the next rolling refresh advances D-1 once the prices settle. This is NOT a stale-cycle block and NOT a defect.
-const valueMissing = Number(blockedCodes.OLI_NON_CANCELLED_VALUE_MISSING || 0);
-if (Object.keys(blockedCodes).length) log("fresh-fetch block reasons: " + JSON.stringify(blockedCodes) + (valueMissing ? " -- D-1 orders exist but prices are UNSETTLED (unpriced non-cancelled units); honest not-ready, next refresh advances it" : ""));
+// PRECISE, PROVEN not-ready reason (never a vague "settlement delay"). A genuinely fresh D-1 export was fetched
+// (forceFreshOli), but coverage did not advance for some accounts. The item_status classifier separates two cases:
+//   - OLI_D1_PENDING_ITEMIZATION: the D-1 orders EXIST but Amazon has not yet populated their per-line item detail
+//     (item_status / item_price_value are genuinely null in the raw source ~1-2 days after placement). This is an
+//     expected, transient item-level lag -- an HONEST wait (LKG retained); the next refresh advances D-1 as Amazon
+//     itemizes. NOT a stale-cycle block, NOT our code, NOT a fabricatable value.
+//   - OLI_ITEMIZED_VALUE_MISSING: an itemized recognized-sale with a genuinely null value -> a REAL source-data
+//     defect on that account (investigate; do not publish).
+const pendingItemization = Number(blockedCodes.OLI_D1_PENDING_ITEMIZATION || 0);
+const realDefect = Number(blockedCodes.OLI_ITEMIZED_VALUE_MISSING || 0);
+const denom = itemz.resolved + itemz.pending;
+const overallPct = denom > 0 ? Math.round((itemz.resolved / denom) * 1000) / 10 : null;
+const minPct = itemz.pctByAccount.length ? Math.min(...itemz.pctByAccount) : null;
+const itemizationNote = pendingItemization
+  ? " -- " + pendingItemization + " account(s) held: D-1 orders EXIST but Amazon has itemized only ~" + (overallPct == null ? "?" : overallPct) + "% so far ("
+    + itemz.resolved + " itemized+priced vs " + itemz.pending + " pending item-level sync [" + itemz.notItemized + " not-itemized + " + itemz.presale + " pre-sale]); honest wait, LKG retained, next refresh advances it as Amazon itemizes"
+  : "";
+if (Object.keys(blockedCodes).length) log("fresh-fetch block reasons: " + JSON.stringify(blockedCodes) + itemizationNote + (realDefect ? " -- WARNING " + realDefect + " account(s) have a REAL itemized-value defect (investigate)" : ""));
 log("assessment: creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok + " | STILL behind D-1: " + cov1.missing.length + "/" + ids.length);
-console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, d1Complete, stillBehindD1: cov1.missing.length, blockedCodes, d1RowsUnsettled: valueMissing > 0 }));
+console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, d1Complete, stillBehindD1: cov1.missing.length, blockedCodes, itemization: { resolved: itemz.resolved, pending: itemz.pending, notItemized: itemz.notItemized, presale: itemz.presale, defect: itemz.defect, overallItemizedPct: overallPct, minAccountItemizedPct: minPct }, pendingItemization: pendingItemization > 0, realDefect: realDefect > 0 }));
 if (!a.ok) { console.error("STOP OLI assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
 // exit 0 whether or not D-1 fully settled: the strict D-1 readiness gate downstream decides publish vs not-ready.
 process.exit(0);

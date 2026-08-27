@@ -378,14 +378,46 @@ export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizat
  *
  * The authoritative order rules (oli-order-rules.js) are enforced fail-closed. Structural corruption (a non-object
  * row, an unknown seller, a bad date/currency) rejects the WHOLE payload (matching the non-dimensional builder).
- * But an account whose rows violate the ORDER rules -- a missing status (OLI_ORDER_STATUS_MISSING) or a
- * non-cancelled positive-unit row with a missing/zero value (OLI_NON_CANCELLED_VALUE_MISSING) -- is BLOCKED: it is
- * excluded from `byAccount` (so its window is never written and its coverage never advanced -> LKG preserved) and
- * reported in `blocked`. Cancelled rows are kept (audit) and carry through to the dimensional table; the RPC folds
- * the NON-cancelled rollup. Same-grain fragment rows SUM (value sums only present values; units always sum).
+ * An account is HELD/BLOCKED (excluded from `byAccount` so its window is never written and its coverage never
+ * advanced -> LKG preserved, reported in `blocked` with a redacted itemization summary) when its rows carry:
+ *   - a missing amazon_order_status -> OLI_ORDER_STATUS_MISSING (cancellation unclassifiable);
+ *   - an ITEMIZED recognized-sale (item_status present) with a genuinely null value -> OLI_ITEMIZED_VALUE_MISSING
+ *     (a real source-data defect, precedence over pending);
+ *   - otherwise a not-yet-itemized (item_status blank) or pre-sale Pending null-value row -> OLI_D1_PENDING_ITEMIZATION
+ *     (an expected, transient Amazon item-level lag: an HONEST wait, never a fabricated value).
+ * Cancelled + resolved (value-present, incl. explicit-zero) rows are kept (audit) and carry through to the
+ * dimensional table; the RPC folds the NON-cancelled rollup. Same-grain fragment rows SUM (value sums only present
+ * values; units always sum). A fully-resolved account (no pending, no defect) persists and its coverage advances,
+ * even with zero completed sales (only cancelled / explicit-zero).
  *
- * Returns { byAccount: Map<accountId, dimRows[]>, blocked: [{ accountId, code, detail }] }.
+ * Returns { byAccount, rollupByAccount, orderAuditByAccount, blocked: [{ accountId, code, detail }] }.
  */
+// A redacted, PII-free itemization summary for honest diagnostics (never leaks order ids / customer data): how
+// many rows resolved (priced) vs are still PENDING Amazon item-level sync, split by reason, plus the itemized %
+// overall and for the latest (D-1) date. `resolved`/`pending` are non-cancelled row counts.
+export function oliItemizationDetail(summary) {
+  const dates = [...summary.byDate.keys()].sort();
+  const latest = dates.length ? dates[dates.length - 1] : null;
+  const ld = latest ? summary.byDate.get(latest) : null;
+  const pct = (r, d) => (d > 0 ? Math.round((r / d) * 1000) / 10 : null);
+  const denom = summary.resolved + summary.pending;
+  const latestDenom = ld ? ld.resolved + ld.pending : 0;
+  return {
+    resolved: summary.resolved,
+    pending: summary.pending,
+    notItemized: summary.notItemized,       // item_status blank -> Amazon has not yet itemized the order
+    presalePending: summary.presale,        // amazon_order_status = Pending (pre-sale, payment unconfirmed)
+    cancelled: summary.cancelled,
+    zeroPriced: summary.zero,
+    defect: summary.defect || 0,            // itemized recognized-sale rows with a genuinely null value
+    itemizedPct: pct(summary.resolved, denom),
+    latestDate: latest,
+    latestResolved: ld ? ld.resolved : 0,
+    latestPending: ld ? ld.pending : 0,
+    latestItemizedPct: pct(ld ? ld.resolved : 0, latestDenom),
+  };
+}
+
 export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organizationFingerprint, connectionId, sourceRequestHash }) {
   if (!Array.isArray(rows)) throw new Error("oliDimensionalRowsFromFragment requires an array payload (fail closed).");
   if (!organizationFingerprint || !connectionId || !sourceRequestHash) {
@@ -425,21 +457,34 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
   const orderAuditByAccount = new Map(); // ORDER-level audit (dimensional grain + amazon_order_id); folded OUT of byAccount
   const blocked = [];
   for (const [accountId, entries] of rawByAccount) {
-    let violated = null;
+    let violated = null; // a hard order-rule violation (missing status) -> refuse the account immediately
+    // ITEMIZATION summary for honest diagnostics + the pending/defect block decision (see oliItemizationDetail).
+    const summary = { resolved: 0, pending: 0, notItemized: 0, presale: 0, cancelled: 0, zero: 0, defect: 0, byDate: new Map() };
     const byGrain = new Map();      // dimensional grain (full evidence, cancelled included) -- NO order_id (byte-identical)
     const rollupByGrain = new Map(); // NON-cancelled rollup at (date, sku, child_asin, currency)
     const orderAuditByGrain = new Map(); // dimensional grain + amazon_order_id (a blank ID stays its own grain)
     for (const { row, seller, date, currency } of entries) {
       let c;
       try {
-        c = classifyOliDimensionalRow(row); // throws typed OliOrderRuleError on an order-rule violation
+        c = classifyOliDimensionalRow(row); // throws only on a HARD rule violation (missing status / malformed)
       } catch (e) {
-        if (e instanceof OliOrderRuleError && (e.code === "OLI_NON_CANCELLED_VALUE_MISSING" || e.code === "OLI_ORDER_STATUS_MISSING")) {
+        if (e instanceof OliOrderRuleError && e.code === "OLI_ORDER_STATUS_MISSING") {
           violated = { accountId, code: e.code, detail: { ...e.detail } };
-          break; // this account's window is refused; LKG preserved
+          break; // cancellation cannot be classified -> the account's window is refused; LKG preserved
         }
         throw e; // a malformed (non-finite) row is a hard payload failure
       }
+      // Tally the itemization state (per account + per date) for the honest diagnostics and the block decision.
+      const ds = summary.byDate.get(date) || { resolved: 0, pending: 0 };
+      if (c.isCancelled) summary.cancelled += 1;
+      else if (c.pending) { summary.pending += 1; ds.pending += 1; if (c.pendingReason === "pre-sale-pending") summary.presale += 1; else summary.notItemized += 1; }
+      else if (c.defect) summary.defect += 1;
+      else if (c.valuePresent) { summary.resolved += 1; ds.resolved += 1; if (Number(c.value) === 0) summary.zero += 1; }
+      summary.byDate.set(date, ds);
+      // A PENDING (not-yet-itemized / pre-sale) or DEFECT (itemized-but-null) row carries a MISSING value: keep it
+      // out of the persisted dimensional/audit/rollup grains (never persist a null non-cancelled value) -- it is
+      // captured in the summary and the account is blocked below (LKG preserved). Cancelled + resolved rows persist.
+      if (c.pending || c.defect) continue;
       const sku = String(row.sku ?? "");
       const childAsin = String(row.child_asin ?? "");
       const grain = [accountId, date, seller, sku, childAsin, currency, c.status, c.fulfillmentChannel, c.addressState, c.addressCity].join(US);
@@ -495,6 +540,12 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
       }
     }
     if (violated) { blocked.push(violated); continue; }
+    // A real DEFECT (an itemized recognized-sale with a genuinely null value) takes precedence: block the account
+    // and flag it as a source-data problem to investigate. Otherwise, if any row is PENDING (not-yet-itemized /
+    // pre-sale), HOLD the account window (honest wait until Amazon finishes item-level sync) with a precise,
+    // transient reason + the itemization %. Only a fully-resolved account (no pending, no defect) persists.
+    if (summary.defect > 0) { blocked.push({ accountId, code: "OLI_ITEMIZED_VALUE_MISSING", detail: oliItemizationDetail(summary) }); continue; }
+    if (summary.pending > 0) { blocked.push({ accountId, code: "OLI_D1_PENDING_ITEMIZATION", detail: oliItemizationDetail(summary) }); continue; }
     byAccount.set(accountId, [...byGrain.values()]);
     rollupByAccount.set(accountId, [...rollupByGrain.values()]);
     orderAuditByAccount.set(accountId, [...orderAuditByGrain.values()]);

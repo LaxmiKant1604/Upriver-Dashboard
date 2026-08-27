@@ -26,6 +26,7 @@
     "test:source-fixpoint": "node scripts/source-fixpoint.test.js",
     "test:source-durable-model": "node scripts/source-durable-model.test.js",
     "test:oli-dimensional": "node scripts/oli-dimensional.test.js",
+    "test:oli-itemization": "node scripts/oli-itemization.test.js",
     "test:oli-value-policy": "node scripts/oli-value-policy.test.js",
     "test:oli-quality": "node scripts/oli-quality.test.js",
     "test:oli-order-audit": "node scripts/oli-order-audit.test.js",

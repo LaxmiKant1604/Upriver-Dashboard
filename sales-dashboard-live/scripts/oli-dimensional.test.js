@@ -28,12 +28,12 @@ const build = (rows) => oliDimensionalRowsFromFragment({ rows, accountsBySellerI
 
 /* ===== A. the exported contract carries the exact requested columns ===== */
 
-test("A1. OLI_SALES_COLUMNS includes the 4 dimensions + amazon_order_id (future-only capture) and EXCLUDES address_country", () => {
-  for (const c of ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"]) {
+test("A1. OLI_SALES_COLUMNS includes the 4 dimensions + amazon_order_id + item_status (future-only capture) and EXCLUDES address_country", () => {
+  for (const c of ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"]) {
     assert.ok(OLI_SALES_COLUMNS.includes(c), "missing requested column: " + c);
   }
   assert.ok(!OLI_SALES_COLUMNS.includes("address_country"), "address_country must NOT be requested");
-  assert.equal(OLI_SALES_COLUMNS.length, 10, "exactly 5 kept + 4 dimensions + amazon_order_id");
+  assert.equal(OLI_SALES_COLUMNS.length, 11, "exactly 5 kept + 4 dimensions + amazon_order_id + item_status");
 });
 
 /* ===== B. status normalization + cancellation ===== */
@@ -65,11 +65,22 @@ test("B2. cancelled positive-unit rows contribute ZERO business sales/units (kep
 
 /* ===== C. non-cancelled value rules ===== */
 
-test("C1. a NON-cancelled row with units>0 and a NULL value fails OLI_NON_CANCELLED_VALUE_MISSING (before persistence)", () => {
-  const { blocked, byAccount } = build([frag({ amazon_order_status: "Shipped", total_sales_sum: null, total_units_sum: 3 })]);
+test("C1. a NON-cancelled NULL-value row that is NOT yet itemized (item_status blank) HOLDS the account as OLI_D1_PENDING_ITEMIZATION (honest wait, LKG preserved)", () => {
+  const { blocked, byAccount } = build([frag({ amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 3 })]);
+  assert.equal(blocked.length, 1, "the account is held (LKG preserved)");
+  assert.equal(blocked[0].code, "OLI_D1_PENDING_ITEMIZATION", "not-yet-itemized is a PENDING hold, not a defect");
+  assert.equal(blocked[0].detail.pending, 1, "the pending row is surfaced in the itemization summary");
+  assert.equal(blocked[0].detail.notItemized, 1);
+  assert.equal(blocked[0].detail.resolved, 0);
+  assert.ok(!byAccount.has("ACC-1"), "no rows written for a held account");
+});
+
+test("C1b. a NON-cancelled NULL-value row that IS itemized (item_status present) blocks as a real OLI_ITEMIZED_VALUE_MISSING defect", () => {
+  const { blocked, byAccount } = build([frag({ amazon_order_status: "Shipped", item_status: "Shipped", total_sales_sum: null, total_units_sum: 3 })]);
   assert.equal(blocked.length, 1, "the account is blocked (LKG preserved)");
-  assert.equal(blocked[0].code, "OLI_NON_CANCELLED_VALUE_MISSING");
-  assert.ok(!byAccount.has("ACC-1"), "no rows written for a refused account");
+  assert.equal(blocked[0].code, "OLI_ITEMIZED_VALUE_MISSING", "an itemized recognized-sale with a null value is a real source defect");
+  assert.equal(blocked[0].detail.defect, 1);
+  assert.ok(!byAccount.has("ACC-1"), "no rows written for a blocked account");
 });
 
 test("C2. a NON-cancelled row with units>0 and a PRESENT ZERO value is treated LIKE cancelled: kept, contributes ZERO, NOT refused", () => {
@@ -90,9 +101,17 @@ test("C2. a NON-cancelled row with units>0 and a PRESENT ZERO value is treated L
   assert.equal(roll[0].units, 2, "the zero-value unit's units are excluded too (like cancelled)");
 });
 
-test("C2b. a MISSING (null/blank) value on a non-cancelled positive-unit row STILL refuses the window", () => {
-  assert.throws(() => classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: null, total_units_sum: 1 })), (e) => e instanceof OliOrderRuleError && e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
-  assert.throws(() => classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", total_sales_sum: "", total_units_sum: 1 })), (e) => e.code === "OLI_NON_CANCELLED_VALUE_MISSING");
+test("C2b. classify no longer THROWS on a missing value: it returns a typed pending/defect flag (never coerced to 0)", () => {
+  const p = classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 1 }));
+  assert.equal(p.pending, true, "not-yet-itemized -> pending");
+  assert.equal(p.pendingReason, "not-itemized");
+  assert.equal(p.defect, false);
+  assert.equal(p.value, null, "never coerced to 0");
+  const b = classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", item_status: "", total_sales_sum: "", total_units_sum: 1 }));
+  assert.equal(b.pending, true, "blank value is also missing -> pending");
+  const d = classifyOliDimensionalRow(frag({ amazon_order_status: "Shipped", item_status: "Shipped", total_sales_sum: null, total_units_sum: 1 }));
+  assert.equal(d.defect, true, "itemized + null value -> real defect");
+  assert.equal(d.pending, false);
 });
 
 test("C3. a CANCELLED row with a null/zero value is FINE (cancelled has no value requirement)", () => {
@@ -177,14 +196,15 @@ test("G1. rows are attributed to each account ONLY by its own seller id (no cros
   assert.equal(byAccount.get("ACC-2").length, 1);
 });
 
-test("G2. one account's invalid evidence blocks ONLY that account; the other still persists", () => {
+test("G2. one account's held/blocked evidence affects ONLY that account; the other still persists", () => {
   const { byAccount, blocked } = build([
-    frag({ seller_or_vendor_id: "S1", amazon_order_status: "Shipped", total_sales_sum: null, total_units_sum: 3 }), // bad
-    frag({ seller_or_vendor_id: "S2", amazon_order_status: "Shipped", total_sales_sum: 200, total_units_sum: 2 }), // good
+    frag({ seller_or_vendor_id: "S1", amazon_order_status: "Shipped", item_status: "", total_sales_sum: null, total_units_sum: 3 }), // pending (not itemized)
+    frag({ seller_or_vendor_id: "S2", amazon_order_status: "Shipped", item_status: "Shipped", total_sales_sum: 200, total_units_sum: 2 }), // good
   ]);
   assert.equal(blocked.length, 1);
   assert.equal(blocked[0].accountId, "ACC-1");
-  assert.ok(!byAccount.has("ACC-1"), "bad account not written (LKG preserved)");
+  assert.equal(blocked[0].code, "OLI_D1_PENDING_ITEMIZATION");
+  assert.ok(!byAccount.has("ACC-1"), "held account not written (LKG preserved)");
   assert.equal(byAccount.get("ACC-2").length, 1, "good account still persists");
 });
 

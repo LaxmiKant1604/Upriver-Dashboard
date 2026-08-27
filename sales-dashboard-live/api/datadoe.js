@@ -1619,8 +1619,8 @@ const DAILY_SALES_AGGREGATIONS = [
 // The named-brand superset IS the CANONICAL Order Line Items sales fragment (Blocker 1): grouped by
 // [date, seller, sku, child_asin, item_price_currency] so it is byte-identical to OLI_SALES_* and shares
 // request_hashes with fba-plan / buy-box-loss / returns-leakage / ppc-performance on overlapping slices.
-const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
-const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const DAILY_BRAND_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
+const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 
 // ===== CANONICAL Order Line Items sales fragment (Blocker 1 — parity source of truth) =====
 // ONE fragment spec shared IDENTICALLY by daily-reporting (the superset above), fba-plan, buy-box-loss,
@@ -1631,8 +1631,8 @@ const DAILY_BRAND_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child
 // money across currencies; every downstream fold keys currency in and re-aggregates to its own grain.
 // Mirrors report-source-contracts.js OLI_SALES_* (parity-tested). The four order dimensions were added here too
 // so the live "fetch latest" export identity stays byte-identical to the scheduler's (one shared cached export).
-const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
-const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id"];
+const OLI_SALES_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
+const OLI_SALES_GROUP_BY = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },

@@ -5,11 +5,15 @@
 //   - a missing order status is INVALID (cancellation cannot be classified) -> OLI_ORDER_STATUS_MISSING;
 //   - status is normalized ONLY for comparison (trim + lower-case); 'canceled' == 'cancelled';
 //   - cancelled rows are kept for audit but contribute ZERO to the dashboard rollup (sales/units/orders);
-//   - a NON-cancelled row with units > 0 must carry an order value PRESENT (never null/blank), else the whole
-//     window is refused with OLI_NON_CANCELLED_VALUE_MISSING (a missing value is NEVER coerced to 0 first). A
-//     PRESENT-but-zero value is a REAL zero-priced unit (promotional / replacement / free): it is kept for audit
-//     and treated LIKE a cancelled row -- contributing ZERO sales AND units to the rollup -- and NEVER blocks the
-//     window (`contributesToRollup` is true only when not-cancelled AND value present AND value > 0);
+//   - a NON-cancelled positive-unit row with a MISSING order value is classified by the ITEM-LEVEL signal
+//     (item_status), never coerced to 0: (a) not-yet-itemized (item_status blank) or a pre-sale Pending order is
+//     PENDING -- an expected, transient Amazon item-level lag that is audited, contributes zero, and HOLDS the
+//     account window (honest wait), reported as OLI_D1_PENDING_ITEMIZATION; (b) an ITEMIZED recognized-sale
+//     (item_status present, not Pending) with a genuinely null value is a real DEFECT, reported as
+//     OLI_ITEMIZED_VALUE_MISSING, blocking only its account. A PRESENT-but-zero value is a REAL zero-priced unit
+//     (promotional / replacement / free): kept for audit, treated LIKE a cancelled row -- contributing ZERO sales
+//     AND units -- and NEVER blocks (`contributesToRollup` is true only when not-cancelled AND value present AND
+//     value > 0);
 //   - blank state/city is allowed (stored '') and never blocks an otherwise-valid sale;
 //   - amazon_order_id is AUDIT-ONLY: it is trimmed to a canonical form and NEVER blocks a window. A blank/missing
 //     Order ID is stored '' with orderIdAvailable=false (never fabricated, never copied from another row) so a
@@ -114,6 +118,7 @@ export function classifyOliDimensionalRow(row) {
     throw new OliOrderRuleError("OLI_ORDER_STATUS_MISSING", "a row has no amazon_order_status; cancellation cannot be classified", { date: S(row.date ?? row.sale_date) });
   }
   const cancelled = isCancelledStatus(status);
+  const isPendingOrder = normalizeOrderStatus(status) === "pending"; // Amazon pre-sale: order placed, payment not confirmed
   const units = Number(row.total_units_sum ?? 0);
   if (!Number.isFinite(units)) {
     throw new OliOrderRuleError("OLI_MALFORMED_ROW", "a row carries a non-finite units value", { date: S(row.date ?? row.sale_date) });
@@ -123,14 +128,29 @@ export function classifyOliDimensionalRow(row) {
   if (valuePresent && !Number.isFinite(value)) {
     throw new OliOrderRuleError("OLI_MALFORMED_ROW", "a row carries a non-finite order value", { date: S(row.date ?? row.sale_date) });
   }
+  // ITEM-LEVEL completion signal. PROVEN (raw source 89b27535d2): Amazon populates the per-line item detail
+  // (item_status / amazon_order_item_id / item_price_value) over ~1-2 days AFTER the order is placed. On the D+1
+  // run only a fraction of D-1 orders are itemized; the rest are order-level shells whose item_status is blank and
+  // whose item_price_value is genuinely null in the raw response (NOT lost in our SUM). So a missing value is NOT
+  // uniformly "incorrect evidence": item_status distinguishes an expected, transient item-level lag from a real
+  // data defect.
+  const itemStatus = S(row.item_status).trim();
+  const itemized = itemStatus !== ""; // has per-line detail -> Amazon has recognized/priced the item
+  // Classify a NON-cancelled positive-unit row whose value is MISSING (never fabricate a zero):
+  //   - not-yet-itemized (item_status blank) OR a pre-sale Pending order -> PENDING: expected item-level lag,
+  //     audited, contributes zero, and HOLDS the window (honest wait) -- it is not a defect.
+  //   - itemized recognized-sale (item_status present, not Pending) with a genuinely null value -> DEFECT: a real
+  //     source-data problem that blocks only its account.
+  let pending = false;
+  let pendingReason = null;
+  let defect = false;
   if (!cancelled && units > 0 && !valuePresent) {
-    // A non-cancelled positive-unit row with a MISSING (null/blank) value is incorrect source evidence -> refuse
-    // the whole window (never a fabricated zero). A PRESENT-but-zero value is NOT refused (handled below).
-    throw new OliOrderRuleError(
-      "OLI_NON_CANCELLED_VALUE_MISSING",
-      "non-cancelled row with units>0 has a missing order value",
-      { date: S(row.date ?? row.sale_date), status },
-    );
+    if (itemized && !isPendingOrder) {
+      defect = true;
+    } else {
+      pending = true;
+      pendingReason = isPendingOrder ? "pre-sale-pending" : "not-itemized";
+    }
   }
   // A row contributes real sales/units to the dashboard rollup ONLY when it is not cancelled AND carries a
   // present, strictly-positive value. A cancelled row OR a present-but-zero-value non-cancelled unit (a real
@@ -140,6 +160,12 @@ export function classifyOliDimensionalRow(row) {
     status,
     statusNormalized: normalizeOrderStatus(status),
     isCancelled: cancelled,
+    isPendingOrder,
+    itemStatus,
+    itemized,
+    pending,           // not-yet-itemized / pre-sale: expected item-level lag (audited, holds the window)
+    pendingReason,     // "not-itemized" | "pre-sale-pending" | null
+    defect,            // itemized recognized-sale with a genuinely missing value: a REAL source-data defect
     units,
     valuePresent,
     value, // null when absent -- NOT coerced to 0
