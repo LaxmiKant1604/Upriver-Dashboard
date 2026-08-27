@@ -12569,3 +12569,49 @@ path (manual-source-sync.mjs, same buildBucketSourceSyncRuntime + runSourceCardA
 STATUS: code+tests e5c473e; docs separate. Push main + verify Vercel 200 next. Phase-10 production acceptance
 (dispatch the two workflow_dispatch runs, or run the bucket operators locally) is PENDING a run environment with
 GitHub/gh access -- no gh/token in this session; the readiness policy is already prod-validated read-only.
+
+## Scheduler v2 -- previous-day (D-1) guarantee: strict D-1 gate + force-latest fresh re-fetch (2026-08-27, code 5a9a77c)
+
+Guarantees every automatic + manual Scheduler-v2 run makes a GENUINE attempt at the previous day (D-1) and never
+reports a stale D-2 as D-1 success. Supersedes the prior task's 2-day-clamp publish (per user: strict D-1, retain
+LKG, no D-2 publish).
+
+ROOT CAUSE of the stale D-2 reuse (proven from cycle c9e3d573): the trailing OLI rolling window [asOf-6, asOf] has a
+canonical request_hash with NO date/nonce, so a same-day re-run adopts the earlier cached payload (20h cache TTL,
+source-worker.js Branch A) and never re-queries DataDoe. c9e3d573's 5 OLI exports were all created ONCE at 04:39Z
+(cache=true) and adopted with zero new creates -> published D-2 (08-25) for a D-1 (08-26) request.
+
+FIX:
+- STRICT D-1 GATE: `assessBucketPublishReadiness({ requireD1: true })` -> a non-"exact" status (proven only through
+  D-2, interior gap, blank provenance, unreadable coverage) becomes DATADOE_D1_NOT_READY (ok=false, effectiveAsOf
+  null, carries provenThrough + redacted missingAccounts). `verify-bucket-readiness.mjs` is strict D-1: emits
+  status/proven_through, fails closed (exit 1) with a distinguishing summary (D-1 SUCCESS vs DATADOE_D1_NOT_READY),
+  so the publish step is success()-skipped and the LKG is retained. `priority-dashboards-release.mjs --strict-d1`
+  fails closed (runner returns status DATADOE_D1_NOT_READY, stage d1-not-ready:<bucket>) if the derive clamps below
+  D-1. Prod-validated read-only: Non-US requested 08-26 -> DATADOE_D1_NOT_READY, provenThrough 08-25, 17/22 behind.
+- forceFreshOli (build-time, OLI-only): a pending order-line-items job skips Branch A cache adoption -> real
+  create-export POST. Threaded runSourceCardAction (guarded: only sourceKey==="order-line-items") -> run ->
+  runBucketSourceSync -> runSourceJobs -> runJobLifecycle. request_hash UNCHANGED.
+- Migration 20260829_source_oli_freshness_attempt.sql (APPLIED to prod 2026-08-27): durable per-(operation_key,
+  request_hash) reservation, mirrors the Catalog reservation (reserve_oli_freshness_create / record_oli_freshness_
+  export; PK (op,hash); one forced create per pair; SELECT-only ACL; writes via SECURITY DEFINER). Schema contract
+  entry added; schema-contract-mutation baseline audits clean.
+- Operation identities (source-oli-freshness.js): scheduled-fresh/<bucket>/<requestedAsOf> (normal) and
+  manual-force/<bucket>/<requestedAsOf>/<github.run_id> (force-latest; requires a run_id). Same run_id idempotent
+  (adopt its own export, zero create); a new authorized run_id re-attempts only the missing window; a reserved-but-
+  unrecorded attempt is ambiguous (no second create, no COMMIT_UNKNOWN retry).
+- oli-force-latest.mjs: bounded operator -> planForceLatestBatches (only <=5-seller batches whose owners include a
+  D-1-missing account) -> runOliForceLatest (reserve -> reopen the batch job to pending on the RUNNING cycle ->
+  ONE forced fresh pass -> record) -> re-read coverage. Never touches the other bucket; LKG preserved on failure.
+- Manual Data Sync Center: `validateSourceSyncRequest({ refreshMode })` -> forceFreshOli (admin-manual + OLI only;
+  scheduled origin rejected SOURCE_SYNC_FORCE_LATEST_ADMIN_ONLY), threaded to the SAME runSourceCardAction path
+  (api/admin/sources.js) -- not a second implementation.
+
+WORKFLOW: refresh_mode input (normal | force-latest, choice); a SCHEDULED event is ALWAYS normal; force-latest step
+(oli-force-latest.mjs --run-id=github.run_id, gated on mode, after normal OLI + before the strict D-1 proof);
+release --strict-d1. Crons (02:00 non-us / 10:30 us), concurrency, 180-min timeout, token ceilings (20/10), secret
+guard unchanged. Campaign Ads/FBA never force-fetched (forceFreshOli OLI-only).
+
+TESTS: +15 D-1/force-latest regressions (scheduler-v2-d1-freshness.test.js) + workflow-shape D4 + schema contract.
+`npm run verify` green: 77 steps / 57 suites incl. production build. STATUS: code+tests 5a9a77c; migration APPLIED;
+docs separate; push + Vercel 200 + acceptance (force-latest runs) next.
