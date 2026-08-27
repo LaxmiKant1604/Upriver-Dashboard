@@ -59,6 +59,7 @@ const SUITES = [
   "test:source-priority-dashboards",
   "test:scheduler-automation",
   "test:scheduler-bucket-independence",
+  "test:scheduler-d1-freshness",
   "test:asin-ads-aggregation",
   "test:daily-durable-rederive",
   "test:daily-v2-backfill",

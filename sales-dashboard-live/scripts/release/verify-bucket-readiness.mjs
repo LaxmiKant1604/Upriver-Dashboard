@@ -41,6 +41,7 @@ const { organizationFingerprint } = await import("../../lib/server/source-identi
 
 const log = (m) => console.log("verify-readiness[" + bucket + "@" + requestedAsOf + "]: " + m);
 const ghOut = (k, v) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, k + "=" + v + "\n"); } catch { /* ignore */ } } };
+const ghSum = (s) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) { try { appendFileSync(f, s + "\n"); } catch { /* ignore */ } } };
 
 // discover EXACTLY this bucket's primary accounts (zero tokens)
 const connections = getDataDoeConnections();
@@ -108,23 +109,33 @@ for (const id of ids) {
   adsUnavailableByAccountId[id] = outcome === "incompatible";
 }
 
+// STRICT PREVIOUS-DAY (D-1) mode: publication requires EVERY account gapless through the EXACT requestedAsOf.
+// A settlement tail (proven only through D-2), an interior gap, blank provenance, or unreadable coverage is a typed
+// DATADOE_D1_NOT_READY -- the LKG is retained (the publish step below is skipped) and the honest provenThrough is
+// reported. Never publishes a lagged/blocked date as D-1.
 const result = assessBucketPublishReadiness({
   bucket, requestedAsOf, from: oliStart, discoveredAccounts: discovered,
   coverageByAccountId, provenanceBlankByAccountId,
   adsCoveredByAccountId, adsFailedByAccountId, adsUnavailableByAccountId,
   cyclePresent, cycleOliAssessment,
+  requireD1: true,
 });
 for (const n of result.notes || []) log("note: " + n);
-log("OLI honest effectivePublishAsOf=" + (result.effectiveAsOf || "(none)") + " status=" + result.status + " tailLag=" + result.tailLagDays + "d | cycle present=" + cyclePresent + (cycleOliAssessment ? " oli-ok=" + cycleOliAssessment.ok : ""));
+log("OLI D-1 status=" + result.status + " requested=" + requestedAsOf + " provenThrough=" + (result.provenThrough || "(none)") + " tailLag=" + result.tailLagDays + "d | cycle present=" + cyclePresent + (cycleOliAssessment ? " oli-ok=" + cycleOliAssessment.ok : ""));
 
 ghOut("requested_asof", requestedAsOf);
+ghOut("proven_through", result.provenThrough || "");
+ghOut("status", result.status);
 if (!result.ok) {
   ghOut("proceed", "false");
-  console.error("STOP BUCKET_NOT_PUBLISHABLE (" + bucket + "): " + result.problems.join(", "));
+  ghOut("effective_asof", "");
+  const d = result.d1 || {};
+  ghSum("### D-1 readiness (" + bucket + ")\n- **DATADOE_D1_NOT_READY** -- requested " + requestedAsOf + ", proven through " + (result.provenThrough || "(none)") + "\n- " + (d.missingCount == null ? "" : d.missingCount + "/" + result.accounts + " account(s) behind D-1") + " -- LKG retained (no publish)\n- reason: " + (d.reason || result.problems.join(", ")));
+  console.error("STOP DATADOE_D1_NOT_READY (" + bucket + "): requested " + requestedAsOf + ", proven through " + (result.provenThrough || "(none)") + "; " + (result.d1 && result.d1.missingCount != null ? result.d1.missingCount + " account(s) behind D-1" : result.problems.join(", ")) + " -- LKG retained.");
   process.exit(1);
 }
-ghOut("effective_asof", result.effectiveAsOf);
-ghOut("status", result.status);
+ghOut("effective_asof", result.effectiveAsOf); // === requestedAsOf (D-1 proven)
 ghOut("proceed", "true");
-log("READY: " + result.accounts + " " + bucket + " accounts publishable through effectivePublishAsOf " + result.effectiveAsOf + " (" + result.status + ").");
+ghSum("### D-1 readiness (" + bucket + ")\n- **D-1 SUCCESS** -- all " + result.accounts + " account(s) gapless through " + requestedAsOf + " (status " + result.status + ")");
+log("D-1 READY: " + result.accounts + " " + bucket + " accounts gapless through D-1 " + result.effectiveAsOf + ".");
 process.exit(0);

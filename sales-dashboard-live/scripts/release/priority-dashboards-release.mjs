@@ -36,6 +36,11 @@ if (asOfArg) console.log("priority-release: asOf pinned to " + asOfArg + " (deri
 const bucketArg = (process.argv.find((a) => a.startsWith("--bucket=")) || "").split("=")[1] || null;
 if (bucketArg != null && bucketArg !== "us" && bucketArg !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucketArg + ")"); process.exit(2); }
 if (bucketArg) console.log("priority-release: bucket scope = " + bucketArg + " ONLY (the other bucket's snapshots are preserved untouched).");
+
+// --strict-d1: FAIL CLOSED (DATADOE_D1_NOT_READY, never publish) if the derive clamps effectivePublishAsOf below the
+// requested D-1 (--as-of). The scheduler passes it so a lagged/regressed bucket keeps its LKG instead of publishing D-2.
+const strictD1 = process.argv.includes("--strict-d1");
+if (strictD1) console.log("priority-release: --strict-d1 (a derive that clamps below the requested D-1 fails closed; LKG retained).");
 // Optional --operation-key: the Catalog reservation key. Default = the historical v2 go-live key; an AUTOMATIC
 // scheduled run passes "priority-dashboards/scheduled/YYYY-MM-DD" so each date owns its one-Catalog-create
 // reservation. buildPriorityDashboardsRelease validates it STRICTLY (any other shape fails closed).
@@ -87,7 +92,8 @@ const readbackLive = buildLiveReadback({
 const result = await runPriorityDashboardsRelease({
   release, reconcile, readbackLive, assertNoCron,
   ...(bucketArg ? { bucket: bucketArg } : {}),
+  ...(strictD1 ? { strictD1: true } : {}),
   log: (m) => console.log("priority-release: " + m),
 });
-console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, bucket: bucketArg || "both", evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
+console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, status: result.status || null, bucket: bucketArg || "both", evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
 process.exit(result.code);

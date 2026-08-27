@@ -7,6 +7,7 @@
 import { resolveEffectivePublishAsOf, MAX_PUBLISH_TAIL_LAG_DAYS } from "./source-durable-model.js";
 
 const S = (v) => (v == null ? "" : String(v));
+const nb = (v) => S(v).trim() !== "";
 
 /**
  * Assess Non-US prerequisites for a US run at `asOf`. Inputs:
@@ -98,10 +99,15 @@ export function assessBucketPublishReadiness({
   discoveredAccounts, coverageByAccountId = {}, provenanceBlankByAccountId = {},
   adsCoveredByAccountId = {}, adsFailedByAccountId = {}, adsUnavailableByAccountId = {},
   cyclePresent, cycleOliAssessment,
+  // STRICT PREVIOUS-DAY (D-1) MODE: when true, publication requires EVERY account gapless through the EXACT
+  // requestedAsOf (D-1). A pure trailing settlement tail (effectiveAsOf === requestedAsOf-1..2, otherwise
+  // publishable) is NOT a D-1 success: it becomes a typed DATADOE_D1_NOT_READY (ok=false, LKG retained) carrying
+  // provenThrough + the redacted missing accounts. Off (default) keeps the honest bounded-tail publishable result.
+  requireD1 = false,
 } = {}) {
   const problems = [];
   const notes = [];
-  const fail = (p) => ({ ok: false, bucket, requestedAsOf, effectiveAsOf: null, tailLagDays: null, status: "blocked", accounts: 0, problems: [p], notes });
+  const fail = (p) => ({ ok: false, bucket, requestedAsOf, effectiveAsOf: null, tailLagDays: null, status: "blocked", accounts: 0, problems: [p], notes, d1: requireD1 ? { requestedAsOf: S(requestedAsOf), provenThrough: null, missingAccounts: [], missingCount: null, reason: p } : null });
   if (bucket !== "us" && bucket !== "non-us") return fail("bad-bucket:" + S(bucket));
   const at = S(requestedAsOf);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(at)) return fail("bad-requested-asof:" + at);
@@ -142,17 +148,50 @@ export function assessBucketPublishReadiness({
   if (oliDurableComplete && cycleProblems.length) notes.push("cycle-shape-note:" + cycleProblems.join("|") + " (durable evidence complete; not blocking)");
   if (!oliDurableComplete) problems.push(...cycleProblems);
 
-  const ok = problems.length === 0;
-  if (ok && eff.status === "UPSTREAM_TAIL_LAG") notes.push("UPSTREAM_TAIL_LAG: requested " + at + " but published through " + eff.effectiveAsOf + " (" + eff.tailLagDays + "d settlement tail; the next rolling refresh advances it once DataDoe settles).");
+  let ok = problems.length === 0;
+  if (ok && eff.status === "UPSTREAM_TAIL_LAG") notes.push("UPSTREAM_TAIL_LAG: requested " + at + " but proven only through " + eff.effectiveAsOf + " (" + eff.tailLagDays + "d settlement tail).");
+  let status = ok ? eff.status : (eff.status === "TAIL_LAG_EXCEEDED" ? "TAIL_LAG_EXCEEDED" : "blocked");
+  let effectiveAsOf = ok ? eff.effectiveAsOf : null;
+
+  // The honest per-account covered-through map (min across all readable/contiguous accounts = the conservative
+  // bucket-wide provenThrough). Used for the D-1 report; the resolver already computed each coveredTo.
+  const coveredTo = eff.perAccount || {};
+  const provenValues = discovered.map((id) => coveredTo[id]).filter((v) => nb(v)).sort();
+  const provenThrough = provenValues.length ? provenValues[0] : null;
+  const missingD1 = discovered.filter((id) => !nb(coveredTo[id]) || S(coveredTo[id]) < at);
+
+  let d1 = null;
+  if (requireD1) {
+    // D-1 SUCCESS requires EVERY account gapless through the EXACT requestedAsOf (status "exact") AND no OLI/
+    // provenance/cycle problem. Anything else -- a settlement tail (UPSTREAM_TAIL_LAG), a >2d lag, an interior gap,
+    // blank provenance, unreadable coverage -- is DATADOE_D1_NOT_READY (retain LKG; never publish D-2 as D-1).
+    const d1Ready = ok && eff.status === "exact" && missingD1.length === 0;
+    d1 = {
+      requestedAsOf: at,
+      provenThrough,
+      missingAccounts: missingD1.map((id) => id.slice(0, 8)),
+      missingCount: missingD1.length,
+      reason: d1Ready ? "d1-proven" : (problems.length ? [...new Set(problems)][0] : (eff.status === "TAIL_LAG_EXCEEDED" ? "tail-lag-exceeded" : "upstream-tail-lag")),
+    };
+    if (!d1Ready) {
+      ok = false;
+      status = "DATADOE_D1_NOT_READY";
+      effectiveAsOf = null; // NEVER publish a lagged/blocked date under strict D-1
+      notes.push("DATADOE_D1_NOT_READY: requested " + at + ", proven through " + (provenThrough || "(none)") + "; " + missingD1.length + "/" + discovered.length + " account(s) behind D-1 -- LKG retained (no publish).");
+    }
+  }
+
   return {
     ok,
     bucket,
     requestedAsOf: at,
-    effectiveAsOf: ok ? eff.effectiveAsOf : null,
+    effectiveAsOf,
+    provenThrough,
     tailLagDays: eff.tailLagDays,
-    status: ok ? eff.status : (eff.status === "TAIL_LAG_EXCEEDED" ? "TAIL_LAG_EXCEEDED" : "blocked"),
+    status,
     accounts: discovered.length,
     problems: [...new Set(problems)],
     notes,
+    d1,
   };
 }

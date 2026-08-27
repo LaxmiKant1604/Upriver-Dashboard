@@ -49,7 +49,7 @@ export const OPERATION_ORIGINS = Object.freeze(["scheduled", "admin-manual"]);
  * plus the date-scoped catalog operation key (manual + scheduled same-day operations SHARE it, so the org-wide
  * Catalog is created at most once per date across BOTH paths).
  */
-export function validateSourceSyncRequest({ bucket, sourceKey, origin, asOf } = {}) {
+export function validateSourceSyncRequest({ bucket, sourceKey, origin, asOf, refreshMode = "normal" } = {}) {
   const b = S(bucket).trim();
   if (b !== "us" && b !== "non-us") { const e = new Error("SOURCE_SYNC_BAD_BUCKET: bucket must be us|non-us."); e.code = "SOURCE_SYNC_BAD_BUCKET"; e.status = 400; throw e; }
   const k = S(sourceKey).trim();
@@ -58,8 +58,15 @@ export function validateSourceSyncRequest({ bucket, sourceKey, origin, asOf } = 
   if (!OPERATION_ORIGINS.includes(o)) { const e = new Error("SOURCE_SYNC_BAD_ORIGIN: origin must be scheduled|admin-manual."); e.code = "SOURCE_SYNC_BAD_ORIGIN"; e.status = 400; throw e; }
   const a = S(asOf).trim();
   if (!isDate(a)) { const e = new Error("SOURCE_SYNC_BAD_ASOF: asOf must be YYYY-MM-DD."); e.code = "SOURCE_SYNC_BAD_ASOF"; e.status = 400; throw e; }
+  // REFRESH MODE (the admin-only "Force latest D-1"): 'force-latest' makes the OLI fetch bypass the stale 20h cache
+  // (forceFreshOli -- the SAME reviewed runSourceCardAction path the GitHub force-latest job uses). It is meaningful
+  // ONLY for order-line-items AND ONLY from an admin-manual origin; a scheduled origin can NEVER force fresh.
+  const m = S(refreshMode).trim() || "normal";
+  if (m !== "normal" && m !== "force-latest") { const e = new Error("SOURCE_SYNC_BAD_REFRESH_MODE: refreshMode must be normal|force-latest."); e.code = "SOURCE_SYNC_BAD_REFRESH_MODE"; e.status = 400; throw e; }
+  if (m === "force-latest" && o !== "admin-manual") { const e = new Error("SOURCE_SYNC_FORCE_LATEST_ADMIN_ONLY: force-latest is admin-manual only (a scheduled event can never force fresh)."); e.code = "SOURCE_SYNC_FORCE_LATEST_ADMIN_ONLY"; e.status = 403; throw e; }
+  const forceFreshOli = m === "force-latest" && k === "order-line-items";
   return Object.freeze({
-    bucket: b, sourceKey: k, origin: o, asOf: a,
+    bucket: b, sourceKey: k, origin: o, asOf: a, refreshMode: m, forceFreshOli,
     dependencies: SOURCE_DASHBOARD_DEPENDENCIES[k],
     operationKey: SCHEDULED_OPERATION_KEY_PREFIX + a,
   });

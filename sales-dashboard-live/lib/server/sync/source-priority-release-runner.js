@@ -68,7 +68,7 @@ function threeResultProblems(frozenKeys, envelope, accountId, okDispositions) {
  *   log(message)       -- optional progress line.
  */
 export async function runPriorityDashboardsRelease(deps = {}) {
-  const { release, reconcile, readbackLive, assertNoCron, log = () => {}, bucket = null } = deps;
+  const { release, reconcile, readbackLive, assertNoCron, log = () => {}, bucket = null, strictD1 = false } = deps;
   if (!release || typeof release.deriveBucket !== "function" || typeof release.finalizeBucket !== "function"
       || typeof release.preflightAccount !== "function" || typeof release.publishAccount !== "function") {
     throw new Error("runPriorityDashboardsRelease requires a release with deriveBucket/finalizeBucket/preflightAccount/publishAccount (fail closed).");
@@ -103,6 +103,12 @@ export async function runPriorityDashboardsRelease(deps = {}) {
       return fail("derive:" + b, "derive did not complete: " + S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))));
     }
     if (rollup.derived && rollup.derived.effectivePublishAsOf) effectiveByBucket[b] = S(rollup.derived.effectivePublishAsOf);
+    // STRICT D-1: the derive was pinned to the requested D-1 (--as-of). If it nonetheless CLAMPED below D-1
+    // (asOfClamped -- coverage regressed / a tail reappeared between the readiness proof and the derive), FAIL CLOSED
+    // with a typed DATADOE_D1_NOT_READY; NEVER publish the clamped D-2 as D-1. LKG preserved (nothing published yet).
+    if (strictD1 && rollup.derived && rollup.derived.asOfClamped === true) {
+      return { code: 1, ok: false, stage: "d1-not-ready:" + b, status: "DATADOE_D1_NOT_READY", problems: ["DATADOE_D1_NOT_READY: derive clamped effectivePublishAsOf=" + S(rollup.derived.effectivePublishAsOf) + " below requestedAsOf=" + S(rollup.derived.refreshAsOf) + " for " + b + " -- LKG retained (no publish)."] };
+    }
     // A derive that GATED on readiness (daily/brandView ready=false) produces NO snapshots -> NO lineage -> a
     // clean-looking rollup (skipped=null, stopped=false) with saved=0 and lineageCount=0. `!stopped && skipped==null`
     // is therefore NOT proof that report jobs were produced. Require the derive to have genuinely produced a

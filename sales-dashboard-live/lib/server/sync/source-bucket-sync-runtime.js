@@ -524,7 +524,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`buildBucketSourceSyncRuntime.run requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
@@ -758,6 +758,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         reuseOnly,
         catalogCarrierSeller,
         forceCatalogRefresh: priority,
+        forceFreshOli: forceFreshOli === true,
       });
     } catch (e) { return catchDeadline(e); }
     rollup.excludedAccounts = excluded;
@@ -1404,8 +1405,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null } = {}) => {
+  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
     const entry = sourceRegistryEntry(sourceKey); // typed UNREGISTERED_SOURCE (fail closed)
+    // FORCE-FRESH-OLI is authorized ONLY for the order-line-items family (the D-1 "force latest" re-fetch). It is a
+    // trusted operator/composition argument (the admin DSC + the GitHub force-latest job), never an ordinary read.
+    const freshOli = forceFreshOli === true && sourceKey === "order-line-items";
     if (bucket !== "us" && bucket !== "non-us") {
       throw new Error(`runSourceCardAction requires bucket 'us'|'non-us' (got "${bucket}").`);
     }
@@ -1425,7 +1429,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       };
     }
     if (entry.storage === "durable-history" || entry.storage === "durable-snapshot") {
-      return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf });
+      return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
     }
     // FINDING 1: a cycle-cache family executes ONLY its own canonical source family -- the trusted
     // per-tranche composition FIXED to exactly this family (the full plan is still upserted; execution

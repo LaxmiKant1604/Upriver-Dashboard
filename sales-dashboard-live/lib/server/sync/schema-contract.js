@@ -553,6 +553,39 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     note: "Migration 9: durable operation-wide one-Catalog-export / two-token reservation (PREPARED, UNAPPLIED).",
   },
   {
+    // Migration 13: the durable per-operation OLI FRESHNESS-ATTEMPT reservation for the previous-day (D-1) "force
+    // latest" fresh-fetch. One forced OLI create per (operation_key, request_hash); idempotent by github.run_id; a
+    // reserved-but-unrecorded attempt is ambiguous (never a second create). Same fail-closed ACL as the Catalog
+    // reservation: admin-only SELECT policy, service_role SELECT, every write via the two SECURITY DEFINER RPCs.
+    migration: "20260829_source_oli_freshness_attempt.sql",
+    tables: [
+      {
+        name: "source_oli_freshness_attempt",
+        unique: [["operation_key", "request_hash"]],
+        namedConstraints: [
+          { name: "source_oli_freshness_attempt_pk", kind: "primary key", columns: ["operation_key", "request_hash"] },
+          { name: "source_oli_freshness_attempt_op_nonblank", kind: "check", canonical: "char_length(btrim(operation_key)) > 0" },
+          { name: "source_oli_freshness_attempt_hash_nonblank", kind: "check", canonical: "char_length(btrim(request_hash)) > 0" },
+          { name: "source_oli_freshness_attempt_tokens_check", kind: "check", canonical: "tokens_spent in (0, 2)" },
+          { name: "source_oli_freshness_attempt_status_check", kind: "check", canonical: "status in ('reserved', 'created')" },
+          { name: "source_oli_freshness_attempt_created_coherent", kind: "check", canonical: "(status = 'reserved' and export_id is null and tokens_spent = 0) or (status = 'created' and export_id is not null and char_length(btrim(export_id)) > 0 and tokens_spent = 2)" },
+        ],
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        rlsEnabled: true,
+        requiredPolicies: [{ name: "source_oli_freshness_attempt_admin_read", command: "select", role: "authenticated", using: "public.is_dashboard_admin()" }],
+        authenticatedAcl: { grants: ["select"] },
+        requiredTriggers: [{ name: "source_oli_freshness_attempt_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["operation_key", "request_hash", "export_id", "tokens_spent", "status"],
+      },
+    ],
+    rpcs: [
+      { name: "reserve_oli_freshness_create", params: ["p_operation_key", "p_request_hash"] },
+      { name: "record_oli_freshness_export", params: ["p_operation_key", "p_request_hash", "p_export_id", "p_tokens"] },
+    ],
+    wrappers: ["reserveOliFreshnessCreate", "recordOliFreshnessExport", "getOliFreshnessAttempt"],
+    note: "Migration 13: durable per-(operation,hash) OLI force-latest freshness reservation (PREPARED, UNAPPLIED).",
+  },
+  {
     // Migration 10: the ADDITIVE dimensional OLI history (amazon_order_status / fulfillment_channel /
     // address_state / address_city) + its atomic replacement RPC. Full-grain evidence (cancelled included, for
     // audit) written ONLY through the SECURITY DEFINER RPC that also folds the non-cancelled daily rollup into

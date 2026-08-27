@@ -35,6 +35,14 @@ on:
         description: "Bucket to run + publish (us | non-us). Publishes ONLY that bucket's accounts."
         required: true
         default: "non-us"
+      refresh_mode:
+        description: "normal | force-latest. force-latest makes a FRESH bounded DataDoe re-fetch of the still-missing D-1 window (bypasses stale cache). Scheduled events are ALWAYS normal."
+        required: false
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - force-latest
 
 concurrency:
   group: scheduler-v2
@@ -76,7 +84,7 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve bucket + requestedAsOf (previous UTC date) + per-run token ceiling
+      - name: Resolve bucket + requestedAsOf (previous UTC date, = D-1) + refresh_mode + per-run token ceiling
         id: cfg
         run: |
           set -euo pipefail
@@ -87,17 +95,23 @@ jobs:
               "30 10 * * *") bucket="us" ;;
               *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
             esac
+            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch.
+            mode="normal"
           else
             bucket="${{ github.event.inputs.bucket }}"
+            mode="${{ github.event.inputs.refresh_mode }}"
+            if [ -z "$mode" ]; then mode="normal"; fi
           fi
           if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then echo "Invalid bucket '$bucket'." >&2; exit 1; fi
+          if [ "$mode" != "normal" ] && [ "$mode" != "force-latest" ]; then echo "Invalid refresh_mode '$mode'." >&2; exit 1; fi
           if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
-          { echo "### scheduler-v2 run"; echo "- bucket: $bucket (publishes ONLY this bucket; the other bucket is untouched)"; echo "- requestedAsOf: $asof"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
-          echo "Resolved bucket=$bucket requestedAsOf=$asof tokenmin=$tokenmin"
+          { echo "### scheduler-v2 run"; echo "- bucket: $bucket (publishes ONLY this bucket; the other bucket is untouched)"; echo "- requestedAsOf (D-1): $asof"; echo "- refresh_mode: $mode"; echo "- token ceiling: $tokenmin"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Resolved bucket=$bucket requestedAsOf=$asof mode=$mode tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
@@ -112,19 +126,30 @@ jobs:
         id: tokengate
         run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.bucket }}
 
-      # (step 3) Refresh canonical OLI for THIS bucket only.
+      # (step 3) Refresh canonical OLI for THIS bucket only (normal fetch on the fresh daily cycle -- a genuine D-1
+      # attempt; pending jobs create real exports, so DataDoe is genuinely queried for the requested D-1 rows).
       - name: Refresh canonical OLI (this bucket only)
         if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-oli-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
+
+      # (step 3b) FORCE-LATEST ONLY: a BOUNDED fresh DataDoe re-fetch of the still-missing D-1 rolling window
+      # (forceFreshOli bypasses the 20h stale-cache adoption), under the durable freshness reservation (idempotent by
+      # github.run_id; one forced create per (operation, batch hash); never a COMMIT_UNKNOWN retry). Only missing
+      # <=5-seller batches are re-fetched. Scheduled runs are 'normal' and skip this entirely.
+      - name: Force-latest fresh D-1 re-fetch (workflow_dispatch force-latest only)
+        if: steps.tokengate.outputs.proceed == 'true' && steps.cfg.outputs.mode == 'force-latest'
+        run: node scripts/release/oli-force-latest.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }} --run-id=${{ github.run_id }}
 
       # (step 4) Refresh ASIN Ads for THIS bucket only (coverage mode, 21-day rolling window).
       - name: Refresh ASIN Ads (this bucket only; coverage mode, 21-day rolling window)
         if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-asin-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
-      # (step 5) Bucket-specific evidence proof + HONEST effectivePublishAsOf (bounded 2-day settlement tail). Fails
-      # closed on interior gap / blank provenance / tail lag > 2 / unreadable coverage BEFORE any control is opened.
-      - name: Compute this bucket's effectivePublishAsOf (read-only readiness proof)
+      # (step 5) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless through the EXACT
+      # requestedAsOf (D-1). A settlement tail (proven only through D-2), interior gap, blank provenance, or unreadable
+      # coverage is a typed DATADOE_D1_NOT_READY: this step fails closed BEFORE any control is opened, the publish steps
+      # below are skipped (success()-gated), the LKG is retained, and the summary distinguishes it from a D-1 success.
+      - name: Prove previous-day (D-1) readiness for this bucket (read-only; strict)
         id: readiness
         if: steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }}
@@ -135,11 +160,12 @@ jobs:
         run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.bucket }}
 
       # (steps 6/8/9/10) Catalog reuse/refresh (one create/day shared across buckets) + derive + preflight EVERY
-      # account in this bucket + publish this bucket x3 + live read-back. Publishes at the honest effectivePublishAsOf;
-      # the operation key is the requestedAsOf calendar date so BOTH buckets share one Catalog reservation.
-      - name: Refresh Catalog + derive/preflight/publish this bucket + live read-back
+      # account in this bucket + publish this bucket x3 + live read-back. Reached ONLY after the strict D-1 proof, so
+      # --as-of is the requestedAsOf (D-1); --strict-d1 is a belt-and-suspenders that FAILS CLOSED (never publishes)
+      # if the derive would clamp below D-1. The operation key is the requestedAsOf so BOTH buckets share one Catalog.
+      - name: Refresh Catalog + derive/preflight/publish this bucket at D-1 + live read-back
         if: steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }}
+        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --strict-d1
 
       # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this bucket's fresh
       # snapshots + the OTHER bucket's latest-known-good) -- Supabase-only, zero tokens.

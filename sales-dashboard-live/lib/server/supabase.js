@@ -1071,6 +1071,73 @@ export async function getPriorityCatalogReservation(operationKey, catalogRequest
   return { operationKey, catalogRequestHash: r.catalog_request_hash, exportId: r.export_id ?? null, tokensSpent: Number(r.tokens_spent), status: r.status };
 }
 
+// ---------------------------------------------------------------------------
+// OLI freshness-attempt reservation wrappers (20260829_source_oli_freshness_attempt.sql). The durable
+// per-(operation_key, request_hash) guard for the "force latest" fresh-fetch: one forced OLI create per
+// (operation, batch hash). Every ack is validated STRICTLY (echo + coherent state) and normalized.
+// ---------------------------------------------------------------------------
+const OLI_FRESHNESS_RESERVE_DISPOSITIONS = new Set(["reserved", "exists"]);
+const OLI_FRESHNESS_RECORD_DISPOSITIONS = new Set(["recorded", "already-recorded", "conflict", "not-reserved"]);
+
+export async function reserveOliFreshnessCreate(operationKey, requestHash, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/reserve_oli_freshness_create", {
+    method: "POST", signal, body: { p_operation_key: operationKey, p_request_hash: requestHash },
+  });
+  const ack = priorityOneAck(body, "oli-freshness reserve");
+  const d = ack.disposition;
+  if (!OLI_FRESHNESS_RESERVE_DISPOSITIONS.has(d)) throw new Error(`oli-freshness reserve: unknown disposition "${d}"; failing closed.`);
+  if (ack.operation_key !== operationKey) throw new Error("oli-freshness reserve: operation_key echo mismatch; failing closed.");
+  if (ack.request_hash !== requestHash) throw new Error("oli-freshness reserve: request_hash echo mismatch; failing closed.");
+  if (d === "reserved") {
+    if (ack.export_id != null || Number(ack.tokens_spent) !== 0 || ack.status !== "reserved") throw new Error("oli-freshness reserve: malformed 'reserved' ack; failing closed.");
+    return { disposition: "reserved", exportId: null, status: "reserved", tokensSpent: 0, requestHash };
+  }
+  if (ack.status !== "reserved" && ack.status !== "created") throw new Error("oli-freshness reserve: malformed 'exists' status; failing closed.");
+  if (ack.status === "created") {
+    if (!nbStr(ack.export_id) || Number(ack.tokens_spent) !== 2) throw new Error("oli-freshness reserve: 'exists'+created requires export_id + 2 tokens; failing closed.");
+    return { disposition: "exists", exportId: ack.export_id, status: "created", tokensSpent: 2, requestHash };
+  }
+  if (ack.export_id != null || Number(ack.tokens_spent) !== 0) throw new Error("oli-freshness reserve: 'exists'+reserved requires no export_id + 0 tokens; failing closed.");
+  return { disposition: "exists", exportId: null, status: "reserved", tokensSpent: 0, requestHash };
+}
+
+export async function recordOliFreshnessExport(operationKey, requestHash, exportId, tokens, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/record_oli_freshness_export", {
+    method: "POST", signal, body: { p_operation_key: operationKey, p_request_hash: requestHash, p_export_id: exportId, p_tokens: tokens },
+  });
+  const ack = priorityOneAck(body, "oli-freshness record");
+  const d = ack.disposition;
+  if (!OLI_FRESHNESS_RECORD_DISPOSITIONS.has(d)) throw new Error(`oli-freshness record: unknown disposition "${d}"; failing closed.`);
+  if (ack.operation_key !== operationKey) throw new Error("oli-freshness record: operation_key echo mismatch; failing closed.");
+  if (d === "not-reserved") return { disposition: "not-reserved", exportId: null, tokensSpent: 0 };
+  if (ack.request_hash !== requestHash) throw new Error("oli-freshness record: request_hash echo mismatch; failing closed.");
+  if (d === "recorded" || d === "already-recorded") {
+    if (ack.export_id !== exportId || Number(ack.tokens_spent) !== 2 || ack.status !== "created") throw new Error(`oli-freshness record: '${d}' requires the exact export_id + 2 tokens + created; failing closed.`);
+    return { disposition: d, exportId, tokensSpent: 2, status: "created" };
+  }
+  if (!nbStr(ack.export_id) || ack.export_id === exportId) throw new Error("oli-freshness record: 'conflict' requires a DIFFERENT existing export_id; failing closed.");
+  return { disposition: "conflict", exportId: ack.export_id, tokensSpent: Number(ack.tokens_spent) || 0, status: ack.status };
+}
+
+export async function getOliFreshnessAttempt(operationKey, requestHash, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "operation_key,request_hash,export_id,tokens_spent,status,created_at,updated_at",
+    operation_key: `eq.${operationKey}`, request_hash: `eq.${requestHash}`, limit: "1",
+  });
+  const rows = await request(`/rest/v1/source_oli_freshness_attempt?${query}`, { signal });
+  if (!Array.isArray(rows)) throw new Error("oli-freshness read: malformed (non-array) response; failing closed.");
+  if (rows.length === 0) return null;
+  if (rows.length !== 1) throw new Error("oli-freshness read: expected at most one row; failing closed.");
+  const r = rows[0];
+  if (!isPlainObj(r)) throw new Error("oli-freshness read: malformed row; failing closed.");
+  if (r.operation_key !== operationKey || r.request_hash !== requestHash) throw new Error("oli-freshness read: identity mismatch; failing closed.");
+  if (r.status !== "reserved" && r.status !== "created") throw new Error("oli-freshness read: bad status; failing closed.");
+  const coherent = (r.status === "reserved" && r.export_id == null && Number(r.tokens_spent) === 0)
+    || (r.status === "created" && nbStr(r.export_id) && Number(r.tokens_spent) === 2);
+  if (!coherent) throw new Error("oli-freshness read: status/state incoherent; failing closed.");
+  return { operationKey, requestHash, exportId: r.export_id ?? null, tokensSpent: Number(r.tokens_spent), status: r.status };
+}
+
 // claim_source_export_attempt: the durable one-attempt guard. TRUE only for the caller
 // that made the first (and only) create-export POST for this (cycle, request_hash).
 export async function claimSourceExportAttempt(cycleId, requestHash, { signal = null } = {}) {

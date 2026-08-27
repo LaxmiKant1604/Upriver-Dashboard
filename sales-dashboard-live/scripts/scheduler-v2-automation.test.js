@@ -240,6 +240,31 @@ test("D3. SINGLE active scheduler: scheduler-v2.yml is the ONLY workflow declari
   assert.deepEqual(scheduled, ["scheduler-v2.yml"], "exactly one scheduled workflow; got " + JSON.stringify(scheduled));
 });
 
+test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-always-normal, force-latest step (run_id, gated on mode + OLI-first), strict D-1 readiness + --strict-d1 release", () => {
+  const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
+  const idx = (s) => yml.indexOf(s);
+  // refresh_mode is a dispatch-only choice input; a SCHEDULED event is ALWAYS normal (force-latest can never be
+  // activated by a schedule).
+  assert.match(yml, /refresh_mode:/, "refresh_mode input present");
+  assert.match(yml, /type:\s*choice/, "refresh_mode is a choice");
+  assert.match(yml, /options:\s*\n\s*- normal\s*\n\s*- force-latest/, "the two modes");
+  assert.match(yml, /mode="normal"/, "scheduled resolves to normal");
+  assert.match(yml, /A SCHEDULED event is ALWAYS normal/, "documented + enforced scheduled=normal");
+  assert.match(yml, /mode="\$\{\{ github\.event\.inputs\.refresh_mode \}\}"/, "dispatch reads the refresh_mode input");
+  // the force-latest re-fetch step: gated on mode == force-latest, carries the github.run_id (durable idempotent
+  // identity), runs AFTER the normal OLI fetch and BEFORE the readiness proof.
+  assert.match(yml, /steps\.cfg\.outputs\.mode == 'force-latest'/, "force-latest step gated on mode");
+  assert.match(yml, /oli-force-latest\.mjs[^\n]*--run-id=\$\{\{ github\.run_id \}\}/, "force-latest carries github.run_id");
+  assert.ok(idx("scheduled-oli-refresh.mjs") < idx("oli-force-latest.mjs"), "normal OLI fetch before the force-latest re-fetch");
+  assert.ok(idx("oli-force-latest.mjs") < idx("verify-bucket-readiness.mjs"), "force-latest re-fetch before the D-1 proof");
+  assert.ok(idx("oli-force-latest.mjs") > 0 && idx("oli-force-latest.mjs") < idx("priority-dashboards-release.mjs"), "force-latest before publish");
+  // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
+  assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
+  // schedules unchanged.
+  const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
+  assert.deepEqual(crons, ["0 2 * * *", "30 10 * * *"], "02:00 UTC non-us + 10:30 UTC us unchanged");
+});
+
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");
 
 const usageResp = (rows) => ({ ok: true, json: async () => ({ data: rows, meta: {} }) });

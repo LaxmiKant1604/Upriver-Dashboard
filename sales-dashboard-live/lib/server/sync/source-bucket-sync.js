@@ -381,6 +381,9 @@ export async function runBucketSourceSync({
   // PRIORITY DASHBOARDS PATH: force a Catalog job so a catalog-only (OLI/Ads/FBA-paused) run still drains a
   // cycle for the durable-evidence Daily Reporting + Brand View derive. See planBucketSourceSync.
   forceCatalogRefresh = false,
+  // FORCE-FRESH-OLI (previous-day "force latest"): a pending OLI job skips the stale-cache adoption so it makes a
+  // real create-export POST (re-querying DataDoe for newly-settled D-1 rows). Threaded to runSourceJobs.
+  forceFreshOli = false,
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
@@ -461,7 +464,7 @@ export async function runBucketSourceSync({
       const res = await runSourceJobs({
         store, dataDoe, plannedJobs: allPlannedJobs, ownerIds,
         bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs,
-        sourceTranche: tranche, reuseOnly, budget,
+        sourceTranche: tranche, reuseOnly, budget, forceFreshOli,
       });
       continuations += 1;
       rollup.cycleId = res.cycleId || rollup.cycleId;

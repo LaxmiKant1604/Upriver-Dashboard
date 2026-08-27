@@ -192,7 +192,9 @@ export default async function handler(req, res) {
           return;
         }
         const asOf = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // server-resolved; never from the body
-        const request = validateSourceSyncRequest({ bucket, sourceKey: onlySourceKey, origin: "admin-manual", asOf });
+        // Admin-only "Force latest D-1": force-latest makes the OLI fetch bypass the stale cache (the SAME reviewed
+        // runSourceCardAction forceFreshOli path the GitHub force-latest job uses). The route is assertAdmin-gated.
+        const request = validateSourceSyncRequest({ bucket, sourceKey: onlySourceKey, origin: "admin-manual", asOf, refreshMode: body.refreshMode == null ? "normal" : String(body.refreshMode) });
         let syncDone = requestedPhase === "release";
         if (!syncDone) {
           if (onlySourceKey === "ads-asin-date") {
@@ -207,7 +209,7 @@ export default async function handler(req, res) {
                 : { phase: "sync", ok: false, problems: ads.problems || [] };
             } else { syncDone = true; result = { adsSync: ads }; }
           } else {
-            const rollup = await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight });
+            const rollup = await runtime.runSourceCardAction({ bucket, sourceKey: onlySourceKey, deadline, preflight, forceFreshOli: request.forceFreshOli === true });
             if (rollup && rollup.refused === true) { res.status(409).json({ refusal: rollup, status: await boundedStatusFn(deadline) }); return; }
             if (rollup && rollup.stopped === true) {
               operation = { phase: "sync", ok: false, problems: ["source sync stopped: " + String(rollup.stopReason && rollup.stopReason.code)] };

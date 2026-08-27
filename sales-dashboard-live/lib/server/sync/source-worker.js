@@ -156,7 +156,7 @@ export function recoveryEligibility(jobRow) {
  * derivation. Never throws for an expected source failure — it records a safe failure and
  * returns a non-success outcome so the cycle continues.
  */
-async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false, budget = null }) {
+async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false, budget = null, forceFreshOli = false }) {
   const requestHash = job.requestHash;
   const requestKey = job.requestKey || "";
   const started = clock();
@@ -195,7 +195,12 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     // entry records NOTHING and falls through to the normal claim -> create -> poll -> download -> save
     // path (exactly one create POST per hash). Gated on the store exposing a cache reader, so injected
     // test/canary stores without one keep the old path unchanged.
-    if (typeof store.loadSourceRows === "function") {
+    // FORCE-FRESH-OLI: skip the durable exact-cache adoption for a PENDING order-line-items job so a stale
+    // (but TTL-valid) earlier payload for the SAME request_hash is NEVER reused -- the job falls through to a real
+    // create-export POST (below), genuinely re-querying DataDoe for the newly-settled D-1 rows. Only OLI is force-
+    // refreshed; every other family keeps the reviewed cache-reuse path unchanged.
+    const skipCacheAdoption = forceFreshOli && job.sourceKey === "order-line-items";
+    if (typeof store.loadSourceRows === "function" && !skipCacheAdoption) {
       let entry = null;
       try { entry = await store.loadSourceRows(requestHash); } catch (_e) { entry = null; }
       const cachedRows = entry && Array.isArray(entry.rows) ? entry.rows : null;
@@ -486,6 +491,13 @@ export async function runSourceJobs({
   // once and validate/save/success through the existing paths. NEVER re-creates; a terminal/TRUNCATED/create-
   // stage failure is never eligible. NEVER a per-run/untrusted argument (a build-time composition flag).
   recoverFailedDownloads = false,
+  // FORCE-FRESH-OLI flag (the previous-day "force latest" fresh-fetch). When true, a PENDING order-line-items job
+  // SKIPS the durable exact-cache adoption (Part C) so a stale-but-TTL-valid earlier payload for the SAME canonical
+  // request_hash is NOT reused -- the job falls through to the reservation/claim -> real dataDoe.create() POST, so
+  // DataDoe is genuinely re-queried for the newly-settled D-1 rows. The request_hash is UNCHANGED (identity has no
+  // run-scoped input); only the execution-time reuse decision is overridden. Idempotency across runs is the caller's
+  // durable freshness reservation, not this flag. NEVER a per-run/untrusted argument (a build-time composition flag).
+  forceFreshOli = false,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -642,7 +654,7 @@ export async function runSourceJobs({
       continue;
     }
     const job = mergeJob(meta, jobRow);
-    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly, budget });
+    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly, budget, forceFreshOli });
     if (outcome) outcomes.push(outcome);
   }
 
