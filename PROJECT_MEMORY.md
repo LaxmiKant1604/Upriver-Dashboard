@@ -12770,3 +12770,26 @@ membership rebuilt (111 pairs); controls safe-closed. IDEMPOTENCE proven: re-run
 creates=0/tokens=0. FAILED-RUN RECONCILIATION: GitHub run's DATADOE_D1_NOT_READY/provenThrough=2026-08-25(D-2)/17-behind
 is the OLD held-behavior signature -> it ran PRE-provisional 1e9b600; bucket=non-us correct (0 2 cron; delayed exec).
 verify 81 steps/61 suites green. See [[scheduler-v2-provisional-final]].
+
+## Scheduler v2 -- publish Non-US 2026-08-27 + Sales Dashboard provisional + inactive-account labelling (2026-08-28, code 16ffbf7)
+
+State at 2026-08-28: NO account had 2026-08-27 (D-1) coverage (all only proved 2026-08-26); no cycle_date=2026-08-28
+-> the automatic Non-US 2026-08-27 run had not landed. Ran the trusted path (bucket=non-us, requestedAsOf=2026-08-27,
+normal, op scheduled-fresh/non-us/2026-08-27): OLI 5 creates/10 tok -> 22/22 at D-1, D1_PROVISIONAL (0% itemized on
+D+1 -- very early; 555 pending orders, 0 defects); ASIN Ads 4 creates/8 tok (17 covered, 5 disconnected excluded);
+readiness D1_PROVISIONAL exact through 2026-08-27; release published 66 (effectivePublishAsOf=2026-08-27, 2 tok/1
+catalog); membership rebuilt (111); safe-closed. The "bucket=us/2026-08-26" run was YESTERDAY's US work -- not proof
+for Non-US 2026-08-27.
+
+TWO GAPS FOUND + FIXED (code 16ffbf7):
+- SALES DASHBOARD (App.jsx main view = brand-sales path) did not READ body.completeness (backend augment was wired
+  since the prior task) -> silently showed only the latest itemized day. Fixed: loadCachedRows/fetchRows capture
+  body.completeness + render Provisional/Final D-1 badge + notice ("Covered through <D-1>", itemization %, pending,
+  finalized-through). Sales rows still end at the latest ITEMIZED date; a 0%-itemized D-1 shows NO fabricated zero.
+- FULLY-INACTIVE account (0 OLI rows in the window) had covered D-1 but no completenessByAccount entry -> unlabelled.
+  Fixed in source-bucket-sync: write explicit FINAL D-1 (0 orders) for EVERY covered account incl. 0-row ones (b60cf1
+  backfilled). All 22 Non-US @2026-08-27 now labelled (5 final + 17 provisional).
+
+IMPORTANT SEMANTICS: covered-through (D-1) != latest-itemized-sales-date. On a 0%-itemized D+1 morning the daily rows
+end at D-2 while the badge honestly says Provisional D-1 (D-1), 0% itemized. Never null->0. verify 81/61 green.
+US 2026-08-27 preflight + evening automatic run pending. See [[scheduler-v2-provisional-final]].
