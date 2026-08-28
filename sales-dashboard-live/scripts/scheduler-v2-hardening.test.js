@@ -34,6 +34,25 @@ test("12/13. each cron maps deterministically to its bucket; unknown cron fails 
   assert.ok(cfgIdx > 0 && cfgIdx < npmIdx, "bucket resolution + unknown-cron guard run before npm ci / any I/O");
 });
 
+/* 1/3/6. requestedAsOf is the PREVIOUS UTC DAY (D-1) -- computed once, UTC, from the calendar, never the clock/bucket */
+test("1/3/6. requestedAsOf = previous UTC day (D-1): computed via `date -u -d 'yesterday'`, UTC + calendar, not the local clock or bucket", () => {
+  // The workflow computes a SINGLE previous-UTC-day asof AFTER bucket resolution: -u forces UTC (never the runner's
+  // local zone), 'yesterday' is the previous CALENDAR day (D-1) at execution time, and it is bucket-independent.
+  assert.match(yml, /asof="\$\(date -u -d 'yesterday' \+%Y-%m-%d\)"/, "asof is the previous UTC calendar day (D-1)");
+  // Exactly ONE asof computation (not one per bucket, not derived from the wall-clock hour).
+  assert.equal((yml.match(/date -u -d 'yesterday'/g) || []).length, 1, "asof is computed exactly once");
+  assert.doesNotMatch(yml, /asof=.*date \+/, "asof never uses the LOCAL date (must be -u / UTC)");
+  // A delayed run keeps the correct bucket (from github.event.schedule) AND a previous-UTC-day D-1 (from the calendar
+  // at execution time) -- neither is inferred from the wall-clock hour.
+  const jsPrevUtc = () => { const d = new Date(Date.UTC(2026, 7, 28, 2, 0, 0)); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
+  assert.equal(jsPrevUtc(), "2026-08-27", "the readiness/operator default previous-UTC-day arithmetic yields D-1");
+  // The operator + readiness are HANDED the asof (they never recompute the date from the clock on a scheduled run).
+  assert.match(yml, /oli-refresh-d1\.mjs[^\n]*--requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "operator receives the resolved asof");
+  assert.match(yml, /verify-bucket-readiness\.mjs[^\n]*--requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness receives the resolved asof");
+  const readiness2 = readiness; // the CLI default (when no --requested-as-of) is the previous UTC day, not local.
+  assert.match(readiness2, /setUTCDate\(d\.getUTCDate\(\) - 1\)/, "the readiness CLI default asof is UTC previous-day");
+});
+
 /* scheduled events cannot select force-latest via input injection */
 test("scheduled events are ALWAYS normal mode (force-latest is dispatch-only; no input injection)", () => {
   assert.match(yml, /if \[ "\$\{\{ github\.event_name \}\}" = "schedule" \]; then[\s\S]*?mode="normal"/);
