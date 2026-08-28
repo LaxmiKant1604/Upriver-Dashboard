@@ -12833,3 +12833,51 @@ scheduler tolerates it (180min budget) + the API slices via polled continuation,
 preflightEvidence 3x (Stage1 + derive + finalize) so a full-bucket CLI run is slow (>400-580s) -- slow, not hung.
 Candidate future optimization: thread ONE preflight through the release slices. verify 81 steps/61 suites green.
 See [[scheduler-v2-provisional-final]].
+
+## SKU Movement -- NEW zero-export durable report, live end to end (2026-08-28, code ce2b6e8)
+
+Built + wired a brand-new advanced report `sku-movement` / version `sku-movement/v1` from ALREADY-DURABLE evidence
+ONLY (OLI daily rollup source_oli_daily_history + the reusable org Product Catalog snapshot). NO new DataDoe source,
+scheduler, migration, control, or approval. A derive/serve/reload/account-change/brand-change is STRUCTURALLY
+incapable of an export (no adapter is ever imported on the path). Does not touch Sales Movers or any other report.
+
+FILES (all under sales-dashboard-live/): NEW lib/server/reports/sku-movement-core.js (pure math),
+sku-movement-durable-rederive.js (I/O + honest-date boundary), sku-movement-backfill.js (+ scripts/release/
+backfill-sku-movement.mjs runner), src/views/SkuMovement.jsx, scripts/sku-movement.test.js (21) +
+sku-movement-integration.test.js (18). EDITED api/datadoe.js (serveSelfHealingSkuMovement + descriptor +
+ACCOUNT_SCOPED_ACTIONS + imports), lib/server/sync/report-derivation.js (additive no-contract registry entry, like
+brand-inventory), src/components/shell.jsx (Growth nav tab), src/App.jsx (params + useSharedReport hook + render +
+header reload routing + catalogBrands selector feed), src/views/shared.jsx (SortTh gains an optional `style` for the
+sticky headers), package.json + scripts/verify.mjs (both new suites registered).
+
+DATA MODEL (per account+ASIN+SKU row): ASIN, SKU, Catalog product name/brand, units for the 3 completed months, MTD
+units through effectiveD-1, units for the latest 5 individual dates, Last-5 + Previous-5 totals, movement% =
+((Last5-Prev5)/Prev5)x100, avg monthly units, MTD run rate, projected month units, movement status (New/Rising/Stable/
+Declining/Dormant/No Data). ALL date/month windows are DYNAMIC from each account's effectiveAsOf; thresholds central
++ testable (Rising >+20%, Declining <-20%). effectiveAsOf = account's LATEST PROVEN OLI date capped at a
+SERVER-resolved D-1 (never the viewer's browser clock); month/Dec->Jan/leap-Feb rollover handled by date-windows.js.
+
+POLICIES ENFORCED (proven by tests): cancelled/explicit-zero/pending already excluded by the rollup so SUM(units) is
+correct; NO double-count across currency; covered no-sale date = honest 0; a month entirely before coverage =
+UNAVAILABLE (null em-dash), NEVER a fabricated 0; null never coerced. Brand isolation: canonical brandKey (trim +
+collapse-whitespace + lowercase, PUNCTUATION significant -> "Caruso-Italy" != "Caruso Italy"); a named brand yields
+ONLY its Catalog-proven ASINs; Unmapped never folded into a named brand; unmatched brand = VALID empty report, NEVER
+an All-Brands fallback. catalogBrands (header selector) is ACCOUNT-scoped to sold+proven ASINs (org catalog would leak
+other accounts' brands).
+
+PROPAGATION: dedicated serveSelfHealingSkuMovement (mirrors serveSelfHealingBrandDirectory) -- cheap freshness probe
+(coverage + catalog metadata, no history load); serves the stored snapshot when its provenance matches, else
+re-derives from the latest saved OLI+Catalog under a per-(account,brand) lock and republishes. So a scheduler OR a
+manual Data Sync Center OLI sync auto-propagates on the NEXT page load, zero export. Intercepted BEFORE any
+refresh/build path, so even a forced header refresh is zero-export. Carries the two-layer provisional/final D-1
+completeness label (makeCompletenessAugment). One derive path (rederiveSkuMovement) => scheduler/manual/self-heal
+PARITY (backfill payload byte-identical to a direct re-derive, asserted).
+
+UI (SkuMovement.jsx): search, sort, movement-state filter, pagination (50/pg), sticky ASIN/SKU columns, totals row
+(current scope), scope-respecting CSV with dynamic month/date headers, provisional/final badge, states (loading/
+missing/valid-empty-branded), read-only "Reload latest data" (never DataDoe).
+
+STATUS: code committed ce2b6e8 on main; docs this entry. npm run verify GREEN (83 steps / 63 suites incl. build).
+PENDING (this session, needs prod reachable): push -> Vercel 200 -> run backfill-sku-movement.mjs APPLY (30 accounts,
+All Brands, creates=0/tokens=0) -> authenticated prod read-backs for US/India/Germany/France/Italy/Spain/UK (All
+Brands + >=2 named brands each). Named-brand snapshots self-heal on first read (backfill does All Brands per account).
