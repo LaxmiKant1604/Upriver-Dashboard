@@ -12891,3 +12891,26 @@ CRITICAL FIX f4bf583 (caught by the DRY-RUN backfill against real prod): getSour
 ALL 30 accounts failed "oli-coverage-incomplete". Fixed to accept { from, to } (+ raw column names). The integration
 fixtures had masked it by using the wrong window shape; they now use the production { from, to } shape (one raw-column
 window retained to prove both spellings). Lesson: mirror the ACTUAL reader output shape in fixtures.
+
+## Daily Reporting -- Royal Violet content-area redesign (2026-08-28, code fd2ae03)
+
+VISUAL-ONLY redesign of the Daily Reporting CONTENT AREA to the supplied Figma (Royal Violet system). NO backend /
+formula / source-contract / scheduler / DataDoe / migration change; shared sidebar + top bar (shell.jsx) and every
+other route UNTOUCHED. Files: NEW src/views/DailyReporting.jsx (presentational, driven by the SAME payload App
+already builds: dailyReport {latest,columns,cells} + dailyCompleteness + dailyCurrency), NEW
+src/lib/daily-view-model.js (pure KPI/trend/completeness derivations) + scripts/daily-view-model.test.js (9). EDITED
+src/App.jsx (extracted the ~112-line inline daily block -> a 15-line <DailyReporting/> call), src/styles/theme.js
+(additive, token-based .dr-* block only), package.json + scripts/verify.mjs (new suite).
+
+Renders: full-width violet Provisional/Final D-1 information band (live itemization %/pending/finalized-through, never
+hard-coded); six gradient MTD KPI cards (coral/violet/orange/emerald/amber/pink) from the MTD column cell; deep-violet
+table header with the coral-tinted MTD emphasis column, dynamic 3-month/MTD/latest-5 columns, restrained Lucide row
+icons (NO emoji), sticky metric column, alternating shading/hover; four 5-day trend cards using the shared honest
+Sparkline (drops unavailable points, never fabricates); soft-violet formula note with the existing accurate wording.
+ROI=TotalSales/AdSpend, ACoS=AdSpend/AdSales, TACoS=AdSpend/TotalSales UNCHANGED; zero/missing denom -> em dash (never
+Infinity/NaN/0); advertising a period does not cover -> null gap. Table money keeps full fmtMoney (no value/format
+change); KPI/trend headlines use compact. Responsive KPI 6->3->2 + trend 4->2->1 grids + horizontally-scrolling table;
+VERIFIED with headless-Chrome screenshots at 1440/1280/768/390 (no page overflow, clipping, or overlap; Chrome
+headless clamps to a 500px min viewport, so 390 was checked via a width-constrained main-area). npm run verify green
+(84 steps / 64 suites incl. build). Named-brand scope never falls back to All Brands; cache-first + read-only reload +
+auto-revalidation + provisional/final completeness all intact.
