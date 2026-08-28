@@ -12809,3 +12809,27 @@ Serve augment returns Provisional D-1 (2026-08-27, 0% itemized, pending shown) e
 rows honestly end at the latest ITEMIZED date (no fabricated zero). Total tokens 2026-08-27: non-us ~20 (10 OLI + 8
 Ads + 2 release), us ~10 (4 OLI + 4 Ads + 2 release). OPEN ITEM: the GitHub automatic scheduler did not fire the
 Non-US 2026-08-27 run -- needs gh-side verification (secrets/enablement/run logs) that I cannot do here.
+
+## Scheduler v2 -- END-TO-END AUDIT of 2026-08-27 D-1 delivery (2026-08-28, code 6339023)
+
+Read-only audit + reconciliation on current head (origin/main 6339023, deployed, Vercel 200). CONCLUSION: NO
+internal data-integrity bug -- the current state is correct end to end. The 0% itemized 2026-08-27 is the ESCALATED
+DataDoe null-price gap (item_price_value/item_status null for not-yet-itemized orders), classified provisional,
+never fabricated.
+
+VERIFIED: (a) CHAIN-OF-CUSTODY item 16 BOTH buckets -- a valid DataDoe value survives dimensional -> daily rollup ->
+published snapshot EXACTLY (non-us 12f3a6 @2026-08-26 = 14316.95/31u; us 51bec5 @2026-08-26 = 360.00). (b) directory
+8 us + 22 non-us, 0 dd-secondary; Campaign Ads/FBA 0 jobs. (c) publication controls FULLY safe-closed (approvals=0,
+13 report settings paused, rollout=0, promoted=0); the 3 enabled source_controls = OLI/Catalog/Ads source enablement
+(correct, NOT a safe-close target). (d) serve honesty: covered-through (D-1) != latest-itemized date; a 0%-itemized
+D-1 shows NO fabricated zero row, augment returns Provisional D-1 even for to=TODAY. (e) 20 mandatory regressions all
+covered; ONLY gap = requestedAsOf date-value (#1/#3/#6) -> ADDED (requestedAsOf = previous UTC day via
+`date -u -d 'yesterday'`, clock/bucket-independent). (f) MANUAL Data Sync Center path (item 20) uses the SAME runtime
++ release engine as the scheduler; auto derives+publishes+read-backs+safe-closes; proven structurally + by tests.
+
+PERFORMANCE NOTE (pre-existing, NOT a bug, NOT mine): the bucket-wide preflightEvidence sweep (gatherEvidence:
+coverage + Ads + catalog/FBA storage hydration for 22 accounts) is SLOW (~200s; every individual read is ~1s). The
+scheduler tolerates it (180min budget) + the API slices via polled continuation, but manual-source-sync.mjs invokes
+preflightEvidence 3x (Stage1 + derive + finalize) so a full-bucket CLI run is slow (>400-580s) -- slow, not hung.
+Candidate future optimization: thread ONE preflight through the release slices. verify 81 steps/61 suites green.
+See [[scheduler-v2-provisional-final]].
