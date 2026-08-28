@@ -46,12 +46,14 @@ const HISTORY_Z = [{ sale_date: "2026-08-26", child_asin: "A1", sku: "Z9", units
 // Account "RECENT": coverage only from 2026-08-01, so the three completed months are all BEFORE coverage (null).
 const HISTORY_RECENT = [{ sale_date: "2026-08-10", child_asin: "A1", sku: "S1", units: 3, currency: "EUR" }];
 
+// PRODUCTION shape: getSourceCoverageWindows returns windows as { from, to }. (Account "A" also carries a raw
+// covered_from/covered_to window to prove skuMovementProvenDates accepts both column spellings.)
 const WINDOWS = {
-  A: [{ covered_from: "2025-01-01", covered_to: "2026-08-27" }],
-  Z: [{ covered_from: "2025-01-01", covered_to: "2026-08-27" }],
-  LAG: [{ covered_from: "2025-01-01", covered_to: "2026-08-20" }], // proven only through Aug20 -> honest earlier as-of
-  BEYOND: [{ covered_from: "2025-01-01", covered_to: "2026-09-30" }], // proven beyond ceiling -> must cap at CEIL
-  RECENT: [{ covered_from: "2026-08-01", covered_to: "2026-08-27" }],
+  A: [{ from: "2025-01-01", to: "2026-08-27" }, { covered_from: "2025-01-01", covered_to: "2026-08-27" }],
+  Z: [{ from: "2025-01-01", to: "2026-08-27" }],
+  LAG: [{ from: "2025-01-01", to: "2026-08-20" }], // proven only through Aug20 -> honest earlier as-of
+  BEYOND: [{ from: "2025-01-01", to: "2026-09-30" }], // proven beyond ceiling -> must cap at CEIL
+  RECENT: [{ from: "2026-08-01", to: "2026-08-27" }],
   NONE: [],
 };
 const HISTORY = { A: HISTORY_A, Z: HISTORY_Z, LAG: HISTORY_A, BEYOND: HISTORY_A, RECENT: HISTORY_RECENT, NONE: [] };

@@ -17,10 +17,13 @@ const ORGANIZATION_SCOPE_KEY = "__organization";
 // capped at `ceiling` = D-1) + the earliest covered date (coverageFrom, so a completed month entirely before it is
 // UNAVAILABLE, never a fabricated 0). Never invents D-1: if coverage proves only an earlier date, THAT is effectiveAsOf.
 export function skuMovementProvenDates(oliWindows, ceiling) {
-  const wins = (Array.isArray(oliWindows) ? oliWindows : []).filter((w) => w && isDate(S(w.covered_from ?? w.coveredFrom)) && isDate(S(w.covered_to ?? w.coveredTo)));
+  // getSourceCoverageWindows yields { from, to } (mapped from covered_from/covered_to); accept the raw column names too.
+  const wFrom = (w) => S(w && (w.from ?? w.covered_from ?? w.coveredFrom));
+  const wTo = (w) => S(w && (w.to ?? w.covered_to ?? w.coveredTo));
+  const wins = (Array.isArray(oliWindows) ? oliWindows : []).filter((w) => w && isDate(wFrom(w)) && isDate(wTo(w)));
   if (!wins.length || !isDate(ceiling)) return { effectiveAsOf: null, coverageFrom: null };
-  const froms = wins.map((w) => S(w.covered_from ?? w.coveredFrom));
-  const tos = wins.map((w) => S(w.covered_to ?? w.coveredTo));
+  const froms = wins.map(wFrom);
+  const tos = wins.map(wTo);
   const maxTo = tos.reduce((m, t) => (t > m ? t : m), tos[0]);
   const minFrom = froms.reduce((m, f) => (f < m ? f : m), froms[0]);
   const effectiveAsOf = maxTo < ceiling ? maxTo : ceiling; // cap at D-1; honest earlier date if that is all that is proven
