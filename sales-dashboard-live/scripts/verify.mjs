@@ -49,6 +49,8 @@ const SUITES = [
   "test:oli-dimensional",
   "test:oli-itemization",
   "test:oli-completeness-serve",
+  "test:sku-movement",
+  "test:sku-movement-integration",
   "test:oli-value-policy",
   "test:oli-quality",
   "test:oli-order-audit",

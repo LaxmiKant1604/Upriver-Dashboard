@@ -76,7 +76,7 @@ export function StatRow({ stats }) {
 }
 
 /** Sortable header cell. Same markup and behaviour as the FBA plan table. */
-export function SortTh({ label, col, sort, onSort, align = "right", className = "", hint }) {
+export function SortTh({ label, col, sort, onSort, align = "right", className = "", hint, style }) {
   const active = sort.key === col;
   return (
     <th
@@ -84,6 +84,7 @@ export function SortTh({ label, col, sort, onSort, align = "right", className = 
       onClick={() => onSort(col)}
       title={hint || "Click to sort"}
       aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}
+      style={style}
     >
       <span className="pt-th-inner">
         {label}

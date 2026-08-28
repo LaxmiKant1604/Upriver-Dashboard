@@ -39,6 +39,7 @@ import {
   listingOptimizerUnavailablePayload,
   ppcPerformancePayload,
 } from "../reports/derivation-core.js";
+import { skuMovementPayload } from "../reports/sku-movement-core.js";
 import {
   declaredReportKeys,
   declaredRequestKeys,
@@ -1198,6 +1199,27 @@ const REGISTRY = {
     // Latest real data date = the latest VALIDATED in-window FBA snapshot date the fold selected; null for
     // a validated empty snapshot. Never asOf / fetched_at / saved_at.
     latestDataDate: (p) => (p && isValidCalendarDate(p.inventoryDate) ? p.inventoryDate : null),
+  },
+  // SKU Movement -- a DURABLE, zero-export derived report over the account's OLI daily rollup + Product Catalog.
+  // No source contract (like brand-inventory): it is produced only by the durable re-derive / backfill, never a fetch.
+  // The pure movement math lives in sku-movement-core.js; the derive here folds durable OLI rows + Catalog for the
+  // registry/backfill path. context: { effectiveAsOf, brand, coverageFrom }.
+  "sku-movement": {
+    snapshotVersion: "sku-movement/v1",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: ({ sources, context }) => skuMovementPayload({
+      oliRows: (sources && sources["sku-movement:oli"] && sources["sku-movement:oli"].rows) || [],
+      catalogRows: (sources && sources["sku-movement:catalog"] && sources["sku-movement:catalog"].rows) || [],
+      effectiveAsOf: context && context.effectiveAsOf,
+      brand: (context && context.brand) || "ALL",
+      coverageFrom: (context && context.coverageFrom) || null,
+    }),
+    validatePayload: (p) => !!p && typeof p === "object" && !Array.isArray(p)
+      && Array.isArray(p.rows) && typeof p.brandFiltered === "boolean"
+      && ("effectiveAsOf" in p) && isValidCalendarDate(p.effectiveAsOf),
+    // Latest real data date = the honest effectiveAsOf (latest proven OLI date, capped at D-1). Never asOf-now / saved_at.
+    latestDataDate: (p) => (p && isValidCalendarDate(p.effectiveAsOf) ? p.effectiveAsOf : null),
   },
 };
 

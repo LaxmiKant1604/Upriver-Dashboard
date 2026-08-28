@@ -24,6 +24,7 @@ import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell } from "./lib/csv.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
+import SkuMovement from "./views/SkuMovement.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
@@ -2100,6 +2101,12 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (insightScope ? { action: "listing-optimizer", ...insightScope } : null),
     [insightScope]
   );
+  // SKU Movement is BRAND-scoped (unlike the insight reports), so its snapshot identity includes the selected brand.
+  // Read-only + durable: loading/reloading/changing account or brand only reads saved OLI+Catalog, never DataDoe.
+  const skuMovementParams = useMemo(
+    () => (selectedAccountId ? { action: "sku-movement", reportVersion: "sku-movement/v1", ids: selectedAccountId, brand: selectedBrand, to: TODAY } : null),
+    [selectedAccountId, selectedBrand, TODAY]
+  );
 
   // The Priority Feed combines all six, so each report also loads its shared
   // snapshot while the feed is open. That is a snapshot read, never a DataDoe
@@ -2111,6 +2118,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const returns = useSharedReport({ params: returnsParams, active: view === "returns" || onFeed });
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
   const optimizer = useSharedReport({ params: optimizerParams, active: view === "optimizer" || onFeed });
+  const skuMovement = useSharedReport({ params: skuMovementParams, active: view === "skumovement" });
 
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
@@ -2133,6 +2141,16 @@ function DashboardApp({ session, access, onSignOut }) {
       setCatalogBrandsAccountId(body.accountId);
     }
   }, [activeInsightReport?.data]);
+
+  // SKU Movement carries the same account-scoped catalog brands, so its view can drive the shared header selector too.
+  useEffect(() => {
+    const body = skuMovement?.data;
+    if (!body || body.snapshotMissing) return;
+    if (body.accountId && Array.isArray(body.catalogBrands) && body.catalogBrands.length) {
+      setCatalogBrands(body.catalogBrands);
+      setCatalogBrandsAccountId(body.accountId);
+    }
+  }, [skuMovement?.data]);
 
   const dailyCurrency = selectedMarketplace.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
@@ -2824,6 +2842,7 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "skupl" ? skuPlCachedAt
     : view === "keywordrank" ? keywordRankCachedAt
     : view === "contentchanges" ? contentChangesCachedAt
+    : view === "skumovement" ? skuMovement.cachedAt
     : lastFetchedAt;
   const activeBusy = showingBrandPortfolio ? brandDirectoryLoading
     : activeInsightReport ? activeInsightReport.loading
@@ -2833,6 +2852,7 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "skupl" ? skuPlLoading
     : view === "keywordrank" ? keywordRankLoading
     : view === "contentchanges" ? contentChangesLoading
+    : view === "skumovement" ? (skuMovement.loading || skuMovement.updating)
     : rowsLoading;
   const accountLabel = refreshScopeAccount?.name || "selected account";
   const refreshScopeLabel = showingBrandPortfolio ? (selectedPortfolioBrand || "portfolio brand") : accountLabel;
@@ -2862,6 +2882,7 @@ function DashboardApp({ session, access, onSignOut }) {
       : view === "skupl" ? loadCachedSkuPl
       : view === "keywordrank" ? loadCachedKeywordRank
       : view === "contentchanges" ? loadCachedContentChanges
+      : view === "skumovement" ? skuMovement.reload
       : loadCachedRows,
     disabled: onFeed || (showingBrandPortfolio && !accounts.length && !isAdmin && !allowedAccountIds.size),
     hint: onFeed
@@ -4060,6 +4081,19 @@ function DashboardApp({ session, access, onSignOut }) {
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}
+        />
+      )}
+
+      {view === "skumovement" && (
+        <SkuMovement
+          data={skuMovement.data}
+          loading={skuMovement.loading}
+          updating={skuMovement.updating}
+          error={skuMovement.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          onReload={skuMovement.reload}
+          cachedAt={skuMovement.cachedAt}
         />
       )}
 

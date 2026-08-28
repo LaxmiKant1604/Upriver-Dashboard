@@ -33,6 +33,7 @@ import {
   Store,
   Tag,
   Tags,
+  Activity,
   TrendingUp,
   Trophy,
   Undo2,
@@ -79,6 +80,7 @@ export const NAV_GROUPS = [
     label: "Growth",
     items: [
       { view: "salesmovers", label: "Sales Movers", title: "Sales Movers — weekly ASIN gains and declines", icon: TrendingUp },
+      { view: "skumovement", label: "SKU Movement", title: "SKU Movement — per-ASIN/SKU units, trend and month projection", icon: Activity },
       { view: "ppc", label: "PPC Performance", title: "PPC Performance & Wasted Spend", icon: Megaphone },
       { view: "keywordrank", label: "Keyword Rank", title: "Keyword rank and share of query", icon: Tag },
       { view: "optimizer", label: "Listing Optimizer", title: "Listing & Search Optimizer — search-funnel and content gaps", icon: FileSearch },

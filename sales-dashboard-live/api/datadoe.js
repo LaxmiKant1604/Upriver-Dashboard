@@ -32,6 +32,7 @@ import {
   getDashboardAccess,
   getDailyAdsCoverage,
   getLatestReportSnapshot,
+  getLatestReportSnapshotForScope,
   getLatestReportSnapshotHydrated,
   getLatestReportSnapshotMeta,
   getLatestSourceProvenance,
@@ -145,6 +146,7 @@ import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggreg
 import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
+import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
@@ -177,6 +179,9 @@ const ACCOUNT_SCOPED_ACTIONS = new Set([
   // OLI data-quality: a read-only, ZERO-DataDoe explicit-zero indicator (Sales Dashboard) + per-account quality
   // counts (Data Sync Center). Both are single-account, authorised, and read only the durable dimensional table.
   "oli-quality", "oli-quality-summary",
+  // SKU Movement: single-account, authorised, DURABLE (zero-DataDoe) -- derived from the account's saved OLI
+  // rollup + Product Catalog only. Never spends a token on a read/derive/reload/account-change/brand-change.
+  "sku-movement",
 ]);
 
 // Every insight report is strictly one selected account: the shared snapshot,
@@ -958,6 +963,113 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
   }
 }
 
+// SKU Movement -- a dedicated ZERO-EXPORT self-healing serve (mirrors serveSelfHealingBrandDirectory). The generic
+// shared serve would serve ANY latest snapshot before it would ever re-derive; this instead re-derives from the
+// account's LATEST saved OLI daily rollup + Product Catalog the moment the durable evidence has ADVANCED past the
+// stored snapshot -- so a scheduler OR a manual Data Sync Center OLI sync auto-propagates on the very next page load.
+// NO DataDoe adapter is on this path: derive / serve / reload / account-change / brand-change can NEVER spend a token.
+// Brand scope is honoured strictly (a named-brand read never falls back to the ALL-brand snapshot); the effectiveAsOf
+// is server-resolved from the account's own proven coverage (the account/marketplace date, never the viewer clock).
+const SKU_MOVEMENT_OLI_SOURCE_KEY = "order-line-items";
+const SKU_MOVEMENT_CATALOG_SOURCE_KEY = "product-catalog";
+const SKU_MOVEMENT_ORG_SCOPE = "__organization";
+async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections }) {
+  const { reportKey, reportVersion, accountId, params, label } = legacyShared;
+  const brand = params && params.brand != null ? params.brand : "ALL";
+  const brandScope = { brand: String(brand).trim() === "" ? "ALL" : String(brand).trim() };
+  const primary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+  if (!accountId || !primary) {
+    res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, message: `${label} needs the primary connection and a selected account.` });
+    return;
+  }
+  const orgFp = primary.organizationFingerprint || organizationFingerprint(primary.apiKey);
+  // The future-guard ceiling is the SERVER's UTC calendar date (never the viewer's browser clock). The real as-of is
+  // the account's latest PROVEN OLI date (its marketplace D-1), inherently <= this ceiling.
+  const ceiling = new Date().toISOString().slice(0, 10);
+  const readers = {
+    readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
+    readCatalogSnapshot: getSourceSnapshot, loadCatalogPayload: getSourceSnapshotPayload,
+  };
+  const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness });
+
+  // CHEAP freshness probe (coverage + catalog metadata only -- NO history load, NO DataDoe): the current proven
+  // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive".
+  let effectiveAsOf = null;
+  let freshRefreshedAt = null;
+  try {
+    const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId, sourceKey: SKU_MOVEMENT_OLI_SOURCE_KEY });
+    const oliWindows = cov && cov.read === "ok" ? (cov.windows || []) : [];
+    ({ effectiveAsOf } = skuMovementProvenDates(oliWindows, ceiling));
+    const catRead = await getSourceSnapshot({ organizationFingerprint: orgFp, connectionId: "primary", sourceKey: SKU_MOVEMENT_CATALOG_SOURCE_KEY, scopeKey: SKU_MOVEMENT_ORG_SCOPE });
+    const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
+    freshRefreshedAt = skuMovementRefreshedAt({ catalogSnapshot, effectiveAsOf });
+  } catch (_e) { /* fall through: treat as evidence-advanced and let the derive make the honest decision */ }
+
+  const stored = await getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion, scope: brandScope }).catch(() => null);
+  const serveStored = async (snap, extra = {}) => {
+    const storedParams = snap.params && typeof snap.params === "object"
+      ? Object.fromEntries(Object.entries(snap.params).filter(([k]) => k !== "reportVersion"))
+      : params;
+    const paramsHash = paramsHashFor(reportVersion, storedParams);
+    const extraAug = await augment({ accountId, params, payload: snap.payload }).catch(() => ({}));
+    res.status(200).json({
+      ...snap.payload, reportKey, reportVersion, paramsHash,
+      ...(extraAug && typeof extraAug === "object" ? extraAug : {}),
+      ...extra,
+      snapshot: { savedAt: snap.source_refreshed_at || snap.updated_at || null, updatedAt: snap.updated_at || null, shared: true },
+    });
+  };
+
+  // Stored snapshot is CURRENT (its provenance matches the freshly-probed evidence for the SAME effectiveAsOf) ->
+  // serve it immediately, no re-derive, no history load.
+  if (stored && stored.payload && effectiveAsOf && freshRefreshedAt
+      && String(stored.source_refreshed_at || "") === String(freshRefreshedAt)
+      && stored.payload.effectiveAsOf === effectiveAsOf) {
+    await serveStored(stored);
+    return;
+  }
+
+  // Evidence advanced (or nothing stored yet) -> re-derive from saved OLI + Catalog under a per-(account,brand) lock.
+  // ZERO DataDoe. One re-derive serves concurrent readers; the rest serve the stored snapshot (labelled updating).
+  const lockHash = paramsHashFor(reportVersion, { brand: brandScope.brand, selfHeal: "sku-movement" });
+  const locked = await claimRefreshLock({ reportKey, accountId, paramsHash: lockHash, lockSeconds: 300 }).catch(() => false);
+  if (!locked) {
+    if (stored && stored.payload) { await serveStored(stored, { updating: true }); return; }
+    res.status(200).json({ snapshotMissing: true, updating: true, reportKey, reportVersion, accountId, message: `${label} is being prepared from saved data — no export is created.` });
+    return;
+  }
+  try {
+    const derived = await rederiveSkuMovement({ accountId, brand, organizationFingerprint: orgFp, connectionId: "primary", ceiling }, readers);
+    if (!derived || derived.notReady || !derived.payload) {
+      if (stored && stored.payload) { await serveStored(stored, { updating: true }); return; }
+      res.status(200).json({
+        snapshotMissing: true, reportKey, reportVersion, accountId, waitingForScheduledData: true,
+        missingSources: (derived && derived.blockedBy) || [],
+        message: `No saved ${label} for this account yet — waiting for the scheduled data refresh.`,
+      });
+      return;
+    }
+    const publishedParams = { asOf: derived.effectiveParams.asOf, brand: brandScope.brand };
+    const publishedHash = paramsHashFor(reportVersion, publishedParams);
+    const payloadBytes = Buffer.byteLength(JSON.stringify(derived.payload), "utf8");
+    const saved = await saveReportSnapshot({
+      reportKey, accountId, paramsHash: publishedHash,
+      params: { reportVersion, ...publishedParams },
+      payload: derived.payload, payloadBytes,
+      sourceRefreshedAt: derived.sourceRefreshedAt || new Date().toISOString(),
+    }).catch(() => null);
+    if (saved && saved.id) await publishSnapshotUpdate({ reportKey, accountId, paramsHash: publishedHash, snapshotId: saved.id }).catch(() => {});
+    const extraAug = await augment({ accountId, params, payload: derived.payload }).catch(() => ({}));
+    res.status(200).json({
+      ...derived.payload, reportKey, reportVersion, paramsHash: publishedHash,
+      ...(extraAug && typeof extraAug === "object" ? extraAug : {}),
+      snapshot: { savedAt: derived.sourceRefreshedAt || new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true },
+    });
+  } finally {
+    await releaseRefreshLock({ reportKey, accountId, paramsHash: lockHash }).catch(() => {});
+  }
+}
+
 async function saveBrandCatalogSnapshot(accountId, payload) {
   const paramsHash = paramsHashFor(BRAND_CATALOG_REPORT_VERSION, { accountId });
   const saved = await saveReportSnapshot({
@@ -1508,6 +1620,16 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
       return {
         reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v2", accountId,
         params: { from, to, brand: String(req.query.brand || "ALL") }, label: "Daily Reporting",
+      };
+    case "sku-movement":
+      if (!accountId) return null;
+      // DURABLE, zero-export SKU Movement. The request identity carries the selected brand scope; the honest
+      // effectiveAsOf is server-resolved from the account's proven OLI coverage inside the durable self-heal,
+      // so the snapshot the self-heal publishes is keyed by { asOf: <effectiveAsOf>, brand } and the read
+      // stale-serves the latest snapshot for the same brand scope. `to` is only a request-time hint.
+      return {
+        reportKey: "sku-movement", reportVersion: "sku-movement/v1", accountId,
+        params: { asOf: to || "", brand: String(req.query.brand || "ALL") }, label: "SKU Movement",
       };
     case "reconciliation":
       if (!accountId || !from || !to) return null;
@@ -2738,6 +2860,14 @@ async function handleDataDoe(req, res) {
             }, dailyDurableReaders);
           };
         }
+      }
+      // SKU Movement is DURABLE + zero-export: it never touches the DataDoe/refresh build path. Intercept it here
+      // (before any refresh handling) with its own self-healing serve, which re-derives from the account's LATEST
+      // saved OLI + Catalog the moment the durable evidence advances -- so a scheduler OR manual OLI sync propagates
+      // on the very next page load, with NO export ever created (even when a refresh is forced).
+      if (action === "sku-movement") {
+        await serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections });
+        return;
       }
       if (!wantsRefresh(req)) {
         // Brand Directory READ: a generic ZERO-EXPORT self-heal. The stored map is served immediately when its
