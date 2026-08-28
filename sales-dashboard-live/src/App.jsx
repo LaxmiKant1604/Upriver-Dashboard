@@ -1161,6 +1161,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const [rows, setRows] = useState([]);
   const [rowsLoading, setRowsLoading] = useState(false);
   const [rowsError, setRowsError] = useState(null);
+  const [salesCompleteness, setSalesCompleteness] = useState(null); // two-layer provisional/final D-1 for the Sales Dashboard (brand-sales)
   // "Nothing saved for this scope yet" is a first-run state, not a failure, so
   // it is tracked separately from a real upstream error and rendered as an
   // empty state with a Refresh action instead of a red banner.
@@ -1589,6 +1590,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setLastFetchedAt(new Date(cached.cachedAt));
       setRowsError(null);
       setRowsCacheMissing(false);
+      setSalesCompleteness(cached.body.completeness || null);
     } else {
       setRows([]);
       setCatalogBrands([]);
@@ -1606,6 +1608,7 @@ function DashboardApp({ session, access, onSignOut }) {
       setLastFetchedAt(new Date(cachedAt));
       setRowsError(null);
       setRowsCacheMissing(Boolean(body.snapshotMissing));
+      setSalesCompleteness(body.completeness || null);
     } catch (error) {
       if (!isCurrentReq("dashboard", myId)) return;
       if (!cached) setRowsError(error.message);
@@ -1648,6 +1651,7 @@ function DashboardApp({ session, access, onSignOut }) {
         setCatalogBrandsAccountId(selectedAccountId);
         setLastFetchedAt(new Date(cachedAt));
         setRowsCacheMissing(false);
+        setSalesCompleteness(body.completeness || null);
       })
       .catch((err) => setRowsError(err.message))
       .finally(() => setRowsLoading(false));
@@ -2955,6 +2959,29 @@ function DashboardApp({ session, access, onSignOut }) {
             </div>
           </div>
         </div>
+
+        {/* Two-layer PROVISIONAL/FINAL D-1 on the Sales Dashboard: covered-through vs latest-itemized are distinct.
+            The real itemized sales are shown; pending is counted separately; a 0%-itemized D-1 shows no fabricated
+            zero row -- the sales simply end at the latest itemized date while the badge says the D-1 is provisional. */}
+        {salesCompleteness && (
+          <div className="page-sub" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700,
+              background: salesCompleteness.provisional ? "rgba(210,140,0,0.14)" : (salesCompleteness.sourceDefect ? "rgba(200,50,50,0.14)" : "rgba(30,150,80,0.14)"),
+              color: salesCompleteness.provisional ? "#a86a00" : (salesCompleteness.sourceDefect ? "#b32424" : "#1a7f45") }}>
+              {salesCompleteness.provisional ? "Provisional D-1" : (salesCompleteness.sourceDefect ? "Source issue" : "Final D-1")}
+            </span>
+            <span>Covered through {fmtDateHuman(salesCompleteness.latestDate)}
+              {salesCompleteness.provisional ? ` · ${salesCompleteness.itemizationPercent}% itemized · ${salesCompleteness.pendingOrderCount} orders pending` : ""}
+              {salesCompleteness.finalizedThrough ? ` · finalized through ${fmtDateHuman(salesCompleteness.finalizedThrough)}` : ""}</span>
+          </div>
+        )}
+        {salesCompleteness && salesCompleteness.provisional && (
+          <DataQualityAlert tone="info" title={`Provisional D-1 (${fmtDateHuman(salesCompleteness.latestDate)}) — ${salesCompleteness.itemizationPercent}% of orders itemized`}
+            detail={`${salesCompleteness.notice} (${salesCompleteness.pendingOrderCount} order(s), ${salesCompleteness.pendingUnitCount} unit(s) pending item-level prices; sales shown are through the latest itemized date.)`} />
+        )}
+        {salesCompleteness && salesCompleteness.sourceDefect && (
+          <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={salesCompleteness.notice} />
+        )}
 
         {/* Global date filter. Presets, the custom range and its clamping are
             the app's existing logic; only the control's presentation changed. */}

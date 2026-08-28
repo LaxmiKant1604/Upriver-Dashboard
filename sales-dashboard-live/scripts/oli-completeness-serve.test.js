@@ -104,4 +104,24 @@ const row = (o) => ({ account_id: "A1", sale_date: "2026-08-26", completeness_st
   assert.equal(called, false);
 });
 
+/* 11 */ test("a 0%-itemized D-1 (covered but no itemized sales yet) is provisional with the latest FINAL date earlier -- honest, no fabricated zero", () => {
+  const c = summarizeCompleteness([
+    row({ sale_date: "2026-08-25", completeness_status: "final", itemized_order_count: 40, pending_order_count: 0, itemization_percent: 100 }),
+    row({ sale_date: "2026-08-26", completeness_status: "provisional", itemized_order_count: 13, pending_order_count: 20, itemization_percent: 39 }),
+    row({ sale_date: "2026-08-27", completeness_status: "provisional", itemized_order_count: 0, pending_order_count: 59, pending_unit_count: 60, itemization_percent: 0 }),
+  ]);
+  assert.equal(c.status, "provisional");
+  assert.equal(c.latestDate, "2026-08-27", "covered THROUGH D-1 even at 0% itemized");
+  assert.equal(c.itemizationPercent, 0, "D-1 is 0% itemized (no itemized sales yet)");
+  assert.equal(c.pendingOrderCount, 59);
+  assert.equal(c.finalizedThrough, "2026-08-25", "the latest FULLY-itemized day is earlier -- shown honestly, never as a D-1 zero");
+});
+
+/* 12 */ test("an inactive account (only a final/zero D-1 row) is Final D-1, never a false provisional", () => {
+  const c = summarizeCompleteness([row({ sale_date: "2026-08-27", completeness_status: "final", itemized_order_count: 0, pending_order_count: 0, itemization_percent: 100 })]);
+  assert.equal(c.status, "final");
+  assert.equal(c.provisional, false);
+  assert.equal(c.pendingOrderCount, 0);
+});
+
 out("\n" + passed + " assertions passed");

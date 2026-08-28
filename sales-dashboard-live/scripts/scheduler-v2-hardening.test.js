@@ -105,4 +105,21 @@ test("release finalize targets the BASE cycle (Catalog owner), not the OLI-only 
   assert.match(supa, /supersedes_cycle_id:\s*"is\.null"/, "the base resolver filters supersedes_cycle_id IS NULL");
 });
 
+/* Sales Dashboard (brand-sales) + Daily + Brand View all carry the completeness augment, and the frontend reads it */
+test("Sales Dashboard, Daily, and Brand endpoints are all wired to the completeness augment; the frontend reads it", () => {
+  const api = readFileSync(resolve(ROOT, "api", "datadoe.js"), "utf8");
+  assert.match(api, /action === "brand-sales"[\s\S]*?augmentResponse\s*=\s*oliCompletenessAugmentSingle\(\)/, "brand-sales (Sales Dashboard) is wired");
+  assert.match(api, /oliCompletenessAugmentSingle|oliCompletenessAugmentPortfolio/, "single + portfolio augment helpers exist");
+  const app = readFileSync(resolve(ROOT, "src", "App.jsx"), "utf8");
+  assert.match(app, /setSalesCompleteness\(body\.completeness/, "the Sales Dashboard reads body.completeness");
+  assert.match(app, /setDailyCompleteness\(body\.completeness/, "Daily Reporting reads body.completeness");
+});
+
+/* a covered account with ZERO OLI rows in the window is labelled explicit FINAL D-1 (never left unlabelled) */
+test("a fully-inactive covered account (zero rows) is labelled explicit FINAL D-1, never unlabelled/false-provisional", () => {
+  const src = readFileSync(resolve(ROOT, "lib", "server", "sync", "source-bucket-sync.js"), "utf8");
+  assert.match(src, /FINAL_ZERO\s*=\s*\{\s*completenessStatus:\s*"final"/, "a final/zero completeness template exists");
+  assert.match(src, /A FULLY-inactive account[\s\S]*?await writeOne\(unit\.slice\.to, FINAL_ZERO\)/, "a covered 0-row account is written FINAL D-1");
+});
+
 out("\n" + passed + " assertions passed");

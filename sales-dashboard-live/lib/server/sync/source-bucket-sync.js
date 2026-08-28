@@ -599,7 +599,7 @@ export async function runBucketSourceSync({
           // regresses, a stale export never clobbers newer. Non-fatal: the sales already persisted; the next run
           // re-records idempotently.
           const comp = completenessByAccount && completenessByAccount.get(a.accountId);
-          if (recordCompleteness && comp && comp.byDate) {
+          if (recordCompleteness) {
             const writeOne = async (saleDate, dc) => {
               try {
                 const res = await recordCompleteness({
@@ -617,12 +617,16 @@ export async function runBucketSourceSync({
                 (rollup.completenessErrors = rollup.completenessErrors || []).push({ accountId: a.accountId, saleDate, error: String(e && e.message ? e.message : e) });
               }
             };
-            for (const [saleDate, dc] of comp.byDate) await writeOne(saleDate, dc);
-            // A covered account with NO orders on the requested D-1 (an INACTIVE day) has no per-date entry -- record
-            // an explicit FINAL (zero orders, 100%) completeness for D-1 so EVERY covered account is labelled (never
-            // left unlabelled), and never a false provisional.
-            if (!comp.byDate.has(unit.slice.to)) {
-              await writeOne(unit.slice.to, { completenessStatus: "final", itemizedOrderCount: 0, pendingOrderCount: 0, itemizedUnitCount: 0, pendingUnitCount: 0, itemizationPercent: 100 });
+            const FINAL_ZERO = { completenessStatus: "final", itemizedOrderCount: 0, pendingOrderCount: 0, itemizedUnitCount: 0, pendingUnitCount: 0, itemizationPercent: 100 };
+            if (comp && comp.byDate && comp.byDate.size) {
+              for (const [saleDate, dc] of comp.byDate) await writeOne(saleDate, dc);
+              // A covered account with rows but NONE on the requested D-1 (an inactive D-1) -> explicit FINAL (0 orders).
+              if (!comp.byDate.has(unit.slice.to)) await writeOne(unit.slice.to, FINAL_ZERO);
+            } else {
+              // A FULLY-inactive account (zero OLI rows in the whole window) still has its D-1 window covered (empty
+              // slice = valid zero-sales evidence). Label its D-1 explicit FINAL (0 orders, 100%) so EVERY covered
+              // account is labelled -- never left unlabelled, never a false provisional, never a fabricated sale.
+              await writeOne(unit.slice.to, FINAL_ZERO);
             }
           }
         }
