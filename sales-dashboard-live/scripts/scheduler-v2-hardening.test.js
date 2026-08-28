@@ -19,6 +19,15 @@ let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 const test = (name, fn) => { try { fn(); passed += 1; out("  ok  " + name); } catch (e) { out("FAIL  " + name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; } };
 
+/* External coordinator identity: the watchdog can identify the exact bucket/date workflow run without reading
+   production data, while ordinary manual dispatches retain the safe "manual" default. */
+test("external dispatches have a unique run title and a non-forgeable-by-schedule dispatch_id input", () => {
+  assert.match(yml, /^run-name:\s*scheduler-v2 \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.dispatch_id \|\| github\.event\.schedule \}\}/m);
+  assert.match(yml, /^\s{6}dispatch_id:\s*$/m, "workflow_dispatch exposes dispatch_id");
+  assert.match(yml, /^\s{8}default:\s*"manual"\s*$/m, "ordinary manual runs use a harmless manual identity");
+  assert.match(yml, /dispatch identity:.*inputs\.dispatch_id/, "the immutable summary prints the dispatch identity");
+});
+
 /* 12/13. correct cron -> correct bucket; unknown cron fails BEFORE any production I/O */
 test("12/13. each cron maps deterministically to its bucket; unknown cron fails closed before I/O", () => {
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
@@ -62,8 +71,8 @@ test("scheduled events are ALWAYS normal mode (force-latest is dispatch-only; no
 });
 
 /* 14. every run prints IMMUTABLE metadata (event, cron, bucket, SHA, run id, asOf, mode, opkey, contract, ceiling) */
-test("14. the summary prints immutable run metadata (event/cron/bucket/SHA/asOf/mode/opkey/contract/ceiling)", () => {
-  for (const token of ["github.event_name", "github.event.schedule", "resolved bucket", "github.sha", "github.run_id", "requestedAsOf", "refresh_mode", "operation key", "source contract", "token ceiling", "run_kind="]) {
+test("14. the summary prints immutable run metadata (event/cron/dispatch/bucket/SHA/asOf/mode/opkey/contract/ceiling)", () => {
+  for (const token of ["github.event_name", "github.event.schedule", "dispatch identity", "inputs.dispatch_id", "resolved bucket", "github.sha", "github.run_id", "requestedAsOf", "refresh_mode", "operation key", "source contract", "token ceiling", "run_kind="]) {
     assert.ok(yml.includes(token), "summary/metadata missing: " + token);
   }
 });

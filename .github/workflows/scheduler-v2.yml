@@ -1,4 +1,5 @@
 name: scheduler-v2
+run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id || github.event.schedule }}
 
 # TRUSTED refresh + publish workflow for Daily Reporting + Brand View (Scheduler v2) -- the ONLY automatic scheduler
 # (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap).
@@ -48,6 +49,10 @@ on:
         options:
           - normal
           - force-latest
+      dispatch_id:
+        description: "External scheduler identity used by the watchdog (external/<bucket>/<D-1>); ordinary manual runs may keep 'manual'."
+        required: false
+        default: "manual"
 
 concurrency:
   group: scheduler-v2
@@ -127,11 +132,11 @@ jobs:
           echo "run_kind=$run_kind" >> "$GITHUB_OUTPUT"
           echo "opkey=$opkey" >> "$GITHUB_OUTPUT"
           # IMMUTABLE run metadata in EVERY summary -- so any future run's version + bucket are provable from the
-          # summary alone (no gh CLI needed): event, cron, resolved bucket, run kind, head/workflow SHA, run id,
-          # requestedAsOf, refresh mode, operation key, source contract, token ceiling.
+          # summary alone (no gh CLI needed): event, cron, dispatch identity, resolved bucket, run kind,
+          # head/workflow SHA, run id, requestedAsOf, refresh mode, operation key, source contract, token ceiling.
           {
             echo "### scheduler-v2 run";
-            echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · run kind: $run_kind";
+            echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\` · run kind: $run_kind";
             echo "- resolved bucket: **$bucket** (publishes ONLY this bucket; the other bucket is untouched)";
             echo "- head/workflow SHA: \`${{ github.sha }}\` · ref: \`${{ github.ref }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
             echo "- requestedAsOf (D-1): $asof · refresh_mode: $mode · operation key: \`$opkey\`";

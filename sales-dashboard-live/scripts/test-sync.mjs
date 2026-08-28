@@ -85,6 +85,8 @@ test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exa
   const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "primary + fallback crons per bucket");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
+  assert.match(workflow, /^run-name:\s*scheduler-v2 .*inputs\.dispatch_id/m, "external coordinator runs are identifiable by dispatch_id");
+  assert.match(workflow, /^\s{6}dispatch_id:\s*$/m, "workflow_dispatch accepts the coordinator dispatch_id");
 });
 
 /* 3. Registry coverage of every existing report key + ads sources. */
