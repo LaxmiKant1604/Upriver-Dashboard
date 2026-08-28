@@ -12793,3 +12793,19 @@ TWO GAPS FOUND + FIXED (code 16ffbf7):
 IMPORTANT SEMANTICS: covered-through (D-1) != latest-itemized-sales-date. On a 0%-itemized D+1 morning the daily rows
 end at D-2 while the badge honestly says Provisional D-1 (D-1), 0% itemized. Never null->0. verify 81/61 green.
 US 2026-08-27 preflight + evening automatic run pending. See [[scheduler-v2-provisional-final]].
+
+## Scheduler v2 -- US 2026-08-27 published + FULL 2026-08-27 acceptance (2026-08-28, code 16ffbf7)
+
+At 04:10 UTC the US primary cron (10:30 UTC) was 6h away, but the Non-US automatic 2026-08-27 run had NOT landed
+(evidence the GitHub scheduler is not delivering -- likely secrets/enablement, unverifiable without gh). Ran US via
+the trusted path (op scheduled-fresh/us/2026-08-27 -- SHARED with the automatic run, so the 10:30 UTC run is a
+zero-cost ALREADY_PUBLISHED_D1 no-op): OLI 2 creates/4 tok -> 8/8 at D-1, D1_PROVISIONAL (0% itemized, 59 pending);
+ASIN Ads 2 creates/4 tok; readiness D1_PROVISIONAL exact; release 24 published (effectivePublishAsOf=2026-08-27);
+membership rebuilt; safe-closed; idempotence replay -> ALREADY_PUBLISHED_D1 creates=0.
+
+FINAL 2026-08-27 ACCEPTANCE (DB-verified): non-us OLI-D1-coverage 22/22, completeness 5 final + 17 provisional,
+66 snapshots @to=2026-08-27; us OLI-D1-coverage 8/8, completeness 8 provisional, 24 snapshots @to=2026-08-27.
+Serve augment returns Provisional D-1 (2026-08-27, 0% itemized, pending shown) even for a to=TODAY request; sales
+rows honestly end at the latest ITEMIZED date (no fabricated zero). Total tokens 2026-08-27: non-us ~20 (10 OLI + 8
+Ads + 2 release), us ~10 (4 OLI + 4 Ads + 2 release). OPEN ITEM: the GitHub automatic scheduler did not fire the
+Non-US 2026-08-27 run -- needs gh-side verification (secrets/enablement/run logs) that I cannot do here.
