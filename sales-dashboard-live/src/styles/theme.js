@@ -792,6 +792,85 @@ body{ overflow-x:hidden; }
 .daily-table tr.dt-row-highlight td.dt-mtd{ background:#F7E9D2; }
 .daily-table tr.dt-row-highlight td.dt-metric{ background:var(--accent-soft); }
 
+/* ===================== DAILY REPORTING (redesigned content area) =====================
+   Scoped entirely under .dr-* so no other view is affected. Built on the design tokens;
+   the KPI gradients and the deep-violet table header are the design's own accents. */
+.dr-page{ padding-bottom:var(--space-5); }
+
+/* Provisional D-1 -- the full-width violet information band */
+.dr-band{ display:flex; align-items:flex-start; gap:12px; margin-top:var(--space-4); padding:14px 16px; border-radius:var(--radius-md); background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.22); }
+.dr-band-icon{ color:#6366F1; flex-shrink:0; margin-top:1px; display:inline-flex; }
+.dr-band-title{ font-family:'Outfit',sans-serif; font-size:13.5px; font-weight:700; color:#4338CA; letter-spacing:0; }
+.dr-band-text{ font-size:12px; color:#4F46E5; opacity:.82; line-height:1.55; margin-top:2px; }
+
+/* Six MTD KPI cards */
+.dr-kpis{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
+.dr-kpi{ border-radius:var(--radius-sm); padding:13px 15px; color:#fff; box-shadow:var(--shadow-sm); min-width:0; }
+.dr-kpi-label{ font-size:9.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:rgba(255,255,255,.82); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-kpi-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:20px; font-weight:800; line-height:1.15; margin-top:6px; letter-spacing:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* Main reporting table card */
+.dr-card{ margin-top:var(--space-5); background:var(--bg-surface); border:1px solid var(--border-default); border-radius:var(--radius-md); box-shadow:var(--shadow-sm); overflow:hidden; }
+.dr-card-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:15px 18px 13px; border-bottom:1px solid var(--border-default); background:linear-gradient(135deg,rgba(139,92,246,.05),rgba(99,102,241,.03)); }
+.dr-card-head-main{ min-width:0; }
+.dr-card-title{ font-family:'Outfit',sans-serif; font-size:14px; font-weight:800; color:var(--text-primary); letter-spacing:0; }
+.dr-card-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:11px; color:var(--text-muted); }
+.dr-badge{ padding:2px 9px; border-radius:var(--radius-pill); font-size:10.5px; font-weight:700; letter-spacing:.2px; }
+.dr-badge-provisional{ background:var(--warning-soft); color:var(--warning); }
+.dr-badge-final{ background:var(--positive-soft); color:var(--positive); }
+.dr-badge-defect{ background:var(--negative-soft); color:var(--negative); }
+.dr-refresh{ flex-shrink:0; width:32px; height:32px; border-radius:var(--radius-sm); border:1px solid var(--border-default); background:var(--bg-elevated); color:var(--text-muted); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+.dr-refresh:hover{ color:var(--accent); border-color:var(--border-hover); }
+.dr-refresh:disabled{ opacity:.6; cursor:default; }
+.dr-card-body{ padding:10px 14px 14px; }
+
+/* Table -- deep-violet header, coral MTD emphasis, sticky metric column */
+.dr-scroll{ overflow-x:auto; overflow-y:hidden; }
+.dr-scroll::-webkit-scrollbar{ height:10px; }
+.dr-scroll::-webkit-scrollbar-thumb{ background:var(--border-strong); border-radius:var(--radius-pill); border:3px solid var(--bg-surface); }
+.dr-table{ width:100%; min-width:920px; border-collapse:collapse; font-size:12px; }
+.dr-table .dr-th{ padding:11px 14px; text-align:right; white-space:nowrap; font-family:'Outfit',sans-serif; font-size:10px; font-weight:800; letter-spacing:.07em; text-transform:uppercase; color:rgba(196,181,253,.6); background:linear-gradient(90deg,#1E1245,#2d1b69); position:sticky; top:0; z-index:2; }
+.dr-table .dr-th-metric{ text-align:left; color:#C4B5FD; position:sticky; left:0; z-index:3; background:#1E1245; }
+.dr-table .dr-th-mtd{ color:#FF9482; box-shadow:inset 0 -2px 0 #FF6B6B; }
+.dr-table tbody tr{ background:var(--bg-surface); transition:background var(--t-fast) var(--ease); }
+.dr-table tbody tr:nth-child(even){ background:var(--bg-subtle); }
+.dr-table tbody tr:hover{ background:#ECE7FF; }
+.dr-table tbody tr.dr-row-highlight{ background:var(--accent-soft); }
+.dr-table .dr-td{ padding:11px 14px; text-align:right; white-space:nowrap; background:transparent; font-variant-numeric:tabular-nums; border-bottom:1px solid var(--border-default); color:var(--text-secondary); }
+.dr-table .dr-td-metric{ text-align:left; position:sticky; left:0; z-index:1; background:inherit; border-right:1px solid var(--border-default); color:var(--text-primary); }
+.dr-table .dr-td-mtd{ background:var(--brand-soft); font-weight:800; border-left:1px solid rgba(255,107,107,.22); border-right:1px solid rgba(255,107,107,.22); }
+.dr-table tbody tr:hover .dr-td-mtd{ background:#FFE1DC; }
+.dr-table tbody tr.dr-row-highlight .dr-td-mtd{ background:#F7E9D2; }
+.dr-table tbody tr.dr-row-highlight .dr-td{ font-weight:750; }
+.dr-ic{ display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:7px; margin-right:9px; vertical-align:middle; }
+.dr-metric-label{ font-weight:700; color:var(--text-primary); vertical-align:middle; }
+.dr-dash{ color:var(--text-muted); opacity:.55; }
+
+/* Four 5-day trend cards */
+.dr-trends{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
+.dr-trend{ background:var(--bg-surface); border:1px solid var(--border-default); border-radius:var(--radius-sm); padding:14px 16px; box-shadow:var(--shadow-xs); min-width:0; }
+.dr-trend-label{ font-size:10px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-trend-row{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; margin-top:10px; }
+.dr-trend-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:17px; font-weight:800; letter-spacing:0; white-space:nowrap; }
+.dr-trend-spark{ width:110px; max-width:56%; flex-shrink:0; }
+
+/* Formula / source note panel */
+.dr-note{ margin-top:var(--space-4); padding:14px 16px; border-radius:var(--radius-md); background:var(--accent-soft); border:1px solid var(--accent-border); font-size:11px; color:var(--text-secondary); line-height:1.65; }
+.dr-note strong{ color:var(--text-secondary); }
+.dr-note code{ font-family:'Outfit',sans-serif; font-size:10.5px; background:rgba(255,255,255,.6); padding:1px 5px; border-radius:5px; color:var(--accent-strong); }
+
+/* Responsive: KPI + trend grids reflow; the table always scrolls horizontally */
+@media (max-width:1180px){
+  .dr-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .dr-trends{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (max-width:640px){
+  .dr-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .dr-trends{ grid-template-columns:1fr; }
+  .dr-trend-spark{ width:88px; }
+  .dr-kpi-value{ font-size:18px; }
+}
+
 /* Report-specific table widths (unchanged behaviour, new palette) */
 .keyword-rank-table{ min-width:1280px; }
 .keyword-rank-table .keyword-query{ text-align:left; white-space:normal; min-width:190px; max-width:280px; line-height:1.4; }

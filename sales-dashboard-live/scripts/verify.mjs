@@ -80,6 +80,7 @@ const SUITES = [
   "test:source-download-recovery",
   "test:source-create-reconcile",
   "test:daily-roi-format",
+  "test:daily-view-model",
   "test:brand-sales-backfill",
   "test:brand-membership-scope",
   "test:brand-view-freshness",

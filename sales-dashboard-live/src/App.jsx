@@ -25,6 +25,7 @@ import { csvCell } from "./lib/csv.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
+import DailyReporting from "./views/DailyReporting.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
@@ -3299,112 +3300,20 @@ function DashboardApp({ session, access, onSignOut }) {
       ))}
 
       {view === "daily" && (
-      <div className="container">
-        <div className="controls-bar">
-          <div>
-            <div className="page-title">Daily Reporting</div>
-            <div className="page-sub">Sales & advertising snapshot for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
-          </div>
-        </div>
-
-        {dailyError && (dailyMissing
-          // The server's honest "no snapshot yet" state (typed waiting/unavailable) is NOT a failed refresh:
-          // the report self-heals from saved evidence on read, so this is informational, never an error.
-          ? <DataQualityAlert tone="info" title="This report is not available yet" detail={dailyError} />
-          : <DataQualityAlert tone="error" title="The last refresh failed" detail={dailyError} />)}
-
-        {/* Two-layer PROVISIONAL/FINAL D-1: the real itemized D-1 data is shown, honestly labelled while some order
-            shells are not yet itemized. Sales/ratio metrics may increase automatically -- never a fabricated value. */}
-        {dailyCompleteness && dailyCompleteness.provisional && (
-          <DataQualityAlert tone="info"
-            title={`Provisional D-1 — ${dailyCompleteness.itemizationPercent}% of orders itemized`}
-            detail={`${dailyCompleteness.notice} (${dailyCompleteness.pendingOrderCount} order(s)${dailyCompleteness.pendingUnitCount ? `, ${dailyCompleteness.pendingUnitCount} unit(s)` : ""} pending item-level prices${dailyCompleteness.finalizedThrough ? `; last fully finalized day: ${fmtDateHuman(dailyCompleteness.finalizedThrough)}` : ""}.)`} />
-        )}
-        {dailyCompleteness && dailyCompleteness.sourceDefect && (
-          <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={dailyCompleteness.notice} />
-        )}
-
-        <div className="panel panel-flush">
-          <div className="panel-head" style={{ padding: "15px 18px 12px", marginBottom: 0, borderBottom: "1px solid var(--border-default)" }}>
-            <div>
-              <div className="panel-title">{refreshScopeAccount?.name || "Account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}</div>
-              <div className="page-sub">
-                {dailyRows.length
-                  ? `Latest completed sales: ${fmtDateHuman(dailyReport.latest)} · shown in ${dailyCurrency}`
-                  : `Reported in ${dailyCurrency}`}
-              </div>
-              {dailyCompleteness && (
-                <div className="page-sub" style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700, letterSpacing: 0.2,
-                    background: dailyCompleteness.provisional ? "rgba(210,140,0,0.14)" : (dailyCompleteness.sourceDefect ? "rgba(200,50,50,0.14)" : "rgba(30,150,80,0.14)"),
-                    color: dailyCompleteness.provisional ? "#a86a00" : (dailyCompleteness.sourceDefect ? "#b32424" : "#1a7f45") }}>
-                    {dailyCompleteness.provisional ? "Provisional D-1" : (dailyCompleteness.sourceDefect ? "Source issue" : "Final D-1")}
-                  </span>
-                  {dailyCompleteness.provisional && (
-                    <span>{dailyCompleteness.itemizationPercent}% itemized · {dailyCompleteness.pendingOrderCount} orders pending{dailyCompleteness.pendingUnitCount ? ` (${dailyCompleteness.pendingUnitCount} units)` : ""}</span>
-                  )}
-                  {dailyCompleteness.finalizedThrough && <span>· finalized through {fmtDateHuman(dailyCompleteness.finalizedThrough)}</span>}
-                </div>
-              )}
-            </div>
-            <button className="refresh-btn" onClick={loadCachedDaily} disabled={dailyLoading} title="Reload the latest saved data (no DataDoe export)" aria-label="Reload Daily Reporting">
-              <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
-            </button>
-          </div>
-
-          {/* No saved rows means no measured values. Rendering the matrix here
-              would print a full grid of zeroes that look like real reported
-              sales, so an explicit state is shown instead. */}
-          {dailyLoading && !dailyRows.length ? (
-            <SkeletonTable rows={8} />
-          ) : !dailyRows.length ? (
-            <EmptyState
-              icon={<DatabaseZap size={19} aria-hidden="true" />}
-              title={selectedAccountId ? "No data for this selection yet" : "No account selected"}
-              actions={selectedAccountId ? (
-                <button className="plan-export-btn" type="button" onClick={loadCachedDaily} disabled={dailyLoading}>
-                  <RefreshCw size={14} className={dailyLoading ? "spin" : ""} aria-hidden="true" />
-                  Reload latest data
-                </button>
-              ) : null}
-            >
-              {selectedAccountId
-                ? "This report is derived automatically from saved data the first time it is opened — selecting a brand never waits for a schedule and never calls DataDoe. If this stays empty, the account has no rows for this selection or a required saved source is still missing."
-                : "Choose an Amazon account in the command bar above."}
-            </EmptyState>
-          ) : (
-            <div className="daily-scroll">
-              <table className="daily-table">
-                <thead>
-                  <tr>
-                    <th className="dt-metric">{refreshScopeAccount?.name?.split(" ")[0] || "Metric"}</th>
-                    {dailyReport.columns.map((c) => (
-                      <th key={c.key} className={"dt-col dt-" + c.group}>{c.label}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {DAILY_METRICS.map((metric) => (
-                    <tr key={metric.key} className={metric.highlight ? "dt-row-highlight" : ""}>
-                      <td className="dt-metric">{metric.label}</td>
-                      {dailyReport.cells.map((cell, i) => (
-                        <td key={dailyReport.columns[i].key} className={"mono dt-" + dailyReport.columns[i].group}>
-                          {metric.fmt(cell, dailyCurrency)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        <div className="footer-note">
-          ROI = Total Sales ÷ Ad Spend · ACoS % = Ad Spend ÷ Ad Sales · TACoS % = Ad Spend ÷ Total Sales.
-          Sales and ordered units are sourced from DataDoe Order Line Items (item_price_value / quantity). {selectedBrand === "ALL" ? "Ad Sales, Ad Spend, and Clicks are sourced from the saved ASIN advertising data (same-SKU attributed sales)." : "Advertising metrics for this brand are the saved ASIN advertising rows whose ASIN maps to the brand through the Product Catalog (same-SKU attributed sales); ads on ASINs without a catalog brand mapping are not attributed. An em dash means advertising coverage is unavailable for that period, never a measured zero."} The report ends on the latest completed sales date so a delayed source row is not shown as a real zero-sales day.
-        </div>
-      </div>
+        <DailyReporting
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={dailyCurrency}
+          report={dailyReport}
+          rows={dailyRows}
+          completeness={dailyCompleteness}
+          loading={dailyLoading}
+          error={dailyError}
+          missing={dailyMissing}
+          accountId={selectedAccountId}
+          onReload={loadCachedDaily}
+          metrics={DAILY_METRICS}
+        />
       )}
 
       {view === "reconciliation" && (
