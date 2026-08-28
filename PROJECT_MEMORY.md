@@ -12877,7 +12877,17 @@ UI (SkuMovement.jsx): search, sort, movement-state filter, pagination (50/pg), s
 (current scope), scope-respecting CSV with dynamic month/date headers, provisional/final badge, states (loading/
 missing/valid-empty-branded), read-only "Reload latest data" (never DataDoe).
 
-STATUS: code committed ce2b6e8 on main; docs this entry. npm run verify GREEN (83 steps / 63 suites incl. build).
-PENDING (this session, needs prod reachable): push -> Vercel 200 -> run backfill-sku-movement.mjs APPLY (30 accounts,
-All Brands, creates=0/tokens=0) -> authenticated prod read-backs for US/India/Germany/France/Italy/Spain/UK (All
-Brands + >=2 named brands each). Named-brand snapshots self-heal on first read (backfill does All Brands per account).
+STATUS: DONE + LIVE. code ce2b6e8 + coverage-shape fix f4bf583 (see below) + docs pushed to origin/main. npm run
+verify GREEN (83 steps / 63 suites incl. build). Backfill APPLIED to prod: 30/30 published asOf=2026-08-27,
+creates=0/tokens=0; a replay is 30 existing / 0 writes (idempotent). Authenticated prod read-backs GREEN (38/38) for
+US(OwlKraft)/India(ThePerfectCompany)/Germany(Alpha Traders)/France(Premium-Avenue)/Italy(Premium-Avenue)/Spain(
+Premium-Avenue)/UK(MeridianmarKet): each All-Brands snapshot served (asOf=2026-08-27, brandFiltered=false, no
+fabricated cells) + named-brand derives (owlKraft; Brilliant Kids+Cleanfect; SHAFI; Bebi Born; Bebi Born+DREAM HAVEN;
+Bebi Born; Caruso Italy+Glimpse Homes) all brandFiltered + ISOLATED (every row == the brand, Unmapped excluded) +
+subset of All. Named-brand snapshots self-heal on first read (backfill did All Brands per account).
+
+CRITICAL FIX f4bf583 (caught by the DRY-RUN backfill against real prod): getSourceCoverageWindows returns windows as
+{ from, to } (NOT { covered_from, covered_to }); skuMovementProvenDates read the wrong keys -> effectiveAsOf null ->
+ALL 30 accounts failed "oli-coverage-incomplete". Fixed to accept { from, to } (+ raw column names). The integration
+fixtures had masked it by using the wrong window shape; they now use the production { from, to } shape (one raw-column
+window retained to prove both spellings). Lesson: mirror the ACTUAL reader output shape in fixtures.
