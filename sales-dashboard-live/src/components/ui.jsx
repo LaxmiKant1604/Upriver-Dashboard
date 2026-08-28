@@ -82,7 +82,7 @@ export function StatusBadge({ tone = "neutral", children, title }) {
  * Renders nothing at all when fewer than three real points exist, because a
  * one- or two-point "trend" is decoration, not information.
  */
-export function Sparkline({ values, color = "#2C5FD6", height = 26, ariaLabel }) {
+export function Sparkline({ values, color = "#8B5CF6", height = 26, ariaLabel }) {
   const points = (values || []).filter((v) => Number.isFinite(v));
   if (points.length < 3) return null;
   const min = Math.min(...points);
@@ -117,12 +117,15 @@ export function Sparkline({ values, color = "#2C5FD6", height = 26, ariaLabel })
  * omitted entirely when the underlying comparison or history does not exist,
  * rather than passed as zero.
  */
-export function MetricCard({ label, value, hint, period, trend, spark, tone }) {
+export function MetricCard({ label, value, hint, period, trend, spark, tone, variant, icon }) {
   return (
-    <div className="metric-card">
+    <div className={"metric-card" + (variant ? ` ${variant}` : "")}>
       <div className="metric-top">
         <div className="metric-label">{label}</div>
-        <MetricTooltip text={hint} />
+        <span className="metric-actions">
+          {icon ? <span className="metric-icon" aria-hidden="true">{icon}</span> : null}
+          <MetricTooltip text={hint} />
+        </span>
       </div>
       <div className={"metric-value" + (tone === "bad" ? " sku-neg" : tone === "good" ? " sku-pos" : "")}>{value}</div>
       <div className="metric-foot">
@@ -226,11 +229,14 @@ export function ChartTooltip({ active, payload, label, rows }) {
 
 /* --------------------------------------------------------- breakdown card */
 
-export function ContributionBar({ ratio, active, muted }) {
+export function ContributionBar({ ratio, active, muted, color }) {
   const width = Math.max(0, Math.min(100, (Number(ratio) || 0) * 100));
   return (
     <div className="bd-bar" role="presentation">
-      <div className={"bd-fill" + (active ? " active" : "") + (muted ? " muted" : "")} style={{ width: width + "%" }} />
+      <div
+        className={"bd-fill" + (active ? " active" : "") + (muted ? " muted" : "")}
+        style={{ width: width + "%", ...(color && !muted ? { background: color, boxShadow: `0 0 10px ${color}55` } : {}) }}
+      />
     </div>
   );
 }
@@ -242,7 +248,7 @@ export function ContributionBar({ ratio, active, muted }) {
  * already computes them. `formatValue` receives the raw value so the caller
  * controls currency; nothing here assumes a currency.
  */
-export function BreakdownCard({ title, subtitle, items, activeKeys, formatValue, mutedKeys, emptyMessage, footer }) {
+export function BreakdownCard({ title, subtitle, items, activeKeys, formatValue, mutedKeys, emptyMessage, footer, palette }) {
   const max = items.reduce((top, item) => Math.max(top, Math.abs(item.value)), 0);
   const active = activeKeys || new Set();
   const muted = mutedKeys || new Set(["Unassigned"]);
@@ -258,7 +264,7 @@ export function BreakdownCard({ title, subtitle, items, activeKeys, formatValue,
         <div className="empty-note">{emptyMessage || "No data for this period."}</div>
       ) : (
         <div className="bd-list">
-          {items.map((item) => {
+          {items.map((item, index) => {
             const isActive = active.has(item.key);
             const isMuted = muted.has(item.key);
             return (
@@ -272,7 +278,12 @@ export function BreakdownCard({ title, subtitle, items, activeKeys, formatValue,
                     {item.flag ? <span aria-hidden="true">{item.flag}</span> : null}
                     <span>{item.label}</span>
                   </div>
-                  <ContributionBar ratio={max ? Math.abs(item.value) / max : 0} active={isActive} muted={isMuted} />
+                  <ContributionBar
+                    ratio={max ? Math.abs(item.value) / max : 0}
+                    active={isActive}
+                    muted={isMuted}
+                    color={palette?.length ? palette[index % palette.length] : undefined}
+                  />
                 </div>
                 <div className="bd-figures">
                   <div className="bd-value">{formatValue(item.value)}</div>

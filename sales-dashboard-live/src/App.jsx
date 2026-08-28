@@ -3158,6 +3158,7 @@ function DashboardApp({ session, access, onSignOut }) {
           <div className="metric-grid">
             <MetricCard
               label="Total Sales"
+              variant="hero"
               value={fmtMoney(kpi.sales, displayCurrency)}
               hint={`Order value in ${displayCurrency}. Currencies are never converted or combined.`}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
@@ -3166,6 +3167,7 @@ function DashboardApp({ session, access, onSignOut }) {
             />
             <MetricCard
               label="Units Sold"
+              icon={<Boxes size={15} />}
               value={kpi.units.toLocaleString("en-US")}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
@@ -3173,6 +3175,7 @@ function DashboardApp({ session, access, onSignOut }) {
             />
             <MetricCard
               label="Orders"
+              icon={<ReceiptText size={15} />}
               value={hasOrders ? kpi.orders.toLocaleString("en-US") : "—"}
               hint={hasOrders ? undefined : "This sales source reports no order count, so Orders and Average Order Value are unavailable rather than shown as zero."}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
@@ -3181,6 +3184,7 @@ function DashboardApp({ session, access, onSignOut }) {
             />
             <MetricCard
               label="Avg. Order Value"
+              icon={<Wallet size={15} />}
               value={hasOrders ? fmtMoney(aov, displayCurrency, 2) : "—"}
               hint={hasOrders ? "Total sales divided by orders for the selected range." : "Requires an order count, which this sales source does not report."}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
@@ -3279,6 +3283,7 @@ function DashboardApp({ session, access, onSignOut }) {
               title="Sales by Brand"
               subtitle="Contribution to the selected range"
               items={byBrandBreakdown}
+              palette={["#FF6B6B", "#9B7BFF", "#28D7A1", "#FFB81C", "#38BDF8", "#F472B6"]}
               activeKeys={activeBrandKeys}
               formatValue={(value) => fmtMoneyCompact(value, displayCurrency)}
               emptyMessage="No brand sales in this range."
