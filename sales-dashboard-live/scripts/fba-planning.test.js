@@ -200,6 +200,29 @@ test("stockout/priority: no demand -> no stockout date + reason; sufficient stoc
   assert.equal(covered.planningPriority, "OK");
 });
 
+test("display: threeMonthAverage requires all three completed months; one missing -> null (never a coerced 0)", () => {
+  const full = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, monthlyValues: [30, 60, 90], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(full.threeMonthAverage, 60);
+  const missing = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, monthlyValues: [30, null, 90], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(missing.threeMonthAverage, null);
+});
+
+test("customer-order reserve is DISPLAY ONLY: it is surfaced but never in immediatelyAvailable/pipeline/network totals", () => {
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, customerOrderReserved: 40, reservedFcProcessing: 5, inboundWorking: 3, monthlyValues: [30, 30, 30], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(r.customerOrderReserved, 40);
+  assert.equal(r.immediatelyAvailable, 100, "sellable = available only");
+  assert.equal(r.amazonPipeline, 8, "pipeline = fc_processing + inbound_working; customer reserve excluded");
+  assert.equal(r.totalAmazonAwdStock, 108, "customer reserve never counted as usable stock");
+});
+
+test("AWD inbound is folded US-only when validated; Non-US and unvalidated stay null (never a fake 0)", () => {
+  const us = computePlanRow({ isUS: true, awdValidated: true, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, awdAvailable: 42, awdInbound: 15, monthlyValues: [30, 30, 30], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(us.awdInbound, 15);
+  const nonUs = computePlanRow({ isUS: false, awdValidated: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, awdAvailable: 42, awdInbound: 15, monthlyValues: [30, 30, 30], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(nonUs.awdInbound, null);
+  assert.equal(nonUs.awdAvailable, null);
+});
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

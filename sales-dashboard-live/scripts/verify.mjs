@@ -87,6 +87,7 @@ const SUITES = [
   "test:brand-view-freshness",
   "test:brand-view-render",
   "test:fba-planning",
+  "test:warehouse-import",
   "test:asin-ads-backfill-window",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",

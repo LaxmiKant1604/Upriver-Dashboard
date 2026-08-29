@@ -429,6 +429,55 @@ body{ overflow-x:hidden; }
 .pt-badge.plan-prio-medium{ background:var(--accent-soft); color:var(--accent-strong); }
 .pt-badge.plan-prio-low{ background:var(--bg-subtle); color:var(--text-secondary); }
 .pt-badge.plan-prio-ok{ background:var(--positive-soft); color:var(--positive); }
+/* FBA plan toolbar (import + columns) */
+.plan-tool-btn{ display:inline-flex; align-items:center; gap:7px; height:38px; padding:0 14px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); font:800 12px inherit; cursor:pointer; }
+.plan-tool-btn:hover:not(:disabled){ border-color:var(--accent); color:var(--accent-strong); background:var(--accent-soft); }
+.plan-tool-btn:disabled{ opacity:.5; cursor:not-allowed; }
+.plan-cols-wrap{ position:relative; }
+.plan-cols-pop{ position:absolute; z-index:40; top:calc(100% + 6px); right:0; width:300px; max-height:70vh; overflow:auto; border:1px solid var(--border-default); border-radius:var(--radius-md); background:var(--bg-surface); box-shadow:0 12px 40px rgba(0,0,0,.28); padding:10px; }
+.plan-cols-head{ display:flex; align-items:center; justify-content:space-between; gap:8px; font:800 13px inherit; color:var(--text-primary); padding:2px 2px 8px; border-bottom:1px solid var(--border-default); }
+.plan-cols-actions{ display:inline-flex; align-items:center; gap:6px; }
+.plan-cols-group{ padding:8px 2px 2px; }
+.plan-cols-group-title{ font:800 10px inherit; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); margin-bottom:4px; }
+.plan-cols-item{ display:flex; align-items:center; gap:8px; padding:4px 4px; font:600 12px inherit; color:var(--text-primary); cursor:pointer; border-radius:var(--radius-sm); }
+.plan-cols-item:hover{ background:var(--bg-subtle); }
+.plan-cols-item.locked{ color:var(--text-muted); cursor:default; }
+.plan-cols-lock{ color:var(--text-muted); font-weight:600; }
+.plan-horizon-btn{ display:inline-flex; align-items:center; gap:4px; min-width:36px; padding:2px 7px; border:1px solid transparent; border-radius:var(--radius-sm); background:var(--bg-subtle); color:var(--text-secondary); font:700 12px inherit; cursor:pointer; }
+.plan-horizon-btn:hover{ border-color:var(--accent); color:var(--accent-strong); background:var(--accent-soft); }
+.plan-horizon-btn.has-override{ color:var(--accent-strong); font-weight:800; }
+.plan-horizon-dot{ width:6px; height:6px; border-radius:50%; background:var(--accent); display:inline-block; }
+/* FBA plan modals (SKU horizon + warehouse import) */
+.plan-modal-backdrop{ position:fixed; inset:0; z-index:60; background:rgba(15,18,28,.55); display:flex; align-items:flex-start; justify-content:center; padding:6vh 16px; overflow:auto; }
+.plan-modal{ width:100%; max-width:560px; border:1px solid var(--border-default); border-radius:var(--radius-lg); background:var(--bg-surface); box-shadow:0 24px 70px rgba(0,0,0,.4); display:flex; flex-direction:column; }
+.plan-modal-sm{ max-width:420px; }
+.plan-modal-lg{ max-width:760px; }
+.plan-modal-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:16px 18px; border-bottom:1px solid var(--border-default); }
+.plan-modal-title{ font:800 15px inherit; color:var(--text-primary); }
+.plan-modal-sub{ font-size:12px; color:var(--text-muted); margin-top:3px; }
+.plan-modal-body{ padding:16px 18px; display:flex; flex-direction:column; gap:12px; }
+.plan-modal-note, .plan-modal-foot-note{ font-size:12px; color:var(--text-secondary); margin:0; }
+.plan-modal-foot{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-top:1px solid var(--border-default); }
+.plan-icon-btn{ display:inline-flex; align-items:center; justify-content:center; width:30px; height:30px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); cursor:pointer; }
+.plan-icon-btn:hover{ border-color:var(--accent); color:var(--accent-strong); }
+.plan-reset-link{ display:inline-flex; align-items:center; gap:6px; background:none; border:0; padding:2px 0; color:var(--accent-strong); font:700 12px inherit; cursor:pointer; }
+.plan-reset-link:disabled{ opacity:.4; cursor:default; }
+.plan-import-controls{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.plan-import-file{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border:1px dashed var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); font:700 12px inherit; cursor:pointer; }
+.plan-import-file:hover{ border-color:var(--accent); color:var(--accent-strong); }
+.plan-import-file input{ display:none; }
+.plan-import-paste summary{ font-size:12px; color:var(--text-muted); cursor:pointer; }
+.plan-import-paste textarea{ width:100%; margin-top:6px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-primary); font:500 12px ui-monospace,monospace; padding:8px; }
+.plan-import-summary{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.plan-import-pill{ display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:var(--radius-pill); font:800 11px inherit; background:var(--bg-subtle); color:var(--text-secondary); }
+.plan-import-pill.ok{ background:var(--positive-soft); color:var(--positive); }
+.plan-import-pill.bad{ background:var(--negative-soft); color:var(--negative); }
+.plan-import-table-wrap{ max-height:220px; overflow:auto; border:1px solid var(--border-default); border-radius:var(--radius-sm); }
+.plan-import-table{ width:100%; border-collapse:collapse; font-size:12px; }
+.plan-import-table th{ position:sticky; top:0; background:var(--bg-subtle); text-align:left; padding:6px 8px; font-weight:800; color:var(--text-secondary); }
+.plan-import-table td{ padding:5px 8px; border-top:1px solid var(--border-default); color:var(--text-primary); }
+.plan-import-table tr.bad td{ color:var(--negative); }
+.plan-import-more{ padding:6px 8px; font-size:11px; color:var(--text-muted); }
 .secondary-action{
   display:inline-flex; align-items:center; gap:6px; min-height:34px; border:1px solid var(--border-default);
   border-radius:var(--radius-sm); padding:7px 11px; color:var(--text-secondary); background:var(--bg-elevated);

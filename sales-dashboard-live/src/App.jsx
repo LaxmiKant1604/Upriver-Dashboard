@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
-import { TrendingUp, Info, RefreshCw, AlertTriangle, X, Search, Boxes, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, CalendarRange, BarChart3, Inbox, DatabaseZap } from "lucide-react";
+import { TrendingUp, Info, RefreshCw, AlertTriangle, X, Search, Boxes, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, CalendarRange, BarChart3, Inbox, DatabaseZap, Upload, SlidersHorizontal } from "lucide-react";
 import { supabase } from "./lib/supabase.js";
 // The whole workspace is styled from one token-based stylesheet. Every current
 // and future report must build on these tokens and shared patterns rather than
@@ -26,6 +26,7 @@ import {
   computePlanRow as computePlanningRow, resolveHorizon, normalizeHorizon,
   DEFAULT_FORECAST_METHOD, DEFAULT_SAFETY_DAYS, SYSTEM_DEFAULT_HORIZON,
 } from "./lib/fba-planning.js";
+import { validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS } from "./lib/warehouse-import.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
@@ -419,6 +420,234 @@ function WarehouseCell({ row, onSave, busy }) {
         </button>
       )}
     </td>
+  );
+}
+
+// A compact label for a resolved horizon: {kind:"months",months:2} -> "2M"; {kind:"days",days:45} -> "45d".
+function horizonLabel(h) {
+  if (!h) return "—";
+  if (h.kind === "days") return `${h.days}d`;
+  return `${h.months}M`;
+}
+
+// One row's effective planning horizon with a click to open the per-SKU override editor. A SKU with an override
+// carries a dot; a row without a SKU can't be overridden (shows the inherited value, not editable).
+function SkuHorizonCell({ row, onOpen }) {
+  const label = horizonLabel(row.effectiveHorizon);
+  if (!row.sku) return <td className="mono"><span className="dr-dash" title="No SKU -- uses the account default">{label}</span></td>;
+  const src = row.horizonSource === "sku" ? "per-SKU override" : row.horizonSource === "account" ? "account default" : "system default";
+  return (
+    <td className="mono">
+      <button type="button" className={"plan-horizon-btn" + (row.skuHasOverride ? " has-override" : "")}
+        title={`Horizon: ${label} (${src}). Click to set a per-SKU override.`} onClick={() => onOpen(row)}>
+        {label}{row.skuHasOverride && <span className="plan-horizon-dot" aria-label="per-SKU override" />}
+      </button>
+    </td>
+  );
+}
+
+// Popover editor for ONE SKU's horizon override: choose 1/2/3 months or custom days, or reset to inherit the
+// account default. Save persists durably; the plan recomputes locally with zero DataDoe.
+function SkuHorizonEditor({ target, accountDefault, onSave, onClose, busy }) {
+  const [days, setDays] = useState(target.effective?.kind === "days" ? String(target.effective.days) : "45");
+  if (!target) return null;
+  const isDays = target.effective?.kind === "days" && target.source === "sku";
+  const monthActive = (m) => target.source === "sku" && target.effective?.kind === "months" && target.effective.months === m;
+  const commitDays = () => { const d = Math.trunc(Number(days)); if (Number.isInteger(d) && d >= 1 && d <= 365) onSave({ sku: target.sku, horizon: { kind: "days", days: d } }); };
+  return (
+    <div className="plan-modal-backdrop" onClick={onClose}>
+      <div className="plan-modal plan-modal-sm" role="dialog" aria-label="SKU horizon override" onClick={(e) => e.stopPropagation()}>
+        <div className="plan-modal-head">
+          <div><div className="plan-modal-title">Planning horizon</div><div className="plan-modal-sub mono">{target.sku}{target.asin ? ` · ${target.asin}` : ""}</div></div>
+          <button type="button" className="plan-icon-btn" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div className="plan-modal-body">
+          <p className="plan-modal-note">Currently <strong>{horizonLabel(target.effective)}</strong> from the {target.source === "sku" ? "per-SKU override" : target.source === "account" ? "account default" : "system default"}. Set an override for this SKU or reset to inherit the account default ({horizonLabel(accountDefault)}).</p>
+          <div className="plan-seg" style={{ marginBottom: 10 }}>
+            {[1, 2, 3].map((m) => (
+              <button key={m} type="button" disabled={busy} aria-pressed={monthActive(m)} className={"plan-seg-btn" + (monthActive(m) ? " active" : "")} onClick={() => onSave({ sku: target.sku, horizon: { kind: "months", months: m } })}>{m}M</button>
+            ))}
+            <span className={"plan-seg-custom" + (isDays ? " active" : "")}>
+              <input type="number" min="1" max="365" step="1" aria-label="Custom horizon days" value={days} disabled={busy}
+                onChange={(e) => setDays(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") commitDays(); }} />
+              <span>days</span>
+              <button type="button" className="plan-mini-btn" disabled={busy} onClick={commitDays}>Set</button>
+            </span>
+          </div>
+          <button type="button" className="plan-reset-link" disabled={busy || target.source !== "sku"} onClick={() => onSave({ sku: target.sku, clear: true })}>
+            <RotateCcw size={13} /> Reset to account default
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Grouped show/hide column chooser (per-user prefs). Identity columns are locked visible; AWD columns are omitted
+// entirely for non-US accounts (never a fake toggle for data that does not exist).
+function PlanColumnChooser({ groups, hidden, isUS, onToggle, onSelectAll, onReset, onClose, busy }) {
+  return (
+    <div className="plan-cols-pop" role="dialog" aria-label="Choose columns">
+      <div className="plan-cols-head">
+        <span>Columns</span>
+        <div className="plan-cols-actions">
+          <button type="button" className="plan-mini-btn" disabled={busy} onClick={onSelectAll}>Select all</button>
+          <button type="button" className="plan-mini-btn" disabled={busy} onClick={onReset}>Reset default</button>
+          <button type="button" className="plan-icon-btn" onClick={onClose} aria-label="Close"><X size={15} /></button>
+        </div>
+      </div>
+      <div className="plan-cols-body">
+        {groups.map((g) => {
+          const cols = g.cols.filter((c) => isUS || !c.awd);
+          if (cols.length === 0) return null;
+          return (
+            <div key={g.group} className="plan-cols-group">
+              <div className="plan-cols-group-title">{g.group}</div>
+              {cols.map((c) => (
+                <label key={c.id} className={"plan-cols-item" + (c.locked ? " locked" : "")}>
+                  <input type="checkbox" checked={c.locked || !hidden.has(c.id)} disabled={c.locked || busy} onChange={() => onToggle(c.id)} />
+                  <span>{c.chooserLabel || c.label}{c.locked && <span className="plan-cols-lock"> · always</span>}</span>
+                </label>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// Seller-warehouse CSV/XLSX bulk importer. Parse -> STRICT validate (isolated to this account's SKUs) -> preview
+// valid + error rows -> atomic apply (only when there are ZERO errors). Never touches Amazon-source inventory.
+function WarehouseImportModal({ onClose, defaultMarketplace, knownSkus, skuAsinMap, onApply }) {
+  const [fileName, setFileName] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [result, setResult] = useState(null);
+  const [parseError, setParseError] = useState(null);
+  const [applying, setApplying] = useState(false);
+  const [applied, setApplied] = useState(null);
+  const [applyError, setApplyError] = useState(null);
+
+  const runText = (text) => {
+    setApplied(null); setApplyError(null); setParseError(null);
+    try { setResult(validateWarehouseImport(text, { defaultMarketplace, knownSkus })); }
+    catch (e) { setParseError(String(e?.message || e)); setResult(null); }
+  };
+  const onFile = async (file) => {
+    if (!file) return;
+    setFileName(file.name); setApplied(null); setApplyError(null); setParseError(null);
+    try {
+      if (/\.xlsx$/i.test(file.name)) {
+        const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js");
+        const rows = await readXlsxFirstSheet(await file.arrayBuffer());
+        setResult(validateWarehouseRows(rows, { defaultMarketplace, knownSkus }));
+      } else {
+        runText(await file.text());
+      }
+    } catch (e) { setParseError(String(e?.message || e)); setResult(null); }
+  };
+  const downloadTemplate = () => {
+    const samples = Array.from(skuAsinMap || new Map()).slice(0, 5).map(([sku, asin]) => ({ sku, childAsin: asin }));
+    const csv = buildImportTemplateCsv({ defaultMarketplace, sampleSkus: samples });
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a"); a.href = url; a.download = "seller-warehouse-template.csv"; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+  const canApply = result && result.valid.length > 0 && result.errors.length === 0 && !applying;
+  const doApply = async () => {
+    if (!canApply) return;
+    setApplying(true); setApplyError(null);
+    try {
+      const rows = result.valid.map((r) => ({ marketplace: r.marketplace, sku: r.sku, qty: r.qty, childAsin: r.childAsin || (skuAsinMap?.get(r.sku) || ""), note: r.note || "" }));
+      const res = await onApply(rows);
+      setApplied(res?.applied ?? rows.length);
+    } catch (e) { setApplyError(String(e?.message || e)); }
+    finally { setApplying(false); }
+  };
+
+  return (
+    <div className="plan-modal-backdrop" onClick={onClose}>
+      <div className="plan-modal plan-modal-lg" role="dialog" aria-label="Import seller warehouse" onClick={(e) => e.stopPropagation()}>
+        <div className="plan-modal-head">
+          <div><div className="plan-modal-title">Import seller warehouse</div><div className="plan-modal-sub">Bulk-set your own warehouse units for this account. CSV, TSV or XLSX. Amazon inventory is never changed.</div></div>
+          <button type="button" className="plan-icon-btn" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div className="plan-modal-body">
+          {applied != null ? (
+            <div className="alert success"><Check size={15} /> Imported {applied} warehouse row{applied === 1 ? "" : "s"} for this account. The plan has been recomputed.</div>
+          ) : (
+            <>
+              <div className="plan-import-controls">
+                <label className="plan-import-file">
+                  <Upload size={14} /> <span>{fileName || "Choose CSV / XLSX file"}</span>
+                  <input type="file" accept=".csv,.tsv,.txt,.xlsx" onChange={(e) => onFile(e.target.files?.[0])} />
+                </label>
+                <button type="button" className="plan-mini-btn" onClick={downloadTemplate}><Download size={13} /> Template</button>
+              </div>
+              <details className="plan-import-paste">
+                <summary>or paste rows (SKU, Marketplace, Warehouse Units, …)</summary>
+                <textarea rows={4} value={pasteText} placeholder={IMPORT_COLUMNS.map((c) => c.label).join(",")}
+                  onChange={(e) => setPasteText(e.target.value)} onBlur={(e) => e.target.value.trim() && runText(e.target.value)} />
+              </details>
+
+              {parseError && <div className="alert error"><AlertTriangle size={15} /> {parseError}</div>}
+              {result && result.missingRequired?.length > 0 && (
+                <div className="alert error"><AlertTriangle size={15} /> The file is missing required column{result.missingRequired.length === 1 ? "" : "s"}: {result.missingRequired.join(", ")}. Download the template for the exact headers.</div>
+              )}
+              {result && result.empty && <div className="alert warning">No rows found in the file.</div>}
+
+              {result && !result.empty && result.missingRequired?.length === 0 && (
+                <>
+                  <div className="plan-import-summary">
+                    <span className="plan-import-pill ok"><Check size={13} /> {result.valid.length} ready</span>
+                    {result.errors.length > 0 && <span className="plan-import-pill bad"><AlertTriangle size={13} /> {result.errors.length} to fix</span>}
+                    {result.duplicates.length > 0 && <span className="plan-import-pill bad">{result.duplicates.length} duplicate{result.duplicates.length === 1 ? "" : "s"}</span>}
+                    <span className="plan-import-pill">{result.totalDataRows} total</span>
+                  </div>
+                  {result.errors.length > 0 && (
+                    <div className="plan-import-table-wrap">
+                      <table className="plan-import-table">
+                        <thead><tr><th>Line</th><th>SKU</th><th>Marketplace</th><th>Units</th><th>Problem</th></tr></thead>
+                        <tbody>
+                          {result.errors.slice(0, 100).map((e) => (
+                            <tr key={e.line} className="bad"><td className="mono">{e.line}</td><td className="mono">{e.sku || "—"}</td><td className="mono">{e.marketplace || "—"}</td><td className="mono">{e.qty == null ? "—" : e.qty}</td><td>{e.problems.join("; ")}</td></tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {result.errors.length > 100 && <div className="plan-import-more">…and {result.errors.length - 100} more</div>}
+                    </div>
+                  )}
+                  {result.valid.length > 0 && (
+                    <div className="plan-import-table-wrap">
+                      <table className="plan-import-table">
+                        <thead><tr><th>SKU</th><th>Marketplace</th><th>Units</th><th>Note</th></tr></thead>
+                        <tbody>
+                          {result.valid.slice(0, 100).map((r) => (
+                            <tr key={r.line}><td className="mono">{r.sku}</td><td className="mono">{r.marketplace}</td><td className="mono">{nInt(r.qty)}</td><td>{r.note || ""}</td></tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {result.valid.length > 100 && <div className="plan-import-more">…and {result.valid.length - 100} more ready to import</div>}
+                    </div>
+                  )}
+                  {applyError && <div className="alert error"><AlertTriangle size={15} /> Import failed (nothing was applied): {applyError}</div>}
+                </>
+              )}
+            </>
+          )}
+        </div>
+        <div className="plan-modal-foot">
+          {applied != null ? (
+            <button type="button" className="plan-export-btn" onClick={onClose}>Done</button>
+          ) : (
+            <>
+              <span className="plan-modal-foot-note">{result && result.errors.length > 0 ? "Fix every error row before importing — the apply is all-or-nothing." : "The import applies atomically; a single bad row aborts it."}</span>
+              <button type="button" className="plan-export-btn" disabled={!canApply} onClick={doApply}>{applying ? "Importing…" : `Import ${result?.valid.length || 0} row${(result?.valid.length || 0) === 1 ? "" : "s"}`}</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1317,6 +1546,11 @@ function DashboardApp({ session, access, onSignOut }) {
   // account-scoped API. A settings/warehouse change re-reads this and recomputes locally with ZERO DataDoe.
   const [planConfig, setPlanConfig] = useState(null);
   const [planConfigBusy, setPlanConfigBusy] = useState(false);
+  // Per-user column visibility (set of HIDDEN column ids), the SKU-horizon editor target, and the bulk-import modal.
+  const [planHiddenCols, setPlanHiddenCols] = useState(() => new Set());
+  const [planColsBusy, setPlanColsBusy] = useState(false);
+  const [skuHorizonEdit, setSkuHorizonEdit] = useState(null); // { sku, asin, effective, source } | null
+  const [warehouseImportOpen, setWarehouseImportOpen] = useState(false);
 
   // Reconciliation is a six-full-month, cache-first report. Once refreshed,
   // its month selector and Order Explorer operate entirely in the browser.
@@ -1970,6 +2204,54 @@ function DashboardApp({ session, access, onSignOut }) {
     finally { setPlanConfigBusy(false); }
   }, [selectedAccountId, session?.access_token, loadPlanConfig]);
 
+  // Persist (or clear) ONE SKU's horizon override, then reload + recompute. clear=true reverts the SKU to the
+  // account default ("inherit").
+  const saveSkuHorizon = useCallback(async ({ sku, horizon, clear }) => {
+    if (!selectedAccountId || !session?.access_token || !sku) return;
+    const body = clear
+      ? { kind: "sku-horizon", accountId: selectedAccountId, sku, clear: true }
+      : { kind: "sku-horizon", accountId: selectedAccountId, sku, horizonKind: horizon.kind, horizonMonths: horizon.kind === "months" ? horizon.months : undefined, horizonDays: horizon.kind === "days" ? horizon.days : undefined };
+    setPlanConfigBusy(true);
+    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); setSkuHorizonEdit(null); }
+    catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
+    finally { setPlanConfigBusy(false); }
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
+  // Atomic bulk seller-warehouse apply (validated + de-duplicated client rows). Returns the applied count or throws.
+  const bulkImportWarehouse = useCallback(async (rows) => {
+    if (!selectedAccountId || !session?.access_token) throw new Error("No account selected.");
+    const res = await authFetch("/api/fba-plan-config", session.access_token, {
+      method: "POST", body: JSON.stringify({ kind: "warehouse-bulk", accountId: selectedAccountId, rows }),
+    });
+    await loadPlanConfig();
+    return res;
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
+  // Per-USER column-visibility prefs: localStorage for an instant first paint, then the durable server copy (which
+  // wins). Saving writes both. A guest (no session) keeps localStorage only.
+  const columnPrefsKey = useMemo(() => `fbaplan.cols.${session?.user?.id || "anon"}`, [session?.user?.id]);
+  const loadPlanColumns = useCallback(async () => {
+    let local = null;
+    try { const raw = localStorage.getItem(columnPrefsKey); if (raw) local = JSON.parse(raw); } catch { /* ignore */ }
+    if (Array.isArray(local)) setPlanHiddenCols(new Set(local.map(String)));
+    if (!session?.access_token) return;
+    try {
+      const r = await authFetch("/api/fba-plan-columns", session.access_token);
+      if (Array.isArray(r?.hiddenColumns)) setPlanHiddenCols(new Set(r.hiddenColumns.map(String)));
+    } catch { /* keep local */ }
+  }, [columnPrefsKey, session?.access_token]);
+  useEffect(() => { if (view === "fbaplan") loadPlanColumns(); }, [view, loadPlanColumns]);
+  const savePlanColumns = useCallback(async (nextHidden) => {
+    const arr = Array.from(nextHidden);
+    setPlanHiddenCols(new Set(arr));
+    try { localStorage.setItem(columnPrefsKey, JSON.stringify(arr)); } catch { /* ignore */ }
+    if (!session?.access_token) return;
+    setPlanColsBusy(true);
+    try { await authFetch("/api/fba-plan-columns", session.access_token, { method: "POST", body: JSON.stringify({ hiddenColumns: arr }) }); }
+    catch { /* localStorage already holds it */ }
+    finally { setPlanColsBusy(false); }
+  }, [columnPrefsKey, session?.access_token]);
+
   const reconciliationWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
   const reconciliationParams = useMemo(() => {
     if (!selectedAccountId) return null;
@@ -2376,7 +2658,10 @@ function DashboardApp({ session, access, onSignOut }) {
         forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
         horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
       });
-      return { ...legacy, planning, horizonSource, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null };
+      // Null-aware month values for DISPLAY (a genuinely absent month stays null -> em dash, never a coerced 0).
+      const monthsDisplay = monthKeys.map((k) => { const v = r.unitsByMonth?.[k]; return v == null ? null : Number(v); });
+      const skuHasOverride = !!(r.sku && planSkuOverrides.get(String(r.sku)));
+      return { ...legacy, planning, horizonSource, effectiveHorizon: resolvedHorizon, skuHasOverride, monthsDisplay, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null };
     });
   }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku]);
 
@@ -2388,9 +2673,9 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0,
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inTransit: 0, awd: 0, awdInbound: 0, coverage: 0, recommended: 0, restockCount: 0,
       pipeline: 0, horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0 };
-    let anyInv = false, anyAwd = false;
+    let anyInv = false, anyAwd = false, anyAwdInbound = false;
     const add = (key, v) => { if (v != null && Number.isFinite(Number(v))) t[key] += Number(v); };
     planRows.forEach((r) => {
       t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
@@ -2400,9 +2685,11 @@ function DashboardApp({ session, access, onSignOut }) {
         t.fbaAvailable += r.fbaAvailable;
         if (r.mtdDrr !== null) t.mtdDrr += r.mtdDrr;
         t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage;
+        add("custReserved", r.planning?.customerOrderReserved);
         add("pipeline", r.planning?.amazonPipeline);
       }
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
+      if (r.planning?.awdInbound != null) { anyAwdInbound = true; t.awdInbound += Number(r.planning.awdInbound); }
       if (r.recommended !== null) t.recommended += r.recommended;
       if (r.remark === "Restock") t.restockCount += 1;
       // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total).
@@ -2411,9 +2698,67 @@ function DashboardApp({ session, access, onSignOut }) {
       add("shipWh", r.planning?.shipFromSellerWarehouse); add("production", r.planning?.productionRequirement);
     });
     t.fbaDaysCover = t.mtdDrr > 0 ? t.fbaAvailable / t.mtdDrr : null;
-    t.anyInv = anyInv; t.anyAwd = anyAwd;
+    t.anyInv = anyInv; t.anyAwd = anyAwd; t.anyAwdInbound = anyAwdInbound;
     return t;
   }, [planRows]);
+
+  // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
+  // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
+  // columns are tagged so they vanish for non-US accounts (never a fake 0). `nInt` renders null as an em dash.
+  const planColumns = useMemo(() => {
+    if (!planData) return [];
+    const months = planData.months || [];
+    const mLabel = (i) => monthKeyLabel(months[i]?.key) || `Month ${i + 1}`;
+    const td = (key, val, cls = "mono") => <td key={key} className={cls}>{nInt(val)}</td>;
+    return [
+      { id: "asin", group: "Identity", label: "Product / ASIN", chooserLabel: "Product / ASIN", align: "left", sortKey: "asin", locked: true,
+        cell: (r) => (<td key="asin" className="pt-id"><div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div><div className="pt-meta mono">{r.asin}{r.sku ? ` · ${r.sku}` : ""}</div>{r.brand && <div className="pt-brand">{r.brand}</div>}</td>),
+        foot: (t, rows) => <td key="asin" className="pt-id">Totals · {rows.length} ASIN{rows.length === 1 ? "" : "s"}</td> },
+      { id: "m1", group: "Sales", label: mLabel(0), chooserLabel: "Month 1 units", sortKey: "m1", cell: (r) => td("m1", r.monthsDisplay?.[0]), foot: (t) => td("m1", t.m1) },
+      { id: "m2", group: "Sales", label: mLabel(1), chooserLabel: "Month 2 units", sortKey: "m2", cell: (r) => td("m2", r.monthsDisplay?.[1]), foot: (t) => td("m2", t.m2) },
+      { id: "m3", group: "Sales", label: mLabel(2), chooserLabel: "Month 3 units", sortKey: "m3", cell: (r) => td("m3", r.monthsDisplay?.[2]), foot: (t) => td("m3", t.m3) },
+      { id: "mtdUnits", group: "Sales", label: "MTD", chooserLabel: "MTD units", sortKey: "mtdUnits", cell: (r) => td("mtdUnits", r.mtdUnits), foot: (t) => td("mtdUnits", t.mtdUnits) },
+      { id: "threeMoAvg", group: "Forecast", label: "3M Avg", chooserLabel: "3-month average", sortKey: "threeMoAvg", cell: (r) => td("threeMoAvg", r.planning?.threeMonthAverage), foot: () => <td key="threeMoAvg" className="mono">—</td> },
+      { id: "mtdProjected", group: "Forecast", label: "MTD Proj.", chooserLabel: "MTD projected", sortKey: "mtdProjected", cell: (r) => td("mtdProjected", r.planning?.mtdProjectedUnits), foot: () => <td key="mtdProjected" className="mono">—</td> },
+      { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong") },
+      { id: "fbaAvailable", group: "Inventory", label: "FBA Avail", chooserLabel: "FBA available", sortKey: "fbaAvailable", cell: (r) => td("fbaAvailable", r.fbaAvailable), foot: (t) => <td key="fbaAvailable" className="mono">{t.anyInv ? nInt(t.fbaAvailable) : "—"}</td> },
+      { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", cell: (r) => td("fbaDaysCover", r.fbaDaysCover), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
+      { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "Units reserved for customer orders (reserved_customer_order). DISPLAY ONLY — never counted as usable planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
+      { id: "reserved", group: "Inventory", label: "Reserved", chooserLabel: "Reserved (FC)", sortKey: "reserved", thTitle: "reserved_fc_transfer + reserved_fc_processing (raw, no subtraction). Customer-order reserve is a separate column.", cell: (r) => td("reserved", r.reserved), foot: (t) => <td key="reserved" className="mono">{t.anyInv ? nInt(t.reserved) : "—"}</td> },
+      { id: "inTransit", group: "Inventory", label: "In Transit", chooserLabel: "In transit", sortKey: "inTransit", cell: (r) => td("inTransit", r.inTransit), foot: (t) => <td key="inTransit" className="mono">{t.anyInv ? nInt(t.inTransit) : "—"}</td> },
+      { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available", sortKey: "awd", awd: true, cell: (r) => td("awd", r.awd), foot: (t) => <td key="awd" className="mono">{t.anyAwd ? nInt(t.awd) : "—"}</td> },
+      { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound", awd: true, thTitle: "AWD units inbound to Amazon (awd_total_inbound_quantity). US only.", cell: (r) => td("awdInbound", r.planning?.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
+      { id: "coverage", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory", sortKey: "coverage", cell: (r) => td("coverage", r.coverage), foot: (t) => <td key="coverage" className="mono">{t.anyInv ? nInt(t.coverage) : "—"}</td> },
+      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (legacy)", sortKey: "recommended", cell: (r) => td("recommended", r.recommended, "mono pt-strong"), foot: (t) => <td key="recommended" className="mono pt-strong">{t.anyInv ? nInt(t.recommended) : "—"}</td> },
+      { id: "pipeline", group: "Planning", label: "Pipeline", chooserLabel: "Pipeline", thTitle: "In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)", cell: (r) => td("pipeline", r.planning?.amazonPipeline), foot: (t) => <td key="pipeline" className="mono">{t.anyInv ? nInt(t.pipeline) : "—"}</td> },
+      { id: "horizon", group: "Planning", label: "Horizon", chooserLabel: "Planning horizon", thTitle: "Effective planning horizon (per-SKU override or account default). Click a SKU's value to override.", cell: (r) => <SkuHorizonCell key="horizon" row={r} onOpen={(row) => setSkuHorizonEdit({ sku: row.sku, asin: row.asin, effective: row.effectiveHorizon, source: row.horizonSource, hasOverride: row.skuHasOverride })} />, foot: () => <td key="horizon" className="mono">—</td> },
+      { id: "horizonDemand", group: "Planning", label: "Horizon Demand", chooserLabel: "Horizon demand", thTitle: "Daily run rate × effective horizon days (calendar-aware from the effective-through date)", cell: (r) => td("horizonDemand", r.planning?.horizonDemand), foot: (t) => td("horizonDemand", t.horizonDemand) },
+      { id: "safety", group: "Planning", label: "Safety", chooserLabel: "Safety stock", thTitle: "Daily run rate × safety days", cell: (r) => td("safety", r.planning?.safetyStockUnits), foot: (t) => td("safety", t.safetyStock) },
+      { id: "targetInv", group: "Planning", label: "Target Inv", chooserLabel: "Target inventory", thTitle: "ceil(Horizon Demand + Safety Stock)", cell: (r) => td("targetInv", r.planning?.targetInventory, "mono pt-strong"), foot: (t) => td("targetInv", t.targetInventory, "mono pt-strong") },
+      { id: "sellerWh", group: "Planning", label: "Seller WH", chooserLabel: "Seller warehouse", thTitle: "Your OWN uncommitted warehouse units for this SKU (click to edit). Never Amazon inventory and never units already in inbound working.", cell: (r) => <WarehouseCell key="sellerWh" row={r} onSave={saveWarehouseQty} busy={planConfigBusy} />, foot: (t) => td("sellerWh", t.sellerWh) },
+      { id: "shipWh", group: "Planning", label: "Ship WH", chooserLabel: "Ship from warehouse", thTitle: "min(Seller WH, shortage after Amazon/AWD network stock)", cell: (r) => td("shipWh", r.planning?.shipFromSellerWarehouse), foot: (t) => td("shipWh", t.shipWh) },
+      { id: "produce", group: "Planning", label: "Produce", chooserLabel: "Production requirement", thTitle: "max(0, shortage after Amazon/AWD network stock − Seller WH)", cell: (r) => td("produce", r.planning?.productionRequirement, "mono pt-strong"), foot: (t) => td("produce", t.production, "mono pt-strong") },
+      { id: "stockout", group: "Planning", label: "Est. Stockout", chooserLabel: "Estimated stockout", thTitle: "Effective-through date + floor(Immediately Available / daily run rate)", cell: (r) => <td key="stockout" className="mono" title={r.planning?.estimatedStockoutDate ? "" : (r.planning?.stockoutReason || "")}>{r.planning?.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>, foot: () => <td key="stockout" className="mono">—</td> },
+      { id: "priority", group: "Planning", label: "Priority", chooserLabel: "Priority", align: "left", cell: (r) => <td key="priority">{r.planning?.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>, foot: () => <td key="priority">—</td> },
+      { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark">{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>, foot: (t) => <td key="remark">{t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}</td> },
+    ];
+  }, [planData, targetDays, saveWarehouseQty, planConfigBusy]);
+
+  // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
+  const planVisibleColumns = useMemo(
+    () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planData?.isUS || !c.awd)),
+    [planColumns, planHiddenCols, planData?.isUS]
+  );
+  // Grouped, ordered column list for the chooser (preserves model order within each group).
+  const planColumnGroups = useMemo(() => {
+    const order = []; const byGroup = new Map();
+    for (const c of planColumns) { if (!byGroup.has(c.group)) { byGroup.set(c.group, []); order.push(c.group); } byGroup.get(c.group).push(c); }
+    return order.map((group) => ({ group, cols: byGroup.get(group) }));
+  }, [planColumns]);
+  // Every SKU that belongs to this account (for import isolation) + its representative child ASIN.
+  const planKnownSkus = useMemo(() => new Set((planComputed || []).map((r) => r.sku).filter(Boolean).map(String)), [planComputed]);
+  const planSkuAsinMap = useMemo(() => { const m = new Map(); for (const r of planComputed || []) if (r.sku && !m.has(String(r.sku))) m.set(String(r.sku), r.asin || ""); return m; }, [planComputed]);
+  const [planColsOpen, setPlanColsOpen] = useState(false);
 
   const reconciliationScope = useMemo(
     () => buildReconciliation(reconciliationData, selectedBrand),
@@ -3670,6 +4015,23 @@ function DashboardApp({ session, access, onSignOut }) {
               <input type="text" placeholder="ASIN, SKU, product, or brand" value={planSearch} onChange={(e) => setPlanSearch(e.target.value)} />
             </span>
           </label>
+          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId} onClick={() => setWarehouseImportOpen(true)} title="Bulk-import your seller warehouse units (CSV / XLSX)">
+            <Upload size={15} /> Import warehouse
+          </button>
+          <div className="plan-cols-wrap">
+            <button className="plan-tool-btn" type="button" disabled={!planData} onClick={() => setPlanColsOpen((v) => !v)} aria-expanded={planColsOpen} title="Show or hide columns">
+              <SlidersHorizontal size={15} /> Columns{planHiddenCols.size > 0 ? ` (${planHiddenCols.size} hidden)` : ""}
+            </button>
+            {planColsOpen && planData && (
+              <PlanColumnChooser
+                groups={planColumnGroups} hidden={planHiddenCols} isUS={planData.isUS === true} busy={planColsBusy}
+                onToggle={(id) => { const next = new Set(planHiddenCols); if (next.has(id)) next.delete(id); else next.add(id); savePlanColumns(next); }}
+                onSelectAll={() => savePlanColumns(new Set())}
+                onReset={() => savePlanColumns(new Set())}
+                onClose={() => setPlanColsOpen(false)}
+              />
+            )}
+          </div>
           <button
             className="plan-export-btn"
             type="button"
@@ -3717,95 +4079,23 @@ function DashboardApp({ session, access, onSignOut }) {
               <table className="plan-table">
                 <thead>
                   <tr>
-                    <PlanTh className="pt-id" label="Product / ASIN" col="asin" sort={planSort} onSort={setPlanSortKey} align="left" />
-                    <PlanTh label={monthKeyLabel(planData.months?.[0]?.key)} col="m1" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label={monthKeyLabel(planData.months?.[1]?.key)} col="m2" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label={monthKeyLabel(planData.months?.[2]?.key)} col="m3" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="MTD" col="mtdUnits" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="3M Avg" col="threeMoAvg" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="MTD Proj." col="mtdProjected" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label={`Target Units (${targetDays || 0}d)`} col="targetUnits" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="FBA Avail" col="fbaAvailable" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="FBA Days (MTD DRR)" col="fbaDaysCover" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="Reserved" col="reserved" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="In Transit" col="inTransit" sort={planSort} onSort={setPlanSortKey} />
-                    {planData.isUS && <PlanTh label="AWD Avail" col="awd" sort={planSort} onSort={setPlanSortKey} />}
-                    <PlanTh label="Total FBA Inv." col="coverage" sort={planSort} onSort={setPlanSortKey} />
-                    <PlanTh label="Recommend" col="recommended" sort={planSort} onSort={setPlanSortKey} />
-                    <th title="In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)">Pipeline</th>
-                    <th title="Daily run rate x effective horizon days (calendar-aware from the effective-through date)">Horizon Demand</th>
-                    <th title="Daily run rate x safety days">Safety</th>
-                    <th title="ceil(Horizon Demand + Safety Stock)">Target Inv</th>
-                    <th title="Your own warehouse units for this SKU (click to edit). Never Amazon inventory.">Seller WH</th>
-                    <th title="min(Seller WH, shortage after Amazon/AWD network stock)">Ship WH</th>
-                    <th title="max(0, shortage after Amazon/AWD network stock - Seller WH)">Produce</th>
-                    <th title="Effective-through date + floor(Immediately Available / daily run rate)">Est. Stockout</th>
-                    <th style={{ textAlign: "left" }}>Priority</th>
-                    <PlanTh label="Remark" col="remark" sort={planSort} onSort={setPlanSortKey} align="left" />
+                    {planVisibleColumns.map((c) => (
+                      c.sortKey
+                        ? <PlanTh key={c.id} className={c.id === "asin" ? "pt-id" : ""} label={c.label} col={c.sortKey} sort={planSort} onSort={setPlanSortKey} align={c.align || "right"} />
+                        : <th key={c.id} title={c.thTitle || undefined} style={c.align === "left" ? { textAlign: "left" } : undefined}>{c.label}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
                   {planRows.map((r) => (
                     <tr key={r.asin} className={r.remark === "Restock" ? "plan-restock" : ""}>
-                      <td className="pt-id">
-                        <div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div>
-                        <div className="pt-meta mono">{r.asin}{r.sku ? ` · ${r.sku}` : ""}</div>
-                        {r.brand && <div className="pt-brand">{r.brand}</div>}
-                      </td>
-                      <td className="mono">{nInt(r.m1)}</td>
-                      <td className="mono">{nInt(r.m2)}</td>
-                      <td className="mono">{nInt(r.m3)}</td>
-                      <td className="mono">{nInt(r.mtdUnits)}</td>
-                      <td className="mono">{nInt(r.threeMoAvg)}</td>
-                      <td className="mono">{nInt(r.mtdProjected)}</td>
-                      <td className="mono pt-strong">{nInt(r.targetUnits)}</td>
-                      <td className="mono">{nInt(r.fbaAvailable)}</td>
-                      <td className="mono">{nInt(r.fbaDaysCover)}</td>
-                      <td className="mono">{nInt(r.reserved)}</td>
-                      <td className="mono">{nInt(r.inTransit)}</td>
-                      {planData.isUS && <td className="mono">{nInt(r.awd)}</td>}
-                      <td className="mono">{nInt(r.coverage)}</td>
-                      <td className="mono pt-strong">{nInt(r.recommended)}</td>
-                      <td className="mono">{nInt(r.planning.amazonPipeline)}</td>
-                      <td className="mono">{nInt(r.planning.horizonDemand)}</td>
-                      <td className="mono">{nInt(r.planning.safetyStockUnits)}</td>
-                      <td className="mono pt-strong">{nInt(r.planning.targetInventory)}</td>
-                      <WarehouseCell row={r} onSave={saveWarehouseQty} busy={planConfigBusy} />
-                      <td className="mono">{nInt(r.planning.shipFromSellerWarehouse)}</td>
-                      <td className="mono pt-strong">{nInt(r.planning.productionRequirement)}</td>
-                      <td className="mono" title={r.planning.estimatedStockoutDate ? "" : (r.planning.stockoutReason || "")}>{r.planning.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>
-                      <td>{r.planning.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>
-                      <td>{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>
+                      {planVisibleColumns.map((c) => c.cell(r))}
                     </tr>
                   ))}
                 </tbody>
                 <tfoot>
                   <tr className="plan-totals-row">
-                    <td className="pt-id">Totals · {planRows.length} ASIN{planRows.length === 1 ? "" : "s"}</td>
-                    <td className="mono">{nInt(planTotals.m1)}</td>
-                    <td className="mono">{nInt(planTotals.m2)}</td>
-                    <td className="mono">{nInt(planTotals.m3)}</td>
-                    <td className="mono">{nInt(planTotals.mtdUnits)}</td>
-                    <td className="mono">—</td>
-                    <td className="mono">—</td>
-                    <td className="mono pt-strong">{nInt(planTotals.targetUnits)}</td>
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</td>
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.fbaDaysCover) : "—"}</td>
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.reserved) : "—"}</td>
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.inTransit) : "—"}</td>
-                    {planData.isUS && <td className="mono">{planTotals.anyAwd ? nInt(planTotals.awd) : "—"}</td>}
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</td>
-                    <td className="mono pt-strong">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</td>
-                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.pipeline) : "—"}</td>
-                    <td className="mono">{nInt(planTotals.horizonDemand)}</td>
-                    <td className="mono">{nInt(planTotals.safetyStock)}</td>
-                    <td className="mono pt-strong">{nInt(planTotals.targetInventory)}</td>
-                    <td className="mono">{nInt(planTotals.sellerWh)}</td>
-                    <td className="mono">{nInt(planTotals.shipWh)}</td>
-                    <td className="mono pt-strong">{nInt(planTotals.production)}</td>
-                    <td className="mono">—</td>
-                    <td>—</td>
-                    <td>{planTotals.restockCount > 0 ? `${planTotals.restockCount} restock` : "OK"}</td>
+                    {planVisibleColumns.map((c) => c.foot(planTotals, planRows))}
                   </tr>
                 </tfoot>
               </table>
@@ -3828,11 +4118,24 @@ function DashboardApp({ session, access, onSignOut }) {
         )}
 
         <div className="footer-note">
-          Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date.
-          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = the non-overlapping remainder of <code>reserved_fc_transfer</code> after <code>inbound_shipped</code>, plus <code>reserved_fc_processing</code> (customer-order reserve excluded); In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
-          {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> from <code>Listings</code> and is added to coverage for this US account.</> : <> AWD does not apply to non-US accounts and is hidden.</>}
-          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Total FBA Inv. = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. FBA Days (MTD DRR) = FBA Available divided by MTD daily run rate; it excludes reserved, inbound, and AWD stock. Recommended Shipment = ceil(Target Units − Total FBA Inv.), floored at 0. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+          Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date. A genuinely missing month shows an em dash — never a fabricated 0 — so the 3-month average is only shown when all three completed months have proven data.
+          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> shown RAW (no subtraction — the authoritative source metadata proves the reserved FC-transfer state and the inbound states are distinct, so nothing is netted off); Cust. Reserved = <code>reserved_customer_order</code>, shown for reference and never counted as usable stock; In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
+          {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> and AWD Inbound = <code>awd_total_inbound_quantity</code> from <code>Listings</code> (US only); AWD Available is added to coverage.</> : <> AWD does not apply to non-US accounts and its columns are hidden (never shown as 0).</>}
+          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Total FBA Inv. = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. Seller WH holds your OWN uncommitted warehouse units (edit inline or bulk-import); it is never Amazon inventory and never units already counted in inbound working. FBA Days (MTD DRR) = FBA Available divided by MTD daily run rate; it excludes reserved, inbound, and AWD stock. Recommended Shipment = ceil(Target Units − Total FBA Inv.), floored at 0. Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
+        {skuHorizonEdit && (
+          <SkuHorizonEditor target={skuHorizonEdit} accountDefault={planAccountSettings.horizon} busy={planConfigBusy}
+            onSave={saveSkuHorizon} onClose={() => setSkuHorizonEdit(null)} />
+        )}
+        {warehouseImportOpen && (
+          <WarehouseImportModal
+            defaultMarketplace={planData?.marketCountry || ""}
+            knownSkus={planKnownSkus}
+            skuAsinMap={planSkuAsinMap}
+            onApply={bulkImportWarehouse}
+            onClose={() => setWarehouseImportOpen(false)}
+          />
+        )}
       </div>
       )}
 

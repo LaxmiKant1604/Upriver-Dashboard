@@ -644,6 +644,44 @@ export async function recordFbaSellerWarehouse({ organizationFingerprint, connec
   return Array.isArray(body) ? body[0] : body;
 }
 
+// Atomic BULK warehouse apply (many validated rows for one account, all-or-nothing) via the SECURITY DEFINER RPC.
+// rows: [{ marketplace, sku, childAsin?, qty, note? }]. Any invalid row aborts the whole transaction.
+export async function recordFbaSellerWarehouseBulk({ organizationFingerprint, connectionId = "primary", accountId, rows, updatedBy = null, updatedByEmail = "" }) {
+  const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({
+    marketplace: r.marketplace, sku: r.sku, child_asin: r.childAsin || "", qty: r.qty == null ? null : Number(r.qty), note: r.note || "",
+  }));
+  const body = await request("/rest/v1/rpc/record_fba_seller_warehouse_bulk", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_rows, p_updated_by: updatedBy, p_updated_by_email: updatedByEmail,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+// Per-user column visibility prefs for the FBA plan (hidden column ids). Absent row => all defaults visible.
+export async function getFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", signal = null } = {}) {
+  if (!userId) throw new Error("getFbaPlanColumnPrefs requires userId (fail closed).");
+  const q = new URLSearchParams({ user_id: `eq.${userId}`, report_key: `eq.${reportKey}`, select: "hidden_columns,updated_at" });
+  try {
+    const rows = await request(`/rest/v1/fba_plan_column_prefs?${q}`, { signal });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : [], updatedAt: row?.updated_at || null };
+  } catch (e) { if (isSchemaMissingError(e)) return { hiddenColumns: [], updatedAt: null }; throw e; }
+}
+
+export async function setFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", hiddenColumns }) {
+  const hidden = Array.from(new Set((Array.isArray(hiddenColumns) ? hiddenColumns : []).map(String))).slice(0, 200);
+  const rows = await request("/rest/v1/fba_plan_column_prefs?on_conflict=user_id,report_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: { user_id: userId, report_key: reportKey, hidden_columns: hidden, updated_at: new Date().toISOString() },
+  });
+  const row = Array.isArray(rows) ? rows[0] : rows;
+  return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : hidden };
+}
+
 const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,metric_date,dimension_key";
 
 export async function getAdsSyncStates(accountIds) {

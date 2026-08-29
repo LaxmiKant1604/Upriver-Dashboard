@@ -31,6 +31,7 @@
     "test:oli-operational-units": "node scripts/oli-operational-units.test.js",
     "test:brand-view-render": "node scripts/brand-view-render.test.js",
     "test:fba-planning": "node scripts/fba-planning.test.js",
+    "test:warehouse-import": "node scripts/warehouse-import.test.js",
     "test:sku-movement": "node scripts/sku-movement.test.js",
     "test:sku-movement-integration": "node scripts/sku-movement-integration.test.js",
     "test:oli-value-policy": "node scripts/oli-value-policy.test.js",

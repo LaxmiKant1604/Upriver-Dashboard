@@ -197,6 +197,11 @@ export function computePlanRow({
   // 4) demand / forecast.
   const mtdProj = mtdProjectedUnits({ mtdUnits, elapsedCompletedDays, daysInCurrentMonth });
   const baseForecast = baseMonthlyForecast({ method: forecastMethod, monthlyValues, mtdProjected: mtdProj, weights: forecastWeights });
+  // The plain three-month average, exposed for DISPLAY (null unless all three completed months have proven evidence,
+  // never a missing month coerced to 0). Independent of the chosen forecast method.
+  const monthsForAvg = (Array.isArray(monthlyValues) ? monthlyValues : []).map((v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v)));
+  const threeMonthAverage = monthsForAvg.length === 3 && monthsForAvg.every((v) => v != null)
+    ? Math.round((monthsForAvg.reduce((s, x) => s + x, 0) / 3) * 100) / 100 : null;
   const win = horizonWindow(effectiveAsOf, horizon);
   const basisMonthDays = N(daysInCurrentMonth);
   const dailyRunRate = baseForecast == null || basisMonthDays == null || basisMonthDays <= 0
@@ -246,7 +251,7 @@ export function computePlanRow({
     // network totals
     totalAmazonAwdStock, totalNetworkStock,
     // horizon + forecast
-    forecastMethod, mtdProjectedUnits: mtdProj, baseMonthlyForecast: baseForecast, dailyRunRate,
+    forecastMethod, mtdProjectedUnits: mtdProj, threeMonthAverage, baseMonthlyForecast: baseForecast, dailyRunRate,
     projectionStart: win.start, projectionEnd: win.end, effectiveHorizonDays,
     horizonDemand, safetyStockUnits, targetInventory,
     // outputs
