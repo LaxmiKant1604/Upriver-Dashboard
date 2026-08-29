@@ -729,6 +729,15 @@ export function fbaPlanPayload({
     }
   }
 
+  // 5b) The durable ACCOUNT SKU UNIVERSE -- every SKU seen in ANY source (inventory, AWD, sales). This is a SUPERSET of
+  //     the representative SKUs shown in the per-ASIN rows, so seller-warehouse management + bulk-import validation can
+  //     cover SKUs the plan drops (a non-representative SKU on a multi-SKU ASIN, or a SKU whose ASIN has zero sales AND
+  //     zero Amazon inventory). Used only as an authorization allowlist; never fabricates a plan number.
+  const accountSkuSet = new Set();
+  for (const set of Object.values(skusByAsin)) for (const s of set) accountSkuSet.add(s);
+  for (const arr of completedUnitRows || []) for (const r of arr || []) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
+  for (const r of mtdUnitRows || []) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
+
   // 6) Assemble one row per ASIN (representative SKU = first localeCompare SKU; drop zero-activity).
   const rows = [];
   for (const asin of asinSet) {
@@ -788,6 +797,7 @@ export function fbaPlanPayload({
     inventoryAvailable,
     awdAvailable,
     rows,
+    accountSkus: [...accountSkuSet].sort((a, b) => a.localeCompare(b)),
     inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
       ...entry,
       skuCount: skus.size,

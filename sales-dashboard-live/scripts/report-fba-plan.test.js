@@ -171,6 +171,7 @@ const EXPECTED = {
     { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaAvailable: 100, customerOrderReserved: 4, reservedFcTransfer: 8, reservedFcProcessing: 1, inboundShipped: 5, inboundReceived: 2, inboundWorking: 0, awdAvailable: 42, awdInbound: 15 },
     { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, customerOrderReserved: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0, awdInbound: 0 },
   ],
+  accountSkus: ["SKU-1"],
   inventoryByBrandCountry: [{ country: "US", brand: "Acme", fbaAvailable: 100, skuCount: 1 }],
 };
 
@@ -192,6 +193,20 @@ test("fba-plan: representative SKU is the first localeCompare SKU (stable across
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: [] });
   const row = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN1");
   assert.equal(row.sku, "SKU-A");
+});
+
+test("fba-plan: accountSkus is the FULL SKU universe -- includes multi-SKU ASINs + SKUs on dropped zero-activity ASINs", () => {
+  const inv = [
+    { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-B", available: 1 },   // ASIN1 has TWO SKUs; only one is the row rep
+    { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-A", available: 1 },
+    { date: "2025-08-06", child_asin: "ASIN9", sku: "SKU-ZERO", available: 0, inbound_working: 0 }, // zero-activity ASIN -> dropped from rows
+  ];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: [] });
+  const p = deriveFba(planned, rows).payload;
+  // ASIN9 is dropped from the visible rows (zero everything)...
+  assert.equal(p.rows.find((r) => r.asin === "ASIN9"), undefined, "zero-activity ASIN dropped from rows");
+  // ...but every SKU seen in the sources is in the account SKU universe, so warehouse import can authorize it.
+  assert.deepEqual(p.accountSkus, ["SKU-A", "SKU-B", "SKU-ZERO"], "sorted union incl. non-representative + dropped-ASIN SKUs");
 });
 
 test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {

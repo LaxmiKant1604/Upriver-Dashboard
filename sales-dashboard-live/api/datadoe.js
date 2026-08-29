@@ -3591,6 +3591,14 @@ async function handleDataDoe(req, res) {
         }
       }
 
+      // 5b) The durable ACCOUNT SKU UNIVERSE -- every SKU seen in ANY source (inventory, AWD, sales). A SUPERSET of the
+      // representative SKUs the per-ASIN rows show, used only as an authorization allowlist for seller-warehouse
+      // management + bulk-import validation so a SKU the plan drops (non-representative on a multi-SKU ASIN, or an ASIN
+      // with zero sales + zero Amazon inventory) is still recognised. Never fabricates a plan number.
+      const accountSkuSet = new Set();
+      for (const set of Object.values(skusByAsin)) for (const s of set) accountSkuSet.add(s);
+      for (const r of oliSalesRows) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
+
       // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU
       // in ascending (localeCompare) order, so it is stable across refreshes.
       // Only ASINs with real activity are kept: any unit sales in the window, or
@@ -3653,6 +3661,7 @@ async function handleDataDoe(req, res) {
         inventoryAvailable,
         awdAvailable,
         rows,
+        accountSkus: [...accountSkuSet].sort((a, b) => a.localeCompare(b)),
         // Additive: consumed only by the account-scoped Brand View. Bounded by
         // (marketplaces x brands), so it stays small for accounts with
         // thousands of SKUs.

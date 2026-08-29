@@ -3,29 +3,36 @@
 // settings/warehouse change re-computes here with ZERO DataDoe. Missing evidence stays `null` (Unavailable) and is
 // NEVER coerced to a fabricated 0; no output is ever Infinity/NaN/negative.
 //
-// ============================ NON-OVERLAPPING INVENTORY EQUATION (documented) ============================
-// FBA Inventory Health (source 44fc5ba0ce) exposes these MUTUALLY-DISTINCT states for a SKU:
-//   available               -- sellable now, in an FC
-//   reserved_customer_order -- already allocated to placed customer orders (being picked/packed) -> NOT future stock
-//   reserved_fc_transfer    -- reserved for an FC->FC transfer (temporarily unavailable, still in-network)
-//   reserved_fc_processing  -- being processed at an FC (temporarily unavailable, still in-network)
-//   inbound_working         -- shipment created, not yet shipped (still at the seller)
-//   inbound_shipped         -- shipped to Amazon, in transit
-//   inbound_received        -- received at an FC, not yet checked in to `available`
-// We NEVER use total_reserved_quantity (the aggregate of the reserved_* components) NOR inbound_quantity (the
-// aggregate of the inbound_* states) -- using an aggregate together with its components would double-count. We show
-// each component separately and add each AT MOST ONCE:
-//   immediatelyAvailable = available
-//   amazonPipeline       = inbound_working + inbound_shipped + inbound_received + reserved_fc_processing
-//                          + adjustedFcTransfer,   where adjustedFcTransfer = max(0, reserved_fc_transfer - inbound_shipped)
-//                          (Amazon exposes the FC-transfer leg that is already in transit ALSO as inbound_shipped; the
-//                           subtraction removes that single known overlap so those units are counted once.)
-//   customerOrderReserved = reserved_customer_order  -- DISPLAY ONLY; excluded from every usable-stock total.
-//   totalAmazonAwdStock   = immediatelyAvailable + amazonPipeline + validatedAwdStock   (AWD US-only, see below)
-//   totalNetworkStock     = totalAmazonAwdStock + sellerWarehouseQty
-// inbound_received is a DISTINCT pipeline state (received, not yet in `available`), so it does not overlap `available`
-// and is added exactly once. Every quantity above appears in exactly one summand -> no double counting (proven in
-// scripts/fba-planning.test.js).
+// ============================ CANONICAL, NON-OVERLAPPING INVENTORY MODEL (documented) ============================
+// FBA Inventory Health (source 44fc5ba0ce) exposes these MUTUALLY-EXCLUSIVE states for a SKU -- Amazon places each
+// physical unit in exactly one bucket, and `available` (fulfillable) EXCLUDES every reserved and inbound state:
+//   available               -- sellable now, in an FC (fulfillable)
+//   reserved_customer_order -- already allocated to placed customer orders (being picked/packed) -> already SOLD
+//   reserved_fc_transfer    -- reserved for an FC->FC transfer (in-network, temporarily unavailable, becomes sellable)
+//   reserved_fc_processing  -- being processed at an FC (in-network, temporarily unavailable, becomes sellable)
+//   inbound_working         -- shipment created, not yet shipped (en route to the FBA network)
+//   inbound_shipped         -- shipped to Amazon, in transit (en route)
+//   inbound_received        -- received at an FC, not yet checked in to `available` (en route to fulfillable)
+// We NEVER use total_reserved_quantity (the aggregate of the reserved_* components) NOR inbound_quantity (the aggregate
+// of the inbound_* states) -- using an aggregate together with its components would double-count. reserved_fc_transfer
+// is used RAW (no inbound-shipped subtraction: the authoritative source metadata proves the reserved and inbound
+// states are DISTINCT buckets, so there is no overlap to net off). Each component is added AT MOST ONCE.
+//
+// Canonical named quantities (each unit appears in exactly one summand):
+//   sellableNow          = available                                                         (fulfillable NOW)
+//   reservedFcTotal      = reserved_fc_transfer + reserved_fc_processing                      (in-FC, becoming sellable)
+//   inboundPipeline      = inbound_working + inbound_shipped + inbound_received               (en route to the FC)
+//   amazonPipeline       = reservedFcTotal + inboundPipeline                                  (in-network, not yet sellable)
+//   customerOrderReserved= reserved_customer_order  -- DISPLAY ONLY; already sold, EXCLUDED from every usable total.
+//   totalFbaInventory    = sellableNow + amazonPipeline                                       (FBA network only; NO AWD)
+//   awdAvailable (US)    = awd_available_distributable_quantity  -- distributable AWD stock (counts as usable supply)
+//   awdInbound   (US)    = awd_total_inbound_quantity            -- inbound TO AWD, NOT yet distributable: DISPLAY ONLY,
+//                                                                  EXCLUDED from every usable total (never a fake 0 non-US)
+//   amazonNetworkPosition= totalFbaInventory + awdAvailable       (all Amazon-held stock that is/will be sellable)
+//   totalNetworkPosition = amazonNetworkPosition + sellerWarehouseQty  (adds the seller's uncommitted warehouse stock)
+// Planning supply (what reduces the restock shortage) = amazonNetworkPosition; the seller warehouse is applied
+// afterward in the ship-from-warehouse / production split. Every UI number, footer, export column and planning figure
+// derives from THIS one model. No quantity is double-counted (proven in scripts/fba-planning.test.js).
 
 const N = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
 const num0 = (v) => { const n = N(v); return n == null ? 0 : n; };
@@ -178,19 +185,22 @@ export function computePlanRow({
   const avail = inventoryAvailable ? num0(available) : null;
   const custReserved = inventoryAvailable ? (customerOrderReserved == null ? null : num0(customerOrderReserved)) : null;
   const fcTransferNet = num0(reservedFcTransfer); // RAW: a distinct reserved state, no proven inbound-shipped overlap
-  const pipelineParts = inventoryAvailable
-    ? num0(inboundWorking) + num0(inboundShipped) + num0(inboundReceived) + num0(reservedFcProcessing) + fcTransferNet
-    : null;
+  const reservedFcTotal = inventoryAvailable ? fcTransferNet + num0(reservedFcProcessing) : null; // in-FC, becoming sellable
+  const inboundPipeline = inventoryAvailable ? num0(inboundWorking) + num0(inboundShipped) + num0(inboundReceived) : null; // en route
+  const pipelineParts = inventoryAvailable ? num0(reservedFcTotal) + num0(inboundPipeline) : null;
   const immediatelyAvailable = avail; // sellable now
   const amazonPipeline = pipelineParts; // in-network, not yet sellable (customer-order-reserved EXCLUDED)
+  const totalFbaInventory = immediatelyAvailable == null ? null : num0(immediatelyAvailable) + num0(amazonPipeline); // FBA only, NO AWD
 
   // 2) AWD (US-only, validated). Non-US or unvalidated -> null (Unavailable), never 0.
+  //    awdAvailable is DISTRIBUTABLE stock -> counts as usable supply. awdInbound is inbound TO the AWD warehouse and
+  //    is NOT yet distributable -> DISPLAY ONLY, never added to usable/network/planning supply.
   const awdAvail = isUS && awdValidated ? (awdAvailable == null ? null : num0(awdAvailable)) : null;
   const awdInb = isUS && awdValidated ? (awdInbound == null ? null : num0(awdInbound)) : null;
-  const validatedAwdStock = isUS && awdValidated ? num0(awdAvail) + num0(awdInb) : 0;
+  const distributableAwdStock = isUS && awdValidated ? num0(awdAvail) : 0; // awdInbound EXCLUDED (not yet distributable)
 
-  // 3) network totals.
-  const totalAmazonAwdStock = immediatelyAvailable == null ? null : num0(immediatelyAvailable) + num0(amazonPipeline) + validatedAwdStock;
+  // 3) network totals. amazonNetworkPosition = FBA inventory + distributable AWD (the usable planning supply).
+  const totalAmazonAwdStock = immediatelyAvailable == null ? null : num0(totalFbaInventory) + distributableAwdStock;
   const whQty = sellerWarehouseQty == null ? null : Math.max(0, Math.trunc(num0(sellerWarehouseQty)));
   const totalNetworkStock = totalAmazonAwdStock == null ? (whQty == null ? null : whQty) : num0(totalAmazonAwdStock) + num0(whQty);
 
@@ -216,7 +226,7 @@ export function computePlanRow({
   // 5) shortage / ship / production. Requires the target + Amazon-network stock evidence.
   let shortageBeforeWarehouse = null, shipFromSellerWarehouse = null, productionRequirement = null;
   if (targetInventory != null && immediatelyAvailable != null) {
-    const amazonNetwork = num0(immediatelyAvailable) + num0(amazonPipeline) + validatedAwdStock;
+    const amazonNetwork = num0(totalFbaInventory) + distributableAwdStock; // == amazonNetworkPosition (usable supply)
     shortageBeforeWarehouse = Math.max(0, targetInventory - amazonNetwork);
     const wh = num0(whQty);
     shipFromSellerWarehouse = Math.min(wh, shortageBeforeWarehouse);
@@ -239,17 +249,19 @@ export function computePlanRow({
   });
 
   return {
-    // display breakdown (each shown separately)
+    // display breakdown (each shown separately, each counted at most once)
     immediatelyAvailable, customerOrderReserved: custReserved, amazonPipeline,
     reservedFcTransfer: inventoryAvailable ? fcTransferNet : null,
     reservedFcProcessing: inventoryAvailable ? (reservedFcProcessing == null ? null : num0(reservedFcProcessing)) : null,
+    reservedFcTotal, inboundPipeline,
     inboundWorking: inventoryAvailable ? (inboundWorking == null ? null : num0(inboundWorking)) : null,
     inboundShipped: inventoryAvailable ? (inboundShipped == null ? null : num0(inboundShipped)) : null,
     inboundReceived: inventoryAvailable ? (inboundReceived == null ? null : num0(inboundReceived)) : null,
     awdAvailable: awdAvail, awdInbound: awdInb,
     sellerWarehouseQty: whQty,
-    // network totals
-    totalAmazonAwdStock, totalNetworkStock,
+    // canonical named totals (one model for UI, footer, export + planning)
+    totalFbaInventory, amazonNetworkPosition: totalAmazonAwdStock, totalNetworkPosition: totalNetworkStock,
+    totalAmazonAwdStock, totalNetworkStock, // kept as aliases for existing callers/tests
     // horizon + forecast
     forecastMethod, mtdProjectedUnits: mtdProj, threeMonthAverage, baseMonthlyForecast: baseForecast, dailyRunRate,
     projectionStart: win.start, projectionEnd: win.end, effectiveHorizonDays,

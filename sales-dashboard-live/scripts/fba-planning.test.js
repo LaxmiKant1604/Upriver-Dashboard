@@ -140,11 +140,37 @@ test("14/15. AWD counts ONLY for a US account with validated evidence; Non-US co
   const us = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(us.awdAvailable, 30);
   assert.equal(us.awdInbound, 15);
-  assert.equal(us.totalAmazonAwdStock, 100 + 0 + (30 + 15), "US AWD adds to the network stock");
+  // ONLY distributable AWD (awd_available) is usable supply; awd_inbound (inbound TO the AWD warehouse) is NOT yet
+  // distributable and is EXCLUDED from every usable/network total (display-only).
+  assert.equal(us.totalFbaInventory, 100, "Total FBA Inventory is FBA-only, never includes AWD");
+  assert.equal(us.amazonNetworkPosition, 100 + 30, "network position adds distributable AWD only");
+  assert.equal(us.totalAmazonAwdStock, 100 + 30, "awd_inbound (15) is NOT added to usable stock");
   const nonUs = computePlanRow({ isUS: false, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(nonUs.awdAvailable, null, "Non-US AWD is Unavailable (null), never 0");
   assert.equal(nonUs.awdInbound, null);
   assert.equal(nonUs.totalAmazonAwdStock, 100, "Non-US AWD never contributes to stock");
+  assert.equal(nonUs.amazonNetworkPosition, 100);
+});
+
+test("canonical model: one non-overlapping equation; each raw state counted exactly once; AWD-inbound + customer-reserve excluded", () => {
+  const r = computePlanRow({
+    isUS: true, awdValidated: true, awdAvailable: 7, awdInbound: 99, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31,
+    inventoryAvailable: true, available: 100, customerOrderReserved: 40, reservedFcTransfer: 10, reservedFcProcessing: 5,
+    inboundWorking: 20, inboundShipped: 8, inboundReceived: 12, sellerWarehouseQty: 25,
+    monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 },
+  });
+  // Buckets are the raw states, each summed once.
+  assert.equal(r.reservedFcTotal, 10 + 5);
+  assert.equal(r.inboundPipeline, 20 + 8 + 12);
+  assert.equal(r.amazonPipeline, r.reservedFcTotal + r.inboundPipeline, "pipeline = reservedFc + inbound, no aggregate reused");
+  assert.equal(r.totalFbaInventory, 100 + (10 + 5) + (20 + 8 + 12), "Total FBA Inv = sellable + reservedFc + inbound (no AWD)");
+  assert.equal(r.amazonNetworkPosition, r.totalFbaInventory + 7, "+ distributable AWD only (awd_inbound 99 excluded)");
+  assert.equal(r.totalNetworkPosition, r.amazonNetworkPosition + 25, "+ seller warehouse");
+  // No double count: the disjoint raw components sum to exactly totalFbaInventory; adding customer reserve would over-count.
+  const disjoint = r.immediatelyAvailable + r.reservedFcTransfer + r.reservedFcProcessing + r.inboundWorking + r.inboundShipped + r.inboundReceived;
+  assert.equal(disjoint, r.totalFbaInventory, "each distinct FBA state counted exactly once");
+  assert.notEqual(r.totalFbaInventory, disjoint + r.customerOrderReserved, "customer-order reserve never in the usable total");
+  assert.equal(r.amazonNetworkPosition, r.totalAmazonAwdStock, "alias parity");
 });
 
 test("16. missing US AWD evidence is Unavailable (null), never a fabricated 0", () => {

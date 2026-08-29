@@ -271,16 +271,19 @@ const PLAN_SORT_ACCESSORS = {
   brand: (r) => (r.brand || "").toLowerCase(),
   m1: (r) => r.m1, m2: (r) => r.m2, m3: (r) => r.m3,
   mtdUnits: (r) => r.mtdUnits,
-  threeMoAvg: (r) => r.threeMoAvg,
-  mtdProjected: (r) => r.mtdProjected,
+  threeMoAvg: (r) => r.planning?.threeMonthAverage,
+  mtdProjected: (r) => r.planning?.mtdProjectedUnits,
   planningAvg: (r) => r.planningAvg,
   targetUnits: (r) => r.targetUnits,
   fbaAvailable: (r) => r.fbaAvailable,
   fbaDaysCover: (r) => r.fbaDaysCover,
+  custReserved: (r) => r.planning?.customerOrderReserved,
   reserved: (r) => r.reserved,
-  inTransit: (r) => r.inTransit,
+  inboundPipeline: (r) => r.inboundPipeline,
   awd: (r) => r.awd,
-  coverage: (r) => r.coverage,
+  awdInbound: (r) => r.awdInbound,
+  totalFbaInv: (r) => r.totalFbaInv,
+  amazonNetwork: (r) => r.amazonNetwork,
   recommended: (r) => r.recommended,
   remark: (r) => r.remark || "",
 };
@@ -299,30 +302,33 @@ function comparePlanRows(a, b, key, dir) {
   return dir === "asc" ? cmp : -cmp;
 }
 
-function downloadPlanSpreadsheet(rows, meta, targetDays) {
-  const monthLabels = (meta.months || []).map((m) => monthKeyLabel(m.key));
-  const targetLabel = `Target Units (${targetDays} Days)`;
-  const exportRows = rows.map((row) => ({
-    "Product Name": row.productName || "",
-    ASIN: row.asin || "",
-    SKU: row.sku || "",
-    Brand: row.brand || "",
-    [monthLabels[0] || "Month 1"]: Math.round(row.m1),
-    [monthLabels[1] || "Month 2"]: Math.round(row.m2),
-    [monthLabels[2] || "Month 3"]: Math.round(row.m3),
-    "MTD Units": Math.round(row.mtdUnits),
-    "3M Avg": Math.round(row.threeMoAvg),
-    "MTD Projected": Math.round(row.mtdProjected),
-    [targetLabel]: Math.round(row.targetUnits),
-    "FBA Available": row.fbaAvailable === null ? "" : Math.round(row.fbaAvailable),
-    "FBA Days Cover (MTD DRR)": row.fbaDaysCover === null ? "" : Math.round(row.fbaDaysCover),
-    Reserved: row.reserved === null ? "" : Math.round(row.reserved),
-    "In Transit": row.inTransit === null ? "" : Math.round(row.inTransit),
-    ...(meta.isUS ? { "AWD Available": row.awd === null ? "" : Math.round(row.awd) } : {}),
-    "Total FBA Inv.": row.coverage === null ? "" : Math.round(row.coverage),
-    "Recommended Shipment": row.recommended === null ? "" : Math.round(row.recommended),
-    "Stock Remark": row.remark || "",
-  }));
+// Per-column export value (raw number/string; null -> "" so a missing value is blank, never a fabricated 0). The
+// identity column expands to Product Name / ASIN / SKU / Brand; every other column mirrors exactly what the table
+// shows, from the SAME canonical model. Keyed by column id so the export can never diverge from the visible columns.
+const expNum = (v) => (v == null || !Number.isFinite(Number(v)) ? "" : Math.round(Number(v)));
+const PLAN_EXPORT_VALUES = {
+  m1: (r) => expNum(r.monthsDisplay?.[0]), m2: (r) => expNum(r.monthsDisplay?.[1]), m3: (r) => expNum(r.monthsDisplay?.[2]),
+  mtdUnits: (r) => expNum(r.mtdUnits), threeMoAvg: (r) => expNum(r.planning?.threeMonthAverage), mtdProjected: (r) => expNum(r.planning?.mtdProjectedUnits),
+  targetUnits: (r) => expNum(r.targetUnits), fbaAvailable: (r) => expNum(r.fbaAvailable), fbaDaysCover: (r) => expNum(r.fbaDaysCover),
+  custReserved: (r) => expNum(r.planning?.customerOrderReserved), reserved: (r) => expNum(r.reserved), inboundPipeline: (r) => expNum(r.inboundPipeline),
+  awd: (r) => expNum(r.awd), awdInbound: (r) => expNum(r.awdInbound), totalFbaInv: (r) => expNum(r.totalFbaInv), amazonNetwork: (r) => expNum(r.amazonNetwork),
+  recommended: (r) => expNum(r.recommended), pipeline: (r) => expNum(r.planning?.amazonPipeline), horizon: (r) => horizonLabel(r.effectiveHorizon),
+  horizonDemand: (r) => expNum(r.planning?.horizonDemand), safety: (r) => expNum(r.planning?.safetyStockUnits), targetInv: (r) => expNum(r.planning?.targetInventory),
+  sellerWh: (r) => expNum(r.planning?.sellerWarehouseQty), shipWh: (r) => expNum(r.planning?.shipFromSellerWarehouse), produce: (r) => expNum(r.planning?.productionRequirement),
+  stockout: (r) => r.planning?.estimatedStockoutDate || "", priority: (r) => r.planning?.planningPriority || "", remark: (r) => r.remark || "",
+};
+
+// Export EXACTLY the currently-visible/authorized columns, in order, from the one canonical model.
+function downloadPlanSpreadsheet(visibleColumns, rows, meta) {
+  const exportRows = rows.map((row) => {
+    const rec = {};
+    for (const c of visibleColumns) {
+      if (c.id === "asin") { rec["Product Name"] = row.productName || ""; rec.ASIN = row.asin || ""; rec.SKU = row.sku || ""; rec.Brand = row.brand || ""; continue; }
+      const fn = PLAN_EXPORT_VALUES[c.id];
+      if (fn) rec[c.label] = fn(row);
+    }
+    return rec;
+  });
   if (exportRows.length === 0) return;
   const headers = Object.keys(exportRows[0]);
   const csv = "\uFEFF" + [headers, ...exportRows.map((row) => headers.map((header) => row[header]))]
@@ -2168,7 +2174,7 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planConfig]);
   const planWarehouseBySku = useMemo(() => {
     const m = new Map();
-    for (const w of planConfig?.warehouse || []) m.set(String(w.sku), { qty: Number(w.qty), marketplace: w.marketplace, note: w.note || "", updatedByEmail: w.updated_by_email || "" });
+    for (const w of planConfig?.warehouse || []) m.set(String(w.sku), { qty: Number(w.qty), marketplace: w.marketplace, childAsin: w.child_asin || "", note: w.note || "", updatedByEmail: w.updated_by_email || "" });
     return m;
   }, [planConfig]);
 
@@ -2638,7 +2644,7 @@ function DashboardApp({ session, access, onSignOut }) {
     const effectiveAsOf = planData.salesLatestDate || planData.asOf || null;
     const daysInCurrentMonth = planData.currentMonth?.daysInMonth || null;
     const awdSourceValidated = planData.isUS === true && planData.awdAvailable === true;
-    return planData.rows.map((r) => {
+    const built = planData.rows.map((r) => {
       const legacy = computePlanRow(r, planData, targetDays); // preserved existing columns (unchanged)
       const wh = r.sku ? planWarehouseBySku.get(String(r.sku)) : null;
       const { horizon: resolvedHorizon, source: horizonSource } = resolveHorizon({
@@ -2661,8 +2667,55 @@ function DashboardApp({ session, access, onSignOut }) {
       // Null-aware month values for DISPLAY (a genuinely absent month stays null -> em dash, never a coerced 0).
       const monthsDisplay = monthKeys.map((k) => { const v = r.unitsByMonth?.[k]; return v == null ? null : Number(v); });
       const skuHasOverride = !!(r.sku && planSkuOverrides.get(String(r.sku)));
-      return { ...legacy, planning, horizonSource, effectiveHorizon: resolvedHorizon, skuHasOverride, monthsDisplay, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null };
+      // ONE canonical inventory model for every display/total/export/plan number: derived from the engine, so the
+      // table, footer, export and planning can never disagree. Demand uses the corrected daily run rate; supply is
+      // the amazonNetworkPosition (FBA + distributable AWD; awd_inbound + customer-reserve excluded).
+      const amazonNetwork = planning.amazonNetworkPosition;
+      const targetUnits = planning.dailyRunRate == null ? null : Math.round(planning.dailyRunRate * (Number(targetDays) || 0));
+      const recommended = (amazonNetwork == null || targetUnits == null) ? null : Math.max(0, Math.ceil(targetUnits - amazonNetwork));
+      return {
+        ...legacy, planning, horizonSource, effectiveHorizon: resolvedHorizon, skuHasOverride, monthsDisplay,
+        reserved: planning.reservedFcTotal, inboundPipeline: planning.inboundPipeline,
+        awd: planning.awdAvailable, awdInbound: planning.awdInbound,
+        totalFbaInv: planning.totalFbaInventory, amazonNetwork,
+        targetUnits, recommended, remark: recommended == null ? null : recommended > 0 ? "Restock" : "OK",
+        rowKey: r.asin, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null,
+      };
     });
+
+    // Synthetic WAREHOUSE-ONLY rows: a SKU the seller saved a warehouse quantity for that the per-ASIN plan does not
+    // already show (its ASIN had zero sales + zero Amazon inventory, or it is a non-representative SKU). It appears
+    // with its Seller WH units + honest em dashes for every FBA/AWD/sales figure (inventory genuinely unavailable for
+    // it -> never a fabricated 0). This satisfies "a saved warehouse SKU must appear in the plan".
+    const seenSkus = new Set(built.map((r) => r.sku).filter(Boolean).map(String));
+    const synthetic = [];
+    for (const [sku, wh] of planWarehouseBySku) {
+      const key = String(sku);
+      if (seenSkus.has(key)) continue;
+      const { horizon: resolvedHorizon, source: horizonSource } = resolveHorizon({
+        skuOverride: planSkuOverrides.get(key) || null, accountDefault: planAccountSettings.horizon,
+      });
+      const planning = computePlanningRow({
+        isUS: planData.isUS === true, effectiveAsOf, daysInCurrentMonth, inventoryAvailable: false,
+        available: null, customerOrderReserved: null, reservedFcTransfer: null, reservedFcProcessing: null,
+        inboundWorking: null, inboundShipped: null, inboundReceived: null,
+        awdValidated: false, awdAvailable: null, awdInbound: null, sellerWarehouseQty: wh.qty,
+        monthlyValues: [null, null, null], mtdUnits: null, elapsedCompletedDays: planData.elapsedDays,
+        forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
+        horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
+      });
+      synthetic.push({
+        asin: wh.childAsin || "", rowKey: `wh:${key}`, warehouseOnly: true,
+        productName: "(warehouse-only SKU)", brand: null, sku: key,
+        monthsDisplay: [null, null, null], m1: null, m2: null, m3: null, mtdUnits: null,
+        threeMoAvg: null, mtdProjected: null, planningAvg: null, targetUnits: null,
+        fbaAvailable: null, mtdDrr: null, fbaDaysCover: null, invKnown: false, isUS: planData.isUS === true,
+        reserved: null, inboundPipeline: null, awd: null, awdInbound: null, totalFbaInv: null, amazonNetwork: null,
+        recommended: null, remark: null, planning, horizonSource, effectiveHorizon: resolvedHorizon,
+        skuHasOverride: !!planSkuOverrides.get(key), warehouse: wh, marketplace: wh.marketplace || planData.marketCountry || null,
+      });
+    }
+    return [...built, ...synthetic];
   }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku]);
 
   const planRows = useMemo(() => {
@@ -2673,23 +2726,24 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inTransit: 0, awd: 0, awdInbound: 0, coverage: 0, recommended: 0, restockCount: 0,
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inboundPipeline: 0, awd: 0, awdInbound: 0, totalFbaInv: 0, amazonNetwork: 0, recommended: 0, restockCount: 0,
       pipeline: 0, horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0 };
     let anyInv = false, anyAwd = false, anyAwdInbound = false;
     const add = (key, v) => { if (v != null && Number.isFinite(Number(v))) t[key] += Number(v); };
     planRows.forEach((r) => {
       t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
-      t.targetUnits += r.targetUnits;
+      add("targetUnits", r.targetUnits);
       if (r.fbaAvailable !== null) {
         anyInv = true;
         t.fbaAvailable += r.fbaAvailable;
         if (r.mtdDrr !== null) t.mtdDrr += r.mtdDrr;
-        t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage;
+        add("reserved", r.reserved); add("inboundPipeline", r.inboundPipeline);
+        add("totalFbaInv", r.totalFbaInv); add("amazonNetwork", r.amazonNetwork);
         add("custReserved", r.planning?.customerOrderReserved);
         add("pipeline", r.planning?.amazonPipeline);
       }
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
-      if (r.planning?.awdInbound != null) { anyAwdInbound = true; t.awdInbound += Number(r.planning.awdInbound); }
+      if (r.awdInbound != null) { anyAwdInbound = true; t.awdInbound += Number(r.awdInbound); }
       if (r.recommended !== null) t.recommended += r.recommended;
       if (r.remark === "Restock") t.restockCount += 1;
       // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total).
@@ -2712,7 +2766,7 @@ function DashboardApp({ session, access, onSignOut }) {
     const td = (key, val, cls = "mono") => <td key={key} className={cls}>{nInt(val)}</td>;
     return [
       { id: "asin", group: "Identity", label: "Product / ASIN", chooserLabel: "Product / ASIN", align: "left", sortKey: "asin", locked: true,
-        cell: (r) => (<td key="asin" className="pt-id"><div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div><div className="pt-meta mono">{r.asin}{r.sku ? ` · ${r.sku}` : ""}</div>{r.brand && <div className="pt-brand">{r.brand}</div>}</td>),
+        cell: (r) => (<td key="asin" className="pt-id"><div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div><div className="pt-meta mono">{r.asin || (r.warehouseOnly ? "warehouse only" : "")}{r.sku ? `${r.asin || r.warehouseOnly ? " · " : ""}${r.sku}` : ""}</div>{r.brand && <div className="pt-brand">{r.brand}</div>}</td>),
         foot: (t, rows) => <td key="asin" className="pt-id">Totals · {rows.length} ASIN{rows.length === 1 ? "" : "s"}</td> },
       { id: "m1", group: "Sales", label: mLabel(0), chooserLabel: "Month 1 units", sortKey: "m1", cell: (r) => td("m1", r.monthsDisplay?.[0]), foot: (t) => td("m1", t.m1) },
       { id: "m2", group: "Sales", label: mLabel(1), chooserLabel: "Month 2 units", sortKey: "m2", cell: (r) => td("m2", r.monthsDisplay?.[1]), foot: (t) => td("m2", t.m2) },
@@ -2720,16 +2774,17 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "mtdUnits", group: "Sales", label: "MTD", chooserLabel: "MTD units", sortKey: "mtdUnits", cell: (r) => td("mtdUnits", r.mtdUnits), foot: (t) => td("mtdUnits", t.mtdUnits) },
       { id: "threeMoAvg", group: "Forecast", label: "3M Avg", chooserLabel: "3-month average", sortKey: "threeMoAvg", cell: (r) => td("threeMoAvg", r.planning?.threeMonthAverage), foot: () => <td key="threeMoAvg" className="mono">—</td> },
       { id: "mtdProjected", group: "Forecast", label: "MTD Proj.", chooserLabel: "MTD projected", sortKey: "mtdProjected", cell: (r) => td("mtdProjected", r.planning?.mtdProjectedUnits), foot: () => <td key="mtdProjected" className="mono">—</td> },
-      { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong") },
+      { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", thTitle: "Corrected daily run rate (the account forecast method) × the target-days input. Unavailable (em dash) when the forecast can't be derived.", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong") },
       { id: "fbaAvailable", group: "Inventory", label: "FBA Avail", chooserLabel: "FBA available", sortKey: "fbaAvailable", cell: (r) => td("fbaAvailable", r.fbaAvailable), foot: (t) => <td key="fbaAvailable" className="mono">{t.anyInv ? nInt(t.fbaAvailable) : "—"}</td> },
       { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", cell: (r) => td("fbaDaysCover", r.fbaDaysCover), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
-      { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "Units reserved for customer orders (reserved_customer_order). DISPLAY ONLY — never counted as usable planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
-      { id: "reserved", group: "Inventory", label: "Reserved", chooserLabel: "Reserved (FC)", sortKey: "reserved", thTitle: "reserved_fc_transfer + reserved_fc_processing (raw, no subtraction). Customer-order reserve is a separate column.", cell: (r) => td("reserved", r.reserved), foot: (t) => <td key="reserved" className="mono">{t.anyInv ? nInt(t.reserved) : "—"}</td> },
-      { id: "inTransit", group: "Inventory", label: "In Transit", chooserLabel: "In transit", sortKey: "inTransit", cell: (r) => td("inTransit", r.inTransit), foot: (t) => <td key="inTransit" className="mono">{t.anyInv ? nInt(t.inTransit) : "—"}</td> },
-      { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available", sortKey: "awd", awd: true, cell: (r) => td("awd", r.awd), foot: (t) => <td key="awd" className="mono">{t.anyAwd ? nInt(t.awd) : "—"}</td> },
-      { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound", awd: true, thTitle: "AWD units inbound to Amazon (awd_total_inbound_quantity). US only.", cell: (r) => td("awdInbound", r.planning?.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
-      { id: "coverage", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory", sortKey: "coverage", cell: (r) => td("coverage", r.coverage), foot: (t) => <td key="coverage" className="mono">{t.anyInv ? nInt(t.coverage) : "—"}</td> },
-      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (legacy)", sortKey: "recommended", cell: (r) => td("recommended", r.recommended, "mono pt-strong"), foot: (t) => <td key="recommended" className="mono pt-strong">{t.anyInv ? nInt(t.recommended) : "—"}</td> },
+      { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "reserved_customer_order — units already allocated to placed customer orders. DISPLAY ONLY: already sold, never counted as usable/planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
+      { id: "reserved", group: "Inventory", label: "Reserved (FC)", chooserLabel: "Reserved (FC transfer + processing)", sortKey: "reserved", thTitle: "reserved_fc_transfer + reserved_fc_processing (raw, no subtraction) — in-FC, temporarily unavailable, becoming sellable. Distinct from Cust. Reserved.", cell: (r) => td("reserved", r.reserved), foot: (t) => <td key="reserved" className="mono">{t.anyInv ? nInt(t.reserved) : "—"}</td> },
+      { id: "inboundPipeline", group: "Inventory", label: "Inbound Pipeline", chooserLabel: "Inbound pipeline (working+shipped+received)", sortKey: "inboundPipeline", thTitle: "inbound_working + inbound_shipped + inbound_received — en route to the FBA network, not yet sellable.", cell: (r) => td("inboundPipeline", r.inboundPipeline), foot: (t) => <td key="inboundPipeline" className="mono">{t.anyInv ? nInt(t.inboundPipeline) : "—"}</td> },
+      { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available (distributable)", sortKey: "awd", awd: true, thTitle: "awd_available_distributable_quantity — distributable AWD stock; counts as usable replenishment supply. US only.", cell: (r) => td("awd", r.awd), foot: (t) => <td key="awd" className="mono">{t.anyAwd ? nInt(t.awd) : "—"}</td> },
+      { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound (not yet distributable)", awd: true, thTitle: "awd_total_inbound_quantity — inbound TO the AWD warehouse, NOT yet distributable. DISPLAY ONLY: excluded from usable supply. US only.", cell: (r) => td("awdInbound", r.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
+      { id: "totalFbaInv", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory (FBA only)", sortKey: "totalFbaInv", thTitle: "Sellable Now + Reserved (FC) + Inbound Pipeline. FBA network only — excludes AWD, seller warehouse and customer-order reserve.", cell: (r) => td("totalFbaInv", r.totalFbaInv), foot: (t) => <td key="totalFbaInv" className="mono">{t.anyInv ? nInt(t.totalFbaInv) : "—"}</td> },
+      { id: "amazonNetwork", group: "Inventory", label: "Amazon Network Pos.", chooserLabel: "Amazon network position (FBA + AWD avail)", sortKey: "amazonNetwork", thTitle: "Total FBA Inv. + AWD Available — all Amazon-held stock that is or will become sellable. This is the planning supply.", cell: (r) => td("amazonNetwork", r.amazonNetwork), foot: (t) => <td key="amazonNetwork" className="mono">{t.anyInv ? nInt(t.amazonNetwork) : "—"}</td> },
+      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (target-days)", sortKey: "recommended", thTitle: "ceil(Target Units − Amazon Network Position), floored at 0.", cell: (r) => td("recommended", r.recommended, "mono pt-strong"), foot: (t) => <td key="recommended" className="mono pt-strong">{t.anyInv ? nInt(t.recommended) : "—"}</td> },
       { id: "pipeline", group: "Planning", label: "Pipeline", chooserLabel: "Pipeline", thTitle: "In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)", cell: (r) => td("pipeline", r.planning?.amazonPipeline), foot: (t) => <td key="pipeline" className="mono">{t.anyInv ? nInt(t.pipeline) : "—"}</td> },
       { id: "horizon", group: "Planning", label: "Horizon", chooserLabel: "Planning horizon", thTitle: "Effective planning horizon (per-SKU override or account default). Click a SKU's value to override.", cell: (r) => <SkuHorizonCell key="horizon" row={r} onOpen={(row) => setSkuHorizonEdit({ sku: row.sku, asin: row.asin, effective: row.effectiveHorizon, source: row.horizonSource, hasOverride: row.skuHasOverride })} />, foot: () => <td key="horizon" className="mono">—</td> },
       { id: "horizonDemand", group: "Planning", label: "Horizon Demand", chooserLabel: "Horizon demand", thTitle: "Daily run rate × effective horizon days (calendar-aware from the effective-through date)", cell: (r) => td("horizonDemand", r.planning?.horizonDemand), foot: (t) => td("horizonDemand", t.horizonDemand) },
@@ -2756,7 +2811,16 @@ function DashboardApp({ session, access, onSignOut }) {
     return order.map((group) => ({ group, cols: byGroup.get(group) }));
   }, [planColumns]);
   // Every SKU that belongs to this account (for import isolation) + its representative child ASIN.
-  const planKnownSkus = useMemo(() => new Set((planComputed || []).map((r) => r.sku).filter(Boolean).map(String)), [planComputed]);
+  // Authorized SKU set for bulk-import isolation = the durable account SKU UNIVERSE (every SKU in any source, incl.
+  // multi-SKU ASINs + zero-activity SKUs the plan drops) UNION already-saved warehouse SKUs. Falls back to the visible
+  // plan-row SKUs when a pre-change snapshot has no accountSkus yet. Unknown / cross-account SKUs still fail closed.
+  const planKnownSkus = useMemo(() => {
+    const s = new Set();
+    for (const sku of Array.isArray(planData?.accountSkus) ? planData.accountSkus : []) if (sku) s.add(String(sku));
+    for (const r of planComputed || []) if (r.sku && !r.warehouseOnly) s.add(String(r.sku));
+    for (const sku of planWarehouseBySku.keys()) s.add(String(sku));
+    return s;
+  }, [planData, planComputed, planWarehouseBySku]);
   const planSkuAsinMap = useMemo(() => { const m = new Map(); for (const r of planComputed || []) if (r.sku && !m.has(String(r.sku))) m.set(String(r.sku), r.asin || ""); return m; }, [planComputed]);
   const [planColsOpen, setPlanColsOpen] = useState(false);
 
@@ -4036,7 +4100,7 @@ function DashboardApp({ session, access, onSignOut }) {
             className="plan-export-btn"
             type="button"
             disabled={!planData || planRows.length === 0}
-            onClick={() => downloadPlanSpreadsheet(planRows, planData, targetDays || 30)}
+            onClick={() => downloadPlanSpreadsheet(planVisibleColumns, planRows, planData)}
           >
             <Download size={15} />
             Download Excel
@@ -4068,7 +4132,7 @@ function DashboardApp({ session, access, onSignOut }) {
               <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.restockCount.toLocaleString("en-US")}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Total FBA Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Total FBA Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"}</div></div>
             </div>
           </>
         )}
@@ -4081,14 +4145,14 @@ function DashboardApp({ session, access, onSignOut }) {
                   <tr>
                     {planVisibleColumns.map((c) => (
                       c.sortKey
-                        ? <PlanTh key={c.id} className={c.id === "asin" ? "pt-id" : ""} label={c.label} col={c.sortKey} sort={planSort} onSort={setPlanSortKey} align={c.align || "right"} />
+                        ? <PlanTh key={c.id} className={c.id === "asin" ? "pt-id" : ""} label={c.label} col={c.sortKey} sort={planSort} onSort={setPlanSortKey} align={c.align || "right"} title={c.thTitle} />
                         : <th key={c.id} title={c.thTitle || undefined} style={c.align === "left" ? { textAlign: "left" } : undefined}>{c.label}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {planRows.map((r) => (
-                    <tr key={r.asin} className={r.remark === "Restock" ? "plan-restock" : ""}>
+                    <tr key={r.rowKey || r.asin} className={(r.remark === "Restock" ? "plan-restock" : "") + (r.warehouseOnly ? " plan-wh-only" : "")}>
                       {planVisibleColumns.map((c) => c.cell(r))}
                     </tr>
                   ))}
@@ -4119,9 +4183,9 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className="footer-note">
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date. A genuinely missing month shows an em dash — never a fabricated 0 — so the 3-month average is only shown when all three completed months have proven data.
-          Live FBA stock comes from <code>FBA Inventory Health</code>: FBA Available = <code>available</code>; Reserved = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> shown RAW (no subtraction — the authoritative source metadata proves the reserved FC-transfer state and the inbound states are distinct, so nothing is netted off); Cust. Reserved = <code>reserved_customer_order</code>, shown for reference and never counted as usable stock; In Transit = <code>inbound_shipped</code> + <code>inbound_received</code> (working excluded).
-          {planData?.isUS ? <> AWD Available = <code>awd_available_distributable_quantity</code> and AWD Inbound = <code>awd_total_inbound_quantity</code> from <code>Listings</code> (US only); AWD Available is added to coverage.</> : <> AWD does not apply to non-US accounts and its columns are hidden (never shown as 0).</>}
-          {" "}Planning Avg = max(3-month avg, MTD projected). Target Units is the number of units needed for the entered coverage days. Total FBA Inv. = FBA Available + Reserved + In Transit{planData?.isUS ? " + AWD Available" : ""}. Seller WH holds your OWN uncommitted warehouse units (edit inline or bulk-import); it is never Amazon inventory and never units already counted in inbound working. FBA Days (MTD DRR) = FBA Available divided by MTD daily run rate; it excludes reserved, inbound, and AWD stock. Recommended Shipment = ceil(Target Units − Total FBA Inv.), floored at 0. Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+          One canonical, non-overlapping inventory model drives every number here (table, totals, export and planning agree). From <code>FBA Inventory Health</code>, each unit is in exactly one bucket: <strong>FBA Available</strong> = <code>available</code> (sellable now); <strong>Reserved (FC)</strong> = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> shown RAW (no subtraction — the reserved FC states and the inbound states are distinct buckets, proven by the source metadata); <strong>Inbound Pipeline</strong> = <code>inbound_working</code> + <code>inbound_shipped</code> + <code>inbound_received</code>. <strong>Cust. Reserved</strong> = <code>reserved_customer_order</code> is already-sold stock, shown for reference and never counted as usable supply.
+          {planData?.isUS ? <> <strong>AWD Available</strong> = <code>awd_available_distributable_quantity</code> is distributable and counts as usable supply; <strong>AWD Inbound</strong> = <code>awd_total_inbound_quantity</code> is inbound to the AWD warehouse, not yet distributable, so it is display-only (US only).</> : <> AWD does not apply to non-US accounts and its columns are hidden (never shown as 0).</>}
+          {" "}<strong>Total FBA Inv.</strong> = FBA Available + Reserved (FC) + Inbound Pipeline (FBA network only — no AWD, no seller warehouse). <strong>Amazon Network Pos.</strong> = Total FBA Inv.{planData?.isUS ? " + AWD Available" : ""} and is the planning supply. <strong>Seller WH</strong> holds your OWN uncommitted warehouse units (edit inline or bulk-import); never Amazon inventory and never units already in inbound working. Target Units = the corrected daily run rate × the entered coverage days; Recommend = ceil(Target Units − Amazon Network Pos.), floored at 0. FBA Days (MTD DRR) = FBA Available ÷ MTD daily run rate (excludes reserved, inbound and AWD). Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
         {skuHorizonEdit && (
           <SkuHorizonEditor target={skuHorizonEdit} accountDefault={planAccountSettings.horizon} busy={planConfigBusy}
@@ -4609,13 +4673,13 @@ function SkuKpi({ label, value, tone }) {
 }
 
 // Sortable header cell for the plan table.
-function PlanTh({ label, col, sort, onSort, align = "right", className = "" }) {
+function PlanTh({ label, col, sort, onSort, align = "right", className = "", title = "" }) {
   const active = sort.key === col;
   return (
     <th
       className={`${className} ${align === "left" ? "pt-left" : ""} pt-sortable ${active ? "pt-sorted" : ""}`}
       onClick={() => onSort(col)}
-      title="Click to sort"
+      title={title ? `${title}\n(Click to sort)` : "Click to sort"}
     >
       <span className="pt-th-inner">
         {label}

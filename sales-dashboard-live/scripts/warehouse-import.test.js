@@ -101,6 +101,20 @@ test("isolation: with no knownSkus supplied, SKU membership is NOT enforced (any
   assert.equal(r.valid.length, 1);
 });
 
+test("Phase 3: a WAREHOUSE-ONLY / zero-activity account SKU (in the durable SKU universe) imports; a cross-account SKU fails closed", () => {
+  // The authorized set is the durable account SKU universe (every SKU in any source, incl. SKUs the per-ASIN plan
+  // drops) UNION already-saved warehouse SKUs -- NOT just the visible plan rows. So a warehouse-only catalog SKU with
+  // zero sales + zero Amazon inventory is importable, while a SKU from another account is rejected.
+  const authorized = new Set(["ACTIVE-1", "WH-ONLY-2", "ZERO-ACTIVITY-3"]); // account universe incl. dropped-row SKUs
+  const csv = "SKU,Marketplace,Warehouse Units\nWH-ONLY-2,US,120\nZERO-ACTIVITY-3,US,0\nOTHER-ACCT-9,US,50";
+  const r = validateWarehouseImport(csv, { knownSkus: authorized });
+  assert.equal(r.valid.length, 2, "warehouse-only + zero-activity account SKUs import");
+  assert.deepEqual(r.valid.map((v) => v.sku).sort(), ["WH-ONLY-2", "ZERO-ACTIVITY-3"]);
+  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors[0].sku, "OTHER-ACCT-9");
+  assert.match(r.errors[0].problems[0], /not in this account/);
+});
+
 /* ===== pre-parsed rows path (shared by the XLSX reader) ===== */
 test("validateWarehouseRows: XLSX-shaped string[][] validates identically to CSV", () => {
   const rows = [["SKU", "Marketplace", "Warehouse Units"], ["A-1", "US", "7"], ["A-1", "US", "8"]];
