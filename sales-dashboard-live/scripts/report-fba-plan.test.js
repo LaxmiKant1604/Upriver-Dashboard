@@ -221,6 +221,27 @@ test("fba-plan: accountSkus is the FULL SKU universe -- includes multi-SKU ASINs
   assert.equal(p.catalogByAsin.ASIN9, undefined, "ASIN9 absent from the catalog -> not a valid manual-SKU ASIN");
 });
 
+test("fba-plan: a SKU mapped to CONFLICTING child ASINs across sources BLOCKS the snapshot (last-known-good preserved)", () => {
+  // Inventory says SKU-1 -> ASIN1; AWD says SKU-1 -> ASIN2. Two different nonblank ASINs for one SKU is unresolvable
+  // identity -> a typed account-level derive refusal (never a silent inventory>AWD>sales priority pick).
+  const inv = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 5 }];
+  const awd = [{ marketplace_country_code: "US", child_asin: "ASIN2", sku: "SKU-1", awd_available_distributable_quantity: 3 }];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: awd });
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "invalid");
+  assert.equal(res.payload, null, "conflicting identity -> no snapshot; last-known-good preserved");
+});
+
+test("fba-plan: IDENTICAL child ASINs across sources are NOT a conflict (derives cleanly)", () => {
+  const inv = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 5 }];
+  const awd = [{ marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 3 }];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: awd });
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "derived");
+  const e = res.payload.accountSkuDirectory.find((x) => x.sku === "SKU-1");
+  assert.equal(e.childAsin, "ASIN1", "one agreed ASIN; no conflict");
+});
+
 test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {
   // The authoritative source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a
   // SEPARATE reserved state) proves the two do NOT overlap, so reserved_fc_transfer is returned in full.

@@ -3599,6 +3599,7 @@ async function handleDataDoe(req, res) {
       // the per-ASIN rows show, so a dropped/warehouse-only SKU keeps its identity + canonical brand. Priority (first
       // writer sets provenance): inventory > AWD > sales. A SKU maps to exactly one child ASIN.
       const skuDir = new Map();
+      const skuAsinConflicts = new Map(); // sku -> {a, b}  (two DIFFERENT nonblank ASINs for one SKU)
       const putSku = (sku, asin, marketplace, provenance, invName) => {
         const s = String(sku || "").trim();
         if (!s) return;
@@ -3606,6 +3607,8 @@ async function handleDataDoe(req, res) {
         const mkt = String(marketplace || "").trim().toUpperCase() || null;
         let e = skuDir.get(s);
         if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
+        // Two DIFFERENT nonblank child ASINs for one SKU is an unresolvable identity error (never a silent pick).
+        if (e.childAsin && a && a !== e.childAsin) { if (!skuAsinConflicts.has(s)) skuAsinConflicts.set(s, { a: e.childAsin, b: a }); }
         if (!e.childAsin && a) e.childAsin = a;
         if (!e.marketplace && mkt) e.marketplace = mkt;
         const ca = e.childAsin;
@@ -3617,6 +3620,12 @@ async function handleDataDoe(req, res) {
       for (const r of invRows) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || account?.country, "inventory", String(r.product_name || "").trim() || null); }
       for (const r of awdRows) { const mkt = String(r.marketplace_country_code || "").trim().toUpperCase(); if (mkt && mkt !== "US") continue; putSku(r.sku, r.child_asin, "US", "awd", null); }
       for (const r of oliSalesRows) putSku(r?.sku, r?.child_asin, account?.country, "sales", null);
+      if (skuAsinConflicts.size > 0) {
+        const [conflictSku, c] = [...skuAsinConflicts.entries()][0];
+        const err = new Error(`fba-plan: SKU ${conflictSku} maps to conflicting child ASINs (${c.a} vs ${c.b}) across sources; snapshot blocked (last-known-good preserved).`);
+        err.code = "FBA_PLAN_SKU_ASIN_CONFLICT";
+        throw err;
+      }
       const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
 
       // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU

@@ -6,9 +6,10 @@ export const UNMAPPED_BRAND = "Unmapped";
 
 // keyFn is the shared canonical brand-key (App.jsx#brandKey, mirroring lib/server/reports/brand-membership.js#brandKey).
 export function matchesPlanBrand(rowBrand, selectedBrand, keyFn) {
-  if (selectedBrand == null || selectedBrand === "ALL") return true;
+  if (selectedBrand === "ALL") return true; // the ONLY all-row selection
+  if (selectedBrand == null) return true;   // no explicit brand chosen (initial state) == All
   if (selectedBrand === UNMAPPED_BRAND) return !rowBrand; // only rows WITHOUT a proven brand
   const want = keyFn(selectedBrand);
-  if (want == null) return true; // a blank named brand degrades to All rather than hiding everything
-  return keyFn(rowBrand) === want; // exact canonical match; no fallback to All
+  if (want == null) return false; // a blank/invalid named brand shows NO rows -- it must NEVER fall back to All Brands
+  return keyFn(rowBrand) === want; // exact canonical match; punctuation significant; no fallback to All
 }

@@ -40,8 +40,13 @@ test("Unmapped shows ONLY rows with no proven brand; a proven brand never appear
   assert.equal(m("Acme", UNMAPPED_BRAND), false, "a catalog-proven brand is never Unmapped");
 });
 
-test("a blank named brand degrades to All rather than hiding everything", () => {
-  assert.equal(m("Acme", "   "), true);
+test("STRICT: a blank/invalid named-brand key returns NO rows and never falls back to All", () => {
+  assert.equal(m("Acme", "   "), false, "whitespace-only named brand -> no rows");
+  assert.equal(m("Acme", ""), false, "empty named brand -> no rows");
+  assert.equal(m(null, "   "), false);
+  // A truly-absent selection (null/undefined) is the initial state and equals All, not a blank named brand.
+  assert.equal(m("Acme", null), true);
+  assert.equal(m("Acme", undefined), true);
 });
 
 let failures = 0;
