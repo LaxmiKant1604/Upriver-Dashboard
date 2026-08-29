@@ -13018,3 +13018,46 @@ scheduler covers pending-unit population automatically, and every other acceptan
 
 REMAINING EXTERNAL: the 8-account dimensional-vs-daily gap is pre-existing and orthogonal; pending-unit LIVE evidence
 arrives on the next scheduled sync (no action needed).
+
+## Brand View + SKU Movement -- Royal Violet redesign + amount/percentage separation (2026-08-29, code 2fa3b66)
+
+PRESENTATIONAL redesign of ONLY Brand View and SKU Movement to the supplied Figma. No data / calculation / view-model
+/ scheduler / sync / persistence / API / migration / DataDoe change. Sidebar (shell.jsx), top bar, Dashboard,
+Daily Reporting and every other route are byte-identical. Files changed: src/views/BrandReports.jsx,
+src/views/SkuMovement.jsx, src/components/ui.jsx (additive GradientKpi + MoneyShare), src/styles/theme.js (additive
++ scoped classes; the one edit to an EXISTING rule was removing `.bv-table th` from a late `background:#FAF9FF`
+override so the new deep-violet header wins -- `.bv-table` is used ONLY by Brand View), package.json + scripts/verify.mjs
+(register the new suite), scripts/brand-view-render.test.js (new).
+
+ROOT CAUSE of the Brand View mixed amount/percent display ("EUR806 + 8.5%" concatenated): it was a RENDER/view-model
+SEPARATION issue, never a data bug. The view-model (brand-view-tables.js) already keeps the currency amount in
+`cell.t` and the contribution share in `subcells[i]` -- it NEVER concatenates. The old cell render placed the share
+in an inline `<small>`; the redesign replaces that with a dedicated `MoneyShare` presenter that renders the amount
+(`.cell-amt`, primary) and the share (`.cell-share`, its own smaller second line, sr-only labelled) as TWO SEPARATE
+DOM elements, so a single mixed string is structurally impossible. Currency formatter and percent formatter are never
+mixed; a missing share is never fabricated (a single-marketplace group shows no share, an em dash for an unavailable
+amount); EUR and GBP stay separate currency groups (no cross-currency total); TACoS stays a percent field and Ad Spend
+a currency field; the 7-day table shows percents only in TACoS rows.
+
+DESIGN: reuses the Dashboard/Daily-Reporting Royal Violet system -- gradient KPI tiles (coral/violet/emerald/amber via
+the shared new GradientKpi), deep-violet table headers, coral "current/latest" emphasis, Outfit/Plus-Jakarta type,
+Lucide icons. SKU Movement: gradient KPIs (coral MTD, violet Last-5, tinted Movement), deep-violet header, coral MTD
+column + violet Last-5 column, red/green Movement% pills (sign kept in the text -- never colour alone). It REUSES the
+shared plan-table layout and recolours ONLY under a new `.sku-mv` class, so the 7 other plan-table reports are
+untouched. Existing behaviour retained verbatim: CSV export + "Download Excel" label (not changed to real XLSX),
+search, sort, movement filter, paging, read-only Reload, and the provisional / observed-unit-breakdown evidence.
+
+TESTS: scripts/brand-view-render.test.js (12 cases). Layer 1 (pure): buildBrandTables never puts a currency+percent
+concat in any cell.t; the share lives only in subcells; EUR/GBP separate; TACoS percent vs Ad Spend currency; zero is
+honest; missing is an em dash. Layer 2 (rendered): esbuild bundles the REAL components + react-dom/server renders
+MoneyShare / GradientKpi / BrandReports / SkuMovement, asserting the amount and share are two separate elements, NO
+rendered cell matches the malformed concat regex `/[currency][digits]%/`, gradient KPIs + deep-violet tables + coral
+MTD / violet Last-5 columns + move badges render, and the provisional evidence + export label are preserved. Full
+`npm run verify` 86/86 steps (66 suites incl. build) green; `git diff --check` clean.
+
+RESPONSIVE: verified with headless-Chrome screenshots at 1440 / 1280 / 768 / 390 -- KPI grids reflow (4->2, 5->3->2),
+tables scroll inside their own containers, no whole-page horizontal overflow, amount/percent stay stacked and readable,
+badges intact, fonts do not scale with viewport. The temporary preview harness (preview.html + src/__preview__) used
+for the screenshots was DELETED before commit; it never ships.
+
+STATUS: code+tests committed on main (2fa3b66). Push + Vercel deploy + prod read-backs pending.
