@@ -657,12 +657,16 @@ export function fbaPlanPayload({
     ? Number(String(salesLatestDate).slice(8, 10))
     : 0;
 
-  // 3) Catalog brand + product name (first non-empty per ASIN).
+  // 3) Catalog brand + product name (first non-empty per ASIN). The Product Catalog is ORG-WIDE: it enriches an ASIN
+  //    with brand/name and proves an ASIN EXISTS, but it never proves a SKU belongs to THIS account (that comes from
+  //    the account-scoped inventory/sales/AWD sources below).
   const brandByAsin = new Map();
   const nameByAsin = new Map();
+  const catalogAsinSet = new Set();
   for (const c of catalogRows || []) {
     const asin = String(c.child_asin || "").trim();
     if (!asin) continue;
+    catalogAsinSet.add(asin);
     const brand = String(c.product_brand || "").trim();
     if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
     const name = String(c.product_name || "").trim();
@@ -729,14 +733,35 @@ export function fbaPlanPayload({
     }
   }
 
-  // 5b) The durable ACCOUNT SKU UNIVERSE -- every SKU seen in ANY source (inventory, AWD, sales). This is a SUPERSET of
-  //     the representative SKUs shown in the per-ASIN rows, so seller-warehouse management + bulk-import validation can
-  //     cover SKUs the plan drops (a non-representative SKU on a multi-SKU ASIN, or a SKU whose ASIN has zero sales AND
-  //     zero Amazon inventory). Used only as an authorization allowlist; never fabricates a plan number.
-  const accountSkuSet = new Set();
-  for (const set of Object.values(skusByAsin)) for (const s of set) accountSkuSet.add(s);
-  for (const arr of completedUnitRows || []) for (const r of arr || []) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
-  for (const r of mtdUnitRows || []) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
+  // 5b) The durable ACCOUNT SKU DIRECTORY -- one entry per SKU proven in an ACCOUNT-scoped source (inventory, AWD,
+  //     sales), enriched with the org-wide Product Catalog's ASIN -> brand/name. A SUPERSET of the representative SKUs
+  //     the per-ASIN rows show, so seller-warehouse management + bulk-import validation cover SKUs the plan drops (a
+  //     non-representative SKU on a multi-SKU ASIN, or a SKU whose ASIN has zero sales AND zero Amazon inventory).
+  //     Each entry carries its childAsin/productName/brand/marketplace + the SOURCE that proved it (provenance), so a
+  //     dropped or warehouse-only SKU keeps its identity + canonical brand. Used as an authorization allowlist + an
+  //     identity map; never fabricates a plan number. A SKU maps to exactly one child ASIN.
+  const skuDir = new Map();
+  const putSku = (sku, asin, marketplace, provenance, invName) => {
+    const s = String(sku || "").trim();
+    if (!s) return;
+    const a = String(asin || "").trim() || null;
+    const mkt = String(marketplace || "").trim().toUpperCase() || null;
+    let e = skuDir.get(s);
+    if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
+    if (!e.childAsin && a) e.childAsin = a;
+    if (!e.marketplace && mkt) e.marketplace = mkt;
+    const ca = e.childAsin;
+    if (ca) {
+      if (!e.brand) e.brand = brandByAsin.get(ca) || null;
+      if (!e.productName) e.productName = nameByAsin.get(ca) || invName || invProductName.get(ca) || null;
+    } else if (!e.productName && invName) { e.productName = invName; }
+  };
+  // Priority (first writer sets provenance): inventory > AWD > sales.
+  for (const r of invRows || []) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || marketCountry, "inventory", String(r.product_name || "").trim() || null); }
+  if (isUS) for (const r of awdRows || []) { const mkt = String(r.marketplace_country_code || "").trim().toUpperCase(); if (mkt && mkt !== "US") continue; putSku(r.sku, r.child_asin, "US", "awd", null); }
+  for (const arr of completedUnitRows || []) for (const r of arr || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
+  for (const r of mtdUnitRows || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
+  const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
 
   // 6) Assemble one row per ASIN (representative SKU = first localeCompare SKU; drop zero-activity).
   const rows = [];
@@ -797,7 +822,11 @@ export function fbaPlanPayload({
     inventoryAvailable,
     awdAvailable,
     rows,
-    accountSkus: [...accountSkuSet].sort((a, b) => a.localeCompare(b)),
+    accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
+    accountSkuDirectory,
+    // Org-wide Product Catalog ASIN -> brand/name. ENRICHES manual/warehouse SKUs + proves an ASIN exists; it does NOT
+    // prove account membership (that is the account-scoped directory above).
+    catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
     inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
       ...entry,
       skuCount: skus.size,

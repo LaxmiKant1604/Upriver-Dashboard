@@ -466,9 +466,12 @@ const REGISTRY = {
   // -> derive-invalid -> last-known-good preserved) so it can never silently become zero, while a
   // VALIDATED empty AWD source is honored as "no AWD rows". Non-US never plans or reads AWD.
   "fba-plan": {
-    // v2d-4: adds reserved_customer_order (display-only) + awd_total_inbound_quantity (US) and stores reserved_fc_transfer
-    // RAW (the unproven inbound-shipped subtraction was removed). The LIVE served identity (fba-plan-shared-v1) is unchanged.
-    snapshotVersion: "fba-plan/v2d-4", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
+    // v2d-5: adds accountSkuDirectory (durable per-SKU identity: childAsin/productName/brand/marketplace/provenance)
+    // + catalogByAsin (ASIN -> brand/name enrichment + existence proof). v2d-4 added reserved_customer_order +
+    // awd_total_inbound_quantity and stores reserved_fc_transfer RAW (the unproven subtraction was removed). The LIVE
+    // served identity (fba-plan-shared-v1) is unchanged; the frontend reads accountSkuDirectory when present and falls
+    // back to the string-only accountSkus for older snapshots.
+    snapshotVersion: "fba-plan/v2d-5", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {

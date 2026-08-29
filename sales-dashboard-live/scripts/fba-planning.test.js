@@ -249,6 +249,28 @@ test("AWD inbound is folded US-only when validated; Non-US and unvalidated stay 
   assert.equal(nonUs.awdAvailable, null);
 });
 
+test("seller warehouse is counted EXACTLY ONCE (ship-from-WH + production) and never in FBA/AWD/Amazon totals", () => {
+  const r = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, reservedFcProcessing: 3, inboundShipped: 2, sellerWarehouseQty: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 });
+  // Seller WH is NOT part of the Amazon-side inventory/network figures.
+  assert.equal(r.totalFbaInventory, 10 + 3 + 2, "FBA inventory excludes seller WH (and AWD)");
+  assert.equal(r.amazonNetworkPosition, 10 + 3 + 2 + 5, "Amazon network = FBA + AWD available; no seller WH");
+  // It appears ONCE in the total NETWORK position (Amazon network + seller WH).
+  assert.equal(r.totalNetworkPosition, r.amazonNetworkPosition + 100);
+  // The shortage after the Amazon network is covered by WH first, then production -- WH counted once across the split.
+  assert.equal(r.shipFromSellerWarehouse + r.productionRequirement, r.shortageBeforeWarehouse, "ship-from-WH + production == shortage");
+  assert.ok(r.shipFromSellerWarehouse <= 100, "cannot ship more than the warehouse holds");
+});
+
+test("changing ONLY the seller warehouse quantity never changes any FBA/AWD/Amazon inventory figure", () => {
+  const base = { isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, reservedFcProcessing: 3, inboundShipped: 2, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 };
+  const a = computePlanRow({ ...base, sellerWarehouseQty: 0 });
+  const b = computePlanRow({ ...base, sellerWarehouseQty: 999 });
+  for (const k of ["immediatelyAvailable", "amazonPipeline", "totalFbaInventory", "awdAvailable", "awdInbound", "amazonNetworkPosition"]) {
+    assert.equal(a[k], b[k], `seller WH must not change ${k}`);
+  }
+  assert.notEqual(a.totalNetworkPosition, b.totalNetworkPosition, "only the network position (which includes WH) moves");
+});
+
 let failures = 0;
 for (const t of tests) {
   try { t.fn(); passed += 1; out("  ok  " + t.name); }

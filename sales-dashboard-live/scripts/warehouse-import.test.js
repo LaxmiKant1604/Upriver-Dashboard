@@ -9,6 +9,13 @@ import {
   parseDelimited, mapHeader, validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS,
 } from "../src/lib/warehouse-import.js";
 
+// A small account SKU DIRECTORY + catalog ASIN set for the directory-based tests.
+const DIR = [
+  { sku: "EXIST-1", childAsin: "ASIN1", brand: "Acme", marketplace: "US" },
+  { sku: "EXIST-2", childAsin: "ASIN2", brand: "Beta", marketplace: "US" },
+];
+const CAT_ASINS = new Set(["ASIN1", "ASIN2", "ASIN3"]); // ASIN3 is a catalog ASIN with no current account SKU
+
 let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 const tests = [];
@@ -146,6 +153,48 @@ test("template: header matches the canonical columns + carries the account marke
   const r = validateWarehouseImport(csv, { knownSkus: new Set(["A-1"]) });
   assert.equal(r.errors.length, 0);
   assert.equal(r.valid[0].qty, 0);
+});
+
+/* ===== directory-based identity + isolation (Phase 3) ===== */
+test("directory: a KNOWN SKU may omit Child ASIN (resolved from the directory); provenance=existing", () => {
+  const r = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units"], ["EXIST-1", "US", "10"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(r.valid.length, 1);
+  assert.equal(r.valid[0].childAsin, "ASIN1", "resolved from directory");
+  assert.equal(r.valid[0].provenance, "existing");
+});
+
+test("directory: a NEW MANUAL SKU requires a Child ASIN, which must exist in the catalog; provenance=manual", () => {
+  // No child ASIN -> rejected.
+  const noAsin = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units"], ["NEW-9", "US", "5"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(noAsin.valid.length, 0);
+  assert.match(noAsin.errors[0].problems[0], /new SKU requires a Child ASIN/);
+  // Child ASIN present + in catalog -> valid, manual provenance.
+  const ok = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units", "Child ASIN"], ["NEW-9", "US", "5", "ASIN3"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(ok.valid.length, 1);
+  assert.equal(ok.valid[0].childAsin, "ASIN3");
+  assert.equal(ok.valid[0].provenance, "manual");
+  // Child ASIN present but NOT in catalog -> rejected (zero writes).
+  const bad = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units", "Child ASIN"], ["NEW-9", "US", "5", "ASIN-NOPE"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(bad.valid.length, 0);
+  assert.match(bad.errors[0].problems[0], /not in this account's catalog/);
+});
+
+test("directory: a CONFLICTING SKU -> ASIN mapping is rejected", () => {
+  const r = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units", "Child ASIN"], ["EXIST-1", "US", "5", "ASIN2"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(r.valid.length, 0);
+  assert.match(r.errors[0].problems[0], /SKU maps to ASIN1, not ASIN2/);
+});
+
+test("directory: a cross-account SKU (not in directory) with a non-catalog ASIN fails closed", () => {
+  const r = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units", "Child ASIN"], ["OTHER-ACCT", "US", "5", "ASIN-OTHER"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(r.valid.length, 0);
+  assert.match(r.errors[0].problems[0], /not in this account's catalog/);
+});
+
+test("directory: existing SKU with the CORRECT explicit ASIN is fine; duplicates still caught", () => {
+  const r = validateWarehouseRows([["SKU", "Marketplace", "Warehouse Units", "Child ASIN"], ["EXIST-2", "US", "3", "ASIN2"], ["EXIST-2", "US", "9", "ASIN2"]], { directory: DIR, catalogAsins: CAT_ASINS });
+  assert.equal(r.valid.length, 1, "first ok, second is a duplicate");
+  assert.equal(r.duplicates.length, 1);
 });
 
 let failures = 0;

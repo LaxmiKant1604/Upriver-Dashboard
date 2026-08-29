@@ -172,6 +172,8 @@ const EXPECTED = {
     { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, customerOrderReserved: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0, awdInbound: 0 },
   ],
   accountSkus: ["SKU-1"],
+  accountSkuDirectory: [{ sku: "SKU-1", childAsin: "ASIN1", productName: "Widget", brand: "Acme", marketplace: "US", provenance: "inventory" }],
+  catalogByAsin: { ASIN1: { brand: "Acme", productName: "Widget" }, ASIN2: { brand: "Beta", productName: "Gadget" } },
   inventoryByBrandCountry: [{ country: "US", brand: "Acme", fbaAvailable: 100, skuCount: 1 }],
 };
 
@@ -207,6 +209,16 @@ test("fba-plan: accountSkus is the FULL SKU universe -- includes multi-SKU ASINs
   assert.equal(p.rows.find((r) => r.asin === "ASIN9"), undefined, "zero-activity ASIN dropped from rows");
   // ...but every SKU seen in the sources is in the account SKU universe, so warehouse import can authorize it.
   assert.deepEqual(p.accountSkus, ["SKU-A", "SKU-B", "SKU-ZERO"], "sorted union incl. non-representative + dropped-ASIN SKUs");
+  // The DIRECTORY keeps each SKU's identity even when its ASIN is dropped or it is a non-representative SKU.
+  const bySku = Object.fromEntries(p.accountSkuDirectory.map((e) => [e.sku, e]));
+  assert.equal(bySku["SKU-B"].childAsin, "ASIN1"); // non-representative SKU keeps its ASIN
+  assert.equal(bySku["SKU-B"].brand, "Acme", "catalog-proven brand retained for a non-representative SKU");
+  assert.equal(bySku["SKU-ZERO"].childAsin, "ASIN9"); // dropped-ASIN SKU keeps its ASIN
+  assert.equal(bySku["SKU-ZERO"].brand, null, "ASIN not in catalog -> Unmapped (brand null), never another brand");
+  assert.equal(bySku["SKU-A"].provenance, "inventory");
+  // catalogByAsin proves ASIN existence (for manual-SKU import validation) + enriches brand/name.
+  assert.equal(p.catalogByAsin.ASIN1.brand, "Acme");
+  assert.equal(p.catalogByAsin.ASIN9, undefined, "ASIN9 absent from the catalog -> not a valid manual-SKU ASIN");
 });
 
 test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {

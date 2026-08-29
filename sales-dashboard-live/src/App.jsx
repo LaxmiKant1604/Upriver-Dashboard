@@ -27,6 +27,7 @@ import {
   DEFAULT_FORECAST_METHOD, DEFAULT_SAFETY_DAYS, SYSTEM_DEFAULT_HORIZON,
 } from "./lib/fba-planning.js";
 import { validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS } from "./lib/warehouse-import.js";
+import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
@@ -531,7 +532,7 @@ function PlanColumnChooser({ groups, hidden, isUS, onToggle, onSelectAll, onRese
 
 // Seller-warehouse CSV/XLSX bulk importer. Parse -> STRICT validate (isolated to this account's SKUs) -> preview
 // valid + error rows -> atomic apply (only when there are ZERO errors). Never touches Amazon-source inventory.
-function WarehouseImportModal({ onClose, defaultMarketplace, knownSkus, skuAsinMap, onApply }) {
+function WarehouseImportModal({ onClose, defaultMarketplace, directory, catalogAsins, hasDirectory, knownSkus, skuAsinMap, onApply }) {
   const [fileName, setFileName] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [result, setResult] = useState(null);
@@ -539,10 +540,13 @@ function WarehouseImportModal({ onClose, defaultMarketplace, knownSkus, skuAsinM
   const [applying, setApplying] = useState(false);
   const [applied, setApplied] = useState(null);
   const [applyError, setApplyError] = useState(null);
+  // A v2d-5+ snapshot carries the SKU directory + catalog -> use identity-aware validation; older snapshots fall back
+  // to the string allowlist so imports still work (a re-derive upgrades them).
+  const opts = hasDirectory ? { defaultMarketplace, directory, catalogAsins } : { defaultMarketplace, knownSkus };
 
   const runText = (text) => {
     setApplied(null); setApplyError(null); setParseError(null);
-    try { setResult(validateWarehouseImport(text, { defaultMarketplace, knownSkus })); }
+    try { setResult(validateWarehouseImport(text, opts)); }
     catch (e) { setParseError(String(e?.message || e)); setResult(null); }
   };
   const onFile = async (file) => {
@@ -552,7 +556,7 @@ function WarehouseImportModal({ onClose, defaultMarketplace, knownSkus, skuAsinM
       if (/\.xlsx$/i.test(file.name)) {
         const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js");
         const rows = await readXlsxFirstSheet(await file.arrayBuffer());
-        setResult(validateWarehouseRows(rows, { defaultMarketplace, knownSkus }));
+        setResult(validateWarehouseRows(rows, opts));
       } else {
         runText(await file.text());
       }
@@ -2184,6 +2188,36 @@ function DashboardApp({ session, access, onSignOut }) {
     return m;
   }, [planConfig]);
 
+  // Org-wide Product Catalog ASIN -> { brand, productName }, for enriching manual/warehouse SKUs + proving an ASIN
+  // exists during import. Present on v2d-5+ snapshots.
+  const planCatalogByAsin = useMemo(() => (planData && planData.catalogByAsin && typeof planData.catalogByAsin === "object" ? planData.catalogByAsin : {}), [planData]);
+  const planCatalogAsins = useMemo(() => new Set(Object.keys(planCatalogByAsin)), [planCatalogByAsin]);
+
+  // The client SKU DIRECTORY: the account-scoped directory from the snapshot (each entry keeps its childAsin / brand /
+  // productName / marketplace / provenance) UNION already-saved warehouse SKUs (enriched from the catalog map). Keyed
+  // by SKU. Backward compatible: an older snapshot with only the string `accountSkus` yields identity-less entries.
+  const planSkuDirectory = useMemo(() => {
+    const m = new Map();
+    const dir = Array.isArray(planData?.accountSkuDirectory) ? planData.accountSkuDirectory : null;
+    if (dir) {
+      for (const e of dir) if (e && e.sku) m.set(String(e.sku), { ...e, sku: String(e.sku) });
+    } else {
+      for (const sku of Array.isArray(planData?.accountSkus) ? planData.accountSkus : []) if (sku) m.set(String(sku), { sku: String(sku), childAsin: null, brand: null, productName: null, marketplace: planData?.marketCountry || null, provenance: "source" });
+    }
+    // Warehouse-saved SKUs the directory does not already carry (manual): enrich from the catalog + the warehouse row.
+    for (const [sku, wh] of planWarehouseBySku) {
+      const key = String(sku);
+      if (m.has(key)) continue;
+      const asin = wh.childAsin || null;
+      const cat = asin ? planCatalogByAsin[asin] : null;
+      m.set(key, { sku: key, childAsin: asin, brand: cat?.brand || null, productName: cat?.productName || null, marketplace: wh.marketplace || planData?.marketCountry || null, provenance: "manual" });
+    }
+    return m;
+  }, [planData, planWarehouseBySku, planCatalogByAsin]);
+
+  // Legacy authorization set (SKU strings) kept for the import fallback when no directory is present.
+  const planKnownSkus = useMemo(() => new Set(planSkuDirectory.keys()), [planSkuDirectory]);
+
   // Persist the account planning settings, then reload the config (recomputes the plan locally, zero DataDoe).
   const savePlanSettings = useCallback(async (patch) => {
     if (!selectedAccountId || !session?.access_token) return;
@@ -2715,9 +2749,15 @@ function DashboardApp({ session, access, onSignOut }) {
         forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
         horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
       });
+      // Identity from the durable directory (keeps childAsin/product/brand even for a dropped or manual SKU). A SKU
+      // with no proven catalog brand stays Unmapped (brand null) -- never placed under another brand.
+      const dirEntry = planSkuDirectory.get(key) || null;
+      const asin = (dirEntry && dirEntry.childAsin) || wh.childAsin || "";
+      const brand = (dirEntry && dirEntry.brand) || (asin && planCatalogByAsin[asin]?.brand) || null;
+      const productName = (dirEntry && dirEntry.productName) || (asin && planCatalogByAsin[asin]?.productName) || null;
       synthetic.push({
-        asin: wh.childAsin || "", rowKey: `wh:${key}`, warehouseOnly: true,
-        productName: "(warehouse-only SKU)", brand: null, sku: key,
+        asin, rowKey: `wh:${key}`, warehouseOnly: true,
+        productName: productName || "(warehouse-only SKU)", brand, sku: key,
         monthsDisplay: [null, null, null], m1: null, m2: null, m3: null, mtdUnits: null,
         threeMoAvg: null, mtdProjected: null, planningAvg: null, targetUnits: null,
         fbaAvailable: null, mtdDrr: null, fbaDaysCover: null, invKnown: false, isUS: planData.isUS === true,
@@ -2727,12 +2767,13 @@ function DashboardApp({ session, access, onSignOut }) {
       });
     }
     return [...built, ...synthetic];
-  }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku]);
+  }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku, planSkuDirectory, planCatalogByAsin]);
 
+  // Brand filtering: All -> everything; "Unmapped" -> only rows with NO catalog-proven brand; a named brand -> only
+  // rows whose canonical brandKey matches (whitespace-normalized, case-folded, punctuation-significant -- the shared
+  // brandKey). A named brand NEVER falls back to All; Unmapped rows never appear under a named brand.
   const planRows = useMemo(() => {
-    const filtered = planComputed.filter((r) =>
-      (selectedBrand === "ALL" || r.brand === selectedBrand) && planSearchMatch(r, planSearch)
-    );
+    const filtered = planComputed.filter((r) => planSearchMatch(r, planSearch) && matchesPlanBrand(r.brand, selectedBrand, brandKey));
     return [...filtered].sort((a, b) => comparePlanRows(a, b, planSort.key, planSort.dir));
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
@@ -2827,18 +2868,18 @@ function DashboardApp({ session, access, onSignOut }) {
     return order.map((group) => ({ group, cols: byGroup.get(group) }));
   }, [planColumns]);
   // Every SKU that belongs to this account (for import isolation) + its representative child ASIN.
-  // Authorized SKU set for bulk-import isolation = the durable account SKU UNIVERSE (every SKU in any source, incl.
-  // multi-SKU ASINs + zero-activity SKUs the plan drops) UNION already-saved warehouse SKUs. Falls back to the visible
-  // plan-row SKUs when a pre-change snapshot has no accountSkus yet. Unknown / cross-account SKUs still fail closed.
-  const planKnownSkus = useMemo(() => {
-    const s = new Set();
-    for (const sku of Array.isArray(planData?.accountSkus) ? planData.accountSkus : []) if (sku) s.add(String(sku));
-    for (const r of planComputed || []) if (r.sku && !r.warehouseOnly) s.add(String(r.sku));
-    for (const sku of planWarehouseBySku.keys()) s.add(String(sku));
-    return s;
-  }, [planData, planComputed, planWarehouseBySku]);
-  const planSkuAsinMap = useMemo(() => { const m = new Map(); for (const r of planComputed || []) if (r.sku && !m.has(String(r.sku))) m.set(String(r.sku), r.asin || ""); return m; }, [planComputed]);
+  const planSkuAsinMap = useMemo(() => { const m = new Map(); for (const [sku, e] of planSkuDirectory) if (e.childAsin) m.set(sku, e.childAsin); return m; }, [planSkuDirectory]);
   const [planColsOpen, setPlanColsOpen] = useState(false);
+  // Brand options for the FBA-plan selector: the account's catalog-proven brands present in the plan (incl. warehouse
+  // rows), plus an explicit "Unmapped" option when any row lacks a proven brand. Scoped to this view only.
+  const planBrandOptions = useMemo(() => {
+    const set = new Set();
+    let hasUnmapped = false;
+    for (const r of planComputed) { if (r.brand) set.add(r.brand); else hasUnmapped = true; }
+    const list = [...set].sort((a, b) => a.localeCompare(b));
+    if (hasUnmapped) list.push(UNMAPPED_BRAND);
+    return list;
+  }, [planComputed]);
 
   const reconciliationScope = useMemo(
     () => buildReconciliation(reconciliationData, selectedBrand),
@@ -3553,7 +3594,7 @@ function DashboardApp({ session, access, onSignOut }) {
             onAccountChange={(id) => { setSelectedAccountId(id); setSelectedBrand("ALL"); }}
             onRefreshAccounts={fetchAccounts}
             accountsRefreshing={accountsLoading}
-            brands={brandList}
+            brands={view === "fbaplan" ? planBrandOptions : brandList}
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
             dashboardMode={view === "dashboard" ? dashboardMode : "account"}
@@ -4210,6 +4251,9 @@ function DashboardApp({ session, access, onSignOut }) {
         {warehouseImportOpen && (
           <WarehouseImportModal
             defaultMarketplace={planData?.marketCountry || ""}
+            directory={planSkuDirectory}
+            catalogAsins={planCatalogAsins}
+            hasDirectory={Array.isArray(planData?.accountSkuDirectory)}
             knownSkus={planKnownSkus}
             skuAsinMap={planSkuAsinMap}
             onApply={bulkImportWarehouse}

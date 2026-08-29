@@ -3506,9 +3506,11 @@ async function handleDataDoe(req, res) {
       );
       const brandByAsin = new Map();
       const nameByAsin = new Map();
+      const catalogAsinSet = new Set();
       for (const c of catalog) {
         const asin = String(c.child_asin || "").trim();
         if (!asin) continue;
+        catalogAsinSet.add(asin);
         const brand = String(c.product_brand || "").trim();
         if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
         const name = String(c.product_name || "").trim();
@@ -3572,8 +3574,9 @@ async function handleDataDoe(req, res) {
       const awdByAsin = {};
       const awdInboundByAsin = {};
       let awdAvailable = false;
+      let awdRows = [];
       if (isUS) {
-        const awdRows = await fetchExportRows(
+        awdRows = await fetchExportRows(
           apiKey, LISTINGS_SOURCE_ID, LISTINGS_AWD_COLUMNS, sellerOrVendorIds,
           null, null, CATALOG_ROW_LIMIT,
           { orderByColumn: "child_asin" }
@@ -3591,13 +3594,30 @@ async function handleDataDoe(req, res) {
         }
       }
 
-      // 5b) The durable ACCOUNT SKU UNIVERSE -- every SKU seen in ANY source (inventory, AWD, sales). A SUPERSET of the
-      // representative SKUs the per-ASIN rows show, used only as an authorization allowlist for seller-warehouse
-      // management + bulk-import validation so a SKU the plan drops (non-representative on a multi-SKU ASIN, or an ASIN
-      // with zero sales + zero Amazon inventory) is still recognised. Never fabricates a plan number.
-      const accountSkuSet = new Set();
-      for (const set of Object.values(skusByAsin)) for (const s of set) accountSkuSet.add(s);
-      for (const r of oliSalesRows) { const s = String(r?.sku || "").trim(); if (s) accountSkuSet.add(s); }
+      // 5b) The durable ACCOUNT SKU DIRECTORY -- one entry per SKU proven in an ACCOUNT-scoped source (inventory, AWD,
+      // sales), enriched with the org-wide Product Catalog's ASIN -> brand/name. A SUPERSET of the representative SKUs
+      // the per-ASIN rows show, so a dropped/warehouse-only SKU keeps its identity + canonical brand. Priority (first
+      // writer sets provenance): inventory > AWD > sales. A SKU maps to exactly one child ASIN.
+      const skuDir = new Map();
+      const putSku = (sku, asin, marketplace, provenance, invName) => {
+        const s = String(sku || "").trim();
+        if (!s) return;
+        const a = String(asin || "").trim() || null;
+        const mkt = String(marketplace || "").trim().toUpperCase() || null;
+        let e = skuDir.get(s);
+        if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
+        if (!e.childAsin && a) e.childAsin = a;
+        if (!e.marketplace && mkt) e.marketplace = mkt;
+        const ca = e.childAsin;
+        if (ca) {
+          if (!e.brand) e.brand = brandByAsin.get(ca) || null;
+          if (!e.productName) e.productName = nameByAsin.get(ca) || invName || invProductName.get(ca) || null;
+        } else if (!e.productName && invName) { e.productName = invName; }
+      };
+      for (const r of invRows) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || account?.country, "inventory", String(r.product_name || "").trim() || null); }
+      for (const r of awdRows) { const mkt = String(r.marketplace_country_code || "").trim().toUpperCase(); if (mkt && mkt !== "US") continue; putSku(r.sku, r.child_asin, "US", "awd", null); }
+      for (const r of oliSalesRows) putSku(r?.sku, r?.child_asin, account?.country, "sales", null);
+      const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
 
       // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU
       // in ascending (localeCompare) order, so it is stable across refreshes.
@@ -3661,7 +3681,9 @@ async function handleDataDoe(req, res) {
         inventoryAvailable,
         awdAvailable,
         rows,
-        accountSkus: [...accountSkuSet].sort((a, b) => a.localeCompare(b)),
+        accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
+        accountSkuDirectory,
+        catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
         // Additive: consumed only by the account-scoped Brand View. Bounded by
         // (marketplaces x brands), so it stays small for accounts with
         // thousands of SKUs.

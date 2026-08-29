@@ -32,6 +32,7 @@
     "test:brand-view-render": "node scripts/brand-view-render.test.js",
     "test:fba-planning": "node scripts/fba-planning.test.js",
     "test:warehouse-import": "node scripts/warehouse-import.test.js",
+    "test:plan-brand": "node scripts/plan-brand.test.js",
     "test:sku-movement": "node scripts/sku-movement.test.js",
     "test:sku-movement-integration": "node scripts/sku-movement-integration.test.js",
     "test:oli-value-policy": "node scripts/oli-value-policy.test.js",
