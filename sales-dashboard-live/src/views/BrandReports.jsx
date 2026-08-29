@@ -14,7 +14,7 @@
 import React, { useMemo } from "react";
 import { AlertTriangle, Info } from "lucide-react";
 
-import { DataQualityAlert, MetricCard } from "../components/ui.jsx";
+import { DataQualityAlert, GradientKpi, MoneyShare } from "../components/ui.jsx";
 import { fmtRangeLabel, monthLongLabel, nInt } from "../lib/format.js";
 import { isConvertedMode } from "../lib/brand-view.js";
 import { DASH, buildBrandTables } from "../lib/brand-view-tables.js";
@@ -77,8 +77,13 @@ export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
                       className={columnClass(index)}
                       title={(index === 0 ? row.labelTitle : row.hints?.[index]) || undefined}
                     >
-                      {index === 0 ? row.label || value.t : value.t}
-                      {index > 0 && row.subcells?.[index] ? <small>{row.subcells[index]}</small> : null}
+                      {index === 0
+                        ? (row.label || value.t)
+                        : (row.subcells?.[index]
+                          // A money cell with a proven contribution share: the dedicated presenter keeps the amount
+                          // and the percentage as two SEPARATE elements so they can never render as one mixed string.
+                          ? <MoneyShare amount={value.t} share={row.subcells[index]} />
+                          : value.t)}
                     </td>
                   ))}
                 </tr>
@@ -225,22 +230,24 @@ export default function BrandReports({
         <DataQualityAlert key={note} tone="info" title="Partial source coverage" detail={note} icon={Info} />
       ))}
 
-      <div className="metric-grid bv-kpis">
-        <MetricCard label="Brand" value={model.brand} period={scopeLabel} />
-        <MetricCard
+      <div className="rvkpi-grid rvkpi-grid-4 bv-kpis">
+        <GradientKpi label="Brand" value={model.brand} sub={scopeLabel} gradient="linear-gradient(135deg,#FF6B6B,#FF8E53)" />
+        <GradientKpi
           label="Marketplaces"
           value={nInt(tables.marketplaceCount)}
-          period={rangeLabel}
+          sub={rangeLabel}
           hint="Only marketplaces where this brand has sales or FBA inventory in the selected scope."
+          gradient="linear-gradient(135deg,#A78BFA,#7C3AED)"
         />
-        <MetricCard label="Units sold" value={nInt(tables.totalUnits)} period="never currency converted" />
-        <MetricCard
+        <GradientKpi label="Units sold" value={nInt(tables.totalUnits)} sub="never currency converted" gradient="linear-gradient(135deg,#34D399,#059669)" />
+        <GradientKpi
           label="Currency mode"
           value={converted ? displayCurrency : "Original"}
-          period={converted ? "totals are sums of converted rows" : "grouped per currency, never combined"}
+          sub={converted ? "totals are sums of converted rows" : "grouped per currency, never combined"}
           hint={converted
             ? "Every country value is converted individually at full precision; the totals are the sums of those converted values."
             : "Money stays in each marketplace's own currency. There is deliberately no single cross-currency total."}
+          gradient="linear-gradient(135deg,#F59E0B,#D97706)"
         />
       </div>
 

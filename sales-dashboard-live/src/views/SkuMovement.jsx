@@ -12,9 +12,9 @@ import { downloadCsv, reportFilename } from "../lib/csv.js";
 import { fmtDateHuman, fmtPct, nInt } from "../lib/format.js";
 import {
   ExportButton, FreshnessBar, Notice, Pagination, ReportHeader, SearchField, SelectField,
-  SnapshotState, SortTh, StatRow, snapshotFreshnessLabel, sortRows, useSortState,
+  SnapshotState, SortTh, snapshotFreshnessLabel, sortRows, useSortState,
 } from "./shared.jsx";
-import { ObservedUnitsBreakdown } from "../components/ui.jsx";
+import { GradientKpi, ObservedUnitsBreakdown } from "../components/ui.jsx";
 
 const PAGE_SIZE = 50;
 const STATUS_OPTIONS = [
@@ -36,8 +36,9 @@ const STATUS_STYLE = {
 };
 
 // Sticky first two columns (ASIN/product + SKU): opaque backgrounds so scrolling numeric columns never show through.
+// The header cells sit in the deep-violet table header, so they carry the same deep-violet background.
 const STICKY_BG = "var(--bg-elevated)";
-const STICKY_HEAD_BG = "var(--bg-subtle)";
+const STICKY_HEAD_BG = "#1E1245";
 const C1 = 224; // width of the sticky ASIN/product column
 const col1Td = { position: "sticky", left: 0, zIndex: 1, background: STICKY_BG, minWidth: C1, maxWidth: C1, textAlign: "left" };
 const col1Th = { ...col1Td, top: 0, zIndex: 3, background: STICKY_HEAD_BG };
@@ -72,6 +73,14 @@ function StatusBadge({ status }) {
       {status}
     </span>
   );
+}
+
+// Movement % as a red/green pill. The sign stays in the text, so direction is never conveyed by colour alone. A null
+// movement (no prior-period base) renders a muted em dash, never a fabricated 0%.
+function MoveBadge({ value }) {
+  if (value == null) return <span className="sku-mv-move-flat">{fmtPct(value)}</span>;
+  const cls = value > 0 ? "sku-mv-move-pos" : value < 0 ? "sku-mv-move-neg" : "sku-mv-move-flat";
+  return <span className={"sku-mv-move " + cls}>{fmtPct(value)}</span>;
 }
 
 export default function SkuMovement({ data, loading, updating, error, accountName, selectedBrand, onReload, cachedAt }) {
@@ -181,13 +190,13 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
       )}
 
       {data && !data.snapshotMissing && rows.length > 0 && <>
-        <StatRow stats={[
-          { label: "SKUs in scope", value: nInt(rows.length) },
-          { label: `${mtdLabel} units`, value: nInt(totals.mtd) },
-          { label: "Last 5-day units", value: nInt(totals.last5) },
-          { label: "Previous 5-day units", value: nInt(totals.prev5) },
-          { label: "Movement", value: fmtPct(totals.movementPercent), tone: totals.movementPercent == null ? undefined : (totals.movementPercent > 0 ? "good" : totals.movementPercent < 0 ? "bad" : undefined) },
-        ]} />
+        <div className="rvkpi-grid rvkpi-grid-5">
+          <GradientKpi label="SKUs in scope" value={nInt(rows.length)} />
+          <GradientKpi label={`${mtdLabel} units`} value={nInt(totals.mtd)} gradient="linear-gradient(135deg,#FF6B6B,#FF8E53)" />
+          <GradientKpi label="Last 5-day units" value={nInt(totals.last5)} gradient="linear-gradient(135deg,#A78BFA,#7C3AED)" />
+          <GradientKpi label="Previous 5-day units" value={nInt(totals.prev5)} />
+          <GradientKpi label="Movement" value={fmtPct(totals.movementPercent)} sub="vs previous 5 days" tone={totals.movementPercent == null ? undefined : (totals.movementPercent > 0 ? "good" : totals.movementPercent < 0 ? "bad" : undefined)} />
+        </div>
 
         <div className="panel skupl-table-panel" style={{ padding: 0, overflow: "hidden" }}>
           <div className="skupl-toolbar">
@@ -202,7 +211,7 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
             <ExportButton onClick={exportTable} disabled={!sorted.length} />
           </div>
           <div className="plan-scroll">
-            <table className="plan-table" style={{ minWidth: 1280 }}>
+            <table className="plan-table sku-mv" style={{ minWidth: 1280 }}>
               <thead>
                 <tr>
                   <SortTh style={col1Th} label="Product / ASIN" col="productName" sort={sort} onSort={onSort} align="left" />
@@ -210,11 +219,11 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
                   <SortTh label={monthLabels[0]} col="m0" sort={sort} onSort={onSort} />
                   <SortTh label={monthLabels[1]} col="m1" sort={sort} onSort={onSort} />
                   <SortTh label={monthLabels[2]} col="m2" sort={sort} onSort={onSort} />
-                  <SortTh label={mtdLabel} col="mtd" sort={sort} onSort={onSort} />
+                  <SortTh className="sku-mv-mtd" label={mtdLabel} col="mtd" sort={sort} onSort={onSort} />
                   {last5Dates.map((d) => (
                     <th key={d} title={fmtDateHuman(d)} style={{ textAlign: "right", whiteSpace: "nowrap" }}>{d.slice(5)}</th>
                   ))}
-                  <SortTh label="Last 5" col="last5Total" sort={sort} onSort={onSort} hint="Units over the latest five dates" />
+                  <SortTh className="sku-mv-last5" label="Last 5" col="last5Total" sort={sort} onSort={onSort} hint="Units over the latest five dates" />
                   <SortTh label="Prev 5" col="prev5Total" sort={sort} onSort={onSort} hint="Units over the five dates before that" />
                   <SortTh label="Move %" col="movementPercent" sort={sort} onSort={onSort} hint={`(Last5 − Prev5) ÷ Prev5. Rising > +${thresholds.risingPct}%, Declining < ${thresholds.decliningPct}%`} />
                   <SortTh label="Avg / mo" col="avgMonthlyUnits" sort={sort} onSort={onSort} hint="Average units across the available completed months" />
@@ -232,11 +241,11 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
                     </td>
                     <td className="mono" style={col2Td} title={r.sku || ""}>{r.sku || "—"}</td>
                     {(r.months || []).map((m, i) => <td key={i} className="mono">{unitsCell(m.units)}</td>)}
-                    <td className="mono pt-strong">{nInt(num(r.mtdUnits))}</td>
+                    <td className="mono pt-strong sku-mv-mtd">{nInt(num(r.mtdUnits))}</td>
                     {(r.last5Dates || []).map((d) => <td key={d.date} className="mono">{nInt(num(d.units))}</td>)}
-                    <td className="mono pt-strong">{nInt(num(r.last5Total))}</td>
+                    <td className="mono pt-strong sku-mv-last5">{nInt(num(r.last5Total))}</td>
                     <td className="mono">{nInt(num(r.prev5Total))}</td>
-                    <td className={"mono" + (r.movementPercent == null ? "" : r.movementPercent > 0 ? " sku-pos" : r.movementPercent < 0 ? " sku-neg" : "")}>{fmtPct(r.movementPercent)}</td>
+                    <td className="mono"><MoveBadge value={r.movementPercent} /></td>
                     <td className="mono">{r.avgMonthlyUnits == null ? "—" : r.avgMonthlyUnits}</td>
                     <td className="mono">{r.mtdRunRate == null ? "—" : r.mtdRunRate}</td>
                     <td className="mono">{r.projectedUnits == null ? "—" : nInt(r.projectedUnits)}</td>
@@ -249,11 +258,11 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
                   <td style={{ ...col1Td, fontWeight: 700 }}>Totals · {nInt(filtered.length)} SKU{filtered.length === 1 ? "" : "s"}</td>
                   <td style={col2Td}></td>
                   {totals.months.map((v, i) => <td key={i} className="mono">{unitsCell(v)}</td>)}
-                  <td className="mono">{nInt(totals.mtd)}</td>
+                  <td className="mono sku-mv-mtd">{nInt(totals.mtd)}</td>
                   {totals.last5ByDate.map((v, i) => <td key={i} className="mono">{nInt(v)}</td>)}
-                  <td className="mono">{nInt(totals.last5)}</td>
+                  <td className="mono sku-mv-last5">{nInt(totals.last5)}</td>
                   <td className="mono">{nInt(totals.prev5)}</td>
-                  <td className={"mono" + (totals.movementPercent == null ? "" : totals.movementPercent > 0 ? " sku-pos" : totals.movementPercent < 0 ? " sku-neg" : "")}>{fmtPct(totals.movementPercent)}</td>
+                  <td className="mono"><MoveBadge value={totals.movementPercent} /></td>
                   <td colSpan={4}></td>
                 </tr>
               </tfoot>

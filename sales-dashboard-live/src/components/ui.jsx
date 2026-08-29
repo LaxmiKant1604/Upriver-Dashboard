@@ -138,6 +138,43 @@ export function MetricCard({ label, value, hint, period, trend, spark, tone, var
 }
 
 /**
+ * GradientKpi — a compact Royal Violet KPI card (the coral / violet / emerald / amber gradient tiles used by the
+ * redesigned Brand View and SKU Movement). `value` is pre-formatted. Pass `gradient` for a coloured tile or omit it
+ * for a plain white tile; `sub` is the small supporting line; `hint` renders the shared info tooltip; `tone`
+ * ("good"/"bad") tints a plain tile's value. Values never scale with the viewport and never overflow (CSS clamps).
+ */
+export function GradientKpi({ label, value, sub, hint, gradient = null, tone }) {
+  const light = !gradient;
+  return (
+    <div className={"rvkpi" + (light ? " rvkpi-light" : "")} style={gradient ? { background: gradient } : undefined}>
+      <div className="rvkpi-top">
+        <div className="rvkpi-label">{label}</div>
+        {hint ? <span className="rvkpi-hint"><MetricTooltip text={hint} /></span> : null}
+      </div>
+      <div className={"rvkpi-value" + (tone === "bad" ? " rvkpi-neg" : tone === "good" ? " rvkpi-pos" : "")}>{value}</div>
+      {sub ? <div className="rvkpi-sub">{sub}</div> : null}
+    </div>
+  );
+}
+
+/**
+ * MoneyShare — the dedicated amount-plus-percentage presenter. It renders a currency AMOUNT and its contribution
+ * SHARE as TWO clearly separated elements (the amount as the primary value, the share on its own smaller second
+ * line). The two are NEVER concatenated into a single string, so a malformed mixed value such as "€8068.5%" is
+ * structurally impossible to render. A currency amount uses its own formatter (passed in as `amount`); a share uses
+ * its own (passed in as `share`). When the payload does not prove a share, ONLY the amount renders — a percentage is
+ * never inferred or fabricated. Screen readers read the two values separately (the share carries an sr-only label).
+ */
+export function MoneyShare({ amount, share }) {
+  return (
+    <>
+      <span className="cell-amt">{amount}</span>
+      {share ? <span className="cell-share"><span className="sr-only">share of the currency-group total: </span>{share}</span> : null}
+    </>
+  );
+}
+
+/**
  * ComparisonMetric — one cell of the performance-comparison row.
  *
  * `data` is the existing dashboard comparison shape:

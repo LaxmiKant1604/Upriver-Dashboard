@@ -85,6 +85,7 @@ const SUITES = [
   "test:brand-sales-backfill",
   "test:brand-membership-scope",
   "test:brand-view-freshness",
+  "test:brand-view-render",
   "test:asin-ads-backfill-window",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",

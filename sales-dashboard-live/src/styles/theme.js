@@ -1077,16 +1077,17 @@ body{ overflow-x:hidden; }
 /* Headers are sentence case and generously sized. An all-caps micro-header is
    fine for a dense operational grid; this is a report people read across, and
    "Total Sales" is easier to scan than "TOTAL SALES" at 9px. */
+/* Deep-violet header (matches the Dashboard / Daily Reporting Royal Violet system). */
 .bv-table th{
-  padding:11px 14px; background:var(--bg-surface); border-bottom:1px solid var(--border-strong);
-  color:var(--text-muted); font-size:11.5px; font-weight:650; letter-spacing:0;
+  padding:11px 14px; background:linear-gradient(90deg,#1E1245,#2d1b69); border-bottom:0;
+  color:rgba(196,181,253,.72); font-size:10px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
   text-align:right; white-space:nowrap; position:sticky; top:0; z-index:2;
 }
 .bv-table th.bv-first, .bv-table td.bv-first{
   text-align:left; position:sticky; left:0; z-index:3;
   background:var(--bg-surface); min-width:190px;
 }
-.bv-table th.bv-first{ color:var(--text-muted); }
+.bv-table th.bv-first{ color:#C4B5FD; background:#1E1245; }
 .bv-table td.bv-first{ z-index:1; font-weight:700; color:var(--text-primary); font-size:13px; }
 .bv-table td{
   padding:13px 14px; border-bottom:1px solid var(--grid-line); color:var(--text-primary);
@@ -1102,12 +1103,13 @@ body{ overflow-x:hidden; }
    than a money figure; the current-month projection and the advertising pair
    get their own tints so the eye can find them in a wide month grid. */
 .bv-table .bv-col-positive{ color:var(--positive); }
-.bv-table th.bv-col-positive{ color:var(--positive); font-weight:750; }
+.bv-table th.bv-col-positive{ color:#6EE7B7; font-weight:800; }
 .bv-table .bv-col-accent{ color:var(--accent-strong); }
-.bv-table th.bv-col-accent{ color:var(--accent-strong); font-weight:750; }
-.bv-table .bv-col-latest, .bv-table .bv-col-total{ background:var(--accent-soft); color:var(--accent-strong); font-weight:750; }
-.bv-table th.bv-col-latest, .bv-table th.bv-col-total{ color:var(--accent-strong); font-weight:750; }
-.bv-table tbody tr:hover td.bv-col-latest, .bv-table tbody tr:hover td.bv-col-total{ background:var(--accent-soft); }
+.bv-table th.bv-col-accent{ color:#C4B5FD; font-weight:800; }
+.bv-table .bv-col-latest, .bv-table .bv-col-total{ background:var(--brand-soft); color:var(--text-primary); font-weight:750; }
+/* The current-month / latest column gets a coral accent in the deep-violet header, like the Daily Reporting MTD. */
+.bv-table th.bv-col-latest, .bv-table th.bv-col-total{ color:#FF9482; box-shadow:inset 0 -2px 0 #FF6B6B; }
+.bv-table tbody tr:hover td.bv-col-latest, .bv-table tbody tr:hover td.bv-col-total{ background:#FFE1DC; }
 
 /* The All Markets row. One per currency group — and with a single currency,
    which is every converted view, there is exactly one, at the top. */
@@ -1132,6 +1134,58 @@ body{ overflow-x:hidden; }
   padding:10px 14px; background:var(--bg-subtle); border-top:1px solid var(--border-strong);
   border-bottom:1px solid var(--border-strong); color:var(--text-muted);
   font-size:10.5px; font-weight:800; letter-spacing:.08em; text-align:left; text-transform:uppercase;
+}
+
+/* ===================================================================
+   Brand View + SKU Movement redesign (Royal Violet; additive & scoped)
+   =================================================================== */
+/* Gradient KPI tiles shared by the two redesigned views. */
+.rvkpi-grid{ display:grid; gap:12px; margin-top:var(--space-4); }
+.rvkpi-grid-4{ grid-template-columns:repeat(4,minmax(0,1fr)); }
+.rvkpi-grid-5{ grid-template-columns:repeat(5,minmax(0,1fr)); }
+.rvkpi{ border-radius:var(--radius-md); padding:15px 17px; color:#fff; box-shadow:var(--shadow-sm); min-width:0; }
+.rvkpi-light{ background:var(--bg-surface); border:1px solid var(--border-default); color:var(--text-primary); }
+.rvkpi-top{ display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
+.rvkpi-label{ font-size:9.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:rgba(255,255,255,.82); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.rvkpi-light .rvkpi-label{ color:var(--text-muted); }
+.rvkpi-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:23px; font-weight:800; line-height:1.12; margin-top:9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.rvkpi-sub{ font-size:10.5px; margin-top:6px; color:rgba(255,255,255,.8); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.rvkpi-light .rvkpi-sub{ color:var(--text-muted); }
+.rvkpi-pos{ color:var(--positive); }
+.rvkpi-neg{ color:var(--negative); }
+.rvkpi-hint{ flex-shrink:0; display:inline-flex; }
+.rvkpi-hint button, .rvkpi-hint svg{ color:rgba(255,255,255,.72); }
+.rvkpi-light .rvkpi-hint button, .rvkpi-light .rvkpi-hint svg{ color:var(--text-muted); }
+
+/* Amount + contribution-share presenter -- two SEPARATE block elements, NEVER a concatenated string. */
+.cell-amt{ display:block; }
+.cell-share{ display:block; margin-top:2px; font-size:10.5px; font-weight:600; color:var(--text-muted); }
+.bv-table .bv-total .cell-share{ color:var(--accent-strong); opacity:.85; }
+
+/* SKU Movement table: REUSES plan-table layout; recolours ONLY under .sku-mv, so no other plan table is touched. */
+.sku-mv thead th{ background:linear-gradient(90deg,#1E1245,#2d1b69); color:rgba(196,181,253,.72); border-bottom:0; }
+.sku-mv .pt-sortable:hover{ color:#fff; }
+.sku-mv th.pt-sorted{ color:#C4B5FD; }
+.sku-mv thead th.sku-mv-mtd{ color:#FF9482; box-shadow:inset 0 -2px 0 #FF6B6B; }
+.sku-mv thead th.sku-mv-last5{ color:#C9B8FF; box-shadow:inset 0 -2px 0 #7B4EF3; }
+.sku-mv td.sku-mv-mtd{ background:var(--brand-soft); font-weight:800; color:var(--text-primary); border-left:1px solid rgba(255,107,107,.20); border-right:1px solid rgba(255,107,107,.20); }
+.sku-mv td.sku-mv-last5{ background:rgba(123,78,243,.08); font-weight:800; color:var(--text-primary); border-left:1px solid rgba(123,78,243,.18); border-right:1px solid rgba(123,78,243,.18); }
+.sku-mv tbody tr:hover td.sku-mv-mtd{ background:#FFE1DC; }
+.sku-mv tbody tr:hover td.sku-mv-last5{ background:#EBE3FF; }
+.sku-mv tfoot td.sku-mv-mtd, .sku-mv tfoot td.sku-mv-last5{ background:var(--bg-sunken); }
+/* Movement % badge (red/green pill) -- direction is never colour alone: the sign + word remain in the text/status. */
+.sku-mv-move{ display:inline-block; padding:2px 8px; border-radius:var(--radius-pill); font-size:11px; font-weight:800; font-variant-numeric:tabular-nums; }
+.sku-mv-move-pos{ background:var(--positive-soft); color:var(--positive); }
+.sku-mv-move-neg{ background:var(--negative-soft); color:var(--negative); }
+.sku-mv-move-flat{ color:var(--text-muted); }
+
+@media (max-width:1180px){
+  .rvkpi-grid-4{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .rvkpi-grid-5{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+}
+@media (max-width:640px){
+  .rvkpi-grid-4, .rvkpi-grid-5{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .rvkpi-value{ font-size:20px; }
 }
 
 /* ======================= RESPONSIVE ======================= */
@@ -1366,7 +1420,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .alert.info{ border-color:#CEC5FF; background:rgba(225,221,255,.54); color:#6750DA; }
 .alert.warning{ border-color:#F4D998; background:rgba(255,247,226,.78); }
 .status-badge,.trend{ border-radius:999px; }
-.data-table thead th,.bv-table th{ background:#FAF9FF; }
+.data-table thead th{ background:#FAF9FF; }
 
 @media (max-width:900px){
   .sidebar{ width:272px; }
