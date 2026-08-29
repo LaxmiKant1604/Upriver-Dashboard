@@ -51,12 +51,23 @@ for (const a of accounts) {
   const p = unitRows.reduce((s, r) => s + Number(r.pricedUnits || 0), 0);
   const z = unitRows.reduce((s, r) => s + Number(r.explicitZeroUnits || 0), 0);
   const c = unitRows.reduce((s, r) => s + Number(r.cancelledUnits || 0), 0);
-  totals.accounts += 1; totals.windows += 1; totals.priced += p; totals.zero += z; totals.cancelled += c; totals.rows += unitRows.length;
+  totals.accounts += 1; totals.priced += p; totals.zero += z; totals.cancelled += c; totals.rows += unitRows.length;
   console.log(`  ${a.accountId} [${from}..${to}] dim=${dimRows.length} -> grains=${unitRows.length} priced=${p} zero=${z} cancelled=${c}`);
   if (APPLY && unitRows.length) {
-    const res = await sb.replaceOliOperationalUnitsWindow({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, coveredFrom: from, coveredTo: to, unitRows });
-    if (res.write !== "ok") { console.error(`    WRITE FAILED (${res.error}) -- aborting`); process.exit(1); }
-    console.log(`    wrote replaced=${res.replaced} inserted=${res.inserted}`);
+    // Chunk the atomic replace by CALENDAR MONTH so each window-scoped delete+insert carries a bounded payload
+    // (high-volume accounts have tens of thousands of grains). Months are DISJOINT windows, so replacing each in turn
+    // covers the whole range without overlap and stays idempotent.
+    const byMonth = new Map();
+    for (const r of unitRows) { const mk = String(r.saleDate).slice(0, 7); (byMonth.get(mk) || byMonth.set(mk, []).get(mk)).push(r); }
+    let wroteRows = 0;
+    for (const [mk, rows] of [...byMonth.entries()].sort()) {
+      const mFrom = mk + "-01";
+      const mTo = rows.reduce((m, r) => (r.saleDate > m ? r.saleDate : m), rows[0].saleDate);
+      const res = await sb.replaceOliOperationalUnitsWindow({ organizationFingerprint: orgFp, connectionId: "primary", accountId: a.accountId, coveredFrom: mFrom, coveredTo: mTo, unitRows: rows });
+      if (res.write !== "ok") { console.error(`    WRITE FAILED month=${mk} (${res.error}) -- aborting`); process.exit(1); }
+      wroteRows += res.inserted; totals.windows += 1;
+    }
+    console.log(`    wrote ${byMonth.size} month windows, ${wroteRows} grain rows`);
   }
 }
 console.log(`\nDONE ${APPLY ? "(APPLIED)" : "(DRY-RUN)"}: accounts=${totals.accounts} grains=${totals.rows} priced=${totals.priced} zero=${totals.zero} cancelled=${totals.cancelled}`);
