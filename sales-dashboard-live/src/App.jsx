@@ -305,12 +305,18 @@ function comparePlanRows(a, b, key, dir) {
 // Per-column export value (raw number/string; null -> "" so a missing value is blank, never a fabricated 0). The
 // identity column expands to Product Name / ASIN / SKU / Brand; every other column mirrors exactly what the table
 // shows, from the SAME canonical model. Keyed by column id so the export can never diverge from the visible columns.
+// Columns hidden by DEFAULT (each raw FBA state has its own column per the spec, but the default view shows the
+// combined Reserved (FC) / Inbound Pipeline; the raw components are revealable via the column chooser). "Reset
+// default" restores exactly this set; "Select all" reveals everything.
+const PLAN_DEFAULT_HIDDEN_COLS = ["reservedFcTransfer", "reservedFcProcessing", "inboundWorking", "inboundShipped", "inboundReceived"];
 const expNum = (v) => (v == null || !Number.isFinite(Number(v)) ? "" : Math.round(Number(v)));
 const PLAN_EXPORT_VALUES = {
   m1: (r) => expNum(r.monthsDisplay?.[0]), m2: (r) => expNum(r.monthsDisplay?.[1]), m3: (r) => expNum(r.monthsDisplay?.[2]),
   mtdUnits: (r) => expNum(r.mtdUnits), threeMoAvg: (r) => expNum(r.planning?.threeMonthAverage), mtdProjected: (r) => expNum(r.planning?.mtdProjectedUnits),
   targetUnits: (r) => expNum(r.targetUnits), fbaAvailable: (r) => expNum(r.fbaAvailable), fbaDaysCover: (r) => expNum(r.fbaDaysCover),
   custReserved: (r) => expNum(r.planning?.customerOrderReserved), reserved: (r) => expNum(r.reserved), inboundPipeline: (r) => expNum(r.inboundPipeline),
+  reservedFcTransfer: (r) => expNum(r.planning?.reservedFcTransfer), reservedFcProcessing: (r) => expNum(r.planning?.reservedFcProcessing),
+  inboundWorking: (r) => expNum(r.planning?.inboundWorking), inboundShipped: (r) => expNum(r.planning?.inboundShipped), inboundReceived: (r) => expNum(r.planning?.inboundReceived),
   awd: (r) => expNum(r.awd), awdInbound: (r) => expNum(r.awdInbound), totalFbaInv: (r) => expNum(r.totalFbaInv), amazonNetwork: (r) => expNum(r.amazonNetwork),
   recommended: (r) => expNum(r.recommended), pipeline: (r) => expNum(r.planning?.amazonPipeline), horizon: (r) => horizonLabel(r.effectiveHorizon),
   horizonDemand: (r) => expNum(r.planning?.horizonDemand), safety: (r) => expNum(r.planning?.safetyStockUnits), targetInv: (r) => expNum(r.planning?.targetInventory),
@@ -2239,11 +2245,16 @@ function DashboardApp({ session, access, onSignOut }) {
   const loadPlanColumns = useCallback(async () => {
     let local = null;
     try { const raw = localStorage.getItem(columnPrefsKey); if (raw) local = JSON.parse(raw); } catch { /* ignore */ }
+    // No saved preference anywhere yet -> the default view (raw component columns hidden).
     if (Array.isArray(local)) setPlanHiddenCols(new Set(local.map(String)));
+    else setPlanHiddenCols(new Set(PLAN_DEFAULT_HIDDEN_COLS));
     if (!session?.access_token) return;
     try {
       const r = await authFetch("/api/fba-plan-columns", session.access_token);
-      if (Array.isArray(r?.hiddenColumns)) setPlanHiddenCols(new Set(r.hiddenColumns.map(String)));
+      // A SAVED preference (updatedAt present) wins -- even an empty set (the user chose "Select all"). Only when the
+      // user has never saved AND there is no local copy do we fall back to the default view.
+      if (r && r.updatedAt) setPlanHiddenCols(new Set((r.hiddenColumns || []).map(String)));
+      else if (!Array.isArray(local)) setPlanHiddenCols(new Set(PLAN_DEFAULT_HIDDEN_COLS));
     } catch { /* keep local */ }
   }, [columnPrefsKey, session?.access_token]);
   useEffect(() => { if (view === "fbaplan") loadPlanColumns(); }, [view, loadPlanColumns]);
@@ -2779,7 +2790,12 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", cell: (r) => td("fbaDaysCover", r.fbaDaysCover), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
       { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "reserved_customer_order — units already allocated to placed customer orders. DISPLAY ONLY: already sold, never counted as usable/planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
       { id: "reserved", group: "Inventory", label: "Reserved (FC)", chooserLabel: "Reserved (FC transfer + processing)", sortKey: "reserved", thTitle: "reserved_fc_transfer + reserved_fc_processing (raw, no subtraction) — in-FC, temporarily unavailable, becoming sellable. Distinct from Cust. Reserved.", cell: (r) => td("reserved", r.reserved), foot: (t) => <td key="reserved" className="mono">{t.anyInv ? nInt(t.reserved) : "—"}</td> },
+      { id: "reservedFcTransfer", group: "Inventory", label: "FC Transfer", chooserLabel: "· reserved_fc_transfer (raw)", defaultHidden: true, thTitle: "reserved_fc_transfer (raw). A component of Reserved (FC).", cell: (r) => td("reservedFcTransfer", r.planning?.reservedFcTransfer), foot: () => <td key="reservedFcTransfer" className="mono">—</td> },
+      { id: "reservedFcProcessing", group: "Inventory", label: "FC Processing", chooserLabel: "· reserved_fc_processing (raw)", defaultHidden: true, thTitle: "reserved_fc_processing (raw). A component of Reserved (FC).", cell: (r) => td("reservedFcProcessing", r.planning?.reservedFcProcessing), foot: () => <td key="reservedFcProcessing" className="mono">—</td> },
       { id: "inboundPipeline", group: "Inventory", label: "Inbound Pipeline", chooserLabel: "Inbound pipeline (working+shipped+received)", sortKey: "inboundPipeline", thTitle: "inbound_working + inbound_shipped + inbound_received — en route to the FBA network, not yet sellable.", cell: (r) => td("inboundPipeline", r.inboundPipeline), foot: (t) => <td key="inboundPipeline" className="mono">{t.anyInv ? nInt(t.inboundPipeline) : "—"}</td> },
+      { id: "inboundWorking", group: "Inventory", label: "Inbound Working", chooserLabel: "· inbound_working (raw)", defaultHidden: true, thTitle: "inbound_working (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundWorking", r.planning?.inboundWorking), foot: () => <td key="inboundWorking" className="mono">—</td> },
+      { id: "inboundShipped", group: "Inventory", label: "Inbound Shipped", chooserLabel: "· inbound_shipped (raw)", defaultHidden: true, thTitle: "inbound_shipped (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundShipped", r.planning?.inboundShipped), foot: () => <td key="inboundShipped" className="mono">—</td> },
+      { id: "inboundReceived", group: "Inventory", label: "Inbound Received", chooserLabel: "· inbound_received (raw)", defaultHidden: true, thTitle: "inbound_received (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundReceived", r.planning?.inboundReceived), foot: () => <td key="inboundReceived" className="mono">—</td> },
       { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available (distributable)", sortKey: "awd", awd: true, thTitle: "awd_available_distributable_quantity — distributable AWD stock; counts as usable replenishment supply. US only.", cell: (r) => td("awd", r.awd), foot: (t) => <td key="awd" className="mono">{t.anyAwd ? nInt(t.awd) : "—"}</td> },
       { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound (not yet distributable)", awd: true, thTitle: "awd_total_inbound_quantity — inbound TO the AWD warehouse, NOT yet distributable. DISPLAY ONLY: excluded from usable supply. US only.", cell: (r) => td("awdInbound", r.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
       { id: "totalFbaInv", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory (FBA only)", sortKey: "totalFbaInv", thTitle: "Sellable Now + Reserved (FC) + Inbound Pipeline. FBA network only — excludes AWD, seller warehouse and customer-order reserve.", cell: (r) => td("totalFbaInv", r.totalFbaInv), foot: (t) => <td key="totalFbaInv" className="mono">{t.anyInv ? nInt(t.totalFbaInv) : "—"}</td> },
@@ -4091,7 +4107,7 @@ function DashboardApp({ session, access, onSignOut }) {
                 groups={planColumnGroups} hidden={planHiddenCols} isUS={planData.isUS === true} busy={planColsBusy}
                 onToggle={(id) => { const next = new Set(planHiddenCols); if (next.has(id)) next.delete(id); else next.add(id); savePlanColumns(next); }}
                 onSelectAll={() => savePlanColumns(new Set())}
-                onReset={() => savePlanColumns(new Set())}
+                onReset={() => savePlanColumns(new Set(PLAN_DEFAULT_HIDDEN_COLS))}
                 onClose={() => setPlanColsOpen(false)}
               />
             )}
