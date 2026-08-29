@@ -13160,3 +13160,40 @@ Supabase / DATADOE_API_KEY, so per the token-safety rule NO create was attempted
      request identity. Until run, Cust. Reserved + AWD Inbound show em dash and Reserved reflects the old snapshot
      until the next fba-plan derive republishes v2d-4.
   3. Authenticated prod read-backs of the deployed fba-plan (new columns + raw Reserved).
+
+================================================================================
+2026-08-29 -- FBA Plan Increment 2 (cont.): canonical inventory model + SKU coverage (commit 0723130)
+================================================================================
+CONTINUATION mission Phases 2-3-5 done as CODE (Phases 4/6/7 still credential-blocked -- only VERCEL_OIDC_TOKEN this
+session, no POSTGRES_URL / Supabase / DATADOE_API_KEY, so NO create attempted). `npm run verify` 88/88.
+
+PHASE 2 -- fixed TWO real correctness defects + unified the inventory model:
+* BUG (introduced in Increment 2): awd_total_inbound_quantity was added into usable network stock + the planning
+  shortage. AWD inbound is inbound TO the AWD warehouse, NOT yet distributable -> now DISPLAY ONLY; only
+  awd_available_distributable_quantity is usable supply. (The test at fba-planning.test.js:143 that codified the old
+  behavior was corrected to assert exclusion.)
+* CONTRADICTION: legacy "Total FBA Inv." (available + reserved + shipped+received [working EXCLUDED] + AWD) vs the
+  engine's network position (included inbound_working) disagreed, and "Total FBA Inv." wrongly included AWD. Now ONE
+  canonical, non-overlapping model drives table + totals + export + planning + labels:
+    Sellable Now=available; Reserved(FC)=fc_transfer+fc_processing (raw); Inbound Pipeline=working+shipped+received;
+    Total FBA Inv.=Sellable Now+Reserved(FC)+Inbound Pipeline (FBA only, NO AWD/WH); Amazon Network Pos.=Total FBA
+    Inv.+AWD Available (= planning supply); Total Network Pos.=+Seller WH. Cust. Reserved (reserved_customer_order)
+    display-only. Recommend=ceil(Target Units - Amazon Network Pos.); Target Units uses the corrected daily run rate.
+  Column "In Transit" -> "Inbound Pipeline" (now includes working); new "Amazon Network Pos." column. Excel export is
+  now built from the VISIBLE columns via the same model (export == what you see). This is a CLIENT-side recompute from
+  the snapshot's raw per-field data, so it is live on deploy (no re-derive needed); the new raw fields
+  (reserved_customer_order/awd_inbound) themselves still need the pending source refresh/re-derive to be non-null.
+
+PHASE 3 -- seller-warehouse SKU coverage:
+* Derive now exposes payload.accountSkus = the durable account SKU UNIVERSE (every SKU in any source: inventory, AWD,
+  sales), a superset of the per-ASIN representative SKUs. (Product Catalog has NO sku column, so the SKU evidence is
+  inventory/AWD/sales.) Both derive paths byte-identical. Activates on next re-derive; frontend falls back to plan-row
+  SKUs when absent.
+* Bulk-import isolation now uses (accountSkus UNION saved-warehouse SKUs): a warehouse-only / multi-SKU / zero-activity
+  account SKU imports; unknown/cross-account still fails closed.
+* A saved warehouse SKU the per-ASIN plan does not show appears as a synthetic WAREHOUSE-ONLY row (Seller WH units +
+  honest em dashes; inventory genuinely unavailable, never a 0). Works client-side today (no re-derive needed).
+
+STILL PENDING (credential-blocked, unchanged): apply migration 20260903 (`npm run db:migrate`); guarded source refresh
+(<=9 creates/39 tokens, verify balance first) to populate reserved_customer_order + awd_* + accountSkus; 30-account
+authenticated prod read-backs; responsive visual checks. See [[fba-plan-advanced]].
