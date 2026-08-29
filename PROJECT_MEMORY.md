@@ -13061,3 +13061,51 @@ badges intact, fonts do not scale with viewport. The temporary preview harness (
 for the screenshots was DELETED before commit; it never ships.
 
 STATUS: code+tests committed on main (2fa3b66). Push + Vercel deploy + prod read-backs pending.
+
+## FBA Shipment Plan -- durable per-seller planning config + planning outputs (2026-08-29, code c32db96, migration 20260902)
+
+INCREMENT 1 of the FBA Shipment Plan upgrade: extends (never replaces) report `fba-plan`/`fba-plan-shared-v1` into a
+configurable inventory/production planner. TOKEN-FREE: no source-contract / derivation / snapshot (`fba-plan/v2d-3`) /
+DataDoe change; no new source cycle. Architecture = CLIENT-side re-derivation from (the existing durable fba-plan
+snapshot + new durable per-seller config), mirroring the existing browser-only target-days pattern, so a settings or
+warehouse change recomputes locally with ZERO DataDoe. fba-plan serve stays READ-only; scheduler + manual FBA sync
+still converge on runSourceCardAction (unchanged).
+
+DURABLE STORES (migration 20260902_fba_planning.sql, APPLIED + prod-verified; all org+account isolated; RLS
+account-scoped read via account_permissions OR is_dashboard_admin; authenticated SELECT-only; service_role writes;
+audit service-role-only): fba_planning_settings (horizon = 1/2/3-month preset OR 1-365 custom days; forecast method
+three-month|mtd|higher|weighted + weights; safety days), fba_sku_horizon_overrides (optional per-SKU horizon;
+resolution SKU > account > system-default 2 months), fba_seller_warehouse (seller-OWNED units; nonnegative whole;
+never Amazon inventory) + fba_seller_warehouse_audit (append-only) + record_fba_seller_warehouse (SECURITY DEFINER
+upsert/clear + audit in one txn). Account-scoped API api/fba-plan-config.js (assertAccountAccess; validates + audits).
+
+PURE ENGINE src/lib/fba-planning.js (scripts/fba-planning.test.js, 13 assertions): calendar-aware horizon windows
+(real month boundaries, e.g. Jan 31 +1mo -> Feb 28; custom = exact days) exposing projection start/end + effective
+horizon days; the UNCHANGED current-month MTD projection = (mtdUnits/elapsed)*daysInMonth from the proven
+effectiveAsOf; baseMonthlyForecast for all four methods (weighted requires weights totalling EXACTLY 100 else
+Unavailable); dailyRunRate/horizonDemand/safetyStock/targetInventory; and the DOCUMENTED NON-OVERLAPPING inventory
+equation: immediatelyAvailable = available; amazonPipeline = inbound_working + inbound_shipped + inbound_received +
+reserved_fc_processing + max(0, reserved_fc_transfer - inbound_shipped); customerOrderReserved DISPLAY-ONLY (excluded
+from every usable-stock total); totalAmazonAwdStock adds validated US-AWD; totalNetworkStock adds seller warehouse.
+total_reserved_quantity + inbound_quantity are NEVER used. Proven: no quantity double-counted; AWD only for a US
+account with validated evidence (Non-US + missing US-AWD = null/Unavailable, never 0); no Infinity/NaN/negative.
+shortageBeforeWarehouse/shipFromSellerWarehouse/productionRequirement + an em-dash-with-reason estimatedStockoutDate.
+NOTE: the snapshot already stores reservedFcTransfer as max(0, fcTransfer - inboundShipped), so the frontend passes
+fcTransferAlreadyAdjusted:true (no second subtraction).
+
+FRONTEND (src/App.jsx, fba-plan block only, additive): a durable PlanningSettingsBar (horizon presets/custom +
+forecast method + weights editor + safety days, saved server-side + recompute), a WarehouseCell inline editor, per-
+account config load (reset on account switch -> no cross-account leak), planComputed merges r.planning via
+computePlanningRow, and new columns (Amazon Pipeline, Horizon Demand, Safety, Target Inv, Seller WH, Ship WH, Produce,
+Est. Stockout, Priority) + footer totals. EVERY existing column / formula / filter / sort / LKG / US-only-AWD gating /
+read-only-reload behaviour is preserved. theme.js gained only additive .plan-settings/.plan-seg/.plan-wh/.plan-prio
+classes. Full `npm run verify` 87/87 green; 0 DataDoe tokens; no protected path (Daily/Dashboard/Brand View/SKU
+Movement/OLI/scheduler/contracts/derivation) touched.
+
+DEFERRED follow-ups (documented, not yet built): the SKU-override EDIT control + bulk CSV (backend/resolution/compute
+done); seller-warehouse BULK import (net-new upload->preview->validate->apply subsystem; no import infra exists);
+the custom Column Chooser; and TOKEN-GATED Increment 2 -- add reserved_customer_order to FBA_HEALTH_COLUMNS and
+marketplace_country_code + awd_total_inbound_quantity to LISTINGS_AWD_COLUMNS (both fba-plan-only column sets). Those
+change the fba-plan inventory + AWD request hashes -> ~6 FBA-inventory + ~2 AWD premium creates (~40 tokens) after
+verifying DataDoe /exports/sources metadata + the live token balance. Until run, Customer Order Reserved + AWD Inbound
+render Unavailable (the engine already treats them null, never a fabricated 0).
