@@ -12914,3 +12914,62 @@ VERIFIED with headless-Chrome screenshots at 1440/1280/768/390 (no page overflow
 headless clamps to a 500px min viewport, so 390 was checked via a width-constrained main-area). npm run verify green
 (84 steps / 64 suites incl. build). Named-brand scope never falls back to All Brands; cache-first + read-only reload +
 auto-revalidation + provisional/final completeness all intact.
+
+## OLI operational units -- retain & classify EVERY observed unit for unit reporting + SKU Movement (2026-08-29, code f9c8de0)
+
+ADDITIVE feature so operational unit reporting + SKU Movement count EVERY OLI unit, with revenue/ratios/scheduler/
+publishing/dashboards byte-identical. ROOT CAUSE of the undercount: oliDimensionalRowsFromFragment
+(lib/server/sync/source-durable-model.js, the `if (c.pending || c.defect) continue;` gate) dropped PENDING units from
+every persisted grain (they were only aggregate-counted in source_oli_completeness), and while EXPLICIT-ZERO units
+reached source_oli_dimensional_history they were excluded from the priced rollup (source_oli_daily_history) and from
+SKU Movement (which reads daily-history `units` filtered `sales_amount gt.0`). So zero + pending units never showed.
+
+CANONICAL METRICS (documented, in lib/server/sync/oli-order-rules.js):
+  pricedUnits = non-cancelled units, item_price_value > 0
+  explicitZeroUnits = non-cancelled units, item_price_value <= 0 (an explicit zero)
+  pendingPriceUnitsWithSku / WithoutSku = non-cancelled NULL-price units split by canonical SKU/ASIN presence
+  observedUnits = priced + zero + pendingWith + pendingWithout
+  skuMovementUnits = (priced + zero + pendingWith) counted ONLY where identity exists
+  totalSales = SUM(item_price_value) for non-cancelled PRICED rows only  -- UNCHANGED. NULL is NEVER coerced to 0.
+
+DESIGN (all additive; the priced rollup / revenue path is never read from the new table):
+- Migration 20260901_oli_operational_units.sql (PREPARED): new table source_oli_operational_units at the daily-rollup
+  grain (org, conn, account, sale_date, sku, child_asin, currency) with per-class columns priced_units, priced_sales
+  (nullable), explicit_zero_units, pending_units, cancelled_units; service-role-only, written ONLY via SECURITY
+  DEFINER RPCs. replace_oli_dimensional_window gains a 9th arg p_unit_rows (default NULL): NULL SKIPS the operational
+  block entirely (a legacy caller never disturbs it), a supplied array (even []) REPLACES the account/window
+  atomically alongside the UNCHANGED dimensional/rollup/order-audit/coverage. Plus a standalone
+  replace_oli_operational_units_window RPC for the zero-export backfill.
+- Canonical classifier + metrics (oli-order-rules.js): oliUnitClass, OLI_UNIT_CLASS, hasCanonicalIdentity,
+  operationalUnitMetrics, operationalUnitsFromDimensionalRows -- the single source of truth, used everywhere.
+- oliDimensionalRowsFromFragment returns operationalUnitsByAccount (EVERY class incl. cancelled + pending; a blocked/
+  defect account writes none -> LKG preserved). source-bucket-sync passes unitRows to replaceHistoryWindow, so the
+  scheduler, Data Sync Center manual sync, and force-latest (all converge on runSourceCardAction->run->
+  runBucketSourceSync) hit the SAME shared persist. Idempotent + atomic; a settled export REPLACES the window so a
+  pending->priced (or zero->priced) settle never double-counts.
+- SKU Movement (sku-movement-durable-rederive.js) adds explicit-zero + pending-WITH-SKU units (identity-only; a
+  SKU-less pending unit is NEVER placed under an Unmapped SKU) on top of the UNCHANGED priced daily-rollup source
+  (getSourceOliHistoryRows). New reader getSourceOliOperationalUnitRows (additiveOnly filter). Named-brand isolation
+  and every metric (MTD / last-5 / prev-5 / completed months / movement% / run rate / projection / status) unchanged.
+- Serve completeness augment (oli-completeness-serve.js) gains unitBreakdown (summarizeOperationalUnitBreakdown for
+  the headline day) attached to Daily / Sales Dashboard / Brand View (single + portfolio) / SKU Movement. New shared
+  ObservedUnitsBreakdown component (src/components/ui.jsx + theme.js .obs-* classes) renders the transparent breakdown
+  (priced / explicit-zero / pending-with-SKU / unallocated-pending / cancelled / total observed / status) with the
+  honest "revenue excludes zero+pending; values reconcile on later refreshes" note. Provisional/Final stays from the
+  completeness table (no red banner for expected pending itemization).
+- DEPLOY-SAFE (decoupled from the migration): replaceOliDimensionalWindow tries the 9-arg RPC and, on a PGRST202
+  function-signature-missing error (new isFunctionSignatureMissingError), falls back to the 8-arg call so the priced
+  rollup keeps persisting; operational reads degrade to [] (isSchemaMissingError) if the table is absent.
+- schema-contract entry (migration 16) + proof replace-oli-operational-units (null-guard on the 9-arg RPC).
+- Tests: scripts/oli-operational-units.test.js (24 assertions) covers all 20 required scenarios (priced / explicit-
+  zero / pending-with-sku / pending-without-sku / cancelled / settle-no-double-count / zero->priced / idempotent
+  replay / mixed window / seller isolation / cross-account refuse / malformed fail-closed / defect blocked / named-
+  brand isolation / no-Unmapped / revenue+ROI+ACoS+TACoS unchanged / shared-persist parity / zero-export / null-skip /
+  production-shaped breakdown / backfill aggregator / deploy-safety). Full `npm run verify` 85/85 steps green (incl.
+  build); git diff --check clean.
+
+STATUS: code+tests+migration committed on main (f9c8de0), migration UNAPPLIED, nothing deployed yet, 0 tokens. Pending
+(need prod DB access / tokens): apply migration via guarded runner, push to origin/main + verify Vercel, read-only prod
+reconciliation, one OLI-only sync per bucket (<=5 sellers, token ceilings) to populate current observations, optional
+zero-export backfill (scripts/release/oli-operational-units-backfill.mjs) for historical priced+zero+cancelled, then
+US + Non-US read-backs (all-brand + named-brand + Daily + Brand View + SKU Movement) and controls-safe-closed check.
