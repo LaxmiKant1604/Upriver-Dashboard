@@ -13197,3 +13197,37 @@ PHASE 3 -- seller-warehouse SKU coverage:
 STILL PENDING (credential-blocked, unchanged): apply migration 20260903 (`npm run db:migrate`); guarded source refresh
 (<=9 creates/39 tokens, verify balance first) to populate reserved_customer_order + awd_* + accountSkus; 30-account
 authenticated prod read-backs; responsive visual checks. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-29 -- FBA Plan: durable SKU DIRECTORY + brand-correct warehouse rows + identity-aware import (commit 9ba7821)
+================================================================================
+CONTINUATION Phases 1-4 done as CODE (Phases 5/6/7/8 still credential-blocked -- only VERCEL_OIDC_TOKEN; no
+POSTGRES_URL / Supabase / DATADOE_API_KEY, so NO create attempted). `npm run verify` 89/89 across 69 suites.
+
+ROOT CAUSE fixed: accountSkus was string-only + SKU->ASIN was reconstructed from visible plan rows, so dropped /
+warehouse-only SKUs lost ASIN/product/brand and synthetic rows were brand:null with placeholder text (and broke under
+named-brand filtering).
+
+PHASE 1 -- derive SKU directory (snapshotVersion v2d-4 -> v2d-5; derivation-core.js + api/datadoe.js byte-identical):
+* payload.accountSkuDirectory = one entry per SKU proven in an ACCOUNT source (inventory > AWD > sales, provenance
+  recorded): { sku, childAsin, productName, brand, marketplace, provenance }. A SKU maps to exactly one child ASIN.
+* payload.catalogByAsin = org-wide Product Catalog ASIN -> {brand, productName}; ENRICHES + proves an ASIN EXISTS, does
+  NOT prove account membership (Catalog has no sku column). accountSkus kept (from directory) for backward compat.
+
+PHASE 2 -- warehouse-only rows functional: synthetic rows take identity from the client directory (snapshot directory
+UNION saved warehouse rows enriched via catalogByAsin) -> real childAsin/product/canonical brand; no proven brand ->
+Unmapped, never under another brand. Amazon/sales values stay em dashes. Brand filtering is canonical-key based (new
+pure src/lib/plan-brand.js matchesPlanBrand): All=all; named brand=only brandKey matches, NEVER falls back to All;
+new "Unmapped" option (fbaplan view only). Seller WH never in FBA/AWD totals.
+
+PHASE 3 -- identity-aware import: known SKU may omit child ASIN (resolved from directory); conflicting SKU->ASIN
+rejected; new manual SKU REQUIRES a child ASIN that exists in catalogByAsin, else rejected; cross-account/non-catalog
+fails closed; every valid row carries resolved childAsin + provenance ("existing"|"manual"). Older snapshots fall back
+to the string allowlist so imports still work; a re-derive upgrades them.
+
+PHASE 4 -- tests: report-fba-plan directory identity + catalog-existence; warehouse-import directory/manual/conflict/
+cross-account; new plan-brand suite; engine seller-WH counted-once + never-in-FBA/AWD.
+
+STILL PENDING (credential-blocked): apply migration 20260903 (`npm run db:migrate`); guarded source refresh (<=9
+creates/39 tokens, verify balance first) to populate reserved_customer_order + awd_* + the v2d-5 directory; 30-account
+authenticated prod read-backs; responsive screenshots. See [[fba-plan-advanced]].
