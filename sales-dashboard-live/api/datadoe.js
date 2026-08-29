@@ -1891,6 +1891,7 @@ const FBA_HEALTH_COLUMNS = [
   "fnsku",
   "product_name",
   "available",
+  "reserved_customer_order",
   "reserved_fc_transfer",
   "reserved_fc_processing",
   "inbound_working",
@@ -1903,10 +1904,12 @@ const FBA_HEALTH_COLUMNS = [
 // orderBy.
 const LISTINGS_SOURCE_ID = "ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3";
 const LISTINGS_AWD_COLUMNS = [
+  "marketplace_country_code",
   "child_asin",
   "sku",
   "fnsku",
   "awd_available_distributable_quantity",
+  "awd_total_inbound_quantity",
 ];
 // Inventory Health is a daily snapshot; look back a short window and keep the
 // latest snapshot date. DESC ordering guarantees the full latest snapshot is at
@@ -3537,10 +3540,11 @@ async function handleDataDoe(req, res) {
         if (!asin) continue;
         asinSet.add(asin);
         const cur = invByAsin[asin] || (invByAsin[asin] = {
-          available: 0, fcTransfer: 0, fcProcessing: 0,
+          available: 0, customerOrderReserved: 0, fcTransfer: 0, fcProcessing: 0,
           inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
         });
         cur.available += num(r.available);
+        cur.customerOrderReserved += num(r.reserved_customer_order); // display-only; never usable stock
         cur.fcTransfer += num(r.reserved_fc_transfer);
         cur.fcProcessing += num(r.reserved_fc_processing);
         cur.inboundShipped += num(r.inbound_shipped);
@@ -3564,8 +3568,9 @@ async function handleDataDoe(req, res) {
       }
       const inventoryAvailable = invRows.length > 0;
 
-      // 5) AWD available (US only), folded from SKU to ASIN.
+      // 5) AWD available + inbound (US only), folded from SKU to ASIN. Defensive US-only marketplace guard.
       const awdByAsin = {};
+      const awdInboundByAsin = {};
       let awdAvailable = false;
       if (isUS) {
         const awdRows = await fetchExportRows(
@@ -3575,9 +3580,12 @@ async function handleDataDoe(req, res) {
         );
         awdAvailable = awdRows.length > 0;
         for (const r of awdRows) {
+          const mkt = String(r.marketplace_country_code || "").trim().toUpperCase();
+          if (mkt && mkt !== "US") continue; // US-only: never let a non-US AWD row leak in
           const asin = String(r.child_asin || "").trim();
           if (!asin) continue;
           awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
+          awdInboundByAsin[asin] = (awdInboundByAsin[asin] || 0) + num(r.awd_total_inbound_quantity);
           const sku = String(r.sku || "").trim();
           if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
         }
@@ -3601,17 +3609,15 @@ async function handleDataDoe(req, res) {
         }
         const mtdUnits = num(mtdByAsin.get(asin));
         salesTotal += mtdUnits;
+        // Activity total for the drop check (customer-order-reserved kept as activity). All states are DISTINCT per the
+        // source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a separate reserved
+        // state), so there is NO transfer/shipped overlap to subtract -- reserved_fc_transfer is stored RAW.
         const invTotal = inv
-          ? inv.available + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
+          ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
           : 0;
         const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
-        if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0) continue;
-        // DataDoe's FBA Inventory Health snapshot can include the same units in
-        // both `reserved_fc_transfer` and `inbound_shipped`. Amazon exposes
-        // that overlap only as Inbound, so subtract it from the FC-transfer
-        // reserve before returning the planning components. This preserves a
-        // genuine residual FC-transfer balance without double-counting stock.
-        const adjustedFcTransfer = inv ? Math.max(0, inv.fcTransfer - inv.inboundShipped) : 0;
+        const awdInboundUnits = isUS ? num(awdInboundByAsin[asin]) : 0;
+        if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
         rows.push({
           asin,
           productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
@@ -3623,12 +3629,14 @@ async function handleDataDoe(req, res) {
           // it genuinely holds no FBA stock (0). When the whole snapshot is
           // unavailable, inventory fields are null so the UI can flag it.
           fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-          reservedFcTransfer: inventoryAvailable ? adjustedFcTransfer : null,
+          customerOrderReserved: inventoryAvailable ? num(inv?.customerOrderReserved) : null,
+          reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
           reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
           inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
           inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
           inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
           awdAvailable: isUS ? awdUnits : null,
+          awdInbound: isUS ? awdInboundUnits : null,
         });
       }
 

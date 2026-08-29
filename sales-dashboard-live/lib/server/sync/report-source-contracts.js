@@ -138,8 +138,14 @@ const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_
 // fba-plan: derives per-ASIN monthly units + the current-month latest-sales-date probe from the ONE
 // shared canonical Order Line Items sales fragment (OLI_SALES_*, Blocker 1) -- no dedicated units export --
 // plus catalog + FBA Inventory Health + US-only AWD listings.
-const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
-const LISTINGS_AWD_COLUMNS = ["child_asin", "sku", "fnsku", "awd_available_distributable_quantity"];
+// FBA Inventory Health (44fc5ba0ce): every field verified NUMBER via GET /exports/sources metadata. reserved_customer_order
+// is a SEPARATE reserved state (display-only, never usable stock). total_reserved_quantity + inbound_quantity (the
+// aggregates) are DELIBERATELY not requested -- inbound_quantity = sum(inbound_working, inbound_shipped, inbound_received)
+// per the source metadata, so requesting an aggregate alongside its components would double-count.
+const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_customer_order", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
+// Listings (ba689c05d7) AWD -- US only. awd_total_inbound_quantity added (verified NUMBER); marketplace_country_code
+// carried so the US-only rows can never be attributed to another marketplace.
+const LISTINGS_AWD_COLUMNS = ["marketplace_country_code", "child_asin", "sku", "fnsku", "awd_available_distributable_quantity", "awd_total_inbound_quantity"];
 
 /* ---- insight-report constants (transcribed verbatim from lib/server/reports/*.js;
    parity-tested against the builder files). All insight DataDoe fetches use

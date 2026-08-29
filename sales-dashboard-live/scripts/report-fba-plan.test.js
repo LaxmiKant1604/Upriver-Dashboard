@@ -145,10 +145,10 @@ const OLI = [
 ];
 const CATALOG = [{ child_asin: "ASIN1", product_brand: "Acme", product_name: "Widget" }, { child_asin: "ASIN2", product_brand: "Beta", product_name: "Gadget" }];
 const INV = [
-  { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", marketplace_country_code: "US", available: 100, reserved_fc_transfer: 8, reserved_fc_processing: 1, inbound_shipped: 5, inbound_received: 2, inbound_working: 0, product_name: "Widget Inv" },
+  { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", marketplace_country_code: "US", available: 100, reserved_customer_order: 4, reserved_fc_transfer: 8, reserved_fc_processing: 1, inbound_shipped: 5, inbound_received: 2, inbound_working: 0, product_name: "Widget Inv" },
   { date: "2025-08-01", child_asin: "ASIN1", sku: "SKU-OLD", available: 999 }, // older snapshot -> ignored
 ];
-const AWD = [{ child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 42 }];
+const AWD = [{ marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15 }];
 
 // Hand-computed expected payload, transcribed from the api/datadoe.js `fba-plan` handler formula.
 const EXPECTED = {
@@ -168,8 +168,8 @@ const EXPECTED = {
   inventoryAvailable: true,
   awdAvailable: true,
   rows: [
-    { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaAvailable: 100, reservedFcTransfer: 3, reservedFcProcessing: 1, inboundShipped: 5, inboundReceived: 2, inboundWorking: 0, awdAvailable: 42 },
-    { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0 },
+    { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaAvailable: 100, customerOrderReserved: 4, reservedFcTransfer: 8, reservedFcProcessing: 1, inboundShipped: 5, inboundReceived: 2, inboundWorking: 0, awdAvailable: 42, awdInbound: 15 },
+    { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, customerOrderReserved: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0, awdInbound: 0 },
   ],
   inventoryByBrandCountry: [{ country: "US", brand: "Acme", fbaAvailable: 100, skuCount: 1 }],
 };
@@ -194,13 +194,22 @@ test("fba-plan: representative SKU is the first localeCompare SKU (stable across
   assert.equal(row.sku, "SKU-A");
 });
 
-test("fba-plan: FC-transfer/inbound overlap is subtracted (max(0, fcTransfer - inboundShipped))", () => {
+test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {
+  // The authoritative source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a
+  // SEPARATE reserved state) proves the two do NOT overlap, so reserved_fc_transfer is returned in full.
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  assert.equal(deriveFba(planned, rows).payload.rows[0].reservedFcTransfer, 3); // 8 - 5
-  // Floor at zero when inbound exceeds the FC-transfer reserve.
+  assert.equal(deriveFba(planned, rows).payload.rows[0].reservedFcTransfer, 8, "full reserved_fc_transfer, never 8-5");
+  // Even when inbound_shipped exceeds reserved_fc_transfer, the transfer reserve is returned in full (no floor-at-zero).
   const inv2 = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 1, reserved_fc_transfer: 2, inbound_shipped: 9 }];
   const two = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv2, awdRows: [] });
-  assert.equal(deriveFba(two.planned, two.rows).payload.rows[0].reservedFcTransfer, 0);
+  assert.equal(deriveFba(two.planned, two.rows).payload.rows[0].reservedFcTransfer, 2, "raw 2, never subtracted to 0");
+});
+
+test("fba-plan: reserved_customer_order + AWD inbound are folded (US); customer-order-reserved is display-only", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const a1 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN1");
+  assert.equal(a1.customerOrderReserved, 4, "reserved_customer_order folded + displayed separately");
+  assert.equal(a1.awdInbound, 15, "awd_total_inbound_quantity folded (US)");
 });
 
 test("fba-plan: completed-month + MTD units are preserved per ASIN", () => {

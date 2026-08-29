@@ -94,15 +94,39 @@ test("11/12. Customer Order Reserved is displayed but EXCLUDED from usable stock
   // immediatelyAvailable = available; customer-order-reserved is separate + NOT in any usable total.
   assert.equal(r.immediatelyAvailable, 100);
   assert.equal(r.customerOrderReserved, 40);
-  // amazonPipeline = working + shipped + received + fcProcessing + max(0, fcTransfer - shipped) = 20+8+12+5+max(0,10-8)=47
-  assert.equal(r.amazonPipeline, 20 + 8 + 12 + 5 + Math.max(0, 10 - 8));
-  // totalAmazonAwdStock = 100 + 47 + 0(no AWD, non-US) ; customer reserved NOT added.
-  assert.equal(r.totalAmazonAwdStock, 100 + 47);
+  // amazonPipeline = working + shipped + received + fcProcessing + reserved_fc_transfer (RAW, no subtraction) = 20+8+12+5+10
+  assert.equal(r.amazonPipeline, 20 + 8 + 12 + 5 + 10);
+  assert.equal(r.reservedFcTransfer, 10, "reserved_fc_transfer is RAW -- no inbound-shipped subtraction");
+  // totalAmazonAwdStock = 100 + 55 + 0(no AWD, non-US) ; customer reserved NOT added.
+  assert.equal(r.totalAmazonAwdStock, 100 + 55);
   // Prove no double count: the sum of the distinct display components equals totalAmazonAwdStock, and adding
   // customerOrderReserved would OVER-count (guard).
   const distinct = r.immediatelyAvailable + r.inboundWorking + r.inboundShipped + r.inboundReceived + r.reservedFcProcessing + r.reservedFcTransfer;
   assert.equal(distinct, r.totalAmazonAwdStock, "every distinct inventory component is counted exactly once");
   assert.notEqual(r.totalAmazonAwdStock, distinct + r.customerOrderReserved, "customer-order-reserved is never added into usable stock");
+});
+
+test("no transfer/shipped subtraction: reserved_fc_transfer + inbound_shipped are both counted in full (distinct states)", () => {
+  // A SKU with fc_transfer=30 and inbound_shipped=25 -- the OLD code would have subtracted to fc_transfer=5. The
+  // authoritative source metadata (inbound_quantity = sum of inbound states; fc_transfer separate) proves no overlap,
+  // so BOTH are counted in full.
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 0, reservedFcTransfer: 30, inboundShipped: 25, monthlyValues: [30, 30, 30], mtdUnits: 28, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(r.reservedFcTransfer, 30, "no subtraction: full reserved_fc_transfer");
+  assert.equal(r.amazonPipeline, 25 + 30, "inbound_shipped + reserved_fc_transfer both counted in full");
+});
+
+/* ===== forecast engine: a missing month/MTD is Unavailable, never treated as 0 ===== */
+test("forecast requires proven inputs: missing month -> three-month Unavailable; higher uses the available side; MTD covered-zero is 0", () => {
+  // Only two of three months present -> three-month average is Unavailable (null), NOT an average of a fabricated 0.
+  assert.equal(baseMonthlyForecast({ method: "three-month", monthlyValues: [300, null, 420] }), null);
+  assert.equal(baseMonthlyForecast({ method: "three-month", monthlyValues: [300, 0, 420] }), Math.round((300 + 0 + 420) / 3 * 100) / 100, "a covered-zero month IS counted");
+  // higher uses only the available side; a missing side is never 0.
+  assert.equal(baseMonthlyForecast({ method: "higher", monthlyValues: [300, null, 420], mtdProjected: 500 }), 500, "3mo unavailable -> higher = MTD");
+  assert.equal(baseMonthlyForecast({ method: "higher", monthlyValues: [300, 360, 420], mtdProjected: null }), 360, "MTD unavailable -> higher = 3mo avg");
+  assert.equal(baseMonthlyForecast({ method: "higher", monthlyValues: [null, null, null], mtdProjected: null }), null, "both sides unavailable -> Unavailable");
+  // weighted: a positive-weight input that is missing -> Unavailable (never treated as 0).
+  assert.equal(baseMonthlyForecast({ method: "weighted", monthlyValues: [300, null, 420], mtdProjected: 500, weights: [25, 25, 25, 25] }), null, "positive weight on a missing month -> Unavailable");
+  assert.equal(baseMonthlyForecast({ method: "weighted", monthlyValues: [300, null, 420], mtdProjected: 500, weights: [50, 0, 25, 25] }), Math.round((0.5 * 300 + 0.25 * 420 + 0.25 * 500) * 100) / 100, "a zero-weight missing month is fine");
 });
 
 test("13. aggregate fields (total_reserved_quantity / inbound_quantity) are never referenced by the helper", () => {

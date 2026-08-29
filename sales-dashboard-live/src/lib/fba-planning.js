@@ -111,23 +111,32 @@ export function validateWeights(weights) {
   return { valid: sum === 100, sum, weights: w };
 }
 // baseMonthlyForecast (a MONTHLY unit figure). monthlyValues = the 3 completed months [m1,m2,m3] (oldest->newest);
-// mtdProjected = the current-month MTD projection. Returns null only when the chosen method has no usable input.
+// each is a NUMBER (a covered zero is 0) or null (that month has NO proven evidence). mtdProjected = the current-month
+// MTD projection (or null). A missing month / MTD is NEVER coerced to 0: a method that needs a missing input returns
+// null (Unavailable). This is the fix that removes the old map(num0) missing-to-zero behaviour.
 export function baseMonthlyForecast({ method = DEFAULT_FORECAST_METHOD, monthlyValues = [], mtdProjected = null, weights = null } = {}) {
-  const months = (Array.isArray(monthlyValues) ? monthlyValues : []).map(num0);
-  const threeMonthAverage = months.length ? Math.round((months.reduce((s, x) => s + x, 0) / months.length) * 100) / 100 : 0;
-  const mtd = num0(mtdProjected);
+  const months = (Array.isArray(monthlyValues) ? monthlyValues : []).map((v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v)));
+  // Three-month average REQUIRES all three completed months present (else Unavailable).
+  const allThree = months.length === 3 && months.every((v) => v != null);
+  const threeMonthAverage = allThree ? Math.round((months.reduce((s, x) => s + x, 0) / 3) * 100) / 100 : null;
+  const mtd = mtdProjected == null || !Number.isFinite(Number(mtdProjected)) ? null : Number(mtdProjected);
   switch (method) {
     case "three-month": return threeMonthAverage;
     case "mtd": return mtd;
     case "weighted": {
       const v = validateWeights(weights);
       if (!v.valid) return null; // an invalid weighted config yields no forecast (caller shows Unavailable + a reason)
-      const vals = [months[0] || 0, months[1] || 0, months[2] || 0, mtd];
-      return Math.round((v.weights.reduce((s, wpct, i) => s + (wpct / 100) * vals[i], 0)) * 100) / 100;
+      const vals = [months[0] ?? null, months[1] ?? null, months[2] ?? null, mtd];
+      // EVERY input carrying a positive weight must be available; a missing one -> Unavailable (never treated as 0).
+      for (let i = 0; i < 4; i++) if (v.weights[i] > 0 && vals[i] == null) return null;
+      return Math.round(vals.reduce((s, x, i) => s + (v.weights[i] / 100) * (x == null ? 0 : x), 0) * 100) / 100;
     }
     case "higher":
-    default:
-      return Math.max(threeMonthAverage, mtd);
+    default: {
+      // Higher of the two, using ONLY the available side(s) -- a missing side is never treated as 0. Null iff both missing.
+      const cands = [threeMonthAverage, mtd].filter((x) => x != null);
+      return cands.length ? Math.max(...cands) : null;
+    }
   }
 }
 
@@ -152,12 +161,11 @@ export function computePlanRow({
   effectiveAsOf = null,
   daysInCurrentMonth = null,
   inventoryAvailable = false, // whether the FBA inventory snapshot exists at all
-  // FBA states (already SKU->ASIN folded; null when the whole snapshot is unavailable)
+  // FBA states (already SKU->ASIN folded; null when the whole snapshot is unavailable). Each is a DISTINCT state per
+  // the source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a separate reserved
+  // state), so reserved_fc_transfer is used RAW -- there is NO proven inbound-shipped overlap to subtract.
   available = null, customerOrderReserved = null, reservedFcTransfer = null, reservedFcProcessing = null,
   inboundWorking = null, inboundShipped = null, inboundReceived = null,
-  // The fba-plan snapshot already stores reservedFcTransfer as max(0, fcTransfer - inboundShipped); pass true so the
-  // overlap is not subtracted a second time. Raw callers (tests) leave it false and the helper adjusts.
-  fcTransferAlreadyAdjusted = false,
   // AWD (US-only). awdAvailable/awdInbound are null when unavailable; only counted when isUS && awdValidated.
   awdValidated = false, awdAvailable = null, awdInbound = null,
   // seller-owned + demand + config
@@ -169,7 +177,7 @@ export function computePlanRow({
   // 1) inventory buckets (non-overlapping). When the snapshot is unavailable every FBA figure is null.
   const avail = inventoryAvailable ? num0(available) : null;
   const custReserved = inventoryAvailable ? (customerOrderReserved == null ? null : num0(customerOrderReserved)) : null;
-  const fcTransferNet = fcTransferAlreadyAdjusted ? num0(reservedFcTransfer) : Math.max(0, num0(reservedFcTransfer) - num0(inboundShipped));
+  const fcTransferNet = num0(reservedFcTransfer); // RAW: a distinct reserved state, no proven inbound-shipped overlap
   const pipelineParts = inventoryAvailable
     ? num0(inboundWorking) + num0(inboundShipped) + num0(inboundReceived) + num0(reservedFcProcessing) + fcTransferNet
     : null;

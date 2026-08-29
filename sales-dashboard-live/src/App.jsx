@@ -2368,10 +2368,11 @@ function DashboardApp({ session, access, onSignOut }) {
         available: r.fbaAvailable, customerOrderReserved: r.customerOrderReserved ?? null,
         reservedFcTransfer: r.reservedFcTransfer, reservedFcProcessing: r.reservedFcProcessing,
         inboundWorking: r.inboundWorking, inboundShipped: r.inboundShipped, inboundReceived: r.inboundReceived,
-        fcTransferAlreadyAdjusted: true,
         awdValidated: awdSourceValidated, awdAvailable: r.awdAvailable, awdInbound: r.awdInbound ?? null,
         sellerWarehouseQty: wh ? wh.qty : null,
-        monthlyValues: monthKeys.map((k) => Number(r.unitsByMonth?.[k] || 0)), mtdUnits: r.mtdUnits, elapsedCompletedDays: planData.elapsedDays,
+        // A completed month with proven evidence is a number (covered zero = 0); a genuinely absent month stays null
+        // so the forecast engine never treats a missing month as 0.
+        monthlyValues: monthKeys.map((k) => { const v = r.unitsByMonth?.[k]; return v == null ? null : Number(v); }), mtdUnits: r.mtdUnits, elapsedCompletedDays: planData.elapsedDays,
         forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
         horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
       });

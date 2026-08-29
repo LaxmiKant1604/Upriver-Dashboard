@@ -684,10 +684,11 @@ export function fbaPlanPayload({
     if (!asin) continue;
     asinSet.add(asin);
     const cur = invByAsin[asin] || (invByAsin[asin] = {
-      available: 0, fcTransfer: 0, fcProcessing: 0,
+      available: 0, customerOrderReserved: 0, fcTransfer: 0, fcProcessing: 0,
       inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
     });
     cur.available += num(r.available);
+    cur.customerOrderReserved += num(r.reserved_customer_order); // display-only; never usable stock
     cur.fcTransfer += num(r.reserved_fc_transfer);
     cur.fcProcessing += num(r.reserved_fc_processing);
     cur.inboundShipped += num(r.inbound_shipped);
@@ -708,16 +709,21 @@ export function fbaPlanPayload({
   }
   const inventoryAvailable = (invRows || []).length > 0;
 
-  // 5) AWD available (US only), folded SKU->ASIN.
+  // 5) AWD available + inbound (US only), folded SKU->ASIN. AWD rows are pinned to US at the source (marketplaceCountries
+  //    ["US"]); a defensive marketplace check drops any non-US row so US AWD can never attach to another marketplace.
   const awdByAsin = {};
+  const awdInboundByAsin = {};
   let awdAvailable = false;
   if (isUS) {
     const rows = awdRows || [];
     awdAvailable = rows.length > 0;
     for (const r of rows) {
+      const mkt = String(r.marketplace_country_code || "").trim().toUpperCase();
+      if (mkt && mkt !== "US") continue; // US-only: never let a non-US AWD row leak in
       const asin = String(r.child_asin || "").trim();
       if (!asin) continue;
       awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
+      awdInboundByAsin[asin] = (awdInboundByAsin[asin] || 0) + num(r.awd_total_inbound_quantity);
       const sku = String(r.sku || "").trim();
       if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
     }
@@ -737,13 +743,16 @@ export function fbaPlanPayload({
     }
     const mtdUnits = num(mtdByAsin.get(asin));
     salesTotal += mtdUnits;
+    // Activity total for the drop check (customer-order-reserved counts as activity so a customer-reserved-only SKU
+    // is kept). These are DISTINCT states per the source metadata; the inbound_quantity aggregate proves the 3 inbound
+    // states sum to it, and reserved_fc_transfer is a separate reserved state -- so there is NO transfer/shipped overlap
+    // to subtract. Each state is counted exactly once (no double count).
     const invTotal = inv
-      ? inv.available + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
+      ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
       : 0;
     const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
-    if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0) continue;
-    // Subtract the FC-transfer/inbound-shipped overlap Amazon exposes only as Inbound.
-    const adjustedFcTransfer = inv ? Math.max(0, inv.fcTransfer - inv.inboundShipped) : 0;
+    const awdInboundUnits = isUS ? num(awdInboundByAsin[asin]) : 0;
+    if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
     rows.push({
       asin,
       productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
@@ -752,14 +761,17 @@ export function fbaPlanPayload({
       unitsByMonth,
       mtdUnits,
       // FBA fields are null ONLY when the whole snapshot is unavailable; when the snapshot exists
-      // but this ASIN is absent, it genuinely holds no FBA stock (0).
+      // but this ASIN is absent, it genuinely holds no FBA stock (0). reserved_fc_transfer is stored RAW (no
+      // inbound-shipped subtraction -- that overlap was never proven by the source metadata).
       fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-      reservedFcTransfer: inventoryAvailable ? adjustedFcTransfer : null,
+      customerOrderReserved: inventoryAvailable ? num(inv?.customerOrderReserved) : null,
+      reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
       reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
       inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
       inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
       inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
       awdAvailable: isUS ? awdUnits : null,
+      awdInbound: isUS ? awdInboundUnits : null,
     });
   }
 
