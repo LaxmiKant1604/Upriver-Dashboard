@@ -13109,3 +13109,54 @@ marketplace_country_code + awd_total_inbound_quantity to LISTINGS_AWD_COLUMNS (b
 change the fba-plan inventory + AWD request hashes -> ~6 FBA-inventory + ~2 AWD premium creates (~40 tokens) after
 verifying DataDoe /exports/sources metadata + the live token balance. Until run, Customer Order Reserved + AWD Inbound
 render Unavailable (the engine already treats them null, never a fabricated 0).
+
+================================================================================
+2026-08-29 -- FBA Shipment Plan INCREMENT 2: correctness fix + full advanced UI (pushed origin/main @ 43ec1a3)
+================================================================================
+Two commits, pushed (3e8dae2..43ec1a3); Vercel auto-deploys. `npm run verify` 88/88 across 68 suites (incl.
+build:check). No protected report touched (Daily/Dashboard/Brand View/SKU Movement/OLI/scheduler untouched).
+
+CORRECTNESS CORE (ba5846c):
+* Source contract (fba-plan only): FBA Inventory Health now requests reserved_customer_order; US Listings/AWD now
+  requests awd_total_inbound_quantity + marketplace_country_code. total_reserved_quantity is NEVER used.
+* REMOVED the unproven `max(0, reserved_fc_transfer - inbound_shipped)` subtraction. Proven via the authoritative
+  GET /exports/sources metadata: inbound_quantity = sum(inbound_working, inbound_shipped, inbound_received) and
+  reserved_fc_transfer is a SEPARATE reserved state -> no documented overlap -> reserved_fc_transfer stored RAW.
+  (This SUPERSEDES the earlier "snapshot stores the adjusted value + frontend passes fcTransferAlreadyAdjusted:true"
+  note above -- that param + subtraction are gone.)
+* customerOrderReserved folded + shown separately, never usable stock. awd_total_inbound_quantity folded US-only.
+* Forecast engine (src/lib/fba-planning.js): removed every missing-to-zero coercion. threeMonthAverage requires all
+  3 completed months (else null); weighted returns null if any positive-weight input missing; "higher" uses only the
+  available side. Covered 0 stays 0; missing stays null -> em dash. threeMonthAverage exposed for display.
+* Both derive paths (derivation-core.js scheduler + api/datadoe.js live) updated byte-identically; snapshotVersion
+  fba-plan/v2d-3 -> v2d-4. LIVE served identity fba-plan-shared-v1 unchanged. report-fba-plan parity test updated;
+  "overlap is subtracted" test REPLACED with a "stored RAW" test.
+
+ADVANCED UI (43ec1a3):
+* Array-driven table render (one column model drives header/rows/footer). New columns: Cust. Reserved
+  (reserved_customer_order, display-only) + AWD Inbound (awd_total_inbound_quantity, US only; omitted for non-US --
+  never a fake 0). 3M Avg / MTD Proj now from the corrected engine (missing -> em dash). Footer note rewritten.
+* SKU horizon override editor: per-row Horizon cell + popover (1/2/3 months, custom days, reset-to-inherit).
+* Seller-warehouse BULK import: new src/lib/warehouse-import.js (pure, tested -- quote-aware CSV/TSV parser, header
+  mapping, valid/error preview split, duplicate detection, malformed-qty rejection, account/SKU ISOLATION) +
+  src/lib/xlsx-read.js (dependency-free .xlsx reader via native DecompressionStream) + an import modal (template
+  download, file/paste, preview, atomic apply only when zero errors). Migration 20260903 adds
+  record_fba_seller_warehouse_bulk (single-transaction, all-or-nothing, one 'bulk' audit row per line).
+* Grouped column chooser (show/hide, Select all, Reset default; identity locked). Per-user prefs -> fba_plan_column_prefs
+  (migration 20260903, RLS own-row) via user-scoped /api/fba-plan-columns, with a localStorage fast-path.
+* Tests: scripts/warehouse-import.test.js (14) + fba-planning engine assertions (threeMonthAverage/customer-reserve/
+  AWD-inbound). Auto re-derive+publish rides the EXISTING canonical source-persist-derive-publish cycle (fba-plan is
+  a planned report deriving from fba-plan:inventory-health + fba-plan:awd) -- no parallel path added.
+
+PENDING (requires prod credentials NOT present in this session -- only VERCEL_OIDC_TOKEN available; no POSTGRES_URL /
+Supabase / DATADOE_API_KEY, so per the token-safety rule NO create was attempted):
+  1. Apply migration 20260903 to prod: `npm run db:migrate` (additive + idempotent). Until applied, bulk import +
+     cross-device column prefs are inert (graceful: column chooser still works via localStorage; page load safe via
+     schema-missing handling; bulk import errors cleanly with NO partial write). SKU override editor + column chooser
+     UI work now (sku-horizon backend from 20260902 is already applied).
+  2. Guarded source refresh to populate the new fields (verify balance FIRST; rediscover primaries 8 US + 22 Non-US;
+     current-snapshot only; <=5 sellers/export; US and Non-US never mixed): FBA Health <=7 creates/35 tokens + US
+     Listings/AWD <=2 creates/4 tokens; HARD combined ceiling 9 creates/39 tokens. Reuse/adopt only on proven exact
+     request identity. Until run, Cust. Reserved + AWD Inbound show em dash and Reserved reflects the old snapshot
+     until the next fba-plan derive republishes v2d-4.
+  3. Authenticated prod read-backs of the deployed fba-plan (new columns + raw Reserved).
