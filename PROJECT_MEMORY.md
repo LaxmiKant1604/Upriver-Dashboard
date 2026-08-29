@@ -13231,3 +13231,29 @@ cross-account; new plan-brand suite; engine seller-WH counted-once + never-in-FB
 STILL PENDING (credential-blocked): apply migration 20260903 (`npm run db:migrate`); guarded source refresh (<=9
 creates/39 tokens, verify balance first) to populate reserved_customer_order + awd_* + the v2d-5 directory; 30-account
 authenticated prod read-backs; responsive screenshots. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-29 -- FBA Plan: 3 Codex blockers fixed (server validation / identity conflict / brand isolation) (commit 9d95a0a)
+================================================================================
+`npm run verify` 90/90 across 70 suites. Phases 5-8 production steps STILL credential-blocked (only VERCEL_OIDC_TOKEN;
+no POSTGRES_URL / Supabase / DATADOE_API_KEY -> NO create attempted).
+
+1) SERVER-SIDE WAREHOUSE VALIDATION: new lib/server/reports/warehouse-validation.js re-validates every warehouse write
+   against the account's OWN published fba-plan snapshot evidence (SKU directory + catalogByAsin + marketplace scope),
+   loaded server-side via getLatestReportSnapshotHydrated({reportKey:"fba-plan"}). api/fba-plan-config.js applies it to
+   BOTH `warehouse` (single set) and `warehouse-bulk` (all rows validated BEFORE the atomic RPC -> any invalid row =
+   zero writes). Child ASIN RESOLVED server-side; browser-supplied directory/brand/provenance/account ignored. Rules
+   identical inline+bulk: existing SKU resolves ASIN from directory (supplied ASIN must match); new manual SKU needs a
+   catalog-existing ASIN; unknown/cross-account/conflict/out-of-scope-marketplace fail closed. Tiers: v2d-5 full;
+   v2d-4 membership-only (new SKU rejected); no snapshot -> all rejected. scripts/warehouse-validation.test.js (10)
+   proves forged single+bulk requests refused before any write.
+2) CONFLICTING SOURCE IDENTITY: both derive paths now throw a typed refusal (FBA_PLAN_SKU_ASIN_CONFLICT) when a SKU
+   maps to two DIFFERENT nonblank child ASINs across inventory/AWD/sales -> snapshot blocked, LKG preserved (no silent
+   priority pick). Blank->nonblank + identical still resolve. Parity+LKG regressions in report-fba-plan.test.js.
+3) STRICT BRAND ISOLATION: src/lib/plan-brand.js -- a blank/invalid named-brand key returns NO rows, never falls back
+   to All; All Brands is the only all-row selection; Unmapped = brand-less only; punctuation-significant.
+
+STILL PENDING (credential-blocked): apply migration 20260903; guarded source refresh (<=9 creates/39 tok, verify
+balance first) -> re-derive/publish v2d-5; 30-account authenticated read-backs (incl. forged single+bulk => zero DB
+change); responsive screenshots. Server validation degrades gracefully until v2d-5 is live (v2d-4 membership tier).
+See [[fba-plan-advanced]].
