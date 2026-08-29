@@ -12973,3 +12973,48 @@ STATUS: code+tests+migration committed on main (f9c8de0), migration UNAPPLIED, n
 reconciliation, one OLI-only sync per bucket (<=5 sellers, token ceilings) to populate current observations, optional
 zero-export backfill (scripts/release/oli-operational-units-backfill.mjs) for historical priced+zero+cancelled, then
 US + Non-US read-backs (all-brand + named-brand + Daily + Brand View + SKU Movement) and controls-safe-closed check.
+
+## OLI operational units -- LIVE in production (2026-08-29, migration applied + deployed + backfilled)
+
+Deployed end to end. Migration 20260901 APPLIED via db:migrate (tracked in app_schema_migrations; it was the ONLY
+pending file). Prod-verified: replace_oli_dimensional_window is now the 9-arg overload (p_unit_rows), the standalone
+replace_oli_operational_units_window (6-arg) exists, source_oli_operational_units has all 16 columns + PK + 10 checks +
+RLS + service_role-only SELECT/EXECUTE (no anon/authenticated) + touch trigger + 2 indexes. Backward-compatible: the
+9-arg function accepts the pre-deploy 8-arg calls via defaults, so applying the migration before the code deploy was safe.
+
+Code de85715/3553c41/f9c8de0 PUSHED to origin/main (320e41b..de85715); Vercel deploy healthy (root 200, api 401 =
+function live). 0 DataDoe tokens spent, 0 exports/creates (structurally zero -- no adapter in any of these paths).
+
+Zero-export BACKFILL (scripts/release/oli-operational-units-backfill.mjs, chunked by month) populated
+source_oli_operational_units from dimensional history for all 30 accounts: 134,980 grains, 504,097 priced units,
+1,639 explicit-zero units (PREVIOUSLY INVISIBLE), 1 cancelled. Pending = 0 (forward-only; dimensional history never
+stored pending rows -- they populate from the next scheduler OLI sync, which now runs the deployed persist that writes
+p_unit_rows incl. pending).
+
+RECONCILIATION (revenue unchanged): operational priced_units/priced_sales vs the revenue rollup
+(source_oli_daily_history): 22/30 accounts EXACT. The other 8 have a PRE-EXISTING dimensional-vs-daily discrepancy
+(daily-history carries more units than source_oli_dimensional_history for those accounts -- a legacy-backfill remnant,
+NOT caused by this feature). It does NOT affect correctness: revenue reads daily-history (untouched), and SKU Movement
+reads PRICED units from daily-history (complete/unchanged) and only ADDS zero+pending-with-SKU from operational-units.
+This feature NEVER writes daily-history or dimensional -- only the new additive table.
+
+PROD READ-BACKS (rederiveSkuMovement against prod readers, WITH vs WITHOUT the operational reader):
+- 12f3a683 (high-volume): 283 rows both ways (operational adds NO new SKU rows -- it only adds units to existing
+  rows), 3-month units 34105 -> 34182 (+77 explicit-zero units now counted). Breakdown for D-1 (2026-08-28):
+  priced 120, zero 1, pending 0, observed 121, provisional. Named-brand isolation intact.
+- 916be46e: 97 rows, 3-month units 2086 -> 2101 (+15 zero units).
+- Live ALL-brand snapshot for 12f3a683 republished (params_hash 37f7a1a8...): 283 rows, 3-month units 34182 -- EXACT
+  match to the read-back, so the deployed serve now shows the operational units.
+
+SKU Movement RE-DERIVE/REPUBLISH (scripts/release/backfill-sku-movement.mjs, zero-export): 30/30 successful (21
+published, 8 republished as "units-changed", 1 unchanged), 0 failed, creates=0 tokens=0. The completeness serve
+augment attaches unitBreakdown; ObservedUnitsBreakdown renders on SKU Movement + Daily + Sales Dashboard + Brand View.
+
+CONTROLS/SCHEDULER: untouched. No sync cycle run by this work (the last sync_cycles are the scheduler's own terminal
+succeeded runs); no source_controls change; no open cycle; no held report locks. The GitHub Actions scheduler is
+unchanged and will populate PENDING operational units + the D-1 breakdown automatically on its next OLI run (the
+deployed code writes p_unit_rows including pending). DECISION: did NOT spend tokens on a manual forward sync -- the
+scheduler covers pending-unit population automatically, and every other acceptance item is prod-verified without it.
+
+REMAINING EXTERNAL: the 8-account dimensional-vs-daily gap is pre-existing and orthogonal; pending-unit LIVE evidence
+arrives on the next scheduled sync (no action needed).
