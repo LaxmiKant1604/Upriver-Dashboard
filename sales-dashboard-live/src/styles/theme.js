@@ -399,6 +399,36 @@ body{ overflow-x:hidden; }
 .plan-export-btn:hover:not(:disabled){ border-color:var(--accent); color:var(--accent-strong); background:var(--accent-soft); }
 .plan-export-btn:disabled{ opacity:.5; cursor:not-allowed; }
 .plan-export-btn svg{ opacity:.8; }
+
+/* FBA Shipment Plan -- durable planning settings bar + seller-warehouse cell + priority badges */
+.plan-settings{ display:flex; flex-wrap:wrap; gap:18px; align-items:flex-end; margin-top:12px; padding:12px 14px; border:1px solid var(--border-default); border-radius:var(--radius-md); background:var(--bg-surface); }
+.plan-set-group{ display:flex; flex-direction:column; gap:6px; min-width:0; }
+.plan-seg{ display:inline-flex; align-items:center; gap:6px; }
+.plan-seg-btn{ min-width:38px; height:32px; padding:0 10px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); font:800 12px inherit; cursor:pointer; }
+.plan-seg-btn.active{ background:linear-gradient(135deg,#FF6B6B,#FF8E53); border-color:transparent; color:#fff; }
+.plan-seg-btn:disabled{ opacity:.55; cursor:default; }
+.plan-seg-custom{ display:inline-flex; align-items:center; gap:5px; padding:0 8px; height:32px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); font-size:11px; color:var(--text-muted); }
+.plan-seg-custom.active{ border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent-soft); }
+.plan-seg-custom input{ width:52px; border:0; background:transparent; font:700 12px inherit; color:var(--text-primary); text-align:right; }
+.plan-set-group select, .plan-set-group input[type=number]{ height:32px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-primary); font:600 12px inherit; padding:0 8px; }
+.plan-set-group input[type=number]{ width:90px; }
+.plan-weights{ display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.plan-weights input{ width:52px; height:30px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); text-align:right; font:600 12px inherit; padding:0 6px; }
+.plan-weight-sum{ font-size:11px; font-weight:800; padding:2px 8px; border-radius:var(--radius-pill); }
+.plan-weight-sum.ok{ background:var(--positive-soft); color:var(--positive); }
+.plan-weight-sum.bad{ background:var(--negative-soft); color:var(--negative); }
+.plan-mini-btn{ height:30px; padding:0 10px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); font:800 11px inherit; cursor:pointer; }
+.plan-mini-btn:disabled{ opacity:.5; cursor:default; }
+.plan-wh-cell{ padding:4px 8px; }
+.plan-wh-btn{ min-width:44px; padding:3px 8px; border:1px dashed var(--border-default); border-radius:var(--radius-sm); background:transparent; color:var(--text-primary); font:700 12px inherit; font-variant-numeric:tabular-nums; cursor:pointer; }
+.plan-wh-btn:hover{ border-color:var(--accent); color:var(--accent-strong); background:var(--accent-soft); }
+.plan-wh-empty{ color:var(--text-muted); font-weight:600; }
+.plan-wh-cell input{ width:64px; height:28px; border:1px solid var(--accent); border-radius:var(--radius-sm); background:var(--bg-elevated); text-align:right; font:700 12px inherit; padding:0 6px; }
+.pt-badge.plan-prio-critical{ background:var(--negative-soft); color:var(--negative); }
+.pt-badge.plan-prio-high{ background:var(--warning-soft); color:var(--warning); }
+.pt-badge.plan-prio-medium{ background:var(--accent-soft); color:var(--accent-strong); }
+.pt-badge.plan-prio-low{ background:var(--bg-subtle); color:var(--text-secondary); }
+.pt-badge.plan-prio-ok{ background:var(--positive-soft); color:var(--positive); }
 .secondary-action{
   display:inline-flex; align-items:center; gap:6px; min-height:34px; border:1px solid var(--border-default);
   border-radius:var(--radius-sm); padding:7px 11px; color:var(--text-secondary); background:var(--bg-elevated);

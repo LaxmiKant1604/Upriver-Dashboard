@@ -582,6 +582,68 @@ export async function getCogsOverrides(accountId) {
   return request(`/rest/v1/cogs_overrides?${query}`);
 }
 
+// ---- FBA Shipment Plan durable PLANNING config (settings + SKU horizon overrides + seller warehouse). Read via the
+//      service role for a single account; ALL writes are service-role-only and audited. These NEVER touch DataDoe or
+//      any source-derived table. Missing rows come back empty (the planner applies the system default). ----
+export async function getFbaPlanningConfig({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getFbaPlanningConfig requires organizationFingerprint + accountId (fail closed).");
+  const base = { organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}` };
+  const q = (extra) => new URLSearchParams({ ...base, ...extra }).toString();
+  const safe = async (p) => { try { const r = await request(p, { signal }); return Array.isArray(r) ? r : []; } catch (e) { if (isSchemaMissingError(e)) return []; throw e; } };
+  const [settings, overrides, warehouse] = await Promise.all([
+    safe(`/rest/v1/fba_planning_settings?${q({ select: "horizon_kind,horizon_months,horizon_days,forecast_method,forecast_weights,safety_days,updated_at" })}`),
+    safe(`/rest/v1/fba_sku_horizon_overrides?${q({ select: "sku,horizon_kind,horizon_months,horizon_days,updated_at" })}`),
+    safe(`/rest/v1/fba_seller_warehouse?${q({ select: "marketplace,sku,child_asin,qty,note,updated_at,updated_by_email" })}`),
+  ]);
+  return { settings: settings[0] || null, overrides, warehouse };
+}
+
+export async function setFbaPlanningSettings({ organizationFingerprint, connectionId = "primary", accountId, horizonKind, horizonMonths, horizonDays, forecastMethod, forecastWeights, safetyDays, updatedBy }) {
+  const rows = await request("/rest/v1/fba_planning_settings?on_conflict=organization_fingerprint,connection_id,account_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      organization_fingerprint: organizationFingerprint, connection_id: connectionId, account_id: accountId,
+      horizon_kind: horizonKind, horizon_months: horizonMonths ?? null, horizon_days: horizonDays ?? null,
+      forecast_method: forecastMethod, forecast_weights: forecastWeights ?? null, safety_days: safetyDays,
+      updated_by: updatedBy || null, updated_at: new Date().toISOString(),
+    },
+  });
+  return (Array.isArray(rows) ? rows[0] : rows) || null;
+}
+
+export async function setFbaSkuHorizonOverride({ organizationFingerprint, connectionId = "primary", accountId, sku, horizonKind, horizonMonths, horizonDays, updatedBy }) {
+  const rows = await request("/rest/v1/fba_sku_horizon_overrides?on_conflict=organization_fingerprint,connection_id,account_id,sku", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: {
+      organization_fingerprint: organizationFingerprint, connection_id: connectionId, account_id: accountId, sku,
+      horizon_kind: horizonKind, horizon_months: horizonMonths ?? null, horizon_days: horizonDays ?? null,
+      updated_by: updatedBy || null, updated_at: new Date().toISOString(),
+    },
+  });
+  return (Array.isArray(rows) ? rows[0] : rows) || null;
+}
+
+export async function deleteFbaSkuHorizonOverride({ organizationFingerprint, connectionId = "primary", accountId, sku }) {
+  const q = new URLSearchParams({ organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}`, sku: `eq.${sku}` });
+  await request(`/rest/v1/fba_sku_horizon_overrides?${q}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
+  return { deleted: true };
+}
+
+// One warehouse write (upsert, or delete when qty is null) + its audit row, atomically, via the SECURITY DEFINER RPC.
+export async function recordFbaSellerWarehouse({ organizationFingerprint, connectionId = "primary", accountId, marketplace, sku, childAsin = "", qty, note = "", updatedBy = null, updatedByEmail = "", action = "set" }) {
+  const body = await request("/rest/v1/rpc/record_fba_seller_warehouse", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_marketplace: marketplace, p_sku: sku, p_child_asin: childAsin, p_qty: qty == null ? null : Number(qty),
+      p_note: note, p_updated_by: updatedBy, p_updated_by_email: updatedByEmail, p_action: action,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
 const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,metric_date,dimension_key";
 
 export async function getAdsSyncStates(accountIds) {

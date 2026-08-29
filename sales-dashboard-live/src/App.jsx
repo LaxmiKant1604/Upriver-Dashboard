@@ -22,6 +22,10 @@ import {
 } from "./lib/format.js";
 import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
 import { csvCell } from "./lib/csv.js";
+import {
+  computePlanRow as computePlanningRow, resolveHorizon, normalizeHorizon,
+  DEFAULT_FORECAST_METHOD, DEFAULT_SAFETY_DAYS, SYSTEM_DEFAULT_HORIZON,
+} from "./lib/fba-planning.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
@@ -330,6 +334,92 @@ function downloadPlanSpreadsheet(rows, meta, targetDays) {
   link.download = `fba-shipment-plan-${account || "account"}-${meta.asOf || "report"}.csv`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+// Durable, per-seller Planning Settings: horizon (1/2/3-month preset or 1-365 custom days) + forecast method
+// (+ weights, which must total 100) + safety days. Every change persists server-side (onSave) and the plan
+// recomputes locally with ZERO DataDoe. `settings` = the resolved account defaults.
+function PlanningSettingsBar({ settings, onSave, busy }) {
+  const isDays = settings.horizon.kind === "days";
+  const [customDays, setCustomDays] = useState(isDays ? String(settings.horizon.days) : "45");
+  const [weights, setWeights] = useState(() => (Array.isArray(settings.forecastWeights) ? settings.forecastWeights : [25, 25, 25, 25]).map(String));
+  useEffect(() => { if (settings.horizon.kind === "days") setCustomDays(String(settings.horizon.days)); }, [settings.horizon]);
+  useEffect(() => { if (Array.isArray(settings.forecastWeights)) setWeights(settings.forecastWeights.map(String)); }, [settings.forecastWeights]);
+  const weightSum = weights.reduce((s, w) => s + (Number(w) || 0), 0);
+  const setMonths = (m) => onSave({ horizon: { kind: "months", months: m } });
+  const setCustom = () => { const d = Math.trunc(Number(customDays)); if (Number.isInteger(d) && d >= 1 && d <= 365) onSave({ horizon: { kind: "days", days: d } }); };
+  return (
+    <div className="plan-settings" role="group" aria-label="Planning settings">
+      <div className="plan-set-group">
+        <span className="plan-field-label">Planning horizon</span>
+        <div className="plan-seg">
+          {[1, 2, 3].map((m) => (
+            <button key={m} type="button" disabled={busy} aria-pressed={!isDays && settings.horizon.months === m}
+              className={"plan-seg-btn" + (!isDays && settings.horizon.months === m ? " active" : "")} onClick={() => setMonths(m)}>{m}M</button>
+          ))}
+          <span className={"plan-seg-custom" + (isDays ? " active" : "")}>
+            <input type="number" min="1" max="365" step="1" aria-label="Custom horizon days" value={customDays}
+              onChange={(e) => setCustomDays(e.target.value)} onBlur={setCustom}
+              onKeyDown={(e) => { if (e.key === "Enter") setCustom(); }} disabled={busy} />
+            <span>days</span>
+          </span>
+        </div>
+      </div>
+      <label className="plan-set-group">
+        <span className="plan-field-label">Forecast method</span>
+        <select value={settings.forecastMethod} disabled={busy} onChange={(e) => onSave({ forecastMethod: e.target.value, forecastWeights: e.target.value === "weighted" ? weights.map(Number) : undefined })}>
+          <option value="three-month">3-month average</option>
+          <option value="mtd">MTD projected</option>
+          <option value="higher">Higher of the two</option>
+          <option value="weighted">Weighted</option>
+        </select>
+      </label>
+      {settings.forecastMethod === "weighted" && (
+        <div className="plan-set-group">
+          <span className="plan-field-label">Weights % (M1·M2·M3·MTD, total 100)</span>
+          <div className="plan-weights">
+            {weights.map((w, i) => (
+              <input key={i} type="number" min="0" step="1" value={w} disabled={busy} aria-label={`Weight ${i + 1}`}
+                onChange={(e) => setWeights(weights.map((x, j) => (j === i ? e.target.value : x)))} />
+            ))}
+            <span className={"plan-weight-sum" + (weightSum === 100 ? " ok" : " bad")}>{weightSum}%</span>
+            <button type="button" className="plan-mini-btn" disabled={busy || weightSum !== 100} onClick={() => onSave({ forecastMethod: "weighted", forecastWeights: weights.map(Number) })}>Apply</button>
+          </div>
+        </div>
+      )}
+      <label className="plan-set-group">
+        <span className="plan-field-label">Safety days</span>
+        <input type="number" min="0" max="365" step="1" defaultValue={settings.safetyDays} disabled={busy}
+          onBlur={(e) => { const d = Math.trunc(Number(e.target.value)); if (Number.isInteger(d) && d >= 0 && d <= 365 && d !== settings.safetyDays) onSave({ safetyDays: d }); }} />
+      </label>
+    </div>
+  );
+}
+
+// Inline editor for one SKU's seller-warehouse units (nonnegative whole units). A blank commit is ignored; saving
+// persists durably (onSave) and the plan recomputes locally. Amazon-source inventory is never touched.
+function WarehouseCell({ row, onSave, busy }) {
+  const [editing, setEditing] = useState(false);
+  const qty = row.warehouse ? row.warehouse.qty : null;
+  const marketplace = row.marketplace;
+  if (!row.sku || !marketplace) return <td className="mono"><span className="dr-dash">—</span></td>;
+  const commit = (raw) => {
+    const t = String(raw).trim();
+    if (t !== "") { const n = Math.trunc(Number(t)); if (Number.isInteger(n) && n >= 0) onSave({ sku: row.sku, marketplace, childAsin: row.asin, qty: n }); }
+    setEditing(false);
+  };
+  return (
+    <td className="mono plan-wh-cell">
+      {editing ? (
+        <input autoFocus type="number" min="0" step="1" defaultValue={qty == null ? "" : qty} disabled={busy}
+          onBlur={(e) => commit(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") commit(e.target.value); if (e.key === "Escape") setEditing(false); }} />
+      ) : (
+        <button type="button" className="plan-wh-btn" title={`Edit seller warehouse units${row.warehouse?.updatedByEmail ? ` (last by ${row.warehouse.updatedByEmail})` : ""}`} onClick={() => setEditing(true)}>
+          {qty == null ? <span className="plan-wh-empty">+ add</span> : nInt(qty)}
+        </button>
+      )}
+    </td>
+  );
 }
 
 /* ============================== RECONCILIATION HELPERS ============================== */
@@ -1223,6 +1313,10 @@ function DashboardApp({ session, access, onSignOut }) {
   const [targetDays, setTargetDays] = useState(30);
   const [planSearch, setPlanSearch] = useState("");
   const [planSort, setPlanSort] = useState({ key: "recommended", dir: "desc" });
+  // Durable, per-seller planning config (settings + SKU horizon overrides + seller warehouse), loaded from the
+  // account-scoped API. A settings/warehouse change re-reads this and recomputes locally with ZERO DataDoe.
+  const [planConfig, setPlanConfig] = useState(null);
+  const [planConfigBusy, setPlanConfigBusy] = useState(false);
 
   // Reconciliation is a six-full-month, cache-first report. Once refreshed,
   // its month selector and Order Explorer operate entirely in the browser.
@@ -1803,6 +1897,79 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [view, loadCachedPlan]);
   useAutoRevalidate(loadCachedPlan, { active: view === "fbaplan" });
 
+  // Load the durable planning config for the selected account (read-only; never DataDoe). Resets on account change so
+  // one account's settings/warehouse never leak into another.
+  const loadPlanConfig = useCallback(async () => {
+    if (!selectedAccountId || !session?.access_token) { setPlanConfig(null); return; }
+    const acct = selectedAccountId;
+    try {
+      const cfg = await authFetch(`/api/fba-plan-config?accountId=${encodeURIComponent(acct)}`, session.access_token);
+      if (selectedAccountId === acct) setPlanConfig(cfg && typeof cfg === "object" ? cfg : { settings: null, overrides: [], warehouse: [] });
+    } catch (_e) {
+      if (selectedAccountId === acct) setPlanConfig({ settings: null, overrides: [], warehouse: [] });
+    }
+  }, [selectedAccountId, session?.access_token]);
+  useEffect(() => { if (view === "fbaplan") loadPlanConfig(); else setPlanConfig(null); }, [view, loadPlanConfig]);
+
+  // The resolved ACCOUNT-DEFAULT planning settings (durable, with the system defaults when unsaved).
+  const planAccountSettings = useMemo(() => {
+    const s = planConfig?.settings || null;
+    const horizon = normalizeHorizon(
+      s ? (s.horizon_kind === "days" ? { kind: "days", days: s.horizon_days } : { kind: "months", months: s.horizon_months }) : null
+    ) || { ...SYSTEM_DEFAULT_HORIZON };
+    return {
+      horizon,
+      forecastMethod: s?.forecast_method || DEFAULT_FORECAST_METHOD,
+      forecastWeights: Array.isArray(s?.forecast_weights) ? s.forecast_weights.map(Number) : null,
+      safetyDays: Number.isFinite(Number(s?.safety_days)) ? Number(s.safety_days) : DEFAULT_SAFETY_DAYS,
+      isSaved: !!s,
+    };
+  }, [planConfig]);
+
+  // SKU horizon overrides + seller warehouse qty, keyed for O(1) lookup during the per-row planning compute.
+  const planSkuOverrides = useMemo(() => {
+    const m = new Map();
+    for (const o of planConfig?.overrides || []) m.set(String(o.sku), o.horizon_kind === "days" ? { kind: "days", days: o.horizon_days } : { kind: "months", months: o.horizon_months });
+    return m;
+  }, [planConfig]);
+  const planWarehouseBySku = useMemo(() => {
+    const m = new Map();
+    for (const w of planConfig?.warehouse || []) m.set(String(w.sku), { qty: Number(w.qty), marketplace: w.marketplace, note: w.note || "", updatedByEmail: w.updated_by_email || "" });
+    return m;
+  }, [planConfig]);
+
+  // Persist the account planning settings, then reload the config (recomputes the plan locally, zero DataDoe).
+  const savePlanSettings = useCallback(async (patch) => {
+    if (!selectedAccountId || !session?.access_token) return;
+    const cur = planAccountSettings;
+    const horizon = patch.horizon || cur.horizon;
+    const body = {
+      kind: "settings", accountId: selectedAccountId,
+      horizonKind: horizon.kind, horizonMonths: horizon.kind === "months" ? horizon.months : undefined, horizonDays: horizon.kind === "days" ? horizon.days : undefined,
+      forecastMethod: patch.forecastMethod || cur.forecastMethod,
+      forecastWeights: (patch.forecastMethod || cur.forecastMethod) === "weighted" ? (patch.forecastWeights || cur.forecastWeights) : undefined,
+      safetyDays: patch.safetyDays != null ? patch.safetyDays : cur.safetyDays,
+    };
+    setPlanConfigBusy(true);
+    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
+    catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
+    finally { setPlanConfigBusy(false); }
+  }, [selectedAccountId, session?.access_token, planAccountSettings, loadPlanConfig]);
+
+  // Persist one seller-warehouse quantity (qty=null clears it), then reload + recompute.
+  const saveWarehouseQty = useCallback(async ({ sku, marketplace, childAsin, qty, note }) => {
+    if (!selectedAccountId || !session?.access_token || !sku || !marketplace) return;
+    setPlanConfigBusy(true);
+    try {
+      await authFetch("/api/fba-plan-config", session.access_token, {
+        method: "POST",
+        body: JSON.stringify({ kind: "warehouse", accountId: selectedAccountId, sku, marketplace, childAsin: childAsin || "", qty: qty == null ? undefined : qty, clear: qty == null, note: note || "" }),
+      });
+      await loadPlanConfig();
+    } catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
+    finally { setPlanConfigBusy(false); }
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
   const reconciliationWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
   const reconciliationParams = useMemo(() => {
     if (!selectedAccountId) return null;
@@ -2182,11 +2349,35 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [dailyRows]);
 
   // Derived FBA Shipment Plan: raw rows -> computed metrics -> filter -> sort.
-  // Everything here is local, so search/sort/target changes never refetch.
+  // Everything here is local, so search/sort/target/config changes never refetch (ZERO DataDoe).
   const planComputed = useMemo(() => {
     if (!planData || !Array.isArray(planData.rows)) return [];
-    return planData.rows.map((r) => computePlanRow(r, planData, targetDays));
-  }, [planData, targetDays]);
+    const monthKeys = (planData.months || []).map((m) => m.key);
+    const effectiveAsOf = planData.salesLatestDate || planData.asOf || null;
+    const daysInCurrentMonth = planData.currentMonth?.daysInMonth || null;
+    const awdSourceValidated = planData.isUS === true && planData.awdAvailable === true;
+    return planData.rows.map((r) => {
+      const legacy = computePlanRow(r, planData, targetDays); // preserved existing columns (unchanged)
+      const wh = r.sku ? planWarehouseBySku.get(String(r.sku)) : null;
+      const { horizon: resolvedHorizon, source: horizonSource } = resolveHorizon({
+        skuOverride: r.sku ? planSkuOverrides.get(String(r.sku)) : null, accountDefault: planAccountSettings.horizon,
+      });
+      const planning = computePlanningRow({
+        isUS: planData.isUS === true,
+        effectiveAsOf, daysInCurrentMonth, inventoryAvailable: planData.inventoryAvailable === true,
+        available: r.fbaAvailable, customerOrderReserved: r.customerOrderReserved ?? null,
+        reservedFcTransfer: r.reservedFcTransfer, reservedFcProcessing: r.reservedFcProcessing,
+        inboundWorking: r.inboundWorking, inboundShipped: r.inboundShipped, inboundReceived: r.inboundReceived,
+        fcTransferAlreadyAdjusted: true,
+        awdValidated: awdSourceValidated, awdAvailable: r.awdAvailable, awdInbound: r.awdInbound ?? null,
+        sellerWarehouseQty: wh ? wh.qty : null,
+        monthlyValues: monthKeys.map((k) => Number(r.unitsByMonth?.[k] || 0)), mtdUnits: r.mtdUnits, elapsedCompletedDays: planData.elapsedDays,
+        forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
+        horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
+      });
+      return { ...legacy, planning, horizonSource, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null };
+    });
+  }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku]);
 
   const planRows = useMemo(() => {
     const filtered = planComputed.filter((r) =>
@@ -2196,8 +2387,10 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0 };
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, reserved: 0, inTransit: 0, awd: 0, coverage: 0, recommended: 0, restockCount: 0,
+      pipeline: 0, horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0 };
     let anyInv = false, anyAwd = false;
+    const add = (key, v) => { if (v != null && Number.isFinite(Number(v))) t[key] += Number(v); };
     planRows.forEach((r) => {
       t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
       t.targetUnits += r.targetUnits;
@@ -2206,10 +2399,15 @@ function DashboardApp({ session, access, onSignOut }) {
         t.fbaAvailable += r.fbaAvailable;
         if (r.mtdDrr !== null) t.mtdDrr += r.mtdDrr;
         t.reserved += r.reserved; t.inTransit += r.inTransit; t.coverage += r.coverage;
+        add("pipeline", r.planning?.amazonPipeline);
       }
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
       if (r.recommended !== null) t.recommended += r.recommended;
       if (r.remark === "Restock") t.restockCount += 1;
+      // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total).
+      add("horizonDemand", r.planning?.horizonDemand); add("safetyStock", r.planning?.safetyStockUnits);
+      add("targetInventory", r.planning?.targetInventory); add("sellerWh", r.planning?.sellerWarehouseQty);
+      add("shipWh", r.planning?.shipFromSellerWarehouse); add("production", r.planning?.productionRequirement);
     });
     t.fbaDaysCover = t.mtdDrr > 0 ? t.fbaAvailable / t.mtdDrr : null;
     t.anyInv = anyInv; t.anyAwd = anyAwd;
@@ -3461,15 +3659,9 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
+        <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planConfigBusy} />
+
         <div className="plan-controls">
-          <label className="plan-field">
-            <span className="plan-field-label">Target Coverage Days</span>
-            <input
-              type="number" min="1" step="1" value={targetDays}
-              onChange={(e) => { const v = e.target.value; setTargetDays(v === "" ? "" : Math.max(1, Number(v))); }}
-              onBlur={(e) => { if (e.target.value === "" || Number(e.target.value) < 1) setTargetDays(30); }}
-            />
-          </label>
           <label className="plan-field plan-search">
             <span className="plan-field-label">Search</span>
             <span className="plan-search-wrap">
@@ -3539,6 +3731,15 @@ function DashboardApp({ session, access, onSignOut }) {
                     {planData.isUS && <PlanTh label="AWD Avail" col="awd" sort={planSort} onSort={setPlanSortKey} />}
                     <PlanTh label="Total FBA Inv." col="coverage" sort={planSort} onSort={setPlanSortKey} />
                     <PlanTh label="Recommend" col="recommended" sort={planSort} onSort={setPlanSortKey} />
+                    <th title="In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)">Pipeline</th>
+                    <th title="Daily run rate x effective horizon days (calendar-aware from the effective-through date)">Horizon Demand</th>
+                    <th title="Daily run rate x safety days">Safety</th>
+                    <th title="ceil(Horizon Demand + Safety Stock)">Target Inv</th>
+                    <th title="Your own warehouse units for this SKU (click to edit). Never Amazon inventory.">Seller WH</th>
+                    <th title="min(Seller WH, shortage after Amazon/AWD network stock)">Ship WH</th>
+                    <th title="max(0, shortage after Amazon/AWD network stock - Seller WH)">Produce</th>
+                    <th title="Effective-through date + floor(Immediately Available / daily run rate)">Est. Stockout</th>
+                    <th style={{ textAlign: "left" }}>Priority</th>
                     <PlanTh label="Remark" col="remark" sort={planSort} onSort={setPlanSortKey} align="left" />
                   </tr>
                 </thead>
@@ -3564,6 +3765,15 @@ function DashboardApp({ session, access, onSignOut }) {
                       {planData.isUS && <td className="mono">{nInt(r.awd)}</td>}
                       <td className="mono">{nInt(r.coverage)}</td>
                       <td className="mono pt-strong">{nInt(r.recommended)}</td>
+                      <td className="mono">{nInt(r.planning.amazonPipeline)}</td>
+                      <td className="mono">{nInt(r.planning.horizonDemand)}</td>
+                      <td className="mono">{nInt(r.planning.safetyStockUnits)}</td>
+                      <td className="mono pt-strong">{nInt(r.planning.targetInventory)}</td>
+                      <WarehouseCell row={r} onSave={saveWarehouseQty} busy={planConfigBusy} />
+                      <td className="mono">{nInt(r.planning.shipFromSellerWarehouse)}</td>
+                      <td className="mono pt-strong">{nInt(r.planning.productionRequirement)}</td>
+                      <td className="mono" title={r.planning.estimatedStockoutDate ? "" : (r.planning.stockoutReason || "")}>{r.planning.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>
+                      <td>{r.planning.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>
                       <td>{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>
                     </tr>
                   ))}
@@ -3585,6 +3795,15 @@ function DashboardApp({ session, access, onSignOut }) {
                     {planData.isUS && <td className="mono">{planTotals.anyAwd ? nInt(planTotals.awd) : "—"}</td>}
                     <td className="mono">{planTotals.anyInv ? nInt(planTotals.coverage) : "—"}</td>
                     <td className="mono pt-strong">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</td>
+                    <td className="mono">{planTotals.anyInv ? nInt(planTotals.pipeline) : "—"}</td>
+                    <td className="mono">{nInt(planTotals.horizonDemand)}</td>
+                    <td className="mono">{nInt(planTotals.safetyStock)}</td>
+                    <td className="mono pt-strong">{nInt(planTotals.targetInventory)}</td>
+                    <td className="mono">{nInt(planTotals.sellerWh)}</td>
+                    <td className="mono">{nInt(planTotals.shipWh)}</td>
+                    <td className="mono pt-strong">{nInt(planTotals.production)}</td>
+                    <td className="mono">—</td>
+                    <td>—</td>
                     <td>{planTotals.restockCount > 0 ? `${planTotals.restockCount} restock` : "OK"}</td>
                   </tr>
                 </tfoot>
