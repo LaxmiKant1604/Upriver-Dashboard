@@ -8,7 +8,7 @@ import {
   Wallet, Megaphone, BarChart3, MousePointerClick, Boxes, TrendingUp, Target, Percent,
   RefreshCw, Info, DatabaseZap,
 } from "lucide-react";
-import { Sparkline, DataQualityAlert, EmptyState, SkeletonTable } from "../components/ui.jsx";
+import { Sparkline, DataQualityAlert, EmptyState, ObservedUnitsBreakdown, SkeletonTable } from "../components/ui.jsx";
 import { fmtMoneyCompact, fmtDateHuman } from "../lib/format.js";
 import { dailyMtdKpis, dailyTrendSeries, lastFinite, dailyCompletenessLabel } from "../lib/daily-view-model.js";
 
@@ -88,6 +88,7 @@ export default function DailyReporting({
       {completeness && completeness.sourceDefect && (
         <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={completeness.notice} />
       )}
+      {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
 
       {/* Six MTD KPI cards -- values straight from the report's MTD column */}
       {hasData && cards.length > 0 && (

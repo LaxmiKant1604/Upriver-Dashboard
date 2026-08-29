@@ -699,6 +699,63 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["replaceOliDimensionalWindow"],
     note: "Migration 12: order-audit RPC md5 hashfix (sale_date::date GROUP BY alignment); authoritative corrected RPC.",
   },
+  {
+    // Migration 16: OPERATIONAL UNITS. An ADDITIVE per-(account, sale_date, sku, child_asin, currency) table holding
+    // EVERY observed unit split by class (priced / explicit-zero / pending / cancelled), plus a DROP/CREATE of the
+    // replace RPC that gains p_unit_rows (9th param, default NULL) writing the operational units in the SAME
+    // transaction as the UNCHANGED dimensional + rollup + order-audit + coverage, PLUS a standalone
+    // replace_oli_operational_units_window RPC for the zero-export backfill. Revenue is untouched (the priced rollup
+    // stays priced-only); this table is the durable home for explicit-zero + pending units that operational unit
+    // reporting + SKU Movement need. Service-role-only, written ONLY through the SECURITY DEFINER RPCs.
+    migration: "20260901_oli_operational_units.sql",
+    tables: [
+      {
+        name: "source_oli_operational_units",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "sale_date", "sku", "child_asin", "currency"]],
+        namedConstraints: [
+          { name: "source_oli_opunits_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "sale_date", "sku", "child_asin", "currency"] },
+          { name: "source_oli_opunits_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_oli_opunits_account_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "source_oli_opunits_seller_nonblank", kind: "check", canonical: "char_length(btrim(seller_or_vendor_id)) > 0" },
+          { name: "source_oli_opunits_currency_check", kind: "check", canonical: "currency ~ '^[A-Z]{3}$'" },
+          { name: "source_oli_opunits_priced_units_nonneg", kind: "check", canonical: "priced_units >= 0" },
+          { name: "source_oli_opunits_priced_sales_nonneg", kind: "check", canonical: "priced_sales is null or priced_sales >= 0" },
+          { name: "source_oli_opunits_zero_units_nonneg", kind: "check", canonical: "explicit_zero_units >= 0" },
+          { name: "source_oli_opunits_pending_units_nonneg", kind: "check", canonical: "pending_units >= 0" },
+          { name: "source_oli_opunits_cancelled_units_nonneg", kind: "check", canonical: "cancelled_units >= 0" },
+          { name: "source_oli_opunits_hash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+        ],
+        requiredIndexes: [
+          { name: "source_oli_opunits_account_date_idx", columns: ["account_id", "sale_date"] },
+          { name: "source_oli_opunits_org_date_idx", columns: ["organization_fingerprint", "sale_date"] },
+        ],
+        rlsEnabled: true,
+        // Written ONLY through the SECURITY DEFINER RPCs: service_role keeps SELECT alone.
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
+        requiredTriggers: [{ name: "source_oli_opunits_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "sale_date",
+          "sku", "child_asin", "currency", "priced_units", "priced_sales", "explicit_zero_units", "pending_units",
+          "cancelled_units", "source_request_hash"],
+      },
+    ],
+    rpcs: [
+      { name: "replace_oli_dimensional_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_rows", "p_source_refreshed_at", "p_order_rows", "p_unit_rows"] },
+      { name: "replace_oli_operational_units_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_unit_rows"] },
+    ],
+    // The DIMENSIONAL/rollup/order-audit/coverage behaviour is PRESERVED byte-for-byte (replace-oli-dimensional +
+    // replace-oli-order-audit) AND the NEW atomic operational-unit block is proven (replace-oli-operational-units,
+    // null-guarded on the 9-arg RPC; unconditional on the standalone).
+    provenFunctions: [
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-dimensional" },
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-order-audit" },
+      { name: "replace_oli_dimensional_window", proof: "replace-oli-operational-units" },
+      { name: "replace_oli_operational_units_window", proof: "replace-oli-operational-units" },
+    ],
+    wrappers: ["replaceOliDimensionalWindow", "replaceOliOperationalUnitsWindow", "getSourceOliOperationalUnitRows"],
+    note: "Migration 16: operational units (priced/explicit-zero/pending/cancelled) + p_unit_rows on the replace RPC + standalone backfill RPC (revenue byte-identical).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------
@@ -1364,6 +1421,33 @@ function auditReplaceOliOrderAuditFunction(clean, masked, fnName) {
   return problems;
 }
 
+// STRUCTURAL proof of the OPERATIONAL-UNIT replace block: it validates p_unit_rows fail-closed, DELETEs the
+// account's operational-unit rows inside the window, and INSERTs the aggregated per-class unit rows. On the 9-arg
+// dimensional RPC the block MUST be guarded by `if p_unit_rows is not null then` so a legacy caller that supplies no
+// units NEVER disturbs the operational units; the standalone RPC requires p_unit_rows (no guard). Revenue is never
+// touched by this block (only unit-class columns + priced_sales are written; a null price is never coerced to 0).
+function auditReplaceOliOperationalUnitsFunction(clean, masked, fnName) {
+  const body = functionBodyViews(clean, masked, fnName);
+  if (!body) return [{ code: "REPLACE_OLI_OPUNITS_FUNCTION_MISSING", reason: "function body not found" }];
+  const problems = [];
+  const M = body.masked;
+  if (!/jsonb_array_elements\s*\(\s*p_unit_rows\s*\)[\s\S]*raise\s+exception|raise\s+exception[\s\S]*jsonb_array_elements\s*\(\s*p_unit_rows\s*\)/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_OPUNITS_VALIDATION_MISSING", reason: "does not validate p_unit_rows fail-closed before mutating" });
+  }
+  if (!/delete\s+from\s+public\.source_oli_operational_units\b[^;]*\baccount_id\s*=\s*p_account_id\b[^;]*\bsale_date\s+between\s+p_covered_from\s+and\s+p_covered_to/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_OPUNITS_DELETE_MISSING", reason: "does not DELETE the account's operational-unit rows inside the replaced window" });
+  }
+  if (!/insert\s+into\s+public\.source_oli_operational_units\b/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_OPUNITS_INSERT_MISSING", reason: "does not INSERT the operational-unit rows" });
+  }
+  // The 9-arg dimensional RPC must GUARD the operational block on a supplied (non-null) p_unit_rows so a legacy
+  // caller that omits units never wipes the operational-unit window.
+  if (fnName === "replace_oli_dimensional_window" && !/if\s+p_unit_rows\s+is\s+not\s+null\s+then/i.test(M)) {
+    problems.push({ code: "REPLACE_OLI_OPUNITS_NULL_GUARD_MISSING", reason: "the operational-unit block is not guarded by 'if p_unit_rows is not null' (a legacy caller could wipe it)" });
+  }
+  return problems;
+}
+
 // Round-4 finding 8 structural proof: the snapshot pointer CAS must LOCK the existing row FOR UPDATE,
 // refuse an OLDER save ('stale-save'), accept an equal-identical save as 'unchanged', refuse equal but
 // CONFLICTING evidence ('conflict'), and replace only on a STRICTLY NEWER validated_at.
@@ -1628,6 +1712,7 @@ function auditProvenFunction(clean, masked, proof, fnName) {
   if (proof === "replace-oli") return auditReplaceOliFunction(clean, masked, fnName);
   if (proof === "replace-oli-dimensional") return auditReplaceOliDimensionalFunction(clean, masked, fnName);
   if (proof === "replace-oli-order-audit") return auditReplaceOliOrderAuditFunction(clean, masked, fnName);
+  if (proof === "replace-oli-operational-units") return auditReplaceOliOperationalUnitsFunction(clean, masked, fnName);
   if (proof === "snapshot-cas") return auditSnapshotCasFunction(clean, masked, fnName);
   if (proof === "claim-report-lease") return auditClaimReportLeaseFunction(clean, masked, fnName);
   if (proof === "reconcile-report-success") return auditReconcileReportSuccessFunction(clean, masked, fnName);

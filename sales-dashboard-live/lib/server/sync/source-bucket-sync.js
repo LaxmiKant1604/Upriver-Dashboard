@@ -538,7 +538,7 @@ export async function runBucketSourceSync({
         // and a missing-status row is refused (OLI_ORDER_STATUS_MISSING). A blocked account's window is never written,
         // its coverage never advanced, LKG preserved, and it is reported with a redacted itemization summary. The
         // builder returns the dimensional rows + the non-cancelled daily rollup for each fully-resolved account.
-        const { byAccount, rollupByAccount, orderAuditByAccount, blocked, completenessByAccount } = oliDimensionalRowsFromFragment({
+        const { byAccount, rollupByAccount, orderAuditByAccount, operationalUnitsByAccount, blocked, completenessByAccount } = oliDimensionalRowsFromFragment({
           rows: payload.rows, accountsBySellerId,
           organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
           connectionId: "primary", sourceRequestHash: unit.requestHash,
@@ -574,11 +574,15 @@ export async function runBucketSourceSync({
           // The order-level audit rows (dimensional grain + amazon_order_id) ride the SAME atomic replace as the
           // dimensional/rollup evidence, from the SAME validated export -- no second export, no separate transaction.
           const orderRows = (orderAuditByAccount && orderAuditByAccount.get(a.accountId)) || [];
+          // The operational-unit rows (EVERY observed unit: priced / explicit-zero / pending / cancelled) ride the
+          // SAME atomic replace. A covered account ALWAYS passes an array (an empty [] clears a now-inactive window),
+          // so the operational units can never drift from the priced rollup they commit alongside.
+          const unitRows = (operationalUnitsByAccount && operationalUnitsByAccount.get(a.accountId)) || [];
           const outcome = await replaceHistoryWindow({
             organizationFingerprint: family.plannedJobs[0].organizationFingerprint,
             connectionId: "primary", accountId: a.accountId,
             coveredFrom: unit.slice.from, coveredTo: unit.slice.to,
-            rows: dimRows, rollupRows, orderRows, sourceRefreshedAt: nowIso(),
+            rows: dimRows, rollupRows, orderRows, unitRows, sourceRefreshedAt: nowIso(),
           });
           if (outcome && (outcome.write === "value-missing" || outcome.write === "status-missing")) {
             // The RPC's last-line-of-defence validation refused this window (JS builder should have caught it, but

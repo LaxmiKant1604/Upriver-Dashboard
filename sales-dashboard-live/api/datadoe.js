@@ -40,6 +40,7 @@ import {
   getReportSnapshotsOlderThan,
   getSourceCoverageWindows,
   getSourceOliHistoryRows,
+  getSourceOliOperationalUnitRows,
   getSourceSnapshot,
   getSourceSnapshotPayload,
   getExplicitZeroOliUnits,
@@ -102,14 +103,16 @@ function primaryOrgFingerprintOrNull() {
   return p ? (p.organizationFingerprint || organizationFingerprint(p.apiKey)) : null;
 }
 // A single-account completeness augment (Daily + single-account Brand endpoints; resolves the real account from params).
+// readUnitBreakdown surfaces the transparent observed-unit breakdown (priced / explicit-zero / pending-with-sku /
+// pending-without-sku / cancelled) from the additive operational-unit table -- advisory; never breaks a report read.
 function oliCompletenessAugmentSingle() {
   const fp = primaryOrgFingerprintOrNull();
-  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness }) : null;
+  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows }) : null;
 }
 // A portfolio (multi-account) completeness augment (Brand View portfolio surfaces; any provisional -> provisional).
 function oliCompletenessAugmentPortfolio(accountIds) {
   const fp = primaryOrgFingerprintOrNull();
-  return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness }) : null;
+  return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows }) : null;
 }
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
@@ -989,8 +992,9 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
   const readers = {
     readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
     readCatalogSnapshot: getSourceSnapshot, loadCatalogPayload: getSourceSnapshotPayload,
+    readOliOperationalUnits: getSourceOliOperationalUnitRows,
   };
-  const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness });
+  const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows });
 
   // CHEAP freshness probe (coverage + catalog metadata only -- NO history load, NO DataDoe): the current proven
   // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive".
@@ -2553,7 +2557,7 @@ async function handleDataDoe(req, res) {
         lockSeconds: 300,
         build: () => buildBrandPortfolioSnapshot({ brand, accountIds, asOf }),
         // Two-layer completeness aggregated across the portfolio's accounts (any provisional -> portfolio provisional).
-        augmentResponse: bpOrgFp ? makePortfolioCompletenessAugment({ organizationFingerprint: bpOrgFp, connectionId: "primary", accountIds, read: getOliCompleteness }) : null,
+        augmentResponse: bpOrgFp ? makePortfolioCompletenessAugment({ organizationFingerprint: bpOrgFp, connectionId: "primary", accountIds, read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows }) : null,
       });
       return;
     }
@@ -2842,7 +2846,7 @@ async function handleDataDoe(req, res) {
           };
           // Two-layer PROVISIONAL/FINAL completeness: attach the current itemization state (read live from
           // source_oli_completeness) so Daily Reporting labels D-1 provisional/final without a snapshot rewrite.
-          sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness });
+          sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows });
           sharedOptions.deriveDurable = async () => {
             // sharedAccountMetadata (defined in THIS module) reads the account's currency from the shared
             // account-directory snapshot. The previous call referenced an UNDEFINED helper (accountDirectoryMeta),

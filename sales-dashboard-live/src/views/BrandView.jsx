@@ -24,7 +24,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CalendarRange, Coins, Inbox, RefreshCw, Store, Tag } from "lucide-react";
 
-import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
+import { DataQualityAlert, EmptyState, ErrorState, ObservedUnitsBreakdown, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { FLAGS, fmtRangeLabel } from "../lib/format.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
 import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
@@ -388,6 +388,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
       {completeness && completeness.sourceDefect && (
         <DataQualityAlert tone="error" title="Source-data issue for one or more accounts" detail={completeness.notice} />
       )}
+      {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
 
       {!accountId ? (
         <div className="panel">

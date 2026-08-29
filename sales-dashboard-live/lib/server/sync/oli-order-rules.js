@@ -231,3 +231,131 @@ export function nonCancelledDailyRollup(dimRows) {
   }
   return [...byGrain.values()];
 }
+
+// ===========================================================================
+// CANONICAL OPERATIONAL-UNIT CLASSIFIER + METRICS (shared everywhere)
+// ---------------------------------------------------------------------------
+// The single, testable source of truth for "which observed-unit bucket does a row belong to". Revenue is NEVER
+// affected by any of this: totalSales stays the sum of valid item_price_value for non-cancelled PRICED rows only
+// (contributesToRollup / nonCancelledDailyRollup above). These functions only govern OPERATIONAL unit reporting
+// (observed units + SKU Movement) and the transparent breakdown. A NULL price is never treated as zero; an
+// explicit-zero unit adds units and exactly ZERO revenue; a pending (null-price) unit adds no revenue until a
+// later export supplies a real value; a cancelled unit is audit-only (excluded from units, sales and movement).
+// ===========================================================================
+
+// The exact operational unit classes. `defect` is an itemized recognized-sale whose value is genuinely null (a
+// REAL source-data problem: the account is blocked and its LKG preserved -- it NEVER contributes a unit). `none`
+// is a non-cancelled row that carries no positive units and no usable value (e.g. a zero-unit shell) -- it
+// contributes to no bucket. These two never reach the operational-unit table.
+export const OLI_UNIT_CLASS = Object.freeze({
+  PRICED: "priced",                // non-cancelled, value present and > 0
+  EXPLICIT_ZERO: "explicit-zero",  // non-cancelled, value present and <= 0 (an explicit zero-priced/promotional unit)
+  PENDING: "pending",              // non-cancelled, value NULL/blank (itemization pending) -- never coerced to 0
+  CANCELLED: "cancelled",          // cancelled order -- audit only
+  DEFECT: "defect",                // itemized recognized-sale with a genuinely missing value -- blocks the account
+  NONE: "none",                    // non-cancelled shell that contributes to no unit bucket
+});
+
+// THE canonical classifier: given a `classifyOliDimensionalRow(...)` result, return its operational unit class.
+// Cancellation wins first (a cancelled row is never a sale, whatever its value); then the expected pending lag;
+// then a real defect; then priced vs explicit-zero by the strictly-positive value test used by the rollup.
+export function oliUnitClass(c) {
+  if (!c || typeof c !== "object") {
+    throw new OliOrderRuleError("OLI_UNIT_CLASS_INVALID", "oliUnitClass requires a row classification");
+  }
+  if (c.isCancelled) return OLI_UNIT_CLASS.CANCELLED;
+  if (c.pending) return OLI_UNIT_CLASS.PENDING;
+  if (c.defect) return OLI_UNIT_CLASS.DEFECT;
+  if (c.valuePresent && Number(c.value) > 0) return OLI_UNIT_CLASS.PRICED;
+  if (c.valuePresent) return OLI_UNIT_CLASS.EXPLICIT_ZERO; // present but <= 0 -- an explicit-zero unit (never fabricated)
+  return OLI_UNIT_CLASS.NONE;                              // no value and not pending/cancelled/defect (e.g. zero-unit shell)
+}
+
+// A grain row carries CANONICAL identity when its SKU or its child ASIN is non-blank. A SKU-less, ASIN-less unit
+// can NEVER be attributed to a product -- it is counted in account/day observed totals only, NEVER placed under a
+// fabricated "Unmapped" SKU in SKU Movement.
+export function hasCanonicalIdentity(row) {
+  return S(row && (row.sku ?? row.sku_id)).trim() !== "" || S(row && (row.childAsin ?? row.child_asin)).trim() !== "";
+}
+
+const numOr0 = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+/**
+ * The CANONICAL operational-unit metrics, computed from a set of operational-unit grain rows. Each row carries the
+ * per-(sku, child_asin) class unit sums { pricedUnits, explicitZeroUnits, pendingUnits, cancelledUnits, pricedSales }.
+ * Definitions (documented contract):
+ *   pricedUnits                 = non-cancelled units with a valid item_price_value > 0
+ *   explicitZeroUnits           = non-cancelled units with an explicit item_price_value <= 0 (an explicit zero)
+ *   pendingPriceUnitsWithSku    = non-cancelled null-price units WHERE a canonical SKU/ASIN exists
+ *   pendingPriceUnitsWithoutSku = non-cancelled null-price units WHERE no canonical SKU/ASIN exists
+ *   observedUnits               = pricedUnits + explicitZeroUnits + pendingWithSku + pendingWithoutSku
+ *   skuMovementUnits            = (pricedUnits + explicitZeroUnits + pendingWithSku) counted ONLY where identity exists
+ *   cancelledUnits              = cancelled units (audit only; excluded from every non-cancelled total above)
+ * NULL is NEVER implemented as zero; pending contributes no sales; explicit-zero contributes no sales.
+ */
+/**
+ * ZERO-EXPORT backfill helper: aggregate already-stored DIMENSIONAL history rows into operational-unit grain rows
+ * (per sale_date, sku, child_asin, currency) with per-class unit sums. Dimensional history carries priced +
+ * explicit-zero + cancelled rows (PENDING null-price rows were never persisted there), so this reconstructs those
+ * three classes exactly; pending units flow forward from the next sync. `dimRows` carry snake_case columns
+ * { seller_or_vendor_id, sale_date, sku, child_asin, currency, is_cancelled, total_sales_sum, total_units_sum,
+ * source_request_hash }. Returns the p_unit_rows shape (camelCase) for replaceOliOperationalUnitsWindow.
+ */
+export function operationalUnitsFromDimensionalRows(dimRows) {
+  const byGrain = new Map();
+  for (const r of Array.isArray(dimRows) ? dimRows : []) {
+    const saleDate = S(r.sale_date ?? r.saleDate);
+    const sku = S(r.sku);
+    const childAsin = S(r.child_asin ?? r.childAsin);
+    const currency = S(r.currency);
+    const units = Number(r.total_units_sum ?? r.totalUnitsSum ?? 0) || 0;
+    const cancelled = r.is_cancelled === true || r.is_cancelled === "true" || r.isCancelled === true;
+    const salesPresent = orderValuePresent(r.total_sales_sum ?? r.totalSalesSum);
+    const sales = salesPresent ? Number(r.total_sales_sum ?? r.totalSalesSum) : null;
+    const key = [saleDate, sku, childAsin, currency].join("");
+    const e = byGrain.get(key) || {
+      sellerOrVendorId: S(r.seller_or_vendor_id ?? r.sellerOrVendorId), saleDate, sku, childAsin, currency,
+      pricedUnits: 0, pricedSales: 0, hasPricedSales: false, explicitZeroUnits: 0, pendingUnits: 0, cancelledUnits: 0,
+      sourceRequestHash: S(r.source_request_hash ?? r.sourceRequestHash),
+    };
+    if (cancelled) e.cancelledUnits += units;
+    else if (salesPresent && Number(sales) > 0) { e.pricedUnits += units; e.pricedSales += Number(sales); e.hasPricedSales = true; }
+    else if (salesPresent) e.explicitZeroUnits += units; // present but <= 0 -- explicit zero
+    // a non-cancelled null-value dimensional row cannot exist (never persisted); if seen, it contributes nothing
+    byGrain.set(key, e);
+  }
+  return [...byGrain.values()].map((e) => ({
+    sellerOrVendorId: e.sellerOrVendorId, saleDate: e.saleDate, sku: e.sku, childAsin: e.childAsin, currency: e.currency,
+    pricedUnits: e.pricedUnits, pricedSales: e.hasPricedSales ? e.pricedSales : null,
+    explicitZeroUnits: e.explicitZeroUnits, pendingUnits: e.pendingUnits, cancelledUnits: e.cancelledUnits,
+    sourceRequestHash: e.sourceRequestHash,
+  }));
+}
+
+export function operationalUnitMetrics(rows) {
+  let priced = 0, zero = 0, pendWith = 0, pendWithout = 0, cancelled = 0, pricedSales = 0;
+  let movementPriced = 0, movementZero = 0; // priced/zero counted toward movement ONLY when identity exists
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const id = hasCanonicalIdentity(r);
+    const p = numOr0(r.pricedUnits);
+    const z = numOr0(r.explicitZeroUnits);
+    const pend = numOr0(r.pendingUnits);
+    priced += p;
+    zero += z;
+    cancelled += numOr0(r.cancelledUnits);
+    pricedSales += numOr0(r.pricedSales);
+    if (id) { pendWith += pend; movementPriced += p; movementZero += z; } else { pendWithout += pend; }
+  }
+  const observedUnits = priced + zero + pendWith + pendWithout;
+  const skuMovementUnits = movementPriced + movementZero + pendWith;
+  return {
+    pricedUnits: priced,
+    explicitZeroUnits: zero,
+    pendingPriceUnitsWithSku: pendWith,
+    pendingPriceUnitsWithoutSku: pendWithout,
+    cancelledUnits: cancelled,
+    observedUnits,
+    skuMovementUnits,
+    pricedSales,
+  };
+}

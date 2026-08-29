@@ -49,6 +49,7 @@ const readers = {
   readOliCoverage: sb.getSourceCoverageWindows,
   readCatalogSnapshot: sb.getSourceSnapshot,
   loadCatalogPayload: sb.getSourceSnapshotPayload,
+  readOliOperationalUnits: sb.getSourceOliOperationalUnitRows,
 };
 
 const guardedSave = makeSkuMovementProvenanceGuardedSave({

@@ -14,6 +14,7 @@ import {
   ExportButton, FreshnessBar, Notice, Pagination, ReportHeader, SearchField, SelectField,
   SnapshotState, SortTh, StatRow, snapshotFreshnessLabel, sortRows, useSortState,
 } from "./shared.jsx";
+import { ObservedUnitsBreakdown } from "../components/ui.jsx";
 
 const PAGE_SIZE = 50;
 const STATUS_OPTIONS = [
@@ -158,6 +159,8 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
             : (completeness.sourceDefect ? "Source issue on D-1" : "Final D-1")] : []),
         ]} />
       )}
+
+      {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
 
       {completeness && completeness.provisional && (
         <Notice tone="warn">

@@ -16,7 +16,7 @@
 import { addDaysStr, monthStartStr, canonicalOliSlices } from "../date-windows.js";
 import { canonicalCurrency } from "../currency.js";
 import { sourceRegistryEntry } from "./source-registry.js";
-import { classifyOliDimensionalRow, OliOrderRuleError } from "./oli-order-rules.js";
+import { classifyOliDimensionalRow, OliOrderRuleError, oliUnitClass, OLI_UNIT_CLASS } from "./oli-order-rules.js";
 
 export const OLI_SOURCE_KEY = "order-line-items";
 export const CATALOG_SOURCE_KEY = "product-catalog";
@@ -390,7 +390,9 @@ export function oliHistoryRowsFromFragment({ rows, accountsBySellerId, organizat
  * values; units always sum). A fully-resolved account (no pending, no defect) persists and its coverage advances,
  * even with zero completed sales (only cancelled / explicit-zero).
  *
- * Returns { byAccount, rollupByAccount, orderAuditByAccount, blocked: [{ accountId, code, detail }] }.
+ * Returns { byAccount, rollupByAccount, orderAuditByAccount, operationalUnitsByAccount, blocked: [{ accountId, code, detail }],
+ * completenessByAccount }. operationalUnitsByAccount carries EVERY observed unit (priced / explicit-zero / pending /
+ * cancelled) at the rollup grain for a non-blocked account -- the ONLY durable home for pending units at SKU grain.
  */
 // A redacted, PII-free itemization summary for honest diagnostics (never leaks order ids / customer data): how
 // many rows resolved (priced) vs are still PENDING Amazon item-level sync, split by reason, plus the itemized %
@@ -476,6 +478,7 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
   const byAccount = new Map();
   const rollupByAccount = new Map();
   const orderAuditByAccount = new Map(); // ORDER-level audit (dimensional grain + amazon_order_id); folded OUT of byAccount
+  const operationalUnitsByAccount = new Map(); // per-(date, sku, child_asin, currency) observed-unit class sums (ALL classes)
   const completenessByAccount = new Map(); // per account -> { byDate: Map<date, dateCompleteness>, itemization }
   const blocked = [];
   for (const [accountId, entries] of rawByAccount) {
@@ -485,6 +488,7 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
     const byGrain = new Map();      // dimensional grain (full evidence, cancelled included) -- NO order_id (byte-identical)
     const rollupByGrain = new Map(); // NON-cancelled rollup at (date, sku, child_asin, currency)
     const orderAuditByGrain = new Map(); // dimensional grain + amazon_order_id (a blank ID stays its own grain)
+    const opUnitsByGrain = new Map(); // OPERATIONAL units at (date, sku, child_asin, currency): per-class unit sums (ALL classes)
     for (const { row, seller, date, currency } of entries) {
       let c;
       try {
@@ -511,10 +515,34 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
         const oid = c.orderId || ""; const oe = ds.orders.get(oid) || { itemized: 0, pending: 0 }; oe.itemized += 1; ds.orders.set(oid, oe);
       }
       summary.byDate.set(date, ds);
+      // OPERATIONAL-UNIT observation (ALL classes, incl. cancelled + pending): retain EVERY unit at the rollup grain,
+      // split by canonical class, so operational unit reporting + SKU Movement + the breakdown see units the priced
+      // rollup deliberately excludes. This is the ONLY place a pending unit is retained at SKU/ASIN grain. Revenue is
+      // untouched (only priced_units carries a value; a NULL price is never coerced to 0). A DEFECT row contributes
+      // nothing here and its account is blocked below (its operational rows are discarded with the rest of its LKG).
+      {
+        const uSku = String(row.sku ?? "");
+        const uAsin = String(row.child_asin ?? "");
+        // Keyed on the SAME unit-separator grain as the dimensional/rollup maps (US), so grains never collide.
+        const ugrain = [date, uSku, uAsin, currency].join(US);
+        const ue = opUnitsByGrain.get(ugrain) || {
+          sellerOrVendorId: seller, saleDate: date, sku: uSku, childAsin: uAsin, currency,
+          pricedUnits: 0, pricedSales: 0, hasPricedSales: false, explicitZeroUnits: 0, pendingUnits: 0, cancelledUnits: 0,
+          sourceRequestHash,
+        };
+        switch (oliUnitClass(c)) {
+          case OLI_UNIT_CLASS.CANCELLED: ue.cancelledUnits += c.units; break;
+          case OLI_UNIT_CLASS.PENDING: ue.pendingUnits += c.units; break;
+          case OLI_UNIT_CLASS.PRICED: ue.pricedUnits += c.units; ue.pricedSales += Number(c.value); ue.hasPricedSales = true; break;
+          case OLI_UNIT_CLASS.EXPLICIT_ZERO: ue.explicitZeroUnits += c.units; break;
+          default: break; // DEFECT / NONE contribute no operational unit
+        }
+        opUnitsByGrain.set(ugrain, ue);
+      }
       // A PENDING (not-yet-itemized / pre-sale) or DEFECT (itemized-but-null) row carries a MISSING value: keep it
       // OUT of the persisted dimensional/audit/rollup grains (never persist a null non-cancelled value). PENDING rows
-      // are captured in the completeness metadata (the itemized window still PUBLISHES, labelled provisional); DEFECT
-      // rows block the account below (LKG preserved). Cancelled + itemized (value-present) rows persist normally.
+      // are captured in the operational-unit + completeness metadata (the itemized window still PUBLISHES, labelled
+      // provisional); DEFECT rows block the account below (LKG preserved). Cancelled + itemized rows persist normally.
       if (c.pending || c.defect) continue;
       const sku = String(row.sku ?? "");
       const childAsin = String(row.child_asin ?? "");
@@ -580,11 +608,18 @@ export function oliDimensionalRowsFromFragment({ rows, accountsBySellerId, organ
     byAccount.set(accountId, [...byGrain.values()]);
     rollupByAccount.set(accountId, [...rollupByGrain.values()]);
     orderAuditByAccount.set(accountId, [...orderAuditByGrain.values()]);
+    // priced_sales is NULL for a grain that carries no priced units (never coerced to 0). Emit the finalized shape.
+    operationalUnitsByAccount.set(accountId, [...opUnitsByGrain.values()].map((u) => ({
+      sellerOrVendorId: u.sellerOrVendorId, saleDate: u.saleDate, sku: u.sku, childAsin: u.childAsin, currency: u.currency,
+      pricedUnits: u.pricedUnits, pricedSales: u.hasPricedSales ? u.pricedSales : null,
+      explicitZeroUnits: u.explicitZeroUnits, pendingUnits: u.pendingUnits, cancelledUnits: u.cancelledUnits,
+      sourceRequestHash: u.sourceRequestHash,
+    })));
     const byDate = new Map();
     for (const [d, ds] of summary.byDate) byDate.set(d, oliDateCompleteness(ds));
     completenessByAccount.set(accountId, { byDate, itemization: oliItemizationDetail(summary) });
   }
-  return { byAccount, rollupByAccount, orderAuditByAccount, blocked, completenessByAccount };
+  return { byAccount, rollupByAccount, orderAuditByAccount, operationalUnitsByAccount, blocked, completenessByAccount };
 }
 
 /**

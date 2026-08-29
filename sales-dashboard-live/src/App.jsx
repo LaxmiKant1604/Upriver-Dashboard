@@ -8,7 +8,7 @@ import { supabase } from "./lib/supabase.js";
 import { STYLE, CHART } from "./styles/theme.js";
 import {
   BreakdownCard, ChartCard, ChartTooltip, ComparisonMetric, DataQualityAlert,
-  EmptyState, ErrorState, MetricCard, SegmentedControl, SkeletonChart,
+  EmptyState, ErrorState, MetricCard, ObservedUnitsBreakdown, SegmentedControl, SkeletonChart,
   SkeletonMetricGrid, SkeletonTable, Sparkline, TrendIndicator,
 } from "./components/ui.jsx";
 import { DateRangeSelector, Sidebar, TopBar, VIEW_TITLES } from "./components/shell.jsx";
@@ -3004,6 +3004,7 @@ function DashboardApp({ session, access, onSignOut }) {
         {salesCompleteness && salesCompleteness.sourceDefect && (
           <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={salesCompleteness.notice} />
         )}
+        {salesCompleteness && salesCompleteness.unitBreakdown && <ObservedUnitsBreakdown completeness={salesCompleteness} />}
 
         {/* Global date filter. Presets, the custom range and its clamping are
             the app's existing logic; only the control's presentation changed. */}

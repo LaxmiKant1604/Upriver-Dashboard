@@ -318,6 +318,49 @@ export function DataQualityAlert({ tone = "warning", title, detail, icon }) {
   );
 }
 
+/* -------------------------------------------------- observed-unit breakdown */
+
+/**
+ * ObservedUnitsBreakdown -- a compact, transparent breakdown of the day's OBSERVED units by class, shown beside the
+ * completeness/provisional line. Revenue is deliberately excluded from explicit-zero + pending units; identifiable
+ * pending units DO move unit reporting; SKU-less pending units cannot be assigned to a product yet. It renders
+ * nothing when there is no `completeness.unitBreakdown` (advisory -- degrades gracefully pre-backfill). Never a red
+ * failure banner: expected pending itemization is a neutral, informational note.
+ */
+export function ObservedUnitsBreakdown({ completeness }) {
+  const b = completeness && completeness.unitBreakdown;
+  if (!b) return null;
+  const nf = (v) => (Number(v) || 0).toLocaleString();
+  const chips = [
+    { key: "priced", cls: "priced", label: "Priced", value: b.pricedUnits },
+    { key: "zero", cls: "zero", label: "Explicit zero-price", value: b.explicitZeroUnits },
+    { key: "pend-sku", cls: "pending", label: "Pending · has SKU", value: b.pendingWithSkuUnits },
+    { key: "pend-nosku", cls: "pending", label: "Pending · no SKU", value: b.pendingWithoutSkuUnits },
+    { key: "cancelled", cls: "cancelled", label: "Cancelled", value: b.cancelledUnits },
+  ];
+  const status = completeness.provisional ? "Provisional" : (completeness.sourceDefect ? "Source issue" : "Final");
+  return (
+    <div className="obs-units" role="status" aria-label="Observed unit breakdown">
+      <div className="obs-units-head">
+        <span className="obs-units-title">Observed units{b.onDate ? ` — ${b.onDate}` : ""}</span>
+        <span className="obs-units-total">{nf(b.observedUnits)} total · {nf(b.skuMovementUnits)} in SKU Movement · {status}</span>
+      </div>
+      <div className="obs-units-chips">
+        {chips.map((c) => (
+          <span key={c.key} className={"obs-chip obs-chip-" + c.cls}>
+            <span className="obs-chip-v">{nf(c.value)}</span> {c.label}
+          </span>
+        ))}
+      </div>
+      <div className="obs-units-note">
+        Revenue counts priced units only — explicit zero-price and pending-price units add no sales. Explicit-zero and
+        SKU-identifiable pending units are included in unit movement; unallocated pending units (no SKU/ASIN yet) are not.
+        {completeness.finalizedThrough ? ` Fully finalized through ${completeness.finalizedThrough}.` : ""} Values reconcile automatically on later order refreshes.
+      </div>
+    </div>
+  );
+}
+
 /* -------------------------------------------------- loading / empty / error */
 
 export function SkeletonLine({ width = "100%", height = 11, style }) {

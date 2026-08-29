@@ -1455,61 +1455,95 @@ export async function replaceOliHistoryWindow({ organizationFingerprint, connect
 // A row that violates the authoritative order rules raises fail-closed inside the RPC (the whole window rolls
 // back, LKG preserved); this wrapper surfaces those as TYPED write outcomes so the caller can report the affected
 // account/window separately and never marks its coverage successful.
-export async function replaceOliDimensionalWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, orderRows = [], sourceRefreshedAt = null, signal = null }) {
+export async function replaceOliDimensionalWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, rows, orderRows = [], unitRows = null, sourceRefreshedAt = null, signal = null }) {
   if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(rows)) {
     throw new Error("replaceOliDimensionalWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a rows array (fail closed).");
   }
   if (!Array.isArray(orderRows)) {
     throw new Error("replaceOliDimensionalWindow orderRows must be an array (fail closed).");
   }
+  // unitRows is OPTIONAL: null/undefined => p_unit_rows NULL (the RPC SKIPS the operational-unit block, preserving
+  // any existing rows -- for legacy callers). A supplied array (even []) => the operational units are REPLACED.
+  if (unitRows != null && !Array.isArray(unitRows)) {
+    throw new Error("replaceOliDimensionalWindow unitRows must be an array or null (fail closed).");
+  }
+  // The 8-arg body (dimensional + rollup + order-audit + coverage). p_unit_rows is added ONLY for the 9-arg call.
+  const baseBody = {
+    p_organization_fingerprint: organizationFingerprint,
+    p_connection_id: connectionId,
+    p_account_id: accountId,
+    p_covered_from: coveredFrom,
+    p_covered_to: coveredTo,
+    p_rows: rows.map((r) => ({
+      seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+      sale_date: r.saleDate ?? r.sale_date,
+      sku: String(r.sku ?? ""),
+      child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+      currency: r.currency,
+      amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
+      fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
+      address_state: r.addressState ?? r.address_state ?? "",
+      address_city: r.addressCity ?? r.address_city ?? "",
+      // total_sales_sum is passed AS-IS (null when absent) -- never coerced to 0 before the RPC's validation.
+      total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
+      total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
+      source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+    })),
+    p_source_refreshed_at: sourceRefreshedAt || new Date().toISOString(),
+    // The SAME validated export ALSO feeds the order-level audit (amazon_order_id folded IN here only). Persisted
+    // atomically with the dimensional/rollup replace, so an OLI window can never commit without its Order IDs.
+    p_order_rows: orderRows.map((r) => ({
+      seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+      sale_date: r.saleDate ?? r.sale_date,
+      sku: String(r.sku ?? ""),
+      child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+      currency: r.currency,
+      amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
+      fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
+      address_state: r.addressState ?? r.address_state ?? "",
+      address_city: r.addressCity ?? r.address_city ?? "",
+      // amazon_order_id is passed AS-IS (already canonicalized; '' when the source had none -- never fabricated).
+      amazon_order_id: r.amazonOrderId ?? r.amazon_order_id ?? "",
+      total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
+      total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
+      source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+    })),
+  };
+  // The SAME validated export ALSO feeds the operational-unit classes (priced / explicit-zero / pending / cancelled),
+  // persisted atomically with the dimensional/rollup/audit replace. Included ONLY when unitRows is supplied.
+  const includeUnits = unitRows != null;
+  const fullBody = includeUnits
+    ? { ...baseBody, p_unit_rows: unitRows.map((r) => ({
+        seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+        sale_date: r.saleDate ?? r.sale_date,
+        sku: String(r.sku ?? ""),
+        child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+        currency: r.currency,
+        priced_units: r.pricedUnits ?? r.priced_units ?? 0,
+        // priced_sales is passed AS-IS (null when the grain carries no priced units -- never coerced to 0).
+        priced_sales: (r.pricedSales ?? r.priced_sales) ?? null,
+        explicit_zero_units: r.explicitZeroUnits ?? r.explicit_zero_units ?? 0,
+        pending_units: r.pendingUnits ?? r.pending_units ?? 0,
+        cancelled_units: r.cancelledUnits ?? r.cancelled_units ?? 0,
+        source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+      })) }
+    : baseBody;
   try {
-    const body = await request("/rest/v1/rpc/replace_oli_dimensional_window", {
-      method: "POST",
-      signal,
-      body: {
-        p_organization_fingerprint: organizationFingerprint,
-        p_connection_id: connectionId,
-        p_account_id: accountId,
-        p_covered_from: coveredFrom,
-        p_covered_to: coveredTo,
-        p_rows: rows.map((r) => ({
-          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
-          sale_date: r.saleDate ?? r.sale_date,
-          sku: String(r.sku ?? ""),
-          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
-          currency: r.currency,
-          amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
-          fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
-          address_state: r.addressState ?? r.address_state ?? "",
-          address_city: r.addressCity ?? r.address_city ?? "",
-          // total_sales_sum is passed AS-IS (null when absent) -- never coerced to 0 before the RPC's validation.
-          total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
-          total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
-          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
-        })),
-        p_source_refreshed_at: sourceRefreshedAt || new Date().toISOString(),
-        // The SAME validated export ALSO feeds the order-level audit (amazon_order_id folded IN here only). Persisted
-        // atomically with the dimensional/rollup replace, so an OLI window can never commit without its Order IDs.
-        p_order_rows: orderRows.map((r) => ({
-          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
-          sale_date: r.saleDate ?? r.sale_date,
-          sku: String(r.sku ?? ""),
-          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
-          currency: r.currency,
-          amazon_order_status: r.amazonOrderStatus ?? r.amazon_order_status,
-          fulfillment_channel: r.fulfillmentChannel ?? r.fulfillment_channel ?? "",
-          address_state: r.addressState ?? r.address_state ?? "",
-          address_city: r.addressCity ?? r.address_city ?? "",
-          // amazon_order_id is passed AS-IS (already canonicalized; '' when the source had none -- never fabricated).
-          amazon_order_id: r.amazonOrderId ?? r.amazon_order_id ?? "",
-          total_sales_sum: (r.totalSalesSum ?? r.total_sales_sum) ?? null,
-          total_units_sum: r.totalUnitsSum ?? r.total_units_sum,
-          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
-        })),
-      },
-    });
+    let body;
+    try {
+      body = await request("/rest/v1/rpc/replace_oli_dimensional_window", { method: "POST", signal, body: fullBody });
+    } catch (attemptError) {
+      // DEPLOY SAFETY: if the 9-arg signature (p_unit_rows) is not deployed yet (the migration has not been applied),
+      // fall back to the 8-arg call so the priced rollup + dimensional + order-audit STILL persist. Operational units
+      // simply wait for the migration; a re-sync backfills them. This makes the code deploy safe in ANY order.
+      if (includeUnits && isFunctionSignatureMissingError(attemptError)) {
+        body = await request("/rest/v1/rpc/replace_oli_dimensional_window", { method: "POST", signal, body: baseBody });
+      } else {
+        throw attemptError;
+      }
+    }
     const value = Array.isArray(body) ? body[0] : body;
-    return { write: "ok", dimensionalInserted: value?.dimensionalInserted ?? 0, rollupInserted: value?.rollupInserted ?? 0, orderAuditInserted: value?.orderAuditInserted ?? 0, error: null };
+    return { write: "ok", dimensionalInserted: value?.dimensionalInserted ?? 0, rollupInserted: value?.rollupInserted ?? 0, orderAuditInserted: value?.orderAuditInserted ?? 0, operationalUnitsInserted: value?.operationalUnitsInserted ?? 0, error: null };
   } catch (writeError) {
     if (isSchemaMissingError(writeError)) return { write: "schema-missing", dimensionalInserted: 0, rollupInserted: 0, orderAuditInserted: 0, error: "OLI_DIM_SCHEMA_MISSING" };
     const msg = String(writeError && writeError.message ? writeError.message : writeError);
@@ -1626,6 +1660,94 @@ export async function getSourceOliHistoryRows({ organizationFingerprint, connect
   return out;
 }
 
+// Bounded OPERATIONAL-UNIT read (source_oli_operational_units): the per-(account, sale_date, sku, child_asin,
+// currency) observed-unit class sums (priced / explicit-zero / pending / cancelled). PAGINATED like the history read.
+// This is the durable home for explicit-zero + pending units (which the priced rollup deliberately excludes) so
+// SKU Movement + the transparent breakdown can count EVERY non-cancelled unit. Revenue never reads this table.
+export async function getSourceOliOperationalUnitRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, additiveOnly = false, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getSourceOliOperationalUnitRows requires organizationFingerprint + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const out = [];
+  try {
+    for (let offset = 0; ; offset += PAGE) {
+      const query = new URLSearchParams({
+        select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,priced_units,priced_sales,explicit_zero_units,pending_units,cancelled_units,source_request_hash",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        sale_date: `gte.${from}`,
+        order: "sale_date.asc,account_id.asc,sku.asc,child_asin.asc,currency.asc",
+        limit: String(PAGE),
+        offset: String(offset),
+      });
+      query.append("sale_date", `lte.${to}`);
+      // additiveOnly narrows to grains that carry ADDITIVE operational units (explicit-zero OR pending) -- the only
+      // rows SKU Movement adds beyond the priced daily rollup. It keeps the read small; the priced rollup is unaffected.
+      if (additiveOnly) query.append("or", "(explicit_zero_units.gt.0,pending_units.gt.0)");
+      if (Array.isArray(accountIds) && accountIds.length) {
+        query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+      }
+      const rows = await request(`/rest/v1/source_oli_operational_units?${query}`, { signal });
+      const list = Array.isArray(rows) ? rows : [];
+      out.push(...list);
+      if (out.length > maxRows) {
+        const err = new Error("OLI_OPUNITS_ROW_LIMIT_EXCEEDED: durable operational-unit read exceeded its row cap; refusing a truncated series (fail closed).");
+        err.code = "OLI_OPUNITS_ROW_LIMIT_EXCEEDED";
+        throw err;
+      }
+      if (list.length < PAGE) break;
+    }
+  } catch (readError) {
+    // Advisory: the operational-unit table is ADDITIVE. If it is not yet present (pre-migration) treat it as empty
+    // so SKU Movement + the breakdown degrade gracefully to the priced evidence (never a broken read). A row-cap
+    // breach is a real fail-closed error and is re-raised.
+    if (readError && readError.code === "OLI_OPUNITS_ROW_LIMIT_EXCEEDED") throw readError;
+    if (isSchemaMissingError(readError)) return [];
+    throw readError;
+  }
+  return out;
+}
+
+// STANDALONE atomic replace of ONLY the operational-unit window (used by the zero-export backfill that recomputes
+// operational units from dimensional history WITHOUT touching the priced rollup / dimensional / audit / coverage).
+export async function replaceOliOperationalUnitsWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, unitRows, signal = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(unitRows)) {
+    throw new Error("replaceOliOperationalUnitsWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a unitRows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_oli_operational_units_window", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_unit_rows: unitRows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          sale_date: r.saleDate ?? r.sale_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          priced_units: r.pricedUnits ?? r.priced_units ?? 0,
+          priced_sales: (r.pricedSales ?? r.priced_sales) ?? null,
+          explicit_zero_units: r.explicitZeroUnits ?? r.explicit_zero_units ?? 0,
+          pending_units: r.pendingUnits ?? r.pending_units ?? 0,
+          cancelled_units: r.cancelledUnits ?? r.cancelled_units ?? 0,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash,
+        })),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", replaced: value?.operationalUnitsReplaced ?? 0, inserted: value?.operationalUnitsInserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "OLI_OPUNITS_SCHEMA_MISSING" };
+    return { write: "write-failed", replaced: 0, inserted: 0, error: "OLI_OPUNITS_REPLACE_FAILED" };
+  }
+}
+
 // Durable read helper for future fulfillment / state / city contribution slices WITHOUT another historical
 // DataDoe export: reads the NON-CANCELLED dimensional OLI rows over a window for a set of accounts, aggregated by
 // the requested dimension keys. `dimensions` is a subset of ['fulfillment_channel','address_state','address_city']
@@ -1708,6 +1830,41 @@ export async function getExplicitZeroOliUnits({ organizationFingerprint, connect
     if (raw.length > maxRows) {
       const err = new Error("OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED: explicit-zero OLI read exceeded its row cap; refusing a truncated series (fail closed).");
       err.code = "OLI_EXPLICIT_ZERO_ROW_LIMIT_EXCEEDED";
+      throw err;
+    }
+    if (list.length < PAGE) break;
+  }
+  return raw;
+}
+
+// Raw dimensional rows (ALL classes, cancelled included) for ONE account over a window -- the zero-export input the
+// operational-units BACKFILL classifies into per-class unit sums. Selects only already-stored safe fields. Note:
+// PENDING (null-price) rows are NOT in the dimensional table (they were never persisted at grain), so a backfill
+// reconstructs priced + explicit-zero + cancelled units only; pending units flow forward from the next OLI sync.
+export async function getSourceOliDimensionalUnitRows({ organizationFingerprint, connectionId = "primary", accountId, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId || !from || !to) {
+    throw new Error("getSourceOliDimensionalUnitRows requires organizationFingerprint + accountId + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const raw = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const query = new URLSearchParams({
+      select: "seller_or_vendor_id,sale_date,sku,child_asin,currency,is_cancelled,total_sales_sum,total_units_sum,source_request_hash",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      sale_date: `gte.${from}`,
+      order: "sale_date.asc,sku.asc,child_asin.asc,currency.asc",
+      limit: String(PAGE),
+      offset: String(offset),
+    });
+    query.append("sale_date", `lte.${to}`);
+    const rows = await request(`/rest/v1/source_oli_dimensional_history?${query}`, { signal });
+    const list = Array.isArray(rows) ? rows : [];
+    raw.push(...list);
+    if (raw.length > maxRows) {
+      const err = new Error("OLI_DIM_UNIT_ROW_LIMIT_EXCEEDED: dimensional unit read exceeded its row cap; refusing a truncated series (fail closed).");
+      err.code = "OLI_DIM_UNIT_ROW_LIMIT_EXCEEDED";
       throw err;
     }
     if (list.length < PAGE) break;
@@ -2565,6 +2722,17 @@ export function isSchemaMissingError(error) {
     || /\b42P01\b/.test(message)
     || /Could not find the table\b[\s\S]*\bschema cache\b/i.test(message)
     || /relation "[^"]+" does not exist/i.test(message);
+}
+
+// A PostgREST RPC signature-not-found error (PGRST202): the named function with the SUPPLIED argument set is not in
+// the schema cache -- e.g. calling the 9-arg replace_oli_dimensional_window (with p_unit_rows) before its migration
+// is applied. Distinct from a missing TABLE (isSchemaMissingError). Used to fall back to a compatible older signature.
+export function isFunctionSignatureMissingError(error) {
+  const code = error && typeof error.code === "string" ? error.code : "";
+  if (code === "PGRST202") return true;
+  const message = error && error.message ? String(error.message) : String(error || "");
+  return /\bPGRST202\b/.test(message)
+    || /Could not find the function\b[\s\S]*\bschema cache\b/i.test(message);
 }
 
 // Quote a text value for a PostgREST filter (dates need no quoting; text with reserved chars does).

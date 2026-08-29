@@ -819,6 +819,19 @@ body{ overflow-x:hidden; }
 .dr-badge-provisional{ background:var(--warning-soft); color:var(--warning); }
 .dr-badge-final{ background:var(--positive-soft); color:var(--positive); }
 .dr-badge-defect{ background:var(--negative-soft); color:var(--negative); }
+/* Observed-unit breakdown (transparent per-class units beside the completeness line). Responsive: chips wrap, never overflow. */
+.obs-units{ margin:8px 0 4px; padding:10px 12px; border:1px solid var(--border-default); border-radius:var(--radius-md,10px); background:var(--bg-elevated); max-width:100%; }
+.obs-units-head{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.obs-units-title{ font-size:12px; font-weight:800; color:var(--text-primary); letter-spacing:.2px; }
+.obs-units-total{ font-size:11px; color:var(--text-muted); }
+.obs-units-chips{ display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+.obs-chip{ display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:var(--radius-pill); font-size:10.5px; font-weight:600; white-space:nowrap; }
+.obs-chip-v{ font-weight:800; }
+.obs-chip-priced{ background:var(--positive-soft); color:var(--positive); }
+.obs-chip-zero{ background:var(--bg-subtle,rgba(120,120,140,0.12)); color:var(--text-primary); }
+.obs-chip-pending{ background:var(--warning-soft); color:var(--warning); }
+.obs-chip-cancelled{ background:var(--negative-soft); color:var(--negative); }
+.obs-units-note{ font-size:10.5px; line-height:1.5; color:var(--text-muted); }
 .dr-refresh{ flex-shrink:0; width:32px; height:32px; border-radius:var(--radius-sm); border:1px solid var(--border-default); background:var(--bg-elevated); color:var(--text-muted); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
 .dr-refresh:hover{ color:var(--accent); border-color:var(--border-hover); }
 .dr-refresh:disabled{ opacity:.6; cursor:default; }
