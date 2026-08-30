@@ -953,6 +953,43 @@ test("P12a. APPLY on a clean baseline COMMITS and produces EXACTLY the global ta
   assert.deepEqual((await store.promotedRows()).filter((x) => x.publish_enabled).map((x) => x.report_key), ["brand-inventory"]);
   assert.equal((await store.approvalRows()).filter((x) => x.approved).length, 6);
 });
+test("P12-fba-a. buildFbaPlanControlPackage: exact rollout, ONLY fba-plan dispatch enabled (all others paused), NO promoted, 1xN approvals", () => {
+  const pkg = controlPkg.buildFbaPlanControlPackage({ accounts: ["A02", "A01", "A01"], operator: "op@x", controlledReportKeys: CONTROLLED });
+  assert.deepEqual(pkg.accounts, ["A01", "A02"], "dedup + sort");
+  assert.deepEqual(pkg.post.dispatchEnabled, ["fba-plan"], "ONLY fba-plan dispatch-enabled");
+  assert.deepEqual(pkg.post.dispatchPaused, CONTROLLED.filter((rk) => rk !== "fba-plan").sort(), "every other controlled report paused");
+  assert.equal(pkg.post.promotedEnabled, "", "NO promoted control enabled");
+  assert.deepEqual(pkg.post.rolloutEnabled, ["A01", "A02"]);
+  assert.deepEqual(pkg.post.approvals, ["fba-plan|A01", "fba-plan|A02"], "approvals ONLY for fba-plan x each account");
+  assert.throws(() => controlPkg.buildFbaPlanControlPackage({ accounts: [], operator: "op" }), /primary account/);
+  assert.throws(() => controlPkg.buildFbaPlanControlPackage({ accounts: ["dd-secondary:x"], operator: "op" }), /dd-secondary/);
+  assert.throws(() => controlPkg.buildFbaPlanControlPackage({ accounts: ["A01"], operator: "" }), /operator id/);
+});
+
+test("P12-fba-b. APPLY the fba-plan package on a clean baseline enables ONLY fba-plan, no promoted, fba-plan approvals -- COMMITS", async () => {
+  const pkg = controlPkg.buildFbaPlanControlPackage({ accounts: ["A01", "A02"], operator: "op@x", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline());
+  const r = await runTxn(store, pkg, "apply");
+  assert.equal(r.committed, true, JSON.stringify(r));
+  assert.deepEqual((await store.dispatchRows()).filter((x) => x.schedule_enabled).map((x) => x.report_key), ["fba-plan"], "ONLY fba-plan enabled -- daily/brand-sales stay paused");
+  assert.deepEqual((await store.promotedRows()).filter((x) => x.publish_enabled).map((x) => x.report_key), [], "NO promoted control enabled (no blank-key row)");
+  assert.deepEqual((await store.rolloutRows()).filter((x) => x.enabled).map((x) => x.account_id).sort(), ["A01", "A02"]);
+  const appr = (await store.approvalRows()).filter((x) => x.approved).map((x) => x.report_key + "|" + x.account_id).sort();
+  assert.deepEqual(appr, ["fba-plan|A01", "fba-plan|A02"], "approvals ONLY for fba-plan");
+});
+
+test("P12-fba-c. the SAME global SAFE-CLOSE closes the fba-plan apply (rollback disables every control)", async () => {
+  const pkg = controlPkg.buildFbaPlanControlPackage({ accounts: ["A01", "A02"], operator: "op@x", controlledReportKeys: CONTROLLED });
+  const store = makeControlStore(baseline());
+  await runTxn(store, pkg, "apply");
+  const safeClose = controlPkg.buildPrioritySafeClosePackage({ operator: "op@x", controlledReportKeys: CONTROLLED });
+  const r = await runTxn(store, safeClose, "rollback");
+  assert.equal(r.committed, true, JSON.stringify(r));
+  assert.equal((await store.rolloutRows()).filter((x) => x.enabled).length, 0, "all rollout disabled");
+  assert.equal((await store.dispatchRows()).filter((x) => x.schedule_enabled).length, 0, "all dispatch paused (incl. fba-plan)");
+  assert.equal((await store.approvalRows()).filter((x) => x.approved).length, 0, "all approvals revoked");
+});
+
 test("P12b. APPLY actively RECONCILES AWAY a pre-existing EXTRA rollout row + EXTRA approval (produces exactly the target) and COMMITS", async () => {
   const pkg = controlPkg.buildPriorityControlPackage({ accounts: ["A01"], operator: "op", controlledReportKeys: CONTROLLED });
   const store = makeControlStore(baseline({ rollout: [{ account_id: "STRAY", enabled: true }], approvals: ["daily-reporting|STRAY"] }));

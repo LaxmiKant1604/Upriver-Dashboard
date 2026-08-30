@@ -84,6 +84,47 @@ export function buildPriorityControlPackage({ accounts, operator = "", controlle
   return { accounts: acct, operator, controlled, apply, rollback, post };
 }
 
+// The FBA Shipment Plan go-live dispatch key (report_sync_settings.schedule_enabled). fba-plan is a DISPATCH
+// report (not source-promoted), so no promoted control is enabled -- brand-inventory stays as-is (disabled).
+export const FBA_PLAN_DISPATCH_ENABLED = Object.freeze(["fba-plan"]);
+
+/**
+ * Build the exact control package that enables ONLY the FBA Shipment Plan publication gates (GATE2 dispatch + GATE3
+ * rollout + GATE4 approvals) for the first-time go-live, reconciling every OTHER controlled report to PAUSED and
+ * every promoted control to DISABLED. This is SAFE precisely because the whole report publish control-plane is
+ * transient (opened per bounded run, always-safe-closed after): the live daily/brand-view snapshots persist
+ * regardless of these gates, so an fba-plan-only apply never disturbs them. Same guarded transaction + global-set
+ * assertions as the priority package; the SAFE-CLOSE (--rollback) is the SAME discovery-independent global close.
+ */
+export function buildFbaPlanControlPackage({ accounts, operator = "", controlledReportKeys = CONTROLLED_REPORT_KEYS } = {}) {
+  const acct = uniqSort(accounts);
+  if (!acct.length) throw new Error("buildFbaPlanControlPackage requires >=1 primary account (fail closed).");
+  if (acct.some((a) => a.startsWith("dd-secondary:"))) throw new Error("buildFbaPlanControlPackage refuses a dd-secondary account (primary only, fail closed).");
+  if (!nb(operator)) throw new Error("buildFbaPlanControlPackage requires an operator id for the audited approvals (fail closed).");
+  const publishKeys = ["fba-plan"];
+  const controlled = uniqSort(controlledReportKeys);
+  const reportSyncSettings = controlled.map((rk) => ({ report_key: rk, schedule_enabled: FBA_PLAN_DISPATCH_ENABLED.includes(rk) }));
+  const approvals = acct.flatMap((a) => publishKeys.map((rk) => rk + "|" + a)).sort();
+  const apply = {
+    allPrimary: false,
+    rollout: acct.map((a) => ({ account_id: a, enabled: true, note: "fba-plan go-live" })),
+    reportSyncSettings,
+    promoted: [], // fba-plan is a dispatch report; no promoted control is enabled
+    approvals: acct.flatMap((a) => publishKeys.map((rk) => ({ report_key: rk, account_id: a, approved: true, approved_by: operator }))),
+  };
+  const rollback = { mode: "safe-close", allPrimary: false, disablesAllRollout: true, pausesAllControlledDispatch: true, disablesAllPromoted: true, revokesAllApprovals: true };
+  const post = {
+    allPrimaryFalse: true,
+    rolloutEnabled: [...acct],
+    dispatchEnabled: [...FBA_PLAN_DISPATCH_ENABLED].sort(),
+    dispatchPaused: controlled.filter((rk) => !FBA_PLAN_DISPATCH_ENABLED.includes(rk)).sort(),
+    promotedEnabled: "", // NO promoted control enabled (setPromotedEnabled([""]) disables all)
+    approvals,
+    noCron: true,
+  };
+  return { accounts: acct, operator, controlled, apply, rollback, post };
+}
+
 /**
  * Build the DISCOVERY-INDEPENDENT safe-close package for --rollback. It needs NO account discovery and NO
  * DataDoe call -- the safe-close disables EVERY priority control globally -- only a validated `operator` for the
@@ -153,16 +194,20 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
     if (mode === "apply") {
       if (!pkg.accounts.length) throw new Error("PRE: zero discovered primary accounts");
       // ---- WRITES: ACTIVELY produce EXACTLY the approved target (reconcile away any pre-existing extra) ----
+      // A blank promotedEnabled means NO promoted control is enabled (the fba-plan go-live is a dispatch report,
+      // not a source-promoted one), so setPromotedEnabled([]) disables every promoted control without creating a
+      // blank-keyed row. The priority package supplies "brand-inventory".
+      const promotedTargets = nb(pkg.post.promotedEnabled) ? [pkg.post.promotedEnabled] : [];
       await store.setRolloutEnabled(pkg.post.rolloutEnabled);
       await store.setDispatchEnabled(pkg.post.dispatchEnabled, controlled);
-      await store.setPromotedEnabled([pkg.post.promotedEnabled]);
+      await store.setPromotedEnabled(promotedTargets);
       // Revoking an EXTRA approval here is an audited write (operator + now()), same as approving the target.
       await store.setApprovalsApproved(pkg.post.approvals, operator);
       // ---- POST: COMPLETE global sets (NEVER filtered) ----
       needSet(await enabledRollout(), pkg.post.rolloutEnabled, "rollout-enabled");
       needSet(await enabledDispatch(), pkg.post.dispatchEnabled, "dispatch-enabled");
       needSet(await pausedDispatch(), pkg.post.dispatchPaused, "dispatch-paused");
-      needSet(await enabledPromoted(), [pkg.post.promotedEnabled], "promoted-enabled");
+      needSet(await enabledPromoted(), promotedTargets, "promoted-enabled");
       needSet(await approvedPairs(), pkg.post.approvals, "approved");
     } else {
       // ---- WRITES: SAFE-CLOSE every priority control (documented; NOT a restoration). The approval revocation
@@ -213,18 +258,21 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
  * NEVER calls discoverAccounts (it works even if DataDoe is down -- zero DataDoe calls, no account list).
  * "dry-run" returns the plan with no writes. Returns the transaction result (or { dryRun:true, pkg }).
  */
-export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, log = () => {} } = {}) {
+export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, buildApplyPackage = buildPriorityControlPackage, log = () => {} } = {}) {
   if (mode !== "apply" && mode !== "rollback" && mode !== "dry-run") throw new Error("runControlPackageCli mode must be apply|rollback|dry-run (fail closed).");
   if (!isCanonicalOperator(operator)) throw new Error("runControlPackageCli requires a canonical operator id (fail closed).");
   let pkg;
   if (mode === "rollback") {
-    // DISCOVERY-INDEPENDENT: no DataDoe call, no account list -- the safe-close is global.
+    // DISCOVERY-INDEPENDENT: no DataDoe call, no account list -- the safe-close is global (it closes EVERY control,
+    // so one shared safe-close correctly closes the priority OR the fba-plan apply -- there is only one thing open).
     pkg = buildPrioritySafeClosePackage({ operator, controlledReportKeys });
     log("SAFE-CLOSE (--rollback): no DataDoe discovery required; disabling every priority control globally.");
   } else {
     if (typeof discoverAccounts !== "function") throw new Error("runControlPackageCli apply/dry-run requires discoverAccounts (fail closed).");
     const accounts = await discoverAccounts();
-    pkg = buildPriorityControlPackage({ accounts, operator, controlledReportKeys });
+    // buildApplyPackage defaults to the priority package; the fba-plan go-live passes buildFbaPlanControlPackage
+    // to enable ONLY the fba-plan publication gates (every other controlled report reconciled to paused).
+    pkg = buildApplyPackage({ accounts, operator, controlledReportKeys });
     log("discovered " + pkg.accounts.length + " primary accounts");
   }
   if (mode === "dry-run") return { dryRun: true, mode: "dry-run", committed: false, code: 0, pkg };
