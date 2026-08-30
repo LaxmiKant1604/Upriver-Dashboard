@@ -104,7 +104,16 @@ export function selectSchedulerV2ReportKeys({ settings = [], manualReportKeys = 
 // same owned jobs each round; the driver reaches its fixpoint after one drained round.
 const resolveFromGenericPlan = (plan) => () => ({
   sourceJobs: plan.reportRequests.flatMap((req) => req.sources.map(
-    (s) => plannedSourceJob(req.reportKey, s, req.bucket, DRIVER_CONNECTION_ID[req.connectionId] || req.connectionId, req.accountId),
+    // A BATCHED seller-scoped report request (fba-plan) carries per-account owner metadata + a per-source
+    // marketplace constraint; pass the account's individual rawSellerId + the batch marketplace so plannedSourceJob
+    // computes this account's owner scope (accountScopeHash([rawSellerId])) and the source worker validates every
+    // row against the batch marketplace. A single-account request (no owner / no marketplaceConstraint) passes null
+    // for both and takes the byte-identical single-account path (backward compatible).
+    (s) => plannedSourceJob(
+      req.reportKey, s, req.bucket, DRIVER_CONNECTION_ID[req.connectionId] || req.connectionId, req.accountId,
+      req.owner ? req.owner.rawSellerId : null,
+      s.marketplaceConstraint != null ? s.marketplaceConstraint : null,
+    ),
   )),
 });
 

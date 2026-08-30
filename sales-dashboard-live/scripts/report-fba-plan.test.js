@@ -36,6 +36,7 @@ let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
 let makeFbaPlanDurableContextLoader, oliCoverageProvesWindow;
+let planFbaPlanBucketBatched;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -651,6 +652,101 @@ test("loader: a non-calendar asOf yields {} (derive fails closed)", async () => 
   assert.deepEqual(await makeLoader()({ reportKey: "fba-plan", accountId: ID, planned: { context: usContext({ to: "not-a-date" }) } }), {});
 });
 
+/* ===================== BATCHED marketplace-safe planning + isolation (go-live) ===================== */
+
+group("fba-plan: BATCHED marketplace-safe planning + per-account isolation");
+
+// Raw seller id == public accountId on the primary connection (PL_CONN primary has no prefix).
+const bAccounts = [
+  { accountId: "US1", name: "US One", country: "US", currency: "USD" },
+  { accountId: "US2", name: "US Two", country: "US", currency: "USD" },
+  { accountId: "IN1", name: "IN One", country: "IN", currency: "INR" },
+];
+const bAsOfFor = () => ASOF;
+
+test("planFbaPlanBucketBatched: single-marketplace <=5 batches, per-account owner metadata, US-only AWD", () => {
+  const reqs = planFbaPlanBucketBatched({ accounts: bAccounts, connections: PL_CONN, asOfFor: bAsOfFor });
+  assert.equal(reqs.length, 3, "one report request per account");
+  // US1+US2 share ONE FBA batch hash; IN1 is a SEPARATE marketplace batch (never mixed with US).
+  const invHash = (id) => reqs.find((r) => r.accountId === id).sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
+  assert.equal(invHash("US1"), invHash("US2"), "US1 + US2 share ONE batched FBA export (<=5, same marketplace)");
+  assert.notEqual(invHash("US1"), invHash("IN1"), "IN never batches with US (marketplace-safe)");
+  // AWD is US-only: US accounts carry it, IN does not.
+  const awd = (id) => reqs.find((r) => r.accountId === id).sources.some((s) => s.requestKey === "fba-plan:awd");
+  assert.ok(awd("US1") && awd("US2"), "US accounts carry the AWD source");
+  assert.ok(!awd("IN1"), "IN (non-US) carries NO AWD source");
+  // Every request carries COMPLETE, per-account owner metadata (never the batch scope).
+  for (const r of reqs) {
+    for (const f of ["accountId", "rawSellerId", "connectionId", "organizationFingerprint", "accountScopeHash"]) {
+      assert.ok(r.owner && String(r.owner[f] || "").length > 0, `${r.accountId} owner.${f} present`);
+    }
+    assert.equal(r.owner.accountId, r.accountId);
+    assert.equal(r.owner.rawSellerId, r.accountId, "raw seller id == accountId on the primary connection");
+  }
+  // The two US owners have DISTINCT individual scopes (never the shared batch scope).
+  assert.notEqual(reqs.find((r) => r.accountId === "US1").owner.accountScopeHash, reqs.find((r) => r.accountId === "US2").owner.accountScopeHash);
+  // Every batched FBA/AWD source carries the batch's single canonical marketplace constraint.
+  for (const r of reqs) for (const s of r.sources) assert.equal(s.marketplaceConstraint, r.context.marketCountry);
+});
+
+test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller FBA/AWD export (no cross-account leak)", async () => {
+  const reqs = planFbaPlanBucketBatched({ accounts: [bAccounts[0], bAccounts[1]], connections: PL_CONN, asOfFor: bAsOfFor });
+  // The two US accounts share ONE FBA + ONE AWD export. Its rows carry BOTH accounts (tagged by seller_or_vendor_id).
+  const invRow = (seller, asin, avail) => ({ date: ASOF, seller_or_vendor_id: seller, child_asin: asin, sku: "S-" + seller, marketplace_country_code: "US", available: avail, reserved_customer_order: 0, reserved_fc_transfer: 0, reserved_fc_processing: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, product_name: "P-" + asin });
+  const awdRow = (seller, asin, qty) => ({ marketplace_country_code: "US", seller_or_vendor_id: seller, child_asin: asin, sku: "S-" + seller, awd_available_distributable_quantity: qty, awd_total_inbound_quantity: 0 });
+  const invHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
+  const awdHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:awd").requestHash;
+  const rowsByHash = {
+    [invHash]: [invRow("US1", "ASIN1", 100), invRow("US2", "ASIN2", 50)], // BOTH accounts in the one shared export
+    [awdHash]: [awdRow("US1", "ASIN1", 10), awdRow("US2", "ASIN2", 20)],
+  };
+  // Durable OLI (empty -> valid canonical slice sequence, zero sales) + org catalog for both ASINs, per account.
+  const catalog = [{ child_asin: "ASIN1", product_brand: "B1", product_name: "P-ASIN1" }, { child_asin: "ASIN2", product_brand: "B2", product_name: "P-ASIN2" }];
+  const loadDerivedContext = async ({ reportKey, accountId }) => {
+    if (reportKey !== "fba-plan") return {};
+    const bridged = slicedOliSourceFromHistory({ historyRows: [], accountId, rawSellerId: accountId, from: WINS[0].from, to: ASOF });
+    return {
+      fbaPlanDurableOli: { available: true, rows: bridged.rows, fragments: bridged.fragments },
+      fbaPlanDurableCatalog: { available: true, rows: catalog, fragments: [{ from: WINS[0].from, to: WINS[3].to, sellerOrVendorIds: [accountId], rows: catalog }] },
+    };
+  };
+  const store = makeReportStore();
+  for (const h of [invHash, awdHash]) store.seedSourceSucceeded(h);
+  const saved = new Map();
+  const saveSnapshot = async ({ reportKey, accountId, payload }) => { saved.set(accountId, payload); return { paramsHash: "ph-" + accountId }; };
+  const sourceRows = (h) => (Object.prototype.hasOwnProperty.call(rowsByHash, h) ? { rows: rowsByHash[h] } : { rows: [] });
+  await runReportJobs({ store, cycleId: "cycB", sourceRows, saveSnapshot, plannedReports: reqs, loadDerivedContext });
+
+  assert.ok(saved.has("US1") && saved.has("US2"), "both accounts derived a snapshot");
+  // Each account's rows come SOLELY from its own isolated inventory/AWD (+ its own sales). The batch-mate's
+  // ASIN -- which has zero inventory/AWD/sales for THIS account after isolation -- is dropped as zero-activity, so
+  // it never appears; and the ASINs that DO appear carry only this account's own quantities (no value leak).
+  const asinsOf = (p) => new Set((p.rows || []).map((r) => r.asin));
+  const us1 = asinsOf(saved.get("US1"));
+  const us2 = asinsOf(saved.get("US2"));
+  assert.ok(us1.has("ASIN1") && !us1.has("ASIN2"), "US1 rows contain ONLY its own ASIN1 (US2's ASIN2 never leaks in)");
+  assert.ok(us2.has("ASIN2") && !us2.has("ASIN1"), "US2 rows contain ONLY its own ASIN2 (US1's ASIN1 never leaks in)");
+  const rowOf = (p, asin) => (p.rows || []).find((r) => r.asin === asin) || {};
+  assert.equal(rowOf(saved.get("US1"), "ASIN1").fbaAvailable, 100, "US1 sees its OWN ASIN1 available=100");
+  assert.equal(rowOf(saved.get("US2"), "ASIN2").fbaAvailable, 50, "US2 sees its OWN ASIN2 available=50");
+  assert.equal(rowOf(saved.get("US1"), "ASIN1").awdAvailable, 10, "US1 sees its OWN ASIN1 AWD=10 (never US2's 20)");
+  assert.equal(rowOf(saved.get("US2"), "ASIN2").awdAvailable, 20, "US2 sees its OWN ASIN2 AWD=20 (never US1's 10)");
+});
+
+test("fba-plan BATCHED derive FAILS CLOSED without owner metadata (a batched source can never leak the full batch)", async () => {
+  const reqs = planFbaPlanBucketBatched({ accounts: [bAccounts[0], bAccounts[1]], connections: PL_CONN, asOfFor: bAsOfFor });
+  const stripped = reqs.map((r) => ({ ...r, owner: undefined })); // simulate a bug dropping owner metadata
+  const invHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
+  const awdHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:awd").requestHash;
+  const store = makeReportStore();
+  for (const h of [invHash, awdHash]) store.seedSourceSucceeded(h);
+  let saveCalls = 0;
+  const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "x" }; };
+  await runReportJobs({ store, cycleId: "cycC", sourceRows: () => ({ rows: [] }), saveSnapshot, plannedReports: stripped, loadDerivedContext: async () => ({}) });
+  assert.equal(saveCalls, 0, "a batched report with missing owner metadata writes ZERO snapshots (fail closed)");
+  for (const id of ["US1", "US2"]) assert.equal(store.report("fba-plan", id).derive_status, "failed", id + " failed closed (OWNER_BINDING_MISSING)");
+});
+
 /* ============================= run ============================= */
 
 async function main() {
@@ -659,7 +755,7 @@ async function main() {
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
-  ({ planFbaPlan } = await import("../lib/server/sync/report-planner.js"));
+  ({ planFbaPlan, planFbaPlanBucketBatched } = await import("../lib/server/sync/report-planner.js"));
   ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
   ({ makeFbaPlanDurableContextLoader, oliCoverageProvesWindow } = await import("../lib/server/sync/fba-plan-durable-loader.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
