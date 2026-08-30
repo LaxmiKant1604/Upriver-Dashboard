@@ -536,7 +536,9 @@ group("C. composed-runtime enforcement (caller overrides can NOT widen scope)");
 
 test("(C1) RUN_OPERATIONAL_ARGS is pinned: no trusted collaborator is per-run overridable", () => {
   assert.deepEqual([...RUN_OPERATIONAL_ARGS], [
-    "bucket", "cycleDate", "asOf", "asOfFor", "manualReportKeys",
+    // cycleBucket is an OPTIONAL cycle-key NAMESPACE (defaults to bucket); it namespaces ONLY the sync_cycles key
+    // (fba-plan uses us-fba / non-us-fba), never the account scope or any collaborator -- so it stays operational.
+    "bucket", "cycleBucket", "cycleDate", "asOf", "asOfFor", "manualReportKeys",
     "clock", "deadlineMs", "reserveMs", "maxJobs", "scheduledAt", "trigger",
   ]);
   for (const trusted of ["loadAccountRollout", "getAccountRollout", "discoverAccounts", "controlCatalog", "settings", "connections", "store", "dataDoe", "saveSnapshot"]) {

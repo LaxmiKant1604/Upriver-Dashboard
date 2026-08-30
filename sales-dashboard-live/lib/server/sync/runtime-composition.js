@@ -33,7 +33,7 @@ export const REQUIRED_WRAPPERS = REQUIRED_WRAPPER_EXPORTS;
 // routing, stores, saver, loaders, and the durable settings) is fixed by the composition and can NOT be
 // overridden per run (blocker 2). Test injection happens at buildSchedulerV2Runtime(overrides), never per run.
 export const RUN_OPERATIONAL_ARGS = Object.freeze([
-  "bucket", "cycleDate", "asOf", "asOfFor", "manualReportKeys",
+  "bucket", "cycleBucket", "cycleDate", "asOf", "asOfFor", "manualReportKeys",
   "clock", "deadlineMs", "reserveMs", "maxJobs", "scheduledAt", "trigger",
 ]);
 

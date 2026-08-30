@@ -502,6 +502,11 @@ export async function runSourceJobs({
   // and the create-reservation share one cycle). When provided it is used verbatim (still claimed); when null, this
   // function resolves the head itself, falling back to opening a fresh BASE cycle.
   cycleId: providedCycleId = null,
+  // OPTIONAL cycle-bucket NAMESPACE (defaults to `bucket`, so the scheduler-v2 path is byte-identical). A dedicated
+  // operator (the FBA Plan go-live/refresh) passes a distinct namespace (e.g. "us-fba") so its sync_cycles row NEVER
+  // collides with the scheduler-v2 daily (bucket, cycle_date) cycle. Account scope + EVERY validation still use the
+  // real `bucket`; ONLY the cycle key (getCycleByBucketDate + openCycle) is namespaced.
+  cycleBucket = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
   const progress = {
@@ -517,15 +522,16 @@ export async function runSourceJobs({
   // superseding attempt an operator created to take over a stale terminal slot -- resume THAT cycle instead of
   // re-opening the base (which would re-select the immutable terminal cycle). Only when neither exists is a fresh
   // BASE cycle created. The head read is a plain read (safe to abort); openCycle stays a pure write.
+  const cycleKeyBucket = cycleBucket || bucket; // the namespaced cycle key (fba-plan) or the real bucket (scheduler-v2)
   let cycleId = providedCycleId;
   if (!cycleId) {
     let head = null;
     if (typeof store.getCycleByBucketDate === "function") {
-      try { head = await store.getCycleByBucketDate(bucket, cycleDate); } catch (_e) { head = null; }
+      try { head = await store.getCycleByBucketDate(cycleKeyBucket, cycleDate); } catch (_e) { head = null; }
     }
     cycleId = head && head.id && ["running", "pending"].includes(String(head.status))
       ? head.id
-      : await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+      : await store.openCycle({ bucket: cycleKeyBucket, cycleDate, scheduledAt, trigger });
   }
   progress.cycleId = cycleId;
   progress.claimedCycle = await store.claimCycle(cycleId);

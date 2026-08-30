@@ -163,6 +163,11 @@ export async function runSchedulerV2Shadow({
   loadAccountRollout = null,
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity,
   scheduledAt = null, trigger = "manual",
+  // OPTIONAL cycle-bucket NAMESPACE (operational arg). Defaults to `bucket` -> the scheduler-v2 path is byte-
+  // identical. A dedicated operator (FBA Plan) passes e.g. "us-fba" so ITS sync_cycles rows never collide with the
+  // scheduler-v2 daily (bucket, cycle_date) cycle; account discovery/rollout + every bucket validation use the real
+  // `bucket`, ONLY the cycle key is namespaced.
+  cycleBucket = null,
   // BUILD-TIME source-tranche selector (Part A). Supplied ONLY by the trusted composition
   // (buildSchedulerV2SourceTrancheRuntime); NEVER a per-run operational arg. When present, each source
   // unit executes only the selected families this pass; the full plan is still upserted, so the next
@@ -348,7 +353,7 @@ export async function runSchedulerV2Shadow({
           if (typeof store.persistBudget !== "function") {
             throw new Error("runSchedulerV2Shadow: a frozen tranche budget is required but store.persistBudget is unavailable; refusing to execute (fail closed).");
           }
-          const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+          const cycleId = await store.openCycle({ bucket: cycleBucket || bucket, cycleDate, scheduledAt, trigger });
           rollup.cycleId = rollup.cycleId || cycleId;
           const ack = await store.persistBudget({
             cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
@@ -363,7 +368,7 @@ export async function runSchedulerV2Shadow({
       }
       res = await runStagedSourceCycle({
         store, dataDoe, resolvePlan: resolveFromGenericPlan(plan),
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
+        bucket, cycleBucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
       });
       collectedReports.push(...plan.reportRequests);
     } else {

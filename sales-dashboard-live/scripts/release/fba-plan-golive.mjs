@@ -22,7 +22,13 @@ if (mode !== "dry-run" && mode !== "go-live") { console.error("STOP --mode must 
 const asOfArg = argOf("as-of");
 const maxTokens = Number(argOf("max-tokens") || 80);
 const maxBlocked = Number(argOf("max-blocked") || 2);
-const log = (m) => console.log("fba-golive[" + mode + "]: " + m);
+// --bucket selects which bucket(s) to refresh + publish: "us" | "non-us" | "both" (default). The scheduler runs ONE
+// bucket per cron (per-bucket independence); the manual go-live publishes both. Each bucket is fully independent --
+// a failure in one never touches the other's accounts or snapshots.
+const bucketArg = (argOf("bucket") || "both").toLowerCase();
+if (!["us", "non-us", "both"].includes(bucketArg)) { console.error("STOP --bucket must be us | non-us | both"); process.exit(2); }
+const wantBucket = (b) => bucketArg === "both" || bucketArg === b;
+const log = (m) => console.log("fba-golive[" + mode + (bucketArg === "both" ? "" : "/" + bucketArg) + "]: " + m);
 
 const { getDataDoeConnections, resolveDataDoeAccountIds } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
@@ -83,8 +89,10 @@ if (asOfResolved.blocked.length) log("  blocked (publish later once OLI catches 
 
 // ---------------- Stage 2: build the exact batched plan + prove the token cost (ZERO creates) ----------------
 const asOfFor = () => asOf; // a SINGLE go-live as-of => batched FBA/AWD exports share one window per batch
-const usAccounts = accounts.filter((a) => a.country.toUpperCase() === "US");
-const nonUsAccounts = accounts.filter((a) => a.country.toUpperCase() !== "US");
+// Scope accounts to the selected bucket(s) -- each bucket is planned/fetched/published INDEPENDENTLY.
+const usAccounts = wantBucket("us") ? accounts.filter((a) => a.country.toUpperCase() === "US") : [];
+const nonUsAccounts = wantBucket("non-us") ? accounts.filter((a) => a.country.toUpperCase() !== "US") : [];
+const selectedIds = new Set([...usAccounts, ...nonUsAccounts].map((a) => a.accountId));
 const planFor = (bucketAccounts) => (bucketAccounts.length ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor }) : { sourceJobs: [], reportRequests: [] });
 const usPlan = planFor(usAccounts);
 const nonUsPlan = planFor(nonUsAccounts);
@@ -126,14 +134,18 @@ try {
   if (!applied || applied.committed !== true) throw new Error("controls apply did not commit (code " + (applied && applied.code) + ")");
   controlsOpen = true;
 
-  // 2) run the fba-plan SHADOW dispatch for each bucket until drained (batched FBA/AWD fetch + durable derive).
+  // 2) run the fba-plan SHADOW dispatch for each SELECTED bucket until drained (batched FBA/AWD fetch + durable
+  //    derive). Buckets run independently -- a failure in one never touches the other's accounts or snapshots.
   for (const bucket of ["us", "non-us"]) {
+    if (!wantBucket(bucket)) continue;
     if (bucket === "us" ? !usAccounts.length : !nonUsAccounts.length) continue;
     for (let slice = 1; slice <= 40; slice += 1) {
       // trigger MUST be one of the sync_cycles_trigger_check enum ('pg_cron'|'github'|'vercel'|'manual'); this
       // operator runs in GitHub Actions. The fba-plan operation identity (bucket + as-of + request_hash) is what
       // distinguishes/idempotates fba-plan runs, NOT the trigger enum.
-      const res = await runtime.run({ bucket, cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
+      // cycleBucket namespaces the fba-plan cycle (us-fba / non-us-fba) so it NEVER collides with the scheduler-v2
+      // daily (us|non-us, cycle_date) cycle; account scope is still the real bucket (us | non-us).
+      const res = await runtime.run({ bucket, cycleBucket: bucket + "-fba", cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
       log(bucket + " slice " + slice + ": cycle=" + String(res.cycleId || "").slice(0, 8) + " drained=" + res.drained + " reports=" + JSON.stringify(res.reports ? { processed: res.reports.processed, drained: res.reports.drained } : null));
       if (res.drained === true) break;
       if (res.continuationRequired !== true) throw new Error(bucket + " dispatch stopped un-drained without requesting continuation");
@@ -141,9 +153,10 @@ try {
     }
   }
 
-  // 3) publish every INCLUDED account through the four gates (preflight proves it before the CAS write).
+  // 3) publish every INCLUDED account IN THE SELECTED BUCKET(S) through the four gates (preflight proves it
+  //    before the CAS write). A stale-OLI-blocked account is simply absent from `included` -> its LKG is untouched.
   const published = []; const skipped = [];
-  for (const accountId of asOfResolved.included) {
+  for (const accountId of asOfResolved.included.filter((id) => selectedIds.has(id))) {
     const pre = await publisher.preflight("fba-plan", accountId);
     if (pre.disposition !== "ready") { skipped.push(accountId.slice(0, 6) + ":" + pre.disposition); continue; }
     const r = await publisher.publish("fba-plan", accountId);
