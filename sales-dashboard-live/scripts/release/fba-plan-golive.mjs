@@ -130,7 +130,10 @@ try {
   for (const bucket of ["us", "non-us"]) {
     if (bucket === "us" ? !usAccounts.length : !nonUsAccounts.length) continue;
     for (let slice = 1; slice <= 40; slice += 1) {
-      const res = await runtime.run({ bucket, cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "fba-plan-golive" });
+      // trigger MUST be one of the sync_cycles_trigger_check enum ('pg_cron'|'github'|'vercel'|'manual'); this
+      // operator runs in GitHub Actions. The fba-plan operation identity (bucket + as-of + request_hash) is what
+      // distinguishes/idempotates fba-plan runs, NOT the trigger enum.
+      const res = await runtime.run({ bucket, cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
       log(bucket + " slice " + slice + ": cycle=" + String(res.cycleId || "").slice(0, 8) + " drained=" + res.drained + " reports=" + JSON.stringify(res.reports ? { processed: res.reports.processed, drained: res.reports.drained } : null));
       if (res.drained === true) break;
       if (res.continuationRequired !== true) throw new Error(bucket + " dispatch stopped un-drained without requesting continuation");
