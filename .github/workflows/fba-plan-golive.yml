@@ -22,6 +22,7 @@ on:
         type: choice
         options:
           - preflight
+          - dry-run-cost
       dispatch_id:
         description: "Free-text run identity for the log (e.g. golive-2026-08-30)."
         required: false
@@ -70,3 +71,7 @@ jobs:
       - name: FBA source preflight (READ ONLY -- balance + source column metadata; zero tokens)
         if: ${{ inputs.mode == 'preflight' }}
         run: node scripts/release/fba-source-preflight.mjs
+
+      - name: FBA go-live cost dry-run (READ ONLY -- planned exports vs adoptable cache; zero tokens)
+        if: ${{ inputs.mode == 'dry-run-cost' }}
+        run: node scripts/release/fba-golive-dryrun.mjs
