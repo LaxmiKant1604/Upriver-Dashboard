@@ -31,3 +31,34 @@ begin
     add constraint sync_cycles_bucket_check
     check (bucket in ('us', 'non-us', 'us-fba', 'non-us-fba'));
 end $$;
+
+-- open_sync_cycle also validates the bucket in PL/pgSQL; expand its allow-list to the fba namespaces so the
+-- fba-plan operator can open its dedicated cycle. Additive: the scheduler-v2 (us / non-us) path is unchanged.
+-- (Only sync_cycles.bucket ever takes the fba namespace; sync_source_jobs.bucket / sync_report_jobs.bucket store
+-- the real ACCOUNT bucket (us / non-us), so their CHECKs are untouched.)
+create or replace function public.open_sync_cycle(
+  p_bucket text,
+  p_cycle_date date,
+  p_scheduled_at timestamptz default null,
+  p_trigger text default 'pg_cron'
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_id uuid;
+begin
+  if p_bucket not in ('us', 'non-us', 'us-fba', 'non-us-fba') then
+    raise exception 'Invalid bucket %', p_bucket;
+  end if;
+
+  insert into public.sync_cycles (bucket, cycle_date, scheduled_at, trigger, status)
+  values (p_bucket, p_cycle_date, p_scheduled_at, coalesce(p_trigger, 'pg_cron'), 'pending')
+  on conflict (bucket, cycle_date) do update set updated_at = now()
+  returning id into v_id;
+
+  return v_id;
+end;
+$$;
