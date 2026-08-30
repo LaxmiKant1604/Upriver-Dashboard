@@ -13392,3 +13392,29 @@ gates for fba-plan: report_sync_settings.schedule_enabled, scheduler_account_rol
 NEEDS A DECISION before proceeding (cannot resolve within the stated ceiling): raise the token/create budget to
 ~38 creates/~190 tokens (per-account premium, as-is) OR authorize a batching contract change (+seller_or_vendor_id,
 verify DataDoe support) at ~9 creates/45 tokens. Migrations are already applied; the DB is ready. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-30 -- FBA Plan go-live: TRUE cost established (zero-token dry-run in Actions); OLI re-fetch dominates
+================================================================================
+Credential path PROVEN in GitHub Actions (workflow_dispatch fba-plan-golive.yml + scripts/release/fba-source-preflight.mjs
++ fba-golive-dryrun.mjs). Preflight: DataDoe balance 3642 usable; seller_or_vendor_id IS available on BOTH
+fba-inventory-health + listings (5-seller batching feasible). Zero tokens spent.
+
+DECISIVE cost dry-run (planFbaPlan x30 accts, checked source_export_cache adoptability):
+  fba-plan:oli-sales       distinct=600 adoptable=0 need=600  standard(2) = 1200 tokens
+  fba-plan:catalog         distinct=30  adoptable=0 need=30   standard(2) = 60
+  fba-plan:inventory-health distinct=30 adoptable=0 need=30   premium(5)  = 150
+  fba-plan:awd (US)        distinct=8   adoptable=0 need=8    premium(5)  = 40
+  PER-ACCOUNT TOTAL = 668 creates / 1450 tokens. Batched ~160 creates / ~366 tokens.
+NONE adoptable: fba-plan has never run, and its OLI/catalog are NOT in source_export_cache. The derive reads
+source_export_cache by fba-plan's OWN request_hash; the scheduler keeps OLI in the DURABLE store
+source_oli_daily_history (different hashes) -> no reuse. So the go-live as-architected re-fetches 3 MONTHS of OLI
+(the 1200-token driver), NOT just FBA Health + AWD. This contradicts the mission premise ("fetch only FBA Health +
+AWD", ~80 tok) and the approved ~80-token batching budget by 4.5x-18x. STOPPED before any create (0 tokens).
+
+BETTER PATH (recommended): source_oli_daily_history already holds 3mo OLI for all 30 accts; SKU Movement already
+derives from that durable history with ZERO exports. Wire fba-plan's OLI to derive from the durable history (like
+sku-movement) instead of re-fetching fba-plan:oli-sales -> eliminates the 1200-token OLI fetch -> go-live cost becomes
+just FBA Health + AWD (+ catalog), ~80-130 tokens, reusing proven architecture. Needs a fba-plan derive change (read
+OLI from durable history). Awaiting direction: (a) authorize ~366-token batched re-fetch as-is, (b) do the
+durable-OLI refactor first (cheaper), or (c) hold. See [[fba-plan-advanced]].
