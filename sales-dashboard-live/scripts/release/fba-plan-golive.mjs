@@ -139,6 +139,7 @@ try {
   for (const bucket of ["us", "non-us"]) {
     if (!wantBucket(bucket)) continue;
     if (bucket === "us" ? !usAccounts.length : !nonUsAccounts.length) continue;
+    let cycleId = null;
     for (let slice = 1; slice <= 40; slice += 1) {
       // trigger MUST be one of the sync_cycles_trigger_check enum ('pg_cron'|'github'|'vercel'|'manual'); this
       // operator runs in GitHub Actions. The fba-plan operation identity (bucket + as-of + request_hash) is what
@@ -146,10 +147,24 @@ try {
       // cycleBucket namespaces the fba-plan cycle (us-fba / non-us-fba) so it NEVER collides with the scheduler-v2
       // daily (us|non-us, cycle_date) cycle; account scope is still the real bucket (us | non-us).
       const res = await runtime.run({ bucket, cycleBucket: bucket + "-fba", cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
+      cycleId = res.cycleId || cycleId;
       log(bucket + " slice " + slice + ": cycle=" + String(res.cycleId || "").slice(0, 8) + " drained=" + res.drained + " reports=" + JSON.stringify(res.reports ? { processed: res.reports.processed, drained: res.reports.drained } : null));
       if (res.drained === true) break;
       if (res.continuationRequired !== true) throw new Error(bucket + " dispatch stopped un-drained without requesting continuation");
       if (slice === 40) throw new Error(bucket + " dispatch did not drain within the slice budget");
+    }
+    // FINALIZE the fba-plan cycle. A manualReportKeys dispatch deliberately NEVER auto-finalizes (it must not
+    // terminalize a SHARED (bucket, cycle_date) cycle other reports may append to). But fba-plan's cycle is
+    // DEDICATED (us-fba / non-us-fba, no other report), so we finalize it here -- the publisher's four-gate check
+    // requires a validated report job in a TERMINAL (succeeded|partial) cycle. Idempotent: a replay's already-
+    // terminal cycle returns "already-terminal".
+    if (cycleId) {
+      const disp = await runtime.store.finalizeCycle({ cycleId });
+      const status = disp && disp.cycle && disp.cycle.status;
+      log(bucket + " cycle finalized: disposition=" + (disp && disp.disposition) + " status=" + status);
+      if (!disp || !["finalized", "already-terminal"].includes(disp.disposition) || !["succeeded", "partial"].includes(status)) {
+        throw new Error(bucket + " fba-plan cycle did not finalize to a terminal (succeeded|partial) status: " + JSON.stringify(disp));
+      }
     }
   }
 
