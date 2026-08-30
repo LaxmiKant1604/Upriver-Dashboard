@@ -37,6 +37,7 @@ let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
 let makeFbaPlanDurableContextLoader, oliCoverageProvesWindow;
 let planFbaPlanBucketBatched;
+let resolveGoLiveAsOf, fbaGoLiveTokenCost;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -747,6 +748,47 @@ test("fba-plan BATCHED derive FAILS CLOSED without owner metadata (a batched sou
   for (const id of ["US1", "US2"]) assert.equal(store.report("fba-plan", id).derive_status, "failed", id + " failed closed (OWNER_BINDING_MISSING)");
 });
 
+/* ===================== go-live planning helpers (as-of + token cost) ===================== */
+
+group("fba-plan: go-live planning helpers");
+
+test("resolveGoLiveAsOf: picks the coverage-maximizing recent date; genuinely-stale accounts fail closed", () => {
+  // Mirrors the prod recon: 8@Aug29, 15@Aug28, 5@Aug27, 1@Aug24, 1@Aug11(stale). maxBlocked=2 => asOf=Aug27
+  // keeps 28/30; the two genuinely-stale accounts (Aug24, Aug11) are blocked.
+  const proven = [];
+  const push = (n, d) => { for (let i = 0; i < n; i++) proven.push({ accountId: `${d}-${i}`, provenTo: d }); };
+  push(8, "2026-08-29"); push(15, "2026-08-28"); push(5, "2026-08-27"); push(1, "2026-08-24"); push(1, "2026-08-11");
+  const r = resolveGoLiveAsOf(proven, { ceiling: "2026-08-29", maxBlocked: 2 });
+  assert.equal(r.asOf, "2026-08-27", "the latest date all-but-2 accounts still cover");
+  assert.equal(r.included.length, 28);
+  assert.equal(r.blocked.length, 2);
+  assert.deepEqual(r.blocked.map((b) => b.provenTo).sort(), ["2026-08-11", "2026-08-24"]);
+});
+
+test("resolveGoLiveAsOf: caps at the ceiling (never claims a date past server D-1); empty proven => no as-of", () => {
+  const r = resolveGoLiveAsOf([{ accountId: "A", provenTo: "2026-09-10" }, { accountId: "B", provenTo: "2026-09-11" }], { ceiling: "2026-08-29", maxBlocked: 0 });
+  assert.equal(r.asOf, "2026-08-29", "capped at the ceiling");
+  assert.equal(r.included.length, 2);
+  const none = resolveGoLiveAsOf([{ accountId: "A", provenTo: null }], { ceiling: "2026-08-29" });
+  assert.equal(none.asOf, null);
+  assert.equal(none.blocked.length, 1);
+});
+
+test("fbaGoLiveTokenCost: 16 batched exports = 80 premium tokens; adoptable jobs cost 0", () => {
+  const jobs = [];
+  for (let i = 0; i < 14; i++) jobs.push({ requestHash: "fba" + i, sourceKey: "fba-inventory-health" });
+  for (let i = 0; i < 2; i++) jobs.push({ requestHash: "awd" + i, sourceKey: "listings" });
+  const full = fbaGoLiveTokenCost(jobs, () => false);
+  assert.equal(full.creates, 16);
+  assert.equal(full.tokens, 80, "16 premium exports * 5 = 80 (exactly the ceiling)");
+  // Four already-cached FBA Health jobs adopt for free.
+  const cached = new Set(["fba0", "fba1", "fba2", "fba3"]);
+  const partial = fbaGoLiveTokenCost(jobs, (h) => cached.has(h));
+  assert.equal(partial.creates, 12);
+  assert.equal(partial.tokens, 60);
+  assert.equal(partial.byFamily["fba-inventory-health"].adoptable, 4);
+});
+
 /* ============================= run ============================= */
 
 async function main() {
@@ -758,6 +800,7 @@ async function main() {
   ({ planFbaPlan, planFbaPlanBucketBatched } = await import("../lib/server/sync/report-planner.js"));
   ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
   ({ makeFbaPlanDurableContextLoader, oliCoverageProvesWindow } = await import("../lib/server/sync/fba-plan-durable-loader.js"));
+  ({ resolveGoLiveAsOf, fbaGoLiveTokenCost } = await import("../lib/server/sync/fba-plan-golive-plan.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

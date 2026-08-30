@@ -18,11 +18,21 @@ on:
       mode:
         description: "Operation mode"
         required: true
-        default: "preflight"
+        default: "golive-dry-run"
         type: choice
         options:
           - preflight
           - dry-run-cost
+          - golive-dry-run
+          - golive
+      as_of:
+        description: "Optional YYYY-MM-DD go-live as-of (blank = coverage-maximizing auto). Accounts short of it fail closed."
+        required: false
+        default: ""
+      max_tokens:
+        description: "Hard token ceiling for the go-live (refuses to start if the plan exceeds it)."
+        required: false
+        default: "80"
       dispatch_id:
         description: "Free-text run identity for the log (e.g. golive-2026-08-30)."
         required: false
@@ -75,3 +85,15 @@ jobs:
       - name: FBA go-live cost dry-run (READ ONLY -- planned exports vs adoptable cache; zero tokens)
         if: ${{ inputs.mode == 'dry-run-cost' }}
         run: node scripts/release/fba-golive-dryrun.mjs
+
+      - name: FBA go-live DRY-RUN (READ ONLY -- coverage-max as-of + batched plan + token cost; ZERO creates/controls)
+        if: ${{ inputs.mode == 'golive-dry-run' }}
+        env:
+          PRIORITY_OPERATOR: laxmikant@superboring.in
+        run: node scripts/release/fba-plan-golive.mjs --mode=dry-run ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
+
+      - name: FBA GO-LIVE (bounded refresh + derive + publish + always-safe-close; hard token ceiling)
+        if: ${{ inputs.mode == 'golive' }}
+        env:
+          PRIORITY_OPERATOR: laxmikant@superboring.in
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --max-tokens=${{ inputs.max_tokens }} ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
