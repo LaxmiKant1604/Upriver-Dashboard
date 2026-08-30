@@ -33,9 +33,10 @@ begin
 end $$;
 
 -- open_sync_cycle also validates the bucket in PL/pgSQL; expand its allow-list to the fba namespaces so the
--- fba-plan operator can open its dedicated cycle. Additive: the scheduler-v2 (us / non-us) path is unchanged.
--- (Only sync_cycles.bucket ever takes the fba namespace; sync_source_jobs.bucket / sync_report_jobs.bucket store
--- the real ACCOUNT bucket (us / non-us), so their CHECKs are untouched.)
+-- fba-plan operator can open its dedicated cycle. This preserves the 20260830 superseding-aware body EXACTLY
+-- (attempt_kind='base' + the partial base index conflict target `where supersedes_cycle_id is null`) and ONLY
+-- widens the bucket allow-list -- the scheduler-v2 (us / non-us) path stays byte-identical. (Only sync_cycles.bucket
+-- takes the fba namespace; sync_source_jobs.bucket / sync_report_jobs.bucket store the real ACCOUNT bucket.)
 create or replace function public.open_sync_cycle(
   p_bucket text,
   p_cycle_date date,
@@ -54,9 +55,9 @@ begin
     raise exception 'Invalid bucket %', p_bucket;
   end if;
 
-  insert into public.sync_cycles (bucket, cycle_date, scheduled_at, trigger, status)
-  values (p_bucket, p_cycle_date, p_scheduled_at, coalesce(p_trigger, 'pg_cron'), 'pending')
-  on conflict (bucket, cycle_date) do update set updated_at = now()
+  insert into public.sync_cycles (bucket, cycle_date, scheduled_at, trigger, status, attempt_kind)
+  values (p_bucket, p_cycle_date, p_scheduled_at, coalesce(p_trigger, 'pg_cron'), 'pending', 'base')
+  on conflict (bucket, cycle_date) where supersedes_cycle_id is null do update set updated_at = now()
   returning id into v_id;
 
   return v_id;
